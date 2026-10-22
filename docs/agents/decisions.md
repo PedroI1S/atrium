@@ -13,3 +13,6 @@ Headless `agy` 1.4.5 auto-denies every command that would need a prompt, and hoo
 
 ## D-004 — 2026-10-22 — Codex workers get network access in their sandbox
 `codex exec -s workspace-write` blocks network by default, which breaks crate and npm downloads. Workers run with `-c sandbox_workspace_write.network_access=true`; writes stay confined to the worktree.
+
+## D-005 — 2026-10-22 — Push policy
+Remote: `github.com/PedroI1S/atrium` (private). Plan and doc changes (`PLAN.md`, `docs/`) are pushed right away. Code is pushed only at milestone gates, after Pedro's sign-off. Workers never push. **Decided by Pedro.**
