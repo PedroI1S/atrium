@@ -32,6 +32,7 @@ A fast, lightweight agent development environment written in Rust. It wraps the 
 | Workspace | Worktree per thread with a ready-to-use environment (env files, setup, ports, preview), checkpoints/revert, checks, terminal, editor, diff review with inline comments |
 | Multi-agent | Attention inbox, definition of done + automatic checks, conflict radar + merge queue, delegation + cross-provider review, shared notes + handoffs, backlog/queue/schedules, concurrency and rate-limit management, approval rules |
 | Audience | Personal first, kept clean enough to open-source later |
+| Databases | SQLite/libSQL + PostgreSQL: query editor, drawDB-style schema diagram with design → migration, Drizzle Studio-style table view with staged edits; agents get read-only `db_*` tools, writes go through approvals (3.19) |
 | Build team | Opus 5.5 orchestrates; Sol 6.1 (backend), Sonnet 5.5 (frontend), Argon (systems/security), 3.8 Flash (utility), Astra (gates/escalation). Cross-provider review, contract-first parallel fan-out. See section 8. |
 
 ## 2. Landscape (what we borrow / where we differ)
@@ -68,6 +69,7 @@ A fast, lightweight agent development environment written in Rust. It wraps the 
 │  scheduler  backlog queue, concurrency limits, rate-limit pauses, cron     │
 │  pty        portable-pty terminals                                         │
 │  browser    Chromium discovery, CDP (chromiumoxide), screencast, input     │
+│  db         SQLite/libSQL + Postgres: introspection, queries, staged edits │
 │  sandbox    (optional) libkrun VMs via atrium-vmm child processes          │
 │  mcp        rmcp server: browser_* sandbox_* thread_* notes_* checks_* …   │
 └────────────────────────────────────────────────────────────────────────────┘
@@ -96,6 +98,7 @@ atrium/
 │  ├─ atrium-env/            worktree setup/teardown, port allocator, previews
 │  ├─ atrium-checks/         check runner, evidence, risk-flag heuristics
 │  ├─ atrium-browser/        discovery, CDP, screencast, input, a11y snapshot
+│  ├─ atrium-db/             DB drivers, introspection, schema model, diff → migrations
 │  ├─ atrium-sandbox/        (feature) image builder, VM lifecycle, vsock plumbing
 │  ├─ atrium-mcp/            MCP server (rmcp) + per-thread scoping
 │  ├─ atrium-vmm/   (bin)    one process per VM, calls krun_start_enter
@@ -367,6 +370,7 @@ url     = "http://localhost:$PORT"
 | `checks_*` | workspace threads | `checks_run`, `checks_status` |
 | `notes_*` | every thread | `notes_list/read/search/write` |
 | `thread_*` | every thread | `thread_delegate`, `thread_status`, `thread_handoff` |
+| `db_*` | every thread with a configured connection | `db_connections`, `db_schema`, `db_query` (read-only), `db_explain`, `db_execute` (approval required; never for production): see 3.19 |
 | `sandbox_*` | when the sandbox is available | `sandbox_run` (approval required; read-only copy of the worktree unless writes are allowed), `status`, `logs` |
 | `workspace_*` / `task_*` | Home only | list workspaces, start or queue threads, read results and handoffs, open diffs, manage the backlog: Home is the orchestrator |
 
@@ -375,7 +379,7 @@ url     = "http://localhost:$PORT"
 - **Layout**:
   - A left rail: Inbox (badge), Home, Workspaces → Threads/Backlog.
   - A main thread view: messages, tool calls, inline approvals and question forms.
-  - A right panel with tabs: Review card, Diff, Browser, Terminal, Files, Editor, Checks.
+  - A right panel with tabs: Review card, Diff, Browser, Terminal, Files, Editor, Checks, Database.
   - Split panes come later.
 - **Libraries**:
   - CodeMirror 6 for the editor and for the diff/merge view (inline comments as decorations; they're sent back to the agent as a review message).
@@ -437,6 +441,94 @@ Atrium doesn't replace these. It keeps a **normalized copy** in its own store, p
   - "Restore from snapshot" is in settings.
 - **Privacy**: everything stays local. Nothing is uploaded unless you explicitly export or enable remote access.
 
+### 3.19 Databases: query editor, schema diagram, table view (`atrium-db`)
+
+Built-in database tooling for **SQLite/libSQL and PostgreSQL**. It's for you (a query editor, a drawDB-style schema diagram, a Drizzle Studio-style table view) and for agents (`db_*` MCP tools: read-only by default, writes through approvals).
+
+**Connections**
+- **Discovery per workspace**: Atrium proposes connections it finds, and you confirm them before it connects. It looks in:
+  - `.env*` (`DATABASE_URL`, `POSTGRES_URL`, `TURSO_DATABASE_URL`, …),
+  - `drizzle.config.*`, the `prisma/schema.prisma` datasource,
+  - `docker-compose.yml` Postgres services (mapped to localhost),
+  - `*.db` / `*.sqlite` files in the repo.
+- **Config**: `atrium.toml` references connections by name and environment variable. It never stores secrets:
+
+  ```toml
+  [[databases]]
+  name = "dev"
+  url_env = "DATABASE_URL"   # or url_keychain = "atrium/dev-db"
+  env = "development"        # development | staging | production
+  ```
+
+  Credentials typed into the UI go to the OS keychain (macOS Keychain / Secret Service via `keyring`), never into the store.
+- **Environment tags**:
+  - `production` connections get a red banner and typed confirmation for any human write, and are always read-only for agents.
+  - `development` is the default for local files and Docker.
+- **Drivers**:
+  - SQLite through **`rusqlite`**, the same library as Atrium's own store, run on a blocking pool. Using `sqlx` here as well would bring a second `libsqlite3-sys` link and conflict.
+  - PostgreSQL through **`tokio-postgres`** + rustls.
+  - Remote libSQL/Turso through the `libsql` crate's remote-only (HTTP) feature, which avoids a second native SQLite.
+  - SSH tunnels come later.
+- **Introspection** into one normalized schema model, shared by every feature below:
+  - Model: schemas → tables → columns (type, nullability, default, generated), primary keys, foreign keys, indexes, unique/check constraints, comments; plus views and enums.
+  - SQLite: `sqlite_schema` + `pragma_table_info/foreign_key_list/index_list`.
+  - Postgres: `pg_catalog` + `information_schema`.
+- **Per-thread databases (later)**: worktree setup (3.6) can give a thread its own copy, so agents mutate a copy instead of the shared dev DB. SQLite: a `clonefile` copy. Postgres: `CREATE DATABASE … TEMPLATE …`, or provider branching such as Neon.
+
+**Query editor**
+- CodeMirror 6 + `@codemirror/lang-sql`, with **schema-aware autocomplete** from introspection. Run the statement under the cursor or the selection. Multiple result tabs. Cancel (`pg_cancel_backend`, or SQLite interrupt), statement timeout, row limit with streamed pagination.
+- **Statement classification** with `sqlparser-rs` (read / write / DDL / destructive):
+  - `DROP`, `TRUNCATE`, and `UPDATE`/`DELETE` without `WHERE` need confirmation.
+  - On production connections, every write needs typed confirmation.
+  - There's an optional manual-transaction mode (BEGIN … COMMIT/ROLLBACK buttons).
+- `EXPLAIN` / `EXPLAIN ANALYZE` (Postgres) shown as a plan tree with cost hotspots.
+- **History** per connection in Atrium's store, plus **saved queries** as `.sql` files in the workspace (committable). Export results to CSV/JSON.
+- **"Ask the agent"**: sends the query, its error or plan, and the relevant schema slice to the current thread. Atrium has no built-in text-to-SQL model; the thread's own agent does it.
+
+**Schema diagram (drawDB-style)**
+- **View**:
+  - Each table is a card showing columns, types and PK/FK/nullable markers. Foreign keys are drawn as edges with crow's-foot cardinality.
+  - Tables are color-grouped by schema.
+  - **Auto layout** with ELK (`elkjs`, layered, in a web worker). Manual positions persist per workspace in `.atrium/diagrams/<connection>.json`.
+  - Search, **focus mode** (a table plus its n-hop neighborhood), minimap, zoom/pan, export to SVG/PNG.
+  - Export the schema as **DBML**, SQL DDL or a **Mermaid `erDiagram`**. Mermaid is handy for docs and as compact context for agents.
+- **Design → migration** (nothing is ever applied directly):
+  1. Edit on the canvas: add or rename tables and columns, change types/nullability/defaults, add foreign keys, indexes and uniques. This builds a *target* schema next to the live one, with changes highlighted.
+  2. A diff engine (current → target, over the normalized model) generates **dialect-correct migration SQL**. For SQLite that includes the table-rebuild procedure for changes `ALTER TABLE` can't do.
+     - v1 covers tables, columns, foreign keys, indexes and uniques. Views, enums, triggers and policies are shown read-only.
+  3. Choose an output:
+     - **(a)** write a migration file into the project's migrations folder, or
+     - **(b) hand off to an agent**: Atrium opens a thread whose brief is the schema diff, e.g. *"apply this to the Drizzle schema in `src/db/schema.ts` and generate the migration with `drizzle-kit`"*. ORM-specific code stays with agents that know the project.
+  4. Applying a migration is a reviewed, explicit action: through the query editor, or the project's own migration command run by the agent or the checks.
+- **Correctness check**: every generated migration is tested by applying it to a scratch copy (a SQLite file copy, or a Postgres template DB), re-introspecting, and comparing with the target model.
+
+**Table view (Drizzle Studio-style)**
+- **Grid**:
+  - Virtualized, with **keyset pagination** on the primary key, so large tables stay fast.
+  - Type-aware cells: a JSON viewer, booleans, timestamps with timezone, bytes shown as size/hex, enums as dropdowns.
+  - Per-column filters (operator + value), sort, hide/reorder columns, quick search.
+- **Relations**: FK cells link to the referenced row. A side panel shows *reverse* relations (rows that reference this one), with counts.
+- **Staged edits**:
+  - Edit cells, add rows (pre-filled with defaults), and delete or duplicate rows. Pending changes are highlighted and shown as a diff.
+  - **Review** shows the generated parameterized SQL. **Apply** runs everything in one transaction; **Discard** drops it.
+  - Each `UPDATE`/`DELETE` checks the row's original values, so if the row changed in the meantime, the conflict is reported instead of overwritten.
+  - Applied batches store best-effort inverse statements for **undo**.
+  - Tables without a primary key are read-only (SQLite falls back to `rowid` where it's safe).
+
+**Agent tools (`db_*` MCP)**
+
+| Tool | Access |
+|---|---|
+| `db_connections` | Lists connection *names* and environments. Agents never see credentials. |
+| `db_schema(conn, tables?)` | Compact schema (DBML-like text) to save tokens; optional table filter and n-hop neighborhood |
+| `db_query(conn, sql, limit)` | **Read-only**, enforced three ways: (1) `sqlparser` classification; (2) execution inside a `READ ONLY` transaction (Postgres) or a read-only connection with `query_only` (SQLite); (3) row limit + statement timeout |
+| `db_explain(conn, sql)` | Query plan |
+| `db_execute(conn, sql)` | Writes/DDL. Always goes to the **approval queue**, showing the SQL and a dry-run estimate (affected rows, computed in a transaction that is rolled back). Never offered for `production` connections. Approval rules (3.12) can allow e.g. "writes to the dev SQLite in this workspace". |
+
+Recommended (optional): give agents a least-privilege Postgres role for their connections. Note that the tools don't stop an agent from reading `.env` inside its worktree. Real isolation for risky database work is the sandbox or a per-thread database copy.
+
+**UI**: a **Database** tab in the workspace right panel, with sub-tabs Query / Tables / Diagram. Home lists connections across workspaces.
+
 ## 4. Performance budgets (targets)
 
 - Cold start to interactive: < 400 ms (macOS, M-series); reconnecting to a running daemon with full state: < 100 ms.
@@ -444,6 +536,7 @@ Atrium doesn't replace these. It keeps a **normalized copy** in its own store, p
 - Token streaming: 60 fps, no dropped input with 10 active threads.
 - Browser pane: ≥ 30 fps screencast, < 80 ms input-to-frame locally.
 - Conflict radar: an incremental update in < 200 ms per thread change.
+- Database: first page of any table (keyset) in < 150 ms locally; schema diagram layout for 300 tables in < 1 s (in a worker); autocomplete in < 30 ms.
 - Sandbox: < 1 s from "start" to guest ready, excluding agent CLI startup.
 
 ## 5. Milestones
@@ -474,6 +567,10 @@ Atrium doesn't replace these. It keeps a **normalized copy** in its own store, p
 **M3: Browser**
 - Discovery and settings, per-thread contexts, the screencast pane with take-over, the browser MCP tools.
 - Preview opened in the thread's browser, screenshot evidence on review cards.
+
+**M3.5: Databases (3.19)**
+- **a**: connection discovery + keychain, SQLite/libSQL + Postgres drivers, introspection → schema model, query editor (autocomplete, classification, history, EXPLAIN), table view (keyset grid, filters, relations, staged edits), `db_*` MCP tools with read-only enforcement and approvals, view-only schema diagram.
+- **b**: design mode, diff engine → migration SQL (SQLite rebuild procedure included), round-trip verification on scratch copies, hand-off-to-agent flow, DBML/Mermaid export.
 
 **M4: Sandbox (optional feature)**
 - **Spike**: boot libkrun on macOS from a directory rootfs, then a virtio-fs share, a vsock round-trip and hypervisor-entitlement signing.
@@ -521,6 +618,9 @@ Atrium doesn't replace these. It keeps a **normalized copy** in its own store, p
 | libkrun on macOS is Apple Silicon only; needs a hypervisor entitlement + signing | The sandbox is optional, so Intel Macs just don't get it; handle signing in the M4 spike |
 | CoW rootfs on Linux (no clonefile) | Spike reflink, overlayfs (fuse-overlayfs) and a qcow2 disk overlay; pick one |
 | WebKitGTK performance on Linux (canvas, xterm WebGL) | Measure in M0; tune frame size/quality; fall back to the xterm canvas renderer |
+| Agent read-only DB access bypassed (writable CTEs, side-effecting functions, multi-statements) | Three layers: parser classification + `READ ONLY` transaction / `query_only` + timeouts; Argon adversarial suite; optional least-privilege role; production connections are never writable by agents |
+| Migration diff engine produces wrong SQL (especially SQLite rebuilds) | Round-trip verification on a scratch copy before any migration is offered; v1 limited to tables/columns/FKs/indexes/uniques |
+| Two SQLite builds linked (`rusqlite` + `sqlx`) | Use `rusqlite` everywhere, `tokio-postgres` for Postgres, `libsql` remote-only |
 | Chrome blocks remote debugging on the default profile | Always use a dedicated `--user-data-dir` (we do anyway) |
 | Credentials inside sandboxes | Forward only the needed credential, scoped per VM; destroyed with the VM |
 
@@ -534,6 +634,7 @@ Atrium doesn't replace these. It keeps a **normalized copy** in its own store, p
 - Merge queue default: local fast-forward or PR + auto-merge?
 - Linear import in M6, or GitHub only at first?
 - Split panes / multiple threads visible at once: M2 or later?
+- Databases: MySQL and DuckDB after v1? SSH tunnels? Per-thread database copies by default?
 
 ## 8. Build orchestration (how we build Atrium with agents)
 
@@ -665,6 +766,7 @@ Model: <primary> · Reviewer: <other provider> · Depends on: <ids>
 | **M1 daemon + Home + attention** | Protocol, store schema, thread state machine, policy model | `atriumd`, store, `atrium-client`, lifecycle, policy engine | Tauri shell, tray, Home chat UI, inbox, approval queue, question forms | Adversarial tests for the hard-deny list and approval rules; socket permissions | Unit tests, docs, protocol TS generation checks | Gate review |
 | **M2 workspaces + done** | `atrium.toml` schema, checks/env contracts | `atrium-git` (worktrees, checkpoints), `atrium-env` (ports, setup), `atrium-checks` | Diff + inline comments, terminal, editor, review cards | ACP adapter for production | Risk-flag heuristics, check-output trimming, fixtures | n/a |
 | **M3 browser** | Browser MCP tool schemas | CDP backend: discovery, contexts, input, a11y snapshot | Screencast pane, take-over, preview/evidence UI | Isolation review (contexts, profiles, pipe) | Tool tests against local fixture pages | n/a |
+| **M3.5 databases** | Normalized schema model + `db_*` tool contracts | Drivers, introspection, statement classifier, staged-edit SQL generation, diff → migration engine | Query editor, table grid, ER diagram (ELK), design mode | Adversarial tests of read-only enforcement (side-effecting functions, `COPY`, writable CTEs, multi-statement tricks) | Fixture databases (SQLite + Postgres in Docker), round-trip migration tests, docs | Review of the migration engine's correctness |
 | **M4 sandbox** | Sandbox contracts, integration | Image builder, rootfs CoW | Sandbox UI, terminal | **libkrun FFI, `atrium-vmm`, `atrium-guest`, vsock, MCP shim** | Guest tests, docs | **Security review of sandbox + credentials** |
 | **M5 multi-agent** | Delegation/orchestrator design, budgets | Conflict radar, merge queue, rebase flow | Review/merge-queue UI, notes UI | Cross-review prompt + reviewer harness | Handoff templates, follow-up extraction | Gate review |
 | **M6 scale** | Scheduler contracts | Scheduler, rate-limit pausing, budgets, cron | Usage dashboard, backlog UI | Approval presets review | GitHub/Linear import, quick capture | n/a |
