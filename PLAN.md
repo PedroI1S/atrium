@@ -380,11 +380,12 @@ url     = "http://localhost:$PORT"
   - A left rail: Inbox (badge), Home, Workspaces → Threads/Backlog.
   - A main thread view: messages, tool calls, inline approvals and question forms.
   - A right panel with tabs: Review card, Diff, Browser, Terminal, Files, Editor, Checks, Database.
-  - Split panes come later.
+  - Split panes, saved layouts and theming: see 3.20.
 - **Libraries**:
   - CodeMirror 6 for the editor and for the diff/merge view (inline comments as decorations; they're sent back to the agent as a review message).
   - xterm.js with the WebGL addon for terminals.
   - Markdown rendered incrementally while it streams.
+  - Kobalte + Corvu primitives, solid-dnd, solid-virtual, Shiki, lucide (3.20).
 - **Keyboard-first**: a command palette, `⌘J` for the next item needing attention, quick thread switcher, global quick capture.
 - **Performance rules**: token streams are batched per animation frame, long transcripts are virtualized, and nothing heavy runs on the UI thread.
 
@@ -529,6 +530,51 @@ Recommended (optional): give agents a least-privilege Postgres role for their co
 
 **UI**: a **Database** tab in the workspace right panel, with sub-tabs Query / Tables / Diagram. Home lists connections across workspaces.
 
+### 3.20 Look & feel: theming, layout, customization
+
+Atrium has **its own design language**. Other tools (e.g. MonoCode) serve only as references for density and polish; nothing is copied. Everything visual is driven by tokens, so the look can change without code changes.
+
+**Window chrome (native feel)**
+- macOS:
+  - Tauri `titleBarStyle: "Overlay"` + `hiddenTitle` + custom `trafficLightPosition`, so the traffic lights sit inline with the tab strip. Drag regions use `data-tauri-drag-region`.
+  - Native blur via the `window-vibrancy` crate (`NSVisualEffectView`), with CSS `backdrop-filter` on panels.
+- Linux: client-side decorations with the same tab-strip header. Blur only where the compositor supports it; otherwise a solid-color fallback (decided by the M0 UI shell spike).
+
+**Design tokens**
+- Every color, radius, spacing step, shadow, font, font size, density and motion duration is a CSS custom property. Components never hard-code values.
+- Three layers:
+  1. *primitive* (palette, scales),
+  2. *semantic* (`--surface-1`, `--text-muted`, `--accent`, `--danger`, `--diff-add`, …),
+  3. *component* (`--tab-active-bg`, `--composer-radius`, …).
+- Contrast is checked against WCAG AA for every shipped theme (a CI check on the token files).
+
+**Themes**
+- A theme is a token file (`themes/<name>.toml`), loaded at runtime. Switching is instant, with no rebuild or reload. Atrium ships dark and light defaults plus a high-contrast variant, and can follow the system appearance.
+- **VS Code theme import**:
+  - UI colors are mapped from `colors` onto semantic tokens.
+  - Syntax colors come straight from `tokenColors` through **Shiki** (chat, markdown) and a CodeMirror theme generated from the same data (editor, diffs, query editor).
+  - Terminal colors come from `terminal.ansi*`.
+- **User overrides**: per-token overrides in settings, an accent color picker, and an escape hatch `~/.config/atrium/theme.css` (like Firefox's `userChrome.css`) for anything tokens don't cover. Atrium documents a set of stable `data-atrium-*` attributes and part names, so user CSS keeps working across updates.
+
+**Layout**
+- A panel system: the left sidebar, the tab strip with draggable tabs, **split panes** (e.g. chat next to a file preview, or two threads side by side), and a right panel (Explorer / Changes / History / Review / Browser / Terminal / Database). Any panel can be moved, resized, collapsed or popped out to its own window.
+- Layouts are saved per workspace, and there are **named presets**: *Default*, *Review* (diff large, chat narrow), *Focus* (chat only), *Browser* (pane large), *Data* (database tabs). Switch from the command palette.
+- **Density**: compact / comfortable. UI font, code font and size are configurable separately. Any spacing token can be scaled.
+
+**Keybindings**: `~/.config/atrium/keybindings.json`, with VS Code-style `when` contexts. Everything in the command palette can be bound.
+
+**Building blocks (SolidJS)**
+- Headless, accessible primitives: **Kobalte** (dialogs, menus, combobox/command palette, select, popover, tabs) and **Corvu** (resizable panels, drawers). Styling is entirely ours via tokens.
+- Other libraries:
+  - `@thisbeyond/solid-dnd` for tab and panel dragging
+  - `@tanstack/solid-virtual` for transcripts, file trees and grids
+  - `lucide-solid` icons + `material-icon-theme` file icons
+  - Shiki for highlighting
+  - incremental markdown with path → file-chip rendering (file-type icons on inline paths)
+- **Motion**: short, purposeful transitions (panel resize, streaming caret, inbox state changes), all disabled under `prefers-reduced-motion`.
+
+**Visual direction**: decided in the M0 UI shell spike, where 2–3 directions are built as live token sets on the same shell and Pedro picks one. The others ship as alternative themes.
+
 ## 4. Performance budgets (targets)
 
 - Cold start to interactive: < 400 ms (macOS, M-series); reconnecting to a running daemon with full state: < 100 ms.
@@ -548,6 +594,10 @@ Recommended (optional): give agents a least-privilege Postgres role for their co
 2. Daemon ↔ Tauri over a unix socket: streaming, reconnect with event replay, an agent surviving an app restart.
 3. CDP screencast into a Tauri canvas with input forwarding. Measure fps and latency on macOS *and* WebKitGTK/Linux.
 4. Tauri + Solid: stream 10k tokens per second through the client bridge without jank.
+5. **UI shell**: a clickable mock with dummy data. Overlay title bar + traffic lights, vibrancy, tab strip, resizable split panes, sidebar, right panel, composer, command palette.
+   - The token pipeline with runtime theme switching + one imported VS Code theme.
+   - **2–3 visual directions** as token sets on the same shell, for Pedro to choose.
+   - Measured on macOS and WebKitGTK/Linux: blur fallback, scroll/resize smoothness at 120 Hz, idle memory.
 
 **M1: Daemon + Home + attention**
 - Cargo workspace, protocol + TS generation, SQLite store, `atriumd` with its lifecycle (detached start, single instance, crash reaping, launchd/systemd option), `atrium-client`, Tauri shell, tray.
@@ -635,6 +685,7 @@ Recommended (optional): give agents a least-privilege Postgres role for their co
 - Linear import in M6, or GitHub only at first?
 - Split panes / multiple threads visible at once: M2 or later?
 - Databases: MySQL and DuckDB after v1? SSH tunnels? Per-thread database copies by default?
+- Visual direction: chosen from the 2–3 directions built in the M0 UI shell spike.
 
 ## 8. Build orchestration (how we build Atrium with agents)
 
@@ -762,7 +813,7 @@ Model: <primary> · Reviewer: <other provider> · Depends on: <ids>
 
 | Milestone | Opus 5.5 | Sol 6.1 | Sonnet 5.5 | Argon | 3.8 Flash | Astra |
 |---|---|---|---|---|---|---|
-| **M0 spikes** | Event enum and normalization; picks the winner of each spike | Codex app-server client; daemon socket + replay spike | Claude stream-json + control protocol; CDP screencast → canvas; streaming perf | `agy` stream-json client + ACP client | Recorded protocol transcripts as fixtures; spike reports | Review of the M0 findings and architecture |
+| **M0 spikes** | Event enum and normalization; picks the winner of each spike; token architecture for the UI shell | Codex app-server client; daemon socket + replay spike | Claude stream-json + control protocol; CDP screencast → canvas; streaming perf; **UI shell + visual directions** | `agy` stream-json client + ACP client | Recorded protocol transcripts as fixtures; spike reports | Review of the M0 findings and architecture |
 | **M1 daemon + Home + attention** | Protocol, store schema, thread state machine, policy model | `atriumd`, store, `atrium-client`, lifecycle, policy engine | Tauri shell, tray, Home chat UI, inbox, approval queue, question forms | Adversarial tests for the hard-deny list and approval rules; socket permissions | Unit tests, docs, protocol TS generation checks | Gate review |
 | **M2 workspaces + done** | `atrium.toml` schema, checks/env contracts | `atrium-git` (worktrees, checkpoints), `atrium-env` (ports, setup), `atrium-checks` | Diff + inline comments, terminal, editor, review cards | ACP adapter for production | Risk-flag heuristics, check-output trimming, fixtures | n/a |
 | **M3 browser** | Browser MCP tool schemas | CDP backend: discovery, contexts, input, a11y snapshot | Screencast pane, take-over, preview/evidence UI | Isolation review (contexts, profiles, pipe) | Tool tests against local fixture pages | n/a |
