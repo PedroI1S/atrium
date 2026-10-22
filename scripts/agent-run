@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Launch a headless worker for one task in its own worktree.
+#
+#   scripts/agent-run <codex|agy> <model> <task-id> <prompt-file>
+#
+# Claude workers (Sonnet/Opus) are launched as Claude Code subagents by the
+# orchestrator instead. Logs go to .orchestration/logs/<task-id>.* (git-ignored).
+# Verified launch flags: see PLAN.md §8.7.
+set -euo pipefail
+
+provider="$1" model="$2" task="$3" prompt_file="$4"
+root="$(git rev-parse --show-toplevel)"
+worktree="$(cd "$root/.." && pwd)/atrium-wt/$task"
+logs="$root/.orchestration/logs"
+mkdir -p "$logs"
+
+[[ -d "$worktree" ]] || { echo "worktree not found: $worktree" >&2; exit 1; }
+prompt="$(cat "$prompt_file")"
+
+case "$provider" in
+  codex)
+    # Codex's own sandbox confines writes to the worktree; network is needed
+    # for crate/npm downloads.
+    exec codex exec -m "$model" -C "$worktree" \
+      -s workspace-write -c sandbox_workspace_write.network_access=true \
+      --json -o "$logs/$task.last.md" "$prompt" \
+      > "$logs/$task.jsonl" 2> "$logs/$task.err" < /dev/null
+    ;;
+  agy)
+    # Headless agy can't prompt, and hook "allow" can't grant permissions, so
+    # permissions are skipped and .agents/hooks/agy_policy.py (PreToolUse,
+    # matcher "*") is the policy: it denies anything off the allowlist.
+    [[ -f "$worktree/.agents/hooks.json" ]] || { echo "missing agy policy hook in worktree" >&2; exit 1; }
+    cd "$worktree"
+    exec agy -p "$prompt" --model "$model" --mode accept-edits \
+      --dangerously-skip-permissions --output-format stream-json --print-timeout 0s \
+      > "$logs/$task.jsonl" 2> "$logs/$task.err" < /dev/null
+    ;;
+  *)
+    echo "unknown provider: $provider (claude workers run as subagents)" >&2
+    exit 2
+    ;;
+esac

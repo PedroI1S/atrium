@@ -25,4 +25,4 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 - Task IDs: `M<milestone>-<nn>-<slug>`, e.g. `M0-01-codex-client`.
 - Branches: `agent/<model>/<task-id>`, e.g. `agent/sol/M0-01-codex-client`.
 - Worktrees: `../atrium-wt/<task-id>`.
-- Logs (git-ignored): `.agents/logs/<task-id>.jsonl`.
+- Logs (git-ignored): `.orchestration/logs/<task-id>.jsonl`.

@@ -141,7 +141,9 @@ trait AgentAdapter {
 - **Antigravity (`agy`)**: Google's agent CLI, which runs the Gemini models (Argon, 3.8 Flash).
   - Spawn `agy -p --input-format stream-json --output-format stream-json --model <id> --effort <level>`.
   - Permission modes: `--mode accept-edits|auto|plan`. Resume: `--conversation <id>`.
-  - **Spike (M0)**: map its stream-json events (possibly close to Claude's), find out whether permission requests can be answered from the host, and how to inject MCP servers per session. `agy mcp` manages servers globally, so per-session scoping may need a generated config.
+  - **Approvals (found in the M0-00 smoke test)**: headless `agy` can't prompt and ignores hook `allow` grants, but enforces hook `deny`. So Atrium runs `agy` with `--dangerously-skip-permissions` plus a `PreToolUse` hook (matcher `"*"`) that calls back into `atriumd`'s policy engine over the socket: `allow`/`deny` per call, and `ask` becomes "deny + inbox approval + retry". Re-test with each `agy` release; a native host-approval channel would replace this.
+  - Event stream: NDJSON with `event: init | step_update | result`. `step_update` carries `tool_name`, `state` (ACTIVE/DONE/ERROR), parameters and errors; `result` carries the response, usage and `denied_actions`.
+  - **Spike (M0)**: per-session MCP injection (`agy mcp` manages servers globally, so per-session scoping may need a generated config), and the `--input-format stream-json` multi-turn mode.
 - **ACP**: the `agent-client-protocol` crate (Zed). One adapter covers OpenCode, Goose, etc. MCP servers are passed in `session/new`.
 - **Skills / native config**: we never rewrite prompts. Agents load their own `CLAUDE.md` / `AGENTS.md` / skills from the cwd and home dir as usual. Atrium only *adds* MCP tools and sends ordinary user messages (review comments, check failures, handoff requests).
 - **Fallback if Claude's stream-json control protocol proves brittle**: use `claude-code-acp` through the ACP adapter (costs a Node dependency).
@@ -477,7 +479,7 @@ escalate_across_providers = true
 | Risk | Mitigation |
 |---|---|
 | Claude CLI's stream-json control protocol is not a stable public API | Pin versions, add contract tests, fall back to `claude-code-acp` via ACP |
-| `agy` stream-json format, permission handling and per-session MCP are undocumented | Spike in M0 with recorded transcripts as fixtures; pin the `agy` version; if host-side approvals aren't possible, run `agy` threads in `accept-edits`/`plan` modes or inside the sandbox |
+| `agy` stream-json format and per-session MCP are undocumented; approvals depend on skip-permissions + a deny-enforcing hook | Recorded transcripts as fixtures; pin the `agy` version; contract test that hook `deny` is still enforced under skip-permissions (if a release breaks it, `agy` threads only run inside the sandbox) |
 | Provider terms for third-party clients using subscription logins | Check each provider's current terms before relying on subscription auth; API keys are supported as a fallback |
 | Daemon lifecycle: orphaned agents/browsers/VMs, version skew between app and daemon | PID tracking + reaping, single-instance lock, protocol version handshake, hand over to the new daemon only when idle |
 | Runaway cost from auto-fix loops, delegation trees and auto-review | Attempt caps, a delegation depth limit, per-thread budgets, reviewer acceptance-rate tracking |
@@ -658,15 +660,26 @@ Until Atrium can build itself, the orchestrator is a **Claude Code session on Op
 
 **How each model is launched** (all in the background, all in their own worktree under `../atrium-wt/<id>`):
 
-| Model | Launch |
+| Model | Launch (verified 2026-10-22 smoke test, task `M0-00`) |
 |---|---|
 | Sonnet 5.5 / Opus 5.5 | Claude Code subagent (`Agent`, model `sonnet`/`opus`, background), told to work only in its worktree path |
-| GPT-6.1 Sol / GPT-6 Astra | `codex exec -m <model> -C <worktree> -s workspace-write --json -o <last.md> "<prompt>" > .agents/logs/<id>.jsonl` |
-| Gemini 4 Argon / 3.8 Flash | `agy -p "<prompt>" --model gemini-4-argon-high --mode <mode> --output-format stream-json > .agents/logs/<id>.jsonl`, run with cwd = worktree |
+| GPT-6.1 Sol / GPT-6 Astra | `scripts/agent-run codex <model> <id> <prompt-file>` runs `codex exec -m <model> -C <worktree> -s workspace-write -c sandbox_workspace_write.network_access=true --json -o <last.md>` |
+| Gemini 4 Argon / 3.8 Flash | `scripts/agent-run agy <model> <id> <prompt-file>` runs `agy -p --model <model> --mode accept-edits --dangerously-skip-permissions --output-format stream-json` with cwd = worktree, **guarded by the policy hook** |
 
-Calibrate in M0, before the first real dispatch:
-- Which `agy --mode` lets a worker run `cargo test` headless without `--dangerously-skip-permissions`.
-- Whether Codex's `workspace-write` sandbox needs network enabled (`-c sandbox_workspace_write.network_access=true`) for crate downloads.
+**Smoke-test findings:**
+- **Claude subagent:** works as-is.
+- **Codex:** `workspace-write` blocks network by default, so `cargo search` failed until `network_access=true` was set. Codex's sandbox still confines writes to the worktree. Pass `< /dev/null`, or Codex waits for extra stdin.
+- **`agy` 1.4.5:**
+  - Headless mode auto-denies every command that would need a prompt.
+  - A `PreToolUse` hook returning `allow`, even with `permissionOverrides`, does **not** grant it.
+  - Project `.agents/settings.json` permissions aren't read; only the user-level `~/.gemini/config/config.json` is.
+  - A hook **`deny` is enforced even under `--dangerously-skip-permissions`**. So `agy` workers skip permissions, and `.agents/hooks/agy_policy.py` (matcher `"*"`) is the policy. It fails closed:
+    - shell commands on an allowlist,
+    - git only on the worker's own branch,
+    - file tools only inside the worktree,
+    - browser/MCP/subagent/scheduling tools denied.
+  - Some tool names used at runtime (`write_file`) aren't in the advertised tool list. The policy logs denials, so new names surface quickly.
+- **`.agents/` belongs to `agy`** (its project customization root). Orchestration logs live in `.orchestration/` instead.
 
 **The task loop:**
 
@@ -687,7 +700,7 @@ Calibrate in M0, before the first real dispatch:
 **Guardrails:**
 - Concurrency limits from 8.4 (≤ 6 workers at once).
 - Astra launches and security-sensitive tasks need Pedro's OK first.
-- `.agents/logs/` is git-ignored.
+- `.orchestration/logs/` is git-ignored.
 - **Context hygiene**: the orchestrator reads handoffs and check results, not full transcripts. It opens logs only when debugging a failure.
 - **Session rotation**: at milestone boundaries, a fresh orchestrator session starts from `PLAN.md` + `docs/agents/`, so nothing depends on chat history.
 - **Multi-agent workflows (optional)**: Claude Code's Workflow tool can run fixed fan-out pipelines, like the M0 calibration bake-off. It only runs when Pedro explicitly asks for a workflow.

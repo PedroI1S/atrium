@@ -1,0 +1,16 @@
+{
+  "atrium-worker-policy": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$(git rev-parse --show-toplevel)/.agents/hooks/agy_policy.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

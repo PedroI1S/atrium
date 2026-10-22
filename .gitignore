@@ -8,8 +8,7 @@ dist/
 .vite/
 
 # Agent orchestration
-/.agents/logs/
-/.agents/tmp/
+/.orchestration/
 
 # OS / editors
 .DS_Store
