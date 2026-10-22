@@ -161,6 +161,7 @@ trait AgentAdapter {
   - SQLite (rusqlite, WAL). There is an append-only `events` table per thread, and projections (threads, turns, approvals, tasks, rules, leases) are updated in the same transaction.
   - Commands go through a single writer task.
   - FTS5 indexes messages, notes and branches.
+  - Import, export, retention and backup of chat histories: see 3.18.
 - **Protocol**: `atrium-protocol` types are exported to TS with `tauri-specta`. The daemon socket carries them; inside the app, `atrium-client` forwards streams to the webview via `tauri::ipc::Channel` with binary payloads.
 
 ### 3.4 Attention inbox and notifications (`attention`)
@@ -409,6 +410,33 @@ escalate_across_providers = true
 - A task kind comes from the backlog label, the delegating agent's hint, or a cheap classification by the utility model. You can always override it.
 - The routing scoreboard (pass rate, review findings, cost per model × task kind) is collected automatically from thread outcomes. It powers suggestions like "Sol has passed 9 of 10 backend tasks; Sonnet 6 of 10".
 
+### 3.18 Chat history: import, export, retention
+
+Every provider already keeps its own transcripts:
+- Claude Code: `~/.claude/projects/<project>/<session>.jsonl`, plus `subagents/`
+- Codex: `~/.codex/sessions/…` rollouts
+- `agy`: `~/.gemini/antigravity-cli/conversations/*.db` + `brain/<id>/…/transcript_full.jsonl`
+- MonoCode: `monocode.db`
+
+Atrium doesn't replace these. It keeps a **normalized copy** in its own store, plus the native session ID so any thread can be resumed in its own CLI.
+
+- **Source of truth**: the per-thread append-only `events` table (3.3). Each thread records `{provider, native_session_id, native_path}`, so Atrium can always point back to the original transcript.
+- **Import** (read-only, never modifies the source):
+  - Importers for Claude Code, Codex, `agy` and MonoCode histories. They map native records into the same event enum as the live adapters (3.2) and reuse their parsers and recorded fixtures.
+  - Imported threads appear under Home or under the workspace that matches their cwd, marked "imported". Re-imports are idempotent (keyed by native session ID and record offset).
+  - First-run offer: "Import your existing conversations?", per provider, with a preview of the count and size.
+  - The Atrium **build archive** (8.7) uses the same format, so Atrium's own construction history imports at graduation.
+- **Export**: a thread or workspace to Markdown (readable, with tool calls collapsed) or JSONL (lossless events + manifest). Redaction runs first (below).
+- **Search**: FTS5 over messages, tool calls, notes and handoffs, across live and imported threads (the full UI comes in M7).
+- **Retention**: per-workspace policy, keep forever (default) / N days / archive only.
+  - Archived threads keep their handoff and summary but drop bulky tool output: large tool results go into a content-addressed blob store (zstd), which can be pruned.
+  - **Delete** removes Atrium's copy and, optionally, the provider's native copy, with confirmation and the paths shown.
+- **Redaction**: a secret scanner (API-key formats, tokens, `.env` values, private keys) runs on export, before any remote sync, and on demand. Matches are replaced with typed placeholders, and the originals are never written to export files.
+- **Backup**:
+  - The SQLite DB is snapshotted with `VACUUM INTO` on a schedule (default daily, keep 7) into Atrium's data dir. It's covered by Time Machine or a backup tool of your choice.
+  - "Restore from snapshot" is in settings.
+- **Privacy**: everything stays local. Nothing is uploaded unless you explicitly export or enable remote access.
+
 ## 4. Performance budgets (targets)
 
 - Cold start to interactive: < 400 ms (macOS, M-series); reconnecting to a running daemon with full state: < 100 ms.
@@ -433,6 +461,7 @@ escalate_across_providers = true
 - Home chat with Claude Code and Codex, the read-only + approval policy, resume.
 - Thread state machine, inbox v1, approval queue, question forms, native notifications, `⌘J`.
 - Approval rules ("always…") and the hard-deny list.
+- History basics: native session IDs on every thread, export to Markdown/JSONL, daily DB snapshots.
 
 **M2: Workspaces + definition of done**
 - Add folder(s) and threads, a worktree per thread, checkpoints and revert.
@@ -440,6 +469,7 @@ escalate_across_providers = true
 - Checks: `atrium.toml`, the automatic runner, the auto-fix loop, `checks_*` MCP tools, review cards with risk flags, "unverified" labelling.
 - Diff view with inline comments, terminal, editor.
 - Commit/push/PR through `gh`. ACP adapter.
+- History import: Claude Code, Codex, `agy` and MonoCode importers, and the build archive (8.7) at graduation.
 
 **M3: Browser**
 - Discovery and settings, per-thread contexts, the screencast pane with take-over, the browser MCP tools.
@@ -464,6 +494,7 @@ escalate_across_providers = true
 - Scheduled runs.
 - Approval presets per workspace.
 - Model routing (3.17): `[routing]` config, task-kind classification, escalation ladder, automatic routing scoreboard.
+- History retention policies, blob pruning, the secret scanner/redaction, delete-with-native-copy.
 
 **M7: Extras**
 - Search across threads (FTS5), timeline/replay of tool calls per thread.
@@ -693,9 +724,33 @@ Until Atrium can build itself, the orchestrator is a **Claude Code session on Op
    - A reviewer from another provider runs read-only in the worktree (Codex `-s read-only`, `agy --mode plan`, or a Claude subagent told not to edit) and writes `docs/agents/reviews/<id>.md`.
    - The orchestrator filters its comments. The accepted ones go back to the author.
 8. **Merge**:
-   - The orchestrator runs the merge queue: rebase in dependency order, full checks on `main`, merge, `git worktree remove`.
+   - The orchestrator runs the merge queue: rebase in dependency order, full checks on `main`, merge, archive the task's transcripts (below), `git worktree remove`.
    - Workers never merge or push. Pushing to a remote needs Pedro.
 9. **Status board**: the orchestrator keeps `docs/agents/status.md` up to date (task, model, state, worktree, log). Pedro can check it any time, or open a worktree in MonoCode to watch.
+
+**Chat histories during the build** (two tiers):
+
+| Tier | Where | What | Who reads it |
+|---|---|---|---|
+| **1. Curated, in git** | `docs/agents/` | briefs, handoffs, reviews, decisions, **session logs** | Everyone; the orchestrator starts each session here |
+| **2. Raw archive, local only** | `.orchestration/archive/<task-id>/` (git-ignored) | every transcript for a task + manifest | Debugging, audits, resuming, and the Atrium import at graduation |
+
+- **Session logs**: at the end of every orchestrator session (and at each milestone gate), the orchestrator writes `docs/agents/sessions/<date>-<n>.md`. It covers what was dispatched, decided, escalated and left open, with links to the briefs and handoffs. A new orchestrator session reads the latest log, `status.md` and `decisions.md` before anything else.
+- **Archiving a task** (step 8 of the task loop, after merge or abandonment): collect every transcript the task produced from its native location:
+
+  | Source | Native location |
+  |---|---|
+  | Claude subagent | `~/.claude/projects/<project>/<session>/subagents/` |
+  | Codex | `.orchestration/logs/<task>.jsonl` and its `~/.codex/sessions` rollout |
+  | `agy` | `.orchestration/logs/<task>.jsonl` and `~/.gemini/antigravity-cli/brain/<id>/…/transcript_full.jsonl` |
+
+  This includes reviewer and escalation sessions as well as the worker.
+  1. Compress them with zstd into `.orchestration/archive/<task-id>/`.
+  2. Write `manifest.json` with one entry per session (role, model, provider, native session ID for resuming, start/end, tokens, cost, exit status), plus the check outputs and the merge commit.
+- **Orchestrator sessions** are archived the same way under `.orchestration/archive/_orchestrator/<session-id>/` at rotation.
+- **Never in git**: raw transcripts can contain env values, file contents or tokens, and the repo may go public. Only the curated tier 1 is committed. Anything leaving the machine goes through redaction first (3.18).
+- **Backup**: `~/Documents` is covered by Time Machine, which includes the archive. The provider-native stores stay where they are; the archive is our copy, so tool cleanups or format changes don't lose history.
+- **Graduation**: at M2, Atrium's importer reads `.orchestration/archive/` (same manifest format), so Atrium's own build history becomes searchable inside Atrium.
 
 **Guardrails:**
 - Concurrency limits from 8.4 (≤ 6 workers at once).

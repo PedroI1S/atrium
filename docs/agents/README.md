@@ -11,6 +11,7 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 | `change-requests.md` | Workers (append) | Requests to change a frozen contract |
 | `routing.md` | Orchestrator | Scoreboard per model × task type |
 | `status.md` | Orchestrator | Live board of all tasks |
+| `sessions/<date>-<n>.md` | Orchestrator | Log of each orchestrator session: dispatched, decided, escalated, open. Read first by a fresh session. |
 
 ## Rules for workers
 
@@ -26,3 +27,4 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 - Branches: `agent/<model>/<task-id>`, e.g. `agent/sol/M0-01-codex-client`.
 - Worktrees: `../atrium-wt/<task-id>`.
 - Logs (git-ignored): `.orchestration/logs/<task-id>.jsonl`.
+- Raw transcript archive (git-ignored, never committed): `.orchestration/archive/<task-id>/` with `manifest.json`. See PLAN §8.7.
