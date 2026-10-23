@@ -879,7 +879,7 @@ Until Atrium can build itself, the orchestrator is a **Claude Code session on Op
 8. **Merge**:
    - The orchestrator runs the merge queue: rebase in dependency order, full checks on `main`, merge, archive the task's transcripts (below), `git worktree remove`.
    - Workers never merge or push.
-   - **Push policy (D-005)**: plan and doc changes (`PLAN.md`, `docs/`) are pushed to `origin` right away. Code reaches `origin` only at milestone gates, after Pedro signs off; until then, merged code stays on local `main`.
+   - **Push policy (D-005)**: plan, docs and orchestration tooling (`PLAN.md`, `docs/`, `scripts/`, `.gitignore`, agent config) are pushed to `origin` right away. Atrium's own code (`crates/`, `app/`, `images/`, …) reaches `origin` only at milestone gates, after Pedro signs off; until then, merged code stays on local `main`.
 9. **Status board**: the orchestrator keeps `docs/agents/status.md` up to date (task, model, state, worktree, log). Pedro can check it any time, or open a worktree in MonoCode to watch.
 
 **Chat histories during the build** (two tiers):
