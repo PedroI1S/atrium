@@ -857,7 +857,7 @@ Until Atrium can build itself, the orchestrator is a **Claude Code session on Op
   - Headless mode auto-denies every command that would need a prompt.
   - A `PreToolUse` hook returning `allow`, even with `permissionOverrides`, does **not** grant it.
   - Project `.agents/settings.json` permissions aren't read; only the user-level `~/.gemini/config/config.json` is.
-  - A hook **`deny` is enforced even under `--dangerously-skip-permissions`**. So `agy` workers skip permissions, and `.agents/hooks/agy_policy.py` (matcher `"*"`) is the policy. It fails closed:
+  - A hook **`deny` is enforced even under `--dangerously-skip-permissions`**. So `agy` workers skip permissions, and `scripts/agy-policy.py` (matcher `"*"`) is the policy. `scripts/agent-run` installs it **only into each worker's worktree** (`.agents/hooks.json`, git-ignored, using absolute paths), never into the main checkout, so Pedro's own `agy` sessions are unaffected (D-006). It fails closed:
     - shell commands on an allowlist,
     - git only on the worker's own branch,
     - file tools only inside the worktree,

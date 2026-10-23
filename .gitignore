@@ -8,6 +8,7 @@ dist/
 .vite/
 
 # Agent orchestration
+/.agents/hooks.json
 /.orchestration/
 
 # OS / editors

@@ -28,9 +28,26 @@ case "$provider" in
     ;;
   agy)
     # Headless agy can't prompt, and hook "allow" can't grant permissions, so
-    # permissions are skipped and .agents/hooks/agy_policy.py (PreToolUse,
-    # matcher "*") is the policy: it denies anything off the allowlist.
-    [[ -f "$worktree/.agents/hooks.json" ]] || { echo "missing agy policy hook in worktree" >&2; exit 1; }
+    # permissions are skipped and scripts/agy-policy.py (PreToolUse, matcher
+    # "*") is the policy: it denies anything off the allowlist. The hook is
+    # installed only into this worker's worktree (git-ignored), never into the
+    # main checkout, and points at the policy by absolute path.
+    python="$(command -v python3)"
+    mkdir -p "$worktree/.agents"
+    cat > "$worktree/.agents/hooks.json" <<JSON
+{
+  "atrium-worker-policy": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "'$python' -I '$root/scripts/agy-policy.py'", "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}
+JSON
     cd "$worktree"
     exec agy -p "$prompt" --model "$model" --mode accept-edits \
       --dangerously-skip-permissions --output-format stream-json --print-timeout 0s \

@@ -10,6 +10,11 @@ enforced even under skip-permissions).
 This is a guardrail against mistakes, not a security boundary: cargo build
 scripts and package.json scripts can still run arbitrary code.
 
+Scope: the hook is NOT committed to the repo's .agents/ (that would apply it
+to Pedro's own agy sessions). scripts/agent-run writes .agents/hooks.json
+(git-ignored) into each worker worktree at launch, pointing at this file in
+the main checkout by absolute path, so workers can't edit their own policy.
+
 Contract: JSON on stdin ({"toolCall": {"name", "args": {"CommandLine"}}, ...}),
 JSON on stdout ({"decision": "allow"|"deny", "reason": ...}).
 """
@@ -41,6 +46,7 @@ DENY_PATTERNS = [
     (r"\b(pnpm|npm)\s+(dlx|exec)\b", "running arbitrary packages is not allowed"),
     (r"\$\(|`", "command substitution is not allowed"),
     (r"\.\./", "paths outside the worktree are not allowed"),
+    (r"(^|[\s/])\.agents(/|\s|$)", "workers may not touch .agents/ (agent configuration and policy)"),
 ]
 
 
@@ -124,8 +130,17 @@ def strings(value):
             yield from strings(v)
 
 
-def check_paths(args: dict, roots: list[str]) -> tuple[str, str]:
+# File tools that modify files; these may not touch the agent config dir.
+WRITE_TOOLS = {
+    "write_to_file", "replace_file_content", "multi_replace_file_content", "sed_file",
+    "notebook_edit", "write_file", "edit_file", "create_file",
+}
+
+
+def check_paths(args: dict, roots: list[str], writing: bool = False) -> tuple[str, str]:
     for value in strings(args):
+        if writing and (value.startswith(".agents") or "/.agents/" in value or value.endswith("/.agents")):
+            return "deny", "workers may not modify .agents/ (agent configuration and policy)"
         if value.startswith("~") or "../" in value:
             return "deny", f"path outside the worktree: {value}"
         if value.startswith("/") and not inside(value, roots):
@@ -142,7 +157,7 @@ def main() -> None:
         print(json.dumps({"decision": "allow"}))
         return
     if name in FILE_TOOLS:
-        decision, reason = check_paths(call.get("args", {}), roots)
+        decision, reason = check_paths(call.get("args", {}), roots, writing=name in WRITE_TOOLS)
         print(json.dumps({"decision": decision, "reason": reason}))
         return
     if name != "run_command":
