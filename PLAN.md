@@ -999,7 +999,7 @@ Until Atrium can build itself, the orchestrator is a **Claude Code session on Op
 8. **Merge**:
    - The orchestrator runs the merge queue: rebase in dependency order, full checks on `main`, merge, archive the task's transcripts (below), `git worktree remove`.
    - Workers never merge or push.
-   - **Push policy (D-005)**: plan, docs and orchestration tooling (`PLAN.md`, `docs/`, `scripts/`, `.gitignore`, agent config) are pushed to `origin` right away. Atrium's own code (`crates/`, `app/`, `images/`, …) reaches `origin` only at milestone gates, after Pedro signs off; until then, merged code stays on local `main`.
+   - **Push policy (D-005, D-007)**: all work happens on the `dev` branch. Plan, docs and orchestration tooling are pushed to `dev` right away. Merged Atrium code is pushed to `dev` at every handoff (8.9). `main` moves only at milestone gates, after sign-off (a merge of `dev`).
 9. **Status board**: the orchestrator keeps `docs/agents/status.md` up to date (task, model, state, worktree, log). Pedro can check it any time, or open a worktree in MonoCode to watch.
 
 **Chat histories during the build** (two tiers):
@@ -1040,9 +1040,32 @@ Until Atrium can build itself, the orchestrator is a **Claude Code session on Op
 
 **Graduation**: once Atrium M2 works (workspaces, checks, inbox), the project moves into Atrium, which then builds itself. Every friction point from this phase becomes an Atrium backlog task. One example: reading only the last few exchanges of a worker is why Atrium's `thread_status` returns the handoff + checks + diff summary.
 
+### 8.9 Two drivers: handoffs and checkpoints
+
+Pedro and a partner build Atrium **in turns, never at the same time**. Whoever is working is the *driver*: they run their own orchestrator (Claude Code on their machine), dispatch workers and merge. The full protocol is in `docs/agents/HANDOFF.md`. In short:
+
+- **Branches**: `dev` is the shared working branch. Everything a driver does lands there and is pushed by the end of the shift. `main` only moves at milestone gates. Worker branches (`agent/*`) are pushed at handoff if their task is still in flight.
+- **The baton**: `docs/agents/DRIVER.md` on `dev` records who is driving. `scripts/handoff start` claims it after syncing, and refuses if the other person is still active. It then prints:
+  - the last session log's `## Next`,
+  - all commits since the last handoff,
+  - the status board,
+  - the in-flight branches.
+
+  `scripts/handoff end` checks that the shift is safe to hand over, then frees the baton:
+  - no headless workers running,
+  - every worktree committed and its branch pushed,
+  - a session log committed this shift.
+
+  It then tags `handoff/<date>-<driver>` and pushes. The tags are the **checkpoints**: `git log handoff/<tag>..dev` shows exactly what the other person did.
+- **Never hand off with a worker running.** Native agent sessions can't be resumed on the other machine. An interrupted task gets a `partial` handoff note and a WIP commit on its branch, and the next driver dispatches a fresh worker from there.
+- **Shared rules live in the repo**: `CLAUDE.md` (orchestrator sessions) and `AGENTS.md` (Codex/`agy` workers), not in Claude Code memory, which is per machine.
+- **Machine-local things**: worktrees, raw transcripts, agent CLI logins, and the generated `agy` hook. These are per machine and are recreated or kept locally. `scripts/doctor` checks a machine's tools, GitHub access and the `agy` policy self-test.
+- **Authority**: either driver can approve contracts, give a phase go and sign off a gate. Each decision is recorded with who made it. Changes to security/approval defaults need both people.
+- **Records carry the driver's name**: status board owner column, session logs, decisions, and archive manifests (with the machine that holds the raw transcripts).
+
 ### 8.8 Your role (Pedro)
 
 - Approve contracts at the start of each milestone.
-- Sign off at each gate (demo + review). Sign-off is also what lets that milestone's code be pushed to GitHub.
+- Sign off at each gate (demo + review). Sign-off is what moves `main` (a merge of `dev`). The same applies to the partner when they're the driver (8.9).
 - Decide open questions and anything that changes security or approval defaults.
 - Everything else reaches you through the handoffs/inbox, and only when it needs you.

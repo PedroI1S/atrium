@@ -11,6 +11,8 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 | `change-requests.md` | Workers (append) | Requests to change a frozen contract |
 | `routing.md` | Orchestrator | Scoreboard per model × task type |
 | `status.md` | Orchestrator | Live board of all tasks |
+| `DRIVER.md` | `scripts/handoff` | The baton: who is driving right now (8.9) |
+| `HANDOFF.md` | — | Two-person handoff protocol and end-of-shift checklist |
 | `sessions/<date>-<n>.md` | Orchestrator | Log of each orchestrator session: dispatched, decided, escalated, open. Read first by a fresh session. |
 
 ## Rules for workers

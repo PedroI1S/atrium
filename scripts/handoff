@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Two-person handoff for building Atrium (PLAN.md §8.9, docs/agents/HANDOFF.md).
+#
+#   scripts/handoff start [--force]   take the baton: sync `dev`, claim DRIVER.md, show what changed
+#   scripts/handoff end               hand it back: check nothing is running or unpushed, tag, push
+#   scripts/handoff status            who is driving + the status board
+#
+# Only one person drives at a time. The baton is docs/agents/DRIVER.md on the
+# `dev` branch; `main` only moves at milestone gates.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+branch=dev
+driver_file=docs/agents/DRIVER.md
+me="$(git config user.name)"
+slug="$(printf '%s' "$me" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
+now="$(date -u +%Y-%m-%dT%H:%MZ)"
+stamp="$(date -u +%Y%m%d-%H%M)"
+
+die() { echo "handoff: $*" >&2; exit 1; }
+field() { sed -n "s/^$1: //p" "$driver_file"; }
+
+write_driver() { # <state> <driver>
+  cat > "$driver_file" <<EOF
+# Driver baton
+
+Only one person drives at a time: runs the orchestrator, dispatches workers, merges.
+Managed by \`scripts/handoff\`. Don't edit by hand.
+
+state: $1
+driver: $2
+since: $now
+machine: $(hostname -s)
+EOF
+}
+
+sync_dev() {
+  git fetch -q origin
+  if git show-ref -q --verify "refs/heads/$branch"; then
+    git switch -q "$branch"
+  else
+    git switch -q -c "$branch" --track "origin/$branch"
+  fi
+  git pull -q --ff-only origin "$branch"
+}
+
+latest_log() { ls docs/agents/sessions/*.md 2>/dev/null | sort | tail -1; }
+
+case "${1:-status}" in
+  start)
+    [[ -z "$(git status --porcelain)" ]] || die "working tree not clean; commit or stash first"
+    sync_dev
+    state="$(field state)"
+    current="$(field driver)"
+    if [[ "$state" == active && "$current" != "$me" && "${2:-}" != --force ]]; then
+      die "$current is still driving (since $(field since), on $(field machine)). Ask them to run 'scripts/handoff end', or pass --force if you're sure they've stopped."
+    fi
+    previous="$(git describe --tags --abbrev=0 --match 'handoff/*' 2>/dev/null || true)"
+    write_driver active "$me"
+    git add "$driver_file"
+    git commit -q -m "handoff: $me takes over"
+    git tag "shift/$stamp-$slug"
+    git push -q origin "$branch" "shift/$stamp-$slug"
+
+    echo "You're driving now ($me). Before anything else:"
+    log="$(latest_log)"
+    if [[ -n "$log" ]]; then
+      echo
+      echo "== Next steps from the last session log ($log)"
+      awk '/^## (Next|Open \/ next)/{on=1; next} /^## /{on=0} on' "$log"
+    fi
+    if [[ -n "$previous" ]]; then
+      echo "== Commits since the last handoff ($previous)"
+      git log --oneline "$previous..HEAD~1"
+      echo
+    fi
+    echo "== Status board"
+    sed -n '/^|/p' docs/agents/status.md
+    echo
+    echo "== In-flight worker branches on origin"
+    git branch -r --list 'origin/agent/*' | sed 's/^ */  /' || true
+    echo "   (recreate a worktree: git worktree add ../atrium-wt/<task-id> <branch-without-origin/>)"
+    echo
+    echo "Also read docs/agents/decisions.md and docs/agents/change-requests.md if they changed above."
+    ;;
+
+  end)
+    [[ "$(git branch --show-current)" == "$branch" ]] || die "switch to $branch first"
+    [[ "$(field state)" == active && "$(field driver)" == "$me" ]] || die "you are not the active driver (see $driver_file)"
+    if pgrep -fl 'codex exec|agy -p' >/dev/null 2>&1; then
+      pgrep -fl 'codex exec|agy -p' >&2
+      die "headless workers are still running. Let them finish, or stop them and record a 'partial' handoff."
+    fi
+    # Every worker worktree must be committed, and its branch pushed, so the next driver can continue.
+    while IFS= read -r wt; do
+      [[ -n "$(git -C "$wt" status --porcelain)" ]] && die "uncommitted work in $wt. Commit it on its branch (WIP is fine) or discard it."
+      b="$(git -C "$wt" branch --show-current)"
+      git push -q -u origin "$b"
+      echo "pushed $b"
+    done < <(git worktree list --porcelain | sed -n 's/^worktree //p' | grep '/atrium-wt/' || true)
+    shift_tag="$(git describe --tags --abbrev=0 --match "shift/*-$slug" 2>/dev/null)" || die "no shift tag found; did you run 'scripts/handoff start'?"
+    git log --oneline "$shift_tag..HEAD" -- docs/agents/sessions | grep -q . ||
+      die "write your session log in docs/agents/sessions/ (starting with a '## Next' section) and commit it first"
+    [[ -z "$(git status --porcelain)" ]] || die "working tree not clean; commit your remaining changes first"
+    write_driver free "$me"
+    git add "$driver_file"
+    git commit -q -m "handoff: $me hands off"
+    git tag "handoff/$stamp-$slug"
+    git push -q origin "$branch" "handoff/$stamp-$slug"
+    echo "Handed off. Tag: handoff/$stamp-$slug. The next driver runs 'scripts/handoff start'."
+    echo "Reminder: Claude subagents can't be detected by this script. Make sure none are still running."
+    ;;
+
+  status)
+    git fetch -q origin 2>/dev/null || true
+    git show "origin/$branch:$driver_file" 2>/dev/null | sed -n '/^state:/,$p' || sed -n '/^state:/,$p' "$driver_file"
+    echo
+    sed -n '/^|/p' docs/agents/status.md
+    ;;
+
+  *)
+    die "usage: scripts/handoff start [--force] | end | status"
+    ;;
+esac

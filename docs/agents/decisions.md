@@ -24,3 +24,10 @@ Remote: `github.com/PedroI1S/atrium` (private). Plan and doc changes (`PLAN.md`,
 - The policy moved to `scripts/agy-policy.py` and is no longer committed as a hook.
 - `scripts/agent-run` writes `.agents/hooks.json` (git-ignored) into each worker worktree at launch, with absolute paths to `python3` and the policy, so it doesn't depend on the working directory.
 - The policy now denies any worker write to `.agents/`, so workers can't edit their own hook. The policy file itself lives in the main checkout, outside the worker's worktree.
+
+## D-007 — 2026-10-24 — Two drivers, `dev` branch, handoff checkpoints
+Pedro builds Atrium with a partner, in turns, never at the same time. **Requested by Pedro.**
+- All work happens on `dev`. Docs and tooling are pushed right away; merged code is pushed at every handoff. `main` moves only at milestone gates. This amends D-005, where merged code would otherwise stay on one machine.
+- `docs/agents/DRIVER.md` is the baton, managed by `scripts/handoff start|end|status`. `handoff/<date>-<driver>` tags are the checkpoints.
+- Rules are shared through `CLAUDE.md` / `AGENTS.md`, not machine-local memory. `scripts/doctor` checks a machine.
+- Either driver can approve contracts, phase gos and gates; security/approval default changes need both.
