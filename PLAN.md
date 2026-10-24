@@ -32,6 +32,7 @@ A fast, lightweight agent development environment written in Rust. It wraps the 
 | Workspace | Worktree per thread with a ready-to-use environment (env files, setup, ports, preview), checkpoints/revert, checks, terminal, editor, diff review with inline comments |
 | Multi-agent | Attention inbox, definition of done + automatic checks, conflict radar + merge queue, delegation + cross-provider review, shared notes + handoffs, backlog/queue/schedules, concurrency and rate-limit management, approval rules |
 | Audience | Personal first, kept clean enough to open-source later |
+| Editor completion | Optional inline FIM ghost text, manual by default, opt-in per workspace; the one place `atriumd` calls a model API directly (local Ollama or FIM endpoints); never blocks typing (3.21) |
 | Databases | SQLite/libSQL + PostgreSQL: query editor, drawDB-style schema diagram with design → migration, Drizzle Studio-style table view with staged edits; agents get read-only `db_*` tools, writes go through approvals (3.19) |
 | Build team | Opus 5.5 orchestrates; Sol 6.1 (backend), Sonnet 5.5 (frontend), Argon (systems/security), 3.8 Flash (utility), Astra (gates/escalation). Cross-provider review, contract-first parallel fan-out. See section 8. |
 
@@ -575,6 +576,73 @@ Atrium has **its own design language**. Other tools (e.g. MonoCode) serve only a
 
 **Visual direction**: decided in the M0 UI shell spike, where 2–3 directions are built as live token sets on the same shell and Pedro picks one. The others ship as alternative themes.
 
+### 3.21 Inline AI completion in the editor (`completion`)
+
+Ghost-text completion in the CodeMirror editors (file editor, query editor). It's **opt-in, manual by default, and never blocks typing**.
+
+**A deliberate exception to "Atrium doesn't call models itself."** Agents always run through their native CLIs (3.2). Inline completion can't: it needs fill-in-the-middle (FIM) results in well under a second. So `atriumd` has one small, contained completion subsystem that calls completion APIs directly. Nothing else in Atrium uses it.
+
+**Configuration** (global settings, overridable per workspace in `atrium.toml`):
+
+```toml
+[editor.completion]
+enabled     = true        # master switch; also in the status bar and command palette
+mode        = "manual"    # "off" | "manual" (keybind only) | "automatic" (ghost text after a pause)
+provider    = "local"     # name of a [[completion.providers]] entry
+debounce_ms = 400         # automatic mode only
+max_tokens  = 64          # keep suggestions to 1–3 lines
+timeout_ms  = 800         # hard cap; a late answer is dropped, typing is never blocked
+context     = "file"      # "file" (prefix/suffix of the current file) | "file+open" (+ snippets from open tabs)
+exclude     = [".env*", "**/*.pem", "**/*.key", "secrets/**"]   # never sent to any provider
+
+[[completion.providers]]
+name  = "local"
+kind  = "ollama"                    # ollama | fim-openai | chat
+url   = "http://localhost:11434"
+model = "<any FIM-capable coder model>"
+
+[[completion.providers]]
+name    = "deepseek"
+kind    = "fim-openai"              # OpenAI-style /completions with `suffix` (DeepSeek, Codestral, vLLM, llama.cpp)
+url     = "https://api.deepseek.com/beta"
+model   = "<model id>"
+key     = "keychain:atrium/deepseek" # API keys only in the OS keychain
+```
+
+**Provider kinds**
+- `fim-openai`: endpoints that take `prompt` + `suffix` and handle FIM natively.
+- `ollama`: local models. The daemon applies the model's FIM template (its special prefix/suffix/middle tokens) when the model doesn't do it itself.
+- `chat`: any chat model (including Claude/GPT/Gemini via API). Prompt-based "complete between these markers". Slower and pricier, so it's not recommended for automatic mode.
+- Model IDs are never hard-coded in Atrium. The provider settings list what the endpoint reports (where it supports listing), and you pick.
+
+**Flow**
+1. The editor sends `CompletionRequested { request_id, workspace_id, path, language, prefix, suffix, cursor }` over the socket. There's no thread ID: the editor belongs to a workspace. Prefix and suffix are clipped to a token budget.
+2. `atriumd` checks `enabled`/`mode`, the `exclude` globs, and **workspace consent**. The first use in a workspace with a remote provider asks once: "Send code from this workspace to `<provider>`?" Production database or secret-tagged files are always excluded.
+3. The daemon calls the provider with streaming. Any new keystroke or cursor move **cancels** the in-flight request, and only the newest `request_id` is ever displayed. Results go into a small per-file cache, so moving back and forth doesn't re-request.
+4. Usage (requests, tokens, cost, accept rate) is recorded per provider in the usage dashboard (3.11), with optional daily request/cost caps.
+
+**UI**
+- **Status bar badge** in the editor footer: `⚡ local · Manual (⌥\)`. Clicking opens a Kobalte popover with Off / Manual / Automatic, the provider/model selector, and "exclude this file".
+- **Command palette**: `Editor: Trigger Inline Suggestion`, `Editor: Set Completion Mode…`, `Editor: Switch Completion Provider…`.
+- **Ghost text** is rendered as a CodeMirror decoration (widget) with low-contrast theme tokens (`--ghost-text`). Multi-line suggestions are shown as a block.
+
+**Keybindings** (defaults, rebindable in `keybindings.json`, 3.20):
+
+| Key | Command | When |
+|---|---|---|
+| `⌥\` / `Alt+\` | `editor.completion.trigger` | `editorTextFocus` |
+| `Tab` | `editor.completion.accept` | `editorTextFocus && hasGhostText && !completionPopupOpen` |
+| `⌥→` / `Ctrl+→` | `editor.completion.acceptWord` | `hasGhostText` |
+| `⌥⇧→` | `editor.completion.acceptLine` | `hasGhostText` |
+| `Esc` | `editor.completion.dismiss` | `hasGhostText` (otherwise Esc keeps its normal meaning) |
+
+- Precedence rules:
+  - When CodeMirror's own completion popup is open (e.g. schema-aware SQL autocomplete, 3.19), the **popup wins** `Tab`/`Enter`.
+  - With no ghost text, `Tab` indents as usual (the handler returns `false`).
+- macOS caveat: `Option+\` types `«` on many keyboard layouts. The binding matches on the physical key (`event.code`), and this gets tested across layouts. If it's unreliable, the default switches to `Ctrl+\`.
+
+**Performance**: ghost-text rendering within one frame (< 16 ms) of the response arriving. Zero work on the UI thread while waiting. No requests at all in `manual` mode unless triggered.
+
 ## 4. Performance budgets (targets)
 
 - Cold start to interactive: < 400 ms (macOS, M-series); reconnecting to a running daemon with full state: < 100 ms.
@@ -648,6 +716,7 @@ Atrium has **its own design language**. Other tools (e.g. MonoCode) serve only a
 - Provider handoff: continue a thread with another provider, seeded with the summary, the handoff note and the diff.
 - Fan-out & compare: the same prompt to N agents/worktrees, side-by-side diffs and checks, pick a winner.
 - Design mode, stacked threads, worktree pool.
+- Inline editor completion (3.21): providers, consent + exclusions, ghost text, keybindings, usage tracking. Can be pulled forward right after the M2 editor if wanted.
 
 **M8: Polish → open source**
 - Settings, keybindings, themes, packaging (notarized dmg with the hypervisor entitlement; AppImage/deb), docs, license, contributor guide.
@@ -677,7 +746,7 @@ Atrium has **its own design language**. Other tools (e.g. MonoCode) serve only a
 ## 7. Open questions (for later)
 
 - License (MIT vs Apache-2.0)?
-- How deep should the editor go: quick edits only, or LSP?
+- How deep should the editor go: quick edits only, or LSP? (Inline completion, 3.21, is planned either way.)
 - Default network policy for sandboxes.
 - Which ACP agents to test first (OpenCode, Goose)?
 - Workspace notes: private by default (current plan) or committed?
