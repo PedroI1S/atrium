@@ -32,7 +32,7 @@ A fast, lightweight agent development environment written in Rust. It wraps the 
 | Workspace | Worktree per thread with a ready-to-use environment (env files, setup, ports, preview), checkpoints/revert, checks, terminal, editor, diff review with inline comments |
 | Multi-agent | Attention inbox, definition of done + automatic checks, conflict radar + merge queue, delegation + cross-provider review, shared notes + handoffs, backlog/queue/schedules, concurrency and rate-limit management, approval rules |
 | Audience | Personal first, kept clean enough to open-source later |
-| Editor completion | Optional inline FIM ghost text, manual by default, opt-in per workspace; the one place `atriumd` calls a model API directly (local Ollama or FIM endpoints); never blocks typing (3.21) |
+| Editor AI | Optional and off until you pick a provider: Copilot-style ghost text, next-edit prediction, ⌘K inline edit. Backends: Copilot LSP, your own local server (never bundled or auto-started), remote APIs, free hosted models (`untrusted`: manual only, current file only). Context engine in `atriumd`; the one place it calls models directly (3.21) |
 | Databases | SQLite/libSQL + PostgreSQL: query editor, drawDB-style schema diagram with design → migration, Drizzle Studio-style table view with staged edits; agents get read-only `db_*` tools, writes go through approvals (3.19) |
 | Build team | Opus 5.5 orchestrates; Sol 6.1 (backend), Sonnet 5.5 (frontend), Argon (systems/security), 3.8 Flash (utility), Astra (gates/escalation). Cross-provider review, contract-first parallel fan-out. See section 8. |
 
@@ -576,72 +576,118 @@ Atrium has **its own design language**. Other tools (e.g. MonoCode) serve only a
 
 **Visual direction**: decided in the M0 UI shell spike, where 2–3 directions are built as live token sets on the same shell and Pedro picks one. The others ship as alternative themes.
 
-### 3.21 Inline AI completion in the editor (`completion`)
+### 3.21 AI in the editor: completion, next-edit prediction, inline edit (`completion`)
 
-Ghost-text completion in the CodeMirror editors (file editor, query editor). It's **opt-in, manual by default, and never blocks typing**.
+Goal: editing should feel like **VS Code + Copilot or Zed**. Ghost text appears as you type, `Tab` accepts it, suggestions can point at the *next edit* nearby, and `⌘K` edits a selection in place. But it's **entirely optional and always the user's choice**.
 
-**A deliberate exception to "Atrium doesn't call models itself."** Agents always run through their native CLIs (3.2). Inline completion can't: it needs fill-in-the-middle (FIM) results in well under a second. So `atriumd` has one small, contained completion subsystem that calls completion APIs directly. Nothing else in Atrium uses it.
+**Principles**
+1. **Off by default; nothing runs until you choose.** No provider is preselected, no model is bundled, and Atrium never installs or starts a local model server. On first use (status bar or command palette), a setup sheet explains each option and its trade-offs (table below), and you pick one or keep it off.
+2. **Local models are your call.** They're private but heavy (RAM/VRAM, battery, heat). Atrium only *connects* to a server you run yourself (Ollama, llama.cpp, LM Studio). It can detect running ones, but never launches them.
+3. **Every provider has a trust level**, and the level decides what's allowed (below). Free hosted models (e.g. OpenCode's free models) are **`untrusted` by default**: free tiers commonly allow the provider to log or train on submitted code, so Atrium treats them that way unless you change it after reading their terms.
+4. **Never in the way.** Typing is never blocked. Every request is cancellable and hard-capped by a timeout. A late answer is dropped.
+5. **The one exception to "Atrium doesn't call models itself."** Agents always run through their native CLIs (3.2). Editor AI needs answers in a few hundred milliseconds, so `atriumd` has one contained subsystem that talks to completion backends directly. Nothing else uses it.
+
+**Features**
+- **Inline completion (ghost text)**:
+  - *Automatic*: appears after a short pause in typing.
+  - *Manual*: only on `⌥\`.
+  - `Tab` accepts all, `⌥→` accepts a word, `⌥⇧→` a line, `Esc` dismisses.
+  - Multi-line suggestions render as a block.
+  - Several candidates can be cycled with `⌥]` / `⌥[`.
+- **Next-edit prediction** (like Copilot's next edit suggestions or Zed's edit prediction):
+  - From your recent edits, the model predicts the next change *anywhere nearby*, e.g. the other call sites after a rename, or the matching field after adding a struct member.
+  - Shown as a gutter arrow plus an inline diff preview. `Tab` jumps to it, `Tab` again applies it.
+  - Needs a provider that supports edit prediction (an endpoint or a local Zeta-style model).
+- **Inline edit (`⌘K`)**:
+  - Select code (or just place the cursor), type an instruction, and see the result as an **inline diff** in the editor. Accept with `⌘↵`, reject with `Esc`, refine by typing a follow-up.
+  - Uses the configured chat/fast provider.
+  - **"Send to agent"** turns the same instruction into a thread task when it's bigger than a local rewrite.
+
+**Backends** (one `CompletionBackend` trait in the daemon, with capabilities `inline` / `next_edit` / `edit`):
+
+| Backend | What it is | Trust (default) | Notes |
+|---|---|---|---|
+| **Copilot (LSP)** | GitHub's official Copilot language server, spoken to over LSP `textDocument/inlineCompletion` | `trusted` (your GitHub account and its data settings) | Official sign-in, no API keys. The daemon includes a minimal LSP client for this even if full LSP support for the editor comes later. Closest to the "VS Code Copilot" feel. |
+| **Local server** | Ollama / llama.cpp / LM Studio on `localhost` (FIM, chat, edit-prediction models) | `local` | You run it; Atrium only connects. Optional `keep_alive` so the model unloads when idle, and "pause on battery". |
+| **Remote API (FIM)** | OpenAI-style `/completions` with `suffix` (e.g. DeepSeek, Codestral, vLLM) | `trusted` if it's your paid account, otherwise `untrusted` | API key in the OS keychain |
+| **Free hosted models** | e.g. OpenCode's free models | **`untrusted`** | Strict rules below; a warning on setup and in the status bar |
+| **Chat models** | Any chat API (Claude/GPT/Gemini via API key) | per provider | Used for `⌘K` inline edit and as a prompt-based completion fallback (too slow and costly for automatic ghost text) |
+
+Model IDs are never hard-coded. Atrium lists what each backend reports, and you choose.
+
+**Trust levels and what they allow**
+
+| | `local` | `trusted` | `untrusted` |
+|---|---|---|---|
+| Automatic mode | ✅ | ✅ | ❌ manual only (unless explicitly overridden per workspace) |
+| Consent | none | once per workspace | once per workspace + repeated warning in the status bar |
+| Context sent | full context engine | full context engine | **current file only**, no neighbouring files or edit history |
+| Secret redaction on the payload (3.18 scanner) | – | ✅ | ✅ + skip the request entirely if anything secret-like is in range |
+| Workspaces tagged `private` | ✅ | ✅ | ❌ never |
+
+Always excluded, for every trust level: `exclude` globs (default `.env*`, `*.pem`, `*.key`, `secrets/**`), git-ignored files, files outside the workspace, and anything open from a `production` database connection (3.19).
+
+**Context engine** (in the daemon; this decides quality more than the model does)
+- **Recent edits**: a ring buffer of your last N edits across open files. This is the strongest signal for both completion and next-edit prediction.
+- **Syntax-aware windows**: tree-sitter parses the file. Prefix and suffix are cut at statement/function boundaries, the enclosing scope is always included, and multi-line completions stop at the end of the block.
+- **Related code**: definitions of symbols near the cursor (tree-sitter tags across open files and imported modules, or LSP when available), plus snippets from open tabs ranked by similarity to the cursor region.
+- **Token budget** per backend, with priority: cursor scope → recent edits → definitions → neighbouring files.
+- **Post-processing**: trim overlap with the existing suffix, balance brackets, fix indentation, drop suggestions that only repeat existing code, de-duplicate candidates.
+- The context build budget is < 10 ms. It runs on daemon threads, never the UI thread.
 
 **Configuration** (global settings, overridable per workspace in `atrium.toml`):
 
 ```toml
-[editor.completion]
-enabled     = true        # master switch; also in the status bar and command palette
-mode        = "manual"    # "off" | "manual" (keybind only) | "automatic" (ghost text after a pause)
-provider    = "local"     # name of a [[completion.providers]] entry
-debounce_ms = 400         # automatic mode only
-max_tokens  = 64          # keep suggestions to 1–3 lines
-timeout_ms  = 800         # hard cap; a late answer is dropped, typing is never blocked
-context     = "file"      # "file" (prefix/suffix of the current file) | "file+open" (+ snippets from open tabs)
-exclude     = [".env*", "**/*.pem", "**/*.key", "secrets/**"]   # never sent to any provider
+[editor.ai]
+enabled  = false            # off until you run setup
+provider = ""               # chosen in setup, e.g. "copilot" | "local" | "deepseek" | "opencode-free"
+mode     = "automatic"      # "automatic" | "manual"; forced to "manual" for untrusted providers
+next_edit = true            # only if the provider supports it
+debounce_ms = 300
+timeout_ms  = 800           # completion; inline edit uses its own, longer timeout
+exclude = [".env*", "**/*.pem", "**/*.key", "secrets/**"]
 
-[[completion.providers]]
+[[editor.ai.providers]]
 name  = "local"
-kind  = "ollama"                    # ollama | fim-openai | chat
+kind  = "ollama"            # copilot-lsp | ollama | openai-compatible | fim-openai | chat
 url   = "http://localhost:11434"
-model = "<any FIM-capable coder model>"
+model = "<your FIM-capable coder model>"
+keep_alive = "5m"           # let the model unload when idle
+trust = "local"
 
-[[completion.providers]]
-name    = "deepseek"
-kind    = "fim-openai"              # OpenAI-style /completions with `suffix` (DeepSeek, Codestral, vLLM, llama.cpp)
-url     = "https://api.deepseek.com/beta"
-model   = "<model id>"
-key     = "keychain:atrium/deepseek" # API keys only in the OS keychain
+[[editor.ai.providers]]
+name  = "opencode-free"
+kind  = "openai-compatible"
+url   = "<endpoint>"
+model = "<model id>"
+trust = "untrusted"         # default for free tiers; changing it requires confirmation
 ```
 
-**Provider kinds**
-- `fim-openai`: endpoints that take `prompt` + `suffix` and handle FIM natively.
-- `ollama`: local models. The daemon applies the model's FIM template (its special prefix/suffix/middle tokens) when the model doesn't do it itself.
-- `chat`: any chat model (including Claude/GPT/Gemini via API). Prompt-based "complete between these markers". Slower and pricier, so it's not recommended for automatic mode.
-- Model IDs are never hard-coded in Atrium. The provider settings list what the endpoint reports (where it supports listing), and you pick.
-
-**Flow**
-1. The editor sends `CompletionRequested { request_id, workspace_id, path, language, prefix, suffix, cursor }` over the socket. There's no thread ID: the editor belongs to a workspace. Prefix and suffix are clipped to a token budget.
-2. `atriumd` checks `enabled`/`mode`, the `exclude` globs, and **workspace consent**. The first use in a workspace with a remote provider asks once: "Send code from this workspace to `<provider>`?" Production database or secret-tagged files are always excluded.
-3. The daemon calls the provider with streaming. Any new keystroke or cursor move **cancels** the in-flight request, and only the newest `request_id` is ever displayed. Results go into a small per-file cache, so moving back and forth doesn't re-request.
-4. Usage (requests, tokens, cost, accept rate) is recorded per provider in the usage dashboard (3.11), with optional daily request/cost caps.
-
 **UI**
-- **Status bar badge** in the editor footer: `⚡ local · Manual (⌥\)`. Clicking opens a Kobalte popover with Off / Manual / Automatic, the provider/model selector, and "exclude this file".
-- **Command palette**: `Editor: Trigger Inline Suggestion`, `Editor: Set Completion Mode…`, `Editor: Switch Completion Provider…`.
-- **Ghost text** is rendered as a CodeMirror decoration (widget) with low-contrast theme tokens (`--ghost-text`). Multi-line suggestions are shown as a block.
+- **Status bar badge**: provider + trust icon + mode, e.g. `● Copilot · Auto`, `⌂ local · Auto`, `⚠ opencode-free · Manual`.
+  - Clicking it opens a popover: Off / Manual / Automatic, provider switcher, "pause for 1 hour", "exclude this file".
+  - One click always turns AI off.
+- **Command palette**: `AI: Set Up Editor AI…`, `AI: Toggle`, `AI: Switch Provider…`, `AI: Trigger Suggestion`, `AI: Inline Edit`.
+- Ghost text and diff previews use theme tokens (`--ghost-text`, `--diff-add`, `--diff-del`).
+- The CodeMirror ghost-text layer starts from existing extensions (e.g. `codemirror-copilot`) as a reference. Next-edit previews and inline-edit diffs are our own CodeMirror decorations.
 
-**Keybindings** (defaults, rebindable in `keybindings.json`, 3.20):
+**Keybindings** (defaults; rebindable in `keybindings.json`, 3.20):
 
 | Key | Command | When |
 |---|---|---|
-| `⌥\` / `Alt+\` | `editor.completion.trigger` | `editorTextFocus` |
-| `Tab` | `editor.completion.accept` | `editorTextFocus && hasGhostText && !completionPopupOpen` |
-| `⌥→` / `Ctrl+→` | `editor.completion.acceptWord` | `hasGhostText` |
-| `⌥⇧→` | `editor.completion.acceptLine` | `hasGhostText` |
-| `Esc` | `editor.completion.dismiss` | `hasGhostText` (otherwise Esc keeps its normal meaning) |
+| `⌥\` | `ai.trigger` | `editorTextFocus` |
+| `Tab` | `ai.accept` / `ai.nextEdit.jumpOrApply` | `hasGhostText \|\| hasNextEdit`, and `!completionPopupOpen` |
+| `⌥→` / `⌥⇧→` | `ai.acceptWord` / `ai.acceptLine` | `hasGhostText` |
+| `⌥]` / `⌥[` | `ai.nextCandidate` / `ai.prevCandidate` | `hasGhostText` |
+| `Esc` | `ai.dismiss` | `hasGhostText \|\| hasNextEdit \|\| inlineEditOpen` |
+| `⌘K` | `ai.inlineEdit` | `editorTextFocus` |
+| `⌘↵` | `ai.inlineEdit.accept` | `inlineEditOpen` |
 
-- Precedence rules:
-  - When CodeMirror's own completion popup is open (e.g. schema-aware SQL autocomplete, 3.19), the **popup wins** `Tab`/`Enter`.
-  - With no ghost text, `Tab` indents as usual (the handler returns `false`).
-- macOS caveat: `Option+\` types `«` on many keyboard layouts. The binding matches on the physical key (`event.code`), and this gets tested across layouts. If it's unreliable, the default switches to `Ctrl+\`.
+- Precedence: CodeMirror's own completion popup (e.g. SQL autocomplete, 3.19) wins `Tab`/`Enter`.
+- With nothing pending, `Tab` indents and `Esc` behaves normally.
+- On macOS, `⌥\` types `«` on many keyboard layouts, so bindings match the physical key (`event.code`). This gets tested across layouts, with `Ctrl+\` as the fallback.
 
-**Performance**: ghost-text rendering within one frame (< 16 ms) of the response arriving. Zero work on the UI thread while waiting. No requests at all in `manual` mode unless triggered.
+**Measurement (local only, never sent anywhere)**: accept rate, partial-accept rate, latency p50/p95 per provider and per feature. Shown in the usage dashboard (3.11) along with tokens and cost for paid providers, with optional daily caps.
 
 ## 4. Performance budgets (targets)
 
@@ -716,7 +762,10 @@ key     = "keychain:atrium/deepseek" # API keys only in the OS keychain
 - Provider handoff: continue a thread with another provider, seeded with the summary, the handoff note and the diff.
 - Fan-out & compare: the same prompt to N agents/worktrees, side-by-side diffs and checks, pick a winner.
 - Design mode, stacked threads, worktree pool.
-- Inline editor completion (3.21): providers, consent + exclusions, ghost text, keybindings, usage tracking. Can be pulled forward right after the M2 editor if wanted.
+- Editor AI (3.21), can be pulled forward right after the M2 editor:
+  - **a**: setup sheet, trust levels + consent + exclusions, backend trait with local-server/remote FIM/chat backends, context engine (recent edits, tree-sitter windows, related code, post-processing), ghost-text completion, ⌘K inline edit.
+  - **b**: Copilot LSP backend (minimal LSP client).
+  - **c**: next-edit prediction.
 
 **M8: Polish → open source**
 - Settings, keybindings, themes, packaging (notarized dmg with the hypervisor entitlement; AppImage/deb), docs, license, contributor guide.
@@ -737,6 +786,8 @@ key     = "keychain:atrium/deepseek" # API keys only in the OS keychain
 | libkrun on macOS is Apple Silicon only; needs a hypervisor entitlement + signing | The sandbox is optional, so Intel Macs just don't get it; handle signing in the M4 spike |
 | CoW rootfs on Linux (no clonefile) | Spike reflink, overlayfs (fuse-overlayfs) and a qcow2 disk overlay; pick one |
 | WebKitGTK performance on Linux (canvas, xterm WebGL) | Measure in M0; tune frame size/quality; fall back to the xterm canvas renderer |
+| Editor AI leaks code or secrets to a third party | Off by default; trust levels with `untrusted` restricted to manual + current file; consent per workspace; exclude globs + git-ignored files; secret scanner on payloads; status-bar trust indicator |
+| Local models drain memory/battery | Never bundled or auto-started; connect-only; `keep_alive` unload; pause on battery; a single request in flight |
 | Agent read-only DB access bypassed (writable CTEs, side-effecting functions, multi-statements) | Three layers: parser classification + `READ ONLY` transaction / `query_only` + timeouts; Argon adversarial suite; optional least-privilege role; production connections are never writable by agents |
 | Migration diff engine produces wrong SQL (especially SQLite rebuilds) | Round-trip verification on a scratch copy before any migration is offered; v1 limited to tables/columns/FKs/indexes/uniques |
 | Two SQLite builds linked (`rusqlite` + `sqlx`) | Use `rusqlite` everywhere, `tokio-postgres` for Postgres, `libsql` remote-only |
@@ -746,7 +797,7 @@ key     = "keychain:atrium/deepseek" # API keys only in the OS keychain
 ## 7. Open questions (for later)
 
 - License (MIT vs Apache-2.0)?
-- How deep should the editor go: quick edits only, or LSP? (Inline completion, 3.21, is planned either way.)
+- How deep should the editor go: quick edits only, or LSP? (Editor AI, 3.21, is planned either way; its minimal LSP client for Copilot could grow into full LSP support.)
 - Default network policy for sandboxes.
 - Which ACP agents to test first (OpenCode, Goose)?
 - Workspace notes: private by default (current plan) or committed?
