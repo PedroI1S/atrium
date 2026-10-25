@@ -1067,7 +1067,7 @@ Pedro and a partner build Atrium **in turns, never at the same time**. Whoever i
 - **Never hand off with a worker running.** Native agent sessions can't be resumed on the other machine. An interrupted task gets a `partial` handoff note and a WIP commit on its branch, and the next driver dispatches a fresh worker from there.
 - **Shared rules live in the repo**: `CLAUDE.md` (orchestrator sessions) and `AGENTS.md` (Codex/`agy` workers), not in Claude Code memory, which is per machine.
 - **Machine-local things**: worktrees, raw transcripts, agent CLI logins, and the generated `agy` hook. These are per machine and are recreated or kept locally. `scripts/doctor` checks a machine's tools, GitHub access and the `agy` policy self-test.
-- **Authority**: either driver can approve contracts, give a phase go and sign off a gate. Each decision is recorded with who made it. Changes to security/approval defaults need both people.
+- **Authority**: either driver can approve contracts, give a phase go and sign off a gate. Each decision is recorded with who made it. **Pedro is the project owner**: changes to security/approval defaults are his decision alone (D-013).
 - **Records carry the driver's name**: status board owner column, session logs, decisions, and archive manifests (with the machine that holds the raw transcripts).
 
 ### 8.8 Your role (Pedro)

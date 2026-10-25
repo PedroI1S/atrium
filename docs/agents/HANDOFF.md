@@ -64,7 +64,7 @@ Either driver can:
 - give the go for a milestone phase,
 - sign off a milestone gate.
 
-Each decision is recorded in `decisions.md` with the person's name. Changes to security or approval defaults (policy hook, sandbox, editor AI trust levels) need **both** people, recorded as such.
+Each decision is recorded in `decisions.md` with the person's name. Changes to security or approval defaults (policy hook, sandbox, editor AI trust levels) are decided by **Pedro, the project owner** (D-013). The partner can propose them; Pedro approves.
 
 ## After upgrading `agy`
 
