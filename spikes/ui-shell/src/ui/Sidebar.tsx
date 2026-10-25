@@ -1,7 +1,7 @@
 import { ChevronRight, GitBranch, House, Inbox } from "lucide-solid";
 import { For, createSignal } from "solid-js";
 import { WORKSPACES, type Thread } from "../data/dummy";
-import { activeTab, activeTabId, inboxCount, openThread, setActiveTabId, showToast, tabs } from "../state";
+import { activeTab, activeTabId, inboxCount, openHome, openThread, showToast } from "../state";
 
 const stateLabel: Record<Thread["state"], string> = {
   running: "Running",
@@ -17,17 +17,16 @@ function StateDot(props: { state: Thread["state"] }) {
 
 export function Sidebar() {
   const [open, setOpen] = createSignal<Record<string, boolean>>({ atrium: true, harness: true, sandbox: false });
-  const homeTab = () => tabs().find((t) => t.kind === "home");
   return (
     <nav class="sidebar" aria-label="Workspaces" data-atrium-part="sidebar">
       <div class="side-nav">
         <button class="side-row" onClick={() => showToast("Inbox: opens the attention queue (dummy)")}>
-          <Inbox size={15} />
+          <Inbox class="icon-md" />
           <span class="side-grow">Inbox</span>
           <span class="badge" aria-label={`${inboxCount()} items need attention`}>{inboxCount()}</span>
         </button>
-        <button class="side-row" classList={{ "is-active": activeTab().kind === "home" }} onClick={() => homeTab() && setActiveTabId(homeTab()!.id)}>
-          <House size={15} />
+        <button class="side-row" classList={{ "is-active": activeTab().kind === "home" }} onClick={openHome}>
+          <House class="icon-md" />
           <span class="side-grow">Home</span>
         </button>
       </div>
@@ -37,10 +36,10 @@ export function Sidebar() {
           {(w) => (
             <div class="ws">
               <button class="side-row ws-head" aria-expanded={open()[w.id]} onClick={() => setOpen({ ...open(), [w.id]: !open()[w.id] })}>
-                <ChevronRight size={13} class="chev" classList={{ "is-open": open()[w.id] }} />
+                <ChevronRight class="icon-sm chev" classList={{ "is-open": open()[w.id] }} />
                 <span class="side-grow">{w.name}</span>
                 <span class="ws-branch">
-                  <GitBranch size={11} />
+                  <GitBranch class="icon-xs" />
                   {w.branch}
                 </span>
               </button>

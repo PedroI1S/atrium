@@ -32,6 +32,12 @@ const work = (xs: number[]): WorkStats => {
 };
 
 export interface FrameStats {
+  /**
+   * Main-thread time from the start of each rAF callback to the next task: the rendering update
+   * (style, layout, paint recording, ResizeObserver callbacks such as the virtualizer's row
+   * measurements) plus the callback itself. Compositing and GPU work are off-thread and not included.
+   */
+  renderWork: WorkStats;
   frames: number;
   seconds: number;
   fps: number;
@@ -47,10 +53,11 @@ export interface FrameStats {
 
 const pct = (sorted: number[], p: number): number => sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))] ?? 0;
 
-export function summarize(dts: number[]): FrameStats {
+export function summarize(dts: number[], render: number[] = []): FrameStats {
   const sorted = [...dts].sort((a, b) => a - b);
   const total = dts.reduce((s, v) => s + v, 0);
   return {
+    renderWork: work(render),
     frames: dts.length,
     seconds: total / 1000,
     fps: dts.length / (total / 1000),
@@ -68,9 +75,17 @@ export function summarize(dts: number[]): FrameStats {
 export function sampleFrames(ms: number, step?: (elapsed: number, dt: number) => void): Promise<FrameStats> {
   return new Promise((resolve) => {
     const dts: number[] = [];
+    const render: number[] = [];
     let last = 0;
     let start = 0;
+    let t0 = 0;
+    // A task posted from the rAF callback runs after that frame's rendering update, so its delay
+    // is the main-thread cost of the update.
+    const ch = new MessageChannel();
+    ch.port1.onmessage = () => render.push(performance.now() - t0);
     const tick = (now: number) => {
+      t0 = performance.now();
+      ch.port2.postMessage(0);
       if (!start) {
         start = now;
         last = now;
@@ -81,7 +96,11 @@ export function sampleFrames(ms: number, step?: (elapsed: number, dt: number) =>
         step?.(now - start, dt);
       }
       if (now - start < ms) requestAnimationFrame(tick);
-      else resolve(summarize(dts));
+      else
+        setTimeout(() => {
+          ch.port1.close();
+          resolve(summarize(dts, render));
+        }, 50);
     };
     requestAnimationFrame(tick);
   });
@@ -195,7 +214,7 @@ export async function runHarness(info: StartupInfo): Promise<void> {
   const swaps: number[] = [];
   for (const id of ["flat-dark", "paper-light", "glass-dark", "imported-catppuccin-mocha", "glass-light", "glass-dark"]) {
     const a = performance.now();
-    activateTheme(id);
+    activateTheme(id, false);
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
     swaps.push(performance.now() - a);
     await sleep(60);

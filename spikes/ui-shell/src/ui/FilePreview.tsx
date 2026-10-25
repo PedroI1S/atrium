@@ -29,7 +29,7 @@ export function FilePreview(props: { file: string }) {
   return (
     <section class="pane preview" aria-label="File preview" data-atrium-part="file-preview">
       <header class="pane-head">
-        <FileCode2 size={14} />
+        <FileCode2 class="icon-md" />
         <span class="pane-title mono">{f().path}</span>
         <span class="side-grow" />
         <span class="pane-sub">read-only preview</span>

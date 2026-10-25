@@ -50,6 +50,7 @@ export type IssueCode =
   | "missing-reference"
   | "cycle"
   | "missing-token"
+  | "name-collision"
   | "unparseable-color"
   | "contrast";
 
@@ -254,12 +255,35 @@ export function loadTheme(text: string, id: string): ResolvedTheme {
   return resolveTheme(parseThemeToml(text, id), id);
 }
 
+/**
+ * Every layer is emitted into one CSS namespace: primitives as `--p-<name>`, semantic and component
+ * tokens as `--<name>`. A component (or semantic) token that reuses an emitted name would silently
+ * overwrite a validated variable (e.g. `[component] text = ...` replacing `--text` after the contrast
+ * check), so any such collision is an error.
+ */
+export function nameCollisions(file: ThemeFile): ThemeIssue[] {
+  const issues: ThemeIssue[] = [];
+  const emitted = new Map<string, string>(); // css var -> "layer.name"
+  for (const [k] of Object.entries(file.primitive)) emitted.set(`--p-${k}`, `primitive.${k}`);
+  for (const layer of ["semantic", "component"] as const) {
+    for (const k of Object.keys(file[layer])) {
+      const css = `--${k}`;
+      const prior = emitted.get(css);
+      if (prior)
+        issues.push({ code: "name-collision", message: `${layer}.${k} would overwrite ${prior} (both emit ${css})`, token: k });
+      else emitted.set(css, `${layer}.${k}`);
+    }
+  }
+  return issues;
+}
+
 export function resolveTheme(file: ThemeFile, id: string): ResolvedTheme {
   const issues: ThemeIssue[] = [];
   // Required tokens are checked against what the file defines, so a missing token is reported
   // even when other tokens reference it (which also fails resolution).
   for (const req of REQUIRED_SEMANTIC)
     if (!Object.hasOwn(file.semantic, req)) issues.push({ code: "missing-token", message: `required semantic token --${req} is missing`, token: req });
+  issues.push(...nameCollisions(file));
   let layers: Record<Layer, Record<string, string>> | null = null;
   try {
     layers = resolveLayers(file);

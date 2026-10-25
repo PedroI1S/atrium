@@ -37,6 +37,36 @@ describe("colour maths", () => {
     expect(parseColor("rgba(10, 20, 30, 0.5)")).toEqual({ r: 10, g: 20, b: 30, a: 0.5 });
     expect(parseColor("not-a-colour")).toBeNull();
   });
+  it("accepts both valid rgb() syntaxes, with numbers and percentages", () => {
+    expect(parseColor("rgb(255, 0, 0)")).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+    expect(parseColor("rgb(255 0 0)")).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+    expect(parseColor("rgb(10 20 30 / 50%)")).toEqual({ r: 10, g: 20, b: 30, a: 0.5 });
+    expect(parseColor("rgba(100%, 0%, 0%, .25)")).toEqual({ r: 255, g: 0, b: 0, a: 0.25 });
+    expect(parseColor("  RGB( 1 , 2 , 3 )  ")).toEqual({ r: 1, g: 2, b: 3, a: 1 });
+  });
+  it("rejects malformed rgb() the way CSS does (no parseFloat leniency)", () => {
+    for (const bad of [
+      "rgb(255junk,255junk,255junk)", // junk suffixes
+      "rgb(255px, 0, 0)", // units
+      "rgb(255, 255 255)", // mixed separators
+      "rgb(255 255, 255)",
+      "rgb(255, 255, 255 / 0.5)", // slash in the legacy syntax
+      "rgb(255 255 255, 0.5)", // comma alpha in the modern syntax
+      "rgb(255, 255)",
+      "rgb(255, 255, 255, 0.5, 1)",
+      "rgb(255, 255, 255,)",
+      "rgb(,255, 255, 255)",
+      "rgb(1e2, 0, 0)",
+      "rgb(0x10, 0, 0)",
+      "rgb(255, 255, 255) foo",
+      "rgb()",
+      "rgba(0, 0, 0, abc)",
+    ])
+      expect(parseColor(bad), bad).toBeNull();
+  });
+  it("rejects a malformed rgb() in a theme instead of certifying its contrast", () => {
+    expect(() => loadTheme(minimal({ semantic: { text: "rgb(255junk,255junk,255junk)" } }), "junk")).toThrow(/unparseable-color/);
+  });
   it("matches the WCAG reference ratios", () => {
     const w = parseColor("#ffffff")!;
     const b = parseColor("#000000")!;
@@ -157,6 +187,39 @@ describe("theme loader", () => {
     const before = JSON.stringify(file);
     expect(resolveLayers(file)).toEqual(resolveLayers(file));
     expect(JSON.stringify(file)).toBe(before);
+  });
+});
+
+describe("name collisions across layers (validated variables cannot be overwritten)", () => {
+  it("rejects a [component] token named like a semantic token (the --text bypass)", () => {
+    expect.assertions(3);
+    try {
+      loadTheme(minimal({ component: { text: "{surface-1}" } }), "bypass");
+    } catch (e) {
+      expect((e as ThemeError).has("name-collision")).toBe(true);
+      expect((e as ThemeError).message).toContain("--text");
+      expect((e as ThemeError).issues.find((i) => i.code === "name-collision")?.token).toBe("text");
+    }
+  });
+  it("rejects collisions with every required semantic name", () => {
+    for (const token of REQUIRED_SEMANTIC) {
+      expect(() => loadTheme(minimal({ component: { [token]: "#ffffff" } }), "c"), token).toThrow(/name-collision/);
+    }
+  });
+  it("rejects a component or semantic token that would emit an existing --p-* primitive variable", () => {
+    expect(() => loadTheme(minimal({ component: { "p-gray-100": "#000000" } }), "p")).toThrow(/name-collision/);
+    expect(() => loadTheme(minimal({ semantic: { "p-gray-900": "#000000" } }), "p")).toThrow(/name-collision/);
+  });
+  it("still reports the collision when the colliding value would also fail to resolve", () => {
+    expect(() => loadTheme(minimal({ component: { text: "{nope}" } }), "both")).toThrow(/name-collision/);
+  });
+  it("allows component tokens with distinct names, and the same name in different layers' emitted spaces", () => {
+    // primitive `gray-100` emits --p-gray-100; a component `gray-100` emits --gray-100: no clash.
+    expect(() => loadTheme(minimal({ component: { "gray-100": "#ffffff", "tab-active-bg": "{surface-2}" } }), "ok")).not.toThrow();
+  });
+  it("leaves the validated --text untouched in the output of a valid theme", () => {
+    const t = loadTheme(minimal(), "ok");
+    expect(t.vars["--text"]).toBe(t.semantic.text);
   });
 });
 

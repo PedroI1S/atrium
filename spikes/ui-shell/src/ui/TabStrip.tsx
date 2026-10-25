@@ -29,7 +29,7 @@ import {
 } from "../state";
 
 function TabIcon(props: { kind: TabSpec["kind"] }) {
-  return props.kind === "home" ? <House size={13} /> : props.kind === "split" ? <Columns2 size={13} /> : <MessagesSquare size={13} />;
+  return props.kind === "home" ? <House class="icon-sm" /> : props.kind === "split" ? <Columns2 class="icon-sm" /> : <MessagesSquare class="icon-sm" />;
 }
 
 function SortableTab(props: { tab: TabSpec }) {
@@ -62,7 +62,7 @@ function SortableTab(props: { tab: TabSpec }) {
       <TabIcon kind={props.tab.kind} />
       <span class="tab-title">{props.tab.title}</span>
       <button class="tab-close" aria-label={`Close ${props.tab.title}`} onClick={close} onPointerDown={(e) => e.stopPropagation()}>
-        <X size={12} />
+        <X class="icon-xs" />
       </button>
     </div>
   );
@@ -73,7 +73,7 @@ function LookMenu() {
   return (
     <DropdownMenu placement="bottom-end" gutter={6}>
       <DropdownMenu.Trigger class="icon-btn" aria-label="Look: theme and direction" title="Look">
-        <Palette size={15} />
+        <Palette class="icon-md" />
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content class="menu" data-atrium-menu>
@@ -89,7 +89,7 @@ function LookMenu() {
                       {(e) => (
                         <DropdownMenu.RadioItem class="menu-item" value={e.id}>
                           <DropdownMenu.ItemIndicator class="menu-indicator">
-                            <Check size={13} />
+                            <Check class="icon-sm" />
                           </DropdownMenu.ItemIndicator>
                           <span class="swatch" style={{ background: e.theme.semantic.accent }} />
                           {e.theme.meta.name}
@@ -130,7 +130,7 @@ export function TabStrip() {
       {/* Room for the native traffic lights (titleBarStyle Overlay). */}
       <div class="strip-traffic" data-tauri-drag-region />
       <button class="icon-btn" aria-label="Toggle sidebar" title="Toggle sidebar" onClick={toggleSidebar} aria-pressed={outerSizes()[0]! > 0.01}>
-        <PanelLeft size={15} />
+        <PanelLeft class="icon-md" />
       </button>
       <DragDropProvider onDragEnd={onDragEnd} collisionDetector={closestCenter}>
         <DragDropSensors />
@@ -156,12 +156,12 @@ export function TabStrip() {
           setActiveTabId(id);
         }}
       >
-        <Plus size={15} />
+        <Plus class="icon-md" />
       </button>
       <div class="strip-fill" data-tauri-drag-region />
       <LookMenu />
       <button class="icon-btn" aria-label="Toggle right panel" title="Toggle right panel" onClick={toggleRightPanel} aria-pressed={outerSizes()[2]! > 0.01}>
-        <PanelRight size={15} />
+        <PanelRight class="icon-md" />
       </button>
     </header>
   );

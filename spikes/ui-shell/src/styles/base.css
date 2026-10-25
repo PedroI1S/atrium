@@ -7,6 +7,36 @@
  */
 
 :root {
+  /* hairlines, focus and the shapes shared by every component */
+  --hairline: 1px;
+  --focus-width: 2px;
+  --pill-radius: 999px;
+  --dot-size: 8px;
+  --icon-xs: 12px;
+  --icon-sm: 13px;
+  --icon-md: 15px;
+  --pulse-duration: 1.6s;
+  --blink-duration: 1.1s;
+
+  /* sizes of fixed-size parts */
+  --traffic-light-width: 78px;
+  --strip-fill-min-width: 24px;
+  --tab-max-width: 220px;
+  --tab-min-width: 90px;
+  --tab-close-size: 16px;
+  --handle-line: 2px;
+  --handle-hit: 4px;
+  --sidebar-min-width: 190px;
+  --badge-size: 18px;
+  --composer-max-height: 200px;
+  --placeholder-min-height: 160px;
+  --home-max-width: 760px;
+  --home-card-min-width: 220px;
+  --menu-min-width: 270px;
+  --palette-width: 640px;
+  --palette-gutter: 48px;
+  --palette-list-max-height: 420px;
+
   /* layout shape (Glass floats panels with a gap; Flat and Paper run edge to edge) */
   --panel-gap: 0px;
   --panel-radius: 0px;
@@ -114,13 +144,13 @@ code {
   font-family: var(--font-code);
 }
 :focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
+  outline: var(--focus-width) solid var(--focus-ring);
+  outline-offset: calc(var(--focus-width) * -1);
 }
 .sr-only {
   position: absolute;
-  width: 1px;
-  height: 1px;
+  width: var(--hairline);
+  height: var(--hairline);
   overflow: hidden;
   clip: rect(0 0 0 0);
   white-space: nowrap;
@@ -157,3 +187,8 @@ code {
     scroll-behavior: auto !important;
   }
 }
+
+/* Icons are sized by tokens (lucide's size attribute is a literal). */
+.icon-xs { width: var(--icon-xs); height: var(--icon-xs); }
+.icon-sm { width: var(--icon-sm); height: var(--icon-sm); }
+.icon-md { width: var(--icon-md); height: var(--icon-md); }

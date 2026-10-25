@@ -18,7 +18,17 @@ export interface StartupInfo {
 
 const BROWSER_DEFAULTS: StartupInfo = { mainEpochMs: 0, benchMode: null, theme: null, preset: null, openPalette: false, tab: null, rightTab: null, vibrancySupported: false };
 
+/** Whether this platform can show native vibrancy at all (Rust says macOS only; a browser says no). */
+let vibrancyAvailable = false;
+export const vibrancySupported = (): boolean => vibrancyAvailable;
+
 export async function startupInfo(): Promise<StartupInfo> {
+  const info = await readStartupInfo();
+  vibrancyAvailable = info.vibrancySupported;
+  return info;
+}
+
+async function readStartupInfo(): Promise<StartupInfo> {
   if (!inTauri) {
     const q = new URLSearchParams(location.search);
     return {
@@ -34,12 +44,15 @@ export async function startupInfo(): Promise<StartupInfo> {
   return invoke<StartupInfo>("startup_info");
 }
 
-export async function setVibrancy(enabled: boolean, dark: boolean): Promise<void> {
-  if (!inTauri) return;
+/** Returns whether native vibrancy is applied now (always false when it was not requested or failed). */
+export async function setVibrancy(enabled: boolean, dark: boolean): Promise<boolean> {
+  if (!inTauri) return false;
   try {
-    await invoke("set_vibrancy", { enabled, dark });
+    const result = await invoke<boolean>("set_vibrancy", { enabled, dark });
+    return enabled && result;
   } catch (e) {
     console.warn("set_vibrancy failed", e);
+    return false;
   }
 }
 

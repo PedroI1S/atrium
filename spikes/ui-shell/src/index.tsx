@@ -21,7 +21,8 @@ async function boot() {
     /* ignore */
   }
   const wanted = info.theme ?? saved ?? "glass-dark";
-  activateTheme(entries.some((t) => t.id === wanted) ? wanted : "glass-dark");
+  // A theme pinned by the harness (env) is not remembered, so it never leaks into later runs.
+  activateTheme(entries.some((t) => t.id === wanted) ? wanted : "glass-dark", !info.theme);
 
   if (info.preset && info.preset in PRESETS) applyPreset(info.preset as keyof typeof PRESETS, true);
   if (info.tab) {

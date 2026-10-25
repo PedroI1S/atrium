@@ -42,10 +42,10 @@ function MessageView(props: { m: Message }) {
             return (
               <div class="tool" data-status={t.status}>
                 <div class="tool-head">
-                  <Terminal size={12} />
+                  <Terminal class="icon-xs" />
                   <span class="tool-name">{t.tool}</span>
                   <span class="tool-target">{t.target}</span>
-                  {t.status === "ok" ? <Check size={12} class="tool-ok" /> : <CircleAlert size={12} class="tool-err" />}
+                  {t.status === "ok" ? <Check class="icon-xs tool-ok" /> : <CircleAlert class="icon-xs tool-err" />}
                 </div>
                 <pre class="tool-out">{t.lines.join("\n")}</pre>
               </div>

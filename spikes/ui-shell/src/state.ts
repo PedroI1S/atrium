@@ -2,7 +2,7 @@
 
 import { batch, createSignal } from "solid-js";
 import { ALL_THREADS, INITIAL_TABS, type TabSpec, threadById } from "./data/dummy";
-import { setVibrancy, setWindowTheme } from "./platform";
+import { setVibrancy, setWindowTheme, vibrancySupported } from "./platform";
 import type { ThemeEntry } from "./theme/registry";
 import { applyTheme } from "./theme/runtime";
 
@@ -53,16 +53,22 @@ export function showToast(text: string): void {
 
 // -- themes -----------------------------------------------------------------
 
-export function activateTheme(id: string): void {
+export function activateTheme(id: string, persist = true): void {
   const entry = themes().find((t) => t.id === id);
   if (!entry) {
     showToast(`Unknown theme ${id}`);
     return;
   }
-  applyTheme(entry.theme);
+  const requested = entry.theme.meta.vibrancy;
+  applyTheme(entry.theme, requested && vibrancySupported());
   setThemeId(id);
   void setWindowTheme(entry.theme.meta.appearance);
-  void setVibrancy(entry.theme.meta.vibrancy, entry.theme.meta.appearance === "dark");
+  void setVibrancy(requested, entry.theme.meta.appearance === "dark").then((applied) => {
+    // Requested but not applied (unsupported platform, or the native call failed): fall back to opaque.
+    // Ignore a stale answer if the theme changed meanwhile.
+    if (requested && !applied && themeId() === id) document.documentElement.setAttribute("data-vibrancy", "false");
+  });
+  if (!persist) return;
   try {
     localStorage.setItem("atrium.theme", id);
   } catch {
@@ -84,6 +90,14 @@ export function toggleAppearance(): void {
 
 // -- layout -----------------------------------------------------------------
 
+/** Layout animation lasts `--motion-normal` (plus a frame of slack); read from the active theme. */
+function layoutAnimationMs(): number {
+  const raw = getComputedStyle(document.documentElement).getPropertyValue("--motion-normal").trim();
+  const n = Number.parseFloat(raw);
+  const ms = raw.endsWith("ms") ? n : raw.endsWith("s") ? n * 1000 : 220;
+  return (Number.isFinite(ms) ? ms : 220) + 40;
+}
+
 let animTimer: number | undefined;
 export function applyPreset(id: PresetId, silent = false): void {
   const p = PRESETS[id];
@@ -91,7 +105,7 @@ export function applyPreset(id: PresetId, silent = false): void {
   const share = split ? p.splitShare : p.chatShare;
   setAnimateLayout(true);
   window.clearTimeout(animTimer);
-  animTimer = window.setTimeout(() => setAnimateLayout(false), 320);
+  animTimer = window.setTimeout(() => setAnimateLayout(false), layoutAnimationMs());
   batch(() => {
     setPresetId(id);
     setOuterSizes([...p.outer]);
@@ -105,7 +119,7 @@ export function toggleSidebar(): void {
   const [s, m, r] = outerSizes() as [number, number, number];
   setAnimateLayout(true);
   window.clearTimeout(animTimer);
-  animTimer = window.setTimeout(() => setAnimateLayout(false), 320);
+  animTimer = window.setTimeout(() => setAnimateLayout(false), layoutAnimationMs());
   if (s > 0.01) setOuterSizes([0, m + s, r]);
   else setOuterSizes([0.17, Math.max(0.3, m - 0.17), r]);
 }
@@ -114,7 +128,7 @@ export function toggleRightPanel(): void {
   const [s, m, r] = outerSizes() as [number, number, number];
   setAnimateLayout(true);
   window.clearTimeout(animTimer);
-  animTimer = window.setTimeout(() => setAnimateLayout(false), 320);
+  animTimer = window.setTimeout(() => setAnimateLayout(false), layoutAnimationMs());
   if (r > 0.01) setOuterSizes([s, m + r, 0]);
   else setOuterSizes([s, Math.max(0.3, m - 0.33), 0.33]);
 }
@@ -132,6 +146,20 @@ export function openThread(threadId: string): void {
   batch(() => {
     setTabs((ts) => [...ts, tab]);
     setActiveTabId(tab.id);
+  });
+}
+
+/** Activates the Home tab, recreating it if it was closed. */
+export function openHome(): void {
+  const existing = tabs().find((t) => t.kind === "home");
+  if (existing) {
+    setActiveTabId(existing.id);
+    return;
+  }
+  const home = INITIAL_TABS.find((t) => t.kind === "home")!;
+  batch(() => {
+    setTabs((ts) => [...ts, home]);
+    setActiveTabId(home.id);
   });
 }
 

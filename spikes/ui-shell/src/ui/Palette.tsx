@@ -166,7 +166,7 @@ export function Palette() {
           <Dialog.Content class="palette" aria-label="Command palette" data-atrium-part="palette">
             <Dialog.Title class="sr-only">Command palette</Dialog.Title>
             <PaletteBody />
-            <div class="pal-foot"><CornerDownLeft size={12} /> run <span class="pal-sep" /> up/down move <span class="pal-sep" /> esc close</div>
+            <div class="pal-foot"><CornerDownLeft class="icon-xs" /> run <span class="pal-sep" /> up/down move <span class="pal-sep" /> esc close</div>
           </Dialog.Content>
         </div>
       </Dialog.Portal>

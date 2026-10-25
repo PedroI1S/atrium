@@ -10,6 +10,21 @@ export interface Rgba {
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
 
+// One CSS <number> or <percentage>. Anything else (units, junk suffixes, exponents) is rejected.
+const N = "[+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)%?";
+// Legacy syntax: commas between all components. Modern syntax: spaces, `/` before alpha. Never mixed.
+const RGB_LEGACY = new RegExp(`^rgba?\\(\\s*(${N})\\s*,\\s*(${N})\\s*,\\s*(${N})\\s*(?:,\\s*(${N})\\s*)?\\)$`);
+const RGB_MODERN = new RegExp(`^rgba?\\(\\s*(${N})\\s+(${N})\\s+(${N})\\s*(?:/\\s*(${N})\\s*)?\\)$`);
+
+/** Strict `rgb()`/`rgba()`: returns [r, g, b, a] (channels 0..255, alpha 0..1) or null if it is not valid CSS. */
+function parseRgbFunction(s: string): [number, number, number, number] | null {
+  const m = RGB_LEGACY.exec(s) ?? RGB_MODERN.exec(s);
+  if (!m) return null;
+  const channel = (p: string) => (p.endsWith("%") ? (Number.parseFloat(p) / 100) * 255 : Number.parseFloat(p));
+  const alpha = (p: string | undefined) => (p === undefined ? 1 : p.endsWith("%") ? Number.parseFloat(p) / 100 : Number.parseFloat(p));
+  return [channel(m[1] as string), channel(m[2] as string), channel(m[3] as string), alpha(m[4])];
+}
+
 /** Parses `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `rgb()`/`rgba()`. Returns null otherwise. */
 export function parseColor(input: string): Rgba | null {
   const s = input.trim().toLowerCase();
@@ -22,15 +37,9 @@ export function parseColor(input: string): Rgba | null {
     const n = (i: number) => Number.parseInt(h.slice(i, i + 2), 16);
     return { r: n(0), g: n(2), b: n(4), a: h.length === 8 ? n(6) / 255 : 1 };
   }
-  const m = /^rgba?\(([^)]+)\)$/.exec(s);
-  if (m?.[1]) {
-    const parts = m[1].split(/[\s,/]+/).filter(Boolean);
-    if (parts.length < 3 || parts.length > 4) return null;
-    const ch = (p: string) => (p.endsWith("%") ? (Number.parseFloat(p) / 100) * 255 : Number.parseFloat(p));
-    const [r, g, b] = [ch(parts[0]!), ch(parts[1]!), ch(parts[2]!)];
-    let a = 1;
-    if (parts[3] !== undefined) a = parts[3].endsWith("%") ? Number.parseFloat(parts[3]) / 100 : Number.parseFloat(parts[3]);
-    if ([r, g, b, a].some((v) => Number.isNaN(v))) return null;
+  const parts = parseRgbFunction(s);
+  if (parts) {
+    const [r, g, b, a] = parts;
     return { r: clamp(r, 0, 255), g: clamp(g, 0, 255), b: clamp(b, 0, 255), a: clamp(a, 0, 1) };
   }
   return null;

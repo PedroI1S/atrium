@@ -15,7 +15,7 @@ export function RightPanel() {
             const Icon = ICONS[t.id];
             return (
               <Tabs.Trigger class="right-tab" value={t.id}>
-                <Icon size={13} /> {t.label}
+                <Icon class="icon-sm" /> {t.label}
               </Tabs.Trigger>
             );
           }}
