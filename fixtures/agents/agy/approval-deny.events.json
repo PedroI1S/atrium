@@ -1,0 +1,100 @@
+[
+  {
+    "type": "session_started",
+    "provider": "agy",
+    "native_session_id": "11111111-0005-4000-8000-000000000005",
+    "model": "gemini-3.8-flash-medium",
+    "tools": [
+      "ask_question",
+      "call_mcp_tool",
+      "edit_file",
+      "find_by_name",
+      "grep_search",
+      "list_dir",
+      "read_file",
+      "run_command",
+      "search_web",
+      "view_file",
+      "write_file"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "step-2",
+    "name": "run_command",
+    "kind": "execute",
+    "title": "echo should-be-denied",
+    "input": {
+      "CommandLine": "echo should-be-denied"
+    }
+  },
+  {
+    "type": "approval_requested",
+    "request_id": "req-1",
+    "call_id": "step-2",
+    "name": "run_command",
+    "kind": "execute",
+    "title": "echo should-be-denied",
+    "input": {
+      "CommandLine": "echo should-be-denied"
+    },
+    "reason": null
+  },
+  {
+    "type": "request_resolved",
+    "request_id": "req-1",
+    "outcome": "denied"
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "step-2",
+    "status": "denied",
+    "output": null,
+    "error": "tool call denied by pre-tool hook: denied by user in approval-deny scenario"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg-3",
+    "kind": "assistant",
+    "text": "The command was denied by the user."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg-3",
+    "kind": "assistant",
+    "text": "The command was denied by the user."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 400,
+      "output_tokens": 25,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 9,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 400,
+      "output_tokens": 25,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 9,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

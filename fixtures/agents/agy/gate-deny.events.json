@@ -1,0 +1,100 @@
+[
+  {
+    "type": "session_started",
+    "provider": "agy",
+    "native_session_id": "11111111-0003-4000-8000-000000000003",
+    "model": "gemini-3.8-flash-medium",
+    "tools": [
+      "ask_question",
+      "call_mcp_tool",
+      "edit_file",
+      "find_by_name",
+      "grep_search",
+      "list_dir",
+      "read_file",
+      "run_command",
+      "search_web",
+      "view_file",
+      "write_file"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "step-2",
+    "name": "read_file",
+    "kind": "read",
+    "title": "~/scratch/secret.txt",
+    "input": {
+      "Path": "~/scratch/secret.txt"
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "step-2",
+    "status": "denied",
+    "output": null,
+    "error": "tool call denied by pre-tool hook: reading secret.txt is denied by Atrium policy"
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "step-4",
+    "name": "run_command",
+    "kind": "execute",
+    "title": "cat ~/scratch/secret.txt",
+    "input": {
+      "CommandLine": "cat ~/scratch/secret.txt"
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "step-4",
+    "status": "denied",
+    "output": null,
+    "error": "tool call denied by pre-tool hook: executing cat on secret.txt is denied by Atrium policy"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg-5",
+    "kind": "assistant",
+    "text": "Both read_file and run_command on secret.txt were denied by Atrium policy."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg-5",
+    "kind": "assistant",
+    "text": "Both read_file and run_command on secret.txt were denied by Atrium policy."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 780,
+      "output_tokens": 60,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 30,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 780,
+      "output_tokens": 60,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 30,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

@@ -1,0 +1,71 @@
+[
+  {
+    "type": "session_started",
+    "provider": "agy",
+    "native_session_id": "11111111-0007-4000-8000-000000000007",
+    "model": "gemini-3.8-flash-medium",
+    "tools": [
+      "ask_question",
+      "call_mcp_tool",
+      "edit_file",
+      "find_by_name",
+      "grep_search",
+      "list_dir",
+      "read_file",
+      "run_command",
+      "search_web",
+      "view_file",
+      "write_file"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "step-2",
+    "name": "run_command",
+    "kind": "execute",
+    "title": "sleep 10",
+    "input": {
+      "CommandLine": "sleep 10"
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "step-2",
+    "status": "cancelled",
+    "output": null,
+    "error": null
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 160,
+      "output_tokens": 12,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 4,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "interrupted",
+    "usage": {
+      "input_tokens": 160,
+      "output_tokens": 12,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 4,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 130,
+    "reason": null
+  }
+]

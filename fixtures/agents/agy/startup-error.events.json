@@ -1,0 +1,12 @@
+[
+  {
+    "type": "error",
+    "message": "Error: invalid or unknown model 'invalid-model-does-not-exist'",
+    "fatal": true
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 1,
+    "reason": "startup failed"
+  }
+]

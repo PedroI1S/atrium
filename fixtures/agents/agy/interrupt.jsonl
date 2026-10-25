@@ -1,0 +1,11 @@
+{"ms":0,"dir":"command","command":{"type":"send_user_message","text":"Run sleep 10."}}
+{"ms":1,"dir":"stdin","line":"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Run sleep 10.\"}}"}
+{"ms":10,"dir":"stdout","line":"{\"event\":\"init\",\"conversation_id\":\"11111111-0007-4000-8000-000000000007\",\"init\":{\"model\":\"gemini-3.8-flash-medium\",\"cwd\":\"~/Documents/atrium-wt/M0-03-agy-adapter\",\"tools\":[\"ask_question\",\"call_mcp_tool\",\"edit_file\",\"find_by_name\",\"grep_search\",\"list_dir\",\"read_file\",\"run_command\",\"search_web\",\"view_file\",\"write_file\"],\"permission_mode\":\"always-proceed\"}}"}
+{"ms":15,"dir":"stdout","line":"{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"11111111-0007-4000-8000-000000000007\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}"}
+{"ms":40,"dir":"stdout","line":"{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"11111111-0007-4000-8000-000000000007\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"duration_seconds\":0.02,\"usage\":{\"input_tokens\":160,\"output_tokens\":12,\"thinking_tokens\":4,\"cache_read_tokens\":0,\"total_tokens\":172}}}"}
+{"ms":45,"dir":"stdout","line":"{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"11111111-0007-4000-8000-000000000007\",\"step_index\":2,\"state\":\"ACTIVE\",\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"tool_info\":{\"name\":\"run_command\",\"parameters\":{\"CommandLine\":\"sleep 10\"}}}}"}
+{"ms":48,"dir":"hook_request","id":"req-1","payload":{"toolCall":{"name":"run_command","args":{"CommandLine":"sleep 10"}},"workspacePaths":["~/scratch"]}}
+{"ms":50,"dir":"gate","check":{"call_id":"step-2","name":"run_command","kind":"execute","title":"sleep 10","input":{"CommandLine":"sleep 10"}},"decision":{"type":"allow"}}
+{"ms":52,"dir":"hook_response","id":"req-1","payload":{"decision":"allow"}}
+{"ms":80,"dir":"command","command":{"type":"interrupt"}}
+{"ms":95,"dir":"exit","code":130}

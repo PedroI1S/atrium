@@ -1,0 +1,121 @@
+[
+  {
+    "type": "session_started",
+    "provider": "agy",
+    "native_session_id": "11111111-0006-4000-8000-000000000006",
+    "model": "gemini-3.8-flash-medium",
+    "tools": [
+      "ask_question",
+      "call_mcp_tool",
+      "edit_file",
+      "find_by_name",
+      "grep_search",
+      "list_dir",
+      "read_file",
+      "run_command",
+      "search_web",
+      "view_file",
+      "write_file"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "question_asked",
+    "request_id": "req-q1",
+    "questions": [
+      {
+        "id": "q-0",
+        "prompt": "Which build profile should we use?",
+        "options": [
+          {
+            "id": "opt-0",
+            "label": "Debug",
+            "description": "Recommended"
+          },
+          {
+            "id": "opt-1",
+            "label": "Release",
+            "description": null
+          }
+        ],
+        "multi_select": false,
+        "allow_text": false
+      }
+    ]
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "step-2",
+    "name": "ask_question",
+    "kind": "other",
+    "title": null,
+    "input": {
+      "questions": [
+        {
+          "question": "Which build profile should we use?",
+          "options": [
+            "(Recommended) Debug",
+            "Release"
+          ],
+          "is_multi_select": false
+        }
+      ]
+    }
+  },
+  {
+    "type": "request_resolved",
+    "request_id": "req-q1",
+    "outcome": "answered"
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "step-2",
+    "status": "succeeded",
+    "output": "Selected: Debug",
+    "error": null
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg-3",
+    "kind": "assistant",
+    "text": "Proceeding with the Debug build profile."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg-3",
+    "kind": "assistant",
+    "text": "Proceeding with the Debug build profile."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 420,
+      "output_tokens": 30,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 10,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 420,
+      "output_tokens": 30,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 10,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]
