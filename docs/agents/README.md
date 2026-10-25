@@ -33,6 +33,10 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 
 ## Prior art (when stuck)
 
-- **MonoCode** (`github.com/hardbeat920/monocode`, MIT): a working reference for driving native agents.
-  - Its OpenCode connector uses `opencode serve` (HTTP API) with per-session permission rules, plus per-prompt model and `variant` (reasoning level) selection. See `src/integrations/harness/providers/opencode/`.
-  - Read it for protocol shapes and edge cases. Copy no code, and credit it in the spike report when it informs a design.
+These projects are open source and solve the same problems. Read them for protocol shapes, edge cases and design ideas. **Copy no code**: check each repo's (or crate's) license first, and credit the source in the spike report when it informs a design.
+
+- **MonoCode** (`github.com/hardbeat920/monocode`, MIT): drives many native agents from a Tauri app.
+  - Its OpenCode connector uses `opencode serve` (HTTP API) with per-session permission rules and per-prompt model + `variant` (reasoning level). See `src/integrations/harness/providers/opencode/`.
+  - Connectors for other agents live next to it.
+- **Zed** (`github.com/zed-industries/zed`): the origin of the Agent Client Protocol (`agent-client-protocol` crate) and of the ACP client side: how an editor drives external agents, permissions, tool calls and terminals. Licenses differ per crate (some are GPL/AGPL), so ideas only.
+- **T3 Code** (`github.com/pingdotgg/t3code`): provider adapters over native protocols, an event-sourced thread model, checkpoints (PLAN §2).
