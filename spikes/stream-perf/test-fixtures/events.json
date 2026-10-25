@@ -1,0 +1,90 @@
+[
+  {
+    "id": 1,
+    "thread_id": "t-a",
+    "envelope": {
+      "seq": 1,
+      "at_ms": 1760000000001,
+      "event": {
+        "type": "turn_started",
+        "turn": 1
+      }
+    }
+  },
+  {
+    "id": 2,
+    "thread_id": "t-a",
+    "envelope": {
+      "seq": 2,
+      "at_ms": 1760000000002,
+      "event": {
+        "type": "message_delta",
+        "message_id": "1",
+        "kind": "assistant",
+        "text": "Hello, \"wor\\ld\"\n\n"
+      }
+    }
+  },
+  {
+    "id": 3,
+    "thread_id": "t-b",
+    "envelope": {
+      "seq": 3,
+      "at_ms": 1760000000003,
+      "event": {
+        "type": "message_delta",
+        "message_id": "1",
+        "kind": "assistant",
+        "text": "café 😀 ok"
+      }
+    }
+  },
+  {
+    "id": 4,
+    "thread_id": "t-a",
+    "envelope": {
+      "seq": 4,
+      "at_ms": 1760000000004,
+      "event": {
+        "type": "tool_call_started",
+        "call_id": "c1",
+        "name": "fake_read",
+        "kind": "read",
+        "title": "read file",
+        "input": {
+          "path": "a.rs",
+          "n": 3
+        }
+      }
+    }
+  },
+  {
+    "id": 5,
+    "thread_id": "t-a",
+    "envelope": {
+      "seq": 5,
+      "at_ms": 1760000000005,
+      "event": {
+        "type": "tool_call_finished",
+        "call_id": "c1",
+        "status": "succeeded",
+        "output": "done",
+        "error": null
+      }
+    }
+  },
+  {
+    "id": 6,
+    "thread_id": "t-b",
+    "envelope": {
+      "seq": 6,
+      "at_ms": 1760000000006,
+      "event": {
+        "type": "message_completed",
+        "message_id": "1",
+        "kind": "assistant",
+        "text": "café 😀 ok"
+      }
+    }
+  }
+]

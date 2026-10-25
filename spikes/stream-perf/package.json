@@ -1,0 +1,30 @@
+{
+  "name": "atrium-stream-perf",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "tauri": "tauri",
+    "bench": "python3 scripts/bench.py",
+    "bench:build": "python3 scripts/bench.py build"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.2",
+    "@tanstack/solid-virtual": "^3.13.49",
+    "@tauri-apps/api": "^2.12.4",
+    "marked": "^16.4.2",
+    "solid-js": "^1.9.17"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vite-plugin-solid": "^2.11.14",
+    "vitest": "^5.0.5"
+  }
+}

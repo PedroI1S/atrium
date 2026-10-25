@@ -1,0 +1,28 @@
+/* Semantic tokens copied from M0-06's "Flat Dark" theme (names unchanged, primitives resolved).
+ * Only what this spike uses; the real token pipeline lives in spikes/ui-shell. */
+:root {
+  --surface-0: #0c0c0d;
+  --surface-1: #131315;
+  --surface-2: #1c1c1f;
+  --text: #ededee;
+  --text-muted: #a1a1a6;
+  --text-faint: #6e6e74;
+  --text-on-accent: #04140d;
+  --border: #26262a;
+  --border-strong: #3a3a40;
+  --focus-ring: #34d399;
+  --accent: #34d399;
+  --accent-muted: rgba(52, 211, 153, 0.16);
+  --danger: #f87171;
+  --warning: #fbbf24;
+  --success: #4ade80;
+  --info: #60a5fa;
+  --code-bg: #0f0f11;
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  --font-code: ui-monospace, "SF Mono", Menlo, monospace;
+  --text-sm: 11px;
+  --text-md: 12.5px;
+  --text-lg: 14px;
+  --radius: 4px;
+  color-scheme: dark;
+}

@@ -1,0 +1,37 @@
+[package]
+name = "atrium-stream-perf"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "UNLICENSED"
+publish = false
+description = "Atrium M0-07 spike: 10k tokens/s through daemon, unix socket, Tauri IPC and a SolidJS transcript"
+
+# Standalone project: not a member of the repository's root workspace.
+[workspace]
+
+[lib]
+name = "atrium_stream_perf_lib"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# M0-05's client (ClientHandle / EventStream) and, through it, the frozen wire contract.
+spike-daemon-socket = { path = "../../daemon-socket" }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[[example]]
+name = "stream-perf-encode-bench"
+path = "examples/encode_bench.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+strip = true

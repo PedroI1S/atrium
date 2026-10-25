@@ -1,0 +1,47 @@
+*, *::before, *::after { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body { background: var(--surface-0); color: var(--text); font: 400 var(--text-md) / 1.45 var(--font-ui); -webkit-font-smoothing: antialiased; overflow: hidden; }
+button, select, input, textarea { font: inherit; color: inherit; }
+
+.app { display: grid; grid-template-rows: auto auto 1fr auto; height: 100%; }
+.bar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--surface-1); }
+.bar label { display: inline-flex; gap: 6px; align-items: center; color: var(--text-muted); }
+.bar select, .bar input { background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--radius); padding: 2px 6px; }
+.bar input[type="number"] { width: 70px; }
+.btn { background: var(--accent); color: var(--text-on-accent); border: 0; border-radius: var(--radius); padding: 4px 12px; cursor: pointer; font-weight: 600; }
+.btn.secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--border-strong); }
+.stats { margin-left: auto; font: var(--text-sm) var(--font-code); color: var(--text-muted); white-space: pre; }
+
+.tabs { display: flex; gap: 2px; padding: 4px 8px 0; border-bottom: 1px solid var(--border); background: var(--surface-1); overflow-x: auto; }
+.tab { padding: 4px 10px; border: 1px solid transparent; border-bottom: 0; border-radius: var(--radius) var(--radius) 0 0; color: var(--text-muted); background: transparent; cursor: pointer; white-space: nowrap; }
+.tab.active { background: var(--surface-0); color: var(--text); border-color: var(--border); }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); margin-right: 6px; }
+.dot.running { background: var(--info); }
+
+.transcript { overflow-y: auto; overflow-x: hidden; position: relative; contain: strict; background: var(--surface-0); }
+.spacer { position: relative; width: 100%; }
+.vrow { position: absolute; top: 0; left: 0; width: 100%; padding: 0 16px; }
+.md { padding: 3px 0; max-width: 78ch; margin: 0 auto; word-wrap: break-word; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md blockquote, .md table, .md pre { margin: 0 0 6px; }
+.md h2, .md h3 { margin: 8px 0 4px; font-size: var(--text-lg); }
+.md code { font: 11.5px var(--font-code); background: var(--code-bg); padding: 0 3px; border-radius: 3px; }
+.md pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; overflow: hidden; }
+.md pre code { padding: 0; background: none; white-space: pre; }
+.md blockquote { border-left: 2px solid var(--border-strong); padding-left: 10px; color: var(--text-muted); }
+.md table { border-collapse: collapse; }
+.md th, .md td { border: 1px solid var(--border); padding: 2px 8px; }
+.md.reasoning { color: var(--text-faint); }
+.md a { color: var(--info); text-decoration: none; }
+.tool { max-width: 78ch; margin: 3px auto; padding: 4px 8px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); font: 11.5px var(--font-code); color: var(--text-muted); display: flex; gap: 8px; align-items: baseline; }
+.tool .status { margin-left: auto; color: var(--text-faint); }
+.tool .status.succeeded { color: var(--success); }
+.tool .status.running { color: var(--info); }
+.note { max-width: 78ch; margin: 2px auto; color: var(--text-faint); font-size: var(--text-sm); }
+.note.error { color: var(--danger); }
+
+.composer { display: flex; gap: 8px; align-items: flex-end; padding: 8px 12px; border-top: 1px solid var(--border); background: var(--surface-1); }
+.composer textarea { flex: 1; resize: none; height: 54px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--radius); padding: 6px 8px; outline: none; }
+.composer textarea:focus { border-color: var(--focus-ring); }
+.composer .count { color: var(--text-faint); font: var(--text-sm) var(--font-code); min-width: 56px; text-align: right; }
