@@ -9,9 +9,7 @@ use spike_daemon_socket::{
 use std::{
     collections::BTreeSet,
     fs, io,
-    os::unix::{
-        fs::{PermissionsExt, symlink},
-    },
+    os::unix::fs::{PermissionsExt, symlink},
     path::PathBuf,
     process::{Child, Command, Stdio},
     time::Duration,
@@ -64,7 +62,7 @@ impl Daemon {
         let child = Command::new(env!("CARGO_BIN_EXE_spike-daemon"))
             .arg("--dir")
             .arg(dir)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
@@ -72,20 +70,14 @@ impl Daemon {
             child,
             dir: dir.into(),
         };
-        for _ in 0..200 {
-            if Client::connect(dir.join("daemon.sock"), "ready")
-                .await
-                .is_ok()
-            {
-                return d;
-            }
-            assert!(
-                d.child.try_wait().unwrap().is_none(),
-                "daemon exited before ready"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("daemon not ready");
+        // The child announces readiness only after recovery and socket publication.
+        use std::io::BufRead;
+        let mut ready = String::new();
+        std::io::BufReader::new(d.child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "READY", "daemon exited before ready");
+        d
     }
     async fn client(&self) -> Client {
         Client::connect(self.dir.join("daemon.sock"), "test")
@@ -203,6 +195,20 @@ async fn security_and_single_instance() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("another daemon"));
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::metadata(path.join("daemon.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let mut survivor = d.client().await;
+    assert!(matches!(
+        survivor.command(DaemonCommand::ListThreads).await.unwrap(),
+        CommandResult::Ok { .. }
+    ));
     drop(d);
 }
 trait ErrString {
@@ -244,48 +250,68 @@ async fn subscribe_errors_and_replacement() {
     assert!(until_done(&mut c).await.is_empty());
 }
 #[tokio::test]
-async fn replay_live_boundary_repeated_with_concurrent_append() {
+async fn replay_live_boundary_current_thread() {
+    replay_boundary().await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_live_boundary_multi_thread() {
+    replay_boundary().await;
+}
+async fn replay_boundary() {
     let dir = temp();
     let store = seed(dir.path(), 1024).await;
+    let (entered, mut at_boundary) = tokio::sync::mpsc::channel(1);
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = daemon::ReplayGate {
+        entered,
+        release: release.clone(),
+    };
+    let (ready, wait_ready) = tokio::sync::oneshot::channel();
     let path = dir.path().to_owned();
     let writer = store.clone();
     let serving = tokio::spawn(async move {
-        daemon::run_with_store(
+        daemon::run_with_replay_gate(
             &path,
             PathBuf::from(env!("CARGO_BIN_EXE_spike-fake-agent")),
             writer,
+            gate,
+            ready,
         )
         .await
         .unwrap()
     });
-    let socket = dir.path().join("daemon.sock");
-    for _ in 0..100 {
-        if Client::connect(&socket, "ready").await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_ready.await.unwrap();
     for round in 0..25 {
-        let mut c = Client::connect(&socket, "boundary").await.unwrap();
+        let mut c = Client::connect(dir.path().join("daemon.sock"), "boundary")
+            .await
+            .unwrap();
         let base = 1024 + round * 64;
-        let writer = store.clone();
-        let writing = tokio::spawn(async move {
-            for seq in base..base + 64 {
-                writer
-                    .append(ThreadId("t".into()), vec![envelope(seq)])
-                    .await
-                    .unwrap();
-                tokio::task::yield_now().await;
-            }
-        });
-        let response = c
+        let result = c
             .subscribe(ThreadId("t".into()), Some(EventId(base - 512)))
             .await
             .unwrap();
-        let CommandResult::Ok { value } = response else {
-            panic!("subscribe failed")
+        let CommandResult::Ok { value } = result else {
+            panic!()
         };
-        let boundary = value["replay_until"].as_u64().unwrap();
+        assert_eq!(value["replay_until"].as_u64(), Some(base));
+        assert_eq!(at_boundary.recv().await.unwrap(), ThreadId("t".into()));
+        // The daemon is blocked after responding and before querying page one.
+        store
+            .append(
+                ThreadId("t".into()),
+                (base..base + 64).map(envelope).collect(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store::last(
+                &store::open_reader(&store.path).unwrap(),
+                &ThreadId("t".into())
+            )
+            .unwrap(),
+            Some(EventId(base + 64))
+        );
+        release.add_permits(1);
         let mut next = base - 512 + 1;
         let mut done = false;
         timeout(Duration::from_secs(10), async {
@@ -293,28 +319,22 @@ async fn replay_live_boundary_repeated_with_concurrent_append() {
                 match c.next().await.unwrap() {
                     ServerMessage::Event { event } => {
                         assert_eq!(event.id.0, next);
-                        if !done {
-                            assert!(event.id.0 <= boundary);
-                        } else {
-                            assert!(event.id.0 > boundary);
-                        }
-                        next += 1;
+                        assert_eq!(event.id.0 > base, done);
                         c.applied(&event.thread_id, event.id);
+                        next += 1;
                     }
                     ServerMessage::ReplayDone { last, .. } => {
                         assert!(!done);
-                        assert_eq!(last, Some(EventId(boundary)));
-                        assert_eq!(next, boundary + 1);
+                        assert_eq!(last, Some(EventId(base)));
+                        assert_eq!(next, base + 1);
                         done = true;
                     }
-                    _ => panic!("unexpected message"),
+                    other => panic!("{other:?}"),
                 }
             }
         })
         .await
         .unwrap();
-        writing.await.unwrap();
-        assert!(done);
     }
     serving.abort();
     let _ = serving.await;
@@ -354,78 +374,122 @@ async fn reconnect_replays_read_but_unapplied_after_daemon_crash() {
 }
 #[tokio::test]
 async fn command_executed_response_lost_is_unknown_and_never_retried() {
+    use spike_daemon_socket::CommandError;
     let dir = temp();
     let d = Daemon::start(dir.path()).await;
     let socket = dir.path().join("proxy.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     let upstream = dir.path().join("daemon.sock");
+    let (paused, at_handshake) = tokio::sync::oneshot::channel();
+    let (resume, wait_resume) = tokio::sync::oneshot::channel();
+    let (finish, wait_finish) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        let (mut downstream, _) = listener.accept().await.unwrap();
-        let mut upstream = UnixStream::connect(upstream).await.unwrap();
-        let hello = codec::read::<_, ClientMessage>(&mut downstream)
-            .await
-            .unwrap();
-        codec::write(&mut upstream, &hello).await.unwrap();
-        let welcome = codec::read::<_, ServerMessage>(&mut upstream)
-            .await
-            .unwrap();
-        codec::write(&mut downstream, &welcome).await.unwrap();
-        let command = codec::read::<_, ClientMessage>(&mut downstream)
-            .await
-            .unwrap();
-        assert!(matches!(
-            command,
-            Frame::Control(ClientMessage::Command {
-                command: DaemonCommand::StartThread { .. },
-                ..
-            })
-        ));
-        codec::write(&mut upstream, &command).await.unwrap();
-        // Execution completed in the actual daemon. Discard its response.
-        assert!(matches!(
-            codec::read::<_, ServerMessage>(&mut upstream)
+        let mut paused = Some(paused);
+        let mut wait_resume = Some(wait_resume);
+        let mut wait_finish = Some(wait_finish);
+        for attempt in 0..2 {
+            let (mut downstream, _) = listener.accept().await.unwrap();
+            let mut upstream = UnixStream::connect(&upstream).await.unwrap();
+            let hello = codec::read::<_, ClientMessage>(&mut downstream)
                 .await
-                .unwrap(),
-            Frame::Control(ServerMessage::Response {
-                result: CommandResult::Ok { .. },
-                ..
-            })
-        ));
-        drop(downstream);
-        assert!(
-            timeout(Duration::from_millis(100), listener.accept())
+                .unwrap();
+            codec::write(&mut upstream, &hello).await.unwrap();
+            let welcome = codec::read::<_, ServerMessage>(&mut upstream)
                 .await
-                .is_err()
-        );
+                .unwrap();
+            if attempt == 0 {
+                codec::write(&mut downstream, &welcome).await.unwrap();
+                let command = codec::read::<_, ClientMessage>(&mut downstream)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    command,
+                    Frame::Control(ClientMessage::Command {
+                        command: DaemonCommand::StartThread { .. },
+                        ..
+                    })
+                ));
+                codec::write(&mut upstream, &command).await.unwrap();
+                assert!(matches!(
+                    codec::read::<_, ServerMessage>(&mut upstream)
+                        .await
+                        .unwrap(),
+                    Frame::Control(ServerMessage::Response {
+                        result: CommandResult::Ok { .. },
+                        ..
+                    })
+                ));
+                drop(downstream); // side effect committed; response lost
+            } else {
+                // Reconnect is paused before Welcome. A queued command must wait.
+                paused.take().unwrap().send(()).unwrap();
+                wait_resume.take().unwrap().await.unwrap();
+                codec::write(&mut downstream, &welcome).await.unwrap();
+                let command = codec::read::<_, ClientMessage>(&mut downstream)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    command,
+                    Frame::Control(ClientMessage::Command {
+                        command: DaemonCommand::ListThreads,
+                        ..
+                    })
+                ));
+                codec::write(&mut upstream, &command).await.unwrap();
+                let response = codec::read::<_, ServerMessage>(&mut upstream)
+                    .await
+                    .unwrap();
+                codec::write(&mut downstream, &response).await.unwrap();
+                wait_finish.take().unwrap().await.unwrap();
+                return;
+            }
+        }
     });
     let mut c = Client::connect(socket, "loss").await.unwrap();
-    assert!(
-        c.command(DaemonCommand::StartThread {
+    let result = c
+        .command(DaemonCommand::StartThread {
             agent: AgentLaunch::Fake {
                 tokens_per_second: 100,
                 chunk_chars: 200,
-                duration_ms: 200,
-                tool_call_every_ms: 0
+                duration_ms: 10,
+                tool_call_every_ms: 0,
             },
-            cwd: "/tmp".into()
+            cwd: "/tmp".into(),
         })
-        .await
-        .is_err()
-    );
-    server.await.unwrap();
-    let mut observer = d.client().await;
-    let CommandResult::Ok { value } = observer.command(DaemonCommand::ListThreads).await.unwrap()
-    else {
+        .await;
+    assert!(matches!(result, Err(CommandError::UnknownOutcome(_))));
+    at_handshake.await.unwrap();
+    let handle = c.handle();
+    let request = handle.command(DaemonCommand::ListThreads);
+    tokio::pin!(request);
+    std::future::poll_fn(|cx| {
+        use std::future::Future;
+        assert!(request.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    resume.send(()).unwrap();
+    let CommandResult::Ok { value } = request.await.unwrap() else {
         panic!()
     };
     assert_eq!(
         value.as_array().unwrap().len(),
         1,
-        "command must execute once"
+        "no automatic command retry"
     );
-    // Let the short-lived child exit and be reaped before dropping the daemon.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let thread = ThreadId(value[0]["thread_id"].as_str().unwrap().into());
+    let mut observer = d.client().await;
+    observer.subscribe(thread, None).await.unwrap();
+    loop {
+        if let ServerMessage::Event { event } = observer.next().await.unwrap()
+            && matches!(event.envelope.event, AgentEvent::SessionEnded { .. })
+        {
+            break;
+        }
+    }
+    finish.send(()).unwrap();
+    server.await.unwrap();
 }
 #[tokio::test]
 async fn automatic_reconnect_from_applied_cursor() {
@@ -436,14 +500,24 @@ async fn automatic_reconnect_from_applied_cursor() {
     c.subscribe(ThreadId("t".into()), Some(EventId(5)))
         .await
         .unwrap();
-    // Explicitly losing transport (a failed command) exercises next's automatic path.
+    // EOF after the daemon exits triggers the actor's automatic reconnect.
     let ids = until_done(&mut c).await;
     assert_eq!(ids.len(), 5);
     for id in ids {
         c.applied(&ThreadId("t".into()), id);
     }
     drop(d);
+    _store
+        .append(ThreadId("t".into()), (10..20).map(envelope).collect())
+        .await
+        .unwrap();
     let d = Daemon::start(dir.path()).await;
+    let replayed = until_done(&mut c).await;
+    assert_eq!(replayed, (11..=20).map(EventId).collect::<Vec<_>>());
+    for id in replayed {
+        c.applied(&ThreadId("t".into()), id);
+    }
+    c.reconnect().await.unwrap();
     let msg = timeout(Duration::from_secs(5), c.next())
         .await
         .unwrap()
@@ -451,7 +525,7 @@ async fn automatic_reconnect_from_applied_cursor() {
     assert!(matches!(
         msg,
         ServerMessage::ReplayDone {
-            last: Some(EventId(10)),
+            last: Some(EventId(20)),
             ..
         }
     ));
@@ -465,29 +539,52 @@ async fn orphan_recovery_and_identity_mismatch() {
     // matching process; its parent (this test) can prove the terminating signal.
     use std::os::unix::process::ExitStatusExt;
     let mut orphan = tokio::process::Command::new("/bin/sleep")
-        .arg("60").kill_on_drop(true).spawn().unwrap();
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
     let mut bystander = tokio::process::Command::new("/bin/sleep")
-        .arg("60").kill_on_drop(true).spawn().unwrap();
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
     let saved = daemon::identity(orphan.id().unwrap()).unwrap();
-    let mismatch = Identity { start: "different start time".into(),
-        ..daemon::identity(bystander.id().unwrap()).unwrap() };
+    let mismatch = Identity {
+        start: "different start time".into(),
+        ..daemon::identity(bystander.id().unwrap()).unwrap()
+    };
     let thread = ThreadId("orphan".into());
     let cdb = rusqlite::Connection::open(dir.path().join("events.sqlite")).unwrap();
     for (id, identity) in [("orphan", &saved), ("mismatch", &mismatch)] {
-        cdb.execute("INSERT INTO threads(id,running,pid,start,exe) VALUES(?1,1,?2,?3,?4)",
-            rusqlite::params![id, identity.pid, identity.start, identity.exe]).unwrap();
+        cdb.execute(
+            "INSERT INTO threads(id,running,pid,start,exe) VALUES(?1,1,?2,?3,?4)",
+            rusqlite::params![id, identity.pid, identity.start, identity.exe],
+        )
+        .unwrap();
     }
-    for (seq, event) in [AgentEvent::TurnStarted { turn: 1 }, envelope(0).event].into_iter().enumerate() {
-        let env = AgentEventEnvelope { seq: seq as u64, at_ms: 0, event };
-        cdb.execute("INSERT INTO events(thread_id,envelope_json) VALUES('orphan',?1)",
-            [serde_json::to_string(&env).unwrap()]).unwrap();
+    for (seq, event) in [AgentEvent::TurnStarted { turn: 1 }, envelope(0).event]
+        .into_iter()
+        .enumerate()
+    {
+        let env = AgentEventEnvelope {
+            seq: seq as u64,
+            at_ms: 0,
+            event,
+        };
+        cdb.execute(
+            "INSERT INTO events(thread_id,envelope_json) VALUES('orphan',?1)",
+            [serde_json::to_string(&env).unwrap()],
+        )
+        .unwrap();
     }
     drop(cdb);
     d.crash();
     assert!(orphan.try_wait().unwrap().is_none());
     let _restart = Daemon::start(dir.path()).await;
-    let status = timeout(Duration::from_secs(2), orphan.wait()).await
-        .expect("recovery did not kill the pipe-independent orphan").unwrap();
+    let status = timeout(Duration::from_secs(2), orphan.wait())
+        .await
+        .expect("recovery did not kill the pipe-independent orphan")
+        .unwrap();
     assert_eq!(status.signal(), Some(9));
     assert!(bystander.try_wait().unwrap().is_none());
     bystander.kill().await.unwrap();
@@ -526,7 +623,24 @@ async fn agents_continue_without_clients() {
     let mut c = d.client().await;
     let thread = start_fake(&mut c, 150).await;
     drop(c);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let db = store::open_reader(&dir.path().join("events.sqlite")).unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let running: bool = db
+                .query_row(
+                    "SELECT running FROM threads WHERE id=?1",
+                    [&thread.0],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if !running {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let mut c = d.client().await;
     c.subscribe(thread, None).await.unwrap();
     let mut ended = false;
@@ -655,4 +769,325 @@ fn closing_lifecycle_order_and_sequence() {
         AgentEvent::Error { fatal: true, .. }
     ));
     assert!(matches!(pre[1].event, AgentEvent::SessionEnded { .. }));
+}
+
+#[tokio::test]
+async fn client_death_restores_only_persisted_applied_cursor() {
+    let dir = temp();
+    let _store = seed(dir.path(), 100).await;
+    let d = Daemon::start(dir.path()).await;
+    let thread = ThreadId("t".into());
+    let mut c = d.client().await;
+    c.subscribe(thread.clone(), None).await.unwrap();
+    let mut applied = BTreeSet::new();
+    let mut persisted = None;
+    for _ in 0..10 {
+        let ServerMessage::Event { event } = c.next().await.unwrap() else {
+            panic!()
+        };
+        applied.insert(event.id);
+        persisted = Some(event.id);
+        c.applied(&thread, event.id);
+    }
+    assert!(
+        matches!(c.next().await.unwrap(),ServerMessage::Event {event} if event.id==EventId(11))
+    );
+    drop(c); // Entire old consumer dies; the daemon remains alive.
+    let mut replacement = d.client().await;
+    replacement
+        .subscribe(thread.clone(), persisted)
+        .await
+        .unwrap();
+    for id in until_done(&mut replacement).await {
+        assert!(applied.insert(id));
+        replacement.applied(&thread, id);
+    }
+    assert_eq!(
+        applied.into_iter().collect::<Vec<_>>(),
+        (1..=100).map(EventId).collect::<Vec<_>>()
+    );
+}
+#[tokio::test]
+async fn resubscribe_with_inflight_events_and_drop_applied_ids() {
+    let dir = temp();
+    let _store = seed(dir.path(), 1000).await;
+    let d = Daemon::start(dir.path()).await;
+    let mut c = d.client().await;
+    let thread = ThreadId("t".into());
+    c.subscribe(thread.clone(), None).await.unwrap();
+    // Buffered events <= this consumer cursor must never reach the UI.
+    c.applied(&thread, EventId(900));
+    let ServerMessage::Event { event } = c.next().await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(event.id, EventId(901));
+    let handle = c.handle();
+    let subscription = handle.subscribe(thread.clone(), Some(EventId(995)));
+    tokio::pin!(subscription);
+    loop {
+        tokio::select! {biased; r=&mut subscription=>{assert!(matches!(r.unwrap(),CommandResult::Ok {..}));break;}, event=c.next()=>{event.unwrap();}}
+    }
+    assert_eq!(
+        until_done(&mut c).await,
+        (996..=1000).map(EventId).collect::<Vec<_>>()
+    );
+}
+#[tokio::test]
+async fn client_checks_private_directory_and_socket_owner() {
+    let dir = temp();
+    let d = Daemon::start(dir.path()).await;
+    let metadata = fs::symlink_metadata(dir.path().join("daemon.sock")).unwrap();
+    assert!(
+        daemon::verify_socket_metadata(&metadata, nix::unistd::geteuid().as_raw() + 1).is_err()
+    );
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        Client::connect(dir.path().join("daemon.sock"), "bad-mode")
+            .await
+            .is_err()
+    );
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let other = temp();
+    let link = other.path().join("alias");
+    symlink(dir.path(), &link).unwrap();
+    assert!(
+        Client::connect(link.join("daemon.sock"), "symlink")
+            .await
+            .is_err()
+    );
+    d.client().await;
+}
+#[tokio::test]
+async fn exact_frame_limit_and_write_side_oversize() {
+    use spike_daemon_socket::wire::MAX_FRAME_LEN;
+    let frame = Frame::<serde_json::Value>::Stream {
+        stream_id: 42,
+        bytes: vec![7; MAX_FRAME_LEN as usize - 5],
+    };
+    let mut encoded = vec![];
+    codec::write(&mut encoded, &frame).await.unwrap();
+    assert_eq!(
+        u32::from_be_bytes(encoded[..4].try_into().unwrap()),
+        MAX_FRAME_LEN
+    );
+    assert_eq!(
+        codec::read::<_, serde_json::Value>(&mut encoded.as_slice())
+            .await
+            .unwrap(),
+        frame
+    );
+    let too_big = Frame::<serde_json::Value>::Stream {
+        stream_id: 42,
+        bytes: vec![0; MAX_FRAME_LEN as usize - 4],
+    };
+    let mut sink = vec![];
+    assert!(codec::write(&mut sink, &too_big).await.is_err());
+    assert!(sink.is_empty());
+    let mut sink = vec![];
+    let too_big = Frame::Control("x".repeat(MAX_FRAME_LEN as usize));
+    assert!(codec::write(&mut sink, &too_big).await.is_err());
+    assert!(sink.is_empty());
+}
+#[tokio::test]
+async fn connect_or_spawn_is_shared_and_logs_to_private_file() {
+    let parent = temp();
+    let dir = parent.path().join("private");
+    let c = Client::connect_or_spawn(&dir, env!("CARGO_BIN_EXE_spike-daemon"), "spawn")
+        .await
+        .unwrap();
+    let again = Client::connect_or_spawn(&dir, "/not/an/executable", "existing")
+        .await
+        .unwrap();
+    let mut raw = UnixStream::connect(dir.join("daemon.sock")).await.unwrap();
+    codec::write(
+        &mut raw,
+        &Frame::Control(ClientMessage::Hello {
+            protocol_version: 1,
+            client_name: "pid".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    let Frame::Control(ServerMessage::Welcome { daemon_pid, .. }) =
+        codec::read(&mut raw).await.unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        fs::metadata(dir.join("daemon.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    drop(c);
+    drop(again);
+    drop(raw);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(daemon_pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn permanent_reconnect_errors_surface_and_queued_commands_are_not_sent() {
+    use spike_daemon_socket::{CommandError, ConnectionState};
+    for scenario in [
+        "incompatible",
+        "bad_handshake",
+        "unknown thread",
+        "cursor past end",
+    ] {
+        let dir = temp();
+        let socket = dir.path().join("s");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let (close, closed) = tokio::sync::oneshot::channel();
+        let (paused, at_welcome) = tokio::sync::oneshot::channel();
+        let (resume, wait_resume) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            codec::read::<_, ClientMessage>(&mut s).await.unwrap();
+            codec::write(
+                &mut s,
+                &Frame::Control(ServerMessage::Welcome {
+                    protocol_version: 1,
+                    daemon_version: "test".into(),
+                    daemon_pid: 1,
+                }),
+            )
+            .await
+            .unwrap();
+            let Frame::Control(ClientMessage::Subscribe { request_id, .. }) =
+                codec::read(&mut s).await.unwrap()
+            else {
+                panic!()
+            };
+            codec::write(
+                &mut s,
+                &Frame::Control(ServerMessage::Response {
+                    request_id,
+                    result: CommandResult::Ok {
+                        value: serde_json::json!({"replay_until":null}),
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+            closed.await.unwrap();
+            drop(s);
+            let (mut s, _) = listener.accept().await.unwrap();
+            codec::read::<_, ClientMessage>(&mut s).await.unwrap();
+            paused.send(()).unwrap();
+            wait_resume.await.unwrap();
+            let message = match scenario {
+                "incompatible" => ServerMessage::Incompatible {
+                    protocol_version: 2,
+                    message: "upgrade required".into(),
+                },
+                "bad_handshake" => ServerMessage::ReplayDone {
+                    thread_id: ThreadId("t".into()),
+                    last: None,
+                },
+                _ => ServerMessage::Welcome {
+                    protocol_version: 1,
+                    daemon_version: "test".into(),
+                    daemon_pid: 1,
+                },
+            };
+            codec::write(&mut s, &Frame::Control(message))
+                .await
+                .unwrap();
+            if !matches!(scenario, "incompatible" | "bad_handshake") {
+                let Frame::Control(ClientMessage::Subscribe { request_id, .. }) =
+                    codec::read(&mut s).await.unwrap()
+                else {
+                    panic!()
+                };
+                codec::write(
+                    &mut s,
+                    &Frame::Control(ServerMessage::Response {
+                        request_id,
+                        result: CommandResult::Err {
+                            message: scenario.into(),
+                        },
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+            // Terminal classification closes this socket; no command was written.
+            assert!(codec::read::<_, ClientMessage>(&mut s).await.is_err());
+        });
+        let mut c = Client::connect(socket, "permanent").await.unwrap();
+        c.subscribe(ThreadId("t".into()), None).await.unwrap();
+        close.send(()).unwrap();
+        at_welcome.await.unwrap();
+        let handle = c.handle();
+        let request = handle.command(DaemonCommand::ListThreads);
+        tokio::pin!(request);
+        std::future::poll_fn(|cx| {
+            use std::future::Future;
+            assert!(request.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        resume.send(()).unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), request).await.unwrap(),
+            Err(CommandError::NotSent(_))
+        ));
+        assert_eq!(
+            c.next().await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(matches!(
+            *c.handle().connection_state().borrow(),
+            ConnectionState::Failed(_)
+        ));
+        server.await.unwrap();
+    }
+}
+#[tokio::test]
+async fn only_appends_notify_store_subscribers() {
+    let dir = temp();
+    let store = seed(dir.path(), 1).await;
+    let mut changed = store.changed.clone();
+    store
+        .append(ThreadId("t".into()), vec![envelope(1)])
+        .await
+        .unwrap();
+    changed.changed().await.unwrap();
+    changed.borrow_and_update();
+    store
+        .call(|c| {
+            c.query_row("SELECT count(*) FROM threads", [], |r| r.get::<_, i64>(0))
+                .map_err(io::Error::other)
+        })
+        .await
+        .unwrap();
+    assert!(!changed.has_changed().unwrap());
+}
+
+#[tokio::test]
+async fn invalid_command_frame_is_not_sent_and_connection_remains_usable() {
+    let dir = temp();
+    let d = Daemon::start(dir.path()).await;
+    let mut c = d.client().await;
+    let command = DaemonCommand::ThreadCommand {
+        thread_id: ThreadId("unused".into()),
+        command: SessionCommand::SendUserMessage {
+            text: "x".repeat(MAX_FRAME_LEN as usize),
+        },
+    };
+    assert!(matches!(
+        c.command(command).await,
+        Err(spike_daemon_socket::CommandError::NotSent(_))
+    ));
+    assert!(matches!(
+        c.command(DaemonCommand::ListThreads).await.unwrap(),
+        CommandResult::Ok { .. }
+    ));
 }

@@ -1,9 +1,4 @@
 use spike_daemon_socket::{Client, daemon, wire::*};
-use std::{
-    os::unix::process::CommandExt,
-    process::{Command, Stdio},
-    time::Duration,
-};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -12,32 +7,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("--dir") => args.next().expect("--dir needs path").into(),
         _ => panic!("usage: spike-client [--dir PATH]"),
     };
-    let socket = dir.join("daemon.sock");
-    let mut client = match Client::connect(&socket, "spike-client").await {
-        Ok(c) => c,
-        Err(_) => {
-            let mut child = Command::new(std::env::current_exe()?.with_file_name("spike-daemon"))
-                .arg("--dir")
-                .arg(&dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0)
-                .spawn()?;
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            let mut connected = None;
-            for _ in 0..100 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                if let Ok(c) = Client::connect(&socket, "spike-client").await {
-                    connected = Some(c);
-                    break;
-                }
-            }
-            connected.ok_or("daemon did not become ready")?
-        }
-    };
+    let executable = std::env::current_exe()?.with_file_name("spike-daemon");
+    let mut client = Client::connect_or_spawn(&dir, executable, "spike-client").await?;
     let result = client
         .command(DaemonCommand::StartThread {
             agent: AgentLaunch::Fake {
@@ -60,9 +31,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "following {}; Ctrl-C detaches (agent keeps running)",
         thread.0
     );
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut interrupt => break,
             msg = client.next() => if let ServerMessage::Event { event } = msg? { println!("{}", serde_json::to_string(&event)?); client.applied(&thread, event.id); }
         }
     }

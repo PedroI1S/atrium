@@ -1,0 +1,69 @@
+run=1
+after=Some(EventId(99000)) events=1000 connect_to_caught_up_ms=10.259
+after=None events=100000 connect_to_caught_up_ms=340.060
+stored_event_sustained_delivery_events_per_second=294066.1 payload_chars_per_event=200
+phase=after_replay rss_bytes=11517952 rss_mib=10.984 phys_footprint_bytes=Some(5489144)
+generator_target=10000_deltas_per_second live_delta_events=49988 elapsed_s=5.247 observed_delivery_per_second=9526.2
+phase=idle_0s rss_bytes=93454336 rss_mib=89.125 phys_footprint_bytes=Some(87294552)
+phase=idle_3s rss_bytes=93454336 rss_mib=89.125 phys_footprint_bytes=Some(87294552)
+phase=idle_60s rss_bytes=24248320 rss_mib=23.125 phys_footprint_bytes=Some(4981264)
+diagnostics:
+memory phase=reader_open readers=1 rss=Ok(8126464) footprint=Ok(Some(2343392))
+memory phase=reader_closed readers=0 rss=Ok(9338880) footprint=Ok(Some(3342840))
+client disconnected: unexpected end of file
+memory phase=reader_open readers=1 rss=Ok(9404416) footprint=Ok(Some(3391992))
+memory phase=reader_closed readers=0 rss=Ok(11517952) footprint=Ok(Some(5489144))
+client disconnected: unexpected end of file
+memory phase=reader_open readers=1 rss=Ok(11517952) footprint=Ok(Some(5489144))
+lifecycle_scan events=49993 message_text_bytes=19995200
+memory phase=history_loaded readers=1 rss=Ok(89931776) footprint=Ok(Some(83755608))
+memory phase=history_released readers=1 rss=Ok(93454336) footprint=Ok(Some(87278168))
+memory phase=reader_closed readers=0 rss=Ok(93470720) footprint=Ok(Some(87294552))
+client disconnected: unexpected end of file
+
+run=2
+after=Some(EventId(99000)) events=1000 connect_to_caught_up_ms=3.454
+after=None events=100000 connect_to_caught_up_ms=335.905
+stored_event_sustained_delivery_events_per_second=297702.9 payload_chars_per_event=200
+phase=after_replay rss_bytes=11403264 rss_mib=10.875 phys_footprint_bytes=Some(5374456)
+generator_target=10000_deltas_per_second live_delta_events=49984 elapsed_s=5.074 observed_delivery_per_second=9850.5
+phase=idle_0s rss_bytes=93339648 rss_mib=89.016 phys_footprint_bytes=Some(87147096)
+phase=idle_3s rss_bytes=63307776 rss_mib=60.375 phys_footprint_bytes=Some(57098816)
+phase=idle_60s rss_bytes=9699328 rss_mib=9.250 phys_footprint_bytes=Some(5046800)
+diagnostics:
+memory phase=reader_open readers=1 rss=Ok(8142848) footprint=Ok(Some(2359776))
+memory phase=reader_closed readers=0 rss=Ok(9289728) footprint=Ok(Some(3277304))
+client disconnected: unexpected end of file
+memory phase=reader_open readers=1 rss=Ok(9338880) footprint=Ok(Some(3310072))
+memory phase=reader_closed readers=0 rss=Ok(11403264) footprint=Ok(Some(5374456))
+client disconnected: unexpected end of file
+memory phase=reader_open readers=1 rss=Ok(11403264) footprint=Ok(Some(5374456))
+lifecycle_scan events=49989 message_text_bytes=19993600
+memory phase=history_loaded readers=1 rss=Ok(89833472) footprint=Ok(Some(83624536))
+memory phase=history_released readers=1 rss=Ok(93356032) footprint=Ok(Some(87147096))
+memory phase=reader_closed readers=0 rss=Ok(93356032) footprint=Ok(Some(87147096))
+client disconnected: unexpected end of file
+
+run=3
+after=Some(EventId(99000)) events=1000 connect_to_caught_up_ms=3.676
+after=None events=100000 connect_to_caught_up_ms=334.229
+stored_event_sustained_delivery_events_per_second=299196.1 payload_chars_per_event=200
+phase=after_replay rss_bytes=11403264 rss_mib=10.875 phys_footprint_bytes=Some(5390840)
+generator_target=10000_deltas_per_second live_delta_events=49986 elapsed_s=5.063 observed_delivery_per_second=9872.4
+phase=idle_0s rss_bytes=93372416 rss_mib=89.047 phys_footprint_bytes=Some(87130688)
+phase=idle_3s rss_bytes=49872896 rss_mib=47.562 phys_footprint_bytes=Some(29721104)
+phase=idle_60s rss_bytes=9797632 rss_mib=9.344 phys_footprint_bytes=Some(4948472)
+diagnostics:
+memory phase=reader_open readers=1 rss=Ok(8159232) footprint=Ok(Some(2376160))
+memory phase=reader_closed readers=0 rss=Ok(9306112) footprint=Ok(Some(3293688))
+client disconnected: unexpected end of file
+memory phase=reader_open readers=1 rss=Ok(9355264) footprint=Ok(Some(3326456))
+memory phase=reader_closed readers=0 rss=Ok(11403264) footprint=Ok(Some(5374456))
+client disconnected: unexpected end of file
+memory phase=reader_open readers=1 rss=Ok(11403264) footprint=Ok(Some(5374456))
+lifecycle_scan events=49991 message_text_bytes=19994400
+memory phase=history_loaded readers=1 rss=Ok(89833472) footprint=Ok(Some(83575360))
+memory phase=history_released readers=1 rss=Ok(93372416) footprint=Ok(Some(87114304))
+memory phase=reader_closed readers=0 rss=Ok(93388800) footprint=Ok(Some(87130688))
+client disconnected: unexpected end of file
+

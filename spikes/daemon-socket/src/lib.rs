@@ -4,7 +4,9 @@ pub mod codec;
 pub mod daemon;
 pub mod store;
 pub use atrium_protocol::{agent, wire};
-pub use client::{Client, ClientHandle, EventStream, CommandError, ConnectionState, UnknownOutcome};
+pub use client::{
+    Client, ClientHandle, CommandError, ConnectionState, EventStream, UnknownOutcome,
+};
 use std::{
     io,
     time::{SystemTime, UNIX_EPOCH},

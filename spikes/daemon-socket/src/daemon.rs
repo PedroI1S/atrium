@@ -18,7 +18,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     os::unix::{
-        fs::{DirBuilderExt, MetadataExt, PermissionsExt, FileTypeExt, OpenOptionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         process::CommandExt,
     },
     path::{Path, PathBuf},
@@ -29,7 +29,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     process::Command,
-    sync::{Mutex, mpsc, oneshot, Semaphore},
+    sync::{Mutex, Semaphore, mpsc, oneshot},
 };
 
 pub fn default_dir() -> PathBuf {
@@ -49,12 +49,20 @@ pub fn verify_dir_metadata(meta: &fs::Metadata, uid: u32) -> io::Result<()> {
 }
 /// Check the endpoint before connecting, including for reconnect attempts.
 pub fn verify_socket(path: &Path) -> io::Result<()> {
-    let dir = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,"socket has no directory"))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no directory"))?;
     verify_dir_metadata(&fs::symlink_metadata(dir)?, geteuid().as_raw())
-        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied,e))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
     let meta = fs::symlink_metadata(path)?;
-    if !meta.file_type().is_socket() || meta.uid() != geteuid().as_raw() || meta.mode() & 0o7777 != 0o600 {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied,"socket must be owned by current user with mode 0600"));
+    verify_socket_metadata(&meta, geteuid().as_raw())
+}
+pub fn verify_socket_metadata(meta: &fs::Metadata, uid: u32) -> io::Result<()> {
+    if !meta.file_type().is_socket() || meta.uid() != uid || meta.mode() & 0o7777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket must be owned by current user with mode 0600",
+        ));
     }
     Ok(())
 }
@@ -170,26 +178,52 @@ pub fn reap_if_matching(saved: &Identity) -> io::Result<bool> {
 }
 
 fn signal_result(result: Result<(), nix::errno::Errno>) -> io::Result<()> {
-    match result { Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()), Err(e) => Err(error(e)) }
+    match result {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(e) => Err(error(e)),
+    }
 }
 /// macOS physical footprint includes compressed/private memory absent from RSS.
 pub fn phys_footprint(pid: u32) -> io::Result<Option<u64>> {
     #[cfg(target_os = "macos")]
-    { libproc::libproc::pid_rusage::pidrusage::<libproc::libproc::pid_rusage::RUsageInfoV2>(pid as i32)
-        .map(|r| Some(r.ri_phys_footprint)).map_err(error) }
+    {
+        libproc::libproc::pid_rusage::pidrusage::<libproc::libproc::pid_rusage::RUsageInfoV2>(
+            pid as i32,
+        )
+        .map(|r| Some(r.ri_phys_footprint))
+        .map_err(error)
+    }
     #[cfg(not(target_os = "macos"))]
-    { let _ = pid; Ok(None) }
+    {
+        let _ = pid;
+        Ok(None)
+    }
 }
 static READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 fn memory_trace(label: &str) {
     if std::env::var_os("ATRIUM_MEMORY_DIAGNOSTICS").is_some() {
-        eprintln!("memory phase={label} readers={} rss={:?} footprint={:?}",
-            READERS.load(std::sync::atomic::Ordering::Relaxed), rss(std::process::id()), phys_footprint(std::process::id()));
+        eprintln!(
+            "memory phase={label} readers={} rss={:?} footprint={:?}",
+            READERS.load(std::sync::atomic::Ordering::Relaxed),
+            rss(std::process::id()),
+            phys_footprint(std::process::id())
+        );
     }
 }
 struct ReaderCount;
-impl ReaderCount { fn new() -> Self { READERS.fetch_add(1,std::sync::atomic::Ordering::Relaxed); memory_trace("reader_open"); Self } }
-impl Drop for ReaderCount { fn drop(&mut self) { READERS.fetch_sub(1,std::sync::atomic::Ordering::Relaxed); memory_trace("reader_closed"); } }
+impl ReaderCount {
+    fn new() -> Self {
+        READERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        memory_trace("reader_open");
+        Self
+    }
+}
+impl Drop for ReaderCount {
+    fn drop(&mut self) {
+        READERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        memory_trace("reader_closed");
+    }
+}
 /// Reconstruct only open lifecycle objects; complete them before SessionEnded.
 pub fn closing(
     events: impl IntoIterator<Item = AgentEventEnvelope>,
@@ -303,8 +337,18 @@ async fn close_thread(store: &Store, thread: ThreadId, reason: &str) -> io::Resu
         all.extend(page.into_iter().map(|e| e.envelope));
     }
     if std::env::var_os("ATRIUM_MEMORY_DIAGNOSTICS").is_some() {
-        let bytes: usize = all.iter().map(|e| match &e.event { AgentEvent::MessageDelta {text,..} | AgentEvent::MessageCompleted {text,..} => text.len(), _ => 0 }).sum();
-        eprintln!("lifecycle_scan events={} message_text_bytes={bytes}", all.len());
+        let bytes: usize = all
+            .iter()
+            .map(|e| match &e.event {
+                AgentEvent::MessageDelta { text, .. }
+                | AgentEvent::MessageCompleted { text, .. } => text.len(),
+                _ => 0,
+            })
+            .sum();
+        eprintln!(
+            "lifecycle_scan events={} message_text_bytes={bytes}",
+            all.len()
+        );
         memory_trace("history_loaded");
     }
     store.append(thread.clone(), closing(all, reason)).await?;
@@ -416,28 +460,58 @@ impl State {
         thread: ThreadId,
         command: SessionCommand,
     ) -> io::Result<serde_json::Value> {
-        let sender = self.children.lock().await.get(&thread).cloned()
+        let sender = self
+            .children
+            .lock()
+            .await
+            .get(&thread)
+            .cloned()
             .ok_or_else(|| error("thread is not running"))?;
-        let mut line = serde_json::to_vec(&command).map_err(error)?; line.push(b'\n');
+        let mut line = serde_json::to_vec(&command).map_err(error)?;
+        line.push(b'\n');
         let (reply, rx) = oneshot::channel();
-        sender.try_send(StdinRequest { line, reply }).map_err(|_| error("child command queue full or closed"))?;
-        tokio::time::timeout(std::time::Duration::from_secs(5),rx).await.map_err(error)?.map_err(error)??;
+        sender
+            .try_send(StdinRequest { line, reply })
+            .map_err(|_| error("child command queue full or closed"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .map_err(error)?
+            .map_err(error)??;
         Ok(json!({}))
     }
 }
-struct StdinRequest { line: Vec<u8>, reply: oneshot::Sender<io::Result<()>> }
-fn spawn_stdin_writer<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(mut stdin: W) -> (mpsc::Sender<StdinRequest>, tokio::task::JoinHandle<()>) {
+struct StdinRequest {
+    line: Vec<u8>,
+    reply: oneshot::Sender<io::Result<()>>,
+}
+fn spawn_stdin_writer<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    mut stdin: W,
+) -> (mpsc::Sender<StdinRequest>, tokio::task::JoinHandle<()>) {
     let (sender, mut commands) = mpsc::channel::<StdinRequest>(16);
     let writer = tokio::spawn(async move {
         while let Some(request) = commands.recv().await {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(5),stdin.write_all(&request.line)).await.map_err(error).and_then(|r| r);
-            let failed = result.is_err(); let _ = request.reply.send(result); if failed { break; }
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stdin.write_all(&request.line),
+            )
+            .await
+            .map_err(error)
+            .and_then(|r| r);
+            let failed = result.is_err();
+            let _ = request.reply.send(result);
+            if failed {
+                break;
+            }
         }
-    }); (sender, writer)
+    });
+    (sender, writer)
 }
 /// Deterministic replay test seam: pause after response, before the first page.
 #[derive(Clone)]
-pub struct ReplayGate { pub entered: mpsc::Sender<ThreadId>, pub release: Arc<Semaphore> }
+pub struct ReplayGate {
+    pub entered: mpsc::Sender<ThreadId>,
+    pub release: Arc<Semaphore>,
+}
 fn result(r: io::Result<serde_json::Value>) -> CommandResult {
     match r {
         Ok(value) => CommandResult::Ok { value },
@@ -591,7 +665,14 @@ async fn handle(
                 Ok(json!({"replay_until": boundary}))
             };
             let success = r.is_ok();
-            send(w, ServerMessage::Response { request_id, result: result(r) }).await?;
+            send(
+                w,
+                ServerMessage::Response {
+                    request_id,
+                    result: result(r),
+                },
+            )
+            .await?;
             if success && let Some(gate) = &state.replay_gate {
                 gate.entered.send(subscribed).await.map_err(error)?;
                 gate.release.acquire().await.map_err(error)?.forget();
@@ -630,24 +711,49 @@ pub async fn run_with_store(dir: &Path, fake: PathBuf, store: Store) -> io::Resu
     let guard = SocketGuard::acquire(dir)?;
     serve(guard, store, fake, None, None).await
 }
-pub async fn run_with_replay_gate(dir: &Path, fake: PathBuf, store: Store, gate: ReplayGate, ready: oneshot::Sender<()>) -> io::Result<()> {
-    serve(SocketGuard::acquire(dir)?, store, fake, Some(gate), Some(ready)).await
+pub async fn run_with_replay_gate(
+    dir: &Path,
+    fake: PathBuf,
+    store: Store,
+    gate: ReplayGate,
+    ready: oneshot::Sender<()>,
+) -> io::Result<()> {
+    serve(
+        SocketGuard::acquire(dir)?,
+        store,
+        fake,
+        Some(gate),
+        Some(ready),
+    )
+    .await
 }
-async fn serve(guard: SocketGuard, store: Store, fake: PathBuf, replay_gate: Option<ReplayGate>, ready: Option<oneshot::Sender<()>>) -> io::Result<()> {
+async fn serve(
+    guard: SocketGuard,
+    store: Store,
+    fake: PathBuf,
+    replay_gate: Option<ReplayGate>,
+    ready: Option<oneshot::Sender<()>>,
+) -> io::Result<()> {
     recover(&store).await?;
     // Publish only after setting permissions; no permissive public socket window.
     let staging = guard.socket.with_file_name(".bind");
-    match fs::remove_file(&staging) { Ok(()) => (), Err(e) if e.kind()==io::ErrorKind::NotFound => (), Err(e) => return Err(e) }
+    match fs::remove_file(&staging) {
+        Ok(()) => (),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
     let listener = UnixListener::bind(&staging)?;
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&staging,&guard.socket)?;
+    fs::rename(&staging, &guard.socket)?;
     let state = Arc::new(State {
         store,
         children: Mutex::new(HashMap::new()),
         fake,
         replay_gate,
     });
-    if let Some(ready) = ready { let _ = ready.send(()); }
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
     println!("READY");
     loop {
         let (stream, _) = listener.accept().await?;
@@ -657,5 +763,49 @@ async fn serve(guard: SocketGuard, store: Store, fake: PathBuf, replay_gate: Opt
                 eprintln!("client disconnected: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn disappearance_between_identity_and_signal_is_success() {
+        assert!(signal_result(Err(nix::errno::Errno::ESRCH)).is_ok());
+        assert!(signal_result(Err(nix::errno::Errno::EPERM)).is_err());
+    }
+    #[tokio::test]
+    async fn blocked_child_stdin_does_not_block_other_children() {
+        use tokio::io::AsyncReadExt;
+        let (slow, mut slow_read) = tokio::io::duplex(1);
+        let (fast, _fast_read) = tokio::io::duplex(128);
+        let (slow_queue, slow_task) = spawn_stdin_writer(slow);
+        let (fast_queue, fast_task) = spawn_stdin_writer(fast);
+        let (reply, mut slow_reply) = oneshot::channel();
+        slow_queue
+            .send(StdinRequest {
+                line: vec![1; 100],
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_eq!(slow_read.read_u8().await.unwrap(), 1); // writer is now blocked
+        let (reply, fast_reply) = oneshot::channel();
+        fast_queue
+            .send(StdinRequest {
+                line: vec![2; 3],
+                reply,
+            })
+            .await
+            .unwrap();
+        fast_reply.await.unwrap().unwrap();
+        assert!(matches!(
+            slow_reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        slow_task.abort();
+        fast_task.abort();
+        let _ = slow_task.await;
+        let _ = fast_task.await;
     }
 }

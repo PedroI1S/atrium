@@ -20,13 +20,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let daemon = PathBuf::from(
         std::env::args()
             .nth(1)
-            .ok_or("usage: measure /path/to/spike-daemon [idle_seconds=60]")?,
+            .ok_or("usage: measure /path/to/spike-daemon [runs=3]")?,
     )
     .canonicalize()?;
-    let idle = std::env::args()
+    let runs = std::env::args()
         .nth(2)
-        .unwrap_or("60".into())
-        .parse::<u64>()?;
+        .unwrap_or("3".into())
+        .parse::<usize>()?;
+    for run in 1..=runs {
+        println!("run={run}");
+        measure(&daemon).await?;
+    }
+    Ok(())
+}
+fn memory(pid: u32, phase: &str) -> std::io::Result<()> {
+    let rss = spike_daemon_socket::daemon::rss(pid)?;
+    let footprint = spike_daemon_socket::daemon::phys_footprint(pid)?;
+    println!(
+        "phase={phase} rss_bytes={rss} rss_mib={:.3} phys_footprint_bytes={footprint:?}",
+        rss as f64 / 1048576.
+    );
+    Ok(())
+}
+async fn measure(daemon: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::Builder::new()
         .prefix("a5-bench-")
         .tempdir_in("/tmp")?;
@@ -56,21 +72,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     }
     drop(s);
-    let child = Process(
+    let diagnostics = std::fs::File::create(dir.path().join("memory.log"))?;
+    let mut child = Process(
         Command::new(daemon)
             .arg("--dir")
             .arg(dir.path())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(diagnostics)
+            .env("ATRIUM_MEMORY_DIAGNOSTICS", "1")
             .spawn()?,
     );
     let socket = dir.path().join("daemon.sock");
-    for _ in 0..200 {
-        if Client::connect(&socket, "ready").await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    use std::io::BufRead;
+    let mut ready = String::new();
+    std::io::BufReader::new(child.0.stdout.take().ok_or("no stdout")?).read_line(&mut ready)?;
+    if ready.trim() != "READY" {
+        return Err("daemon failed before ready".into());
     }
     let mut through = 0.;
     for after in [Some(EventId(99_000)), None] {
@@ -104,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "stored_event_sustained_delivery_events_per_second={through:.1} payload_chars_per_event=200"
     );
+    memory(child.0.id(), "after_replay")?;
     // Also measure append + live delivery from a real fake child, at a target
     // 10,000 200-character deltas/sec. SQLite transactions may be the limiter.
     let mut c = Client::connect(&socket, "live-measure").await?;
@@ -122,12 +141,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("fake launch failed".into());
     };
     let thread = ThreadId(value["thread_id"].as_str().ok_or("thread missing")?.into());
-    c.subscribe(thread, None).await?;
+    c.subscribe(thread.clone(), None).await?;
     let start = Instant::now();
     let mut deltas = 0;
     loop {
         if let ServerMessage::Event { event } = c.next().await? {
-            let done = matches!(event.envelope.event, AgentEvent::TurnCompleted { .. });
+            let done = matches!(event.envelope.event, AgentEvent::SessionEnded { .. });
             if matches!(event.envelope.event, AgentEvent::MessageDelta { .. }) {
                 deltas += 1;
             }
@@ -138,17 +157,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "live_delta_events={deltas} elapsed_s={:.3} live_delta_events_per_second={:.1}",
+        "generator_target=10000_deltas_per_second live_delta_events={deltas} elapsed_s={:.3} observed_delivery_per_second={:.1}",
         start.elapsed().as_secs_f64(),
         deltas as f64 / start.elapsed().as_secs_f64()
     );
+    // Wait on the durable lifecycle projection, not a guessed settling sleep.
+    loop {
+        let CommandResult::Ok { value } = c.command(DaemonCommand::ListThreads).await? else {
+            return Err("ListThreads failed".into());
+        };
+        if value
+            .as_array()
+            .ok_or("invalid threads")?
+            .iter()
+            .any(|row| row["thread_id"] == thread.0 && row["running"] == false)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     drop(c);
-    println!("idle_wait_seconds={idle} daemon_pid={}", child.0.id());
-    tokio::time::sleep(Duration::from_secs(idle)).await;
-    let bytes = spike_daemon_socket::daemon::rss(child.0.id())?;
+    let idle_start = tokio::time::Instant::now();
+    for seconds in [0, 3, 60] {
+        tokio::time::sleep_until(idle_start + Duration::from_secs(seconds)).await;
+        memory(child.0.id(), &format!("idle_{seconds}s"))?;
+    }
     println!(
-        "daemon_idle_rss_bytes={bytes} daemon_idle_rss_mib={:.3}",
-        bytes as f64 / 1024. / 1024.
+        "diagnostics:\n{}",
+        std::fs::read_to_string(dir.path().join("memory.log"))?
     );
     Ok(())
 }
