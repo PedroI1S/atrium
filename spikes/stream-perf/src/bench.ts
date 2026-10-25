@@ -74,6 +74,11 @@ function startTypist(intervalMs: number) {
 
 export async function runScenario(sc: Partial<Scenario>, info: StartupInfo): Promise<void> {
   const full: Scenario = { ...DEFAULT_RUN, name: "scenario", typing: "none", typingIntervalMs: 120, typingStartMs: 2000, idleTypingMs: 0, baselineMs: 1500, hold: false, ...sc };
+  // Evidence for "the window was hidden or occluded": rAF stops then, which is an environment
+  // artifact, not a result. The script discards and repeats such runs and keeps the evidence.
+  const visibility: { t: number; state: string; focus: boolean }[] = [];
+  const t0 = performance.now();
+  document.addEventListener("visibilitychange", () => visibility.push({ t: performance.now() - t0, state: document.visibilityState, focus: document.hasFocus() }));
   try {
     await raf2();
     await sleep(300);
@@ -105,6 +110,7 @@ export async function runScenario(sc: Partial<Scenario>, info: StartupInfo): Pro
     await raf2();
     sampler.start();
     const startedAt = performance.now();
+    const streamStartRel = startedAt - t0;
     let typist: ReturnType<typeof startTypist> | null = null;
     if (full.typing === "synthetic") setTimeout(() => (typist = startTypist(full.typingIntervalMs)), full.typingStartMs);
 
@@ -134,6 +140,7 @@ export async function runScenario(sc: Partial<Scenario>, info: StartupInfo): Pro
       timedOut,
       host: { userAgent: navigator.userAgent, dpr: devicePixelRatio, viewport: [innerWidth, innerHeight] },
       refreshMs,
+      visibility: { streamStartRelMs: streamStartRel, streamEndRelMs: performance.now() - t0, changes: visibility, hiddenAtEnd: document.hidden, focusAtEnd: document.hasFocus() },
       baseline: summarizeFrames(base.dts, refreshMs),
       frames: summarizeFrames(sampler.dts, refreshMs),
       renderWork: summarizeValues(sampler.work),

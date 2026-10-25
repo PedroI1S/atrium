@@ -1,0 +1,461 @@
+{
+ "scenario": {
+  "threads": 1,
+  "tokensPerSecond": 10000,
+  "chunkChars": 4,
+  "durationMs": 20000,
+  "toolCallEveryMs": 4000,
+  "encoding": "msgpack",
+  "batchMs": 16,
+  "ackIntervalMs": 30,
+  "name": "single",
+  "typing": "none",
+  "typingIntervalMs": 120,
+  "typingStartMs": 3000,
+  "idleTypingMs": 0,
+  "baselineMs": 1500,
+  "hold": false
+ },
+ "timedOut": false,
+ "host": {
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)",
+  "dpr": 2,
+  "viewport": [
+   1200,
+   768
+  ],
+  "macos": "27.0.1",
+  "cpu": "Apple M4",
+  "cores": 10,
+  "loadavg_at_start": [
+   6.0107421875,
+   5.72119140625,
+   6.12744140625
+  ],
+  "loadavg_at_end": [
+   5.82763671875,
+   5.69580078125,
+   6.10498046875
+  ]
+ },
+ "refreshMs": 16.67,
+ "visibility": {
+  "streamStartRelMs": 1896,
+  "streamEndRelMs": 22303,
+  "changes": [],
+  "hiddenAtEnd": false,
+  "focusAtEnd": true
+ },
+ "baseline": {
+  "n": 90,
+  "mean": 16.66,
+  "p50": 17,
+  "p95": 18,
+  "p99": 19,
+  "max": 19,
+  "frames": 90,
+  "seconds": 1.5,
+  "fps": 60.04,
+  "refreshMs": 16.67,
+  "slowFrames": 0,
+  "droppedFrames": 0,
+  "over25ms": 0,
+  "worst": [
+   19,
+   19,
+   19,
+   18,
+   18,
+   18,
+   18,
+   18
+  ]
+ },
+ "frames": {
+  "n": 1205,
+  "mean": 16.67,
+  "p50": 17,
+  "p95": 18,
+  "p99": 19,
+  "max": 20,
+  "frames": 1205,
+  "seconds": 20.08,
+  "fps": 60,
+  "refreshMs": 16.67,
+  "slowFrames": 0,
+  "droppedFrames": 0,
+  "over25ms": 0,
+  "worst": [
+   20,
+   20,
+   20,
+   20,
+   20,
+   19,
+   19,
+   19
+  ]
+ },
+ "renderWork": {
+  "n": 1206,
+  "mean": 1.69,
+  "p50": 2,
+  "p95": 2,
+  "p99": 3,
+  "max": 5
+ },
+ "applyMs": {
+  "n": 1180,
+  "mean": 0.91,
+  "p50": 1,
+  "p95": 1,
+  "p99": 2,
+  "max": 10
+ },
+ "latency": {
+  "n": 199745,
+  "mean": 34.05,
+  "p50": 34,
+  "p95": 46,
+  "p99": 49,
+  "max": 60
+ },
+ "ipc": {
+  "n": 199758,
+  "mean": 0.19,
+  "p50": 0,
+  "p95": 1,
+  "p99": 2,
+  "max": 4.44
+ },
+ "queueWait": {
+  "n": 199758,
+  "mean": 8.4,
+  "p50": 9,
+  "p95": 15,
+  "p99": 16,
+  "max": 18
+ },
+ "commit": {
+  "n": 1180,
+  "mean": 16.66,
+  "p50": 17,
+  "p95": 18,
+  "p99": 19,
+  "max": 21
+ },
+ "decode": {
+  "totalMs": 279,
+  "perBatchMs": 0.22,
+  "batches": 1251
+ },
+ "pipeline": {
+  "batchesReceived": 1251,
+  "eventsReceived": 199758,
+  "eventsApplied": 199758,
+  "framesWithWork": 1180,
+  "maxQueue": 2,
+  "seqGaps": 0,
+  "streamSeconds": 20.15
+ },
+ "transcript": {
+  "visibleThread": 0,
+  "visibleRows": 5314,
+  "visibleChars": 798980,
+  "totalChars": 798980,
+  "totalTokensApprox": 199745,
+  "events": [
+   199758
+  ],
+  "completedMismatch": 0,
+  "domNodes": 131,
+  "followingTail": 0
+ },
+ "typing": {
+  "idle": null,
+  "streaming": {
+   "keys": 0,
+   "inputs": 0,
+   "handlerMs": {
+    "n": 0,
+    "mean": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0,
+    "max": 0
+   },
+   "frameMs": {
+    "n": 0,
+    "mean": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0,
+    "max": 0
+   },
+   "paintMs": {
+    "n": 0,
+    "mean": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0,
+    "max": 0
+   }
+  },
+  "typed": 0,
+  "textareaLength": null
+ },
+ "bridge": {
+  "events": 199758,
+  "deltas": 199745,
+  "chars": 798980,
+  "tokensApprox": 199745,
+  "spanSeconds": 20,
+  "eventsPerSecond": 9986.05,
+  "tokensPerSecondApprox": 9985.4,
+  "batches": 1251,
+  "bytes": 28342342,
+  "bytesPerEvent": 141.88,
+  "batchEventsP50": 161,
+  "batchEventsMax": 259,
+  "encodeUs": {
+   "p50": 25,
+   "p99": 70,
+   "max": 108,
+   "totalMs": 37.29
+  },
+  "agentToBridgeMs": {
+   "p50": 0,
+   "p95": 1,
+   "p99": 2,
+   "max": 26
+  },
+  "batchingMs": {
+   "p50": 8,
+   "p95": 15,
+   "p99": 16,
+   "max": 20
+  },
+  "backpressureWaits": 0,
+  "backpressureMs": 0,
+  "maxInFlightBytes": 857865,
+  "acks": 655
+ },
+ "timeline": {
+  "streamStartEpochMs": 1792945359592,
+  "streamEndEpochMs": 1792945379741,
+  "reportEpochMs": 1792945380047
+ },
+ "resources": {
+  "cpu_pct_during_stream": {
+   "app": {
+    "mean": 18.717732775250614,
+    "max": 25.57205599891973
+   },
+   "webcontent": {
+    "mean": 21.011038110109926,
+    "max": 30.84132099230678
+   },
+   "webkit_other": {
+    "mean": 21.201346516453405,
+    "max": 28.413395554355258
+   },
+   "daemon": {
+    "mean": 60.92446403086594,
+    "max": 86.18729984821091
+   },
+   "agents": {
+    "mean": 2.6741392372669095,
+    "max": 3.800487077672147
+   }
+  },
+  "peak_rss_mb": {
+   "app": 110.75,
+   "webcontent": 114.65625,
+   "webkit_other": 64.875,
+   "daemon": 36.40625,
+   "agents": 6.328125
+  },
+  "footprint_series": [],
+  "after_report": [],
+  "rss_series_1hz": [
+   {
+    "t": 0.1,
+    "app_rss_mb": 98.4,
+    "webcontent_rss_mb": 16.0,
+    "webkit_other_rss_mb": 23.0,
+    "daemon_rss_mb": 0.0,
+    "agents_rss_mb": 0.0
+   },
+   {
+    "t": 1.1,
+    "app_rss_mb": 104.1,
+    "webcontent_rss_mb": 32.6,
+    "webkit_other_rss_mb": 39.0,
+    "daemon_rss_mb": 0.0,
+    "agents_rss_mb": 0.0
+   },
+   {
+    "t": 2.2,
+    "app_rss_mb": 105.1,
+    "webcontent_rss_mb": 58.2,
+    "webkit_other_rss_mb": 45.0,
+    "daemon_rss_mb": 9.1,
+    "agents_rss_mb": 6.2
+   },
+   {
+    "t": 3.2,
+    "app_rss_mb": 108.2,
+    "webcontent_rss_mb": 104.1,
+    "webkit_other_rss_mb": 62.0,
+    "daemon_rss_mb": 11.2,
+    "agents_rss_mb": 6.3
+   },
+   {
+    "t": 4.3,
+    "app_rss_mb": 110.8,
+    "webcontent_rss_mb": 109.6,
+    "webkit_other_rss_mb": 64.9,
+    "daemon_rss_mb": 11.3,
+    "agents_rss_mb": 6.3
+   },
+   {
+    "t": 5.3,
+    "app_rss_mb": 102.9,
+    "webcontent_rss_mb": 86.1,
+    "webkit_other_rss_mb": 61.8,
+    "daemon_rss_mb": 10.0,
+    "agents_rss_mb": 5.1
+   },
+   {
+    "t": 6.4,
+    "app_rss_mb": 105.3,
+    "webcontent_rss_mb": 91.1,
+    "webkit_other_rss_mb": 60.2,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.1
+   },
+   {
+    "t": 7.4,
+    "app_rss_mb": 99.8,
+    "webcontent_rss_mb": 89.3,
+    "webkit_other_rss_mb": 56.7,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.1
+   },
+   {
+    "t": 8.5,
+    "app_rss_mb": 99.6,
+    "webcontent_rss_mb": 92.0,
+    "webkit_other_rss_mb": 56.6,
+    "daemon_rss_mb": 10.1,
+    "agents_rss_mb": 5.1
+   },
+   {
+    "t": 9.5,
+    "app_rss_mb": 101.8,
+    "webcontent_rss_mb": 94.8,
+    "webkit_other_rss_mb": 58.4,
+    "daemon_rss_mb": 10.1,
+    "agents_rss_mb": 5.2
+   },
+   {
+    "t": 10.6,
+    "app_rss_mb": 101.2,
+    "webcontent_rss_mb": 94.6,
+    "webkit_other_rss_mb": 58.6,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.2
+   },
+   {
+    "t": 11.6,
+    "app_rss_mb": 101.5,
+    "webcontent_rss_mb": 100.7,
+    "webkit_other_rss_mb": 57.2,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.2
+   },
+   {
+    "t": 12.6,
+    "app_rss_mb": 101.8,
+    "webcontent_rss_mb": 96.6,
+    "webkit_other_rss_mb": 58.5,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.2
+   },
+   {
+    "t": 13.7,
+    "app_rss_mb": 102.0,
+    "webcontent_rss_mb": 97.0,
+    "webkit_other_rss_mb": 58.8,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.3
+   },
+   {
+    "t": 14.7,
+    "app_rss_mb": 102.1,
+    "webcontent_rss_mb": 101.2,
+    "webkit_other_rss_mb": 59.9,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.4
+   },
+   {
+    "t": 15.8,
+    "app_rss_mb": 101.9,
+    "webcontent_rss_mb": 100.1,
+    "webkit_other_rss_mb": 60.5,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.3
+   },
+   {
+    "t": 16.8,
+    "app_rss_mb": 102.1,
+    "webcontent_rss_mb": 102.5,
+    "webkit_other_rss_mb": 59.5,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.4
+   },
+   {
+    "t": 17.9,
+    "app_rss_mb": 102.2,
+    "webcontent_rss_mb": 104.2,
+    "webkit_other_rss_mb": 59.0,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.4
+   },
+   {
+    "t": 18.9,
+    "app_rss_mb": 102.2,
+    "webcontent_rss_mb": 104.3,
+    "webkit_other_rss_mb": 59.8,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.4
+   },
+   {
+    "t": 20.0,
+    "app_rss_mb": 102.2,
+    "webcontent_rss_mb": 105.8,
+    "webkit_other_rss_mb": 60.1,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.4
+   },
+   {
+    "t": 21.0,
+    "app_rss_mb": 102.1,
+    "webcontent_rss_mb": 107.2,
+    "webkit_other_rss_mb": 60.4,
+    "daemon_rss_mb": 10.2,
+    "agents_rss_mb": 5.4
+   },
+   {
+    "t": 22.0,
+    "app_rss_mb": 104.3,
+    "webcontent_rss_mb": 114.7,
+    "webkit_other_rss_mb": 60.3,
+    "daemon_rss_mb": 36.4,
+    "agents_rss_mb": 0.0
+   }
+  ],
+  "report_at_s": 22.712069988250732
+ },
+ "attempt": 1
+}
