@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokio::sync::{mpsc, oneshot, watch};
-type Job = Box<dyn FnOnce(&mut Connection) + Send>;
+type Job = Box<dyn FnOnce(&mut Connection) -> bool + Send>;
 #[derive(Clone)]
 pub struct Store {
     jobs: mpsc::Sender<Job>,
@@ -34,8 +34,7 @@ impl Store {
         let (notify, changed) = watch::channel(0u64);
         std::thread::spawn(move || {
             while let Some(job) = rx.blocking_recv() {
-                job(&mut c);
-                notify.send_modify(|n| *n = n.wrapping_add(1));
+                if job(&mut c) { notify.send_modify(|n| *n = n.wrapping_add(1)); }
             }
         });
         Ok(Self {
@@ -48,10 +47,14 @@ impl Store {
         &self,
         f: impl FnOnce(&mut Connection) -> io::Result<T> + Send + 'static,
     ) -> io::Result<T> {
+        self.call_inner(false, f).await
+    }
+    async fn call_inner<T: Send + 'static>(&self, notify: bool, f: impl FnOnce(&mut Connection) -> io::Result<T> + Send + 'static) -> io::Result<T> {
         let (tx, rx) = oneshot::channel();
         self.jobs
             .send(Box::new(move |c| {
-                let _ = tx.send(f(c));
+                let result = f(c); let changed = notify && result.is_ok();
+                let _ = tx.send(result); changed
             }))
             .await
             .map_err(error)?;
@@ -62,7 +65,7 @@ impl Store {
         thread: ThreadId,
         envelopes: Vec<AgentEventEnvelope>,
     ) -> io::Result<()> {
-        self.call(move |c| {
+        self.call_inner(true, move |c| {
             let tx = c.transaction().map_err(error)?;
             for envelope in envelopes {
                 tx.execute(

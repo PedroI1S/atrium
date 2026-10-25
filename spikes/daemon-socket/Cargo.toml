@@ -34,3 +34,6 @@ features = ["signal"]
 version = "0.37.2"
 default-features = false
 features = ["system"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14.11"

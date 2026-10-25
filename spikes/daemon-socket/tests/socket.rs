@@ -11,7 +11,6 @@ use std::{
     fs, io,
     os::unix::{
         fs::{PermissionsExt, symlink},
-        process::CommandExt,
     },
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -359,6 +358,7 @@ async fn command_executed_response_lost_is_unknown_and_never_retried() {
     let d = Daemon::start(dir.path()).await;
     let socket = dir.path().join("proxy.sock");
     let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     let upstream = dir.path().join("daemon.sock");
     let server = tokio::spawn(async move {
         let (mut downstream, _) = listener.accept().await.unwrap();
@@ -461,70 +461,37 @@ async fn automatic_reconnect_from_applied_cursor() {
 async fn orphan_recovery_and_identity_mismatch() {
     let dir = temp();
     let mut d = Daemon::start(dir.path()).await;
-    let mut c = d.client().await;
-    let thread = start_fake(&mut c, 60_000).await;
-    c.subscribe(thread.clone(), None).await.unwrap();
-    loop {
-        if matches!(
-            c.next().await.unwrap(),
-            ServerMessage::Event {
-                event: StoredEvent {
-                    envelope: AgentEventEnvelope {
-                        event: AgentEvent::MessageDelta { .. },
-                        ..
-                    },
-                    ..
-                }
-            }
-        ) {
-            break;
-        }
-    }
-    let db = store::open_reader(&dir.path().join("events.sqlite")).unwrap();
-    let saved = db
-        .query_row(
-            "SELECT pid,start,exe FROM threads WHERE id=?1",
-            [&thread.0],
-            |r| {
-                Ok(Identity {
-                    pid: r.get(0)?,
-                    start: r.get(1)?,
-                    exe: r.get(2)?,
-                })
-            },
-        )
-        .unwrap();
-    // An unrelated live process with a mismatched stored start must survive restart.
-    let mut bystander = Command::new("/bin/sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let mismatch = Identity {
-        start: "different start time".into(),
-        ..daemon::identity(bystander.id()).unwrap()
-    };
+    // Neither process has a pipe to the daemon. Only recovery can terminate the
+    // matching process; its parent (this test) can prove the terminating signal.
+    use std::os::unix::process::ExitStatusExt;
+    let mut orphan = tokio::process::Command::new("/bin/sleep")
+        .arg("60").kill_on_drop(true).spawn().unwrap();
+    let mut bystander = tokio::process::Command::new("/bin/sleep")
+        .arg("60").kill_on_drop(true).spawn().unwrap();
+    let saved = daemon::identity(orphan.id().unwrap()).unwrap();
+    let mismatch = Identity { start: "different start time".into(),
+        ..daemon::identity(bystander.id().unwrap()).unwrap() };
+    let thread = ThreadId("orphan".into());
     let cdb = rusqlite::Connection::open(dir.path().join("events.sqlite")).unwrap();
-    cdb.execute(
-        "INSERT INTO threads(id,running,pid,start,exe) VALUES('mismatch',1,?1,?2,?3)",
-        rusqlite::params![mismatch.pid, mismatch.start, mismatch.exe],
-    )
-    .unwrap();
+    for (id, identity) in [("orphan", &saved), ("mismatch", &mismatch)] {
+        cdb.execute("INSERT INTO threads(id,running,pid,start,exe) VALUES(?1,1,?2,?3,?4)",
+            rusqlite::params![id, identity.pid, identity.start, identity.exe]).unwrap();
+    }
+    for (seq, event) in [AgentEvent::TurnStarted { turn: 1 }, envelope(0).event].into_iter().enumerate() {
+        let env = AgentEventEnvelope { seq: seq as u64, at_ms: 0, event };
+        cdb.execute("INSERT INTO events(thread_id,envelope_json) VALUES('orphan',?1)",
+            [serde_json::to_string(&env).unwrap()]).unwrap();
+    }
     drop(cdb);
     d.crash();
-    assert_eq!(daemon::identity(saved.pid).unwrap(), saved);
+    assert!(orphan.try_wait().unwrap().is_none());
     let _restart = Daemon::start(dir.path()).await;
+    let status = timeout(Duration::from_secs(2), orphan.wait()).await
+        .expect("recovery did not kill the pipe-independent orphan").unwrap();
+    assert_eq!(status.signal(), Some(9));
     assert!(bystander.try_wait().unwrap().is_none());
-    bystander.kill().unwrap();
-    bystander.wait().unwrap();
-    // A dead child may briefly remain as a zombie under the host's init.
-    for _ in 0..100 {
-        if daemon::identity(saved.pid).ok().as_ref() != Some(&saved) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_ne!(daemon::identity(saved.pid).ok().as_ref(), Some(&saved));
+    bystander.kill().await.unwrap();
+    let db = store::open_reader(&dir.path().join("events.sqlite")).unwrap();
     let mut after = None;
     let mut events = vec![];
     loop {

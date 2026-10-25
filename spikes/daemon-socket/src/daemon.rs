@@ -18,7 +18,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     os::unix::{
-        fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, MetadataExt, PermissionsExt, FileTypeExt, OpenOptionsExt},
         process::CommandExt,
     },
     path::{Path, PathBuf},
@@ -28,8 +28,8 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    process::{ChildStdin, Command},
-    sync::{Mutex, mpsc},
+    process::Command,
+    sync::{Mutex, mpsc, oneshot, Semaphore},
 };
 
 pub fn default_dir() -> PathBuf {
@@ -44,6 +44,17 @@ pub fn verify_dir_metadata(meta: &fs::Metadata, uid: u32) -> io::Result<()> {
         return Err(error(
             "daemon directory must be a real directory owned by current user with mode 0700",
         ));
+    }
+    Ok(())
+}
+/// Check the endpoint before connecting, including for reconnect attempts.
+pub fn verify_socket(path: &Path) -> io::Result<()> {
+    let dir = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,"socket has no directory"))?;
+    verify_dir_metadata(&fs::symlink_metadata(dir)?, geteuid().as_raw())
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied,e))?;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_socket() || meta.uid() != geteuid().as_raw() || meta.mode() & 0o7777 != 0o600 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,"socket must be owned by current user with mode 0600"));
     }
     Ok(())
 }
@@ -73,10 +84,12 @@ impl SocketGuard {
         }
         let lock = OpenOptions::new()
             .create(true)
+            .mode(0o600)
             .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)?;
+        lock.set_permissions(fs::Permissions::from_mode(0o600))?;
         lock.try_lock()
             .map_err(|e| error(format!("another daemon holds the lock: {e}")))?;
         match fs::remove_file(&socket) {
@@ -152,10 +165,31 @@ pub fn reap_if_matching(saved: &Identity) -> io::Result<bool> {
         );
         return Ok(false);
     }
-    kill(Pid::from_raw(saved.pid as i32), Signal::SIGKILL).map_err(error)?;
+    signal_result(kill(Pid::from_raw(saved.pid as i32), Signal::SIGKILL))?;
     Ok(true)
 }
 
+fn signal_result(result: Result<(), nix::errno::Errno>) -> io::Result<()> {
+    match result { Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()), Err(e) => Err(error(e)) }
+}
+/// macOS physical footprint includes compressed/private memory absent from RSS.
+pub fn phys_footprint(pid: u32) -> io::Result<Option<u64>> {
+    #[cfg(target_os = "macos")]
+    { libproc::libproc::pid_rusage::pidrusage::<libproc::libproc::pid_rusage::RUsageInfoV2>(pid as i32)
+        .map(|r| Some(r.ri_phys_footprint)).map_err(error) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = pid; Ok(None) }
+}
+static READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn memory_trace(label: &str) {
+    if std::env::var_os("ATRIUM_MEMORY_DIAGNOSTICS").is_some() {
+        eprintln!("memory phase={label} readers={} rss={:?} footprint={:?}",
+            READERS.load(std::sync::atomic::Ordering::Relaxed), rss(std::process::id()), phys_footprint(std::process::id()));
+    }
+}
+struct ReaderCount;
+impl ReaderCount { fn new() -> Self { READERS.fetch_add(1,std::sync::atomic::Ordering::Relaxed); memory_trace("reader_open"); Self } }
+impl Drop for ReaderCount { fn drop(&mut self) { READERS.fetch_sub(1,std::sync::atomic::Ordering::Relaxed); memory_trace("reader_closed"); } }
 /// Reconstruct only open lifecycle objects; complete them before SessionEnded.
 pub fn closing(
     events: impl IntoIterator<Item = AgentEventEnvelope>,
@@ -268,7 +302,13 @@ async fn close_thread(store: &Store, thread: ThreadId, reason: &str) -> io::Resu
         after = page.last().map(|e| e.id);
         all.extend(page.into_iter().map(|e| e.envelope));
     }
+    if std::env::var_os("ATRIUM_MEMORY_DIAGNOSTICS").is_some() {
+        let bytes: usize = all.iter().map(|e| match &e.event { AgentEvent::MessageDelta {text,..} | AgentEvent::MessageCompleted {text,..} => text.len(), _ => 0 }).sum();
+        eprintln!("lifecycle_scan events={} message_text_bytes={bytes}", all.len());
+        memory_trace("history_loaded");
+    }
     store.append(thread.clone(), closing(all, reason)).await?;
+    memory_trace("history_released");
     store
         .call(move |c| {
             c.execute("UPDATE threads SET running=0 WHERE id=?1", [thread.0])
@@ -312,14 +352,15 @@ async fn recover(store: &Store) -> io::Result<()> {
 }
 struct State {
     store: Store,
-    children: Mutex<HashMap<ThreadId, ChildStdin>>,
+    children: Mutex<HashMap<ThreadId, mpsc::Sender<StdinRequest>>>,
     fake: PathBuf,
+    replay_gate: Option<ReplayGate>,
 }
 impl State {
     async fn command(self: &Arc<Self>, command: DaemonCommand) -> io::Result<serde_json::Value> {
         match command {
             DaemonCommand::ListThreads => self.store.call(|c| {
-                let mut q = c.prepare("SELECT t.id,t.running,max(e.id) FROM threads t LEFT JOIN events e ON e.thread_id=t.id GROUP BY t.id ORDER BY t.id").map_err(error)?;
+                let mut q = c.prepare("SELECT t.id,t.running,(SELECT max(id) FROM events WHERE thread_id=t.id) FROM threads t ORDER BY t.id").map_err(error)?;
                 let rows = q.query_map([], |r| Ok(json!({"thread_id": r.get::<_,String>(0)?, "running": r.get::<_,bool>(1)?, "last_event": r.get::<_,Option<i64>>(2)?}))).map_err(error)?;
                 Ok(serde_json::Value::Array(rows.map(|r| r.map_err(error)).collect::<io::Result<Vec<_>>>()?))
             }).await,
@@ -342,7 +383,8 @@ impl State {
                 if let Err(e) = self.store.call(move |c| { c.execute("INSERT INTO threads(id,running,pid,start,exe) VALUES(?1,1,?2,?3,?4)", rusqlite::params![id.0,saved.pid,saved.start,saved.exe]).map_err(error)?; Ok(()) }).await { child.kill().await?; return Err(e); }
                 let mut stdin = child.stdin.take().ok_or_else(|| error("missing stdin"))?;
                 stdin.write_all(b"go\n").await?;
-                self.children.lock().await.insert(thread.clone(), stdin);
+                let (commands, writer) = spawn_stdin_writer(stdin);
+                self.children.lock().await.insert(thread.clone(), commands);
                 let stdout = child.stdout.take().ok_or_else(|| error("missing stdout"))?;
                 let state = self.clone(); let id = thread.clone();
                 tokio::spawn(async move {
@@ -360,6 +402,7 @@ impl State {
                     let _ = child.kill().await; // also waits/reaps; harmless after normal exit
                     let _ = child.wait().await;
                     state.children.lock().await.remove(&id);
+                    writer.abort(); let _ = writer.await;
                     if let Err(e) = close_thread(&state.store, id, "Interrupted: child exited").await { eprintln!("close: {e}"); }
                 });
                 Ok(json!({"thread_id": thread}))
@@ -373,16 +416,28 @@ impl State {
         thread: ThreadId,
         command: SessionCommand,
     ) -> io::Result<serde_json::Value> {
-        let mut children = self.children.lock().await;
-        let stdin = children
-            .get_mut(&thread)
+        let sender = self.children.lock().await.get(&thread).cloned()
             .ok_or_else(|| error("thread is not running"))?;
-        let mut line = serde_json::to_vec(&command).map_err(error)?;
-        line.push(b'\n');
-        stdin.write_all(&line).await?;
+        let mut line = serde_json::to_vec(&command).map_err(error)?; line.push(b'\n');
+        let (reply, rx) = oneshot::channel();
+        sender.try_send(StdinRequest { line, reply }).map_err(|_| error("child command queue full or closed"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(5),rx).await.map_err(error)?.map_err(error)??;
         Ok(json!({}))
     }
 }
+struct StdinRequest { line: Vec<u8>, reply: oneshot::Sender<io::Result<()>> }
+fn spawn_stdin_writer<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(mut stdin: W) -> (mpsc::Sender<StdinRequest>, tokio::task::JoinHandle<()>) {
+    let (sender, mut commands) = mpsc::channel::<StdinRequest>(16);
+    let writer = tokio::spawn(async move {
+        while let Some(request) = commands.recv().await {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5),stdin.write_all(&request.line)).await.map_err(error).and_then(|r| r);
+            let failed = result.is_err(); let _ = request.reply.send(result); if failed { break; }
+        }
+    }); (sender, writer)
+}
+/// Deterministic replay test seam: pause after response, before the first page.
+#[derive(Clone)]
+pub struct ReplayGate { pub entered: mpsc::Sender<ThreadId>, pub release: Arc<Semaphore> }
 fn result(r: io::Result<serde_json::Value>) -> CommandResult {
     match r {
         Ok(value) => CommandResult::Ok { value },
@@ -400,7 +455,8 @@ async fn send(w: &mut tokio::net::unix::OwnedWriteHalf, message: ServerMessage) 
     codec::write(w, &Frame::Control(message)).await
 }
 async fn connection(stream: UnixStream, state: Arc<State>) -> io::Result<()> {
-    let (mut r, mut w) = stream.into_split();
+    let (r, mut w) = stream.into_split();
+    let mut r = BufReader::new(r);
     match codec::read::<_, ClientMessage>(&mut r).await? {
         Frame::Control(ClientMessage::Hello {
             protocol_version, ..
@@ -446,6 +502,7 @@ async fn connection(stream: UnixStream, state: Arc<State>) -> io::Result<()> {
         }
     }
     let _reader = ReaderGuard(reader);
+    let _reader_count = ReaderCount::new();
     let mut c = store::open_reader(&state.store.path)?;
     let mut changed = state.store.changed.clone();
     let mut subscriptions = BTreeMap::<ThreadId, Subscription>::new();
@@ -517,6 +574,7 @@ async fn handle(
                 )
                 .map_err(error)?;
             let boundary = store::last(c, &thread_id)?;
+            let subscribed = thread_id.clone();
             let r = if !exists {
                 Err(error("unknown thread"))
             } else if after.is_some_and(|a| a > boundary.unwrap_or(EventId(0))) {
@@ -532,14 +590,13 @@ async fn handle(
                 );
                 Ok(json!({"replay_until": boundary}))
             };
-            send(
-                w,
-                ServerMessage::Response {
-                    request_id,
-                    result: result(r),
-                },
-            )
-            .await
+            let success = r.is_ok();
+            send(w, ServerMessage::Response { request_id, result: result(r) }).await?;
+            if success && let Some(gate) = &state.replay_gate {
+                gate.entered.send(subscribed).await.map_err(error)?;
+                gate.release.acquire().await.map_err(error)?.forget();
+            }
+            Ok(())
         }
         Frame::Control(ClientMessage::Unsubscribe { thread_id }) => {
             subscriptions.remove(&thread_id);
@@ -566,22 +623,32 @@ async fn handle(
 pub async fn run(dir: &Path, fake: PathBuf) -> io::Result<()> {
     let guard = SocketGuard::acquire(dir)?;
     let store = Store::open(&dir.join("events.sqlite"))?;
-    serve(guard, store, fake).await
+    serve(guard, store, fake, None, None).await
 }
 /// In-process harness with the same single writer used to seed fixtures.
 pub async fn run_with_store(dir: &Path, fake: PathBuf, store: Store) -> io::Result<()> {
     let guard = SocketGuard::acquire(dir)?;
-    serve(guard, store, fake).await
+    serve(guard, store, fake, None, None).await
 }
-async fn serve(guard: SocketGuard, store: Store, fake: PathBuf) -> io::Result<()> {
+pub async fn run_with_replay_gate(dir: &Path, fake: PathBuf, store: Store, gate: ReplayGate, ready: oneshot::Sender<()>) -> io::Result<()> {
+    serve(SocketGuard::acquire(dir)?, store, fake, Some(gate), Some(ready)).await
+}
+async fn serve(guard: SocketGuard, store: Store, fake: PathBuf, replay_gate: Option<ReplayGate>, ready: Option<oneshot::Sender<()>>) -> io::Result<()> {
     recover(&store).await?;
-    let listener = UnixListener::bind(&guard.socket)?;
-    fs::set_permissions(&guard.socket, fs::Permissions::from_mode(0o600))?;
+    // Publish only after setting permissions; no permissive public socket window.
+    let staging = guard.socket.with_file_name(".bind");
+    match fs::remove_file(&staging) { Ok(()) => (), Err(e) if e.kind()==io::ErrorKind::NotFound => (), Err(e) => return Err(e) }
+    let listener = UnixListener::bind(&staging)?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&staging,&guard.socket)?;
     let state = Arc::new(State {
         store,
         children: Mutex::new(HashMap::new()),
         fake,
+        replay_gate,
     });
+    if let Some(ready) = ready { let _ = ready.send(()); }
+    println!("READY");
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
