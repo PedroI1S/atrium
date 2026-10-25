@@ -1,6 +1,6 @@
 # M0-02: Codex app-server adapter
 
-Status: fix round 2 implemented offline. Orchestrator verified a live simple session; full live enforcement verification remains pending.
+Status: fix round 2 implemented offline; all 13 scenarios then recorded **live** (codex 0.163.0, `gpt-5.6-luna`) by the orchestrator and committed as the primary fixtures; escalation fixed the tests. Live facts are summarized in "Live verification results" below. Rows still marked verify live were not exercised.
 Installed CLI: `codex-cli 0.163.0` (`codex --version`).
 
 ## Implementation
@@ -64,20 +64,21 @@ safe commands and writes inside provider-granted roots.
 
 | Tool class | Intercepted before execution? | How | Evidence and limitation |
 | --- | --- | --- | --- |
-| Read | partial | command approval request, when issued | `tool-read`, `gate-deny` goldens; hand-made, unchecked reads remain possible. |
-| Edit/write | partial | `item/fileChange/requestApproval`, when issued | `patch` golden; no proof that every write asks. |
+| Read | partial; **live verified** for the sampled reads | command approval request, when issued | Live: `tool-read` (compound `rg`/`sed` read of `public.txt`) and `gate-deny` (`cat secret.txt`) both raised `item/commandExecution/requestApproval` under ReadOnly/untrusted. `gate-deny` was **denied, sentinel absent, no native execution**. Two samples do not prove every read or "safe" command asks. |
+| Edit/write | partial, **not live verified** | `item/fileChange/requestApproval`, when issued | The live `patch` recording ended in a `usageLimitExceeded` refusal (mapped to `RateLimited`) before any file change, so the file-change request/mapping is proven only on the hand-made `handmade/patch` trace. Re-record `patch` when quota allows. |
 | Delete/move | partial | command/file approval, when issued | shared routing only; no live delete/move evidence. |
-| Execute | partial | `item/commandExecution/requestApproval` | `gate-deny-execute`, both approval goldens, fake-server panic denial; safe-command bypass not ruled out. |
+| Execute | partial; **live verified** for the sampled commands | `item/commandExecution/requestApproval` | Live: `gate-deny-execute` **denied, sentinel absent, no native execution**; `approval-allow` (Allow, command ran) and `approval-deny` (denied) work; `interrupt` cancels a pending `sleep 60` (tool Cancelled, turn Interrupted). Fake-server panic denial is offline. Safe-command bypass not ruled out. |
 | Search | partial | command approval, when issued | action classification; universal interception unproven. |
 | Fetch/web | no | item notifications are observations | web items map to tools; no universal authorization request established. |
-| MCP | partial, verify live | injected servers use `default_tools_approval_mode="prompt"`; `mcpServer/elicitation/request` routes through the gate | Offline allow/deny/Ask/cancel tests pass; elicitations do not establish coverage of all MCP calls. |
+| MCP | partial, verify live (not exercised: recordings inject no MCP servers) | injected servers use `default_tools_approval_mode="prompt"`; `mcpServer/elicitation/request` routes through the gate | Offline allow/deny/Ask/cancel tests pass; elicitations do not establish coverage of all MCP calls. |
 | Subagents | no | collaboration notifications | observed as tools; universal authorization callback unproven. |
 | Extra permissions/dynamic tools/auth refresh | unsupported | server requests return `-32601` | no execution or permission grant is authorized. |
 
-Fixtures prove mapping only, not provider enforcement or real absence of secret
-leakage. No live evidence established the brief's stop-condition finding: writes
-or non-read commands bypassing the client under every setting. The orchestrator
-must explicitly test that condition during verification.
+Hand-made fixtures prove mapping only. The live recordings add real wire evidence
+for the rows marked live above; they are samples, not coverage proofs. The brief's
+stop condition (writes or non-read commands bypassing the client under every
+setting) was **not observed**: no non-read command or write ran without a request
+in any live scenario. Writes are the unverified part (live `patch` hit the quota).
 
 ## Lifecycle, bounds and saturation
 
@@ -106,12 +107,36 @@ cargo test -p spike-agent-codex --test live interrupt_during_turn_start_is_not_l
 
 All required scenarios have separate golden tests: simple, tool-read, gate-deny,
 approval-allow, approval-deny, question, interrupt, multi-turn, resume, startup-error.
-Additional scenarios cover execution denial, patches and quota/usage/reasoning/
-plan/unknown records. **Every committed fixture is hand-made**, with neighboring
-provenance notes. Resume's fixture represents the second process resuming a
-synthetic id. The live harness separately records `resume-origin`, then resumes
-that real native id in a second process. Experimental question transport is
-implemented; the selected live model/mode's willingness to invoke it is unverified.
+Additional scenarios cover execution denial, patches and quota/usage. Fixtures are
+split by purpose:
+
+- `fixtures/agents/codex/<scenario>.*`: **live recordings** (codex 0.163.0,
+  `gpt-5.6-luna`), the primary scenario fixtures with a golden test each. The
+  `*-startup-failure` and `resume-origin` files are auxiliary live traces.
+  Regenerate goldens with `UPDATE_GOLDEN=1` only after re-recording, and review the diff.
+- `fixtures/agents/codex/handmade/<scenario>.*`: **hand-made** synthetic traces
+  (`approval-allow`, `interrupt`, `question`, `quota-usage`, `patch`) that unit and
+  semantic tests need for specific content live Codex did not produce: the
+  question round trip, `RequestResolved(Cancelled)` after interrupt, per-turn totals
+  `[10, 25, 5]` with a refusal and an unknown record, and the file-change mapping.
+  They prove mapping only and are labeled in their `.md`. The `--hand-made`
+  recorder flag now writes only here and can no longer overwrite a live recording.
+
+Live deviations from the hand-made assumptions (none violates a contract invariant;
+all live streams satisfy the structural invariants: first SessionStarted, last
+SessionEnded, every tool call and request closed exactly once):
+
+- `question`: Codex answered in plain text ("I can't use `request_user_input` in the
+  current mode") and did **not** ask, so there is no `QuestionAsked` live. The
+  experimental question transport is verified only on the hand-made trace.
+- `interrupt`: the interrupt raced the gate. The request (id 0) arrived, the
+  interrupt was sent before any gate decision, so `ApprovalRequested` was never
+  emitted; the late `serverRequest/resolved` has nothing to resolve and emits no
+  event. No pending request leaks; the tool ends Cancelled and the turn Interrupted.
+- `patch`: refused with `usageLimitExceeded` (`RateLimited`, `resets_at_ms` null,
+  empty quota windows, turn Failed); the account's primary window was at 96-99%.
+- Reads like `rg`/`sed` compound commands are classified `execute`, not `read`; only
+  the plain `cat` is `read` (classification is advisory).
 
 The CLI labels app-server experimental. Local schemas require item timestamps and
 session/project fields on threads. `schema/` and raw `live/` files are ignored.
@@ -121,7 +146,7 @@ codex app-server generate-json-schema --out spikes/agent-codex/schema
 python3 spikes/agent-codex/tests/support/check_schema.py
 ```
 
-The structural check reports **180 records passed, 0 errors**, plus six enforcement candidate shape checks for the committed
+The structural check reports **717 records passed, 0 errors** on the live corpus, plus six enforcement candidate shape checks for the committed
 corpus. It checks references, required fields, types, enums and alternatives with
 Python's standard library; it is not a full JSON Schema validator. The deliberate
 `future/notification` example is excluded from known-schema checks. Upgrade the
@@ -155,7 +180,7 @@ Real-world unknown-record frequency is unmeasured.
 
 ## Measurements and live verification
 
-**Time to first real event: 416 ms**, reported by the orchestrator from
+**Time to first real event: 416 ms** (SessionStarted at 181 ms in the committed live `simple` recording: thread/start response; turn/started 351 ms; first text delta 1.8 s), reported by the orchestrator from
 `cargo run -p spike-agent-codex --example record -- simple` outside the worker
 sandbox, using `gpt-5.6-luna`. Session/turn/message/usage/quota ordering passed.
 That recording was discarded for privacy issues; it is not a committed fixture.
@@ -182,8 +207,9 @@ generation is `cargo run -p spike-agent-codex --example record -- simple --hand-
 ## Validation and M1 recommendation
 
 `cargo fmt --check`, clippy with `--all-targets -- -D warnings`, and
-`cargo test -p spike-agent-codex` pass. The latter runs 20 fixture/semantic tests
-and 9 subprocess/policy tests; see the handoff for command results.
+`cargo test -p spike-agent-codex` pass. The latter runs 28 fixture/semantic tests
+(live goldens plus hand-made unit traces), 17 subprocess/policy tests
+and 9 recording/privacy tests; see the handoff for command results.
 
 Carry the pure mapper, request routing, sanitizer and process-owner tests into M1
 after independent review and real recordings. Keep ProviderGated visible to daemon
@@ -289,7 +315,7 @@ in place until safe live recordings replace them.
 ## Fix round 2 — accepted review findings
 
 Base: `49e6b20` (fix round 1, committed by the orchestrator, 34 tests verified).
-All current fixtures remain **hand-made**. Offline routing and shape checks do
+At the time of fix round 2 all fixtures were hand-made (since replaced by live recordings; see Fixtures). Offline routing and shape checks do
 not establish provider enforcement. The original 29-test and round-1 34-test
 counts above describe historical verification, not this revision.
 
@@ -342,3 +368,26 @@ The process owner kills/reaps its direct child and joins its own tasks. It does
 child; M1 needs platform-specific process-tree supervision and descendant tests.
 This limitation does not weaken fail-closed handling of received gate requests,
 but prevents claiming complete provider process-tree cleanup.
+
+## Live verification results (codex 0.163.0, gpt-5.6-luna)
+
+Recorded by the orchestrator; recorder keeps user MCP on (disabling it makes
+`app-server` exit with "invalid transport" on 0.163, so names are redacted instead).
+All 13 scenarios are live and leak-clean.
+
+| Scenario | Live result |
+| --- | --- |
+| simple, multi-turn, resume, startup-error | **live verified**, including native resume in a second process and the startup fallback |
+| tool-read | **live verified**; read command asked, Allow ran it |
+| gate-deny | **live verified**: denied, no secret, no native execution |
+| gate-deny-execute | **live verified**: denied, no secret, no native execution |
+| approval-allow / approval-deny | **live verified** (Ask, resolved Approved / Denied) |
+| interrupt | **live verified**: tool Cancelled, turn Interrupted; raced the gate (see above) |
+| question | recorded live, **but Codex did not ask the question** (no QuestionAsked); the question mapping is hand-made verified only |
+| patch | recorded live but ended in a usage-limit refusal; file-change approval **not live verified**; RateLimited mapping is live verified |
+| quota-usage | **live verified**: Usage and QuotaUpdated, no spurious RateLimited |
+
+Runtime accepted `approvalPolicy: "untrusted"` with ReadOnly (the schema/runtime
+discrepancy is not an issue on 0.163). Still unverified live: file-change requests,
+MCP, granular, hooks, allow-prefixes, FullAccess, subagents, the `Ask` policy's workspace-write behavior beyond thread parameters, and refusal variants other
+than `usageLimitExceeded`.

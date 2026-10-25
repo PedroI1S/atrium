@@ -1,0 +1,86 @@
+[
+  {
+    "type": "session_started",
+    "provider": "codex",
+    "native_session_id": "thread-fixture",
+    "model": "fixture-model",
+    "tools": []
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "call-1",
+    "name": "commandExecution",
+    "kind": "execute",
+    "title": "sleep 60",
+    "input": {
+      "id": "call-1",
+      "type": "commandExecution",
+      "command": "sleep 60",
+      "cwd": "/scratch",
+      "status": "inProgress",
+      "commandActions": [
+        {
+          "type": "unknown",
+          "command": "sleep 60"
+        }
+      ]
+    }
+  },
+  {
+    "type": "approval_requested",
+    "request_id": "17",
+    "call_id": "call-1",
+    "name": "commandExecution",
+    "kind": "execute",
+    "title": "sleep 60",
+    "input": {
+      "itemId": "call-1",
+      "threadId": "thread-fixture",
+      "turnId": "turn-1",
+      "startedAtMs": 0,
+      "command": "sleep 60",
+      "cwd": "/scratch",
+      "item": {
+        "id": "call-1",
+        "type": "commandExecution",
+        "command": "sleep 60",
+        "cwd": "/scratch",
+        "status": "inProgress",
+        "commandActions": [
+          {
+            "type": "unknown",
+            "command": "sleep 60"
+          }
+        ]
+      }
+    },
+    "reason": null
+  },
+  {
+    "type": "request_resolved",
+    "request_id": "17",
+    "outcome": "cancelled"
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "call-1",
+    "status": "cancelled",
+    "output": null,
+    "error": null
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "interrupted",
+    "usage": null
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

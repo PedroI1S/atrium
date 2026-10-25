@@ -177,7 +177,10 @@ fn written_transcript_and_goldens_redact_identifiers_and_preserve_unmapped() {
 fn installed_fixture_corpus_does_not_contain_current_hostname() {
     let host = recording::hostname().unwrap();
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/agents/codex");
-    for entry in std::fs::read_dir(fixtures).unwrap() {
+    for entry in std::fs::read_dir(&fixtures)
+        .unwrap()
+        .chain(std::fs::read_dir(fixtures.join("handmade")).unwrap())
+    {
         let path = entry.unwrap().path();
         if path.is_file() {
             let text = std::fs::read_to_string(&path).unwrap();

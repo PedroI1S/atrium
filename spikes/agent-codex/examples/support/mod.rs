@@ -69,8 +69,14 @@ pub fn save_with_secrets(
     secrets: &[String],
     invocation: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(root())?;
-    let path = root().join(format!("{scenario}.jsonl"));
+    // Hand-made traces never overwrite the live recordings.
+    let dir = if provenance.starts_with("live") {
+        root()
+    } else {
+        root().join("handmade")
+    };
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{scenario}.jsonl"));
     let clean = spike_agent_codex::recording::write_with_secrets(&path, lines, secrets)?;
     if provenance.starts_with("live") {
         let mut n = CodexNormalizer::default();

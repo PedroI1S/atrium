@@ -1,6 +1,6 @@
 # Handoff: M0-02-codex-adapter
 
-Model: GPT-6.1 Sol · Status: partial (fix round 2 complete offline; full live verification awaits orchestrator)
+Model: GPT-6.1 Sol (escalated to Sonnet 5.5) · Status: done for the escalation (live fixtures separated from hand-made unit fixtures; tests green); some enforcement rows remain unverified live
 
 ## Done
 
@@ -119,3 +119,53 @@ be created in the shared repository's external `.git/worktrees` metadata,
 `Operation not permitted`. No workaround was attempted. All fix-round-2 changes,
 including this handoff, remain uncommitted on `agent/sol/M0-02-codex-adapter`
 for the orchestrator to commit.
+
+## Escalation (Sonnet)
+
+Cross-provider escalation after both Sol fix rounds. The orchestrator had committed
+13 live recordings (codex 0.163.0, `gpt-5.6-luna`) over the hand-made fixtures, which broke
+4 tests that depended on synthetic content. Changes:
+
+- Restored the hand-made traces from `a4b6163` into `fixtures/agents/codex/handmade/`
+  (`approval-allow`, `interrupt`, `question`, `quota-usage`, `patch`; each with
+  `.jsonl`, golden `.events.json` and a `hand-made` `.md`). Live recordings stay the
+  primary scenario fixtures; their goldens were not regenerated (no diff, so
+  `UPDATE_GOLDEN` was not needed).
+- Tests (`tests/fixtures.rs`): `exit_closes_in_contract_order_and_is_idempotent`,
+  `queued_messages_are_bounded_and_unknown_records_are_retained`,
+  `totals_replace_and_reset_per_turn`, `duplicate_resolution_is_rejected` now use the
+  hand-made traces. `lifecycle_and_security_semantics` runs the structural invariants
+  (SessionStarted first, SessionEnded last, calls and requests closed once, no pending
+  leftovers) on **all live and hand-made** streams, keeps the live denial /
+  no-sentinel / Approved / Denied / Cancelled-tool / Interrupted checks, takes
+  `RequestResolved(Cancelled)` and `Answered` from the hand-made traces, and adds
+  explicit assertions that live `question` has no `QuestionAsked` and live `interrupt`
+  never reached the gate (so these flip loudly if re-recorded differently). Added live
+  `quota-usage` (Usage and QuotaUpdated, no RateLimited), `patch` (RateLimited, no edit
+  tool live; Edit mapping on hand-made) and hand-made goldens. The sanitizer, golden
+  corpus and hostname tests now walk `handmade/` too. No assertion was weakened.
+- `examples/support/mod.rs`: hand-made saves go to `handmade/` so `--hand-made`
+  cannot overwrite live recordings again.
+- Report: matrix rows updated with live facts, fixtures section split, new "Live
+  verification results" table with "live verified" markers.
+
+Findings (no contract invariant violated by any live fixture):
+
+1. Live Codex **did not ask the question** in `question`; no `QuestionAsked` live.
+2. Live `patch` ended in `usageLimitExceeded` before any file change, so the
+   file-change approval is **not live verified** (account primary window 96-99%).
+   Re-record `patch` when quota is available, then `UPDATE_GOLDEN=1` for it only.
+3. Live `interrupt` raced the gate: no `ApprovalRequested`, so no live
+   `RequestResolved(Cancelled)`; the late `serverRequest/resolved` yields no event.
+   Nothing leaks. The Cancelled resolution is proven on the hand-made trace.
+4. Even a plain read (`pwd && rg ... && sed public.txt`) asked for approval under
+   ReadOnly/untrusted; no write or non-read command ran without a request. Samples only.
+
+DoD (run in this worktree, no live `codex` run):
+
+```text
+cargo fmt --check                                              PASS
+cargo clippy -p spike-agent-codex --all-targets -- -D warnings PASS
+cargo test -p spike-agent-codex                                PASS: 28 fixtures + 17 live(fake server) + 9 recording
+python3 spikes/agent-codex/tests/support/check_schema.py       PASS: 717 records, 0 errors
+```
