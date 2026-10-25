@@ -20,7 +20,7 @@ export function App() {
 
   const say = (text: string, kind: "info" | "error" = "info") => {
     setStatus({ text, kind });
-    window.setTimeout(() => setStatus((s) => (s?.text === text ? null : s)), 4000);
+    if (kind === "info") window.setTimeout(() => setStatus((s) => (s?.text === text ? null : s)), 4000);
   };
 
   async function show(ctx: number) {
@@ -79,7 +79,14 @@ export function App() {
     const r = pane.canvas.parentElement!.getBoundingClientRect();
     await pane.resize(r.width, r.height);
     await show(0);
-    if (config.bench) {
+    if (config.bench?.startsWith("shot:")) {
+      const { runShot } = await import("./shot");
+      try {
+        await runShot(config.bench.slice(5), pane, info()!, takeOver, show);
+      } catch (e) {
+        say(`scene failed: ${e}`, "error");
+      }
+    } else if (config.bench) {
       const { runBench } = await import("./bench");
       await runBench(pane, config, info()!, takeOver);
     }

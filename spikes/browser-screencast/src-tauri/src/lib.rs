@@ -292,7 +292,7 @@ async fn pane_navigate(state: State<'_, AppState>, context: usize, url: String) 
     state.control.require_user()?;
     let (_, page) = state.page(context).await?;
     // Do not wait for load: the pane keeps streaming while the page loads.
-    let r = page.call("Page.navigate", json!({"url": url})).await.map_err(err)?;
+    let r = page.navigate_start(&url).await.map_err(err)?;
     match r["errorText"].as_str() {
         Some(e) => Err(format!("navigate: {e}")),
         None => Ok(()),

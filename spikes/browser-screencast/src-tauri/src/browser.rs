@@ -337,10 +337,22 @@ impl Page {
         self.cdp.subscribe()
     }
 
+    /// `Page.navigate`, returning the raw result. The first navigation shortly after launch
+    /// is sometimes answered with `net::ERR_ABORTED` (seen reliably in the app, about 1 in 12
+    /// in a headless probe; cause not found). One retry after 300 ms always succeeded.
+    pub async fn navigate_start(&self, url: &str) -> Result<Value> {
+        let mut r = self.call("Page.navigate", json!({"url": url})).await?;
+        if r["errorText"].as_str() == Some("net::ERR_ABORTED") {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            r = self.call("Page.navigate", json!({"url": url})).await?;
+        }
+        Ok(r)
+    }
+
     /// Navigates and waits for `Page.loadEventFired` (15 s cap).
     pub async fn navigate(&self, url: &str) -> Result<()> {
         let mut rx = self.subscribe();
-        let r = self.call("Page.navigate", json!({"url": url})).await?;
+        let r = self.navigate_start(url).await?;
         if let Some(err) = r["errorText"].as_str() {
             bail!("navigate {url}: {err}");
         }
