@@ -196,3 +196,92 @@ confirm actual runtime settings, record read/execution denials, exercise safe
 commands/writes/MCP/subagents under every policy, prove native resume, choose the
 cheapest entitled model, inspect refusal variants and measure latency. No frozen
 contract, root manifest, lockfile or other provider implementation was changed.
+
+## Fix round 1
+
+The orchestrator committed the initial implementation as `83225db` and reran fmt,
+clippy and all 29 original tests successfully. Its real
+`cargo run -p spike-agent-codex --example record -- simple` run selected
+`gpt-5.6-luna` and produced the first event at **416 ms**. Session/turn lifecycle,
+message deltas/completion, usage and quota events mapped correctly. These are
+orchestrator-reported measurements from the pre-fix recorder, not measurements
+repeated in the worker sandbox. The unsafe recording was discarded; no live
+fixture or enforcement proof is claimed from that run. This supersedes the
+original section's lack of any real latency result.
+
+### Recorder privacy and configuration
+
+The recorder now uses `recording::write` for both JSONL and golden output. It
+obtains the hostname from the OS `hostname` command, and also checks macOS
+`LocalHostName` through `scutil` when available. Failure to obtain the OS hostname
+stops fixture writing. Nested JSON-RPC strings are decoded before redaction.
+`installationId`/`installation_id` become a stable string placeholder; account
+`authMode`/`planType` (including snake_case spellings) become null, including in
+unknown/nested records. Remote-control hostname and environment id fields are
+replaced. A whole-stream pass collects installation and remote-control identifiers
+so copies in earlier diagnostic text are redacted too. Generic secret, home and
+user sanitization still runs; both outputs are checked before writing and read
+back for cleanliness assertions. Raw session inputs are not modified.
+
+`codex app-server --help` exposes `-c` overrides but no `--ignore-user-config` flag.
+The local ConfigReadParams schema supports `config/read` with `cwd` and
+`includeLayers`; ConfigReadResponse permits additional effective config fields.
+The [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+documents `features.hooks=false`, `mcp_servers.<name>.enabled=false`, and per-plugin
+MCP server enablement. Recording therefore uses this sequence:
+
+1. Start the catalog/config-discovery process with `-c features.hooks=false`.
+   It initializes and reads model/list plus effective config for the recorder's
+   scratch cwd, without starting an agent thread or turn.
+2. For the actual recording processes, including both resume processes, pass
+   `-c features.hooks=false` and individual `enabled=false` overrides for the MCP
+   servers discovered in `config.mcp_servers` and plugin MCP tables.
+3. Keep native Codex home and authentication unchanged. No config file or auth store
+   is rewritten, and normal `CodexAdapter::default()` / chat sessions have no extra
+   overrides. A fake-child test checks the actual process arguments in both modes.
+
+There is no demonstrated blanket MCP switch in app-server help. Empty-table
+`mcp_servers={}`/`hooks={}` overrides are not assumed to erase inherited layers.
+Effective config may omit plugin or managed sources, and config/read may fail.
+In those cases the recorder uses the authorized redaction fallback; it does not
+claim complete configuration isolation. MCP startup/status records retain their
+method and status but replace names with `mcp-1`, `mcp-2`, etc. Hook start/completion
+records share `hook-1` aliases for the same run. Names, commands, source paths,
+error/output text and unknown diagnostic text fields receive stable placeholders;
+lifecycle enums and thread/turn correlations remain. This fallback always runs,
+including if a source emits metadata despite the disable overrides. Discovery
+errors are not printed verbatim. Auth continuity and suppression of real user
+sources still need the orchestrator's live verification; no app-server was launched
+inside the worker sandbox during this fix round.
+
+### Observed Unmapped records: M1 disposition
+
+All eight records remain `Unmapped` now. These are proposed M1 interpretations,
+not changes to the frozen contract or current normalizer:
+
+| Native notification | M1 relevance / proposed mapping |
+| --- | --- |
+| `account/updated` | Ignorable in the normalized session lifecycle; shared account UI may consume it separately. No existing AgentEvent represents account plan/auth metadata. Actual auth failures should map from provider errors to `Error`, not be inferred from a plan change. |
+| `hook/started` | Relevant execution visibility: `ToolCallStarted`, with a provider hook name and `Execute` for command hooks (`Mcp` for MCP handlers). It is an observation, not a pre-execution approval. |
+| `hook/completed` | Relevant execution visibility: corresponding `ToolCallFinished` with succeeded/failed/denied status and safe output; preserve start/completion correlation. |
+| `mcpServer/startupStatus/updated` | Relevant readiness failures: `Error { fatal: false }` on failed startup. Starting/ready updates are ignorable in agent-tool execution history; they describe a server, not a tool invocation. |
+| `remoteControl/status/changed` | Ignorable for the local stdio adapter; belongs to a future remote-device connection UI, not agent turn events. Host and installation identifiers are fixture-private. |
+| `thread/readState/changed` | Ignorable in execution history; read/unread state belongs to local client/storage state, with no matching AgentEvent. |
+| `thread/status/changed` | Relevant reconciliation: `systemError` can become `Error { fatal: false }`; active/idle/waiting flags corroborate TurnStarted/TurnCompleted/ApprovalRequested/QuestionAsked. Do not synthesize duplicate lifecycle or request events from status alone. |
+| `turn/moderationMetadata` | Relevant for diagnosing moderation/refusals, but the schema leaves metadata opaque. Keep raw metadata pending interpretation; only an explicit refusal should become `Error` alongside the failed TurnCompleted. Metadata alone is not a failure or RateLimited event. |
+
+### Fix validation
+
+Synthetic-stream tests exercise the production writer with all eight notifications,
+current OS hostname, installation identifiers (including earlier text copies),
+account fields, multiple MCP servers and repeated hook start/completion records.
+They read JSONL/goldens back, check stable aliases and preserved Unmapped methods,
+and verify the original session data was untouched. A separate corpus test fails
+if any committed Codex fixture contains the current hostname. JSON escaping and
+scalar line preservation are also covered. Process tests verify recorder overrides
+reach the fake child while default sessions retain their original arguments.
+
+Required fmt, clippy and test command results are recorded in the handoff's Fix
+round 1 section. Live record/chat commands are deliberately deferred to the
+orchestrator per the fix-round instruction; the existing hand-made scenarios stay
+in place until safe live recordings replace them.

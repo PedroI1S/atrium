@@ -1,6 +1,6 @@
 # Handoff: M0-02-codex-adapter
 
-Model: GPT-6.1 Sol · Status: partial (offline implementation complete; live verification blocked)
+Model: GPT-6.1 Sol · Status: partial (fix round 1 complete; live rerecording awaits orchestrator)
 
 ## Done
 
@@ -20,15 +20,12 @@ Model: GPT-6.1 Sol · Status: partial (offline implementation complete; live ver
 
 ## Not done
 
-- Real Codex recordings, real time-to-first-event, live enforcement matrix evidence,
+- The full set of real Codex recordings, live enforcement matrix evidence,
   cheapest-model verification, native persistence/resume and real question/quota
   behavior. Direct `codex app-server` printed `Operation not permitted` and exited
   before initialization. No sandbox workaround was attempted.
-- Commit blocked: `git add spikes/agent-codex fixtures/agents/codex` failed creating
-  `/Users/pedro/Documents/Harness/.git/worktrees/M0-02-codex-adapter/index.lock`
-  with `Operation not permitted`. The chained commit could not run. All work,
-  including this handoff, is left uncommitted for the orchestrator. No alternate
-  git metadata or sandbox workaround was used.
+- Initial worker staging was sandbox-blocked; the orchestrator subsequently
+  committed that implementation as `83225db`. Fix round 1 commit status is below.
 
 ## Definition of Done results
 
@@ -81,7 +78,7 @@ cargo run -p spike-agent-codex --example record -- <scenario> --hand-made
 
 ## Follow-ups
 
-1. Orchestrator: commit owned changes and this handoff from a session with git metadata access.
+1. Orchestrator: commit fix-round changes if worker staging remains blocked (initial implementation is `83225db`).
 2. Reviewer: review the pure mapper and process-owner paths, especially reserved
    lifecycle slots, write acknowledgement ordering and failure cleanup.
 3. Orchestrator verification: run the recorder outside this worker sandbox for every
@@ -91,3 +88,73 @@ cargo run -p spike-agent-codex --example record -- <scenario> --hand-made
    or non-read commands bypass every setting, stop and escalate the security finding.
 5. Record launch-to-first-event from real traces, confirm cheapest-model choice,
    native resume, supported question mode and refusal/error variants before M1.
+
+## Fix round 1
+
+Base: orchestrator commit `83225db`. The orchestrator reconfirmed the original
+29 tests, fmt and clippy and successfully recorded simple with `gpt-5.6-luna`:
+first normalized event at 416 ms, with correct session/turn/message/usage/quota
+mapping. That recording was discarded because of privacy leaks. The worker did
+not launch app-server during this fix round, as instructed.
+
+### Done
+
+- Added the recorder-only `recording::write` path: OS-derived hostname redaction,
+  nested `installationId` redaction, null account auth/plan fields, and removal of
+  remote-control environment identifiers. Decoded JSON-RPC strings and both JSONL
+  and golden files are checked. Earlier copies of installation/remote identifiers
+  in text are removed through a whole-stream collection pass.
+- Discovery now reads effective config for the scratch cwd alongside model/list.
+  It disables hooks via `-c features.hooks=false`; actual recording children also
+  disable each discovered native/plugin MCP server with an invocation-local
+  `enabled=false` override. Auth, Codex home and native config files are unchanged.
+  Ordinary adapter/chat sessions default to no extra overrides.
+- Since app-server help has no ignore-user-config/blanket MCP-disable flag, and
+  effective config may omit some sources, always apply the authorized fallback:
+  stable `mcp-1`/`hook-1` aliases and placeholders for commands, source paths,
+  errors and diagnostic text. Unknown source discovery does not weaken redaction.
+- Kept all eight observed notifications Unmapped and classified each for M1 in
+  the report's Fix round 1 section. No normalizer or frozen contract was changed.
+- Added four recorder tests (including a current-hostname corpus guard and a
+  synthetic stream with all eight records), plus a fake-child test proving the
+  process overrides are scoped to the configured recorder invocation.
+
+### Definition of Done results
+
+```text
+cargo fmt --check
+  PASS (exit 0)
+
+cargo clippy -p spike-agent-codex --all-targets -- -D warnings
+  PASS (exit 0)
+
+cargo test -p spike-agent-codex
+  PASS: 20 fixture/semantic + 10 subprocess/policy + 4 recorder tests.
+  Total 34 passed, 0 failed; all 13 existing golden scenarios still pass.
+  Saturation, interrupt, shutdown and forced kill/reap remain covered.
+
+python3 spikes/agent-codex/tests/support/check_schema.py
+  PASS: 179 records passed structural schema checks; 0 errors.
+
+git diff --check
+  PASS (exit 0)
+
+Live record/chat commands
+  NOT RUN, per explicit fix-round instruction; orchestrator will record all scenarios.
+  Only codex/app-server --help was inspected; no provider process was launched.
+```
+
+### Remaining verification and commit
+
+- Orchestrator: record every live scenario with the updated recorder; verify auth
+  continuity and that real user hooks/discovered MCP servers are suppressed.
+  Config-read omissions/managed sources use the sanitizing fallback, so complete
+  source isolation is not claimed from offline tests.
+- The original hand-made fixtures remain unchanged. The 416 ms timing is the
+  orchestrator's pre-fix measurement, not a new worker measurement.
+- Commit blocked again: `git add spikes/agent-codex docs/spikes/M0-02-codex-adapter.md docs/agents/handoffs/M0-02-codex-adapter.md`
+  exited 128 because the sandbox cannot create
+  `/Users/pedro/Documents/Harness/.git/worktrees/M0-02-codex-adapter/index.lock`
+  (`Operation not permitted`). The chained commit did not run. All fix-round
+  changes, including this handoff, remain uncommitted for the orchestrator.
+  No sandbox or alternate-metadata workaround was attempted.

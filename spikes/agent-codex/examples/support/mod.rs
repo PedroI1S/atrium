@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use atrium_agents::fixture::{FixtureLine, Sanitizer};
+use atrium_agents::fixture::FixtureLine;
 use atrium_agents::*;
 use atrium_protocol::agent::*;
 use serde_json::{Value, json};
@@ -55,46 +55,14 @@ impl ToolGate for ScenarioGate {
         })
     }
 }
-pub fn sanitizer() -> Sanitizer {
-    // Include configured env secrets, plus all conventional token/key variables.
-    let secrets = std::env::vars()
-        .filter(|(k, _)| {
-            k.contains("TOKEN") || k.contains("SECRET") || k.contains("API_KEY") || k == "PASSWORD"
-        })
-        .map(|(_, v)| v)
-        .collect::<Vec<_>>();
-    let refs = secrets.iter().map(String::as_str).collect::<Vec<_>>();
-    Sanitizer::new(
-        &std::env::var("HOME").unwrap_or_default(),
-        &std::env::var("USER").unwrap_or_default(),
-        &refs,
-    )
-}
 pub fn save(
     scenario: &str,
     lines: &[FixtureLine],
     provenance: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sanitize = sanitizer();
-    let mut clean = lines.to_vec();
-    for line in &mut clean {
-        // The contract sanitizer does not rewrite client commands, so sanitize
-        // the full decoded FixtureLine too (messages and structured answers).
-        sanitize.input(&mut line.input);
-        let mut value = serde_json::to_value(&line)?;
-        sanitize.value(&mut value);
-        *line = serde_json::from_value(value)?;
-    }
     std::fs::create_dir_all(root())?;
-    let jsonl = clean
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()?
-        .join("\n")
-        + "\n";
     let path = root().join(format!("{scenario}.jsonl"));
-    std::fs::write(&path, &jsonl)?;
-    assert!(sanitize.is_clean(&std::fs::read_to_string(&path)?));
+    let clean = spike_agent_codex::recording::write(&path, lines)?;
     if provenance.starts_with("live") {
         let mut n = CodexNormalizer::default();
         if let Some(ms) = clean
@@ -106,10 +74,6 @@ pub fn save(
             );
         }
     }
-    let events = atrium_agents::fixture::normalize(&clean, &mut CodexNormalizer::default());
-    let golden = serde_json::to_string_pretty(&events)? + "\n";
-    assert!(sanitize.is_clean(&golden));
-    std::fs::write(path.with_extension("events.json"), golden)?;
     std::fs::write(
         path.with_extension("md"),
         format!(

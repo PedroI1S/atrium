@@ -20,6 +20,9 @@ pub type Recording = Arc<Mutex<Vec<FixtureLine>>>;
 #[derive(Default)]
 pub struct CodexAdapter {
     pub recording: Option<Recording>,
+    /// Invocation-local configuration, used by the fixture recorder. Empty for
+    /// normal sessions; does not modify the user's configuration or auth store.
+    pub config_overrides: Vec<String>,
 }
 
 /// Process-local MCP overrides. Names and values are quoted as TOML strings.
@@ -150,6 +153,11 @@ impl AgentAdapter for CodexAdapter {
                     .unwrap_or_else(|| std::path::Path::new("codex")),
             )
             .args(process_args(&config))
+            .args(
+                self.config_overrides
+                    .iter()
+                    .flat_map(|value| ["-c", value.as_str()]),
+            )
             .current_dir(&config.cwd)
             .envs(config.env.clone())
             .stdin(std::process::Stdio::piped())

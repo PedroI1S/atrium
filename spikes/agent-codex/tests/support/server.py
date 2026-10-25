@@ -34,6 +34,8 @@ def flood():
     for _ in range(10000):
         notify('item/agentMessage/delta', {'itemId': 'fake-message', 'delta': 'x' * 512})
 
+audit({'processArgs': sys.argv[1:]})
+
 if mode == 'startup-fail':
     print('simulated startup failure', file=sys.stderr, flush=True)
     sys.exit(1)

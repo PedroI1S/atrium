@@ -7,9 +7,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Catalog discovery is a separate, reaped process; catalog traffic is not
 /// part of the subsequently recorded agent session.
-async fn catalog_model(config: &SessionConfig) -> Result<String, Box<dyn std::error::Error>> {
+async fn catalog_model(
+    config: &SessionConfig,
+) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
     let mut child = tokio::process::Command::new("codex")
-        .args(["app-server"])
+        .args(["app-server", "-c", "features.hooks=false"])
         .current_dir(&config.cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -18,19 +20,39 @@ async fn catalog_model(config: &SessionConfig) -> Result<String, Box<dyn std::er
         .spawn()?;
     let mut stdin = child.stdin.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let result=tokio::time::timeout(STARTUP_TIMEOUT,async {
+    let result = tokio::time::timeout(STARTUP_TIMEOUT, async {
+        let mut model = None;
+        let mut overrides = None;
         stdin.write_all(b"{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"atrium_m0\",\"version\":\"0.0.0\"}}}\n").await?;
-        while let Some(line)=lines.next_line().await? {
-            let v:serde_json::Value=serde_json::from_str(&line)?;
-            if v.get("error").is_some() {return Err(std::io::Error::other(v["error"].to_string()));}
-            if v["id"]==1 {stdin.write_all(b"{\"method\":\"initialized\"}\n{\"id\":2,\"method\":\"model/list\",\"params\":{}}\n").await?;}
-            if v["id"]==2 {
-                let mut models=v["result"]["data"].as_array().into_iter().flatten().filter(|m|m["hidden"]!=true).filter_map(|m|m["model"].as_str()).collect::<Vec<_>>();
-                models.sort_by_key(|m|(!m.contains("mini"),!m.contains("nano"),*m));
-                return models.first().map(|m|m.to_string()).ok_or_else(||std::io::Error::other("empty model catalog"));
+        while let Some(line) = lines.next_line().await? {
+            let v: serde_json::Value = serde_json::from_str(&line)?;
+            if v.get("error").is_some() {
+                if v["id"] == 3 {
+                    // No blanket MCP-disable flag exists in app-server help.
+                    // Keep auth intact and use fixture pseudonyms if discovery
+                    // is unavailable; never print account/config error payloads.
+                    eprintln!("config/read unavailable; using recorder metadata redaction fallback");
+                    overrides = Some(spike_agent_codex::recording::config_overrides(&serde_json::Value::Null));
+                } else {
+                    return Err(std::io::Error::other("catalog RPC failed"));
+                }
+            } else if v["id"] == 1 {
+                stdin.write_all(b"{\"method\":\"initialized\"}\n{\"id\":2,\"method\":\"model/list\",\"params\":{}}\n").await?;
+                let request = serde_json::json!({"id":3,"method":"config/read","params":{"includeLayers":false,"cwd":config.cwd}});
+                stdin.write_all(format!("{request}\n").as_bytes()).await?;
+            } else if v["id"] == 2 {
+                let mut models = v["result"]["data"].as_array().into_iter().flatten()
+                    .filter(|m| m["hidden"] != true).filter_map(|m| m["model"].as_str()).collect::<Vec<_>>();
+                models.sort_by_key(|m| (!m.contains("mini"), !m.contains("nano"), *m));
+                model = Some(models.first().ok_or_else(|| std::io::Error::other("empty model catalog"))?.to_string());
+            } else if v["id"] == 3 {
+                overrides = Some(spike_agent_codex::recording::config_overrides(&v["result"]["config"]));
+            }
+            if model.is_some() && overrides.is_some() {
+                return Ok((model.take().unwrap(), overrides.take().unwrap()));
             }
         }
-        Err(std::io::Error::other("app-server closed before model/list; check sandbox permissions"))
+        Err(std::io::Error::other("app-server closed before catalog/config discovery"))
     }).await;
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -66,7 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     // model/list has no numeric price field. Prefer a mini/nano catalog entry;
     // CODEX_MODEL lets the verifier select the cheapest entitled model explicitly.
-    config.model = Some(std::env::var("CODEX_MODEL").unwrap_or(catalog_model(&config).await?));
+    let (catalog_model, config_overrides) = catalog_model(&config).await?;
+    config.model = Some(std::env::var("CODEX_MODEL").unwrap_or(catalog_model));
     println!(
         "Catalog selection: {:?} (verify price; model/list does not expose it)",
         config.model
@@ -74,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recording = support::recording();
     let adapter = CodexAdapter {
         recording: Some(recording.clone()),
+        config_overrides,
     };
     if scenario == "startup-error" {
         config.model = Some("invalid-atrium-fixture-model".into());

@@ -115,6 +115,7 @@ async fn live_uses_same_normalizer_and_reaps() {
     let recording = Arc::new(std::sync::Mutex::new(vec![]));
     let mut session = CodexAdapter {
         recording: Some(recording.clone()),
+        ..Default::default()
     }
     .start(
         h.config("simple", Arc::new(Gate(GateDecision::Allow))),
@@ -464,4 +465,48 @@ async fn dropping_both_halves_shuts_down_and_reaps() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn recorder_overrides_reach_child_without_changing_normal_sessions() {
+    for recorder in [false, true] {
+        let h = Harness::new();
+        let mut expected = vec!["app-server", "--listen", "stdio://"];
+        let config_overrides = if recorder {
+            expected.extend([
+                "-c",
+                "features.hooks=false",
+                "-c",
+                "mcp_servers.\"sample\".enabled=false",
+            ]);
+            spike_agent_codex::recording::config_overrides(
+                &serde_json::json!({"mcp_servers":{"sample":{}}}),
+            )
+        } else {
+            vec![]
+        };
+        let mut session = CodexAdapter {
+            config_overrides,
+            ..Default::default()
+        }
+        .start(
+            h.config("simple", Arc::new(Gate(GateDecision::Allow))),
+            Transport::Local,
+        )
+        .await
+        .unwrap();
+        session
+            .commands
+            .send(SessionCommand::Shutdown)
+            .await
+            .unwrap();
+        collect(&mut session).await;
+        let audit = h.audit();
+        let process = audit
+            .iter()
+            .find(|v| v.get("processArgs").is_some())
+            .unwrap();
+        assert_eq!(process["processArgs"], serde_json::json!(expected));
+        assert!(h.reaped());
+    }
 }
