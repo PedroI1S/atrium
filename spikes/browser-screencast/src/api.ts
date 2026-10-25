@@ -14,6 +14,8 @@ export interface StartInfo {
   fixturePort: number;
   userDataDir: string;
   contexts: string[];
+  /** `--force-device-scale-factor` Chromium was launched with (1 = none). */
+  launchDeviceScaleFactor: number;
 }
 
 export interface StartupInfo {

@@ -103,7 +103,12 @@ export function App() {
       const frames = pane.stats.framesDrawn;
       setFps(((frames - last.frames) * 1000) / (now - last.at));
       last = { frames, at: now };
-      setStats({ kib: pane.stats.lastFrameBytes / 1024, decode: pane.stats.lastDecodeMs, size: `${pane.canvas.width}x${pane.canvas.height}` });
+      setStats({
+        kib: pane.stats.lastFrameBytes / 1024,
+        decode: pane.stats.lastDecodeMs,
+        // Decoded frame size (what Chromium sent) next to the canvas size (what we draw into).
+        size: `frame ${pane.stats.lastFrameWidth}x${pane.stats.lastFrameHeight}, canvas ${pane.canvas.width}x${pane.canvas.height}`,
+      });
     }, 500);
     onCleanup(() => window.clearInterval(timer));
   });
@@ -124,7 +129,14 @@ export function App() {
         <span class="label">Scale</span>
         <span class="seg" role="group" aria-label="Device scale factor">
           <button aria-pressed={dsf() === 1} onClick={() => void changeScale(1)}>1x</button>
-          <button aria-pressed={dsf() === 2} onClick={() => void changeScale(2)}>2x</button>
+          <button
+            aria-pressed={dsf() === 2}
+            disabled={(info()?.launchDeviceScaleFactor ?? 1) < 2}
+            title="Needs a browser launched with --force-device-scale-factor=2 (start the app with ATRIUM_LAUNCH_DSF=2). Without it Chromium keeps sending 1x frames."
+            onClick={() => void changeScale(2)}
+          >
+            2x
+          </button>
         </span>
         <button class="btn" onClick={() => void agent("click")}>Agent: click</button>
         <button class="btn" onClick={() => void agent("navigate")}>Agent: open click.html</button>

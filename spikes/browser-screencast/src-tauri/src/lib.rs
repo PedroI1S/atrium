@@ -138,6 +138,19 @@ struct StartInfo {
     fixture_port: u16,
     user_data_dir: PathBuf,
     contexts: Vec<String>,
+    /// The `--force-device-scale-factor` Chromium was launched with (1.0 if none). The screencast
+    /// only produces frames larger than CSS px when this is >= the emulated scale; it cannot be
+    /// changed without relaunching.
+    launch_device_scale_factor: f64,
+}
+
+/// `--force-device-scale-factor=N` from the extra args, else 1.
+fn launch_scale(extra_args: &[String]) -> f64 {
+    extra_args
+        .iter()
+        .find_map(|a| a.strip_prefix("--force-device-scale-factor="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0)
 }
 
 fn data_dir(app: &AppHandle) -> PathBuf {
@@ -160,9 +173,14 @@ async fn browser_start(
     let found = discovery::discover();
     let picked = discovery::pick(&found, default_browser.as_deref()).ok_or("no Chromium-based browser found")?;
     let dir = data_dir(&app);
-    let extra_args = std::env::var("ATRIUM_EXTRA_ARGS")
+    let mut extra_args: Vec<String> = std::env::var("ATRIUM_EXTRA_ARGS")
         .map(|v| v.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
+    // Opt-in 2x pane: needs the flag at launch (see `launch_device_scale_factor`).
+    if let Some(n) = env_num::<f64>("ATRIUM_LAUNCH_DSF") {
+        extra_args.push(format!("--force-device-scale-factor={n}"));
+    }
+    let launch_dsf = launch_scale(&extra_args);
     let opts = LaunchOptions {
         binary: picked.binary.clone(),
         user_data_dir: browser::profile_dir(&dir, "pane"),
@@ -185,6 +203,7 @@ async fn browser_start(
         fixture_port: fixtures.port,
         user_data_dir: browser.user_data_dir.clone(),
         contexts: CONTEXT_LABELS.iter().map(|s| (*s).to_string()).collect(),
+        launch_device_scale_factor: launch_dsf,
     };
     *state.session.write().await = Some(Arc::new(Session { browser, pages, fixtures, info: info.clone() }));
     Ok(info)
@@ -543,7 +562,14 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::ack_belongs_to;
+    use super::{ack_belongs_to, launch_scale};
+
+    #[test]
+    fn launch_scale_reads_the_flag() {
+        assert_eq!(launch_scale(&[]), 1.0);
+        assert_eq!(launch_scale(&["--mute-audio".into(), "--force-device-scale-factor=2".into()]), 2.0);
+        assert_eq!(launch_scale(&["--force-device-scale-factor=junk".into()]), 1.0);
+    }
 
     #[test]
     fn acks_only_reach_the_stream_that_produced_the_frame() {

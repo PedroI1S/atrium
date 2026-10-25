@@ -108,6 +108,8 @@ export async function runBench(
       intervalsOver33ms: intervals.filter((x) => x > 33.4).length,
       intervalsOver50ms: intervals.filter((x) => x > 50).length,
       frameKiB: dist(inWindow.map((f) => f.bytes / 1024)),
+      // What Chromium actually sent, as opposed to `environment.pane.canvasPixels`.
+      decodedFramePixels: [pane.stats.lastFrameWidth, pane.stats.lastFrameHeight],
       mbitPerSecond: (inWindow.reduce((a, f) => a + f.bytes, 0) * 8) / ((t1 - t0) / 1000) / 1e6,
       channelTransitMs: dist(transit),
       droppedByPane: pane.stats.framesDropped - dropped0,

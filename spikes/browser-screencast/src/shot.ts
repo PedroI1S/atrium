@@ -74,6 +74,20 @@ export async function runShot(
       await pane.navigate(`${base}/state.html`);
       break;
     }
+    case "isolation": {
+      // One launch, one browser process: A writes its marker, then B opens the same origin and
+      // sees nothing, then A is shown again and still has its own state. Each phase lasts 10 s
+      // so scripts/screenshots.sh can capture all three.
+      await takeOver(true);
+      await pane.navigate(`${base}/state.html?set=A`);
+      await sleep(10_000);
+      await show(1);
+      await pane.navigate(`${base}/state.html`);
+      await sleep(10_000);
+      await show(0);
+      await pane.navigate(`${base}/state.html`);
+      break;
+    }
     default:
       throw new Error(`unknown scene ${scene}`);
   }

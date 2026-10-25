@@ -218,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
     let colours: [[u8; 3]; 4] = [[255, 0, 0], [0, 0, 255], [0, 255, 0], [255, 255, 255]];
     let (px, py) = ((100.0 * dsf) as usize, (100.0 * dsf) as usize);
     let mut lat = vec![];
+    let mut lat_consumer = vec![];
     let mut misses = 0;
     for i in 0..probes {
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -233,14 +234,20 @@ async fn main() -> anyhow::Result<()> {
         while let Ok(Some(f)) =
             tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), frames.next()).await
         {
+            // Stamped where the consumer gets the frame, before the ack: the same point the
+            // chromiumoxide probe stamps, so the two are comparable.
+            let consumer_ms = epoch_ms();
             page.ack(f.ack_id);
-            candidates.push(f);
+            candidates.push((consumer_ms, f));
             if candidates.len() >= 6 {
                 break;
             }
         }
-        match candidates.iter().find(|f| pixel_matches(&f.data, png, px, py, expected)) {
-            Some(f) => lat.push(f.rx_epoch_ms - t0),
+        match candidates.iter().find(|(_, f)| pixel_matches(&f.data, png, px, py, expected)) {
+            Some((consumer_ms, f)) => {
+                lat.push(f.rx_epoch_ms - t0);
+                lat_consumer.push(consumer_ms - t0);
+            }
             None => misses += 1,
         }
     }
@@ -264,7 +271,9 @@ async fn main() -> anyhow::Result<()> {
             "cpuRss": streaming,
         },
         "staticPageWithScreencast": {"framesIn5s": static_frames, "cpuRss": static_screencast},
-        "inputToFrameMs": {"backendOnly": true, "misses": misses, "dist": dist(lat)},
+        "inputToFrameMs": {"backendOnly": true, "misses": misses,
+            "definition": "dist: to the pipe reader thread; distConsumer: to the consumer's frames.next(), the same endpoint as screencast-oxide-probe",
+            "dist": dist(lat), "distConsumer": dist(lat_consumer)},
     });
     println!("{}", serde_json::to_string_pretty(&result)?);
     browser.close().await;

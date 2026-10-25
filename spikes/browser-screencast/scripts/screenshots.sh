@@ -30,6 +30,28 @@ shot() { # name, scene, extra env...
 
 shot pane-agent-driving agent
 shot pane-form-input-ime form
-shot pane-context-a-state contexts-a
-shot pane-context-b-empty contexts-b
+
+# Isolation: ONE launch (one browser process, one fixture port), three captures 10 s apart:
+# A has written its marker, B on the same origin sees nothing, A still has its marker.
+isolation() {
+  env ATRIUM_BENCH="shot:isolation" ATRIUM_DATA_DIR="$DATA/isolation" "$BIN" >/dev/null 2>&1 &
+  local pid=$!
+  local id=""
+  for _ in $(seq 1 60); do
+    sleep 0.25
+    id=$("$DATA/window-id" "$pid" 2>/dev/null || true)
+    [ -n "$id" ] && break
+  done
+  sleep 8
+  screencapture -x -o -l"$id" "$OUT/isolation-1-context-a-writes.png"
+  sleep 10
+  screencapture -x -o -l"$id" "$OUT/isolation-2-context-b-sees-nothing.png"
+  sleep 10
+  screencapture -x -o -l"$id" "$OUT/isolation-3-context-a-keeps-its-state.png"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  sleep 1
+  echo "captured isolation (3 images)"
+}
+isolation
 rm -rf "$DATA"

@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
             .chrome_executable(&info.binary)
             .user_data_dir(dir.path().join("profile"))
             .new_headless_mode()
+            .window_size(1280, 800)
             .build()
             .map_err(anyhow::Error::msg)?,
     )
@@ -74,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
     let colours: [[u8; 3]; 4] = [[255, 0, 0], [0, 0, 255], [0, 255, 0], [255, 255, 255]];
     let mut lat = vec![];
+    let mut decoded_px = (0u16, 0u16);
     for i in 0..probes {
         tokio::time::sleep(Duration::from_millis(120)).await;
         while tokio::time::timeout(Duration::from_millis(60), frames.next()).await.is_ok() {}
@@ -97,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             let mut d = jpeg_decoder::Decoder::new(&jpeg[..]);
             if let Ok(px) = d.decode() {
                 let w = d.info().unwrap().width as usize;
+                decoded_px = (d.info().unwrap().width, d.info().unwrap().height);
                 let k = (100 * w + 100) * 3;
                 if (0..3).all(|c| (i32::from(px[k + c]) - i32::from(colours[i % 4][c])).abs() < 70) {
                     lat.push(rx - t0);
@@ -108,7 +111,8 @@ async fn main() -> anyhow::Result<()> {
     let pid = procstat::snapshot().into_iter().filter(|r| r.comm.contains("Helium") && r.ppid > 1).map(|r| r.ppid).next();
     let result = json!({
         "driver": "chromiumoxide 0.9.1 (WebSocket on --remote-debugging-port; no pipe transport)",
-        "launchMs": launch_ms, "fps": fps, "frames": n, "meanFrameKiB": bytes as f64 / f64::from(n.max(1)) / 1024.0,
+        "launchMs": launch_ms, "decodedFramePixels": [decoded_px.0, decoded_px.1],
+        "endpoint": "consumer: frames.next() returned, stamped before the ack (same as screencast-bench distConsumer)", "fps": fps, "frames": n, "meanFrameKiB": bytes as f64 / f64::from(n.max(1)) / 1024.0,
         "inputToFrameMs": {"n": lat.len(), "p50": pct(&mut lat.clone(), 0.5), "p95": pct(&mut lat.clone(), 0.95), "max": pct(&mut lat, 1.0)},
         "note": pid.map(|p| format!("a parent pid seen: {p}")),
     });
