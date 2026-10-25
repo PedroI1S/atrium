@@ -67,6 +67,22 @@ async fn sample_for(pid: u32, secs: f64) -> Value {
     serde_json::to_value(procstat::summarize(&samples)).unwrap()
 }
 
+/// Footprint (physical memory) and RSS of the whole tree, plus per process, at one moment.
+fn stage(name: &str, pid: u32) -> Value {
+    let rows = procstat::snapshot();
+    let t = procstat::tree(&rows, pid);
+    let per: Vec<Value> = t
+        .iter()
+        .map(|r| {
+            json!({"pid": r.pid, "process": r.comm.rsplit('/').next().unwrap_or(&r.comm),
+                   "rssMb": r.rss_kb / 1024, "footprintMb": procstat::footprint_mb(&[r.pid])})
+        })
+        .collect();
+    let ids: Vec<u32> = t.iter().map(|r| r.pid).collect();
+    json!({"stage": name, "processes": t.len(), "rssMbSum": t.iter().map(|r| r.rss_kb).sum::<u64>() / 1024,
+           "footprintMbTotal": procstat::footprint_mb(&ids), "perProcess": per})
+}
+
 fn mouse(kind: &str, x: f64, y: f64) -> MouseParams {
     MouseParams {
         kind: kind.into(),
@@ -117,8 +133,17 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
     let fixtures = Fixtures::start().await?;
+    let mut memory_stages = vec![];
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    memory_stages.push(stage("browser launched, about:blank only", browser.pid));
     let page: Arc<Page> = browser.new_page(&fixtures.url("/animation.html")).await?;
     page.set_viewport(width, height, dsf).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    memory_stages.push(stage("1 context (animation page)", browser.pid));
+    let page_b = browser.new_page(&fixtures.url("/click.html")).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    memory_stages.push(stage("2 contexts", browser.pid));
+    drop(page_b);
     tokio::time::sleep(Duration::from_secs(2)).await; // settle: startup work, not the metric
     let opts = ScreencastOptions {
         format: if png { FrameFormat::Png } else { FrameFormat::Jpeg },
@@ -145,11 +170,19 @@ async fn main() -> anyhow::Result<()> {
     let mut arrivals: Vec<f64> = vec![];
     let mut sizes: Vec<f64> = vec![];
     let mut dims = (0.0, 0.0);
+    let mut image_px = (0u16, 0u16);
     while start.elapsed().as_secs_f64() < secs {
         let Ok(Some(f)) = tokio::time::timeout(Duration::from_secs(2), frames.next()).await else { break };
         arrivals.push(f.rx_epoch_ms);
         sizes.push(f.data.len() as f64 / 1024.0);
         dims = (f.meta.device_width, f.meta.device_height);
+        if image_px == (0, 0) && !png {
+            let mut d = jpeg_decoder::Decoder::new(&f.data[..]);
+            if d.read_info().is_ok() {
+                let i = d.info().unwrap();
+                image_px = (i.width, i.height);
+            }
+        }
         page.ack(f.ack_id);
     }
     let wall = start.elapsed().as_secs_f64();
@@ -217,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
         "product": browser.version().await?,
         "options": {"quality": quality, "format": if png {"png"} else {"jpeg"}, "width": width, "height": height,
                     "deviceScaleFactor": dsf, "everyNthFrame": every_nth, "extraArgs": extra, "transport": "pipe"},
+        "memoryStages": memory_stages,
         "idleNoScreencast": idle,
         "streaming": {
             "seconds": wall, "frames": arrivals.len(), "fps": fps,
@@ -224,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
             "frameKiB": dist(sizes.clone()),
             "mbitPerSecond": sizes.iter().sum::<f64>() * 1024.0 * 8.0 / wall / 1e6,
             "frameCssSize": [dims.0, dims.1],
+            "frameImagePixels": [image_px.0, image_px.1],
             "pageRafCountTotal": raf_total,
             "droppedEvents": frames.lagged,
             "cpuRss": streaming,

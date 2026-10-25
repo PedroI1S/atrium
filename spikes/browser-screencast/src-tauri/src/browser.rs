@@ -81,9 +81,43 @@ pub struct Browser {
     child: Mutex<Option<tokio::process::Child>>,
 }
 
+const PID_FILE: &str = "atrium-browser.pid";
+
+/// Kills a Chromium left behind by a previous run that died without closing it.
+///
+/// Closing the debugging pipe does NOT make Chromium exit (measured: it was still running 30 s
+/// after its parent got SIGKILL), so the owner has to clean up. The pid file lives in the
+/// profile dir; a pid is only killed if its command line still names this profile, so a
+/// recycled pid is never touched. Returns true when something was killed.
+pub fn reap_stale(user_data_dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(user_data_dir.join(PID_FILE)) else { return false };
+    let Ok(pid) = text.trim().parse::<i32>() else { return false };
+    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+    if pid <= 1 || !alive(pid) {
+        return false;
+    }
+    let cmdline = std::process::Command::new("ps").args(["-o", "command=", "-p", &pid.to_string()]).output();
+    let names_profile = cmdline
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&user_data_dir.display().to_string()))
+        .unwrap_or(false);
+    if !names_profile {
+        return false;
+    }
+    // SAFETY: plain signal to a process we verified is our own stale browser.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    for _ in 0..50 {
+        if !alive(pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
 impl Browser {
     pub async fn launch(opts: &LaunchOptions) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&opts.user_data_dir).context("create user-data-dir")?;
+        reap_stale(&opts.user_data_dir);
         // Parent -> child commands (child fd 3) and child -> parent responses (child fd 4).
         let (cmd_r, cmd_w) = make_pipe()?;
         let (resp_r, resp_w) = make_pipe()?;
@@ -110,6 +144,7 @@ impl Browser {
         }
         let child = command.spawn().with_context(|| format!("spawn {}", opts.binary.display()))?;
         let pid = child.id().ok_or_else(|| anyhow!("browser exited immediately"))?;
+        std::fs::write(opts.user_data_dir.join(PID_FILE), pid.to_string()).context("write pid file")?;
         // The parent must not keep the child's ends open, or EOF would never be seen.
         drop(cmd_r);
         drop(resp_w);
@@ -171,6 +206,7 @@ impl Browser {
             let _ = child.kill().await;
         }
         *guard = None;
+        let _ = std::fs::remove_file(self.user_data_dir.join(PID_FILE));
     }
 }
 
@@ -472,4 +508,47 @@ impl Page {
 /// `<data dir>/profile-<name>`: one dedicated profile per run purpose.
 pub fn profile_dir(data_dir: &Path, name: &str) -> PathBuf {
     data_dir.join(format!("profile-{name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[test]
+    fn reaper_kills_only_a_process_that_names_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+
+        // A bystander whose command line does not mention the profile (a recycled pid).
+        let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(profile.join(PID_FILE), other.id().to_string()).unwrap();
+        assert!(!reap_stale(&profile));
+        assert!(alive(other.id() as i32));
+        other.kill().unwrap();
+        other.wait().unwrap();
+
+        // A stale browser: its command line carries the profile path.
+        let mut stale = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 30 # --user-data-dir={}", profile.display()))
+            .spawn()
+            .unwrap();
+        std::fs::write(profile.join(PID_FILE), stale.id().to_string()).unwrap();
+        assert!(reap_stale(&profile));
+        assert!(stale.wait().is_ok());
+        assert!(!reap_stale(&profile), "already gone");
+    }
+
+    #[test]
+    fn reaper_ignores_missing_and_garbage_pid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!reap_stale(dir.path()));
+        std::fs::write(dir.path().join(PID_FILE), "not a pid").unwrap();
+        assert!(!reap_stale(dir.path()));
+    }
 }

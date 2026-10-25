@@ -56,9 +56,9 @@ export function App() {
 
   onMount(async () => {
     const config = await startupInfo();
+    // The pane reads its options once at mount, so the scale must be set before it mounts.
+    setDsf(config.deviceScaleFactor ?? 1);
     setCfg(config);
-    const startDsf = config.deviceScaleFactor ?? 1;
-    setDsf(startDsf);
     const unlisten = await listen<{ context: number; url: string }>("browser://nav", (ev) => {
       setUrls((u) => u.map((x, i) => (i === ev.payload.context ? ev.payload.url : x)));
       if (ev.payload.context === context()) setUrlDraft(ev.payload.url);

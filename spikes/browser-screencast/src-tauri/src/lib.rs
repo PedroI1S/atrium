@@ -487,6 +487,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build the app");
 
+    // SIGTERM / Ctrl-C would otherwise end the process without `RunEvent::Exit`, leaving
+    // Chromium running. Route them through a normal exit so the browser gets closed.
+    let handle = app.handle().clone();
+    tauri::async_runtime::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+            return;
+        };
+        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+        handle.exit(0);
+    });
+
     app.run(|handle, event| {
         if let RunEvent::Exit = event {
             // Close Chromium on the way out so no helper process is left behind.

@@ -17,7 +17,13 @@
     vx: (Math.random() - 0.5) * 7, vy: (Math.random() - 0.5) * 7,
     r: 8 + Math.random() * 26, hue: (i * 37) % 360,
   }));
-  function size() { w = c.width = innerWidth; h = c.height = innerHeight; }
+  // The backing store follows devicePixelRatio, so at 2x the frames really carry 4x the pixels.
+  function size() {
+    const r = devicePixelRatio || 1;
+    c.width = Math.round(innerWidth * r); c.height = Math.round(innerHeight * r);
+    g.setTransform(r, 0, 0, r, 0, 0);
+    w = innerWidth; h = innerHeight;
+  }
   addEventListener('resize', size); size();
   function frame(t) {
     n++;
