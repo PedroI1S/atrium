@@ -1,33 +1,5 @@
 [
   {
-    "type": "unmapped",
-    "record_type": "session/update:available_commands_update",
-    "raw": {
-      "jsonrpc": "2.0",
-      "method": "session/update",
-      "params": {
-        "sessionId": "ses_e8db1d903ffeYa6bm8YZZjsXbH",
-        "update": {
-          "sessionUpdate": "available_commands_update",
-          "availableCommands": [
-            {
-              "name": "init",
-              "description": "guided AGENTS.md setup"
-            },
-            {
-              "name": "review",
-              "description": "review changes [commit|branch|pr], defaults to uncommitted"
-            },
-            {
-              "name": "compact",
-              "description": "Compact the session"
-            }
-          ]
-        }
-      }
-    }
-  },
-  {
     "type": "error",
     "message": "Invalid params: model not found: invalid-provider/nonexistent-model-000",
     "fatal": true

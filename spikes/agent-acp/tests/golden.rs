@@ -10,7 +10,7 @@ use atrium_protocol::agent::{
 };
 use spike_agent_acp::AcpNormalizer;
 use spike_agent_acp::sanitize::contains_temp_path;
-use spike_agent_acp::selfcheck::{CANARY, detect_gate_bypass};
+use spike_agent_acp::selfcheck::{CANARY, detect_gate_bypass, detect_ungated_completions};
 
 const SCENARIOS: &[&str] = &[
     "simple",
@@ -260,15 +260,14 @@ fn assert_contract_invariants(scenario: &str, events: &[AgentEvent]) {
             );
         }
         "resume" => {
+            // Replayed history must not leak in before SessionStarted (checked
+            // above) and is reported once, as Unmapped, right after it.
             assert!(
-                matches!(
-                    events.first(),
-                    Some(AgentEvent::SessionStarted {
-                        native_session_id,
-                        ..
-                    }) if native_session_id == "ses_multi_01"
-                ),
-                "{scenario}: expected resumed session id ses_multi_01"
+                events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::Unmapped { record_type, .. } if record_type == "session/load:history_replay"
+                )) || !events.iter().any(|e| matches!(e, AgentEvent::MessageDelta { text, .. } if text == "stored")),
+                "{scenario}: replayed history must not become message events"
             );
         }
         _ => {}
@@ -296,6 +295,27 @@ fn all_fixtures_pass_golden_and_invariants() {
         let lines = fixture::read(&jsonl_path).expect("fixture reads");
         let events = fixture::normalize(&lines, &mut AcpNormalizer::new());
         assert_contract_invariants(scenario, &events);
+
+        if *scenario == "resume" {
+            let loaded = lines
+                .iter()
+                .find_map(|l| match &l.input {
+                    AdapterInput::Stdin { line } => {
+                        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                        (v["method"] == "session/load")
+                            .then(|| v["params"]["sessionId"].as_str().map(str::to_owned))?
+                    }
+                    _ => None,
+                })
+                .expect("resume fixture has a session/load request");
+            assert!(
+                matches!(
+                    events.first(),
+                    Some(AgentEvent::SessionStarted { native_session_id, .. }) if *native_session_id == loaded
+                ),
+                "resume: SessionStarted must carry the resumed id {loaded}"
+            );
+        }
 
         let raw_jsonl = fs::read_to_string(&jsonl_path).expect("read jsonl");
         let raw_events = fs::read_to_string(&events_path).expect("read events.json");
@@ -327,6 +347,11 @@ fn all_fixtures_pass_golden_and_invariants() {
                 "{scenario}.{what} contains the secret canary"
             );
         }
+        // No tool call may complete without reaching the gate. (The tool-fetch
+        // probe, kept as evidence of the `execute` bypass, is not a scenario here;
+        // see `live_tool_fetch_evidence_is_flagged_by_the_ungated_check`.)
+        let ungated = detect_ungated_completions(&lines);
+        assert!(ungated.is_empty(), "{scenario}: {ungated:?}");
         if scenario.starts_with("gate-deny") {
             let denied: &[&str] = if scenario.contains("execute") || scenario.contains("terminal") {
                 &["execute"]
@@ -623,6 +648,113 @@ fn opencode_top_level_tool_name_reaches_the_events() {
             e,
             AgentEvent::ToolCallStarted { name, .. } if name == "shell"
         )),
+        "{events:?}"
+    );
+}
+
+/// Live run 2 found OpenCode's `execute` tool (Code Mode, runs JavaScript)
+/// completing with no permission request. The recording is kept as evidence,
+/// and the check must flag it for as long as it shows that.
+#[test]
+fn live_tool_fetch_evidence_is_flagged_by_the_ungated_check() {
+    let path = fixtures_dir().join("tool-fetch.jsonl");
+    let lines = fixture::read(&path).expect("tool-fetch fixture");
+    let findings = detect_ungated_completions(&lines);
+    let md = fs::read_to_string(path.with_extension("md")).expect("md");
+    // Re-recorded with execute denied: nothing to flag any more.
+    if md.contains("did not reach the gate") {
+        assert_eq!(findings.len(), 1, "{findings:?}");
+    } else {
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+}
+
+#[test]
+fn replayed_history_is_reported_not_turned_into_events() {
+    let mut norm = AcpNormalizer::new();
+    let events = feed(
+        &mut norm,
+        &[
+            (
+                "in",
+                r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"old","cwd":"/scratch","mcpServers":[]}}"#,
+            ),
+            (
+                "out",
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"old","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}}}"#,
+            ),
+            (
+                "out",
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"old","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}}}"#,
+            ),
+            ("out", r#"{"jsonrpc":"2.0","id":2,"result":{}}"#),
+        ],
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                AgentEvent::SessionStarted { native_session_id, .. },
+                AgentEvent::Unmapped { record_type, raw }
+            ] if native_session_id == "old"
+                && record_type == "session/load:history_replay"
+                && raw["updates"]["agent_message_chunk"] == 1
+        ),
+        "{events:?}"
+    );
+    // After the load response, updates are live again.
+    let live = feed(
+        &mut norm,
+        &[(
+            "out",
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"old","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"new"}}}}"#,
+        )],
+    );
+    assert!(
+        live.iter()
+            .any(|e| matches!(e, AgentEvent::MessageDelta { text, .. } if text == "new"))
+    );
+}
+
+#[test]
+fn updates_before_the_session_exists_wait_for_session_started_or_vanish() {
+    let update = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}}"#;
+    // Session never starts: the failure begins with its Error, nothing before.
+    let mut failed = AcpNormalizer::new();
+    let events = feed(
+        &mut failed,
+        &[
+            ("in", NEW_WITH_MODEL),
+            ("out", NEW_RESP_DEFAULT),
+            ("out", update),
+        ],
+    );
+    assert!(events.is_empty(), "{events:?}");
+    let end = failed.on_input(&AdapterInput::Exit { code: Some(1) });
+    assert!(
+        matches!(end.first(), Some(AgentEvent::Error { fatal: true, .. })),
+        "{end:?}"
+    );
+    // Session starts: the held update follows SessionStarted.
+    let mut ok = AcpNormalizer::new();
+    let events = feed(
+        &mut ok,
+        &[
+            ("in", NEW_WITH_MODEL),
+            ("out", NEW_RESP_DEFAULT),
+            ("out", update),
+            ("in", SET_MODEL),
+            ("out", r#"{"jsonrpc":"2.0","id":3,"result":{}}"#),
+        ],
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                AgentEvent::SessionStarted { .. },
+                AgentEvent::Unmapped { .. }
+            ]
+        ),
         "{events:?}"
     );
 }

@@ -1,6 +1,36 @@
 # Handoff: M0-04-acp-adapter
 
-Model: argon (round 1 fixes: Sonnet 5.5) · Status: done, fix round 1 applied; live re-recording pending
+Model: argon (round 1 fixes: Sonnet 5.5) · Status: done, fix round 2 applied; re-recording of the round-2 changes pending
+
+## Fix round 2 (Sonnet)
+
+Input: the orchestrator's re-recording with round-1 code (commit 114a35c: live fixtures, OpenCode 2.1.3, `opencode/deepseek-v4.1-flash-free`). Round 1's `ask` config works: read, shell, edit, search and question reach the gate, every `gate-deny*` is denied (with and without client caps), the canary never appears, `model-select`, `startup-error` and the approvals work. Details in `docs/spikes/M0-04-acp-adapter.md` (sections 4 and 6).
+
+1. **Security finding: OpenCode's `execute` tool (Code Mode) bypasses the gate.** It runs model-written JavaScript with a raw `fetch` and nested tool calls; in `tool-fetch` it completed with no `session/request_permission` despite `* * ask`. From the 2.1.3 binary and the v2 permission docs: the only documented control is that a `deny` on action `execute` removes Code Mode. So it is **disabled per session, not gated**: `{execute * deny}` is added after the ask rule (global and on `explore`/`general`). Because OpenCode reaches MCP tools only through Code Mode by default, `SessionConfig::mcp_servers` are now put in the injected config as `mcp.servers.<name>` with `codemode: false` (direct, gated tools) and are no longer sent in ACP `session/new` while injecting. Neither the deny nor `codemode: false` is proven live yet.
+2. **Recorder**: in every scenario it now exits 3 (fixtures still written) if any tool call completed without reaching the gate (`detect_ungated_completions`); new `tool-execute` probe scenario. Golden tests run the same check over every scenario and pin it on the real `tool-fetch` evidence.
+3. **Resume lifecycle**: `session/load` replays the old conversation as `session/update`s before answering. Decision: replayed history is not turned into events; it is counted and reported as one `Unmapped { record_type: "session/load:history_replay" }` right after `SessionStarted` (raw lines stay in the fixture). More generally, `session/update`s that arrive before the session is established are held until after `SessionStarted`, or dropped if the session never starts (so a pre-session failure begins with its `Error`; this also fixes the live `startup-error` golden, which began with an `Unmapped`). `resume.events.json` and `startup-error.events.json` were re-normalized offline with `examples/replay.rs --write`; nothing was re-recorded. The golden `resume` check now compares with the id in the fixture's `session/load` request (live ids are random).
+4. **Matrix** filled from the live `.md` files; the report also records that a reject makes OpenCode end the turn (`stopReason: "cancelled"` -> `TurnOutcome::Interrupted`, live in `gate-deny`, `gate-deny-execute`, `approval-deny`).
+
+`interception()` stays `ProviderGated`.
+
+**Re-record (orchestrator)**: only these change with round 2 (the others are unaffected, but re-running all is harmless). From the worktree root:
+```bash
+cd /Users/pedro/Documents/atrium-wt/M0-04-acp-adapter
+cargo build -p spike-agent-acp --examples
+for s in tool-fetch tool-execute; do
+  cargo run -q -p spike-agent-acp --example record -- $s || echo "!! $s exited $?"
+done
+# optional full set:
+for s in simple tool-read gate-deny gate-deny-execute approval-allow approval-deny question interrupt multi-turn resume startup-error model-select tool-search; do
+  cargo run -q -p spike-agent-acp --example record -- $s || echo "!! $s exited $?"
+done
+cargo run -q -p spike-agent-acp --example record -- --no-client-caps gate-deny
+cargo run -q -p spike-agent-acp --example record -- --no-client-caps gate-deny-execute
+cargo test -p spike-agent-acp
+```
+Exit 3 anywhere means a tool call ran without the gate. Expected now: `tool-fetch` uses `webfetch` (gated) or no tool; `tool-execute` shows a model with no `execute` tool. If `tool-execute` still shows an `execute` call, the deny does not work and `execute` is ungatable on ACP; the M1 HTTP-adapter recommendation applies. If the golden test then complains that `live_tool_fetch_evidence_is_flagged_by_the_ungated_check` expects a finding, check that `tool-fetch.md` still says "did not reach the gate" (the test follows the md).
+
+DoD after round 2: `cargo fmt --check`, `cargo clippy -p spike-agent-acp --all-targets -- -D warnings` clean; `cargo test -p spike-agent-acp`: 22 unit, 12 golden, 9 mock-agent tests pass.
 
 ## Fix round 1 (Sonnet)
 

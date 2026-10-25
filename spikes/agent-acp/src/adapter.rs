@@ -213,7 +213,10 @@ impl AgentAdapter for AcpAdapter {
                 .clone()
                 .unwrap_or_else(|| self.program.clone());
             let injected = if self.inject_opencode_config {
-                Some(InjectedConfig::create(config.model.as_deref()).map_err(AdapterError::Spawn)?)
+                Some(
+                    InjectedConfig::create(config.model.as_deref(), &config.mcp_servers)
+                        .map_err(AdapterError::Spawn)?,
+                )
             } else {
                 None
             };
@@ -338,6 +341,7 @@ impl AgentAdapter for AcpAdapter {
                 recorder: self.recorder.clone(),
                 started_at,
                 normalizer,
+                mcp_via_config: injected.is_some(),
                 _injected_config: injected,
                 next_seq: 0,
                 next_rpc_id: 0,
@@ -456,6 +460,9 @@ struct SessionRuntime {
     normalizer: AcpNormalizer,
     /// Removes the generated config directory when the session ends.
     _injected_config: Option<InjectedConfig>,
+    /// MCP servers travel in the injected config (with `codemode: false`), not
+    /// in `session/new`.
+    mcp_via_config: bool,
     next_seq: u64,
     next_rpc_id: i64,
     session_id: String,
@@ -562,6 +569,7 @@ impl SessionRuntime {
             .config
             .mcp_servers
             .iter()
+            .filter(|_| !self.mcp_via_config)
             .map(|s| {
                 let env_vars = s
                     .env

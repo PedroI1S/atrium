@@ -1,16 +1,20 @@
 [
   {
-    "type": "message_delta",
-    "message_id": "msg_1724e1587001Yl5A3VoZPYBZBD",
-    "kind": "assistant",
-    "text": "stored"
-  },
-  {
     "type": "session_started",
     "provider": "acp",
     "native_session_id": "ses_e8db1ea8bffevMwJ5ypmRge0ns",
     "model": "opencode/deepseek-v4.1-flash-free",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/load:history_replay",
+    "raw": {
+      "updates": {
+        "agent_message_chunk": 1,
+        "user_message_chunk": 1
+      }
+    }
   },
   {
     "type": "turn_started",
@@ -43,12 +47,6 @@
         }
       }
     }
-  },
-  {
-    "type": "message_completed",
-    "message_id": "msg_1724e1587001Yl5A3VoZPYBZBD",
-    "kind": "assistant",
-    "text": "stored"
   },
   {
     "type": "message_delta",

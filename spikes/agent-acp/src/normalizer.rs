@@ -96,6 +96,19 @@ pub struct AcpNormalizer {
     configured_model: Option<String>,
     /// Set between the `session/new` response and the model confirmation.
     deferred_start: Option<DeferredStart>,
+    /// True between a `session/load` / `session/resume` request and its
+    /// response. The agent replays the old conversation as `session/update`s in
+    /// that window. The event contract has no history event and the session is
+    /// not established yet (`SessionStarted` must be first), so replayed updates
+    /// are not turned into events; they are counted and reported in one
+    /// `Unmapped { record_type: "session/load:history_replay" }` right after
+    /// `SessionStarted`. The raw lines stay in the fixture.
+    loading_history: bool,
+    history_replay: Vec<String>,
+    /// `session/update`s that arrive before the session is established are held
+    /// and replayed right after `SessionStarted` (dropped if it never starts:
+    /// a pre-session failure begins with its `Error`).
+    pre_start_updates: Vec<(Value, Value)>,
 
     pending_client_reqs: BTreeMap<String, OutboundReq>,
     pending_gateable_rpcs: VecDeque<PendingGateableRpc>,
@@ -138,6 +151,9 @@ impl AcpNormalizer {
             stderr_lines: Vec::new(),
             configured_model: None,
             deferred_start: None,
+            loading_history: false,
+            history_replay: Vec::new(),
+            pre_start_updates: Vec::new(),
             pending_client_reqs: BTreeMap::new(),
             pending_gateable_rpcs: VecDeque::new(),
             rpc_to_call_id: BTreeMap::new(),
@@ -313,6 +329,7 @@ impl AcpNormalizer {
                     }
                 }
                 "session/load" => {
+                    self.loading_history = true;
                     let model = extract_meta_model(&params);
                     if model.is_some() {
                         self.configured_model = model.clone();
@@ -332,6 +349,7 @@ impl AcpNormalizer {
                     }
                 }
                 "session/resume" => {
+                    self.loading_history = true;
                     let model = extract_meta_model(&params);
                     if model.is_some() {
                         self.configured_model = model.clone();
@@ -554,6 +572,12 @@ impl AcpNormalizer {
                 });
                 return;
             };
+            if matches!(
+                req,
+                OutboundReq::SessionLoad { .. } | OutboundReq::SessionResume { .. }
+            ) {
+                self.loading_history = false;
+            }
 
             if let Some(err) = obj.get("error") {
                 let message = err
@@ -657,6 +681,7 @@ impl AcpNormalizer {
                                 model: Some(d.requested_model),
                                 tools: d.tools,
                             });
+                            self.after_session_started(out);
                         }
                     }
                 }
@@ -710,6 +735,31 @@ impl AcpNormalizer {
             model: resp_model,
             tools: extract_tools(result),
         });
+        self.after_session_started(out);
+    }
+
+    /// Right after `SessionStarted`: report replayed history, then the updates
+    /// that arrived while the session was still being established.
+    fn after_session_started(&mut self, out: &mut Vec<AgentEvent>) {
+        self.emit_history_note(out);
+        for (params, raw) in std::mem::take(&mut self.pre_start_updates) {
+            self.handle_session_update(params, &raw, out);
+        }
+    }
+
+    /// Reports the replayed history that was not turned into events.
+    fn emit_history_note(&mut self, out: &mut Vec<AgentEvent>) {
+        if self.history_replay.is_empty() {
+            return;
+        }
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for tag in self.history_replay.drain(..) {
+            *counts.entry(tag).or_default() += 1;
+        }
+        out.push(AgentEvent::Unmapped {
+            record_type: "session/load:history_replay".into(),
+            raw: json!({ "updates": counts }),
+        });
     }
 
     fn handle_session_update(
@@ -718,6 +768,19 @@ impl AcpNormalizer {
         raw_msg: &Value,
         out: &mut Vec<AgentEvent>,
     ) {
+        if self.loading_history {
+            let tag = params
+                .get("update")
+                .and_then(|u| u.get("sessionUpdate"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            self.history_replay.push(tag.to_owned());
+            return;
+        }
+        if !self.session_started {
+            self.pre_start_updates.push((params, raw_msg.clone()));
+            return;
+        }
         hoist_tool_name(&mut params);
         let Ok(notif) = serde_json::from_value::<SessionNotification>(params.clone()) else {
             let tag = params

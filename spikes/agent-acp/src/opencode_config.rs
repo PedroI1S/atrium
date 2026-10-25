@@ -19,6 +19,17 @@
 //! - the same `ask` rule on the two built-in subagents (`explore`, `general`),
 //!   because agent rules are appended after global rules and `explore` ships
 //!   with `shell`/`read`/`grep` allows that would otherwise override it.
+//! - `{"execute", "*", "deny"}` after the ask rule. OpenCode's `execute` tool
+//!   (Code Mode) runs model-written JavaScript with a raw `fetch` and tool
+//!   calls inside; in the second live run it completed a network fetch with no
+//!   `session/request_permission`, `ask` rule or not. OpenCode's docs say a
+//!   `deny` on `execute` removes Code Mode, so the tool is disabled for the
+//!   session: it cannot be gated, only removed (see the report).
+//! - MCP servers from `SessionConfig::mcp_servers` as `mcp.servers.<name>`
+//!   with `codemode: false`. By default OpenCode reaches MCP tools only
+//!   through Code Mode, which is now denied, and `codemode: false` keeps them
+//!   as direct tools (`<server>_<tool>`, covered by the ask rule). They are
+//!   therefore not passed in ACP `session/new` when this config is injected.
 //! - `model`, when [`crate::AcpAdapter`] was given one (the adapter still
 //!   verifies it over ACP afterwards).
 //!
@@ -35,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use atrium_agents::McpServer;
 use serde_json::{Value, json};
 
 /// Env var holding an inline config.
@@ -49,18 +61,50 @@ fn ask_all() -> Value {
     json!({"action": "*", "resource": "*", "effect": "ask"})
 }
 
+/// Removes Code Mode (`execute`), which cannot be gated (see the module docs).
+fn deny_execute() -> Value {
+    json!({"action": "execute", "resource": "*", "effect": "deny"})
+}
+
+fn rules() -> Value {
+    json!([ask_all(), deny_execute()])
+}
+
 /// The config document Atrium injects (see the module docs).
-pub fn build_config(model: Option<&str>) -> Value {
+pub fn build_config(model: Option<&str>, mcp_servers: &[McpServer]) -> Value {
     let mut doc = json!({
         "$schema": "https://opencode.ai/config.json",
-        "permissions": [ask_all()],
+        "permissions": rules(),
         "agents": {
-            "explore": {"permissions": [ask_all()]},
-            "general": {"permissions": [ask_all()]}
+            "explore": {"permissions": rules()},
+            "general": {"permissions": rules()}
         }
     });
     if let Some(model) = model {
         doc["model"] = Value::String(model.to_owned());
+    }
+    if !mcp_servers.is_empty() {
+        let mut servers = serde_json::Map::new();
+        for s in mcp_servers {
+            let command: Vec<String> = std::iter::once(s.command.to_string_lossy().into_owned())
+                .chain(s.args.iter().cloned())
+                .collect();
+            let environment: serde_json::Map<String, Value> = s
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect();
+            servers.insert(
+                s.name.clone(),
+                json!({
+                    "type": "local",
+                    "command": command,
+                    "environment": environment,
+                    "codemode": false
+                }),
+            );
+        }
+        doc["mcp"] = json!({ "servers": servers });
     }
     doc
 }
@@ -79,6 +123,24 @@ pub fn merge_inline(existing: Option<&str>, ours: &Value) -> Value {
     for (key, value) in ours_obj {
         match key.as_str() {
             "permissions" => append_array(&mut base, "permissions", value),
+            "mcp" => {
+                let mcp = base
+                    .entry("mcp")
+                    .or_insert_with(|| Value::Object(Default::default()));
+                if let (Some(mcp), Some(ours_servers)) = (
+                    mcp.as_object_mut(),
+                    value.get("servers").and_then(Value::as_object),
+                ) {
+                    let servers = mcp
+                        .entry("servers")
+                        .or_insert_with(|| Value::Object(Default::default()));
+                    if let Some(servers) = servers.as_object_mut() {
+                        for (name, cfg) in ours_servers {
+                            servers.insert(name.clone(), cfg.clone());
+                        }
+                    }
+                }
+            }
             "agents" => {
                 let agents = base
                     .entry("agents")
@@ -130,7 +192,7 @@ pub struct InjectedConfig {
 }
 
 impl InjectedConfig {
-    pub fn create(model: Option<&str>) -> io::Result<Self> {
+    pub fn create(model: Option<&str>, mcp_servers: &[McpServer]) -> io::Result<Self> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -141,7 +203,7 @@ impl InjectedConfig {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         create_private_dir(&dir)?;
-        let doc = build_config(model);
+        let doc = build_config(model, mcp_servers);
         let file = dir.join("opencode.json");
         let text = serde_json::to_string_pretty(&doc).map_err(io::Error::other)?;
         if let Err(e) = fs::write(&file, text) {
@@ -198,16 +260,46 @@ mod tests {
 
     #[test]
     fn config_asks_for_everything_and_pins_the_model() {
-        let doc = build_config(Some("opencode/deepseek-v4.1-flash-free"));
+        let doc = build_config(Some("opencode/deepseek-v4.1-flash-free"), &[]);
         assert_eq!(
             doc["permissions"],
-            json!([{"action": "*", "resource": "*", "effect": "ask"}])
+            json!([
+                {"action": "*", "resource": "*", "effect": "ask"},
+                {"action": "execute", "resource": "*", "effect": "deny"}
+            ])
         );
         assert_eq!(doc["model"], "opencode/deepseek-v4.1-flash-free");
         for agent in ["explore", "general"] {
             assert_eq!(doc["agents"][agent]["permissions"][0]["effect"], "ask");
+            assert_eq!(doc["agents"][agent]["permissions"][1]["action"], "execute");
         }
-        assert!(build_config(None).get("model").is_none());
+        assert!(build_config(None, &[]).get("model").is_none());
+        assert!(build_config(None, &[]).get("mcp").is_none());
+    }
+
+    #[test]
+    fn mcp_servers_become_direct_tools() {
+        let server = McpServer {
+            name: "files".into(),
+            command: "/bin/mcp-files".into(),
+            args: vec!["--root".into(), "/scratch".into()],
+            env: vec![("K".into(), "v".into())],
+        };
+        let doc = build_config(None, &[server]);
+        let cfg = &doc["mcp"]["servers"]["files"];
+        assert_eq!(cfg["type"], "local");
+        assert_eq!(
+            cfg["command"],
+            json!(["/bin/mcp-files", "--root", "/scratch"])
+        );
+        assert_eq!(cfg["environment"], json!({"K": "v"}));
+        assert_eq!(cfg["codemode"], false);
+        let merged = merge_inline(
+            Some(r#"{"mcp":{"servers":{"mine":{"type":"local","command":["x"]}}}}"#),
+            &doc,
+        );
+        assert!(merged["mcp"]["servers"]["mine"].is_object());
+        assert!(merged["mcp"]["servers"]["files"].is_object());
     }
 
     #[test]
@@ -215,30 +307,34 @@ mod tests {
         let user = r#"{"permissions":[{"action":"read","resource":"*","effect":"allow"}],
                        "model":"user/model","theme":"x",
                        "agents":{"explore":{"permissions":[{"action":"shell","resource":"*","effect":"allow"}]}}}"#;
-        let merged = merge_inline(Some(user), &build_config(Some("a/b")));
+        let merged = merge_inline(Some(user), &build_config(Some("a/b"), &[]));
         let perms = merged["permissions"].as_array().unwrap();
-        assert_eq!(perms.len(), 2);
+        assert_eq!(perms.len(), 3);
         assert_eq!(perms[0]["effect"], "allow");
-        assert_eq!(perms[1]["effect"], "ask", "ours is last, so it wins");
+        assert_eq!(perms[1]["effect"], "ask", "ours follows the user's rules");
+        assert_eq!(
+            perms[2]["action"], "execute",
+            "and the execute deny is last"
+        );
         assert_eq!(merged["model"], "a/b");
         assert_eq!(merged["theme"], "x");
         let explore = merged["agents"]["explore"]["permissions"]
             .as_array()
             .unwrap();
-        assert_eq!(explore.last().unwrap()["effect"], "ask");
-        assert_eq!(explore.len(), 2);
+        assert_eq!(explore.last().unwrap()["action"], "execute");
+        assert_eq!(explore.len(), 3);
     }
 
     #[test]
     fn merge_replaces_unparseable_user_config() {
-        let ours = build_config(None);
+        let ours = build_config(None, &[]);
         assert_eq!(merge_inline(Some("{not json"), &ours), ours);
         assert_eq!(merge_inline(None, &ours), ours);
     }
 
     #[test]
     fn file_exists_for_the_session_and_is_removed_after() {
-        let cfg = InjectedConfig::create(Some("a/b")).expect("create");
+        let cfg = InjectedConfig::create(Some("a/b"), &[]).expect("create");
         let path = cfg.path().to_path_buf();
         let text = fs::read_to_string(&path).expect("config file");
         assert_eq!(
@@ -258,7 +354,7 @@ mod tests {
 
     #[test]
     fn users_own_config_file_is_not_replaced() {
-        let cfg = InjectedConfig::create(None).expect("create");
+        let cfg = InjectedConfig::create(None, &[]).expect("create");
         let env = cfg.env(|k| (k == ENV_CONFIG_FILE).then(|| "/home/me/oc.json".to_owned()));
         assert!(!env.iter().any(|(k, _)| k == ENV_CONFIG_FILE));
         assert!(env.iter().any(|(k, _)| k == ENV_CONFIG_CONTENT));

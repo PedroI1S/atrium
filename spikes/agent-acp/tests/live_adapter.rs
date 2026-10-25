@@ -473,7 +473,13 @@ async fn bad_model_is_pre_session_failure_test() {
 /// everything, in the inline variable and in a file that is removed afterwards.
 async fn injected_config_test() {
     let cwd = std::env::current_dir().expect("cwd");
-    let (adapter, cfg) = adapter_for_scenario("env_probe", cwd, plain_gate());
+    let (adapter, mut cfg) = adapter_for_scenario("env_probe", cwd, plain_gate());
+    cfg.mcp_servers = vec![atrium_agents::McpServer {
+        name: "files".into(),
+        command: "/bin/mcp-files".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+    }];
     let adapter = adapter.with_opencode_config(true);
     let session = adapter.start(cfg, Transport::Local).await.expect("start");
     let events = run_to_end(session, Some("probe")).await;
@@ -482,8 +488,16 @@ async fn injected_config_test() {
     let inline: Value =
         serde_json::from_str(report["content"].as_str().expect("inline config")).expect("json");
     assert_eq!(
+        report["mcp_in_new"], 0,
+        "MCP servers travel in the config, not session/new"
+    );
+    assert_eq!(inline["mcp"]["servers"]["files"]["codemode"], false);
+    assert_eq!(
         inline["permissions"],
-        json!([{ "action": "*", "resource": "*", "effect": "ask" }])
+        json!([
+            { "action": "*", "resource": "*", "effect": "ask" },
+            { "action": "execute", "resource": "*", "effect": "deny" }
+        ])
     );
     let file: Value =
         serde_json::from_str(report["file_text"].as_str().expect("file text")).expect("json");
@@ -608,6 +622,7 @@ async fn run_mock_acp_agent(scenario: &str) {
 
     let mut session_id = "ses_mock_1".to_owned();
     let mut cwd = String::new();
+    let mut mcp_in_new = 0usize;
 
     while let Ok(Some(line)) = lines.next_line().await {
         let msg: Value = match serde_json::from_str(&line) {
@@ -648,6 +663,11 @@ async fn run_mock_acp_agent(scenario: &str) {
                 {
                     cwd = c.to_owned();
                 }
+                mcp_in_new = msg
+                    .get("params")
+                    .and_then(|p| p.get("mcpServers"))
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
                 if scenario == "never_answer" {
                     loop {
                         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -812,8 +832,7 @@ async fn run_mock_acp_agent(scenario: &str) {
                         let content = std::env::var("OPENCODE_CONFIG_CONTENT").unwrap_or_default();
                         let file = std::env::var("OPENCODE_CONFIG").unwrap_or_default();
                         let file_text = std::fs::read_to_string(&file).unwrap_or_default();
-                        let report =
-                            json!({ "content": content, "file": file, "file_text": file_text });
+                        let report = json!({ "content": content, "file": file, "file_text": file_text, "mcp_in_new": mcp_in_new });
                         write_rpc(
                             &mut stdout,
                             &json!({

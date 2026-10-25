@@ -15,8 +15,9 @@
 //!   (default `opencode/big-pickle`).
 //! - `ATRIUM_ACP_SCENARIO_TIMEOUT_SECS`: overall limit per scenario (default 240).
 //!
-//! Exit codes: 0 ok, 1 error, 2 usage, 3 gate bypassed (fixtures are still
-//! written, as evidence), 4 scenario timed out (nothing written), 5 scenario
+//! Exit codes: 0 ok, 1 error, 2 usage, 3 gate bypassed in any scenario (a denied
+//! class completed, the canary leaked, or any tool call completed without
+//! reaching the gate; fixtures are still written, as evidence), 4 scenario timed out (nothing written), 5 scenario
 //! did not behave as expected (e.g. a bad model was accepted).
 
 use std::env;
@@ -35,7 +36,9 @@ use atrium_protocol::agent::{
     AgentEvent, ApprovalDecision, QuestionAnswer, SessionCommand, ToolKind,
 };
 use spike_agent_acp::sanitize::FixtureSanitizer;
-use spike_agent_acp::selfcheck::{CANARY, detect_gate_bypass, is_gate_deny_scenario, tool_gating};
+use spike_agent_acp::selfcheck::{
+    CANARY, detect_gate_bypass, detect_ungated_completions, is_gate_deny_scenario, tool_gating,
+};
 use spike_agent_acp::{AcpAdapter, AcpNormalizer, ClientCapabilityConfig};
 use tokio::sync::mpsc;
 
@@ -54,9 +57,10 @@ const SCENARIOS: &[&str] = &[
     "resume",
     "startup-error",
     "model-select",
-    // Matrix probes (not required scenarios): search and web fetch.
+    // Matrix probes (not required scenarios): search, web fetch, Code Mode.
     "tool-search",
     "tool-fetch",
+    "tool-execute",
 ];
 
 struct ScenarioGate {
@@ -171,6 +175,9 @@ fn prompt_for(scenario: &str) -> &'static str {
             "Use grep to find the word 'sensitive' in the files here and tell me which file has it."
         }
         "tool-fetch" => "Fetch https://example.com and tell me the page title.",
+        "tool-execute" => {
+            "Use your execute tool to run JavaScript that computes 6 * 7 and returns the result. If you have no execute tool, say so."
+        }
         _ => "Hello",
     }
 }
@@ -435,6 +442,12 @@ async fn record(
             ));
         } else if driven.saw_fatal_error.is_none() {
             failures.push("startup-error: no fatal error reported".to_owned());
+        }
+    }
+    // In every scenario: a tool call that completed must have reached the gate.
+    for finding in detect_ungated_completions(&raw_lines) {
+        if !bypass.contains(&finding) {
+            bypass.push(finding);
         }
     }
     let gating = tool_gating(&raw_lines);

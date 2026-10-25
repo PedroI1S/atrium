@@ -1,6 +1,6 @@
 # Spike Report: M0-04 — ACP Adapter (`opencode acp`)
 
-Status after **fix round 1**: the adapter now makes OpenCode ask before every action and routes the asks to the gate, selects the model over ACP, bounds startup, and the recorder checks itself for a bypassed gate. The `ask` behaviour is derived from OpenCode's documentation and from the 2.1.3 binary, **not yet proven live**: the orchestrator re-records (commands in section 8). `interception()` stays `ProviderGated`.
+Status after **fix round 2**. Round 1 injected a per-session `ask` config; the second live recording (OpenCode 2.1.3, `opencode/deepseek-v4.1-flash-free`, commit 114a35c) confirmed it: read, shell, edit, search and the question tool all reached the gate, every `gate-deny*` was denied (with and without client capabilities) and the canary never appears. It also found OpenCode's `execute` tool (Code Mode) completing without a permission request (section 4); round 2 disables it per session and adds a recorder check for any such call. Round 2's `execute` deny and the MCP change are **not proven live yet**: the orchestrator re-records (section 8). `interception()` stays `ProviderGated`.
 
 ## 1. Summary & Pinned Crate Version
 
@@ -14,7 +14,7 @@ Status after **fix round 1**: the adapter now makes OpenCode ask before every ac
 
 `ClientSideConnection` needs `!Send` async I/O on a `LocalSet` and hides the wire lines. `atrium-agents` needs a `Send` `start` future and a normalizer that sees every `AdapterInput` (stdin, stdout, stderr, gate decisions, commands, exit) so live runs and replays share one code path. The adapter therefore uses the schema types for (de)serialization and frames newline-delimited JSON-RPC itself over `tokio::process` pipes.
 
-## 2. Live finding (first recording, `M0-04-live-1`): the gate was bypassed
+## 2. Live finding 1 (first recording, `M0-04-live-1`): the gate was bypassed
 
 Recorded on the host with `opencode acp` v2.1.3, model `opencode/deepseek-v4.1-flash-free`, from a scratch directory, with the client advertising `fs.readTextFile`, `fs.writeTextFile` and `terminal`:
 
@@ -39,34 +39,53 @@ OpenCode's ACP `session/new` takes only `cwd`, `additionalDirectories` and `mcpS
 - `OPENCODE_CONFIG_CONTENT`: inline config. In the 2.1.3 loader it ranks above project `opencode.json` files, which a repository could otherwise use to allow everything (order, low to high: global, `OPENCODE_CONFIG`, project, inline content, system/managed).
 - `OPENCODE_CONFIG`: a generated file with the same document (the mechanism the orchestrator already proved for the model). A user's own `OPENCODE_CONFIG` is left alone; a user's own inline content is merged, with ours last. The file lives in a private temp dir and is removed when the session ends.
 - The document: `permissions: [{"action":"*","resource":"*","effect":"ask"}]` (the last matching rule wins and global rules come after the defaults, so it replaces `* allow`; `*` covers reads), the same rule under `agents.explore` and `agents.general` (agent rules are appended after global rules, and `explore` ships `shell`/`read`/`grep` allows), and `model` when `SessionConfig::model` is set.
+- `{"execute", "*", "deny"}` after the ask rule, global and on the two subagents (section 4, Code Mode).
+- `SessionConfig::mcp_servers` become `mcp.servers.<name>` with `codemode: false` in the same document, and are not sent in ACP `session/new` while the config is injected (section 4, MCP).
 - Every `session/request_permission` goes through `SessionConfig::gate`. `Allow` answers the `allow_once` option (`once`), `Deny` the `reject_once` option (`reject`), `Ask` emits `ApprovalRequested` first. An agent-side `allow_always` is **never** selected (OpenCode would save it as a durable project rule that skips the gate from then on); if there is no once-option, the request is cancelled, which is a denial.
 - `PermissionPolicy`: `ReadOnly` additionally selects OpenCode's `plan` mode (it denies edits); `Ask` and `FullAccess` keep the default agent. The `ask` rule applies in every policy, so in `FullAccess` the gate still sees every call and applies the user's rules, as D-011 requires; the gate, not OpenCode, decides to let everything through.
 
 ## 4. Enforcement matrix (`docs/contracts/m0.md` §3.1)
 
-"Before fix" is what the live recording shows. "After fix" is what the injected config should do; it comes from OpenCode's v2 permission documentation (actions and resources; `ask` = "wait for a decision from the client") and from the 2.1.3 binary, where the ACP layer answers a `permission.asked` event with `connection.requestPermission` and the options `once` / `always` / `reject`. **It has not been run live yet.** The re-recording fills the last column.
+Columns: what the first recording showed (default permissions), what the second recording showed with the injected `ask` config (`tool-*`, `approval-*`, `gate-deny*`, `question` fixtures; each `.md` lists the calls and whether they reached the gate), and what is still to prove.
 
-| Tool class | OpenCode action | Intercepted before execution, before fix | After fix (expected) | How | Live evidence of the fix |
+| Tool class | OpenCode action / tool | Default config (live run 1) | With injected `ask` (live run 2) | How | Evidence |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| Read | `read` | **No** (canary read natively) | Yes | `session/request_permission` (rule `* ask`; `*` includes `read`) | `gate-deny` (to record) |
-| Edit / write / patch | `edit` | **No** (file written without a prompt) | Yes | `session/request_permission` | `approval-allow`, `approval-deny` (to record) |
-| Delete / move | `shell` (`rm`, `mv`) | **No** | Yes, as shell | `session/request_permission` | shape of `gate-deny-execute` (to record) |
-| Execute | `shell` | **No** (`cat secret.txt` ran) | Yes | `session/request_permission` | `gate-deny-execute` (to record) |
-| Search | `grep`, `glob` | **No** | Yes | `session/request_permission` | `tool-search` (to record) |
-| Fetch / web | `webfetch`, `websearch` | **No** | Yes | `session/request_permission` | `tool-fetch` (to record) |
-| Outside the workspace | `external_directory` | No (default is allow) | Yes | same | not probed |
-| MCP tools | `<server>_<tool>` | not probed | Expected yes (docs list it; `*` matches) | same | **not probed** |
-| Subagents | `subagent`; the child's own calls | not probed | Spawn: expected yes. Child calls: depend on the agent rules; the injected rule on `explore` and `general` is best effort (the order against the shipped agent rules is not documented) | same | **not probed** |
-| Client `fs/*`, `terminal/*` | n/a | **Never used** by OpenCode | Never used | n/a | all recordings |
+| Read | `read` | **No**: canary read natively | **Yes**: gated; denied read never ran, canary absent (with and without client caps) | `session/request_permission` | `tool-read`, `gate-deny`, `gate-deny-no-caps` |
+| Edit / write / patch | `edit` (`write`) | **No** | **Yes**: asked, approved and denied both resolve | `session/request_permission` | `approval-allow`, `approval-deny` |
+| Execute (shell) | `shell` | **No**: `cat secret.txt` ran | **Yes**: denied command never ran | `session/request_permission` | `gate-deny-execute`, `-no-caps`, `approval-deny` |
+| Delete / move | `shell` (`rm`, `mv`) | **No** | **Yes**, as `shell` | same | shape of `approval-deny` (`rm -rf`) |
+| Search | `grep`, `glob` | **No** | **Yes** | same | `tool-search` |
+| Question | `question` | n/a | **Yes**: asks, then `elicitation/create` | same, then elicitation | `question` |
+| **Code Mode** | **`execute`** (ACP kind `other`) runs model-written JavaScript with a raw `fetch` and nested tool calls | not probed | **No: completed with no `session/request_permission`** despite the `* ask` rule (`fetch("https://example.com")` ran) | none | `tool-fetch` (call `call_ebd1a2e3ecdb47b39eeaa90c`, kept as evidence) |
+| Fetch / web | `webfetch`, `websearch` (the model used Code Mode instead) | not probed | not exercised: the model chose `execute` | expected `session/request_permission` | re-record `tool-fetch` |
+| Outside the workspace | `external_directory` | No (default is allow) | covered by `*` ask; not probed | same | not probed |
+| MCP tools | `<server>_<tool>`, or via Code Mode | not probed | not probed | see below | **not probed** |
+| Subagents | `subagent`; the child's own calls | not probed | not probed; the injected rule on `explore`/`general` is best effort (order against the shipped agent rules is undocumented) | same | **not probed** |
+| Client `fs/*`, `terminal/*` | n/a | **Never used** | **Never used** | n/a | all recordings |
 
-Why `ProviderGated` stays: OpenCode enforces this itself, MCP tools and subagent internals are unproven, and a few things can still skip the ask:
+### Code Mode (`execute`): cannot be gated, so it is disabled per session
+
+What it is (2.1.3 binary strings and the v2 permission docs): a tool named `execute` that "runs JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests". Inside the code, `fetch` is available for raw HTTP and every other tool is reached through `tools.<namespace>[...]`. Its input is `{ code }`. The permissions docs list the action `execute` (resource `*`) and say "a deny removes Code Mode and the tools reached only through it, while nested tools enforce their rules".
+
+What the recording shows: with `permissions: [{* * ask}]` in force (the other recordings with the same config asked for every `read`, `shell`, `edit`, `grep` and `question` call), `execute` and the `fetch` inside it completed with no permission request, and `rawOutput.metadata.toolCalls` shows a nested `fetch` that ran unasked. So `ask` on `execute` is not honoured, and the HTTP request inside the code never meets a permission check.
+
+Fix: `{"action":"execute","resource":"*","effect":"deny"}` is added after the ask rule, in the global rules and in the `explore`/`general` agents. This is **disabling, not gating**: the one documented effect of a deny on `execute` is that Code Mode is removed, and it is the only documented control. Consequences:
+
+- The model must use `webfetch` / `websearch` / `shell` directly, which are gated.
+- By default OpenCode exposes MCP tools only through Code Mode ("they cannot be called directly"; config `mcp.servers.<name>.codemode` "defaults to true"). Denying `execute` would make them unreachable, so when the config is injected the adapter puts `SessionConfig::mcp_servers` into the config as `mcp.servers.<name>` with `codemode: false` and does not pass them in ACP `session/new` (the ACP path would register them with the default, Code Mode only). With `codemode: false` they should be direct tools `<server>_<tool>`, covered by the `*` ask rule. Not verified live.
+- MCP servers in the user's own config keep `codemode: true`, so they are unreachable in an Atrium session. That is the safe direction.
+- The recorder's `tool-execute` probe asks the model to use `execute`; the expected result is a model that has no such tool. If the tool still exists and runs, the new any-scenario check (section 6) fails the recording (exit 3).
+
+Why `ProviderGated` stays: OpenCode enforces this itself; MCP tools and subagent internals are unproven; the Code Mode disable is untested live; and a few things can still skip the ask:
 
 - saved "always" approvals in the user's OpenCode project state (durable `allow` rules from the user's own earlier use of OpenCode in the same project; Atrium never creates one);
 - user-defined agents, or a system/managed config (`/Library/Application Support/opencode`, managed preferences), which rank above ours;
-- anything a tool does without going through OpenCode's permission check;
-- a `reject` reply makes OpenCode reject every other pending request of that session.
+- anything a tool does without going through OpenCode's permission check (Code Mode was one);
+- a `reject` reply makes OpenCode reject every other pending request of that session, **and end the turn**: after Atrium's `Deny`, OpenCode answers `session/prompt` with `stopReason: "cancelled"`, which the normalizer maps to `TurnOutcome::Interrupted`. Live in `gate-deny`, `gate-deny-execute` and `approval-deny`. A denied call therefore ends the turn instead of letting the model carry on.
 
-`interception()` may move to `AllToolCalls` only when the re-recording proves every row, MCP and subagent calls included.
+Also seen live: `interrupt` sent `session/cancel` right after the `shell` tool call was announced, before its permission request; the call ended `failed`, never reached the gate and never ran.
+
+`interception()` may move to `AllToolCalls` only when a re-recording proves every row, MCP and subagent calls included, and `tool-execute` shows Code Mode gone.
 
 ## 5. Model and effort selection
 
@@ -83,9 +102,16 @@ The old adapter put the model in `_meta`, which OpenCode ignores, so every run u
 - `start` bounds `initialize` + `session/new`/`load` + model selection by `STARTUP_TIMEOUT` (30 s; `AcpAdapter::with_startup_timeout` for tests), kills and reaps the child on expiry and returns `AdapterError::Handshake`. Test: `startup_timeout_test` (an agent that never answers `session/new`).
 - The 27-minute `startup-error` hang was the recorder: with the model ignored, a session started, the scenario sent no prompt, and nothing waited with a limit. The recorder now has an overall per-scenario timeout (`ATRIUM_ACP_SCENARIO_TIMEOUT_SECS`, default 240; exit code 4, nothing written), and `startup-error` fails (exit 5) if a session starts with the bad model.
 - **Sanitizer**: `src/sanitize.rs` wraps the contract `Sanitizer`. On decoded values it maps the scratch directory (realpath, the form without `/private`, and the form as given) to `/scratch`, any other `[/private]/var/folders/x/y/T` to `/tmp`, then applies the contract sanitizer; `is_clean` fails if a `/var/folders/`, `/private/var/` or `/private/tmp/` path is left. Tests in `src/sanitize.rs` (raw, prose, `file://`, sibling names) and a check in `tests/golden.rs` over every committed fixture.
+- **Any-scenario check**: in every scenario the recorder fails with exit 3 (fixtures still written, with `GATE BYPASSED` in the `.md`) if any tool call has completed without a `Gate` for its call id (`detect_ungated_completions`). A call that failed or was cancelled before the gate did not run and is not flagged. `tests/golden.rs` runs it over every golden scenario, and `live_tool_fetch_evidence_is_flagged_by_the_ungated_check` pins it on the real `tool-fetch` recording.
 - **Recorder self-check** (`src/selfcheck.rs`): for `gate-deny*` the recorder fails (exit 3, still writing the fixtures as evidence, with `GATE BYPASSED: record as ungated in the matrix` in the `.md`) if the canary appears anywhere in the raw stream, if a tool call of a denied class completed, or if tool calls completed without the gate ever being consulted. Every recording's `.md` lists each tool call and whether it reached the gate, which is the evidence for the matrix. `tests/golden.rs` runs the same check over the committed fixtures.
 - The recorder creates its own scratch directory (`Cargo.toml`, `secret.txt` with the canary, `notes.txt`), so it runs from the repository root. `resume` now really resumes: a first process creates the session, the recorded second process resumes it by native id. `interrupt` interrupts a running `sleep 30`.
 - `examples/replay.rs` replays a recorded `.jsonl` through the normalizer (`--write` regenerates `.events.json`).
+
+### Lifecycle on `session/load` and `session/resume` (round 2)
+
+`session/load` makes OpenCode replay the old conversation as `session/update`s (`user_message_chunk`, `agent_message_chunk`, ...) before it answers the request, so the first stdout record after the request is a `MessageDelta`, not the start of a session. The event contract has no history event and requires `SessionStarted` first. Decision: **replayed history is not turned into events**. The normalizer treats every `session/update` between a `session/load` / `session/resume` request and its response as history, counts it by update type, and emits one `Unmapped { record_type: "session/load:history_replay", raw: {"updates": {"agent_message_chunk": 1, ...}} }` right after `SessionStarted`. The raw lines stay in the fixture, nothing is dropped silently, and the client does not see old messages as new ones. If the UI ever wants the history, it can come from a future contract event or from the daemon's own log; the adapter would only need to hold the replayed updates instead of counting them.
+
+Related and general: any `session/update` that arrives before the session is established (for example `available_commands_update` between the `session/new` response and a pending model selection) is held and emitted right after `SessionStarted`; if the session never starts, it is dropped, so a pre-session failure still begins with its `Error`. Tests: `replayed_history_is_reported_not_turned_into_events`, `updates_before_the_session_exists_wait_for_session_started_or_vanish`, the `resume` and `startup-error` fixtures (re-normalized offline with `examples/replay.rs`, not re-recorded).
 
 ## 7. Recommendation for M1
 
@@ -94,6 +120,7 @@ Keep the generic ACP adapter for ACP agents that ask by default (and for the one
 - **Per-session permission rules at session creation**: `POST /session` takes the rules (v1 `{permission: [{permission, pattern, action}]}`, v2 `{permissions: [{action, resource, effect}]}`), for example `[* ask, question allow]`, or a full `* allow` for full access. That is a real per-session setting; the ACP path only has per-process environment.
 - **Model and variant per prompt** (v1 `prompt_async {model, variant, agent, parts}`; v2 sets them with `setModel` first) instead of config options after session creation.
 - Permission replies are explicit (`POST /permission/{id}/reply {once|always|reject}` or the v2 session route), and interrupt is `/abort` (v1) or `/interrupt` (v2).
+- The Code Mode finding is a second reason: with the HTTP server the adapter sees tool events and permission requests of the whole server API, and can deny a tool at session creation (`execute` `*` deny) as a documented per-session rule rather than through a process-wide environment config.
 - It removes the reliance on environment-config precedence and on the background `opencode serve --service` that may already be running on the host.
 
 The cost is a second, OpenCode-only adapter and version handling (v1 and v2 differ). Not built in this round: ACP is not proven a dead end; it awaits the live re-recording.
@@ -108,7 +135,7 @@ cargo fmt --check
 cargo clippy -p spike-agent-acp --all-targets -- -D warnings
 cargo test -p spike-agent-acp
 ```
-- `tests/golden.rs`: replays 15 scenarios (`simple`, `tool-read`, `gate-deny`, `gate-deny-execute`, `approval-allow`, `approval-deny`, `question`, `interrupt`, `multi-turn`, `resume`, `startup-error`, `model-select`, and the client-capability variants `tool-read-fs`, `gate-deny-fs`, `gate-deny-terminal`), checks golden events, invariants, `Sanitizer::is_clean`, no temp path, no canary, and the bypass self-check; plus normalizer unit tests for model confirmation and the top-level tool name.
+- `tests/golden.rs`: replays 15 scenarios (live fixtures where recorded) (`simple`, `tool-read`, `gate-deny`, `gate-deny-execute`, `approval-allow`, `approval-deny`, `question`, `interrupt`, `multi-turn`, `resume`, `startup-error`, `model-select`, and the client-capability variants `tool-read-fs`, `gate-deny-fs`, `gate-deny-terminal`), checks golden events, invariants, `Sanitizer::is_clean`, no temp path, no canary, and the bypass self-check; plus normalizer unit tests for model confirmation and the top-level tool name.
 - `tests/live_adapter.rs` (a mock ACP agent over real stdio): saturation (§3.2), fs/terminal gate enforcement, approval and question round trips, pre-session failure, model selection, bad model (rejected and silently ignored), injected config (inline = file, `ask` rule, file removed), startup timeout, permission option choice (never `allow_always`).
 - `src/*` unit tests: model state parsing, config merge, sanitizer, self-check, permission option choice.
 
@@ -119,14 +146,14 @@ From the worktree root (the recorder makes its own scratch directory):
 ```bash
 cd /Users/pedro/Documents/atrium-wt/M0-04-acp-adapter
 cargo build -p spike-agent-acp --examples
-for s in simple tool-read gate-deny gate-deny-execute approval-allow approval-deny question interrupt multi-turn resume startup-error model-select tool-search tool-fetch; do
+for s in simple tool-read gate-deny gate-deny-execute approval-allow approval-deny question interrupt multi-turn resume startup-error model-select tool-search tool-fetch tool-execute; do
   cargo run -q -p spike-agent-acp --example record -- $s || echo "!! $s exited $?"
 done
 cargo run -q -p spike-agent-acp --example record -- --no-client-caps gate-deny
 cargo run -q -p spike-agent-acp --example record -- --no-client-caps gate-deny-execute
 cargo test -p spike-agent-acp
 ```
-(bash syntax; in fish use `for s in ...; ...; end`.) Exit code 3 means the gate was bypassed: the fixtures are still written, the class is recorded as ungated in the matrix, and the M1 recommendation above becomes the plan. `ATRIUM_ACP_MODEL` and `ATRIUM_ACP_SELECT_MODEL` override the models. Check a recording offline with `cargo run -p spike-agent-acp --example replay -- fixtures/agents/acp/<name>.jsonl`. `tool-search`, `tool-fetch` and the `-no-caps` recordings are matrix probes; they are not golden scenarios.
+(bash syntax; in fish use `for s in ...; ...; end`.) Exit code 3 means the gate was bypassed: the fixtures are still written, the class is recorded as ungated in the matrix, and the M1 recommendation above becomes the plan. `ATRIUM_ACP_MODEL` and `ATRIUM_ACP_SELECT_MODEL` override the models. Check a recording offline with `cargo run -p spike-agent-acp --example replay -- fixtures/agents/acp/<name>.jsonl`. `tool-search`, `tool-fetch`, `tool-execute` and the `-no-caps` recordings are matrix probes; they are not golden scenarios.
 
 ## 9. OpenCode ACP feature support (v2.1.3, from the live `initialize` and the binary)
 
@@ -134,7 +161,7 @@ cargo test -p spike-agent-acp
 | :--- | :--- | :--- |
 | `initialize` | Yes | `protocolVersion: 1`; `authMethods: opencode-login`. |
 | `session/new` | Yes | `cwd`, `additionalDirectories`, `mcpServers` only (stdio and HTTP; SSE rejected). Returns `sessionId` and `configOptions` (`model`, `effort`, `mode`); no `modes`/`models` state. |
-| `session/load`, `session/resume` | Yes | `loadSession: true`, `sessionCapabilities.resume`; also `fork`, `list`, `close`, `delete`. Used when `SessionConfig::resume` is set. |
+| `session/load`, `session/resume` | Yes | `loadSession: true`, `sessionCapabilities.resume`; also `fork`, `list`, `close`, `delete`. Used when `SessionConfig::resume` is set. `session/load` replays the old conversation as `session/update`s before it answers (live); see "Lifecycle on session/load". |
 | `session/prompt`, `session/cancel` | Yes | Stop reason maps to `TurnOutcome`. |
 | `session/set_config_option` | Yes | The way to set `model`, `effort`, `mode` (values are strings). |
 | `session/set_mode` | Yes | Used only if the agent reports a `modes` state; OpenCode reports the mode as a config option. |
@@ -147,11 +174,11 @@ cargo test -p spike-agent-acp
 
 ## 10. `AgentEvent::Unmapped` records
 
-`AcpNormalizer` never drops an unknown record. Unmapped: `session/update:available_commands_update` (seen live), `current_mode_update`, `config_option_update`, `session_info_update`, any unknown `session/update:<tag>`, unknown `rpc:<method>`, non-JSON / non-object stdout, `rpc_response:unknown_id`.
+`AcpNormalizer` never drops an unknown record. Unmapped: `session/load:history_replay` (a count of the history replayed by `session/load`), `session/update:available_commands_update` (seen live), `current_mode_update`, `config_option_update`, `session_info_update`, any unknown `session/update:<tag>`, unknown `rpc:<method>`, non-JSON / non-object stdout, `rpc_response:unknown_id`.
 
 ## 11. Open risks
 
-1. The injected `ask` config is unproven live through `opencode acp`. A background service (`opencode serve --service`) is running on the host; if ACP sessions are served by it rather than by the `acp` process, environment config may not reach it. The orchestrator's earlier `OPENCODE_CONFIG` model override worked, which suggests the config is read in the `acp` process, but permission rules in the same config are unverified.
-2. MCP tools and subagent-internal calls are unprobed.
+1. The injected `ask` config is proven live for read, shell, edit, search and question (run 2), so the environment config does reach the session. Still unproven: that `deny` on `execute` removes Code Mode (`tool-execute`), and `codemode: false` MCP servers as direct, gated tools.
+2. MCP tools and subagent-internal calls are unprobed; `webfetch`/`websearch` have not been exercised (the model chose Code Mode).
 3. Saved "always" approvals and managed config can override the per-session rules (section 4).
 4. The exact OpenCode error text for an unknown model is unknown (the hand-made fixture invents one).

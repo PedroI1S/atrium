@@ -176,6 +176,22 @@ pub fn tool_gating(lines: &[FixtureLine]) -> Vec<ToolGating> {
         .collect()
 }
 
+/// Any scenario: every tool call that completed must have reached the gate.
+/// One finding per call that ran without Atrium being asked (the second live
+/// run found OpenCode's `execute` tool, which runs JavaScript, doing this).
+pub fn detect_ungated_completions(lines: &[FixtureLine]) -> Vec<String> {
+    tool_gating(lines)
+        .into_iter()
+        .filter(|g| !g.gated && g.status.as_deref() == Some("completed"))
+        .map(|g| {
+            format!(
+                "tool call {} (kind {}) completed without reaching the gate",
+                g.call_id, g.kind
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +282,29 @@ mod tests {
             findings.iter().any(|f| f.contains("kind execute")),
             "{findings:?}"
         );
+    }
+
+    #[test]
+    fn ungated_completion_is_found_in_any_scenario() {
+        let lines = vec![
+            update(
+                json!({"sessionUpdate":"tool_call","toolCallId":"x","name":"execute","kind":"other","status":"pending"}),
+            ),
+            update(
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"x","status":"completed"}),
+            ),
+        ];
+        let findings = detect_ungated_completions(&lines);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("kind other"));
+        // A call that failed or was cancelled before the gate did not run.
+        let lines = vec![
+            update(
+                json!({"sessionUpdate":"tool_call","toolCallId":"y","kind":"execute","status":"pending"}),
+            ),
+            update(json!({"sessionUpdate":"tool_call_update","toolCallId":"y","status":"failed"})),
+        ];
+        assert!(detect_ungated_completions(&lines).is_empty());
     }
 
     #[test]
