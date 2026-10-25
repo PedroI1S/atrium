@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use atrium_agents::fixture::FixtureLine;
@@ -15,6 +16,15 @@ use atrium_protocol::agent::{
 use serde_json::json;
 use spike_agent_agy::{AgyAdapter, AgyNormalizer, FixtureSanitizer};
 use tokio::sync::mpsc;
+
+/// Set by `--no-coverage-check`: investigate a tripwire without it killing the session.
+static NO_COVERAGE_CHECK: AtomicBool = AtomicBool::new(false);
+
+fn new_adapter() -> AgyAdapter {
+    let mut adapter = AgyAdapter::new();
+    adapter.enforce_gate_coverage = !NO_COVERAGE_CHECK.load(Ordering::Relaxed);
+    adapter
+}
 
 const SCENARIO_SECRET: &str = "TOP_SECRET_VALUE_994812_DO_NOT_LEAK";
 const DEFAULT_MODEL: &str = "gemini-3.8-flash-medium";
@@ -91,6 +101,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let val = raw_args.next().ok_or("--binary requires a value")?;
                 program = Some(PathBuf::from(val));
             }
+            "--no-coverage-check" => {
+                raw_args.next();
+                NO_COVERAGE_CHECK.store(true, Ordering::Relaxed);
+            }
             "--fixtures-dir" => {
                 raw_args.next();
                 let val = raw_args.next().ok_or("--fixtures-dir requires a value")?;
@@ -110,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let Some(scenario) = args.first().map(String::as_str) else {
         eprintln!(
-            "Usage:\n  cargo run -p spike-agent-agy --example record -- [--binary <path>] [--fixtures-dir <dir>] <scenario|all>\n  cargo run -p spike-agent-agy --example record -- --generate-handmade [scenario|all]\n\nScenarios: {}",
+            "Usage:\n  cargo run -p spike-agent-agy --example record -- [--binary <path>] [--fixtures-dir <dir>] [--no-coverage-check] <scenario|all>\n  cargo run -p spike-agent-agy --example record -- --generate-handmade [scenario|all]\n\nScenarios: {}",
             ALL_SCENARIOS.join(", ")
         );
         std::process::exit(2);
@@ -212,7 +226,7 @@ async fn seed_resume_session(
     program: Option<PathBuf>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let (seed_tx, _seed_rx) = mpsc::unbounded_channel();
-    let seed_adapter = AgyAdapter::new().with_recorder(seed_tx);
+    let seed_adapter = new_adapter().with_recorder(seed_tx);
     let cfg = base_config(
         scratch_dir,
         Some(DEFAULT_MODEL.to_owned()),
@@ -304,7 +318,7 @@ async fn record_in_scratch(
     };
 
     let (rec_tx, mut rec_rx) = mpsc::unbounded_channel();
-    let adapter = AgyAdapter::new().with_recorder(rec_tx);
+    let adapter = new_adapter().with_recorder(rec_tx);
 
     let gate_mode = match scenario {
         "gate-deny" => GateMode::DenySecret,
@@ -650,7 +664,7 @@ fn check_expectations(scenario: &str, events: &[AgentEvent]) -> Result<(), Vec<S
             expect(ran == 0, "no tool call succeeded");
         }
         "question" => {
-            expect(questions >= 1, "a QuestionAsked");
+            expect(questions == 1, "exactly one QuestionAsked");
             expect(
                 resolved.contains(&RequestOutcome::Answered),
                 "the question resolved as answered",

@@ -553,23 +553,11 @@ impl AgyNormalizer {
                         input: params.clone(),
                     });
 
-                    if tool_name == "ask_question"
-                        && !self
-                            .pending_requests
-                            .iter()
-                            .any(|r| matches!(r.kind, PendingRequestKind::Question))
-                        && let Some(questions) = parse_questions(&params)
-                    {
-                        let request_id = self.alloc_request_id();
-                        self.pending_requests.push(PendingRequest {
-                            request_id: request_id.clone(),
-                            kind: PendingRequestKind::Question,
-                        });
-                        out.push(AgentEvent::QuestionAsked {
-                            request_id,
-                            questions,
-                        });
-                    }
+                    // `ask_question` is NOT surfaced from the step: the `QuestionAsked` must carry
+                    // the id of the hook request that is blocked waiting for the answer
+                    // (`AnswerQuestion` is routed back to the bridge by that id), and the step
+                    // can arrive before or after the hook request. `handle_hook_request`
+                    // emits it, exactly once.
                 }
             }
             "DONE" | "ERROR" | "CANCELLED" | "INTERRUPTED" => {

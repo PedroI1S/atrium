@@ -272,3 +272,94 @@ fn event_stream_contract_invariants_hold_for_all_fixtures() {
         );
     }
 }
+
+/// The question must surface once, with the id of the blocked hook request, whichever of the
+/// `ask_question` step and the hook request arrives first. (Live `agy` sends the step first;
+/// answering with any other id would never reach the bridge, and the hook would time out.)
+#[test]
+fn ask_question_is_surfaced_once_with_the_hook_request_id_in_either_order() {
+    use atrium_protocol::agent::{QuestionAnswer, RequestOutcome};
+    use serde_json::json;
+
+    let params = json!({"questions":[{"question":"Which profile?","options":["Debug","Release"],"is_multi_select":false}]});
+    let init = AdapterInput::Stdout {
+        line: json!({"event":"init","conversation_id":"c-1","init":{"model":"m","tools":["ask_question"]}}).to_string(),
+    };
+    let step = |state: &str| {
+        AdapterInput::Stdout {
+        line: json!({"event":"step_update","step_update":{"conversation_id":"c-1","step_index":2,"state":state,"step_type":"tool","tool_name":"ask_question","tool_info":{"name":"ask_question","parameters":params.clone()}}}).to_string(),
+    }
+    };
+    let hook = AdapterInput::HookRequest {
+        id: "req-7".into(),
+        payload: json!({"toolCall":{"name":"ask_question","args":params.clone()}}),
+    };
+    let answer = AdapterInput::Command {
+        command: atrium_protocol::agent::SessionCommand::AnswerQuestion {
+            request_id: "req-7".into(),
+            answers: vec![QuestionAnswer {
+                question_id: "q-0".into(),
+                selected: vec!["opt-0".into()],
+                text: None,
+            }],
+        },
+    };
+    let response = AdapterInput::HookResponse {
+        id: "req-7".into(),
+        payload: json!({"decision":"allow","reason":"User answered: Debug"}),
+    };
+
+    for (name, order) in [
+        (
+            "step first",
+            vec![
+                init.clone(),
+                step("ACTIVE"),
+                hook.clone(),
+                answer.clone(),
+                response.clone(),
+                step("DONE"),
+            ],
+        ),
+        (
+            "hook first",
+            vec![
+                init.clone(),
+                hook.clone(),
+                step("ACTIVE"),
+                answer.clone(),
+                response.clone(),
+                step("DONE"),
+            ],
+        ),
+    ] {
+        let mut normalizer = AgyNormalizer::default();
+        let events: Vec<AgentEvent> = order
+            .iter()
+            .flat_map(|i| atrium_agents::Normalizer::on_input(&mut normalizer, i))
+            .collect();
+        let asked: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::QuestionAsked { request_id, .. } => Some(request_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, vec!["req-7"], "{name}: {events:?}");
+        let resolved: Vec<(&str, RequestOutcome)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::RequestResolved {
+                    request_id,
+                    outcome,
+                } => Some((request_id.as_str(), *outcome)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![("req-7", RequestOutcome::Answered)],
+            "{name}"
+        );
+    }
+}

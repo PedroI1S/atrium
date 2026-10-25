@@ -312,7 +312,7 @@ fn recorder_fails_loudly_when_the_scenario_expectations_are_not_met() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "must fail: {stderr}");
     assert!(stderr.contains("did not meet its expectations"), "{stderr}");
-    assert!(stderr.contains("a QuestionAsked"), "{stderr}");
+    assert!(stderr.contains("exactly one QuestionAsked"), "{stderr}");
     assert!(!fixtures.join("question.jsonl").exists());
     assert!(!fixtures.join("question.events.json").exists());
     assert!(!fixtures.join("question.md").exists());

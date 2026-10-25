@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -296,6 +296,7 @@ impl AgentAdapter for AgyAdapter {
                 enforce_gate_coverage: self.enforce_gate_coverage,
                 allowed_hooks: 0,
                 executed_tools: 0,
+                open_tool_names: HashMap::new(),
                 abort_reason: None,
                 events_tx,
                 recorder: self.recorder.clone(),
@@ -358,6 +359,8 @@ struct ActorState {
     allowed_hooks: u64,
     /// Tool calls that finished `Succeeded` or `Failed` (that is, that actually ran).
     executed_tools: u64,
+    /// `call_id` -> tool name of calls that started and have not finished.
+    open_tool_names: HashMap<String, String>,
     /// Set when a gate bypass is suspected; the actor stops and kills the child at once.
     abort_reason: Option<String>,
     events_tx: mpsc::Sender<AgentEventEnvelope>,
@@ -616,8 +619,9 @@ impl ActorState {
                     self.in_turn = false;
                     self.bridge.set_call_id_hint(None);
                 }
-                AgentEvent::ToolCallStarted { call_id, .. } => {
+                AgentEvent::ToolCallStarted { call_id, name, .. } => {
                     self.bridge.set_call_id_hint(Some(call_id.clone()));
+                    self.open_tool_names.insert(call_id.clone(), name.clone());
                     // A tool is about to run: the hook config must still be exactly what we
                     // wrote (a tool, or anything else, may have changed it since the last check).
                     if self.enforce_gate_coverage
@@ -627,8 +631,14 @@ impl ActorState {
                         violation = Some(format!("hook config no longer valid: {e}"));
                     }
                 }
-                AgentEvent::ToolCallFinished { status, .. } => {
+                AgentEvent::ToolCallFinished {
+                    call_id, status, ..
+                } => {
                     self.bridge.set_call_id_hint(None);
+                    let tool = self
+                        .open_tool_names
+                        .remove(call_id)
+                        .unwrap_or_else(|| "unknown".to_owned());
                     if matches!(status, ToolStatus::Succeeded | ToolStatus::Failed) {
                         self.executed_tools += 1;
                         if self.enforce_gate_coverage
@@ -636,8 +646,9 @@ impl ActorState {
                             && self.executed_tools > self.allowed_hooks
                         {
                             violation = Some(format!(
-                                "a tool ran without a preceding allowed hook request \
-                                 ({} tools ran, {} hook requests were allowed)",
+                                "tool '{tool}' ({call_id}) finished {status:?} without a \
+                                 preceding allowed hook request ({} tools ran, {} hook \
+                                 requests were allowed)",
                                 self.executed_tools, self.allowed_hooks
                             ));
                         }

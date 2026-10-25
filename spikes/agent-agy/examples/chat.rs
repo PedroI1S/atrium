@@ -23,6 +23,7 @@ struct ChatArgs {
     prompt: Option<String>,
     approval_mode: ApprovalMode,
     program: Option<PathBuf>,
+    enforce_gate_coverage: bool,
 }
 
 fn parse_args() -> Result<ChatArgs, String> {
@@ -32,6 +33,7 @@ fn parse_args() -> Result<ChatArgs, String> {
     let mut prompt = None;
     let mut approval_mode = ApprovalMode::Block;
     let mut program = None;
+    let mut enforce_gate_coverage = true;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -57,6 +59,9 @@ fn parse_args() -> Result<ChatArgs, String> {
                 let val = args.next().ok_or("--binary requires a value")?;
                 program = Some(PathBuf::from(val));
             }
+            "--no-coverage-check" => {
+                enforce_gate_coverage = false;
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -67,6 +72,7 @@ fn parse_args() -> Result<ChatArgs, String> {
         prompt,
         approval_mode,
         program,
+        enforce_gate_coverage,
     })
 }
 
@@ -85,8 +91,10 @@ async fn run() -> Result<(), String> {
         prompt,
         approval_mode,
         program,
+        enforce_gate_coverage,
     } = parse_args()?;
-    let adapter = AgyAdapter::new().with_approval_mode(approval_mode);
+    let mut adapter = AgyAdapter::new().with_approval_mode(approval_mode);
+    adapter.enforce_gate_coverage = enforce_gate_coverage;
     let gate: Arc<dyn ToolGate> = Arc::new(AskGate);
 
     let config = SessionConfig {
