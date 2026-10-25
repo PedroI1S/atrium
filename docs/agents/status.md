@@ -9,7 +9,7 @@
 | M0-02-codex-adapter | GPT-6.1 Sol | Pedro | 🏃 running · wave 1 · dispatched 2026-10-24 | `../atrium-wt/M0-02-codex-adapter` · `agent/sol/M0-02-codex-adapter` | `.orchestration/logs/M0-02-codex-adapter.*` (Pedro's Mac) |
 | M0-03-agy-adapter | Gemini 4 Argon | Pedro | 🏃 running · wave 1 · dispatched 2026-10-24 | `../atrium-wt/M0-03-agy-adapter` · `agent/argon/M0-03-agy-adapter` | `.orchestration/logs/M0-03-agy-adapter.*` (Pedro's Mac) |
 | M0-04-acp-adapter | Gemini 4 Argon | Pedro | 🏃 running · wave 1 · dispatched 2026-10-24 | `../atrium-wt/M0-04-acp-adapter` · `agent/argon/M0-04-acp-adapter` | `.orchestration/logs/M0-04-acp-adapter.*` (Pedro's Mac) |
-| M0-05-daemon-socket | GPT-6.1 Sol | Pedro | 🏃 running · wave 1 · dispatched 2026-10-24 | `../atrium-wt/M0-05-daemon-socket` · `agent/sol/M0-05-daemon-socket` | `.orchestration/logs/M0-05-daemon-socket.*` (Pedro's Mac) |
+| M0-05-daemon-socket | GPT-6.1 Sol | Pedro | 🔍 in review (Sonnet 5.5) · DoD re-run by orchestrator: 11/11 tests, budgets met · committed `9fa0f4f` | `../atrium-wt/M0-05-daemon-socket` · `agent/sol/M0-05-daemon-socket` | `.orchestration/logs/M0-05-daemon-socket.*` (Pedro's Mac) |
 | M0-06-ui-shell | Sonnet 5.5 | Pedro | 🏃 running · wave 1 · dispatched 2026-10-24 | `../atrium-wt/M0-06-ui-shell` · `agent/sonnet/M0-06-ui-shell` | Claude subagent transcript (Pedro's Mac) |
 | M0-07-stream-perf | Sonnet 5.5 | Pedro | 🧊 contract frozen (D-014) · wave 2, after M0-05 merges | — | — |
 | M0-08-browser-screencast | Sonnet 5.5 | Pedro | 🧊 contract frozen (D-014) · wave 2, when a Sonnet slot frees | — | — |
