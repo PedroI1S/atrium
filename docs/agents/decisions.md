@@ -31,3 +31,11 @@ Pedro builds Atrium with a partner, in turns, never at the same time. **Requeste
 - `docs/agents/DRIVER.md` is the baton, managed by `scripts/handoff start|end|status`. `handoff/<date>-<driver>` tags are the checkpoints.
 - Rules are shared through `CLAUDE.md` / `AGENTS.md`, not machine-local memory. `scripts/doctor` checks a machine.
 - Either driver can approve contracts, phase gos and gates; security/approval default changes need both.
+
+## D-008 — 2026-10-24 — Go for the M0 contract phase
+**Pedro gave the go** for the M0 contract phase only: contracts and briefs, no dispatch. Drafted by the orchestrator:
+- `crates/atrium-protocol` (normalized agent events, daemon wire protocol), `crates/atrium-agents` (adapter interface, fixtures);
+- `docs/contracts/m0.md` (layout, ownership, fixture scenarios, UI token architecture);
+- briefs `M0-01` … `M0-09`.
+
+Live provider runs that workers' sandboxes or policy can't do (Codex app-server inside Codex, `agy`/`opencode` under the `agy` worker policy) are recorded by the orchestrator during verification. The worker policy is **not** widened, since that would change a security default and need both drivers. **Contract approval and dispatch: pending.**
