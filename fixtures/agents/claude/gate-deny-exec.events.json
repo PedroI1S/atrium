@@ -1,0 +1,332 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "2bb77c33-1829-46e1-8123-1df9f6afa908",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_019XbngN5nL5D9J8wvHYmBVv",
+    "name": "Bash",
+    "kind": "execute",
+    "title": "touch pwned.txt && ls -l pwned.txt",
+    "input": {
+      "command": "touch pwned.txt && ls -l pwned.txt",
+      "description": "Create pwned.txt in the working directory and confirm it exists"
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_019XbngN5nL5D9J8wvHYmBVv",
+    "status": "denied",
+    "output": null,
+    "error": "commands are not allowed here"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 163,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 6948,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 86.0,
+        "resets_at_ms": 1792900200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 9.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "I did"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "n't create `pwned."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "txt`. The"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " Bash call"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " was blocked by a Pre"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "ToolUse hook with"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " the message \"Denied by"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " Atrium policy: commands"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " are not allowed here,\""
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " so the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " command never ran.\n\nI"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " haven't t"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "ried another"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " way to create the file, since that"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " would work"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " around the policy. If"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " you"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " want it"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " created, you"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "'d need to l"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "ift the rest"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "riction for this wor"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "ktree or run"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": " `"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "touch pwned.txt"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "` yourself in `"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "~/"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "Documents/atrium-"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "wt/M0-01-"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "claude-adapter/."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "orchestration/scratch"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "/record/gate-deny"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "-exec`."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNDtFrhUX2LWkqgsw3yN:1",
+    "kind": "assistant",
+    "text": "I didn't create `pwned.txt`. The Bash call was blocked by a PreToolUse hook with the message \"Denied by Atrium policy: commands are not allowed here,\" so the command never ran.\n\nI haven't tried another way to create the file, since that would work around the policy. If you want it created, you'd need to lift the restriction for this worktree or run `touch pwned.txt` yourself in `~/Documents/atrium-wt/M0-01-claude-adapter/.orchestration/scratch/record/gate-deny-exec`."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 450,
+      "cache_read_tokens": 57778,
+      "cache_write_tokens": 7179,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 450,
+      "cache_read_tokens": 57778,
+      "cache_write_tokens": 7179,
+      "reasoning_tokens": 163,
+      "cost_usd": 0.0022389800000000007
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 450,
+      "cache_read_tokens": 57778,
+      "cache_write_tokens": 7179,
+      "reasoning_tokens": 163,
+      "cost_usd": 0.0022389800000000007
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

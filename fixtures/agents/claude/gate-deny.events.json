@@ -1,0 +1,307 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "e58ec75b-c654-4457-b3b0-109a3b55a4a9",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_015x7884vms2joenDg1jgWVm",
+    "name": "Read",
+    "kind": "read",
+    "title": "~/Documents/atrium-wt/M0-01-claude-adapter/.orchestration/scratch/record/gate-deny/secret.txt",
+    "input": {
+      "file_path": "~/Documents/atrium-wt/M0-01-claude-adapter/.orchestration/scratch/record/gate-deny/secret.txt"
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_015x7884vms2joenDg1jgWVm",
+    "status": "denied",
+    "output": null,
+    "error": "secret.txt is off limits"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 154,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 6861,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 86.0,
+        "resets_at_ms": 1792900200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 9.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "I cou"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "ldn't read `secret."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "txt`. A PreTo"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "olUse hook den"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "ied the read with"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": ":"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " `Denied by Atr"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "ium policy: secret.tx"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "t is off limits`. I"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " didn't try another"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " route"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " to"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " the file, since the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " polic"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "y bl"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "ocks it"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " on"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " purpose.\n\nIf"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " you want its"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " contents, you"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " could"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " read it yourself or change the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " Atrium policy that"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " covers it."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " Tell me if"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " you want me to do"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " something else in"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": " the me"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "antime."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNDsd77cbyDGoPv1jNTe:1",
+    "kind": "assistant",
+    "text": "I couldn't read `secret.txt`. A PreToolUse hook denied the read with: `Denied by Atrium policy: secret.txt is off limits`. I didn't try another route to the file, since the policy blocks it on purpose.\n\nIf you want its contents, you could read it yourself or change the Atrium policy that covers it. Tell me if you want me to do something else in the meantime."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 390,
+      "cache_read_tokens": 57691,
+      "cache_write_tokens": 7083,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 390,
+      "cache_read_tokens": 57691,
+      "cache_write_tokens": 7083,
+      "reasoning_tokens": 163,
+      "cost_usd": 0.00218891
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 390,
+      "cache_read_tokens": 57691,
+      "cache_write_tokens": 7083,
+      "reasoning_tokens": 163,
+      "cost_usd": 0.00218891
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

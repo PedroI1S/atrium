@@ -1,0 +1,170 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "c4fd978b-bde1-4de5-acdd-3a606233f5ee",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_014SQESR49e47NHrBMg9vkyz",
+    "name": "Bash",
+    "kind": "execute",
+    "title": "echo approved",
+    "input": {
+      "command": "echo approved",
+      "description": "Echo the word approved"
+    }
+  },
+  {
+    "type": "approval_requested",
+    "request_id": "7a6cb43a-56ee-4dda-8327-a6dc7c0eb9a7",
+    "call_id": "toolu_014SQESR49e47NHrBMg9vkyz",
+    "name": "Bash",
+    "kind": "execute",
+    "title": "echo approved",
+    "input": {
+      "command": "echo approved",
+      "description": "Echo the word approved"
+    },
+    "reason": null
+  },
+  {
+    "type": "request_resolved",
+    "request_id": "7a6cb43a-56ee-4dda-8327-a6dc7c0eb9a7",
+    "outcome": "approved"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 77,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 7314,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 86.0,
+        "resets_at_ms": 1792900200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 9.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_014SQESR49e47NHrBMg9vkyz",
+    "status": "succeeded",
+    "output": "approved",
+    "error": null
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDw72Ug3hVvi784Krwj:0",
+    "kind": "assistant",
+    "text": "The command `"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDw72Ug3hVvi784Krwj:0",
+    "kind": "assistant",
+    "text": "echo approved` printed:"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDw72Ug3hVvi784Krwj:0",
+    "kind": "assistant",
+    "text": "\n\n```\napproved\n```"
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNDw72Ug3hVvi784Krwj:0",
+    "kind": "assistant",
+    "text": "The command `echo approved` printed:\n\n```\napproved\n```"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 97,
+      "cache_read_tokens": 58144,
+      "cache_write_tokens": 7422,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 97,
+      "cache_read_tokens": 58144,
+      "cache_write_tokens": 7422,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0021147400000000004
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 97,
+      "cache_read_tokens": 58144,
+      "cache_write_tokens": 7422,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0021147400000000004
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

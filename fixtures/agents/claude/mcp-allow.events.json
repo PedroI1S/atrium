@@ -1,0 +1,181 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "103f75b6-e48b-4816-b145-26afa1cea002",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write",
+      "mcp__echo__echo"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_014HvT9h2p2A6kBfznGb5gQW",
+    "name": "ToolSearch",
+    "kind": "search",
+    "title": "select:mcp__echo__echo",
+    "input": {
+      "query": "select:mcp__echo__echo",
+      "max_results": 1
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 141,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 7155,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 86.0,
+        "resets_at_ms": 1792900200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 9.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_014HvT9h2p2A6kBfznGb5gQW",
+    "status": "succeeded",
+    "output": "{\"type\":\"tool_reference\",\"tool_name\":\"mcp__echo__echo\"}",
+    "error": null
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_01Jf2gxDnFDnoqUteVhx65pz",
+    "name": "mcp__echo__echo",
+    "kind": "mcp",
+    "title": "echo.echo",
+    "input": {
+      "text": "ping"
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 195,
+      "cache_read_tokens": 57985,
+      "cache_write_tokens": 7418,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_01Jf2gxDnFDnoqUteVhx65pz",
+    "status": "succeeded",
+    "output": "echo: ping",
+    "error": null
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvAHA1FbPgsgRPS1CG:0",
+    "kind": "assistant",
+    "text": "The echo t"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvAHA1FbPgsgRPS1CG:0",
+    "kind": "assistant",
+    "text": "ool returned `echo: "
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvAHA1FbPgsgRPS1CG:0",
+    "kind": "assistant",
+    "text": "ping`."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNDvAHA1FbPgsgRPS1CG:0",
+    "kind": "assistant",
+    "text": "The echo tool returned `echo: ping`."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 6,
+      "output_tokens": 212,
+      "cache_read_tokens": 90818,
+      "cache_write_tokens": 7506,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 6,
+      "output_tokens": 212,
+      "cache_read_tokens": 90818,
+      "cache_write_tokens": 7506,
+      "reasoning_tokens": 57,
+      "cost_usd": 0.00251598
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 6,
+      "output_tokens": 212,
+      "cache_read_tokens": 90818,
+      "cache_write_tokens": 7506,
+      "reasoning_tokens": 57,
+      "cost_usd": 0.00251598
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

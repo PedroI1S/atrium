@@ -1,0 +1,111 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "b9e93a03-e5b4-48e2-8550-902f585fc676",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDzVFnKMGBBrbeRvhfg:0",
+    "kind": "assistant",
+    "text": "PINEAPPLE"
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNDzVFnKMGBBrbeRvhfg:0",
+    "kind": "assistant",
+    "text": "PINEAPPLE"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 10,
+      "cache_read_tokens": 28422,
+      "cache_write_tokens": 4741,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 87.0,
+        "resets_at_ms": 1792900200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 9.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 10,
+      "cache_read_tokens": 28422,
+      "cache_write_tokens": 4741,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0030329700000000003
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 10,
+      "cache_read_tokens": 28422,
+      "cache_write_tokens": 4741,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0030329700000000003
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

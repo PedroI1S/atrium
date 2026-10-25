@@ -1,0 +1,145 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "f7ec4c95-eecf-4c32-b8df-ffb931f7a097",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_01EtWehESqiabpNEeF2jeXbR",
+    "name": "Read",
+    "kind": "read",
+    "title": "~/Documents/atrium-wt/M0-01-claude-adapter/.orchestration/scratch/record/tool-read/notes.txt",
+    "input": {
+      "file_path": "~/Documents/atrium-wt/M0-01-claude-adapter/.orchestration/scratch/record/tool-read/notes.txt"
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 100,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 6783,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 86.0,
+        "resets_at_ms": 1792900200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 9.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_01EtWehESqiabpNEeF2jeXbR",
+    "status": "succeeded",
+    "output": "1\tThe launch codeword is MARIGOLD.\n2\t",
+    "error": null
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsCGsfghdpNrveKadQ:0",
+    "kind": "assistant",
+    "text": "The codeword is M"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDsCGsfghdpNrveKadQ:0",
+    "kind": "assistant",
+    "text": "ARIGOLD."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNDsCGsfghdpNrveKadQ:0",
+    "kind": "assistant",
+    "text": "The codeword is MARIGOLD."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 115,
+      "cache_read_tokens": 57613,
+      "cache_write_tokens": 6932,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 115,
+      "cache_read_tokens": 57613,
+      "cache_write_tokens": 6932,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00202043
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 115,
+      "cache_read_tokens": 57613,
+      "cache_write_tokens": 6932,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00202043
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

@@ -1,0 +1,162 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "df142524-2e6c-45dc-b85a-35b0586334f8",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDyeFz26ZP5To1jkskT:0",
+    "kind": "assistant",
+    "text": "OK"
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNDyeFz26ZP5To1jkskT:0",
+    "kind": "assistant",
+    "text": "OK"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 4,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 7688,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 87.0,
+        "resets_at_ms": 1792900200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 9.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 4,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 7688,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00179395
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 4,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 7688,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00179395
+    }
+  },
+  {
+    "type": "turn_started",
+    "turn": 2
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDyqi4dVPXeHfKkrWkg:0",
+    "kind": "assistant",
+    "text": "42"
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNDyqi4dVPXeHfKkrWkg:0",
+    "kind": "assistant",
+    "text": "42"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 3,
+      "cache_read_tokens": 28410,
+      "cache_write_tokens": 4742,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 3,
+      "cache_read_tokens": 28410,
+      "cache_write_tokens": 4742,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0012342000000000002
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 2,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 3,
+      "cache_read_tokens": 28410,
+      "cache_write_tokens": 4742,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0012342000000000002
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

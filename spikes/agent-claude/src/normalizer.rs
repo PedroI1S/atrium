@@ -289,6 +289,23 @@ impl ClaudeNormalizer {
             // Progress noise with no Atrium equivalent. Everything else under
             // `system` stays visible as Unmapped.
             "status" | "thinking_tokens" | "post_turn_summary" | "task_summary" => {}
+            // Subagent progress: the parent call's title follows the subagent.
+            "task_progress" => {
+                let call = str_of(v, "tool_use_id");
+                let title = str_of(v, "description");
+                if let (Some(call_id), Some(title)) = (call, title) {
+                    if self.calls.iter().any(|c| c.id == call_id) {
+                        out.push(AgentEvent::ToolCallUpdated {
+                            call_id,
+                            title: Some(title),
+                            kind: None,
+                            input: None,
+                            output_delta: None,
+                            output: None,
+                        });
+                    }
+                }
+            }
             other => out.push(unmapped(&format!("system/{other}"), v)),
         }
     }
@@ -493,8 +510,11 @@ impl ClaudeNormalizer {
                 Some("tool_result") => self.tool_result(item, out),
                 Some("text") => {
                     let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-                    // The CLI's own marker for an interrupted turn.
-                    if !text.starts_with("[Request interrupted by user") {
+                    let from_subagent = v.get("parent_tool_use_id").is_some_and(|p| !p.is_null());
+                    // The CLI's own marker for an interrupted turn, and the
+                    // prompt a subagent starts with (already in the Agent
+                    // call's input).
+                    if !from_subagent && !text.starts_with("[Request interrupted by user") {
                         out.push(unmapped("user/text", item));
                     }
                 }

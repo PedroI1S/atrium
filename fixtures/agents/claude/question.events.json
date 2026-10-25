@@ -1,0 +1,156 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "350254a7-4852-4587-a7b0-9331e42d02c1",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "question_asked",
+    "request_id": "55fbd66e-cf78-4e6a-81f4-e000fccfe65e",
+    "questions": [
+      {
+        "id": "q0",
+        "prompt": "Which color do you prefer?",
+        "options": [
+          {
+            "id": "o0",
+            "label": "Red",
+            "description": "Choose red as your color."
+          },
+          {
+            "id": "o1",
+            "label": "Green",
+            "description": "Choose green as your color."
+          },
+          {
+            "id": "o2",
+            "label": "Blue",
+            "description": "Choose blue as your color."
+          }
+        ],
+        "multi_select": false,
+        "allow_text": true
+      }
+    ]
+  },
+  {
+    "type": "request_resolved",
+    "request_id": "55fbd66e-cf78-4e6a-81f4-e000fccfe65e",
+    "outcome": "answered"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 158,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 7497,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 86.0,
+        "resets_at_ms": 1792900200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 9.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDx6CtJhoZyYjws1eXJ:0",
+    "kind": "assistant",
+    "text": "You prefer red."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNDx6CtJhoZyYjws1eXJ:0",
+    "kind": "assistant",
+    "text": "You prefer red."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 166,
+      "cache_read_tokens": 58327,
+      "cache_write_tokens": 7721,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 166,
+      "cache_read_tokens": 58327,
+      "cache_write_tokens": 7721,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00221087
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 166,
+      "cache_read_tokens": 58327,
+      "cache_write_tokens": 7721,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00221087
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

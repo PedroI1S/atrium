@@ -26,10 +26,11 @@
 //!
 //! # Interrupts
 //!
-//! Claude Code 2.1.308 exits (code 1, no `result`) when it is interrupted
-//! with no message queued. The adapter treats that exit as the end of the
-//! turn, keeps the session, and resumes it (`--resume <id>`) with the next
-//! message.
+//! `SessionCommand::Interrupt` sends the `interrupt` control request. Claude
+//! Code ends the turn with a `result` (`error_during_execution`) and stays
+//! alive for the next message. If it neither answers nor exits within
+//! [`SHUTDOWN_GRACE`], the adapter kills it, reaps it and resumes the session
+//! (`--resume <id>`) with the next message.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;

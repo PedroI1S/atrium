@@ -1,0 +1,169 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "50909723-c365-411a-aa0d-201c6ead867e",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_01VgnJZ4AYwRb6pNq3heY7kc",
+    "name": "Bash",
+    "kind": "execute",
+    "title": "python3 -c 'import time; time.sleep(60)'",
+    "input": {
+      "command": "python3 -c 'import time; time.sleep(60)'",
+      "description": "Sleep 60 seconds in the foreground",
+      "timeout": 120000
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 124,
+      "cache_read_tokens": 28438,
+      "cache_write_tokens": 4695,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 88.0,
+        "resets_at_ms": 1792900200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 9.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_01VgnJZ4AYwRb6pNq3heY7kc",
+    "status": "cancelled",
+    "output": null,
+    "error": "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.\n\nNote: The user's next message may contain a correction or preference. Pay close attention — if they explain what went wrong or how they'd prefer you to work, consider saving that to memory for future sessions."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 124,
+      "cache_read_tokens": 28438,
+      "cache_write_tokens": 4695,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00128558
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "interrupted",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 124,
+      "cache_read_tokens": 28438,
+      "cache_write_tokens": 4695,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00128558
+    }
+  },
+  {
+    "type": "turn_started",
+    "turn": 2
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNE45DXd1XKCPMHQnys6:0",
+    "kind": "assistant",
+    "text": "OK"
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNE45DXd1XKCPMHQnys6:0",
+    "kind": "assistant",
+    "text": "OK"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 4,
+      "cache_read_tokens": 33133,
+      "cache_write_tokens": 318,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 4,
+      "cache_read_tokens": 33133,
+      "cache_write_tokens": 318,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0003971300000000001
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 2,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 4,
+      "cache_read_tokens": 33133,
+      "cache_write_tokens": 318,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0003971300000000001
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

@@ -1,0 +1,385 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "320359dd-a52a-49d5-b228-373938dc6be7",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write",
+      "mcp__echo__echo"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_01AarWy97RUGg83GpPR4C41i",
+    "name": "ToolSearch",
+    "kind": "search",
+    "title": "select:mcp__echo__echo",
+    "input": {
+      "query": "select:mcp__echo__echo",
+      "max_results": 1
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_01AarWy97RUGg83GpPR4C41i",
+    "status": "succeeded",
+    "output": "{\"type\":\"tool_reference\",\"tool_name\":\"mcp__echo__echo\"}",
+    "error": null
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 132,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 7247,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 86.0,
+        "resets_at_ms": 1792900200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 9.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_01LfUgTxpvGACFgksQ2Dnm7b",
+    "name": "mcp__echo__echo",
+    "kind": "mcp",
+    "title": "echo.echo",
+    "input": {
+      "text": "ping"
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_01LfUgTxpvGACFgksQ2Dnm7b",
+    "status": "denied",
+    "output": null,
+    "error": "MCP tools are not allowed here"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 186,
+      "cache_read_tokens": 58077,
+      "cache_write_tokens": 7501,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "The echo"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " call"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " did"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "n't go"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " through."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " A PreToolUse h"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "ook denied it with:"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " `Denied by Atr"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "ium policy: MCP t"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "ools are not allowed here`"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": ". So the echo server"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " returned nothing, and I"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " don't have a result"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " to"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " report.\n\nI"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " didn't retry or"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " look"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " for another"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " way to re"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "ach the server"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": ", since"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " hook is a de"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "liberate policy block"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": ". If you"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " need"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " MCP tools to"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " work"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " in this worktree, that polic"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "y would"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " have"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " to change, and that"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "'s a decision for you or"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": " wh"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "oever owns the Atr"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "ium polic"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "y."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "kind": "assistant",
+    "text": "The echo call didn't go through. A PreToolUse hook denied it with: `Denied by Atrium policy: MCP tools are not allowed here`. So the echo server returned nothing, and I don't have a result to report.\n\nI didn't retry or look for another way to reach the server, since the hook is a deliberate policy block. If you need MCP tools to work in this worktree, that policy would have to change, and that's a decision for you or whoever owns the Atrium policy."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 6,
+      "output_tokens": 388,
+      "cache_read_tokens": 90993,
+      "cache_write_tokens": 7632,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 6,
+      "output_tokens": 388,
+      "cache_read_tokens": 90993,
+      "cache_write_tokens": 7632,
+      "reasoning_tokens": 100,
+      "cost_usd": 0.00263093
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 6,
+      "output_tokens": 388,
+      "cache_read_tokens": 90993,
+      "cache_write_tokens": 7632,
+      "reasoning_tokens": 100,
+      "cost_usd": 0.00263093
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

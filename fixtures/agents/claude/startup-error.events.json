@@ -1,0 +1,12 @@
+[
+  {
+    "type": "error",
+    "message": "There's an issue with the selected model (nonexistent-model-xyz). It may not exist or you may not have access to it. Run --model to pick a different model.",
+    "fatal": true
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 1,
+    "reason": "provider error"
+  }
+]
