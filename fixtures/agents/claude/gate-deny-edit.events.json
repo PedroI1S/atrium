@@ -1,0 +1,410 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "49d9ffb8-792e-4540-a275-294deea0e246",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_0124YDs5YaDrf9Y1gb81cPB9",
+    "name": "Write",
+    "kind": "edit",
+    "title": "~/Documents/atrium-wt/M0-01-claude-adapter/.orchestration/scratch/record/gate-deny-edit/made.txt",
+    "input": {
+      "file_path": "~/Documents/atrium-wt/M0-01-claude-adapter/.orchestration/scratch/record/gate-deny-edit/made.txt",
+      "content": "hello\n"
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_0124YDs5YaDrf9Y1gb81cPB9",
+    "status": "denied",
+    "output": null,
+    "error": "writing files is not allowed here"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 126,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 6915,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 7.000000000000001,
+        "resets_at_ms": 1792918200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 12.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "I couldn't"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " create `made.txt`."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " An"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " Atrium policy hook"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " den"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "ied the Write call"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " with: \""
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "Denied by Atrium polic"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "y: writing files is not all"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "owed here.\"\n\nI ha"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "ven't t"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "ried another"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " route"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": ", such"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " as writing the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " file through Bash,"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " because the hook is"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " a deliberate policy g"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "ate and get"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "ting around it is"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "n't m"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "ine to dec"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "ide. The file do"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "esn't exist y"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "et.\n\nIf you want the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " file created"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": ", you"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " can either l"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "ift the write"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " restriction for this worktree"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " (the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " directory is `.orchest"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "ration/scratch/record/"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "gate-deny-edit"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "`), or tell me to write"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " it"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " another"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " way that you"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "'ve"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " approved. Once"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " writ"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "es"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " are allowed, I'll"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": " create `made.txt` contain"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "ing `hello`"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNH23h3ebKv1UikqrwD6:1",
+    "kind": "assistant",
+    "text": "I couldn't create `made.txt`. An Atrium policy hook denied the Write call with: \"Denied by Atrium policy: writing files is not allowed here.\"\n\nI haven't tried another route, such as writing the file through Bash, because the hook is a deliberate policy gate and getting around it isn't mine to decide. The file doesn't exist yet.\n\nIf you want the file created, you can either lift the write restriction for this worktree (the directory is `.orchestration/scratch/record/gate-deny-edit`), or tell me to write it another way that you've approved. Once writes are allowed, I'll create `made.txt` containing `hello`."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 472,
+      "cache_read_tokens": 57745,
+      "cache_write_tokens": 7109,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 472,
+      "cache_read_tokens": 57745,
+      "cache_write_tokens": 7109,
+      "reasoning_tokens": 140,
+      "cost_usd": 0.00223565
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 472,
+      "cache_read_tokens": 57745,
+      "cache_write_tokens": 7109,
+      "reasoning_tokens": 140,
+      "cost_usd": 0.00223565
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

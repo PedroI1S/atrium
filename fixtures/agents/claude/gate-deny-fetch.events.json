@@ -1,0 +1,347 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "b4c73485-cb03-4e43-9a17-30743d85023e",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_01TqSzSYY1apC5CiZGyc6jdR",
+    "name": "WebFetch",
+    "kind": "fetch",
+    "title": "https://example.com",
+    "input": {
+      "url": "https://example.com",
+      "prompt": "Summarize this page in one sentence."
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_01TqSzSYY1apC5CiZGyc6jdR",
+    "status": "denied",
+    "output": null,
+    "error": "network access is not allowed here"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 87,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 7109,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 7.000000000000001,
+        "resets_at_ms": 1792918200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 12.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "I couldn't f"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "etch https"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "://example.com."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " The WebFetch call"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " was blocked by a Pre"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "ToolUse hook with"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " the message \""
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "Denied by Atrium"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " policy: network access is not all"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "owed here,\" so I have"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " no page"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " content to summarize.\n\nI"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " did"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "n't try another"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " route"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " to"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " the page"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": ", since"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " block"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " is a deliberate policy"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " in"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " this environ"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "ment. If you want"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " summary, you"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "'"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "d"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " need to l"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "ift the network rest"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "riction for this worktree or"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": " run the fetch yourself"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNH3d8yL1MdsgAfAKs7U:1",
+    "kind": "assistant",
+    "text": "I couldn't fetch https://example.com. The WebFetch call was blocked by a PreToolUse hook with the message \"Denied by Atrium policy: network access is not allowed here,\" so I have no page content to summarize.\n\nI didn't try another route to the page, since the block is a deliberate policy in this environment. If you want the summary, you'd need to lift the network restriction for this worktree or run the fetch yourself."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 272,
+      "cache_read_tokens": 57939,
+      "cache_write_tokens": 7266,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 8.0,
+        "resets_at_ms": 1792918200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 12.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 272,
+      "cache_read_tokens": 57939,
+      "cache_write_tokens": 7266,
+      "reasoning_tokens": 51,
+      "cost_usd": 0.00216899
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 272,
+      "cache_read_tokens": 57939,
+      "cache_write_tokens": 7266,
+      "reasoning_tokens": 51,
+      "cost_usd": 0.00216899
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

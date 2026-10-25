@@ -40,12 +40,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     append(&dir, "pids.txt", &std::process::id().to_string());
     append(&dir, "argv.txt", &args.join(" "));
-    if let Some(i) = args.iter().position(|a| a == "--mcp-config") {
-        if let Some(path) = args.get(i + 1) {
-            if let Ok(text) = fs::read_to_string(path) {
-                let _ = fs::write(dir.join("mcp-copy.json"), text);
-            }
-        }
+    if let Some(i) = args.iter().position(|a| a == "--mcp-config")
+        && let Some(path) = args.get(i + 1)
+        && let Ok(text) = fs::read_to_string(path)
+    {
+        let _ = fs::write(dir.join("mcp-copy.json"), text);
     }
     if mode == "exit" {
         eprintln!("fake claude: refusing to start");

@@ -29,11 +29,15 @@ const REQUIRED: &[&str] = &[
 
 const EXTRA: &[&str] = &[
     "gate-deny-exec",
+    "gate-deny-edit",
+    "gate-deny-delete",
+    "gate-deny-fetch",
     "gate-deny-fullaccess",
     "gate-deny-mcp",
     "gate-deny-subagent",
     "mcp-allow",
     "interrupt-resume",
+    "rate-limited",
 ];
 
 fn dir() -> PathBuf {
@@ -208,7 +212,7 @@ fn kind(e: &AgentEvent) -> String {
         .to_owned()
 }
 
-fn finished<'a>(evs: &'a [AgentEvent], status: ToolStatus) -> Vec<&'a AgentEvent> {
+fn finished(evs: &[AgentEvent], status: ToolStatus) -> Vec<&AgentEvent> {
     evs.iter()
         .filter(|e| matches!(e, AgentEvent::ToolCallFinished { status: s, .. } if *s == status))
         .collect()
@@ -317,6 +321,9 @@ fn gate_deny_blocks_reads_and_the_contents_never_appear() {
 #[test]
 fn gate_deny_covers_execute_mcp_subagent_and_full_access() {
     assert_denied("gate-deny-exec", ToolKind::Execute);
+    assert_denied("gate-deny-edit", ToolKind::Edit);
+    assert_denied("gate-deny-delete", ToolKind::Execute);
+    assert_denied("gate-deny-fetch", ToolKind::Fetch);
     assert_denied("gate-deny-fullaccess", ToolKind::Execute);
     assert_denied("gate-deny-mcp", ToolKind::Mcp);
     assert_denied("gate-deny-subagent", ToolKind::Read);
@@ -461,4 +468,27 @@ fn startup_error_is_a_pre_session_failure() {
         AgentEvent::Error { fatal: true, message } if message.contains("nonexistent-model-xyz")
     ));
     assert!(matches!(&evs[1], AgentEvent::SessionEnded { .. }));
+}
+
+#[test]
+fn a_real_refusal_is_one_rate_limited_event_inside_an_established_session() {
+    let evs = events("rate-limited");
+    assert!(matches!(evs[0], AgentEvent::SessionStarted { .. }));
+    let limited: Vec<_> = evs
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::RateLimited { .. }))
+        .collect();
+    assert_eq!(limited.len(), 1, "{evs:#?}");
+    assert!(matches!(
+        limited[0],
+        AgentEvent::RateLimited { resets_at_ms: Some(_), message: Some(m) } if m.contains("limit")
+    ));
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        AgentEvent::TurnCompleted {
+            outcome: TurnOutcome::Failed,
+            ..
+        }
+    )));
+    assert!(!evs.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
 }

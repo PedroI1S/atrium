@@ -145,6 +145,11 @@ pub struct ClaudeNormalizer {
     last_quota: Option<Vec<QuotaWindow>>,
     last_reset_ms: Option<u64>,
     rate_limited: bool,
+    /// A `rejected` rate-limit record was seen; the refusal itself is emitted
+    /// with the message that follows, or at the end of the turn.
+    limit_pending: Option<Option<u64>>,
+    /// Events produced before `SessionStarted`, released right after it.
+    held: Vec<AgentEvent>,
 
     stderr_tail: VecDeque<String>,
 }
@@ -196,6 +201,7 @@ impl ClaudeNormalizer {
         self.ever_had_turn = true;
         self.turn_start_emitted = false;
         self.rate_limited = false;
+        self.limit_pending = None;
         self.error_emitted = false;
         self.msg_usage.clear();
         self.interrupt_requested = false;
@@ -225,6 +231,7 @@ impl ClaudeNormalizer {
             self.turn_start_emitted = true;
             out.push(AgentEvent::TurnStarted { turn: self.turn });
         }
+        out.append(&mut self.held);
     }
 
     /// A record arrived outside any turn the client started (a background
@@ -293,17 +300,17 @@ impl ClaudeNormalizer {
             "task_progress" => {
                 let call = str_of(v, "tool_use_id");
                 let title = str_of(v, "description");
-                if let (Some(call_id), Some(title)) = (call, title) {
-                    if self.calls.iter().any(|c| c.id == call_id) {
-                        out.push(AgentEvent::ToolCallUpdated {
-                            call_id,
-                            title: Some(title),
-                            kind: None,
-                            input: None,
-                            output_delta: None,
-                            output: None,
-                        });
-                    }
+                if let (Some(call_id), Some(title)) = (call, title)
+                    && self.calls.iter().any(|c| c.id == call_id)
+                {
+                    out.push(AgentEvent::ToolCallUpdated {
+                        call_id,
+                        title: Some(title),
+                        kind: None,
+                        input: None,
+                        output_delta: None,
+                        output: None,
+                    });
                 }
             }
             other => out.push(unmapped(&format!("system/{other}"), v)),
@@ -558,10 +565,14 @@ impl ClaudeNormalizer {
             .to_owned();
         match v.get("error").and_then(Value::as_str) {
             Some("rate_limit") => {
+                // A limit is the provider talking, not a startup failure: the
+                // session exists.
+                self.establish(out);
                 self.ensure_turn(out);
+                let resets = self.limit_pending.take().flatten().or(self.last_reset_ms);
                 self.rate_limited = true;
                 out.push(AgentEvent::RateLimited {
-                    resets_at_ms: self.last_reset_ms,
+                    resets_at_ms: resets,
                     message: Some(text),
                 });
             }
@@ -578,6 +589,18 @@ impl ClaudeNormalizer {
     }
 
     fn result(&mut self, v: &Value, out: &mut Vec<AgentEvent>) {
+        if let Some(resets) = self.limit_pending.take()
+            && !self.rate_limited
+        {
+            // A rejection with no refusal message after it.
+            self.establish(out);
+            self.ensure_turn(out);
+            self.rate_limited = true;
+            out.push(AgentEvent::RateLimited {
+                resets_at_ms: resets,
+                message: None,
+            });
+        }
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         if !self.established {
             if is_error {
@@ -672,16 +695,23 @@ impl ClaudeNormalizer {
         if resets.is_some() {
             self.last_reset_ms = resets;
         }
+        let rejected = info.get("status").and_then(Value::as_str) == Some("rejected");
+        if rejected {
+            // A refusal is the provider answering: the session exists.
+            self.establish(out);
+            self.ensure_turn(out);
+        }
         if !windows.is_empty() && self.last_quota.as_ref() != Some(&windows) {
             self.last_quota = Some(windows.clone());
-            out.push(AgentEvent::QuotaUpdated { windows });
+            let ev = AgentEvent::QuotaUpdated { windows };
+            if self.established {
+                out.push(ev);
+            } else {
+                self.held.push(ev);
+            }
         }
-        if info.get("status").and_then(Value::as_str) == Some("rejected") && !self.rate_limited {
-            self.rate_limited = true;
-            out.push(AgentEvent::RateLimited {
-                resets_at_ms: resets,
-                message: None,
-            });
+        if rejected && !self.rate_limited {
+            self.limit_pending = Some(resets);
         }
     }
 

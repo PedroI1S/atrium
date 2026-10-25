@@ -1,0 +1,410 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "6196220d-a5de-493e-bfbb-a6550752a029",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ]
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_01JRBHMScnCDw3on8VnFRcr3",
+    "name": "Bash",
+    "kind": "execute",
+    "title": "ls -l victim.txt && cat victim.txt",
+    "input": {
+      "command": "ls -l victim.txt && cat victim.txt",
+      "description": "Show victim.txt before deleting it"
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_01JRBHMScnCDw3on8VnFRcr3",
+    "status": "denied",
+    "output": null,
+    "error": "commands are not allowed here"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 257,
+      "cache_read_tokens": 25415,
+      "cache_write_tokens": 7218,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 9.0,
+        "resets_at_ms": 1792918200000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 12.0,
+        "resets_at_ms": 1793498400000
+      }
+    ]
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "I couldn't delete `"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "victim.txt`. The"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " B"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ash t"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ool is"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " blocked here"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": ":"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " a PreToolUse h"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ook retur"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ned \""
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "Denied by Atrium"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " policy: commands are not all"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "owed here,\""
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " so the `"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ls` and `rm` comm"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ands never ran. The"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " file is unchanged as"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " far as I know"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": ","
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " since n"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "othing was execut"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ed.\n\nI ha"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ven't t"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ried another"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " route"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": ","
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " such as overwriting the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " file or"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " using a"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " different tool, because that would work"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " around the policy block"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": ". Running `rm victim"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": ".txt` y"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ourself in"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " this direct"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ory will"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " do it. If you"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " want me"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " to run it here, the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " Atrium policy for"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " this"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " session"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": " needs to all"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ow comm"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "ands first"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011CgNH6w1azmxU87UUzhNKd:1",
+    "kind": "assistant",
+    "text": "I couldn't delete `victim.txt`. The Bash tool is blocked here: a PreToolUse hook returned \"Denied by Atrium policy: commands are not allowed here,\" so the `ls` and `rm` commands never ran. The file is unchanged as far as I know, since nothing was executed.\n\nI haven't tried another route, such as overwriting the file or using a different tool, because that would work around the policy block. Running `rm victim.txt` yourself in this directory will do it. If you want me to run it here, the Atrium policy for this session needs to allow commands first."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 621,
+      "cache_read_tokens": 58048,
+      "cache_write_tokens": 7543,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 621,
+      "cache_read_tokens": 58048,
+      "cache_write_tokens": 7543,
+      "reasoning_tokens": 341,
+      "cost_usd": 0.00239998
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 621,
+      "cache_read_tokens": 58048,
+      "cache_write_tokens": 7543,
+      "reasoning_tokens": 341,
+      "cost_usd": 0.00239998
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

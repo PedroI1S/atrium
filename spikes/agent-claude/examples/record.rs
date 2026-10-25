@@ -70,6 +70,8 @@ struct Scenario {
     resume_from: Option<&'static str>,
     /// Files that must not exist after the run (the denied action).
     must_not_exist: Vec<&'static str>,
+    /// Files that must still exist after the run.
+    must_exist: Vec<&'static str>,
     /// Text that must appear in no recorded line.
     canary: Option<&'static str>,
     /// Extra seconds to wait for a second turn the CLI starts on its own.
@@ -96,6 +98,7 @@ fn base(name: &'static str, covers: &'static str, turns: Vec<&'static str>) -> S
         mcp: false,
         resume_from: None,
         must_not_exist: vec![],
+        must_exist: vec![],
         canary: None,
         max_turns: 1,
     }
@@ -187,6 +190,54 @@ fn scenarios() -> Vec<Scenario> {
     s.gate = deny_execute.clone();
     s.gate_text = "deny every Execute-kind call";
     s.must_not_exist = vec!["pwned.txt"];
+    v.push(s);
+
+    let mut s = base(
+        "gate-deny-edit",
+        "Edit/write row: the gate denies the Write tool; the file is not created.",
+        vec!["Use the Write tool to create a file named made.txt that contains the word hello."],
+    );
+    s.gate = Arc::new(|c| {
+        if c.kind == ToolKind::Edit {
+            GateDecision::Deny {
+                reason: "writing files is not allowed here".into(),
+            }
+        } else {
+            GateDecision::Allow
+        }
+    });
+    s.gate_text = "deny every Edit-kind call";
+    s.must_not_exist = vec!["made.txt"];
+    v.push(s);
+
+    let mut s = base(
+        "gate-deny-delete",
+        "Delete/move row: Claude Code has no delete tool, it runs `rm` through Bash; the gate denies it and the file survives.",
+        vec!["Delete the file victim.txt by running: rm victim.txt"],
+    );
+    s.setup = vec![("victim.txt", "do not delete me\n")];
+    s.gate = deny_execute.clone();
+    s.gate_text = "deny every Execute-kind call";
+    s.must_exist = vec!["victim.txt"];
+    v.push(s);
+
+    let mut s = base(
+        "gate-deny-fetch",
+        "Fetch/web row: the gate denies WebFetch before any request is made.",
+        vec![
+            "Use the WebFetch tool to fetch https://example.com and summarize the page in one sentence.",
+        ],
+    );
+    s.gate = Arc::new(|c| {
+        if c.kind == ToolKind::Fetch {
+            GateDecision::Deny {
+                reason: "network access is not allowed here".into(),
+            }
+        } else {
+            GateDecision::Allow
+        }
+    });
+    s.gate_text = "deny every Fetch-kind call";
     v.push(s);
 
     let mut s = base(
@@ -548,6 +599,11 @@ async fn record(s: &Scenario, out_dir: &Path, keep: bool) -> Result<(), String> 
     };
     let run = drive(s, make_config(s, &scratch, resume, &marker), &s.turns).await?;
 
+    for f in &s.must_exist {
+        if !scratch.join(f).exists() {
+            return Err(format!("{f} is gone: the denied action ran"));
+        }
+    }
     for f in &s.must_not_exist {
         if scratch.join(f).exists() {
             return Err(format!("{f} exists: the denied action ran"));
@@ -579,6 +635,9 @@ async fn record(s: &Scenario, out_dir: &Path, keep: bool) -> Result<(), String> 
     let mut lines = run.lines;
     for l in &mut lines {
         trim(&mut l.input);
+    }
+    let merged = merge_split_deltas(&mut lines, &sanitizer);
+    for l in &mut lines {
         sanitizer.input(&mut l.input);
     }
     let mut text = String::new();
@@ -622,6 +681,7 @@ async fn record(s: &Scenario, out_dir: &Path, keep: bool) -> Result<(), String> 
 - Covers: {covers}\n\
 - Spawn to `SessionStarted`: {started}.\n\
 - Events: {n} ({unmapped} unmapped). Counts: {counts:?}\n\
+- Deltas merged because a sanitized value spanned several of them: {merged} block(s).\n\
 - Trimmed before sanitizing: the `initialize` response's `commands`, `agents`, `models` and `account` (personal and bulky) and the `system/init` lists of slash commands, skills, plugins and agents. Nothing the normalizer reads.\n",
         name = s.name,
         model = s.model,
@@ -644,6 +704,85 @@ async fn record(s: &Scenario, out_dir: &Path, keep: bool) -> Result<(), String> 
         let _ = fs::remove_dir_all(&scratch);
     }
     Ok(())
+}
+
+/// A path or name the sanitizer must rewrite can be split across streamed text
+/// deltas, where per-line sanitizing can't see it (and the concatenated message
+/// would leak it). For such blocks the whole text moves into the first delta
+/// and the others become empty. Returns how many blocks were merged.
+fn merge_split_deltas(lines: &mut [FixtureLine], san: &Sanitizer) -> usize {
+    let mut groups: BTreeMap<(String, u64), Vec<usize>> = BTreeMap::new();
+    for (i, l) in lines.iter().enumerate() {
+        let AdapterInput::Stdout { line } = &l.input else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("stream_event") {
+            continue;
+        }
+        let Some(delta) = v.pointer("/event/delta") else {
+            continue;
+        };
+        if !matches!(
+            delta.get("type").and_then(Value::as_str),
+            Some("text_delta" | "thinking_delta")
+        ) {
+            continue;
+        }
+        let key = (
+            v.get("api_message_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            v.pointer("/event/index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        groups.entry(key).or_default().push(i);
+    }
+    let text_of = |l: &FixtureLine| -> (Value, String) {
+        let AdapterInput::Stdout { line } = &l.input else {
+            unreachable!()
+        };
+        let v: Value = serde_json::from_str(line).expect("checked above");
+        let t = v
+            .pointer("/event/delta/text")
+            .or_else(|| v.pointer("/event/delta/thinking"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        (v, t)
+    };
+    let mut merged = 0;
+    for idxs in groups.values() {
+        let pieces: Vec<String> = idxs.iter().map(|&i| text_of(&lines[i]).1).collect();
+        let joined: String = pieces.concat();
+        let piecewise: String = pieces.iter().map(|p| san.text(p)).collect();
+        if san.text(&joined) == piecewise {
+            continue;
+        }
+        merged += 1;
+        for (n, &i) in idxs.iter().enumerate() {
+            let (mut v, _) = text_of(&lines[i]);
+            let new = if n == 0 {
+                joined.clone()
+            } else {
+                String::new()
+            };
+            let key = if v.pointer("/event/delta/text").is_some() {
+                "text"
+            } else {
+                "thinking"
+            };
+            v["event"]["delta"][key] = Value::String(new);
+            lines[i].input = AdapterInput::Stdout {
+                line: v.to_string(),
+            };
+        }
+    }
+    merged
 }
 
 fn first_started_ms(lines: &[FixtureLine]) -> Option<u64> {
@@ -672,35 +811,32 @@ fn trim(input: &mut AdapterInput) {
     if let Some(resp) = v
         .pointer_mut("/response/response")
         .and_then(Value::as_object_mut)
+        && resp.contains_key("commands")
     {
-        if resp.contains_key("commands") {
-            resp.insert("commands".into(), json!([]));
-            resp.insert("agents".into(), json!([]));
-            resp.insert("models".into(), json!([]));
-            resp.insert(
-                "account".into(),
-                json!({"email": "<redacted>", "organization": "<redacted>", "subscriptionType": "<redacted>", "apiProvider": "firstParty"}),
-            );
-            changed = true;
-        }
+        resp.insert("commands".into(), json!([]));
+        resp.insert("agents".into(), json!([]));
+        resp.insert("models".into(), json!([]));
+        resp.insert(
+            "account".into(),
+            json!({"email": "<redacted>", "organization": "<redacted>", "subscriptionType": "<redacted>", "apiProvider": "firstParty"}),
+        );
+        changed = true;
     }
-    if v.get("type").and_then(Value::as_str) == Some("system")
-        && v.get("subtype").and_then(Value::as_str) == Some("init")
-    {
-        if let Some(o) = v.as_object_mut() {
-            for k in [
-                "slash_commands",
-                "terminal_slash_commands",
-                "skills",
-                "plugins",
-                "agents",
-            ] {
-                if o.contains_key(k) {
-                    o.insert(k.into(), json!([]));
-                }
+    let is_init = v.get("type").and_then(Value::as_str) == Some("system")
+        && v.get("subtype").and_then(Value::as_str) == Some("init");
+    if is_init && let Some(o) = v.as_object_mut() {
+        for k in [
+            "slash_commands",
+            "terminal_slash_commands",
+            "skills",
+            "plugins",
+            "agents",
+        ] {
+            if o.contains_key(k) {
+                o.insert(k.into(), json!([]));
             }
-            changed = true;
         }
+        changed = true;
     }
     if changed {
         *line = v.to_string();

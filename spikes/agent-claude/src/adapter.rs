@@ -151,7 +151,7 @@ enum Out {
 
 enum Ev {
     Command(Option<SessionCommand>),
-    Internal(Internal),
+    Internal(Box<Internal>),
     InterruptDeadline,
     Flushed,
     ConsumerGone,
@@ -486,9 +486,7 @@ impl Actor {
     /// Waits up to `grace` for the child to exit, then kills it. Returns its
     /// exit code.
     async fn reap(&mut self, grace: Duration) -> Option<i32> {
-        let Some(mut p) = self.proc.take() else {
-            return None;
-        };
+        let mut p = self.proc.take()?;
         p.stdin_tx = None; // EOF on stdin
         let code = match timeout(grace, p.child.wait()).await {
             Ok(Ok(status)) => status.code(),
@@ -581,7 +579,7 @@ impl Actor {
             let ev = tokio::select! {
                 biased;
                 cmd = self.commands_rx.recv() => Ev::Command(cmd),
-                Some(msg) = self.internal_rx.recv() => Ev::Internal(msg),
+                Some(msg) = self.internal_rx.recv() => Ev::Internal(Box::new(msg)),
                 _ = sleep_until(deadline.unwrap_or_else(TokioInstant::now)), if deadline.is_some() => Ev::InterruptDeadline,
                 permit = self.events_tx.reserve(), if flush => match permit {
                     Ok(p) => {
@@ -601,7 +599,7 @@ impl Actor {
                     self.finish(true).await;
                     break;
                 }
-                Ev::Internal(msg) => self.on_internal(msg),
+                Ev::Internal(msg) => self.on_internal(*msg),
                 Ev::InterruptDeadline => {
                     // The child ignored the interrupt.
                     self.interrupt_deadline = None;
@@ -1028,16 +1026,16 @@ impl Actor {
         let Some(text) = self.queue.pop_front() else {
             return;
         };
-        if self.proc.is_none() {
-            if let Err(e) = self.spawn_proc(false).await {
-                self.push_event(AgentEvent::Error {
-                    message: format!("could not resume the session: {e}"),
-                    fatal: true,
-                });
-                self.feed(AdapterInput::Exit { code: None });
-                self.shutting_down = true;
-                return;
-            }
+        if self.proc.is_none()
+            && let Err(e) = self.spawn_proc(false).await
+        {
+            self.push_event(AgentEvent::Error {
+                message: format!("could not resume the session: {e}"),
+                fatal: true,
+            });
+            self.feed(AdapterInput::Exit { code: None });
+            self.shutting_down = true;
+            return;
         }
         self.write_user(&text);
     }
