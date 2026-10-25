@@ -30,3 +30,9 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 - Worktrees: `../atrium-wt/<task-id>`.
 - Logs (git-ignored): `.orchestration/logs/<task-id>.jsonl`.
 - Raw transcript archive (git-ignored, never committed): `.orchestration/archive/<task-id>/` with `manifest.json`. See PLAN §8.7.
+
+## Prior art (when stuck)
+
+- **MonoCode** (`github.com/hardbeat920/monocode`, MIT): a working reference for driving native agents.
+  - Its OpenCode connector uses `opencode serve` (HTTP API) with per-session permission rules, plus per-prompt model and `variant` (reasoning level) selection. See `src/integrations/harness/providers/opencode/`.
+  - Read it for protocol shapes and edge cases. Copy no code, and credit it in the spike report when it informs a design.
