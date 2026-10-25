@@ -1,0 +1,32 @@
+{
+  "name": "atrium-ui-shell",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@kobalte/core": "^0.13.14",
+    "@tanstack/solid-virtual": "^3.13.49",
+    "@tauri-apps/api": "^2.12.4",
+    "@thisbeyond/solid-dnd": "^0.7.5",
+    "corvu": "^0.7.2",
+    "lucide-solid": "^1.61.0",
+    "smol-toml": "^1.9.1",
+    "solid-js": "^1.9.17"
+  },
+  "devDependencies": {
+    "@shikijs/themes": "^4.5.0",
+    "@tauri-apps/cli": "^2.12.4",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vite-plugin-solid": "^2.11.14",
+    "vitest": "^5.0.5"
+  }
+}
