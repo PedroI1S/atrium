@@ -21,7 +21,7 @@ for windows in 1 3; do
       extra=()
       if [[ "$metric" != rss && -n "${ATRIUM_MEASURE_RUNS:-}" ]]; then extra+=(--runs "$ATRIUM_MEASURE_RUNS"); fi
       echo "Measuring metric=$metric windows=$windows opacity=$opacity (alpha off=1, otherwise=0.6)"
-      python3 scripts/measure.py "$metric" --windows "$windows" --opacity "$opacity" "${args[@]}" "${extra[@]}" \
+      python3 scripts/measure.py "$metric" --windows "$windows" --opacity "$opacity" ${args[@]+"${args[@]}"} ${extra[@]+"${extra[@]}"} \
         | tee "$out/$metric-$windows-$opacity.log"
     done
   done
