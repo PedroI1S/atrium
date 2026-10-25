@@ -128,3 +128,6 @@ This amends D-002's assumption. `scripts/agent-run` now parses the generated `ho
 - **Prototype:** the "Atrium UI directions" artifact, artboard B.
 
 This replaces the M0-06 directions; M0-06's token system and layout mechanics stay. **CR-02** (runtime window-opacity tokens, surface channel tokens, overlay state tokens, folding in CR-01) is a token-contract change proposal for the M1 contract phase. It needs Pedro's approval with the M1 contracts, as does the `macOSPrivateApi` distribution decision that transparency needs.
+
+## D-025 — 2026-10-25 — Add M0-06b (layout B, opacity, pop-out windows) to M0
+**Decided by Pedro.** M0-06 is not redone; its token system, layout mechanics and measurements stand. M0-06b de-risks what layout B adds: both opacity modes (CR-02), pop-out windows, and the performance of the floating-card look. **Worker: GPT-6.1 Sol; reviewer: Sonnet 5.5** (Pedro is short on Claude credits). Sol can't launch GUI apps in its sandbox, so the orchestrator runs the app and the measurements. Brief: `docs/agents/briefs/M0-06b-ui-shell-layout-b.md`. It runs with wave 2, so the D-021/D-022 pause still applies until Pedro says go.
