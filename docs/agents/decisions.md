@@ -85,3 +85,6 @@ A live run of the M0-03 hook-failure harness on `agy` 1.4.7 (with a control case
 - a broken hook **config** fails **open**: when `hooks.json` is unreadable or malformed, `agy` ignores it, and under `--dangerously-skip-permissions` it runs every tool.
 
 This amends D-002's assumption. `scripts/agent-run` now parses the generated `hooks.json` and self-tests the policy before launching an `agy` worker, and refuses otherwise. The M0-03 adapter gets the same check (fix round 2). It's hardening, not a change to any default.
+
+## D-017 — 2026-10-25 — Claude keeps its native settings; external hooks make enforcement Partial
+**Decided by Pedro (owner).** The Claude adapter loads the user's native Claude Code settings by default (user, project, local, managed), as PLAN §3.2 and D-011 require. When those settings define hooks that run outside Atrium's gate, the adapter reports its enforcement level as *Partial*, with the reason (D-012), instead of disabling the user's configuration. A `setting_sources` option lets a user restrict it. Fixtures are recorded with external settings off so they stay machine-independent. This closes the open item from the M0-01 review (finding 1).
