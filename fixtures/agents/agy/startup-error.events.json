@@ -1,7 +1,7 @@
 [
   {
     "type": "error",
-    "message": "Error: invalid or unknown model 'invalid-model-does-not-exist'",
+    "message": "error: invalid model selection (--model \"invalid-model-does-not-exist-000\" --effort \"\"): model invalid-model-does-not-exist-000 is not recognized as a known model or custom model in settings\nAvailable models:\nGemini 4 Argon (Medium)\nGemini 4 Argon (High)\nGemini 4 Argon (Low)\nGemini 3.8 Flash (High)\nGemini 3.8 Flash (Medium)\nGemini 3.8 Flash (Low)\nClaude Opus 5.5 (Low)\nClaude Opus 5.5 (Medium)\nClaude Opus 5.5 (High)\nClaude Sonnet 5.5 (Low)\nClaude Sonnet 5.5 (Medium)\nClaude Sonnet 5.5 (High)\nGPT-OSS 120B (Medium)",
     "fatal": true
   },
   {

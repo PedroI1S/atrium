@@ -2,20 +2,69 @@
   {
     "type": "session_started",
     "provider": "agy",
-    "native_session_id": "11111111-0009-4000-8000-000000000009",
+    "native_session_id": "9dd9761f-2c68-43ff-b47e-3d6700335847",
     "model": "gemini-3.8-flash-medium",
     "tools": [
+      "ask_custom_permission",
+      "ask_permission",
       "ask_question",
+      "browser_click_element",
+      "browser_drag_pixel_to_pixel",
+      "browser_get_dom",
+      "browser_get_network_request",
+      "browser_input",
+      "browser_list_network_requests",
+      "browser_mouse_down",
+      "browser_mouse_up",
+      "browser_move_mouse",
+      "browser_press_key",
+      "browser_refresh_page",
+      "browser_resize_window",
+      "browser_scroll",
+      "browser_scroll_dom",
+      "browser_select_option",
+      "browser_subagent",
       "call_mcp_tool",
-      "edit_file",
+      "capture_browser_console_logs",
+      "capture_browser_screenshot",
+      "click_browser_pixel",
+      "command_status",
+      "define_subagent",
+      "delete_knowledge",
+      "execute_browser_javascript",
       "find_by_name",
+      "finish",
+      "generate_image",
       "grep_search",
+      "invoke_subagent",
+      "list_browser_pages",
       "list_dir",
-      "read_file",
+      "list_permissions",
+      "list_plugin_accounts",
+      "list_resources",
+      "manage_inbox",
+      "manage_subagents",
+      "manage_task",
+      "multi_replace_file_content",
+      "notebook_edit",
+      "notebook_execution",
+      "open_browser_url",
+      "read_browser_page",
+      "read_resource",
+      "read_url_content",
+      "replace_file_content",
       "run_command",
+      "run_workflow",
+      "schedule",
+      "search_marketplace",
       "search_web",
+      "sed_file",
+      "send_command_input",
+      "send_message",
       "view_file",
-      "write_file"
+      "wait",
+      "wait_5_seconds",
+      "write_to_file"
     ]
   },
   {
@@ -23,25 +72,39 @@
     "turn": 1
   },
   {
+    "type": "unmapped",
+    "record_type": "step_update:system_message",
+    "raw": {
+      "event": "step_update",
+      "step_update": {
+        "conversation_id": "9dd9761f-2c68-43ff-b47e-3d6700335847",
+        "step_index": 3,
+        "state": "DONE",
+        "step_type": "system_message",
+        "duration_seconds": 0.000324
+      }
+    }
+  },
+  {
     "type": "message_delta",
-    "message_id": "msg-3",
+    "message_id": "msg-4",
     "kind": "assistant",
-    "text": "The codeword you asked me to remember is COBALT-42."
+    "text": "You asked me to remember the codeword **COBALT-42**.\n"
   },
   {
     "type": "message_completed",
-    "message_id": "msg-3",
+    "message_id": "msg-4",
     "kind": "assistant",
-    "text": "The codeword you asked me to remember is COBALT-42."
+    "text": "You asked me to remember the codeword **COBALT-42**.\n"
   },
   {
     "type": "usage",
     "usage": {
-      "input_tokens": 165,
-      "output_tokens": 12,
-      "cache_read_tokens": 120,
+      "input_tokens": 13990,
+      "output_tokens": 71,
+      "cache_read_tokens": 0,
       "cache_write_tokens": null,
-      "reasoning_tokens": 5,
+      "reasoning_tokens": 54,
       "cost_usd": null
     }
   },
@@ -50,11 +113,11 @@
     "turn": 1,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 165,
-      "output_tokens": 12,
-      "cache_read_tokens": 120,
+      "input_tokens": 13990,
+      "output_tokens": 71,
+      "cache_read_tokens": 0,
       "cache_write_tokens": null,
-      "reasoning_tokens": 5,
+      "reasoning_tokens": 54,
       "cost_usd": null
     }
   },

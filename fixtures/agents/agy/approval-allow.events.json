@@ -2,20 +2,69 @@
   {
     "type": "session_started",
     "provider": "agy",
-    "native_session_id": "11111111-0004-4000-8000-000000000004",
+    "native_session_id": "aa5e78aa-7a97-4e7a-9005-63a497434082",
     "model": "gemini-3.8-flash-medium",
     "tools": [
+      "ask_custom_permission",
+      "ask_permission",
       "ask_question",
+      "browser_click_element",
+      "browser_drag_pixel_to_pixel",
+      "browser_get_dom",
+      "browser_get_network_request",
+      "browser_input",
+      "browser_list_network_requests",
+      "browser_mouse_down",
+      "browser_mouse_up",
+      "browser_move_mouse",
+      "browser_press_key",
+      "browser_refresh_page",
+      "browser_resize_window",
+      "browser_scroll",
+      "browser_scroll_dom",
+      "browser_select_option",
+      "browser_subagent",
       "call_mcp_tool",
-      "edit_file",
+      "capture_browser_console_logs",
+      "capture_browser_screenshot",
+      "click_browser_pixel",
+      "command_status",
+      "define_subagent",
+      "delete_knowledge",
+      "execute_browser_javascript",
       "find_by_name",
+      "finish",
+      "generate_image",
       "grep_search",
+      "invoke_subagent",
+      "list_browser_pages",
       "list_dir",
-      "read_file",
+      "list_permissions",
+      "list_plugin_accounts",
+      "list_resources",
+      "manage_inbox",
+      "manage_subagents",
+      "manage_task",
+      "multi_replace_file_content",
+      "notebook_edit",
+      "notebook_execution",
+      "open_browser_url",
+      "read_browser_page",
+      "read_resource",
+      "read_url_content",
+      "replace_file_content",
       "run_command",
+      "run_workflow",
+      "schedule",
+      "search_marketplace",
       "search_web",
+      "sed_file",
+      "send_command_input",
+      "send_message",
       "view_file",
-      "write_file"
+      "wait",
+      "wait_5_seconds",
+      "write_to_file"
     ]
   },
   {
@@ -40,7 +89,9 @@
     "kind": "execute",
     "title": "echo approved-ok",
     "input": {
-      "CommandLine": "echo approved-ok"
+      "CommandLine": "echo approved-ok",
+      "WaitMsBeforeAsync": 5000,
+      "toolSummary": "Run echo approved-ok"
     },
     "reason": null
   },
@@ -53,29 +104,35 @@
     "type": "tool_call_finished",
     "call_id": "step-2",
     "status": "succeeded",
-    "output": "Command exited with code 0.\n\nCommand output:\napproved-ok\n",
+    "output": "Command exited with code 0.\n\nCommand output:\napproved-ok\r\n",
     "error": null
   },
   {
     "type": "message_delta",
     "message_id": "msg-3",
     "kind": "assistant",
-    "text": "The command ran and printed approved-ok."
+    "text": "The command has been executed:\n\n```\napproved-ok\n```"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg-3",
+    "kind": "assistant",
+    "text": "\n"
   },
   {
     "type": "message_completed",
     "message_id": "msg-3",
     "kind": "assistant",
-    "text": "The command ran and printed approved-ok."
+    "text": "The command has been executed:\n\n```\napproved-ok\n```\n"
   },
   {
     "type": "usage",
     "usage": {
-      "input_tokens": 400,
-      "output_tokens": 27,
+      "input_tokens": 13942,
+      "output_tokens": 136,
       "cache_read_tokens": 0,
       "cache_write_tokens": null,
-      "reasoning_tokens": 9,
+      "reasoning_tokens": 82,
       "cost_usd": null
     }
   },
@@ -84,11 +141,11 @@
     "turn": 1,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 400,
-      "output_tokens": 27,
+      "input_tokens": 13942,
+      "output_tokens": 136,
       "cache_read_tokens": 0,
       "cache_write_tokens": null,
-      "reasoning_tokens": 9,
+      "reasoning_tokens": 82,
       "cost_usd": null
     }
   },

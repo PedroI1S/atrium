@@ -1,2 +1,20 @@
-{"ms":5,"dir":"stderr","line":"Error: invalid or unknown model 'invalid-model-does-not-exist'"}
-{"ms":10,"dir":"exit","code":1}
+{"ms":0,"dir":"command","command":{"type":"send_user_message","text":"Hello"}}
+{"ms":0,"dir":"stdin","line":"{\"event\":\"user\",\"message\":{\"content\":\"Hello\"}}"}
+{"ms":2123,"dir":"stderr","line":"error: invalid model selection (--model \"invalid-model-does-not-exist-000\" --effort \"\"): model invalid-model-does-not-exist-000 is not recognized as a known model or custom model in settings"}
+{"ms":2123,"dir":"stderr","line":"Available models:"}
+{"ms":2123,"dir":"stderr","line":"  Gemini 4 Argon (Medium)"}
+{"ms":2123,"dir":"stderr","line":"  Gemini 4 Argon (High)"}
+{"ms":2123,"dir":"stderr","line":"  Gemini 4 Argon (Low)"}
+{"ms":2123,"dir":"stderr","line":"  Gemini 3.8 Flash (High)"}
+{"ms":2123,"dir":"stderr","line":"  Gemini 3.8 Flash (Medium)"}
+{"ms":2123,"dir":"stderr","line":"  Gemini 3.8 Flash (Low)"}
+{"ms":2123,"dir":"stderr","line":"  Claude Opus 5.5 (Low)"}
+{"ms":2123,"dir":"stderr","line":"  Claude Opus 5.5 (Medium)"}
+{"ms":2123,"dir":"stderr","line":"  Claude Opus 5.5 (High)"}
+{"ms":2124,"dir":"stderr","line":"  Claude Sonnet 5.5 (Low)"}
+{"ms":2124,"dir":"stderr","line":"  Claude Sonnet 5.5 (Medium)"}
+{"ms":2124,"dir":"stderr","line":"  Claude Sonnet 5.5 (High)"}
+{"ms":2124,"dir":"stderr","line":"  GPT-OSS 120B (Medium)"}
+{"ms":2124,"dir":"stdout","line":"{\"event\":\"result\",\"result\":{\"conversation_id\":\"\",\"status\":\"ERROR\",\"response\":\"\",\"error\":\"invalid model selection (--model \\\"invalid-model-does-not-exist-000\\\" --effort \\\"\\\"): model invalid-model-does-not-exist-000 is not recognized as a known model or custom model in settings\\nAvailable models:\\n  Gemini 4 Argon (Medium)\\n  Gemini 4 Argon (High)\\n  Gemini 4 Argon (Low)\\n  Gemini 3.8 Flash (High)\\n  Gemini 3.8 Flash (Medium)\\n  Gemini 3.8 Flash (Low)\\n  Claude Opus 5.5 (Low)\\n  Claude Opus 5.5 (Medium)\\n  Claude Opus 5.5 (High)\\n  Claude Sonnet 5.5 (Low)\\n  Claude Sonnet 5.5 (Medium)\\n  Claude Sonnet 5.5 (High)\\n  GPT-OSS 120B (Medium)\",\"duration_seconds\":0,\"num_turns\":0,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":0}}}"}
+{"ms":2124,"dir":"command","command":{"type":"shutdown"}}
+{"ms":2409,"dir":"exit","code":1}

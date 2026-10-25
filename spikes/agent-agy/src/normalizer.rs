@@ -639,6 +639,19 @@ impl AgyNormalizer {
     }
 
     fn handle_result(&mut self, val: &Value) -> Vec<AgentEvent> {
+        // Before `init`, a `result` can only report a startup failure (e.g. an
+        // invalid model). The pre-session lifecycle is `Error { fatal }` then
+        // `SessionEnded`, both emitted by `handle_exit`, so no turn opens here.
+        if !self.session_started {
+            if self.startup_stderr.is_empty() {
+                let res = val.get("result").unwrap_or(val);
+                if let Some(error) = res.get("error").and_then(Value::as_str) {
+                    self.startup_stderr.push(error.to_owned());
+                }
+            }
+            return Vec::new();
+        }
+
         let mut out = Vec::new();
         self.ensure_turn_started(&mut out);
 

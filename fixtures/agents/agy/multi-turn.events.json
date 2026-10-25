@@ -2,20 +2,69 @@
   {
     "type": "session_started",
     "provider": "agy",
-    "native_session_id": "11111111-0008-4000-8000-000000000008",
+    "native_session_id": "db8e8c0e-9f0b-492e-8ca2-cc97b77e2e28",
     "model": "gemini-3.8-flash-medium",
     "tools": [
+      "ask_custom_permission",
+      "ask_permission",
       "ask_question",
+      "browser_click_element",
+      "browser_drag_pixel_to_pixel",
+      "browser_get_dom",
+      "browser_get_network_request",
+      "browser_input",
+      "browser_list_network_requests",
+      "browser_mouse_down",
+      "browser_mouse_up",
+      "browser_move_mouse",
+      "browser_press_key",
+      "browser_refresh_page",
+      "browser_resize_window",
+      "browser_scroll",
+      "browser_scroll_dom",
+      "browser_select_option",
+      "browser_subagent",
       "call_mcp_tool",
-      "edit_file",
+      "capture_browser_console_logs",
+      "capture_browser_screenshot",
+      "click_browser_pixel",
+      "command_status",
+      "define_subagent",
+      "delete_knowledge",
+      "execute_browser_javascript",
       "find_by_name",
+      "finish",
+      "generate_image",
       "grep_search",
+      "invoke_subagent",
+      "list_browser_pages",
       "list_dir",
-      "read_file",
+      "list_permissions",
+      "list_plugin_accounts",
+      "list_resources",
+      "manage_inbox",
+      "manage_subagents",
+      "manage_task",
+      "multi_replace_file_content",
+      "notebook_edit",
+      "notebook_execution",
+      "open_browser_url",
+      "read_browser_page",
+      "read_resource",
+      "read_url_content",
+      "replace_file_content",
       "run_command",
+      "run_workflow",
+      "schedule",
+      "search_marketplace",
       "search_web",
+      "sed_file",
+      "send_command_input",
+      "send_message",
       "view_file",
-      "write_file"
+      "wait",
+      "wait_5_seconds",
+      "write_to_file"
     ]
   },
   {
@@ -29,19 +78,25 @@
     "text": "TURN_ONE_OK"
   },
   {
+    "type": "message_delta",
+    "message_id": "msg-1",
+    "kind": "assistant",
+    "text": "\n"
+  },
+  {
     "type": "message_completed",
     "message_id": "msg-1",
     "kind": "assistant",
-    "text": "TURN_ONE_OK"
+    "text": "TURN_ONE_OK\n"
   },
   {
     "type": "usage",
     "usage": {
-      "input_tokens": 110,
-      "output_tokens": 5,
+      "input_tokens": 6867,
+      "output_tokens": 33,
       "cache_read_tokens": 0,
       "cache_write_tokens": null,
-      "reasoning_tokens": 4,
+      "reasoning_tokens": 28,
       "cost_usd": null
     }
   },
@@ -50,11 +105,11 @@
     "turn": 1,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 110,
-      "output_tokens": 5,
+      "input_tokens": 6867,
+      "output_tokens": 33,
       "cache_read_tokens": 0,
       "cache_write_tokens": null,
-      "reasoning_tokens": 4,
+      "reasoning_tokens": 28,
       "cost_usd": null
     }
   },
@@ -66,22 +121,22 @@
     "type": "message_delta",
     "message_id": "msg-3",
     "kind": "assistant",
-    "text": "TURN_TWO_OK"
+    "text": "TURN_TWO_OK\n"
   },
   {
     "type": "message_completed",
     "message_id": "msg-3",
     "kind": "assistant",
-    "text": "TURN_TWO_OK"
+    "text": "TURN_TWO_OK\n"
   },
   {
     "type": "usage",
     "usage": {
-      "input_tokens": 130,
-      "output_tokens": 5,
-      "cache_read_tokens": 100,
+      "input_tokens": 13842,
+      "output_tokens": 65,
+      "cache_read_tokens": 0,
       "cache_write_tokens": null,
-      "reasoning_tokens": 4,
+      "reasoning_tokens": 55,
       "cost_usd": null
     }
   },
@@ -90,11 +145,11 @@
     "turn": 2,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 130,
-      "output_tokens": 5,
-      "cache_read_tokens": 100,
+      "input_tokens": 13842,
+      "output_tokens": 65,
+      "cache_read_tokens": 0,
       "cache_write_tokens": null,
-      "reasoning_tokens": 4,
+      "reasoning_tokens": 55,
       "cost_usd": null
     }
   },
