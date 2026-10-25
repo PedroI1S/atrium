@@ -1,12 +1,26 @@
 [
   {
     "type": "error",
-    "message": "{\"code\":-32600,\"message\":\"invalid model id\"}",
+    "message": "{\"code\":-32600,\"message\":\"no rollout found for thread id 00000000-0000-0000-0000-000000000000\"}",
     "fatal": true
   },
   {
+    "type": "unmapped",
+    "record_type": "remoteControl/status/changed",
+    "raw": {
+      "method": "remoteControl/status/changed",
+      "params": {
+        "status": "disabled",
+        "serverName": "<hostname>",
+        "installationId": "<installation-id>",
+        "environmentId": null
+      },
+      "emittedAtMs": 1792920204527
+    }
+  },
+  {
     "type": "session_ended",
-    "exit_code": 1,
+    "exit_code": null,
     "reason": null
   }
 ]

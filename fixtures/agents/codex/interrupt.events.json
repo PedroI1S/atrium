@@ -2,72 +2,469 @@
   {
     "type": "session_started",
     "provider": "codex",
-    "native_session_id": "thread-fixture",
-    "model": "fixture-model",
+    "native_session_id": "01a1725f-0f4a-7330-80eb-190157908a50",
+    "model": "gpt-5.6-luna",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "remoteControl/status/changed",
+    "raw": {
+      "method": "remoteControl/status/changed",
+      "params": {
+        "status": "disabled",
+        "serverName": "<hostname>",
+        "installationId": "<installation-id>",
+        "environmentId": null
+      },
+      "emittedAtMs": 1792920194887
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-1",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920194980
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-2",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920194980
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-3",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920194980
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-4",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920194980
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-3",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920194980
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-4",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920194980
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "status": {
+          "type": "active",
+          "activeFlags": []
+        }
+      },
+      "emittedAtMs": 1792920195064
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "unmapped",
+    "record_type": "account/updated",
+    "raw": {
+      "method": "account/updated",
+      "params": {
+        "authMode": null,
+        "planType": null
+      },
+      "emittedAtMs": 1792920195084
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-4",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920195115
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-3",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920195115
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-3",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920195115
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-4",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920195115
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-1",
+        "status": "ready",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920195187
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "name": "mcp-2",
+        "status": "ready",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920195333
+    }
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": "I"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": "’ll"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": " wait"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": " "
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": "60"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": " seconds"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": ","
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": " then"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": " report"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": " completion"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": "."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_060d7cbaadff38a5016addca84aafc819189d43070bdc5bd5a",
+    "kind": "assistant",
+    "text": "I’ll wait 60 seconds, then report completion."
+  },
+  {
+    "type": "unmapped",
+    "record_type": "turn/moderationMetadata",
+    "raw": {
+      "method": "turn/moderationMetadata",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "turnId": "01a1725f-0fa5-7f13-a797-e7c6c45bce69",
+        "metadata": {
+          "prompt": {
+            "omnimod": {
+              "protection_type": "omnimod",
+              "outputs": [
+                {
+                  "results": [
+                    {
+                      "category_flags": {
+                        "A1": false,
+                        "A2": false,
+                        "A3": false,
+                        "C1": false,
+                        "C11": false,
+                        "C2": false,
+                        "E1": false,
+                        "E2": false,
+                        "E3": false,
+                        "H1": false,
+                        "H2": false,
+                        "H3": false,
+                        "JB1": false,
+                        "K1": false,
+                        "K2": false,
+                        "K3": false,
+                        "K4": false,
+                        "P1": false,
+                        "P2": false,
+                        "P3": false,
+                        "P4": false,
+                        "PD1": false,
+                        "PD4": false,
+                        "S1": false,
+                        "S3+": false,
+                        "S4": false,
+                        "SH": false,
+                        "TXT-C3": false,
+                        "TXT-C4": false,
+                        "V1": false,
+                        "V2+": false,
+                        "V4+": false,
+                        "REFUSED": false,
+                        "CBRN-B1+": false,
+                        "IMG-C1": false,
+                        "IMG-C11": false,
+                        "IMG-C2": false,
+                        "IMG-S1": false,
+                        "IMG-SH": false,
+                        "IMG-V1": false,
+                        "IMG-V2+": false,
+                        "IMG-V4+": false
+                      }
+                    }
+                  ],
+                  "is_blocked": false
+                }
+              ]
+            }
+          },
+          "generation": {},
+          "tool_call": {},
+          "tool_response": {}
+        }
+      },
+      "emittedAtMs": 1792920197208
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "status": {
+          "type": "active",
+          "activeFlags": [
+            "waitingOnApproval"
+          ]
+        }
+      },
+      "emittedAtMs": 1792920197248
+    }
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "call-1",
+    "call_id": "exec-e0caf2c8-6027-40ec-ba79-68d9786f433d",
     "name": "commandExecution",
     "kind": "execute",
-    "title": "sleep 60",
+    "title": "/bin/zsh -lc 'sleep 60'",
     "input": {
-      "id": "call-1",
       "type": "commandExecution",
-      "command": "sleep 60",
+      "id": "exec-e0caf2c8-6027-40ec-ba79-68d9786f433d",
+      "pluginId": null,
+      "scriptPath": null,
+      "command": "/bin/zsh -lc 'sleep 60'",
       "cwd": "/scratch",
+      "processId": null,
+      "source": "agent",
       "status": "inProgress",
       "commandActions": [
         {
           "type": "unknown",
           "command": "sleep 60"
         }
-      ]
+      ],
+      "aggregatedOutput": null,
+      "exitCode": null,
+      "durationMs": null
     }
   },
   {
-    "type": "approval_requested",
-    "request_id": "17",
-    "call_id": "call-1",
-    "name": "commandExecution",
-    "kind": "execute",
-    "title": "sleep 60",
-    "input": {
-      "itemId": "call-1",
-      "threadId": "thread-fixture",
-      "turnId": "turn-1",
-      "startedAtMs": 0,
-      "command": "sleep 60",
-      "cwd": "/scratch",
-      "item": {
-        "id": "call-1",
-        "type": "commandExecution",
-        "command": "sleep 60",
-        "cwd": "/scratch",
-        "status": "inProgress",
-        "commandActions": [
-          {
-            "type": "unknown",
-            "command": "sleep 60"
-          }
-        ]
-      }
-    },
-    "reason": null
+    "type": "usage",
+    "usage": {
+      "input_tokens": 13847,
+      "output_tokens": 145,
+      "cache_read_tokens": 10240,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 49,
+      "cost_usd": null
+    }
   },
   {
-    "type": "request_resolved",
-    "request_id": "17",
-    "outcome": "cancelled"
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "primary",
+        "used_percent": 96.0,
+        "resets_at_ms": 1792937006000
+      },
+      {
+        "name": "secondary",
+        "used_percent": 15.0,
+        "resets_at_ms": 1793523806000
+      }
+    ]
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725f-0f4a-7330-80eb-190157908a50",
+        "status": {
+          "type": "idle"
+        }
+      },
+      "emittedAtMs": 1792920197254
+    }
   },
   {
     "type": "tool_call_finished",
-    "call_id": "call-1",
+    "call_id": "exec-e0caf2c8-6027-40ec-ba79-68d9786f433d",
     "status": "cancelled",
     "output": null,
     "error": null
@@ -76,7 +473,14 @@
     "type": "turn_completed",
     "turn": 1,
     "outcome": "interrupted",
-    "usage": null
+    "usage": {
+      "input_tokens": 13847,
+      "output_tokens": 145,
+      "cache_read_tokens": 10240,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 49,
+      "cost_usd": null
+    }
   },
   {
     "type": "session_ended",

@@ -12,29 +12,13 @@ use atrium_agents::{AdapterInput, GateDecision};
 use atrium_protocol::agent::{AgentEvent, ToolStatus};
 
 /// These invocation-local overrides do not change Codex home, auth, or config files.
-/// `config/read` supplies effective user/project server names. Unknown or managed
-/// sources can still emit records, so fixture redaction is always applied as well.
-pub fn config_overrides(config: &Value) -> Vec<String> {
-    let mut result = vec!["features.hooks=false".into()];
-    if let Some(servers) = config["mcp_servers"].as_object() {
-        for name in servers.keys() {
-            result.push(format!("mcp_servers.{}.enabled=false", json!(name)));
-        }
-    }
-    if let Some(plugins) = config["plugins"].as_object() {
-        for (plugin, config) in plugins {
-            if let Some(servers) = config["mcp_servers"].as_object() {
-                for name in servers.keys() {
-                    result.push(format!(
-                        "plugins.{}.mcp_servers.{}.enabled=false",
-                        json!(plugin),
-                        json!(name)
-                    ));
-                }
-            }
-        }
-    }
-    result
+/// Only hooks are switched off. On codex 0.163, `-c mcp_servers."<n>".enabled=false`
+/// replaces the server table instead of merging into it, and app-server exits with
+/// "invalid transport" before thread/start (orchestrator live run, 2026-10-25). So
+/// user MCP servers stay enabled while recording; their names, collected from
+/// `config/read` by `config_secrets`, are redacted from fixtures instead.
+pub fn config_overrides(_config: &Value) -> Vec<String> {
+    vec!["features.hooks=false".into()]
 }
 
 /// Read the OS hostname rather than trusting a possibly absent/stale HOSTNAME env.

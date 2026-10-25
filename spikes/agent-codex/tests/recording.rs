@@ -191,18 +191,12 @@ fn installed_fixture_corpus_does_not_contain_current_hostname() {
 }
 
 #[test]
-fn overrides_disable_discovered_mcp_and_hooks_without_changing_auth() {
+fn overrides_disable_hooks_only_without_changing_auth() {
     let config = json!({"mcp_servers":{"personal.server":{"command":"/private/bin/server"},"quoted\"server":{"url":"https://private.invalid"}},"plugins":{"example@market":{"mcp_servers":{"plugin-server":{}}}},"forced_login_method":"chatgpt","cli_auth_credentials_store":"keyring"});
     let overrides = recording::config_overrides(&config);
-    assert_eq!(
-        overrides,
-        vec![
-            "features.hooks=false",
-            "mcp_servers.\"personal.server\".enabled=false",
-            "mcp_servers.\"quoted\\\"server\".enabled=false",
-            "plugins.\"example@market\".mcp_servers.\"plugin-server\".enabled=false"
-        ]
-    );
+    // MCP servers are not disabled: on codex 0.163 that override breaks
+    // app-server ("invalid transport"); their names are redacted instead.
+    assert_eq!(overrides, vec!["features.hooks=false"]);
     assert!(CodexAdapter::default().config_overrides.is_empty());
     assert_eq!(
         recording::config_overrides(&Value::Null),

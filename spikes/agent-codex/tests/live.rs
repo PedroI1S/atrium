@@ -496,12 +496,7 @@ async fn recorder_overrides_reach_child_without_changing_normal_sessions() {
         let h = Harness::new();
         let mut expected = vec!["app-server", "--listen", "stdio://"];
         let config_overrides = if recorder {
-            expected.extend([
-                "-c",
-                "features.hooks=false",
-                "-c",
-                "mcp_servers.\"sample\".enabled=false",
-            ]);
+            expected.extend(["-c", "features.hooks=false"]);
             spike_agent_codex::recording::config_overrides(
                 &serde_json::json!({"mcp_servers":{"sample":{}}}),
             )

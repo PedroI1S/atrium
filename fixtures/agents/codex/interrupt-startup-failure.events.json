@@ -1,0 +1,27 @@
+[
+  {
+    "type": "error",
+    "message": "provider exited before session establishment",
+    "fatal": true
+  },
+  {
+    "type": "unmapped",
+    "record_type": "stderr",
+    "raw": "<recorder-stderr>"
+  },
+  {
+    "type": "unmapped",
+    "record_type": "stderr",
+    "raw": "<recorder-stderr>"
+  },
+  {
+    "type": "unmapped",
+    "record_type": "stderr",
+    "raw": "<recorder-stderr>"
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 1,
+    "reason": null
+  }
+]

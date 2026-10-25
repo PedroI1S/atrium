@@ -1,6 +1,7 @@
-{"ms":0,"dir":"stdin","line":"{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"atrium_m0\",\"version\":\"0.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}"}
-{"ms":1,"dir":"stdout","line":"{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\",\"codexHome\":\"/scratch/.codex\",\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}}"}
-{"ms":2,"dir":"stdin","line":"{\"method\":\"initialized\"}"}
-{"ms":3,"dir":"stdin","line":"{\"id\":2,\"method\":\"thread/start\",\"params\":{\"threadId\":null,\"model\":\"invalid-fixture-model\",\"cwd\":\"/scratch\",\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":\"read-only\"}}"}
-{"ms":4,"dir":"stdout","line":"{\"id\":2,\"error\":{\"code\":-32600,\"message\":\"invalid model id\"}}"}
-{"ms":5,"dir":"exit","code":1}
+{"ms":2,"dir":"stdin","line":"{\"id\":\"atrium-init\",\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"atrium_m0\",\"title\":\"Atrium M0\",\"version\":\"0.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}"}
+{"ms":89,"dir":"stdout","line":"{\"id\":\"atrium-init\",\"result\":{\"userAgent\":\"atrium_m0/0.163.0 (Mac OS 27.0.1; arm64) unknown (atrium_m0; 0.0.0)\",\"codexHome\":\"~/.codex\",\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}}"}
+{"ms":89,"dir":"stdin","line":"{\"method\":\"initialized\"}"}
+{"ms":89,"dir":"stdin","line":"{\"id\":\"atrium-thread\",\"method\":\"thread/resume\",\"params\":{\"cwd\":\"/scratch\",\"model\":\"invalid-atrium-fixture-model\",\"sandbox\":\"read-only\",\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"threadId\":\"00000000-0000-0000-0000-000000000000\"}}"}
+{"ms":89,"dir":"stdout","line":"{\"method\":\"remoteControl/status/changed\",\"params\":{\"status\":\"disabled\",\"serverName\":\"<hostname>\",\"installationId\":\"<installation-id>\",\"environmentId\":null},\"emittedAtMs\":1792920204527}"}
+{"ms":150,"dir":"stdout","line":"{\"error\":{\"code\":-32600,\"message\":\"no rollout found for thread id 00000000-0000-0000-0000-000000000000\"},\"id\":\"atrium-thread\"}"}
+{"ms":153,"dir":"exit","code":null}

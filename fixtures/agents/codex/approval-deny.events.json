@@ -2,114 +2,730 @@
   {
     "type": "session_started",
     "provider": "codex",
-    "native_session_id": "thread-fixture",
-    "model": "fixture-model",
+    "native_session_id": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+    "model": "gpt-5.6-luna",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "remoteControl/status/changed",
+    "raw": {
+      "method": "remoteControl/status/changed",
+      "params": {
+        "status": "disabled",
+        "serverName": "<hostname>",
+        "installationId": "<installation-id>",
+        "environmentId": null
+      },
+      "emittedAtMs": 1792920187395
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-1",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187485
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-2",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187486
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-3",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187486
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-4",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187486
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-3",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187486
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-4",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187486
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "status": {
+          "type": "active",
+          "activeFlags": []
+        }
+      },
+      "emittedAtMs": 1792920187569
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "unmapped",
+    "record_type": "account/updated",
+    "raw": {
+      "method": "account/updated",
+      "params": {
+        "authMode": null,
+        "planType": null
+      },
+      "emittedAtMs": 1792920187595
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-3",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187611
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-4",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187611
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-3",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187611
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-4",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187611
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-2",
+        "status": "ready",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187699
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "name": "mcp-1",
+        "status": "ready",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920187887
+    }
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": "I"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": "’m"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": " requesting"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": " approval"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": " to"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": " run"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": " the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": " exact"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": " command"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": " once"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": "."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_017b39ba5ca43b6e016addca7d8fe88191938a1fb3c3533352",
+    "kind": "assistant",
+    "text": "I’m requesting approval to run the exact command once."
+  },
+  {
+    "type": "unmapped",
+    "record_type": "turn/moderationMetadata",
+    "raw": {
+      "method": "turn/moderationMetadata",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "turnId": "01a1725e-f25f-70d3-be41-3b182d99e278",
+        "metadata": {
+          "prompt": {
+            "omnimod": {
+              "protection_type": "omnimod",
+              "outputs": [
+                {
+                  "results": [
+                    {
+                      "category_flags": {
+                        "A1": false,
+                        "A2": false,
+                        "A3": false,
+                        "C1": false,
+                        "C11": false,
+                        "C2": false,
+                        "E1": false,
+                        "E2": false,
+                        "E3": false,
+                        "H1": false,
+                        "H2": false,
+                        "H3": false,
+                        "JB1": false,
+                        "K1": false,
+                        "K2": false,
+                        "K3": false,
+                        "K4": false,
+                        "P1": false,
+                        "P2": false,
+                        "P3": false,
+                        "P4": false,
+                        "PD1": false,
+                        "PD4": false,
+                        "S1": false,
+                        "S3+": false,
+                        "S4": false,
+                        "SH": false,
+                        "TXT-C3": false,
+                        "TXT-C4": false,
+                        "V1": false,
+                        "V2+": false,
+                        "V4+": false,
+                        "REFUSED": false,
+                        "CBRN-B1+": false,
+                        "IMG-C1": false,
+                        "IMG-C11": false,
+                        "IMG-C2": false,
+                        "IMG-S1": false,
+                        "IMG-SH": false,
+                        "IMG-V1": false,
+                        "IMG-V2+": false,
+                        "IMG-V4+": false
+                      }
+                    }
+                  ],
+                  "is_blocked": false
+                }
+              ]
+            }
+          },
+          "generation": {},
+          "tool_call": {},
+          "tool_response": {}
+        }
+      },
+      "emittedAtMs": 1792920190109
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "status": {
+          "type": "active",
+          "activeFlags": [
+            "waitingOnApproval"
+          ]
+        }
+      },
+      "emittedAtMs": 1792920190136
+    }
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "call-1",
+    "call_id": "exec-7ef0a8bb-7b6d-45c9-9c9b-8801aa9c918b",
     "name": "commandExecution",
     "kind": "execute",
-    "title": "python3 -c 'print(42)'",
+    "title": "/bin/zsh -lc \"python3 -c 'print(42)'\"",
     "input": {
-      "id": "call-1",
       "type": "commandExecution",
-      "command": "python3 -c 'print(42)'",
+      "id": "exec-7ef0a8bb-7b6d-45c9-9c9b-8801aa9c918b",
+      "pluginId": null,
+      "scriptPath": null,
+      "command": "/bin/zsh -lc \"python3 -c 'print(42)'\"",
       "cwd": "/scratch",
+      "processId": null,
+      "source": "agent",
       "status": "inProgress",
       "commandActions": [
         {
           "type": "unknown",
           "command": "python3 -c 'print(42)'"
         }
-      ]
+      ],
+      "aggregatedOutput": null,
+      "exitCode": null,
+      "durationMs": null
     }
   },
   {
     "type": "approval_requested",
-    "request_id": "17",
-    "call_id": "call-1",
+    "request_id": "0",
+    "call_id": "exec-7ef0a8bb-7b6d-45c9-9c9b-8801aa9c918b",
     "name": "commandExecution",
     "kind": "execute",
-    "title": "python3 -c 'print(42)'",
+    "title": "/bin/zsh -lc \"python3 -c 'print(42)'\"",
     "input": {
-      "itemId": "call-1",
-      "threadId": "thread-fixture",
-      "turnId": "turn-1",
-      "startedAtMs": 0,
-      "command": "python3 -c 'print(42)'",
+      "kind": "command",
+      "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+      "turnId": "01a1725e-f25f-70d3-be41-3b182d99e278",
+      "itemId": "exec-7ef0a8bb-7b6d-45c9-9c9b-8801aa9c918b",
+      "startedAtMs": 1792920190136,
+      "environmentId": "local",
+      "reason": "Run the exact Python command requested by the user.",
+      "command": "/bin/zsh -lc \"python3 -c 'print(42)'\"",
       "cwd": "/scratch",
+      "commandActions": [
+        {
+          "type": "unknown",
+          "command": "python3 -c 'print(42)'"
+        }
+      ],
+      "proposedExecpolicyAmendment": [
+        "python3",
+        "-c",
+        "print(42)"
+      ],
+      "availableDecisions": [
+        "accept",
+        {
+          "acceptWithExecpolicyAmendment": {
+            "execpolicy_amendment": [
+              "python3",
+              "-c",
+              "print(42)"
+            ]
+          }
+        },
+        "cancel"
+      ],
       "item": {
-        "id": "call-1",
         "type": "commandExecution",
-        "command": "python3 -c 'print(42)'",
+        "id": "exec-7ef0a8bb-7b6d-45c9-9c9b-8801aa9c918b",
+        "pluginId": null,
+        "scriptPath": null,
+        "command": "/bin/zsh -lc \"python3 -c 'print(42)'\"",
         "cwd": "/scratch",
+        "processId": null,
+        "source": "agent",
         "status": "inProgress",
         "commandActions": [
           {
             "type": "unknown",
             "command": "python3 -c 'print(42)'"
           }
-        ]
+        ],
+        "aggregatedOutput": null,
+        "exitCode": null,
+        "durationMs": null
       }
     },
-    "reason": null
+    "reason": "Run the exact Python command requested by the user."
   },
   {
     "type": "request_resolved",
-    "request_id": "17",
+    "request_id": "0",
     "outcome": "denied"
   },
   {
     "type": "tool_call_updated",
-    "call_id": "call-1",
+    "call_id": "exec-7ef0a8bb-7b6d-45c9-9c9b-8801aa9c918b",
     "title": null,
     "kind": "execute",
     "input": {
-      "id": "call-1",
       "type": "commandExecution",
-      "command": "python3 -c 'print(42)'",
+      "id": "exec-7ef0a8bb-7b6d-45c9-9c9b-8801aa9c918b",
+      "pluginId": null,
+      "scriptPath": null,
+      "command": "/bin/zsh -lc \"python3 -c 'print(42)'\"",
       "cwd": "/scratch",
+      "processId": null,
+      "source": "agent",
       "status": "declined",
       "commandActions": [
         {
           "type": "unknown",
           "command": "python3 -c 'print(42)'"
         }
-      ]
+      ],
+      "aggregatedOutput": null,
+      "exitCode": null,
+      "durationMs": null
     },
     "output_delta": null,
     "output": null
   },
   {
     "type": "tool_call_finished",
-    "call_id": "call-1",
+    "call_id": "exec-7ef0a8bb-7b6d-45c9-9c9b-8801aa9c918b",
     "status": "denied",
     "output": null,
     "error": null
   },
   {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "status": {
+          "type": "active",
+          "activeFlags": []
+        }
+      },
+      "emittedAtMs": 1792920190137
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "stderr",
+    "raw": "<recorder-stderr>"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 13857,
+      "output_tokens": 153,
+      "cache_read_tokens": 10240,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 54,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "primary",
+        "used_percent": 96.0,
+        "resets_at_ms": 1792937006000
+      },
+      {
+        "name": "secondary",
+        "used_percent": 15.0,
+        "resets_at_ms": 1793523806000
+      }
+    ]
+  },
+  {
     "type": "message_delta",
-    "message_id": "message-1",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
     "kind": "assistant",
-    "text": "Denied."
+    "text": "Approval"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
+    "kind": "assistant",
+    "text": " was"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
+    "kind": "assistant",
+    "text": " denied"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
+    "kind": "assistant",
+    "text": ","
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
+    "kind": "assistant",
+    "text": " so"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
+    "kind": "assistant",
+    "text": " I"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
+    "kind": "assistant",
+    "text": " did"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
+    "kind": "assistant",
+    "text": " not"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
+    "kind": "assistant",
+    "text": " retry"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
+    "kind": "assistant",
+    "text": "."
+  },
+  {
+    "type": "unmapped",
+    "record_type": "turn/moderationMetadata",
+    "raw": {
+      "method": "turn/moderationMetadata",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "turnId": "01a1725e-f25f-70d3-be41-3b182d99e278",
+        "metadata": {
+          "prompt": {},
+          "generation": {},
+          "tool_call": {},
+          "tool_response": {}
+        }
+      },
+      "emittedAtMs": 1792920191010
+    }
   },
   {
     "type": "message_completed",
-    "message_id": "message-1",
+    "message_id": "msg_017b39ba5ca43b6e016addca7ed6bc819192f31a39f1dfba78",
     "kind": "assistant",
-    "text": "Denied."
+    "text": "Approval was denied, so I did not retry."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 27912,
+      "output_tokens": 182,
+      "cache_read_tokens": 23936,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 67,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "primary",
+        "used_percent": 96.0,
+        "resets_at_ms": 1792937006000
+      },
+      {
+        "name": "secondary",
+        "used_percent": 15.0,
+        "resets_at_ms": 1793523806000
+      }
+    ]
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/readState/changed",
+    "raw": {
+      "method": "thread/readState/changed",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "readState": {
+          "firstUnread": {
+            "type": "turn",
+            "turnId": "01a1725e-f25f-70d3-be41-3b182d99e278"
+          },
+          "revision": "71c7ce35-a207-4c69-b11e-8a0b3696f66d"
+        }
+      },
+      "emittedAtMs": 1792920191027
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725e-f207-7d51-b1ef-25a44b47d974",
+        "status": {
+          "type": "idle"
+        }
+      },
+      "emittedAtMs": 1792920191027
+    }
   },
   {
     "type": "turn_completed",
     "turn": 1,
     "outcome": "completed",
-    "usage": null
+    "usage": {
+      "input_tokens": 27912,
+      "output_tokens": 182,
+      "cache_read_tokens": 23936,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 67,
+      "cost_usd": null
+    }
   },
   {
     "type": "session_ended",

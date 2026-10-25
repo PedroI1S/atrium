@@ -2,60 +2,585 @@
   {
     "type": "session_started",
     "provider": "codex",
-    "native_session_id": "thread-fixture",
-    "model": "fixture-model",
+    "native_session_id": "01a1725f-0187-7660-9b00-31b137eb6747",
+    "model": "gpt-5.6-luna",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "remoteControl/status/changed",
+    "raw": {
+      "method": "remoteControl/status/changed",
+      "params": {
+        "status": "disabled",
+        "serverName": "<hostname>",
+        "installationId": "<installation-id>",
+        "environmentId": null
+      },
+      "emittedAtMs": 1792920191364
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-1",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191458
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-2",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191458
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-3",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191458
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-4",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191458
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-3",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191458
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-2",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191458
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "status": {
+          "type": "active",
+          "activeFlags": []
+        }
+      },
+      "emittedAtMs": 1792920191541
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
-    "type": "question_asked",
-    "request_id": "question-1",
-    "questions": [
-      {
-        "id": "color",
-        "prompt": "Choose a color",
-        "options": [
-          {
-            "id": "0",
-            "label": "Red",
-            "description": "Warm"
+    "type": "unmapped",
+    "record_type": "account/updated",
+    "raw": {
+      "method": "account/updated",
+      "params": {
+        "authMode": null,
+        "planType": null
+      },
+      "emittedAtMs": 1792920191568
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-2",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191585
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-3",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191585
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-2",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191585
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-3",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191585
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-4",
+        "status": "ready",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191667
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "name": "mcp-1",
+        "status": "ready",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920191836
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "stderr",
+    "raw": "<recorder-stderr>"
+  },
+  {
+    "type": "unmapped",
+    "record_type": "turn/moderationMetadata",
+    "raw": {
+      "method": "turn/moderationMetadata",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "turnId": "01a1725f-01e3-7d01-af0c-a934ccbc2e8e",
+        "metadata": {
+          "prompt": {
+            "omnimod": {
+              "protection_type": "omnimod",
+              "outputs": [
+                {
+                  "results": [
+                    {
+                      "category_flags": {
+                        "A1": false,
+                        "A2": false,
+                        "A3": false,
+                        "C1": false,
+                        "C11": false,
+                        "C2": false,
+                        "E1": false,
+                        "E2": false,
+                        "E3": false,
+                        "H1": false,
+                        "H2": false,
+                        "H3": false,
+                        "JB1": false,
+                        "K1": false,
+                        "K2": false,
+                        "K3": false,
+                        "K4": false,
+                        "P1": false,
+                        "P2": false,
+                        "P3": false,
+                        "P4": false,
+                        "PD1": false,
+                        "PD4": false,
+                        "S1": false,
+                        "S3+": false,
+                        "S4": false,
+                        "SH": false,
+                        "TXT-C3": false,
+                        "TXT-C4": false,
+                        "V1": false,
+                        "V2+": false,
+                        "V4+": false,
+                        "REFUSED": false,
+                        "CBRN-B1+": false,
+                        "IMG-C1": false,
+                        "IMG-C11": false,
+                        "IMG-C2": false,
+                        "IMG-S1": false,
+                        "IMG-SH": false,
+                        "IMG-V1": false,
+                        "IMG-V2+": false,
+                        "IMG-V4+": false
+                      }
+                    }
+                  ],
+                  "is_blocked": false
+                }
+              ]
+            }
           },
-          {
-            "id": "1",
-            "label": "Blue",
-            "description": "Cool"
-          }
-        ],
-        "multi_select": false,
-        "allow_text": true
+          "generation": {},
+          "tool_call": {},
+          "tool_response": {}
+        }
+      },
+      "emittedAtMs": 1792920193409
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 13851,
+      "output_tokens": 91,
+      "cache_read_tokens": 13696,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 25,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "primary",
+        "used_percent": 96.0,
+        "resets_at_ms": 1792937006000
+      },
+      {
+        "name": "secondary",
+        "used_percent": 15.0,
+        "resets_at_ms": 1793523806000
       }
     ]
   },
   {
-    "type": "request_resolved",
-    "request_id": "question-1",
-    "outcome": "answered"
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "I"
   },
   {
     "type": "message_delta",
-    "message_id": "message-1",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
     "kind": "assistant",
-    "text": "Blue."
+    "text": " can"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "’t"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " use"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " `"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "request"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "_user"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "_input"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "`"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " in"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " current"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " mode"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " Please"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " choose"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": ":"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " **"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "red"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "**"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " or"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": " **"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "blue"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "**"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
+    "kind": "assistant",
+    "text": "."
+  },
+  {
+    "type": "unmapped",
+    "record_type": "turn/moderationMetadata",
+    "raw": {
+      "method": "turn/moderationMetadata",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "turnId": "01a1725f-01e3-7d01-af0c-a934ccbc2e8e",
+        "metadata": {
+          "prompt": {},
+          "generation": {},
+          "tool_call": {},
+          "tool_response": {}
+        }
+      },
+      "emittedAtMs": 1792920194554
+    }
   },
   {
     "type": "message_completed",
-    "message_id": "message-1",
+    "message_id": "msg_0bfeebcc77da1a49016addca8257888191be72c3bd2ddfeb66",
     "kind": "assistant",
-    "text": "Blue."
+    "text": "I can’t use `request_user_input` in the current mode. Please choose: **red** or **blue**."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 27813,
+      "output_tokens": 130,
+      "cache_read_tokens": 27392,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 33,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "primary",
+        "used_percent": 96.0,
+        "resets_at_ms": 1792937006000
+      },
+      {
+        "name": "secondary",
+        "used_percent": 15.0,
+        "resets_at_ms": 1793523806000
+      }
+    ]
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/readState/changed",
+    "raw": {
+      "method": "thread/readState/changed",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "readState": {
+          "firstUnread": {
+            "type": "turn",
+            "turnId": "01a1725f-01e3-7d01-af0c-a934ccbc2e8e"
+          },
+          "revision": "2700d323-318a-493d-a3bc-dca6dfc91770"
+        }
+      },
+      "emittedAtMs": 1792920194569
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725f-0187-7660-9b00-31b137eb6747",
+        "status": {
+          "type": "idle"
+        }
+      },
+      "emittedAtMs": 1792920194569
+    }
   },
   {
     "type": "turn_completed",
     "turn": 1,
     "outcome": "completed",
-    "usage": null
+    "usage": {
+      "input_tokens": 27813,
+      "output_tokens": 130,
+      "cache_read_tokens": 27392,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 33,
+      "cost_usd": null
+    }
   },
   {
     "type": "session_ended",

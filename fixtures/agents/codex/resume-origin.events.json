@@ -1,0 +1,346 @@
+[
+  {
+    "type": "session_started",
+    "provider": "codex",
+    "native_session_id": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+    "model": "gpt-5.6-luna",
+    "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "remoteControl/status/changed",
+    "raw": {
+      "method": "remoteControl/status/changed",
+      "params": {
+        "status": "disabled",
+        "serverName": "<hostname>",
+        "installationId": "<installation-id>",
+        "environmentId": null
+      },
+      "emittedAtMs": 1792920200396
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-1",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200516
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-2",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200516
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-3",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200516
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-4",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200516
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-4",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200516
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-3",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200516
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "account/updated",
+    "raw": {
+      "method": "account/updated",
+      "params": {
+        "authMode": null,
+        "planType": null
+      },
+      "emittedAtMs": 1792920200603
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "status": {
+          "type": "active",
+          "activeFlags": []
+        }
+      },
+      "emittedAtMs": 1792920200619
+    }
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-3",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200706
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-4",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200706
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-4",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200707
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-3",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200707
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-2",
+        "status": "ready",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200777
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "name": "mcp-1",
+        "status": "ready",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920200880
+    }
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_069b6dd4a4103ef5016addca89d14c8191959e95bc59061818",
+    "kind": "assistant",
+    "text": "Hello"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_069b6dd4a4103ef5016addca89d14c8191959e95bc59061818",
+    "kind": "assistant",
+    "text": "!"
+  },
+  {
+    "type": "unmapped",
+    "record_type": "turn/moderationMetadata",
+    "raw": {
+      "method": "turn/moderationMetadata",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "turnId": "01a1725f-2545-7181-88ef-3b8d773f2aa1",
+        "metadata": {
+          "prompt": {},
+          "generation": {},
+          "tool_call": {},
+          "tool_response": {}
+        }
+      },
+      "emittedAtMs": 1792920201917
+    }
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_069b6dd4a4103ef5016addca89d14c8191959e95bc59061818",
+    "kind": "assistant",
+    "text": "Hello!"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 13840,
+      "output_tokens": 6,
+      "cache_read_tokens": 10240,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 0,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "primary",
+        "used_percent": 96.0,
+        "resets_at_ms": 1792937006000
+      },
+      {
+        "name": "secondary",
+        "used_percent": 15.0,
+        "resets_at_ms": 1793523806000
+      }
+    ]
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/readState/changed",
+    "raw": {
+      "method": "thread/readState/changed",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "readState": {
+          "firstUnread": {
+            "type": "turn",
+            "turnId": "01a1725f-2545-7181-88ef-3b8d773f2aa1"
+          },
+          "revision": "dc5a43a5-24a1-484e-af3c-d1f5aeba3cd2"
+        }
+      },
+      "emittedAtMs": 1792920201952
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a1725f-24d7-7c10-8675-66e1cf5886b3",
+        "status": {
+          "type": "idle"
+        }
+      },
+      "emittedAtMs": 1792920201952
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 13840,
+      "output_tokens": 6,
+      "cache_read_tokens": 10240,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 0,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

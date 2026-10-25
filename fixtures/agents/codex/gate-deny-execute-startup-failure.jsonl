@@ -1,0 +1,5 @@
+{"ms":0,"dir":"stdin","line":"{\"id\":\"atrium-init\",\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"atrium_m0\",\"title\":\"Atrium M0\",\"version\":\"0.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}"}
+{"ms":13,"dir":"stderr","line":"<recorder-stderr>"}
+{"ms":13,"dir":"stderr","line":"<recorder-stderr>"}
+{"ms":13,"dir":"stderr","line":"<recorder-stderr>"}
+{"ms":13,"dir":"exit","code":1}

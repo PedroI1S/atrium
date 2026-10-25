@@ -2,82 +2,280 @@
   {
     "type": "session_started",
     "provider": "codex",
-    "native_session_id": "thread-fixture",
-    "model": "fixture-model",
+    "native_session_id": "01a17260-1078-70e2-990b-6e32a3f03919",
+    "model": "gpt-5.6-luna",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "remoteControl/status/changed",
+    "raw": {
+      "method": "remoteControl/status/changed",
+      "params": {
+        "status": "disabled",
+        "serverName": "<hostname>",
+        "installationId": "<installation-id>",
+        "environmentId": null
+      },
+      "emittedAtMs": 1792920260724
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-1",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920260811
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-2",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920260811
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-3",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920260811
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-4",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920260811
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-1",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920260811
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-4",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920260811
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "status": {
+          "type": "active",
+          "activeFlags": []
+        }
+      },
+      "emittedAtMs": 1792920260895
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
-    "type": "tool_call_started",
-    "call_id": "call-1",
-    "name": "fileChange",
-    "kind": "edit",
-    "title": null,
-    "input": {
-      "id": "call-1",
-      "type": "fileChange",
-      "status": "inProgress",
-      "changes": [
-        {
-          "path": "/scratch/public.txt",
-          "kind": {
-            "type": "update",
-            "move_path": null
-          },
-          "diff": "-public\n+updated"
-        }
-      ]
+    "type": "unmapped",
+    "record_type": "account/updated",
+    "raw": {
+      "method": "account/updated",
+      "params": {
+        "authMode": null,
+        "planType": null
+      },
+      "emittedAtMs": 1792920260930
     }
   },
   {
-    "type": "tool_call_updated",
-    "call_id": "call-1",
-    "title": null,
-    "kind": "edit",
-    "input": {
-      "id": "call-1",
-      "type": "fileChange",
-      "status": "completed",
-      "changes": [
-        {
-          "path": "/scratch/public.txt",
-          "kind": {
-            "type": "update",
-            "move_path": null
-          },
-          "diff": "-public\n+updated"
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-1",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920260939
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-4",
+        "status": "starting",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920260939
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-4",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920260939
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-1",
+        "status": "failed",
+        "error": "<mcp-error>",
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920260940
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-3",
+        "status": "ready",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920261027
+    }
+  },
+  {
+    "type": "unmapped",
+    "record_type": "mcpServer/startupStatus/updated",
+    "raw": {
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "name": "mcp-2",
+        "status": "ready",
+        "error": null,
+        "failureReason": null
+      },
+      "emittedAtMs": 1792920261197
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "thread/status/changed",
+    "raw": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "status": {
+          "type": "systemError"
         }
-      ]
-    },
-    "output_delta": null,
-    "output": null
+      },
+      "emittedAtMs": 1792920261950
+    }
   },
   {
-    "type": "tool_call_finished",
-    "call_id": "call-1",
-    "status": "succeeded",
-    "output": null,
-    "error": null
+    "type": "rate_limited",
+    "resets_at_ms": null,
+    "message": "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at 11:03 AM."
   },
   {
-    "type": "message_delta",
-    "message_id": "message-1",
-    "kind": "assistant",
-    "text": "Done."
-  },
-  {
-    "type": "message_completed",
-    "message_id": "message-1",
-    "kind": "assistant",
-    "text": "Done."
+    "type": "unmapped",
+    "record_type": "thread/readState/changed",
+    "raw": {
+      "method": "thread/readState/changed",
+      "params": {
+        "threadId": "01a17260-1078-70e2-990b-6e32a3f03919",
+        "readState": {
+          "firstUnread": {
+            "type": "turn",
+            "turnId": "01a17260-10cd-7bf2-b54d-4cb89227414e"
+          },
+          "revision": "30ac49c1-721f-46e9-88e2-f6417d790fb1"
+        }
+      },
+      "emittedAtMs": 1792920261955
+    }
   },
   {
     "type": "turn_completed",
     "turn": 1,
-    "outcome": "completed",
+    "outcome": "failed",
     "usage": null
   },
   {
