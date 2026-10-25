@@ -1,0 +1,60 @@
+[
+  {
+    "type": "session_started",
+    "provider": "acp",
+    "native_session_id": "ses_tool_read_01",
+    "model": "anthropic/claude-haiku-4-5",
+    "tools": []
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "call_read_1",
+    "name": "read",
+    "kind": "read",
+    "title": "Read hello.txt",
+    "input": {
+      "path": "~/scratch/tool-read/hello.txt"
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "call_read_1",
+    "status": "succeeded",
+    "output": "Hello from Atrium!",
+    "error": null
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg-1",
+    "kind": "assistant",
+    "text": "The file says: Hello from Atrium!"
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg-1",
+    "kind": "assistant",
+    "text": "The file says: Hello from Atrium!"
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 90,
+      "output_tokens": 25,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

@@ -1,0 +1,6 @@
+{"ms":0,"dir":"stdin","line":"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true,\"elicitation\":{\"form\":{}}},\"clientInfo\":{\"name\":\"atrium\",\"version\":\"0.0.0\"}}}"}
+{"ms":10,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true},\"agentInfo\":{\"name\":\"opencode\",\"version\":\"2.1.3\"}}}"}
+{"ms":14,"dir":"stdin","line":"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"~/scratch/startup-error\",\"mcpServers\":[],\"_meta\":{\"model\":\"invalid-provider/nonexistent-model\"}}}"}
+{"ms":25,"dir":"stderr","line":"Error: Model not found: invalid-provider/nonexistent-model"}
+{"ms":28,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"Model not found: invalid-provider/nonexistent-model\"}}"}
+{"ms":32,"dir":"exit","code":1}

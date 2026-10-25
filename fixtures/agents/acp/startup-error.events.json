@@ -1,0 +1,12 @@
+[
+  {
+    "type": "error",
+    "message": "Model not found: invalid-provider/nonexistent-model",
+    "fatal": true
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 1,
+    "reason": "Model not found: invalid-provider/nonexistent-model"
+  }
+]

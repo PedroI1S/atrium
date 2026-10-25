@@ -1,0 +1,15 @@
+{"ms":0,"dir":"stdin","line":"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true,\"elicitation\":{\"form\":{}}},\"clientInfo\":{\"name\":\"atrium\",\"version\":\"0.0.0\"}}}"}
+{"ms":10,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true},\"agentInfo\":{\"name\":\"opencode\",\"version\":\"2.1.3\"}}}"}
+{"ms":14,"dir":"stdin","line":"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"~/scratch/tool-read\",\"mcpServers\":[],\"_meta\":{\"model\":\"anthropic/claude-haiku-4-5\"}}}"}
+{"ms":30,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"ses_tool_read_01\"}}"}
+{"ms":35,"dir":"command","command":{"type":"send_user_message","text":"Read hello.txt and tell me what it says."}}
+{"ms":36,"dir":"stdin","line":"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"ses_tool_read_01\",\"prompt\":[{\"type\":\"text\",\"text\":\"Read hello.txt and tell me what it says.\"}]}}"}
+{"ms":90,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_tool_read_01\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call_read_1\",\"title\":\"Read hello.txt\",\"kind\":\"read\",\"status\":\"in_progress\",\"rawInput\":{\"path\":\"~/scratch/tool-read/hello.txt\"},\"locations\":[{\"path\":\"~/scratch/tool-read/hello.txt\"}],\"_meta\":{\"toolName\":\"read\"}}}}"}
+{"ms":95,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"id\":\"fs-1\",\"method\":\"fs/read_text_file\",\"params\":{\"sessionId\":\"ses_tool_read_01\",\"path\":\"~/scratch/tool-read/hello.txt\",\"_meta\":{\"toolCallId\":\"call_read_1\"}}}"}
+{"ms":96,"dir":"gate","check":{"call_id":"call_read_1","name":"fs/read_text_file","kind":"read","title":"Read ~/scratch/tool-read/hello.txt","input":{"path":"~/scratch/tool-read/hello.txt"}},"decision":{"type":"allow"}}
+{"ms":98,"dir":"stdin","line":"{\"jsonrpc\":\"2.0\",\"id\":\"fs-1\",\"result\":{\"content\":\"Hello from Atrium!\\n\"}}"}
+{"ms":115,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_tool_read_01\",\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call_read_1\",\"status\":\"completed\",\"content\":[{\"type\":\"content\",\"content\":{\"type\":\"text\",\"text\":\"Hello from Atrium!\"}}]}}}"}
+{"ms":150,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_tool_read_01\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"The file says: Hello from Atrium!\"}}}}"}
+{"ms":175,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"totalTokens\":115,\"inputTokens\":90,\"outputTokens\":25}}}"}
+{"ms":180,"dir":"command","command":{"type":"shutdown"}}
+{"ms":185,"dir":"exit","code":0}

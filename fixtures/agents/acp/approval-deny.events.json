@@ -1,0 +1,77 @@
+[
+  {
+    "type": "session_started",
+    "provider": "acp",
+    "native_session_id": "ses_approval_deny_01",
+    "model": "anthropic/claude-haiku-4-5",
+    "tools": []
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "call_bash_deny_1",
+    "name": "bash",
+    "kind": "execute",
+    "title": "rm -rf build",
+    "input": {
+      "command": "rm -rf build"
+    }
+  },
+  {
+    "type": "approval_requested",
+    "request_id": "perm-deny-1",
+    "call_id": "call_bash_deny_1",
+    "name": "bash",
+    "kind": "execute",
+    "title": "rm -rf build",
+    "input": {
+      "command": "rm -rf build"
+    },
+    "reason": null
+  },
+  {
+    "type": "request_resolved",
+    "request_id": "perm-deny-1",
+    "outcome": "denied"
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "call_bash_deny_1",
+    "status": "denied",
+    "output": null,
+    "error": "destructive command rejected by user"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg-1",
+    "kind": "assistant",
+    "text": "Understood, I did not run `rm -rf build`."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg-1",
+    "kind": "assistant",
+    "text": "Understood, I did not run `rm -rf build`."
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 82,
+      "output_tokens": 23,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

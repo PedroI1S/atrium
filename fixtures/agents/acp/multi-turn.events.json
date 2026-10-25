@@ -1,0 +1,93 @@
+[
+  {
+    "type": "session_started",
+    "provider": "acp",
+    "native_session_id": "ses_multi_01",
+    "model": "anthropic/claude-haiku-4-5",
+    "tools": []
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "message_delta",
+    "message_id": "thought-1",
+    "kind": "reasoning",
+    "text": "Storing codeword cobalt."
+  },
+  {
+    "type": "plan_updated",
+    "entries": [
+      {
+        "content": "Record codeword",
+        "status": "completed"
+      }
+    ]
+  },
+  {
+    "type": "message_completed",
+    "message_id": "thought-1",
+    "kind": "reasoning",
+    "text": "Storing codeword cobalt."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg-2",
+    "kind": "assistant",
+    "text": "I will remember cobalt."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg-2",
+    "kind": "assistant",
+    "text": "I will remember cobalt."
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 30,
+      "output_tokens": 18,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 6,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "turn_started",
+    "turn": 2
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg-3",
+    "kind": "assistant",
+    "text": "The codeword is cobalt."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg-3",
+    "kind": "assistant",
+    "text": "The codeword is cobalt."
+  },
+  {
+    "type": "turn_completed",
+    "turn": 2,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 52,
+      "output_tokens": 12,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

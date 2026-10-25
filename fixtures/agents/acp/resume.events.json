@@ -1,0 +1,43 @@
+[
+  {
+    "type": "session_started",
+    "provider": "acp",
+    "native_session_id": "ses_multi_01",
+    "model": "anthropic/claude-haiku-4-5",
+    "tools": []
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg-1",
+    "kind": "assistant",
+    "text": "The codeword from the previous session is cobalt."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg-1",
+    "kind": "assistant",
+    "text": "The codeword from the previous session is cobalt."
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 60,
+      "output_tokens": 15,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

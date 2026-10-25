@@ -1,0 +1,12 @@
+{"ms":0,"dir":"stdin","line":"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true,\"elicitation\":{\"form\":{}}},\"clientInfo\":{\"name\":\"atrium\",\"version\":\"0.0.0\"}}}"}
+{"ms":10,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true},\"agentInfo\":{\"name\":\"opencode\",\"version\":\"2.1.3\"}}}"}
+{"ms":14,"dir":"stdin","line":"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"~/scratch/interrupt\",\"mcpServers\":[],\"_meta\":{\"model\":\"anthropic/claude-haiku-4-5\"}}}"}
+{"ms":28,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"ses_interrupt_01\"}}"}
+{"ms":32,"dir":"command","command":{"type":"send_user_message","text":"Run a slow command that sleeps for 30 seconds."}}
+{"ms":33,"dir":"stdin","line":"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"ses_interrupt_01\",\"prompt\":[{\"type\":\"text\",\"text\":\"Run a slow command that sleeps for 30 seconds.\"}]}}"}
+{"ms":75,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_interrupt_01\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call_slow_1\",\"title\":\"sleep 30\",\"kind\":\"execute\",\"status\":\"in_progress\",\"rawInput\":{\"command\":\"sleep 30\"},\"_meta\":{\"toolName\":\"bash\"}}}}"}
+{"ms":110,"dir":"command","command":{"type":"interrupt"}}
+{"ms":111,"dir":"stdin","line":"{\"jsonrpc\":\"2.0\",\"method\":\"session/cancel\",\"params\":{\"sessionId\":\"ses_interrupt_01\"}}"}
+{"ms":130,"dir":"stdout","line":"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"cancelled\",\"usage\":{\"totalTokens\":52,\"inputTokens\":44,\"outputTokens\":8}}}"}
+{"ms":140,"dir":"command","command":{"type":"shutdown"}}
+{"ms":145,"dir":"exit","code":0}

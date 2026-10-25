@@ -1,1 +1,7 @@
-//! Spike M0-04: see `docs/agents/briefs/M0-04-*.md`. Owned by that task.
+#![allow(clippy::collapsible_if)]
+
+pub mod adapter;
+pub mod normalizer;
+
+pub use adapter::{AcpAdapter, ClientCapabilityConfig};
+pub use normalizer::AcpNormalizer;
