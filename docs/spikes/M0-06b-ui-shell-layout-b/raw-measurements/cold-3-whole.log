@@ -1,0 +1,17 @@
+config: ATRIUM_THEME=atrium-calm-dark ATRIUM_PRESET=default ATRIUM_TAB=auth ATRIUM_WINDOWS=3 ATRIUM_OPACITY=whole ATRIUM_PALETTE= ATRIUM_RIGHT_TAB=diff  bin=src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell
+host: 27.0.1, Apple M4
+verified app configuration: {"applied": {"accessibilityOpaque": false, "chromeAlpha": 1, "contentAlpha": 1, "error": "", "nativeAlpha": 0.6, "vibrancy": "false"}, "opacity": "whole", "readyWindows": 3, "settings": {"alpha": 0.6, "blur": true, "mode": "whole", "solid": false, "theme": "atrium-calm-dark"}, "windows": 3}
+raw report: {"configuration": {"applied": {"accessibilityOpaque": false, "chromeAlpha": 1, "contentAlpha": 1, "error": "", "nativeAlpha": 0.6, "vibrancy": "false"}, "opacity": "whole", "readyWindows": 3, "settings": {"alpha": 0.6, "blur": true, "mode": "whole", "solid": false, "theme": "atrium-calm-dark"}, "windows": 3}, "dpr": 2, "kind": "startup", "mainEpochMs": 1792963517779.396, "marks": {"firstContentfulPaint": 1792963518170, "firstInputHandled": 1792963540997, "firstPaintRaf": 1792963540964, "jsStart": 1792963517994, "keystrokeDispatched": 1792963540997, "mounted": 1792963518158, "paletteDispatched": 1792963541005, "paletteReady": 1792963541035}, "theme": "atrium-calm-dark", "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)", "viewport": [1360, 860]}
+run  1: exec_to_main=    6.2  main_to_js=  214.6  js_to_mounted=  164.0  first_contentful_paint=  396.8  first_paint_raf2=23190.8  tti_keystroke=23223.8  tti_palette=23261.8
+verified app configuration: {"applied": {"accessibilityOpaque": false, "chromeAlpha": 1, "contentAlpha": 1, "error": "", "nativeAlpha": 0.6, "vibrancy": "false"}, "opacity": "whole", "readyWindows": 3, "settings": {"alpha": 0.6, "blur": true, "mode": "whole", "solid": false, "theme": "atrium-calm-dark"}, "windows": 3}
+raw report: {"configuration": {"applied": {"accessibilityOpaque": false, "chromeAlpha": 1, "contentAlpha": 1, "error": "", "nativeAlpha": 0.6, "vibrancy": "false"}, "opacity": "whole", "readyWindows": 3, "settings": {"alpha": 0.6, "blur": true, "mode": "whole", "solid": false, "theme": "atrium-calm-dark"}, "windows": 3}, "dpr": 2, "kind": "startup", "mainEpochMs": 1792963541647.891, "marks": {"firstContentfulPaint": 1792963542138, "firstInputHandled": 1792963542197, "firstPaintRaf": 1792963542159, "jsStart": 1792963541951, "keystrokeDispatched": 1792963542197, "mounted": 1792963542125, "paletteDispatched": 1792963542201, "paletteReady": 1792963542230}, "theme": "atrium-calm-dark", "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)", "viewport": [1360, 860]}
+run  2: exec_to_main=   18.3  main_to_js=  303.1  js_to_mounted=  174.0  first_contentful_paint=  508.4  first_paint_raf2=  529.4  tti_keystroke=  567.4  tti_palette=  600.4
+Traceback (most recent call last):
+  File "/Users/pedro/Documents/atrium-wt/M0-06b-ui-shell-layout-b/spikes/ui-shell/scripts/measure.py", line 280, in <module>
+    {"cold": cold, "rss": rss, "frames": frames}[a.mode](a)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/Users/pedro/Documents/atrium-wt/M0-06b-ui-shell-layout-b/spikes/ui-shell/scripts/measure.py", line 82, in cold
+    r = wait_report(out)
+  File "/Users/pedro/Documents/atrium-wt/M0-06b-ui-shell-layout-b/spikes/ui-shell/scripts/measure.py", line 42, in wait_report
+    raise TimeoutError(path)
+TimeoutError: /var/folders/y7/ch2jnhf54fb3wcbbk9xfdy6w0000gn/T/tmpxktnwp2y.json

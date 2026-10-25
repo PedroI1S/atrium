@@ -1,0 +1,22 @@
+config: ATRIUM_THEME=atrium-calm-dark ATRIUM_PRESET=default ATRIUM_TAB=auth ATRIUM_WINDOWS=3 ATRIUM_OPACITY=off ATRIUM_PALETTE= ATRIUM_RIGHT_TAB=diff  bin=src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell
+host: 27.0.1, Apple M4
+verified app configuration: {"applied": {"accessibilityOpaque": false, "chromeAlpha": 1, "contentAlpha": 1, "error": "", "nativeAlpha": 1, "vibrancy": "false"}, "opacity": "off", "readyWindows": 3, "settings": {"alpha": 1, "blur": true, "mode": "background", "solid": false, "theme": "atrium-calm-dark"}, "windows": 3}
+raw report: {"configuration": {"applied": {"accessibilityOpaque": false, "chromeAlpha": 1, "contentAlpha": 1, "error": "", "nativeAlpha": 1, "vibrancy": "false"}, "opacity": "off", "readyWindows": 3, "settings": {"alpha": 1, "blur": true, "mode": "background", "solid": false, "theme": "atrium-calm-dark"}, "windows": 3}, "dpr": 2, "kind": "startup", "mainEpochMs": 1792963147371.0378, "marks": {"firstContentfulPaint": 1792963147762, "firstInputHandled": 1792963147815, "firstPaintRaf": 1792963147778, "jsStart": 1792963147575, "keystrokeDispatched": 1792963147814, "mounted": 1792963147749, "paletteDispatched": 1792963147819, "paletteReady": 1792963147848}, "theme": "atrium-calm-dark", "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)", "viewport": [1360, 860]}
+idle 10 s after launch:
+  pid  32092  responsible  32092  rss   115.6 MB  footprint   33.0 MB  atrium-ui-shell
+  pid  32095  responsible  32092  rss    37.3 MB  footprint   20.0 MB  com.apple.WebKit.GPU
+  pid  32096  responsible  32092  rss    76.9 MB  footprint   75.0 MB  com.apple.WebKit.WebContent
+  pid  32097  responsible  32092  rss    13.4 MB  footprint    6.1 MB  com.apple.WebKit.Networking
+  pid  32099  responsible  32092  rss    46.9 MB  footprint   30.0 MB  com.apple.WebKit.WebContent
+  pid  32100  responsible  32092  rss    47.3 MB  footprint   30.0 MB  com.apple.WebKit.WebContent
+  (6 WebKit processes belonging to other apps ignored)
+  TOTAL rss 337.4 MB   footprint 194.1 MB   (6 processes)
+idle 30 s after launch:
+  pid  32092  responsible  32092  rss   115.5 MB  footprint   31.0 MB  atrium-ui-shell
+  pid  32095  responsible  32092  rss    37.3 MB  footprint   15.0 MB  com.apple.WebKit.GPU
+  pid  32096  responsible  32092  rss    76.8 MB  footprint   73.0 MB  com.apple.WebKit.WebContent
+  pid  32097  responsible  32092  rss    13.4 MB  footprint    6.0 MB  com.apple.WebKit.Networking
+  pid  32099  responsible  32092  rss    46.8 MB  footprint   29.0 MB  com.apple.WebKit.WebContent
+  pid  32100  responsible  32092  rss    47.1 MB  footprint   29.0 MB  com.apple.WebKit.WebContent
+  (6 WebKit processes belonging to other apps ignored)
+  TOTAL rss 337.1 MB   footprint 183.0 MB   (6 processes)

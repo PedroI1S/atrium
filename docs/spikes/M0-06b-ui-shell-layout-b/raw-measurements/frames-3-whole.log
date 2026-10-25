@@ -1,0 +1,11 @@
+config: ATRIUM_THEME=atrium-calm-dark ATRIUM_PRESET=default ATRIUM_TAB=auth ATRIUM_WINDOWS=3 ATRIUM_OPACITY=whole ATRIUM_PALETTE= ATRIUM_RIGHT_TAB=diff  bin=src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell
+host: 27.0.1, Apple M4
+Traceback (most recent call last):
+  File "/Users/pedro/Documents/atrium-wt/M0-06b-ui-shell-layout-b/spikes/ui-shell/scripts/measure.py", line 280, in <module>
+    {"cold": cold, "rss": rss, "frames": frames}[a.mode](a)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/Users/pedro/Documents/atrium-wt/M0-06b-ui-shell-layout-b/spikes/ui-shell/scripts/measure.py", line 231, in frames
+    r = wait_report(out, timeout=90)
+  File "/Users/pedro/Documents/atrium-wt/M0-06b-ui-shell-layout-b/spikes/ui-shell/scripts/measure.py", line 42, in wait_report
+    raise TimeoutError(path)
+TimeoutError: /var/folders/y7/ch2jnhf54fb3wcbbk9xfdy6w0000gn/T/tmp_b1k1m37.json
