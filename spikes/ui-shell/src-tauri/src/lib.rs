@@ -8,7 +8,9 @@ use serde::Serialize;
 use tauri::{Manager, State, WebviewWindow};
 
 #[cfg(target_os = "macos")]
-use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState, apply_vibrancy, clear_vibrancy};
+use window_vibrancy::{
+    NSVisualEffectMaterial, NSVisualEffectState, apply_vibrancy, clear_vibrancy,
+};
 
 /// Corner radius of the native vibrancy view. Matches the macOS window radius so
 /// the blur doesn't poke out of the rounded corners.
@@ -121,15 +123,15 @@ pub fn run() {
         .setup(|app| {
             // Vibrancy starts on; the frontend turns it off for themes that don't use it.
             #[cfg(target_os = "macos")]
-            if let Some(window) = app.get_webview_window("main") {
-                if let Err(e) = apply_vibrancy(
+            if let Some(window) = app.get_webview_window("main")
+                && let Err(e) = apply_vibrancy(
                     &window,
                     NSVisualEffectMaterial::UnderWindowBackground,
                     Some(NSVisualEffectState::Active),
                     Some(WINDOW_CORNER_RADIUS),
-                ) {
-                    eprintln!("apply_vibrancy failed: {e}");
-                }
+                )
+            {
+                eprintln!("apply_vibrancy failed: {e}");
             }
             let _ = app;
             Ok(())

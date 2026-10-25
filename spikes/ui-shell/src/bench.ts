@@ -19,6 +19,18 @@ export const registerScroller = (el: HTMLElement): void => {
   scroller = el;
 };
 
+/** Main-thread cost of the work the benchmark triggers each frame (JS + forced style/layout), in ms. */
+export interface WorkStats {
+  samples: number;
+  meanMs: number;
+  p95Ms: number;
+  maxMs: number;
+}
+const work = (xs: number[]): WorkStats => {
+  const sorted = [...xs].sort((a, b) => a - b);
+  return { samples: xs.length, meanMs: xs.reduce((s, v) => s + v, 0) / (xs.length || 1), p95Ms: pct(sorted, 0.95), maxMs: sorted[sorted.length - 1] ?? 0 };
+};
+
 export interface FrameStats {
   frames: number;
   seconds: number;
@@ -77,30 +89,51 @@ export function sampleFrames(ms: number, step?: (elapsed: number, dt: number) =>
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Scrolls the 5,000-message transcript upwards at a constant speed (px/s). */
-export async function benchScroll(pxPerSecond: number, ms = 3000): Promise<FrameStats & { pxPerSecond: number; distancePx: number }> {
+/**
+ * Scrolls the 5,000-message transcript upwards at a constant speed (px/s). Besides frame deltas it
+ * times the scroll handler (virtualizer + Solid DOM updates) plus a forced style/layout, which is
+ * the main-thread cost per frame and shows headroom even when rAF is pinned at 60 Hz.
+ */
+export async function benchScroll(pxPerSecond: number, ms = 3000): Promise<FrameStats & { pxPerSecond: number; distancePx: number; handler: WorkStats }> {
   if (!scroller) throw new Error("no transcript registered");
   const el = scroller;
   el.scrollTop = el.scrollHeight;
   await sleep(200);
   const startTop = el.scrollTop;
+  const costs: number[] = [];
+  let t0 = 0;
+  const begin = () => {
+    t0 = performance.now();
+  };
+  const end = () => {
+    void el.offsetHeight; // force style + layout for the rows the handler just rendered
+    costs.push(performance.now() - t0);
+  };
+  window.addEventListener("scroll", begin, true);
+  el.addEventListener("scroll", end);
   const stats = await sampleFrames(ms, (elapsed) => {
     el.scrollTop = Math.max(0, startTop - (pxPerSecond * elapsed) / 1000);
   });
-  return { ...stats, pxPerSecond, distancePx: Math.round(startTop - el.scrollTop) };
+  window.removeEventListener("scroll", begin, true);
+  el.removeEventListener("scroll", end);
+  return { ...stats, pxPerSecond, distancePx: Math.round(startTop - el.scrollTop), handler: work(costs) };
 }
 
 /** Drives the panel sizes every frame, the same state path a pointer drag takes. */
-export async function benchResize(ms = 3000): Promise<FrameStats> {
+export async function benchResize(ms = 3000): Promise<FrameStats & { step: WorkStats }> {
   const base = PRESETS.default.outer;
+  const costs: number[] = [];
   const stats = await sampleFrames(ms, (elapsed) => {
+    const t0 = performance.now();
     const k = (Math.sin((elapsed / 1000) * Math.PI * 2 * 0.8) + 1) / 2; // 0.8 Hz sweep
     const sidebar = 0.14 + 0.14 * k;
     const right = 0.2 + 0.2 * (1 - k);
     batch(() => setOuterSizes([sidebar, 1 - sidebar - right, right]));
+    void document.body.offsetHeight; // force style + layout of every panel
+    costs.push(performance.now() - t0);
   });
   setOuterSizes([...base]);
-  return stats;
+  return { ...stats, step: work(costs) };
 }
 
 const fmt = (s: FrameStats) => `${s.fps.toFixed(1)} fps · p50 ${s.p50Ms.toFixed(1)} · p95 ${s.p95Ms.toFixed(1)} · p99 ${s.p99Ms.toFixed(1)} · max ${s.maxMs.toFixed(1)} ms · >16.7 ms: ${s.over16_7ms}/${s.frames}`;

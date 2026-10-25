@@ -526,11 +526,15 @@
   color: var(--text-faint);
 }
 .composer-bar {
+  min-width: 0;
+  overflow: hidden;
   display: flex;
   align-items: center;
   gap: calc(var(--space-unit) * 1.5);
 }
 .chip {
+  white-space: nowrap;
+  flex: none;
   display: inline-flex;
   align-items: center;
   gap: 4px;

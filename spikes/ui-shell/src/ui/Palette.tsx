@@ -58,9 +58,9 @@ function sections(): Section[] {
   ];
 }
 
-/** Case-insensitive subsequence-friendly match: every word of the query must appear in the label or hint. */
+/** Case-insensitive subsequence-friendly match: every word of the query must appear in the label. */
 function matches(c: Command, q: string): boolean {
-  const hay = `${c.label} ${c.hint ?? ""}`.toLowerCase();
+  const hay = c.label.toLowerCase();
   return q
     .toLowerCase()
     .split(/\s+/)
