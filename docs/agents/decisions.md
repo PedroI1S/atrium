@@ -118,3 +118,13 @@ This amends D-002's assumption. `scripts/agent-run` now parses the generated `ho
 - **Window opacity setting**: fundamental, many users want it.
 
 **Next step (not started; waits on Pedro's go)**: an Opus design session produces a clickable design artifact with 3–4 layout options (sidebar and chat grouping, settings plus the advanced pane, a popped-out window, light and dark). Pedro picks; the result becomes the M1 UI spec and token values (PLAN §3.20).
+
+## D-024 — 2026-10-25 — UI direction: layout B "Floating spaces", Atrium Calm themes
+**Chosen by Pedro** in the design session (Opus, `docs/design/ui-direction.md`).
+- **Layout:** B, *Floating spaces*. It also takes C's centered file path in the editor header, and keeps B's inbox list.
+- **Look:** near-monochrome greys with one ink accent; colour only where it carries meaning. References: Things/Bear/Craft for calm, Arc/Zed for minimal chrome.
+- **Opacity:** both modes (background-only and whole window), the user picks.
+- **Draft themes:** `docs/design/themes/atrium-calm-{light,dark}.toml`.
+- **Prototype:** the "Atrium UI directions" artifact, artboard B.
+
+This replaces the M0-06 directions; M0-06's token system and layout mechanics stay. **CR-02** (runtime window-opacity tokens, surface channel tokens, overlay state tokens, folding in CR-01) is a token-contract change proposal for the M1 contract phase. It needs Pedro's approval with the M1 contracts, as does the `macOSPrivateApi` distribution decision that transparency needs.
