@@ -8,7 +8,8 @@
 //! `fixtures/agents/claude/<scenario>.{jsonl,events.json,md}`.
 //!
 //! Options: `--out DIR` (default `fixtures/agents/claude`), `--keep` (keep the
-//! scratch dir; it is git-ignored either way).
+//! scratch dir; it is git-ignored either way), `--resanitize` (re-apply the
+//! current scrubbing to the fixtures on disk, offline).
 //! Environment: `ATRIUM_RECORD_SECRETS=a,b` adds values the sanitizer must
 //! redact (for example your e-mail address).
 //!
@@ -72,6 +73,8 @@ struct Scenario {
     must_not_exist: Vec<&'static str>,
     /// Files that must still exist after the run.
     must_exist: Vec<&'static str>,
+    /// A command line the agent must have attempted (and the gate denied).
+    must_attempt: Option<&'static str>,
     /// Text that must appear in no recorded line.
     canary: Option<&'static str>,
     /// Extra seconds to wait for a second turn the CLI starts on its own.
@@ -99,6 +102,7 @@ fn base(name: &'static str, covers: &'static str, turns: Vec<&'static str>) -> S
         resume_from: None,
         must_not_exist: vec![],
         must_exist: vec![],
+        must_attempt: None,
         canary: None,
         max_turns: 1,
     }
@@ -213,12 +217,15 @@ fn scenarios() -> Vec<Scenario> {
     let mut s = base(
         "gate-deny-delete",
         "Delete/move row: Claude Code has no delete tool, it runs `rm` through Bash; the gate denies it and the file survives.",
-        vec!["Delete the file victim.txt by running: rm victim.txt"],
+        vec![
+            "Use the Bash tool to run exactly this command and nothing else, not even a check first: rm victim.txt   Then tell me whether it worked.",
+        ],
     );
     s.setup = vec![("victim.txt", "do not delete me\n")];
     s.gate = deny_execute.clone();
     s.gate_text = "deny every Execute-kind call";
     s.must_exist = vec!["victim.txt"];
+    s.must_attempt = Some("rm victim.txt");
     v.push(s);
 
     let mut s = base(
@@ -396,6 +403,13 @@ async fn main() {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from)
         .unwrap_or_else(|| worktree_root().join("fixtures/agents/claude"));
+    if args.iter().any(|a| a == "--resanitize") {
+        if let Err(e) = resanitize(&out_dir) {
+            eprintln!("FAILED: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let keep = args.iter().any(|a| a == "--keep");
     let mut wanted: Vec<String> = Vec::new();
     let mut skip = false;
@@ -473,7 +487,8 @@ struct RunOutput {
 async fn drive(s: &Scenario, config: SessionConfig, turns: &[&str]) -> Result<RunOutput, String> {
     let (tap_tx, mut tap_rx) = mpsc::unbounded_channel();
     let adapter = ClaudeAdapter::new(ClaudeOptions {
-        setting_sources: Some("project,local".into()),
+        // External settings off: fixtures must not depend on this machine's.
+        setting_sources: Some(String::new()),
         gate_deadline: Duration::from_secs(60),
         tap: Some(tap_tx),
         ..ClaudeOptions::default()
@@ -620,39 +635,31 @@ async fn record(s: &Scenario, out_dir: &Path, keep: bool) -> Result<(), String> 
     }
 
     // Trim, sanitize, write.
-    let home = std::env::var("HOME").unwrap_or_default();
-    let user = std::env::var("USER").unwrap_or_default();
-    let mut secrets: Vec<String> = std::env::var("ATRIUM_RECORD_SECRETS")
-        .unwrap_or_default()
-        .split(',')
-        .filter(|x| !x.is_empty())
-        .map(str::to_owned)
-        .collect();
-    secrets.push(home.replace('/', "-")); // Claude's encoded project dir name
-    let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
-    let sanitizer = Sanitizer::new(&home, &user, &secret_refs);
-
     let mut lines = run.lines;
-    for l in &mut lines {
-        trim(&mut l.input);
-    }
-    let merged = merge_split_deltas(&mut lines, &sanitizer);
-    for l in &mut lines {
-        sanitizer.input(&mut l.input);
-    }
-    let mut text = String::new();
-    for l in &lines {
-        text.push_str(&serde_json::to_string(l).map_err(|e| e.to_string())?);
-        text.push('\n');
-    }
-    if !sanitizer.is_clean(&text) {
-        return Err("sanitizer: the recording still has machine-specific values".into());
+    let (merged, text) = scrub(&mut lines)?;
+    let events = fixture::normalize(&lines, &mut ClaudeNormalizer::new());
+    if let Some(cmd) = s.must_attempt {
+        let attempted: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolCallStarted {
+                    kind: ToolKind::Execute,
+                    input,
+                    ..
+                } => input.get("command").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect();
+        if !attempted.iter().any(|c| c.contains(cmd)) {
+            return Err(format!(
+                "the agent never tried `{cmd}` (tried {attempted:?}); not written"
+            ));
+        }
     }
     fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let jsonl = out_dir.join(format!("{}.jsonl", s.name));
     fs::write(&jsonl, &text).map_err(|e| e.to_string())?;
 
-    let events = fixture::normalize(&lines, &mut ClaudeNormalizer::new());
     let json = serde_json::to_string_pretty(&events).map_err(|e| e.to_string())?;
     fs::write(out_dir.join(format!("{}.events.json", s.name)), json + "\n")
         .map_err(|e| e.to_string())?;
@@ -675,14 +682,14 @@ async fn record(s: &Scenario, out_dir: &Path, keep: bool) -> Result<(), String> 
     let md = format!(
         "# {name} (live)\n\n\
 - Recording: `live`, `cargo run -p spike-agent-claude --example record -- {name}`.\n\
-- CLI: {version}, model `{model}`, permission policy `{perm:?}`, `--setting-sources project,local`, `--permission-prompt-tool stdio`, one `PreToolUse` hook callback registered through `initialize`.\n\
+- CLI: {version}, model `{model}`, permission policy `{perm:?}`, `--setting-sources` empty (no user, project or local settings), `--permission-prompt-tool stdio`, one `PreToolUse` hook callback registered through `initialize`.\n\
 - Prompt(s): {prompts}\n\
 - Gate: {gate}.\n\
 - Covers: {covers}\n\
 - Spawn to `SessionStarted`: {started}.\n\
 - Events: {n} ({unmapped} unmapped). Counts: {counts:?}\n\
 - Deltas merged because a sanitized value spanned several of them: {merged} block(s).\n\
-- Trimmed before sanitizing: the `initialize` response's `commands`, `agents`, `models` and `account` (personal and bulky) and the `system/init` lists of slash commands, skills, plugins and agents. Nothing the normalizer reads.\n",
+- Trimmed before sanitizing: the `initialize` response's `commands`, `agents`, `models` and `account` (personal and bulky) and the `system/init` lists of slash commands, skills, plugins and agents, and machine paths (`memory_paths`, scratchpad, socket, transcript and output files). Nothing the normalizer reads.\n",
         name = s.name,
         model = s.model,
         perm = s.permissions,
@@ -702,6 +709,90 @@ async fn record(s: &Scenario, out_dir: &Path, keep: bool) -> Result<(), String> 
     fs::write(out_dir.join(format!("{}.md", s.name)), md).map_err(|e| e.to_string())?;
     if !keep {
         let _ = fs::remove_dir_all(&scratch);
+    }
+    Ok(())
+}
+
+/// The sanitizers every recording goes through: the structured one with this
+/// machine's home, user name, e-mail (`ATRIUM_RECORD_SECRETS`), Claude's encoded
+/// project directory name, its per-user temp directory and the time zone name;
+/// and a second pass that catches `/Users/user` left behind when the user name
+/// was rewritten inside a value the first pass saw only in pieces.
+fn sanitizers() -> (Sanitizer, Sanitizer) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let user = std::env::var("USER").unwrap_or_default();
+    let mut secrets: Vec<String> = std::env::var("ATRIUM_RECORD_SECRETS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|x| !x.is_empty())
+        .map(str::to_owned)
+        .collect();
+    secrets.push(home.replace('/', "-")); // Claude's encoded project dir name
+    if let Ok(out) = std::process::Command::new("id").arg("-u").output() {
+        let uid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if !uid.is_empty() {
+            secrets.push(format!("claude-{uid}")); // /private/tmp/claude-<uid>
+        }
+    }
+    if let Ok(target) = fs::read_link("/etc/localtime")
+        && let Some(zone) = target.to_string_lossy().split("zoneinfo/").nth(1)
+    {
+        secrets.push(zone.to_owned());
+    }
+    let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    let first = Sanitizer::new(&home, &user, &refs);
+    let second = Sanitizer::new("/Users/user", "user", &[]);
+    (first, second)
+}
+
+/// Trims, merges split deltas and sanitizes; returns how many delta blocks
+/// were merged and the file text.
+fn scrub(lines: &mut [FixtureLine]) -> Result<(usize, String), String> {
+    let (first, second) = sanitizers();
+    for l in lines.iter_mut() {
+        trim(&mut l.input);
+    }
+    let mut merged = merge_split_deltas(lines, &first);
+    for l in lines.iter_mut() {
+        first.input(&mut l.input);
+    }
+    merged += merge_split_deltas(lines, &second);
+    for l in lines.iter_mut() {
+        second.input(&mut l.input);
+    }
+    let mut text = String::new();
+    for l in lines.iter() {
+        text.push_str(&serde_json::to_string(l).map_err(|e| e.to_string())?);
+        text.push('\n');
+    }
+    if !first.is_clean(&text) {
+        return Err("sanitizer: the recording still has machine-specific values".into());
+    }
+    Ok((merged, text))
+}
+
+/// Re-applies the current scrubbing to the fixtures already on disk (no
+/// network, no account use) and regenerates the expected events.
+fn resanitize(out_dir: &Path) -> Result<(), String> {
+    let mut names: Vec<_> = fs::read_dir(out_dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.strip_suffix(".jsonl").map(str::to_owned)
+        })
+        .collect();
+    names.sort();
+    for name in names {
+        let path = out_dir.join(format!("{name}.jsonl"));
+        let mut lines = fixture::read(&path).map_err(|e| e.to_string())?;
+        let (merged, text) = scrub(&mut lines)?;
+        fs::write(&path, text).map_err(|e| e.to_string())?;
+        let events = fixture::normalize(&lines, &mut ClaudeNormalizer::new());
+        let json = serde_json::to_string_pretty(&events).map_err(|e| e.to_string())?;
+        fs::write(out_dir.join(format!("{name}.events.json")), json + "\n")
+            .map_err(|e| e.to_string())?;
+        eprintln!("resanitized {name} ({merged} blocks merged)");
     }
     Ok(())
 }
@@ -838,9 +929,53 @@ fn trim(input: &mut AdapterInput) {
         }
         changed = true;
     }
+    if redact_paths(&mut v) {
+        changed = true;
+    }
     if changed {
         *line = v.to_string();
     }
+}
+
+/// Keys whose values are machine-specific paths and of no use to the mapping.
+fn redact_paths(v: &mut Value) -> bool {
+    const KEYS: [&str; 7] = [
+        "memory_paths",
+        "scratchpad_path",
+        "scratchpad_dir",
+        "messaging_socket_path",
+        "transcript_path",
+        "user_output_styles_dir",
+        "output_file",
+    ];
+    let mut changed = false;
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                if KEYS.contains(&k.as_str()) {
+                    let new = match val {
+                        Value::Object(_) => json!({}),
+                        _ => json!("<redacted>"),
+                    };
+                    if *val != new {
+                        *val = new;
+                        changed = true;
+                    }
+                } else if redact_paths(val) {
+                    changed = true;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for i in items {
+                if redact_paths(i) {
+                    changed = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    changed
 }
 
 fn short(e: &AgentEvent) -> String {

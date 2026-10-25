@@ -9,7 +9,7 @@
 //!
 //! Usage: `cargo run -p spike-agent-claude --example chat -- [--cwd DIR]
 //! [--model M] [--permissions ask|read-only|full-access] [--resume ID]
-//! [--program PATH] [--setting-sources S] [--gate-timeout-secs N]`
+//! [--program PATH] [--setting-sources S (empty = no external settings)] [--gate-timeout-secs N]`
 //! With stdin at EOF every undecided gate request is denied.
 
 use std::collections::VecDeque;
@@ -88,6 +88,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Say up front when Claude Code's own settings put hooks outside the gate.
+    if let Some(e) = adapter.last_enforcement() {
+        eprintln!(
+            "enforcement: {:?}{}",
+            e.interception,
+            e.reason.map(|r| format!(" ({r})")).unwrap_or_default()
+        );
+    }
     let commands = session.commands.clone();
     let reader_gate = gate.clone();
     tokio::spawn(async move {

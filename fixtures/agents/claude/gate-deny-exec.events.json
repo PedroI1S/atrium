@@ -66,7 +66,7 @@
       "output_tokens": 163,
       "cache_read_tokens": 25415,
       "cache_write_tokens": 6948,
-      "reasoning_tokens": null,
+      "reasoning_tokens": 57,
       "cost_usd": null
     }
   },
@@ -296,7 +296,7 @@
       "output_tokens": 450,
       "cache_read_tokens": 57778,
       "cache_write_tokens": 7179,
-      "reasoning_tokens": null,
+      "reasoning_tokens": 163,
       "cost_usd": null
     }
   },

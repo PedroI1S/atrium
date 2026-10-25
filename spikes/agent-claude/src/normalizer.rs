@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use atrium_agents::{AdapterInput, GateDecision, Normalizer, ToolCheck};
+use atrium_agents::{AdapterInput, GateDecision, MAX_QUEUED_MESSAGES, Normalizer, ToolCheck};
 use atrium_protocol::agent::{
     AgentEvent, ApprovalDecision, MessageKind, PlanEntry, PlanStatus, Provider, Question,
     QuestionOption, QuotaWindow, RequestOutcome, SessionCommand, ToolKind, ToolStatus, TurnOutcome,
@@ -74,14 +74,18 @@ struct OpenCall {
     id: String,
 }
 
+/// Tool calls that are not shown as tool calls: the question dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Virtual {
     Question,
-    Todo,
 }
 
 #[derive(Debug)]
 struct CanUse {
+    question: bool,
+    /// Matches a gate decision: the `tool_use_id`, or the tool name and input
+    /// when the request carries no id.
+    key: String,
     tool_use_id: Option<String>,
     name: String,
     input: Value,
@@ -102,6 +106,19 @@ struct MsgUsage {
     output: u64,
     cache_read: u64,
     cache_write: u64,
+    reasoning: u64,
+}
+
+/// Session-cumulative totals from `result.modelUsage` (every model, subagents
+/// included).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Totals {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    reasoning: u64,
+    cost: f64,
 }
 
 #[derive(Debug)]
@@ -138,10 +155,16 @@ pub struct ClaudeNormalizer {
 
     pending: Vec<(String, Pending)>,
     can_use: HashMap<String, CanUse>,
+    /// Gate keys answered `Ask` / `Allow` (see [`gate_key`]).
     asked: HashSet<String>,
+    allowed: HashSet<String>,
+
+    /// User messages accepted and not yet written to the provider.
+    waiting: usize,
+    rejected: bool,
 
     msg_usage: HashMap<String, MsgUsage>,
-    prev_cost: f64,
+    prev_totals: Totals,
     last_quota: Option<Vec<QuotaWindow>>,
     last_reset_ms: Option<u64>,
     rate_limited: bool,
@@ -171,6 +194,12 @@ impl ClaudeNormalizer {
         self.pre_session_failed
     }
 
+    /// The last `SendUserMessage` was refused because too many were waiting
+    /// (the normalizer emitted the `Error`). Reading clears the flag.
+    pub fn take_rejected(&mut self) -> bool {
+        std::mem::take(&mut self.rejected)
+    }
+
     pub fn native_session_id(&self) -> Option<&str> {
         self.init.as_ref().map(|i| i.session_id.as_str())
     }
@@ -191,6 +220,7 @@ impl ClaudeNormalizer {
             return;
         };
         if v.get("type").and_then(Value::as_str) == Some("user") {
+            self.waiting = self.waiting.saturating_sub(1);
             self.begin_turn(out);
         }
     }
@@ -257,18 +287,35 @@ impl ClaudeNormalizer {
             return;
         };
         let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let before = out.len();
+        self.dispatch(ty, &v, out);
+        if !self.established {
+            // Nothing precedes SessionStarted; notes about records we don't
+            // map are released right after it (or before a failure's end).
+            let mut i = before;
+            while i < out.len() {
+                if matches!(out[i], AgentEvent::Unmapped { .. }) {
+                    self.held.push(out.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn dispatch(&mut self, ty: &str, v: &Value, out: &mut Vec<AgentEvent>) {
         match ty {
-            "system" => self.system(&v, out),
-            "stream_event" => self.stream_event(&v, out),
-            "assistant" => self.assistant(&v, out),
-            "user" => self.user(&v, out),
-            "result" => self.result(&v, out),
-            "rate_limit_event" => self.rate_limit(&v, out),
-            "control_request" => self.control_request(&v, out),
-            "control_cancel_request" => self.control_cancel(&v, out),
+            "system" => self.system(v, out),
+            "stream_event" => self.stream_event(v, out),
+            "assistant" => self.assistant(v, out),
+            "user" => self.user(v, out),
+            "result" => self.result(v, out),
+            "rate_limit_event" => self.rate_limit(v, out),
+            "control_request" => self.control_request(v, out),
+            "control_cancel_request" => self.control_cancel(v, out),
             // Replies to our own control requests (initialize, interrupt).
             "control_response" | "keep_alive" => {}
-            other => out.push(unmapped(other, &v)),
+            other => out.push(unmapped(other, v)),
         }
     }
 
@@ -357,10 +404,8 @@ impl ClaudeNormalizer {
                 });
             }
             "message_delta" => {
-                if v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
-                    return;
-                }
                 if let Some(u) = e.get("usage") {
+                    self.ensure_turn(out);
                     let mu = msg_usage(u);
                     self.msg_usage.insert(api_id, mu);
                     out.push(AgentEvent::Usage {
@@ -380,13 +425,14 @@ impl ClaudeNormalizer {
             total.output += u.output;
             total.cache_read += u.cache_read;
             total.cache_write += u.cache_write;
+            total.reasoning += u.reasoning;
         }
         Usage {
             input_tokens: Some(total.input),
             output_tokens: Some(total.output),
             cache_read_tokens: Some(total.cache_read),
             cache_write_tokens: Some(total.cache_write),
-            reasoning_tokens: None,
+            reasoning_tokens: Some(total.reasoning),
             cost_usd: None,
         }
     }
@@ -466,13 +512,7 @@ impl ClaudeNormalizer {
             self.virtual_calls.insert(id, Virtual::Question);
             return;
         }
-        if name == TODO_WRITE {
-            self.virtual_calls.insert(id, Virtual::Todo);
-            out.push(AgentEvent::PlanUpdated {
-                entries: plan_entries(&input),
-            });
-            return;
-        }
+        let plan = (name == TODO_WRITE).then(|| plan_entries(&input));
         out.push(AgentEvent::ToolCallStarted {
             call_id: id.clone(),
             name: name.clone(),
@@ -481,6 +521,9 @@ impl ClaudeNormalizer {
             input,
         });
         self.calls.push(OpenCall { id: id.clone() });
+        if let Some(entries) = plan {
+            out.push(AgentEvent::PlanUpdated { entries });
+        }
         if let Some(reason) = self.denied_early.remove(&id) {
             self.finish(&id, ToolStatus::Denied, None, Some(reason), out);
         }
@@ -623,6 +666,7 @@ impl ClaudeNormalizer {
         self.ensure_turn(out);
         self.close_messages(out);
         self.cancel_open_calls(out);
+        self.cancel_pending(out);
 
         let terminal = str_of(v, "terminal_reason").unwrap_or_default();
         let subtype = str_of(v, "subtype").unwrap_or_default();
@@ -641,7 +685,7 @@ impl ClaudeNormalizer {
                 fatal: false,
             });
         }
-        let usage = result_usage(v, &mut self.prev_cost);
+        let usage = result_usage(v, &mut self.prev_totals);
         if let Some(u) = &usage {
             out.push(AgentEvent::Usage { usage: u.clone() });
         }
@@ -734,21 +778,16 @@ impl ClaudeNormalizer {
         let name = str_of(r, "tool_name").unwrap_or_default();
         let input = r.get("input").cloned().unwrap_or(Value::Null);
         let tool_use_id = str_of(r, "tool_use_id");
-        if name == ASK_USER_QUESTION {
-            self.ensure_turn(out);
-            out.push(AgentEvent::QuestionAsked {
-                request_id: rid.clone(),
-                questions: questions_of(&input),
-            });
-            self.pending.push((rid, Pending::Question));
-            return;
-        }
+        let key = gate_key(tool_use_id.as_deref(), &name, &input);
         let reason = str_of(r, "decision_reason").filter(|s| !s.is_empty());
         let title = tool_title(&name, &input).or_else(|| str_of(r, "description"));
+        let question = name == ASK_USER_QUESTION;
         self.can_use.insert(
             rid.clone(),
             CanUse {
-                tool_use_id: tool_use_id.clone(),
+                question,
+                key: key.clone(),
+                tool_use_id,
                 name,
                 input,
                 title,
@@ -756,12 +795,19 @@ impl ClaudeNormalizer {
                 emitted: false,
             },
         );
-        if tool_use_id.is_some_and(|t| self.asked.contains(&t)) {
-            self.emit_approval(&rid, out);
+        // Shown only once the gate has let it through: `Ask` for a tool,
+        // `Allow` or `Ask` for the question dialog.
+        let ready = if question {
+            self.allowed.contains(&key) || self.asked.contains(&key)
+        } else {
+            self.asked.contains(&key)
+        };
+        if ready {
+            self.emit_request(&rid, out);
         }
     }
 
-    fn emit_approval(&mut self, rid: &str, out: &mut Vec<AgentEvent>) {
+    fn emit_request(&mut self, rid: &str, out: &mut Vec<AgentEvent>) {
         let Some(c) = self.can_use.get_mut(rid) else {
             return;
         };
@@ -769,6 +815,37 @@ impl ClaudeNormalizer {
             return;
         }
         c.emitted = true;
+        self.ensure_turn(out);
+        let Some(c) = self.can_use.get(rid) else {
+            return;
+        };
+        if c.question {
+            let questions = questions_of(&c.input);
+            out.push(AgentEvent::QuestionAsked {
+                request_id: rid.to_owned(),
+                questions,
+            });
+            self.pending.push((rid.to_owned(), Pending::Question));
+            return;
+        }
+        // The approval must refer to a call the client has seen (a subagent's
+        // call can ask before its tool_use record arrives).
+        let (name, input, title) = (c.name.clone(), c.input.clone(), c.title.clone());
+        if let Some(id) = c.tool_use_id.clone()
+            && self.seen_calls.insert(id.clone())
+        {
+            out.push(AgentEvent::ToolCallStarted {
+                call_id: id.clone(),
+                name: name.clone(),
+                kind: tool_kind(&name),
+                title: title.clone(),
+                input: input.clone(),
+            });
+            self.calls.push(OpenCall { id });
+        }
+        let Some(c) = self.can_use.get(rid) else {
+            return;
+        };
         out.push(AgentEvent::ApprovalRequested {
             request_id: rid.to_owned(),
             call_id: c.tool_use_id.clone(),
@@ -799,26 +876,34 @@ impl ClaudeNormalizer {
     }
 
     fn gate(&mut self, check: &ToolCheck, decision: &GateDecision, out: &mut Vec<AgentEvent>) {
-        let Some(id) = check.call_id.clone() else {
-            return;
-        };
+        let key = gate_key(check.call_id.as_deref(), &check.name, &check.input);
+        let waiting: Vec<String> = self
+            .can_use
+            .iter()
+            .filter(|(_, c)| c.key == key && !c.emitted)
+            .map(|(rid, _)| rid.clone())
+            .collect();
         match decision {
-            GateDecision::Allow => {}
+            GateDecision::Allow => {
+                self.allowed.insert(key);
+                for rid in waiting {
+                    // An allowed tool needs no client; the question dialog does.
+                    if self.can_use.get(&rid).is_some_and(|c| c.question) {
+                        self.emit_request(&rid, out);
+                    }
+                }
+            }
             GateDecision::Deny { reason } => {
                 // A can_use_tool request waiting on this decision is dead.
-                self.can_use
-                    .retain(|_, c| c.tool_use_id.as_deref() != Some(id.as_str()));
-                self.deny_call(&id, reason, out);
+                self.can_use.retain(|_, c| c.key != key);
+                if let Some(id) = &check.call_id {
+                    self.deny_call(id, reason, out);
+                }
             }
             GateDecision::Ask => {
-                self.asked.insert(id.clone());
-                let rid = self
-                    .can_use
-                    .iter()
-                    .find(|(_, c)| c.tool_use_id.as_deref() == Some(id.as_str()) && !c.emitted)
-                    .map(|(k, _)| k.clone());
-                if let Some(rid) = rid {
-                    self.emit_approval(&rid, out);
+                self.asked.insert(key);
+                for rid in waiting {
+                    self.emit_request(&rid, out);
                 }
             }
         }
@@ -837,8 +922,22 @@ impl ClaudeNormalizer {
 
     fn command(&mut self, command: &SessionCommand, out: &mut Vec<AgentEvent>) {
         match command {
-            // The adapter owns the queue of waiting messages.
-            SessionCommand::SendUserMessage { .. } => {}
+            // The adapter holds the texts; the count and the limit live here so
+            // a replay rejects the same messages.
+            SessionCommand::SendUserMessage { .. } => {
+                let busy = self.turn_open || self.waiting > 0;
+                if busy && self.waiting >= MAX_QUEUED_MESSAGES {
+                    self.rejected = true;
+                    out.push(AgentEvent::Error {
+                        message: format!(
+                            "message rejected: {MAX_QUEUED_MESSAGES} messages are already waiting"
+                        ),
+                        fatal: false,
+                    });
+                } else {
+                    self.waiting += 1;
+                }
+            }
             SessionCommand::ResolveApproval {
                 request_id,
                 decision,
@@ -937,6 +1036,7 @@ impl ClaudeNormalizer {
                         fatal: true,
                     });
                 }
+                out.append(&mut self.held);
                 self.finish_session(code, out);
                 return;
             }
@@ -1032,6 +1132,15 @@ impl Normalizer for ClaudeNormalizer {
     }
 }
 
+/// What ties a gate decision to a `can_use_tool` request: the `tool_use_id`,
+/// or the tool and its exact input when the request has no id.
+fn gate_key(call_id: Option<&str>, name: &str, input: &Value) -> String {
+    match call_id {
+        Some(id) => id.to_owned(),
+        None => format!("anon:{name}:{input}"),
+    }
+}
+
 fn exit_text(code: Option<i32>) -> String {
     code.map(|c| format!(" with code {c}")).unwrap_or_default()
 }
@@ -1072,30 +1181,78 @@ fn msg_usage(u: &Value) -> MsgUsage {
         output: n("output_tokens"),
         cache_read: n("cache_read_input_tokens"),
         cache_write: n("cache_creation_input_tokens"),
+        reasoning: u
+            .pointer("/output_tokens_details/thinking_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     }
 }
 
-/// `result.usage` is this turn's tally; `total_cost_usd` is the session's
-/// running total, so the turn's cost is the difference.
-fn result_usage(v: &Value, prev_cost: &mut f64) -> Option<Usage> {
-    let u = v.get("usage")?;
-    let n = |k: &str| u.get(k).and_then(Value::as_u64);
-    let total = v.get("total_cost_usd").and_then(Value::as_f64);
-    let cost = total.map(|t| {
-        let c = (t - *prev_cost).max(0.0);
-        *prev_cost = t;
-        c
-    });
-    Some(Usage {
-        input_tokens: n("input_tokens"),
-        output_tokens: n("output_tokens"),
-        cache_read_tokens: n("cache_read_input_tokens"),
-        cache_write_tokens: n("cache_creation_input_tokens"),
-        reasoning_tokens: u
-            .pointer("/output_tokens_details/thinking_tokens")
-            .and_then(Value::as_u64),
-        cost_usd: cost,
-    })
+/// The turn's usage. `result.usage` leaves subagents out, while
+/// `result.modelUsage` and `total_cost_usd` are session totals over every
+/// model and subagent: the turn is the difference from the previous totals. A
+/// total that went down means a new process (after a resume), so counting
+/// restarts from zero.
+fn result_usage(v: &Value, prev: &mut Totals) -> Option<Usage> {
+    let models = v
+        .get("modelUsage")
+        .and_then(Value::as_object)
+        .filter(|m| !m.is_empty());
+    let Some(models) = models else {
+        // No per-model totals (a failed request): use the turn's own usage.
+        let u = v.get("usage")?;
+        let n = |k: &str| u.get(k).and_then(Value::as_u64);
+        let total = v.get("total_cost_usd").and_then(Value::as_f64);
+        let cost = total.map(|t| {
+            if t < prev.cost {
+                prev.cost = 0.0;
+            }
+            let c = t - prev.cost;
+            prev.cost = t;
+            c
+        });
+        return Some(Usage {
+            input_tokens: n("input_tokens"),
+            output_tokens: n("output_tokens"),
+            cache_read_tokens: n("cache_read_input_tokens"),
+            cache_write_tokens: n("cache_creation_input_tokens"),
+            reasoning_tokens: u
+                .pointer("/output_tokens_details/thinking_tokens")
+                .and_then(Value::as_u64),
+            cost_usd: cost,
+        });
+    };
+    let mut now = Totals::default();
+    for m in models.values() {
+        let n = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+        now.input += n("inputTokens");
+        now.output += n("outputTokens");
+        now.cache_read += n("cacheReadInputTokens");
+        now.cache_write += n("cacheCreationInputTokens");
+        now.reasoning += n("thinkingTokens");
+    }
+    now.cost = v
+        .get("total_cost_usd")
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| {
+            models
+                .values()
+                .filter_map(|m| m.get("costUSD").and_then(Value::as_f64))
+                .sum()
+        });
+    if now.input < prev.input || now.output < prev.output || now.cost < prev.cost {
+        *prev = Totals::default();
+    }
+    let usage = Usage {
+        input_tokens: Some(now.input - prev.input),
+        output_tokens: Some(now.output - prev.output),
+        cache_read_tokens: Some(now.cache_read.saturating_sub(prev.cache_read)),
+        cache_write_tokens: Some(now.cache_write.saturating_sub(prev.cache_write)),
+        reasoning_tokens: Some(now.reasoning.saturating_sub(prev.reasoning)),
+        cost_usd: Some((now.cost - prev.cost).max(0.0)),
+    };
+    *prev = now;
+    Some(usage)
 }
 
 fn result_text(content: Option<&Value>) -> String {

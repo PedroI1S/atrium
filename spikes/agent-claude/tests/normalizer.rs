@@ -60,7 +60,7 @@ fn started() -> (ClaudeNormalizer, Vec<AgentEvent>) {
 }
 
 #[test]
-fn todo_write_becomes_plan_updated_without_a_tool_call() {
+fn todo_write_is_a_tool_call_and_a_plan() {
     let (mut n, _) = started();
     let evs = run(
         &mut n,
@@ -76,8 +76,9 @@ fn todo_write_becomes_plan_updated_without_a_tool_call() {
             ),
         ],
     );
-    assert_eq!(evs.len(), 1, "{evs:?}");
-    let AgentEvent::PlanUpdated { entries } = &evs[0] else {
+    assert_eq!(evs.len(), 3, "{evs:?}");
+    assert!(matches!(&evs[0], AgentEvent::ToolCallStarted { name, .. } if name == "TodoWrite"));
+    let AgentEvent::PlanUpdated { entries } = &evs[1] else {
         panic!("{evs:?}")
     };
     let st: Vec<_> = entries.iter().map(|e| e.status).collect();
@@ -89,6 +90,13 @@ fn todo_write_becomes_plan_updated_without_a_tool_call() {
             PlanStatus::Pending
         ]
     );
+    assert!(matches!(
+        &evs[2],
+        AgentEvent::ToolCallFinished {
+            status: ToolStatus::Succeeded,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -654,4 +662,291 @@ fn a_cli_that_leaves_after_an_interrupt_keeps_the_session_open() {
         ],
     );
     assert!(matches!(&evs[..], [AgentEvent::SessionEnded { .. }]));
+}
+
+fn can_use_anon(rid: &str, name: &str, input: Value) -> AdapterInput {
+    out(json!({"type":"control_request","request_id":rid,"request":{
+        "subtype":"can_use_tool","tool_name":name,"input":input}}))
+}
+
+fn gate_anon(name: &str, input: Value, d: GateDecision) -> AdapterInput {
+    AdapterInput::Gate {
+        check: tool_check(None, name, &input),
+        decision: d,
+    }
+}
+
+#[test]
+fn can_use_tool_without_an_id_is_matched_by_tool_and_input() {
+    let (mut n, _) = started();
+    let input = json!({"command":"ls"});
+    let evs = run(&mut n, vec![can_use_anon("r1", "Bash", input.clone())]);
+    assert!(evs.is_empty(), "{evs:?}");
+    let evs = run(&mut n, vec![gate_anon("Bash", input, GateDecision::Ask)]);
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::ApprovalRequested { request_id, call_id: None, .. }] if request_id == "r1"
+    ));
+    // The other order (the gate answered first) works too.
+    let (mut n, _) = started();
+    let input = json!({"command":"pwd"});
+    run(
+        &mut n,
+        vec![gate_anon("Bash", input.clone(), GateDecision::Ask)],
+    );
+    let evs = run(&mut n, vec![can_use_anon("r2", "Bash", input)]);
+    assert!(matches!(&evs[..], [AgentEvent::ApprovalRequested { .. }]));
+}
+
+#[test]
+fn an_approval_opens_the_call_it_refers_to() {
+    // A subagent's call can ask before its tool_use record has arrived.
+    let (mut n, _) = started();
+    let evs = run(
+        &mut n,
+        vec![gate("sub1", GateDecision::Ask), can_use("r1", "sub1")],
+    );
+    assert!(matches!(
+        &evs[..],
+        [
+            AgentEvent::ToolCallStarted { call_id, .. },
+            AgentEvent::ApprovalRequested { .. }
+        ] if call_id == "sub1"
+    ));
+    // The late tool_use record does not start it twice.
+    let evs = run(&mut n, vec![bash_call("sub1")]);
+    assert!(evs.is_empty(), "{evs:?}");
+}
+
+fn ask_question(rid: &str, tool_use_id: &str) -> AdapterInput {
+    out(json!({"type":"control_request","request_id":rid,"request":{
+        "subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":tool_use_id,
+        "input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}}}))
+}
+
+fn gate_question(id: &str, d: GateDecision) -> AdapterInput {
+    AdapterInput::Gate {
+        check: tool_check(
+            Some(id),
+            "AskUserQuestion",
+            &json!({"questions":[{"question":"Q?","options":[{"label":"A"}]}]}),
+        ),
+        decision: d,
+    }
+}
+
+#[test]
+fn a_question_is_shown_only_after_the_gate_lets_it_through() {
+    let (mut n, _) = started();
+    let evs = run(&mut n, vec![ask_question("r1", "q1")]);
+    assert!(evs.is_empty(), "{evs:?}");
+    let evs = run(&mut n, vec![gate_question("q1", GateDecision::Allow)]);
+    assert!(matches!(&evs[..], [AgentEvent::QuestionAsked { .. }]));
+
+    // Denied: never shown.
+    let (mut n, _) = started();
+    run(&mut n, vec![ask_question("r1", "q1")]);
+    let evs = run(
+        &mut n,
+        vec![gate_question(
+            "q1",
+            GateDecision::Deny {
+                reason: "no".into(),
+            },
+        )],
+    );
+    assert!(evs.is_empty(), "{evs:?}");
+    // Allowed at the hook first (the normal order): shown at once.
+    let (mut n, _) = started();
+    run(&mut n, vec![gate_question("q1", GateDecision::Allow)]);
+    let evs = run(&mut n, vec![ask_question("r1", "q1")]);
+    assert!(matches!(&evs[..], [AgentEvent::QuestionAsked { .. }]));
+}
+
+#[test]
+fn the_turn_end_cancels_requests_still_open() {
+    let (mut n, _) = started();
+    run(
+        &mut n,
+        vec![
+            bash_call("t1"),
+            gate("t1", GateDecision::Ask),
+            can_use("r1", "t1"),
+        ],
+    );
+    let evs = run(&mut n, vec![result(json!({}))]);
+    let kinds: Vec<&str> = evs
+        .iter()
+        .map(|e| match e {
+            AgentEvent::ToolCallFinished {
+                status: ToolStatus::Cancelled,
+                ..
+            } => "call",
+            AgentEvent::RequestResolved {
+                outcome: RequestOutcome::Cancelled,
+                ..
+            } => "request",
+            AgentEvent::Usage { .. } => "usage",
+            AgentEvent::TurnCompleted { .. } => "turn",
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(kinds, ["call", "request", "usage", "turn"]);
+    // Resolving it afterwards is an unknown request.
+    let evs = run(
+        &mut n,
+        vec![AdapterInput::Command {
+            command: SessionCommand::ResolveApproval {
+                request_id: "r1".into(),
+                decision: ApprovalDecision::Allow,
+            },
+        }],
+    );
+    assert!(matches!(&evs[..], [AgentEvent::Error { fatal: false, .. }]));
+}
+
+fn say(text: &str) -> AdapterInput {
+    AdapterInput::Command {
+        command: SessionCommand::SendUserMessage { text: text.into() },
+    }
+}
+
+#[test]
+fn the_message_queue_limit_is_decided_by_the_normalizer() {
+    let mut n = ClaudeNormalizer::new();
+    // Idle: accepted, written, the turn starts.
+    assert!(run(&mut n, vec![say("m0")]).is_empty());
+    assert!(!n.take_rejected());
+    let evs = run(&mut n, vec![user_line("m0"), init(), message_start()]);
+    assert!(matches!(evs[1], AgentEvent::TurnStarted { .. }));
+    // Eight wait while the turn runs; the ninth is refused.
+    for i in 1..=8 {
+        assert!(run(&mut n, vec![say(&format!("m{i}"))]).is_empty());
+        assert!(!n.take_rejected());
+    }
+    let evs = run(&mut n, vec![say("m9")]);
+    assert!(
+        matches!(&evs[..], [AgentEvent::Error { fatal: false, message }] if message.contains("rejected"))
+    );
+    assert!(n.take_rejected());
+    assert!(!n.take_rejected(), "reading clears the flag");
+    // The turn ends and one waiting message is written: room again.
+    run(&mut n, vec![result(json!({})), user_line("m1")]);
+    assert!(run(&mut n, vec![say("m10")]).is_empty());
+    assert!(!n.take_rejected());
+}
+
+fn result_models(total: f64, input: u64, output: u64, thinking: u64) -> AdapterInput {
+    result(json!({
+        "total_cost_usd": total,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+        "modelUsage": {"m": {"inputTokens": input, "outputTokens": output, "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0, "thinkingTokens": thinking}}
+    }))
+}
+
+fn turn_usage(evs: &[AgentEvent]) -> atrium_protocol::agent::Usage {
+    evs.iter()
+        .find_map(|e| match e {
+            AgentEvent::TurnCompleted { usage: Some(u), .. } => Some(u.clone()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn turn_usage_is_the_model_usage_delta_and_survives_a_new_process() {
+    let (mut n, _) = started();
+    // Subagent tokens are in modelUsage but not in result.usage.
+    let u1 = turn_usage(&run(&mut n, vec![result_models(1.0, 100, 50, 10)]));
+    assert_eq!(
+        (u1.input_tokens, u1.output_tokens, u1.reasoning_tokens),
+        (Some(100), Some(50), Some(10))
+    );
+    assert_eq!(u1.cost_usd, Some(1.0));
+    let evs = run(
+        &mut n,
+        vec![
+            user_line("2"),
+            message_start(),
+            result_models(1.5, 130, 70, 15),
+        ],
+    );
+    let u2 = turn_usage(&evs);
+    assert_eq!(
+        (u2.input_tokens, u2.output_tokens, u2.reasoning_tokens),
+        (Some(30), Some(20), Some(5))
+    );
+    assert_eq!(u2.cost_usd, Some(0.5));
+    // A resumed process counts from zero again: totals went down.
+    let evs = run(
+        &mut n,
+        vec![
+            user_line("3"),
+            message_start(),
+            result_models(0.25, 10, 5, 1),
+        ],
+    );
+    let u3 = turn_usage(&evs);
+    assert_eq!((u3.input_tokens, u3.output_tokens), (Some(10), Some(5)));
+    assert_eq!(u3.cost_usd, Some(0.25));
+}
+
+#[test]
+fn running_usage_counts_reasoning_and_subagent_messages() {
+    let (mut n, _) = started();
+    let delta = |id: &str, parent: Value, out_tokens: u64, think: u64| {
+        out(
+            json!({"type":"stream_event","api_message_id":id,"parent_tool_use_id":parent,
+            "event":{"type":"message_delta","usage":{"input_tokens":1,"output_tokens":out_tokens,
+            "output_tokens_details":{"thinking_tokens":think}}}}),
+        )
+    };
+    let evs = run(
+        &mut n,
+        vec![
+            delta("a", Value::Null, 10, 4),
+            delta("b", json!("toolu_x"), 5, 2),
+        ],
+    );
+    let AgentEvent::Usage { usage } = evs.last().unwrap() else {
+        panic!("{evs:?}")
+    };
+    assert_eq!(usage.output_tokens, Some(15));
+    assert_eq!(usage.reasoning_tokens, Some(6));
+}
+
+#[test]
+fn notes_about_unmapped_records_never_precede_session_started() {
+    let mut n = ClaudeNormalizer::new();
+    let evs = run(
+        &mut n,
+        vec![
+            user_line("go"),
+            out(json!({"type":"system","subtype":"hook_started"})),
+            init(),
+            message_start(),
+        ],
+    );
+    assert!(
+        matches!(evs[0], AgentEvent::SessionStarted { .. }),
+        "{evs:?}"
+    );
+    assert!(matches!(evs[1], AgentEvent::TurnStarted { .. }));
+    assert!(
+        matches!(&evs[2], AgentEvent::Unmapped { record_type, .. } if record_type == "system/hook_started")
+    );
+    // On a failed start they come after the Error, before the end.
+    let mut n = ClaudeNormalizer::new();
+    let evs = run(
+        &mut n,
+        vec![
+            user_line("go"),
+            out(json!({"type":"system","subtype":"hook_started"})),
+            AdapterInput::Exit { code: Some(1) },
+        ],
+    );
+    assert!(matches!(evs[0], AgentEvent::Error { fatal: true, .. }));
+    assert!(matches!(evs[1], AgentEvent::Unmapped { .. }));
+    assert!(matches!(evs[2], AgentEvent::SessionEnded { .. }));
 }

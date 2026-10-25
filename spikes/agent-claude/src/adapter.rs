@@ -37,15 +37,15 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atrium_agents::fixture::FixtureLine;
 use atrium_agents::{
     AdapterError, AdapterInput, AgentAdapter, BoxFuture, COMMAND_BUFFER, EVENT_BUFFER,
-    GateDecision, Interception, MAX_QUEUED_MESSAGES, Normalizer, PermissionPolicy, SHUTDOWN_GRACE,
-    STARTUP_TIMEOUT, Session, SessionConfig, ToolGate, Transport,
+    GateDecision, Interception, Normalizer, PermissionPolicy, SHUTDOWN_GRACE, STARTUP_TIMEOUT,
+    Session, SessionConfig, ToolGate, Transport,
 };
 use atrium_protocol::agent::{
     AgentEvent, AgentEventEnvelope, ApprovalDecision, Provider, QuestionAnswer, SessionCommand,
@@ -58,6 +58,7 @@ use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
 
 use crate::normalizer::{ClaudeNormalizer, tool_check};
+use crate::settings::{Enforcement, default_locations, detect_external_hooks};
 
 const INIT_REQUEST_ID: &str = "atrium-init";
 const HOOK_CALLBACK_ID: &str = "atrium-pre-tool-use";
@@ -98,11 +99,36 @@ impl Default for ClaudeOptions {
 #[derive(Default)]
 pub struct ClaudeAdapter {
     options: ClaudeOptions,
+    last: Arc<Mutex<Option<Enforcement>>>,
 }
 
 impl ClaudeAdapter {
     pub fn new(options: ClaudeOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            last: Arc::default(),
+        }
+    }
+
+    /// What the gate decides for a session in `cwd`: full ([`Interception::
+    /// AllToolCalls`]) unless Claude Code's own settings, which are loaded by
+    /// default, contain hooks that run outside the gate; then partial
+    /// ([`Interception::ProviderGated`]) with the reason and the hooks found.
+    /// Pass `ClaudeOptions::setting_sources = Some("")` to disable external
+    /// settings.
+    pub fn enforcement_for(&self, cwd: &Path, env: &[(String, String)]) -> Enforcement {
+        let (user_dir, managed) = default_locations(env);
+        Enforcement::from_hooks(detect_external_hooks(
+            cwd,
+            self.options.setting_sources.as_deref(),
+            &user_dir,
+            &managed,
+        ))
+    }
+
+    /// The enforcement computed by the most recent `start`.
+    pub fn last_enforcement(&self) -> Option<Enforcement> {
+        self.last.lock().ok().and_then(|l| l.clone())
     }
 }
 
@@ -111,10 +137,19 @@ impl AgentAdapter for ClaudeAdapter {
         Provider::Claude
     }
 
-    /// `AllToolCalls`: the `PreToolUse` hook fires for built-in, MCP and
-    /// subagent tools in every permission mode (see the enforcement matrix).
+    /// `AllToolCalls` when nothing outside the gate can act on tool calls: the
+    /// `PreToolUse` hook fires for built-in, MCP and subagent tools in every
+    /// permission mode (see the enforcement matrix). `ProviderGated` while
+    /// Claude Code's own settings contain external hooks: the level of the
+    /// last `start`, or of the current directory before any.
     fn interception(&self) -> Interception {
-        Interception::AllToolCalls
+        match self.last_enforcement() {
+            Some(e) => e.interception,
+            None => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                self.enforcement_for(&cwd, &[]).interception
+            }
+        }
     }
 
     fn start(
@@ -123,6 +158,8 @@ impl AgentAdapter for ClaudeAdapter {
         transport: Transport,
     ) -> BoxFuture<'_, Result<Session, AdapterError>> {
         let options = self.options.clone();
+        let enforcement = self.enforcement_for(&config.cwd, &config.env);
+        let last = self.last.clone();
         Box::pin(async move {
             match transport {
                 Transport::Local => {}
@@ -132,7 +169,17 @@ impl AgentAdapter for ClaudeAdapter {
             let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
             let (commands_tx, commands_rx) = mpsc::channel(COMMAND_BUFFER);
             let mut actor = Actor::new(config, options, events_tx, commands_rx)?;
-            actor.spawn_proc(true).await?;
+            actor.launch(true)?;
+            actor.handshake().await?;
+            if let Some(reason) = &enforcement.reason {
+                // Recorded with the rest of the session's inputs.
+                actor.feed(AdapterInput::Stderr {
+                    line: format!("atrium: {reason}"),
+                });
+            }
+            if let Ok(mut l) = last.lock() {
+                *l = Some(enforcement);
+            }
             tokio::spawn(actor.run());
             Ok(Session {
                 events: events_rx,
@@ -153,6 +200,7 @@ enum Ev {
     Command(Option<SessionCommand>),
     Internal(Box<Internal>),
     InterruptDeadline,
+    HandshakeDeadline,
     Flushed,
     ConsumerGone,
     Output(Option<Out>),
@@ -173,6 +221,8 @@ enum Reply {
     Hook { request_id: String },
     /// A `can_use_tool` request the CLI asked directly.
     CanUse { request_id: String, input: Value },
+    /// A `can_use_tool` for `AskUserQuestion` the hook did not decide.
+    Question { request_id: String, input: Value },
 }
 
 struct AbortOnDrop(AbortHandle);
@@ -193,6 +243,9 @@ impl Drop for TempDir {
 
 struct Proc {
     child: Child,
+    /// The child leads its own process group, so Bash tasks and MCP servers
+    /// it started can be killed with it.
+    pgid: Option<u32>,
     stdin_tx: Option<mpsc::UnboundedSender<String>>,
     writer: JoinHandle<()>,
     readers: Vec<JoinHandle<()>>,
@@ -217,6 +270,9 @@ struct Actor {
     /// The process left after an interrupt; the next message resumes it.
     dormant: bool,
     interrupt_deadline: Option<TokioInstant>,
+    /// A respawned process has not answered `initialize` yet; messages wait.
+    handshaking: bool,
+    handshake_deadline: Option<TokioInstant>,
     queue: VecDeque<String>,
     shutting_down: bool,
     /// In-flight gate checks; aborted when the session ends.
@@ -224,6 +280,8 @@ struct Actor {
 
     /// `tool_use_id`s the hook answered `ask` for.
     hook_asked: HashSet<String>,
+    /// `tool_use_id`s the hook allowed (or `ask`ed, for the question dialog).
+    hook_allowed: HashSet<String>,
     approvals: HashMap<String, Value>,
     questions: HashMap<String, Value>,
 
@@ -270,10 +328,13 @@ impl Actor {
             out_rx: None,
             dormant: false,
             interrupt_deadline: None,
+            handshaking: false,
+            handshake_deadline: None,
             queue: VecDeque::new(),
             shutting_down: false,
             gates: JoinSet::new(),
             hook_asked: HashSet::new(),
+            hook_allowed: HashSet::new(),
             approvals: HashMap::new(),
             questions: HashMap::new(),
             _mcp_dir: mcp_dir,
@@ -324,7 +385,7 @@ impl Actor {
     /// Starts the process and completes the `initialize` handshake. With
     /// `first` the configured `resume` id applies; later respawns resume the
     /// session this normalizer has seen.
-    async fn spawn_proc(&mut self, first: bool) -> Result<(), AdapterError> {
+    fn launch(&mut self, first: bool) -> Result<(), AdapterError> {
         let resume = if first {
             self.config.resume.clone()
         } else {
@@ -341,6 +402,7 @@ impl Actor {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true);
         // Only this session's MCP servers; no claude.ai connectors.
         cmd.env("ENABLE_CLAUDEAI_MCP_SERVERS", "false");
@@ -393,8 +455,10 @@ impl Actor {
             }
             // Dropping `stdin` closes the pipe: Claude Code exits on EOF.
         });
+        let pgid = child.id();
         self.proc = Some(Proc {
             child,
+            pgid,
             stdin_tx: Some(stdin_tx),
             writer,
             readers,
@@ -416,7 +480,7 @@ impl Actor {
                 }
             }
         }));
-        self.handshake().await
+        Ok(())
     }
 
     async fn handshake(&mut self) -> Result<(), AdapterError> {
@@ -471,10 +535,12 @@ impl Actor {
     async fn kill_proc(&mut self) -> Option<i32> {
         let mut code = None;
         if let Some(mut p) = self.proc.take() {
+            kill_group(p.pgid);
             let _ = p.child.start_kill();
             if let Ok(Ok(status)) = timeout(Duration::from_secs(2), p.child.wait()).await {
                 code = status.code();
             }
+            kill_group(p.pgid);
             p.writer.abort();
             for r in p.readers {
                 r.abort();
@@ -491,10 +557,13 @@ impl Actor {
         let code = match timeout(grace, p.child.wait()).await {
             Ok(Ok(status)) => status.code(),
             _ => {
+                kill_group(p.pgid);
                 let _ = p.child.start_kill();
                 p.child.wait().await.ok().and_then(|s| s.code())
             }
         };
+        // Whatever the child started (Bash tasks, MCP servers) goes with it.
+        kill_group(p.pgid);
         p.writer.abort();
         for r in p.readers {
             r.abort();
@@ -576,11 +645,13 @@ impl Actor {
             let flush = !self.pending.is_empty() && !consumer_gone;
             let can_read = self.pending.len() < PENDING_LIMIT && self.out_rx.is_some();
             let deadline = self.interrupt_deadline;
+            let hs_deadline = self.handshake_deadline;
             let ev = tokio::select! {
                 biased;
                 cmd = self.commands_rx.recv() => Ev::Command(cmd),
                 Some(msg) = self.internal_rx.recv() => Ev::Internal(Box::new(msg)),
                 _ = sleep_until(deadline.unwrap_or_else(TokioInstant::now)), if deadline.is_some() => Ev::InterruptDeadline,
+                _ = sleep_until(hs_deadline.unwrap_or_else(TokioInstant::now)), if hs_deadline.is_some() => Ev::HandshakeDeadline,
                 permit = self.events_tx.reserve(), if flush => match permit {
                     Ok(p) => {
                         if let Some(ev) = self.pending.pop_front() {
@@ -605,6 +676,7 @@ impl Actor {
                     self.interrupt_deadline = None;
                     self.kill_after_interrupt().await;
                 }
+                Ev::HandshakeDeadline => self.handshake_failed().await,
                 Ev::Flushed => {}
                 Ev::ConsumerGone => {
                     consumer_gone = true;
@@ -679,9 +751,11 @@ impl Actor {
                 }
             }
             if !exited {
+                kill_group(p.pgid);
                 let _ = p.child.start_kill();
                 code = p.child.wait().await.ok().and_then(|s| s.code());
             }
+            kill_group(p.pgid);
             p.writer.abort();
             // Anything still buffered.
             if let Some(mut rx) = rx {
@@ -707,6 +781,7 @@ impl Actor {
 
     fn clear_requests(&mut self) {
         self.hook_asked.clear();
+        self.hook_allowed.clear();
         self.approvals.clear();
         self.questions.clear();
     }
@@ -729,17 +804,43 @@ impl Actor {
         }
         let code = self.reap(Duration::from_secs(2)).await;
         self.clear_requests();
+        if self.handshaking {
+            self.handshaking = false;
+            self.handshake_deadline = None;
+            self.push_event(AgentEvent::Error {
+                message: format!(
+                    "claude exited{} while resuming the session",
+                    exit_suffix(code)
+                ),
+                fatal: true,
+            });
+        }
         self.feed(AdapterInput::Exit { code });
-        self.after_exit().await;
+        self.after_exit();
     }
 
-    async fn after_exit(&mut self) {
+    /// The respawned process never answered `initialize`.
+    async fn handshake_failed(&mut self) {
+        self.handshaking = false;
+        self.handshake_deadline = None;
+        let code = self.kill_proc().await;
+        self.out_rx = None;
+        self.clear_requests();
+        self.push_event(AgentEvent::Error {
+            message: format!("claude did not answer initialize within {STARTUP_TIMEOUT:?}"),
+            fatal: true,
+        });
+        self.feed(AdapterInput::Exit { code });
+        self.shutting_down = true;
+    }
+
+    fn after_exit(&mut self) {
         if self.norm.has_ended() {
             self.shutting_down = true;
         } else {
             // Left after an interrupt: the session lives on, dormant.
             self.dormant = true;
-            self.dispatch_next().await;
+            self.dispatch_next();
         }
     }
 
@@ -748,7 +849,7 @@ impl Actor {
         self.out_rx = None;
         self.clear_requests();
         self.feed(AdapterInput::Exit { code });
-        self.after_exit().await;
+        self.after_exit();
     }
 
     // ---- provider output ---------------------------------------------------------
@@ -757,7 +858,13 @@ impl Actor {
     /// are recorded but not answered.
     fn on_stdout(&mut self, line: String, active: bool) {
         let parsed: Option<Value> = serde_json::from_str(&line).ok();
+        let is_init = self.handshaking && is_init_response(&line);
         self.feed(AdapterInput::Stdout { line });
+        if is_init {
+            self.handshaking = false;
+            self.handshake_deadline = None;
+            self.dispatch_next();
+        }
         let Some(v) = parsed.filter(|_| active) else {
             return;
         };
@@ -765,7 +872,7 @@ impl Actor {
             Some("control_request") => self.on_control_request(&v),
             Some("result") if !self.norm.turn_in_flight() => {
                 self.interrupt_deadline = None;
-                self.pump_queue();
+                self.dispatch_next();
             }
             _ => {}
         }
@@ -823,9 +930,17 @@ impl Actor {
             .and_then(Value::as_str)
             .map(str::to_owned);
         if name == ASK_USER_QUESTION {
-            // The gate already saw this call at the hook; the question is the
-            // interaction, so there is nothing to approve.
-            self.questions.insert(request_id, input);
+            // The question is the interaction, so there is nothing to approve,
+            // but the gate must have let the call through: at the hook, or now.
+            match tool_use_id.as_deref() {
+                Some(id) if self.hook_allowed.contains(id) => {
+                    self.questions.insert(request_id, input);
+                }
+                _ => {
+                    let check = tool_check(tool_use_id.as_deref(), name, &input);
+                    self.spawn_gate(Reply::Question { request_id, input }, check);
+                }
+            }
             return;
         }
         if tool_use_id
@@ -883,11 +998,19 @@ impl Actor {
         }
         match reply {
             Reply::Hook { request_id } => match decision {
-                GateDecision::Allow => self.respond_hook(&request_id, "allow", None),
+                GateDecision::Allow => {
+                    if let Some(id) = &check.call_id {
+                        self.hook_allowed.insert(id.clone());
+                    }
+                    self.respond_hook(&request_id, "allow", None);
+                }
                 GateDecision::Deny { reason } => {
                     self.respond_hook(&request_id, "deny", Some(&deny_text(&reason)));
                 }
                 GateDecision::Ask if check.name == ASK_USER_QUESTION => {
+                    if let Some(id) = &check.call_id {
+                        self.hook_allowed.insert(id.clone());
+                    }
                     self.respond_hook(&request_id, "allow", None);
                 }
                 GateDecision::Ask => {
@@ -912,6 +1035,19 @@ impl Actor {
                 }
                 GateDecision::Ask => {
                     self.approvals.insert(request_id, input);
+                }
+            },
+            Reply::Question { request_id, input } => match decision {
+                // The question dialog is the interaction: `Ask` needs no
+                // second prompt.
+                GateDecision::Allow | GateDecision::Ask => {
+                    self.questions.insert(request_id, input);
+                }
+                GateDecision::Deny { reason } => {
+                    self.respond(
+                        &request_id,
+                        json!({"behavior": "deny", "message": deny_text(&reason)}),
+                    );
                 }
             },
         }
@@ -940,24 +1076,18 @@ impl Actor {
                 }
             }
             SessionCommand::SendUserMessage { text } => {
+                // The normalizer owns the limit, so a replay refuses the same
+                // messages; this only keeps the texts.
+                let busy = self.norm.turn_in_flight() || !self.queue.is_empty() || self.handshaking;
                 self.feed(AdapterInput::Command {
                     command: SessionCommand::SendUserMessage { text: text.clone() },
                 });
-                let busy = self.norm.turn_in_flight() || !self.queue.is_empty();
-                if busy {
-                    if self.queue.len() >= MAX_QUEUED_MESSAGES {
-                        self.push_event(AgentEvent::Error {
-                            message: format!(
-                                "message rejected: {MAX_QUEUED_MESSAGES} messages are already waiting"
-                            ),
-                            fatal: false,
-                        });
-                    } else {
-                        self.queue.push_back(text);
-                    }
-                } else {
-                    self.queue.push_back(text);
-                    self.dispatch_next().await;
+                if self.norm.take_rejected() {
+                    return;
+                }
+                self.queue.push_back(text);
+                if !busy {
+                    self.dispatch_next();
                 }
             }
             SessionCommand::ResolveApproval {
@@ -1006,12 +1136,26 @@ impl Actor {
         }
     }
 
-    /// Writes the next queued message if no turn is running.
-    fn pump_queue(&mut self) {
-        // Called from the synchronous reader path; the async dispatch (which
-        // may respawn) is done by `dispatch_next` from the loop. Here the
-        // process is alive, so writing is enough.
-        if self.norm.turn_in_flight() {
+    /// Writes the next queued message unless a turn is running or a respawned
+    /// process is still starting. With no process (the child had to be killed
+    /// after an interrupt) it starts one and waits for its handshake in the
+    /// main loop, so commands stay responsive meanwhile.
+    fn dispatch_next(&mut self) {
+        if self.norm.turn_in_flight() || self.handshaking || self.queue.is_empty() {
+            return;
+        }
+        if self.proc.is_none() {
+            if let Err(e) = self.launch(false) {
+                self.push_event(AgentEvent::Error {
+                    message: format!("could not resume the session: {e}"),
+                    fatal: true,
+                });
+                self.feed(AdapterInput::Exit { code: None });
+                self.shutting_down = true;
+                return;
+            }
+            self.handshaking = true;
+            self.handshake_deadline = Some(TokioInstant::now() + STARTUP_TIMEOUT);
             return;
         }
         if let Some(text) = self.queue.pop_front() {
@@ -1019,32 +1163,24 @@ impl Actor {
         }
     }
 
-    async fn dispatch_next(&mut self) {
-        if self.norm.turn_in_flight() {
-            return;
-        }
-        let Some(text) = self.queue.pop_front() else {
-            return;
-        };
-        if self.proc.is_none()
-            && let Err(e) = self.spawn_proc(false).await
-        {
-            self.push_event(AgentEvent::Error {
-                message: format!("could not resume the session: {e}"),
-                fatal: true,
-            });
-            self.feed(AdapterInput::Exit { code: None });
-            self.shutting_down = true;
-            return;
-        }
-        self.write_user(&text);
-    }
-
     fn write_user(&mut self, text: &str) {
         self.write_value(&json!({
             "type": "user",
             "message": {"role": "user", "content": text},
         }));
+    }
+}
+
+/// Kills the process group the child leads (SIGKILL). No libc: the `kill`
+/// utility takes a negative pid for a group. Errors (no such group) are fine.
+fn kill_group(pgid: Option<u32>) {
+    if let Some(pgid) = pgid {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pgid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -1069,6 +1205,10 @@ fn is_init_response(line: &str) -> bool {
         v.get("type").and_then(Value::as_str) == Some("control_response")
             && v.pointer("/response/request_id").and_then(Value::as_str) == Some(INIT_REQUEST_ID)
     })
+}
+
+fn exit_suffix(code: Option<i32>) -> String {
+    code.map(|c| format!(" with code {c}")).unwrap_or_default()
 }
 
 fn deny_text(reason: &str) -> String {

@@ -60,7 +60,7 @@
       "output_tokens": 141,
       "cache_read_tokens": 25415,
       "cache_write_tokens": 7155,
-      "reasoning_tokens": null,
+      "reasoning_tokens": 57,
       "cost_usd": null
     }
   },
@@ -103,7 +103,7 @@
       "output_tokens": 195,
       "cache_read_tokens": 57985,
       "cache_write_tokens": 7418,
-      "reasoning_tokens": null,
+      "reasoning_tokens": 57,
       "cost_usd": null
     }
   },
@@ -145,7 +145,7 @@
       "output_tokens": 212,
       "cache_read_tokens": 90818,
       "cache_write_tokens": 7506,
-      "reasoning_tokens": null,
+      "reasoning_tokens": 57,
       "cost_usd": null
     }
   },

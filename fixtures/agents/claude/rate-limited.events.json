@@ -59,7 +59,7 @@
   {
     "type": "rate_limited",
     "resets_at_ms": 1792900200000,
-    "message": "You've hit your session limit · resets 12:50am (America/Sao_Paulo)"
+    "message": "You've hit your session limit · resets 12:50am (<redacted>)"
   },
   {
     "type": "usage",

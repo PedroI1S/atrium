@@ -60,7 +60,7 @@
       "output_tokens": 124,
       "cache_read_tokens": 28438,
       "cache_write_tokens": 4695,
-      "reasoning_tokens": null,
+      "reasoning_tokens": 0,
       "cost_usd": null
     }
   },
@@ -133,7 +133,7 @@
       "output_tokens": 4,
       "cache_read_tokens": 33133,
       "cache_write_tokens": 318,
-      "reasoning_tokens": null,
+      "reasoning_tokens": 0,
       "cost_usd": null
     }
   },

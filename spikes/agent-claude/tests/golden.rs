@@ -75,8 +75,27 @@ fn fixtures_are_sanitized() {
     // check that nothing machine-specific slipped through.
     for name in all_names() {
         let text = fs::read_to_string(dir().join(format!("{name}.jsonl"))).unwrap();
-        for bad in ["/Users/", "/home/", "@icloud.com", "ATRIUM-7Q2X-CANARY"] {
+        for bad in [
+            "/Users/",
+            "/home/",
+            "@icloud.com",
+            "ATRIUM-7Q2X-CANARY",
+            "/private/tmp/claude-",
+            "/Users/user",
+            "America/",
+        ] {
             assert!(!text.contains(bad), "{name}.jsonl contains {bad}");
+        }
+        // Machine paths Claude Code reports about itself are redacted.
+        for line in text.lines() {
+            let l: FixtureLine = serde_json::from_str(line).unwrap();
+            if let atrium_agents::AdapterInput::Stdout { line } = &l.input
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                && v.get("subtype").and_then(|s| s.as_str()) == Some("init")
+            {
+                assert_eq!(v["memory_paths"], serde_json::json!({}), "{name}");
+                assert_eq!(v["scratchpad_path"], "<redacted>", "{name}");
+            }
         }
         let events = fs::read_to_string(dir().join(format!("{name}.events.json"))).unwrap();
         for bad in ["/Users/", "/home/", "@icloud.com", "ATRIUM-7Q2X-CANARY"] {
@@ -123,8 +142,45 @@ fn every_scenario_obeys_the_lifecycle_rules() {
         let mut open_requests = HashSet::new();
         let mut turn_open = false;
         let mut open_msgs: HashSet<String> = HashSet::new();
+        let mut in_turn = false;
+        let mut seen_started = false;
         let mut streamed: std::collections::HashMap<String, String> = Default::default();
         for e in &evs {
+            // Everything about a turn's work happens inside the turn.
+            let turn_scoped = matches!(
+                e,
+                AgentEvent::MessageDelta { .. }
+                    | AgentEvent::MessageCompleted { .. }
+                    | AgentEvent::ToolCallStarted { .. }
+                    | AgentEvent::ToolCallUpdated { .. }
+                    | AgentEvent::ToolCallFinished { .. }
+                    | AgentEvent::ApprovalRequested { .. }
+                    | AgentEvent::QuestionAsked { .. }
+                    | AgentEvent::RequestResolved { .. }
+                    | AgentEvent::Usage { .. }
+                    | AgentEvent::PlanUpdated { .. }
+            );
+            if turn_scoped {
+                assert!(in_turn, "{desc}: {e:?} outside a turn");
+            }
+            match e {
+                AgentEvent::TurnStarted { .. } => in_turn = true,
+                AgentEvent::TurnCompleted { .. } => in_turn = false,
+                _ => {}
+            }
+            // Nothing before SessionStarted except a failed start's Error.
+            if !seen_started && !matches!(e, AgentEvent::SessionStarted { .. }) {
+                assert!(
+                    matches!(
+                        e,
+                        AgentEvent::Error { .. } | AgentEvent::SessionEnded { .. }
+                    ),
+                    "{desc}: {e:?} before SessionStarted"
+                );
+            }
+            if matches!(e, AgentEvent::SessionStarted { .. }) {
+                seen_started = true;
+            }
             match e {
                 AgentEvent::ToolCallStarted { call_id, .. } => {
                     assert!(
@@ -323,6 +379,23 @@ fn gate_deny_covers_execute_mcp_subagent_and_full_access() {
     assert_denied("gate-deny-exec", ToolKind::Execute);
     assert_denied("gate-deny-edit", ToolKind::Edit);
     assert_denied("gate-deny-delete", ToolKind::Execute);
+    // The deletion was actually attempted, and the gate stopped it.
+    let evs = events("gate-deny-delete");
+    let rm = evs.iter().find_map(|e| match e {
+        AgentEvent::ToolCallStarted { call_id, input, .. }
+            if input["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("rm victim.txt")) =>
+        {
+            Some(call_id.clone())
+        }
+        _ => None,
+    });
+    let rm = rm.expect("the agent tried rm victim.txt");
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        AgentEvent::ToolCallFinished { call_id, status: ToolStatus::Denied, .. } if *call_id == rm
+    )));
     assert_denied("gate-deny-fetch", ToolKind::Fetch);
     assert_denied("gate-deny-fullaccess", ToolKind::Execute);
     assert_denied("gate-deny-mcp", ToolKind::Mcp);

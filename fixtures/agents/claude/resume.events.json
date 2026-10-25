@@ -60,7 +60,7 @@
       "output_tokens": 10,
       "cache_read_tokens": 28422,
       "cache_write_tokens": 4741,
-      "reasoning_tokens": null,
+      "reasoning_tokens": 0,
       "cost_usd": null
     }
   },
@@ -82,10 +82,10 @@
   {
     "type": "usage",
     "usage": {
-      "input_tokens": 2,
-      "output_tokens": 10,
-      "cache_read_tokens": 28422,
-      "cache_write_tokens": 4741,
+      "input_tokens": 4,
+      "output_tokens": 14,
+      "cache_read_tokens": 53837,
+      "cache_write_tokens": 12436,
       "reasoning_tokens": 0,
       "cost_usd": 0.0030329700000000003
     }
@@ -95,10 +95,10 @@
     "turn": 1,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 2,
-      "output_tokens": 10,
-      "cache_read_tokens": 28422,
-      "cache_write_tokens": 4741,
+      "input_tokens": 4,
+      "output_tokens": 14,
+      "cache_read_tokens": 53837,
+      "cache_write_tokens": 12436,
       "reasoning_tokens": 0,
       "cost_usd": 0.0030329700000000003
     }
