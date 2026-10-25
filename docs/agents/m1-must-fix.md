@@ -26,7 +26,7 @@ M0 spikes are merged as spikes: they answered their questions, but they aren't p
 
 | # | Sev. | Must fix |
 |---|---|---|
-| O1 | **blocker** | The Code Mode (`execute`) policy applies to **every** agent, including `build`, custom agents and inherited rules, not only `explore`/`general`. Proven against a config that tries to re-enable it. (The default, deny vs native + Partial, is a Pedro decision that's still open.) |
+| O1 | **blocker** | The Code Mode (`execute`) policy applies to **every** agent, including `build`, custom agents and inherited rules, not only `explore`/`general`. Proven against a config that tries to re-enable it. **Default decided (D-019): native Code Mode on + enforcement *Partial*; "turn Code Mode off" is an opt-in that must then apply to every agent.** The spike currently denies by default; M1 flips it. |
 | O2 | major | Cancelling a turn also clears runtime `pending_approvals`/`pending_questions`; a cancelled approval can never be executed. |
 | O3 | major | Waiting on a terminal never blocks Interrupt/Shutdown (off the session loop). |
 | O4 | major | `Usage`: ACP `UsageUpdate.used` is context size, not input tokens; cost is per-turn deltas, not cumulative. |

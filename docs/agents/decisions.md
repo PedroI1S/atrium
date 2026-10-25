@@ -91,3 +91,6 @@ This amends D-002's assumption. `scripts/agent-run` now parses the generated `ho
 
 ## D-018 — 2026-10-25 — M0-03 and M0-04 merged as spikes; review findings become M1 must-fixes
 **Decided by Pedro.** Both reviews (Sol) said rework, each with a security blocker: the M0-03 hook-config race, and M0-04 inherited agent rules re-enabling Code Mode. Both tasks had used their two fix rounds. They're merged as spikes, since their M0 questions are answered (real protocols, gating feasibility, fail-open behaviour). Every finding is recorded in `docs/agents/m1-must-fix.md`, which becomes part of the Definition of Done of the M1 tasks that turn these spikes into real adapters.
+
+## D-019 — 2026-10-25 — OpenCode keeps native Code Mode; enforcement shown as Partial
+**Decided by Pedro (owner).** As with Claude (D-017): Atrium sessions keep OpenCode's native Code Mode (`execute`) on by default. It can't be gated, so the provider's enforcement level is shown as *Partial*, with the reason (D-012). The user's own MCP servers keep working through it. Turning Code Mode off per session (Full enforcement, but then the user's own MCP servers need direct mode) is offered as an option. The M0-04 spike denies it by default; M1 flips the default (`m1-must-fix.md` O1).
