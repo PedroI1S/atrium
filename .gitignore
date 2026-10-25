@@ -19,3 +19,6 @@ dist/
 # Python
 __pycache__/
 *.pyc
+
+# Playwright MCP output (written to the orchestrator session's cwd)
+/.playwright-mcp/
