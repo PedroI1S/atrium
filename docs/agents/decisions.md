@@ -70,3 +70,11 @@ GPT-6 Astra reviewed revision 1 read-only (`docs/agents/reviews/M0-contracts.md`
 
 ## D-014 — 2026-10-24 — M0 contracts revision 2 approved and frozen
 **Approved by Pedro.** Frozen: `crates/atrium-protocol`, `crates/atrium-agents`, `docs/contracts/m0.md`, and briefs M0-01 … M0-09, all as of revision 2 (D-009, with D-011 applied). The code is tagged `contracts/m0-r2`, local until the next handoff (D-007). From now on, any change goes through `docs/agents/change-requests.md`. **Dispatch: not yet. Pedro will give a separate go.** Before M0-03/M0-04 are dispatched, the `agy` 1.4.7 hook check (HANDOFF.md) must pass.
+
+## D-015 — 2026-10-25 — Argon paused (weekly limit used up; no paid overage)
+**Decided by Pedro.** Gemini 4 Argon isn't used until Pedro says otherwise. Reassignments, following PLAN §8.3 (escalate across providers):
+- **M0-03 (`agy` adapter) and M0-04 (ACP adapter)**: Argon's work stays on its branches. Any further fix rounds go to **Sonnet 5.5**, and their reviewer becomes **GPT-6.1 Sol** (never the author's provider).
+- **Reviews Argon would have done** (cross-provider for Anthropic-authored work, security and isolation reviews): **Sol**, and **GPT-6 Astra** for gate/security reviews (with Pedro's OK for each Astra launch, as before).
+- Gemini 3.8 Flash isn't affected by this decision (M0-09 stays with Flash).
+
+Both providers have limits too (Codex on ChatGPT Plus ran out on 2026-10-25), so dispatch respects them. When a worker hits a limit, it's paused and resumed after the reset, not re-routed silently.
