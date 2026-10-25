@@ -114,7 +114,7 @@ export async function runBench(
       cpuRss: streamRun.cpuRss,
     };
 
-    // 4. Click-to-frame latency. A DOM mousedown/mouseup is dispatched on the canvas, so the
+    // 4. Click-to-frame latency. A DOM pointerdown/pointerup is dispatched on the canvas, so the
     // whole path runs: Pane handler -> invoke -> Rust -> CDP pipe -> Chromium -> screencast
     // frame -> channel -> createImageBitmap -> drawImage. The clock stops when the first frame
     // whose probe pixel shows the new colour has been drawn to the canvas.
@@ -150,9 +150,9 @@ export async function runBench(
       });
       const start = performance.now();
       const ev = (type: string, buttons: number) =>
-        new MouseEvent(type, { clientX, clientY, button: 0, buttons, detail: 1, bubbles: true, cancelable: true });
-      pane.canvas.dispatchEvent(ev("mousedown", 1));
-      pane.canvas.dispatchEvent(ev("mouseup", 0));
+        new PointerEvent(type, { clientX, clientY, button: 0, buttons, detail: 1, bubbles: true, cancelable: true });
+      pane.canvas.dispatchEvent(ev("pointerdown", 1));
+      pane.canvas.dispatchEvent(ev("pointerup", 0));
       const hit = await match;
       if (hit) {
         latency.push(hit.drawnAt - start);
@@ -163,7 +163,7 @@ export async function runBench(
       }
     }
     report.inputToFrameMs = {
-      definition: "synthetic DOM mousedown on the canvas -> drawImage of the first frame showing the change",
+      definition: "synthetic DOM pointerdown on the canvas -> drawImage of the first frame showing the change",
       misses,
       dist: dist(latency),
       channelTransitMs: dist(transitAtMatch),

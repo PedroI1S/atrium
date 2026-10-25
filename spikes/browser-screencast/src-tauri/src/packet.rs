@@ -1,6 +1,6 @@
 //! Binary layout of one screencast frame on the `tauri::ipc::Channel`.
 //!
-//! Little-endian, fixed 48-byte header followed by the encoded image (JPEG or PNG):
+//! Little-endian, fixed 52-byte header followed by the encoded image (JPEG or PNG):
 //!
 //! | offset | type | field |
 //! |---|---|---|
@@ -13,8 +13,9 @@
 //! | 24 | f64 | Chromium timestamp (seconds since epoch) |
 //! | 32 | f64 | backend received the CDP event (ms since epoch) |
 //! | 40 | f64 | backend sent the packet to the channel (ms since epoch) |
+//! | 48 | u32 | stream generation: which `pane_attach` produced this frame; acks must echo it |
 
-pub const HEADER_LEN: usize = 48;
+pub const HEADER_LEN: usize = 52;
 pub const FLAG_PNG: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +29,7 @@ pub struct Header {
     pub cdp_timestamp: f64,
     pub rx_epoch_ms: f64,
     pub sent_epoch_ms: f64,
+    pub stream: u32,
 }
 
 pub fn encode(h: &Header, image: &[u8]) -> Vec<u8> {
@@ -41,6 +43,7 @@ pub fn encode(h: &Header, image: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&h.cdp_timestamp.to_le_bytes());
     out.extend_from_slice(&h.rx_epoch_ms.to_le_bytes());
     out.extend_from_slice(&h.sent_epoch_ms.to_le_bytes());
+    out.extend_from_slice(&h.stream.to_le_bytes());
     out.extend_from_slice(image);
     out
 }
@@ -63,13 +66,14 @@ pub fn decode(buf: &[u8]) -> Option<(Header, &[u8])> {
             cdp_timestamp: d(24),
             rx_epoch_ms: d(32),
             sent_epoch_ms: d(40),
+            stream: u(48),
         },
         &buf[HEADER_LEN..],
     ))
 }
 
 #[cfg(test)]
-const GOLDEN_HEADER_HEX: &str = "070000000100000063000000010000000010a044000034443bdf0740fc54d94100b88756febc784200c48756febc7842";
+const GOLDEN_HEADER_HEX: &str = "070000000100000063000000010000000010a044000034443bdf0740fc54d94100b88756febc784200c48756febc784203000000";
 
 #[cfg(test)]
 mod tests {
@@ -87,6 +91,7 @@ mod tests {
             cdp_timestamp: 1_700_000_000.123,
             rx_epoch_ms: 1_700_000_000_123.5,
             sent_epoch_ms: 1_700_000_000_124.25,
+            stream: 3,
         };
         let image = [0xff, 0xd8, 1, 2, 3];
         let wire = encode(&h, &image);

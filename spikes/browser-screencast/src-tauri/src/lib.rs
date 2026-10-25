@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod fixture;
 pub mod packet;
 pub mod procstat;
+pub mod profile;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,8 +43,17 @@ struct Session {
 }
 
 struct Stream {
+    /// Generation of this attachment: stamped into every frame header, echoed by `pane_ack`.
+    id: u32,
     page: Arc<Page>,
     task: JoinHandle<()>,
+}
+
+/// An ack is only forwarded if it belongs to the stream that is active now. A late ack from a
+/// stream that was replaced (a context switch) must not reach the new page: its id means
+/// nothing there and would release a frame the pane has not drawn yet.
+fn ack_belongs_to(active: Option<u32>, ack_stream: u32) -> bool {
+    active == Some(ack_stream)
 }
 
 struct SamplerRun {
@@ -61,6 +71,7 @@ struct AppState {
     /// ack after drawing (end-to-end back-pressure).
     eager_ack: AtomicBool,
     samplers: Mutex<HashMap<String, SamplerRun>>,
+    next_stream: std::sync::atomic::AtomicU32,
 }
 
 impl AppState {
@@ -215,9 +226,15 @@ async fn pane_attach(
     quality: Option<u8>,
     format: Option<String>,
     on_frame: Channel<InvokeResponseBody>,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let (_, page) = state.page(context).await?;
-    stop_stream(&state).await;
+    // Held until the new stream is stored, so two quick switches cannot interleave.
+    let mut slot = state.stream.lock().await;
+    if let Some(old) = slot.take() {
+        old.task.abort();
+        let _ = old.page.stop_screencast().await;
+    }
+    let stream_id = state.next_stream.fetch_add(1, Ordering::SeqCst) + 1;
     let png = format.as_deref() == Some("png");
     let opts = ScreencastOptions {
         format: if png { FrameFormat::Png } else { FrameFormat::Jpeg },
@@ -239,6 +256,7 @@ async fn pane_attach(
                 cdp_timestamp: f.meta.timestamp,
                 rx_epoch_ms: f.rx_epoch_ms,
                 sent_epoch_ms: epoch_ms(),
+                stream: stream_id,
             };
             let wire = packet::encode(&header, &f.data);
             if on_frame.send(InvokeResponseBody::Raw(wire)).is_err() {
@@ -249,8 +267,8 @@ async fn pane_attach(
             }
         }
     });
-    *state.stream.lock().await = Some(Stream { page, task });
-    Ok(())
+    *slot = Some(Stream { id: stream_id, page, task });
+    Ok(stream_id)
 }
 
 async fn stop_stream(state: &AppState) {
@@ -268,8 +286,10 @@ async fn pane_detach(state: State<'_, AppState>) -> Result<(), String> {
 
 /// The pane calls this after it has drawn a frame (not used when `ATRIUM_ACK=eager`).
 #[tauri::command]
-async fn pane_ack(state: State<'_, AppState>, ack_id: i64) -> Result<(), String> {
-    if let Some(s) = state.stream.lock().await.as_ref() {
+async fn pane_ack(state: State<'_, AppState>, stream: u32, ack_id: i64) -> Result<(), String> {
+    if let Some(s) = state.stream.lock().await.as_ref()
+        && ack_belongs_to(Some(s.id), stream)
+    {
         s.page.ack(ack_id);
     }
     Ok(())
@@ -289,10 +309,10 @@ async fn pane_resize(state: State<'_, AppState>, width: u32, height: u32, device
 
 #[tauri::command]
 async fn pane_navigate(state: State<'_, AppState>, context: usize, url: String) -> Result<(), String> {
-    state.control.require_user()?;
+    let _turn = state.control.user_enter().await?;
     let (_, page) = state.page(context).await?;
     // Do not wait for load: the pane keeps streaming while the page loads.
-    let r = page.navigate_start(&url).await.map_err(err)?;
+    let r = page.navigate_start(&url, || Ok(())).await.map_err(err)?;
     match r["errorText"].as_str() {
         Some(e) => Err(format!("navigate: {e}")),
         None => Ok(()),
@@ -301,7 +321,7 @@ async fn pane_navigate(state: State<'_, AppState>, context: usize, url: String) 
 
 #[tauri::command]
 async fn pane_history(state: State<'_, AppState>, context: usize, action: String) -> Result<(), String> {
-    state.control.require_user()?;
+    let _turn = state.control.user_enter().await?;
     let (_, page) = state.page(context).await?;
     match action.as_str() {
         "back" => page.history_step(-1).await,
@@ -314,14 +334,14 @@ async fn pane_history(state: State<'_, AppState>, context: usize, action: String
 
 #[tauri::command]
 async fn pane_mouse(state: State<'_, AppState>, context: usize, params: MouseParams) -> Result<(), String> {
-    state.control.require_user()?;
+    let _turn = state.control.user_enter().await?;
     let (_, page) = state.page(context).await?;
     page.mouse(&params).await.map_err(err)
 }
 
 #[tauri::command]
 async fn pane_key(state: State<'_, AppState>, context: usize, params: KeyParams) -> Result<(), String> {
-    state.control.require_user()?;
+    let _turn = state.control.user_enter().await?;
     let (_, page) = state.page(context).await?;
     page.key(&params).await.map_err(err)
 }
@@ -329,7 +349,7 @@ async fn pane_key(state: State<'_, AppState>, context: usize, params: KeyParams)
 /// IME: `Input.imeSetComposition` while composing, `Input.insertText` to commit.
 #[tauri::command]
 async fn pane_ime(state: State<'_, AppState>, context: usize, kind: String, text: String) -> Result<(), String> {
-    state.control.require_user()?;
+    let _turn = state.control.user_enter().await?;
     let (_, page) = state.page(context).await?;
     let len = i32::try_from(text.encode_utf16().count()).unwrap_or(0);
     match kind.as_str() {
@@ -342,9 +362,12 @@ async fn pane_ime(state: State<'_, AppState>, context: usize, kind: String, text
 
 // ---- take over --------------------------------------------------------------------------
 
+/// Completes only once every input admitted under the previous owner has finished or been
+/// cancelled (see `control.rs`).
 #[tauri::command]
-fn set_user_control(state: State<'_, AppState>, on: bool) {
-    state.control.set_user_control(on);
+async fn set_user_control(state: State<'_, AppState>, on: bool) -> Result<(), String> {
+    state.control.set_user_control(on).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -363,30 +386,37 @@ async fn agent_action(
     y: Option<f64>,
     url: Option<String>,
 ) -> Result<String, String> {
-    state.control.require_agent()?;
+    // The turn is held for the whole action; `checkpoint()` between commands stops it as soon
+    // as the user takes over, and `set_user_control(true)` waits for it to finish.
+    let turn = state.control.agent_enter().await?;
     let (_, page) = state.page(context).await?;
     match kind.as_str() {
         "click" => {
             let (x, y) = (x.unwrap_or(100.0), y.unwrap_or(100.0));
-            for kind in ["mousePressed", "mouseReleased"] {
-                let p = MouseParams {
-                    kind: kind.into(),
-                    x,
-                    y,
-                    button: Some("left".into()),
-                    buttons: Some(i32::from(kind == "mousePressed")),
-                    click_count: Some(1),
-                    modifiers: None,
-                    delta_x: None,
-                    delta_y: None,
-                };
-                page.mouse(&p).await.map_err(err)?;
+            let event = |kind: &str| MouseParams {
+                kind: kind.into(),
+                x,
+                y,
+                button: Some("left".into()),
+                buttons: Some(i32::from(kind == "mousePressed")),
+                click_count: Some(1),
+                modifiers: None,
+                delta_x: None,
+                delta_y: None,
+            };
+            page.mouse(&event("mousePressed")).await.map_err(err)?;
+            if let Err(cancelled) = turn.checkpoint() {
+                // Never leave the agent's own button held down for the user.
+                let _ = page.mouse(&event("mouseReleased")).await;
+                return Err(cancelled);
             }
+            page.mouse(&event("mouseReleased")).await.map_err(err)?;
             Ok(format!("agent clicked ({x}, {y})"))
         }
         "navigate" => {
             let url = url.ok_or("url required")?;
-            page.navigate(&url).await.map_err(err)?;
+            turn.checkpoint()?;
+            page.navigate_cancellable(&url, || turn.checkpoint()).await.map_err(err)?;
             Ok(format!("agent navigated to {url}"))
         }
         other => Err(format!("unknown agent action {other}")),
@@ -509,4 +539,16 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ack_belongs_to;
+
+    #[test]
+    fn acks_only_reach_the_stream_that_produced_the_frame() {
+        assert!(ack_belongs_to(Some(2), 2));
+        assert!(!ack_belongs_to(Some(2), 1), "late ack from the replaced stream");
+        assert!(!ack_belongs_to(None, 1), "no stream attached");
+    }
 }

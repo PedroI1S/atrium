@@ -190,3 +190,23 @@ async fn keyboard_ime_and_wheel_are_forwarded() {
     assert_eq!(page.eval("innerWidth").await.unwrap(), json!(500));
     l.browser.close().await;
 }
+
+/// A second Atrium on the same profile must be refused, and must not touch the first one's browser.
+#[tokio::test]
+async fn second_owner_of_a_profile_is_refused_and_the_first_browser_survives() {
+    let Some(l) = live().await else { return };
+    let info = discovery::pick(&discovery::discover(), None).unwrap();
+    let err = Browser::launch(&LaunchOptions {
+        binary: info.binary,
+        user_data_dir: l.browser.user_data_dir.clone(),
+        log_path: None,
+        extra_args: vec![],
+    })
+    .await
+    .err()
+    .expect("second launch must fail");
+    assert!(err.to_string().contains("in use by another running Atrium"), "{err}");
+    // The first browser is untouched and still answers.
+    assert!(l.browser.version().await.unwrap().contains("Chrome"));
+    l.browser.close().await;
+}

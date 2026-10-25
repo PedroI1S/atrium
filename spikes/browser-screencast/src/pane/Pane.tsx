@@ -1,5 +1,6 @@
 import { createEffect, onCleanup, onMount } from "solid-js";
 import { PaneController, type PaneOptions } from "./controller";
+import { bindImeSink } from "./imeSink";
 
 interface PaneProps {
   options: PaneOptions;
@@ -14,12 +15,43 @@ export function Pane(props: PaneProps) {
   let canvas!: HTMLCanvasElement;
   let sink!: HTMLTextAreaElement;
   let box!: HTMLDivElement;
+  let controller: PaneController | undefined;
 
   onMount(() => {
     const c = new PaneController(canvas, props.options);
+    controller = c;
     c.onError = props.onError;
-    c.userControl = props.userControl;
+    c.setUserControl(props.userControl);
     (window as unknown as { __pane: PaneController }).__pane = c;
+
+    // Pointer events with capture: a drag that leaves the canvas still delivers its release.
+    const down = (e: PointerEvent) => {
+      if (!props.userControl) return;
+      try {
+        canvas.setPointerCapture(e.pointerId);
+      } catch {
+        // Synthetic events (the bench) have no active pointer to capture.
+      }
+      sink.focus({ preventScroll: true });
+      c.mouseDown(e);
+    };
+    const up = (e: PointerEvent) => c.mouseUp(e);
+    const move = (e: PointerEvent) => c.mouseMove(e);
+    // Anything that ends the gesture without a pointerup must release the held buttons.
+    const release = () => void c.releaseAll();
+    const wheel = (e: WheelEvent) => {
+      if (!props.userControl) return;
+      e.preventDefault();
+      c.wheel(e);
+    };
+    canvas.addEventListener("pointerdown", down);
+    canvas.addEventListener("pointerup", up);
+    canvas.addEventListener("pointermove", move);
+    canvas.addEventListener("pointercancel", release);
+    canvas.addEventListener("lostpointercapture", release);
+    canvas.addEventListener("wheel", wheel, { passive: false });
+    window.addEventListener("blur", release);
+    const unbindSink = bindImeSink(sink, c);
 
     let timer = 0;
     const observer = new ResizeObserver(() => {
@@ -30,16 +62,19 @@ export function Pane(props: PaneProps) {
       }, 60);
     });
     observer.observe(box);
-    onCleanup(() => observer.disconnect());
+    onCleanup(() => {
+      observer.disconnect();
+      unbindSink();
+      window.removeEventListener("blur", release);
+    });
     props.ready(c);
   });
 
-  const controller = () => (window as unknown as { __pane?: PaneController }).__pane;
   // The controller gates input on this flag; keep it in step with the prop.
   createEffect(() => {
-    const c = controller();
-    if (c) c.userControl = props.userControl;
-    if (props.userControl) sink?.focus({ preventScroll: true });
+    const on = props.userControl;
+    controller?.setUserControl(on);
+    if (on) sink?.focus({ preventScroll: true });
   });
 
   return (
@@ -48,22 +83,7 @@ export function Pane(props: PaneProps) {
         ref={canvas}
         classList={{ driving: props.userControl }}
         aria-label="Browser page"
-        onMouseDown={(e) => {
-          if (!props.userControl) return;
-          sink.focus({ preventScroll: true });
-          controller()?.mouseDown(e);
-        }}
-        onMouseUp={(e) => controller()?.mouseUp(e)}
-        onMouseMove={(e) => controller()?.mouseMove(e)}
         onContextMenu={(e) => e.preventDefault()}
-        on:wheel={{
-          passive: false,
-          handleEvent: (e: WheelEvent) => {
-            if (!props.userControl) return;
-            e.preventDefault();
-            controller()?.wheel(e);
-          },
-        }}
       />
       {/* Keyboard and IME sink: focus lives here so the OS input method has a text target. */}
       <textarea
@@ -73,21 +93,6 @@ export function Pane(props: PaneProps) {
         autocomplete="off"
         autocapitalize="off"
         spellcheck={false}
-        onKeyDown={(e) => {
-          if (controller()?.key("keyDown", e)) e.preventDefault();
-        }}
-        onKeyUp={(e) => {
-          if (controller()?.key("keyUp", e)) e.preventDefault();
-        }}
-        onCompositionUpdate={(e) => controller()?.ime("compose", e.data)}
-        onCompositionEnd={(e) => {
-          controller()?.ime("commit", e.data);
-          sink.value = "";
-        }}
-        onInput={() => {
-          // Text reaches the page through keydown and composition events, never through this element.
-          sink.value = "";
-        }}
       />
     </div>
   );

@@ -87,7 +87,8 @@ struct Inner {
     next_id: AtomicU64,
     pending: Pending,
     writer: Mutex<Box<dyn Write + Send>>,
-    events: broadcast::Sender<Arc<CdpEvent>>,
+    /// Dropped at EOF so every subscriber's `recv()` returns `Closed` instead of waiting forever.
+    events: Mutex<Option<broadcast::Sender<Arc<CdpEvent>>>>,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -114,7 +115,7 @@ impl Cdp {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             writer: Mutex::new(Box::new(writer)),
-            events,
+            events: Mutex::new(Some(events)),
             closed: std::sync::atomic::AtomicBool::new(false),
         });
         let thread_inner = inner.clone();
@@ -125,8 +126,13 @@ impl Cdp {
         Self { inner }
     }
 
+    /// A receiver for browser events. After the connection closed it is already closed
+    /// (`recv()` returns `Closed` at once), so consumers always terminate.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<CdpEvent>> {
-        self.inner.events.subscribe()
+        match self.inner.events.lock().unwrap().as_ref() {
+            Some(tx) => tx.subscribe(),
+            None => broadcast::channel(1).1,
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -213,6 +219,7 @@ fn read_loop(mut reader: impl Read, inner: &Arc<Inner>) {
         acc.extend_from_slice(rest);
     }
     inner.closed.store(true, Ordering::Relaxed);
+    inner.events.lock().unwrap().take(); // closes every event subscriber
     let drained: Vec<_> = inner.pending.lock().unwrap().drain().collect();
     for (_, (_, tx)) in drained {
         let _ = tx.send(Err(CdpError::Closed));
@@ -232,12 +239,14 @@ fn dispatch(msg: &[u8], inner: &Inner) {
         let _ = tx.send(outcome);
     } else if let (Some(method), Some(params)) = (m.method, m.params) {
         // No subscribers is fine; the event is simply dropped.
-        let _ = inner.events.send(Arc::new(CdpEvent {
-            method,
-            session_id: m.session_id,
-            params: params.to_owned(),
-            received_epoch_ms: received,
-        }));
+        if let Some(tx) = inner.events.lock().unwrap().as_ref() {
+            let _ = tx.send(Arc::new(CdpEvent {
+                method,
+                session_id: m.session_id,
+                params: params.to_owned(),
+                received_epoch_ms: received,
+            }));
+        }
     }
 }
 
@@ -327,5 +336,19 @@ mod tests {
         assert!(matches!(call.await.unwrap(), Err(CdpError::Closed)));
         assert!(cdp.is_closed());
         assert!(matches!(cdp.call_raw("After.close", serde_json::json!({}), None).await, Err(CdpError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn eof_closes_event_subscribers_waiting_and_late() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let cdp = Cdp::new(client.try_clone().unwrap(), client);
+        let mut waiting = cdp.subscribe();
+        let waiter = tokio::spawn(async move { waiting.recv().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(server);
+        let r = tokio::time::timeout(Duration::from_secs(2), waiter).await.expect("waiter must wake").unwrap();
+        assert!(matches!(r, Err(broadcast::error::RecvError::Closed)));
+        let mut late = cdp.subscribe();
+        assert!(matches!(late.recv().await, Err(broadcast::error::RecvError::Closed)));
     }
 }

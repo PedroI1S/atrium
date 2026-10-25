@@ -39,9 +39,11 @@ export function App() {
   }
 
   async function takeOver(on: boolean) {
+    // Handing back: release any button the pane still holds while the backend still accepts it.
+    if (!on) await pane?.releaseAll();
     await setUserControl(on);
     setControl(on);
-    if (pane) pane.userControl = on;
+    pane?.setUserControl(on);
     say(on ? "You have control. The agent is paused." : "Control handed back to the agent.");
   }
 

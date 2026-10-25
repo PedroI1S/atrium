@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::cdp::{Cdp, CdpEvent};
+use crate::profile::{self, ProfileLock, Reaped};
 
 #[derive(Debug, Clone)]
 pub struct LaunchOptions {
@@ -79,45 +80,19 @@ pub struct Browser {
     pub binary: PathBuf,
     pub user_data_dir: PathBuf,
     child: Mutex<Option<tokio::process::Child>>,
-}
-
-const PID_FILE: &str = "atrium-browser.pid";
-
-/// Kills a Chromium left behind by a previous run that died without closing it.
-///
-/// Closing the debugging pipe does NOT make Chromium exit (measured: it was still running 30 s
-/// after its parent got SIGKILL), so the owner has to clean up. The pid file lives in the
-/// profile dir; a pid is only killed if its command line still names this profile, so a
-/// recycled pid is never touched. Returns true when something was killed.
-pub fn reap_stale(user_data_dir: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(user_data_dir.join(PID_FILE)) else { return false };
-    let Ok(pid) = text.trim().parse::<i32>() else { return false };
-    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
-    if pid <= 1 || !alive(pid) {
-        return false;
-    }
-    let cmdline = std::process::Command::new("ps").args(["-o", "command=", "-p", &pid.to_string()]).output();
-    let names_profile = cmdline
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&user_data_dir.display().to_string()))
-        .unwrap_or(false);
-    if !names_profile {
-        return false;
-    }
-    // SAFETY: plain signal to a process we verified is our own stale browser.
-    unsafe { libc::kill(pid, libc::SIGTERM) };
-    for _ in 0..50 {
-        if !alive(pid) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    true
+    /// Held for the browser's lifetime: proves this process owns the profile.
+    lock: ProfileLock,
 }
 
 impl Browser {
     pub async fn launch(opts: &LaunchOptions) -> Result<Arc<Self>> {
-        std::fs::create_dir_all(&opts.user_data_dir).context("create user-data-dir")?;
-        reap_stale(&opts.user_data_dir);
+        // Refuses (instead of killing anything) when another live Atrium owns this profile.
+        let lock = ProfileLock::acquire(&opts.user_data_dir)?;
+        match profile::reap_stale(&lock) {
+            Reaped::Killed(pid) => eprintln!("reaped orphaned browser {pid} from a previous run"),
+            Reaped::Refused(why) => eprintln!("left a leftover browser record alone: {why}"),
+            Reaped::Nothing => {}
+        }
         // Parent -> child commands (child fd 3) and child -> parent responses (child fd 4).
         let (cmd_r, cmd_w) = make_pipe()?;
         let (resp_r, resp_w) = make_pipe()?;
@@ -144,7 +119,9 @@ impl Browser {
         }
         let child = command.spawn().with_context(|| format!("spawn {}", opts.binary.display()))?;
         let pid = child.id().ok_or_else(|| anyhow!("browser exited immediately"))?;
-        std::fs::write(opts.user_data_dir.join(PID_FILE), pid.to_string()).context("write pid file")?;
+        if let Some(record) = profile::describe(pid, &opts.user_data_dir) {
+            profile::write_record(&lock, &record).context("write browser record")?;
+        }
         // The parent must not keep the child's ends open, or EOF would never be seen.
         drop(cmd_r);
         drop(resp_w);
@@ -156,6 +133,7 @@ impl Browser {
             binary: opts.binary.clone(),
             user_data_dir: opts.user_data_dir.clone(),
             child: Mutex::new(Some(child)),
+            lock,
         });
         // Fails fast (instead of hanging) when the browser refused to start.
         let _version: Value = tokio::time::timeout(
@@ -206,7 +184,7 @@ impl Browser {
             let _ = child.kill().await;
         }
         *guard = None;
-        let _ = std::fs::remove_file(self.user_data_dir.join(PID_FILE));
+        profile::clear_record(&self.lock);
     }
 }
 
@@ -376,10 +354,14 @@ impl Page {
     /// `Page.navigate`, returning the raw result. The first navigation shortly after launch
     /// is sometimes answered with `net::ERR_ABORTED` (seen reliably in the app, about 1 in 12
     /// in a headless probe; cause not found). One retry after 300 ms always succeeded.
-    pub async fn navigate_start(&self, url: &str) -> Result<Value> {
+    ///
+    /// `still_allowed` is checked before the retry, so a retry never fires after the caller lost
+    /// the right to drive (the user took over while we slept).
+    pub async fn navigate_start(&self, url: &str, still_allowed: impl Fn() -> Result<(), String>) -> Result<Value> {
         let mut r = self.call("Page.navigate", json!({"url": url})).await?;
         if r["errorText"].as_str() == Some("net::ERR_ABORTED") {
             tokio::time::sleep(Duration::from_millis(300)).await;
+            still_allowed().map_err(anyhow::Error::msg)?;
             r = self.call("Page.navigate", json!({"url": url})).await?;
         }
         Ok(r)
@@ -387,8 +369,14 @@ impl Page {
 
     /// Navigates and waits for `Page.loadEventFired` (15 s cap).
     pub async fn navigate(&self, url: &str) -> Result<()> {
+        self.navigate_cancellable(url, || Ok(())).await
+    }
+
+    /// Like `navigate`, but `check` is polled while waiting and before any retry; an `Err` aborts
+    /// the wait (used so an agent navigation never outlives a user take-over).
+    pub async fn navigate_cancellable(&self, url: &str, check: impl Fn() -> Result<(), String>) -> Result<()> {
         let mut rx = self.subscribe();
-        let r = self.navigate_start(url).await?;
+        let r = self.navigate_start(url, &check).await?;
         if let Some(err) = r["errorText"].as_str() {
             bail!("navigate {url}: {err}");
         }
@@ -396,19 +384,21 @@ impl Page {
         if r.get("loaderId").is_none() {
             return Ok(());
         }
-        let wait = async {
-            loop {
-                match rx.recv().await {
-                    Ok(ev) if ev.method == "Page.loadEventFired" && ev.session_id.as_deref() == Some(&self.session_id) => {
-                        return;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return,
-                    _ => {}
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            check().map_err(anyhow::Error::msg)?;
+            let slice = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+            match slice {
+                Ok(Ok(ev)) if ev.method == "Page.loadEventFired" && ev.session_id.as_deref() == Some(&self.session_id) => {
+                    return Ok(());
                 }
+                Ok(Err(broadcast::error::RecvError::Closed)) => return Ok(()),
+                _ => {}
             }
-        };
-        tokio::time::timeout(Duration::from_secs(15), wait).await.map_err(|_| anyhow!("load of {url} timed out"))?;
-        Ok(())
+            if tokio::time::Instant::now() >= deadline {
+                bail!("load of {url} timed out");
+            }
+        }
     }
 
     pub async fn eval(&self, expression: &str) -> Result<Value> {
@@ -512,43 +502,53 @@ pub fn profile_dir(data_dir: &Path, name: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
     use super::*;
 
-    fn alive(pid: i32) -> bool {
-        unsafe { libc::kill(pid, 0) == 0 }
+    /// A browser stand-in that answers every command with `{}` until it is dropped.
+    fn answer_everything(server: UnixStream) {
+        std::thread::spawn(move || {
+            let mut s = server;
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let Ok(n) = s.read(&mut buf) else { return };
+                if n == 0 {
+                    return;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                while let Some(p) = acc.iter().position(|&b| b == 0) {
+                    let line: Vec<u8> = acc.drain(..=p).collect();
+                    let v: Value = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
+                    let mut out = serde_json::to_vec(&json!({"id": v["id"], "result": {}})).unwrap();
+                    out.push(0);
+                    if s.write_all(&out).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
     }
 
-    #[test]
-    fn reaper_kills_only_a_process_that_names_the_profile() {
-        let dir = tempfile::tempdir().unwrap();
-        let profile = dir.path().join("profile");
-        std::fs::create_dir_all(&profile).unwrap();
+    /// Before the fix a `FrameStream` waiting for a frame never returned once the browser was
+    /// gone, because the event channel's sender lived on inside the `Cdp` the page still held.
+    #[tokio::test]
+    async fn frame_stream_ends_when_the_browser_connection_closes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let keep = server.try_clone().unwrap();
+        answer_everything(server);
+        let cdp = Cdp::new(client.try_clone().unwrap(), client);
+        let page = Page { cdp, context_id: "c".into(), target_id: "t".into(), session_id: "s".into() };
+        let mut frames = page.start_screencast(ScreencastOptions::default()).await.unwrap();
 
-        // A bystander whose command line does not mention the profile (a recycled pid).
-        let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        std::fs::write(profile.join(PID_FILE), other.id().to_string()).unwrap();
-        assert!(!reap_stale(&profile));
-        assert!(alive(other.id() as i32));
-        other.kill().unwrap();
-        other.wait().unwrap();
-
-        // A stale browser: its command line carries the profile path.
-        let mut stale = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("sleep 30 # --user-data-dir={}", profile.display()))
-            .spawn()
-            .unwrap();
-        std::fs::write(profile.join(PID_FILE), stale.id().to_string()).unwrap();
-        assert!(reap_stale(&profile));
-        assert!(stale.wait().is_ok());
-        assert!(!reap_stale(&profile), "already gone");
-    }
-
-    #[test]
-    fn reaper_ignores_missing_and_garbage_pid_files() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!reap_stale(dir.path()));
-        std::fs::write(dir.path().join(PID_FILE), "not a pid").unwrap();
-        assert!(!reap_stale(dir.path()));
+        let waiter = tokio::spawn(async move { frames.next().await.map(|f| f.seq) });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        keep.shutdown(std::net::Shutdown::Both).unwrap(); // the browser "exits"
+        let got = tokio::time::timeout(Duration::from_secs(2), waiter).await.expect("must not wait forever").unwrap();
+        assert_eq!(got, None);
+        // And the page's own calls now fail fast instead of hanging.
+        assert!(page.call("Page.reload", json!({})).await.is_err());
     }
 }

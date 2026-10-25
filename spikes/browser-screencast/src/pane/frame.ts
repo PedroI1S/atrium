@@ -1,6 +1,6 @@
 // Parses the binary screencast packet from the Rust side (layout in src-tauri/src/packet.rs).
 
-export const HEADER_LEN = 48;
+export const HEADER_LEN = 52;
 export const FLAG_PNG = 1;
 
 export interface FrameHeader {
@@ -16,6 +16,8 @@ export interface FrameHeader {
   rxEpochMs: number;
   /** Backend wrote the packet to the channel (ms since the epoch). */
   sentEpochMs: number;
+  /** Which `pane_attach` produced the frame; echoed back in the ack. */
+  stream: number;
 }
 
 export interface Frame {
@@ -39,6 +41,7 @@ export function parseFrame(buf: ArrayBuffer): Frame | null {
       cdpTimestamp: v.getFloat64(24, true),
       rxEpochMs: v.getFloat64(32, true),
       sentEpochMs: v.getFloat64(40, true),
+      stream: v.getUint32(48, true),
     },
     image: new Uint8Array(buf, HEADER_LEN),
     mime: flags & FLAG_PNG ? "image/png" : "image/jpeg",

@@ -6,6 +6,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { type FrameHeader, parseFrame } from "./frame";
 import {
   type KeyLike,
+  type MouseParams,
   type MouseLike,
   type PaneGeometry,
   type WheelLike,
@@ -39,13 +40,25 @@ export interface PaneStats {
   bytes: number;
   lastFrameBytes: number;
   lastDecodeMs: number;
+  /** Decoded size of the last frame in pixels: what Chromium really sent, not the canvas size. */
+  lastFrameWidth: number;
+  lastFrameHeight: number;
+}
+
+/** A pressed mouse button, remembered so it can be released if the pointer never comes back. */
+interface HeldButton {
+  context: number;
+  params: MouseParams;
 }
 
 export class PaneController {
   readonly canvas: HTMLCanvasElement;
   private readonly g2d: CanvasRenderingContext2D;
   private channel: Channel<ArrayBuffer> | null = null;
+  /** Bumped by every attach and detach. Packets and decodes from an older one are dropped. */
+  private generation = 0;
   private lastDrawnSeq = 0;
+  private readonly held = new Map<number, HeldButton>();
   private lastBitmap: ImageBitmap | null = null;
   private view = { width: 0, height: 0 };
   private pendingMove: MouseLike | null = null;
@@ -55,7 +68,7 @@ export class PaneController {
   /** Mirrors the backend flag; input is only forwarded while the user has control. */
   userControl = false;
   options: PaneOptions;
-  readonly stats: PaneStats = { framesDrawn: 0, framesDropped: 0, bytes: 0, lastFrameBytes: 0, lastDecodeMs: 0 };
+  readonly stats: PaneStats = { framesDrawn: 0, framesDropped: 0, bytes: 0, lastFrameBytes: 0, lastDecodeMs: 0, lastFrameWidth: 0, lastFrameHeight: 0 };
   /** The frontend acks after drawing (end-to-end back-pressure). Off when the backend acks eagerly. */
   ackAfterDraw = true;
   onDrawn?: (f: DrawnFrame) => void;
@@ -72,10 +85,14 @@ export class PaneController {
   // ---- screencast ----------------------------------------------------------------------
 
   async attach(context: number): Promise<void> {
+    // A button still held on the page we are leaving must be released there, not lost.
+    await this.releaseAll();
     this.context = context;
     this.lastDrawnSeq = 0;
+    const generation = ++this.generation;
     const channel = new Channel<ArrayBuffer>();
-    channel.onmessage = (buf) => void this.onPacket(buf);
+    // The closure pins the generation: a decode that finishes after a switch is recognised as stale.
+    channel.onmessage = (buf) => void this.onPacket(buf, generation);
     this.channel = channel;
     await invoke("pane_attach", {
       context,
@@ -86,11 +103,13 @@ export class PaneController {
   }
 
   async detach(): Promise<void> {
+    this.generation++;
     this.channel = null;
     await invoke("pane_detach");
   }
 
-  private async onPacket(raw: ArrayBuffer | number[]): Promise<void> {
+  private async onPacket(raw: ArrayBuffer | number[], generation: number): Promise<void> {
+    if (generation !== this.generation) return; // from a stream we already left
     const receivedEpochMs = Date.now();
     const buf = raw instanceof ArrayBuffer ? raw : new Uint8Array(raw).buffer;
     const frame = parseFrame(buf);
@@ -101,7 +120,13 @@ export class PaneController {
       bitmap = await createImageBitmap(new Blob([frame.image], { type: frame.mime }));
     } catch (e) {
       this.onError?.(`decode failed: ${e}`);
-      this.ack(frame.header.ackId); // never stall the stream on one bad frame
+      if (generation === this.generation) this.ack(frame.header); // never stall the stream on one bad frame
+      return;
+    }
+    if (generation !== this.generation) {
+      // The pane switched context (or detached) while this frame was decoding: never draw it,
+      // and its ack belongs to a stream the backend has already dropped.
+      bitmap.close();
       return;
     }
     this.stats.lastDecodeMs = performance.now() - t0;
@@ -109,7 +134,7 @@ export class PaneController {
       // A newer frame already won the race through the decoder; drawing this would go back in time.
       this.stats.framesDropped++;
       bitmap.close();
-      this.ack(frame.header.ackId);
+      this.ack(frame.header);
       return;
     }
     this.lastDrawnSeq = frame.header.seq;
@@ -119,6 +144,8 @@ export class PaneController {
     this.stats.framesDrawn++;
     this.stats.bytes += frame.image.byteLength;
     this.stats.lastFrameBytes = frame.image.byteLength;
+    this.stats.lastFrameWidth = bitmap.width;
+    this.stats.lastFrameHeight = bitmap.height;
     this.lastBitmap?.close();
     this.lastBitmap = bitmap;
     this.onDrawn?.({
@@ -129,11 +156,12 @@ export class PaneController {
       receivedEpochMs,
       bitmap,
     });
-    this.ack(frame.header.ackId);
+    this.ack(frame.header);
   }
 
-  private ack(ackId: number): void {
-    if (this.ackAfterDraw) void invoke("pane_ack", { ackId });
+  /** The ack names the stream that produced the frame; the backend ignores stale ones. */
+  private ack(header: FrameHeader): void {
+    if (this.ackAfterDraw) void invoke("pane_ack", { stream: header.stream, ackId: header.ackId });
   }
 
   // ---- size ----------------------------------------------------------------------------
@@ -165,20 +193,29 @@ export class PaneController {
 
   // ---- input (all of it gated on `userControl`; the backend enforces it too) ----------
 
-  private send(cmd: string, args: Record<string, unknown>): void {
-    invoke(cmd, args).catch((e) => this.onError?.(String(e)));
+  private send(cmd: string, args: Record<string, unknown>): Promise<void> {
+    return invoke<void>(cmd, args).catch((e) => this.onError?.(String(e)));
+  }
+
+  /** Called when ownership changes. Handing back releases anything still held first. */
+  setUserControl(on: boolean): void {
+    this.userControl = on;
+    if (!on) void this.releaseAll();
   }
 
   mouseDown = (e: MouseLike): void => {
     this.flushMove();
     if (!this.userControl) return;
-    this.send("pane_mouse", { context: this.context, params: mouseParams("mousePressed", e, this.geometry()) });
+    const params = mouseParams("mousePressed", e, this.geometry());
+    this.held.set(e.button, { context: this.context, params });
+    void this.send("pane_mouse", { context: this.context, params });
   };
 
   mouseUp = (e: MouseLike): void => {
     this.flushMove();
-    if (!this.userControl) return;
-    this.send("pane_mouse", { context: this.context, params: mouseParams("mouseReleased", e, this.geometry()) });
+    if (!this.userControl && !this.held.has(e.button)) return;
+    this.held.delete(e.button);
+    void this.send("pane_mouse", { context: this.context, params: mouseParams("mouseReleased", e, this.geometry()) });
   };
 
   /** Moves are coalesced to one per animation frame: the latest position wins. */
@@ -194,27 +231,56 @@ export class PaneController {
     const e = this.pendingMove;
     this.pendingMove = null;
     if (e && this.userControl) {
-      this.send("pane_mouse", { context: this.context, params: mouseParams("mouseMoved", e, this.geometry()) });
+      const params = mouseParams("mouseMoved", e, this.geometry());
+      for (const h of this.held.values()) {
+        h.params = { ...h.params, x: params.x, y: params.y };
+      }
+      void this.send("pane_mouse", { context: this.context, params });
     }
+  }
+
+  /**
+   * Releases every button the pane pressed and never saw released (pointer cancelled, window
+   * blurred, context switched, control handed back), at its last known position, so the page
+   * is not left in a half-finished drag. Resolves once the backend has them.
+   */
+  releaseAll(): Promise<void> {
+    const pending = [...this.held.values()];
+    this.held.clear();
+    return Promise.all(
+      pending.map((h) =>
+        this.send("pane_mouse", {
+          context: h.context,
+          params: { ...h.params, type: "mouseReleased", buttons: 0 },
+        }),
+      ),
+    ).then(() => undefined);
+  }
+
+  hasHeldButtons(): boolean {
+    return this.held.size > 0;
   }
 
   wheel = (e: WheelLike): void => {
     if (!this.userControl) return;
-    this.send("pane_mouse", { context: this.context, params: wheelParams(e, this.geometry()) });
+    void this.send("pane_mouse", { context: this.context, params: wheelParams(e, this.geometry()) });
   };
 
   key = (type: "keyDown" | "keyUp", e: KeyLike): boolean => {
     if (!this.userControl) return false;
     const params = keyParams(type, e);
     if (!params) return false;
-    this.send("pane_key", { context: this.context, params });
+    void this.send("pane_key", { context: this.context, params });
     return true;
   };
 
-  /** IME: `compose` while the candidate text changes, `commit` with the final text. */
+  /**
+   * IME: `compose` while the candidate text changes (an empty text cancels the composition),
+   * `commit` with the final text.
+   */
   ime = (kind: "compose" | "commit", text: string): void => {
     if (!this.userControl) return;
-    this.send("pane_ime", { context: this.context, kind, text });
+    void this.send("pane_ime", { context: this.context, kind, text });
   };
 
   // ---- navigation ----------------------------------------------------------------------
