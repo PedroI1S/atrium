@@ -25,6 +25,11 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 
 ## Conventions
 
+- **Shells**: Pedro's interactive shell is **fish**. The agents' shell tool runs zsh and reports `$SHELL=/bin/zsh`, so don't trust `$SHELL`.
+  - Commands an agent runs itself can be zsh/POSIX.
+  - Code never relies on the user's shell: scripts use `#!/usr/bin/env bash`.
+  - Any command written into a report, handoff or doc for a human to run must work in fish: `env VAR=value cmd` (not `VAR=value cmd`), no `$(...)` or `export`, or wrap it in a bash script.
+
 - Task IDs: `M<milestone>-<nn>-<slug>`, e.g. `M0-01-codex-client`.
 - Branches: `agent/<model>/<task-id>`, e.g. `agent/sol/M0-01-codex-client`.
 - Worktrees: `../atrium-wt/<task-id>`.
