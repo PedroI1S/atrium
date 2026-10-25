@@ -99,6 +99,14 @@ fn all_fixture_files_are_sanitized() {
                 "leaked user path in {}",
                 path.display()
             );
+            // The per-user macOS temp dir (/var/folders/<id>/T, /private/var/...) and this
+            // machine's temp dir must never be committed; recorded scratch dirs are `/scratch`.
+            assert_eq!(
+                spike_agent_agy::leaked_temp_path(&text),
+                None,
+                "temp-dir path in {}",
+                path.display()
+            );
             checked += 1;
         }
     }

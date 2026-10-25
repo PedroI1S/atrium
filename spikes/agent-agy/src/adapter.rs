@@ -10,14 +10,17 @@ use atrium_agents::{
     Interception, MAX_QUEUED_MESSAGES, Normalizer, PermissionPolicy, SHUTDOWN_GRACE, Session,
     SessionConfig, Transport,
 };
-use atrium_protocol::agent::{AgentEvent, AgentEventEnvelope, Provider, SessionCommand};
+use atrium_protocol::agent::{
+    AgentEvent, AgentEventEnvelope, Provider, SessionCommand, ToolStatus,
+};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use crate::bridge::{
-    ApprovalMode, GateBridge, create_private_session_dir, write_session_hook_config,
+    ApprovalMode, CwdHookInstall, GateBridge, GateSetup, HookConfigError, HookConfigExpectation,
+    create_private_session_dir, install_cwd_hook, write_session_hook_config,
     write_session_mcp_config,
 };
 use crate::normalizer::AgyNormalizer;
@@ -55,7 +58,15 @@ pub struct AgyAdapter {
     pub shutdown_grace: Duration,
     pub use_default_cli_args: bool,
     pub pass_add_dir: bool,
+    /// Install the session's hook config as `<cwd>/<agents dir>/hooks.json`, the file `agy`
+    /// reads. If a hook config is already there the adapter **refuses to start** (`agy` would
+    /// read that one and run tools ungated). Set to `false` only if the caller installs the
+    /// gate hook itself; the runtime coverage check below is then the only safety net.
     pub install_cwd_hook_if_absent: bool,
+    /// Abort the session (fatal `Error`, child killed, every later hook denied) when a tool
+    /// finishes that no `allow` hook reply covers, or when a hook config stops validating.
+    /// This is the fail-open tripwire: `agy` ignores an unreadable or malformed hook config.
+    pub enforce_gate_coverage: bool,
     pub extra_args: Vec<String>,
     pub recorder: Option<mpsc::UnboundedSender<FixtureLine>>,
 }
@@ -72,6 +83,7 @@ impl Default for AgyAdapter {
             use_default_cli_args: true,
             pass_add_dir: false,
             install_cwd_hook_if_absent: true,
+            enforce_gate_coverage: true,
             extra_args: Vec::new(),
             recorder: None,
         }
@@ -191,10 +203,16 @@ impl AgentAdapter for AgyAdapter {
             }
 
             let session_dir = create_private_session_dir(&self.session_base_dir, "s")?;
+            // Removes what this call created if it returns early; disarmed once the actor owns it.
+            let mut guard = StartGuard {
+                session_dir: session_dir.clone(),
+                cwd_install: None,
+                armed: true,
+            };
             let socket_path = session_dir.join("g.sock");
             let helper_bin = self.resolve_helper_bin();
 
-            write_session_hook_config(
+            let session_hooks = write_session_hook_config(
                 &session_dir,
                 &helper_bin,
                 &socket_path,
@@ -205,20 +223,23 @@ impl AgentAdapter for AgyAdapter {
                 write_session_mcp_config(&session_dir, &config.mcp_servers)?;
             }
 
-            let mut created_cwd_hook_path: Option<PathBuf> = None;
+            let mut cwd_hooks = None;
             if self.install_cwd_hook_if_absent {
-                let agents_name = [".", "agents"].concat();
-                let cwd_agents_dir = config.cwd.join(agents_name);
-                let cwd_hooks_path = cwd_agents_dir.join("hooks.json");
-                if !cwd_hooks_path.exists() {
-                    let _ = fs::create_dir_all(&cwd_agents_dir);
-                    if let Ok(contents) = fs::read_to_string(session_dir.join("hooks.json"))
-                        && fs::write(&cwd_hooks_path, contents).is_ok()
-                    {
-                        created_cwd_hook_path = Some(cwd_hooks_path);
-                    }
-                }
+                let install =
+                    install_cwd_hook(&config.cwd, &session_hooks).map_err(gate_config_error)?;
+                cwd_hooks = Some(install.hooks_path.clone());
+                guard.cwd_install = Some(install);
             }
+
+            let gate_setup = GateSetup {
+                session_dir: session_dir.clone(),
+                cwd_hooks,
+                expectation: HookConfigExpectation {
+                    helper_bin: helper_bin.clone(),
+                    socket_path: socket_path.clone(),
+                    timeout_secs: self.hook_timeout_secs,
+                },
+            };
 
             let (bridge_inputs_tx, bridge_inputs_rx) = mpsc::unbounded_channel();
             let initial_session_id = config
@@ -232,6 +253,11 @@ impl AgentAdapter for AgyAdapter {
                 self.approval_mode,
                 bridge_inputs_tx,
             )?;
+
+            // `agy` fails OPEN on an unreadable or malformed hook config (it ignores it and runs
+            // tools under --dangerously-skip-permissions). Read everything back right before
+            // spawning and refuse to start unless it is exactly what `agy` must see.
+            gate_setup.verify().map_err(gate_config_error)?;
 
             let program = config
                 .program
@@ -252,13 +278,9 @@ impl AgentAdapter for AgyAdapter {
                 cmd.env(k, v);
             }
 
-            let child = cmd.spawn().map_err(|e| {
-                let _ = fs::remove_dir_all(&session_dir);
-                if let Some(p) = &created_cwd_hook_path {
-                    let _ = fs::remove_file(p);
-                }
-                AdapterError::Spawn(e)
-            })?;
+            let child = cmd.spawn().map_err(AdapterError::Spawn)?;
+            guard.armed = false;
+            let created_cwd_hook = guard.cwd_install.take();
 
             let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
             let (commands_tx, commands_rx) = mpsc::channel(COMMAND_BUFFER);
@@ -269,7 +291,12 @@ impl AgentAdapter for AgyAdapter {
                 stdin_format: self.stdin_format,
                 shutdown_grace: self.shutdown_grace,
                 session_dir,
-                created_cwd_hook_path,
+                cwd_install: created_cwd_hook,
+                gate_setup,
+                enforce_gate_coverage: self.enforce_gate_coverage,
+                allowed_hooks: 0,
+                executed_tools: 0,
+                abort_reason: None,
                 events_tx,
                 recorder: self.recorder.clone(),
                 started_at: Instant::now(),
@@ -294,13 +321,45 @@ impl AgentAdapter for AgyAdapter {
     }
 }
 
+fn gate_config_error(e: HookConfigError) -> AdapterError {
+    AdapterError::Handshake(format!(
+        "refusing to start agy, gate hook config check failed: {e}"
+    ))
+}
+
+/// Cleans up a half-started session on every early return from `start`.
+struct StartGuard {
+    session_dir: PathBuf,
+    cwd_install: Option<CwdHookInstall>,
+    armed: bool,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(install) = &self.cwd_install {
+                install.remove();
+            }
+            let _ = fs::remove_dir_all(&self.session_dir);
+        }
+    }
+}
+
 struct ActorState {
     bridge: GateBridge,
     normalizer: AgyNormalizer,
     stdin_format: StdinFormat,
     shutdown_grace: Duration,
     session_dir: PathBuf,
-    created_cwd_hook_path: Option<PathBuf>,
+    cwd_install: Option<CwdHookInstall>,
+    gate_setup: GateSetup,
+    enforce_gate_coverage: bool,
+    /// Hook requests answered `allow` so far.
+    allowed_hooks: u64,
+    /// Tool calls that finished `Succeeded` or `Failed` (that is, that actually ran).
+    executed_tools: u64,
+    /// Set when a gate bypass is suspected; the actor stops and kills the child at once.
+    abort_reason: Option<String>,
     events_tx: mpsc::Sender<AgentEventEnvelope>,
     recorder: Option<mpsc::UnboundedSender<FixtureLine>>,
     started_at: Instant,
@@ -328,6 +387,9 @@ async fn run_session_actor(
     let mut exited = false;
 
     loop {
+        if state.abort_reason.is_some() {
+            break;
+        }
         let has_pending_out = !state.pending_out.is_empty() && !state.events_tx.is_closed();
         let can_read_pipes = state.pending_out.len() < EVENT_BUFFER * 2;
         let events_tx_closed = state.events_tx.clone();
@@ -420,6 +482,12 @@ async fn run_session_actor(
             res = stdout_lines.next_line(), if !stdout_done && can_read_pipes => {
                 match res {
                     Ok(Some(line)) => {
+                        // Hook traffic that happened before this line must be processed
+                        // first, so the coverage check sees hook replies before the tool
+                        // step they cover finishes.
+                        while let Ok(inp) = bridge_inputs_rx.try_recv() {
+                            state.record_and_normalize(inp);
+                        }
                         state.record_and_normalize(AdapterInput::Stdout { line });
                         if !state.in_turn
                             && let Some(next_msg) = state.queued_messages.pop_front()
@@ -464,6 +532,10 @@ async fn run_session_actor(
 
         let code = if let Ok(Some(status)) = child.try_wait() {
             status.code()
+        } else if state.abort_reason.is_some() {
+            // Gate bypass suspected: no grace period, nothing more may run.
+            let _ = child.kill().await;
+            child.wait().await.ok().and_then(|s| s.code())
         } else {
             if let Some(pid) = child.id() {
                 send_unix_signal(pid, "-TERM");
@@ -483,6 +555,9 @@ async fn run_session_actor(
         state.record_and_normalize(AdapterInput::Exit { code });
     }
 
+    // Remove the session dir and the cwd hook config before the final flush: a consumer that
+    // sees `SessionEnded` may start the next session in the same working directory at once.
+    state.cleanup();
     state.try_flush_pending();
     if !state.pending_out.is_empty() && !state.events_tx.is_closed() {
         let flush_deadline = Duration::from_millis(50);
@@ -495,8 +570,6 @@ async fn run_session_actor(
         })
         .await;
     }
-
-    state.cleanup();
 }
 
 impl ActorState {
@@ -515,6 +588,11 @@ impl ActorState {
     }
 
     fn record_and_normalize(&mut self, input: AdapterInput) {
+        if let AdapterInput::HookResponse { payload, .. } = &input
+            && payload.get("decision").and_then(|d| d.as_str()) == Some("allow")
+        {
+            self.allowed_hooks += 1;
+        }
         if let Some(rec) = &self.recorder {
             let ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             let _ = rec.send(FixtureLine {
@@ -523,6 +601,7 @@ impl ActorState {
             });
         }
         let events = self.normalizer.on_input(&input);
+        let mut violation: Option<String> = None;
         for ev in events {
             match &ev {
                 AgentEvent::SessionStarted {
@@ -539,14 +618,52 @@ impl ActorState {
                 }
                 AgentEvent::ToolCallStarted { call_id, .. } => {
                     self.bridge.set_call_id_hint(Some(call_id.clone()));
+                    // A tool is about to run: the hook config must still be exactly what we
+                    // wrote (a tool, or anything else, may have changed it since the last check).
+                    if self.enforce_gate_coverage
+                        && violation.is_none()
+                        && let Err(e) = self.gate_setup.verify()
+                    {
+                        violation = Some(format!("hook config no longer valid: {e}"));
+                    }
                 }
-                AgentEvent::ToolCallFinished { .. } => {
+                AgentEvent::ToolCallFinished { status, .. } => {
                     self.bridge.set_call_id_hint(None);
+                    if matches!(status, ToolStatus::Succeeded | ToolStatus::Failed) {
+                        self.executed_tools += 1;
+                        if self.enforce_gate_coverage
+                            && violation.is_none()
+                            && self.executed_tools > self.allowed_hooks
+                        {
+                            violation = Some(format!(
+                                "a tool ran without a preceding allowed hook request \
+                                 ({} tools ran, {} hook requests were allowed)",
+                                self.executed_tools, self.allowed_hooks
+                            ));
+                        }
+                    }
                 }
                 _ => {}
             }
             self.push_event(ev);
         }
+        if let Some(reason) = violation {
+            self.abort_session(&reason);
+        }
+    }
+
+    /// Fail-open tripwire: deny every later hook request, tell the consumer, and make the actor
+    /// kill the child immediately.
+    fn abort_session(&mut self, reason: &str) {
+        if self.abort_reason.is_some() {
+            return;
+        }
+        self.abort_reason = Some(reason.to_owned());
+        self.bridge.lock_down();
+        self.push_event(AgentEvent::Error {
+            message: format!("gate bypass suspected, session aborted: {reason}"),
+            fatal: true,
+        });
     }
 
     fn push_event(&mut self, event: AgentEvent) {
@@ -577,8 +694,8 @@ impl ActorState {
     }
 
     fn cleanup(&self) {
-        if let Some(p) = &self.created_cwd_hook_path {
-            let _ = fs::remove_file(p);
+        if let Some(install) = &self.cwd_install {
+            install.remove();
         }
         let _ = fs::remove_dir_all(&self.session_dir);
     }

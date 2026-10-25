@@ -519,5 +519,33 @@ async fn run() -> Result<(), String> {
     );
 
     print_report(&out);
+
+    let fail_open: Vec<&str> = out
+        .iter()
+        .filter(|r| r.verdict == "fail_open")
+        .map(|r| r.case.as_str())
+        .collect();
+    let inconclusive: Vec<&str> = out
+        .iter()
+        .filter(|r| r.verdict == "inconclusive")
+        .map(|r| r.case.as_str())
+        .collect();
+    if !inconclusive.is_empty() {
+        eprintln!(
+            "\nINCONCLUSIVE cases (agy did not start or never attempted the tool): {}",
+            inconclusive.join(", ")
+        );
+    }
+    if !fail_open.is_empty() {
+        eprintln!(
+            "\nFAIL-OPEN: agy ran the tool although the hook was broken in: {}.\n\
+             Known on agy 1.4.7: an unreadable (mode 0000) or malformed hooks.json is ignored.\n\
+             AgyAdapter refuses to start on such a config and aborts a session whose config \
+             stops validating (tests/gate_hardening.rs), but agy itself is not safe to run \
+             with a hook config nobody has validated.",
+            fail_open.join(", ")
+        );
+        std::process::exit(3);
+    }
     Ok(())
 }

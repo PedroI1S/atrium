@@ -3,16 +3,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use atrium_agents::fixture::{FixtureLine, Sanitizer};
+use atrium_agents::fixture::FixtureLine;
 use atrium_agents::{
     AdapterInput, AgentAdapter, BoxFuture, GateDecision, PermissionPolicy, SessionConfig,
     ToolCheck, ToolGate, Transport,
 };
 use atrium_protocol::agent::{
-    AgentEvent, ApprovalDecision, QuestionAnswer, SessionCommand, ToolKind,
+    AgentEvent, ApprovalDecision, MessageKind, QuestionAnswer, RequestOutcome, SessionCommand,
+    ToolKind, ToolStatus, TurnOutcome,
 };
 use serde_json::json;
-use spike_agent_agy::{AgyAdapter, AgyNormalizer};
+use spike_agent_agy::{AgyAdapter, AgyNormalizer, FixtureSanitizer};
 use tokio::sync::mpsc;
 
 const SCENARIO_SECRET: &str = "TOP_SECRET_VALUE_994812_DO_NOT_LEAK";
@@ -116,8 +117,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if scenario == "all" {
+        // Run every scenario, then fail if any did: one bad scenario must not hide the rest.
+        let mut failed = Vec::new();
         for &sc in ALL_SCENARIOS {
-            record_live_scenario(&fixtures_dir, sc, program.clone()).await?;
+            if let Err(e) = record_live_scenario(&fixtures_dir, sc, program.clone()).await {
+                eprintln!("FAILED {sc}: {e}");
+                failed.push(sc);
+            }
+        }
+        if !failed.is_empty() {
+            eprintln!("\nscenarios that failed: {}", failed.join(", "));
+            std::process::exit(1);
         }
     } else if ALL_SCENARIOS.contains(&scenario) {
         record_live_scenario(&fixtures_dir, scenario, program).await?;
@@ -143,112 +153,15 @@ fn locate_fixtures_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(dir)
 }
 
-fn build_sanitizer() -> Sanitizer {
+fn build_sanitizer(scratch_dirs: &[&Path]) -> FixtureSanitizer {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/user".to_owned());
     let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
-    Sanitizer::new(&home, &user, &[SCENARIO_SECRET])
+    FixtureSanitizer::new(&home, &user, &[SCENARIO_SECRET], scratch_dirs)
 }
 
-async fn record_live_scenario(
-    fixtures_dir: &Path,
-    scenario: &str,
-    program: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Recording live scenario: {scenario}");
-    let scratch_base = std::env::temp_dir().join("atrium-agy-record-scratch");
-    let scratch_dir = spike_agent_agy::create_private_session_dir(&scratch_base, scenario)?;
-
-    if scenario == "tool-read" {
-        fs::write(
-            scratch_dir.join("hello.txt"),
-            "Hello from Atrium tool-read scenario.\n",
-        )?;
-    } else if scenario == "gate-deny" {
-        fs::write(scratch_dir.join("secret.txt"), SCENARIO_SECRET)?;
-    }
-
-    let mut resume_id: Option<String> = None;
-    if scenario == "resume" {
-        // Seed first session to obtain a real native_session_id.
-        let (seed_tx, _seed_rx) = mpsc::unbounded_channel();
-        let mut seed_adapter = AgyAdapter::new().with_recorder(seed_tx);
-        seed_adapter.install_cwd_hook_if_absent = true;
-        let seed_cfg = SessionConfig {
-            cwd: scratch_dir.clone(),
-            model: Some(DEFAULT_MODEL.to_owned()),
-            effort: None,
-            permissions: PermissionPolicy::Ask,
-            gate: Arc::new(StaticGate {
-                mode: GateMode::AllowAll,
-            }),
-            mcp_servers: Vec::new(),
-            resume: None,
-            env: Vec::new(),
-            program: program.clone(),
-        };
-        let mut seed_session = seed_adapter.start(seed_cfg, Transport::Local).await?;
-        let _ = seed_session
-            .commands
-            .send(SessionCommand::SendUserMessage {
-                text: "Remember the codeword COBALT-42 and reply OK.".into(),
-            })
-            .await;
-        while let Some(env) = seed_session.events.recv().await {
-            if let AgentEvent::SessionStarted {
-                ref native_session_id,
-                ..
-            } = env.event
-            {
-                resume_id = Some(native_session_id.clone());
-            }
-            if matches!(
-                env.event,
-                AgentEvent::TurnCompleted { .. } | AgentEvent::SessionEnded { .. }
-            ) {
-                break;
-            }
-        }
-        let _ = seed_session.commands.send(SessionCommand::Shutdown).await;
-        if resume_id.is_none() {
-            let _ = fs::remove_dir_all(&scratch_dir);
-            return Err(
-                "resume seed session failed to reach SessionStarted; aborting live recording"
-                    .into(),
-            );
-        }
-    }
-
-    let (rec_tx, mut rec_rx) = mpsc::unbounded_channel();
-    let mut adapter = AgyAdapter::new().with_recorder(rec_tx);
-    adapter.install_cwd_hook_if_absent = true;
-
-    let gate_mode = match scenario {
-        "gate-deny" => GateMode::DenySecret,
-        "approval-allow" | "approval-deny" => GateMode::AskCommands,
-        _ => GateMode::AllowAll,
-    };
-
-    let model = if scenario == "startup-error" {
-        Some("invalid-model-does-not-exist-000".to_owned())
-    } else {
-        Some(DEFAULT_MODEL.to_owned())
-    };
-
-    let cfg = SessionConfig {
-        cwd: scratch_dir.clone(),
-        model,
-        effort: None,
-        permissions: PermissionPolicy::Ask,
-        gate: Arc::new(StaticGate { mode: gate_mode }),
-        mcp_servers: Vec::new(),
-        resume: resume_id,
-        env: Vec::new(),
-        program,
-    };
-
-    let mut session = adapter.start(cfg, Transport::Local).await?;
-
-    let initial_prompt = match scenario {
+/// The prompt each scenario sends first (also written into the fixture's `.md`).
+fn scenario_prompt(scenario: &str) -> Option<&'static str> {
+    match scenario {
         "simple" => Some("Reply with exactly the word PONG and nothing else."),
         "tool-read" => Some("Use read_file to read hello.txt and state its contents."),
         "gate-deny" => {
@@ -264,25 +177,179 @@ async fn record_live_scenario(
         "resume" => Some("What codeword did I ask you to remember?"),
         "startup-error" => Some("Hello"),
         _ => None,
+    }
+}
+
+const SESSION_DEADLINE: Duration = Duration::from_secs(90);
+const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn base_config(
+    cwd: &Path,
+    model: Option<String>,
+    gate_mode: GateMode,
+    resume: Option<String>,
+    program: Option<PathBuf>,
+) -> SessionConfig {
+    SessionConfig {
+        cwd: cwd.to_path_buf(),
+        model,
+        effort: None,
+        permissions: PermissionPolicy::Ask,
+        gate: Arc::new(StaticGate { mode: gate_mode }),
+        mcp_servers: Vec::new(),
+        resume,
+        env: Vec::new(),
+        program,
+    }
+}
+
+/// Runs the throwaway first session of `resume` and returns its native session id. Waits until
+/// the session is completely gone (events channel closed, which happens after the adapter has
+/// removed its hook config from the scratch dir), so the resumed session starts clean.
+async fn seed_resume_session(
+    scratch_dir: &Path,
+    program: Option<PathBuf>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (seed_tx, _seed_rx) = mpsc::unbounded_channel();
+    let seed_adapter = AgyAdapter::new().with_recorder(seed_tx);
+    let cfg = base_config(
+        scratch_dir,
+        Some(DEFAULT_MODEL.to_owned()),
+        GateMode::AllowAll,
+        None,
+        program,
+    );
+    let mut session = seed_adapter.start(cfg, Transport::Local).await?;
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage {
+            text: "Remember the codeword COBALT-42 and reply OK.".into(),
+        })
+        .await?;
+
+    let mut native_id: Option<String> = None;
+    let mut completed = false;
+    let outcome = tokio::time::timeout(SESSION_DEADLINE, async {
+        while let Some(env) = session.events.recv().await {
+            match env.event {
+                AgentEvent::SessionStarted {
+                    native_session_id, ..
+                } => native_id = Some(native_session_id),
+                AgentEvent::TurnCompleted { .. } => {
+                    completed = true;
+                    break;
+                }
+                AgentEvent::SessionEnded { .. } => break,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    let _ = session.commands.send(SessionCommand::Shutdown).await;
+    let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while session.events.recv().await.is_some() {}
+    })
+    .await;
+
+    if outcome.is_err() {
+        return Err("resume seed session timed out".into());
+    }
+    if drained.is_err() {
+        return Err("resume seed session did not shut down".into());
+    }
+    let id = native_id
+        .ok_or("resume seed session failed to reach SessionStarted; aborting live recording")?;
+    if !completed {
+        return Err("resume seed session ended before its turn completed".into());
+    }
+    Ok(id)
+}
+
+async fn record_live_scenario(
+    fixtures_dir: &Path,
+    scenario: &str,
+    program: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Recording live scenario: {scenario}");
+    let scratch_base = std::env::temp_dir().join("atrium-agy-record-scratch");
+    let scratch_dir = spike_agent_agy::create_private_session_dir(&scratch_base, scenario)?;
+    let result = record_in_scratch(fixtures_dir, scenario, program, &scratch_dir).await;
+    let _ = fs::remove_dir_all(&scratch_dir);
+    result
+}
+
+async fn record_in_scratch(
+    fixtures_dir: &Path,
+    scenario: &str,
+    program: Option<PathBuf>,
+    scratch_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Built while the scratch dir exists so its realpath (`/private/var/...`) is known.
+    let sanitizer = build_sanitizer(&[scratch_dir]);
+
+    if scenario == "tool-read" {
+        fs::write(
+            scratch_dir.join("hello.txt"),
+            "Hello from Atrium tool-read scenario.\n",
+        )?;
+    } else if scenario == "gate-deny" {
+        fs::write(scratch_dir.join("secret.txt"), SCENARIO_SECRET)?;
+    }
+
+    let resume_id = if scenario == "resume" {
+        Some(seed_resume_session(scratch_dir, program.clone()).await?)
+    } else {
+        None
     };
 
-    if let Some(prompt) = initial_prompt {
-        let _ = session
+    let (rec_tx, mut rec_rx) = mpsc::unbounded_channel();
+    let adapter = AgyAdapter::new().with_recorder(rec_tx);
+
+    let gate_mode = match scenario {
+        "gate-deny" => GateMode::DenySecret,
+        "approval-allow" | "approval-deny" => GateMode::AskCommands,
+        _ => GateMode::AllowAll,
+    };
+    let model = if scenario == "startup-error" {
+        Some("invalid-model-does-not-exist-000".to_owned())
+    } else {
+        Some(DEFAULT_MODEL.to_owned())
+    };
+    let cfg = base_config(scratch_dir, model, gate_mode, resume_id, program);
+
+    let mut session = adapter.start(cfg, Transport::Local).await?;
+
+    if let Some(prompt) = scenario_prompt(scenario) {
+        session
             .commands
             .send(SessionCommand::SendUserMessage {
                 text: prompt.to_owned(),
             })
-            .await;
+            .await?;
     }
 
     let mut turn_count = 0u32;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut timed_out = false;
+    let mut shutdown_sent = false;
+    let deadline = tokio::time::Instant::now() + SESSION_DEADLINE;
+    let mut interrupt_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        let wake = interrupt_deadline.map_or(deadline, |d| d.min(deadline));
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => {
-                let _ = session.commands.send(SessionCommand::Shutdown).await;
-                break;
+            _ = tokio::time::sleep_until(wake) => {
+                if tokio::time::Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = session.commands.send(SessionCommand::Shutdown).await;
+                    break;
+                }
+                // Interrupt grace elapsed without the session ending on its own.
+                interrupt_deadline = None;
+                if !shutdown_sent {
+                    shutdown_sent = true;
+                    let _ = session.commands.send(SessionCommand::Shutdown).await;
+                }
             }
             ev_opt = session.events.recv() => {
                 let Some(env) = ev_opt else {
@@ -327,10 +394,13 @@ async fn record_live_scenario(
                             })
                             .await;
                     }
-                    AgentEvent::ToolCallStarted { .. } if scenario == "interrupt" => {
+                    AgentEvent::ToolCallStarted { .. }
+                        if scenario == "interrupt" && interrupt_deadline.is_none() && !shutdown_sent =>
+                    {
+                        // Interrupt mid-tool-call, then give agy a few seconds to end the turn
+                        // itself before the harness shuts it down.
                         let _ = session.commands.send(SessionCommand::Interrupt).await;
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        let _ = session.commands.send(SessionCommand::Shutdown).await;
+                        interrupt_deadline = Some(tokio::time::Instant::now() + INTERRUPT_GRACE);
                     }
                     AgentEvent::TurnCompleted { .. } => {
                         turn_count += 1;
@@ -341,7 +411,8 @@ async fn record_live_scenario(
                                     text: "Now reply with TURN_TWO_OK.".into(),
                                 })
                                 .await;
-                        } else {
+                        } else if !shutdown_sent {
+                            shutdown_sent = true;
                             let _ = session.commands.send(SessionCommand::Shutdown).await;
                         }
                     }
@@ -354,33 +425,312 @@ async fn record_live_scenario(
         }
     }
 
+    // Let the actor finish (kill + reap + Exit input recorded) before collecting the lines.
+    let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while session.events.recv().await.is_some() {}
+    })
+    .await;
+
     let mut lines = Vec::new();
     while let Ok(line) = rec_rx.try_recv() {
         lines.push(line);
     }
 
-    let _ = fs::remove_dir_all(&scratch_dir);
+    if timed_out {
+        dump_failure(scenario, &lines, &sanitizer);
+        return Err(format!(
+            "scenario '{scenario}' did not finish within {}s; nothing written",
+            SESSION_DEADLINE.as_secs()
+        )
+        .into());
+    }
+    if drained.is_err() {
+        dump_failure(scenario, &lines, &sanitizer);
+        return Err(format!(
+            "scenario '{scenario}': session did not shut down within {}s; nothing written",
+            DRAIN_TIMEOUT.as_secs()
+        )
+        .into());
+    }
 
-    write_fixture_files(
+    let res = write_fixture_files(
         fixtures_dir,
         scenario,
-        lines,
+        lines.clone(),
+        &sanitizer,
         "live",
         "agy 1.4.7",
         DEFAULT_MODEL,
-    )?;
-    Ok(())
+    );
+    if res.is_err() {
+        dump_failure(scenario, &lines, &sanitizer);
+    }
+    res
+}
+
+/// Writes the sanitized recording of a failed scenario next to the OS temp dir (never into
+/// the repo), so the orchestrator can see what happened without spending quota on a re-run.
+fn dump_failure(scenario: &str, lines: &[FixtureLine], sanitizer: &FixtureSanitizer) {
+    let dir = std::env::temp_dir().join("atrium-agy-record-failures");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let mut out = String::new();
+    for line in lines {
+        let mut line = line.clone();
+        sanitizer.input(&mut line.input);
+        if let Ok(s) = serde_json::to_string(&line) {
+            out.push_str(&s);
+            out.push('\n');
+        }
+    }
+    let path = dir.join(format!("{scenario}.sanitized.jsonl"));
+    if fs::write(&path, out).is_ok() {
+        eprintln!(
+            "  sanitized recording of the failed run: {}",
+            path.display()
+        );
+    }
+}
+
+fn assistant_text(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageCompleted {
+                kind: MessageKind::Assistant,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn count_finished(events: &[AgentEvent], status: ToolStatus) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolCallFinished { status: s, .. } if *s == status))
+        .count()
+}
+
+fn outcomes(events: &[AgentEvent]) -> Vec<RequestOutcome> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::RequestResolved { outcome, .. } => Some(*outcome),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What each scenario must show for the fixture to be worth committing. Returns every unmet
+/// expectation, so a failed live run says what is wrong in one go.
+fn check_expectations(scenario: &str, events: &[AgentEvent]) -> Result<(), Vec<String>> {
+    let mut problems: Vec<String> = Vec::new();
+    let mut expect = |ok: bool, what: &str| {
+        if !ok {
+            problems.push(what.to_owned());
+        }
+    };
+
+    let started = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::SessionStarted { .. }))
+        .count();
+    let completed_turns = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::TurnCompleted {
+                    outcome: TurnOutcome::Completed,
+                    ..
+                }
+            )
+        })
+        .count();
+    let tool_started = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolCallStarted { .. }))
+        .count();
+    let tool_finished = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolCallFinished { .. }))
+        .count();
+    let approvals = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ApprovalRequested { .. }))
+        .count();
+    let questions = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::QuestionAsked { .. }))
+        .count();
+    let resolved = outcomes(events);
+    let text = assistant_text(events).to_lowercase();
+    let ran = count_finished(events, ToolStatus::Succeeded);
+    let denied = count_finished(events, ToolStatus::Denied);
+
+    expect(
+        matches!(events.last(), Some(AgentEvent::SessionEnded { .. })),
+        "the last event is SessionEnded",
+    );
+    expect(
+        tool_started == tool_finished,
+        "every ToolCallStarted has a ToolCallFinished",
+    );
+    expect(
+        approvals + questions == resolved.len(),
+        "every ApprovalRequested / QuestionAsked has exactly one RequestResolved",
+    );
+    expect(
+        !events.iter().any(|e| {
+            matches!(e, AgentEvent::Error { message, .. } if message.contains("gate bypass suspected"))
+        }),
+        "the adapter's gate-bypass tripwire did not fire",
+    );
+
+    if scenario != "startup-error" {
+        expect(started == 1, "exactly one SessionStarted");
+        expect(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error { fatal: true, .. })),
+            "no fatal Error",
+        );
+    }
+
+    match scenario {
+        "simple" => {
+            expect(text.contains("pong"), "the reply contains PONG");
+            expect(completed_turns == 1, "one completed turn");
+            expect(tool_started == 0, "no tool calls");
+        }
+        "tool-read" => {
+            expect(
+                events.iter().any(|e| {
+                    matches!(
+                        e,
+                        AgentEvent::ToolCallStarted {
+                            kind: ToolKind::Read,
+                            ..
+                        }
+                    )
+                }),
+                "a read tool call started",
+            );
+            expect(ran >= 1, "the read tool call succeeded");
+            expect(
+                text.contains("hello from atrium"),
+                "the reply quotes hello.txt",
+            );
+            expect(completed_turns >= 1, "a completed turn");
+        }
+        "gate-deny" => {
+            expect(denied >= 1, "at least one tool call was denied");
+            expect(ran == 0, "no tool call succeeded");
+        }
+        "approval-allow" => {
+            expect(approvals >= 1, "an ApprovalRequested");
+            expect(
+                resolved.contains(&RequestOutcome::Approved),
+                "the approval resolved as approved",
+            );
+            expect(ran >= 1, "the approved command ran");
+            expect(completed_turns >= 1, "a completed turn");
+        }
+        "approval-deny" => {
+            expect(approvals >= 1, "an ApprovalRequested");
+            expect(
+                resolved.contains(&RequestOutcome::Denied),
+                "the approval resolved as denied",
+            );
+            expect(denied >= 1, "the denied command ended denied");
+            expect(ran == 0, "no tool call succeeded");
+        }
+        "question" => {
+            expect(questions >= 1, "a QuestionAsked");
+            expect(
+                resolved.contains(&RequestOutcome::Answered),
+                "the question resolved as answered",
+            );
+        }
+        "interrupt" => {
+            expect(
+                tool_started >= 1,
+                "a tool call started before the interrupt",
+            );
+            expect(
+                events.iter().any(|e| {
+                    matches!(
+                        e,
+                        AgentEvent::TurnCompleted {
+                            outcome: TurnOutcome::Interrupted,
+                            ..
+                        }
+                    )
+                }),
+                "the turn ended interrupted",
+            );
+            expect(ran == 0, "the interrupted tool call did not succeed");
+        }
+        "multi-turn" => {
+            expect(completed_turns >= 2, "two completed turns in one session");
+            expect(text.contains("turn_one_ok"), "the reply to turn 1");
+            expect(text.contains("turn_two_ok"), "the reply to turn 2");
+        }
+        "resume" => {
+            expect(
+                text.contains("cobalt-42"),
+                "the resumed session remembers COBALT-42",
+            );
+            expect(completed_turns >= 1, "a completed turn");
+        }
+        "startup-error" => {
+            expect(started == 0, "no SessionStarted");
+            expect(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Error { fatal: true, .. })),
+                "a fatal Error",
+            );
+        }
+        _ => {}
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
+    }
 }
 
 fn write_fixture_files(
     fixtures_dir: &Path,
     scenario: &str,
     mut lines: Vec<FixtureLine>,
+    sanitizer: &FixtureSanitizer,
     source_kind: &str,
     cli_version: &str,
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sanitizer = build_sanitizer();
+    // The scenario secret is a `Sanitizer` secret, so it would silently turn into
+    // `<redacted>` below. Look for it in the raw recording first: if it is there, the agent
+    // read the file, and the gate did not hold.
+    let raw: String = lines
+        .iter()
+        .filter_map(|l| serde_json::to_string(l).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if raw.contains(SCENARIO_SECRET) {
+        return Err(format!(
+            "scenario '{scenario}' ({source_kind}): the secret value is in the raw recording, \
+             so the agent read secret.txt despite the gate; refusing to write a fixture"
+        )
+        .into());
+    }
+
     for line in &mut lines {
         sanitizer.input(&mut line.input);
     }
@@ -391,34 +741,18 @@ fn write_fixture_files(
         jsonl_out.push_str(&s);
         jsonl_out.push('\n');
     }
-    assert!(
-        sanitizer.is_clean(&jsonl_out),
-        "Sanitizer::is_clean failed on {scenario}.jsonl"
-    );
+    if !sanitizer.is_clean(&jsonl_out) {
+        return Err(format!(
+            "Sanitizer::is_clean failed on {scenario}.jsonl (a temp-dir path, home path, user \
+             name or secret survived); nothing written"
+        )
+        .into());
+    }
 
     let mut normalizer = AgyNormalizer::new();
     let events = atrium_agents::fixture::normalize(&lines, &mut normalizer);
 
-    let saw_session_started = events
-        .iter()
-        .any(|e| matches!(e, AgentEvent::SessionStarted { .. }));
-    if scenario == "startup-error" {
-        if saw_session_started {
-            return Err(format!(
-                "scenario '{scenario}' ({source_kind}) unexpectedly reached SessionStarted"
-            )
-            .into());
-        }
-        let saw_fatal_err = events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Error { fatal: true, .. }));
-        if !saw_fatal_err {
-            return Err(format!(
-                "scenario '{scenario}' ({source_kind}) did not emit a fatal Error event"
-            )
-            .into());
-        }
-    } else if !saw_session_started {
+    if let Err(problems) = check_expectations(scenario, &events) {
         let errs: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
@@ -427,22 +761,19 @@ fn write_fixture_files(
             })
             .collect();
         return Err(format!(
-            "scenario '{scenario}' ({source_kind}) failed to reach SessionStarted (errors: {errs:?}); refusing to write broken fixture"
+            "scenario '{scenario}' ({source_kind}) did not meet its expectations; refusing to \
+             write a broken fixture:\n  - {}\n  agent errors: {errs:?}",
+            problems.join("\n  - ")
         )
         .into());
     }
 
     let events_json = serde_json::to_string_pretty(&events)? + "\n";
-    assert!(
-        sanitizer.is_clean(&events_json),
-        "Sanitizer::is_clean failed on {scenario}.events.json"
-    );
-
-    if scenario == "gate-deny" {
-        assert!(
-            !events_json.contains(SCENARIO_SECRET),
-            "gate-deny events leaked secret contents!"
-        );
+    if !sanitizer.is_clean(&events_json) {
+        return Err(format!(
+            "Sanitizer::is_clean failed on {scenario}.events.json; nothing written"
+        )
+        .into());
     }
 
     let jsonl_path = fixtures_dir.join(format!("{scenario}.jsonl"));
@@ -452,8 +783,16 @@ fn write_fixture_files(
     fs::write(&jsonl_path, &jsonl_out)?;
     fs::write(&events_path, &events_json)?;
 
+    let prompt_line = scenario_prompt(scenario)
+        .map(|p| format!("- Prompt: `{p}`\n"))
+        .unwrap_or_default();
+    let paths_line = if source_kind == "live" {
+        "- Paths: the scratch working directory is recorded as `/scratch`, other temp-dir roots as `/scratch-tmp`, the home directory as `~`.\n"
+    } else {
+        ""
+    };
     let md_content = format!(
-        "# {scenario}\n\n- Status: `{source_kind}`\n- CLI: `{cli_version}`\n- Model: `{model}`\n- Command: `agy --print= --input-format stream-json --output-format stream-json --mode accept-edits --dangerously-skip-permissions --print-timeout 0s`\n- Scenario: `{scenario}` (`docs/contracts/m0.md` §3.3)\n"
+        "# {scenario}\n\n- Status: `{source_kind}`\n- CLI: `{cli_version}`\n- Model: `{model}`\n- Command: `agy --print= --input-format stream-json --output-format stream-json --mode accept-edits --dangerously-skip-permissions --print-timeout 0s`\n{prompt_line}- Scenario: `{scenario}` (`docs/contracts/m0.md` §3.3)\n{paths_line}"
     );
     fs::write(&md_path, md_content)?;
     println!("Wrote {}", jsonl_path.display());
@@ -468,7 +807,7 @@ fn generate_handmade(fixtures_dir: &Path, target: &str) -> Result<(), Box<dyn st
         let mut normalizer = AgyNormalizer::new();
         let events = atrium_agents::fixture::normalize(&smoke_lines, &mut normalizer);
         let events_json = serde_json::to_string_pretty(&events)? + "\n";
-        let sanitizer = build_sanitizer();
+        let sanitizer = build_sanitizer(&[]);
         assert!(sanitizer.is_clean(&events_json));
         fs::write(fixtures_dir.join("m0-00-smoke.events.json"), events_json)?;
     }
@@ -486,7 +825,16 @@ fn generate_handmade(fixtures_dir: &Path, target: &str) -> Result<(), Box<dyn st
         } else {
             DEFAULT_MODEL
         };
-        write_fixture_files(fixtures_dir, sc, lines, "hand-made", "agy 1.4.7", model)?;
+        let sanitizer = build_sanitizer(&[]);
+        write_fixture_files(
+            fixtures_dir,
+            sc,
+            lines,
+            &sanitizer,
+            "hand-made",
+            "agy 1.4.7",
+            model,
+        )?;
     }
     Ok(())
 }

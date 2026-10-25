@@ -150,6 +150,8 @@ struct PendingHookQuestion {
 struct BridgeState {
     session_id: String,
     call_id_hint: Option<String>,
+    /// Set by [`GateBridge::lock_down`]: every later hook request is denied.
+    locked_down: bool,
     approvals: HashMap<String, PendingHookApproval>,
     questions: HashMap<String, PendingHookQuestion>,
 }
@@ -187,6 +189,7 @@ impl GateBridge {
         let state = Arc::new(Mutex::new(BridgeState {
             session_id: session_id.into(),
             call_id_hint: None,
+            locked_down: false,
             approvals: HashMap::new(),
             questions: HashMap::new(),
         }));
@@ -299,6 +302,16 @@ impl GateBridge {
         true
     }
 
+    /// Denies every hook request from now on and cancels the pending ones. Used when the
+    /// adapter detects that the gate may be bypassed and is about to kill the child.
+    pub fn lock_down(&self) {
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.locked_down = true;
+        }
+        self.cancel_all();
+    }
+
     /// Cancels all pending approvals and questions, causing blocked hooks to fail closed (`deny`).
     pub fn cancel_all(&self) {
         let (approvals, questions) = {
@@ -352,6 +365,14 @@ async fn handle_hook_connection(
         let _ = send_hook_reply(&mut write_half, &reply).await;
         return;
     };
+
+    let locked_down = state.lock().unwrap_or_else(|e| e.into_inner()).locked_down;
+    if locked_down {
+        let reply =
+            HookDecisionOutput::deny("session locked down by Atrium (gate bypass suspected)");
+        let _ = send_hook_reply(&mut write_half, &reply).await;
+        return;
+    }
 
     let _ = inputs_tx.send(AdapterInput::HookRequest {
         id: req_id.clone(),
@@ -616,11 +637,7 @@ pub fn write_session_hook_config(
     fs::create_dir_all(session_dir)?;
     fs::set_permissions(session_dir, fs::Permissions::from_mode(0o700))?;
 
-    let cmd = format!(
-        "'{}' --socket '{}'",
-        helper_bin.display(),
-        socket_path.display()
-    );
+    let cmd = hook_command(helper_bin, socket_path);
     let config_json = json!({
         "atrium-gate-bridge": {
             "PreToolUse": [
@@ -641,10 +658,9 @@ pub fn write_session_hook_config(
 
     let direct_path = session_dir.join("hooks.json");
     fs::write(&direct_path, &pretty)?;
-    fs::set_permissions(&direct_path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(&direct_path, fs::Permissions::from_mode(HOOK_FILE_MODE))?;
 
-    let agents_subdir_name = [".", "agents"].concat();
-    let agents_dir = session_dir.join(agents_subdir_name);
+    let agents_dir = session_dir.join(agents_dir_name());
     fs::create_dir_all(&agents_dir)?;
     fs::set_permissions(&agents_dir, fs::Permissions::from_mode(0o700))?;
     let nested_path = agents_dir.join("hooks.json");
@@ -697,4 +713,414 @@ pub fn write_session_mcp_config(session_dir: &Path, servers: &[McpServer]) -> io
     fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600))?;
 
     Ok(mcp_path)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hook config hardening (Fix round 2)
+//
+// Live finding on `agy` 1.4.7 (hook-failure harness): if the hook config is unreadable (mode
+// 0000) or malformed JSON, `agy` silently ignores it and runs the tool under
+// `--dangerously-skip-permissions`. That is fail-OPEN. The helper-side failures (helper
+// missing, non-zero exit, invalid JSON output, timeout) fail closed. So the adapter must prove,
+// before it spawns `agy`, that the config `agy` will read is present, private, parseable and
+// really registers the gate hook, and must keep checking while the session runs.
+// ---------------------------------------------------------------------------------------------
+
+/// Required permission bits (`mode & 0o777`) of every hook config file the adapter writes.
+pub const HOOK_FILE_MODE: u32 = 0o600;
+/// Required permission bits of the session-private directories.
+pub const HOOK_DIR_MODE: u32 = 0o700;
+
+/// Name of the per-directory config folder `agy` reads hook configs from.
+pub fn agents_dir_name() -> String {
+    [".", "agents"].concat()
+}
+
+/// The shell command registered in `hooks.json` for the gate helper.
+pub fn hook_command(helper_bin: &Path, socket_path: &Path) -> String {
+    format!(
+        "'{}' --socket '{}'",
+        helper_bin.display(),
+        socket_path.display()
+    )
+}
+
+/// What a valid gate hook config must register.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookConfigExpectation {
+    pub helper_bin: PathBuf,
+    pub socket_path: PathBuf,
+    pub timeout_secs: u64,
+}
+
+/// Which mode a directory holding a hook config must have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirRule {
+    /// Exactly `0700` (directories the adapter created inside its session dir).
+    Private,
+    /// Not writable by group or others (a project's own config directory; it may be `0755`).
+    NoGroupOtherWrite,
+}
+
+/// Why a hook config (or the helper it points to) was rejected. Every variant means
+/// "refuse to start / abort the session": none of them is recoverable by trying `agy` anyway.
+#[derive(Debug)]
+pub enum HookConfigError {
+    /// The file or directory cannot be stat'ed (missing, no search permission on the parent).
+    Missing { path: PathBuf, source: io::Error },
+    /// The path is a symlink or something other than a regular file.
+    NotRegularFile { path: PathBuf },
+    /// The path is a symlink or something other than a directory.
+    NotADirectory { path: PathBuf },
+    /// The file mode is not exactly [`HOOK_FILE_MODE`] (covers mode 0000 and group/world access).
+    BadFileMode {
+        path: PathBuf,
+        actual: u32,
+        expected: u32,
+    },
+    /// The directory mode violates `rule`.
+    BadDirMode {
+        path: PathBuf,
+        actual: u32,
+        rule: DirRule,
+    },
+    /// The file could not be read although its mode looked right.
+    Unreadable { path: PathBuf, source: io::Error },
+    /// The file is not valid JSON or has the wrong top-level shape.
+    Malformed { path: PathBuf, detail: String },
+    /// The JSON parses but does not register the expected `PreToolUse` command hook.
+    GateHookAbsent { path: PathBuf, detail: String },
+    /// A hook config already exists in the working directory, so ours would not be used.
+    CwdHooksPresent { path: PathBuf },
+    /// The helper binary is missing or not executable.
+    HelperUnusable { path: PathBuf, detail: String },
+}
+
+impl std::fmt::Display for HookConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { path, source } => {
+                write!(f, "{} cannot be inspected: {source}", path.display())
+            }
+            Self::NotRegularFile { path } => {
+                write!(f, "{} is not a regular file (symlink?)", path.display())
+            }
+            Self::NotADirectory { path } => {
+                write!(f, "{} is not a directory (symlink?)", path.display())
+            }
+            Self::BadFileMode {
+                path,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "{} has mode {actual:04o}, expected {expected:04o}",
+                path.display()
+            ),
+            Self::BadDirMode { path, actual, rule } => write!(
+                f,
+                "{} has mode {actual:04o}, which violates the {rule:?} rule",
+                path.display()
+            ),
+            Self::Unreadable { path, source } => {
+                write!(f, "{} cannot be read: {source}", path.display())
+            }
+            Self::Malformed { path, detail } => {
+                write!(f, "{} is malformed: {detail}", path.display())
+            }
+            Self::GateHookAbsent { path, detail } => write!(
+                f,
+                "{} does not register the Atrium gate hook: {detail}",
+                path.display()
+            ),
+            Self::CwdHooksPresent { path } => write!(
+                f,
+                "{} already exists, so Atrium's gate hook would not be installed (agy ignores a \
+                 hook config it does not read, and runs the tool ungated)",
+                path.display()
+            ),
+            Self::HelperUnusable { path, detail } => {
+                write!(f, "gate helper {} is unusable: {detail}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for HookConfigError {}
+
+fn check_dir(path: &Path, rule: DirRule) -> Result<(), HookConfigError> {
+    let meta = fs::symlink_metadata(path).map_err(|source| HookConfigError::Missing {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !meta.file_type().is_dir() {
+        return Err(HookConfigError::NotADirectory {
+            path: path.to_path_buf(),
+        });
+    }
+    let actual = meta.permissions().mode() & 0o777;
+    let ok = match rule {
+        DirRule::Private => actual == HOOK_DIR_MODE,
+        DirRule::NoGroupOtherWrite => actual & 0o022 == 0,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(HookConfigError::BadDirMode {
+            path: path.to_path_buf(),
+            actual,
+            rule,
+        })
+    }
+}
+
+fn find_gate_hook(doc: &Value, exp: &HookConfigExpectation) -> Result<(), String> {
+    let root = doc
+        .as_object()
+        .ok_or_else(|| "top-level JSON value is not an object".to_owned())?;
+    let want_cmd = hook_command(&exp.helper_bin, &exp.socket_path);
+    let mut seen_pre_tool_use = false;
+    for group in root.values() {
+        let Some(entries) = group.get("PreToolUse").and_then(Value::as_array) else {
+            continue;
+        };
+        seen_pre_tool_use = true;
+        for entry in entries {
+            if entry.get("matcher").and_then(Value::as_str) != Some("*") {
+                continue;
+            }
+            let Some(hooks) = entry.get("hooks").and_then(Value::as_array) else {
+                continue;
+            };
+            let hit = hooks.iter().any(|h| {
+                h.get("type").and_then(Value::as_str) == Some("command")
+                    && h.get("command").and_then(Value::as_str) == Some(want_cmd.as_str())
+                    && h.get("timeout").and_then(Value::as_u64) == Some(exp.timeout_secs)
+            });
+            if hit {
+                return Ok(());
+            }
+        }
+    }
+    Err(if seen_pre_tool_use {
+        "no PreToolUse entry with matcher \"*\" runs the expected helper command with the \
+         expected timeout"
+            .to_owned()
+    } else {
+        "no PreToolUse entry".to_owned()
+    })
+}
+
+/// Reads `path` back and proves it is what `agy` must see: a regular file (not a symlink)
+/// with mode exactly [`HOOK_FILE_MODE`], inside a directory that satisfies `dir_rule`,
+/// readable, valid JSON, registering a `PreToolUse` command hook with matcher `"*"` that runs
+/// `exp`'s helper with `exp`'s socket and timeout.
+pub fn validate_hook_config(
+    path: &Path,
+    exp: &HookConfigExpectation,
+    dir_rule: DirRule,
+) -> Result<(), HookConfigError> {
+    if exp.helper_bin.to_string_lossy().contains('\'')
+        || exp.socket_path.to_string_lossy().contains('\'')
+    {
+        return Err(HookConfigError::Malformed {
+            path: path.to_path_buf(),
+            detail: "helper or socket path contains a single quote and cannot be quoted safely"
+                .to_owned(),
+        });
+    }
+    if let Some(parent) = path.parent() {
+        check_dir(parent, dir_rule)?;
+    }
+    let meta = fs::symlink_metadata(path).map_err(|source| HookConfigError::Missing {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(HookConfigError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    let actual = meta.permissions().mode() & 0o777;
+    if actual != HOOK_FILE_MODE {
+        return Err(HookConfigError::BadFileMode {
+            path: path.to_path_buf(),
+            actual,
+            expected: HOOK_FILE_MODE,
+        });
+    }
+    let text = fs::read_to_string(path).map_err(|source| HookConfigError::Unreadable {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let doc: Value = serde_json::from_str(&text).map_err(|e| HookConfigError::Malformed {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    })?;
+    find_gate_hook(&doc, exp).map_err(|detail| {
+        if doc.is_object() {
+            HookConfigError::GateHookAbsent {
+                path: path.to_path_buf(),
+                detail,
+            }
+        } else {
+            HookConfigError::Malformed {
+                path: path.to_path_buf(),
+                detail,
+            }
+        }
+    })
+}
+
+/// Checks that the helper `agy` will run exists and is executable. A bare name is looked up
+/// on `PATH`, as the shell running the hook command would.
+pub fn check_helper_binary(helper: &Path) -> Result<(), HookConfigError> {
+    let unusable = |detail: &str| HookConfigError::HelperUnusable {
+        path: helper.to_path_buf(),
+        detail: detail.to_owned(),
+    };
+    let candidates: Vec<PathBuf> = if helper.components().count() > 1 || helper.is_absolute() {
+        vec![helper.to_path_buf()]
+    } else {
+        std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).map(|d| d.join(helper)).collect())
+            .unwrap_or_default()
+    };
+    for cand in &candidates {
+        if let Ok(meta) = fs::metadata(cand)
+            && meta.is_file()
+        {
+            return if meta.permissions().mode() & 0o111 != 0 {
+                Ok(())
+            } else {
+                Err(unusable("not executable"))
+            };
+        }
+    }
+    Err(unusable(
+        "not found (build it with `cargo build -p spike-agent-agy --bins`)",
+    ))
+}
+
+/// Everything the adapter verifies about the gate hook set-up, before spawning `agy` and again
+/// while the session runs.
+#[derive(Debug, Clone)]
+pub struct GateSetup {
+    pub session_dir: PathBuf,
+    /// The copy in the working directory (the one `agy` actually reads), if the adapter
+    /// installed one.
+    pub cwd_hooks: Option<PathBuf>,
+    pub expectation: HookConfigExpectation,
+}
+
+impl GateSetup {
+    /// Reads every hook config back and checks it. Any error means: do not start / abort.
+    pub fn verify(&self) -> Result<(), HookConfigError> {
+        check_dir(&self.session_dir, DirRule::Private)?;
+        validate_hook_config(
+            &self.session_dir.join("hooks.json"),
+            &self.expectation,
+            DirRule::Private,
+        )?;
+        validate_hook_config(
+            &self.session_dir.join(agents_dir_name()).join("hooks.json"),
+            &self.expectation,
+            DirRule::Private,
+        )?;
+        if let Some(cwd_hooks) = &self.cwd_hooks {
+            validate_hook_config(cwd_hooks, &self.expectation, DirRule::NoGroupOtherWrite)?;
+        }
+        check_helper_binary(&self.expectation.helper_bin)
+    }
+}
+
+/// What [`install_cwd_hook`] created, so cleanup removes exactly that and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CwdHookInstall {
+    pub hooks_path: PathBuf,
+    /// The config directory, if the adapter created it.
+    pub created_dir: Option<PathBuf>,
+}
+
+impl CwdHookInstall {
+    /// Removes the installed file, and the directory if the adapter created it and it is empty.
+    pub fn remove(&self) {
+        let _ = fs::remove_file(&self.hooks_path);
+        if let Some(dir) = &self.created_dir {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
+/// Installs a copy of the session's hook config as `<cwd>/<agents dir>/hooks.json` (mode 0600),
+/// which is where `agy` looks for it. Refuses (and changes nothing) if a hook config is already
+/// there: `agy` would read that one, not ours, and run tools without the Atrium gate.
+pub fn install_cwd_hook(
+    cwd: &Path,
+    session_hooks: &Path,
+) -> Result<CwdHookInstall, HookConfigError> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let agents_dir = cwd.join(agents_dir_name());
+    let hooks_path = agents_dir.join("hooks.json");
+    match fs::symlink_metadata(&hooks_path) {
+        Ok(_) => return Err(HookConfigError::CwdHooksPresent { path: hooks_path }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(HookConfigError::Missing {
+                path: hooks_path,
+                source,
+            });
+        }
+    }
+    let contents =
+        fs::read_to_string(session_hooks).map_err(|source| HookConfigError::Unreadable {
+            path: session_hooks.to_path_buf(),
+            source,
+        })?;
+
+    let mut created_dir = None;
+    match fs::DirBuilder::new()
+        .mode(HOOK_DIR_MODE)
+        .create(&agents_dir)
+    {
+        Ok(()) => created_dir = Some(agents_dir.clone()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(HookConfigError::Missing {
+                path: agents_dir,
+                source,
+            });
+        }
+    }
+    let install = CwdHookInstall {
+        hooks_path: hooks_path.clone(),
+        created_dir,
+    };
+    let write = || -> io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(HOOK_FILE_MODE)
+            .open(&hooks_path)?;
+        f.write_all(contents.as_bytes())?;
+        f.flush()?;
+        fs::set_permissions(&hooks_path, fs::Permissions::from_mode(HOOK_FILE_MODE))
+    };
+    if let Err(source) = write() {
+        if source.kind() == io::ErrorKind::AlreadyExists {
+            // Lost a race with someone else creating the file: it is not ours, leave it.
+            if let Some(dir) = &install.created_dir {
+                let _ = fs::remove_dir(dir);
+            }
+            return Err(HookConfigError::CwdHooksPresent { path: hooks_path });
+        }
+        install.remove();
+        return Err(HookConfigError::Unreadable {
+            path: hooks_path,
+            source,
+        });
+    }
+    Ok(install)
 }
