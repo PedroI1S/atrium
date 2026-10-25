@@ -855,7 +855,7 @@ async fn record_and_hook_failures_harnesses_reject_broken_launches() {
 
     // 2. Verify `examples/record` with broken agy on a non-startup-error scenario ("simple")
     // fails loudly (non-zero exit) and refuses to write simple.jsonl into the target fixtures dir.
-    let rec_bin = examples_dir.join("record");
+    let rec_bin = examples_dir.join("agy-record");
     if rec_bin.exists() {
         let scratch_fixtures = dir.join("fixtures");
         fs::create_dir_all(&scratch_fixtures).expect("create scratch fixtures");

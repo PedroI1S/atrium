@@ -230,19 +230,19 @@ cargo build -p spike-agent-agy --bins --examples
 
 1. **Remaining scenarios**, with the verified invocation. `question` is the one most likely to need a look: it may fail after its 90 s deadline if headless `agy` does not deliver the hook's answer; the failure prints where the sanitized dump is.
    ```sh
-   cargo run -p spike-agent-agy --example record -- question
-   cargo run -p spike-agent-agy --example record -- interrupt
-   cargo run -p spike-agent-agy --example record -- multi-turn
-   cargo run -p spike-agent-agy --example record -- resume
-   cargo run -p spike-agent-agy --example record -- startup-error
+   cargo run -p spike-agent-agy --example agy-record -- question
+   cargo run -p spike-agent-agy --example agy-record -- interrupt
+   cargo run -p spike-agent-agy --example agy-record -- multi-turn
+   cargo run -p spike-agent-agy --example agy-record -- resume
+   cargo run -p spike-agent-agy --example agy-record -- startup-error
    ```
 2. **Re-record the first five** (the earlier live fixtures were discarded for leaking the temp path; the new files must say `/scratch`, and `git grep -n -e /var/folders -e /private/var fixtures/` must find nothing):
    ```sh
-   cargo run -p spike-agent-agy --example record -- simple
-   cargo run -p spike-agent-agy --example record -- tool-read
-   cargo run -p spike-agent-agy --example record -- gate-deny
-   cargo run -p spike-agent-agy --example record -- approval-allow
-   cargo run -p spike-agent-agy --example record -- approval-deny
+   cargo run -p spike-agent-agy --example agy-record -- simple
+   cargo run -p spike-agent-agy --example agy-record -- tool-read
+   cargo run -p spike-agent-agy --example agy-record -- gate-deny
+   cargo run -p spike-agent-agy --example agy-record -- approval-allow
+   cargo run -p spike-agent-agy --example agy-record -- approval-deny
    ```
    (`record -- all` runs all ten and exits non-zero at the end if any failed.) Watch for a `gate bypass suspected` error: it means a tool ran without a hook request (or the config stopped validating) and names the tool. Add `--no-coverage-check` to look at what `agy` does without the abort.
 3. **Hook-failure harness** (optional re-run; expect `fail_closed` for the four helper cases and `fail_open` for `unreadable-config-permissions` and `malformed-config-json`, then a `FAIL-OPEN:` line and exit 3):
@@ -251,8 +251,8 @@ cargo build -p spike-agent-agy --bins --examples
    ```
 4. **Adapter refuses what `agy` fails open on.** Quick live check that needs no model call: run `chat` from a directory that already has a hook config and see it refuse (use a fresh directory for the normal run):
    ```sh
-   d=$(mktemp -d) && mkdir "$d/.agents" && echo '{ malformed' > "$d/.agents/hooks.json" && cargo run -p spike-agent-agy --example chat -- --cwd "$d" --prompt hi   # must print: chat failed: ... refusing to start agy ...
-   cargo run -p spike-agent-agy --example chat -- --cwd "$(mktemp -d)" --prompt "Run pwd and tell me the directory."
+   d=$(mktemp -d) && mkdir "$d/.agents" && echo '{ malformed' > "$d/.agents/hooks.json" && cargo run -p spike-agent-agy --example agy-chat -- --cwd "$d" --prompt hi   # must print: chat failed: ... refusing to start agy ...
+   cargo run -p spike-agent-agy --example agy-chat -- --cwd "$(mktemp -d)" --prompt "Run pwd and tell me the directory."
    ```
 
 ---

@@ -47,13 +47,13 @@ Run at `ebc3bb8` (Fix round 2):
 - `cargo fmt --check` -> exit 0
 - `cargo clippy -p spike-agent-agy --all-targets -- -D warnings` -> exit 0 (0 warnings)
 - `cargo test -p spike-agent-agy` -> exit 0, 37 tests: `bridge_and_saturation` 9, `gate_hardening` 14, `golden` 4, `recorder_scenarios` 1, `sanitize_and_record` 9 (what each covers: report section 4). Golden over `m0-00-smoke.jsonl` + the 10 hand-made scenarios (marked `hand-made` in their `.md`); saturation test; bridge tests with a fake hook client (allow, deny, ask -> allow/deny, adapter dropped mid-wait, malformed request, socket missing: all deny); retry-grant tests.
-- `cargo run -p spike-agent-agy --example record -- --generate-handmade all` -> exit 0 (no `.jsonl` or `.events.json` changed)
+- `cargo run -p spike-agent-agy --example agy-record -- --generate-handmade all` -> exit 0 (no `.jsonl` or `.events.json` changed)
 - `cargo run -p spike-agent-agy --example hook-failures -- --self-test` -> exit 0 (3/3 bridge failure cases fail closed)
 
 **Live commands for the orchestrator** (build first: `cargo build -p spike-agent-agy --bins --examples`; the adapter now refuses to start without the `spike-agy-hook` binary):
-- Remaining scenarios: `cargo run -p spike-agent-agy --example record -- question` (then `interrupt`, `multi-turn`, `resume`, `startup-error`)
+- Remaining scenarios: `cargo run -p spike-agent-agy --example agy-record -- question` (then `interrupt`, `multi-turn`, `resume`, `startup-error`)
 - Re-record the first five (earlier ones were discarded for the temp-path leak): `record -- simple`, `tool-read`, `gate-deny`, `approval-allow`, `approval-deny` (or `record -- all`). Afterwards `git grep -n -e /var/folders -e /private/var fixtures/` must find nothing.
-- Optional: `cargo run -p spike-agent-agy --example hook-failures` (expect `FAIL-OPEN:` for `unreadable-config-permissions` and `malformed-config-json`, exit 3); `cargo run -p spike-agent-agy --example chat -- --cwd "$(mktemp -d)" --prompt "Run pwd and tell me the directory."` (use a fresh `--cwd`: a directory that already has a hook config is refused by design).
+- Optional: `cargo run -p spike-agent-agy --example hook-failures` (expect `FAIL-OPEN:` for `unreadable-config-permissions` and `malformed-config-json`, exit 3); `cargo run -p spike-agent-agy --example agy-chat -- --cwd "$(mktemp -d)" --prompt "Run pwd and tell me the directory."` (use a fresh `--cwd`: a directory that already has a hook config is refused by design).
 - If a run aborts with `gate bypass suspected`, that is a finding (a tool ran with no hook request, or the config stopped validating); `--no-coverage-check` shows what `agy` does without the abort.
 
 ## Spike report (M0 only)

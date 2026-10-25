@@ -15,3 +15,14 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+# Unique example names: several spike crates have `record`/`chat` examples, and
+# cargo writes every example to the shared target/debug/examples/, so same-named
+# examples overwrite each other (tests then ran another crate's `record`).
+[[example]]
+name = "agy-record"
+path = "examples/record.rs"
+
+[[example]]
+name = "agy-chat"
+path = "examples/chat.rs"

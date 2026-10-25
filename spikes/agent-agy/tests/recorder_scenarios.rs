@@ -112,7 +112,7 @@ fn record_exe() -> PathBuf {
         .parent()
         .expect("target dir")
         .join("examples")
-        .join("record");
+        .join("agy-record");
     if !exe.exists() {
         let status = std::process::Command::new(env!("CARGO"))
             .args([
@@ -121,10 +121,10 @@ fn record_exe() -> PathBuf {
                 "-p",
                 "spike-agent-agy",
                 "--example",
-                "record",
+                "agy-record",
             ])
             .status()
-            .expect("cargo build --example record");
+            .expect("cargo build --example agy-record");
         assert!(status.success(), "building the record example failed");
     }
     exe

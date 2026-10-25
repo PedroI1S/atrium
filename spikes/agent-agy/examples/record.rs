@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let Some(scenario) = args.first().map(String::as_str) else {
         eprintln!(
-            "Usage:\n  cargo run -p spike-agent-agy --example record -- [--binary <path>] [--fixtures-dir <dir>] [--no-coverage-check] <scenario|all>\n  cargo run -p spike-agent-agy --example record -- --generate-handmade [scenario|all]\n\nScenarios: {}",
+            "Usage:\n  cargo run -p spike-agent-agy --example agy-record -- [--binary <path>] [--fixtures-dir <dir>] [--no-coverage-check] <scenario|all>\n  cargo run -p spike-agent-agy --example agy-record -- --generate-handmade [scenario|all]\n\nScenarios: {}",
             ALL_SCENARIOS.join(", ")
         );
         std::process::exit(2);
