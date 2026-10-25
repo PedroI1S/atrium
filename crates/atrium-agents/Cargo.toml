@@ -1,0 +1,18 @@
+[package]
+name = "atrium-agents"
+version = "0.0.0"
+description = "Atrium agent adapter contract: AgentAdapter, sessions, normalizers, protocol fixtures"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+atrium-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

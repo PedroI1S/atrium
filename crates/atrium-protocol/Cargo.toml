@@ -1,0 +1,15 @@
+[package]
+name = "atrium-protocol"
+version = "0.0.0"
+description = "Atrium contract types: normalized agent events and the daemon wire format"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

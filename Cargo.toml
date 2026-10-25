@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+# Contract crates (crates/) are owned by the orchestrator. Each Rust spike
+# (spikes/) is owned by one task; see docs/agents/briefs/. Tauri spikes
+# (ui-shell, stream-perf, browser-screencast) are standalone Cargo projects
+# under spikes/<name>/src-tauri and are not members of this workspace.
+members = [
+    "crates/atrium-protocol",
+    "crates/atrium-agents",
+    "spikes/agent-claude",
+    "spikes/agent-codex",
+    "spikes/agent-agy",
+    "spikes/agent-acp",
+    "spikes/daemon-socket",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+atrium-protocol = { path = "crates/atrium-protocol" }
+atrium-agents = { path = "crates/atrium-agents" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "time", "net"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
