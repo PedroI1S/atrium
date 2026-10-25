@@ -1,0 +1,60 @@
+[
+  {
+    "type": "session_started",
+    "provider": "acp",
+    "native_session_id": "ses_gate_deny_01",
+    "model": "anthropic/claude-haiku-4-5",
+    "tools": []
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "call_read_secret_1",
+    "name": "read",
+    "kind": "read",
+    "title": "Read secret.txt",
+    "input": {
+      "path": "~/scratch/gate-deny/secret.txt"
+    }
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "call_read_secret_1",
+    "status": "denied",
+    "output": null,
+    "error": "blocked by Atrium policy: secret.txt is restricted"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg-1",
+    "kind": "assistant",
+    "text": "I cannot read secret.txt because access was denied by policy."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg-1",
+    "kind": "assistant",
+    "text": "I cannot read secret.txt because access was denied by policy."
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 78,
+      "output_tokens": 26,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

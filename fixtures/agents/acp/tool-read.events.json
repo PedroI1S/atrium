@@ -2,8 +2,8 @@
   {
     "type": "session_started",
     "provider": "acp",
-    "native_session_id": "ses_tool_read_01",
-    "model": "anthropic/claude-haiku-4-5",
+    "native_session_id": "ses_hm_tool_read",
+    "model": "opencode/deepseek-v4.1-flash-free",
     "tools": []
   },
   {
@@ -12,44 +12,75 @@
   },
   {
     "type": "tool_call_started",
-    "call_id": "call_read_1",
+    "call_id": "call_1",
     "name": "read",
     "kind": "read",
-    "title": "Read hello.txt",
+    "title": "read",
+    "input": {}
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_1",
+    "title": null,
+    "kind": null,
     "input": {
-      "path": "~/scratch/tool-read/hello.txt"
-    }
+      "path": "/scratch/Cargo.toml"
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_1",
+    "title": "read",
+    "kind": "read",
+    "input": {
+      "path": "/scratch/Cargo.toml"
+    },
+    "output_delta": null,
+    "output": null
   },
   {
     "type": "tool_call_finished",
-    "call_id": "call_read_1",
+    "call_id": "call_1",
     "status": "succeeded",
-    "output": "Hello from Atrium!",
+    "output": "Read file /scratch/Cargo.toml, lines 1-3\n1: [package]\n2: name = \"scratch\"\n3: version = \"0.0.0\"",
     "error": null
   },
   {
     "type": "message_delta",
     "message_id": "msg-1",
     "kind": "assistant",
-    "text": "The file says: Hello from Atrium!"
+    "text": "The package name is scratch."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8300,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
   },
   {
     "type": "message_completed",
     "message_id": "msg-1",
     "kind": "assistant",
-    "text": "The file says: Hello from Atrium!"
+    "text": "The package name is scratch."
   },
   {
     "type": "turn_completed",
     "turn": 1,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 90,
-      "output_tokens": 25,
+      "input_tokens": 3900,
+      "output_tokens": 110,
       "cache_read_tokens": null,
       "cache_write_tokens": null,
       "reasoning_tokens": null,
-      "cost_usd": null
+      "cost_usd": 0.0
     }
   },
   {

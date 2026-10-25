@@ -1,9 +1,8 @@
 # Fixture: `gate-deny-execute`
 
-- **Source**: `hand-made` (constructed against `agent-client-protocol = 3.5.0` / ACP v1 schema; worker sandbox policy blocks executing `opencode`)
+- **Source**: `hand-made` (shaped after the live OpenCode v2.1.3 recording M0-04-live-1: `configOptions`, top-level tool `name`, permission options `once`/`always`/`reject`; the orchestrator replaces it with a live recording)
 - **Provider**: ACP (`opencode acp`, v2.1.3)
-- **Command**: `opencode acp`
-- **Model**: `anthropic/claude-haiku-4-5`
-- **Client capabilities**: `fs.readTextFile = true`, `fs.writeTextFile = true`, `terminal = true`, `elicitation.form = {}`
-- **Prompt**: `"Run \`cat secret.txt\` in the shell."`
-- **Covers**: Pre-execution gate denial for `Execute` (`terminal/create`). The gate returns `GateDecision::Deny`, the adapter refuses to spawn the command and returns a JSON-RPC error, the tool call finishes with `ToolCallFinished { status: Denied }`, and `secret.txt` is never read.
+- **Client capabilities**: `fs`, `terminal`, `elicitation.form` advertised (OpenCode ignores fs/terminal)
+- **Injected config**: `permissions: [{* * ask}]` (see `spikes/agent-acp/src/opencode_config.rs`)
+- **Prompt**: `"Run the shell command \`cat secret.txt\`."`
+- **Covers**: Same for `shell` (kind `execute`): `session/request_permission` -> gate `Deny` -> `reject` -> `denied`.

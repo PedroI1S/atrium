@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -13,8 +13,8 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, InitializeResponse, LoadSessionRequest, McpServer as AcpMcpServer,
     McpServerStdio, NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
     PromptRequest, ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionModeState,
-    SetSessionModeRequest, TextContent, ToolKind as AcpToolKind, WriteTextFileRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionModeState, TextContent,
+    ToolKind as AcpToolKind, WriteTextFileRequest,
 };
 use atrium_agents::fixture::FixtureLine;
 use atrium_agents::{
@@ -31,9 +31,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, watch};
 
+use crate::model::{ModelVia, find_select_option, parse_model_state};
 use crate::normalizer::{
     AcpNormalizer, extract_tool_name, map_tool_kind, normalize_tool_input, rpc_id_to_string,
 };
+use crate::opencode_config::InjectedConfig;
 
 /// Client capability advertisement configuration for [`AcpAdapter`].
 ///
@@ -100,6 +102,11 @@ pub struct AcpAdapter {
     args: Vec<String>,
     capabilities: ClientCapabilityConfig,
     recorder: Option<mpsc::UnboundedSender<FixtureLine>>,
+    /// Spawn the agent with a per-session OpenCode config that makes it ask
+    /// for every action (see [`crate::opencode_config`]). On for the default
+    /// `opencode acp` command, off for [`AcpAdapter::with_command`].
+    inject_opencode_config: bool,
+    startup_timeout: Duration,
 }
 
 impl Default for AcpAdapter {
@@ -117,6 +124,8 @@ impl AcpAdapter {
             args: vec!["acp".to_owned()],
             capabilities: ClientCapabilityConfig::all(),
             recorder: None,
+            inject_opencode_config: true,
+            startup_timeout: STARTUP_TIMEOUT,
         }
     }
 
@@ -132,7 +141,23 @@ impl AcpAdapter {
             args: args.into_iter().map(Into::into).collect(),
             capabilities: ClientCapabilityConfig::all(),
             recorder: None,
+            inject_opencode_config: false,
+            startup_timeout: STARTUP_TIMEOUT,
         }
+    }
+
+    /// Turns the per-session OpenCode config injection on or off. It is on for
+    /// [`AcpAdapter::new`] (`opencode acp`) and off for other commands.
+    pub fn with_opencode_config(mut self, inject: bool) -> Self {
+        self.inject_opencode_config = inject;
+        self
+    }
+
+    /// Bounds `initialize` + session creation + model selection. Defaults to
+    /// [`STARTUP_TIMEOUT`]; tests use a shorter one.
+    pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
+        self
     }
 
     /// Configures which ACP client capabilities (`fs`, `terminal`, `elicitation`)
@@ -156,9 +181,15 @@ impl AgentAdapter for AcpAdapter {
     }
 
     fn interception(&self) -> Interception {
-        // Even with fs and terminal client capabilities enabled, ACP agents run
-        // search (grep/glob), web fetch, and MCP tools inside their own process
-        // and only gate them if the provider chooses to emit `session/request_permission`.
+        // `ProviderGated` on purpose. OpenCode does not use the client fs and
+        // terminal capabilities (live finding), and with its default
+        // permissions it asks about nothing. The injected `ask` rule makes it
+        // send `session/request_permission` for the tool classes its docs list,
+        // but that is the provider's own enforcement: not every class has been
+        // proven live (MCP tools and subagent internals are open), saved
+        // "always" approvals and user-defined agents can override it, and other
+        // ACP agents choose for themselves. See the enforcement matrix in
+        // `docs/spikes/M0-04-acp-adapter.md`.
         Interception::ProviderGated
     }
 
@@ -181,11 +212,29 @@ impl AgentAdapter for AcpAdapter {
                 .program
                 .clone()
                 .unwrap_or_else(|| self.program.clone());
+            let injected = if self.inject_opencode_config {
+                Some(InjectedConfig::create(config.model.as_deref()).map_err(AdapterError::Spawn)?)
+            } else {
+                None
+            };
             let mut cmd = Command::new(&program);
             cmd.args(&self.args)
                 .current_dir(&config.cwd)
-                .envs(config.env.iter().cloned())
-                .stdin(Stdio::piped())
+                .envs(config.env.iter().cloned());
+            if let Some(injected) = &injected {
+                // Ours go last, so they win over anything in `config.env`.
+                let lookup = |name: &str| {
+                    config
+                        .env
+                        .iter()
+                        .rev()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.clone())
+                        .or_else(|| std::env::var(name).ok())
+                };
+                cmd.envs(injected.env(lookup));
+            }
+            cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
@@ -289,6 +338,7 @@ impl AgentAdapter for AcpAdapter {
                 recorder: self.recorder.clone(),
                 started_at,
                 normalizer,
+                _injected_config: injected,
                 next_seq: 0,
                 next_rpc_id: 0,
                 session_id: String::new(),
@@ -305,9 +355,11 @@ impl AgentAdapter for AcpAdapter {
 
             // Perform the ACP handshake (`initialize` + `session/new` or `session/load`)
             // bounded by `STARTUP_TIMEOUT`.
-            let handshake_res =
-                tokio::time::timeout(STARTUP_TIMEOUT, runtime.handshake(&mut child, &mut io_rx))
-                    .await;
+            let handshake_res = tokio::time::timeout(
+                self.startup_timeout,
+                runtime.handshake(&mut child, &mut io_rx),
+            )
+            .await;
 
             match handshake_res {
                 Err(_) => {
@@ -402,6 +454,8 @@ struct SessionRuntime {
     recorder: Option<mpsc::UnboundedSender<FixtureLine>>,
     started_at: Instant,
     normalizer: AcpNormalizer,
+    /// Removes the generated config directory when the session ends.
+    _injected_config: Option<InjectedConfig>,
     next_seq: u64,
     next_rpc_id: i64,
     session_id: String,
@@ -599,30 +653,120 @@ impl SessionRuntime {
             }
         }
 
-        // 4. Apply PermissionPolicy mode if the agent advertised matching modes.
+        // 4. Select the model. OpenCode ignores `_meta.model` on session/new, so
+        //    the model is verified from the response and, if the agent is not
+        //    running it, selected over ACP. The normalizer holds back
+        //    `SessionStarted` until this succeeds, so a model the agent rejects
+        //    (or silently does not apply) is a pre-session failure.
+        if let Some(model) = self.config.model.clone() {
+            let state = parse_model_state(&sess_resp_val);
+            if !state.as_ref().is_some_and(|s| s.confirms(&model)) {
+                let (method, params) = match state.map(|s| s.via) {
+                    Some(ModelVia::ModelsState) => (
+                        "session/set_model",
+                        json!({ "sessionId": self.session_id, "modelId": model }),
+                    ),
+                    Some(ModelVia::ConfigOption { config_id }) => (
+                        "session/set_config_option",
+                        json!({ "sessionId": self.session_id, "configId": config_id, "value": model }),
+                    ),
+                    // The agent reports no model state at all: try the
+                    // conventional id and let the agent answer.
+                    None => (
+                        "session/set_config_option",
+                        json!({ "sessionId": self.session_id, "configId": "model", "value": model }),
+                    ),
+                };
+                match self.request(method, params, child, io_rx).await? {
+                    WaitOutcome::Response(_) => {}
+                    WaitOutcome::RpcError => {
+                        let code = terminate_and_reap(&mut self.stdin, child).await;
+                        return Ok(HandshakeOutcome::PreSessionExit { exit_code: code });
+                    }
+                    WaitOutcome::Exited(code) => {
+                        let _ = terminate_and_reap(&mut self.stdin, child).await;
+                        return Ok(HandshakeOutcome::PreSessionExit { exit_code: code });
+                    }
+                }
+                if !self.normalizer.session_started() {
+                    // The agent answered but the normalizer did not accept the
+                    // model (it reported another one): fail before the session.
+                    let code = terminate_and_reap(&mut self.stdin, child).await;
+                    return Ok(HandshakeOutcome::PreSessionExit { exit_code: code });
+                }
+            }
+        }
+
+        // 5. Apply the PermissionPolicy and effort where the agent offers them.
+        //    Failures here are reported by the normalizer as non-fatal errors.
+        let mut options_source = sess_resp_val.clone();
         if let Some(modes_val) = sess_resp_val.get("modes") {
             if let Ok(modes) = serde_json::from_value::<SessionModeState>(modes_val.clone()) {
                 if let Some(target_mode) = select_mode_for_policy(self.config.permissions, &modes) {
                     if target_mode != modes.current_mode_id.0.as_ref() {
-                        let mode_rpc_id = self.alloc_rpc_id();
-                        let mode_req = SetSessionModeRequest::new(
-                            SessionId::new(self.session_id.clone()),
-                            target_mode,
-                        );
-                        let mode_msg = json!({
-                            "jsonrpc": "2.0",
-                            "id": mode_rpc_id,
-                            "method": "session/set_mode",
-                            "params": mode_req,
-                        });
-                        let _ = self.send_json(&mode_msg).await;
-                        let _ = self.wait_for_rpc_response(mode_rpc_id, child, io_rx).await;
+                        let params = json!({ "sessionId": self.session_id, "modeId": target_mode });
+                        let _ = self
+                            .request("session/set_mode", params, child, io_rx)
+                            .await?;
                     }
+                }
+            }
+        } else if let Some((id, current, offered)) =
+            find_select_option(&options_source, "mode", "mode")
+        {
+            if let Some(target) = select_mode_value(self.config.permissions, &offered) {
+                if target != current {
+                    let params =
+                        json!({ "sessionId": self.session_id, "configId": id, "value": target });
+                    if let WaitOutcome::Response(v) = self
+                        .request("session/set_config_option", params, child, io_rx)
+                        .await?
+                    {
+                        if v.get("configOptions").is_some() {
+                            options_source = v;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(effort) = self.config.effort.clone() {
+            match find_select_option(&options_source, "thought_level", "effort") {
+                Some((id, current, offered))
+                    if current != effort && (offered.is_empty() || offered.contains(&effort)) =>
+                {
+                    let params =
+                        json!({ "sessionId": self.session_id, "configId": id, "value": effort });
+                    let _ = self
+                        .request("session/set_config_option", params, child, io_rx)
+                        .await?;
+                }
+                Some((_, current, _)) if current == effort => {}
+                // Not offered (or not a listed level): ask anyway so the agent's
+                // refusal is recorded and reported, not silently ignored.
+                _ => {
+                    let params = json!({ "sessionId": self.session_id, "configId": "effort", "value": effort });
+                    let _ = self
+                        .request("session/set_config_option", params, child, io_rx)
+                        .await?;
                 }
             }
         }
 
         Ok(HandshakeOutcome::Established)
+    }
+
+    /// Sends a request and waits for its response.
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        child: &mut Child,
+        io_rx: &mut mpsc::UnboundedReceiver<ChildIo>,
+    ) -> Result<WaitOutcome, AdapterError> {
+        let id = self.alloc_rpc_id();
+        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.send_json(&msg).await?;
+        self.wait_for_rpc_response(id, child, io_rx).await
     }
 
     async fn wait_for_rpc_response(
@@ -936,6 +1080,8 @@ impl SessionRuntime {
         rpc_id_str: String,
         params: Value,
     ) {
+        let mut params = params;
+        crate::normalizer::hoist_tool_name(&mut params);
         let Ok(req) = serde_json::from_value::<RequestPermissionRequest>(params) else {
             let err_resp = json!({
                 "jsonrpc": "2.0",
@@ -1605,40 +1751,49 @@ async fn terminate_and_reap(stdin: &mut Option<ChildStdin>, child: &mut Child) -
     }
 }
 
+/// Picks the `allow_once` / `reject_once` option. Atrium's "always" rules live
+/// in Atrium, so an agent-side `allow_always` is never selected (OpenCode
+/// would save it as a durable project rule that later skips the gate). If the
+/// agent offers no matching once-option, the request is cancelled, which is a
+/// denial (fail closed).
 fn build_permission_response(
     options: &[PermissionOption],
     allow: bool,
 ) -> RequestPermissionResponse {
-    let target_primary = if allow {
+    let target = if allow {
         PermissionOptionKind::AllowOnce
     } else {
         PermissionOptionKind::RejectOnce
     };
-    let target_fallback = if allow {
-        PermissionOptionKind::AllowAlways
-    } else {
-        PermissionOptionKind::RejectAlways
-    };
-
-    if let Some(opt) = options
-        .iter()
-        .find(|o| o.kind == target_primary)
-        .or_else(|| options.iter().find(|o| o.kind == target_fallback))
-    {
-        RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+    let chosen = options.iter().find(|o| o.kind == target).or_else(|| {
+        // A reject-always is still a denial; an allow-always is not an allow-once.
+        (!allow)
+            .then(|| {
+                options
+                    .iter()
+                    .find(|o| o.kind == PermissionOptionKind::RejectAlways)
+            })
+            .flatten()
+    });
+    match chosen {
+        Some(opt) => RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
             SelectedPermissionOutcome::new(opt.option_id.clone()),
-        ))
-    } else if allow {
-        if let Some(first) = options.first() {
-            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
-                SelectedPermissionOutcome::new(first.option_id.clone()),
-            ))
-        } else {
-            RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
-        }
-    } else {
-        RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
+        )),
+        None => RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
     }
+}
+
+/// The mode value (from a `mode` select option) for a [`PermissionPolicy`]:
+/// only `ReadOnly` changes anything (OpenCode's `plan` agent denies edits).
+/// `Ask` and `FullAccess` keep the agent's default; the injected `ask` rule
+/// applies in every mode, so the gate sees calls either way.
+fn select_mode_value(policy: PermissionPolicy, offered: &[String]) -> Option<String> {
+    if policy != PermissionPolicy::ReadOnly {
+        return None;
+    }
+    ["plan", "read-only", "readonly", "architect"]
+        .iter()
+        .find_map(|c| offered.iter().find(|o| o.eq_ignore_ascii_case(c)).cloned())
 }
 
 fn select_mode_for_policy(policy: PermissionPolicy, modes: &SessionModeState) -> Option<String> {
@@ -1686,4 +1841,60 @@ fn slice_lines(content: &str, line: Option<u32>, limit: Option<u32>) -> String {
         .take(max_lines)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opt(id: &str, kind: PermissionOptionKind) -> PermissionOption {
+        PermissionOption::new(id.to_owned(), id.to_owned(), kind)
+    }
+
+    fn selected(resp: &RequestPermissionResponse) -> Option<String> {
+        match &resp.outcome {
+            RequestPermissionOutcome::Selected(s) => Some(s.option_id.0.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn allow_is_always_allow_once_never_allow_always() {
+        let both = [
+            opt("always", PermissionOptionKind::AllowAlways),
+            opt("once", PermissionOptionKind::AllowOnce),
+            opt("reject", PermissionOptionKind::RejectOnce),
+        ];
+        assert_eq!(
+            selected(&build_permission_response(&both, true)).as_deref(),
+            Some("once")
+        );
+        assert_eq!(
+            selected(&build_permission_response(&both, false)).as_deref(),
+            Some("reject")
+        );
+        let only_always = [opt("always", PermissionOptionKind::AllowAlways)];
+        assert_eq!(
+            selected(&build_permission_response(&only_always, true)),
+            None
+        );
+        assert_eq!(
+            selected(&build_permission_response(&only_always, false)),
+            None
+        );
+    }
+
+    #[test]
+    fn only_read_only_policy_changes_the_mode() {
+        let offered = vec!["build".to_owned(), "plan".to_owned()];
+        assert_eq!(
+            select_mode_value(PermissionPolicy::ReadOnly, &offered).as_deref(),
+            Some("plan")
+        );
+        assert_eq!(select_mode_value(PermissionPolicy::Ask, &offered), None);
+        assert_eq!(
+            select_mode_value(PermissionPolicy::FullAccess, &offered),
+            None
+        );
+    }
 }

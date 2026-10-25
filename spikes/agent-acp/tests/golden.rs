@@ -9,6 +9,8 @@ use atrium_protocol::agent::{
     ToolStatus, TurnOutcome,
 };
 use spike_agent_acp::AcpNormalizer;
+use spike_agent_acp::sanitize::contains_temp_path;
+use spike_agent_acp::selfcheck::{CANARY, detect_gate_bypass};
 
 const SCENARIOS: &[&str] = &[
     "simple",
@@ -22,6 +24,13 @@ const SCENARIOS: &[&str] = &[
     "multi-turn",
     "resume",
     "startup-error",
+    // Fix round 1 additions.
+    "model-select",
+    // The client-capability path (fs/* and terminal/*), which OpenCode does not
+    // use but other ACP agents may.
+    "tool-read-fs",
+    "gate-deny-fs",
+    "gate-deny-terminal",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -177,7 +186,7 @@ fn assert_contract_invariants(scenario: &str, events: &[AgentEvent]) {
     );
 
     match scenario {
-        "gate-deny" | "gate-deny-execute" => {
+        "gate-deny" | "gate-deny-execute" | "gate-deny-fs" | "gate-deny-terminal" => {
             assert!(
                 finished_tools.values().any(|s| *s == ToolStatus::Denied),
                 "{scenario}: expected at least one ToolStatus::Denied, got {finished_tools:?}"
@@ -238,6 +247,18 @@ fn assert_contract_invariants(scenario: &str, events: &[AgentEvent]) {
                 .count();
             assert_eq!(turn_count, 2, "{scenario}: expected 2 completed turns");
         }
+        "model-select" => {
+            assert!(
+                matches!(
+                    events.first(),
+                    Some(AgentEvent::SessionStarted {
+                        model: Some(m),
+                        ..
+                    }) if m == "opencode/big-pickle"
+                ),
+                "{scenario}: SessionStarted must carry the requested model"
+            );
+        }
         "resume" => {
             assert!(
                 matches!(
@@ -292,6 +313,32 @@ fn all_fixtures_pass_golden_and_invariants() {
             sanitizer.is_clean(&raw_md),
             "{scenario}.md failed Sanitizer::is_clean"
         );
+        for (what, raw) in [
+            ("jsonl", &raw_jsonl),
+            ("events.json", &raw_events),
+            ("md", &raw_md),
+        ] {
+            assert!(
+                !contains_temp_path(raw),
+                "{scenario}.{what} still contains a temp path"
+            );
+            assert!(
+                !raw.contains(CANARY),
+                "{scenario}.{what} contains the secret canary"
+            );
+        }
+        if scenario.starts_with("gate-deny") {
+            let denied: &[&str] = if scenario.contains("execute") || scenario.contains("terminal") {
+                &["execute"]
+            } else {
+                &["read"]
+            };
+            let findings = detect_gate_bypass(CANARY, denied, &lines);
+            assert!(
+                findings.is_empty(),
+                "{scenario}: gate bypassed, record as ungated in the matrix: {findings:?}"
+            );
+        }
         assert!(
             raw_md.contains("hand-made") || raw_md.contains("live"),
             "{scenario}.md must state whether it is hand-made or live"
@@ -417,4 +464,165 @@ fn unexpected_exit_closes_open_items_in_contract_order() {
             ..
         }
     ));
+}
+
+fn feed(norm: &mut AcpNormalizer, inputs: &[(&str, &str)]) -> Vec<AgentEvent> {
+    let mut all = Vec::new();
+    for (dir, line) in inputs {
+        let input = match *dir {
+            "in" => AdapterInput::Stdin {
+                line: (*line).into(),
+            },
+            "out" => AdapterInput::Stdout {
+                line: (*line).into(),
+            },
+            other => panic!("bad dir {other}"),
+        };
+        all.extend(norm.on_input(&input));
+    }
+    all
+}
+
+const NEW_WITH_MODEL: &str = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/scratch","mcpServers":[],"_meta":{"model":"a/wanted"}}}"#;
+const NEW_RESP_DEFAULT: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"a/default","options":[{"value":"a/default","name":"d"},{"value":"a/wanted","name":"w"}]}]}}"#;
+const SET_MODEL: &str = r#"{"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{"sessionId":"s1","configId":"model","value":"a/wanted"}}"#;
+
+#[test]
+fn session_start_waits_for_the_requested_model() {
+    let mut norm = AcpNormalizer::new();
+    let before = feed(
+        &mut norm,
+        &[("in", NEW_WITH_MODEL), ("out", NEW_RESP_DEFAULT)],
+    );
+    assert!(before.is_empty(), "no SessionStarted yet: {before:?}");
+    let after = feed(
+        &mut norm,
+        &[
+            ("in", SET_MODEL),
+            (
+                "out",
+                r#"{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"model","category":"model","type":"select","currentValue":"a/wanted","options":[{"value":"a/wanted","name":"w"}]}]}}"#,
+            ),
+        ],
+    );
+    assert!(
+        matches!(
+            after.as_slice(),
+            [AgentEvent::SessionStarted { model: Some(m), .. }] if m == "a/wanted"
+        ),
+        "{after:?}"
+    );
+}
+
+#[test]
+fn model_the_agent_does_not_apply_is_a_pre_session_failure() {
+    let mut norm = AcpNormalizer::new();
+    let events = feed(
+        &mut norm,
+        &[
+            ("in", NEW_WITH_MODEL),
+            ("out", NEW_RESP_DEFAULT),
+            ("in", SET_MODEL),
+            // The agent says OK but still reports the default model.
+            (
+                "out",
+                r#"{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"model","category":"model","type":"select","currentValue":"a/default","options":[{"value":"a/default","name":"d"}]}]}}"#,
+            ),
+        ],
+    );
+    assert!(
+        matches!(events.as_slice(), [AgentEvent::Error { fatal: true, .. }]),
+        "{events:?}"
+    );
+    let end = norm.on_input(&AdapterInput::Exit { code: Some(0) });
+    assert!(
+        matches!(end.as_slice(), [AgentEvent::SessionEnded { .. }]),
+        "{end:?}"
+    );
+}
+
+#[test]
+fn exit_while_waiting_for_the_model_never_starts_the_session() {
+    let mut norm = AcpNormalizer::new();
+    feed(
+        &mut norm,
+        &[("in", NEW_WITH_MODEL), ("out", NEW_RESP_DEFAULT)],
+    );
+    let end = norm.on_input(&AdapterInput::Exit { code: Some(1) });
+    assert!(
+        matches!(
+            end.as_slice(),
+            [
+                AgentEvent::Error { fatal: true, message },
+                AgentEvent::SessionEnded { .. }
+            ] if message.contains("a/wanted")
+        ),
+        "{end:?}"
+    );
+}
+
+#[test]
+fn model_already_selected_starts_at_once_and_without_a_request_it_is_unchanged() {
+    let mut norm = AcpNormalizer::new();
+    let events = feed(
+        &mut norm,
+        &[
+            ("in", NEW_WITH_MODEL),
+            (
+                "out",
+                r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"a/wanted","options":[{"value":"a/wanted","name":"w"}]}]}}"#,
+            ),
+        ],
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::SessionStarted { .. }]
+    ));
+    let mut plain = AcpNormalizer::new();
+    let events = feed(
+        &mut plain,
+        &[
+            (
+                "in",
+                r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/scratch","mcpServers":[]}}"#,
+            ),
+            (
+                "out",
+                r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s2"}}"#,
+            ),
+        ],
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::SessionStarted { .. }]
+    ));
+}
+
+#[test]
+fn opencode_top_level_tool_name_reaches_the_events() {
+    let mut norm = AcpNormalizer::new();
+    let events = feed(
+        &mut norm,
+        &[
+            (
+                "in",
+                r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/scratch","mcpServers":[]}}"#,
+            ),
+            (
+                "out",
+                r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#,
+            ),
+            (
+                "out",
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"c1","name":"shell","title":"shell","kind":"execute","status":"pending","locations":[],"rawInput":{}}}}"#,
+            ),
+        ],
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallStarted { name, .. } if name == "shell"
+        )),
+        "{events:?}"
+    );
 }

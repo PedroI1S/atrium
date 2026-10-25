@@ -17,6 +17,8 @@ use atrium_protocol::agent::{
 };
 use serde_json::{Value, json};
 
+use crate::model::{ModelVia, parse_model_state};
+
 #[derive(Debug, Clone)]
 enum OutboundReq {
     Initialize,
@@ -33,6 +35,11 @@ enum OutboundReq {
     },
     SetMode,
     SetConfigOption,
+    /// `session/set_config_option` (model) or `session/set_model` sent while
+    /// the session start waits for the model to be confirmed.
+    SetModel {
+        model: String,
+    },
     Prompt {
         turn: u32,
     },
@@ -62,6 +69,16 @@ struct PendingGateableRpc {
     call_id: String,
 }
 
+/// A session the agent created, whose start is held back until the requested
+/// model is confirmed (see [`AcpNormalizer`]).
+#[derive(Debug, Clone)]
+struct DeferredStart {
+    native_session_id: String,
+    requested_model: String,
+    via: Option<ModelVia>,
+    tools: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct PendingApproval {
     request_id: String,
@@ -77,6 +94,8 @@ pub struct AcpNormalizer {
     last_error_reason: Option<String>,
     stderr_lines: Vec<String>,
     configured_model: Option<String>,
+    /// Set between the `session/new` response and the model confirmation.
+    deferred_start: Option<DeferredStart>,
 
     pending_client_reqs: BTreeMap<String, OutboundReq>,
     pending_gateable_rpcs: VecDeque<PendingGateableRpc>,
@@ -118,6 +137,7 @@ impl AcpNormalizer {
             last_error_reason: None,
             stderr_lines: Vec::new(),
             configured_model: None,
+            deferred_start: None,
             pending_client_reqs: BTreeMap::new(),
             pending_gateable_rpcs: VecDeque::new(),
             rpc_to_call_id: BTreeMap::new(),
@@ -143,6 +163,11 @@ impl AcpNormalizer {
     pub fn with_model(mut self, model: Option<String>) -> Self {
         self.configured_model = model;
         self
+    }
+
+    /// True once `SessionStarted` has been emitted.
+    pub fn session_started(&self) -> bool {
+        self.session_started
     }
 
     pub fn call_id_for_rpc(&self, rpc_id: &str) -> Option<String> {
@@ -341,13 +366,35 @@ impl AcpNormalizer {
                             SessionConfigOptionValue::Boolean { value: b, .. } => b.to_string(),
                             _ => String::new(),
                         };
+                        let selects_deferred_model =
+                            self.deferred_start.as_ref().is_some_and(|d| match &d.via {
+                                Some(ModelVia::ConfigOption { config_id: id }) => *id == config_id,
+                                _ => config_id == "model",
+                            });
+                        if let Some(id) = rpc_id {
+                            let req = if selects_deferred_model {
+                                OutboundReq::SetModel {
+                                    model: value.clone(),
+                                }
+                            } else {
+                                OutboundReq::SetConfigOption
+                            };
+                            self.pending_client_reqs.insert(id, req);
+                        }
                         if config_id == "model" && !value.is_empty() {
                             self.configured_model = Some(value);
                         }
-                        if let Some(id) = rpc_id {
-                            self.pending_client_reqs
-                                .insert(id, OutboundReq::SetConfigOption);
-                        }
+                    }
+                }
+                "session/set_model" => {
+                    let model = params
+                        .get("modelId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    if let Some(id) = rpc_id {
+                        self.pending_client_reqs
+                            .insert(id, OutboundReq::SetModel { model });
                     }
                 }
                 "session/prompt" => {
@@ -526,7 +573,12 @@ impl AcpNormalizer {
                         }
                         out.push(AgentEvent::Error { message, fatal });
                     }
-                    OutboundReq::SetMode | OutboundReq::SetConfigOption => {
+                    OutboundReq::SetMode
+                    | OutboundReq::SetConfigOption
+                    | OutboundReq::SetModel { .. } => {
+                        if matches!(req, OutboundReq::SetModel { .. }) {
+                            self.deferred_start = None;
+                        }
                         let fatal = !self.session_started;
                         if fatal {
                             self.fatal_error_emitted = true;
@@ -549,7 +601,7 @@ impl AcpNormalizer {
                             Ok(resp) => (
                                 resp.session_id.0.to_string(),
                                 extract_model_from_options(resp.config_options.as_deref())
-                                    .or(model)
+                                    .or_else(|| model.clone())
                                     .or_else(|| self.configured_model.clone()),
                             ),
                             Err(_) => {
@@ -558,53 +610,54 @@ impl AcpNormalizer {
                                     .and_then(Value::as_str)
                                     .unwrap_or_default()
                                     .to_owned();
-                                (sid, model.or_else(|| self.configured_model.clone()))
+                                (sid, model.clone().or_else(|| self.configured_model.clone()))
                             }
                         };
-                    if !native_session_id.is_empty() && !self.session_started {
-                        self.session_started = true;
-                        self.configured_model = resp_model.clone();
-                        out.push(AgentEvent::SessionStarted {
-                            provider: Provider::Acp,
-                            native_session_id,
-                            model: resp_model,
-                            tools: extract_tools(&result),
-                        });
-                    }
+                    self.start_or_defer(native_session_id, model, resp_model, &result, out);
                 }
                 OutboundReq::SessionLoad { session_id, model } => {
                     let resp_model = serde_json::from_value::<LoadSessionResponse>(result.clone())
                         .ok()
                         .and_then(|r| extract_model_from_options(r.config_options.as_deref()))
-                        .or(model)
+                        .or_else(|| model.clone())
                         .or_else(|| self.configured_model.clone());
-                    if !session_id.is_empty() && !self.session_started {
-                        self.session_started = true;
-                        self.configured_model = resp_model.clone();
-                        out.push(AgentEvent::SessionStarted {
-                            provider: Provider::Acp,
-                            native_session_id: session_id,
-                            model: resp_model,
-                            tools: extract_tools(&result),
-                        });
-                    }
+                    self.start_or_defer(session_id, model, resp_model, &result, out);
                 }
                 OutboundReq::SessionResume { session_id, model } => {
                     let resp_model =
                         serde_json::from_value::<ResumeSessionResponse>(result.clone())
                             .ok()
                             .and_then(|r| extract_model_from_options(r.config_options.as_deref()))
-                            .or(model)
+                            .or_else(|| model.clone())
                             .or_else(|| self.configured_model.clone());
-                    if !session_id.is_empty() && !self.session_started {
-                        self.session_started = true;
-                        self.configured_model = resp_model.clone();
-                        out.push(AgentEvent::SessionStarted {
-                            provider: Provider::Acp,
-                            native_session_id: session_id,
-                            model: resp_model,
-                            tools: extract_tools(&result),
-                        });
+                    self.start_or_defer(session_id, model, resp_model, &result, out);
+                }
+                OutboundReq::SetModel { model } => {
+                    if let Some(d) = self.deferred_start.take() {
+                        // The set_config_option response lists the options again;
+                        // when it does, it must show the model we asked for.
+                        let reported = parse_model_state(&result);
+                        if let Some(state) = reported.filter(|s| !s.confirms(&model)) {
+                            let message = format!(
+                                "the agent did not select model {model} (it reports {})",
+                                state.current
+                            );
+                            self.last_error_reason = Some(message.clone());
+                            self.fatal_error_emitted = true;
+                            out.push(AgentEvent::Error {
+                                message,
+                                fatal: true,
+                            });
+                        } else {
+                            self.session_started = true;
+                            self.configured_model = Some(d.requested_model.clone());
+                            out.push(AgentEvent::SessionStarted {
+                                provider: Provider::Acp,
+                                native_session_id: d.native_session_id,
+                                model: Some(d.requested_model),
+                                tools: d.tools,
+                            });
+                        }
                     }
                 }
                 OutboundReq::SetMode | OutboundReq::SetConfigOption => {}
@@ -621,7 +674,51 @@ impl AcpNormalizer {
         });
     }
 
-    fn handle_session_update(&mut self, params: Value, raw_msg: &Value, out: &mut Vec<AgentEvent>) {
+    /// Emits `SessionStarted`, unless a model was requested and the agent does
+    /// not confirm it yet. In that case the start is held back: the adapter
+    /// selects the model next, and the session starts when that succeeds. If
+    /// it fails, or the agent exits first, the session never started
+    /// (pre-session failure), which is what a bad model id must produce.
+    fn start_or_defer(
+        &mut self,
+        native_session_id: String,
+        requested_model: Option<String>,
+        resp_model: Option<String>,
+        result: &Value,
+        out: &mut Vec<AgentEvent>,
+    ) {
+        if native_session_id.is_empty() || self.session_started || self.deferred_start.is_some() {
+            return;
+        }
+        if let Some(requested) = requested_model {
+            let state = parse_model_state(result);
+            if !state.as_ref().is_some_and(|s| s.confirms(&requested)) {
+                self.deferred_start = Some(DeferredStart {
+                    native_session_id,
+                    requested_model: requested,
+                    via: state.map(|s| s.via),
+                    tools: extract_tools(result),
+                });
+                return;
+            }
+        }
+        self.session_started = true;
+        self.configured_model = resp_model.clone();
+        out.push(AgentEvent::SessionStarted {
+            provider: Provider::Acp,
+            native_session_id,
+            model: resp_model,
+            tools: extract_tools(result),
+        });
+    }
+
+    fn handle_session_update(
+        &mut self,
+        mut params: Value,
+        raw_msg: &Value,
+        out: &mut Vec<AgentEvent>,
+    ) {
+        hoist_tool_name(&mut params);
         let Ok(notif) = serde_json::from_value::<SessionNotification>(params.clone()) else {
             let tag = params
                 .get("update")
@@ -868,10 +965,11 @@ impl AcpNormalizer {
     fn handle_request_permission(
         &mut self,
         rpc_id: Option<String>,
-        params: Value,
+        mut params: Value,
         raw_msg: &Value,
         out: &mut Vec<AgentEvent>,
     ) {
+        hoist_tool_name(&mut params);
         let Ok(req) = serde_json::from_value::<RequestPermissionRequest>(params) else {
             out.push(AgentEvent::Unmapped {
                 record_type: "session/request_permission:invalid".into(),
@@ -903,6 +1001,32 @@ impl AcpNormalizer {
                 },
                 out,
             );
+        } else if let Some(open) = self.open_tool_calls.get_mut(&call_id) {
+            // OpenCode announces a call with an empty input and only sends the
+            // real input (the command, the path) with the permission request.
+            // Surface it, so the user and the log see what is being asked.
+            let fields = &req.tool_call.fields;
+            let locations = fields.locations.clone().unwrap_or_default();
+            let input = normalize_tool_input(fields.raw_input.as_ref(), &locations);
+            let title = fields.title.as_deref().and_then(non_empty_string);
+            let new_input = (input != open.input && input != json!({})).then_some(input);
+            let new_title = title.filter(|t| open.title.as_deref() != Some(t.as_str()));
+            if new_input.is_some() || new_title.is_some() {
+                if let Some(i) = &new_input {
+                    open.input = i.clone();
+                }
+                if let Some(t) = &new_title {
+                    open.title = Some(t.clone());
+                }
+                out.push(AgentEvent::ToolCallUpdated {
+                    call_id: call_id.clone(),
+                    title: new_title,
+                    kind: None,
+                    input: new_input,
+                    output_delta: None,
+                    output: None,
+                });
+            }
         }
 
         if let Some(id) = rpc_id {
@@ -1482,8 +1606,12 @@ impl AcpNormalizer {
                 .last_error_reason
                 .clone()
                 .or_else(|| (!self.stderr_lines.is_empty()).then(|| self.stderr_lines.join("\n")))
-                .unwrap_or_else(|| {
-                    format!("ACP process exited before session started (code: {code:?})")
+                .unwrap_or_else(|| match &self.deferred_start {
+                    Some(d) => format!(
+                        "ACP process exited before confirming model {} (code: {code:?})",
+                        d.requested_model
+                    ),
+                    None => format!("ACP process exited before session started (code: {code:?})"),
                 });
             if !self.fatal_error_emitted {
                 self.fatal_error_emitted = true;
@@ -1680,6 +1808,36 @@ pub(crate) fn map_tool_kind(
         AcpToolKind::Think => ToolKind::Think,
         AcpToolKind::Fetch => ToolKind::Fetch,
         AcpToolKind::SwitchMode | AcpToolKind::Other | _ => ToolKind::Other,
+    }
+}
+
+/// OpenCode puts the tool's name in a top-level `name` field of `tool_call`,
+/// `tool_call_update` and the `toolCall` of `session/request_permission`
+/// (live, v2.1.3), which the ACP schema does not have. Move it to
+/// `_meta.toolName`, where [`extract_tool_name`] looks, so the gate and the
+/// events see `shell` rather than a name guessed from the kind.
+pub(crate) fn hoist_tool_name(params: &mut Value) {
+    let target = if params.get("update").is_some() {
+        params.get_mut("update")
+    } else {
+        params.get_mut("toolCall")
+    };
+    let Some(Value::Object(obj)) = target else {
+        return;
+    };
+    let Some(name) = obj
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let meta = obj
+        .entry("_meta")
+        .or_insert_with(|| Value::Object(Default::default()));
+    if let Value::Object(meta) = meta {
+        meta.entry("toolName").or_insert(Value::String(name));
     }
 }
 

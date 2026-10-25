@@ -1,6 +1,38 @@
 # Handoff: M0-04-acp-adapter
 
-Model: argon · Status: done
+Model: argon (round 1 fixes: Sonnet 5.5) · Status: done, fix round 1 applied; live re-recording pending
+
+## Fix round 1 (Sonnet)
+
+Input: the orchestrator's first live recording (`.orchestration/evidence/M0-04-live-1`, not committed) and two pointers (MonoCode's OpenCode HTTP integration, MIT; the ACP docs). Details and the matrix are in `docs/spikes/M0-04-acp-adapter.md`.
+
+**Security finding (escalation case, reported)**: with its default permissions OpenCode bypasses the gate: it read `secret.txt` and ran `cat secret.txt` natively (canary in the stream), never called `fs/*` or `terminal/*` although advertised, and never sent `session/request_permission`.
+
+What changed:
+1. **Gating**: `AcpAdapter::new()` spawns `opencode acp` with a per-session generated config (`OPENCODE_CONFIG_CONTENT` inline, plus an `OPENCODE_CONFIG` file removed at session end) holding the rule `* * ask` (covers reads), the same on the `explore`/`general` subagents, and the model. OpenCode's ACP `session/new` has no permission parameter, so per-process environment is the only per-session lever; user config files are untouched. `session/request_permission` goes to the gate; Allow = `once`, Deny = `reject`, an agent-side `allow_always` is never chosen. `interception()` stays `ProviderGated`: the `ask` path is documented and visible in the 2.1.3 binary but **unproven live**, and MCP/subagent internals are unprobed. Per-class matrix with caveats in the report.
+2. **Model**: `SessionConfig::model` is now selected over ACP (`session/set_config_option`, or `session/set_model`), verified, and `SessionStarted` waits for it. `effort` is applied through OpenCode's `effort` config option; `ReadOnly` selects the `plan` mode. Pinned by `model_*` tests (golden and mock-agent).
+3. **Startup**: `STARTUP_TIMEOUT` covers `initialize`, session creation and model selection (`startup_timeout_test`); a bad model gives the pre-session lifecycle. The 27-minute hang was the recorder (no prompt, no limit): it now has a per-scenario timeout (`ATRIUM_ACP_SCENARIO_TIMEOUT_SECS`, default 240).
+4. **Sanitizer**: `FixtureSanitizer` (`src/sanitize.rs`) maps the scratch dir and macOS temp roots; `is_clean` fails on a surviving temp path; tested, and checked over every committed fixture.
+5. **Recorder self-check**: for `gate-deny*`, exit code 3 and `GATE BYPASSED: record as ungated in the matrix` if the canary shows in the raw stream, a denied-class call completed, or calls completed without the gate. Fixtures are still written as evidence. The recorder also makes its own scratch dir, really resumes in `resume`, interrupts a running command in `interrupt`, and adds `model-select`, `tool-search` and `tool-fetch` probes. New `examples/replay.rs`.
+6. Normalizer: OpenCode's top-level tool `name` is kept (`shell`, not `execute`); the real tool input (sent only with the permission request) becomes a `ToolCallUpdated`.
+7. Fixtures (hand-made, shaped after the live recording): `gate-deny`, `gate-deny-execute`, `tool-read`, `startup-error` rewritten; `model-select` added; the old fs/terminal shapes kept as `gate-deny-fs`, `gate-deny-terminal`, `tool-read-fs`.
+
+M1 recommendation (in the report): keep the generic ACP adapter; plan an OpenCode-specific adapter over `opencode serve` (per-session rules at `POST /session`, model/variant per prompt) unless the re-recording shows ACP gates every class. Not built.
+
+**Live re-record (orchestrator)**, from the worktree root (the recorder creates its own scratch dir; exit 3 = gate bypassed, fixtures still written):
+```bash
+cd /Users/pedro/Documents/atrium-wt/M0-04-acp-adapter
+cargo build -p spike-agent-acp --examples
+for s in simple tool-read gate-deny gate-deny-execute approval-allow approval-deny question interrupt multi-turn resume startup-error model-select tool-search tool-fetch; do
+  cargo run -q -p spike-agent-acp --example record -- $s || echo "!! $s exited $?"
+done
+cargo run -q -p spike-agent-acp --example record -- --no-client-caps gate-deny
+cargo run -q -p spike-agent-acp --example record -- --no-client-caps gate-deny-execute
+cargo test -p spike-agent-acp
+```
+Then fill the last column of the enforcement matrix from each recording's `.md` ("Tool calls ... reached the gate").
+
+Definition of Done after round 1: `cargo fmt --check` clean; `cargo clippy -p spike-agent-acp --all-targets -- -D warnings` clean; `cargo test -p spike-agent-acp`: 20 unit, 9 golden, 9 mock-agent (`live_adapter`) tests pass. `Cargo.lock` has uncommitted changes from the original task (new dependencies); it is not an owned path, left for the orchestrator.
 
 ## Done
 
@@ -70,19 +102,4 @@ test result: ok. 4 passed; 0 failed; 0 ignored
 
 ## Follow-ups
 
-- Orchestrator can record live `opencode acp` fixtures (with and without client `fs`/`terminal` capabilities) using:
-  ```bash
-  cargo run -p spike-agent-acp --example record -- simple
-  cargo run -p spike-agent-acp --example record -- tool-read
-  cargo run -p spike-agent-acp --example record -- gate-deny
-  cargo run -p spike-agent-acp --example record -- gate-deny-execute
-  cargo run -p spike-agent-acp --example record -- approval-allow
-  cargo run -p spike-agent-acp --example record -- approval-deny
-  cargo run -p spike-agent-acp --example record -- question
-  cargo run -p spike-agent-acp --example record -- interrupt
-  cargo run -p spike-agent-acp --example record -- multi-turn
-  cargo run -p spike-agent-acp --example record -- resume
-  cargo run -p spike-agent-acp --example record -- startup-error
-  cargo run -p spike-agent-acp --example record -- --no-client-caps tool-read
-  cargo run -p spike-agent-acp --example record -- --no-client-caps gate-deny
-  ```
+- Orchestrator: re-record live with the commands in "Fix round 1 (Sonnet)" below; the fixtures committed now are hand-made.

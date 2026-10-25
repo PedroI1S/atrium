@@ -2,8 +2,8 @@
   {
     "type": "session_started",
     "provider": "acp",
-    "native_session_id": "ses_gate_deny_01",
-    "model": "anthropic/claude-haiku-4-5",
+    "native_session_id": "ses_hm_gate_deny",
+    "model": "opencode/deepseek-v4.1-flash-free",
     "tools": []
   },
   {
@@ -12,44 +12,64 @@
   },
   {
     "type": "tool_call_started",
-    "call_id": "call_read_secret_1",
+    "call_id": "call_1",
     "name": "read",
     "kind": "read",
-    "title": "Read secret.txt",
+    "title": "read",
+    "input": {}
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_1",
+    "title": null,
+    "kind": null,
     "input": {
-      "path": "~/scratch/gate-deny/secret.txt"
-    }
+      "path": "/scratch/secret.txt"
+    },
+    "output_delta": null,
+    "output": null
   },
   {
     "type": "tool_call_finished",
-    "call_id": "call_read_secret_1",
+    "call_id": "call_1",
     "status": "denied",
     "output": null,
-    "error": "blocked by Atrium policy: secret.txt is restricted"
+    "error": "denied by Atrium policy: secret.txt is restricted"
   },
   {
     "type": "message_delta",
     "message_id": "msg-1",
     "kind": "assistant",
-    "text": "I cannot read secret.txt because access was denied by policy."
+    "text": "I could not read secret.txt: access was denied."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8300,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
   },
   {
     "type": "message_completed",
     "message_id": "msg-1",
     "kind": "assistant",
-    "text": "I cannot read secret.txt because access was denied by policy."
+    "text": "I could not read secret.txt: access was denied."
   },
   {
     "type": "turn_completed",
     "turn": 1,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 78,
-      "output_tokens": 26,
+      "input_tokens": 3900,
+      "output_tokens": 110,
       "cache_read_tokens": null,
       "cache_write_tokens": null,
       "reasoning_tokens": null,
-      "cost_usd": null
+      "cost_usd": 0.0
     }
   },
   {

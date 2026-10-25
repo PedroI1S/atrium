@@ -1,9 +1,8 @@
 # Fixture: `startup-error`
 
-- **Source**: `hand-made` (constructed against `agent-client-protocol = 3.5.0` / ACP v1 schema; worker sandbox policy blocks executing `opencode`)
+- **Source**: `hand-made` (shaped after the live OpenCode v2.1.3 recording M0-04-live-1: `configOptions`, top-level tool `name`, permission options `once`/`always`/`reject`; the orchestrator replaces it with a live recording)
 - **Provider**: ACP (`opencode acp`, v2.1.3)
-- **Command**: `opencode acp`
-- **Model**: `invalid-provider/nonexistent-model`
-- **Client capabilities**: `fs.readTextFile = true`, `fs.writeTextFile = true`, `terminal = true`, `elicitation.form = {}`
-- **Prompt**: *(none — fails during session creation)*
-- **Covers**: Pre-session failure lifecycle (`Error { fatal: true }` followed by `SessionEnded { exit_code: Some(1), .. }`, with **no** `SessionStarted` event).
+- **Client capabilities**: `fs`, `terminal`, `elicitation.form` advertised (OpenCode ignores fs/terminal)
+- **Injected config**: `permissions: [{* * ask}]` (see `spikes/agent-acp/src/opencode_config.rs`)
+- **Prompt**: *(none: fails during session creation)*
+- **Covers**: A model the agent rejects (`session/set_config_option` returns an error): pre-session failure lifecycle, `Error {fatal: true}` then `SessionEnded`, **no** `SessionStarted`. The exact OpenCode error text is not known yet; the live recording replaces this.
