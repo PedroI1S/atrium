@@ -1,0 +1,12 @@
+[
+  {
+    "type": "error",
+    "message": "{\"code\":-32600,\"message\":\"invalid model id\"}",
+    "fatal": true
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 1,
+    "reason": null
+  }
+]

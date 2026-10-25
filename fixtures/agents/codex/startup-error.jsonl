@@ -1,0 +1,6 @@
+{"ms":0,"dir":"stdin","line":"{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"atrium_m0\",\"version\":\"0.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}"}
+{"ms":1,"dir":"stdout","line":"{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\",\"codexHome\":\"/scratch/.codex\",\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}}"}
+{"ms":2,"dir":"stdin","line":"{\"method\":\"initialized\"}"}
+{"ms":3,"dir":"stdin","line":"{\"id\":2,\"method\":\"thread/start\",\"params\":{\"threadId\":null,\"model\":\"invalid-fixture-model\",\"cwd\":\"/scratch\",\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":\"read-only\"}}"}
+{"ms":4,"dir":"stdout","line":"{\"id\":2,\"error\":{\"code\":-32600,\"message\":\"invalid model id\"}}"}
+{"ms":5,"dir":"exit","code":1}

@@ -1,0 +1,88 @@
+[
+  {
+    "type": "session_started",
+    "provider": "codex",
+    "native_session_id": "thread-fixture",
+    "model": "fixture-model",
+    "tools": []
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "call-1",
+    "name": "commandExecution",
+    "kind": "read",
+    "title": "cat secret.txt",
+    "input": {
+      "id": "call-1",
+      "type": "commandExecution",
+      "command": "cat secret.txt",
+      "cwd": "/scratch",
+      "status": "inProgress",
+      "commandActions": [
+        {
+          "type": "read",
+          "command": "cat secret.txt",
+          "name": "cat",
+          "path": "secret.txt"
+        }
+      ]
+    }
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call-1",
+    "title": null,
+    "kind": "read",
+    "input": {
+      "id": "call-1",
+      "type": "commandExecution",
+      "command": "cat secret.txt",
+      "cwd": "/scratch",
+      "status": "declined",
+      "commandActions": [
+        {
+          "type": "read",
+          "command": "cat secret.txt",
+          "name": "cat",
+          "path": "secret.txt"
+        }
+      ]
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "call-1",
+    "status": "denied",
+    "output": null,
+    "error": null
+  },
+  {
+    "type": "message_delta",
+    "message_id": "message-1",
+    "kind": "assistant",
+    "text": "Denied."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "message-1",
+    "kind": "assistant",
+    "text": "Denied."
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": null
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

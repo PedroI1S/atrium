@@ -1,0 +1,65 @@
+[
+  {
+    "type": "session_started",
+    "provider": "codex",
+    "native_session_id": "thread-fixture",
+    "model": "fixture-model",
+    "tools": []
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "question_asked",
+    "request_id": "question-1",
+    "questions": [
+      {
+        "id": "color",
+        "prompt": "Choose a color",
+        "options": [
+          {
+            "id": "0",
+            "label": "Red",
+            "description": "Warm"
+          },
+          {
+            "id": "1",
+            "label": "Blue",
+            "description": "Cool"
+          }
+        ],
+        "multi_select": false,
+        "allow_text": true
+      }
+    ]
+  },
+  {
+    "type": "request_resolved",
+    "request_id": "question-1",
+    "outcome": "answered"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "message-1",
+    "kind": "assistant",
+    "text": "Blue."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "message-1",
+    "kind": "assistant",
+    "text": "Blue."
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": null
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

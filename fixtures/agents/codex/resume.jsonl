@@ -1,0 +1,15 @@
+{"ms":0,"dir":"stdin","line":"{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"atrium_m0\",\"version\":\"0.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}"}
+{"ms":1,"dir":"stdout","line":"{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\",\"codexHome\":\"/scratch/.codex\",\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}}"}
+{"ms":2,"dir":"stdin","line":"{\"method\":\"initialized\"}"}
+{"ms":3,"dir":"stdin","line":"{\"id\":2,\"method\":\"thread/resume\",\"params\":{\"threadId\":\"thread-fixture\",\"model\":\"fixture-model\",\"cwd\":\"/scratch\",\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":\"read-only\"}}"}
+{"ms":4,"dir":"stdout","line":"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-fixture\",\"projectId\":null,\"sessionId\":\"session-fixture\",\"preview\":\"\",\"ephemeral\":false,\"modelProvider\":\"openai\",\"createdAt\":0,\"updatedAt\":0,\"status\":{\"type\":\"idle\"},\"path\":null,\"cwd\":\"/scratch\",\"cliVersion\":\"0.163.0\",\"source\":\"appServer\",\"gitInfo\":null,\"name\":null,\"turns\":[]},\"model\":\"fixture-model\",\"modelProvider\":\"openai\",\"cwd\":\"/scratch\",\"approvalPolicy\":\"untrusted\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"readOnly\"},\"reasoningEffort\":null}}"}
+{"ms":5,"dir":"command","command":{"type":"send_user_message","text":"Reply with exactly hello."}}
+{"ms":6,"dir":"stdin","line":"{\"id\":3,\"method\":\"turn/start\",\"params\":{\"threadId\":\"thread-fixture\",\"input\":[{\"type\":\"text\",\"text\":\"Reply with exactly hello.\"}]}}"}
+{"ms":7,"dir":"stdout","line":"{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\",\"items\":[],\"status\":\"inProgress\",\"error\":null}}}"}
+{"ms":8,"dir":"stdout","line":"{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-fixture\",\"turn\":{\"id\":\"turn-1\",\"items\":[],\"status\":\"inProgress\",\"error\":null}}}"}
+{"ms":9,"dir":"stdout","line":"{\"method\":\"item/started\",\"params\":{\"threadId\":\"thread-fixture\",\"turnId\":\"turn-1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"message-1\",\"text\":\"\"},\"startedAtMs\":0}}"}
+{"ms":10,"dir":"stdout","line":"{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-fixture\",\"turnId\":\"turn-1\",\"itemId\":\"message-1\",\"delta\":\"hello\"}}"}
+{"ms":11,"dir":"stdout","line":"{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thread-fixture\",\"turnId\":\"turn-1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"message-1\",\"text\":\"hello\"},\"completedAtMs\":1}}"}
+{"ms":12,"dir":"stdout","line":"{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-fixture\",\"turn\":{\"id\":\"turn-1\",\"items\":[],\"status\":\"completed\",\"error\":null}}}"}
+{"ms":13,"dir":"command","command":{"type":"shutdown"}}
+{"ms":14,"dir":"exit","code":0}
