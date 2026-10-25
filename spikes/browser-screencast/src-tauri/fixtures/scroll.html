@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>scroll</title>
+<style>
+  body { margin: 0; font: 15px/1.5 -apple-system, system-ui, sans-serif; }
+  section { height: 300px; display: flex; align-items: center; justify-content: center; font-size: 28px; }
+  section:nth-child(odd) { background: #e8f0fe; } section:nth-child(even) { background: #fef7e0; }
+</style>
+<script>
+  for (let i = 1; i <= 40; i++) document.write(`<section>Section ${i}</section>`);
+  window.__scroll = () => scrollY;
+</script>

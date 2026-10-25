@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>form</title>
+<style>
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 24px; background: #fff; color: #111; }
+  input, textarea { font: inherit; padding: 8px; width: 420px; display: block; margin: 8px 0 16px; }
+  pre { background: #f2f2f2; padding: 8px; max-height: 260px; overflow: auto; font-size: 12px; }
+</style>
+<label>Single line<input id="text" autofocus></label>
+<label>Multi line<textarea id="area" rows="3"></textarea></label>
+<pre id="log"></pre>
+<script>
+  window.__log = [];
+  const log = (s) => { window.__log.push(s); document.getElementById('log').textContent = window.__log.slice(-14).join('\n'); };
+  for (const id of ['text', 'area']) {
+    const el = document.getElementById(id);
+    for (const t of ['compositionstart', 'compositionupdate', 'compositionend'])
+      el.addEventListener(t, (e) => log(`${t} ${JSON.stringify(e.data)}`));
+    el.addEventListener('keydown', (e) => log(`keydown key=${e.key} code=${e.code} meta=${+e.metaKey} shift=${+e.shiftKey}`));
+    el.addEventListener('input', (e) => log(`input ${e.inputType} value=${JSON.stringify(el.value)}`));
+  }
+  window.__state = () => ({ text: document.getElementById('text').value, area: document.getElementById('area').value, log: window.__log });
+</script>

@@ -1,0 +1,49 @@
+[package]
+name = "atrium-browser-screencast"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "UNLICENSED"
+publish = false
+description = "Atrium M0-08 spike: CDP screencast into a Tauri canvas, with input"
+
+# Standalone project: not a member of the repository's root workspace.
+[workspace]
+
+[lib]
+name = "atrium_browser_screencast_lib"
+crate-type = ["rlib"]
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "net", "io-util", "fs"] }
+base64 = "0.22"
+libc = "0.2"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+jpeg-decoder = "0.3"
+# Only for the `screencast-oxide-probe` example (verdict on chromiumoxide).
+chromiumoxide = "0.9"
+futures = "0.3"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[[example]]
+name = "screencast-bench"
+path = "examples/screencast-bench.rs"
+
+[[example]]
+name = "screencast-oxide-probe"
+path = "examples/screencast-oxide-probe.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+strip = true

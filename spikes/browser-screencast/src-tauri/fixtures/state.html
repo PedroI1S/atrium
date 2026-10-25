@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>state</title>
+<style> body { font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 24px; } pre { background: #f2f2f2; padding: 12px; } </style>
+<h3>Storage seen by this page</h3>
+<pre id="out"></pre>
+<script>
+  // /state.html?set=A writes the marker, then every load shows what is visible.
+  const set = new URLSearchParams(location.search).get('set');
+  if (set) {
+    document.cookie = 'who=' + set + '; path=/';
+    localStorage.setItem('who', set);
+    sessionStorage.setItem('who', set);
+  }
+  window.__read = () => ({
+    cookie: document.cookie,
+    local: localStorage.getItem('who'),
+    session: sessionStorage.getItem('who'),
+  });
+  document.getElementById('out').textContent = JSON.stringify(window.__read(), null, 2);
+</script>

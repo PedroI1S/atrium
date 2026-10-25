@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>click probe</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; font: 15px/1.5 -apple-system, system-ui, sans-serif; }
+  #probe { position: fixed; left: 20px; top: 20px; width: 160px; height: 160px; background: #ffffff; }
+  p { position: fixed; left: 200px; top: 24px; margin: 0; color: #333; }
+</style>
+<div id="probe"></div>
+<p>Each mousedown steps the probe square (20,20)-(180,180) through red, blue, green and white.<br>
+Clicks: <b id="n">0</b></p>
+<script>
+  // Saturated primaries survive JPEG compression, so the pixel colour is a reliable probe.
+  const colours = ['#ffffff', '#ff0000', '#0000ff', '#00ff00'];
+  let n = 0;
+  window.__clicks = 0;
+  addEventListener('mousedown', () => {
+    n = (n + 1) % colours.length;
+    window.__clicks++;
+    document.getElementById('probe').style.background = colours[n];
+    document.getElementById('n').textContent = window.__clicks;
+  });
+</script>
