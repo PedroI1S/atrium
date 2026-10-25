@@ -97,3 +97,10 @@ This amends D-002's assumption. `scripts/agent-run` now parses the generated `ho
 
 ## D-020 — 2026-10-25 — Go for M0 wave 2
 **Pedro gave the go** for wave 2: M0-07 (stream perf, on the merged M0-05 `ClientHandle`) and M0-08 (browser screencast), both Sonnet 5.5, reviewed by Sol (cross-provider, D-015). Wave 3 (M0-09) still needs its own go.
+
+## D-021 — 2026-10-25 — Everything paused: Tauri vs GPUI under consideration
+**Decided by Pedro.** All work is paused while Pedro considers switching the UI from Tauri 2 + SolidJS to GPUI (Rust-native, the framework Zed uses).
+- **M0-07** (stream perf) and **M0-08** (browser screencast, in fix round 1 after an approve-with-changes review) were stopped mid-task. Their work is committed as WIP on their branches.
+- **Unaffected by the choice**: the contracts, the four agent adapters, the daemon/client and most of the CDP client (all UI-agnostic Rust, ~32k lines).
+- **Affected**: the M0-06 shell code (the token design survives), M0-07's IPC question, M0-08's frontend, and the PLAN's web-library assumptions (CodeMirror, xterm.js, Shiki, elkjs, Kobalte/Corvu, CSS theming).
+- **The orchestrator's recommendation** if GPUI stays on the table: a GPUI shell spike mirroring M0-06's checks (tokens, panes, 5k-message transcript, TTI and memory, plus screencast frames as images) before deciding. MonoCode's own Tauri→GPUI migration (`mc/migrate-monocode-to-gpui`) is prior art.
