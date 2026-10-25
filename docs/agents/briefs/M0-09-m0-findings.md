@@ -17,12 +17,18 @@ Branch: `agent/flash/M0-09-m0-findings` · Worktree: `../atrium-wt/M0-09-m0-find
 - `docs/agents/handoffs/M0-09-m0-findings.md`
 
 ## Contract to implement (do not modify)
-- `consistency.rs` loads every scenario's `.events.json` across providers and checks the invariants in the `atrium_protocol::agent` docs:
-  - `SessionStarted` comes first and `SessionEnded` last;
-  - every `ToolCallStarted` has exactly one `ToolCallFinished`;
+- `consistency.rs` loads every scenario's `.events.json` across providers and checks the lifecycles and mapping rules in the `atrium_protocol::agent` module docs. First it classifies the run:
+  - **established session** (contains `SessionStarted`): `SessionStarted` first, `SessionEnded` last;
+  - **pre-session failure** (no `SessionStarted`): only `Error { fatal: true }` then `SessionEnded`.
+
+  Then, for established sessions:
+  - every `ToolCallStarted` has exactly one `ToolCallFinished`, and no `ToolCallUpdated` comes after it;
   - deltas are followed by one `MessageCompleted` whose text equals their concatenation;
-  - every `ApprovalRequested` in `approval-*` scenarios is followed by a `ToolCallFinished` with the right status;
-  - `TurnStarted`/`TurnCompleted` pair up and `turn` increases.
+  - every `ApprovalRequested` / `QuestionAsked` has exactly one `RequestResolved`, and none is left open at `SessionEnded`;
+  - in `approval-deny` and `gate-deny`, the gated call ends `denied`; in `gate-deny`, no event contains the secret file's contents;
+  - in `interrupt`, the turn ends `interrupted` and open calls end `cancelled`;
+  - `TurnStarted`/`TurnCompleted` pair up and `turn` increases; no `Usage` comes after its turn's `TurnCompleted`;
+  - the closing order on exit matches the module docs.
 
   It reads the golden files only, so it needs no dependency on the spike crates.
 - `M0-findings.md`: one table of measurements vs PLAN §4 budgets (pass/fail/not measured), per-spike recommendation, a list of every `Unmapped` record type per provider, security findings, and open questions for the driver. Quote numbers; don't re-derive them.

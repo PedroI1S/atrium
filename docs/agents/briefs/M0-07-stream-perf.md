@@ -17,7 +17,7 @@ Show that the full path, daemon → unix socket → Rust client inside Tauri →
 - `docs/agents/handoffs/M0-07-stream-perf.md`
 
 ## Contract to implement (do not modify)
-- The Tauri backend subscribes to N fake threads via the M0-05 client and forwards events to the webview over `tauri::ipc::Channel`. Compare at least two encodings, JSON vs a compact binary (e.g. MessagePack or a custom one), and pick one with numbers.
+- The Tauri backend subscribes to N fake threads via the M0-05 client and forwards events to the webview over `tauri::ipc::Channel`. The webview reports which events it has rendered, and only then does the backend call `client.applied(...)` (the cursor rule in `wire.rs`). Compare at least two encodings, JSON vs a compact binary (e.g. MessagePack or a custom one), and pick one with numbers.
 - The webview transcript: deltas coalesced once per animation frame, incremental markdown (only the open block re-parses), `@tanstack/solid-virtual` for long transcripts, tool-call rows from `ToolCall*` events.
 - A composer you can type in while streaming, to measure input latency.
 

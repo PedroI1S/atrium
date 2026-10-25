@@ -34,7 +34,7 @@ Prove the browser pane in PLAN §3.13: drive an installed Chromium over CDP, sho
 - [ ] Handoff written.
 
 ## Out of scope
-The browser MCP tools, a11y snapshots, the daemon (the backend owns Chromium in-process for this spike), Linux runs.
+The browser MCP tools, a11y snapshots, the daemon (the backend owns Chromium in-process for this spike), Linux runs. List in the report exactly what a Linux run must check (fps and latency on WebKitGTK); the deferral itself is a driver decision.
 
 ## Escalate if
 - No Chromium flag combination gives ≥ 20 fps. Report the numbers and stop.

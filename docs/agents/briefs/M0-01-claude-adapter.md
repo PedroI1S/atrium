@@ -22,23 +22,25 @@ A Rust `AgentAdapter` for Claude Code that runs it headless and maps everything 
 - Mapping as documented in `atrium_protocol::agent`, including:
   - partial messages → `MessageDelta`; thinking → `MessageKind::Reasoning`;
   - tool_use / tool_result → the `ToolCall*` triple; tool name → `ToolKind`;
-  - `can_use_tool` control requests → `ApprovalRequested`, answered from `ResolveApproval` (deny message passed through);
-  - `AskUserQuestion` → `QuestionAsked`; `TodoWrite` → `PlanUpdated`;
-  - `result` → `Usage` + `TurnCompleted`; rate-limit records → `RateLimited`;
+  - `AskUserQuestion` → `QuestionAsked` with structured options; `TodoWrite` → `PlanUpdated`;
+  - `result` → `Usage` + `TurnCompleted`; quota/usage-window records → `QuotaUpdated`; an actual refusal → `RateLimited`;
   - `SessionCommand::Interrupt` → the control-protocol interrupt.
-- `PermissionPolicy`: `Ask` → every gated tool goes to Atrium. `ReadOnly` → Read/Grep/Glob auto-allowed, everything else goes to Atrium. `FullAccess` → bypass permissions.
+- **Policy enforcement (`docs/contracts/m0.md` §3.1)**: every tool call, including Read/Grep/Glob and MCP tools, goes through `SessionConfig::gate` before it runs. Candidates: a per-session `PreToolUse` hook (generated settings passed with `--settings`, never the user's own settings) bridged back to the adapter, and/or `can_use_tool` / `--permission-prompts host` with nothing pre-allowed. Find the combination that reaches `AllToolCalls`, and show it with the `gate-deny` fixture. `Ask` → `ApprovalRequested`, then `RequestResolved`.
+- `PermissionPolicy`: `Ask` and `ReadOnly` → Claude's normal permission mode, with everything routed to the gate. `FullAccess` → `--permission-mode bypassPermissions` (the user's choice, allowed on the host, D-011); calls still pass the gate where it can see them.
 - Per-session MCP: `SessionConfig::mcp_servers` → a generated `--mcp-config` file + `--strict-mcp-config`. Never touch the user's global config.
+- Live inputs go through `AdapterInput` and the same `Normalizer` as replays.
 
 ## Definition of Done
-- [ ] All fixture scenarios from `docs/contracts/m0.md` §3, recorded live with the cheapest model (`--model haiku`) in a scratch dir inside your worktree, sanitized, each with a golden test.
-- [ ] `cargo run -p spike-agent-claude --example record -- <scenario>` re-records a scenario; `--example chat` runs an interactive session, printing events as JSONL and reading approvals from stdin.
+- [ ] All fixture scenarios from `docs/contracts/m0.md` §3.3, recorded live with the cheapest model (`--model haiku`) in a scratch dir inside your worktree, sanitized, each with a golden test.
+- [ ] The saturation test (§3.2).
+- [ ] `cargo run -p spike-agent-claude --example record -- <scenario>` re-records a scenario; `--example chat` runs an interactive session, printing events as JSONL and reading gate decisions and approvals from stdin.
 - [ ] `cargo fmt --check` · `cargo clippy -p spike-agent-claude --all-targets -- -D warnings` · `cargo test -p spike-agent-claude`
-- [ ] Spike report `docs/spikes/M0-01-claude-adapter.md`: time from spawn to `SessionStarted`; which records stayed `Unmapped`; how stable the control protocol looks; whether the `claude-code-acp` fallback is needed.
+- [ ] Spike report `docs/spikes/M0-01-claude-adapter.md`: the enforcement matrix; time from spawn to `SessionStarted`; which records stayed `Unmapped`; how stable the control protocol looks; whether the `claude-code-acp` fallback is needed.
 - [ ] Handoff written.
 
 ## Out of scope
 The daemon, storage, UI, the policy engine itself (just surface approvals), other providers.
 
 ## Escalate if
-- `can_use_tool` (or `--permission-prompts host`) can't gate a tool class, e.g. Bash runs without asking under `Ask`. Stop and report; that's a security finding.
+- No combination lets the gate see a tool class before it runs (e.g. Read or Bash slips through). Stop and report; that's a security finding.
 - You need a contract change → `docs/agents/change-requests.md` and stop.

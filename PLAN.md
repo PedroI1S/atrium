@@ -16,6 +16,7 @@ A fast, lightweight agent development environment written in Rust. It wraps the 
 4. **Cheap, safe parallelism.** Starting a task is instant. Every task gets isolated files, ports and dependencies. Conflicts show up early, not at merge time.
 5. **Durability.** Agents keep running when you close the window, sleep the laptop or walk away.
 6. **Parallel independent tasks before agent swarms.** Agents coordinate through explicit handoffs, notes and reviews, not open-ended conversations with each other.
+7. **The user decides.** Atrium ships safe defaults and makes risks visible, but it doesn't forbid a choice the user makes explicitly (e.g. full access on the host). Heavy or privacy-sensitive features stay opt-in (D-011).
 
 ## 1. Decisions so far
 

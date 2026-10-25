@@ -36,8 +36,8 @@ A clickable Tauri 2 + SolidJS mock of Atrium's window, with dummy data, that pro
 - [ ] `pnpm install && pnpm typecheck && pnpm test` (at least the theme loader: reference resolution, a missing token, a cycle, contrast failure) and `cargo clippy --manifest-path spikes/ui-shell/src-tauri/Cargo.toml -- -D warnings`, all passing.
 - [ ] `pnpm tauri build --debug` produces an app that launches.
 - [ ] Screenshots of every direction (dark + light) and of the palette and split panes in `docs/spikes/M0-06-ui-shell/`. Use `screencapture`; if it's blocked by permissions, say so and list the exact shots for the orchestrator to take.
-- [ ] Measured on macOS, with method and numbers in the report: cold start to first paint, app idle RSS (Tauri process + WebKit helpers), frame times while resizing panes and scrolling a long dummy transcript (sampled with `requestAnimationFrame` and logged).
-- [ ] Spike report `docs/spikes/M0-06-ui-shell.md` with a recommendation per direction. Linux/WebKitGTK is **not** measured here (no Linux machine yet): list what a Linux run must check.
+- [ ] Measured on macOS, with method and numbers in the report (`docs/contracts/m0.md` §5): cold start as **time to interactive** (budget < 400 ms) and first paint separately, app idle RSS (Tauri process + WebKit helpers; budget < 150 MB), frame times while resizing panes and scrolling a 5,000-message dummy transcript (sampled with `requestAnimationFrame` and logged).
+- [ ] Spike report `docs/spikes/M0-06-ui-shell.md` with a recommendation per direction. Linux/WebKitGTK is **not** measured here: list exactly what a Linux run must check (blur fallback, 120 Hz smoothness, idle memory).
 - [ ] Handoff written.
 
 ## Out of scope
