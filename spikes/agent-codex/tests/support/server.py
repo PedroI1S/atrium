@@ -36,6 +36,8 @@ def flood():
 
 audit({'processArgs': sys.argv[1:]})
 
+if mode == 'startup-hang':
+    time.sleep(120)
 if mode == 'startup-fail':
     print('simulated startup failure', file=sys.stderr, flush=True)
     sys.exit(1)
@@ -48,13 +50,26 @@ for line in sys.stdin:
         emit({'id': rid, 'result': {'userAgent': 'fake/0.163.0'}})
     elif method in ('thread/start', 'thread/resume'):
         emit({'id': rid, 'result': {'thread': {'id': 'fake-thread'}, 'model': 'fake-model'}})
+        if mode == 'write-pressure':
+            # Fill stdout before reading a large turn/start from stdin.
+            time.sleep(0.05)
+            for _ in range(100):
+                notify('future/pressure', {'text':'x'*8192})
     elif method == 'turn/start':
         emit({'id': rid, 'result': {'turn': {'id': 'fake-turn', 'status': 'inProgress'}}})
         if mode == 'delayed-turn':
             time.sleep(0.1)
         turn('inProgress')
-        if mode in ('flood', 'ignore-eof'):
+        if mode in ('flood', 'ignore-eof', 'flood-ask', 'flood-exit'):
+            if mode == 'flood-ask':
+                notify('item/started', {'item': item('inProgress')})
+                emit({'id': 77, 'method': 'item/commandExecution/requestApproval', 'params': {'itemId':'fake-call','command':'python3','reason':'needs permission'}})
+                time.sleep(0.05)
             threading.Thread(target=flood, daemon=True).start()
+            if mode == 'flood-exit':
+                threading.Timer(0.5, lambda: os._exit(7)).start()
+        elif mode == 'mcp':
+            emit({'id':77,'method':'mcpServer/elicitation/request','params':{'serverName':'fixture-mcp','threadId':'fake-thread','mode':'url','elicitationId':'fixture-elicitation','url':'https://example.invalid/approve','message':'Approve MCP action'}})
         elif mode in ('gate', 'stall-gate', 'delayed-turn'):
             notify('item/started', {'item': item('inProgress')})
             emit({'id': 77, 'method': 'item/commandExecution/requestApproval', 'params': {
@@ -64,7 +79,7 @@ for line in sys.stdin:
             notify('item/completed', {'item': {'id': 'fake-message', 'type': 'agentMessage', 'text': 'hello'}})
             turn('completed')
     elif method == 'turn/interrupt':
-        if mode in ('flood', 'ignore-eof'):
+        if mode in ('flood', 'ignore-eof', 'flood-ask', 'flood-exit'):
             # Audit proves Interrupt was consumed even while stdout is blocked.
             continue
         emit({'id': rid, 'result': {}})
@@ -72,7 +87,8 @@ for line in sys.stdin:
         turn('interrupted')
     elif rid == 77 and 'result' in value:
         notify('serverRequest/resolved', {'threadId': 'fake-thread', 'requestId': 77})
-        notify('item/completed', {'item': item('completed' if value['result']['decision'] == 'accept' else 'declined')})
+        if mode != 'mcp':
+            notify('item/completed', {'item': item('completed' if value['result'].get('decision') == 'accept' else 'declined')})
         turn('completed')
 if mode == 'ignore-eof':
     while True:

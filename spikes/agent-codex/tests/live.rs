@@ -297,11 +297,11 @@ async fn interrupt_cancels_stalled_gate_without_leaving_task() {
 }
 #[tokio::test]
 async fn saturation_interrupt_shutdown_and_forced_kill() {
-    for mode in ["flood", "ignore-eof"] {
+    for mode in ["flood", "ignore-eof", "flood-ask"] {
         let h = Harness::new();
         let mut session = CodexAdapter::default()
             .start(
-                h.config(mode, Arc::new(Gate(GateDecision::Allow))),
+                h.config(mode, Arc::new(Gate(GateDecision::Ask))),
                 Transport::Local,
             )
             .await
@@ -316,7 +316,7 @@ async fn saturation_interrupt_shutdown_and_forced_kill() {
         // Never read events before the owner has terminated. Wait until both
         // output has filled the channel up to its reserved lifecycle slots.
         tokio::time::timeout(Duration::from_secs(2), async {
-            while session.events.len() < EVENT_BUFFER - 8 {
+            while session.events.len() < EVENT_BUFFER - 12 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -351,10 +351,29 @@ async fn saturation_interrupt_shutdown_and_forced_kill() {
         assert!(h.reaped());
         // Closed receiver drains to None: no detached event-forwarding task.
         let mut tail = None;
+        let mut cancelled_tool = false;
+        let mut cancelled_request = false;
         while let Some(event) = session.events.recv().await {
+            cancelled_tool |= matches!(
+                event.event,
+                AgentEvent::ToolCallFinished {
+                    status: ToolStatus::Cancelled,
+                    ..
+                }
+            );
+            cancelled_request |= matches!(
+                event.event,
+                AgentEvent::RequestResolved {
+                    outcome: RequestOutcome::Cancelled,
+                    ..
+                }
+            );
             tail = Some(event.event);
         }
         assert!(matches!(tail, Some(AgentEvent::SessionEnded { .. })));
+        if mode == "flood-ask" {
+            assert!(cancelled_tool && cancelled_request);
+        }
     }
 }
 #[tokio::test]
@@ -394,6 +413,10 @@ fn policies_and_mcp_overrides_are_process_local() {
     assert!(
         args.iter()
             .any(|a| a == "mcp_servers.\"quoted.name\".command=\"/tmp/mcp\"")
+    );
+    assert!(
+        args.iter()
+            .any(|a| a == "mcp_servers.\"quoted.name\".default_tools_approval_mode=\"prompt\"")
     );
     assert!(!args.iter().any(|a| a.contains("config.toml")));
     assert_eq!(
@@ -507,6 +530,327 @@ async fn recorder_overrides_reach_child_without_changing_normal_sessions() {
             .find(|v| v.get("processArgs").is_some())
             .unwrap();
         assert_eq!(process["processArgs"], serde_json::json!(expected));
+        assert!(h.reaped());
+    }
+}
+
+#[tokio::test]
+async fn startup_timeout_reaps_child() {
+    let h = Harness::new();
+    let before = Instant::now();
+    let result = CodexAdapter::default()
+        .start(
+            h.config("startup-hang", Arc::new(Gate(GateDecision::Allow))),
+            Transport::Local,
+        )
+        .await;
+    assert!(matches!(result,Err(AdapterError::Handshake(ref e)) if e.contains("timeout")));
+    assert!(
+        before.elapsed() >= STARTUP_TIMEOUT && before.elapsed() < STARTUP_TIMEOUT + SHUTDOWN_GRACE
+    );
+    assert!(h.reaped());
+}
+
+#[tokio::test]
+async fn saturated_child_death_is_detected_without_shutdown() {
+    let h = Harness::new();
+    let mut session = CodexAdapter::default()
+        .start(
+            h.config("flood-exit", Arc::new(Gate(GateDecision::Allow))),
+            Transport::Local,
+        )
+        .await
+        .unwrap();
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage { text: "hi".into() })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !session.commands.is_closed() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(h.reaped());
+    assert!(matches!(
+        collect(&mut session).await.last(),
+        Some(AgentEvent::SessionEnded {
+            exit_code: Some(7),
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn queue_bound_matches_wire_and_normalizer() {
+    let h = Harness::new();
+    let mut session = CodexAdapter::default()
+        .start(
+            h.config("gate", Arc::new(Gate(GateDecision::Ask))),
+            Transport::Local,
+        )
+        .await
+        .unwrap();
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage {
+            text: "first".into(),
+        })
+        .await
+        .unwrap();
+    while let Some(e) = session.events.recv().await {
+        if matches!(e.event, AgentEvent::ApprovalRequested { .. }) {
+            break;
+        }
+    }
+    for i in 0..MAX_QUEUED_MESSAGES + 1 {
+        session
+            .commands
+            .send(SessionCommand::SendUserMessage {
+                text: format!("queued-{i}"),
+            })
+            .await
+            .unwrap();
+    }
+    let mut errors = 0;
+    while let Some(e) = session.events.recv().await {
+        if matches!(e.event, AgentEvent::Error { .. }) {
+            errors += 1;
+            break;
+        }
+    }
+    session
+        .commands
+        .send(SessionCommand::ResolveApproval {
+            request_id: "77".into(),
+            decision: ApprovalDecision::Allow,
+        })
+        .await
+        .unwrap();
+    let mut completed = 0;
+    while let Some(e) = session.events.recv().await {
+        match e.event {
+            AgentEvent::ApprovalRequested { request_id, .. } => session
+                .commands
+                .send(SessionCommand::ResolveApproval {
+                    request_id,
+                    decision: ApprovalDecision::Allow,
+                })
+                .await
+                .unwrap(),
+            AgentEvent::Error { .. } => errors += 1,
+            AgentEvent::TurnCompleted { .. } => {
+                completed += 1;
+                if completed == MAX_QUEUED_MESSAGES + 1 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    session
+        .commands
+        .send(SessionCommand::Shutdown)
+        .await
+        .unwrap();
+    collect(&mut session).await;
+    assert_eq!(errors, 1);
+    let wire = h
+        .audit()
+        .into_iter()
+        .filter(|v| v["method"] == "turn/start")
+        .collect::<Vec<_>>();
+    assert_eq!(wire.len(), MAX_QUEUED_MESSAGES + 1);
+    assert!(
+        !wire
+            .iter()
+            .any(|v| v["params"]["input"][0]["text"] == format!("queued-{MAX_QUEUED_MESSAGES}"))
+    );
+    assert!(h.reaped());
+}
+
+#[tokio::test]
+async fn mcp_elicitation_routes_allow_deny_and_ask() {
+    for decision in [
+        GateDecision::Allow,
+        GateDecision::Deny {
+            reason: "test".into(),
+        },
+        GateDecision::Ask,
+    ] {
+        let h = Harness::new();
+        let mut session = CodexAdapter::default()
+            .start(
+                h.config("mcp", Arc::new(Gate(decision.clone()))),
+                Transport::Local,
+            )
+            .await
+            .unwrap();
+        session
+            .commands
+            .send(SessionCommand::SendUserMessage { text: "hi".into() })
+            .await
+            .unwrap();
+        while let Some(e) = session.events.recv().await {
+            match e.event {
+                AgentEvent::ApprovalRequested {
+                    request_id,
+                    kind,
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(kind, ToolKind::Mcp);
+                    assert_eq!(reason.as_deref(), Some("Approve MCP action"));
+                    session
+                        .commands
+                        .send(SessionCommand::ResolveApproval {
+                            request_id,
+                            decision: ApprovalDecision::Allow,
+                        })
+                        .await
+                        .unwrap();
+                }
+                AgentEvent::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+        session
+            .commands
+            .send(SessionCommand::Shutdown)
+            .await
+            .unwrap();
+        collect(&mut session).await;
+        let expected = if matches!(decision, GateDecision::Deny { .. }) {
+            "decline"
+        } else {
+            "accept"
+        };
+        assert!(
+            h.audit()
+                .iter()
+                .any(|v| v["id"] == 77 && v["result"]["action"] == expected)
+        );
+        assert!(h.reaped());
+    }
+}
+
+#[tokio::test]
+async fn large_stdin_and_stdout_do_not_deadlock() {
+    let h = Harness::new();
+    let mut session = CodexAdapter::default()
+        .start(
+            h.config("write-pressure", Arc::new(Gate(GateDecision::Allow))),
+            Transport::Local,
+        )
+        .await
+        .unwrap();
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage {
+            text: "x".repeat(2_000_000),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(e) = session.events.recv().await {
+            if matches!(e.event, AgentEvent::TurnCompleted { .. }) {
+                return;
+            }
+        }
+        panic!("no completed turn");
+    })
+    .await
+    .unwrap();
+    session
+        .commands
+        .send(SessionCommand::Shutdown)
+        .await
+        .unwrap();
+    collect(&mut session).await;
+    assert!(h.reaped());
+}
+#[tokio::test]
+async fn interrupt_cancels_mcp_elicitation_on_wire() {
+    let h = Harness::new();
+    let mut session = CodexAdapter::default()
+        .start(
+            h.config("mcp", Arc::new(Gate(GateDecision::Ask))),
+            Transport::Local,
+        )
+        .await
+        .unwrap();
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage { text: "hi".into() })
+        .await
+        .unwrap();
+    while let Some(e) = session.events.recv().await {
+        if matches!(e.event, AgentEvent::ApprovalRequested { .. }) {
+            break;
+        }
+    }
+    session
+        .commands
+        .send(SessionCommand::Interrupt)
+        .await
+        .unwrap();
+    while let Some(e) = session.events.recv().await {
+        if let AgentEvent::RequestResolved { outcome, .. } = e.event {
+            assert_eq!(outcome, RequestOutcome::Cancelled);
+            break;
+        }
+    }
+    session
+        .commands
+        .send(SessionCommand::Shutdown)
+        .await
+        .unwrap();
+    collect(&mut session).await;
+    assert!(
+        h.audit()
+            .iter()
+            .any(|v| v["id"] == 77 && v["result"]["action"] == "cancel")
+    );
+    assert!(h.reaped());
+}
+
+#[tokio::test]
+async fn granular_candidate_reaches_wire_but_full_access_remains_never() {
+    let candidate = serde_json::json!({"granular":{"mcp_elicitations":true,"rules":true,"sandbox_approval":true,"request_permissions":true,"skill_approval":true}});
+    for full in [false, true] {
+        let h = Harness::new();
+        let mut config = h.config("simple", Arc::new(Gate(GateDecision::Allow)));
+        if full {
+            config.permissions = PermissionPolicy::FullAccess;
+        }
+        let mut session = CodexAdapter {
+            approval_policy: Some(candidate.clone()),
+            ..Default::default()
+        }
+        .start(config, Transport::Local)
+        .await
+        .unwrap();
+        session
+            .commands
+            .send(SessionCommand::Shutdown)
+            .await
+            .unwrap();
+        collect(&mut session).await;
+        let audit = h.audit();
+        let start = audit
+            .iter()
+            .find(|v| v["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(
+            start["params"]["approvalPolicy"],
+            if full {
+                serde_json::json!("never")
+            } else {
+                candidate.clone()
+            }
+        );
         assert!(h.reaped());
     }
 }

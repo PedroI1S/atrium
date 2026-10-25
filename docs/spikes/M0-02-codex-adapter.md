@@ -1,6 +1,6 @@
 # M0-02: Codex app-server adapter
 
-Status: offline implementation complete; real provider verification blocked by the worker sandbox.
+Status: fix round 2 implemented offline. Orchestrator verified a live simple session; full live enforcement verification remains pending.
 Installed CLI: `codex-cli 0.163.0` (`codex --version`).
 
 ## Implementation
@@ -28,8 +28,9 @@ or a fatal pre-session failure.
 
 Every stdin write, stdout/stderr record, gate decision, client command and exit
 passes through `AdapterInput` and the same normalizer used by replay. A writer
-task acknowledges actual writes; stdout processing waits for outstanding write
-acknowledgements so replay observes requests before their responses. Transport
+task acknowledges writes; stdin submissions are recorded in enqueue order before
+stdout responses. Write failures produce transport diagnostics. Stdout never
+waits on an outstanding stdin write, avoiding circular pipe backpressure. Transport
 diagnostics also pass through the mapper as stderr records.
 
 Recording is opt-in and memory-resident. Before writing, examples sanitize decoded
@@ -52,8 +53,8 @@ approval the provider nevertheless sends still passes the gate.
 **Compatibility finding:** the installed binary's generated `AskForApproval`
 schema includes `untrusted`, the strongest legacy candidate implemented here.
 Current [official sandbox documentation](https://learn.chatgpt.com/docs/sandboxing)
-says the selectable policy is retired. Runtime acceptance and exact enforcement
-could not be tested. There is no automatic downgrade to `on-request`: rejection
+says the selectable policy is retired. The orchestrator verified runtime acceptance in the live simple run. Exact
+enforcement still needs live verification. There is no automatic downgrade to `on-request`: rejection
 fails startup. Resolve this schema/runtime discrepancy before M1.
 
 `interception()` always returns **ProviderGated**. The schema does not establish
@@ -69,7 +70,7 @@ safe commands and writes inside provider-granted roots.
 | Execute | partial | `item/commandExecution/requestApproval` | `gate-deny-execute`, both approval goldens, fake-server panic denial; safe-command bypass not ruled out. |
 | Search | partial | command approval, when issued | action classification; universal interception unproven. |
 | Fetch/web | no | item notifications are observations | web items map to tools; no universal authorization request established. |
-| MCP | no universal hook | tool notifications; unsupported elicitations fail closed | native MCP items map to `ToolKind::Mcp`; elicitation does not establish coverage of all calls. |
+| MCP | partial, verify live | injected servers use `default_tools_approval_mode="prompt"`; `mcpServer/elicitation/request` routes through the gate | Offline allow/deny/Ask/cancel tests pass; elicitations do not establish coverage of all MCP calls. |
 | Subagents | no | collaboration notifications | observed as tools; universal authorization callback unproven. |
 | Extra permissions/dynamic tools/auth refresh | unsupported | server requests return `-32601` | no execution or permission grant is authorized. |
 
@@ -120,7 +121,7 @@ codex app-server generate-json-schema --out spikes/agent-codex/schema
 python3 spikes/agent-codex/tests/support/check_schema.py
 ```
 
-The structural check reports **179 records passed, 0 errors** for the committed
+The structural check reports **180 records passed, 0 errors**, plus six enforcement candidate shape checks for the committed
 corpus. It checks references, required fields, types, enums and alternatives with
 Python's standard library; it is not a full JSON Schema validator. The deliberate
 `future/notification` example is excluded from known-schema checks. Upgrade the
@@ -133,7 +134,10 @@ reset seconds and duration minutes. Normalized windows retain names, percentages
 and reset times converted to milliseconds. Credits, plan metadata and spend-control
 fields remain available in raw transcripts, outside the smaller normalized quota
 type. Window fullness alone never emits RateLimited. An explicit usage-limit
-refusal or HTTP 429 does; other error variants remain errors/raw records pending
+refusal or HTTP 429 does (unless `willRetry=true`). Duplicate terminal errors are
+deduplicated per turn; reset time comes from the last quota update (latest exhausted
+window, otherwise earliest known window). It is an estimate, not proof that the
+refusal concerned that window; other error variants remain errors/raw records pending
 live coverage.
 
 Thread cumulative token counts become per-turn running totals by subtracting the
@@ -151,17 +155,12 @@ Real-world unknown-record frequency is unmeasured.
 
 ## Measurements and live verification
 
-**Time to first real event: unavailable.** The direct app-server probe printed
-`Operation not permitted` and exited before initialization. No real model list,
-thread, inference, denial, resume or quota update was obtained. Codex home was not
-changed and no sandbox workaround was attempted.
-
-```sh
-cargo run -p spike-agent-codex --example record -- simple
-# exit 1: app-server closed before model/list; check sandbox permissions
-cargo run -p spike-agent-codex --example chat
-# exit 1: Handshake("stdout closed before thread creation")
-```
+**Time to first real event: 416 ms**, reported by the orchestrator from
+`cargo run -p spike-agent-codex --example record -- simple` outside the worker
+sandbox, using `gpt-5.6-luna`. Session/turn/message/usage/quota ordering passed.
+That recording was discarded for privacy issues; it is not a committed fixture.
+The original worker attempts to run record/chat failed before handshake. Per the
+user's instruction, no real app-server was launched in either fix round.
 
 The live recorder queries model/list in a separate reaped discovery process.
 The model schema has no prices: mini/nano preference is a heuristic, and the
@@ -285,3 +284,61 @@ Required fmt, clippy and test command results are recorded in the handoff's Fix
 round 1 section. Live record/chat commands are deliberately deferred to the
 orchestrator per the fix-round instruction; the existing hand-made scenarios stay
 in place until safe live recordings replace them.
+
+
+## Fix round 2 — accepted review findings
+
+Base: `49e6b20` (fix round 1, committed by the orchestrator, 34 tests verified).
+All current fixtures remain **hand-made**. Offline routing and shape checks do
+not establish provider enforcement. The original 29-test and round-1 34-test
+counts above describe historical verification, not this revision.
+
+| Finding | Change and evidence |
+| --- | --- |
+| 1 | Injected MCP servers request prompt approval. Elicitations route through gate Allow/Deny/Ask, emit approval reasons, use native action responses, and send cancel on interruption. Fake-server tests exercise all four paths. The investigation matrix below separates schema support from runtime coverage. |
+| 3 | `record` checks the decoded, raw stream before sanitization or fixture writing. It prints PASS/FAIL for target gate denial, matching denied-call completion, sentinel absence and absence of native successful execution. A failure says `read bypassed the gate` (or execute), returns failure and refuses the recording. Native success cannot be hidden by the mapper's Denied status. The sentinel is never passed to the sanitizer. Missing evidence fails; it is not itself proof of execution. |
+| 2 | Whole-stream identifiers plus discovered config MCP/plugin names and hook names/source paths become sanitizer secrets, including for earlier unknown notifications. Stderr becomes a stable placeholder in committed recordings. Synthetic tests put those identifiers in both stderr and an unknown method. Recording metadata uses the same privacy pass; scratch roots become `/scratch`. |
+| 4 | Retry notifications do not emit Error/RateLimited. Terminal duplicates are deduplicated per turn; RateLimited uses cached quota reset metadata. The quota-usage hand-made fixture includes retry, terminal notification and the same completion error; its golden contains one refusal. |
+| 5 | Ordered stdin submission records remove the stdout/write-ack dependency. A 2 MB input versus blocked provider stdout regression passes. A saturated child that exits unexpectedly is polled/reaped without a Shutdown command, with lifecycle cleanup. |
+| 6 | Added actual STARTUP_TIMEOUT/reap test, end-to-end queue overflow/wire count test, and saturation with an open tool plus pending Ask; cancellation and SessionEnded survive reserved slots. |
+| 7 | Corrected live timing to the orchestrator's 416 ms, runtime acceptance, current status and historical commit references. Machine-specific paths removed from handoff. Current DoD results are in the handoff. |
+| 8 | Live footer identifies live data; hand-made footer remains mapping-only. Protocol version comes from the initialize response, model/parameters from the sanitized launch transcript, and actual argv from the invocation (private values redacted). If initialization never completes the version is explicitly unknown. A corpus-wide golden test covers auxiliary `resume-origin` and `*-startup-failure` files whenever recorded. |
+| 9 | If invalid-model startup establishes a session, recorder shuts it down and retries with the missing zero UUID resume id. If that also establishes a session it fails. Before saving, it asserts fatal Error then SessionEnded and no SessionStarted. Offline tests reject established-session traces. Verify live on this CLI. |
+| 10 | FullAccess has `approvalPolicy=never`; command/file user deny rules have no callback unless Codex independently sends a request. Explicit matrix row below. |
+| 11 | Approval reason preserved; Read/Search classification documented as advisory; home/user tests use environment values; gate decision timeout is a separate 30 seconds, independent of shutdown grace; scratch paths normalized. Process-group limitation documented below. |
+
+### Enforcement investigation and live verification checklist
+
+The installed generated schemas are evidence for wire **shapes**, not guarantees
+about trigger coverage. `tests/support/check_schema.py` validates granular policy,
+command hook configuration, elicitation params and accept/decline/cancel responses.
+For comparison, run `cargo run -p spike-agent-codex --example record -- gate-deny --granular`
+and the same execute scenario. The selected policy is captured in fixture metadata.
+The default ReadOnly/Ask setting remains `untrusted`; schema presence alone does
+not justify silently replacing it with granular policy.
+
+| Mechanism / policy | Intercepted before execution? | Offline finding | Live evidence required |
+| --- | --- | --- | --- |
+| `preToolUse` / `PreToolUse` | untested, verify live | HookRunSummary lists preToolUse; ManagedHooksRequirements exposes PreToolUse matchers with synchronous command/MCP handlers. `hook/started` is a notification, not a client gate callback. | Build and verify a synchronous **preToolUse hook bridge** to ToolGate, including reads, safe commands, patches, MCP and subagents. Check deny, panic, timeout and unavailable bridge before side effects. Recorder normally disables user hooks; use a deliberately injected test bridge, never rewrite native config. |
+| `permissionRequest` / `PermissionRequest` | untested, verify live | Separate configured hook event; notification schema alone gives no all-tool coverage guarantee. | Verify ordering against JSON-RPC approval, native user hooks, allow rules and FullAccess. Ensure hooks cannot override Atrium denial. |
+| `approvalPolicy.granular` | untested, verify live | Object supports booleans `mcp_elicitations`, `rules`, `sandbox_approval`, `request_permissions`, `skill_approval`. All-true candidate validates offline and reaches the fake server through the opt-in `--granular` recorder flag; FullAccess still uses never. These flags permit request categories; schema does not say “ask for every tool”. | Compare all-true candidate with untrusted for safe cat/search, writes, execute and MCP. Test each disabled category's fail-closed behavior. Do not count shape validation as coverage. |
+| MCP `default_tools_approval_mode="prompt"` | partial, verify live | Added to every injected server's process args, including FullAccess. Native elicitation is gated; URL-mode consent can accept/decline/cancel. Form content remains null; arbitrary form data is not invented. | Verify every injected tool prompts, per-tool overrides, native user servers and required-form behavior. A form requiring structured values needs M1 UI/input mapping; consent alone does not supply those values. |
+| User `.rules` allow-prefixes | partial, verify live | Native config and rules remain untouched; allow-prefixes may bypass provider requests. No schema-backed switch demonstrated that forces every allowed command through a client callback. | Test allowed safe and non-read command prefixes under untrusted and granular, with and without hook bridge. Record each bypass explicitly. |
+| FullAccess (`never`) | no command/file interception expected; independent requests remain gated, verify live | Required danger-full-access/never policy removes ordinary provider approval callbacks; user deny rules cannot apply to calls that produce no callback. Injected MCP prompt requests, if emitted, still pass the gate. | Verify command/file bypass and independent MCP/hook behavior; never claim AllToolCalls. |
+
+All original tool-class rows remain **verify live** for execution coverage. Safe
+reads may run without any request under untrusted. `gate-deny` then fails loudly;
+record that observed bypass in the read row rather than committing a misleading
+proof. A successful denial proves that call only. If writes/non-read commands
+bypass the client under **every** tested setting, stop and escalate per the brief.
+
+Read/Search kinds come from Codex `commandActions`, not trusted static command
+analysis. Gate policy must inspect the original command/input and must not grant
+access solely because Codex labels a call Read. Elicitation requests can lack
+itemId/turnId, so correlation to an MCP ToolCall is not fabricated.
+
+The process owner kills/reaps its direct child and joins its own tasks. It does
+**not** create/kill a process group. Provider-launched descendants can outlive the
+child; M1 needs platform-specific process-tree supervision and descendant tests.
+This limitation does not weaken fail-closed handling of received gate requests,
+but prevents claiming complete provider process-tree cleanup.

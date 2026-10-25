@@ -230,3 +230,103 @@ fn json_scalar_and_escaped_line_values_survive_sanitization() {
     let text = std::fs::read_to_string(path).unwrap();
     assert!(!text.contains("escaped"));
 }
+
+#[test]
+fn metadata_secrets_redact_stderr_and_unknown_notifications() {
+    let dir = Scratch::new();
+    let path = dir.0.join("private.jsonl");
+    let private = "personal-mcp personal-hook private-hook-uuid /opt/private-account/hooks.json private-plugin";
+    let mut raw = synthetic(&recording::hostname().unwrap());
+    raw.insert(
+        0,
+        FixtureLine {
+            ms: 0,
+            input: AdapterInput::Stderr {
+                line: private.into(),
+            },
+        },
+    );
+    raw.insert(1, notification("future/private", json!({"text":private})));
+    let secrets = recording::config_secrets(&json!({"plugins":{"private-plugin":{}}}));
+    recording::write_with_secrets(&path, &raw, &secrets).unwrap();
+    for path in [path.clone(), path.with_extension("events.json")] {
+        let text = std::fs::read_to_string(path).unwrap();
+        for name in private.split_whitespace() {
+            assert!(!text.contains(name), "leaked {name}");
+        }
+        assert!(text.contains("<recorder-stderr>"));
+    }
+}
+#[test]
+fn raw_enforcement_check_rejects_bypass_before_redaction() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/agents/codex");
+    for scenario in ["gate-deny", "gate-deny-execute"] {
+        let raw = fixture::read(&root.join(format!("{scenario}.jsonl"))).unwrap();
+        assert_eq!(
+            recording::verify_enforcement(scenario, &raw).unwrap().len(),
+            4
+        );
+        let mut bypass = raw.clone();
+        bypass.insert(
+            0,
+            notification(
+                "item/commandExecution/outputDelta",
+                json!({"delta":"FIXTURE_SECRET_MUST_NOT_APPEAR"}),
+            ),
+        );
+        let error = recording::verify_enforcement(scenario, &bypass)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("FAIL") && error.contains("bypassed the gate"));
+        let no_gate = raw
+            .into_iter()
+            .filter(|l| !matches!(l.input, AdapterInput::Gate { .. }))
+            .collect::<Vec<_>>();
+        assert!(recording::verify_enforcement(scenario, &no_gate).is_err());
+    }
+}
+
+#[test]
+fn startup_proof_rejects_established_sessions() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/agents/codex");
+    assert!(
+        recording::verify_startup_failure(
+            &fixture::read(&root.join("startup-error.jsonl")).unwrap()
+        )
+        .is_ok()
+    );
+    assert!(
+        recording::verify_startup_failure(&fixture::read(&root.join("simple.jsonl")).unwrap())
+            .is_err()
+    );
+}
+#[test]
+fn native_success_cannot_be_hidden_by_normalized_denial() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/agents/codex");
+    let mut raw = fixture::read(&root.join("gate-deny.jsonl")).unwrap();
+    for l in &mut raw {
+        if let AdapterInput::Stdout { line } = &mut l.input {
+            let mut v: Value = serde_json::from_str(line).unwrap();
+            if v["method"] == "item/completed" && v["params"]["item"]["type"] == "commandExecution"
+            {
+                v["params"]["item"]["status"] = json!("completed");
+                *line = v.to_string();
+            }
+        }
+    }
+    let error = recording::verify_enforcement("gate-deny", &raw)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("FAIL read: no native target execution"));
+}
+#[test]
+fn invocation_metadata_redacts_config_names_and_scratch_paths() {
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("live/scratch");
+    let args = vec![
+        "mcp_servers.private-server.enabled=false".into(),
+        scratch.to_string_lossy().into(),
+    ];
+    let clean = recording::sanitize_arguments(&args, &["private-server".into()]).unwrap();
+    assert!(!clean[0].contains("private-server"));
+    assert_eq!(clean[1], "/scratch");
+}

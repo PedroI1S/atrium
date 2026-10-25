@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// part of the subsequently recorded agent session.
 async fn catalog_model(
     config: &SessionConfig,
-) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
+) -> Result<(String, Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
     let mut child = tokio::process::Command::new("codex")
         .args(["app-server", "-c", "features.hooks=false"])
         .current_dir(&config.cwd)
@@ -22,6 +22,7 @@ async fn catalog_model(
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let result = tokio::time::timeout(STARTUP_TIMEOUT, async {
         let mut model = None;
+        let mut secrets=vec![];
         let mut overrides = None;
         stdin.write_all(b"{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"atrium_m0\",\"version\":\"0.0.0\"}}}\n").await?;
         while let Some(line) = lines.next_line().await? {
@@ -46,10 +47,11 @@ async fn catalog_model(
                 models.sort_by_key(|m| (!m.contains("mini"), !m.contains("nano"), *m));
                 model = Some(models.first().ok_or_else(|| std::io::Error::other("empty model catalog"))?.to_string());
             } else if v["id"] == 3 {
+                secrets=spike_agent_codex::recording::config_secrets(&v["result"]["config"]);
                 overrides = Some(spike_agent_codex::recording::config_overrides(&v["result"]["config"]));
             }
             if model.is_some() && overrides.is_some() {
-                return Ok((model.take().unwrap(), overrides.take().unwrap()));
+                return Ok((model.take().unwrap(), overrides.take().unwrap(), secrets));
             }
         }
         Err(std::io::Error::other("app-server closed before catalog/config discovery"))
@@ -88,16 +90,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     // model/list has no numeric price field. Prefer a mini/nano catalog entry;
     // CODEX_MODEL lets the verifier select the cheapest entitled model explicitly.
-    let (catalog_model, config_overrides) = catalog_model(&config).await?;
+    let (catalog_model, config_overrides, secrets) = catalog_model(&config).await?;
     config.model = Some(std::env::var("CODEX_MODEL").unwrap_or(catalog_model));
     println!(
         "Catalog selection: {:?} (verify price; model/list does not expose it)",
         config.model
     );
+    let mut invocation = vec!["codex".to_owned()];
+    invocation.extend(spike_agent_codex::process_args(&config));
+    for value in &config_overrides {
+        invocation.extend(["-c".into(), value.clone()]);
+    }
     let recording = support::recording();
     let adapter = CodexAdapter {
         recording: Some(recording.clone()),
         config_overrides,
+        approval_policy: args.iter().any(|a|a=="--granular").then(||serde_json::json!({"granular":{"mcp_elicitations":true,"rules":true,"sandbox_approval":true,"request_permissions":true,"skill_approval":true}})),
     };
     if scenario == "startup-error" {
         config.model = Some("invalid-atrium-fixture-model".into());
@@ -132,14 +140,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("no native resume id".into());
         }
         // First process is retained separately for native-id provenance.
-        support::save(
+        support::save_with_secrets(
             "resume-origin",
             &recording.lock().unwrap(),
             "live; first process for resume",
+            &secrets,
+            &invocation,
         )?;
         recording.lock().unwrap().clear();
     }
-    let result = adapter.start(config, Transport::Local).await;
+    let mut result = adapter.start(config.clone(), Transport::Local).await;
+    if scenario == "startup-error"
+        && let Ok(ref mut established) = result
+    {
+        established.commands.send(SessionCommand::Shutdown).await?;
+        while established.events.recv().await.is_some() {}
+        recording.lock().unwrap().clear();
+        config.resume = Some("00000000-0000-0000-0000-000000000000".into());
+        result = adapter.start(config, Transport::Local).await;
+        if let Ok(mut unexpected) = result {
+            unexpected.commands.send(SessionCommand::Shutdown).await?;
+            while unexpected.events.recv().await.is_some() {}
+            return Err(
+                "FAIL startup-error: invalid model and missing resume id both established sessions"
+                    .into(),
+            );
+        }
+        println!("PASS startup-error: missing resume id failed before SessionStarted");
+    }
     if let Ok(mut session) = result {
         session
             .commands
@@ -214,16 +242,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             session.commands.send(SessionCommand::Shutdown).await?;
             while session.events.recv().await.is_some() {}
         }
+        if finished.is_err() || matches!(&finished, Ok(Err(_))) {
+            // Even an incomplete run must surface a bypass before returning its transport error.
+            spike_agent_codex::recording::verify_enforcement(scenario, &recording.lock().unwrap())?;
+        }
         finished??;
     } else if scenario != "startup-error" {
         // Save startup failures to a separate name, preserving the golden scenario.
-        support::save(
+        support::save_with_secrets(
             &format!("{scenario}-startup-failure"),
             &recording.lock().unwrap(),
             "live; startup failure",
+            &secrets,
+            &invocation,
         )?;
         return Err(result.unwrap_err().into());
     }
-    support::save(scenario, &recording.lock().unwrap(), "live")?;
+    if scenario == "startup-error" {
+        spike_agent_codex::recording::verify_startup_failure(&recording.lock().unwrap())?;
+        println!("PASS startup-error: fatal pre-session lifecycle");
+    }
+    for check in
+        spike_agent_codex::recording::verify_enforcement(scenario, &recording.lock().unwrap())?
+    {
+        println!("{check}");
+    }
+    support::save_with_secrets(
+        scenario,
+        &recording.lock().unwrap(),
+        "live",
+        &secrets,
+        &invocation,
+    )?;
     Ok(())
 }

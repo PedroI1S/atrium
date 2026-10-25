@@ -21,7 +21,8 @@
 {"ms":20,"dir":"command","command":{"type":"send_user_message","text":"again"}}
 {"ms":21,"dir":"stdout","line":"{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-fixture\",\"turn\":{\"id\":\"turn-2\",\"items\":[],\"status\":\"inProgress\",\"error\":null}}}"}
 {"ms":22,"dir":"stdout","line":"{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thread-fixture\",\"turnId\":\"turn-2\",\"tokenUsage\":{\"total\":{\"inputTokens\":30,\"outputTokens\":5,\"cachedInputTokens\":2,\"reasoningOutputTokens\":1,\"totalTokens\":35},\"last\":{\"inputTokens\":5,\"outputTokens\":3,\"cachedInputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":8}}}}"}
+{"ms":23,"dir":"stdout","line":"{\"method\":\"error\",\"params\":{\"threadId\":\"thread-fixture\",\"turnId\":\"turn-2\",\"willRetry\":true,\"error\":{\"message\":\"quota exhausted\",\"codexErrorInfo\":\"usageLimitExceeded\"}}}"}
 {"ms":23,"dir":"stdout","line":"{\"method\":\"error\",\"params\":{\"threadId\":\"thread-fixture\",\"turnId\":\"turn-2\",\"willRetry\":false,\"error\":{\"message\":\"quota exhausted\",\"codexErrorInfo\":\"usageLimitExceeded\"}}}"}
-{"ms":24,"dir":"stdout","line":"{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-fixture\",\"turn\":{\"id\":\"turn-2\",\"items\":[],\"status\":\"failed\",\"error\":null}}}"}
+{"ms":24,"dir":"stdout","line":"{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-fixture\",\"turn\":{\"id\":\"turn-2\",\"items\":[],\"status\":\"failed\",\"error\":{\"message\":\"quota exhausted\",\"codexErrorInfo\":\"usageLimitExceeded\"}}}}"}
 {"ms":25,"dir":"command","command":{"type":"shutdown"}}
 {"ms":26,"dir":"exit","code":0}

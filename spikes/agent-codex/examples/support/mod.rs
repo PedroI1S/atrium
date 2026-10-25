@@ -60,9 +60,18 @@ pub fn save(
     lines: &[FixtureLine],
     provenance: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    save_with_secrets(scenario, lines, provenance, &[], &[])
+}
+pub fn save_with_secrets(
+    scenario: &str,
+    lines: &[FixtureLine],
+    provenance: &str,
+    secrets: &[String],
+    invocation: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(root())?;
     let path = root().join(format!("{scenario}.jsonl"));
-    let clean = spike_agent_codex::recording::write(&path, lines)?;
+    let clean = spike_agent_codex::recording::write_with_secrets(&path, lines, secrets)?;
     if provenance.starts_with("live") {
         let mut n = CodexNormalizer::default();
         if let Some(ms) = clean
@@ -74,10 +83,41 @@ pub fn save(
             );
         }
     }
+    let records: Vec<serde_json::Value> = clean
+        .iter()
+        .filter_map(|l| match &l.input {
+            AdapterInput::Stdout { line } | AdapterInput::Stdin { line } => {
+                serde_json::from_str(line).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    let version = records
+        .iter()
+        .find_map(|v| v["result"]["userAgent"].as_str())
+        .unwrap_or("unknown (pre-handshake failure)");
+    let launch = records
+        .iter()
+        .find(|v| matches!(v["method"].as_str(), Some("thread/start" | "thread/resume")));
+    let model = launch
+        .map(|v| v["params"]["model"].to_string())
+        .unwrap_or_else(|| "unavailable".into());
+    let invocation = spike_agent_codex::recording::sanitize_arguments(invocation, secrets)?;
+    let invocation = if invocation.is_empty() {
+        "not executed; hand-made protocol trace".into()
+    } else {
+        serde_json::to_string(&invocation)?
+    };
+    let footer = if provenance.starts_with("live") {
+        "Live transcript; enforcement claims require the raw-stream PASS checks and matrix qualifications."
+    } else {
+        "Hand-made traces demonstrate mapping only; they do not prove provider enforcement."
+    };
     std::fs::write(
         path.with_extension("md"),
         format!(
-            "# {scenario}\n\n{provenance}. Protocol: codex-cli 0.163.0 app-server v2, generated JSON schema.\n\nReproduce: `cargo run -p spike-agent-codex --example record -- {scenario}`.\nPrompt: {}\n\nHand-made traces demonstrate mapping only; they do not prove provider enforcement.\n",
+            "# {scenario}\n\n{provenance}. Protocol: {version}, app-server v2.\nModel: {model}.\nCommand argv (private values redacted): `{invocation}`.\nThread parameters: `{}`.\n\nReproduce: `cargo run -p spike-agent-codex --example record -- {scenario}`.\nPrompt: {}\n\n{footer}\n",
+            launch.map(|v| v["params"].to_string()).unwrap_or_default(),
             prompt(scenario)
         ),
     )?;
@@ -313,8 +353,12 @@ pub fn handmade(scenario: &str) -> Vec<FixtureLine> {
                 }));
                 v.push(turn(2, "inProgress"));
                 v.push(notify("thread/tokenUsage/updated",json!({"threadId":"thread-fixture","turnId":"turn-2","tokenUsage":{"total":{"inputTokens":30,"outputTokens":5,"cachedInputTokens":2,"reasoningOutputTokens":1,"totalTokens":35},"last":{"inputTokens":5,"outputTokens":3,"cachedInputTokens":1,"reasoningOutputTokens":0,"totalTokens":8}}})));
-                v.push(notify("error",json!({"threadId":"thread-fixture","turnId":"turn-2","willRetry":false,"error":{"message":"quota exhausted","codexErrorInfo":"usageLimitExceeded"}})));
-                v.push(turn(2, "failed"));
+                let error =
+                    json!({"message":"quota exhausted","codexErrorInfo":"usageLimitExceeded"});
+                for retry in [true, false] {
+                    v.push(notify("error",json!({"threadId":"thread-fixture","turnId":"turn-2","willRetry":retry,"error":error})));
+                }
+                v.push(notify("turn/completed",json!({"threadId":"thread-fixture","turn":{"id":"turn-2","status":"failed","items":[],"error":error}})));
             }
             _ => {
                 v.extend(message("hello", 1));

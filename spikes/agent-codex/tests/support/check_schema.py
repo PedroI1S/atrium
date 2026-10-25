@@ -98,6 +98,20 @@ for fixture in sorted((ROOT.parents[1] / 'fixtures/agents/codex').glob('*.jsonl'
                 count += 1
             except ValueError as error:
                 errors.append(f'{fixture.name}:{index}: {error}')
+# Schema-supported investigation candidates; these assert shapes, not runtime enforcement.
+thread_spec = load('v2/ThreadStartParams')
+validate({'approvalPolicy': {'granular': {'mcp_elicitations': True, 'rules': True,
+    'sandbox_approval': True, 'request_permissions': True, 'skill_approval': True}}}, thread_spec, thread_spec)
+hook_spec = load('v2/ConfigRequirementsReadResponse')
+validate({'hooks': [{'type': 'command', 'async': False, 'command': 'fixture-hook-bridge'}],
+    'matcher': '*'}, hook_spec['definitions']['ConfiguredHookMatcherGroup'], hook_spec)
+elicit_spec = load('McpServerElicitationRequestParams')
+validate({'serverName':'fixture-mcp','threadId':'thread-fixture','mode':'url',
+    'elicitationId':'elicit-1','url':'https://example.invalid/approve','message':'Approve'}, elicit_spec, elicit_spec)
+response_spec = load('McpServerElicitationRequestResponse')
+for action in ('accept','decline','cancel'):
+    validate({'action':action,'content':None}, response_spec, response_spec)
+print('6 enforcement candidate shapes passed; runtime coverage: verify live')
 print(f'{count} records passed structural schema checks; {len(errors)} errors')
 for error in errors:
     print(error)

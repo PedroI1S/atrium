@@ -1,160 +1,121 @@
 # Handoff: M0-02-codex-adapter
 
-Model: GPT-6.1 Sol · Status: partial (fix round 1 complete; live rerecording awaits orchestrator)
+Model: GPT-6.1 Sol · Status: partial (fix round 2 complete offline; full live verification awaits orchestrator)
 
 ## Done
 
-- Implemented `CodexAdapter` and `CodexNormalizer`, initialize/start/resume/turn/interrupt,
-  gate approvals, structured questions, messages/reasoning/tools/patches/plans,
-  per-turn usage, quota/refusal mapping, bounded queues and shutdown/kill/reap.
-- Every required golden scenario exists, plus execution denial, patch and quota
-  coverage. All fixtures are explicitly **hand-made** and sanitized.
-- Added recorder and chat examples, schema regeneration instructions and a
-  stdlib structural schema checker. Generated schemas/raw scratch data are ignored.
-- Added real subprocess tests using a deterministic fake server: live/replay parity,
-  approvals, panic denial, gate cancellation, interrupt during startup, dropped
-  session cleanup, saturation, forced kill and reaping. Reserved cleanup slots
-  preserve `SessionEnded` even when no events are read before shutdown.
-- Spike report: [M0-02-codex-adapter](../../spikes/M0-02-codex-adapter.md).
-- Changed only owned paths. Contracts, root manifest and Cargo.lock are unchanged.
+- Implemented adapter, normalizer, recorder/chat harness, required hand-made
+  fixtures and golden tests within owned paths. Contracts, root manifest and
+  Cargo.lock are unchanged.
+- Addressed accepted review findings 1–11; mapping and evidence below.
+- Updated [spike report](../../spikes/M0-02-codex-adapter.md), enforcement matrix,
+  provenance and regression coverage.
+- Initial work was committed by the orchestrator as `83225db`; fix round 1 as
+  `49e6b20`. These are historical commits, not uncommitted work.
 
 ## Not done
 
-- The full set of real Codex recordings, live enforcement matrix evidence,
-  cheapest-model verification, native persistence/resume and real question/quota
-  behavior. Direct `codex app-server` printed `Operation not permitted` and exited
-  before initialization. No sandbox workaround was attempted.
-- Initial worker staging was sandbox-blocked; the orchestrator subsequently
-  committed that implementation as `83225db`. Fix round 1 commit status is below.
+- Real app-server recordings and provider enforcement verification. The user
+  explicitly prohibited launching app-server in this sandbox, so no live record
+  or chat session was attempted in this round. Offline subprocess tests use the
+  deterministic Python fake server only.
+- Every committed fixture remains **hand-made**. Orchestrator's previous live
+  simple run used `gpt-5.6-luna`, reached its first normalized event at **416 ms**,
+  and mapped the lifecycle/message/usage/quota correctly. That unsafe recording
+  was discarded and does not prove tool enforcement.
+- Hook bridge runtime coverage, native rule precedence, MCP prompt coverage,
+  granular behavior and process-tree cleanup remain explicit verification items.
 
 ## Definition of Done results
 
 ```text
 cargo fmt --check
-  PASS (exit 0)
+  PASS, exit 0.
 
 cargo clippy -p spike-agent-codex --all-targets -- -D warnings
-  PASS (exit 0)
+  PASS, exit 0; recorder/chat examples compile.
 
 cargo test -p spike-agent-codex
-  PASS: 20 fixture/semantic tests + 9 subprocess/policy tests, 0 failed.
-  Includes all 13 scenario golden tests, saturation and forced kill/reap.
-
-codex app-server generate-json-schema --out spikes/agent-codex/schema
-  PASS (exit 0); output ignored, not committed.
+  PASS, exit 0: 47 tests, 0 failed.
+  21 fixture/semantic + 17 subprocess/policy + 9 recording/privacy tests.
+  Includes all 13 scenario goldens and corpus-wide auxiliary golden coverage.
+  Actual startup timeout test completed at the 30-second contract deadline.
 
 python3 spikes/agent-codex/tests/support/check_schema.py
-  PASS: 179 records passed structural schema checks; 0 errors.
+  PASS, exit 0: 180 records, 0 errors; six enforcement candidate shapes pass.
+  Shape validation does not establish runtime enforcement.
 
-cargo run -p spike-agent-codex --example record -- simple
-  BLOCKED (exit 1): app-server closed before model/list; check sandbox permissions.
+git diff --check
+  PASS, exit 0.
 
+cargo run -p spike-agent-codex --example record -- <scenario>
 cargo run -p spike-agent-codex --example chat
-  BLOCKED (exit 1): Handshake("stdout closed before thread creation").
-
-cargo run -p spike-agent-codex --example record -- <scenario> --hand-made
-  PASS (exit 0) for all 13 scenarios; neighboring .md files identify provenance.
+  NOT RUN: explicit user instruction prohibits real app-server in sandbox.
+  Orchestrator owns these live DoD checks. Both examples compile above.
 ```
 
 ## Gotchas
 
-- `interception()` is always `ProviderGated`. Offline approval examples do not prove
-  that the provider asks before every read, safe command, file write or MCP call.
-- ReadOnly/Ask currently request `untrusted` from the installed 0.163.0 schema.
-  Current official docs say that selectable policy is retired; runtime behavior
-  could not be checked. Startup fails rather than silently weakening settings.
-  FullAccess uses `danger-full-access` + `never` on the host as required.
-- On resumed threads with no historical token baseline, the first turn's token
-  records remain `Unmapped` and its usage unknown. Old tokens are not charged to
-  the new turn. Later turns can use the observed cumulative baseline.
-- `model/list` has no price field. The recorder's mini/nano preference is a heuristic;
-  verification must choose the cheapest entitled model explicitly with `CODEX_MODEL`.
-- Extra permission grants, dynamic tool execution, MCP elicitations and auth refresh
-  are unsupported server requests and fail closed with JSON-RPC errors.
-- Opt-in raw recordings live in memory until sanitized writing; do not commit raw
-  scratch files. The live scratch directory is under the owned, ignored `live/`.
-- Hand-made `resume` covers the second-process wire flow only. The live harness
-  records a separate `resume-origin` process before resuming its actual native id.
-
-## Follow-ups
-
-1. Orchestrator: commit fix-round changes if worker staging remains blocked (initial implementation is `83225db`).
-2. Reviewer: review the pure mapper and process-owner paths, especially reserved
-   lifecycle slots, write acknowledgement ordering and failure cleanup.
-3. Orchestrator verification: run the recorder outside this worker sandbox for every
-   required scenario and replace hand-made fixtures after review/sanitization.
-4. Resolve the `untrusted` schema/runtime discrepancy, test actual bypasses across
-   tool classes and all policies, and fill the matrix with live evidence. If writes
-   or non-read commands bypass every setting, stop and escalate the security finding.
-5. Record launch-to-first-event from real traces, confirm cheapest-model choice,
-   native resume, supported question mode and refusal/error variants before M1.
+- `ProviderGated` remains correct. Safe reads or allow-prefix commands can bypass
+  provider approval; no all-tool interception claim is made. Read/Search kinds
+  are provider heuristics, not authorization evidence.
+- FullAccess retains danger-full-access/never; deny rules cannot apply to calls
+  without callbacks. Independently emitted requests are still gated.
+- Stdin inputs now represent ordered submissions to the bounded writer queue.
+  Failed writes emit diagnostics. Stdout does not wait for write acknowledgements.
+- Elicitation consent is supported, with null form content. Arbitrary required
+  form inputs need M1 UI mapping; consent cannot invent them. Correlation ids
+  absent from MCP requests are not fabricated.
+- Direct child is killed/reaped and adapter tasks joined. Descendant process
+  groups are not supervised; the report explicitly defers that platform work.
+- Resumed usage without a historical baseline remains unknown/Unmapped for the
+  first resumed turn. `model/list` does not expose numeric prices.
+- Raw recordings stay in memory; do not commit ignored scratch data. Denial
+  failures refuse fixture writes and must remain visible in live verification.
 
 ## Fix round 1
 
-Base: orchestrator commit `83225db`. The orchestrator reconfirmed the original
-29 tests, fmt and clippy and successfully recorded simple with `gpt-5.6-luna`:
-first normalized event at 416 ms, with correct session/turn/message/usage/quota
-mapping. That recording was discarded because of privacy leaks. The worker did
-not launch app-server during this fix round, as instructed.
+Committed by orchestrator as `49e6b20`, verified with 34/34 tests, fmt and clippy.
+Added OS hostname/account/installation redaction, recording-only native config
+isolation, diagnostic pseudonyms and classification of eight Unmapped methods.
+Round 2 extends those protections to unstructured text and invocation metadata.
 
-### Done
+## Fix round 2
 
-- Added the recorder-only `recording::write` path: OS-derived hostname redaction,
-  nested `installationId` redaction, null account auth/plan fields, and removal of
-  remote-control environment identifiers. Decoded JSON-RPC strings and both JSONL
-  and golden files are checked. Earlier copies of installation/remote identifiers
-  in text are removed through a whole-stream collection pass.
-- Discovery now reads effective config for the scratch cwd alongside model/list.
-  It disables hooks via `-c features.hooks=false`; actual recording children also
-  disable each discovered native/plugin MCP server with an invocation-local
-  `enabled=false` override. Auth, Codex home and native config files are unchanged.
-  Ordinary adapter/chat sessions default to no extra overrides.
-- Since app-server help has no ignore-user-config/blanket MCP-disable flag, and
-  effective config may omit some sources, always apply the authorized fallback:
-  stable `mcp-1`/`hook-1` aliases and placeholders for commands, source paths,
-  errors and diagnostic text. Unknown source discovery does not weaken redaction.
-- Kept all eight observed notifications Unmapped and classified each for M1 in
-  the report's Fix round 1 section. No normalizer or frozen contract was changed.
-- Added four recorder tests (including a current-hostname corpus guard and a
-  synthetic stream with all eight records), plus a fake-child test proving the
-  process overrides are scoped to the configured recorder invocation.
+Read-only cross-provider review base: `49e6b20`. Addressed in priority order
+1, 3, 2, then remaining findings. Detailed enforcement matrix is in the report.
 
-### Definition of Done results
+| Finding | Change / evidence |
+| --- | --- |
+| 1 | Injected MCP prompt mode; elicitation Allow/Deny/Ask/cancel gate routing; offline wire tests. Generated schemas inspected for hooks/granular/elicitation. `record -- <scenario> --granular` sends the all-true candidate explicitly; fake test confirms FullAccess remains never. Matrix covers PreToolUse/PermissionRequest bridge, granular, MCP prompt and native allow-prefixes with verify-live labels. |
+| 3 | Raw decoded stream checked before sanitization: four PASS/FAIL claims cover target denial, matching denied completion, no sentinel and no native success. Missing evidence or bypass refuses fixture writing with `read bypassed the gate` / execute equivalent. Tests reject leaked sentinel, absent gate and native success masked by normalized Denied. Sentinel never supplied to sanitizer. |
+| 2 | Config and stream identifiers become sanitizer secrets; stderr becomes a placeholder; unknown notifications retain their type with secrets redacted. Tests place MCP/hook/plugin names and source paths in both unknown notifications and stderr. Scratch and argv privacy also covered. |
+| 4 | willRetry errors ignored; terminal errors deduplicated per turn; refusal reset uses last quota data. Hand-made quota fixture includes retry and both terminal records, with one RateLimited golden. |
+| 5 | Removed circular stdout/write dependency; 2 MB stdin/blocked stdout regression passes. Saturated unexpected child exit detected/reaped without Shutdown. |
+| 6 | Added real STARTUP_TIMEOUT/reap test, live queue overflow/wire count test, saturation with open tool and pending Ask plus cancelled closing events. |
+| 7 | Current 47-test results, 416 ms real timing and orchestrator commit history reconciled; stale personal paths removed. |
+| 8 | Accurate live/hand-made footers; version from recorded initialize, model/thread params from sanitized launch, sanitized actual argv. Corpus-wide golden test covers resume-origin and startup-failure recordings when present. Existing notes retain hand-made provenance and synthetic model identity. |
+| 9 | Invalid-model session establishment triggers shutdown and missing-resume-id fallback. Recorder refuses startup-error unless fatal pre-session lifecycle has no SessionStarted. Offline trace tests cover acceptance/rejection; verify fallback live. |
+| 10 | Matrix explicitly documents FullAccess callbacks absent for ordinary commands/files and consequent inability to enforce user deny rules there. |
+| 11 | Approval reason preserved; classification advisory; environment-derived home/user tests; separate 30-second gate timeout; scratch normalization; direct-child-only cleanup documented. |
 
-```text
-cargo fmt --check
-  PASS (exit 0)
+## Follow-ups
 
-cargo clippy -p spike-agent-codex --all-targets -- -D warnings
-  PASS (exit 0)
+1. Orchestrator: record all scenarios live, including startup fallback and resume;
+   review generated metadata and privacy before committing fixtures.
+2. Compare `gate-deny` and `gate-deny-execute` with default untrusted and
+   `--granular`. Record bypasses in the matrix; never reinterpret a missing
+   denial as a passing proof. A passing trace proves that call only.
+3. Verify the synchronous PreToolUse hook bridge and PermissionRequest ordering,
+   native allow-prefixes, MCP prompt mode/per-tool overrides and FullAccess.
+   If writes or non-read commands bypass every setting, stop and escalate.
+4. M1: implement platform-specific descendant supervision and structured MCP form
+   input support; retain ProviderGated until all tool classes have live proof.
 
-cargo test -p spike-agent-codex
-  PASS: 20 fixture/semantic + 10 subprocess/policy + 4 recorder tests.
-  Total 34 passed, 0 failed; all 13 existing golden scenarios still pass.
-  Saturation, interrupt, shutdown and forced kill/reap remain covered.
+## Commit status
 
-python3 spikes/agent-codex/tests/support/check_schema.py
-  PASS: 179 records passed structural schema checks; 0 errors.
-
-git diff --check
-  PASS (exit 0)
-
-Live record/chat commands
-  NOT RUN, per explicit fix-round instruction; orchestrator will record all scenarios.
-  Only codex/app-server --help was inspected; no provider process was launched.
-```
-
-### Remaining verification and commit
-
-- Orchestrator: record every live scenario with the updated recorder; verify auth
-  continuity and that real user hooks/discovered MCP servers are suppressed.
-  Config-read omissions/managed sources use the sanitizing fallback, so complete
-  source isolation is not claimed from offline tests.
-- The original hand-made fixtures remain unchanged. The 416 ms timing is the
-  orchestrator's pre-fix measurement, not a new worker measurement.
-- Commit blocked again: `git add spikes/agent-codex docs/spikes/M0-02-codex-adapter.md docs/agents/handoffs/M0-02-codex-adapter.md`
-  exited 128 because the sandbox cannot create
-  `/Users/pedro/Documents/Harness/.git/worktrees/M0-02-codex-adapter/index.lock`
-  (`Operation not permitted`). The chained commit did not run. All fix-round
-  changes, including this handoff, remain uncommitted for the orchestrator.
-  No sandbox or alternate-metadata workaround was attempted.
+Both `git add` and `git commit -am` failed (exit 128): `index.lock` could not
+be created in the shared repository's external `.git/worktrees` metadata,
+`Operation not permitted`. No workaround was attempted. All fix-round-2 changes,
+including this handoff, remain uncommitted on `agent/sol/M0-02-codex-adapter`
+for the orchestrator to commit.

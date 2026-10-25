@@ -207,7 +207,11 @@ fn exit_closes_in_contract_order_and_is_idempotent() {
 }
 #[test]
 fn fixtures_are_sanitized() {
-    let s = fixture::Sanitizer::new("/Users/pedro", "pedro", &["FIXTURE_SECRET_MUST_NOT_APPEAR"]);
+    let s = fixture::Sanitizer::new(
+        &std::env::var("HOME").unwrap_or_default(),
+        &std::env::var("USER").unwrap_or_default(),
+        &["FIXTURE_SECRET_MUST_NOT_APPEAR"],
+    );
     for entry in std::fs::read_dir(path("simple").parent().unwrap()).unwrap() {
         let p = entry.unwrap().path();
         assert!(s.is_clean(&std::fs::read_to_string(p).unwrap()));
@@ -262,4 +266,14 @@ fn resume_without_historical_usage_does_not_charge_old_tokens() {
     assert!(
         matches!(result.as_slice(),[AgentEvent::Unmapped {record_type,..}] if record_type.ends_with("missing_resume_baseline"))
     );
+}
+
+#[test]
+fn every_recording_has_a_golden_including_auxiliary_traces() {
+    for entry in std::fs::read_dir(path("simple").parent().unwrap()).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().is_some_and(|e| e == "jsonl") {
+            fixture::assert_golden(&p, &mut CodexNormalizer::default());
+        }
+    }
 }

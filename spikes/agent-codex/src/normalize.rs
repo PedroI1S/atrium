@@ -26,6 +26,8 @@ pub struct CodexNormalizer {
     queued: usize,
     resumed: bool,
     usage_baseline_known: bool,
+    errors: BTreeSet<String>,
+    quota_reset: Option<u64>,
 }
 
 struct Pending {
@@ -87,6 +89,15 @@ impl CodexNormalizer {
             + usize::from(self.turn_id.is_some())
     }
     pub(crate) fn check(&self, method: &str, p: &Value) -> ToolCheck {
+        if method == "mcpServer/elicitation/request" {
+            return ToolCheck {
+                call_id: opt(p, "itemId"),
+                name: s(p, "serverName"),
+                kind: ToolKind::Mcp,
+                title: opt(p, "message"),
+                input: p.clone(),
+            };
+        }
         let item = self.tools.get(&s(p, "itemId")).cloned().unwrap_or_else(|| json!({"type": if method.contains("fileChange") {"fileChange"} else {"commandExecution"}}));
         let mut input = p.clone();
         input["item"] = item.clone();
@@ -96,6 +107,22 @@ impl CodexNormalizer {
             kind: tool_kind(&item),
             title: opt(p, "command").or_else(|| opt(&item, "command")),
             input,
+        }
+    }
+    pub(crate) fn pending_mcp(&self, request_id: &str) -> bool {
+        self.requests.get(request_id).is_some_and(|r| {
+            r.outcome.is_none() && r.check.as_ref().is_some_and(|c| c.kind == ToolKind::Mcp)
+        })
+    }
+    pub(crate) fn approval_result(&self, request_id: &str, action: &str) -> Value {
+        if self
+            .request_check(request_id)
+            .is_some_and(|c| c.kind == ToolKind::Mcp)
+        {
+            // Elicitation acceptance is consent, not fabricated form input.
+            json!({"action":action,"content":null})
+        } else {
+            json!({"decision":action})
         }
     }
     pub(crate) fn request_check(&self, request_id: &str) -> Option<ToolCheck> {
@@ -219,6 +246,7 @@ impl CodexNormalizer {
             "turn/started" => {
                 if self.turn_id.is_none() {
                     self.turn += 1;
+                    self.errors.clear();
                     self.turn_id = opt(&p["turn"], "id");
                     self.usage = None;
                     self.baseline = self.total.clone();
@@ -230,7 +258,7 @@ impl CodexNormalizer {
             }
             "turn/completed" => {
                 if let Some(error) = p["turn"].get("error").filter(|e| !e.is_null()) {
-                    Self::error(error, out);
+                    self.error(error, out);
                 }
                 let outcome = match p["turn"]["status"].as_str() {
                     Some("completed") => TurnOutcome::Completed,
@@ -291,7 +319,9 @@ impl CodexNormalizer {
                 output_delta: opt(p, "delta"),
                 output: None,
             }),
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "mcpServer/elicitation/request" => {
                 let check = self.check(method, p);
                 self.requests.insert(
                     id(&v["id"]),
@@ -417,20 +447,34 @@ impl CodexNormalizer {
                         })
                     })
                     .collect();
+                let windows: Vec<QuotaWindow> = windows;
+                self.quota_reset = windows
+                    .iter()
+                    .filter(|w| w.used_percent.is_some_and(|p| p >= 100.0))
+                    .filter_map(|w| w.resets_at_ms)
+                    .max()
+                    .or_else(|| windows.iter().filter_map(|w| w.resets_at_ms).min());
                 out.push(AgentEvent::QuotaUpdated { windows });
             }
-            "error" => Self::error(&p["error"], out),
+            "error" => {
+                if p["willRetry"] != true {
+                    self.error(&p["error"], out);
+                }
+            }
             _ => out.push(unmapped(method, v)),
         }
     }
-    fn error(error: &Value, out: &mut Vec<AgentEvent>) {
+    fn error(&mut self, error: &Value, out: &mut Vec<AgentEvent>) {
+        if !self.errors.insert(error.to_string()) {
+            return;
+        }
         let info = &error["codexErrorInfo"];
         if info == "usageLimitExceeded"
             || info == "rateLimitExceeded"
             || info["httpConnectionFailed"]["httpStatusCode"] == 429
         {
             out.push(AgentEvent::RateLimited {
-                resets_at_ms: None,
+                resets_at_ms: self.quota_reset,
                 message: opt(error, "message"),
             });
         } else {
@@ -564,7 +608,11 @@ impl Normalizer for CodexNormalizer {
                         }
                         r.outcome = Some(if r.check.is_none() {
                             RequestOutcome::Answered
-                        } else if v["result"]["decision"] == "accept" {
+                        } else if v["result"]["action"] == "cancel" {
+                            RequestOutcome::Cancelled
+                        } else if v["result"]["decision"] == "accept"
+                            || v["result"]["action"] == "accept"
+                        {
                             RequestOutcome::Approved
                         } else {
                             RequestOutcome::Denied
@@ -586,7 +634,8 @@ impl Normalizer for CodexNormalizer {
                                 kind: check.kind,
                                 title: check.title.clone(),
                                 input: check.input.clone(),
-                                reason: None,
+                                reason: opt(&check.input, "reason")
+                                    .or_else(|| opt(&check.input, "message")),
                             });
                         }
                         GateDecision::Allow => r.outcome = Some(RequestOutcome::Approved),

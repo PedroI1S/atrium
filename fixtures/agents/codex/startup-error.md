@@ -2,6 +2,8 @@
 
 hand-made; app-server was blocked by worker sandbox before handshake. Protocol: codex-cli 0.163.0 app-server v2, generated JSON schema.
 
+Model: `invalid-fixture-model` (synthetic startup error). Command: not executed; hand-made app-server v2 trace.
+
 Reproduce: `cargo run -p spike-agent-codex --example record -- startup-error`.
 Prompt: Reply with exactly hello.
 

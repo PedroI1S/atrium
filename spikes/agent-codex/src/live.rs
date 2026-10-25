@@ -23,6 +23,9 @@ pub struct CodexAdapter {
     /// Invocation-local configuration, used by the fixture recorder. Empty for
     /// normal sessions; does not modify the user's configuration or auth store.
     pub config_overrides: Vec<String>,
+    /// Explicit experimental policy candidate for verification. FullAccess always
+    /// retains the contract's `never`; ordinary callers leave this unset.
+    pub approval_policy: Option<Value>,
 }
 
 /// Process-local MCP overrides. Names and values are quoted as TOML strings.
@@ -33,6 +36,7 @@ pub fn process_args(config: &SessionConfig) -> Vec<String> {
         for (key, value) in [
             ("command", json!(server.command)),
             ("args", json!(server.args)),
+            ("default_tools_approval_mode", json!("prompt")),
         ] {
             args.extend(["-c".into(), format!("{root}.{key}={value}")]);
         }
@@ -104,6 +108,7 @@ async fn handshake(
     stderr: &mut Lines<BufReader<ChildStderr>>,
     state: &mut State,
     config: &SessionConfig,
+    approval_policy: Option<&Value>,
 ) -> Result<(), AdapterError> {
     write(stdin,state,json!({"id":"atrium-init","method":"initialize","params":{"clientInfo":{"name":"atrium_m0","title":"Atrium M0","version":"0.0.0"},"capabilities":{"experimentalApi":true}}})).await?;
     let mut err_open = true;
@@ -117,7 +122,9 @@ async fn handshake(
                 if v.get("error").is_some() {return Err(AdapterError::Handshake(v["error"].to_string()));}
                 if v["id"]=="atrium-init" {
                     write(stdin,state,json!({"method":"initialized"})).await?;
-                    write(stdin,state,json!({"id":"atrium-thread","method":if config.resume.is_some(){"thread/resume"}else{"thread/start"},"params":thread_params(config)})).await?;
+                    let mut params=thread_params(config);
+                    if config.permissions!=PermissionPolicy::FullAccess && let Some(policy)=approval_policy {params["approvalPolicy"]=policy.clone();}
+                    write(stdin,state,json!({"id":"atrium-thread","method":if config.resume.is_some(){"thread/resume"}else{"thread/start"},"params":params})).await?;
                 }
                 if v["id"]=="atrium-thread" {
                     if state.normalizer.native_id.is_none() {return Err(AdapterError::Handshake("thread response has no native id".into()));}
@@ -178,7 +185,14 @@ impl AgentAdapter for CodexAdapter {
             };
             let result = timeout(
                 STARTUP_TIMEOUT,
-                handshake(&mut stdin, &mut stdout, &mut stderr, &mut state, &config),
+                handshake(
+                    &mut stdin,
+                    &mut stdout,
+                    &mut stderr,
+                    &mut state,
+                    &config,
+                    self.approval_policy.as_ref(),
+                ),
             )
             .await;
             if !matches!(result, Ok(Ok(()))) {
@@ -229,10 +243,12 @@ async fn writer(
     }
 }
 fn send(tx: &mpsc::Sender<Value>, v: Value, state: &mut State) -> bool {
+    let line = v.to_string();
     if tx.try_send(v).is_err() {
         state.failure("provider input queue exhausted or closed".into());
         false
     } else {
+        state.input(AdapterInput::Stdin { line });
         state.in_flight_writes += 1;
         true
     }
@@ -298,6 +314,11 @@ async fn run(
                 match cmd {
                     SessionCommand::Shutdown=>{shutting=Some(Instant::now());queued.clear();gates.abort_all();gate_checks.clear();writer.abort();}
                     SessionCommand::Interrupt=> {
+                        for (request_id,native) in &request_ids {
+                            if state.normalizer.pending_mcp(request_id) {
+                                send(&writes,json!({"id":native,"result":{"action":"cancel","content":null}}),&mut state);
+                            }
+                        }
                         queued.clear();gates.abort_all();gate_checks.clear();
                         interrupt_pending=starting;
                         if let Some(turn)=state.normalizer.turn_id.clone() {
@@ -313,7 +334,7 @@ async fn run(
                     SessionCommand::ResolveApproval {request_id,decision} if approval=> {
                         let value=if matches!(decision,ApprovalDecision::Allow){"accept"}else{"decline"};
                         if let Some(native)=request_ids.get(&request_id) {
-                            let v=json!({"id":native,"result":{"decision":value}});
+                            let v=json!({"id":native,"result":state.normalizer.approval_result(&request_id,value)});
                             send(&writes,v,&mut state);
                         }
                     }
@@ -326,7 +347,7 @@ async fn run(
             }
             _=events.closed(),if shutting.is_none() && commands.is_closed()=> {shutting=Some(Instant::now());gates.abort_all();gate_checks.clear();writer.abort();}
             result=ack_rx.recv(),if state.in_flight_writes>0=>match result {
-                Some(Ok(line))=>{state.in_flight_writes-=1;state.input(AdapterInput::Stdin {line});},
+                Some(Ok(_))=>{state.in_flight_writes-=1;},
                 Some(Err(e))=>{state.in_flight_writes=0;state.failure(e);shutting=Some(Instant::now());},None=>{state.in_flight_writes=0;}
             },
             result=gates.join_next_with_id(),if !gates.is_empty()=>if let Some(result)=result {
@@ -337,7 +358,7 @@ async fn run(
                 if let Some((request_id,check))=gate_checks.remove(&task_id) && state.normalizer.request_check(&request_id).is_some() {
                         state.input(AdapterInput::Gate {check,decision:decision.clone()});
                         if !matches!(decision,GateDecision::Ask) {
-                            let result=json!({"decision":if matches!(decision,GateDecision::Allow){"accept"}else{"decline"}});
+                            let result=state.normalizer.approval_result(&request_id,if matches!(decision,GateDecision::Allow){"accept"}else{"decline"});
                             if let Some(native)=request_ids.get(&request_id) {send(&writes,json!({"id":native,"result":result}),&mut state);}
                         }
                 }
@@ -346,7 +367,7 @@ async fn run(
                 if let Ok(permit)=permit {permit.send(state.pending.pop_front().expect("pending event"));}
                 else {state.pending.clear();}
             }
-            line=stdout.next_line(),if out_open && state.in_flight_writes==0 && state.pending.is_empty() && events.capacity()>state.normalizer.closing_slots()+4=>match line {
+            line=stdout.next_line(),if out_open && state.pending.is_empty() && events.capacity()>state.normalizer.closing_slots()+4=>match line {
                 Ok(Some(line))=> {
                     let v=serde_json::from_str::<Value>(&line).unwrap_or(Value::Null);
                     let method=v["method"].as_str().unwrap_or_default().to_owned();
@@ -370,7 +391,7 @@ async fn run(
                             let gate=config.gate.clone();
                             let gate_check=check.clone();
                             let task=gates.spawn(async move {
-                                timeout(SHUTDOWN_GRACE,gate.check(&gate_check)).await.unwrap_or_else(|_|GateDecision::Deny {reason:"gate timeout".into()})
+                                timeout(std::time::Duration::from_secs(30),gate.check(&gate_check)).await.unwrap_or_else(|_|GateDecision::Deny {reason:"gate timeout".into()})
                             });
                             gate_checks.insert(task.id(),(rid,check));
                         }else if method!="item/tool/requestUserInput" {
@@ -388,16 +409,15 @@ async fn run(
                     writer.abort();gates.abort_all();gate_checks.clear();
                     // Leave time to reap before the contract's shutdown deadline.
                     if started.elapsed()>=SHUTDOWN_GRACE.saturating_sub(std::time::Duration::from_millis(100)) {let _=child.start_kill();}
-                    if let Ok(Some(status))=child.try_wait(){break status.code();}
                 }
+                // A dead provider must be reaped even with a stalled receiver.
+                if (shutting.is_some() || events.capacity() <= state.normalizer.closing_slots()+4) && let Ok(Some(status))=child.try_wait(){break status.code();}
             }
         }
     };
     writer.abort();
     let _ = writer.await;
-    while let Ok(Ok(line)) = ack_rx.try_recv() {
-        state.input(AdapterInput::Stdin { line });
-    }
+    // Stdin records describe ordered submissions; failed writes have diagnostics.
     gates.abort_all();
     gate_checks.clear();
     while gates.join_next().await.is_some() {}

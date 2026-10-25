@@ -120,7 +120,7 @@
   },
   {
     "type": "rate_limited",
-    "resets_at_ms": null,
+    "resets_at_ms": 1800000000000,
     "message": "quota exhausted"
   },
   {
