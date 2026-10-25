@@ -1153,3 +1153,37 @@ fn answered_input(input: &Value, answers: &[QuestionAnswer]) -> Value {
     updated["answers"] = Value::Object(map);
     updated
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn answers_are_keyed_by_question_text_with_labels_joined() {
+        let input = json!({"questions":[
+            {"question":"Pick some","options":[{"label":"A"},{"label":"B"},{"label":"C"}],"multiSelect":true},
+            {"question":"Why?","options":[]}]});
+        let answers = [
+            QuestionAnswer {
+                question_id: "q0".into(),
+                selected: vec!["o2".into(), "o0".into()],
+                text: None,
+            },
+            QuestionAnswer {
+                question_id: "q1".into(),
+                selected: vec![],
+                text: Some("because".into()),
+            },
+            QuestionAnswer {
+                question_id: "q9".into(),
+                selected: vec![],
+                text: Some("ignored".into()),
+            },
+        ];
+        let out = answered_input(&input, &answers);
+        assert_eq!(out["answers"]["Pick some"], "C, A");
+        assert_eq!(out["answers"]["Why?"], "because");
+        assert_eq!(out["answers"].as_object().unwrap().len(), 2);
+        assert_eq!(out["questions"], input["questions"]);
+    }
+}

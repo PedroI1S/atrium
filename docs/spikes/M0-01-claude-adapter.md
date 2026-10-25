@@ -1,6 +1,6 @@
 # M0-01: Claude Code adapter
 
-Status: done. Code in `spikes/agent-claude`, fixtures in `fixtures/agents/claude` (21 scenarios, all `live`, model `haiku`, `claude` 2.1.308).
+Status: done. Code in `spikes/agent-claude`, fixtures in `fixtures/agents/claude` (20 scenarios, all `live`, model `haiku`, `claude` 2.1.308).
 
 ## What was built
 

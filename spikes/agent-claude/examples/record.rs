@@ -727,7 +727,7 @@ fn merge_split_deltas(lines: &mut [FixtureLine], san: &Sanitizer) -> usize {
         };
         if !matches!(
             delta.get("type").and_then(Value::as_str),
-            Some("text_delta" | "thinking_delta")
+            Some("text_delta" | "thinking_delta" | "input_json_delta")
         ) {
             continue;
         }
@@ -750,6 +750,7 @@ fn merge_split_deltas(lines: &mut [FixtureLine], san: &Sanitizer) -> usize {
         let t = v
             .pointer("/event/delta/text")
             .or_else(|| v.pointer("/event/delta/thinking"))
+            .or_else(|| v.pointer("/event/delta/partial_json"))
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
@@ -771,11 +772,10 @@ fn merge_split_deltas(lines: &mut [FixtureLine], san: &Sanitizer) -> usize {
             } else {
                 String::new()
             };
-            let key = if v.pointer("/event/delta/text").is_some() {
-                "text"
-            } else {
-                "thinking"
-            };
+            let key = ["text", "thinking", "partial_json"]
+                .into_iter()
+                .find(|k| v.pointer(&format!("/event/delta/{k}")).is_some())
+                .unwrap_or("text");
             v["event"]["delta"][key] = Value::String(new);
             lines[i].input = AdapterInput::Stdout {
                 line: v.to_string(),
