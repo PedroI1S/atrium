@@ -131,3 +131,6 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 
 ## D-025 — 2026-10-25 — Add M0-06b (layout B, opacity, pop-out windows) to M0
 **Decided by Pedro.** M0-06 is not redone; its token system, layout mechanics and measurements stand. M0-06b de-risks what layout B adds: both opacity modes (CR-02), pop-out windows, and the performance of the floating-card look. **Worker: GPT-6.1 Sol; reviewer: Sonnet 5.5** (Pedro is short on Claude credits). Sol can't launch GUI apps in its sandbox, so the orchestrator runs the app and the measurements. Brief: `docs/agents/briefs/M0-06b-ui-shell-layout-b.md`. It runs with wave 2, so the D-021/D-022 pause still applies until Pedro says go.
+
+## D-026 — 2026-10-25 — Resume: M0-06b and M0-08 (M0-07 stays paused)
+**Pedro gave the go** to start M0-06b (Sol, reviewer Sonnet) and to resume M0-08's fix round 1 (Sonnet, from WIP `f50361e`). M0-07 stays paused (~65% done, WIP `c06628a`), and so does wave 3 (M0-09). The D-021 pause is lifted only for these two tasks.
