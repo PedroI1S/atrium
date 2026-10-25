@@ -48,6 +48,17 @@ case "$provider" in
   }
 }
 JSON
+    # agy fails OPEN if hooks.json is unreadable or malformed (M0-03 live
+    # hook-failure run on agy 1.4.7): it ignores the hook and runs every tool.
+    # Refuse to launch unless the config parses and the policy self-tests.
+    "$python" -I - "$worktree/.agents/hooks.json" <<'PY' || { echo "agy hook config invalid; not launching" >&2; exit 1; }
+import json, sys
+hook = json.load(open(sys.argv[1]))["atrium-worker-policy"]["PreToolUse"][0]
+assert hook["matcher"] == "*" and hook["hooks"][0]["type"] == "command"
+PY
+    printf '{"toolCall":{"name":"run_command","args":{"CommandLine":"git push"}},"workspacePaths":["%s"]}' "$worktree" |
+      "$python" -I "$root/scripts/agy-policy.py" | grep -q '"deny"' ||
+      { echo "agy policy self-test failed; not launching" >&2; exit 1; }
     cd "$worktree"
     exec agy -p "$prompt" --model "$model" --mode accept-edits \
       --dangerously-skip-permissions --output-format stream-json --print-timeout 0s \

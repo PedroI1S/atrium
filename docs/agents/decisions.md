@@ -78,3 +78,10 @@ GPT-6 Astra reviewed revision 1 read-only (`docs/agents/reviews/M0-contracts.md`
 - Gemini 3.8 Flash isn't affected by this decision (M0-09 stays with Flash).
 
 Both providers have limits too (Codex on ChatGPT Plus ran out on 2026-10-25), so dispatch respects them. When a worker hits a limit, it's paused and resumed after the reset, not re-routed silently.
+
+## D-016 — 2026-10-25 — `agy` fails open on a broken hook config; `agent-run` now validates it
+A live run of the M0-03 hook-failure harness on `agy` 1.4.7 (with a control case that proved tools do run) showed:
+- a broken hook **helper** fails closed: missing binary, non-zero exit, invalid JSON output, timeout;
+- a broken hook **config** fails **open**: when `hooks.json` is unreadable or malformed, `agy` ignores it, and under `--dangerously-skip-permissions` it runs every tool.
+
+This amends D-002's assumption. `scripts/agent-run` now parses the generated `hooks.json` and self-tests the policy before launching an `agy` worker, and refuses otherwise. The M0-03 adapter gets the same check (fix round 2). It's hardening, not a change to any default.
