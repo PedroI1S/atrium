@@ -189,7 +189,7 @@ export function importVscodeTheme(vs: VscodeTheme, opts: { name?: string; vibran
 
   const sem: Record<string, string> = {
     ...BASE_SEMANTIC,
-    "surface-0": toHex(s0), "surface-1": toHex(s1), "surface-2": toHex(s2), "surface-overlay": toHex(overlay),
+    "surface-0": toHex(composite(s0, base)), "surface-1": toHex(composite(s1, base)), "surface-2": toHex(composite(s2, base)), "surface-overlay": toHex(composite(overlay, base)),
     "surface-glass": toHex(withAlpha(s0, 0.72)),
     "text": toHex(text), "text-muted": toHex(muted), "text-faint": toHex(faint), "text-on-accent": toHex(onAccent),
     "border": toHex(border), "border-strong": toHex(borderStrong), "focus-ring": toHex(focus),
@@ -197,7 +197,7 @@ export function importVscodeTheme(vs: VscodeTheme, opts: { name?: string; vibran
     "danger": toHex(danger), "warning": toHex(warning), "success": toHex(success), "info": toHex(info),
     "code-bg": toHex(codeBg), "diff-add": toHex(diffAdd), "diff-del": toHex(diffDel),
     "diff-add-text": toHex(diffAddText), "diff-del-text": toHex(diffDelText), "ghost-text": toHex(ghost),
-    "state-running": "{info}", "state-needs-you": "{warning}", "state-failed": "{danger}", "state-ready": "{success}",
+    "state-running": toHex(ensureContrast(info, bgs, base, "state-running", adjustments)), "state-needs-you": toHex(ensureContrast(warning, bgs, base, "state-needs-you", adjustments)), "state-failed": toHex(ensureContrast(danger, bgs, base, "state-failed", adjustments)), "state-ready": toHex(ensureContrast(success, bgs, base, "state-ready", adjustments)),
   };
 
   const component: Record<string, string> = {};

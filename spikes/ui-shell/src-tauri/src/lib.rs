@@ -2,6 +2,8 @@
 //! tiny command surface used by the measurement harness. All UI logic is in the
 //! frontend; the Rust side only owns what the web layer cannot do.
 
+mod shell;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -44,6 +46,8 @@ struct StartupInfo {
     tab: Option<String>,
     right_tab: Option<String>,
     vibrancy_supported: bool,
+    windows: u32,
+    opacity: String,
 }
 
 #[tauri::command]
@@ -57,6 +61,10 @@ fn startup_info(boot: State<'_, Boot>) -> StartupInfo {
         open_palette: env("ATRIUM_PALETTE").is_some(),
         tab: env("ATRIUM_TAB"),
         right_tab: env("ATRIUM_RIGHT_TAB"),
+        windows: env("ATRIUM_WINDOWS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1),
+        opacity: env("ATRIUM_OPACITY").unwrap_or_else(|| "off".into()),
         vibrancy_supported: cfg!(target_os = "macos"),
     }
 }
@@ -115,12 +123,40 @@ pub fn run() {
     tauri::Builder::default()
         .manage(boot)
         .invoke_handler(tauri::generate_handler![
+            shell::opaque_accessibility,
+            shell::window_ready,
+            shell::ready_count,
+            shell::shell_snapshot,
+            shell::shell_patch,
+            shell::pop_out,
+            shell::bring_back,
+            shell::set_window_alpha,
             startup_info,
             set_vibrancy,
             write_report,
             quit
         ])
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                window
+                    .app_handle()
+                    .state::<shell::Ready>()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .remove(window.label());
+                if window.label() == "main" {
+                    window.app_handle().exit(0);
+                } else {
+                    shell::return_view(window.app_handle(), window.label());
+                }
+            }
+        })
         .setup(|app| {
+            app.manage(shell::Ready::default());
+            app.manage(shell::Shell(std::sync::Mutex::new(shell::initial(
+                app.handle(),
+            ))));
             // Vibrancy starts on; the frontend turns it off for themes that don't use it.
             #[cfg(target_os = "macos")]
             if let Some(window) = app.get_webview_window("main")

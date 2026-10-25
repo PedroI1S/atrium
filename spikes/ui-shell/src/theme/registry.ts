@@ -7,12 +7,13 @@ import { type ResolvedTheme, ThemeError, loadTheme, resolveTheme } from "./loade
 import { type ImportResult, importVscodeTheme } from "./vscode";
 
 export interface Direction {
-  id: "glass" | "flat" | "paper" | "imported";
+  id: "atrium" | "glass" | "flat" | "paper" | "imported";
   name: string;
   blurb: string;
 }
 
 export const DIRECTIONS: readonly Direction[] = [
+  { id: "atrium", name: "Calm", blurb: "Floating spaces, neutral ink" },
   { id: "glass", name: "Glass", blurb: "Native vibrancy, floating rounded panels, indigo" },
   { id: "flat", name: "Flat", blurb: "Opaque, dense hairline grid, mono labels, emerald" },
   { id: "paper", name: "Paper", blurb: "Warm editorial, serif conversation, terracotta" },

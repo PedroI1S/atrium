@@ -21,6 +21,7 @@ function minimal(overrides: { semantic?: Record<string, string | null>; primitiv
     "space-unit": "4px", "radius": "8px", "font-ui": "system-ui", "font-code": "monospace",
     "text-ui": "13px", "text-code": "12px", "motion-fast": "90ms", "motion-normal": "180ms",
   };
+  if (overrides.appearance === "light") Object.assign(semantic, { info: "#4d6684", warning: "#94540f", danger: "#ac3c33", success: "#33704a" });
   for (const [k, v] of Object.entries(overrides.semantic ?? {})) {
     if (v === null) delete semantic[k];
     else semantic[k] = v;
@@ -225,7 +226,7 @@ describe("name collisions across layers (validated variables cannot be overwritt
 
 describe("shipped themes (the CI check on the token files)", () => {
   it("ships three directions, each with dark and light", () => {
-    for (const d of ["glass", "flat", "paper"]) {
+    for (const d of ["glass", "flat", "paper", "atrium-calm"]) {
       expect(shipped).toContain(`${d}-dark.toml`);
       expect(shipped).toContain(`${d}-light.toml`);
     }
@@ -240,7 +241,7 @@ describe("shipped themes (the CI check on the token files)", () => {
     });
   }
   it("light and dark variants differ in appearance, not in structure (same token names)", () => {
-    for (const d of ["glass", "flat", "paper"]) {
+    for (const d of ["glass", "flat", "paper", "atrium-calm"]) {
       const a = loadTheme(readFileSync(join(THEMES_DIR, `${d}-dark.toml`), "utf8"), "a");
       const b = loadTheme(readFileSync(join(THEMES_DIR, `${d}-light.toml`), "utf8"), "b");
       const sem = (t: typeof a) => Object.keys(t.semantic).filter((k) => !k.startsWith("syntax")).sort();

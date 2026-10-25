@@ -94,6 +94,9 @@ export interface ResolvedTheme {
 const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
 const REF_RE = /\{([^{}]*)\}/g;
 export const AA_NORMAL = 4.5;
+export const RUNTIME_NAMES = ["window-alpha-chrome", "window-alpha-content", "window-opacity", "window-blur"];
+export const SURFACES = ["surface-0", "surface-1", "surface-2", "surface-overlay"];
+
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -223,12 +226,12 @@ export const CONTRAST_PAIRS: readonly (readonly [fg: string, bg: string])[] = [
   ["text-on-accent", "accent"],
 ];
 
-export function checkContrast(semantic: Record<string, string>, appearance: Appearance): { checks: ContrastCheck[]; issues: ThemeIssue[] } {
+export function checkContrast(semantic: Record<string, string>, appearance: Appearance, pairs: readonly (readonly [string, string])[] = CONTRAST_PAIRS): { checks: ContrastCheck[]; issues: ThemeIssue[] } {
   const base: Rgba = appearance === "dark" ? { r: 0, g: 0, b: 0, a: 1 } : { r: 255, g: 255, b: 255, a: 1 };
   const checks: ContrastCheck[] = [];
   const issues: ThemeIssue[] = [];
   const unparseable = new Set<string>();
-  for (const [fgName, bgName] of CONTRAST_PAIRS) {
+  for (const [fgName, bgName] of pairs) {
     const fgRaw = semantic[fgName];
     const bgRaw = semantic[bgName];
     if (fgRaw === undefined || bgRaw === undefined) continue; // reported as missing-token
@@ -263,8 +266,11 @@ export function loadTheme(text: string, id: string): ResolvedTheme {
  */
 export function nameCollisions(file: ThemeFile): ThemeIssue[] {
   const issues: ThemeIssue[] = [];
-  const emitted = new Map<string, string>(); // css var -> "layer.name"
-  for (const [k] of Object.entries(file.primitive)) emitted.set(`--p-${k}`, `primitive.${k}`);
+  const emitted = new Map<string, string>([...RUNTIME_NAMES, ...SURFACES.map(n => `${n}-rgb`)].map(n => [`--${n}`, "reserved runtime/derived token"])); // css var -> "layer.name"
+  for (const [k] of Object.entries(file.primitive)) {
+    if (RUNTIME_NAMES.includes(k)) issues.push({ code: "name-collision", token: k, message: `primitive.${k} is a reserved runtime token` });
+    emitted.set(`--p-${k}`, `primitive.${k}`);
+  }
   for (const layer of ["semantic", "component"] as const) {
     for (const k of Object.keys(file[layer])) {
       const css = `--${k}`;
@@ -303,5 +309,20 @@ export function resolveTheme(file: ThemeFile, id: string): ResolvedTheme {
   for (const [k, v] of Object.entries(layers.primitive)) vars[`--p-${k}`] = v;
   for (const [k, v] of Object.entries(layers.semantic)) vars[`--${k}`] = v;
   for (const [k, v] of Object.entries(layers.component)) vars[`--${k}`] = v;
+  for (const name of SURFACES) {
+    const raw = layers.semantic[name]!;
+    const color = parseColor(raw);
+    if (!/^#[0-9a-f]{6}$/i.test(raw) || !color || color.a !== 1)
+      throw new ThemeError([{ code: "invalid-value", token: name, message: `${name} must be opaque six-digit hex for surface channels` }], id);
+    vars[`--${name}-rgb`] = `${color.r} ${color.g} ${color.b}`;
+  }
+  // CR-02: state colours are text, including in imported themes.
+  {
+    const extra = checkContrast({ ...layers.semantic }, file.meta.appearance,
+      ["state-running", "state-needs-you", "state-failed", "state-ready"].flatMap(fg =>
+        ["surface-0", "surface-1", "surface-2"].map(bg => [fg, bg] as const)));
+    if (extra.issues.length) throw new ThemeError(extra.issues, id);
+    checks.push(...extra.checks);
+  }
   return { id, meta: file.meta, vars, semantic: layers.semantic, contrast: checks };
 }

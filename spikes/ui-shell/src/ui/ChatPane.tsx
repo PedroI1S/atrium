@@ -1,8 +1,9 @@
 import { createVirtualizer } from "@tanstack/solid-virtual";
 import { Check, CircleAlert, Terminal } from "lucide-solid";
-import { For, Match, Switch, createMemo, createSignal, onMount } from "solid-js";
+import { For, Match, Switch, createMemo, onMount } from "solid-js";
 import { type Message, makeTranscript, threadById } from "../data/dummy";
 import { registerScroller } from "../bench";
+import { model, patchView } from "../windows";
 import { showToast } from "../state";
 import { Composer } from "./Composer";
 
@@ -75,7 +76,7 @@ function MessageView(props: { m: Message }) {
 
 export function ChatPane(props: { threadId: string; primary?: boolean }) {
   const thread = () => threadById(props.threadId);
-  const [local, setLocal] = createSignal<Message[]>([]);
+  const local = () => model().views.chat.messages.map((text, i) => ({ kind: "user" as const, id: base().length + i, text }));
   const base = createMemo(() => transcriptFor(props.threadId));
   const all = createMemo(() => (local().length ? [...base(), ...local()] : base()));
   let scroller!: HTMLDivElement;
@@ -88,17 +89,13 @@ export function ChatPane(props: { threadId: string; primary?: boolean }) {
     overscan: 6,
   });
   onMount(() => {
-    virt.scrollToIndex(all().length - 1, { align: "end" });
+    if (model().views.chat.scroll >= 0) scroller.scrollTop = model().views.chat.scroll;
+    else virt.scrollToIndex(all().length - 1, { align: "end" });
     if (props.primary) registerScroller(scroller);
   });
   const send = (text: string) => {
-    const id = all().length;
-    setLocal((l) => [...l, { kind: "user", id, text }]);
+    void patchView("chat", { messages: [...model().views.chat.messages, text], draft: "" });
     requestAnimationFrame(() => virt.scrollToIndex(all().length - 1, { align: "end" }));
-    window.setTimeout(() => {
-      setLocal((l) => [...l, { kind: "assistant", id: id + 1, paragraphs: ["Understood. This is a dummy reply: nothing is running behind the mock."] }]);
-      requestAnimationFrame(() => virt.scrollToIndex(all().length - 1, { align: "end" }));
-    }, 350);
   };
   return (
     <section class="pane chat" aria-label={`Thread: ${thread().title}`} data-atrium-part="chat">
@@ -109,7 +106,7 @@ export function ChatPane(props: { threadId: string; primary?: boolean }) {
         <span class="side-grow" />
         <span class="pane-sub">{all().length.toLocaleString()} messages</span>
       </header>
-      <div class="chat-scroll" ref={scroller} tabindex="0" role="log" aria-label="Conversation">
+      <div class="chat-scroll" ref={scroller} onScroll={() => void patchView("chat", { scroll: scroller.scrollTop })} tabindex="0" role="log" aria-label="Conversation">
         <div class="chat-sizer" style={{ height: `${virt.getTotalSize()}px` }}>
           <For each={virt.getVirtualItems()}>
             {(item) => (

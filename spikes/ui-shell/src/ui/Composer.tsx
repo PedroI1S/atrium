@@ -1,9 +1,10 @@
 import { ArrowUp, ChevronDown, Paperclip, ShieldCheck } from "lucide-solid";
-import { createSignal } from "solid-js";
+import { model, patchView } from "../windows";
 import { markFirstInput } from "../bench";
 
 export function Composer(props: { onSend: (text: string) => void; id?: string }) {
-  const [text, setText] = createSignal("");
+  const text = () => model().views.chat.draft;
+  const setText = (draft: string) => void patchView("chat", { draft });
   let area!: HTMLTextAreaElement;
   const grow = () => {
     area.style.height = "auto";

@@ -14,9 +14,11 @@ export interface StartupInfo {
   tab: string | null;
   rightTab: string | null;
   vibrancySupported: boolean;
+  windows: number;
+  opacity: string;
 }
 
-const BROWSER_DEFAULTS: StartupInfo = { mainEpochMs: 0, benchMode: null, theme: null, preset: null, openPalette: false, tab: null, rightTab: null, vibrancySupported: false };
+const BROWSER_DEFAULTS: StartupInfo = { mainEpochMs: 0, benchMode: null, theme: null, preset: null, openPalette: false, tab: null, rightTab: null, vibrancySupported: false, windows: 1, opacity: "off" };
 
 /** Whether this platform can show native vibrancy at all (Rust says macOS only; a browser says no). */
 let vibrancyAvailable = false;

@@ -9,9 +9,9 @@ import { applyTheme } from "./theme/runtime";
 export type PresetId = "default" | "review" | "focus";
 export type RightTabId = "review" | "diff" | "browser" | "terminal" | "database";
 export const RIGHT_TABS: { id: RightTabId; label: string }[] = [
-  { id: "review", label: "Review" },
-  { id: "diff", label: "Diff" },
-  { id: "browser", label: "Browser" },
+  { id: "review", label: "Checks" },
+  { id: "diff", label: "Changes" },
+  { id: "browser", label: "Files" },
   { id: "terminal", label: "Terminal" },
   { id: "database", label: "Database" },
 ];
@@ -99,6 +99,14 @@ function layoutAnimationMs(): number {
 }
 
 let animTimer: number | undefined;
+export function floatingDefaultSizes(): number[] {
+  const style = getComputedStyle(document.documentElement);
+  const share = (token: string) => Number.parseFloat(style.getPropertyValue(token)) / window.innerWidth;
+  const sidebar = share("--sidebar-width");
+  const panel = share("--panel-width");
+  return [sidebar, 1 - sidebar - panel, panel];
+}
+
 export function applyPreset(id: PresetId, silent = false): void {
   const p = PRESETS[id];
   const split = activeTab().kind === "split";
@@ -108,7 +116,7 @@ export function applyPreset(id: PresetId, silent = false): void {
   animTimer = window.setTimeout(() => setAnimateLayout(false), layoutAnimationMs());
   batch(() => {
     setPresetId(id);
-    setOuterSizes([...p.outer]);
+    setOuterSizes(id === "default" ? floatingDefaultSizes() : [...p.outer]);
     setInnerSizes([share, 1 - share]);
     if (p.right) setRightTab(p.right);
   });

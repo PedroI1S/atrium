@@ -1,14 +1,16 @@
 // Measurement hooks. Everything here is inert unless the harness (or the palette) calls it.
 // Method and commands are documented in docs/spikes/M0-06-ui-shell.md.
 
+import { accessibilityOpaque, model, nativeError, settingsSettled } from "./windows";
 import { batch } from "solid-js";
 import { type StartupInfo, quitApp, writeReport } from "./platform";
-import { PRESETS, activateTheme, setBenchOverlay, setOuterSizes, setPaletteOpen, themeId } from "./state";
+import { floatingDefaultSizes, setBenchOverlay, setOuterSizes, setPaletteOpen, themeId } from "./state";
 
 /** Wall clock in ms with sub-millisecond resolution, comparable with the Rust side and the shell script. */
 export const epochNow = (): number => performance.timeOrigin + performance.now();
 
-export const marks: Record<string, number> = { jsStart: epochNow() };
+declare global { interface Window { __atriumJsStart?: number } }
+export const marks: Record<string, number> = { jsStart: window.__atriumJsStart ?? epochNow() };
 export const markOnce = (name: string): void => {
   if (marks[name] === undefined) marks[name] = epochNow();
 };
@@ -140,7 +142,7 @@ export async function benchScroll(pxPerSecond: number, ms = 3000): Promise<Frame
 
 /** Drives the panel sizes every frame, the same state path a pointer drag takes. */
 export async function benchResize(ms = 3000): Promise<FrameStats & { step: WorkStats }> {
-  const base = PRESETS.default.outer;
+  const base = floatingDefaultSizes();
   const costs: number[] = [];
   const stats = await sampleFrames(ms, (elapsed) => {
     const t0 = performance.now();
@@ -178,7 +180,8 @@ export async function runHarness(info: StartupInfo): Promise<void> {
   // Probe 1: a keystroke in the composer. Synthetic (dispatched from script), so it measures the
   // app's readiness to handle input, not the OS delivery path.
   const composer = document.getElementById("composer-primary") as HTMLTextAreaElement | null;
-  composer?.focus();
+  if (!composer) throw new Error("TTI probe has no primary composer");
+  composer.focus();
   const t0 = epochNow();
   composer?.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
   marks.keystrokeDispatched = t0;
@@ -186,13 +189,20 @@ export async function runHarness(info: StartupInfo): Promise<void> {
   window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
   const t1 = epochNow();
   for (let i = 0; i < 200 && !document.querySelector(".palette"); i++) await sleep(5);
+  if (!document.querySelector(".palette")) throw new Error("Palette input was not handled");
   await raf2();
   marks.paletteReady = epochNow();
   marks.paletteDispatched = t1;
   setPaletteOpen(false);
 
+  await settingsSettled();
   const report: Record<string, unknown> = {
     kind: "startup",
+    configuration: { windows: info.windows, opacity: info.opacity, settings: model().settings, readyWindows: info.windows,
+      applied: { nativeAlpha: Number(document.documentElement.dataset.nativeAlpha ?? 1),
+        chromeAlpha: Number(getComputedStyle(document.documentElement).getPropertyValue("--window-alpha-chrome")),
+        contentAlpha: Number(getComputedStyle(document.documentElement).getPropertyValue("--window-alpha-content")),
+        vibrancy: document.documentElement.dataset.vibrancy, accessibilityOpaque: accessibilityOpaque(), error: nativeError() } },
     theme: themeId(),
     marks,
     mainEpochMs: info.mainEpochMs,
@@ -210,16 +220,7 @@ export async function runHarness(info: StartupInfo): Promise<void> {
   report.scrollReading = await benchScroll(1500);
   report.scrollFling = await benchScroll(20000);
   report.resize = await benchResize();
-  // Theme swap cost: time to apply, then the frame after.
-  const swaps: number[] = [];
-  for (const id of ["flat-dark", "paper-light", "glass-dark", "imported-catppuccin-mocha", "glass-light", "glass-dark"]) {
-    const a = performance.now();
-    activateTheme(id, false);
-    await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    swaps.push(performance.now() - a);
-    await sleep(60);
-  }
-  report.themeSwapToNextFrameMs = swaps;
+  report.themeSwapToNextFrameMs = []; // Pinned configuration: do not change modes mid-run.
   report.kind = "frames";
   await writeReport(report);
   await quitApp();

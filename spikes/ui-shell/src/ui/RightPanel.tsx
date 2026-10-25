@@ -46,8 +46,7 @@ export function RightPanel() {
       </Tabs.Content>
 
       <Tabs.Content class="right-body" value="browser">
-        <div class="browser-bar"><span class="url">localhost:5173/settings</span></div>
-        <div class="placeholder">Browser pane: a CDP screencast lands here in M0-08.</div>
+        <div class="side-label">Files in this worktree</div><div class="side-row mono">crates/atrium-core/src/session.rs</div><div class="side-row mono">crates/atrium-core/tests/refresh.rs</div>
       </Tabs.Content>
 
       <Tabs.Content class="right-body flush" value="terminal">

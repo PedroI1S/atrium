@@ -15,7 +15,7 @@ DEFAULT_BIN = "src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Content
 
 # Every command pins the state the app starts in, so results never depend on what ran before
 # (the app persists the last chosen theme). Printed with every result.
-CONFIG = {"ATRIUM_THEME": "glass-dark", "ATRIUM_PRESET": "default", "ATRIUM_TAB": "auth"}
+CONFIG = {"ATRIUM_THEME": "atrium-calm-dark", "ATRIUM_PRESET": "default", "ATRIUM_TAB": "auth", "ATRIUM_WINDOWS": "1", "ATRIUM_OPACITY": "off", "ATRIUM_PALETTE": "", "ATRIUM_RIGHT_TAB": "diff"}
 
 
 def print_config(binary):
@@ -42,12 +42,30 @@ def wait_report(path, timeout=40):
     raise TimeoutError(path)
 
 
+def validate_report(r):
+    c = r["configuration"]
+    expected = int(CONFIG["ATRIUM_WINDOWS"])
+    assert c["readyWindows"] == expected and c["windows"] == expected, c
+    assert c["opacity"] == CONFIG["ATRIUM_OPACITY"], c
+    assert c["settings"]["theme"] == CONFIG["ATRIUM_THEME"], c
+    assert c["settings"]["alpha"] == (1 if c["opacity"] == "off" else 0.6), c
+    applied = c["applied"]
+    assert not applied["error"] and not applied["accessibilityOpaque"], c
+    assert applied["nativeAlpha"] == (0.6 if c["opacity"] == "whole" else 1), c
+    assert applied["chromeAlpha"] == (0.6 if c["opacity"] == "background" else 1), c
+    assert applied["contentAlpha"] == (0.74 if c["opacity"] == "background" else 1), c
+    if c["opacity"] == "background": assert applied["vibrancy"] == "true", c
+    print("verified app configuration:", json.dumps(c, sort_keys=True))
+    print("raw report:", json.dumps(r, sort_keys=True))
+
+
 def stop(p):
     p.send_signal(signal.SIGTERM)
     try:
         p.wait(timeout=5)
     except subprocess.TimeoutExpired:
         p.kill()
+        p.wait(timeout=5)
 
 
 def med(xs):
@@ -60,9 +78,12 @@ def cold(a):
     for i in range(a.runs):
         out = tempfile.mktemp(suffix=".json")
         p, t0 = launch(a.bin, {"ATRIUM_BENCH": "startup", "ATRIUM_BENCH_OUT": out})
-        r = wait_report(out)
-        stop(p)
-        os.unlink(out)
+        try:
+            r = wait_report(out)
+            validate_report(r)
+        finally:
+            stop(p)
+            if os.path.exists(out): os.unlink(out)
         m = r["marks"]
         rows.append({
             "exec_to_main": r["mainEpochMs"] - t0,
@@ -158,7 +179,7 @@ def snapshot(app_pid, resp, label):
     return total_rss, sum(fps)
 
 
-def launch_via_open(binary):
+def launch_via_open(binary, extra):
     """Launches the .app with `open -n`, which makes the app its own 'responsible process'; WebKit's
     helpers are then attributable to it exactly (a direct exec would inherit the launching terminal as
     responsible, and every other web view under it would look the same). Returns the app's pid."""
@@ -166,7 +187,7 @@ def launch_via_open(binary):
     exe = os.path.abspath(binary)
     before = {r[0] for r in ps_table() if r[3] == exe}
     cmd = ["open", "-n"]
-    for k, v in CONFIG.items():
+    for k, v in dict(CONFIG, **extra).items():
         cmd += ["--env", f"{k}={v}"]
     subprocess.check_call(cmd + [app])
     for _ in range(100):
@@ -182,18 +203,21 @@ def rss(a):
     resp = responsible_pid_fn()
     if resp is None:
         sys.exit("cannot determine helper ownership on this macOS (responsibility API missing); refusing to guess")
-    pid = launch_via_open(a.bin)
+    out = tempfile.mktemp(suffix=".json")
+    pid = launch_via_open(a.bin, {"ATRIUM_BENCH": "startup", "ATRIUM_BENCH_OUT": out})
     if resp(pid) != pid:
-        os.kill(pid, signal.SIGTERM)
+        terminate_pid(pid)
         sys.exit(f"app pid {pid} is not its own responsible process (responsible={resp(pid)}); ownership would be ambiguous")
     ok = True
     try:
+        validate_report(wait_report(out))
         time.sleep(a.settle)
         ok &= snapshot(pid, resp, f"idle {a.settle} s after launch") is not None
         time.sleep(20)
         ok &= snapshot(pid, resp, f"idle {a.settle + 20} s after launch") is not None
     finally:
-        os.kill(pid, signal.SIGTERM)
+        terminate_pid(pid)
+        if os.path.exists(out): os.unlink(out)
     if not ok:
         sys.exit(1)
 
@@ -203,9 +227,12 @@ def frames(a):
     for i in range(a.runs):
         out = tempfile.mktemp(suffix=".json")
         p, _ = launch(a.bin, {"ATRIUM_BENCH": "frames", "ATRIUM_BENCH_OUT": out})
-        r = wait_report(out, timeout=90)
-        stop(p)
-        os.unlink(out)
+        try:
+            r = wait_report(out, timeout=90)
+            validate_report(r)
+        finally:
+            stop(p)
+            if os.path.exists(out): os.unlink(out)
         print(f"--- run {i+1}  (dpr {r['dpr']}, viewport {r['viewport']})")
         for k in ("idleFrames", "scrollReading", "scrollFling", "resize"):
             s = r[k]
@@ -221,17 +248,33 @@ def frames(a):
         print("theme swap to next frame (ms):", [round(x, 1) for x in r["themeSwapToNextFrameMs"]])
 
 
+def terminate_pid(pid):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    for _ in range(50):
+        if not any(r[0] == pid for r in ps_table()): return
+        time.sleep(0.1)
+    os.kill(pid, signal.SIGKILL)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["cold", "rss", "frames"])
     ap.add_argument("--runs", type=int, default=None)
     ap.add_argument("--settle", type=int, default=10)
     ap.add_argument("--bin", default=DEFAULT_BIN)
-    ap.add_argument("--theme", default=None, help="pin the starting theme (default glass-dark)")
+    ap.add_argument("--theme", default=None, help="starting theme (default atrium-calm-dark)")
+    ap.add_argument("--windows", type=int, choices=[1, 3], default=1)
+    ap.add_argument("--opacity", choices=["off", "background", "whole"], default="off")
     a = ap.parse_args()
+    CONFIG["ATRIUM_WINDOWS"] = str(a.windows)
+    CONFIG["ATRIUM_OPACITY"] = a.opacity
     if a.theme:
         CONFIG["ATRIUM_THEME"] = a.theme
     os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     if a.runs is None:
         a.runs = 10 if a.mode == "cold" else 3
+    if a.runs < 1 or a.settle < 0: ap.error("runs must be positive; settle must be nonnegative")
     {"cold": cold, "rss": rss, "frames": frames}[a.mode](a)

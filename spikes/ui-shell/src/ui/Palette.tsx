@@ -1,3 +1,5 @@
+import { model, patchSettings, popOut } from "../windows";
+import { openFloatingInbox, toggleFloatingPanel, toggleFloatingSidebar } from "./FloatingShell";
 import { Dialog } from "@kobalte/core/dialog";
 import { CornerDownLeft } from "lucide-solid";
 import { For, createEffect, createMemo, createSignal } from "solid-js";
@@ -5,16 +7,11 @@ import { runFrameBenchesInteractive, benchResize } from "../bench";
 import {
   PRESETS,
   type PresetId,
-  activateTheme,
   applyPreset,
-  nextAttention,
   paletteOpen,
   setPaletteOpen,
   showToast,
   themes,
-  toggleAppearance,
-  toggleRightPanel,
-  toggleSidebar,
 } from "../state";
 
 interface Command {
@@ -36,15 +33,16 @@ function sections(): Section[] {
     run: () => applyPreset(id),
   }));
   const look: Command[] = [
-    ...themes().map((t) => ({ id: `theme-${t.id}`, label: `Theme: ${t.theme.meta.name}`, hint: t.theme.meta.appearance, run: () => activateTheme(t.id) })),
-    { id: "toggle-appearance", label: "Theme: toggle dark / light", hint: "⌘⇧L", run: toggleAppearance },
+    ...themes().map((t) => ({ id: `theme-${t.id}`, label: `Theme: ${t.theme.meta.name}`, hint: t.theme.meta.appearance, run: () => void patchSettings({ theme: t.id }) })),
+    { id: "toggle-appearance", label: "Theme: toggle dark / light", hint: "⌘⇧L", run: () => void patchSettings({ theme: model().settings.theme.endsWith("dark") ? "atrium-calm-light" : "atrium-calm-dark" }) },
   ];
   const actions: Command[] = [
-    { id: "next-attention", label: "Go to next item needing attention", hint: "⌘J", run: nextAttention },
+    ...(["chat", "editor", "database"] as const).map(view => ({ id: `pop-${view}`, label: `Move ${view} to New Window`, run: () => { void popOut(view); } })),
+    { id: "next-attention", label: "Go to next item needing attention", hint: "⌘J", run: openFloatingInbox },
     { id: "new-thread", label: "New thread", hint: "⌘N", run: () => showToast("New thread (dummy)") },
     { id: "quick-capture", label: "Quick capture a task", hint: "⌃⌥Space", run: () => showToast("Quick capture (dummy)") },
-    { id: "toggle-sidebar", label: "View: toggle sidebar", hint: "⌘B", run: toggleSidebar },
-    { id: "toggle-right", label: "View: toggle right panel", run: toggleRightPanel },
+    { id: "toggle-sidebar", label: "View: toggle sidebar", hint: "⌘B", run: toggleFloatingSidebar },
+    { id: "toggle-right", label: "View: toggle right panel", run: toggleFloatingPanel },
   ];
   const bench: Command[] = [
     { id: "bench-frames", label: "Dev: run frame-time benchmarks", hint: "scroll 5,000 messages + resize", run: () => void runFrameBenchesInteractive() },

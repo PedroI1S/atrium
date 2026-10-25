@@ -192,3 +192,25 @@ code {
 .icon-xs { width: var(--icon-xs); height: var(--icon-xs); }
 .icon-sm { width: var(--icon-sm); height: var(--icon-sm); }
 .icon-md { width: var(--icon-md); height: var(--icon-md); }
+
+/* CR-02 proposal: runtime alpha is independent of the theme. */
+:root {
+  --window-alpha-chrome: 1;
+  --window-alpha-content: 1;
+  --window-opacity: 1;
+  --window-blur: 0px;
+  --frame-paint: rgb(var(--surface-0-rgb) / var(--window-alpha-chrome));
+  --card-paint: rgb(var(--surface-1-rgb) / var(--window-alpha-content));
+  --overlay-paint: rgb(var(--surface-overlay-rgb) / var(--window-alpha-content));
+  --raised-paint: rgb(var(--surface-2-rgb) / var(--window-alpha-content));
+  --card-gap: 8px;
+  --card-radius: 11px;
+  --sidebar-width: 244px;
+  --panel-width: 420px;
+  --panel-strip-width: 46px;
+  --shadow-card: 0 1px 3px var(--border);
+  --chat-font-size: 14.5px;
+  --editor-line-height: 23px;
+  --editor-font-size: 13px;
+  --topic-size: 30px;
+}
