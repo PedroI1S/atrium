@@ -56,3 +56,11 @@ GPT-6 Astra reviewed revision 1 read-only (`docs/agents/reviews/M0-contracts.md`
 
 ## D-011 — 2026-10-24 — The user decides; Atrium sets safe defaults but doesn't forbid choices
 **Decided by Pedro.** Atrium ships safe defaults, but it doesn't take choices away from the user. In particular, `PermissionPolicy::FullAccess` is available on the host, not only in a sandbox. This reverses that part of revision 2 (Astra finding 1, which made `FullAccess` + local transport `Unsupported`). The gate is still called wherever an adapter can intercept, and applies whatever rules the user has set. Defaults are unchanged (`Ask` for workspace threads, `ReadOnly` for Home). Added to PLAN §0 as design principle 7.
+
+## D-012 — 2026-10-24 — Provider enforcement levels are shown to the user, never used to restrict
+**Decided by Pedro; the partner's agreement is still needed** (it sets a security/approval default, D-007).
+- Each provider gets an enforcement level from the M0 enforcement matrix: *Full* (every tool call passes the gate) or *Partial* (only what the provider asks about).
+- The level is shown in the provider picker, the thread header and *Settings → Agents*, with an explanation and the matrix.
+- Atrium never blocks, downgrades or forces a sandbox on a provider because of its level.
+- Rules and the hard-deny list still apply to every call the gate sees.
+- PLAN §3.12 updated, which also adds the *Full access* preset from D-011.

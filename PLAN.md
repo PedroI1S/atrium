@@ -310,8 +310,14 @@ url     = "http://localhost:$PORT"
   - *Careful*: ask for everything except reads.
   - *Normal*: edits auto-allowed, commands ask unless a rule matches.
   - *Trusted*: everything except the deny list.
+  - *Full access*: the provider's own full-access mode, with no provider prompts, on the host or in a sandbox. It's the user's choice (principle 7, D-011), never a default. Atrium's gate still sees whatever the adapter can intercept.
 - **Hard-deny list** that no rule overrides, e.g. `rm -rf` outside the worktree, force-push to protected branches, reading credential stores, `curl | sh` outside a sandbox. A hard-denied action can instead be offered as "run it in a sandbox" when the sandbox is available.
-- **Enforcement per provider**: Claude via `can_use_tool` responses, Codex via app-server approval responses, ACP via permission requests.
+- **Enforcement per provider**: every adapter routes each tool call it can intercept through Atrium's policy gate *before* it runs (Claude: a per-session `PreToolUse` hook and `can_use_tool`; Codex: app-server approval requests; `agy`: the per-session hook bridge; ACP: permission requests, plus the client fs/terminal capabilities). How much each provider exposes differs, measured in M0 as an enforcement matrix per adapter.
+- **Enforcement levels are shown, not imposed** (D-012). Each provider has a level:
+  - *Full*: every tool call passes the gate.
+  - *Partial*: only what the provider asks about passes the gate. Some reads or commands run unchecked; which ones comes from the M0 matrix.
+
+  The level appears in the provider picker, the thread header and in settings (*Settings → Agents → <provider>*), with a one-line explanation and a "details" link to the matrix. Atrium **never blocks or downgrades** a provider because of its level. It doesn't push you toward the sandbox either, beyond mentioning that it exists. Rules and the hard-deny list apply to every call the gate sees, whatever the level.
 
 ### 3.13 Browser (`atrium-browser`)
 
