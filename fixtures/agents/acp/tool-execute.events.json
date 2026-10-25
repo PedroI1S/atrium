@@ -1,0 +1,225 @@
+[
+  {
+    "type": "session_started",
+    "provider": "acp",
+    "native_session_id": "ses_e8daaefe7ffeFAtV94I04QEXgA",
+    "model": "opencode/deepseek-v4.1-flash-free",
+    "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8daaefe7ffeFAtV94I04QEXgA",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": "The user asks me to use my \"execute\" tool to run JavaScript. I don't have an execute tool listed. My tools include shell"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": ", but not execute. The instruction says: if you have no execute tool, say so"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": ".\n\nI should say I don't have an execute tool. I could offer shell. Let me just check — no execute"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": " tool available. I should be honest and state that. I could run shell to compute it, but the user specifically asked for"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": " execute tool and to say so if unavailable.\n\nBest: say I don't have an execute tool, but I do"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": " have shell, and offer/do the computation. The instruction says \"If you have no execute tool, say so.\" I'll say so and note I"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": " can use shell instead. Let me run it with shell to be helpful? That might be fine, but I should be clear it wasn"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": "'t via execute. I'll just answer, and maybe offer.\n\nI'll run shell quickly? The user asked"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": " a specific thing. Doing it via shell is helpful and transparent. But ze said \"say so\" if absent. I"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": "'ll say so and provide the answer via shell, clearly labeled.\n\nI think just saying so is cleanest, maybe"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": " with the offer. But being helpful: compute with shell and note it's not execute."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg:reasoning:0",
+    "kind": "reasoning",
+    "text": "The user asks me to use my \"execute\" tool to run JavaScript. I don't have an execute tool listed. My tools include shell, but not execute. The instruction says: if you have no execute tool, say so.\n\nI should say I don't have an execute tool. I could offer shell. Let me just check — no execute tool available. I should be honest and state that. I could run shell to compute it, but the user specifically asked for execute tool and to say so if unavailable.\n\nBest: say I don't have an execute tool, but I do have shell, and offer/do the computation. The instruction says \"If you have no execute tool, say so.\" I'll say so and note I can use shell instead. Let me run it with shell to be helpful? That might be fine, but I should be clear it wasn't via execute. I'll just answer, and maybe offer.\n\nI'll run shell quickly? The user asked a specific thing. Doing it via shell is helpful and transparent. But ze said \"say so\" if absent. I'll say so and provide the answer via shell, clearly labeled.\n\nI think just saying so is cleanest, maybe with the offer. But being helpful: compute with shell and note it's not execute."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg",
+    "kind": "assistant",
+    "text": "I don't have an `execute` tool in this session. My available tools are file tools"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg",
+    "kind": "assistant",
+    "text": " (read/write/edit/glob/grep), `shell`, `webfetch`/`websearch`, `question`, `skill`, and `subagent"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg",
+    "kind": "assistant",
+    "text": "`.\n\nI can still compute it via the shell, if useful:"
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1725510390019tUwrCyM2rrTZg",
+    "kind": "assistant",
+    "text": "I don't have an `execute` tool in this session. My available tools are file tools (read/write/edit/glob/grep), `shell`, `webfetch`/`websearch`, `question`, `skill`, and `subagent`.\n\nI can still compute it via the shell, if useful:"
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "call_00_227lwavarij16nx4u3hmiya0",
+    "name": "shell",
+    "kind": "execute",
+    "title": "shell",
+    "input": {
+      "cwd": "/scratch"
+    }
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_00_227lwavarij16nx4u3hmiya0",
+    "title": "node -e 'console.log(6 * 7)'",
+    "kind": "execute",
+    "input": {
+      "command": "node -e 'console.log(6 * 7)'",
+      "cwd": "/scratch"
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_00_227lwavarij16nx4u3hmiya0",
+    "title": "node -e 'console.log(6 * 7)'",
+    "kind": "execute",
+    "input": {
+      "command": "node -e 'console.log(6 * 7)'",
+      "cwd": "/scratch"
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "call_00_227lwavarij16nx4u3hmiya0",
+    "status": "succeeded",
+    "output": "42\n",
+    "error": null
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_172551ea0001ZGdf0mFu11nWZZ",
+    "kind": "assistant",
+    "text": "The result is **42** — but to be clear, that came from `node`"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_172551ea0001ZGdf0mFu11nWZZ",
+    "kind": "assistant",
+    "text": " via the `shell` tool, not from an `execute` tool, which I don't have."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 7126,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_172551ea0001ZGdf0mFu11nWZZ",
+    "kind": "assistant",
+    "text": "The result is **42** — but to be clear, that came from `node` via the `shell` tool, not from an `execute` tool, which I don't have."
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 5079,
+      "output_tokens": 152,
+      "cache_read_tokens": 8704,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 263,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]
