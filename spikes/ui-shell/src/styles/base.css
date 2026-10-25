@@ -1,0 +1,159 @@
+/* Base: reset, window frame, and the component-token defaults.
+ *
+ * Rule: nothing in this folder uses a literal colour, radius, font or duration. Components read
+ * semantic tokens (--surface-1, --text-muted, ...) and component tokens (--tab-active-bg, ...).
+ * The component tokens below are DEFAULTS built from semantic tokens; a theme may override any of
+ * them in its [component] table (the loader sets them inline on :root, which wins over this rule).
+ */
+
+:root {
+  /* layout shape (Glass floats panels with a gap; Flat and Paper run edge to edge) */
+  --panel-gap: 0px;
+  --panel-radius: 0px;
+  --glass-blur: 0px;
+  --handle-size: 7px;
+
+  /* chrome */
+  --strip-height: 44px;
+  --strip-bg: var(--surface-glass);
+  --sidebar-bg: var(--surface-glass);
+  --pane-bg: var(--surface-1);
+  --pane-border: var(--border);
+  --pane-head-bg: transparent;
+
+  /* tabs */
+  --tab-height: 30px;
+  --tab-radius: calc(var(--radius) * 0.75);
+  --tab-bg: transparent;
+  --tab-hover-bg: var(--accent-muted);
+  --tab-active-bg: var(--surface-2);
+  --tab-active-fg: var(--text);
+  --tab-fg: var(--text-muted);
+
+  /* conversation */
+  --chat-font: var(--font-ui);
+  --chat-text-size: var(--text-ui);
+  --chat-line-height: 1.5;
+  --chat-measure: 100%;
+  --message-padding-y: 6px;
+  --bubble-user-bg: var(--accent-muted);
+  --bubble-user-fg: var(--text);
+  --tool-bg: var(--surface-2);
+
+  /* composer */
+  --composer-bg: var(--surface-2);
+  --composer-radius: calc(var(--radius) * 1.25);
+  --composer-border: var(--border-strong);
+
+  /* badges and labels */
+  --badge-bg: var(--accent);
+  --badge-fg: var(--text-on-accent);
+  --badge-font: var(--font-ui);
+  --label-font: var(--font-ui);
+  --label-transform: none;
+
+  /* overlays */
+  --palette-bg: var(--surface-overlay);
+  --palette-radius: calc(var(--radius) * 1.25);
+  --palette-blur: var(--glass-blur);
+  --scrim: rgba(0, 0, 0, 0.32);
+  --shadow-overlay: 0 24px 64px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--border-strong);
+
+  /* syntax (a theme's [component] table overrides these; the VS Code import fills them from tokenColors) */
+  --syntax-keyword: var(--accent);
+  --syntax-string: var(--success);
+  --syntax-number: var(--warning);
+  --syntax-comment: var(--text-faint);
+  --syntax-function: var(--info);
+  --syntax-type: var(--warning);
+  --syntax-variable: var(--text);
+  --syntax-property: var(--info);
+  --syntax-punctuation: var(--text-muted);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  /* The window is transparent so native vibrancy can show through. Opaque themes paint .app. */
+  background: transparent;
+  color: var(--text);
+  font: 400 var(--text-ui) / 1.4 var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: default;
+}
+textarea {
+  font: inherit;
+  color: inherit;
+}
+pre,
+code {
+  font-family: var(--font-code);
+}
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.mono {
+  font-family: var(--font-code);
+}
+.muted {
+  color: var(--text-muted);
+}
+
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-0);
+}
+:root[data-vibrancy="true"] .app {
+  background: transparent;
+}
+
+/* Themes swap in one cut; no 200 ms colour smear across the whole window. */
+:root[data-theme-switching] * {
+  transition: none !important;
+}
+
+/* Reduced motion: no transitions, no animation (PLAN 3.20). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
+}

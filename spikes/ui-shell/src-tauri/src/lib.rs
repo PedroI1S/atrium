@@ -122,12 +122,14 @@ pub fn run() {
             // Vibrancy starts on; the frontend turns it off for themes that don't use it.
             #[cfg(target_os = "macos")]
             if let Some(window) = app.get_webview_window("main") {
-                let _ = apply_vibrancy(
+                if let Err(e) = apply_vibrancy(
                     &window,
                     NSVisualEffectMaterial::UnderWindowBackground,
                     Some(NSVisualEffectState::Active),
                     Some(WINDOW_CORNER_RADIUS),
-                );
+                ) {
+                    eprintln!("apply_vibrancy failed: {e}");
+                }
             }
             let _ = app;
             Ok(())
