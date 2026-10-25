@@ -104,3 +104,17 @@ This amends D-002's assumption. `scripts/agent-run` now parses the generated `ho
 - **Unaffected by the choice**: the contracts, the four agent adapters, the daemon/client and most of the CDP client (all UI-agnostic Rust, ~32k lines).
 - **Affected**: the M0-06 shell code (the token design survives), M0-07's IPC question, M0-08's frontend, and the PLAN's web-library assumptions (CodeMirror, xterm.js, Shiki, elkjs, Kobalte/Corvu, CSS theming).
 - **The orchestrator's recommendation** if GPUI stays on the table: a GPUI shell spike mirroring M0-06's checks (tokens, panes, 5k-message transcript, TTI and memory, plus screencast frames as images) before deciding. MonoCode's own Tauri→GPUI migration (`mc/migrate-monocode-to-gpui`) is prior art.
+
+## D-022 — 2026-10-25 — Stay on Tauri for now
+**Decided by Pedro**, after the GPUI discussion (D-021). Tauri 2 + SolidJS stays the UI stack for v1. The UI layer stays thin and the daemon protocol clean, so a native (GPUI) client remains possible later. The pause from D-021 stays in effect until Pedro says to resume: wave 2 (M0-07, M0-08) waits on his go.
+
+## D-023 — 2026-10-25 — UI design direction (input for the design session)
+**Pedro's requirements**, replacing the M0-06 directions, none of which he liked:
+- Minimalist, light, calm, easy on the eyes; not overwhelming.
+- Progressive disclosure: deep customization exists but appears only when you look for it.
+- Settings: a simple view of the essentials; **Advanced** opens as a side pane, never a large popup full of information; extensible, so features add sections without clutter.
+- Any chat, editor or database view can become **its own window** if wanted.
+- Chats can be **organized by topic/theme** (groups or folders).
+- **Window opacity setting**: fundamental, many users want it.
+
+**Next step (not started; waits on Pedro's go)**: an Opus design session produces a clickable design artifact with 3–4 layout options (sidebar and chat grouping, settings plus the advanced pane, a popped-out window, light and dark). Pedro picks; the result becomes the M1 UI spec and token values (PLAN §3.20).

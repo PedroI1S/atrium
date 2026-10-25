@@ -25,6 +25,8 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 
 ## Conventions
 
+- **Stopping a worker doesn't stop what it launched.** Background processes (bench loops, dev servers, apps, browsers) keep running, and they keep relaunching windows. After stopping or pausing a worker, the orchestrator finds and stops every process started from that worktree (`ps` matching the worktree path, the task id, and the spike's app/binary names), and tells the worker to clean up when it resumes. Workers stop their own background processes before finishing.
+
 - **Shells**: Pedro's interactive shell is **fish**. The agents' shell tool runs zsh and reports `$SHELL=/bin/zsh`, so don't trust `$SHELL`.
   - Commands an agent runs itself can be zsh/POSIX.
   - Code never relies on the user's shell: scripts use `#!/usr/bin/env bash`.
