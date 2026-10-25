@@ -2,9 +2,37 @@
   {
     "type": "session_started",
     "provider": "acp",
-    "native_session_id": "ses_simple_01",
-    "model": "anthropic/claude-haiku-4-5",
+    "native_session_id": "ses_e8db26bf7ffeRi0DPch0v2Oi65",
+    "model": "opencode/deepseek-v4.1-flash-free",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db26bf7ffeRi0DPch0v2Oi65",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
   },
   {
     "type": "turn_started",
@@ -12,27 +40,44 @@
   },
   {
     "type": "message_delta",
-    "message_id": "msg-1",
+    "message_id": "msg_1724d941d001JSwOZmlB1WCcV5",
     "kind": "assistant",
-    "text": "4"
+    "text": "Hello! I'm ready to help you with"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724d941d001JSwOZmlB1WCcV5",
+    "kind": "assistant",
+    "text": " whatever you need."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8081,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
   },
   {
     "type": "message_completed",
-    "message_id": "msg-1",
+    "message_id": "msg_1724d941d001JSwOZmlB1WCcV5",
     "kind": "assistant",
-    "text": "4"
+    "text": "Hello! I'm ready to help you with whatever you need."
   },
   {
     "type": "turn_completed",
     "turn": 1,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 28,
-      "output_tokens": 4,
-      "cache_read_tokens": null,
+      "input_tokens": 3971,
+      "output_tokens": 14,
+      "cache_read_tokens": 4096,
       "cache_write_tokens": null,
       "reasoning_tokens": null,
-      "cost_usd": null
+      "cost_usd": 0.0
     }
   },
   {

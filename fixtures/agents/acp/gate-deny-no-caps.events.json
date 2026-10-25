@@ -1,0 +1,123 @@
+[
+  {
+    "type": "session_started",
+    "provider": "acp",
+    "native_session_id": "ses_e8db17f85ffeMVwxhsXcz6v6PV",
+    "model": "opencode/deepseek-v4.1-flash-free",
+    "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db17f85ffeMVwxhsXcz6v6PV",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e808b001qco6G58tkZDtvO",
+    "kind": "assistant",
+    "text": "I'll read the file for"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e808b001qco6G58tkZDtvO",
+    "kind": "assistant",
+    "text": " you."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724e808b001qco6G58tkZDtvO",
+    "kind": "assistant",
+    "text": "I'll read the file for you."
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "call_a3af8a28a34b4bb4a37dbae0",
+    "name": "read",
+    "kind": "read",
+    "title": "read",
+    "input": {}
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_a3af8a28a34b4bb4a37dbae0",
+    "title": "read",
+    "kind": "read",
+    "input": {
+      "path": "/scratch/secret.txt"
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_a3af8a28a34b4bb4a37dbae0",
+    "title": "/scratch/secret.txt",
+    "kind": null,
+    "input": null,
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "call_a3af8a28a34b4bb4a37dbae0",
+    "status": "denied",
+    "output": null,
+    "error": "denied by Atrium policy: secret.txt is restricted"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8220,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "interrupted",
+    "usage": {
+      "input_tokens": 5313,
+      "output_tokens": 91,
+      "cache_read_tokens": 2816,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

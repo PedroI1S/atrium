@@ -2,17 +2,57 @@
   {
     "type": "session_started",
     "provider": "acp",
-    "native_session_id": "ses_hm_gate_deny",
+    "native_session_id": "ses_e8db24f63ffeS0pU8jRKt2zIDb",
     "model": "opencode/deepseek-v4.1-flash-free",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db24f63ffeS0pU8jRKt2zIDb",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_delta",
+    "message_id": "msg_1724db0b0001C3GyLPr0aeqvMv",
+    "kind": "assistant",
+    "text": "I'll read that file."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724db0b0001C3GyLPr0aeqvMv",
+    "kind": "assistant",
+    "text": "I'll read that file."
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "call_1",
+    "call_id": "call_00_eyietqot0tsp9im0pv0p9l6q",
     "name": "read",
     "kind": "read",
     "title": "read",
@@ -20,9 +60,9 @@
   },
   {
     "type": "tool_call_updated",
-    "call_id": "call_1",
-    "title": null,
-    "kind": null,
+    "call_id": "call_00_eyietqot0tsp9im0pv0p9l6q",
+    "title": "read",
+    "kind": "read",
     "input": {
       "path": "/scratch/secret.txt"
     },
@@ -30,22 +70,25 @@
     "output": null
   },
   {
+    "type": "tool_call_updated",
+    "call_id": "call_00_eyietqot0tsp9im0pv0p9l6q",
+    "title": "/scratch/secret.txt",
+    "kind": null,
+    "input": null,
+    "output_delta": null,
+    "output": null
+  },
+  {
     "type": "tool_call_finished",
-    "call_id": "call_1",
+    "call_id": "call_00_eyietqot0tsp9im0pv0p9l6q",
     "status": "denied",
     "output": null,
     "error": "denied by Atrium policy: secret.txt is restricted"
   },
   {
-    "type": "message_delta",
-    "message_id": "msg-1",
-    "kind": "assistant",
-    "text": "I could not read secret.txt: access was denied."
-  },
-  {
     "type": "usage",
     "usage": {
-      "input_tokens": 8300,
+      "input_tokens": 8156,
       "output_tokens": null,
       "cache_read_tokens": null,
       "cache_write_tokens": null,
@@ -54,19 +97,13 @@
     }
   },
   {
-    "type": "message_completed",
-    "message_id": "msg-1",
-    "kind": "assistant",
-    "text": "I could not read secret.txt: access was denied."
-  },
-  {
     "type": "turn_completed",
     "turn": 1,
-    "outcome": "completed",
+    "outcome": "interrupted",
     "usage": {
-      "input_tokens": 3900,
-      "output_tokens": 110,
-      "cache_read_tokens": null,
+      "input_tokens": 3972,
+      "output_tokens": 88,
+      "cache_read_tokens": 4096,
       "cache_write_tokens": null,
       "reasoning_tokens": null,
       "cost_usd": 0.0

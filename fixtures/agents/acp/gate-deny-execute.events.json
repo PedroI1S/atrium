@@ -2,27 +2,69 @@
   {
     "type": "session_started",
     "provider": "acp",
-    "native_session_id": "ses_hm_gate_deny_exec",
+    "native_session_id": "ses_e8db24526ffe2SmQVGEDGV4EFz",
     "model": "opencode/deepseek-v4.1-flash-free",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db24526ffe2SmQVGEDGV4EFz",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_delta",
+    "message_id": "msg_1724dbaec001xHNmhg5ARapxsc:reasoning:0",
+    "kind": "reasoning",
+    "text": "The user wants me to run `cat secret.txt`. Simple. Let me check the working directory."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724dbaec001xHNmhg5ARapxsc:reasoning:0",
+    "kind": "reasoning",
+    "text": "The user wants me to run `cat secret.txt`. Simple. Let me check the working directory."
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "call_1",
+    "call_id": "call_00_rjjuokvk0d26emvaa6fe41qy",
     "name": "shell",
     "kind": "execute",
     "title": "shell",
-    "input": {}
+    "input": {
+      "cwd": "/scratch"
+    }
   },
   {
     "type": "tool_call_updated",
-    "call_id": "call_1",
+    "call_id": "call_00_rjjuokvk0d26emvaa6fe41qy",
     "title": "cat secret.txt",
-    "kind": null,
+    "kind": "execute",
     "input": {
       "command": "cat secret.txt",
       "cwd": "/scratch"
@@ -32,21 +74,15 @@
   },
   {
     "type": "tool_call_finished",
-    "call_id": "call_1",
+    "call_id": "call_00_rjjuokvk0d26emvaa6fe41qy",
     "status": "denied",
     "output": null,
     "error": "denied by Atrium policy: shell execution blocked"
   },
   {
-    "type": "message_delta",
-    "message_id": "msg-1",
-    "kind": "assistant",
-    "text": "I could not run the command: it was denied."
-  },
-  {
     "type": "usage",
     "usage": {
-      "input_tokens": 8300,
+      "input_tokens": 8127,
       "output_tokens": null,
       "cache_read_tokens": null,
       "cache_write_tokens": null,
@@ -55,21 +91,15 @@
     }
   },
   {
-    "type": "message_completed",
-    "message_id": "msg-1",
-    "kind": "assistant",
-    "text": "I could not run the command: it was denied."
-  },
-  {
     "type": "turn_completed",
     "turn": 1,
-    "outcome": "completed",
+    "outcome": "interrupted",
     "usage": {
-      "input_tokens": 3900,
-      "output_tokens": 110,
-      "cache_read_tokens": null,
+      "input_tokens": 3588,
+      "output_tokens": 39,
+      "cache_read_tokens": 4480,
       "cache_write_tokens": null,
-      "reasoning_tokens": null,
+      "reasoning_tokens": 20,
       "cost_usd": 0.0
     }
   },

@@ -1,0 +1,148 @@
+[
+  {
+    "type": "session_started",
+    "provider": "acp",
+    "native_session_id": "ses_e8db1c61dffeRdO4xE1Y9pY1av",
+    "model": "opencode/deepseek-v4.1-flash-free",
+    "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db1c61dffeRdO4xE1Y9pY1av",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e39fc001kBjLqqjA9aQx4g",
+    "kind": "assistant",
+    "text": "I'll search for the word 'sensitive' in the files here."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724e39fc001kBjLqqjA9aQx4g",
+    "kind": "assistant",
+    "text": "I'll search for the word 'sensitive' in the files here."
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "call_00_uaausn2qrpc8u8idujqhvxhz",
+    "name": "grep",
+    "kind": "search",
+    "title": "grep",
+    "input": {}
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_00_uaausn2qrpc8u8idujqhvxhz",
+    "title": "grep",
+    "kind": "search",
+    "input": {
+      "path": "/scratch",
+      "pattern": "sensitive"
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_00_uaausn2qrpc8u8idujqhvxhz",
+    "title": "sensitive",
+    "kind": null,
+    "input": null,
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "call_00_uaausn2qrpc8u8idujqhvxhz",
+    "status": "succeeded",
+    "output": "Found 1 matches\n/scratch/notes.txt:\n  Line 1: nothing sensitive here\n",
+    "error": null
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e426d001tfAuGgs5Zyb5Tp:reasoning:0",
+    "kind": "reasoning",
+    "text": "Simple. Report the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e426d001tfAuGgs5Zyb5Tp:reasoning:0",
+    "kind": "reasoning",
+    "text": " result."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724e426d001tfAuGgs5Zyb5Tp:reasoning:0",
+    "kind": "reasoning",
+    "text": "Simple. Report the result."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e426d001tfAuGgs5Zyb5Tp",
+    "kind": "assistant",
+    "text": "Only one file contains it:\n\n- **`notes.txt`** — line 1: `nothing sensitive here`\n\nJust that single match, case-sensitive lowercase."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8307,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724e426d001tfAuGgs5Zyb5Tp",
+    "kind": "assistant",
+    "text": "Only one file contains it:\n\n- **`notes.txt`** — line 1: `nothing sensitive here`\n\nJust that single match, case-sensitive lowercase."
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 3805,
+      "output_tokens": 145,
+      "cache_read_tokens": 12544,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 6,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

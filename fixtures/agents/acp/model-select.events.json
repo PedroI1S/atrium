@@ -2,9 +2,37 @@
   {
     "type": "session_started",
     "provider": "acp",
-    "native_session_id": "ses_hm_model",
+    "native_session_id": "ses_e8db1d5f8ffeyzOw3llXYF7kaM",
     "model": "opencode/big-pickle",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db1d5f8ffeyzOw3llXYF7kaM",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
   },
   {
     "type": "turn_started",
@@ -12,27 +40,38 @@
   },
   {
     "type": "message_delta",
-    "message_id": "msg-1",
+    "message_id": "msg_1724e2a1e001GionRFa2ICFmo3",
     "kind": "assistant",
-    "text": "Hello."
+    "text": "Hello there!"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 6974,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
   },
   {
     "type": "message_completed",
-    "message_id": "msg-1",
+    "message_id": "msg_1724e2a1e001GionRFa2ICFmo3",
     "kind": "assistant",
-    "text": "Hello."
+    "text": "Hello there!"
   },
   {
     "type": "turn_completed",
     "turn": 1,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 10,
-      "output_tokens": 2,
-      "cache_read_tokens": null,
+      "input_tokens": 5924,
+      "output_tokens": 10,
+      "cache_read_tokens": 1017,
       "cache_write_tokens": null,
-      "reasoning_tokens": null,
-      "cost_usd": null
+      "reasoning_tokens": 23,
+      "cost_usd": 0.0
     }
   },
   {

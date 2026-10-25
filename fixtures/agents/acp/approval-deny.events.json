@@ -2,71 +2,129 @@
   {
     "type": "session_started",
     "provider": "acp",
-    "native_session_id": "ses_approval_deny_01",
-    "model": "anthropic/claude-haiku-4-5",
+    "native_session_id": "ses_e8db22730ffeTyLpJybw2L55AV",
+    "model": "opencode/deepseek-v4.1-flash-free",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db22730ffeTyLpJybw2L55AV",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_delta",
+    "message_id": "msg_1724dd8e2001W1X3HwM6JLiE87:reasoning:0",
+    "kind": "reasoning",
+    "text": "The user wants me to write 'blocked' to production.conf. Working directory is a temp dir. Let me check if the"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724dd8e2001W1X3HwM6JLiE87:reasoning:0",
+    "kind": "reasoning",
+    "text": " file exists. This seems potentially a test of whether I'll overwrite something. Let's look."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724dd8e2001W1X3HwM6JLiE87:reasoning:0",
+    "kind": "reasoning",
+    "text": "The user wants me to write 'blocked' to production.conf. Working directory is a temp dir. Let me check if the file exists. This seems potentially a test of whether I'll overwrite something. Let's look."
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "call_bash_deny_1",
-    "name": "bash",
+    "call_id": "call_00_qamw8ulq4f46r2dpzwpwuvab",
+    "name": "shell",
     "kind": "execute",
-    "title": "rm -rf build",
+    "title": "shell",
     "input": {
-      "command": "rm -rf build"
+      "cwd": "/scratch"
     }
   },
   {
-    "type": "approval_requested",
-    "request_id": "perm-deny-1",
-    "call_id": "call_bash_deny_1",
-    "name": "bash",
+    "type": "tool_call_updated",
+    "call_id": "call_00_qamw8ulq4f46r2dpzwpwuvab",
+    "title": "ls -la; echo \"---\"; cat production.conf 2>/dev/null",
     "kind": "execute",
-    "title": "rm -rf build",
     "input": {
-      "command": "rm -rf build"
+      "command": "ls -la; echo \"---\"; cat production.conf 2>/dev/null",
+      "cwd": "/scratch"
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "approval_requested",
+    "request_id": "0",
+    "call_id": "call_00_qamw8ulq4f46r2dpzwpwuvab",
+    "name": "shell",
+    "kind": "execute",
+    "title": "ls -la; echo \"---\"; cat production.conf 2>/dev/null",
+    "input": {
+      "command": "ls -la; echo \"---\"; cat production.conf 2>/dev/null",
+      "cwd": "/scratch"
     },
     "reason": null
   },
   {
     "type": "request_resolved",
-    "request_id": "perm-deny-1",
+    "request_id": "0",
     "outcome": "denied"
   },
   {
     "type": "tool_call_finished",
-    "call_id": "call_bash_deny_1",
+    "call_id": "call_00_qamw8ulq4f46r2dpzwpwuvab",
     "status": "denied",
     "output": null,
-    "error": "destructive command rejected by user"
+    "error": "Rejected by user during recording"
   },
   {
-    "type": "message_delta",
-    "message_id": "msg-1",
-    "kind": "assistant",
-    "text": "Understood, I did not run `rm -rf build`."
-  },
-  {
-    "type": "message_completed",
-    "message_id": "msg-1",
-    "kind": "assistant",
-    "text": "Understood, I did not run `rm -rf build`."
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8166,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
   },
   {
     "type": "turn_completed",
     "turn": 1,
-    "outcome": "completed",
+    "outcome": "interrupted",
     "usage": {
-      "input_tokens": 82,
-      "output_tokens": 23,
-      "cache_read_tokens": null,
+      "input_tokens": 3972,
+      "output_tokens": 52,
+      "cache_read_tokens": 4096,
       "cache_write_tokens": null,
-      "reasoning_tokens": null,
-      "cost_usd": null
+      "reasoning_tokens": 46,
+      "cost_usd": 0.0
     }
   },
   {

@@ -1,0 +1,123 @@
+[
+  {
+    "type": "session_started",
+    "provider": "acp",
+    "native_session_id": "ses_e8db16a87ffeIzo4EylLGnrkRM",
+    "model": "opencode/deepseek-v4.1-flash-free",
+    "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db16a87ffeIzo4EylLGnrkRM",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e958b00154rWgpr96hytZJ:reasoning:0",
+    "kind": "reasoning",
+    "text": "The user wants me to run cat secret.txt. This is a simple request. But is it a secret exfiltration concern"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e958b00154rWgpr96hytZJ:reasoning:0",
+    "kind": "reasoning",
+    "text": "? The file is in the working directory. The user is the one asking. It's their machine. Let me just check"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e958b00154rWgpr96hytZJ:reasoning:0",
+    "kind": "reasoning",
+    "text": " the directory first maybe. Just run it.\n\nLet me run the command."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724e958b00154rWgpr96hytZJ:reasoning:0",
+    "kind": "reasoning",
+    "text": "The user wants me to run cat secret.txt. This is a simple request. But is it a secret exfiltration concern? The file is in the working directory. The user is the one asking. It's their machine. Let me just check the directory first maybe. Just run it.\n\nLet me run the command."
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "call_00_0wjlutwgni3i6xuw61ak9u9s",
+    "name": "shell",
+    "kind": "execute",
+    "title": "shell",
+    "input": {
+      "cwd": "/scratch"
+    }
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_00_0wjlutwgni3i6xuw61ak9u9s",
+    "title": "cat secret.txt",
+    "kind": "execute",
+    "input": {
+      "command": "cat secret.txt",
+      "cwd": "/scratch"
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "call_00_0wjlutwgni3i6xuw61ak9u9s",
+    "status": "denied",
+    "output": null,
+    "error": "denied by Atrium policy: shell execution blocked"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8172,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "interrupted",
+    "usage": {
+      "input_tokens": 3588,
+      "output_tokens": 39,
+      "cache_read_tokens": 4480,
+      "cache_write_tokens": null,
+      "reasoning_tokens": 65,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

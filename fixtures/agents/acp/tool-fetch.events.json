@@ -1,0 +1,226 @@
+[
+  {
+    "type": "session_started",
+    "provider": "acp",
+    "native_session_id": "ses_e8db1b2bdffeykcn2aZzNuxRYl",
+    "model": "opencode/deepseek-v4.1-flash-free",
+    "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db1b2bdffeykcn2aZzNuxRYl",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": "The"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": " user asks to fetch https://example.com and tell the page title. I have webfetch tool available directly. But note the Code Mode instructions:"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": " tools listed"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": " in catalog are opencode tools only... Actually the system prompt says \"Use the `"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": "execute` tool to call the tools listed below. They cannot be called directly.\" Then"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": " lists only open"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": "code tools. But the harness also provides webfetch, read"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": ", etc. as direct tools. Hmm, conflicting"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": ". The \"Available"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": " tools\" in"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": " code mode catalog lists open"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": "code tools only. But the outer tool list includes webfetch, websearch, etc. The instruction says call tools through execute. But"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": " webfetch is not in the Code Mode catalog... Within execute, I could use `fetch` for HTTP requests. That"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": "'s the cleanest.\n\nLet me use execute with fetch to get https://example.com and extract title"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": "."
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724e4d5b0017Pvds5ZjJ275nS:reasoning:0",
+    "kind": "reasoning",
+    "text": "The user asks to fetch https://example.com and tell the page title. I have webfetch tool available directly. But note the Code Mode instructions: tools listed in catalog are opencode tools only... Actually the system prompt says \"Use the `execute` tool to call the tools listed below. They cannot be called directly.\" Then lists only opencode tools. But the harness also provides webfetch, read, etc. as direct tools. Hmm, conflicting. The \"Available tools\" in code mode catalog lists opencode tools only. But the outer tool list includes webfetch, websearch, etc. The instruction says call tools through execute. But webfetch is not in the Code Mode catalog... Within execute, I could use `fetch` for HTTP requests. That's the cleanest.\n\nLet me use execute with fetch to get https://example.com and extract title."
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "call_ebd1a2e3ecdb47b39eeaa90c",
+    "name": "execute",
+    "kind": "other",
+    "title": "execute",
+    "input": {}
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_ebd1a2e3ecdb47b39eeaa90c",
+    "title": "execute",
+    "kind": "other",
+    "input": {
+      "code": "const res = await fetch(\"https://example.com\");\nconst html = await res.text();\nconst match = html.match(/<title[^>]*>([\\s\\S]*?)<\\/title>/i);\nreturn { status: res.status, title: match ? match[1].trim() : null };"
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_ebd1a2e3ecdb47b39eeaa90c",
+    "title": "execute",
+    "kind": "other",
+    "input": {
+      "code": "const res = await fetch(\"https://example.com\");\nconst html = await res.text();\nconst match = html.match(/<title[^>]*>([\\s\\S]*?)<\\/title>/i);\nreturn { status: res.status, title: match ? match[1].trim() : null };"
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_updated",
+    "call_id": "call_ebd1a2e3ecdb47b39eeaa90c",
+    "title": "execute",
+    "kind": "other",
+    "input": {
+      "code": "const res = await fetch(\"https://example.com\");\nconst html = await res.text();\nconst match = html.match(/<title[^>]*>([\\s\\S]*?)<\\/title>/i);\nreturn { status: res.status, title: match ? match[1].trim() : null };"
+    },
+    "output_delta": null,
+    "output": null
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "call_ebd1a2e3ecdb47b39eeaa90c",
+    "status": "succeeded",
+    "output": "{\n  \"status\": 200,\n  \"title\": \"Example Domain\"\n}",
+    "error": null
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e7b9e001Dut1Q7G2gjfFwE",
+    "kind": "assistant",
+    "text": "The page title is **\"Example Domain\"** (HTTP 200)."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8456,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724e7b9e001Dut1Q7G2gjfFwE",
+    "kind": "assistant",
+    "text": "The page title is **\"Example Domain\"** (HTTP 200)."
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 6075,
+      "output_tokens": 297,
+      "cache_read_tokens": 10496,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": null
+  }
+]

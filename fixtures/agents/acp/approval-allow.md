@@ -1,9 +1,11 @@
 # Fixture: `approval-allow`
 
-- **Source**: `hand-made` (constructed against `agent-client-protocol = 3.5.0` / ACP v1 schema; worker sandbox policy blocks executing `opencode`)
-- **Provider**: ACP (`opencode acp`, v2.1.3)
-- **Command**: `opencode acp`
-- **Model**: `anthropic/claude-haiku-4-5`
-- **Client capabilities**: `fs.readTextFile = true`, `fs.writeTextFile = true`, `terminal = true`, `elicitation.form = {}`
-- **Prompt**: `"Run \`echo approved-ok\`."`
-- **Covers**: `session/request_permission` routed to `SessionConfig::gate` returning `GateDecision::Ask` → emits `ApprovalRequested` → resolved with `SessionCommand::ResolveApproval { decision: Allow }` → adapter selects `allow_once` option → emits `RequestResolved { outcome: Approved }` → tool finishes `Succeeded`.
+- **Source**: `live`
+- **Provider**: OpenCode `opencode v2.1.3` (`opencode acp`)
+- **Model**: `opencode/deepseek-v4.1-flash-free`
+- **Client capabilities**: `fs.read_text_file=true`, `fs.write_text_file=true`, `terminal=true`, `elicitation=true`
+- **Injected config**: `permissions: [{* * ask}]` per session (`opencode_config.rs`)
+- **Prompt**: `Create a file named approved-note.txt containing 'ok'.`
+- **Events**: 14
+- **Tool calls**:
+  - `call_00_e016ys2pm7e8h9dbujlicym0` kind `edit` status `completed`: reached the gate

@@ -1,9 +1,15 @@
 [
   {
+    "type": "message_delta",
+    "message_id": "msg_1724e1587001Yl5A3VoZPYBZBD",
+    "kind": "assistant",
+    "text": "stored"
+  },
+  {
     "type": "session_started",
     "provider": "acp",
-    "native_session_id": "ses_multi_01",
-    "model": "anthropic/claude-haiku-4-5",
+    "native_session_id": "ses_e8db1ea8bffevMwJ5ypmRge0ns",
+    "model": "opencode/deepseek-v4.1-flash-free",
     "tools": []
   },
   {
@@ -11,28 +17,73 @@
     "turn": 1
   },
   {
-    "type": "message_delta",
-    "message_id": "msg-1",
-    "kind": "assistant",
-    "text": "The codeword from the previous session is cobalt."
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db1ea8bffevMwJ5ypmRge0ns",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
   },
   {
     "type": "message_completed",
-    "message_id": "msg-1",
+    "message_id": "msg_1724e1587001Yl5A3VoZPYBZBD",
     "kind": "assistant",
-    "text": "The codeword from the previous session is cobalt."
+    "text": "stored"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e1d97001k41vMwJ3QUE4NA",
+    "kind": "assistant",
+    "text": "The code word was **cobalt**."
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8096,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724e1d97001k41vMwJ3QUE4NA",
+    "kind": "assistant",
+    "text": "The code word was **cobalt**."
   },
   {
     "type": "turn_completed",
     "turn": 1,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 60,
-      "output_tokens": 15,
-      "cache_read_tokens": null,
+      "input_tokens": 23,
+      "output_tokens": 9,
+      "cache_read_tokens": 8064,
       "cache_write_tokens": null,
       "reasoning_tokens": null,
-      "cost_usd": null
+      "cost_usd": 0.0
     }
   },
   {

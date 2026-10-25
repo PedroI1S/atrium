@@ -2,9 +2,37 @@
   {
     "type": "session_started",
     "provider": "acp",
-    "native_session_id": "ses_multi_01",
-    "model": "anthropic/claude-haiku-4-5",
+    "native_session_id": "ses_e8db1fbb2ffecI9k6Dd2Y1VOPu",
+    "model": "opencode/deepseek-v4.1-flash-free",
     "tools": []
+  },
+  {
+    "type": "unmapped",
+    "record_type": "session/update:available_commands_update",
+    "raw": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "ses_e8db1fbb2ffecI9k6Dd2Y1VOPu",
+        "update": {
+          "sessionUpdate": "available_commands_update",
+          "availableCommands": [
+            {
+              "name": "init",
+              "description": "guided AGENTS.md setup"
+            },
+            {
+              "name": "review",
+              "description": "review changes [commit|branch|pr], defaults to uncommitted"
+            },
+            {
+              "name": "compact",
+              "description": "Compact the session"
+            }
+          ]
+        }
+      }
+    }
   },
   {
     "type": "turn_started",
@@ -12,48 +40,74 @@
   },
   {
     "type": "message_delta",
-    "message_id": "thought-1",
+    "message_id": "msg_1724e0461001D223xX8qMpobpS:reasoning:0",
     "kind": "reasoning",
-    "text": "Storing codeword cobalt."
-  },
-  {
-    "type": "plan_updated",
-    "entries": [
-      {
-        "content": "Record codeword",
-        "status": "completed"
-      }
-    ]
-  },
-  {
-    "type": "message_completed",
-    "message_id": "thought-1",
-    "kind": "reasoning",
-    "text": "Storing codeword cobalt."
+    "text": "The user asks to remember a code word. There's a skill called hindsight-coding-agent for memory. But"
   },
   {
     "type": "message_delta",
-    "message_id": "msg-2",
-    "kind": "assistant",
-    "text": "I will remember cobalt."
+    "message_id": "msg_1724e0461001D223xX8qMpobpS:reasoning:0",
+    "kind": "reasoning",
+    "text": " simplest: just reply \"stored\". No persistence mechanism needed? \"Remember\" — could"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e0461001D223xX8qMpobpS:reasoning:0",
+    "kind": "reasoning",
+    "text": " store in memory file. But the instruction: reply with 'stored'. I'll just reply stored.\n\nShould I actually"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e0461001D223xX8qMpobpS:reasoning:0",
+    "kind": "reasoning",
+    "text": " persist? The user says \"Remember the code word 'cobalt'.\" In this harness, there's no"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e0461001D223xX8qMpobpS:reasoning:0",
+    "kind": "reasoning",
+    "text": " memory bank tool exposed. Simplest compliance: reply \"stored\". Keep it minimal."
   },
   {
     "type": "message_completed",
-    "message_id": "msg-2",
+    "message_id": "msg_1724e0461001D223xX8qMpobpS:reasoning:0",
+    "kind": "reasoning",
+    "text": "The user asks to remember a code word. There's a skill called hindsight-coding-agent for memory. But simplest: just reply \"stored\". No persistence mechanism needed? \"Remember\" — could store in memory file. But the instruction: reply with 'stored'. I'll just reply stored.\n\nShould I actually persist? The user says \"Remember the code word 'cobalt'.\" In this harness, there's no memory bank tool exposed. Simplest compliance: reply \"stored\". Keep it minimal."
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_1724e0461001D223xX8qMpobpS",
     "kind": "assistant",
-    "text": "I will remember cobalt."
+    "text": "stored"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8179,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_1724e0461001D223xX8qMpobpS",
+    "kind": "assistant",
+    "text": "stored"
   },
   {
     "type": "turn_completed",
     "turn": 1,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 30,
-      "output_tokens": 18,
-      "cache_read_tokens": null,
+      "input_tokens": 3593,
+      "output_tokens": 3,
+      "cache_read_tokens": 4480,
       "cache_write_tokens": null,
-      "reasoning_tokens": 6,
-      "cost_usd": null
+      "reasoning_tokens": 103,
+      "cost_usd": 0.0
     }
   },
   {
@@ -62,27 +116,38 @@
   },
   {
     "type": "message_delta",
-    "message_id": "msg-3",
+    "message_id": "msg_1724e0d96001XqmosP6k1OVM5O",
     "kind": "assistant",
-    "text": "The codeword is cobalt."
+    "text": "cobalt"
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 8192,
+      "output_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": 0.0
+    }
   },
   {
     "type": "message_completed",
-    "message_id": "msg-3",
+    "message_id": "msg_1724e0d96001XqmosP6k1OVM5O",
     "kind": "assistant",
-    "text": "The codeword is cobalt."
+    "text": "cobalt"
   },
   {
     "type": "turn_completed",
     "turn": 2,
     "outcome": "completed",
     "usage": {
-      "input_tokens": 52,
-      "output_tokens": 12,
-      "cache_read_tokens": null,
+      "input_tokens": 125,
+      "output_tokens": 3,
+      "cache_read_tokens": 8064,
       "cache_write_tokens": null,
       "reasoning_tokens": null,
-      "cost_usd": null
+      "cost_usd": 0.0
     }
   },
   {
