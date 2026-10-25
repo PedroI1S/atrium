@@ -1,5 +1,5 @@
 {"ms":0,"dir":"command","command":{"type":"send_user_message","text":"Reply with PONG."}}
-{"ms":1,"dir":"stdin","line":"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Reply with PONG.\"}}"}
+{"ms":1,"dir":"stdin","line":"{\"event\":\"user\",\"message\":{\"content\":\"Reply with PONG.\"}}"}
 {"ms":15,"dir":"stdout","line":"{\"event\":\"init\",\"conversation_id\":\"11111111-0001-4000-8000-000000000001\",\"init\":{\"model\":\"gemini-3.8-flash-medium\",\"cwd\":\"~/Documents/atrium-wt/M0-03-agy-adapter\",\"tools\":[\"ask_question\",\"call_mcp_tool\",\"edit_file\",\"find_by_name\",\"grep_search\",\"list_dir\",\"read_file\",\"run_command\",\"search_web\",\"view_file\",\"write_file\"],\"permission_mode\":\"always-proceed\"}}"}
 {"ms":20,"dir":"stdout","line":"{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"11111111-0001-4000-8000-000000000001\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}"}
 {"ms":120,"dir":"stdout","line":"{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"11111111-0001-4000-8000-000000000001\",\"step_index\":1,\"state\":\"ACTIVE\",\"step_type\":\"agent_response\",\"text_delta\":\"PO\"}}"}

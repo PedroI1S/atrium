@@ -1,5 +1,5 @@
 {"ms":0,"dir":"command","command":{"type":"send_user_message","text":"Run echo should-be-denied."}}
-{"ms":1,"dir":"stdin","line":"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Run echo should-be-denied.\"}}"}
+{"ms":1,"dir":"stdin","line":"{\"event\":\"user\",\"message\":{\"content\":\"Run echo should-be-denied.\"}}"}
 {"ms":10,"dir":"stdout","line":"{\"event\":\"init\",\"conversation_id\":\"11111111-0005-4000-8000-000000000005\",\"init\":{\"model\":\"gemini-3.8-flash-medium\",\"cwd\":\"~/Documents/atrium-wt/M0-03-agy-adapter\",\"tools\":[\"ask_question\",\"call_mcp_tool\",\"edit_file\",\"find_by_name\",\"grep_search\",\"list_dir\",\"read_file\",\"run_command\",\"search_web\",\"view_file\",\"write_file\"],\"permission_mode\":\"always-proceed\"}}"}
 {"ms":15,"dir":"stdout","line":"{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"11111111-0005-4000-8000-000000000005\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}"}
 {"ms":40,"dir":"stdout","line":"{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"11111111-0005-4000-8000-000000000005\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"duration_seconds\":0.02,\"usage\":{\"input_tokens\":180,\"output_tokens\":15,\"thinking_tokens\":5,\"cache_read_tokens\":0,\"total_tokens\":195}}}"}

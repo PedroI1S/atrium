@@ -25,27 +25,19 @@ use crate::normalizer::AgyNormalizer;
 /// Shape of user messages written to `agy`'s stdin under `--input-format stream-json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StdinFormat {
-    /// `{"type":"user","message":{"role":"user","content":"..."}}`
+    /// Verified on `agy` 1.4.7: `{"event":"user","message":{"content":"..."}}`
     #[default]
-    StreamJsonUserMessage,
-    /// `{"event":"user_input","text":"..."}`
-    EventUserInput,
+    EventUserMessage,
 }
 
 impl StdinFormat {
     pub fn format_message(self, text: &str) -> String {
         match self {
-            Self::StreamJsonUserMessage => json!({
-                "type": "user",
+            Self::EventUserMessage => json!({
+                "event": "user",
                 "message": {
-                    "role": "user",
                     "content": text,
                 }
-            })
-            .to_string(),
-            Self::EventUserInput => json!({
-                "event": "user_input",
-                "text": text,
             })
             .to_string(),
         }
@@ -74,12 +66,12 @@ impl Default for AgyAdapter {
             helper_bin: None,
             session_base_dir: std::env::temp_dir().join("agy"),
             approval_mode: ApprovalMode::Block,
-            stdin_format: StdinFormat::StreamJsonUserMessage,
+            stdin_format: StdinFormat::EventUserMessage,
             hook_timeout_secs: 300,
             shutdown_grace: SHUTDOWN_GRACE,
             use_default_cli_args: true,
             pass_add_dir: false,
-            install_cwd_hook_if_absent: false,
+            install_cwd_hook_if_absent: true,
             extra_args: Vec::new(),
             recorder: None,
         }
@@ -132,7 +124,7 @@ impl AgyAdapter {
     pub fn build_cli_args(&self, config: &SessionConfig, session_dir: &Path) -> Vec<String> {
         let mut args = Vec::new();
         if self.use_default_cli_args {
-            args.push("-p".to_owned());
+            args.push("--print=".to_owned());
             args.push("--input-format".to_owned());
             args.push("stream-json".to_owned());
             args.push("--output-format".to_owned());

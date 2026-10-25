@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use atrium_agents::AdapterInput;
 use atrium_agents::fixture::{Sanitizer, assert_golden};
 use atrium_protocol::agent::{AgentEvent, Provider};
+use serde_json::Value;
 use spike_agent_agy::AgyNormalizer;
 
 fn fixtures_dir() -> PathBuf {
@@ -37,6 +39,37 @@ fn golden_all_agy_fixtures() {
         let jsonl = dir.join(format!("{name}.jsonl"));
         assert!(jsonl.exists(), "missing fixture {}", jsonl.display());
         assert_golden(&jsonl, &mut AgyNormalizer::default());
+
+        // Pin that every Stdin line in every fixture uses the verified agy 1.4.7 shape:
+        // {"event":"user","message":{"content":"..."}}
+        let fixture_lines = atrium_agents::fixture::read(&jsonl).expect("read fixture lines");
+        for fl in fixture_lines {
+            if let AdapterInput::Stdin { line } = fl.input {
+                let parsed: Value = serde_json::from_str(&line)
+                    .unwrap_or_else(|e| panic!("{name}: invalid JSON in Stdin line: {e}"));
+                assert_eq!(
+                    parsed.get("event").and_then(Value::as_str),
+                    Some("user"),
+                    "{name}: Stdin line must have \"event\":\"user\", got: {line}"
+                );
+                assert!(
+                    parsed.get("type").is_none(),
+                    "{name}: Stdin line must not use \"type\", got: {line}"
+                );
+                let msg = parsed
+                    .get("message")
+                    .and_then(Value::as_object)
+                    .unwrap_or_else(|| panic!("{name}: Stdin line missing message object: {line}"));
+                assert!(
+                    msg.get("content").and_then(Value::as_str).is_some(),
+                    "{name}: Stdin line missing message.content string: {line}"
+                );
+                assert!(
+                    msg.get("role").is_none(),
+                    "{name}: Stdin line must not include message.role: {line}"
+                );
+            }
+        }
     }
 }
 

@@ -50,7 +50,12 @@ impl ToolGate for StaticGate {
                 GateMode::DenySecret => {
                     let s = check.input.to_string();
                     if s.contains("secret.txt")
+                        || matches!(
+                            check.kind,
+                            ToolKind::Read | ToolKind::Execute | ToolKind::Search
+                        )
                         || check.name == "read_file"
+                        || check.name == "view_file"
                         || check.name == "run_command"
                     {
                         GateDecision::Deny {
@@ -74,8 +79,27 @@ impl ToolGate for StaticGate {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let fixtures_dir = locate_fixtures_dir()?;
+    let mut raw_args = std::env::args().skip(1).peekable();
+    let mut fixtures_dir = locate_fixtures_dir()?;
+    let mut program: Option<PathBuf> = None;
+
+    while let Some(peek) = raw_args.peek() {
+        match peek.as_str() {
+            "--binary" => {
+                raw_args.next();
+                let val = raw_args.next().ok_or("--binary requires a value")?;
+                program = Some(PathBuf::from(val));
+            }
+            "--fixtures-dir" => {
+                raw_args.next();
+                let val = raw_args.next().ok_or("--fixtures-dir requires a value")?;
+                fixtures_dir = PathBuf::from(val);
+            }
+            _ => break,
+        }
+    }
+
+    let args: Vec<String> = raw_args.collect();
 
     if args.first().map(String::as_str) == Some("--generate-handmade") {
         let target = args.get(1).map(String::as_str).unwrap_or("all");
@@ -85,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let Some(scenario) = args.first().map(String::as_str) else {
         eprintln!(
-            "Usage:\n  cargo run -p spike-agent-agy --example record -- <scenario|all>\n  cargo run -p spike-agent-agy --example record -- --generate-handmade [scenario|all]\n\nScenarios: {}",
+            "Usage:\n  cargo run -p spike-agent-agy --example record -- [--binary <path>] [--fixtures-dir <dir>] <scenario|all>\n  cargo run -p spike-agent-agy --example record -- --generate-handmade [scenario|all]\n\nScenarios: {}",
             ALL_SCENARIOS.join(", ")
         );
         std::process::exit(2);
@@ -93,10 +117,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if scenario == "all" {
         for &sc in ALL_SCENARIOS {
-            record_live_scenario(&fixtures_dir, sc).await?;
+            record_live_scenario(&fixtures_dir, sc, program.clone()).await?;
         }
     } else if ALL_SCENARIOS.contains(&scenario) {
-        record_live_scenario(&fixtures_dir, scenario).await?;
+        record_live_scenario(&fixtures_dir, scenario, program).await?;
     } else {
         eprintln!(
             "Unknown scenario '{scenario}'. Valid scenarios: {}",
@@ -128,6 +152,7 @@ fn build_sanitizer() -> Sanitizer {
 async fn record_live_scenario(
     fixtures_dir: &Path,
     scenario: &str,
+    program: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Recording live scenario: {scenario}");
     let scratch_base = std::env::temp_dir().join("atrium-agy-record-scratch");
@@ -159,7 +184,7 @@ async fn record_live_scenario(
             mcp_servers: Vec::new(),
             resume: None,
             env: Vec::new(),
-            program: None,
+            program: program.clone(),
         };
         let mut seed_session = seed_adapter.start(seed_cfg, Transport::Local).await?;
         let _ = seed_session
@@ -184,6 +209,13 @@ async fn record_live_scenario(
             }
         }
         let _ = seed_session.commands.send(SessionCommand::Shutdown).await;
+        if resume_id.is_none() {
+            let _ = fs::remove_dir_all(&scratch_dir);
+            return Err(
+                "resume seed session failed to reach SessionStarted; aborting live recording"
+                    .into(),
+            );
+        }
     }
 
     let (rec_tx, mut rec_rx) = mpsc::unbounded_channel();
@@ -211,7 +243,7 @@ async fn record_live_scenario(
         mcp_servers: Vec::new(),
         resume: resume_id,
         env: Vec::new(),
-        program: None,
+        program,
     };
 
     let mut session = adapter.start(cfg, Transport::Local).await?;
@@ -366,6 +398,40 @@ fn write_fixture_files(
 
     let mut normalizer = AgyNormalizer::new();
     let events = atrium_agents::fixture::normalize(&lines, &mut normalizer);
+
+    let saw_session_started = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::SessionStarted { .. }));
+    if scenario == "startup-error" {
+        if saw_session_started {
+            return Err(format!(
+                "scenario '{scenario}' ({source_kind}) unexpectedly reached SessionStarted"
+            )
+            .into());
+        }
+        let saw_fatal_err = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { fatal: true, .. }));
+        if !saw_fatal_err {
+            return Err(format!(
+                "scenario '{scenario}' ({source_kind}) did not emit a fatal Error event"
+            )
+            .into());
+        }
+    } else if !saw_session_started {
+        let errs: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Error { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        return Err(format!(
+            "scenario '{scenario}' ({source_kind}) failed to reach SessionStarted (errors: {errs:?}); refusing to write broken fixture"
+        )
+        .into());
+    }
+
     let events_json = serde_json::to_string_pretty(&events)? + "\n";
     assert!(
         sanitizer.is_clean(&events_json),
@@ -387,7 +453,7 @@ fn write_fixture_files(
     fs::write(&events_path, &events_json)?;
 
     let md_content = format!(
-        "# {scenario}\n\n- Status: `{source_kind}`\n- CLI: `{cli_version}`\n- Model: `{model}`\n- Command: `agy -p --input-format stream-json --output-format stream-json --mode accept-edits --dangerously-skip-permissions`\n- Scenario: `{scenario}` (`docs/contracts/m0.md` §3.3)\n"
+        "# {scenario}\n\n- Status: `{source_kind}`\n- CLI: `{cli_version}`\n- Model: `{model}`\n- Command: `agy --print= --input-format stream-json --output-format stream-json --mode accept-edits --dangerously-skip-permissions --print-timeout 0s`\n- Scenario: `{scenario}` (`docs/contracts/m0.md` §3.3)\n"
     );
     fs::write(&md_path, md_content)?;
     println!("Wrote {}", jsonl_path.display());
@@ -451,6 +517,10 @@ fn init_line(conv_id: &str, model: &str) -> String {
     .to_string()
 }
 
+fn user_stdin_line(text: &str) -> String {
+    spike_agent_agy::StdinFormat::default().format_message(text)
+}
+
 fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
     match scenario {
         "simple" => {
@@ -467,11 +537,7 @@ fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
                 FixtureLine {
                     ms: 1,
                     input: AdapterInput::Stdin {
-                        line: json!({
-                            "type": "user",
-                            "message": {"role": "user", "content": "Reply with PONG."}
-                        })
-                        .to_string(),
+                        line: user_stdin_line("Reply with PONG."),
                     },
                 },
                 FixtureLine {
@@ -580,11 +646,7 @@ fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
                 FixtureLine {
                     ms: 1,
                     input: AdapterInput::Stdin {
-                        line: json!({
-                            "type": "user",
-                            "message": {"role": "user", "content": "Read hello.txt and tell me what it says."}
-                        })
-                        .to_string(),
+                        line: user_stdin_line("Read hello.txt and tell me what it says."),
                     },
                 },
                 FixtureLine {
@@ -791,11 +853,7 @@ fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
                 FixtureLine {
                     ms: 1,
                     input: AdapterInput::Stdin {
-                        line: json!({
-                            "type": "user",
-                            "message": {"role": "user", "content": "Read secret.txt in the scratch directory."}
-                        })
-                        .to_string(),
+                        line: user_stdin_line("Read secret.txt in the scratch directory."),
                     },
                 },
                 FixtureLine {
@@ -1102,11 +1160,7 @@ fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
                 FixtureLine {
                     ms: 1,
                     input: AdapterInput::Stdin {
-                        line: json!({
-                            "type": "user",
-                            "message": {"role": "user", "content": "Run echo approved-ok."}
-                        })
-                        .to_string(),
+                        line: user_stdin_line("Run echo approved-ok."),
                     },
                 },
                 FixtureLine {
@@ -1306,11 +1360,7 @@ fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
                 FixtureLine {
                     ms: 1,
                     input: AdapterInput::Stdin {
-                        line: json!({
-                            "type": "user",
-                            "message": {"role": "user", "content": "Run echo should-be-denied."}
-                        })
-                        .to_string(),
+                        line: user_stdin_line("Run echo should-be-denied."),
                     },
                 },
                 FixtureLine {
@@ -1526,11 +1576,7 @@ fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
                 FixtureLine {
                     ms: 1,
                     input: AdapterInput::Stdin {
-                        line: json!({
-                            "type": "user",
-                            "message": {"role": "user", "content": "Ask me which build profile to use."}
-                        })
-                        .to_string(),
+                        line: user_stdin_line("Ask me which build profile to use."),
                     },
                 },
                 FixtureLine {
@@ -1724,11 +1770,7 @@ fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
                 FixtureLine {
                     ms: 1,
                     input: AdapterInput::Stdin {
-                        line: json!({
-                            "type": "user",
-                            "message": {"role": "user", "content": "Run sleep 10."}
-                        })
-                        .to_string(),
+                        line: user_stdin_line("Run sleep 10."),
                     },
                 },
                 FixtureLine {
@@ -1855,11 +1897,7 @@ fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
                 FixtureLine {
                     ms: 1,
                     input: AdapterInput::Stdin {
-                        line: json!({
-                            "type": "user",
-                            "message": {"role": "user", "content": "Reply with TURN_ONE_OK."}
-                        })
-                        .to_string(),
+                        line: user_stdin_line("Reply with TURN_ONE_OK."),
                     },
                 },
                 FixtureLine {
@@ -1942,11 +1980,7 @@ fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
                 FixtureLine {
                     ms: 61,
                     input: AdapterInput::Stdin {
-                        line: json!({
-                            "type": "user",
-                            "message": {"role": "user", "content": "Now reply with TURN_TWO_OK."}
-                        })
-                        .to_string(),
+                        line: user_stdin_line("Now reply with TURN_TWO_OK."),
                     },
                 },
                 FixtureLine {
@@ -2032,11 +2066,7 @@ fn handmade_scenario_lines(scenario: &str) -> Vec<FixtureLine> {
                 FixtureLine {
                     ms: 1,
                     input: AdapterInput::Stdin {
-                        line: json!({
-                            "type": "user",
-                            "message": {"role": "user", "content": "What codeword did I ask you to remember?"}
-                        })
-                        .to_string(),
+                        line: user_stdin_line("What codeword did I ask you to remember?"),
                     },
                 },
                 FixtureLine {

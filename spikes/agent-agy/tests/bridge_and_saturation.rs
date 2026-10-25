@@ -670,7 +670,49 @@ async fn spike_agy_hook_binary_end_to_end_and_cli_args() {
         serde_json::from_slice(&out_missing.stdout).expect("parse hook stdout");
     assert_eq!(parsed_missing.decision, "deny");
 
-    // 3. Verify AgyAdapter::build_cli_args maps PermissionPolicy, model, and resume
+    // 3. Pin exact CLI argv and stdin NDJSON shape verified against agy 1.4.7
+    let default_adapter = AgyAdapter::new();
+    let default_cfg = SessionConfig {
+        cwd: dir.clone(),
+        model: Some("gemini-3.8-flash-medium".to_string()),
+        effort: None,
+        permissions: PermissionPolicy::Ask,
+        gate: Arc::new(CountingGate::new(GateDecision::Allow)),
+        mcp_servers: Vec::new(),
+        resume: None,
+        env: Vec::new(),
+        program: None,
+    };
+    let pinned_args = default_adapter.build_cli_args(&default_cfg, &dir);
+    assert_eq!(
+        pinned_args,
+        vec![
+            "--print=",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--print-timeout",
+            "0s",
+            "--mode",
+            "accept-edits",
+            "--dangerously-skip-permissions",
+            "--model",
+            "gemini-3.8-flash-medium",
+        ]
+    );
+    assert!(
+        !pinned_args.contains(&"-p".to_string()),
+        "-p without attached value must never be used; use --print="
+    );
+
+    let stdin_line = spike_agent_agy::StdinFormat::default().format_message("Reply with PONG.");
+    assert_eq!(
+        stdin_line,
+        r#"{"event":"user","message":{"content":"Reply with PONG."}}"#
+    );
+
+    // 4. Verify AgyAdapter::build_cli_args with ReadOnly, resume, and pass_add_dir
     let mut adapter = AgyAdapter::new();
     adapter.pass_add_dir = true;
     let cfg = SessionConfig {
@@ -685,15 +727,156 @@ async fn spike_agy_hook_binary_end_to_end_and_cli_args() {
         program: None,
     };
     let args = adapter.build_cli_args(&cfg, &dir);
-    assert!(args.contains(&"--input-format".to_string()));
-    assert!(args.contains(&"--output-format".to_string()));
-    assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
-    assert!(args.contains(&"plan".to_string()));
-    assert!(args.contains(&"gemini-3.8-flash-medium".to_string()));
-    assert!(args.contains(&"--conversation".to_string()));
-    assert!(args.contains(&"prev-conv-123".to_string()));
-    assert!(args.contains(&"--add-dir".to_string()));
+    assert_eq!(
+        args,
+        vec![
+            "--print=".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--print-timeout".to_string(),
+            "0s".to_string(),
+            "--mode".to_string(),
+            "plan".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--model".to_string(),
+            "gemini-3.8-flash-medium".to_string(),
+            "--conversation".to_string(),
+            "prev-conv-123".to_string(),
+            "--add-dir".to_string(),
+            dir.display().to_string(),
+        ]
+    );
+
+    // 5. End-to-end live session check against a mock agy binary that validates argv[1] == "--print="
+    // and validates the stdin line has `"event":"user"` and `"message":{"content":"..."}`.
+    let mock_agy = dir.join("mock-agy.sh");
+    let mock_script = "#!/bin/sh\n\
+        if [ \"$1\" != \"--print=\" ]; then\n\
+          echo \"Error: -p took $2 as its prompt\" >&2\n\
+          exit 2\n\
+        fi\n\
+        read -r line\n\
+        case \"$line\" in\n\
+          *'\"event\":\"user\"'*'\"message\":{\"content\":\"Reply with PONG.\"}'*) ;;\n\
+          *) echo \"Error: missing the event field or unsupported event: $line\" >&2; exit 2 ;;\n\
+        esac\n\
+        printf '{\"event\":\"init\",\"conversation_id\":\"conv-live-1\",\"init\":{\"model\":\"gemini-3.8-flash-medium\",\"tools\":[\"run_command\"]}}\\n'\n\
+        printf '{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"conv-live-1\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"PONG\"}}\\n'\n\
+        printf '{\"event\":\"result\",\"result\":{\"conversation_id\":\"conv-live-1\",\"status\":\"SUCCESS\",\"response\":\"PONG\",\"num_turns\":1,\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\\n'\n\
+        exit 0\n";
+    fs::write(&mock_agy, mock_script).expect("write mock-agy.sh");
+    fs::set_permissions(&mock_agy, fs::Permissions::from_mode(0o755)).expect("chmod +x");
+
+    let mut live_cfg = default_cfg;
+    live_cfg.program = Some(mock_agy);
+    let mut session = default_adapter
+        .start(live_cfg, Transport::Local)
+        .await
+        .expect("start mock-agy");
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage {
+            text: "Reply with PONG.".to_string(),
+        })
+        .await
+        .expect("send user message");
+
+    let mut saw_started = false;
+    let mut saw_pong = false;
+    let mut saw_completed = false;
+    while let Some(env) = session.events.recv().await {
+        match env.event {
+            AgentEvent::SessionStarted {
+                native_session_id, ..
+            } => {
+                assert_eq!(native_session_id, "conv-live-1");
+                saw_started = true;
+            }
+            AgentEvent::MessageCompleted { text, .. } => {
+                assert_eq!(text, "PONG");
+                saw_pong = true;
+            }
+            AgentEvent::TurnCompleted { .. } => {
+                saw_completed = true;
+            }
+            AgentEvent::SessionEnded { exit_code, .. } => {
+                assert_eq!(exit_code, Some(0));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_started && saw_pong && saw_completed);
 
     drop(bridge);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn record_and_hook_failures_harnesses_reject_broken_launches() {
+    let dir = temp_test_dir("harnesses");
+
+    // Create a broken agy binary that prints usage on stderr and exits 2 without emitting `init`
+    let broken_agy = dir.join("broken-agy.sh");
+    fs::write(
+        &broken_agy,
+        "#!/bin/sh\necho 'Error: bad flag' >&2\nexit 2\n",
+    )
+    .expect("write broken-agy.sh");
+    fs::set_permissions(&broken_agy, fs::Permissions::from_mode(0o755)).expect("chmod +x");
+
+    let hook_bin = PathBuf::from(env!("CARGO_BIN_EXE_spike-agy-hook"));
+    let target_debug_dir = hook_bin.parent().expect("target/debug");
+    let examples_dir = target_debug_dir.join("examples");
+
+    // 1. Verify `examples/hook-failures` with broken agy reports INCONCLUSIVE and exits 2,
+    // and NEVER reports `fail_closed: true`.
+    let hf_bin = examples_dir.join("hook-failures");
+    if hf_bin.exists() {
+        let out = tokio::process::Command::new(&hf_bin)
+            .arg("--binary")
+            .arg(&broken_agy)
+            .output()
+            .await
+            .expect("run hook-failures with broken agy");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "hook-failures must exit 2 when control case is inconclusive"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("OVERALL RUN: INCONCLUSIVE"));
+        assert!(stdout.contains("\"verdict\": \"inconclusive\""));
+        assert!(!stdout.contains("\"fail_closed\": true"));
+    }
+
+    // 2. Verify `examples/record` with broken agy on a non-startup-error scenario ("simple")
+    // fails loudly (non-zero exit) and refuses to write simple.jsonl into the target fixtures dir.
+    let rec_bin = examples_dir.join("record");
+    if rec_bin.exists() {
+        let scratch_fixtures = dir.join("fixtures");
+        fs::create_dir_all(&scratch_fixtures).expect("create scratch fixtures");
+        let out = tokio::process::Command::new(&rec_bin)
+            .arg("--binary")
+            .arg(&broken_agy)
+            .arg("--fixtures-dir")
+            .arg(&scratch_fixtures)
+            .arg("simple")
+            .output()
+            .await
+            .expect("run record with broken agy");
+        assert!(
+            !out.status.success(),
+            "record must fail loudly when simple does not reach SessionStarted"
+        );
+        assert!(
+            !scratch_fixtures.join("simple.jsonl").exists(),
+            "record must never write a live fixture when SessionStarted was not reached"
+        );
+    }
+
     let _ = fs::remove_dir_all(&dir);
 }
