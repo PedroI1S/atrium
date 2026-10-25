@@ -390,7 +390,7 @@ def cmd_multi(a):
 
 
 def cmd_memory(a):
-    sc = base(a, name="memory", threads=1, tokensPerSecond=a.tps, durationMs=a.secs * 1000)
+    sc = base(a, name="memory", threads=1, tokensPerSecond=a.tps, durationMs=a.secs * 1000, endMode="time")
     r = run_scenario(sc, a.label or "memory", hold_s=60, fp_every=30, timeout=a.secs + 400, quiet=a.quiet)
     print(fmt(r))
     print("transcript:", r["transcript"])

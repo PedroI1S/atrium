@@ -18,6 +18,8 @@ export interface Scenario extends RunConfig {
   /** Idle typing window before the stream starts (ms); 0 skips. */
   idleTypingMs: number;
   baselineMs: number;
+  /** `ended`: wait for every session to end; `time`: stop `durationMs + 3 s` after the start (the daemon folds a very long history when a session closes, which takes minutes). */
+  endMode: "ended" | "time";
   /** Keep the app open after the report so the script can sample memory. */
   hold: boolean;
 }
@@ -73,7 +75,7 @@ function startTypist(intervalMs: number) {
 }
 
 export async function runScenario(sc: Partial<Scenario>, info: StartupInfo): Promise<void> {
-  const full: Scenario = { ...DEFAULT_RUN, name: "scenario", typing: "none", typingIntervalMs: 120, typingStartMs: 2000, idleTypingMs: 0, baselineMs: 1500, hold: false, ...sc };
+  const full: Scenario = { ...DEFAULT_RUN, name: "scenario", typing: "none", typingIntervalMs: 120, typingStartMs: 2000, idleTypingMs: 0, baselineMs: 1500, endMode: "ended", hold: false, ...sc };
   // Evidence for "the window was hidden or occluded": rAF stops then, which is an environment
   // artifact, not a result. The script discards and repeats such runs and keeps the evidence.
   const visibility: { t: number; state: string; focus: boolean }[] = [];
@@ -117,9 +119,10 @@ export async function runScenario(sc: Partial<Scenario>, info: StartupInfo): Pro
     const deadline = startedAt + full.durationMs + 90_000;
     while (performance.now() < deadline) {
       if (pipeline.threads.length > 0 && pipeline.threads.every((t) => t.ended)) break;
+      if (full.endMode === "time" && performance.now() >= startedAt + full.durationMs + 3000) break;
       await sleep(100);
     }
-    const timedOut = !pipeline.threads.every((t) => t.ended);
+    const timedOut = full.endMode === "ended" && !pipeline.threads.every((t) => t.ended);
     // Let the last frames settle and the acknowledgement go out.
     while (!pipeline.idle()) await sleep(20);
     await raf2();
