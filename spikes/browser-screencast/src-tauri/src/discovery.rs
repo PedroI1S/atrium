@@ -134,15 +134,15 @@ pub fn linux_extra_dirs() -> Vec<PathBuf> {
 /// puts a custom binary first (used by tests and the harness).
 pub fn discover() -> Vec<BrowserInfo> {
     let mut found = Vec::new();
-    if let Some(custom) = std::env::var_os("ATRIUM_BROWSER").map(PathBuf::from) {
-        if is_executable_file(&custom) {
-            found.push(BrowserInfo {
-                id: "custom".into(),
-                name: custom.file_name().map_or_else(|| "custom".into(), |n| n.to_string_lossy().into_owned()),
-                app_path: None,
-                binary: custom,
-            });
-        }
+    if let Some(custom) = std::env::var_os("ATRIUM_BROWSER").map(PathBuf::from)
+        && is_executable_file(&custom)
+    {
+        found.push(BrowserInfo {
+            id: "custom".into(),
+            name: custom.file_name().map_or_else(|| "custom".into(), |n| n.to_string_lossy().into_owned()),
+            app_path: None,
+            binary: custom,
+        });
     }
     if cfg!(target_os = "macos") {
         found.extend(discover_macos(&macos_roots()));

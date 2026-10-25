@@ -165,10 +165,10 @@ impl Browser {
     pub async fn close(&self) {
         let _ = tokio::time::timeout(Duration::from_secs(3), self.cdp.call_raw("Browser.close", json!({}), None)).await;
         let mut guard = self.child.lock().await;
-        if let Some(child) = guard.as_mut() {
-            if tokio::time::timeout(Duration::from_secs(5), child.wait()).await.is_err() {
-                let _ = child.kill().await;
-            }
+        if let Some(child) = guard.as_mut()
+            && tokio::time::timeout(Duration::from_secs(5), child.wait()).await.is_err()
+        {
+            let _ = child.kill().await;
         }
         *guard = None;
     }

@@ -423,17 +423,7 @@ async fn bench_sampler_start(state: State<'_, AppState>, label: String) -> Resul
     let task = tokio::spawn(async move {
         loop {
             let (b, a) = tokio::task::spawn_blocking(move || {
-                let rows = procstat::snapshot();
-                let mk = |pid| {
-                    let t = procstat::tree(&rows, pid);
-                    procstat::Sample {
-                        at: std::time::Instant::now(),
-                        cpu_secs: t.iter().map(|r| r.cpu_secs).sum(),
-                        rss_kb: t.iter().map(|r| r.rss_kb).sum(),
-                        processes: t.len(),
-                    }
-                };
-                (mk(browser_pid), mk(app_pid))
+                (procstat::sample_tree(browser_pid), procstat::sample_process(app_pid))
             })
             .await
             .unwrap();
@@ -453,7 +443,7 @@ async fn bench_sampler_stop(state: State<'_, AppState>, label: String) -> Result
     run.task.abort();
     let browser = procstat::summarize(&run.browser_samples.lock().unwrap());
     let app = procstat::summarize(&run.app_samples.lock().unwrap());
-    Ok(json!({"label": label, "chromium": browser, "tauriAppProcessTree": app}))
+    Ok(json!({"label": label, "chromium": browser, "tauriAppProcessOnly": app}))
 }
 
 /// Writes the report (to `ATRIUM_BENCH_OUT` or stdout) and quits.

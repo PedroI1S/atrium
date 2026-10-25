@@ -69,6 +69,9 @@ pub fn decode(buf: &[u8]) -> Option<(Header, &[u8])> {
 }
 
 #[cfg(test)]
+const GOLDEN_HEADER_HEX: &str = "070000000100000063000000010000000010a044000034443bdf0740fc54d94100b88756febc784200c48756febc7842";
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -92,5 +95,8 @@ mod tests {
         assert_eq!(back, h);
         assert_eq!(rest, image);
         assert!(decode(&wire[..HEADER_LEN - 1]).is_none());
+        // Golden bytes, mirrored by src/pane/frame.test.ts so both sides agree on the layout.
+        let hex: String = wire[..HEADER_LEN].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, GOLDEN_HEADER_HEX);
     }
 }

@@ -75,18 +75,68 @@ pub struct Sample {
     pub at: Instant,
     pub cpu_secs: f64,
     pub rss_kb: u64,
+    /// Physical footprint (what Activity Monitor calls Memory), from `footprint(1)`.
+    /// Unlike RSS it does not count shared framework pages once per process.
+    pub footprint_mb: Option<f64>,
     pub processes: usize,
 }
 
+/// Sums the `Footprint: N MB` lines of `footprint` output (one per process).
+pub fn parse_footprint(output: &str) -> Option<f64> {
+    let mut total = 0.0;
+    let mut seen = false;
+    for line in output.lines() {
+        // "Helium Helper (Renderer) [7822]: 64-bit    Footprint: 416 MB (16384 bytes per page)"
+        let Some((head, rest)) = line.split_once("Footprint:") else { continue };
+        if !head.contains(']') {
+            continue; // the "Summary Footprint" line has no pid
+        }
+        let mut it = rest.split_whitespace();
+        let (Some(v), Some(unit)) = (it.next().and_then(|v| v.parse::<f64>().ok()), it.next()) else { continue };
+        total += match unit {
+            "KB" => v / 1024.0,
+            "GB" => v * 1024.0,
+            _ => v,
+        };
+        seen = true;
+    }
+    seen.then_some(total)
+}
+
+pub fn footprint_mb(pids: &[u32]) -> Option<f64> {
+    let mut cmd = Command::new("footprint");
+    cmd.arg("--noCategories");
+    for p in pids {
+        cmd.arg("-p").arg(p.to_string());
+    }
+    let out = cmd.output().ok()?;
+    parse_footprint(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn sample_pids(pids: &[&ProcRow]) -> Sample {
+    let ids: Vec<u32> = pids.iter().map(|r| r.pid).collect();
+    
+    Sample {
+        at: Instant::now(),
+        cpu_secs: pids.iter().map(|r| r.cpu_secs).sum(),
+        rss_kb: pids.iter().map(|r| r.rss_kb).sum(),
+        footprint_mb: footprint_mb(&ids),
+        processes: pids.len(),
+    }
+}
+
+/// `root` and all its descendants (the whole Chromium process tree).
 pub fn sample_tree(root: u32) -> Sample {
     let rows = snapshot();
     let t = tree(&rows, root);
-    Sample {
-        at: Instant::now(),
-        cpu_secs: t.iter().map(|r| r.cpu_secs).sum(),
-        rss_kb: t.iter().map(|r| r.rss_kb).sum(),
-        processes: t.len(),
-    }
+    sample_pids(&t)
+}
+
+/// Just one process (the Tauri app itself; WKWebView's XPC helpers are not its children).
+pub fn sample_process(pid: u32) -> Sample {
+    let rows = snapshot();
+    let t: Vec<&ProcRow> = rows.iter().filter(|r| r.pid == pid).collect();
+    sample_pids(&t)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +147,8 @@ pub struct Summary {
     pub cpu_percent: f64,
     pub rss_mb_median: f64,
     pub rss_mb_max: f64,
+    pub footprint_mb_median: Option<f64>,
+    pub footprint_mb_max: Option<f64>,
     pub processes: usize,
     pub samples: usize,
 }
@@ -106,11 +158,15 @@ pub fn summarize(samples: &[Sample]) -> Option<Summary> {
     let wall = last.at.duration_since(first.at).as_secs_f64();
     let mut rss: Vec<f64> = samples.iter().map(|s| s.rss_kb as f64 / 1024.0).collect();
     rss.sort_by(f64::total_cmp);
+    let mut fp: Vec<f64> = samples.iter().filter_map(|s| s.footprint_mb).collect();
+    fp.sort_by(f64::total_cmp);
     Some(Summary {
         seconds: wall,
         cpu_percent: if wall > 0.0 { (last.cpu_secs - first.cpu_secs) / wall * 100.0 } else { 0.0 },
         rss_mb_median: rss[rss.len() / 2],
         rss_mb_max: *rss.last()?,
+        footprint_mb_median: fp.get(fp.len() / 2).copied(),
+        footprint_mb_max: fp.last().copied(),
         processes: samples.iter().map(|s| s.processes).max().unwrap_or(0),
         samples: samples.len(),
     })
@@ -145,12 +201,23 @@ mod tests {
     }
 
     #[test]
+    fn sums_per_process_footprints_and_skips_the_summary_line() {
+        let out = "=====\nHelium Helper (Renderer) [7822]: 64-bit    Footprint: 416 MB (16384 bytes per page)\n=====\n\
+                   Helium Helper (Renderer) [28804]: 64-bit    Footprint: 512 KB (16384 bytes per page)\n\
+                   Summary Footprint: 416 MB\n";
+        let v = parse_footprint(out).unwrap();
+        assert!((v - 416.5).abs() < 1e-9, "{v}");
+        assert_eq!(parse_footprint("nothing here"), None);
+    }
+
+    #[test]
     fn summary_uses_cpu_time_delta_over_wall_time() {
         let t0 = Instant::now();
         let mk = |ms: u64, cpu: f64, rss: u64| Sample {
             at: t0 + std::time::Duration::from_millis(ms),
             cpu_secs: cpu,
             rss_kb: rss,
+            footprint_mb: Some(rss as f64 / 4096.0),
             processes: 3,
         };
         let s = summarize(&[mk(0, 10.0, 100 * 1024), mk(1000, 10.5, 120 * 1024), mk(2000, 11.0, 110 * 1024)]).unwrap();
