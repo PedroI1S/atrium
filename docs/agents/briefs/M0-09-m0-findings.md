@@ -15,7 +15,7 @@ Branch: `agent/flash/M0-09-m0-findings` · Worktree: `../atrium-wt/M0-09-m0-find
   - `docs/agents/m1-must-fix.md` (link to it; don't duplicate it);
   - `docs/design/ui-direction.md`;
   - CR-01 … CR-03 in `docs/agents/change-requests.md`.
-- **M0-06b** (layout B, opacity, pop-outs) is still in its final fix round on another branch, so its report isn't in your worktree. Put an "M0-06b: pending final round" placeholder row in every table and section where it belongs; the orchestrator fills it in after merge. Don't try to read other worktrees.
+- **M0-06b** (layout B, opacity, pop-outs) is merged: include its report `docs/spikes/M0-06b-ui-shell-layout-b.md` and both of its reviews.
 - **The `agy` fixtures** come from `agy` 1.4.7. The consistency test reads golden `.events.json` files only.
 
 ## Owned paths
