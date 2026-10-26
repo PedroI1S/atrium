@@ -94,6 +94,7 @@ This amends D-002's assumption. `scripts/agent-run` now parses the generated `ho
 
 ## D-019 — 2026-10-25 — OpenCode keeps native Code Mode; enforcement shown as Partial
 **Decided by Pedro (owner).** As with Claude (D-017): Atrium sessions keep OpenCode's native Code Mode (`execute`) on by default. It can't be gated, so the provider's enforcement level is shown as *Partial*, with the reason (D-012). The user's own MCP servers keep working through it. Turning Code Mode off per session (Full enforcement, but then the user's own MCP servers need direct mode) is offered as an option. The M0-04 spike denies it by default; M1 flips the default (`m1-must-fix.md` O1).
+*Gate note (2026-10-26, `reviews/M0-gate.md`):* "Full" with Code Mode off is only claimed once O1 holds for every agent (build, custom, managed and persisted permissions; MCP and subagents). Until then it shows as *Partial*. The default above is unchanged.
 
 ## D-020 — 2026-10-25 — Go for M0 wave 2
 **Pedro gave the go** for wave 2: M0-07 (stream perf, on the merged M0-05 `ClientHandle`) and M0-08 (browser screencast), both Sonnet 5.5, reviewed by Sol (cross-provider, D-015). Wave 3 (M0-09) still needs its own go.
