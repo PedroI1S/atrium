@@ -1,0 +1,23 @@
+config: ATRIUM_THEME=atrium-calm-dark ATRIUM_WINDOWS=3 ATRIUM_OPACITY=whole ATRIUM_SCREEN=chat ATRIUM_RIGHT_TAB=changes  bin=src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell
+host: macOS 27.0.1, Apple M4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+idle 10 s after launch:
+  pid  97832  responsible  97832  rss   113.5 MB  footprint   37.0 MB  atrium-ui-shell
+  pid  97835  responsible  97832  rss    37.2 MB  footprint   22.0 MB  com.apple.WebKit.GPU
+  pid  97836  responsible  97832  rss    65.0 MB  footprint   79.0 MB  com.apple.WebKit.WebContent
+  pid  97837  responsible  97832  rss    12.7 MB  footprint    5.8 MB  com.apple.WebKit.Networking
+  pid  97839  responsible  97832  rss    43.4 MB  footprint   30.0 MB  com.apple.WebKit.WebContent
+  pid  97840  responsible  97832  rss    40.8 MB  footprint   30.0 MB  com.apple.WebKit.WebContent
+  (4 WebKit processes belonging to other apps ignored)
+  TOTAL rss 312.5 MB   footprint 203.8 MB   (6 processes, 3 WebContent)
+idle 30 s after launch:
+  pid  97832  responsible  97832  rss   113.3 MB  footprint   35.0 MB  atrium-ui-shell
+  pid  97835  responsible  97832  rss    37.2 MB  footprint   17.0 MB  com.apple.WebKit.GPU
+  pid  97836  responsible  97832  rss    64.8 MB  footprint   77.0 MB  com.apple.WebKit.WebContent
+  pid  97837  responsible  97832  rss    12.7 MB  footprint    5.7 MB  com.apple.WebKit.Networking
+  pid  97839  responsible  97832  rss    43.3 MB  footprint   28.0 MB  com.apple.WebKit.WebContent
+  pid  97840  responsible  97832  rss    40.7 MB  footprint   29.0 MB  com.apple.WebKit.WebContent
+  (4 WebKit processes belonging to other apps ignored)
+  TOTAL rss 312.0 MB   footprint 191.7 MB   (6 processes, 3 WebContent)
+SUMMARY {"metric": "rss", "windows": 3, "opacity": "whole", "load": 3.0, "footprint": [203.8, 191.7], "rss": [312.5, 312.0], "footprint_max": 203.75}

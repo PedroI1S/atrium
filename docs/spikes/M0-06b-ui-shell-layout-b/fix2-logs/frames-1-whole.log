@@ -1,0 +1,45 @@
+config: ATRIUM_THEME=atrium-calm-dark ATRIUM_WINDOWS=1 ATRIUM_OPACITY=whole ATRIUM_SCREEN=chat ATRIUM_RIGHT_TAB=changes  bin=src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell
+host: macOS 27.0.1, Apple M4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+--- run 1  (dpr 2, viewport [1360, 860])
+idleFrames       59.8 fps  mean 16.71  p50 17.00  p95 18.00  p99 19.00  max  19.00 ms  >16.7ms 60/90  >25ms 0
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 0.40 p95 1.00 max 1.00 ms
+scrollReading    60.0 fps  mean 16.66  p50 17.00  p95 19.00  p99 19.00  max  19.00 ms  >16.7ms 109/181  >25ms 0  dist 4523 px
+                 scroll-handler+forced-layout: mean 0.59 p95 2.00 max 4.00 ms (synchronous part only)
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 1.18 p95 3.00 max 5.00 ms
+scrollFling      60.1 fps  mean 16.63  p50 17.00  p95 19.00  p99 19.00  max  19.00 ms  >16.7ms 111/181  >25ms 0  dist 60341 px
+                 scroll-handler+forced-layout: mean 1.07 p95 3.00 max 4.00 ms (synchronous part only)
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 1.35 p95 3.00 max 4.00 ms
+resize           60.0 fps  mean 16.67  p50 17.00  p95 18.00  p99 19.00  max  19.00 ms  >16.7ms 121/180  >25ms 0
+                 resize-step+forced-layout: mean 1.92 p95 3.00 max 4.00 ms (synchronous part only)
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 2.82 p95 4.00 max 7.00 ms
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+--- run 2  (dpr 2, viewport [1360, 860])
+idleFrames       60.3 fps  mean 16.59  p50 17.00  p95 19.00  p99 19.00  max  19.00 ms  >16.7ms 54/91  >25ms 0
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 0.42 p95 1.00 max 3.00 ms
+scrollReading    60.1 fps  mean 16.65  p50 17.00  p95 19.00  p99 19.00  max  19.00 ms  >16.7ms 114/181  >25ms 0  dist 4521 px
+                 scroll-handler+forced-layout: mean 0.61 p95 2.00 max 4.00 ms (synchronous part only)
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 1.04 p95 3.00 max 4.00 ms
+scrollFling      60.1 fps  mean 16.64  p50 17.00  p95 19.00  p99 19.00  max  19.00 ms  >16.7ms 109/181  >25ms 0  dist 60335 px
+                 scroll-handler+forced-layout: mean 1.13 p95 3.00 max 4.00 ms (synchronous part only)
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 1.34 p95 3.00 max 4.00 ms
+resize           60.0 fps  mean 16.66  p50 17.00  p95 18.00  p99 19.00  max  22.00 ms  >16.7ms 126/181  >25ms 0
+                 resize-step+forced-layout: mean 1.94 p95 3.00 max 6.00 ms (synchronous part only)
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 2.90 p95 4.00 max 11.00 ms
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+--- run 3  (dpr 2, viewport [1360, 860])
+idleFrames       59.8 fps  mean 16.72  p50 17.00  p95 19.00  p99 19.00  max  22.00 ms  >16.7ms 61/90  >25ms 0
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 0.46 p95 1.00 max 5.00 ms
+scrollReading    60.1 fps  mean 16.64  p50 17.00  p95 19.00  p99 19.00  max  19.00 ms  >16.7ms 106/181  >25ms 0  dist 4518 px
+                 scroll-handler+forced-layout: mean 0.62 p95 2.00 max 3.00 ms (synchronous part only)
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 1.13 p95 3.00 max 5.00 ms
+scrollFling      60.1 fps  mean 16.64  p50 17.00  p95 18.00  p99 19.00  max  19.00 ms  >16.7ms 114/181  >25ms 0  dist 60315 px
+                 scroll-handler+forced-layout: mean 1.12 p95 3.00 max 3.00 ms (synchronous part only)
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 1.43 p95 3.00 max 5.00 ms
+resize           60.0 fps  mean 16.66  p50 17.00  p95 18.00  p99 19.00  max  19.00 ms  >16.7ms 134/181  >25ms 0
+                 resize-step+forced-layout: mean 2.02 p95 3.00 max 4.00 ms (synchronous part only)
+                 rAF->next task (style/layout/paint-record/ResizeObserver): mean 2.99 p95 4.00 max 9.00 ms
+SUMMARY {"metric": "frames", "windows": 1, "opacity": "whole", "load": 2.8, "runs": 3, "idleFrames": {"fps_median": 59.840425531914896, "fps_worst": 59.800664451827245, "p95_median": 19, "p99_worst": 19, "max_worst": 22, "over25_total": 0}, "scrollReading": {"fps_median": 60.05308560053086, "fps_worst": 60.03316749585406, "p95_median": 19, "p99_worst": 19, "max_worst": 19, "over25_total": 0}, "scrollFling": {"fps_median": 60.11291929591498, "fps_worst": 60.092961487383796, "p95_median": 19, "p99_worst": 19, "max_worst": 19, "over25_total": 0}, "resize": {"fps_median": 60.0132625994695, "fps_worst": 60, "p95_median": 18, "p99_worst": 19, "max_worst": 22, "over25_total": 0}}

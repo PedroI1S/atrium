@@ -1,0 +1,261 @@
+config: ATRIUM_THEME=atrium-calm-dark ATRIUM_WINDOWS=1 ATRIUM_OPACITY=off ATRIUM_SCREEN=chat ATRIUM_RIGHT_TAB=changes  bin=src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell
+host: macOS 27.0.1, Apple M4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  1 windows=1 opacity=off        tti= 375.4  all-ready= 383.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  1 windows=1 opacity=background tti= 379.4  all-ready= 385.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  1 windows=1 opacity=whole      tti= 394.1  all-ready= 402.1
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  1 windows=3 opacity=off        tti= 398.2  all-ready= 542.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-database": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-editor": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  1 windows=3 opacity=background tti= 400.7  all-ready= 553.7
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  1 windows=3 opacity=whole      tti= 380.4  all-ready= 514.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  2 windows=1 opacity=off        tti= 390.4  all-ready= 396.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  2 windows=1 opacity=background tti= 378.2  all-ready= 384.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  2 windows=1 opacity=whole      tti= 377.3  all-ready= 383.3
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  2 windows=3 opacity=off        tti= 383.7  all-ready= 514.7
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-database": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-editor": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  2 windows=3 opacity=background tti= 367.3  all-ready= 511.3
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  2 windows=3 opacity=whole      tti= 377.9  all-ready= 505.9
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  3 windows=1 opacity=off        tti= 385.0  all-ready= 391.0
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  3 windows=1 opacity=background tti= 373.8  all-ready= 379.8
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  3 windows=1 opacity=whole      tti= 374.4  all-ready= 380.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  3 windows=3 opacity=off        tti= 375.2  all-ready= 521.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-database": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-editor": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  3 windows=3 opacity=background tti= 404.6  all-ready= 548.6
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  3 windows=3 opacity=whole      tti= 386.8  all-ready= 544.8
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  4 windows=1 opacity=off        tti= 401.2  all-ready= 407.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  4 windows=1 opacity=background tti= 378.5  all-ready= 383.5
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  4 windows=1 opacity=whole      tti= 366.2  all-ready= 372.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  4 windows=3 opacity=off        tti= 377.4  all-ready= 520.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-database": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-editor": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  4 windows=3 opacity=background tti= 386.7  all-ready= 541.7
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  4 windows=3 opacity=whole      tti= 381.6  all-ready= 537.6
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  5 windows=1 opacity=off        tti= 391.6  all-ready= 397.6
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  5 windows=1 opacity=background tti= 357.6  all-ready= 362.6
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  5 windows=1 opacity=whole      tti= 384.4  all-ready= 390.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  5 windows=3 opacity=off        tti= 396.5  all-ready= 531.5
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-database": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-editor": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  5 windows=3 opacity=background tti= 366.3  all-ready= 496.3
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  5 windows=3 opacity=whole      tti= 366.1  all-ready= 519.1
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  6 windows=1 opacity=off        tti= 368.0  all-ready= 374.0
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  6 windows=1 opacity=background tti= 368.5  all-ready= 374.5
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  6 windows=1 opacity=whole      tti= 379.0  all-ready= 385.0
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  6 windows=3 opacity=off        tti= 374.9  all-ready= 517.9
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-database": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-editor": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  6 windows=3 opacity=background tti= 362.4  all-ready= 510.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  6 windows=3 opacity=whole      tti= 384.8  all-ready= 527.8
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  7 windows=1 opacity=off        tti= 400.4  all-ready= 406.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  7 windows=1 opacity=background tti= 395.0  all-ready= 401.0
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  7 windows=1 opacity=whole      tti= 376.3  all-ready= 382.3
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  7 windows=3 opacity=off        tti= 411.1  all-ready= 552.1
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-database": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-editor": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  7 windows=3 opacity=background tti= 376.1  all-ready= 508.1
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  7 windows=3 opacity=whole      tti= 374.9  all-ready= 509.9
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  8 windows=1 opacity=off        tti= 382.8  all-ready= 388.8
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  8 windows=1 opacity=background tti= 356.5  all-ready= 362.5
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  8 windows=1 opacity=whole      tti= 378.3  all-ready= 384.3
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  8 windows=3 opacity=off        tti= 384.2  all-ready= 514.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-database": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-editor": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  8 windows=3 opacity=background tti= 395.7  all-ready= 545.7
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  8 windows=3 opacity=whole      tti= 380.9  all-ready= 525.9
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  9 windows=1 opacity=off        tti= 382.8  all-ready= 389.8
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  9 windows=1 opacity=background tti= 390.2  all-ready= 396.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  9 windows=1 opacity=whole      tti= 385.3  all-ready= 391.3
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run  9 windows=3 opacity=off        tti= 365.7  all-ready= 508.7
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-database": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-editor": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  9 windows=3 opacity=background tti= 380.0  all-ready= 527.0
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run  9 windows=3 opacity=whole      tti= 368.4  all-ready= 522.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run 10 windows=1 opacity=off        tti= 381.5  all-ready= 387.5
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run 10 windows=1 opacity=background tti= 386.2  all-ready= 392.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run 10 windows=1 opacity=whole      tti= 391.2  all-ready= 397.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+run 10 windows=3 opacity=off        tti= 372.8  all-ready= 515.8
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-database": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}, "view-editor": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run 10 windows=3 opacity=background tti= 358.1  all-ready= 513.1
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes", "view-database": "yes", "view-editor": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-database": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}, "view-editor": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 0.6, "vibrancy": false}}
+run 10 windows=3 opacity=whole      tti= 377.6  all-ready= 508.6
+1-minute load average at the start of each round: [20.1, 19.3, 18.1, 17.3, 15.9, 14.0, 13.2, 12.4, 11.7, 10.5]
+
+[windows=1 opacity=off] ms from process launch
+exec_to_main             first=    5.3  median=   15.2  min=    5.3  max=   17.8
+main_to_js               first=  239.0  median=  250.0  min=  234.9  max=  263.4
+js_to_mounted            first=   75.0  median=   72.0  min=   71.0  max=   75.0
+input_ready              first=  322.4  median=  338.3  min=  322.4  max=  355.2
+first_paint              first=  375.4  median=  383.9  min=  368.0  max=  401.2
+first_contentful_paint   first=  351.4  median=  358.9  min=  345.0  max=  377.2
+tti_palette              first=  375.4  median=  383.9  min=  368.0  max=  401.2
+all_windows_ready        first=  383.4  median=  390.4  min=  374.0  max=  407.2
+tti                      first=  375.4  median=  383.9  min=  368.0  max=  401.2
+TTI vs the 400 ms budget: 2/10 launches over 400 ms; median 384 ms, worst 401 ms
+SUMMARY {"metric": "cold", "windows": 1, "opacity": "off", "runs": 10, "tti_median": 383.922119140625, "tti_worst": 401.19873046875, "over_budget": 2, "input_ready_median": 338.2816162109375, "input_ready_worst": 355.19873046875, "palette_median": 383.922119140625, "first_paint_median": 383.922119140625, "main_to_js_median": 249.9554443359375, "js_to_mounted_median": 72.0, "all_windows_median": 390.4024658203125, "all_windows_worst": 407.19873046875, "load": [10.5, 20.1]}
+
+[windows=1 opacity=background] ms from process launch
+exec_to_main             first=   12.2  median=   15.0  min=    5.3  max=   18.6
+main_to_js               first=  251.2  median=  244.0  min=  231.0  max=  260.0
+js_to_mounted            first=   71.0  median=   72.0  min=   70.0  max=   74.0
+input_ready              first=  335.4  median=  330.1  min=  309.5  max=  351.0
+first_paint              first=  379.4  median=  378.3  min=  356.5  max=  395.0
+first_contentful_paint   first=  356.4  median=  352.1  min=  330.5  max=  372.0
+tti_palette              first=  379.4  median=  378.3  min=  356.5  max=  395.0
+all_windows_ready        first=  385.4  median=  383.8  min=  362.5  max=  401.0
+tti                      first=  379.4  median=  378.3  min=  356.5  max=  395.0
+TTI vs the 400 ms budget: 0/10 launches over 400 ms; median 378 ms, worst 395 ms
+SUMMARY {"metric": "cold", "windows": 1, "opacity": "background", "runs": 10, "tti_median": 378.343994140625, "tti_worst": 394.9970703125, "over_budget": 0, "input_ready_median": 330.1444091796875, "input_ready_worst": 350.9970703125, "palette_median": 378.343994140625, "first_paint_median": 378.343994140625, "main_to_js_median": 243.9610595703125, "js_to_mounted_median": 72.0, "all_windows_median": 383.843994140625, "all_windows_worst": 400.9970703125, "load": [10.5, 20.1]}
+
+[windows=1 opacity=whole] ms from process launch
+exec_to_main             first=   17.3  median=   17.3  min=   13.5  max=   18.1
+main_to_js               first=  253.8  median=  244.6  min=  233.7  max=  255.2
+js_to_mounted            first=   74.0  median=   72.0  min=   71.0  max=   74.0
+input_ready              first=  346.1  median=  333.6  min=  322.2  max=  347.2
+first_paint              first=  394.1  median=  378.7  min=  366.2  max=  394.1
+first_contentful_paint   first=  368.1  median=  354.6  min=  343.2  max=  368.2
+tti_palette              first=  394.1  median=  378.7  min=  366.2  max=  394.1
+all_windows_ready        first=  402.1  median=  384.7  min=  372.2  max=  402.1
+tti                      first=  394.1  median=  378.7  min=  366.2  max=  394.1
+TTI vs the 400 ms budget: 0/10 launches over 400 ms; median 379 ms, worst 394 ms
+SUMMARY {"metric": "cold", "windows": 1, "opacity": "whole", "runs": 10, "tti_median": 378.6500244140625, "tti_worst": 394.14501953125, "over_budget": 0, "input_ready_median": 333.617431640625, "input_ready_worst": 347.218994140625, "palette_median": 378.6500244140625, "first_paint_median": 378.6500244140625, "main_to_js_median": 244.5784912109375, "js_to_mounted_median": 72.0, "all_windows_median": 384.6500244140625, "all_windows_worst": 402.14501953125, "load": [10.5, 20.1]}
+
+[windows=3 opacity=off] ms from process launch
+exec_to_main             first=   17.5  median=   15.5  min=    8.1  max=   18.9
+main_to_js               first=  261.6  median=  246.5  min=  239.6  max=  275.8
+js_to_mounted            first=   72.0  median=   72.0  min=   71.0  max=   73.0
+input_ready              first=  352.2  median=  333.6  min=  321.7  max=  366.1
+first_paint              first=  398.2  median=  380.6  min=  365.7  max=  411.1
+first_contentful_paint   first=  373.2  median=  355.3  min=  341.7  max=  387.1
+tti_palette              first=  398.2  median=  380.6  min=  365.7  max=  411.1
+all_windows_ready        first=  542.2  median=  519.2  min=  508.7  max=  552.1
+tti                      first=  398.2  median=  380.6  min=  365.7  max=  411.1
+TTI vs the 400 ms budget: 1/10 launches over 400 ms; median 381 ms, worst 411 ms
+SUMMARY {"metric": "cold", "windows": 3, "opacity": "off", "runs": 10, "tti_median": 380.559326171875, "tti_worst": 411.075927734375, "over_budget": 1, "input_ready_median": 333.559326171875, "input_ready_worst": 366.075927734375, "palette_median": 380.559326171875, "first_paint_median": 380.559326171875, "main_to_js_median": 246.4581298828125, "js_to_mounted_median": 72.0, "all_windows_median": 519.180908203125, "all_windows_worst": 552.075927734375, "load": [10.5, 20.1]}
+
+[windows=3 opacity=background] ms from process launch
+exec_to_main             first=   24.1  median=   14.8  min=    6.5  max=   24.1
+main_to_js               first=  257.6  median=  246.4  min=  227.3  max=  261.0
+js_to_mounted            first=   73.0  median=   72.0  min=   70.0  max=   77.0
+input_ready              first=  356.7  median=  333.1  min=  314.1  max=  357.6
+first_paint              first=  400.7  median=  378.1  min=  358.1  max=  404.6
+first_contentful_paint   first=  377.7  median=  353.6  min=  335.1  max=  379.6
+tti_palette              first=  400.7  median=  378.1  min=  358.1  max=  404.6
+all_windows_ready        first=  553.7  median=  520.1  min=  496.3  max=  553.7
+tti                      first=  400.7  median=  378.1  min=  358.1  max=  404.6
+TTI vs the 400 ms budget: 2/10 launches over 400 ms; median 378 ms, worst 405 ms
+SUMMARY {"metric": "cold", "windows": 3, "opacity": "background", "runs": 10, "tti_median": 378.0655517578125, "tti_worst": 404.56689453125, "over_budget": 2, "input_ready_median": 333.0655517578125, "input_ready_worst": 357.56689453125, "palette_median": 378.0655517578125, "first_paint_median": 378.0655517578125, "main_to_js_median": 246.4459228515625, "js_to_mounted_median": 72.0, "all_windows_median": 520.056640625, "all_windows_worst": 553.694091796875, "load": [10.5, 20.1]}
+
+[windows=3 opacity=whole] ms from process launch
+exec_to_main             first=   15.6  median=   14.1  min=   11.5  max=   18.7
+main_to_js               first=  245.8  median=  242.6  min=  234.8  max=  251.8
+js_to_mounted            first=   73.0  median=   72.5  min=   70.0  max=   74.0
+input_ready              first=  335.4  median=  334.5  min=  322.1  max=  340.8
+first_paint              first=  380.4  median=  379.1  min=  366.1  max=  386.8
+first_contentful_paint   first=  356.4  median=  355.5  min=  343.1  max=  362.8
+tti_palette              first=  380.4  median=  379.1  min=  366.1  max=  386.8
+all_windows_ready        first=  514.4  median=  520.7  min=  505.9  max=  544.8
+tti                      first=  380.4  median=  379.1  min=  366.1  max=  386.8
+TTI vs the 400 ms budget: 0/10 launches over 400 ms; median 379 ms, worst 387 ms
+SUMMARY {"metric": "cold", "windows": 3, "opacity": "whole", "runs": 10, "tti_median": 379.14794921875, "tti_worst": 386.80908203125, "over_budget": 0, "input_ready_median": 334.5274658203125, "input_ready_worst": 340.81201171875, "palette_median": 379.14794921875, "first_paint_median": 379.14794921875, "main_to_js_median": 242.5841064453125, "js_to_mounted_median": 72.5, "all_windows_median": 520.7425537109375, "all_windows_worst": 544.80908203125, "load": [10.5, 20.1]}
