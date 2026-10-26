@@ -153,3 +153,12 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 
 ## D-031 — 2026-10-26 — M0 gate review by Astra
 **Pedro approved launching GPT-6 Astra** (read-only, `codex exec -s read-only`) for the M0 gate review: security and architecture, starting from `docs/spikes/M0-findings.md`, on a frozen snapshot of `dev` (`666ce2d`). Argon is paused (D-015), so Astra reviews alone. Still to come for the gate: Pedro's hands-on checks, the partner's Linux checks (or an explicit deferral), decisions on CR-01 … CR-04 and `macOSPrivateApi`, then Pedro's sign-off (merge `dev` → `main`, push the code).
+
+## D-032 — 2026-10-26 — M0-06b hands-on check: accepted as is
+**Pedro**: the M0-06b build (layout B, Atrium Calm, opacity, pop-outs) "feels great for now, nothing to change". The hands-on gate check is done.
+
+## D-033 — 2026-10-26 — Linux checks run by the partner after the M0 gate
+**Pedro**: once M0 is closed, he hands the baton over (`scripts/handoff end`), and the partner runs the Linux/WebKitGTK checks (D-010) on their shift: blur fallback, opaque Linux mode, 60/120 Hz smoothness, TTI and memory for the shell, stream perf and screencast. They're explicitly **outside the M0 gate** and must be done before M1's UI work depends on them.
+
+## D-034 — 2026-10-26 — No Mac App Store: `macOSPrivateApi` accepted
+**Pedro** doesn't plan to ship through the Mac App Store. Tauri's `macOSPrivateApi` (needed for transparent windows / background-only opacity) is therefore accepted, and distribution is a notarized DMG (PLAN §5 M8). The CR-01 … CR-04 token and contract proposals are still decided in the M1 contract phase.
