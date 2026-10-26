@@ -11,12 +11,13 @@ import glob, json, os, sys
 out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/atrium-layout-b-measurements"
 cells = {}
 for path in sorted(glob.glob(os.path.join(out, "*.log"))):
-    metric, windows, opacity = os.path.basename(path)[:-4].split("-")
+    parts = os.path.basename(path)[:-4].split("-")
     text = open(path, errors="replace").read()
-    line = next((l for l in text.splitlines() if l.startswith("SUMMARY ")), None)
-    if line:
-        cells[(metric, windows, opacity)] = json.loads(line[len("SUMMARY "):])
-    else:
+    lines = [json.loads(l[len("SUMMARY "):]) for l in text.splitlines() if l.startswith("SUMMARY ")]
+    for c in lines:  # a coldmatrix log holds one SUMMARY per configuration
+        cells[(c["metric"], str(c["windows"]), c["opacity"])] = c
+    if not lines and len(parts) == 3:
+        metric, windows, opacity = parts
         failed = next((l for l in text.splitlines() if l.startswith("FAILED")), "FAILED (no summary)")
         cells[(metric, windows, opacity)] = {"failed": failed}
 

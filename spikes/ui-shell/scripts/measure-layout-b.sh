@@ -30,6 +30,19 @@ modes=("$mode")
 if [[ "$mode" == all ]]; then modes=(cold rss frames); fi
 failed=()
 for metric in "${modes[@]}"; do
+  if [[ "$metric" == cold ]]; then
+    # Interleaved: every launch round visits all six configurations, so other load on the
+    # machine spreads evenly instead of skewing whichever cell happened to run during it.
+    extra=()
+    if [[ -n "${ATRIUM_MEASURE_RUNS:-}" ]]; then extra+=(--runs "$ATRIUM_MEASURE_RUNS"); fi
+    echo "=== metric=cold, all six configurations interleaved"
+    if ! python3 scripts/measure.py coldmatrix ${args[@]+"${args[@]}"} ${extra[@]+"${extra[@]}"} >"$out/cold-matrix.log" 2>&1; then
+      failed+=(cold); echo "    FAILED: $(grep -m1 '^FAILED' "$out/cold-matrix.log" || tail -n 3 "$out/cold-matrix.log")"
+    else
+      grep '^TTI' "$out/cold-matrix.log" | sed 's/^/    ok: /'
+    fi
+    continue
+  fi
   for windows in 1 3; do
     for opacity in off background whole; do
       extra=()

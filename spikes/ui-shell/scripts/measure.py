@@ -2,6 +2,7 @@
 """Measurement harness for the layout-B UI shell (macOS).
 
   scripts/measure.py cold   [--runs 10] [--bin PATH]  time to interactive + first paint
+  scripts/measure.py coldmatrix [--runs 10]          cold, all six configurations interleaved
   scripts/measure.py rss    [--settle 10] [--bin PATH] idle memory: app + its WebKit helpers
   scripts/measure.py frames [--runs 3]  [--bin PATH]   rAF frame times (scroll 5k messages, resize)
   scripts/measure.py roundtrip [--bin PATH]            pop-out lifecycle checks in the real app
@@ -123,40 +124,70 @@ def summary(metric, **values):
     print("SUMMARY " + json.dumps({"metric": metric, "windows": int(CONFIG["ATRIUM_WINDOWS"]), "opacity": CONFIG["ATRIUM_OPACITY"], **values}))
 
 
-def cold(a):
-    print_config(a.bin)
-    rows = []
-    for i in range(a.runs):
-        tmp = tempfile.mkdtemp(prefix="atrium-cold-")
-        out, log = os.path.join(tmp, "report.json"), os.path.join(tmp, "app.log")
-        p, t0 = launch(a.bin, {"ATRIUM_BENCH": "startup", "ATRIUM_BENCH_OUT": out}, log)
-        try:
-            r = wait_report(out, p.poll, log, timeout=40)
-            validate_report(r)
-        finally:
-            stop(p)
-        m = r["marks"]
-        rows.append({
-            "exec_to_main": r["mainEpochMs"] - t0,
-            "main_to_js": m["jsStart"] - r["mainEpochMs"],
-            "js_to_mounted": m["mounted"] - m["jsStart"],
-            "first_paint_raf": m.get("firstPaintRaf", float("nan")) - t0,
-            "first_contentful_paint": m.get("firstContentfulPaint", float("nan")) - t0,
-            "tti_keystroke": m["firstInputHandled"] - t0,
-            "tti_palette": m["paletteReady"] - t0,
-            "all_windows_ready": m["allWindowsReady"] - t0,
-        })
-        print(f"run {i+1:2d}: " + "  ".join(f"{k}={v:7.1f}" for k, v in rows[-1].items()))
-        time.sleep(0.5)
-    print("\nms from process launch (run 1 = first launch of this configuration, rest = warm file cache)")
+def cold_once(binary):
+    tmp = tempfile.mkdtemp(prefix="atrium-cold-")
+    out, log = os.path.join(tmp, "report.json"), os.path.join(tmp, "app.log")
+    p, t0 = launch(binary, {"ATRIUM_BENCH": "startup", "ATRIUM_BENCH_OUT": out}, log)
+    try:
+        r = wait_report(out, p.poll, log, timeout=40)
+        validate_report(r)
+    finally:
+        stop(p)
+    m = r["marks"]
+    return {
+        "exec_to_main": r["mainEpochMs"] - t0,
+        "main_to_js": m["jsStart"] - r["mainEpochMs"],
+        "js_to_mounted": m["mounted"] - m["jsStart"],
+        "first_paint_raf": m.get("firstPaintRaf", float("nan")) - t0,
+        "first_contentful_paint": m.get("firstContentfulPaint", float("nan")) - t0,
+        "tti_keystroke": m["firstInputHandled"] - t0,
+        "tti_palette": m["paletteReady"] - t0,
+        "all_windows_ready": m["allWindowsReady"] - t0,
+    }
+
+
+def cold_summary(rows, load):
+    print(f"\n[windows={CONFIG['ATRIUM_WINDOWS']} opacity={CONFIG['ATRIUM_OPACITY']}] ms from process launch")
     for k in rows[0]:
         xs = [r[k] for r in rows]
         print(f"{k:24s} first={xs[0]:7.1f}  median={med(xs):7.1f}  min={min(xs):7.1f}  max={max(xs):7.1f}")
     tti = [r["tti_keystroke"] for r in rows]
-    print(f"\nTTI vs the 400 ms budget: {sum(1 for x in tti if x > 400)}/{len(tti)} launches over 400 ms; median {med(tti):.0f} ms, worst {max(tti):.0f} ms")
+    print(f"TTI vs the 400 ms budget: {sum(1 for x in tti if x > 400)}/{len(tti)} launches over 400 ms; median {med(tti):.0f} ms, worst {max(tti):.0f} ms")
     summary("cold", runs=len(rows), tti_median=med(tti), tti_worst=max(tti), over_budget=sum(1 for x in tti if x > 400),
             palette_median=med([r["tti_palette"] for r in rows]), first_paint_median=med([r["first_paint_raf"] for r in rows]),
-            all_windows_median=med([r["all_windows_ready"] for r in rows]), all_windows_worst=max(r["all_windows_ready"] for r in rows))
+            main_to_js_median=med([r["main_to_js"] for r in rows]), js_to_mounted_median=med([r["js_to_mounted"] for r in rows]),
+            all_windows_median=med([r["all_windows_ready"] for r in rows]), all_windows_worst=max(r["all_windows_ready"] for r in rows), load=load)
+
+
+def cold(a):
+    print_config(a.bin)
+    load0 = os.getloadavg()[0]
+    rows = []
+    for i in range(a.runs):
+        rows.append(cold_once(a.bin))
+        print(f"run {i+1:2d}: " + "  ".join(f"{k}={v:7.1f}" for k, v in rows[-1].items()))
+        time.sleep(0.5)
+    cold_summary(rows, [round(load0, 1), round(os.getloadavg()[0], 1)])
+
+
+def coldmatrix(a):
+    """All six configurations interleaved launch by launch, so background load from other work on
+    the machine spreads evenly over them instead of landing on whichever cell ran at the time."""
+    print_config(a.bin)
+    configs = [(w, o) for w in ("1", "3") for o in ("off", "background", "whole")]
+    rows = {c: [] for c in configs}
+    loads = []
+    for i in range(a.runs):
+        loads.append(round(os.getloadavg()[0], 1))
+        for w, o in configs:
+            CONFIG["ATRIUM_WINDOWS"], CONFIG["ATRIUM_OPACITY"] = w, o
+            rows[(w, o)].append(cold_once(a.bin))
+            print(f"run {i+1:2d} windows={w} opacity={o:10s} tti={rows[(w, o)][-1]['tti_keystroke']:6.1f}  all-ready={rows[(w, o)][-1]['all_windows_ready']:6.1f}")
+            time.sleep(0.3)
+    print(f"1-minute load average at the start of each round: {loads}")
+    for w, o in configs:
+        CONFIG["ATRIUM_WINDOWS"], CONFIG["ATRIUM_OPACITY"] = w, o
+        cold_summary(rows[(w, o)], [min(loads), max(loads)])
 
 
 def ps_table():
@@ -275,7 +306,7 @@ def rss(a):
         r2, f2 = snapshot(pid, resp, f"idle {a.settle + 20} s after launch")
     finally:
         terminate_pid(pid)
-    summary("rss", footprint=[round(f1, 1), round(f2, 1)], rss=[round(r1, 1), round(r2, 1)], footprint_max=max(f1, f2))
+    summary("rss", load=round(os.getloadavg()[0], 1), footprint=[round(f1, 1), round(f2, 1)], rss=[round(r1, 1), round(r2, 1)], footprint_max=max(f1, f2))
 
 
 def frames(a):
@@ -308,7 +339,7 @@ def frames(a):
         return {"fps_median": med([r[k]["fps"] for r in runs]), "fps_worst": min(r[k]["fps"] for r in runs),
                 "p95_median": med([r[k]["p95Ms"] for r in runs]), "p99_worst": max(r[k]["p99Ms"] for r in runs),
                 "max_worst": max(r[k]["maxMs"] for r in runs), "over25_total": sum(r[k]["over25ms"] for r in runs)}
-    summary("frames", runs=len(runs), **{k: agg(k) for k in ("idleFrames", "scrollReading", "scrollFling", "resize")})
+    summary("frames", load=round(os.getloadavg()[0], 1), runs=len(runs), **{k: agg(k) for k in ("idleFrames", "scrollReading", "scrollFling", "resize")})
 
 
 def roundtrip(a):
@@ -343,7 +374,7 @@ def terminate_pid(pid):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["cold", "rss", "frames", "roundtrip"])
+    ap.add_argument("mode", choices=["cold", "coldmatrix", "rss", "frames", "roundtrip"])
     ap.add_argument("--runs", type=int, default=None)
     ap.add_argument("--settle", type=int, default=10)
     ap.add_argument("--bin", default=DEFAULT_BIN)
@@ -363,7 +394,7 @@ if __name__ == "__main__":
     if not os.access(a.bin, os.X_OK):
         sys.exit(f"FAILED: no executable at {a.bin} (build it with `pnpm tauri build`)")
     try:
-        {"cold": cold, "rss": rss, "frames": frames, "roundtrip": roundtrip}[a.mode](a)
+        {"cold": cold, "coldmatrix": coldmatrix, "rss": rss, "frames": frames, "roundtrip": roundtrip}[a.mode](a)
     except (HarnessError, KeyError, AssertionError) as e:
         print(f"FAILED ({a.mode}, windows={a.windows}, opacity={a.opacity}): {type(e).__name__}: {e}", file=sys.stderr)
         print(f"FAILED {type(e).__name__}: {e}")
