@@ -134,3 +134,6 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 
 ## D-026 — 2026-10-25 — Resume: M0-06b and M0-08 (M0-07 stays paused)
 **Pedro gave the go** to start M0-06b (Sol, reviewer Sonnet) and to resume M0-08's fix round 1 (Sonnet, from WIP `f50361e`). M0-07 stays paused (~65% done, WIP `c06628a`), and so does wave 3 (M0-09). The D-021 pause is lifted only for these two tasks.
+
+## D-027 — 2026-10-26 — M0-06b handed from Sol to Opus
+**Decided by Pedro**: Sol's M0-06b result was underwhelming. An Opus 5.5 subagent takes over the fix round. It fixes all 13 review findings, raises the design fidelity to `docs/design/ui-direction.md`, and runs the full measurement matrix and screenshots itself (it runs on the host). The cross-provider reviewer for Opus's work is Sol (read-only). Routing note: for UI/design-heavy frontend work, Sonnet/Opus outperformed Sol in M0 (M0-06 vs M0-06b).
