@@ -8,6 +8,9 @@ import { quitApp, writeReport } from "./platform";
 import { setStage } from "./bench";
 import { bringBack, model, patchView, popOut, viewId } from "./windows";
 
+/** Set before subscribing, so the database pop-out never answers (see runRoundtrip). */
+export const ignoresReturn = (view: string | null) => view === "database";
+
 const WAIT_MS = 10000;
 const POLL_MS = 25;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -21,10 +24,13 @@ async function until(what: string, ok: () => boolean | Promise<boolean>): Promis
   throw new Error(`timed out waiting for ${what}`);
 }
 const ready = async (label: string) => label in (await invoke<Record<string, unknown>>("ready_states"));
+/** The native window list (Rust), not readiness: proves a window was actually destroyed. */
+const exists = async (label: string) => (await invoke<string[]>("window_labels")).includes(label);
 
 export const POPOUT_EDIT = " + typed in the pop-out right before closing";
 
-/** Pop-out side: edit, and close at once without waiting for the edit to be sent. */
+/** Pop-out side: the chat edits and closes at once without waiting for the edit to be sent;
+ *  the database never answers a return request. */
 export async function roundtripPopout(): Promise<void> {
   if (viewId !== "chat") return;
   void patchView("chat", { draft: model().views.chat.draft + POPOUT_EDIT });
@@ -40,7 +46,7 @@ export async function runRoundtrip(): Promise<void> {
   await patchView("chat", { draft });
   await popOut("chat");
   check("chat moved to its pop-out", model().views.chat.owner === "view-chat", model().views.chat.owner);
-  await until("the chat pop-out to return its view", async () => model().views.chat.owner === "main" && !(await ready("view-chat")));
+  await until("the chat pop-out to return its view and close", async () => model().views.chat.owner === "main" && !(await exists("view-chat")));
   check("edit made right before closing survives", model().views.chat.draft === draft + POPOUT_EDIT, JSON.stringify(model().views.chat.draft));
 
   setStage("roundtrip: polite bring-back");
@@ -52,11 +58,15 @@ export async function runRoundtrip(): Promise<void> {
   check("editor text unchanged", model().views.editor.content === content, "");
 
   setStage("roundtrip: forced bring-back");
+  // The database pop-out is loaded and listening, but deterministically ignores return requests
+  // (`ignoreReturnRequests`, set by index.tsx in this mode): it stands in for a hung window.
   await popOut("database");
-  // Ask before the pop-out has loaded its listener: it cannot answer, so main must force it.
+  await until("the database pop-out to be ready", () => ready("view-database"));
+  check("the database window exists natively", await exists("view-database"), "");
   const forced = await bringBack("database");
-  await until("the database window to be gone", async () => !(await ready("view-database")));
-  check("main recovers a view from a pop-out that does not answer", model().views.database.owner === "main", String(forced));
+  check("main forces the view back from a pop-out that does not answer", forced === "forced" && model().views.database.owner === "main", String(forced));
+  await until("the database window to be destroyed", async () => !(await exists("view-database")));
+  check("the unanswering window is destroyed (native window list)", !(await exists("view-database")), JSON.stringify(await invoke<string[]>("window_labels")));
 
   setStage("roundtrip: report");
   await writeReport({ kind: "roundtrip", checks });

@@ -28,7 +28,8 @@ def cold(c):
     if "failed" in c:
         return c["failed"][:80]
     mark = "✅" if c["tti_worst"] < 400 else ("⚠️" if c["tti_median"] < 400 else "❌")
-    return f"{c['tti_median']:.0f} / {c['tti_worst']:.0f} ms {mark} ({c['over_budget']}/{c['runs']} over)"
+    extra = f"; paint {c['first_paint_median']:.0f}, input {c['input_ready_median']:.0f}" if "input_ready_median" in c else ""
+    return f"{c['tti_median']:.0f} / {c['tti_worst']:.0f} ms {mark} ({c['over_budget']}/{c['runs']} over{extra})"
 
 
 def rss(c):

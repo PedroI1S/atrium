@@ -88,6 +88,26 @@ export function appearanceFor(input: AppearanceInput): Appearance {
   };
 }
 
+/** The native window's appearance; "system" clears the override so it follows macOS. */
+export type WindowAppearance = "light" | "dark" | "system";
+
+/** What a window's native side currently shows. `dark` is the vibrancy material's input. */
+export interface NativeShown { vibrancy: boolean; dark: boolean; alpha: number; appearance: "" | WindowAppearance }
+export interface NativeTarget { vibrancy: boolean; dark: boolean; alpha: number; appearance: WindowAppearance }
+
+/**
+ * The native calls needed to go from what is shown to the target. Vibrancy is re-applied when it
+ * turns on or off, and also when it stays on but the theme flips (the material depends on
+ * light/dark: review 2 #5).
+ */
+export function nativeCalls(shown: NativeShown, target: NativeTarget): { appearance?: WindowAppearance; vibrancy?: { enabled: boolean; dark: boolean }; alpha?: number } {
+  const calls: ReturnType<typeof nativeCalls> = {};
+  if (target.appearance !== shown.appearance) calls.appearance = target.appearance;
+  if (target.vibrancy !== shown.vibrancy || (target.vibrancy && target.dark !== shown.dark)) calls.vibrancy = { enabled: target.vibrancy, dark: target.dark };
+  if (target.alpha !== shown.alpha) calls.alpha = target.alpha;
+  return calls;
+}
+
 export function moveView(model: WindowModel, id: ViewId, owner: string): WindowModel {
   return { ...model, revision: model.revision + 1, views: { ...model.views, [id]: { ...model.views[id], owner } } };
 }

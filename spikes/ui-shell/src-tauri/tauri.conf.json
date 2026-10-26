@@ -22,7 +22,10 @@
         "minHeight": 560,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "trafficLightPosition": { "x": 18, "y": 21 },
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 21
+        },
         "transparent": true,
         "dragDropEnabled": false
       }
@@ -33,7 +36,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.png"]
+    "targets": [
+      "app"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.png"
+    ],
+    "resources": {
+      "../node_modules/@fontsource/instrument-sans/LICENSE": "licenses/Instrument-Sans-OFL-1.1.txt",
+      "../node_modules/@fontsource/geist-mono/LICENSE": "licenses/Geist-Mono-OFL-1.1.txt"
+    }
   }
 }

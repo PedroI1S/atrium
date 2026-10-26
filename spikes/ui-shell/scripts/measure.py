@@ -133,17 +133,29 @@ def cold_once(binary):
         validate_report(r)
     finally:
         stop(p)
+    return timing(r, t0)
+
+
+def timing(r, t0):
+    """Contract §5: TTI is reached once the window has painted AND the first input is handled,
+    so it is the later of the two. Input-handler readiness and first paint are reported apart."""
     m = r["marks"]
-    return {
+    if "firstPaint" not in m or "firstInputHandled" not in m:
+        raise HarnessError(f"report lacks firstPaint or firstInputHandled: {sorted(m)}")
+    row = {
         "exec_to_main": r["mainEpochMs"] - t0,
         "main_to_js": m["jsStart"] - r["mainEpochMs"],
         "js_to_mounted": m["mounted"] - m["jsStart"],
-        "first_paint_raf": m.get("firstPaintRaf", float("nan")) - t0,
+        "input_ready": m["firstInputHandled"] - t0,
+        "first_paint": m["firstPaint"] - t0,
         "first_contentful_paint": m.get("firstContentfulPaint", float("nan")) - t0,
-        "tti_keystroke": m["firstInputHandled"] - t0,
         "tti_palette": m["paletteReady"] - t0,
         "all_windows_ready": m["allWindowsReady"] - t0,
     }
+    row["tti"] = max(row["input_ready"], row["first_paint"])
+    if row["tti"] < row["first_paint"] or row["tti"] < row["input_ready"]:
+        raise HarnessError(f"TTI {row['tti']:.1f} ms precedes paint or input: {row}")
+    return row
 
 
 def cold_summary(rows, load):
@@ -151,10 +163,11 @@ def cold_summary(rows, load):
     for k in rows[0]:
         xs = [r[k] for r in rows]
         print(f"{k:24s} first={xs[0]:7.1f}  median={med(xs):7.1f}  min={min(xs):7.1f}  max={max(xs):7.1f}")
-    tti = [r["tti_keystroke"] for r in rows]
+    tti = [r["tti"] for r in rows]
     print(f"TTI vs the 400 ms budget: {sum(1 for x in tti if x > 400)}/{len(tti)} launches over 400 ms; median {med(tti):.0f} ms, worst {max(tti):.0f} ms")
     summary("cold", runs=len(rows), tti_median=med(tti), tti_worst=max(tti), over_budget=sum(1 for x in tti if x > 400),
-            palette_median=med([r["tti_palette"] for r in rows]), first_paint_median=med([r["first_paint_raf"] for r in rows]),
+            input_ready_median=med([r["input_ready"] for r in rows]), input_ready_worst=max(r["input_ready"] for r in rows),
+            palette_median=med([r["tti_palette"] for r in rows]), first_paint_median=med([r["first_paint"] for r in rows]),
             main_to_js_median=med([r["main_to_js"] for r in rows]), js_to_mounted_median=med([r["js_to_mounted"] for r in rows]),
             all_windows_median=med([r["all_windows_ready"] for r in rows]), all_windows_worst=max(r["all_windows_ready"] for r in rows), load=load)
 
@@ -170,24 +183,47 @@ def cold(a):
     cold_summary(rows, [round(load0, 1), round(os.getloadavg()[0], 1)])
 
 
-def coldmatrix(a):
+COLD_CONFIGS = [(w, o) for w in ("1", "3") for o in ("off", "background", "whole")]
+
+
+def coldmatrix(a, run_once=None, pause=0.3):
     """All six configurations interleaved launch by launch, so background load from other work on
-    the machine spreads evenly over them instead of landing on whichever cell ran at the time."""
+    the machine spreads evenly over them instead of landing on whichever cell ran at the time.
+    A failing configuration is recorded and skipped from then on; the others keep running and
+    still get their summaries (review 2 #6). Raises at the end if any configuration failed."""
+    run_once = run_once or (lambda: cold_once(a.bin))
     print_config(a.bin)
-    configs = [(w, o) for w in ("1", "3") for o in ("off", "background", "whole")]
-    rows = {c: [] for c in configs}
+    rows = {c: [] for c in COLD_CONFIGS}
+    failures = {}
     loads = []
     for i in range(a.runs):
         loads.append(round(os.getloadavg()[0], 1))
-        for w, o in configs:
+        for w, o in COLD_CONFIGS:
+            if (w, o) in failures:
+                continue
             CONFIG["ATRIUM_WINDOWS"], CONFIG["ATRIUM_OPACITY"] = w, o
-            rows[(w, o)].append(cold_once(a.bin))
-            print(f"run {i+1:2d} windows={w} opacity={o:10s} tti={rows[(w, o)][-1]['tti_keystroke']:6.1f}  all-ready={rows[(w, o)][-1]['all_windows_ready']:6.1f}")
-            time.sleep(0.3)
+            try:
+                rows[(w, o)].append(run_once())
+            except (HarnessError, KeyError, AssertionError, OSError) as e:
+                failures[(w, o)] = f"run {i+1}: {type(e).__name__}: {e}"
+                print(f"FAILED windows={w} opacity={o}: {failures[(w, o)]}")
+                continue
+            print(f"run {i+1:2d} windows={w} opacity={o:10s} tti={rows[(w, o)][-1]['tti']:6.1f}  all-ready={rows[(w, o)][-1]['all_windows_ready']:6.1f}")
+            time.sleep(pause)
     print(f"1-minute load average at the start of each round: {loads}")
-    for w, o in configs:
+    for w, o in COLD_CONFIGS:
         CONFIG["ATRIUM_WINDOWS"], CONFIG["ATRIUM_OPACITY"] = w, o
-        cold_summary(rows[(w, o)], [min(loads), max(loads)])
+        if (w, o) in failures:
+            print(f"SUMMARY " + json.dumps({"metric": "cold", "windows": int(w), "opacity": o, "failed": failures[(w, o)]}))
+        else:
+            cold_summary(rows[(w, o)], [min(loads), max(loads)])
+    if failures:
+        raise HarnessError(f"{len(failures)} cold configuration(s) failed: " + "; ".join(f"{w}/{o}: {m}" for (w, o), m in failures.items()))
+
+
+def default_runs(mode):
+    """Both cold modes default to ten launches per configuration (review 2 #7); frames to three."""
+    return 10 if mode in ("cold", "coldmatrix") else 3
 
 
 def ps_table():
@@ -388,7 +424,7 @@ if __name__ == "__main__":
         CONFIG["ATRIUM_THEME"] = a.theme
     os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     if a.runs is None:
-        a.runs = 10 if a.mode == "cold" else 3
+        a.runs = default_runs(a.mode)
     if a.runs < 1 or a.settle < 0:
         ap.error("runs must be positive; settle must be nonnegative")
     if not os.access(a.bin, os.X_OK):

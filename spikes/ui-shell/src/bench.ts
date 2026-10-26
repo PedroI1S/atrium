@@ -256,6 +256,11 @@ const BEFORE_FRAMES_MS = 500;
 
 /** Startup report (and, in `frames` mode, the frame benchmarks); reports through Rust. */
 export async function runHarness(info: StartupInfo): Promise<void> {
+  setStage("first paint");
+  for (let waited = 0; marks.firstPaint === undefined; waited += GATE_POLL_MS) {
+    if (waited > RAF_TIMEOUT_MS) throw new Error("the main window never painted (no rAF after mount)");
+    await sleep(GATE_POLL_MS);
+  }
   setStage("gate");
   await waitForWindows(info.windows);
   marks.allWindowsReady = epochNow();

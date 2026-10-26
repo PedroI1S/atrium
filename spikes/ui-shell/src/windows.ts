@@ -8,8 +8,8 @@ import { emitTo, listen } from "@tauri-apps/api/event";
 import { inTauri, setWindowTheme, type StartupInfo } from "./platform";
 import { applyTheme } from "./theme/runtime";
 import { calmTheme } from "./theme/calm";
-import { WriteQueue, bringBackFromMain, closeOwnedView, coalescing, debounced, latestWins } from "./sync";
-import { DEFAULT_SETTINGS, appearanceFor, initialModel, type Appearance, type AppearanceSettings, type ViewId, type ViewState, type WindowModel } from "./window-model";
+import { EditGate, WriteQueue, bringBackFromMain, coalescing, debounced, latestWins, makeCloser, prepareMove } from "./sync";
+import { DEFAULT_SETTINGS, appearanceFor, initialModel, nativeCalls, type Appearance, type NativeShown, type WindowAppearance, type AppearanceSettings, type ViewId, type ViewState, type WindowModel } from "./window-model";
 
 export const viewId = new URLSearchParams(location.search).get("view") as ViewId | null;
 export const windowLabel = viewId ? `view-${viewId}` : "main";
@@ -32,7 +32,7 @@ const pending: { view: ViewId; patch: Partial<ViewState> }[] = [];
 const [settingsOverlay, setSettingsOverlay] = createSignal<Partial<AppearanceSettings> | null>(null);
 
 /** What the native window currently shows, so paint only calls native APIs on a change. */
-const native = { vibrancy: false, alpha: 1, appearance: "" as "" | WindowAppearance };
+const native: NativeShown = { vibrancy: false, dark: false, alpha: 1, appearance: "" };
 let paintedTheme = "";
 let lastAppearance: Appearance | null = null;
 
@@ -47,7 +47,6 @@ function currentAppearance(): Appearance {
 }
 
 /** The native window follows the OS for "system", so prefers-color-scheme keeps tracking it. */
-type WindowAppearance = "light" | "dark" | "system";
 const windowAppearance = (a: Appearance): WindowAppearance => (effectiveSettings().theme === "system" ? "system" : a.native.appearance);
 
 /** CSS half of a paint: synchronous, cheap, safe to run on every slider event. */
@@ -66,15 +65,17 @@ function paintTokens(a: Appearance): void {
 async function paintNative(a: Appearance): Promise<void> {
   if (!inTauri) return;
   const calls: Promise<void>[] = [];
-  const appearance = windowAppearance(a);
-  if (appearance !== native.appearance) {
+  const need = nativeCalls(native, { vibrancy: a.native.vibrancy, dark: a.native.appearance === "dark", alpha: a.native.alpha, appearance: windowAppearance(a) });
+  if (need.appearance) {
+    const appearance = need.appearance;
     calls.push(setWindowTheme(appearance).then(() => { native.appearance = appearance; }));
   }
-  if (a.native.vibrancy !== native.vibrancy) {
-    calls.push(invoke<boolean>("set_vibrancy", { enabled: a.native.vibrancy, dark: a.native.appearance === "dark" }).then((v) => { native.vibrancy = v; }));
+  if (need.vibrancy) {
+    const { enabled, dark } = need.vibrancy;
+    calls.push(invoke<boolean>("set_vibrancy", { enabled, dark }).then((v) => { native.vibrancy = v; native.dark = dark; }));
   }
-  if (a.native.alpha !== native.alpha) {
-    calls.push(invoke<number>("set_window_alpha", { alpha: a.native.alpha }).then((v) => { native.alpha = v; }));
+  if (need.alpha !== undefined) {
+    calls.push(invoke<number>("set_window_alpha", { alpha: need.alpha }).then((v) => { native.alpha = v; }));
   }
   const results = await Promise.allSettled(calls);
   const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
@@ -121,6 +122,7 @@ export function initFromStartup(info: StartupInfo): void {
   setNativeSupported(info.vibrancySupported);
   osReduce = info.accessibilityOpaque;
   native.vibrancy = info.native.vibrancy;
+  native.dark = info.native.dark;
   native.alpha = info.native.alpha;
   if (info.snapshot) setModel(info.snapshot);
   else {
@@ -139,7 +141,7 @@ export async function subscribe(): Promise<void> {
   if (!inTauri) return;
   await listen<WindowModel>("shell-state", (e) => accept(e.payload));
   await listen<boolean>("accessibility-changed", (e) => { osReduce = e.payload; void repaint(); });
-  if (viewId) await listen("return-view", () => { void closeThisPopout(); });
+  if (viewId) await listen("return-view", () => { if (answerReturnRequests) void closeThisPopout(); });
 }
 
 /** Wires the OS-preference listeners and the close handler. Runs after the first render. */
@@ -206,10 +208,21 @@ export function patchSettings(patch: Partial<AppearanceSettings>): Promise<void>
 // -- views ---------------------------------------------------------------------------------
 
 export const ownsView = (view: ViewId) => model().views[view].owner === windowLabel;
+/** Refuses new user edits to a view while it moves to another window (synchronous). */
+const gate = new EditGate<ViewId>();
 export const canEdit = (view: ViewId) => ownsView(view) && moving() !== view;
 
-export function patchView(view: ViewId, patch: Partial<ViewState>): Promise<void> {
-  if (!canEdit(view)) return Promise.resolve();
+function unfreeze(view: ViewId): void {
+  gate.unblock(view);
+  setMoving(null);
+}
+
+/**
+ * A view edit. User edits are refused while the view is moving; `buffered` marks state that was
+ * captured before the move started (the debounced scroll position), which must still land.
+ */
+export function patchView(view: ViewId, patch: Partial<ViewState>, buffered = false): Promise<void> {
+  if (!ownsView(view) || !gate.allows(view, buffered)) return Promise.resolve();
   if (!inTauri) {
     setModel({ ...model(), revision: model().revision + 1, views: { ...model().views, [view]: { ...model().views[view], ...patch } } });
     return Promise.resolve();
@@ -226,47 +239,46 @@ export function patchView(view: ViewId, patch: Partial<ViewState>): Promise<void
   });
 }
 
-export const persistScroll = debounced((scroll: number) => { void patchView("chat", { scroll }); }, SCROLL_PERSIST_MS);
+export const persistScroll = debounced((scroll: number) => { void patchView("chat", { scroll }, true); }, SCROLL_PERSIST_MS);
 
-async function flushEdits(): Promise<void> {
-  persistScroll.flush();
-  await writes.flush();
+/** Freeze user edits, flush the buffered scroll position, drain every accepted write. */
+function prepare(view: ViewId): Promise<void> {
+  setMoving(view);
+  return prepareMove(gate, view, () => persistScroll.flush(), writes);
 }
 
 export async function popOut(view: ViewId): Promise<void> {
   if (!inTauri) { setNativeError("Pop-out windows need the native app."); return; }
-  setMoving(view);
   try {
-    await flushEdits();
+    await prepare(view);
     accept(await invoke<WindowModel>("pop_out", { view }));
   } catch (e) {
     setNativeError(String(e));
   } finally {
-    setMoving(null);
+    unfreeze(view);
   }
 }
 
-/** Pop-out side: flush, hand the view back, close. Always closes (review #6). */
-async function closeThisPopout(): Promise<void> {
-  if (!viewId) return;
-  const id = viewId;
-  await closeOwnedView({
-    flush: flushEdits,
-    bringBack: () => invoke("bring_back", { view: id }),
-    destroy: async () => {
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().destroy();
-    },
-  });
+/** Pop-out side: freeze, drain, hand the view back, close. Idempotent; always closes (#6, review 2 #1). */
+const closeThisPopout = makeCloser({
+  prepare: () => (viewId ? prepare(viewId) : Promise.resolve()),
+  bringBack: () => invoke("bring_back", { view: viewId }),
+  destroy: async () => {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    await getCurrentWindow().destroy();
+  },
+});
+
+/** Pop-out side: a "return-view" request from main. Suppressible for the forced-path check. */
+let answerReturnRequests = true;
+export function ignoreReturnRequests(): void {
+  answerReturnRequests = false;
 }
 
 /** From either side: the pop-out closes itself; main asks politely, then forces after a timeout. */
 export async function bringBack(view: ViewId): Promise<"returned" | "forced" | "destroyed" | "none"> {
   if (!inTauri) return "none";
-  if (viewId === view) {
-    await closeThisPopout();
-    return "returned";
-  }
+  if (viewId === view) return closeThisPopout();
   const owner = model().views[view].owner;
   if (owner === "main") return "none";
   return bringBackFromMain({

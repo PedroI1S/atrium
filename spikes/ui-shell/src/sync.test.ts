@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WriteQueue, bringBackFromMain, closeOwnedView, coalescing, debounced, latestWins } from "./sync";
+import { EditGate, WriteQueue, bringBackFromMain, coalescing, debounced, latestWins, makeCloser, prepareMove } from "./sync";
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 function deferred() {
@@ -39,18 +39,78 @@ describe("WriteQueue (review #6: a rejected patch latched and made the pop-out u
   });
 });
 
-describe("closeOwnedView", () => {
-  it("brings the view back even when the flush fails", async () => {
+describe("makeCloser", () => {
+  it("brings the view back even when the drain fails", async () => {
     const bringBack = vi.fn(async () => {});
     const destroy = vi.fn(async () => {});
-    expect(await closeOwnedView({ flush: () => Promise.reject(new Error("x")), bringBack, destroy })).toBe("returned");
+    expect(await makeCloser({ prepare: () => Promise.reject(new Error("x")), bringBack, destroy })()).toBe("returned");
     expect(bringBack).toHaveBeenCalledOnce();
     expect(destroy).not.toHaveBeenCalled();
   });
   it("destroys the window when bring-back is refused", async () => {
     const destroy = vi.fn(async () => {});
-    expect(await closeOwnedView({ flush: async () => {}, bringBack: () => Promise.reject(new Error("refused")), destroy })).toBe("destroyed");
+    expect(await makeCloser({ prepare: async () => {}, bringBack: () => Promise.reject(new Error("refused")), destroy })()).toBe("destroyed");
     expect(destroy).toHaveBeenCalledOnce();
+  });
+});
+
+/** A miniature of windows.ts: user edits pass the gate, then go through the write queue. */
+function viewModel() {
+  const gate = new EditGate<"chat">();
+  const queue = new WriteQueue();
+  const sent: unknown[] = [];
+  const stalls = new Map<unknown, Promise<void>>();
+  const edit = (patch: unknown, buffered = false): boolean => {
+    if (!gate.allows("chat", buffered)) return false;
+    void queue.enqueue(async () => {
+      await stalls.get(patch);
+      sent.push(patch);
+    });
+    return true;
+  };
+  return { gate, queue, sent, stalls, edit };
+}
+
+describe("closing with a stalled write (review 2 #1)", () => {
+  it("freezes edits synchronously, drains every accepted edit before bring-back, and closes once", async () => {
+    const m = viewModel();
+    const stall = deferred();
+    const a = { draft: "a" };
+    m.stalls.set(a, stall.promise);
+    expect(m.edit(a)).toBe(true); // in flight, stalled
+    expect(m.edit({ draft: "ab" })).toBe(true); // accepted, queued behind the stalled write
+    const bringBack = vi.fn(async () => { m.sent.push("bring_back"); });
+    const close = makeCloser({ prepare: () => prepareMove(m.gate, "chat", () => {}, m.queue), bringBack, destroy: async () => {} });
+    const first = close();
+    expect(m.edit({ draft: "abc" })).toBe(false); // typed after close started: refused at once
+    expect(close()).toBe(first); // idempotent
+    await tick();
+    expect(bringBack).not.toHaveBeenCalled(); // still draining the stalled write
+    stall.resolve();
+    expect(await first).toBe("returned");
+    expect(m.sent).toEqual([a, { draft: "ab" }, "bring_back"]);
+    expect(bringBack).toHaveBeenCalledOnce();
+  });
+  it("drain also waits for writes enqueued while it waits", async () => {
+    const q = new WriteQueue();
+    const order: string[] = [];
+    void q.enqueue(async () => { await tick(); order.push("a"); void q.enqueue(async () => { await tick(); order.push("b"); }); });
+    await q.drain();
+    expect(order).toEqual(["a", "b"]);
+  });
+});
+
+describe("scroll then pop-out (review 2 #2)", () => {
+  it("the pending scroll position lands before the move; new user edits do not", async () => {
+    const m = viewModel();
+    const scroll = debounced((y: number) => { m.edit({ scroll: y }, true); }, 150);
+    scroll(100);
+    scroll(425); // the user pops out within 150 ms of scrolling
+    const moved = prepareMove(m.gate, "chat", () => scroll.flush(), m.queue).then(() => { m.sent.push("pop_out"); });
+    expect(m.edit({ draft: "late" })).toBe(false);
+    await moved;
+    expect(m.sent).toEqual([{ scroll: 425 }, "pop_out"]);
+    expect(scroll.pending()).toBe(false);
   });
 });
 

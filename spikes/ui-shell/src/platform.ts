@@ -21,7 +21,7 @@ export interface StartupInfo {
   opacity: string;
   accessibilityOpaque: boolean;
   /** What Rust already applied natively to this window before the webview loaded. */
-  native: { vibrancy: boolean; alpha: number };
+  native: { vibrancy: boolean; dark: boolean; alpha: number };
   /** The first state snapshot (null in a browser). */
   snapshot: WindowModel | null;
 }
@@ -32,7 +32,7 @@ export async function startupInfo(): Promise<StartupInfo> {
   return {
     mainEpochMs: 0, label: q.get("view") ? `view-${q.get("view")}` : "main", benchMode: q.get("bench"), openPalette: q.has("palette"),
     screen: q.get("screen"), rightTab: q.get("rightTab"), advanced: q.has("advanced"), panel: q.get("panel"),
-    vibrancySupported: false, windows: 1, opacity: "off", accessibilityOpaque: false, native: { vibrancy: false, alpha: 1 }, snapshot: null,
+    vibrancySupported: false, windows: 1, opacity: "off", accessibilityOpaque: false, native: { vibrancy: false, dark: false, alpha: 1 }, snapshot: null,
   };
 }
 

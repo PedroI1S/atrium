@@ -47,12 +47,14 @@ struct Native(Mutex<HashMap<String, NativeState>>);
 #[serde(rename_all = "camelCase")]
 struct NativeState {
     vibrancy: bool,
+    /// The vibrancy material's input (dark or light material).
+    dark: bool,
     alpha: f64,
 }
 
 impl Default for NativeState {
     fn default() -> Self {
-        Self { vibrancy: false, alpha: 1.0 }
+        Self { vibrancy: false, dark: false, alpha: 1.0 }
     }
 }
 
@@ -63,6 +65,7 @@ fn native_target(s: &Settings, popout: bool, reduce: bool) -> NativeState {
     let alpha = if opaque { 1.0 } else { s.alpha };
     NativeState {
         vibrancy: s.mode == "background" && alpha < 1.0 && s.blur,
+        dark: s.theme != "atrium-calm-light",
         alpha: if s.mode == "whole" { alpha } else { 1.0 },
     }
 }
@@ -132,7 +135,10 @@ fn set_vibrancy(window: WebviewWindow, native: State<'_, Native>, enabled: bool,
         let _ = (enabled, dark);
         false
     };
-    native.0.lock().unwrap().entry(window.label().to_string()).or_default().vibrancy = applied;
+    let mut shown = native.0.lock().unwrap();
+    let entry = shown.entry(window.label().to_string()).or_default();
+    entry.vibrancy = applied;
+    entry.dark = dark;
     Ok(applied)
 }
 
@@ -152,9 +158,11 @@ fn apply_native(app: &tauri::AppHandle, window: &WebviewWindow, settings: &Setti
     #[cfg(target_os = "macos")]
     {
         if target.vibrancy {
-            let dark = settings.theme != "atrium-calm-light";
-            match vibrancy_on(window, true, dark) {
-                Ok(v) => applied.vibrancy = v,
+            match vibrancy_on(window, true, target.dark) {
+                Ok(v) => {
+                    applied.vibrancy = v;
+                    applied.dark = target.dark;
+                }
                 Err(e) => eprintln!("apply_vibrancy failed: {e}"),
             }
         }
@@ -180,6 +188,15 @@ fn write_report(json: String) -> Result<(), String> {
         shell::write_atomic(std::path::Path::new(&path), json.as_bytes()).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Labels of the windows that exist natively right now (the round-trip check uses it to prove a
+/// pop-out was destroyed, not merely that it stopped reporting).
+#[tauri::command]
+fn window_labels(app: tauri::AppHandle) -> Vec<String> {
+    let mut labels: Vec<String> = app.webview_windows().into_keys().collect();
+    labels.sort();
+    labels
 }
 
 #[tauri::command]
@@ -222,17 +239,6 @@ fn restore_windows(app: tauri::AppHandle, window: WebviewWindow) -> Result<usize
         let _ = window.set_focus();
     }
     Ok(views.len())
-}
-
-/// Keeps App Nap and timer coalescing away from a measurement run (the harness launches the
-/// app while the user's other apps are in front).
-#[cfg(target_os = "macos")]
-fn hold_measurement_activity() {
-    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
-    let reason = NSString::from_str("Atrium measurement run");
-    let token = NSProcessInfo::processInfo()
-        .beginActivityWithOptions_reason(NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical, &reason);
-    std::mem::forget(token); // held for the life of the process
 }
 
 /// Re-checks Reduce transparency / Increase contrast whenever macOS says they changed and tells
@@ -280,6 +286,7 @@ pub fn run() {
             startup_info,
             set_vibrancy,
             write_report,
+            window_labels,
             quit
         ])
         .on_window_event(|window, event| {
@@ -316,8 +323,6 @@ pub fn run() {
             observe_accessibility(handle.clone());
 
             if harness {
-                #[cfg(target_os = "macos")]
-                hold_measurement_activity();
                 // Three-window runs restore two pop-outs, as a relaunch would; main creates them
                 // once it is interactive (`restore_windows`). `ATRIUM_POPOUTS=chat,editor` picks
                 // them explicitly (screenshots).
@@ -327,8 +332,10 @@ pub fn run() {
                     None => Vec::new(),
                 };
                 *app.state::<Restore>().0.lock().unwrap() = popouts;
-                // Activate the app and bring main to the front: a background, non-key window
-                // gets throttled timers and no rAF, which skewed (and hung) earlier runs.
+                // Activate the app and bring main to the front, as a launch from the Dock or
+                // Finder does: a background, non-key window gets throttled timers and no rAF,
+                // which skewed (and hung) earlier runs. No process activity is held (review 2 #4):
+                // measured runs schedule like normal launches.
                 if let Some(main) = app.get_webview_window(MAIN) {
                     let _ = main.set_focus();
                 }
@@ -364,6 +371,8 @@ mod tests {
         assert_eq!(native_target(&opaque_popouts, true, false).alpha, 1.0);
         assert_eq!(native_target(&opaque_popouts, false, false).alpha, if mac { 0.6 } else { 1.0 }, "main is not a pop-out");
         assert!(!native_target(&bg, false, true).vibrancy, "accessibility forces opaque");
-        assert!(!native_target(&Settings { blur: false, ..bg }, false, false).vibrancy);
+        assert!(!native_target(&Settings { blur: false, ..bg.clone() }, false, false).vibrancy);
+        assert!(native_target(&bg, false, false).dark);
+        assert!(!native_target(&Settings { theme: "atrium-calm-light".into(), ..bg }, false, false).dark, "light material");
     }
 }

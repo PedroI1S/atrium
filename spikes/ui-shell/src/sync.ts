@@ -31,6 +31,39 @@ export class WriteQueue {
   flush(): Promise<void> {
     return this.tail;
   }
+
+  /** Waits until the queue is empty, including writes enqueued while waiting. */
+  async drain(): Promise<void> {
+    let seen: Promise<void>;
+    do {
+      seen = this.tail;
+      await seen;
+    } while (seen !== this.tail);
+  }
+}
+
+/**
+ * Edit gate for views (review 2, #1 and #2). While a view is moving (pop-out or close), new USER
+ * edits are refused synchronously, but state that was already buffered (the debounced scroll
+ * position) may still be written, so nothing accepted before the move is lost.
+ */
+export class EditGate<V extends string> {
+  private blocked = new Set<V>();
+  block(view: V): void { this.blocked.add(view); }
+  unblock(view: V): void { this.blocked.delete(view); }
+  isBlocked(view: V): boolean { return this.blocked.has(view); }
+  /** A user edit may start only while the view is not moving. Buffered flushes pass `buffered`. */
+  allows(view: V, buffered = false): boolean { return buffered || !this.blocked.has(view); }
+}
+
+/**
+ * Prepares a view to move to another window: refuse new user edits (synchronously, before any
+ * await), flush buffered state, then drain every accepted write. Used by pop-out and by close.
+ */
+export function prepareMove<V extends string>(gate: EditGate<V>, view: V, flushBuffered: () => void, queue: WriteQueue): Promise<void> {
+  gate.block(view);
+  flushBuffered();
+  return queue.drain();
 }
 
 /**
@@ -100,23 +133,30 @@ export function debounced<A>(fn: (arg: A) => void, ms: number) {
 }
 
 /**
- * Closing a pop-out: flush its edits, then give the view back. A failed flush or a failed
- * bring-back can never leave the window unclosable: the last resort destroys it, and Rust
- * returns the view on destruction anyway.
+ * Closing a pop-out: freeze and drain its edits, then give the view back. Idempotent: a second
+ * close (the close button pressed twice, or a close request racing "Move back") reuses the
+ * first. A failed drain or a failed bring-back can never leave the window unclosable: the last
+ * resort destroys it, and Rust returns the view on destruction anyway.
  */
-export async function closeOwnedView(steps: { flush: () => Promise<void>; bringBack: () => Promise<unknown>; destroy: () => Promise<unknown> }): Promise<"returned" | "destroyed"> {
-  try {
-    await steps.flush();
-  } catch {
-    /* edits that failed to send are already reported; closing must still work */
-  }
-  try {
-    await steps.bringBack();
-    return "returned";
-  } catch {
-    await steps.destroy();
-    return "destroyed";
-  }
+export function makeCloser(steps: { prepare: () => Promise<void>; bringBack: () => Promise<unknown>; destroy: () => Promise<unknown> }): () => Promise<"returned" | "destroyed"> {
+  let closing: Promise<"returned" | "destroyed"> | null = null;
+  return () => {
+    closing ??= (async () => {
+      try {
+        await steps.prepare();
+      } catch {
+        /* edits that failed to send are already reported; closing must still work */
+      }
+      try {
+        await steps.bringBack();
+        return "returned" as const;
+      } catch {
+        await steps.destroy();
+        return "destroyed" as const;
+      }
+    })();
+    return closing;
+  };
 }
 
 /**

@@ -13,8 +13,8 @@ import { epochNow, markOnce, reportFailure, runHarness, runProbe, setStage } fro
 import { type PanelTab, type Screen } from "./layout";
 import { type StartupInfo, inTauri, startupInfo } from "./platform";
 import { setAdvancedOpen, setPaletteOpen, setPanel, setScreen } from "./state";
-import { roundtripPopout, runRoundtrip } from "./roundtrip";
-import { afterMount, appliedState, initFromStartup, repaint, subscribe, viewId } from "./windows";
+import { ignoresReturn, roundtripPopout, runRoundtrip } from "./roundtrip";
+import { afterMount, appliedState, ignoreReturnRequests, initFromStartup, repaint, subscribe, viewId } from "./windows";
 
 const SCREENS: Screen[] = ["chat", "inbox", "editor", "database", "settings"];
 
@@ -37,12 +37,15 @@ async function boot() {
   await subscribe();
   setStage("startup-info");
   info = await startupInfo();
+  if (info.benchMode === "roundtrip" && ignoresReturn(viewId)) ignoreReturnRequests();
   initFromStartup(info);
   applyPins(info);
   setStage("render");
   render(() => <App />, document.getElementById("root")!);
   markOnce("mounted");
-  requestAnimationFrame(() => markOnce("firstPaintRaf"));
+  // First paint: the second rAF after mount, i.e. the frame holding the mounted DOM has been
+  // produced. Contract §5 TTI needs both this and a handled input (measure.py takes the later).
+  requestAnimationFrame(() => requestAnimationFrame(() => markOnce("firstPaint")));
   const harnessMain = Boolean(info.benchMode) && !viewId;
   if (harnessMain && info.benchMode !== "roundtrip") {
     setStage("probe");

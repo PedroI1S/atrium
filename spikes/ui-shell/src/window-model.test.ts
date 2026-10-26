@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { loadTheme } from "./theme/loader";
-import { DEFAULT_SETTINGS, MIN_ALPHA, appearanceFor, moveView, initialModel, resolveTheme, type AppearanceInput } from "./window-model";
+import { DEFAULT_SETTINGS, MIN_ALPHA, appearanceFor, moveView, initialModel, nativeCalls, resolveTheme, type AppearanceInput } from "./window-model";
 
 const calm = readFileSync(new URL("../themes/atrium-calm-dark.toml", import.meta.url), "utf8");
 const input = (over: Partial<AppearanceInput> & { s?: Partial<typeof DEFAULT_SETTINGS> } = {}): AppearanceInput => ({
@@ -75,4 +75,21 @@ it("moveView changes only the owner and bumps the revision", () => {
   expect(moved.views.editor).toEqual({ ...state.views.editor, owner: "view-editor" });
   expect(moved.views.chat).toBe(state.views.chat);
   expect(moved.revision).toBe(state.revision + 1);
+});
+
+describe("nativeCalls (review 2 #5)", () => {
+  const shownDark = { vibrancy: true, dark: true, alpha: 1, appearance: "dark" as const };
+  it("re-applies vibrancy when the theme flips while vibrancy stays on", () => {
+    const calls = nativeCalls(shownDark, { vibrancy: true, dark: false, alpha: 1, appearance: "light" });
+    expect(calls).toEqual({ appearance: "light", vibrancy: { enabled: true, dark: false } });
+  });
+  it("makes no call when nothing changed", () => {
+    expect(nativeCalls(shownDark, { vibrancy: true, dark: true, alpha: 1, appearance: "dark" })).toEqual({});
+  });
+  it("ignores the material while vibrancy stays off", () => {
+    expect(nativeCalls({ ...shownDark, vibrancy: false }, { vibrancy: false, dark: false, alpha: 1, appearance: "dark" })).toEqual({});
+  });
+  it("turns vibrancy off and sets alpha for whole-window mode", () => {
+    expect(nativeCalls(shownDark, { vibrancy: false, dark: true, alpha: 0.6, appearance: "dark" })).toEqual({ vibrancy: { enabled: false, dark: true }, alpha: 0.6 });
+  });
 });
