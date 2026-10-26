@@ -1,60 +1,58 @@
 # Handoff: M0-06b-ui-shell-layout-b
 
-Model: GPT-6.1 Sol · Status: partial
+First version: GPT-6.1 Sol (2026-10-25, partial). **Fix round 1: Opus 5.5 (2026-10-26). Status: done.**
 
-## Done
+Report: [docs/spikes/M0-06b-ui-shell-layout-b.md](../../spikes/M0-06b-ui-shell-layout-b.md). Branch `agent/sol/M0-06b-ui-shell-layout-b`, committed, not pushed.
 
-- Implemented layout B's floating cards, topic sidebar, ranked inbox mock, collapsible sidebar/context strips, resize handles, simple Appearance settings and non-modal Advanced side pane.
-- Copied both Calm themes unchanged into the spike. Added CR-02 runtime opacity/channel emission, reserved-name/collision checks, opaque surface validation and state-text AA validation. Migrated old comparison-theme surfaces/state colours and adjusted the VS Code importer for the stronger checks.
-- Implemented background-only opacity with surface alpha/native vibrancy and whole-window opacity using public AppKit `NSWindow.setAlphaValue` with native readback, not CSS opacity. Settings persist and update live. Added native accessibility preference checks and an explained opaque Linux fallback.
-- Added a Rust-owned, revisioned shared dummy model and movable chat/editor/database WebviewWindows. Drafts, sent messages, selected thread, scroll offset and edited text survive ownership changes. Return/close flushes the owning window's queued writes. Settings/theme changes broadcast to all windows.
-- Added the bash matrix harness for off/background/whole × 1/3 windows, covering TTI, owned-process RSS/footprint and main-window scroll/resize frames. It pins/prints settings, verifies applied opacity/readiness, logs raw reports, and cleans up launched apps on report errors/timeouts.
-- Added early JS timing before module/theme evaluation and separate paint/input marks.
-- Report: [M0-06b-ui-shell-layout-b.md](../../spikes/M0-06b-ui-shell-layout-b.md), including mechanisms, limitations, exact fish-compatible commands, Linux deferral, CR-02 feedback and the native verification checklist.
+## Done (fix round 1)
 
-## Not done
+- **All 13 review findings fixed** (report §1 has the finding → fix → test table). Every bug fix has a test that fails without it: `src/sync.test.ts` (#6, #7, #8, #4), `src/layout.test.ts` (#9, settings registry), `src-tauri/src/shell.rs` tests (#7 whitelist/persister/atomic write, #8 `get_mut`, ownership), `src/styles/tokens-conformance.test.ts` (#11). Plus an end-to-end pop-out check in the real app: `python3 scripts/measure.py roundtrip` (5/5 pass).
+- **Harness** (#1–#3, #5): mount-based per-window readiness with each window's applied appearance; cascaded pop-outs restored after main is interactive; app self-activates and holds an activity in harness mode; error reports with a stage; fail-fast on a dead process or error report; per-run app logs; per-cell failure handling; interleaved cold matrix with the load average recorded; `scripts/summarize.py` prints the table.
+- **Layout B rebuilt to `docs/design/ui-direction.md`**, ported from the prototype's source onto Calm tokens: sidebar on the frame (raised selected chat, topic circles with amber attention dot, `+` topic), chat / inbox / editor / database cards, minimizable context panel, settings with section tabs, search (covers Advanced) and the 400 px Advanced card, pop-out chrome (title, status pill, keep-on-top, move back), "Popped-out windows: Same as main / Always opaque", pop-out traffic lights aligned. Instrument Sans + Geist Mono bundled (OFL).
+- **Measured** (release, full matrix, under the shared GUI lock; report §5): TTI medians 327–341 ms in all six configurations; 60 fps in all frame tests; footprint 125–134 MB with one window, **194–207 MB with three (over 150 MB)**.
+- **Screenshots** (12 JPEGs, 1.6 MB) in `docs/spikes/M0-06b-ui-shell-layout-b/`; logs in `.../fix1-logs/`.
+- **CR-03** appended to `docs/agents/change-requests.md` (CR-02 feedback; ui-direction §3/§5 amendments). No contract or `docs/design/` file changed.
 
-- No app/browser/dev server was launched and no screenshots were taken, following the sandbox instruction. Native alpha/vibrancy, window move/close/focus, live cross-window synchronization and visual layout still need orchestrator verification.
-- No TTI, footprint/RSS, frame or Linux measurements were collected. No performance budget is claimed to pass.
-- The broader design is not fully implemented: bundled font files, topic management, per-workspace layout persistence, native window bounds/pinning, drag-to-detach, real editor/database/terminal and per-thread independent dummy stores remain outside this mechanics implementation. One chat/editor/database view can be detached at a time. These limits are detailed in the report.
+## Not done / limits
 
-## Definition of Done results
+- Visual-only controls: text size, tint (needs Warm/Cool theme files), card gap, fonts, and the non-Appearance settings sections. Pop-out positions are cascaded, not remembered; no drag-to-detach. Editor is a highlighted textarea (CodeMirror is M1).
+- Background-mode opacity at 60 % looks only slightly see-through: the native frosted material under the frame is dense, and ScreenCaptureKit captures may under-show the live blur. Worth Pedro's eye on a real desktop (report §4); M1 can try a thinner material.
+- Linux not run (driver-owned deferral).
 
-Commands were run in `spikes/ui-shell` unless an explicit manifest/worktree-relative path is shown.
+## Questions for Pedro
 
-| Command | Actual result |
+1. **Three-window footprint:** each pop-out adds about 33 MB (its own WebKit process). Is 150 MB the budget for one window, or with pop-outs open?
+2. Whether the background-mode glass should be clearer than the native material gives (report §4).
+
+## Definition of Done results (2026-10-26, from `spikes/ui-shell`)
+
+| Command | Result |
 |---|---|
-| `pnpm install && pnpm typecheck && pnpm test` | Exit 0. Install completed; typecheck passed. Final reruns after all frontend changes: **3 test files, 95 tests passed**, including token conformance, opacity emission/validation and serialized view-state round-trip. |
-| `cargo clippy --manifest-path spikes/ui-shell/src-tauri/Cargo.toml -- -D warnings` (worktree root) | Exit 0, final native source checked without warnings. |
-| `pnpm tauri build --debug` | Exit 0 on the final frontend/native sources. Bundled `src-tauri/target/debug/bundle/macos/Atrium UI Shell.app`; final bundle output **28.71 MiB**. The app was not launched. |
-| `cargo test --manifest-path spikes/ui-shell/src-tauri/Cargo.toml` (worktree root) | Exit 0: **2 native unit tests passed**, 0 failures; main/doc-test targets also passed. Tests cover native ownership restoration/serialization and settings bounds/mode validation. |
-| `bash -n spikes/ui-shell/scripts/measure-layout-b.sh` | Exit 0. |
-| `spikes/ui-shell/scripts/measure-layout-b.sh --help` | Exit 0; displays matrix usage without launching anything. |
-| `env PYTHONPYCACHEPREFIX=/tmp/atrium-m006b-pycache python3 -m py_compile spikes/ui-shell/scripts/measure.py` | Exit 0. Default macOS Python cache location was initially denied; the permitted `/tmp` cache resolves it. |
-| `python3 spikes/ui-shell/scripts/measure.py --help` | Exit 0; lists mode, window-count and opacity options. |
-| `git diff --check` | Exit 0. |
-
-The code/build/test and report/handoff portions are complete. Runtime proof remains outstanding by design of this worker sandbox.
+| `pnpm install && pnpm typecheck && pnpm test` | Exit 0. 5 test files, **130 tests passed** (was 95). |
+| `cargo clippy --manifest-path spikes/ui-shell/src-tauri/Cargo.toml --all-targets -- -D warnings` | Exit 0, no warnings. |
+| `cargo test --manifest-path spikes/ui-shell/src-tauri/Cargo.toml` | Exit 0. **12 passed** (11 `shell.rs`, 1 `lib.rs`). |
+| `pnpm tauri build` | Exit 0. `Atrium UI Shell.app` release bundle, 4.81 MiB. |
+| `pnpm tauri build --debug` | Exit 0. Debug bundle, 29.38 MiB. |
+| `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock scripts/measure-layout-b.sh all <dir>` | All cells passed (cold rerun interleaved with `coldmatrix` after the first sequential run hit heavy machine load). |
+| `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock python3 scripts/measure.py roundtrip` | 5/5 checks pass. |
+| `bash -n scripts/*.sh`, `python3 -m py_compile scripts/*.py`, `git diff --check` | Exit 0. |
 
 ## Gotchas
 
-- Changes are **uncommitted**. Git metadata resolves to `/Users/pedro/Documents/Harness/.git/worktrees/M0-06b-ui-shell-layout-b`, outside the sandbox's writable roots; no commit was attempted. The orchestrator should review and commit.
-- No contracts or `docs/design/` files changed. All final changed/untracked files are in the brief's owned paths.
-- pnpm initially chose a worktree-root package store; it was moved into the owned spike directory. `pnpm-workspace.yaml` pins the local store and `.gitignore` excludes it. No root store remains.
-- The existing `macOSPrivateApi` / `macos-private-api` flags remain necessary for background translucency. Public AppKit whole-window alpha does not remove that inherited distribution constraint.
-- The new measurement wrapper uses a release bundle by default. The debug bundle above is for smoke checks; the report gives an explicit executable override for it.
-- Three-window frame measurements animate the main window while editor/database windows remain open and idle; they do not claim simultaneous frame performance in all three windows. Harness accessibility/fallback mismatches fail instead of silently measuring opaque windows as translucent.
-- Native close/reopen races, crashes and cursor/selection restoration still need M1 lifecycle hardening. Native state transformation tests are not WebKit integration tests.
-- Cleanup: all tracked install/test/build command sessions completed. No long-running app/server/browser process was started. A final `ps` audit was attempted but the sandbox returned `operation not permitted`; no process-list workaround was used.
+- **Run every GUI command under the lock**: `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock <command>` (other agents' windows throttle rAF and skew numbers). The M0-07 overlap the orchestrator flagged (02:35–02:41) predates every number in the report (runs started 02:58).
+- The machine was busy during measurements (load average 4–8, Messages at ~50 % of a core). Interleaving configurations keeps comparisons fair; absolute worst cases are load-sensitive.
+- WebKit clamps `performance.now()` to 1 ms: ">16.7 ms" frame counts are meaningless; read fps, p99 and max.
+- A first screenshot attempt that captured a screen region picked up unrelated screen content; it was deleted at once and never committed. Screenshots now use `screencapture -l` (app window only) or ScreenCaptureKit with a filter that includes only the app and the synthetic backdrop window.
+- Harness runs never read or write the user's `calm-settings.json`.
+- All processes started by this round were stopped; a final `pgrep` found no app, backdrop or harness process.
 
 ## Follow-ups
 
-Orchestrator: run the report's native checklist, then execute the following from fish, starting at the worktree root:
+- Orchestrator: decide the three-window footprint budget with Pedro; consider CR-03; record the `macOSPrivateApi` distribution decision when M1 starts.
+- M1: back the shared state with M0-05's `ClientHandle` (report §3), keep `sync.ts`'s ordering helpers, track TTI/frames/footprint in CI with this harness.
+- Pedro (fish), to look at it:
 
 ```text
 cd /Users/pedro/Documents/atrium-wt/M0-06b-ui-shell-layout-b/spikes/ui-shell
-pnpm tauri build
-scripts/measure-layout-b.sh all /tmp/atrium-M0-06b-measurements
+open "src-tauri/target/release/bundle/macos/Atrium UI Shell.app"
 ```
-
-This builds release and runs every metric across all six configurations. Keep windows visible, record display/refresh conditions, and attach logs/screenshots plus actual median/worst TTI, RSS/footprint and frame results to the report. Close main after manual checks and confirm children exit. Record Linux fallback verification's owner/gate as a driver decision. Review CR-02's migration/required-token feedback before adopting it for M1; no frozen-contract update was made by this worker.

@@ -1,3 +1,5 @@
+> **Superseded** by fix round 1: see section 5 of `../M0-06b-ui-shell-layout-b.md` and `fix1-logs/`. Kept for the record.
+
 # M0-06b measurements (orchestrator run, 2026-10-25)
 
 Release build, M4 / macOS 27.0.1, Calm Dark, settled machine; raw logs in `raw-measurements/`.
