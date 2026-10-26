@@ -22,3 +22,7 @@ __pycache__/
 
 # Playwright MCP output (written to the orchestrator session's cwd)
 /.playwright-mcp/
+
+# iCloud Drive / Finder conflict copies ("file 2.md", "Cargo 3.toml"). Never commit them.
+* [0-9].*
+* [0-9]
