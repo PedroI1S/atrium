@@ -137,3 +137,6 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 
 ## D-027 — 2026-10-26 — M0-06b handed from Sol to Opus
 **Decided by Pedro**: Sol's M0-06b result was underwhelming. An Opus 5.5 subagent takes over the fix round. It fixes all 13 review findings, raises the design fidelity to `docs/design/ui-direction.md`, and runs the full measurement matrix and screenshots itself (it runs on the host). The cross-provider reviewer for Opus's work is Sol (read-only). Routing note: for UI/design-heavy frontend work, Sonnet/Opus outperformed Sol in M0 (M0-06 vs M0-06b).
+
+## D-028 — 2026-10-26 — Idle memory budget is per main window; pop-outs add ~35 MB each
+**Decided by Pedro.** The PLAN §4 app idle budget (< 150 MB) applies to the app with **one window**. Each popped-out window has its own WebKit content process and adds about 35 MB (M0-06b: 194–207 MB with three windows); that's acceptable. M1 doesn't need to cap or lazily create pop-outs for the budget, but it should still measure each window's cost and keep it from growing.

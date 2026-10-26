@@ -699,7 +699,7 @@ trust = "untrusted"         # default for free tiers; changing it requires confi
 ## 4. Performance budgets (targets)
 
 - Cold start to interactive: < 400 ms (macOS, M-series); reconnecting to a running daemon with full state: < 100 ms.
-- App idle RSS (excluding agents and Chromium): < 150 MB; daemon idle RSS: < 50 MB.
+- App idle memory (excluding agents and Chromium): < 150 MB with one window; each popped-out window adds about 35 MB, which is accepted (D-028). Daemon idle RSS: < 50 MB.
 - Token streaming: 60 fps, no dropped input with 10 active threads.
 - Browser pane: ≥ 30 fps screencast, < 80 ms input-to-frame locally.
 - Conflict radar: an incremental update in < 200 ms per thread change.
