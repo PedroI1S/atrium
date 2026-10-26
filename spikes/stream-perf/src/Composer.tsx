@@ -8,7 +8,8 @@ export function Composer() {
 
   const onKeyDown = (e: KeyboardEvent) => {
     typing.keys++;
-    typing.pending.push(e.timeStamp);
+    typing.pending.push(typing.nextOrigin ?? e.timeStamp);
+    typing.nextOrigin = null;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       if (draft().trim() !== "") {

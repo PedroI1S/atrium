@@ -42,7 +42,14 @@ function medianRefresh(dts: number[]): number {
   return known.reduce((best, k) => (Math.abs(k - m) < Math.abs(best - m) ? k : best), known[0]!);
 }
 
-/** Types into the composer on a jittery schedule until `stop()` is called. */
+/**
+ * Types into the composer on an absolute, jittery schedule until `stop()` is called. Each keystroke has a
+ * deadline (previous deadline + interval); the event is created when its timer fires, which a busy main
+ * thread delays. Latencies are measured from the deadline, and the lateness is recorded, so a stalled
+ * main thread cannot hide itself by delaying the event's creation. A late timer fires the following
+ * keystrokes back to back (they are never skipped), so the count of keystrokes sent depends only on
+ * elapsed time. These are still synthetic events: they bypass OS and WebKit input routing.
+ */
 function startTypist(intervalMs: number) {
   const ta = document.querySelector("textarea") as HTMLTextAreaElement;
   ta.focus();
@@ -50,21 +57,26 @@ function startTypist(intervalMs: number) {
   let n = 0;
   let seed = 12345;
   let alive = true;
-  const next = () => {
+  const jitter = () => {
     seed = (seed * 1664525 + 1013904223) >>> 0;
     return intervalMs * (0.6 + 0.8 * (seed / 0xffffffff));
   };
+  let deadline = performance.now() + jitter();
   const step = () => {
     if (!alive) return;
+    const now = performance.now();
+    typing.lateness.push(Math.max(0, now - deadline));
     const ch = text[n % text.length]!;
     n++;
+    typing.nextOrigin = deadline;
     ta.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
     ta.value += ch;
     ta.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
     ta.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
-    setTimeout(step, next());
+    deadline += jitter();
+    setTimeout(step, Math.max(0, deadline - performance.now()));
   };
-  setTimeout(step, next());
+  setTimeout(step, Math.max(0, deadline - performance.now()));
   return {
     stop: () => {
       alive = false;
@@ -163,6 +175,7 @@ export async function runScenario(sc: Partial<Scenario>, info: StartupInfo): Pro
         batchesReceived: pipeline.batchesReceived,
         eventsReceived: pipeline.eventsReceived,
         eventsApplied: pipeline.eventsApplied,
+        duplicatesDropped: pipeline.duplicatesDropped,
         framesWithWork: pipeline.framesWithWork,
         maxQueue: pipeline.maxQueue,
         seqGaps: pipeline.seqGaps,

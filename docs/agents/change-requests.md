@@ -33,10 +33,19 @@ Proposal from the design session (`docs/design/ui-direction.md`, Pedro chose lay
 
 ## CR-03 — M0-07-stream-perf — 2026-10-26
 
-Non-blocking; the spike forwarded the events as they are. (Number may need renumbering at merge if another CR-02 exists.)
+Non-blocking for M0 (the spike forwarded events as they are). Two separate problems, one proposal for the first.
 
-**Change** (`crates/atrium-protocol` agent contract, M1 revision): stop repeating the full text in `MessageCompleted` for messages whose deltas were stored. Options: `text` becomes optional and absent when the deltas are in the store, or it carries `{len, sha256}` so consumers can verify the concatenation; whole-message providers keep sending `text`.
+**1. Wire size (what the spike measured).** `MessageCompleted.text` repeats the concatenation of all the message's deltas. A 5-minute stream at 10k tokens/s is one 12 MB message, within 4.8 MB of `MAX_FRAME_LEN` (16 MiB), and every consumer (client, bridge, webview) receives and decodes it again although the UI already holds the text.
 
-**Why**: `MessageCompleted.text` is the concatenation of all deltas. A 5-minute stream at 10k tokens/s is one 12 MB message, close to `MAX_FRAME_LEN` (16 MiB), and building it made the M0-05 daemon peak at 487 MB at session close (M0-07 memory run). Every consumer (bridge, webview) pays for it again, and the UI already holds the text.
+**2. Lifecycle-fold memory (not fixed by item 1).** The M0-05 daemon peaked at 487 MB footprint at session close for this stream because `close_thread` materializes the whole event history (about 3 million envelopes, `spikes/daemon-socket/src/daemon.rs`), not because of the 12 MB completion text. Omitting that text does not remove this cost. It needs the M0-05 follow-up already listed (incremental fold or persisted open-object projections) and is out of scope here.
 
-**Affected**: `atrium-agents` adapters (the closing-order rule in `agent.rs` still holds), the daemon's lifecycle fold, UI reducers. No M0 spike needs it.
+**Change proposed for item 1** (`crates/atrium-protocol/src/agent.rs`, M1 revision; versioned):
+- Replace `MessageCompleted.text: String` by `body: MessageBody` where `MessageBody` is `Inline { text }` (whole-message providers, and short messages) or `Streamed { chars: u64, deltas: u64, sha256: String }` (the text is the in-order concatenation of the stored `MessageDelta`s of this `message_id`; `chars` is its length in Unicode scalar values, `sha256` is over its UTF-8 bytes).
+- Reconstruction rule: a consumer that needs the full text concatenates the stored deltas and checks `chars` and `sha256`; a mismatch is a hard error (it indicates a lost or reordered delta), not something to patch up. Deltas of a message with a `Streamed` completion must be retained by the store at least as long as the completion (history export and resume need them).
+- Protocol version bump in `Hello`/`Welcome`; the daemon keeps writing `Inline` for events recorded before the change and a reader accepts both. During one release the daemon may send `Inline` to clients that announce an older version.
+- Adapters: the closing-order rule in `agent.rs` ("open messages first, `MessageCompleted` with the text so far") stays; the adapter emits `Streamed` when it has emitted deltas and `Inline` otherwise.
+- Update together: UI reducers (the spike's `model.ts` reads `text.length` and would break on absent text; its `completedMismatch` check becomes `chars`/`sha256` verification), the daemon's lifecycle fold, and the concatenation fixtures in `fixtures/` (add: streamed completion with matching and non-matching hash, completion-only provider, replay across a reconnect).
+
+**Why now**: the choice affects every adapter and reducer in M1, and the wire limit is within reach of a long single message.
+
+**Affected**: `atrium-protocol`, `atrium-agents` adapters, daemon fold and store, UI reducers, fixtures.

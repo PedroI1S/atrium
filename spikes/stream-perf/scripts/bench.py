@@ -234,34 +234,56 @@ def host_info():
     }
 
 
-def invalid_reason(r):
-    """Why a run cannot be used, or None. The window must stay visible for the whole stream (rAF stops
-    otherwise), frames must keep coming, and nothing may time out."""
+class HiddenWindow(RuntimeError):
+    """The page itself reported that the window was hidden (document.hidden): environmental, evidenced."""
+
+
+DISCARDS = {"environment": 0, "failure": 0}
+FAILURE_LOG = os.path.join(OUT, "failures.jsonl")
+
+
+def classify(r):
+    """Returns (kind, why) with kind in ok | environment | failure.
+
+    environment: independent evidence that the window was hidden (the page logged `visibilitychange` to
+        hidden during the stream, or the progress file said hidden). WebKit stops rAF then, so the run
+        measures nothing; it is discarded and repeated, and kept as *-environment*.json.
+    failure: anything else that went wrong (error, timeout, daemon not ready, no report). Never treated as
+        an artifact: it is logged to measurements/failures.jsonl, counted, and reported.
+    ok: a result, including one with a long frame or a low frame count while the window was visible:
+        that is a measurement, it is not discarded, and `anomalies` lists it."""
+    if r.get("hiddenEvidence"):
+        return "environment", r.get("error", "hidden")
     if "error" in r or "frames" not in r:
-        return f"error: {r.get('error')}"
-    if r.get("timedOut"):
-        return "timed out"
+        return "failure", f"error: {r.get('error')}"
     v = r.get("visibility", {})
     lo, hi = v.get("streamStartRelMs", 0), v.get("streamEndRelMs", 1e12)
     hidden = [c for c in v.get("changes", []) if c["state"] == "hidden" and lo - 100 <= c["t"] <= hi]
     if hidden:
-        return f"window hidden during the stream at {hidden[0]['t'] - lo:.0f} ms (occluded by another window?)"
+        return "environment", f"window hidden during the stream at {hidden[0]['t'] - lo:.0f} ms"
+    if r.get("timedOut"):
+        return "failure", "timed out waiting for the sessions to end"
+    return "ok", None
+
+
+def anomalies(r):
+    out = []
     expected = r["pipeline"]["streamSeconds"] * 1000 / r["refreshMs"]
     if r["frames"]["frames"] < 0.9 * expected:
-        return f"only {r['frames']['frames']} frames, expected ~{expected:.0f}"
+        out.append(f"only {r['frames']['frames']} frames, expected about {expected:.0f}, window visible")
     if r["frames"]["max"] > 1000:
-        return f"rAF stall of {r['frames']['max']} ms"
-    return None
+        out.append(f"rAF stall of {r['frames']['max']} ms with the window visible")
+    return out
 
 
 def run_scenario(sc, label, attempts=6, **kw):
-    """Runs a scenario; a run in which rAF stalled for over a second (window hidden or occluded) or that
-    timed out is an environment artifact: it is kept as <label>-invalid<N>.json and repeated."""
+    """Runs a scenario. Environmental discards are repeated; failures are logged, counted and repeated
+    (at most `attempts` runs in total), never silently absorbed."""
     existing = os.path.join(OUT, label + ".json")
-    if os.path.exists(existing):  # resume: reuse a valid report of the same scenario
+    if os.path.exists(existing):  # resume: reuse a good report of the same scenario
         try:
             r = json.load(open(existing))
-            if not invalid_reason(r) and all(r["scenario"].get(k) == v for k, v in sc.items() if k != "hold"):
+            if classify(r)[0] == "ok" and all(r["scenario"].get(k) == v for k, v in sc.items() if k != "hold"):
                 print(f"== {label}: reusing {existing}", flush=True)
                 return r
         except (ValueError, KeyError):
@@ -269,18 +291,28 @@ def run_scenario(sc, label, attempts=6, **kw):
     for n in range(1, attempts + 1):
         try:
             r = _run_once(sc, label, **kw)
+        except HiddenWindow as e:
+            r = {"error": str(e), "hiddenEvidence": True}
+            open(existing, "w").write(json.dumps(r))
         except (TimeoutError, RuntimeError) as e:
             r = {"error": str(e)}
-            open(os.path.join(OUT, label + ".json"), "w").write(json.dumps(r))
-        stalled = invalid_reason(r)
-        if not stalled:
+            open(existing, "w").write(json.dumps(r))
+        kind, why = classify(r)
+        if kind == "ok":
             r["attempt"] = n
-            json.dump(r, open(os.path.join(OUT, label + ".json"), "w"), indent=1)
+            r["anomalies"] = anomalies(r)
+            if r["anomalies"]:
+                print(f"   ANOMALY (kept as a result): {'; '.join(r['anomalies'])}", flush=True)
+            json.dump(r, open(existing, "w"), indent=1)
             return r
-        print(f"   INVALID run ({stalled}); kept as {label}-invalid{n}.json", flush=True)
+        DISCARDS[kind] += 1
+        print(f"   {kind.upper()} ({why}); kept as {label}-{kind}{n}.json", flush=True)
+        if kind == "failure":
+            with open(FAILURE_LOG, "a") as f:
+                f.write(json.dumps({"label": label, "attempt": n, "why": why, "t": time.time()}) + "\n")
+        os.replace(existing, os.path.join(OUT, f"{label}-{kind}{n}.json"))
         time.sleep(30)
-        os.replace(os.path.join(OUT, label + ".json"), os.path.join(OUT, f"{label}-invalid{n}.json"))
-    sys.exit(f"{label}: {attempts} invalid runs in a row")
+    sys.exit(f"{label}: {attempts} runs without a usable result ({DISCARDS})")
 
 
 def _run_once(sc, label, **kw):
@@ -330,13 +362,19 @@ def _run_locked(sc, label, hold_s=0, fp_every=0, timeout=None, quiet=None):
                 except (OSError, ValueError):
                     pass
                 if not started_streaming:
-                    raise RuntimeError("the page never started streaming within 45 s (window hidden before the run?)")
+                    try:
+                        hidden_boot = json.load(open(out_path + ".progress")).get("hidden")
+                    except (OSError, ValueError):
+                        hidden_boot = None
+                    if hidden_boot:
+                        raise HiddenWindow("the page never started streaming within 45 s and reported document.hidden")
+                    raise RuntimeError("the page never started streaming within 45 s (no hidden evidence)")
             try:  # the page writes a progress file every 10 s; a hidden window stops rAF, so give up early
                 hidden_polls = hidden_polls + 1 if json.load(open(out_path + ".progress")).get("hidden") else 0
             except (OSError, ValueError):
                 pass
             if hidden_polls > 40:  # about 10 s of consecutive hidden progress snapshots (polled every 0.25 s)
-                raise RuntimeError("window hidden (another window covers the app); aborting early")
+                raise HiddenWindow("progress snapshots say document.hidden (another window covers the app); aborting early")
             if time.time() - t_start > timeout:
                 raise TimeoutError(f"no report after {timeout:.0f}s")
             if pid not in ps_table():
@@ -411,14 +449,14 @@ def fmt(r):
     f, l, t = r["frames"], r["latency"], r["typing"]
     lines = [
         f"frames: n={f['frames']} fps={f['fps']:.1f} p50={f['p50']} p95={f['p95']} p99={f['p99']} max={f['max']} ms; slow(>1.5x refresh {r['refreshMs']})={f['slowFrames']} dropped={f['droppedFrames']} >25ms={f['over25ms']}",
-        f"e2e latency (agent ts -> committed frame, visible deltas): n={l['n']} p50={l['p50']} p95={l['p95']} p99={l['p99']} max={l['max']} ms",
+        f"latency agent timestamp -> next rAF after the update (visible deltas; a rendering proxy, not presentation): n={l['n']} p50={l['p50']} p95={l['p95']} p99={l['p99']} max={l['max']} ms",
         f"  segments (per event): agent->bridge p50={r['bridge']['agentToBridgeMs']['p50']} p99={r['bridge']['agentToBridgeMs']['p99']}  batching p50={r['bridge']['batchingMs']['p50']} p99={r['bridge']['batchingMs']['p99']}  ipc p50={r['ipc']['p50']} p99={r['ipc']['p99']}  js-queue p50={r['queueWait']['p50']} p99={r['queueWait']['p99']} ms",
         f"  per-frame: apply(JS+Solid) p50={r['applyMs']['p50']} p99={r['applyMs']['p99']} max={r['applyMs']['max']}  rAF->next task p50={r['renderWork']['p50']} p99={r['renderWork']['p99']} max={r['renderWork']['max']} ms",
         f"events: bridge={r['bridge']['events']} received={r['pipeline']['eventsReceived']} applied={r['pipeline']['eventsApplied']}  tokens~{r['bridge']['tokensApprox']} ({r['bridge']['tokensPerSecondApprox']:.0f}/s)  batches={r['pipeline']['batchesReceived']} bytes={r['bridge']['bytes']} backpressure waits={r['bridge']['backpressureWaits']}",
     ]
     if t["streaming"]["inputs"]:
         s, i = t["streaming"], t["idle"]
-        lines.append(f"typing (streaming): inputs={s['inputs']} typed={t['typed']} textarea={t['textareaLength']} handler p50={s['handlerMs']['p50']} p99={s['handlerMs']['p99']} frame p50={s['frameMs']['p50']} p99={s['frameMs']['p99']} paint p50={s['paintMs']['p50']} p95={s['paintMs']['p95']} p99={s['paintMs']['p99']} max={s['paintMs']['max']} ms")
+        lines.append(f"typing (streaming): inputs={s['inputs']} typed={t['typed']} textarea={t['textareaLength']} timer lateness p50={s['timerLatenessMs']['p50']} p99={s['timerLatenessMs']['p99']} max={s['timerLatenessMs']['max']} | from the keystroke deadline: handler p50={s['handlerMs']['p50']} p99={s['handlerMs']['p99']} frame p50={s['frameMs']['p50']} p99={s['frameMs']['p99']} paint p50={s['paintMs']['p50']} p95={s['paintMs']['p95']} p99={s['paintMs']['p99']} max={s['paintMs']['max']} ms")
         if i:
             lines.append(f"typing (idle ref):  inputs={i['inputs']} paint p50={i['paintMs']['p50']} p95={i['paintMs']['p95']} p99={i['paintMs']['p99']} max={i['paintMs']['max']} ms")
     cpu = r["resources"]["cpu_pct_during_stream"]
@@ -506,6 +544,7 @@ def main():
         sys.exit("run `pnpm bench:build` first")
     stage_daemon()
     {"micro": cmd_micro, "single": cmd_single, "multi": cmd_multi, "memory": cmd_memory, "sweep": cmd_sweep}.get(a.mode, lambda x: None)(a)
+    print(f"discarded runs in this invocation: {DISCARDS}")
     if a.mode == "all":
         a.secs = 60
         for f in (cmd_micro, cmd_sweep, cmd_single, cmd_multi):

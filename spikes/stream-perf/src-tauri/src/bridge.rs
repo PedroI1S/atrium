@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -85,6 +85,9 @@ struct Flow {
     inflight: Mutex<VecDeque<(u64, usize)>>,
     bytes: AtomicUsize,
     notify: Notify,
+    /// Shutdown mode: keep reading the event stream (so command replies are never stuck behind a full
+    /// event queue) but drop what is read, and stop waiting for acknowledgements.
+    draining: AtomicBool,
 }
 
 struct StatsInner {
@@ -105,6 +108,7 @@ struct StatsInner {
     first_ms: f64,
     last_ms: f64,
     acks: u64,
+    duplicates_dropped: u64,
 }
 
 impl StatsInner {
@@ -125,6 +129,7 @@ impl StatsInner {
             first_ms: 0.0,
             last_ms: 0.0,
             acks: 0,
+            duplicates_dropped: 0,
         }
     }
 }
@@ -162,7 +167,7 @@ fn vec_pct(v: &mut [u32], p: f64) -> f64 {
     f64::from(v[((v.len() - 1) as f64 * p) as usize])
 }
 
-struct Active {
+pub struct Active {
     handle: ClientHandle,
     threads: Vec<ThreadId>,
     flow: Arc<Flow>,
@@ -183,11 +188,21 @@ pub async fn bridge_start(
     config: BridgeConfig,
     on_batch: Channel<InvokeResponseBody>,
 ) -> Result<StartInfo, String> {
-    let enc = Encoding::parse(&config.encoding).ok_or("unknown encoding")?;
     let mut slot = bridge.0.lock().await;
     if slot.is_some() {
         return Err("bridge already running".into());
     }
+    let (active, info) = start(config, on_batch).await?;
+    *slot = Some(active);
+    Ok(info)
+}
+
+/// Connects (spawning the daemon if needed), starts the fake threads and subscribes to each.
+pub async fn start(
+    config: BridgeConfig,
+    on_batch: Channel<InvokeResponseBody>,
+) -> Result<(Active, StartInfo), String> {
+    let enc = Encoding::parse(&config.encoding).ok_or("unknown encoding")?;
     let dir = config.dir.clone().unwrap_or_else(|| {
         std::env::temp_dir()
             .join(format!("atrium-stream-perf-{}", std::process::id()))
@@ -252,37 +267,73 @@ pub async fn bridge_start(
         encoding: enc.name().into(),
         start_epoch_ms,
     };
-    *slot = Some(Active {
-        handle,
-        threads,
-        flow,
-        stats,
-        pump,
-    });
-    Ok(info)
+    Ok((
+        Active {
+            handle,
+            threads,
+            flow,
+            stats,
+            pump,
+        },
+        info,
+    ))
 }
 
-/// Prepare one stored event for the wire; returns the number of text bytes if it was a delta.
-fn prepare(item: &mut Item, corpus: Option<&Corpus>, offsets: &mut HashMap<(u16, String), usize>) -> usize {
-    match &mut item.event.envelope.event {
-        AgentEvent::MessageDelta {
-            message_id, text, ..
-        } => {
-            let n = text.len();
-            if let Some(c) = corpus {
-                let off = offsets.entry((item.thread, message_id.clone())).or_insert(0);
-                *text = c.slice(*off, n);
-                *off += n;
-            }
-            n
+/// Per-bridge preparation of events for the wire.
+///
+/// After a reconnect the client replays events that were read but not yet acknowledged, so the same
+/// id can arrive twice. A duplicate must be dropped **before** anything stateful happens: the corpus
+/// offsets below advance per delta, and a replayed delta would shift all later replacement text.
+/// (The webview also ignores `id <= lastId`; both ends are guarded.)
+pub struct Prep {
+    corpus: Option<Corpus>,
+    offsets: HashMap<(u16, String), usize>,
+    forwarded: HashMap<u16, u64>,
+    pub duplicates: u64,
+}
+
+impl Prep {
+    pub fn new(corpus: bool) -> Self {
+        Self {
+            corpus: corpus.then(Corpus::new),
+            offsets: HashMap::new(),
+            forwarded: HashMap::new(),
+            duplicates: 0,
         }
-        AgentEvent::MessageCompleted { text, .. } => {
-            if let Some(c) = corpus {
-                *text = c.slice(0, text.len());
-            }
-            0
+    }
+
+    /// `None` for a duplicate (already forwarded); otherwise the number of delta text bytes.
+    pub fn prepare(&mut self, item: &mut Item) -> Option<usize> {
+        let last = self.forwarded.entry(item.thread).or_insert(0);
+        if item.event.id.0 <= *last {
+            self.duplicates += 1;
+            return None;
         }
-        _ => 0,
+        *last = item.event.id.0;
+        let corpus = self.corpus.as_ref();
+        Some(match &mut item.event.envelope.event {
+            AgentEvent::MessageDelta {
+                message_id, text, ..
+            } => {
+                let n = text.len();
+                if let Some(c) = corpus {
+                    let off = self
+                        .offsets
+                        .entry((item.thread, message_id.clone()))
+                        .or_insert(0);
+                    *text = c.slice(*off, n);
+                    *off += n;
+                }
+                n
+            }
+            AgentEvent::MessageCompleted { text, .. } => {
+                if let Some(c) = corpus {
+                    *text = c.slice(0, text.len());
+                }
+                0
+            }
+            _ => 0,
+        })
     }
 }
 
@@ -295,8 +346,7 @@ async fn pump(
     stats: Arc<Mutex<StatsInner>>,
     index: Arc<Mutex<HashMap<ThreadId, u16>>>,
 ) {
-    let corpus = cfg.corpus.then(Corpus::new);
-    let mut offsets: HashMap<(u16, String), usize> = HashMap::new();
+    let mut prep = Prep::new(cfg.corpus);
     let mut batch: Vec<Item> = Vec::new();
     let mut recv_times: Vec<f64> = Vec::new();
     let mut seq: u64 = 0;
@@ -341,10 +391,14 @@ async fn pump(
 
     loop {
         // Backpressure: stop reading while too much is unacknowledged.
-        if flow.bytes.load(Ordering::SeqCst) > cfg.max_in_flight_bytes {
+        let over = || {
+            flow.bytes.load(Ordering::SeqCst) > cfg.max_in_flight_bytes
+                && !flow.draining.load(Ordering::SeqCst)
+        };
+        if over() {
             flush(&mut batch, &mut recv_times, &mut seq);
             let t = Instant::now();
-            while flow.bytes.load(Ordering::SeqCst) > cfg.max_in_flight_bytes {
+            while over() {
                 flow.notify.notified().await;
             }
             let mut s = stats.lock().unwrap();
@@ -355,11 +409,15 @@ async fn pump(
             msg = events.next() => {
                 let Ok(msg) = msg else { break };
                 let ServerMessage::Event { event } = msg else { continue };
+                if flow.draining.load(Ordering::SeqCst) { continue; }
                 let recv = now_ms();
                 let Some(&thread) = index.lock().unwrap().get(&event.thread_id) else { continue };
                 let at = event.envelope.at_ms as f64;
                 let mut item = Item { thread, event };
-                let chars = prepare(&mut item, corpus.as_ref(), &mut offsets);
+                let Some(chars) = prep.prepare(&mut item) else {
+                    stats.lock().unwrap().duplicates_dropped += 1;
+                    continue;
+                };
                 {
                     let mut s = stats.lock().unwrap();
                     s.events += 1;
@@ -446,22 +504,172 @@ pub async fn bridge_stats(bridge: State<'_, Bridge>) -> Result<Value, String> {
         "backpressureMs": s.backpressure_ms,
         "maxInFlightBytes": s.max_in_flight_bytes,
         "acks": s.acks,
+        "duplicatesDropped": s.duplicates_dropped,
     }))
 }
 
-#[tauri::command]
-pub async fn bridge_stop(bridge: State<'_, Bridge>) -> Result<(), String> {
-    let Some(active) = bridge.0.lock().await.take() else {
-        return Ok(());
-    };
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShutdownReport {
+    pub stopped: usize,
+    pub failed: usize,
+    /// The deadline passed before every StopThread was answered; the connection was dropped instead.
+    pub timed_out: bool,
+}
+
+/// Stops the fake threads and tears the bridge down.
+///
+/// A stalled or hidden webview stops acknowledging, which exhausts the flow-control credits and parks
+/// the pump; once the client's bounded event queue is full it cannot read a command reply either, so
+/// a plain "send StopThread and wait" never finishes. Shutdown therefore switches the pump to drain
+/// mode first (read and drop events, ignore credits), bounds the whole thing by `deadline`, and falls
+/// back to dropping the connection (which stops the client actor) when the deadline passes.
+pub async fn shutdown(active: Active, deadline: Duration) -> ShutdownReport {
+    active.flow.draining.store(true, Ordering::SeqCst);
+    active.flow.notify.notify_one();
+    let mut report = ShutdownReport::default();
+    let end = tokio::time::Instant::now() + deadline;
     for t in &active.threads {
-        let _ = active
-            .handle
-            .command(DaemonCommand::StopThread {
-                thread_id: t.clone(),
-            })
-            .await;
+        let cmd = active.handle.command(DaemonCommand::StopThread {
+            thread_id: t.clone(),
+        });
+        match tokio::time::timeout_at(end, cmd).await {
+            Ok(Ok(CommandResult::Ok { .. })) => report.stopped += 1,
+            Ok(_) => report.failed += 1,
+            Err(_) => {
+                report.timed_out = true;
+                break;
+            }
+        }
     }
     active.pump.abort();
-    Ok(())
+    report
+}
+
+#[tauri::command]
+pub async fn bridge_stop(bridge: State<'_, Bridge>) -> Result<ShutdownReport, String> {
+    let Some(active) = bridge.0.lock().await.take() else {
+        return Ok(ShutdownReport::default());
+    };
+    Ok(shutdown(active, Duration::from_secs(5)).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spike_daemon_socket::{agent::*, wire::StoredEvent};
+
+    fn delta(id: u64, text: &str) -> Item {
+        Item {
+            thread: 0,
+            event: StoredEvent {
+                id: EventId(id),
+                thread_id: ThreadId("t".into()),
+                envelope: AgentEventEnvelope {
+                    seq: id,
+                    at_ms: 0,
+                    event: AgentEvent::MessageDelta {
+                        message_id: "1".into(),
+                        kind: MessageKind::Assistant,
+                        text: text.into(),
+                    },
+                },
+            },
+        }
+    }
+
+    fn text(item: &Item) -> String {
+        match &item.event.envelope.event {
+            AgentEvent::MessageDelta { text, .. } => text.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Delivers `ids` in order and returns what the webview would receive.
+    fn deliver(prep: &mut Prep, ids: &[u64]) -> Vec<(u64, String)> {
+        ids.iter()
+            .filter_map(|&id| {
+                let mut item = delta(id, "xxxx");
+                prep.prepare(&mut item)?;
+                Some((id, text(&item)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replay_after_reconnect_does_not_shift_corpus_text() {
+        // Reference: ids 1..=10 delivered once.
+        let reference = deliver(&mut Prep::new(true), &(1..=10).collect::<Vec<_>>());
+        // Reconnect before the acknowledgements of 6..=10: the client replays them, then goes on.
+        let mut prep = Prep::new(true);
+        let mut got = deliver(&mut prep, &(1..=10).collect::<Vec<_>>());
+        let replayed = deliver(&mut prep, &(6..=12).collect::<Vec<_>>());
+        assert_eq!(replayed.iter().map(|r| r.0).collect::<Vec<_>>(), vec![11, 12]);
+        got.extend(replayed);
+        // The first ten are untouched, and 11 and 12 continue the corpus where 10 stopped.
+        assert_eq!(got[..10], reference[..]);
+        let continued = deliver(&mut Prep::new(true), &(1..=12).collect::<Vec<_>>());
+        assert_eq!(got, continued);
+        assert_eq!(prep.duplicates, 5);
+    }
+
+    #[test]
+    fn replay_after_the_acknowledgement_is_unaffected() {
+        // Reconnect after everything was acknowledged: the client resumes at 11, nothing to drop.
+        let mut prep = Prep::new(true);
+        let mut got = deliver(&mut prep, &(1..=10).collect::<Vec<_>>());
+        got.extend(deliver(&mut prep, &[11, 12]));
+        assert_eq!(got, deliver(&mut Prep::new(true), &(1..=12).collect::<Vec<_>>()));
+        assert_eq!(prep.duplicates, 0);
+    }
+
+    /// Stopping while the webview has stopped acknowledging. Needs the daemon binaries:
+    /// `cargo build --release -p spike-daemon-socket --bins` at the repository root
+    /// (or ATRIUM_DAEMON_EXE).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_with_exhausted_credits_completes_within_the_deadline() {
+        let exe = std::env::var("ATRIUM_DAEMON_EXE").unwrap_or_else(|_| default_daemon_exe());
+        assert!(
+            std::path::Path::new(&exe).exists(),
+            "daemon binary missing: {exe}; see the test's doc comment"
+        );
+        let dir = std::env::temp_dir()
+            .join(format!("asp-stop-test-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let cfg = BridgeConfig {
+            threads: 2,
+            tokens_per_second: 20_000,
+            chunk_chars: 4,
+            duration_ms: 60_000,
+            tool_call_every_ms: 0,
+            encoding: "bin".into(),
+            batch_ms: 2,
+            max_in_flight_bytes: 1024,
+            corpus: true,
+            dir: Some(dir.clone()),
+            daemon_exe: Some(exe),
+        };
+        // Nobody ever acknowledges: the credits run out almost at once.
+        let (active, _) = start(cfg, Channel::new(|_| Ok(()))).await.unwrap();
+        let flow = active.flow.clone();
+        for _ in 0..100 {
+            if flow.bytes.load(Ordering::SeqCst) > 1024 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(flow.bytes.load(Ordering::SeqCst) > 1024, "credits were never exhausted");
+        // Let the daemon fill the client's bounded event queue behind the parked pump.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let t = Instant::now();
+        let report = shutdown(active, Duration::from_secs(5)).await;
+        let took = t.elapsed();
+        let _ = std::process::Command::new("pkill").arg("-f").arg(&dir).status();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!report.timed_out, "shutdown hit its deadline: {report:?}");
+        assert_eq!(report.stopped, 2, "{report:?}");
+        assert!(took < Duration::from_secs(4), "took {took:?}");
+    }
 }

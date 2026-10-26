@@ -89,6 +89,8 @@ export class Transcript {
   /** Highest event id applied to the model (the bridge's cursor for this thread). */
   lastId = 0;
   events = 0;
+  /** Events rejected because their id had been applied already (replay after a reconnect). */
+  duplicates = 0;
   chars = 0;
   /** `message_completed` whose text length differed from the streamed deltas. */
   completedMismatch = 0;
@@ -125,9 +127,18 @@ export class Transcript {
     m.cur = null;
   }
 
-  apply(ev: Ev): void {
+  /**
+   * Applies one event. Returns false, changing nothing, for an id at or below the highest one applied:
+   * after a reconnect the client replays events that were read but not yet acknowledged, and those
+   * have already been applied here. Ids are strictly increasing per thread.
+   */
+  apply(ev: Ev): boolean {
+    if (ev.id <= this.lastId) {
+      this.duplicates++;
+      return false;
+    }
     this.events++;
-    if (ev.id > this.lastId) this.lastId = ev.id;
+    this.lastId = ev.id;
     if (ev.delta) {
       const m = this.message(ev.message, ev.mkind === 1);
       m.chars += ev.text.length;
@@ -137,9 +148,10 @@ export class Transcript {
         m.dirty = true;
         this.dirty.add(m);
       }
-      return;
+      return true;
     }
     this.applyEvent(ev.event);
+    return true;
   }
 
   private seal(): void {

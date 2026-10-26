@@ -47,6 +47,7 @@ export class Pipeline {
   batchesReceived = 0;
   eventsReceived = 0;
   eventsApplied = 0;
+  duplicatesDropped = 0;
   framesWithWork = 0;
   maxQueue = 0;
   lastSeq = -1;
@@ -118,7 +119,10 @@ export class Pipeline {
           for (const ev of b.events) {
             const t = this.threads[ev.thread];
             if (!t) continue;
-            t.apply(ev);
+            if (!t.apply(ev)) {
+              this.duplicatesDropped++;
+              continue;
+            }
             this.eventsApplied++;
             if (ev.delta && ev.thread === visible) ats.push(ev.at);
           }
