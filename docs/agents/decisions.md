@@ -163,3 +163,10 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 
 ## D-034 — 2026-10-26 — No Mac App Store: `macOSPrivateApi` accepted
 **Pedro** doesn't plan to ship through the Mac App Store. Tauri's `macOSPrivateApi` (needed for transparent windows / background-only opacity) is therefore accepted, and distribution is a notarized DMG (PLAN §5 M8). The CR-01 … CR-04 token and contract proposals are still decided in the M1 contract phase.
+
+## D-035 — 2026-10-26 — M0 gate signed off; `dev` merged to `main`
+**Signed off by Pedro (owner).** M0 is closed on Astra's verdict, *pass with conditions* (`reviews/M0-gate.md`), Pedro's hands-on check (D-032) and the corrected findings report (`docs/spikes/M0-findings.md`). `dev` is merged to `main` and all M0 code is pushed.
+- **Conditions carried into M1** (`m1-must-fix.md`, "From the M0 gate review"): G1–G3 are blockers for freezing the M1 contracts (per-session enforcement and honest "hard deny" wording; the daemon's human-control authority; authoritative, single-use approvals). G4–G6 are majors (protocol changes incl. amended CR-03; performance statistics; Linux checks before M1 UI work merges).
+- G1–G3 change approval and enforcement behaviour, so their defaults are Pedro's call (D-013).
+- The Linux/WebKitGTK checks stay outside the gate and go to the partner (D-033).
+- CR-01 … CR-04 are decided in the M1 contract phase. M1 starts only on an explicit go from the driver.
