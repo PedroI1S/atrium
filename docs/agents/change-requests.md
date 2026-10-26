@@ -49,3 +49,18 @@ Non-blocking for M0 (the spike forwarded events as they are). Two separate probl
 **Why now**: the choice affects every adapter and reducer in M1, and the wire limit is within reach of a long single message.
 
 **Affected**: `atrium-protocol`, `atrium-agents` adapters, daemon fold and store, UI reducers, fixtures.
+
+## CR-04 — M0-06b-ui-shell-layout-b — 2026-10-26
+
+Feedback on CR-02 and three small amendments to `docs/design/ui-direction.md`, from building and measuring layout B (fix round 1). Non-blocking; the spike implements what is described here.
+
+**Change**:
+1. **ui-direction §5, whole window:** replace "the window's CSS `opacity` is `a`" with "the native window alpha is `a` (`NSWindow.alphaValue` on macOS)". CSS `opacity` on the root cannot fade the native traffic lights or the window shadow, and it forces a compositing layer over the whole page. CR-02's `--window-opacity` stays as the runtime token that carries `a`; components never read it.
+2. **ui-direction §3 Settings, Advanced → "Blur strength (0–48 px)":** macOS's `NSVisualEffectView` has no public radius, so the native blur behind the window is not adjustable. Either drop the row or keep it for the CSS blur of in-window overlays only (palette, popovers), which is what `--window-blur` drives in the spike. The spike shows it disabled with "macOS sets the blur radius; not adjustable".
+3. **CR-02 point 2:** state that surfaces must be **six-digit** opaque hex (the loader rejects shorthand and alpha), and that `--<surface>-rgb` names are reserved derived outputs (a theme defining one is a load error, like the runtime names).
+4. **Component tokens for layout B** that the Calm themes should own (the spike defines them in `base.css` for now): `advanced-width` (400 px), `panel-width-editor` (380 px), and the drag bounds `sidebar-min-width`/`sidebar-max-width`, `panel-min-width`/`panel-max-width`.
+5. **Accessibility (ui-direction §5):** add "Atrium observes the OS setting (`NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification`) and repaints every window when it changes". The spike does this; re-checking on focus is not needed.
+
+**Why**: (1) and (2) describe what the platform can do; (3)–(5) close gaps the spike hit. Details and measurements: `docs/spikes/M0-06b-ui-shell-layout-b.md` ("CR-02 feedback").
+
+**Affected**: `docs/design/ui-direction.md` §3 and §5, the Calm theme files' `[component]` tables, CR-02's text. No Rust contract is touched.
