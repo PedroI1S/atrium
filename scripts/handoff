@@ -100,7 +100,8 @@ case "${1:-status}" in
       echo "pushed $b"
     done < <(git worktree list --porcelain | sed -n 's/^worktree //p' | grep '/atrium-wt/' || true)
     shift_tag="$(git describe --tags --abbrev=0 --match "shift/*-$slug" 2>/dev/null)" || die "no shift tag found; did you run 'scripts/handoff start'?"
-    git log --oneline "$shift_tag..HEAD" -- docs/agents/sessions | grep -q . ||
+    # Not `| grep -q`: under pipefail, grep exiting early makes git log fail with SIGPIPE.
+    [[ -n "$(git log --oneline "$shift_tag..HEAD" -- docs/agents/sessions)" ]] ||
       die "write your session log in docs/agents/sessions/ (starting with a '## Next' section) and commit it first"
     [[ -z "$(git status --porcelain)" ]] || die "working tree not clean; commit your remaining changes first"
     write_driver free "$me"
