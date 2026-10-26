@@ -1,10 +1,18 @@
-import { describe, expect, it } from "vitest";
-import { initialModel, moveView, opacityTokens } from "./window-model";
-import { loadTheme } from "./theme/loader";
 import { readFileSync } from "node:fs";
-const calm = readFileSync(new URL("../themes/atrium-calm-dark.toml", import.meta.url), "utf8");
+import { describe, expect, it } from "vitest";
+import { loadTheme } from "./theme/loader";
+import { DEFAULT_SETTINGS, MIN_ALPHA, appearanceFor, moveView, initialModel, resolveTheme, type AppearanceInput } from "./window-model";
 
-describe("CR-02 opacity", () => {
+const calm = readFileSync(new URL("../themes/atrium-calm-dark.toml", import.meta.url), "utf8");
+const input = (over: Partial<AppearanceInput> & { s?: Partial<typeof DEFAULT_SETTINGS> } = {}): AppearanceInput => ({
+  settings: { ...DEFAULT_SETTINGS, alpha: 0.6, ...over.s },
+  supported: over.supported ?? true,
+  reduce: over.reduce ?? false,
+  popout: over.popout ?? false,
+  systemDark: over.systemDark ?? true,
+});
+
+describe("CR-02 theme rules", () => {
   it("reserves runtime names in primitives and validates state contrast for arbitrary theme ids", () => {
     expect(() => loadTheme(calm.replace("[primitive]", '[primitive]\nwindow-opacity = "0.5"'), "custom")).toThrow(/reserved/);
     expect(() => loadTheme(calm.replace('state-ready = "{success}"', 'state-ready = "#222222"'), "custom")).toThrow(/state-ready/);
@@ -17,31 +25,54 @@ describe("CR-02 opacity", () => {
       expect(() => loadTheme(`${calm}\n${key} = "0.5"`, "bad")).toThrow(/reserved/);
     expect(() => loadTheme(calm.replace('surface-0 = "{gray-0}"', 'surface-0 = "rgba(22, 22, 21, 0.8)"'), "bad")).toThrow(/opaque/);
   });
-  it("background preserves ink; whole mode leaves surfaces solid and uses native alpha", () => {
-    const s = { ...initialModel().settings, alpha: 0.6 };
-    expect(opacityTokens(s, true)).toEqual({ "--window-alpha-chrome": "0.6", "--window-alpha-content": "0.74", "--window-opacity": "1", "--window-blur": "24px" });
-    expect(opacityTokens({ ...s, solid: true }, true)["--window-alpha-content"]).toBe("1");
-    expect(opacityTokens({ ...s, mode: "whole" }, true)["--window-opacity"]).toBe("0.6");
-    expect(opacityTokens({ ...s, mode: "whole" }, true)["--window-alpha-content"]).toBe("1");
+});
+
+describe("appearanceFor (opacity rules, ui-direction §5)", () => {
+  it("background mode fades surfaces only; cards stay more solid; vibrancy on", () => {
+    const a = appearanceFor(input());
+    expect(a.tokens).toEqual({ "--window-alpha-chrome": "0.6", "--window-alpha-content": "0.74", "--window-opacity": "1", "--window-blur": "var(--glass-blur)" });
+    expect(a.native).toEqual({ vibrancy: true, alpha: 1, appearance: "dark" });
   });
-  it("uses opaque fallback, accessibility override and bounds", () => {
-    const s = { ...initialModel().settings, alpha: 0.3 };
-    for (const t of [opacityTokens(s, false), opacityTokens(s, true, true)]) {
-      expect(t["--window-alpha-chrome"]).toBe("1"); expect(t["--window-opacity"]).toBe("1");
+  it("keep reading areas solid holds cards at 1", () => {
+    expect(appearanceFor(input({ s: { solid: true } })).tokens["--window-alpha-content"]).toBe("1");
+  });
+  it("whole window keeps surfaces opaque and uses native alpha, no vibrancy", () => {
+    const a = appearanceFor(input({ s: { mode: "whole" } }));
+    expect(a.tokens["--window-alpha-chrome"]).toBe("1");
+    expect(a.tokens["--window-alpha-content"]).toBe("1");
+    expect(a.native).toEqual({ vibrancy: false, alpha: 0.6, appearance: "dark" });
+  });
+  it("blur off: translucent without vibrancy", () => {
+    const a = appearanceFor(input({ s: { blur: false } }));
+    expect(a.native.vibrancy).toBe(false);
+    expect(a.tokens["--window-blur"]).toBe("0");
+  });
+  it("unsupported platform and accessibility force opaque", () => {
+    for (const a of [appearanceFor(input({ supported: false })), appearanceFor(input({ reduce: true })), appearanceFor(input({ reduce: true, s: { mode: "whole" } }))]) {
+      expect(a.tokens["--window-alpha-chrome"]).toBe("1");
+      expect(a.native).toMatchObject({ vibrancy: false, alpha: 1 });
     }
-    expect(opacityTokens({ ...s, alpha: -10 }, true)["--window-alpha-chrome"]).toBe("0.3");
-    expect(opacityTokens({ ...s, alpha: NaN }, true)["--window-alpha-chrome"]).toBe("1");
+  });
+  it("pop-outs follow main unless Advanced pins them opaque", () => {
+    expect(appearanceFor(input({ popout: true })).alpha).toBe(0.6);
+    const pinned = appearanceFor(input({ popout: true, s: { popouts: "opaque", mode: "whole" } }));
+    expect(pinned.native.alpha).toBe(1);
+    expect(appearanceFor(input({ popout: false, s: { popouts: "opaque" } })).alpha).toBe(0.6);
+  });
+  it("clamps to the slider range and ignores NaN", () => {
+    expect(appearanceFor(input({ s: { alpha: -10 } })).alpha).toBe(MIN_ALPHA);
+    expect(appearanceFor(input({ s: { alpha: Number.NaN } })).alpha).toBe(1);
+  });
+  it("system theme follows the OS", () => {
+    expect(resolveTheme("system", false)).toBe("atrium-calm-light");
+    expect(appearanceFor(input({ s: { theme: "system" }, systemDark: false })).native.appearance).toBe("light");
   });
 });
-it("round-trips all view state through pop-out, serialization and close", () => {
-  for (const id of ["chat", "editor", "database"] as const) {
-    const state = initialModel();
-    state.views[id] = { threadId: "t-flaky", owner: "main", draft: "unfinished", messages: ["hello"], scroll: 425, content: "edited" };
-    const detached = moveView(state, id, `view-${id}`);
-    expect(detached.views[id].owner).toBe(`view-${id}`);
-    const restored = moveView(JSON.parse(JSON.stringify(detached)), id, "main");
-    expect(restored.views).toEqual(state.views);
-    expect(restored.revision).toBe(2);
-    expect(state.views[id].owner).toBe("main");
-  }
+
+it("moveView changes only the owner and bumps the revision", () => {
+  const state = initialModel();
+  const moved = moveView(state, "editor", "view-editor");
+  expect(moved.views.editor).toEqual({ ...state.views.editor, owner: "view-editor" });
+  expect(moved.views.chat).toBe(state.views.chat);
+  expect(moved.revision).toBe(state.revision + 1);
 });

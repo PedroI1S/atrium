@@ -295,11 +295,15 @@ pub fn run() {
                 #[cfg(target_os = "macos")]
                 hold_measurement_activity();
                 // Three-window runs restore two pop-outs at launch, as a relaunch would.
-                if env("ATRIUM_WINDOWS").as_deref() == Some("3") {
-                    for view in ["editor", "database"] {
-                        if let Err(e) = pop_out_and_apply(&handle, view) {
-                            eprintln!("harness pop-out {view} failed: {e}");
-                        }
+                // `ATRIUM_POPOUTS=chat,editor` picks them explicitly (screenshots).
+                let popouts: Vec<String> = match env("ATRIUM_POPOUTS") {
+                    Some(list) => list.split(',').map(str::to_string).collect(),
+                    None if env("ATRIUM_WINDOWS").as_deref() == Some("3") => vec!["editor".into(), "database".into()],
+                    None => Vec::new(),
+                };
+                for view in &popouts {
+                    if let Err(e) = pop_out_and_apply(&handle, view) {
+                        eprintln!("harness pop-out {view} failed: {e}");
                     }
                 }
                 // Activate the app and bring main to the front: a background, non-key window

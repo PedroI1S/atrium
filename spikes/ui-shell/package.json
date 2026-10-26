@@ -11,6 +11,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@fontsource/geist-mono": "5.3.0",
+    "@fontsource/instrument-sans": "5.3.0",
     "@kobalte/core": "^0.13.14",
     "@tanstack/solid-virtual": "^3.13.49",
     "@tauri-apps/api": "^2.12.4",

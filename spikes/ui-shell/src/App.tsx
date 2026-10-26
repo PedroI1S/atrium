@@ -1,34 +1,28 @@
-import { model, patchSettings } from "./windows";
-import { onCleanup, onMount } from "solid-js";
-import { Show } from "solid-js";
-import { FloatingShell, openFloatingInbox, toggleFloatingPanel, toggleFloatingSidebar } from "./ui/FloatingShell";
+import { Show, onCleanup, onMount } from "solid-js";
+import { advancedOpen, benchOverlay, paletteOpen, panelOpen, setAdvancedOpen, setPanel, setPaletteOpen, setScreen, setSidebarOpen, sidebarOpen, toast } from "./state";
 import { Palette } from "./ui/Palette";
-
-import { benchOverlay, paletteOpen, setPaletteOpen, toast } from "./state";
+import { MainWindow, PopoutWindow } from "./ui/Shell";
+import { effectiveSettings, patchSettings, viewId } from "./windows";
 
 export function App() {
   const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape" && advancedOpen()) { setAdvancedOpen(false); return; }
     if (!(e.metaKey || e.ctrlKey)) return;
     const k = e.key.toLowerCase();
-    if (k === "k") {
-      e.preventDefault();
-      setPaletteOpen(!paletteOpen());
-    } else if (k === "j") {
-      e.preventDefault();
-      openFloatingInbox();
-    } else if (k === "l" && e.shiftKey) {
-      e.preventDefault();
-      void patchSettings({ theme: model().settings.theme.endsWith("dark") ? "atrium-calm-light" : "atrium-calm-dark" });
-    } else if (k === "b") {
-      e.preventDefault();
-      if (e.altKey) toggleFloatingPanel(); else toggleFloatingSidebar();
-    }
+    const take = (f: () => void) => { e.preventDefault(); f(); };
+    if (k === "k") take(() => setPaletteOpen(!paletteOpen()));
+    else if (k === "l" && e.shiftKey) take(() => void patchSettings({ theme: effectiveSettings().theme === "atrium-calm-dark" ? "atrium-calm-light" : "atrium-calm-dark" }));
+    else if (viewId) return;
+    else if (k === "j") take(() => setScreen("inbox"));
+    else if (k === ",") take(() => setScreen("settings"));
+    else if (k === "b" && e.altKey) take(() => setPanel({ open: !panelOpen() }));
+    else if (k === "b") take(() => setSidebarOpen(!sidebarOpen()));
   };
   onMount(() => window.addEventListener("keydown", onKey));
   onCleanup(() => window.removeEventListener("keydown", onKey));
   return (
-    <div class="app" data-atrium-part="window">
-      <FloatingShell />
+    <div class="app" data-atrium-part="window" data-window={viewId ? "popout" : "main"}>
+      <Show when={viewId} fallback={<MainWindow />}><PopoutWindow /></Show>
       <Palette />
       <div class="toast-region" role="status" aria-live="polite">
         <Show when={toast()}>{(t) => <div class="toast">{t().text}</div>}</Show>

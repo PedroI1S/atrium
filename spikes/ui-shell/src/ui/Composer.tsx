@@ -1,10 +1,11 @@
-import { ArrowUp, ChevronDown, Paperclip, ShieldCheck } from "lucide-solid";
-import { model, patchView } from "../windows";
+import { ArrowUp, Shield } from "lucide-solid";
+import { Show } from "solid-js";
 import { markFirstInput } from "../bench";
+import { canEdit, model, patchView } from "../windows";
 
-export function Composer(props: { onSend: (text: string) => void; id?: string }) {
+/** Rounded composer: the field, then chips for approval mode and agent, and a round send button. */
+export function Composer(props: { onSend: (text: string) => void; id?: string; agent: string; compact?: boolean; placeholder?: string; scope?: string }) {
   const text = () => model().views.chat.draft;
-  const setText = (draft: string) => void patchView("chat", { draft });
   let area!: HTMLTextAreaElement;
   const grow = () => {
     area.style.height = "auto";
@@ -13,25 +14,25 @@ export function Composer(props: { onSend: (text: string) => void; id?: string })
   };
   const send = () => {
     const v = text().trim();
-    if (!v) return;
+    if (!v || !canEdit("chat")) return;
     props.onSend(v);
-    setText("");
     area.value = "";
     grow();
   };
   return (
-    <div class="composer" data-atrium-part="composer">
+    <div class="composer" classList={{ compact: props.compact }} data-atrium-part="composer">
       <textarea
         ref={area}
         id={props.id}
         class="composer-input"
         rows={1}
-        placeholder="Ask, or type / for commands"
+        placeholder={props.placeholder ?? "Reply…"}
         aria-label="Message"
         value={text()}
+        readOnly={!canEdit("chat")}
         onInput={(e) => {
           markFirstInput("input");
-          setText(e.currentTarget.value);
+          void patchView("chat", { draft: e.currentTarget.value });
           grow();
         }}
         onKeyDown={(e) => {
@@ -42,13 +43,13 @@ export function Composer(props: { onSend: (text: string) => void; id?: string })
           }
         }}
       />
-      <div class="composer-bar">
-        <button class="icon-btn" aria-label="Attach file" title="Attach"><Paperclip class="icon-md" /></button>
-        <button class="chip" title="Model (dummy)">claude-sonnet-5.5 <ChevronDown class="icon-xs" /></button>
-        <button class="chip" title="Approval mode (dummy)"><ShieldCheck class="icon-xs" /> Ask first</button>
-        <span class="side-grow" />
-        <button class="send-btn" aria-label="Send" title="Send (Enter)" disabled={!text().trim()} onClick={send}>
-          <ArrowUp class="icon-md" />
+      <div class="cm-row">
+        <Show when={props.scope} fallback={<span class="chip"><Shield class="i sm" aria-hidden="true" />Ask first</span>}>
+          <span class="chip">{props.scope}</span>
+        </Show>
+        <Show when={!props.scope}><span class="chip">{props.agent}</span></Show>
+        <button type="button" class="send" aria-label="Send" title="Send (Enter)" disabled={!text().trim()} onClick={send}>
+          <ArrowUp class="i" aria-hidden="true" />
         </button>
       </div>
     </div>

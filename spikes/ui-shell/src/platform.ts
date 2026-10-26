@@ -1,71 +1,46 @@
-// Thin wrapper over Tauri so the same frontend also runs in a plain browser (vite dev,
-// used for quick functional checks). Everything degrades to a no-op there.
+// Thin wrapper over Tauri so the same frontend also runs in a plain browser (vite dev, for
+// quick layout checks). Everything native degrades to a no-op there.
 
 import { invoke } from "@tauri-apps/api/core";
+import type { WindowModel } from "./window-model";
 
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 export interface StartupInfo {
   mainEpochMs: number;
+  label: string;
   benchMode: string | null;
-  theme: string | null;
-  preset: string | null;
   openPalette: boolean;
-  tab: string | null;
+  /** Harness/screenshot pins: starting screen, panel tab, Advanced open, panel minimized. */
+  screen: string | null;
   rightTab: string | null;
+  advanced: boolean;
+  panel: string | null;
   vibrancySupported: boolean;
   windows: number;
   opacity: string;
+  accessibilityOpaque: boolean;
+  /** What Rust already applied natively to this window before the webview loaded. */
+  native: { vibrancy: boolean; alpha: number };
+  /** The first state snapshot (null in a browser). */
+  snapshot: WindowModel | null;
 }
-
-const BROWSER_DEFAULTS: StartupInfo = { mainEpochMs: 0, benchMode: null, theme: null, preset: null, openPalette: false, tab: null, rightTab: null, vibrancySupported: false, windows: 1, opacity: "off" };
-
-/** Whether this platform can show native vibrancy at all (Rust says macOS only; a browser says no). */
-let vibrancyAvailable = false;
-export const vibrancySupported = (): boolean => vibrancyAvailable;
 
 export async function startupInfo(): Promise<StartupInfo> {
-  const info = await readStartupInfo();
-  vibrancyAvailable = info.vibrancySupported;
-  return info;
+  if (inTauri) return invoke<StartupInfo>("startup_info");
+  const q = new URLSearchParams(location.search);
+  return {
+    mainEpochMs: 0, label: q.get("view") ? `view-${q.get("view")}` : "main", benchMode: q.get("bench"), openPalette: q.has("palette"),
+    screen: q.get("screen"), rightTab: q.get("rightTab"), advanced: q.has("advanced"), panel: q.get("panel"),
+    vibrancySupported: false, windows: 1, opacity: "off", accessibilityOpaque: false, native: { vibrancy: false, alpha: 1 }, snapshot: null,
+  };
 }
 
-async function readStartupInfo(): Promise<StartupInfo> {
-  if (!inTauri) {
-    const q = new URLSearchParams(location.search);
-    return {
-      ...BROWSER_DEFAULTS,
-      benchMode: q.get("bench"),
-      theme: q.get("theme"),
-      preset: q.get("preset"),
-      openPalette: q.has("palette"),
-      tab: q.get("tab"),
-      rightTab: q.get("rightTab"),
-    };
-  }
-  return invoke<StartupInfo>("startup_info");
-}
-
-/** Returns whether native vibrancy is applied now (always false when it was not requested or failed). */
-export async function setVibrancy(enabled: boolean, dark: boolean): Promise<boolean> {
-  if (!inTauri) return false;
-  try {
-    const result = await invoke<boolean>("set_vibrancy", { enabled, dark });
-    return enabled && result;
-  } catch (e) {
-    console.warn("set_vibrancy failed", e);
-    return false;
-  }
-}
-
-export async function setWindowTheme(appearance: "dark" | "light"): Promise<void> {
+/** Native window appearance; "system" clears the override so the window follows macOS. */
+export async function setWindowTheme(appearance: "dark" | "light" | "system"): Promise<void> {
   if (!inTauri) return;
-  try {
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
-    await getCurrentWindow().setTheme(appearance);
-  } catch (e) {
-    console.warn("setTheme failed", e);
-  }
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  await getCurrentWindow().setTheme(appearance === "system" ? null : appearance);
 }
 
 export async function writeReport(payload: unknown): Promise<void> {

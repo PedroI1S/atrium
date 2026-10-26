@@ -1,18 +1,13 @@
-import { model, patchSettings, popOut } from "../windows";
-import { openFloatingInbox, toggleFloatingPanel, toggleFloatingSidebar } from "./FloatingShell";
 import { Dialog } from "@kobalte/core/dialog";
 import { CornerDownLeft } from "lucide-solid";
 import { For, createEffect, createMemo, createSignal } from "solid-js";
-import { runFrameBenchesInteractive, benchResize } from "../bench";
-import {
-  PRESETS,
-  type PresetId,
-  applyPreset,
-  paletteOpen,
-  setPaletteOpen,
-  showToast,
-  themes,
-} from "../state";
+import { benchResize, runFrameBenchesInteractive } from "../bench";
+import { paletteOpen, panelOpen, setPanel, setPaletteOpen, setScreen, setSidebarOpen, sidebarOpen } from "../state";
+import { VIEW_IDS } from "../window-model";
+import { bringBack, model, patchSettings, popOut, viewId } from "../windows";
+
+/** The palette's quick "see-through" preset (the harness pins the same value). */
+const SEE_THROUGH = 0.6;
 
 interface Command {
   id: string;
@@ -26,34 +21,36 @@ interface Section {
 }
 
 function sections(): Section[] {
-  const presets: Command[] = (Object.keys(PRESETS) as PresetId[]).map((id) => ({
-    id: `layout-${id}`,
-    label: `Layout: ${PRESETS[id].label}`,
-    hint: id === "default" ? "chat + preview + review" : id === "review" ? "diff large, chat narrow" : "chat only",
-    run: () => applyPreset(id),
-  }));
+  const windows: Command[] = VIEW_IDS.map((view) =>
+    model().views[view].owner === "main"
+      ? { id: `pop-${view}`, label: `Move ${view} to New Window`, run: () => void popOut(view) }
+      : { id: `back-${view}`, label: `Bring ${view} back`, run: () => void bringBack(view) },
+  );
+  const go: Command[] = viewId ? [] : [
+    { id: "inbox", label: "Go to Inbox", hint: "⌘J", run: () => setScreen("inbox") },
+    { id: "chat", label: "Go to chat", run: () => setScreen("chat") },
+    { id: "editor", label: "Go to editor", run: () => setScreen("editor") },
+    { id: "settings", label: "Open Settings", hint: "⌘,", run: () => setScreen("settings") },
+    { id: "toggle-sidebar", label: "View: toggle sidebar", hint: "⌘B", run: () => setSidebarOpen(!sidebarOpen()) },
+    { id: "toggle-panel", label: "View: minimize or expand the panel", hint: "⌘⌥B", run: () => setPanel({ open: !panelOpen() }) },
+  ];
   const look: Command[] = [
-    ...themes().map((t) => ({ id: `theme-${t.id}`, label: `Theme: ${t.theme.meta.name}`, hint: t.theme.meta.appearance, run: () => void patchSettings({ theme: t.id }) })),
-    { id: "toggle-appearance", label: "Theme: toggle dark / light", hint: "⌘⇧L", run: () => void patchSettings({ theme: model().settings.theme.endsWith("dark") ? "atrium-calm-light" : "atrium-calm-dark" }) },
+    { id: "theme-light", label: "Theme: Light", run: () => void patchSettings({ theme: "atrium-calm-light" }) },
+    { id: "theme-dark", label: "Theme: Dark", run: () => void patchSettings({ theme: "atrium-calm-dark" }) },
+    { id: "theme-system", label: "Theme: System", run: () => void patchSettings({ theme: "system" }) },
+    { id: "opacity-60", label: "Opacity: 60 %", run: () => void patchSettings({ alpha: SEE_THROUGH }) },
+    { id: "opacity-100", label: "Opacity: 100 %", run: () => void patchSettings({ alpha: 1 }) },
   ];
-  const actions: Command[] = [
-    ...(["chat", "editor", "database"] as const).map(view => ({ id: `pop-${view}`, label: `Move ${view} to New Window`, run: () => { void popOut(view); } })),
-    { id: "next-attention", label: "Go to next item needing attention", hint: "⌘J", run: openFloatingInbox },
-    { id: "new-thread", label: "New thread", hint: "⌘N", run: () => showToast("New thread (dummy)") },
-    { id: "quick-capture", label: "Quick capture a task", hint: "⌃⌥Space", run: () => showToast("Quick capture (dummy)") },
-    { id: "toggle-sidebar", label: "View: toggle sidebar", hint: "⌘B", run: toggleFloatingSidebar },
-    { id: "toggle-right", label: "View: toggle right panel", run: toggleFloatingPanel },
-  ];
-  const bench: Command[] = [
+  const bench: Command[] = viewId ? [] : [
     { id: "bench-frames", label: "Dev: run frame-time benchmarks", hint: "scroll 5,000 messages + resize", run: () => void runFrameBenchesInteractive() },
     { id: "bench-resize", label: "Dev: resize panes for 3 s", run: () => void benchResize() },
   ];
   return [
-    { label: "Actions", options: actions },
-    { label: "Layout", options: presets },
+    { label: "Go", options: go },
+    { label: "Windows", options: windows },
     { label: "Look", options: look },
     { label: "Developer", options: bench },
-  ];
+  ].filter((x) => x.options.length);
 }
 
 /** Case-insensitive subsequence-friendly match: every word of the query must appear in the label. */

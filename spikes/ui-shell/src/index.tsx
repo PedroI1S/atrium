@@ -1,51 +1,63 @@
 /* @refresh reload */
 import { invoke } from "@tauri-apps/api/core";
-import { inTauri } from "./platform";
 import { render } from "solid-js/web";
-import { initWindows, popOut, settingsSettled, viewId } from "./windows";
-import { App } from "./App";
+import "@fontsource/instrument-sans/latin-400.css";
+import "@fontsource/instrument-sans/latin-500.css";
+import "@fontsource/instrument-sans/latin-600.css";
+import "@fontsource/geist-mono/latin-400.css";
+import "@fontsource/geist-mono/latin-500.css";
 import "./styles/base.css";
-import "./styles/components.css";
-import { markOnce, runHarness } from "./bench";
-import { startupInfo } from "./platform";
-import { PRESETS, applyPreset, floatingDefaultSizes, setOuterSizes, setActiveTabId, setRightTab, setPaletteOpen, setThemes, tabs, type RightTabId } from "./state";
-import { loadAllThemes } from "./theme/registry";
+import "./styles/calm.css";
+import { App } from "./App";
+import { markOnce, reportFailure, runHarness, runProbe, setStage } from "./bench";
+import { type PanelTab, type Screen } from "./layout";
+import { type StartupInfo, inTauri, startupInfo } from "./platform";
+import { setAdvancedOpen, setPaletteOpen, setPanel, setScreen } from "./state";
+import { afterMount, appliedState, initFromStartup, repaint, subscribe, viewId } from "./windows";
 
-async function boot() {
-  const info = await startupInfo();
-  const { entries, errors } = loadAllThemes();
-  setThemes(entries.filter(e => e.direction === "atrium"));
-  for (const e of errors) console.error("theme failed to load:", e.message);
+const SCREENS: Screen[] = ["chat", "inbox", "editor", "database", "settings"];
 
-  if (info.preset && info.preset in PRESETS) applyPreset(info.preset as keyof typeof PRESETS, true);
-  if (info.tab) {
-    const t = tabs().find((x) => x.id === `tab-${info.tab}` || x.id === info.tab);
-    if (t) setActiveTabId(t.id);
-  }
-  if (info.rightTab) setRightTab(info.rightTab as RightTabId);
+/** Harness and screenshot pins (ATRIUM_SCREEN, ATRIUM_RIGHT_TAB, ATRIUM_ADVANCED, ATRIUM_PANEL). */
+function applyPins(info: StartupInfo): void {
+  if (viewId) return;
+  if (info.screen && SCREENS.includes(info.screen as Screen)) setScreen(info.screen as Screen);
+  if (info.rightTab) setPanel({ tab: info.rightTab as PanelTab });
+  if (info.panel === "min") setPanel({ open: false });
+  if (info.advanced) setAdvancedOpen(true);
   if (info.openPalette) setPaletteOpen(true);
-
-  await initWindows(info.vibrancySupported);
-  if (!info.preset || info.preset === "default") setOuterSizes(floatingDefaultSizes());
-  if (!viewId && info.windows === 3) { await popOut("editor"); await popOut("database"); }
-  await settingsSettled();
-  render(() => <App />, document.getElementById("root")!);
-  markOnce("mounted");
-  if (inTauri) {
-    await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
-    markOnce("firstPaintRaf");
-    await invoke("window_ready");
-    if (!viewId && info.benchMode) {
-      let count = 0;
-      for (let i = 0; i < 500; i++) {
-        count = await invoke<number>("ready_count");
-        if (count === info.windows) break;
-        await new Promise(r => setTimeout(r, 20));
-      }
-      if (count !== info.windows) throw new Error(`Expected ${info.windows} ready windows; got ${count}`);
-    }
-  }
-  if (info.benchMode && !viewId) void runHarness(info);
 }
 
-void boot();
+let info: StartupInfo | null = null;
+
+async function boot() {
+  // One subscription and one startup call (snapshot included), then paint tokens and render:
+  // no other IPC, theme loading or native call sits before the first render (review #5).
+  setStage("subscribe");
+  await subscribe();
+  setStage("startup-info");
+  info = await startupInfo();
+  initFromStartup(info);
+  applyPins(info);
+  setStage("render");
+  render(() => <App />, document.getElementById("root")!);
+  markOnce("mounted");
+  requestAnimationFrame(() => markOnce("firstPaintRaf"));
+  const harnessMain = Boolean(info.benchMode) && !viewId;
+  if (harnessMain) {
+    setStage("probe");
+    await runProbe();
+  }
+  setStage("after-mount");
+  await afterMount();
+  // Native reconciliation runs after mount; Rust already applied the pinned state in setup.
+  setStage("native-paint");
+  await repaint();
+  if (inTauri) {
+    // Ready = mounted and appearance applied. Not rAF, which stops in occluded windows (review #1).
+    setStage("ready");
+    await invoke("window_ready", { applied: appliedState() });
+  }
+  if (harnessMain) await runHarness(info);
+}
+
+boot().catch((e) => reportFailure(e, info));

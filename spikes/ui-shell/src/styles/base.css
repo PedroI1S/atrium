@@ -1,104 +1,163 @@
-/* Base: reset, window frame, and the component-token defaults.
+/* Base: reset, the CR-02 paint tokens, and component-token defaults.
  *
- * Rule: nothing in this folder uses a literal colour, radius, font or duration. Components read
- * semantic tokens (--surface-1, --text-muted, ...) and component tokens (--tab-active-bg, ...).
- * The component tokens below are DEFAULTS built from semantic tokens; a theme may override any of
- * them in its [component] table (the loader sets them inline on :root, which wins over this rule).
+ * Rule: literals live only in `:root { ... }` token blocks here and in the theme TOML files.
+ * Components (calm.css, the TSX) read semantic tokens (--surface-1, --text-muted, ...) and
+ * component tokens. Layout-B tokens that the Calm themes define (sidebar-width, panel-width,
+ * card-gap, card-radius, chat-measure, composer-radius, ...) are NOT repeated here: the theme
+ * is their single source (review #11).
  */
 
 :root {
-  /* hairlines, focus and the shapes shared by every component */
+  /* lines, focus, shapes */
   --hairline: 1px;
+  --hairline-fine: 0.5px;
   --focus-width: 2px;
+  --focus-offset: 2px;
   --pill-radius: 999px;
-  --dot-size: 8px;
-  --icon-xs: 12px;
-  --icon-sm: 13px;
-  --icon-md: 15px;
-  --pulse-duration: 1.6s;
-  --blink-duration: 1.1s;
+  --dot-size: 7px;
+  --dot-ring: 1.3px;
+  --badge-size: 8px;
+  --badge-ring: 2px;
+  --icon: 16px;
+  --icon-sm: 14px;
+  --icon-lg: 22px;
+  --icon-stroke: 1.6;
 
-  /* sizes of fixed-size parts */
-  --traffic-light-width: 78px;
-  --strip-fill-min-width: 24px;
-  --tab-max-width: 220px;
-  --tab-min-width: 90px;
-  --tab-close-size: 16px;
-  --handle-line: 2px;
-  --handle-hit: 4px;
-  --sidebar-min-width: 190px;
-  --badge-size: 18px;
+  /* rows, buttons, fields (ui-direction §6 shape and density) */
+  --row-height: 34px;
+  --row-height-sm: 32px;
+  --step-height: 30px;
+  --tree-row-height: 28px;
+  --check-row-height: 42px;
+  --row-radius: 9px;
+  --row-radius-sm: 7px;
+  --head-height: 50px;
+  --icon-button: 30px;
+  --icon-button-sm: 26px;
+  --icon-button-radius: 8px;
+  --btn-height: 30px;
+  --btn-height-sm: 26px;
+  --btn-radius: 9px;
+  --btn-radius-sm: 8px;
+  --pill-height: 22px;
+  --chip-height: 24px;
+  --tile-height: 54px;
+  --tile-radius: 10px;
+  --topic-size: 30px;
+  --strip-button: 34px;
+  --strip-divider: 20px;
+  --seg-height: 26px;
+  --seg-pad: 2px;
+  --toggle-width: 34px;
+  --toggle-height: 20px;
+  --toggle-knob: 16px;
+  --toggle-knob-off: #ffffff;
+  --slider-width: 170px;
+  --slider-width-sm: 120px;
+  --select-height: 28px;
+  --stab-height: 28px;
+  --ftab-height: 30px;
+  --mod-dot: 6px;
+  --code-radius: 5px;
+  --approval-radius: 14px;
+  --approval-radius-sm: 12px;
+  --bubble-radius: 16px;
+  --bubble-tail-radius: 5px;
+  --bubble-max-width: 480px;
+  --bubble-max-width-sm: 290px;
+  --composer-field-height: 40px;
+  --composer-field-height-sm: 26px;
   --composer-max-height: 200px;
-  --placeholder-min-height: 160px;
-  --home-max-width: 760px;
-  --home-card-min-width: 220px;
-  --menu-min-width: 270px;
-  --palette-width: 640px;
-  --palette-gutter: 48px;
-  --palette-list-max-height: 420px;
+  --send-size: 30px;
+  --caret-width: 1.5px;
+  --caret-height: 16px;
+  --statusbar-height: 30px;
+  --diff-gutter: 40px;
+  --diff-sign: 16px;
+  --editor-gutter: 56px;
+  --editor-font-size: 13px;
+  --editor-line-height: 23px;
+  --code-indent: 4ch;
 
-  /* layout shape (Glass floats panels with a gap; Flat and Paper run edge to edge) */
-  --panel-gap: 0px;
-  --panel-radius: 0px;
-  --glass-blur: 0px;
-  --handle-size: 7px;
+  /* columns (bounds for dragging; the default widths come from the theme) */
+  --sidebar-min-width: 200px;
+  --sidebar-max-width: 360px;
+  --panel-min-width: 320px;
+  --panel-max-width: 640px;
+  --panel-width-editor: 380px;
+  --advanced-width: 400px;
+  --main-min-width: 420px;
+  --settings-measure: 520px;
+  --popout-bar-height: 44px;
+  /* Room for the macOS traffic lights; must match the native position in tauri.conf.json / shell.rs. */
+  --traffic-light-inset: 78px;
+  --palette-width: 620px;
+  --palette-top: 96px;
+  --palette-list-max-height: 400px;
+  --toast-offset: 20px;
 
-  /* chrome */
-  --strip-height: 44px;
-  --strip-bg: var(--surface-glass);
-  --sidebar-bg: var(--surface-glass);
-  --pane-bg: var(--surface-1);
-  --pane-border: var(--border);
-  --pane-head-bg: transparent;
+  /* type scale on top of the theme's --text-ui / --text-code / --chat-font-size */
+  --text-meta: 11.5px;
+  --text-label: 12px;
+  --text-small: 12.5px;
+  --text-row: 13px;
+  --text-title: 14px;
+  --text-section: 15px;
+  --text-kbd: 10.5px;
+  --text-mono-sm: 12px;
+  --line-ui: 1.5;
+  --line-chat: 1.65;
+  --line-bubble: 1.55;
+  --line-mini: 1.6;
+  --line-diff: 21px;
+  --line-term: 20px;
+  --tracking-section: -0.01em;
+  --weight-medium: 500;
+  --weight-semibold: 600;
 
-  /* tabs */
-  --tab-height: 30px;
-  --tab-radius: calc(var(--radius) * 0.75);
-  --tab-bg: transparent;
-  --tab-hover-bg: var(--accent-muted);
-  --tab-active-bg: var(--surface-2);
-  --tab-active-fg: var(--text);
-  --tab-fg: var(--text-muted);
+  /* motion and emphasis */
+  --pulse-duration: 1.8s;
+  --pulse-dim: 0.3;
+  --blink-duration: 1.1s;
+  --kbd-opacity: 0.7;
+  --disabled-opacity: 0.45;
+  --knob-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --seg-on-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+  --flash-bg: var(--state-needs-you-bg);
 
-  /* conversation */
-  --chat-font: var(--font-ui);
-  --chat-text-size: var(--text-ui);
-  --chat-line-height: 1.5;
-  --chat-measure: 100%;
-  --message-padding-y: 6px;
-  --bubble-user-bg: var(--accent-muted);
-  --bubble-user-fg: var(--text);
-  --tool-bg: var(--surface-2);
+  /* spacing: multiples of the theme's 4 px grid (--space-unit) */
+  --u05: calc(var(--space-unit) * 0.5);
+  --u1: var(--space-unit);
+  --u15: calc(var(--space-unit) * 1.5);
+  --u2: calc(var(--space-unit) * 2);
+  --u25: calc(var(--space-unit) * 2.5);
+  --u3: calc(var(--space-unit) * 3);
+  --u35: calc(var(--space-unit) * 3.5);
+  --u4: calc(var(--space-unit) * 4);
+  --u45: calc(var(--space-unit) * 4.5);
+  --u5: calc(var(--space-unit) * 5);
+  --u6: calc(var(--space-unit) * 6);
+  --u7: calc(var(--space-unit) * 7);
+  --u9: calc(var(--space-unit) * 9);
+  --u10: calc(var(--space-unit) * 10);
 
-  /* composer */
-  --composer-bg: var(--surface-2);
-  --composer-radius: calc(var(--radius) * 1.25);
-  --composer-border: var(--border-strong);
+  /* CR-02 runtime tokens: written by the app from settings, never by a theme. */
+  --window-alpha-chrome: 1;
+  --window-alpha-content: 1;
+  --window-opacity: 1;
+  --window-blur: 0;
 
-  /* badges and labels */
-  --badge-bg: var(--accent);
-  --badge-fg: var(--text-on-accent);
-  --badge-font: var(--font-ui);
-  --label-font: var(--font-ui);
-  --label-transform: none;
+  /* CR-02 paint tokens: opaque theme surfaces composed with runtime alpha. */
+  --frame-paint: rgb(var(--surface-0-rgb) / var(--window-alpha-chrome));
+  --card-paint: rgb(var(--surface-1-rgb) / var(--window-alpha-content));
+  --raised-paint: rgb(var(--surface-2-rgb) / var(--window-alpha-content));
+  --overlay-paint: rgb(var(--surface-overlay-rgb) / var(--window-alpha-content));
+  --seg-on-bg: var(--surface-1);
+  --badge-ring-color: rgb(var(--surface-0-rgb));
+}
 
-  /* overlays */
-  --palette-bg: var(--surface-overlay);
-  --palette-radius: calc(var(--radius) * 1.25);
-  --palette-blur: var(--glass-blur);
-  --scrim: rgba(0, 0, 0, 0.32);
-  --shadow-overlay: 0 24px 64px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--border-strong);
-
-  /* syntax (a theme's [component] table overrides these; the VS Code import fills them from tokenColors) */
-  --syntax-keyword: var(--accent);
-  --syntax-string: var(--success);
-  --syntax-number: var(--warning);
-  --syntax-comment: var(--text-faint);
-  --syntax-function: var(--info);
-  --syntax-type: var(--warning);
-  --syntax-variable: var(--text);
-  --syntax-property: var(--info);
-  --syntax-punctuation: var(--text-muted);
+:root[data-appearance="dark"] {
+  --seg-on-bg: var(--surface-2);
 }
 
 *,
@@ -115,10 +174,10 @@ body,
 }
 
 body {
-  /* The window is transparent so native vibrancy can show through. Opaque themes paint .app. */
+  /* The window is transparent so vibrancy and the desktop can show through; .app paints the frame. */
   background: transparent;
   color: var(--text);
-  font: 400 var(--text-ui) / 1.4 var(--font-ui);
+  font: 400 var(--text-ui) / var(--line-ui) var(--font-ui);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   overflow: hidden;
@@ -127,52 +186,33 @@ body {
   cursor: default;
 }
 
-button {
-  font: inherit;
-  color: inherit;
-  background: none;
-  border: 0;
-  padding: 0;
-  cursor: default;
-}
+button,
+input,
+select,
 textarea {
   font: inherit;
   color: inherit;
 }
-pre,
-code {
-  font-family: var(--font-code);
+button {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: default;
+  text-align: left;
+}
+button:disabled {
+  opacity: var(--disabled-opacity);
 }
 :focus-visible {
   outline: var(--focus-width) solid var(--focus-ring);
-  outline-offset: calc(var(--focus-width) * -1);
+  outline-offset: var(--focus-offset);
 }
-.sr-only {
-  position: absolute;
-  width: var(--hairline);
-  height: var(--hairline);
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-}
-.mono {
-  font-family: var(--font-code);
-}
-.muted {
-  color: var(--text-muted);
+textarea:focus-visible,
+input:focus-visible {
+  outline-offset: 0;
 }
 
-.app {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  background: var(--surface-0);
-}
-:root[data-vibrancy="true"] .app {
-  background: transparent;
-}
-
-/* Themes swap in one cut; no 200 ms colour smear across the whole window. */
+/* Themes swap in one cut; no colour smear across the whole window. */
 :root[data-theme-switching] * {
   transition: none !important;
 }
@@ -186,31 +226,4 @@ code {
     animation: none !important;
     scroll-behavior: auto !important;
   }
-}
-
-/* Icons are sized by tokens (lucide's size attribute is a literal). */
-.icon-xs { width: var(--icon-xs); height: var(--icon-xs); }
-.icon-sm { width: var(--icon-sm); height: var(--icon-sm); }
-.icon-md { width: var(--icon-md); height: var(--icon-md); }
-
-/* CR-02 proposal: runtime alpha is independent of the theme. */
-:root {
-  --window-alpha-chrome: 1;
-  --window-alpha-content: 1;
-  --window-opacity: 1;
-  --window-blur: 0px;
-  --frame-paint: rgb(var(--surface-0-rgb) / var(--window-alpha-chrome));
-  --card-paint: rgb(var(--surface-1-rgb) / var(--window-alpha-content));
-  --overlay-paint: rgb(var(--surface-overlay-rgb) / var(--window-alpha-content));
-  --raised-paint: rgb(var(--surface-2-rgb) / var(--window-alpha-content));
-  --card-gap: 8px;
-  --card-radius: 11px;
-  --sidebar-width: 244px;
-  --panel-width: 420px;
-  --panel-strip-width: 46px;
-  --shadow-card: 0 1px 3px var(--border);
-  --chat-font-size: 14.5px;
-  --editor-line-height: 23px;
-  --editor-font-size: 13px;
-  --topic-size: 30px;
 }
