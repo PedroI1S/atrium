@@ -170,3 +170,10 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 - G1–G3 change approval and enforcement behaviour, so their defaults are Pedro's call (D-013).
 - The Linux/WebKitGTK checks stay outside the gate and go to the partner (D-033).
 - CR-01 … CR-04 are decided in the M1 contract phase. M1 starts only on an explicit go from the driver.
+
+## D-036 — 2026-10-26 — Repo moved out of `~/Documents` (corrects D-030)
+**Decided by Pedro.** The `.nosync` rename (D-030) didn't stop iCloud. After it, iCloud created 1,097 more conflict copies, including in `.git` (`index 4…7`, `AUTO_MERGE 6…8`) and in build output during a build. It also renamed the Codex spike's `src` folder to `src 4`, which is what made the 2026-10-26 rebase "local changes would be overwritten" glitch and the four missing files. No pushed commit was affected (exact-file staging; `fsck` clean).
+- **The fix:** the repo is now `~/Harness` and the worktrees are in `~/atrium-wt`. There are no symlinks left in `~/Documents`. `git worktree repair` was run, and 1,473 conflict copies were quarantined in `~/Harness-icloud-copies` (Pedro deletes them).
+- **Verified:** a full clean rebuild plus the workspace tests (231 passed, 0 failed, 1 ignored) produced no new copies.
+- After a move, run `cargo clean`: test binaries keep the old `CARGO_MANIFEST_DIR` and fail on fixture paths.
+- **Rule for every machine** (`docs/agents/README.md`): keep the repo outside any synced folder; a `.nosync` rename inside one is not enough.
