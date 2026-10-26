@@ -1,92 +1,137 @@
 # M0-06b: Floating spaces, opacity and pop-out windows
 
-Task `M0-06b-ui-shell-layout-b` · GPT-6.1 Sol · 2026-10-25.
+Task `M0-06b-ui-shell-layout-b` · first version GPT-6.1 Sol (2026-10-25) · fix round 1 Opus 5.5 (2026-10-26) · Tauri 2.12.5 + SolidJS 1.9 · macOS 27.0.1, Apple M4, built-in Retina panel at 60 Hz.
 
-Implementation and build checks are complete. **Native interaction, screenshots and performance measurements have not been run.** The worker did not launch the app, a browser or a dev server. The orchestrator must perform the runtime checks below before treating any of these mechanisms as proven or declaring the performance budgets met.
+Code: `spikes/ui-shell/`. Screenshots: `docs/spikes/M0-06b-ui-shell-layout-b/`. Logs of this round: `docs/spikes/M0-06b-ui-shell-layout-b/fix1-logs/`. The orchestrator's first, partial run (`raw-measurements/`, `measurements.md`) is superseded by section 5.
 
-## What was built
+**Status: done.** Layout B is built to `docs/design/ui-direction.md`, both opacity modes and pop-out windows work in the real app, the full measurement matrix ran (section 5), and all 13 review findings are fixed (section 1). Budgets: TTI medians 327–341 ms in all six configurations (under 400 ms; worst cases 359–472 ms, two configurations had 2 of 10 launches over), 60 fps in every frame test, footprint 125–134 MB with one window (under 150 MB) and **194–207 MB with three windows (over 150 MB: about +33 MB per pop-out)**. The three-window budget is a question for Pedro (section 5).
 
-`spikes/ui-shell/` now opens layout B: a sidebar directly on the window frame, floating main/context cards, topic circles, a ranked inbox mock, chat/editor/database mock views, sidebar and context-panel strips, Corvu resize handles, and an Appearance settings card. Advanced appearance occupies the right side, closes on navigation and is never a modal. The editor path is centered. The 5,000-message seeded, virtualized transcript is retained.
+## 1. Fix round 1 (Opus)
 
-The two Calm theme files are copied unchanged from `docs/design/themes/`. The app and palette expose Calm Light/Dark; the older directions and importer remain as loader regression coverage. This is a mechanics spike, not a pixel-perfect implementation of every screen in the design. It uses the theme's system-font fallbacks: Instrument Sans and Geist Mono font binaries are not bundled. Topic management, real editor/terminal/database engines, window-position restoration, drag-to-detach, pinning and per-workspace layout persistence are deferred. There is one movable chat view (its selected thread identity moves with it), one editor and one database. Threads share the dummy chat's draft/message store rather than implementing a real multi-session model.
+The review (`docs/agents/reviews/M0-06b-ui-shell-layout-b.md`) had 13 accepted findings, plus Pedro's note that the look was underwhelming. Every bug fix has a test that fails without it.
 
-## Opacity mechanisms
+| # | Finding | Fix | Test / evidence |
+|---|---|---|---|
+| 1 | 3-window and translucent runs timed out: readiness waited on rAF, pop-outs stacked on top of each other, cold/frames launches were never activated | Readiness = mounted + appearance applied, reported per window (`window_ready`), never rAF. Pop-outs cascade from main's origin (`build_popout`). In harness mode the app activates itself, brings main to the front and holds an `NSProcessInfo` activity (no App Nap). Remembered pop-outs are restored once main is interactive (`restore_windows`), not in `setup`. | All 6 configurations × 3 metrics completed (section 5). Discriminating check: every window reports whether rAF fired after it was ready (`rAF fired after ready` in each log); with the fixes, rAF fired after readiness in every window of all 42 three-window launches (cold, frames and footprint runs) (main is activated and frontmost, pop-outs cascade out from under it). The old setup (stacked, unactivated windows) was not re-run; readiness no longer depends on rAF either way. |
+| 2 | Failures became silent 40/90 s timeouts | `boot()` and the harness track a stage; any failure writes `{kind:"error", stage, message, windows}` and exits. `measure.py` fails fast on an error report or a dead process, logs the app's stdout/stderr per run and prints its tail. The wrapper runs every cell, reports each failure, exits 1 at the end. Reports are written atomically. | Exercised while developing (a missing composer, a wrong pin); `FAILED (...)` lines name the stage. |
+| 3 | `readyWindows` was tautological; only main's applied state was checked | `ready_states` returns each window's applied state (theme, alphas, native alpha read back from `NSWindow`, vibrancy, accessibility, error). `measure.py` checks the exact set of window labels and every window's values. | `verified per-window appearance` line in every log. |
+| 4 | ~60 Hz `shell_patch` for scroll; focus re-ran the whole native chain | Scroll position is debounced (150 ms) and flushed before a pop-out or close. Native calls run only when their input changed (theme, vibrancy, alpha are diffed). The focus listener is gone: an `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification` observer tells every window when Reduce transparency / Increase contrast change. | `sync.test.ts` (`debounced`); code review of `paintNative`. |
+| 5 | TTI regression: probe after the gate, themes loaded twice, serial IPC before first render, vibrancy applied then cleared | The TTI probe runs right after mount, before waiting for other windows or native calls. Only the two Calm themes are parsed, once (`theme/calm.ts`; the M0-06 themes and VS Code importer are no longer evaluated at startup). One `startup_info` call carries the state snapshot, so tokens are painted synchronously before the first render. Rust applies the persisted (or pinned) vibrancy/alpha/theme to each window in `setup` / `build_popout`; the frontend only reconciles differences, in parallel, after mount. | Section 5: TTI medians 327–341 ms (was 396–419 ms for one window and timeouts for three). |
+| 6 | A rejected patch latched `writeFailure`; close and "Move back" threw; the pop-out could not be closed | Ownership rejections (`not-owner:`) are dropped, never latched (`WriteQueue`). Closing is `flush → bring_back`, and if bring-back fails the window is destroyed anyway (`closeOwnedView`); Rust returns the view on destruction. | `sync.test.ts`: WriteQueue and closeOwnedView cases; real app: `measure.py roundtrip` (section 3). |
+| 7 | Opacity slider: synchronous non-atomic file write and an unbounded paint queue per event; arbitrary keys persisted | Frontend: optimistic overlay, settings patches coalesced (one in flight), native paint latest-wins. Rust: whitelisted keys and values (`apply_settings_patch`), persistence on a background thread, debounced 250 ms and atomic (temp + rename), flushed on exit. | `sync.test.ts` (latestWins, coalescing); `shell.rs` tests (whitelist, coalesced persister, atomic write). |
+| 8 | Ownership holes: edits during the switch lost; main could not force a hung pop-out back; `IndexMut` inserted null | The view is read-only from the moment a pop-out starts until it lands (`moving`, `canEdit`). Main asks the pop-out politely and forces it after 1.5 s (`bringBackFromMain` + `force_bring_back`). View lookups use `get_mut`; an unknown view is an error and nothing is inserted. | `sync.test.ts` (bringBackFromMain); `shell.rs` (`patching_an_unknown_view_does_not_insert_it`, `only_the_owner_can_patch_a_view`); real app: forced bring-back in `roundtrip`. |
+| 9 | Advanced opened in the 46 px strip when the panel was minimized | The right column is a pure function of screen, panel state and Advanced (`layout.ts` `rightColumn`); in Settings, Advanced always takes `--advanced-width` (400 px). | `layout.test.ts` (fails with the old rule). |
+| 10 | Inert `--window-opacity`/`--window-blur`; whole-window via `NSWindow.alphaValue` contradicts ui-direction §5; no blur strength; bare `0.35`; no accessibility observer; Linux opaque-only | Documented in CR-03 and section 6. `READING_AREA_LIFT = 0.35` is a named constant. Accessibility observer added (row 4). Blur strength is shown disabled with the reason. | — |
+| 11 | Conformance test missed `windows.ts`/`window-model.ts`/`state.ts` and bare fractions; `base.css` duplicated Calm values | The test now scans every CSS file, all TSX, and the TS modules that paint or size anything (`windows.ts`, `window-model.ts`, `state.ts`, `sync.ts`, `layout.ts`, `bench.ts`, ...). New rules: bare fractions (CSS values that are not `calc()` multipliers; TS literals that are not named `UPPER_CASE` constants), lengths/durations in TS. A new test fails if `base.css` defines a token the Calm themes own; the duplicates were removed. | `tokens-conformance.test.ts` (with self-tests for each rule). |
+| 12 | Layout B gaps: settings tabs, attention dot, `+` topic, raised selected card, pop-out chrome, per-pop-out opacity; pop-out traffic lights | All done (section 2). Pop-out traffic lights are positioned by `traffic_light_position` to sit centred in the 44 px pop-out bar. | Screenshots. |
+| 13 | Tests overclaimed; no `shell_patch` ownership or close/bring-back race tests; stale report; 3-window footprint over budget | Tests renamed and rewritten against pure functions (`shell.rs`: 11, `lib.rs`: 1; TS: 130 including 35 new). The pop-out lifecycle is also checked end to end in the real app (`measure.py roundtrip`). This report replaces the old one. The 3-window footprint question is for Pedro (section 5). | — |
 
-| Mode | Mechanism | Native API / limitations |
+## 2. What was built: layout B
+
+The spike now looks like the "B · Floating spaces" prototype; it was ported view by view from the prototype's source onto the Calm tokens. Everything is calm, near-monochrome and token-only (the conformance test is strict).
+
+- **Frame and cards** (ui-direction §2): the sidebar sits on the window frame (`surface-0`); the main card and the right column are floating cards (`surface-1`, 11 px radius, `--shadow-card`, 8 px gap). Columns are resizable by dragging the gaps, within token bounds.
+- **Sidebar** (§2.1): hide button, ⌘K bar, Inbox tile (needs-you count in amber) and Home tile, topic title with ⋯, "New chat in this topic", chats with status dot, title and age; **the selected chat is a small raised card**. Topic switcher: monogram circles, **amber attention dot** on topics with something that needs you, **`+` for a new topic**, Settings. ⌘B collapses it to a strip (show, Inbox with dot, topic circles).
+- **Main card**: Chat (title, state pill, worktree chip, ⧉; 640 px measure; user bubbles; plain agent text; one-line tool steps that open the matching panel tab; the approval card; the composer with approval-mode and agent chips); Inbox (ranked groups, inline approval/answer buttons, filter, footer hints, preview in the panel); Editor (file tabs, centred path, hint chip, a dummy highlighted editor whose text is shared state, status bar with the AI badge); Database (query + grid).
+- **Right panel** (§2.2): tabs depend on the main card (Changes · Checks · Files · Terminal; Chat · Files · Changes for the editor at 380 px; Preview for the inbox). » minimizes it to a 46 px strip with attention dots; open/tab are remembered per main-card kind.
+- **Settings** (§3): a card in place of the main card with **section tabs** (General · Appearance · Agents · Approvals · Notifications · More) and **search across all sections, Advanced included** (a hit opens the section, opens Advanced when needed, and highlights the row). Sections come from a small registry (`settings-registry.ts`: `essentials[]` capped at 5, overflow moves to Advanced). Each section ends with "Advanced \<section\> ›", which opens the 400 px **Advanced card** in the panel's place, with a breadcrumb and a close button; it closes when you leave the section or press Esc.
+- **Pop-out chrome** (§3): traffic lights, title, **status pill**, 📌 keep-on-top, ↩ move back; the view in a card below. The main window shows "This chat is open in its own window · Show window / Bring back".
+- **Per-pop-out opacity**: Advanced → "Popped-out windows: Same as main / Always opaque" (persisted; applied live to every pop-out).
+- **Fonts**: Instrument Sans and Geist Mono are bundled from `@fontsource` (OFL, Latin subset, woff2), never loaded from a CDN.
+
+Real vs visual-only: theme (Light/Dark/System), opacity, blur, opacity mode, solid reading areas and pop-out opacity are real and persisted. Text size, tint, card gap, fonts and the non-Appearance sections are visual stand-ins (local state, no effect); tint needs the Warm/Cool sibling theme files (M1).
+
+Removed: the M0-06 direction components (tab strip, presets, Corvu layout, file preview, home pane). The comparison themes and the VS Code importer stay as loader test fixtures.
+
+## 3. Pop-out windows
+
+- **One owner per view.** `shell.rs` holds a typed, revisioned `ShellState` (settings + chat/editor/database views). Every change goes through Rust and is broadcast to all windows; a window subscribes before it reads its snapshot and drops anything older than what it has.
+- **Moving out:** ⧉, or the palette. The view turns read-only, pending edits are flushed, Rust moves ownership and builds the `WebviewWindow` (cascaded, same theme, native appearance applied before its page loads).
+- **Moving back:** ↩ in the pop-out, closing it, or "Bring back" in main. The pop-out flushes its edits and hands the view back; main asks politely and forces after 1.5 s if the pop-out does not answer (edits that pop-out never sent are lost, nothing else). Closing main quits the app and its pop-outs.
+- **End-to-end check in the real app** (`scripts/measure.py roundtrip`, release build): all 5 checks pass: the chat moves to its pop-out; an edit typed in the pop-out and closed at once (without waiting for the write) survives, together with the draft typed in main; main brings the editor back politely with its text unchanged; main recovers the database view from a pop-out that cannot answer yet (forced after 1.5 s). Log: `fix1-logs/roundtrip.txt`.
+- **Limits** (spike): one chat/editor/database view each; positions are cascaded, not remembered; drag-to-detach is not built; state lives for the process (only settings persist).
+- **For M1:** replace the dummy snapshot with one Rust-side daemon client built on M0-05's `ClientHandle` that forwards projections to each window (D-022's thin UI); keep view placement and drafts in the per-workspace layout store (PLAN §3.20); add generation ids for rapid close/reopen, remembered bounds, and selection restore.
+
+## 4. Opacity: mechanisms and caveats
+
+| Mode | Mechanism | Native API |
 |---|---|---|
-| Off | Slider at 100%; all surface alphas and native alpha are 1, native vibrancy cleared | The baseline uses the same transparent-window configuration and floating cards as the other modes. |
-| Background only | Opaque theme surfaces emit `--surface-{0,1,2}-rgb` and `--surface-overlay-rgb`. CSS composes them through component paint tokens with runtime alpha. Chrome uses `a`; cards use `a + (1-a)*0.35`, or 1 with Keep reading areas solid. | `window-vibrancy` supplies native blur when enabled. Existing `transparent: true`, `macOSPrivateApi: true` and the cargo `macos-private-api` feature remain necessary for transparent macOS backgrounds. Blur failure paints opaque surfaces and reports an error. |
-| Whole window | Surface alphas remain 1; `--window-opacity` is passed to **AppKit `NSWindow.setAlphaValue`**. There is no CSS opacity approximation. | A Tauri `with_webview` callback borrows the native window on the main thread, sets its alpha and reads `alphaValue` back. The operation includes native chrome. This is a public AppKit API; the spike still has the private-API flags because it also supports background transparency. |
+| Background only (default) | Themes stay opaque; the loader emits `--surface-*-rgb` channels; components paint `rgb(channel / alpha)`. Frame `a`, cards `a + (1 − a) × 0.35` (or 1 with "Keep reading areas solid"). Native blur behind the window comes from `NSVisualEffectView` via `window-vibrancy`. | Needs `transparent: true` + `macOSPrivateApi` (cargo `macos-private-api`): rules out the Mac App Store. |
+| Whole window | Surfaces opaque; the native window alpha is `a` (`NSWindow.setAlphaValue`, read back). Everything fades together, including traffic lights and the shadow. | Public AppKit. |
 
-API references: [Apple NSWindow alphaValue](https://developer.apple.com/documentation/appkit/nswindow/alphavalue), [Tauri WebviewWindow / with_webview](https://docs.rs/tauri/2.12.5/tauri/webview/struct.WebviewWindow.html). The native call compiles and links here; its visual effect still needs runtime verification. No unsupported API workaround was required, so the brief's whole-window-opacity escalation did not trigger.
+- One slider drives both modes; the mode is in Advanced. All windows update live; pop-outs follow main unless "Always opaque".
+- Reduce transparency / Increase contrast (macOS) force opaque surfaces in every window, with a note in Appearance; changes are observed (no focus polling).
+- `--window-blur` drives only the CSS `backdrop-filter` of in-window overlays (the palette). macOS gives no public control over the native blur radius, so "Blur strength" is shown disabled with that reason (CR-03).
+- **Linux fallback (in code, untested here):** `vibrancySupported` is false off macOS, so alphas stay 1, native alpha is a no-op, and the slider/blur controls are disabled with an explanation. A compositor-aware path (alpha only where the compositor supports transparent windows) is M1 work; Linux verification remains a driver-owned deferral (contract §5).
+- What the screenshots show: opacity shots are captured with ScreenCaptureKit over a synthetic wallpaper window (section 7). With the native frosted material under the frame, the light theme at 60 % reads as only slightly see-through: the material itself is light and dense. If Pedro wants the prototype's clearer glass, M1 can try a thinner material (`.hudWindow`/`.popover`) or none plus CSS blur; noted, not changed.
 
-One slider controls both modes; Advanced selects the mode and the solid-reading option. Settings are changed live and serialized by the Rust shared-state command, persisted in Tauri's app-config directory as `calm-settings.json`. Harness runs pin settings and never overwrite that file. Live theme/opacity changes are broadcast to every window, without reload. Only settings persist across application relaunch; dummy view contents live for the process lifetime.
+## 5. Measurements
 
-On macOS, native `NSWorkspace` Reduce transparency / Increase contrast preferences and the matching CSS media queries force opaque rendering. Native preferences are re-read on settings changes and window focus; media-query changes also trigger reapplication. Appearance shows the accessibility override. There is no dedicated native notification observer for changes while focus never changes.
+**How.** Release build (`pnpm tauri build`), Calm Dark, chat screen with the 5,000-message transcript, Changes panel. Every launch pins its configuration through the environment and never touches the user's settings. Runs were serialized with the other agents' GUI work through `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock`; this run started after the M0-07 overlap the orchestrator flagged (02:35–02:41), so none of these numbers come from that window. The machine was not idle: other agents were working (1-minute load average 4.0–5.6 during the cold runs, about 8 earlier), and Messages used ~50 % of a core throughout. A first, sequential cold run during heavier load gave medians of 340–506 ms that moved with the load rather than with the configuration (kept as `fix1-logs/sequential-cold-*.txt`); the harness now interleaves the six configurations launch by launch (`coldmatrix`), so load spreads evenly, and records the load average.
 
-**Linux fallback is implemented, untested:** `vibrancySupported` is false; channel alphas and native alpha stay at 1, the slider/blur controls are disabled with an explanation, and native blur is not applied. Detached Linux windows use normal decorations and opaque backgrounds. The main window's existing configuration remains the inherited M0-06 configuration; client-side decorations and WebKitGTK compositor testing are still deferred. The macOS measurement harness intentionally refuses an opaque/accessibility fallback instead of reporting it as a translucent run.
+- **TTI** (contract §5): from `exec` (Python timestamp right before `Popen`) to the composer handling a keystroke; the probe runs right after mount, before waiting on other windows. Also reported: ⌘K palette painted, first rAF paint, and "all windows ready" (3-window runs: until both restored pop-outs are mounted and painted). 10 launches per configuration, interleaved across the six configurations (`measure.py coldmatrix`); the first round after the build includes a cold file cache.
+- **Footprint**: `open -n` launch; app + the WebKit helpers whose responsible process is the app; `footprint -p` summed, sampled 10 s and 30 s after the ready report. RSS is listed too.
+- **Frames**: rAF deltas in main while scrolling the transcript at 1,500 and 20,000 px/s and sweeping both column widths at 0.8 Hz, with pop-outs open behind main in 3-window runs. 3 runs per cell. WebKit clamps `performance.now()` to 1 ms, so a 60 Hz frame reads as 16 or 17 ms; ">16.7 ms" counts are not meaningful, use fps, p95/p99 and max.
 
-## Pop-out state and lifecycle
+**Results** (median / worst case):
 
-`src-tauri/src/shell.rs` owns a mutex-protected, revisioned snapshot. Frontends subscribe **before** requesting their initial snapshot, and ignore stale revisions. Settings and view updates are emitted to all windows. Each view has one owner; only that owner may edit its content. State includes selected dummy thread, draft, sent messages, transcript scroll offset and editor/query text.
+| Config | TTI (keystroke) median / worst | Launches over 400 ms | All windows ready (median) | Footprint (10 s / 30 s) | Frames: scroll 1.5k · fling 20k · resize (median fps; worst p99 / max) |
+|---|---|---|---|---|---|
+| off, 1 window | 329 / 466 ms ⚠️ | 2 / 10 | 384 ms | 132 / 126 MB ✅ | 60.1 · 60.1 · 60.1 fps; p99 ≤ 19 ms, max 26 ms ✅ |
+| background, 1 window | 336 / 389 ms ✅ | 0 / 10 | 389 ms | 133 / 125 MB ✅ | 60.1 · 60.1 · 60.1 fps; p99 ≤ 19 ms, max 28 ms ✅ |
+| whole, 1 window | 328 / 362 ms ✅ | 0 / 10 | 383 ms | 134 / 131 MB ✅ | 60.1 · 60.1 · 60.1 fps; p99 ≤ 19 ms, max 23 ms ✅ |
+| off, 3 windows | 327 / 359 ms ✅ | 0 / 10 | 528 ms | 207 / 195 MB ❌ | 60.1 · 60.1 · 60.1 fps; p99 ≤ 19 ms, max 23 ms ✅ |
+| background, 3 windows | 341 / 397 ms ✅ | 0 / 10 | 537 ms | 194 / 194 MB ❌ | 60.1 · 60.1 · 60.1 fps; p99 ≤ 19 ms, max 24 ms ✅ |
+| whole, 3 windows | 332 / 472 ms ⚠️ | 2 / 10 | 528 ms | 203 / 194 MB ❌ | 60.1 · 60.1 · 60.0 fps (worst run 59.1); p99 ≤ 19 ms, max 59 ms ✅ |
 
-The header or command palette creates a `WebviewWindow` at `index.html?view=<id>` and transfers ownership before the child reads its initial snapshot. The source displays an “Open in its own window / Bring back” placeholder. Repeated pop-out focuses the existing window; failed creation restores ownership. Child windows have the same capabilities, theme, runtime opacity and accessibility handling as main.
+Other columns per configuration (palette painted, first rAF paint, RSS, per-process lists, per-run rows) are in `fix1-logs/` (`cold-matrix.log`, `rss-*.log`, `frames-*.log`). Frame runs: 3 per configuration; footprint: one launch per configuration, two samples.
 
-Input patches are optimistic locally and sent in order. A header return, native close, or source-window Bring back flushes the **owning window's** queued edits before destruction. Source requests are delivered to that owner, rather than destroying it from main before its edits finish. Rust also restores ownership on native destruction. Closing main exits the spike and its child windows. Pure TypeScript and Rust tests verify serialized state survives an ownership round-trip; they do not exercise WebKit, close-button delivery or focus.
+**Against the budgets (PLAN §4):**
+- **TTI < 400 ms: met at the median in every configuration, not in every launch.** Worst cases of 466 and 472 ms (2 of 10 launches in two configurations) came with the load average above 5. The breakdown is stable across configurations: Rust `main` → JS start ≈ 245 ms (WebKit spawning its web process; the same platform cost M0-06 measured), JS start → mounted ≈ 73 ms (module evaluation, two theme parses, first render), mounted → keystroke handled ≈ 10 ms. Opacity mode and pop-outs cost nothing here: pop-outs are restored after main is interactive and finish 150–200 ms later ("all windows ready" ≈ 530 ms). Versus the first version: 396–419 → 327–341 ms medians for one window; three windows went from timing out to the same TTI as one.
+- **60 fps: met** in all 18 frame runs (scroll at 1.5k and 20k px/s through 5,000 messages, column-resize sweep), opacity and pop-outs included. p95 18–19 ms is the 1 ms timer clamp around 16.7 ms; the one 59 ms max is a single hitch in one resize run.
+- **Footprint < 150 MB: met with one window (125–134 MB), missed with three (194–207 MB).** Each pop-out is its own `WKWebView` and WebKit web-content process, about 30 MB of footprint plus app-side overhead, so +33 MB per window. Sharing one web process between windows is not something WKWebView exposes through Tauri today. **Question for Pedro:** is the 150 MB budget for the app with one window (as it reads today), or must it hold with pop-outs open? If the latter, M1 must cap or lazily create pop-outs, or the budget becomes "150 MB + ~35 MB per extra window".
+- RSS (the literal budget word) is 165–212 MB for one window and swings by 40–180 MB between samples (72–293 MB for three windows) with memory compression; as M0-06 found, footprint is the stable metric.
 
-For M1, replace the dummy snapshot with one Rust-managed daemon client built around M0-05's `ClientHandle`: subscribe once to daemon events, forward projections to view owners, and route commands through the shared client. Keep view placement and unsent drafts in app/workspace state, not in the agent protocol. Add native lifecycle integration tests, per-view generation IDs for rapid close/reopen, crash recovery, bounds, selection/cursor restoration and atomic settings-file replacement before shipping.
-
-## Measurement harness and exact commands
-
-Run from the worktree root, in fish or another shell:
+**Commands** (from `spikes/ui-shell`, any shell including fish):
 
 ```text
-cd /Users/pedro/Documents/atrium-wt/M0-06b-ui-shell-layout-b/spikes/ui-shell
 pnpm tauri build
-scripts/measure-layout-b.sh all /tmp/atrium-M0-06b-measurements
+/usr/bin/lockf -k /tmp/atrium-gui-measure.lock scripts/measure-layout-b.sh all /tmp/atrium-layout-b-measurements
+python3 scripts/summarize.py /tmp/atrium-layout-b-measurements
+/usr/bin/lockf -k /tmp/atrium-gui-measure.lock python3 scripts/measure.py roundtrip
 ```
 
-`pnpm tauri build` above is the **release** build for measurements. The worker built debug only. Run individual metric matrices with:
+One cell: `python3 scripts/measure.py cold --windows 3 --opacity background --runs 10` (modes `cold | rss | frames | roundtrip`). Fewer launches per cell: `env ATRIUM_MEASURE_RUNS=3 scripts/measure-layout-b.sh cold /tmp/out`. Another binary: `env ATRIUM_MEASURE_BIN=/abs/path/to/atrium-ui-shell ...`.
 
-```text
-scripts/measure-layout-b.sh cold /tmp/atrium-M0-06b-measurements
-scripts/measure-layout-b.sh rss /tmp/atrium-M0-06b-measurements
-scripts/measure-layout-b.sh frames /tmp/atrium-M0-06b-measurements
-```
+## 6. CR-02 feedback
 
-The executable bash wrapper runs all six configurations: **off / background / whole × 1 / 3 windows**. Off pins alpha 1; the other two pin 0.6, blur on, reading areas not forced solid, Calm Dark, default split and the auth chat. Three windows means the main chat plus detached editor and database. These are real WebviewWindows in a single process. Child settings/native alpha must finish applying, mounting and two rAF callbacks before a window reports ready; main waits for the expected ready count before its input probe. Each report prints both requested configuration and main-window applied alphas, native readback, accessibility override and vibrancy. Mismatches fail the run. Raw startup/frame JSON is included in the logs.
+CR-02 works as written; the spike implements it without changing the frozen contract:
+- Runtime tokens (`--window-alpha-chrome`, `--window-alpha-content`, `--window-opacity`, `--window-blur`) are reserved: a theme defining one (in any layer) fails to load.
+- Surface channels (`--surface-0/1/2/overlay-rgb`) are emitted by the loader and are themselves reserved; surfaces must be opaque six-digit hex.
+- State colours are checked as text on `surface-0..2`; the Calm themes pass unchanged.
+- Hover/selected/state backgrounds, shadows, scrim and glass blur are used as the Calm themes' component tokens.
 
-The wrapper accepts an absolute executable override and a repeat-count override, using fish-compatible `env` syntax. For a debug **smoke test**, not release budget evidence:
+Amendments (CR-03 in `docs/agents/change-requests.md`): whole-window mode uses the native window alpha, not CSS `opacity`; native blur strength is not adjustable on macOS; say "six-digit hex" and "reserved derived names"; move `advanced-width`, `panel-width-editor` and the drag bounds into the themes; observe the OS accessibility setting. AA is checked against opaque surfaces only: no check can guarantee contrast over an arbitrary desktop at low alpha, which is why the 30 % floor, "Keep reading areas solid" and the accessibility override matter.
 
-```text
-env ATRIUM_MEASURE_BIN='/Users/pedro/Documents/atrium-wt/M0-06b-ui-shell-layout-b/spikes/ui-shell/src-tauri/target/debug/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell' ATRIUM_MEASURE_RUNS=1 scripts/measure-layout-b.sh cold /tmp/atrium-M0-06b-debug
-```
+## 7. Screenshots
 
-Methods inherited from M0-06, with the configuration/readiness checks added:
+`docs/spikes/M0-06b-ui-shell-layout-b/` (release build, pinned settings, 1.6 MB in total):
 
-- **TTI:** ten launches per configuration by default; reports median, worst, first launch, warm-launch median and count over 400 ms. Launch time comes from Python immediately before process creation. First paint is a two-rAF proxy, separately marked after main mounts; FCP is included when WebKit exposes it. TTI requires handled synthetic composer input after the window readiness gate, and palette handling is reported separately. It does not measure OS input delivery or a cache-purged boot. With three windows, TTI includes creating and readying the two additional views.
-- **Memory:** `open -n` creates a separate responsible process. After the ready report, sample at 10 and 30 seconds. Attribute app and WebKit helpers by macOS responsible PID, print each PID/RSS/physical footprint and the total, and refuse totals on missing helpers or unreadable footprints. This preserves the frozen RSS metric alongside footprint; it does not redefine the 150 MB budget. Opening multiple windows may share helpers; helpers are summed once by PID, not once per window.
-- **Frames:** three repeats per configuration. Main samples idle, 1,500 and 20,000 px/s transcript scrolling and a 0.8 Hz Corvu pane resize sweep. Report rAF deltas/fps, p95/p99/max, synchronous forced-layout cost and rAF-to-next-task cost separately. Extra windows stay open and idle; these are **main-window frame measurements with extra windows present**, not simultaneous scrolling/resizing in all three windows. Theme swapping is disabled during these pinned-mode runs. Compositor/GPU time, real pointer dragging and 120 Hz remain unmeasured.
+| File | What |
+|---|---|
+| `chat-light.jpg`, `chat-dark.jpg` | Chat, panel on Changes |
+| `settings-advanced-light.jpg`, `settings-advanced-dark.jpg` | Settings → Appearance with the Advanced card |
+| `popout-chat-dark.jpg`, `popout-placeholder-light.jpg` | The chat in its own window, and main's placeholder |
+| `inbox-light.jpg`, `editor-dark.jpg` | Inbox with preview; editor with the chat panel |
+| `opacity60-background-{light,dark}.jpg` | 60 %, background only (frame 0.6, cards 0.74, native blur) |
+| `opacity60-whole-{light,dark}.jpg` | 60 %, whole window (native alpha) |
 
-Use an otherwise idle machine, keep windows visible (a larger display helps), record refresh rate/display arrangement, and avoid interacting during frame runs. Existing windows of this spike should be closed before starting. Startup/frame launches are stopped and reaped in `finally`, including timeout/configuration failures; memory launches are terminated in `finally`. Main exit closes the extra views. The harness never uses an application-wide `killall`.
+How (`scripts/screenshots.sh`): opaque shots capture only the app's window (`screencapture -l`) and composite it over a synthetic wallpaper. Opacity shots open a full-screen synthetic wallpaper window and capture with ScreenCaptureKit through a filter that includes only that window and the app's windows, so the real vibrancy and native alpha show and nothing else on the screen can appear.
 
-**Results:** no TTI, RSS, footprint or frame numbers were collected by this worker. There is no pass/fail verdict against 400 ms, 150 MB or 60 fps.
+## 8. Recommendation for M1
 
-## Orchestrator runtime checklist
-
-1. Launch the debug bundle normally. Check Calm Light/Dark, sidebar and context strips, resizing, and Settings → Appearance → Advanced. Confirm Advanced closes on navigation and focus remains usable.
-2. At 60% background opacity, inspect against a patterned desktop: labels/native chrome should remain opaque while surfaces fade. Toggle solid reading areas and blur. Switch to whole-window opacity: text and traffic lights should fade together. Return to 100%. Repeat in Light and Dark.
-3. Type an unsent chat draft, send a message and scroll to a recognizable point. Pop out chat, then return using its header, native close, and source Bring back on separate attempts. Repeat edited editor text and database query. Try typing immediately before each return. Verify no content/draft is lost and there is one owner/placeholder at every step.
-4. Leave all three windows open. Switch theme and both opacity modes in main; verify every window changes live. Close and reopen one child; verify it inherits the latest settings. Close main; verify all child windows terminate. Relaunch normally; verify appearance settings persist.
-5. Enable macOS Reduce transparency / Increase contrast and refocus the app; verify opaque rendering and the note. Disable the preference before measurements (the harness fails on the override).
-6. Run the release measurement commands above and attach results/screenshots to this report. If `ps`, `footprint`, LaunchServices or app launching is denied, report that failure; do not replace responsible-PID attribution with timing guesses.
-
-Linux verification remains an orchestrator-owned deferral, with its owner/gate to be recorded by the driver: opaque fallback/explanation, theme channels in WebKitGTK, decorated child windows, one-owner return/close, resize/scroll at 60/120 Hz, startup and app/helper RSS/PSS. No Linux results are implied here.
-
-## CR-02 feedback and M1 recommendation
-
-The runtime/channel split is implementable without relative-colour syntax and without changing the frozen contract. Runtime tokens remain outside the theme variable replacement set. The loader rejects runtime-name overrides (including primitive definitions), derived-channel collisions and non-opaque/non-six-digit-hex surfaces. State text contrast is checked on surfaces 0–2 for all loaded themes, including imports. The old light comparison themes needed stronger state colours; the importer now adjusts state colours and flattens surface alpha. Old Glass overlay surfaces were migrated to opaque hex. Calm itself required no edits.
-
-Keep the draft's component stopgaps (`hover-bg`, `selected-bg`, `state-*-bg`, shadows/scrim/glass-blur) until the orchestrator approves their required semantic names; the frozen required-token set is unchanged. CR-02 should clarify opaque **six-digit** hex versus shorthand hex, define channel tokens as reserved derived outputs, and state how existing translucent imported surfaces are migrated. AA validation is against opaque theme surfaces; it cannot guarantee contrast against arbitrary desktops at user-selected alpha, especially whole-window alpha. Keep the solid-reading option and OS accessibility override.
-
-Recommendation: retain floating cards, surface-channel composition and a shared Rust owner for window state, pending the runtime checks and six-configuration measurements. Public AppKit alpha is the candidate for whole-window opacity. Do not declare the performance/distribution gate passed from compilation: native background transparency still has the inherited Mac App Store constraint, and each extra WebviewWindow adds work that has not yet been measured.
+1. Keep layout B as built here: floating cards on token-driven paint, the settings registry with essentials/Advanced, and the per-kind panel memory.
+2. Keep the Rust single writer for window state and back it with one daemon client (section 3). Keep the ordering helpers (`sync.ts`) and their tests.
+3. Keep both opacity modes: channel tokens for background mode, native alpha for whole-window. Record the `macOSPrivateApi` distribution decision (ui-direction §9.5).
+4. Restore secondary windows after the main window is interactive; budget each extra window (section 5).
+5. Track TTI, footprint and frames in CI with this harness (`measure.py`), always under the shared GUI lock.

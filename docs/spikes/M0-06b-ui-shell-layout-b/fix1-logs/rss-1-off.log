@@ -1,0 +1,19 @@
+config: ATRIUM_THEME=atrium-calm-dark ATRIUM_WINDOWS=1 ATRIUM_OPACITY=off ATRIUM_SCREEN=chat ATRIUM_RIGHT_TAB=changes  bin=src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell
+host: macOS 27.0.1, Apple M4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 1, "contentAlpha": 1, "nativeAlpha": 1, "vibrancy": false}}
+idle 10 s after launch:
+  pid  73706  responsible  73706  rss    99.1 MB  footprint   27.0 MB  atrium-ui-shell
+  pid  73710  responsible  73706  rss    29.1 MB  footprint   20.0 MB  com.apple.WebKit.GPU
+  pid  73711  responsible  73706  rss    64.9 MB  footprint   79.0 MB  com.apple.WebKit.WebContent
+  pid  73712  responsible  73706  rss    13.1 MB  footprint    6.0 MB  com.apple.WebKit.Networking
+  (9 WebKit processes belonging to other apps ignored)
+  TOTAL rss 206.2 MB   footprint 132.0 MB   (4 processes, 1 WebContent)
+idle 30 s after launch:
+  pid  73706  responsible  73706  rss    99.0 MB  footprint   27.0 MB  atrium-ui-shell
+  pid  73710  responsible  73706  rss    29.1 MB  footprint   15.0 MB  com.apple.WebKit.GPU
+  pid  73711  responsible  73706  rss    64.8 MB  footprint   78.0 MB  com.apple.WebKit.WebContent
+  pid  73712  responsible  73706  rss    13.1 MB  footprint    6.0 MB  com.apple.WebKit.Networking
+  (9 WebKit processes belonging to other apps ignored)
+  TOTAL rss 206.0 MB   footprint 126.0 MB   (4 processes, 1 WebContent)
+SUMMARY {"metric": "rss", "windows": 1, "opacity": "off", "footprint": [132.0, 126.0], "rss": [206.2, 206.0], "footprint_max": 131.984375}

@@ -1,0 +1,45 @@
+config: ATRIUM_THEME=atrium-calm-dark ATRIUM_WINDOWS=1 ATRIUM_OPACITY=background ATRIUM_SCREEN=chat ATRIUM_RIGHT_TAB=changes  bin=src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell
+host: macOS 27.0.1, Apple M4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  1: exec_to_main=    5.9  main_to_js=  360.3  js_to_mounted=  120.0  first_paint_raf=  522.2  first_contentful_paint=  523.2  tti_keystroke=  488.2  tti_palette=  561.2  all_windows_ready=  571.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  2: exec_to_main=    7.3  main_to_js=  376.7  js_to_mounted=  117.0  first_paint_raf=  539.0  first_contentful_paint=  539.0  tti_keystroke=  504.0  tti_palette=  576.0  all_windows_ready=  586.0
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  3: exec_to_main=    6.6  main_to_js=  297.8  js_to_mounted=  101.0  first_paint_raf=  437.4  first_contentful_paint=  437.4  tti_keystroke=  408.4  tti_palette=  469.4  all_windows_ready=  477.4
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  4: exec_to_main=   15.2  main_to_js=  253.5  js_to_mounted=   76.0  first_paint_raf=  375.7  first_contentful_paint=  375.7  tti_keystroke=  346.7  tti_palette=  402.7  all_windows_ready=  409.7
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  5: exec_to_main=   12.7  main_to_js=  275.3  js_to_mounted=   73.0  first_paint_raf=  385.0  first_contentful_paint=  385.0  tti_keystroke=  363.0  tti_palette=  409.0  all_windows_ready=  415.0
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  6: exec_to_main=    9.2  main_to_js=  246.4  js_to_mounted=   72.0  first_paint_raf=  351.5  first_contentful_paint=  352.5  tti_keystroke=  329.5  tti_palette=  378.5  all_windows_ready=  384.5
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  7: exec_to_main=   17.1  main_to_js=  233.9  js_to_mounted=   71.0  first_paint_raf=  345.0  first_contentful_paint=  345.0  tti_keystroke=  324.0  tti_palette=  369.0  all_windows_ready=  375.0
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  8: exec_to_main=   16.2  main_to_js=  262.8  js_to_mounted=   74.0  first_paint_raf=  375.9  first_contentful_paint=  375.9  tti_keystroke=  354.9  tti_palette=  399.9  all_windows_ready=  405.9
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run  9: exec_to_main=   16.1  main_to_js=  255.1  js_to_mounted=   76.0  first_paint_raf=  370.2  first_contentful_paint=  370.2  tti_keystroke=  348.2  tti_palette=  395.2  all_windows_ready=  403.2
+rAF fired after ready (main is frontmost; pop-outs may be occluded): {"main": "yes"}
+verified per-window appearance: {"main": {"chromeAlpha": 0.6, "contentAlpha": 0.74, "nativeAlpha": 1, "vibrancy": true}}
+run 10: exec_to_main=   13.0  main_to_js=  245.8  js_to_mounted=   74.0  first_paint_raf=  354.8  first_contentful_paint=  354.8  tti_keystroke=  334.8  tti_palette=  378.8  all_windows_ready=  383.8
+
+ms from process launch (run 1 = first launch of this configuration, rest = warm file cache)
+exec_to_main             first=    5.9  median=   12.8  min=    5.9  max=   17.1
+main_to_js               first=  360.3  median=  258.9  min=  233.9  max=  376.7
+js_to_mounted            first=  120.0  median=   75.0  min=   71.0  max=  120.0
+first_paint_raf          first=  522.2  median=  375.8  min=  345.0  max=  539.0
+first_contentful_paint   first=  523.2  median=  375.8  min=  345.0  max=  539.0
+tti_keystroke            first=  488.2  median=  351.6  min=  324.0  max=  504.0
+tti_palette              first=  561.2  median=  401.3  min=  369.0  max=  576.0
+all_windows_ready        first=  571.2  median=  407.8  min=  375.0  max=  586.0
+
+TTI vs the 400 ms budget: 3/10 launches over 400 ms; median 352 ms, worst 504 ms
+SUMMARY {"metric": "cold", "windows": 1, "opacity": "background", "runs": 10, "tti_median": 351.5810546875, "tti_worst": 503.972900390625, "over_budget": 3, "palette_median": 401.306884765625, "first_paint_median": 375.806884765625, "all_windows_median": 407.806884765625, "all_windows_worst": 585.972900390625}

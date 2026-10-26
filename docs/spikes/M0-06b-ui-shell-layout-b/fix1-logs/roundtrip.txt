@@ -1,0 +1,8 @@
+config: ATRIUM_THEME=atrium-calm-dark ATRIUM_WINDOWS=1 ATRIUM_OPACITY=off ATRIUM_SCREEN=chat ATRIUM_RIGHT_TAB=changes  bin=src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell
+host: macOS 27.0.1, Apple M4
+PASS  chat moved to its pop-out  view-chat
+PASS  edit made right before closing survives  "draft typed in main + typed in the pop-out right before closing"
+PASS  main brings the editor back politely  returned
+PASS  editor text unchanged  
+PASS  main recovers a view from a pop-out that does not answer  forced
+SUMMARY {"metric": "roundtrip", "windows": 1, "opacity": "off", "checks": 5, "failed": []}
