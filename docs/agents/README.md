@@ -25,6 +25,8 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 
 ## Conventions
 
+- **GUI measurements are exclusive.** Only one app window set may be measured at a time; overlapping or occluded windows throttle rAF and invalidate the run. Wrap every GUI measurement or screenshot run in `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock <command>`, and hold the lock only while measuring.
+
 - **Stopping a worker doesn't stop what it launched.** Background processes (bench loops, dev servers, apps, browsers) keep running, and they keep relaunching windows. After stopping or pausing a worker, the orchestrator finds and stops every process started from that worktree (`ps` matching the worktree path, the task id, and the spike's app/binary names), and tells the worker to clean up when it resumes. Workers stop their own background processes before finishing.
 
 - **Shells**: Pedro's interactive shell is **fish**. The agents' shell tool runs zsh and reports `$SHELL=/bin/zsh`, so don't trust `$SHELL`.
