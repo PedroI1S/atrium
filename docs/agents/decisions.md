@@ -143,3 +143,10 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 
 ## D-029 — 2026-10-26 — M0-06b gets its final fix round (2/2) with Opus
 **Decided by Pedro.** After Sol's second review (rework, 9 findings), Opus does the final round on exactly those 9 findings: the close-time edit race, the scroll flush on pop-out, TTI per contract §5 (paint and input), measurements under normal scheduling (no harness-only latency-critical activity), the vibrancy material cache, cold-matrix resilience, the reproduction command, a deterministic forced bring-back, and the font licence notices. Then it re-measures and is merged.
+
+## D-030 — 2026-10-26 — Repo out of iCloud sync (`.nosync`); M0-09 launched
+**Decided by Pedro.**
+- **The problem:** `~/Documents` is synced by iCloud Drive, which kept creating "`file 2.md`"-style conflict copies while git and agents rewrote files. There were ~1,700 in the checkout and 7 inside `.git` (including a broken ref `origin/dev 2`). It also caused the "local changes to Cargo.lock" rebase interruptions, a stray `Sidebar 2.tsx` that would have broken a build, and 23 copies swept into pushed docs commits (removed in `cdab9cc`).
+- **The fix:** `~/Documents/Harness` → `Harness.nosync` and `~/Documents/atrium-wt` → `atrium-wt.nosync`, which iCloud skips. Symlinks keep the old paths working. All copies were deleted (untracked only), `git worktree repair` run, `git fsck` clean. `.gitignore` now ignores `* [0-9].*`.
+- **Rule for every machine** (in `docs/agents/README.md`): the repo and worktrees must not live in a cloud-synced folder.
+- **M0-09** (wave 3, Flash) launched with updated inputs.
