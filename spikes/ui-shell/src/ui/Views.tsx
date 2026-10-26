@@ -53,17 +53,42 @@ export function InboxView() {
   );
 }
 
-/** Dummy editor: a plain textarea stands in for CodeMirror (out of scope); its text is view state. */
+/** First line number shown (the dummy file is an excerpt). */
+const FIRST_LINE = 36;
+const RUST_KEYWORDS = new Set(["use", "const", "impl", "pub", "fn", "let", "if", "else", "return", "mut", "self", "crate", "struct", "match", "for", "in", "where", "mod"]);
+type Tok = { t: string; k?: "keyword" | "type" | "function" | "string" | "comment" };
+
+/** A tiny Rust highlighter for the dummy editor (CodeMirror replaces it in M1). */
+export function highlight(line: string): Tok[] {
+  const c = line.indexOf("//");
+  if (c >= 0) return [...highlight(line.slice(0, c)), { t: line.slice(c), k: "comment" }];
+  const out: Tok[] = [];
+  for (const m of line.matchAll(/"[^"]*"|[A-Za-z_][A-Za-z0-9_]*|[^A-Za-z_"]+/g)) {
+    const t = m[0];
+    const next = line[(m.index ?? 0) + t.length];
+    if (t.startsWith('"')) out.push({ t, k: "string" });
+    else if (RUST_KEYWORDS.has(t)) out.push({ t, k: "keyword" });
+    else if (/^[A-Z]/.test(t)) out.push({ t, k: "type" });
+    else if (next === "(" && /^[a-z_]/.test(t)) out.push({ t, k: "function" });
+    else out.push({ t });
+  }
+  return out;
+}
+
+/** Dummy editor: a transparent textarea over highlighted text; the text is view state. */
 export function EditorBody() {
   const content = () => model().views.editor.content;
-  const lines = createMemo(() => content().split("\n").length);
+  const lines = createMemo(() => content().split("\n"));
   return (
     <>
       <div class="ed">
-        <div class="ed-gutter" aria-hidden="true"><For each={Array.from({ length: lines() }, (_, i) => i + 36)}>{(n) => <div>{n}</div>}</For></div>
-        <textarea class="ed-text" aria-label="Editor content" spellcheck={false} readOnly={!canEdit("editor")} value={content()} onInput={(e) => void patchView("editor", { content: e.currentTarget.value })} />
+        <div class="ed-gutter" aria-hidden="true"><For each={lines()}>{(_, i) => <div>{i() + FIRST_LINE}</div>}</For></div>
+        <div class="ed-code">
+          <pre class="ed-hl" aria-hidden="true"><For each={lines()}>{(l) => <div><For each={highlight(l)}>{(tok) => (tok.k ? <span class={`syn-${tok.k}`}>{tok.t}</span> : tok.t)}</For></div>}</For></pre>
+          <textarea class="ed-text" aria-label="Editor content" spellcheck={false} rows={lines().length} readOnly={!canEdit("editor")} value={content()} onInput={(e) => void patchView("editor", { content: e.currentTarget.value })} />
+        </div>
       </div>
-      <footer class="statusb"><span>Rust</span><span>{lines()} lines</span><span>Spaces 4</span><Spacer /><span>Tab accepts the grey suggestion</span><span class="ai-badge">● Copilot · Auto</span></footer>
+      <footer class="statusb"><span>Rust</span><span>{lines().length} lines</span><span>Spaces 4</span><Spacer /><span>Tab accepts the grey suggestion</span><span class="ai-badge">● Copilot · Auto</span></footer>
     </>
   );
 }
@@ -74,7 +99,6 @@ export function EditorHeader(props: { popout?: boolean }) {
       <div class="ftabs" role="tablist" aria-label="Open files">
         <button type="button" class="ftab on" role="tab" aria-selected="true"><span class="mod" aria-label="modified" />session.rs</button>
         <button type="button" class="ftab" role="tab" aria-selected="false">retry.rs</button>
-        <Show when={!props.popout}><button type="button" class="ftab" role="tab" aria-selected="false">Cargo.toml</button></Show>
       </div>
       <span class="crumbs">token-refresh<span>/</span>crates/atrium-core/src<span>/</span><b>session.rs</b></span>
       <div class="ed-right">

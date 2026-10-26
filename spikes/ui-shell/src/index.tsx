@@ -9,7 +9,7 @@ import "@fontsource/geist-mono/latin-500.css";
 import "./styles/base.css";
 import "./styles/calm.css";
 import { App } from "./App";
-import { markOnce, reportFailure, runHarness, runProbe, setStage } from "./bench";
+import { epochNow, markOnce, reportFailure, runHarness, runProbe, setStage } from "./bench";
 import { type PanelTab, type Screen } from "./layout";
 import { type StartupInfo, inTauri, startupInfo } from "./platform";
 import { setAdvancedOpen, setPaletteOpen, setPanel, setScreen } from "./state";
@@ -55,7 +55,11 @@ async function boot() {
   if (inTauri) {
     // Ready = mounted and appearance applied. Not rAF, which stops in occluded windows (review #1).
     setStage("ready");
-    await invoke("window_ready", { applied: appliedState() });
+    const readyAt = epochNow();
+    await invoke("window_ready", { applied: { ...appliedState(), readyAt, rafAt: null } });
+    // Discriminating check for review #1: does this window get rAF at all? Occluded or
+    // background WKWebViews do not; the harness reports it per window instead of hanging on it.
+    requestAnimationFrame(() => { void invoke("window_ready", { applied: { ...appliedState(), readyAt, rafAt: epochNow() } }); });
   }
   if (harnessMain) await runHarness(info);
 }

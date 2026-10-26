@@ -236,6 +236,7 @@ export async function runProbe(): Promise<void> {
 }
 
 const GATE_TIMEOUT_MS = 20000;
+const RAF_REPORT_GRACE_MS = 300;
 const GATE_POLL_MS = 25;
 
 /** Waits until every expected window has mounted and reported its applied appearance. */
@@ -256,8 +257,11 @@ const BEFORE_FRAMES_MS = 500;
 /** Startup report (and, in `frames` mode, the frame benchmarks); reports through Rust. */
 export async function runHarness(info: StartupInfo): Promise<void> {
   setStage("gate");
-  const windows = await waitForWindows(info.windows);
+  await waitForWindows(info.windows);
   marks.allWindowsReady = epochNow();
+  // Give every window a moment to report whether rAF fires for it (see index.tsx).
+  await sleep(RAF_REPORT_GRACE_MS);
+  const windows = await invoke<Record<string, unknown>>("ready_states");
   const report: Record<string, unknown> = {
     kind: "startup",
     configuration: { windows: info.windows, opacity: info.opacity, readyWindows: Object.keys(windows).length, perWindow: windows },

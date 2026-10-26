@@ -214,7 +214,17 @@ code, .code { font-family: var(--font-code); font-size: var(--text-code); backgr
 .ed-right { display: flex; align-items: center; justify-content: flex-end; gap: var(--u1); }
 .ed { flex: 1; min-height: 0; display: flex; overflow: auto; font-family: var(--font-code); font-size: var(--editor-font-size); line-height: var(--editor-line-height); padding-top: var(--u1); }
 .ed-gutter { width: var(--editor-gutter); padding-right: var(--u45); text-align: right; color: var(--text-faint); flex: none; }
-.ed-text { flex: 1; border: 0; outline: 0; resize: none; background: transparent; font: inherit; line-height: inherit; padding: 0; white-space: pre; overflow: hidden; -webkit-user-select: text; user-select: text; tab-size: 4; }
+.ed-code { flex: 1; position: relative; min-width: 0; }
+.ed-hl, .ed-text { margin: 0; font: inherit; line-height: inherit; white-space: pre; tab-size: 4; padding: 0; }
+.ed-hl div { min-height: var(--editor-line-height); }
+.ed-hl div:empty::after { content: " "; }
+/* The textarea sits on top with transparent text: the caret and selection are real, the colour comes from the highlighted copy beneath. */
+.ed-text { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; outline: 0; resize: none; background: transparent; color: transparent; caret-color: var(--text); overflow: hidden; -webkit-user-select: text; user-select: text; }
+.syn-keyword { color: var(--syntax-keyword); }
+.syn-type { color: var(--syntax-type); }
+.syn-function { color: var(--syntax-function); }
+.syn-string { color: var(--syntax-string); }
+.syn-comment { color: var(--syntax-comment); }
 .db { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: var(--u2); padding: var(--u1) var(--u5) var(--u5); }
 .db-label { font-size: var(--text-label); font-weight: var(--weight-medium); color: var(--text-muted); }
 .db-query { border: 0; outline: 0; resize: vertical; border-radius: var(--btn-radius); padding: var(--u3); font-family: var(--font-code); font-size: var(--text-code); line-height: var(--line-diff); min-height: calc(var(--line-diff) * 5); -webkit-user-select: text; user-select: text; }
