@@ -47,6 +47,11 @@ async function boot() {
     setStage("probe");
     await runProbe();
   }
+  if (inTauri && !viewId) {
+    // Remembered pop-outs open only once main is interactive (Rust holds the list).
+    setStage("restore-windows");
+    await invoke("restore_windows");
+  }
   setStage("after-mount");
   await afterMount();
   // Native reconciliation runs after mount; Rust already applied the pinned state in setup.

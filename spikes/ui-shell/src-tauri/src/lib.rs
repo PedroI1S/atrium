@@ -202,6 +202,28 @@ fn pop_out(app: tauri::AppHandle, view: String) -> Result<ShellState, String> {
     pop_out_and_apply(&app, &view)
 }
 
+/// Pop-outs to restore once the main window is interactive. Restoring them in `setup` made
+/// three webviews load at once and delayed the main window's first input by their load time.
+#[derive(Default)]
+struct Restore(Mutex<Vec<String>>);
+
+/// Called by main after its first render: recreates the remembered pop-outs, then keeps main
+/// in front (harness runs measure main's frames with the others open behind it).
+#[tauri::command]
+fn restore_windows(app: tauri::AppHandle, window: WebviewWindow) -> Result<usize, String> {
+    if window.label() != MAIN {
+        return Err("only the main window restores pop-outs".into());
+    }
+    let views: Vec<String> = std::mem::take(&mut *app.state::<Restore>().0.lock().unwrap());
+    for view in &views {
+        pop_out_and_apply(&app, view)?;
+    }
+    if !views.is_empty() && (env("ATRIUM_WINDOWS").is_some() || env("ATRIUM_BENCH").is_some()) {
+        let _ = window.set_focus();
+    }
+    Ok(views.len())
+}
+
 /// Keeps App Nap and timer coalescing away from a measurement run (the harness launches the
 /// app while the user's other apps are in front).
 #[cfg(target_os = "macos")]
@@ -243,6 +265,7 @@ pub fn run() {
         .manage(boot)
         .manage(Ready::default())
         .manage(Native::default())
+        .manage(Restore::default())
         .invoke_handler(tauri::generate_handler![
             shell::opaque_accessibility,
             shell::window_ready,
@@ -252,6 +275,7 @@ pub fn run() {
             shell::bring_back,
             shell::force_bring_back,
             pop_out,
+            restore_windows,
             set_window_alpha,
             startup_info,
             set_vibrancy,
@@ -294,18 +318,15 @@ pub fn run() {
             if harness {
                 #[cfg(target_os = "macos")]
                 hold_measurement_activity();
-                // Three-window runs restore two pop-outs at launch, as a relaunch would.
-                // `ATRIUM_POPOUTS=chat,editor` picks them explicitly (screenshots).
+                // Three-window runs restore two pop-outs, as a relaunch would; main creates them
+                // once it is interactive (`restore_windows`). `ATRIUM_POPOUTS=chat,editor` picks
+                // them explicitly (screenshots).
                 let popouts: Vec<String> = match env("ATRIUM_POPOUTS") {
                     Some(list) => list.split(',').map(str::to_string).collect(),
                     None if env("ATRIUM_WINDOWS").as_deref() == Some("3") => vec!["editor".into(), "database".into()],
                     None => Vec::new(),
                 };
-                for view in &popouts {
-                    if let Err(e) = pop_out_and_apply(&handle, view) {
-                        eprintln!("harness pop-out {view} failed: {e}");
-                    }
-                }
+                *app.state::<Restore>().0.lock().unwrap() = popouts;
                 // Activate the app and bring main to the front: a background, non-key window
                 // gets throttled timers and no rAF, which skewed (and hung) earlier runs.
                 if let Some(main) = app.get_webview_window(MAIN) {
