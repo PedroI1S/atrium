@@ -41,9 +41,21 @@ export function TranscriptView(props: { t: Transcript; tick: Accessor<number>; s
       return props.settings.overscan;
     },
   });
+  // Follow the tail until the *user* scrolls up. Deciding from the scroll position alone is wrong: when
+  // rows arrive faster than a frame (or the virtualizer re-measures), the distance to the bottom grows
+  // without any user action, and following would be lost for good (seen in the first 5-minute run).
   let follow = true;
+  const unfollow = () => {
+    follow = false;
+  };
   const onScroll = () => {
-    follow = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
+    if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 4) follow = true;
+  };
+  const onWheel = (e: WheelEvent) => {
+    if (e.deltaY < 0) follow = false;
+  };
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") follow = false;
   };
   // Runs in the same synchronous pass as the row updates and again after the virtualizer re-measured.
   createEffect(() => {
@@ -53,7 +65,7 @@ export function TranscriptView(props: { t: Transcript; tick: Accessor<number>; s
   });
   const indexes = createMemo(() => virt.getVirtualItems().map((v) => v.index));
   return (
-    <div class="transcript" ref={scroller} onScroll={onScroll}>
+    <div class="transcript" ref={scroller} tabindex={0} onScroll={onScroll} onWheel={onWheel} onTouchMove={unfollow} onPointerDown={unfollow} onKeyDown={onKey}>
       <div class="spacer" style={{ height: `${virt.getTotalSize()}px` }}>
         <For each={indexes()}>
           {(index) => {

@@ -4,7 +4,7 @@
 
 import { setActivePipeline } from "./App";
 import { FrameSampler, epochNow, summarizeFrames, summarizeValues } from "./metrics";
-import { bridgeStats, bridgeStop, quitApp, type StartupInfo, writeReport } from "./platform";
+import { bridgeStats, bridgeStop, quitApp, type StartupInfo, writeProgress, writeReport } from "./platform";
 import { type RunConfig, DEFAULT_RUN, startSession } from "./session";
 import { typing } from "./typing";
 
@@ -81,6 +81,7 @@ export async function runScenario(sc: Partial<Scenario>, info: StartupInfo): Pro
   const visibility: { t: number; state: string; focus: boolean }[] = [];
   const t0 = performance.now();
   document.addEventListener("visibilitychange", () => visibility.push({ t: performance.now() - t0, state: document.visibilityState, focus: document.hasFocus() }));
+  writeProgress({ stage: "boot", hidden: document.hidden });
   try {
     await raf2();
     await sleep(300);
@@ -117,7 +118,12 @@ export async function runScenario(sc: Partial<Scenario>, info: StartupInfo): Pro
     if (full.typing === "synthetic") setTimeout(() => (typist = startTypist(full.typingIntervalMs)), full.typingStartMs);
 
     const deadline = startedAt + full.durationMs + 90_000;
+    let lastProgress = 0;
     while (performance.now() < deadline) {
+      if (performance.now() - lastProgress > 10_000) {
+        lastProgress = performance.now();
+        writeProgress({ t: (lastProgress - startedAt) / 1000, applied: pipeline.eventsApplied, received: pipeline.eventsReceived, queued: pipeline.maxQueue, frames: sampler.dts.length, hidden: document.hidden, rows: pipeline.threads[0]?.rows.length ?? 0 });
+      }
       if (pipeline.threads.length > 0 && pipeline.threads.every((t) => t.ended)) break;
       if (full.endMode === "time" && performance.now() >= startedAt + full.durationMs + 3000) break;
       await sleep(100);

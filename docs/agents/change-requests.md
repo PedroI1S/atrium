@@ -30,3 +30,13 @@ Proposal from the design session (`docs/design/ui-direction.md`, Pedro chose lay
 **Why**: D-023 makes window opacity a core setting, with a background-only mode and a whole-window mode (Pedro, design session). Opacity is a user setting that applies across every theme, so it can't live in theme files.
 
 **Affected**: the theme loader (emit channel tokens, reject runtime names, extra contrast pairs), the M1 UI components (surface painting), and the draft themes in `docs/design/themes/`. No Rust contract is touched. The macOS side needs `macOSPrivateApi` (already noted in M0-06 §1), which is a distribution decision.
+
+## CR-03 — M0-07-stream-perf — 2026-10-26
+
+Non-blocking; the spike forwarded the events as they are. (Number may need renumbering at merge if another CR-02 exists.)
+
+**Change** (`crates/atrium-protocol` agent contract, M1 revision): stop repeating the full text in `MessageCompleted` for messages whose deltas were stored. Options: `text` becomes optional and absent when the deltas are in the store, or it carries `{len, sha256}` so consumers can verify the concatenation; whole-message providers keep sending `text`.
+
+**Why**: `MessageCompleted.text` is the concatenation of all deltas. A 5-minute stream at 10k tokens/s is one 12 MB message, close to `MAX_FRAME_LEN` (16 MiB), and building it made the M0-05 daemon peak at 487 MB at session close (M0-07 memory run). Every consumer (bridge, webview) pays for it again, and the UI already holds the text.
+
+**Affected**: `atrium-agents` adapters (the closing-order rule in `agent.rs` still holds), the daemon's lifecycle fold, UI reducers. No M0 spike needs it.

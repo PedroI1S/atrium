@@ -74,3 +74,7 @@ export async function writeReport(payload: unknown): Promise<void> {
 export async function quitApp(): Promise<void> {
   if (inTauri) await invoke("quit");
 }
+
+export function writeProgress(payload: unknown): void {
+  if (inTauri) void invoke("write_progress", { json: JSON.stringify(payload) });
+}

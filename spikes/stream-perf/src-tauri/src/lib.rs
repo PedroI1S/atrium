@@ -79,6 +79,14 @@ fn encode_sample(encoding: String, events: usize, chars: usize) -> Result<tauri:
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// Interim progress for long runs, written next to the report (`<ATRIUM_BENCH_OUT>.progress`).
+#[tauri::command]
+fn write_progress(json: String) {
+    if let Ok(path) = std::env::var("ATRIUM_BENCH_OUT") {
+        let _ = std::fs::write(format!("{path}.progress"), json);
+    }
+}
+
 #[tauri::command]
 fn quit(app: tauri::AppHandle) {
     app.exit(0);
@@ -95,6 +103,7 @@ pub fn run() {
             startup_info,
             write_report,
             quit,
+            write_progress,
             encode_sample,
             bridge::bridge_start,
             bridge::bridge_ack,

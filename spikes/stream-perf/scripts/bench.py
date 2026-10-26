@@ -12,7 +12,7 @@
 Common: --encoding E --batch-ms N --chunk-chars N --label NAME --typing synthetic|none
 Every run writes its full JSON report to measurements/<label>.json. Method: docs/spikes/M0-07-stream-perf.md.
 """
-import argparse, ctypes, json, os, re, signal, statistics, subprocess, sys, tempfile, threading, time
+import argparse, atexit, ctypes, fcntl, json, os, re, signal, statistics, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPIKE = os.path.dirname(HERE)
@@ -169,6 +169,30 @@ def summarize_cpu(samples, key, lo, hi):
 # ---------------------------------------------------------------- running a scenario
 
 
+# Everything this script launches is registered here and killed on any exit path (error, Ctrl-C, SIGTERM).
+LAUNCHED = {"pids": set(), "dirs": set()}
+LOCK_PATH = "/tmp/atrium-gui-measure.lock"
+
+
+def cleanup_all():
+    for pid in list(LAUNCHED["pids"]):
+        kill_tree(pid)
+        LAUNCHED["pids"].discard(pid)
+    for d in list(LAUNCHED["dirs"]):
+        cleanup_dir(d)
+        LAUNCHED["dirs"].discard(d)
+
+
+def _terminate(signum, _frame):
+    cleanup_all()
+    sys.exit(128 + signum)
+
+
+atexit.register(cleanup_all)
+for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(_sig, _terminate)
+
+
 def kill_tree(pid):
     rows = ps_table()
     for p in descendants(rows, pid)[::-1] + [pid]:
@@ -230,7 +254,7 @@ def invalid_reason(r):
     return None
 
 
-def run_scenario(sc, label, attempts=4, **kw):
+def run_scenario(sc, label, attempts=6, **kw):
     """Runs a scenario; a run in which rAF stalled for over a second (window hidden or occluded) or that
     timed out is an environment artifact: it is kept as <label>-invalid<N>.json and repeated."""
     existing = os.path.join(OUT, label + ".json")
@@ -254,11 +278,23 @@ def run_scenario(sc, label, attempts=4, **kw):
             json.dump(r, open(os.path.join(OUT, label + ".json"), "w"), indent=1)
             return r
         print(f"   INVALID run ({stalled}); kept as {label}-invalid{n}.json", flush=True)
+        time.sleep(30)
         os.replace(os.path.join(OUT, label + ".json"), os.path.join(OUT, f"{label}-invalid{n}.json"))
     sys.exit(f"{label}: {attempts} invalid runs in a row")
 
 
-def _run_once(sc, label, hold_s=0, fp_every=0, timeout=None, quiet=None):
+def _run_once(sc, label, **kw):
+    """One run under the shared GUI lock (another agent's app window would hide ours and stop rAF).
+    flock(2) is what /usr/bin/lockf uses, so `lockf -k /tmp/atrium-gui-measure.lock ...` interoperates."""
+    with open(LOCK_PATH, "a") as lock:
+        t = time.time()
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if time.time() - t > 1:
+            print(f"   waited {time.time() - t:.0f} s for {LOCK_PATH}", flush=True)
+        return _run_locked(sc, label, **kw)
+
+
+def _run_locked(sc, label, hold_s=0, fp_every=0, timeout=None, quiet=None):
     os.makedirs(OUT, exist_ok=True)
     out_path = os.path.join(OUT, label + ".json")
     if os.path.exists(out_path):
@@ -267,11 +303,13 @@ def _run_once(sc, label, hold_s=0, fp_every=0, timeout=None, quiet=None):
         wait_quiet(quiet)
     dirpath = tempfile.mkdtemp(prefix="asp-")
     os.rmdir(dirpath)  # the client creates it with mode 0700
+    LAUNCHED["dirs"].add(dirpath)
     resp = responsible_fn()
     sc = dict(sc, hold=hold_s > 0)
     host = host_info()
     print(f"== {label}: {json.dumps(sc)}\n   host: {host}", flush=True)
     pid = launch(sc, out_path, dirpath)
+    LAUNCHED["pids"].add(pid)
     # Another window on top hides this one and WebKit stops running rAF; ask for the foreground.
     subprocess.call(["osascript", "-e", 'tell application id "dev.atrium.stream-perf" to activate'], stderr=subprocess.DEVNULL)
     if resp and resp(pid) != pid:
@@ -283,7 +321,22 @@ def _run_once(sc, label, hold_s=0, fp_every=0, timeout=None, quiet=None):
     t_start = time.time()
     timeout = timeout or (sc.get("durationMs", 0) / 1000 + 150)
     try:
+        hidden_polls = 0
+        started_streaming = False
         while not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+            if not started_streaming and sc.get("name") != "x" and time.time() - t_start > 45 and sc.get("mode") != "micro":
+                try:
+                    started_streaming = "t" in json.load(open(out_path + ".progress"))
+                except (OSError, ValueError):
+                    pass
+                if not started_streaming:
+                    raise RuntimeError("the page never started streaming within 45 s (window hidden before the run?)")
+            try:  # the page writes a progress file every 10 s; a hidden window stops rAF, so give up early
+                hidden_polls = hidden_polls + 1 if json.load(open(out_path + ".progress")).get("hidden") else 0
+            except (OSError, ValueError):
+                pass
+            if hidden_polls > 40:  # about 10 s of consecutive hidden progress snapshots (polled every 0.25 s)
+                raise RuntimeError("window hidden (another window covers the app); aborting early")
             if time.time() - t_start > timeout:
                 raise TimeoutError(f"no report after {timeout:.0f}s")
             if pid not in ps_table():
@@ -304,7 +357,9 @@ def _run_once(sc, label, hold_s=0, fp_every=0, timeout=None, quiet=None):
     finally:
         sampler.stop()
         kill_tree(pid)
+        LAUNCHED["pids"].discard(pid)
         cleanup_dir(dirpath)
+        LAUNCHED["dirs"].discard(dirpath)
     if "error" in report and "scenario" not in report:
         return report
     if "error" in report:
