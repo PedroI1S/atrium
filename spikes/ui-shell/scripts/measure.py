@@ -4,6 +4,7 @@
   scripts/measure.py cold   [--runs 10] [--bin PATH]  time to interactive + first paint
   scripts/measure.py rss    [--settle 10] [--bin PATH] idle memory: app + its WebKit helpers
   scripts/measure.py frames [--runs 3]  [--bin PATH]   rAF frame times (scroll 5k messages, resize)
+  scripts/measure.py roundtrip [--bin PATH]            pop-out lifecycle checks in the real app
 
   --windows 1|3                main only, or main + editor and database pop-outs
   --opacity off|background|whole  alpha 1, or 0.6 in background or whole-window mode
@@ -310,6 +311,24 @@ def frames(a):
     summary("frames", runs=len(runs), **{k: agg(k) for k in ("idleFrames", "scrollReading", "scrollFling", "resize")})
 
 
+def roundtrip(a):
+    """Pop-out lifecycle in the real app: close-with-pending-edit, polite and forced bring-back."""
+    print_config(a.bin)
+    tmp = tempfile.mkdtemp(prefix="atrium-roundtrip-")
+    out, log = os.path.join(tmp, "report.json"), os.path.join(tmp, "app.log")
+    p, _ = launch(a.bin, {"ATRIUM_BENCH": "roundtrip", "ATRIUM_BENCH_OUT": out}, log)
+    try:
+        r = wait_report(out, p.poll, log, timeout=60)
+    finally:
+        stop(p)
+    for c in r["checks"]:
+        print(f"{'PASS' if c['ok'] else 'FAIL'}  {c['name']}  {c['detail']}")
+    failed = [c["name"] for c in r["checks"] if not c["ok"]]
+    summary("roundtrip", checks=len(r["checks"]), failed=failed)
+    if failed:
+        raise HarnessError(f"{len(failed)} pop-out check(s) failed: {failed}")
+
+
 def terminate_pid(pid):
     try:
         os.kill(pid, signal.SIGTERM)
@@ -324,7 +343,7 @@ def terminate_pid(pid):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["cold", "rss", "frames"])
+    ap.add_argument("mode", choices=["cold", "rss", "frames", "roundtrip"])
     ap.add_argument("--runs", type=int, default=None)
     ap.add_argument("--settle", type=int, default=10)
     ap.add_argument("--bin", default=DEFAULT_BIN)
@@ -344,7 +363,7 @@ if __name__ == "__main__":
     if not os.access(a.bin, os.X_OK):
         sys.exit(f"FAILED: no executable at {a.bin} (build it with `pnpm tauri build`)")
     try:
-        {"cold": cold, "rss": rss, "frames": frames}[a.mode](a)
+        {"cold": cold, "rss": rss, "frames": frames, "roundtrip": roundtrip}[a.mode](a)
     except (HarnessError, KeyError, AssertionError) as e:
         print(f"FAILED ({a.mode}, windows={a.windows}, opacity={a.opacity}): {type(e).__name__}: {e}", file=sys.stderr)
         print(f"FAILED {type(e).__name__}: {e}")

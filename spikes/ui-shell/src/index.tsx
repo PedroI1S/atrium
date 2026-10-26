@@ -13,6 +13,7 @@ import { epochNow, markOnce, reportFailure, runHarness, runProbe, setStage } fro
 import { type PanelTab, type Screen } from "./layout";
 import { type StartupInfo, inTauri, startupInfo } from "./platform";
 import { setAdvancedOpen, setPaletteOpen, setPanel, setScreen } from "./state";
+import { roundtripPopout, runRoundtrip } from "./roundtrip";
 import { afterMount, appliedState, initFromStartup, repaint, subscribe, viewId } from "./windows";
 
 const SCREENS: Screen[] = ["chat", "inbox", "editor", "database", "settings"];
@@ -43,7 +44,7 @@ async function boot() {
   markOnce("mounted");
   requestAnimationFrame(() => markOnce("firstPaintRaf"));
   const harnessMain = Boolean(info.benchMode) && !viewId;
-  if (harnessMain) {
+  if (harnessMain && info.benchMode !== "roundtrip") {
     setStage("probe");
     await runProbe();
   }
@@ -66,7 +67,10 @@ async function boot() {
     // background WKWebViews do not; the harness reports it per window instead of hanging on it.
     requestAnimationFrame(() => { void invoke("window_ready", { applied: { ...appliedState(), readyAt, rafAt: epochNow() } }); });
   }
-  if (harnessMain) await runHarness(info);
+  if (info.benchMode === "roundtrip") {
+    if (viewId) await roundtripPopout();
+    else await runRoundtrip();
+  } else if (harnessMain) await runHarness(info);
 }
 
 boot().catch((e) => reportFailure(e, info));

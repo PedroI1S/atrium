@@ -261,12 +261,15 @@ async function closeThisPopout(): Promise<void> {
 }
 
 /** From either side: the pop-out closes itself; main asks politely, then forces after a timeout. */
-export async function bringBack(view: ViewId): Promise<void> {
-  if (!inTauri) return;
-  if (viewId === view) return closeThisPopout();
+export async function bringBack(view: ViewId): Promise<"returned" | "forced" | "destroyed" | "none"> {
+  if (!inTauri) return "none";
+  if (viewId === view) {
+    await closeThisPopout();
+    return "returned";
+  }
   const owner = model().views[view].owner;
-  if (owner === "main") return;
-  await bringBackFromMain({
+  if (owner === "main") return "none";
+  return bringBackFromMain({
     ask: () => emitTo(owner, "return-view"),
     returned: () => model().views[view].owner === "main",
     force: async () => accept(await invoke<WindowModel>("force_bring_back", { view })),
