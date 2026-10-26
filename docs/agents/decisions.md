@@ -150,3 +150,6 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 - **The fix:** `~/Documents/Harness` → `Harness.nosync` and `~/Documents/atrium-wt` → `atrium-wt.nosync`, which iCloud skips. Symlinks keep the old paths working. All copies were deleted (untracked only), `git worktree repair` run, `git fsck` clean. `.gitignore` now ignores `* [0-9].*`.
 - **Rule for every machine** (in `docs/agents/README.md`): the repo and worktrees must not live in a cloud-synced folder.
 - **M0-09** (wave 3, Flash) launched with updated inputs.
+
+## D-031 — 2026-10-26 — M0 gate review by Astra
+**Pedro approved launching GPT-6 Astra** (read-only, `codex exec -s read-only`) for the M0 gate review: security and architecture, starting from `docs/spikes/M0-findings.md`, on a frozen snapshot of `dev` (`666ce2d`). Argon is paused (D-015), so Astra reviews alone. Still to come for the gate: Pedro's hands-on checks, the partner's Linux checks (or an explicit deferral), decisions on CR-01 … CR-04 and `macOSPrivateApi`, then Pedro's sign-off (merge `dev` → `main`, push the code).

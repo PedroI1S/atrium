@@ -16,3 +16,4 @@
 | M0-08-browser-screencast | Sonnet 5.5 | Pedro | 🔧 fix round 1 resumed (Sonnet, D-026) · ~90% | `../atrium-wt/M0-08-browser-screencast` · `agent/sonnet/M0-08-browser-screencast` | Claude subagent transcript (Pedro's Mac) |
 | M0-09-m0-findings | Gemini 3.8 Flash | Pedro | ✅ merged into local `dev` · `docs/spikes/M0-findings.md` (gate summary) + cross-adapter consistency test (13 Codex fixture violations, see m1-must-fix X6) · archived | removed | `.orchestration/archive/M0-09-m0-findings/` (Pedro's Mac) |
 | M0-00-hookcheck-1.4.7 | Gemini 3.8 Flash (`agy -p`) | Pedro | ✅ `agy` 1.4.7 policy re-check passed: `cargo` allowed, `.agents/` write and `git push` denied | removed | `.orchestration/logs/M0-00-hookcheck-1.4.7.*` (Pedro's Mac) |
+| M0-gate | GPT-6 Astra (read-only) | Pedro | 🔍 gate review running (D-031) on snapshot `666ce2d` | `../atrium-wt/M0-gate-review` (detached) | `.orchestration/logs/M0-gate-review.*` (Pedro's Mac) |
