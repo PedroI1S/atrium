@@ -177,3 +177,19 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 - **Verified:** a full clean rebuild plus the workspace tests (231 passed, 0 failed, 1 ignored) produced no new copies.
 - After a move, run `cargo clean`: test binaries keep the old `CARGO_MANIFEST_DIR` and fail on fixture paths.
 - **Rule for every machine** (`docs/agents/README.md`): keep the repo outside any synced folder; a `.nosync` rename inside one is not enough.
+
+## D-037 — 2026-10-27 — Linux measurement plan for the M0 spikes (G6) approved
+**Approved by rodrigo (driver).** This approves the method for the D-033 checks. It's not a go to build, dispatch or measure; that needs its own go.
+- **Where:** the orchestrator runs in a Debian distrobox on rodrigo's CachyOS laptop. Builds and measurements run on the host (`distrobox-host-exec`), against the host's WebKitGTK and Mesa, never in the container.
+- **Rules:** release builds; one GUI app at a time under `flock /tmp/atrium-gui-measure.lock`; sweep for orphaned processes after each run. "Warm" means one discarded launch first, as on macOS.
+- **ui-shell (layout B), 1 and 3 windows:**
+  - opaque mode and disabled controls: `roundtrip` checks, plus a hands-on check with screenshots;
+  - TTI: 10 warm launches per configuration, against 400 ms as a reference (PLAN §4 states that budget for macOS only);
+  - memory: PSS summed over the app and its WebKit children at 10 s and 30 s, 3 launches per configuration, plus a 5-minute 1 Hz idle trace; RSS, USS and DRM GPU memory reported separately;
+  - smoothness: rAF frames, 3 runs per configuration at 144 Hz and 60 Hz (120 Hz if offered), plus one set with compositing disabled; pass if every run's median fps is at least 97% of the refresh rate.
+- **stream-perf:** `single` (3 runs at 144 Hz, 1 at 60 Hz), `multi` (3 runs), `memory` (one 300 s run). Typing stays synthetic, so input latency stays unproven.
+- **browser-screencast:** `bench.sh`, 10 runs with Brave, plus 1 run at 2× scale. Chromium CPU and PSS are sampled from `/proc`.
+- **Harness:** Linux branches in `measure.py` and `bench.py`, plus a `/proc` sampler. No app code changes without asking. No worker.
+- **Machine answers (rodrigo):** shell zsh. Claude Code (all models), Codex and Google plans are all available on this machine; their limits aren't known. As in D-015, a worker that hits a limit is paused, not silently re-routed. Pedro's routing constraints (Argon paused, at most 3 Sol jobs at once) applied to his accounts and don't bind this machine.
+- **Power:** the orchestrator chose **balanced on AC** for every run, since it's the default a user runs. The laptop was in power-saver on battery when this was recorded. Each run records the profile and AC state.
+- **Still open:** fresh-launch TTI (needs sudo to drop caches) and a read-only Sol review of the harness before its numbers count.
