@@ -2,19 +2,19 @@
 
 Run by rodrigo (partner driver), with Opus 5.5 as orchestrator, under D-033 and gate condition G6. The method is D-037; measuring on battery is D-038. This report covers the Linux/WebKitGTK half of three M0 spikes: ui-shell layout B (M0-06b), stream-perf (M0-07) and browser-screencast (M0-08). The macOS reports remain the reference for what was built. This file only records how the same code behaves on Linux.
 
-**Verdict.**
+**Verdict.** Memory figures are MiB, and the harness was reviewed read-only by Codex (see "Harness review").
 
 | Check | Budget | Linux result | |
 |---|---|---|---|
-| ui-shell: opaque Linux mode | translucency off; opacity and blur controls disabled, with an explanation | Opaque in every window (verified automatically). Controls disabled, but **there is no Linux explanation** (finding L1) | partial |
-| ui-shell: frames at 60 Hz | ≥ 97% of the refresh rate in every run | Main batch: 58.7–60.0 fps, 1 and 3 windows. In the 15 extra runs, 2 resize sections fell to 54.2 and 58.0 fps (section 2.3) | **pass**, resize marginal |
-| ui-shell: frames at 120/144 Hz | same | Windows always opened on the 60 Hz panel; WebKitGTK also paces near 60 fps by default (L10) | not measured |
-| ui-shell: TTI, 1 window | 400 ms (contract §5: painted and input handled) | median 472 ms, worst 487 ms; 10/10 over | **fail** |
-| ui-shell: TTI, 3 windows | 400 ms | median 495 ms, worst 562 ms; 10/10 over | **fail** |
+| ui-shell: opaque Linux mode | translucency off; opacity and blur controls disabled, with an explanation | Opaque in every window (verified automatically). Controls disabled, with a Linux note (checked hands-on). One Advanced hint still says macOS (L1) | **pass**, minor text fix |
+| ui-shell: frames at 60 Hz | ≥ 97% of the refresh rate in every run | `performance` profile: 59.9–60.0 fps in every section. `balanced` on battery: main batch 58.7–60.0 fps, but 3 sections of the extra runs fell to 54.2–58.0 fps (section 2.3) | **pass** on `performance`; **fail** on `balanced` (battery) |
+| ui-shell: frames at 144 Hz | same | Smooth, but rendering is capped at 60 fps (idle rAF 100–126/s), with the 60 fps preference on or off (L10); 120 Hz not measured separately | **fail** |
+| ui-shell: TTI, 1 window | 400 ms (contract §5: painted and input handled) | median 472 ms, worst 487 ms; 10/10 over. On `performance`: 452 ms (section 2.4) | **fail** |
+| ui-shell: TTI, 3 windows | 400 ms | median 495 ms, worst 562 ms; 10/10 over. On `performance`: 446 ms | **fail** |
 | ui-shell: memory, 1 window | 150 MB (PLAN §4, D-028) | PSS 273–277 MB at 30 s, plus GPU 168 MB | **fail** (see L2 on the metric) |
 | ui-shell: memory, 3 windows | 220 MB (D-028) | PSS 425–429 MB at 30 s, plus GPU 344 MB | **fail** (see L2) |
 | stream-perf: 60 fps at 10k tok/s | 60 fps | 60.0 fps in all 7 runs (1 thread, 10 threads, 5 min); latency p99 40–42 ms | **pass** |
-| stream-perf: memory while streaming | reported (macOS: 1.0–1.5 GB footprint) | WebContent PSS 231 → 417 MB, no transient spike; the daemon keeps 227 MB after close (L8) | reported |
+| stream-perf: memory while streaming | reported (macOS: 1.0–1.5 GB footprint) | WebContent PSS 231 → 417 MB, no transient spike observed at 30 s sampling; the daemon keeps 227 MB after close (L8) | reported |
 | screencast: fps | ≥ 30 fps | 60.0 at 1× (10 runs) and at 2× | **pass** |
 | screencast: click → canvas | p50 and p95 < 80 ms | 1×: p50 19, p95 21 ms; 2×: 35 / 43 ms | **pass** |
 
@@ -23,17 +23,17 @@ Run by rodrigo (partner driver), with Opus 5.5 as orchestrator, under D-033 and 
 | | |
 |---|---|
 | Machine | Intel Core Ultra 7 258V (8 cores), Intel Arc 140V (`xe`), 30 GB RAM |
-| OS | CachyOS, kernel 7.3.0-4-cachyos |
+| OS | CachyOS, kernel 7.3.0-4-cachyos (7.3.1-1-cachyos for the 2026-11-04 runs) |
 | Session | GNOME Shell 51.1 on Wayland |
 | WebKitGTK | webkit2gtk-4.1 2.54.2, Mesa 26.2.5 |
 | Toolchain | cargo 1.99.1, node 26.12.1, pnpm 12.15.0 |
-| Monitors | eDP-1 (built-in) 2560×1440 at 59.961 Hz; HDMI-1 2560×1440 at 143.991 Hz. The ui-shell windows opened on eDP-1, so every frame number in section 2 is at 60 Hz |
+| Monitors | eDP-1 (built-in) 2560×1440 at 59.961 Hz; HDMI-1 (LG ULTRAGEAR+) 2560×1440 at 143.991 Hz. Until 2026-11-03 the ui-shell windows opened on eDP-1, so those frame numbers are at 60 Hz. The 144 Hz runs used HDMI-1 alone (section 2.3) |
 | Power | **On battery** (no charger available, D-038), `balanced` power profile; each log records the battery level at start and end (61% → 54% for the ui-shell batch) |
 | Environment variables | no `WEBKIT_*` set, except where a row says `WEBKIT_DISABLE_COMPOSITING_MODE=1` |
 
 Battery and the balanced profile slow the CPU compared with mains power. The TTI numbers in particular should be re-checked on mains before anyone treats the size of the gap as final (section 5).
 
-On 2026-10-29 the monitors reported a different mode (both 1920×1080; eDP-1 at 119.93 Hz, HDMI-1 at 60 Hz), and on 2026-11-01 they were back to the table above. Every log line records the modes that were current at that moment (`host_line()`).
+On 2026-10-29 the monitors reported a different mode (both 1920×1080; eDP-1 at 119.93 Hz, HDMI-1 at 60 Hz), and on 2026-11-01 they were back to the table above. Every log line records the modes that were current at that moment (`host_line()`). On 2026-11-04 they were first mirrored, then HDMI-1 alone.
 
 The orchestrator runs in a Debian distrobox. Every build and measurement ran on the host through `distrobox-host-exec`, as `systemd-run --user` units, so a dropped session can't kill a batch. GUI measurements are serialised with `flock /tmp/atrium-gui-measure.lock`. After each command a sweep checks for leftover spike processes: none were found in any run.
 
@@ -51,7 +51,10 @@ python3 scripts/measure.py cold --runs 1 --opacity whole --windows 3
 
 - With opacity requested as `background` or `whole` and 3 windows, every window reports chrome, content and native alpha 1 and vibrancy false. The harness refuses any other result on Linux (`validate_report(…, translucency=False)`, tested in `scripts/test_measure.py`, `OpaqueLinuxMode`).
 - Pop-out round trip: 7/7 checks pass (move to pop-out, edit right before close survives, polite and forced bring-back, native window list).
-- **Finding L1: the controls have no Linux explanation.** In the Settings code, the opacity slider and the blur toggle are disabled on Linux (`opacityLocked`), but their hints are the macOS ones: "Lets the desktop show through. Text stays solid." for opacity, and "macOS sets the blur radius; not adjustable" for blur strength, which is wrong on Linux. The PLAN asks for the controls to be disabled *with an explanation*. This was checked in the code only. No hands-on check with screenshots was made, because the driver was working remotely.
+- **Controls and their explanation, checked hands-on by rodrigo on 2026-11-04 in the running app (Settings → Appearance):**
+  - "Window opacity" and "Blur behind the window" are disabled.
+  - Below them, the app shows the note "This platform draws opaque windows; opacity and blur need a compositor that supports them." (`Settings.tsx`, shown when `opacityLocked`). That covers the PLAN's "disabled, with an explanation".
+- **Finding L1: one hint is macOS text.** In Advanced appearance, the always-disabled "Blur strength" hint reads "macOS sets the blur radius; not adjustable", which is wrong on Linux. The note's "need a compositor that supports them" is also a little misleading: GNOME can composite transparent windows, but Atrium doesn't implement translucency on Linux. Both are wording fixes for M1. An earlier version of this report said there was no explanation at all; it had missed the note.
 
 ### 2.2 Frames at 60 Hz
 
@@ -71,25 +74,42 @@ A section passes when every run reaches 97% of the refresh rate (58.2 fps here).
 
 Values are the worst run's fps out of 3. **All pass.** Turning off accelerated compositing doesn't hurt frame pacing on this machine; it is slightly smoother.
 
-### 2.3 Frames at 120 and 144 Hz: not measured
+### 2.3 Frames at 144 Hz, and extra 60 Hz runs
 
-Both monitors support high refresh rates: eDP-1 has 2560×1440 at 119.877 Hz, and HDMI-1 has 2560×1440 at 143.991 and 119.998 Hz. No high-refresh run was possible, for two reasons:
-- **GNOME opened every window on the primary monitor** (eDP-1, 60 Hz), wherever the pointer was. Wayland clients can't position their own windows. Making HDMI-1 primary, or switching eDP-1 to 120 Hz, means changing the display settings, and the driver couldn't do that during this shift.
-- **WebKitGTK paces rendering near 60 fps by default (L10).** The feature `PreferPageRenderingUpdatesNear60FPS` is on by default in 2.54. Checked through GObject introspection: `WebKit2.Settings.get_all_features()`, default `True`. A high-refresh measurement has to turn it off, or it will read about 60 fps whatever the display.
-
-For the next attempt, the ui-shell spike has a Linux-only diagnostic switch, off by default. `ATRIUM_WEBKIT_NATIVE_FPS=1` turns the feature off in every webview (`src-tauri/src/linux.rs`). Each window also logs the monitor it landed on and the feature's state (`linux-display main: monitor 0x419d 2560x1440+0+0 @59.960 Hz, PreferPageRenderingUpdatesNear60FPS=off`), and `measure.py frames` copies those lines into the run log. The command:
+**144 Hz** (2026-11-04). Setup: HDMI-1 alone (LG ULTRAGEAR+, 2560×1440 at 143.991 Hz, laptop panel off), `balanced` profile, on battery (41% → 39%). The `linux-display` log line confirms every window was on that monitor at 143.991 Hz.
 
 ```
-env ATRIUM_WEBKIT_NATIVE_FPS=1 python3 scripts/measure.py frames --runs 3 --windows 1 --hz <rate>
+python3 scripts/measure.py frames --runs 3 --windows 1 --hz 143.991
+env ATRIUM_WEBKIT_NATIVE_FPS=1 python3 scripts/measure.py frames --runs 3 --windows 1 --hz 143.991
+env ATRIUM_WEBKIT_NATIVE_FPS=1 python3 scripts/measure.py frames --runs 3 --windows 3 --hz 143.991
 ```
 
-The 15 runs made while trying landed on eDP-1 at 60 Hz: 9 have the monitor log, and the first 6 were before it. They count as extra 60 Hz data:
-- With the switch on (6 runs), the worst runs were 59.3–60.0 fps in every section, with p99 ≤ 26 ms. On a 60 Hz panel the switch makes no difference.
-- With it off (9 runs), idle and scroll stayed at or above the 58.2 fps threshold, but **two resize sections fell under it**:
-  - 1 window, at 67% battery: worst run 54.2 fps, p99 38 ms;
-  - 3 windows, at 82% battery: worst run 58.0 fps, p99 31 ms.
+| worst run of 3, fps | idle | scroll (reading) | scroll (fling) | resize | worst p99 |
+|---|---|---|---|---|---|
+| 1 window, default | 120.9 | 59.7 | 60.3 | 60.0 | 20 ms |
+| 1 window, 60 fps preference off | 126.0 | 60.0 | 60.5 | 60.0 | 19 ms |
+| 3 windows, 60 fps preference off | 102.0 | 60.0 | 60.2 | 60.0 | 19 ms |
 
-  The other six resize sections across all 60 Hz runs reached 58.7–60.0 fps. Resize is therefore marginal at 60 Hz on battery. This isn't explained, and wasn't repeated.
+**Fail against 144 Hz.** WebKitGTK renders every changing frame at 60 fps on the 144 Hz monitor, whether `PreferPageRenderingUpdatesNear60FPS` is on or off. Only when nothing changes does rAF run faster, and irregularly: 100–126 callbacks per second, with the p95 interval still at 17 ms. The 60 fps pacing itself is clean: p99 19–20 ms and max ≤ 33 ms in every section. A stream-perf single run on the same monitor (`linux-single-json-slim-b8-ext144.json`) behaves the same: 60.1 fps, latency p99 42 ms, all events applied. So the 60 fps cap comes from somewhere else in WebKitGTK 2.54's rendering path, not that preference. It wasn't investigated further (L10). 120 Hz wasn't measured separately.
+
+Getting a window onto the fast monitor took three attempts:
+1. GNOME opens new windows on the primary monitor, wherever the pointer is.
+2. With the screens mirrored, GTK reports the 60 Hz panel (`0x419d @59.960 Hz`), and the app stays at 60 fps even with the preference off.
+3. Only HDMI-1 as the only display worked.
+
+The ui-shell spike has a Linux-only diagnostic switch, off by default: `ATRIUM_WEBKIT_NATIVE_FPS=1` turns the preference off in every webview (`src-tauri/src/linux.rs`). Each window also logs the monitor it landed on and the preference's state, and `measure.py frames` copies those lines into the run log.
+
+**Extra 60 Hz runs.** Altogether 25 more frame runs ran at 60 Hz:
+- 15 on eDP-1 alone, during the earlier attempts;
+- 4 runs × 3 with the screens mirrored, on `balanced`;
+- 2 runs × 3 mirrored, on `performance`.
+
+Idle stayed at 60 fps throughout. In `balanced` on battery, **three sections fell under the 58.2 fps threshold**:
+- resize, 1 window: 54.2 fps, p99 38 ms;
+- resize, 3 windows: 58.0 fps, p99 31 ms;
+- scroll fling, 3 windows: 57.7 fps, p99 34 ms.
+
+Every other section reached 58.4–60.0 fps. With the `performance` profile (1 and 3 windows), every section reached 59.9–60.0 fps with p99 ≤ 19 ms. By the rule (every run at ≥ 97%), 60 Hz therefore **passes on `performance` and fails on `balanced` on battery**. The dips happen only under `balanced`, which is consistent with CPU power saving. These runs don't prove that cause.
 
 ### 2.4 Time to interactive
 
@@ -111,6 +131,15 @@ These are warm launches: one discarded warm-up launch, then 10 recorded ones, op
 | all windows ready | 484 | 783 (worst 876) | |
 
 **Fail: 10/10 launches over 400 ms in both configurations.** The keystroke is handled (input ready) at about 388 ms, just under the budget, but the first paint comes about 85 ms later. On macOS that step takes about 60 ms. Mounting the SolidJS tree also takes about twice as long as on macOS. Startup before JS (main → JS, 212 ms) is the largest single block. Fresh-launch TTI after dropping the page cache was not measured (it needs root; open item in D-037).
+
+**Is it the battery?** No charger was available, so on 2026-11-04 the cold runs were repeated with the `performance` power profile (still on battery), against `balanced` controls measured right before:
+
+| TTI median (worst), ms | balanced | performance |
+|---|---|---|
+| 1 window | 464 (476) | 452 (471) |
+| 3 windows | 459 (497) | 446 (463) |
+
+The screens were mirrored for these runs, which explains why the balanced control is a little faster than in the table above. The CPU profile gains only 12–13 ms, and all 40 launches stay over 400 ms. Mains power might add a little more, but the profile result shows the gap isn't a power-saving artefact. TTI fails on Linux because of the app's own startup on WebKitGTK.
 
 ### 2.5 Memory
 
@@ -207,7 +236,7 @@ A fourth single run, `linux-single-json-slim-b8-144.json`, was meant for 144 Hz 
 | GPU (DRM, apart) | 368–379 | 370 | (in footprint) |
 
 Two differences from macOS:
-- **No transient spike in WebContent.** On macOS, footprint is four to five times the retained size while streaming. On Linux, WebContent grows steadily to about 417 MB, and settles at about 330 MB PSS afterwards, against 248 MB of footprint on macOS. The two metrics differ (section 2.5), so this is no evidence that one platform retains more.
+- **No transient spike in WebContent was observed** at the 30 s sampling interval (the same interval as on macOS). A shorter peak between samples would be missed. On macOS, footprint is four to five times the retained size while streaming. On Linux, WebContent grows steadily to about 417 MB, and settles at about 330 MB PSS afterwards, against 248 MB of footprint on macOS. The two metrics differ (section 2.5), so this is no evidence that one platform retains more.
 - **The daemon keeps its close-time peak (L8).** At session close the daemon folds the 3 M-event history (CR-03; M0-05's known behaviour). macOS returns that memory within 15 s. On Linux, 227 MB is still resident 60 s later. This looks like glibc's allocator holding freed memory and is a candidate for M1 (`malloc_trim`, or a different allocator for the daemon). Not investigated further.
 
 ## 4. browser-screencast (M0-08)
@@ -241,23 +270,40 @@ Not measured:
 
 Chromium was not measured, only Brave. Both are Chromium-based and use the same CDP screencast path.
 
+## Harness review (Codex, read-only)
+
+D-037 asked for an independent read-only review of the harness before its numbers count. Codex 0.164.0 ran it on 2026-11-04 (`codex exec -s read-only`, with the prompt and result kept in `.orchestration/m0-linux/review/`). Both test suites passed, and no files were changed. The findings, and what was done about each:
+
+| Finding | Severity | Effect on this report | Action |
+|---|---|---|---|
+| CPU % came from group totals, so a helper exiting or starting skews the delta | major | The stream-perf CPU figures (§3) were measured that way. During a stream the process set is stable, so treat them as approximate. §4's CPU figures come from `procstat`, not this sampler | Fixed: per-process deltas in `bench.py` and `procsample.py`, unit-checked |
+| Browser PSS summed even when a process was unreadable | major | Checked in the raw data: unreadable samples occur only in the first 1–4 s while Brave starts. The median and maximum over readable samples equal the §4 values | Fixed: PSS statistics skip partial samples |
+| The 60 Hz verdict said pass despite runs under the threshold | major | Verdict corrected: pass on `performance`, fail on `balanced` on battery. The power-saving cause is stated as consistent with the data, not proven | Report fixed |
+| GPU values are DRM **total** summed per client, not unique resident memory | minor | Read §2.5, §3.3 and §4 GPU figures as summed client allocations. In the readings checked, total equalled resident | Noted |
+| "No transient spike" overstates 30 s sampling | minor | Reworded to "none observed at 30 s sampling" | Report fixed |
+| "MB" is MiB (kB ÷ 1024) | nit | Every memory figure in this report is MiB. The conclusions don't change | Noted here |
+
+The review found no defect in the PSS grouping, opacity validation, warm-up exclusion, the Linux code paths, or the FFI in `linux.rs` (ownership, thread and casts match the WebKitGTK headers). Codex's verdict was "numbers need re-measuring" for browser PSS and CPU under process churn. The raw data above shows the reported figures weren't affected, so nothing was re-measured. The fixed harness applies to any future run.
+
 ## 5. Linux findings
 
-- **L1. The opacity and blur hints are macOS text on Linux.** Section 2.1. It's a small UI fix for M1: a Linux-specific hint, such as "Translucency isn't available on Linux; Atrium uses opaque windows."
+- **L1. The "Blur strength" hint is macOS text on Linux.** Section 2.1. The disabled controls do have a Linux note. The fixes for M1 are wording only:
+  - a platform-aware hint for "Blur strength";
+  - a note that doesn't blame the compositor, such as "Atrium uses opaque windows on Linux."
 - **L2. Memory budget metric for Linux is undefined.** Section 2.5. For Pedro to decide. Candidates for one window:
 - PSS without shared-library pages (anon + mapped files): about 144 MB, within 150.
 - The same plus GPU (DRM), closer to what `phys_footprint` counts: about 310 MB.
 - Full PSS: about 275 MB.
 
 Whichever is chosen, a pop-out costs about twice D-028's allowance on Linux: 75 MB PSS, plus GPU.
-- **L3. TTI misses the budget by about 70–95 ms on this machine, on battery.** Section 2.4. The largest gap from macOS is between mount and first paint. Next steps: re-measure on mains power, and profile startup (main → JS, and WebKitGTK's first composite).
+- **L3. TTI misses the budget by about 45–95 ms on this machine.** Section 2.4. The `performance` profile gains only 12–13 ms, so power saving isn't the cause. The largest gap from macOS is between mount and first paint. M1 should profile startup on WebKitGTK: main → JS, mount, and the first composite.
 - **L4. Harness: GUI-lock deadlock (fixed).** stream-perf's `bench.py` takes the GUI lock itself around each run, so wrapping it in `flock` deadlocked the batch. The wrapper now skips the lock for `bench.py`.
 - **L5. Harness: xe's DRM cycle counters (fixed).** The `xe` driver exposes `drm-total-cycles-<engine>`. A prefix match on `drm-total-` read those counters as bytes and reported hundreds of GB of GPU memory. Memory regions only now; covered by a test.
 - **L6. Harness: power detection (fixed).** A wireless mouse's battery (`hidpp_battery_0`) also exposes `online`, so the first `on_ac()` reported mains power while the machine was on battery. Only `Mains` and `USB` supplies count now.
 - **L7. Environment.** The orchestrator ran in a distrobox. GUI apps, git and the agent CLIs only work on the host (`distrobox-host-exec`, and `zsh -lic` for the user's `PATH`). The rebase glitch of D-030 didn't come up on this machine.
 - **L8. The daemon doesn't give back its close-time memory on Linux.** Section 3.3. 227 MB is still resident 60 s after a 3 M-event session closes, where macOS drops to 9 MB. This adds to CR-03's lifecycle-fold issue. For M1: `malloc_trim` after the fold, a different allocator, or avoiding the fold altogether.
 - **L9. Streaming and screencast are not Linux risks.** Sections 3 and 4. WebKitGTK keeps 60 fps at 10k events/s and with the screencast pane. The typing probe matches macOS within 1 ms, and click → canvas is within 6 ms of macOS.
-- **L10. WebKitGTK renders near 60 fps on high-refresh displays by default.** Section 2.3. `PreferPageRenderingUpdatesNear60FPS` is on in WebKitGTK 2.54. WebKit on macOS has a preference of the same name, and the macOS spikes ran only on a 60 Hz panel, so 120 Hz is unverified on both platforms. M1 should decide whether Atrium turns it off: smoother on fast displays, at the cost of more power.
+- **L10. WebKitGTK renders at 60 fps on a 144 Hz display.** Section 2.3. Content updates ran at 60 fps on the 144 Hz monitor, with `PreferPageRenderingUpdatesNear60FPS` (on by default in 2.54) either on or off; only an idle page runs rAF faster. So turning that preference off isn't enough; the cap comes from elsewhere in WebKitGTK's rendering path. Pacing at 60 fps is clean. WebKit on macOS has a preference of the same name, and the macOS spikes ran only on a 60 Hz panel, so high refresh is unverified on macOS too. For M1 and Pedro: either accept 60 fps on high-refresh displays for now, or budget time to find the cap (WebKitGTK compositor and vblank monitor) before promising 120 Hz.
 
 ## 6. Reproducing
 

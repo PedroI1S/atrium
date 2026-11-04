@@ -196,3 +196,11 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 
 ## D-038 — 2026-10-27 — Linux measurements run on battery
 **Decided by rodrigo (driver).** This replaces D-037's "balanced on AC": the charger isn't detected (`AC0` offline, battery discharging at about 20 W), and rodrigo can't plug in now, so the measurements run on battery with the balanced profile. rodrigo gave the go to measure this way. Each run records the power state. The report marks every number as "on battery", since firmware power limits on battery can lower CPU and GPU clocks. If the battery falls below 20%, runs stop. A repeat on AC power is a follow-up only if a result is borderline.
+
+## D-039 — 2026-11-04 — M0 Linux checks finished (G6)
+**Decided by rodrigo (driver).** The Linux/WebKitGTK checks of D-033 are finished (`docs/spikes/M0-linux-checks.md`):
+- **Pass:** opaque mode (one hint still has macOS text, L1); stream-perf; screencast; 60 Hz frames on the `performance` profile.
+- **Fail:** TTI (median 446–472 ms against 400, not a power-saving effect); memory, measured as PSS; 144 Hz (WebKitGTK renders content updates at 60 fps); 60 Hz on `balanced` on battery (3 sections).
+- **Harness:** reviewed read-only by Codex, as D-037 required. Its two accounting bugs were fixed. The raw data shows the reported numbers weren't affected, so nothing was re-measured. Fresh-launch TTI (needs root) was dropped.
+
+G6 is met: the checks are done before any M1 UI work merges. The failures aren't blockers for G6. They become M1 inputs, and three of them are Pedro's call: the Linux memory metric (L2), the TTI budget on Linux (L3) and high refresh (L10).
