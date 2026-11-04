@@ -28,18 +28,21 @@ def group_tree(rows, app):
 
 
 def sample(rows, groups, prev, dt):
+    """prev: cumulative CPU seconds per pid from the previous sample; updated in place. Deltas are
+    per process, so a helper exiting or starting doesn't skew the group's CPU."""
     s = {}
     for g, pids in groups.items():
-        cpu = sum(rows[p][2] for p in pids if p in rows)
-        if g in prev and dt:
-            s[g + "_cpu_pct"] = max(0.0, (cpu - prev[g]) / dt * 100)
-        prev[g] = cpu
+        if dt:
+            used = sum(rows[p][2] - prev[p] for p in pids if p in rows and p in prev)
+            s[g + "_cpu_pct"] = max(0.0, used / dt * 100)
         mems = [linuxproc.mem_kb(p) for p in pids]
         s[g + "_pss_mb"] = sum(m["pss"] for m in mems if m) / 1024
         s[g + "_unreadable"] = sum(1 for m in mems if m is None)
         gpu = linuxproc.gpu_kb(pids)
         s[g + "_gpu_drm_mb"] = None if gpu is None else gpu["total"] / 1024
         s[g + "_procs"] = len(pids)
+    prev.clear()
+    prev.update({p: r[2] for p, r in rows.items()})
     return s
 
 
@@ -68,7 +71,10 @@ def main():
             p.terminate()
             p.wait(timeout=10)
     live = [s for s in samples if s["browser_procs"] > 0]
-    summary = {g: {"cpu_pct": stats([s.get(g + "_cpu_pct") for s in live]), "pss_mb": stats([s[g + "_pss_mb"] for s in live]),
+    # PSS stats skip samples where a process of the group couldn't be read (a partial sum, e.g. while
+    # the sandboxed browser is still starting); `unreadable_max` still reports that it happened.
+    summary = {g: {"cpu_pct": stats([s.get(g + "_cpu_pct") for s in live]),
+                   "pss_mb": stats([s[g + "_pss_mb"] for s in live if s[g + "_unreadable"] == 0]),
                    "gpu_drm_mb": stats([s[g + "_gpu_drm_mb"] for s in live]), "unreadable_max": max((s[g + "_unreadable"] for s in live), default=0)}
                for g in GROUPS}
     with open(out, "w") as f:

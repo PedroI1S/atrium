@@ -153,17 +153,19 @@ class Sampler(threading.Thread):
         self.t0 = time.time()
 
     def run(self):
-        prev, prev_t, n = {}, None, 0
+        prev, prev_t, n = {}, None, 0  # prev: cumulative CPU seconds per pid
         while not self.stop_ev.is_set():
             rows, groups = self.procs.find()
             now = time.time()
             s = {"t": now - self.t0}
             for g, pids in groups.items():
                 s[g + "_rss_mb"] = sum(rows[p][1] for p in pids if p in rows) / 1024
-                cpu = sum(rows[p][2] for p in pids if p in rows)
-                if g in prev and prev_t:
-                    s[g + "_cpu_pct"] = max(0.0, (cpu - prev[g]) / (now - prev_t) * 100)
-                prev[g] = cpu
+                if prev_t:
+                    # Per-process deltas, so a helper exiting or starting doesn't skew the group total;
+                    # processes seen for the first time only set their baseline.
+                    used = sum(rows[p][2] - prev[p] for p in pids if p in rows and p in prev)
+                    s[g + "_cpu_pct"] = max(0.0, used / (now - prev_t) * 100)
+            prev = {p: r[2] for p, r in rows.items()}
             prev_t = now
             if self.fp_every and n % self.fp_every == 0:
                 self.fps.append({"t": now - self.t0, **footprint_groups(groups)})
