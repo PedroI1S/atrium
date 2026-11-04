@@ -26,6 +26,10 @@ objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSWorkspace", "NSAcc
 objc2-foundation = { version = "0.3", features = ["NSNotification", "NSOperation", "block2"] }
 block2 = "0.6"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already in the tree through Tauri; used by the WebKitGTK diagnostics in src/linux.rs.
+gtk = "0.18"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark driver for the M0-07 stream-perf spike (macOS).
+"""Benchmark driver for the M0-07 stream-perf spike (macOS and Linux/WebKitGTK).
 
   scripts/bench.py build                          build the daemon, the frontend and the release .app
   scripts/bench.py micro                          in-webview decode and markdown microbenchmarks
@@ -11,14 +11,27 @@
 
 Common: --encoding E --batch-ms N --chunk-chars N --label NAME --typing synthetic|none
 Every run writes its full JSON report to measurements/<label>.json. Method: docs/spikes/M0-07-stream-perf.md.
+
+Linux: the app is executed directly; WebKitGTK's processes are its descendants, so groups come from
+the process tree (WebKitWebProcess -> webcontent, any other descendant outside the daemon's tree ->
+webkit_other). The `*_footprint_mb` keys then hold PSS from smaps_rollup (the report's
+host.memory_metric says which), DRM GPU memory is added as `gpu_drm_mb`, and CPU comes from
+/proc/<pid>/stat. Method: D-037 and docs/spikes/M0-linux-checks.md.
 """
 import argparse, atexit, ctypes, fcntl, json, os, re, signal, statistics, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPIKE = os.path.dirname(HERE)
 ROOT = os.path.abspath(os.path.join(SPIKE, "..", ".."))
-APP = os.path.join(SPIKE, "src-tauri/target/release/bundle/macos/Atrium Stream Perf.app")
-BIN = os.path.join(APP, "Contents/MacOS/atrium-stream-perf")
+LINUX = sys.platform.startswith("linux")
+if LINUX:
+    sys.path.insert(0, os.path.dirname(SPIKE))
+    import linuxproc
+    APP = None
+    BIN = os.path.join(SPIKE, "src-tauri/target/release/atrium-stream-perf")
+else:
+    APP = os.path.join(SPIKE, "src-tauri/target/release/bundle/macos/Atrium Stream Perf.app")
+    BIN = os.path.join(APP, "Contents/MacOS/atrium-stream-perf")
 DAEMON_BUILT = os.path.join(ROOT, "target/release/spike-daemon")
 # The app spawns the daemon, and macOS blocks (TCC) a process started by an app from running a binary
 # under ~/Documents until the user answers a prompt, so the daemon and its fake agent run from a copy.
@@ -40,7 +53,7 @@ def sh(cmd, cwd=None, env=None):
 def build(_a=None):
     sh(["cargo", "build", "--release", "-p", "spike-daemon-socket", "--bins"], cwd=ROOT)
     sh(["pnpm", "install", "--frozen-lockfile"], cwd=SPIKE)
-    sh(["pnpm", "tauri", "build", "--bundles", "app"], cwd=SPIKE)
+    sh(["pnpm", "tauri", "build"] + (["--no-bundle"] if LINUX else ["--bundles", "app"]), cwd=SPIKE)
     if not os.path.exists(BIN):
         sys.exit(f"expected {BIN}")
 
@@ -49,6 +62,8 @@ def build(_a=None):
 
 
 def ps_table():
+    if LINUX:  # /proc gives CPU time in clock ticks; procps `ps -o time` only has 1 s resolution
+        return linuxproc.ps_rows()
     out = subprocess.check_output(["ps", "-axo", "pid=,ppid=,rss=,time=,command="], text=True)
     rows = {}
     for line in out.splitlines():
@@ -67,6 +82,9 @@ def cpu_seconds(t):
 
 
 def footprint_mb(pid):
+    if LINUX:  # PSS (see the module docstring)
+        m = linuxproc.mem_kb(pid)
+        return None if m is None else m["pss"] / 1024
     try:
         out = subprocess.check_output(["footprint", "-p", str(pid), "--noCategories"], text=True, stderr=subprocess.DEVNULL)
     except Exception:
@@ -109,12 +127,19 @@ class Procs:
         rows = ps_table()
         groups = {"app": [self.app] if self.app in rows else [], "webcontent": [], "webkit_other": [], "daemon": [], "agents": []}
         for pid, (ppid, rss, cpu, cmd) in rows.items():
-            if "com.apple.WebKit" in cmd and self.resp and self.resp(pid) == self.app:
+            if not LINUX and "com.apple.WebKit" in cmd and self.resp and self.resp(pid) == self.app:
                 (groups["webcontent"] if "WebContent" in cmd else groups["webkit_other"]).append(pid)
             elif f"--dir {self.dir}" in cmd and "spike-daemon" in cmd:
                 groups["daemon"].append(pid)
         for d in groups["daemon"]:
             groups["agents"] += descendants(rows, d)
+        if LINUX:  # every other descendant of the app is WebKit's (or its sandbox helpers)
+            daemon_tree = set(groups["daemon"]) | set(groups["agents"])
+            for pid in descendants(rows, self.app):
+                if pid in daemon_tree:
+                    continue
+                webcontent = os.path.basename(rows[pid][3].split(" ", 1)[0]) == "WebKitWebProcess"
+                (groups["webcontent"] if webcontent else groups["webkit_other"]).append(pid)
         return rows, groups
 
 
@@ -158,6 +183,9 @@ def footprint_groups(groups):
         res[g + "_footprint_mb"] = None if any(v is None for v in vals) else sum(vals)
     parts = [v for v in res.values() if v is not None]
     res["total_footprint_mb"] = sum(parts) if len(parts) == 5 else None
+    if LINUX:  # GPU buffers of the app and WebKit, not part of PSS and not in the total
+        gpu = linuxproc.gpu_kb(groups["app"] + groups["webcontent"] + groups["webkit_other"])
+        res["gpu_drm_mb"] = None if gpu is None else gpu["total"] / 1024
     return res
 
 
@@ -200,6 +228,8 @@ def kill_tree(pid):
             os.kill(p, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    if pid in POPENS:
+        POPENS.pop(pid).wait(timeout=5)
 
 
 def cleanup_dir(dirpath):
@@ -210,7 +240,16 @@ def cleanup_dir(dirpath):
     subprocess.call(["rm", "-rf", dirpath])
 
 
+POPENS = {}  # Linux: pid -> Popen, so an exited app is reaped and seen as gone (not a zombie in /proc)
+
+
 def launch(scenario, out_path, dirpath):
+    if LINUX:  # direct exec: the app is its own process and WebKit's processes are its descendants
+        env = dict(os.environ, ATRIUM_BENCH=json.dumps(scenario), ATRIUM_BENCH_OUT=out_path, ATRIUM_BENCH_DIR=dirpath, ATRIUM_DAEMON_EXE=DAEMON)
+        with open(out_path + ".log", "w") as log:
+            p = subprocess.Popen([BIN], env=env, stdout=log, stderr=subprocess.STDOUT)
+        POPENS[p.pid] = p
+        return p.pid
     cmd = ["open", "-n", "--env", f"ATRIUM_BENCH={json.dumps(scenario)}", "--env", f"ATRIUM_BENCH_OUT={out_path}",
            "--env", f"ATRIUM_BENCH_DIR={dirpath}", "--env", f"ATRIUM_DAEMON_EXE={DAEMON}", APP]
     before = {p for p, (_a, _b, _c, cmd_) in ps_table().items() if cmd_.startswith(BIN)}
@@ -223,7 +262,15 @@ def launch(scenario, out_path, dirpath):
     sys.exit("could not identify the launched app")
 
 
+def app_gone(pid):
+    if pid in POPENS:
+        return POPENS[pid].poll() is not None
+    return pid not in ps_table()
+
+
 def host_info():
+    if LINUX:
+        return {**linuxproc.host_info(), "memory_metric": "PSS (smaps_rollup) in *_footprint_mb; GPU in gpu_drm_mb"}
     def q(*a):
         return subprocess.check_output(a, text=True).strip()
     return {
@@ -343,7 +390,8 @@ def _run_locked(sc, label, hold_s=0, fp_every=0, timeout=None, quiet=None):
     pid = launch(sc, out_path, dirpath)
     LAUNCHED["pids"].add(pid)
     # Another window on top hides this one and WebKit stops running rAF; ask for the foreground.
-    subprocess.call(["osascript", "-e", 'tell application id "dev.atrium.stream-perf" to activate'], stderr=subprocess.DEVNULL)
+    if not LINUX:  # GNOME/Wayland doesn't let a client raise itself; the page's hidden-window evidence still applies
+        subprocess.call(["osascript", "-e", 'tell application id "dev.atrium.stream-perf" to activate'], stderr=subprocess.DEVNULL)
     if resp and resp(pid) != pid:
         kill_tree(pid)
         sys.exit(f"app pid {pid} is not its own responsible process; memory attribution would be ambiguous")
@@ -377,7 +425,7 @@ def _run_locked(sc, label, hold_s=0, fp_every=0, timeout=None, quiet=None):
                 raise HiddenWindow("progress snapshots say document.hidden (another window covers the app); aborting early")
             if time.time() - t_start > timeout:
                 raise TimeoutError(f"no report after {timeout:.0f}s")
-            if pid not in ps_table():
+            if app_gone(pid):
                 raise RuntimeError("app exited without a report")
             time.sleep(0.25)
         time.sleep(0.2)
@@ -488,9 +536,9 @@ def cmd_memory(a):
     print(fmt(r))
     print("transcript:", r["transcript"])
     for p in r["resources"]["after_report"]:
-        print("after", p["after_s"], "s:", {k: (round(v, 1) if isinstance(v, float) else v) for k, v in p.items() if k.endswith("footprint_mb")})
+        print("after", p["after_s"], "s:", {k: (round(v, 1) if isinstance(v, float) else v) for k, v in p.items() if k.endswith(("footprint_mb", "gpu_drm_mb"))})
     for p in r["resources"]["footprint_series"]:
-        print("during t=%.0f:" % p["t"], {k: (round(v, 1) if isinstance(v, float) else v) for k, v in p.items() if k.endswith("footprint_mb")})
+        print("during t=%.0f:" % p["t"], {k: (round(v, 1) if isinstance(v, float) else v) for k, v in p.items() if k.endswith(("footprint_mb", "gpu_drm_mb"))})
     return r
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measurement harness for the layout-B UI shell (macOS).
+"""Measurement harness for the layout-B UI shell (macOS and Linux/WebKitGTK).
 
   scripts/measure.py cold   [--runs 10] [--bin PATH]  time to interactive + first paint
   scripts/measure.py coldmatrix [--runs 10]          cold, all six configurations interleaved
@@ -9,6 +9,14 @@
 
   --windows 1|3                main only, or main + editor and database pop-outs
   --opacity off|background|whole  alpha 1, or 0.6 in background or whole-window mode
+  --warmup N                   cold modes: N unrecorded launches first (warm page cache)
+  --trace S                    rss, Linux: also sample total PSS at 1 Hz for S seconds after ready
+  --hz HZ                      frames: the display's refresh rate; each section is checked against it
+
+Linux: the memory metric is PSS (smaps_rollup) summed over the app and all its descendants, GPU
+memory (DRM fdinfo) is reported separately, and translucency is unsupported, so every window must
+apply alpha 1 whatever opacity was requested (the opaque Linux mode). Method: D-037 and
+docs/spikes/M0-linux-checks.md. Run under `flock /tmp/atrium-gui-measure.lock`.
 
 Method: docs/spikes/M0-06b-ui-shell-layout-b.md ("Measurements"). Every failure is reported with
 the app's stage and the tail of its stderr, and the run fails fast (review #2): a dead process,
@@ -17,7 +25,13 @@ successful run is `SUMMARY {json}`, which scripts/summarize.py turns into the re
 """
 import argparse, ctypes, json, os, re, signal, statistics, subprocess, sys, tempfile, time
 
-DEFAULT_BIN = "src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell"
+LINUX = sys.platform.startswith("linux")
+if LINUX:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    import linuxproc
+
+DEFAULT_BIN = ("src-tauri/target/release/atrium-ui-shell" if LINUX else
+               "src-tauri/target/release/bundle/macos/Atrium UI Shell.app/Contents/MacOS/atrium-ui-shell")
 
 # Every launch pins the state the app starts in (theme, opacity, windows); the app never reads
 # or writes the user's settings file in a harness run. Printed with every result.
@@ -32,6 +46,9 @@ class HarnessError(Exception):
 
 def print_config(binary):
     print("config: " + " ".join(f"{k}={v}" for k, v in CONFIG.items()) + f"  bin={binary}")
+    if LINUX:
+        print("host: " + linuxproc.host_line())
+        return
     print(f"host: macOS {subprocess.check_output(['sw_vers', '-productVersion'], text=True).strip()}, "
           f"{subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True).strip()}")
 
@@ -77,24 +94,26 @@ def expected_windows():
     return ["main"] if CONFIG["ATRIUM_WINDOWS"] == "1" else ["main", "view-database", "view-editor"]
 
 
-def validate_report(r):
-    """Checks the real ready count and every window's applied appearance (review #3)."""
+def validate_report(r, translucency=not LINUX):
+    """Checks the real ready count and every window's applied appearance (review #3). Without
+    translucency (Linux) the requested settings are kept but every window must apply alpha 1."""
     c = r["configuration"]
     per = c["perWindow"]
     want = expected_windows()
     if sorted(per) != want:
         raise HarnessError(f"ready windows {sorted(per)} != expected {want}")
     opacity = CONFIG["ATRIUM_OPACITY"]
+    applied = opacity if translucency else "off"
     for label, w in per.items():
         s = w["settings"]
         checks = {
             "theme": (w["theme"], CONFIG["ATRIUM_THEME"]),
             "settings.alpha": (s["alpha"], 1 if opacity == "off" else ALPHA),
             "settings.mode": (s["mode"], "whole" if opacity == "whole" else "background"),
-            "chromeAlpha": (w["chromeAlpha"], ALPHA if opacity == "background" else 1),
-            "contentAlpha": (w["contentAlpha"], CONTENT_ALPHA if opacity == "background" else 1),
-            "nativeAlpha": (w["nativeAlpha"], ALPHA if opacity == "whole" else 1),
-            "vibrancy": (w["vibrancy"], opacity == "background"),
+            "chromeAlpha": (w["chromeAlpha"], ALPHA if applied == "background" else 1),
+            "contentAlpha": (w["contentAlpha"], CONTENT_ALPHA if applied == "background" else 1),
+            "nativeAlpha": (w["nativeAlpha"], ALPHA if applied == "whole" else 1),
+            "vibrancy": (w["vibrancy"], applied == "background"),
             "error": (w["error"], ""),
             "accessibilityOpaque": (w["accessibilityOpaque"], False),
         }
@@ -172,8 +191,17 @@ def cold_summary(rows, load):
             all_windows_median=med([r["all_windows_ready"] for r in rows]), all_windows_worst=max(r["all_windows_ready"] for r in rows), load=load)
 
 
+def warmup(a, run_once):
+    """Unrecorded launches that bring the binary and WebKit into the page cache ("warm", D-037)."""
+    for i in range(getattr(a, "warmup", 0)):
+        r = run_once()
+        print(f"warm-up {i+1} (not recorded): tti={r['tti']:6.1f}")
+        time.sleep(0.5)
+
+
 def cold(a):
     print_config(a.bin)
+    warmup(a, lambda: cold_once(a.bin))
     load0 = os.getloadavg()[0]
     rows = []
     for i in range(a.runs):
@@ -193,6 +221,7 @@ def coldmatrix(a, run_once=None, pause=0.3):
     still get their summaries (review 2 #6). Raises at the end if any configuration failed."""
     run_once = run_once or (lambda: cold_once(a.bin))
     print_config(a.bin)
+    warmup(a, run_once)
     rows = {c: [] for c in COLD_CONFIGS}
     failures = {}
     loads = []
@@ -324,7 +353,81 @@ def pid_alive(pid):
     return check
 
 
+LINUX_HELPERS = {"WebKitWebProcess", "WebKitNetworkProcess"}
+
+
+def linux_snapshot(app_pid, label, quiet=False):
+    """PSS of the app and every descendant (WebKit's processes and any sandbox helpers), plus DRM GPU
+    memory reported apart. Refuses an incomplete picture: an unreadable process or a missing helper."""
+    rows = linuxproc.ps_rows()
+    pids = [app_pid] + linuxproc.descendants(rows, app_pid)
+    mems, bad = {}, []
+    for pid in pids:
+        m = linuxproc.mem_kb(pid)
+        if m is None:
+            bad.append(pid)
+        mems[pid] = m
+    names = {pid: linuxproc.proc_name(pid) for pid in pids}
+    missing = LINUX_HELPERS - set(names.values())
+    if bad or missing:
+        raise HarnessError(f"incomplete snapshot: unreadable smaps_rollup for pids {bad}; missing helpers {sorted(missing)}")
+    gpu = linuxproc.gpu_kb(pids)
+    total = {k: sum(m[k] for m in mems.values()) / 1024 for k in ("pss", "rss", "uss")}
+    if not quiet:
+        print(f"{label}:")
+        for pid in pids:
+            m = mems[pid]
+            print(f"  pid {pid:7d}  ppid {rows.get(pid, (0,))[0]:7d}  pss {m['pss']/1024:7.1f} MB  uss {m['uss']/1024:7.1f} MB  rss {m['rss']/1024:7.1f} MB  {names[pid]}")
+        gtxt = "none (no DRM client)" if gpu is None else f"total {gpu['total']/1024:.1f} MB, resident {gpu['resident']/1024:.1f} MB"
+        print(f"  TOTAL pss {total['pss']:.1f} MB   uss {total['uss']:.1f} MB   rss {total['rss']:.1f} MB   "
+              f"({len(pids)} processes, {list(names.values()).count('WebKitWebProcess')} WebKitWebProcess)   GPU (DRM fdinfo, not in PSS): {gtxt}")
+    return total, (None if gpu is None else gpu["total"] / 1024)
+
+
+def rss_linux(a):
+    print_config(a.bin)
+    tmp = tempfile.mkdtemp(prefix="atrium-rss-")
+    out, log = os.path.join(tmp, "report.json"), os.path.join(tmp, "app.log")
+    p, _ = launch(a.bin, {"ATRIUM_BENCH": "startup", "ATRIUM_BENCH_OUT": out}, log)
+    trace = []
+    try:
+        validate_report(wait_report(out, p.poll, log, timeout=40))
+        t_ready = time.time()
+        marks = {a.settle: None, a.settle + 20: None}
+        end = max(a.settle + 20, a.trace)
+        tick = 0
+        while tick <= end:  # 1 Hz from ready; the two report snapshots land on their seconds
+            time.sleep(max(0.0, t_ready + tick - time.time()))
+            if tick in marks:
+                marks[tick] = linux_snapshot(p.pid, f"idle {tick} s after ready")
+                m, g = marks[tick]
+            elif a.trace and tick <= a.trace:
+                m, g = linux_snapshot(p.pid, "", quiet=True)
+            else:
+                tick += 1
+                continue
+            if a.trace and tick <= a.trace:
+                trace.append({"t": round(time.time() - t_ready, 1), "pss": round(m["pss"], 1), "gpu": None if g is None else round(g, 1)})
+            tick += 1
+        (m1, g1), (m2, g2) = marks[a.settle], marks[a.settle + 20]
+    finally:
+        stop(p)
+    extra = {}
+    if trace:
+        xs = [s["pss"] for s in trace]
+        path = os.path.join(tmp, "pss-trace.json")
+        with open(path, "w") as f:
+            json.dump(trace, f)
+        print(f"PSS trace, {len(trace)} samples over {trace[-1]['t']:.0f} s: min {min(xs):.1f}  median {med(xs):.1f}  max {max(xs):.1f} MB  ({path})")
+        extra = {"trace_s": a.trace, "trace_pss_min": min(xs), "trace_pss_median": med(xs), "trace_pss_max": max(xs), "trace_file": path}
+    summary("rss", metric_memory="pss", load=round(os.getloadavg()[0], 1), pss=[round(m1["pss"], 1), round(m2["pss"], 1)],
+            uss=[round(m1["uss"], 1), round(m2["uss"], 1)], rss=[round(m1["rss"], 1), round(m2["rss"], 1)],
+            gpu_drm=[g1 if g1 is None else round(g1, 1), g2 if g2 is None else round(g2, 1)], pss_max=max(m1["pss"], m2["pss"]), **extra)
+
+
 def rss(a):
+    if LINUX:
+        return rss_linux(a)
     print_config(a.bin)
     resp = responsible_pid_fn()
     if resp is None:
@@ -359,6 +462,11 @@ def frames(a):
             stop(p)
         runs.append(r)
         print(f"--- run {i+1}  (dpr {r['dpr']}, viewport {r['viewport']})")
+        if LINUX:  # which monitor each window landed on, and WebKitGTK's 60 fps pacing (src/linux.rs)
+            with open(log, errors="replace") as f:
+                for line in f:
+                    if line.startswith("linux-display "):
+                        print("   " + line.rstrip())
         for k in ("idleFrames", "scrollReading", "scrollFling", "resize"):
             s = r[k]
             extra = f"  dist {s['distancePx']} px" if "distancePx" in s else ""
@@ -372,10 +480,31 @@ def frames(a):
             print(f"{k:14s} {s['fps']:6.1f} fps  mean {s['meanMs']:5.2f}  p50 {s['p50Ms']:5.2f}  p95 {s['p95Ms']:5.2f}  p99 {s['p99Ms']:5.2f}  max {s['maxMs']:6.2f} ms  >16.7ms {s['over16_7ms']}/{s['frames']}  >25ms {s['over25ms']}{extra}")
         time.sleep(0.5)
     def agg(k):
-        return {"fps_median": med([r[k]["fps"] for r in runs]), "fps_worst": min(r[k]["fps"] for r in runs),
-                "p95_median": med([r[k]["p95Ms"] for r in runs]), "p99_worst": max(r[k]["p99Ms"] for r in runs),
-                "max_worst": max(r[k]["maxMs"] for r in runs), "over25_total": sum(r[k]["over25ms"] for r in runs)}
-    summary("frames", load=round(os.getloadavg()[0], 1), runs=len(runs), **{k: agg(k) for k in ("idleFrames", "scrollReading", "scrollFling", "resize")})
+        res = {"fps_median": med([r[k]["fps"] for r in runs]), "fps_worst": min(r[k]["fps"] for r in runs),
+               "p95_median": med([r[k]["p95Ms"] for r in runs]), "p99_worst": max(r[k]["p99Ms"] for r in runs),
+               "max_worst": max(r[k]["maxMs"] for r in runs), "over25_total": sum(r[k]["over25ms"] for r in runs)}
+        if a.hz:
+            res.update(display_check(runs, k, a.hz))
+        return res
+    sections = ("idleFrames", "scrollReading", "scrollFling", "resize")
+    aggs = {k: agg(k) for k in sections}
+    if a.hz:
+        for k in sections:
+            c = aggs[k]
+            print(f"{k:14s} vs {a.hz} Hz: {'PASS' if c['pass'] else 'FAIL'}  worst run {c['fps_worst']:.1f} fps (need >= {c['fps_needed']:.1f}); "
+                  f"worst p99 {c['p99_worst']:.2f} ms ({'over' if c['p99_over_2_intervals'] else 'within'} 2 frame intervals = {2000 / a.hz:.1f} ms)")
+    summary("frames", load=round(os.getloadavg()[0], 1), runs=len(runs), hz=a.hz, **aggs)
+
+
+PASS_FRACTION = 0.97  # D-037: every run's fps at least 97% of the display's refresh rate
+
+
+def display_check(runs, k, hz):
+    """D-037's smoothness rule for one section: every run reaches 97% of the refresh rate; a p99 above
+    two frame intervals is flagged but doesn't fail the check."""
+    need = PASS_FRACTION * hz
+    return {"fps_needed": need, "pass": all(r[k]["fps"] >= need for r in runs),
+            "p99_over_2_intervals": max(r[k]["p99Ms"] for r in runs) > 2000 / hz}
 
 
 def roundtrip(a):
@@ -417,6 +546,9 @@ if __name__ == "__main__":
     ap.add_argument("--theme", default=None, help="starting theme (default atrium-calm-dark)")
     ap.add_argument("--windows", type=int, choices=[1, 3], default=1)
     ap.add_argument("--opacity", choices=["off", "background", "whole"], default="off")
+    ap.add_argument("--warmup", type=int, default=0, help="cold modes: unrecorded launches first")
+    ap.add_argument("--trace", type=int, default=0, help="rss (Linux): 1 Hz PSS trace for this many seconds after ready")
+    ap.add_argument("--hz", type=float, default=None, help="frames: display refresh rate to check against")
     a = ap.parse_args()
     CONFIG["ATRIUM_WINDOWS"] = str(a.windows)
     CONFIG["ATRIUM_OPACITY"] = a.opacity

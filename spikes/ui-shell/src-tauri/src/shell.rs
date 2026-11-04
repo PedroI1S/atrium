@@ -415,7 +415,10 @@ pub fn build_popout(app: &tauri::AppHandle, view: &str, theme: Option<tauri::The
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
         .traffic_light_position(tauri::LogicalPosition::new(POPOUT_TRAFFIC_LIGHTS.0, POPOUT_TRAFFIC_LIGHTS.1));
-    builder.build()
+    let window = builder.build()?;
+    #[cfg(target_os = "linux")]
+    let _ = window.with_webview(crate::linux::configure);
+    Ok(window)
 }
 
 /// Moves `view` into its own window (or focuses it if it already is).
@@ -484,6 +487,12 @@ pub struct Ready(pub Mutex<BTreeMap<String, Value>>);
 
 #[tauri::command]
 pub fn window_ready(window: WebviewWindow, ready: State<'_, Ready>, applied: Value) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        // Picked up by measure.py into the run log (which monitor, which pacing).
+        let label = window.label().to_string();
+        let _ = window.with_webview(move |w| println!("linux-display {label}: {}", crate::linux::describe(&w)));
+    }
     let mut states = ready.0.lock().unwrap();
     states.insert(window.label().to_string(), applied);
     states.len()

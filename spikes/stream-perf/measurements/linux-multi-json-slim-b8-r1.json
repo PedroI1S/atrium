@@ -1,0 +1,875 @@
+{
+ "scenario": {
+  "threads": 10,
+  "tokensPerSecond": 1000,
+  "chunkChars": 4,
+  "durationMs": 60000,
+  "toolCallEveryMs": 4000,
+  "encoding": "json-slim",
+  "batchMs": 8,
+  "ackIntervalMs": 30,
+  "name": "multi",
+  "typing": "synthetic",
+  "typingIntervalMs": 120,
+  "typingStartMs": 3000,
+  "idleTypingMs": 4000,
+  "baselineMs": 1500,
+  "endMode": "ended",
+  "hold": false
+ },
+ "timedOut": false,
+ "host": {
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15",
+  "dpr": 1,
+  "viewport": [
+   1200,
+   800
+  ],
+  "os": "CachyOS",
+  "kernel": "7.3.0-4-cachyos",
+  "cpu": "Intel(R) Core(TM) Ultra 7 258V",
+  "cores": 8,
+  "webkit2gtk": "2.54.2",
+  "mesa": "3:26.2.5-1",
+  "session": "wayland",
+  "desktop": "GNOME",
+  "compositor": "GNOME Shell 51.1",
+  "monitors": [
+   "eDP-1 2560x1440@59.961",
+   "HDMI-1 2560x1440@143.991"
+  ],
+  "power_profile": "balanced",
+  "on_ac": false,
+  "webkit_env": {},
+  "loadavg_at_start": [
+   2.4521484375,
+   1.60693359375,
+   0.83056640625
+  ],
+  "memory_metric": "PSS (smaps_rollup) in *_footprint_mb; GPU in gpu_drm_mb",
+  "loadavg_at_end": [
+   2.54736328125,
+   1.80517578125,
+   0.95263671875
+  ]
+ },
+ "refreshMs": 16.67,
+ "visibility": {
+  "streamStartRelMs": 4707,
+  "streamEndRelMs": 65448,
+  "changes": [],
+  "hiddenAtEnd": false,
+  "focusAtEnd": true
+ },
+ "baseline": {
+  "n": 257,
+  "mean": 16.67,
+  "p50": 17,
+  "p95": 17,
+  "p99": 18,
+  "max": 18,
+  "frames": 257,
+  "seconds": 4.28,
+  "fps": 60,
+  "refreshMs": 16.67,
+  "slowFrames": 0,
+  "droppedFrames": 0,
+  "over25ms": 0,
+  "worst": [
+   18,
+   18,
+   18,
+   18,
+   18,
+   18,
+   18,
+   17
+  ]
+ },
+ "frames": {
+  "n": 3627,
+  "mean": 16.66,
+  "p50": 17,
+  "p95": 18,
+  "p99": 19,
+  "max": 22,
+  "frames": 3627,
+  "seconds": 60.43,
+  "fps": 60.02,
+  "refreshMs": 16.67,
+  "slowFrames": 0,
+  "droppedFrames": 0,
+  "over25ms": 0,
+  "worst": [
+   22,
+   21,
+   20,
+   20,
+   20,
+   19,
+   19,
+   19
+  ]
+ },
+ "renderWork": {
+  "n": 3628,
+  "mean": 0.97,
+  "p50": 1,
+  "p95": 2,
+  "p99": 2,
+  "max": 9
+ },
+ "applyMs": {
+  "n": 3602,
+  "mean": 0.74,
+  "p50": 1,
+  "p95": 1,
+  "p99": 2,
+  "max": 24
+ },
+ "latency": {
+  "n": 59999,
+  "mean": 29.56,
+  "p50": 30,
+  "p95": 38,
+  "p99": 41,
+  "max": 56
+ },
+ "ipc": {
+  "n": 600322,
+  "mean": 0.17,
+  "p50": 0,
+  "p95": 1,
+  "p99": 2,
+  "max": 26.1
+ },
+ "queueWait": {
+  "n": 600322,
+  "mean": 8.24,
+  "p50": 8,
+  "p95": 15,
+  "p99": 16,
+  "max": 23
+ },
+ "commit": {
+  "n": 3602,
+  "mean": 16.67,
+  "p50": 17,
+  "p95": 18,
+  "p99": 19,
+  "max": 33
+ },
+ "decode": {
+  "totalMs": 122,
+  "perBatchMs": 0.02,
+  "batches": 7504
+ },
+ "pipeline": {
+  "batchesReceived": 7504,
+  "eventsReceived": 600322,
+  "eventsApplied": 600322,
+  "duplicatesDropped": 0,
+  "framesWithWork": 3602,
+  "maxQueue": 4,
+  "seqGaps": 0,
+  "streamSeconds": 60.51
+ },
+ "transcript": {
+  "visibleThread": 0,
+  "visibleRows": 1615,
+  "visibleChars": 239996,
+  "totalChars": 2399968,
+  "totalTokensApprox": 599992,
+  "events": [
+   60032,
+   60032,
+   60032,
+   60033,
+   60032,
+   60032,
+   60033,
+   60032,
+   60032,
+   60032
+  ],
+  "completedMismatch": 0,
+  "domNodes": 166,
+  "followingTail": 0
+ },
+ "typing": {
+  "idle": {
+   "keys": 33,
+   "inputs": 33,
+   "timerLatenessMs": {
+    "n": 33,
+    "mean": 1.16,
+    "p50": 0.98,
+    "p95": 2.41,
+    "p99": 3.48,
+    "max": 3.97
+   },
+   "handlerMs": {
+    "n": 33,
+    "mean": 1.11,
+    "p50": 0.98,
+    "p95": 2.41,
+    "p99": 3.48,
+    "max": 3.97
+   },
+   "frameMs": {
+    "n": 33,
+    "mean": 10.05,
+    "p50": 11.98,
+    "p95": 15.81,
+    "p99": 16.59,
+    "max": 16.6
+   },
+   "paintMs": {
+    "n": 33,
+    "mean": 26.29,
+    "p50": 27.98,
+    "p95": 31.81,
+    "p99": 32.59,
+    "max": 33.6
+   }
+  },
+  "streaming": {
+   "keys": 476,
+   "inputs": 476,
+   "timerLatenessMs": {
+    "n": 476,
+    "mean": 2.07,
+    "p50": 2.09,
+    "p95": 3.87,
+    "p99": 3.97,
+    "max": 4.34
+   },
+   "handlerMs": {
+    "n": 476,
+    "mean": 2.07,
+    "p50": 2.11,
+    "p95": 3.88,
+    "p99": 3.97,
+    "max": 4.67
+   },
+   "frameMs": {
+    "n": 477,
+    "mean": 10.86,
+    "p50": 10.94,
+    "p95": 18.89,
+    "p99": 19.7,
+    "max": 20.67
+   },
+   "paintMs": {
+    "n": 477,
+    "mean": 27.93,
+    "p50": 27.9,
+    "p95": 35.39,
+    "p99": 36.97,
+    "max": 37.67
+   }
+  },
+  "typed": 476,
+  "textareaLength": 476
+ },
+ "bridge": {
+  "events": 600322,
+  "deltas": 599992,
+  "chars": 2399968,
+  "tokensApprox": 599992,
+  "spanSeconds": 60.39,
+  "eventsPerSecond": 9940.56,
+  "tokensPerSecondApprox": 9935.09,
+  "batches": 7504,
+  "bytes": 45450487,
+  "bytesPerEvent": 75.71,
+  "batchEventsP50": 80,
+  "batchEventsMax": 106,
+  "encodeUs": {
+   "p50": 14,
+   "p99": 39,
+   "max": 1279,
+   "totalMs": 116.31
+  },
+  "agentToBridgeMs": {
+   "p50": 0,
+   "p95": 1,
+   "p99": 1,
+   "max": 387
+  },
+  "batchingMs": {
+   "p50": 4,
+   "p95": 7,
+   "p99": 8,
+   "max": 8
+  },
+  "backpressureWaits": 0,
+  "backpressureMs": 0,
+  "maxInFlightBytes": 1974176,
+  "acks": 1997,
+  "duplicatesDropped": 0
+ },
+ "timeline": {
+  "streamStartEpochMs": 1793565421238,
+  "streamEndEpochMs": 1793565481750,
+  "reportEpochMs": 1793565482054
+ },
+ "resources": {
+  "cpu_pct_during_stream": {
+   "app": {
+    "mean": 20.832089458277974,
+    "max": 23.378404690948816
+   },
+   "webcontent": {
+    "mean": 31.03875924571499,
+    "max": 36.04170723187943
+   },
+   "webkit_other": {
+    "mean": 0.0,
+    "max": 0.0
+   },
+   "daemon": {
+    "mean": 105.37926115742052,
+    "max": 200.07183605948754
+   },
+   "agents": {
+    "mean": 15.245946077493828,
+    "max": 20.63449966476112
+   }
+  },
+  "peak_rss_mb": {
+   "app": 176.8515625,
+   "webcontent": 328.09375,
+   "webkit_other": 87.46484375,
+   "daemon": 101.078125,
+   "agents": 36.58203125
+  },
+  "footprint_series": [],
+  "after_report": [],
+  "rss_series_1hz": [
+   {
+    "t": 0.0,
+    "app_rss_mb": 40.5,
+    "webcontent_rss_mb": 0.0,
+    "webkit_other_rss_mb": 0.0,
+    "daemon_rss_mb": 0.0,
+    "agents_rss_mb": 0.0
+   },
+   {
+    "t": 1.1,
+    "app_rss_mb": 159.7,
+    "webcontent_rss_mb": 200.6,
+    "webkit_other_rss_mb": 87.4,
+    "daemon_rss_mb": 0.0,
+    "agents_rss_mb": 0.0
+   },
+   {
+    "t": 2.1,
+    "app_rss_mb": 158.4,
+    "webcontent_rss_mb": 200.8,
+    "webkit_other_rss_mb": 87.4,
+    "daemon_rss_mb": 0.0,
+    "agents_rss_mb": 0.0
+   },
+   {
+    "t": 3.1,
+    "app_rss_mb": 158.4,
+    "webcontent_rss_mb": 205.2,
+    "webkit_other_rss_mb": 87.4,
+    "daemon_rss_mb": 0.0,
+    "agents_rss_mb": 0.0
+   },
+   {
+    "t": 4.1,
+    "app_rss_mb": 158.4,
+    "webcontent_rss_mb": 205.8,
+    "webkit_other_rss_mb": 87.4,
+    "daemon_rss_mb": 0.0,
+    "agents_rss_mb": 0.0
+   },
+   {
+    "t": 5.2,
+    "app_rss_mb": 172.8,
+    "webcontent_rss_mb": 225.2,
+    "webkit_other_rss_mb": 87.4,
+    "daemon_rss_mb": 7.6,
+    "agents_rss_mb": 33.0
+   },
+   {
+    "t": 6.2,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 243.5,
+    "webkit_other_rss_mb": 87.4,
+    "daemon_rss_mb": 9.4,
+    "agents_rss_mb": 33.1
+   },
+   {
+    "t": 7.2,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 246.1,
+    "webkit_other_rss_mb": 87.4,
+    "daemon_rss_mb": 9.5,
+    "agents_rss_mb": 33.1
+   },
+   {
+    "t": 8.3,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 250.6,
+    "webkit_other_rss_mb": 87.4,
+    "daemon_rss_mb": 9.5,
+    "agents_rss_mb": 33.2
+   },
+   {
+    "t": 9.3,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 254.9,
+    "webkit_other_rss_mb": 87.4,
+    "daemon_rss_mb": 9.5,
+    "agents_rss_mb": 33.2
+   },
+   {
+    "t": 10.3,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 261.8,
+    "webkit_other_rss_mb": 87.4,
+    "daemon_rss_mb": 9.6,
+    "agents_rss_mb": 33.3
+   },
+   {
+    "t": 11.3,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 267.8,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.6,
+    "agents_rss_mb": 33.3
+   },
+   {
+    "t": 12.4,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 272.7,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.6,
+    "agents_rss_mb": 33.3
+   },
+   {
+    "t": 13.4,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 276.2,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.6,
+    "agents_rss_mb": 33.4
+   },
+   {
+    "t": 14.4,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 279.9,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.6,
+    "agents_rss_mb": 33.5
+   },
+   {
+    "t": 15.4,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 283.9,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.6,
+    "agents_rss_mb": 33.5
+   },
+   {
+    "t": 16.4,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 290.2,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.6,
+    "agents_rss_mb": 33.5
+   },
+   {
+    "t": 17.4,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 296.4,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 33.6
+   },
+   {
+    "t": 18.5,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 301.5,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 33.6
+   },
+   {
+    "t": 19.5,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 305.8,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 33.7
+   },
+   {
+    "t": 20.5,
+    "app_rss_mb": 172.5,
+    "webcontent_rss_mb": 305.2,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 33.7
+   },
+   {
+    "t": 21.5,
+    "app_rss_mb": 172.4,
+    "webcontent_rss_mb": 296.2,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 33.7
+   },
+   {
+    "t": 22.5,
+    "app_rss_mb": 172.4,
+    "webcontent_rss_mb": 299.0,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 33.8
+   },
+   {
+    "t": 23.5,
+    "app_rss_mb": 172.4,
+    "webcontent_rss_mb": 302.8,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 33.8
+   },
+   {
+    "t": 24.6,
+    "app_rss_mb": 172.4,
+    "webcontent_rss_mb": 306.2,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 33.8
+   },
+   {
+    "t": 25.6,
+    "app_rss_mb": 172.4,
+    "webcontent_rss_mb": 311.1,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 33.9
+   },
+   {
+    "t": 26.6,
+    "app_rss_mb": 172.4,
+    "webcontent_rss_mb": 310.7,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 33.9
+   },
+   {
+    "t": 27.6,
+    "app_rss_mb": 172.4,
+    "webcontent_rss_mb": 298.5,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 34.0
+   },
+   {
+    "t": 28.6,
+    "app_rss_mb": 172.4,
+    "webcontent_rss_mb": 301.7,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 34.0
+   },
+   {
+    "t": 29.7,
+    "app_rss_mb": 172.4,
+    "webcontent_rss_mb": 307.2,
+    "webkit_other_rss_mb": 87.5,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 34.0
+   },
+   {
+    "t": 30.7,
+    "app_rss_mb": 172.4,
+    "webcontent_rss_mb": 310.2,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 34.0
+   },
+   {
+    "t": 31.7,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 313.6,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 34.1
+   },
+   {
+    "t": 32.7,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 314.1,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 34.1
+   },
+   {
+    "t": 33.7,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 300.3,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 34.2
+   },
+   {
+    "t": 34.8,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 307.5,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 34.2
+   },
+   {
+    "t": 35.8,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 307.9,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 34.2
+   },
+   {
+    "t": 36.8,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 311.1,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 34.3
+   },
+   {
+    "t": 37.8,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 314.3,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 35.6
+   },
+   {
+    "t": 38.8,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 316.3,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 35.6
+   },
+   {
+    "t": 39.8,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 303.0,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 35.6
+   },
+   {
+    "t": 40.9,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 306.4,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 35.7
+   },
+   {
+    "t": 41.9,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 314.3,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 35.7
+   },
+   {
+    "t": 42.9,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 318.4,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 35.8
+   },
+   {
+    "t": 43.9,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 320.8,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 35.8
+   },
+   {
+    "t": 44.9,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 322.6,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 35.8
+   },
+   {
+    "t": 45.9,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 308.4,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 35.9
+   },
+   {
+    "t": 47.0,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 311.6,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 35.9
+   },
+   {
+    "t": 48.0,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 315.1,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.0
+   },
+   {
+    "t": 49.0,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 318.2,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.0
+   },
+   {
+    "t": 50.0,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 321.3,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.0
+   },
+   {
+    "t": 51.0,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 304.4,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.1
+   },
+   {
+    "t": 52.1,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 308.3,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.1
+   },
+   {
+    "t": 53.1,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 313.4,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.2
+   },
+   {
+    "t": 54.1,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 317.0,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.2
+   },
+   {
+    "t": 55.1,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 320.2,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.2
+   },
+   {
+    "t": 56.1,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 323.8,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.3
+   },
+   {
+    "t": 57.2,
+    "app_rss_mb": 172.3,
+    "webcontent_rss_mb": 326.5,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.3
+   },
+   {
+    "t": 58.2,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 312.5,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.3
+   },
+   {
+    "t": 59.2,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 315.8,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.4
+   },
+   {
+    "t": 60.2,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 319.4,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.4
+   },
+   {
+    "t": 61.3,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 323.6,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.5
+   },
+   {
+    "t": 62.3,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 326.5,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.5
+   },
+   {
+    "t": 63.3,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 325.6,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.5
+   },
+   {
+    "t": 64.3,
+    "app_rss_mb": 172.2,
+    "webcontent_rss_mb": 313.2,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 9.7,
+    "agents_rss_mb": 36.6
+   },
+   {
+    "t": 65.4,
+    "app_rss_mb": 176.9,
+    "webcontent_rss_mb": 328.1,
+    "webkit_other_rss_mb": 66.6,
+    "daemon_rss_mb": 101.1,
+    "agents_rss_mb": 0.0
+   }
+  ],
+  "report_at_s": 66.02005696296692
+ },
+ "attempt": 1,
+ "anomalies": []
+}

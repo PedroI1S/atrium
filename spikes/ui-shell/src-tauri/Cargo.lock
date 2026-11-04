@@ -81,6 +81,7 @@ name = "atrium-ui-shell"
 version = "0.0.0"
 dependencies = [
  "block2",
+ "gtk",
  "objc2-app-kit",
  "objc2-foundation",
  "serde",

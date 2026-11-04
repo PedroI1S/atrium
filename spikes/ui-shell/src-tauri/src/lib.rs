@@ -2,6 +2,8 @@
 //! vibrancy, window alpha), the shared window state for pop-outs, and a small command surface
 //! for the measurement harness. All UI is in the frontend.
 
+#[cfg(target_os = "linux")]
+mod linux;
 mod shell;
 
 use std::collections::HashMap;
@@ -318,6 +320,8 @@ pub fn run() {
             if let Some(main) = app.get_webview_window(MAIN) {
                 let _ = main.set_theme(shell::native_theme(&settings));
                 apply_native(&handle, &main, &settings, false);
+                #[cfg(target_os = "linux")]
+                let _ = main.with_webview(linux::configure);
             }
             #[cfg(target_os = "macos")]
             observe_accessibility(handle.clone());

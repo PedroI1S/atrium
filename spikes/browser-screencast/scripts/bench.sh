@@ -9,7 +9,10 @@ BIN=src-tauri/target/release/atrium-browser-screencast
 mkdir -p "$OUT"
 for i in $(seq 1 "$RUNS"); do
   DATA="$(mktemp -d)"
-  env ATRIUM_BENCH=screencast ATRIUM_BENCH_OUT="$OUT/run-$i.json" ATRIUM_DATA_DIR="$DATA" "$@" "$BIN" >/dev/null 2>&1
+  # Linux: sample the process tree from /proc alongside the run (D-037), into run-<i>.proc.json.
+  WRAP=()
+  [[ "$(uname -s)" == Linux ]] && WRAP=(python3 scripts/procsample.py "$OUT/run-$i.proc.json" --)
+  env ATRIUM_BENCH=screencast ATRIUM_BENCH_OUT="$OUT/run-$i.json" ATRIUM_DATA_DIR="$DATA" "$@" ${WRAP[@]+"${WRAP[@]}"} "$BIN" >/dev/null 2>&1
   rm -rf "$DATA"
   echo "run $i -> $OUT/run-$i.json"
 done
