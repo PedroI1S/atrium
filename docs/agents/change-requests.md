@@ -74,3 +74,15 @@ The M1 contract (§4, and `crates/atrium-host/src/peer.rs` doc comments) names `
 **Why**: an undocumented symbol is an ABI and availability risk on the security-critical path.
 
 **Affected**: `docs/contracts/m1.md` §4 wording, doc comments in `crates/atrium-host/src/peer.rs` (M1-10 updates them in its fix round). **Approved by Pedro (driver), 2026-11-09 (D-052)**; applied to `docs/contracts/m1.md` §4.
+
+## CR-06 — M1-03-policy (orchestrator, from the Opus security review) — 2026-11-09
+
+Two contract-level findings from `docs/agents/reviews/M1-03-policy.md`. They change security defaults, so they need Pedro's approval (D-013). **Status: proposed.**
+
+**1. `date` guard (finding 3).** On GNU `date` (Linux, and Homebrew's coreutils on macOS), `-f FILE` prints every line of FILE in an error message. In `HOME_READONLY_COMMANDS` (`crates/atrium-protocol/src/policy.rs`), the `date` entry's `forbidden` goes from `["-s", "--set"]` to `["-s", "--set", "-f", "--file"]`. BSD `date -f fmt` would then ask too. The worker's fix (resolving every suffix of a short-flag cluster) already closes the reported bypass. This is defence in depth.
+
+**2. Remembered command rules match extra arguments (finding 12).** "Always allow `rm -rf build`" stores `CommandPrefix ["rm","-rf","build"]`, and that rule also allows `rm -rf build ~/Documents`. The options:
+- (a) remembered rules match the whole argv exactly (a new `RuleMatcher::CommandExact`), and prefix rules can only be created in the rules editor. **Recommended.**
+- (b) keep the prefix match and word the UI "commands starting with …".
+
+**Affected**: `atrium-protocol` policy (`HOME_READONLY_COMMANDS`, and `RuleMatcher` under (a)), contract §5 and §9, M1-03's engine and tables, and the M1-07/M1-08 approval UI wording.
