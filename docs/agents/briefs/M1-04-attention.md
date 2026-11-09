@@ -1,6 +1,6 @@
 # M1-04-attention: thread state machine, inbox ranking, notification policy
 
-Model: Sonnet 5.5 · Reviewer: Gemini 3.8 Flash · Depends on: contract (M1 rev 2)
+Model: Sonnet 5.5 · Reviewer: Gemini 3.8 Flash · Depends on: contract (M1 rev 3)
 Branch: `agent/sonnet/M1-04-attention` · Worktree: `../atrium-wt/M1-04-attention`
 
 ## Goal
@@ -17,7 +17,7 @@ Implement the pure functions that decide a thread's state, rank the inbox and de
 - `docs/agents/handoffs/M1-04-attention.md`
 
 ## Contract to implement
-- `attention::next_state(current, pending, input)`: every `ThreadState` × every relevant `AgentEvent` and `Signal`. `pending` is the count after the input. `NeedsApproval` beats `NeedsInput`; both return to `Running` when cleared during a turn. `Failed` and `Paused` are sticky through the closing events and exit; after `Signal::Stopped` the exit is `Ended`; an exit with a turn open or a non-zero code is `Interrupted { cleanup: Verified }`; `Signal::Recovered { cleanup }` is `Interrupted { cleanup }`.
+- `attention::next_state(current, pending, input)`: every `ThreadState` × every relevant `AgentEvent` and `Signal`. `pending` is the count after the input. Implement exactly the rules in its doc comment: `Signal::Stopped` → `Ended` at once; `Failed`, `Ended` and `Interrupted` sticky until `Signal::Starting`, `Paused` through the closing events; otherwise exit code `Some(0)` → `Ended`, anything else → `Interrupted { cleanup: Verified }`; `NeedsApproval` beats `NeedsInput`, and both return to `Running` when cleared during a turn.
 - `attention::rank_inbox(threads, storage_full_since_ms)`: one item per thread that needs the user, reason from its state and `unread`, ranked by `InboxReason` order then `attention_since_ms` (oldest first), detail from `attention_detail`. A storage-full item first when given.
 - `attention::should_notify(previous, next, focused, last_notified_ms, now_ms)`: only for transitions into `NeedsApproval`, `NeedsInput` and `Failed`; never when focused; at most once per `limits::NOTIFY_MIN_INTERVAL` per thread.
 

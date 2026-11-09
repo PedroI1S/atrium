@@ -1,6 +1,6 @@
 # M1-07-claude-adapter: Claude Code adapter (production)
 
-Model: Sonnet 5.5 · Reviewer: Gemini 4 Argon · Depends on: contract (M1 rev 2), M1-10 merged (dispatched after it)
+Model: Sonnet 5.5 · Reviewer: Gemini 4 Argon · Depends on: contract (M1 rev 3), M1-10 merged (dispatched after it)
 Branch: `agent/sonnet/M1-07-claude-adapter` · Worktree: `../atrium-wt/M1-07-claude-adapter`
 
 ## Goal
@@ -28,6 +28,9 @@ Fold the M0-01 spike into `atrium-agents` as the production Claude Code adapter,
 - Spawn through `atrium_host::supervise::spawn_group`, call `SessionConfig::on_spawn` right after, before the handshake, and set `Session::process`. Never spawn a second process within one session: the spike's resume-respawn on a hung interrupt (`spikes/agent-claude/src/adapter.rs:32`) becomes "end the session" (the daemon resumes in a new incarnation).
 - `MessageBody` (`Streamed` with chars/deltas/sha256; `Inline` only for short completion-only messages), `ContextUpdated` for context figures, `Error::details` for pre-session diagnostics, output caps and record limits from `limits.rs`.
 - Shutdown: soft stop, then `atrium_host::supervise::terminate` on the process group. Closing events go through a bounded terminal tail (`TERMINAL_TAIL_EVENTS`) and are never dropped after 300 ms (`spikes/agent-claude/src/adapter.rs:696`).
+
+- User messages: right after `TurnStarted` (after `SessionStarted` if the provider starts lazily), emit the turn's user message as `MessageKind::User` from the `SendUserMessage` you sent, with the inline/delta rules.
+- Record the descriptor you build (at start and on every change) as `AdapterInput::Enforcement`, so fixture replay emits the same `SessionStarted.enforcement`/`EnforcementChanged`. The sanitizer already cleans it and every `ToolCheck.subject`.
 
 ## Definition of Done
 - [ ] All nine M0 scenarios re-recorded **live** with the current `claude` CLI and the cheapest model, sanitized, `Sanitizer::is_clean` asserted; goldens regenerated on the rev-3 event shapes.

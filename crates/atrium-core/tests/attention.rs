@@ -35,3 +35,15 @@ fn failed_and_paused_are_sticky_through_exit() {
 fn user_stop_ends_as_ended_whatever_the_exit_code() {
     unimplemented!()
 }
+
+#[test]
+#[ignore = "M1-04"]
+fn stopped_is_ended_and_sticky_through_exit() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-04"]
+fn exit_code_decides_ended_or_interrupted() {
+    unimplemented!()
+}

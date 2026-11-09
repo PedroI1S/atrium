@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 /// What the daemon accepts as "the app".
 ///
 /// - Release builds compile it in: `MacSigned` with the designated
-///   requirement, or `Linux` with the packaged app path (the daemon checks
-///   that the file isn't writable by the user, so a same-user process can't
+///   requirement, or `Linux` with the packaged app path and `dev_ino: None`
+///   (the daemon checks at runtime that the file and its folders are owned
+///   by root and not writable by the user, so a same-user process can't
 ///   replace it). The data folder can't change it.
 /// - Development builds read `Paths::app_identity` (mode 0600, owner checked),
 ///   written by the dev app at start. That file is as strong as the user's
@@ -24,11 +25,11 @@ pub enum AppIdentity {
     MacSigned { requirement: String },
     /// macOS, unsigned development build: executable path + cdhash.
     MacUnsigned { executable: PathBuf, cdhash: String },
-    /// Linux: the installed binary, by path and (device, inode).
+    /// Linux: the installed binary by path. `dev_ino` (device, inode) is
+    /// set only in development identities; release builds can't know it.
     Linux {
         executable: PathBuf,
-        dev: u64,
-        ino: u64,
+        dev_ino: Option<(u64, u64)>,
     },
 }
 
@@ -56,10 +57,12 @@ pub enum PeerError {
 ///   `SecCodeCheckValidity` against the requirement; unsigned: the cdhash
 ///   from the code object (`kSecCodeInfoUnique`), never a hash of the file on
 ///   disk.
-/// - Linux: `SO_PEERCRED`, then a pidfd (`SO_PEERPIDFD`, or `pidfd_open`
-///   immediately). `stat` `/proc/<pid>/exe` for (dev, ino), then
-///   `pidfd_send_signal(pidfd, 0)` must still succeed, proving the process
-///   that was inspected is the one connected.
+/// - Linux: `SO_PEERCRED`, then the peer's pidfd from `SO_PEERPIDFD`
+///   (kernel 6.5+; without it, App authority is refused: no `pidfd_open`
+///   fallback, which would race with pid reuse). `stat` `/proc/<pid>/exe`:
+///   it must be `executable` (and match `dev_ino` when set; otherwise the
+///   ownership check above), then `pidfd_send_signal(pidfd, 0)` must still
+///   succeed, proving the process inspected is the one connected.
 pub fn verify_app_peer(
     stream: &tokio::net::UnixStream,
     expected: &AppIdentity,

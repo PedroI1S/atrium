@@ -67,12 +67,11 @@ pub fn identify(pid: u32) -> io::Result<Option<ProcessIdentity>> {
 }
 
 /// Daemon recovery. If the leader still matches `recorded`, kills the group
-/// and returns `Verified`. If the leader is gone, returns `Verified` only if
-/// the group is empty too (`kill(-pgid, 0)` fails with `ESRCH`); if processes
-/// remain in the group that can't be shown to descend from the recorded
-/// leader (started at or after it), returns `Unverified` without killing.
-/// If the pid now belongs to another executable or can't be inspected:
-/// `Unverified`, nothing killed.
+/// and returns `Verified`. If the leader is gone: `Verified` if the group is
+/// empty too (`kill(-pgid, 0)` fails with `ESRCH`), otherwise `Unverified`
+/// and nothing is killed (after a crash the group id may have been reused,
+/// and start times can't prove descent). If the pid now belongs to another
+/// executable or can't be inspected: `Unverified`, nothing killed.
 pub fn kill_recorded(recorded: &ProcessIdentity) -> Cleanup {
     let _ = recorded;
     unimplemented!("M1-10")

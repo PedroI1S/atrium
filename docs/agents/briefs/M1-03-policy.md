@@ -1,6 +1,6 @@
 # M1-03-policy: policy engine, command parsing, approval ledger
 
-Model: Sonnet 5.5 (Opus 5.5 if it escalates) · Reviewer: Gemini 4 Argon · Depends on: contract (M1 rev 2)
+Model: Sonnet 5.5 (Opus 5.5 if it escalates) · Reviewer: Gemini 4 Argon · Depends on: contract (M1 rev 3)
 Branch: `agent/sonnet/M1-03-policy` · Worktree: `../atrium-wt/M1-03-policy`
 
 ## Goal
@@ -25,10 +25,12 @@ Implement what decides whether a tool call runs: the policy engine (hard deny, r
   - Home preset (D-050): file reads and searches allowed, except a recursive search rooted at `~` itself (asks); `HOME_READONLY_COMMANDS` allowed with their `forbidden`/`only` guards when the line has no `$` expansion, globs, brace expansion or newline and no `git -c`/`--config-env`/`--exec-path`; everything else asks.
   - A `ToolSubject::Unknown` call is never allowed by a rule or preset: hard deny on the raw input, otherwise ask. A command subject is treated as `Execute` whatever `kind` says.
 - `policy::parse_command` (separators `;`, `&&`, `||`, `|`, newline), `policy::canonical_input`, `policy::input_sha256`.
-- Hard-deny matching for every entry of `HARD_DENY_DEFAULTS` as approved in D-050, for every tool kind whose subject names a matching command or path (searches included), on every segment, inside command and process substitutions, and on the raw string. Atrium's paths come in `PolicyInput::atrium_paths`.
+- Hard-deny matching for every entry of `HARD_DENY_DEFAULTS` as approved in D-050, for every tool kind whose subject names a matching command or path (searches included), on every segment, inside command and process substitutions, and on the raw string. Atrium's paths come in `PolicyInput::atrium_data_paths` (no read, no write) and `atrium_protected_paths` (no write).
 - `policy::Ledger: ApprovalLedger` over an `Arc<dyn RequestStore>`, implementing every state and transition in `lib.rs` (including `approved → cancelled | expired`) and `TooMany`. Tests use an in-memory `RequestStore` you write in the test file.
 - `policy::SessionGate: atrium_agents::ToolGate`, one per session (thread, incarnation, cwd, home, Atrium's paths, preset, provider), reading a rules snapshot `(revision, rules)` through a small trait you define in `policy/`. Exactly as documented on `SessionGate`: path resolution (its only filesystem access), the "always…" matcher computed at `check` (`Binding::remember_matcher`, and `ApprovalTicket::rememberable`), `redeem` re-evaluating the policy when the rules revision or preset changed (excluding the rule this approval itself created) before the ledger's `redeem`. Any internal error → `Deny`.
-- `resolve` with `remember`: creates the rule from `Binding::remember_matcher` in the same transaction; with no matcher it still allows once and returns no rule.
+- `resolve` with `remember`: creates the rule from `Binding::remember_matcher` in the same transaction; with no matcher it still allows once and returns no rule. A key whose incarnation is older than `RequestStore::current_incarnation` → `StaleIncarnation`.
+- `parse_command` fills `Segment::assignments` and `Segment::redirects`. Rules and Home's read-only list match a segment only with no assignments and only `Redirect::harmless` redirects; the hard-deny list looks through assignments and checks redirect targets as paths. In Home, a command whose `ReadOnlyCommand::recursion` applies asks unless every search root is given and resolves to a file or a folder strictly inside `~`.
+- Path resolution, `cd` handling, the "always…" matcher's limits and `redeem`'s unconditional hard-deny re-check are as documented on `SessionGate` (review rev 2, finding 2: `ls > ~/.zshrc`, `rg token` in `~`, `LD_PRELOAD=… ls`, `cat .npmrc`, `cd .ssh && cat id_ed25519` are your test cases).
 
 ## Definition of Done
 - [ ] Every test in `tests/ledger.rs` and `tests/policy.rs` un-ignored and passing.

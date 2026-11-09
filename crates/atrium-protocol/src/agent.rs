@@ -109,7 +109,8 @@ pub enum AgentEvent {
     EnforcementChanged {
         enforcement: EnforcementDescriptor,
     },
-    /// A user message was accepted and the agent is working on it.
+    /// A user message was accepted and the agent is working on it. The
+    /// message itself follows as a `MessageKind::User` message.
     TurnStarted {
         turn: u32,
     },
@@ -257,6 +258,12 @@ pub enum MessageBody {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
+    /// The user's message for this turn, emitted by the adapter right after
+    /// `TurnStarted` from the `SendUserMessage` it sent (after
+    /// `SessionStarted` for providers that start lazily), with the same
+    /// delta/inline rules, so replay, paging and export see the whole
+    /// conversation. Never sets `ThreadSummary::unread`.
+    User,
     Assistant,
     /// Thinking / reasoning text, when the provider exposes it.
     Reasoning,

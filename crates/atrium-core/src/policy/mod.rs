@@ -31,15 +31,57 @@ pub enum ParsedCommand {
     /// One or more simple commands joined by `;`, `&&`, `||` or `|`, each as
     /// argv. `piped` marks segments that receive another's output.
     Segments(Vec<Segment>),
-    /// Substitution, backgrounding, here-docs, redirection outside the cwd, or
-    /// anything the parser doesn't handle: rules can't allow it.
+    /// Substitution, backgrounding, here-docs, subshells, or anything the
+    /// parser doesn't handle: rules and Home's read-only list can't allow it.
     Unparseable { reason: String },
 }
 
+/// One simple command. Rules and `HOME_READONLY_COMMANDS` match a segment
+/// only if it has no `assignments` and every redirect is
+/// [`Redirect::harmless`]; the hard-deny list looks through assignments and
+/// checks redirect targets as paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
+    /// Leading `NAME=value` words (`LD_PRELOAD=… ls`, `PAGER=… git log`).
+    pub assignments: Vec<(String, String)>,
     pub argv: Vec<String>,
+    pub redirects: Vec<Redirect>,
     pub piped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redirect {
+    /// The file descriptor redirected (`2>` is 2; `>` is 1, `<` is 0).
+    pub fd: u32,
+    pub op: RedirectOp,
+    /// A file path, or the fd number for `Dup`.
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectOp {
+    /// `<`
+    Read,
+    /// `>`, `>|`, `&>`
+    Write,
+    /// `>>`, `&>>`
+    Append,
+    /// `<>`
+    ReadWrite,
+    /// `>&N`, `<&N`, `N>&-`
+    Dup,
+}
+
+impl Redirect {
+    /// fd duplication, or output to `/dev/null`. Anything else that writes
+    /// is a write, wherever it points (in Home the cwd is `~`).
+    pub fn harmless(&self) -> bool {
+        match self.op {
+            RedirectOp::Dup => true,
+            RedirectOp::Write | RedirectOp::Append => self.target == "/dev/null",
+            RedirectOp::Read | RedirectOp::ReadWrite => false,
+        }
+    }
 }
 
 pub fn parse_command(line: &str, cwd: &std::path::Path) -> ParsedCommand {
@@ -67,17 +109,27 @@ impl Ledger {
 /// One session's [`atrium_agents::ToolGate`]: evaluates the policy, opens and
 /// redeems ledger entries. Built by the daemon for each incarnation.
 ///
-/// - `check`: resolves the subject's paths (deepest existing ancestor
-///   canonicalized; this is the gate's only filesystem access), evaluates the
-///   policy, and for `Ask` computes the "always…" matcher (an `Execute` of one
-///   simple command → `CommandPrefix` of its argv; file tools → `PathGlob` of
-///   the exact resolved path; anything else → not rememberable) and opens the
-///   ledger entry. In Home, a recursive search rooted at `~` itself is `Ask`
-///   (D-050). Any internal error → `Deny` (fail closed).
-/// - `redeem`: rebuilds the binding from the given check; if the rules
-///   revision or preset changed since the approval, re-evaluates the policy
-///   and refuses on `Deny`/`HardDeny`; then calls the ledger's `redeem`.
-///   Anything but success → `Deny`.
+/// - `check`: resolves paths (deepest existing ancestor canonicalized, the
+///   rest appended; this is the gate's only filesystem access), evaluates
+///   the policy, and for `Ask` computes the "always…" matcher and opens the
+///   ledger entry. Any internal error → `Deny` (fail closed).
+///   - Paths resolved: a `Paths` subject's paths; for a command, every
+///     non-flag argument, the value of every `--flag=value`, and every
+///     redirect target, of every segment, against the segment's cwd. The
+///     cwd is `ToolSubject::Command.cwd` (or the thread's), updated by a
+///     `cd` to a literal path for later segments; any other directory
+///     change (`cd -`, `cd $X`, `pushd`) makes the line `Ask`.
+///   - "Always…" matcher: one simple command with no assignments, harmless
+///     redirects only and no `$`, globs or braces → `CommandPrefix` of its
+///     argv; a file tool with exactly one path → `PathGlob` of that resolved
+///     path with glob metacharacters escaped; anything else → none (not
+///     rememberable).
+/// - `redeem`: rebuilds the binding from the given check and re-resolves its
+///   paths; always re-checks the hard-deny list (a symlink may have been
+///   swapped since the approval); if the rules revision or preset changed,
+///   re-evaluates the whole policy (excluding the rule this approval itself
+///   created); refuses on `Deny`/`HardDeny`; then calls the ledger's
+///   `redeem`. Anything but success → `Deny`.
 pub struct SessionGate {
     _policy: Arc<dyn PolicyEngine>,
     _ledger: Arc<dyn ApprovalLedger>,

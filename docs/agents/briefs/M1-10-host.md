@@ -1,6 +1,6 @@
 # M1-10-host: process supervision, peer verification, daemon lifecycle
 
-Model: Gemini 4 Argon · Reviewer: Sonnet 5.5, then Opus 5.5 for every `unsafe` block · Depends on: contract (M1 rev 2)
+Model: Gemini 4 Argon · Reviewer: Sonnet 5.5, then Opus 5.5 for every `unsafe` block · Depends on: contract (M1 rev 3)
 Branch: `agent/argon/M1-10-host` · Worktree: `../atrium-wt/M1-10-host`
 
 ## Goal
@@ -20,13 +20,13 @@ Implement `crates/atrium-host`: the platform code everything else relies on to k
 
 ## Contract to implement
 - `supervise`: exactly as documented. `spawn_group` (new process group, `kill_on_drop`, identity recorded); `terminate` (grace, then `SIGKILL` to the group **before** reaping the leader, so the group id can't be reused; also kills leftover descendants when the leader exited); `identify`; `kill_recorded` (a gone leader is `Verified` only if its group is empty; remaining processes that can't be shown to descend from it → `Unverified`, nothing killed).
-- `peer`: exactly as documented on `AppIdentity` and `verify_app_peer`. macOS: audit token, `SecCodeCheckValidity` against the requirement compiled into release daemons; unsigned dev builds compare the code object's cdhash (`kSecCodeInfoUnique`), never a hash of the file. Linux: uid, pidfd, `stat` of `/proc/<pid>/exe`, then `pidfd_send_signal(pidfd, 0)`; release builds check the packaged app path isn't writable by the user. `current_app_identity` for dev builds.
+- `peer`: exactly as documented on `AppIdentity` and `verify_app_peer`. macOS: audit token, `SecCodeCheckValidity` against the requirement compiled into release daemons; unsigned dev builds compare the code object's cdhash (`kSecCodeInfoUnique`), never a hash of the file. Linux: uid, the pidfd from `SO_PEERPIDFD` (no `pidfd_open` fallback: without it, refuse), `/proc/<pid>/exe` is the expected path (and `dev_ino` when set; release identities have none and instead check the file and its folders are root-owned and not user-writable), then `pidfd_send_signal(pidfd, 0)`. `current_app_identity` for dev builds.
 - `lifecycle`: `default_paths` (every field of `Paths`, `ATRIUM_HOME` honoured only in debug builds), `secure_dir`, `InstanceLock::acquire` (lock taken before a stale socket is removed; the lock file holds the daemon's `ProcessIdentity` as JSON), `spawn_detached` (log `O_NOFOLLOW`, mode 0600, refused if it exists with another owner or looser mode), `install_keep_running`/`remove_keep_running` (launchd LaunchAgent / systemd user unit; never touch anything else in the user's launchd or systemd config). Signal handling in `atriumd` is M1-05's.
 - Every `unsafe` block has a `// SAFETY:` comment; keep them few and small.
 
 ## Definition of Done
 - [ ] Tests: a child that spawns grandchildren is fully gone after `terminate` (check by pid); a leader that exits early still has its descendants killed; `kill_recorded` returns `Unverified` for a reused pid (simulate with a different executable) and never kills it; a gone leader with a live descendant in its group is not `Verified`.
-- [ ] Peer tests: the test binary verifying itself with its own identity succeeds; a different executable (`/bin/cat` connected through a socketpair helper) fails with `NotApp`.
+- [ ] Peer tests: the test binary verifying itself with its own identity succeeds; a different executable fails with `NotApp`: spawn a small helper binary that, after `exec`, itself `connect()`s to a `UnixListener` the test owns (a `socketpair` made before the fork reports the test process's own credentials, so it can't test this).
 - [ ] `secure_dir` refuses a symlink, a 0755 directory, and a directory owned by someone else (where testable without root; say which weren't).
 - [ ] Install/remove of the keep-running service tested against a temporary `HOME`/`XDG_CONFIG_HOME`, never the real one.
 - [ ] `cargo fmt --all --check`

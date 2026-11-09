@@ -65,3 +65,21 @@ fn store_never_changes_request_status() {
 fn attention_fields_follow_events() {
     unimplemented!()
 }
+
+#[test]
+#[ignore = "M1-02"]
+fn rename_updates_title_and_summary() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-02"]
+fn request_row_without_opening_event_is_not_open() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-02"]
+fn user_messages_never_set_unread() {
+    unimplemented!()
+}

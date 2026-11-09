@@ -14,6 +14,6 @@ fn export_redacts_secrets_split_across_deltas_and_escaped() {
 
 #[test]
 #[ignore = "M1-11"]
-fn export_file_is_mode_0600() {
+fn create_export_file_is_0600_new_and_nofollow() {
     unimplemented!()
 }

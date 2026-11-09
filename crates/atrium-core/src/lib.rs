@@ -1,6 +1,6 @@
 //! Atrium's domain (PLAN §3.3, §3.4, §3.12; contract §5, §7–§9, §13).
 //!
-//! **Contract, M1 revision 1 (draft, `docs/contracts/m1.md`).** This file and
+//! **Contract, M1 revision 3 (draft, `docs/contracts/m1.md`).** This file and
 //! `schema/` are the orchestrator's. Each module directory is owned by one
 //! task, which implements the items this file names and may add private code
 //! freely, but never changes the public items listed here:
@@ -10,7 +10,9 @@
 //! | [`store`] | M1-02 | [`Store`] as `store::SqliteStore` |
 //! | [`policy`] | M1-03 | [`PolicyEngine`], [`ApprovalLedger`], `policy::SessionGate` ([`atrium_agents::ToolGate`]), `policy::canonical_input`, `policy::parse_command` |
 //! | [`attention`] | M1-04 | `attention::next_state`, `attention::rank_inbox`, `attention::should_notify` |
-//! | [`history`] | M1-11 | `history::reconstruct_message`, `history::export_thread`, snapshots scheduling |
+//! | [`history`] | M1-11 | `history::reconstruct_message`, `history::Redactor`, `history::export_thread`, `history::create_export_file` |
+//!
+//! Snapshot scheduling (once a day over [`Store::snapshot`]) is the daemon's (M1-05).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -88,8 +90,11 @@ pub enum Signal {
 
 /// What is still open in an incarnation: what the closing events are built
 /// from, without reading the history. `requests` are the requests whose
-/// `RequestResolved` event hasn't been stored (`requests.event_closed = 0`),
-/// whatever the ledger status.
+/// `ApprovalRequested`/`QuestionAsked` was stored and whose `RequestResolved`
+/// wasn't (`event_opened = 1 AND event_closed = 0`), whatever the ledger
+/// status. A ledger row whose opening event never got stored (a crash
+/// between the two) is not open: `expire_all` expires it and no event is
+/// written for it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenItems {
     /// `(message_id, kind)`; `chars`/`deltas`/`sha256` come from the store.
@@ -175,6 +180,9 @@ pub trait Store: Send + Sync {
     /// Not archived, newest first.
     fn threads(&self) -> BoxFuture<'_, StoreResult<Vec<ThreadSummary>>>;
     fn archive(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<()>>;
+    /// Sets the title (`RenameThread`, or the first user message's text for a
+    /// thread started without one). Returns the updated summary.
+    fn rename(&self, thread: &ThreadId, title: &str) -> BoxFuture<'_, StoreResult<ThreadSummary>>;
     fn mark_read(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<()>>;
     fn set_enforcement(
         &self,
@@ -222,13 +230,14 @@ pub struct PolicyInput<'a> {
     /// Absolute, symlinks resolved.
     pub cwd: &'a Path,
     pub home: &'a Path,
-    /// Atrium's own data, config, runtime, service-unit and app paths
-    /// (`atrium-self`), resolved.
-    pub atrium_paths: &'a [PathBuf],
-    /// The check's subject paths (and a command's path-like arguments), made
-    /// absolute against the cwd and resolved by `SessionGate` (deepest
-    /// existing ancestor canonicalized, the rest appended). The engine never
-    /// touches the filesystem.
+    /// Atrium's data (database, WAL, snapshots, logs): neither read nor
+    /// written (`atrium-self`), resolved.
+    pub atrium_data_paths: &'a [PathBuf],
+    /// Atrium's config, socket, runtime, service-unit and app paths: never
+    /// written; reading is up to the preset. Resolved.
+    pub atrium_protected_paths: &'a [PathBuf],
+    /// Every path the call names (see `policy::SessionGate`), made absolute
+    /// and resolved by the gate. The engine never touches the filesystem.
     pub resolved_paths: &'a [PathBuf],
     pub preset: Preset,
 }
@@ -303,8 +312,15 @@ pub enum LedgerError {
 }
 
 /// The ledger's rows (`requests` table). Implemented by the store (M1-02),
-/// used only by the ledger (M1-03). Each method is one transaction.
+/// used only by the ledger (M1-03). Each method is one transaction. Rows are
+/// created here, before the adapter emits the opening event; the store marks
+/// them `event_opened` when it stores `ApprovalRequested`/`QuestionAsked`
+/// (setting a question's `title` to its first prompt) and `event_closed`
+/// when it stores `RequestResolved`.
 pub trait RequestStore: Send + Sync {
+    /// The thread's latest incarnation (`None`: unknown thread), so the
+    /// ledger can answer `StaleIncarnation` for a key from an older one.
+    fn current_incarnation(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<Option<u32>>>;
     fn open_approval(&self, key: &RequestKey, binding: &Binding) -> BoxFuture<'_, StoreResult<()>>;
     fn open_question(&self, key: &RequestKey, turn: Option<u32>) -> BoxFuture<'_, StoreResult<()>>;
     /// Compare-and-set on `status` from any of `from`; returns the status
@@ -317,7 +333,9 @@ pub trait RequestStore: Send + Sync {
     ) -> BoxFuture<'_, StoreResult<Option<String>>>;
     /// Pending + approved rows of this incarnation (for `MAX_PENDING_REQUESTS`).
     fn open_count(&self, thread: &ThreadId, incarnation: u32) -> BoxFuture<'_, StoreResult<u64>>;
-    /// Approves and creates the rule in one transaction.
+    /// `pending → approved` and, only if that compare-and-set succeeded,
+    /// inserts `rule` and increments `rules_revision`, in one transaction.
+    /// Returns the status found, like `transition`.
     fn approve_with_rule(
         &self,
         key: &RequestKey,

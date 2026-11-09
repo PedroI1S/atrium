@@ -1,6 +1,6 @@
 # M1-12-protocol-ts: TS generation, protocol shape tests, consistency checker
 
-Model: Gemini 3.8 Flash · Reviewer: Sonnet 5.5 · Depends on: contract (M1 rev 2)
+Model: Gemini 3.8 Flash · Reviewer: Sonnet 5.5 · Depends on: contract (M1 rev 3)
 Branch: `agent/flash/M1-12-protocol-ts` · Worktree: `../atrium-wt/M1-12-protocol-ts`
 
 ## Goal
@@ -25,12 +25,12 @@ Make the protocol usable from the app and keep it honest: generate TypeScript ty
 ## Contract to implement
 - `cargo run -p atrium-protocol --example export-ts --features ts` writes `crates/atrium-protocol/bindings/protocol.ts`. No spike uses `specta` yet: pick the `specta`/`specta-typescript` versions that `tauri-specta` 2 for Tauri 2 expects, pin them exactly, and say which. Enable `specta`'s `serde_json` feature (for `Value`) and export `u64` as `number` (`BigIntExportBehavior::Number`; Atrium's ids and counters stay below 2^53, say so in a comment).
 - `scripts/check-protocol-ts` (bash) regenerates into a temp file and fails if it differs from the committed one.
-- `serde_shape.rs`: a round-trip test with the exact expected JSON for every public serde type in `agent`, `policy`, `thread` and `wire`, including every enum variant (rev 2 added `ToolSubject`, `RuleDraft`, `ErrorCode`, `ProviderProbe`, `rememberable`, the attention fields, and `Incompatible`'s new fields).
+- `serde_shape.rs`: a round-trip test with the exact expected JSON for every public serde type in `agent`, `policy`, `thread` and `wire`, including every enum variant (rev 2 added `ToolSubject`, `RuleDraft`, `ErrorCode`, `ProviderProbe`, `rememberable`, the attention fields, and `Incompatible`'s new fields; rev 3 added `MessageKind::User`).
 - Consistency checker: verify `MessageBody::Streamed` `sha256` (add `sha2` as a dev-dependency of `atrium-agents` with `# M1-12`); flag duplicate `ApprovalRequested`/`QuestionAsked` ids and duplicate resolutions; check the closing order per closure episode, not per session; restrict to `fixtures/agents/{claude,codex}` (agy and ACP are M2). The test stays `#[ignore]` until M1-07 and M1-08 merge; the orchestrator un-ignores it.
 - `Sanitizer::is_clean` also checks decoded content: JSON-escaped (`\uXXXX`) and Unicode-escaped forms of every secret (A13).
 
 ## Definition of Done
-- [ ] `scripts/check-protocol-ts` passes; the generated file is committed.
+- [ ] Regenerating with `cargo run -p atrium-protocol --example export-ts --features ts` leaves `git diff --exit-code crates/atrium-protocol/bindings/` clean; the generated file is committed. (Write `scripts/check-protocol-ts` but don't run it: the agy policy blocks running shell scripts; the orchestrator runs it at integration.)
 - [ ] Every rev-3 type and variant has a shape test.
 - [ ] The checker's new rules each have a unit test with a small bad event list that it catches.
 - [ ] `cargo fmt --all --check`

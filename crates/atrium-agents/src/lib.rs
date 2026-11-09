@@ -355,6 +355,13 @@ pub enum AdapterInput {
     Deadline {
         what: String,
     },
+    /// The enforcement descriptor the adapter built (at start, from `probe`
+    /// and configuration inspection) or rebuilt (a configuration source
+    /// changed, the gate became unreachable). Recorded so offline replay
+    /// emits the same `SessionStarted.enforcement` / `EnforcementChanged`.
+    Enforcement {
+        descriptor: EnforcementDescriptor,
+    },
     /// The provider process exited (or the connection closed).
     Exit {
         code: Option<i32>,

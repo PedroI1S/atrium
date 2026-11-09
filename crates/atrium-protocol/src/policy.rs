@@ -387,7 +387,7 @@ pub const HARD_DENY_DEFAULTS: &[HardDenyDefault] = &[
     },
     HardDenyDefault {
         id: "credential-read",
-        description: "Reading or writing credential stores: every private key and the config and authorized_keys in ~/.ssh, ~/.aws/credentials, ~/.netrc, ~/.git-credentials, ~/.npmrc, ~/.docker/config.json, ~/.kube/config, ~/.gnupg, ~/.config/gh/hosts.yml, ~/.config/gcloud, agent tokens (~/.claude/.credentials.json, ~/.claude.json, ~/.codex/auth.json, ~/.gemini), browser login and cookie databases, keychain dumps and lookups (security find-*-password, dump-keychain), secret-tool lookup",
+        description: "Reading or writing credential stores: every private key in ~/.ssh (and writing ~/.ssh/config or authorized_keys), ~/.aws/credentials, ~/.netrc, ~/.git-credentials, ~/.npmrc, ~/.docker/config.json, ~/.kube/config, ~/.gnupg, ~/.config/gh/hosts.yml, ~/.config/gcloud, agent tokens (~/.claude/.credentials.json, ~/.claude.json, ~/.codex/auth.json, ~/.gemini), browser login and cookie databases, keychain dumps and lookups (security find-*-password, dump-keychain), secret-tool lookup",
     },
     HardDenyDefault {
         id: "pipe-to-shell",
@@ -395,7 +395,7 @@ pub const HARD_DENY_DEFAULTS: &[HardDenyDefault] = &[
     },
     HardDenyDefault {
         id: "atrium-self",
-        description: "Reading Atrium's data (database, WAL, snapshots, logs: other threads' transcripts) and writing its data, config, socket and service files or its app",
+        description: "Reading or writing Atrium's data (database, WAL, snapshots, logs: other threads' transcripts), and writing its config, socket and service files or its app",
     },
     HardDenyDefault {
         id: "privilege-escalation",
@@ -418,6 +418,18 @@ pub struct ReadOnlyCommand {
     /// If set, every further argument must be one of these flags (no
     /// positional arguments), e.g. `git branch` only lists.
     pub only: Option<&'static [&'static str]>,
+    /// Whether it searches recursively (D-050: a recursive search rooted at
+    /// `~` itself asks).
+    pub recursion: Recursion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recursion {
+    Never,
+    /// Always recursive into directory arguments (`rg`).
+    Always,
+    /// Recursive when one of these flags is present (`grep -r`).
+    WithFlags(&'static [&'static str]),
 }
 
 const GIT_FORBIDDEN: &[&str] = &[
@@ -433,6 +445,7 @@ const fn cmd(prefix: &'static [&'static str]) -> ReadOnlyCommand {
         prefix,
         forbidden: &[],
         only: None,
+        recursion: Recursion::Never,
     }
 }
 
@@ -441,15 +454,22 @@ const fn git(sub: &'static [&'static str]) -> ReadOnlyCommand {
         prefix: sub,
         forbidden: GIT_FORBIDDEN,
         only: None,
+        recursion: Recursion::Never,
     }
 }
 
 /// Commands Home allows without asking (D-050), when the whole line is one
 /// simple command (or several joined by `&&`, `||`, `;`, `|`, each allowed)
-/// with no `$` expansion, globs, brace expansion or newline, and no
-/// `git -c`/`--config-env`/`--exec-path`. The hard-deny list applies on top
-/// (so `cat ~/.ssh/id_ed25519` is blocked). A recursive search rooted at `~`
-/// itself asks (D-050).
+/// with no `$` expansion, globs, brace expansion or newline, no
+/// `git -c`/`--config-env`/`--exec-path`, no leading `NAME=value`
+/// assignment, and no redirect other than fd duplication or output to
+/// `/dev/null` (in Home the cwd is `~`, so `ls > ~/.zshrc` would otherwise
+/// be "inside the folder"). The hard-deny list applies on top (so
+/// `cat ~/.ssh/id_ed25519` is blocked).
+///
+/// A recursive search (`recursion`) asks unless every search root is given
+/// and resolves to a file or to a folder strictly inside `~`: `rg token`
+/// with no path, or `grep -r token .`, searches all of home (D-050).
 ///
 /// Known limit, stated in settings: a repository's own `.git/config` can make
 /// git run programs (`core.fsmonitor`, textconv and diff drivers), so
@@ -465,6 +485,7 @@ pub const HOME_READONLY_COMMANDS: &[ReadOnlyCommand] = &[
         prefix: &["file"],
         forbidden: &["-C", "--compile", "-m", "--magic-file"],
         only: None,
+        recursion: Recursion::Never,
     },
     cmd(&["stat"]),
     cmd(&["du"]),
@@ -475,19 +496,42 @@ pub const HOME_READONLY_COMMANDS: &[ReadOnlyCommand] = &[
         prefix: &["date"],
         forbidden: &["-s", "--set"],
         only: None,
+        recursion: Recursion::Never,
     },
     cmd(&["whoami"]),
     ReadOnlyCommand {
         prefix: &["tree"],
-        forbidden: &["-o"],
+        // `-R` with `-H` writes an HTML file into every directory.
+        forbidden: &["-o", "--output", "-R"],
         only: None,
+        recursion: Recursion::Never,
     },
     ReadOnlyCommand {
         prefix: &["rg"],
-        forbidden: &["--pre", "--pre-glob", "-z", "--search-zip"],
+        // `--hostname-bin` runs a program.
+        forbidden: &[
+            "--pre",
+            "--pre-glob",
+            "-z",
+            "--search-zip",
+            "--hostname-bin",
+        ],
         only: None,
+        recursion: Recursion::Always,
     },
-    cmd(&["grep"]),
+    ReadOnlyCommand {
+        prefix: &["grep"],
+        forbidden: &[],
+        only: None,
+        recursion: Recursion::WithFlags(&[
+            "-r",
+            "-R",
+            "--recursive",
+            "--dereference-recursive",
+            "-d",
+            "--directories",
+        ]),
+    },
     git(&["git", "status"]),
     git(&["git", "log"]),
     git(&["git", "diff"]),
@@ -507,6 +551,7 @@ pub const HOME_READONLY_COMMANDS: &[ReadOnlyCommand] = &[
             "-l",
             "--show-current",
         ]),
+        recursion: Recursion::Never,
     },
     git(&["git", "rev-parse"]),
     git(&["git", "ls-files"]),

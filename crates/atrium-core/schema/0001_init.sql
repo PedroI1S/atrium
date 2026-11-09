@@ -108,8 +108,10 @@ CREATE TABLE requests (
     status        TEXT NOT NULL,                -- 'pending' | 'approved' | 'redeemed' | 'denied' | 'answered' | 'cancelled' | 'expired'
     opened_ms     INTEGER NOT NULL,
     resolved_ms   INTEGER,
-    -- Set by the store when the RequestResolved event is stored; the ledger
-    -- never touches it. Rows with 0 are "open" for closing (OpenItems).
+    -- Set by the store when the ApprovalRequested/QuestionAsked and the
+    -- RequestResolved events are stored; the ledger never touches them.
+    -- Open for closing (OpenItems): event_opened = 1 AND event_closed = 0.
+    event_opened  INTEGER NOT NULL DEFAULT 0,
     event_closed  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (thread_id, incarnation, request_id)
 );

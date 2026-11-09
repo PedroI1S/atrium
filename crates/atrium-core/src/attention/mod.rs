@@ -20,11 +20,23 @@ pub enum AttentionInput<'a> {
 
 /// The next state. `pending` is the count *after* the input is applied.
 ///
-/// Precedence: `Failed` (after a fatal `Error`) and `Paused` (after
-/// `RateLimited`) are sticky: the `TurnCompleted`, `SessionEnded` and
-/// `Signal::Exited` that follow keep them. After `Signal::Stopped`, the exit
-/// is `Ended` whatever its code. Otherwise an exit with a turn open, or a
-/// non-zero code, is `Interrupted { cleanup: Verified }`.
+/// - `Signal::Starting` → `Starting`, from any state (a new incarnation).
+/// - `Signal::Stopped` (the user stopped it) → `Ended` at once.
+/// - Sticky until the next `Signal::Starting`: `Failed` (after a fatal
+///   `Error`), `Ended` and `Interrupted`; the `TurnCompleted`,
+///   `SessionEnded` and `Signal::Exited` that follow keep them. `Paused`
+///   (after `RateLimited`) is kept by those closing events too.
+/// - Otherwise, the end of a session (`SessionEnded`, or `Signal::Exited`
+///   if it comes first): exit code `Some(0)` → `Ended`; any other code or
+///   `None` → `Interrupted { cleanup: Verified }`. (The closing
+///   `TurnCompleted` arrives first, so whether a turn was open isn't
+///   visible here; a provider that exits 0 mid-turn shows as `Ended`, and
+///   can still be resumed.)
+/// - `Signal::Recovered { cleanup }` → `Interrupted { cleanup }`;
+///   `Signal::StorageReadOnly` → `Interrupted { cleanup: Verified }`.
+/// - While alive: pending approvals → `NeedsApproval`; else pending
+///   questions → `NeedsInput`; else a turn running → `Running`; else
+///   `Idle`.
 pub fn next_state(
     current: &ThreadState,
     pending: Pending,

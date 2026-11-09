@@ -127,6 +127,34 @@ impl Sanitizer {
         }
     }
 
+    /// A tool check's input, title and subject (command lines, cwd, paths and
+    /// URLs carry home paths and secrets).
+    fn check(&self, check: &mut crate::ToolCheck) {
+        use atrium_protocol::policy::ToolSubject;
+        self.value(&mut check.input);
+        if let Some(title) = &mut check.title {
+            *title = self.text(title);
+        }
+        match &mut check.subject {
+            ToolSubject::Command { line, cwd } => {
+                *line = self.text(line);
+                if let Some(cwd) = cwd {
+                    *cwd = self.text(cwd);
+                }
+            }
+            ToolSubject::Paths { paths, glob, .. } => {
+                for path in paths {
+                    *path = self.text(path);
+                }
+                if let Some(glob) = glob {
+                    *glob = self.text(glob);
+                }
+            }
+            ToolSubject::Fetch { url } => *url = self.text(url),
+            ToolSubject::Mcp { .. } | ToolSubject::None | ToolSubject::Unknown => {}
+        }
+    }
+
     pub fn input(&self, input: &mut AdapterInput) {
         match input {
             AdapterInput::Stdin { line }
@@ -134,24 +162,21 @@ impl Sanitizer {
             | AdapterInput::Stderr { line } => *line = self.line(line),
             AdapterInput::HookRequest { payload, .. }
             | AdapterInput::HookResponse { payload, .. } => self.value(payload),
-            AdapterInput::Gate { check, decision } => {
-                self.value(&mut check.input);
-                if let Some(title) = &mut check.title {
-                    *title = self.text(title);
-                }
+            AdapterInput::Gate { check, decision }
+            | AdapterInput::Redeem {
+                check, decision, ..
+            } => {
+                self.check(check);
                 if let crate::GateDecision::Deny { reason } = decision {
                     *reason = self.text(reason);
                 }
             }
-            AdapterInput::Redeem {
-                check, decision, ..
-            } => {
-                self.value(&mut check.input);
-                if let Some(title) = &mut check.title {
-                    *title = self.text(title);
+            AdapterInput::Enforcement { descriptor } => {
+                for source in &mut descriptor.config_sources {
+                    source.path = self.text(&source.path);
                 }
-                if let crate::GateDecision::Deny { reason } = decision {
-                    *reason = self.text(reason);
+                for reason in &mut descriptor.reasons {
+                    reason.message = self.text(&reason.message);
                 }
             }
             // Prompts and answers are user content and can carry secrets

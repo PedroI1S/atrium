@@ -78,3 +78,15 @@ fn rule_change_to_deny_before_redeem_wins() {
 fn own_remember_rule_does_not_block_redeem() {
     unimplemented!()
 }
+
+#[test]
+#[ignore = "M1-03"]
+fn resolve_on_older_incarnation_is_stale() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn approve_with_rule_creates_no_rule_when_not_pending() {
+    unimplemented!()
+}

@@ -1,6 +1,6 @@
 # M1-08-codex-adapter: Codex adapter (production, fixtures)
 
-Model: Gemini 4 Argon · Reviewer: Sonnet 5.5 · Depends on: contract (M1 rev 2), M1-10 merged (dispatched after it)
+Model: Gemini 4 Argon · Reviewer: Sonnet 5.5 · Depends on: contract (M1 rev 3), M1-10 merged (dispatched after it)
 Branch: `agent/argon/M1-08-codex-adapter` · Worktree: `../atrium-wt/M1-08-codex-adapter`
 
 ## Goal
@@ -28,6 +28,9 @@ Fold the M0-02 spike into `atrium-agents` as the production Codex adapter on the
 - Spawn through `atrium_host::supervise::spawn_group`, call `on_spawn` before the handshake, set `Session::process`, never respawn within a session.
 - `MessageBody`, `ContextUpdated`, `Error::details`, output caps and record limits; closing through a bounded terminal tail; shutdown via `atrium_host::supervise`.
 - Re-normalize the existing recorded inputs into rev-3 goldens. Where a fixture is hand-made, keep it marked hand-made.
+
+- User messages: right after `TurnStarted` (after `SessionStarted` if the provider starts lazily), emit the turn's user message as `MessageKind::User` from the `SendUserMessage` you sent, with the inline/delta rules.
+- Record the descriptor you build (at start and on every change) as `AdapterInput::Enforcement`, so fixture replay emits the same `SessionStarted.enforcement`/`EnforcementChanged`. The sanitizer already cleans it and every `ToolCheck.subject`.
 
 ## Definition of Done
 - [ ] All Codex goldens regenerated; the X6 violations are gone (run `cargo test -p atrium-agents --test consistency -- --ignored` and show it reports no Codex violations).

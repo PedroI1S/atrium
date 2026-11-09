@@ -89,3 +89,51 @@ fn hard_deny_applies_to_searches_and_inside_substitutions() {
 fn shell_commands_are_execute_whatever_the_provider_says() {
     unimplemented!()
 }
+
+#[test]
+#[ignore = "M1-03"]
+fn home_output_redirect_to_a_file_asks() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn leading_env_assignment_never_matches_a_rule_or_readonly_command() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn home_recursive_search_without_a_subfolder_root_asks() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn cd_to_literal_path_moves_resolution_and_other_cd_asks() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn bare_filename_and_flag_value_arguments_are_resolved_for_hard_deny() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn redeem_rechecks_hard_deny_after_symlink_swap() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn remember_matcher_none_for_compound_glob_or_multi_path() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn atrium_protected_paths_readable_not_writable() {
+    unimplemented!()
+}

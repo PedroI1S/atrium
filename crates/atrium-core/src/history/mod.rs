@@ -54,9 +54,17 @@ impl Redactor {
     }
 }
 
+/// Creates an export file: new file only (`O_CREAT | O_EXCL`), `O_NOFOLLOW`,
+/// mode 0600, in a directory owned by the user. The daemon writes the export
+/// into it with [`export_thread`].
+pub fn create_export_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let _ = path;
+    unimplemented!("M1-11")
+}
+
 /// Writes one thread's events as Markdown or JSONL, redacted with `redactor`.
-/// Returns bytes written. The daemon opens `out` with mode 0600 and
-/// `O_NOFOLLOW`.
+/// Returns bytes written. User messages (`MessageKind::User`) are included
+/// and redacted like the rest.
 pub fn export_thread(
     events: &mut dyn Iterator<Item = StoredEvent>,
     format: ExportFormat,

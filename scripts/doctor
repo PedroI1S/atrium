@@ -56,14 +56,17 @@ synced() { # <real path>
   return 1
 }
 gitdir="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
-wt="$(cd "$root/.." && pwd -P)/atrium-wt"
+# Worktrees live next to the main checkout (the .git's parent), wherever this runs.
+wt="$(dirname "$(dirname "$gitdir")")/atrium-wt"
+[[ -d "$wt" ]] && wt="$(cd "$wt" && pwd -P)"
+paths_ok=1
 for path in "$(pwd -P)" "$gitdir" "$wt"; do
   if synced "$path/"; then
     echo "  ✗ synced   $path is inside a cloud-synced folder: move the repo (README, Conventions)"
-    failed=1
+    failed=1 paths_ok=0
   fi
 done
-[[ $failed -eq 0 ]] && echo "  ✓ paths    repo, .git and atrium-wt are outside synced folders"
+[[ $paths_ok -eq 1 ]] && echo "  ✓ paths    repo, .git and atrium-wt are outside synced folders"
 if git fsck --connectivity-only --no-dangling >/dev/null 2>&1; then
   echo "  ✓ git      fsck (connectivity) passed"
 else
