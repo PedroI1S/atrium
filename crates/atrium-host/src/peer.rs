@@ -432,12 +432,18 @@ mod platform {
         Ok(())
     }
 
-    /// Reads dynamic signing information directly from a live `SecCodeRef`
-    /// (`kSecCSDynamicInformation`), never via `SecCodeCopyStaticCode`.
+    /// Reads signing information for a live `SecCodeRef`
+    /// (`kSecCSDynamicInformation`). The returned `kSecCodeInfoUnique` and
+    /// `kSecCodeInfoMainExecutable` are the code's static view (Security
+    /// resolves the code to its static code internally); they are trusted only
+    /// because `check_code_validity` ran first on the same dynamic `SecCodeRef`,
+    /// which fails (`errSecCSStaticCodeChanged`) unless the running process's
+    /// cdhash matches. That call order is load-bearing: never read these values
+    /// before the validity check.
     fn extract_dynamic_signing_details(code: &CfRef) -> Result<SigningDetails, String> {
-        // SAFETY: `code.as_ptr()` is a valid running `SecCodeRef` (accepted by
-        // `SecCodeCopySigningInformation` directly without converting to a
-        // disk-backed static code object). On `ERR_SEC_SUCCESS`, `raw_dict` is a
+        // SAFETY: `code.as_ptr()` is a valid live `SecCodeRef`, which
+        // `SecCodeCopySigningInformation` accepts (a `SecCode` is a
+        // `SecStaticCode` subtype). On `ERR_SEC_SUCCESS`, `raw_dict` is a
         // +1 owned `CFDictionaryRef` under the Copy rule. Dictionary values are
         // unowned borrows tied to `dict`'s lifetime, runtime-type-checked with
         // `CFGetTypeID` before reading `CFData` or `CFURL` bytes.
@@ -625,7 +631,10 @@ mod platform {
         // `sizeof(c_int)`). When `getsockopt(SO_PEERPIDFD)` returns `0` and
         // writes a non-negative descriptor to `raw_pidfd`, ownership of that new
         // open fd belongs to the caller, so we wrap it in `OwnedFd` immediately
-        // before checking `len` so it cannot leak.
+        // before checking `len` so it cannot leak. Wrapping before the `len`
+        // check is sound because the kernel clamps `len` to `sizeof(int)` and,
+        // with `optlen == sizeof(int)`, always writes the whole `int`: a short
+        // write that could leave a foreign positive value can't happen.
         let pidfd = unsafe {
             let rc = libc::getsockopt(
                 fd.as_raw_fd(),
