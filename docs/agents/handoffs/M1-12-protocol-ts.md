@@ -134,3 +134,74 @@ None. Everything in the brief's contract and Definition of Done is completed.
 
 - When M1-07 and M1-08 merge (production Claude and Codex adapters), un-ignore `consistency_all_fixtures` in `crates/atrium-agents/tests/consistency.rs`.
 - Run `bash scripts/check-protocol-ts` at integration to confirm the script operates as expected in the orchestrator environment.
+
+## Review fixes
+
+Addressed all reviewer findings from Sonnet 5.5 review:
+
+1. **Closing-order rule checked only on actual session close (`consistency.rs`)**:
+   - Updated `consistency.rs` so closing order is only enforced for the closing run between the last non-closing event and `SessionEnded` (messages completed -> cancelled tools -> cancelled requests -> turn completed -> session ended).
+   - Mid-turn cancellations (cancelled tool calls or requests followed by subsequent output in the turn) are no longer flagged.
+   - Added unit test `test_valid_mid_turn_cancel_followed_by_more_output_passes` proving valid mid-turn cancellations pass, and `test_bad_closing_order_before_session_ended_fails` proving invalid closing sequences fail.
+
+2. **Flag `RequestResolved(cancelled)` after `TurnCompleted`, keep max stage, fix previous index (`consistency.rs`)**:
+   - Flagged `RequestResolved(cancelled)` when it occurs after `TurnCompleted` in the closing run.
+   - Updated stage tracking using `max` so the stage is never lowered when subsequent events appear out of order.
+   - Fixed the previous event index in the violation message to accurately identify the earlier event that set the higher stage.
+   - Added unit test `test_closing_order_request_resolved_cancelled_after_turn_completed`.
+
+3. **`serde_shape.rs` default field omission tests**:
+   - Added `serde_default_fields_omitted` test verifying deserialization when `#[serde(default)]` fields are omitted: `tools`, `truncated_bytes`, `rememberable`, `details`, `Question.options`/`multi_select`/`allow_text`, and `QuestionAnswer.selected`.
+
+5. **`crates/atrium-protocol/Cargo.toml` optional TS dependencies**:
+   - Made `specta-typescript`, `specta-serde`, and `specta-util` optional dependencies enabled by the `ts` feature rather than unconditional dev-dependencies.
+   - Added `required-features = ["ts"]` to `[[example]] name = "export-ts"`.
+
+6. **Updated fixture ignore attribute (`consistency.rs`)**:
+   - Changed ignore attribute on `consistency_all_fixtures` to `#[ignore = "M1-07, M1-08: fixtures regenerate for rev 3"]`.
+
+7. **Generated `protocol.ts` header note & Sanitizer malformed escape tests**:
+   - Added header note `// Note: u64 maps to number; Atrium's ids, ms timestamps and counters stay below 2^53` in `crates/atrium-protocol/bindings/protocol.ts` via `specta_typescript::Typescript::header`.
+   - Added `malformed_escapes_no_panic_and_correct_cleanliness` test in `crates/atrium-agents/src/fixture.rs` covering `\u`, `\u12`, `\ud83d`, `\u{110000}`, and `\x`, proving no panics and correct reporting of cleanliness.
+
+### Review fix verification results
+
+- **Idempotent TS export clean diff**:
+  ```
+  cargo run -p atrium-protocol --example export-ts --features ts && git diff --exit-code crates/atrium-protocol/bindings/
+  ```
+  Output:
+  ```
+      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.01s
+       Running `target/debug/examples/export-ts`
+  Wrote protocol bindings to /Users/pedro/atrium-wt/M1-12-protocol-ts/crates/atrium-protocol/bindings/protocol.ts
+  ```
+  (exit code 0)
+
+- **`cargo fmt --all --check`**:
+  ```
+  cargo fmt --all --check
+  ```
+  Output: (clean, exit code 0)
+
+- **`cargo clippy --workspace --all-targets --all-features -- -D warnings`**:
+  ```
+  cargo clippy --workspace --all-targets --all-features -- -D warnings
+  ```
+  Output:
+  ```
+      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s
+  ```
+  (exit code 0)
+
+- **`cargo test --workspace --all-features`**:
+  ```
+  cargo test --workspace --all-features
+  ```
+  Output:
+  ```
+  test result: ok. 7 passed; 0 failed; 0 ignored in atrium-agents src/lib.rs
+  test result: ok. 11 passed; 0 failed; 1 ignored in atrium-agents tests/consistency.rs
+  test result: ok. 13 passed; 0 failed; 0 ignored in atrium-protocol tests/serde_shape.rs
+  ```
+  (exit code 0)

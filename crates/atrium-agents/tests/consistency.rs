@@ -107,10 +107,26 @@ struct MessageDeltasTracker {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ClosureStage {
-    Normal = 0,
+    MessagesCompleted = 0,
     ToolCallsCancelled = 1,
     RequestsCancelled = 2,
     TurnCompleted = 3,
+}
+
+fn is_closing_candidate(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::MessageCompleted { .. }
+            | AgentEvent::ToolCallFinished {
+                status: ToolStatus::Cancelled,
+                ..
+            }
+            | AgentEvent::RequestResolved {
+                outcome: RequestOutcome::Cancelled,
+                ..
+            }
+            | AgentEvent::TurnCompleted { .. }
+    )
 }
 
 pub fn check_events(events: &[AgentEvent], file_stem: &str) -> ConsistencyReport {
@@ -229,10 +245,6 @@ pub fn check_events(events: &[AgentEvent], file_stem: &str) -> ConsistencyReport
     let mut last_turn_completed: Option<u32> = None;
     let mut turn_outcomes: Vec<(u32, TurnOutcome)> = Vec::new();
 
-    // Closure episode tracking (per episode, resetting on TurnStarted)
-    let mut closure_stage = ClosureStage::Normal;
-    let mut last_cancelled_req_idx: Option<usize> = None;
-
     for (idx, event) in events.iter().enumerate() {
         match event {
             AgentEvent::ToolCallStarted { call_id, .. } => {
@@ -251,17 +263,6 @@ pub fn check_events(events: &[AgentEvent], file_stem: &str) -> ConsistencyReport
                 *tool_finishes.entry(call_id.clone()).or_insert(0) += 1;
                 finished_tool_calls.insert(call_id.clone(), idx);
                 tool_status.insert(call_id.clone(), *status);
-
-                if *status == ToolStatus::Cancelled {
-                    if closure_stage >= ClosureStage::RequestsCancelled {
-                        let prev = last_cancelled_req_idx.unwrap_or(0);
-                        report.add(format!(
-                            "Event {idx}: ToolCallFinished(cancelled) for '{call_id}' appeared after RequestResolved(cancelled) at event {prev} in closure episode (violates closing order: tool calls before requests)"
-                        ));
-                    } else {
-                        closure_stage = ClosureStage::ToolCallsCancelled;
-                    }
-                }
             }
             AgentEvent::MessageDelta {
                 message_id, text, ..
@@ -279,12 +280,6 @@ pub fn check_events(events: &[AgentEvent], file_stem: &str) -> ConsistencyReport
                 message_id, body, ..
             } => {
                 *completed_messages.entry(message_id.clone()).or_insert(0) += 1;
-
-                if closure_stage >= ClosureStage::ToolCallsCancelled {
-                    report.add(format!(
-                        "Event {idx}: MessageCompleted for '{message_id}' appeared after tool calls or requests were cancelled in closure episode"
-                    ));
-                }
 
                 match body {
                     MessageBody::Inline { text } => {
@@ -358,7 +353,7 @@ pub fn check_events(events: &[AgentEvent], file_stem: &str) -> ConsistencyReport
             }
             AgentEvent::RequestResolved {
                 request_id,
-                outcome,
+                outcome: _,
             } => {
                 let res_count = requests_resolved.entry(request_id.clone()).or_insert(0);
                 *res_count += 1;
@@ -366,11 +361,6 @@ pub fn check_events(events: &[AgentEvent], file_stem: &str) -> ConsistencyReport
                     report.add(format!(
                         "Event {idx}: Duplicate RequestResolved for request_id '{request_id}'"
                     ));
-                }
-
-                if *outcome == RequestOutcome::Cancelled {
-                    closure_stage = ClosureStage::RequestsCancelled;
-                    last_cancelled_req_idx = Some(idx);
                 }
             }
             AgentEvent::TurnStarted { turn } => {
@@ -386,33 +376,27 @@ pub fn check_events(events: &[AgentEvent], file_stem: &str) -> ConsistencyReport
                     ));
                 }
                 current_turn = Some(*turn);
-                // Reset closure episode for new turn
-                closure_stage = ClosureStage::Normal;
-                last_cancelled_req_idx = None;
             }
-            AgentEvent::TurnCompleted { turn, outcome, .. } => {
-                closure_stage = ClosureStage::TurnCompleted;
-                match current_turn {
-                    Some(open) if open == *turn => {
-                        current_turn = None;
-                        last_turn_completed = Some(*turn);
-                        turn_outcomes.push((*turn, *outcome));
-                    }
-                    Some(open) => {
-                        report.add(format!(
-                            "Event {idx}: TurnCompleted({turn}) does not match open turn {open}"
-                        ));
-                        current_turn = None;
-                        last_turn_completed = Some(*turn);
-                    }
-                    None => {
-                        report.add(format!(
-                            "Event {idx}: TurnCompleted({turn}) without an open TurnStarted"
-                        ));
-                        last_turn_completed = Some(*turn);
-                    }
+            AgentEvent::TurnCompleted { turn, outcome, .. } => match current_turn {
+                Some(open) if open == *turn => {
+                    current_turn = None;
+                    last_turn_completed = Some(*turn);
+                    turn_outcomes.push((*turn, *outcome));
                 }
-            }
+                Some(open) => {
+                    report.add(format!(
+                        "Event {idx}: TurnCompleted({turn}) does not match open turn {open}"
+                    ));
+                    current_turn = None;
+                    last_turn_completed = Some(*turn);
+                }
+                None => {
+                    report.add(format!(
+                        "Event {idx}: TurnCompleted({turn}) without an open TurnStarted"
+                    ));
+                    last_turn_completed = Some(*turn);
+                }
+            },
             AgentEvent::Usage { .. } if current_turn.is_none() => {
                 report.add(format!(
                     "Event {idx}: Usage event emitted while no turn is open (after TurnCompleted)"
@@ -501,6 +485,79 @@ pub fn check_events(events: &[AgentEvent], file_stem: &str) -> ConsistencyReport
     // Check no unclosed turns at SessionEnded
     if let Some(open) = current_turn {
         report.add(format!("Session ended while turn {open} was still open"));
+    }
+
+    // Check closing order only for the closing run when a session ends (agent.rs lifecycle).
+    // The closing run consists of events between the last non-closing event and SessionEnded:
+    // messages completed -> cancelled tools -> cancelled requests -> turn completed -> session ended.
+    if matches!(events.last(), Some(AgentEvent::SessionEnded { .. })) {
+        let session_ended_idx = events.len() - 1;
+        let last_non_closing_idx = events[..session_ended_idx]
+            .iter()
+            .rposition(|e| !is_closing_candidate(e));
+        let closing_start = match last_non_closing_idx {
+            Some(idx) => idx + 1,
+            None => 0,
+        };
+
+        let mut max_stage: Option<(ClosureStage, usize, String)> = None;
+
+        for (offset, event) in events[closing_start..session_ended_idx].iter().enumerate() {
+            let idx = closing_start + offset;
+            let (stage, desc) = match event {
+                AgentEvent::MessageCompleted { message_id, .. } => (
+                    ClosureStage::MessagesCompleted,
+                    format!("MessageCompleted for '{message_id}'"),
+                ),
+                AgentEvent::ToolCallFinished {
+                    call_id,
+                    status: ToolStatus::Cancelled,
+                    ..
+                } => (
+                    ClosureStage::ToolCallsCancelled,
+                    format!("ToolCallFinished(cancelled) for '{call_id}'"),
+                ),
+                AgentEvent::RequestResolved {
+                    request_id,
+                    outcome: RequestOutcome::Cancelled,
+                    ..
+                } => (
+                    ClosureStage::RequestsCancelled,
+                    format!("RequestResolved(cancelled) for '{request_id}'"),
+                ),
+                AgentEvent::TurnCompleted { turn, .. } => (
+                    ClosureStage::TurnCompleted,
+                    format!("TurnCompleted({turn})"),
+                ),
+                _ => unreachable!("closing run only contains closing candidates"),
+            };
+
+            if let Some((prev_stage, prev_idx, prev_name)) = &max_stage
+                && stage < *prev_stage
+            {
+                let reason = match (*prev_stage, stage) {
+                    (ClosureStage::RequestsCancelled, ClosureStage::ToolCallsCancelled) => {
+                        ": tool calls before requests"
+                    }
+                    (ClosureStage::TurnCompleted, ClosureStage::RequestsCancelled) => {
+                        ": requests before turn completion"
+                    }
+                    (ClosureStage::TurnCompleted, ClosureStage::ToolCallsCancelled) => {
+                        ": tool calls before turn completion"
+                    }
+                    (_, ClosureStage::MessagesCompleted) => ": messages before cancellations",
+                    _ => "",
+                };
+                report.add(format!(
+                    "Event {idx}: {desc} appeared after {prev_name} at event {prev_idx} in closing run (violates closing order{reason})"
+                ));
+            }
+
+            // Never lower the stage: use max
+            if max_stage.as_ref().is_none_or(|(s, _, _)| stage >= *s) {
+                max_stage = Some((stage, idx, desc));
+            }
+        }
     }
 
     report
@@ -880,6 +937,200 @@ mod tests {
     }
 
     #[test]
+    fn test_valid_mid_turn_cancel_followed_by_more_output_passes() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+            },
+            // Mid-turn cancel of tool call c1
+            AgentEvent::ToolCallFinished {
+                call_id: "c1".into(),
+                status: ToolStatus::Cancelled,
+                output: None,
+                error: None,
+                truncated_bytes: 0,
+            },
+            // More output follows in the same turn: message delta and completion
+            AgentEvent::MessageDelta {
+                message_id: "m1".into(),
+                kind: MessageKind::Assistant,
+                text: "Tool cancelled, trying alternative approach.".into(),
+            },
+            AgentEvent::MessageCompleted {
+                message_id: "m1".into(),
+                kind: MessageKind::Assistant,
+                body: MessageBody::Streamed {
+                    chars: 44,
+                    deltas: 1,
+                    sha256: "8805f635676755ec50eeb557348eebf995804368a4d70da67285a225674c3e80"
+                        .into(),
+                },
+            },
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Completed,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(0),
+                reason: None,
+            },
+        ];
+        let report = check_events(&events, "simple");
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.contains("violates closing order")),
+            "Expected NO closing order violation for valid mid-turn cancel followed by output, got: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_bad_closing_order_before_session_ended_fails() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+            },
+            // Closing run before SessionEnded: ToolCallFinished(cancelled) at event 3
+            AgentEvent::ToolCallFinished {
+                call_id: "c1".into(),
+                status: ToolStatus::Cancelled,
+                output: None,
+                error: None,
+                truncated_bytes: 0,
+            },
+            // BAD ORDER: MessageCompleted at event 4 appeared after ToolCallFinished(cancelled) at event 3
+            AgentEvent::MessageCompleted {
+                message_id: "m1".into(),
+                kind: MessageKind::Assistant,
+                body: MessageBody::Inline {
+                    text: "Closing message".into(),
+                },
+            },
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Interrupted,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(1),
+                reason: Some("interrupted".into()),
+            },
+        ];
+        let report = check_events(&events, "interrupt");
+        let violation = report
+            .violations
+            .iter()
+            .find(|v| v.contains("violates closing order: messages before cancellations"))
+            .expect("Expected closing order violation for MessageCompleted after ToolCallFinished(cancelled)");
+        assert!(
+            violation.contains("Event 4: MessageCompleted for 'm1' appeared after ToolCallFinished(cancelled) for 'c1' at event 3"),
+            "Expected exact indices in violation message, got: {violation}"
+        );
+    }
+
+    #[test]
+    fn test_closing_order_request_resolved_cancelled_after_turn_completed() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::ApprovalRequested {
+                request_id: "req1".into(),
+                call_id: None,
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+                reason: None,
+                rememberable: false,
+            },
+            AgentEvent::ApprovalRequested {
+                request_id: "req2".into(),
+                call_id: None,
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+                reason: None,
+                rememberable: false,
+            },
+            // TurnCompleted occurs at event index 4
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Interrupted,
+                usage: None,
+            },
+            // BAD ORDER: RequestResolved(cancelled) at event index 5 after TurnCompleted at index 4
+            AgentEvent::RequestResolved {
+                request_id: "req1".into(),
+                outcome: RequestOutcome::Cancelled,
+            },
+            // Another RequestResolved(cancelled) at event index 6: stage must not lower,
+            // so this also flags against TurnCompleted at event index 4!
+            AgentEvent::RequestResolved {
+                request_id: "req2".into(),
+                outcome: RequestOutcome::Cancelled,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(1),
+                reason: Some("interrupted".into()),
+            },
+        ];
+        let report = check_events(&events, "interrupt");
+        let v1 = report
+            .violations
+            .iter()
+            .find(|v| v.contains("Event 5: RequestResolved(cancelled) for 'req1' appeared after TurnCompleted(1) at event 4"))
+            .expect("Expected first violation referencing TurnCompleted at event 4");
+        assert!(
+            v1.contains("violates closing order: requests before turn completion"),
+            "Expected requests before turn completion reason, got: {v1}"
+        );
+
+        let v2 = report
+            .violations
+            .iter()
+            .find(|v| v.contains("Event 6: RequestResolved(cancelled) for 'req2' appeared after TurnCompleted(1) at event 4"))
+            .expect("Expected second violation still referencing TurnCompleted at event 4 (stage was not lowered)");
+        assert!(
+            v2.contains("violates closing order: requests before turn completion"),
+            "Expected requests before turn completion reason, got: {v2}"
+        );
+    }
+
+    #[test]
     fn test_closing_order_per_closure_episode_resets_on_new_turn() {
         let events = vec![
             AgentEvent::SessionStarted {
@@ -950,7 +1201,7 @@ mod tests {
 }
 
 #[test]
-#[ignore = "Cross-adapter consistency violations are tracked and reported in docs/spikes/M0-findings.md"]
+#[ignore = "M1-07, M1-08: fixtures regenerate for rev 3"]
 fn consistency_all_fixtures() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir

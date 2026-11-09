@@ -139,6 +139,7 @@ fn main() {
     }
 
     specta_typescript::Typescript::default()
+        .header("// Note: u64 maps to number; Atrium's ids, ms timestamps and counters stay below 2^53\n")
         .export_to(&out_path, &types, RemapFormat(remapper))
         .expect("failed to export TypeScript definitions");
 

@@ -11,14 +11,21 @@ publish.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 specta = { version = "=2.0.0-rc.26", features = ["derive", "serde_json"], optional = true }
-
-[dev-dependencies]
-specta-typescript = "=0.0.13"
-specta-serde = "=0.0.13"
-specta-util = "=0.0.13"
+specta-typescript = { version = "=0.0.13", optional = true }
+specta-serde = { version = "=0.0.13", optional = true }
+specta-util = { version = "=0.0.13", optional = true }
 
 [features]
-ts = ["dep:specta"]
+ts = [
+    "dep:specta",
+    "dep:specta-typescript",
+    "dep:specta-serde",
+    "dep:specta-util",
+]
+
+[[example]]
+name = "export-ts"
+required-features = ["ts"]
 
 [lints]
 workspace = true

@@ -482,6 +482,32 @@ mod tests {
     }
 
     #[test]
+    fn malformed_escapes_no_panic_and_correct_cleanliness() {
+        let s = Sanitizer::new("/home/user", "user", &["secret_canary"]);
+
+        // Malformed escapes alone: no panic, correctly reported as clean when no secrets present
+        assert!(s.is_clean(r"\u"));
+        assert!(s.is_clean(r"\u12"));
+        assert!(s.is_clean(r"\ud83d"));
+        assert!(s.is_clean(r"\u{110000}"));
+        assert!(s.is_clean(r"\x"));
+
+        // Malformed escapes in context without secret: clean
+        assert!(s.is_clean(r"prefix \u suffix"));
+        assert!(s.is_clean(r"prefix \u12 suffix"));
+        assert!(s.is_clean(r"prefix \ud83d suffix"));
+        assert!(s.is_clean(r"prefix \u{110000} suffix"));
+        assert!(s.is_clean(r"prefix \x suffix"));
+
+        // Malformed escapes with secret adjacent or embedded: correctly detected as unclean
+        assert!(!s.is_clean(r"\usecret_canary"));
+        assert!(!s.is_clean(r"\u12secret_canary"));
+        assert!(!s.is_clean(r"\ud83dsecret_canary"));
+        assert!(!s.is_clean(r"\u{110000}secret_canary"));
+        assert!(!s.is_clean(r"\xsecret_canary"));
+    }
+
+    #[test]
     fn fixture_lines_round_trip() {
         let line = FixtureLine {
             ms: 12,

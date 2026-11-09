@@ -1332,3 +1332,138 @@ fn wire_server_messages_and_error_codes() {
     assert_eq!(FrameKind::try_from(1), Ok(FrameKind::Stream));
     assert_eq!(FrameKind::try_from(99), Err(99));
 }
+
+#[test]
+fn serde_default_fields_omitted() {
+    let dummy_enforcement = EnforcementDescriptor {
+        level: EnforcementLevel::Full,
+        reasons: vec![],
+        provider: Provider::Claude,
+        cli_version: Some("1.0.0".into()),
+        version_tested: true,
+        coverage: vec![],
+        config_sources: vec![],
+    };
+
+    // 1. AgentEvent::SessionStarted with `tools` omitted
+    let json_session_started = json!({
+        "type": "session_started",
+        "provider": "claude",
+        "native_session_id": "s1",
+        "model": null,
+        "enforcement": {
+            "level": "full",
+            "reasons": [],
+            "provider": "claude",
+            "cli_version": "1.0.0",
+            "version_tested": true,
+            "coverage": [],
+            "config_sources": []
+        }
+    });
+    let event: AgentEvent = serde_json::from_value(json_session_started).unwrap();
+    assert_eq!(
+        event,
+        AgentEvent::SessionStarted {
+            provider: Provider::Claude,
+            native_session_id: "s1".into(),
+            model: None,
+            tools: vec![],
+            enforcement: dummy_enforcement,
+        }
+    );
+
+    // 2. AgentEvent::ToolCallFinished with `truncated_bytes` omitted
+    let json_tool_finished = json!({
+        "type": "tool_call_finished",
+        "call_id": "c1",
+        "status": "succeeded",
+        "output": "done",
+        "error": null
+    });
+    let event: AgentEvent = serde_json::from_value(json_tool_finished).unwrap();
+    assert_eq!(
+        event,
+        AgentEvent::ToolCallFinished {
+            call_id: "c1".into(),
+            status: ToolStatus::Succeeded,
+            output: Some("done".into()),
+            error: None,
+            truncated_bytes: 0,
+        }
+    );
+
+    // 3. AgentEvent::ApprovalRequested with `rememberable` omitted
+    let json_approval = json!({
+        "type": "approval_requested",
+        "request_id": "r1",
+        "call_id": null,
+        "name": "Bash",
+        "kind": "execute",
+        "title": null,
+        "input": {},
+        "reason": null
+    });
+    let event: AgentEvent = serde_json::from_value(json_approval).unwrap();
+    assert_eq!(
+        event,
+        AgentEvent::ApprovalRequested {
+            request_id: "r1".into(),
+            call_id: None,
+            name: "Bash".into(),
+            kind: ToolKind::Execute,
+            title: None,
+            input: json!({}),
+            reason: None,
+            rememberable: false,
+        }
+    );
+
+    // 4. AgentEvent::Error with `details` omitted
+    let json_error = json!({
+        "type": "error",
+        "message": "fatal crash",
+        "fatal": true
+    });
+    let event: AgentEvent = serde_json::from_value(json_error).unwrap();
+    assert_eq!(
+        event,
+        AgentEvent::Error {
+            message: "fatal crash".into(),
+            fatal: true,
+            details: vec![],
+        }
+    );
+
+    // 5. Question with `options`, `multi_select`, and `allow_text` omitted
+    let json_question = json!({
+        "id": "q1",
+        "prompt": "What is your preference?"
+    });
+    let question: Question = serde_json::from_value(json_question).unwrap();
+    assert_eq!(
+        question,
+        Question {
+            id: "q1".into(),
+            prompt: "What is your preference?".into(),
+            options: vec![],
+            multi_select: false,
+            allow_text: false,
+        }
+    );
+
+    // 6. QuestionAnswer with `selected` omitted
+    let json_answer = json!({
+        "question_id": "q1",
+        "text": "my custom answer"
+    });
+    let answer: QuestionAnswer = serde_json::from_value(json_answer).unwrap();
+    assert_eq!(
+        answer,
+        QuestionAnswer {
+            question_id: "q1".into(),
+            selected: vec![],
+            text: Some("my custom answer".into()),
+        }
+    );
+}
