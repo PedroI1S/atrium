@@ -64,3 +64,13 @@ Feedback on CR-02 and three small amendments to `docs/design/ui-direction.md`, f
 **Why**: (1) and (2) describe what the platform can do; (3)–(5) close gaps the spike hit. Details and measurements: `docs/spikes/M0-06b-ui-shell-layout-b.md` ("CR-02 feedback").
 
 **Affected**: `docs/design/ui-direction.md` §3 and §5, the Calm theme files' `[component]` tables, CR-02's text. No Rust contract is touched.
+
+## CR-05 — M1-10-host (orchestrator, from review) — 2026-11-09
+
+The M1 contract (§4, and `crates/atrium-host/src/peer.rs` doc comments) names `SecCodeCreateWithAuditToken` for macOS peer verification. Sonnet's M1-10 review found it isn't in the public Security headers: it's exported, but undocumented, and linking it directly would make the daemon fail to load on a macOS that lacks it.
+
+**Change**: in §4 and on `verify_app_peer`, "audit token → `SecCodeCreateWithAuditToken`" becomes "audit token → `SecCodeCopyGuestWithAttributes` with `kSecGuestAttributeAudit`" (the documented route to the same code object). Also make explicit that the unsigned dev-build cdhash comes from the **running** (dynamic) code object, which §4 already intends ("never a hash of the file on disk"). No signature or behaviour change. macOS 11 is the stated minimum.
+
+**Why**: an undocumented symbol is an ABI and availability risk on the security-critical path.
+
+**Affected**: `docs/contracts/m1.md` §4 wording, doc comments in `crates/atrium-host/src/peer.rs` (M1-10 updates them in its fix round). **Needs the driver's approval** (frozen contract, D-051).
