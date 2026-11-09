@@ -231,7 +231,7 @@ Pedro's Codex subscription has ended, so GPT-6.1 Sol and GPT-6 Astra are unavail
 - Argon keeps its M1 role (adversarial tests of the deny list and approval rules, socket permissions), and Flash keeps tests, fixtures and docs.
 - Live Codex work (X1–X3) needs a Codex login. On rodrigo's shifts their Codex can be used, under the same rules.
 
-`agy` is now 1.5.1. The worker policy hook was last verified on 1.4.7, so it is re-checked before the first agy worker runs (PLAN §8.7).
+`agy` is now 1.5.1. The worker policy hook was last verified on 1.4.7, so it is re-checked before the first agy worker runs (PLAN §8.7). *Update, same day:* re-checked on 1.5.1, and again on 1.5.3 after agy updated itself mid-session: `cargo` allowed, `.agents/` writes and `git push` denied. `scripts/doctor` now pins 1.5.3.
 
 ## D-044 — 2026-11-09 — Enforcement is per session; unverified coverage shows as Partial (G1)
 **Decided by Pedro (owner, D-013).** Enforcement is a property of each session, not of a provider. Each session records a descriptor: effective level, reasons, provider and CLI version, and the tool coverage that was verified.

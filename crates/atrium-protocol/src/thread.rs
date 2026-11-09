@@ -75,6 +75,12 @@ pub struct ThreadSummary {
     pub unread: bool,
     pub pending_approvals: u32,
     pub pending_questions: u32,
+    /// Since when the thread has needed the user (pending request, failure,
+    /// unverified cleanup, unread reply); `None` when it doesn't.
+    pub attention_since_ms: Option<u64>,
+    /// The ask itself, for the inbox: the oldest pending approval's title,
+    /// the question's first prompt, the error message.
+    pub attention_detail: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }

@@ -24,6 +24,8 @@ CREATE TABLE threads (
     unread             INTEGER NOT NULL DEFAULT 0,
     pending_approvals  INTEGER NOT NULL DEFAULT 0,
     pending_questions  INTEGER NOT NULL DEFAULT 0,
+    attention_since_ms INTEGER,
+    attention_detail   TEXT,
     archived           INTEGER NOT NULL DEFAULT 0,
     created_ms         INTEGER NOT NULL,
     updated_ms         INTEGER NOT NULL
@@ -76,7 +78,8 @@ CREATE TABLE open_messages (
     kind         TEXT NOT NULL,                 -- MessageKind
     chars        INTEGER NOT NULL DEFAULT 0,
     deltas       INTEGER NOT NULL DEFAULT 0,
-    sha256_state BLOB,                          -- incremental hash state, if kept
+    -- The running SHA-256 lives in the writer task's memory; after a crash
+    -- it is recomputed from this message's stored deltas.
     PRIMARY KEY (thread_id, incarnation, message_id)
 );
 
@@ -88,8 +91,8 @@ CREATE TABLE open_tool_calls (
     PRIMARY KEY (thread_id, incarnation, call_id)
 );
 
--- The approval ledger's persisted state (contract §5). Updated in the same
--- transaction as the event that opened or closed the request.
+-- The approval ledger's persisted state (contract §5). `status` is written
+-- only by the ledger (through RequestStore), never by event appends.
 CREATE TABLE requests (
     thread_id     TEXT NOT NULL,
     incarnation   INTEGER NOT NULL,
@@ -101,9 +104,13 @@ CREATE TABLE requests (
     input_sha256  TEXT,
     context       TEXT,                         -- PolicyContext (JSON)
     title         TEXT,
+    remember_matcher TEXT,                      -- RuleMatcher (JSON); NULL: not rememberable
     status        TEXT NOT NULL,                -- 'pending' | 'approved' | 'redeemed' | 'denied' | 'answered' | 'cancelled' | 'expired'
     opened_ms     INTEGER NOT NULL,
     resolved_ms   INTEGER,
+    -- Set by the store when the RequestResolved event is stored; the ledger
+    -- never touches it. Rows with 0 are "open" for closing (OpenItems).
+    event_closed  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (thread_id, incarnation, request_id)
 );
 CREATE INDEX requests_pending ON requests (status) WHERE status = 'pending';

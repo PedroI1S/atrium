@@ -69,8 +69,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use atrium_host::supervise::ProcessIdentity;
 use atrium_protocol::agent::{AgentEvent, AgentEventEnvelope, Provider, SessionCommand, ToolKind};
-use atrium_protocol::policy::EnforcementDescriptor;
+use atrium_protocol::policy::{EnforcementDescriptor, ToolSubject};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -78,6 +79,9 @@ use tokio::sync::mpsc;
 pub mod fixture;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// See [`SessionConfig::on_spawn`].
+pub type OnSpawn = Arc<dyn Fn(&ProcessIdentity) + Send + Sync>;
 
 pub const EVENT_BUFFER: usize = 1024;
 pub const COMMAND_BUFFER: usize = 64;
@@ -116,6 +120,10 @@ pub struct Session {
     /// The enforcement this session actually got (same as
     /// `SessionStarted.enforcement`).
     pub descriptor: EnforcementDescriptor,
+    /// The provider process (also reported earlier through
+    /// [`SessionConfig::on_spawn`]). `None` only for transports without a
+    /// local process.
+    pub process: Option<ProcessIdentity>,
     /// Closed after [`AgentEvent::SessionEnded`].
     pub events: mpsc::Receiver<AgentEventEnvelope>,
     pub commands: mpsc::Sender<SessionCommand>,
@@ -137,6 +145,12 @@ pub struct SessionConfig {
     pub env: Vec<(String, String)>,
     /// Override the CLI binary (default: found on `PATH`).
     pub program: Option<PathBuf>,
+    /// Called once, right after the provider process is spawned and before
+    /// the handshake, so the daemon records it for crash recovery. An adapter
+    /// never spawns a second provider process inside one `Session`: if an
+    /// interrupt has to kill the process, the session ends and the daemon
+    /// resumes in a new incarnation.
+    pub on_spawn: Option<OnSpawn>,
 }
 
 impl fmt::Debug for SessionConfig {
@@ -222,23 +236,38 @@ pub trait ToolGate: Send + Sync {
     /// Opens a ledger entry for a question the provider asked. `None` if the
     /// gate is unreachable: the adapter then declines the question to the
     /// provider and emits nothing for it.
-    fn question_ticket(&self) -> BoxFuture<'_, Option<ApprovalTicket>>;
+    fn question_ticket(&self, turn: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>>;
 }
 
 /// A ledger entry's handle. `request_id` is what the events and commands use.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ApprovalTicket {
     pub request_id: String,
+    /// Copied into `ApprovalRequested.rememberable`. Always `false` for
+    /// question tickets.
+    #[serde(default)]
+    pub rememberable: bool,
 }
 
 /// A tool call the provider is about to run.
+///
+/// For [`ToolGate::redeem`], build it from the provider's own approval
+/// request (e.g. the `can_use_tool` payload), never from a cached earlier
+/// check, so a changed input is caught.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCheck {
     pub call_id: Option<String>,
     pub name: String,
+    /// `Execute` whenever `subject` is a command, whatever the provider calls
+    /// the tool.
     pub kind: ToolKind,
     pub title: Option<String>,
     pub input: Value,
+    /// Extracted by the adapter; `Unknown` when it can't (the policy asks).
+    pub subject: ToolSubject,
+    /// The adapter's own turn counter for this incarnation, so the binding
+    /// never races the event stream.
+    pub turn: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +336,12 @@ pub enum AdapterInput {
         ticket: ApprovalTicket,
         check: ToolCheck,
         decision: GateDecision,
+    },
+    /// What [`ToolGate::question_ticket`] returned for the provider's question
+    /// `id` (its native id); `None` means the question was declined.
+    QuestionTicket {
+        id: String,
+        ticket: Option<ApprovalTicket>,
     },
     /// A hook connection closed before it was answered (its Ask is cancelled).
     HookDisconnected {

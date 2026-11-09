@@ -51,8 +51,10 @@ pub fn spawn_group(command: tokio::process::Command) -> io::Result<SupervisedChi
 }
 
 /// After the adapter's provider-specific soft stop: waits up to `grace` for
-/// the leader, then `SIGKILL`s the whole group, and reaps the leader. Also
-/// kills the group when the leader exited on its own but descendants remain.
+/// the leader, then `SIGKILL`s the whole group, and only then reaps the
+/// leader (so the group id can't be reused in between; use `WNOWAIT` to see
+/// an early exit without reaping). Also kills the group when the leader
+/// exited on its own but descendants remain.
 pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Result<Termination> {
     let _ = (child, grace);
     unimplemented!("M1-10")
@@ -64,10 +66,13 @@ pub fn identify(pid: u32) -> io::Result<Option<ProcessIdentity>> {
     unimplemented!("M1-10")
 }
 
-/// Daemon recovery: kills the recorded process group only if `recorded` still
-/// identifies the same process. `Verified` if it was killed or is already
-/// gone; `Unverified` if the pid now belongs to something else or can't be
-/// inspected.
+/// Daemon recovery. If the leader still matches `recorded`, kills the group
+/// and returns `Verified`. If the leader is gone, returns `Verified` only if
+/// the group is empty too (`kill(-pgid, 0)` fails with `ESRCH`); if processes
+/// remain in the group that can't be shown to descend from the recorded
+/// leader (started at or after it), returns `Unverified` without killing.
+/// If the pid now belongs to another executable or can't be inspected:
+/// `Unverified`, nothing killed.
 pub fn kill_recorded(recorded: &ProcessIdentity) -> Cleanup {
     let _ = recorded;
     unimplemented!("M1-10")

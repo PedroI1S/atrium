@@ -103,12 +103,13 @@ fn wire_messages() {
         &ServerMessage::Response {
             request_id: 7,
             result: CommandResult::Err {
+                code: ErrorCode::UnknownThread,
                 message: "no such thread".into(),
             },
         },
         json!({
             "type": "response", "request_id": 7,
-            "result": {"status": "err", "message": "no such thread"}
+            "result": {"status": "err", "code": "unknown_thread", "message": "no such thread"}
         }),
     );
     assert_eq!(FrameKind::try_from(1), Ok(FrameKind::Stream));

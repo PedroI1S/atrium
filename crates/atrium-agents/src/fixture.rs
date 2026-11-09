@@ -158,7 +158,8 @@ impl Sanitizer {
             // (gate review: the sanitizer ignored `Command`).
             AdapterInput::Command { command } => self.command(command),
             AdapterInput::WriteFailed { error } => *error = self.text(error),
-            AdapterInput::HookDisconnected { .. }
+            AdapterInput::QuestionTicket { .. }
+            | AdapterInput::HookDisconnected { .. }
             | AdapterInput::Deadline { .. }
             | AdapterInput::Exit { .. } => {}
         }

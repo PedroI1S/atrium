@@ -20,13 +20,23 @@ pub enum LifecycleError {
 }
 
 /// `~/Library/Application Support/Atrium` on macOS, `$XDG_RUNTIME_DIR/atrium`
-/// (socket, lock) and `$XDG_DATA_HOME/atrium` (store) on Linux.
+/// (socket, lock) and `$XDG_DATA_HOME/atrium` (store) on Linux. `ATRIUM_HOME`,
+/// when set, replaces both roots (tests and development only; release
+/// daemons ignore it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub runtime_dir: PathBuf,
     pub data_dir: PathBuf,
     pub socket: PathBuf,
+    /// Holds the daemon's `ProcessIdentity` (JSON) while it runs, so an
+    /// upgraded app can find and verify it.
     pub lock: PathBuf,
+    /// `data_dir/atrium.db` (+ WAL).
+    pub store: PathBuf,
+    pub snapshots_dir: PathBuf,
+    pub logs_dir: PathBuf,
+    /// `data_dir/app-identity.json`, used only by development builds.
+    pub app_identity: PathBuf,
 }
 
 pub fn default_paths() -> std::io::Result<Paths> {
@@ -48,7 +58,12 @@ impl InstanceLock {
 }
 
 /// Starts `atriumd` detached (new session, stdio to the log file), for the
-/// app when it finds no daemon. Returns its pid.
+/// app when it finds no daemon. The log is opened with `O_NOFOLLOW`, created
+/// mode 0600, and refused if it exists with another owner or a looser mode.
+/// Returns its pid.
+///
+/// `atriumd` handles `SIGTERM` by exiting once no turn is running, and
+/// `SIGINT` by interrupting running turns (resumable) and exiting now.
 pub fn spawn_detached(executable: &Path, args: &[String], log: &Path) -> std::io::Result<u32> {
     let _ = (executable, args, log);
     unimplemented!("M1-10")

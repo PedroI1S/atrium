@@ -53,3 +53,39 @@ fn canonical_input_ignores_key_order_and_whitespace_only() {
 fn gate_failure_denies() {
     unimplemented!()
 }
+
+#[test]
+#[ignore = "M1-03"]
+fn newline_separates_commands() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn home_readonly_flag_guards_ask() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn whole_home_recursive_search_asks() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn unknown_subject_never_allowed_by_rules() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn hard_deny_applies_to_searches_and_inside_substitutions() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn shell_commands_are_execute_whatever_the_provider_says() {
+    unimplemented!()
+}

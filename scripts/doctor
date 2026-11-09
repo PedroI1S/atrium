@@ -22,7 +22,11 @@ echo "Tools"
 check git git --version
 check gh gh --version
 check claude claude --version
-check codex codex --version
+if command -v codex >/dev/null 2>&1; then
+  check codex codex --version
+else
+  echo "  - codex    not installed (optional: Codex live work runs on a driver with a Codex login, D-047)"
+fi
 check agy agy --version
 check cargo cargo --version
 check node node --version
@@ -43,8 +47,42 @@ else
   failed=1
 fi
 
+echo "Repo location (D-030, D-036)"
+# Cloud-synced folders create conflict copies inside the tree and .git.
+synced() { # <real path>
+  case "$1" in
+    "$HOME/Documents"/*|"$HOME/Desktop"/*|"$HOME/Library/Mobile Documents"/*|"$HOME/Library/CloudStorage"/*|*/Dropbox/*|*/OneDrive*/*|*"/Google Drive"/*) return 0 ;;
+  esac
+  return 1
+}
+gitdir="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
+wt="$(cd "$root/.." && pwd -P)/atrium-wt"
+for path in "$(pwd -P)" "$gitdir" "$wt"; do
+  if synced "$path/"; then
+    echo "  ✗ synced   $path is inside a cloud-synced folder: move the repo (README, Conventions)"
+    failed=1
+  fi
+done
+[[ $failed -eq 0 ]] && echo "  ✓ paths    repo, .git and atrium-wt are outside synced folders"
+if git fsck --connectivity-only --no-dangling >/dev/null 2>&1; then
+  echo "  ✓ git      fsck (connectivity) passed"
+else
+  echo "  ✗ git      fsck failed: the repository is damaged"
+  failed=1
+fi
+# iCloud-style conflict copies: "name 2.ext", "name 3" (tracked or not).
+copies="$(find . \( -name target -o -name node_modules -o -name .git -o -name .orchestration \) -prune -o \
+  \( -name '* [0-9]' -o -name '* [0-9].*' \) -print 2>/dev/null | head -5)"
+if [[ -n "$copies" ]]; then
+  echo "  ✗ copies   conflict copies found (first 5):"
+  printf '%s\n' "$copies" | sed 's/^/      /'
+  failed=1
+else
+  echo "  ✓ copies   no conflict copies in the tree"
+fi
+
 echo "agy worker policy (D-002, D-006)"
-tested="1.4.7"
+tested="1.5.3"
 version="$(agy --version 2>/dev/null || true)"
 if [[ "$version" != "$tested" ]]; then
   echo "  ! agy $version differs from the tested $tested: re-run the hook check in docs/agents/HANDOFF.md before dispatching agy workers"

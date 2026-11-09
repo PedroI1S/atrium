@@ -22,18 +22,23 @@ pub const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 /// `Error::details`.
 pub const MAX_DIAGNOSTIC_LINES: usize = 50;
 pub const MAX_DIAGNOSTIC_LINE_BYTES: usize = 2 * 1024;
-/// Pending approvals + questions per session. More: the adapter denies the
-/// new request (`Deny { reason: "too many pending requests" }`).
+/// Pending approvals + questions per session, enforced by the ledger before
+/// it inserts: more makes the gate answer `Deny { reason: "too many pending
+/// requests" }` (or `None` for a question).
 pub const MAX_PENDING_REQUESTS: usize = 64;
+/// `Unmapped.raw` is cut to this.
+pub const MAX_UNMAPPED_RAW_BYTES: usize = 64 * 1024;
 /// Closing events an adapter keeps for a receiver that isn't reading, so
 /// `SessionEnded` is never lost (contract §10).
 pub const TERMINAL_TAIL_EVENTS: usize = 4096;
 
 // ---- Store ----
 
-/// One stored event's JSON payload. Tool output is already capped, so this is
-/// only reached by a bug; the event is replaced by a fatal `Error`.
-pub const MAX_EVENT_BYTES: usize = 2 * 1024 * 1024;
+/// One stored event's JSON payload. Above every per-field limit (a provider
+/// record is at most 8 MiB), so only a bug reaches it: the store rejects the
+/// batch with `StoreError::EventTooLarge` and the daemon ends the session with
+/// a fatal `Error`. Below `MAX_FRAME_LEN` with room for the envelope.
+pub const MAX_EVENT_BYTES: usize = 10 * 1024 * 1024;
 /// Below this much free space on the data volume, the store goes read-only.
 pub const MIN_FREE_DISK_BYTES: u64 = 512 * 1024 * 1024;
 /// SQLite page cache per connection (`PRAGMA cache_size = -<KiB>`).
@@ -63,7 +68,12 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per window, bytes queued for delivery. Past it the window is marked
 /// `needs_resync` and its queue dropped.
 pub const MAX_WINDOW_QUEUE_BYTES: usize = 16 * 1024 * 1024;
-/// `data:` images rendered inline in agent content.
+/// Rendered transcript a thread view keeps loaded (text and tool output);
+/// older parts are dropped from the view and paged back from the client on
+/// scroll (streaming memory, gate review).
+pub const MAX_LOADED_TRANSCRIPT_BYTES: usize = 8 * 1024 * 1024;
+/// `data:` raster images (png, jpeg, gif, webp) rendered inline in agent
+/// content. SVG is never rendered inline.
 pub const MAX_INLINE_IMAGE_BYTES: usize = 1024 * 1024;
 
 // ---- Attention ----

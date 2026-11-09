@@ -59,9 +59,11 @@
 //!    the earlier subscription and replays from the new cursor.
 //! 3. Commands carry a client-chosen `request_id`; the daemon answers each with
 //!    exactly one [`ServerMessage::Response`].
-//! 4. [`ClientMessage::SubscribeInbox`] streams [`ServerMessage::ThreadUpdated`]
-//!    and [`ServerMessage::InboxUpdated`] for every thread, starting with the
-//!    full current set.
+//! 4. [`ClientMessage::SubscribeInbox`] is answered with `Response { Ok
+//!    {"threads": [ThreadSummary], "inbox": [InboxItem]} }` (the full current
+//!    set), then [`ServerMessage::ThreadUpdated`] and
+//!    [`ServerMessage::InboxUpdated`] for every later change, in order, on the
+//!    control lane.
 //!
 //! # Lanes and slow readers
 //!
@@ -91,7 +93,7 @@ use serde_json::Value;
 use crate::agent::{
     AgentEventEnvelope, ApprovalDecision, Provider, QuestionAnswer, SessionCommand,
 };
-use crate::policy::{Preset, RememberScope, Rule, RuleId};
+use crate::policy::{EnforcementDescriptor, Preset, RememberScope, RuleDraft, RuleId};
 use crate::thread::{InboxItem, ThreadSummary};
 
 pub use crate::thread::ThreadId;
@@ -200,6 +202,15 @@ pub enum DaemonCommand {
     },
     /// Value: `Vec<ThreadSummary>`, newest first, archived ones excluded.
     ListThreads,
+    /// Runs `AgentAdapter::probe` for every provider with this preset, for
+    /// the provider picker and settings. Value: `Vec<ProviderProbe>`.
+    ProbeProviders {
+        preset: Preset,
+    },
+    RenameThread {
+        thread_id: ThreadId,
+        title: String,
+    },
     /// Value: [`ThreadSummary`].
     GetThread {
         thread_id: ThreadId,
@@ -212,7 +223,7 @@ pub enum DaemonCommand {
     },
     /// Validated by the approval ledger before the session sees it (D-046).
     /// An unknown, resolved, expired or older-incarnation request is
-    /// `Err { message: "expired" }`. `remember` with `Allow` also creates a
+    /// `Err { code: Expired }`. `remember` with `Allow` also creates a
     /// rule in the same transaction. Value: `{"rule_id": RuleId|null}`.
     ResolveApproval {
         thread_id: ThreadId,
@@ -249,9 +260,9 @@ pub enum DaemonCommand {
     ListInbox,
     /// Value: `Vec<Rule>`.
     ListRules,
-    /// Value: [`Rule`] (with its new id).
+    /// The daemon assigns id, origin (`Settings`) and time. Value: `Rule`.
     CreateRule {
-        rule: Rule,
+        rule: RuleDraft,
     },
     DeleteRule {
         rule_id: RuleId,
@@ -268,7 +279,9 @@ pub enum DaemonCommand {
         key: String,
         value: Value,
     },
-    /// Exit when no turn is running, or now if `force` (upgrades, §10).
+    /// Upgrades (contract §10). Without `force`: exits now if no turn is
+    /// running, else `Err { code: TurnsRunning }` and nothing changes. With
+    /// `force`: running turns are interrupted (resumable) and it exits.
     ShutdownDaemon {
         force: bool,
     },
@@ -281,6 +294,15 @@ impl DaemonCommand {
     pub fn authority(&self) -> Authority {
         Authority::HumanControl
     }
+}
+
+/// One provider's probe result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderProbe {
+    pub provider: Provider,
+    /// `None` when the CLI isn't installed.
+    pub enforcement: Option<EnforcementDescriptor>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,9 +347,15 @@ pub enum ServerMessage {
         /// The role granted (always the one asked for; otherwise `Incompatible`).
         role: ClientRole,
     },
+    /// Sent before closing. Carries what an upgraded app needs to replace an
+    /// older daemon (contract §10): its pid (also in the lock file, with its
+    /// process identity) and whether turns are running.
     Incompatible {
         protocol_version: u32,
         message: String,
+        daemon_version: String,
+        daemon_pid: u32,
+        running_turns: u32,
     },
     Event {
         event: StoredEvent,
@@ -362,5 +390,23 @@ pub enum ServerMessage {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommandResult {
     Ok { value: Value },
-    Err { message: String },
+    Err { code: ErrorCode, message: String },
+}
+
+/// What clients branch on; `message` is for people.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// The approval or question is unknown, resolved, expired, or from an
+    /// older incarnation. The UI shows it as expired.
+    Expired,
+    UnknownThread,
+    /// The thread has no live session (resume it first).
+    NotRunning,
+    StorageReadOnly,
+    TurnsRunning,
+    /// The connection's role can't send this command.
+    Forbidden,
+    Invalid,
+    Internal,
 }

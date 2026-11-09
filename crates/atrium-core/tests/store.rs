@@ -41,3 +41,27 @@ fn snapshot_is_private_and_pruned() {
 fn incarnations_scope_sequences_and_requests() {
     unimplemented!()
 }
+
+#[test]
+#[ignore = "M1-02"]
+fn stale_incarnation_batch_is_rejected() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-02"]
+fn read_only_store_still_accepts_closing_batches_and_signals() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-02"]
+fn store_never_changes_request_status() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-02"]
+fn attention_fields_follow_events() {
+    unimplemented!()
+}

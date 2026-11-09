@@ -23,3 +23,15 @@ fn unverified_cleanup_is_never_shown_as_stopped() {
 fn notifications_are_rate_limited_and_suppressed_when_focused() {
     unimplemented!()
 }
+
+#[test]
+#[ignore = "M1-04"]
+fn failed_and_paused_are_sticky_through_exit() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-04"]
+fn user_stop_ends_as_ended_whatever_the_exit_code() {
+    unimplemented!()
+}

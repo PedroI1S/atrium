@@ -153,7 +153,9 @@ pub struct EnforcementDescriptor {
 impl EnforcementDescriptor {
     /// The only way adapters build a descriptor: computes `level` and adds a
     /// reason for everything that isn't verified. `extra` reasons (e.g.
-    /// `ExternalHooks`, `GateUnreachable`) always make it Partial.
+    /// `ExternalHooks`, `GateUnreachable`) always make it Partial. A missing
+    /// `cli_version` is never Full, and when a class has several entries the
+    /// weakest one counts.
     pub fn evaluate(
         provider: Provider,
         cli_version: Option<String>,
@@ -163,7 +165,7 @@ impl EnforcementDescriptor {
         extra: Vec<EnforcementReason>,
     ) -> Self {
         let mut reasons = extra;
-        if !version_tested {
+        if !version_tested || cli_version.is_none() {
             reasons.push(EnforcementReason {
                 code: ReasonCode::UntestedVersion,
                 message: match &cli_version {
@@ -173,20 +175,29 @@ impl EnforcementDescriptor {
             });
         }
         for class in ToolClass::ALL {
-            let found = coverage
+            let entries: Vec<Coverage> = coverage
                 .iter()
-                .find(|c| c.class == class)
-                .map(|c| c.coverage);
-            let code = match found {
-                Some(Coverage::Intercepted | Coverage::NotApplicable) => continue,
-                Some(Coverage::ProviderGated | Coverage::NotIntercepted) => {
-                    ReasonCode::ClassNotIntercepted
-                }
-                Some(Coverage::Unknown) | None => ReasonCode::CoverageUnknown,
+                .filter(|c| c.class == class)
+                .map(|c| c.coverage)
+                .collect();
+            let weakest = if entries.is_empty() || entries.contains(&Coverage::Unknown) {
+                Coverage::Unknown
+            } else if let Some(bad) = entries
+                .iter()
+                .copied()
+                .find(|c| !matches!(c, Coverage::Intercepted | Coverage::NotApplicable))
+            {
+                bad
+            } else {
+                continue;
+            };
+            let code = match weakest {
+                Coverage::Unknown => ReasonCode::CoverageUnknown,
+                _ => ReasonCode::ClassNotIntercepted,
             };
             reasons.push(EnforcementReason {
                 code,
-                message: format!("{class:?} calls: {:?}", found.unwrap_or(Coverage::Unknown)),
+                message: format!("{class:?} calls: {weakest:?}"),
             });
         }
         for source in config_sources.iter().filter(|s| !s.inspected) {
@@ -268,6 +279,53 @@ pub enum RuleMatcher {
 #[serde(transparent)]
 pub struct RuleId(pub String);
 
+/// What a tool call acts on, extracted by the adapter so the policy engine
+/// never guesses from provider-specific input shapes (review finding 3).
+/// Anything the adapter can't extract is `Unknown`, which the policy treats
+/// as `Ask` (after the hard-deny check on the raw input).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolSubject {
+    /// A shell command line. The call's `kind` is always `Execute`, whatever
+    /// the provider calls it (e.g. Codex `commandExecution` with read
+    /// actions).
+    Command {
+        line: String,
+        /// The directory it runs in, if not the thread's cwd.
+        cwd: Option<String>,
+    },
+    /// File tools: every path the call reads or writes, as given (the gate
+    /// resolves them). Searches give their root and glob.
+    Paths {
+        paths: Vec<String>,
+        /// For searches: the glob or pattern scope, if any.
+        glob: Option<String>,
+        recursive: bool,
+    },
+    Fetch {
+        url: String,
+    },
+    Mcp {
+        server: String,
+        tool: String,
+    },
+    /// No side effects outside the conversation (e.g. thinking, plans).
+    None,
+    Unknown,
+}
+
+/// A rule as a client creates it; the daemon assigns `id`, `origin` and
+/// `created_at_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleDraft {
+    pub scope: RuleScope,
+    pub tool_kind: ToolKind,
+    pub tool_name: Option<String>,
+    pub matcher: RuleMatcher,
+    pub path_scope: Option<String>,
+    pub decision: RuleDecision,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleOrigin {
@@ -303,7 +361,8 @@ pub struct PolicyContext {
 }
 
 // ---------------------------------------------------------------------------
-// Hard-deny defaults (§9). NEEDS PEDRO'S EXPLICIT APPROVAL (D-013).
+// Hard-deny defaults and Home's auto-allowed commands (§9). Approved by
+// Pedro (D-050). Changes need his approval (D-013).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,36 +372,142 @@ pub struct HardDenyDefault {
     pub description: &'static str,
 }
 
-/// The M1 defaults. Matching lives in `atrium-core::policy`; each entry has
-/// adversarial tests (M1-13). No rule or remembered decision overrides them
-/// for calls the gate sees.
+/// Matching lives in `atrium-core::policy`; each entry has adversarial tests
+/// (M1-13). No rule or remembered decision overrides them for calls the gate
+/// sees. Applies to every tool kind whose subject names a matching command
+/// or path, searches included.
 pub const HARD_DENY_DEFAULTS: &[HardDenyDefault] = &[
     HardDenyDefault {
         id: "recursive-delete-outside-cwd",
-        description: "Recursive delete (rm -r, find -delete, …) of a path outside the thread's folder, or of ~ or /",
+        description: "Recursive delete (rm -r, find -delete, …) of a path outside the thread's folder, of the folder itself, or of ~, / or any ancestor of ~. In Home, `.` is ~, so it counts.",
     },
     HardDenyDefault {
         id: "force-push-protected",
-        description: "Force-push (--force, -f, --force-with-lease, +refspec) to main, master, release/* or the remote's default branch",
+        description: "Force-push (--force, -f, --force-with-lease, --force-if-includes, +refspec) unless every destination is an explicit branch that isn't main, master, dev, develop, trunk or release/*. A bare force-push, or one whose destination is HEAD or implicit, is blocked.",
     },
     HardDenyDefault {
         id: "credential-read",
-        description: "Reading credential stores: ~/.ssh private keys, ~/.aws/credentials, ~/.netrc, gh/docker/kube credentials, ~/.gnupg, browser login and cookie databases, keychain and secret-tool lookups",
+        description: "Reading or writing credential stores: every private key and the config and authorized_keys in ~/.ssh, ~/.aws/credentials, ~/.netrc, ~/.git-credentials, ~/.npmrc, ~/.docker/config.json, ~/.kube/config, ~/.gnupg, ~/.config/gh/hosts.yml, ~/.config/gcloud, agent tokens (~/.claude/.credentials.json, ~/.claude.json, ~/.codex/auth.json, ~/.gemini), browser login and cookie databases, keychain dumps and lookups (security find-*-password, dump-keychain), secret-tool lookup",
     },
     HardDenyDefault {
         id: "pipe-to-shell",
-        description: "Downloading and piping into a shell or interpreter (curl … | sh, wget -O- … | bash, …) outside a sandbox",
+        description: "Running downloaded code outside a sandbox: curl or wget piped into a shell or interpreter, or used in command or process substitution with sh, bash, zsh, eval or source (bash -c \"$(curl …)\", sh <(curl …))",
     },
     HardDenyDefault {
         id: "atrium-self",
-        description: "Writing to Atrium's own data, socket and app folders",
+        description: "Reading Atrium's data (database, WAL, snapshots, logs: other threads' transcripts) and writing its data, config, socket and service files or its app",
     },
     HardDenyDefault {
         id: "privilege-escalation",
-        description: "sudo, su, doas",
+        description: "sudo, su, doas, pkexec, run0, osascript … with administrator privileges",
     },
     HardDenyDefault {
         id: "disk-wipe",
         description: "Formatting or overwriting disks (mkfs, dd of=/dev/…, diskutil erase…)",
     },
+];
+
+/// A command Home allows without asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadOnlyCommand {
+    /// The argv prefix, e.g. `["git", "log"]`.
+    pub prefix: &'static [&'static str],
+    /// Flags that make it write, execute or configure something; their
+    /// presence (as `--flag`, `--flag=…` or a combined short flag) means ask.
+    pub forbidden: &'static [&'static str],
+    /// If set, every further argument must be one of these flags (no
+    /// positional arguments), e.g. `git branch` only lists.
+    pub only: Option<&'static [&'static str]>,
+}
+
+const GIT_FORBIDDEN: &[&str] = &[
+    "--output",
+    "--ext-diff",
+    "--exec-path",
+    "--config-env",
+    "-c",
+];
+
+const fn cmd(prefix: &'static [&'static str]) -> ReadOnlyCommand {
+    ReadOnlyCommand {
+        prefix,
+        forbidden: &[],
+        only: None,
+    }
+}
+
+const fn git(sub: &'static [&'static str]) -> ReadOnlyCommand {
+    ReadOnlyCommand {
+        prefix: sub,
+        forbidden: GIT_FORBIDDEN,
+        only: None,
+    }
+}
+
+/// Commands Home allows without asking (D-050), when the whole line is one
+/// simple command (or several joined by `&&`, `||`, `;`, `|`, each allowed)
+/// with no `$` expansion, globs, brace expansion or newline, and no
+/// `git -c`/`--config-env`/`--exec-path`. The hard-deny list applies on top
+/// (so `cat ~/.ssh/id_ed25519` is blocked). A recursive search rooted at `~`
+/// itself asks (D-050).
+///
+/// Known limit, stated in settings: a repository's own `.git/config` can make
+/// git run programs (`core.fsmonitor`, textconv and diff drivers), so
+/// auto-allowed git reads trust the repositories already on disk.
+pub const HOME_READONLY_COMMANDS: &[ReadOnlyCommand] = &[
+    cmd(&["ls"]),
+    cmd(&["pwd"]),
+    cmd(&["cat"]),
+    cmd(&["head"]),
+    cmd(&["tail"]),
+    cmd(&["wc"]),
+    ReadOnlyCommand {
+        prefix: &["file"],
+        forbidden: &["-C", "--compile", "-m", "--magic-file"],
+        only: None,
+    },
+    cmd(&["stat"]),
+    cmd(&["du"]),
+    cmd(&["df"]),
+    cmd(&["which"]),
+    cmd(&["uname"]),
+    ReadOnlyCommand {
+        prefix: &["date"],
+        forbidden: &["-s", "--set"],
+        only: None,
+    },
+    cmd(&["whoami"]),
+    ReadOnlyCommand {
+        prefix: &["tree"],
+        forbidden: &["-o"],
+        only: None,
+    },
+    ReadOnlyCommand {
+        prefix: &["rg"],
+        forbidden: &["--pre", "--pre-glob", "-z", "--search-zip"],
+        only: None,
+    },
+    cmd(&["grep"]),
+    git(&["git", "status"]),
+    git(&["git", "log"]),
+    git(&["git", "diff"]),
+    git(&["git", "show"]),
+    ReadOnlyCommand {
+        prefix: &["git", "branch"],
+        forbidden: GIT_FORBIDDEN,
+        only: Some(&[
+            "-a",
+            "--all",
+            "-r",
+            "--remotes",
+            "-v",
+            "-vv",
+            "--verbose",
+            "--list",
+            "-l",
+            "--show-current",
+        ]),
+    },
+    git(&["git", "rev-parse"]),
+    git(&["git", "ls-files"]),
 ];

@@ -34,7 +34,8 @@
 //!   Providers that only send whole messages emit the completed event alone
 //!   with [`MessageBody::Inline`], if the text is at most
 //!   [`crate::limits::MAX_INLINE_MESSAGE_BYTES`]; a longer one is first split
-//!   into deltas, so it is `Streamed`.
+//!   into deltas of at most that size, on UTF-8 character boundaries, so it is
+//!   `Streamed`.
 //! - Every tool call is `ToolCallStarted` → zero or more `ToolCallUpdated` →
 //!   exactly one `ToolCallFinished`, all with the same `call_id`. `input` is
 //!   always a complete JSON value: partial provider arguments are buffered
@@ -57,7 +58,9 @@
 //! - `QuotaUpdated` is informational (subscription windows filling up).
 //!   `RateLimited` means the provider is refusing work right now.
 //! - A record the adapter can't map yet becomes [`AgentEvent::Unmapped`],
-//!   never a silent drop, so spike fixtures show the gaps.
+//!   never a silent drop. Its `raw` is cut to
+//!   [`crate::limits::MAX_UNMAPPED_RAW_BYTES`] (replaced by a JSON string of
+//!   the truncated text when longer).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -163,6 +166,10 @@ pub enum AgentEvent {
         title: Option<String>,
         input: Value,
         reason: Option<String>,
+        /// The gate can turn this into a rule ("always…"); when `false` the UI
+        /// offers only allow/deny once.
+        #[serde(default)]
+        rememberable: bool,
     },
     /// The agent asked the user something. Answer with
     /// [`SessionCommand::AnswerQuestion`].

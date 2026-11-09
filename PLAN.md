@@ -785,7 +785,7 @@ trust = "untrusted"         # default for free tiers; changing it requires confi
 | Risk | Mitigation |
 |---|---|
 | Claude CLI's stream-json control protocol is not a stable public API | Pin versions, add contract tests, fall back to `claude-code-acp` via ACP |
-| `agy` stream-json format and per-session MCP are undocumented; approvals depend on skip-permissions + a deny-enforcing hook | Recorded transcripts as fixtures; pin the `agy` version; contract test that hook `deny` is still enforced under skip-permissions (if a release breaks it, `agy` threads only run inside the sandbox) |
+| `agy` stream-json format and per-session MCP are undocumented; approvals depend on skip-permissions + a deny-enforcing hook | Recorded transcripts as fixtures; pin the `agy` version; contract test that hook `deny` is still enforced under skip-permissions (if a release breaks it, `agy` sessions show Partial with the reason, and the user decides; Atrium never restricts a provider by its level, D-012) |
 | Provider terms for third-party clients using subscription logins | Check each provider's current terms before relying on subscription auth; API keys are supported as a fallback |
 | Daemon lifecycle: orphaned agents/browsers/VMs, version skew between app and daemon | PID tracking + reaping, single-instance lock, protocol version handshake, hand over to the new daemon only when idle |
 | Runaway cost from auto-fix loops, delegation trees and auto-review | Attempt caps, a delegation depth limit, per-thread budgets, reviewer acceptance-rate tracking |

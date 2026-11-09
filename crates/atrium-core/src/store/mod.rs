@@ -25,7 +25,8 @@ pub struct StoreOptions {
 
 /// The production [`crate::Store`]: WAL, one writer task, a pool of
 /// `limits::STORE_READERS` read-only connections, migrations from
-/// `schema/*.sql` run at open.
+/// `schema/*.sql` run at open. Each open message's running SHA-256 is kept in
+/// the writer task's memory and recomputed from stored deltas after a crash.
 #[derive(Debug)]
 pub struct SqliteStore {
     _private: (),

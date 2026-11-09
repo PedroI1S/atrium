@@ -8,8 +8,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// What the daemon accepts as "the app". Written by the app at install to
-/// `$ATRIUM_HOME/app-identity.json` (mode 0600, owner checked when read).
+/// What the daemon accepts as "the app".
+///
+/// - Release builds compile it in: `MacSigned` with the designated
+///   requirement, or `Linux` with the packaged app path (the daemon checks
+///   that the file isn't writable by the user, so a same-user process can't
+///   replace it). The data folder can't change it.
+/// - Development builds read `Paths::app_identity` (mode 0600, owner checked),
+///   written by the dev app at start. That file is as strong as the user's
+///   own account, which is the documented same-UID limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppIdentity {
@@ -43,7 +50,16 @@ pub enum PeerError {
 }
 
 /// Verifies the peer of a connected unix socket against `expected`. Any
-/// failure is an error; there is no partial success.
+/// failure is an error; there is no partial success. The uid is checked
+/// first.
+/// - macOS: `LOCAL_PEERTOKEN` → `SecCodeCreateWithAuditToken`; signed:
+///   `SecCodeCheckValidity` against the requirement; unsigned: the cdhash
+///   from the code object (`kSecCodeInfoUnique`), never a hash of the file on
+///   disk.
+/// - Linux: `SO_PEERCRED`, then a pidfd (`SO_PEERPIDFD`, or `pidfd_open`
+///   immediately). `stat` `/proc/<pid>/exe` for (dev, ino), then
+///   `pidfd_send_signal(pidfd, 0)` must still succeed, proving the process
+///   that was inspected is the one connected.
 pub fn verify_app_peer(
     stream: &tokio::net::UnixStream,
     expected: &AppIdentity,

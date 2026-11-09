@@ -24,7 +24,8 @@ pub fn input_sha256(check: &ToolCheck) -> String {
     unimplemented!("M1-03")
 }
 
-/// A shell command line, as rules see it (contract §9).
+/// A shell command line, as rules see it (contract §9). Separators are `;`,
+/// `&&`, `||`, `|` and newline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedCommand {
     /// One or more simple commands joined by `;`, `&&`, `||` or `|`, each as
@@ -65,6 +66,18 @@ impl Ledger {
 
 /// One session's [`atrium_agents::ToolGate`]: evaluates the policy, opens and
 /// redeems ledger entries. Built by the daemon for each incarnation.
+///
+/// - `check`: resolves the subject's paths (deepest existing ancestor
+///   canonicalized; this is the gate's only filesystem access), evaluates the
+///   policy, and for `Ask` computes the "always…" matcher (an `Execute` of one
+///   simple command → `CommandPrefix` of its argv; file tools → `PathGlob` of
+///   the exact resolved path; anything else → not rememberable) and opens the
+///   ledger entry. In Home, a recursive search rooted at `~` itself is `Ask`
+///   (D-050). Any internal error → `Deny` (fail closed).
+/// - `redeem`: rebuilds the binding from the given check; if the rules
+///   revision or preset changed since the approval, re-evaluates the policy
+///   and refuses on `Deny`/`HardDeny`; then calls the ledger's `redeem`.
+///   Anything but success → `Deny`.
 pub struct SessionGate {
     _policy: Arc<dyn PolicyEngine>,
     _ledger: Arc<dyn ApprovalLedger>,

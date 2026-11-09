@@ -19,6 +19,12 @@ pub enum AttentionInput<'a> {
 }
 
 /// The next state. `pending` is the count *after* the input is applied.
+///
+/// Precedence: `Failed` (after a fatal `Error`) and `Paused` (after
+/// `RateLimited`) are sticky: the `TurnCompleted`, `SessionEnded` and
+/// `Signal::Exited` that follow keep them. After `Signal::Stopped`, the exit
+/// is `Ended` whatever its code. Otherwise an exit with a turn open, or a
+/// non-zero code, is `Interrupted { cleanup: Verified }`.
 pub fn next_state(
     current: &ThreadState,
     pending: Pending,

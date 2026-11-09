@@ -48,3 +48,33 @@ fn daemon_startup_expires_everything_pending_or_approved() {
 fn remember_creates_rule_atomically_and_never_revives_an_expired_request() {
     unimplemented!()
 }
+
+#[test]
+#[ignore = "M1-03"]
+fn approved_then_withdrawn_is_cancelled_and_never_redeemable() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn opening_past_max_pending_is_refused() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn redeem_in_a_later_turn_is_refused() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn rule_change_to_deny_before_redeem_wins() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn own_remember_rule_does_not_block_redeem() {
+    unimplemented!()
+}
