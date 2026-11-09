@@ -232,3 +232,25 @@ Pedro's Codex subscription has ended, so GPT-6.1 Sol and GPT-6 Astra are unavail
 - Live Codex work (X1–X3) needs a Codex login. On rodrigo's shifts their Codex can be used, under the same rules.
 
 `agy` is now 1.5.1. The worker policy hook was last verified on 1.4.7, so it is re-checked before the first agy worker runs (PLAN §8.7).
+
+## D-044 — 2026-11-09 — Enforcement is per session; unverified coverage shows as Partial (G1)
+**Decided by Pedro (owner, D-013).** Enforcement is a property of each session, not of a provider. Each session records a descriptor: effective level, reasons, provider and CLI version, and the tool coverage that was verified.
+- Only two levels are shown: **Full** and **Partial**. Anything Atrium can't verify is Partial, with the reason shown, such as "plugin hooks not inspected" or "untested CLI version". Unknown coverage never shows as Full.
+- The hard-deny list takes precedence only over calls Atrium intercepts. It is not a machine-wide prohibition, and the UI and PLAN §3.12 say so. They also keep three things apart: interception coverage (which calls Atrium sees), the policy decision (what it does with them) and OS isolation (the sandbox, the only thing that limits what allowed code does).
+- `AgentAdapter::interception(&self)` becomes session-scoped in the M1 contract.
+
+## D-045 — 2026-11-09 — Human-control commands come only from the verified Atrium app (G2)
+**Decided by Pedro (owner, D-013).** The daemon separates two kinds of authority:
+- **Agent and MCP connections** get a per-thread scope. They can never approve, answer a question, create or edit rules, or change settings.
+- **Human-control commands** (resolving approvals, answering questions, rules, settings, policy presets) are accepted only on a connection whose peer process is the Atrium app binary. On macOS that's checked through the peer's code signature (audit token). On Linux it's the peer's `/proc/<pid>/exe`, checked against the installed app.
+- The remaining limit is documented: an unconfined agent running as the same user can still do anything that user can, for example by modifying the app or the daemon's files. The sandbox is the real boundary. Peer checks raise the bar; they are not isolation.
+
+## D-046 — 2026-11-09 — Approvals wait, are never auto-allowed, and expire with their turn (G3)
+**Decided by Pedro (owner, D-013).** One authoritative approval state in the daemon validates and consumes each approval before any effect runs.
+- An unanswered request waits while the agent is alive and is never auto-allowed. It expires when the turn ends, the agent exits, the daemon restarts or the provider times out. An expired or cancelled request can never authorize anything.
+- **Allow once** is single use, bound to the session incarnation, the request, the tool, the canonical arguments and the policy context.
+- An answer from a stale window or an old connection is rejected, and the window shows the request as expired.
+- This promotes A4 and O2 to blockers wherever those adapters are promoted.
+
+## D-047 — 2026-11-09 — Codex stays in M1; its live checks run on rodrigo's shift
+**Decided by Pedro (driver).** M1 keeps Home chat with Claude Code and Codex. The Codex adapter is built against the recorded fixtures on Pedro's shifts. The live checks (X1–X3: file-change approval, the question mode, the `ProviderGated` matrix) run on rodrigo's shift with their Codex login. They're required before the M1 gate.
