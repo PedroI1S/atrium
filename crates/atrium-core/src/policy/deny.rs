@@ -348,15 +348,18 @@ impl Sensitive {
         {
             return Some(h);
         }
-        let glob = GlobBuilder::new(&pl).literal_separator(true).build().ok()?.compile_matcher();
         for probe in self.probes() {
-            if glob.is_match(&probe)
+            if shell_glob_matches(&pl, &probe)
                 && let Some(h) = self.hit(Path::new(&probe), Role::Read)
             {
                 return Some(h);
             }
         }
         None
+    }
+
+    pub fn is_ssh_dir(&self, p: &Path) -> bool {
+        lower(p) == format!("{}/.ssh", self.home)
     }
 
     /// Raw-text check: home-anchored credential paths and Atrium's data.
@@ -384,6 +387,28 @@ impl Sensitive {
         }
         None
     }
+}
+
+/// Shell globbing: `*` and `?` don't cross `/` and don't match a leading dot.
+fn shell_glob_matches(pattern: &str, probe: &str) -> bool {
+    if pattern.contains("**") {
+        return GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .is_ok_and(|g| g.compile_matcher().is_match(probe));
+    }
+    let pc: Vec<&str> = pattern.split('/').collect();
+    let qc: Vec<&str> = probe.split('/').collect();
+    pc.len() == qc.len()
+        && pc.iter().zip(&qc).all(|(p, q)| {
+            if q.starts_with('.') && !p.starts_with('.') {
+                return false;
+            }
+            GlobBuilder::new(p)
+                .literal_separator(true)
+                .build()
+                .is_ok_and(|g| g.compile_matcher().is_match(q))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +688,9 @@ impl Ctx<'_> {
                 if let Some(h) = self.s.hit(p, u.role) {
                     hits.push(h);
                 }
+                if self.s.is_ssh_dir(p) && self.ssh_dir_hit(u) {
+                    hits.push("credential-read");
+                }
                 if globby && let Some(h) = self.s.glob_hit(p, u.role) {
                     hits.push(h);
                 }
@@ -775,6 +803,29 @@ impl Ctx<'_> {
             }
         }
         hits
+    }
+
+    /// `~/.ssh` itself: listing it is fine; searching, copying or writing into
+    /// it is not.
+    fn ssh_dir_hit(&self, u: &Use) -> bool {
+        const LISTERS: &[&str] = &[
+            "ls", "stat", "cd", "pushd", "popd", "pwd", "test", "[", "du", "dir", "readlink",
+            "realpath", "basename", "dirname", "echo", "printf", "chmod", "chown", "chgrp", "mkdir",
+            "rmdir",
+        ];
+        match self.a.units.get(u.unit) {
+            Some(unit) => unit
+                .eff
+                .first()
+                .map(|f| base(f))
+                .is_some_and(|c| !LISTERS.contains(&c)),
+            None => {
+                let k = self.input.check.kind;
+                u.role == Role::Write
+                    || (k == ToolKind::Search
+                        && matches!(&self.input.check.subject, ToolSubject::Paths { recursive: true, .. }))
+            }
+        }
     }
 
     fn is_device(&self, i: usize, word: &str) -> bool {

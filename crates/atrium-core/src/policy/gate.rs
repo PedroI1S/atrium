@@ -85,10 +85,15 @@ fn resolve_fs(p: &Path, hops: u8) -> PathBuf {
                     }
                     None => {
                         let n = normalize(&head);
-                        if n == head {
+                        if n == head || hops >= MAX_HOPS {
                             break head;
                         }
-                        head = n;
+                        // `missing/..`: start over on the cleaned-up path
+                        let mut rebuilt = n;
+                        for t in tail.into_iter().rev() {
+                            rebuilt.push(t);
+                        }
+                        return resolve_fs(&rebuilt, hops + 1);
                     }
                 }
             }
