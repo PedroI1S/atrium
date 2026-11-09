@@ -288,3 +288,9 @@ Changes from now on go through `docs/agents/change-requests.md`. Dispatching M1 
 
 ## D-052 — 2026-11-09 — CR-05 approved: documented macOS API for peer verification
 **Decided by Pedro (driver).** Contract §4 now names `SecCodeCopyGuestWithAttributes` with `kSecGuestAttributeAudit` instead of the undocumented `SecCodeCreateWithAuditToken`, and states that unsigned dev builds compare the running (dynamic) code object's cdhash, never the static code on disk. No signature or behaviour change. macOS 11 is the stated minimum. From Sonnet's and Opus's M1-10 reviews; M1-10 implements it in its fix round.
+
+## D-053 — 2026-11-09 — Claude fallback when Argon runs out of usage
+**Decided by Pedro (driver).** Argon's usage is running low. If an Argon run fails (quota or otherwise), the task continues on a Claude model instead of waiting:
+- reviews of Sonnet's work (M1-03's security review) go to Opus 5.5: still a fresh, independent reviewer, though not cross-provider;
+- worker and fix rounds (M1-10's fixes) go to Sonnet 5.5, with Opus re-auditing any changed `unsafe` block.
+The work done so far on the branch is kept; the Claude model picks up from the branch and the reviews.
