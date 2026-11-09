@@ -285,3 +285,6 @@ Pedro's Codex subscription has ended, so GPT-6.1 Sol and GPT-6 Astra are unavail
 - Known limits stated in Settings: auto-allowed git reads trust each repository's own git config; exports turn the home path into `~` and keep the user name.
 
 Changes from now on go through `docs/agents/change-requests.md`. Dispatching M1 workers needs its own go.
+
+## D-052 — 2026-11-09 — CR-05 approved: documented macOS API for peer verification
+**Decided by Pedro (driver).** Contract §4 now names `SecCodeCopyGuestWithAttributes` with `kSecGuestAttributeAudit` instead of the undocumented `SecCodeCreateWithAuditToken`, and states that unsigned dev builds compare the running (dynamic) code object's cdhash, never the static code on disk. No signature or behaviour change. macOS 11 is the stated minimum. From Sonnet's and Opus's M1-10 reviews; M1-10 implements it in its fix round.

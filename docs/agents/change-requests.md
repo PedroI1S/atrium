@@ -73,4 +73,4 @@ The M1 contract (§4, and `crates/atrium-host/src/peer.rs` doc comments) names `
 
 **Why**: an undocumented symbol is an ABI and availability risk on the security-critical path.
 
-**Affected**: `docs/contracts/m1.md` §4 wording, doc comments in `crates/atrium-host/src/peer.rs` (M1-10 updates them in its fix round). **Needs the driver's approval** (frozen contract, D-051).
+**Affected**: `docs/contracts/m1.md` §4 wording, doc comments in `crates/atrium-host/src/peer.rs` (M1-10 updates them in its fix round). **Approved by Pedro (driver), 2026-11-09 (D-052)**; applied to `docs/contracts/m1.md` §4.
