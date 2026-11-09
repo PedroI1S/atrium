@@ -10,3 +10,9 @@
 pub mod lifecycle;
 pub mod peer;
 pub mod supervise;
+
+pub(crate) fn current_euid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, has no preconditions, and is
+    // async-signal-safe and thread-safe on all POSIX platforms.
+    unsafe { libc::geteuid() }
+}

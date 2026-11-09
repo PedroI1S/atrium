@@ -43,6 +43,7 @@ name = "atrium-host"
 version = "0.0.0"
 dependencies = [
  "atrium-protocol",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

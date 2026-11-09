@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 atrium-protocol.workspace = true
+libc = "0.2" # M1-10
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
