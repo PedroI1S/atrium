@@ -143,7 +143,45 @@ impl Sanitizer {
                     *reason = self.text(reason);
                 }
             }
-            AdapterInput::Command { .. } | AdapterInput::Exit { .. } => {}
+            AdapterInput::Redeem {
+                check, decision, ..
+            } => {
+                self.value(&mut check.input);
+                if let Some(title) = &mut check.title {
+                    *title = self.text(title);
+                }
+                if let crate::GateDecision::Deny { reason } = decision {
+                    *reason = self.text(reason);
+                }
+            }
+            // Prompts and answers are user content and can carry secrets
+            // (gate review: the sanitizer ignored `Command`).
+            AdapterInput::Command { command } => self.command(command),
+            AdapterInput::WriteFailed { error } => *error = self.text(error),
+            AdapterInput::HookDisconnected { .. }
+            | AdapterInput::Deadline { .. }
+            | AdapterInput::Exit { .. } => {}
+        }
+    }
+
+    fn command(&self, command: &mut atrium_protocol::agent::SessionCommand) {
+        use atrium_protocol::agent::{ApprovalDecision, SessionCommand};
+        match command {
+            SessionCommand::SendUserMessage { text } => *text = self.text(text),
+            SessionCommand::ResolveApproval {
+                decision: ApprovalDecision::Deny { message: Some(m) },
+                ..
+            } => *m = self.text(m),
+            SessionCommand::AnswerQuestion { answers, .. } => {
+                for answer in answers {
+                    if let Some(t) = &mut answer.text {
+                        *t = self.text(t);
+                    }
+                }
+            }
+            SessionCommand::ResolveApproval { .. }
+            | SessionCommand::Interrupt
+            | SessionCommand::Shutdown => {}
         }
     }
 

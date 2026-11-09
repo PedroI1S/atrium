@@ -13,9 +13,10 @@
 //! - `kind` = [`FrameKind::Stream`]: payload is `[stream_id: u32 big-endian][bytes]`,
 //!   for raw byte streams (PTY output, screencast frames). Stream ids are
 //!   announced in a control message before first use.
-//! - `len` covers kind + payload and never exceeds [`MAX_FRAME_LEN`]; a peer
-//!   that receives a larger frame, an unknown kind or invalid JSON closes the
-//!   connection.
+//! - `len` covers kind + payload and never exceeds [`MAX_FRAME_LEN`]
+//!   (daemon → client) or [`crate::limits::MAX_CLIENT_FRAME_LEN`] (client →
+//!   daemon); a peer that receives a larger frame, an unknown kind or invalid
+//!   JSON closes the connection.
 //!
 //! # Socket security
 //!
@@ -24,11 +25,29 @@
 //! is a symlink or owned by someone else. It takes the lock file *before*
 //! removing a stale socket.
 //!
+//! # Roles and authority (contract §4, D-045)
+//!
+//! The socket's permissions keep other users out, not agents running as the
+//! same user. So each connection asks for a [`ClientRole`] in `Hello`, and the
+//! daemon grants it only after checking the peer:
+//! - [`ClientRole::App`]: the peer process must be the Atrium app binary
+//!   (macOS code signature via the audit token; Linux `/proc/<pid>/exe`).
+//! - [`ClientRole::Dev`]: only when a debug daemon runs with `--dev-socket`.
+//! - [`ClientRole::Agent`]: reserved for the MCP server; M1 rejects it.
+//!
+//! A failed check is `Incompatible`, never a lesser role. Every command has a
+//! required [`Authority`] ([`DaemonCommand::authority`]) checked before it
+//! does anything. Subscriptions need `App` too in M1. An unconfined same-user
+//! agent can still modify Atrium's files; peer checks raise the bar, they are
+//! not isolation.
+//!
 //! # Session
 //!
-//! 1. Client sends [`ClientMessage::Hello`]. The daemon answers
-//!    [`ServerMessage::Welcome`], or [`ServerMessage::Incompatible`] and closes.
-//!    Any other message before `Hello` closes the connection.
+//! 1. Client sends [`ClientMessage::Hello`] within
+//!    [`crate::limits::HELLO_TIMEOUT`]. The daemon answers
+//!    [`ServerMessage::Welcome`] with the granted role, or
+//!    [`ServerMessage::Incompatible`] and closes. Any other message before
+//!    `Hello` closes the connection.
 //! 2. Client sends [`ClientMessage::Subscribe`] with a cursor (see below).
 //!    The daemon answers with a [`ServerMessage::Response`]: `Ok` with
 //!    `{"replay_until": EventId|null}` (the thread's last event at that
@@ -40,6 +59,20 @@
 //!    the earlier subscription and replays from the new cursor.
 //! 3. Commands carry a client-chosen `request_id`; the daemon answers each with
 //!    exactly one [`ServerMessage::Response`].
+//! 4. [`ClientMessage::SubscribeInbox`] streams [`ServerMessage::ThreadUpdated`]
+//!    and [`ServerMessage::InboxUpdated`] for every thread, starting with the
+//!    full current set.
+//!
+//! # Lanes and slow readers
+//!
+//! The daemon writes each connection's **control lane** (responses,
+//! `ThreadUpdated`, `InboxUpdated`, `SubscriptionLagged`) before its **event
+//! lane** (replay pages and live events), so a command is never stuck behind
+//! replay. The event lane holds at most
+//! [`crate::limits::MAX_CONNECTION_QUEUE_BYTES`]. When a subscription would
+//! overflow it, the daemon drops that subscription and sends
+//! [`ServerMessage::SubscriptionLagged`]; the client resubscribes from its
+//! applied cursor. Other subscriptions are unaffected.
 //!
 //! # Cursors and retries
 //!
@@ -55,7 +88,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent::{AgentEventEnvelope, Provider, SessionCommand};
+use crate::agent::{
+    AgentEventEnvelope, ApprovalDecision, Provider, QuestionAnswer, SessionCommand,
+};
+use crate::policy::{Preset, RememberScope, Rule, RuleId};
+use crate::thread::{InboxItem, ThreadSummary};
+
+pub use crate::thread::ThreadId;
 
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
@@ -78,10 +117,6 @@ impl TryFrom<u8> for FrameKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ThreadId(pub String);
-
 /// Global, strictly increasing, assigned by the daemon's store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -95,12 +130,43 @@ pub struct StoredEvent {
     pub envelope: AgentEventEnvelope,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientRole {
+    /// The Atrium app. Human-control authority, after peer verification.
+    App,
+    /// Tests and harnesses against a debug daemon started with `--dev-socket`.
+    Dev,
+    /// Reserved for the MCP server (per-thread scope). Rejected in M1.
+    Agent { token: String },
+}
+
+/// The authority a command needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Authority {
+    /// Read and act within one thread the connection is scoped to.
+    ThreadScoped,
+    /// Human control: approvals, answers, rules, settings, every thread.
+    HumanControl,
+}
+
+impl ClientRole {
+    pub fn authority(&self) -> Authority {
+        match self {
+            ClientRole::App | ClientRole::Dev => Authority::HumanControl,
+            ClientRole::Agent { .. } => Authority::ThreadScoped,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Hello {
         protocol_version: u32,
         client_name: String,
+        role: ClientRole,
     },
     Subscribe {
         request_id: u64,
@@ -111,41 +177,131 @@ pub enum ClientMessage {
     Unsubscribe {
         thread_id: ThreadId,
     },
+    /// Thread summaries and the inbox, for every thread (see the module docs).
+    SubscribeInbox {
+        request_id: u64,
+    },
     Command {
         request_id: u64,
         command: DaemonCommand,
     },
 }
 
+/// Commands. Responses are [`CommandResult::Ok`] with the value given on each
+/// variant (`null` when none is given), or [`CommandResult::Err`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonCommand {
-    /// Response value: `{"thread_id": "<id>"}`.
+    /// Starts a Home thread. Value: [`ThreadSummary`].
     StartThread {
         agent: AgentLaunch,
-        cwd: String,
+        /// The first user message, sent once the session starts.
+        message: Option<String>,
     },
-    /// Response value: `[{"thread_id", "running": bool, "last_event": EventId|null}]`.
+    /// Value: `Vec<ThreadSummary>`, newest first, archived ones excluded.
     ListThreads,
-    /// Forward a command to the thread's agent session.
+    /// Value: [`ThreadSummary`].
+    GetThread {
+        thread_id: ThreadId,
+    },
+    /// `SendUserMessage`, `Interrupt` and `Shutdown` only. Approvals and
+    /// answers use their own commands so the ledger sees them first.
     ThreadCommand {
         thread_id: ThreadId,
         command: SessionCommand,
     },
-    StopThread {
+    /// Validated by the approval ledger before the session sees it (D-046).
+    /// An unknown, resolved, expired or older-incarnation request is
+    /// `Err { message: "expired" }`. `remember` with `Allow` also creates a
+    /// rule in the same transaction. Value: `{"rule_id": RuleId|null}`.
+    ResolveApproval {
+        thread_id: ThreadId,
+        incarnation: u32,
+        request_id: String,
+        decision: ApprovalDecision,
+        remember: Option<RememberScope>,
+    },
+    /// Same ledger checks as `ResolveApproval`.
+    AnswerQuestion {
+        thread_id: ThreadId,
+        incarnation: u32,
+        request_id: String,
+        answers: Vec<QuestionAnswer>,
+    },
+    /// Starts a new incarnation from the last native session id.
+    /// Value: [`ThreadSummary`].
+    ResumeThread {
         thread_id: ThreadId,
     },
+    /// Ends the session (if running) and hides the thread from lists.
+    ArchiveThread {
+        thread_id: ThreadId,
+    },
+    MarkRead {
+        thread_id: ThreadId,
+    },
+    /// The thread the user is looking at in some window (`None`: none), for
+    /// notification suppression.
+    SetFocus {
+        thread_id: Option<ThreadId>,
+    },
+    /// Value: `Vec<InboxItem>`, ranked.
+    ListInbox,
+    /// Value: `Vec<Rule>`.
+    ListRules,
+    /// Value: [`Rule`] (with its new id).
+    CreateRule {
+        rule: Rule,
+    },
+    DeleteRule {
+        rule_id: RuleId,
+    },
+    /// Writes `path` (mode 0600). Value: `{"bytes": u64}`.
+    ExportThread {
+        thread_id: ThreadId,
+        format: ExportFormat,
+        path: String,
+    },
+    /// Value: `{key: value}` for every setting.
+    GetSettings,
+    SetSetting {
+        key: String,
+        value: Value,
+    },
+    /// Exit when no turn is running, or now if `force` (upgrades, §10).
+    ShutdownDaemon {
+        force: bool,
+    },
+}
+
+impl DaemonCommand {
+    /// Checked by the daemon before anything else. Every M1 command needs
+    /// human control; the table exists so later roles can't silently gain
+    /// these commands.
+    pub fn authority(&self) -> Authority {
+        Authority::HumanControl
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportFormat {
+    Markdown,
+    Jsonl,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentLaunch {
-    /// **M0 placeholder, not frozen for M1.** M1 replaces it with a full
-    /// launch config (permission policy, resume, effort), validated by the
-    /// daemon's policy engine. M0 daemons answer it with `CommandResult::Err`.
+    /// A real provider session. The daemon validates it (provider enabled,
+    /// model known if the provider lists models) and adds its own MCP
+    /// servers; clients never supply MCP commands.
     Native {
         provider: Provider,
         model: Option<String>,
+        effort: Option<String>,
+        /// The user's choice; Home threads default to `Preset::Home`.
+        preset: Preset,
     },
     /// A synthetic agent process for transport and rendering tests: it emits
     /// `MessageDelta` events of `chunk_chars` characters at
@@ -166,6 +322,8 @@ pub enum ServerMessage {
         protocol_version: u32,
         daemon_version: String,
         daemon_pid: u32,
+        /// The role granted (always the one asked for; otherwise `Incompatible`).
+        role: ClientRole,
     },
     Incompatible {
         protocol_version: u32,
@@ -183,6 +341,20 @@ pub enum ServerMessage {
     Response {
         request_id: u64,
         result: CommandResult,
+    },
+    /// Control lane, for `SubscribeInbox` connections.
+    ThreadUpdated {
+        summary: ThreadSummary,
+    },
+    /// Control lane: the whole ranked inbox, replacing the previous one.
+    InboxUpdated {
+        items: Vec<InboxItem>,
+    },
+    /// The thread's subscription was dropped because this connection's event
+    /// lane was full. Resubscribe from the applied cursor.
+    SubscriptionLagged {
+        thread_id: ThreadId,
+        last_sent: Option<EventId>,
     },
 }
 

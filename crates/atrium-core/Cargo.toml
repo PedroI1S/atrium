@@ -1,0 +1,22 @@
+[package]
+name = "atrium-core"
+version = "0.0.0"
+description = "Atrium domain: store, policy and approval ledger, attention, history"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Shared crate: a task adds a dependency on its own line with a `# M1-xx`
+# comment; the orchestrator resolves conflicts at integration (contract §2).
+[dependencies]
+atrium-protocol.workspace = true
+atrium-host.workspace = true
+atrium-agents.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

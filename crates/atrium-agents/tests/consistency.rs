@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use atrium_protocol::agent::{AgentEvent, RequestOutcome, ToolStatus, TurnOutcome};
+use atrium_protocol::agent::{AgentEvent, MessageBody, RequestOutcome, ToolStatus, TurnOutcome};
 
 const CANARIES: &[&str] = &[
     "ATRIUM-7Q2X-CANARY",
@@ -238,16 +238,24 @@ pub fn check_fixture(path: &Path) -> ConsistencyReport {
                     .push_str(text);
             }
             AgentEvent::MessageCompleted {
-                message_id, text, ..
+                message_id, body, ..
             } => {
                 *completed_messages.entry(message_id.clone()).or_insert(0) += 1;
-                if let Some(expected) = message_deltas.get(message_id)
-                    && expected != text
-                {
+                // M1-12 adds the sha256 check (contract §6.1).
+                let expected = message_deltas.get(message_id);
+                let ok = match (body, expected) {
+                    (MessageBody::Inline { text }, None) => {
+                        text.len() <= atrium_protocol::limits::MAX_INLINE_MESSAGE_BYTES
+                    }
+                    (MessageBody::Inline { .. }, Some(_)) => false,
+                    (MessageBody::Streamed { chars, .. }, Some(expected)) => {
+                        *chars == expected.chars().count() as u64
+                    }
+                    (MessageBody::Streamed { .. }, None) => false,
+                };
+                if !ok {
                     report.add(format!(
-                        "Event {idx}: MessageCompleted text does not match concatenated deltas for '{message_id}'. Expected len {}, got len {}",
-                        expected.len(),
-                        text.len()
+                        "Event {idx}: MessageCompleted body does not match the deltas for '{message_id}'"
                     ));
                 }
             }

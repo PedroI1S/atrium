@@ -1,8 +1,9 @@
 //! Agent adapter contract (PLAN §3.2, §3.12).
 //!
-//! **Contract, frozen for M0 (revision 2, D-014).** Each adapter spike
-//! (`spikes/agent-*`) implements [`AgentAdapter`] and [`Normalizer`] for one
-//! provider. Changes go through `docs/agents/change-requests.md`.
+//! **Contract, M1 revision 3 (draft, `docs/contracts/m1.md`).** Each
+//! production adapter (`src/claude`, `src/codex`) implements [`AgentAdapter`]
+//! and [`Normalizer`] for one provider. Changes go through
+//! `docs/agents/change-requests.md`.
 //!
 //! An adapter has two layers:
 //! - a pure [`Normalizer`] that turns everything that crosses the adapter
@@ -18,12 +19,29 @@
 //! Atrium, not the provider, decides what runs. Wherever the provider offers
 //! a pre-execution hook, **every** tool call (including MCP tools) goes
 //! through [`SessionConfig::gate`] before it runs: `Allow` lets it run,
-//! `Deny` blocks it (`ToolCallFinished { status: denied }`), `Ask` emits
-//! [`AgentEvent::ApprovalRequested`] and waits for the client. If the gate
-//! can't be reached, or the hook fails in any way, the call is denied (fail
-//! closed). An adapter that can only see calls the provider itself chooses to
-//! gate reports [`Interception::ProviderGated`]; the daemon decides what such
-//! a provider may do.
+//! `Deny` blocks it (`ToolCallFinished { status: denied }`), `Ask { ticket }`
+//! emits [`AgentEvent::ApprovalRequested`] with the ticket's id and waits.
+//! If the gate can't be reached, or the hook fails in any way, the call is
+//! denied (fail closed).
+//!
+//! **Approvals are redeemed, not trusted (D-046).** When an approval comes
+//! back as `ResolveApproval { Allow }`, the adapter calls
+//! [`ToolGate::redeem`] *immediately before* performing the effect (answering
+//! the provider's control request, writing a file, retrying a hook-denied
+//! call). Only `Allow` from `redeem` lets the effect happen; it is single use
+//! and checks that the call's input still matches what was approved. Every
+//! redeem is recorded as [`AdapterInput::Redeem`].
+//!
+//! # Enforcement per session (D-044)
+//!
+//! What Atrium can enforce depends on the session (CLI version, settings
+//! files, plugins, hooks, mode), so it is reported per session as an
+//! [`EnforcementDescriptor`]: [`AgentAdapter::probe`] before starting,
+//! [`Session::descriptor`] and `SessionStarted.enforcement` once started,
+//! `EnforcementChanged` if it changes. Build it only with
+//! [`EnforcementDescriptor::evaluate`]. Report conservatively: anything not
+//! verified is Partial. Enforcement levels are shown, never used to restrict
+//! (D-012).
 //!
 //! # Backpressure and lifecycle
 //!
@@ -35,8 +53,14 @@
 //!   more are rejected with `Error { fatal: false }`.
 //! - `start` fails with [`AdapterError::Handshake`] after [`STARTUP_TIMEOUT`].
 //! - `Shutdown`, or dropping both halves of the [`Session`], asks the
-//!   provider to stop, waits [`SHUTDOWN_GRACE`], then kills it, reaps it, and
-//!   emits the closing events (see `atrium_protocol::agent`).
+//!   provider to stop, waits [`SHUTDOWN_GRACE`], then kills its whole process
+//!   group (`atrium_host::supervise`), reaps it, and emits the closing events (see
+//!   `atrium_protocol::agent`).
+//! - Cleanup is bounded; delivery of the closing events is not dropped. If
+//!   the receiver isn't reading, the adapter keeps up to
+//!   [`atrium_protocol::limits::TERMINAL_TAIL_EVENTS`] closing events and
+//!   delivers them when it drains, or until the receiver is dropped.
+//! - Byte limits: see [`atrium_protocol::limits`].
 
 use std::fmt;
 use std::future::Future;
@@ -46,6 +70,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atrium_protocol::agent::{AgentEvent, AgentEventEnvelope, Provider, SessionCommand, ToolKind};
+use atrium_protocol::policy::EnforcementDescriptor;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -63,8 +88,14 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub trait AgentAdapter: Send + Sync {
     fn provider(&self) -> Provider;
 
-    /// How much of the provider's activity this adapter can put through the gate.
-    fn interception(&self) -> Interception;
+    /// CLI versions this adapter was verified against (fixtures and live
+    /// enforcement checks). Any other version makes sessions Partial.
+    fn tested_versions(&self) -> &'static [&'static str];
+
+    /// The enforcement a session with this config would get, without starting
+    /// it: finds the CLI and its version, and inspects the configuration
+    /// sources it would load. For the provider picker and settings.
+    fn probe<'a>(&'a self, config: &'a SessionConfig) -> BoxFuture<'a, EnforcementDescriptor>;
 
     /// Spawns the provider and completes its handshake. On success the first
     /// event is [`AgentEvent::SessionStarted`] (possibly only once the first
@@ -79,19 +110,12 @@ pub trait AgentAdapter: Send + Sync {
     ) -> BoxFuture<'_, Result<Session, AdapterError>>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Interception {
-    /// Every tool call, MCP tools included, passes the gate before it runs.
-    AllToolCalls,
-    /// Only calls the provider itself asks about pass the gate; the rest run
-    /// unchecked.
-    ProviderGated,
-}
-
 /// A running provider session. Dropping both halves shuts it down.
 #[derive(Debug)]
 pub struct Session {
+    /// The enforcement this session actually got (same as
+    /// `SessionStarted.enforcement`).
+    pub descriptor: EnforcementDescriptor,
     /// Closed after [`AgentEvent::SessionEnded`].
     pub events: mpsc::Receiver<AgentEventEnvelope>,
     pub commands: mpsc::Sender<SessionCommand>,
@@ -149,12 +173,26 @@ pub enum PermissionPolicy {
     FullAccess,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServer {
     pub name: String,
     pub command: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+}
+
+/// Prints `args` and `env` values redacted: they can hold credentials
+/// (gate review, credential-safe `Debug`).
+impl fmt::Debug for McpServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env_keys: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
+        f.debug_struct("McpServer")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &format_args!("[{} redacted]", self.args.len()))
+            .field("env_keys", &env_keys)
+            .finish()
+    }
 }
 
 /// Where the provider process runs. Sandbox (vsock) transport comes in M4.
@@ -165,9 +203,32 @@ pub enum Transport {
     Local,
 }
 
-/// Atrium's policy engine, as an adapter sees it.
+/// Atrium's policy engine and approval ledger, as an adapter sees it. One
+/// gate per session; it knows the thread, incarnation, cwd and turn.
 pub trait ToolGate: Send + Sync {
+    /// Called for every intercepted tool call before it runs. `Ask` has
+    /// already opened a ledger entry bound to this call (contract §5).
     fn check<'a>(&'a self, check: &'a ToolCheck) -> BoxFuture<'a, GateDecision>;
+
+    /// Called after `ResolveApproval { Allow }`, immediately before the
+    /// effect. Returns `Allow` at most once per ticket, and only if `check`
+    /// still matches the binding; otherwise `Deny`. Never `Ask`.
+    fn redeem<'a>(
+        &'a self,
+        ticket: &'a ApprovalTicket,
+        check: &'a ToolCheck,
+    ) -> BoxFuture<'a, GateDecision>;
+
+    /// Opens a ledger entry for a question the provider asked. `None` if the
+    /// gate is unreachable: the adapter then declines the question to the
+    /// provider and emits nothing for it.
+    fn question_ticket(&self) -> BoxFuture<'_, Option<ApprovalTicket>>;
+}
+
+/// A ledger entry's handle. `request_id` is what the events and commands use.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ApprovalTicket {
+    pub request_id: String,
 }
 
 /// A tool call the provider is about to run.
@@ -187,8 +248,11 @@ pub enum GateDecision {
     Deny {
         reason: String,
     },
-    /// Ask the user: emit `ApprovalRequested` and wait for `ResolveApproval`.
-    Ask,
+    /// Ask the user: emit `ApprovalRequested` with `ticket.request_id` and
+    /// wait for `ResolveApproval`.
+    Ask {
+        ticket: ApprovalTicket,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -237,6 +301,24 @@ pub enum AdapterInput {
     /// A command the client sent to the session.
     Command {
         command: SessionCommand,
+    },
+    /// What [`ToolGate::redeem`] returned for an approved call.
+    Redeem {
+        ticket: ApprovalTicket,
+        check: ToolCheck,
+        decision: GateDecision,
+    },
+    /// A hook connection closed before it was answered (its Ask is cancelled).
+    HookDisconnected {
+        id: String,
+    },
+    /// Writing to the provider failed (stdin closed, broken pipe).
+    WriteFailed {
+        error: String,
+    },
+    /// A deadline fired: `what` is e.g. `startup`, `shutdown_grace`, `hook`.
+    Deadline {
+        what: String,
     },
     /// The provider process exited (or the connection closed).
     Exit {

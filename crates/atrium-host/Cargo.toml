@@ -1,0 +1,25 @@
+[package]
+name = "atrium-host"
+version = "0.0.0"
+description = "Atrium platform services: process supervision, peer verification, daemon lifecycle"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+atrium-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+# The one crate allowed to use `unsafe` (contract §2): every block has a
+# `// SAFETY:` comment and is reviewed by Claude and Argon.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+undocumented_unsafe_blocks = "deny"

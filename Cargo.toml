@@ -1,17 +1,14 @@
 [workspace]
 resolver = "3"
-# Contract crates (crates/) are owned by the orchestrator. Each Rust spike
-# (spikes/) is owned by one task; see docs/agents/briefs/. Tauri spikes
-# (ui-shell, stream-perf, browser-screencast) are standalone Cargo projects
-# under spikes/<name>/src-tauri and are not members of this workspace.
+# M1 (docs/contracts/m1.md §2): crates/ are production code; ownership per
+# module is in the contract. The M0 spikes under spikes/ are kept as
+# reference until the M1 gate but are no longer built: they target the M0
+# contract (revision 2), not M1's revision 3.
 members = [
     "crates/atrium-protocol",
     "crates/atrium-agents",
-    "spikes/agent-claude",
-    "spikes/agent-codex",
-    "spikes/agent-agy",
-    "spikes/agent-acp",
-    "spikes/daemon-socket",
+    "crates/atrium-core",
+    "crates/atrium-host",
 ]
 
 [workspace.package]
@@ -23,6 +20,8 @@ publish = false
 [workspace.dependencies]
 atrium-protocol = { path = "crates/atrium-protocol" }
 atrium-agents = { path = "crates/atrium-agents" }
+atrium-core = { path = "crates/atrium-core" }
+atrium-host = { path = "crates/atrium-host" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
