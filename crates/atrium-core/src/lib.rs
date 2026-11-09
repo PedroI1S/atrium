@@ -1,6 +1,6 @@
 //! Atrium's domain (PLAN §3.3, §3.4, §3.12; contract §5, §7–§9, §13).
 //!
-//! **Contract, M1 revision 3 (draft, `docs/contracts/m1.md`).** This file and
+//! **Contract, M1 revision 3 (frozen, D-051, `docs/contracts/m1.md`).** This file and
 //! `schema/` are the orchestrator's. Each module directory is owned by one
 //! task, which implements the items this file names and may add private code
 //! freely, but never changes the public items listed here:

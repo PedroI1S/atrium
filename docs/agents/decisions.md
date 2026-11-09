@@ -276,3 +276,12 @@ Pedro's Codex subscription has ended, so GPT-6.1 Sol and GPT-6 Astra are unavail
 - **Home's auto-allowed commands** (`HOME_READONLY_COMMANDS`): `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `du`, `df`, `which`, `uname`, `date`, `whoami`, `tree`, `rg`, `grep`, and `git status|log|diff|show|branch|rev-parse|ls-files`. Never auto-allowed: anything with `$` expansion, globs, brace expansion, a newline, or `git -c`/`--config-env`/`--exec-path`. The always-blocked list applies on top.
 - **Codex in Home** uses `sandbox=read-only` with `approval_policy=untrusted`, as verified in M0 (not `on-request`, under which Codex reads without asking).
 - **Whole-home search asks**: in Home, a recursive search rooted at `~` itself (no subfolder) needs approval. Searches in a subfolder stay auto-allowed.
+
+## D-051 — 2026-11-09 — M1 contracts approved and frozen (revision 3)
+**Decided by Pedro (driver, owner per D-013).** `docs/contracts/m1.md` revision 3 and its code (protocol rev 3, `atrium-agents` `lib.rs` and `fixture.rs`, the `atrium-core` and `atrium-host` signatures, the schema and test stubs, commit `10b72bf`) are approved and frozen, after three Argon reviews (`reviews/M1-contracts.md` rework → `M1-contracts-rev2.md` rework → `M1-contracts-rev3.md` approve with fixes, fixes applied). This includes the security defaults revision 3 adds on top of D-050:
+- Home's auto-allowed commands never match a line with a redirect other than fd duplication or output to `/dev/null`, or a leading `NAME=value`; they forbid `-f` for `file`, `rg` and `grep`, `tree -o/--output/-R` and `rg --hostname-bin`. `rg` and recursive `grep` ask unless every search root is a file or a folder strictly inside `~`.
+- Reading `~/.ssh/config` is allowed (only writing it, and `authorized_keys`, is blocked), as D-050 said.
+- On Linux, App authority needs `SO_PEERPIDFD` (kernel 6.5+); there is no `pidfd_open` fallback.
+- Known limits stated in Settings: auto-allowed git reads trust each repository's own git config; exports turn the home path into `~` and keep the user name.
+
+Changes from now on go through `docs/agents/change-requests.md`. Dispatching M1 workers needs its own go.

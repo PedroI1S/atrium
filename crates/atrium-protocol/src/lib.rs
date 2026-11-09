@@ -1,6 +1,6 @@
 //! Atrium contract types (PLAN §3.1–§3.4, §3.12).
 //!
-//! **Contract, M1 revision 3 (draft, `docs/contracts/m1.md`).** Workers
+//! **Contract, M1 revision 3 (frozen, D-051, `docs/contracts/m1.md`).** Workers
 //! implement against these types and never edit them; changes go through
 //! `docs/agents/change-requests.md`. M1-12 may add TS-export derives only.
 //!

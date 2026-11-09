@@ -1,6 +1,6 @@
 //! Agent adapter contract (PLAN §3.2, §3.12).
 //!
-//! **Contract, M1 revision 3 (draft, `docs/contracts/m1.md`).** Each
+//! **Contract, M1 revision 3 (frozen, D-051, `docs/contracts/m1.md`).** Each
 //! production adapter (`src/claude`, `src/codex`) implements [`AgentAdapter`]
 //! and [`Normalizer`] for one provider. Changes go through
 //! `docs/agents/change-requests.md`.
