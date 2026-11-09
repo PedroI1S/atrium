@@ -137,3 +137,21 @@ fn remember_matcher_none_for_compound_glob_or_multi_path() {
 fn atrium_protected_paths_readable_not_writable() {
     unimplemented!()
 }
+
+#[test]
+#[ignore = "M1-03"]
+fn attached_flag_values_key_value_operands_and_assignments_are_resolved() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn unknown_cwd_after_cd_asks_and_blocks_relative_recursive_delete() {
+    unimplemented!()
+}
+
+#[test]
+#[ignore = "M1-03"]
+fn search_flag_values_are_not_search_roots() {
+    unimplemented!()
+}

@@ -113,12 +113,20 @@ impl Ledger {
 ///   rest appended; this is the gate's only filesystem access), evaluates
 ///   the policy, and for `Ask` computes the "always…" matcher and opens the
 ///   ledger entry. Any internal error → `Deny` (fail closed).
-///   - Paths resolved: a `Paths` subject's paths; for a command, every
-///     non-flag argument, the value of every `--flag=value`, and every
-///     redirect target, of every segment, against the segment's cwd. The
-///     cwd is `ToolSubject::Command.cwd` (or the thread's), updated by a
-///     `cd` to a literal path for later segments; any other directory
-///     change (`cd -`, `cd $X`, `pushd`) makes the line `Ask`.
+///   - Paths resolved: a `Paths` subject's paths; for a command, of every
+///     segment: every argument, the value part of every `--flag=value`,
+///     `-X=value`, attached short-flag value (`-Xvalue`) and `key=value`
+///     operand, every assignment's value, and every redirect target except
+///     a `Dup` fd. Over-resolving is safe: it can only make a call ask or
+///     be blocked.
+///   - The cwd starts as `ToolSubject::Command.cwd` (or the thread's). For
+///     later segments: `cd <literal>` and `pushd <literal>` move it, a bare
+///     `cd` goes to `home`, `cd -` returns to the previous known cwd. Any
+///     other change (`cd $X`, `popd`, `cd -` with no earlier `cd`) makes
+///     the cwd unknown: the line asks, relative paths are checked for hard
+///     deny against `home`, the starting cwd and every cwd seen so far, and
+///     a recursive delete of a relative path is blocked
+///     (`recursive-delete-outside-cwd`).
 ///   - "Always…" matcher: one simple command with no assignments, harmless
 ///     redirects only and no `$`, globs or braces → `CommandPrefix` of its
 ///     argv; a file tool with exactly one path → `PathGlob` of that resolved

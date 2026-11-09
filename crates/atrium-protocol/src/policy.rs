@@ -469,7 +469,10 @@ const fn git(sub: &'static [&'static str]) -> ReadOnlyCommand {
 ///
 /// A recursive search (`recursion`) asks unless every search root is given
 /// and resolves to a file or to a folder strictly inside `~`: `rg token`
-/// with no path, or `grep -r token .`, searches all of home (D-050).
+/// with no path, or `grep -r token .`, searches all of home (D-050). A flag
+/// that takes a separate value (`-e`, `-g`, `-t`, `-m`, …) consumes the
+/// next word, which is not a search root; a flag the matcher doesn't know
+/// makes the command ask.
 ///
 /// Known limit, stated in settings: a repository's own `.git/config` can make
 /// git run programs (`core.fsmonitor`, textconv and diff drivers), so
@@ -483,7 +486,15 @@ pub const HOME_READONLY_COMMANDS: &[ReadOnlyCommand] = &[
     cmd(&["wc"]),
     ReadOnlyCommand {
         prefix: &["file"],
-        forbidden: &["-C", "--compile", "-m", "--magic-file"],
+        // `-f` reads a list of names from a file and echoes its lines.
+        forbidden: &[
+            "-C",
+            "--compile",
+            "-m",
+            "--magic-file",
+            "-f",
+            "--files-from",
+        ],
         only: None,
         recursion: Recursion::Never,
     },
@@ -515,13 +526,16 @@ pub const HOME_READONLY_COMMANDS: &[ReadOnlyCommand] = &[
             "-z",
             "--search-zip",
             "--hostname-bin",
+            "-f",
+            "--file",
         ],
         only: None,
         recursion: Recursion::Always,
     },
     ReadOnlyCommand {
         prefix: &["grep"],
-        forbidden: &[],
+        // `-f` reads patterns from a file the gate can't see as a search root.
+        forbidden: &["-f", "--file"],
         only: None,
         recursion: Recursion::WithFlags(&[
             "-r",
