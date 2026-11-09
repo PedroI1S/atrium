@@ -220,3 +220,15 @@ G6 is met: the checks are done before any M1 UI work merges. The failures aren't
 **Decided by Pedro (owner).** Atrium targets 60 fps on every display, which is what PLAN §4 asks for. Linux meets it cleanly, including on a 144 Hz monitor where WebKitGTK caps content updates at 60 fps (`M0-linux-checks.md` §2.3).
 - No UI, docs or release notes promise 120 Hz or higher.
 - Later, as a timeboxed task (not M1's critical path): find what caps WebKitGTK at 60 fps, and check macOS on a 120 Hz display (ProMotion or external). The spikes only ran on 60 Hz Mac screens.
+
+## D-043 — 2026-11-09 — Go for the M1 contract phase; no Codex, so Sonnet and agy take its roles
+**Decided by Pedro (driver).** Pedro gave the go for M1's contract phase only: contracts, test stubs and briefs. Dispatching workers needs its own go after he approves the contracts.
+
+Pedro's Codex subscription has ended, so GPT-6.1 Sol and GPT-6 Astra are unavailable on his shifts. Argon's usage has reset, which ends D-015's pause. Routing until this changes (PLAN §8.2's pairing rule still holds: the reviewer is never from the author's provider):
+- **Sol's work** (Rust daemon, store, client, policy engine) goes to **Sonnet 5.5**. Opus 5.5 is used as a worker only when a task needs it, such as a fix after two failed rounds or a contract-heavy task.
+- **Astra's reviews** (contract review, gate review, security review) go to **Gemini 4 Argon**, read-only through `agy --mode plan`.
+- **Cross-provider review** of anything Claude writes is done by Argon or Gemini 3.8 Flash, and Claude reviews anything agy writes.
+- Argon keeps its M1 role (adversarial tests of the deny list and approval rules, socket permissions), and Flash keeps tests, fixtures and docs.
+- Live Codex work (X1–X3) needs a Codex login. On rodrigo's shifts their Codex can be used, under the same rules.
+
+`agy` is now 1.5.1. The worker policy hook was last verified on 1.4.7, so it is re-checked before the first agy worker runs (PLAN §8.7).
