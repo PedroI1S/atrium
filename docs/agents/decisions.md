@@ -260,3 +260,6 @@ Pedro's Codex subscription has ended, so GPT-6.1 Sol and GPT-6 Astra are unavail
 - In M1, that covers M1-09a (app shell) and M1-09b (Home chat, inbox, approvals, questions).
 - Reviewers stay cross-provider: Gemini 3.8 Flash or Argon, with screenshots as evidence.
 - At most one Opus UI worker at a time, besides the orchestrator.
+
+## D-049 — 2026-11-09 — The M1 contract code is pushed to `dev` right away
+**Decided by Pedro (driver).** The contract code (`crates/atrium-protocol`, `crates/atrium-agents/src/lib.rs`, the `atrium-core` and `atrium-host` signatures, the schema and test stubs) is pushed to `dev` as soon as it's committed, like the docs. It's the spec workers and the other driver build against. Worker code still reaches `origin` only at handoffs (D-005, D-007).
