@@ -24,6 +24,7 @@ use crate::thread::ThreadId;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementLevel {
     /// Every tool call, of every class, passes Atrium's gate before it runs,
@@ -36,6 +37,7 @@ pub enum EnforcementLevel {
 /// The classes an adapter must account for. `Full` needs all of them
 /// `Intercepted`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolClass {
     Read,
@@ -67,6 +69,7 @@ impl ToolClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum Coverage {
     /// Every call of this class reaches the gate before it runs.
@@ -82,6 +85,7 @@ pub enum Coverage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct ClassCoverage {
     pub class: ToolClass,
     pub coverage: Coverage,
@@ -90,6 +94,7 @@ pub struct ClassCoverage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigSourceKind {
     UserSettings,
@@ -105,6 +110,7 @@ pub enum ConfigSourceKind {
 
 /// A configuration source the provider loads for this session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct ConfigSource {
     pub kind: ConfigSourceKind,
     /// Sanitized path (home directory as `~`).
@@ -117,6 +123,7 @@ pub struct ConfigSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum ReasonCode {
     ClassNotIntercepted,
@@ -129,6 +136,7 @@ pub enum ReasonCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct EnforcementReason {
     pub code: ReasonCode,
     /// One line for the UI, e.g. "Plugin hooks are not inspected".
@@ -138,6 +146,7 @@ pub struct EnforcementReason {
 /// What Atrium can enforce for one session. Persisted with the session and
 /// shown in the thread header, the provider picker and settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct EnforcementDescriptor {
     pub level: EnforcementLevel,
     /// Empty only when `level` is `Full`.
@@ -228,6 +237,7 @@ impl EnforcementDescriptor {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum Preset {
     /// Home: read freely, approve changes (PLAN §3.3). M1's only preset in use.
@@ -240,6 +250,7 @@ pub enum Preset {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum RuleDecision {
     Allow,
@@ -247,6 +258,7 @@ pub enum RuleDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleScope {
     Thread { thread_id: ThreadId },
@@ -256,6 +268,7 @@ pub enum RuleScope {
 
 /// "Always…" choices offered with an approval. The thread is implied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum RememberScope {
     Thread,
@@ -264,6 +277,7 @@ pub enum RememberScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleMatcher {
     /// Every call of the rule's tool kind (and name, if set).
@@ -276,6 +290,7 @@ pub enum RuleMatcher {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(transparent)]
 pub struct RuleId(pub String);
 
@@ -284,6 +299,7 @@ pub struct RuleId(pub String);
 /// Anything the adapter can't extract is `Unknown`, which the policy treats
 /// as `Ask` (after the hard-deny check on the raw input).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolSubject {
     /// A shell command line. The call's `kind` is always `Execute`, whatever
@@ -317,6 +333,7 @@ pub enum ToolSubject {
 /// A rule as a client creates it; the daemon assigns `id`, `origin` and
 /// `created_at_ms`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct RuleDraft {
     pub scope: RuleScope,
     pub tool_kind: ToolKind,
@@ -327,6 +344,7 @@ pub struct RuleDraft {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleOrigin {
     /// Created by "always…" on an approval.
@@ -336,6 +354,7 @@ pub enum RuleOrigin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct Rule {
     pub id: RuleId,
     pub scope: RuleScope,
@@ -354,6 +373,7 @@ pub struct Rule {
 /// What a policy decision was evaluated against. Bound into every approval
 /// ticket (D-046).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct PolicyContext {
     /// Increases on every rule change.
     pub rules_revision: u64,
