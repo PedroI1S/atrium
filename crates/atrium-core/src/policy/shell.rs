@@ -776,6 +776,7 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                 }
             }
             "command" | "setsid" => skip(&a, &[], &[]),
+            "busybox" | "toybox" => 1,
             "exec" => skip(&a, &["-a"], &[]),
             "nice" => skip(&a, &["-n"], &[]),
             "ionice" => skip(&a, &["-c", "-n", "-p"], &[]),
@@ -855,7 +856,11 @@ fn payload_of(eff: &[String]) -> Option<String> {
             if w.starts_with('-') && !w.starts_with("--") && w[1..].contains('c') {
                 return eff.get(j + 1).cloned();
             }
-            if w.starts_with('-') {
+            if matches!(w.as_str(), "-o" | "+o" | "-O" | "+O") {
+                j += 2;
+                continue;
+            }
+            if w.starts_with('-') || w.starts_with('+') {
                 j += 1;
                 continue;
             }

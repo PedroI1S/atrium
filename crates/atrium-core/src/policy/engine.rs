@@ -475,8 +475,8 @@ impl Home<'_> {
 
     fn word_paths(&self, unit: usize, word: &str) -> Vec<PathBuf> {
         let mut out = vec![];
-        for (idx, u) in self.a.uses.iter().enumerate() {
-            if u.unit == unit && u.word == word {
+        if let Some(idxs) = self.a.use_index.get(&(unit, word.to_string())) {
+            for &idx in idxs {
                 out.extend(self.a.all_paths(idx).into_iter().cloned());
             }
         }

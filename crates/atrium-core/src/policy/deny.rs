@@ -3,6 +3,7 @@
 //! (through assignments and wrappers), inside substitutions and payloads, and
 //! on the raw text.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use atrium_agents::ToolCheck;
@@ -24,6 +25,8 @@ pub struct Analysis {
     /// Per `uses` entry: the gate's resolution, when its list lines up with
     /// ours.
     pub aligned: Option<Vec<Vec<PathBuf>>>,
+    /// `(unit, word)` → indexes into `uses`.
+    pub use_index: HashMap<(usize, String), Vec<usize>>,
     pub unit_cwd: Vec<CwdState>,
     pub cwd_unknown: bool,
     /// Text the raw-string checks run on.
@@ -73,6 +76,7 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         reasons: vec![],
         uses: vec![],
         aligned: None,
+        use_index: HashMap::new(),
         unit_cwd: vec![],
         cwd_unknown: false,
         raw: vec![],
@@ -143,6 +147,12 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
             a.uses = walk.uses;
             a.reasons.push("unknown tool input".into());
         }
+    }
+    for (idx, u) in a.uses.iter().enumerate() {
+        a.use_index
+            .entry((u.unit, u.word.clone()))
+            .or_default()
+            .push(idx);
     }
     // Line the gate's resolutions up with ours, word for word.
     let total: usize = a.uses.iter().map(|u| u.paths.len()).sum();
@@ -367,8 +377,9 @@ impl Sensitive {
         {
             return Some(h);
         }
+        let glob = ShellGlob::new(&pl);
         for probe in self.probes() {
-            if shell_glob_matches(&pl, &probe)
+            if glob.is_match(&probe)
                 && let Some(h) = self.hit(Path::new(&probe), Role::Read)
             {
                 return Some(h);
@@ -421,25 +432,48 @@ impl Sensitive {
 }
 
 /// Shell globbing: `*` and `?` don't cross `/` and don't match a leading dot.
-fn shell_glob_matches(pattern: &str, probe: &str) -> bool {
-    if pattern.contains("**") {
-        return GlobBuilder::new(pattern)
-            .literal_separator(true)
-            .build()
-            .is_ok_and(|g| g.compile_matcher().is_match(probe));
-    }
-    let pc: Vec<&str> = pattern.split('/').collect();
-    let qc: Vec<&str> = probe.split('/').collect();
-    pc.len() == qc.len()
-        && pc.iter().zip(&qc).all(|(p, q)| {
-            if q.starts_with('.') && !p.starts_with('.') {
-                return false;
-            }
+struct ShellGlob {
+    whole: Option<globset::GlobMatcher>,
+    parts: Vec<(bool, Option<globset::GlobMatcher>)>,
+}
+
+impl ShellGlob {
+    fn new(pattern: &str) -> Self {
+        let compile = |p: &str| {
             GlobBuilder::new(p)
                 .literal_separator(true)
                 .build()
-                .is_ok_and(|g| g.compile_matcher().is_match(q))
-        })
+                .ok()
+                .map(|g| g.compile_matcher())
+        };
+        if pattern.contains("**") {
+            return Self {
+                whole: compile(pattern),
+                parts: vec![],
+            };
+        }
+        Self {
+            whole: None,
+            parts: pattern
+                .split('/')
+                .map(|c| (c.starts_with('.'), compile(c)))
+                .collect(),
+        }
+    }
+
+    fn is_match(&self, probe: &str) -> bool {
+        if let Some(w) = &self.whole {
+            return w.is_match(probe);
+        }
+        if self.parts.is_empty() {
+            return false;
+        }
+        let qc: Vec<&str> = probe.split('/').collect();
+        qc.len() == self.parts.len()
+            && self.parts.iter().zip(&qc).all(|((dot, m), q)| {
+                (*dot || !q.starts_with('.')) && m.as_ref().is_some_and(|m| m.is_match(q))
+            })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -664,9 +698,9 @@ impl Ctx<'_> {
     fn target_paths(&self, i: usize, word: &str) -> Vec<PathBuf> {
         let mut out = vec![];
         let mut found = false;
-        for (idx, u) in self.a.uses.iter().enumerate() {
-            if u.unit == i && u.word == word {
-                found = true;
+        if let Some(idxs) = self.a.use_index.get(&(i, word.to_string())) {
+            found = true;
+            for &idx in idxs {
                 out.extend(self.a.all_paths(idx).into_iter().cloned());
             }
         }
@@ -688,7 +722,11 @@ impl Ctx<'_> {
         let cwd = self.input.cwd;
         let unknown = self.a.unit_cwd.get(i).is_some_and(CwdState::is_unknown);
         let start_l = lower(&self.a.start);
+        let mut seen = std::collections::HashSet::new();
         for t in targets {
+            if !seen.insert(t.as_str()) {
+                continue;
+            }
             let relative = {
                 let e = words::expand_home(t, self.home(), cwd);
                 !Path::new(&e).is_absolute()

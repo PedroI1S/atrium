@@ -158,8 +158,63 @@ fn has_unknown_var(w: &str) -> bool {
     w.contains('$') || w.contains('`')
 }
 
+/// `a{b,c}d` → `abd`, `acd` (comma lists only; capped).
+fn brace_expand(w: &str) -> Vec<String> {
+    fn go(w: &str, out: &mut Vec<String>) {
+        let cs: Vec<char> = w.chars().collect();
+        let mut i = 0;
+        while i < cs.len() {
+            if cs[i] == '{' && (i == 0 || cs[i - 1] != '$') {
+                let (mut d, mut j, mut commas) = (1usize, i + 1, vec![]);
+                while j < cs.len() && d > 0 {
+                    match cs[j] {
+                        '{' => d += 1,
+                        '}' => d -= 1,
+                        ',' if d == 1 => commas.push(j),
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if d == 0 && !commas.is_empty() {
+                    let pre: String = cs[..i].iter().collect();
+                    let post: String = cs[j..].iter().collect();
+                    let mut bounds = vec![i];
+                    bounds.extend(commas);
+                    bounds.push(j - 1);
+                    for k in 0..bounds.len() - 1 {
+                        let alt: String = cs[bounds[k] + 1..bounds[k + 1]].iter().collect();
+                        if out.len() > 256 {
+                            return;
+                        }
+                        go(&format!("{pre}{alt}{post}"), out);
+                    }
+                    return;
+                }
+            }
+            i += 1;
+        }
+        out.push(w.to_string());
+    }
+    let mut out = vec![];
+    go(w, &mut out);
+    if out.len() > 256 {
+        return vec![w.to_string()];
+    }
+    out
+}
+
 /// Words that name paths, in the order the gate and the engine both use.
 fn words_of(unit: &Unit) -> Vec<(String, Role)> {
+    let mut out = vec![];
+    for (w, role) in raw_words_of(unit) {
+        for e in brace_expand(&w) {
+            out.push((e, role));
+        }
+    }
+    out
+}
+
+fn raw_words_of(unit: &Unit) -> Vec<(String, Role)> {
     let mut out = vec![];
     for (_, v) in &unit.seg.assignments {
         out.push((v.clone(), Role::Read));
