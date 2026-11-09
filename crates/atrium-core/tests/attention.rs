@@ -124,7 +124,7 @@ fn table() -> Vec<Row> {
     //                                                          S R A Q I P F X U E
     let mut rows = vec![
         sig("Signal::Starting", Signal::Starting, "SSSSSSSSSS"),
-        sig("Signal::Stopped", Signal::Stopped, "EEEEEEEEEE"),
+        sig("Signal::Stopped", Signal::Stopped, "EEEEEE===="),
         sig(
             "Signal::Exited(0)",
             Signal::Exited { code: Some(0) },
@@ -351,6 +351,12 @@ fn table() -> Vec<Row> {
                 output: None,
                 error: None,
                 truncated_bytes: 0,
+            },
+        ),
+        (
+            "Usage",
+            AgentEvent::Usage {
+                usage: atrium_protocol::agent::Usage::default(),
             },
         ),
         ("PlanUpdated", AgentEvent::PlanUpdated { entries: vec![] }),
@@ -713,16 +719,27 @@ fn failed_and_paused_are_sticky_through_exit() {
 
 #[test]
 fn user_stop_ends_as_ended_whatever_the_exit_code() {
-    for from in STATES.chars().map(state_of) {
-        let stopped = next_state(
-            &from,
+    let stop = |from: &ThreadState| {
+        next_state(
+            from,
             Pending::default(),
             AttentionInput::Signal(&Signal::Stopped),
-        );
-        assert_eq!(stopped, ThreadState::Ended, "from {from:?}");
+        )
+    };
+    for from in "SRAQIP".chars().map(state_of) {
+        assert_eq!(stop(&from), ThreadState::Ended, "from {from:?}");
     }
+    // The sticky states are only left by a start: a stop keeps them.
+    for from in "FXU".chars().map(state_of) {
+        assert_eq!(stop(&from), from, "from {from:?}");
+    }
+    let unverified = state_of('U');
+    assert_eq!(stop(&unverified), unverified);
     for code in [Some(0), Some(1), Some(137), None] {
         assert_eq!(exit(ThreadState::Ended, code), ThreadState::Ended);
+        // A stop, then any exit code, ends as Ended.
+        let stopped = stop(&ThreadState::Running);
+        assert_eq!(exit(stopped, code), ThreadState::Ended);
     }
 }
 

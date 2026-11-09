@@ -24,7 +24,8 @@ pub enum AttentionInput<'a> {
 /// The next state. `pending` is the count *after* the input is applied.
 ///
 /// - `Signal::Starting` → `Starting`, from any state (a new incarnation).
-/// - `Signal::Stopped` (the user stopped it) → `Ended` at once.
+/// - `Signal::Stopped` (the user stopped it) → `Ended` at once, except from
+///   the sticky states below, which it never leaves.
 /// - Sticky until the next `Signal::Starting`: `Failed` (after a fatal
 ///   `Error`), `Ended` and `Interrupted`; the `TurnCompleted`,
 ///   `SessionEnded` and `Signal::Exited` that follow keep them. `Paused`
@@ -45,13 +46,9 @@ pub fn next_state(
     pending: Pending,
     input: AttentionInput<'_>,
 ) -> ThreadState {
-    // A new incarnation, or the user stopping the session, beats everything.
-    if let AttentionInput::Signal(signal) = input {
-        match signal {
-            Signal::Starting => return ThreadState::Starting,
-            Signal::Stopped => return ThreadState::Ended,
-            _ => {}
-        }
+    // A new incarnation beats everything.
+    if matches!(input, AttentionInput::Signal(Signal::Starting)) {
+        return ThreadState::Starting;
     }
 
     // Failed, Ended and Interrupted stay until the next start.
@@ -71,7 +68,9 @@ pub fn next_state(
             cleanup: Cleanup::Verified,
         },
         AttentionInput::Signal(Signal::Exited { code }) => exit_state(current, *code),
-        AttentionInput::Signal(Signal::Starting | Signal::Stopped) => current.clone(),
+        AttentionInput::Signal(Signal::Starting) => ThreadState::Starting,
+        // Not from the sticky states (handled above): the user stopped it.
+        AttentionInput::Signal(Signal::Stopped) => ThreadState::Ended,
         AttentionInput::Event(event) => match event {
             AgentEvent::SessionEnded { exit_code, .. } => exit_state(current, *exit_code),
             AgentEvent::Error {
