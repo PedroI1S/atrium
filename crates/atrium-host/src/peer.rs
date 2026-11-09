@@ -169,11 +169,7 @@ mod platform {
         fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
         fn CFDataGetTypeID() -> CFTypeID;
         fn CFURLGetTypeID() -> CFTypeID;
-        fn CFDataCreate(
-            allocator: CFAllocatorRef,
-            bytes: *const u8,
-            length: CFIndex,
-        ) -> CFDataRef;
+        fn CFDataCreate(allocator: CFAllocatorRef, bytes: *const u8, length: CFIndex) -> CFDataRef;
         fn CFDataGetBytePtr(the_data: CFDataRef) -> *const u8;
         fn CFDataGetLength(the_data: CFDataRef) -> CFIndex;
         fn CFDictionaryCreate(
@@ -327,10 +323,9 @@ mod platform {
         // SAFETY: `token_bytes` points to `size_of::<AuditToken>()` initialized
         // bytes valid during `CFDataCreate`, which copies them and returns null
         // or a +1 owned `CFDataRef` under the Create rule.
-        let audit_data = unsafe {
-            CfRef::from_create_rule(CFDataCreate(ptr::null(), token_bytes, token_len))
-        }
-        .ok_or_else(|| PeerError::Inspect("CFDataCreate for audit token failed".into()))?;
+        let audit_data =
+            unsafe { CfRef::from_create_rule(CFDataCreate(ptr::null(), token_bytes, token_len)) }
+                .ok_or_else(|| PeerError::Inspect("CFDataCreate for audit token failed".into()))?;
 
         // SAFETY: `kSecGuestAttributeAudit` is an immutable `CFStringRef`
         // constant exported by `Security.framework`, and `audit_data` is a live

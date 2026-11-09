@@ -250,18 +250,24 @@ fn spawn_detached_creates_new_session_and_enforces_private_log_0600_nofollow() {
     )
     .expect("spawn_detached");
 
-    // Ensure cleanup even on assertion failure.
+    // Ensure cleanup even on assertion failure. The detached child leads its
+    // own session and process group, so kill the whole group (`sh` and its
+    // `sleep 30`).
+    fn kill_detached_group(pid: u32) {
+        if let Ok(raw) = i32::try_from(pid)
+            && raw > 1
+        {
+            // SAFETY: `raw > 1`, so `-raw <= -2` targets only the process
+            // group this test created through `spawn_detached` (`setsid`).
+            unsafe {
+                libc::kill(-raw, libc::SIGKILL);
+            }
+        }
+    }
     struct DetachKill(u32);
     impl Drop for DetachKill {
         fn drop(&mut self) {
-            if let Ok(raw) = i32::try_from(self.0)
-                && raw > 1
-            {
-                // SAFETY: Killing detached process spawned by this test.
-                unsafe {
-                    libc::kill(raw, libc::SIGKILL);
-                }
-            }
+            kill_detached_group(self.0);
         }
     }
     let _guard = DetachKill(pid);
@@ -285,11 +291,8 @@ fn spawn_detached_creates_new_session_and_enforces_private_log_0600_nofollow() {
     assert!(text.contains("out-line"));
     assert!(text.contains("err-line"));
 
-    // Kill the detached process and verify the background reaper reaps it.
-    // SAFETY: Killing detached process spawned by this test.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+    // Kill the whole detached group and verify the background reaper reaps it.
+    kill_detached_group(pid);
     for _ in 0..100 {
         // SAFETY: Signal 0 checks existence.
         if unsafe { libc::kill(pid as i32, 0) } != 0 {

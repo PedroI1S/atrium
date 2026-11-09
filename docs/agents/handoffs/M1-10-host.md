@@ -121,8 +121,41 @@ test result: ok. 2 unit + 4 lifecycle + 3 peer + 6 supervise passed; 0 failed
 ## Gotchas
 
 - **XNU `killpg1` zombie-group `EPERM`**: On macOS (`bsd/kern/kern_sig.c`), when `pgfind(pgid)` finds a process group whose only remaining members are unreaped `SZOMB` processes (`nfound == 0`), `kill(-pgid, SIGKILL)` returns `EPERM` instead of `0` or `ESRCH`. `supervise::terminate` checks `peek_exited(pid)` on macOS `EPERM`, reaps the zombie leader, and then verifies `group_is_empty(pgid)` (`ESRCH`), surfacing `EPERM` if any non-zombie process actually remained.
-- **`SecCodeCreateWithAuditToken` parameter ABI**: Despite some third-party wrappers describing the first parameter as a `CFDataRef`, `<Security/SecCode.h>` takes `const audit_token_t *` directly; passing a `CFDataRef` fails with `OSStatus 100003` (`ESRCH`).
+- **Superseded (see "Review fixes")**: the earlier claim that `<Security/SecCode.h>` declares `SecCodeCreateWithAuditToken` was wrong; that symbol is not in the public headers and is no longer linked.
 
 ## Follow-ups
 
 - Run `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test -p atrium-host` on a Linux 6.5+ host during rodrigo's shift to exercise `SO_PEERPIDFD`, `SYS_pidfd_send_signal`, `/proc/<pid>` inspection, and XDG path/systemd unit integration tests.
+
+## Review fixes (round 1)
+
+Argon (Gemini 4 Argon) started the round and ran out of quota; the partial work is commit 46dabff ("unverified"). Claude Sonnet 5.5 took over (D-053), checked every item against the code, and finished the rest.
+
+1. **[major] Documented Security API (Argon, checked by me).** `SecCodeCreateWithAuditToken` is gone. `sec_code_from_token` builds `{kSecGuestAttributeAudit: CFData(audit token bytes)}` and calls `SecCodeCopyGuestWithAttributes(NULL, attrs, kSecCSDefaultFlags, &code)`. The handoff claim about headers is corrected (Gotchas).
+2. **[major] Running-process cdhash (Argon's code; I strengthened the test).** `MacUnsigned` no longer uses `SecCodeCopyStaticCode`. It runs `SecCodeCheckValidity(code, 0, cdhash H"<expected>")` on the dynamic code, then reads `kSecCodeInfoUnique` via `SecCodeCopySigningInformation(code, kSecCSDynamicInformation)` on the `SecCode` itself; any Security error fails closed. Test `macos_requirement_check_and_in_kernel_code_object_cdhash` launches helper A, replaces its file on disk with a differently signed helper B (re-signed ad hoc, distinct cdhash, confirmed with `codesign -dvvv`), then connects: the forged identity (B's cdhash) is refused, and A's own running identity either verifies with A's pid or fails closed. Observed on this machine: it fails closed with `errSecCSStaticCodeChanged` (-67034), because Security also notices the file changed. Consequence: a dev app rebuilt while running can't re-verify until restarted.
+3. **[minor] Verified only if drained (Argon).** `kill_recorded` returns `Verified` only if `group_is_empty` after the wait, else `Unverified`; `terminate` returns an error (`TimedOut`/`EPERM`) when the group isn't empty. My test fix: `kill_recorded_kills_matching_live_orphan_group` now reaps the killed leader from a thread (an unreaped zombie rightly keeps the group non-empty).
+4. **[minor] Docs (Argon).** `terminate` documents that the caller must not reap the leader first (it now returns `InvalidInput` if the leader was already reaped); `kill_recorded` documents that it blocks (use `spawn_blocking`).
+5. **[minor] Keep-running (mine, docs only).** Neither function runs `launchctl` or `systemctl`. The code already had `KeepAlive = {SuccessfulExit: false}` and `Restart=on-failure`; I documented on both functions that the change takes effect at next login.
+6. **[minor] `CfRef::from_create_rule` (Argon).** `unsafe fn` with a `# Safety` doc; every call site is in an `unsafe` block.
+7. **[minor] Never the daemon's own group (Argon; my extra test).** `spawn_group` kills the child and fails if `pgid != pid`; `signal_group` refuses `pgid <= 1` and `pgid == getpgrp()` (new unsafe `getpgrp`). New test `kill_recorded_never_signals_the_callers_own_process_group`.
+8. **[nit] `peer_pidfd`, constants, order, SAFETY (Argon).** `OwnedFd` wraps the fd before the `len` check; `libc::SOL_LOCAL`/`libc::LOCAL_PEERTOKEN` are used; `len` is checked before `audit_token_to_*`; `peek_exited` SAFETY mentions the Linux `si_pid()` union read. Linux code still not compiled here (no Linux std target installed).
+9. **[nit] Test kills (mine).** The descendant is killed through `KillPidGuard`; the `spawn_detached` test kills the whole group (`kill(-pid)`). `pgrep -f "sleep 30|sleep 60"` is empty after both test runs.
+10. **[nit] Log directory and macOS minimum (log dir mine; docs Argon).** `open_private_log` runs `secure_dir` when the parent equals `default_paths().logs_dir`. The peer module docs name macOS 11 as the minimum.
+
+### Definition of Done results (after the fixes)
+
+```text
+$ cargo fmt --all --check                                  -> ok
+$ cargo clippy --workspace --all-targets -- -D warnings    -> Finished, no warnings
+$ cargo test -p atrium-host            -> 2 unit, 4 lifecycle, 3 peer, 7 supervise passed, 0 failed
+$ cargo test -p atrium-host --release  -> same counts, 0 failed
+$ pgrep -f "sleep 30|sleep 60|helper_" -> empty after each run
+```
+
+### Unsafe blocks (current, `crates/atrium-host`)
+
+Library: `lib.rs:17` geteuid; `lifecycle.rs:262` `pre_exec(setsid)`; `supervise.rs:213` getpgrp (new); `:235` kill(-pgid) (now also refuses own group); `:311` waitid (SAFETY completed); `:408` proc_pidinfo; `:440` proc_pidpath; `peer.rs:155/164/206` `unsafe extern` blocks for libbsm audit_token_to_*, CoreFoundation (now also `CFDataCreate`, `CFDictionaryCreate` and the type callbacks), Security (`SecCodeCopyGuestWithAttributes`, `kSecGuestAttributeAudit`; `SecCodeCreateWithAuditToken`, `SecCodeCopyStaticCode` removed); `:247` `unsafe fn from_create_rule` (new); `:260` CFRelease; `:289` getsockopt LOCAL_PEERTOKEN; `:312` audit_token_to_*; `:327` CFDataCreate; `:335` CFDictionaryCreate; `:359` SecCodeCopyGuestWithAttributes; `:392` requirement string/`SecRequirementCreateWithString`; `:426` SecCodeCheckValidity; `:444` dynamic signing info read; `:582` SecCodeCopySelf; Linux `:629` getsockopt SO_PEERPIDFD (OwnedFd first); `:661` pidfd_send_signal.
+
+Tests: `tests/supervise.rs:20,36,51` (kill probes/guards; the unguarded descendant kill is removed); `tests/peer.rs:119`; `tests/lifecycle.rs:111,262,277,298,319` (the detached kills now go through `kill(-pid)` with `raw > 1`).
+
+Changed or added since 40437e3: peer.rs (all macOS FFI blocks above, `from_create_rule`, peer_pidfd), supervise.rs (getpgrp, kill, waitid comment), tests/lifecycle.rs:262.

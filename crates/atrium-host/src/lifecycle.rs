@@ -284,6 +284,12 @@ pub fn spawn_detached(executable: &Path, args: &[String], log: &Path) -> std::io
 
 /// "Keep agents running after quitting": a launchd LaunchAgent (macOS) or a
 /// systemd user unit (Linux) that starts `executable` at login.
+///
+/// This only writes Atrium's own service file; it never runs `launchctl` or
+/// `systemctl` (that could stop the daemon that is running now). The job
+/// restarts the daemon only after a crash (`KeepAlive` = `{SuccessfulExit:
+/// false}` on launchd, `Restart=on-failure` on systemd). The change takes
+/// effect at the next login.
 pub fn install_keep_running(executable: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -297,6 +303,9 @@ pub fn install_keep_running(executable: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Removes Atrium's own service file (and nothing else). Doesn't run
+/// `launchctl` or `systemctl`, so a daemon that is running keeps running; the
+/// change takes effect at the next login.
 pub fn remove_keep_running() -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -390,12 +399,20 @@ fn open_private_log(log: &Path) -> std::io::Result<std::fs::File> {
 
     if let Some(parent) = log.parent()
         && !parent.as_os_str().is_empty()
-        && !parent.exists()
     {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
+        let is_logs_dir = default_paths().is_ok_and(|p| p.logs_dir == parent);
+        if is_logs_dir {
+            // The daemon's own logs folder: owner, mode and symlink checked.
+            secure_dir(parent).map_err(|e| match e {
+                LifecycleError::Io(io) => io,
+                other => std::io::Error::new(ErrorKind::PermissionDenied, other.to_string()),
+            })?;
+        } else if !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
     }
 
     let my_uid = crate::current_euid();

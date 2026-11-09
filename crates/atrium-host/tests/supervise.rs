@@ -236,7 +236,7 @@ async fn gone_leader_with_live_descendant_in_group_is_not_verified() {
         .trim()
         .parse()
         .expect("parse descendant pid");
-    let _desc_guard = KillPidGuard(descendant_pid);
+    let desc_guard = KillPidGuard(descendant_pid);
 
     // Reap ONLY the leader (simulating an exited leader reaped by init after a
     // daemon crash while a tool descendant remains in `recorded.pgid`).
@@ -257,11 +257,8 @@ async fn gone_leader_with_live_descendant_in_group_is_not_verified() {
     );
 
     // Once the descendant is gone too, the group is empty, so recovery is Verified.
-    // SAFETY: Killing the descendant this test spawned so we can verify the
-    // empty-group branch.
-    unsafe {
-        libc::kill(descendant_pid as i32, libc::SIGKILL);
-    }
+    // Kill the descendant through the guarded helper (pid > 1).
+    drop(desc_guard);
     for _ in 0..100 {
         if !pid_exists(descendant_pid) {
             break;
@@ -318,8 +315,12 @@ fn kill_recorded_kills_matching_live_orphan_group() {
     assert_eq!(recorded.pgid, leader_pid);
     assert!(pid_exists(child_pid));
 
+    // The launcher plays the role of init: it reaps the killed leader while
+    // `kill_recorded` waits for the group to drain (an unreaped zombie keeps
+    // the group alive, so `kill_recorded` would rightly say `Unverified`).
+    let reaper = std::thread::spawn(move || launcher.wait());
     assert_eq!(kill_recorded(&recorded), Cleanup::Verified);
-    let _ = launcher.wait();
+    let _ = reaper.join();
 
     for _ in 0..100 {
         if !pid_exists(child_pid) {
@@ -343,4 +344,13 @@ async fn fast_exiting_process_records_identity_and_terminates_cleanly() {
         .expect("terminate fast exit");
     assert_eq!(term.exit_code, Some(0));
     assert!(!term.killed);
+}
+
+#[test]
+fn kill_recorded_never_signals_the_callers_own_process_group() {
+    // The identity of this very test process: its pgid is the runner's own
+    // group, which must never be signalled.
+    let me = identify(std::process::id()).unwrap().expect("own identity");
+    assert_eq!(kill_recorded(&me), Cleanup::Unverified);
+    // Still alive to assert this.
 }
