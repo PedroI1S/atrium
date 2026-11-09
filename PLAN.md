@@ -126,6 +126,7 @@ atrium/
 - **Crash safety**:
   - Agent/browser/VM PIDs are recorded in the store.
   - On daemon restart, orphans are reaped and their threads marked `Interrupted`, with one-click resume using the agent's native session id.
+- **Authority** (D-045): agent and MCP connections get a per-thread scope and can never approve, answer, or change rules or settings. Human-control commands are accepted only from a connection whose peer process is the Atrium app (code signature on macOS, `/proc/<pid>/exe` on Linux). An unconfined agent running as the same user can still modify Atrium's files: peer checks raise the bar, the sandbox is the boundary.
 - **Upgrades**: the app and daemon ship together. A new daemon takes over when no turns are running, or after you confirm.
 - **Presence**: a menu bar / tray item shows running and needs-attention counts while the window is closed.
 
@@ -309,13 +310,15 @@ url     = "http://localhost:$PORT"
 - **Presets per workspace**:
   - *Careful*: ask for everything except reads.
   - *Normal*: edits auto-allowed, commands ask unless a rule matches.
-  - *Trusted*: everything except the deny list.
+  - *Trusted*: everything except the deny list, for the calls Atrium sees.
   - *Full access*: the provider's own full-access mode, with no provider prompts, on the host or in a sandbox. It's the user's choice (principle 7, D-011), never a default. Atrium's gate still sees whatever the adapter can intercept.
-- **Hard-deny list** that no rule overrides, e.g. `rm -rf` outside the worktree, force-push to protected branches, reading credential stores, `curl | sh` outside a sandbox. A hard-denied action can instead be offered as "run it in a sandbox" when the sandbox is available.
+- **Hard-deny list** that no rule overrides, for the calls Atrium intercepts (D-044). It is not a machine-wide prohibition: code that was allowed to run (an approved `cargo test` running a build script) can still do anything the user can. The UI calls it "Always blocked (for calls Atrium sees)". The M1 defaults are `HARD_DENY_DEFAULTS` in `atrium-protocol`, e.g. `rm -rf` outside the worktree, force-push to protected branches, reading credential stores, `curl | sh` outside a sandbox. A hard-denied action can instead be offered as "run it in a sandbox" when the sandbox is available.
 - **Enforcement per provider**: every adapter routes each tool call it can intercept through Atrium's policy gate *before* it runs (Claude: a per-session `PreToolUse` hook and `can_use_tool`; Codex: app-server approval requests; `agy`: the per-session hook bridge; ACP: permission requests, plus the client fs/terminal capabilities). How much each provider exposes differs, measured in M0 as an enforcement matrix per adapter.
-- **Enforcement levels are shown, not imposed** (D-012). Each provider has a level:
-  - *Full*: every tool call passes the gate.
-  - *Partial*: only what the provider asks about passes the gate. Some reads or commands run unchecked; which ones comes from the M0 matrix.
+- **Three separate things**, kept apart in code and UI (D-044): **coverage** (which calls Atrium sees before they run), **policy** (what it does with them: rules, presets, the deny list) and **isolation** (what limits code that was allowed to run; only the sandbox gives that).
+- **Approvals are single use** (D-046): one ledger in the daemon validates and consumes each approval before any effect, bound to the session incarnation, request, tool, canonical arguments and policy context. Unanswered requests wait, are never auto-allowed, and expire with their turn.
+- **Enforcement levels are shown, not imposed** (D-012), and are a property of each **session**, not of a provider (D-044): CLI version, settings files, plugins and hooks all change them. Each session has a level:
+  - *Full*: every tool call of every class passes the gate, on a tested CLI version, with every configuration source inspected.
+  - *Partial*: anything less, including anything Atrium couldn't verify, with the reasons shown. Some reads or commands run unchecked; which ones comes from the session's coverage.
 
   The level appears in the provider picker, the thread header and in settings (*Settings → Agents → <provider>*), with a one-line explanation and a "details" link to the matrix. Atrium **never blocks or downgrades** a provider because of its level. It doesn't push you toward the sandbox either, beyond mentioning that it exists. Rules and the hard-deny list apply to every call the gate sees, whatever the level.
 
