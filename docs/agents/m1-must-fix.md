@@ -80,3 +80,13 @@ M0 spikes are merged as spikes: they answered their questions, but they aren't p
 
 **Process (for M1):** reviewer verification at the final merged commit after the last fix round; ignored/known-failing tests stay visible at gates; measurement evidence pinned and reproducible; D-030 becomes a machine preflight in `scripts/doctor` (real paths outside sync roots, `.git` integrity).
 
+## From the M0 Linux checks (rodrigo, `docs/spikes/M0-linux-checks.md`; G6 done, D-039)
+
+| # | Sev. | Must fix |
+|---|---|---|
+| L1 | minor | Platform-aware appearance hints: "Blur strength" says macOS text on Linux, and the Linux note blames the compositor. Say "Atrium uses opaque windows on Linux." |
+| L2 | major | The memory harnesses report **private PSS** on Linux (PSS without shared-library pages) as the budgeted number, with GPU memory, full PSS and RSS beside it (D-040). Each window's cost is tracked so it doesn't grow. |
+| L3 | major | Profile WebKitGTK startup: main → JS (~212 ms), SolidJS mount (~140 ms), input-ready → first paint (~85 ms). Report Linux TTI on every UI change; it's a goal, not a gate, until the driver decides otherwise (D-041). |
+| L8 | major | The daemon keeps ~227 MB resident on Linux after closing a 3M-event session (macOS: 9 MB). `malloc_trim` after the fold, another allocator, or no full-history fold (see the lifecycle-projections item above). |
+| L10 | later | 60 fps everywhere, no 120 Hz promise (D-042). Not M1's critical path: a timeboxed look at WebKitGTK's 60 fps cap, and a check on a 120 Hz Mac display. |
+

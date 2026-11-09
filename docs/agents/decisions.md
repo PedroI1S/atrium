@@ -204,3 +204,19 @@ This replaces the M0-06 directions; M0-06's token system and layout mechanics st
 - **Harness:** reviewed read-only by Codex, as D-037 required. Its two accounting bugs were fixed. The raw data shows the reported numbers weren't affected, so nothing was re-measured. Fresh-launch TTI (needs root) was dropped.
 
 G6 is met: the checks are done before any M1 UI work merges. The failures aren't blockers for G6. They become M1 inputs, and three of them are Pedro's call: the Linux memory metric (L2), the TTI budget on Linux (L3) and high refresh (L10).
+
+## D-040 — 2026-11-09 — Linux memory budget is measured as private PSS (L2)
+**Decided by Pedro (owner).** On Linux, the PLAN §4 app idle budget (< 150 MB, one window) applies to **private PSS**: PSS without shared-library pages (anonymous memory plus private file pages), summed over the app and its WebKit processes. That's the closest match to macOS `phys_footprint`, which also leaves out shared system libraries. It's about 144 MB today (`M0-linux-checks.md` §2.5), so within budget.
+- GPU memory (DRM fdinfo) is reported next to it and watched for growth. It has no budget yet, since there's no like-for-like macOS figure.
+- Full PSS and RSS keep being reported for context. They aren't budgeted.
+- Pop-outs (~75 MB PSS each on Linux, vs ~35 MB on macOS) are measured, not capped, as in D-028. M1 keeps each window's cost from growing.
+
+## D-041 — 2026-11-09 — 400 ms TTI stays the goal on Linux; M1 profiles WebKitGTK startup (L3)
+**Decided by Pedro (owner).** The 400 ms cold-start target applies to both platforms. On Linux it's a goal, not a gate, until profiling shows what's reachable: Linux TTI is measured and reported for M1 work, but a miss doesn't block a merge.
+- M1 profiles WebKitGTK startup: the pre-JS block (main → JS, ~212 ms), SolidJS mount (~140 ms, about twice macOS), and the step from input-ready to first paint (~85 ms vs ~60 ms). Measured median today: 446–472 ms (`M0-linux-checks.md` §2.4).
+- After that profiling, the driver decides whether 400 ms becomes a gate on Linux.
+
+## D-042 — 2026-11-09 — 60 fps on every display for now; no 120 Hz promise (L10)
+**Decided by Pedro (owner).** Atrium targets 60 fps on every display, which is what PLAN §4 asks for. Linux meets it cleanly, including on a 144 Hz monitor where WebKitGTK caps content updates at 60 fps (`M0-linux-checks.md` §2.3).
+- No UI, docs or release notes promise 120 Hz or higher.
+- Later, as a timeboxed task (not M1's critical path): find what caps WebKitGTK at 60 fps, and check macOS on a 120 Hz display (ProMotion or external). The spikes only ran on 60 Hz Mac screens.
