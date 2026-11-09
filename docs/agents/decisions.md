@@ -263,3 +263,16 @@ Pedro's Codex subscription has ended, so GPT-6.1 Sol and GPT-6 Astra are unavail
 
 ## D-049 — 2026-11-09 — The M1 contract code is pushed to `dev` right away
 **Decided by Pedro (driver).** The contract code (`crates/atrium-protocol`, `crates/atrium-agents/src/lib.rs`, the `atrium-core` and `atrium-host` signatures, the schema and test stubs) is pushed to `dev` as soon as it's committed, like the docs. It's the spec workers and the other driver build against. Worker code still reaches `origin` only at handoffs (D-005, D-007).
+
+## D-050 — 2026-11-09 — Home policy defaults and the always-blocked list (M1 contract review)
+**Decided by Pedro (owner, D-013)**, on Argon's M1 contract review (`reviews/M1-contracts.md` findings 3, 6, 10):
+- **Always-blocked list (`HARD_DENY_DEFAULTS`)**: approved, expanded as Argon proposed:
+  - agent and CLI tokens count as credentials (`~/.claude` credentials, `~/.claude.json`, `~/.codex/auth.json`, `~/.gemini/`, `~/.config/gcloud/`, `~/.git-credentials`, `~/.npmrc`), as does every private key in `~/.ssh/`; writing `~/.ssh/config` or `authorized_keys` is blocked;
+  - force-push covers `dev`, `develop` and `trunk`, and any force-push without an explicit non-protected destination;
+  - pipe-to-shell covers command and process substitution (`bash -c "$(curl …)"`, `sh <(curl …)`, `eval`, `source`);
+  - Atrium's own data (database, WAL, snapshots, logs) can't be read either, and its config, service units and app binary can't be written;
+  - privilege escalation adds `pkexec`, `run0` and `osascript … with administrator privileges`;
+  - in Home, `.` and every folder above `~` count as outside the thread's folder.
+- **Home's auto-allowed commands** (`HOME_READONLY_COMMANDS`): `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `du`, `df`, `which`, `uname`, `date`, `whoami`, `tree`, `rg`, `grep`, and `git status|log|diff|show|branch|rev-parse|ls-files`. Never auto-allowed: anything with `$` expansion, globs, brace expansion, a newline, or `git -c`/`--config-env`/`--exec-path`. The always-blocked list applies on top.
+- **Codex in Home** uses `sandbox=read-only` with `approval_policy=untrusted`, as verified in M0 (not `on-request`, under which Codex reads without asking).
+- **Whole-home search asks**: in Home, a recursive search rooted at `~` itself (no subfolder) needs approval. Searches in a subfolder stay auto-allowed.
