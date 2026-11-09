@@ -15,7 +15,6 @@ mod writer;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::JoinHandle;
 
@@ -36,6 +35,7 @@ use crate::{
 use reader::ReaderPool;
 use writer::Writer;
 
+#[doc(hidden)]
 pub use migrate::Migration;
 
 /// The state machine the store applies on every append and signal.
@@ -67,10 +67,13 @@ impl Default for StoreOptions {
     }
 }
 
+/// Jobs queued for the writer before callers wait.
+const WRITER_QUEUE: usize = 64;
+
 type Job = Box<dyn FnOnce(&mut Writer) + Send>;
 
 pub(crate) struct Shared {
-    tx: Mutex<Option<mpsc::Sender<Job>>>,
+    tx: Mutex<Option<tokio::sync::mpsc::Sender<Job>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     pub(crate) readers: Arc<ReaderPool>,
     pub(crate) options: StoreOptions,
@@ -107,14 +110,12 @@ impl Shared {
             let job: Job = Box::new(move |w| {
                 let _ = otx.send(f(w));
             });
-            {
+            let sender = {
                 let guard = shared.tx.lock().map_err(|_| gone())?;
-                guard
-                    .as_ref()
-                    .ok_or_else(gone)?
-                    .send(job)
-                    .map_err(|_| gone())?;
-            }
+                guard.as_ref().ok_or_else(gone)?.clone()
+            };
+            // Bounded: a slow writer pushes back on callers.
+            sender.send(job).await.map_err(|_| gone())?;
             orx.await.map_err(|_| gone())?
         })
     }
@@ -127,9 +128,21 @@ impl Shared {
     {
         let pool = self.readers.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || pool.with(f))
+            // One permit per pooled connection, taken before the blocking
+            // task exists, so blocking-pool threads never park waiting.
+            let permit = pool
+                .permits
+                .clone()
+                .acquire_owned()
                 .await
-                .map_err(|e| StoreError::Sqlite(format!("read task failed: {e}")))?
+                .map_err(|_| StoreError::Sqlite("reader pool closed".into()))?;
+            tokio::task::spawn_blocking(move || {
+                let out = pool.with(f);
+                drop(permit);
+                out
+            })
+            .await
+            .map_err(|e| StoreError::Sqlite(format!("read task failed: {e}")))?
         })
     }
 }
@@ -166,7 +179,8 @@ pub(crate) fn now_ms() -> u64 {
 fn statvfs_free(dir: &Path) -> u64 {
     match rustix::fs::statvfs(dir) {
         Ok(s) => s.f_bavail.saturating_mul(s.f_frsize),
-        Err(_) => u64::MAX,
+        // Fail closed: if the volume can't be probed, treat it as full.
+        Err(_) => 0,
     }
 }
 
@@ -195,21 +209,12 @@ impl SqliteStore {
         mut options: StoreOptions,
         migrations: &'static [Migration],
     ) -> StoreResult<Self> {
-        let dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
+        let path = secure_database_file(&path)?;
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         if Arc::ptr_eq(&options.free_space, &DEFAULT_FREE_SPACE) {
-            let dir = dir.to_path_buf();
+            let dir = dir.clone();
             options.free_space = Arc::new(move || statvfs_free(&dir));
         }
-        // Create the file private from the first byte; SQLite gives the WAL
-        // and shm files the same mode.
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&path)?;
 
         let mut conn = rusqlite::Connection::open(&path).map_err(sql_err)?;
         // Migrations run before WAL is switched on, in the rollback journal,
@@ -229,16 +234,20 @@ impl SqliteStore {
         let readers = Arc::new(ReaderPool::open(&path, limits::STORE_READERS)?);
         let integrity = Arc::new(AtomicU64::new(0));
         let writer = Writer::new(conn, options.clone(), integrity.clone());
-        let (tx, rx) = mpsc::channel::<Job>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Job>(WRITER_QUEUE);
         let handle = std::thread::Builder::new()
             .name("atrium-store-writer".into())
             .spawn(move || {
                 let mut writer = writer;
-                while let Ok(job) = rx.recv() {
+                while let Some(job) = rx.blocking_recv() {
                     // A panicking job drops its reply channel (the caller gets
-                    // an error); the writer lives on.
-                    let _ =
+                    // an error); the writer lives on, its transaction rolled
+                    // back and its hashers rebuilt from stored events.
+                    let r =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut writer)));
+                    if r.is_err() {
+                        writer.recover_from_panic();
+                    }
                 }
             })?;
         Ok(Self {
@@ -413,4 +422,60 @@ impl Store for SqliteStore {
             shared: self.shared.clone(),
         })
     }
+}
+
+/// Opens (creating, mode 0600) the database file without following symlinks,
+/// checks it is a regular file of ours, tightens an existing file to 0600
+/// through the open handle, and rejects symlinked SQLite sidecar files.
+/// Returns the canonical path.
+fn secure_database_file(path: &Path) -> StoreResult<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let denied = |m: &str| {
+        StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            m.to_owned(),
+        ))
+    };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| denied("database path has no file name"))?;
+    let path = parent.canonicalize()?.join(name);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(&path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+                denied("database path is a symlink")
+            } else {
+                StoreError::Io(e)
+            }
+        })?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(denied("database path is not a regular file"));
+    }
+    if meta.uid() != rustix::process::getuid().as_raw() {
+        return Err(denied("database file is not owned by the current user"));
+    }
+    if meta.mode() & 0o777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut side = path.clone().into_os_string();
+        side.push(suffix);
+        if let Ok(m) = std::fs::symlink_metadata(&side)
+            && !m.file_type().is_file()
+        {
+            return Err(denied("a SQLite sidecar file is a symlink"));
+        }
+    }
+    Ok(path)
 }

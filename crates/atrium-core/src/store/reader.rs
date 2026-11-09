@@ -18,6 +18,8 @@ use atrium_protocol::limits;
 pub(crate) struct ReaderPool {
     conns: Mutex<Vec<Connection>>,
     available: Condvar,
+    /// One permit per connection, taken by async callers before they spawn.
+    pub(crate) permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl ReaderPool {
@@ -33,9 +35,11 @@ impl ReaderPool {
                 .map_err(sql_err)?;
             conns.push(c);
         }
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(conns.len()));
         Ok(Self {
             conns: Mutex::new(conns),
             available: Condvar::new(),
+            permits,
         })
     }
 
@@ -67,18 +71,19 @@ pub(crate) fn events_after(
     after: Option<EventId>,
     limit: usize,
 ) -> StoreResult<Vec<StoredEvent>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let mut stmt = c
         .prepare_cached(
             "SELECT event_id, payload FROM events WHERE thread_id = ?1 AND event_id > ?2 \
              ORDER BY event_id LIMIT ?3",
         )
         .map_err(sql_err)?;
+    let after = after.map_or(0, |e| i64::try_from(e.0).unwrap_or(i64::MAX));
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let mut rows = stmt
-        .query(rusqlite::params![
-            thread.0,
-            after.map_or(0, |e| e.0) as i64,
-            limit as i64
-        ])
+        .query(rusqlite::params![thread.0, after, limit])
         .map_err(sql_err)?;
     let mut out = Vec::new();
     while let Some(r) = rows.next().map_err(sql_err)? {
@@ -137,6 +142,8 @@ pub(crate) fn live_processes(c: &Connection) -> StoreResult<Vec<(ThreadId, u32, 
 }
 
 pub(crate) fn rules(c: &Connection) -> StoreResult<(u64, Vec<Rule>)> {
+    // One read transaction: revision and rules come from the same snapshot.
+    let c = &c.unchecked_transaction().map_err(sql_err)?;
     let revision: i64 = c
         .query_row(
             "SELECT revision FROM rules_revision WHERE id = 1",

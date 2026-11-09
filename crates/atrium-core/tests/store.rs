@@ -840,6 +840,14 @@ async fn incarnations_scope_sequences_and_requests() {
     let inc2 = store.begin_incarnation(&t).await.unwrap();
     assert_eq!(inc2, 2);
     assert_eq!(reqs.current_incarnation(&t).await.unwrap(), Some(2));
+    // Incarnation 1 never closed r1, but the new incarnation starts clean.
+    let s = summary(&store, &t).await;
+    assert_eq!((s.pending_approvals, s.pending_questions), (0, 0));
+    assert_eq!((s.attention_since_ms, s.attention_detail), (None, None));
+    assert_eq!(
+        store.signal(&t, Signal::Starting).await.unwrap().state,
+        ThreadState::Starting
+    );
     // seq, turn numbers and request ids restart.
     reqs.open_approval(&key(&t, 2, "r1"), &binding("b"))
         .await
@@ -890,6 +898,10 @@ async fn incarnations_scope_sequences_and_requests() {
         .unwrap();
     assert!(store.open_items(&t, 2).await.unwrap().requests.is_empty());
     assert_eq!(store.open_items(&t, 1).await.unwrap().requests, vec!["r1"]);
+    let s = summary(&store, &t).await;
+    assert_eq!(s.pending_approvals, 0);
+    assert_eq!(s.state, ThreadState::Running);
+    assert_eq!((s.attention_since_ms, s.attention_detail), (None, None));
     // The summary and resume id follow the latest incarnation.
     let s = summary(&store, &t).await;
     assert_eq!(
@@ -1012,6 +1024,29 @@ async fn store_never_changes_request_status() {
     let reqs = store.requests();
     let k = key(&t, inc, "a1");
     reqs.open_approval(&k, &binding("x")).await.unwrap();
+    // A binding without a title round-trips even after the event is stored.
+    let mut untitled = binding("x");
+    untitled.title = None;
+    let k0 = key(&t, inc, "a0");
+    reqs.open_approval(&k0, &untitled).await.unwrap();
+    store
+        .append(&t, inc, vec![env(100, approval("a0", "from the event"))])
+        .await
+        .unwrap();
+    assert_eq!(reqs.binding(&k0).await.unwrap().unwrap().1, untitled);
+    assert_eq!(
+        summary(&store, &t).await.attention_detail.as_deref(),
+        Some("Bash")
+    );
+    store
+        .append(
+            &t,
+            inc,
+            vec![env(101, resolved("a0", RequestOutcome::Denied))],
+        )
+        .await
+        .unwrap();
+    reqs.transition(&k0, &["pending"], "denied").await.unwrap();
     assert_eq!(reqs.open_count(&t, inc).await.unwrap(), 1);
     store
         .append(&t, inc, vec![env(0, approval("a1", "x"))])
@@ -1609,4 +1644,342 @@ async fn three_million_token_stream_appends_and_closes() {
     store.open_items(&t, inc).await.unwrap();
     assert!(t0.elapsed() < std::time::Duration::from_millis(200));
     let _: &Path = fx.dir.path();
+}
+
+#[tokio::test]
+async fn symlinks_are_refused() {
+    use std::os::unix::fs::symlink;
+    let fx = Fixture::new();
+    // The database path itself.
+    let real = fx.dir.path().join("real.db");
+    std::fs::write(&real, b"").unwrap();
+    let link = fx.dir.path().join("link.db");
+    symlink(&real, &link).unwrap();
+    let e = SqliteStore::open(&link, fx.options()).await.unwrap_err();
+    assert!(matches!(e, StoreError::Io(_)), "{e:?}");
+    assert_eq!(std::fs::metadata(&real).unwrap().len(), 0);
+    // A dangling one too.
+    let dangling = fx.dir.path().join("dangling.db");
+    symlink(fx.dir.path().join("nowhere"), &dangling).unwrap();
+    assert!(SqliteStore::open(&dangling, fx.options()).await.is_err());
+    assert!(!fx.dir.path().join("nowhere").exists());
+    // A symlinked sidecar.
+    let other = fx.dir.path().join("other.db");
+    symlink(
+        fx.dir.path().join("elsewhere"),
+        fx.dir.path().join("other.db-wal"),
+    )
+    .unwrap();
+    let e = SqliteStore::open(&other, fx.options()).await.unwrap_err();
+    assert!(matches!(e, StoreError::Io(_)), "{e:?}");
+    // A loose existing file is tightened.
+    let loose = fx.dir.path().join("loose.db");
+    std::fs::write(&loose, b"").unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+    drop(SqliteStore::open(&loose, fx.options()).await.unwrap());
+    assert_eq!(
+        std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // A symlinked snapshot folder is refused and its target left alone.
+    let store = fx.open().await;
+    let target = fx.dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let snaps = fx.dir.path().join("snaps");
+    symlink(&target, &snaps).unwrap();
+    assert!(store.snapshot(&snaps).await.is_err());
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    // A loose real folder is tightened.
+    let loose_dir = fx.dir.path().join("loose-snaps");
+    std::fs::create_dir(&loose_dir).unwrap();
+    std::fs::set_permissions(&loose_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    store.snapshot(&loose_dir).await.unwrap();
+    assert_eq!(
+        std::fs::metadata(&loose_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+fn panicking(cur: &ThreadState, p: Pending, input: AttentionInput<'_>) -> ThreadState {
+    if let AttentionInput::Event(AgentEvent::TurnStarted { turn: 99 }) = input {
+        panic!("boom");
+    }
+    transition(cur, p, input)
+}
+
+#[tokio::test]
+async fn writer_survives_a_panic_and_rebuilds_hashes() {
+    let fx = Fixture::new();
+    let mut options = fx.options();
+    options.transition = panicking;
+    let store = SqliteStore::open(&fx.path(), options).await.unwrap();
+    let (t, inc) = started_thread(&store).await;
+    store
+        .append(
+            &t,
+            inc,
+            vec![env(0, delta("m", MessageKind::Assistant, "ab"))],
+        )
+        .await
+        .unwrap();
+    let e = store
+        .append(
+            &t,
+            inc,
+            vec![
+                env(1, delta("m", MessageKind::Assistant, "cd")),
+                env(2, AgentEvent::TurnStarted { turn: 99 }),
+            ],
+        )
+        .await;
+    assert!(e.is_err());
+    // Nothing of the failed batch is stored and the hash is back to "ab".
+    assert_eq!(store.events_after(&t, None, 10).await.unwrap().len(), 1);
+    let open = store.open_items(&t, inc).await.unwrap();
+    assert_eq!(open.messages[0].sha256, sha_hex("ab"));
+    store
+        .append(
+            &t,
+            inc,
+            vec![env(1, delta("m", MessageKind::Assistant, "ef"))],
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &t,
+            inc,
+            vec![env(2, completed("m", MessageKind::Assistant, "abef", 2))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.integrity_errors(), 0);
+}
+
+#[tokio::test]
+async fn usage_enforcement_and_two_approvals() {
+    let fx = Fixture::new();
+    let store = fx.open().await;
+    let (t, inc) = started_thread(&store).await;
+    let usage = |n: u64| Usage {
+        input_tokens: Some(n),
+        ..Default::default()
+    };
+    store
+        .append(
+            &t,
+            inc,
+            vec![
+                env(0, AgentEvent::TurnStarted { turn: 1 }),
+                env(1, AgentEvent::Usage { usage: usage(5) }),
+                env(2, AgentEvent::Usage { usage: usage(7) }),
+            ],
+        )
+        .await
+        .unwrap();
+    let turn_usage = |turn: u32| -> (Option<String>, Option<String>) {
+        let c = rusqlite::Connection::open(fx.path()).unwrap();
+        c.query_row(
+            "SELECT usage, outcome FROM turns WHERE turn = ?1",
+            [turn],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    let (u, o) = turn_usage(1);
+    assert_eq!(
+        serde_json::from_str::<Usage>(&u.unwrap()).unwrap(),
+        usage(7)
+    );
+    assert_eq!(o, None);
+    store
+        .append(
+            &t,
+            inc,
+            vec![env(
+                3,
+                AgentEvent::TurnCompleted {
+                    turn: 1,
+                    outcome: TurnOutcome::Completed,
+                    usage: Some(usage(9)),
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    let (u, o) = turn_usage(1);
+    assert_eq!(
+        serde_json::from_str::<Usage>(&u.unwrap()).unwrap(),
+        usage(9)
+    );
+    assert_eq!(o.as_deref(), Some("completed"));
+
+    // Enforcement: the latest descriptor wins, from events and from the setter.
+    let desc = |v: &str| {
+        EnforcementDescriptor::evaluate(
+            Provider::Claude,
+            Some(v.into()),
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+    };
+    store
+        .append(&t, inc, vec![env(4, started())])
+        .await
+        .unwrap();
+    store
+        .append(
+            &t,
+            inc,
+            vec![env(
+                5,
+                AgentEvent::EnforcementChanged {
+                    enforcement: desc("2.0"),
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        summary(&store, &t)
+            .await
+            .enforcement
+            .unwrap()
+            .cli_version
+            .as_deref(),
+        Some("2.0")
+    );
+    store.set_enforcement(&t, inc, desc("3.0")).await.unwrap();
+    assert_eq!(
+        summary(&store, &t)
+            .await
+            .enforcement
+            .unwrap()
+            .cli_version
+            .as_deref(),
+        Some("3.0")
+    );
+    assert!(matches!(
+        store.set_enforcement(&t, 9, desc("x")).await,
+        Err(StoreError::UnknownThread(_))
+    ));
+
+    // Two open approvals: the oldest decides the attention detail.
+    let reqs = store.requests();
+    reqs.open_approval(&key(&t, inc, "first"), &binding("First ask"))
+        .await
+        .unwrap();
+    reqs.open_approval(&key(&t, inc, "second"), &binding("Second ask"))
+        .await
+        .unwrap();
+    store
+        .append(
+            &t,
+            inc,
+            vec![
+                env(6, approval("second", "Second ask")),
+                env(7, approval("first", "First ask")),
+            ],
+        )
+        .await
+        .unwrap();
+    let s = summary(&store, &t).await;
+    assert_eq!(s.pending_approvals, 2);
+    assert_eq!(s.attention_detail.as_deref(), Some("First ask"));
+    store
+        .append(
+            &t,
+            inc,
+            vec![env(8, resolved("first", RequestOutcome::Denied))],
+        )
+        .await
+        .unwrap();
+    let s = summary(&store, &t).await;
+    assert_eq!(s.pending_approvals, 1);
+    assert_eq!(s.attention_detail.as_deref(), Some("Second ask"));
+
+    // approve_with_rule and snapshots are not cleanup: refused while read-only.
+    fx.free.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        reqs.approve_with_rule(&key(&t, inc, "second"), Some(rule("r")))
+            .await,
+        Err(StoreError::ReadOnly { .. })
+    ));
+    assert!(matches!(
+        store.snapshot(&fx.dir.path().join("s")).await,
+        Err(StoreError::ReadOnly { .. })
+    ));
+    assert_eq!(
+        reqs.transition(&key(&t, inc, "second"), &["pending"], "denied")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("pending")
+    );
+}
+
+#[tokio::test]
+async fn events_after_handles_extreme_arguments() {
+    let fx = Fixture::new();
+    let store = fx.open().await;
+    let (t, inc) = started_thread(&store).await;
+    store
+        .append(
+            &t,
+            inc,
+            vec![env(0, delta("m", MessageKind::Assistant, "x"))],
+        )
+        .await
+        .unwrap();
+    assert!(store.events_after(&t, None, 0).await.unwrap().is_empty());
+    assert!(
+        store
+            .events_after(&t, Some(EventId(u64::MAX)), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .events_after(&t, None, usize::MAX)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_reads_and_writes_complete() {
+    let fx = Fixture::new();
+    let store = Arc::new(fx.open().await);
+    let (t, inc) = started_thread(&store).await;
+    let mut tasks = Vec::new();
+    for i in 0..200u64 {
+        let (store, t) = (store.clone(), t.clone());
+        tasks.push(tokio::spawn(async move {
+            store
+                .append(
+                    &t,
+                    inc,
+                    vec![env(i, delta("m", MessageKind::Assistant, "x"))],
+                )
+                .await
+                .unwrap();
+            store.events_after(&t, None, 5).await.unwrap();
+            store.rules().await.unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert_eq!(store.events_after(&t, None, 1000).await.unwrap().len(), 200);
 }

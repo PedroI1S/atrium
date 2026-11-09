@@ -61,3 +61,17 @@ Reproduce: `cargo test -p atrium-core --test store --no-run`, then `/usr/bin/tim
 - M1-05: call `snapshot` daily; on `StorageStatus::ReadOnly` send `Signal::StorageReadOnly` and show the storage-full inbox item.
 - M1-03: use `RequestStore::approve_with_rule` for "remember" and read `binding` for `redeem`. Question rows have no binding (`binding` returns `None` for them).
 - A logging crate for the integrity error (currently `eprintln!`).
+
+## Review fixes (Argon's M1-02 review, approve with changes)
+
+1. `begin_incarnation` resets `pending_approvals`/`pending_questions` to 0 and recomputes attention in the same transaction (sticky Failed, unverified cleanup and Reply attention stay). `incarnations_scope_sequences_and_requests` now asserts a clean summary after `begin_incarnation` and `pending_approvals == 0`, state `Running`, no attention after incarnation 2 resolves `r1`.
+2. The writer queue is a bounded `tokio::sync::mpsc` channel (64 jobs; callers `send().await`, writer thread uses `blocking_recv`). Reads take a `tokio::sync::Semaphore` permit (one per reader connection) before `spawn_blocking`. Test `concurrent_reads_and_writes_complete`.
+3. The database is opened with `O_NOFOLLOW` on its canonical path; regular file and owner checked on the open handle; an existing file is `fchmod`ed to 0600; symlinked `-wal`/`-shm`/`-journal` are refused (`StoreError::Io`, PermissionDenied). Snapshot folder: `DirBuilder` mode 0700, `symlink_metadata` must be a real directory owned by the user (looser mode tightened through an `O_NOFOLLOW|O_DIRECTORY` handle), snapshot files opened with `O_NOFOLLOW`. Test `symlinks_are_refused` (db symlink, dangling symlink, wal symlink, loose db file, symlinked snapshot folder with its target untouched, loose snapshot folder). `rustix` now also uses its `process` feature (`getuid`).
+4. `rules()` reads revision and rules in one read transaction.
+5. After a caught writer panic the writer clears its hashers and rolls back if not in autocommit. Test `writer_survives_a_panic_and_rebuilds_hashes` (a transition function that panics mid-batch).
+6. `ApprovalRequested` only sets `event_opened`; it never writes `requests.title`. `attention_detail` still falls back to the tool name when computed. `store_never_changes_request_status` covers a `Binding` with `title: None` round-tripping.
+7. `events_after` converts with `i64::try_from(..).unwrap_or(i64::MAX)`; `limit == 0` returns empty. Test `events_after_handles_extreme_arguments`.
+8. `statvfs_free` fails closed (0); the data dir is canonicalized at open. New test `usage_enforcement_and_two_approvals`: `Usage` and `TurnCompleted.usage`, `EnforcementChanged` and `set_enforcement`, two open approvals (oldest wins, then the next after resolving), and `approve_with_rule` and `snapshot` refused with `ReadOnly` (neither is cleanup; moves to final statuses stay allowed, checked in the same test).
+9. `#[doc(hidden)]` on `pub use migrate::Migration`. `Cargo.lock` changes kept, as instructed.
+
+Results: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test -p atrium-core --test store`: 28 passed, 0 failed, 0 ignored (37 s); `cargo test -p atrium-core --lib`: ok (0 tests).

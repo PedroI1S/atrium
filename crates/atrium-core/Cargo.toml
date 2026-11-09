@@ -19,7 +19,7 @@ thiserror.workspace = true
 tokio.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] } # M1-02
 sha2 = "0.10" # M1-02
-rustix = { version = "1", features = ["fs"] } # M1-02
+rustix = { version = "1", features = ["fs", "process"] } # M1-02
 
 [dev-dependencies]
 tempfile = "3" # M1-02

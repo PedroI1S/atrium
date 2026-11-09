@@ -270,6 +270,15 @@ impl Writer {
         }
     }
 
+    /// After a job panicked: drop any open transaction and every in-memory
+    /// hash (they are recomputed from committed events on next use).
+    pub(super) fn recover_from_panic(&mut self) {
+        self.hashers.clear();
+        if !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+
     pub(super) fn tx(&mut self) -> StoreResult<Transaction<'_>> {
         self.conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -323,6 +332,14 @@ impl Writer {
             params![thread.0, next, now_ms() as i64],
         )
         .map_err(sql_err)?;
+        // The new incarnation starts with nothing open: its predecessor's
+        // unclosed requests no longer count (crash recovery expires them).
+        let mut new_row = row.clone();
+        new_row.incarnation = next;
+        new_row.pa = 0;
+        new_row.pq = 0;
+        refresh_attention(&tx, thread, &mut new_row, &row, None, now_ms())?;
+        save_row(&tx, thread, &new_row)?;
         tx.commit().map_err(sql_err)?;
         self.hashers.retain(|k, _| k.0 != thread.0);
         Ok(next)
@@ -851,25 +868,15 @@ fn apply(
             .execute(params![t, inc, call_id])
             .map_err(sql_err)?;
         }
-        AgentEvent::ApprovalRequested {
-            request_id,
-            name,
-            title,
-            ..
-        } => {
+        AgentEvent::ApprovalRequested { request_id, .. } => {
             let n = tx
                 .prepare_cached(
-                    "UPDATE requests SET event_opened = 1, title = COALESCE(title, ?4) \
+                    "UPDATE requests SET event_opened = 1 \
                      WHERE thread_id = ?1 AND incarnation = ?2 AND request_id = ?3 \
                      AND kind = 'approval' AND event_opened = 0",
                 )
                 .map_err(sql_err)?
-                .execute(params![
-                    t,
-                    inc,
-                    request_id,
-                    title.clone().unwrap_or_else(|| name.clone())
-                ])
+                .execute(params![t, inc, request_id])
                 .map_err(sql_err)?;
             if n > 0 {
                 cx.row.pa += 1;

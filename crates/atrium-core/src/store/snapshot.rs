@@ -75,8 +75,7 @@ pub(crate) fn snapshot(
         let target = dir.clone();
         let path = shared
             .read(move |c| {
-                std::fs::create_dir_all(&target)?;
-                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))?;
+                secure_dir(&target)?;
                 let mut ms = now_ms();
                 // An empty private file first, so the snapshot is never
                 // readable by others, not even briefly.
@@ -86,6 +85,7 @@ pub(crate) fn snapshot(
                         .write(true)
                         .create_new(true)
                         .mode(0o600)
+                        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
                         .open(&p)
                     {
                         Ok(_) => break p,
@@ -107,4 +107,38 @@ pub(crate) fn snapshot(
             .await?;
         Ok(path)
     })
+}
+
+/// Creates `dir` (mode 0700) if missing and checks it is a real directory,
+/// not a symlink, owned by us; a looser existing mode is tightened through an
+/// `O_NOFOLLOW` handle.
+fn secure_dir(dir: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let denied = |m: &str| {
+        StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            m.to_owned(),
+        ))
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(denied("snapshot folder is a symlink or not a directory"));
+    }
+    if meta.uid() != rustix::process::getuid().as_raw() {
+        return Err(denied("snapshot folder is not owned by the current user"));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::DIRECTORY).bits() as i32,
+            )
+            .open(dir)?;
+        handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
