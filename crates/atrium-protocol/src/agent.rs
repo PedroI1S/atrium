@@ -69,6 +69,7 @@ use crate::policy::EnforcementDescriptor;
 
 /// The native agent behind a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
     Claude,
@@ -79,6 +80,7 @@ pub enum Provider {
 
 /// One event, as the adapter emits it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct AgentEventEnvelope {
     /// The provider process this event came from (see the module docs).
     /// Adapters emit 0; the daemon sets it when it stores the event.
@@ -91,6 +93,7 @@ pub struct AgentEventEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// The provider's session exists. `native_session_id` is what resume uses.
@@ -235,6 +238,7 @@ pub enum AgentEvent {
 
 /// The text of a completed message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageBody {
     /// The whole text, for completion-only messages up to
@@ -256,6 +260,7 @@ pub enum MessageBody {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
     /// The user's message for this turn, emitted by the adapter right after
@@ -272,6 +277,7 @@ pub enum MessageKind {
 /// Coarse tool category, used by the policy engine and the UI. Mapped from
 /// the provider's tool name; `Other` when unsure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     Read,
@@ -288,6 +294,7 @@ pub enum ToolKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
     Succeeded,
@@ -298,6 +305,7 @@ pub enum ToolStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum TurnOutcome {
     Completed,
@@ -308,6 +316,7 @@ pub enum TurnOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOutcome {
     Approved,
@@ -320,6 +329,7 @@ pub enum RequestOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct Question {
     pub id: String,
     pub prompt: String,
@@ -334,6 +344,7 @@ pub struct Question {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct QuestionOption {
     /// Stable within the question. The adapter makes one up if the provider
     /// has none (e.g. the option's index).
@@ -343,6 +354,7 @@ pub struct QuestionOption {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct QuestionAnswer {
     pub question_id: String,
     /// [`QuestionOption::id`]s, in the order chosen.
@@ -352,12 +364,14 @@ pub struct QuestionAnswer {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct PlanEntry {
     pub content: String,
     pub status: PlanStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
     Pending,
@@ -367,6 +381,7 @@ pub enum PlanStatus {
 
 /// Token counts. Fields a provider doesn't report stay `None`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -377,6 +392,7 @@ pub struct Usage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct QuotaWindow {
     /// The provider's name for the window, e.g. `5h`, `weekly`, `primary`.
     pub name: String,
@@ -386,6 +402,7 @@ pub struct QuotaWindow {
 
 /// What a client can tell a running session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionCommand {
     /// Starts a new turn. Sent while a turn is running, it waits in a bounded
@@ -407,6 +424,7 @@ pub enum SessionCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApprovalDecision {
     Allow,

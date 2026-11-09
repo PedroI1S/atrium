@@ -2,7 +2,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use atrium_protocol::agent::{AgentEvent, MessageBody, RequestOutcome, ToolStatus, TurnOutcome};
+use atrium_protocol::agent::{
+    AgentEvent, MessageBody, MessageKind, Provider, RequestOutcome, ToolKind, ToolStatus,
+    TurnOutcome,
+};
+use atrium_protocol::policy::EnforcementDescriptor;
+use sha2::{Digest, Sha256};
 
 const CANARIES: &[&str] = &[
     "ATRIUM-7Q2X-CANARY",
@@ -26,9 +31,11 @@ impl ConsistencyReport {
     }
 }
 
-pub fn find_fixtures(root: &Path) -> Vec<PathBuf> {
+/// Restricts fixture discovery to `fixtures/agents/{claude,codex}` (M1-12).
+pub fn find_fixtures(agents_root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    collect_fixtures(root, &mut out);
+    collect_fixtures(&agents_root.join("claude"), &mut out);
+    collect_fixtures(&agents_root.join("codex"), &mut out);
     out.sort();
     out
 }
@@ -70,11 +77,6 @@ pub fn check_fixture(path: &Path) -> ConsistencyReport {
         }
     };
 
-    if events.is_empty() {
-        report.add("Fixture contains no events");
-        return report;
-    }
-
     let file_stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -82,10 +84,48 @@ pub fn check_fixture(path: &Path) -> ConsistencyReport {
         .trim_end_matches(".events");
 
     let is_gate_deny = file_stem.contains("gate-deny");
+    if is_gate_deny {
+        for canary in CANARIES {
+            if content.contains(canary) {
+                report.add(format!(
+                    "Scenario '{file_stem}' leaked canary secret in events: {canary}"
+                ));
+            }
+        }
+    }
+
+    let mut event_report = check_events(&events, file_stem);
+    report.violations.append(&mut event_report.violations);
+    report
+}
+
+#[derive(Default)]
+struct MessageDeltasTracker {
+    text: String,
+    delta_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ClosureStage {
+    Normal = 0,
+    ToolCallsCancelled = 1,
+    RequestsCancelled = 2,
+    TurnCompleted = 3,
+}
+
+pub fn check_events(events: &[AgentEvent], file_stem: &str) -> ConsistencyReport {
+    let mut report = ConsistencyReport::default();
+
+    if events.is_empty() {
+        report.add("Fixture contains no events");
+        return report;
+    }
+
+    let is_gate_deny = file_stem.contains("gate-deny");
     let is_approval_deny = file_stem.contains("approval-deny");
     let is_interrupt = file_stem.contains("interrupt");
 
-    // Check classification:
+    // Classification:
     // established session: contains SessionStarted
     // pre-session failure: no SessionStarted
     let has_session_started = events
@@ -169,34 +209,30 @@ pub fn check_fixture(path: &Path) -> ConsistencyReport {
         ));
     }
 
-    // Track tool calls:
-    // every ToolCallStarted has exactly one ToolCallFinished, and no ToolCallUpdated comes after it
+    // Tool call tracking
     let mut tool_starts: HashMap<String, usize> = HashMap::new();
     let mut tool_finishes: HashMap<String, usize> = HashMap::new();
     let mut tool_status: HashMap<String, ToolStatus> = HashMap::new();
     let mut finished_tool_calls: HashMap<String, usize> = HashMap::new();
 
-    // Track message deltas & message completed:
-    // deltas are followed by one MessageCompleted whose text equals their concatenation
-    let mut message_deltas: BTreeMap<String, String> = BTreeMap::new();
+    // Message tracking
+    let mut message_deltas: BTreeMap<String, MessageDeltasTracker> = BTreeMap::new();
     let mut completed_messages: HashMap<String, usize> = HashMap::new();
 
-    // Track approvals and questions:
-    // every ApprovalRequested / QuestionAsked has exactly one RequestResolved, and none is left open at SessionEnded
-    let mut requests_asked: HashMap<String, &'static str> = HashMap::new();
+    // Requests tracking
+    let mut requests_asked: HashMap<String, (&'static str, usize)> = HashMap::new();
+    let mut requests_asked_counts: HashMap<String, usize> = HashMap::new();
     let mut requests_resolved: HashMap<String, usize> = HashMap::new();
 
     // Turns and usage
-    // TurnStarted/TurnCompleted pair up and turn increases; no Usage comes after its turn's TurnCompleted
     let mut current_turn: Option<u32> = None;
     let mut last_turn_completed: Option<u32> = None;
     let mut turn_outcomes: Vec<(u32, TurnOutcome)> = Vec::new();
 
-    // Closing order checks:
-    // When a session ends: open messages -> open tool calls (cancelled) -> pending approvals/questions (cancelled) -> open turn -> SessionEnded
-    let mut last_cancelled_request_idx: Option<usize> = None;
+    // Closure episode tracking (per episode, resetting on TurnStarted)
+    let mut closure_stage = ClosureStage::Normal;
+    let mut last_cancelled_req_idx: Option<usize> = None;
 
-    // Check events in order
     for (idx, event) in events.iter().enumerate() {
         match event {
             AgentEvent::ToolCallStarted { call_id, .. } => {
@@ -216,12 +252,15 @@ pub fn check_fixture(path: &Path) -> ConsistencyReport {
                 finished_tool_calls.insert(call_id.clone(), idx);
                 tool_status.insert(call_id.clone(), *status);
 
-                if *status == ToolStatus::Cancelled
-                    && let Some(req_idx) = last_cancelled_request_idx
-                {
-                    report.add(format!(
-                        "Event {idx}: ToolCallFinished(cancelled) for '{call_id}' appeared after RequestResolved(cancelled) at event {req_idx} (violates closing order: tool calls before requests)"
-                    ));
+                if *status == ToolStatus::Cancelled {
+                    if closure_stage >= ClosureStage::RequestsCancelled {
+                        let prev = last_cancelled_req_idx.unwrap_or(0);
+                        report.add(format!(
+                            "Event {idx}: ToolCallFinished(cancelled) for '{call_id}' appeared after RequestResolved(cancelled) at event {prev} in closure episode (violates closing order: tool calls before requests)"
+                        ));
+                    } else {
+                        closure_stage = ClosureStage::ToolCallsCancelled;
+                    }
                 }
             }
             AgentEvent::MessageDelta {
@@ -232,46 +271,106 @@ pub fn check_fixture(path: &Path) -> ConsistencyReport {
                         "Event {idx}: MessageDelta for '{message_id}' after MessageCompleted"
                     ));
                 }
-                message_deltas
-                    .entry(message_id.clone())
-                    .or_default()
-                    .push_str(text);
+                let tracker = message_deltas.entry(message_id.clone()).or_default();
+                tracker.text.push_str(text);
+                tracker.delta_count += 1;
             }
             AgentEvent::MessageCompleted {
                 message_id, body, ..
             } => {
                 *completed_messages.entry(message_id.clone()).or_insert(0) += 1;
-                // M1-12 adds the sha256 check (contract §6.1).
-                let expected = message_deltas.get(message_id);
-                let ok = match (body, expected) {
-                    (MessageBody::Inline { text }, None) => {
-                        text.len() <= atrium_protocol::limits::MAX_INLINE_MESSAGE_BYTES
-                    }
-                    (MessageBody::Inline { .. }, Some(_)) => false,
-                    (MessageBody::Streamed { chars, .. }, Some(expected)) => {
-                        *chars == expected.chars().count() as u64
-                    }
-                    (MessageBody::Streamed { .. }, None) => false,
-                };
-                if !ok {
+
+                if closure_stage >= ClosureStage::ToolCallsCancelled {
                     report.add(format!(
-                        "Event {idx}: MessageCompleted body does not match the deltas for '{message_id}'"
+                        "Event {idx}: MessageCompleted for '{message_id}' appeared after tool calls or requests were cancelled in closure episode"
                     ));
+                }
+
+                match body {
+                    MessageBody::Inline { text } => {
+                        if message_deltas.contains_key(message_id) {
+                            report.add(format!(
+                                "Event {idx}: MessageCompleted(inline) for '{message_id}' but deltas were emitted"
+                            ));
+                        } else if text.len() > atrium_protocol::limits::MAX_INLINE_MESSAGE_BYTES {
+                            report.add(format!(
+                                "Event {idx}: MessageCompleted(inline) for '{message_id}' exceeds MAX_INLINE_MESSAGE_BYTES ({})",
+                                text.len()
+                            ));
+                        }
+                    }
+                    MessageBody::Streamed {
+                        chars,
+                        deltas,
+                        sha256,
+                    } => match message_deltas.get(message_id) {
+                        None => {
+                            report.add(format!(
+                                "Event {idx}: MessageCompleted(streamed) for '{message_id}' without deltas"
+                            ));
+                        }
+                        Some(tracker) => {
+                            let actual_chars = tracker.text.chars().count() as u64;
+                            if *chars != actual_chars {
+                                report.add(format!(
+                                    "Event {idx}: MessageCompleted chars mismatch for '{message_id}': expected {actual_chars}, found {chars}"
+                                ));
+                            }
+                            if *deltas != tracker.delta_count {
+                                report.add(format!(
+                                    "Event {idx}: MessageCompleted deltas mismatch for '{message_id}': expected {}, found {deltas}",
+                                    tracker.delta_count
+                                ));
+                            }
+                            let mut hasher = Sha256::new();
+                            hasher.update(tracker.text.as_bytes());
+                            let actual_sha256 = format!("{:x}", hasher.finalize());
+                            if sha256 != &actual_sha256 {
+                                report.add(format!(
+                                    "Event {idx}: MessageCompleted sha256 mismatch for '{message_id}': expected {actual_sha256}, found {sha256}"
+                                ));
+                            }
+                        }
+                    },
                 }
             }
             AgentEvent::ApprovalRequested { request_id, .. } => {
-                requests_asked.insert(request_id.clone(), "ApprovalRequested");
+                let count = requests_asked_counts.entry(request_id.clone()).or_insert(0);
+                *count += 1;
+                if *count > 1 {
+                    report.add(format!(
+                        "Event {idx}: Duplicate ApprovalRequested id '{request_id}'"
+                    ));
+                } else {
+                    requests_asked.insert(request_id.clone(), ("ApprovalRequested", idx));
+                }
             }
             AgentEvent::QuestionAsked { request_id, .. } => {
-                requests_asked.insert(request_id.clone(), "QuestionAsked");
+                let count = requests_asked_counts.entry(request_id.clone()).or_insert(0);
+                *count += 1;
+                if *count > 1 {
+                    report.add(format!(
+                        "Event {idx}: Duplicate QuestionAsked id '{request_id}'"
+                    ));
+                } else {
+                    requests_asked.insert(request_id.clone(), ("QuestionAsked", idx));
+                }
             }
             AgentEvent::RequestResolved {
                 request_id,
                 outcome,
             } => {
-                *requests_resolved.entry(request_id.clone()).or_insert(0) += 1;
+                let res_count = requests_resolved.entry(request_id.clone()).or_insert(0);
+                *res_count += 1;
+                if *res_count > 1 {
+                    report.add(format!(
+                        "Event {idx}: Duplicate RequestResolved for request_id '{request_id}'"
+                    ));
+                }
+
                 if *outcome == RequestOutcome::Cancelled {
-                    last_cancelled_request_idx = Some(idx);
+                    closure_stage = ClosureStage::RequestsCancelled;
+                    last_cancelled_req_idx = Some(idx);
                 }
             }
             AgentEvent::TurnStarted { turn } => {
@@ -287,27 +386,33 @@ pub fn check_fixture(path: &Path) -> ConsistencyReport {
                     ));
                 }
                 current_turn = Some(*turn);
+                // Reset closure episode for new turn
+                closure_stage = ClosureStage::Normal;
+                last_cancelled_req_idx = None;
             }
-            AgentEvent::TurnCompleted { turn, outcome, .. } => match current_turn {
-                Some(open) if open == *turn => {
-                    current_turn = None;
-                    last_turn_completed = Some(*turn);
-                    turn_outcomes.push((*turn, *outcome));
+            AgentEvent::TurnCompleted { turn, outcome, .. } => {
+                closure_stage = ClosureStage::TurnCompleted;
+                match current_turn {
+                    Some(open) if open == *turn => {
+                        current_turn = None;
+                        last_turn_completed = Some(*turn);
+                        turn_outcomes.push((*turn, *outcome));
+                    }
+                    Some(open) => {
+                        report.add(format!(
+                            "Event {idx}: TurnCompleted({turn}) does not match open turn {open}"
+                        ));
+                        current_turn = None;
+                        last_turn_completed = Some(*turn);
+                    }
+                    None => {
+                        report.add(format!(
+                            "Event {idx}: TurnCompleted({turn}) without an open TurnStarted"
+                        ));
+                        last_turn_completed = Some(*turn);
+                    }
                 }
-                Some(open) => {
-                    report.add(format!(
-                        "Event {idx}: TurnCompleted({turn}) does not match open turn {open}"
-                    ));
-                    current_turn = None;
-                    last_turn_completed = Some(*turn);
-                }
-                None => {
-                    report.add(format!(
-                        "Event {idx}: TurnCompleted({turn}) without an open TurnStarted"
-                    ));
-                    last_turn_completed = Some(*turn);
-                }
-            },
+            }
             AgentEvent::Usage { .. } if current_turn.is_none() => {
                 report.add(format!(
                     "Event {idx}: Usage event emitted while no turn is open (after TurnCompleted)"
@@ -345,7 +450,7 @@ pub fn check_fixture(path: &Path) -> ConsistencyReport {
     }
 
     // Check request resolutions
-    for (req_id, kind) in &requests_asked {
+    for (req_id, (kind, _)) in &requests_asked {
         let res = requests_resolved.get(req_id).copied().unwrap_or(0);
         if res != 1 {
             report.add(format!(
@@ -373,16 +478,6 @@ pub fn check_fixture(path: &Path) -> ConsistencyReport {
         }
     }
 
-    if is_gate_deny {
-        for canary in CANARIES {
-            if content.contains(canary) {
-                report.add(format!(
-                    "Scenario '{file_stem}' leaked canary secret in events: {canary}"
-                ));
-            }
-        }
-    }
-
     // Scenario specific: interrupt
     if is_interrupt {
         let has_interrupted = turn_outcomes
@@ -403,18 +498,455 @@ pub fn check_fixture(path: &Path) -> ConsistencyReport {
         }
     }
 
-    // Closing order on exit (module docs):
-    // "When a session ends for any reason, the adapter first closes everything still open,
-    // in this order: open messages → MessageCompleted (text so far);
-    // open tool calls → ToolCallFinished { status: cancelled };
-    // pending approvals and questions → RequestResolved { outcome: cancelled };
-    // an open turn → TurnCompleted { outcome: interrupted | failed }. Then SessionEnded."
-    // Let's check if session ended cleanly without open turns
+    // Check no unclosed turns at SessionEnded
     if let Some(open) = current_turn {
         report.add(format!("Session ended while turn {open} was still open"));
     }
 
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_descriptor() -> EnforcementDescriptor {
+        EnforcementDescriptor {
+            level: atrium_protocol::policy::EnforcementLevel::Full,
+            reasons: vec![],
+            provider: Provider::Claude,
+            cli_version: Some("1.0.0".into()),
+            version_tested: true,
+            coverage: vec![],
+            config_sources: vec![],
+        }
+    }
+
+    #[test]
+    fn test_streamed_message_sha256_mismatch() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::MessageDelta {
+                message_id: "m1".into(),
+                kind: MessageKind::Assistant,
+                text: "hello world".into(),
+            },
+            AgentEvent::MessageCompleted {
+                message_id: "m1".into(),
+                kind: MessageKind::Assistant,
+                body: MessageBody::Streamed {
+                    chars: 11,
+                    deltas: 1,
+                    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                        .into(),
+                },
+            },
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Completed,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(0),
+                reason: None,
+            },
+        ];
+        let report = check_events(&events, "simple");
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("sha256 mismatch")),
+            "Expected sha256 mismatch violation, got: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_streamed_message_deltas_count_mismatch() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::MessageDelta {
+                message_id: "m1".into(),
+                kind: MessageKind::Assistant,
+                text: "hello".into(),
+            },
+            AgentEvent::MessageDelta {
+                message_id: "m1".into(),
+                kind: MessageKind::Assistant,
+                text: " world".into(),
+            },
+            AgentEvent::MessageCompleted {
+                message_id: "m1".into(),
+                kind: MessageKind::Assistant,
+                body: MessageBody::Streamed {
+                    chars: 11,
+                    deltas: 1, // Actually 2 deltas
+                    sha256: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+                        .into(),
+                },
+            },
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Completed,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(0),
+                reason: None,
+            },
+        ];
+        let report = check_events(&events, "simple");
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("deltas mismatch")),
+            "Expected deltas mismatch violation, got: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_streamed_message_chars_mismatch() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::MessageDelta {
+                message_id: "m1".into(),
+                kind: MessageKind::Assistant,
+                text: "hello".into(),
+            },
+            AgentEvent::MessageCompleted {
+                message_id: "m1".into(),
+                kind: MessageKind::Assistant,
+                body: MessageBody::Streamed {
+                    chars: 99, // Actually 5 chars
+                    deltas: 1,
+                    sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                        .into(),
+                },
+            },
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Completed,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(0),
+                reason: None,
+            },
+        ];
+        let report = check_events(&events, "simple");
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("chars mismatch")),
+            "Expected chars mismatch violation, got: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_duplicate_approval_requested_id() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::ApprovalRequested {
+                request_id: "dup_req".into(),
+                call_id: None,
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+                reason: None,
+                rememberable: false,
+            },
+            AgentEvent::ApprovalRequested {
+                request_id: "dup_req".into(),
+                call_id: None,
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+                reason: None,
+                rememberable: false,
+            },
+            AgentEvent::RequestResolved {
+                request_id: "dup_req".into(),
+                outcome: RequestOutcome::Approved,
+            },
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Completed,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(0),
+                reason: None,
+            },
+        ];
+        let report = check_events(&events, "simple");
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("Duplicate ApprovalRequested id 'dup_req'")),
+            "Expected duplicate approval id violation, got: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_duplicate_question_asked_id() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::QuestionAsked {
+                request_id: "dup_q".into(),
+                questions: vec![],
+            },
+            AgentEvent::QuestionAsked {
+                request_id: "dup_q".into(),
+                questions: vec![],
+            },
+            AgentEvent::RequestResolved {
+                request_id: "dup_q".into(),
+                outcome: RequestOutcome::Answered,
+            },
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Completed,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(0),
+                reason: None,
+            },
+        ];
+        let report = check_events(&events, "simple");
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("Duplicate QuestionAsked id 'dup_q'")),
+            "Expected duplicate question id violation, got: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_duplicate_request_resolved() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::ApprovalRequested {
+                request_id: "req1".into(),
+                call_id: None,
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+                reason: None,
+                rememberable: false,
+            },
+            AgentEvent::RequestResolved {
+                request_id: "req1".into(),
+                outcome: RequestOutcome::Approved,
+            },
+            AgentEvent::RequestResolved {
+                request_id: "req1".into(),
+                outcome: RequestOutcome::Approved,
+            },
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Completed,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(0),
+                reason: None,
+            },
+        ];
+        let report = check_events(&events, "simple");
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("Duplicate RequestResolved for request_id 'req1'")),
+            "Expected duplicate resolution violation, got: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_closing_order_tool_cancelled_after_request_cancelled() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+            },
+            AgentEvent::ApprovalRequested {
+                request_id: "req1".into(),
+                call_id: Some("c1".into()),
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+                reason: None,
+                rememberable: false,
+            },
+            // BAD ORDER: RequestResolved(cancelled) before ToolCallFinished(cancelled)
+            AgentEvent::RequestResolved {
+                request_id: "req1".into(),
+                outcome: RequestOutcome::Cancelled,
+            },
+            AgentEvent::ToolCallFinished {
+                call_id: "c1".into(),
+                status: ToolStatus::Cancelled,
+                output: None,
+                error: None,
+                truncated_bytes: 0,
+            },
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Interrupted,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(1),
+                reason: Some("interrupted".into()),
+            },
+        ];
+        let report = check_events(&events, "interrupt");
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("violates closing order: tool calls before requests")),
+            "Expected closing order violation, got: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_closing_order_per_closure_episode_resets_on_new_turn() {
+        let events = vec![
+            AgentEvent::SessionStarted {
+                provider: Provider::Claude,
+                native_session_id: "s1".into(),
+                model: None,
+                tools: vec![],
+                enforcement: dummy_descriptor(),
+            },
+            // Turn 1: has a cancelled request during turn 1 closure
+            AgentEvent::TurnStarted { turn: 1 },
+            AgentEvent::ApprovalRequested {
+                request_id: "req1".into(),
+                call_id: None,
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+                reason: None,
+                rememberable: false,
+            },
+            AgentEvent::RequestResolved {
+                request_id: "req1".into(),
+                outcome: RequestOutcome::Cancelled,
+            },
+            AgentEvent::TurnCompleted {
+                turn: 1,
+                outcome: TurnOutcome::Interrupted,
+                usage: None,
+            },
+            // Turn 2: starts fresh. Tool call is started and cancelled.
+            // This should NOT trigger a violation from Turn 1's cancelled request!
+            AgentEvent::TurnStarted { turn: 2 },
+            AgentEvent::ToolCallStarted {
+                call_id: "c2".into(),
+                name: "Bash".into(),
+                kind: ToolKind::Execute,
+                title: None,
+                input: serde_json::json!({}),
+            },
+            AgentEvent::ToolCallFinished {
+                call_id: "c2".into(),
+                status: ToolStatus::Cancelled,
+                output: None,
+                error: None,
+                truncated_bytes: 0,
+            },
+            AgentEvent::TurnCompleted {
+                turn: 2,
+                outcome: TurnOutcome::Interrupted,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                exit_code: Some(0),
+                reason: None,
+            },
+        ];
+        let report = check_events(&events, "interrupt");
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.contains("violates closing order")),
+            "Expected NO closing order violation across separate turns, got: {:?}",
+            report.violations
+        );
+    }
 }
 
 #[test]

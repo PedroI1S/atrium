@@ -211,11 +211,23 @@ impl Sanitizer {
         }
     }
 
-    /// True if no secret, home path or user name is left in `text`.
-    pub fn is_clean(&self, text: &str) -> bool {
+    fn is_clean_raw(&self, text: &str) -> bool {
         self.secrets.iter().all(|s| !text.contains(s.as_str()))
             && (self.home.is_empty() || !text.contains(&self.home))
             && replace_word(text, &self.user, "") == text
+    }
+
+    /// True if no secret, home path or user name is left in `text`,
+    /// including in decoded content with JSON-escaped or Unicode-escaped forms.
+    pub fn is_clean(&self, text: &str) -> bool {
+        if !self.is_clean_raw(text) {
+            return false;
+        }
+        let decoded = decode_all_escapes(text);
+        if decoded != text && !self.is_clean_raw(&decoded) {
+            return false;
+        }
+        true
     }
 }
 
@@ -240,6 +252,185 @@ fn replace_word(text: &str, word: &str, with: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Decodes JSON escape sequences (\uXXXX, \", \\, etc.) and Unicode escapes (\u{...}, \xXX).
+fn decode_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.char_indices().peekable();
+
+    while let Some((_, c)) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+
+        match chars.peek() {
+            Some(&(_, '"')) => {
+                chars.next();
+                out.push('"');
+            }
+            Some(&(_, '\\')) => {
+                chars.next();
+                out.push('\\');
+            }
+            Some(&(_, '/')) => {
+                chars.next();
+                out.push('/');
+            }
+            Some(&(_, 'b')) => {
+                chars.next();
+                out.push('\x08');
+            }
+            Some(&(_, 'f')) => {
+                chars.next();
+                out.push('\x0C');
+            }
+            Some(&(_, 'n')) => {
+                chars.next();
+                out.push('\n');
+            }
+            Some(&(_, 'r')) => {
+                chars.next();
+                out.push('\r');
+            }
+            Some(&(_, 't')) => {
+                chars.next();
+                out.push('\t');
+            }
+            Some(&(_, 'u')) => {
+                chars.next();
+                if let Some(&(_, '{')) = chars.peek() {
+                    chars.next();
+                    let mut hex = String::new();
+                    while let Some(&(_, hc)) = chars.peek() {
+                        if hc == '}' {
+                            chars.next();
+                            break;
+                        }
+                        if hc.is_ascii_hexdigit() {
+                            hex.push(hc);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(code) {
+                            out.push(ch);
+                        } else {
+                            out.push_str("\\u{");
+                            out.push_str(&hex);
+                            out.push('}');
+                        }
+                    } else {
+                        out.push_str("\\u{");
+                        out.push_str(&hex);
+                    }
+                } else {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        if let Some(&(_, hc)) = chars.peek() {
+                            if hc.is_ascii_hexdigit() {
+                                hex.push(hc);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if hex.len() == 4 {
+                        if let Ok(code) = u16::from_str_radix(&hex, 16) {
+                            if (0xD800..=0xDBFF).contains(&code) {
+                                let mut cloned = chars.clone();
+                                if let (Some((_, '\\')), Some((_, 'u'))) =
+                                    (cloned.next(), cloned.next())
+                                {
+                                    let mut hex2 = String::new();
+                                    for _ in 0..4 {
+                                        if let Some((_, hc)) = cloned.next() {
+                                            if hc.is_ascii_hexdigit() {
+                                                hex2.push(hc);
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if hex2.len() == 4
+                                        && let Ok(code2) = u16::from_str_radix(&hex2, 16)
+                                        && (0xDC00..=0xDFFF).contains(&code2)
+                                        && let Some(Ok(ch)) =
+                                            char::decode_utf16([code, code2]).next()
+                                    {
+                                        out.push(ch);
+                                        chars = cloned;
+                                        continue;
+                                    }
+                                }
+                            }
+                            if let Some(ch) = char::from_u32(code as u32) {
+                                out.push(ch);
+                            } else {
+                                out.push_str("\\u");
+                                out.push_str(&hex);
+                            }
+                        } else {
+                            out.push_str("\\u");
+                            out.push_str(&hex);
+                        }
+                    } else {
+                        out.push_str("\\u");
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some(&(_, 'x')) => {
+                chars.next();
+                let mut hex = String::new();
+                for _ in 0..2 {
+                    if let Some(&(_, hc)) = chars.peek() {
+                        if hc.is_ascii_hexdigit() {
+                            hex.push(hc);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if hex.len() == 2 {
+                    if let Ok(code) = u8::from_str_radix(&hex, 16) {
+                        out.push(code as char);
+                    } else {
+                        out.push_str("\\x");
+                        out.push_str(&hex);
+                    }
+                } else {
+                    out.push_str("\\x");
+                    out.push_str(&hex);
+                }
+            }
+            _ => {
+                out.push('\\');
+            }
+        }
+    }
+
+    out
+}
+
+fn decode_all_escapes(s: &str) -> String {
+    let mut current = decode_escapes(s);
+    for _ in 0..3 {
+        if !current.contains('\\') {
+            break;
+        }
+        let next = decode_escapes(&current);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
 }
 
 #[cfg(test)]
@@ -273,6 +464,21 @@ mod tests {
     fn user_name_only_as_a_whole_word() {
         let s = Sanitizer::new("", "ana", &[]);
         assert_eq!(s.text("banana ana ana_x ana."), "banana user ana_x user.");
+    }
+
+    #[test]
+    fn escaped_secret_detected_by_is_clean() {
+        let s = Sanitizer::new("/home/user", "user", &["super_secret"]);
+        // Raw matches
+        assert!(!s.is_clean("super_secret"));
+        // JSON-escaped \uXXXX form
+        assert!(!s.is_clean(r"contains \u0073\u0075\u0070\u0065\u0072\u005f\u0073\u0065\u0063\u0072\u0065\u0074 within"));
+        // Unicode-escaped \u{...} form
+        assert!(!s.is_clean(r"contains \u{73}\u{75}\u{70}\u{65}\u{72}\u{5f}\u{73}\u{65}\u{63}\u{72}\u{65}\u{74} within"));
+        // Mixed partial escape
+        assert!(!s.is_clean(r"super_\u0073ecret"));
+        // Clean text passes
+        assert!(s.is_clean("completely benign text"));
     }
 
     #[test]

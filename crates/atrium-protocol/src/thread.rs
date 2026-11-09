@@ -12,10 +12,12 @@ use crate::policy::EnforcementDescriptor;
 use crate::wire::EventId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(transparent)]
 pub struct ThreadId(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum Cleanup {
     /// The provider's process group was killed and reaped.
@@ -26,6 +28,7 @@ pub enum Cleanup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThreadState {
     /// The provider is starting (before `SessionStarted`).
@@ -50,6 +53,7 @@ pub enum ThreadState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Location {
     /// Home: cwd `~`, policy "read freely, approve changes".
@@ -57,6 +61,7 @@ pub enum Location {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct ThreadSummary {
     pub thread_id: ThreadId,
     /// From the first user message until the user renames it.
@@ -86,6 +91,7 @@ pub struct ThreadSummary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum InboxReason {
     // Declaration order is the ranking (contract §8): earlier ranks higher.
@@ -98,6 +104,7 @@ pub enum InboxReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct InboxItem {
     /// `None` only for `StorageFull`.
     pub thread_id: Option<ThreadId>,
