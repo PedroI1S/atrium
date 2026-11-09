@@ -3,6 +3,13 @@
 //! `App` authority is granted only when the connecting process is the Atrium
 //! app. The check is done once per connection, at `Hello`, and pins the
 //! process (audit token on macOS, pidfd on Linux) so pid reuse can't swap it.
+//!
+//! Platform minimums:
+//! - **macOS 11+**: requires `LOCAL_PEERTOKEN`, `SecCodeCopyGuestWithAttributes`
+//!   (`kSecGuestAttributeAudit`), and macOS 11+ linker-emitted ad-hoc code
+//!   directory hashes for unsigned development binaries (`MacUnsigned`).
+//! - **Linux 6.5+**: requires `SO_PEERPIDFD` to pin the peer process without
+//!   `pidfd_open` PID-reuse races.
 
 use std::path::PathBuf;
 
@@ -53,10 +60,12 @@ pub enum PeerError {
 /// Verifies the peer of a connected unix socket against `expected`. Any
 /// failure is an error; there is no partial success. The uid is checked
 /// first.
-/// - macOS: `LOCAL_PEERTOKEN` → `SecCodeCreateWithAuditToken`; signed:
-///   `SecCodeCheckValidity` against the requirement; unsigned: the cdhash
-///   from the code object (`kSecCodeInfoUnique`), never a hash of the file on
-///   disk.
+/// - macOS: `LOCAL_PEERTOKEN` → `SecCodeCopyGuestWithAttributes`
+///   (`kSecGuestAttributeAudit`); signed: `SecCodeCheckValidity` against the
+///   requirement; unsigned: validates dynamic code with `SecCodeCheckValidity`
+///   and compares the running process's cdhash (`kSecCodeInfoUnique` via
+///   `SecCodeCopySigningInformation` with `kSecCSDynamicInformation`), never a
+///   hash of the file on disk.
 /// - Linux: `SO_PEERCRED`, then the peer's pidfd from `SO_PEERPIDFD`
 ///   (kernel 6.5+; without it, App authority is refused: no `pidfd_open`
 ///   fallback, which would race with pid reuse). `stat` `/proc/<pid>/exe`:
@@ -93,9 +102,6 @@ mod platform {
 
     use super::{AppIdentity, PeerError, PeerInfo};
 
-    const SOL_LOCAL: libc::c_int = 0;
-    const LOCAL_PEERTOKEN: libc::c_int = 0x006;
-
     type CFTypeRef = *const libc::c_void;
     type CFTypeID = usize;
     type CFAllocatorRef = *const libc::c_void;
@@ -114,6 +120,7 @@ mod platform {
 
     const K_CF_STRING_ENCODING_UTF8: CFStringEncoding = 0x0800_0100;
     const K_SEC_CS_DEFAULT_FLAGS: SecCSFlags = 0;
+    const K_SEC_CS_DYNAMIC_INFORMATION: SecCSFlags = 1 << 3;
     const ERR_SEC_SUCCESS: OSStatus = 0;
     const ERR_SEC_CS_UNSIGNED: OSStatus = -67062;
 
@@ -121,6 +128,25 @@ mod platform {
     #[derive(Clone, Copy)]
     struct AuditToken {
         val: [u32; 8],
+    }
+
+    #[repr(C)]
+    struct CFDictionaryKeyCallBacks {
+        version: CFIndex,
+        retain: *const libc::c_void,
+        release: *const libc::c_void,
+        copy_description: *const libc::c_void,
+        equal: *const libc::c_void,
+        hash: *const libc::c_void,
+    }
+
+    #[repr(C)]
+    struct CFDictionaryValueCallBacks {
+        version: CFIndex,
+        retain: *const libc::c_void,
+        release: *const libc::c_void,
+        copy_description: *const libc::c_void,
+        equal: *const libc::c_void,
     }
 
     // SAFETY: Declarations match `<bsm/libbsm.h>` on macOS (`audit_token_t` is
@@ -136,12 +162,28 @@ mod platform {
     // `Boolean` = `unsigned char`).
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
+        static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
+        static kCFTypeDictionaryValueCallBacks: CFDictionaryValueCallBacks;
+
         fn CFRelease(cf: CFTypeRef);
         fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
         fn CFDataGetTypeID() -> CFTypeID;
         fn CFURLGetTypeID() -> CFTypeID;
+        fn CFDataCreate(
+            allocator: CFAllocatorRef,
+            bytes: *const u8,
+            length: CFIndex,
+        ) -> CFDataRef;
         fn CFDataGetBytePtr(the_data: CFDataRef) -> *const u8;
         fn CFDataGetLength(the_data: CFDataRef) -> CFIndex;
+        fn CFDictionaryCreate(
+            allocator: CFAllocatorRef,
+            keys: *const *const libc::c_void,
+            values: *const *const libc::c_void,
+            num_values: CFIndex,
+            key_call_backs: *const CFDictionaryKeyCallBacks,
+            value_call_backs: *const CFDictionaryValueCallBacks,
+        ) -> CFDictionaryRef;
         fn CFDictionaryGetValue(
             the_dict: CFDictionaryRef,
             key: *const libc::c_void,
@@ -161,24 +203,21 @@ mod platform {
         ) -> Boolean;
     }
 
-    // SAFETY: Declarations match Apple's `<Security/CSCommon.h>`,
-    // `<Security/SecCode.h>`, and `<Security/SecRequirement.h>` in
-    // `Security.framework`.
+    // SAFETY: Declarations match Apple's public `<Security/CSCommon.h>`,
+    // `<Security/SecCode.h>`, `<Security/SecStaticCode.h>`, and
+    // `<Security/SecRequirement.h>` headers in `Security.framework`.
     #[link(name = "Security", kind = "framework")]
     unsafe extern "C" {
+        static kSecGuestAttributeAudit: CFStringRef;
         static kSecCodeInfoUnique: CFStringRef;
         static kSecCodeInfoMainExecutable: CFStringRef;
 
         fn SecCodeCopySelf(flags: SecCSFlags, self_code: *mut SecCodeRef) -> OSStatus;
-        fn SecCodeCreateWithAuditToken(
-            audit: *const AuditToken,
+        fn SecCodeCopyGuestWithAttributes(
+            host: SecCodeRef,
+            attributes: CFDictionaryRef,
             flags: SecCSFlags,
-            code: *mut SecCodeRef,
-        ) -> OSStatus;
-        fn SecCodeCopyStaticCode(
-            code: SecCodeRef,
-            flags: SecCSFlags,
-            static_code: *mut SecStaticCodeRef,
+            guest: *mut SecCodeRef,
         ) -> OSStatus;
         fn SecCodeCheckValidity(
             code: SecCodeRef,
@@ -201,7 +240,15 @@ mod platform {
     struct CfRef(CFTypeRef);
 
     impl CfRef {
-        fn new(ptr: CFTypeRef) -> Option<Self> {
+        /// Takes ownership of a CoreFoundation pointer returned under the
+        /// Create or Copy rule.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` must be either null or a valid CoreFoundation object reference
+        /// with a +1 retain count whose ownership the caller transfers to
+        /// `Self` (never an unowned Get-rule reference).
+        unsafe fn from_create_rule(ptr: CFTypeRef) -> Option<Self> {
             (!ptr.is_null()).then_some(Self(ptr))
         }
 
@@ -212,8 +259,8 @@ mod platform {
 
     impl Drop for CfRef {
         fn drop(&mut self) {
-            // SAFETY: `self.0` is guaranteed non-null and owned under the
-            // CoreFoundation Create/Copy rule, released exactly once on drop.
+            // SAFETY: `self.0` is guaranteed non-null and +1 owned by
+            // `CfRef::from_create_rule`'s invariant, released once on drop.
             unsafe { CFRelease(self.0) };
         }
     }
@@ -232,38 +279,41 @@ mod platform {
         out
     }
 
+    fn is_valid_cdhash_hex(s: &str) -> bool {
+        !s.is_empty() && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
     fn peer_audit_token(fd: BorrowedFd<'_>) -> Result<(AuditToken, u32, u32), PeerError> {
         let expected_len = std::mem::size_of::<AuditToken>() as libc::socklen_t;
         let mut len = expected_len;
-        // SAFETY: `token` is a plain `[u32; 8]` C struct valid when zeroed,
-        // `fd` is a live borrowed socket fd, and `&mut len` bounds `getsockopt`
-        // writes to `sizeof(AuditToken)`. `audit_token_to_*` are pure functions
-        // reading `token` by value.
-        let (rc, token, euid, pid) = unsafe {
-            let mut token = AuditToken { val: [0; 8] };
-            let rc = libc::getsockopt(
+        let mut token = AuditToken { val: [0; 8] };
+        // SAFETY: `token` is a plain `[u32; 8]` C struct, `fd` is a live
+        // borrowed socket fd, and `&mut len` bounds `getsockopt` writes to
+        // `sizeof(AuditToken)`.
+        let rc = unsafe {
+            libc::getsockopt(
                 fd.as_raw_fd(),
-                SOL_LOCAL,
-                LOCAL_PEERTOKEN,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERTOKEN,
                 (&raw mut token).cast::<libc::c_void>(),
                 &mut len,
-            );
-            if rc != 0 {
-                return Err(PeerError::Inspect(format!(
-                    "LOCAL_PEERTOKEN failed: {}",
-                    io::Error::last_os_error()
-                )));
-            }
-            let euid = audit_token_to_euid(token);
-            let pid = audit_token_to_pid(token);
-            (rc, token, euid, pid)
+            )
         };
-        let _ = rc;
+        if rc != 0 {
+            return Err(PeerError::Inspect(format!(
+                "LOCAL_PEERTOKEN failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
         if len != expected_len {
             return Err(PeerError::Inspect(format!(
                 "short LOCAL_PEERTOKEN length {len}"
             )));
         }
+        // SAFETY: `getsockopt` succeeded and wrote a complete `AuditToken`
+        // (`len == sizeof(AuditToken)` checked above). `audit_token_to_*` are
+        // pure functions reading `token` by value.
+        let (euid, pid) = unsafe { (audit_token_to_euid(token), audit_token_to_pid(token)) };
         let pid_u32 = u32::try_from(pid)
             .ok()
             .filter(|&p| p > 0)
@@ -272,13 +322,50 @@ mod platform {
     }
 
     fn sec_code_from_token(token: &AuditToken) -> Result<CfRef, PeerError> {
-        // SAFETY: `token` is a valid initialized `audit_token_t` reference for
-        // the duration of `SecCodeCreateWithAuditToken`. On `ERR_SEC_SUCCESS`,
-        // `code_raw` receives a newly created owned `SecCodeRef`.
+        let token_bytes = ptr::from_ref(token).cast::<u8>();
+        let token_len = std::mem::size_of::<AuditToken>() as CFIndex;
+        // SAFETY: `token_bytes` points to `size_of::<AuditToken>()` initialized
+        // bytes valid during `CFDataCreate`, which copies them and returns null
+        // or a +1 owned `CFDataRef` under the Create rule.
+        let audit_data = unsafe {
+            CfRef::from_create_rule(CFDataCreate(ptr::null(), token_bytes, token_len))
+        }
+        .ok_or_else(|| PeerError::Inspect("CFDataCreate for audit token failed".into()))?;
+
+        // SAFETY: `kSecGuestAttributeAudit` is an immutable `CFStringRef`
+        // constant exported by `Security.framework`, and `audit_data` is a live
+        // `CFDataRef`. `CFDictionaryCreate` retains key and value using Core
+        // Foundation's standard type callbacks and returns null or a +1 owned
+        // `CFDictionaryRef` under the Create rule.
+        let attrs = unsafe {
+            let key = kSecGuestAttributeAudit;
+            if key.is_null() {
+                return Err(PeerError::Inspect("kSecGuestAttributeAudit is null".into()));
+            }
+            let keys: [*const libc::c_void; 1] = [key];
+            let values: [*const libc::c_void; 1] = [audit_data.as_ptr()];
+            CfRef::from_create_rule(CFDictionaryCreate(
+                ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            ))
+        }
+        .ok_or_else(|| {
+            PeerError::Inspect("CFDictionaryCreate for guest attributes failed".into())
+        })?;
+
+        // SAFETY: `host` is null (system host), `attrs.as_ptr()` is a live
+        // `CFDictionaryRef` kept alive by `attrs`, and `&mut code_raw` is a
+        // valid out pointer. On `ERR_SEC_SUCCESS`, `SecCodeCopyGuestWithAttributes`
+        // writes a +1 owned `SecCodeRef` under the Copy rule.
         unsafe {
             let mut code_raw: SecCodeRef = ptr::null();
-            let status = SecCodeCreateWithAuditToken(
-                ptr::from_ref(token),
+            let status = SecCodeCopyGuestWithAttributes(
+                ptr::null(),
+                attrs.as_ptr(),
                 K_SEC_CS_DEFAULT_FLAGS,
                 &mut code_raw,
             );
@@ -287,11 +374,11 @@ mod platform {
             }
             if status != ERR_SEC_SUCCESS {
                 return Err(PeerError::Inspect(format!(
-                    "SecCodeCreateWithAuditToken failed (OSStatus {status})"
+                    "SecCodeCopyGuestWithAttributes failed (OSStatus {status})"
                 )));
             }
-            CfRef::new(code_raw).ok_or_else(|| {
-                PeerError::Inspect("SecCodeCreateWithAuditToken returned null".into())
+            CfRef::from_create_rule(code_raw).ok_or_else(|| {
+                PeerError::Inspect("SecCodeCopyGuestWithAttributes returned null".into())
             })
         }
     }
@@ -300,14 +387,15 @@ mod platform {
         let req_ref = match requirement {
             None => None,
             Some(req_str) => {
-                // SAFETY: `req_str.as_ptr()` is valid for `req_str.len()` UTF-8
-                // bytes during `CFStringCreateWithBytes`. On `ERR_SEC_SUCCESS`,
-                // `SecRequirementCreateWithString` writes an owned
+                let len = CFIndex::try_from(req_str.len())
+                    .map_err(|_| PeerError::NotApp("requirement string too long".into()))?;
+                // SAFETY: `req_str.as_ptr()` is valid for `len` UTF-8 bytes
+                // during `CFStringCreateWithBytes`, which copies them and
+                // returns null or a +1 owned `CFStringRef`. On `ERR_SEC_SUCCESS`,
+                // `SecRequirementCreateWithString` writes a +1 owned
                 // `SecRequirementRef` to `raw_req`.
                 let created = unsafe {
-                    let len = CFIndex::try_from(req_str.len())
-                        .map_err(|_| PeerError::NotApp("requirement string too long".into()))?;
-                    let Some(cf_str) = CfRef::new(CFStringCreateWithBytes(
+                    let Some(cf_str) = CfRef::from_create_rule(CFStringCreateWithBytes(
                         ptr::null(),
                         req_str.as_ptr(),
                         len,
@@ -327,7 +415,7 @@ mod platform {
                             "invalid designated requirement (OSStatus {status})"
                         )));
                     }
-                    CfRef::new(raw_req).ok_or_else(|| {
+                    CfRef::from_create_rule(raw_req).ok_or_else(|| {
                         PeerError::NotApp("SecRequirementCreateWithString returned null".into())
                     })?
                 };
@@ -336,8 +424,8 @@ mod platform {
         };
 
         let raw_req = req_ref.as_ref().map_or(ptr::null(), CfRef::as_ptr);
-        // SAFETY: `code.as_ptr()` is a live `SecCodeRef`, and `raw_req` is
-        // either null (check structural code validity only) or a live
+        // SAFETY: `code.as_ptr()` is a live dynamic `SecCodeRef`, and `raw_req`
+        // is either null (validate dynamic code signature) or a live
         // `SecRequirementRef` kept alive by `req_ref` across this call.
         let status =
             unsafe { SecCodeCheckValidity(code.as_ptr(), K_SEC_CS_DEFAULT_FLAGS, raw_req) };
@@ -349,28 +437,20 @@ mod platform {
         Ok(())
     }
 
-    fn extract_signing_details(code: &CfRef) -> Result<SigningDetails, String> {
-        // SAFETY: `code.as_ptr()` is a valid `SecCodeRef`. Both
-        // `SecCodeCopyStaticCode` and `SecCodeCopySigningInformation` follow the
-        // Copy rule on `ERR_SEC_SUCCESS`. Dictionary values are unowned borrows
-        // tied to `dict`'s lifetime, runtime-type-checked with `CFGetTypeID`
-        // before accessing `CFData` bytes or `CFURL` path bytes.
+    /// Reads dynamic signing information directly from a live `SecCodeRef`
+    /// (`kSecCSDynamicInformation`), never via `SecCodeCopyStaticCode`.
+    fn extract_dynamic_signing_details(code: &CfRef) -> Result<SigningDetails, String> {
+        // SAFETY: `code.as_ptr()` is a valid running `SecCodeRef` (accepted by
+        // `SecCodeCopySigningInformation` directly without converting to a
+        // disk-backed static code object). On `ERR_SEC_SUCCESS`, `raw_dict` is a
+        // +1 owned `CFDictionaryRef` under the Copy rule. Dictionary values are
+        // unowned borrows tied to `dict`'s lifetime, runtime-type-checked with
+        // `CFGetTypeID` before reading `CFData` or `CFURL` bytes.
         unsafe {
-            let mut raw_static: SecStaticCodeRef = ptr::null();
-            let st_status =
-                SecCodeCopyStaticCode(code.as_ptr(), K_SEC_CS_DEFAULT_FLAGS, &mut raw_static);
-            if st_status != ERR_SEC_SUCCESS {
-                return Err(format!(
-                    "SecCodeCopyStaticCode failed (OSStatus {st_status})"
-                ));
-            }
-            let static_code = CfRef::new(raw_static)
-                .ok_or_else(|| "SecCodeCopyStaticCode returned null".to_string())?;
-
             let mut raw_dict: CFDictionaryRef = ptr::null();
             let info_status = SecCodeCopySigningInformation(
-                static_code.as_ptr(),
-                K_SEC_CS_DEFAULT_FLAGS,
+                code.as_ptr(),
+                K_SEC_CS_DYNAMIC_INFORMATION,
                 &mut raw_dict,
             );
             if info_status != ERR_SEC_SUCCESS {
@@ -378,7 +458,7 @@ mod platform {
                     "SecCodeCopySigningInformation failed (OSStatus {info_status})"
                 ));
             }
-            let dict = CfRef::new(raw_dict)
+            let dict = CfRef::from_create_rule(raw_dict)
                 .ok_or_else(|| "SecCodeCopySigningInformation returned null".to_string())?;
 
             let unique_val = CFDictionaryGetValue(dict.as_ptr(), kSecCodeInfoUnique);
@@ -439,7 +519,7 @@ mod platform {
         match expected {
             AppIdentity::MacSigned { requirement } => {
                 check_code_validity(&code, Some(requirement))?;
-                let details = extract_signing_details(&code).map_err(PeerError::Inspect)?;
+                let details = extract_dynamic_signing_details(&code).map_err(PeerError::Inspect)?;
                 let executable = match details.executable {
                     Some(p) => p,
                     None => crate::supervise::identify(pid)
@@ -457,16 +537,23 @@ mod platform {
                 executable: expected_exe,
                 cdhash: expected_cdhash,
             } => {
-                check_code_validity(&code, None)?;
-                let details = extract_signing_details(&code).map_err(|e| {
-                    PeerError::NotApp(format!("cannot read peer signing info: {e}"))
+                if !is_valid_cdhash_hex(expected_cdhash) {
+                    return Err(PeerError::NotApp("expected cdhash is invalid".into()));
+                }
+                // Validate the dynamic running code object against the expected
+                // cdhash requirement first so any post-launch on-disk replacement
+                // (`errSecCSStaticCodeChanged`) or signature mismatch fails closed
+                // before inspecting signing dictionary fields.
+                let cdhash_req = format!("cdhash H\"{expected_cdhash}\"");
+                check_code_validity(&code, Some(&cdhash_req))?;
+
+                let details = extract_dynamic_signing_details(&code).map_err(|e| {
+                    PeerError::NotApp(format!("cannot read peer dynamic signing info: {e}"))
                 })?;
                 let Some(actual_cdhash) = details.cdhash_hex else {
                     return Err(PeerError::NotApp("peer code object has no cdhash".into()));
                 };
-                if expected_cdhash.is_empty()
-                    || !actual_cdhash.eq_ignore_ascii_case(expected_cdhash)
-                {
+                if !actual_cdhash.eq_ignore_ascii_case(expected_cdhash) {
                     return Err(PeerError::NotApp(format!(
                         "cdhash mismatch (peer {actual_cdhash})"
                     )));
@@ -495,8 +582,8 @@ mod platform {
     }
 
     pub(super) fn current_identity() -> io::Result<AppIdentity> {
-        // SAFETY: `SecCodeCopySelf` writes an owned `SecCodeRef` to `raw_self`
-        // when returning `ERR_SEC_SUCCESS`.
+        // SAFETY: `SecCodeCopySelf` writes a +1 owned `SecCodeRef` to `raw_self`
+        // under the Copy rule when returning `ERR_SEC_SUCCESS`.
         let self_code = unsafe {
             let mut raw_self: SecCodeRef = ptr::null();
             let status = SecCodeCopySelf(K_SEC_CS_DEFAULT_FLAGS, &mut raw_self);
@@ -505,9 +592,11 @@ mod platform {
                     "SecCodeCopySelf failed (OSStatus {status})"
                 )));
             }
-            CfRef::new(raw_self).ok_or_else(|| io::Error::other("SecCodeCopySelf returned null"))?
+            CfRef::from_create_rule(raw_self)
+                .ok_or_else(|| io::Error::other("SecCodeCopySelf returned null"))?
         };
-        let details = extract_signing_details(&self_code).map_err(io::Error::other)?;
+        check_code_validity(&self_code, None).map_err(io::Error::other)?;
+        let details = extract_dynamic_signing_details(&self_code).map_err(io::Error::other)?;
         let cdhash = details
             .cdhash_hex
             .ok_or_else(|| io::Error::other("current executable has no code-object cdhash"))?;
@@ -536,11 +625,13 @@ mod platform {
         let mut raw_pidfd: libc::c_int = -1;
         let expected_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         let mut len = expected_len;
-        // SAFETY: `fd` is a valid borrowed Unix socket fd, `raw_pidfd` and `len`
-        // are valid mutable stack locals, and on `rc == 0` with `raw_pidfd >= 0`
-        // the kernel returned a brand-new open pidfd owned by this caller, which
-        // we immediately wrap in `OwnedFd`.
-        unsafe {
+        // SAFETY: `fd` is a valid borrowed Unix socket fd, and `raw_pidfd` and
+        // `len` are valid mutable stack locals (`len` initialized to
+        // `sizeof(c_int)`). When `getsockopt(SO_PEERPIDFD)` returns `0` and
+        // writes a non-negative descriptor to `raw_pidfd`, ownership of that new
+        // open fd belongs to the caller, so we wrap it in `OwnedFd` immediately
+        // before checking `len` so it cannot leak.
+        let pidfd = unsafe {
             let rc = libc::getsockopt(
                 fd.as_raw_fd(),
                 libc::SOL_SOCKET,
@@ -554,11 +645,17 @@ mod platform {
                     io::Error::last_os_error()
                 )));
             }
-            if len != expected_len || raw_pidfd < 0 {
+            if raw_pidfd < 0 {
                 return Err(PeerError::Inspect("invalid SO_PEERPIDFD descriptor".into()));
             }
-            Ok(OwnedFd::from_raw_fd(raw_pidfd))
+            OwnedFd::from_raw_fd(raw_pidfd)
+        };
+        if len != expected_len {
+            return Err(PeerError::Inspect(format!(
+                "unexpected SO_PEERPIDFD length {len}"
+            )));
         }
+        Ok(pidfd)
     }
 
     fn verify_pidfd_alive(pidfd: BorrowedFd<'_>) -> Result<(), PeerError> {

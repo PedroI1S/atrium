@@ -43,6 +43,8 @@ pub struct Termination {
     pub killed: bool,
 }
 
+const GROUP_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Spawns `command` as the leader of a new process group, with
 /// `kill_on_drop`, and records its identity.
 pub fn spawn_group(mut command: tokio::process::Command) -> io::Result<SupervisedChild> {
@@ -68,7 +70,15 @@ pub fn spawn_group(mut command: tokio::process::Command) -> io::Result<Supervise
         raw_cwd.as_deref(),
         path_override.as_deref(),
     ) {
-        Ok(identity) => Ok(SupervisedChild { child, identity }),
+        Ok(identity) if identity.pgid == pid => Ok(SupervisedChild { child, identity }),
+        Ok(identity) => {
+            let _ = signal_group(pid, libc::SIGKILL);
+            let _ = child.start_kill();
+            Err(io::Error::other(format!(
+                "spawned child {pid} has pgid {}, expected {pid}",
+                identity.pgid
+            )))
+        }
         Err(err) => {
             let _ = signal_group(pid, libc::SIGKILL);
             let _ = child.start_kill();
@@ -82,13 +92,17 @@ pub fn spawn_group(mut command: tokio::process::Command) -> io::Result<Supervise
 /// leader (so the group id can't be reused in between; use `WNOWAIT` to see
 /// an early exit without reaping). Also kills the group when the leader
 /// exited on its own but descendants remain.
+///
+/// The caller must **not** reap `child.child` itself first (adapters call
+/// `terminate`, never `wait` or `try_wait`); reaping the leader early would
+/// release its process group id for reuse before the group can be signalled.
+/// Returns `Ok` only once the process group is verified empty (`ESRCH`).
 pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Result<Termination> {
     if child.child.id().is_none() {
-        let status = child.child.wait().await?;
-        return Ok(Termination {
-            exit_code: status.code(),
-            killed: false,
-        });
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "supervised child leader was already reaped before terminate",
+        ));
     }
 
     let pid = child.identity.pid;
@@ -114,10 +128,16 @@ pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Resu
     };
 
     let status = child.child.wait().await?;
-    wait_for_group_drain(pgid, Duration::from_millis(500)).await;
+    wait_for_group_drain(pgid, GROUP_DRAIN_TIMEOUT).await;
 
-    if macos_zombie_eperm && !group_is_empty(pgid) {
-        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    if !group_is_empty(pgid) {
+        if macos_zombie_eperm {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("process group {pgid} did not empty after SIGKILL"),
+        ));
     }
 
     Ok(Termination {
@@ -137,12 +157,17 @@ pub fn identify(pid: u32) -> io::Result<Option<ProcessIdentity>> {
     platform_identify(pid, raw_pid)
 }
 
-/// Daemon recovery. If the leader still matches `recorded`, kills the group
-/// and returns `Verified`. If the leader is gone: `Verified` if the group is
-/// empty too (`kill(-pgid, 0)` fails with `ESRCH`), otherwise `Unverified`
-/// and nothing is killed (after a crash the group id may have been reused,
-/// and start times can't prove descent). If the pid now belongs to another
-/// executable or can't be inspected: `Unverified`, nothing killed.
+/// Daemon recovery. If the leader still matches `recorded`, kills the group,
+/// waits for it to drain, and returns `Verified` only if the group is
+/// actually empty (`Unverified` if any member remains). If the leader is
+/// gone: `Verified` if the group is empty too (`kill(-pgid, 0)` fails with
+/// `ESRCH`), otherwise `Unverified` and nothing is killed (after a crash the
+/// group id may have been reused, and start times can't prove descent). If
+/// the pid now belongs to another executable or can't be inspected:
+/// `Unverified`, nothing killed.
+///
+/// This function blocks briefly while waiting for a signalled process group to
+/// drain; async callers should run it on `tokio::task::spawn_blocking`.
 pub fn kill_recorded(recorded: &ProcessIdentity) -> Cleanup {
     if recorded.pid <= 1
         || recorded.pgid <= 1
@@ -172,10 +197,20 @@ pub fn kill_recorded(recorded: &ProcessIdentity) -> Cleanup {
                 }
                 Err(_) => return Cleanup::Unverified,
             }
-            wait_for_group_drain_sync(recorded.pgid, Duration::from_millis(500));
-            Cleanup::Verified
+            wait_for_group_drain_sync(recorded.pgid, GROUP_DRAIN_TIMEOUT);
+            if group_is_empty(recorded.pgid) {
+                Cleanup::Verified
+            } else {
+                Cleanup::Unverified
+            }
         }
     }
+}
+
+fn current_pgid() -> libc::pid_t {
+    // SAFETY: `getpgrp` takes no arguments, has no preconditions, and is
+    // async-signal-safe and thread-safe on POSIX platforms.
+    unsafe { libc::getpgrp() }
 }
 
 fn signal_group(pgid: u32, sig: libc::c_int) -> io::Result<()> {
@@ -187,9 +222,16 @@ fn signal_group(pgid: u32, sig: libc::c_int) -> io::Result<()> {
             "refusing to signal pgid <= 1",
         ));
     }
-    // SAFETY: `raw_pgid >= 2` is checked above, so `-raw_pgid <= -2` cannot
-    // overflow `i32` and strictly addresses process group `raw_pgid` (never `0`
-    // or `-1`). `kill` has no memory-safety preconditions.
+    if raw_pgid == current_pgid() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to signal current process group",
+        ));
+    }
+    // SAFETY: `raw_pgid >= 2` and `raw_pgid != getpgrp()` are checked above, so
+    // `-raw_pgid <= -2` cannot overflow `i32`, never addresses `0` or `-1`, and
+    // never targets the caller's own process group. `kill` has no memory-safety
+    // preconditions.
     let rc = unsafe { libc::kill(-raw_pgid, sig) };
     if rc == 0 {
         Ok(())
@@ -257,9 +299,15 @@ fn peek_exited(pid: u32) -> io::Result<bool> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"));
     }
     loop {
-        // SAFETY: `siginfo_t` is a C pod struct/union valid when zero-initialized.
-        // `&mut info` is valid for the duration of `waitid`. `WNOWAIT` leaves
-        // the zombie unreaped so `tokio::process::Child` remains sole reaper.
+        // SAFETY: `siginfo_t` is a C POD struct/union valid when all-bits-zero.
+        // `&mut info` is valid for the duration of `waitid`, and `WNOWAIT`
+        // leaves any zombie unreaped so `tokio::process::Child` remains sole
+        // reaper. On Linux, `libc::siginfo_t::si_pid()` is an `unsafe` union
+        // field read (`_sifields._sigchld.si_pid`); calling it only when
+        // `rc == 0` is sound because `waitid(WEXITED | WNOHANG | WNOWAIT)`
+        // either populates the `SIGCHLD` union variant with the child's
+        // non-zero PID or (when `WNOHANG` finds the child still running) leaves
+        // `info` zero-initialized so `si_pid` reads `0`.
         let (rc, si_pid) = unsafe {
             let mut info: libc::siginfo_t = std::mem::zeroed();
             let rc = libc::waitid(
@@ -268,10 +316,18 @@ fn peek_exited(pid: u32) -> io::Result<bool> {
                 &mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             );
-            #[cfg(target_os = "macos")]
-            let si_pid = info.si_pid;
-            #[cfg(target_os = "linux")]
-            let si_pid = info.si_pid();
+            let si_pid = if rc == 0 {
+                #[cfg(target_os = "macos")]
+                {
+                    info.si_pid
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    info.si_pid()
+                }
+            } else {
+                0
+            };
             (rc, si_pid)
         };
         if rc == 0 {

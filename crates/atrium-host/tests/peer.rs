@@ -177,6 +177,23 @@ async fn different_executable_connecting_after_exec_fails_with_not_app() {
 }
 
 #[cfg(target_os = "macos")]
+fn read_codesign_cdhash(bin: &Path) -> String {
+    let out = Command::new("/usr/bin/codesign")
+        .arg("-dvvv")
+        .arg(bin)
+        .output()
+        .expect("invoke codesign -dvvv");
+    assert!(out.status.success(), "codesign -dvvv failed on {bin:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("CDHash="))
+        .expect("CDHash= line in codesign -dvvv output")
+        .trim()
+        .to_string()
+}
+
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn macos_requirement_check_and_in_kernel_code_object_cdhash() {
     use std::io::{BufRead, Write};
@@ -231,28 +248,51 @@ async fn macos_requirement_check_and_in_kernel_code_object_cdhash() {
     // is already running, then let `helper_a` connect.
     let helper_a_path = compile_helper(tmp.path(), "helper_a", "alpha-code-directory-payload");
     let helper_b_path = compile_helper(tmp.path(), "helper_b", "bravo-different-payload-9999");
+    // Re-sign helper_b with a fresh ad-hoc signature and distinct identifier so
+    // it is an explicitly differently signed binary on disk.
+    let codesign_status = Command::new("/usr/bin/codesign")
+        .args(["-s", "-", "-f", "-i", "dev.atrium.test.helper-b"])
+        .arg(&helper_b_path)
+        .status()
+        .expect("invoke codesign");
+    assert!(codesign_status.success(), "codesign failed on helper_b");
     let canon_a = std::fs::canonicalize(&helper_a_path).unwrap();
 
-    // Observe `helper_b`'s real cdhash from `NotApp` error message or `SecCode`:
-    let child_b = Command::new(&helper_b_path)
+    let cdhash_a = read_codesign_cdhash(&helper_a_path);
+    let cdhash_b = read_codesign_cdhash(&helper_b_path);
+    assert_ne!(cdhash_a, cdhash_b);
+
+    let running_id_a = AppIdentity::MacUnsigned {
+        executable: canon_a.clone(),
+        cdhash: cdhash_a.clone(),
+    };
+    let forged_disk_id = AppIdentity::MacUnsigned {
+        executable: canon_a.clone(),
+        cdhash: cdhash_b.clone(),
+    };
+
+    // Sanity check before disk replacement: `helper_a` succeeds against its own
+    // dynamic cdhash (`running_id_a`) and fails against `forged_disk_id`.
+    let child_a0 = Command::new(&helper_a_path)
         .arg("direct")
         .arg(&sock)
         .spawn()
         .unwrap();
-    let mut guard_b = ChildGuard::new(child_b);
-    let (stream_b, _) = listener.accept().await.unwrap();
-    let Err(PeerError::NotApp(msg_b)) = verify_app_peer(&stream_b, &my_id) else {
-        panic!("expected NotApp for helper_b");
-    };
-    let cdhash_b = msg_b
-        .strip_prefix("cdhash mismatch (peer ")
-        .and_then(|s| s.strip_suffix(')'))
-        .expect("extract peer b cdhash")
-        .to_string();
-    drop(stream_b);
-    guard_b.wait();
+    let child_a0_pid = child_a0.id();
+    let mut guard_a0 = ChildGuard::new(child_a0);
+    let (stream_a0, _) = listener.accept().await.unwrap();
+    let info_a0 = verify_app_peer(&stream_a0, &running_id_a)
+        .expect("helper_a must verify against its own MacUnsigned identity");
+    assert_eq!(info_a0.pid, child_a0_pid);
+    assert_eq!(info_a0.executable, canon_a);
+    assert!(matches!(
+        verify_app_peer(&stream_a0, &forged_disk_id),
+        Err(PeerError::NotApp(_))
+    ));
+    drop(stream_a0);
+    guard_a0.wait();
 
-    // Now launch `helper_a` in wait-stdin mode so it is already `exec`'d in memory.
+    // Launch `helper_a` in wait-stdin mode so it is already `exec`'d in memory.
     let mut child_a = Command::new(&helper_a_path)
         .arg("wait-stdin")
         .arg(&sock)
@@ -260,14 +300,16 @@ async fn macos_requirement_check_and_in_kernel_code_object_cdhash() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+    let running_a_pid = child_a.id();
     let mut ready_line = String::new();
     std::io::BufReader::new(child_a.stdout.take().unwrap())
         .read_line(&mut ready_line)
         .unwrap();
     assert_eq!(ready_line.trim(), "ready");
 
-    // Replace `helper_a` on disk with `helper_b`'s binary BEFORE `helper_a` connects!
+    // Replace `helper_a` on disk with differently signed `helper_b` BEFORE `helper_a` connects!
     std::fs::rename(&helper_b_path, &helper_a_path).unwrap();
+    assert_eq!(read_codesign_cdhash(&helper_a_path), cdhash_b);
 
     // Signal `helper_a` to call `connect()` now.
     let mut stdin_a = child_a.stdin.take().unwrap();
@@ -277,16 +319,29 @@ async fn macos_requirement_check_and_in_kernel_code_object_cdhash() {
 
     let (stream_a, _) = listener.accept().await.unwrap();
 
-    // If `verify_app_peer` hashed the file on disk at `canon_a`, `forged_disk_id`
-    // (carrying `cdhash_b`, which is now at `canon_a` on disk!) would SUCCEED.
-    // Because it checks the kernel audit-token code object, it MUST FAIL with NotApp!
-    let forged_disk_id = AppIdentity::MacUnsigned {
-        executable: canon_a,
-        cdhash: cdhash_b,
-    };
+    // 4a. Replacing the binary on disk MUST NEVER allow the running process to
+    // pass verification under the new on-disk file's cdhash (`cdhash_b`).
     let disk_err = verify_app_peer(&stream_a, &forged_disk_id)
         .expect_err("on-disk replacement binary cdhash must NOT match running process");
     assert!(matches!(disk_err, PeerError::NotApp(_)));
+
+    // 4b. Against the running process's own pre-replacement identity (`cdhash_a`),
+    // `verify_app_peer` either reflects the running process (`Ok` with `running_a_pid`)
+    // or fails closed (`Err(PeerError::NotApp)` when Security.framework flags
+    // `errSecCSStaticCodeChanged` -67034).
+    match verify_app_peer(&stream_a, &running_id_a) {
+        Ok(info) => {
+            assert_eq!(info.pid, running_a_pid);
+            assert_eq!(info.executable, canon_a);
+        }
+        Err(PeerError::NotApp(msg)) => {
+            assert!(
+                msg.contains("-67034") || msg.contains("code signature check failed"),
+                "unexpected NotApp message on replaced binary: {msg}"
+            );
+        }
+        Err(other) => panic!("unexpected error variant on replaced binary: {other:?}"),
+    }
 
     drop(stream_a);
     guard_a.wait();
