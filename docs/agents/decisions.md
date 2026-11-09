@@ -254,3 +254,9 @@ Pedro's Codex subscription has ended, so GPT-6.1 Sol and GPT-6 Astra are unavail
 
 ## D-047 — 2026-11-09 — Codex stays in M1; its live checks run on rodrigo's shift
 **Decided by Pedro (driver).** M1 keeps Home chat with Claude Code and Codex. The Codex adapter is built against the recorded fixtures on Pedro's shifts. The live checks (X1–X3: file-change approval, the question mode, the `ProviderGated` matrix) run on rodrigo's shift with their Codex login. They're required before the M1 gate.
+
+## D-048 — 2026-11-09 — Every UI task goes to Opus 5.5
+**Decided by Pedro (driver).** Any UI job (SolidJS app, Tauri windows and bridge, tokens and themes, UI harnesses and screenshots) is done by **Opus 5.5** as a Claude Code subagent, not Sonnet. This follows M0-06b, where design fidelity only came right with Opus (D-027).
+- In M1, that covers M1-09a (app shell) and M1-09b (Home chat, inbox, approvals, questions).
+- Reviewers stay cross-provider: Gemini 3.8 Flash or Argon, with screenshots as evidence.
+- At most one Opus UI worker at a time, besides the orchestrator.
