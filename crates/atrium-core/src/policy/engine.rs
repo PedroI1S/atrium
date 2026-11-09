@@ -10,10 +10,9 @@ use atrium_protocol::policy::{
 };
 use globset::GlobBuilder;
 
+use super::DefaultPolicy;
 use super::deny::{self, Analysis, Sensitive};
 use super::shell::Unit;
-use super::words::Role;
-use super::{DefaultPolicy, RedirectOp};
 use crate::{PolicyEngine, PolicyInput, PolicyVerdict};
 
 fn effective_kind(input: &PolicyInput<'_>) -> ToolKind {
@@ -48,7 +47,10 @@ fn all_paths(input: &PolicyInput<'_>, a: &Analysis) -> Vec<PathBuf> {
 
 fn name_matches(rule: &Rule, input: &PolicyInput<'_>) -> bool {
     rule.tool_kind == effective_kind(input)
-        && rule.tool_name.as_ref().is_none_or(|n| *n == input.check.name)
+        && rule
+            .tool_name
+            .as_ref()
+            .is_none_or(|n| *n == input.check.name)
 }
 
 fn scope_rank(r: &Rule, input: &PolicyInput<'_>) -> Option<u8> {
@@ -76,7 +78,12 @@ fn harmless(unit: &Unit) -> bool {
 
 /// Top-level simple commands of a parseable line.
 fn parts(a: &Analysis) -> Vec<usize> {
-    a.units.iter().enumerate().filter(|(_, u)| !u.derived).map(|(i, _)| i).collect()
+    a.units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| !u.derived)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Whether a deny rule matches anywhere in the call (loosely: through
@@ -88,7 +95,9 @@ fn deny_matches(rule: &Rule, input: &PolicyInput<'_>, a: &Analysis, paths: &[Pat
     match &rule.matcher {
         RuleMatcher::Any => path_scope_ok(rule, paths),
         RuleMatcher::CommandPrefix { argv } => {
-            a.units.iter().any(|u| prefix_of(&u.eff, argv) || prefix_of(&u.seg.argv, argv))
+            a.units
+                .iter()
+                .any(|u| prefix_of(&u.eff, argv) || prefix_of(&u.seg.argv, argv))
                 && path_scope_ok(rule, paths)
         }
         RuleMatcher::PathGlob { glob } => {
@@ -158,14 +167,20 @@ fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOut
     let mut covered = vec![false; n];
     let mut allow_rule: Option<RuleId> = None;
     for rank in 0..3u8 {
-        let ranked: Vec<&Rule> = rules.iter().filter(|r| scope_rank(r, input) == Some(rank)).collect();
+        let ranked: Vec<&Rule> = rules
+            .iter()
+            .filter(|r| scope_rank(r, input) == Some(rank))
+            .collect();
         if !covered.iter().all(|c| *c)
             && let Some(r) = ranked
                 .iter()
                 .find(|r| r.decision == RuleDecision::Deny && deny_matches(r, input, a, &paths))
         {
             return RuleOutcome {
-                deny: Some((Some(format!("denied by a rule ({:?})", r.matcher)), Some(r.id.clone()))),
+                deny: Some((
+                    Some(format!("denied by a rule ({:?})", r.matcher)),
+                    Some(r.id.clone()),
+                )),
                 covered,
                 allow_rule,
             };
@@ -180,7 +195,11 @@ fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOut
             }
         }
     }
-    RuleOutcome { deny: None, covered, allow_rule }
+    RuleOutcome {
+        deny: None,
+        covered,
+        allow_rule,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,14 +213,22 @@ fn forbidden_flag(entry: &ReadOnlyCommand, args: &[String]) -> bool {
         .filter(|f| f.len() == 2 && !f.starts_with("--"))
         .filter_map(|f| f.chars().nth(1))
         .collect();
-    let longs: Vec<&str> = entry.forbidden.iter().copied().filter(|f| f.starts_with("--")).collect();
+    let longs: Vec<&str> = entry
+        .forbidden
+        .iter()
+        .copied()
+        .filter(|f| f.starts_with("--"))
+        .collect();
     for a in args {
         if a == "--" {
             break;
         }
         if let Some(rest) = a.strip_prefix("--") {
             let name = format!("--{}", rest.split('=').next().unwrap_or(rest));
-            if longs.iter().any(|l| *l == name || (name.len() >= 3 && l.starts_with(&name))) {
+            if longs
+                .iter()
+                .any(|l| *l == name || (name.len() >= 3 && l.starts_with(&name)))
+            {
                 return true;
             }
         } else if a.starts_with('-') && a.len() > 1 && a[1..].chars().any(|c| shorts.contains(&c)) {
@@ -214,34 +241,136 @@ fn forbidden_flag(entry: &ReadOnlyCommand, args: &[String]) -> bool {
 const RG_BOOL_S: &str = "iSsnNHIlcovwxuaUFPq0pb";
 const RG_VAL_S: &str = "egtTmABCdjMEr";
 const RG_BOOL_L: &[&str] = &[
-    "hidden", "no-ignore", "no-ignore-vcs", "no-ignore-dot", "no-ignore-parent", "no-ignore-global",
-    "no-ignore-files", "no-messages", "no-heading", "heading", "line-number", "no-line-number",
-    "with-filename", "no-filename", "ignore-case", "smart-case", "case-sensitive", "count",
-    "count-matches", "files-with-matches", "files-without-match", "only-matching", "invert-match",
-    "word-regexp", "line-regexp", "fixed-strings", "multiline", "multiline-dotall", "text", "binary",
-    "unrestricted", "files", "type-list", "json", "column", "no-column", "vimgrep", "trim", "pretty",
-    "quiet", "stats", "null", "no-config", "version", "help", "pcre2", "no-pcre2", "crlf",
-    "include-zero", "byte-offset", "glob-case-insensitive", "no-glob-case-insensitive",
+    "hidden",
+    "no-ignore",
+    "no-ignore-vcs",
+    "no-ignore-dot",
+    "no-ignore-parent",
+    "no-ignore-global",
+    "no-ignore-files",
+    "no-messages",
+    "no-heading",
+    "heading",
+    "line-number",
+    "no-line-number",
+    "with-filename",
+    "no-filename",
+    "ignore-case",
+    "smart-case",
+    "case-sensitive",
+    "count",
+    "count-matches",
+    "files-with-matches",
+    "files-without-match",
+    "only-matching",
+    "invert-match",
+    "word-regexp",
+    "line-regexp",
+    "fixed-strings",
+    "multiline",
+    "multiline-dotall",
+    "text",
+    "binary",
+    "unrestricted",
+    "files",
+    "type-list",
+    "json",
+    "column",
+    "no-column",
+    "vimgrep",
+    "trim",
+    "pretty",
+    "quiet",
+    "stats",
+    "null",
+    "no-config",
+    "version",
+    "help",
+    "pcre2",
+    "no-pcre2",
+    "crlf",
+    "include-zero",
+    "byte-offset",
+    "glob-case-insensitive",
+    "no-glob-case-insensitive",
 ];
 const RG_VAL_L: &[&str] = &[
-    "regexp", "glob", "iglob", "type", "type-not", "max-count", "after-context", "before-context",
-    "context", "max-depth", "maxdepth", "threads", "max-columns", "encoding", "replace", "colors",
-    "color", "sort", "sortr", "max-filesize", "path-separator", "engine", "context-separator",
-    "type-add", "type-clear", "field-context-separator", "field-match-separator", "dfa-size-limit",
+    "regexp",
+    "glob",
+    "iglob",
+    "type",
+    "type-not",
+    "max-count",
+    "after-context",
+    "before-context",
+    "context",
+    "max-depth",
+    "maxdepth",
+    "threads",
+    "max-columns",
+    "encoding",
+    "replace",
+    "colors",
+    "color",
+    "sort",
+    "sortr",
+    "max-filesize",
+    "path-separator",
+    "engine",
+    "context-separator",
+    "type-add",
+    "type-clear",
+    "field-context-separator",
+    "field-match-separator",
+    "dfa-size-limit",
     "regex-size-limit",
 ];
 const GREP_BOOL_S: &str = "ivnclLoqswxhHEFGPaIrRzZbTUy0123456789";
 const GREP_VAL_S: &str = "emABCdD";
 const GREP_BOOL_L: &[&str] = &[
-    "ignore-case", "no-ignore-case", "invert-match", "line-number", "count", "files-with-matches",
-    "files-without-match", "only-matching", "quiet", "silent", "no-messages", "word-regexp",
-    "line-regexp", "no-filename", "with-filename", "extended-regexp", "fixed-strings",
-    "basic-regexp", "perl-regexp", "text", "null-data", "null", "byte-offset", "initial-tab",
-    "recursive", "dereference-recursive", "no-group-separator",
+    "ignore-case",
+    "no-ignore-case",
+    "invert-match",
+    "line-number",
+    "count",
+    "files-with-matches",
+    "files-without-match",
+    "only-matching",
+    "quiet",
+    "silent",
+    "no-messages",
+    "word-regexp",
+    "line-regexp",
+    "no-filename",
+    "with-filename",
+    "extended-regexp",
+    "fixed-strings",
+    "basic-regexp",
+    "perl-regexp",
+    "text",
+    "null-data",
+    "null",
+    "byte-offset",
+    "initial-tab",
+    "recursive",
+    "dereference-recursive",
+    "no-group-separator",
 ];
 const GREP_VAL_L: &[&str] = &[
-    "regexp", "max-count", "after-context", "before-context", "context", "directories", "devices",
-    "include", "exclude", "exclude-dir", "label", "color", "colour", "binary-files",
+    "regexp",
+    "max-count",
+    "after-context",
+    "before-context",
+    "context",
+    "directories",
+    "devices",
+    "include",
+    "exclude",
+    "exclude-dir",
+    "label",
+    "color",
+    "colour",
+    "binary-files",
     "group-separator",
 ];
 
@@ -287,7 +416,15 @@ fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
             if name == "regexp" {
                 have_pattern_flag = true;
             }
-            if matches!(name, "recursive" | "dereference-recursive" | "directories") || (!is_rg && name.len() >= 3 && ("recursive".starts_with(name) || "dereference-recursive".starts_with(name) || "directories".starts_with(name)) && !bl.contains(&name) && !vl.contains(&name)) {
+            if matches!(name, "recursive" | "dereference-recursive" | "directories")
+                || (!is_rg
+                    && name.len() >= 3
+                    && ("recursive".starts_with(name)
+                        || "dereference-recursive".starts_with(name)
+                        || "directories".starts_with(name))
+                    && !bl.contains(&name)
+                    && !vl.contains(&name))
+            {
                 recursive = true;
             }
             if vl.contains(&name) {
@@ -366,14 +503,19 @@ impl Home<'_> {
         {
             return false;
         }
-        if args.iter().any(|a| a.starts_with("--exec-path") || a.starts_with("--config-env")) {
+        if args
+            .iter()
+            .any(|a| a.starts_with("--exec-path") || a.starts_with("--config-env"))
+        {
             return false;
         }
         let is_rg = entry.prefix == ["rg"];
         match entry.recursion {
             Recursion::Never => true,
             Recursion::Always | Recursion::WithFlags(_) => {
-                let Some(s) = search_roots(is_rg, args) else { return false };
+                let Some(s) = search_roots(is_rg, args) else {
+                    return false;
+                };
                 if !s.recursive {
                     return true;
                 }
@@ -392,7 +534,9 @@ impl Home<'_> {
         let input = self.input;
         match &input.check.subject {
             ToolSubject::None => PolicyVerdict::Allow { rule: None },
-            ToolSubject::Paths { paths, recursive, .. } => match input.check.kind {
+            ToolSubject::Paths {
+                paths, recursive, ..
+            } => match input.check.kind {
                 ToolKind::Read => PolicyVerdict::Allow { rule: None },
                 ToolKind::Search => {
                     if *recursive {
@@ -439,19 +583,31 @@ impl PolicyEngine for DefaultPolicy {
         }
         let out = apply_rules(input, &a, rules);
         if let Some((reason, rule)) = out.deny {
-            return PolicyVerdict::Deny { reason: reason.unwrap_or_default(), rule };
+            return PolicyVerdict::Deny {
+                reason: reason.unwrap_or_default(),
+                rule,
+            };
         }
         let unknown = matches!(input.check.subject, ToolSubject::Unknown);
         let command = matches!(input.check.subject, ToolSubject::Command { .. });
-        if !unknown && out.covered.iter().all(|c| *c) && (command && !parts(&a).is_empty() || !command) {
-            return PolicyVerdict::Allow { rule: out.allow_rule };
+        if !unknown
+            && out.covered.iter().all(|c| *c)
+            && (command && !parts(&a).is_empty() || !command)
+        {
+            return PolicyVerdict::Allow {
+                rule: out.allow_rule,
+            };
         }
         if unknown {
             return PolicyVerdict::Ask;
         }
         match input.preset {
             Preset::Home | Preset::Normal | Preset::Trusted => {
-                let h = Home { input, a: &a, s: deny::sensitive(input) };
+                let h = Home {
+                    input,
+                    a: &a,
+                    s: deny::sensitive(input),
+                };
                 h.evaluate(&out.covered, out.allow_rule)
             }
             Preset::Careful => {
@@ -465,6 +621,3 @@ impl PolicyEngine for DefaultPolicy {
         }
     }
 }
-
-#[allow(dead_code)]
-fn _roles(_: Role, _: RedirectOp) {}

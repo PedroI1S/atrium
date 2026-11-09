@@ -9,9 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use atrium_agents::{ApprovalTicket, BoxFuture, ToolCheck};
 use atrium_protocol::agent::ApprovalDecision;
 use atrium_protocol::limits::MAX_PENDING_REQUESTS;
-use atrium_protocol::policy::{
-    RememberScope, Rule, RuleDecision, RuleId, RuleOrigin, RuleScope,
-};
+use atrium_protocol::policy::{RememberScope, Rule, RuleDecision, RuleId, RuleOrigin, RuleScope};
 use atrium_protocol::thread::ThreadId;
 use sha2::{Digest, Sha256};
 
@@ -19,7 +17,9 @@ use super::{Ledger, input_sha256};
 use crate::{ApprovalLedger, Binding, LedgerError, RequestKey, RequestStore};
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// The error for a transition that found `found` instead of what it needed.
@@ -33,7 +33,9 @@ fn refused(found: Option<&str>) -> LedgerError {
 
 impl Ledger {
     pub fn new(store: Arc<dyn RequestStore>) -> Self {
-        let salt = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let salt = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
         Self {
             store,
             open_lock: tokio::sync::Mutex::new(()),
@@ -43,11 +45,19 @@ impl Ledger {
     }
 
     fn new_request_id(&self) -> String {
-        format!("req_{:x}_{}", self.salt, self.counter.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "req_{:x}_{}",
+            self.salt,
+            self.counter.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     /// The stale / unknown-thread check shared by every entry point.
-    async fn check_incarnation(&self, key_thread: &ThreadId, incarnation: u32) -> Result<(), LedgerError> {
+    async fn check_incarnation(
+        &self,
+        key_thread: &ThreadId,
+        incarnation: u32,
+    ) -> Result<(), LedgerError> {
         match self.store.current_incarnation(key_thread).await {
             Ok(None) => Err(LedgerError::Unknown),
             Ok(Some(cur)) if incarnation < cur => Err(LedgerError::StaleIncarnation),
@@ -67,7 +77,11 @@ impl Ledger {
         self.check_incarnation(thread, incarnation).await?;
         // One opener at a time, so the limit can't be raced past.
         let _guard = self.open_lock.lock().await;
-        let open = self.store.open_count(thread, incarnation).await.map_err(|_| LedgerError::Store)?;
+        let open = self
+            .store
+            .open_count(thread, incarnation)
+            .await
+            .map_err(|_| LedgerError::Store)?;
         if open >= MAX_PENDING_REQUESTS as u64 {
             return Err(LedgerError::TooMany);
         }
@@ -76,13 +90,18 @@ impl Ledger {
             incarnation,
             request_id: self.new_request_id(),
         };
-        let rememberable = binding.as_ref().is_some_and(|b| b.remember_matcher.is_some());
+        let rememberable = binding
+            .as_ref()
+            .is_some_and(|b| b.remember_matcher.is_some());
         match &binding {
             Some(b) => self.store.open_approval(&key, b).await,
             None => self.store.open_question(&key, turn).await,
         }
         .map_err(|_| LedgerError::Store)?;
-        Ok(ApprovalTicket { request_id: key.request_id, rememberable })
+        Ok(ApprovalTicket {
+            request_id: key.request_id,
+            rememberable,
+        })
     }
 
     fn rule_id(key: &RequestKey) -> RuleId {
@@ -144,7 +163,11 @@ impl ApprovalLedger for Ledger {
                     let rule = match remember {
                         None => None,
                         Some(scope) => {
-                            let found = self.store.binding(&key).await.map_err(|_| LedgerError::Store)?;
+                            let found = self
+                                .store
+                                .binding(&key)
+                                .await
+                                .map_err(|_| LedgerError::Store)?;
                             let Some((status, binding)) = found else {
                                 return Err(LedgerError::Unknown);
                             };
@@ -154,7 +177,9 @@ impl ApprovalLedger for Ledger {
                             binding.remember_matcher.map(|matcher| Rule {
                                 id: Self::rule_id(&key),
                                 scope: match scope {
-                                    RememberScope::Thread => RuleScope::Thread { thread_id: key.thread.clone() },
+                                    RememberScope::Thread => RuleScope::Thread {
+                                        thread_id: key.thread.clone(),
+                                    },
                                     RememberScope::Home => RuleScope::Home,
                                     RememberScope::Global => RuleScope::Global,
                                 },
@@ -163,7 +188,9 @@ impl ApprovalLedger for Ledger {
                                 matcher,
                                 path_scope: None,
                                 decision: RuleDecision::Allow,
-                                origin: RuleOrigin::Approval { request_id: key.request_id.clone() },
+                                origin: RuleOrigin::Approval {
+                                    request_id: key.request_id.clone(),
+                                },
                                 created_at_ms: now_ms(),
                             })
                         }
@@ -199,12 +226,20 @@ impl ApprovalLedger for Ledger {
         })
     }
 
-    fn redeem(&self, key: &RequestKey, check: &ToolCheck) -> BoxFuture<'_, Result<(), LedgerError>> {
+    fn redeem(
+        &self,
+        key: &RequestKey,
+        check: &ToolCheck,
+    ) -> BoxFuture<'_, Result<(), LedgerError>> {
         let key = key.clone();
         let check = check.clone();
         Box::pin(async move {
             self.check_incarnation(&key.thread, key.incarnation).await?;
-            let found = self.store.binding(&key).await.map_err(|_| LedgerError::Store)?;
+            let found = self
+                .store
+                .binding(&key)
+                .await
+                .map_err(|_| LedgerError::Store)?;
             let Some((status, binding)) = found else {
                 return Err(LedgerError::Unknown);
             };
@@ -253,14 +288,20 @@ impl ApprovalLedger for Ledger {
     fn expire_turn(&self, thread: &ThreadId, incarnation: u32, turn: u32) -> BoxFuture<'_, u64> {
         let thread = thread.clone();
         Box::pin(async move {
-            self.store.expire(Some(&thread), Some(incarnation), Some(turn)).await.unwrap_or(0)
+            self.store
+                .expire(Some(&thread), Some(incarnation), Some(turn))
+                .await
+                .unwrap_or(0)
         })
     }
 
     fn expire_incarnation(&self, thread: &ThreadId, incarnation: u32) -> BoxFuture<'_, u64> {
         let thread = thread.clone();
         Box::pin(async move {
-            self.store.expire(Some(&thread), Some(incarnation), None).await.unwrap_or(0)
+            self.store
+                .expire(Some(&thread), Some(incarnation), None)
+                .await
+                .unwrap_or(0)
         })
     }
 

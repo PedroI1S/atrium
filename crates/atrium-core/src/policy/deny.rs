@@ -48,8 +48,15 @@ fn strings_of(v: &Value, out: &mut Vec<String>) {
 
 /// A string that looks like a single path (no whitespace, bounded).
 fn path_like(s: &str) -> bool {
-    !s.is_empty() && s.len() < 4096 && !s.contains(char::is_whitespace) && !s.contains('\0')
-        && (s.starts_with('/') || s.starts_with('~') || s.starts_with('$') || s.contains('/') || s.starts_with('.'))
+    !s.is_empty()
+        && s.len() < 4096
+        && !s.contains(char::is_whitespace)
+        && !s.contains('\0')
+        && (s.starts_with('/')
+            || s.starts_with('~')
+            || s.starts_with('$')
+            || s.contains('/')
+            || s.starts_with('.'))
 }
 
 pub fn analyze(input: &PolicyInput<'_>) -> Analysis {
@@ -85,7 +92,6 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
             word: word.to_string(),
             role,
             unit: usize::MAX,
-            cwd: CwdState::Known(input.cwd.to_path_buf()),
             paths: vec![resolve(word, input.cwd, home)],
         });
     };
@@ -170,7 +176,11 @@ impl Analysis {
 fn lower(p: &Path) -> String {
     let s = p.to_string_lossy().to_lowercase();
     let s = s.trim_end_matches('/');
-    if s.is_empty() { "/".into() } else { s.to_string() }
+    if s.is_empty() {
+        "/".into()
+    } else {
+        s.to_string()
+    }
 }
 
 /// `Some(rest)` when `p` is `base` or below it (`rest` is "" for equal).
@@ -236,7 +246,11 @@ impl Sensitive {
     pub fn new(input: &PolicyInput<'_>) -> Self {
         let home = lower(input.home);
         let data: Vec<String> = input.atrium_data_paths.iter().map(|p| lower(p)).collect();
-        let protected: Vec<String> = input.atrium_protected_paths.iter().map(|p| lower(p)).collect();
+        let protected: Vec<String> = input
+            .atrium_protected_paths
+            .iter()
+            .map(|p| lower(p))
+            .collect();
         let mut raw_forms = vec![];
         for rel in CRED_FILES.iter().chain(CRED_TREES.iter()) {
             for anchor in ["~/", "$home/", "${home}/"] {
@@ -247,7 +261,12 @@ impl Sensitive {
         for d in &data {
             raw_forms.push((d.clone(), "atrium-self"));
         }
-        Self { home, data, protected, raw_forms }
+        Self {
+            home,
+            data,
+            protected,
+            raw_forms,
+        }
     }
 
     /// The hard-deny entry hit by reading (or, for `Write`, writing) `p`.
@@ -266,7 +285,7 @@ impl Sensitive {
             }
         }
         let rest = under(&pl, &self.home)?;
-        if CRED_FILES.iter().any(|f| rest == *f) || CRED_TREES.iter().any(|t| under(rest, t).is_some()) {
+        if CRED_FILES.contains(&rest) || CRED_TREES.iter().any(|t| under(rest, t).is_some()) {
             return Some("credential-read");
         }
         if let Some(r) = under(rest, ".ssh")
@@ -364,13 +383,22 @@ impl Sensitive {
 
     /// Raw-text check: home-anchored credential paths and Atrium's data.
     fn raw_hit(&self, text: &str) -> Option<&'static str> {
-        let t: String = text.to_lowercase().chars().filter(|c| !matches!(c, '"' | '\'' | '\\')).collect();
+        let t: String = text
+            .to_lowercase()
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+            .collect();
         for (form, id) in &self.raw_forms {
             if t.contains(form.as_str()) {
                 return Some(id);
             }
         }
-        for anchor in ["~/.ssh/", "$home/.ssh/", "${home}/.ssh/", &format!("{}/.ssh/", self.home)] {
+        for anchor in [
+            "~/.ssh/",
+            "$home/.ssh/",
+            "${home}/.ssh/",
+            &format!("{}/.ssh/", self.home),
+        ] {
             let mut rest = t.as_str();
             while let Some(i) = rest.find(anchor) {
                 rest = &rest[i + anchor.len()..];
@@ -379,7 +407,10 @@ impl Sensitive {
                     .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '|' | '&' | ')' | '`'))
                     .collect();
                 if !name.is_empty()
-                    && !(name.ends_with(".pub") || name.starts_with("known_hosts") || name == "config" || name == "authorized_keys")
+                    && !(name.ends_with(".pub")
+                        || name.starts_with("known_hosts")
+                        || name == "config"
+                        || name == "authorized_keys")
                 {
                     return Some("credential-read");
                 }
@@ -422,15 +453,22 @@ fn is_interpreter(cmd: &str) -> bool {
     let b = base(cmd);
     is_shell(b)
         || b.starts_with("python")
-        || matches!(b, "perl" | "ruby" | "node" | "deno" | "bun" | "php" | "lua" | "osascript" | "pwsh")
+        || matches!(
+            b,
+            "perl" | "ruby" | "node" | "deno" | "bun" | "php" | "lua" | "osascript" | "pwsh"
+        )
 }
 
 fn reads_stdin_as_code(eff: &[String]) -> bool {
-    let Some(first) = eff.first() else { return false };
+    let Some(first) = eff.first() else {
+        return false;
+    };
     let b = base(first);
     let args = &eff[1..];
     if matches!(b, "source" | ".") {
-        return args.first().is_some_and(|a| matches!(a.as_str(), "/dev/stdin" | "/dev/fd/0" | "-"));
+        return args
+            .first()
+            .is_some_and(|a| matches!(a.as_str(), "/dev/stdin" | "/dev/fd/0" | "-"));
     }
     if b == "eval" || !is_interpreter(b) {
         return false;
@@ -459,10 +497,11 @@ fn is_executor(eff: &[String]) -> bool {
 }
 
 fn contains_downloader(body: &str) -> bool {
-    shell::lex(body)
-        .units
-        .iter()
-        .any(|u| u.eff.first().is_some_and(|f| DOWNLOADERS.contains(&base(f))))
+    shell::lex(body).units.iter().any(|u| {
+        u.eff
+            .first()
+            .is_some_and(|f| DOWNLOADERS.contains(&base(f)))
+    })
 }
 
 fn force_push(eff: &[String]) -> bool {
@@ -473,8 +512,16 @@ fn force_push(eff: &[String]) -> bool {
     let mut i = 1;
     while i < eff.len() {
         let w = eff[i].as_str();
-        if matches!(w, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" | "--config-env" | "--exec-path")
-        {
+        if matches!(
+            w,
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--config-env"
+                | "--exec-path"
+        ) {
             i += 2;
         } else if w.starts_with('-') {
             i += 1;
@@ -502,13 +549,11 @@ fn force_push(eff: &[String]) -> bool {
         } else if w.starts_with("--") {
             let name = w.split('=').next().unwrap_or(w);
             match name {
-                "--force" | "--force-with-lease" | "--force-if-includes" | "--mirror" => force = true,
-                "--all" | "--tags" | "--branches" | "--prune" => implicit = true,
-                "--repo" | "--push-option" | "--receive-pack" | "--exec" | "--signed" => {
-                    if !w.contains('=') && matches!(name, "--push-option" | "--receive-pack" | "--exec") {
-                        j += 1;
-                    }
+                "--force" | "--force-with-lease" | "--force-if-includes" | "--mirror" => {
+                    force = true
                 }
+                "--all" | "--tags" | "--branches" | "--prune" => implicit = true,
+                "--push-option" | "--receive-pack" | "--exec" if !w.contains('=') => j += 1,
                 _ => {}
             }
         } else {
@@ -520,7 +565,11 @@ fn force_push(eff: &[String]) -> bool {
             }
         }
     }
-    let refspecs: &[&str] = if positional.len() > 1 { &positional[1..] } else { &[] };
+    let refspecs: &[&str] = if positional.len() > 1 {
+        &positional[1..]
+    } else {
+        &[]
+    };
     let check = |spec: &str| -> bool {
         // true = blocked
         let s = spec.strip_prefix('+').unwrap_or(spec);
@@ -536,7 +585,8 @@ fn force_push(eff: &[String]) -> bool {
             None if dst.starts_with("refs/") => return true,
             None => dst,
         };
-        matches!(branch, "main" | "master" | "dev" | "develop" | "trunk") || branch.starts_with("release/")
+        matches!(branch, "main" | "master" | "dev" | "develop" | "trunk")
+            || branch.starts_with("release/")
     };
     if force {
         return implicit || refspecs.is_empty() || refspecs.iter().any(|s| check(s));
@@ -556,9 +606,7 @@ fn rm_recursive(eff: &[String]) -> Option<Vec<String>> {
             targets.push(w.clone());
         } else if w == "--" {
             dd = true;
-        } else if w == "--recursive" {
-            rec = true;
-        } else if !w.starts_with("--") && w[1..].contains(['r', 'R']) {
+        } else if w == "--recursive" || (!w.starts_with("--") && w[1..].contains(['r', 'R'])) {
             rec = true;
         }
     }
@@ -623,7 +671,12 @@ impl Ctx<'_> {
             }
         }
         if !found {
-            let cwd = self.a.unit_cwd.get(i).cloned().unwrap_or(CwdState::Known(self.a.start.clone()));
+            let cwd = self
+                .a
+                .unit_cwd
+                .get(i)
+                .cloned()
+                .unwrap_or(CwdState::Known(self.a.start.clone()));
             for c in cwd.candidates() {
                 out.push(lexical_resolve(word, c, self.home()));
             }
@@ -714,7 +767,12 @@ impl Ctx<'_> {
             }
         }
         // search globs that name credential files
-        if let ToolSubject::Paths { paths, glob: Some(g), recursive, .. } = &self.input.check.subject
+        if let ToolSubject::Paths {
+            paths,
+            glob: Some(g),
+            recursive,
+            ..
+        } = &self.input.check.subject
             && *recursive
         {
             hits.extend(self.search_glob_hit(paths, g));
@@ -727,7 +785,9 @@ impl Ctx<'_> {
             // privilege escalation
             if PRIV.contains(&b)
                 || (b == "osascript"
-                    && eff.iter().any(|w| w.to_lowercase().contains("administrator privileges")))
+                    && eff
+                        .iter()
+                        .any(|w| w.to_lowercase().contains("administrator privileges")))
             {
                 hits.push("privilege-escalation");
             }
@@ -735,7 +795,11 @@ impl Ctx<'_> {
             if b.starts_with("mkfs") || b == "mke2fs" {
                 hits.push("disk-wipe");
             }
-            if b == "dd" && eff.iter().any(|w| w.strip_prefix("of=").is_some_and(|v| self.is_device(i, v))) {
+            if b == "dd"
+                && eff
+                    .iter()
+                    .any(|w| w.strip_prefix("of=").is_some_and(|v| self.is_device(i, v)))
+            {
                 hits.push("disk-wipe");
             }
             if matches!(b, "shred" | "wipefs" | "blkdiscard")
@@ -746,14 +810,21 @@ impl Ctx<'_> {
             if b == "diskutil"
                 && eff.get(1).is_some_and(|s| {
                     let s = s.to_lowercase();
-                    s.starts_with("erase") || s.starts_with("reformat") || s.starts_with("partitiondisk")
-                        || s.starts_with("secureerase") || s.starts_with("zerodisk") || s.starts_with("randomdisk")
+                    s.starts_with("erase")
+                        || s.starts_with("reformat")
+                        || s.starts_with("partitiondisk")
+                        || s.starts_with("secureerase")
+                        || s.starts_with("zerodisk")
+                        || s.starts_with("randomdisk")
                 })
             {
                 hits.push("disk-wipe");
             }
             for r in &u.seg.redirects {
-                if r.op != super::RedirectOp::Read && r.op != super::RedirectOp::Dup && self.is_device(i, &r.target) {
+                if r.op != super::RedirectOp::Read
+                    && r.op != super::RedirectOp::Dup
+                    && self.is_device(i, &r.target)
+                {
                     hits.push("disk-wipe");
                 }
             }
@@ -810,8 +881,8 @@ impl Ctx<'_> {
     fn ssh_dir_hit(&self, u: &Use) -> bool {
         const LISTERS: &[&str] = &[
             "ls", "stat", "cd", "pushd", "popd", "pwd", "test", "[", "du", "dir", "readlink",
-            "realpath", "basename", "dirname", "echo", "printf", "chmod", "chown", "chgrp", "mkdir",
-            "rmdir",
+            "realpath", "basename", "dirname", "echo", "printf", "chmod", "chown", "chgrp",
+            "mkdir", "rmdir",
         ];
         match self.a.units.get(u.unit) {
             Some(unit) => unit
@@ -823,7 +894,13 @@ impl Ctx<'_> {
                 let k = self.input.check.kind;
                 u.role == Role::Write
                     || (k == ToolKind::Search
-                        && matches!(&self.input.check.subject, ToolSubject::Paths { recursive: true, .. }))
+                        && matches!(
+                            &self.input.check.subject,
+                            ToolSubject::Paths {
+                                recursive: true,
+                                ..
+                            }
+                        ))
             }
         }
     }
@@ -832,24 +909,41 @@ impl Ctx<'_> {
         self.target_paths(i, word).iter().any(|p| {
             let s = lower(p);
             s.starts_with("/dev/")
-                && !matches!(s.as_str(), "/dev/null" | "/dev/tty" | "/dev/stdout" | "/dev/stderr" | "/dev/stdin" | "/dev/zero")
+                && !matches!(
+                    s.as_str(),
+                    "/dev/null"
+                        | "/dev/tty"
+                        | "/dev/stdout"
+                        | "/dev/stderr"
+                        | "/dev/stdin"
+                        | "/dev/zero"
+                )
                 && !s.starts_with("/dev/fd/")
         })
     }
 
     fn search_glob_hit(&self, roots: &[String], glob: &str) -> Option<&'static str> {
-        let g = GlobBuilder::new(glob).literal_separator(false).build().ok()?.compile_matcher();
+        let g = GlobBuilder::new(glob)
+            .literal_separator(false)
+            .build()
+            .ok()?
+            .compile_matcher();
         let root_paths: Vec<PathBuf> = if roots.is_empty() {
             vec![self.input.cwd.to_path_buf()]
         } else {
-            roots.iter().map(|r| lexical_resolve(r, self.input.cwd, self.home())).collect()
+            roots
+                .iter()
+                .map(|r| lexical_resolve(r, self.input.cwd, self.home()))
+                .collect()
         };
         for probe in self.s.probes() {
             let pp = Path::new(&probe);
             let name = pp.file_name()?.to_string_lossy().to_string();
             if (g.is_match(&name) || g.is_match(&probe))
                 && self.s.hit(pp, Role::Read).is_some()
-                && root_paths.iter().any(|r| under(&probe, &lower(r)).is_some())
+                && root_paths
+                    .iter()
+                    .any(|r| under(&probe, &lower(r)).is_some())
             {
                 return self.s.hit(pp, Role::Read);
             }
@@ -868,7 +962,8 @@ fn raw_pipe_to_shell(t: &str) -> bool {
             let seg: &str = rest.split([';', '\n', '&']).next().unwrap_or("");
             if let Some((_, after)) = seg.split_once('|') {
                 let w: Vec<&str> = after.split_whitespace().collect();
-                let eff: Vec<String> = shell::unwrap(&w.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                let eff: Vec<String> =
+                    shell::unwrap(&w.iter().map(|s| s.to_string()).collect::<Vec<_>>());
                 if reads_stdin_as_code(&eff) {
                     return true;
                 }
@@ -880,9 +975,16 @@ fn raw_pipe_to_shell(t: &str) -> bool {
 
 /// The first `HARD_DENY_DEFAULTS` entry (in list order) that the call hits.
 pub fn hard_deny(input: &PolicyInput<'_>, a: &Analysis) -> Option<&'static str> {
-    let ctx = Ctx { input, a, s: Sensitive::new(input) };
+    let ctx = Ctx {
+        input,
+        a,
+        s: Sensitive::new(input),
+    };
     let hits = ctx.check();
-    HARD_DENY_DEFAULTS.iter().map(|d| d.id).find(|id| hits.contains(id))
+    HARD_DENY_DEFAULTS
+        .iter()
+        .map(|d| d.id)
+        .find(|id| hits.contains(id))
 }
 
 pub fn sensitive(input: &PolicyInput<'_>) -> Sensitive {

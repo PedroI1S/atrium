@@ -211,7 +211,11 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                         }
                         let l: String = chars[i..j].iter().collect();
                         i = (j + 1).min(chars.len());
-                        let t = if strip { l.trim_start_matches('\t') } else { l.as_str() };
+                        let t = if strip {
+                            l.trim_start_matches('\t')
+                        } else {
+                            l.as_str()
+                        };
                         if t == delim {
                             break;
                         }
@@ -269,7 +273,13 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             }
             '|' => {
                 let is_pipe = chars.get(i + 1) != Some(&'|');
-                i += if is_pipe && chars.get(i + 1) == Some(&'&') { 2 } else if is_pipe { 1 } else { 2 };
+                i += if is_pipe && chars.get(i + 1) == Some(&'&') {
+                    2
+                } else if is_pipe {
+                    1
+                } else {
+                    2
+                };
                 // Both ends of a pipeline are not in plain sequence.
                 cur.grouped |= is_pipe;
                 if is_pipe && cur.pipe == 0 {
@@ -359,7 +369,11 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                                 i += 1;
                                 break;
                             }
-                            '\\' if matches!(chars.get(i + 1), Some('$' | '`' | '"' | '\\' | '\n')) => {
+                            '\\' if matches!(
+                                chars.get(i + 1),
+                                Some('$' | '`' | '"' | '\\' | '\n')
+                            ) =>
+                            {
                                 if chars[i + 1] != '\n' {
                                     word.push(chars[i + 1]);
                                 }
@@ -554,7 +568,11 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         }
         match pending.take() {
             Some(Pending::Redirect(fd, op)) => {
-                cur.redirects.push(Redirect { fd, op: fix_dup(op, &word), target: word });
+                cur.redirects.push(Redirect {
+                    fd,
+                    op: fix_dup(op, &word),
+                    target: word,
+                });
             }
             Some(Pending::HereString) => {
                 out.reasons.push("here-string".into());
@@ -562,7 +580,8 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             None => {
                 if cur.argv.is_empty() && assign_name_end.is_some() {
                     let n = assign_name_end.unwrap_or(0);
-                    cur.assignments.push((word[..n].to_string(), word[n + 1..].to_string()));
+                    cur.assignments
+                        .push((word[..n].to_string(), word[n + 1..].to_string()));
                 } else {
                     cur.argv.push(word);
                 }
@@ -579,8 +598,21 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
 
     // Reserved words and wrappers; payloads become extra units.
     for b in raw_units {
-        let Builder { assignments, argv, redirects, subs, piped, grouped, pipe } = b;
-        let seg = Segment { assignments, argv, redirects, piped };
+        let Builder {
+            assignments,
+            argv,
+            redirects,
+            subs,
+            piped,
+            grouped,
+            pipe,
+        } = b;
+        let seg = Segment {
+            assignments,
+            argv,
+            redirects,
+            piped,
+        };
         let eff = unwrap(&seg.argv);
         if let Some(first) = seg.argv.first()
             && RESERVED.contains(&first.as_str())
@@ -600,7 +632,15 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             // reads the units.
         }
         let exec_roots = None;
-        let unit = Unit { seg, eff: eff.clone(), subs, grouped, exec_roots, derived, pipe };
+        let unit = Unit {
+            seg,
+            eff: eff.clone(),
+            subs,
+            grouped,
+            exec_roots,
+            derived,
+            pipe,
+        };
         out.units.push(unit);
         if eff.first().map(|s| base(s)) == Some("find") {
             find_exec_units(&eff, &mut out.units);
@@ -665,7 +705,11 @@ fn lex_redirect(
         }
         let mut delim = String::new();
         let mut quoted = false;
-        while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>')
+        while i < chars.len()
+            && !matches!(
+                chars[i],
+                ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>'
+            )
         {
             match chars[i] {
                 '\'' | '"' | '\\' => quoted = true,
@@ -740,7 +784,11 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                 let j = skip(&a, &["-s", "-k"], &[]);
                 (j + 1).min(a.len())
             }
-            "xargs" => skip(&a, &["-n", "-P", "-I", "-L", "-s", "-d", "-a", "-E", "-J"], &[]),
+            "xargs" => skip(
+                &a,
+                &["-n", "-P", "-I", "-L", "-s", "-d", "-a", "-E", "-J"],
+                &[],
+            ),
             "env" => {
                 let mut j = 1;
                 while j < a.len() {
@@ -760,9 +808,7 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                         } else {
                             j += 1;
                         }
-                    } else if w.starts_with('-') && w.len() > 1 {
-                        j += 1;
-                    } else if is_assignment_word(w) {
+                    } else if (w.starts_with('-') && w.len() > 1) || is_assignment_word(w) {
                         j += 1;
                     } else {
                         break;
@@ -788,7 +834,9 @@ fn is_assignment_word(w: &str) -> bool {
     w.split_once('=').is_some_and(|(n, _)| is_name(n))
 }
 
-const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"];
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh",
+];
 
 pub fn is_shell(cmd: &str) -> bool {
     SHELLS.contains(&base(cmd))
@@ -815,7 +863,11 @@ fn payload_of(eff: &[String]) -> Option<String> {
         }
         None
     } else if first == "eval" {
-        if eff.len() > 1 { Some(eff[1..].join(" ")) } else { None }
+        if eff.len() > 1 {
+            Some(eff[1..].join(" "))
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -849,7 +901,12 @@ fn find_exec_units(eff: &[String], units: &mut Vec<Unit>) {
             if !argv.is_empty() {
                 let e = unwrap(&argv);
                 units.push(Unit {
-                    seg: Segment { assignments: vec![], argv, redirects: vec![], piped: false },
+                    seg: Segment {
+                        assignments: vec![],
+                        argv,
+                        redirects: vec![],
+                        piped: false,
+                    },
                     eff: e,
                     subs: vec![],
                     grouped: true,

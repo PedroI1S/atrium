@@ -139,11 +139,18 @@ pub fn parse_command(line: &str, cwd: &std::path::Path) -> ParsedCommand {
     let _ = cwd;
     let lexed = shell::lex(line);
     if !lexed.reasons.is_empty() {
-        return ParsedCommand::Unparseable { reason: lexed.reasons.join(", ") };
+        return ParsedCommand::Unparseable {
+            reason: lexed.reasons.join(", "),
+        };
     }
     // Top-level commands only: payloads are the hard-deny list's business.
     ParsedCommand::Segments(
-        lexed.units.into_iter().filter(|u| !u.derived).map(|u| u.seg).collect(),
+        lexed
+            .units
+            .into_iter()
+            .filter(|u| !u.derived)
+            .map(|u| u.seg)
+            .collect(),
     )
 }
 

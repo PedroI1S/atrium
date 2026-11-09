@@ -39,7 +39,6 @@ pub struct Use {
     pub word: String,
     pub role: Role,
     pub unit: usize,
-    pub cwd: CwdState,
     /// One resolution per cwd candidate.
     pub paths: Vec<PathBuf>,
 }
@@ -52,29 +51,48 @@ pub struct Walk {
     pub total: usize,
 }
 
-impl Walk {
-    pub fn flat(&self) -> Vec<PathBuf> {
-        self.uses.iter().flat_map(|u| u.paths.iter().cloned()).collect()
-    }
-}
-
 pub type Resolver<'a> = &'a dyn Fn(&str, &Path, &Path) -> PathBuf;
 
 const WRITERS: &[&str] = &[
-    "rm", "mv", "cp", "tee", "touch", "chmod", "chown", "chgrp", "ln", "truncate", "install",
-    "mkdir", "rmdir", "rsync", "unlink", "shred", "patch", "ed", "ex", "wipefs", "blkdiscard",
+    "rm",
+    "mv",
+    "cp",
+    "tee",
+    "touch",
+    "chmod",
+    "chown",
+    "chgrp",
+    "ln",
+    "truncate",
+    "install",
+    "mkdir",
+    "rmdir",
+    "rsync",
+    "unlink",
+    "shred",
+    "patch",
+    "ed",
+    "ex",
+    "wipefs",
+    "blkdiscard",
 ];
 
 /// Whether this command writes to (some of) the paths in its arguments.
 pub fn is_writer(eff: &[String]) -> bool {
-    let Some(first) = eff.first() else { return false };
+    let Some(first) = eff.first() else {
+        return false;
+    };
     let b = base(first);
     if WRITERS.contains(&b) {
         return true;
     }
     match b {
-        "sed" => eff.iter().skip(1).any(|a| a == "-i" || a.starts_with("-i") && !a.starts_with("--") || a.starts_with("--in-place")),
-        "perl" => eff.iter().skip(1).any(|a| a.starts_with("-i") || (a.starts_with('-') && !a.starts_with("--") && a.contains('i'))),
+        "sed" => eff.iter().skip(1).any(|a| {
+            a == "-i" || a.starts_with("-i") && !a.starts_with("--") || a.starts_with("--in-place")
+        }),
+        "perl" => eff.iter().skip(1).any(|a| {
+            a.starts_with("-i") || (a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
+        }),
         _ => false,
     }
 }
@@ -187,6 +205,7 @@ fn words_of(unit: &Unit) -> Vec<(String, Role)> {
 }
 
 /// Applies a `cd`-like command to the tracked directory.
+#[allow(clippy::too_many_arguments)]
 fn apply_cd(
     unit: &Unit,
     state: &mut CwdState,
@@ -197,7 +216,9 @@ fn apply_cd(
     resolve: Resolver<'_>,
     unknown: &mut bool,
 ) {
-    let Some(first) = unit.eff.first() else { return };
+    let Some(first) = unit.eff.first() else {
+        return;
+    };
     let name = base(first);
     if !matches!(name, "cd" | "pushd" | "popd" | "chdir") {
         return;
@@ -267,9 +288,23 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
                 .map(|c| resolve(&word, c, home))
                 .collect();
             w.total += paths.len();
-            w.uses.push(Use { word, role, unit: i, cwd: state.clone(), paths });
+            w.uses.push(Use {
+                word,
+                role,
+                unit: i,
+                paths,
+            });
         }
-        apply_cd(unit, &mut state, &mut prev, &mut seen, start, home, resolve, &mut w.unknown);
+        apply_cd(
+            unit,
+            &mut state,
+            &mut prev,
+            &mut seen,
+            start,
+            home,
+            resolve,
+            &mut w.unknown,
+        );
     }
     w
 }

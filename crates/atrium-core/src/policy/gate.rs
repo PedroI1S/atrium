@@ -13,7 +13,7 @@ use atrium_protocol::policy::{
 };
 use atrium_protocol::thread::ThreadId;
 
-use super::deny::{self, Analysis};
+use super::deny;
 use super::shell;
 use super::words::{expand_home, normalize};
 use super::{SessionGate, input_sha256};
@@ -55,7 +55,11 @@ const MAX_HOPS: u8 = 40;
 pub fn fs_resolve(word: &str, cwd: &Path, home: &Path) -> PathBuf {
     let w = expand_home(word, home, cwd);
     let p = Path::new(&w);
-    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
     resolve_fs(&abs, 0)
 }
 
@@ -125,7 +129,6 @@ fn deny_reason(id: &str) -> String {
 
 pub struct Evaluated {
     pub verdict: PolicyVerdict,
-    pub analysis: Analysis,
     pub resolved: Vec<PathBuf>,
 }
 
@@ -137,7 +140,14 @@ impl SessionGate {
         rules: Arc<dyn RulesSource>,
     ) -> Self {
         let preset = Mutex::new(config.preset);
-        Self { config, preset, policy, ledger, rules, opened: Mutex::new(HashMap::new()) }
+        Self {
+            config,
+            preset,
+            policy,
+            ledger,
+            rules,
+            opened: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Changes the preset for later checks. Approvals opened under another
@@ -172,7 +182,7 @@ impl SessionGate {
         }
         input.resolved_paths = &resolved;
         let verdict = self.policy.evaluate(&input, rules);
-        Evaluated { verdict, analysis, resolved }
+        Evaluated { verdict, resolved }
     }
 
     /// The rule "always…" would create (contract §5, `SessionGate` docs).
@@ -190,17 +200,25 @@ impl SessionGate {
                 {
                     return None;
                 }
-                Some(RuleMatcher::CommandPrefix { argv: u.seg.argv.clone() })
+                Some(RuleMatcher::CommandPrefix {
+                    argv: u.seg.argv.clone(),
+                })
             }
             ToolSubject::Paths { paths, .. } => {
                 let file_tool = matches!(
                     check.kind,
-                    ToolKind::Read | ToolKind::Edit | ToolKind::Delete | ToolKind::Move | ToolKind::Search
+                    ToolKind::Read
+                        | ToolKind::Edit
+                        | ToolKind::Delete
+                        | ToolKind::Move
+                        | ToolKind::Search
                 );
                 if !file_tool || paths.len() != 1 || e.resolved.len() != 1 {
                     return None;
                 }
-                Some(RuleMatcher::PathGlob { glob: escape_glob(&e.resolved[0]) })
+                Some(RuleMatcher::PathGlob {
+                    glob: escape_glob(&e.resolved[0]),
+                })
             }
             _ => None,
         }
@@ -212,10 +230,17 @@ impl SessionGate {
         let e = self.evaluate(check, &rules, preset);
         match &e.verdict {
             PolicyVerdict::Allow { .. } => Ok(GateDecision::Allow),
-            PolicyVerdict::Deny { reason, .. } => Ok(GateDecision::Deny { reason: reason.clone() }),
-            PolicyVerdict::HardDeny { id } => Ok(GateDecision::Deny { reason: deny_reason(id) }),
+            PolicyVerdict::Deny { reason, .. } => Ok(GateDecision::Deny {
+                reason: reason.clone(),
+            }),
+            PolicyVerdict::HardDeny { id } => Ok(GateDecision::Deny {
+                reason: deny_reason(id),
+            }),
             PolicyVerdict::Ask => {
-                let context = PolicyContext { rules_revision: rev, preset };
+                let context = PolicyContext {
+                    rules_revision: rev,
+                    preset,
+                };
                 let binding = Binding {
                     turn: check.turn,
                     tool_name: check.name.clone(),
@@ -239,7 +264,11 @@ impl SessionGate {
         }
     }
 
-    async fn do_redeem(&self, ticket: &ApprovalTicket, check: &ToolCheck) -> Result<GateDecision, String> {
+    async fn do_redeem(
+        &self,
+        ticket: &ApprovalTicket,
+        check: &ToolCheck,
+    ) -> Result<GateDecision, String> {
         let key = RequestKey {
             thread: self.config.thread.clone(),
             incarnation: self.config.incarnation,
@@ -268,7 +297,9 @@ impl SessionGate {
         match e.verdict {
             PolicyVerdict::HardDeny { id } => {
                 let _ = self.ledger.withdraw(&key).await;
-                return Ok(GateDecision::Deny { reason: deny_reason(id) });
+                return Ok(GateDecision::Deny {
+                    reason: deny_reason(id),
+                });
             }
             PolicyVerdict::Deny { reason, .. } => {
                 let _ = self.ledger.withdraw(&key).await;
@@ -276,7 +307,10 @@ impl SessionGate {
             }
             PolicyVerdict::Allow { .. } | PolicyVerdict::Ask => {}
         }
-        self.ledger.redeem(&key, check).await.map_err(|e| e.to_string())?;
+        self.ledger
+            .redeem(&key, check)
+            .await
+            .map_err(|e| e.to_string())?;
         if let Ok(mut m) = self.opened.lock() {
             m.remove(&ticket.request_id);
         }
@@ -293,7 +327,11 @@ impl ToolGate for SessionGate {
         })
     }
 
-    fn redeem<'a>(&'a self, ticket: &'a ApprovalTicket, check: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+    fn redeem<'a>(
+        &'a self,
+        ticket: &'a ApprovalTicket,
+        check: &'a ToolCheck,
+    ) -> BoxFuture<'a, GateDecision> {
         Box::pin(async move {
             self.do_redeem(ticket, check)
                 .await
