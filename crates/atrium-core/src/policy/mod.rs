@@ -1,27 +1,75 @@
 //! Policy engine, command parsing and the approval ledger (contract §5, §9).
 //! **Owned by M1-03.** Public items named in `lib.rs` are contract.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 use atrium_agents::ToolCheck;
 use atrium_protocol::agent::ToolKind;
+use atrium_protocol::policy::{PolicyContext, Preset};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{ApprovalLedger, PolicyEngine, RequestStore};
+
+mod deny;
+mod engine;
+mod gate;
+mod ledger;
+mod shell;
+mod words;
+
+pub use gate::{RulesSource, SessionGateConfig, StoreRules, fs_resolve};
 
 /// Canonical bytes of a tool call's input for binding approvals: JSON with
 /// object keys sorted, no insignificant whitespace, numbers as serde_json
 /// prints them, prefixed by `kind` and `name`. Two calls hash equal iff an
 /// approval for one may authorize the other.
 pub fn canonical_input(kind: ToolKind, name: &str, input: &Value) -> Vec<u8> {
-    let _ = (kind, name, input);
-    unimplemented!("M1-03")
+    fn write(v: &Value, out: &mut String) {
+        match v {
+            Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, k) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Value::String(k.clone()).to_string());
+                    out.push(':');
+                    write(&m[k], out);
+                }
+                out.push('}');
+            }
+            Value::Array(a) => {
+                out.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(x, out);
+                }
+                out.push(']');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+    let kind = serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let mut body = String::new();
+    write(input, &mut body);
+    // Length-prefixed, so `kind`/`name`/input can't run into one another.
+    format!("{}:{kind}\n{}:{name}\n{body}", kind.len(), name.len()).into_bytes()
 }
 
 /// Lowercase hex SHA-256 of [`canonical_input`].
 pub fn input_sha256(check: &ToolCheck) -> String {
-    let _ = check;
-    unimplemented!("M1-03")
+    let digest = Sha256::digest(canonical_input(check.kind, &check.name, &check.input));
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A shell command line, as rules see it (contract §9). Separators are `;`,
@@ -84,9 +132,19 @@ impl Redirect {
     }
 }
 
+/// Parses a shell line into simple commands. `Unparseable` for anything a
+/// rule must not trust: substitution, globs, `$` expansion, brace expansion,
+/// backgrounding, here-docs, subshells and compound commands.
 pub fn parse_command(line: &str, cwd: &std::path::Path) -> ParsedCommand {
-    let _ = (line, cwd);
-    unimplemented!("M1-03")
+    let _ = cwd;
+    let lexed = shell::lex(line);
+    if !lexed.reasons.is_empty() {
+        return ParsedCommand::Unparseable { reason: lexed.reasons.join(", ") };
+    }
+    // Top-level commands only: payloads are the hard-deny list's business.
+    ParsedCommand::Segments(
+        lexed.units.into_iter().filter(|u| !u.derived).map(|u| u.seg).collect(),
+    )
 }
 
 /// The default [`PolicyEngine`]: hard-deny defaults, rules, presets.
@@ -95,50 +153,39 @@ pub struct DefaultPolicy {
     _private: (),
 }
 
-/// The ledger over a [`crate::RequestStore`].
-pub struct Ledger {
-    _store: Arc<dyn RequestStore>,
-}
-
-impl Ledger {
-    pub fn new(store: Arc<dyn RequestStore>) -> Self {
-        Self { _store: store }
+impl DefaultPolicy {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
+/// The ledger over a [`crate::RequestStore`].
+pub struct Ledger {
+    store: Arc<dyn RequestStore>,
+    open_lock: tokio::sync::Mutex<()>,
+    counter: AtomicU64,
+    salt: u64,
+}
+
 /// One session's [`atrium_agents::ToolGate`]: evaluates the policy, opens and
-/// redeems ledger entries. Built by the daemon for each incarnation.
+/// redeems ledger entries. Built by the daemon for each incarnation with
+/// [`SessionGate::new`].
 ///
 /// - `check`: resolves paths (deepest existing ancestor canonicalized, the
 ///   rest appended; this is the gate's only filesystem access), evaluates
 ///   the policy, and for `Ask` computes the "always…" matcher and opens the
 ///   ledger entry. Any internal error → `Deny` (fail closed).
-///   - Paths resolved: a `Paths` subject's paths; for a command, of every
-///     segment: every argument, the value part of every `--flag=value`,
-///     `-X=value`, attached short-flag value (`-Xvalue`) and `key=value`
-///     operand, every assignment's value, and every redirect target except
-///     a `Dup` fd. Over-resolving is safe: it can only make a call ask or
-///     be blocked.
-///   - The cwd starts as `ToolSubject::Command.cwd` (or the thread's). For
-///     later segments: `cd <literal>` and `pushd <literal>` move it, a bare
-///     `cd` goes to `home`, `cd -` returns to the previous known cwd. Any
-///     other change (`cd $X`, `popd`, `cd -` with no earlier `cd`) makes
-///     the cwd unknown: the line asks, relative paths are checked for hard
-///     deny against `home`, the starting cwd and every cwd seen so far, and
-///     a recursive delete of a relative path is blocked
-///     (`recursive-delete-outside-cwd`).
-///   - "Always…" matcher: one simple command with no assignments, harmless
-///     redirects only and no `$`, globs or braces → `CommandPrefix` of its
-///     argv; a file tool with exactly one path → `PathGlob` of that resolved
-///     path with glob metacharacters escaped; anything else → none (not
-///     rememberable).
-/// - `redeem`: rebuilds the binding from the given check and re-resolves its
-///   paths; always re-checks the hard-deny list (a symlink may have been
-///   swapped since the approval); if the rules revision or preset changed,
-///   re-evaluates the whole policy (excluding the rule this approval itself
-///   created); refuses on `Deny`/`HardDeny`; then calls the ledger's
-///   `redeem`. Anything but success → `Deny`.
+/// - `redeem`: re-resolves the call's paths, always re-checks the hard-deny
+///   list (a symlink may have been swapped since the approval), re-evaluates
+///   the policy without the rule this approval itself created, refuses on
+///   `Deny`/`HardDeny`, then calls the ledger's `redeem`. Anything but
+///   success → `Deny`.
 pub struct SessionGate {
-    _policy: Arc<dyn PolicyEngine>,
-    _ledger: Arc<dyn ApprovalLedger>,
+    config: SessionGateConfig,
+    preset: Mutex<Preset>,
+    policy: Arc<dyn PolicyEngine>,
+    ledger: Arc<dyn ApprovalLedger>,
+    rules: Arc<dyn RulesSource>,
+    /// The policy context each open ticket was evaluated under.
+    opened: Mutex<HashMap<String, PolicyContext>>,
 }

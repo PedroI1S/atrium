@@ -17,6 +17,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+sha2 = "0.10" # M1-03
+globset = "0.4" # M1-03
 
 [lints]
 workspace = true

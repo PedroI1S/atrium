@@ -1,0 +1,865 @@
+//! A tolerant shell lexer: one pass that yields simple commands (argv,
+//! assignments, redirects) and notes everything a rule must not trust
+//! (substitution, globs, expansion, backgrounding, here-docs, subshells).
+//! The hard-deny list reads the same output but looks inside substitutions
+//! and payloads (`sh -c`, `eval`, `find -exec`) too.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use super::{Redirect, RedirectOp, Segment};
+
+const MAX_DEPTH: u8 = 6;
+
+/// One simple command, plus what the lexer saw inside it.
+#[derive(Debug, Clone)]
+pub struct Unit {
+    pub seg: Segment,
+    /// argv after reserved words and wrappers (`env`, `command`, `exec`, …).
+    pub eff: Vec<String>,
+    /// Command and process substitution bodies found in this command.
+    pub subs: Vec<String>,
+    /// Inside parentheses, a pipeline, or otherwise not in plain sequence:
+    /// a `cd` here makes the working directory unknown.
+    pub grouped: bool,
+    /// For `find … -exec CMD {} …`: the directories `find` walks.
+    pub exec_roots: Option<Vec<String>>,
+    /// Produced by a payload or substitution, not written at top level.
+    pub derived: bool,
+    /// Non-zero: the units sharing this number are one pipeline.
+    pub pipe: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Lexed {
+    pub units: Vec<Unit>,
+    /// Why rules and Home's read-only list must not allow the line.
+    pub reasons: Vec<String>,
+}
+
+struct Builder {
+    assignments: Vec<(String, String)>,
+    argv: Vec<String>,
+    redirects: Vec<Redirect>,
+    subs: Vec<String>,
+    piped: bool,
+    grouped: bool,
+    pipe: u32,
+}
+
+static PIPE_IDS: AtomicU32 = AtomicU32::new(1);
+
+impl Builder {
+    fn new(piped: bool, grouped: bool) -> Self {
+        Self {
+            pipe: 0,
+            assignments: vec![],
+            argv: vec![],
+            redirects: vec![],
+            subs: vec![],
+            piped,
+            grouped,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.assignments.is_empty() && self.argv.is_empty() && self.redirects.is_empty()
+    }
+}
+
+enum Pending {
+    Redirect(u32, RedirectOp),
+    HereString,
+}
+
+fn is_name(s: &str) -> bool {
+    let mut it = s.chars();
+    match it.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `start` is just after the opening delimiter; returns the body and the
+/// index just past the matching `)`.
+fn scan_paren(chars: &[char], start: usize) -> (String, usize, bool) {
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            '\'' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    i += 1;
+                }
+            }
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (chars[start..i].iter().collect(), i + 1, true);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (chars[start..].iter().collect(), chars.len(), false)
+}
+
+fn scan_backtick(chars: &[char], start: usize) -> (String, usize, bool) {
+    let mut i = start;
+    let mut body = String::new();
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                body.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            '`' => return (body, i + 1, true),
+            c => body.push(c),
+        }
+        i += 1;
+    }
+    (body, chars.len(), false)
+}
+
+/// Substitution bodies in text that is expanded but not word-split (here-doc
+/// bodies, `$((…))`).
+fn find_substitutions(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && chars.get(i + 1) == Some(&'(') {
+            let (body, end, _) = scan_paren(&chars, i + 2);
+            out.push(body);
+            i = end;
+        } else if chars[i] == '`' {
+            let (body, end, _) = scan_backtick(&chars, i + 1);
+            out.push(body);
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+pub fn lex(line: &str) -> Lexed {
+    lex_depth(line, 0, false)
+}
+
+fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
+    let mut out = Lexed::default();
+    if depth > MAX_DEPTH {
+        out.reasons.push("nested too deeply".into());
+        return out;
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0usize;
+    let mut cur = Builder::new(false, false);
+    let mut paren_depth = 0usize;
+    let mut pending: Option<Pending> = None;
+    let mut heredocs: Vec<(String, bool, bool)> = vec![];
+    let mut raw_units: Vec<Builder> = vec![];
+
+    macro_rules! flush {
+        () => {{
+            let b = std::mem::replace(&mut cur, Builder::new(false, paren_depth > 0));
+            if !b.is_empty() {
+                raw_units.push(b);
+            }
+        }};
+    }
+
+    while i < chars.len() {
+        let c = chars[i];
+        // Separators and whitespace.
+        match c {
+            ' ' | '\t' | '\r' => {
+                i += 1;
+                continue;
+            }
+            '\\' if chars.get(i + 1) == Some(&'\n') => {
+                i += 2;
+                continue;
+            }
+            '\n' => {
+                i += 1;
+                flush!();
+                // Here-doc bodies start on the next line.
+                for (delim, strip, quoted) in std::mem::take(&mut heredocs) {
+                    let mut body = String::new();
+                    loop {
+                        if i >= chars.len() {
+                            break;
+                        }
+                        let mut j = i;
+                        while j < chars.len() && chars[j] != '\n' {
+                            j += 1;
+                        }
+                        let l: String = chars[i..j].iter().collect();
+                        i = (j + 1).min(chars.len());
+                        let t = if strip { l.trim_start_matches('\t') } else { l.as_str() };
+                        if t == delim {
+                            break;
+                        }
+                        body.push_str(&l);
+                        body.push('\n');
+                    }
+                    if !quoted {
+                        for sub in find_substitutions(&body) {
+                            if let Some(last) = raw_units.last_mut() {
+                                last.subs.push(sub);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            ';' => {
+                i += if chars.get(i + 1) == Some(&';') { 2 } else { 1 };
+                flush!();
+                continue;
+            }
+            '(' | ')' => {
+                if c == '(' {
+                    paren_depth += 1;
+                } else {
+                    paren_depth = paren_depth.saturating_sub(1);
+                }
+                out.reasons.push("subshell".into());
+                i += 1;
+                flush!();
+                cur.grouped = paren_depth > 0;
+                continue;
+            }
+            '&' if chars.get(i + 1) == Some(&'&') => {
+                i += 2;
+                flush!();
+                continue;
+            }
+            '&' if chars.get(i + 1) == Some(&'>') => {
+                // `&>` / `&>>`
+                let (op, n) = if chars.get(i + 2) == Some(&'>') {
+                    (RedirectOp::Append, 3)
+                } else {
+                    (RedirectOp::Write, 2)
+                };
+                i += n;
+                pending = Some(Pending::Redirect(1, op));
+                continue;
+            }
+            '&' => {
+                out.reasons.push("backgrounding".into());
+                i += 1;
+                flush!();
+                continue;
+            }
+            '|' => {
+                let is_pipe = chars.get(i + 1) != Some(&'|');
+                i += if is_pipe && chars.get(i + 1) == Some(&'&') { 2 } else if is_pipe { 1 } else { 2 };
+                // Both ends of a pipeline are not in plain sequence.
+                cur.grouped |= is_pipe;
+                if is_pipe && cur.pipe == 0 {
+                    cur.pipe = PIPE_IDS.fetch_add(1, Ordering::Relaxed);
+                }
+                let id = cur.pipe;
+                flush!();
+                if is_pipe {
+                    cur.piped = true;
+                    cur.grouped = true;
+                    cur.pipe = id;
+                }
+                continue;
+            }
+            '#' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        // Redirection operators (with an optional leading fd number).
+        if c == '<' || c == '>' {
+            if chars.get(i + 1) == Some(&'(') {
+                // process substitution: handled as part of a word below
+            } else {
+                let fd_default = if c == '<' { 0 } else { 1 };
+                i = lex_redirect(&chars, i, fd_default, &mut pending, &mut heredocs, &mut out);
+                continue;
+            }
+        }
+
+        // A word.
+        let mut word = String::new();
+        let mut unq_glob = false;
+        let mut brace = false;
+        let mut expansion = false;
+        let mut quoted_prefix_empty = true; // no quote seen before first char
+        let mut assign_name_end: Option<usize> = None;
+        let start_i = i;
+        while i < chars.len() {
+            let c = chars[i];
+            match c {
+                ' ' | '\t' | '\r' | '\n' | ';' | '&' | '|' | '(' | ')' => break,
+                '<' | '>' if chars.get(i + 1) != Some(&'(') => {
+                    // `2>file`: digits directly before a redirect are the fd.
+                    break;
+                }
+                '\\' => {
+                    if let Some(n) = chars.get(i + 1) {
+                        if *n != '\n' {
+                            word.push(*n);
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    quoted_prefix_empty = false;
+                }
+                '\'' => {
+                    i += 1;
+                    quoted_prefix_empty = false;
+                    let mut closed = false;
+                    while i < chars.len() {
+                        if chars[i] == '\'' {
+                            closed = true;
+                            i += 1;
+                            break;
+                        }
+                        word.push(chars[i]);
+                        i += 1;
+                    }
+                    if !closed {
+                        out.reasons.push("unterminated quote".into());
+                    }
+                }
+                '"' => {
+                    i += 1;
+                    quoted_prefix_empty = false;
+                    let mut closed = false;
+                    while i < chars.len() {
+                        match chars[i] {
+                            '"' => {
+                                closed = true;
+                                i += 1;
+                                break;
+                            }
+                            '\\' if matches!(chars.get(i + 1), Some('$' | '`' | '"' | '\\' | '\n')) => {
+                                if chars[i + 1] != '\n' {
+                                    word.push(chars[i + 1]);
+                                }
+                                i += 2;
+                            }
+                            '$' if chars.get(i + 1) == Some(&'(') => {
+                                let (body, end, ok) = scan_paren(&chars, i + 2);
+                                if !ok {
+                                    out.reasons.push("unterminated substitution".into());
+                                }
+                                word.push_str("$(");
+                                word.push_str(&body);
+                                word.push(')');
+                                cur.subs.push(body);
+                                expansion = true;
+                                i = end;
+                            }
+                            '`' => {
+                                let (body, end, ok) = scan_backtick(&chars, i + 1);
+                                if !ok {
+                                    out.reasons.push("unterminated substitution".into());
+                                }
+                                word.push('`');
+                                word.push_str(&body);
+                                word.push('`');
+                                cur.subs.push(body);
+                                expansion = true;
+                                i = end;
+                            }
+                            '$' => {
+                                expansion = true;
+                                word.push('$');
+                                i += 1;
+                            }
+                            ch => {
+                                word.push(ch);
+                                i += 1;
+                            }
+                        }
+                    }
+                    if !closed {
+                        out.reasons.push("unterminated quote".into());
+                    }
+                }
+                '$' => {
+                    expansion = true;
+                    if chars.get(i + 1) == Some(&'(') {
+                        let dbl = chars.get(i + 2) == Some(&'(');
+                        let (body, end, ok) = scan_paren(&chars, i + 2);
+                        if !ok {
+                            out.reasons.push("unterminated substitution".into());
+                        }
+                        word.push_str("$(");
+                        word.push_str(&body);
+                        word.push(')');
+                        if dbl {
+                            for s in find_substitutions(&body) {
+                                cur.subs.push(s);
+                            }
+                        }
+                        cur.subs.push(body);
+                        i = end;
+                    } else if chars.get(i + 1) == Some(&'\'') {
+                        // ANSI-C quoting: contents are escape sequences.
+                        word.push('$');
+                        i += 1;
+                    } else if chars.get(i + 1) == Some(&'{') {
+                        let mut j = i + 2;
+                        let mut body = String::new();
+                        while j < chars.len() && chars[j] != '}' {
+                            body.push(chars[j]);
+                            j += 1;
+                        }
+                        word.push_str("${");
+                        word.push_str(&body);
+                        word.push('}');
+                        i = (j + 1).min(chars.len());
+                        for s in find_substitutions(&body) {
+                            cur.subs.push(s);
+                        }
+                    } else {
+                        word.push('$');
+                        i += 1;
+                    }
+                }
+                '`' => {
+                    let (body, end, ok) = scan_backtick(&chars, i + 1);
+                    if !ok {
+                        out.reasons.push("unterminated substitution".into());
+                    }
+                    word.push('`');
+                    word.push_str(&body);
+                    word.push('`');
+                    cur.subs.push(body);
+                    expansion = true;
+                    i = end;
+                }
+                '<' | '>' => {
+                    // process substitution `<(…)` / `>(…)`
+                    let (body, end, ok) = scan_paren(&chars, i + 2);
+                    if !ok {
+                        out.reasons.push("unterminated substitution".into());
+                    }
+                    word.push(c);
+                    word.push('(');
+                    word.push_str(&body);
+                    word.push(')');
+                    cur.subs.push(body);
+                    expansion = true;
+                    i = end;
+                }
+                '*' | '?' | '[' => {
+                    unq_glob = true;
+                    word.push(c);
+                    i += 1;
+                }
+                '{' => {
+                    // brace expansion needs a `,` or `..` at depth 1
+                    let mut j = i + 1;
+                    let mut d = 1;
+                    let mut has = false;
+                    while j < chars.len() && d > 0 {
+                        match chars[j] {
+                            '{' => d += 1,
+                            '}' => d -= 1,
+                            ',' if d == 1 => has = true,
+                            '.' if d == 1 && chars.get(j + 1) == Some(&'.') => has = true,
+                            ' ' | '\t' | '\n' | ';' | '&' | '|' => break,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if d == 0 && has {
+                        brace = true;
+                    }
+                    word.push(c);
+                    i += 1;
+                }
+                '~' if word.is_empty() && quoted_prefix_empty => {
+                    // `~` and `~/x` are the user's home; `~name` is someone else's.
+                    match chars.get(i + 1) {
+                        None | Some('/') | Some(' ') | Some('\t') | Some('\n') | Some(';')
+                        | Some('&') | Some('|') | Some(')') => {}
+                        Some(_) => out.reasons.push("tilde expansion".into()),
+                    }
+                    word.push('~');
+                    i += 1;
+                }
+                '=' if assign_name_end.is_none() && is_name(&word) && quoted_prefix_empty => {
+                    assign_name_end = Some(word.len());
+                    word.push('=');
+                    i += 1;
+                }
+                ch => {
+                    word.push(ch);
+                    i += 1;
+                    if ch != '=' {
+                        // keep `quoted_prefix_empty` semantics: only quotes clear it
+                    }
+                }
+            }
+        }
+        if i == start_i {
+            // A lone character the loop didn't consume (shouldn't happen).
+            i += 1;
+            continue;
+        }
+        if unq_glob {
+            out.reasons.push("glob".into());
+        }
+        if brace {
+            out.reasons.push("brace expansion".into());
+        }
+        if expansion {
+            out.reasons.push("expansion".into());
+        }
+        // `2>file` / `3<file`: a number glued to a redirect is its fd.
+        if let Some(op_c) = chars.get(i)
+            && (*op_c == '<' || *op_c == '>')
+            && chars.get(i + 1) != Some(&'(')
+            && !word.is_empty()
+            && word.chars().all(|c| c.is_ascii_digit())
+            && pending.is_none()
+        {
+            let fd: u32 = word.parse().unwrap_or(1);
+            let fd_default = fd;
+            let mut dummy = None;
+            let new_i = lex_redirect(&chars, i, fd_default, &mut dummy, &mut heredocs, &mut out);
+            pending = dummy;
+            i = new_i;
+            continue;
+        }
+        match pending.take() {
+            Some(Pending::Redirect(fd, op)) => {
+                cur.redirects.push(Redirect { fd, op: fix_dup(op, &word), target: word });
+            }
+            Some(Pending::HereString) => {
+                out.reasons.push("here-string".into());
+            }
+            None => {
+                if cur.argv.is_empty() && assign_name_end.is_some() {
+                    let n = assign_name_end.unwrap_or(0);
+                    cur.assignments.push((word[..n].to_string(), word[n + 1..].to_string()));
+                } else {
+                    cur.argv.push(word);
+                }
+            }
+        }
+    }
+    flush!();
+    if pending.is_some() {
+        out.reasons.push("redirect without target".into());
+    }
+    if !heredocs.is_empty() {
+        // here-doc body never started (no newline after the operator)
+    }
+
+    // Reserved words and wrappers; payloads become extra units.
+    for b in raw_units {
+        let Builder { assignments, argv, redirects, subs, piped, grouped, pipe } = b;
+        let seg = Segment { assignments, argv, redirects, piped };
+        let eff = unwrap(&seg.argv);
+        if let Some(first) = seg.argv.first()
+            && RESERVED.contains(&first.as_str())
+        {
+            out.reasons.push("compound command".into());
+        }
+        let mut extra: Vec<Lexed> = vec![];
+        for body in &subs {
+            extra.push(lex_depth(body, depth + 1, true));
+        }
+        let mut payload_units: Vec<Unit> = vec![];
+        if let Some(p) = payload_of(&eff) {
+            let l = lex_depth(&p, depth + 1, true);
+            payload_units.extend(l.units);
+            // reasons of a payload don't matter: the call is `sh -c …`, which
+            // rules never match as a prefix of `sh`, and the hard-deny list
+            // reads the units.
+        }
+        let exec_roots = None;
+        let unit = Unit { seg, eff: eff.clone(), subs, grouped, exec_roots, derived, pipe };
+        out.units.push(unit);
+        if eff.first().map(|s| base(s)) == Some("find") {
+            find_exec_units(&eff, &mut out.units);
+        }
+        for l in extra {
+            for mut u in l.units {
+                u.grouped = true;
+                u.derived = true;
+                out.units.push(u);
+            }
+        }
+        for mut u in payload_units {
+            u.derived = true;
+            out.units.push(u);
+        }
+    }
+    out.reasons.sort();
+    out.reasons.dedup();
+    out
+}
+
+/// Words that start compound commands; a segment starting with one can't be
+/// matched by a rule.
+const RESERVED: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "function", "select", "{", "}", "!", "[[", "coproc",
+];
+
+fn fix_dup(op: RedirectOp, word: &str) -> RedirectOp {
+    // `>&file` writes both stdout and stderr to the file; `<&file` is an error.
+    if op == RedirectOp::Dup && !(word == "-" || word.chars().all(|c| c.is_ascii_digit())) {
+        return RedirectOp::Write;
+    }
+    op
+}
+
+/// Lexes a redirection operator at `i`; returns the new index.
+fn lex_redirect(
+    chars: &[char],
+    mut i: usize,
+    fd_default: u32,
+    pending: &mut Option<Pending>,
+    heredocs: &mut Vec<(String, bool, bool)>,
+    out: &mut Lexed,
+) -> usize {
+    let c = chars[i];
+    let n1 = chars.get(i + 1).copied();
+    let n2 = chars.get(i + 2).copied();
+    if c == '<' && n1 == Some('<') && n2 == Some('<') {
+        i += 3;
+        *pending = Some(Pending::HereString);
+        return i;
+    }
+    if c == '<' && n1 == Some('<') {
+        i += 2;
+        let strip = chars.get(i) == Some(&'-');
+        if strip {
+            i += 1;
+        }
+        while matches!(chars.get(i), Some(' ' | '\t')) {
+            i += 1;
+        }
+        let mut delim = String::new();
+        let mut quoted = false;
+        while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>')
+        {
+            match chars[i] {
+                '\'' | '"' | '\\' => quoted = true,
+                ch => delim.push(ch),
+            }
+            i += 1;
+        }
+        out.reasons.push("here-doc".into());
+        heredocs.push((delim, strip, quoted));
+        return i;
+    }
+    let (op, n) = match (c, n1) {
+        ('>', Some('>')) => (RedirectOp::Append, 2),
+        ('>', Some('&')) => (RedirectOp::Dup, 2),
+        ('>', Some('|')) => (RedirectOp::Write, 2),
+        ('>', _) => (RedirectOp::Write, 1),
+        ('<', Some('>')) => (RedirectOp::ReadWrite, 2),
+        ('<', Some('&')) => (RedirectOp::Dup, 2),
+        _ => (RedirectOp::Read, 1),
+    };
+    i += n;
+    while matches!(chars.get(i), Some(' ' | '\t')) {
+        i += 1;
+    }
+    *pending = Some(Pending::Redirect(fd_default, op));
+    i
+}
+
+pub fn base(s: &str) -> &str {
+    s.rsplit('/').next().unwrap_or(s)
+}
+
+/// Strips reserved words and transparent wrappers off the front of `argv`.
+pub fn unwrap(argv: &[String]) -> Vec<String> {
+    let mut a: Vec<String> = argv.to_vec();
+    for _ in 0..8 {
+        let Some(first) = a.first() else { break };
+        let b = base(first).to_string();
+        let skip = |a: &[String], flags_with_value: &[&str], bare: &[&str]| -> usize {
+            let mut j = 1;
+            while j < a.len() {
+                let w = a[j].as_str();
+                if w == "--" {
+                    j += 1;
+                    break;
+                }
+                if flags_with_value.contains(&w) {
+                    j += 2;
+                } else if bare.contains(&w) || (w.starts_with('-') && w.len() > 1 && w != "-") {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            j.min(a.len())
+        };
+        let n = match b.as_str() {
+            "{" | "}" | "!" | "do" | "then" | "else" | "elif" | "if" | "while" | "until"
+            | "time" | "builtin" | "nohup" | "coproc" => {
+                if b == "time" || b == "nohup" || b == "builtin" {
+                    skip(&a, &[], &[])
+                } else {
+                    1
+                }
+            }
+            "command" | "setsid" => skip(&a, &[], &[]),
+            "exec" => skip(&a, &["-a"], &[]),
+            "nice" => skip(&a, &["-n"], &[]),
+            "ionice" => skip(&a, &["-c", "-n", "-p"], &[]),
+            "stdbuf" => skip(&a, &["-i", "-o", "-e"], &[]),
+            "timeout" => {
+                let j = skip(&a, &["-s", "-k"], &[]);
+                (j + 1).min(a.len())
+            }
+            "xargs" => skip(&a, &["-n", "-P", "-I", "-L", "-s", "-d", "-a", "-E", "-J"], &[]),
+            "env" => {
+                let mut j = 1;
+                while j < a.len() {
+                    let w = a[j].as_str();
+                    if w == "--" {
+                        j += 1;
+                        break;
+                    }
+                    if matches!(w, "-u" | "-C" | "--unset" | "--chdir") {
+                        j += 2;
+                    } else if w == "-S" || w == "--split-string" {
+                        // the next word is a command line: splice its words in
+                        if let Some(s) = a.get(j + 1).cloned() {
+                            let words: Vec<String> =
+                                s.split_whitespace().map(str::to_string).collect();
+                            a.splice(j..j + 2, words);
+                        } else {
+                            j += 1;
+                        }
+                    } else if w.starts_with('-') && w.len() > 1 {
+                        j += 1;
+                    } else if is_assignment_word(w) {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                j.min(a.len())
+            }
+            _ => break,
+        };
+        if n == 0 {
+            break;
+        }
+        if n >= a.len() {
+            a.clear();
+            break;
+        }
+        a.drain(..n);
+    }
+    a
+}
+
+fn is_assignment_word(w: &str) -> bool {
+    w.split_once('=').is_some_and(|(n, _)| is_name(n))
+}
+
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"];
+
+pub fn is_shell(cmd: &str) -> bool {
+    SHELLS.contains(&base(cmd))
+}
+
+/// The string a shell or `eval` will run, if the command has one.
+fn payload_of(eff: &[String]) -> Option<String> {
+    let first = base(eff.first()?);
+    if SHELLS.contains(&first) {
+        let mut j = 1;
+        while j < eff.len() {
+            let w = &eff[j];
+            if w == "--" {
+                break;
+            }
+            if w.starts_with('-') && !w.starts_with("--") && w[1..].contains('c') {
+                return eff.get(j + 1).cloned();
+            }
+            if w.starts_with('-') {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        None
+    } else if first == "eval" {
+        if eff.len() > 1 { Some(eff[1..].join(" ")) } else { None }
+    } else {
+        None
+    }
+}
+
+/// `find … -exec CMD … ;` becomes its own unit so hard-deny sees `CMD`.
+fn find_exec_units(eff: &[String], units: &mut Vec<Unit>) {
+    // roots: leading words that aren't expression starters
+    let mut roots = vec![];
+    let mut j = 1;
+    while j < eff.len() {
+        let w = eff[j].as_str();
+        if w.starts_with('-') && w != "-" || w == "!" || w == "(" {
+            break;
+        }
+        roots.push(eff[j].clone());
+        j += 1;
+    }
+    if roots.is_empty() {
+        roots.push(".".into());
+    }
+    let mut k = j;
+    while k < eff.len() {
+        if matches!(eff[k].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+            let mut argv = vec![];
+            let mut m = k + 1;
+            while m < eff.len() && eff[m] != ";" && eff[m] != "+" {
+                argv.push(eff[m].clone());
+                m += 1;
+            }
+            if !argv.is_empty() {
+                let e = unwrap(&argv);
+                units.push(Unit {
+                    seg: Segment { assignments: vec![], argv, redirects: vec![], piped: false },
+                    eff: e,
+                    subs: vec![],
+                    grouped: true,
+                    exec_roots: Some(roots.clone()),
+                    derived: true,
+                    pipe: 0,
+                });
+            }
+            k = m;
+        }
+        k += 1;
+    }
+}
