@@ -178,7 +178,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     }) {
         out.reasons.push("control character".into());
     }
-    let mut bodies: Vec<String> = vec![];
+    let mut bodies: Vec<(usize, String)> = vec![];
     let mut i = 0usize;
     let mut cur = Builder::new(false, false);
     let mut paren_depth = 0usize;
@@ -234,7 +234,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                         body.push_str(&l);
                         body.push('\n');
                     }
-                    bodies.push(body.clone());
+                    bodies.push((raw_units.len().saturating_sub(1), body.clone()));
                     if !quoted {
                         for sub in find_substitutions(&body) {
                             if let Some(last) = raw_units.last_mut() {
@@ -598,7 +598,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             }
             Some(Pending::HereString) => {
                 out.reasons.push("here-string".into());
-                bodies.push(word);
+                bodies.push((raw_units.len(), word));
             }
             None => {
                 if cur.argv.is_empty() && assign_name_end.is_some() {
@@ -620,7 +620,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     }
 
     // Reserved words and wrappers; payloads become extra units.
+    let mut raw_pos: Vec<usize> = vec![];
     for b in raw_units {
+        raw_pos.push(out.units.len());
         if out.units.len() > MAX_UNITS {
             out.overflow = true;
             return out;
@@ -700,8 +702,17 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         return out;
     }
     let mut texts: Vec<String> = vec![];
+    // a body counts only when the command that owns it is such a reader
+    for (owner, text) in &bodies {
+        if raw_pos
+            .get(*owner)
+            .and_then(|p| out.units.get(*p))
+            .is_some_and(is_stdin_code)
+        {
+            texts.push(text.clone());
+        }
+    }
     if out.units.iter().any(is_stdin_code) {
-        texts.extend(bodies.iter().cloned());
         let mut seen_pipes: Vec<u32> = vec![];
         for u in out
             .units

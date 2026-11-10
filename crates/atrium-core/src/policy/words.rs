@@ -157,6 +157,9 @@ const READERS: &[&str] = &[
     "mdls",
     "mdfind",
     "codesign",
+    "awk",
+    "gawk",
+    "mawk",
     "sed",
     "perl",
 ];
@@ -174,11 +177,17 @@ pub fn is_writer(eff: &[String]) -> bool {
     }
     let args = &eff[1..];
     let flag = |a: &String, c: char| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
-    let operands = args.iter().filter(|a| !a.starts_with('-')).count();
+    let operands = args
+        .iter()
+        .filter(|a| !a.starts_with('-') || *a == "-")
+        .count();
+    // `--out`, `--o`: GNU long options take unique prefixes
+    let long_is = |a: &String, full: &str| {
+        let n = a.split('=').next().unwrap_or(a);
+        n.starts_with("--") && n.len() >= 3 && full.starts_with(n)
+    };
     match b {
-        "sort" => args
-            .iter()
-            .any(|a| flag(a, 'o') || a.starts_with("--output")),
+        "sort" => args.iter().any(|a| flag(a, 'o') || long_is(a, "--output")),
         "uniq" => operands >= 2,
         "find" => args.iter().any(|a| {
             a == "-delete"
@@ -187,16 +196,37 @@ pub fn is_writer(eff: &[String]) -> bool {
                 || a.starts_with("-fprint")
                 || a == "-fls"
         }),
-        "xxd" => args.iter().any(|a| flag(a, 'r')) && operands >= 2,
-        "tree" => args
-            .iter()
-            .any(|a| flag(a, 'o') || a.starts_with("--output")),
-        "sed" => args
-            .iter()
-            .any(|a| !a.starts_with(['-', '/', '~', '.']) && a.contains(['w', 'W'])),
-        "codesign" => !args.iter().any(|a| {
-            a.starts_with("-d") || a.starts_with("-v") || a == "--display" || a == "--verify"
+        "xxd" => operands >= 2,
+        "tree" => args.iter().any(|a| flag(a, 'o') || long_is(a, "--output")),
+        "sed" => args.iter().any(|a| {
+            let script = if let Some(r) = a.strip_prefix("--expression=") {
+                Some(r)
+            } else if a.starts_with("-e") && a.len() > 2 {
+                Some(&a[2..])
+            } else if !a.starts_with('-') && (a.contains(char::is_whitespace) || !a.contains('/')) {
+                Some(a.as_str())
+            } else {
+                None
+            };
+            script.is_some_and(|s| s.contains(['w', 'W']))
         }),
+        "awk" | "gawk" | "mawk" => args
+            .iter()
+            .any(|a| !a.starts_with('-') && a.contains(['>', '|']) || a.contains("system(")),
+        "codesign" => {
+            let signs = args.iter().any(|a| {
+                matches!(a.as_str(), "--sign" | "--force" | "--remove-signature")
+                    || flag(a, 's')
+                    || flag(a, 'f')
+            });
+            signs
+                || !args.iter().any(|a| {
+                    a.starts_with("-d")
+                        || a.starts_with("-v")
+                        || a == "--display"
+                        || a == "--verify"
+                })
+        }
         _ => !READERS.contains(&b),
     }
 }
@@ -358,6 +388,16 @@ fn words_of(unit: &Unit, overflow: &mut bool) -> Vec<(String, Role)> {
     out
 }
 
+/// Words inside a `sed`/`awk` script (`w /path`, `print > \"/path\"`).
+fn push_script_tokens(script: &str, role: Role, out: &mut Vec<(String, Role)>) {
+    for tok in script.split_whitespace().take(64) {
+        let t = tok.trim_matches(|c| "\"'{}();".contains(c));
+        if !t.is_empty() {
+            out.push((t.to_string(), role));
+        }
+    }
+}
+
 fn raw_words_of(unit: &Unit) -> Vec<(String, Role)> {
     let mut out = vec![];
     for (_, v) in &unit.seg.assignments {
@@ -370,6 +410,10 @@ fn raw_words_of(unit: &Unit) -> Vec<(String, Role)> {
     } else {
         Role::Read
     };
+    let script_cmd = unit
+        .eff
+        .first()
+        .is_some_and(|f| matches!(base(f), "sed" | "awk" | "gawk" | "mawk"));
     for (idx, w) in unit.seg.argv.iter().enumerate() {
         if idx == 0 {
             // running a binary isn't writing it
@@ -381,6 +425,9 @@ fn raw_words_of(unit: &Unit) -> Vec<(String, Role)> {
         if w.starts_with("--") {
             if let Some((_, v)) = w.split_once('=') {
                 out.push((v.to_string(), role));
+                if script_cmd {
+                    push_script_tokens(v, role, &mut out);
+                }
             }
         } else if w.starts_with('-') && w.len() > 1 {
             // every suffix after a flag letter: `-uf.npmrc` is `-u -f .npmrc`
@@ -393,15 +440,15 @@ fn raw_words_of(unit: &Unit) -> Vec<(String, Role)> {
                 let rest = rest.strip_prefix('=').unwrap_or(&rest);
                 if !rest.is_empty() {
                     out.push((rest.to_string(), role));
+                    if script_cmd {
+                        push_script_tokens(rest, role, &mut out);
+                    }
                 }
             }
         } else {
             out.push((w.clone(), role));
-            // a script or quoted command line: `w /path` in a sed script
-            if w.contains(char::is_whitespace) {
-                for tok in w.split_whitespace().take(8) {
-                    out.push((tok.to_string(), role));
-                }
+            if script_cmd {
+                push_script_tokens(w, role, &mut out);
             }
             if idx > 0
                 && let Some((k, v)) = w.split_once('=')

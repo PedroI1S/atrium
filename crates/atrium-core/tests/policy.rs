@@ -2587,3 +2587,80 @@ fn hard_link_to_a_key_is_caught_next_to_a_big_credential_tree() {
         GateDecision::Allow
     );
 }
+
+#[test]
+fn review_round3_table() {
+    let env = Env::home();
+    let table: Vec<(&str, Want)> = vec![
+        // 1: message text that mentions a protected path is just text
+        (
+            "git commit -m 'stop writing ~/.config/atrium/config.toml'",
+            Ask,
+        ),
+        (
+            "git commit -m 'document /Applications/Atrium.app paths'",
+            Ask,
+        ),
+        // 2: a body is lexed only when its own command is a shell
+        (
+            "cat > notes.md <<'EOF'\nsudo make install\nEOF\nbash build.sh",
+            Ask,
+        ),
+        (
+            "git commit -F - <<'EOF'\nrm -rf ~ fix\nEOF\nsh -c make",
+            Ask,
+        ),
+        ("bash /dev/stdin <<EOF\nrm -rf ~\nEOF", Hard(RD)),
+        ("bash -o pipefail <<< 'rm -rf ~'", Hard(RD)),
+        ("eval <<< 'rm -rf ~'", Hard(RD)),
+        // 3: more write forms of the "readers"
+        ("sed -n '/./w ~/.config/atrium/config.toml' x", Hard(AS)),
+        (
+            "sed --expression='w /h/u/.config/atrium/config.toml' x",
+            Hard(AS),
+        ),
+        ("sed -e'w /h/u/.config/atrium/config.toml' x", Hard(AS)),
+        (
+            "sed 'a b c d e f g h i j w ~/.config/atrium/config.toml' x",
+            Hard(AS),
+        ),
+        ("uniq - ~/.config/atrium/config.toml", Hard(AS)),
+        ("xxd -r - ~/.config/atrium/config.toml", Hard(AS)),
+        ("xxd /etc/hosts ~/.config/atrium/config.toml", Hard(AS)),
+        ("sort --out=~/.config/atrium/config.toml x", Hard(AS)),
+        ("sort --o ~/.config/atrium/config.toml x", Hard(AS)),
+        (
+            "awk '{print > \"/h/u/.config/atrium/config.toml\"}' x",
+            Hard(AS),
+        ),
+        (
+            "awk '{print >> \"/h/u/.config/atrium/config.toml\"}' x",
+            Hard(AS),
+        ),
+        (
+            "codesign -v --force --sign - /Applications/Atrium.app",
+            Hard(AS),
+        ),
+        ("codesign -dvf -s - /Applications/Atrium.app", Hard(AS)),
+        ("codesign -dv /Applications/Atrium.app", Ask),
+        ("awk '{print}' ~/.config/atrium/config.toml", Ask),
+    ];
+    run_table(&env, &table);
+}
+
+#[test]
+fn hard_link_into_a_ssh_subfolder_is_caught() {
+    let t = Tmp::new();
+    t.write(".ssh/work/id_work", "secret");
+    t.write("proj/a.txt", "x");
+    std::fs::hard_link(t.home.join(".ssh/work/id_work"), t.home.join("proj/kw")).unwrap();
+    let g = t.gate(Preset::Home, vec![]);
+    assert!(matches!(
+        block_on(g.gate.check(&cmd_check("cat proj/kw"))),
+        GateDecision::Deny { .. }
+    ));
+    assert_eq!(
+        block_on(g.gate.check(&cmd_check("cat proj/a.txt"))),
+        GateDecision::Allow
+    );
+}

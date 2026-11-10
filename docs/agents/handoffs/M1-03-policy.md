@@ -115,3 +115,16 @@ DoD: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets --
 - f. Here-doc and here-string bodies and `echo | sh` texts are lexed whenever any shell, `eval` or `source` unit is present. Test: `review_round2_table` (`bash /dev/stdin <<…`, `bash -o pipefail <<<`, `bash --norc <<<`).
 - g. A single-dash cluster longer than 64 letters gives the lexer reason "flag cluster too long" (asks, can't be remembered). Test: `review_round2_table`.
 - h (part). A `CommandExact` with an empty argv never matches. Test: `review_round2_table`. The cwd binding and the rules-editor wording are left for Pedro and the UI, as instructed.
+
+## Review fixes (round 3)
+
+DoD: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `--test ledger` 20 passed, `--test policy` 42 passed; `cargo test --workspace` green.
+
+1. Quoted arguments are split into path tokens only for `sed`, `awk`, `gawk`, `mawk` (arguments, `--expression=`, `-e…` values; up to 64 tokens, punctuation trimmed). `git commit -m '… ~/.config/atrium/config.toml'` and `… /Applications/Atrium.app …` ask. Test: `review_round3_table`.
+2. A here-doc or here-string body is re-lexed only when the command that owns it is a shell, `eval` or `source` (any arguments, so `/dev/stdin` and `-o X` forms still work). `cat > notes.md <<EOF … EOF` then `bash build.sh`, and `git commit -F - <<EOF … EOF` then `sh -c make`, ask. Test: `review_round3_table`.
+3. Write forms: `sed` scripts with `w`/`W` anywhere (address before `w`, `--expression=`, `-e'…'`, any non-flag script with whitespace or no `/`); `uniq` and `xxd` count `-` as an operand and `xxd` with two operands writes (with or without `-r`); `sort`/`tree` long options by prefix (`--out=`, `--o`); `awk` with `>`, `>>`, `|` or `system(`; `codesign` with `-s`/`--sign`/`-f`/`--force`/`--remove-signature`. Each gives `HardDeny(atrium-self)` on a protected path; plain reads (`awk '{print}' file`, `codesign -dv`) ask. Test: `review_round3_table`.
+4. The identity map walks `~/.ssh` to depth 3 (cap 256 entries); no other tree is walked. Test: `hard_link_into_a_ssh_subfolder_is_caught`.
+
+Known limits for M1-13 (left as instructed):
+- Finding 5: a symlink inside `~/.ssh` that points to an ordinary folder makes that folder look like a `.ssh` member (`metadata` follows the link), so it is denied. Rare; fix with `symlink_metadata` for such members.
+- Hard links to files inside the other credential trees (`~/.gnupg`, `~/.config/gcloud`, `~/.gemini`, browser profiles, Keychains), Atrium's data and protected paths are not caught by identity, only through their ancestors. A cheap first step for M1-13: never auto-allow a file under Home with `st_nlink > 1` outside the sensitive roots.

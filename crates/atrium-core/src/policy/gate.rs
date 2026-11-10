@@ -176,9 +176,25 @@ fn alias_fix(p: &Path, roots: &[((u64, u64), PathBuf)]) -> Result<PathBuf, Strin
 /// key is the same file. The big trees (browser profiles) aren't walked; a
 /// path inside one is caught through its ancestors.
 fn expand_roots(home: &Path, roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    const MAX_ENTRIES: usize = 256;
     let mut out = roots;
-    if let Ok(rd) = std::fs::read_dir(home.join(".ssh")) {
-        out.extend(rd.flatten().take(256).map(|e| e.path()));
+    let mut found = 0usize;
+    let mut stack = vec![(home.join(".ssh"), 0u8)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= 3 || found >= MAX_ENTRIES {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten().take(MAX_ENTRIES) {
+            found += 1;
+            let p = e.path();
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push((p.clone(), depth + 1));
+            }
+            out.push(p);
+        }
     }
     out
 }
