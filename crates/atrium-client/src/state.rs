@@ -20,7 +20,10 @@
 //! Events are applied only while `Replaying` or `Live`. While `Subscribing`
 //! they belong to an earlier subscription and are dropped: the new one
 //! replays from the cursor. The client relies on the daemon sending nothing
-//! of an earlier subscription after it has answered the new `Subscribe`.
+//! of an earlier subscription after it has answered the new `Subscribe`
+//! (D-058). So a `ReplayDone` while `Replaying` is this replay's: one that
+//! doesn't end where the answer said, or comes before the events up to
+//! there, is a protocol violation.
 //!
 //! # Windows
 //!
@@ -472,9 +475,24 @@ impl State {
         match message {
             ServerMessage::Event { event } => self.on_event(event, json),
             ServerMessage::ReplayDone { thread_id, last } => {
+                // Outside `Replaying` it is late (the thread was left, or
+                // subscribed to again) and means nothing.
                 if let Some(sub) = self.known.subs.get_mut(&thread_id)
-                    && matches!(sub.phase, Phase::Replaying { until } if until == last)
+                    && let Phase::Replaying { until } = sub.phase
                 {
+                    // Going live on anything else would show a history with
+                    // a hole; waiting for a better one would wait for ever.
+                    if until != last {
+                        return Err(format!(
+                            "`ReplayDone` up to {last:?} for a replay up to {until:?}"
+                        ));
+                    }
+                    if until.is_some_and(|until| sub.cache.last().is_none_or(|have| have < until)) {
+                        return Err(format!(
+                            "`ReplayDone` before the events up to {until:?} (the last was {:?})",
+                            sub.cache.last()
+                        ));
+                    }
                     sub.phase = Phase::Live;
                     self.pump_viewers(&thread_id);
                 }
@@ -1151,8 +1169,6 @@ mod tests {
         rig.daemon(ok(2, json!({ "replay_until": 3 })));
         rig.daemon(event(1, turn(1)));
         rig.daemon(event(2, delta("m1", "Hel")));
-        // A replay marker of an earlier subscription.
-        rig.daemon(done("t", Some(1)));
         rig.daemon(event(3, delta("m1", "lo")));
         assert_eq!(rig.drain(&main), [], "nothing while the thread loads");
         rig.daemon(done("t", Some(3)));
@@ -1662,6 +1678,24 @@ mod tests {
         let json: Arc<str> = serde_json::to_string(&message).expect("json").into();
         assert!(rig.state.on_message(message, json).is_err());
 
+        // A replay that ends somewhere else than announced, or before its
+        // events came.
+        for (replayed, last) in [(2, Some(1)), (2, None), (1, Some(2))] {
+            let mut rig = Rig::new(SMALL);
+            let main = rig.open("main");
+            rig.view(&main, "t");
+            rig.daemon(ok(2, json!({ "replay_until": 2 })));
+            for id in 1..=replayed {
+                rig.daemon(event(id, turn(id as u32)));
+            }
+            let message = done("t", last);
+            let json: Arc<str> = serde_json::to_string(&message).expect("json").into();
+            assert!(
+                rig.state.on_message(message, json).is_err(),
+                "{replayed} events, then done at {last:?}"
+            );
+        }
+
         // Not violations: answers and events that arrive late.
         let mut rig = Rig::new(SMALL);
         let main = rig.open("main");
@@ -1674,6 +1708,38 @@ mod tests {
             thread_id: t(),
             last_sent: None,
         });
+        // They leave no trace: nothing is kept of the thread, nothing is
+        // sent to the daemon, and the window only has the connection state.
+        assert!(rig.state.cached(&t()).is_none());
+        assert_eq!(
+            rig.sent(),
+            [
+                ClientMessage::Subscribe {
+                    request_id: 2,
+                    thread_id: t(),
+                    after: None
+                },
+                ClientMessage::Unsubscribe { thread_id: t() }
+            ]
+        );
+        assert!(
+            rig.drain(&main)
+                .iter()
+                .all(|delivery| matches!(delivery, Delivery::Connection { .. }))
+        );
+        // The same `ReplayDone` while live (a second one) changes nothing.
+        let mut rig = Rig::new(SMALL);
+        let main = rig.open("main");
+        rig.view(&main, "t");
+        rig.daemon(ok(2, json!({ "replay_until": null })));
+        rig.daemon(done("t", None));
+        rig.daemon(done("t", Some(5)));
+        rig.daemon(event(1, turn(1)));
+        assert!(
+            rig.drain(&main)
+                .iter()
+                .any(|delivery| matches!(delivery, Delivery::Event { .. }))
+        );
     }
 
     #[test]

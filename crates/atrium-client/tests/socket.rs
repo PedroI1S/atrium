@@ -440,6 +440,33 @@ async fn a_dropped_connection_comes_back_and_continues_from_the_cursor() {
 }
 
 #[tokio::test]
+async fn a_daemon_that_welcomes_and_drops_is_tried_with_backoff() {
+    let daemon = Daemon::new();
+    let client = Client::start(options(daemon.socket.clone()));
+    // Each connection is welcomed and closed at once. The first drop is
+    // followed by an attempt without a wait, the later ones by waits of
+    // 100 ms, 200 ms, 400 ms, 800 ms: connections at about 0, 0, 100, 300,
+    // 700 and 1500 ms.
+    let started = Instant::now();
+    let mut connections = 0;
+    while started.elapsed() < Duration::from_millis(1_000) {
+        if let Ok(Ok((stream, _))) =
+            tokio::time::timeout(Duration::from_millis(50), daemon.listener.accept()).await
+        {
+            Peer { stream }.welcome().await;
+            connections += 1;
+        }
+    }
+    assert!(
+        (4..=6).contains(&connections),
+        "{connections} connections in a second"
+    );
+    // Asking for a reconnect clears the record: the next attempt is at once.
+    client.reconnect();
+    assert!(daemon.connection_within(Duration::from_millis(100)).await);
+}
+
+#[tokio::test]
 async fn nothing_listening_calls_the_start_hook_once_and_connects_when_it_can() {
     let folder = folder();
     let socket = folder.path().join("atriumd.sock");
@@ -724,6 +751,10 @@ async fn catching_up_a_thousand_events_after_a_reconnect_is_quick() {
     let mut cursor = 0;
     let mut times = Vec::new();
     for _ in 0..20 {
+        // Connections that drop this soon after each other are spaced
+        // (a daemon that keeps dropping); asking clears that, and what is
+        // measured is a reconnect without a wait.
+        client.reconnect();
         let dropped = Instant::now();
         drop(peer);
         peer = daemon.accept().await;

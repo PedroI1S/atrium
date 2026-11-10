@@ -8,7 +8,7 @@
 //! - a tool call's `ToolCallUpdated`s become one update (later fields win,
 //!   `output` replaces, `output_delta` appends);
 //! - `Usage` within a turn, `ContextUpdated` and `QuotaUpdated` keep only the
-//!   latest, where the first one was.
+//!   latest within a segment (see below), where the segment's first one was.
 //!
 //! Applying the folded entries in order gives the same state as applying the
 //! original events. An entry keeps the id of the first event folded into it,
@@ -71,6 +71,10 @@ pub(crate) struct ThreadCache {
     entries: VecDeque<Entry>,
     /// Entries dropped from the front.
     base: u64,
+    /// The entry number that starts the last segment. Folding never reaches
+    /// behind it: a snapshot of the newest segments must hold every value
+    /// that arrived within them.
+    segment_start: u64,
     bytes: usize,
     max_bytes: usize,
     last: Option<EventId>,
@@ -86,6 +90,7 @@ impl ThreadCache {
         Self {
             entries: VecDeque::new(),
             base: 0,
+            segment_start: 0,
             bytes: 0,
             max_bytes,
             last: None,
@@ -173,8 +178,8 @@ impl ThreadCache {
                 let update = self.open.calls.get(&id).copied().flatten();
                 match update.and_then(|number| entry_mut(&mut self.entries, self.base, number)) {
                     Some(entry) => {
-                        let replaced = merge_update(&mut entry.event.envelope.event, stored);
-                        let merged = if replaced { bytes } else { entry.bytes + bytes };
+                        let (grown, shrunk) = merge_update(&mut entry.event.envelope.event, stored);
+                        let merged = (entry.bytes + grown).saturating_sub(shrunk);
                         self.bytes = self.bytes.saturating_sub(entry.bytes) + merged;
                         entry.bytes = merged;
                     }
@@ -197,7 +202,10 @@ impl ThreadCache {
                 self.open.requests.remove(&id);
             }
             Kind::Latest(slot) => {
-                let number = *slot.of(&mut self.open);
+                // Only within the last segment: an older entry may lie
+                // outside the snapshot a window is given, which would then
+                // never show this value.
+                let number = (*slot.of(&mut self.open)).filter(|n| *n >= self.segment_start);
                 match number.and_then(|number| entry_mut(&mut self.entries, self.base, number)) {
                     Some(entry) => {
                         self.bytes = self.bytes.saturating_sub(entry.bytes) + bytes;
@@ -230,11 +238,15 @@ impl ThreadCache {
 
     fn push(&mut self, event: StoredEvent, bytes: usize, boundary: bool) -> u64 {
         let number = self.base + self.entries.len() as u64;
+        // The first entry always starts a segment.
+        let boundary = boundary || self.entries.is_empty();
+        if boundary {
+            self.segment_start = number;
+        }
         self.entries.push_back(Entry {
             event,
             bytes,
-            // The first entry always starts a segment.
-            boundary: boundary || self.entries.is_empty(),
+            boundary,
         });
         self.bytes += bytes;
         number
@@ -403,8 +415,9 @@ fn kind_of(event: &AgentEvent) -> Kind {
 }
 
 /// Folds a later `ToolCallUpdated` into an earlier one of the same call.
-/// Returns whether the later one replaced the whole output.
-fn merge_update(into: &mut AgentEvent, from: StoredEvent) -> bool {
+/// Returns the bytes of content the entry gained and those it lost, so the
+/// entry is counted at what it holds and not at the frames that built it.
+fn merge_update(into: &mut AgentEvent, from: StoredEvent) -> (usize, usize) {
     let (
         AgentEvent::ToolCallUpdated {
             title,
@@ -424,33 +437,63 @@ fn merge_update(into: &mut AgentEvent, from: StoredEvent) -> bool {
         },
     ) = (into, from.envelope.event)
     else {
-        return false;
+        return (0, 0);
     };
+    let text = |text: &Option<String>| text.as_ref().map_or(0, String::len);
+    let (mut grown, mut shrunk) = (0, 0);
     if new_title.is_some() {
+        grown += text(&new_title);
+        shrunk += text(title);
         *title = new_title;
     }
     if new_kind.is_some() {
         *kind = new_kind;
     }
     if new_input.is_some() {
+        grown += json_len(&new_input);
+        shrunk += json_len(input);
         *input = new_input;
     }
     match whole {
         // "Replaces the whole output so far", then its own delta appends.
         Some(whole) => {
+            grown += whole.len() + text(&more);
+            shrunk += text(output) + text(output_delta);
             *output = Some(whole);
             *output_delta = more;
-            true
         }
         None => {
             if let Some(more) = more {
+                grown += more.len();
                 match output_delta {
                     Some(joined) => joined.push_str(&more),
                     None => *output_delta = Some(more),
                 }
             }
-            false
         }
+    }
+    (grown, shrunk)
+}
+
+/// The length of a value's JSON, without building it.
+fn json_len<T: Serialize>(value: &Option<T>) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let Some(value) = value else {
+        return 0;
+    };
+    let mut count = Count(0);
+    match serde_json::to_writer(&mut count, value) {
+        Ok(()) => count.0,
+        Err(_) => 0,
     }
 }
 
@@ -599,20 +642,94 @@ pub(crate) mod tests {
             ],
         );
         let events = all(&cache);
-        // 4, 5 joined 2; 9, 11, 12 joined 8; 10 replaced 3.
-        assert_eq!(ids(&events), [1, 2, 3, 6, 7, 8, 13, 14, 15, 16]);
+        // 4, 5 joined 2; 9, 11, 12 joined 8; 10 is in another segment than
+        // 3, so it stays.
+        assert_eq!(ids(&events), [1, 2, 3, 6, 7, 8, 10, 13, 14, 15, 16]);
         assert_eq!(events[1].envelope.event, delta("m1", "Hello there"));
-        // The usage entry is where the turn's first one was, with the latest total.
-        assert_eq!(events[2].envelope.event, usage(2));
-        assert_eq!(events[2].envelope.seq, 10);
+        assert_eq!(events[2].envelope.event, usage(1));
         assert_eq!(
             events[5].envelope.event,
             update("c1", Some("ls"), Some("de"), Some("c"))
         );
+        assert_eq!(events[6].envelope.event, usage(2));
         // A new turn's usage is a new entry.
-        assert_eq!(events[9].envelope.event, usage(3));
+        assert_eq!(events[10].envelope.event, usage(3));
         assert_eq!(cache.last(), Some(EventId(16)));
         assert_eq!(cache.gaps(), 0);
+    }
+
+    #[test]
+    fn latest_values_fold_only_within_a_segment() {
+        let mut cache = ThreadCache::new(usize::MAX);
+        fill(
+            &mut cache,
+            1,
+            vec![
+                turn(1),          // 1
+                delta("m1", "a"), // 2  starts a segment
+                usage(1),         // 3
+                usage(2),         // 4  replaces 3: same segment
+                completed("m1"),  // 5
+                call("c1"),       // 6  starts a segment
+                usage(3),         // 7  a new entry: 3 is in an earlier segment
+                usage(4),         // 8  replaces 7
+                finished("c1"),   // 9
+            ],
+        );
+        let events = all(&cache);
+        assert_eq!(ids(&events), [1, 2, 3, 5, 6, 7, 9]);
+        assert_eq!(events[2].envelope.event, usage(2));
+        assert_eq!(events[2].envelope.seq, 4);
+        assert_eq!(events[5].envelope.event, usage(4));
+        // A snapshot of the last segment alone has the turn's latest usage.
+        let tail = cache.events(cache.tail(1));
+        assert_eq!(ids(&tail), [6, 7, 9]);
+        assert_eq!(tail[1].envelope.event, usage(4));
+        assert_eq!(cache.bytes(), 70);
+    }
+
+    #[test]
+    fn a_folded_tool_call_is_counted_at_what_it_holds() {
+        let with_input = |input: serde_json::Value| AgentEvent::ToolCallUpdated {
+            call_id: "c1".into(),
+            title: None,
+            kind: None,
+            input: Some(input),
+            output_delta: None,
+            output: None,
+        };
+        let mut cache = ThreadCache::new(usize::MAX);
+        cache.append(stored(1, call("c1")), 100);
+        // The first update is an entry at its wire size.
+        cache.append(stored(2, update("c1", None, Some("0123456789"), None)), 200);
+        assert_eq!(cache.bytes(), 300);
+        // A thousand more chunks cost their text, not their frames.
+        for id in 3..1_003 {
+            cache.append(
+                stored(id, update("c1", None, Some("0123456789"), None)),
+                200,
+            );
+        }
+        assert_eq!(cache.bytes(), 300 + 10_000);
+        // A large input stays counted when the output is then replaced.
+        let input = json!({ "command": "x".repeat(50_000) });
+        let input_len = serde_json::to_vec(&input).expect("json").len();
+        cache.append(stored(1_003, with_input(input)), 50_200);
+        assert_eq!(cache.bytes(), 300 + 10_000 + input_len);
+        cache.append(
+            stored(1_004, update("c1", None, Some("!"), Some("ok"))),
+            200,
+        );
+        // The 10,010 bytes of output so far went; "ok" and "!" came.
+        assert_eq!(cache.bytes(), 300 - 10 + input_len + 3);
+        // A title replaced by a shorter one gives bytes back.
+        cache.append(
+            stored(1_005, update("c1", Some("a long title"), None, None)),
+            200,
+        );
+        cache.append(stored(1_006, update("c1", Some("short"), None, None)), 200);
+        assert_eq!(cache.bytes(), 300 - 10 + input_len + 3 + 5);
+        assert_eq!(all(&cache).len(), 2);
     }
 
     #[test]

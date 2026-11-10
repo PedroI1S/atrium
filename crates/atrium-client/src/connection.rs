@@ -6,7 +6,9 @@
 //! waits on a window.
 //!
 //! What ends a connection decides what happens next:
-//! - the socket closed or stalled: reconnect at once, then with backoff;
+//! - the socket closed or stalled: reconnect at once, then with backoff
+//!   (connections that keep dropping before [`SETTLED`] are spaced like
+//!   failed attempts, so a daemon that welcomes and closes isn't hammered);
 //! - nothing is listening: call the start hook, keep trying with backoff;
 //! - the daemon answered `Incompatible`, the socket isn't safe, or the
 //!   daemon broke the protocol: stop, and wait for [`crate::Client::reconnect`].
@@ -16,7 +18,7 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atrium_protocol::PROTOCOL_VERSION;
 use atrium_protocol::wire::{ClientMessage, ServerMessage};
@@ -40,6 +42,16 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// The start hook runs on the first failed attempt and every this many
 /// after it.
 const START_EVERY: u32 = 20;
+
+/// A connection that lasted this long was a working one. One that dropped
+/// sooner is an early drop; the second in a row and those after it are
+/// followed by a wait.
+const SETTLED: Duration = Duration::from_secs(2);
+
+/// How long to wait before the attempt after `attempt` failed ones.
+fn backoff(attempt: u32) -> Duration {
+    Duration::from_millis((25u64 << attempt.min(6)).min(1000))
+}
 
 /// Why a connection (or an attempt at one) ended.
 enum Ended {
@@ -74,6 +86,8 @@ pub(crate) async fn run(
     mut control: mpsc::UnboundedReceiver<Control>,
 ) {
     let mut attempt: u32 = 0;
+    // Connections in a row that dropped before `SETTLED`.
+    let mut early: u32 = 0;
     loop {
         attempt = attempt.saturating_add(1);
         shared.with_connection(|state| {
@@ -88,18 +102,40 @@ pub(crate) async fn run(
             connection = connect(&options) => match connection {
                 Ok(connection) => {
                     attempt = 0;
-                    session(&shared, connection, &mut control).await
+                    let since = Instant::now();
+                    let ended = session(&shared, connection, &mut control, &mut early).await;
+                    if since.elapsed() >= SETTLED {
+                        early = 0;
+                    } else {
+                        early = early.saturating_add(1);
+                    }
+                    ended
                 }
                 Err(ended) => ended,
             },
         };
         match ended {
             Ended::Shutdown => break,
-            Ended::Retry => attempt = 0,
+            Ended::Retry => {
+                attempt = 0;
+                early = 0;
+            }
             Ended::Lost => {
                 shared.with_connection(|state| {
                     state.disconnected(ConnectionState::Connecting { attempt: 1 });
                 });
+                // After a working connection, or the first that dropped
+                // early: at once. From the second early drop in a row the
+                // daemon is accepting and dropping, and attempts are spaced.
+                if early > 1 {
+                    tokio::select! {
+                        message = control.recv() => match message {
+                            Some(Control::Reconnect) => early = 0,
+                            Some(Control::Shutdown) | None => break,
+                        },
+                        () = tokio::time::sleep(backoff(early)) => {}
+                    }
+                }
             }
             Ended::Unreachable => {
                 if attempt % START_EVERY == 1
@@ -108,19 +144,24 @@ pub(crate) async fn run(
                     // Its result shows in whether the next attempts connect.
                     let _ = tokio::task::spawn_blocking(move || start()).await;
                 }
-                let delay = Duration::from_millis((25u64 << attempt.min(6)).min(1000));
                 tokio::select! {
                     message = control.recv() => match message {
-                        Some(Control::Reconnect) => attempt = 0,
+                        Some(Control::Reconnect) => {
+                            attempt = 0;
+                            early = 0;
+                        }
                         Some(Control::Shutdown) | None => break,
                     },
-                    () = tokio::time::sleep(delay) => {}
+                    () = tokio::time::sleep(backoff(attempt)) => {}
                 }
             }
             Ended::Refused(state) => {
                 shared.with_connection(|s| s.disconnected(state));
                 match control.recv().await {
-                    Some(Control::Reconnect) => attempt = 0,
+                    Some(Control::Reconnect) => {
+                        attempt = 0;
+                        early = 0;
+                    }
                     Some(Control::Shutdown) | None => break,
                 }
             }
@@ -144,6 +185,23 @@ async fn connect(options: &ClientOptions) -> Result<Connection, Ended> {
     let stream = within(UnixStream::connect(&options.socket))
         .await
         .map_err(|_| Ended::Unreachable)?;
+    // The checks above were on the path; this one is on the connection
+    // itself, whatever the path named by the time it was made.
+    match stream.peer_cred() {
+        Ok(peer) if peer.uid() == rustix::process::geteuid().as_raw() => {}
+        Ok(_) => {
+            return Err(failed(format!(
+                "the process answering on {} belongs to another user",
+                options.socket.display()
+            )));
+        }
+        Err(e) => {
+            return Err(failed(format!(
+                "the process answering on {} can't be identified: {e}",
+                options.socket.display()
+            )));
+        }
+    }
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::with_capacity(64 * 1024, reader);
 
@@ -214,6 +272,7 @@ async fn session(
     shared: &Arc<Shared>,
     connection: Connection,
     control: &mut mpsc::UnboundedReceiver<Control>,
+    early: &mut u32,
 ) -> Ended {
     let Connection {
         reader,
@@ -225,20 +284,33 @@ async fn session(
     shared.with_connection(|state| state.connected(frames, daemon_version, daemon_pid));
     let mut read = tokio::spawn(read_loop(reader, shared.clone()));
     let mut write = tokio::spawn(write_loop(writer, queue));
+    let mut reading = true;
     let ended = loop {
         tokio::select! {
             // A task that panicked counts as a lost connection.
-            ended = &mut read => break ended.unwrap_or(Ended::Lost),
+            ended = &mut read => {
+                reading = false;
+                break ended.unwrap_or(Ended::Lost);
+            }
             _ = &mut write => break Ended::Lost,
             message = control.recv() => match message {
-                // Already connected.
-                Some(Control::Reconnect) => {}
+                // Already connected. Being asked still clears the record
+                // of early drops: the next reconnect is at once.
+                Some(Control::Reconnect) => *early = 0,
                 Some(Control::Shutdown) | None => break Ended::Shutdown,
             },
         }
     };
     read.abort();
     write.abort();
+    if reading {
+        // The reader may be between parsing a message and applying it, and
+        // an abort only lands where it next waits. It must be gone before
+        // the state is told the connection ended: a message of this
+        // connection applied after the next one subscribed would be taken
+        // for one of the new replay.
+        let _ = read.await;
+    }
     ended
 }
 
