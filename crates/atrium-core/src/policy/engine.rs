@@ -437,7 +437,10 @@ fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
         } else {
             let cs: Vec<char> = a[1..].chars().collect();
             for (k, c) in cs.iter().enumerate() {
-                if !is_rg && matches!(c, 'r' | 'R' | 'd') {
+                if !is_rg && *c == 'R' {
+                    return None; // follows every symlink below the root
+                }
+                if !is_rg && matches!(c, 'r' | 'd') {
                     recursive = true;
                 }
                 if *c == 'e' {
@@ -578,6 +581,12 @@ impl Home<'_> {
 impl PolicyEngine for DefaultPolicy {
     fn evaluate(&self, input: &PolicyInput<'_>, rules: &[Rule]) -> PolicyVerdict {
         let a = deny::analyze(input);
+        if a.overflow {
+            return PolicyVerdict::Deny {
+                reason: "too large to check".into(),
+                rule: None,
+            };
+        }
         if let Some(id) = deny::hard_deny(input, &a) {
             return PolicyVerdict::HardDeny { id };
         }

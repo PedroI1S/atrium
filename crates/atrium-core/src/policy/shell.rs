@@ -167,6 +167,15 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         return out;
     }
     let chars: Vec<char> = line.chars().collect();
+    // Shells treat `\r` as a word character; any other control character is
+    // something this lexer can't vouch for.
+    if chars
+        .iter()
+        .any(|c| (c.is_control() && !matches!(c, '\n' | '\t' | '\r')) || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        out.reasons.push("control character".into());
+    }
+    let mut bodies: Vec<String> = vec![];
     let mut i = 0usize;
     let mut cur = Builder::new(false, false);
     let mut paren_depth = 0usize;
@@ -187,7 +196,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         let c = chars[i];
         // Separators and whitespace.
         match c {
-            ' ' | '\t' | '\r' => {
+            ' ' | '\t' => {
                 i += 1;
                 continue;
             }
@@ -222,6 +231,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                         body.push_str(&l);
                         body.push('\n');
                     }
+                    bodies.push(body.clone());
                     if !quoted {
                         for sub in find_substitutions(&body) {
                             if let Some(last) = raw_units.last_mut() {
@@ -325,7 +335,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         while i < chars.len() {
             let c = chars[i];
             match c {
-                ' ' | '\t' | '\r' | '\n' | ';' | '&' | '|' | '(' | ')' => break,
+                ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' => break,
                 '<' | '>' if chars.get(i + 1) != Some(&'(') => {
                     // `2>file`: digits directly before a redirect are the fd.
                     break;
@@ -576,6 +586,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             }
             Some(Pending::HereString) => {
                 out.reasons.push("here-string".into());
+                bodies.push(word);
             }
             None => {
                 if cur.argv.is_empty() && assign_name_end.is_some() {
@@ -657,6 +668,43 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             out.units.push(u);
         }
     }
+    // Text fed to a shell on stdin (here-docs, here-strings, `echo … | sh`) is
+    // a command line too.
+    let takes_stdin_code = |u: &Unit| {
+        u.eff.first().is_some_and(|f| {
+            let b = base(f);
+            (is_shell(b) && payload_of(&u.eff).is_none() && !u.eff[1..].iter().any(|a| !a.starts_with('-')))
+                || matches!(b, "eval" | "source" | ".")
+        })
+    };
+    let mut extra_units: Vec<Unit> = vec![];
+    if out.units.iter().any(&takes_stdin_code) {
+        for b in &bodies {
+            for mut u in lex_depth(b, depth + 1, true).units {
+                u.derived = true;
+                extra_units.push(u);
+            }
+        }
+    }
+    for (j, u) in out.units.iter().enumerate() {
+        if u.pipe != 0 && u.seg.piped && takes_stdin_code(u) {
+            for prev in out.units[..j].iter().filter(|p| p.pipe == u.pipe) {
+                if prev.eff.first().is_some_and(|f| matches!(base(f), "echo" | "printf")) {
+                    let text = prev.eff[1..]
+                        .iter()
+                        .filter(|a| !a.starts_with('-'))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    for mut x in lex_depth(&text, depth + 1, true).units {
+                        x.derived = true;
+                        extra_units.push(x);
+                    }
+                }
+            }
+        }
+    }
+    out.units.extend(extra_units);
     out.reasons.sort();
     out.reasons.dedup();
     out
@@ -878,14 +926,24 @@ fn payload_of(eff: &[String]) -> Option<String> {
     }
 }
 
-/// `find … -exec CMD … ;` becomes its own unit so hard-deny sees `CMD`.
-fn find_exec_units(eff: &[String], units: &mut Vec<Unit>) {
-    // roots: leading words that aren't expression starters
-    let mut roots = vec![];
+/// The directories `find` walks and the index where its expression starts.
+/// Skips the leading options (`-H -L -P -E -X -O<n> -D <x>`).
+pub fn find_roots(eff: &[String]) -> (Vec<String>, usize) {
     let mut j = 1;
     while j < eff.len() {
         let w = eff[j].as_str();
-        if w.starts_with('-') && w != "-" || w == "!" || w == "(" {
+        if matches!(w, "-H" | "-L" | "-P" | "-E" | "-X") || (w.starts_with("-O") && w.len() > 2) {
+            j += 1;
+        } else if w == "-D" {
+            j += 2;
+        } else {
+            break;
+        }
+    }
+    let mut roots = vec![];
+    while j < eff.len() {
+        let w = eff[j].as_str();
+        if (w.starts_with('-') && w != "-") || w == "!" || w == "(" {
             break;
         }
         roots.push(eff[j].clone());
@@ -894,6 +952,12 @@ fn find_exec_units(eff: &[String], units: &mut Vec<Unit>) {
     if roots.is_empty() {
         roots.push(".".into());
     }
+    (roots, j.min(eff.len()))
+}
+
+/// `find … -exec CMD … ;` becomes its own unit so hard-deny sees `CMD`.
+fn find_exec_units(eff: &[String], units: &mut Vec<Unit>) {
+    let (roots, j) = find_roots(eff);
     let mut k = j;
     while k < eff.len() {
         if matches!(eff[k].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {

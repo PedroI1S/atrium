@@ -16,6 +16,9 @@ use super::shell::{self, Unit, base, is_shell};
 use super::words::{self, CwdState, Role, Use, Walk, lexical_resolve};
 use crate::PolicyInput;
 
+const MAX_BYTES: usize = 128 * 1024;
+const MAX_UNITS: usize = 512;
+
 /// What the engine knows about a call, computed once.
 pub struct Analysis {
     pub units: Vec<Unit>,
@@ -29,6 +32,8 @@ pub struct Analysis {
     pub use_index: HashMap<(usize, String), Vec<usize>>,
     pub unit_cwd: Vec<CwdState>,
     pub cwd_unknown: bool,
+    /// Bigger than the checker takes on (line bytes, commands, words, paths).
+    pub overflow: bool,
     /// Text the raw-string checks run on.
     pub raw: Vec<String>,
     /// The starting directory of a command.
@@ -79,14 +84,24 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         use_index: HashMap::new(),
         unit_cwd: vec![],
         cwd_unknown: false,
+        overflow: false,
         raw: vec![],
         start: input.cwd.to_path_buf(),
     };
     let lex_cmd = |a: &mut Analysis, line: &str, start: &Path| {
+        if line.len() > MAX_BYTES {
+            a.overflow = true;
+            return;
+        }
         let l = shell::lex(line);
         a.units = l.units;
         a.reasons = l.reasons;
+        if a.units.len() > MAX_UNITS {
+            a.overflow = true;
+            return;
+        }
         let walk: Walk = words::walk(&a.units, start, home, resolve);
+        a.overflow |= walk.overflow;
         a.unit_cwd = walk.unit_cwd.clone();
         a.cwd_unknown = walk.unknown;
         a.uses = walk.uses;
@@ -114,7 +129,10 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
                 ToolKind::Read | ToolKind::Search => Role::Read,
                 _ => Role::Write,
             };
-            for p in paths {
+            if paths.len() > words::MAX_USES {
+                a.overflow = true;
+            }
+            for p in paths.iter().take(words::MAX_USES) {
                 pseudo(&mut a, p, role);
             }
         }
@@ -127,7 +145,10 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         ToolSubject::Mcp { .. } => {
             let mut s = vec![];
             strings_of(&check.input, &mut s);
-            for x in s.iter().filter(|x| path_like(x)) {
+            if s.len() > words::MAX_USES {
+                a.overflow = true;
+            }
+            for x in s.iter().filter(|x| path_like(x)).take(words::MAX_USES) {
                 pseudo(&mut a, x, Role::Read);
             }
         }
@@ -135,13 +156,22 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         ToolSubject::Unknown => {
             let mut s = vec![];
             strings_of(&check.input, &mut s);
+            if s.iter().map(String::len).sum::<usize>() > MAX_BYTES || s.len() > words::MAX_USES {
+                a.overflow = true;
+                return a;
+            }
             let mut units = vec![];
             for x in &s {
                 units.extend(shell::lex(x).units);
                 a.raw.push(x.clone());
             }
             a.units = units;
+            if a.units.len() > MAX_UNITS {
+                a.overflow = true;
+                return a;
+            }
             let walk = words::walk(&a.units, input.cwd, home, resolve);
+            a.overflow |= walk.overflow;
             a.unit_cwd = walk.unit_cwd.clone();
             a.cwd_unknown = walk.unknown;
             a.uses = walk.uses;
@@ -184,7 +214,8 @@ impl Analysis {
 // ---------------------------------------------------------------------------
 
 fn lower(p: &Path) -> String {
-    let s = p.to_string_lossy().to_lowercase();
+    // APFS folds ſ (U+017F) to s; `to_lowercase` already maps K (U+212A) to k.
+    let s = p.to_string_lossy().to_lowercase().replace('ſ', "s");
     let s = s.trim_end_matches('/');
     if s.is_empty() {
         "/".into()
@@ -481,7 +512,7 @@ impl ShellGlob {
 // ---------------------------------------------------------------------------
 
 const DOWNLOADERS: &[&str] = &["curl", "wget", "fetch"];
-const PRIV: &[&str] = &["sudo", "su", "doas", "pkexec", "run0"];
+const PRIV: &[&str] = &["sudo", "sudoedit", "su", "doas", "pkexec", "run0"];
 
 fn is_interpreter(cmd: &str) -> bool {
     let b = base(cmd);
@@ -510,17 +541,35 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
     if args.iter().any(|a| a == "-" || a == "-s") {
         return true;
     }
+    // For a shell only `-c` means code follows; `-e`, `-E`, `-m` are options.
+    let shell = is_shell(b);
     let code_flag = args.iter().any(|a| {
         a.starts_with('-')
             && !a.starts_with("--")
             && a.len() > 1
-            && a[1..].chars().any(|c| matches!(c, 'c' | 'e' | 'E' | 'm'))
-            || matches!(a.as_str(), "--eval" | "--command" | "--print")
+            && a[1..].chars().any(|c| {
+                c == 'c' || (!shell && matches!(c, 'e' | 'E' | 'm'))
+            })
+            || (!shell && matches!(a.as_str(), "--eval" | "--command" | "--print"))
     });
     if code_flag {
         return false;
     }
-    !args.iter().any(|a| !a.starts_with('-'))
+    // `bash -o pipefail`: the option's value isn't a script
+    let mut positional = false;
+    let mut k = 0;
+    while k < args.len() {
+        let a = args[k].as_str();
+        if shell && matches!(a, "-o" | "+o" | "-O" | "+O") {
+            k += 2;
+            continue;
+        }
+        if !a.starts_with('-') && !a.starts_with('+') {
+            positional = true;
+        }
+        k += 1;
+    }
+    !positional
 }
 
 fn is_executor(eff: &[String]) -> bool {
@@ -582,13 +631,17 @@ fn force_push(eff: &[String]) -> bool {
             after_dd = true;
         } else if w.starts_with("--") {
             let name = w.split('=').next().unwrap_or(w);
-            match name {
-                "--force" | "--force-with-lease" | "--force-if-includes" | "--mirror" => {
-                    force = true
-                }
-                "--all" | "--tags" | "--branches" | "--prune" => implicit = true,
-                "--push-option" | "--receive-pack" | "--exec" if !w.contains('=') => j += 1,
-                _ => {}
+            // git takes unique prefixes of long options (`--force-w`, `--mirr`)
+            let pfx = |full: &str| name.len() >= 4 && full.starts_with(name);
+            if ["--force", "--force-with-lease", "--force-if-includes", "--mirror"]
+                .iter()
+                .any(|f| pfx(f))
+            {
+                force = true;
+            } else if ["--all", "--tags", "--branches", "--prune"].iter().any(|f| pfx(f)) {
+                implicit = true;
+            } else if matches!(name, "--push-option" | "--receive-pack" | "--exec") && !w.contains('=') {
+                j += 1;
             }
         } else {
             if w[1..].contains('f') {
@@ -640,7 +693,11 @@ fn rm_recursive(eff: &[String]) -> Option<Vec<String>> {
             targets.push(w.clone());
         } else if w == "--" {
             dd = true;
-        } else if w == "--recursive" || (!w.starts_with("--") && w[1..].contains(['r', 'R'])) {
+        } else if (w.starts_with("--")
+            && w.len() >= 3
+            && "--recursive".starts_with(w.split('=').next().unwrap_or(w)))
+            || (!w.starts_with("--") && w[1..].contains(['r', 'R']))
+        {
             rec = true;
         }
     }
@@ -652,19 +709,7 @@ fn find_delete(eff: &[String]) -> Option<(Vec<String>, bool)> {
     if eff.first().map(|f| base(f)) != Some("find") || !eff.iter().any(|a| a == "-delete") {
         return None;
     }
-    let mut roots = vec![];
-    let mut j = 1;
-    while j < eff.len() {
-        let w = eff[j].as_str();
-        if w.starts_with('-') && w != "-" || w == "!" || w == "(" {
-            break;
-        }
-        roots.push(eff[j].clone());
-        j += 1;
-    }
-    if roots.is_empty() {
-        roots.push(".".into());
-    }
+    let (roots, j) = shell::find_roots(eff);
     let mut filtered = false;
     let mut k = j;
     while k < eff.len() {
@@ -732,6 +777,10 @@ impl Ctx<'_> {
                 !Path::new(&e).is_absolute()
             };
             if unknown && relative {
+                return true;
+            }
+            // `~name` for anyone but the user: can't tell where it points
+            if words::expand_home(t, self.home(), cwd).starts_with('~') {
                 return true;
             }
             let globby = t.contains(['*', '?', '[']);
@@ -845,6 +894,29 @@ impl Ctx<'_> {
             {
                 hits.push("disk-wipe");
             }
+            if b.starts_with("newfs") {
+                hits.push("disk-wipe");
+            }
+            if b == "diskutil"
+                && matches!(
+                    eff.get(1).map(|s| s.to_lowercase()).as_deref(),
+                    Some("apfs" | "cs" | "corestorage")
+                )
+                && eff.get(2).is_some_and(|v| {
+                    let v = v.to_lowercase();
+                    ["delete", "erase", "reformat", "zero", "secure", "resize", "split", "merge"]
+                        .iter()
+                        .any(|p| v.starts_with(p))
+                })
+            {
+                hits.push("disk-wipe");
+            }
+            if words::is_known_writer(eff)
+                && !matches!(b, "chmod" | "chown" | "chgrp")
+                && eff.iter().skip(1).any(|w| self.is_device(i, w))
+            {
+                hits.push("disk-wipe");
+            }
             if b == "diskutil"
                 && eff.get(1).is_some_and(|s| {
                     let s = s.to_lowercase();
@@ -869,7 +941,11 @@ impl Ctx<'_> {
             // credential commands
             if b == "security"
                 && eff.iter().skip(1).any(|w| {
-                    (w.starts_with("find-") && w.ends_with("-password")) || w == "dump-keychain"
+                    // `security` takes unique subcommand prefixes
+                    w.len() >= 6
+                        && ["find-generic-password", "find-internet-password", "dump-keychain"]
+                            .iter()
+                            .any(|f| f.starts_with(w.as_str()))
                 })
             {
                 hits.push("credential-read");

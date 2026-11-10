@@ -49,7 +49,14 @@ pub struct Walk {
     pub unit_cwd: Vec<CwdState>,
     pub unknown: bool,
     pub total: usize,
+    /// The call is bigger than the checker will take on.
+    pub overflow: bool,
 }
+
+pub const MAX_USES: usize = 4096;
+pub const MAX_PATHS: usize = 16384;
+const MAX_CANDIDATES: usize = 16;
+const MAX_BRACE_RESULTS: usize = 256;
 
 pub type Resolver<'a> = &'a dyn Fn(&str, &Path, &Path) -> PathBuf;
 
@@ -77,15 +84,24 @@ const WRITERS: &[&str] = &[
     "blkdiscard",
 ];
 
-/// Whether this command writes to (some of) the paths in its arguments.
+/// Commands that only read what they are given. For Atrium's protected
+/// paths, anything else counts as a writer.
+const READERS: &[&str] = &[
+    "cat", "head", "tail", "less", "more", "wc", "ls", "stat", "file", "grep", "egrep", "fgrep",
+    "rg", "ag", "ack", "diff", "cmp", "md5", "md5sum", "shasum", "sha1sum", "sha256sum", "du",
+    "df", "tree", "echo", "printf", "which", "whereis", "type", "readlink", "realpath", "basename",
+    "dirname", "test", "[", "pwd", "sort", "uniq", "cut", "tr", "nl", "od", "xxd", "hexdump",
+    "strings", "bat", "jq", "column", "fold", "expand", "true", "false", "id", "whoami", "uname",
+    "date", "cd", "pushd", "popd", "find", "awk", "sed", "perl",
+];
+
+/// Whether this command writes to (some of) the paths in its arguments: every
+/// command that isn't a known reader (`curl -o`, `tar -C`, …).
 pub fn is_writer(eff: &[String]) -> bool {
     let Some(first) = eff.first() else {
         return false;
     };
     let b = base(first);
-    if WRITERS.contains(&b) {
-        return true;
-    }
     match b {
         "sed" => eff.iter().skip(1).any(|a| {
             a == "-i" || a.starts_with("-i") && !a.starts_with("--") || a.starts_with("--in-place")
@@ -93,32 +109,41 @@ pub fn is_writer(eff: &[String]) -> bool {
         "perl" => eff.iter().skip(1).any(|a| {
             a.starts_with("-i") || (a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
         }),
-        _ => false,
+        _ => !READERS.contains(&b),
     }
+}
+
+/// Commands known to write to a path or device they are given.
+pub fn is_known_writer(eff: &[String]) -> bool {
+    let Some(first) = eff.first() else {
+        return false;
+    };
+    WRITERS.contains(&base(first))
 }
 
 /// `$HOME`, `${HOME}`, `$PWD` and a leading `~` expanded.
 pub fn expand_home(word: &str, home: &Path, cwd: &Path) -> String {
     let h = home.to_string_lossy();
-    if word == "~" {
-        return h.into_owned();
+    let c = cwd.to_string_lossy();
+    if let Some(after) = word.strip_prefix('~') {
+        let (name, rest) = match after.find('/') {
+            Some(i) => (&after[..i], &after[i..]),
+            None => (after, ""),
+        };
+        let user = home.file_name().map(|n| n.to_string_lossy().into_owned());
+        if name.is_empty() || user.as_deref() == Some(name) {
+            return format!("{h}{rest}");
+        }
+        if name == "+" || name == "-" {
+            return format!("{c}{rest}");
+        }
+        return word.to_string();
     }
-    if let Some(rest) = word.strip_prefix("~/") {
-        return format!("{h}/{rest}");
-    }
-    for (var, val) in [("$HOME", &*h), ("${HOME}", &*h)] {
+    for (var, val) in [("$HOME", &*h), ("${HOME}", &*h), ("$PWD", &*c), ("${PWD}", &*c)] {
         if let Some(rest) = word.strip_prefix(var)
             && (rest.is_empty() || rest.starts_with('/'))
         {
             return format!("{val}{rest}");
-        }
-    }
-    let c = cwd.to_string_lossy();
-    for var in ["$PWD", "${PWD}"] {
-        if let Some(rest) = word.strip_prefix(var)
-            && (rest.is_empty() || rest.starts_with('/'))
-        {
-            return format!("{c}{rest}");
         }
     }
     word.to_string()
@@ -158,57 +183,71 @@ fn has_unknown_var(w: &str) -> bool {
     w.contains('$') || w.contains('`')
 }
 
-/// `a{b,c}d` → `abd`, `acd` (comma lists only; capped).
-fn brace_expand(w: &str) -> Vec<String> {
-    fn go(w: &str, out: &mut Vec<String>) {
-        let cs: Vec<char> = w.chars().collect();
-        let mut i = 0;
-        while i < cs.len() {
-            if cs[i] == '{' && (i == 0 || cs[i - 1] != '$') {
-                let (mut d, mut j, mut commas) = (1usize, i + 1, vec![]);
-                while j < cs.len() && d > 0 {
-                    match cs[j] {
-                        '{' => d += 1,
-                        '}' => d -= 1,
-                        ',' if d == 1 => commas.push(j),
-                        _ => {}
+/// `a{b,c}d` → `abd`, `acd` (comma lists only). `None` when it would make
+/// more than a few hundred words.
+fn brace_expand(w: &str) -> Option<Vec<String>> {
+    let mut work = vec![w.to_string()];
+    let mut out = vec![];
+    while let Some(x) = work.pop() {
+        let cs: Vec<char> = x.chars().collect();
+        // matching braces and their top-level commas, in one pass
+        let mut stack: Vec<(usize, Vec<usize>)> = vec![];
+        let mut best: Option<(usize, usize, Vec<usize>)> = None;
+        for (i, &c) in cs.iter().enumerate() {
+            match c {
+                '{' => stack.push((i, vec![])),
+                ',' => {
+                    if let Some(top) = stack.last_mut() {
+                        top.1.push(i);
                     }
-                    j += 1;
                 }
-                if d == 0 && !commas.is_empty() {
-                    let pre: String = cs[..i].iter().collect();
-                    let post: String = cs[j..].iter().collect();
-                    let mut bounds = vec![i];
-                    bounds.extend(commas);
-                    bounds.push(j - 1);
-                    for k in 0..bounds.len() - 1 {
-                        let alt: String = cs[bounds[k] + 1..bounds[k + 1]].iter().collect();
-                        if out.len() > 256 {
-                            return;
-                        }
-                        go(&format!("{pre}{alt}{post}"), out);
+                '}' => {
+                    if let Some((open, commas)) = stack.pop()
+                        && !commas.is_empty()
+                        && (open == 0 || cs[open - 1] != '$')
+                        && best.as_ref().is_none_or(|b| open < b.0)
+                    {
+                        best = Some((open, i, commas));
                     }
-                    return;
+                }
+                _ => {}
+            }
+        }
+        match best {
+            None => out.push(x),
+            Some((open, close, commas)) => {
+                let pre: String = cs[..open].iter().collect();
+                let post: String = cs[close + 1..].iter().collect();
+                let mut bounds = vec![open];
+                bounds.extend(commas);
+                bounds.push(close);
+                for k in 0..bounds.len() - 1 {
+                    let alt: String = cs[bounds[k] + 1..bounds[k + 1]].iter().collect();
+                    work.push(format!("{pre}{alt}{post}"));
                 }
             }
-            i += 1;
         }
-        out.push(w.to_string());
+        if work.len() + out.len() > MAX_BRACE_RESULTS {
+            return None;
+        }
     }
-    let mut out = vec![];
-    go(w, &mut out);
-    if out.len() > 256 {
-        return vec![w.to_string()];
-    }
-    out
+    Some(out)
 }
 
 /// Words that name paths, in the order the gate and the engine both use.
-fn words_of(unit: &Unit) -> Vec<(String, Role)> {
+fn words_of(unit: &Unit, overflow: &mut bool) -> Vec<(String, Role)> {
     let mut out = vec![];
     for (w, role) in raw_words_of(unit) {
-        for e in brace_expand(&w) {
-            out.push((e, role));
+        match brace_expand(&w) {
+            Some(v) => out.extend(v.into_iter().map(|e| (e, role))),
+            None => {
+                *overflow = true;
+                return out;
+            }
+        }
+        if out.len() > MAX_USES {
+            *overflow = true;
+            return out;
         }
     }
     out
@@ -230,10 +269,17 @@ fn raw_words_of(unit: &Unit) -> Vec<(String, Role)> {
                 out.push((v.to_string(), role));
             }
         } else if w.starts_with('-') && w.len() > 1 {
-            let rest = &w[2..];
-            let rest = rest.strip_prefix('=').unwrap_or(rest);
-            if !rest.is_empty() {
-                out.push((rest.to_string(), role));
+            // every suffix after a flag letter: `-uf.npmrc` is `-u -f .npmrc`
+            let cs: Vec<char> = w.chars().skip(1).collect();
+            for k in 1..=cs.len().min(64) {
+                if k >= cs.len() {
+                    break;
+                }
+                let rest: String = cs[k..].iter().collect();
+                let rest = rest.strip_prefix('=').unwrap_or(&rest);
+                if !rest.is_empty() {
+                    out.push((rest.to_string(), role));
+                }
             }
         } else {
             out.push((w.clone(), role));
@@ -270,6 +316,7 @@ fn apply_cd(
     home: &Path,
     resolve: Resolver<'_>,
     unknown: &mut bool,
+    overflow: &mut bool,
 ) {
     let Some(first) = unit.eff.first() else {
         return;
@@ -319,7 +366,12 @@ fn apply_cd(
     match target {
         Some(t) => {
             *prev = current.or_else(|| prev.take());
-            seen.push(t.clone());
+            if !seen.contains(&t) {
+                seen.push(t.clone());
+            }
+            if seen.len() > MAX_CANDIDATES {
+                *overflow = true;
+            }
             *state = CwdState::Known(t);
         }
         None => {
@@ -336,13 +388,17 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
     let mut seen: Vec<PathBuf> = vec![start.to_path_buf()];
     for (i, unit) in units.iter().enumerate() {
         w.unit_cwd.push(state.clone());
-        for (word, role) in words_of(unit) {
+        for (word, role) in words_of(unit, &mut w.overflow) {
             let paths: Vec<PathBuf> = state
                 .candidates()
                 .into_iter()
                 .map(|c| resolve(&word, c, home))
                 .collect();
             w.total += paths.len();
+            if w.uses.len() >= MAX_USES || w.total > MAX_PATHS {
+                w.overflow = true;
+                return w;
+            }
             w.uses.push(Use {
                 word,
                 role,
@@ -359,7 +415,11 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
             home,
             resolve,
             &mut w.unknown,
+            &mut w.overflow,
         );
+        if w.overflow {
+            return w;
+        }
     }
     w
 }
