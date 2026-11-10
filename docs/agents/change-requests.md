@@ -86,3 +86,21 @@ Two contract-level findings from `docs/agents/reviews/M1-03-policy.md`. They cha
 - (b) keep the prefix match and word the UI "commands starting with …".
 
 **Affected**: `atrium-protocol` policy (`HOME_READONLY_COMMANDS`, and `RuleMatcher` under (a)), contract §5 and §9, M1-03's engine and tables, and the M1-07/M1-08 approval UI wording.
+
+## CR-07 — M1-06-client (orchestrator) — 2026-11-10
+
+Non-blocking. `atrium-client` is built against the wire as frozen and works with it; these are three places where the wire can't say what the client needs. Each has a stated workaround. They change `wire.rs`, so they need the driver's approval.
+
+**1. No way to read a range of a thread's history.** A thread is loaded by `Subscribe { after: None }`, which replays every event from its start. The client folds that into its cache and serves snapshots and older pages from there (contract §11, "paged back from the client"). Two costs:
+- Opening a large thread means replaying all of it, however little the view shows.
+- The cache is capped at 64 MiB per thread (`atrium_client::MAX_CACHED_THREAD_BYTES`). Past that the oldest history is dropped and can't be paged back: snapshots and pages say `truncated`. The history is still in the store and in exports.
+
+**Change proposed:** `DaemonCommand::ReadEvents { thread_id, before: Option<EventId>, limit: u32 }` (value: events before `before`, newest first), with `Store::events_before` behind it. The client would then keep only a tail and page the rest from the daemon. Affects `wire.rs`, the `Store` trait and `SqliteStore`, M1-05, and the client's cache.
+
+**2. A thread that is archived leaves no trace on the control lane.** `ThreadUpdated` carries a `ThreadSummary`, which has no "archived" field, and no message says a thread left the list. The client removes the thread and tells its windows (`Delivery::ThreadRemoved`) when its own `ArchiveThread` succeeds. A thread archived by anything else stays in the app's list until the next reconnect.
+
+**Change proposed:** `ServerMessage::ThreadRemoved { thread_id }` on the control lane for inbox subscribers. Affects `wire.rs`, M1-05, and one line in the client.
+
+**3. What follows a replaced subscription.** `wire.rs` says subscribing again "replaces the earlier subscription and replays from the new cursor". The client relies on a stronger reading: once the daemon has answered a `Subscribe`, it sends no event and no `ReplayDone` of an earlier subscription to that thread on that connection, including frames it had already queued. Without that, a late event of the old subscription can be taken for the first event of the new replay. The client drops everything for the thread between sending `Subscribe` and its answer, which is safe only with this rule. The same applies after `Unsubscribe` followed by a new `Subscribe`.
+
+**Change proposed:** state that rule in `wire.rs` ("Session", step 2), and say which `ErrorCode` a cursor beyond the thread's last event gets (the client treats any error but `UnknownThread` on a subscribe that carried a cursor as "reload the thread from its start"). Affects `wire.rs` docs and M1-05; M1-13 should test it.
