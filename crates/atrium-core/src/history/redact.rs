@@ -46,13 +46,15 @@ const SECRET_KEY_SUFFIXES: &[&[u8]] = &[
 ///   (`AIza…`) and OAuth tokens (`ya29.…`), Slack (`xox[abprs]-…`), Stripe live
 ///   keys (`sk_live_…`, `rk_live_…`), JSON Web Tokens, and PEM private-key
 ///   blocks.
-/// - **Credentials, by where they are**: the value of `Authorization: …`, a
-///   `Bearer …` token, the password in `scheme://user:password@host`, and the
-///   value of a key ending in `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
-///   `_PASS`, `API_KEY`, `APIKEY`, `SECRET_KEY`, `PRIVATE_KEY` or `ACCESS_KEY`
-///   (any case, `-` and `.` count as `_`) written as `KEY=value`,
-///   `key = "value"`, `"key": "value"`, `--key value`, or a YAML line
-///   `key: value` whose value looks random.
+/// - **Credentials, by where they are**: the value of an `Authorization` or
+///   `Cookie` header, a `Bearer …` token, the password in
+///   `scheme://user:password@host` and in `-u user:password`, and the value
+///   of a key ending in `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `_PASS`,
+///   `API_KEY`, `APIKEY`, `SECRET_KEY`, `PRIVATE_KEY` or `ACCESS_KEY` (any
+///   case, `-` and `.` count as `_`) written as `KEY=value`, `key = "value"`,
+///   `"key": "value"`, `--key value`, `Some-Key: value`, or as a line
+///   `key: value` or `key = value` whose value looks random. In JSON, every
+///   string under such a key.
 /// - The home directory becomes `~`. The user name is kept (it's their own
 ///   history).
 /// - Extra literal secrets can be added (tests use canaries).
@@ -129,28 +131,30 @@ impl Redactor {
     }
 
     /// Redacts a JSON value in place: every string (object keys included)
-    /// through [`Redactor::text`], and the whole string value of a key that
-    /// names a secret.
+    /// through [`Redactor::text`], and every string under a key that names a
+    /// secret as a whole, however deep (`"password": ["…"]`).
     pub(super) fn value(&self, value: &mut Value) {
+        self.value_under(value, false);
+    }
+
+    fn value_under(&self, value: &mut Value, secret: bool) {
         match value {
+            Value::String(s) if secret => {
+                if !s.is_empty() {
+                    *s = REDACTED.to_owned();
+                }
+            }
             Value::String(s) => {
                 let redacted = self.text(s);
                 if redacted != *s {
                     *s = redacted;
                 }
             }
-            Value::Array(items) => items.iter_mut().for_each(|v| self.value(v)),
+            Value::Array(items) => items.iter_mut().for_each(|v| self.value_under(v, secret)),
             Value::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len());
                 for (key, mut v) in std::mem::take(map) {
-                    match &mut v {
-                        Value::String(s) if is_secret_key(key.as_bytes()) => {
-                            if !s.is_empty() {
-                                *s = REDACTED.to_owned();
-                            }
-                        }
-                        other => self.value(other),
-                    }
+                    self.value_under(&mut v, secret || is_secret_key(key.as_bytes()));
                     out.insert(self.text(&key), v);
                 }
                 *map = out;
@@ -633,39 +637,35 @@ fn scan_private_keys(text: &str, emit: Emit<'_>) {
     }
 }
 
-/// The value of an `Authorization` header (in a header line, a curl argument
-/// or a JSON map), and any `Bearer <token>`.
+/// The value of an `Authorization` or `Cookie` header (in a header line, a
+/// curl argument or a JSON map; `Proxy-Authorization` and `Set-Cookie` too),
+/// and any `Bearer <token>`.
 fn scan_authorization(bytes: &[u8], emit: Emit<'_>) {
-    const NAME: &[u8] = b"authorization";
-    let mut from = 0;
-    while let Some(at) = find_ignoring_case(bytes, NAME, from) {
-        from = at + NAME.len();
-        let mut i = from;
-        if bytes.get(i).is_some_and(|c| is_quote(*c)) {
-            i += 1;
+    for name in [b"authorization".as_slice(), b"cookie"] {
+        let mut from = 0;
+        while let Some(at) = find_ignoring_case(bytes, name, from) {
+            from = at + name.len();
+            let mut i = from;
+            if bytes.get(i).is_some_and(|c| is_quote(*c)) {
+                i += 1;
+            }
+            i = skip_blanks(bytes, i);
+            if !matches!(bytes.get(i), Some(b':' | b'=')) {
+                continue;
+            }
+            i = skip_blanks(bytes, i + 1);
+            if bytes.get(i).is_some_and(|c| is_quote(*c)) {
+                i += 1;
+            }
+            let end = header_value_end(bytes, i);
+            if end > i {
+                emit(i, end, Kind::Secret);
+            }
+            // Nothing inside the value needs another look (and looking
+            // again from every match would take quadratic time on one long
+            // line).
+            from = end.max(from);
         }
-        i = skip_blanks(bytes, i);
-        if !matches!(bytes.get(i), Some(b':' | b'=')) {
-            continue;
-        }
-        i = skip_blanks(bytes, i + 1);
-        if bytes.get(i).is_some_and(|c| is_quote(*c)) {
-            i += 1;
-        }
-        let line_end = i + bytes[i..]
-            .iter()
-            .take_while(|c| !matches!(c, b'\n' | b'\r' | b'"' | b'\'' | b'`'))
-            .count();
-        let mut end = line_end;
-        while end > i && is_blank(bytes[end - 1]) {
-            end -= 1;
-        }
-        if end > i {
-            emit(i, end, Kind::Secret);
-        }
-        // Nothing inside the value needs another look (and looking again
-        // from every match would take quadratic time on one long line).
-        from = line_end.max(from);
     }
     const SCHEME: &[u8] = b"bearer";
     let mut from = 0;
@@ -746,29 +746,54 @@ fn assignment_value(bytes: &[u8], sep: usize) -> Option<(usize, usize)> {
     // A bare value is taken only where it is unlikely to be code. These
     // checks come before the value is measured, so a value that is skipped
     // is never walked.
-    let plain = !spaced_before && !quoted_key;
-    let taken = if c == b'=' {
-        // `KEY=value`, `?token=value`, `--password=value`. With blanks
-        // around the `=` it is far more often code (`token = next()`), and
-        // `==` is a comparison.
-        plain && !spaced_after && bytes.get(value) != Some(&b'=')
-    } else {
-        // A YAML line. One key can start a line, so each line's value is
-        // walked at most once.
-        plain && spaced_after && is_yaml_key(bytes, key_start)
-    };
-    if !taken {
+    if quoted_key {
         return None;
     }
-    let end = value + bare_value_len(&bytes[value..]);
-    let bare = &bytes[value..end];
-    if bare.is_empty() || is_keyword(bare) {
-        return None;
+    let key = &bytes[key_start..key_end];
+    match (c, spaced_before, spaced_after) {
+        // `KEY=value`, `?token=value`, `--password=value`; `==` compares.
+        (b'=', false, false) => {
+            if bytes.get(value) == Some(&b'=') {
+                return None;
+            }
+            let end = value + bare_value_len(&bytes[value..]);
+            let bare = &bytes[value..end];
+            (!bare.is_empty() && !is_keyword(bare)).then_some((value, end))
+        }
+        // `X-Api-Key: value`, `api-key: value`: a name with a dash is a
+        // header or a config key, never a variable. The rest of the line.
+        (b':', false, true) if key.contains(&b'-') => {
+            let end = header_value_end(bytes, value);
+            (end > value).then_some((value, end))
+        }
+        // `key: value` (YAML) and `key = value` (INI, TOML). These are also
+        // what code looks like (`token: String,`, `token = next()`), so the
+        // key must start its line and the value must look random. One key
+        // can start a line, so each line's value is walked at most once.
+        (b':', false, true) | (b'=', _, _) => {
+            if !starts_line(bytes, key_start) {
+                return None;
+            }
+            let end = value + bare_value_len(&bytes[value..]);
+            let bare = &bytes[value..end];
+            (ends_line(bytes, end) && looks_random(bare)).then_some((value, end))
+        }
+        _ => None,
     }
-    if c == b':' && !(ends_line(bytes, end) && looks_random(bare)) {
-        return None;
+}
+
+/// Where a header's value ends: the line, or a quote around the header.
+/// Trailing blanks are left out.
+fn header_value_end(bytes: &[u8], value: usize) -> usize {
+    let mut end = value
+        + bytes[value..]
+            .iter()
+            .take_while(|c| !matches!(c, b'\n' | b'\r' | b'"' | b'\'' | b'`'))
+            .count();
+    while end > value && is_blank(bytes[end - 1]) {
+        end -= 1;
     }
-    Some((value, end))
+    end
 }
 
 /// An unquoted value runs to the next whitespace, quote or backtick.
@@ -815,7 +840,7 @@ fn is_keyword(value: &[u8]) -> bool {
 }
 
 /// The key starts its line, after indentation and an optional list dash.
-fn is_yaml_key(bytes: &[u8], key_start: usize) -> bool {
+fn starts_line(bytes: &[u8], key_start: usize) -> bool {
     bytes[..key_start]
         .iter()
         .rev()
@@ -845,22 +870,34 @@ fn looks_random(value: &[u8]) -> bool {
 }
 
 /// `--password hunter2`, `--api-key "…"`: a flag that names a secret and
-/// takes its value as the next argument.
+/// takes its value as the next argument. Also the password in
+/// `-u user:password`.
 fn scan_flags(bytes: &[u8], emit: Emit<'_>) {
     let mut at = 0;
     while let Some(found) = memchr(b'-', bytes, at) {
         at = found + 1;
-        if bytes.get(found + 1) != Some(&b'-') || (found > 0 && is_key(bytes[found - 1])) {
+        if found > 0 && is_key(bytes[found - 1]) {
             continue;
         }
-        let key = found + 2;
+        let long = bytes.get(found + 1) == Some(&b'-');
+        let key = found + if long { 2 } else { 1 };
         let key_end = key + run(bytes, key, is_key);
         at = key_end.max(at);
-        if !is_secret_key(&bytes[key..key_end]) {
-            continue;
-        }
         let value = skip_blanks(bytes, key_end);
         if value == key_end {
+            continue;
+        }
+        let name = &bytes[key..key_end];
+        // `curl -u user:password`, `--user user:password`.
+        if name == b"u" || (long && name == b"user") {
+            let end = value + bare_value_len(&bytes[value..]);
+            if let Some(colon) = memchr(b':', &bytes[..end], value).filter(|c| c + 1 < end) {
+                emit(colon + 1, end, Kind::Secret);
+            }
+            at = end.max(at);
+            continue;
+        }
+        if !long || !is_secret_key(name) {
             continue;
         }
         match bytes.get(value) {

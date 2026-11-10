@@ -414,7 +414,33 @@ fn credentials_are_redacted_by_where_they_are() {
             "  - api_key: abcd1234efgh\nnext: 1",
             "  - api_key: [redacted]\nnext: 1",
         ),
+        (
+            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "aws_secret_access_key = [redacted]",
+        ),
+        // Headers.
+        (
+            r#"curl -H "X-Api-Key: abcdef" https://x"#,
+            r#"curl -H "X-Api-Key: [redacted]" https://x"#,
+        ),
+        (
+            "X-Auth-Token: opaque value here\nnext",
+            "X-Auth-Token: [redacted]\nnext",
+        ),
+        ("Cookie: session=abc123; theme=dark", "Cookie: [redacted]"),
+        (
+            "Set-Cookie: sid=xyz; HttpOnly\n",
+            "Set-Cookie: [redacted]\n",
+        ),
         // Flags.
+        (
+            "curl -u pedro:hunter2 https://x",
+            "curl -u pedro:[redacted] https://x",
+        ),
+        (
+            "curl --user pedro:hunter2 x",
+            "curl --user pedro:[redacted] x",
+        ),
         (
             "mysql --password hunter2 -u root",
             "mysql --password [redacted] -u root",
@@ -439,6 +465,12 @@ fn credentials_are_redacted_by_where_they_are() {
 fn ordinary_text_and_code_are_left_alone() {
     let cases = [
         "let token = lexer.next();",
+        "token = lexer.next();",
+        "secret = other_secret",
+        // A known gap, not a goal: too short to tell from code.
+        "password = hunter2",
+        "docker run -u root image and tar -u archive.tar",
+        "the cookies are in the jar, and a cookie-cutter",
         "token: String,",
         "secret: Vec<u8>,",
         "    password: string;",
@@ -602,6 +634,9 @@ fn redaction_stays_linear_on_one_long_line() {
         "token: ",
         "token=\"",
         "authorization:",
+        "cookie=",
+        "x-token: ",
+        "-u a:b",
         "bearer x",
         "--password x",
         "://a:",
@@ -936,7 +971,13 @@ fn jsonl_is_the_folded_event_stream() {
         .finish("c3", Some("final"))
         .push(AgentEvent::Unmapped {
             record_type: "debug".into(),
-            raw: json!({ "path": "/Users/pedro/x", "api_key": "abc" }),
+            raw: json!({
+                "path": "/Users/pedro/x",
+                "api_key": "abc",
+                // Everything under a key that names a secret.
+                "token": { "value": "abc", "ttl": 60, "old": ["def"] },
+                "/Users/pedro/key": true,
+            }),
         })
         .end();
 
@@ -983,7 +1024,12 @@ fn jsonl_is_the_folded_event_stream() {
         event(18),
         AgentEvent::Unmapped {
             record_type: "debug".into(),
-            raw: json!({ "path": "~/x", "api_key": "[redacted]" }),
+            raw: json!({
+                "path": "~/x",
+                "api_key": "[redacted]",
+                "token": { "value": "[redacted]", "ttl": 60, "old": ["[redacted]"] },
+                "~/key": true,
+            }),
         }
     );
 }

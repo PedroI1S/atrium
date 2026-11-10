@@ -22,7 +22,7 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, before 
 - Scanners run on the text as written and again on up to three layers of decoded escapes (JSON escapes, `\'`, `\xNN`, `\u{…}`). A match in a decoded layer is mapped back to the bytes that produced it (A13).
 - For JSONL and for tool input in Markdown, the JSON value is walked: every string and object key is redacted, and a string under a key that names a secret is replaced whole.
 - In Markdown, session text can only enter through methods that redact it; the method for fixed text takes `&'static str` only.
-- The full list of what is recognised is in the `Redactor` doc comment. It is wider than the contract's list: GitLab, npm, Stripe and Google OAuth tokens, JWTs, URL passwords, `--flag value`, quoted values, and YAML lines were added.
+- The full list of what is recognised is in the `Redactor` doc comment. It is wider than the contract's list: GitLab, npm, Stripe and Google OAuth tokens, JWTs, `Cookie` headers, header-style keys (`X-Api-Key: …`), URL passwords, `-u user:password`, `--flag value`, quoted values, and YAML or INI lines were added.
 
 **Export files.** The folder is opened first, its owner is checked on that handle, and the file is created relative to it with `O_CREAT | O_EXCL | O_NOFOLLOW`, then set to exactly 0600.
 
@@ -31,11 +31,12 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, before 
 - Three deliberate breakages were each caught by the tests: no escape decoding, one escape layer only, and no folder-owner check.
 
 ## Not caught by redaction
-- A secret with no recognisable shape that isn't next to a telling key, such as a bare password in prose.
-- `key: value` YAML lines whose value is short or has no digit (`password: hunter2`). Taking those would also blank type annotations in code (`token: String`).
-- `token = value` with spaces and no quotes, for the same reason (`token = lexer.next()`).
+- A secret with no recognisable shape that isn't next to a telling key, such as a bare password in prose or `.netrc`'s `password hunter2`.
+- `key: value` and `key = value` lines whose value is short or has no digit (`password: hunter2`). A bare value on such a line is taken only if it is at least 8 characters, has a digit and has no code punctuation; otherwise type annotations and assignments in code (`token: String`, `token = lexer.next()`) would be blanked.
+- A quoted value that continues on the next line: only its first line is taken. PEM blocks are handled separately and are taken whole.
 - Encodings other than JSON-style escapes: base64, percent-encoding, more than three layers of escaping.
 - Numbers under a secret key (`"pin": 1234`).
+- The home directory spelled differently (`$HOME`, another letter case).
 
 ## For M1-05 (`ExportThread`)
 - Pass the thread's events from its first event, oldest first. The fold needs every delta of a message.
