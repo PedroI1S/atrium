@@ -3,7 +3,7 @@
 Only one person drives at a time: runs the orchestrator, dispatches workers, merges.
 Managed by `scripts/handoff`. Don't edit by hand.
 
-state: free
-driver: Pedro Mariano
-since: 2026-11-10T19:03Z
-machine: Pedros-MacBook-Air
+state: active
+driver: rodrigo
+since: 2026-11-10T19:32Z
+machine: rodrigo
