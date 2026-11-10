@@ -89,7 +89,7 @@ Two contract-level findings from `docs/agents/reviews/M1-03-policy.md`. They cha
 
 ## CR-07 — M1-06-client (orchestrator) — 2026-11-10
 
-Non-blocking. `atrium-client` is built against the wire as frozen and works with it; these are three places where the wire can't say what the client needs. Each has a stated workaround. They change `wire.rs`, so they need the driver's approval. **Decided by rodrigo (driver), 2026-11-10 (D-058): points 2 and 3 approved, point 1 put off until after the M1 gate.**
+Non-blocking. `atrium-client` is built against the wire as frozen and works with it; these are three places where the wire can't say what the client needs. Each has a stated workaround. They change `wire.rs`, so they need the driver's approval. **Decided by rodrigo (driver), 2026-11-10 (D-058): points 2 and 3 approved, point 1 put off until after the M1 gate.** Points 2 and 3 are applied to `wire.rs`, the serde shape test, `bindings/protocol.ts`, contract §6.2 and `atrium-client` (which no longer infers a removal from its own `ArchiveThread`).
 
 **1. No way to read a range of a thread's history.** A thread is loaded by `Subscribe { after: None }`, which replays every event from its start. The client folds that into its cache and serves snapshots and older pages from there (contract §11, "paged back from the client"). Two costs:
 - Opening a large thread means replaying all of it, however little the view shows.

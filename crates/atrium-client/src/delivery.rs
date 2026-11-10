@@ -61,7 +61,7 @@ pub enum Delivery {
     InboxUpdated {
         items: Vec<InboxItem>,
     },
-    /// The thread was archived from this app.
+    /// The thread was archived and has left the list.
     ThreadRemoved {
         thread_id: ThreadId,
     },

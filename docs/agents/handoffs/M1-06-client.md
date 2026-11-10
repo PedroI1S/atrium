@@ -15,6 +15,11 @@ Gemini 3.8 Flash, two rounds: **approve with changes**, then **approve** (`docs/
 - Declined: a command timeout in the client. A command has one response and is never retried, and dropping the `Client::command` future is safe, so **the bridge (M1-09a) sets its own deadline per command**. A dropped command stays in the client's table until its answer or the connection's end.
 - Not a defect, but worth knowing: an item that never closes within an incarnation (a tool call with no `ToolCallFinished`) keeps its segment open, and an open segment is never evicted. The adapters' output caps bound it.
 
+## After the merge: CR-07 applied (D-058)
+- `ServerMessage::ThreadRemoved` exists now. The client forwards it to inbox windows as the daemon's own JSON and no longer infers a removal from its own `ArchiveThread` succeeding. So **M1-05 must send `ThreadRemoved` to every inbox subscriber when a thread is archived**, the archiving connection included.
+- The rule on replaced subscriptions is in `wire.rs` ("Session", step 2), with the error codes: `Invalid` for a cursor beyond the thread's last event, `UnknownThread` for an unknown thread.
+- Point 1 (`ReadEvents`) is put off until after the M1 gate.
+
 ## Done
 - New crate `crates/atrium-client`, added to the workspace. No dependency that wasn't already in `Cargo.lock` (`rustix` for the effective uid; `specta` behind the optional `ts` feature).
 - 28 unit tests (state machine, history cache, codec) and 11 tests over a real unix socket against a scripted daemon.

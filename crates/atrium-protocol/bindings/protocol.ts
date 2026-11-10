@@ -505,6 +505,13 @@ role: ClientRole } |
 { type: "replay_done"; thread_id: ThreadId; last: EventId | null } | { type: "response"; request_id: number; result: CommandResult } | 
 /**  Control lane, for `SubscribeInbox` connections. */
 { type: "thread_updated"; summary: ThreadSummary } | 
+/**
+ *  Control lane, for `SubscribeInbox` connections: the thread was
+ *  archived and has left the list, whoever archived it (the connection
+ *  that sent `ArchiveThread` gets this too). No `ThreadUpdated` for it
+ *  follows.
+ */
+{ type: "thread_removed"; thread_id: ThreadId } | 
 /**  Control lane: the whole ranked inbox, replacing the previous one. */
 { type: "inbox_updated"; items: InboxItem[] } | 
 /**

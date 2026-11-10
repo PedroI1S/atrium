@@ -1243,6 +1243,16 @@ fn wire_server_messages_and_error_codes() {
     );
 
     round_trip(
+        &ServerMessage::ThreadRemoved {
+            thread_id: ThreadId("t1".into()),
+        },
+        json!({
+            "type": "thread_removed",
+            "thread_id": "t1"
+        }),
+    );
+
+    round_trip(
         &ServerMessage::Response {
             request_id: 42,
             result: CommandResult::Ok { value: json!(null) },

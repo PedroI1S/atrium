@@ -182,8 +182,6 @@ impl WindowState {
 
 struct PendingCommand {
     reply: oneshot::Sender<Result<Value, CommandError>>,
-    /// Set for `ArchiveThread`: the thread to drop from the list on success.
-    archives: Option<ThreadId>,
 }
 
 /// What windows are shown, as opposed to the windows themselves.
@@ -507,6 +505,13 @@ impl State {
                     .insert(summary.thread_id.clone(), Listed { summary, bytes });
                 self.send_to_inbox_windows(json);
             }
+            ServerMessage::ThreadRemoved { thread_id } => {
+                // Like the updates, it reaches windows as the daemon's own
+                // JSON, which is `Delivery::ThreadRemoved`'s.
+                if self.known.threads.remove(&thread_id).is_some() {
+                    self.send_to_inbox_windows(json);
+                }
+            }
             ServerMessage::InboxUpdated { items } => {
                 self.known.inbox = items;
                 self.known.inbox_bytes = json.len();
@@ -568,12 +573,7 @@ impl State {
     fn on_response(&mut self, request: u64, result: CommandResult) -> Result<(), String> {
         if let Some(pending) = self.commands.remove(&request) {
             let result = match result {
-                CommandResult::Ok { value } => {
-                    if let Some(thread_id) = pending.archives {
-                        self.archived(thread_id);
-                    }
-                    Ok(value)
-                }
+                CommandResult::Ok { value } => Ok(value),
                 CommandResult::Err { code, message } => {
                     Err(CommandError::Rejected { code, message })
                 }
@@ -693,17 +693,6 @@ impl State {
         Ok(())
     }
 
-    /// `ArchiveThread` succeeded. The daemon sends no update for a thread
-    /// that leaves the list, so the client tells its windows.
-    fn archived(&mut self, thread_id: ThreadId) {
-        if self.known.threads.remove(&thread_id).is_none() {
-            return;
-        }
-        if let Some(json) = to_json(&Delivery::ThreadRemoved { thread_id }) {
-            self.send_to_inbox_windows(json);
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Commands
     // -----------------------------------------------------------------------
@@ -718,10 +707,6 @@ impl State {
         let Some(writer) = &self.writer else {
             return Err(CommandError::NotConnected);
         };
-        let archives = match &command {
-            DaemonCommand::ArchiveThread { thread_id } => Some(thread_id.clone()),
-            _ => None,
-        };
         let request = self.requests + 1;
         let frame = codec::encode(&ClientMessage::Command {
             request_id: request,
@@ -730,8 +715,7 @@ impl State {
         .map_err(|bytes| CommandError::TooLarge { bytes })?;
         writer.send(frame).map_err(|_| CommandError::NotConnected)?;
         self.requests = request;
-        self.commands
-            .insert(request, PendingCommand { reply, archives });
+        self.commands.insert(request, PendingCommand { reply });
         Ok(())
     }
 
@@ -1545,24 +1529,24 @@ mod tests {
         assert_eq!(rig.take(&main).expect("the update").json, json);
         assert_eq!(rig.drain(&pop), [], "it doesn't show the inbox");
 
-        // Archiving a thread from here takes it off every list.
-        let (reply, mut answer) = oneshot::channel();
-        rig.state
-            .command(
-                DaemonCommand::ArchiveThread {
-                    thread_id: ThreadId("a".into()),
-                },
-                reply,
-            )
-            .expect("sent");
-        rig.daemon(ok(2, Value::Null));
-        assert_eq!(answer.try_recv().expect("answered"), Ok(Value::Null));
+        // An archived thread leaves every list, whoever archived it. The
+        // window gets the daemon's own JSON, which reads as a delivery.
+        let json = rig.daemon(ServerMessage::ThreadRemoved {
+            thread_id: ThreadId("a".into()),
+        });
+        let outgoing = rig.take(&main).expect("the removal");
+        assert_eq!(outgoing.json, json);
         assert_eq!(
-            rig.drain(&main),
-            [Delivery::ThreadRemoved {
+            outgoing.delivery().expect("a delivery"),
+            Delivery::ThreadRemoved {
                 thread_id: ThreadId("a".into())
-            }]
+            }
         );
+        // One for a thread that isn't listed says nothing new.
+        rig.daemon(ServerMessage::ThreadRemoved {
+            thread_id: ThreadId("a".into()),
+        });
+        assert!(rig.take(&main).is_none());
 
         // A window that starts showing the inbox gets what is known now.
         rig.state.show_inbox(pop.label, pop.generation, true);
@@ -1579,7 +1563,7 @@ mod tests {
             .disconnected(ConnectionState::Connecting { attempt: 1 });
         rig.reconnect();
         rig.daemon(ok(
-            3,
+            2,
             json!({ "threads": [summary("c", "C")], "inbox": [] }),
         ));
         let fresh = Delivery::Inbox {

@@ -51,24 +51,32 @@
 //! 2. Client sends [`ClientMessage::Subscribe`] with a cursor (see below).
 //!    The daemon answers with a [`ServerMessage::Response`]: `Ok` with
 //!    `{"replay_until": EventId|null}` (the thread's last event at that
-//!    moment), or `Err` for an unknown thread or a cursor beyond the thread's
-//!    last event. After `Ok` it sends every stored event after the cursor up
-//!    to `replay_until`, then [`ServerMessage::ReplayDone`], then live events.
-//!    No event is skipped or duplicated across the replay/live boundary.
+//!    moment), or `Err`: [`ErrorCode::UnknownThread`] for an unknown thread,
+//!    [`ErrorCode::Invalid`] for a cursor beyond the thread's last event.
+//!    After `Ok` it sends every stored event after the cursor up to
+//!    `replay_until`, then [`ServerMessage::ReplayDone`] with `last` equal
+//!    to `replay_until`, then live events. No event is skipped or duplicated
+//!    across the replay/live boundary.
 //!    Subscribing again to the same thread on the same connection replaces
-//!    the earlier subscription and replays from the new cursor.
+//!    the earlier subscription and replays from the new cursor. **Once the
+//!    daemon has answered a `Subscribe` (or processed an `Unsubscribe`), it
+//!    sends no `Event`, `ReplayDone` or `SubscriptionLagged` of an earlier
+//!    subscription to that thread on that connection, frames it had already
+//!    queued included** (CR-07, D-058). So everything a client receives for
+//!    a thread after a subscribe response belongs to that subscription.
 //! 3. Commands carry a client-chosen `request_id`; the daemon answers each with
 //!    exactly one [`ServerMessage::Response`].
 //! 4. [`ClientMessage::SubscribeInbox`] is answered with `Response { Ok
 //!    {"threads": [ThreadSummary], "inbox": [InboxItem]} }` (the full current
-//!    set), then [`ServerMessage::ThreadUpdated`] and
-//!    [`ServerMessage::InboxUpdated`] for every later change, in order, on the
-//!    control lane.
+//!    set), then [`ServerMessage::ThreadUpdated`],
+//!    [`ServerMessage::ThreadRemoved`] and [`ServerMessage::InboxUpdated`]
+//!    for every later change, in order, on the control lane.
 //!
 //! # Lanes and slow readers
 //!
 //! The daemon writes each connection's **control lane** (responses,
-//! `ThreadUpdated`, `InboxUpdated`, `SubscriptionLagged`) before its **event
+//! `ThreadUpdated`, `ThreadRemoved`, `InboxUpdated`, `SubscriptionLagged`)
+//! before its **event
 //! lane** (replay pages and live events), so a command is never stuck behind
 //! replay. The event lane holds at most
 //! [`crate::limits::MAX_CONNECTION_QUEUE_BYTES`]. When a subscription would
@@ -383,6 +391,13 @@ pub enum ServerMessage {
     /// Control lane, for `SubscribeInbox` connections.
     ThreadUpdated {
         summary: ThreadSummary,
+    },
+    /// Control lane, for `SubscribeInbox` connections: the thread was
+    /// archived and has left the list, whoever archived it (the connection
+    /// that sent `ArchiveThread` gets this too). No `ThreadUpdated` for it
+    /// follows.
+    ThreadRemoved {
+        thread_id: ThreadId,
     },
     /// Control lane: the whole ranked inbox, replacing the previous one.
     InboxUpdated {
