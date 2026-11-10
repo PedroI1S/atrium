@@ -121,11 +121,13 @@ impl TryFrom<u8> for FrameKind {
 
 /// Global, strictly increasing, assigned by the daemon's store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(transparent)]
 pub struct EventId(pub u64);
 
 /// An agent event after the daemon has stored it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct StoredEvent {
     pub id: EventId,
     pub thread_id: ThreadId,
@@ -133,6 +135,7 @@ pub struct StoredEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientRole {
     /// The Atrium app. Human-control authority, after peer verification.
@@ -145,6 +148,7 @@ pub enum ClientRole {
 
 /// The authority a command needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum Authority {
     /// Read and act within one thread the connection is scoped to.
@@ -163,6 +167,7 @@ impl ClientRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Hello {
@@ -192,6 +197,7 @@ pub enum ClientMessage {
 /// Commands. Responses are [`CommandResult::Ok`] with the value given on each
 /// variant (`null` when none is given), or [`CommandResult::Err`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonCommand {
     /// Starts a Home thread. Value: [`ThreadSummary`].
@@ -298,6 +304,7 @@ impl DaemonCommand {
 
 /// One provider's probe result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 pub struct ProviderProbe {
     pub provider: Provider,
     /// `None` when the CLI isn't installed.
@@ -306,6 +313,7 @@ pub struct ProviderProbe {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
     Markdown,
@@ -313,6 +321,7 @@ pub enum ExportFormat {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentLaunch {
     /// A real provider session. The daemon validates it (provider enabled,
@@ -338,6 +347,7 @@ pub enum AgentLaunch {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     Welcome {
@@ -387,6 +397,7 @@ pub enum ServerMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommandResult {
     Ok { value: Value },
@@ -395,6 +406,7 @@ pub enum CommandResult {
 
 /// What clients branch on; `message` is for people.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// The approval or question is unknown, resolved, expired, or from an

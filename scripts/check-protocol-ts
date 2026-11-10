@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+committed="${root}/crates/atrium-protocol/bindings/protocol.ts"
+temp_file="$(mktemp)"
+trap 'rm -f "${temp_file}"' EXIT
+
+cargo run -p atrium-protocol --example export-ts --features ts -- "${temp_file}" >/dev/null
+
+if ! diff -u "${committed}" "${temp_file}"; then
+  echo "crates/atrium-protocol/bindings/protocol.ts is out of date. Run: cargo run -p atrium-protocol --example export-ts --features ts" >&2
+  exit 1
+fi
+
+echo "crates/atrium-protocol/bindings/protocol.ts is up to date."

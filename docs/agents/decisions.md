@@ -285,3 +285,18 @@ Pedro's Codex subscription has ended, so GPT-6.1 Sol and GPT-6 Astra are unavail
 - Known limits stated in Settings: auto-allowed git reads trust each repository's own git config; exports turn the home path into `~` and keep the user name.
 
 Changes from now on go through `docs/agents/change-requests.md`. Dispatching M1 workers needs its own go.
+
+## D-052 — 2026-11-09 — CR-05 approved: documented macOS API for peer verification
+**Decided by Pedro (driver).** Contract §4 now names `SecCodeCopyGuestWithAttributes` with `kSecGuestAttributeAudit` instead of the undocumented `SecCodeCreateWithAuditToken`, and states that unsigned dev builds compare the running (dynamic) code object's cdhash, never the static code on disk. No signature or behaviour change. macOS 11 is the stated minimum. From Sonnet's and Opus's M1-10 reviews; M1-10 implements it in its fix round.
+
+## D-053 — 2026-11-09 — Claude fallback when Argon runs out of usage
+**Decided by Pedro (driver).** Argon's usage is running low. If an Argon run fails (quota or otherwise), the task continues on a Claude model instead of waiting:
+- reviews of Sonnet's work (M1-03's security review) go to Opus 5.5: still a fresh, independent reviewer, though not cross-provider;
+- worker and fix rounds (M1-10's fixes) go to Sonnet 5.5, with Opus re-auditing any changed `unsafe` block.
+The work done so far on the branch is kept; the Claude model picks up from the branch and the reviews.
+
+## D-054 — 2026-11-09 — CR-06 approved, option (a): remembered command rules match exactly
+**Decided by Pedro (driver, owner per D-013)**, on the Opus security review of M1-03 (`reviews/M1-03-policy.md` findings 3 and 12):
+- "Always…" on a command now creates `RuleMatcher::CommandExact` (the whole argv). A remembered `rm -rf build` no longer allows `rm -rf build ~/Documents`. `CommandPrefix` rules can be created only in the rules editor.
+- In `HOME_READONLY_COMMANDS`, `date` also forbids `-f`/`--file`, because GNU `date -f FILE` prints FILE's lines. This is stricter than D-050/D-051.
+Applied to `atrium-protocol` (`policy.rs`, the serde shape test, `bindings/protocol.ts`) and contract §5 and §9. M1-03 implements it in its fix round. The M1-07/M1-08 approval UI shows the exact command.

@@ -64,3 +64,25 @@ Feedback on CR-02 and three small amendments to `docs/design/ui-direction.md`, f
 **Why**: (1) and (2) describe what the platform can do; (3)–(5) close gaps the spike hit. Details and measurements: `docs/spikes/M0-06b-ui-shell-layout-b.md` ("CR-02 feedback").
 
 **Affected**: `docs/design/ui-direction.md` §3 and §5, the Calm theme files' `[component]` tables, CR-02's text. No Rust contract is touched.
+
+## CR-05 — M1-10-host (orchestrator, from review) — 2026-11-09
+
+The M1 contract (§4, and `crates/atrium-host/src/peer.rs` doc comments) names `SecCodeCreateWithAuditToken` for macOS peer verification. Sonnet's M1-10 review found it isn't in the public Security headers: it's exported, but undocumented, and linking it directly would make the daemon fail to load on a macOS that lacks it.
+
+**Change**: in §4 and on `verify_app_peer`, "audit token → `SecCodeCreateWithAuditToken`" becomes "audit token → `SecCodeCopyGuestWithAttributes` with `kSecGuestAttributeAudit`" (the documented route to the same code object). Also make explicit that the unsigned dev-build cdhash comes from the **running** (dynamic) code object, which §4 already intends ("never a hash of the file on disk"). No signature or behaviour change. macOS 11 is the stated minimum.
+
+**Why**: an undocumented symbol is an ABI and availability risk on the security-critical path.
+
+**Affected**: `docs/contracts/m1.md` §4 wording, doc comments in `crates/atrium-host/src/peer.rs` (M1-10 updates them in its fix round). **Approved by Pedro (driver), 2026-11-09 (D-052)**; applied to `docs/contracts/m1.md` §4.
+
+## CR-06 — M1-03-policy (orchestrator, from the Opus security review) — 2026-11-09
+
+Two contract-level findings from `docs/agents/reviews/M1-03-policy.md`. They change security defaults, so they need Pedro's approval (D-013). **Approved by Pedro (driver), 2026-11-09, option (a) (D-054)**; applied to `atrium-protocol` and contract §5 and §9.
+
+**1. `date` guard (finding 3).** On GNU `date` (Linux, and Homebrew's coreutils on macOS), `-f FILE` prints every line of FILE in an error message. In `HOME_READONLY_COMMANDS` (`crates/atrium-protocol/src/policy.rs`), the `date` entry's `forbidden` goes from `["-s", "--set"]` to `["-s", "--set", "-f", "--file"]`. BSD `date -f fmt` would then ask too. The worker's fix (resolving every suffix of a short-flag cluster) already closes the reported bypass. This is defence in depth.
+
+**2. Remembered command rules match extra arguments (finding 12).** "Always allow `rm -rf build`" stores `CommandPrefix ["rm","-rf","build"]`, and that rule also allows `rm -rf build ~/Documents`. The options:
+- (a) remembered rules match the whole argv exactly (a new `RuleMatcher::CommandExact`), and prefix rules can only be created in the rules editor. **Recommended.**
+- (b) keep the prefix match and word the UI "commands starting with …".
+
+**Affected**: `atrium-protocol` policy (`HOME_READONLY_COMMANDS`, and `RuleMatcher` under (a)), contract §5 and §9, M1-03's engine and tables, and the M1-07/M1-08 approval UI wording.
