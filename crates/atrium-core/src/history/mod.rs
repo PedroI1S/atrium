@@ -1,10 +1,23 @@
 //! History export and message reconstruction (contract §13).
 //! **Owned by M1-11.** Public items named in `lib.rs` are contract.
-
-use std::io::Write;
+//!
+//! - [`reconstruct_message`] rebuilds a message from its deltas and checks it
+//!   against its completion.
+//! - [`Redactor`] removes secrets from exported text (`redact.rs`).
+//! - [`export_thread`] writes one thread as Markdown or JSONL (`export.rs`).
+//! - [`create_export_file`] creates the private file an export goes into
+//!   (`file.rs`).
 
 use atrium_protocol::agent::MessageBody;
-use atrium_protocol::wire::{ExportFormat, StoredEvent};
+use sha2::{Digest, Sha256};
+
+mod export;
+mod file;
+mod redact;
+
+pub use export::export_thread;
+pub use file::create_export_file;
+pub use redact::Redactor;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HistoryError {
@@ -17,60 +30,60 @@ pub enum HistoryError {
 }
 
 /// Rebuilds a message from its deltas, checking the completion.
+///
+/// A `Streamed` body must match the deltas in number, in length (Unicode
+/// scalar values) and in SHA-256. An `Inline` body is the whole text, so it
+/// must come with no deltas. Anything else is [`HistoryError::Integrity`].
 pub fn reconstruct_message(
     message_id: &str,
     deltas: &[&str],
     body: &MessageBody,
 ) -> Result<String, HistoryError> {
-    let _ = (message_id, deltas, body);
-    unimplemented!("M1-11")
+    verify_message(message_id, deltas.concat(), deltas.len() as u64, body)
 }
 
-/// Redaction for exports of real sessions (secrets aren't known canaries).
-/// Works on decoded content: reconstructed messages, and JSON strings nested
-/// inside tool input and output, after `\uXXXX` and escape decoding.
-/// - Token patterns: Anthropic (`sk-ant-…`), OpenAI (`sk-…`), GitHub
-///   (`gh[pousr]_…`, `github_pat_…`), AWS access keys (`AKIA…`, `ASIA…`), Google
-///   API keys (`AIza…`), Slack (`xox[abpr]-…`), PEM private-key blocks,
-///   `Authorization: Bearer …`, and `KEY=value` lines whose key ends in
-///   `TOKEN`, `SECRET`, `PASSWORD` or `API_KEY`.
-/// - The home directory becomes `~`. The user name is kept (it's their own
-///   history).
-/// - Extra literal secrets can be added (tests use canaries).
-#[derive(Debug, Clone, Default)]
-pub struct Redactor {
-    _private: (),
-}
-
-impl Redactor {
-    pub fn new(home: &str, extra_secrets: &[&str]) -> Self {
-        let _ = (home, extra_secrets);
-        unimplemented!("M1-11")
+/// [`reconstruct_message`] for deltas that were already joined into `text`
+/// (the export joins them as they arrive, so a message of millions of deltas
+/// costs one string).
+fn verify_message(
+    message_id: &str,
+    text: String,
+    deltas: u64,
+    body: &MessageBody,
+) -> Result<String, HistoryError> {
+    let integrity = || HistoryError::Integrity {
+        message_id: message_id.to_owned(),
+    };
+    match body {
+        MessageBody::Inline { text: whole } => {
+            if deltas != 0 {
+                return Err(integrity());
+            }
+            Ok(whole.clone())
+        }
+        MessageBody::Streamed {
+            chars,
+            deltas: count,
+            sha256,
+        } => {
+            if deltas != *count
+                || text.chars().count() as u64 != *chars
+                || hex(&Sha256::digest(text.as_bytes())) != *sha256
+            {
+                return Err(integrity());
+            }
+            Ok(text)
+        }
     }
+}
 
-    pub fn text(&self, text: &str) -> String {
-        let _ = text;
-        unimplemented!("M1-11")
+/// Lowercase hex, as `MessageBody::Streamed::sha256` is written.
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0xf)]));
     }
-}
-
-/// Creates an export file: new file only (`O_CREAT | O_EXCL`), `O_NOFOLLOW`,
-/// mode 0600, in a directory owned by the user. The daemon writes the export
-/// into it with [`export_thread`].
-pub fn create_export_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let _ = path;
-    unimplemented!("M1-11")
-}
-
-/// Writes one thread's events as Markdown or JSONL, redacted with `redactor`.
-/// Returns bytes written. User messages (`MessageKind::User`) are included
-/// and redacted like the rest.
-pub fn export_thread(
-    events: &mut dyn Iterator<Item = StoredEvent>,
-    format: ExportFormat,
-    redactor: &Redactor,
-    out: &mut dyn Write,
-) -> Result<u64, HistoryError> {
-    let _ = (events, format, redactor, out);
-    unimplemented!("M1-11")
+    out
 }
