@@ -169,10 +169,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     let chars: Vec<char> = line.chars().collect();
     // Shells treat `\r` as a word character; any other control character is
     // something this lexer can't vouch for.
-    if chars
-        .iter()
-        .any(|c| (c.is_control() && !matches!(c, '\n' | '\t' | '\r')) || matches!(c, '\u{2028}' | '\u{2029}'))
-    {
+    if chars.iter().any(|c| {
+        (c.is_control() && !matches!(c, '\n' | '\t' | '\r')) || matches!(c, '\u{2028}' | '\u{2029}')
+    }) {
         out.reasons.push("control character".into());
     }
     let mut bodies: Vec<String> = vec![];
@@ -673,7 +672,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     let takes_stdin_code = |u: &Unit| {
         u.eff.first().is_some_and(|f| {
             let b = base(f);
-            (is_shell(b) && payload_of(&u.eff).is_none() && !u.eff[1..].iter().any(|a| !a.starts_with('-')))
+            (is_shell(b)
+                && payload_of(&u.eff).is_none()
+                && !u.eff[1..].iter().any(|a| !a.starts_with('-')))
                 || matches!(b, "eval" | "source" | ".")
         })
     };
@@ -689,7 +690,11 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     for (j, u) in out.units.iter().enumerate() {
         if u.pipe != 0 && u.seg.piped && takes_stdin_code(u) {
             for prev in out.units[..j].iter().filter(|p| p.pipe == u.pipe) {
-                if prev.eff.first().is_some_and(|f| matches!(base(f), "echo" | "printf")) {
+                if prev
+                    .eff
+                    .first()
+                    .is_some_and(|f| matches!(base(f), "echo" | "printf"))
+                {
                     let text = prev.eff[1..]
                         .iter()
                         .filter(|a| !a.starts_with('-'))

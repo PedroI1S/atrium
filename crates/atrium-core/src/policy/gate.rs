@@ -127,6 +127,116 @@ fn deny_reason(id: &str) -> String {
     format!("Always blocked ({id}): {}", d.map_or("", |d| d.description))
 }
 
+#[cfg(unix)]
+fn identity(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+}
+#[cfg(not(unix))]
+fn identity(_: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+const FIRMLINK: &str = "/System/Volumes/Data";
+
+/// Aliases of sensitive paths (`/.vol/<dev>/<ino>`, the Data firmlink, hard
+/// links, case-folded spellings) compare by identity: a path with a prefix
+/// that is the same file or folder as a sensitive root is rewritten onto that
+/// root, so the pure engine sees the canonical spelling.
+fn alias_fix(p: &Path, roots: &[((u64, u64), PathBuf)]) -> Result<PathBuf, String> {
+    let s = p.to_string_lossy();
+    if s == "/.vol" || s.starts_with("/.vol/") {
+        return Err("paths under /.vol can't be checked".into());
+    }
+    let p = match p.strip_prefix(FIRMLINK) {
+        Ok(rest) => Path::new("/").join(rest),
+        Err(_) => p.to_path_buf(),
+    };
+    let mut prefix = PathBuf::new();
+    let comps: Vec<_> = p.components().collect();
+    for (i, c) in comps.iter().enumerate() {
+        prefix.push(c.as_os_str());
+        if i == 0 {
+            continue;
+        }
+        if let Some(id) = identity(&prefix)
+            && let Some((_, root)) = roots.iter().find(|(rid, _)| *rid == id)
+        {
+            let mut out = root.clone();
+            for rest in &comps[i + 1..] {
+                out.push(rest.as_os_str());
+            }
+            return Ok(normalize(&out));
+        }
+    }
+    Ok(p)
+}
+
+/// The roots, plus the files and folders a few levels below each folder
+/// (hard links to a key inside `~/.ssh` are the same file).
+fn expand_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    const MAX_ENTRIES: usize = 2000;
+    let mut out = roots.clone();
+    let mut stack: Vec<(PathBuf, u8)> = roots.into_iter().map(|r| (r, 0)).collect();
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= 3 || out.len() > MAX_ENTRIES {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten().take(MAX_ENTRIES) {
+            let p = e.path();
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            out.push(p.clone());
+            if is_dir {
+                stack.push((p, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+fn evaluate_sync(
+    c: &SessionGateConfig,
+    policy: &dyn PolicyEngine,
+    check: &ToolCheck,
+    rules: &[Rule],
+    preset: Preset,
+) -> Result<Evaluated, String> {
+    let mut input = PolicyInput {
+        check,
+        thread: &c.thread,
+        provider: c.provider,
+        cwd: &c.cwd,
+        home: &c.home,
+        atrium_data_paths: &c.atrium_data_paths,
+        atrium_protected_paths: &c.atrium_protected_paths,
+        resolved_paths: &[],
+        preset,
+    };
+    let analysis = deny::analyze_with(&input, &fs_resolve);
+    let mut resolved = vec![];
+    if !analysis.overflow {
+        let roots: Vec<((u64, u64), PathBuf)> = expand_roots(deny::sensitive_roots(
+            &c.home,
+            &c.atrium_data_paths,
+            &c.atrium_protected_paths,
+        ))
+        .into_iter()
+        .filter_map(|r| identity(&r).map(|id| (id, r)))
+        .collect();
+        for u in &analysis.uses {
+            for p in &u.paths {
+                resolved.push(alias_fix(p, &roots)?);
+            }
+        }
+    }
+    input.resolved_paths = &resolved;
+    let verdict = policy.evaluate(&input, rules);
+    Ok(Evaluated { verdict, resolved })
+}
+
 pub struct Evaluated {
     pub verdict: PolicyVerdict,
     pub resolved: Vec<PathBuf>,
@@ -162,27 +272,26 @@ impl SessionGate {
         self.preset.lock().ok().map(|p| *p)
     }
 
-    fn evaluate(&self, check: &ToolCheck, rules: &[Rule], preset: Preset) -> Evaluated {
-        let c = &self.config;
-        let mut input = PolicyInput {
-            check,
-            thread: &c.thread,
-            provider: c.provider,
-            cwd: &c.cwd,
-            home: &c.home,
-            atrium_data_paths: &c.atrium_data_paths,
-            atrium_protected_paths: &c.atrium_protected_paths,
-            resolved_paths: &[],
-            preset,
-        };
-        let analysis = deny::analyze_with(&input, &fs_resolve);
-        let mut resolved = vec![];
-        for u in &analysis.uses {
-            resolved.extend(u.paths.iter().cloned());
-        }
-        input.resolved_paths = &resolved;
-        let verdict = self.policy.evaluate(&input, rules);
-        Evaluated { verdict, resolved }
+    /// Path resolution touches the filesystem, so it runs on the blocking
+    /// pool; a panic anywhere in it becomes an error (the caller denies).
+    async fn evaluate(
+        &self,
+        check: &ToolCheck,
+        rules: &[Rule],
+        preset: Preset,
+    ) -> Result<Evaluated, String> {
+        let cfg = self.config.clone();
+        let policy = self.policy.clone();
+        let check = check.clone();
+        let rules = rules.to_vec();
+        tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                evaluate_sync(&cfg, policy.as_ref(), &check, &rules, preset)
+            }))
+            .map_err(|_| "internal error while checking".to_string())?
+        })
+        .await
+        .map_err(|e| format!("internal error while checking: {e}"))?
     }
 
     /// The rule "always…" would create (contract §5, `SessionGate` docs).
@@ -200,7 +309,7 @@ impl SessionGate {
                 {
                     return None;
                 }
-                Some(RuleMatcher::CommandPrefix {
+                Some(RuleMatcher::CommandExact {
                     argv: u.seg.argv.clone(),
                 })
             }
@@ -227,7 +336,7 @@ impl SessionGate {
     async fn do_check(&self, check: &ToolCheck) -> Result<GateDecision, String> {
         let (rev, rules) = self.rules.snapshot().await.ok_or("rules unavailable")?;
         let preset = self.preset().ok_or("preset unavailable")?;
-        let e = self.evaluate(check, &rules, preset);
+        let e = self.evaluate(check, &rules, preset).await?;
         match &e.verdict {
             PolicyVerdict::Allow { .. } => Ok(GateDecision::Allow),
             PolicyVerdict::Deny { reason, .. } => Ok(GateDecision::Deny {
@@ -293,7 +402,7 @@ impl SessionGate {
         // Always evaluated, so a symlink swapped since the approval, a deny
         // rule added meanwhile or a changed preset can't reach a blocked
         // place. `Ask` is fine: the user already approved this call.
-        let e = self.evaluate(check, &others, preset);
+        let e = self.evaluate(check, &others, preset).await?;
         match e.verdict {
             PolicyVerdict::HardDeny { id } => {
                 let _ = self.ledger.withdraw(&key).await;

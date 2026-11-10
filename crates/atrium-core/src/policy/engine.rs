@@ -100,6 +100,12 @@ fn deny_matches(rule: &Rule, input: &PolicyInput<'_>, a: &Analysis, paths: &[Pat
                 .any(|u| prefix_of(&u.eff, argv) || prefix_of(&u.seg.argv, argv))
                 && path_scope_ok(rule, paths)
         }
+        RuleMatcher::CommandExact { argv } => {
+            a.units
+                .iter()
+                .any(|u| u.eff == *argv || u.seg.argv == *argv)
+                && path_scope_ok(rule, paths)
+        }
         RuleMatcher::PathGlob { glob } => {
             paths.iter().any(|p| glob_matches(glob, p)) && path_scope_ok(rule, paths)
         }
@@ -138,6 +144,18 @@ fn allow_covers(
                 .map(|&i| {
                     let u = &a.units[i];
                     u.seg.assignments.is_empty() && harmless(u) && prefix_of(&u.seg.argv, argv)
+                })
+                .collect()
+        }
+        RuleMatcher::CommandExact { argv } => {
+            if !simple {
+                return none;
+            }
+            part_ids
+                .iter()
+                .map(|&i| {
+                    let u = &a.units[i];
+                    u.seg.assignments.is_empty() && harmless(u) && u.seg.argv == *argv
                 })
                 .collect()
         }
@@ -412,6 +430,9 @@ fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
             };
             if name == "files" || name == "type-list" {
                 files_mode = true;
+            }
+            if !is_rg && name.len() >= 3 && "dereference-recursive".starts_with(name) {
+                return None; // follows every symlink below the root
             }
             if name == "regexp" {
                 have_pattern_flag = true;

@@ -547,9 +547,9 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
         a.starts_with('-')
             && !a.starts_with("--")
             && a.len() > 1
-            && a[1..].chars().any(|c| {
-                c == 'c' || (!shell && matches!(c, 'e' | 'E' | 'm'))
-            })
+            && a[1..]
+                .chars()
+                .any(|c| c == 'c' || (!shell && matches!(c, 'e' | 'E' | 'm')))
             || (!shell && matches!(a.as_str(), "--eval" | "--command" | "--print"))
     });
     if code_flag {
@@ -633,14 +633,24 @@ fn force_push(eff: &[String]) -> bool {
             let name = w.split('=').next().unwrap_or(w);
             // git takes unique prefixes of long options (`--force-w`, `--mirr`)
             let pfx = |full: &str| name.len() >= 4 && full.starts_with(name);
-            if ["--force", "--force-with-lease", "--force-if-includes", "--mirror"]
+            if [
+                "--force",
+                "--force-with-lease",
+                "--force-if-includes",
+                "--mirror",
+            ]
+            .iter()
+            .any(|f| pfx(f))
+            {
+                force = true;
+            } else if ["--all", "--tags", "--branches", "--prune"]
                 .iter()
                 .any(|f| pfx(f))
             {
-                force = true;
-            } else if ["--all", "--tags", "--branches", "--prune"].iter().any(|f| pfx(f)) {
                 implicit = true;
-            } else if matches!(name, "--push-option" | "--receive-pack" | "--exec") && !w.contains('=') {
+            } else if matches!(name, "--push-option" | "--receive-pack" | "--exec")
+                && !w.contains('=')
+            {
                 j += 1;
             }
         } else {
@@ -904,9 +914,11 @@ impl Ctx<'_> {
                 )
                 && eff.get(2).is_some_and(|v| {
                     let v = v.to_lowercase();
-                    ["delete", "erase", "reformat", "zero", "secure", "resize", "split", "merge"]
-                        .iter()
-                        .any(|p| v.starts_with(p))
+                    [
+                        "delete", "erase", "reformat", "zero", "secure", "resize", "split", "merge",
+                    ]
+                    .iter()
+                    .any(|p| v.starts_with(p))
                 })
             {
                 hits.push("disk-wipe");
@@ -943,9 +955,13 @@ impl Ctx<'_> {
                 && eff.iter().skip(1).any(|w| {
                     // `security` takes unique subcommand prefixes
                     w.len() >= 6
-                        && ["find-generic-password", "find-internet-password", "dump-keychain"]
-                            .iter()
-                            .any(|f| f.starts_with(w.as_str()))
+                        && [
+                            "find-generic-password",
+                            "find-internet-password",
+                            "dump-keychain",
+                        ]
+                        .iter()
+                        .any(|f| f.starts_with(w.as_str()))
                 })
             {
                 hits.push("credential-read");
@@ -1103,4 +1119,15 @@ pub fn hard_deny(input: &PolicyInput<'_>, a: &Analysis) -> Option<&'static str> 
 
 pub fn sensitive(input: &PolicyInput<'_>) -> Sensitive {
     Sensitive::new(input)
+}
+
+/// Every credential, `~/.ssh`, browser and Atrium location, absolute.
+pub fn sensitive_roots(home: &Path, data: &[PathBuf], protected: &[PathBuf]) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = vec![home.join(".ssh")];
+    for rel in CRED_FILES.iter().chain(CRED_TREES).chain(BROWSER_ROOTS) {
+        v.push(home.join(rel));
+    }
+    v.extend(data.iter().cloned());
+    v.extend(protected.iter().cloned());
+    v
 }

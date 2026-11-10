@@ -480,7 +480,7 @@ async fn deny_or_cancel_never_creates_a_grant() {
     assert_eq!(l.answer(&qk).await, Err(LedgerError::AlreadyResolved));
     assert_eq!(
         l.resolve(&qk, &ApprovalDecision::Allow, None).await,
-        Err(LedgerError::AlreadyResolved)
+        Err(LedgerError::Unknown)
     );
     assert_eq!(l.withdraw(&qk).await, Err(LedgerError::AlreadyResolved));
 }
@@ -892,4 +892,76 @@ async fn withdraw_racing_redeem_never_allows_a_cancelled_request() {
         let status = store.status(&k).unwrap();
         assert_eq!(status, if r.is_ok() { "redeemed" } else { "cancelled" });
     }
+}
+
+#[tokio::test]
+async fn resolving_a_question_as_an_approval_is_refused_and_it_stays_answerable() {
+    let (store, l) = setup();
+    let q = key(&l.open_question(&thread(), 1, Some(1)).await.unwrap());
+    assert_eq!(
+        l.resolve(&q, &ApprovalDecision::Allow, None).await,
+        Err(LedgerError::Unknown)
+    );
+    assert_eq!(
+        l.resolve(
+            &q,
+            &ApprovalDecision::Deny { message: None },
+            Some(RememberScope::Global)
+        )
+        .await,
+        Err(LedgerError::Unknown)
+    );
+    assert_eq!(store.status(&q).as_deref(), Some("pending"));
+    assert_eq!(l.answer(&q).await, Ok(()));
+}
+
+fn exact(argv: &[&str]) -> RuleMatcher {
+    RuleMatcher::CommandExact {
+        argv: argv.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn remembered_command_is_exact_not_a_prefix() {
+    let (store, l) = setup();
+    let g = gate(&store, l.clone());
+    let c = check(1, "touch build");
+    let GateDecision::Ask { ticket } = g.check(&c).await else {
+        panic!()
+    };
+    l.resolve(
+        &key(&ticket),
+        &ApprovalDecision::Allow,
+        Some(RememberScope::Global),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.0.lock().unwrap().rules[0].matcher,
+        exact(&["touch", "build"])
+    );
+    assert_eq!(g.redeem(&ticket, &c).await, GateDecision::Allow);
+    assert_eq!(g.check(&c).await, GateDecision::Allow);
+    // extra arguments are a different call
+    assert!(matches!(
+        g.check(&check(1, "touch build ~/Documents")).await,
+        GateDecision::Ask { .. }
+    ));
+    assert!(matches!(
+        g.check(&check(1, "touch")).await,
+        GateDecision::Ask { .. }
+    ));
+    // a prefix rule (from the editor) still matches extra arguments
+    store.0.lock().unwrap().rules.push(Rule {
+        id: RuleId("p".into()),
+        scope: RuleScope::Global,
+        tool_kind: ToolKind::Execute,
+        tool_name: None,
+        matcher: prefix(&["mkdir", "x"]),
+        path_scope: None,
+        decision: RuleDecision::Allow,
+        origin: RuleOrigin::Settings,
+        created_at_ms: 0,
+    });
+    assert_eq!(g.check(&check(1, "mkdir x y z")).await, GateDecision::Allow);
 }

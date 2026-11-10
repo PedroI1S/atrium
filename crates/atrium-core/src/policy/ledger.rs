@@ -147,6 +147,17 @@ impl ApprovalLedger for Ledger {
         let decision = decision.clone();
         Box::pin(async move {
             self.check_incarnation(&key.thread, key.incarnation).await?;
+            // Only approvals have a binding; a question can't be resolved
+            // as one (it would become unanswerable).
+            if self
+                .store
+                .binding(&key)
+                .await
+                .map_err(|_| LedgerError::Store)?
+                .is_none()
+            {
+                return Err(LedgerError::Unknown);
+            }
             match decision {
                 ApprovalDecision::Deny { .. } => {
                     let found = self
