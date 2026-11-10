@@ -1,6 +1,6 @@
 # Handoff: M1-11-export
 
-Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, fix round 2 applied
+Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, merged into `dev` after review round 4
 
 ## Done
 - `history::reconstruct_message`, `Redactor`, `export_thread` and `create_export_file` are implemented. No public signature changed, and `atrium-core` needed no new dependency.
@@ -41,7 +41,8 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, fix rou
 - **Round 3** (`47737a3`, the fix diff): rework, two majors, both accepted and fixed.
   1. Inside a string, a header value's own quotes are escaped (`"Authorization": "Digest username=\"u\", …"`), and the value was cut at the first of them. A backslash now escapes the next character when the header is written inside a quote.
   2. A cookie value was recognised only when its first name was an identifier, so `Cookie: $Version=1; session=…` and `auth+session=…` came through. Cookie names now follow RFC 6265.
-- A value that is measured and then not taken is no longer measured again from later matches in the same run (`BareRuns`), so the new rules stay linear. The worst of 49 adversarial one-megabyte inputs is 34 ms.
+- **Round 4** (`6ccbd37`, the fix diff and a last look over the header rules): approve, no findings.
+- A value that is measured and then not taken is no longer measured again from later matches in the same run (`BareRuns`), so the new rules stay linear. The worst adversarial one-megabyte input after the last fix is 38 ms.
 
 ## Not caught by redaction
 - A secret with no recognisable shape that isn't next to a telling key, such as a bare password in prose or `.netrc`'s `password hunter2`.
