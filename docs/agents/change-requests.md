@@ -77,7 +77,7 @@ The M1 contract (§4, and `crates/atrium-host/src/peer.rs` doc comments) names `
 
 ## CR-06 — M1-03-policy (orchestrator, from the Opus security review) — 2026-11-09
 
-Two contract-level findings from `docs/agents/reviews/M1-03-policy.md`. They change security defaults, so they need Pedro's approval (D-013). **Status: proposed.**
+Two contract-level findings from `docs/agents/reviews/M1-03-policy.md`. They change security defaults, so they need Pedro's approval (D-013). **Approved by Pedro (driver), 2026-11-09, option (a) (D-054)**; applied to `atrium-protocol` and contract §5 and §9.
 
 **1. `date` guard (finding 3).** On GNU `date` (Linux, and Homebrew's coreutils on macOS), `-f FILE` prints every line of FILE in an error message. In `HOME_READONLY_COMMANDS` (`crates/atrium-protocol/src/policy.rs`), the `date` entry's `forbidden` goes from `["-s", "--set"]` to `["-s", "--set", "-f", "--file"]`. BSD `date -f fmt` would then ask too. The worker's fix (resolving every suffix of a short-flag cluster) already closes the reported bypass. This is defence in depth.
 

@@ -464,8 +464,17 @@ export type RuleId = string;
 export type RuleMatcher = 
 /**  Every call of the rule's tool kind (and name, if set). */
 { type: "any" } | 
-/**  A simple command whose argv starts with these tokens (contract §9). */
+/**
+ *  A simple command whose argv starts with these tokens (contract §9).
+ *  Created only in the rules editor, never by "always…" (CR-06, D-054).
+ */
 { type: "command_prefix"; argv: string[] } | 
+/**
+ *  A simple command whose whole argv is exactly these tokens (contract
+ *  §9). What "always…" creates for a command (CR-06, D-054), so a
+ *  remembered `rm -rf build` never allows `rm -rf build ~/Documents`.
+ */
+{ type: "command_exact"; argv: string[] } | 
 /**
  *  A path argument matching this glob (`**` allowed), after the path is
  *  made absolute against the thread's cwd and symlinks are resolved.

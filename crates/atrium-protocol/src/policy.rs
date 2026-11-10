@@ -283,7 +283,12 @@ pub enum RuleMatcher {
     /// Every call of the rule's tool kind (and name, if set).
     Any,
     /// A simple command whose argv starts with these tokens (contract §9).
+    /// Created only in the rules editor, never by "always…" (CR-06, D-054).
     CommandPrefix { argv: Vec<String> },
+    /// A simple command whose whole argv is exactly these tokens (contract
+    /// §9). What "always…" creates for a command (CR-06, D-054), so a
+    /// remembered `rm -rf build` never allows `rm -rf build ~/Documents`.
+    CommandExact { argv: Vec<String> },
     /// A path argument matching this glob (`**` allowed), after the path is
     /// made absolute against the thread's cwd and symlinks are resolved.
     PathGlob { glob: String },
@@ -525,7 +530,8 @@ pub const HOME_READONLY_COMMANDS: &[ReadOnlyCommand] = &[
     cmd(&["uname"]),
     ReadOnlyCommand {
         prefix: &["date"],
-        forbidden: &["-s", "--set"],
+        // `-f`/`--file`: GNU date prints each line of FILE in an error (CR-06).
+        forbidden: &["-s", "--set", "-f", "--file"],
         only: None,
         recursion: Recursion::Never,
     },

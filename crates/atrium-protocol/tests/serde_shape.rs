@@ -618,6 +618,12 @@ fn policy_enums_and_descriptors() {
         json!({"type": "command_prefix", "argv": ["git", "status"]}),
     );
     round_trip(
+        &RuleMatcher::CommandExact {
+            argv: vec!["rm".into(), "-rf".into(), "build".into()],
+        },
+        json!({"type": "command_exact", "argv": ["rm", "-rf", "build"]}),
+    );
+    round_trip(
         &RuleMatcher::PathGlob {
             glob: "**/*.rs".into(),
         },
