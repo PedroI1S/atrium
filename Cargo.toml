@@ -9,6 +9,7 @@ members = [
     "crates/atrium-agents",
     "crates/atrium-core",
     "crates/atrium-host",
+    "crates/atrium-client",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ atrium-protocol = { path = "crates/atrium-protocol" }
 atrium-agents = { path = "crates/atrium-agents" }
 atrium-core = { path = "crates/atrium-core" }
 atrium-host = { path = "crates/atrium-host" }
+atrium-client = { path = "crates/atrium-client" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"

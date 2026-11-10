@@ -2,21 +2,22 @@
 
 Model: Claude Fable 5 (the orchestrator, inline; D-055) Â· Status: **partial** â€” written and tested, not reviewed, not merged (the shift ended here)
 
-## Next step, for whoever continues
-1. Run the Gemini 3.8 Flash review (D-056) on branch `agent/fable/M1-06-client`, commit `5a88cb8` or later. Nothing else is outstanding: the code is complete and every check passes.
-   - `git worktree add --detach ../atrium-wt/M1-06-review agent/fable/M1-06-client`, write the prompt to a file, then `scripts/agent-run agy gemini-3.8-flash-medium M1-06-review <prompt-file>`. The review lands in that worktree at `docs/agents/reviews/M1-06-client.md`.
-   - Ask for exact failing sequences, not a general opinion. On M1-11 a general prompt got "approve, no findings"; prompts that asked for a concrete input per claim found four real defects.
-   - What to have it attack:
-     - **Windows** (`state.rs`): a sequence of deliveries, takes and acknowledgements after which a window has a wrong or incomplete view (an event lost or applied twice across a snapshot, a snapshot that never comes, a window that stays stale for ever); the byte accounting of `waiting` and `in_flight`; whether one window can delay another or a command.
-     - **Subscriptions** (`state.rs`): each `Phase` transition against `wire.rs`; late answers, late events and late `ReplayDone`s; reconnect from the cursor; `SubscriptionLagged`; the reload after a rejected cursor; whether any path can loop sending `Subscribe`.
-     - **The cache** (`cache.rs`): is applying the folded entries always equal to applying the events (tool-call update merging, in-place `Usage`); can a segment boundary fall inside an open item; entry numbers after eviction; ids rising along the list.
-     - **The connection** (`connection.rs`): which endings are retried and which are not; the socket checks and the window between the check and the connect; cancellation of the read task mid-frame; what a panic in a task does.
-     - **Tests**: which rule has no test, and which test only mirrors the code.
-2. Fix what it finds on the branch, ask it to look at the fix, then merge into `dev` (`git merge --no-ff`), copy the review files to `docs/agents/reviews/`, update the status row, and remove the worktrees and the branch.
+## Review (done, 2026-11-10, rodrigo's shift)
+Gemini 3.8 Flash, two rounds: **approve with changes**, then **approve** (`docs/agents/reviews/M1-06-client.md`, `M1-06-client-round2.md`). Fixed on the branch (`328a128`):
+- From the review:
+  - A `ReplayDone` while replaying that doesn't end at `replay_until`, or comes before the events up to it, is a protocol violation. Before, the view never loaded.
+  - The peer's uid is checked on the connected socket, not only on the path.
+  - A folded tool call is counted at what it holds (text added, content replaced), not at its frames' sizes.
+- Found by the orchestrator while reading:
+  - `Usage`, `ContextUpdated` and `QuotaUpdated` fold only within the last segment. Before, a later value was folded into the first entry wherever it was, so a tail snapshot could lack the latest one.
+  - Connections that drop within 2 s of connecting, twice or more in a row, are followed by a wait (100 ms doubling to 1 s). `Client::reconnect` clears the count.
+  - The aborted read task is awaited before the state hears the connection ended, so no message of an old connection is applied after the next one subscribed.
+- Declined: a command timeout in the client. A command has one response and is never retried, and dropping the `Client::command` future is safe, so **the bridge (M1-09a) sets its own deadline per command**. A dropped command stays in the client's table until its answer or the connection's end.
+- Not a defect, but worth knowing: an item that never closes within an incarnation (a tool call with no `ToolCallFinished`) keeps its segment open, and an open segment is never evicted. The adapters' output caps bound it.
 
 ## Done
 - New crate `crates/atrium-client`, added to the workspace. No dependency that wasn't already in `Cargo.lock` (`rustix` for the effective uid; `specta` behind the optional `ts` feature).
-- 26 unit tests (state machine, history cache, codec) and 10 tests over a real unix socket against a scripted daemon.
+- 28 unit tests (state machine, history cache, codec) and 11 tests over a real unix socket against a scripted daemon.
 
 ## How it is built
 | File | What it holds |
@@ -29,7 +30,7 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) Â· Status: **partial** â
 | `delivery.rs` | What windows receive (`Delivery`), `ConnectionState`, `CommandError`. |
 
 **Connection.** Before each connect the client checks that the socket's folder is a real directory, owned by the user and closed to others, and that the socket is a socket of the user's. What ends a connection decides what follows:
-- dropped or stalled: reconnect at once, then with backoff (50 ms doubling to 1 s);
+- dropped or stalled: reconnect at once; from the second connection in a row that dropped within 2 s, after a wait (100 ms doubling to 1 s);
 - nothing listening: the start hook runs on the first failed attempt and every 20th after, and attempts continue;
 - `Incompatible`, an unsafe socket, or a protocol violation: stop until `Client::reconnect`. None of these runs the start hook.
 
@@ -50,7 +51,7 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) Â· Status: **partial** â
 
 ## For M1-05 (`atriumd`)
 - The client depends on the three points in **CR-07**. Point 3 matters most: after answering a `Subscribe`, send nothing of an earlier subscription to that thread, queued frames included.
-- A subscribe response must carry `replay_until` (a missing key is a protocol violation), and `ReplayDone.last` must equal it. The client only goes live on a `ReplayDone` that matches.
+- A subscribe response must carry `replay_until` (a missing key is a protocol violation). `ReplayDone.last` must equal it and must come after every event up to it: anything else is a protocol violation and closes the connection.
 - The client always sends `SubscribeInbox` first after `Welcome`. A refused or unreadable answer to it is a protocol violation.
 - A response with a request id the client didn't use is a protocol violation, and so is any `Stream` frame in M1.
 
@@ -72,6 +73,6 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) Â· Status: **partial** â
 ## Definition of Done results
 - `cargo fmt --all --check`: clean.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean, also with `--features ts` for this crate.
-- `cargo test --workspace`: 219 passed, 0 failed, 1 ignored (`consistency_all_fixtures`, owned by M1-07 and M1-08).
-- `cargo test -p atrium-client`: 26 unit and 10 socket tests, run three times in a row with the same result.
+- `cargo test --workspace`: 222 passed, 0 failed, 1 ignored (also on Linux, rodrigo's machine) (`consistency_all_fixtures`, owned by M1-07 and M1-08).
+- `cargo test -p atrium-client`: 28 unit and 11 socket tests, run three times in a row with the same result.
 - No `unsafe`, and no `unwrap`, `expect` or `panic!` outside tests.

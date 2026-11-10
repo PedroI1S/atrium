@@ -31,6 +31,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-client"
+version = "0.0.0"
+dependencies = [
+ "atrium-protocol",
+ "rustix",
+ "serde",
+ "serde_json",
+ "specta",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "atrium-core"
 version = "0.0.0"
 dependencies = [
