@@ -104,3 +104,14 @@ Non-blocking. `atrium-client` is built against the wire as frozen and works with
 **3. What follows a replaced subscription.** `wire.rs` says subscribing again "replaces the earlier subscription and replays from the new cursor". The client relies on a stronger reading: once the daemon has answered a `Subscribe`, it sends no event and no `ReplayDone` of an earlier subscription to that thread on that connection, including frames it had already queued. Without that, a late event of the old subscription can be taken for the first event of the new replay. The client drops everything for the thread between sending `Subscribe` and its answer, which is safe only with this rule. The same applies after `Unsubscribe` followed by a new `Subscribe`.
 
 **Change proposed:** state that rule in `wire.rs` ("Session", step 2), and say which `ErrorCode` a cursor beyond the thread's last event gets (the client treats any error but `UnknownThread` on a subscribe that carried a cursor as "reload the thread from its start"). Affects `wire.rs` docs and M1-05; M1-13 should test it.
+
+## CR-08 — M1-05-daemon (orchestrator) — 2026-11-10
+
+Non-blocking; it needs the driver's approval because it adds a method to the frozen `Store` trait.
+
+**`ResumeThread` can't read back how a thread was launched.** `NewThread` carries `effort` and `preset`, and the store keeps both (`threads.effort`, `threads.preset`), but nothing in `Store` returns them: `ThreadSummary` has the provider and the model only. A resumed incarnation needs both for its `SessionConfig` and its `SessionGate`.
+
+**Workaround in M1-05 until this is decided:** a resumed thread runs with the Home preset (M1's only preset in use, contract §9) and no effort setting, so a thread started with an effort level loses it when resumed.
+
+**Change proposed:** `Store::launch(&ThreadId) -> StoreResult<Option<NewThread>>` (the row as it was created, with the current title), implemented in `SqliteStore`'s reader. Affects `crates/atrium-core/src/lib.rs`, `store/`, and one function in the daemon.
+
