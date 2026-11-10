@@ -307,4 +307,12 @@ Applied to `atrium-protocol` (`policy.rs`, the serde shape test, `bindings/proto
 - Unchanged: the frozen M1 contract and the change-request process, an explicit go from the driver for each phase, work on `dev` only, and the push policy (D-005, D-007).
 - **Still open:** the go for the second-wave tasks, and who reviews work the orchestrator wrote itself (PLAN §8.2 wants a reviewer from another provider).
 
+*Update, 2026-11-10:* both open points are settled by D-056.
+
 Housekeeping the same day, asked for by Pedro: the stale `claude/design-ui-direction-6c0810` worktree and branch (content already on `dev` as `ea3a1f3`) and the five merged first-wave `agent/*` branches were removed. They existed only on Pedro's Mac.
+
+## D-056 — 2026-11-10 — Go for the second wave of M1, inline, with a Flash review per task
+**Decided by Pedro (driver).** Pedro gave the go to start the second wave. Under D-055 the orchestrator (Claude Fable 5) writes each task itself, one at a time, in this order: M1-11 (history export), M1-06 (client), M1-05 (`atriumd`), M1-07 and M1-08 (Claude and Codex adapters), M1-09a and M1-09b (app shell, Home chat), M1-13 (adversarial tests, with the M1-03 leftovers).
+- **Review:** every task is reviewed read-only by **Gemini 3.8 Flash** (`agy`, through `scripts/agent-run`) before it's merged into `dev`. That keeps the review cross-provider (PLAN §8.2). It replaces the reviewers in contract §15 and D-053 on Pedro's shifts while D-055 holds.
+- Each task still gets a short brief (scope, owned paths, Definition of Done), which is what the reviewer checks against, and its own branch `agent/fable/<task-id>` and worktree, merged after the review.
+- **Still open, before M1-07:** whether remembered command rules are bound to a folder (`path_scope`) or stay global with "in any folder" in the approval UI (`reviews/M1-03-policy-round2.md`, finding h).
