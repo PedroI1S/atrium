@@ -1,6 +1,18 @@
 # Handoff: M1-06-client
 
-Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, before review
+Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: **partial** — written and tested, not reviewed, not merged (the shift ended here)
+
+## Next step, for whoever continues
+1. Run the Gemini 3.8 Flash review (D-056) on branch `agent/fable/M1-06-client`, commit `5a88cb8` or later. Nothing else is outstanding: the code is complete and every check passes.
+   - `git worktree add --detach ../atrium-wt/M1-06-review agent/fable/M1-06-client`, write the prompt to a file, then `scripts/agent-run agy gemini-3.8-flash-medium M1-06-review <prompt-file>`. The review lands in that worktree at `docs/agents/reviews/M1-06-client.md`.
+   - Ask for exact failing sequences, not a general opinion. On M1-11 a general prompt got "approve, no findings"; prompts that asked for a concrete input per claim found four real defects.
+   - What to have it attack:
+     - **Windows** (`state.rs`): a sequence of deliveries, takes and acknowledgements after which a window has a wrong or incomplete view (an event lost or applied twice across a snapshot, a snapshot that never comes, a window that stays stale for ever); the byte accounting of `waiting` and `in_flight`; whether one window can delay another or a command.
+     - **Subscriptions** (`state.rs`): each `Phase` transition against `wire.rs`; late answers, late events and late `ReplayDone`s; reconnect from the cursor; `SubscriptionLagged`; the reload after a rejected cursor; whether any path can loop sending `Subscribe`.
+     - **The cache** (`cache.rs`): is applying the folded entries always equal to applying the events (tool-call update merging, in-place `Usage`); can a segment boundary fall inside an open item; entry numbers after eviction; ids rising along the list.
+     - **The connection** (`connection.rs`): which endings are retried and which are not; the socket checks and the window between the check and the connect; cancellation of the read task mid-frame; what a panic in a task does.
+     - **Tests**: which rule has no test, and which test only mirrors the code.
+2. Fix what it finds on the branch, ask it to look at the fix, then merge into `dev` (`git merge --no-ff`), copy the review files to `docs/agents/reviews/`, update the status row, and remove the worktrees and the branch.
 
 ## Done
 - New crate `crates/atrium-client`, added to the workspace. No dependency that wasn't already in `Cargo.lock` (`rustix` for the effective uid; `specta` behind the optional `ts` feature).
