@@ -184,6 +184,8 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     let mut paren_depth = 0usize;
     let mut pending: Option<Pending> = None;
     let mut heredocs: Vec<(String, bool, bool)> = vec![];
+    // the command each here-doc belongs to (the one holding the `<<`)
+    let mut heredoc_owners: Vec<usize> = vec![];
     let mut raw_units: Vec<Builder> = vec![];
 
     macro_rules! flush {
@@ -211,7 +213,11 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 i += 1;
                 flush!();
                 // Here-doc bodies start on the next line.
-                for (delim, strip, quoted) in std::mem::take(&mut heredocs) {
+                let owners = std::mem::take(&mut heredoc_owners);
+                for (hd_idx, (delim, strip, quoted)) in
+                    std::mem::take(&mut heredocs).into_iter().enumerate()
+                {
+                    let owner = owners.get(hd_idx).copied().unwrap_or(usize::MAX);
                     let mut body = String::new();
                     loop {
                         if i >= chars.len() {
@@ -234,7 +240,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                         body.push_str(&l);
                         body.push('\n');
                     }
-                    bodies.push((raw_units.len().saturating_sub(1), body.clone()));
+                    bodies.push((owner, body.clone()));
                     if !quoted {
                         for sub in find_substitutions(&body) {
                             if let Some(last) = raw_units.last_mut() {
@@ -322,7 +328,11 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 // process substitution: handled as part of a word below
             } else {
                 let fd_default = if c == '<' { 0 } else { 1 };
+                let before = heredocs.len();
                 i = lex_redirect(&chars, i, fd_default, &mut pending, &mut heredocs, &mut out);
+                if heredocs.len() > before {
+                    heredoc_owners.push(raw_units.len());
+                }
                 continue;
             }
         }
@@ -583,7 +593,11 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             let fd: u32 = word.parse().unwrap_or(1);
             let fd_default = fd;
             let mut dummy = None;
+            let before = heredocs.len();
             let new_i = lex_redirect(&chars, i, fd_default, &mut dummy, &mut heredocs, &mut out);
+            if heredocs.len() > before {
+                heredoc_owners.push(raw_units.len());
+            }
             pending = dummy;
             i = new_i;
             continue;
@@ -702,13 +716,25 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         return out;
     }
     let mut texts: Vec<String> = vec![];
-    // a body counts only when the command that owns it is such a reader
+    // A body counts when its owner (the command holding the `<<`) is such a
+    // reader, is piped into one, or is a `{ … }` / `( … )` group around one.
+    let any_reader = out.units.iter().any(is_stdin_code);
     for (owner, text) in &bodies {
-        if raw_pos
-            .get(*owner)
-            .and_then(|p| out.units.get(*p))
-            .is_some_and(is_stdin_code)
-        {
+        let unit = raw_pos.get(*owner).and_then(|p| out.units.get(*p));
+        let counts = match unit {
+            // no command of its own: a `( … ) <<EOF` group
+            None => any_reader,
+            Some(u) => {
+                is_stdin_code(u)
+                    || u.seg.argv.first().is_some_and(|w| w == "}") && any_reader
+                    || (u.pipe != 0
+                        && out
+                            .units
+                            .iter()
+                            .any(|o| o.pipe == u.pipe && is_stdin_code(o)))
+            }
+        };
+        if counts {
             texts.push(text.clone());
         }
     }

@@ -210,9 +210,14 @@ pub fn is_writer(eff: &[String]) -> bool {
             };
             script.is_some_and(|s| s.contains(['w', 'W']))
         }),
-        "awk" | "gawk" | "mawk" => args
-            .iter()
-            .any(|a| !a.starts_with('-') && a.contains(['>', '|']) || a.contains("system(")),
+        "awk" | "gawk" | "mawk" => args.iter().any(|a| {
+            // gawk's `-i inplace` / `--include=inplace` rewrites its file
+            a.starts_with("-i")
+                || a.starts_with("--include")
+                || a.contains("inplace")
+                || (!a.starts_with('-') && a.contains(['>', '|']))
+                || a.contains("system(")
+        }),
         "codesign" => {
             let signs = args.iter().any(|a| {
                 matches!(a.as_str(), "--sign" | "--force" | "--remove-signature")

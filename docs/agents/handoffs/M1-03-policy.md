@@ -128,3 +128,10 @@ DoD: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets --
 Known limits for M1-13 (left as instructed):
 - Finding 5: a symlink inside `~/.ssh` that points to an ordinary folder makes that folder look like a `.ssh` member (`metadata` follows the link), so it is denied. Rare; fix with `symlink_metadata` for such members.
 - Hard links to files inside the other credential trees (`~/.gnupg`, `~/.config/gcloud`, `~/.gemini`, browser profiles, Keychains), Atrium's data and protected paths are not caught by identity, only through their ancestors. A cheap first step for M1-13: never auto-allow a file under Home with `st_nlink > 1` outside the sensitive roots.
+
+## Review fixes (round 4)
+
+DoD: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `--test ledger` 20 passed, `--test policy` 43 passed; `cargo test --workspace` green.
+
+- R1. The owner of a here-doc is recorded when the `<<` is lexed (the command holding it), and a here-string's owner is the command it is attached to. A body is re-lexed when its owner is a shell, `eval` or `source`; when the owner is piped into one (same pipeline); when the owner is a `}` of a `{ …; }` group; or when it has no command of its own (`( … ) <<EOF`) and a shell is present. The round-3 cases (`cat > notes.md <<EOF … EOF` then `bash build.sh` / `sh -c make`, `git commit -F -`) still ask. Test: `review_round4_table` (all nine review inputs plus `bash <<A <<B`).
+- R2. `awk`/`gawk`/`mawk` count as writers with `-i…`, `--include…` or `inplace` in any argument. Test: `review_round4_table` (`-i inplace`, `-iinplace`, `--include=inplace`; plain `awk '{print}' file` still asks).

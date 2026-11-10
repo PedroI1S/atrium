@@ -2664,3 +2664,54 @@ fn hard_link_into_a_ssh_subfolder_is_caught() {
         GateDecision::Allow
     );
 }
+
+#[test]
+fn review_round4_table() {
+    let env = Env::home();
+    let table: Vec<(&str, Want)> = vec![
+        // R1: the body belongs to the command holding the `<<`
+        ("bash <<EOF; true\nrm -rf ~\nEOF", Hard(RD)),
+        ("bash <<EOF && true\nrm -rf ~\nEOF", Hard(RD)),
+        ("bash <<EOF || true\nrm -rf ~\nEOF", Hard(RD)),
+        ("bash <<EOF | cat\nrm -rf ~\nEOF", Hard(RD)),
+        ("cat <<EOF | bash; true\nrm -rf ~\nEOF", Hard(RD)),
+        ("bash <<A; cat <<B\nrm -rf ~\nA\nls\nB", Hard(RD)),
+        ("{ bash; } <<EOF\nrm -rf ~\nEOF", Hard(RD)),
+        ("(bash) <<EOF\nrm -rf ~\nEOF", Hard(RD)),
+        ("cat <<< 'rm -rf ~' | sh", Hard(RD)),
+        ("bash <<EOF; true\nsudo id\nEOF", Hard(PE)),
+        ("bash <<A <<B\nls\nA\nrm -rf ~\nB", Hard(RD)),
+        // still just text when the owner isn't a shell
+        (
+            "cat > notes.md <<'EOF'\nsudo make install\nEOF\nbash build.sh",
+            Ask,
+        ),
+        (
+            "cat > notes.md <<'EOF'\nsudo make install\nEOF\nsh -c make",
+            Ask,
+        ),
+        (
+            "git commit -F - <<'EOF'\nrm -rf ~ fix\nEOF\nsh -c make",
+            Ask,
+        ),
+        // R2: awk's in-place forms write
+        (
+            "awk -i inplace '{print}' ~/.config/atrium/config.toml",
+            Hard(AS),
+        ),
+        (
+            "gawk -i inplace '{print}' ~/.config/atrium/config.toml",
+            Hard(AS),
+        ),
+        (
+            "awk -iinplace '{print}' ~/.config/atrium/config.toml",
+            Hard(AS),
+        ),
+        (
+            "gawk --include=inplace '{print}' ~/.config/atrium/config.toml",
+            Hard(AS),
+        ),
+        ("awk '{print}' ~/.config/atrium/config.toml", Ask),
+    ];
+    run_table(&env, &table);
+}
