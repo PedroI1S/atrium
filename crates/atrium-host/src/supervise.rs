@@ -569,6 +569,12 @@ fn platform_identify(pid: u32, _raw_pid: i32) -> io::Result<Option<ProcessIdenti
         Err(err) => match read_linux_stat(pid)? {
             None => Ok(None),
             Some((after_state, _, _)) if is_dead_linux_state(after_state) => Ok(None),
+            // A process that is exiting gives up its memory, and with it
+            // `/proc/<pid>/exe` (`ENOENT`), before its state becomes `Z`.
+            // In that window it is no longer a running process with an
+            // executable to compare. (A kernel thread never has one either,
+            // and is never a process Atrium started.)
+            Some(_) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Some(_) => Err(err),
         },
     }
