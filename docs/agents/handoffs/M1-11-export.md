@@ -1,6 +1,6 @@
 # Handoff: M1-11-export
 
-Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, fix round 1 applied
+Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, fix round 2 applied
 
 ## Done
 - `history::reconstruct_message`, `Redactor`, `export_thread` and `create_export_file` are implemented. No public signature changed, and `atrium-core` needed no new dependency.
@@ -38,6 +38,9 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, fix rou
   2. `-u "user:password"` with a quoted argument was not redacted. Quoted arguments and `--user=…` are handled now.
   3. The round-2 tests only mirrored the code. The reviewer's inputs are now tests, with more of the same kind.
 - While fixing these I found that a header value stopped at the first quote, so `Authorization: Digest username="u", response="…"` was only partly redacted. A header value now ends with its line, or with the quote the header or its value is written inside.
+- **Round 3** (`47737a3`, the fix diff): rework, two majors, both accepted and fixed.
+  1. Inside a string, a header value's own quotes are escaped (`"Authorization": "Digest username=\"u\", …"`), and the value was cut at the first of them. A backslash now escapes the next character when the header is written inside a quote.
+  2. A cookie value was recognised only when its first name was an identifier, so `Cookie: $Version=1; session=…` and `auth+session=…` came through. Cookie names now follow RFC 6265.
 - A value that is measured and then not taken is no longer measured again from later matches in the same run (`BareRuns`), so the new rules stay linear. The worst of 49 adversarial one-megabyte inputs is 34 ms.
 
 ## Not caught by redaction
@@ -46,6 +49,7 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, fix rou
 - A quoted value that continues on the next line: only its first line is taken. PEM blocks are handled separately and are taken whole.
 - Encodings other than JSON-style escapes: base64, percent-encoding, more than three layers of escaping.
 - Numbers under a secret key (`"pin": 1234`).
+- A header given as a name and a value in separate fields (`{"name": "Cookie", "value": "sid=…"}`, as in a HAR file), and a cookie assigned in code (`document.cookie = "sid=…"`).
 - The home directory spelled differently (`$HOME`, another letter case).
 
 Known false positives: prose after a header name that happens to have the header's shape (`authorization: none required for this API`), and `-u a:b` in commands where `-u` isn't a login (`docker run -u 1000:1000`).

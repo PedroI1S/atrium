@@ -709,7 +709,7 @@ fn cookie_end(bytes: &[u8], value: usize, closer: Option<u8>) -> Option<usize> {
     let name = bytes[value..]
         .iter()
         .take(MAX_NAME + 1)
-        .take_while(|c| is_key(**c))
+        .take_while(|c| is_cookie_name(**c))
         .count();
     let pair = (1..=MAX_NAME).contains(&name)
         && bytes.get(value + name) == Some(&b'=')
@@ -717,6 +717,33 @@ fn cookie_end(bytes: &[u8], value: usize, closer: Option<u8>) -> Option<usize> {
             .get(value + name + 1)
             .is_some_and(|c| !c.is_ascii_whitespace() && *c != b'=');
     pair.then(|| header_value_end(bytes, value, closer))
+}
+
+/// RFC 6265's cookie-name characters (`$Version`, `auth+session`), without
+/// the quotes and backtick a header can be written inside.
+fn is_cookie_name(c: u8) -> bool {
+    c.is_ascii_graphic()
+        && !matches!(
+            c,
+            b'(' | b')'
+                | b'<'
+                | b'>'
+                | b'@'
+                | b','
+                | b';'
+                | b':'
+                | b'\\'
+                | b'"'
+                | b'\''
+                | b'`'
+                | b'/'
+                | b'['
+                | b']'
+                | b'?'
+                | b'='
+                | b'{'
+                | b'}'
+        )
 }
 
 /// Where an `Authorization` value starting at `value` ends, if it is a
@@ -901,13 +928,22 @@ fn opening_quote(bytes: &[u8], at: usize) -> Option<u8> {
 /// Where a header's value ends: the line, or `closer`, the quote the header
 /// or its value is written inside. Trailing blanks are left out. A header
 /// value can hold quotes of its own (`Digest username="…"`), so nothing else
-/// ends it.
+/// ends it; inside a string those are escaped (`\"`), and a backslash
+/// escapes the next character there.
 fn header_value_end(bytes: &[u8], value: usize, closer: Option<u8>) -> usize {
-    let mut end = value
-        + bytes[value..]
-            .iter()
-            .take_while(|c| !matches!(c, b'\n' | b'\r') && Some(**c) != closer)
-            .count();
+    let mut end = value;
+    while let Some(&c) = bytes.get(end) {
+        match c {
+            b'\n' | b'\r' => break,
+            b'\\' if closer.is_some() => end += 1,
+            c if Some(c) == closer => break,
+            _ => {}
+        }
+        end += 1;
+    }
+    // A trailing backslash steps past the end. Otherwise the loop stops at
+    // an ASCII byte or the end, so this is a character boundary.
+    let mut end = end.min(bytes.len());
     while end > value && is_blank(bytes[end - 1]) {
         end -= 1;
     }
@@ -994,7 +1030,7 @@ fn is_code_punctuation(c: u8) -> bool {
 
 /// `--password hunter2`, `--api-key "…"`: a flag that names a secret and
 /// takes its value as the next argument. Also the password in
-/// `-u user:password`.
+/// `-u user:password` (`--user`, `--proxy-user`).
 fn scan_flags(bytes: &[u8], emit: Emit<'_>) {
     let mut at = 0;
     while let Some(found) = memchr(b'-', bytes, at) {
@@ -1007,7 +1043,7 @@ fn scan_flags(bytes: &[u8], emit: Emit<'_>) {
         let key_end = key + run(bytes, key, is_key);
         at = key_end.max(at);
         let name = &bytes[key..key_end];
-        let user = name == b"u" || (long && name == b"user");
+        let user = name == b"u" || (long && (name == b"user" || name == b"proxy-user"));
         let value = skip_blanks(bytes, key_end);
         let value = match bytes.get(key_end) {
             // `--user=user:password`.

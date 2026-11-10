@@ -450,6 +450,29 @@ fn credentials_are_redacted_by_where_they_are() {
             "authorization: AWS4-HMAC-SHA256 Credential=x/20250101/s3, Signature=0a1b",
             "authorization: [redacted]",
         ),
+        // Inside a string, the value's own quotes are escaped.
+        (
+            r#"{"Authorization": "Digest username=\"u\", response=\"0a1b\""}"#,
+            r#"{"Authorization": "[redacted]"}"#,
+        ),
+        (
+            r#"curl -H "Authorization: Digest username=\"u\", response=\"0a1b\"" x"#,
+            r#"curl -H "Authorization: [redacted]" x"#,
+        ),
+        (
+            r#"{"Cookie": "a=\"secret123\""}"#,
+            r#"{"Cookie": "[redacted]"}"#,
+        ),
+        (
+            r#"-H "X-Api-Key: a\"b" -v"#,
+            r#"-H "X-Api-Key: [redacted]" -v"#,
+        ),
+        // Cookie names are more than identifiers.
+        (
+            "Cookie: $Version=1; session=secret123",
+            "Cookie: [redacted]",
+        ),
+        ("cookie: auth+session=secret123", "cookie: [redacted]"),
         // No scheme: one random-looking word.
         (
             "Authorization: a1b2c3d4e5f6\nHost: x",
@@ -483,6 +506,10 @@ fn credentials_are_redacted_by_where_they_are() {
         (
             "curl --user=pedro:hunter2 x",
             "curl --user=pedro:[redacted] x",
+        ),
+        (
+            "curl --proxy-user pedro:hunter2 x",
+            "curl --proxy-user pedro:[redacted] x",
         ),
         (
             "mysql --password hunter2 -u root",
@@ -710,6 +737,8 @@ fn redaction_stays_linear_on_one_long_line() {
         "authorization:abc_defg1 ",
         "authorization:abcdefgh(1",
         "authorization: a ",
+        "\"authorization: a b\\",
+        "\"cookie: a=b\\\"",
         "x-token: ",
         "-u 'a:",
         "-u a:b",
