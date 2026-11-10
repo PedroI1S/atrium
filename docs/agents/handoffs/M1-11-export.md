@@ -1,6 +1,6 @@
 # Handoff: M1-11-export
 
-Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, before review
+Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, fix round 1 applied
 
 ## Done
 - `history::reconstruct_message`, `Redactor`, `export_thread` and `create_export_file` are implemented. No public signature changed, and `atrium-core` needed no new dependency.
@@ -30,6 +30,15 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, before 
 - Two scanners were quadratic on one long line: a megabyte of `token=` took 43 s and a megabyte of `authorization:` took 16 s in a release build. Tool output is agent-controlled, so that would have stalled the daemon during an export. Both now skip past a value once it is taken. The worst of 53 adversarial one-megabyte inputs is 43 ms, and `redaction_stays_linear_on_one_long_line` guards it.
 - Three deliberate breakages were each caught by the tests: no escape decoding, one escape layer only, and no folder-owner check.
 
+## Review (Gemini 3.8 Flash)
+- **Round 1** (`67ac06b`): approve, no findings.
+- After round 1 I widened the redaction on my own initiative (`488b6d7`): cookies, header-style keys, `-u user:password`, INI lines, everything under a JSON key that names a secret.
+- **Round 2** (`488b6d7`, that diff only): rework, two majors and a minor, all accepted and fixed.
+  1. The `Cookie` rule blanked ordinary code (`fn parse(cookie: &str)`, `cookie = jar.get()`). The same was true of `authorization`. Both names now need a word boundary, and the value must have the header's shape: a cookie value starts with `name=`; an authorization value is `<scheme> <credentials>` or one random-looking word that is the whole value. `Cookie` takes `:` only.
+  2. `-u "user:password"` with a quoted argument was not redacted. Quoted arguments and `--user=…` are handled now.
+  3. The round-2 tests only mirrored the code. The reviewer's inputs are now tests, with more of the same kind.
+- A value that is measured and then not taken is no longer measured again from later matches in the same run (`BareRuns`), so the new rules stay linear. The worst of 49 adversarial one-megabyte inputs is 34 ms.
+
 ## Not caught by redaction
 - A secret with no recognisable shape that isn't next to a telling key, such as a bare password in prose or `.netrc`'s `password hunter2`.
 - `key: value` and `key = value` lines whose value is short or has no digit (`password: hunter2`). A bare value on such a line is taken only if it is at least 8 characters, has a digit and has no code punctuation; otherwise type annotations and assignments in code (`token: String`, `token = lexer.next()`) would be blanked.
@@ -37,6 +46,8 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, before 
 - Encodings other than JSON-style escapes: base64, percent-encoding, more than three layers of escaping.
 - Numbers under a secret key (`"pin": 1234`).
 - The home directory spelled differently (`$HOME`, another letter case).
+
+Known false positives: prose after a header name that happens to have the header's shape (`authorization: none required for this API`), and `-u a:b` in commands where `-u` isn't a login (`docker run -u 1000:1000`).
 
 ## For M1-05 (`ExportThread`)
 - Pass the thread's events from its first event, oldest first. The fold needs every delta of a message.

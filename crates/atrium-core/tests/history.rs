@@ -429,6 +429,19 @@ fn credentials_are_redacted_by_where_they_are() {
         ),
         ("Cookie: session=abc123; theme=dark", "Cookie: [redacted]"),
         (
+            r#"{"cookie": "sid=abc", "Authorization": "ApiKey abc"}"#,
+            r#"{"cookie": "[redacted]", "Authorization": "[redacted]"}"#,
+        ),
+        // No scheme: one random-looking word.
+        (
+            "Authorization: a1b2c3d4e5f6\nHost: x",
+            "Authorization: [redacted]\nHost: x",
+        ),
+        (
+            "proxy-authorization=Basic dXNlcjpwYXNz",
+            "proxy-authorization=[redacted]",
+        ),
+        (
             "Set-Cookie: sid=xyz; HttpOnly\n",
             "Set-Cookie: [redacted]\n",
         ),
@@ -440,6 +453,18 @@ fn credentials_are_redacted_by_where_they_are() {
         (
             "curl --user pedro:hunter2 x",
             "curl --user pedro:[redacted] x",
+        ),
+        (
+            r#"curl -u "pedro:hunter 2" https://x"#,
+            r#"curl -u "pedro:[redacted]" https://x"#,
+        ),
+        (
+            "curl --user 'pedro:hunter2' x",
+            "curl --user 'pedro:[redacted]' x",
+        ),
+        (
+            "curl --user=pedro:hunter2 x",
+            "curl --user=pedro:[redacted] x",
         ),
         (
             "mysql --password hunter2 -u root",
@@ -471,6 +496,21 @@ fn ordinary_text_and_code_are_left_alone() {
         "password = hunter2",
         "docker run -u root image and tar -u archive.tar",
         "the cookies are in the jar, and a cookie-cutter",
+        // `cookie` and `authorization` are identifiers too.
+        "fn parse(cookie: &str) -> bool",
+        "struct Req { cookie: String, path: String }",
+        "    cookie: String,",
+        "if (cookie == null) { cookie = getCookie(); }",
+        "my_cookie: String and cookie = jar.get()",
+        "cookie: str = request.cookies.get('session')",
+        "document.cookie = \"a=b\"",
+        "fn f(authorization: &str) and authorization: String,",
+        "authorization = get_auth() or authorization: Option<String> = None",
+        "authorization: str = Header(None)",
+        "authorization: string | undefined;",
+        "Authorization: required",
+        "reauthorization: Bearer of news",
+        "sort -u file and su -u pedro",
         "token: String,",
         "secret: Vec<u8>,",
         "    password: string;",
@@ -568,6 +608,8 @@ fn redaction_never_panics_and_never_lets_a_literal_secret_through() {
         ":",
         " ",
         "\n",
+        "\r",
+        "\t",
         "\\u",
         "\\uD83D",
         "\\u00e9",
@@ -577,7 +619,14 @@ fn redaction_never_panics_and_never_lets_a_literal_secret_through() {
         "😀",
         "token",
         "password",
+        "x-api-key",
+        "cookie",
         "--",
+        "-u ",
+        "--user ",
+        "a:b",
+        " = ",
+        ": ",
         "-----BEGIN ",
         "PRIVATE KEY-----",
         "-----END ",
@@ -608,7 +657,11 @@ fn redaction_never_panics_and_never_lets_a_literal_secret_through() {
         (state % below as u64) as usize
     };
     let redactor = redactor();
-    for _ in 0..3000 {
+    let rounds: usize = std::env::var("ATRIUM_FUZZ_ROUNDS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(3000);
+    for _ in 0..rounds {
         let len = 1 + next(40);
         let canary_at = next(len);
         let mut text = String::new();
@@ -634,8 +687,13 @@ fn redaction_stays_linear_on_one_long_line() {
         "token: ",
         "token=\"",
         "authorization:",
-        "cookie=",
+        "cookie:",
+        "cookie: a=",
+        "authorization:abc_defg1 ",
+        "authorization:abcdefgh(1",
+        "authorization: a ",
         "x-token: ",
+        "-u 'a:",
         "-u a:b",
         "bearer x",
         "--password x",

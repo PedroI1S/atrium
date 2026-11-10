@@ -640,31 +640,46 @@ fn scan_private_keys(text: &str, emit: Emit<'_>) {
 /// The value of an `Authorization` or `Cookie` header (in a header line, a
 /// curl argument or a JSON map; `Proxy-Authorization` and `Set-Cookie` too),
 /// and any `Bearer <token>`.
+///
+/// Both names are also ordinary identifiers (`cookie: &str`,
+/// `authorization = get()`), so a value is taken only when it has the shape
+/// of that header's value.
 fn scan_authorization(bytes: &[u8], emit: Emit<'_>) {
-    for name in [b"authorization".as_slice(), b"cookie"] {
+    let mut runs = BareRuns::default();
+    for (name, is_cookie) in [(b"authorization".as_slice(), false), (b"cookie", true)] {
         let mut from = 0;
         while let Some(at) = find_ignoring_case(bytes, name, from) {
             from = at + name.len();
+            // `my_cookie`, `reauthorization`; a dash is fine (`Set-Cookie`).
+            if at > 0 && is_word(bytes[at - 1]) {
+                continue;
+            }
             let mut i = from;
             if bytes.get(i).is_some_and(|c| is_quote(*c)) {
                 i += 1;
             }
             i = skip_blanks(bytes, i);
-            if !matches!(bytes.get(i), Some(b':' | b'=')) {
-                continue;
+            match bytes.get(i) {
+                Some(b':') => {}
+                Some(b'=') if !is_cookie => {}
+                _ => continue,
             }
             i = skip_blanks(bytes, i + 1);
             if bytes.get(i).is_some_and(|c| is_quote(*c)) {
                 i += 1;
             }
-            let end = header_value_end(bytes, i);
-            if end > i {
+            let end = if is_cookie {
+                cookie_end(bytes, i)
+            } else {
+                authorization_end(bytes, i, &mut runs)
+            };
+            if let Some(end) = end {
                 emit(i, end, Kind::Secret);
+                // Nothing inside the value needs another look (and looking
+                // again from every match would take quadratic time on one
+                // long line).
+                from = end.max(from);
             }
-            // Nothing inside the value needs another look (and looking
-            // again from every match would take quadratic time on one long
-            // line).
-            from = end.max(from);
         }
     }
     const SCHEME: &[u8] = b"bearer";
@@ -680,6 +695,93 @@ fn scan_authorization(bytes: &[u8], emit: Emit<'_>) {
             emit(start, start + len, Kind::Secret);
         }
         from = start + len;
+    }
+}
+
+/// Where a `Cookie` value starting at `value` ends, if it is one: it starts
+/// with `name=`, as in `session=abc; theme=dark`.
+fn cookie_end(bytes: &[u8], value: usize) -> Option<usize> {
+    const MAX_NAME: usize = 128;
+    let name = bytes[value..]
+        .iter()
+        .take(MAX_NAME + 1)
+        .take_while(|c| is_key(**c))
+        .count();
+    let pair = (1..=MAX_NAME).contains(&name)
+        && bytes.get(value + name) == Some(&b'=')
+        && bytes
+            .get(value + name + 1)
+            .is_some_and(|c| !c.is_ascii_whitespace() && *c != b'=');
+    pair.then(|| header_value_end(bytes, value))
+}
+
+/// Where an `Authorization` value starting at `value` ends, if it is a
+/// credential.
+fn authorization_end(bytes: &[u8], value: usize, runs: &mut BareRuns) -> Option<usize> {
+    const MAX_SCHEME: usize = 32;
+    // `<scheme> <credentials>`: `Bearer …`, `Basic …`, `token …`,
+    // `AWS4-HMAC-SHA256 …`. Not `str = Header()` or `string | undefined`.
+    let scheme = bytes[value..]
+        .iter()
+        .take(MAX_SCHEME + 1)
+        .take_while(|c| is_alnum_or_dash(**c))
+        .count();
+    if (1..=MAX_SCHEME).contains(&scheme)
+        && bytes[value].is_ascii_alphabetic()
+        && bytes.get(value + scheme).is_some_and(|c| is_blank(*c))
+    {
+        let credentials = skip_blanks(bytes, value + scheme);
+        return bytes
+            .get(credentials)
+            .is_some_and(|c| is_bearer(*c) && *c != b'=')
+            .then(|| header_value_end(bytes, value));
+    }
+    // A credential with no scheme: one random-looking word that is the whole
+    // value.
+    let end = runs.random_end(bytes, value)?;
+    matches!(
+        bytes.get(skip_blanks(bytes, end)),
+        None | Some(b'\n' | b'\r' | b'"' | b'\'' | b'`')
+    )
+    .then_some(end)
+}
+
+/// Answers "does the bare value starting here look random?" for many starts
+/// in the same whitespace-free run, walking each run once: a value that is
+/// measured and then not taken must not be measured again from every later
+/// match inside it.
+#[derive(Default)]
+struct BareRuns {
+    start: usize,
+    end: usize,
+    last_digit: Option<usize>,
+    last_code: Option<usize>,
+}
+
+impl BareRuns {
+    /// The end of the bare value starting at `from`, if it [`looks_random`].
+    /// Starts must not decrease from one call to the next.
+    fn random_end(&mut self, bytes: &[u8], from: usize) -> Option<usize> {
+        if from < self.start || from >= self.end {
+            let len = bare_value_len(&bytes[from..]);
+            *self = Self {
+                start: from,
+                end: from + len,
+                last_digit: None,
+                last_code: None,
+            };
+            for (at, c) in bytes[from..from + len].iter().enumerate() {
+                if c.is_ascii_digit() {
+                    self.last_digit = Some(from + at);
+                } else if is_code_punctuation(*c) {
+                    self.last_code = Some(from + at);
+                }
+            }
+        }
+        let random = self.end - from >= MIN_RANDOM_LEN
+            && self.last_digit.is_some_and(|at| at >= from)
+            && self.last_code.is_none_or(|at| at < from);
+        random.then_some(self.end)
     }
 }
 
@@ -855,18 +957,23 @@ fn ends_line(bytes: &[u8], at: usize) -> bool {
     )
 }
 
-/// An unquoted YAML value is only taken when it can't be a type or an
-/// expression (`token: String,`, `secret: Vec<u8>`): long enough, with a
-/// digit, and none of the punctuation code has.
+/// A bare value on a `key: value` or `key = value` line is only taken when
+/// it can't be a type or an expression (`token: String,`,
+/// `secret: Vec<u8>`): long enough, with a digit, and none of the
+/// punctuation code has.
 fn looks_random(value: &[u8]) -> bool {
-    value.len() >= 8
+    value.len() >= MIN_RANDOM_LEN
         && value.iter().any(u8::is_ascii_digit)
-        && !value.iter().any(|c| {
-            matches!(
-                c,
-                b'<' | b'>' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b';' | b','
-            )
-        })
+        && !value.iter().any(|c| is_code_punctuation(*c))
+}
+
+const MIN_RANDOM_LEN: usize = 8;
+
+fn is_code_punctuation(c: u8) -> bool {
+    matches!(
+        c,
+        b'<' | b'>' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b';' | b','
+    )
 }
 
 /// `--password hunter2`, `--api-key "…"`: a flag that names a secret and
@@ -883,15 +990,24 @@ fn scan_flags(bytes: &[u8], emit: Emit<'_>) {
         let key = found + if long { 2 } else { 1 };
         let key_end = key + run(bytes, key, is_key);
         at = key_end.max(at);
-        let value = skip_blanks(bytes, key_end);
-        if value == key_end {
-            continue;
-        }
         let name = &bytes[key..key_end];
-        // `curl -u user:password`, `--user user:password`.
-        if name == b"u" || (long && name == b"user") {
-            let end = value + bare_value_len(&bytes[value..]);
-            if let Some(colon) = memchr(b':', &bytes[..end], value).filter(|c| c + 1 < end) {
+        let user = name == b"u" || (long && name == b"user");
+        let value = skip_blanks(bytes, key_end);
+        let value = match bytes.get(key_end) {
+            // `--user=user:password`.
+            Some(b'=') if user && long => key_end + 1,
+            _ if value == key_end => continue,
+            _ => value,
+        };
+        // `curl -u user:password`, `--user "user:password"`.
+        if user {
+            let (start, end) = match bytes.get(value) {
+                Some(&quote) if is_quote(quote) => {
+                    (value + 1, closing_quote(bytes, value + 1, quote))
+                }
+                _ => (value, value + bare_value_len(&bytes[value..])),
+            };
+            if let Some(colon) = memchr(b':', &bytes[..end], start).filter(|c| c + 1 < end) {
                 emit(colon + 1, end, Kind::Secret);
             }
             at = end.max(at);
