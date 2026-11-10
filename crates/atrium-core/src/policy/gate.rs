@@ -172,27 +172,13 @@ fn alias_fix(p: &Path, roots: &[((u64, u64), PathBuf)]) -> Result<PathBuf, Strin
     Ok(p)
 }
 
-/// The roots, plus the files and folders a few levels below each folder
-/// (hard links to a key inside `~/.ssh` are the same file).
-fn expand_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    const MAX_ENTRIES: usize = 2000;
-    let mut out = roots.clone();
-    let mut stack: Vec<(PathBuf, u8)> = roots.into_iter().map(|r| (r, 0)).collect();
-    while let Some((dir, depth)) = stack.pop() {
-        if depth >= 3 || out.len() > MAX_ENTRIES {
-            continue;
-        }
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in rd.flatten().take(MAX_ENTRIES) {
-            let p = e.path();
-            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-            out.push(p.clone());
-            if is_dir {
-                stack.push((p, depth + 1));
-            }
-        }
+/// The roots plus the members of `~/.ssh` (a small folder): a hard link to a
+/// key is the same file. The big trees (browser profiles) aren't walked; a
+/// path inside one is caught through its ancestors.
+fn expand_roots(home: &Path, roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = roots;
+    if let Ok(rd) = std::fs::read_dir(home.join(".ssh")) {
+        out.extend(rd.flatten().take(256).map(|e| e.path()));
     }
     out
 }
@@ -218,11 +204,10 @@ fn evaluate_sync(
     let analysis = deny::analyze_with(&input, &fs_resolve);
     let mut resolved = vec![];
     if !analysis.overflow {
-        let roots: Vec<((u64, u64), PathBuf)> = expand_roots(deny::sensitive_roots(
+        let roots: Vec<((u64, u64), PathBuf)> = expand_roots(
             &c.home,
-            &c.atrium_data_paths,
-            &c.atrium_protected_paths,
-        ))
+            deny::sensitive_roots(&c.home, &c.atrium_data_paths, &c.atrium_protected_paths),
+        )
         .into_iter()
         .filter_map(|r| identity(&r).map(|id| (id, r)))
         .collect();

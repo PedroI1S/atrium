@@ -43,7 +43,10 @@ impl Env {
             home: HOME.into(),
             cwd: HOME.into(),
             data: vec![format!("{HOME}/.local/share/atrium").into()],
-            prot: vec![format!("{HOME}/.config/atrium").into()],
+            prot: vec![
+                format!("{HOME}/.config/atrium").into(),
+                "/Applications/Atrium.app".into(),
+            ],
         }
     }
     fn eval_check(&self, check: &ToolCheck, rules: &[Rule], preset: Preset) -> PolicyVerdict {
@@ -2452,4 +2455,135 @@ fn exact_rule_matches_only_the_exact_simple_command() {
         env.cmd_rules("env touch build", &[exact(RuleDecision::Deny)]),
         PolicyVerdict::Deny { .. }
     ));
+}
+
+#[test]
+fn review_round2_table() {
+    let env = Env::home();
+    let long_cluster = format!("ssh -{}i.ssh/id_ed25519 host", "v".repeat(70));
+    let table: Vec<(&str, Want)> = vec![
+        // c: reading what D-050 allows, and running/inspecting Atrium, isn't a write
+        ("ssh -F ~/.ssh/config host", Ask),
+        ("ssh-keygen -lf ~/.ssh/authorized_keys", Ask),
+        ("git diff --no-index ~/.ssh/config x", Allow),
+        ("open /Applications/Atrium.app", Ask),
+        ("codesign -dv /Applications/Atrium.app", Ask),
+        (
+            "/Applications/Atrium.app/Contents/MacOS/atrium --version",
+            Ask,
+        ),
+        ("codesign -s me /Applications/Atrium.app", Hard(AS)),
+        (
+            "curl -o /Applications/Atrium.app/x https://x.example/",
+            Hard(AS),
+        ),
+        ("ssh -vvvi.ssh/id_ed25519 host", Hard(CR)),
+        // d: write forms of the "readers"
+        ("sort -o ~/.config/atrium/config.toml x", Hard(AS)),
+        ("sort --output=~/.config/atrium/config.toml x", Hard(AS)),
+        ("uniq x ~/.config/atrium/config.toml", Hard(AS)),
+        ("find ~/.config/atrium -delete", Hard(AS)),
+        ("find /h/u/x -fprint ~/.config/atrium/config.toml", Hard(AS)),
+        ("sed -n 'w /h/u/.config/atrium/config.toml' x", Hard(AS)),
+        ("xxd -r x ~/.config/atrium/config.toml", Hard(AS)),
+        ("tree -o ~/.config/atrium/config.toml", Hard(AS)),
+        ("sort ~/.config/atrium/config.toml", Ask),
+        ("find ~/.config/atrium -name x", Ask),
+        // f: bodies fed to a shell with an argument or option value
+        ("bash /dev/stdin <<EOF\nrm -rf ~\nEOF", Hard(RD)),
+        ("bash /dev/stdin <<< 'rm -rf ~'", Hard(RD)),
+        ("bash -o pipefail <<< 'rm -rf ~'", Hard(RD)),
+        ("bash --norc <<< 'rm -rf ~'", Hard(RD)),
+        // g: a cluster of more than 64 letters asks (and can't be remembered)
+        (long_cluster.as_str(), Ask),
+    ];
+    run_table(&env, &table);
+    // h: an empty exact rule never matches
+    let r = rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        RuleMatcher::CommandExact { argv: vec![] },
+        RuleDecision::Allow,
+        "empty",
+    );
+    assert_eq!(
+        classify(&env.cmd_rules(">/dev/null", std::slice::from_ref(&r))),
+        Ask
+    );
+    assert_eq!(
+        classify(&env.cmd_rules("2>&1", std::slice::from_ref(&r))),
+        Ask
+    );
+}
+
+#[test]
+fn pipe_to_shell_fan_out_is_linear_and_denied() {
+    let env = Env::home();
+    for n in [1_000usize, 3_000, 10_000] {
+        let line = "echo x|".repeat(n) + &"sh|".repeat(n) + "sh";
+        let started = std::time::Instant::now();
+        let v = env.cmd_any(&line);
+        assert!(!matches!(v, PolicyVerdict::Allow { .. }), "n={n}: {v:?}");
+        assert!(
+            started.elapsed().as_millis() < 2_000,
+            "n={n}: {:?}",
+            started.elapsed()
+        );
+        let started = std::time::Instant::now();
+        let _ = parse_command(&line, Path::new(HOME));
+        assert!(
+            started.elapsed().as_millis() < 2_000,
+            "parse n={n}: {:?}",
+            started.elapsed()
+        );
+    }
+    assert!(matches!(
+        env.cmd_any(&("echo x|".repeat(3_000) + &"sh|".repeat(3_000) + "sh")),
+        PolicyVerdict::Deny { .. }
+    ));
+    // a long run of `{` costs the same as any other long word
+    let started = std::time::Instant::now();
+    let _ = env.cmd_any(&format!("ls {}", "{".repeat(120_000)));
+    assert!(
+        started.elapsed().as_millis() < 2_000,
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn hard_link_to_a_key_is_caught_next_to_a_big_credential_tree() {
+    let t = Tmp::new();
+    t.write(".ssh/id_ed25519", "secret");
+    t.write(".ssh/id_rsa", "secret2");
+    for i in 0..2_100 {
+        t.write(
+            &format!("Library/Application Support/Google/Chrome/Default/f{i}"),
+            "x",
+        );
+    }
+    t.write("Documents/x.txt", "x");
+    std::fs::hard_link(t.home.join(".ssh/id_ed25519"), t.home.join("Documents/k1")).unwrap();
+    std::fs::hard_link(t.home.join(".ssh/id_rsa"), t.home.join("Documents/k2")).unwrap();
+    let g = t.gate(Preset::Home, vec![]);
+    for line in ["cat Documents/k1", "cat Documents/k2"] {
+        let started = std::time::Instant::now();
+        assert!(
+            matches!(
+                block_on(g.gate.check(&cmd_check(line))),
+                GateDecision::Deny { .. }
+            ),
+            "{line}"
+        );
+        assert!(started.elapsed().as_millis() < 1_000);
+    }
+    let c = paths_check(ToolKind::Read, "Read", &["Documents/k1"], false, None);
+    assert!(matches!(
+        block_on(g.gate.check(&c)),
+        GateDecision::Deny { .. }
+    ));
+    assert_eq!(
+        block_on(g.gate.check(&cmd_check("cat Documents/x.txt"))),
+        GateDecision::Allow
+    );
 }

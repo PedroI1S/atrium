@@ -11,7 +11,11 @@ use super::shell::{Unit, base};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Read,
+    /// Known to write (redirects, `rm`, `cp`, `of=`, …).
     Write,
+    /// A command that isn't a known reader: only Atrium's protected paths
+    /// treat it as a write.
+    MaybeWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,24 +152,50 @@ const READERS: &[&str] = &[
     "pushd",
     "popd",
     "find",
-    "awk",
+    "open",
+    "spctl",
+    "mdls",
+    "mdfind",
+    "codesign",
     "sed",
     "perl",
 ];
 
-/// Whether this command writes to (some of) the paths in its arguments: every
-/// command that isn't a known reader (`curl -o`, `tar -C`, …).
+/// Whether this command might write to the paths it is given: everything
+/// that isn't a known reader, and the write forms of the readers
+/// (`sort -o`, `find -delete`, …).
 pub fn is_writer(eff: &[String]) -> bool {
     let Some(first) = eff.first() else {
         return false;
     };
     let b = base(first);
+    if is_known_writer(eff) {
+        return true;
+    }
+    let args = &eff[1..];
+    let flag = |a: &String, c: char| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
+    let operands = args.iter().filter(|a| !a.starts_with('-')).count();
     match b {
-        "sed" => eff.iter().skip(1).any(|a| {
-            a == "-i" || a.starts_with("-i") && !a.starts_with("--") || a.starts_with("--in-place")
+        "sort" => args
+            .iter()
+            .any(|a| flag(a, 'o') || a.starts_with("--output")),
+        "uniq" => operands >= 2,
+        "find" => args.iter().any(|a| {
+            a == "-delete"
+                || a.starts_with("-exec")
+                || a.starts_with("-ok")
+                || a.starts_with("-fprint")
+                || a == "-fls"
         }),
-        "perl" => eff.iter().skip(1).any(|a| {
-            a.starts_with("-i") || (a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
+        "xxd" => args.iter().any(|a| flag(a, 'r')) && operands >= 2,
+        "tree" => args
+            .iter()
+            .any(|a| flag(a, 'o') || a.starts_with("--output")),
+        "sed" => args
+            .iter()
+            .any(|a| !a.starts_with(['-', '/', '~', '.']) && a.contains(['w', 'W'])),
+        "codesign" => !args.iter().any(|a| {
+            a.starts_with("-d") || a.starts_with("-v") || a == "--display" || a == "--verify"
         }),
         _ => !READERS.contains(&b),
     }
@@ -176,7 +206,19 @@ pub fn is_known_writer(eff: &[String]) -> bool {
     let Some(first) = eff.first() else {
         return false;
     };
-    WRITERS.contains(&base(first))
+    let b = base(first);
+    if WRITERS.contains(&b) {
+        return true;
+    }
+    match b {
+        "sed" => eff.iter().skip(1).any(|a| {
+            a == "-i" || a.starts_with("-i") && !a.starts_with("--") || a.starts_with("--in-place")
+        }),
+        "perl" => eff.iter().skip(1).any(|a| {
+            a.starts_with("-i") || (a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
+        }),
+        _ => false,
+    }
 }
 
 /// `$HOME`, `${HOME}`, `$PWD` and a leading `~` expanded.
@@ -321,10 +363,19 @@ fn raw_words_of(unit: &Unit) -> Vec<(String, Role)> {
     for (_, v) in &unit.seg.assignments {
         out.push((v.clone(), Role::Read));
     }
-    let writer = is_writer(&unit.eff);
-    let role = if writer { Role::Write } else { Role::Read };
+    let role = if is_known_writer(&unit.eff) {
+        Role::Write
+    } else if is_writer(&unit.eff) {
+        Role::MaybeWrite
+    } else {
+        Role::Read
+    };
     for (idx, w) in unit.seg.argv.iter().enumerate() {
-        if idx == 0 && !w.contains('/') {
+        if idx == 0 {
+            // running a binary isn't writing it
+            if w.contains('/') {
+                out.push((w.clone(), Role::Read));
+            }
             continue;
         }
         if w.starts_with("--") {
@@ -346,6 +397,12 @@ fn raw_words_of(unit: &Unit) -> Vec<(String, Role)> {
             }
         } else {
             out.push((w.clone(), role));
+            // a script or quoted command line: `w /path` in a sed script
+            if w.contains(char::is_whitespace) {
+                for tok in w.split_whitespace().take(8) {
+                    out.push((tok.to_string(), role));
+                }
+            }
             if idx > 0
                 && let Some((k, v)) = w.split_once('=')
                 && !k.is_empty()

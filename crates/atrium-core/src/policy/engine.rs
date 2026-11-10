@@ -148,7 +148,7 @@ fn allow_covers(
                 .collect()
         }
         RuleMatcher::CommandExact { argv } => {
-            if !simple {
+            if !simple || argv.is_empty() {
                 return none;
             }
             part_ids

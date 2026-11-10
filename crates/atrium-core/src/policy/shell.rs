@@ -34,7 +34,11 @@ pub struct Lexed {
     pub units: Vec<Unit>,
     /// Why rules and Home's read-only list must not allow the line.
     pub reasons: Vec<String>,
+    /// More commands than the checker takes on (`MAX_UNITS`).
+    pub overflow: bool,
 }
+
+pub const MAX_UNITS: usize = 512;
 
 struct Builder {
     assignments: Vec<(String, String)>,
@@ -505,6 +509,12 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     let mut d = 1;
                     let mut has = false;
                     while j < chars.len() && d > 0 {
+                        if j - i > 256 {
+                            // too far to tell: count it as expanding (asks)
+                            has = true;
+                            d = 0;
+                            break;
+                        }
                         match chars[j] {
                             '{' => d += 1,
                             '}' => d -= 1,
@@ -549,6 +559,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             // A lone character the loop didn't consume (shouldn't happen).
             i += 1;
             continue;
+        }
+        if word.starts_with('-') && !word.starts_with("--") && word.chars().count() > 64 {
+            out.reasons.push("flag cluster too long".into());
         }
         if unq_glob {
             out.reasons.push("glob".into());
@@ -608,6 +621,10 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
 
     // Reserved words and wrappers; payloads become extra units.
     for b in raw_units {
+        if out.units.len() > MAX_UNITS {
+            out.overflow = true;
+            return out;
+        }
         let Builder {
             assignments,
             argv,
@@ -631,11 +648,14 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         }
         let mut extra: Vec<Lexed> = vec![];
         for body in &subs {
-            extra.push(lex_depth(body, depth + 1, true));
+            let l = lex_depth(body, depth + 1, true);
+            out.overflow |= l.overflow;
+            extra.push(l);
         }
         let mut payload_units: Vec<Unit> = vec![];
         if let Some(p) = payload_of(&eff) {
             let l = lex_depth(&p, depth + 1, true);
+            out.overflow |= l.overflow;
             payload_units.extend(l.units);
             // reasons of a payload don't matter: the call is `sh -c …`, which
             // rules never match as a prefix of `sh`, and the hard-deny list
@@ -668,45 +688,59 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         }
     }
     // Text fed to a shell on stdin (here-docs, here-strings, `echo … | sh`) is
-    // a command line too.
-    let takes_stdin_code = |u: &Unit| {
-        u.eff.first().is_some_and(|f| {
-            let b = base(f);
-            (is_shell(b)
-                && payload_of(&u.eff).is_none()
-                && !u.eff[1..].iter().any(|a| !a.starts_with('-')))
-                || matches!(b, "eval" | "source" | ".")
-        })
+    // a command line too. Any shell, `eval` or `source` marks it; each text is
+    // lexed once.
+    let is_stdin_code = |u: &Unit| {
+        u.eff
+            .first()
+            .is_some_and(|f| is_shell(base(f)) || matches!(base(f), "eval" | "source" | "."))
     };
-    let mut extra_units: Vec<Unit> = vec![];
-    if out.units.iter().any(&takes_stdin_code) {
-        for b in &bodies {
-            for mut u in lex_depth(b, depth + 1, true).units {
-                u.derived = true;
-                extra_units.push(u);
-            }
-        }
+    if out.units.len() > MAX_UNITS {
+        out.overflow = true;
+        return out;
     }
-    for (j, u) in out.units.iter().enumerate() {
-        if u.pipe != 0 && u.seg.piped && takes_stdin_code(u) {
-            for prev in out.units[..j].iter().filter(|p| p.pipe == u.pipe) {
+    let mut texts: Vec<String> = vec![];
+    if out.units.iter().any(is_stdin_code) {
+        texts.extend(bodies.iter().cloned());
+        let mut seen_pipes: Vec<u32> = vec![];
+        for u in out
+            .units
+            .iter()
+            .filter(|u| u.pipe != 0 && u.seg.piped && is_stdin_code(u))
+        {
+            if seen_pipes.contains(&u.pipe) {
+                continue;
+            }
+            seen_pipes.push(u.pipe);
+            for prev in out.units.iter().filter(|p| p.pipe == u.pipe) {
                 if prev
                     .eff
                     .first()
                     .is_some_and(|f| matches!(base(f), "echo" | "printf"))
                 {
-                    let text = prev.eff[1..]
-                        .iter()
-                        .filter(|a| !a.starts_with('-'))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    for mut x in lex_depth(&text, depth + 1, true).units {
-                        x.derived = true;
-                        extra_units.push(x);
-                    }
+                    texts.push(
+                        prev.eff[1..]
+                            .iter()
+                            .filter(|a| !a.starts_with('-'))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
                 }
             }
+        }
+    }
+    let mut extra_units: Vec<Unit> = vec![];
+    for t in &texts {
+        let l = lex_depth(t, depth + 1, true);
+        out.overflow |= l.overflow;
+        for mut u in l.units {
+            u.derived = true;
+            extra_units.push(u);
+        }
+        if out.units.len() + extra_units.len() > MAX_UNITS {
+            out.overflow = true;
+            return out;
         }
     }
     out.units.extend(extra_units);

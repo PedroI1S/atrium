@@ -17,7 +17,7 @@ use super::words::{self, CwdState, Role, Use, Walk, lexical_resolve};
 use crate::PolicyInput;
 
 const MAX_BYTES: usize = 128 * 1024;
-const MAX_UNITS: usize = 512;
+use super::shell::MAX_UNITS;
 
 /// What the engine knows about a call, computed once.
 pub struct Analysis {
@@ -96,7 +96,7 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         let l = shell::lex(line);
         a.units = l.units;
         a.reasons = l.reasons;
-        if a.units.len() > MAX_UNITS {
+        if l.overflow || a.units.len() > MAX_UNITS {
             a.overflow = true;
             return;
         }
@@ -162,8 +162,14 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
             }
             let mut units = vec![];
             for x in &s {
-                units.extend(shell::lex(x).units);
+                let l = shell::lex(x);
+                a.overflow |= l.overflow;
+                units.extend(l.units);
                 a.raw.push(x.clone());
+                if a.overflow || units.len() > MAX_UNITS {
+                    a.overflow = true;
+                    return a;
+                }
             }
             a.units = units;
             if a.units.len() > MAX_UNITS {
@@ -318,7 +324,7 @@ impl Sensitive {
                 return Some("atrium-self");
             }
         }
-        if role == Role::Write {
+        if role != Role::Read {
             for d in &self.protected {
                 if under(&pl, d).is_some() {
                     return Some("atrium-self");
@@ -335,7 +341,7 @@ impl Sensitive {
             let name = r.rsplit('/').next().unwrap_or(r);
             let public = name.ends_with(".pub") || name.starts_with("known_hosts");
             let readable_config = r == "config" || r == "authorized_keys";
-            if !(public || (readable_config && role == Role::Read)) {
+            if !(public || (readable_config && role != Role::Write)) {
                 return Some("credential-read");
             }
         }
