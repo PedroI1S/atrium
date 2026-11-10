@@ -300,3 +300,11 @@ The work done so far on the branch is kept; the Claude model picks up from the b
 - "Always…" on a command now creates `RuleMatcher::CommandExact` (the whole argv). A remembered `rm -rf build` no longer allows `rm -rf build ~/Documents`. `CommandPrefix` rules can be created only in the rules editor.
 - In `HOME_READONLY_COMMANDS`, `date` also forbids `-f`/`--file`, because GNU `date -f FILE` prints FILE's lines. This is stricter than D-050/D-051.
 Applied to `atrium-protocol` (`policy.rs`, the serde shape test, `bindings/protocol.ts`) and contract §5 and §9. M1-03 implements it in its fix round. The M1-07/M1-08 approval UI shows the exact command.
+
+## D-055 — 2026-11-09 — The orchestrator makes all changes inline (trial of Claude Fable 5)
+**Decided by Pedro (driver).** From this shift, the orchestrator writes every change itself, in its own session, instead of fanning tasks out to workers. The orchestrator on Pedro's Mac is now Claude Fable 5 (`claude-fable-5-2`), and Pedro wants to see how it does. He accepts that this is slower than parallel workers.
+- While this holds, it replaces the fan-out step of PLAN §8 and the worker routing of D-043, D-048 and D-053 on Pedro's shifts. It doesn't bind rodrigo's shifts.
+- Unchanged: the frozen M1 contract and the change-request process, an explicit go from the driver for each phase, work on `dev` only, and the push policy (D-005, D-007).
+- **Still open:** the go for the second-wave tasks, and who reviews work the orchestrator wrote itself (PLAN §8.2 wants a reviewer from another provider).
+
+Housekeeping the same day, asked for by Pedro: the stale `claude/design-ui-direction-6c0810` worktree and branch (content already on `dev` as `ea3a1f3`) and the five merged first-wave `agent/*` branches were removed. They existed only on Pedro's Mac.
