@@ -716,25 +716,33 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         return out;
     }
     let mut texts: Vec<String> = vec![];
-    // A body counts when its owner (the command holding the `<<`) is such a
-    // reader, is piped into one, or is a `{ … }` / `( … )` group around one.
-    let any_reader = out.units.iter().any(is_stdin_code);
+    // A body is shell-fed (lexed for the hard-deny list) unless it is clearly
+    // text: its owner is a simple command that isn't a shell, `eval`,
+    // `source` or an interpreter, and whose output isn't piped or
+    // process-substituted. Groups, loops, subshells and anything piped count.
+    let reads_code = |u: &Unit| {
+        is_stdin_code(u)
+            || u.eff.first().is_some_and(|f| {
+                let b = base(f);
+                b.starts_with("python")
+                    || matches!(b, "perl" | "ruby" | "node" | "deno" | "bun" | "php" | "lua")
+            })
+    };
     for (owner, text) in &bodies {
-        let unit = raw_pos.get(*owner).and_then(|p| out.units.get(*p));
-        let counts = match unit {
-            // no command of its own: a `( … ) <<EOF` group
-            None => any_reader,
-            Some(u) => {
-                is_stdin_code(u)
-                    || u.seg.argv.first().is_some_and(|w| w == "}") && any_reader
-                    || (u.pipe != 0
-                        && out
-                            .units
-                            .iter()
-                            .any(|o| o.pipe == u.pipe && is_stdin_code(o)))
-            }
-        };
-        if counts {
+        let clearly_text = raw_pos
+            .get(*owner)
+            .and_then(|p| out.units.get(*p))
+            .is_some_and(|u| {
+                !u.seg
+                    .argv
+                    .first()
+                    .is_some_and(|w| RESERVED.contains(&w.as_str()) || w == "}" || w == ")")
+                    && !reads_code(u)
+                    && u.pipe == 0
+                    && u.subs.is_empty()
+                    && !u.grouped
+            });
+        if !clearly_text {
             texts.push(text.clone());
         }
     }

@@ -2715,3 +2715,33 @@ fn review_round4_table() {
     ];
     run_table(&env, &table);
 }
+
+#[test]
+fn review_round5_table() {
+    let env = Env::home();
+    let table: Vec<(&str, Want)> = vec![
+        ("cat <<EOF | (bash)\nrm -rf ~\nEOF", Hard(RD)),
+        ("cat <<EOF > >(bash)\nrm -rf ~\nEOF", Hard(RD)),
+        ("while read l; do bash; done <<EOF\nrm -rf ~\nEOF", Hard(RD)),
+        ("if true; then bash; fi <<EOF\nrm -rf ~\nEOF", Hard(RD)),
+        ("case x in x) bash;; esac <<EOF\nrm -rf ~\nEOF", Hard(RD)),
+        ("python3 <<EOF\nrm -rf ~\nEOF", Hard(RD)),
+        // piped, so shell-fed: a false hard deny is acceptable here
+        ("cat <<EOF | tee x\nrm -rf ~\nEOF", Hard(RD)),
+        // clearly text
+        (
+            "cat > notes.md <<'EOF'\nsudo make install\nEOF\nbash build.sh",
+            Ask,
+        ),
+        (
+            "cat > notes.md <<'EOF'\nsudo make install\nEOF\nsh -c make",
+            Ask,
+        ),
+        ("git commit -F - <<'EOF'\nrm -rf ~ fix\nEOF", Ask),
+        (
+            "git commit -F - <<'EOF'\nrm -rf ~ fix\nEOF\nsh -c make",
+            Ask,
+        ),
+    ];
+    run_table(&env, &table);
+}

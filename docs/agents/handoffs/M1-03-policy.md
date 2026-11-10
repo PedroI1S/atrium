@@ -135,3 +135,9 @@ DoD: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets --
 
 - R1. The owner of a here-doc is recorded when the `<<` is lexed (the command holding it), and a here-string's owner is the command it is attached to. A body is re-lexed when its owner is a shell, `eval` or `source`; when the owner is piped into one (same pipeline); when the owner is a `}` of a `{ …; }` group; or when it has no command of its own (`( … ) <<EOF`) and a shell is present. The round-3 cases (`cat > notes.md <<EOF … EOF` then `bash build.sh` / `sh -c make`, `git commit -F -`) still ask. Test: `review_round4_table` (all nine review inputs plus `bash <<A <<B`).
 - R2. `awk`/`gawk`/`mawk` count as writers with `-i…`, `--include…` or `inplace` in any argument. Test: `review_round4_table` (`-i inplace`, `-iinplace`, `--include=inplace`; plain `awk '{print}' file` still asks).
+
+## Review fixes (round 5)
+
+DoD: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `--test ledger` 20 passed, `--test policy` 44 passed; `cargo test --workspace` green.
+
+The here-doc rule is inverted. A here-doc or here-string body is shell-fed (re-lexed for hard deny) unless it is clearly text: its owner is a simple command (not a reserved word, `}` or `)`, not in a group or pipe), not a shell, `eval`, `source` or an interpreter (`python*`, `perl`, `ruby`, `node`, `deno`, `bun`, `php`, `lua`), with no process substitution among its words. Every compound owner, every pipeline and every process substitution therefore counts, whatever is on the other side. Test: `review_round5_table` (`cat <<EOF | (bash)`, `cat <<EOF > >(bash)`, `while … done <<EOF`, `if … fi <<EOF`, `case … esac <<EOF`, `python3 <<EOF`, and `cat <<EOF | tee x` as an accepted false hard deny; the round-3 cases still ask). All earlier here-doc inputs (`review_round4_table`) still pass.
