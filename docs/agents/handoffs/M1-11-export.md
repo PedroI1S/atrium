@@ -37,6 +37,7 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055) · Status: done, fix rou
   1. The `Cookie` rule blanked ordinary code (`fn parse(cookie: &str)`, `cookie = jar.get()`). The same was true of `authorization`. Both names now need a word boundary, and the value must have the header's shape: a cookie value starts with `name=`; an authorization value is `<scheme> <credentials>` or one random-looking word that is the whole value. `Cookie` takes `:` only.
   2. `-u "user:password"` with a quoted argument was not redacted. Quoted arguments and `--user=…` are handled now.
   3. The round-2 tests only mirrored the code. The reviewer's inputs are now tests, with more of the same kind.
+- While fixing these I found that a header value stopped at the first quote, so `Authorization: Digest username="u", response="…"` was only partly redacted. A header value now ends with its line, or with the quote the header or its value is written inside.
 - A value that is measured and then not taken is no longer measured again from later matches in the same run (`BareRuns`), so the new rules stay linear. The worst of 49 adversarial one-megabyte inputs is 34 ms.
 
 ## Not caught by redaction

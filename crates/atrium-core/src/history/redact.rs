@@ -654,6 +654,9 @@ fn scan_authorization(bytes: &[u8], emit: Emit<'_>) {
             if at > 0 && is_word(bytes[at - 1]) {
                 continue;
             }
+            // `-H "Name: value"` ends at the quote it started in;
+            // `"Name": "value"` at the value's own.
+            let mut closer = opening_quote(bytes, at);
             let mut i = from;
             if bytes.get(i).is_some_and(|c| is_quote(*c)) {
                 i += 1;
@@ -665,13 +668,14 @@ fn scan_authorization(bytes: &[u8], emit: Emit<'_>) {
                 _ => continue,
             }
             i = skip_blanks(bytes, i + 1);
-            if bytes.get(i).is_some_and(|c| is_quote(*c)) {
+            if let Some(&quote) = bytes.get(i).filter(|c| is_quote(**c)) {
+                closer = Some(quote);
                 i += 1;
             }
             let end = if is_cookie {
-                cookie_end(bytes, i)
+                cookie_end(bytes, i, closer)
             } else {
-                authorization_end(bytes, i, &mut runs)
+                authorization_end(bytes, i, closer, &mut runs)
             };
             if let Some(end) = end {
                 emit(i, end, Kind::Secret);
@@ -700,7 +704,7 @@ fn scan_authorization(bytes: &[u8], emit: Emit<'_>) {
 
 /// Where a `Cookie` value starting at `value` ends, if it is one: it starts
 /// with `name=`, as in `session=abc; theme=dark`.
-fn cookie_end(bytes: &[u8], value: usize) -> Option<usize> {
+fn cookie_end(bytes: &[u8], value: usize, closer: Option<u8>) -> Option<usize> {
     const MAX_NAME: usize = 128;
     let name = bytes[value..]
         .iter()
@@ -712,12 +716,17 @@ fn cookie_end(bytes: &[u8], value: usize) -> Option<usize> {
         && bytes
             .get(value + name + 1)
             .is_some_and(|c| !c.is_ascii_whitespace() && *c != b'=');
-    pair.then(|| header_value_end(bytes, value))
+    pair.then(|| header_value_end(bytes, value, closer))
 }
 
 /// Where an `Authorization` value starting at `value` ends, if it is a
 /// credential.
-fn authorization_end(bytes: &[u8], value: usize, runs: &mut BareRuns) -> Option<usize> {
+fn authorization_end(
+    bytes: &[u8],
+    value: usize,
+    closer: Option<u8>,
+    runs: &mut BareRuns,
+) -> Option<usize> {
     const MAX_SCHEME: usize = 32;
     // `<scheme> <credentials>`: `Bearer …`, `Basic …`, `token …`,
     // `AWS4-HMAC-SHA256 …`. Not `str = Header()` or `string | undefined`.
@@ -734,16 +743,13 @@ fn authorization_end(bytes: &[u8], value: usize, runs: &mut BareRuns) -> Option<
         return bytes
             .get(credentials)
             .is_some_and(|c| is_bearer(*c) && *c != b'=')
-            .then(|| header_value_end(bytes, value));
+            .then(|| header_value_end(bytes, value, closer));
     }
     // A credential with no scheme: one random-looking word that is the whole
     // value.
     let end = runs.random_end(bytes, value)?;
-    matches!(
-        bytes.get(skip_blanks(bytes, end)),
-        None | Some(b'\n' | b'\r' | b'"' | b'\'' | b'`')
-    )
-    .then_some(end)
+    let next = bytes.get(skip_blanks(bytes, end)).copied();
+    (matches!(next, None | Some(b'\n' | b'\r')) || next == closer).then_some(end)
 }
 
 /// Answers "does the bare value starting here look random?" for many starts
@@ -865,7 +871,7 @@ fn assignment_value(bytes: &[u8], sep: usize) -> Option<(usize, usize)> {
         // `X-Api-Key: value`, `api-key: value`: a name with a dash is a
         // header or a config key, never a variable. The rest of the line.
         (b':', false, true) if key.contains(&b'-') => {
-            let end = header_value_end(bytes, value);
+            let end = header_value_end(bytes, value, opening_quote(bytes, key_start));
             (end > value).then_some((value, end))
         }
         // `key: value` (YAML) and `key = value` (INI, TOML). These are also
@@ -884,13 +890,23 @@ fn assignment_value(bytes: &[u8], sep: usize) -> Option<(usize, usize)> {
     }
 }
 
-/// Where a header's value ends: the line, or a quote around the header.
-/// Trailing blanks are left out.
-fn header_value_end(bytes: &[u8], value: usize) -> usize {
+/// The quote or backtick right before `at`, if there is one: what closes a
+/// header that is written inside a string (`-H "Name: value"`).
+fn opening_quote(bytes: &[u8], at: usize) -> Option<u8> {
+    at.checked_sub(1)
+        .map(|before| bytes[before])
+        .filter(|c| is_quote(*c) || *c == b'`')
+}
+
+/// Where a header's value ends: the line, or `closer`, the quote the header
+/// or its value is written inside. Trailing blanks are left out. A header
+/// value can hold quotes of its own (`Digest username="…"`), so nothing else
+/// ends it.
+fn header_value_end(bytes: &[u8], value: usize, closer: Option<u8>) -> usize {
     let mut end = value
         + bytes[value..]
             .iter()
-            .take_while(|c| !matches!(c, b'\n' | b'\r' | b'"' | b'\'' | b'`'))
+            .take_while(|c| !matches!(c, b'\n' | b'\r') && Some(**c) != closer)
             .count();
     while end > value && is_blank(bytes[end - 1]) {
         end -= 1;

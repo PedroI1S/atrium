@@ -432,6 +432,24 @@ fn credentials_are_redacted_by_where_they_are() {
             r#"{"cookie": "sid=abc", "Authorization": "ApiKey abc"}"#,
             r#"{"cookie": "[redacted]", "Authorization": "[redacted]"}"#,
         ),
+        // A value with quotes of its own ends with its line, or with the
+        // quote the header is written inside.
+        (
+            "Authorization: Digest username=\"u\", response=\"0a1b\"\nHost: x",
+            "Authorization: [redacted]\nHost: x",
+        ),
+        (
+            r#"curl -H 'Authorization: Digest username="u", response="0a1b"' https://x"#,
+            "curl -H 'Authorization: [redacted]' https://x",
+        ),
+        (
+            "send `Cookie: sid=it's-me` first",
+            "send `Cookie: [redacted]` first",
+        ),
+        (
+            "authorization: AWS4-HMAC-SHA256 Credential=x/20250101/s3, Signature=0a1b",
+            "authorization: [redacted]",
+        ),
         // No scheme: one random-looking word.
         (
             "Authorization: a1b2c3d4e5f6\nHost: x",
