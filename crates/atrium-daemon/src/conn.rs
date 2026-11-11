@@ -408,7 +408,7 @@ impl Conn {
         }
         if let Some(control) = outbox.control.pop_front() {
             outbox.control_bytes -= control.frame.len();
-            return Take::Frame(control.frame);
+            return Take::Frame(control.frame, None);
         }
         let Some(event) = outbox.events.pop_front() else {
             if outbox.finishing {
@@ -417,27 +417,71 @@ impl Conn {
             return Take::Empty;
         };
         outbox.event_bytes -= event.frame.len();
-        if let Some(id) = event.id
-            && let Some(sub) = outbox.subs.get_mut(&event.sub)
-        {
-            sub.written = Some(id);
-        }
         drop(outbox);
         self.room.notify_waiters();
-        Take::Frame(event.frame)
+        Take::Frame(event.frame, Some((event.sub, event.id)))
+    }
+
+    /// Writes as much of a taken frame as the socket takes now. `Ok(None)`:
+    /// the frame is an event frame of a subscription that ended before any
+    /// of it was written, and must not be sent (D-058: nothing of a
+    /// subscription follows its end, a frame the writer already holds
+    /// included).
+    ///
+    /// The check and the first bytes happen under the outbox lock, the one
+    /// a `Subscribe` or an `Unsubscribe` ends a subscription under. So a
+    /// frame is either on its way before the subscription ends, or never
+    /// sent. The write never waits: the socket was reported writable.
+    fn write_some(
+        &self,
+        writer: &OwnedWriteHalf,
+        frame: &[u8],
+        first: bool,
+        origin: Option<(SubId, Option<EventId>)>,
+    ) -> std::io::Result<Option<usize>> {
+        let mut outbox = self.lock();
+        if first
+            && let Some((sub, _)) = origin
+            && !outbox.subs.contains_key(&sub)
+        {
+            return Ok(None);
+        }
+        let written = match writer.try_write(frame) {
+            Ok(written) => written,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(error) => return Err(error),
+        };
+        // `last_sent` names an event only once some of it is on the wire.
+        if first
+            && written > 0
+            && let Some((sub, Some(id))) = origin
+            && let Some(state) = outbox.subs.get_mut(&sub)
+        {
+            state.written = Some(id);
+        }
+        Ok(Some(written))
     }
 
     #[cfg(test)]
     pub(crate) fn take_for_test(&self) -> Option<Frame> {
         match self.take() {
-            Take::Frame(frame) => Some(frame),
+            Take::Frame(frame, origin) => {
+                // As the writer would: the frame counts as sent.
+                if let Some((sub, Some(id))) = origin
+                    && let Some(state) = self.lock().subs.get_mut(&sub)
+                {
+                    state.written = Some(id);
+                }
+                Some(frame)
+            }
             Take::Empty | Take::Closed => None,
         }
     }
 }
 
 enum Take {
-    Frame(Frame),
+    /// A frame and, for an event-lane frame, its subscription and event.
+    Frame(Frame, Option<(SubId, Option<EventId>)>),
     Empty,
     Closed,
 }
@@ -446,8 +490,8 @@ enum Take {
 /// stalls. The connection is closed when this returns.
 pub(crate) async fn write_loop(conn: &Conn, mut writer: OwnedWriteHalf) {
     loop {
-        let frame = match conn.take() {
-            Take::Frame(frame) => frame,
+        let (frame, origin) = match conn.take() {
+            Take::Frame(frame, origin) => (frame, origin),
             Take::Closed => break,
             Take::Empty => {
                 // `notify_one` keeps a wake-up sent before this point.
@@ -455,7 +499,19 @@ pub(crate) async fn write_loop(conn: &Conn, mut writer: OwnedWriteHalf) {
                 continue;
             }
         };
-        match tokio::time::timeout(WRITE_STALL, writer.write_all(&frame)).await {
+        let writing = async {
+            let mut written = 0;
+            while written < frame.len() {
+                writer.writable().await?;
+                match conn.write_some(&writer, &frame[written..], written == 0, origin)? {
+                    Some(more) => written += more,
+                    // Its subscription ended first: not sent.
+                    None => break,
+                }
+            }
+            std::io::Result::Ok(())
+        };
+        match tokio::time::timeout(WRITE_STALL, writing).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) | Err(_) => break,
         }
@@ -639,6 +695,47 @@ mod tests {
             ServerMessage::Response { request_id: 7, .. }
         ));
         assert!(matches!(conn.take(), Take::Closed));
+    }
+
+    #[tokio::test]
+    async fn a_frame_the_writer_holds_is_not_sent_once_its_subscription_ended() {
+        use tokio::io::AsyncReadExt;
+        for replaced in [false, true] {
+            let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a pair");
+            let (_reading, writer) = ours.into_split();
+            let conn = Conn::with_limit(1, ClientRole::Dev, 1_000);
+            let sub = conn.subscribe(&t("a")).expect("a subscription");
+            assert!(conn.feed(sub, Some(EventId(1)), frame(10)).await);
+            assert!(conn.feed(sub, Some(EventId(2)), frame(20)).await);
+            // The writer takes event 1 and sends it.
+            let Take::Frame(first, origin) = conn.take() else {
+                panic!("a frame")
+            };
+            assert_eq!(
+                conn.write_some(&writer, &first, true, origin)
+                    .expect("writes"),
+                Some(10)
+            );
+            // It takes event 2, and before any of it is written the thread
+            // is unsubscribed from (or subscribed to again).
+            let Take::Frame(second, origin) = conn.take() else {
+                panic!("a frame")
+            };
+            if replaced {
+                conn.subscribe(&t("a")).expect("a subscription");
+            } else {
+                conn.unsubscribe(&t("a"));
+            }
+            assert_eq!(
+                conn.write_some(&writer, &second, true, origin)
+                    .expect("checks"),
+                None
+            );
+            drop(writer);
+            let mut received = Vec::new();
+            theirs.read_to_end(&mut received).await.expect("reads");
+            assert_eq!(received.len(), 10, "event 1 only");
+        }
     }
 
     #[test]

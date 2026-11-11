@@ -167,14 +167,19 @@ pub(crate) async fn snapshot_daily(inner: Arc<Inner>) {
             // A time in the future (a clock that went back) counts as due.
             made.elapsed().map_or(true, |age| age >= SNAPSHOT_EVERY)
         });
-        if !due
-            || inner.running_turns() > 0
-            || matches!(inner.store.storage_status(), StorageStatus::ReadOnly { .. })
-        {
+        if !due || matches!(inner.store.storage_status(), StorageStatus::ReadOnly { .. }) {
             continue;
         }
         if let Err(error) = secure_dir(&dir) {
             eprintln!("atriumd: no snapshot: {error}");
+            continue;
+        }
+        // Nothing is appended while the snapshot is made, and "no turn is
+        // running" is checked with appends held: a session marks its turn
+        // as running before it stores the `TurnStarted`, so a turn that
+        // starts now is either seen here or stored after the snapshot.
+        let _appends_held = inner.publish.lock().await;
+        if inner.running_turns() > 0 {
             continue;
         }
         if let Err(error) = inner.store.snapshot(&dir).await {

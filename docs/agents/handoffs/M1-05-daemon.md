@@ -36,7 +36,7 @@ Not fixed in round 1:
 - **11. A snapshot can start just before a turn does.** Declined: the check is "no turn running now"; a snapshot is one read transaction and doesn't hold the turn up.
 
 ### Round 2
-The reviewer confirmed findings 1, 6, 7, 9 and 12 as fixed, accepted the escalations (CR-09, CR-10), and did **not** accept the two declines (5 first half, 11). Those two stay declined and are **the driver's to settle**: closing them means either making `Unsubscribe` wait for a frame the writer has already taken (which lets a client that doesn't read block its own commands), or holding all appends during a snapshot.
+The reviewer confirmed findings 1, 6, 7, 9 and 12 as fixed, accepted the escalations (CR-09, CR-10), and did **not** accept the two declines (5 first half, 11). Both were fixed afterwards (below).
 
 Fixed after round 2:
 | Finding | Fix |
@@ -50,6 +50,10 @@ Fixed after round 2:
 | New 7: a read that failed in recovery could turn a finished `Paused` thread into `Interrupted` | The reads return their errors and the start fails. |
 | New 9: the synthetic agent dropped messages past its queue without a word | It emits `Error { fatal: false }` for each, as `atrium-agents` asks of adapters. Test: `the_synthetic_agent_says_when_it_does_not_queue_a_message`. |
 
+Fixed afterwards, at the driver's request (rodrigo, 2026-11-11): **the two findings that had been declined.**
+- **5, first half.** The writer now checks, under the lock a subscription ends under, that an event frame's subscription still exists before the frame's first bytes go out; a frame it had taken for a subscription that ended meanwhile is dropped. `SubscriptionLagged.last_sent` names an event only once some of it is written. `Unsubscribe` never waits for the writer. Test: `conn::a_frame_the_writer_holds_is_not_sent_once_its_subscription_ended`.
+- **11.** The daily snapshot is made with appends held (`Inner::publish`), and "no turn running" is checked under that lock. A turn that starts during a snapshot has its events stored when the snapshot is done, so it waits for as long as the snapshot takes.
+
 Not fixed after round 2:
 - **New 2, second half:** a first message can still be put in the command channel of a session whose `SessionEnded` was just stored. Nothing reads that channel any more, so it has no effect.
 - **New 8:** a process record whose incarnation ended, left by a daemon killed before it cleared the record, stays in the store. `Store::live_processes` leaves ended incarnations out, so nothing lists it and nothing uses it. Folded into CR-10.
@@ -57,7 +61,7 @@ Not fixed after round 2:
 
 ## Done
 - New crate `crates/atrium-daemon`: a library and the `atriumd` binary, added to the workspace. No `unsafe`. New dependencies are ones already in `Cargo.lock` (`sha2`, `libc`, `rustix`; `tempfile` and `atrium-client` for tests).
-- 12 unit tests and 32 tests over a real socket in a temporary home (`tests/{socket,sessions,recovery,client}.rs`), with a scripted adapter the test drives event by event.
+- 13 unit tests and 32 tests over a real socket in a temporary home (`tests/{socket,sessions,recovery,client}.rs`), with a scripted adapter the test drives event by event.
 - A measurement harness for contract §14 (`examples/perf.rs`) and a `perf` profile in the root `Cargo.toml`.
 
 ## How it is built
@@ -104,7 +108,7 @@ Run on Linux (CachyOS, kernel 7.3), after the round-2 fixes:
 - `cargo fmt --all --check`: clean.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo test --workspace`: 266 passed, 0 failed, 1 ignored (`consistency_all_fixtures`, owned by M1-07 and M1-08).
-- `cargo test -p atrium-daemon`: 44 passed (12 unit, 9 `socket`, 19 `sessions`, 3 `recovery`, 1 `client`), three runs in a row.
+- `cargo test -p atrium-daemon`: 45 passed (13 unit, 9 `socket`, 19 `sessions`, 3 `recovery`, 1 `client`), three runs in a row.
 
 Each Definition of Done item and its test:
 | Item | Test |
