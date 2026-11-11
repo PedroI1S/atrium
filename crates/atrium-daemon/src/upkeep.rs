@@ -17,7 +17,6 @@ use crate::{Inner, Notifier, Phase, StartError, now_ms};
 const STORAGE_CHECK_EVERY: Duration = Duration::from_secs(2);
 const SNAPSHOT_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 const SNAPSHOT_FIRST_CHECK: Duration = Duration::from_secs(60);
-const SNAPSHOT_CHECK_EVERY: Duration = Duration::from_secs(10 * 60);
 
 const RESTARTED: &str = "the daemon restarted";
 
@@ -144,13 +143,14 @@ fn last_snapshot(dir: &std::path::Path) -> Option<SystemTime> {
 /// A snapshot once a day, when no turn is running (contract §7).
 pub(crate) async fn snapshot_daily(inner: Arc<Inner>) {
     let dir = inner.options.paths.snapshots_dir.clone();
-    let mut wait = SNAPSHOT_FIRST_CHECK;
+    let every = inner.options.snapshot_check_every;
+    let mut wait = every.min(SNAPSHOT_FIRST_CHECK);
     loop {
         tokio::select! {
             () = tokio::time::sleep(wait) => {}
             () = stopping(&inner) => return,
         }
-        wait = SNAPSHOT_CHECK_EVERY;
+        wait = every;
         let due = last_snapshot(&dir).is_none_or(|made| {
             // A time in the future (a clock that went back) counts as due.
             made.elapsed().map_or(true, |age| age >= SNAPSHOT_EVERY)

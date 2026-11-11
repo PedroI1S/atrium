@@ -109,6 +109,9 @@ pub struct Options {
     /// Each connection's event-lane bound. A test seam; production uses
     /// [`Options::new`]'s `MAX_CONNECTION_QUEUE_BYTES`.
     pub connection_queue_bytes: usize,
+    /// How often the daemon looks whether a daily snapshot is due. A test
+    /// seam; production uses [`Options::new`]'s ten minutes.
+    pub snapshot_check_every: std::time::Duration,
 }
 
 impl Options {
@@ -123,6 +126,7 @@ impl Options {
             store: StoreOptions::default(),
             manage_service: false,
             connection_queue_bytes: MAX_CONNECTION_QUEUE_BYTES,
+            snapshot_check_every: std::time::Duration::from_secs(10 * 60),
         }
     }
 }
