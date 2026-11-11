@@ -115,3 +115,30 @@ Non-blocking; it needs the driver's approval because it adds a method to the fro
 
 **Change proposed:** `Store::launch(&ThreadId) -> StoreResult<Option<NewThread>>` (the row as it was created, with the current title), implemented in `SqliteStore`'s reader. Affects `crates/atrium-core/src/lib.rs`, `store/`, and one function in the daemon.
 
+
+## CR-09 — M1-05-daemon (orchestrator, from the Codex review) — 2026-11-11
+
+Needs the driver's approval, and Pedro's, since it changes what a thread is shown as (contract §8, §10). Found by the review of M1-05 (`reviews/M1-05-daemon-codex.md`, finding 4).
+
+**A thread that was stopped can't be shown as "cleanup unverified" afterwards.** Contract §10 says a thread whose process can't be verified "is never shown as stopped". Contract §8 and `attention::next_state` say `Ended`, `Failed` and `Interrupted` are sticky until the next start, and that a user's stop is `Ended` at once. The two meet in this order:
+1. The user stops a thread (`Signal::Stopped`): it is `Ended`.
+2. The adapter then fails to end its session, and the daemon's check of the provider process comes back `Unverified` (the leader is gone and its group isn't empty, or the process couldn't be inspected).
+3. The daemon sends `Signal::Recovered { cleanup: Unverified }`, which `next_state` ignores because `Ended` is sticky.
+
+The thread stays `Ended` while something of it may still be running. The same happens from `Interrupted { Verified }` (full storage, then a failed cleanup) and when the daemon is killed between the user's stop and the session's end.
+
+**What M1-05 does until this is decided:** it sends the `Unverified` signal before the closing events, so the case is right whenever the thread was still in a live state. From a state that is already sticky, the thread keeps that state; the `SessionEnded` the daemon stores says `"the daemon restarted"` or the session's own reason, and nothing else records the doubt.
+
+**Change proposed:** in `next_state`, `Signal::Recovered { cleanup: Unverified }` moves `Ended` and `Interrupted { cleanup: Verified }` to `Interrupted { cleanup: Unverified }` (not `Failed`, which keeps its message). Affects `crates/atrium-core/src/attention/mod.rs`, its transition table test, and the wording of contract §8.
+
+## CR-10 — M1-05-daemon (orchestrator, from the Codex review) — 2026-11-11
+
+Non-blocking; it adds a method to the frozen `Store` trait. Found by the review of M1-05 (finding 2).
+
+**Recovery can't find an unfinished incarnation of an archived thread.** At its start the daemon closes every incarnation a previous daemon left unfinished (contract §5, §10). It finds them through `Store::live_processes` (incarnations with a recorded process) and `Store::threads` (which leaves archived threads out). `ArchiveThread` stops the session and archives the thread at once, so a daemon killed in between leaves an archived thread whose session never ended. If it had no recorded process (a synthetic session, or the record was already cleared), recovery never sees it.
+
+**What M1-05 does until this is decided:** the thread's requests are expired with all the others at start, so nothing of it can be approved. Its open messages, tool calls and turn stay open in the store, and its history has no `SessionEnded`. The thread is hidden, so only an export shows it.
+
+**Change proposed:** `Store::unfinished_incarnations() -> StoreResult<Vec<(ThreadId, u32)>>`: every thread's current incarnation that has events and no `SessionEnded`, archived or not, from the sessions table. Recovery would then use it instead of reading each listed thread's last event. Affects `crates/atrium-core/src/lib.rs`, `store/`, and `upkeep::recover`.
+
+The same method would let recovery clear a process record whose incarnation already ended (left by a daemon killed between storing `SessionEnded` and clearing the record). `Store::live_processes` leaves ended incarnations out, so today nothing lists such a record; nothing uses it either (round 2 of the review, finding 8).
