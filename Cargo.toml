@@ -36,3 +36,11 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 dbg_macro = "deny"
 todo = "warn"
+
+# Optimized like `release`, with debug assertions on: what `atriumd` needs to
+# accept a `Dev` client and `ATRIUM_HOME` (contract §4), so the contract §14
+# numbers can be measured against a real daemon process
+# (`crates/atrium-daemon/examples/perf.rs`).
+[profile.perf]
+inherits = "release"
+debug-assertions = true

@@ -18,13 +18,13 @@ use atrium_agents::{
 };
 use atrium_core::policy::{SessionGate, SessionGateConfig, StoreRules};
 use atrium_core::{ApprovalLedger, RequestKey, Signal, StoreError, StoreResult};
-use atrium_host::supervise::ProcessIdentity;
+use atrium_host::supervise::{self, ProcessIdentity};
 use atrium_protocol::agent::{
     AgentEvent, AgentEventEnvelope, MessageBody, MessageKind, Provider, RequestOutcome,
     SessionCommand, ToolStatus, TurnOutcome,
 };
 use atrium_protocol::policy::Preset;
-use atrium_protocol::thread::{ThreadId, ThreadSummary};
+use atrium_protocol::thread::{Cleanup, ThreadId, ThreadSummary};
 use atrium_protocol::wire::{ErrorCode, EventId, StoredEvent};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -103,6 +103,29 @@ impl Live {
                 "the session isn't taking commands",
             )),
         }
+    }
+}
+
+/// One incarnation's provider process, as the daemon knows it.
+#[derive(Default)]
+struct Process {
+    /// Set as soon as the adapter reports the process (`on_spawn`).
+    identity: Mutex<Option<ProcessIdentity>>,
+    /// Orders the store's record of it: `true` once the incarnation is
+    /// over, after which a report that comes late is not recorded.
+    over: tokio::sync::Mutex<bool>,
+}
+
+impl Process {
+    fn identity(&self) -> Option<ProcessIdentity> {
+        self.identity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn seen(&self, identity: &ProcessIdentity) {
+        *self.identity.lock().unwrap_or_else(PoisonError::into_inner) = Some(identity.clone());
     }
 }
 
@@ -210,6 +233,7 @@ impl Inner {
         thread: &ThreadId,
         incarnation: u32,
         launch: &Launch,
+        process: &Arc<Process>,
     ) -> SessionConfig {
         let gate = SessionGate::new(
             SessionGateConfig {
@@ -230,14 +254,18 @@ impl Inner {
         // handshake, so a daemon that dies meanwhile finds it at its next
         // start. The callback can't wait, so a task does the write.
         let (spawned, mut identities) = mpsc::unbounded_channel::<ProcessIdentity>();
-        let (store, recorded) = (self.store.clone(), thread.clone());
+        let (store, recorded, slot) = (self.store.clone(), thread.clone(), process.clone());
         tokio::spawn(async move {
             while let Some(identity) = identities.recv().await {
-                let _ = store
-                    .set_process(&recorded, incarnation, Some(identity))
-                    .await;
+                let over = slot.over.lock().await;
+                if !*over {
+                    let _ = store
+                        .set_process(&recorded, incarnation, Some(identity))
+                        .await;
+                }
             }
         });
+        let slot = process.clone();
         SessionConfig {
             cwd: self.home.clone(),
             model: launch.model.clone(),
@@ -255,6 +283,7 @@ impl Inner {
             env: Vec::new(),
             program: None,
             on_spawn: Some(Arc::new(move |identity: &ProcessIdentity| {
+                slot.seen(identity);
                 let _ = spawned.send(identity.clone());
             })),
         }
@@ -484,29 +513,29 @@ impl Inner {
                         out.stale = true;
                         break;
                     }
-                    Err(error) => {
+                    // Not an error of the session's: the thread is
+                    // interrupted, and resumable when space returns. Its
+                    // closing events are still accepted.
+                    Err(StoreError::ReadOnly { .. }) => {
                         closing_only = true;
-                        match error {
-                            // Not an error of the session's: the thread is
-                            // interrupted, and resumable when space returns.
-                            StoreError::ReadOnly { .. } => {
-                                out.reason.get_or_insert_with(|| "storage is full".into());
-                                if self
-                                    .store
-                                    .signal(thread, Signal::StorageReadOnly)
-                                    .await
-                                    .is_ok()
-                                {
-                                    self.refresh_thread(thread).await;
-                                }
-                            }
-                            other => {
-                                out.error.get_or_insert_with(|| {
-                                    format!("an event couldn't be stored: {other}")
-                                });
-                            }
+                        out.reason.get_or_insert_with(|| "storage is full".into());
+                        if self
+                            .store
+                            .signal(thread, Signal::StorageReadOnly)
+                            .await
+                            .is_ok()
+                        {
+                            self.refresh_thread(thread).await;
                         }
                         live.stop();
+                    }
+                    // The batch is lost (an event over `MAX_EVENT_BYTES`, a
+                    // store that fails): what follows would be a history
+                    // with a hole in it. The session is let go of here, and
+                    // the daemon closes the incarnation with the error.
+                    Err(other) => {
+                        out.error = Some(format!("an event couldn't be stored: {other}"));
+                        break;
                     }
                 }
             }
@@ -533,10 +562,11 @@ async fn run(
         Failed(String),
     }
     let mut stop = live.stop.subscribe();
+    let process = Arc::new(Process::default());
     let started = match &launch.agent {
         Agent::Fake(params) => Started::Session(fake::start(*params, launch.message.take())),
         Agent::Native(adapter) => {
-            let config = inner.session_config(&thread, incarnation, &launch);
+            let config = inner.session_config(&thread, incarnation, &launch, &process);
             tokio::select! {
                 started = adapter.start(config, Transport::Local) => match started {
                     Ok(session) => Started::Session(session),
@@ -551,7 +581,7 @@ async fn run(
         Started::Session(session) => {
             let Session {
                 descriptor,
-                process,
+                process: reported,
                 events,
                 commands,
             } = session;
@@ -559,10 +589,11 @@ async fn run(
                 .store
                 .set_enforcement(&thread, incarnation, descriptor)
                 .await;
-            if let Some(process) = process {
+            if let Some(reported) = reported {
+                process.seen(&reported);
                 let _ = inner
                     .store
-                    .set_process(&thread, incarnation, Some(process))
+                    .set_process(&thread, incarnation, Some(reported))
                     .await;
             }
             live.set_sender(Some(commands.clone()));
@@ -588,10 +619,22 @@ async fn run(
     };
     live.set_sender(None);
     live.turn.store(false, Ordering::Relaxed);
-    let exit_code = match pumped.ended {
-        Some(exit_code) => exit_code,
-        None => {
-            if !pumped.stale {
+    if !pumped.stale {
+        let ending = match pumped.ended {
+            Some(code) => Signal::Exited { code },
+            // The adapter didn't end its session (it failed to start, its
+            // stream stopped, it didn't stop in time), so nothing says its
+            // process is gone: the daemon checks, kills what is left of
+            // its group, and says so when it can't tell.
+            None => {
+                let cleanup = match process.identity() {
+                    Some(identity) => {
+                        tokio::task::spawn_blocking(move || supervise::kill_recorded(&identity))
+                            .await
+                            .unwrap_or(Cleanup::Unverified)
+                    }
+                    None => Cleanup::Verified,
+                };
                 inner
                     .close_incarnation(
                         &thread,
@@ -601,18 +644,18 @@ async fn run(
                         pumped.reason,
                     )
                     .await;
+                match cleanup {
+                    Cleanup::Verified => Signal::Exited { code: None },
+                    Cleanup::Unverified => Signal::Recovered { cleanup },
+                }
             }
-            None
-        }
-    };
-    if !pumped.stale {
-        let _ = inner.store.set_process(&thread, incarnation, None).await;
-        if inner
-            .store
-            .signal(&thread, Signal::Exited { code: exit_code })
-            .await
-            .is_ok()
+        };
         {
+            let mut over = process.over.lock().await;
+            *over = true;
+            let _ = inner.store.set_process(&thread, incarnation, None).await;
+        }
+        if inner.store.signal(&thread, ending).await.is_ok() {
             inner.refresh_thread(&thread).await;
         }
     }

@@ -1230,3 +1230,92 @@ async fn a_snapshot_is_made_once_a_day_when_no_turn_runs() {
         .await;
     common::until(|| count() == 1).await;
 }
+
+#[tokio::test]
+async fn an_event_the_store_refuses_fails_the_session() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    let (thread, mut script) = running(&mut rig, &mut wire).await;
+    // Over `MAX_EVENT_BYTES`: only a bug in an adapter gets here.
+    let huge = "x".repeat(atrium_protocol::limits::MAX_EVENT_BYTES + 1);
+    script.delta("m", &huge).await;
+    let summary = wire
+        .thread_when(&thread, |summary| {
+            matches!(summary.state, ThreadState::Failed { .. })
+        })
+        .await;
+    let ThreadState::Failed { message } = summary.state else {
+        unreachable!()
+    };
+    assert!(message.contains("couldn't be stored"), "{message}");
+    // Nothing of the refused batch is stored, and the incarnation is closed
+    // with the error first.
+    let history = wire.history(&thread).await;
+    assert_eq!(
+        kinds(&history),
+        [
+            "session_started",
+            "turn_started",
+            "error",
+            "turn_completed",
+            "session_ended"
+        ]
+    );
+    assert!(matches!(
+        history[3].envelope.event,
+        AgentEvent::TurnCompleted {
+            outcome: TurnOutcome::Failed,
+            ..
+        }
+    ));
+    // The session was let go of: its command channel is closed.
+    assert_eq!(soon(script.commands.recv()).await, None);
+    assert_eq!(
+        wire.refused(say(&thread, "hi")).await,
+        ErrorCode::NotRunning
+    );
+}
+
+#[tokio::test]
+async fn a_process_the_adapter_left_running_is_killed_or_reported() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    *rig.adapter.start.lock().expect("lock") = Start::Process;
+    let alive = |pid: u32| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+
+    // The adapter's stream stops while its provider is still running. The
+    // daemon kills the provider's group; here something still reaps it, as
+    // an adapter's own cleanup would.
+    let thread = wire.start_thread(native(), Some("go")).await.thread_id;
+    let mut script = rig.script().await;
+    script.command().await;
+    script.started("native-1").await;
+    script.turn(1).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Running)
+        .await;
+    let mut provider = script.process.take().expect("a process");
+    let pid = provider.identity.pid;
+    assert!(alive(pid));
+    let reaping = tokio::spawn(async move { provider.child.wait().await });
+    script.die();
+    let summary = wire
+        .thread_when(&thread, |summary| {
+            matches!(summary.state, ThreadState::Interrupted { .. })
+        })
+        .await;
+    assert_eq!(
+        summary.state,
+        ThreadState::Interrupted {
+            cleanup: Cleanup::Verified
+        }
+    );
+    let status = soon(reaping).await.expect("joins").expect("waits");
+    assert!(!status.success(), "it was killed");
+    assert!(!alive(pid));
+}
