@@ -287,6 +287,15 @@ impl Script {
     /// would, emits `ApprovalRequested` with the ticket. Returns the
     /// request id.
     pub async fn ask(&mut self, turn: u32, file: &str) -> String {
+        self.ask_ticket(turn, file).await.0.request_id
+    }
+
+    /// [`Script::ask`], returning the ticket and the check it is bound to.
+    pub async fn ask_ticket(
+        &mut self,
+        turn: u32,
+        file: &str,
+    ) -> (atrium_agents::ApprovalTicket, ToolCheck) {
         let check = Self::write_check(turn, file);
         let GateDecision::Ask { ticket } = self.config.gate.check(&check).await else {
             panic!("Home asks about a write");
@@ -294,15 +303,15 @@ impl Script {
         self.emit(AgentEvent::ApprovalRequested {
             request_id: ticket.request_id.clone(),
             call_id: None,
-            name: check.name,
+            name: check.name.clone(),
             kind: check.kind,
-            title: check.title,
-            input: check.input,
+            title: check.title.clone(),
+            input: check.input.clone(),
             reason: None,
             rememberable: ticket.rememberable,
         })
         .await;
-        ticket.request_id
+        (ticket, check)
     }
 
     /// The next command the session was sent.

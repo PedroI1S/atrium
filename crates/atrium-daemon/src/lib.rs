@@ -340,7 +340,15 @@ impl Daemon {
         let listener = server::bind(&inner.options.paths.socket)?;
         tokio::spawn(upkeep::watch_storage(inner.clone()));
         tokio::spawn(upkeep::snapshot_daily(inner.clone()));
-        let serving = tokio::spawn(server::serve(inner.clone(), listener));
+        let serving = tokio::spawn({
+            let inner = inner.clone();
+            async move {
+                server::serve(inner.clone(), listener).await;
+                // No client is left: end the sessions, storing their
+                // closing events.
+                sessions::stop_all(&inner).await;
+            }
+        });
         Ok(Self {
             inner,
             serving: Some(serving),
@@ -357,9 +365,10 @@ impl Daemon {
         self.inner.request_stop(force);
     }
 
-    /// Returns once the daemon has stopped serving: it was asked to stop
-    /// (by [`Daemon::stop`] or `ShutdownDaemon`) and, unless forced, no turn
-    /// was running. Call [`Daemon::stopped`] next.
+    /// Returns once the daemon has stopped: it was asked to (by
+    /// [`Daemon::stop`] or `ShutdownDaemon`) and, unless forced, no turn was
+    /// running; its connections are closed and its sessions ended. Call
+    /// [`Daemon::stopped`] next, which lets go of the socket and the lock.
     pub async fn served(&mut self) {
         if let Some(serving) = self.serving.as_mut() {
             let _ = serving.await;
@@ -372,7 +381,6 @@ impl Daemon {
     /// the socket removed.
     pub async fn stopped(mut self) {
         self.served().await;
-        sessions::stop_all(&self.inner).await;
         // The lock (and with it the socket) goes when the last task holding
         // the state lets go. Nothing is left running by now, but a task that
         // has finished may not have been dropped yet.
