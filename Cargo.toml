@@ -10,6 +10,7 @@ members = [
     "crates/atrium-core",
     "crates/atrium-host",
     "crates/atrium-client",
+    "crates/atrium-daemon",
 ]
 
 [workspace.package]
