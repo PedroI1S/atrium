@@ -56,8 +56,8 @@ mod server;
 mod sessions;
 mod upkeep;
 
-pub use hub::{Notification, NotifyReason};
 pub use commands::KEEP_RUNNING_SETTING;
+pub use hub::{Notification, NotifyReason};
 pub use upkeep::CommandNotifier;
 
 use hub::Hub;

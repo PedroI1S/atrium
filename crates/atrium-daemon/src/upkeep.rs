@@ -98,10 +98,7 @@ async fn stopping(inner: &Inner) {
 pub(crate) async fn watch_storage(inner: Arc<Inner>) {
     let mut full = false;
     loop {
-        let now_full = matches!(
-            inner.store.storage_status(),
-            StorageStatus::ReadOnly { .. }
-        );
+        let now_full = matches!(inner.store.storage_status(), StorageStatus::ReadOnly { .. });
         if now_full != full {
             full = now_full;
             inner.hub().set_storage_full(full.then(now_ms));
@@ -157,10 +154,7 @@ pub(crate) async fn snapshot_daily(inner: Arc<Inner>) {
         });
         if !due
             || inner.running_turns() > 0
-            || matches!(
-                inner.store.storage_status(),
-                StorageStatus::ReadOnly { .. }
-            )
+            || matches!(inner.store.storage_status(), StorageStatus::ReadOnly { .. })
         {
             continue;
         }

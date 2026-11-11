@@ -29,7 +29,7 @@ use atrium_protocol::wire::{ErrorCode, EventId, StoredEvent};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-use crate::{Failure, Inner, fake, failure, now_ms, store_failure};
+use crate::{Failure, Inner, failure, fake, now_ms, store_failure};
 
 /// Events stored per transaction, at most.
 const BATCH_EVENTS: usize = 256;
@@ -201,13 +201,7 @@ impl Inner {
         };
         live.incarnation.store(incarnation, Ordering::Relaxed);
         self.refresh_thread(thread).await;
-        tokio::spawn(run(
-            self.clone(),
-            thread.clone(),
-            incarnation,
-            live,
-            launch,
-        ));
+        tokio::spawn(run(self.clone(), thread.clone(), incarnation, live, launch));
         Ok(summary)
     }
 
@@ -576,7 +570,9 @@ async fn run(
                 // Asked to stop while it was starting.
                 let _ = commands.try_send(SessionCommand::Shutdown);
             } else if let Some(text) = launch.message.take() {
-                let _ = commands.send(SessionCommand::SendUserMessage { text }).await;
+                let _ = commands
+                    .send(SessionCommand::SendUserMessage { text })
+                    .await;
             }
             drop(commands);
             inner.pump(&thread, incarnation, &live, events).await

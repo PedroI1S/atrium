@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use atrium_protocol::limits::{MAX_CONNECTION_QUEUE_BYTES, MAX_SUBSCRIPTIONS_PER_CONNECTION};
+use atrium_protocol::limits::MAX_SUBSCRIPTIONS_PER_CONNECTION;
 use atrium_protocol::thread::ThreadId;
 use atrium_protocol::wire::{ClientRole, CommandResult, ErrorCode, EventId, ServerMessage};
 use serde_json::Value;
@@ -153,10 +153,6 @@ pub(crate) struct Conn {
 static SUBS: AtomicU64 = AtomicU64::new(1);
 
 impl Conn {
-    pub(crate) fn new(id: ConnId, role: ClientRole) -> Self {
-        Self::with_limit(id, role, MAX_CONNECTION_QUEUE_BYTES)
-    }
-
     pub(crate) fn with_limit(id: ConnId, role: ClientRole, max_event_bytes: usize) -> Self {
         Self {
             id,
@@ -597,7 +593,7 @@ mod tests {
 
     #[test]
     fn subscriptions_are_limited() {
-        let conn = Conn::new(1, ClientRole::Dev);
+        let conn = Conn::with_limit(1, ClientRole::Dev, 1_000);
         for n in 0..MAX_SUBSCRIPTIONS_PER_CONNECTION {
             assert!(conn.subscribe(&t(&n.to_string())).is_some());
         }

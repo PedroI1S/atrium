@@ -12,7 +12,9 @@ use atrium_agents::{
     ApprovalTicket, BoxFuture, GateDecision, PermissionPolicy, SessionConfig, ToolCheck, ToolGate,
 };
 use atrium_core::history::{self, Redactor};
-use atrium_core::{ApprovalLedger, LedgerError, NewThread, RequestKey, Signal, StorageStatus, Store};
+use atrium_core::{
+    ApprovalLedger, LedgerError, NewThread, RequestKey, Signal, StorageStatus, Store,
+};
 use atrium_host::lifecycle;
 use atrium_protocol::agent::SessionCommand;
 use atrium_protocol::limits::REPLAY_PAGE_EVENTS;
@@ -26,7 +28,7 @@ use serde_json::{Map, Value, json};
 use crate::conn::Conn;
 use crate::hub::inbox_value;
 use crate::sessions::{Agent, Launch};
-use crate::{Failure, Inner, Phase, fake, failure, now_ms, store_failure};
+use crate::{Failure, Inner, Phase, failure, fake, now_ms, store_failure};
 
 /// A thread's title until its first user message or a rename.
 pub(crate) const UNTITLED: &str = "New thread";
@@ -116,7 +118,10 @@ pub(crate) fn permissions(preset: Preset) -> PermissionPolicy {
 impl Inner {
     /// A thread that is listed (exists and isn't archived).
     fn listed(&self, thread: &ThreadId) -> Result<ThreadSummary, Failure> {
-        self.hub().thread(thread).cloned().ok_or_else(unknown_thread)
+        self.hub()
+            .thread(thread)
+            .cloned()
+            .ok_or_else(unknown_thread)
     }
 
     /// Whether new work can start: not while stopping, not while storage is
@@ -503,8 +508,7 @@ async fn probe(inner: &Arc<Inner>, preset: Preset) -> Result<Value, Failure> {
 }
 
 async fn create_rule(inner: &Arc<Inner>, draft: RuleDraft) -> Result<Value, Failure> {
-    if let RuleMatcher::CommandPrefix { argv } | RuleMatcher::CommandExact { argv } =
-        &draft.matcher
+    if let RuleMatcher::CommandPrefix { argv } | RuleMatcher::CommandExact { argv } = &draft.matcher
         && argv.is_empty()
     {
         return Err(failure(ErrorCode::Invalid, "the rule's command is empty"));
@@ -524,11 +528,7 @@ async fn create_rule(inner: &Arc<Inner>, draft: RuleDraft) -> Result<Value, Fail
         origin: RuleOrigin::Settings,
         created_at_ms: now,
     };
-    let rule = inner
-        .store
-        .create_rule(rule)
-        .await
-        .map_err(store_failure)?;
+    let rule = inner.store.create_rule(rule).await.map_err(store_failure)?;
     value(&rule)
 }
 
@@ -632,7 +632,12 @@ fn export_error(error: &io::Error) -> Failure {
     failure(code, message)
 }
 
-fn write_export(mut pages: Pages, format: ExportFormat, path: &Path, home: &str) -> Result<u64, Failure> {
+fn write_export(
+    mut pages: Pages,
+    format: ExportFormat,
+    path: &Path,
+    home: &str,
+) -> Result<u64, Failure> {
     let file = history::create_export_file(path).map_err(|error| export_error(&error))?;
     let redactor = Redactor::new(home, &[]);
     let mut out = io::BufWriter::new(file);
@@ -666,7 +671,10 @@ async fn export(
 ) -> Result<Value, Failure> {
     let path = PathBuf::from(path);
     if !path.is_absolute() {
-        return Err(failure(ErrorCode::Invalid, "the export path isn't absolute"));
+        return Err(failure(
+            ErrorCode::Invalid,
+            "the export path isn't absolute",
+        ));
     }
     inner
         .store
@@ -696,10 +704,16 @@ mod tests {
 
     #[test]
     fn a_title_is_the_first_line_with_text() {
-        assert_eq!(title_from("  \n\n  fix   the\tbuild \nmore"), Some("fix the build".into()));
+        assert_eq!(
+            title_from("  \n\n  fix   the\tbuild \nmore"),
+            Some("fix the build".into())
+        );
         assert_eq!(title_from(" \n \t"), None);
         let long = "é".repeat(500);
-        assert_eq!(title_from(&long).map(|title| title.chars().count()), Some(MAX_TITLE_CHARS));
+        assert_eq!(
+            title_from(&long).map(|title| title.chars().count()),
+            Some(MAX_TITLE_CHARS)
+        );
     }
 
     #[test]

@@ -62,10 +62,6 @@ impl Hub {
         attention::rank_inbox(&threads, self.storage_full_since)
     }
 
-    pub(crate) fn connections(&self) -> usize {
-        self.connections.len()
-    }
-
     pub(crate) fn add_conn(&mut self, conn: &Arc<Conn>) {
         self.connections.insert(conn.id, conn.clone());
     }
@@ -76,10 +72,6 @@ impl Hub {
         for conn in self.connections.values() {
             conn.finish();
         }
-    }
-
-    pub(crate) fn threads(&self) -> impl Iterator<Item = &ThreadSummary> {
-        self.threads.values()
     }
 
     /// The connection is gone: nothing more is queued for it.
@@ -106,7 +98,7 @@ impl Hub {
     /// come before it or be missed after it.
     pub(crate) fn subscribe_inbox(&mut self, conn: &Arc<Conn>, request_id: u64) {
         let mut threads: Vec<&ThreadSummary> = self.threads.values().collect();
-        threads.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        threads.sort_by_key(|summary| std::cmp::Reverse(summary.created_at_ms));
         conn.ok(
             request_id,
             json!({ "threads": threads, "inbox": self.ranked }),
@@ -268,11 +260,6 @@ impl Hub {
         if subs.is_empty() {
             self.live.remove(thread);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn live_subscriptions(&self, thread: &ThreadId) -> usize {
-        self.live.get(thread).map_or(0, Vec::len)
     }
 }
 

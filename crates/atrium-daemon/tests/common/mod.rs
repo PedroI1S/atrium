@@ -585,18 +585,27 @@ impl Wire {
     }
 
     /// Subscribes and returns `replay_until`.
-    pub async fn subscribed(&mut self, thread: &ThreadId, after: Option<EventId>) -> Option<EventId> {
+    pub async fn subscribed(
+        &mut self,
+        thread: &ThreadId,
+        after: Option<EventId>,
+    ) -> Option<EventId> {
         let value = self.subscribe(thread, after).await.expect("subscribes");
         serde_json::from_value(value["replay_until"].clone()).expect("replay_until")
     }
 
     pub async fn subscribe_inbox(&mut self) -> Value {
         let request_id = self.request_id();
-        self.send(&ClientMessage::SubscribeInbox { request_id }).await;
+        self.send(&ClientMessage::SubscribeInbox { request_id })
+            .await;
         self.response(request_id).await.expect("the inbox")
     }
 
-    pub async fn start_thread(&mut self, agent: AgentLaunch, message: Option<&str>) -> ThreadSummary {
+    pub async fn start_thread(
+        &mut self,
+        agent: AgentLaunch,
+        message: Option<&str>,
+    ) -> ThreadSummary {
         let value = self
             .ok(DaemonCommand::StartThread {
                 agent,

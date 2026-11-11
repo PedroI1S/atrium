@@ -215,7 +215,8 @@ async fn a_stale_approval_is_expired_and_never_reaches_the_session() {
     };
     // Not with the old incarnation's number.
     assert_eq!(
-        wire.refused(resolve(&thread, 1, &fresh, deny.clone())).await,
+        wire.refused(resolve(&thread, 1, &fresh, deny.clone()))
+            .await,
         ErrorCode::Expired
     );
     wire.ok(resolve(&thread, 2, &fresh, deny.clone())).await;
@@ -250,7 +251,12 @@ async fn always_creates_a_rule_with_the_approval() {
         serde_json::from_value(wire.ok(DaemonCommand::ListRules).await).expect("rules");
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].id.0, rule_id);
-    assert_eq!(rules[0].origin, RuleOrigin::Approval { request_id: request });
+    assert_eq!(
+        rules[0].origin,
+        RuleOrigin::Approval {
+            request_id: request
+        }
+    );
     assert_eq!(
         rules[0].matcher,
         RuleMatcher::CommandExact {
@@ -446,7 +452,7 @@ async fn a_session_that_dies_is_closed_in_order() {
 
 #[tokio::test]
 async fn a_session_that_cannot_start_fails_or_is_stopped() {
-    let mut rig = Rig::start().await;
+    let rig = Rig::start().await;
     let mut wire = rig.dev().await;
 
     *rig.adapter.start.lock().expect("lock") = Start::Fail;
@@ -567,7 +573,10 @@ async fn thread_commands_reach_the_session() {
         }
     })
     .await;
-    assert_eq!(wire.refused(say(&thread, "hi")).await, ErrorCode::NotRunning);
+    assert_eq!(
+        wire.refused(say(&thread, "hi")).await,
+        ErrorCode::NotRunning
+    );
     assert_eq!(wire.thread(&thread).await.state, ThreadState::Ended);
 }
 
@@ -740,12 +749,16 @@ async fn shutdown_waits_for_turns_unless_forced() {
         ]
     );
     // Not forced, with nothing running: it exits at once.
-    wire.ok(DaemonCommand::ShutdownDaemon { force: false }).await;
+    wire.ok(DaemonCommand::ShutdownDaemon { force: false })
+        .await;
     assert!(wire.closed().await);
     rig.stop(false).await;
 }
 
-fn updates_of(messages: &[ServerMessage], thread: &ThreadId) -> Vec<atrium_protocol::thread::ThreadSummary> {
+fn updates_of(
+    messages: &[ServerMessage],
+    thread: &ThreadId,
+) -> Vec<atrium_protocol::thread::ThreadSummary> {
     messages
         .iter()
         .filter_map(|message| match message {
@@ -878,7 +891,11 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
     script.die();
     tokio::time::sleep(Duration::from_millis(200)).await;
     let items = inbox(&mut watcher).await;
-    assert!(items.iter().all(|item| item.thread_id.as_ref() != Some(&thread)));
+    assert!(
+        items
+            .iter()
+            .all(|item| item.thread_id.as_ref() != Some(&thread))
+    );
     let seen: Vec<ServerMessage> = watcher.aside.drain(..).collect();
     assert!(updates_of(&seen, &thread).is_empty(), "{seen:?}");
     for command in [
@@ -901,7 +918,7 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
 
 #[tokio::test]
 async fn rules_settings_and_probes() {
-    let mut rig = Rig::start().await;
+    let rig = Rig::start().await;
     let mut wire = rig.dev().await;
 
     let draft = |argv: &[&str]| RuleDraft {
@@ -1017,7 +1034,10 @@ async fn an_export_is_private_and_removed_when_it_fails() {
     let text = std::fs::read_to_string(&markdown).expect("the export");
     assert_eq!(answer["bytes"], text.len() as u64);
     assert!(text.contains("The answer is 42."), "{text}");
-    let mode = std::fs::metadata(&markdown).expect("stat").permissions().mode();
+    let mode = std::fs::metadata(&markdown)
+        .expect("stat")
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o600);
 
     let jsonl = rig.home.join("thread.jsonl");
@@ -1086,10 +1106,28 @@ async fn the_synthetic_agent_runs_turns_and_stops() {
         .await;
     let history = wire.history(&thread).await;
     let shape = kinds(&history);
-    assert_eq!(shape[..3], ["session_started", "turn_started", "message_completed"]);
-    assert_eq!(shape[shape.len() - 2..], ["message_completed", "turn_completed"]);
-    assert_eq!(shape.iter().filter(|kind| **kind == "tool_call_started").count(), 3);
-    assert_eq!(shape.iter().filter(|kind| **kind == "tool_call_finished").count(), 3);
+    assert_eq!(
+        shape[..3],
+        ["session_started", "turn_started", "message_completed"]
+    );
+    assert_eq!(
+        shape[shape.len() - 2..],
+        ["message_completed", "turn_completed"]
+    );
+    assert_eq!(
+        shape
+            .iter()
+            .filter(|kind| **kind == "tool_call_started")
+            .count(),
+        3
+    );
+    assert_eq!(
+        shape
+            .iter()
+            .filter(|kind| **kind == "tool_call_finished")
+            .count(),
+        3
+    );
     // 300 ms at 2,000 tokens a second, four characters a token.
     let text: String = history
         .iter()
@@ -1099,14 +1137,17 @@ async fn the_synthetic_agent_runs_turns_and_stops() {
         })
         .collect();
     assert_eq!(text.len(), 2_400);
-    let completed = history.iter().rev().find_map(|event| match &event.envelope.event {
-        AgentEvent::MessageCompleted {
-            kind: MessageKind::Assistant,
-            body,
-            ..
-        } => Some(body.clone()),
-        _ => None,
-    });
+    let completed = history
+        .iter()
+        .rev()
+        .find_map(|event| match &event.envelope.event {
+            AgentEvent::MessageCompleted {
+                kind: MessageKind::Assistant,
+                body,
+                ..
+            } => Some(body.clone()),
+            _ => None,
+        });
     assert_eq!(
         completed,
         Some(MessageBody::Streamed {

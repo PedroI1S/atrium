@@ -53,9 +53,7 @@ async fn a_role_is_granted_or_the_connection_is_refused() {
     }
 
     // Never a lesser role: refused, and closed.
-    let agent = ClientRole::Agent {
-        token: "t".into(),
-    };
+    let agent = ClientRole::Agent { token: "t".into() };
     let (mut wire, first) = Wire::hello(rig.socket(), agent).await;
     assert_eq!(incompatible(first), "unverified client");
     assert!(wire.closed().await);
@@ -73,10 +71,7 @@ async fn a_role_is_granted_or_the_connection_is_refused() {
         role: ClientRole::Dev,
     })
     .await;
-    assert_eq!(
-        incompatible(wire.read().await),
-        "protocol version mismatch"
-    );
+    assert_eq!(incompatible(wire.read().await), "protocol version mismatch");
     assert!(wire.closed().await);
 
     // Anything before `Hello` closes the connection, unanswered.
@@ -155,7 +150,10 @@ async fn the_app_identity_file_must_be_private() {
     std::fs::remove_file(&file).expect("removes");
     std::fs::rename(&real, &file).expect("moves");
     let (_, first) = Wire::hello(rig.socket(), ClientRole::App).await;
-    assert!(matches!(first, Some(ServerMessage::Welcome { .. })), "{first:?}");
+    assert!(
+        matches!(first, Some(ServerMessage::Welcome { .. })),
+        "{first:?}"
+    );
     rig.stop(true).await;
 }
 
@@ -166,8 +164,14 @@ async fn a_silent_connection_is_closed_at_the_hello_deadline() {
     let mut wire = Wire::connect(rig.socket()).await;
     assert!(wire.read().await.is_none(), "closed without a word");
     let waited = began.elapsed();
-    assert!(waited >= HELLO_TIMEOUT - Duration::from_millis(200), "{waited:?}");
-    assert!(waited < HELLO_TIMEOUT + Duration::from_secs(5), "{waited:?}");
+    assert!(
+        waited >= HELLO_TIMEOUT - Duration::from_millis(200),
+        "{waited:?}"
+    );
+    assert!(
+        waited < HELLO_TIMEOUT + Duration::from_secs(5),
+        "{waited:?}"
+    );
     rig.stop(true).await;
 }
 
@@ -250,7 +254,10 @@ async fn a_subscribe_is_refused_for_an_unknown_thread_or_a_cursor_past_the_end()
     let mut script = rig.script().await;
     // Nothing stored yet: any cursor is past the end.
     assert_eq!(
-        wire.subscribe(&thread, Some(EventId(1))).await.expect_err("empty").0,
+        wire.subscribe(&thread, Some(EventId(1)))
+            .await
+            .expect_err("empty")
+            .0,
         ErrorCode::Invalid
     );
     script.started("native-1").await;
@@ -309,7 +316,10 @@ async fn follow(wire: &mut Wire, thread: &ThreadId, after: Option<EventId>) -> V
     }
     let replayed = replayed.expect("ReplayDone came");
     // Everything up to `replay_until` came before it, and nothing after it.
-    assert_eq!(ids[..replayed].last().copied().or(after), replay_until.or(after));
+    assert_eq!(
+        ids[..replayed].last().copied().or(after),
+        replay_until.or(after)
+    );
     assert!(ids[replayed..].iter().all(|id| Some(*id) > replay_until));
     ids
 }
@@ -369,13 +379,12 @@ async fn replay_then_live_delivers_every_event_once_and_in_order() {
     assert!(all.windows(2).all(|pair| pair[0] < pair[1]));
     for subscriber in following {
         let (after, ids) = soon(subscriber).await.expect("the subscriber ran");
-        let expected: Vec<EventId> = all
-            .iter()
-            .copied()
-            .filter(|id| Some(*id) > after)
-            .collect();
+        let expected: Vec<EventId> = all.iter().copied().filter(|id| Some(*id) > after).collect();
         assert_eq!(ids.len(), expected.len(), "after {after:?}");
-        assert!(ids == expected, "every event once, in order (after {after:?})");
+        assert!(
+            ids == expected,
+            "every event once, in order (after {after:?})"
+        );
     }
     rig.stop(true).await;
 }
@@ -541,7 +550,10 @@ async fn a_reader_that_stops_lags_alone() {
         .map(|event| event.id)
         .collect();
     let live_from = all.len() - steady_ids.len();
-    assert!(steady_ids == all[live_from..], "the steady reader missed nothing");
+    assert!(
+        steady_ids == all[live_from..],
+        "the steady reader missed nothing"
+    );
     assert_eq!(steady_ids.len(), bursts * per_burst + 1);
 
     // The stalled one still gets its command answered, and is told it
