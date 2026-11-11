@@ -47,10 +47,10 @@ Model: Claude Fable 5 (the orchestrator, inline; D-055, D-057) · Status: **writ
 - **macOS:** nothing here was run on macOS. The code has no platform branches except `CommandNotifier`.
 
 ## Definition of Done results
-Run on Linux (CachyOS, kernel 7.3), at `23a8a89`:
+Run on Linux (CachyOS, kernel 7.3), at `23a8a89` (the daemon's tests again at `3463a45`):
 - `cargo fmt --all --check`: clean.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
-- `cargo test --workspace`: see the numbers at the end of this file.
+- `cargo test --workspace`: 262 passed, 0 failed, 1 ignored (`consistency_all_fixtures`, owned by M1-07 and M1-08).
 - `cargo test -p atrium-daemon`: 40 passed (11 unit, 9 `socket`, 16 `sessions`, 3 `recovery`, 1 `client`).
 
 Each Definition of Done item and its test:
@@ -100,6 +100,7 @@ The `perf` profile is `release` with debug assertions on, which is what lets the
 - After `ShutdownDaemon` the answer arrives and then the connection closes.
 - `ExportThread` needs an absolute path. `Invalid` covers "something is already there", "the folder doesn't exist" and "the folder isn't yours"; the message says which.
 - While the daemon is draining after `SIGTERM`, `StartThread`, `ResumeThread` and `SendUserMessage` are `Invalid`.
+- A `SendUserMessage` while the thread is still `Starting` is `NotRunning`: the session takes commands once the adapter has started. The message a thread is started with is the exception (it is sent as soon as the session exists).
 
 ## For M1-13 (adversarial tests)
 - D-058's rule is tested for one replaced subscription and one `Unsubscribe`. Not tested: many replacements in a row, a replacement while live.
