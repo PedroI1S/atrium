@@ -346,6 +346,14 @@ impl Inner {
             .next()
     }
 
+    /// Whether the incarnation's `SessionEnded` is stored.
+    pub(crate) async fn incarnation_ended(&self, thread: &ThreadId, incarnation: u32) -> bool {
+        self.last_stored(thread).await.is_some_and(|last| {
+            last.envelope.incarnation == incarnation
+                && matches!(last.envelope.event, AgentEvent::SessionEnded { .. })
+        })
+    }
+
     /// Stores the closing events of an incarnation that didn't close itself,
     /// in the contract's order: an error (if any), open messages, open tool
     /// calls, pending requests, the open turn, `SessionEnded`. Does nothing
@@ -635,6 +643,15 @@ async fn run(
                     }
                     None => Cleanup::Verified,
                 };
+                // Before the closing events: the `SessionEnded` among them
+                // settles the thread's state, and "couldn't tell" must not
+                // be lost under it.
+                if cleanup == Cleanup::Unverified {
+                    let _ = inner
+                        .store
+                        .signal(&thread, Signal::Recovered { cleanup })
+                        .await;
+                }
                 inner
                     .close_incarnation(
                         &thread,
@@ -644,10 +661,7 @@ async fn run(
                         pumped.reason,
                     )
                     .await;
-                match cleanup {
-                    Cleanup::Verified => Signal::Exited { code: None },
-                    Cleanup::Unverified => Signal::Recovered { cleanup },
-                }
+                Signal::Exited { code: None }
             }
         };
         {

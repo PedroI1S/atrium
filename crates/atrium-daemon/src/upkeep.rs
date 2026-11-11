@@ -36,36 +36,51 @@ pub(crate) async fn recover(inner: &Arc<Inner>) -> Result<(), StartError> {
         let cleanup = tokio::task::spawn_blocking(move || supervise::kill_recorded(&process))
             .await
             .unwrap_or(Cleanup::Unverified);
-        inner
-            .close_incarnation(&thread, incarnation, 0, None, Some(RESTARTED.into()))
-            .await;
+        if !inner.incarnation_ended(&thread, incarnation).await {
+            // The signal first: the `SessionEnded` among the closing
+            // events settles the thread's state, and an unverified cleanup
+            // must not be lost under it.
+            inner
+                .store
+                .signal(&thread, Signal::Recovered { cleanup })
+                .await?;
+            inner
+                .close_incarnation(&thread, incarnation, 0, None, Some(RESTARTED.into()))
+                .await;
+        }
         inner.store.set_process(&thread, incarnation, None).await?;
-        inner
-            .store
-            .signal(&thread, Signal::Recovered { cleanup })
-            .await?;
         recovered.insert(thread);
     }
     for summary in inner.store.threads().await? {
         if summary.incarnation == 0 || recovered.contains(&summary.thread_id) {
             continue;
         }
-        let (live, cleanup) = match summary.state {
+        let cleanup = match summary.state {
             // A process may have been started and not yet recorded: nothing
             // was killed, and nothing says it stopped.
-            ThreadState::Starting => (true, Cleanup::Unverified),
+            ThreadState::Starting => Cleanup::Unverified,
             ThreadState::Running
             | ThreadState::NeedsApproval
             | ThreadState::NeedsInput
-            | ThreadState::Idle => (true, Cleanup::Verified),
-            // Kept through a session's end: only one that never ended is
-            // interrupted.
-            ThreadState::Paused { .. } => (false, Cleanup::Verified),
+            | ThreadState::Idle
+            // Kept through a session's end: only one whose session never
+            // ended is interrupted (the check below).
+            | ThreadState::Paused { .. } => Cleanup::Verified,
             ThreadState::Failed { .. } | ThreadState::Interrupted { .. } | ThreadState::Ended => {
                 continue;
             }
         };
-        let closed = inner
+        if inner
+            .incarnation_ended(&summary.thread_id, summary.incarnation)
+            .await
+        {
+            continue;
+        }
+        inner
+            .store
+            .signal(&summary.thread_id, Signal::Recovered { cleanup })
+            .await?;
+        inner
             .close_incarnation(
                 &summary.thread_id,
                 summary.incarnation,
@@ -74,12 +89,6 @@ pub(crate) async fn recover(inner: &Arc<Inner>) -> Result<(), StartError> {
                 Some(RESTARTED.into()),
             )
             .await;
-        if live || closed {
-            inner
-                .store
-                .signal(&summary.thread_id, Signal::Recovered { cleanup })
-                .await?;
-        }
     }
     inner.ledger.expire_all().await;
     Ok(())

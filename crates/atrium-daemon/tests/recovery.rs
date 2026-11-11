@@ -42,7 +42,12 @@ fn crash_child() {
                 std::fs::write(root.join(PID_FILE), process.identity.pid.to_string())
                     .expect("the pid file");
             }
-            *adapter.start.lock().expect("lock") = Start::Script;
+            // The third never finishes starting.
+            *adapter.start.lock().expect("lock") = if sessions.is_empty() {
+                Start::Script
+            } else {
+                Start::Hang
+            };
             script.command().await;
             script
                 .started(&format!("native-{}", sessions.len() + 1))
@@ -105,6 +110,9 @@ async fn a_killed_daemon_is_recovered_at_the_next_start() {
     let plain = wire.start_thread(native(), Some("two")).await.thread_id;
     wire.thread_when(&plain, |summary| summary.pending_approvals == 1)
         .await;
+    // A third thread, whose provider never finishes starting.
+    let starting = wire.start_thread(native(), Some("three")).await.thread_id;
+    assert_eq!(wire.thread(&starting).await.state, ThreadState::Starting);
     let requests = [
         request_of(&mut wire, &with_process).await,
         request_of(&mut wire, &plain).await,
@@ -150,6 +158,16 @@ async fn a_killed_daemon_is_recovered_at_the_next_start() {
             ErrorCode::Expired
         );
     }
+
+    // Nothing says whether the third thread's provider had been started:
+    // it is interrupted, and not called stopped.
+    assert_eq!(
+        wire.thread(&starting).await.state,
+        ThreadState::Interrupted {
+            cleanup: Cleanup::Unverified
+        }
+    );
+    assert_eq!(kinds(&wire.history(&starting).await), ["session_ended"]);
 
     // The closing events are stored once: another start adds nothing.
     drop(wire);

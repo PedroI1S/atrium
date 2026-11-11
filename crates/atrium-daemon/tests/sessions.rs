@@ -1319,3 +1319,57 @@ async fn a_process_the_adapter_left_running_is_killed_or_reported() {
     assert!(!status.success(), "it was killed");
     assert!(!alive(pid));
 }
+
+#[tokio::test]
+async fn a_dead_provider_nobody_reaped_is_not_called_stopped() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    *rig.adapter.start.lock().expect("lock") = Start::Process;
+    let thread = wire.start_thread(native(), Some("go")).await.thread_id;
+    let mut script = rig.script().await;
+    script.command().await;
+    script.started("native-1").await;
+    script.turn(1).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Running)
+        .await;
+    // The adapter's stream stops and nothing reaps its provider: killed, it
+    // is still a member of its group, so the daemon can't tell that the
+    // group is empty. It says so instead of calling the thread stopped.
+    script.die();
+    let summary = wire
+        .thread_when(&thread, |summary| {
+            matches!(summary.state, ThreadState::Interrupted { .. })
+        })
+        .await;
+    assert_eq!(
+        summary.state,
+        ThreadState::Interrupted {
+            cleanup: Cleanup::Unverified
+        }
+    );
+    soon(async {
+        while kinds(&wire.history(&thread).await).last() != Some(&"session_ended") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        kinds(&wire.history(&thread).await),
+        [
+            "session_started",
+            "turn_started",
+            "turn_completed",
+            "session_ended"
+        ]
+    );
+    // The closing events don't take it back.
+    assert_eq!(
+        wire.thread(&thread).await.state,
+        ThreadState::Interrupted {
+            cleanup: Cleanup::Unverified
+        }
+    );
+    assert!(inbox(&mut wire).await.iter().any(|item| {
+        item.reason == InboxReason::CleanupUnverified && item.thread_id.as_ref() == Some(&thread)
+    }));
+}
