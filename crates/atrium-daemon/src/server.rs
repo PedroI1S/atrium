@@ -281,15 +281,21 @@ async fn handle(inner: &Arc<Inner>, conn: &Arc<Conn>, message: ClientMessage) ->
             if !authorized(command.authority()) {
                 conn.err(request_id, ErrorCode::Forbidden, "not allowed");
             } else if commands::is_slow(&command)
-                && let Ok(slot) = conn.slow.clone().try_acquire_owned()
+                && let Ok(slot) = inner.slow.clone().try_acquire_owned()
             {
-                // Doesn't hold up the connection's other messages. A
-                // connection has a few such slots; past them, the command
-                // runs below like any other.
+                // Doesn't hold up the connection's other messages. The
+                // daemon has a few such slots; with none free, the command
+                // runs below like any other. It is given up when its
+                // connection goes or the daemon stops.
                 let (inner, conn) = (inner.clone(), conn.clone());
                 tokio::spawn(async move {
-                    let result = commands::run(&inner, &conn, command).await;
-                    answer(&conn, request_id, result);
+                    tokio::select! {
+                        result = commands::run(&inner, &conn, command) => {
+                            answer(&conn, request_id, result);
+                        }
+                        () = conn.closed() => {}
+                        () = crate::upkeep::stopping(&inner) => {}
+                    }
                     drop(slot);
                 });
             } else {

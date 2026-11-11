@@ -46,9 +46,6 @@ const MAX_CONTROL_BYTES: usize = 8 * 1024 * 1024;
 /// client reconnects and continues from its cursor.
 const WRITE_STALL: Duration = Duration::from_secs(30);
 
-/// Slow commands one connection may have running beside its reader.
-const MAX_SLOW_COMMANDS: usize = 4;
-
 /// Which queued control frame a newer one replaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Coalesce {
@@ -166,10 +163,6 @@ pub(crate) struct Conn {
     /// Wakes feeders waiting for room, and tells them of ended subscriptions.
     room: Notify,
     max_event_bytes: usize,
-    /// Commands of this connection that run beside its reader (see
-    /// `commands::is_slow`). With none left, the next one runs in the
-    /// reader, which then reads no further until it is done.
-    pub(crate) slow: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 static SUBS: AtomicU64 = AtomicU64::new(1);
@@ -183,7 +176,6 @@ impl Conn {
             wake: Notify::new(),
             room: Notify::new(),
             max_event_bytes,
-            slow: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SLOW_COMMANDS)),
         }
     }
 

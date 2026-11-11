@@ -355,23 +355,25 @@ impl Inner {
     }
 
     /// The thread's last stored event.
-    async fn last_stored(&self, thread: &ThreadId) -> Option<StoredEvent> {
-        let last = self.store.last_event(thread).await.ok()??;
+    async fn last_stored(&self, thread: &ThreadId) -> StoreResult<Option<StoredEvent>> {
+        let Some(last) = self.store.last_event(thread).await? else {
+            return Ok(None);
+        };
         let before = last.0.checked_sub(1).map(EventId);
-        self.store
-            .events_after(thread, before, 1)
-            .await
-            .ok()?
-            .into_iter()
-            .next()
+        let events = self.store.events_after(thread, before, 1).await?;
+        Ok(events.into_iter().next())
     }
 
     /// Whether the incarnation's `SessionEnded` is stored.
-    pub(crate) async fn incarnation_ended(&self, thread: &ThreadId, incarnation: u32) -> bool {
-        self.last_stored(thread).await.is_some_and(|last| {
+    pub(crate) async fn incarnation_ended(
+        &self,
+        thread: &ThreadId,
+        incarnation: u32,
+    ) -> StoreResult<bool> {
+        Ok(self.last_stored(thread).await?.is_some_and(|last| {
             last.envelope.incarnation == incarnation
                 && matches!(last.envelope.event, AgentEvent::SessionEnded { .. })
-        })
+        }))
     }
 
     /// Stores the closing events of an incarnation that didn't close itself,
@@ -389,7 +391,7 @@ impl Inner {
         live: Option<&Live>,
     ) -> StoreResult<bool> {
         let mut seq = 0;
-        if let Some(last) = self.last_stored(thread).await
+        if let Some(last) = self.last_stored(thread).await?
             && last.envelope.incarnation == incarnation
         {
             if matches!(last.envelope.event, AgentEvent::SessionEnded { .. }) {
@@ -478,6 +480,8 @@ impl Inner {
         // The store refused a batch: from then on only closing events are
         // kept, and the daemon closes whatever is still open at the end.
         let mut closing_only = false;
+        // The sequence number after the last event stored.
+        let mut next_seq = 0;
         let mut deadline: Option<Instant> = None;
         loop {
             let received = tokio::select! {
@@ -515,13 +519,21 @@ impl Inner {
             }
             if closing_only {
                 batch.retain(|envelope| is_closing(&envelope.event));
+                // What was dropped must not leave a hole: the events kept
+                // continue the stored sequence.
+                for (envelope, seq) in batch.iter_mut().zip(next_seq..) {
+                    envelope.seq = seq;
+                }
             }
             if !batch.is_empty() {
                 match self
                     .store_batch(thread, incarnation, std::mem::take(&mut batch), Some(live))
                     .await
                 {
-                    Ok(_) => {
+                    Ok(stored) => {
+                        if let Some(last) = stored.last() {
+                            next_seq = last.envelope.seq.saturating_add(1);
+                        }
                         if let Some((_, exit_code)) = ended {
                             out.ended = Some(exit_code);
                         }
@@ -573,6 +585,15 @@ async fn run(
     live: Arc<Live>,
     mut launch: Launch,
 ) {
+    /// What became of the thread's first message.
+    #[derive(PartialEq)]
+    enum First {
+        Taken,
+        /// The session didn't take it in time.
+        NotTaken,
+        /// The session was told to stop before it took it.
+        Stopped,
+    }
     enum Started {
         Session(Session),
         Stopped,
@@ -614,33 +635,52 @@ async fn run(
                     .set_process(&thread, incarnation, Some(reported))
                     .await;
             }
-            live.set_sender(Some(commands.clone()));
             let mut first = None;
-            if *stop.borrow() {
-                // Asked to stop while it was starting.
-                let _ = commands.try_send(SessionCommand::Shutdown);
-            } else if let Some(text) = launch.message.take() {
-                // Handed over beside the pump, and bounded: a session that
-                // takes no commands holds up neither its own events nor a
-                // stop. If it isn't taken in time, the session is stopped.
-                let (commands, live) = (commands.clone(), live.clone());
-                first = Some(tokio::spawn(async move {
-                    let message = SessionCommand::SendUserMessage { text };
-                    let sent = tokio::time::timeout(COMMAND_PATIENCE, commands.send(message)).await;
-                    let taken = matches!(sent, Ok(Ok(())));
-                    if !taken {
-                        live.stop();
+            match launch.message.take().filter(|_| !*stop.borrow()) {
+                // The message the thread was started with is the first
+                // command its session gets: the session takes nobody
+                // else's until this one is handed over or given up. That
+                // happens beside the pump, and is bounded, so a session
+                // that takes no commands holds up neither its own events
+                // nor a stop.
+                Some(text) => {
+                    let (commands, live) = (commands.clone(), live.clone());
+                    let mut stop = stop.clone();
+                    first = Some(tokio::spawn(async move {
+                        let message = SessionCommand::SendUserMessage { text };
+                        let handed = tokio::select! {
+                            sent = tokio::time::timeout(COMMAND_PATIENCE, commands.send(message)) => {
+                                if matches!(sent, Ok(Ok(()))) {
+                                    First::Taken
+                                } else {
+                                    First::NotTaken
+                                }
+                            }
+                            _ = stop.wait_for(|stop| *stop) => First::Stopped,
+                        };
+                        live.set_sender(Some(commands));
+                        if handed != First::Taken {
+                            live.stop();
+                        }
+                        handed
+                    }));
+                }
+                None => {
+                    live.set_sender(Some(commands.clone()));
+                    if *stop.borrow() {
+                        // Asked to stop while it was starting.
+                        let _ = commands.try_send(SessionCommand::Shutdown);
                     }
-                    taken
-                }));
+                }
             }
             drop(commands);
             let pumped = inner.pump(&thread, incarnation, &live, events).await;
             if let Some(first) = first {
-                // Still waiting when the session is over: given up, and
-                // its hold on the command channel with it.
+                // Still waiting when the session is over: given up (and
+                // its hold on the command channel with it), which is a
+                // message the session never got.
                 first.abort();
-                first_message_lost = matches!(first.await, Ok(false));
+                first_message_lost = !matches!(first.await, Ok(First::Taken | First::Stopped));
             }
             pumped
         }
@@ -661,6 +701,7 @@ async fn run(
             .get_or_insert_with(|| "the session didn't take its first message".into());
     }
     if !pumped.stale {
+        let mut unfinished = false;
         let ending = match pumped.ended {
             Some(code) => Signal::Exited { code },
             // The adapter didn't end its session (it failed to start, its
@@ -695,8 +736,10 @@ async fn run(
                     )
                     .await;
                 if let Err(error) = closed {
-                    // The next start finds the incarnation unfinished and
-                    // closes it then.
+                    // Whatever comes first closes it: a resume of the
+                    // thread, or the daemon's next start. Its process
+                    // record stays until then.
+                    unfinished = true;
                     eprintln!("atriumd: can't store the closing events of {thread:?}: {error}");
                 }
                 Signal::Exited { code: None }
@@ -705,7 +748,9 @@ async fn run(
         {
             let mut over = process.over.lock().await;
             *over = true;
-            let _ = inner.store.set_process(&thread, incarnation, None).await;
+            if !unfinished {
+                let _ = inner.store.set_process(&thread, incarnation, None).await;
+            }
         }
         if inner.store.signal(&thread, ending).await.is_ok() {
             inner.refresh_thread(&thread).await;

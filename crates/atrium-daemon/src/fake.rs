@@ -56,6 +56,7 @@ pub(crate) fn start(params: Params, message: Option<String>) -> Session {
         queue: VecDeque::from([message.unwrap_or_else(|| "Synthetic turn".into())]),
         interrupted: false,
         stopping: false,
+        rejected: 0,
     };
     tokio::spawn(agent.run());
     Session {
@@ -78,6 +79,8 @@ struct Agent {
     queue: VecDeque<String>,
     interrupted: bool,
     stopping: bool,
+    /// User messages that found the queue full and are yet to be reported.
+    rejected: u32,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -105,6 +108,9 @@ impl Agent {
             Some(SessionCommand::SendUserMessage { text }) => {
                 if self.queue.len() < MAX_QUEUED_MESSAGES {
                     self.queue.push_back(text);
+                } else {
+                    // Said in the events, since the command was taken.
+                    self.rejected += 1;
                 }
             }
             Some(SessionCommand::Interrupt) => self.interrupted = true,
@@ -139,6 +145,22 @@ impl Agent {
         }
     }
 
+    /// Reports the user messages that were not queued (`atrium-agents`:
+    /// more than `MAX_QUEUED_MESSAGES` are rejected with a non-fatal
+    /// error).
+    async fn report_rejected(&mut self) -> Result<(), Gone> {
+        while self.rejected > 0 {
+            self.rejected -= 1;
+            self.emit(AgentEvent::Error {
+                message: "too many messages are waiting; this one was not queued".into(),
+                fatal: false,
+                details: Vec::new(),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn run(mut self) {
         let _ = self.session().await;
     }
@@ -164,6 +186,7 @@ impl Agent {
                     self.on_command(command);
                 }
             }
+            self.report_rejected().await?;
         }
         self.emit(AgentEvent::SessionEnded {
             exit_code: Some(0),
@@ -278,6 +301,7 @@ impl Agent {
                 _ = tick.tick() => {}
                 command = self.commands.recv() => self.on_command(command),
             }
+            self.report_rejected().await?;
         }
         if deltas > 0 {
             self.emit(AgentEvent::MessageCompleted {

@@ -607,18 +607,31 @@ async fn full_storage_interrupts_running_turns_and_refuses_new_ones() {
         }
     );
     assert_eq!(busy_script.command().await, SessionCommand::Shutdown);
-    // Its closing events are still stored.
-    busy_script.die();
+    // What it still streams is refused, and its closing events are stored
+    // all the same, continuing the stored sequence.
+    busy_script.delta("m", "more").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    busy_script.turn_done(1).await;
+    busy_script.ended(Some(0)).await;
     soon(async {
         while kinds(&wire.history(&busy).await).last() != Some(&"session_ended") {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
+    let history = wire.history(&busy).await;
     assert_eq!(
-        kinds(&wire.history(&busy).await)[2..],
-        ["turn_completed", "session_ended"]
+        kinds(&history),
+        [
+            "session_started",
+            "turn_started",
+            "turn_completed",
+            "session_ended"
+        ]
     );
+    for (at, event) in history.iter().enumerate() {
+        assert_eq!(event.envelope.seq, at as u64);
+    }
 
     // The inbox says so, first.
     let items = inbox(&mut wire).await;
@@ -1479,4 +1492,48 @@ async fn a_new_inbox_subscriber_gets_current_summaries() {
     let mut late = rig.dev().await;
     let all = late.subscribe_inbox().await;
     assert_eq!(all["threads"][0]["last_event"], json!(current.last_event));
+}
+
+#[tokio::test]
+async fn the_synthetic_agent_says_when_it_does_not_queue_a_message() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    let thread = wire
+        .start_thread(
+            AgentLaunch::Fake {
+                tokens_per_second: 100,
+                chunk_chars: 16,
+                duration_ms: 600_000,
+                tool_call_every_ms: 0,
+            },
+            Some("hi"),
+        )
+        .await
+        .thread_id;
+    wire.thread_when(&thread, |summary| summary.unread).await;
+    // Two more than wait while a turn runs.
+    for n in 0..atrium_agents::MAX_QUEUED_MESSAGES + 2 {
+        wire.ok(say(&thread, &format!("message {n}"))).await;
+    }
+    soon(async {
+        loop {
+            let refused = wire
+                .history(&thread)
+                .await
+                .iter()
+                .filter(|event| {
+                    matches!(event.envelope.event, AgentEvent::Error { fatal: false, .. })
+                })
+                .count();
+            if refused == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // Not a failure of the session.
+    assert_eq!(wire.thread(&thread).await.state, ThreadState::Running);
+    wire.ok(shutdown(&thread)).await;
+    rig.stop(true).await;
 }

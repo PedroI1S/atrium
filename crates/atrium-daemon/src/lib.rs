@@ -65,6 +65,9 @@ use sessions::Live;
 
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Slow commands that may run beside their connections' readers at once.
+const MAX_SLOW_COMMANDS: usize = 8;
+
 /// Posts a notification to the desktop. Called off the hot path, at most
 /// once per thread per `limits::NOTIFY_MIN_INTERVAL`.
 pub trait Notifier: Send + Sync {
@@ -186,6 +189,11 @@ pub(crate) struct Inner {
     /// goes back to an older summary when two tasks refresh the same thread.
     refresh: tokio::sync::Mutex<()>,
     sessions: Mutex<HashMap<ThreadId, Arc<Live>>>,
+    /// Slow commands (`commands::is_slow`) running beside their
+    /// connections' readers, across the daemon.
+    pub(crate) slow: Arc<tokio::sync::Semaphore>,
+    /// Held while the keep-running setting and the login service change.
+    pub(crate) service: tokio::sync::Mutex<()>,
     pub(crate) conn_ids: AtomicU64,
     pub(crate) rule_ids: AtomicU64,
     pub(crate) phase: watch::Sender<Phase>,
@@ -322,6 +330,8 @@ impl Daemon {
             publish: tokio::sync::Mutex::new(()),
             refresh: tokio::sync::Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
+            slow: Arc::new(tokio::sync::Semaphore::new(MAX_SLOW_COMMANDS)),
+            service: tokio::sync::Mutex::new(()),
             conn_ids: AtomicU64::new(1),
             rule_ids: AtomicU64::new(1),
             phase,
@@ -334,6 +344,7 @@ impl Daemon {
 
         // Before any client is accepted or any session starts (contract §5).
         upkeep::recover(&inner).await?;
+        commands::reconcile_service(&inner).await;
         let threads = inner.store.threads().await?;
         inner.hub().load(threads);
 

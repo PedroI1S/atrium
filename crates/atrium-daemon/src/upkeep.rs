@@ -84,7 +84,7 @@ async fn close(
     incarnation: u32,
     cleanup: Cleanup,
 ) -> Result<(), StartError> {
-    if inner.incarnation_ended(thread, incarnation).await {
+    if inner.incarnation_ended(thread, incarnation).await? {
         return Ok(());
     }
     // The signal first: the `SessionEnded` among the closing events settles
@@ -101,7 +101,7 @@ async fn close(
 }
 
 /// Returns once the daemon is stopping.
-async fn stopping(inner: &Inner) {
+pub(crate) async fn stopping(inner: &Inner) {
     let mut phase = inner.phase.subscribe();
     let _ = phase.wait_for(|phase| *phase == Phase::Stopping).await;
 }

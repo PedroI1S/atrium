@@ -424,6 +424,22 @@ async fn resume_thread(inner: &Arc<Inner>, thread: &ThreadId) -> Result<Value, F
                 format!("no adapter for {:?} in this daemon", summary.provider),
             )
         })?;
+    // The incarnation before is closed first. It is, unless storing its
+    // closing events failed when its session ended: that is tried again
+    // here, and the thread isn't resumed until it succeeds, or the open
+    // items of that incarnation would never be closed.
+    if summary.incarnation > 0 && inner.session_of(thread, None).is_err() {
+        inner
+            .close_incarnation(
+                thread,
+                summary.incarnation,
+                None,
+                Some("closed before a resume".into()),
+                None,
+            )
+            .await
+            .map_err(store_failure)?;
+    }
     // The store doesn't give back the effort and preset a thread was
     // started with (CR-08): Home, M1's only preset in use, and no effort.
     let launch = Launch {
@@ -556,6 +572,9 @@ async fn set_setting(inner: &Arc<Inner>, key: String, new: Value) -> Result<Valu
             ));
         };
         if inner.options.manage_service {
+            // One change at a time, so the setting and the service can't
+            // end up saying different things.
+            let _changing = inner.service.lock().await;
             // The setting first, then the service, so a store that refuses
             // leaves the service as it was. If the service can't be
             // changed, the setting goes back to what it was.
@@ -605,6 +624,38 @@ async fn set_setting(inner: &Arc<Inner>, key: String, new: Value) -> Result<Valu
         .await
         .map_err(store_failure)?;
     Ok(Value::Null)
+}
+
+/// Makes the login service say what the stored setting says. At start: a
+/// daemon that died between storing the setting and changing the service
+/// left them apart.
+pub(crate) async fn reconcile_service(inner: &Arc<Inner>) {
+    if !inner.options.manage_service {
+        return;
+    }
+    let _changing = inner.service.lock().await;
+    let Ok(settings) = inner.store.settings().await else {
+        return;
+    };
+    let Some((_, Value::Bool(keep))) = settings
+        .into_iter()
+        .find(|(name, _)| name == KEEP_RUNNING_SETTING)
+    else {
+        // Never set: nothing was ever installed by this setting.
+        return;
+    };
+    let changed = tokio::task::spawn_blocking(move || {
+        if keep {
+            lifecycle::install_keep_running(&std::env::current_exe()?)
+        } else {
+            lifecycle::remove_keep_running()
+        }
+    })
+    .await
+    .unwrap_or_else(|error| Err(io::Error::other(error)));
+    if let Err(error) = changed {
+        eprintln!("atriumd: the login service doesn't match its setting: {error}");
+    }
 }
 
 /// A thread's events from its first one, a page at a time, for the export's
