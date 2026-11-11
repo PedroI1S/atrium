@@ -36,6 +36,18 @@ pub(crate) async fn recover(inner: &Arc<Inner>) -> Result<(), StartError> {
         let cleanup = tokio::task::spawn_blocking(move || supervise::kill_recorded(&process))
             .await
             .unwrap_or(Cleanup::Unverified);
+        // A record left for an incarnation that isn't the thread's current
+        // one has nothing to close: the process is dealt with, and the
+        // thread is looked at below like any other.
+        let current = inner
+            .store
+            .thread(&thread)
+            .await?
+            .is_some_and(|summary| summary.incarnation == incarnation);
+        if !current {
+            inner.store.set_process(&thread, incarnation, None).await?;
+            continue;
+        }
         if !inner.incarnation_ended(&thread, incarnation).await {
             // The signal first: the `SessionEnded` among the closing
             // events settles the thread's state, and an unverified cleanup
