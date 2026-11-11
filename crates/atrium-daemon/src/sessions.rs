@@ -167,18 +167,6 @@ struct Pumped {
     stale: bool,
 }
 
-fn is_closing(event: &AgentEvent) -> bool {
-    matches!(
-        event,
-        AgentEvent::MessageCompleted { .. }
-            | AgentEvent::ToolCallFinished { .. }
-            | AgentEvent::RequestResolved { .. }
-            | AgentEvent::TurnCompleted { .. }
-            | AgentEvent::Error { .. }
-            | AgentEvent::SessionEnded { .. }
-    )
-}
-
 /// Whether a batch can change what a thread's summary shows. Streaming text
 /// and tool output alone don't, so a long answer isn't a stream of updates.
 fn shows_in_summary(events: &[StoredEvent], unread: bool) -> bool {
@@ -477,11 +465,12 @@ impl Inner {
         let mut out = Pumped::default();
         let mut stop = live.stop.subscribe();
         let mut batch = Vec::new();
-        // The store refused a batch: from then on only closing events are
-        // kept, and the daemon closes whatever is still open at the end.
+        // The store refused a batch because storage is full. The batch is
+        // gone, closing events it held included, so the session's own
+        // closing events can no longer be trusted to close everything:
+        // nothing more of it is stored, the session is waited for, and the
+        // daemon closes the incarnation from what the store has open.
         let mut closing_only = false;
-        // The sequence number after the last event stored.
-        let mut next_seq = 0;
         let mut deadline: Option<Instant> = None;
         loop {
             let received = tokio::select! {
@@ -518,22 +507,14 @@ impl Inner {
                 batch.truncate(at + 1);
             }
             if closing_only {
-                batch.retain(|envelope| is_closing(&envelope.event));
-                // What was dropped must not leave a hole: the events kept
-                // continue the stored sequence.
-                for (envelope, seq) in batch.iter_mut().zip(next_seq..) {
-                    envelope.seq = seq;
-                }
+                batch.clear();
             }
             if !batch.is_empty() {
                 match self
                     .store_batch(thread, incarnation, std::mem::take(&mut batch), Some(live))
                     .await
                 {
-                    Ok(stored) => {
-                        if let Some(last) = stored.last() {
-                            next_seq = last.envelope.seq.saturating_add(1);
-                        }
+                    Ok(_) => {
                         if let Some((_, exit_code)) = ended {
                             out.ended = Some(exit_code);
                         }
@@ -695,10 +676,16 @@ async fn run(
     };
     live.set_sender(None);
     live.turn.store(false, Ordering::Relaxed);
-    if first_message_lost && pumped.ended.is_none() {
-        pumped
-            .error
-            .get_or_insert_with(|| "the session didn't take its first message".into());
+    if first_message_lost {
+        if pumped.ended.is_none() {
+            pumped
+                .error
+                .get_or_insert_with(|| "the session didn't take its first message".into());
+        } else {
+            // The session ended by itself first: its history is closed,
+            // and can't say so.
+            eprintln!("atriumd: {thread:?} ended before it took its first message");
+        }
     }
     if !pumped.stale {
         let mut unfinished = false;

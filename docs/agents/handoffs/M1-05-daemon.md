@@ -1,18 +1,22 @@
 # Handoff: M1-05-daemon
 
-Model: Claude Fable 5 (the orchestrator, inline; D-055, D-057) · Status: **partial** — written, tested, reviewed twice by Codex (rework both times) and fixed after each; **not merged**: the Gemini 3.8 Flash review D-056 asks for could not be run (see "Next step")
+Model: Claude Fable 5 (the orchestrator, inline; D-055, D-057) · Status: **done** — reviewed by Gemini 3.8 Flash (approve with changes, fixed) after two Codex rounds; merged into `dev`
 
-## Next step
-1. **The driver decides who reviews.** `agy` is not logged in inside the container this session ran in (it asks for a Google sign-in), so the Flash review of D-056 was not run. Either sign in and run it:
-   ```
-   git worktree add --detach ../atrium-wt/M1-05-review agent/fable/M1-05-daemon   # already exists on rodrigo's machine
-   scripts/agent-run agy gemini-3.8-flash-medium M1-05-review .orchestration/prompts/M1-05-review.md
-   ```
-   or accept the Codex reviews below in its place (they are cross-provider, as PLAN §8.2 asks). Either way the fixes of round 2 have not been reviewed by anyone. The prompt is on rodrigo's machine only; it asks for an exact failing sequence for every claim, area by area.
-2. Fix what the review finds, then merge `agent/fable/M1-05-daemon` into `dev`, update the status row, remove the two worktrees.
-3. Decide CR-08, CR-09 and CR-10 (`docs/agents/change-requests.md`), and the notification question under "Not done".
+## Open after the merge
+- **CR-09** (Pedro): a thread already stopped can't be shown as "cleanup unverified". Both reviewers' top finding; it needs the contract's sticky states changed.
+- **CR-10**: recovery can't see an archived thread whose session never ended.
+- **CR-08**: a resumed thread loses its effort level and preset.
+- Notifications by `notify-send` / `osascript` instead of `notify-rust` (see "Not done").
+- The changes made after the Flash review started were not seen by a reviewer: the two findings under "Fixed afterwards" and the two fixes under "Flash review".
 
-## Review (2026-11-11)
+## Flash review (2026-11-11)
+Gemini 3.8 Flash, read-only, run on the host: **approve with changes** (`docs/agents/reviews/M1-05-daemon.md`). It ran before the two "Fixed afterwards" changes below, and accepted both of those declines as they stood. Its findings:
+1. [major] Unverified cleanup masked by an earlier stop or full storage: **CR-09**, not fixed.
+2. [major] A batch refused for full storage took its closing events with it, and the session's later `SessionEnded` then closed the incarnation with a message still open. **Fixed:** after such a refusal nothing more of the session is stored; the session is waited for and the daemon closes the incarnation from what the store has open. This replaces the renumbering described under "Round 2". Covered by `full_storage_interrupts_running_turns_and_refuses_new_ones`.
+3. [minor] A first message lost because the session ended cleanly before taking it left no trace. **Fixed in part:** it is logged; the history is already closed and can't say so.
+4. [minor] Archived unfinished incarnations: **CR-10**, not fixed.
+
+## Codex reviews (2026-11-11)
 GPT-6.1 Sol through Codex, read-only, with the sources inlined in the prompt because Codex's own sandbox doesn't start inside the container: **rework**, 13 findings (`docs/agents/reviews/M1-05-daemon-codex.md`). It could not run the tests and did not see the test files. A second round on the fixes (`M1-05-daemon-codex-round2.md`) was **rework** again; see "Round 2" below.
 
 Fixed on the branch:
