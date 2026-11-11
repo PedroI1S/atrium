@@ -63,6 +63,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-daemon"
+version = "0.0.0"
+dependencies = [
+ "atrium-agents",
+ "atrium-client",
+ "atrium-core",
+ "atrium-host",
+ "atrium-protocol",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "atrium-host"
 version = "0.0.0"
 dependencies = [
