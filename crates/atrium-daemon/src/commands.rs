@@ -202,13 +202,20 @@ pub(crate) async fn run(
                 request_id: request_id.clone(),
             };
             // The ledger first: only what it accepts reaches the session.
+            // Both under the session's request lock, so neither happens
+            // after an event that ends the request was stored.
+            let live = inner.session_of(&thread_id, Some(incarnation));
+            let _resolving = match &live {
+                Ok(live) => Some(live.requests.lock().await),
+                Err(_) => None,
+            };
             let rule_id = inner
                 .ledger
                 .resolve(&key, &decision, remember)
                 .await
                 .map_err(ledger_failure)?;
-            inner
-                .session_of(&thread_id, Some(incarnation))?
+            live.as_ref()
+                .map_err(Clone::clone)?
                 .send(SessionCommand::ResolveApproval {
                     request_id,
                     decision,
@@ -227,9 +234,14 @@ pub(crate) async fn run(
                 incarnation,
                 request_id: request_id.clone(),
             };
+            let live = inner.session_of(&thread_id, Some(incarnation));
+            let _resolving = match &live {
+                Ok(live) => Some(live.requests.lock().await),
+                Err(_) => None,
+            };
             inner.ledger.answer(&key).await.map_err(ledger_failure)?;
-            inner
-                .session_of(&thread_id, Some(incarnation))?
+            live.as_ref()
+                .map_err(Clone::clone)?
                 .send(SessionCommand::AnswerQuestion {
                     request_id,
                     answers,
@@ -302,8 +314,8 @@ pub(crate) async fn run(
                     ));
                 }
             }
-            // The answer is written before the connection closes.
-            inner.request_stop(true);
+            // Accepted. The connection's reader stops the daemon once this
+            // answer is queued (`server::handle`).
             Ok(Value::Null)
         }
     }
@@ -544,6 +556,22 @@ async fn set_setting(inner: &Arc<Inner>, key: String, new: Value) -> Result<Valu
             ));
         };
         if inner.options.manage_service {
+            // The setting first, then the service, so a store that refuses
+            // leaves the service as it was. If the service can't be
+            // changed, the setting goes back to what it was.
+            let before = inner
+                .store
+                .settings()
+                .await
+                .map_err(store_failure)?
+                .into_iter()
+                .find(|(name, _)| name == KEEP_RUNNING_SETTING)
+                .map_or(Value::Bool(false), |(_, value)| value);
+            inner
+                .store
+                .set_setting(&key, Value::Bool(keep))
+                .await
+                .map_err(store_failure)?;
             // Only Atrium's own service file is written or removed; the
             // change takes effect at the next login.
             let changed = tokio::task::spawn_blocking(move || {
@@ -555,12 +583,20 @@ async fn set_setting(inner: &Arc<Inner>, key: String, new: Value) -> Result<Valu
             })
             .await
             .unwrap_or_else(|error| Err(io::Error::other(error)));
-            changed.map_err(|error| {
-                failure(
+            if let Err(error) = changed {
+                let restored = inner.store.set_setting(&key, before).await;
+                return Err(failure(
                     ErrorCode::Internal,
-                    format!("the login service couldn't be changed: {error}"),
-                )
-            })?;
+                    match restored {
+                        Ok(()) => format!("the login service couldn't be changed: {error}"),
+                        Err(store) => format!(
+                            "the login service couldn't be changed ({error}), and the setting \
+                             couldn't be put back ({store})"
+                        ),
+                    },
+                ));
+            }
+            return Ok(Value::Null);
         }
     }
     inner

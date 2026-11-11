@@ -2,14 +2,14 @@
 //! the storage watch and daily snapshots (contract §7), and posting
 //! notifications (contract §8).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use atrium_core::{ApprovalLedger, Signal, StorageStatus};
 use atrium_host::lifecycle::secure_dir;
 use atrium_host::supervise;
-use atrium_protocol::thread::{Cleanup, ThreadState};
+use atrium_protocol::thread::{Cleanup, ThreadId, ThreadState};
 
 use crate::hub::{Notification, NotifyReason};
 use crate::{Inner, Notifier, Phase, StartError, now_ms};
@@ -23,86 +23,80 @@ const RESTARTED: &str = "the daemon restarted";
 /// What a previous daemon left behind, before any client is accepted or
 /// any session starts:
 /// 1. every recorded process is checked and its group killed
-///    (`supervise::kill_recorded`), its incarnation's closing events are
-///    stored from the store's projections, and its thread becomes
-///    `Interrupted` with the cleanup's result;
-/// 2. a thread left in a live state without a recorded process (a synthetic
-///    session, or a daemon that died while starting one) is closed the same
-///    way;
+///    (`supervise::kill_recorded`);
+/// 2. every listed thread whose current incarnation has no `SessionEnded`
+///    is closed from the store's projections, whatever its state says (a
+///    user's stop or full storage settles the state before the closing
+///    events are stored). It becomes `Interrupted` with the cleanup's
+///    result, unless its state was settled already;
 /// 3. the ledger expires everything.
+///
+/// A closure that can't be stored fails the start: nothing is cleared, and
+/// the next start tries again.
+///
+/// Not covered: an archived thread whose session never ended. The store
+/// lists no archived threads (see the change requests); its requests are
+/// expired with the rest, its open items stay open.
 pub(crate) async fn recover(inner: &Arc<Inner>) -> Result<(), StartError> {
-    let mut recovered = HashSet::new();
+    // What became of each thread's current incarnation's process.
+    let mut cleanups = HashMap::new();
+    let mut records = Vec::new();
     for (thread, incarnation, process) in inner.store.live_processes().await? {
         let cleanup = tokio::task::spawn_blocking(move || supervise::kill_recorded(&process))
             .await
             .unwrap_or(Cleanup::Unverified);
-        // A record left for an incarnation that isn't the thread's current
-        // one has nothing to close: the process is dealt with, and the
-        // thread is looked at below like any other.
         let current = inner
             .store
             .thread(&thread)
             .await?
             .is_some_and(|summary| summary.incarnation == incarnation);
-        if !current {
-            inner.store.set_process(&thread, incarnation, None).await?;
-            continue;
+        if current {
+            cleanups.insert(thread.clone(), cleanup);
+            // An archived thread isn't in the list below.
+            close(inner, &thread, incarnation, cleanup).await?;
         }
-        if !inner.incarnation_ended(&thread, incarnation).await {
-            // The signal first: the `SessionEnded` among the closing
-            // events settles the thread's state, and an unverified cleanup
-            // must not be lost under it.
-            inner
-                .store
-                .signal(&thread, Signal::Recovered { cleanup })
-                .await?;
-            inner
-                .close_incarnation(&thread, incarnation, 0, None, Some(RESTARTED.into()))
-                .await;
-        }
-        inner.store.set_process(&thread, incarnation, None).await?;
-        recovered.insert(thread);
+        records.push((thread, incarnation));
     }
     for summary in inner.store.threads().await? {
-        if summary.incarnation == 0 || recovered.contains(&summary.thread_id) {
+        if summary.incarnation == 0 || cleanups.contains_key(&summary.thread_id) {
             continue;
         }
         let cleanup = match summary.state {
             // A process may have been started and not yet recorded: nothing
             // was killed, and nothing says it stopped.
             ThreadState::Starting => Cleanup::Unverified,
-            ThreadState::Running
-            | ThreadState::NeedsApproval
-            | ThreadState::NeedsInput
-            | ThreadState::Idle
-            // Kept through a session's end: only one whose session never
-            // ended is interrupted (the check below).
-            | ThreadState::Paused { .. } => Cleanup::Verified,
-            ThreadState::Failed { .. } | ThreadState::Interrupted { .. } | ThreadState::Ended => {
-                continue;
-            }
+            _ => Cleanup::Verified,
         };
-        if inner
-            .incarnation_ended(&summary.thread_id, summary.incarnation)
-            .await
-        {
-            continue;
-        }
-        inner
-            .store
-            .signal(&summary.thread_id, Signal::Recovered { cleanup })
-            .await?;
-        inner
-            .close_incarnation(
-                &summary.thread_id,
-                summary.incarnation,
-                0,
-                None,
-                Some(RESTARTED.into()),
-            )
-            .await;
+        close(inner, &summary.thread_id, summary.incarnation, cleanup).await?;
+    }
+    // Only now: a start that failed above finds the records again.
+    for (thread, incarnation) in records {
+        inner.store.set_process(&thread, incarnation, None).await?;
     }
     inner.ledger.expire_all().await;
+    Ok(())
+}
+
+/// Closes one incarnation a previous daemon left unfinished.
+async fn close(
+    inner: &Arc<Inner>,
+    thread: &ThreadId,
+    incarnation: u32,
+    cleanup: Cleanup,
+) -> Result<(), StartError> {
+    if inner.incarnation_ended(thread, incarnation).await {
+        return Ok(());
+    }
+    // The signal first: the `SessionEnded` among the closing events settles
+    // the thread's state, and an unverified cleanup must not be lost under
+    // it.
+    inner
+        .store
+        .signal(thread, Signal::Recovered { cleanup })
+        .await?;
+    inner
+        .close_incarnation(thread, incarnation, None, Some(RESTARTED.into()), None)
+        .await?;
     Ok(())
 }
 

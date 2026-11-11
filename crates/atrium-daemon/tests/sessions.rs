@@ -1195,6 +1195,54 @@ async fn the_synthetic_agent_runs_turns_and_stops() {
             .await,
         ErrorCode::Invalid
     );
+
+    // A user message too long to store inline is kept whole, as deltas.
+    let text = "é".repeat(40_000);
+    let wordy = wire
+        .start_thread(
+            AgentLaunch::Fake {
+                tokens_per_second: 0,
+                chunk_chars: 1,
+                duration_ms: 0,
+                tool_call_every_ms: 0,
+            },
+            Some(&text),
+        )
+        .await
+        .thread_id;
+    wire.thread_when(&wordy, |summary| summary.state == ThreadState::Idle)
+        .await;
+    let history = wire.history(&wordy).await;
+    let parts: Vec<&str> = history
+        .iter()
+        .filter_map(|event| match &event.envelope.event {
+            AgentEvent::MessageDelta {
+                kind: MessageKind::User,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parts.len(), 2);
+    assert!(
+        parts
+            .iter()
+            .all(|part| part.len() <= atrium_protocol::limits::MAX_INLINE_MESSAGE_BYTES)
+    );
+    assert_eq!(parts.concat(), text);
+    assert!(history.iter().any(|event| {
+        event.envelope.event
+            == AgentEvent::MessageCompleted {
+                message_id: "u1".into(),
+                kind: MessageKind::User,
+                body: MessageBody::Streamed {
+                    chars: 40_000,
+                    deltas: 2,
+                    sha256: sha256_hex(&text),
+                },
+            }
+    }));
     rig.stop(true).await;
 }
 
@@ -1268,6 +1316,11 @@ async fn an_event_the_store_refuses_fails_the_session() {
             ..
         }
     ));
+    // The closing events continue the stored sequence: the refused event's
+    // number is not skipped.
+    for (at, event) in history.iter().enumerate() {
+        assert_eq!(event.envelope.seq, at as u64);
+    }
     // The session was let go of: its command channel is closed.
     assert_eq!(soon(script.commands.recv()).await, None);
     assert_eq!(
@@ -1372,4 +1425,58 @@ async fn a_dead_provider_nobody_reaped_is_not_called_stopped() {
     assert!(inbox(&mut wire).await.iter().any(|item| {
         item.reason == InboxReason::CleanupUnverified && item.thread_id.as_ref() == Some(&thread)
     }));
+}
+
+#[tokio::test]
+async fn a_session_that_takes_no_commands_can_still_be_stopped() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    // Its command queue is full from the start, so the thread's first
+    // message can't be handed over.
+    *rig.adapter.start.lock().expect("lock") = Start::Clogged;
+    let thread = wire.start_thread(native(), Some("go")).await.thread_id;
+    let mut script = rig.script().await;
+    script.started("native-1").await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Idle)
+        .await;
+    // The stop gets through all the same, and the incarnation is closed
+    // once the provider is gone.
+    wire.ok(shutdown(&thread)).await;
+    script.die();
+    wire.thread_when(&thread, |summary| {
+        summary.state == ThreadState::Ended
+            && summary.last_event > Some(atrium_protocol::wire::EventId(0))
+    })
+    .await;
+    soon(async {
+        while kinds(&wire.history(&thread).await).last() != Some(&"session_ended") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        kinds(&wire.history(&thread).await),
+        ["session_started", "session_ended"]
+    );
+    // And the daemon itself stops, with nothing held.
+    rig.stop(true).await;
+    assert!(!rig.paths.socket.exists());
+}
+
+#[tokio::test]
+async fn a_new_inbox_subscriber_gets_current_summaries() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    let (thread, mut script) = running(&mut rig, &mut wire).await;
+    // Text alone refreshes nobody's list after the first delta.
+    for n in 0..5 {
+        let before = wire.thread(&thread).await.last_event;
+        script.delta("m", &format!("{n} ")).await;
+        wire.thread_when(&thread, |summary| summary.last_event > before)
+            .await;
+    }
+    let current = wire.thread(&thread).await;
+    let mut late = rig.dev().await;
+    let all = late.subscribe_inbox().await;
+    assert_eq!(all["threads"][0]["last_event"], json!(current.last_event));
 }

@@ -13,7 +13,7 @@ use atrium_protocol::PROTOCOL_VERSION;
 use atrium_protocol::limits::{HELLO_TIMEOUT, MAX_CONNECTIONS, REPLAY_PAGE_EVENTS};
 use atrium_protocol::thread::ThreadId;
 use atrium_protocol::wire::{
-    Authority, ClientMessage, ClientRole, ErrorCode, EventId, ServerMessage,
+    Authority, ClientMessage, ClientRole, DaemonCommand, ErrorCode, EventId, ServerMessage,
 };
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
@@ -264,6 +264,13 @@ async fn handle(inner: &Arc<Inner>, conn: &Arc<Conn>, message: ClientMessage) ->
             if !authorized(Authority::HumanControl) {
                 conn.err(request_id, ErrorCode::Forbidden, "not allowed");
             } else {
+                // The list is refreshed only when something a summary
+                // shows changed, so a thread that is streaming is behind
+                // in it: the answer is the current set.
+                let streaming: Vec<ThreadId> = inner.sessions().keys().cloned().collect();
+                for thread in &streaming {
+                    inner.refresh_thread(thread).await;
+                }
                 inner.hub().subscribe_inbox(conn, request_id);
             }
         }
@@ -273,16 +280,28 @@ async fn handle(inner: &Arc<Inner>, conn: &Arc<Conn>, message: ClientMessage) ->
         } => {
             if !authorized(command.authority()) {
                 conn.err(request_id, ErrorCode::Forbidden, "not allowed");
-            } else if commands::is_slow(&command) {
-                // Doesn't hold up the connection's other messages.
+            } else if commands::is_slow(&command)
+                && let Ok(slot) = conn.slow.clone().try_acquire_owned()
+            {
+                // Doesn't hold up the connection's other messages. A
+                // connection has a few such slots; past them, the command
+                // runs below like any other.
                 let (inner, conn) = (inner.clone(), conn.clone());
                 tokio::spawn(async move {
                     let result = commands::run(&inner, &conn, command).await;
                     answer(&conn, request_id, result);
+                    drop(slot);
                 });
             } else {
+                let stops = matches!(command, DaemonCommand::ShutdownDaemon { .. });
                 let result = commands::run(inner, conn, command).await;
+                let accepted = result.is_ok();
                 answer(conn, request_id, result);
+                // Only once its answer is queued: stopping closes every
+                // connection as soon as its control lane is written.
+                if stops && accepted {
+                    inner.request_stop(true);
+                }
             }
         }
     }

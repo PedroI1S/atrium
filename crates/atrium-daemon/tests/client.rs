@@ -131,6 +131,14 @@ async fn the_client_and_the_daemon_work_together() {
     for n in 0..300 {
         script.delta("m", &format!("word{n} ")).await;
     }
+    // Every delta is stored before the thread is viewed.
+    let mut raw = rig.dev().await;
+    soon(async {
+        while raw.history(&thread).await.len() < 302 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     let stored = thread_when(&client, &thread, |summary| {
         summary.state == ThreadState::Running && summary.unread
     })

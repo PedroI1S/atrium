@@ -46,6 +46,9 @@ const MAX_CONTROL_BYTES: usize = 8 * 1024 * 1024;
 /// client reconnects and continues from its cursor.
 const WRITE_STALL: Duration = Duration::from_secs(30);
 
+/// Slow commands one connection may have running beside its reader.
+const MAX_SLOW_COMMANDS: usize = 4;
+
 /// Which queued control frame a newer one replaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Coalesce {
@@ -55,6 +58,10 @@ pub(crate) enum Coalesce {
     Inbox,
     /// One thread's summary (or its removal).
     Thread(ThreadId),
+    /// `SubscriptionLagged` for a thread: it belongs to the subscription
+    /// that lagged, and goes with it when that thread is subscribed to
+    /// again or unsubscribed from before it was written.
+    Lagged(ThreadId),
 }
 
 struct ControlFrame {
@@ -114,6 +121,17 @@ impl Outbox {
         Some(ended)
     }
 
+    /// Removes a queued `SubscriptionLagged` of an earlier subscription to
+    /// `thread`.
+    fn drop_lagged(&mut self, thread: &ThreadId) {
+        let key = Coalesce::Lagged(thread.clone());
+        if let Some(at) = self.control.iter().position(|queued| queued.key == key)
+            && let Some(old) = self.control.remove(at)
+        {
+            self.control_bytes -= old.frame.len();
+        }
+    }
+
     fn push_control(&mut self, frame: Frame, key: Coalesce) {
         if key != Coalesce::Keep
             && let Some(at) = self.control.iter().position(|queued| queued.key == key)
@@ -148,6 +166,10 @@ pub(crate) struct Conn {
     /// Wakes feeders waiting for room, and tells them of ended subscriptions.
     room: Notify,
     max_event_bytes: usize,
+    /// Commands of this connection that run beside its reader (see
+    /// `commands::is_slow`). With none left, the next one runs in the
+    /// reader, which then reads no further until it is done.
+    pub(crate) slow: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 static SUBS: AtomicU64 = AtomicU64::new(1);
@@ -161,6 +183,7 @@ impl Conn {
             wake: Notify::new(),
             room: Notify::new(),
             max_event_bytes,
+            slow: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SLOW_COMMANDS)),
         }
     }
 
@@ -284,6 +307,7 @@ impl Conn {
         } else if outbox.subs.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
             return None;
         }
+        outbox.drop_lagged(thread);
         let sub = SUBS.fetch_add(1, Ordering::Relaxed);
         outbox.subs.insert(
             sub,
@@ -305,6 +329,7 @@ impl Conn {
         if let Some(sub) = outbox.by_thread.get(thread).copied() {
             outbox.end_sub(sub);
         }
+        outbox.drop_lagged(thread);
         drop(outbox);
         self.room.notify_waiters();
     }
@@ -366,11 +391,12 @@ impl Conn {
         let Some(ended) = outbox.end_sub(sub) else {
             return Pushed::Gone;
         };
+        let lagged = Coalesce::Lagged(ended.thread.clone());
         if let Some(frame) = codec::encode(&ServerMessage::SubscriptionLagged {
             thread_id: ended.thread,
             last_sent: ended.written,
         }) {
-            outbox.push_control(frame, Coalesce::Keep);
+            outbox.push_control(frame, lagged);
         }
         let closed = outbox.closed;
         drop(outbox);
@@ -573,6 +599,38 @@ mod tests {
         }
         assert!(conn.is_closed());
         assert!(conn.subscribe(&t("a")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_queued_lag_notice_goes_with_its_subscription() {
+        for resubscribe in [false, true] {
+            let conn = Conn::with_limit(1, ClientRole::Dev, 100);
+            let sub = conn.subscribe(&t("a")).expect("a subscription");
+            let other = conn.subscribe(&t("b")).expect("a subscription");
+            assert!(conn.go_live(sub) && conn.go_live(other));
+            assert_eq!(conn.push_live(sub, EventId(1), &frame(80)), Pushed::Queued);
+            assert_eq!(
+                conn.push_live(other, EventId(3), &frame(80)),
+                Pushed::Lagged
+            );
+            assert_eq!(conn.push_live(sub, EventId(2), &frame(80)), Pushed::Lagged);
+            // Both notices are queued. The thread is unsubscribed from (or
+            // subscribed to again) before the writer gets to them.
+            if resubscribe {
+                conn.subscribe(&t("a")).expect("a subscription");
+            } else {
+                conn.unsubscribe(&t("a"));
+            }
+            // Only the other thread's notice is left.
+            assert_eq!(
+                message(&conn.take_for_test().expect("a notice")),
+                ServerMessage::SubscriptionLagged {
+                    thread_id: t("b"),
+                    last_sent: None
+                }
+            );
+            assert!(conn.take_for_test().is_none());
+        }
     }
 
     #[tokio::test]

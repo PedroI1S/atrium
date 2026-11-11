@@ -89,6 +89,9 @@ pub enum Start {
     Hang,
     /// Spawns a real process (`sleep`) first, reported through `on_spawn`.
     Process,
+    /// Hands over a session whose command queue is already full, and that
+    /// never takes a command.
+    Clogged,
 }
 
 pub struct Scripted {
@@ -142,7 +145,7 @@ impl AgentAdapter for Scripted {
         Box::pin(async move {
             let mut process = None;
             match start {
-                Start::Script => {}
+                Start::Script | Start::Clogged => {}
                 Start::Fail => return Err(AdapterError::Handshake("no such model".into())),
                 Start::Hang => std::future::pending::<()>().await,
                 Start::Process => {
@@ -157,6 +160,9 @@ impl AgentAdapter for Scripted {
             }
             let (events, receiver) = mpsc::channel(atrium_agents::EVENT_BUFFER);
             let (commands, inbox) = mpsc::channel(atrium_agents::COMMAND_BUFFER);
+            if start == Start::Clogged {
+                while commands.try_send(SessionCommand::Interrupt).is_ok() {}
+            }
             let identity = process.as_ref().map(|child| child.identity.clone());
             let _ = self.scripts.send(Script {
                 config,

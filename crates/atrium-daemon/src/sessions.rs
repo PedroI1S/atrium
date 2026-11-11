@@ -49,6 +49,12 @@ pub(crate) struct Live {
     commands: Mutex<Option<mpsc::Sender<SessionCommand>>>,
     turn: AtomicBool,
     stop: watch::Sender<bool>,
+    /// Held while events that end requests (a resolution, a turn's or the
+    /// session's end) are stored and the ledger follows them, and while a
+    /// resolution is checked by the ledger and passed to the session. So a
+    /// resolution is either before such an event in the history, or
+    /// refused: never accepted after it.
+    pub(crate) requests: tokio::sync::Mutex<()>,
 }
 
 impl Live {
@@ -58,6 +64,7 @@ impl Live {
             commands: Mutex::new(None),
             turn: AtomicBool::new(false),
             stop: watch::channel(false).0,
+            requests: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -152,8 +159,6 @@ pub(crate) struct Launch {
 struct Pumped {
     /// `SessionEnded` was stored, with this exit code.
     ended: Option<Option<i32>>,
-    /// The sequence number after the last one the adapter used.
-    next_seq: u64,
     /// A fatal error to record when the daemon closes the incarnation.
     error: Option<String>,
     /// Why it ended, for `SessionEnded.reason`.
@@ -290,13 +295,28 @@ impl Inner {
     }
 
     /// Stores one batch and publishes it, under the publish lock, then lets
-    /// the ledger and the thread list follow what was stored.
+    /// the ledger and the thread list follow what was stored. `live` is the
+    /// thread's session, when it has one.
     pub(crate) async fn store_batch(
         &self,
         thread: &ThreadId,
         incarnation: u32,
         batch: Vec<AgentEventEnvelope>,
+        live: Option<&Live>,
     ) -> StoreResult<Vec<StoredEvent>> {
+        // See `Live::requests`.
+        let ends_requests = batch.iter().any(|envelope| {
+            matches!(
+                envelope.event,
+                AgentEvent::RequestResolved { .. }
+                    | AgentEvent::TurnCompleted { .. }
+                    | AgentEvent::SessionEnded { .. }
+            )
+        });
+        let _resolving = match live {
+            Some(live) if ends_requests => Some(live.requests.lock().await),
+            _ => None,
+        };
         let stored = {
             let _publishing = self.publish.lock().await;
             let stored = self.store.append(thread, incarnation, batch).await?;
@@ -358,31 +378,26 @@ impl Inner {
     /// in the contract's order: an error (if any), open messages, open tool
     /// calls, pending requests, the open turn, `SessionEnded`. Does nothing
     /// (and returns `false`) if the incarnation's `SessionEnded` is already
-    /// stored.
+    /// stored. The events continue the stored sequence, whatever the
+    /// adapter had sent that wasn't stored.
     pub(crate) async fn close_incarnation(
         &self,
         thread: &ThreadId,
         incarnation: u32,
-        next_seq: u64,
         error: Option<String>,
         reason: Option<String>,
-    ) -> bool {
-        let mut seq = next_seq;
+        live: Option<&Live>,
+    ) -> StoreResult<bool> {
+        let mut seq = 0;
         if let Some(last) = self.last_stored(thread).await
             && last.envelope.incarnation == incarnation
         {
             if matches!(last.envelope.event, AgentEvent::SessionEnded { .. }) {
-                return false;
+                return Ok(false);
             }
-            seq = seq.max(last.envelope.seq.saturating_add(1));
+            seq = last.envelope.seq.saturating_add(1);
         }
-        let open = match self.store.open_items(thread, incarnation).await {
-            Ok(open) => open,
-            Err(error) => {
-                eprintln!("atriumd: can't read what {thread:?} left open: {error}");
-                return false;
-            }
-        };
+        let open = self.store.open_items(thread, incarnation).await?;
         let failed = error.is_some();
         let mut events = Vec::new();
         if let Some(message) = error {
@@ -445,13 +460,8 @@ impl Inner {
             })
             .collect();
         // Closing events are accepted while the store is read-only.
-        match self.store_batch(thread, incarnation, batch).await {
-            Ok(_) => true,
-            Err(error) => {
-                eprintln!("atriumd: can't store the closing events of {thread:?}: {error}");
-                false
-            }
-        }
+        self.store_batch(thread, incarnation, batch, live).await?;
+        Ok(true)
     }
 
     /// Reads a session's events into the store until its stream ends.
@@ -488,7 +498,6 @@ impl Inner {
             }
             let mut ended = None;
             for (at, envelope) in batch.iter().enumerate() {
-                out.next_seq = out.next_seq.max(envelope.seq.saturating_add(1));
                 match &envelope.event {
                     AgentEvent::TurnStarted { .. } => live.turn.store(true, Ordering::Relaxed),
                     AgentEvent::TurnCompleted { .. } => live.turn.store(false, Ordering::Relaxed),
@@ -509,7 +518,7 @@ impl Inner {
             }
             if !batch.is_empty() {
                 match self
-                    .store_batch(thread, incarnation, std::mem::take(&mut batch))
+                    .store_batch(thread, incarnation, std::mem::take(&mut batch), Some(live))
                     .await
                 {
                     Ok(_) => {
@@ -585,7 +594,8 @@ async fn run(
             }
         }
     };
-    let pumped = match started {
+    let mut first_message_lost = false;
+    let mut pumped = match started {
         Started::Session(session) => {
             let Session {
                 descriptor,
@@ -605,16 +615,34 @@ async fn run(
                     .await;
             }
             live.set_sender(Some(commands.clone()));
+            let mut first = None;
             if *stop.borrow() {
                 // Asked to stop while it was starting.
                 let _ = commands.try_send(SessionCommand::Shutdown);
             } else if let Some(text) = launch.message.take() {
-                let _ = commands
-                    .send(SessionCommand::SendUserMessage { text })
-                    .await;
+                // Handed over beside the pump, and bounded: a session that
+                // takes no commands holds up neither its own events nor a
+                // stop. If it isn't taken in time, the session is stopped.
+                let (commands, live) = (commands.clone(), live.clone());
+                first = Some(tokio::spawn(async move {
+                    let message = SessionCommand::SendUserMessage { text };
+                    let sent = tokio::time::timeout(COMMAND_PATIENCE, commands.send(message)).await;
+                    let taken = matches!(sent, Ok(Ok(())));
+                    if !taken {
+                        live.stop();
+                    }
+                    taken
+                }));
             }
             drop(commands);
-            inner.pump(&thread, incarnation, &live, events).await
+            let pumped = inner.pump(&thread, incarnation, &live, events).await;
+            if let Some(first) = first {
+                // Still waiting when the session is over: given up, and
+                // its hold on the command channel with it.
+                first.abort();
+                first_message_lost = matches!(first.await, Ok(false));
+            }
+            pumped
         }
         Started::Stopped => Pumped {
             reason: Some("stopped before the session started".into()),
@@ -627,6 +655,11 @@ async fn run(
     };
     live.set_sender(None);
     live.turn.store(false, Ordering::Relaxed);
+    if first_message_lost && pumped.ended.is_none() {
+        pumped
+            .error
+            .get_or_insert_with(|| "the session didn't take its first message".into());
+    }
     if !pumped.stale {
         let ending = match pumped.ended {
             Some(code) => Signal::Exited { code },
@@ -652,15 +685,20 @@ async fn run(
                         .signal(&thread, Signal::Recovered { cleanup })
                         .await;
                 }
-                inner
+                let closed = inner
                     .close_incarnation(
                         &thread,
                         incarnation,
-                        pumped.next_seq,
                         pumped.error,
                         pumped.reason,
+                        Some(&live),
                     )
                     .await;
+                if let Err(error) = closed {
+                    // The next start finds the incarnation unfinished and
+                    // closes it then.
+                    eprintln!("atriumd: can't store the closing events of {thread:?}: {error}");
+                }
                 Signal::Exited { code: None }
             }
         };

@@ -172,17 +172,50 @@ impl Agent {
         .await
     }
 
+    /// The turn's user message, whole: inline when it is short, otherwise
+    /// as deltas of at most `MAX_INLINE_MESSAGE_BYTES` and a completion
+    /// that describes them (contract §6.1).
+    async fn user_message(&mut self, turn: u32, text: &str) -> Result<(), Gone> {
+        let message_id = format!("u{turn}");
+        if text.len() <= MAX_INLINE_MESSAGE_BYTES {
+            return self
+                .emit(AgentEvent::MessageCompleted {
+                    message_id,
+                    kind: MessageKind::User,
+                    body: MessageBody::Inline {
+                        text: text.to_owned(),
+                    },
+                })
+                .await;
+        }
+        let (mut rest, mut deltas) = (text, 0);
+        while !rest.is_empty() {
+            let part = cut(rest, MAX_INLINE_MESSAGE_BYTES);
+            rest = &rest[part.len()..];
+            deltas += 1;
+            self.emit(AgentEvent::MessageDelta {
+                message_id: message_id.clone(),
+                kind: MessageKind::User,
+                text: part.to_owned(),
+            })
+            .await?;
+        }
+        self.emit(AgentEvent::MessageCompleted {
+            message_id,
+            kind: MessageKind::User,
+            body: MessageBody::Streamed {
+                chars: text.chars().count() as u64,
+                deltas,
+                sha256: hex(&Sha256::digest(text.as_bytes())),
+            },
+        })
+        .await
+    }
+
     async fn turn(&mut self, turn: u32, text: &str) -> Result<(), Gone> {
         self.interrupted = false;
         self.emit(AgentEvent::TurnStarted { turn }).await?;
-        self.emit(AgentEvent::MessageCompleted {
-            message_id: format!("u{turn}"),
-            kind: MessageKind::User,
-            body: MessageBody::Inline {
-                text: cut(text, MAX_INLINE_MESSAGE_BYTES).to_owned(),
-            },
-        })
-        .await?;
+        self.user_message(turn, text).await?;
 
         let Params {
             tokens_per_second,

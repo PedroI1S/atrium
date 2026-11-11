@@ -42,8 +42,8 @@ fn crash_child() {
                 std::fs::write(root.join(PID_FILE), process.identity.pid.to_string())
                     .expect("the pid file");
             }
-            // The third never finishes starting.
-            *adapter.start.lock().expect("lock") = if sessions.is_empty() {
+            // The fourth never finishes starting.
+            *adapter.start.lock().expect("lock") = if sessions.len() < 2 {
                 Start::Script
             } else {
                 Start::Hang
@@ -110,8 +110,20 @@ async fn a_killed_daemon_is_recovered_at_the_next_start() {
     let plain = wire.start_thread(native(), Some("two")).await.thread_id;
     wire.thread_when(&plain, |summary| summary.pending_approvals == 1)
         .await;
-    // A third thread, whose provider never finishes starting.
-    let starting = wire.start_thread(native(), Some("three")).await.thread_id;
+    // A third thread, which the user stops: it is `Ended` at once, and the
+    // daemon is killed before its session has closed anything.
+    let stopped = wire.start_thread(native(), Some("three")).await.thread_id;
+    wire.thread_when(&stopped, |summary| summary.pending_approvals == 1)
+        .await;
+    wire.ok(DaemonCommand::ThreadCommand {
+        thread_id: stopped.clone(),
+        command: SessionCommand::Shutdown,
+    })
+    .await;
+    assert_eq!(wire.thread(&stopped).await.state, ThreadState::Ended);
+    let stopped_request = request_of(&mut wire, &stopped).await;
+    // A fourth, whose provider never finishes starting.
+    let starting = wire.start_thread(native(), Some("four")).await.thread_id;
     assert_eq!(wire.thread(&starting).await.state, ThreadState::Starting);
     let requests = [
         request_of(&mut wire, &with_process).await,
@@ -159,7 +171,24 @@ async fn a_killed_daemon_is_recovered_at_the_next_start() {
         );
     }
 
-    // Nothing says whether the third thread's provider had been started:
+    // The thread the user had stopped keeps its state, and is closed like
+    // the others.
+    assert_eq!(wire.thread(&stopped).await.state, ThreadState::Ended);
+    assert_eq!(wire.thread(&stopped).await.pending_approvals, 0);
+    assert_eq!(kinds(&wire.history(&stopped).await), RECOVERED);
+    assert_eq!(
+        wire.refused(DaemonCommand::ResolveApproval {
+            thread_id: stopped.clone(),
+            incarnation: 1,
+            request_id: stopped_request,
+            decision: ApprovalDecision::Allow,
+            remember: None,
+        })
+        .await,
+        ErrorCode::Expired
+    );
+
+    // Nothing says whether the fourth thread's provider had been started:
     // it is interrupted, and not called stopped.
     assert_eq!(
         wire.thread(&starting).await.state,
@@ -174,13 +203,10 @@ async fn a_killed_daemon_is_recovered_at_the_next_start() {
     rig.stop(true).await;
     rig.boot(|_| {}).await;
     let mut wire = rig.dev().await;
-    for thread in [&with_process, &plain] {
+    for thread in [&with_process, &plain, &stopped] {
         assert_eq!(kinds(&wire.history(thread).await), RECOVERED);
-        assert!(matches!(
-            wire.thread(thread).await.state,
-            ThreadState::Interrupted { .. }
-        ));
     }
+    assert_eq!(kinds(&wire.history(&starting).await), ["session_ended"]);
 
     // And the thread can be resumed from its native session.
     let resumed = wire
