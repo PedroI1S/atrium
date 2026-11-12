@@ -45,6 +45,14 @@ export const [paletteOpen, setPaletteOpen] = createSignal(false);
 export const [keepOnTop, setKeepOnTopSignal] = createSignal(false);
 export const [toast, setToast] = createSignal<{ id: number; text: string } | null>(null);
 
+/** Whether this window has the keyboard focus (reading a reply and the daemon's notification suppression need it, contract §8). */
+const hasFocus = () => typeof document === "undefined" || document.hasFocus();
+export const [windowFocused, setWindowFocused] = createSignal(hasFocus());
+if (typeof window !== "undefined") {
+  window.addEventListener("focus", () => setWindowFocused(true));
+  window.addEventListener("blur", () => setWindowFocused(false));
+}
+
 /** A clock for the ages on rows; one timer for the whole window. */
 const AGE_TICK_MS = 30_000;
 export const [now, setNow] = createSignal(Date.now());
