@@ -370,3 +370,10 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **D-060's model routing** and **D-062's way of working** (parallel workers routed to Claude, Flash and Opus reviews in place of Argon and Codex) apply **on Pedro's shifts only**.
 - **On rodrigo's shifts the original workflow holds**: contract §15's routing and reviewers (Argon, Codex/Sol, Astra where they're named), PLAN §8, and rodrigo's own decisions (D-057, D-059). This stays true unless rodrigo decides otherwise and records it here.
 - What D-062 decided about tasks still holds for everyone: the go for M1-09b, M1-07 and M1-13, and remembered rules staying global. On a rodrigo shift, the remaining work and reviews of those tasks follow his routing.
+
+## D-065 — 2026-11-12 — rodrigo's shift: parallel workers again, Fable 5.2 takes Opus 5.5's role
+**Decided by rodrigo (driver).** The Fable inline trial is over on rodrigo's shifts as well.
+- **D-057 ends.** The orchestrator dispatches workers again (PLAN §8 fan-out, up to six agents at once per contract §15). It still writes small fixes and integration itself. D-059's go and task order stand; only who writes the code changes.
+- **Claude Fable 5 (`claude-fable-5-2`) takes every role that Opus 5.5 holds** on rodrigo's shifts: the orchestrator (D-001), the UI worker (D-048, at most one at a time besides the orchestrator), the `unsafe` audits (D-053, D-061), the escalation and contract-heavy worker (D-047), and the reviews contract §15 or D-062 give to Opus (M1-13's review).
+- **Everything else follows D-064:** contract §15's routing and reviewers (Sonnet 5.5, Argon, Codex/Sol, Astra, Flash) on rodrigo's accounts. A worker that hits a usage limit is paused, not silently re-routed (D-047). PLAN §8.2's cross-provider rule is unchanged: Fable is Anthropic, so its work is reviewed by Gemini or GPT models, not by Sonnet or Opus.
+- **In-flight tasks on rodrigo's shifts:** M1-09b continues with a Fable worker from `agent/opus/M1-09b-home-chat` (new branches named `agent/fable/<task-id>`); M1-13's review goes to Fable. Pedro's shifts are unchanged (D-060, D-062, D-064).
