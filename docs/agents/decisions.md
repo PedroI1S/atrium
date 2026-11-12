@@ -387,3 +387,7 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **Branches:** the three tasks continue on their existing branches (`agent/opus/…`, `agent/sonnet/…`) whatever model works on them. This is the orchestrator's reading of D-065's note on branch names, chosen to avoid deleting pushed branches; the driver can overturn it.
 - **Before any `agy` worker:** the hook check of `HANDOFF.md` is re-run, because `agy` here is 1.5.7 and the tested version is 1.5.3.
 - **Not covered by this go:** M1-08, M1-08L, and the decisions that wait for Pedro (CR-09, CR-12) or a driver (CR-08, CR-10).
+
+*Update, same day (orchestrator):*
+- The `agy` 1.5.7 hook check passed (Flash, scratch worktree): `cargo --version` allowed, a write to `.agents/` and `git push` denied by the hook. `scripts/doctor` now names 1.5.7 as the tested version.
+- M1-14 is split, as M1-09 was: **M1-14a-linux-host** (M1-10's four Linux review findings, a live run of the Linux paths, L8; no GUI, no app file; Sonnet 5.5, reviewed by Argon) is dispatched now under D-059's go; **M1-14b-linux-app** (L1, L2 harness, L3 profiling, M1-09a's and M1-09b's runs on Linux; Fable 5.2, reviewed by Flash) waits for M1-09b's merge, because M1-09b owns `app/src/**` and `app/scripts/**`.
