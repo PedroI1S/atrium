@@ -1,12 +1,12 @@
 // The composer: a rounded field whose text is the view's draft. The draft lives in Rust
 // (windows.ts → shell.rs), so it survives a move to another window, a forced close and a crash.
-// Sending, the mode and agent chips arrive with the chat view (M1-09b), which passes `onSend`.
+// The chat view (ThreadCard) passes `onSend`, `onStop` and its chips.
 
-import { ArrowUp } from "lucide-solid";
-import { type JSX, createEffect } from "solid-js";
+import { ArrowUp, Square } from "lucide-solid";
+import { type JSX, Show, createEffect } from "solid-js";
 import { canEdit, patchView, viewOf } from "../windows";
 
-export function Composer(props: { viewKey: string; placeholder: string; onSend?: (text: string) => void; chips?: JSX.Element; id?: string }) {
+export function Composer(props: { viewKey: string; placeholder: string; onSend?: (text: string) => void; onStop?: () => void; running?: boolean; busy?: boolean; chips?: JSX.Element; id?: string }) {
   const text = () => viewOf(props.viewKey).draft;
   let area!: HTMLTextAreaElement;
   const grow = () => {
@@ -18,7 +18,7 @@ export function Composer(props: { viewKey: string; placeholder: string; onSend?:
   createEffect(() => { text(); queueMicrotask(grow); });
   const send = () => {
     const value = text().trim();
-    if (!value || !props.onSend || !canEdit(props.viewKey)) return;
+    if (!value || !props.onSend || props.busy || !canEdit(props.viewKey)) return;
     props.onSend(value);
   };
   return (
@@ -42,9 +42,17 @@ export function Composer(props: { viewKey: string; placeholder: string; onSend?:
       />
       <div class="cm-row">
         {props.chips}
-        <button type="button" class="send" aria-label="Send" title={props.onSend ? "Send (Enter)" : "Sending arrives with the chat view"} disabled={!props.onSend || !text().trim()} onClick={send}>
-          <ArrowUp class="i" aria-hidden="true" />
-        </button>
+        {/* While a turn runs, a message waits for it (the session queues it); Stop ends the turn. */}
+        <Show when={props.running && props.onStop}>
+          <button type="button" class="send stop" aria-label="Stop the turn" title="Stop the turn" onClick={() => props.onStop?.()}>
+            <Square class="i sm" aria-hidden="true" />
+          </button>
+        </Show>
+        <Show when={!props.running || text().trim()}>
+          <button type="button" class="send" aria-label="Send" title={props.running ? "Send (Enter): it waits for the running turn" : "Send (Enter)"} disabled={!props.onSend || props.busy || !text().trim()} onClick={send}>
+            <ArrowUp class="i" aria-hidden="true" />
+          </button>
+        </Show>
       </div>
     </div>
   );
