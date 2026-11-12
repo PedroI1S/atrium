@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use atrium_agents::{
-    AdapterError, AgentAdapter, BoxFuture, Session, SessionConfig, Transport,
-};
+use atrium_agents::{AdapterError, AgentAdapter, BoxFuture, Session, SessionConfig, Transport};
 use atrium_core::store::{Migration, SqliteStore, StoreOptions};
 use atrium_daemon::AppIdentitySource;
 use atrium_host::peer::AppIdentity;
@@ -385,12 +383,7 @@ async fn many_replaced_subscriptions_in_a_row_and_replacement_while_live_obey_d0
     }
     wire.thread_when(&thread, |s| s.last_event >= Some(EventId(2_000)))
         .await;
-    let all_first_batch: Vec<EventId> = wire
-        .history(&thread)
-        .await
-        .iter()
-        .map(|e| e.id)
-        .collect();
+    let all_first_batch: Vec<EventId> = wire.history(&thread).await.iter().map(|e| e.id).collect();
     assert!(all_first_batch.len() >= 2_002);
 
     let mut client = rig.dev().await;
@@ -464,12 +457,7 @@ async fn many_replaced_subscriptions_in_a_row_and_replacement_while_live_obey_d0
     wire.thread_when(&thread, |s| s.last_event >= Some(target_last))
         .await;
 
-    let all_with_live: Vec<EventId> = wire
-        .history(&thread)
-        .await
-        .iter()
-        .map(|e| e.id)
-        .collect();
+    let all_with_live: Vec<EventId> = wire.history(&thread).await.iter().map(|e| e.id).collect();
     let live_mid = all_with_live[all_with_live.len() - 15];
 
     let replace_live_req = client.request_id();

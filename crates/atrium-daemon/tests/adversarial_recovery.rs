@@ -262,10 +262,13 @@ async fn failed_closure_in_recovery_fails_start_and_next_start_closes_it() {
                   BEGIN DELETE FROM schema_migrations WHERE version > 1; END;",
         },
     ];
-    let temp_store =
-        SqliteStore::open_with(&rig.paths.store, StoreOptions::default(), SWAP_TO_APPEND_FAIL_SQL)
-            .await
-            .expect("swaps trigger");
+    let temp_store = SqliteStore::open_with(
+        &rig.paths.store,
+        StoreOptions::default(),
+        SWAP_TO_APPEND_FAIL_SQL,
+    )
+    .await
+    .expect("swaps trigger");
     drop(temp_store);
 
     let second_start = Daemon::start(rig.options()).await;

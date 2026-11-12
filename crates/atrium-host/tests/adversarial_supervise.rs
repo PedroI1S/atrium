@@ -51,6 +51,7 @@ impl Drop for KillPidOnDrop {
         if let Ok(raw) = i32::try_from(self.0)
             && raw > 1
         {
+            // SAFETY: `raw > 1` targets a specific child pid created by this test.
             unsafe {
                 libc::kill(raw, libc::SIGKILL);
             }
@@ -65,6 +66,7 @@ impl Drop for KillGroupOnDrop {
         if let Ok(raw) = i32::try_from(self.0)
             && raw > 1
         {
+            // SAFETY: `raw > 1`, so `-raw <= -2` targets only the child process group created by this test.
             unsafe {
                 libc::kill(-raw, libc::SIGKILL);
             }
@@ -79,6 +81,7 @@ fn pid_exists(pid: u32) -> bool {
     if raw <= 0 {
         return false;
     }
+    // SAFETY: `kill(raw, 0)` with `raw > 0` performs an existence check without sending a signal.
     let rc = unsafe { libc::kill(raw, 0) };
     if rc == 0 {
         return true;
@@ -119,7 +122,10 @@ fn identify_rejects_degenerate_pids_and_unreaped_zombies() {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(saw_zombie, "child {pid} should reach zombie state before wait()");
+    assert!(
+        saw_zombie,
+        "child {pid} should reach zombie state before wait()"
+    );
     assert_eq!(
         identify(pid).unwrap(),
         None,
@@ -169,12 +175,11 @@ async fn identify_handles_weird_comm_with_parens_and_spaces() {
     assert_eq!(live.pid, sup.identity.pid);
     assert_eq!(live.pgid, sup.identity.pid);
     assert_eq!(live.start_time, sup.identity.start_time);
-    assert_eq!(
-        live.executable,
-        std::fs::canonicalize(&weird_bin).unwrap()
-    );
+    assert_eq!(live.executable, std::fs::canonicalize(&weird_bin).unwrap());
 
-    let term = terminate(&mut sup, Duration::ZERO).await.expect("terminate");
+    let term = terminate(&mut sup, Duration::ZERO)
+        .await
+        .expect("terminate");
     assert!(term.killed);
 }
 
@@ -247,6 +252,7 @@ async fn kill_recorded_unverified_when_leader_exited_and_reaped_but_grandchild_r
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // SAFETY: `setpgid(0, 0)` is async-signal-safe and touches no shared memory.
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
@@ -274,7 +280,9 @@ async fn kill_recorded_unverified_when_leader_exited_and_reaped_but_grandchild_r
 
     let out = StdCommand::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("kill_recorded_unverified_when_leader_exited_and_reaped_but_grandchild_remains_in_pgid")
+        .arg(
+            "kill_recorded_unverified_when_leader_exited_and_reaped_but_grandchild_remains_in_pgid",
+        )
         .arg("--nocapture")
         .arg("--quiet")
         .env("ATRIUM_ADV_ORPHAN_PGID_HELPER", "1")
@@ -352,7 +360,9 @@ async fn unlinked_running_executable_is_rejected_by_kill_recorded_and_verify_app
         assert!(pid_exists(recorded.pid));
     }
 
-    let term = terminate(&mut sup, Duration::ZERO).await.expect("terminate");
+    let term = terminate(&mut sup, Duration::ZERO)
+        .await
+        .expect("terminate");
     assert!(term.killed);
     assert!(!pid_exists(recorded.pid));
 }
@@ -483,6 +493,7 @@ async fn linux_verify_app_peer_rejects_relative_symlink_mismatch_and_deleted_exe
         "got {sym_err:?}"
     );
 
+    // SAFETY: `geteuid` takes no arguments and has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         let non_root_err = verify_app_peer(
             &server_stream,
