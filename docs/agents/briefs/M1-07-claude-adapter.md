@@ -4,6 +4,8 @@ Model: Sonnet 5.5 · Reviewer: Gemini 3.8 Flash (D-062; Argon is out of usage) �
 Go: D-062 (Pedro, 2026-11-12). Remembered command rules are global (D-062): `rememberable` needs no folder.
 Branch: `agent/sonnet/M1-07-claude-adapter` · Worktree: `../atrium-wt/M1-07-claude-adapter`
 
+**On rodrigo's shifts (D-065, D-066):** a Sonnet 5.5 worker finishes the task from `docs/agents/handoffs/M1-07-claude-adapter.md` (status partial, "Next step"); the reviewer is Gemini 4 Argon (contract §15). The live fixtures are recorded: don't re-record them unless a test proves one wrong. The agent's shell runs in a container without `git` and `python3`: run those with `distrobox-host-exec <command>`; `cargo` works in the container.
+
 ## Goal
 Fold the M0-01 spike into `atrium-agents` as the production Claude Code adapter, on the M1 contract, with every M1 must-fix item for Claude closed.
 
