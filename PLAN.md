@@ -23,7 +23,7 @@ A fast, lightweight agent development environment written in Rust. It wraps the 
 | Area | Decision |
 |---|---|
 | Agent core | Wrap native agents. We don't write our own agent loop. |
-| Providers v1 | Claude Code, Codex, Antigravity (`agy`, for Gemini models), generic ACP adapter (OpenCode, Goose, …) |
+| Providers v1 | Claude Code, Codex, Antigravity (`agy`, for Gemini models), **OpenCode** (its own adapter over `opencode serve`, D-063), generic ACP adapter (Goose, other ACP agents) |
 | Process model | **The core runs as a background daemon (`atriumd`) from v1.** The Tauri app is a client over a local socket. Agents keep running after the window closes. Remote/mobile later means adding a transport, not rewriting the core. |
 | UI | Tauri 2 + SolidJS |
 | Platforms | macOS (Apple Silicon) + Linux |
@@ -63,7 +63,7 @@ A fast, lightweight agent development environment written in Rust. It wraps the 
 ┌──────────────▼──────── atriumd (background daemon) ────────────────────────┐
 │  store      SQLite (WAL): append-only events + projections, FTS            │
 │  attention  thread state machine, inbox ranking, notifications             │
-│  agents     AgentAdapter → claude | codex | acp                            │
+│  agents     AgentAdapter → claude | codex | opencode | acp                 │
 │  policy     approval rules, presets, hard-deny list                        │
 │  git        worktrees, checkpoints, conflict radar, merge queue, PRs       │
 │  env        worktree setup/teardown, port leases, preview processes        │
@@ -95,7 +95,7 @@ atrium/
 │  ├─ atrium-core/           domain, store, attention, policy, scheduler
 │  ├─ atrium-daemon/  (bin)  atriumd: socket server, lifecycle, single instance
 │  ├─ atrium-client/         socket client + reconnect/replay (used by Tauri)
-│  ├─ atrium-agents/         AgentAdapter + claude / codex / acp adapters
+│  ├─ atrium-agents/         AgentAdapter + claude / codex / opencode / acp adapters
 │  ├─ atrium-git/            worktrees, checkpoints, conflict radar, merge queue, PR (gh)
 │  ├─ atrium-env/            worktree setup/teardown, port allocator, previews
 │  ├─ atrium-checks/         check runner, evidence, risk-flag heuristics
@@ -150,7 +150,8 @@ trait AgentAdapter {
   - **Approvals (found in the M0-00 smoke test)**: headless `agy` can't prompt and ignores hook `allow` grants, but enforces hook `deny`. So Atrium runs `agy` with `--dangerously-skip-permissions` plus a `PreToolUse` hook (matcher `"*"`) that calls back into `atriumd`'s policy engine over the socket: `allow`/`deny` per call, and `ask` becomes "deny + inbox approval + retry". Re-test with each `agy` release; a native host-approval channel would replace this.
   - Event stream: NDJSON with `event: init | step_update | result`. `step_update` carries `tool_name`, `state` (ACTIVE/DONE/ERROR), parameters and errors; `result` carries the response, usage and `denied_actions`.
   - **Spike (M0)**: per-session MCP injection (`agy mcp` manages servers globally, so per-session scoping may need a generated config), and the `--input-format stream-json` multi-turn mode.
-- **ACP**: the `agent-client-protocol` crate (Zed). One adapter covers OpenCode, Goose, etc. MCP servers are passed in `session/new`.
+- **OpenCode** (D-063; Pedro's main provider): its own adapter over `opencode serve` (HTTP API + event stream), not ACP. Each Atrium session gets its own OpenCode session with **per-session permission rules** that route every tool call through Atrium's gate, and a model and reasoning level (`variant`) per prompt. Prior art: MonoCode's OpenCode connector (`src/integrations/harness/providers/opencode/`, ideas only). The M0-04 spike (OpenCode through ACP) is the starting point for fixtures and the must-fix items O1–O10, which apply to this adapter where they still make sense (Code Mode `execute` policy for every agent, cancelled approvals never executed, usage vs context, closing events under load). Free hosted OpenCode models stay `untrusted` by default (§3.21 trust levels).
+- **ACP**: the `agent-client-protocol` crate (Zed). One generic adapter covers Goose and other ACP agents. MCP servers are passed in `session/new`. Lower priority than OpenCode (D-063).
 - **Skills / native config**: we never rewrite prompts. Agents load their own `CLAUDE.md` / `AGENTS.md` / skills from the cwd and home dir as usual. Atrium only *adds* MCP tools and sends ordinary user messages (review comments, check failures, handoff requests).
 - **Fallback if Claude's stream-json control protocol proves brittle**: use `claude-code-acp` through the ACP adapter (costs a Node dependency).
 
@@ -735,7 +736,7 @@ trust = "untrusted"         # default for free tiers; changing it requires confi
 - Worktree environments: copy, setup/teardown, port leases, preview processes.
 - Checks: `atrium.toml`, the automatic runner, the auto-fix loop, `checks_*` MCP tools, review cards with risk flags, "unverified" labelling.
 - Diff view with inline comments, terminal, editor.
-- Commit/push/PR through `gh`. ACP adapter.
+- Commit/push/PR through `gh`. **OpenCode adapter** over `opencode serve` (first, D-063), then the generic ACP adapter.
 - History import: Claude Code, Codex, `agy` and MonoCode importers, and the build archive (8.7) at graduation.
 
 **M3: Browser**
@@ -809,7 +810,7 @@ trust = "untrusted"         # default for free tiers; changing it requires confi
 - License (MIT vs Apache-2.0)?
 - How deep should the editor go: quick edits only, or LSP? (Editor AI, 3.21, is planned either way; its minimal LSP client for Copilot could grow into full LSP support.)
 - Default network policy for sandboxes.
-- Which ACP agents to test first (OpenCode, Goose)?
+- ~~Which ACP agents to test first (OpenCode, Goose)?~~ OpenCode gets its own adapter (D-063); Goose is the first generic ACP agent.
 - Workspace notes: private by default (current plan) or committed?
 - Merge queue default: local fast-forward or PR + auto-merge?
 - Linear import in M6, or GitHub only at first?
@@ -844,7 +845,7 @@ Prices and positioning come from vendor announcements and early reviews (Sept–
 | Frontend (SolidJS, CodeMirror, xterm, canvas, Tauri bridge) | Sonnet 5.5 | Sol 6.1 | Sol 6.1, plus screenshots as evidence |
 | Claude adapter | Sonnet 5.5 | Opus 5.5 | Sol 6.1 |
 | Codex adapter | Sol 6.1 | Astra | Sonnet 5.5 |
-| Antigravity adapter (`agy` stream-json) and ACP adapter | Argon | 3.8 Flash | Sonnet 5.5 |
+| Antigravity adapter (`agy` stream-json), OpenCode adapter (`opencode serve`) and ACP adapter | Argon | 3.8 Flash | Sonnet 5.5 |
 | Tests, fixtures, recorded protocol transcripts, docs, boilerplate | 3.8 Flash | Sonnet 5.5 | Spot-check by the owner of the code under test |
 | Codebase exploration, summaries, triage of failing checks | 3.8 Flash | n/a | n/a |
 | Security review (policy, hard-deny, MCP tokens, socket permissions, sandbox, browser isolation) | Argon **and** Astra | n/a | Opus integrates the findings |
@@ -945,7 +946,7 @@ Model: <primary> · Reviewer: <other provider> · Depends on: <ids>
 |---|---|---|---|---|---|---|
 | **M0 spikes** | Event enum and normalization; picks the winner of each spike; token architecture for the UI shell | Codex app-server client; daemon socket + replay spike | Claude stream-json + control protocol; CDP screencast → canvas; streaming perf; **UI shell + visual directions** | `agy` stream-json client + ACP client | Recorded protocol transcripts as fixtures; spike reports | Review of the M0 findings and architecture |
 | **M1 daemon + Home + attention** | Protocol, store schema, thread state machine, policy model | `atriumd`, store, `atrium-client`, lifecycle, policy engine | Tauri shell, tray, Home chat UI, inbox, approval queue, question forms | Adversarial tests for the hard-deny list and approval rules; socket permissions | Unit tests, docs, protocol TS generation checks | Gate review |
-| **M2 workspaces + done** | `atrium.toml` schema, checks/env contracts | `atrium-git` (worktrees, checkpoints), `atrium-env` (ports, setup), `atrium-checks` | Diff + inline comments, terminal, editor, review cards | ACP adapter for production | Risk-flag heuristics, check-output trimming, fixtures | n/a |
+| **M2 workspaces + done** | `atrium.toml` schema, checks/env contracts | `atrium-git` (worktrees, checkpoints), `atrium-env` (ports, setup), `atrium-checks` | Diff + inline comments, terminal, editor, review cards | OpenCode adapter (`opencode serve`), then ACP adapter for production | Risk-flag heuristics, check-output trimming, fixtures | n/a |
 | **M3 browser** | Browser MCP tool schemas | CDP backend: discovery, contexts, input, a11y snapshot | Screencast pane, take-over, preview/evidence UI | Isolation review (contexts, profiles, pipe) | Tool tests against local fixture pages | n/a |
 | **M3.5 databases** | Normalized schema model + `db_*` tool contracts | Drivers, introspection, statement classifier, staged-edit SQL generation, diff → migration engine | Query editor, table grid, ER diagram (ELK), design mode | Adversarial tests of read-only enforcement (side-effecting functions, `COPY`, writable CTEs, multi-statement tricks) | Fixture databases (SQLite + Postgres in Docker), round-trip migration tests, docs | Review of the migration engine's correctness |
 | **M4 sandbox** | Sandbox contracts, integration | Image builder, rootfs CoW | Sandbox UI, terminal | **libkrun FFI, `atrium-vmm`, `atrium-guest`, vsock, MCP shim** | Guest tests, docs | **Security review of sandbox + credentials** |
