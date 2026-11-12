@@ -95,7 +95,9 @@ impl ToolGate for ScriptedGate {
     ) -> BoxFuture<'a, GateDecision> {
         let bound = self.issued.lock().unwrap().remove(&ticket.request_id);
         let d = match bound {
-            Some(input) if input.as_str() == check.input.to_string().as_str() => GateDecision::Allow,
+            Some(input) if input.as_str() == check.input.to_string().as_str() => {
+                GateDecision::Allow
+            }
             _ => GateDecision::Deny {
                 reason: "the approval doesn't match this call".into(),
             },

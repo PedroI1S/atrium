@@ -211,7 +211,7 @@ async fn wait_file(path: &Path, secs: u64) -> String {
 
 fn alive(pid: &str) -> bool {
     std::process::Command::new("kill")
-        .args(["-0", pid.trim()])
+        .args(["-0", "--", pid.trim()])
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
@@ -684,6 +684,42 @@ async fn malformed_and_foreign_hook_requests_are_denied() {
             "{mode}: the gate is not asked"
         );
     }
+}
+
+/// Tool arguments past `MAX_PARTIAL_ARGS_BYTES` are denied without asking the
+/// gate, and the call is shown as failed (contract §6).
+#[tokio::test]
+async fn oversize_tool_arguments_are_denied_without_asking_the_gate() {
+    let called = Arc::new(AtomicBool::new(false));
+    let c = called.clone();
+    let gate: Arc<dyn ToolGate> = TestGate::new(move |_| {
+        c.store(true, Ordering::SeqCst);
+        GateDecision::Allow
+    });
+    let (v, evs) = run_mode(
+        "hook-bigargs",
+        "hook-bigargs",
+        gate,
+        Duration::from_secs(5),
+        "hook_response.json",
+    )
+    .await;
+    let (d, reason) = decision(&v);
+    assert_eq!(d, "deny");
+    assert!(reason.unwrap().contains("too large"));
+    assert!(!called.load(Ordering::SeqCst), "the gate is not asked");
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallFinished { status: ToolStatus::Failed, error: Some(m), .. } if m.contains("exceed")
+        )),
+        "{evs:?}"
+    );
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, AgentEvent::ApprovalRequested { .. })),
+        "{evs:?}"
+    );
 }
 
 /// `can_use_tool` that no hook preceded goes through the gate, and every

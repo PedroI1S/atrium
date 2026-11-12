@@ -7,7 +7,8 @@
 //! forever until interrupted), `hook` (asks the `PreToolUse` hook about a
 //! Read and records the answer), `stuck` (starts a turn and never ends it,
 //! ignoring interrupts), `exit` (exits at once), `hook-malformed` and
-//! `hook-badcb` (bad `hook_callback` requests), `canuse`, `canuse-noid` and
+//! `hook-badcb` (bad `hook_callback` requests), `hook-bigargs` (a hook call
+//! whose tool arguments exceed the cap), `canuse`, `canuse-noid` and
 //! `canuse-question` (a `can_use_tool` request no hook preceded), and
 //! `grandchild` (starts a long-lived child and ignores stdin EOF).
 
@@ -153,6 +154,17 @@ fn main() {
                         );
                         emit(
                             &json!({"type":"control_request","request_id":"h1","request":{"subtype":"hook_callback","callback_id":"atrium-pre-tool-use","input":{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"x"},"tool_use_id":"toolu_1"}}}),
+                        );
+                    }
+                    "hook-bigargs" => {
+                        // Arguments past MAX_PARTIAL_ARGS_BYTES, in a record
+                        // under MAX_PROVIDER_RECORD_BYTES.
+                        let input = json!({"command":"x".repeat(4 * 1024 * 1024 + 16)});
+                        emit(
+                            &json!({"type":"assistant","message":{"model":"claude-fake","id":"msg_fake","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":input}]},"session_id":session_id}),
+                        );
+                        emit(
+                            &json!({"type":"control_request","request_id":"h1","request":{"subtype":"hook_callback","callback_id":"atrium-pre-tool-use","input":{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":input,"tool_use_id":"toolu_1"}}}),
                         );
                     }
                     "hook-ask" => {
