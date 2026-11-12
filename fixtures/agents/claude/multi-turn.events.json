@@ -2,7 +2,7 @@
   {
     "type": "session_started",
     "provider": "claude",
-    "native_session_id": "df142524-2e6c-45dc-b85a-35b0586334f8",
+    "native_session_id": "9cb5221a-63b0-48bc-aaa1-c3bdb86ec1db",
     "model": "claude-haiku-5-5",
     "tools": [
       "Task",
@@ -32,34 +32,107 @@
       "Skill",
       "TaskStop",
       "ToolSearch",
-      "WebFetch",
       "WebSearch",
       "Write"
-    ]
+    ],
+    "enforcement": {
+      "level": "full",
+      "reasons": [],
+      "provider": "claude",
+      "cli_version": "2.1.308",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-edit"
+        },
+        {
+          "class": "delete",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "move",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "search",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "execute",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-exec"
+        },
+        {
+          "class": "fetch",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-fetch"
+        },
+        {
+          "class": "mcp",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-mcp"
+        },
+        {
+          "class": "subagent",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-subagent"
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/mcp-allow"
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Remember the number 42. Reply with just: OK."
+    }
+  },
+  {
     "type": "message_delta",
-    "message_id": "msg_011CgNDyeFz26ZP5To1jkskT:0",
+    "message_id": "msg_011Cgyd1MxL273fizsQzMz1w:0",
     "kind": "assistant",
     "text": "OK"
   },
   {
     "type": "message_completed",
-    "message_id": "msg_011CgNDyeFz26ZP5To1jkskT:0",
+    "message_id": "msg_011Cgyd1MxL273fizsQzMz1w:0",
     "kind": "assistant",
-    "text": "OK"
+    "body": {
+      "type": "streamed",
+      "chars": 2,
+      "deltas": 1,
+      "sha256": "565339bc4d33d72817b583024112eb7f5cdf3e5eef0252d6ec1b9c9a94e12bb3"
+    }
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
       "output_tokens": 4,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 7688,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 7033,
       "reasoning_tokens": 0,
       "cost_usd": null
     }
@@ -69,25 +142,30 @@
     "windows": [
       {
         "name": "5h",
-        "used_percent": 87.0,
-        "resets_at_ms": 1792900200000
+        "used_percent": 75.0,
+        "resets_at_ms": 1794522000000
       },
       {
         "name": "weekly",
-        "used_percent": 9.0,
-        "resets_at_ms": 1793498400000
+        "used_percent": 64.0,
+        "resets_at_ms": 1794708000000
       }
     ]
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 32512,
+    "window_tokens": 1000000
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
       "output_tokens": 4,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 7688,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 7033,
       "reasoning_tokens": 0,
-      "cost_usd": 0.00179395
+      "cost_usd": 0.00166353
     }
   },
   {
@@ -97,10 +175,10 @@
     "usage": {
       "input_tokens": 2,
       "output_tokens": 4,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 7688,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 7033,
       "reasoning_tokens": 0,
-      "cost_usd": 0.00179395
+      "cost_usd": 0.00166353
     }
   },
   {
@@ -108,26 +186,29 @@
     "turn": 2
   },
   {
+    "type": "message_completed",
+    "message_id": "user:2",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "What number did I ask you to remember? Reply with just the number."
+    }
+  },
+  {
     "type": "message_delta",
-    "message_id": "msg_011CgNDyqi4dVPXeHfKkrWkg:0",
+    "message_id": "msg_011Cgyd1Y2Jr3m2AUBFYn3VM:0",
     "kind": "assistant",
     "text": "42"
   },
   {
     "type": "message_completed",
-    "message_id": "msg_011CgNDyqi4dVPXeHfKkrWkg:0",
+    "message_id": "msg_011Cgyd1Y2Jr3m2AUBFYn3VM:0",
     "kind": "assistant",
-    "text": "42"
-  },
-  {
-    "type": "usage",
-    "usage": {
-      "input_tokens": 2,
-      "output_tokens": 3,
-      "cache_read_tokens": 28410,
-      "cache_write_tokens": 4742,
-      "reasoning_tokens": 0,
-      "cost_usd": null
+    "body": {
+      "type": "streamed",
+      "chars": 2,
+      "deltas": 1,
+      "sha256": "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"
     }
   },
   {
@@ -135,10 +216,26 @@
     "usage": {
       "input_tokens": 2,
       "output_tokens": 3,
-      "cache_read_tokens": 28410,
-      "cache_write_tokens": 4742,
+      "cache_read_tokens": 27221,
+      "cache_write_tokens": 5334,
       "reasoning_tokens": 0,
-      "cost_usd": 0.0012342000000000002
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 32560,
+    "window_tokens": 1000000
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 3,
+      "cache_read_tokens": 27221,
+      "cache_write_tokens": 5334,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00134071
     }
   },
   {
@@ -148,10 +245,10 @@
     "usage": {
       "input_tokens": 2,
       "output_tokens": 3,
-      "cache_read_tokens": 28410,
-      "cache_write_tokens": 4742,
+      "cache_read_tokens": 27221,
+      "cache_write_tokens": 5334,
       "reasoning_tokens": 0,
-      "cost_usd": 0.0012342000000000002
+      "cost_usd": 0.00134071
     }
   },
   {

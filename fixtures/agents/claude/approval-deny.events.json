@@ -2,7 +2,7 @@
   {
     "type": "session_started",
     "provider": "claude",
-    "native_session_id": "092f70c4-6328-4d13-8318-a20b2b47d06e",
+    "native_session_id": "5fca6af7-49db-4f9a-8a17-e4f1701c6935",
     "model": "claude-haiku-5-5",
     "tools": [
       "Task",
@@ -32,59 +32,129 @@
       "Skill",
       "TaskStop",
       "ToolSearch",
-      "WebFetch",
       "WebSearch",
       "Write"
-    ]
+    ],
+    "enforcement": {
+      "level": "full",
+      "reasons": [],
+      "provider": "claude",
+      "cli_version": "2.1.308",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-edit"
+        },
+        {
+          "class": "delete",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "move",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "search",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "execute",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-exec"
+        },
+        {
+          "class": "fetch",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-fetch"
+        },
+        {
+          "class": "mcp",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-mcp"
+        },
+        {
+          "class": "subagent",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-subagent"
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/mcp-allow"
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Run this exact shell command and report the result: touch pwned.txt"
+    }
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "toolu_01DqiKWez4pp16uBQgzeQMhp",
+    "call_id": "toolu_01Jth35gzt9rWyoZj6yRNL4s",
     "name": "Bash",
     "kind": "execute",
-    "title": "touch pwned.txt && ls -l pwned.txt",
+    "title": "touch pwned.txt",
     "input": {
-      "command": "touch pwned.txt && ls -l pwned.txt",
-      "description": "Create pwned.txt in the working directory and confirm it exists"
+      "command": "touch pwned.txt",
+      "description": "Create empty file pwned.txt in the worktree"
     }
   },
   {
     "type": "approval_requested",
-    "request_id": "ac2a091f-226a-4815-9577-8eedc6abf6e9",
-    "call_id": "toolu_01DqiKWez4pp16uBQgzeQMhp",
+    "request_id": "req-1",
+    "call_id": "toolu_01Jth35gzt9rWyoZj6yRNL4s",
     "name": "Bash",
     "kind": "execute",
-    "title": "touch pwned.txt && ls -l pwned.txt",
+    "title": "touch pwned.txt",
     "input": {
-      "command": "touch pwned.txt && ls -l pwned.txt",
-      "description": "Create pwned.txt in the working directory and confirm it exists"
+      "command": "touch pwned.txt",
+      "description": "Create empty file pwned.txt in the worktree"
     },
-    "reason": null
+    "reason": null,
+    "rememberable": true
   },
   {
     "type": "request_resolved",
-    "request_id": "ac2a091f-226a-4815-9577-8eedc6abf6e9",
+    "request_id": "req-1",
     "outcome": "denied"
   },
   {
     "type": "tool_call_finished",
-    "call_id": "toolu_01DqiKWez4pp16uBQgzeQMhp",
+    "call_id": "toolu_01Jth35gzt9rWyoZj6yRNL4s",
     "status": "denied",
     "output": null,
-    "error": "The user denied this command."
+    "error": "The user denied this command.",
+    "truncated_bytes": 0
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
-      "output_tokens": 175,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 7399,
-      "reasoning_tokens": 69,
+      "output_tokens": 90,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 6720,
+      "reasoning_tokens": 0,
       "cost_usd": null
     }
   },
@@ -93,246 +163,172 @@
     "windows": [
       {
         "name": "5h",
-        "used_percent": 86.0,
-        "resets_at_ms": 1792900200000
+        "used_percent": 74.0,
+        "resets_at_ms": 1794522000000
       },
       {
         "name": "weekly",
-        "used_percent": 9.0,
-        "resets_at_ms": 1793498400000
+        "used_percent": 64.0,
+        "resets_at_ms": 1794708000000
       }
     ]
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": "The `"
+    "text": "The"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
+    "kind": "assistant",
+    "text": " command `"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
     "text": "touch pwned.txt"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": "` command was den"
+    "text": "` was denied,"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": "ied,"
+    "text": " so I didn't run"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": " so I didn't create the"
+    "text": " it and"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": " file. I ha"
+    "text": " no"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": "ven't ret"
+    "text": " file was created. I"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": "ried it, since"
+    "text": " ran it once"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": " a"
+    "text": " and"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": " denial means"
+    "text": " didn't retry."
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
+    "kind": "assistant",
+    "text": " If you want it"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
+    "kind": "assistant",
+    "text": " run"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
+    "kind": "assistant",
+    "text": ", appro"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
+    "kind": "assistant",
+    "text": "ve it when"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
+    "kind": "assistant",
+    "text": " prompted, or"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
+    "kind": "assistant",
+    "text": " tell me where"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
+    "kind": "assistant",
+    "text": " to create"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
     "text": " the"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": " user decl"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": "ined that"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": " ex"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": "act call.\n\nIf"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": " you want the"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": " file created"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": ", t"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": "ell me and"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": " I'll run"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": " it again"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": ", or create"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": " it another"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": " way."
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": " The command would"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": " have"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": " run in `"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": "~/"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": "Documents/atrium-"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": "wt/M0-01-"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": "claude-adapter/."
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": "orchestration/scratch"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": "/record/approval-deny"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
-    "kind": "assistant",
-    "text": "`."
+    "text": " file."
   },
   {
     "type": "message_completed",
-    "message_id": "msg_011CgNDwXcapW7zpyeaxboJ5:0",
+    "message_id": "msg_011CgycyfVU9bfSudJGndYgk:0",
     "kind": "assistant",
-    "text": "The `touch pwned.txt` command was denied, so I didn't create the file. I haven't retried it, since a denial means the user declined that exact call.\n\nIf you want the file created, tell me and I'll run it again, or create it another way. The command would have run in `~/Documents/atrium-wt/M0-01-claude-adapter/.orchestration/scratch/record/approval-deny`."
-  },
-  {
-    "type": "usage",
-    "usage": {
-      "input_tokens": 4,
-      "output_tokens": 306,
-      "cache_read_tokens": 58229,
-      "cache_write_tokens": 7616,
-      "reasoning_tokens": 69,
-      "cost_usd": null
+    "body": {
+      "type": "streamed",
+      "chars": 200,
+      "deltas": 20,
+      "sha256": "328ed462f3d5ca6a431c8224bc5f9e55da7595990436179356cc092908ae64ec"
     }
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 306,
-      "cache_read_tokens": 58229,
-      "cache_write_tokens": 7616,
-      "reasoning_tokens": 69,
-      "cost_usd": 0.0022588900000000004
+      "output_tokens": 157,
+      "cache_read_tokens": 57666,
+      "cache_write_tokens": 6852,
+      "reasoning_tokens": 0,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 32394,
+    "window_tokens": 1000000
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 157,
+      "cache_read_tokens": 57666,
+      "cache_write_tokens": 6852,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0020259600000000003
     }
   },
   {
@@ -341,11 +337,11 @@
     "outcome": "completed",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 306,
-      "cache_read_tokens": 58229,
-      "cache_write_tokens": 7616,
-      "reasoning_tokens": 69,
-      "cost_usd": 0.0022588900000000004
+      "output_tokens": 157,
+      "cache_read_tokens": 57666,
+      "cache_write_tokens": 6852,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0020259600000000003
     }
   },
   {

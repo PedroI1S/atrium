@@ -2,7 +2,7 @@
   {
     "type": "session_started",
     "provider": "claude",
-    "native_session_id": "b9e93a03-e5b4-48e2-8550-902f585fc676",
+    "native_session_id": "35c2348c-05b7-4ae1-bce2-ae1e104f0dd1",
     "model": "claude-haiku-5-5",
     "tools": [
       "Task",
@@ -32,34 +32,107 @@
       "Skill",
       "TaskStop",
       "ToolSearch",
-      "WebFetch",
       "WebSearch",
       "Write"
-    ]
+    ],
+    "enforcement": {
+      "level": "full",
+      "reasons": [],
+      "provider": "claude",
+      "cli_version": "2.1.308",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-edit"
+        },
+        {
+          "class": "delete",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "move",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "search",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "execute",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-exec"
+        },
+        {
+          "class": "fetch",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-fetch"
+        },
+        {
+          "class": "mcp",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-mcp"
+        },
+        {
+          "class": "subagent",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-subagent"
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/mcp-allow"
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "What codeword did I ask you to remember? Reply with just the codeword."
+    }
+  },
+  {
     "type": "message_delta",
-    "message_id": "msg_011CgNDzVFnKMGBBrbeRvhfg:0",
+    "message_id": "msg_011Cgyd28JKb9Z8MfeLg2dTU:0",
     "kind": "assistant",
     "text": "PINEAPPLE"
   },
   {
     "type": "message_completed",
-    "message_id": "msg_011CgNDzVFnKMGBBrbeRvhfg:0",
+    "message_id": "msg_011Cgyd28JKb9Z8MfeLg2dTU:0",
     "kind": "assistant",
-    "text": "PINEAPPLE"
+    "body": {
+      "type": "streamed",
+      "chars": 9,
+      "deltas": 1,
+      "sha256": "bcf79b8876734d35991d0e35dc8c74b7c68e4d09d22f801ae6d91cd9a1a20688"
+    }
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
       "output_tokens": 10,
-      "cache_read_tokens": 28422,
-      "cache_write_tokens": 4741,
+      "cache_read_tokens": 27312,
+      "cache_write_tokens": 5331,
       "reasoning_tokens": 0,
       "cost_usd": null
     }
@@ -69,25 +142,30 @@
     "windows": [
       {
         "name": "5h",
-        "used_percent": 87.0,
-        "resets_at_ms": 1792900200000
+        "used_percent": 75.0,
+        "resets_at_ms": 1794522000000
       },
       {
         "name": "weekly",
-        "used_percent": 9.0,
-        "resets_at_ms": 1793498400000
+        "used_percent": 64.0,
+        "resets_at_ms": 1794708000000
       }
     ]
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 32655,
+    "window_tokens": 1000000
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 4,
       "output_tokens": 14,
-      "cache_read_tokens": 53837,
-      "cache_write_tokens": 12436,
+      "cache_read_tokens": 52785,
+      "cache_write_tokens": 12448,
       "reasoning_tokens": 0,
-      "cost_usd": 0.0030329700000000003
+      "cost_usd": 0.00302485
     }
   },
   {
@@ -97,10 +175,10 @@
     "usage": {
       "input_tokens": 4,
       "output_tokens": 14,
-      "cache_read_tokens": 53837,
-      "cache_write_tokens": 12436,
+      "cache_read_tokens": 52785,
+      "cache_write_tokens": 12448,
       "reasoning_tokens": 0,
-      "cost_usd": 0.0030329700000000003
+      "cost_usd": 0.00302485
     }
   },
   {

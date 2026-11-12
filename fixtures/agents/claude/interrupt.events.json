@@ -2,7 +2,7 @@
   {
     "type": "session_started",
     "provider": "claude",
-    "native_session_id": "1ac28966-3a6d-497a-88db-a9e904f8276e",
+    "native_session_id": "8b38d365-825d-48b3-848c-2e27fd5880b0",
     "model": "claude-haiku-5-5",
     "tools": [
       "Task",
@@ -32,34 +32,103 @@
       "Skill",
       "TaskStop",
       "ToolSearch",
-      "WebFetch",
       "WebSearch",
       "Write"
-    ]
+    ],
+    "enforcement": {
+      "level": "full",
+      "reasons": [],
+      "provider": "claude",
+      "cli_version": "2.1.308",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-edit"
+        },
+        {
+          "class": "delete",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "move",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "search",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "execute",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-exec"
+        },
+        {
+          "class": "fetch",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-fetch"
+        },
+        {
+          "class": "mcp",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-mcp"
+        },
+        {
+          "class": "subagent",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-subagent"
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/mcp-allow"
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Run this exact shell command in the foreground and wait for it: python3 -c 'import time; time.sleep(60)'"
+    }
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "toolu_01DtHevtD7fG9uuWfjzpH3p3",
+    "call_id": "toolu_0144Qed3WaLgzheZNFL7gdxm",
     "name": "Bash",
     "kind": "execute",
     "title": "python3 -c 'import time; time.sleep(60)'",
     "input": {
       "command": "python3 -c 'import time; time.sleep(60)'",
-      "description": "Sleep for 60 seconds in the foreground"
+      "description": "Sleep 60 seconds in the foreground",
+      "timeout": 120000
     }
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
-      "output_tokens": 174,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 7715,
-      "reasoning_tokens": 72,
+      "output_tokens": 124,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 6967,
+      "reasoning_tokens": 0,
       "cost_usd": null
     }
   },
@@ -68,32 +137,38 @@
     "windows": [
       {
         "name": "5h",
-        "used_percent": 88.0,
-        "resets_at_ms": 1792900200000
+        "used_percent": 75.0,
+        "resets_at_ms": 1794522000000
       },
       {
         "name": "weekly",
-        "used_percent": 9.0,
-        "resets_at_ms": 1793498400000
+        "used_percent": 64.0,
+        "resets_at_ms": 1794708000000
       }
     ]
   },
   {
     "type": "tool_call_finished",
-    "call_id": "toolu_01DtHevtD7fG9uuWfjzpH3p3",
+    "call_id": "toolu_0144Qed3WaLgzheZNFL7gdxm",
     "status": "cancelled",
     "output": null,
-    "error": "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.\n\nNote: The user's next message may contain a correction or preference. Pay close attention — if they explain what went wrong or how they'd prefer you to work, consider saving that to memory for future sessions."
+    "error": "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.\n\nNote: The user's next message may contain a correction or preference. Pay close attention — if they explain what went wrong or how they'd prefer you to work, consider saving that to memory for future sessions.",
+    "truncated_bytes": 0
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 32566,
+    "window_tokens": 1000000
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
-      "output_tokens": 174,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 7715,
-      "reasoning_tokens": 72,
-      "cost_usd": 0.00188435
+      "output_tokens": 124,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 6967,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00171033
     }
   },
   {
@@ -102,11 +177,11 @@
     "outcome": "interrupted",
     "usage": {
       "input_tokens": 2,
-      "output_tokens": 174,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 7715,
-      "reasoning_tokens": 72,
-      "cost_usd": 0.00188435
+      "output_tokens": 124,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 6967,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00171033
     }
   },
   {

@@ -34,11 +34,12 @@ fn fake() -> PathBuf {
 }
 
 type CheckFn = dyn Fn(&ToolCheck) -> GateDecision + Send + Sync;
+type RedeemFn = dyn Fn(&ApprovalTicket, &ToolCheck) -> GateDecision + Send + Sync;
 
 /// A scripted gate that remembers what it was asked.
 struct TestGate {
     check: Box<CheckFn>,
-    redeem: Box<dyn Fn(&ApprovalTicket, &ToolCheck) -> GateDecision + Send + Sync>,
+    redeem: Box<RedeemFn>,
     question: Option<ApprovalTicket>,
     checks: Mutex<Vec<ToolCheck>>,
     redeems: Mutex<Vec<(ApprovalTicket, ToolCheck)>>,

@@ -2,7 +2,7 @@
   {
     "type": "session_started",
     "provider": "claude",
-    "native_session_id": "7632e191-9126-4b4a-81d5-81dbbc345e07",
+    "native_session_id": "bf7cfbce-73cd-40c7-a768-7cd4df6d1daf",
     "model": "claude-haiku-5-5",
     "tools": [
       "Task",
@@ -32,40 +32,109 @@
       "Skill",
       "TaskStop",
       "ToolSearch",
-      "WebFetch",
       "WebSearch",
       "Write"
-    ]
+    ],
+    "enforcement": {
+      "level": "full",
+      "reasons": [],
+      "provider": "claude",
+      "cli_version": "2.1.308",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-edit"
+        },
+        {
+          "class": "delete",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "move",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "search",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "execute",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-exec"
+        },
+        {
+          "class": "fetch",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-fetch"
+        },
+        {
+          "class": "mcp",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-mcp"
+        },
+        {
+          "class": "subagent",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-subagent"
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/mcp-allow"
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Use the Bash tool to run exactly this command and nothing else, not even a check first: rm victim.txt   Then tell me whether it worked."
+    }
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "toolu_01TziTKp5giZCZcVWLWpUsCW",
+    "call_id": "toolu_01KcCLUXVnMX1krUHYZsG3yS",
     "name": "Bash",
     "kind": "execute",
     "title": "rm victim.txt",
     "input": {
       "command": "rm victim.txt",
-      "description": "Remove victim.txt in the current worktree"
+      "description": "Delete victim.txt in the current worktree"
     }
   },
   {
     "type": "tool_call_finished",
-    "call_id": "toolu_01TziTKp5giZCZcVWLWpUsCW",
+    "call_id": "toolu_01KcCLUXVnMX1krUHYZsG3yS",
     "status": "denied",
     "output": null,
-    "error": "commands are not allowed here"
+    "error": "commands are not allowed here",
+    "truncated_bytes": 0
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
       "output_tokens": 87,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 6794,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 7398,
       "reasoning_tokens": 0,
       "cost_usd": null
     }
@@ -75,228 +144,166 @@
     "windows": [
       {
         "name": "5h",
-        "used_percent": 39.0,
-        "resets_at_ms": 1792918200000
+        "used_percent": 77.0,
+        "resets_at_ms": 1794522000000
       },
       {
         "name": "weekly",
-        "used_percent": 16.0,
-        "resets_at_ms": 1793498400000
+        "used_percent": 64.0,
+        "resets_at_ms": 1794708000000
       }
     ]
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
     "text": "It didn't work. The command"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": " was bl"
+    "text": " never"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": "ocked before"
+    "text": " ran:"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": " it ran:"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
     "text": " a PreToolUse h"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": "ook retur"
+    "text": "ook blocked it with \""
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": "ned \""
+    "text": "Denied by Atrium polic"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": "Denied by Atrium"
+    "text": "y: commands are not allow"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": " policy: commands are not all"
+    "text": "ed here.\" So `vict"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": "owed here.\""
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": " So `vict"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
     "text": "im.txt` was"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": " not remov"
+    "text": " not deleted, and I can"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": "ed. I didn't ret"
+    "text": "'t t"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": "ry,"
+    "text": "ell from this wh"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": " since the"
+    "text": "ether the"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": " den"
+    "text": " file ex"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": "ial is a policy block"
+    "text": "ists. I didn't try any"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": " rather than a trans"
+    "text": " workaround, since the polic"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": "ient error. If you need"
+    "text": "y blocks Bash comm"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": " the file remov"
+    "text": "ands in this wor"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": "ed, that"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": " will"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": " have"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": " to be done"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": " out"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": "side this session"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": " or"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": " the"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": " policy chang"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
-    "kind": "assistant",
-    "text": "ed."
+    "text": "ktree."
   },
   {
     "type": "message_completed",
-    "message_id": "msg_011CgNKVEj466oSPvJbrncDx:0",
+    "message_id": "msg_011Cgyd5YdshBgxymYEjMk2G:0",
     "kind": "assistant",
-    "text": "It didn't work. The command was blocked before it ran: a PreToolUse hook returned \"Denied by Atrium policy: commands are not allowed here.\" So `victim.txt` was not removed. I didn't retry, since the denial is a policy block rather than a transient error. If you need the file removed, that will have to be done outside this session or the policy changed."
-  },
-  {
-    "type": "usage",
-    "usage": {
-      "input_tokens": 4,
-      "output_tokens": 200,
-      "cache_read_tokens": 57624,
-      "cache_write_tokens": 6949,
-      "reasoning_tokens": 0,
-      "cost_usd": null
+    "body": {
+      "type": "streamed",
+      "chars": 300,
+      "deltas": 19,
+      "sha256": "f0556771a3790fb07fbbf6b41f30c34ce3bc136e57f63a11251260e54a651ff6"
     }
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 200,
-      "cache_read_tokens": 57624,
-      "cache_write_tokens": 6949,
+      "output_tokens": 193,
+      "cache_read_tokens": 58344,
+      "cache_write_tokens": 7553,
       "reasoning_tokens": 0,
-      "cost_usd": 0.00206644
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 33134,
+    "window_tokens": 1000000
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 193,
+      "cache_read_tokens": 58344,
+      "cache_write_tokens": 7553,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00219094
     }
   },
   {
@@ -305,11 +312,11 @@
     "outcome": "completed",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 200,
-      "cache_read_tokens": 57624,
-      "cache_write_tokens": 6949,
+      "output_tokens": 193,
+      "cache_read_tokens": 58344,
+      "cache_write_tokens": 7553,
       "reasoning_tokens": 0,
-      "cost_usd": 0.00206644
+      "cost_usd": 0.00219094
     }
   },
   {

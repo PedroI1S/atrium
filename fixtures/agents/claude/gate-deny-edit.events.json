@@ -2,7 +2,7 @@
   {
     "type": "session_started",
     "provider": "claude",
-    "native_session_id": "892e7971-c45b-41b6-90df-c842a3a6543f",
+    "native_session_id": "62c53612-bd3d-4503-b898-c637f655b5ec",
     "model": "claude-haiku-5-5",
     "tools": [
       "Task",
@@ -32,41 +32,110 @@
       "Skill",
       "TaskStop",
       "ToolSearch",
-      "WebFetch",
       "WebSearch",
       "Write"
-    ]
+    ],
+    "enforcement": {
+      "level": "full",
+      "reasons": [],
+      "provider": "claude",
+      "cli_version": "2.1.308",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-edit"
+        },
+        {
+          "class": "delete",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "move",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "search",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "execute",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-exec"
+        },
+        {
+          "class": "fetch",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-fetch"
+        },
+        {
+          "class": "mcp",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-mcp"
+        },
+        {
+          "class": "subagent",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-subagent"
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/mcp-allow"
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Use the Write tool to create a file named made.txt that contains the word hello."
+    }
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "toolu_01RvYH9FANq4t31CU7bkHNye",
+    "call_id": "toolu_01CUKCTBG3WDoGDMeyj4X8gT",
     "name": "Write",
     "kind": "edit",
-    "title": "~/Documents/atrium-wt/M0-01-claude-adapter/.orchestration/scratch/record/gate-deny-edit/made.txt",
+    "title": "~/atrium-wt/M1-07-claude-adapter/.orchestration/scratch/record/gate-deny-edit/made.txt",
     "input": {
-      "file_path": "~/Documents/atrium-wt/M0-01-claude-adapter/.orchestration/scratch/record/gate-deny-edit/made.txt",
-      "content": "hello"
+      "file_path": "~/atrium-wt/M1-07-claude-adapter/.orchestration/scratch/record/gate-deny-edit/made.txt",
+      "content": "hello\n"
     }
   },
   {
     "type": "tool_call_finished",
-    "call_id": "toolu_01RvYH9FANq4t31CU7bkHNye",
+    "call_id": "toolu_01CUKCTBG3WDoGDMeyj4X8gT",
     "status": "denied",
     "output": null,
-    "error": "writing files is not allowed here"
+    "error": "writing files is not allowed here",
+    "truncated_bytes": 0
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
-      "output_tokens": 190,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 6738,
-      "reasoning_tokens": 64,
+      "output_tokens": 122,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 7366,
+      "reasoning_tokens": 0,
       "cost_usd": null
     }
   },
@@ -75,276 +144,256 @@
     "windows": [
       {
         "name": "5h",
-        "used_percent": 11.0,
-        "resets_at_ms": 1792918200000
+        "used_percent": 77.0,
+        "resets_at_ms": 1794522000000
       },
       {
         "name": "weekly",
-        "used_percent": 12.0,
-        "resets_at_ms": 1793498400000
+        "used_percent": 64.0,
+        "resets_at_ms": 1794708000000
       }
     ]
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
     "text": "I cou"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
     "text": "ldn't create `made.tx"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "t`. A PreTool"
+    "text": "t`. A p"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "Use hook denied the"
+    "text": "re-write"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " Write call"
+    "text": " hook r"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " with:"
+    "text": "ejected the"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " `Denied by Atr"
+    "text": " Write with"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "ium policy: writing files is"
+    "text": ": \"Denied by At"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " not allowed here`."
+    "text": "rium policy: writing files"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "\n\nI"
+    "text": " is not allowed here.\""
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " didn't try another"
+    "text": "\n\nI haven't retried or"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " way to write the file, such as"
+    "text": " tried another"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " a"
+    "text": " way to write the file,"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " shell command, because the"
+    "text": " since"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " hook is an"
+    "text": " the policy bl"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " explicit policy block"
+    "text": "ocks file writes in"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " for"
+    "text": " this worktree. To"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " this worktree. The"
+    "text": " get the"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " worktree name"
+    "text": " file created"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " ("
+    "text": ", the policy would"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "`gate-deny-ed"
+    "text": " need to all"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "it`) suggests this is"
+    "text": "ow writ"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " the de"
+    "text": "es here, or you could"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "ny g"
+    "text": " create it yourself with"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "ate do"
+    "text": " `echo hello > made."
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "ing its job."
+    "text": "txt`"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " If you want the"
+    "text": " in `"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " file written"
+    "text": "~/"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " anyway, you'"
+    "text": "atrium-wt/M"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "d"
+    "text": "1-07-claude-ad"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " need to l"
+    "text": "apter/.orchestration"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "ift or"
+    "text": "/scratch/record/g"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " change"
+    "text": "ate-deny-edit`"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": " that policy,"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
-    "kind": "assistant",
-    "text": " or run the"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
-    "kind": "assistant",
-    "text": " write from a session"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
-    "kind": "assistant",
-    "text": " where it"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
-    "kind": "assistant",
-    "text": " do"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
-    "kind": "assistant",
-    "text": "esn't apply."
+    "text": "."
   },
   {
     "type": "message_completed",
-    "message_id": "msg_011CgNHA3mEb7o8tHQaLUPe1:1",
+    "message_id": "msg_011Cgyd4wTJ1WxaXa3JrQKYo:1",
     "kind": "assistant",
-    "text": "I couldn't create `made.txt`. A PreToolUse hook denied the Write call with: `Denied by Atrium policy: writing files is not allowed here`.\n\nI didn't try another way to write the file, such as a shell command, because the hook is an explicit policy block for this worktree. The worktree name (`gate-deny-edit`) suggests this is the deny gate doing its job. If you want the file written anyway, you'd need to lift or change that policy, or run the write from a session where it doesn't apply."
-  },
-  {
-    "type": "usage",
-    "usage": {
-      "input_tokens": 4,
-      "output_tokens": 455,
-      "cache_read_tokens": 57568,
-      "cache_write_tokens": 6996,
-      "reasoning_tokens": 165,
-      "cost_usd": null
+    "body": {
+      "type": "streamed",
+      "chars": 460,
+      "deltas": 34,
+      "sha256": "4128b2aa7eaefd5a22ae91bbd57f43c72c4be3963e341d25e026d52da94d4bf0"
     }
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 455,
-      "cache_read_tokens": 57568,
-      "cache_write_tokens": 6996,
-      "reasoning_tokens": 165,
-      "cost_usd": 0.00220278
+      "output_tokens": 446,
+      "cache_read_tokens": 58312,
+      "cache_write_tokens": 7556,
+      "reasoning_tokens": 150,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 33355,
+    "window_tokens": 1000000
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 446,
+      "cache_read_tokens": 58312,
+      "cache_write_tokens": 7556,
+      "reasoning_tokens": 150,
+      "cost_usd": 0.0023177199999999997
     }
   },
   {
@@ -353,11 +402,11 @@
     "outcome": "completed",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 455,
-      "cache_read_tokens": 57568,
-      "cache_write_tokens": 6996,
-      "reasoning_tokens": 165,
-      "cost_usd": 0.00220278
+      "output_tokens": 446,
+      "cache_read_tokens": 58312,
+      "cache_write_tokens": 7556,
+      "reasoning_tokens": 150,
+      "cost_usd": 0.0023177199999999997
     }
   },
   {

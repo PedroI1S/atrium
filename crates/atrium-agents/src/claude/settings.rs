@@ -233,7 +233,7 @@ pub fn inspect(input: &InspectInput<'_>) -> Inspection {
         plugin_source(&mut out, input.env, &id, dir);
     }
     for dir in plugin_dirs {
-        let id = dir.display().to_string();
+        let id = display_path(&dir, input.env);
         plugin_source(&mut out, input.env, &id, Some(dir));
     }
     out
