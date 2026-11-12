@@ -111,7 +111,7 @@ fn an_exact_rule_never_matches_a_longer_argv() {
         assert!(!matches!(v, PolicyVerdict::Allow { .. }), "{line:?}: {}", classify(&v));
     }
     // and the same rule never allows another command with the same words
-    for line in ["ls rm -rf build", "echo rm -rf build", "git rm -rf build"] {
+    for line in ["touch rm -rf build", "echo rm -rf build", "git rm -rf build"] {
         let v = env.cmd_rules(line, &rules);
         assert!(!matches!(v, PolicyVerdict::Allow { .. }), "{line:?}");
     }
