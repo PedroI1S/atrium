@@ -20,7 +20,7 @@ pub enum Role {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CwdState {
-    Known(PathBuf),
+    Known(Vec<PathBuf>),
     /// After a `cd` the gate can't follow: every directory the command could
     /// be in (home, the start, every directory seen so far).
     Unknown(Vec<PathBuf>),
@@ -29,8 +29,7 @@ pub enum CwdState {
 impl CwdState {
     pub fn candidates(&self) -> Vec<&PathBuf> {
         match self {
-            CwdState::Known(p) => vec![p],
-            CwdState::Unknown(v) => v.iter().collect(),
+            CwdState::Known(v) | CwdState::Unknown(v) => v.iter().collect(),
         }
     }
     pub fn is_unknown(&self) -> bool {
@@ -482,6 +481,7 @@ fn raw_words_of(unit: &Unit) -> Vec<(String, Role)> {
 fn apply_cd(
     unit: &Unit,
     state: &mut CwdState,
+    current: &mut Option<PathBuf>,
     prev: &mut Option<PathBuf>,
     seen: &mut Vec<PathBuf>,
     start: &Path,
@@ -499,10 +499,15 @@ fn apply_cd(
     }
     let make_unknown = |seen: &Vec<PathBuf>| {
         let mut c = vec![home.to_path_buf(), start.to_path_buf()];
-        c.extend(seen.iter().cloned());
+        for s in seen {
+            if !c.contains(s) {
+                c.push(s.clone());
+            }
+        }
         CwdState::Unknown(c)
     };
-    if unit.grouped || name == "popd" {
+    if name == "popd" {
+        *current = None;
         *state = make_unknown(seen);
         *unknown = true;
         return;
@@ -515,57 +520,87 @@ fn apply_cd(
             break;
         }
     }
-    let current = match state {
-        CwdState::Known(p) => Some(p.clone()),
-        CwdState::Unknown(_) => None,
-    };
-    let target: Option<PathBuf> = match args.as_slice() {
-        [] if name == "pushd" => None,
-        [] => Some(home.to_path_buf()),
-        [a] if a.as_str() == "-" => prev.clone(),
+    let targets: Vec<PathBuf> = match args.as_slice() {
+        [] if name == "pushd" => vec![],
+        [] => vec![home.to_path_buf()],
+        [a] if a.as_str() == "-" => prev.clone().into_iter().collect(),
         [a] => {
             let expanded = expand_home(a, home, current.as_deref().unwrap_or(start));
             if has_unknown_var(&expanded) || expanded.contains(['*', '?', '[']) {
-                None
+                vec![]
             } else if Path::new(&expanded).is_absolute() {
-                Some(resolve(&expanded, start, home))
+                vec![resolve(&expanded, start, home)]
             } else {
-                current.as_ref().map(|c| resolve(&expanded, c, home))
+                let mut v = vec![];
+                if let Some(c) = current.as_ref() {
+                    v.push(resolve(&expanded, c, home));
+                }
+                for base_dir in [Some(start), prev.as_deref()].into_iter().flatten() {
+                    let p = resolve(&expanded, base_dir, home);
+                    if (!expanded.starts_with("..") || p.starts_with(home) || p.starts_with(start))
+                        && !v.contains(&p)
+                    {
+                        v.push(p);
+                    }
+                }
+                v
             }
         }
-        _ => None,
+        _ => vec![],
     };
-    match target {
-        Some(t) => {
-            *prev = current.or_else(|| prev.take());
-            if !seen.contains(&t) {
-                seen.push(t.clone());
-            }
-            if seen.len() > MAX_CANDIDATES {
-                *overflow = true;
-            }
-            *state = CwdState::Known(t);
+    if targets.is_empty() {
+        *current = None;
+        *state = make_unknown(seen);
+        *unknown = true;
+        return;
+    }
+    let primary = targets[0].clone();
+    for t in targets {
+        if !seen.contains(&t) {
+            seen.push(t);
         }
-        None => {
-            *state = make_unknown(seen);
-            *unknown = true;
-        }
+    }
+    if seen.len() > MAX_CANDIDATES {
+        *overflow = true;
+    }
+    *prev = current.take().or_else(|| prev.take());
+    *current = Some(primary);
+    if unit.grouped || *unknown {
+        *state = make_unknown(seen);
+        *unknown = true;
+    } else {
+        *state = CwdState::Known(seen.clone());
     }
 }
 
 pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) -> Walk {
     let mut w = Walk::default();
-    let mut state = CwdState::Known(start.to_path_buf());
+    let mut state = CwdState::Known(vec![start.to_path_buf()]);
+    let mut current: Option<PathBuf> = Some(start.to_path_buf());
     let mut prev: Option<PathBuf> = None;
     let mut seen: Vec<PathBuf> = vec![start.to_path_buf()];
     for (i, unit) in units.iter().enumerate() {
         w.unit_cwd.push(state.clone());
         for (word, role) in words_of(unit, &mut w.overflow) {
-            let paths: Vec<PathBuf> = state
+            let mut paths: Vec<PathBuf> = state
                 .candidates()
                 .into_iter()
                 .map(|c| resolve(&word, c, home))
                 .collect();
+            if seen.len() > 1 && word.starts_with("..") {
+                let rem: PathBuf = Path::new(&word)
+                    .components()
+                    .skip_while(|c| matches!(c, Component::ParentDir | Component::CurDir))
+                    .collect();
+                if let Some(rem_s) = rem.to_str().filter(|s| !s.is_empty()) {
+                    for base_dir in [start, home] {
+                        let p = resolve(rem_s, base_dir, home);
+                        if !paths.contains(&p) {
+                            paths.push(p);
+                        }
+                    }
+                }
+            }
             w.total += paths.len();
             if w.uses.len() >= MAX_USES || w.total > MAX_PATHS {
                 w.overflow = true;
@@ -581,6 +616,7 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
         apply_cd(
             unit,
             &mut state,
+            &mut current,
             &mut prev,
             &mut seen,
             start,

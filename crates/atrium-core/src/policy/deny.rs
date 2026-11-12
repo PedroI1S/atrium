@@ -774,7 +774,7 @@ impl Ctx<'_> {
                 .unit_cwd
                 .get(i)
                 .cloned()
-                .unwrap_or(CwdState::Known(self.a.start.clone()));
+                .unwrap_or_else(|| CwdState::Known(vec![self.a.start.clone()]));
             for c in cwd.candidates() {
                 out.push(lexical_resolve(word, c, self.home()));
             }

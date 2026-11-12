@@ -765,20 +765,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             }
             seen_pipes.push(u.pipe);
             for prev in out.units.iter().filter(|p| p.pipe == u.pipe) {
-                if prev
-                    .eff
-                    .first()
-                    .is_some_and(|f| matches!(base(f), "echo" | "printf"))
-                {
-                    texts.push(
-                        prev.eff[1..]
-                            .iter()
-                            .filter(|a| !a.starts_with('-'))
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    );
-                }
+                echo_printf_texts(&prev.eff, &mut texts);
             }
         }
     }
@@ -1084,17 +1071,173 @@ pub fn reads_stdin_as_script(eff: &[String]) -> bool {
 }
 
 /// The string a shell or `eval` will run, if the command has one.
+fn unescape_printf_to(s: &str, out: &mut String) {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek().copied() {
+                Some('n') => {
+                    chars.next();
+                    out.push('\n');
+                }
+                Some('t') => {
+                    chars.next();
+                    out.push('\t');
+                }
+                Some('r') => {
+                    chars.next();
+                    out.push('\r');
+                }
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+fn format_printf(fmt: &str, args: &[String]) -> String {
+    let mut out = String::new();
+    if args.is_empty() {
+        unescape_printf_to(fmt, &mut out);
+        return out;
+    }
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let before = idx;
+        let mut chars = fmt.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.peek().copied() {
+                    Some('n') => {
+                        chars.next();
+                        out.push('\n');
+                    }
+                    Some('t') => {
+                        chars.next();
+                        out.push('\t');
+                    }
+                    Some('r') => {
+                        chars.next();
+                        out.push('\r');
+                    }
+                    Some('\\') => {
+                        chars.next();
+                        out.push('\\');
+                    }
+                    _ => out.push('\\'),
+                }
+            } else if c == '%' {
+                if chars.peek() == Some(&'%') {
+                    chars.next();
+                    out.push('%');
+                } else {
+                    while let Some(&p) = chars.peek() {
+                        if matches!(p, '-' | '+' | ' ' | '#' | '.' | '0'..='9') {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    let conv = chars.next();
+                    if let Some(arg) = args.get(idx) {
+                        if conv == Some('b') {
+                            unescape_printf_to(arg, &mut out);
+                        } else {
+                            out.push_str(arg);
+                        }
+                        idx += 1;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        if idx == before {
+            break;
+        }
+    }
+    out
+}
+
+fn echo_printf_texts(eff: &[String], texts: &mut Vec<String>) {
+    let Some(first) = eff.first() else {
+        return;
+    };
+    match base(first) {
+        "echo" => {
+            let mut j = 1;
+            while j < eff.len() {
+                let w = eff[j].as_str();
+                if w.starts_with('-')
+                    && w.len() > 1
+                    && w[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E'))
+                {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j < eff.len() {
+                let joined = eff[j..].join(" ");
+                if joined.contains("\\n") {
+                    let mut unesc = String::new();
+                    unescape_printf_to(&joined, &mut unesc);
+                    texts.push(unesc);
+                }
+                texts.push(joined);
+            }
+        }
+        "printf" => {
+            let mut j = 1;
+            while j < eff.len() {
+                let w = eff[j].as_str();
+                if w == "--" {
+                    j += 1;
+                    break;
+                } else if w == "-v" {
+                    j += 2;
+                } else {
+                    break;
+                }
+            }
+            if j < eff.len() {
+                let rest = &eff[j..];
+                let formatted = format_printf(&rest[0], &rest[1..]);
+                texts.push(formatted);
+                if rest.len() > 1 {
+                    texts.push(rest[1..].join(" "));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn payload_of(eff: &[String]) -> Option<String> {
     let first = base(eff.first()?);
     if is_shell(eff.first()?) {
+        let mut has_c = false;
         let mut j = 1;
         while j < eff.len() {
             let w = &eff[j];
             if w == "--" {
+                j += 1;
                 break;
             }
-            if w.starts_with('-') && !w.starts_with("--") && w[1..].contains('c') {
-                return eff.get(j + 1).cloned();
+            if (w.starts_with('-') && !w.starts_with("--") && w[1..].contains('c'))
+                || w == "--command"
+            {
+                has_c = true;
+                j += 1;
+                continue;
+            }
+            if let Some(rest) = w.strip_prefix("--command=") {
+                return Some(rest.to_string());
             }
             if matches!(w.as_str(), "-o" | "+o" | "-O" | "+O") {
                 j += 2;
@@ -1106,10 +1249,18 @@ fn payload_of(eff: &[String]) -> Option<String> {
             }
             break;
         }
+        if has_c {
+            return eff.get(j).cloned();
+        }
         None
     } else if first == "eval" {
-        if eff.len() > 1 {
-            Some(eff[1..].join(" "))
+        let args = if eff.get(1).map(String::as_str) == Some("--") {
+            &eff[2..]
+        } else {
+            &eff[1..]
+        };
+        if !args.is_empty() {
+            Some(args.join(" "))
         } else {
             None
         }

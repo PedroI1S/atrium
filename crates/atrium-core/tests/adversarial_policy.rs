@@ -895,17 +895,18 @@ fn unresolved_inputs_never_reach_allow_in_home() {
 }
 
 #[test]
-#[ignore = "M1-13 finding 1"]
 fn finding_1_cd_in_a_subshell_or_pipeline_is_followed() {
     hard_everywhere(&[
         "(cd .ssh; cat id_rsa)",
         "(cd .ssh); cat id_rsa",
         "cd .ssh | cat id_rsa",
+        "(cd .aws && cat credentials)",
+        "(cd .gnupg; gpg --export-secret-keys)",
+        "cd .ssh | xargs cat id_rsa",
     ]);
 }
 
 #[test]
-#[ignore = "M1-13 finding 2"]
 fn finding_2_a_failing_cd_does_not_move_the_directory() {
     hard_everywhere(&[
         "cd nope; cat .ssh/id_rsa",
@@ -924,7 +925,6 @@ fn finding_2_a_failing_cd_does_not_move_the_directory() {
 /// The same through ordinary prefix rules a user could have made in settings
 /// (`cd` and `cat` allowed): finding 2 gives Allow, no `Any` rule needed.
 #[test]
-#[ignore = "M1-13 finding 2"]
 fn finding_2_with_plain_prefix_rules_a_failing_cd_reaches_allow() {
     let env = Env::home();
     let rules = vec![
@@ -971,20 +971,76 @@ fn finding_4_ansi_c_quoted_words_are_decoded() {
 }
 
 #[test]
-#[ignore = "M1-13 finding 7"]
 fn finding_7_a_shell_payload_after_double_dash_is_read() {
-    hard_everywhere(&["sh -c -- 'rm -rf ~'", "bash -c -- 'rm -rf ~'"]);
+    hard_everywhere(&[
+        "sh -c -- 'rm -rf ~'",
+        "bash -c -- 'rm -rf ~'",
+        "zsh -lc -- 'cat ~/.ssh/id_rsa'",
+        "dash -e -c -- 'rm -rf ~'",
+        "bash --command -- 'cat ~/.aws/credentials'",
+        "eval -- 'rm -rf ~'",
+    ]);
+    let env = Env::home();
+    run_table(
+        &env,
+        &[
+            ("sh -c -- 'rm -rf ~'", Hard(RD)),
+            ("bash -c -- 'rm -rf ~'", Hard(RD)),
+            ("zsh -lc -- 'cat ~/.ssh/id_rsa'", Hard(CR)),
+            ("eval -- 'cat ~/.npmrc'", Hard(CR)),
+            ("sh -c -- 'echo ok'", Ask),
+            ("bash -lc -- 'cargo test'", Ask),
+            ("eval -- 'echo ok'", Ask),
+        ],
+    );
 }
 
 #[test]
-#[ignore = "M1-13 finding 8"]
 fn finding_8_echo_and_printf_text_piped_to_a_shell_is_read_whole() {
     hard_everywhere(&[
         "echo rm -rf ~ | sh",
         "echo rm -rf ~ | bash",
+        "echo -e rm -rf ~ | sh",
+        "echo -n rm -rf ~ | zsh",
         "printf '%s' 'rm -rf ~' | bash",
         "printf '%s\\n' 'rm -rf ~' | sh",
+        "printf '%s %s %s\\n' rm -rf ~ | sh",
+        "printf '%b\\n' 'cat ~/.ssh/id_rsa' | sh",
+        "printf -- '%s\\n' 'rm -rf ~' | bash",
     ]);
+    let env = Env::home();
+    run_table(
+        &env,
+        &[
+            ("echo rm -rf ~ | sh", Hard(RD)),
+            ("echo -n rm -rf ~ | bash", Hard(RD)),
+            ("printf '%s' 'rm -rf ~' | bash", Hard(RD)),
+            ("printf '%s\\n' 'rm -rf ~' | sh", Hard(RD)),
+            ("printf '%s %s\\n' cat '~/.ssh/id_rsa' | sh", Hard(CR)),
+            ("echo cargo test | sh", Ask),
+            ("printf '%s\\n' 'cargo test' | bash", Ask),
+            ("echo -n hello", Ask),
+        ],
+    );
+}
+
+#[test]
+fn findings_1_and_2_table() {
+    let env = Env::home();
+    run_table(
+        &env,
+        &[
+            ("(cd .ssh; cat id_rsa)", Hard(CR)),
+            ("(cd .ssh); cat id_rsa", Hard(CR)),
+            ("cd .ssh | cat id_rsa", Hard(CR)),
+            ("cd nope; cat .ssh/id_rsa", Hard(CR)),
+            ("cd nope || cat .ssh/id_rsa", Hard(CR)),
+            ("cd -P nope; cat .ssh/id_rsa", Hard(CR)),
+            ("(cd proj && cargo test)", Ask),
+            ("cd proj && rm -rf build", Ask),
+            ("cd proj && cat README.md", Ask),
+        ],
+    );
 }
 
 #[test]
