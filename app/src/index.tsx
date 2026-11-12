@@ -9,6 +9,7 @@ import "@fontsource/geist-mono/latin-500.css";
 import "./styles/base.css";
 import "./styles/calm.css";
 import "./styles/shell.css";
+import "./styles/chat.css";
 import { App } from "./App";
 import { attach, daemon } from "./daemon/client";
 import { epochNow, markOnce, reportFailure, runHarness, setStage } from "./harness";

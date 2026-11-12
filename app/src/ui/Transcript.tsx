@@ -194,7 +194,8 @@ function RowView(props: { threadId: string; row: Row; tick: () => number }) {
     <Switch>
       <Match when={props.row.type === "block" && props.row}>{(r) => <BlockRow item={r().item} block={r().block} tick={props.tick} />}</Match>
       <Match when={props.row.type === "user" && props.row}>{(r) => <UserRow item={r().item} tick={props.tick} />}</Match>
-      <Match when={props.row.type === "tool" && props.row}>{(r) => <ToolRow item={r().item} tick={props.tick} />}</Match>
+      {/* Keyed: a row element reused for another call starts closed. */}
+      <Match when={props.row.type === "tool" && props.row.item} keyed>{(item) => <ToolRow item={item as ToolItem} tick={props.tick} />}</Match>
       <Match when={props.row.type === "request" && props.row}>{(r) => <RequestRow threadId={props.threadId} item={r().item} tick={props.tick} />}</Match>
       <Match when={props.row.type === "note" && props.row.item} keyed>{(item) => <NoteRow item={item as NoteItem} />}</Match>
     </Switch>
@@ -254,31 +255,34 @@ export function TranscriptView(props: { model: ThreadModel; viewKey: string; emp
 
   const items = createMemo(() => virt.getVirtualItems());
   return (
-    <div class="thread-scroll" ref={scroller} tabindex="0" role="log" aria-label="Conversation" data-atrium-part="transcript"
-      onScroll={onScroll} onWheel={onWheel} onPointerDown={(e) => { if (e.target === scroller) unfollow(); }} onTouchMove={unfollow} onKeyDown={onKey}>
-      <Show when={rows().length} fallback={props.empty}>
-        <Show when={t().truncated && !t().hasOlder}>
-          <p class="history-note">Older messages of this chat are kept by Atrium's background service but not loaded here. Export the chat to read all of it.</p>
-        </Show>
-        <div class="thread-sizer" style={{ height: `${virt.getTotalSize()}px` }}>
-          <Index each={items()}>
-            {(v) => {
-              const row = () => rows()[v().index];
-              let el!: HTMLDivElement;
-              // A reused row element shows another index: measure it again once it has rendered.
-              createEffect(on(() => row(), () => queueMicrotask(() => el.isConnected && virt.measureElement(el))));
-              return (
-                <div class="thread-row" data-index={v().index} ref={el} style={{ transform: `translateY(${v().start}px)` }}>
-                  <div class="col">
-                    <Show when={row()}>{(r) => <RowView threadId={props.model.threadId} row={r()} tick={props.model.tick} />}</Show>
+    <div class="thread-view">
+      <div class="thread-scroll" ref={scroller} tabindex="0" role="log" aria-label="Conversation" data-atrium-part="transcript"
+        onScroll={onScroll} onWheel={onWheel} onPointerDown={(e) => { if (e.target === scroller) unfollow(); }} onTouchMove={unfollow} onKeyDown={onKey}>
+        <Show when={rows().length} fallback={props.empty}>
+          <Show when={t().truncated && !t().hasOlder}>
+            <p class="history-note">Older messages of this chat are kept by Atrium's background service but not loaded here. Export the chat to read all of it.</p>
+          </Show>
+          <div class="thread-sizer" style={{ height: `${virt.getTotalSize()}px` }}>
+            <Index each={items()}>
+              {(v) => {
+                const row = () => rows()[v().index];
+                let el!: HTMLDivElement;
+                // A reused row element shows another row: register it with the virtualizer again
+                // once it has rendered (its size is then followed by the virtualizer's observer).
+                createEffect(on(() => row()?.key, () => queueMicrotask(() => el.isConnected && virt.measureElement(el))));
+                return (
+                  <div class="thread-row" data-index={v().index} data-row={row()?.type} ref={el} style={{ transform: `translateY(${v().start}px)` }}>
+                    <div class="col">
+                      <Show when={row()}>{(r) => <RowView threadId={props.model.threadId} row={r()} tick={props.model.tick} />}</Show>
+                    </div>
                   </div>
-                </div>
-              );
-            }}
-          </Index>
-        </div>
-      </Show>
-      <Show when={!atTail() || t().detached}>
+                );
+              }}
+            </Index>
+          </div>
+        </Show>
+      </div>
+      <Show when={rows().length && (!atTail() || t().detached)}>
         <button type="button" class="to-tail" onClick={toTail}>
           <ArrowDown class="i sm" aria-hidden="true" />{t().detached ? `Newer messages${t().missed ? ` (${t().missed})` : ""}` : "Jump to latest"}
         </button>

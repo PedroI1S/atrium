@@ -29,7 +29,15 @@ function StateLine(props: { state: CardState }) {
   );
 }
 
-export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick: () => number; small?: boolean; autofocus?: boolean }) {
+/**
+ * A card that just appeared ignores ↵ and esc for this long, so a key already on its way to
+ * something else (the end of a sentence in the composer) never allows or denies a command.
+ */
+const ARM_AFTER_MS = 600;
+
+const typing = () => document.activeElement instanceof HTMLTextAreaElement || document.activeElement instanceof HTMLInputElement;
+
+export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick: () => number; small?: boolean; autofocus?: boolean; keys?: boolean }) {
   const state = () => (props.tick(), cardState(props.item, localOf(props.threadId, props.item)));
   const subject = () => subjectOf(props.item);
   const choices = () => rememberChoices(props.item);
@@ -37,6 +45,7 @@ export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick
   const act = () => canAct(state());
   const allow = (remember: RememberScope | null = null) => { setMenu(false); void resolveApproval(props.threadId, props.item, "allow", remember); };
   const deny = () => void resolveApproval(props.threadId, props.item, "deny");
+  const shownAt = performance.now();
   return (
     <div
       class="ask"
@@ -46,10 +55,13 @@ export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick
       data-atrium-part="approval"
       data-state={state().kind}
       tabindex="-1"
-      ref={(el) => props.autofocus && queueMicrotask(() => el.focus({ preventScroll: true }))}
+      // Focus never leaves a field the user is typing in.
+      ref={(el) => props.autofocus && queueMicrotask(() => { if (!typing()) el.focus({ preventScroll: true }); })}
       onKeyDown={(e) => {
-        if (!act() || e.target instanceof HTMLTextAreaElement) return;
-        if (e.key === "Enter" && !e.metaKey && !e.ctrlKey) { e.preventDefault(); allow(); }
+        if (props.keys === false || !act() || e.target instanceof HTMLTextAreaElement) return;
+        if (performance.now() - shownAt < ARM_AFTER_MS || e.repeat) return;
+        // ↵ on a focused button presses that button (Deny stays Deny).
+        if (e.key === "Enter" && !(e.target instanceof HTMLButtonElement) && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) { e.preventDefault(); allow(); }
         else if (e.key === "Escape") { e.preventDefault(); deny(); }
       }}
     >
@@ -161,10 +173,10 @@ export function QuestionCard(props: { threadId: string; item: QuestionItem; tick
   );
 }
 
-export function RequestCard(props: { threadId: string; item: RequestItem; tick: () => number; small?: boolean; autofocus?: boolean }) {
+export function RequestCard(props: { threadId: string; item: RequestItem; tick: () => number; small?: boolean; autofocus?: boolean; keys?: boolean }) {
   return (
     <Show when={props.item.kind === "approval"} fallback={<QuestionCard threadId={props.threadId} item={props.item as QuestionItem} tick={props.tick} small={props.small} />}>
-      <ApprovalCard threadId={props.threadId} item={props.item as ApprovalItem} tick={props.tick} small={props.small} autofocus={props.autofocus} />
+      <ApprovalCard threadId={props.threadId} item={props.item as ApprovalItem} tick={props.tick} small={props.small} autofocus={props.autofocus} keys={props.keys} />
     </Show>
   );
 }

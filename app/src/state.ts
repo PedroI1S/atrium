@@ -21,7 +21,7 @@ export function setPanel(next: { open?: boolean; tab?: PanelTab }): void {
 export const [sidebarWidth, setSidebarWidth] = createSignal<number | null>(null);
 export const [panelWidth, setPanelWidth] = createSignal<number | null>(null);
 
-export type SettingsSection = "general" | "appearance";
+export type SettingsSection = "general" | "appearance" | "agents" | "approvals" | "notifications";
 export const [settingsSection, setSettingsSectionSignal] = createSignal<SettingsSection>("general");
 export const [advancedOpen, setAdvancedOpen] = createSignal(false);
 export const [settingsQuery, setSettingsQuery] = createSignal<string | null>(null);
@@ -38,8 +38,10 @@ export function setScreen(s: Screen): void {
   setScreenSignal(s);
 }
 
-/** The inbox item the keyboard is on (a thread id; M1-09b drives it with J and K). */
+/** The inbox item the keyboard is on (its `itemKey`: a thread id, or `@storage_full`), moved with J and K. */
 export const [inboxPick, setInboxPick] = createSignal<string | null>(null);
+/** Which inbox items are listed (ui-direction §3 Inbox). */
+export const [inboxFilter, setInboxFilter] = createSignal<"all" | "asks" | "replies">("all");
 
 export const [paletteOpen, setPaletteOpen] = createSignal(false);
 export const [keepOnTop, setKeepOnTopSignal] = createSignal(false);
