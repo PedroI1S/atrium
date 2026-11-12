@@ -99,8 +99,12 @@ def main() -> int:
         return 2
     shots = pathlib.Path(sys.argv[1]).resolve()
     shots.mkdir(parents=True, exist_ok=True)
-    if not APP.exists():
-        raise SystemExit(f"{APP} is missing: run app/scripts/live_check.py first")
+    # Build first, as live_check.py does: a stale binary takes stale pictures.
+    subprocess.run(["pnpm", "build"], cwd=ROOT / "app", check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(
+        ["cargo", "build", "-p", "atrium-app", "--features", "custom-protocol", "-p", "atrium-daemon"],
+        cwd=ROOT, check=True,
+    )
     for name, mode in (("real", "shots"), ("refused", "shots-incompatible")):
         home = pathlib.Path(tempfile.mkdtemp(prefix="atrium-shots-", dir="/tmp"))
         home.chmod(0o700)

@@ -79,7 +79,8 @@ fn env(key: &str) -> Option<String> {
 /// written. The live check (`ATRIUM_BENCH=roundtrip…`) is not one: it tests
 /// what is written, in a throwaway `ATRIUM_HOME`.
 fn harness_run() -> bool {
-    env("ATRIUM_BENCH").is_some_and(|mode| mode.starts_with("startup")) || env("ATRIUM_WINDOWS").is_some()
+    env("ATRIUM_BENCH").is_some_and(|mode| mode.starts_with("startup"))
+        || env("ATRIUM_WINDOWS").is_some()
 }
 
 /// The pinned settings of a harness run: `ATRIUM_OPACITY` (`off`,

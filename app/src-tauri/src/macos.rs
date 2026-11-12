@@ -69,6 +69,23 @@ pub fn set_alpha(window: &tauri::WebviewWindow, alpha: f64) -> Result<f64, Strin
         .map_err(|error| error.to_string())
 }
 
+/// The window server's number for this window, for `screencapture -l`
+/// (harness screenshots, `snapshot.rs`).
+pub fn window_number(window: &tauri::WebviewWindow) -> Result<isize, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    window
+        .with_webview(move |webview| {
+            // SAFETY: as in `set_alpha`: main thread, live window, borrowed
+            // only for the closure.
+            let native = unsafe { &*webview.ns_window().cast::<objc2_app_kit::NSWindow>() };
+            let _ = sender.send(native.windowNumber());
+        })
+        .map_err(|error| error.to_string())?;
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|error| error.to_string())
+}
+
 pub fn apply_to_new_window(window: &tauri::WebviewWindow, target: NativeState) -> NativeState {
     let mut applied = NativeState::default();
     if target.vibrancy {

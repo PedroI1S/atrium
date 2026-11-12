@@ -3,7 +3,8 @@
 //! A desktop session doesn't let a script capture windows (GNOME refuses,
 //! and Wayland has no general way), so a harness run asks its own webview
 //! for a snapshot of what it shows. On Linux the app draws the whole window,
-//! controls included, so the snapshot is the window.
+//! controls included, so the snapshot is the window. On macOS the window
+//! server captures the window instead (see `take`).
 //!
 //! Only in a run that sets `ATRIUM_SHOT_DIR`, and only into that folder: the
 //! webview names the picture, never the path.
@@ -41,10 +42,15 @@ pub fn take(window: &tauri::WebviewWindow, path: PathBuf) -> Result<(), String> 
                 SnapshotOptions::NONE,
                 None::<&gtk::gio::Cancellable>,
                 move |result| {
-                    let written = result.map_err(|error| error.to_string()).and_then(|surface| {
-                        let mut file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
-                        surface.write_to_png(&mut file).map_err(|error| error.to_string())
-                    });
+                    let written = result
+                        .map_err(|error| error.to_string())
+                        .and_then(|surface| {
+                            let mut file =
+                                std::fs::File::create(&path).map_err(|error| error.to_string())?;
+                            surface
+                                .write_to_png(&mut file)
+                                .map_err(|error| error.to_string())
+                        });
                     match written {
                         Ok(()) => println!("ATRIUM_SNAPSHOT {} ok", path.display()),
                         Err(error) => println!("ATRIUM_SNAPSHOT {} error: {error}", path.display()),
@@ -55,9 +61,34 @@ pub fn take(window: &tauri::WebviewWindow, path: PathBuf) -> Result<(), String> 
         .map_err(|error| error.to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// On macOS the window server captures the window itself (`screencapture
+/// -l`), so the picture shows what the webview can't: the translucency, the
+/// vibrancy and the traffic lights. The first capture asks the user for
+/// Screen Recording permission for the app the harness runs from.
+#[cfg(target_os = "macos")]
+pub fn take(window: &tauri::WebviewWindow, path: PathBuf) -> Result<(), String> {
+    // Synchronous: the harness moves on to its next step when this returns,
+    // so the capture must be finished by then (an asynchronous one caught
+    // the next step's state).
+    let number = crate::macos::window_number(window)?;
+    let status = std::process::Command::new("/usr/sbin/screencapture")
+        .arg("-x")
+        .arg(format!("-l{number}"))
+        .arg(&path)
+        .status()
+        .map_err(|error| error.to_string())?;
+    if !status.success() || !path.is_file() {
+        let error = format!("screencapture {status}");
+        println!("ATRIUM_SNAPSHOT {} error: {error}", path.display());
+        return Err(error);
+    }
+    println!("ATRIUM_SNAPSHOT {} ok", path.display());
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn take(_window: &tauri::WebviewWindow, _path: PathBuf) -> Result<(), String> {
-    Err("screenshots from inside the app are implemented on Linux only".into())
+    Err("screenshots from inside the app are implemented on Linux and macOS only".into())
 }
 
 #[cfg(test)]

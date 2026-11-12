@@ -19,6 +19,13 @@
 .pop-bar:not(.lights) { padding-left: var(--u4); }
 .side-strip:not(.lights) { padding-top: var(--u2); }
 .pop-frame[data-platform="linux"] .pop-bar { padding-right: var(--u15); }
+/* With the sidebar hidden, the main card's header runs under the traffic lights: its title
+ * starts after them (the strip, its margin and the gap are what lies to the card's left). */
+.window[data-platform="macos"] .frame > .side-strip ~ .card.main > .head {
+  padding-left: max(var(--u5), calc(var(--traffic-light-inset) + var(--u2) - var(--u1) - var(--panel-strip-width) - var(--card-gap)));
+}
+/* The connection banner is the top row on macOS too: its text starts after the traffic lights. */
+.window[data-platform="macos"] .connbar { padding-left: calc(var(--traffic-light-inset) + var(--u1) - var(--card-gap)); }
 
 /* ---- the connection to the background service -------------------------------------------- */
 .connbar { min-height: var(--connbar-min-height); flex: none; display: flex; align-items: center; gap: var(--u25); margin: var(--u1) var(--card-gap) 0; padding: var(--u15) var(--u3); border-radius: var(--row-radius); background: var(--hover); font-size: var(--text-small); }
