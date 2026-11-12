@@ -18,6 +18,9 @@ pub struct Unit {
     pub eff: Vec<String>,
     /// Command and process substitution bodies found in this command.
     pub subs: Vec<String>,
+    /// One of `subs` is a process substitution (`<(…)` / `>(…)`), whose
+    /// output or input is another process rather than text.
+    pub proc_sub: bool,
     /// Inside parentheses, a pipeline, or otherwise not in plain sequence:
     /// a `cd` here makes the working directory unknown.
     pub grouped: bool,
@@ -45,6 +48,7 @@ struct Builder {
     argv: Vec<String>,
     redirects: Vec<Redirect>,
     subs: Vec<String>,
+    proc_sub: bool,
     piped: bool,
     grouped: bool,
     pipe: u32,
@@ -60,6 +64,7 @@ impl Builder {
             argv: vec![],
             redirects: vec![],
             subs: vec![],
+            proc_sub: false,
             piped,
             grouped,
         }
@@ -505,6 +510,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     word.push_str(&body);
                     word.push(')');
                     cur.subs.push(body);
+                    cur.proc_sub = true;
                     expansion = true;
                     i = end;
                 }
@@ -646,6 +652,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             argv,
             redirects,
             subs,
+            proc_sub,
             piped,
             grouped,
             pipe,
@@ -682,6 +689,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             seg,
             eff: eff.clone(),
             subs,
+            proc_sub,
             grouped,
             exec_roots,
             derived,
@@ -710,6 +718,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         u.eff
             .first()
             .is_some_and(|f| is_shell(base(f)) || matches!(base(f), "eval" | "source" | "."))
+            || reads_stdin_as_script(&u.eff)
     };
     if out.units.len() > MAX_UNITS {
         out.overflow = true;
@@ -736,10 +745,12 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 !u.seg
                     .argv
                     .first()
-                    .is_some_and(|w| RESERVED.contains(&w.as_str()) || w == "}" || w == ")")
+                    .is_some_and(|w| {
+                        (RESERVED.contains(&w.as_str()) && w != "!") || w == "}" || w == ")"
+                    })
                     && !reads_code(u)
                     && u.pipe == 0
-                    && u.subs.is_empty()
+                    && !u.proc_sub
                     && !u.grouped
             });
         if !clearly_text {
@@ -907,7 +918,43 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                     1
                 }
             }
-            "command" | "setsid" => skip(&a, &[], &[]),
+            "command" | "setsid" | "unbuffer" => skip(&a, &[], &[]),
+            "caffeinate" => skip(&a, &["-t", "-w"], &[]),
+            "arch" => skip(&a, &["-e", "-d"], &[]),
+            "sandbox-exec" => skip(&a, &["-f", "-n", "-p", "-D"], &[]),
+            "chroot" => {
+                // `chroot [opts] NEWROOT [COMMAND…]`; without a command it
+                // starts a shell (see `reads_stdin_as_script`).
+                let j = skip(&a, &["--userspec", "--groups"], &[]);
+                if j + 1 < a.len() { j + 1 } else { 0 }
+            }
+            "flock" => {
+                // `flock [opts] FILE COMMAND…`, or `flock FILE -c 'string'`
+                // (the string runs through a shell).
+                if let Some(c) = a.iter().position(|w| matches!(w.as_str(), "-c" | "--command"))
+                    && let Some(cmd) = a.get(c + 1).cloned()
+                {
+                    a = vec!["sh".into(), "-c".into(), cmd];
+                    continue;
+                }
+                let j = skip(
+                    &a,
+                    &["-w", "-E", "--timeout", "--wait", "--conflict-exit-code"],
+                    &[],
+                );
+                if j + 1 < a.len() { j + 1 } else { 0 }
+            }
+            "script" => {
+                // macOS `script [opts] FILE [COMMAND…]`; Linux `script -c CMD`
+                if let Some(c) = a.iter().position(|w| matches!(w.as_str(), "-c" | "--command"))
+                    && let Some(cmd) = a.get(c + 1).cloned()
+                {
+                    a = vec!["sh".into(), "-c".into(), cmd];
+                    continue;
+                }
+                let j = skip(&a, &["-F", "-t", "-T", "-I", "-O", "-B", "-E", "-m"], &[]);
+                if j + 1 < a.len() { j + 1 } else { 0 }
+            }
             "busybox" | "toybox" => 1,
             "exec" => skip(&a, &["-a"], &[]),
             "nice" => skip(&a, &["-n"], &[]),
@@ -932,12 +979,25 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                     }
                     if matches!(w, "-u" | "-C" | "--unset" | "--chdir") {
                         j += 2;
-                    } else if w == "-S" || w == "--split-string" {
-                        // the next word is a command line: splice its words in
-                        if let Some(s) = a.get(j + 1).cloned() {
-                            let words: Vec<String> =
-                                s.split_whitespace().map(str::to_string).collect();
-                            a.splice(j..j + 2, words);
+                    } else if w == "-P" || w == "--default-signal-path" {
+                        j += 2;
+                    } else if w == "-S"
+                        || w == "--split-string"
+                        || w.starts_with("--split-string=")
+                        || (w.starts_with("-S") && !w.starts_with("--"))
+                    {
+                        // a command line: splice its words in, split like a shell
+                        let (text, width) = if w == "-S" || w == "--split-string" {
+                            (a.get(j + 1).cloned(), 2)
+                        } else if let Some(v) = w.strip_prefix("--split-string=") {
+                            (Some(v.to_string()), 1)
+                        } else {
+                            (Some(w[2..].to_string()), 1)
+                        };
+                        if let Some(text) = text {
+                            let words = split_words(&text);
+                            let end = (j + width).min(a.len());
+                            a.splice(j..end, words);
                         } else {
                             j += 1;
                         }
@@ -963,22 +1023,72 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
     a
 }
 
+/// Splits a string into words the way a shell would (quotes, escapes);
+/// assignments stay words. Used for `env -S`.
+fn split_words(text: &str) -> Vec<String> {
+    let l = lex(text);
+    match l.units.into_iter().find(|u| !u.derived) {
+        Some(u) => {
+            let mut w: Vec<String> = u
+                .seg
+                .assignments
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            w.extend(u.seg.argv);
+            w
+        }
+        None => text.split_whitespace().map(str::to_string).collect(),
+    }
+}
+
 fn is_assignment_word(w: &str) -> bool {
     w.split_once('=').is_some_and(|(n, _)| is_name(n))
 }
 
 const SHELLS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh",
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh", "mksh", "yash", "rbash",
+    "posh", "elvish", "xonsh",
 ];
 
+/// A shell by name, or a command word that starts with `$` or a backtick
+/// (`$SHELL`, `${SHELL}`, `` `which bash` ``): its value is only known at run
+/// time, so it is assumed to be a shell.
 pub fn is_shell(cmd: &str) -> bool {
-    SHELLS.contains(&base(cmd))
+    let b = base(cmd);
+    SHELLS.contains(&b) || cmd.starts_with('$') || cmd.starts_with('`')
+}
+
+/// Commands that run their standard input as a script of commands without
+/// being a shell: `at`, `batch`, `crontab -`, `make -f -`, `script`.
+pub fn reads_stdin_as_script(eff: &[String]) -> bool {
+    let Some(first) = eff.first() else {
+        return false;
+    };
+    let args = &eff[1..];
+    match base(first) {
+        "at" | "batch" => !args.iter().any(|a| a == "-f" || a.starts_with("-f")),
+        "script" => true,
+        "chroot" => {
+            // without a command, `chroot NEWROOT` starts a shell
+            args.iter().filter(|a| !a.starts_with('-')).count() <= 1
+        }
+        "crontab" => args.iter().any(|a| a == "-"),
+        "make" | "gmake" => args.iter().enumerate().any(|(i, a)| {
+            a == "-f-"
+                || a == "--file=-"
+                || a == "--makefile=-"
+                || (matches!(a.as_str(), "-f" | "--file" | "--makefile")
+                    && args.get(i + 1).is_some_and(|n| n == "-"))
+        }),
+        _ => false,
+    }
 }
 
 /// The string a shell or `eval` will run, if the command has one.
 fn payload_of(eff: &[String]) -> Option<String> {
     let first = base(eff.first()?);
-    if SHELLS.contains(&first) {
+    if is_shell(eff.first()?) {
         let mut j = 1;
         while j < eff.len() {
             let w = &eff[j];
@@ -1062,6 +1172,7 @@ fn find_exec_units(eff: &[String], units: &mut Vec<Unit>) {
                     },
                     eff: e,
                     subs: vec![],
+                    proc_sub: false,
                     grouped: true,
                     exec_roots: Some(roots.clone()),
                     derived: true,

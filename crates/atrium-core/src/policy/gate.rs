@@ -137,6 +137,33 @@ fn identity(_: &Path) -> Option<(u64, u64)> {
     None
 }
 
+/// Like [`identity`] but does not follow a symlink: a link inside `~/.ssh`
+/// names the link itself (no resolved path ever has that identity), not its
+/// target.
+#[cfg(unix)]
+fn identity_nofollow(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(p)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+#[cfg(not(unix))]
+fn identity_nofollow(_: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// A regular file with more than one link (a hard link, or the original of
+/// one). Its other names can't be found cheaply, so it is never auto-allowed.
+#[cfg(unix)]
+fn multiply_linked_file(p: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file() && m.nlink() > 1)
+}
+#[cfg(not(unix))]
+fn multiply_linked_file(_: &Path) -> bool {
+    false
+}
+
 const FIRMLINK: &str = "/System/Volumes/Data";
 
 /// Aliases of sensitive paths (`/.vol/<dev>/<ino>`, the Data firmlink, hard
@@ -175,9 +202,9 @@ fn alias_fix(p: &Path, roots: &[((u64, u64), PathBuf)]) -> Result<PathBuf, Strin
 /// The roots plus the members of `~/.ssh` (a small folder): a hard link to a
 /// key is the same file. The big trees (browser profiles) aren't walked; a
 /// path inside one is caught through its ancestors.
-fn expand_roots(home: &Path, roots: Vec<PathBuf>) -> Vec<PathBuf> {
+fn ssh_members(home: &Path) -> Vec<PathBuf> {
     const MAX_ENTRIES: usize = 256;
-    let mut out = roots;
+    let mut out = vec![];
     let mut found = 0usize;
     let mut stack = vec![(home.join(".ssh"), 0u8)];
     while let Some((dir, depth)) = stack.pop() {
@@ -190,6 +217,8 @@ fn expand_roots(home: &Path, roots: Vec<PathBuf>) -> Vec<PathBuf> {
         for e in rd.flatten().take(MAX_ENTRIES) {
             found += 1;
             let p = e.path();
+            // `file_type` does not follow links: a link to a folder is not
+            // walked and is not a member (see `identity_nofollow`).
             if e.file_type().is_ok_and(|t| t.is_dir()) {
                 stack.push((p.clone(), depth + 1));
             }
@@ -220,13 +249,16 @@ fn evaluate_sync(
     let analysis = deny::analyze_with(&input, &fs_resolve);
     let mut resolved = vec![];
     if !analysis.overflow {
-        let roots: Vec<((u64, u64), PathBuf)> = expand_roots(
-            &c.home,
-            deny::sensitive_roots(&c.home, &c.atrium_data_paths, &c.atrium_protected_paths),
-        )
-        .into_iter()
-        .filter_map(|r| identity(&r).map(|id| (id, r)))
-        .collect();
+        let mut roots: Vec<((u64, u64), PathBuf)> =
+            deny::sensitive_roots(&c.home, &c.atrium_data_paths, &c.atrium_protected_paths)
+                .into_iter()
+                .filter_map(|r| identity(&r).map(|id| (id, r)))
+                .collect();
+        roots.extend(
+            ssh_members(&c.home)
+                .into_iter()
+                .filter_map(|r| identity_nofollow(&r).map(|id| (id, r))),
+        );
         for u in &analysis.uses {
             for p in &u.paths {
                 resolved.push(alias_fix(p, &roots)?);
@@ -234,7 +266,16 @@ fn evaluate_sync(
         }
     }
     input.resolved_paths = &resolved;
-    let verdict = policy.evaluate(&input, rules);
+    let mut verdict = policy.evaluate(&input, rules);
+    // A file with several links may be another name for a credential in a
+    // tree the identity map doesn't walk: never auto-allow it, ask instead.
+    if matches!(verdict, PolicyVerdict::Allow { .. })
+        && resolved
+            .iter()
+            .any(|p| p.starts_with(&c.home) && multiply_linked_file(p))
+    {
+        verdict = PolicyVerdict::Ask;
+    }
     Ok(Evaluated { verdict, resolved })
 }
 

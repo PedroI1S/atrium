@@ -536,6 +536,9 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
     };
     let b = base(first);
     let args = &eff[1..];
+    if shell::reads_stdin_as_script(eff) {
+        return true;
+    }
     if matches!(b, "source" | ".") {
         return args
             .first()
