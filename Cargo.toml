@@ -11,6 +11,17 @@ members = [
     "crates/atrium-host",
     "crates/atrium-client",
     "crates/atrium-daemon",
+    "app/src-tauri",
+]
+# `cargo build|test|clippy` without `--workspace` leave the app out: it needs
+# WebKitGTK's development files on Linux. `--workspace` includes it.
+default-members = [
+    "crates/atrium-protocol",
+    "crates/atrium-agents",
+    "crates/atrium-core",
+    "crates/atrium-host",
+    "crates/atrium-client",
+    "crates/atrium-daemon",
 ]
 
 [workspace.package]
