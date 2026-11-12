@@ -90,3 +90,22 @@ M0 spikes are merged as spikes: they answered their questions, but they aren't p
 | L8 | major | The daemon keeps ~227 MB resident on Linux after closing a 3M-event session (macOS: 9 MB). `malloc_trim` after the fold, another allocator, or no full-history fold (see the lifecycle-projections item above). |
 | L10 | later | 60 fps everywhere, no 120 Hz promise (D-042). Not M1's critical path: a timeboxed look at WebKitGTK's 60 fps cap, and a check on a 120 Hz Mac display. |
 
+
+## From M1-13 adversarial tests (`handoffs/M1-13-adversarial.md` on `agent/sonnet/M1-13-adversarial`; 2026-11-12)
+
+Each finding is a test marked `#[ignore = "M1-13 finding N"]` on that branch; fixing it means un-ignoring the test. **Must be fixed before the M1 gate:** S1 and S2 (they reach Allow on credentials), and S3–S5.
+
+| # | Sev. | Must fix |
+|---|---|---|
+| S1 | **blocker** | **CR-12** (finding 6): in Home with no rules, reading credential stores outside `HARD_DENY_DEFAULTS` is auto-allowed: `~/.cargo/credentials.toml`, `~/.pypirc`, `~/.pgpass`, `~/.vault-token`, `~/.azure/accessTokens.json`, `~/.aws/sso/cache/*`, `~/.config/git/credentials`, shell history, `~/.env`, and `git show HEAD:.npmrc`. Pedro decides the list (D-013). |
+| S2 | **blocker** | Finding 2: a failing `cd` is assumed to succeed. With two ordinary prefix rules (`cd`, `cat`), `cd nope; cat .ssh/id_rsa` reaches Allow. Treat the cwd as unknown after any `cd` whose target isn't a known folder. |
+| S3 | major | Finding 1: a `cd` inside `( … )` or a pipeline isn't followed (cwd tracking). Under a broad allow rule this reaches Allow on a hard-denied path. |
+| S4 | major | Finding 8: `echo rm -rf ~ \| sh` (the `-rf` is dropped) and `printf '%s' '…' \| sh`: text piped into a shell must be read as code. |
+| S5 | major | Finding 11: a wildcard in the name of a credential tree or Atrium folder (`.g*`, `atr*`) must count as touching it. |
+| S6 | minor | Finding 3: `pushd`/`popd`/`CDPATH` leave the cwd unknown (must not auto-allow afterwards). |
+| S7 | minor | Finding 4: ANSI-C words (`$'…'`) aren't decoded. |
+| S8 | minor | Finding 5: `rg x ~/.aws` (recursive search of a folder holding a credential) only asks; consider hard deny. |
+| S9 | minor | Finding 7: `sh -c -- 'payload'` isn't read. |
+| S10 | minor | Finding 9: a shell fed by process substitution (`bash < <(echo …)`); documented limit from M1-03 round 6 finding 2. |
+| S11 | minor | Finding 10: a glob that reaches a credential only through a symlink. |
+| S12 | — | Still to write (M1-13's remaining scope): the daemon and host adversarial tests (socket roles, `Hello` across the deadline, full control lane, many replaced subscriptions, a store read failing during replay, `kill_recorded` `Unverified`, a recovery closure that fails, the slow-command limit). |
