@@ -14,6 +14,7 @@ import { attach, daemon } from "./daemon/client";
 import { epochNow, markOnce, reportFailure, runHarness, setStage } from "./harness";
 import type { Screen } from "./layout";
 import { type StartupInfo, inTauri, startupInfo } from "./platform";
+import { isRoundtrip, roundtripPopout, runRoundtrip, runRoundtripVerify, runShots, runShotsIncompatible, shotsPopout } from "./roundtrip";
 import { setAdvancedOpen, setPaletteOpen, setPanel, setScreen } from "./state";
 import { afterMount, appliedState, initFromStartup, isPopout, repaint, subscribe } from "./windows";
 
@@ -62,7 +63,15 @@ async function boot() {
     setStage("ready");
     await invoke("window_ready", { applied: { ...appliedState(), readyAt: epochNow() } });
   }
-  if (info.benchMode && !isPopout()) {
+  if (isRoundtrip(info)) {
+    setStage("roundtrip");
+    const shots = info.benchMode?.startsWith("shots");
+    if (isPopout()) await (shots ? shotsPopout() : roundtripPopout());
+    else if (info.benchMode === "roundtrip") await runRoundtrip();
+    else if (info.benchMode === "shots") await runShots();
+    else if (info.benchMode === "shots-incompatible") await runShotsIncompatible();
+    else await runRoundtripVerify();
+  } else if (info.benchMode && !isPopout()) {
     setStage("harness");
     await runHarness(info, () => ({ connection: daemon().connection.type, threads: daemon().order.length }));
   }

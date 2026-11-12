@@ -103,6 +103,7 @@ dependencies = [
  "atrium-host",
  "atrium-protocol",
  "block2",
+ "cairo-rs",
  "gtk",
  "objc2-app-kit",
  "objc2-foundation",
@@ -115,6 +116,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "url",
+ "webkit2gtk",
  "window-vibrancy",
 ]
 

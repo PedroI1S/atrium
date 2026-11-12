@@ -19,6 +19,7 @@ mod macos;
 pub mod native;
 pub mod presence;
 pub mod shell;
+pub mod snapshot;
 pub mod upgrade;
 
 use std::collections::{BTreeMap, HashMap};
@@ -73,10 +74,12 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|value| !value.is_empty())
 }
 
-/// A measurement or screenshot run: settings are pinned from the
-/// environment and nothing of the user's is written.
+/// A measurement run (`ATRIUM_BENCH=startup…`, or `ATRIUM_WINDOWS`):
+/// settings are pinned from the environment and nothing of the user's is
+/// written. The live check (`ATRIUM_BENCH=roundtrip…`) is not one: it tests
+/// what is written, in a throwaway `ATRIUM_HOME`.
 fn harness_run() -> bool {
-    env("ATRIUM_BENCH").is_some() || env("ATRIUM_WINDOWS").is_some()
+    env("ATRIUM_BENCH").is_some_and(|mode| mode.starts_with("startup")) || env("ATRIUM_WINDOWS").is_some()
 }
 
 /// The pinned settings of a harness run: `ATRIUM_OPACITY` (`off`,
@@ -644,15 +647,24 @@ fn ready_states(state: State<'_, AppState>) -> BTreeMap<String, Value> {
 /// Echoes a harness report on stdout and, in a harness run, writes it to the
 /// file named by `ATRIUM_BENCH_OUT`.
 #[tauri::command]
-fn write_report(state: State<'_, AppState>, json: String) -> Result<(), String> {
+fn write_report(json: String) -> Result<(), String> {
     println!("ATRIUM_REPORT {json}");
-    if state.harness
+    if env("ATRIUM_BENCH").is_some()
         && let Some(path) = env("ATRIUM_BENCH_OUT")
     {
         shell::write_private(std::path::Path::new(&path), json.as_bytes())
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// Writes a screenshot of the calling window to `ATRIUM_SHOT_DIR/<name>.png`
+/// (harness runs only; see [`snapshot`]).
+#[tauri::command]
+fn take_snapshot(window: WebviewWindow, name: String) -> Result<String, String> {
+    let path = snapshot::target(&name)?;
+    snapshot::take(&window, path.clone())?;
+    Ok(path.display().to_string())
 }
 
 /// The windows that exist natively right now.
@@ -923,6 +935,7 @@ pub fn run() -> ExitCode {
             window_ready,
             ready_states,
             write_report,
+            take_snapshot,
             window_labels,
             quit
         ])
