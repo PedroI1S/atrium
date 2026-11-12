@@ -32,5 +32,5 @@
 | M1-14-linux | — (go given, D-059) | — | ⏳ not started: needs M1-09a merged and a brief | — | — |
 | M1-07-claude-adapter | Sonnet 5.5 worker (D-062) · review: Gemini 3.8 Flash | Pedro | 🔵 in progress | `agent/sonnet/M1-07-claude-adapter`, `../atrium-wt/M1-07-claude-adapter` | Claude subagent transcript (Pedro's Mac) |
 | M1-13-adversarial | Sonnet 5.5 worker (D-060, D-062) · review: Opus 5.5 | Pedro | 🔵 in progress: brief written | `agent/sonnet/M1-13-adversarial`, `../atrium-wt/M1-13-adversarial` | Claude subagent transcript (Pedro's Mac) |
-| M1-05 late fixes review | Sonnet 5.5 (read-only, D-060) | Pedro | 🔵 running | — | `reviews/M1-05-daemon-late-fixes.md` |
+| M1-05 late fixes review | Sonnet 5.5 (read-only, D-060) | Pedro | ✅ **approve** (`reviews/M1-05-daemon-late-fixes.md`) · `cargo test -p atrium-daemon` passes on macOS (owed since 2026-11-11) · minor, open: the full-storage test doesn't tell the new rule from the old; after a refusal the adapter's `SessionEnded` (exit code, usage) is dropped; the daily snapshot holds `publish` for the whole `VACUUM INTO` (appends and `ResolveApproval` wait); test gaps in `write_loop` | — | — |
 | M1-10 Linux fix review (`8ef0ff1`) | Sonnet 5.5 (read-only, D-060) | Pedro | ✅ **approve with changes** (`reviews/M1-10-host-linux-exit.md`): four minor/nit Linux-only fixes, for a Linux shift (M1-14) | — | — |
