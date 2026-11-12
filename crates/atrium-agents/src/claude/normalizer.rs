@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use atrium_protocol::agent::{
     AgentEvent, ApprovalDecision, MessageBody, MessageKind, PlanEntry, PlanStatus, Provider,
-    Question, QuestionOption, QuotaWindow, RequestOutcome, SessionCommand, ToolKind, ToolStatus,
-    TurnOutcome, Usage,
+    Question, QuestionOption, QuotaWindow, RequestOutcome, SessionCommand, ToolStatus, TurnOutcome,
+    Usage,
 };
 use atrium_protocol::limits::{
     MAX_DIAGNOSTIC_LINE_BYTES, MAX_DIAGNOSTIC_LINES, MAX_INLINE_MESSAGE_BYTES,
@@ -283,10 +283,7 @@ impl ClaudeNormalizer {
             return;
         };
         self.established = true;
-        let enforcement = self
-            .enforcement
-            .clone()
-            .unwrap_or_else(unknown_enforcement);
+        let enforcement = self.enforcement.clone().unwrap_or_else(unknown_enforcement);
         out.push(AgentEvent::SessionStarted {
             provider: Provider::Claude,
             native_session_id: init.session_id.clone(),
@@ -467,7 +464,8 @@ impl ClaudeNormalizer {
                     self.ensure_turn(out);
                     let mu = msg_usage(u);
                     if v.get("parent_tool_use_id").is_none_or(Value::is_null) {
-                        self.last_context = Some(mu.input + mu.cache_read + mu.cache_write + mu.output);
+                        self.last_context =
+                            Some(mu.input + mu.cache_read + mu.cache_write + mu.output);
                     }
                     self.msg_usage.insert(api_id, mu);
                     out.push(AgentEvent::Usage {
@@ -791,9 +789,11 @@ impl ClaudeNormalizer {
     fn context_window(&self, v: &Value) -> Option<u64> {
         let models = v.get("modelUsage").and_then(Value::as_object)?;
         let main = self.init.as_ref().and_then(|i| i.model.as_deref());
-        let entry = main
-            .and_then(|m| models.get(m))
-            .or_else(|| (models.len() == 1).then(|| models.values().next()).flatten())?;
+        let entry = main.and_then(|m| models.get(m)).or_else(|| {
+            (models.len() == 1)
+                .then(|| models.values().next())
+                .flatten()
+        })?;
         entry.get("contextWindow").and_then(Value::as_u64)
     }
 
@@ -998,7 +998,12 @@ impl ClaudeNormalizer {
         }
     }
 
-    fn gate(&mut self, check: &crate::ToolCheck, decision: &GateDecision, out: &mut Vec<AgentEvent>) {
+    fn gate(
+        &mut self,
+        check: &crate::ToolCheck,
+        decision: &GateDecision,
+        out: &mut Vec<AgentEvent>,
+    ) {
         let key = gate_key(check.call_id.as_deref(), &check.name, &check.input);
         let waiting: Vec<String> = self
             .can_use
@@ -1176,12 +1181,12 @@ impl ClaudeNormalizer {
                 // The turn was cut off before the model answered.
                 self.establish(out);
             } else {
-                if self.pre_error.is_some()
-                    || self.ever_had_turn
-                    || !self.shutdown_requested
-                {
+                if self.pre_error.is_some() || self.ever_had_turn || !self.shutdown_requested {
                     let message = self.pre_error.clone().unwrap_or_else(|| {
-                        format!("claude exited{} before the session started", exit_text(code))
+                        format!(
+                            "claude exited{} before the session started",
+                            exit_text(code)
+                        )
                     });
                     let details = self.diagnostics();
                     out.push(AgentEvent::Error {
@@ -1338,10 +1343,7 @@ fn err(message: String, fatal: bool) -> AgentEvent {
 }
 
 fn unknown_request(rid: &str) -> AgentEvent {
-    err(
-        format!("unknown or already resolved request: {rid}"),
-        false,
-    )
+    err(format!("unknown or already resolved request: {rid}"), false)
 }
 
 fn unmapped(record_type: &str, raw: &Value) -> AgentEvent {

@@ -45,8 +45,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atrium_host::supervise::{self, ProcessIdentity, SupervisedChild};
@@ -272,7 +272,14 @@ impl AgentAdapter for ClaudeAdapter {
             let descriptor = inputs.descriptor();
             let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
             let (commands_tx, commands_rx) = mpsc::channel(COMMAND_BUFFER);
-            let mut actor = Actor::new(config, options, inputs, descriptor.clone(), events_tx, commands_rx)?;
+            let mut actor = Actor::new(
+                config,
+                options,
+                inputs,
+                descriptor.clone(),
+                events_tx,
+                commands_rx,
+            )?;
             let identity = actor.launch()?;
             if let Err(e) = actor.handshake().await {
                 actor.discard();
@@ -1051,7 +1058,12 @@ impl Actor {
             return;
         }
         // Nobody asked the gate about this one: it does now.
-        let check = tool_check(tool_use_id.as_deref(), name, &input, self.norm.turn_number());
+        let check = tool_check(
+            tool_use_id.as_deref(),
+            name,
+            &input,
+            self.norm.turn_number(),
+        );
         self.spawn_gate(Reply::CanUse { request_id, input }, check);
     }
 
@@ -1504,7 +1516,10 @@ fn mcp_config(config: &SessionConfig) -> Value {
 /// A directory only this user can enter (the MCP config can hold credentials).
 fn private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

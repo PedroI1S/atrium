@@ -21,9 +21,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use atrium_protocol::policy::{
-    ConfigSource, ConfigSourceKind, EnforcementReason, ReasonCode,
-};
+use atrium_protocol::policy::{ConfigSource, ConfigSourceKind, EnforcementReason, ReasonCode};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -197,13 +195,7 @@ pub fn inspect(input: &InspectInput<'_>) -> Inspection {
         let shown = display_path(&path, input.env);
         match fs::read(&path) {
             Ok(bytes) => {
-                let found = inspect_text(
-                    &mut out,
-                    kind,
-                    scope,
-                    shown,
-                    bytes,
-                );
+                let found = inspect_text(&mut out, kind, scope, shown, bytes);
                 enabled.extend(found);
             }
             // Nothing there: nothing is loaded.
@@ -220,7 +212,7 @@ pub fn inspect(input: &InspectInput<'_>) -> Inspection {
 
     // macOS managed preferences (MDM) are a plist this adapter doesn't parse.
     #[cfg(target_os = "macos")]
-    {
+    if input.managed.is_none() {
         let plist = Path::new("/Library/Managed Preferences/com.anthropic.claudecode.plist");
         if let Ok(bytes) = fs::read(plist) {
             out.sources.push(ConfigSource {
@@ -447,7 +439,11 @@ mod tests {
         );
         let all = run(&cwd, &user, None, &[], &[]);
         assert_eq!(all.sources.len(), 3);
-        assert!(all.sources.iter().all(|s| s.inspected && s.sha256.is_some()));
+        assert!(
+            all.sources
+                .iter()
+                .all(|s| s.inspected && s.sha256.is_some())
+        );
         assert_eq!(all.reasons.len(), 3, "{:?}", all.reasons);
         assert!(all.reasons.iter().any(|r| r.message.contains("audit.sh")));
 
