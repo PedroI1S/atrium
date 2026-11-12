@@ -142,3 +142,15 @@ Non-blocking; it adds a method to the frozen `Store` trait. Found by the review 
 **Change proposed:** `Store::unfinished_incarnations() -> StoreResult<Vec<(ThreadId, u32)>>`: every thread's current incarnation that has events and no `SessionEnded`, archived or not, from the sessions table. Recovery would then use it instead of reading each listed thread's last event. Affects `crates/atrium-core/src/lib.rs`, `store/`, and `upkeep::recover`.
 
 The same method would let recovery clear a process record whose incarnation already ended (left by a daemon killed between storing `SessionEnded` and clearing the record). `Store::live_processes` leaves ended incarnations out, so today nothing lists such a record; nothing uses it either (round 2 of the review, finding 8).
+
+## CR-11 — M1-09a-app-shell (orchestrator) — 2026-11-12
+
+Non-blocking for the review; needed before the merge. The M1-09a brief keeps `unsafe` denied and asks for a change request if the macOS window code can't be written without it. It can't, and the code referred to this CR without anyone writing it. Written on Pedro's shift, when M1-09a first compiled and ran on macOS.
+
+**What needs `unsafe`.** Only `app/src-tauri/src/macos.rs`, which has `#![allow(unsafe_code)]`; the workspace lint stays `deny` everywhere else. It has four `unsafe` blocks, each with a `// SAFETY:` comment:
+- three dereferences of the `NSWindow` pointer Tauri hands out (`ns_window()` returns `*mut c_void`): to set the window alpha in `set_alpha` and in `apply_to_new_window`, and to read `windowNumber` in `window_number` for the harness screenshots;
+- registering the accessibility notification observer (`addObserverForName_object_queue_usingBlock`, `unsafe` in `objc2-foundation`), for "Reduce transparency" and "Increase contrast" (contract §11.1).
+
+Nothing else in the app uses `unsafe`; `window-vibrancy` does its own.
+
+**Change proposed:** allow `unsafe_code` in that one module (on macOS only, since it is `cfg(target_os = "macos")`), with a `// SAFETY:` comment on every block, and an Opus 5.5 audit of the four blocks before the merge, as for M1-10 (D-053). Any new `unsafe` in the app goes through a change request.
