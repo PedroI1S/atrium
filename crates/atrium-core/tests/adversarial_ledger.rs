@@ -20,7 +20,7 @@ use atrium_protocol::policy::{
 };
 use atrium_protocol::thread::{Location, ThreadId};
 use common_adversarial::{
-    Env, Tmp, classify, cmd_check, exact, paths_check, prefix, rule, run_table, Want,
+    Env, Tmp, Want, classify, cmd_check, exact, paths_check, prefix, rule, run_table,
 };
 
 // ---------------------------------------------------------------------------
@@ -104,14 +104,26 @@ fn an_exact_rule_never_matches_a_longer_argv() {
     ];
     for line in same {
         let v = env.cmd_rules(line, &rules);
-        assert!(matches!(v, PolicyVerdict::Allow { .. }), "{line:?}: {}", classify(&v));
+        assert!(
+            matches!(v, PolicyVerdict::Allow { .. }),
+            "{line:?}: {}",
+            classify(&v)
+        );
     }
     for line in not_same {
         let v = env.cmd_rules(line, &rules);
-        assert!(!matches!(v, PolicyVerdict::Allow { .. }), "{line:?}: {}", classify(&v));
+        assert!(
+            !matches!(v, PolicyVerdict::Allow { .. }),
+            "{line:?}: {}",
+            classify(&v)
+        );
     }
     // and the same rule never allows another command with the same words
-    for line in ["touch rm -rf build", "echo rm -rf build", "git rm -rf build"] {
+    for line in [
+        "touch rm -rf build",
+        "echo rm -rf build",
+        "git rm -rf build",
+    ] {
         let v = env.cmd_rules(line, &rules);
         assert!(!matches!(v, PolicyVerdict::Allow { .. }), "{line:?}");
     }
@@ -128,7 +140,13 @@ fn a_prefix_rule_never_matches_a_longer_word_or_a_riskier_line() {
         RuleDecision::Allow,
         "make",
     )];
-    let yes = ["make", "make all", "make -j4 test", "make; make", "make && make clean"];
+    let yes = [
+        "make",
+        "make all",
+        "make -j4 test",
+        "make; make",
+        "make && make clean",
+    ];
     let no = [
         "makeall",
         "make2",
@@ -157,11 +175,19 @@ fn a_prefix_rule_never_matches_a_longer_word_or_a_riskier_line() {
     ];
     for line in yes {
         let v = env.cmd_rules(line, &rules);
-        assert!(matches!(v, PolicyVerdict::Allow { .. }), "{line:?}: {}", classify(&v));
+        assert!(
+            matches!(v, PolicyVerdict::Allow { .. }),
+            "{line:?}: {}",
+            classify(&v)
+        );
     }
     for line in no {
         let v = env.cmd_rules(line, &rules);
-        assert!(!matches!(v, PolicyVerdict::Allow { .. }), "{line:?}: {}", classify(&v));
+        assert!(
+            !matches!(v, PolicyVerdict::Allow { .. }),
+            "{line:?}: {}",
+            classify(&v)
+        );
     }
     // the prefix rule never reaches a hard deny
     run_table(
@@ -212,7 +238,13 @@ fn no_rule_outranks_a_hard_deny() {
     for scope in &scopes {
         for matcher in &matchers {
             for kind in [ToolKind::Execute, ToolKind::Read, ToolKind::Edit] {
-                let allow = rule(scope.clone(), kind, matcher.clone(), RuleDecision::Allow, "r");
+                let allow = rule(
+                    scope.clone(),
+                    kind,
+                    matcher.clone(),
+                    RuleDecision::Allow,
+                    "r",
+                );
                 for line in lines {
                     let v = env.cmd_rules(line, std::slice::from_ref(&allow));
                     assert!(
@@ -239,11 +271,20 @@ fn no_rule_outranks_a_hard_deny() {
         RuleDecision::Allow,
         "g",
     );
-    for p in ["~/.ssh/id_rsa", "/h/u/.npmrc", "~/.aws/credentials", "~/.local/share/atrium/db"] {
+    for p in [
+        "~/.ssh/id_rsa",
+        "/h/u/.npmrc",
+        "~/.aws/credentials",
+        "~/.local/share/atrium/db",
+    ] {
         let c = paths_check(ToolKind::Read, "Read", &[p], false, None);
         for r in [&any_read, &glob_all] {
             let v = env.eval_check(&c, std::slice::from_ref(r), Preset::Home);
-            assert!(matches!(v, PolicyVerdict::HardDeny { .. }), "{p}: {}", classify(&v));
+            assert!(
+                matches!(v, PolicyVerdict::HardDeny { .. }),
+                "{p}: {}",
+                classify(&v)
+            );
         }
     }
     // a hard deny is not an Ask even in FullAccess with every rule
@@ -283,9 +324,17 @@ fn path_rules_match_only_their_glob() {
         // the rule's scope is what is under test, so compare to a no-rule run.
         let base = env.eval_check(&c, &[], Preset::Home);
         if want_allow {
-            assert!(matches!(v, PolicyVerdict::Allow { .. }), "{paths:?}: {}", classify(&v));
+            assert!(
+                matches!(v, PolicyVerdict::Allow { .. }),
+                "{paths:?}: {}",
+                classify(&v)
+            );
         } else {
-            assert_eq!(classify(&v), classify(&base), "{paths:?}: the rule changed the verdict");
+            assert_eq!(
+                classify(&v),
+                classify(&base),
+                "{paths:?}: the rule changed the verdict"
+            );
         }
     }
 }
@@ -333,7 +382,10 @@ impl Sql {
             .await
             .unwrap();
         let inc = self.store.begin_incarnation(&s.thread_id).await.unwrap();
-        self.store.signal(&s.thread_id, Signal::Starting).await.unwrap();
+        self.store
+            .signal(&s.thread_id, Signal::Starting)
+            .await
+            .unwrap();
         (s.thread_id, inc)
     }
 
@@ -391,7 +443,10 @@ async fn an_approval_is_executed_once_and_only_for_its_call() {
 
     // not approved yet: a redeem is refused
     assert!(is_deny(&g.redeem(&ticket, &c).await));
-    sql.ledger.resolve(&k, &ApprovalDecision::Allow, None).await.unwrap();
+    sql.ledger
+        .resolve(&k, &ApprovalDecision::Allow, None)
+        .await
+        .unwrap();
 
     // another call, a longer call, another turn, another tool name: refused,
     // and none of them burns the approval
@@ -403,7 +458,11 @@ async fn an_approval_is_executed_once_and_only_for_its_call() {
     other_kind.kind = ToolKind::Edit;
     let longer = cmd_check("touch notes.txt other.txt");
     for wrong in [&other_turn, &other_name, &other_kind, &longer] {
-        assert!(is_deny(&g.redeem(&ticket, wrong).await), "{:?}", wrong.input);
+        assert!(
+            is_deny(&g.redeem(&ticket, wrong).await),
+            "{:?}",
+            wrong.input
+        );
     }
     // the right call: once
     assert_eq!(g.redeem(&ticket, &c).await, GateDecision::Allow);
@@ -411,7 +470,10 @@ async fn an_approval_is_executed_once_and_only_for_its_call() {
     for _ in 0..3 {
         assert!(is_deny(&g.redeem(&ticket, &c).await));
     }
-    assert_eq!(sql.ledger.redeem(&k, &c).await, Err(LedgerError::AlreadyResolved));
+    assert_eq!(
+        sql.ledger.redeem(&k, &c).await,
+        Err(LedgerError::AlreadyResolved)
+    );
 
     // an approved ticket redeemed with a call that is now a hard deny is
     // refused and withdrawn: the approval can't be used for anything after
@@ -421,7 +483,10 @@ async fn an_approval_is_executed_once_and_only_for_its_call() {
         .await
         .unwrap();
     for hard in ["touch ~/.ssh/authorized_keys", "rm -rf ~"] {
-        assert!(is_deny(&g.redeem(&ticket, &cmd_check(hard)).await), "{hard}");
+        assert!(
+            is_deny(&g.redeem(&ticket, &cmd_check(hard)).await),
+            "{hard}"
+        );
     }
     assert!(is_deny(&g.redeem(&ticket, &c).await));
 }
@@ -435,16 +500,21 @@ async fn a_denied_cancelled_or_expired_approval_never_runs() {
     let c = cmd_check("touch a");
     let ticket = ask(&g, &c).await;
     sql.ledger
-        .resolve(&key(&t, inc, &ticket), &ApprovalDecision::Deny { message: None }, None)
+        .resolve(
+            &key(&t, inc, &ticket),
+            &ApprovalDecision::Deny { message: None },
+            None,
+        )
         .await
         .unwrap();
     assert!(is_deny(&g.redeem(&ticket, &c).await));
     // allowing a denied one is refused, and still can't run
-    assert!(sql
-        .ledger
-        .resolve(&key(&t, inc, &ticket), &ApprovalDecision::Allow, None)
-        .await
-        .is_err());
+    assert!(
+        sql.ledger
+            .resolve(&key(&t, inc, &ticket), &ApprovalDecision::Allow, None)
+            .await
+            .is_err()
+    );
     assert!(is_deny(&g.redeem(&ticket, &c).await));
     // withdrawn by the provider after the user allowed it
     let c = cmd_check("touch b");
@@ -464,11 +534,12 @@ async fn a_denied_cancelled_or_expired_approval_never_runs() {
         .unwrap();
     sql.ledger.expire_turn(&t, inc, 1).await;
     assert!(is_deny(&g.redeem(&ticket, &c).await));
-    assert!(sql
-        .ledger
-        .resolve(&key(&t, inc, &ticket), &ApprovalDecision::Allow, None)
-        .await
-        .is_err());
+    assert!(
+        sql.ledger
+            .resolve(&key(&t, inc, &ticket), &ApprovalDecision::Allow, None)
+            .await
+            .is_err()
+    );
     // the session ended
     let c = cmd_check("touch d");
     let ticket = ask(&g, &c).await;
@@ -540,7 +611,10 @@ async fn approvals_do_not_cross_threads_or_incarnations() {
         },
     ] {
         assert!(
-            sql.ledger.resolve(&wrong, &ApprovalDecision::Allow, None).await.is_err(),
+            sql.ledger
+                .resolve(&wrong, &ApprovalDecision::Allow, None)
+                .await
+                .is_err(),
             "{wrong:?}"
         );
     }
@@ -557,7 +631,10 @@ async fn approvals_do_not_cross_threads_or_incarnations() {
         incarnation: inc_b,
         request_id: ticket.request_id.clone(),
     };
-    assert_eq!(sql.ledger.redeem(&under_b, &c).await, Err(LedgerError::Unknown));
+    assert_eq!(
+        sql.ledger.redeem(&under_b, &c).await,
+        Err(LedgerError::Unknown)
+    );
     // a new incarnation of A: the old approval is stale for the new gate, and
     // the old gate's ticket no longer redeems either
     let inc_a2 = sql.next_incarnation(&a).await;
@@ -650,7 +727,9 @@ async fn concurrent_allow_and_deny_leave_one_outcome() {
         let (l1, k1) = (sql.ledger.clone(), k.clone());
         let (l2, k2) = (sql.ledger.clone(), k.clone());
         let allow = tokio::spawn(async move {
-            l1.resolve(&k1, &ApprovalDecision::Allow, None).await.is_ok()
+            l1.resolve(&k1, &ApprovalDecision::Allow, None)
+                .await
+                .is_ok()
         });
         let deny = tokio::spawn(async move {
             l2.resolve(&k2, &ApprovalDecision::Deny { message: None }, None)
@@ -660,7 +739,10 @@ async fn concurrent_allow_and_deny_leave_one_outcome() {
         let (allow_won, deny_won) = (allow.await.unwrap(), deny.await.unwrap());
         assert!(allow_won ^ deny_won, "round {round}: exactly one resolves");
         let ran = g.redeem(&ticket, &c).await == GateDecision::Allow;
-        assert_eq!(ran, allow_won, "round {round}: it runs only if the allow won");
+        assert_eq!(
+            ran, allow_won,
+            "round {round}: it runs only if the allow won"
+        );
     }
 }
 
@@ -675,7 +757,11 @@ async fn a_remembered_command_allows_only_itself() {
     let ticket = ask(&g, &c).await;
     let id = sql
         .ledger
-        .resolve(&key(&t, inc, &ticket), &ApprovalDecision::Allow, Some(RememberScope::Global))
+        .resolve(
+            &key(&t, inc, &ticket),
+            &ApprovalDecision::Allow,
+            Some(RememberScope::Global),
+        )
         .await
         .unwrap();
     assert!(id.is_some());
@@ -695,10 +781,7 @@ async fn a_remembered_command_allows_only_itself() {
         "touch notes.txt; rm -rf ~",
     ] {
         let d = g.check(&cmd_check(line)).await;
-        assert!(
-            !matches!(d, GateDecision::Allow),
-            "{line:?}: {d:?}"
-        );
+        assert!(!matches!(d, GateDecision::Allow), "{line:?}: {d:?}");
     }
     // another thread has the global rule too (it asked for Global), and the
     // same limits
@@ -756,8 +839,7 @@ async fn stored_rules_never_allow_a_hard_deny_through_the_gate() {
     sql.tmp.write(".ssh/id_rsa", "secret");
     sql.tmp.write(".npmrc", "token");
     let (t, inc) = sql.thread().await;
-    let mut rule_n = 0;
-    for (matcher, kind, scope) in [
+    for (rule_n, (matcher, kind, scope)) in [
         (RuleMatcher::Any, ToolKind::Execute, RuleScope::Global),
         (RuleMatcher::Any, ToolKind::Read, RuleScope::Global),
         (RuleMatcher::Any, ToolKind::Execute, RuleScope::Home),
@@ -786,16 +868,24 @@ async fn stored_rules_never_allow_a_hard_deny_through_the_gate() {
             ToolKind::Read,
             RuleScope::Global,
         ),
-    ] {
-        let id = format!("r{}", rule_n);
-        rule_n += 1;
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("r{rule_n}");
         sql.store
             .create_rule(rule(scope, kind, matcher, RuleDecision::Allow, &id))
             .await
             .unwrap();
     }
     let g = sql.gate(&t, inc);
-    for line in ["cat .ssh/id_rsa", "cat .npmrc", "cat ~/.ssh/id_rsa", "rm -rf ~", "sudo ls"] {
+    for line in [
+        "cat .ssh/id_rsa",
+        "cat .npmrc",
+        "cat ~/.ssh/id_rsa",
+        "rm -rf ~",
+        "sudo ls",
+    ] {
         assert!(is_deny(&g.check(&cmd_check(line)).await), "{line}");
     }
     for p in [".ssh/id_rsa", ".npmrc"] {

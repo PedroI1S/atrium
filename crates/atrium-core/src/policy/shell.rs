@@ -742,13 +742,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             .get(*owner)
             .and_then(|p| out.units.get(*p))
             .is_some_and(|u| {
-                !u.seg
-                    .argv
-                    .first()
-                    .is_some_and(|w| {
-                        (RESERVED.contains(&w.as_str()) && w != "!") || w == "}" || w == ")"
-                    })
-                    && !reads_code(u)
+                !u.seg.argv.first().is_some_and(|w| {
+                    (RESERVED.contains(&w.as_str()) && w != "!") || w == "}" || w == ")"
+                }) && !reads_code(u)
                     && u.pipe == 0
                     && !u.proc_sub
                     && !u.grouped
@@ -931,7 +927,9 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
             "flock" => {
                 // `flock [opts] FILE COMMAND…`, or `flock FILE -c 'string'`
                 // (the string runs through a shell).
-                if let Some(c) = a.iter().position(|w| matches!(w.as_str(), "-c" | "--command"))
+                if let Some(c) = a
+                    .iter()
+                    .position(|w| matches!(w.as_str(), "-c" | "--command"))
                     && let Some(cmd) = a.get(c + 1).cloned()
                 {
                     a = vec!["sh".into(), "-c".into(), cmd];
@@ -946,7 +944,9 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
             }
             "script" => {
                 // macOS `script [opts] FILE [COMMAND…]`; Linux `script -c CMD`
-                if let Some(c) = a.iter().position(|w| matches!(w.as_str(), "-c" | "--command"))
+                if let Some(c) = a
+                    .iter()
+                    .position(|w| matches!(w.as_str(), "-c" | "--command"))
                     && let Some(cmd) = a.get(c + 1).cloned()
                 {
                     a = vec!["sh".into(), "-c".into(), cmd];
@@ -977,9 +977,7 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                         j += 1;
                         break;
                     }
-                    if matches!(w, "-u" | "-C" | "--unset" | "--chdir") {
-                        j += 2;
-                    } else if w == "-P" || w == "--default-signal-path" {
+                    if matches!(w, "-u" | "-C" | "-P" | "--unset" | "--chdir") {
                         j += 2;
                     } else if w == "-S"
                         || w == "--split-string"

@@ -223,7 +223,10 @@ fn dot_dot_after_a_link_goes_where_the_kernel_goes() {
     // `proj/link-deep` -> `elsewhere/deep`: `..` is `elsewhere`, not `proj`
     t.write("elsewhere/innocent.txt", "ok");
     t.write("proj/innocent.txt", "ok");
-    let d = block_on(g.gate.check(&cmd_check("cat proj/link-deep/../innocent.txt")));
+    let d = block_on(
+        g.gate
+            .check(&cmd_check("cat proj/link-deep/../innocent.txt")),
+    );
     assert_eq!(d, GateDecision::Allow);
     finish();
 }
@@ -248,7 +251,12 @@ fn the_working_directory_a_call_names_is_checked() {
         ".ssh/".to_string(),
         ".ssh/sub/..".to_string(),
     ] {
-        for line in ["cat id_ed25519", "head id_ed25519", "cat ./id_ed25519", "cat *"] {
+        for line in [
+            "cat id_ed25519",
+            "head id_ed25519",
+            "cat ./id_ed25519",
+            "cat *",
+        ] {
             let mut c = cmd_check(line);
             c.subject = ToolSubject::Command {
                 line: line.into(),
@@ -266,7 +274,10 @@ fn the_working_directory_a_call_names_is_checked() {
         line: "rm config.toml".into(),
         cwd: Some(".config/atrium".into()),
     };
-    assert!(matches!(block_on(g.gate.check(&c)), GateDecision::Deny { .. }));
+    assert!(matches!(
+        block_on(g.gate.check(&c)),
+        GateDecision::Deny { .. }
+    ));
     // a cwd that is ordinary
     let mut c = cmd_check("cat a.txt");
     c.subject = ToolSubject::Command {
@@ -338,7 +349,12 @@ fn globs_expand_against_the_real_folder() {
         deny(&g, line);
     }
     // globs in a folder with only ordinary files ask, never allow
-    for line in ["cat proj/*", "cat proj/a.*", "ls proj/*", "cat proj/{a,b}.txt"] {
+    for line in [
+        "cat proj/*",
+        "cat proj/a.*",
+        "ls proj/*",
+        "cat proj/{a,b}.txt",
+    ] {
         let d = block_on(g.gate.check(&cmd_check(line)));
         if !matches!(d, GateDecision::Ask { .. }) {
             fail(format!("{line}: wanted Ask, got {d:?}"));
@@ -354,7 +370,9 @@ fn file_tools_cannot_reach_sensitive_paths_or_write_outside() {
     let g = t.gate(Preset::Home, vec![]);
     let h = t.home.display().to_string();
     // a Search rooted at home, above credentials, or in them
-    for p in [".", "~", &h, "..", "../..", "/", ".ssh", ".aws", ".gnupg", "Library", ".config"] {
+    for p in [
+        ".", "~", &h, "..", "../..", "/", ".ssh", ".aws", ".gnupg", "Library", ".config",
+    ] {
         let c = paths_check(ToolKind::Search, "Grep", &[p], true, None);
         let d = block_on(g.gate.check(&c));
         if matches!(d, GateDecision::Allow) {
@@ -396,10 +414,15 @@ fn file_tools_cannot_reach_sensitive_paths_or_write_outside() {
         },
         turn: 1,
     };
-    assert!(matches!(block_on(g.gate.check(&c)), GateDecision::Deny { .. }));
+    assert!(matches!(
+        block_on(g.gate.check(&c)),
+        GateDecision::Deny { .. }
+    ));
     // Fetch, Mcp, Unknown and None subjects are never allowed by Home's list
     for subject in [
-        ToolSubject::Fetch { url: "https://x".into() },
+        ToolSubject::Fetch {
+            url: "https://x".into(),
+        },
         ToolSubject::Mcp {
             server: "s".into(),
             tool: "t".into(),

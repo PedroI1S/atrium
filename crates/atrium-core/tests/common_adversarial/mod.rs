@@ -23,7 +23,6 @@ use atrium_protocol::policy::{
 use atrium_protocol::thread::ThreadId;
 use serde_json::json;
 
-
 pub const HOME: &str = "/h/u";
 
 /// A virtual home: nothing on disk, resolved paths empty (lexical checks).
@@ -461,4 +460,3 @@ impl RulesSource for MemRules {
         })
     }
 }
-

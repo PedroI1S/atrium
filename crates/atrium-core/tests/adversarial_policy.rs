@@ -9,14 +9,14 @@
 
 mod common_adversarial;
 
-use atrium_agents::{GateDecision, ToolGate};
-use atrium_protocol::agent::ToolKind;
-use atrium_protocol::policy::{Preset, RuleDecision, RuleScope};
-use common_adversarial::*;
 use Want::Ask;
 use Want::Hard;
 #[allow(unused_imports)]
 use Want::{AnyHard, NotAllow};
+use atrium_agents::{GateDecision, ToolGate};
+use atrium_protocol::agent::ToolKind;
+use atrium_protocol::policy::{Preset, RuleDecision, RuleScope};
+use common_adversarial::*;
 
 const RD: &str = "recursive-delete-outside-cwd";
 const CR: &str = "credential-read";
@@ -35,8 +35,14 @@ fn leftover_command_substitution_in_text_bodies_is_not_a_false_hard_deny() {
     run_table(
         &env,
         &[
-            ("cat > notes.md <<EOF\nBuilt $(date)\nsudo make install\nEOF", Ask),
-            ("cat <<'EOF' > notes-$(date +%F).md\nsudo make install\nEOF", Ask),
+            (
+                "cat > notes.md <<EOF\nBuilt $(date)\nsudo make install\nEOF",
+                Ask,
+            ),
+            (
+                "cat <<'EOF' > notes-$(date +%F).md\nsudo make install\nEOF",
+                Ask,
+            ),
             (
                 "git commit -F - <<EOF\nfix $(git rev-parse --short HEAD)\nrm -rf ~ docs\nEOF",
                 Ask,
@@ -182,7 +188,10 @@ fn leftover_wrappers_shells_and_stdin_readers() {
     ] {
         table.push((line.to_string(), Ask));
     }
-    let t: Vec<(&str, Want)> = table.iter().map(|(l, w)| (l.as_str(), clone_want(w))).collect();
+    let t: Vec<(&str, Want)> = table
+        .iter()
+        .map(|(l, w)| (l.as_str(), clone_want(w)))
+        .collect();
     run_table(&env, &t);
 }
 
@@ -238,7 +247,11 @@ fn leftover_hard_linked_files_ask() {
     let t = Tmp::new();
     t.write("proj/plain.txt", "x");
     t.write("proj/linked.txt", "y");
-    std::fs::hard_link(t.home.join("proj/linked.txt"), t.home.join("proj/second-name")).unwrap();
+    std::fs::hard_link(
+        t.home.join("proj/linked.txt"),
+        t.home.join("proj/second-name"),
+    )
+    .unwrap();
     // a credential in a tree that isn't walked for identities, hard-linked out
     t.write(".gnupg/private-keys-v1.d/k.key", "k");
     std::fs::hard_link(
@@ -1126,8 +1139,14 @@ fn ordinary_commands_are_not_hard_denied() {
         ("cat <<'EOF' > notes.md\nsudo rm -rf ~\nEOF", Want::Ask),
         ("cat > notes.md <<'EOF'\n$(rm -rf ~)\nEOF", Want::Ask),
         ("cat <<EOF > notes.md\nplain text\nEOF", Want::Ask),
-        ("git commit -m \"$(cat <<'EOF'\nfix: x\nrm -rf ~\nEOF\n)\"", Want::Ask),
-        ("gh pr create --title t --body \"$(cat <<'EOF'\nsudo\nEOF\n)\"", Want::Ask),
+        (
+            "git commit -m \"$(cat <<'EOF'\nfix: x\nrm -rf ~\nEOF\n)\"",
+            Want::Ask,
+        ),
+        (
+            "gh pr create --title t --body \"$(cat <<'EOF'\nsudo\nEOF\n)\"",
+            Want::Ask,
+        ),
         ("ssh host", Want::Ask),
         ("ssh -i key host", Want::Ask),
         ("scp a host:b", Want::Ask),
