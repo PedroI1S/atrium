@@ -908,6 +908,38 @@ fn finding_2_a_failing_cd_does_not_move_the_directory() {
     ]);
 }
 
+/// The same through ordinary prefix rules a user could have made in settings
+/// (`cd` and `cat` allowed): finding 2 gives Allow, no `Any` rule needed.
+#[test]
+#[ignore = "M1-13 finding 2"]
+fn finding_2_with_plain_prefix_rules_a_failing_cd_reaches_allow() {
+    let env = Env::home();
+    let rules = vec![
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["cd"]),
+            RuleDecision::Allow,
+            "cd",
+        ),
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["cat"]),
+            RuleDecision::Allow,
+            "cat",
+        ),
+    ];
+    for line in ["cd nope; cat .ssh/id_rsa", "cd nope\ncat .ssh/id_rsa"] {
+        let v = env.cmd_rules(line, &rules);
+        assert!(
+            matches!(v, atrium_core::PolicyVerdict::HardDeny { .. }),
+            "{line:?}: {}",
+            classify(&v)
+        );
+    }
+}
+
 #[test]
 #[ignore = "M1-13 finding 3"]
 fn finding_3_popd_pushd_and_cdpath_leave_the_directory_unknown() {
