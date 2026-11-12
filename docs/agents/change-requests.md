@@ -154,3 +154,11 @@ Non-blocking for the review; needed before the merge. The M1-09a brief keeps `un
 Nothing else in the app uses `unsafe`; `window-vibrancy` does its own.
 
 **Change proposed:** allow `unsafe_code` in that one module (on macOS only, since it is `cfg(target_os = "macos")`), with a `// SAFETY:` comment on every block, and an Opus 5.5 audit of the four blocks before the merge, as for M1-10 (D-053). Any new `unsafe` in the app goes through a change request.
+
+## CR-12 — M1-13-adversarial (orchestrator, from the worker's finding 6) — 2026-11-12
+
+**Security default; Pedro decides (D-013).** In Home with no rules, the policy auto-allows reading credential stores that aren't on the contract's hard-deny list (§9, `HARD_DENY_DEFAULTS`). The worker's examples: `cat ~/.cargo/credentials.toml`, `~/.pypirc`, `~/.pgpass`, `~/.vault-token`, `~/.azure/accessTokens.json`, `~/.aws/sso/cache/*`, `~/.config/git/credentials`, shell history files, `~/.env`, and `git show HEAD:.npmrc`. They are tested in `crates/atrium-core/tests/adversarial_*.rs` on `agent/sonnet/M1-13-adversarial`, ignored as "M1-13 finding 6".
+
+**Change proposed:** add these to the hard-deny credential list, with the same identity and hard-link handling as the existing entries. Also make `git show`/`git cat-file` of a path matching a credential name ask rather than auto-allow. Affects `atrium-protocol`/`atrium-core` policy defaults, contract §9, and the Settings text that lists what is protected.
+
+**Related, for the same decision:** findings 1 and 2 (a `cd` inside a subshell or pipeline is not followed; a failing `cd` is assumed to succeed). With two ordinary prefix rules (`cd`, `cat`), `cd nope; cat .ssh/id_rsa` reaches Allow. These are engine fixes rather than contract changes, but they reach Allow on a hard-denied path, so they should be fixed before the M1 gate (worker's handoff has proposed fixes for 1, 2, 7 and 8).
