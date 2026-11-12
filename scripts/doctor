@@ -85,7 +85,7 @@ else
 fi
 
 echo "agy worker policy (D-002, D-006)"
-tested="1.5.3"
+tested="1.5.7"
 version="$(agy --version 2>/dev/null || true)"
 if [[ "$version" != "$tested" ]]; then
   echo "  ! agy $version differs from the tested $tested: re-run the hook check in docs/agents/HANDOFF.md before dispatching agy workers"
