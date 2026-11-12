@@ -335,3 +335,13 @@ Housekeeping the same day, asked for by Pedro: the stale `claude/design-ui-direc
 - **What it means for M1-09b:** until M1-07 and M1-08 are merged, `atriumd` has no real provider. The Home chat is built and tested against the daemon's `AgentLaunch::Fake` agent and the client's scripted-daemon tests. A live chat with Claude Code or Codex is checked when the adapters land; that check stays owed for the M1 gate.
 - **Open questions of `docs/design/ui-direction.md` §9, settled in the M1-09a brief by the orchestrator** (the driver can overturn them): Instrument Sans and Geist Mono stay the bundled defaults; Home is a chat like any other, pinned as a tile; Linux gets client-side window controls on the right of the same frame; topic management (§4) is not in M1, whose threads are all Home threads, and the sidebar shows one list.
 - **Not covered by this go:** M1-07, M1-08, M1-08L, M1-13, and the decisions still waiting (CR-08, CR-09, CR-10).
+
+## D-060 — 2026-11-12 — Model routing while Argon and Codex are out of usage
+**Decided by Pedro (driver).** Argon and Codex are both out of usage. Until that changes, work routed to them, or to the other GPT models, goes to a Claude agent or to Flash:
+- **Gemini 4 Argon** → a Sonnet 5.5 agent. This extends D-053 to every Argon job.
+- **Codex** (`codex exec`, any model) → a Sonnet 5.5 agent.
+- **GPT-6 Astra** → Opus 5.5.
+- **GPT-6.1 Sol** → Sonnet 5.5, or Gemini 3.8 Flash through `agy`.
+- Gemini 3.8 Flash reviews through `agy` (D-056, D-057, D-059) are unchanged.
+
+Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it stopped: finish M1-09a under D-059.
