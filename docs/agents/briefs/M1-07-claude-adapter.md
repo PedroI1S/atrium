@@ -1,6 +1,7 @@
 # M1-07-claude-adapter: Claude Code adapter (production)
 
-Model: Sonnet 5.5 · Reviewer: Gemini 4 Argon · Depends on: contract (M1 rev 3), M1-10 merged (dispatched after it)
+Model: Sonnet 5.5 · Reviewer: Gemini 3.8 Flash (D-062; Argon is out of usage) · Depends on: contract (M1 rev 3), M1-10 merged (it is)
+Go: D-062 (Pedro, 2026-11-12). Remembered command rules are global (D-062): `rememberable` needs no folder.
 Branch: `agent/sonnet/M1-07-claude-adapter` · Worktree: `../atrium-wt/M1-07-claude-adapter`
 
 ## Goal

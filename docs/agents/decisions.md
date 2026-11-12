@@ -348,3 +348,13 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 
 ## D-061 — 2026-11-12 — CR-11 approved: `unsafe` in the app's macOS module
 **Decided by Pedro (driver).** `unsafe_code` is allowed in `app/src-tauri/src/macos.rs` only (macOS-only module, `#![allow(unsafe_code)]`); the workspace lint stays `deny` everywhere else. Every block carries a `// SAFETY:` comment. Today there are four: three dereferences of Tauri's `NSWindow` pointer (`set_alpha`, `apply_to_new_window`, `window_number`) and the accessibility observer registration. An Opus 5.5 audit of the four blocks is required before M1-09a is merged (as for M1-10, D-053). Any new `unsafe` in the app needs its own change request.
+
+## D-062 — 2026-11-12 — Parallel workers again on Pedro's shifts; go for M1-09b, M1-07 and M1-13
+**Decided by Pedro (driver).** Pedro asked for parallel work (up to six agents at once, contract §15's cap) and chose which tasks start now.
+- **D-055 ends on Pedro's shifts.** The orchestrator dispatches workers again (PLAN §8 fan-out), routed by D-060. It still writes small fixes and integration itself.
+- **Go:**
+  - **M1-09b-home-chat**: Opus 5.5 worker (contract §15, D-048), reviewed by Gemini 3.8 Flash with screenshots. It starts from M1-09a's branch tip before M1-09a is merged and rebases onto `dev` after M1-09a's merge.
+  - **M1-07-claude-adapter**: Sonnet 5.5 worker. Reviewed by Gemini 3.8 Flash (cross-provider, D-056) instead of Argon.
+  - **M1-13-adversarial**: Sonnet 5.5 worker (Argon → Sonnet, D-060), reviewed by Opus 5.5 (contract §15). It includes the M1-03 and M1-05 leftovers listed for it.
+- **Not in this go:** M1-08 (Codex adapter), M1-08L, M1-14 (Linux, needs a Linux machine; go already given in D-059).
+- **Remembered command rules stay global** (D-056's open point), with "in any folder" shown in the approval UI. This is the orchestrator's default, given with the M1-07 option; Pedro can overturn it before M1-09b's approval UI is reviewed.
