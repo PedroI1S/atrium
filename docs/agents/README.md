@@ -22,12 +22,13 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 3. Never commit to `main`, merge, or push. Commit only on your own branch.
 4. Before finishing, run every Definition of Done command from your brief and paste the results into your handoff.
 5. Always write `handoffs/<id>.md`, even if you failed. Say what blocked you.
+6. **Never put test data in a shell heredoc**, and never write command lines that touch real credentials as shell text. Write test inputs with the file tools, or as Rust string literals in a test. On 2026-11-12 a heredoc in a worker's shell ended early at an `EOF` inside its data, and the lines after it ran in `~`, printing credential files into a tool-result file (session log 2026-11-12 #2). Tests that need a home folder use a temp folder and a fake `HOME`.
 
 ## Conventions
 
 - **Never keep the repo or worktrees in a cloud-synced folder** (iCloud Drive "Desktop & Documents", Dropbox, OneDrive). Sync creates conflict copies (`file 2.md`) inside the tree and `.git` while git and agents rewrite files. Renaming a folder to `.nosync` inside a synced folder is **not** enough: iCloud kept syncing it (D-036). Keep the repo outside `~/Documents` and `~/Desktop`, with `atrium-wt` as its sibling (briefs use `../atrium-wt`). On Pedro's Mac: `~/Harness` and `~/atrium-wt`.
 
-- **GUI measurements are exclusive.** Only one app window set may be measured at a time; overlapping or occluded windows throttle rAF and invalidate the run. Wrap every GUI measurement or screenshot run in `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock <command>`, and hold the lock only while measuring.
+- **GUI measurements are exclusive.** Only one app window set may be measured at a time; overlapping or occluded windows throttle rAF and invalidate the run. Wrap every GUI measurement or screenshot run in `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock <command>`, and hold the lock only while measuring. On Linux there is no `lockf`: use `flock /tmp/atrium-gui-measure.lock <command>`.
 
 - **Stopping a worker doesn't stop what it launched.** Background processes (bench loops, dev servers, apps, browsers) keep running, and they keep relaunching windows. After stopping or pausing a worker, the orchestrator finds and stops every process started from that worktree (`ps` matching the worktree path, the task id, and the spike's app/binary names), and tells the worker to clean up when it resumes. Workers stop their own background processes before finishing.
 

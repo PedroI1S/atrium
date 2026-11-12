@@ -1,7 +1,16 @@
 # M1-13-adversarial: adversarial tests (hard deny, rules, ledger, socket roles) and the policy leftovers
 
-Model: Sonnet 5.5 (contract §15 said Argon; D-060) · Reviewer: Opus 5.5 (read-only) · Depends on: M1-02, M1-03, M1-05, M1-10 (all merged)
+Model: Sonnet 5.5 (contract §15 said Argon; D-060), second part Gemini 4 Argon (D-066) · Reviewer: Opus 5.5, Fable 5.2 on rodrigo's shifts (read-only) · Depends on: M1-02, M1-03, M1-05, M1-10 (all merged)
 Go: D-062 (Pedro, 2026-11-12) · Branch: `agent/sonnet/M1-13-adversarial` · Worktree: `../atrium-wt/M1-13-adversarial`
+
+## Second part (rodrigo's shift, D-065, D-066): Gemini 4 Argon, reviewed by Claude Fable 5.2
+The first part (Sonnet 5.5) is on the branch: read `docs/agents/handoffs/M1-13-adversarial.md` first. Same branch, same owned paths. Do these, in order:
+1. **Engine fixes for findings 2, 1, 7 and 8** (in that order), in `crates/atrium-core/src/policy/**` only. The handoff proposes a fix for each. Each fix gets table tests that fail on the old code, and its `#[ignore = "M1-13 finding N"]` test loses the `ignore` and passes. A fix may only make a verdict stricter (Allow → Ask or Deny); nothing ordinary may become a hard deny, and the round 1–6 tables and the existing `policy` and `ledger` tests still pass. If a fix can't be done without touching a contract type or a default, stop and leave it as a finding.
+2. **Daemon adversarial tests**, `crates/atrium-daemon/tests/adversarial_*.rs`: the list in the handoff's "Not done / next step" item 1.
+3. **Host adversarial tests**, `crates/atrium-host/tests/adversarial_*.rs`, for what is missing on process identity (Linux paths included: this machine is Linux).
+4. The full Definition of Done below, and the handoff updated: append a "Second part" section, keep the first part's text.
+- **Not yours:** finding 6 (CR-12, the owner decides), findings 3, 4, 5, 9, 10 and 11 (they stay ignored tests), `docs/agents/change-requests.md`.
+- **Worker rule 6** (`docs/agents/README.md`): never put test data in a shell heredoc and never write command lines that name real credential files as shell text. Hostile inputs are Rust string literals inside tests, written with the file tools.
 
 ## Goal
 Attack what M1 relies on for safety, as an agent running as the user would: the policy's hard denies and auto-allows, remembered rules, the approval ledger, the daemon's socket roles and limits, and process identity. Turn every attack into a test. Fix the small leftovers the M1-03 and M1-05 reviews put on this task; anything bigger becomes a finding in your handoff, not a silent change.

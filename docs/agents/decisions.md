@@ -358,3 +358,32 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
   - **M1-13-adversarial**: Sonnet 5.5 worker (Argon → Sonnet, D-060), reviewed by Opus 5.5 (contract §15). It includes the M1-03 and M1-05 leftovers listed for it.
 - **Not in this go:** M1-08 (Codex adapter), M1-08L, M1-14 (Linux, needs a Linux machine; go already given in D-059).
 - **Remembered command rules stay global** (D-056's open point), with "in any folder" shown in the approval UI. This is the orchestrator's default, given with the M1-07 option; Pedro can overturn it before M1-09b's approval UI is reviewed.
+
+## D-063 — 2026-11-12 — OpenCode gets its own adapter, ahead of the generic ACP adapter
+**Decided by Pedro (driver).** OpenCode is the provider Pedro will actually use. It settles M0-04's open design point (O11): OpenCode gets its **own adapter over `opencode serve`** (HTTP API, per-session permission rules, model and `variant` per prompt), instead of going through the generic ACP adapter. The generic ACP adapter stays in the plan for Goose and other ACP agents, after OpenCode.
+- **When:** M2, as planned for ACP (PLAN §5), OpenCode first. Not pulled into M1: the M1 contract is provider-agnostic (`AgentAdapter`, per-session enforcement, the gate), so the adapter is additive and needs no change to the frozen contract, the protocol or the UI.
+- The M0-04 fixtures and the must-fix items O1–O10 carry over where they still apply. Free hosted OpenCode models stay `untrusted` by default (PLAN §3.21).
+- PLAN.md updated: providers table, architecture sketches, §3.2, §5 (M2), the open questions, the routing row, the milestone table.
+
+## D-064 — 2026-11-12 — D-060 and D-062 bind Pedro's shifts only
+**Decided by Pedro (driver).** The usage limits behind D-060 (Argon and Codex out of usage) are Pedro's accounts, not rodrigo's. So:
+- **D-060's model routing** and **D-062's way of working** (parallel workers routed to Claude, Flash and Opus reviews in place of Argon and Codex) apply **on Pedro's shifts only**.
+- **On rodrigo's shifts the original workflow holds**: contract §15's routing and reviewers (Argon, Codex/Sol, Astra where they're named), PLAN §8, and rodrigo's own decisions (D-057, D-059). This stays true unless rodrigo decides otherwise and records it here.
+- What D-062 decided about tasks still holds for everyone: the go for M1-09b, M1-07 and M1-13, and remembered rules staying global. On a rodrigo shift, the remaining work and reviews of those tasks follow his routing.
+
+## D-065 — 2026-11-12 — rodrigo's shift: parallel workers again, Fable 5.2 takes Opus 5.5's role
+**Decided by rodrigo (driver).** The Fable inline trial is over on rodrigo's shifts as well.
+- **D-057 ends.** The orchestrator dispatches workers again (PLAN §8 fan-out, up to six agents at once per contract §15). It still writes small fixes and integration itself. D-059's go and task order stand; only who writes the code changes.
+- **Claude Fable 5 (`claude-fable-5-2`) takes every role that Opus 5.5 holds** on rodrigo's shifts: the orchestrator (D-001), the UI worker (D-048, at most one at a time besides the orchestrator), the `unsafe` audits (D-053, D-061), the escalation and contract-heavy worker (D-047), and the reviews contract §15 or D-062 give to Opus (M1-13's review).
+- **Everything else follows D-064:** contract §15's routing and reviewers (Sonnet 5.5, Argon, Codex/Sol, Astra, Flash) on rodrigo's accounts. A worker that hits a usage limit is paused, not silently re-routed (D-047). PLAN §8.2's cross-provider rule is unchanged: Fable is Anthropic, so its work is reviewed by Gemini or GPT models, not by Sonnet or Opus.
+- **In-flight tasks on rodrigo's shifts:** M1-09b continues with a Fable worker from `agent/opus/M1-09b-home-chat` (new branches named `agent/fable/<task-id>`); M1-13's review goes to Fable. Pedro's shifts are unchanged (D-060, D-062, D-064).
+
+## D-066 — 2026-11-12 — rodrigo's go: continue M1-09b, M1-07 and M1-13 with workers; brief for M1-14
+**Decided by rodrigo (driver).** rodrigo gave the go for the wave the orchestrator (Claude Fable 5.2) proposed at the start of the shift, routed by D-065:
+- **M1-09b-home-chat**: a Fable 5.2 worker (Claude subagent) continues from the partial handoff. Review: Gemini 3.8 Flash with screenshots. On this machine the GUI runs, the screenshots and the benches are on Linux; the macOS screenshots and the macOS startup gate of its brief stay owed to a Pedro shift.
+- **M1-07-claude-adapter**: a Sonnet 5.5 worker (Claude subagent) finishes it. Review: Gemini 4 Argon, as contract §15 says (Flash was D-062's stand-in on Pedro's shifts).
+- **M1-13-adversarial**: Gemini 4 Argon through `agy` (contract §15) writes the second part: the daemon and host adversarial tests, and the engine fixes for findings 1, 2, 7 and 8 (S-items in `m1-must-fix.md`), which change no contract and no default. Review: Fable 5.2 (D-065). Finding 6 stays with CR-12 (Pedro, D-013).
+- **M1-14-linux**: the orchestrator writes the brief now. Its dispatch waits until M1-09b is not using the GUI lock, and is covered by D-059's go.
+- **Branches:** the three tasks continue on their existing branches (`agent/opus/…`, `agent/sonnet/…`) whatever model works on them. This is the orchestrator's reading of D-065's note on branch names, chosen to avoid deleting pushed branches; the driver can overturn it.
+- **Before any `agy` worker:** the hook check of `HANDOFF.md` is re-run, because `agy` here is 1.5.7 and the tested version is 1.5.3.
+- **Not covered by this go:** M1-08, M1-08L, and the decisions that wait for Pedro (CR-09, CR-12) or a driver (CR-08, CR-10).

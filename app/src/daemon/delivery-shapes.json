@@ -1,0 +1,25 @@
+[
+  { "type": "connection", "state": { "type": "connecting", "attempt": 3 } },
+  { "type": "connection", "state": { "type": "connected", "daemon_version": "0.0.0", "daemon_pid": 4242 } },
+  { "type": "connection", "state": { "type": "incompatible", "protocol_version": 0, "message": "the daemon speaks protocol 0", "daemon_version": "0.0.0", "daemon_pid": 4242, "running_turns": 2 } },
+  { "type": "connection", "state": { "type": "failed", "message": "the socket folder is open to others" } },
+  { "type": "connection", "state": { "type": "closed" } },
+  {
+    "type": "inbox",
+    "threads": [
+      { "thread_id": "t-old", "title": "Tidy the downloads folder", "provider": "claude", "model": "sonnet", "location": { "type": "home" }, "state": { "type": "idle" }, "enforcement": null, "incarnation": 1, "native_session_id": "s-1", "last_event": 40, "unread": true, "pending_approvals": 0, "pending_questions": 0, "attention_since_ms": 1700000050000, "attention_detail": null, "created_at_ms": 1700000000000, "updated_at_ms": 1700000050000 },
+      { "thread_id": "t-new", "title": "Find the large files", "provider": "codex", "model": null, "location": { "type": "home" }, "state": { "type": "needs_approval" }, "enforcement": null, "incarnation": 2, "native_session_id": null, "last_event": 90, "unread": false, "pending_approvals": 1, "pending_questions": 0, "attention_since_ms": 1700000090000, "attention_detail": "Run `du -sh ~/Videos`?", "created_at_ms": 1700000060000, "updated_at_ms": 1700000090000 }
+    ],
+    "inbox": [
+      { "thread_id": "t-new", "reason": "approval", "since_ms": 1700000090000, "title": "Find the large files", "detail": "Run `du -sh ~/Videos`?" },
+      { "thread_id": "t-old", "reason": "reply", "since_ms": 1700000050000, "title": "Tidy the downloads folder", "detail": null }
+    ]
+  },
+  { "type": "thread_updated", "summary": { "thread_id": "t-old", "title": "Tidy the downloads folder", "provider": "claude", "model": "sonnet", "location": { "type": "home" }, "state": { "type": "interrupted", "cleanup": "unverified" }, "enforcement": null, "incarnation": 1, "native_session_id": "s-1", "last_event": 41, "unread": false, "pending_approvals": 0, "pending_questions": 0, "attention_since_ms": 1700000100000, "attention_detail": null, "created_at_ms": 1700000000000, "updated_at_ms": 1700000100000 } },
+  { "type": "thread_updated", "summary": { "thread_id": "t-third", "title": "", "provider": "claude", "model": null, "location": { "type": "home" }, "state": { "type": "paused", "resets_at_ms": null }, "enforcement": null, "incarnation": 1, "native_session_id": null, "last_event": null, "unread": false, "pending_approvals": 0, "pending_questions": 0, "attention_since_ms": null, "attention_detail": null, "created_at_ms": 1700000110000, "updated_at_ms": 1700000110000 } },
+  { "type": "inbox_updated", "items": [{ "thread_id": null, "reason": "storage_full", "since_ms": 1700000120000, "title": "Storage is full", "detail": null }] },
+  { "type": "thread_removed", "thread_id": "t-new" },
+  { "type": "snapshot", "thread_id": "t-old", "events": [{ "id": 40, "thread_id": "t-old", "envelope": { "incarnation": 1, "seq": 7, "at_ms": 1700000050000, "event": { "type": "turn_started", "turn": 2 } } }], "has_older": true, "truncated": false, "last": 40 },
+  { "type": "event", "event": { "id": 41, "thread_id": "t-old", "envelope": { "incarnation": 1, "seq": 8, "at_ms": 1700000051000, "event": { "type": "message_delta", "message_id": "m-1", "kind": "assistant", "text": "Looking." } } } },
+  { "type": "thread_failed", "thread_id": "t-gone", "code": "unknown_thread", "message": "no such thread" }
+]
