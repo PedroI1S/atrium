@@ -1,0 +1,48 @@
+[package]
+name = "atrium-app"
+version = "0.0.0"
+description = "Atrium: the desktop app (Tauri shell, daemon bridge, windows, tray)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "atrium_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium"
+path = "src/main.rs"
+
+[dependencies]
+atrium-protocol.workspace = true
+atrium-client.workspace = true
+atrium-host.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# `macos-private-api`: a transparent window, so vibrancy shows through (D-034).
+tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
+window-vibrancy = "0.8"
+url = "2"
+rustix = { version = "1", features = ["process", "fs"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSWorkspace", "NSAccessibility", "block2"] }
+objc2-foundation = { version = "0.3", features = ["NSNotification", "NSOperation", "block2"] }
+block2 = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already in the tree through Tauri; used by the WebKitGTK settings in src/linux.rs.
+gtk = "0.18"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

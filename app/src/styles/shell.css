@@ -1,0 +1,56 @@
+/* The shell around the cards: the window wrapper, the Linux window strip and its controls,
+ * the connection line, and the parts that show daemon data (thread list states, inbox rows,
+ * thread details, empty states). Tokens only; their literals are in base.css and the themes. */
+
+/* The text size setting scales the whole interface (a runtime token, contract §11.1). */
+.app { zoom: var(--ui-scale); }
+.window { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.i.xs { width: var(--icon-xs); height: var(--icon-xs); }
+
+/* ---- Linux: the frame's top strip (drag region) and the window controls ------------------ */
+.winbar { height: var(--winbar-height); flex: none; display: flex; align-items: center; padding: 0 var(--u2); margin-bottom: calc(var(--card-gap) * -1 + var(--u1)); }
+.wincontrols { display: flex; align-items: center; gap: var(--u1); flex: none; }
+.wc { width: var(--wc-size); height: var(--wc-size); border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; color: var(--text-muted); transition: background var(--motion-fast), color var(--motion-fast); }
+.wc:hover { background: var(--selected); color: var(--text); }
+.wc.close:hover { background: var(--state-failed-bg); color: var(--state-failed); }
+.window[data-platform="linux"] .frame { padding-top: var(--u1); }
+
+/* macOS keeps its traffic lights: only there do the top-left corners leave room for them. */
+.pop-bar:not(.lights) { padding-left: var(--u4); }
+.side-strip:not(.lights) { padding-top: var(--u2); }
+.pop-frame[data-platform="linux"] .pop-bar { padding-right: var(--u15); }
+
+/* ---- the connection to the background service -------------------------------------------- */
+.connbar { min-height: var(--connbar-min-height); flex: none; display: flex; align-items: center; gap: var(--u25); margin: var(--u1) var(--card-gap) 0; padding: var(--u15) var(--u3); border-radius: var(--row-radius); background: var(--hover); font-size: var(--text-small); }
+.connbar[data-kind="incompatible"], .connbar[data-kind="failed"] { background: var(--state-failed-bg); }
+.cb-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.cb-text b { font-weight: var(--weight-medium); }
+.cb-text span { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- sidebar ----------------------------------------------------------------------------- */
+.side-empty { margin: var(--u2) var(--u25); color: var(--text-muted); font-size: var(--text-small); }
+.chats { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+
+/* ---- empty states -------------------------------------------------------------------------- */
+.thread-empty { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--u15); text-align: center; color: var(--text-muted); font-size: var(--text-ui); padding: var(--u6); }
+.thread-empty b { color: var(--text); font-weight: var(--weight-semibold); font-size: var(--text-section); letter-spacing: var(--tracking-section); }
+.thread-empty span { max-width: var(--empty-measure); }
+
+/* ---- inbox --------------------------------------------------------------------------------- */
+.inbox { flex: 1; min-height: 0; overflow-y: auto; padding: var(--u1) var(--u3) var(--u3); display: flex; flex-direction: column; gap: var(--hairline); }
+.inbox-row { display: flex; align-items: center; gap: var(--u3); min-height: var(--inbox-row-height); padding: var(--u2) var(--u3); border-radius: var(--row-radius); width: 100%; flex: none; transition: background var(--motion-fast); }
+.inbox-row:hover:not(:disabled), .inbox-row.sel { background: var(--hover); }
+.ir-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.ir-main b { font-weight: var(--weight-medium); font-size: var(--text-ui); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ir-main span { color: var(--text-muted); font-size: var(--text-small); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inbox-row .m { font-size: var(--text-meta); color: var(--text-muted); flex: none; }
+.card-foot { flex: none; padding: var(--u25) var(--u5); border-top: var(--hairline) solid var(--border); }
+
+/* ---- thread details (the panel's one tab in M1) -------------------------------------------- */
+.facts { padding: var(--u1) var(--u4) var(--u4); display: flex; flex-direction: column; gap: var(--u25); font-size: var(--text-small); -webkit-user-select: text; user-select: text; }
+.fact { display: flex; gap: var(--u3); align-items: baseline; }
+.fl { width: var(--fact-label-width); flex: none; color: var(--text-muted); }
+.fv { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.fv.code { font-family: var(--font-code); font-size: var(--text-mono-sm); }
+.fact-note { margin: 0 0 0 calc(var(--fact-label-width) + var(--u3)); color: var(--text-muted); }
+.panel-body > .placeholder { padding: var(--u6); }
