@@ -28,7 +28,7 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 
 - **Never keep the repo or worktrees in a cloud-synced folder** (iCloud Drive "Desktop & Documents", Dropbox, OneDrive). Sync creates conflict copies (`file 2.md`) inside the tree and `.git` while git and agents rewrite files. Renaming a folder to `.nosync` inside a synced folder is **not** enough: iCloud kept syncing it (D-036). Keep the repo outside `~/Documents` and `~/Desktop`, with `atrium-wt` as its sibling (briefs use `../atrium-wt`). On Pedro's Mac: `~/Harness` and `~/atrium-wt`.
 
-- **GUI measurements are exclusive.** Only one app window set may be measured at a time; overlapping or occluded windows throttle rAF and invalidate the run. Wrap every GUI measurement or screenshot run in `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock <command>`, and hold the lock only while measuring.
+- **GUI measurements are exclusive.** Only one app window set may be measured at a time; overlapping or occluded windows throttle rAF and invalidate the run. Wrap every GUI measurement or screenshot run in `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock <command>`, and hold the lock only while measuring. On Linux there is no `lockf`: use `flock /tmp/atrium-gui-measure.lock <command>`.
 
 - **Stopping a worker doesn't stop what it launched.** Background processes (bench loops, dev servers, apps, browsers) keep running, and they keep relaunching windows. After stopping or pausing a worker, the orchestrator finds and stops every process started from that worktree (`ps` matching the worktree path, the task id, and the spike's app/binary names), and tells the worker to clean up when it resumes. Workers stop their own background processes before finishing.
 
