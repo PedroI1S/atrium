@@ -1,6 +1,6 @@
 # Handoff: M1-09a-app-shell
 
-Model: Claude Fable 5 (orchestrator, inline; D-057, D-059) on rodrigo's machine, finished by Claude Opus 5.5 (orchestrator, inline) on Pedro's Mac · Status: **written and checked on macOS; review pending**
+Model: Claude Fable 5 (orchestrator, inline; D-057, D-059) on rodrigo's machine, finished by Claude Opus 5.5 (orchestrator, inline) on Pedro's Mac · Status: **done**: Flash review **approve** (two nits, fixed), Opus `unsafe` audit **sound with changes** (fixed)
 
 Written at the handoff of 2026-11-12 from the branch's state. The session that wrote the code left no note, so what follows is taken from its commits, its files and the outputs it left.
 
@@ -31,7 +31,15 @@ First run on macOS. All on Pedro's MacBook Air.
   - **Idle memory, 9 launches: per-launch medians 82.6–84.8 MiB** (app + 3 WebKit processes): within the gate (< 150). Per-launch max 86.8–93.0 MiB, except launch 9: one sample at 143.7 MiB (under 150, not an excursion by §14's rule; not explained).
 - Tray: not exercised by any script on macOS (the app has one there; check by hand).
 
-## Exact next step
+## Reviews
+- Gemini 3.8 Flash (read-only, `reviews/M1-09a-app-shell.md`): **approve**. Nits fixed: a comment in `replace_daemon` on the `WhenIdle` reconnect; the audit fixes committed.
+- Opus 5.5 `unsafe` audit (`reviews/M1-09a-app-shell-unsafe.md`, D-061): **sound with changes**. Fixed: a `MainThreadMarker` check in `apply_to_new_window`, the module doc, the observer's SAFETY comment. Left as known: `set_alpha` can apply the alpha after reporting a timeout if the main thread is busy for more than 5 s (stale state until the next change, not unsound).
+
+## For M1-09b and M1-14
+- M1-09b: build on the bridge, window model, sync reducer and settings registry as they are; the harness scripts build the app first; screenshots on macOS use `screencapture` (Screen Recording permission).
+- M1-14: run `live_check.py`, `screenshots.py` and `startup_bench.py` on Linux (private PSS); the tray on a desktop that has one; M1-10's Linux review findings (`reviews/M1-10-host-linux-exit.md`).
+
+## Exact next step (historical, from rodrigo's handoff)
 In a recreated worktree (`git worktree add ../atrium-wt/M1-09a-app-shell agent/fable/M1-09a-app-shell`): run the DoD commands, then `python3 app/scripts/live_check.py`, then `python3 app/scripts/screenshots.py <dir>`; tick the DoD in this note; write the Flash review prompt.
 
 ## Gotchas

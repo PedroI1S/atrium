@@ -616,6 +616,10 @@ fn replace_daemon(
     match upgrade::stop_old_daemon(&state.paths.lock, daemon_pid, how) {
         // Already gone: the next connection attempt starts the new one.
         Ok(()) | Err(upgrade::UpgradeError::Gone) => {
+            // With `WhenIdle` an old daemon with running turns is still up:
+            // this attempt meets `Incompatible` again and the banner shows
+            // "Waiting for its running turns to finish…". The client's
+            // backoff keeps trying and connects once the old daemon exits.
             state.bridge.client().reconnect();
             Ok(())
         }

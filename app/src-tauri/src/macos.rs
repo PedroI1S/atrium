@@ -1,10 +1,11 @@
 //! AppKit calls for translucent windows (ui-direction §5): the window's
 //! alpha, vibrancy, and the accessibility display options.
 //!
-//! This is the one module of the app with `unsafe` (two dereferences of the
-//! `NSWindow` pointer Tauri hands out, and registering a notification
-//! observer). It is ported from the M0-06b spike, which ran on macOS; it has
-//! not been compiled since (CR-11 asks for the exception this needs).
+//! This is the one module of the app with `unsafe` (CR-11, D-061): three
+//! dereferences of the `NSWindow` pointer Tauri hands out, and registering a
+//! notification observer. Ported from the M0-06b spike; audited by Opus 5.5
+//! (`docs/agents/reviews/M1-09a-app-shell-unsafe.md`). New `unsafe` needs its
+//! own change request.
 #![allow(unsafe_code)]
 
 use std::time::Duration;
@@ -97,12 +98,15 @@ pub fn apply_to_new_window(window: &tauri::WebviewWindow, target: NativeState) -
             Err(error) => eprintln!("atrium: vibrancy failed: {error}"),
         }
     }
+    // `NSWindow` is main-thread only: every caller today (setup, `pop_out`,
+    // `restore_windows`) runs there, and this check keeps a future caller
+    // from making the reference anywhere else.
     if target.alpha < 1.0
+        && objc2_foundation::MainThreadMarker::new().is_some()
         && let Ok(pointer) = window.ns_window()
     {
-        // SAFETY: called on the main thread (setup, or a synchronous
-        // command) with the pointer of a window that was just built and is
-        // still alive.
+        // SAFETY: on the main thread (checked above), with the pointer of a
+        // window that was just built and is still alive, borrowed only here.
         let native = unsafe { &*pointer.cast::<objc2_app_kit::NSWindow>() };
         native.setAlphaValue(target.alpha);
         applied.alpha = native.alphaValue();
@@ -121,8 +125,10 @@ pub fn observe_accessibility(app: tauri::AppHandle) {
         let _ = app.emit("accessibility-changed", accessibility_opaque());
     });
     let center = NSWorkspace::sharedWorkspace().notificationCenter();
-    // SAFETY: a valid notification name and no object filter; the block only
-    // emits a Tauri event, which is safe from any thread.
+    // SAFETY: a valid notification name and no object filter. With `queue`
+    // None the block runs on whichever thread posts the notification, so it
+    // must be sendable: it captures only an `AppHandle` (`Send + Sync`) and
+    // only emits a Tauri event, which is safe from any thread.
     let token = unsafe {
         center.addObserverForName_object_queue_usingBlock(
             Some(NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification),
