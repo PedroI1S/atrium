@@ -335,15 +335,27 @@ fn kill_recorded_kills_matching_live_orphan_group() {
 
 #[tokio::test]
 async fn fast_exiting_process_records_identity_and_terminates_cleanly() {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("exit 0");
-    let mut sup = spawn_group(cmd).expect("spawn_group fast exit");
-    assert_eq!(sup.identity.pgid, sup.identity.pid);
-    let term = terminate(&mut sup, Duration::from_secs(1))
-        .await
-        .expect("terminate fast exit");
-    assert_eq!(term.exit_code, Some(0));
-    assert!(!term.killed);
+    // The window in which a child is exiting (no executable to read yet) is
+    // narrow, so the spawn is repeated to hit it often. Whichever way each
+    // spawn lands (a real executable read, or the resolved path of a child
+    // that is already gone), it must record a usable identity.
+    for round in 0..200 {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("exit 0");
+        let mut sup =
+            spawn_group(cmd).unwrap_or_else(|e| panic!("spawn_group, round {round}: {e}"));
+        assert_eq!(sup.identity.pgid, sup.identity.pid, "round {round}");
+        assert!(
+            sup.identity.executable.is_absolute(),
+            "round {round}: {:?}",
+            sup.identity.executable
+        );
+        let term = terminate(&mut sup, Duration::from_secs(1))
+            .await
+            .unwrap_or_else(|e| panic!("terminate, round {round}: {e}"));
+        assert_eq!(term.exit_code, Some(0), "round {round}");
+        assert!(!term.killed, "round {round}");
+    }
 }
 
 #[test]

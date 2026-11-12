@@ -352,9 +352,11 @@ fn identify_spawned(
         return Ok(id);
     }
     // The child we just spawned has not been waited on yet, so if `identify`
-    // returned `None` it has already exited into a zombie state before its
-    // executable vnode could be queried. Read its kernel `pgid` and
-    // `start_time` from the zombie entry and resolve `raw_program`.
+    // returned `None` it has already exited or is exiting (a zombie, or a
+    // task that has dropped its memory and so has no executable to read yet).
+    // Read its kernel `pgid` and `start_time` from its entry and resolve
+    // `raw_program`: this identity's `executable` is a resolved guess, not
+    // read from the kernel (a shebang script's real one is its interpreter).
     let raw_pid = i32::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of i32 range"))?;
     let (pgid, start_time) = platform_zombie_timings(raw_pid)?;
@@ -500,41 +502,131 @@ fn platform_zombie_timings(raw_pid: i32) -> io::Result<(u32, u64)> {
     Ok((info.pbi_pgid, bsd_start_time(&info)))
 }
 
-/// Parses Linux `/proc/<pid>/stat` into `(state, pgid, start_time_field_22)`.
+/// `PF_EXITING`: the task is being torn down (`include/linux/sched.h`).
 #[cfg(any(target_os = "linux", test))]
-fn parse_linux_proc_stat(stat_text: &str) -> io::Result<(char, u32, u64)> {
+const PF_EXITING: u64 = 0x0000_0004;
+/// `PF_KTHREAD`: a kernel thread, never a process Atrium started.
+#[cfg(any(target_os = "linux", test))]
+const PF_KTHREAD: u64 = 0x0020_0000;
+
+/// What Linux `/proc/<pid>/stat` says about a task.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxStat {
+    /// Field 3.
+    state: char,
+    /// Field 9 (`task->flags`).
+    flags: u64,
+    /// Field 5.
+    pgid: u32,
+    /// Field 22.
+    start_time: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl LinuxStat {
+    fn is_dead(&self) -> bool {
+        matches!(self.state, 'Z' | 'X' | 'x')
+    }
+}
+
+/// Parses Linux `/proc/<pid>/stat`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_proc_stat(stat_text: &str) -> io::Result<LinuxStat> {
+    fn bad(what: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, what)
+    }
     let close_paren = stat_text
         .rfind(')')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed /proc/pid/stat"))?;
+        .ok_or_else(|| bad("malformed /proc/pid/stat"))?;
     let rest = stat_text[close_paren + 1..].trim_start();
     let mut fields = rest.split_whitespace();
     // Field 3: state
-    let state_str = fields
+    let state = fields
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing stat state"))?;
-    let state = state_str
+        .ok_or_else(|| bad("missing stat state"))?
         .chars()
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty stat state"))?;
-    // Field 4: ppid (skip), Field 5: pgrp
+        .ok_or_else(|| bad("empty stat state"))?;
+    // Field 4: ppid (skip), field 5: pgrp
     let _ppid = fields.next();
     let pgid: u32 = fields
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing stat pgrp"))?
+        .ok_or_else(|| bad("missing stat pgrp"))?
         .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid stat pgrp"))?;
-    // Skip fields 6..=21 (16 fields) to reach field 22 (starttime).
-    let start_str = fields
-        .nth(16)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing stat starttime"))?;
-    let start_time: u64 = start_str
+        .map_err(|_| bad("invalid stat pgrp"))?;
+    // Skip fields 6..=8 (session, tty_nr, tpgid) to reach field 9 (flags).
+    let flags: u64 = fields
+        .nth(3)
+        .ok_or_else(|| bad("missing stat flags"))?
         .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid stat starttime"))?;
-    Ok((state, pgid, start_time))
+        .map_err(|_| bad("invalid stat flags"))?;
+    // Skip fields 10..=21 (12 fields) to reach field 22 (starttime).
+    let start_time: u64 = fields
+        .nth(12)
+        .ok_or_else(|| bad("missing stat starttime"))?
+        .parse()
+        .map_err(|_| bad("invalid stat starttime"))?;
+    Ok(LinuxStat {
+        state,
+        flags,
+        pgid,
+        start_time,
+    })
+}
+
+/// What to make of an attempt to read `/proc/<pid>/exe`.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExeVerdict {
+    /// The executable that was read belongs to the task `first` described.
+    Identity,
+    /// There is no running process to identify (`Ok(None)`).
+    NoProcess,
+    /// The answer can't be trusted (`Err`, so cleanup stays `Unverified`).
+    Unverifiable,
+}
+
+/// The decision behind `platform_identify`, pure so that it is tested on every
+/// platform. `exe` is the result of reading `/proc/<pid>/exe` (only the error
+/// kind matters); `first` is the stat read before it and `after` the stat read
+/// after it (`None` if `/proc/<pid>` is gone by then).
+///
+/// - Gone or replaced: `after` missing means no process now; a different
+///   `start_time` means the pid was reused while we looked, and nothing read
+///   in between can be attributed to either process (`Unverifiable`).
+/// - Read succeeded and it is the same task: `Identity`.
+/// - Read failed: `NoProcess` if the task is dead (`Z`/`X`/`x`), is exiting
+///   (`PF_EXITING`: it has dropped its `mm`, and with it `exe`, but is not
+///   `Z` yet) or is a kernel thread (`PF_KTHREAD`: never has an `exe`) and
+///   the error is `ENOENT`. Any other failure of a live task, `ENOENT` of an
+///   ordinary live process included, stays `Unverifiable`.
+///
+/// Nothing here turns a failure into an `Identity`.
+#[cfg(any(target_os = "linux", test))]
+fn judge_exe_read(
+    exe: Result<(), io::ErrorKind>,
+    first: &LinuxStat,
+    after: Option<&LinuxStat>,
+) -> ExeVerdict {
+    let Some(after) = after else {
+        return ExeVerdict::NoProcess;
+    };
+    if after.start_time != first.start_time {
+        return ExeVerdict::Unverifiable;
+    }
+    match exe {
+        Ok(()) => ExeVerdict::Identity,
+        Err(_) if after.is_dead() => ExeVerdict::NoProcess,
+        Err(io::ErrorKind::NotFound) if after.flags & (PF_EXITING | PF_KTHREAD) != 0 => {
+            ExeVerdict::NoProcess
+        }
+        Err(_) => ExeVerdict::Unverifiable,
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn read_linux_stat(pid: u32) -> io::Result<Option<(char, u32, u64)>> {
+fn read_linux_stat(pid: u32) -> io::Result<Option<LinuxStat>> {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(text) => parse_linux_proc_stat(&text).map(Some),
         Err(err)
@@ -547,36 +639,34 @@ fn read_linux_stat(pid: u32) -> io::Result<Option<(char, u32, u64)>> {
 }
 
 #[cfg(target_os = "linux")]
-fn is_dead_linux_state(state: char) -> bool {
-    matches!(state, 'Z' | 'X' | 'x')
-}
-
-#[cfg(target_os = "linux")]
 fn platform_identify(pid: u32, _raw_pid: i32) -> io::Result<Option<ProcessIdentity>> {
-    let Some((state, pgid, start_time)) = read_linux_stat(pid)? else {
+    let Some(first) = read_linux_stat(pid)? else {
         return Ok(None);
     };
-    if is_dead_linux_state(state) {
+    if first.is_dead() {
         return Ok(None);
     }
-    match std::fs::read_link(format!("/proc/{pid}/exe")) {
-        Ok(executable) => Ok(Some(ProcessIdentity {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"));
+    // Stat and exe are two reads, so the pid could be reused in between.
+    // Read stat again and let `judge_exe_read` compare the start times.
+    let after = read_linux_stat(pid)?;
+    let verdict = judge_exe_read(
+        exe.as_ref().map(|_| ()).map_err(io::Error::kind),
+        &first,
+        after.as_ref(),
+    );
+    match (verdict, exe) {
+        (ExeVerdict::Identity, Ok(executable)) => Ok(Some(ProcessIdentity {
             pid,
-            pgid,
-            start_time,
+            pgid: first.pgid,
+            start_time: first.start_time,
             executable,
         })),
-        Err(err) => match read_linux_stat(pid)? {
-            None => Ok(None),
-            Some((after_state, _, _)) if is_dead_linux_state(after_state) => Ok(None),
-            // A process that is exiting gives up its memory, and with it
-            // `/proc/<pid>/exe` (`ENOENT`), before its state becomes `Z`.
-            // In that window it is no longer a running process with an
-            // executable to compare. (A kernel thread never has one either,
-            // and is never a process Atrium started.)
-            Some(_) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-            Some(_) => Err(err),
-        },
+        (ExeVerdict::NoProcess, _) => Ok(None),
+        (_, Err(err)) => Err(err),
+        (_, Ok(_)) => Err(io::Error::other(format!(
+            "pid {pid} changed while its identity was being read"
+        ))),
     }
 }
 
@@ -584,9 +674,9 @@ fn platform_identify(pid: u32, _raw_pid: i32) -> io::Result<Option<ProcessIdenti
 fn platform_zombie_timings(raw_pid: i32) -> io::Result<(u32, u64)> {
     let pid = u32::try_from(raw_pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative pid"))?;
-    let (_, pgid, start_time) = read_linux_stat(pid)?
+    let stat = read_linux_stat(pid)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "spawned child vanished"))?;
-    Ok((pgid, start_time))
+    Ok((stat.pgid, stat.start_time))
 }
 
 #[cfg(test)]
@@ -595,11 +685,116 @@ mod unit_tests {
 
     #[test]
     fn linux_stat_parser_handles_spaces_and_parens_in_comm() {
+        // From field 3: state S, ppid 1, pgrp 4242, session 4242, tty 0,
+        // tpgid -1, flags 4194304 (field 9), ..., starttime 987654321 (field 22).
         let sample = "4242 (weird (comm) name\nline2) S 1 4242 4242 0 -1 4194304 \
             100 0 1 0 10 5 0 0 20 0 3 0 987654321 12345678 100";
-        let (state, pgid, start) = parse_linux_proc_stat(sample).unwrap();
-        assert_eq!(state, 'S');
-        assert_eq!(pgid, 4242);
-        assert_eq!(start, 987_654_321);
+        let stat = parse_linux_proc_stat(sample).unwrap();
+        assert_eq!(stat.state, 'S');
+        assert_eq!(stat.pgid, 4242);
+        assert_eq!(stat.flags, 4_194_304);
+        assert_eq!(stat.start_time, 987_654_321);
+    }
+
+    #[test]
+    fn linux_stat_parser_rejects_truncated_text() {
+        // Ends before field 22.
+        let sample = "7 (x) S 1 7 7 0 -1 4194304 100 0 1 0 10 5 0 0 20 0 3 0";
+        assert!(parse_linux_proc_stat(sample).is_err());
+        assert!(parse_linux_proc_stat("no parenthesis").is_err());
+    }
+
+    fn stat(state: char, flags: u64, start_time: u64) -> LinuxStat {
+        LinuxStat {
+            state,
+            flags,
+            pgid: 100,
+            start_time,
+        }
+    }
+
+    const LIVE: u64 = 0x0040_0000; // PF_FORKNOEXEC, an ordinary task
+    const ENOENT: Result<(), io::ErrorKind> = Err(io::ErrorKind::NotFound);
+    const EACCES: Result<(), io::ErrorKind> = Err(io::ErrorKind::PermissionDenied);
+
+    #[test]
+    fn exe_read_decision_table() {
+        use ExeVerdict::{Identity, NoProcess, Unverifiable};
+        let first = stat('S', LIVE, 500);
+        let same = |state, flags| stat(state, flags, 500);
+        let table = [
+            // The read worked.
+            ("exe ok, same task", Ok(()), Some(same('S', LIVE)), Identity),
+            (
+                "exe ok, task now zombie",
+                Ok(()),
+                Some(same('Z', LIVE)),
+                Identity,
+            ),
+            (
+                "exe ok, pid reused (other start time)",
+                Ok(()),
+                Some(stat('S', LIVE, 501)),
+                Unverifiable,
+            ),
+            ("exe ok, /proc entry gone", Ok(()), None, NoProcess),
+            // ENOENT: only dead, exiting or kernel threads are "no process".
+            (
+                "ENOENT, exiting",
+                ENOENT,
+                Some(same('S', LIVE | PF_EXITING)),
+                NoProcess,
+            ),
+            ("ENOENT, zombie", ENOENT, Some(same('Z', LIVE)), NoProcess),
+            ("ENOENT, dead X", ENOENT, Some(same('X', LIVE)), NoProcess),
+            (
+                "ENOENT, kernel thread",
+                ENOENT,
+                Some(same('S', PF_KTHREAD)),
+                NoProcess,
+            ),
+            (
+                "ENOENT, ordinary live process",
+                ENOENT,
+                Some(same('S', LIVE)),
+                Unverifiable,
+            ),
+            ("ENOENT, /proc entry gone", ENOENT, None, NoProcess),
+            (
+                "ENOENT, exiting but pid reused",
+                ENOENT,
+                Some(stat('S', LIVE | PF_EXITING, 501)),
+                Unverifiable,
+            ),
+            (
+                "ENOENT, zombie but pid reused",
+                ENOENT,
+                Some(stat('Z', LIVE, 501)),
+                Unverifiable,
+            ),
+            // Other errors stay errors for a live task.
+            ("EACCES, live", EACCES, Some(same('S', LIVE)), Unverifiable),
+            (
+                "EACCES, exiting",
+                EACCES,
+                Some(same('S', LIVE | PF_EXITING)),
+                Unverifiable,
+            ),
+            (
+                "EACCES, kernel thread",
+                EACCES,
+                Some(same('S', PF_KTHREAD)),
+                Unverifiable,
+            ),
+            // A dead task is gone whatever the error was.
+            ("EACCES, zombie", EACCES, Some(same('Z', LIVE)), NoProcess),
+        ];
+        for (name, exe, after, expected) in table {
+            assert_eq!(
+                judge_exe_read(exe, &first, after.as_ref()),
+                expected,
+                "{name}"
+            );
+        }
     }
 }
