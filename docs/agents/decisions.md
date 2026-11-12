@@ -364,3 +364,9 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **When:** M2, as planned for ACP (PLAN §5), OpenCode first. Not pulled into M1: the M1 contract is provider-agnostic (`AgentAdapter`, per-session enforcement, the gate), so the adapter is additive and needs no change to the frozen contract, the protocol or the UI.
 - The M0-04 fixtures and the must-fix items O1–O10 carry over where they still apply. Free hosted OpenCode models stay `untrusted` by default (PLAN §3.21).
 - PLAN.md updated: providers table, architecture sketches, §3.2, §5 (M2), the open questions, the routing row, the milestone table.
+
+## D-064 — 2026-11-12 — D-060 and D-062 bind Pedro's shifts only
+**Decided by Pedro (driver).** The usage limits behind D-060 (Argon and Codex out of usage) are Pedro's accounts, not rodrigo's. So:
+- **D-060's model routing** and **D-062's way of working** (parallel workers routed to Claude, Flash and Opus reviews in place of Argon and Codex) apply **on Pedro's shifts only**.
+- **On rodrigo's shifts the original workflow holds**: contract §15's routing and reviewers (Argon, Codex/Sol, Astra where they're named), PLAN §8, and rodrigo's own decisions (D-057, D-059). This stays true unless rodrigo decides otherwise and records it here.
+- What D-062 decided about tasks still holds for everyone: the go for M1-09b, M1-07 and M1-13, and remembered rules staying global. On a rodrigo shift, the remaining work and reviews of those tasks follow his routing.
