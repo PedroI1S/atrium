@@ -345,3 +345,6 @@ Housekeeping the same day, asked for by Pedro: the stale `claude/design-ui-direc
 - Gemini 3.8 Flash reviews through `agy` (D-056, D-057, D-059) are unchanged.
 
 Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it stopped: finish M1-09a under D-059.
+
+## D-061 — 2026-11-12 — CR-11 approved: `unsafe` in the app's macOS module
+**Decided by Pedro (driver).** `unsafe_code` is allowed in `app/src-tauri/src/macos.rs` only (macOS-only module, `#![allow(unsafe_code)]`); the workspace lint stays `deny` everywhere else. Every block carries a `// SAFETY:` comment. Today there are four: three dereferences of Tauri's `NSWindow` pointer (`set_alpha`, `apply_to_new_window`, `window_number`) and the accessibility observer registration. An Opus 5.5 audit of the four blocks is required before M1-09a is merged (as for M1-10, D-053). Any new `unsafe` in the app needs its own change request.
