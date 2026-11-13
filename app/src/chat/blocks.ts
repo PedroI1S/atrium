@@ -5,7 +5,7 @@
 //
 // Long blocks are cut so no single row grows without bound (a 100k-character paragraph would be
 // re-parsed and re-laid-out every frame): an open paragraph past SOFT_BLOCK_CHARS closes at its
-// last line break (or, with none, its last space), and an open fence past SOFT_FENCE_LINES
+// last line break (or, with none, its last space; or, with no space either, at the limit), and an open fence past SOFT_FENCE_LINES
 // closes and continues as a second code block. Such a block is marked `cont` so the view joins
 // it to the one before. The cost: inline markup that spans a cut (a `**` opened before it) is
 // shown as text on both sides. Only paragraphs over 4 KB without blank lines are affected.
@@ -14,6 +14,9 @@
 export const SOFT_BLOCK_CHARS = 4096;
 /** An open fence past this many lines is cut. */
 export const SOFT_FENCE_LINES = 200;
+
+const HIGH_SURROGATE_FIRST = 0xd800;
+const HIGH_SURROGATE_LAST = 0xdbff;
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
 
@@ -181,13 +184,24 @@ export class BlockSplitter {
       this.body = "";
       this.close(b);
       this.cont = true;
-      return;
     }
-    // One long line: cut at its last space, if it has one.
-    const space = this.partial.lastIndexOf(" ");
-    if (space <= 0) return;
-    this.close(this.partial.slice(0, space));
-    this.partial = this.partial.slice(space + 1);
-    this.cont = true;
+    // One long line (it may have arrived whole, as a folded delta): cut at the last space
+    // within the limit. With no space there (a long token, encoded data) it is cut at the
+    // limit, between two characters, so no row grows without bound either way.
+    while (this.partial.length > SOFT_BLOCK_CHARS) {
+      const space = this.partial.lastIndexOf(" ", SOFT_BLOCK_CHARS);
+      if (space > 0) {
+        this.close(this.partial.slice(0, space));
+        this.partial = this.partial.slice(space + 1);
+      } else {
+        let at = SOFT_BLOCK_CHARS;
+        const before = this.partial.charCodeAt(at - 1);
+        // Never between the two halves of one character.
+        if (before >= HIGH_SURROGATE_FIRST && before <= HIGH_SURROGATE_LAST) at--;
+        this.close(this.partial.slice(0, at));
+        this.partial = this.partial.slice(at);
+      }
+      this.cont = true;
+    }
   }
 }

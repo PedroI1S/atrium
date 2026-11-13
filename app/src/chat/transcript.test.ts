@@ -73,6 +73,27 @@ describe("messages", () => {
     expect(blocks.map((b) => b.text).join(" ").replace(/\s+/g, " ").trim()).toBe(word.repeat(2000).trim());
   });
 
+  it("a long run without any space is cut too, token by token or arriving whole, and never inside a character", () => {
+    reset();
+    const streamed = new Transcript();
+    for (let i = 0; i < 12_000; i++) streamed.apply([ev(delta("a1", "synt"))]);
+    const whole = new Transcript();
+    whole.apply([ev(delta("a1", "synt".repeat(12_000)))]);
+    for (const t of [streamed, whole]) {
+      const blocks = messages(t)[0]!.splitter.blocks;
+      expect(blocks.length).toBe(Math.ceil((4 * 12_000) / SOFT_BLOCK_CHARS));
+      expect(blocks.every((b) => b.text.length <= SOFT_BLOCK_CHARS)).toBe(true);
+      expect(blocks.slice(1).every((b) => b.cont)).toBe(true);
+      expect(blocks.map((b) => b.text).join("")).toBe("synt".repeat(12_000));
+    }
+    const emoji = new Transcript();
+    // An odd offset puts a two-unit character across the limit.
+    emoji.apply([ev(delta("a1", `x${"😀".repeat(SOFT_BLOCK_CHARS)}`))]);
+    const cut = messages(emoji)[0]!.splitter.blocks;
+    expect(cut.every((b) => b.text.length <= SOFT_BLOCK_CHARS && !/[\ud800-\udbff]$/.test(b.text))).toBe(true);
+    expect(cut.map((b) => b.text).join("")).toBe(`x${"😀".repeat(SOFT_BLOCK_CHARS)}`);
+  });
+
   it("a long code block continues as a second code block", () => {
     reset();
     const t = new Transcript();
