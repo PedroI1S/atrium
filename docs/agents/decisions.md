@@ -391,3 +391,11 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 *Update, same day (orchestrator):*
 - The `agy` 1.5.7 hook check passed (Flash, scratch worktree): `cargo --version` allowed, a write to `.agents/` and `git push` denied by the hook. `scripts/doctor` now names 1.5.7 as the tested version.
 - M1-14 is split, as M1-09 was: **M1-14a-linux-host** (M1-10's four Linux review findings, a live run of the Linux paths, L8; no GUI, no app file; Sonnet 5.5, reviewed by Argon) is dispatched now under D-059's go; **M1-14b-linux-app** (L1, L2 harness, L3 profiling, M1-09a's and M1-09b's runs on Linux; Fable 5.2, reviewed by Flash) waits for M1-09b's merge, because M1-09b owns `app/src/**` and `app/scripts/**`.
+
+## D-067 — 2026-11-13 — CR-08 and CR-10 approved; the stale M1-09a worktree removed
+**Decided by rodrigo (driver).**
+- **CR-08, approved:** `Store::launch(&ThreadId) -> StoreResult<Option<NewThread>>`, so a resumed thread keeps the effort and preset it was started with. M1-05's workaround (Home preset, no effort on resume) goes when it lands.
+- **CR-10, approved:** `Store::unfinished_incarnations() -> StoreResult<Vec<(ThreadId, u32)>>`, so recovery closes an unfinished incarnation of an archived thread and can clear a process record whose incarnation already ended. M1-13's finding 12 (a failed closure in recovery leaves `sessions.process` set) is looked at in the same change.
+- Both add a method to the frozen `Store` trait and change no existing one. They are applied on `dev` as one task (brief `M1-15-store-launch-recovery`), after M1-13 is merged, because it touches `atrium-daemon`'s recovery, which M1-13's new tests cover.
+- **Housekeeping, asked for by rodrigo:** the worktree `~/atrium-wt/M1-09a-app-shell` on rodrigo's machine was removed on 2026-11-13 (`git worktree remove`). M1-09a is merged into `dev` (`1d8d9ca`); the worktree was clean when removed (the untracked `skills/` folder seen in it on 2026-11-12 was already gone). The local branch `agent/fable/M1-09a-app-shell` (at `b35ea1c`, eight commits behind its pushed branch) and `origin/agent/fable/M1-09a-app-shell` were left as they are.
+
