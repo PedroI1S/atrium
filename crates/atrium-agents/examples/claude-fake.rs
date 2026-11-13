@@ -10,7 +10,15 @@
 //! `hook-badcb` (bad `hook_callback` requests), `hook-bigargs` (a hook call
 //! whose tool arguments exceed the cap), `canuse`, `canuse-noid` and
 //! `canuse-question` (a `can_use_tool` request no hook preceded), and
-//! `grandchild` (starts a long-lived child and ignores stdin EOF).
+//! `grandchild` (starts a long-lived child and ignores stdin EOF), and the
+//! review round-1 modes: `no-init` (never answers `initialize`),
+//! `canuse-cancel` / `canuse-result` (a `can_use_tool` request withdrawn, or
+//! left open when the turn ends), `hook-result` (the same for a hook call),
+//! `canuse-bigargs` / `canuse-bigargs-b` (a `can_use_tool` with oversize
+//! arguments, before / after the `tool_use` record), `hook-ask-changed` (the
+//! `can_use_tool` that follows an `ask` has another input), `hook-ask-anon2`
+//! (two identical hook calls without ids, then two `can_use_tool`) and
+//! `eof-flood` (an open turn, then thousands of records after stdin closes).
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Write};
@@ -68,6 +76,7 @@ fn main() {
     }
     let session_id = "fake-session-1";
     let flooding = Arc::new(AtomicBool::new(false));
+    let mut asked = 0usize;
     let stdin = std::io::stdin();
     for line in stdin.lock().lines().map_while(Result::ok) {
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
@@ -78,6 +87,9 @@ fn main() {
                 let id = v["request_id"].clone();
                 match v.pointer("/request/subtype").and_then(Value::as_str) {
                     Some("initialize") => {
+                        if mode == "no-init" {
+                            continue;
+                        }
                         append(&dir, "initialize.json", &line);
                         emit(
                             &json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{"commands":[]}}}),
@@ -99,14 +111,25 @@ fn main() {
             }
             Some("control_response") => {
                 let id = v.pointer("/response/request_id").and_then(Value::as_str);
-                if id == Some("h1") && mode == "hook-ask" {
+                if mode == "hook-ask-anon2" && matches!(id, Some("h1" | "h2")) {
+                    let which = id.unwrap_or_default();
+                    fs::write(dir.join(format!("hook_response_{which}.json")), &line).ok();
+                    asked += 1;
+                    if asked == 2 {
+                        for rid in ["c1", "c2"] {
+                            emit(
+                                &json!({"type":"control_request","request_id":rid,"request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}),
+                            );
+                        }
+                    }
+                } else if id == Some("h1") && (mode == "hook-ask" || mode == "hook-ask-changed") {
                     fs::write(dir.join("hook_response.json"), &line).ok();
                     let decision = v
                         .pointer("/response/response/hookSpecificOutput/permissionDecision")
                         .and_then(Value::as_str);
                     if decision == Some("ask") {
                         emit(
-                            &json!({"type":"control_request","request_id":"c1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"toolu_1","input":{"command":"echo hi"},"decision_reason":"asked"}}),
+                            &json!({"type":"control_request","request_id":"c1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"toolu_1","input":{"command": if mode == "hook-ask-changed" { "rm -rf x" } else { "echo hi" }},"decision_reason":"asked"}}),
                         );
                     } else {
                         emit(&assistant_text("denied"));
@@ -167,7 +190,65 @@ fn main() {
                             &json!({"type":"control_request","request_id":"h1","request":{"subtype":"hook_callback","callback_id":"atrium-pre-tool-use","input":{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":input,"tool_use_id":"toolu_1"}}}),
                         );
                     }
-                    "hook-ask" => {
+                    "hook-result" => {
+                        emit(
+                            &json!({"type":"assistant","message":{"model":"claude-fake","id":"msg_fake","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"x"}}]},"session_id":session_id}),
+                        );
+                        emit(
+                            &json!({"type":"control_request","request_id":"h1","request":{"subtype":"hook_callback","callback_id":"atrium-pre-tool-use","input":{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"x"},"tool_use_id":"toolu_1"}}}),
+                        );
+                        // Let the adapter hand the call to the gate first.
+                        thread::sleep(Duration::from_millis(300));
+                        emit(&result("success", false));
+                    }
+                    "hook-ask-anon2" => {
+                        for rid in ["h1", "h2"] {
+                            emit(
+                                &json!({"type":"control_request","request_id":rid,"request":{"subtype":"hook_callback","callback_id":"atrium-pre-tool-use","input":{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}}}),
+                            );
+                        }
+                    }
+                    "canuse-cancel" | "canuse-result" => {
+                        emit(
+                            &json!({"type":"assistant","message":{"model":"claude-fake","id":"msg_fake","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"session_id":session_id}),
+                        );
+                        emit(
+                            &json!({"type":"control_request","request_id":"c1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"toolu_1","input":{"command":"ls"}}}),
+                        );
+                        if mode == "canuse-cancel" {
+                            // Let the adapter hand the call to the gate first.
+                            thread::sleep(Duration::from_millis(300));
+                            emit(&json!({"type":"control_cancel_request","request_id":"c1"}));
+                            emit(&assistant_text("after-cancel"));
+                        } else {
+                            thread::sleep(Duration::from_millis(300));
+                            emit(&result("success", false));
+                        }
+                    }
+                    "canuse-bigargs" | "canuse-bigargs-b" => {
+                        let input = json!({"command":"x".repeat(4 * 1024 * 1024 + 16)});
+                        let tool_use = json!({"type":"assistant","message":{"model":"claude-fake","id":"msg_fake","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":input}]},"session_id":session_id});
+                        let request = json!({"type":"control_request","request_id":"c1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"toolu_1","input":input}});
+                        if mode == "canuse-bigargs" {
+                            emit(&request);
+                            emit(&tool_use);
+                        } else {
+                            emit(&tool_use);
+                            emit(&request);
+                        }
+                    }
+                    "eof-flood" => {
+                        emit(
+                            &json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"par"}},"session_id":session_id,"api_message_id":"msg_fake"}),
+                        );
+                        emit(
+                            &json!({"type":"assistant","message":{"model":"claude-fake","id":"msg_t","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"session_id":session_id}),
+                        );
+                        emit(
+                            &json!({"type":"control_request","request_id":"c1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"toolu_1","input":{"command":"ls"}}}),
+                        );
+                    }
+                    "hook-ask" | "hook-ask-changed" => {
                         let input = json!({"command":"echo hi"});
                         emit(
                             &json!({"type":"assistant","message":{"model":"claude-fake","id":"msg_fake","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":input}]},"session_id":session_id}),
@@ -211,6 +292,14 @@ fn main() {
                 }
             }
             _ => {}
+        }
+    }
+    if mode == "eof-flood" {
+        // stdin closed: the soft stop. Keep talking, then leave.
+        for _ in 0..6000 {
+            emit(
+                &json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}},"session_id":session_id,"api_message_id":"msg_fake"}),
+            );
         }
     }
     if mode == "grandchild" {

@@ -281,6 +281,8 @@ impl AgentAdapter for ClaudeAdapter {
                 commands_rx,
             )?;
             let identity = actor.launch()?;
+            // If this future is dropped during the handshake, `Proc`'s drop
+            // kills the whole process group.
             if let Err(e) = actor.handshake().await {
                 actor.discard();
                 return Err(e);
@@ -361,6 +363,14 @@ enum Reply {
     CanUse { request_id: String, input: Value },
 }
 
+impl Reply {
+    fn request_id(&self) -> &str {
+        match self {
+            Reply::Hook { request_id } | Reply::CanUse { request_id, .. } => request_id,
+        }
+    }
+}
+
 /// A `can_use_tool` approval waiting for the client, by ticket id.
 struct PendingApproval {
     native: String,
@@ -387,11 +397,28 @@ impl Drop for TempDir {
 }
 
 struct Proc {
-    child: SupervisedChild,
+    /// `None` once `stop_process` has taken it to terminate and reap it.
+    child: Option<SupervisedChild>,
     identity: ProcessIdentity,
     stdin_tx: Option<mpsc::UnboundedSender<String>>,
     writer: JoinHandle<()>,
     readers: Vec<JoinHandle<()>>,
+}
+
+impl Drop for Proc {
+    /// A `Proc` dropped while its process is still ours (a `start` abandoned
+    /// during the handshake, a panicked session task) must not leave the
+    /// process group behind: `kill_on_drop` reaches the leader only. The group
+    /// is killed and reaped by a task.
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                let _ = supervise::terminate(&mut child, Duration::ZERO).await;
+            });
+        }
+    }
 }
 
 struct Actor {
@@ -423,9 +450,13 @@ struct Actor {
     gates: JoinSet<()>,
 
     /// Gate keys the hook answered `ask` for, with the gate's ticket.
-    hook_asked: HashMap<String, ApprovalTicket>,
-    /// `can_use_tool` requests not answered yet (Claude's own ids).
+    hook_asked: HashMap<String, VecDeque<ApprovalTicket>>,
+    /// Requests of the provider (hook calls and `can_use_tool`, by its own
+    /// ids) not answered yet. An answer for one that is not here is never
+    /// sent: it was withdrawn, or its turn ended.
     live: HashSet<String>,
+    /// The gate tasks in flight, by the provider's request id.
+    inflight: HashMap<String, AbortHandle>,
     approvals: HashMap<String, PendingApproval>,
     /// Questions waiting for an answer, by ticket id: (native id, input).
     questions: HashMap<String, (String, Value)>,
@@ -483,6 +514,7 @@ impl Actor {
             gates: JoinSet::new(),
             hook_asked: HashMap::new(),
             live: HashSet::new(),
+            inflight: HashMap::new(),
             approvals: HashMap::new(),
             questions: HashMap::new(),
             mcp_dir: Some(mcp_dir),
@@ -584,7 +616,7 @@ impl Actor {
             // Dropping `stdin` closes the pipe: Claude Code exits on EOF.
         });
         self.proc = Some(Proc {
-            child,
+            child: Some(child),
             identity: identity.clone(),
             stdin_tx: Some(stdin_tx),
             writer,
@@ -673,10 +705,11 @@ impl Actor {
     /// Returns the exit code.
     async fn stop_process(&mut self, grace: Duration) -> Option<i32> {
         let mut p = self.proc.take()?;
+        let mut child = p.child.take()?;
         p.stdin_tx = None;
         let mut rx = self.out_rx.take();
         let result = {
-            let term = supervise::terminate(&mut p.child, grace);
+            let term = supervise::terminate(&mut child, grace);
             tokio::pin!(term);
             loop {
                 tokio::select! {
@@ -712,7 +745,7 @@ impl Actor {
             }
         }
         p.writer.abort();
-        for r in p.readers {
+        for r in std::mem::take(&mut p.readers) {
             r.abort();
         }
         code
@@ -897,7 +930,6 @@ impl Actor {
     /// is false for endings the adapter or the provider itself caused.
     async fn finish(&mut self, requested: bool, grace: Duration) {
         self.shutting_down = true;
-        self.finishing = true;
         self.gates.abort_all();
         if requested {
             self.feed(AdapterInput::Command {
@@ -907,6 +939,9 @@ impl Actor {
         self.interrupt_deadline = None;
         let code = self.stop_process(grace).await;
         self.out_rx = None;
+        // Only the closing tail counts against its bound: what the provider
+        // wrote while winding down must not use it up.
+        self.finishing = true;
         self.clear_requests();
         self.feed(AdapterInput::Exit { code });
         // The generated MCP config (it can hold credentials) goes with the
@@ -915,6 +950,9 @@ impl Actor {
     }
 
     fn clear_requests(&mut self) {
+        // Nothing in flight can still be answered.
+        self.gates.abort_all();
+        self.inflight.clear();
         self.hook_asked.clear();
         self.live.clear();
         self.approvals.clear();
@@ -967,6 +1005,9 @@ impl Actor {
 
     /// The provider withdrew a request.
     fn forget_native(&mut self, native: &str) {
+        if let Some(task) = self.inflight.remove(native) {
+            task.abort();
+        }
         self.live.remove(native);
         self.approvals.retain(|_, a| a.native != native);
         self.questions.retain(|_, (n, _)| n != native);
@@ -983,7 +1024,7 @@ impl Actor {
         let req = v.get("request").cloned().unwrap_or(Value::Null);
         match req.get("subtype").and_then(Value::as_str) {
             Some("hook_callback") => self.on_hook(request_id, &req, big),
-            Some("can_use_tool") => self.on_can_use(request_id, &req),
+            Some("can_use_tool") => self.on_can_use(request_id, &req, big),
             _ => {
                 // Unknown request: tell Claude Code we don't handle it.
                 self.write_value(&json!({
@@ -1028,12 +1069,21 @@ impl Actor {
         }
         let call_id = input.get("tool_use_id").and_then(Value::as_str);
         let check = tool_check(call_id, name, &tool_input, self.norm.turn_number());
+        self.live.insert(request_id.clone());
         self.spawn_gate(Reply::Hook { request_id }, check);
     }
 
-    fn on_can_use(&mut self, request_id: String, req: &Value) {
+    fn on_can_use(&mut self, request_id: String, req: &Value, big: bool) {
         let name = req.get("tool_name").and_then(Value::as_str).unwrap_or("");
         let input = req.get("input").cloned().unwrap_or(Value::Null);
+        if big && input.to_string().len() > MAX_PARTIAL_ARGS_BYTES {
+            // Never shown to the gate (contract §6: oversize arguments).
+            self.respond(
+                &request_id,
+                json!({"behavior": "deny", "message": "Denied by Atrium: the tool arguments are too large"}),
+            );
+            return;
+        }
         let tool_use_id = req
             .get("tool_use_id")
             .and_then(Value::as_str)
@@ -1044,7 +1094,7 @@ impl Actor {
             return;
         }
         let key = gate_key(tool_use_id.as_deref(), name, &input);
-        if let Some(ticket) = self.hook_asked.remove(&key) {
+        if let Some(ticket) = self.take_hook_ticket(&key) {
             self.approvals.insert(
                 ticket.request_id.clone(),
                 PendingApproval {
@@ -1071,7 +1121,8 @@ impl Actor {
         let gate = self.gate.clone();
         let tx = self.internal_tx.clone();
         let deadline = self.options.gate_deadline;
-        self.gates.spawn(async move {
+        let native = reply.request_id().to_owned();
+        let task = self.gates.spawn(async move {
             let for_gate = check.clone();
             // The call runs in its own task so a panic is contained, and is
             // aborted if this task is (session end) or the deadline passes.
@@ -1092,6 +1143,17 @@ impl Actor {
                 failed,
             });
         });
+        self.inflight.insert(native, task);
+    }
+
+    /// The oldest ticket the hook got for this call and input.
+    fn take_hook_ticket(&mut self, key: &str) -> Option<ApprovalTicket> {
+        let queue = self.hook_asked.get_mut(key)?;
+        let ticket = queue.pop_front();
+        if queue.is_empty() {
+            self.hook_asked.remove(key);
+        }
+        ticket
     }
 
     fn spawn_question(&mut self, native: String, input: Value) {
@@ -1099,7 +1161,8 @@ impl Actor {
         let tx = self.internal_tx.clone();
         let deadline = self.options.gate_deadline;
         let turn = Some(self.norm.turn_number());
-        self.gates.spawn(async move {
+        let key = native.clone();
+        let task = self.gates.spawn(async move {
             let inner = tokio::spawn(async move { gate.question_ticket(turn).await });
             let (ticket, failed) = match guarded(deadline, inner).await {
                 Ok(t) => (t, false),
@@ -1112,6 +1175,7 @@ impl Actor {
                 failed,
             });
         });
+        self.inflight.insert(key, task);
     }
 
     fn spawn_redeem(&mut self, a: PendingApproval) {
@@ -1125,7 +1189,8 @@ impl Actor {
             &a.input,
             self.norm.turn_number(),
         );
-        self.gates.spawn(async move {
+        let key = a.native.clone();
+        let task = self.gates.spawn(async move {
             let (for_gate, ticket) = (check.clone(), a.ticket.clone());
             let inner = tokio::spawn(async move { gate.redeem(&ticket, &for_gate).await });
             let (decision, failed) = match guarded(deadline, inner).await {
@@ -1146,10 +1211,17 @@ impl Actor {
                 failed,
             });
         });
+        self.inflight.insert(key, task);
     }
 
     fn on_internal(&mut self, msg: Internal) {
         while self.gates.try_join_next().is_some() {}
+        match &msg {
+            Internal::Gate { reply, .. } => self.inflight.remove(reply.request_id()),
+            Internal::Redeem { native, .. } | Internal::Question { native, .. } => {
+                self.inflight.remove(native)
+            }
+        };
         let failed = match &msg {
             Internal::Gate { failed, .. }
             | Internal::Redeem { failed, .. }
@@ -1162,11 +1234,16 @@ impl Actor {
                 decision,
                 ..
             } => {
-                self.feed(AdapterInput::Gate {
-                    check: check.clone(),
-                    decision: decision.clone(),
-                });
-                self.on_gate_decision(reply, check, decision);
+                // The request may have been withdrawn, or its turn ended,
+                // while the gate decided: then nobody is waiting for the
+                // answer, and a ticket it opened must not outlive it.
+                if self.live.contains(reply.request_id()) {
+                    self.feed(AdapterInput::Gate {
+                        check: check.clone(),
+                        decision: decision.clone(),
+                    });
+                    self.on_gate_decision(reply, check, decision);
+                }
             }
             Internal::Redeem {
                 native,
@@ -1228,17 +1305,21 @@ impl Actor {
             return;
         }
         match reply {
-            Reply::Hook { request_id } => match decision {
-                GateDecision::Allow => self.respond_hook(&request_id, "allow", None),
-                GateDecision::Deny { reason } => {
-                    self.respond_hook(&request_id, "deny", Some(&deny_text(&reason)));
+            Reply::Hook { request_id } => {
+                // Answered now: the hook call is over.
+                self.live.remove(&request_id);
+                match decision {
+                    GateDecision::Allow => self.respond_hook(&request_id, "allow", None),
+                    GateDecision::Deny { reason } => {
+                        self.respond_hook(&request_id, "deny", Some(&deny_text(&reason)));
+                    }
+                    GateDecision::Ask { ticket } => {
+                        let key = gate_key(check.call_id.as_deref(), &check.name, &check.input);
+                        self.hook_asked.entry(key).or_default().push_back(ticket);
+                        self.respond_hook(&request_id, "ask", None);
+                    }
                 }
-                GateDecision::Ask { ticket } => {
-                    let key = gate_key(check.call_id.as_deref(), &check.name, &check.input);
-                    self.hook_asked.insert(key, ticket);
-                    self.respond_hook(&request_id, "ask", None);
-                }
-            },
+            }
             Reply::CanUse { request_id, input } => match decision {
                 GateDecision::Allow => {
                     self.live.remove(&request_id);

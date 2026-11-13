@@ -1138,6 +1138,392 @@ async fn an_oversize_record_ends_the_session() {
     assert!(!group_alive(pgid));
 }
 
+// ---- fix round 1 (cross-provider review) ----
+
+/// A gate whose `check` waits until the test releases it, one call at a time.
+struct SlowGate {
+    waiting: Mutex<Vec<Option<tokio::sync::oneshot::Sender<GateDecision>>>>,
+    checks: Mutex<Vec<ToolCheck>>,
+}
+
+impl SlowGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            waiting: Mutex::default(),
+            checks: Mutex::default(),
+        })
+    }
+
+    /// Waits until `n` checks have been asked.
+    async fn asked(&self, n: usize) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while self.waiting.lock().unwrap().len() < n {
+            assert!(Instant::now() < end, "the gate was not asked {n} times");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Answers the `i`th check (from 0); false if its task is gone.
+    fn release(&self, i: usize, decision: GateDecision) -> bool {
+        let tx = self.waiting.lock().unwrap()[i].take();
+        tx.is_some_and(|tx| tx.send(decision).is_ok())
+    }
+}
+
+impl ToolGate for SlowGate {
+    fn check<'a>(&'a self, check: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+        self.checks.lock().unwrap().push(check.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.waiting.lock().unwrap().push(Some(tx));
+        Box::pin(async move {
+            rx.await.unwrap_or(GateDecision::Deny {
+                reason: "released without an answer".into(),
+            })
+        })
+    }
+
+    fn redeem<'a>(
+        &'a self,
+        _: &'a ApprovalTicket,
+        _: &'a ToolCheck,
+    ) -> BoxFuture<'a, GateDecision> {
+        Box::pin(async { GateDecision::Allow })
+    }
+
+    fn question_ticket(&self, _: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
+        Box::pin(async { None })
+    }
+}
+
+fn inline_text(e: &AgentEvent, want: &str) -> bool {
+    matches!(e, AgentEvent::MessageCompleted { body: MessageBody::Inline { text }, kind: MessageKind::Assistant, .. } if text == want)
+}
+
+/// Finding 1: the CLI withdrew the request, and only then did the gate
+/// answer `Allow`. Nothing is sent for a request nobody is waiting on.
+#[tokio::test]
+async fn f1_a_gate_answer_after_control_cancel_request_is_not_sent() {
+    let dir = scratch("f1-cancel");
+    let gate = SlowGate::new();
+    let mut session = start(config(&dir, "canuse-cancel", gate.clone()), opts())
+        .await
+        .unwrap();
+    session.commands.send(say("go")).await.unwrap();
+    gate.asked(1).await;
+    // The withdrawal (and the text after it) is processed before we answer.
+    next_matching(&mut session, 10, |e| inline_text(e, "after-cancel")).await;
+    gate.release(0, GateDecision::Allow);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !dir.join("canuse_response.json").exists(),
+        "an answer was written for a withdrawn request"
+    );
+    shutdown(session).await;
+}
+
+/// Finding 1: the turn ended while the gate was still deciding.
+#[tokio::test]
+async fn f1_a_gate_answer_after_the_turn_ended_is_not_sent() {
+    let dir = scratch("f1-result");
+    let gate = SlowGate::new();
+    let mut session = start(config(&dir, "canuse-result", gate.clone()), opts())
+        .await
+        .unwrap();
+    session.commands.send(say("go")).await.unwrap();
+    gate.asked(1).await;
+    next_matching(&mut session, 10, turn_done).await;
+    gate.release(0, GateDecision::Allow);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !dir.join("canuse_response.json").exists(),
+        "an answer was written after the turn ended"
+    );
+    shutdown(session).await;
+}
+
+/// Finding 1, hook path: the hook call is as dead as the turn.
+#[tokio::test]
+async fn f1_a_hook_answer_after_the_turn_ended_is_not_sent() {
+    for (name, decision) in [
+        ("f1-hook-allow", GateDecision::Allow),
+        ("f1-hook-ask", ask()),
+    ] {
+        let dir = scratch(name);
+        let gate = SlowGate::new();
+        let mut session = start(config(&dir, "hook-result", gate.clone()), opts())
+            .await
+            .unwrap();
+        session.commands.send(say("go")).await.unwrap();
+        gate.asked(1).await;
+        next_matching(&mut session, 10, turn_done).await;
+        gate.release(0, decision);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !dir.join("hook_response.json").exists(),
+            "{name}: an answer was written after the turn ended"
+        );
+        shutdown(session).await;
+    }
+}
+
+/// Finding 1: an `Ask` that comes back after the turn must not become the
+/// approval of the next turn's identical request.
+#[tokio::test]
+async fn f1_an_ask_after_the_turn_ended_is_not_reused_by_the_next_turn() {
+    let dir = scratch("f1-stale-ask");
+    let gate = SlowGate::new();
+    let mut session = start(config(&dir, "canuse-result", gate.clone()), opts())
+        .await
+        .unwrap();
+    session.commands.send(say("go")).await.unwrap();
+    gate.asked(1).await;
+    next_matching(&mut session, 10, turn_done).await;
+    gate.release(
+        0,
+        GateDecision::Ask {
+            ticket: ticket("T9", true),
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The same call comes again in turn 2; the gate is asked afresh.
+    session.commands.send(say("again")).await.unwrap();
+    gate.asked(2).await;
+    let evs = next_matching(&mut session, 10, turn_done).await;
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, AgentEvent::ApprovalRequested { .. })),
+        "the stale ticket was shown: {evs:?}"
+    );
+    shutdown(session).await;
+}
+
+/// Finding 3 (adapter): `can_use_tool` with oversize arguments is denied
+/// without asking the gate, and never reaches an event.
+#[tokio::test]
+async fn f3_an_oversize_can_use_tool_is_denied_without_asking_the_gate() {
+    for mode in ["canuse-bigargs", "canuse-bigargs-b"] {
+        let called = Arc::new(AtomicBool::new(false));
+        let c = called.clone();
+        let gate: Arc<dyn ToolGate> = TestGate::new(move |_| {
+            c.store(true, Ordering::SeqCst);
+            ask()
+        });
+        let (v, evs) = run_mode(
+            mode,
+            mode,
+            gate,
+            Duration::from_secs(5),
+            "canuse_response.json",
+        )
+        .await;
+        assert_eq!(behavior(&v).0, "deny", "{mode}");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "{mode}: the gate is not asked"
+        );
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, AgentEvent::ApprovalRequested { .. })),
+            "{mode}"
+        );
+        for e in &evs {
+            assert!(
+                serde_json::to_string(e).unwrap().len() < 64 * 1024,
+                "{mode}: an event carries the oversize input"
+            );
+        }
+        let failed = evs
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::ToolCallFinished {
+                        status: ToolStatus::Failed,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(failed, 1, "{mode}");
+    }
+}
+
+/// Finding 5: records that arrive while the provider winds down must not use
+/// up the tail the closing events need.
+#[tokio::test]
+async fn f5_thousands_of_records_during_shutdown_do_not_drop_the_closing_events() {
+    let dir = scratch("f5-flood");
+    let gate = TestGate::asking(GateDecision::Allow);
+    let mut session = start(config(&dir, "eof-flood", gate), opts())
+        .await
+        .unwrap();
+    session.commands.send(say("go")).await.unwrap();
+    next_matching(&mut session, 10, |e| {
+        matches!(e, AgentEvent::ApprovalRequested { .. })
+    })
+    .await;
+    session
+        .commands
+        .send(SessionCommand::Shutdown)
+        .await
+        .unwrap();
+    let evs = next_matching(&mut session, 30, ended).await;
+    let deltas = evs
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::MessageDelta { .. }))
+        .count();
+    assert!(
+        deltas > 4000,
+        "the scenario needs more than the tail: {deltas}"
+    );
+    let tail: Vec<&AgentEvent> = evs
+        .iter()
+        .filter(|e| !matches!(e, AgentEvent::MessageDelta { .. }))
+        .rev()
+        .take(6)
+        .collect();
+    let has = |f: fn(&AgentEvent) -> bool| tail.iter().any(|e| f(e));
+    assert!(
+        has(|e| matches!(e, AgentEvent::MessageCompleted { .. })),
+        "{tail:?}"
+    );
+    assert!(
+        has(|e| matches!(
+            e,
+            AgentEvent::ToolCallFinished {
+                status: ToolStatus::Cancelled,
+                ..
+            }
+        )),
+        "{tail:?}"
+    );
+    assert!(
+        has(|e| matches!(
+            e,
+            AgentEvent::RequestResolved {
+                outcome: RequestOutcome::Cancelled,
+                ..
+            }
+        )),
+        "{tail:?}"
+    );
+    assert!(
+        has(|e| matches!(e, AgentEvent::TurnCompleted { .. })),
+        "{tail:?}"
+    );
+    assert!(ended(evs.last().unwrap()));
+}
+
+/// Finding 7: a ticket the hook got is for the input the hook saw.
+#[tokio::test]
+async fn f7_a_hook_ticket_is_not_reused_for_a_changed_can_use_input() {
+    let dir = scratch("f7-changed");
+    let n = Arc::new(AtomicUsize::new(0));
+    let counter = n.clone();
+    let gate = TestGate::new(move |_| GateDecision::Ask {
+        ticket: ticket(
+            &format!("T{}", counter.fetch_add(1, Ordering::SeqCst) + 1),
+            true,
+        ),
+    });
+    let g = gate.clone();
+    let mut session = start(config(&dir, "hook-ask-changed", gate), opts())
+        .await
+        .unwrap();
+    session.commands.send(say("go")).await.unwrap();
+    let evs = next_matching(&mut session, 10, |e| {
+        matches!(e, AgentEvent::ApprovalRequested { .. })
+    })
+    .await;
+    let Some(AgentEvent::ApprovalRequested {
+        request_id, input, ..
+    }) = evs.last()
+    else {
+        unreachable!()
+    };
+    assert_eq!(request_id, "T2", "the changed input needs its own ticket");
+    assert_eq!(input["command"], "rm -rf x");
+    session
+        .commands
+        .send(SessionCommand::ResolveApproval {
+            request_id: request_id.clone(),
+            decision: ApprovalDecision::Allow,
+        })
+        .await
+        .unwrap();
+    next_matching(&mut session, 10, turn_done).await;
+    shutdown(session).await;
+    let checks = g.checks.lock().unwrap().clone();
+    assert_eq!(checks.len(), 2, "the gate is asked about both inputs");
+    let redeems = g.redeems();
+    assert_eq!(redeems.len(), 1);
+    assert_eq!(redeems[0].0.request_id, "T2");
+    assert_eq!(redeems[0].1.input["command"], "rm -rf x");
+}
+
+/// Finding 7: two identical calls without ids keep one ticket each.
+#[tokio::test]
+async fn f7_two_identical_anonymous_hook_calls_keep_their_own_tickets() {
+    let dir = scratch("f7-anon2");
+    let n = Arc::new(AtomicUsize::new(0));
+    let counter = n.clone();
+    let gate = TestGate::new(move |_| GateDecision::Ask {
+        ticket: ticket(
+            &format!("T{}", counter.fetch_add(1, Ordering::SeqCst) + 1),
+            true,
+        ),
+    });
+    let g = gate.clone();
+    let mut session = start(config(&dir, "hook-ask-anon2", gate), opts())
+        .await
+        .unwrap();
+    session.commands.send(say("go")).await.unwrap();
+    let mut ids = Vec::new();
+    while ids.len() < 2 {
+        let evs = next_matching(&mut session, 10, |e| {
+            matches!(e, AgentEvent::ApprovalRequested { .. })
+        })
+        .await;
+        if let Some(AgentEvent::ApprovalRequested { request_id, .. }) = evs.last() {
+            ids.push(request_id.clone());
+        }
+    }
+    ids.sort();
+    assert_eq!(ids, ["T1", "T2"]);
+    assert_eq!(
+        g.checks.lock().unwrap().len(),
+        2,
+        "no third question to the gate"
+    );
+    shutdown(session).await;
+}
+
+/// Suspected item: a `start` future dropped during the handshake must not
+/// leave the provider's process group alive.
+#[tokio::test]
+async fn a_start_dropped_during_the_handshake_kills_the_process_group() {
+    let dir = scratch("start-drop");
+    let pgid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut cfg = config(&dir, "no-init", allow());
+    cfg.env.push(("FAKE_GRANDCHILD".into(), "1".into()));
+    let seen = pgid.clone();
+    cfg.on_spawn = Some(Arc::new(move |id| seen.store(id.pgid, Ordering::SeqCst)));
+    let marker = dir.join("grandchild.pid");
+    let mut fut = Box::pin(start(cfg, opts()));
+    tokio::select! {
+        _ = &mut fut => panic!("the fake never answers initialize"),
+        _ = wait_file(&marker, 10) => {}
+    }
+    drop(fut);
+    let pgid = pgid.load(Ordering::SeqCst);
+    assert!(pgid > 1);
+    let end = Instant::now() + Duration::from_secs(5);
+    while group_alive(pgid) {
+        assert!(Instant::now() < end, "the process group survived the drop");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // ---- enforcement descriptor ----
 
 fn write(path: &Path, text: &str) {
