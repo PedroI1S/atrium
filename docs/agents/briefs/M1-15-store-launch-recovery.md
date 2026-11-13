@@ -1,4 +1,4 @@
-# M1-15-store-launch-recovery: CR-08 and CR-10 (two `Store` methods, resume and recovery)
+# M1-15-store-launch-recovery: CR-08 and CR-10 (two `Store` methods, resume and recovery), and the resume race N1
 
 Model: Sonnet 5.5 · Reviewer: Gemini 4 Argon (read-only) · Depends on: M1-02, M1-05 (merged), **M1-13 merged** (its recovery tests cover the code this task changes)
 Go: D-067 (rodrigo approved CR-08 and CR-10) · Branch: `agent/sonnet/M1-15-store-launch-recovery` · Worktree: `../atrium-wt/M1-15-store-launch-recovery`
@@ -29,7 +29,9 @@ Apply the two approved change requests: a resumed thread keeps the effort and pr
 1. **CR-08.** Implement `Store::launch`. On `ResumeThread`, build the new incarnation's `SessionConfig` and `SessionGate` from the stored effort and preset instead of the Home preset with no effort. Tests: a thread started with an effort level and a non-Home preset resumes with both; an unknown thread gives `None`; the title returned is the current one.
 2. **CR-10.** Implement `Store::unfinished_incarnations`. `upkeep::recover` uses it to close every unfinished incarnation, archived threads included, instead of reading each listed thread's last event. Tests: a daemon killed between "stop the session" and "archive" leaves an archived thread; the next start closes its open messages, tool calls and turn and stores `SessionEnded`; a process record whose incarnation already ended is cleared.
 3. **Finding 12.** With the new method, make a failed closure in recovery retried on the next start without leaving `sessions.process` set for an ended session. If that needs a change outside the owned paths, stop and report it instead.
-4. No schema migration unless one is truly needed; if it is, follow M1-02's migration rules and say why in the handoff.
+4. **N1 (`m1-must-fix.md`, from M1-14a): a resume right after `Ended` is refused.** `sessions.rs` `run()` publishes the final state before it removes the thread from `Inner::sessions`, and `launch()` refuses a thread still in the map. Fix the order (or let `launch` take over a finished session) so that a client that sees `Ended`, `Failed` or `Interrupted` can resume at once, without ever running two sessions for one thread. Test: resume in a tight loop right after the final state, 200 rounds. Then run `cargo test -p atrium-daemon` 30 times in a row on the host: `a_stale_approval_is_expired_and_never_reaches_the_session` must no longer fail.
+5. **N2 and N3:** fix the inbox test's ordering race (N2, test-side). For N3, establish whether the daemon's drain or the test is early when `kill_recorded` meets a zombie `sleep`, with evidence; fix it if the cause is in your paths, otherwise report it.
+6. No schema migration unless one is truly needed; if it is, follow M1-02's migration rules and say why in the handoff.
 
 ## Definition of Done
 - [ ] The two methods with tests in `atrium-core`; the resume and recovery tests in `atrium-daemon`.
