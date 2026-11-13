@@ -143,8 +143,13 @@ pub struct ClaudeNormalizer {
     user_text: Option<String>,
 
     enforcement: Option<EnforcementDescriptor>,
+    /// The first descriptor recorded: what `start()` returned and what
+    /// `SessionStarted` carries. Later ones are changes.
+    first_enforcement: Option<EnforcementDescriptor>,
 
     block_counts: HashMap<String, usize>,
+    /// Messages already completed: a late delta can't reopen them.
+    done_msgs: HashSet<String>,
     open_msgs: Vec<OpenMsg>,
 
     calls: Vec<OpenCall>,
@@ -158,7 +163,7 @@ pub struct ClaudeNormalizer {
     /// `can_use_tool` requests, by Claude's own request id.
     can_use: HashMap<String, CanUse>,
     /// Gate keys answered `Ask` (with the ticket) / `Allow` (see [`gate_key`]).
-    asked: HashMap<String, ApprovalTicket>,
+    asked: HashMap<String, VecDeque<ApprovalTicket>>,
     allowed: HashSet<String>,
 
     /// User messages accepted and not yet written to the provider.
@@ -283,7 +288,16 @@ impl ClaudeNormalizer {
             return;
         };
         self.established = true;
-        let enforcement = self.enforcement.clone().unwrap_or_else(unknown_enforcement);
+        // What `start()` returned; a later descriptor is reported as a change
+        // right after.
+        let enforcement = self
+            .first_enforcement
+            .clone()
+            .unwrap_or_else(unknown_enforcement);
+        let changed = self
+            .enforcement
+            .clone()
+            .filter(|current| *current != enforcement);
         out.push(AgentEvent::SessionStarted {
             provider: Provider::Claude,
             native_session_id: init.session_id.clone(),
@@ -291,8 +305,14 @@ impl ClaudeNormalizer {
             tools: init.tools.clone(),
             enforcement,
         });
+        if let Some(enforcement) = changed {
+            out.push(AgentEvent::EnforcementChanged { enforcement });
+        }
         if self.turn_open && !self.turn_start_emitted {
             self.start_turn_events(out);
+        } else if !self.turn_open && self.held.iter().any(needs_turn) {
+            // What waited for the session belongs to a turn.
+            self.ensure_turn(out);
         }
         out.append(&mut self.held);
     }
@@ -325,30 +345,10 @@ impl ClaudeNormalizer {
                 record_type: "unparseable".into(),
                 raw: capped_raw(Value::String(line.to_owned())),
             });
-            self.hold_unmapped(0, out);
             return;
         };
         let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-        let before = out.len();
         self.dispatch(ty, &v, out);
-        self.hold_unmapped(before, out);
-    }
-
-    /// Before `SessionStarted` nothing but the session's own events may be
-    /// emitted: notes about records we don't map wait for it (or become
-    /// diagnostics of a failure).
-    fn hold_unmapped(&mut self, from: usize, out: &mut Vec<AgentEvent>) {
-        if self.established {
-            return;
-        }
-        let mut i = from;
-        while i < out.len() {
-            if matches!(out[i], AgentEvent::Unmapped { .. }) {
-                self.held.push(out.remove(i));
-            } else {
-                i += 1;
-            }
-        }
     }
 
     fn dispatch(&mut self, ty: &str, v: &Value, out: &mut Vec<AgentEvent>) {
@@ -441,6 +441,12 @@ impl ClaudeNormalizer {
                     return;
                 };
                 let id = format!("{api_id}:{index}");
+                // A late delta of a message already completed is dropped.
+                if self.done_msgs.contains(&id) {
+                    return;
+                }
+                self.establish(out);
+                self.ensure_turn(out);
                 match self.open_msgs.iter_mut().find(|m| m.id == id) {
                     Some(m) => {
                         m.text.push_str(&text);
@@ -461,6 +467,7 @@ impl ClaudeNormalizer {
             }
             "message_delta" => {
                 if let Some(u) = e.get("usage") {
+                    self.establish(out);
                     self.ensure_turn(out);
                     let mu = msg_usage(u);
                     if v.get("parent_tool_use_id").is_none_or(Value::is_null) {
@@ -549,9 +556,15 @@ impl ClaudeNormalizer {
             .position(|m| m.id == id)
             .map(|i| self.open_msgs.remove(i));
         match streamed {
-            Some(m) => out.push(streamed_completion(m)),
+            Some(m) => {
+                self.done_msgs.insert(m.id.clone());
+                out.push(streamed_completion(m));
+            }
             None if record_text.is_empty() => {}
-            None => out.extend(whole_message(id, kind, record_text)),
+            None => {
+                self.done_msgs.insert(id.clone());
+                out.extend(whole_message(id, kind, record_text));
+            }
         }
     }
 
@@ -571,23 +584,7 @@ impl ClaudeNormalizer {
         // Arguments past the limit: the call is shown and failed, and the
         // adapter's hook already denied it without asking the gate.
         if value_size(&input) > MAX_PARTIAL_ARGS_BYTES {
-            out.push(AgentEvent::ToolCallStarted {
-                call_id: id.clone(),
-                name: name.clone(),
-                kind: tool_kind(&name),
-                title: None,
-                input: json!({}),
-            });
-            self.calls.push(OpenCall { id: id.clone() });
-            self.finish(
-                &id,
-                ToolStatus::Failed,
-                None,
-                Some(format!(
-                    "tool arguments exceed {MAX_PARTIAL_ARGS_BYTES} bytes"
-                )),
-                out,
-            );
+            self.oversize_call(&id, &name, out);
             return;
         }
         let plan = (name == TODO_WRITE).then(|| plan_entries(&input));
@@ -605,6 +602,28 @@ impl ClaudeNormalizer {
         if let Some(reason) = self.denied_early.remove(&id) {
             self.finish(&id, ToolStatus::Denied, None, Some(reason), out);
         }
+    }
+
+    /// A call whose arguments exceed the limit: shown with empty input and
+    /// failed. The caller has already recorded the id as seen.
+    fn oversize_call(&mut self, id: &str, name: &str, out: &mut Vec<AgentEvent>) {
+        out.push(AgentEvent::ToolCallStarted {
+            call_id: id.to_owned(),
+            name: name.to_owned(),
+            kind: tool_kind(name),
+            title: None,
+            input: json!({}),
+        });
+        self.calls.push(OpenCall { id: id.to_owned() });
+        self.finish(
+            id,
+            ToolStatus::Failed,
+            None,
+            Some(format!(
+                "tool arguments exceed {MAX_PARTIAL_ARGS_BYTES} bytes"
+            )),
+            out,
+        );
     }
 
     fn finish(
@@ -877,10 +896,21 @@ impl ClaudeNormalizer {
         let name = str_of(r, "tool_name").unwrap_or_default();
         let input = r.get("input").cloned().unwrap_or(Value::Null);
         let tool_use_id = str_of(r, "tool_use_id");
+        let question = name == ASK_USER_QUESTION;
+        // Arguments past the limit: the adapter denied it without asking the
+        // gate. The call is shown failed (once), never offered for approval.
+        if value_size(&input) > MAX_PARTIAL_ARGS_BYTES {
+            if let Some(id) = tool_use_id
+                && !question
+                && self.seen_calls.insert(id.clone())
+            {
+                self.oversize_call(&id, &name, out);
+            }
+            return;
+        }
         let key = gate_key(tool_use_id.as_deref(), &name, &input);
         let reason = str_of(r, "decision_reason").filter(|s| !s.is_empty());
         let title = tool_title(&name, &input).or_else(|| str_of(r, "description"));
-        let question = name == ASK_USER_QUESTION;
         self.can_use.insert(
             rid.clone(),
             CanUse {
@@ -896,9 +926,19 @@ impl ClaudeNormalizer {
         );
         // A question waits for its ticket (`QuestionTicket`); a tool for the
         // gate's `Ask`.
-        if !question && let Some(ticket) = self.asked.remove(&key) {
+        if !question && let Some(ticket) = self.take_asked(&key) {
             self.emit_approval(&rid, ticket, out);
         }
+    }
+
+    /// The oldest ticket the gate opened for this call and input.
+    fn take_asked(&mut self, key: &str) -> Option<ApprovalTicket> {
+        let queue = self.asked.get_mut(key)?;
+        let ticket = queue.pop_front();
+        if queue.is_empty() {
+            self.asked.remove(key);
+        }
+        ticket
     }
 
     fn emit_approval(&mut self, rid: &str, ticket: ApprovalTicket, out: &mut Vec<AgentEvent>) {
@@ -909,6 +949,7 @@ impl ClaudeNormalizer {
             return;
         }
         c.emitted = true;
+        self.establish(out);
         self.ensure_turn(out);
         let Some(c) = self.can_use.get(rid) else {
             return;
@@ -970,6 +1011,7 @@ impl ClaudeNormalizer {
         };
         c.emitted = true;
         let questions = questions_of(&c.input);
+        self.establish(out);
         self.ensure_turn(out);
         out.push(AgentEvent::QuestionAsked {
             request_id: ticket.request_id.clone(),
@@ -1027,7 +1069,7 @@ impl ClaudeNormalizer {
                 match waiting.next() {
                     Some(rid) => self.emit_approval(&rid, ticket.clone(), out),
                     None => {
-                        self.asked.insert(key, ticket.clone());
+                        self.asked.entry(key).or_default().push_back(ticket.clone());
                     }
                 }
             }
@@ -1122,6 +1164,7 @@ impl ClaudeNormalizer {
 
     fn close_messages(&mut self, out: &mut Vec<AgentEvent>) {
         for m in std::mem::take(&mut self.open_msgs) {
+            self.done_msgs.insert(m.id.clone());
             out.push(streamed_completion(m));
         }
     }
@@ -1229,10 +1272,13 @@ impl ClaudeNormalizer {
 
     fn cancel_pending(&mut self, out: &mut Vec<AgentEvent>) {
         for (rid, _) in std::mem::take(&mut self.pending) {
-            out.push(AgentEvent::RequestResolved {
-                request_id: rid,
-                outcome: RequestOutcome::Cancelled,
-            });
+            // Nothing was shown before the session started.
+            if self.established {
+                out.push(AgentEvent::RequestResolved {
+                    request_id: rid,
+                    outcome: RequestOutcome::Cancelled,
+                });
+            }
         }
         self.can_use.clear();
         self.asked.clear();
@@ -1309,6 +1355,8 @@ impl Normalizer for ClaudeNormalizer {
                         enforcement: descriptor.clone(),
                     });
                 }
+                self.first_enforcement
+                    .get_or_insert_with(|| descriptor.clone());
                 self.enforcement = Some(descriptor.clone());
             }
             AdapterInput::Deadline { what } => self.deadline(what, &mut out),
@@ -1317,6 +1365,12 @@ impl Normalizer for ClaudeNormalizer {
             | AdapterInput::HookResponse { .. }
             | AdapterInput::HookDisconnected { .. }
             | AdapterInput::WriteFailed { .. } => {}
+        }
+        // Before `SessionStarted` nothing but the failure of a start may be
+        // shown (`Error` then `SessionEnded`, from `Exit`): whatever else
+        // this input produced waits for the session, or is dropped with it.
+        if !self.established && !matches!(input, AdapterInput::Exit { .. }) {
+            self.held.append(&mut out);
         }
         out
     }
@@ -1328,6 +1382,19 @@ fn unknown_enforcement() -> EnforcementDescriptor {
     let d = EnforcementDescriptor::evaluate(Provider::Claude, None, false, vec![], vec![], vec![]);
     debug_assert_eq!(d.level, EnforcementLevel::Partial);
     d
+}
+
+/// Events that belong inside a turn (the others may stand alone).
+fn needs_turn(e: &AgentEvent) -> bool {
+    !matches!(
+        e,
+        AgentEvent::Unmapped { .. }
+            | AgentEvent::QuotaUpdated { .. }
+            | AgentEvent::EnforcementChanged { .. }
+            | AgentEvent::Error { .. }
+            | AgentEvent::SessionStarted { .. }
+            | AgentEvent::SessionEnded { .. }
+    )
 }
 
 fn exit_text(code: Option<i32>) -> String {
