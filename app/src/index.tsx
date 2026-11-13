@@ -11,6 +11,7 @@ import "./styles/calm.css";
 import "./styles/shell.css";
 import "./styles/chat.css";
 import { App } from "./App";
+import { runChatShots } from "./chat-shots";
 import { attach, daemon } from "./daemon/client";
 import { epochNow, markOnce, reportFailure, runHarness, setStage } from "./harness";
 import type { Screen } from "./layout";
@@ -70,6 +71,7 @@ async function boot() {
     if (isPopout()) await (shots ? shotsPopout() : roundtripPopout());
     else if (info.benchMode === "roundtrip") await runRoundtrip();
     else if (info.benchMode === "shots") await runShots();
+    else if (info.benchMode === "shots-chat") await runChatShots();
     else if (info.benchMode === "shots-incompatible") await runShotsIncompatible();
     else await runRoundtripVerify();
   } else if (info.benchMode && !isPopout()) {

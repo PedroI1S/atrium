@@ -4,7 +4,7 @@
 
 import { ChevronDown, ExternalLink, RotateCcw } from "lucide-solid";
 import { For, Show, createEffect, onCleanup } from "solid-js";
-import { agent, agentChoices, markRead, probes, resumeThread, sendMessage, sending, setAgent, startChat, stopTurn } from "../chat/actions";
+import { agent, agentChoices, markRead, probes, reportFocus, resumeThread, sendMessage, sending, setAgent, startChat, stopTurn } from "../chat/actions";
 import { type ThreadModel, holdThread } from "../chat/threads";
 import { windowFocused } from "../state";
 import { daemon } from "../daemon/client";
@@ -80,6 +80,9 @@ function LiveThread(props: { viewKey: string; thread: ThreadSummary }) {
   createEffect(() => {
     if (props.thread.unread && windowFocused()) markRead(props.thread.thread_id);
   });
+  // The daemon doesn't notify about the chat the user is looking at (contract §8, `SetFocus`).
+  createEffect(() => reportFocus(windowFocused() ? props.thread.thread_id : null));
+  onCleanup(() => reportFocus(null));
   const load = () => model.load();
   return (
     <>
