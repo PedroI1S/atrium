@@ -162,3 +162,37 @@ Nothing else in the app uses `unsafe`; `window-vibrancy` does its own.
 **Change proposed:** add these to the hard-deny credential list, with the same identity and hard-link handling as the existing entries. Also make `git show`/`git cat-file` of a path matching a credential name ask rather than auto-allow. Affects `atrium-protocol`/`atrium-core` policy defaults, contract §9, and the Settings text that lists what is protected.
 
 **Related, for the same decision:** findings 1 and 2 (a `cd` inside a subshell or pipeline is not followed; a failing `cd` is assumed to succeed). With two ordinary prefix rules (`cd`, `cat`), `cd nope; cat .ssh/id_rsa` reaches Allow. These are engine fixes rather than contract changes, but they reach Allow on a hard-denied path, so they should be fixed before the M1 gate (worker's handoff has proposed fixes for 1, 2, 7 and 8).
+
+## CR-13 — M1-09b-home-chat — 2026-11-13
+
+Non-blocking for M1-09b; needed by M1-13 and the M1 gate. Asked for by the M1-09b brief.
+
+**The synthetic agent can't raise an approval or a question.** `AgentLaunch::Fake` (`crates/atrium-protocol/src/wire.rs`, `crates/atrium-daemon/src/fake.rs`) streams text and tool calls only, and it ignores `ResolveApproval` and `AnswerQuestion`. With no real provider (D-059), nothing can drive the approval ledger from a running app: the approval card, the question form, the inbox's buttons, "Always…" creating a rule, the stale refusal (`ErrorCode::Expired`) and the notifications for `NeedsApproval`/`NeedsInput` are only tested in vitest against recorded `ServerMessage` sequences (`app/src/chat/fixtures/approvals.json`), and the screenshots of those cards are seeded in the window.
+
+**What M1-09b does until this is decided:** tests the card states against recorded sequences, and seeds the screenshot scenes locally (`app/src/chat-shots.ts`), never through the daemon.
+
+**Change proposed:** two optional fields on `AgentLaunch::Fake`, both defaulting to "none" so existing callers and fixtures don't change:
+- `approval_at_ms: Option<u64>`: at that point of each turn the agent opens a ledger ticket through the session's gate for a fixed call (`Bash`, `ToolKind::Execute`, `{"command": "echo synthetic"}`, rememberable), emits `ToolCallStarted` and `ApprovalRequested` with the ticket's id, and waits. `Allow` redeems the ticket and finishes the call as `Succeeded`; `Deny` finishes it as `Denied`; an interrupt or the turn's end withdraws it (`RequestResolved { cancelled }`).
+- `question_at_ms: Option<u64>`: the agent takes a question ticket (`ToolGate::question_ticket`), emits `QuestionAsked` with one question (two options, `allow_text: true`) and waits for `AnswerQuestion`, then goes on streaming.
+
+Affects `atrium-protocol` (`wire.rs`, the bindings, `serde_shape.rs`), `atrium-daemon` (`fake.rs`, `sessions.rs` to give the synthetic session a gate) and the wire's protocol version if added fields count as a change. M1-09b's live check and screenshot script would then use them instead of seeded events.
+
+## CR-14 — M1-09b-home-chat — 2026-11-13
+
+Non-blocking; a user-visible setting that does nothing until it lands.
+
+**The daemon's notifier doesn't read per-kind notification settings.** The brief asks for Settings → Notifications with on/off per kind. Contract §8 names the three kinds (`NeedsApproval`, `NeedsInput`, `Failed`) and `hub::thread_changed` posts all of them (subject to focus and `NOTIFY_MIN_INTERVAL`); no setting is consulted. `SetSetting` stores any key, so the switches can be saved, but they change nothing.
+
+**What M1-09b does until this is decided:** the three switches store `notify_approval`, `notify_question` and `notify_failed` (booleans; absent means on) through `SetSetting`, and the section says in plain words that the background service doesn't read them yet and still notifies for all three.
+
+**Change proposed:** name the three keys in the contract (§8) and in `atrium-daemon::commands` next to `KEEP_RUNNING_SETTING` (validated as booleans, like it), and have `hub::thread_changed` (or `attention::should_notify`) skip a reason whose setting is `false`. The hub would read them at start and on `SetSetting`. Affects `crates/atrium-daemon/src/{commands,hub,lib}.rs` and contract §8. When it lands, remove the note in `app/src/ui/Settings.tsx`.
+
+## CR-15 — M1-09b-home-chat — 2026-11-13
+
+Non-blocking; a gap in the wire.
+
+**A question can't be declined.** `AnswerQuestion` needs an answer for the question; there is no command that tells the agent "no answer" and lets the turn go on (providers have one: Claude Code's question tool can be dismissed). The only way out of a question the user doesn't want to answer is to interrupt the turn.
+
+**What M1-09b does until this is decided:** the question card's second button is "Stop the turn" (it sends `SessionCommand::Interrupt`, and says so in its tooltip); the ledger then cancels the question with the turn.
+
+**Change proposed:** either `DaemonCommand::DeclineQuestion { thread_id, incarnation, request_id }`, checked by the ledger like `AnswerQuestion` and resolved as `RequestOutcome::Cancelled` (the adapter passes the provider's own "dismissed" answer on), or a documented convention that `AnswerQuestion` with empty `answers` means declined. The first is clearer in the ledger and in the events. Affects `atrium-protocol` (`wire.rs`, bindings), the ledger (`atrium-core`), the adapters (M1-07, M1-08) and contract §5.

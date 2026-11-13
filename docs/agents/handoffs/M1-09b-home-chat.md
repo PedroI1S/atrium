@@ -1,85 +1,56 @@
-# Handoff: M1-09b-home-chat (Opus 5.5) — status: **partial**
+# Handoff: M1-09b-home-chat — status: **partial** (in progress, kept current)
 
-Stopped at the orchestrator's request (driver's shift ending). Branch `agent/opus/M1-09b-home-chat`,
-rebased onto `dev` at 1d8d9ca (M1-09a merge). Not rebased again. No apps, daemons or
-measurements were started in this session, so nothing is left running.
+Worker: Claude Fable 5.2 on rodrigo's machine (Linux), continuing Opus 5.5's branch `agent/opus/M1-09b-home-chat` (D-065, D-066). This note is rewritten as items finish, so a cut-off loses nothing: what is under "Done" is committed.
 
 ## Done (committed)
 
-Pure modules with vitest tests (all pass, 241 tests in 12 files):
-- `app/src/chat/limits.ts` (+ test that parses `crates/atrium-protocol/src/limits.rs`).
-- `app/src/chat/markdown.ts` (parser to AST, depth cap 12), `links.ts` (link/image classification
-  per §12: http/https/mailto open via `open_link`, `file://` reveal only, data raster images
-  ≤ MAX_INLINE_IMAGE_BYTES, SVG never, remote https click-to-load), `render.ts` (DOM built with
-  createElement/text nodes only). `markdown.test.ts` covers the hostile inputs from the brief
-  (javascript: links, raw `<script>`, `<img onerror>`, SVG, huge data images, nested fences) and a
-  source scan forbidding innerHTML & co. in render/markdown/Transcript/RequestCard/InboxCard.
-- `app/src/chat/blocks.ts` (streaming block splitter), `transcript.ts` (reducer: deltas, tool
-  output replace/append, incarnations, loaded-bytes bound, paging/prepend, detach), tested in
-  `transcript.test.ts` including recorded ServerMessage fixture `app/src/chat/fixtures/approvals.json`
-  (card states fresh / stale / resolved elsewhere).
-- `app/src/chat/inbox.ts` (§8 order, groups, filters, ⌘J `nextJump`, J/K) tested in `inbox.test.ts`.
-- `app/src/chat/requests.ts` (card state machine, "Always…" scopes worded per D-062, exact
-  subject per D-054).
-- `app/src-tauri/src/links.rs`: `check_reveal`/`reveal` (+3 tests); `lib.rs`: new command
-  `reveal_path` (Home folder = $HOME). This is an M1-09a-owned file: new command only.
-- `app/src/platform.ts`: `revealPath`. `app/package.json`: devDependency `happy-dom` (DOM env for
-  render tests; dev only, no bundle cost).
+From the first worker (Opus 5.5), unchanged unless said:
+- Pure modules with vitest tests: `app/src/chat/{limits,markdown,links,render,blocks,transcript,inbox,requests}.ts`, the recorded `ServerMessage` fixture `app/src/chat/fixtures/approvals.json`.
+- `app/src-tauri/src/links.rs` (`check_reveal`/`reveal`) and the `reveal_path` command in `lib.rs` (an M1-09a file: one new command, same rules as `open_link`); `app/src/platform.ts`: `revealPath`.
+- `app/package.json`: devDependency `happy-dom` (a DOM for the render tests; not in the bundle).
+- UI: `app/src/chat/{threads,actions}.ts`, `app/src/ui/{Transcript,RequestCard,Composer,ThreadCard}.tsx`.
 
-WIP UI (committed in the wip commits, not yet type-clean):
-- `app/src/chat/threads.ts` (holdThread: per-frame flush, paging, reattach; request commands with
-  per-window local state), `app/src/chat/actions.ts` (start/send/stop/resume/markRead/reportFocus,
-  agent choices from ProbeProviders, synthetic fake agent in debug builds).
-- `app/src/ui/Transcript.tsx` (virtualized transcript, follow tail, paging at top, jump to latest),
-  `app/src/ui/RequestCard.tsx` (approval + question cards), `app/src/ui/Composer.tsx` (stop button,
-  busy), `app/src/ui/ThreadCard.tsx` (ThreadBody: live thread with transcript, request dock,
-  composer; new-chat view with agent chip; Resume button for interrupted threads).
+This worker:
+- `e2b09af` `pnpm typecheck` is clean: the protocol types the chat uses are re-exported from `app/src/daemon/types.ts`; `state.ts` has `windowFocused` (window focus/blur).
+- `655825e` the rest of the UI:
+  - **Inbox** (`ui/InboxCard.tsx`): groups (approvals and questions, failed, ready for you), filter (All · Approvals and questions · Replies), approval and question cards on the item (the first 12 asks view their thread for it), J/K/arrows, ↵ opens, A allows once, D denies, a footer with the keys.
+  - **⌘J / Ctrl+J** (`ui/jump.ts`, `App.tsx`, the palette): the next item in inbox order after the chat being looked at; storage-full opens the inbox; nothing waiting says so. Main window only (a pop-out can't change its thread).
+  - **Panel** (`ui/ContextPanel.tsx`): beside the inbox, a preview of the picked item with "Open chat"; beside a chat, Details plus Usage (context occupancy, tokens, cost) from the thread's events.
+  - **Settings** (`ui/Settings.tsx`, through M1-09a's registry, plus an `action` control kind): Agents (`ProbeProviders`: installed or not, version, tested or not, Full/Partial with the reasons), Approvals (`ListRules`, each rule's exact command or glob, scope "in any folder" per D-062, origin, `DeleteRule`), Notifications (three switches stored with `SetSetting`; the section says the daemon doesn't read them yet, CR-14).
+  - `chat/rules.ts` + `rules.test.ts`: how a rule reads (argv quoted so two argvs never read the same).
+  - `styles/chat.css` (tokens only; new literals are tokens in `base.css`), and every new TS module is in `TS_FILES` of `tokens-conformance.test.ts`.
+  - Approval card safety: a card that just appeared ignores ↵/esc for 600 ms and never takes focus from a field being typed in; ↵ on a focused button presses that button (before, ↵ on "Deny" allowed).
+- Change requests filed in `docs/agents/change-requests.md`: **CR-13** (fake agent option that raises one approval and one question), **CR-14** (daemon reads per-kind notification settings), **CR-15** (declining a question).
 
-## Not done, by Definition of Done item
+## Not done yet (in this order)
 
-- vitest suites (markdown §12, reducer, bound/paging, inbox order, card states, ⌘J): **done**.
-- UI wiring: InboxCard rewrite (filters, inline cards via held models, J/K/Enter/A/D),
-  ContextPanel inbox preview + usage/context, App.tsx ⌘J via `nextJump`, Settings sections
-  Agents / Approvals (list_rules/delete_rule) / Notifications: **not done**.
-- `app/src/styles/chat.css` (tokens only) and adding new TS files to `TS_FILES` in
-  `tokens-conformance.test.ts`: **not done**.
-- Live run against real atriumd + fake agent (stream, second window, daemon killed mid-stream):
-  **not done**.
-- macOS screenshots light/dark (extend `app/scripts/screenshots.py`): **not done**.
-- §14 streaming run (10 threads × 1k tok/s × 30 s): **not done** (no `stream_bench.py` yet).
-- `startup_bench.py` gate: **not run**.
-- `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test -p atrium-app`, `pnpm build`,
-  `scripts/check-protocol-ts`: **not run this session** (links.rs tests passed earlier via cargo test).
-- `pnpm typecheck`: **fails** (see below). `pnpm test`: **passes** (241/241).
-- Change requests: **not yet appended** to `docs/agents/change-requests.md`. Planned:
-  1. fake agent option raising one approval and one question (needed for live approval/question runs);
-  2. daemon honoring per-kind notification settings (notifier ignores them today);
-  3. a "decline question" command (the wire has none; the UI interrupts the turn instead).
+1. Harness code: seeded screenshot scenes (`app/src/chat-shots.ts`), the live check against `atriumd` (`app/src/chat-live.ts`, `app/scripts/chat_check.py`), the §14 streaming run (`app/src/stream-bench.ts`, `app/scripts/stream_bench.py`). None of the new UI has been seen running yet: expect fixes from the first screenshots.
+2. Run them on this machine's display under `flock /tmp/atrium-gui-measure.lock`: live check, screenshots (light and dark), §14 run, `startup_bench.py` (Linux numbers, private PSS).
+3. The DoD command list: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test -p atrium-app`; `pnpm typecheck`; `pnpm test`; `pnpm build`; `scripts/check-protocol-ts`.
+4. Final handoff with the outputs.
 
-## What I ran
+## What I ran so far
 
-- `pnpm test` → 12 files, 241 tests pass.
-- `pnpm typecheck` → fails:
-  - `daemon/types` does not export `RequestOutcome`, `ToolKind`, `ToolStatus`, `TurnOutcome`,
-    `Usage`, `Value`, `QuestionAnswer`, `RememberScope` (used by transcript.ts, RequestCard.tsx,
-    Transcript.tsx, requests.ts). They exist in the generated bindings; either re-export them from
-    `app/src/daemon/types.ts` or import from the bindings path directly.
-  - `state.ts` has no `windowFocused` (ThreadCard.tsx). Add a focus signal (window focus/blur) or
-    use whatever M1-09a exposes for focus.
-  - `Transcript.tsx` lines 107–111: possibly-undefined indexing (noUncheckedIndexedAccess); add guards.
+- `pnpm typecheck` → clean (after `e2b09af`, and again after `655825e`).
+- `pnpm test` → 13 files, 258 tests pass (after `655825e`).
+- `pnpm build` and `cargo build -p atrium-app --features custom-protocol -p atrium-daemon` (debug, on the host) → built.
+
+## Owed to a macOS shift (Pedro)
+
+The macOS screenshots (light and dark) and the macOS `startup_bench.py` gate. The §14 streaming gate is stated for the platform's presentation timestamps or rAF; only Linux/WebKitGTK (rAF) can be measured here.
+
+## Needs a real provider (M1-07)
+
+Approvals and questions end to end (card → ledger → provider), "Always…" creating a rule from a live request, the stale refusal from the daemon, Resume of an interrupted thread, markdown from a real model, usage/context numbers, notifications.
 
 ## Gotchas
 
-- Write tool turned ` ` escapes into literal characters in links.ts; edit those regexes via
-  a script, not the Write tool.
-- The fake agent emits no markdown and can't raise approvals/questions or be resumed; screenshots
-  of markdown/approval/question scenes need seeded events in shots mode (or the CR).
-- Transcript eviction only cuts where no open item spans the cut (documented in transcript.ts).
-- Pending requests are docked above the composer as full cards (transcript rows are compact), so
-  they stay actionable under virtualization and eviction.
+- The agent's shell is a container without `git`, `node`, `python3`: host commands go through `distrobox-host-exec`.
+- The Write tool once turned escape sequences in a regex in `app/src/chat/links.ts` into literal characters; they were checked again (they are escapes now). Check any regex after writing it.
+- The fake agent emits no markdown and can't raise approvals or questions or be resumed (CR-13).
+- Transcript eviction only cuts where no open item spans the cut (documented in `transcript.ts`).
+- Pending requests are docked above the composer as full cards; their transcript rows are compact, so they stay actionable under virtualization and eviction.
 
 ## Exact next step
 
-Fix `pnpm typecheck` (re-export the missing types from `app/src/daemon/types.ts`, add
-`windowFocused` to `state.ts`, guard Transcript.tsx 107–111), then rewrite `ui/InboxCard.tsx` and
-continue down the "Not done" list above.
+Write `app/src/chat-shots.ts` and call it from `runShots` in `app/src/roundtrip.ts`; run `flock /tmp/atrium-gui-measure.lock python3 app/scripts/screenshots.py <dir>` on the host and look at the pictures.
