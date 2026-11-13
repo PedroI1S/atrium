@@ -312,11 +312,14 @@ async fn main() -> Result<(), Failure> {
     // ---- The large session ----
     let (large, took, peak_load) = load(&mut wire, pid, tokens).await?;
     let last = large.last_event.ok_or("the thread has no events")?;
+    let (after_load, high_water_load) = rss_kib(pid);
     println!(
-        "\n{tokens}-token thread: stored in {:.1} s ({:.0} events/s), peak RSS during the load {:.1} MiB",
+        "\n{tokens}-token thread: stored in {:.1} s ({:.0} events/s), peak RSS during the load {:.1} MiB (sampled every 250 ms), RSS right after {:.1} MiB, the process's peak so far {:.1} MiB",
         took.as_secs_f64(),
         tokens as f64 / took.as_secs_f64(),
-        mib(peak_load)
+        mib(peak_load),
+        mib(after_load),
+        mib(high_water_load)
     );
 
     // ---- Reconnect with a cursor 1,000 events behind ----
