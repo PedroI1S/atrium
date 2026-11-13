@@ -74,8 +74,8 @@ function Item(props: { item: InboxItem; cards: boolean }) {
         <button type="button" class="open" disabled={props.item.thread_id === null} title={props.item.thread_id ? "Open the chat" : undefined} onFocus={() => setInboxPick(key())} onClick={() => props.item.thread_id && openThread(props.item.thread_id)}>
           <Dot tone={reason().tone} />
           <span class="body">
-            <span class="ttl">{props.item.detail ?? reason().label}</span>
-            <span class="src">{reason().label} · {props.item.title || "Untitled chat"}{props.item.thread_id ? " · Home" : ""}</span>
+            <span class="ttl">{props.item.detail ?? (props.item.thread_id ? props.item.title || "Untitled chat" : reason().label)}</span>
+            <span class="src">{reason().label}{props.item.detail && props.item.thread_id ? ` · ${props.item.title || "Untitled chat"}` : ""}{props.item.thread_id ? " · Home" : ""}</span>
           </span>
           <span class="tm">{ageLabel(props.item.since_ms, now())}</span>
         </button>

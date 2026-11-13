@@ -77,23 +77,22 @@ export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick
         <div class="ask-act">
           <button type="button" class="btn pri" classList={{ sm: props.small }} onClick={() => allow()}>Allow once<Kbd>↵</Kbd></button>
           <Show when={choices().length}>
-            <span class="menu-wrap">
-              <button type="button" class="btn" classList={{ sm: props.small }} aria-haspopup="menu" aria-expanded={menu()} onClick={() => setMenu(!menu())}>Always…<ChevronDown class="i xs" aria-hidden="true" /></button>
-              <Show when={menu()}>
-                <div class="menu" role="menu" onKeyDown={(e) => { if (e.key === "Escape") { e.stopPropagation(); setMenu(false); } }}>
-                  <For each={choices()}>
-                    {(c) => (
-                      <button type="button" class="menu-item" role="menuitem" onClick={() => allow(c.scope)}>
-                        <b>{c.label}</b><span>{c.hint}</span>
-                      </button>
-                    )}
-                  </For>
-                </div>
-              </Show>
-            </span>
+            <button type="button" class="btn" classList={{ sm: props.small }} aria-haspopup="menu" aria-expanded={menu()} onClick={() => setMenu(!menu())}>Always…<ChevronDown class="i xs" aria-hidden="true" /></button>
           </Show>
           <button type="button" class="btn ghost" classList={{ sm: props.small }} onClick={deny}>Deny<Kbd>esc</Kbd></button>
         </div>
+        {/* The choices open inside the card (never a floating menu a scrolling list could clip). */}
+        <Show when={menu() && choices().length}>
+          <div class="menu" role="menu" aria-label="Always allow" onKeyDown={(e) => { if (e.key === "Escape") { e.stopPropagation(); setMenu(false); } }}>
+            <For each={choices()}>
+              {(c) => (
+                <button type="button" class="menu-item" role="menuitem" onClick={() => allow(c.scope)}>
+                  <b>{c.label}</b><span>{c.hint}</span>
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
       </Show>
     </div>
   );
