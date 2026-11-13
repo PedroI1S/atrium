@@ -399,3 +399,13 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - Both add a method to the frozen `Store` trait and change no existing one. They are applied on `dev` as one task (brief `M1-15-store-launch-recovery`), after M1-13 is merged, because it touches `atrium-daemon`'s recovery, which M1-13's new tests cover.
 - **Housekeeping, asked for by rodrigo:** the worktree `~/atrium-wt/M1-09a-app-shell` on rodrigo's machine was removed on 2026-11-13 (`git worktree remove`). M1-09a is merged into `dev` (`1d8d9ca`); the worktree was clean when removed (the untracked `skills/` folder seen in it on 2026-11-12 was already gone). The local branch `agent/fable/M1-09a-app-shell` (at `b35ea1c`, eight commits behind its pushed branch) and `origin/agent/fable/M1-09a-app-shell` were left as they are.
 
+## D-068 — 2026-11-13 — Gemini 4 Hydrogen takes Gemini 3.8 Flash's place
+**Decided by rodrigo (driver).** Gemini 4 Hydrogen, through `agy`, is used wherever the plan or an open task names Gemini 3.8 Flash: the high-volume utility work of PLAN §8.1 and §8.2 (tests, fixtures, docs, exploration, triage), the cheap end of the escalation ladder (§8.3), and the cross-provider reviews given to Flash (contract §15, D-056, D-057, D-059, D-066: today M1-09b's and M1-14b's reviews, with screenshots).
+- **Model id:** `gemini-4-hydrogen-medium` (`agy models` also lists `low`, `high` and `xhigh`). Medium is the orchestrator's default, as it was for Flash; the driver can change it.
+- **Updated:** PLAN §8 (roster, routing table, ladder, limits, the launch table), the briefs of M1-09b and M1-14b, the status board, `routing.md`.
+- **Left as written:** the frozen M1 contract's task table, earlier decisions, finished briefs, reviews and session logs. Where one of them gives Flash a role that is still open, it reads Hydrogen.
+- **Not changed:** PLAN §3.17's example of Atrium's own default routing (`agy:gemini-3.8-flash-medium`), which is the product's default and not this build's roster.
+- **Limits and policy:** Hydrogen takes Flash's limit of four at once (§8.4). The worker policy hook depends on the `agy` version, not on the model, so the 1.5.7 check (D-066) stands; Hydrogen's first run is watched for tool names the policy doesn't know.
+- **Pedro's shifts:** his own decisions that name Flash (D-056, D-060, D-062) are his to change, as D-064 says for routing. Until he does, Flash stays available on his shifts.
+- Hydrogen has no scoreboard yet: `routing.md` starts a row for it, and its first reviews are read with that in mind.
+

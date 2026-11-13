@@ -1,6 +1,6 @@
 # M1-09b-home-chat: Home chat, inbox, approval queue, question forms, ⌘J
 
-Model: Opus 5.5 (contract §15, D-048) · Reviewer: Gemini 3.8 Flash, read-only, with screenshots · Depends on: M1-09a (written and checked, being reviewed; not yet merged)
+Model: Opus 5.5 (contract §15, D-048) · Reviewer: Gemini 4 Hydrogen (D-068; it was Gemini 3.8 Flash), read-only, with screenshots · Depends on: M1-09a (written and checked, being reviewed; not yet merged)
 Go: D-059 (rodrigo), D-062 (Pedro) · Branch: `agent/opus/M1-09b-home-chat`, cut from `agent/fable/M1-09a-app-shell` · Worktree: `../atrium-wt/M1-09b-home-chat`
 
 **On rodrigo's shifts (D-065, D-066):** the worker is Claude Fable 5.2, on the same branch. Start from `docs/agents/handoffs/M1-09b-home-chat.md` (status partial) and its "Exact next step". The machine is Linux:

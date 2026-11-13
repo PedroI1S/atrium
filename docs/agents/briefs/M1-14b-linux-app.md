@@ -1,6 +1,6 @@
 # M1-14b-linux-app: Linux checks for the app (L1, L2 harness, L3 profiling)
 
-Model: Claude Fable 5.2 (D-065: Opus 5.5's role on rodrigo's shifts) · Reviewer: Gemini 3.8 Flash (read-only, with the numbers and screenshots) · Depends on: M1-09a (merged), **M1-09b merged** (it owns `app/src/**` and `app/scripts/**` until then)
+Model: Claude Fable 5.2 (D-065: Opus 5.5's role on rodrigo's shifts) · Reviewer: Gemini 4 Hydrogen (D-068; read-only, with the numbers and screenshots) · Depends on: M1-09a (merged), **M1-09b merged** (it owns `app/src/**` and `app/scripts/**` until then)
 Go: D-059 (rodrigo), D-066 · Branch: `agent/fable/M1-14b-linux-app` · Worktree: `../atrium-wt/M1-14b-linux-app`
 
 The second half of M1-14 (contract §15). The first half, M1-14a, covers the host crate and the daemon. **Not dispatched until M1-09b is merged into `dev`.**
