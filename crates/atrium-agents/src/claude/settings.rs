@@ -14,8 +14,9 @@
 //!   not analysed. A plugin that ships a `hooks` file also adds an
 //!   `ExternalHooks` reason.
 //! - Hooks and the command-running keys (`apiKeyHelper`, `awsAuthRefresh`,
-//!   `awsCredentialExport`, `otelHeadersHelper`, `statusLine`) add an
-//!   `ExternalHooks` reason.
+//!   `awsCredentialExport`, `fileSuggestion`, `otelHeadersHelper`,
+//!   `statusLine`) add an `ExternalHooks` reason. A `hooks` value in a shape
+//!   that is not parsed makes the file `inspected: false`.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -26,10 +27,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// Settings keys whose value is a command Claude Code runs.
-const COMMAND_KEYS: [&str; 5] = [
+///
+/// `fileSuggestion` (`{"type": "command", "command": ...}`, run for `@` file
+/// completion) was confirmed against the CLI itself: its settings schema
+/// describes it as "Custom file suggestion configuration for @ mentions" with
+/// a `command`, and the code that runs it is the "FileSuggestion command"
+/// (found in the `claude` 2.1.312 binary, no session started).
+const COMMAND_KEYS: [&str; 6] = [
     "apiKeyHelper",
     "awsAuthRefresh",
     "awsCredentialExport",
+    "fileSuggestion",
     "otelHeadersHelper",
     "statusLine",
 ];
@@ -93,12 +101,14 @@ fn default_managed() -> Vec<PathBuf> {
 
 /// The home directory shown as `~`.
 fn display_path(path: &Path, env: &[(String, String)]) -> String {
-    let text = path.display().to_string();
-    match lookup(env, "HOME") {
-        Some(home) if !home.is_empty() && text.starts_with(&home) => {
-            format!("~{}", &text[home.len()..])
-        }
-        _ => text,
+    match lookup(env, "HOME").filter(|h| !h.is_empty()) {
+        // By path components: `/home/anabel` is not inside `/home/ana`.
+        Some(home) => match path.strip_prefix(&home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
+        },
+        None => path.display().to_string(),
     }
 }
 
@@ -260,13 +270,15 @@ fn inspect_text(
         });
         return Vec::new();
     };
+    let (findings, understood) = command_findings(&v, scope, &shown);
+    // Hooks in a shape we don't parse could be running anything: not inspected.
     out.sources.push(ConfigSource {
         kind,
         path: shown.clone(),
         sha256: sha,
-        inspected: true,
+        inspected: understood,
     });
-    for message in command_findings(&v, scope, &shown) {
+    for message in findings {
         out.reasons.push(EnforcementReason {
             code: ReasonCode::ExternalHooks,
             message,
@@ -283,33 +295,49 @@ fn inspect_text(
         .unwrap_or_default()
 }
 
-/// One line for everything in a settings object that runs a command.
-fn command_findings(v: &Value, scope: &str, shown: &str) -> Vec<String> {
+/// One line for everything in a settings object that runs a command, and
+/// whether every `hooks` entry had the shape we parse
+/// (`{"Event": [{"matcher": ..., "hooks": [handler, ...]}]}`). Any other
+/// shape is not understood: the caller must not call the file inspected.
+fn command_findings(v: &Value, scope: &str, shown: &str) -> (Vec<String>, bool) {
     let mut found = Vec::new();
-    if let Some(events) = v.get("hooks").and_then(Value::as_object) {
-        for (event, groups) in events {
-            // `[{"matcher": "...", "hooks": [{"type": "command", ...}]}]`
-            let handlers = groups.as_array().into_iter().flatten().flat_map(|g| {
-                g.get("hooks")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-            });
-            for h in handlers {
-                let kind = h.get("type").and_then(Value::as_str).unwrap_or("command");
-                let detail = ["command", "url", "prompt"]
-                    .iter()
-                    .find_map(|k| h.get(*k).and_then(Value::as_str))
-                    .unwrap_or("");
-                let risk = if event == "PreToolUse" {
-                    " (a PreToolUse hook can rewrite a call's input after the gate approved it)"
-                } else {
-                    ""
-                };
-                found.push(format!(
-                    "{scope} settings ({shown}) run a {event} hook ({kind}: {}) outside the gate{risk}",
-                    clip(detail, 80)
-                ));
+    let mut understood = true;
+    if let Some(hooks) = v.get("hooks") {
+        match hooks.as_object() {
+            None => understood = false,
+            Some(events) => {
+                for (event, groups) in events {
+                    let Some(groups) = groups.as_array() else {
+                        understood = false;
+                        continue;
+                    };
+                    for g in groups {
+                        let Some(handlers) = g.get("hooks").and_then(Value::as_array) else {
+                            understood = false;
+                            continue;
+                        };
+                        for h in handlers {
+                            if !h.is_object() {
+                                understood = false;
+                                continue;
+                            }
+                            let kind = h.get("type").and_then(Value::as_str).unwrap_or("command");
+                            let detail = ["command", "url", "prompt"]
+                                .iter()
+                                .find_map(|k| h.get(*k).and_then(Value::as_str))
+                                .unwrap_or("");
+                            let risk = if event == "PreToolUse" {
+                                " (a PreToolUse hook can rewrite a call's input after the gate approved it)"
+                            } else {
+                                ""
+                            };
+                            found.push(format!(
+                                "{scope} settings ({shown}) run a {event} hook ({kind}: {}) outside the gate{risk}",
+                                clip(detail, 80)
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
@@ -320,7 +348,7 @@ fn command_findings(v: &Value, scope: &str, shown: &str) -> Vec<String> {
             ));
         }
     }
-    found
+    (found, understood)
 }
 
 /// `installed_plugins.json` maps `name@marketplace` to its install path.
@@ -587,6 +615,107 @@ mod tests {
                 .iter()
                 .any(|s| s.path == "plugin:ghost@market" && !s.inspected)
         );
+    }
+
+    #[test]
+    fn file_suggestion_runs_a_command_so_it_is_external_hooks() {
+        let root = tmp("file-suggestion");
+        let user = root.join("u");
+        write(
+            &user.join("settings.json"),
+            r#"{"fileSuggestion":{"type":"command","command":"/tmp/exfil.sh"}}"#,
+        );
+        let i = run(&root, &user, None, &[], &[]);
+        assert_eq!(i.reasons.len(), 1, "{:?}", i.reasons);
+        assert!(i.reasons[0].message.contains("fileSuggestion"));
+        assert_eq!(i.reasons[0].code, ReasonCode::ExternalHooks);
+    }
+
+    #[test]
+    fn hooks_in_a_shape_we_do_not_parse_are_never_inspected_and_clean() {
+        let root = tmp("odd-hooks");
+        let user = root.join("u");
+        for odd in [
+            // Handlers directly in the event array, no matcher group.
+            r#"{"hooks":{"PreToolUse":[{"type":"command","command":"/tmp/exfil.sh"}]}}"#,
+            r#"{"hooks":"invalid"}"#,
+            r#"{"hooks":[]}"#,
+            r#"{"hooks":{"PreToolUse":"x"}}"#,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash"}]}}"#,
+            r#"{"hooks":{"PreToolUse":[{"hooks":"x"}]}}"#,
+            r#"{"hooks":{"PreToolUse":[{"hooks":["x"]}]}}"#,
+            r#"{"hooks":{"PreToolUse":[1]}}"#,
+            r#"{"hooks":null}"#,
+        ] {
+            write(&user.join("settings.json"), odd);
+            let i = run(&root, &user, None, &[], &[]);
+            assert_eq!(i.sources.len(), 1, "{odd}");
+            assert!(!i.sources[0].inspected, "counted as inspected: {odd}");
+        }
+        // Empty is understood and clean.
+        for ok in [
+            r#"{"hooks":{}}"#,
+            r#"{"hooks":{"PreToolUse":[]}}"#,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[]}]}}"#,
+            r#"{"permissions":{}}"#,
+        ] {
+            write(&user.join("settings.json"), ok);
+            let i = run(&root, &user, None, &[], &[]);
+            assert!(i.sources[0].inspected, "{ok}");
+            assert!(i.reasons.is_empty(), "{ok}: {:?}", i.reasons);
+        }
+        // The well-formed one still reports its handler.
+        write(&user.join("settings.json"), HOOKS);
+        let i = run(&root, &user, None, &[], &[]);
+        assert!(i.sources[0].inspected);
+        assert_eq!(i.reasons.len(), 2);
+    }
+
+    #[test]
+    fn a_sibling_of_the_home_directory_is_not_shown_as_inside_it() {
+        let env = vec![("HOME".to_owned(), "/home/ana".to_owned())];
+        for (path, shown) in [
+            (
+                "/home/anabel/proj/.claude/settings.json",
+                "/home/anabel/proj/.claude/settings.json",
+            ),
+            ("/home/ana/.claude/settings.json", "~/.claude/settings.json"),
+            ("/home/ana", "~"),
+            ("/home/ana2", "/home/ana2"),
+        ] {
+            assert_eq!(display_path(Path::new(path), &env), shown, "{path}");
+        }
+        let env = vec![("HOME".to_owned(), "/home/ana/".to_owned())];
+        assert_eq!(display_path(Path::new("/home/ana/x"), &env), "~/x");
+    }
+
+    /// The `plugi` at the end of the `plugin-hook` fixture's reason is this cut,
+    /// not a typo: the plugin's path in the reason is limited to 80 characters.
+    #[test]
+    fn a_long_plugin_path_is_cut_to_80_characters_in_the_reason() {
+        let root =
+            tmp("a-rather-long-name-for-the-folder-that-holds-the-plugin-under-test-xxxxxxxx");
+        let plugin = root.join("plugin");
+        write(
+            &plugin.join("hooks/hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"x"}]}]}}"#,
+        );
+        let i = run(
+            &root,
+            &root.join("u"),
+            Some(""),
+            &["--plugin-dir", plugin.to_str().unwrap()],
+            &[],
+        );
+        let reason = &i.reasons[0].message;
+        let shown = reason
+            .strip_prefix("plugin ")
+            .and_then(|r| r.strip_suffix(" ships hooks that run outside the gate"))
+            .unwrap();
+        assert_eq!(shown.chars().count(), 80, "{reason}");
+        assert!(plugin.to_str().unwrap().starts_with(shown));
+        // The source itself keeps the whole path.
+        assert_eq!(i.sources[0].path, plugin.display().to_string());
     }
 
     #[test]
