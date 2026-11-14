@@ -108,6 +108,7 @@ Each finding is a test marked `#[ignore = "M1-13 finding N"]` on that branch; fi
 | S9 | minor | Finding 7: `sh -c -- 'payload'` isn't read. |
 | S10 | minor | Finding 9: a shell fed by process substitution (`bash < <(echo …)`); documented limit from M1-03 round 6 finding 2. |
 | S11 | minor | Finding 10: a glob that reaches a credential only through a symlink. |
+| S13 | **blocker** | From the security review (`reviews/M1-13-adversarial.md`, 2026-11-14): S2 is **not closed** on the branch, and the branch has regressions against `dev` (a key symlinked into `~/.ssh` readable without asking; a `cd` through a symlink loses the write check; false hard denies after a working `cd`). `dev` doesn't have the regressions: the branch must not be merged before the rework (the brief's "Third part"). |
 | S12 | — | Still to write (M1-13's remaining scope): the daemon and host adversarial tests (socket roles, `Hello` across the deadline, full control lane, many replaced subscriptions, a store read failing during replay, `kill_recorded` `Unverified`, a recovery closure that fails, the slow-command limit). |
 
 ## From the M1 Linux checks (`handoffs/M1-14a-linux-host.md` on `agent/sonnet/M1-14a-linux-host`; 2026-11-13)
