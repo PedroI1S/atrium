@@ -373,11 +373,12 @@ async fn unlinked_running_executable_is_rejected_by_kill_recorded_and_verify_app
 
 // On macOS `/usr/bin/python3` is a stub that execs another Python, so the
 // recorded executable no longer matches, `kill_recorded` refuses (Unverified)
-// without signalling, and the leader never becomes a zombie: the premise of
-// this test holds only on Linux.
+// without signalling, and the leader never becomes a zombie. An unreaped
+// leader keeping its group alive is ordinary POSIX behaviour; the obstacle is
+// the stub this test starts.
 #[cfg_attr(
     not(target_os = "linux"),
-    ignore = "M1-13: python3 stub re-execs on macOS; zombie-leader premise is Linux-only"
+    ignore = "M1-13: macOS /usr/bin/python3 is a re-execing stub, so kill_recorded can't verify the leader"
 )]
 #[tokio::test]
 async fn kill_recorded_setsid_grandchild_and_unreaped_zombie_leader_boundaries() {

@@ -485,8 +485,8 @@ enum Cd {
     /// candidate the command ran in, or one for an absolute target).
     Moved(Vec<PathBuf>),
     /// The engine can't say where the shell is (`popd`, `pushd`, `cd -`,
-    /// `cd $X`, a `cd` in a subshell or pipeline); these are the targets it
-    /// can name.
+    /// `cd $X`, a `cd` in a subshell or pipeline, options it can't read);
+    /// these are the targets it can name.
     Lost(Vec<PathBuf>),
 }
 
@@ -507,34 +507,57 @@ fn cd_effect(
     if name == "popd" {
         return Some(Cd::Lost(vec![]));
     }
+    // Options: `-L`, `-P`, `-e`, `-@` alone or in a cluster (`-LP`, `-Pe`),
+    // then `--`. Any other option leaves the `cd` unread: its targets stay
+    // candidates but the directory becomes unknown (re-review blocker 4).
     let mut args: Vec<&String> = unit.eff.iter().skip(1).collect();
+    let mut readable = true;
     while let Some(a) = args.first() {
-        if matches!(a.as_str(), "-L" | "-P" | "-e" | "-@" | "--") {
+        let a = a.as_str();
+        if a == "--" {
+            args.remove(0);
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') && !a[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            if !a[1..].chars().all(|c| matches!(c, 'L' | 'P' | 'e' | '@')) {
+                readable = false;
+            }
             args.remove(0);
         } else {
             break;
         }
     }
+    let resolve_all = |a: &str| -> Option<Vec<PathBuf>> {
+        let expanded = expand_home(a, home, start);
+        if has_unknown_var(&expanded) || expanded.contains(['*', '?', '[']) {
+            None
+        } else if Path::new(&expanded).is_absolute() {
+            Some(vec![resolve(&expanded, start, home)])
+        } else {
+            Some(cands.iter().map(|c| resolve(&expanded, c, home)).collect())
+        }
+    };
     let targets: Option<Vec<PathBuf>> = match args.as_slice() {
         [] if name == "pushd" => None,
         [] => Some(vec![home.to_path_buf()]),
         // `$OLDPWD`: not something the line names
-        [a] if a.as_str() == "-" || a.starts_with("~+") || a.starts_with("~-") => None,
-        [a] => {
-            let expanded = expand_home(a, home, start);
-            if has_unknown_var(&expanded) || expanded.contains(['*', '?', '[']) {
-                None
-            } else if Path::new(&expanded).is_absolute() {
-                Some(vec![resolve(&expanded, start, home)])
-            } else {
-                Some(cands.iter().map(|c| resolve(&expanded, c, home)).collect())
-            }
+        [a] if a.as_str() == "-" => None,
+        [a] => resolve_all(a),
+        // `cd OLD NEW` (zsh) and other forms: every word may be the target
+        more => {
+            readable = false;
+            Some(
+                more.iter()
+                    .filter(|a| a.as_str() != "-")
+                    .filter_map(|a| resolve_all(a))
+                    .flatten()
+                    .collect(),
+            )
         }
-        _ => None,
     };
     // `pushd` keeps a stack the line can pop later: never followed.
     Some(match targets {
-        Some(t) if name != "pushd" && !unit.grouped => Cd::Moved(t),
+        Some(t) if readable && name != "pushd" && !unit.grouped => Cd::Moved(t),
         Some(t) => Cd::Lost(t),
         None => Cd::Lost(vec![]),
     })
@@ -559,9 +582,36 @@ fn lost_cands(home: &Path, start: &Path, seen: &[PathBuf]) -> Vec<PathBuf> {
     v
 }
 
-/// The next command written at the same level as unit `i`.
-fn next_top(units: &[Unit], i: usize) -> Option<&Unit> {
-    units[i + 1..].iter().find(|u| !u.derived)
+/// Whether the command after unit `i` in the same text is an `exit` that
+/// certainly ends the shell the `cd` ran in: not in a pipeline or a group
+/// (there it leaves only a child), and not `return` (which fails outside a
+/// function and lets the line go on: re-review blocker 3).
+fn exits_after(units: &[Unit], i: usize) -> bool {
+    let u = &units[i];
+    units[i + 1..]
+        .iter()
+        .find(|n| n.ctx == u.ctx)
+        .is_some_and(|n| {
+            n.pipe == 0
+                && !n.grouped
+                && !n.seg.piped
+                && n.seg.argv.first().is_some_and(|f| f == "exit")
+                && n.eff.first().is_some_and(|f| base(f) == "exit")
+        })
+}
+
+/// The directory state of one text (the line, a payload, a substitution):
+/// each has its own `&&` chain.
+struct Level {
+    /// `Unit::ctx` of the text; `None` for the line itself.
+    ctx: Option<u32>,
+    depth: u8,
+    cands: Vec<PathBuf>,
+    /// where the shell is when an `&&` chain stopped early
+    pool: Vec<PathBuf>,
+    unknown: bool,
+    /// The text runs in the shell of the one around it (`eval`, `source`).
+    same_shell: bool,
 }
 
 /// Resolves every word against every directory the shell may be in.
@@ -572,20 +622,66 @@ fn next_top(units: &[Unit], i: usize) -> Option<&Unit> {
 /// both stay candidates. A command written as `cd DIR || exit` leaves only the
 /// target. A change the engine can't follow makes the directory unknown:
 /// every directory the line named, home and the start.
+///
+/// Each text (the line, a `sh -c` or `eval` payload, a substitution, a
+/// here-doc a shell reads) keeps its own chain, starting where the text
+/// around it is; when it ends, the text around it carries on where it was,
+/// unless the text ran in the same shell (`eval`, `source`), which takes
+/// over where it ended (re-review majors 1 and 2).
 pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) -> Walk {
     let mut w = Walk::default();
-    let mut cands: Vec<PathBuf> = vec![start.to_path_buf()];
-    // where the shell is when an `&&` chain stopped early
-    let mut pool: Vec<PathBuf> = vec![];
     let mut seen: Vec<PathBuf> = vec![];
+    let mut stack: Vec<Level> = vec![Level {
+        ctx: None,
+        depth: 0,
+        cands: vec![start.to_path_buf()],
+        pool: vec![],
+        unknown: false,
+        same_shell: false,
+    }];
     for (i, unit) in units.iter().enumerate() {
-        w.unit_cwd.push(if w.unknown {
-            CwdState::Unknown(cands.clone())
+        // leave the texts this unit isn't in
+        while stack.len() > 1 {
+            let top = &stack[stack.len() - 1];
+            let other =
+                top.depth > unit.level || (top.depth == unit.level && top.ctx != Some(unit.ctx));
+            if !other {
+                break;
+            }
+            let Some(done) = stack.pop() else { break };
+            if done.same_shell
+                && let Some(parent) = stack.last_mut()
+            {
+                let mut cands = done.cands;
+                cands.extend(done.pool);
+                parent.cands = cands;
+                parent.unknown |= done.unknown;
+            }
+        }
+        // enter the text it is in
+        let top_depth = stack[stack.len() - 1].depth;
+        if unit.level > top_depth || (unit.level > 0 && stack.len() == 1) {
+            let top = &stack[stack.len() - 1];
+            let entered = Level {
+                ctx: Some(unit.ctx),
+                depth: unit.level,
+                cands: top.cands.clone(),
+                pool: vec![],
+                unknown: top.unknown,
+                same_shell: unit.same_shell,
+            };
+            stack.push(entered);
+        }
+        let Some(lv) = stack.last_mut() else {
+            return w;
+        };
+        w.unit_cwd.push(if lv.unknown {
+            CwdState::Unknown(lv.cands.clone())
         } else {
-            CwdState::Known(cands.clone())
+            CwdState::Known(lv.cands.clone())
         });
         for (word, role) in words_of(unit, &mut w.overflow) {
-            let paths: Vec<PathBuf> = cands.iter().map(|c| resolve(&word, c, home)).collect();
+            let paths: Vec<PathBuf> = lv.cands.iter().map(|c| resolve(&word, c, home)).collect();
             w.total += paths.len();
             if w.uses.len() >= MAX_USES || w.total > MAX_PATHS {
                 w.overflow = true;
@@ -601,62 +697,57 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
         if w.overflow {
             return w;
         }
-        // a payload or substitution isn't a link of the chain it sits in
-        let join = if unit.derived { Join::Seq } else { unit.join };
-        match cd_effect(unit, &cands, start, home, resolve) {
+        let join = unit.join;
+        match cd_effect(unit, &lv.cands, start, home, resolve) {
             None => {
-                if join == Join::And && !w.unknown {
-                    pool.extend(cands.iter().cloned());
+                if join == Join::And {
+                    lv.pool.extend(lv.cands.iter().cloned());
                 }
             }
             Some(Cd::Moved(targets)) => {
                 push_seen(&mut seen, &targets);
-                let exits_on_failure = join == Join::Or
-                    && next_top(units, i).is_some_and(|n| {
-                        n.eff
-                            .first()
-                            .is_some_and(|f| matches!(base(f), "exit" | "return"))
-                    });
-                if w.unknown {
-                    cands = lost_cands(home, start, &seen);
+                if lv.unknown {
+                    lv.cands = lost_cands(home, start, &seen);
                 } else if join == Join::And {
-                    pool.append(&mut cands);
-                    cands = targets;
-                } else if exits_on_failure {
-                    cands = targets;
+                    lv.pool.append(&mut lv.cands);
+                    lv.cands = targets;
+                } else if join == Join::Or && exits_after(units, i) {
+                    lv.cands = targets;
                 } else {
                     let mut next = targets;
-                    next.append(&mut cands);
-                    cands = next;
+                    next.append(&mut lv.cands);
+                    lv.cands = next;
                 }
             }
             Some(Cd::Lost(targets)) => {
                 push_seen(&mut seen, &targets);
-                if !w.unknown {
-                    // (once unknown, `cands` is home, the start and `seen`)
-                    push_seen(&mut seen, &cands);
-                    push_seen(&mut seen, &pool);
+                if !lv.unknown {
+                    push_seen(&mut seen, &lv.cands);
+                    push_seen(&mut seen, &lv.pool);
                 }
-                pool.clear();
+                lv.pool.clear();
+                lv.unknown = true;
                 w.unknown = true;
-                cands = lost_cands(home, start, &seen);
+                lv.cands = lost_cands(home, start, &seen);
             }
         }
-        if join != Join::And && !pool.is_empty() {
-            if w.unknown {
-                push_seen(&mut seen, &pool);
-                pool.clear();
-                cands = lost_cands(home, start, &seen);
+        if join != Join::And && !lv.pool.is_empty() {
+            if lv.unknown {
+                push_seen(&mut seen, &lv.pool);
+                lv.pool.clear();
+                lv.cands = lost_cands(home, start, &seen);
             } else {
-                cands.append(&mut pool);
+                lv.cands.append(&mut lv.pool);
             }
         }
-        if !w.unknown && cands.len() > MAX_CANDIDATES {
+        if !lv.unknown && lv.cands.len() > MAX_CANDIDATES {
             // too many to follow: the directory becomes unknown (asks)
-            push_seen(&mut seen, &cands);
-            push_seen(&mut seen, &pool);
+            push_seen(&mut seen, &lv.cands);
+            push_seen(&mut seen, &lv.pool);
+            lv.pool.clear();
+            lv.unknown = true;
             w.unknown = true;
-            cands = lost_cands(home, start, &seen);
+            lv.cands = lost_cands(home, start, &seen);
         }
     }
     w

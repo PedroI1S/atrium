@@ -44,6 +44,16 @@ pub struct Unit {
     pub pipe: u32,
     /// The operator after this command, as written (top level of its text).
     pub join: Join,
+    /// Which text this command was written in: every `lex` call (the line,
+    /// one payload, one substitution, one here-doc) has its own number, so
+    /// the directory walk can keep one `&&` chain per text.
+    pub ctx: u32,
+    /// How deeply that text is nested (0: the line itself).
+    pub level: u8,
+    /// The text runs in the shell of the text around it (`eval`, `source`,
+    /// `.`), so a `cd` in it moves that shell too; otherwise it runs in a
+    /// child (`sh -c`, a substitution, `find -exec`, a pipe).
+    pub same_shell: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,6 +65,8 @@ pub struct Lexed {
     pub overflow: bool,
     /// Every here-doc and here-string body at this level.
     pub stdin_texts: Vec<String>,
+    /// The number of this text (`Unit::ctx`).
+    pub ctx: u32,
 }
 
 pub const MAX_UNITS: usize = 512;
@@ -72,6 +84,7 @@ struct Builder {
 }
 
 static PIPE_IDS: AtomicU32 = AtomicU32::new(1);
+static CTX_IDS: AtomicU32 = AtomicU32::new(1);
 
 impl Builder {
     fn new(piped: bool, grouped: bool) -> Self {
@@ -188,7 +201,10 @@ pub fn lex(line: &str) -> Lexed {
 }
 
 fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
-    let mut out = Lexed::default();
+    let mut out = Lexed {
+        ctx: CTX_IDS.fetch_add(1, Ordering::Relaxed),
+        ..Lexed::default()
+    };
     if depth > MAX_DEPTH {
         out.reasons.push("nested too deeply".into());
         return out;
@@ -210,10 +226,21 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     // the command each here-doc belongs to (the one holding the `<<`)
     let mut heredoc_owners: Vec<usize> = vec![];
     let mut raw_units: Vec<Builder> = vec![];
+    // Open `( … )` groups (`true`) and `{ …; }`, `if`, `while`, `until`,
+    // `for`, `case`, `select` bodies (`false`); `Some(pipe)` for one a pipe
+    // feeds (`… | (true; sh)`, `… | { :; sh; }`, `… | if …; then sh; fi`):
+    // every command in it may read the pipe (re-review blocker 5).
+    let mut groups: Vec<(bool, Option<u32>)> = vec![];
 
     macro_rules! flush {
         () => {{
-            let b = std::mem::replace(&mut cur, Builder::new(false, paren_depth > 0));
+            let mut next = Builder::new(false, paren_depth > 0);
+            if let Some(id) = groups.iter().rev().find_map(|g| g.1) {
+                next.piped = true;
+                next.grouped = true;
+                next.pipe = id;
+            }
+            let b = std::mem::replace(&mut cur, next);
             if !b.is_empty() {
                 raw_units.push(b);
             }
@@ -287,14 +314,14 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 }
                 out.reasons.push("subshell".into());
                 i += 1;
-                // `… | (sh)`: the group's first command reads the pipe
-                let carry = (c == '(' && cur.is_empty() && cur.piped).then_some(cur.pipe);
-                flush!();
-                cur.grouped = paren_depth > 0;
-                if let Some(id) = carry {
-                    cur.piped = true;
-                    cur.pipe = id;
+                // `… | (sh)`: the group's commands read the pipe
+                if c == '(' {
+                    groups.push((true, (cur.is_empty() && cur.piped).then_some(cur.pipe)));
+                } else if groups.last().is_some_and(|g| g.0) {
+                    groups.pop();
                 }
+                flush!();
+                cur.grouped = cur.grouped || paren_depth > 0;
                 continue;
             }
             '&' if chars.get(i + 1) == Some(&'&') => {
@@ -497,10 +524,49 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                         word.push('$');
                         i += 1;
                     } else if chars.get(i + 1) == Some(&'{') {
+                        // `${x:-"}"}`: quotes, escapes and nested `${…}`
+                        // inside don't end it (re-review blocker 5)
                         let mut j = i + 2;
                         let mut body = String::new();
-                        while j < chars.len() && chars[j] != '}' {
-                            body.push(chars[j]);
+                        let mut nest = 0usize;
+                        while j < chars.len() {
+                            let ch = chars[j];
+                            match ch {
+                                '}' if nest == 0 => break,
+                                '}' => nest -= 1,
+                                '{' if j > 0 && chars[j - 1] == '$' => nest += 1,
+                                '\\' => {
+                                    body.push(ch);
+                                    j += 1;
+                                    if let Some(&n) = chars.get(j) {
+                                        body.push(n);
+                                    }
+                                    j += 1;
+                                    continue;
+                                }
+                                '\'' | '"' => {
+                                    body.push(ch);
+                                    j += 1;
+                                    while j < chars.len() && chars[j] != ch {
+                                        if ch == '"' && chars[j] == '\\' {
+                                            body.push(chars[j]);
+                                            j += 1;
+                                            if j >= chars.len() {
+                                                break;
+                                            }
+                                        }
+                                        body.push(chars[j]);
+                                        j += 1;
+                                    }
+                                    if j < chars.len() {
+                                        body.push(chars[j]);
+                                        j += 1;
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                            body.push(ch);
                             j += 1;
                         }
                         word.push_str("${");
@@ -649,6 +715,18 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 bodies.push((raw_units.len(), word));
             }
             None => {
+                // `{ …; }` groups, for a pipe into one
+                if cur.argv.is_empty() && cur.assignments.is_empty() && quoted_prefix_empty {
+                    match word.as_str() {
+                        "{" | "if" | "while" | "until" | "for" | "case" | "select" => {
+                            groups.push((false, cur.piped.then_some(cur.pipe)));
+                        }
+                        "}" | "fi" | "done" | "esac" if groups.last().is_some_and(|g| !g.0) => {
+                            groups.pop();
+                        }
+                        _ => {}
+                    }
+                }
                 if cur.argv.is_empty() && assign_name_end.is_some() {
                     let n = assign_name_end.unwrap_or(0);
                     cur.assignments
@@ -705,6 +783,10 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             extra.push(l);
         }
         let mut payload_units: Vec<Unit> = vec![];
+        // `eval` and `source` run their text in this shell
+        let same_shell_owner = eff
+            .first()
+            .is_some_and(|f| matches!(base(f), "eval" | "source" | "."));
         let mut payloads = payloads_of(&eff);
         payloads.extend(env_payloads(&seg.argv));
         // the output of a `$(…)` that is run as code: `sh -c "$(echo …)"`,
@@ -741,7 +823,12 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         for p in &payloads {
             let l = lex_depth(p, depth + 1, true);
             out.overflow |= l.overflow;
-            payload_units.extend(l.units);
+            payload_units.extend(l.units.into_iter().map(|mut u| {
+                if u.ctx == l.ctx {
+                    u.same_shell = same_shell_owner;
+                }
+                u
+            }));
             // reasons of a payload don't matter: the call is `sh -c …`, which
             // rules never match as a prefix of `sh`, and the hard-deny list
             // reads the units.
@@ -757,10 +844,13 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             derived,
             pipe,
             join,
+            ctx: out.ctx,
+            level: depth,
+            same_shell: false,
         };
         out.units.push(unit);
         if eff.first().map(|s| base(s)) == Some("find") {
-            find_exec_units(&eff, &mut out.units);
+            find_exec_units(&eff, &mut out.units, depth + 1);
         }
         for l in extra {
             for mut u in l.units {
@@ -789,6 +879,10 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         u.eff.first().is_some_and(|f| {
             is_shell(f)
                 || matches!(base(f), "eval" | "source" | ".")
+                // `| s$(echo h)`, `| $(echo sh)`: a word built by running
+                // something may name a shell (a variable alone, `| $PAGER`,
+                // is read only with `-s` or `-`)
+                || has_command_substitution(f)
                 || (maybe_shell(f) && u.eff[1..].iter().any(|a| a == "-s" || a == "-"))
         }) || reads_stdin_as_script(&u.eff)
     };
@@ -796,7 +890,8 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         out.overflow = true;
         return out;
     }
-    let mut texts: Vec<String> = vec![];
+    // (text, where its owner is when the text runs in this shell)
+    let mut texts: Vec<(String, Option<usize>)> = vec![];
     // A body is shell-fed (lexed for the hard-deny list) unless it is clearly
     // text: its owner is a simple command that isn't a shell, `eval`,
     // `source` or an interpreter, and whose output isn't piped or
@@ -814,8 +909,15 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     for (owner, text) in &bodies {
         let owner_unit = raw_pos.get(*owner).and_then(|p| out.units.get(*p));
         if owner_unit.is_some_and(is_crontab) {
-            texts.push(crontab_commands(text));
+            texts.push((crontab_commands(text), None));
         }
+        let same_shell = raw_pos.get(*owner).copied().filter(|p| {
+            out.units.get(*p).is_some_and(|u| {
+                u.eff
+                    .first()
+                    .is_some_and(|f| matches!(base(f), "eval" | "source" | "."))
+            })
+        });
         let clearly_text = raw_pos
             .get(*owner)
             .and_then(|p| out.units.get(*p))
@@ -833,15 +935,16 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     && !u.grouped
             });
         if !clearly_text {
-            texts.push(text.clone());
+            texts.push((text.clone(), same_shell));
         }
     }
     if out.units.iter().any(is_pipe_code) {
         let mut seen_pipes: Vec<u32> = vec![];
-        for u in out
+        for (k, u) in out
             .units
             .iter()
-            .filter(|u| u.pipe != 0 && u.seg.piped && is_pipe_code(u))
+            .enumerate()
+            .filter(|(_, u)| u.pipe != 0 && u.seg.piped && is_pipe_code(u))
         {
             if seen_pipes.contains(&u.pipe) {
                 continue;
@@ -855,23 +958,52 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 let jobs: Vec<String> = piped.iter().map(|t| crontab_commands(t)).collect();
                 piped.extend(jobs);
             }
-            texts.extend(piped);
+            // a pipeline's commands run in children, except (zsh) its last
+            // one: `… | source /dev/stdin` may run in this shell
+            let same_shell = u
+                .eff
+                .first()
+                .is_some_and(|f| matches!(base(f), "eval" | "source" | "."))
+                .then_some(k);
+            texts.extend(piped.into_iter().map(|t| (t, same_shell)));
         }
     }
     let mut extra_units: Vec<Unit> = vec![];
-    for t in &texts {
+    // a text run in this shell goes right after its owner (and the owner's
+    // own payloads), so the directory walk sees its `cd`s in order
+    let mut placed: Vec<(usize, Vec<Unit>)> = vec![];
+    for (t, owner) in &texts {
         let l = lex_depth(t, depth + 1, true);
         out.overflow |= l.overflow;
+        let mut units = vec![];
         for mut u in l.units {
             u.derived = true;
-            extra_units.push(u);
+            if u.ctx == l.ctx {
+                u.same_shell = owner.is_some();
+            }
+            units.push(u);
         }
-        if out.units.len() + extra_units.len() > MAX_UNITS {
+        let added = extra_units.len() + placed.iter().map(|p| p.1.len()).sum::<usize>();
+        if out.units.len() + added + units.len() > MAX_UNITS {
             out.overflow = true;
             return out;
         }
+        match owner {
+            Some(k) => {
+                let at = out.units[k + 1..]
+                    .iter()
+                    .position(|n| n.ctx == out.ctx)
+                    .map_or(out.units.len(), |p| k + 1 + p);
+                placed.push((at, units));
+            }
+            None => extra_units.extend(units),
+        }
     }
     out.units.extend(extra_units);
+    placed.sort_by_key(|p| std::cmp::Reverse(p.0));
+    for (at, units) in placed {
+        out.units.splice(at..at, units);
+    }
     out.reasons.sort();
     out.reasons.dedup();
     out
@@ -1009,6 +1141,13 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                 // [FILE]`. Only the wrapper's own `-c` (before the command
                 // starts) is a shell string; a `-c` later belongs to the
                 // command (`flock l git -c x=y push`, `script f sudo sh -c id`).
+                // short options that take a value (the rest of a cluster, or
+                // the next word): the `-c` among them is the shell string
+                let short_value: &[char] = if b == "flock" {
+                    &['w', 'E', 'c']
+                } else {
+                    &['c', 'F', 't', 'T', 'I', 'O', 'B', 'E', 'm']
+                };
                 let with_value: &[&str] = if b == "flock" {
                     &["-w", "-E", "--timeout", "--wait", "--conflict-exit-code"]
                 } else {
@@ -1041,6 +1180,22 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                     if let Some(v) = w.strip_prefix("--command=") {
                         shell_string = Some(v.to_string());
                         break;
+                    }
+                    // a cluster: `-c'…'`, `-nc'…'`, `-qc 'cmd'` (re-review
+                    // blocker 5); the first value-taking letter ends it
+                    if w.starts_with('-') && !w.starts_with("--") && w.len() > 2 {
+                        let cs: Vec<char> = w[1..].chars().collect();
+                        if let Some(k) = cs.iter().position(|ch| short_value.contains(ch))
+                            && cs[k] == 'c'
+                        {
+                            let rest: String = cs[k + 1..].iter().collect();
+                            shell_string = if rest.is_empty() {
+                                a.get(j + 1).cloned()
+                            } else {
+                                Some(rest)
+                            };
+                            break;
+                        }
                     }
                     if with_value.contains(&w) {
                         j += 2;
@@ -1260,7 +1415,7 @@ const COMMAND_RUNNERS: &[&str] = &[
 ];
 
 /// A word holding a command substitution.
-fn has_command_substitution(w: &str) -> bool {
+pub fn has_command_substitution(w: &str) -> bool {
     w.contains("$(") || w.contains('`')
 }
 
@@ -1294,7 +1449,31 @@ pub fn reads_stdin_as_script(eff: &[String]) -> bool {
             }
             operands <= 1
         }
-        "crontab" => args.iter().any(|a| stdin(a)),
+        // `crontab [-u USER] [FILE]`: without a file (or with `-`) the
+        // table comes from stdin; `-l`, `-r`, `-e` don't read one
+        "crontab" => {
+            let mut k = 0;
+            let mut file = false;
+            while k < args.len() {
+                let a = args[k].as_str();
+                if a == "-u" {
+                    k += 2;
+                    continue;
+                }
+                if stdin(a) {
+                    return true;
+                }
+                if let Some(flags) = a.strip_prefix('-') {
+                    if flags.contains(['l', 'r', 'e']) {
+                        return false;
+                    }
+                } else {
+                    file = true;
+                }
+                k += 1;
+            }
+            !file
+        }
         "make" | "gmake" => args.iter().enumerate().any(|(i, a)| {
             let next_is_stdin = args.get(i + 1).is_some_and(|n| stdin(n));
             if let Some(v) = a
@@ -1467,6 +1646,7 @@ fn format_printf(fmt: &str, args: &[String], b_octal0: bool) -> String {
     let cs: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
     let mut idx = 0usize;
+    let mut used_positional = false;
     loop {
         let before = idx;
         let mut i = 0;
@@ -1490,7 +1670,23 @@ fn format_printf(fmt: &str, args: &[String], b_octal0: bool) -> String {
                 i += 1;
                 continue;
             }
+            // `%2$s`: an argument named by number (zsh, ksh, BSD); the
+            // format is then not reused (re-review blocker 5)
+            let mut digits = 0;
+            while cs.get(i + digits).is_some_and(|c| c.is_ascii_digit()) {
+                digits += 1;
+            }
+            let positional: Option<usize> = (digits > 0 && cs.get(i + digits) == Some(&'$'))
+                .then(|| cs[i..i + digits].iter().collect::<String>().parse().ok())
+                .flatten();
+            if positional.is_some() {
+                i += digits + 1;
+                used_positional = true;
+            }
             let mut next_arg = || {
+                if let Some(n) = positional {
+                    return n.checked_sub(1).and_then(|k| args.get(k)).cloned();
+                }
                 let a = args.get(idx).cloned();
                 if a.is_some() {
                     idx += 1;
@@ -1563,7 +1759,7 @@ fn format_printf(fmt: &str, args: &[String], b_octal0: bool) -> String {
                 return out;
             }
         }
-        if idx == before || idx >= args.len() {
+        if idx == before || idx >= args.len() || used_positional {
             break;
         }
     }
@@ -1804,7 +2000,7 @@ pub fn find_roots(eff: &[String]) -> (Vec<String>, usize) {
 }
 
 /// `find … -exec CMD … ;` becomes its own unit so hard-deny sees `CMD`.
-fn find_exec_units(eff: &[String], units: &mut Vec<Unit>) {
+fn find_exec_units(eff: &[String], units: &mut Vec<Unit>, level: u8) {
     let (roots, j) = find_roots(eff);
     let mut k = j;
     while k < eff.len() {
@@ -1832,6 +2028,9 @@ fn find_exec_units(eff: &[String], units: &mut Vec<Unit>) {
                     derived: true,
                     pipe: 0,
                     join: Join::Seq,
+                    ctx: CTX_IDS.fetch_add(1, Ordering::Relaxed),
+                    level,
+                    same_shell: false,
                 });
             }
             k = m;

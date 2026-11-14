@@ -403,3 +403,45 @@ fn ordinary_heredoc_text_with_a_substitution_is_not_a_false_hard_deny() {
         ),
     ]);
 }
+
+/// Fourth round, re-review majors 1 and 2: a substitution, `-exec` or `-c`
+/// payload inside an `&&` chain must not bring the directory before the
+/// `cd` back; `cd X && Y` inside `sh -c`, `eval` or `env -C` follows the
+/// `&&` rule. Verdicts are dev's (run on dev's `src`, see the handoff).
+/// `env -C DIR CMD` is a hard deny on dev too (dev reads `CMD` in the start
+/// directory), so those rows keep dev's verdict.
+#[test]
+fn round_4_majors_derived_units_keep_their_own_chain() {
+    let ask = ["Ask", "Ask", "Allow", "Allow"];
+    check_table(&[
+        ("cd proj && echo $(date) && cat .npmrc", ask),
+        ("cd build && TAG=$(date +%F) && rm -rf *", ask),
+        (
+            "cd proj && find . -name '*.o' -exec true {} + && cat .npmrc",
+            ask,
+        ),
+        ("cd proj && sh -c 'true' && cat .npmrc", ask),
+        ("sh -c 'cd proj && cat .npmrc'", ask),
+        ("sh -c 'cd build && rm -rf *'", ask),
+        ("sh -c \"cd proj && find . -name '*.o' -delete\"", ask),
+        ("eval 'cd proj && cat .npmrc'", ask),
+        (
+            "env -C proj cat .npmrc",
+            [
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+            ],
+        ),
+        (
+            "env -C build rm -rf *",
+            [
+                "Hard(recursive-delete-outside-cwd)",
+                "Hard(recursive-delete-outside-cwd)",
+                "Hard(recursive-delete-outside-cwd)",
+                "Hard(recursive-delete-outside-cwd)",
+            ],
+        ),
+    ]);
+}

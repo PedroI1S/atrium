@@ -658,3 +658,185 @@ fn finding_11_a_hard_link_to_a_credential_kept_outside_home() {
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+// ---------------------------------------------------------------------------
+// Fourth round: the third part's re-review
+// (`docs/agents/reviews/M1-13-adversarial-third-part.md`), blockers 1 to 5.
+// Every input it names, with the verdict it must get. These are not cwd
+// uncertainty cases (D-078 doesn't apply): a hard deny was bypassed, so the
+// verdict is a hard deny in every setting.
+// ---------------------------------------------------------------------------
+
+/// Re-review blocker 1: a folder linked into `~/.ssh` (and a deeper key below
+/// a linked folder). A recursive search of the folder, or of a folder that
+/// holds it, reads the keys; a file deep inside is a key at any depth. The
+/// folder itself stays ordinary for `ls` (M1-03 finding 5).
+#[test]
+fn round_4_blocker_1_recursive_search_of_a_folder_linked_into_ssh() {
+    let t = Tmp::new();
+    t.write(".ssh/known_hosts", "x");
+    t.write("vault/work/id_work", "secret");
+    t.write("vault/a/b/id_key", "secret");
+    t.write("deeper/a/b/c/d/e/f/id_deep", "secret");
+    symlink(t.home.join("vault/work"), t.home.join(".ssh/work")).unwrap();
+    symlink(t.home.join("vault"), t.home.join(".ssh/deep")).unwrap();
+    symlink(t.home.join("deeper"), t.home.join(".ssh/deeper")).unwrap();
+    let mut failures = vec![];
+    gate_lines(
+        &t,
+        "cmd",
+        &[
+            "rg x vault/work",
+            "grep -r x vault/work",
+            "rg x vault",
+            "grep -R x vault",
+            "cat vault/a/b/id_key",
+            "cat vault/work/*",
+            "cat deeper/a/b/c/d/e/f/id_deep",
+        ],
+        true,
+        &mut failures,
+    );
+    for (setting, rules, preset) in gate_settings() {
+        let g = t.gate(preset, rules);
+        for p in ["vault/work", "vault"] {
+            let c = paths_check(ToolKind::Search, "Grep", &[p], true, None);
+            let d = block_on(g.gate.check(&c));
+            if !matches!(d, GateDecision::Deny { .. }) {
+                failures.push(format!("Grep [{setting}] {p}: got {d:?}"));
+            }
+        }
+        for p in ["vault/a/b/id_key", "deeper/a/b/c/d/e/f/id_deep"] {
+            let c = paths_check(ToolKind::Read, "Read", &[p], false, None);
+            let d = block_on(g.gate.check(&c));
+            if !matches!(d, GateDecision::Deny { .. }) {
+                failures.push(format!("Read [{setting}] {p}: got {d:?}"));
+            }
+        }
+    }
+    // M1-03 finding 5: listing the linked folder stays ordinary
+    let g = t.gate(Preset::Home, vec![]);
+    for line in ["ls vault/work", "ls vault"] {
+        let d = block_on(g.gate.check(&cmd_check(line)));
+        if d != GateDecision::Allow {
+            failures.push(format!("[home] {line:?}: got {d:?}, wanted Allow"));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Re-review blocker 2: every spelling of grep's recursion that Home's
+/// read-only list accepts is a recursive search for the hard-link check too.
+#[test]
+fn round_4_blocker_2_every_grep_recursion_spelling_reaches_the_hard_link_check() {
+    let t = Tmp::new();
+    t.write(".gnupg/private-keys-v1.d/k.key", "secret");
+    t.write("proj/a.txt", "x");
+    std::fs::hard_link(
+        t.home.join(".gnupg/private-keys-v1.d/k.key"),
+        t.home.join("proj/k2"),
+    )
+    .unwrap();
+    let mut failures = vec![];
+    for (setting, rules, preset) in gate_settings() {
+        let g = t.gate(preset, rules);
+        for line in [
+            "grep -d recurse x proj",
+            "grep --directories recurse x proj",
+            "grep --directories=recurse x proj",
+            "grep --dir=recurse x proj",
+            "grep --rec x proj",
+            "grep -id recurse x proj",
+            "grep -drecurse x proj",
+            "egrep -r x proj",
+            "grep -ri x proj",
+        ] {
+            let d = block_on(g.gate.check(&cmd_check(line)));
+            if matches!(d, GateDecision::Allow) {
+                failures.push(format!("[{setting}] {line:?}: got {d:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Re-review blocker 3: `|| return` (which fails at top level) and an `exit`
+/// inside a pipeline (which leaves only its subshell) don't end the shell, so
+/// the old directory still counts.
+#[test]
+fn round_4_blocker_3_return_and_piped_exit_do_not_narrow() {
+    run_all(&[
+        ("cd /nonexistent || return 0; cat .ssh/id_rsa", h(CR)),
+        ("cd /nonexistent || return; cat .ssh/id_rsa", h(CR)),
+        ("cd /nonexistent || exit 1 | true; cat .ssh/id_rsa", h(CR)),
+        ("cd /nonexistent || true | exit 1; cat .ssh/id_rsa", h(CR)),
+        ("cd /nonexistent || (exit 1); cat .ssh/id_rsa", h(CR)),
+        ("cd proj || return; rm -rf *", h(RD)),
+        ("cd proj || exit 1 | cat; rm -rf *", h(RD)),
+    ]);
+}
+
+/// Re-review blocker 4: `cd` option clusters keep the target; a `cd` the
+/// engine can't parse keeps its targets as candidates.
+#[test]
+fn round_4_blocker_4_cd_option_clusters_keep_the_target() {
+    run_all(&[
+        ("cd -LP .ssh && cat id_rsa", h(CR)),
+        ("cd -Pe .ssh; cat id_rsa", h(CR)),
+        ("cd -eP .ssh && cat id_rsa", h(CR)),
+        ("cd -L -P .ssh && cat id_rsa", h(CR)),
+        ("cd -P -- .ssh && cat id_rsa", h(CR)),
+        ("cd -Q .ssh && cat id_rsa", h(CR)),
+        ("cd .ssh extra && cat id_rsa", h(CR)),
+    ]);
+}
+
+/// Re-review blocker 5: six ways the lexer or the payload reader lost code.
+#[test]
+fn round_4_blocker_5_lexer_and_payload_gaps() {
+    run_all(&[
+        // 1. printf positional conversions
+        ("printf '%2$s%1$s' 'credentials' 'cat .aws/' | sh", h(CR)),
+        ("printf '%2$s %1$s\\n' '~' 'rm -rf' | sh", h(RD)),
+        // 2. a pipe into a group whose shell isn't the first command
+        ("printf 'rm -rf ~\\n' | (true; sh)", h(RD)),
+        ("echo 'cat .aws/credentials' | { :; sh; }", h(CR)),
+        ("echo 'rm -rf ~' | { true && bash; }", h(RD)),
+        // 3. `}` inside quotes inside `${…}`
+        ("echo ${x:-\"}\"} ; cat .ssh/id_rsa", h(CR)),
+        ("echo ${x:-'}'} ; cat .ssh/id_rsa", h(CR)),
+        // 4. attached `-c` on flock / script
+        ("flock -c'cat .aws/credentials; true' /tmp/l", h(CR)),
+        ("script -c'cat .aws/credentials; true' /dev/null", h(CR)),
+        ("flock /tmp/l -c'rm -rf ~'", h(RD)),
+        ("flock -nc'rm -rf ~' /tmp/l", h(RD)),
+        ("script -qc'rm -rf ~' /dev/null", h(RD)),
+        // 5. bare `crontab` reads stdin
+        ("echo '* * * * * rm -rf ~' | crontab", h(RD)),
+        ("echo '@reboot cat .aws/credentials' | crontab -u me", h(CR)),
+        // 6. a pipe into a command word built by a substitution
+        ("echo 'cat .ssh/id_rsa' | s$(echo h)", h(CR)),
+        ("echo 'rm -rf ~' | $(echo sh)", h(RD)),
+        ("echo 'rm -rf ~' | `echo sh`", h(RD)),
+    ]);
+}
+
+/// Fourth round, found by the fixer (not named by the re-review; Ask/Allow
+/// on dev and on 253c7f4): a here-doc or pipe that `source`, `.` or `eval`
+/// runs in this shell moves its directory before the next command, and a
+/// pipe into an `if`, `while`, `until`, `for` or `case` body reaches the
+/// shell inside it, like a pipe into `{ …; }`.
+#[test]
+fn round_4_same_shell_texts_and_pipes_into_compound_commands() {
+    run_all(&[
+        ("source /dev/stdin <<EOF\ncd .ssh\nEOF\ncat id_rsa", h(CR)),
+        (". /dev/stdin <<<'cd .ssh'; cat id_rsa", h(CR)),
+        ("echo 'cd .ssh' | source /dev/stdin; cat id_rsa", h(CR)),
+        ("eval 'cd .ssh'; cat id_rsa", h(CR)),
+        ("echo 'rm -rf ~' | if true; then sh; fi", h(RD)),
+        ("echo 'rm -rf ~' | while read l; do sh; done", h(RD)),
+        ("echo 'rm -rf ~' | until false; do sh; done", h(RD)),
+        ("echo 'rm -rf ~' | for i in 1; do sh; done", h(RD)),
+        ("echo 'rm -rf ~' | case x in *) sh;; esac", h(RD)),
+    ]);
+}

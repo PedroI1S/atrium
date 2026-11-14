@@ -553,7 +553,11 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
             .first()
             .is_some_and(|a| matches!(a.as_str(), "/dev/stdin" | "/dev/fd/0" | "-"));
     }
-    // `| $X -s`: a command named at run time, told to read a script
+    // `| s$(echo h)`: a word built by running something may name a shell;
+    // `| $X -s`: a command named by a variable, told to read a script
+    if !is_interpreter(b) && shell::has_command_substitution(first) {
+        return true;
+    }
     if !is_interpreter(b) && shell::maybe_shell(first) {
         return args.iter().any(|a| a == "-" || a == "-s");
     }

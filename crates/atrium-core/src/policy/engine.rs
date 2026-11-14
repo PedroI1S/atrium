@@ -393,14 +393,14 @@ const GREP_VAL_L: &[&str] = &[
     "group-separator",
 ];
 
-struct Searched {
-    roots: Vec<String>,
-    recursive: bool,
+pub(crate) struct Searched {
+    pub(crate) roots: Vec<String>,
+    pub(crate) recursive: bool,
 }
 
 /// Splits an `rg`/`grep` command into search roots; `None` for a flag it
 /// doesn't know (the command then asks).
-fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
+pub(crate) fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
     let (bs, vs, bl, vl) = if is_rg {
         (RG_BOOL_S, RG_VAL_S, RG_BOOL_L, RG_VAL_L)
     } else {

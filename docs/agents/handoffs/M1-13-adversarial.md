@@ -442,3 +442,117 @@ adversarial_supervise  20/20   adversarial_fuzz 19/20 (the one failure: the 40 s
 ```
 
 - No daemon is left running (`pgrep -fl atriumd`: none).
+
+
+## Fourth round (Claude Opus 5.5, D-079): the re-review of `253c7f4`
+
+Review: `docs/agents/reviews/M1-13-adversarial-third-part.md` (Gemini 4 Hydrogen `high`, rework). Its item 8 is settled by D-078: Any rules and FullAccess keep dev's behaviour on an uncertain cwd. None of the blockers below is an uncertain-cwd case: each one bypassed a hard deny, so they are hard denies under every preset.
+
+**Method.**
+1. Every input the review names went into the tables first, with its verdict per setting:
+   - blockers in `adversarial_regression.rs` (`round_4_*`);
+   - majors in `adversarial_ordinary.rs` (`round_4_majors_derived_units_keep_their_own_chain`).
+2. All of them failed on `253c7f4`.
+3. The fixes are in `crates/atrium-core/src/policy/**` only.
+4. The majors' expected verdicts are dev's. I measured them by running a scratch test over dev's `crates/atrium-core/src` (the merge base, `8677018`) in a scratch copy, as in the third part.
+
+### Blockers
+
+1. **A recursive search of a folder linked into `~/.ssh`, and keys deeper than the walk** (`gate.rs`).
+   - `ssh_members` now also returns the real paths of the folders linked into `~/.ssh`. Its walk was raised to depth 8 and 1024 entries.
+   - A new check, `reaches_linked_ssh_dir`, turns the verdict into a hard deny (`credential-read`) when any of these holds:
+     - a named path is a file below such a folder, at any depth, with no walk needed;
+     - a glob's folder is inside one;
+     - a recursive reader's root is the folder, inside it, or holds it. Recursive readers are `rg`, `ag`, `ack`, every `grep` spelling, and the Grep tool with `recursive`.
+   - Listing or entering the folder stays ordinary (M1-03 finding 5): `ls vault/work` and `ls vault` are allowed.
+   - Test: `round_4_blocker_1_recursive_search_of_a_folder_linked_into_ssh`. It uses `rg`, `grep -r`/`-R`, the Grep tool, `cat` and Read of keys at depth 3 and 7, and `cat vault/work/*` in home, any and full.
+2. **`grep -d recurse` and `--directories recurse`** (`gate.rs`, `engine.rs`).
+   - `recursive_reader` now calls the same parser as Home's read-only list (`engine::search_roots`, now `pub(crate)`), so the two can't drift.
+   - A `grep` line that parser can't read counts as recursive.
+   - Test: `round_4_blocker_2_every_grep_recursion_spelling_reaches_the_hard_link_check`, with `-d recurse`, `--directories recurse`, `--directories=recurse`, `--dir=recurse`, `--rec`, `-id recurse`, `-drecurse`, `egrep -r` and `-ri`.
+3. **`|| return` and a piped `exit`** (`words.rs`, `exits_after`).
+   - Only a plain `exit` narrows the candidates to the target: the next command in the same text, not in a pipeline or a group.
+   - `return` never narrows, because it fails outside a function and the line goes on.
+   - Test: `round_4_blocker_3_return_and_piped_exit_do_not_narrow`, which also has `|| (exit 1)` and `|| true | exit 1`.
+4. **`cd` option clusters** (`words.rs`, `cd_effect`).
+   - Clusters of `L`, `P`, `e` and `@` (`-LP`, `-Pe`, `-eP`, `-L -P`, then `--`) are read, and the target is kept.
+   - These make the cwd unknown but keep their targets as candidates:
+     - any other option;
+     - two or more operands (zsh's `cd OLD NEW`).
+   - Test: `round_4_blocker_4_cd_option_clusters_keep_the_target`, which has `-Q` and `cd .ssh extra`.
+5. **The six lexer and payload gaps** (`shell.rs`, `deny.rs`). Test: `round_4_blocker_5_lexer_and_payload_gaps`.
+   1. `format_printf` reads `%N$…`, an argument named by number. The format is then not reused.
+   2. A pipe into a group reaches every command in the group, not only the first. Groups are `( … )` and `{ …; }`, and also `if`, `while`, `until`, `for`, `case` and `select` bodies. The lexer keeps a stack of open groups for this.
+   3. `${…}` scanning knows about quotes, escapes and a nested `${`.
+   4. `flock` and `script` read `-c` with its value attached or inside a cluster: `-c'…'`, `-nc'…'`, `-qc …`. Each wrapper's short options that take a value are listed. No other wrapper in `unwrap` takes a `-c` shell string.
+   5. A bare `crontab` (or `crontab -u USER`) with no file reads its table from stdin. `-l`, `-r` and `-e` don't.
+   6. A pipe into a command word built by a command substitution counts as code: `s$(echo h)`, `$(echo sh)`, a backtick word. This holds in the lexer (`is_pipe_code`) and in `deny.rs` (`reads_stdin_as_code`). A variable alone, such as `| $PAGER` or `| $CLIP`, still asks, as on dev.
+
+### Majors (back to dev's verdict)
+
+1 and 2. **Derived units keep their own chain** (`shell.rs`, `words.rs`).
+- Every unit now records:
+  - which text it came from (`ctx`: one number per lex of the line, a payload, a substitution, a here-doc or a `find -exec`);
+  - how deeply that text is nested (`level`);
+  - whether the text runs in the shell around it (`same_shell`: the payload or stdin text of `eval`, `source` or `.`).
+- `walk` keeps a stack of states, one per text, each with its own candidates, `&&` pool and unknown flag:
+  - A text starts where the text around it is, and uses its own joins. Derived units are no longer forced to `Seq`.
+  - When it ends, the text around it carries on where it was. A same-shell text (`eval`, `source`) instead hands over where it ended.
+  - A substitution or payload in the middle of an `&&` chain no longer flushes the chain's pool. `cd X && Y` inside `sh -c`, `eval` or `env -C` follows the `&&` rule.
+- **`env -C DIR CMD` keeps dev's verdict**, a hard deny for `env -C proj cat .npmrc` and `env -C build rm -rf *`. dev resolves `CMD` in the start directory: the `env` unit itself, not the payload. Turning that into Ask would be weaker than dev, so the row pins dev's hard deny. **This is a decision for the owner:** the hard deny is a false one (if `proj` doesn't exist, `env` fails and `cat` never runs). Fixing it means reading the `env` unit's own words in `DIR`.
+- Test: `round_4_majors_derived_units_keep_their_own_chain`. It has the review's ten lines. Eight get [Ask, Ask, Allow, Allow], dev's verdict; the two `env -C` lines get Hard in all four settings, also dev's.
+
+### Found by the fixer (not named by the review; Ask in home, Allow with Any/Full on dev and on `253c7f4`)
+
+- `source /dev/stdin <<EOF` + `cd .ssh` + `EOF` + `cat id_rsa`, `. /dev/stdin <<<'cd .ssh'; cat id_rsa`, `echo 'cd .ssh' | source /dev/stdin; cat id_rsa`:
+  - Here-doc and here-string bodies were appended after every command of the line, so their `cd` came too late.
+  - A text that `eval`, `source` or `.` runs in this shell is now placed right after its owner, and is marked `same_shell`. A pipe into one counts too, because zsh runs the last command of a pipeline in this shell.
+- `echo 'rm -rf ~' | if true; then sh; fi`, and the same with `while`, `until`, `for` and `case` bodies: fixed with blocker 5.2.
+- Test: `round_4_same_shell_texts_and_pipes_into_compound_commands`, all Hard.
+
+### Minor and nit
+
+- `adversarial_fuzz`: the debug wall-clock bound of `random_hostile_lines_never_panic_and_nothing_sensitive_is_allowed` is now 60 s. `policy.rs`'s `pipe_to_shell_fan_out_is_linear_and_denied` stays the guard against a blowup.
+- Host test: the macOS ignore reason now names the obstacle, the re-execing `/usr/bin/python3` stub. The zombie-leader premise is ordinary POSIX.
+
+### Checks against dev for false hard denies
+
+I ran 22 ordinary lines that touch these fixes on dev and on the branch, in all four settings. They gave the same verdicts everywhere. Among them:
+- `cd -P build && make`, `cd -L .. && ls`;
+- pipes into `while`, `if`, `{ …; }` and `( … )`;
+- `sh -c`/`bash -c` with `cd X &&`, `eval "$(ssh-agent -s)"`;
+- `cd proj || exit 1; make`, `cd proj || return; make`;
+- `crontab -l`, `flock /tmp/l make`, `echo ${HOME:-"/tmp"}`, `rg TODO src`, `grep -rn TODO src`, `printf '%s\n' hello | cat`.
+
+### What is left
+
+- **Owner decision:** `env -C DIR CMD` keeps dev's hard deny (above).
+- **Limits:**
+  - A glob in a folder linked into `~/.ssh` is a hard deny even for `ls vault/*`. The check doesn't single out listers for globs; a plain `ls` of the folder is allowed.
+  - A same-shell text's directory is followed. A child's (`sh -c`, a substitution) is dropped when it ends, which is right for a child. But a `cd` the engine can't follow anywhere in the line still marks the whole line as having an unknown cwd, so Home and prefix rules ask (same as before).
+  - A here-doc a child shell reads (`bash <<EOF`) still starts from where the line ends, not from where its owner is (as before; stricter).
+- **Still ignored, outside this brief** (as in the third part): part-1 findings 4, 5 and 6, gate findings 10 and 11, fuzz finding 11.
+
+### Real outputs of the Definition of Done (macOS, this worktree)
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test -p atrium-core -p atrium-daemon -p atrium-host --no-fail-fast`: exit 0.
+
+```
+atrium-core lib 9 | adversarial_fuzz 2 passed 1 ignored (12.9 s) | adversarial_gate 9 passed 2 ignored
+adversarial_ledger 14 | adversarial_ordinary 7 | adversarial_policy 15 passed 3 ignored | adversarial_regression 28
+attention 8 | history 25 | ledger 20 | policy 44 | store 28
+atrium-daemon lib 13 | adversarial_recovery 3 | adversarial_socket 7 | client 1 | recovery 3 | sessions 19 | socket 9
+atrium-host lib 5 | adversarial_supervise 7 passed 1 ignored (macOS) | lifecycle 1+1+4 | peer 3 | supervise 7
+```
+
+- 20 runs in a row (fish: `for i in (seq 20); cargo test -q -p atrium-core --test adversarial_regression; or break; end`):
+
+```
+adversarial_regression 20/20   adversarial_ordinary 20/20   adversarial_policy 20/20
+adversarial_gate       20/20   policy               20/20   adversarial_supervise 20/20
+adversarial_fuzz       20/20
+```
+
+- No daemon left running (`pgrep -fl atriumd`: none).

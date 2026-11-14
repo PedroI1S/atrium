@@ -14,6 +14,7 @@ use atrium_protocol::policy::{
 use atrium_protocol::thread::ThreadId;
 
 use super::deny;
+use super::engine;
 use super::shell;
 use super::words::{expand_home, normalize};
 use super::{SessionGate, input_sha256};
@@ -184,22 +185,34 @@ fn alias_fix(p: &Path, roots: &[((u64, u64), PathBuf)]) -> Result<PathBuf, Strin
     Ok(p)
 }
 
-/// The roots plus the members of `~/.ssh` (a small folder): a hard link to a
-/// key is the same file. The big trees (browser profiles) aren't walked; a
-/// path inside one is caught through its ancestors.
+/// The members of `~/.ssh` (a small folder): a hard link to a key is the
+/// same file. The big trees (browser profiles) aren't walked; a path inside
+/// one is caught through its ancestors.
 ///
 /// Every member is identified through links (another name for a key is the
 /// key: review M1-13 finding 1). A folder linked into `~/.ssh` is walked, but
 /// only the files in it are members, not the folder: listing it or `cd`-ing
 /// into it stays ordinary (M1-03 finding 5), reading a file in it doesn't.
-fn ssh_members(home: &Path) -> Vec<PathBuf> {
-    const MAX_ENTRIES: usize = 256;
-    let mut out = vec![];
+/// The real paths of those linked folders are returned too: every file below
+/// one, at any depth, is a key, and a recursive search that reaches one reads
+/// keys (re-review blocker 1).
+struct SshTree {
+    members: Vec<PathBuf>,
+    linked_dirs: Vec<PathBuf>,
+}
+
+fn ssh_members(home: &Path) -> SshTree {
+    const MAX_ENTRIES: usize = 1024;
+    const MAX_DEPTH: u8 = 8;
+    let mut out = SshTree {
+        members: vec![],
+        linked_dirs: vec![],
+    };
     let mut found = 0usize;
     // (folder, depth, reached through a link)
     let mut stack = vec![(home.join(".ssh"), 0u8, false)];
     while let Some((dir, depth, linked)) = stack.pop() {
-        if depth >= 3 || found >= MAX_ENTRIES {
+        if depth >= MAX_DEPTH || found >= MAX_ENTRIES {
             continue;
         }
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -211,8 +224,15 @@ fn ssh_members(home: &Path) -> Vec<PathBuf> {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_symlink() {
                 match std::fs::metadata(&p) {
-                    Ok(m) if m.is_dir() => stack.push((p, depth + 1, true)),
-                    Ok(_) => out.push(p),
+                    Ok(m) if m.is_dir() => {
+                        if let Ok(real) = std::fs::canonicalize(&p)
+                            && !out.linked_dirs.contains(&real)
+                        {
+                            out.linked_dirs.push(real);
+                        }
+                        stack.push((p, depth + 1, true));
+                    }
+                    Ok(_) => out.members.push(p),
                     Err(_) => {}
                 }
                 continue;
@@ -223,7 +243,7 @@ fn ssh_members(home: &Path) -> Vec<PathBuf> {
                     continue;
                 }
             }
-            out.push(p);
+            out.members.push(p);
         }
     }
     out
@@ -248,6 +268,7 @@ fn evaluate_sync(
         preset,
     };
     let analysis = deny::analyze_with(&input, &fs_resolve);
+    let ssh = ssh_members(&c.home);
     let mut resolved = vec![];
     if !analysis.overflow {
         let mut roots: Vec<((u64, u64), PathBuf)> =
@@ -256,9 +277,9 @@ fn evaluate_sync(
                 .filter_map(|r| identity(&r).map(|id| (id, r)))
                 .collect();
         roots.extend(
-            ssh_members(&c.home)
-                .into_iter()
-                .filter_map(|r| identity(&r).map(|id| (id, r))),
+            ssh.members
+                .iter()
+                .filter_map(|r| identity(r).map(|id| (id, r.clone()))),
         );
         for u in &analysis.uses {
             for p in &u.paths {
@@ -268,6 +289,16 @@ fn evaluate_sync(
     }
     input.resolved_paths = &resolved;
     let mut verdict = policy.evaluate(&input, rules);
+    // A file below a folder linked into `~/.ssh`, at any depth, or a
+    // recursive search or glob that reaches such a folder, reads keys.
+    if !matches!(verdict, PolicyVerdict::HardDeny { .. })
+        && !analysis.overflow
+        && reaches_linked_ssh_dir(check, &analysis, &resolved, &ssh.linked_dirs)
+    {
+        verdict = PolicyVerdict::HardDeny {
+            id: "credential-read",
+        };
+    }
     // A file with several links may be another name for a credential in a
     // tree the identity map doesn't walk: never auto-allow it, ask instead.
     if matches!(verdict, PolicyVerdict::Allow { .. })
@@ -279,21 +310,87 @@ fn evaluate_sync(
     Ok(Evaluated { verdict, resolved })
 }
 
-/// Commands that read every file below a folder they are given.
+/// Commands that read every file below a folder they are given. `grep`'s
+/// spellings are read by the same parser Home's read-only list uses, so the
+/// two can't drift; a `grep` line it can't parse counts as recursive.
 fn recursive_reader(eff: &[String]) -> bool {
     let Some(first) = eff.first() else {
         return false;
     };
     match shell::base(first) {
         "rg" | "ag" | "ack" => true,
-        "grep" | "egrep" | "fgrep" => eff[1..].iter().any(|a| {
-            (a.starts_with('-') && !a.starts_with("--") && a.contains(['r', 'R']))
-                || a.starts_with("--recursive")
-                || a.starts_with("--dereference-recursive")
-                || a == "--directories=recurse"
-        }),
+        "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" => {
+            engine::search_roots(false, &eff[1..]).is_none_or(|s| s.recursive)
+        }
         _ => false,
     }
+}
+
+/// The real path of `p`, or of its folder when `p` itself doesn't resolve
+/// (a glob, a file not made yet).
+fn real_path(p: &Path) -> PathBuf {
+    if let Ok(r) = std::fs::canonicalize(p) {
+        return r;
+    }
+    if let (Some(dir), Some(name)) = (p.parent(), p.file_name())
+        && let Ok(r) = std::fs::canonicalize(dir)
+    {
+        return r.join(name);
+    }
+    p.to_path_buf()
+}
+
+/// Whether the call reaches a folder linked into `~/.ssh`: a file below one
+/// (any depth), a glob in one, or a recursive search of one or of a folder
+/// holding one (re-review blocker 1). Listing or entering the folder stays
+/// ordinary.
+fn reaches_linked_ssh_dir(
+    check: &ToolCheck,
+    a: &deny::Analysis,
+    resolved: &[PathBuf],
+    linked: &[PathBuf],
+) -> bool {
+    if linked.is_empty() {
+        return false;
+    }
+    let recursive_paths = matches!(
+        &check.subject,
+        ToolSubject::Paths {
+            recursive: true,
+            ..
+        }
+    );
+    let mut k = 0usize;
+    for u in &a.uses {
+        let unit = a.units.get(u.unit);
+        let command_word = unit.is_some_and(|x| x.seg.argv.first() == Some(&u.word));
+        let recursive = recursive_paths || unit.is_some_and(|x| recursive_reader(&x.eff));
+        let globby = u.word.contains(['*', '?', '[']);
+        for _ in &u.paths {
+            let Some(p) = resolved.get(k) else {
+                return false;
+            };
+            k += 1;
+            if command_word {
+                continue;
+            }
+            let real = real_path(p);
+            let is_dir = real.is_dir();
+            for d in linked {
+                let inside = real.starts_with(d) && real != *d;
+                if inside && !is_dir {
+                    return true;
+                }
+                if globby && real.parent().is_some_and(|parent| parent.starts_with(d)) {
+                    return true;
+                }
+                if recursive && (real.starts_with(d) || d.starts_with(&real)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Whether the call reads a regular file with more than one link: a named

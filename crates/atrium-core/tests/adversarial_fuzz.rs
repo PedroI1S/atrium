@@ -231,8 +231,11 @@ fn random_hostile_lines_never_panic_and_nothing_sensitive_is_allowed() {
         // parse_command is the rules' view: it must not panic either
         let _ = atrium_core::policy::parse_command(&line, std::path::Path::new("/h/u"));
     }
+    // a debug-build wall-clock bound with room for a loaded machine (M1-13
+    // re-review minor 1); `policy.rs`'s `pipe_to_shell_fan_out_is_linear_and_denied` is
+    // the guard against a blowup
     assert!(
-        started.elapsed().as_secs() < 40,
+        started.elapsed().as_secs() < 60,
         "too slow: {:?}",
         started.elapsed()
     );
