@@ -3,8 +3,11 @@
 
     python3 app/scripts/stream_bench.py [--runs 3] [--debug]
 
-Builds release binaries of the app and the daemon (`--debug` uses the debug ones, for trying
-the script), then, `--runs` times, each in a throwaway ATRIUM_HOME: starts the app with
+Builds the app and the daemon with the workspace's `perf` profile (optimized like `release`,
+with debug assertions on; `--debug` uses the debug ones, for trying the script). Not
+`--release`: a release build ignores ATRIUM_HOME and a release daemon refuses every app until
+packaging gives it the app's identity (see startup_bench.py). Then, `--runs` times, each in a
+throwaway ATRIUM_HOME: starts the app with
 ATRIUM_BENCH=stream (app/src/stream-bench.ts), which starts 10 synthetic threads at
 1,000 tokens/s each for 30 s, one token per event, shows one and holds the models of all ten.
 
@@ -62,11 +65,14 @@ def one_run(app_path: pathlib.Path, run: int) -> dict:
             samples += 1
             time.sleep(max(0.0, 1.0 - (time.monotonic() - tick)))
             report = report_of(log, "stream")
+    except SystemExit:
+        # Say why before the folder goes: the log is the only record of a failed run.
+        print(f"run {run} failed; the end of its log:\n{log.read_text(errors='replace')[-3000:]}")
+        raise
     finally:
         app.kill()
         app.wait()
         stop_daemon(home)
-        time.sleep(0.5)
         shutil.rmtree(home, ignore_errors=True)
     report["run"] = run
     report["peakWebContentMiB"] = round(peak_web, 1)
@@ -80,10 +86,10 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-    profile = "debug" if args.debug else "release"
+    profile = "debug" if args.debug else "perf"
     subprocess.run(["pnpm", "build"], cwd=ROOT / "app", check=True, stdout=subprocess.DEVNULL)
     subprocess.run(
-        ["cargo", "build", *([] if args.debug else ["--release"]), "-p", "atrium-app", "--features", "custom-protocol", "-p", "atrium-daemon"],
+        ["cargo", "build", *([] if args.debug else ["--profile", "perf"]), "-p", "atrium-app", "--features", "custom-protocol", "-p", "atrium-daemon"],
         cwd=ROOT, check=True,
     )
     app_path = ROOT / "target" / profile / "atrium"

@@ -22,6 +22,22 @@ This worker:
   - Approval card safety: a card that just appeared ignores ↵/esc for 600 ms and never takes focus from a field being typed in; ↵ on a focused button presses that button (before, ↵ on "Deny" allowed).
 - Change requests filed in `docs/agents/change-requests.md`: **CR-13** (fake agent option that raises one approval and one question), **CR-14** (daemon reads per-kind notification settings), **CR-15** (declining a question).
 
+## Results so far (each written when it was measured)
+
+- **Live check, `python3 app/scripts/chat_check.py` (debug build, real `atriumd`, fake agent): 12/12 passed** (2026-11-13): a Home chat starts from the composer and streams (model and DOM grow, tool calls show, the view follows the tail); a second window shows the same thread, streaming; the daemon is killed mid-stream (pid 1338871 → 1339140), the thread shows as interrupted, both windows show the same closed transcript (3,296 characters, last event 216); a new chat streams after the reconnect; Stop ends its turn.
+- **Screenshots on Linux, `python3 app/scripts/screenshots.py <dir>`: 28 pictures, all three runs report `pass`**, in `/home/rodrigo/atrium-wt/M1-09b-home-chat/.orchestration/M1-09b-screenshots/` (git-ignored; re-run the script to get them elsewhere). The chat scenes are seeded in the window (`app/src/chat-shots.ts` says what is seeded and what is the daemon's).
+- **§14 streaming run, first measurement: FAILS THE GATE BY A WIDE MARGIN** (2026-11-13, `python3 app/scripts/stream_bench.py --runs 3`, `perf` profile, Linux/WebKitGTK, rAF timestamps, window visible in all three runs, load average about 10 at the start because the build had just finished):
+
+  | run | tokens/s | fps | frame p50 / p95 / p99 / max (ms) | frames in the run | web content peak | app + webviews peak |
+  |---|---:|---:|---|---:|---:|---:|
+  | 1 | 7,507 over 39.9 s | 0.3 | 850 / 8,980 / 15,285 / 15,285 | 13 | 798 MiB | 920 MiB |
+  | 2 | 8,933 over 33.5 s | 0.4 | 1,019 / 8,885 / 13,979 / 13,979 | 13 | 741 MiB | 853 MiB |
+  | 3 | 9,651 over 31.1 s | 0.4 | 935 / 11,017 / 11,430 / 11,430 | 12 | 765 MiB | 885 MiB |
+
+  The window drew about a dozen frames in 30 s: the webview's main thread is blocked for seconds at a time. All 300k tokens arrive and are applied (nothing is lost), but nothing like 60 fps. Cause not yet found when this was written; see below for what was tried after.
+- **Release builds can't be used by the harness scripts** (found while measuring): a release build ignores `ATRIUM_HOME` (`lifecycle::default_paths` honours it only with debug assertions), and a release `atriumd` refuses every app ("no app identity is known") until packaging compiles the identity in. So `startup_bench.py` as M1-09a wrote it (release) measured an app that never connects, used the user's real Atrium folders, and left its daemon running there. Both bench scripts now build with the workspace's `perf` profile (optimized, debug assertions on), which honours `ATRIUM_HOME` and connects. `stop_daemon` in `startup_bench.py` now also finds a daemon by its `ATRIUM_HOME` and kills one that ignores SIGINT.
+- **Side effect of my first two streaming attempts (release build): files outside the worktree.** They created `~/.local/share/atrium/` (`atrium.db`, `logs/atriumd.log`, empty `app/`, `snapshots/`) and `$XDG_RUNTIME_DIR/atrium/daemon.lock` on 2026-11-13 08:48, and left a release `atriumd` running (the orchestrator stopped pid 1349294). I did not delete them (outside my worktree); they hold no chats (the app never connected). The orchestrator decides whether to remove them.
+
 ## Not done yet (in this order)
 
 1. Harness code: seeded screenshot scenes (`app/src/chat-shots.ts`), the live check against `atriumd` (`app/src/chat-live.ts`, `app/scripts/chat_check.py`), the §14 streaming run (`app/src/stream-bench.ts`, `app/scripts/stream_bench.py`). None of the new UI has been seen running yet: expect fixes from the first screenshots.

@@ -3,7 +3,12 @@
 
     python3 app/scripts/startup_bench.py [--runs 30] [--memory-launches 9]
 
-Builds release binaries of the app and the daemon, then, in a throwaway ATRIUM_HOME:
+Builds the app and the daemon with the workspace's `perf` profile (optimized like `release`,
+with debug assertions on), then, in a throwaway ATRIUM_HOME. Not `--release`: a release build
+ignores ATRIUM_HOME (`lifecycle::default_paths`), so it would use the user's real Atrium
+folders and leave its daemon running there, and a release daemon refuses every app until
+packaging gives it the app's identity ("no app identity is known"), so the app would be
+measured while it fails to connect. Then:
 
   1. Cold start (warm launches): one warm-up launch, then `--runs` launches with
      `ATRIUM_BENCH=startup-exit`; each reports `tti` (from `main` to the later of first
@@ -31,7 +36,7 @@ import tempfile
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-APP = ROOT / "target" / "release" / "atrium"
+APP = ROOT / "target" / "perf" / "atrium"
 TIMEOUT_S = 60
 WEBKIT = re.compile(r"WebKit\.(WebContent|GPU|Networking)|WebKitWebProcess|WebKitNetworkProcess")
 
@@ -39,7 +44,7 @@ WEBKIT = re.compile(r"WebKit\.(WebContent|GPU|Networking)|WebKitWebProcess|WebKi
 def build() -> None:
     subprocess.run(["pnpm", "build"], cwd=ROOT / "app", check=True, stdout=subprocess.DEVNULL)
     subprocess.run(
-        ["cargo", "build", "--release", "-p", "atrium-app", "--features", "custom-protocol", "-p", "atrium-daemon"],
+        ["cargo", "build", "--profile", "perf", "-p", "atrium-app", "--features", "custom-protocol", "-p", "atrium-daemon"],
         cwd=ROOT, check=True,
     )
 
@@ -94,11 +99,45 @@ def memory_mib(pid: int) -> float | None:
     return kib / 1024
 
 
-def stop_daemon(home: pathlib.Path) -> None:
+def daemons_of(home: pathlib.Path) -> set[int]:
+    """Every `atriumd` of this run: the one in the lock file and, on Linux, any whose
+    ATRIUM_HOME is this run's folder (one the app was still starting has no lock file yet)."""
+    found: set[int] = set()
     try:
-        os.kill(int(json.loads((home / "daemon.lock").read_text())["pid"]), signal.SIGINT)
+        found.add(int(json.loads((home / "daemon.lock").read_text())["pid"]))
     except (OSError, ValueError, KeyError):
         pass
+    wanted = f"ATRIUM_HOME={home}".encode()
+    for proc in pathlib.Path("/proc").glob("[0-9]*"):
+        try:
+            if b"atriumd" in (proc / "cmdline").read_bytes() and wanted in (proc / "environ").read_bytes().split(b"\0"):
+                found.add(int(proc.name))
+        except OSError:
+            continue
+    return found
+
+
+def stop_daemon(home: pathlib.Path) -> None:
+    """Stops this run's daemon and doesn't return while one is alive: SIGINT (it stops its
+    sessions and exits), then SIGKILL for one that is still there after a few seconds. A run
+    that failed early can leave a daemon the app was still starting, so it looks twice."""
+    for _ in range(2):
+        pids = daemons_of(home)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGINT)
+            except OSError:
+                pass
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and any(pathlib.Path(f"/proc/{pid}").exists() for pid in pids):
+            time.sleep(0.1)
+        for pid in pids:
+            if pathlib.Path(f"/proc/{pid}").exists():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        time.sleep(1)
 
 
 def main() -> int:
