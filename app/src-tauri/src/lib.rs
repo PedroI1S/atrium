@@ -633,6 +633,19 @@ fn open_link(url: String) -> Result<(), String> {
     links::open(&url).map_err(|error| error.to_string())
 }
 
+/// A `file:` link in agent text (contract §12): revealed in the file manager
+/// when it resolves inside the thread's folder. Every M1 thread is a Home
+/// thread, whose folder is the home directory; the webview names no folder.
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| "the home folder is unknown".to_string())?;
+    let resolved = links::check_reveal(&path, std::path::Path::new(&home))
+        .map_err(|error| error.to_string())?;
+    links::reveal(&resolved).map_err(|error| error.to_string())
+}
+
 // -- harness --------------------------------------------------------------------------------
 
 /// Each window reports, after mounting and applying its appearance, what it
@@ -937,6 +950,7 @@ pub fn run() -> ExitCode {
             daemon_command,
             replace_daemon,
             open_link,
+            reveal_path,
             window_ready,
             ready_states,
             write_report,

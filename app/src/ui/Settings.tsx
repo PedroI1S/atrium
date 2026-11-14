@@ -5,20 +5,24 @@
 
 import { ChevronLeft, ChevronRight, Search, X } from "lucide-solid";
 import { For, Match, Show, Switch, createResource, createSignal } from "solid-js";
+import { probes, providerName, refetchProbes } from "../chat/actions";
+import { ruleText } from "../chat/rules";
 import { command, daemon } from "../daemon/client";
-import { isCommandFailure } from "../daemon/types";
+import { type Rule, isCommandFailure } from "../daemon/types";
 import { type SettingRow, type SettingsSectionSpec, registerSection, searchSettings } from "../settings-registry";
 import { advancedOpen, highlightRow, setAdvancedOpen, setHighlightRow, setScreen, setSettingsQuery, setSettingsSection, settingsQuery, settingsSection, showToast, type SettingsSection } from "../state";
 import { MAX_BLUR_STRENGTH, MIN_ALPHA, type AppearanceSettings } from "../window-model";
 import { accessibilityOpaque, effectiveSettings, nativeError, nativeSupported, patchSettings, platform } from "../windows";
-import { IconButton, Range, Seg, Select, Spacer, Toggle } from "./controls";
+import { Dot, IconButton, Range, Seg, Select, Spacer, Toggle } from "./controls";
 
 type Opt = { value: string; label: string };
 export type Control =
   | { kind: "seg"; value: () => string; options: Opt[]; set: (v: string) => void; disabled?: () => boolean }
   | { kind: "toggle"; value: () => boolean; set: (v: boolean) => void; disabled?: () => boolean }
   | { kind: "range"; value: () => number; min: number; max: number; format: (v: number) => string; set: (v: number) => void; disabled?: () => boolean; wide?: boolean }
-  | { kind: "select"; value: () => string; options: Opt[]; set: (v: string) => void };
+  | { kind: "select"; value: () => string; options: Opt[]; set: (v: string) => void }
+  /** A button, for rows whose content is a list below them (Agents, Approvals). */
+  | { kind: "action"; text: string; run: () => void; disabled?: () => boolean };
 type Row = SettingRow<Control>;
 
 const s = effectiveSettings;
@@ -55,6 +59,36 @@ async function setDaemonSetting(key: string, value: boolean): Promise<void> {
   }
 }
 
+/**
+ * Notifications per kind (contract §8 names the three). On unless switched off. The daemon
+ * stores these settings but its notifier doesn't read them yet (change request CR-14).
+ */
+const NOTIFY: { id: string; key: string; label: string; hint: string }[] = [
+  { id: "notify-approval", key: "notify_approval", label: "An agent needs your approval", hint: "A command or a change is waiting for you to allow or deny it" },
+  { id: "notify-question", key: "notify_question", label: "An agent has a question", hint: "It can't go on until you answer" },
+  { id: "notify-failed", key: "notify_failed", label: "A chat failed", hint: "Its session ended with an error" },
+];
+
+/** Remembered rules (contract §5 "Remember", §9), read when the Approvals section is shown. */
+const [rules, { refetch: refetchRules }] = createResource<Rule[], boolean>(
+  () => connected() && settingsSection() === "approvals",
+  async (shown) => (shown ? command<Rule[]>({ type: "list_rules" }).catch(() => []) : []),
+);
+const [deletingRule, setDeletingRule] = createSignal<string | null>(null);
+
+async function deleteRule(rule: Rule): Promise<void> {
+  setDeletingRule(rule.id);
+  try {
+    await command({ type: "delete_rule", rule_id: rule.id });
+  } catch (e) {
+    showToast(isCommandFailure(e) ? e.message : String(e));
+  } finally {
+    setDeletingRule(null);
+    // Read the list again either way: an unknown outcome may have deleted it.
+    void refetchRules();
+  }
+}
+
 // -- sections -------------------------------------------------------------------------------
 
 export const SECTIONS: SettingsSectionSpec<Control>[] = [
@@ -85,7 +119,84 @@ export const SECTIONS: SettingsSectionSpec<Control>[] = [
         control: { kind: "range", min: 0, max: MAX_BLUR_STRENGTH, value: () => s().blurStrength ?? THEME_BLUR(), format: (v) => `${v} px`, set: (v) => set({ blurStrength: v }) } },
     ],
   }),
+  registerSection<Control>({
+    id: "agents", label: "Agents",
+    essentials: [
+      { id: "agents-found", label: "Agents on this computer", hint: "What Atrium found, and how much of what each one does passes Atrium's rules",
+        control: { kind: "action", text: "Check again", run: () => void refetchProbes(), disabled: () => !connected() || probes.loading } },
+    ],
+    advanced: [],
+  }),
+  registerSection<Control>({
+    id: "approvals", label: "Approvals",
+    essentials: [
+      { id: "rules", label: "Remembered approvals", hint: "Made by “Always…” on an approval. Each one matches an exact command or path, in any folder.",
+        control: { kind: "action", text: "Refresh", run: () => void refetchRules(), disabled: () => !connected() || rules.loading } },
+    ],
+    advanced: [],
+  }),
+  registerSection<Control>({
+    id: "notifications", label: "Notifications",
+    essentials: NOTIFY.map((n) => ({
+      id: n.id, label: n.label, hint: n.hint,
+      control: { kind: "toggle" as const, value: () => daemonSettings()?.[n.key] !== false, set: (v: boolean) => void setDaemonSetting(n.key, v), disabled: () => !connected() || savingDaemonSetting() },
+    })),
+    advanced: [],
+  }),
 ];
+
+/** Every provider Atrium knows, with what its probe found (`ProbeProviders`, contract §3). */
+function AgentsList() {
+  return (
+    <div class="s-list" data-atrium-part="agents">
+      <For each={probes() ?? []} fallback={<p class="s-empty">{probes.loading ? "Looking for agents…" : connected() ? "Atrium found no agent it can run." : ""}</p>}>
+        {(p) => (
+          <div class="s-item">
+            <Dot tone={p.enforcement ? (p.enforcement.level === "full" ? "ready" : "needs-you") : "idle"} />
+            <div class="s-main">
+              <b>{providerName(p.provider)}</b>
+              <Show when={p.enforcement} fallback={<span>{p.error ? `Can't be used: ${p.error}` : "Not installed"}</span>}>
+                {(e) => (
+                  <>
+                    <span>Installed{e().cli_version ? ` · version ${e().cli_version}${e().version_tested ? "" : " (not tested with Atrium)"}` : ""}</span>
+                    <span>{e().level === "full" ? "Enforcement: full. Every tool call passes Atrium's rules before it runs." : "Enforcement: partial. Atrium sees only some of what this agent does:"}</span>
+                    <For each={e().reasons}>{(r) => <span>• {r.message}</span>}</For>
+                  </>
+                )}
+              </Show>
+            </div>
+          </div>
+        )}
+      </For>
+    </div>
+  );
+}
+
+/** The remembered rules, each with what it matches exactly (D-054) and a way to delete it. */
+function RulesList() {
+  const titleOf = (threadId: string) => daemon().threads[threadId]?.title;
+  return (
+    <div class="s-list" data-atrium-part="rules">
+      <For each={rules() ?? []} fallback={<p class="s-empty">{rules.loading ? "" : "Nothing is remembered. Atrium asks each time, unless you choose “Always…” on an approval."}</p>}>
+        {(rule) => {
+          const text = ruleText(rule, titleOf);
+          return (
+            <div class="s-item">
+              <Dot tone={rule.decision === "allow" ? "ready" : "failed"} />
+              <div class="s-main">
+                <b>{text.decision} {text.what}</b>
+                <Show when={text.code}><span class="code">{text.code}</span></Show>
+                <span>{text.where}</span>
+                <span>{text.origin}</span>
+              </div>
+              <button type="button" class="btn sm" disabled={deletingRule() !== null} aria-label={`Delete the rule: ${text.decision} ${text.what} ${text.code ?? ""}`} onClick={() => void deleteRule(rule)}>Delete</button>
+            </div>
+          );
+        }}
+      </For>
+    </div>
+  );
+}
 
 const sectionById = (id: string) => SECTIONS.find((x) => x.id === id) ?? SECTIONS[0]!;
 
@@ -97,6 +208,7 @@ function ControlView(props: { row: Row }) {
       <Match when={c.kind === "toggle" && c}>{(x) => <Toggle label={props.row.label} on={x().value()} onChange={x().set} disabled={x().disabled?.()} />}</Match>
       <Match when={c.kind === "range" && c}>{(x) => <Range label={props.row.label} value={x().value()} min={x().min} max={x().max} format={x().format} onInput={x().set} disabled={x().disabled?.()} wide={x().wide} />}</Match>
       <Match when={c.kind === "select" && c}>{(x) => <Select label={props.row.label} value={x().value()} options={x().options} onChange={x().set} />}</Match>
+      <Match when={c.kind === "action" && c}>{(x) => <button type="button" class="btn sm" disabled={x().disabled?.()} onClick={x().run}>{x().text}</button>}</Match>
     </Switch>
   );
 }
@@ -162,7 +274,12 @@ export function SettingsCard() {
             </div>
           }>
             <For each={section().essentials}>{(row) => <RowView row={row} />}</For>
-            <Show when={section().id === "general" && !connected()}><p class="note">These settings belong to Atrium's background service, which isn't connected right now.</p></Show>
+            <Show when={section().id === "agents"}><AgentsList /></Show>
+            <Show when={section().id === "approvals"}><RulesList /></Show>
+            <Show when={section().id === "notifications"}>
+              <p class="note">Atrium's background service posts these. It doesn't read these switches yet, so for now it notifies for all three.</p>
+            </Show>
+            <Show when={section().id !== "appearance" && !connected()}><p class="note">These settings belong to Atrium's background service, which isn't connected right now.</p></Show>
             <Show when={section().id === "appearance"}><OpacityNote /></Show>
             <Show when={section().id === "appearance" && nativeError()}><p class="note error" role="alert">{nativeError()}</p></Show>
             <Show when={section().advanced.length}>

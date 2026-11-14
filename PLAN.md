@@ -35,7 +35,7 @@ A fast, lightweight agent development environment written in Rust. It wraps the 
 | Audience | Personal first, kept clean enough to open-source later |
 | Editor AI | Optional and off until you pick a provider: Copilot-style ghost text, next-edit prediction, ⌘K inline edit. Backends: Copilot LSP, your own local server (never bundled or auto-started), remote APIs, free hosted models (`untrusted`: manual only, current file only). Context engine in `atriumd`; the one place it calls models directly (3.21) |
 | Databases | SQLite/libSQL + PostgreSQL: query editor, drawDB-style schema diagram with design → migration, Drizzle Studio-style table view with staged edits; agents get read-only `db_*` tools, writes go through approvals (3.19) |
-| Build team | Opus 5.5 orchestrates; Sol 6.1 (backend), Sonnet 5.5 (frontend), Argon (systems/security), 3.8 Flash (utility), Astra (gates/escalation). Cross-provider review, contract-first parallel fan-out. See section 8. |
+| Build team | Opus 5.5 orchestrates; Sol 6.1 (backend), Sonnet 5.5 (frontend), Argon (systems/security), Gemini 4 Hydrogen (utility; it replaced 3.8 Flash, D-068), Astra (gates/escalation). Cross-provider review, contract-first parallel fan-out. See section 8. |
 
 ## 2. Landscape (what we borrow / where we differ)
 
@@ -144,7 +144,7 @@ trait AgentAdapter {
 
 - **Claude Code**: spawn `claude -p --input-format stream-json --output-format stream-json --verbose` with `--mcp-config` pointing at Atrium's MCP. Handle permission prompts through the control protocol (`can_use_tool`) so approvals show up in our UI and the policy engine. Session resume via `--resume`.
 - **Codex**: `codex app-server` (JSON-RPC over stdio). It has native `sandbox` (`read-only` / `workspace-write`) and `approval_policy`, which fit the Home chat policy directly. Its rate-limit notifications feed the scheduler.
-- **Antigravity (`agy`)**: Google's agent CLI, which runs the Gemini models (Argon, 3.8 Flash).
+- **Antigravity (`agy`)**: Google's agent CLI, which runs the Gemini models (Argon, Hydrogen, 3.8 Flash).
   - Spawn `agy -p --input-format stream-json --output-format stream-json --model <id> --effort <level>`.
   - Permission modes: `--mode accept-edits|auto|plan`. Resume: `--conversation <id>`.
   - **Approvals (found in the M0-00 smoke test)**: headless `agy` can't prompt and ignores hook `allow` grants, but enforces hook `deny`. So Atrium runs `agy` with `--dangerously-skip-permissions` plus a `PreToolUse` hook (matcher `"*"`) that calls back into `atriumd`'s policy engine over the socket: `allow`/`deny` per call, and `ask` becomes "deny + inbox approval + retry". Re-test with each `agy` release; a native host-approval channel would replace this.
@@ -831,7 +831,9 @@ This section covers building Atrium with a team of agents. The same rules later 
 | **Gemini 4 Argon** | Google / Antigravity (`agy`) | Google's new frontier model, pitched at coding, migrations and cyber defense (~$2/$10 intro) | **Systems and security specialist.** Sandbox/FFI/unsafe work, adversarial testing of policy and isolation, the Antigravity and ACP adapters. |
 | **GPT-6.1 Sol** | OpenAI / Codex | Close to Astra on agentic coding at ~1/5 the price; slower output (~$2/$10) | **Backend workhorse.** Most Rust crates. Long, well-specified background tasks. |
 | **Claude Sonnet 5.5** | Anthropic / Claude Code | Fast, strong coder, good at UI iteration | **Frontend + Claude-integration workhorse.** SolidJS UI, Tauri bridge, Claude adapter, mid-tier reviews. |
-| **Gemini 3.8 Flash** | Google / Antigravity (`agy`) | Cheap, fast, 1M context (~$0.75/$3.75) | **High-volume utility.** Tests, fixtures, docs, boilerplate, codebase exploration, check-failure triage, handoff/commit summaries. |
+| **Gemini 4 Hydrogen** | Google / Antigravity (`agy`) | Took Gemini 3.8 Flash's place on 2026-11-13 (D-068); its price and profile are not calibrated yet (8.6) | **High-volume utility.** Tests, fixtures, docs, boilerplate, codebase exploration, check-failure triage, handoff/commit summaries. |
+
+**Gemini 4 Hydrogen replaced Gemini 3.8 Flash in this roster on 2026-11-13 (D-068).** Records written before that (briefs, reviews, decisions, the M1 contract's task table) name Flash and are left as they were; where one of them gives Flash a role that is still open, read Hydrogen.
 
 Prices and positioning come from vendor announcements and early reviews (Sept–Oct 2026), and benchmark claims aren't independently verified. **The routing below is a starting hypothesis that gets calibrated in M0 (8.6).**
 
@@ -845,9 +847,9 @@ Prices and positioning come from vendor announcements and early reviews (Sept–
 | Frontend (SolidJS, CodeMirror, xterm, canvas, Tauri bridge) | Sonnet 5.5 | Sol 6.1 | Sol 6.1, plus screenshots as evidence |
 | Claude adapter | Sonnet 5.5 | Opus 5.5 | Sol 6.1 |
 | Codex adapter | Sol 6.1 | Astra | Sonnet 5.5 |
-| Antigravity adapter (`agy` stream-json), OpenCode adapter (`opencode serve`) and ACP adapter | Argon | 3.8 Flash | Sonnet 5.5 |
-| Tests, fixtures, recorded protocol transcripts, docs, boilerplate | 3.8 Flash | Sonnet 5.5 | Spot-check by the owner of the code under test |
-| Codebase exploration, summaries, triage of failing checks | 3.8 Flash | n/a | n/a |
+| Antigravity adapter (`agy` stream-json), OpenCode adapter (`opencode serve`) and ACP adapter | Argon | Hydrogen | Sonnet 5.5 |
+| Tests, fixtures, recorded protocol transcripts, docs, boilerplate | Hydrogen | Sonnet 5.5 | Spot-check by the owner of the code under test |
+| Codebase exploration, summaries, triage of failing checks | Hydrogen | n/a | n/a |
 | Security review (policy, hard-deny, MCP tokens, socket permissions, sandbox, browser isolation) | Argon **and** Astra | n/a | Opus integrates the findings |
 | Performance profiling and optimization | Astra | Opus 5.5 | Sol or Sonnet |
 | Hard bugs (after escalation) | Opus or Astra (whichever is from the other provider than the author) | Argon | n/a |
@@ -857,7 +859,7 @@ Prices and positioning come from vendor announcements and early reviews (Sept–
 ### 8.3 Escalation ladder
 
 ```
-3.8 Flash  →  Sonnet 5.5 / Sol 6.1  →  Opus 5.5 / Argon / Astra
+Hydrogen   →  Sonnet 5.5 / Sol 6.1  →  Opus 5.5 / Argon / Astra
  (cheap)        (workhorses)              (frontier, scarce)
 ```
 
@@ -874,7 +876,7 @@ Prices and positioning come from vendor announcements and early reviews (Sept–
  ┌─ 1. Contract (serial) ─┐  ┌─ 2. Fan-out (parallel) ─┐  ┌─ 3. Integrate (serial) ─┐  ┌─ 4. Gate ─┐
  │ Opus: types, traits,   │→ │ N implementers, each in │→ │ merge queue in          │→ │ demo +    │
  │ schemas, test stubs,   │  │ its own worktree, owning│  │ dependency order, cross-│  │ Astra/    │
- │ task briefs; Astra     │  │ disjoint paths; Flash   │  │ provider review, Opus   │  │ Argon gate│
+ │ task briefs; Astra     │  │ disjoint paths; Hydrogen│  │ provider review, Opus   │  │ Argon gate│
  │ reviews; Pedro approves│  │ writes tests alongside  │  │ resolves integration    │  │ review;   │
  └────────────────────────┘  └─────────────────────────┘  └─────────────────────────┘  │ Pedro OK  │
                                                                                        └───────────┘
@@ -887,7 +889,7 @@ Prices and positioning come from vendor announcements and early reviews (Sept–
 2. **Fan-out (parallel)**:
    - One worktree and branch per task (`agent/<model>/<task-id>`).
    - Each brief lists the **paths the agent owns**. Touching anything outside them, or changing a contract, means stopping and filing a *change request* to Opus rather than editing.
-   - Flash writes tests and fixtures in parallel against the frozen contracts.
+   - Hydrogen writes tests and fixtures in parallel against the frozen contracts.
 3. **Integration (serial)**:
    - Finished tasks enter a merge queue in dependency order. Each one is rebased, re-checked, cross-reviewed and merged.
    - Opus handles integration fixes and contract change requests. A contract change means bumping the contract and notifying the affected tasks.
@@ -905,7 +907,7 @@ Prices and positioning come from vendor announcements and early reviews (Sept–
 | Argon | 2 |
 | Sol 6.1 | 3 |
 | Sonnet 5.5 | 3 |
-| 3.8 Flash | 4 |
+| Hydrogen | 4 |
 | **Total implementers at once** | **≤ 6** |
 
 **No agent-to-agent chat.** Coordination goes only through files in the repo:
@@ -942,7 +944,7 @@ Model: <primary> · Reviewer: <other provider> · Depends on: <ids>
 
 ### 8.5 Assignments by milestone
 
-| Milestone | Opus 5.5 | Sol 6.1 | Sonnet 5.5 | Argon | 3.8 Flash | Astra |
+| Milestone | Opus 5.5 | Sol 6.1 | Sonnet 5.5 | Argon | Hydrogen | Astra |
 |---|---|---|---|---|---|---|
 | **M0 spikes** | Event enum and normalization; picks the winner of each spike; token architecture for the UI shell | Codex app-server client; daemon socket + replay spike | Claude stream-json + control protocol; CDP screencast → canvas; streaming perf; **UI shell + visual directions** | `agy` stream-json client + ACP client | Recorded protocol transcripts as fixtures; spike reports | Review of the M0 findings and architecture |
 | **M1 daemon + Home + attention** | Protocol, store schema, thread state machine, policy model | `atriumd`, store, `atrium-client`, lifecycle, policy engine | Tauri shell, tray, Home chat UI, inbox, approval queue, question forms | Adversarial tests for the hard-deny list and approval rules; socket permissions | Unit tests, docs, protocol TS generation checks | Gate review |
@@ -979,7 +981,7 @@ Until Atrium can build itself, the orchestrator is a **Claude Code session on Op
 |---|---|
 | Sonnet 5.5 / Opus 5.5 | Claude Code subagent (`Agent`, model `sonnet`/`opus`, background), told to work only in its worktree path |
 | GPT-6.1 Sol / GPT-6 Astra | `scripts/agent-run codex <model> <id> <prompt-file>` runs `codex exec -m <model> -C <worktree> -s workspace-write -c sandbox_workspace_write.network_access=true --json -o <last.md>` |
-| Gemini 4 Argon / 3.8 Flash | `scripts/agent-run agy <model> <id> <prompt-file>` runs `agy -p --model <model> --mode accept-edits --dangerously-skip-permissions --output-format stream-json` with cwd = worktree, **guarded by the policy hook** |
+| Gemini 4 Argon / Gemini 4 Hydrogen | `scripts/agent-run agy <model> <id> <prompt-file>` runs `agy -p --model <model> --mode accept-edits --dangerously-skip-permissions --output-format stream-json` with cwd = worktree, **guarded by the policy hook** |
 
 **Smoke-test findings:**
 - **Claude subagent:** works as-is.
