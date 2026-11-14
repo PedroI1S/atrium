@@ -42,3 +42,40 @@ Restored `upkeep.rs` immediately after.
   - `cargo test -p atrium-daemon --test gaps_snapshot -q` × 20: 20/20 passed (2 passed each run).
   - `cargo test -p atrium-daemon --lib conn::tests -q` × 20: 20/20 passed (11 passed each run).
 - `git diff dev -- crates/atrium-daemon/src`: only `crates/atrium-daemon/src/lib.rs` (the `Options::store_wrapper` field, `None` default, and `Daemon::start` wrap) and `crates/atrium-daemon/src/conn.rs` (the two test nits).
+
+## Review fixes
+1. **Documented test limit (`crates/atrium-daemon/tests/gaps_snapshot.rs`)**
+   - Added a comment on `turn_started_during_snapshot_waits_for_snapshot_to_finish` noting that the tests pin: appends wait while the snapshot is held; a running turn skips the snapshot. They do not pin that `running_turns()` in `snapshot_daily` (`crates/atrium-daemon/src/upkeep.rs`) is checked under the `publish` lock: moving `running_turns()` above the `publish` lock is not caught by either test because catching it would require a turn to be marked running between the check and the lock, which would need another seam.
+
+2. **Fixed Case B latent flake (`snapshot_is_not_called_while_a_turn_is_running`)**
+   - Added an `armed: AtomicBool` flag to `SnapshotGate` (`true` in Case A, `false` initially in Case B and set to `true` after `ThreadState::Running` is observed).
+   - While `!armed`, `GatedStore::snapshot()` returns `Ok(dir)` without incrementing `snapshot_calls` and without forwarding to `inner.snapshot()` (so no snapshot file is written and `due` remains `true` for subsequent ticks).
+
+3. **Direct ordering assertion in Case A**
+   - Added `events: Mutex<Vec<&'static str>>` to `SnapshotGate` and asserted `events == vec!["snapshot", "turn_started"]` in `turn_started_during_snapshot_waits_for_snapshot_to_finish`.
+
+4. **Mutation check (reverted, not committed)**
+   - Temporarily replaced `if inner.running_turns() > 0` with `if false` in `crates/atrium-daemon/src/upkeep.rs` (`snapshot_daily`) and ran `cargo test -p atrium-daemon --test gaps_snapshot`:
+
+```
+running 2 tests
+test turn_started_during_snapshot_waits_for_snapshot_to_finish ... ok
+test snapshot_is_not_called_while_a_turn_is_running ... FAILED
+
+failures:
+
+---- snapshot_is_not_called_while_a_turn_is_running stdout ----
+
+thread 'snapshot_is_not_called_while_a_turn_is_running' (38901014) panicked at crates/atrium-daemon/tests/gaps_snapshot.rs:322:5:
+assertion `left == right` failed: snapshot() must not be called while a turn is running
+  left: 1
+ right: 0
+```
+
+   - Restored `crates/atrium-daemon/src/upkeep.rs` immediately after.
+
+5. **Review fixes DoD outputs**
+   - `cargo test -p atrium-daemon --test gaps_snapshot -q` × 20: 20/20 passed (2 passed each run).
+   - `cargo fmt --all --check`: exited 0 (clean).
+   - `cargo clippy --workspace --all-targets -- -D warnings`: exited 0 (clean).
+   - `cargo test -p atrium-daemon`: exited 0 — all passed (`lib`: 15, `client`: 1, `gaps_full_storage`: 2, `gaps_snapshot`: 2, `recovery`: 3, `sessions`: 19, `socket`: 9).

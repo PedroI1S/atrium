@@ -2,8 +2,8 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use atrium_agents::BoxFuture;
@@ -19,8 +19,10 @@ use tokio::sync::Notify;
 
 struct SnapshotGate {
     hold: AtomicBool,
+    armed: AtomicBool,
     snapshot_calls: AtomicUsize,
     storage_status_calls: AtomicUsize,
+    events: Mutex<Vec<&'static str>>,
     started: Notify,
     release: Notify,
     storage_checked: Notify,
@@ -28,11 +30,13 @@ struct SnapshotGate {
 }
 
 impl SnapshotGate {
-    fn new(hold: bool) -> Arc<Self> {
+    fn new(hold: bool, armed: bool) -> Arc<Self> {
         Arc::new(Self {
             hold: AtomicBool::new(hold),
+            armed: AtomicBool::new(armed),
             snapshot_calls: AtomicUsize::new(0),
             storage_status_calls: AtomicUsize::new(0),
+            events: Mutex::new(Vec::new()),
             started: Notify::new(),
             release: Notify::new(),
             storage_checked: Notify::new(),
@@ -78,6 +82,9 @@ impl Store for GatedStore {
         Box::pin(async move {
             let stored = fut.await?;
             if has_turn_started {
+                if let Ok(mut events) = gate.events.lock() {
+                    events.push("turn_started");
+                }
                 gate.turn_started.notify_one();
             }
             Ok(stored)
@@ -181,12 +188,24 @@ impl Store for GatedStore {
     fn snapshot(&self, dir: &Path) -> BoxFuture<'_, StoreResult<PathBuf>> {
         let dir = dir.to_path_buf();
         Box::pin(async move {
+            if !self.gate.armed.load(Ordering::SeqCst) {
+                // Before the test arms the gate (e.g. before ThreadState::Running
+                // is observed), skip counting and writing a snapshot file so `due`
+                // stays true for subsequent ticks.
+                return Ok(dir);
+            }
             self.gate.snapshot_calls.fetch_add(1, Ordering::SeqCst);
             self.gate.started.notify_one();
             if self.gate.hold.load(Ordering::SeqCst) {
                 self.gate.release.notified().await;
             }
-            self.inner.snapshot(&dir).await
+            let res = self.inner.snapshot(&dir).await;
+            if res.is_ok()
+                && let Ok(mut events) = self.gate.events.lock()
+            {
+                events.push("snapshot");
+            }
+            res
         })
     }
 
@@ -204,9 +223,15 @@ fn fake(duration_ms: u64) -> AgentLaunch {
     }
 }
 
+// Limit: these two tests pin that appends wait while the snapshot is held and
+// that a running turn skips the snapshot, but they do not pin that
+// `running_turns()` in `snapshot_daily` is checked under the `publish` lock.
+// Moving `running_turns()` above the `publish` lock is not caught by either
+// test because catching it would require a turn to be marked running between
+// the check and the lock, which would need another seam.
 #[tokio::test]
 async fn turn_started_during_snapshot_waits_for_snapshot_to_finish() {
-    let gate = SnapshotGate::new(true);
+    let gate = SnapshotGate::new(true, true);
     let wrapper_gate = gate.clone();
     let mut rig = Rig::start_with(|options| {
         options.snapshot_check_every = Duration::from_millis(50);
@@ -239,6 +264,8 @@ async fn turn_started_during_snapshot_waits_for_snapshot_to_finish() {
     gate.release.notify_one();
 
     soon(gate.turn_started.notified()).await;
+    let events = gate.events.lock().expect("events lock").clone();
+    assert_eq!(events, vec!["snapshot", "turn_started"]);
     wire.thread_when(&thread, |summary| summary.state == ThreadState::Idle)
         .await;
     let history = wire.history(&thread).await;
@@ -259,7 +286,7 @@ async fn turn_started_during_snapshot_waits_for_snapshot_to_finish() {
 
 #[tokio::test]
 async fn snapshot_is_not_called_while_a_turn_is_running() {
-    let gate = SnapshotGate::new(false);
+    let gate = SnapshotGate::new(false, false);
     let wrapper_gate = gate.clone();
     let mut rig = Rig::start_with(|options| {
         options.snapshot_check_every = Duration::from_millis(150);
@@ -279,6 +306,7 @@ async fn snapshot_is_not_called_while_a_turn_is_running() {
         .thread_id;
     wire.thread_when(&thread, |summary| summary.state == ThreadState::Running)
         .await;
+    gate.armed.store(true, Ordering::SeqCst);
 
     // Wait for at least two storage_status() checks while the turn is running
     // (watch_storage only checks every 2s, so >= 2 checks proves
