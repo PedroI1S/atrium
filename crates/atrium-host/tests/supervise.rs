@@ -366,3 +366,140 @@ fn kill_recorded_never_signals_the_callers_own_process_group() {
     assert_eq!(kill_recorded(&me), Cleanup::Unverified);
     // Still alive to assert this.
 }
+
+/// A process whose main thread has exited while a worker thread still runs:
+/// `/proc/<pid>/stat` shows the thread-group leader as `Z`, the process lives.
+#[cfg(target_os = "linux")]
+mod leader_exited {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use atrium_host::supervise::{ProcessIdentity, identify, kill_recorded};
+    use atrium_protocol::thread::Cleanup;
+
+    use super::{KillGroupGuard, pid_exists};
+
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "atrium-leader-exited-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // `exit(2)` (not `exit_group`) ends only the calling thread; `pthread_exit`
+    // would unwind through Rust's `main` and abort the process.
+    const HELPER: &str = r#"
+use std::io::Write;
+
+unsafe extern "C" {
+    fn syscall(number: i64, ...) -> i64;
+}
+
+#[cfg(target_arch = "x86_64")]
+const SYS_EXIT: i64 = 60;
+#[cfg(target_arch = "aarch64")]
+const SYS_EXIT: i64 = 93;
+
+fn main() {
+    std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_secs(600)));
+    println!("READY {}", std::process::id());
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // SAFETY: `exit(2)` ends the calling (main) thread only; the worker
+    // thread keeps the process alive.
+    unsafe { syscall(SYS_EXIT, 0i64) };
+}
+"#;
+
+    fn compile_helper(dir: &Path) -> PathBuf {
+        let src = dir.join("leader_exits.rs");
+        let bin = dir.join("leader_exits");
+        std::fs::write(&src, HELPER).expect("write helper source");
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let status = Command::new(rustc)
+            .arg("--edition=2024")
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .status()
+            .expect("invoke rustc");
+        assert!(status.success(), "rustc failed compiling the helper");
+        bin
+    }
+
+    /// The state letter of `/proc/<pid>/stat`.
+    fn state_of(pid: u32) -> Option<char> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        text[text.rfind(')')? + 1..].trim_start().chars().next()
+    }
+
+    #[test]
+    fn a_process_whose_main_thread_exited_is_still_identified_and_killed() {
+        let dir = Dir::new();
+        let helper = compile_helper(&dir.0);
+        let mut child = Command::new(&helper)
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn helper");
+        let pid = child.id();
+        let _group = KillGroupGuard(pid);
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("READY line");
+        assert!(line.starts_with("READY"), "got {line:?}");
+
+        // Wait for the main thread to be gone: the leader shows `Z` while the
+        // process (its worker thread) is alive.
+        let mut zombie_leader = false;
+        for _ in 0..200 {
+            if state_of(pid) == Some('Z') {
+                zombie_leader = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(zombie_leader, "the leader never showed Z");
+        // The process itself is alive: its worker thread is still there.
+        let threads = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .expect("the process has a task folder")
+            .count();
+        assert!(
+            threads >= 2,
+            "expected the leader and a worker, got {threads}"
+        );
+        let expected = std::fs::canonicalize(&helper).unwrap();
+        let identity: Option<ProcessIdentity> = identify(pid).unwrap();
+        let identity = identity.expect("the process is alive: it has an identity");
+        assert_eq!(identity.pid, pid);
+        assert_eq!(identity.pgid, pid);
+        assert_eq!(identity.executable, expected);
+
+        // The identity matches, so recovery kills the group; the parent
+        // (this test) plays init and reaps once the process is gone.
+        let reaper = std::thread::spawn(move || child.wait());
+        assert_eq!(kill_recorded(&identity), Cleanup::Verified);
+        let _ = reaper.join();
+        assert!(!pid_exists(pid));
+    }
+}

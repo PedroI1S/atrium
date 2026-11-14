@@ -517,6 +517,9 @@ struct LinuxStat {
     state: char,
     /// Field 9 (`task->flags`).
     flags: u64,
+    /// Field 20: the threads of the process (the leader included, even once
+    /// it has exited and is waiting for the others).
+    num_threads: u64,
     /// Field 5.
     pgid: u32,
     /// Field 22.
@@ -525,8 +528,15 @@ struct LinuxStat {
 
 #[cfg(any(target_os = "linux", test))]
 impl LinuxStat {
+    /// The task is gone for good. A thread-group leader that has exited (`Z`)
+    /// while other threads run is not: the process is alive, and only
+    /// `/proc/<pid>/stat`, which reports the leader thread, says otherwise.
     fn is_dead(&self) -> bool {
-        matches!(self.state, 'Z' | 'X' | 'x')
+        match self.state {
+            'X' | 'x' => true,
+            'Z' => self.num_threads <= 1,
+            _ => false,
+        }
     }
 }
 
@@ -561,15 +571,22 @@ fn parse_linux_proc_stat(stat_text: &str) -> io::Result<LinuxStat> {
         .ok_or_else(|| bad("missing stat flags"))?
         .parse()
         .map_err(|_| bad("invalid stat flags"))?;
-    // Skip fields 10..=21 (12 fields) to reach field 22 (starttime).
+    // Skip fields 10..=19 (10 fields) to reach field 20 (num_threads), then
+    // field 21 to reach field 22 (starttime).
+    let num_threads: u64 = fields
+        .nth(10)
+        .ok_or_else(|| bad("missing stat num_threads"))?
+        .parse()
+        .map_err(|_| bad("invalid stat num_threads"))?;
     let start_time: u64 = fields
-        .nth(12)
+        .nth(1)
         .ok_or_else(|| bad("missing stat starttime"))?
         .parse()
         .map_err(|_| bad("invalid stat starttime"))?;
     Ok(LinuxStat {
         state,
         flags,
+        num_threads,
         pgid,
         start_time,
     })
@@ -597,7 +614,8 @@ enum ExeVerdict {
 ///   while we looked, and nothing read in between can be attributed to one
 ///   task (`Unverifiable`).
 /// - Read succeeded and it is the same task: `Identity`.
-/// - Read failed: `NoProcess` if the task is dead (`Z`/`X`/`x`), is exiting
+/// - Read failed: `NoProcess` if the task is dead (`X`/`x`, or `Z` with no other
+///   thread: see `LinuxStat::is_dead`), is exiting
 ///   (`PF_EXITING`: it has dropped its `mm`, and with it `exe`, but is not
 ///   `Z` yet) or is a kernel thread (`PF_KTHREAD`: never has an `exe`) and
 ///   the error is `ENOENT`. Any other failure of a live task, `ENOENT` of an
@@ -641,6 +659,38 @@ fn read_linux_stat(pid: u32) -> io::Result<Option<LinuxStat>> {
     }
 }
 
+/// `/proc/<pid>/exe`. For a thread-group leader that has exited while other
+/// threads run (`Z` with `num_threads > 1`) the leader has no `mm` and the link
+/// is `ENOENT`, though the process lives: then a live thread's link, which is
+/// the same executable (threads share the `mm`), is read instead. If there is
+/// none, the leader's own error stands.
+#[cfg(target_os = "linux")]
+fn read_linux_exe(pid: u32, first: &LinuxStat) -> io::Result<PathBuf> {
+    let own = std::fs::read_link(format!("/proc/{pid}/exe"));
+    let Err(err) = &own else {
+        return own;
+    };
+    if err.kind() != io::ErrorKind::NotFound || first.state != 'Z' || first.num_threads <= 1 {
+        return own;
+    }
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return own;
+    };
+    for task in tasks.flatten() {
+        if task
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            == Some(pid)
+        {
+            continue;
+        }
+        if let Ok(executable) = std::fs::read_link(task.path().join("exe")) {
+            return Ok(executable);
+        }
+    }
+    own
+}
 #[cfg(target_os = "linux")]
 fn platform_identify(pid: u32, _raw_pid: i32) -> io::Result<Option<ProcessIdentity>> {
     let Some(first) = read_linux_stat(pid)? else {
@@ -649,9 +699,9 @@ fn platform_identify(pid: u32, _raw_pid: i32) -> io::Result<Option<ProcessIdenti
     if first.is_dead() {
         return Ok(None);
     }
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe"));
+    let exe = read_linux_exe(pid, &first);
     // Stat and exe are two reads, so the pid could be reused in between.
-    // Read stat again and let `judge_exe_read` compare the start times.
+    // Read stat again and let `judge_exe_read` compare what `first` gave.
     let after = read_linux_stat(pid)?;
     let verdict = judge_exe_read(
         exe.as_ref().map(|_| ()).map_err(io::Error::kind),
@@ -696,6 +746,7 @@ mod unit_tests {
         assert_eq!(stat.state, 'S');
         assert_eq!(stat.pgid, 4242);
         assert_eq!(stat.flags, 4_194_304);
+        assert_eq!(stat.num_threads, 3);
         assert_eq!(stat.start_time, 987_654_321);
     }
 
@@ -706,11 +757,12 @@ mod unit_tests {
         assert!(parse_linux_proc_stat(sample).is_err());
         assert!(parse_linux_proc_stat("no parenthesis").is_err());
     }
-
+    /// A task as `/proc/<pid>/stat` shows it: one thread, process group 100.
     fn stat(state: char, flags: u64, start_time: u64) -> LinuxStat {
         LinuxStat {
             state,
             flags,
+            num_threads: 1,
             pgid: 100,
             start_time,
         }
@@ -722,47 +774,92 @@ mod unit_tests {
         stat
     }
 
+    /// The same task with `threads` threads in its process.
+    fn with_threads(mut stat: LinuxStat, threads: u64) -> LinuxStat {
+        stat.num_threads = threads;
+        stat
+    }
+
     const LIVE: u64 = 0x0040_0000; // PF_RANDOMIZE, an ordinary task
     const ENOENT: Result<(), io::ErrorKind> = Err(io::ErrorKind::NotFound);
     const EACCES: Result<(), io::ErrorKind> = Err(io::ErrorKind::PermissionDenied);
 
     #[test]
+    fn dead_states_table() {
+        for (state, threads, dead) in [
+            ('R', 1, false),
+            ('S', 1, false),
+            ('D', 1, false),
+            ('T', 1, false),
+            ('X', 1, true),
+            ('x', 1, true),
+            ('Z', 1, true),
+            ('Z', 0, true),
+            // A leader that exited while other threads run: not dead.
+            ('Z', 2, false),
+            // A dead task is dead whatever its thread count says.
+            ('X', 3, true),
+            ('x', 3, true),
+        ] {
+            assert_eq!(
+                with_threads(stat(state, LIVE, 500), threads).is_dead(),
+                dead,
+                "state {state}, {threads} threads"
+            );
+        }
+    }
+
+    #[test]
     fn exe_read_decision_table() {
         use ExeVerdict::{Identity, NoProcess, Unverifiable};
         let first = stat('S', LIVE, 500);
+        // The same task, a moment later.
         let same = |state, flags| stat(state, flags, 500);
+        // A thread-group leader that has exited while its worker runs.
+        let leader_z = with_threads(stat('Z', LIVE | PF_EXITING, 500), 2);
         let table = [
             // The read worked.
-            ("exe ok, same task", Ok(()), Some(same('S', LIVE)), Identity),
+            (
+                "exe ok, same task",
+                first,
+                Ok(()),
+                Some(same('S', LIVE)),
+                Identity,
+            ),
             (
                 "exe ok, task now zombie",
+                first,
                 Ok(()),
                 Some(same('Z', LIVE)),
                 Identity,
             ),
             (
                 "exe ok, pid reused (other start time)",
+                first,
                 Ok(()),
                 Some(stat('S', LIVE, 501)),
                 Unverifiable,
             ),
-            ("exe ok, /proc entry gone", Ok(()), None, NoProcess),
+            ("exe ok, /proc entry gone", first, Ok(()), None, NoProcess),
             // The identity is built from `first`, so a changed process group
             // is a different identity, whatever else the second read says.
             (
                 "exe ok, process group changed",
+                first,
                 Ok(()),
                 Some(in_group(same('S', LIVE), 9000)),
                 Unverifiable,
             ),
             (
                 "ENOENT, exiting, process group changed",
+                first,
                 ENOENT,
                 Some(in_group(same('S', LIVE | PF_EXITING), 9000)),
                 Unverifiable,
             ),
             (
                 "EACCES, zombie, process group changed",
+                first,
                 EACCES,
                 Some(in_group(same('Z', LIVE), 9000)),
                 Unverifiable,
@@ -770,55 +867,137 @@ mod unit_tests {
             // ENOENT: only dead, exiting or kernel threads are "no process".
             (
                 "ENOENT, exiting",
+                first,
                 ENOENT,
                 Some(same('S', LIVE | PF_EXITING)),
                 NoProcess,
             ),
-            ("ENOENT, zombie", ENOENT, Some(same('Z', LIVE)), NoProcess),
-            ("ENOENT, dead X", ENOENT, Some(same('X', LIVE)), NoProcess),
+            (
+                "ENOENT, zombie",
+                first,
+                ENOENT,
+                Some(same('Z', LIVE)),
+                NoProcess,
+            ),
+            (
+                "ENOENT, dead X",
+                first,
+                ENOENT,
+                Some(same('X', LIVE)),
+                NoProcess,
+            ),
             (
                 "ENOENT, kernel thread",
+                first,
                 ENOENT,
                 Some(same('S', PF_KTHREAD)),
                 NoProcess,
             ),
             (
                 "ENOENT, ordinary live process",
+                first,
                 ENOENT,
                 Some(same('S', LIVE)),
                 Unverifiable,
             ),
-            ("ENOENT, /proc entry gone", ENOENT, None, NoProcess),
+            ("ENOENT, /proc entry gone", first, ENOENT, None, NoProcess),
             (
                 "ENOENT, exiting but pid reused",
+                first,
                 ENOENT,
                 Some(stat('S', LIVE | PF_EXITING, 501)),
                 Unverifiable,
             ),
             (
                 "ENOENT, zombie but pid reused",
+                first,
                 ENOENT,
                 Some(stat('Z', LIVE, 501)),
                 Unverifiable,
             ),
             // Other errors stay errors for a live task.
-            ("EACCES, live", EACCES, Some(same('S', LIVE)), Unverifiable),
+            (
+                "EACCES, live",
+                first,
+                EACCES,
+                Some(same('S', LIVE)),
+                Unverifiable,
+            ),
             (
                 "EACCES, exiting",
+                first,
                 EACCES,
                 Some(same('S', LIVE | PF_EXITING)),
                 Unverifiable,
             ),
             (
                 "EACCES, kernel thread",
+                first,
                 EACCES,
                 Some(same('S', PF_KTHREAD)),
                 Unverifiable,
             ),
             // A dead task is gone whatever the error was.
-            ("EACCES, zombie", EACCES, Some(same('Z', LIVE)), NoProcess),
+            (
+                "EACCES, zombie",
+                first,
+                EACCES,
+                Some(same('Z', LIVE)),
+                NoProcess,
+            ),
+            // A leader that exited while other threads run is judged as a
+            // live task, not as a dead one.
+            (
+                "Z leader with a worker, exe read from the worker",
+                leader_z,
+                Ok(()),
+                Some(leader_z),
+                Identity,
+            ),
+            (
+                "Z leader with a worker, no exe, exiting flag",
+                leader_z,
+                ENOENT,
+                Some(leader_z),
+                NoProcess,
+            ),
+            (
+                "Z leader with a worker, no exe, no exiting flag",
+                leader_z,
+                ENOENT,
+                Some(with_threads(stat('Z', LIVE, 500), 2)),
+                Unverifiable,
+            ),
+            (
+                "Z leader with a worker, EACCES",
+                leader_z,
+                EACCES,
+                Some(leader_z),
+                Unverifiable,
+            ),
+            (
+                "Z leader with a worker, pid reused",
+                leader_z,
+                Ok(()),
+                Some(with_threads(stat('Z', LIVE | PF_EXITING, 501), 2)),
+                Unverifiable,
+            ),
+            (
+                "Z leader, the worker is gone by the second read",
+                leader_z,
+                ENOENT,
+                Some(stat('Z', LIVE | PF_EXITING, 500)),
+                NoProcess,
+            ),
+            (
+                "Z leader, the worker is gone by the second read, EACCES",
+                leader_z,
+                EACCES,
+                Some(stat('Z', LIVE | PF_EXITING, 500)),
+                NoProcess,
+            ),
         ];
-        for (name, exe, after, expected) in table {
+        for (name, first, exe, after, expected) in table {
             assert_eq!(
                 judge_exe_read(exe, &first, after.as_ref()),
                 expected,
