@@ -477,3 +477,15 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **M1-05b-daemon-test-gaps** (new brief): Gemini 4 Hydrogen `medium`, reviewed by Sonnet 5.5.
 - **M1-09b's owed macOS checks (D-072):** run by the orchestrator on Pedro's Mac.
 - Not in this go: M1-15 (waits for M1-13's merge), M1-14b (Linux), M1-08.
+
+## D-076 — 2026-11-14 — Pedro's shifts: Gemini 4 Hydrogen first
+**Decided by Pedro (driver).** Hydrogen is fast and cheap, so on **Pedro's shifts** it is the default worker. This extends D-073 and D-074; `scripts/agy-policy.py` is unchanged.
+- **Every new task, review or follow-up goes to Gemini 4 Hydrogen** (`medium`; `high` for security, `unsafe` and escalation work) unless it falls under one of these, which keep their Claude routing (D-060, D-074):
+  - it needs `python3`, a GUI or another command outside the `agy` allowlist;
+  - it writes path-like text the policy refuses (credential paths as test data, security tables);
+  - it is a security fix, an `unsafe` change or a contract change;
+  - Hydrogen has already failed it (the PLAN §8.3 ladder goes to Claude next).
+- **Reviews stay cross-provider:** Hydrogen reviews Claude's work; Claude (Sonnet 5.5 by default, Opus 5.5 for security) reviews Hydrogen's.
+- **Work already running keeps its worker** (M1-07 escalation and M1-13 fixes on Opus, M1-05b on Hydrogen with a Sonnet review).
+- At most four Hydrogen jobs at once (D-068). The orchestrator says in each brief header why a task did *not* go to Hydrogen when it doesn't.
+- Rodrigo's shifts keep his own routing (D-064).
