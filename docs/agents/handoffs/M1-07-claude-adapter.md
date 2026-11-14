@@ -136,3 +136,9 @@ Left for the policy side (not mine): finding 1's other half, the policy engine i
 - `cargo fmt --all --check`: exit 0.
 - `cargo clippy --workspace --all-targets -- -D warnings`: host, `CARGO_TARGET_DIR` outside the worktree: exit 0, no warnings.
 - `cargo test -p atrium-agents --no-fail-fast` (after `cargo build -p atrium-agents --examples`, which `--test` runs do not do; three consecutive runs, no flake): unit 25, `claude_adapter` 37, `claude_golden` 20, `claude_normalizer` 60, `claude_policy_e2e` 3, `claude_review` 24, `consistency` 11 passed + 1 ignored. No failures.
+
+## Escalation (D-071): not started, stopped at the handoff (2026-11-14)
+
+The Gemini 4 Argon worker (`agy` 1.5.8) ran for about 35 minutes and changed nothing: it read the code and the review, and its edits were refused. The cause is the worker policy, not the task: `scripts/agy-policy.py` (`check_paths`) refuses any file-tool argument, **content included**, that starts with `~`, contains `../`, or starts with an absolute path outside the worktree. This escalation's tests need exactly such literals (`../.aws/cred*`, `~bob/*`, `/home/ana/.ssh/id_ed25519`), so an `agy` worker can't write them under today's policy. The orchestrator stopped it for the handoff; the branch is unchanged since `ea14b48`.
+
+Next: the work list is the brief's "Escalation" section on `dev`. Either the policy checks only path arguments (not file content), decided by a driver, or the escalation goes to a worker that isn't `agy`.
