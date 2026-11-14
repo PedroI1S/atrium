@@ -99,6 +99,20 @@
   --inbox-row-height: 54px;
   --fact-label-width: 96px;
 
+  /* chat (M1-09b): transcript rows, markdown, tool output, request cards, the inbox, settings lists */
+  --text-h1: 19px;
+  --text-h2: 17px;
+  --text-h3: 15.5px;
+  --md-quote-bar: 3px;
+  --md-img-max-height: 360px;
+  --tool-out-max-height: 280px;
+  --ask-cmd-max-height: 160px;
+  --dock-max-height: 55vh;
+  --to-tail-offset: 12px;
+  --q-text-height: 34px;
+  --inbox-measure: 760px;
+  --list-row-min-height: 46px;
+
   /* type scale on top of the theme's --text-ui / --text-code / --chat-font-size */
   --text-meta: 11.5px;
   --text-label: 12px;

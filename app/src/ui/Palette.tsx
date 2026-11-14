@@ -6,6 +6,7 @@ import { isCommandFailure } from "../daemon/types";
 import { paletteOpen, panelOpen, setPanel, setPaletteOpen, setScreen, setSidebarOpen, showToast, sidebarOpen } from "../state";
 import { MAIN } from "../window-model";
 import { bringBack, debugBuild, isPopout, model, ownsView, patchSettings, popOut } from "../windows";
+import { jumpToNext } from "./jump";
 import { openThread } from "./Sidebar";
 
 interface Command {
@@ -37,7 +38,8 @@ function sections(): Section[] {
     ...Object.entries(model().popouts).filter(([label]) => label !== MAIN).map(([label, popout]) => ({ id: `back-${label}`, label: `Bring back: ${titleOf(popout.threadId)}`, run: () => void bringBack(popout.threadId) })),
   ];
   const go: Command[] = isPopout() ? [] : [
-    { id: "inbox", label: "Go to Inbox", hint: "⌘J", run: () => setScreen("inbox") },
+    { id: "next", label: "Go to the next chat that needs you", hint: "⌘J", run: jumpToNext },
+    { id: "inbox", label: "Go to Inbox", run: () => setScreen("inbox") },
     { id: "new-chat", label: "New chat", run: () => openThread(null) },
     { id: "settings", label: "Open Settings", hint: "⌘,", run: () => setScreen("settings") },
     { id: "toggle-sidebar", label: "View: toggle sidebar", hint: "⌘B", run: () => setSidebarOpen(!sidebarOpen()) },

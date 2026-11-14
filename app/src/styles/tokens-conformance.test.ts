@@ -103,7 +103,11 @@ export function checkTsx(src: string): Violation[] {
 const fmt = (file: string, vs: Violation[]) => vs.map((x) => `${file}:${x.line} [${x.rule}] ${x.text}`).join("\n");
 
 /** Every module that paints, sizes or animates anything (review #11 widened this list). */
-const TS_FILES = ["windows.ts", "window-model.ts", "state.ts", "sync.ts", "layout.ts", "harness.ts", "daemon/reduce.ts", "daemon/client.ts", "platform.ts", "settings-registry.ts", "theme/runtime.ts", "theme/calm.ts"];
+const TS_FILES = [
+  "windows.ts", "window-model.ts", "state.ts", "sync.ts", "layout.ts", "harness.ts", "daemon/reduce.ts", "daemon/client.ts", "platform.ts", "settings-registry.ts", "theme/runtime.ts", "theme/calm.ts",
+  // M1-09b: the chat's models and what it renders.
+  "chat/actions.ts", "chat/blocks.ts", "chat/inbox.ts", "chat/limits.ts", "chat/links.ts", "chat/markdown.ts", "chat/render.ts", "chat/requests.ts", "chat/rules.ts", "chat/threads.ts", "chat/transcript.ts", "ui/jump.ts",
+];
 
 describe("token-only components (static conformance)", () => {
   for (const css of readdirSync(join(SRC, "styles")).filter((f) => f.endsWith(".css") && f !== "base.css")) {

@@ -5,7 +5,11 @@
 
 import type { ErrorCode, EventId, InboxItem, StoredEvent, ThreadId, ThreadSummary } from "../../../crates/atrium-protocol/bindings/protocol";
 
-export type { AgentEvent, AgentLaunch, DaemonCommand, ErrorCode, EventId, InboxItem, InboxReason, StoredEvent, ThreadId, ThreadState, ThreadSummary } from "../../../crates/atrium-protocol/bindings/protocol";
+export type {
+  AgentEvent, AgentLaunch, ApprovalDecision, DaemonCommand, EnforcementDescriptor, ErrorCode, EventId, InboxItem, InboxReason, MessageKind, PlanEntry,
+  Provider, ProviderProbe, Question, QuestionAnswer, QuestionOption, RememberScope, RequestOutcome, Rule, RuleMatcher, RuleScope, ServerMessage,
+  StoredEvent, ThreadId, ThreadState, ThreadSummary, ToolKind, ToolStatus, TurnOutcome, Usage, Value,
+} from "../../../crates/atrium-protocol/bindings/protocol";
 
 export type ConnectionState =
   | { type: "connecting"; attempt: number }

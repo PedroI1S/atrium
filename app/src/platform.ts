@@ -65,3 +65,8 @@ export async function quitApp(): Promise<void> {
 export async function openLink(url: string): Promise<void> {
   if (inTauri) await invoke("open_link", { url });
 }
+
+/** Reveals a `file:` link's path in the file manager. Rust resolves it and refuses one outside the thread's folder (contract §12). */
+export async function revealPath(path: string): Promise<void> {
+  if (inTauri) await invoke("reveal_path", { path });
+}

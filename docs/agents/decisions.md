@@ -387,3 +387,93 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **Branches:** the three tasks continue on their existing branches (`agent/opus/…`, `agent/sonnet/…`) whatever model works on them. This is the orchestrator's reading of D-065's note on branch names, chosen to avoid deleting pushed branches; the driver can overturn it.
 - **Before any `agy` worker:** the hook check of `HANDOFF.md` is re-run, because `agy` here is 1.5.7 and the tested version is 1.5.3.
 - **Not covered by this go:** M1-08, M1-08L, and the decisions that wait for Pedro (CR-09, CR-12) or a driver (CR-08, CR-10).
+
+*Update, same day (orchestrator):*
+- The `agy` 1.5.7 hook check passed (Flash, scratch worktree): `cargo --version` allowed, a write to `.agents/` and `git push` denied by the hook. `scripts/doctor` now names 1.5.7 as the tested version.
+- M1-14 is split, as M1-09 was: **M1-14a-linux-host** (M1-10's four Linux review findings, a live run of the Linux paths, L8; no GUI, no app file; Sonnet 5.5, reviewed by Argon) is dispatched now under D-059's go; **M1-14b-linux-app** (L1, L2 harness, L3 profiling, M1-09a's and M1-09b's runs on Linux; Fable 5.2, reviewed by Flash) waits for M1-09b's merge, because M1-09b owns `app/src/**` and `app/scripts/**`.
+
+## D-067 — 2026-11-13 — CR-08 and CR-10 approved; the stale M1-09a worktree removed
+**Decided by rodrigo (driver).**
+- **CR-08, approved:** `Store::launch(&ThreadId) -> StoreResult<Option<NewThread>>`, so a resumed thread keeps the effort and preset it was started with. M1-05's workaround (Home preset, no effort on resume) goes when it lands.
+- **CR-10, approved:** `Store::unfinished_incarnations() -> StoreResult<Vec<(ThreadId, u32)>>`, so recovery closes an unfinished incarnation of an archived thread and can clear a process record whose incarnation already ended. M1-13's finding 12 (a failed closure in recovery leaves `sessions.process` set) is looked at in the same change.
+- Both add a method to the frozen `Store` trait and change no existing one. They are applied on `dev` as one task (brief `M1-15-store-launch-recovery`), after M1-13 is merged, because it touches `atrium-daemon`'s recovery, which M1-13's new tests cover.
+- **Housekeeping, asked for by rodrigo:** the worktree `~/atrium-wt/M1-09a-app-shell` on rodrigo's machine was removed on 2026-11-13 (`git worktree remove`). M1-09a is merged into `dev` (`1d8d9ca`); the worktree was clean when removed (the untracked `skills/` folder seen in it on 2026-11-12 was already gone). The local branch `agent/fable/M1-09a-app-shell` (at `b35ea1c`, eight commits behind its pushed branch) and `origin/agent/fable/M1-09a-app-shell` were left as they are.
+
+## D-068 — 2026-11-13 — Gemini 4 Hydrogen takes Gemini 3.8 Flash's place
+**Decided by rodrigo (driver).** Gemini 4 Hydrogen, through `agy`, is used wherever the plan or an open task names Gemini 3.8 Flash: the high-volume utility work of PLAN §8.1 and §8.2 (tests, fixtures, docs, exploration, triage), the cheap end of the escalation ladder (§8.3), and the cross-provider reviews given to Flash (contract §15, D-056, D-057, D-059, D-066: today M1-09b's and M1-14b's reviews, with screenshots).
+- **Model id:** `gemini-4-hydrogen-medium` (`agy models` also lists `low`, `high` and `xhigh`). Medium is the orchestrator's default, as it was for Flash; the driver can change it.
+- **Updated:** PLAN §8 (roster, routing table, ladder, limits, the launch table), the briefs of M1-09b and M1-14b, the status board, `routing.md`.
+- **Left as written:** the frozen M1 contract's task table, earlier decisions, finished briefs, reviews and session logs. Where one of them gives Flash a role that is still open, it reads Hydrogen.
+- **Not changed:** PLAN §3.17's example of Atrium's own default routing (`agy:gemini-3.8-flash-medium`), which is the product's default and not this build's roster.
+- **Limits and policy:** Hydrogen takes Flash's limit of four at once (§8.4). The worker policy hook depends on the `agy` version, not on the model, so the 1.5.7 check (D-066) stands; Hydrogen's first run is watched for tool names the policy doesn't know.
+- **Pedro's shifts:** his own decisions that name Flash (D-056, D-060, D-062) are his to change, as D-064 says for routing. Until he does, Flash stays available on his shifts.
+- Hydrogen has no scoreboard yet: `routing.md` starts a row for it, and its first reviews are read with that in mind.
+
+
+## D-069 — 2026-11-14 — rodrigo's shift: Opus 5.5 is the orchestrator again; more work goes to Gemini 4 Hydrogen
+**Decided by rodrigo (driver).** rodrigo asked to go back to the original orchestration set-up, change nothing else, and give Gemini 4 Hydrogen every task the orchestrator judges it can handle.
+- **D-065's model swap ends.** Claude Opus 5.5 (`claude-opus-5-5`) takes back, on rodrigo's shifts, every role D-065 gave Claude Fable 5.2: the orchestrator (D-001, PLAN §8.1, §8.7), the UI worker (D-048, at most one at a time besides the orchestrator), the `unsafe` audits (D-053, D-061), the escalation and contract-heavy worker (D-047), and the reviews given to Opus (contract §15, D-062). This is PLAN §8 as written. Fable 5.2 has no standing role on rodrigo's shifts; the driver can bring it back.
+- **The rest of D-065 stands:** parallel workers (D-057 stays ended), routing by contract §15 and D-064, a worker that hits a usage limit is paused, not re-routed. PLAN §8.2's cross-provider rule: Opus is Anthropic, so its work is reviewed by Gemini or GPT models. D-066, D-067 and D-068 stand. Open tasks keep their branches; a new Opus branch is `agent/opus/<task-id>`.
+- **Gemini 4 Hydrogen (`gemini-4-hydrogen-medium`, through `agy`), on rodrigo's shifts** (the orchestrator's judgment): besides its PLAN §8.2 rows (tests, fixtures, docs, exploration, triage) and the reviews D-068 gave it (M1-09b, M1-14b):
+  1. **M1-14a's fix round 1, close-out.** The Sonnet worker stopped at the account's 5-hour limit after findings 1–3 (`823aa7e`..`2cd28c3`). Hydrogen does the review's finding 4 (`perf.rs`'s 60 s idle window holds the daily `VACUUM INTO` snapshot, so the L8 samples are not 60 s after the last activity: fix the window and take the L8 numbers again, raw output in the report), re-runs the DoD and writes the handoff's fix-round section. The nit (`PF_FORKNOEXEC` for `PF_RANDOMIZE`) is already fixed (`2cd28c3`). Argon's re-review follows, as D-066 says.
+  2. **M1-13's third part, its tables (step 5 of the brief).** Before the fixes, Hydrogen writes the regression table (every input of `reviews/M1-13-adversarial.md` with the verdict the review expects) and the table of ordinary lines with the verdict each has on `dev`, on the task's branch, test files only. They fail where the review says the branch is wrong. The Opus worker then does the fixes and checks the tables, as the owner of the code under test (§8.2). Worker rule 6 holds.
+  3. **The M1-05 late-fix review's test gaps** (`reviews/M1-05-daemon-late-fixes.md`: the full-storage test can't tell the new rule from the old; the `write_loop` gaps): a tests-only task in new `crates/atrium-daemon/tests/` files. It needs a brief and the driver's go.
+  4. **Orchestrator utility work:** triage of failing check output, codebase questions, first drafts of summaries. The orchestrator checks what comes back.
+- **Not Hydrogen's** (security, contracts, frontier or specialist work): M1-07's fix round 2 (Sonnet; left: new finding 7 and what follows it), M1-13's fixes (Opus) and its re-review (Argon), M1-15 (Sonnet, Argon review), M1-14b (Opus), M1-09b's remaining UI work and the fixes its screenshots call for (Opus), `unsafe` audits, contract changes, gate reviews.
+- Hydrogen has no scoreboard yet: its first run (M1-14a's close-out) is watched for tool names the policy hook doesn't know (D-068), and `routing.md` gets a row per task.
+- **Pedro's shifts are unchanged** (D-060, D-062, D-064).
+- **Not a go:** this decision routes work. Items 1 and 2 are parts of tasks D-066 already covers, item 3 is new; the orchestrator dispatches none of them until the driver says so.
+
+## D-070 — 2026-11-14 — rodrigo's go: resume the paused workers, Hydrogen's first task included
+**Decided by rodrigo (driver).** The three workers stopped by the usage limits on 2026-11-14 resume, routed by D-069:
+- **M1-09b-home-chat:** an Opus 5.5 worker (Claude subagent) continues from `c884a76` and the handoff on the branch.
+- **M1-07-claude-adapter:** a Sonnet 5.5 worker finishes fix round 2: item 7 (`live` checked before `Redeem`/`Question` are fed; separate id namespaces), item 8 (the five helper keys count as command keys), the DoD and the handoff. Then Argon's review round 3.
+- **M1-14a-linux-host:** Gemini 4 Hydrogen (`gemini-4-hydrogen-medium`, `scripts/agent-run agy`) closes fix round 1 (D-069 item 1). Its first run is watched. Then Argon's re-review.
+- **Not in this go:** M1-13's third part (Hydrogen's tables and the Opus fixes), the M1-05 test-gap task, M1-14b, M1-15.
+
+*Update, same day (orchestrator):* `agy` on the host is now 1.5.8. Before the Hydrogen worker, the hook check of `HANDOFF.md` was re-run with Hydrogen in a scratch worktree (`M1-00-hookcheck-1.5.8`, removed afterwards): `cargo --version` allowed, a write to `.agents/probe.txt` and `git push` denied by the hook, no file written. `scripts/doctor` names 1.5.8 as the tested version. Hydrogen used the tool name `write_file`, which the policy already knows.
+
+## D-071 — 2026-11-14 — M1-07 escalates to Gemini 4 Argon, reviewed by GPT-6.1 Sol
+**Decided by rodrigo (driver).** M1-07's review round 3 is rework again (`reviews/M1-07-claude-adapter-round3.md`): the `Glob`/`Grep` subject, open since round 1, still reaches Allow on credentials (two blockers, one major). Both automatic fix rounds are used, so the task escalates across providers (PLAN §8.3): the author was Sonnet 5.5, the next attempt is **Gemini 4 Argon** (`gemini-4-argon-high`, through `agy`), and its work is reviewed by **GPT-6.1 Sol** (`gpt-6.1-sol`, `codex exec -s read-only`). The orchestrator offered Astra (reviewed by Argon) as its first choice; rodrigo chose Argon, who found the holes.
+- **Same branch and worktree** (`agent/sonnet/M1-07-claude-adapter`, D-066's reading on branch names), same owned paths.
+- **The orchestrator's design rule for the subject** (in the brief's "Escalation" section): stop expanding and bounding arbitrary patterns; accept only a small, explicit grammar and make everything else `Unknown` (which asks). Ordinary patterns (`**/*.rs`, `src/**/mod.rs`, `*.{ts,tsx}`, `src/{a,b}/mod.rs`, `*.[ch]`, `*.[a-z]`) must keep their Allow in Home.
+- The policy engine's side (P1 in `m1-must-fix.md`) stays with `atrium-core`'s owner.
+
+## D-072 — 2026-11-14 — M1-09b merged into `dev` with its macOS checks owed
+**Decided by rodrigo (driver).** M1-09b-home-chat is merged into `dev` at `8e7dffd` after the Gemini 4 Hydrogen review (round 1 approve with changes, fixed by the orchestrator; round 2 approve). Its status is partial only for what this machine can't do:
+- **Owed to a Pedro shift (macOS):** the screenshots in both themes, the `startup_bench.py` gate (median < 400 ms, p90 < 450 ms, idle < 150 MB `phys_footprint`) and the §14 streaming run.
+- **Owed to M1-07 (a real provider):** approvals and questions end to end, "Always…" from a live request, the daemon's stale refusal, Resume, real markdown and usage, a probed agent in Settings.
+- **Linux idle memory over 150 MB is not this task's:** M1-09a's shell measures 219–223 MiB private PSS on the same machine and script (M1-09b: 212–216 MiB). It goes to M1-14b (L3 profiling) and a gate decision.
+- **Open for the drivers, not decided here:** how §14's frame statistic reads on Linux (144 Hz display, 1 ms rAF timestamps; the worker proposes "frames that skip an update", 0.1–0.3 % measured) and batching events in `bridge.rs` (about 10,000 webview script runs a second at 10k tokens/s).
+- The merge unblocks M1-14b (it waited for M1-09b's `app/src/**` and `app/scripts/**`); its dispatch still needs a go.
+
+## D-073 — 2026-11-14 — Pedro's shifts: Gemini 4 Hydrogen takes the Flash and Argon jobs
+**Decided by Pedro (driver).** In Pedro's tests Gemini 4 Hydrogen performs better than Gemini 4 Argon in most cases. On **Pedro's shifts**:
+- **Every `agy` Flash job goes to Hydrogen** (`gemini-4-hydrogen-medium`, through `scripts/agent-run agy`). This confirms D-068 for his shifts.
+- **Every Gemini 4 Argon job goes to Hydrogen too**: work, reviews and escalations. This replaces the Argon → Sonnet 5.5 routing of D-053 and D-060 on his shifts. The orchestrator picks the effort level per job: `medium` by default, `high` for security, `unsafe` and escalation work, which is what Argon used (`gemini-4-argon-high`, D-071).
+- The rest of D-060 is unchanged on Pedro's shifts: Codex → Sonnet 5.5, Astra → Opus 5.5, Sol → Sonnet 5.5 or, where Flash was the alternative, Hydrogen.
+- **Open tasks this changes, when they run on Pedro's shift:**
+  - M1-07's escalation (D-071, Argon, reviewed by Sol) runs on Hydrogen `high`, reviewed by Sonnet 5.5 (Sol → Sonnet, D-060). Hydrogen and Sonnet are different providers, so the review stays cross-provider.
+  - Argon's reviews of M1-15, of M1-14a's re-review if still open, and of M1-13's re-review go to Hydrogen.
+- **Rodrigo's shifts keep his own routing** (D-064, D-066 to D-071) unless he decides otherwise.
+- Hydrogen's limit is four at once (D-068). Its `routing.md` rows track how it does on the Argon-class work.
+
+## D-074 — 2026-11-14 — Pedro's shifts: security-test writing goes to Claude, Hydrogen takes Claude work it can do
+**Decided by Pedro (driver).** `scripts/agy-policy.py` stays as it is: it refuses path-like text (`~…`, `../`, absolute paths outside the worktree) in file contents too. So work that has to write such text goes to Claude workers. To balance the load, Gemini 4 Hydrogen takes Claude-bound work it can do within the policy. This refines D-073 on Pedro's shifts.
+- **To Claude (they write credential paths as test data):**
+  - **M1-07's escalation (D-071):** an **Opus 5.5** worker. The author was Sonnet, so this is a step up the ladder, not a change of provider.
+  - **M1-13's third part:** the regression and ordinary-line tables go to a **Sonnet 5.5** worker, the fixes to **Opus 5.5** (as D-069).
+- **Reviews of that work stay cross-provider: Gemini 4 Hydrogen `high`, read-only.** The review is returned as the agent's final message and the orchestrator writes it to `reviews/<id>.md`, because the policy would refuse a review file that quotes the inputs.
+- **To Hydrogen, from Claude** (the orchestrator's judgment of what it can do: Rust or TypeScript work run with `cargo`/`pnpm`, no credential literals, no GUI):
+  - **The M1-05 late-fix test gaps** (tests only, `crates/atrium-daemon/tests/`; `reviews/M1-05-daemon-late-fixes.md` findings 1 and 4). Needs a brief. Reviewed by Sonnet 5.5.
+  - **M1-15-store-launch-recovery** (CR-08 and CR-10, once M1-13 is merged): Hydrogen `high` instead of Sonnet, reviewed by Opus 5.5. If its tests need path-like literals, that part goes back to Claude.
+  - Hydrogen's PLAN §8.2 rows (fixtures, docs, exploration, triage) and the orchestrator's utility work, as on rodrigo's shifts (D-069).
+- **Not Hydrogen's:** anything that needs `python3` or a GUI (the `agy` allowlist has neither), so M1-09b's macOS checks stay with the orchestrator; security tests and fixes (above); contract changes.
+
+## D-075 — 2026-11-14 — Pedro's go: M1-07 escalation, M1-13 tables, M1-05b, M1-09b's macOS checks
+**Decided by Pedro (driver).** Pedro said "start all" for the work D-074 routed:
+- **M1-07-claude-adapter, escalation:** an Opus 5.5 worker on `agent/sonnet/M1-07-claude-adapter`, from the brief's "Escalation" section. Review by Gemini 4 Hydrogen `high`.
+- **M1-13-adversarial, third part, step 5's tables:** a Sonnet 5.5 worker writes the regression and ordinary-lines tables, commits and stops. The Opus fixes (items 1–4 and 6) follow on the same branch once the tables are in, as part of this go.
+- **M1-05b-daemon-test-gaps** (new brief): Gemini 4 Hydrogen `medium`, reviewed by Sonnet 5.5.
+- **M1-09b's owed macOS checks (D-072):** run by the orchestrator on Pedro's Mac.
+- Not in this go: M1-15 (waits for M1-13's merge), M1-14b (Linux), M1-08.

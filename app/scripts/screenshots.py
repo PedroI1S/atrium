@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Screenshots of the app shell for reviews (Linux).
 
-    python3 app/scripts/screenshots.py <out-dir>
+    python3 app/scripts/screenshots.py <out-dir> [real] [chat] [refused]
 
-Starts the app twice in a throwaway ATRIUM_HOME:
-  - against a real daemon it starts itself, seeded with synthetic threads: the main window in
-    light and dark, the sidebar hidden, the panel minimized, the inbox, Settings with its
-    Advanced card, and a thread in its own window;
-  - against a stand-in daemon that refuses the app as an older version would: the banner.
+Starts the app three times, each in a throwaway ATRIUM_HOME (name the runs to do only some):
+  - real: against a real daemon it starts itself, with synthetic threads: the main window in
+    light and dark (a chat streaming from the fake agent), the sidebar hidden, the panel
+    minimized, the inbox, Settings with its Advanced card, and a thread in its own window;
+  - chat (M1-09b): against a real daemon, with scenes seeded in the window, because the fake
+    agent can't write markdown or raise approvals and questions (app/src/chat-shots.ts says
+    what is seeded and what is the daemon's): a streaming chat with markdown and tool calls,
+    an approval card and its "Always…" choices, a question form, the inbox with items,
+    Settings → Agents, Approvals and Notifications, and a refused approval; light and dark;
+  - refused: against a stand-in daemon that refuses the app as an older version would: the
+    banner.
 
 The pictures are the webviews' own snapshots (the desktop session lets no script capture
 windows). Run `python3 app/scripts/live_check.py` first, or build the same way: this script
@@ -30,6 +36,8 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 APP = ROOT / "target" / "debug" / "atrium"
 TIMEOUT_S = 120
+# Run name -> (ATRIUM_BENCH mode, pictures it takes).
+RUNS = {"real": ("shots", 9), "chat": ("shots-chat", 18), "refused": ("shots-incompatible", 1)}
 
 
 def run_app(home: pathlib.Path, mode: str, shots: pathlib.Path, log: pathlib.Path) -> None:
@@ -94,7 +102,8 @@ def refusing_daemon(home: pathlib.Path) -> socket.socket:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
+    wanted = sys.argv[2:] or list(RUNS)
+    if len(sys.argv) < 2 or any(name not in RUNS for name in wanted):
         print(__doc__)
         return 2
     shots = pathlib.Path(sys.argv[1]).resolve()
@@ -105,7 +114,8 @@ def main() -> int:
         ["cargo", "build", "-p", "atrium-app", "--features", "custom-protocol", "-p", "atrium-daemon"],
         cwd=ROOT, check=True,
     )
-    for name, mode in (("real", "shots"), ("refused", "shots-incompatible")):
+    for name in wanted:
+        mode = RUNS[name][0]
         home = pathlib.Path(tempfile.mkdtemp(prefix="atrium-shots-", dir="/tmp"))
         home.chmod(0o700)
         listener = refusing_daemon(home) if mode == "shots-incompatible" else None
@@ -120,7 +130,7 @@ def main() -> int:
             shutil.rmtree(home, ignore_errors=True)
     pictures = sorted(p.name for p in shots.glob("*.png"))
     print("\n".join(pictures))
-    return 0 if len(pictures) >= 10 else 1
+    return 0 if len(pictures) >= sum(RUNS[name][1] for name in wanted) else 1
 
 
 if __name__ == "__main__":
