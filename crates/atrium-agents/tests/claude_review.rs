@@ -886,3 +886,30 @@ fn r2_what_waits_for_the_session_is_bounded() {
             if *record_type == format!("system/noise_{}", MAX_DIAGNOSTIC_LINES * 10 - 1)
     ));
 }
+
+// ---- round 2, item 5: a late assistant record after the turn closed the message ----
+
+#[test]
+fn r2_a_late_assistant_record_does_not_complete_a_closed_message_again() {
+    let mut n = started();
+    let mut evs = run(
+        &mut n,
+        vec![
+            out(
+                json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}},"api_message_id":"m1"}),
+            ),
+            result(),
+            assistant(json!([{"type":"text","text":"Hi"}])),
+        ],
+    );
+    evs.retain(|e| {
+        matches!(
+            e,
+            AgentEvent::MessageCompleted {
+                kind: MessageKind::Assistant,
+                ..
+            }
+        )
+    });
+    assert_eq!(evs.len(), 1, "{evs:?}");
+}

@@ -571,6 +571,10 @@ impl ClaudeNormalizer {
         record_text: String,
         out: &mut Vec<AgentEvent>,
     ) {
+        // Completed already (the turn closed it): once only.
+        if self.done_msgs.contains(&id) {
+            return;
+        }
         let streamed = self
             .open_msgs
             .iter()
