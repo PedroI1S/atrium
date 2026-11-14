@@ -122,3 +122,12 @@ Found by running the daemon's tests 30 times in a row on Linux (6 of 30 runs fai
 | N4 | minor | M1-13's `adversarial_socket::flooding_unread_list_threads_past_8_mib_control_lane_closes_connection` failed 4 of 7 runs on the orchestrator's re-run (20 s timeout; 0.4 s when it passes). Back with the M1-13 worker to tell a racy test from a daemon that doesn't close the connection (finding 14 may be the cause). |
 | N5 | later | Linux branches no test reaches: `peer.rs` error paths and the whole success path of `check_root_owned_tree` (a root-owned packaged executable; needs a packaged build), `supervise.rs` real `PF_EXITING`/`PF_KTHREAD` tasks (pure table only), `lifecycle.rs` XDG fallbacks and replacing an existing systemd unit. List in `docs/spikes/M1-linux-checks.md` on the branch. |
 
+## From the M1-07 reviews (`reviews/M1-07-claude-adapter*.md`, Argon; 2026-11-13)
+
+For the policy engine, not the adapter (the adapter's own findings are fixed in M1-07's fix rounds).
+
+| # | Sev. | Must fix |
+|---|---|---|
+| P1 | major | **The policy trusts a search subject's `glob` to stay under its `paths`.** `deny.rs` `search_glob_hit` only looks at probes under the subject's roots, and `Home::evaluate` checks the roots alone, so a `ToolSubject::Paths { paths: [cwd], glob }` whose `glob` is absolute, starts with `~`, climbs with `..`, or does either through braces or a character class (`{a,}/home/…`, `.{.,.}/.ssh/…`, `[.][.]/…`) is allowed although it names files outside every root. M1-07 closes it in the Claude adapter's subject (such patterns become extra paths or `Unknown`), but every adapter builds subjects, so the engine should refuse or ask for a `glob` that can leave its roots. For M1-13's follow-up or the policy's owner; test with the patterns in the round-2 review. |
+| P2 | minor | A ticket opened by an `Ask` whose request is then withdrawn (cancelled, or never followed by `can_use_tool`) stays `pending` in the ledger until the turn ends and counts against `MAX_PENDING_REQUESTS`. The adapter can't withdraw it: `SessionGate` has no call for that. A change request if it ever bites; bounded by the turn today. |
+
