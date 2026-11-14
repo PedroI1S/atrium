@@ -4,7 +4,7 @@
 
 import { createVirtualizer } from "@tanstack/solid-virtual";
 import { ArrowDown, Brain, Check, ChevronDown, ChevronRight, CircleStop, FileText, Globe, ListChecks, Pencil, Plug, Search, Terminal, Trash2, TriangleAlert, Wrench, X } from "lucide-solid";
-import { type JSX, For, Index, Match, Show, Switch, createEffect, createMemo, createSignal, on, onCleanup, onMount } from "solid-js";
+import { type JSX, For, Match, Show, Switch, createEffect, createMemo, createSignal, on, onCleanup, onMount, untrack } from "solid-js";
 import { ageLabel } from "../daemon/reduce";
 import type { ToolKind } from "../daemon/types";
 import { type BlockText } from "../chat/blocks";
@@ -65,7 +65,8 @@ function BlockRow(props: { item: MessageItem; block: BlockText; tick: () => numb
 
 function UserRow(props: { item: MessageItem; tick: () => number }) {
   // A user's own text: shown as typed, never as markdown.
-  const text = () => (props.tick(), props.item.splitter.blocks.map((b) => b.text).join("\n\n").replace(/\n$/, ""));
+  const ver = createMemo(() => (props.tick(), props.item.v));
+  const text = createMemo(() => (ver(), props.item.splitter.blocks.map((b) => b.text).join("\n\n").replace(/\n$/, "")));
   return <div class="you-row"><div class="you">{text()}</div></div>;
 }
 
@@ -92,7 +93,11 @@ const STATUS: Record<ToolItem["status"], { text: string; tone: "ok" | "fail" | "
 
 function ToolRow(props: { item: ToolItem; tick: () => number }) {
   const [open, setOpen] = createSignal(false);
-  const t = () => (props.tick(), props.item);
+  // Reads of the item follow its version, not every applied batch: a finished call never
+  // changes again, while the thread around it updates every frame.
+  const ver = createMemo(() => (props.tick(), props.item.v));
+  const t = () => (ver(), props.item);
+  const kind = createMemo(() => t().toolKind);
   const status = () => STATUS[t().status];
   const shown = () => {
     const out = t().output;
@@ -102,7 +107,7 @@ function ToolRow(props: { item: ToolItem; tick: () => number }) {
   return (
     <div class="tool">
       <button type="button" class="step" aria-expanded={open()} onClick={() => setOpen(!open())}>
-        {(TOOL_ICON[t().toolKind] ?? ((p: { class: string }) => <Wrench {...p} aria-hidden="true" />))({ class: "i sm" })}
+        {(TOOL_ICON[kind()] ??((p: { class: string }) => <Wrench {...p} aria-hidden="true" />))({ class: "i sm" })}
         <span class="v">{t().name}</span>
         <span class="tg">{t().title ?? ""}</span>
         <span class="res" data-tone={status().tone}>
@@ -205,15 +210,23 @@ function RowView(props: { threadId: string; row: Row; tick: () => number }) {
 
 // -- the list --------------------------------------------------------------------------------
 
+const sameKeys = (a: readonly unknown[], b: readonly unknown[]) => a.length === b.length && a.every((k, i) => k === b[i]);
+
 export function TranscriptView(props: { model: ThreadModel; viewKey: string; empty: JSX.Element }) {
   let scroller!: HTMLDivElement;
   const t = () => props.model.transcript;
   const rows = createMemo(() => (props.model.tick(), t().rows()), undefined, { equals: false });
+  // The virtualizer's options change only with the rows' structure (rows added, removed or
+  // reordered), not with every batch: its options effect re-reconciles the rendered range each
+  // time it runs. A new `getItemKey` per structure makes it measure the rows again even when
+  // their count stays the same.
+  const structure = createMemo(() => (rows(), t().structure));
+  const keyOf = createMemo(() => (structure(), (i: number) => untrack(rows)[i]?.key ?? i));
   const virt = createVirtualizer({
-    get count() { return rows().length; },
+    get count() { return (structure(), untrack(rows).length); },
     getScrollElement: () => scroller,
-    estimateSize: (i) => estimate(rows()[i]),
-    getItemKey: (i) => rows()[i]?.key ?? i,
+    estimateSize: (i) => estimate(untrack(rows)[i]),
+    get getItemKey() { return keyOf(); },
     overscan: OVERSCAN,
   });
 
@@ -246,7 +259,10 @@ export function TranscriptView(props: { model: ThreadModel; viewKey: string; emp
   const onWheel = (e: WheelEvent) => { if (e.deltaY < 0) unfollow(); };
   const onKey = (e: KeyboardEvent) => { if (["ArrowUp", "PageUp", "Home"].includes(e.key)) unfollow(); };
 
-  createEffect(on(() => [rows(), virt.getTotalSize()], () => {
+  // The rows sit in a sizer as tall as the virtualizer's total, so the scroll height changes
+  // only with that total (or the rows' structure). Setting `scrollTop` lays the page out, so it
+  // is done then, not after every batch.
+  createEffect(on(() => [structure(), virt.getTotalSize()], () => {
     if (follow) scroller.scrollTop = scroller.scrollHeight;
   }));
   onMount(() => {
@@ -254,7 +270,13 @@ export function TranscriptView(props: { model: ThreadModel; viewKey: string; emp
   });
   onCleanup(() => persistScroll.flush());
 
+  // One element per row key, not per position: while the view follows a streaming reply the
+  // rendered range moves down by a row many times a second, and position-keyed elements would
+  // each be handed the next row (re-rendering its markdown and measuring it again) on every
+  // move. Keyed, a move mounts the row that enters and drops the one that leaves.
   const items = createMemo(() => virt.getVirtualItems());
+  const byKey = createMemo(() => new Map(items().map((v) => [v.key, v])));
+  const keys = createMemo(() => items().map((v) => v.key), undefined, { equals: sameKeys });
   return (
     <div class="thread-view">
       <div class="thread-scroll" ref={scroller} tabindex="0" role="log" aria-label="Conversation" data-atrium-part="transcript"
@@ -264,22 +286,23 @@ export function TranscriptView(props: { model: ThreadModel; viewKey: string; emp
             <p class="history-note">Older messages of this chat are kept by Atrium's background service but not loaded here. Export the chat to read all of it.</p>
           </Show>
           <div class="thread-sizer" style={{ height: `${virt.getTotalSize()}px` }}>
-            <Index each={items()}>
-              {(v) => {
-                const row = () => rows()[v().index];
+            <For each={keys()}>
+              {(key) => {
+                const v = () => byKey().get(key);
+                const row = () => { const at = v(); return at ? rows()[at.index] : undefined; };
                 let el!: HTMLDivElement;
-                // A reused row element shows another row: register it with the virtualizer again
-                // once it has rendered (its size is then followed by the virtualizer's observer).
-                createEffect(on(() => row()?.key, () => queueMicrotask(() => el.isConnected && virt.measureElement(el))));
+                // Registered with the virtualizer once it has rendered; its observer follows the
+                // size from then on.
+                onMount(() => queueMicrotask(() => { if (el.isConnected) timed("measure", () => virt.measureElement(el)); }));
                 return (
-                  <div class="thread-row" data-index={v().index} data-row={row()?.type} ref={el} style={{ transform: `translateY(${v().start}px)` }}>
+                  <div class="thread-row" data-index={v()?.index} data-row={row()?.type} ref={el} style={{ transform: `translateY(${v()?.start ?? 0}px)` }}>
                     <div class="col">
                       <Show when={row()}>{(r) => <RowView threadId={props.model.threadId} row={r()} tick={props.model.tick} />}</Show>
                     </div>
                   </div>
                 );
               }}
-            </Index>
+            </For>
           </div>
         </Show>
       </div>

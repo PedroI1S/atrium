@@ -39,13 +39,13 @@ def command_of(pid: int) -> str:
     return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
 
 
-def one_run(app_path: pathlib.Path, run: int) -> dict:
+def one_run(app_path: pathlib.Path, run: int, mode: str = "stream") -> dict:
     home = pathlib.Path(tempfile.mkdtemp(prefix="atrium-stream-", dir="/tmp"))
     home.chmod(0o700)
     log = home / "app.log"
     startup_bench.APP = app_path
     before = webkit_pids()
-    app = startup_bench.launch(home, "stream", log)
+    app = startup_bench.launch(home, mode, log)
     peak_web = peak_total = 0.0
     samples = 0
     try:
@@ -85,6 +85,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--debug", action="store_true")
+    # Diagnosis only, not the §14 run: "stream-one" holds only the shown thread.
+    parser.add_argument("--mode", choices=["stream", "stream-one"], default="stream")
     args = parser.parse_args()
     profile = "debug" if args.debug else "perf"
     subprocess.run(["pnpm", "build"], cwd=ROOT / "app", check=True, stdout=subprocess.DEVNULL)
@@ -96,19 +98,21 @@ def main() -> int:
     kind = "phys_footprint" if sys.platform == "darwin" else "private PSS"
     reports = []
     for run in range(1, args.runs + 1):
-        report = one_run(app_path, run)
+        report = one_run(app_path, run, args.mode)
         reports.append(report)
         frame = report["frameMs"]
         valid = not report["hidden"] and report["hiddenDuring"] == 0 and report["frames"] > 0
         within = report["overGateFramePct"] <= 1.0 and frame["p99"] <= 33
         print(f"run {run}: {report['tokensPerSecond']} tokens/s over {report['seconds']} s, {report['fps']} fps, "
               f"frame p50 {frame['p50']} / p95 {frame['p95']} / p99 {frame['p99']} / max {frame['max']} ms, "
-              f"{report['overGateFramePct']} % of {report['frames']} frames over 16.7 ms, "
-              f"{report['longFrames']} long frames ({report['droppedFrames']} dropped), "
+              f"{report['overGateFramePct']} % of {report['frames']} frames over 16.7 ms ({report.get('overGateBeyondResolutionPct')} % over it by more than the 1 ms timestamp resolution), "
+              f"{report['longFrames']} long frames ({report['longFramesPct']} %, over 1.5 refresh intervals; {report['droppedFrames']} updates dropped), "
               f"web content peak {report['peakWebContentMiB']} MiB, app and webviews peak {report['peakAppAndWebviewsMiB']} MiB ({kind})"
               f"{'' if valid else '  INVALID: the window was hidden'}"
               f"  -> {'within' if within else 'OVER'} the gate")
         print(f"        main-thread work while streaming: {json.dumps(report.get('work', {}))}")
+        print(f"        frames: {json.dumps(report.get('frameWork', {}))}")
+        print(f"        the same window idle, before the run: {json.dumps(report.get('idleFrames', {}))}")
         time.sleep(2)
     print(json.dumps({"kind": "stream-bench", "profile": profile, "memory": kind, "runs": reports}))
     return 0

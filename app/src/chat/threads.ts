@@ -54,7 +54,7 @@ function flush(entry: Entry): void {
   const t = entry.model.transcript;
   let batch: Parameters<Transcript["apply"]>[0] = [];
   const applyBatch = () => {
-    if (batch.length) t.apply(batch);
+    if (batch.length) timed("apply", () => t.apply(batch));
     batch = [];
   };
   for (const d of queue) {
@@ -70,7 +70,8 @@ function flush(entry: Entry): void {
     }
   }
   applyBatch();
-  entry.bump();
+  // The view of the thread, if one is shown, updates here.
+  timed("view", entry.bump);
 }
 
 function schedule(entry: Entry): void {

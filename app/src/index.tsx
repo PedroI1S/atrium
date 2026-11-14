@@ -70,9 +70,9 @@ async function boot() {
   if (info.benchMode === "chat-live") {
     setStage("chat-live");
     await (isPopout() ? chatLivePopout() : runChatLive());
-  } else if (info.benchMode === "stream") {
+  } else if (info.benchMode === "stream" || info.benchMode === "stream-one") {
     setStage("stream");
-    if (!isPopout()) await runStreamBench();
+    if (!isPopout()) await runStreamBench(info.benchMode === "stream-one");
   } else if (isRoundtrip(info)) {
     setStage("roundtrip");
     const shots = info.benchMode?.startsWith("shots");
