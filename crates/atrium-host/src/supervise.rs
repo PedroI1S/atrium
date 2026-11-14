@@ -593,8 +593,9 @@ enum ExeVerdict {
 /// after it (`None` if `/proc/<pid>` is gone by then).
 ///
 /// - Gone or replaced: `after` missing means no process now; a different
-///   `start_time` means the pid was reused while we looked, and nothing read
-///   in between can be attributed to either process (`Unverifiable`).
+///   `start_time` or `pgid` means the pid was reused (or the group changed)
+///   while we looked, and nothing read in between can be attributed to one
+///   task (`Unverifiable`).
 /// - Read succeeded and it is the same task: `Identity`.
 /// - Read failed: `NoProcess` if the task is dead (`Z`/`X`/`x`), is exiting
 ///   (`PF_EXITING`: it has dropped its `mm`, and with it `exe`, but is not
@@ -612,7 +613,9 @@ fn judge_exe_read(
     let Some(after) = after else {
         return ExeVerdict::NoProcess;
     };
-    if after.start_time != first.start_time {
+    // The identity is built from `first` (pgid, start time) and the exe read
+    // in between, so everything it takes from `first` must still hold.
+    if after.start_time != first.start_time || after.pgid != first.pgid {
         return ExeVerdict::Unverifiable;
     }
     match exe {
@@ -713,7 +716,13 @@ mod unit_tests {
         }
     }
 
-    const LIVE: u64 = 0x0040_0000; // PF_FORKNOEXEC, an ordinary task
+    /// The same task seen in another process group.
+    fn in_group(mut stat: LinuxStat, pgid: u32) -> LinuxStat {
+        stat.pgid = pgid;
+        stat
+    }
+
+    const LIVE: u64 = 0x0040_0000; // PF_RANDOMIZE, an ordinary task
     const ENOENT: Result<(), io::ErrorKind> = Err(io::ErrorKind::NotFound);
     const EACCES: Result<(), io::ErrorKind> = Err(io::ErrorKind::PermissionDenied);
 
@@ -738,6 +747,26 @@ mod unit_tests {
                 Unverifiable,
             ),
             ("exe ok, /proc entry gone", Ok(()), None, NoProcess),
+            // The identity is built from `first`, so a changed process group
+            // is a different identity, whatever else the second read says.
+            (
+                "exe ok, process group changed",
+                Ok(()),
+                Some(in_group(same('S', LIVE), 9000)),
+                Unverifiable,
+            ),
+            (
+                "ENOENT, exiting, process group changed",
+                ENOENT,
+                Some(in_group(same('S', LIVE | PF_EXITING), 9000)),
+                Unverifiable,
+            ),
+            (
+                "EACCES, zombie, process group changed",
+                EACCES,
+                Some(in_group(same('Z', LIVE), 9000)),
+                Unverifiable,
+            ),
             // ENOENT: only dead, exiting or kernel threads are "no process".
             (
                 "ENOENT, exiting",
