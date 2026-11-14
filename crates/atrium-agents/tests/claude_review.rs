@@ -572,15 +572,7 @@ fn f2_a_glob_pattern_that_leaves_the_base_names_its_target() {
 
 #[test]
 fn f2_a_glob_pattern_that_cannot_be_bounded_is_unknown() {
-    for pattern in [
-        "**/../../etc/passwd",
-        "src/*/../../../x",
-        "{/etc/passwd,x}",
-        "{a,/etc/passwd}",
-        "{~/x,y}",
-        "a\\b",
-        "*/..",
-    ] {
+    for pattern in ["**/../../etc/passwd", "src/*/../../../x", "a\\b", "*/.."] {
         assert_eq!(
             subject("Glob", json!({"path":"/work","pattern":pattern})),
             ToolSubject::Unknown,
@@ -642,7 +634,7 @@ fn f2_a_grep_glob_that_leaves_the_path_names_its_target_too() {
     assert_eq!(
         subject("Grep", json!({"pattern":"k","glob":"../../x/**"})),
         ToolSubject::Paths {
-            paths: vec![".".into(), "./../../x/".into()],
+            paths: vec![".".into(), "./../../x/".into(), "./../../x/**".into()],
             glob: Some("../../x/**".into()),
             recursive: true
         }
@@ -693,4 +685,18 @@ fn item8_subjects_of_the_tools_without_a_dedicated_one_are_pinned() {
         subject("PowerShell", json!({"command":"dir"})),
         ToolSubject::Command { .. }
     ));
+}
+
+/// Braces that hide a root or a tilde are expanded, and the target named
+/// (round 2: they used to be `Unknown`).
+#[test]
+fn f2_braces_that_hide_a_root_are_expanded_and_the_target_named() {
+    for (pattern, target) in [
+        ("{/etc/passwd,x}", "/etc/passwd"),
+        ("{a,/etc/passwd}", "/etc/passwd"),
+        ("{~/x,y}", "~/x"),
+    ] {
+        let paths = paths_of(&subject("Glob", json!({"path":"/work","pattern":pattern})));
+        assert!(paths.contains(&target.to_owned()), "{pattern}: {paths:?}");
+    }
 }

@@ -21,3 +21,4 @@ workspace = true
 
 [dev-dependencies]
 sha2 = "0.10" # M1-12
+atrium-core.workspace = true # M1-07 (policy end-to-end tests; a dev-dependency cycle is fine)

@@ -126,10 +126,11 @@ pub(crate) fn gate_key(call_id: Option<&str>, name: &str, input: &Value) -> Stri
 ///   string, the subject is `Unknown`.
 /// - `Glob` needs a `pattern`; `Grep` needs its regex `pattern` (a string)
 ///   and may carry a `glob` filter. Any present-but-bad field is `Unknown`.
-/// - A glob that leaves the root (absolute, `~`, or with `..`) puts the place
-///   it points at (its fixed prefix up to the first wildcard, joined to the
-///   root) in `paths` too, so the policy sees what the call really reads.
-///   One that can't be bounded this way is `Unknown`.
+/// - A glob that leaves the root (absolute, `~`, or with `..`, however it is
+///   spelled with braces and classes) puts, besides the root, the directory
+///   it points into and the whole pattern joined to the root in `paths`: the
+///   policy then sees the directory, and runs its own glob matching on the
+///   pattern. One that can't be bounded is `Unknown`.
 fn search_subject(input: &Value, glob_key: &str, glob_is_required: bool) -> ToolSubject {
     // Both tools need a `pattern` (Glob: the glob itself; Grep: the regex).
     if !matches!(input.get("pattern"), Some(Value::String(p)) if !p.is_empty()) {
@@ -148,10 +149,13 @@ fn search_subject(input: &Value, glob_key: &str, glob_is_required: bool) -> Tool
     };
     let mut paths = vec![base.clone()];
     if let Some(g) = &glob {
-        match glob_target(&base, g) {
-            Ok(Some(target)) => paths.push(target),
-            Ok(None) => {}
-            Err(()) => return ToolSubject::Unknown,
+        let Some(extra) = glob_targets(&base, g) else {
+            return ToolSubject::Unknown;
+        };
+        for p in extra {
+            if !paths.contains(&p) {
+                paths.push(p);
+            }
         }
     }
     ToolSubject::Paths {
@@ -161,44 +165,157 @@ fn search_subject(input: &Value, glob_key: &str, glob_is_required: bool) -> Tool
     }
 }
 
-/// Where a glob that leaves its base points: `Ok(None)` if it stays inside,
-/// `Err` if that can't be told.
-fn glob_target(base: &str, glob: &str) -> Result<Option<String>, ()> {
-    const WILDCARDS: [char; 4] = ['*', '?', '[', '{'];
+/// Most alternatives a brace group may expand to before the glob is given up
+/// on.
+const MAX_EXPANSIONS: usize = 32;
+
+/// Where a glob that leaves its base points: nothing extra if every way it
+/// can be spelled stays inside the base; `None` if that can't be told.
+///
+/// Conservative: braces are expanded (bounded), a character class that could
+/// stand for `.`, `/` or `~`, or be negated, is not understood, and so is a
+/// backslash.
+fn glob_targets(base: &str, glob: &str) -> Option<Vec<String>> {
     // On Unix a backslash escapes: too subtle to bound.
-    if glob.contains('\\') {
-        return Err(());
+    if glob.contains('\\') || !classes_are_plain(glob) {
+        return None;
     }
+    let mut out = Vec::new();
+    for e in expand_braces(glob)? {
+        out.extend(glob_target(base, &e)?);
+    }
+    Some(out)
+}
+
+/// Every `[...]` class is closed, not negated, and holds nothing that can be
+/// `.`, `/` or `~` (nor a range that spans `.` and `/`, nor `[:class:]`).
+fn classes_are_plain(glob: &str) -> bool {
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '[' {
+            continue;
+        }
+        let mut closed = false;
+        let mut first = true;
+        let mut prev: Option<char> = None;
+        let mut in_range = false;
+        for c in chars.by_ref() {
+            if c == ']' && !first {
+                closed = true;
+                break;
+            }
+            if first && matches!(c, '!' | '^') {
+                return false;
+            }
+            if matches!(c, '.' | '/' | '~' | '[' | ':') {
+                return false;
+            }
+            if in_range {
+                if let Some(lo) = prev
+                    && lo <= '/'
+                    && c >= '.'
+                {
+                    return false;
+                }
+                in_range = false;
+            } else if c == '-' && prev.is_some() {
+                in_range = true;
+            }
+            prev = Some(c);
+            first = false;
+        }
+        if !closed {
+            return false;
+        }
+    }
+    true
+}
+
+/// All the strings a glob's braces stand for (nested groups included), or
+/// `None` for an unbalanced one or past [`MAX_EXPANSIONS`].
+fn expand_braces(glob: &str) -> Option<Vec<String>> {
+    let Some(open) = glob.find('{') else {
+        return if glob.contains('}') {
+            None
+        } else {
+            Some(vec![glob.to_owned()])
+        };
+    };
+    // The matching close.
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, c) in glob[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    // Alternatives at the group's top level.
+    let inner = &glob[open + 1..close];
+    let mut alts = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (i, c) in inner.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                alts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    alts.push(&inner[start..]);
+    let (head, tail) = (&glob[..open], &glob[close + 1..]);
+    let mut all = Vec::new();
+    for alt in alts {
+        all.extend(expand_braces(&format!("{head}{alt}{tail}"))?);
+        if all.len() > MAX_EXPANSIONS {
+            return None;
+        }
+    }
+    Some(all)
+}
+
+/// What one brace-free glob needs besides the base: nothing if it stays
+/// inside it; the directory it points into and the pattern joined to the
+/// base if it doesn't. `None` if it can't be bounded.
+fn glob_target(base: &str, glob: &str) -> Option<Vec<String>> {
+    const WILDCARDS: [char; 3] = ['*', '?', '['];
     let first = glob.find(WILDCARDS);
     let (prefix, rest) = glob.split_at(first.unwrap_or(glob.len()));
-    // After the first wildcard, nothing may climb out or restart at a root
-    // (`{/etc/passwd,x}`, `**/../..`).
-    let climbs = |text: &str| text.split(['/', '{', '}', ',']).any(|seg| seg == "..");
-    if climbs(rest)
-        || rest.contains("{/")
-        || rest.contains(",/")
-        || rest.contains("{~")
-        || rest.contains(",~")
-    {
-        return Err(());
+    let climbs = |text: &str| text.split('/').any(|seg| seg == "..");
+    // After the first wildcard nothing may climb out.
+    if climbs(rest) {
+        return None;
     }
     let leaves = prefix.starts_with('/') || prefix.starts_with('~') || climbs(prefix);
     if !leaves {
-        return Ok(None);
+        return Some(vec![]);
     }
-    // No wildcard: the whole thing is the target. With one, its directory.
-    let dir = if first.is_none() {
-        prefix
-    } else {
-        match prefix.rfind('/') {
-            Some(i) => &prefix[..=i],
-            None if prefix.starts_with('~') => "~",
-            None => "",
+    let join = |p: &str| {
+        if p.starts_with('/') || p.starts_with('~') {
+            p.to_owned()
+        } else {
+            format!("{}/{}", base.trim_end_matches('/'), p)
         }
     };
-    if dir.starts_with('/') || dir.starts_with('~') {
-        Ok(Some(dir.to_owned()))
-    } else {
-        Ok(Some(format!("{}/{}", base.trim_end_matches('/'), dir)))
+    if first.is_none() {
+        // No wildcard: the whole thing is the target.
+        return Some(vec![join(glob)]);
     }
+    let dir = match prefix.rfind('/') {
+        Some(i) => &prefix[..=i],
+        None if prefix.starts_with('~') => "~",
+        None => "",
+    };
+    Some(vec![join(dir), join(glob)])
 }
