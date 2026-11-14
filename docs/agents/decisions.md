@@ -489,3 +489,6 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **Work already running keeps its worker** (M1-07 escalation and M1-13 fixes on Opus, M1-05b on Hydrogen with a Sonnet review).
 - At most four Hydrogen jobs at once (D-068). The orchestrator says in each brief header why a task did *not* go to Hydrogen when it doesn't.
 - Rodrigo's shifts keep his own routing (D-064).
+
+## D-077 — 2026-11-14 — Pedro's go: M1-05c-snapshot-seam
+**Decided by Pedro (driver).** Go for the follow-up the M1-05b review named (`reviews/M1-05b-daemon-test-gaps.md` §5): a test-only store hook in the daemon's `Options` and a test of the snapshot-ordering rule, plus the review's two test nits. Gemini 4 Hydrogen `medium` (D-076), reviewed by Sonnet 5.5. Brief `M1-05c-snapshot-seam.md`.
