@@ -115,6 +115,10 @@ pub struct Options {
     /// How often the daemon looks whether a daily snapshot is due. A test
     /// seam; production uses [`Options::new`]'s ten minutes.
     pub snapshot_check_every: std::time::Duration,
+    /// Wraps the opened store before anything uses it. A test seam;
+    /// production uses [`Options::new`]'s `None`.
+    #[allow(clippy::type_complexity)]
+    pub store_wrapper: Option<Arc<dyn Fn(Arc<dyn Store>) -> Arc<dyn Store> + Send + Sync>>,
 }
 
 impl Options {
@@ -130,6 +134,7 @@ impl Options {
             manage_service: false,
             connection_queue_bytes: MAX_CONNECTION_QUEUE_BYTES,
             snapshot_check_every: std::time::Duration::from_secs(10 * 60),
+            store_wrapper: None,
         }
     }
 }
@@ -292,7 +297,10 @@ impl Daemon {
         let lock = InstanceLock::acquire(&paths)?;
         let store: Arc<SqliteStore> =
             Arc::new(SqliteStore::open(&paths.store, options.store.clone()).await?);
-        let store: Arc<dyn Store> = store;
+        let store: Arc<dyn Store> = match &options.store_wrapper {
+            Some(wrap) => wrap(store),
+            None => store,
+        };
         let ledger = Arc::new(Ledger::new(store.requests()));
 
         let home = resolved(&options.home);
