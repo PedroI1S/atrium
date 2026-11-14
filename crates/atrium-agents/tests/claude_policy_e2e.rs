@@ -515,14 +515,22 @@ fn all_patterns(alphabet: &[char], len: usize) -> Vec<String> {
     all
 }
 
-/// Every pattern up to 5 characters over `{ } [ ] , . / ~ * a`, alone and
-/// followed by `/.ssh/id_ed25519`, searched from the cwd and from `..`: for
-/// each one the policy allows in Home or in FullAccess, no credential file
-/// of the layout is reached.
+/// Every pattern up to 5 characters over `{ } [ ] , . / ~ * a -`, alone and
+/// followed by `/.ssh/id_ed25519`, searched from the cwd and from `..`: no
+/// pattern that reaches a credential file of the layout is allowed, in Home
+/// or in FullAccess.
+///
+/// That is "every allowed pattern reaches no credential", turned around so
+/// the policy is asked only where it matters: the oracle ([`reached`]) is
+/// cheap and runs on every understood pattern; each one that reaches a
+/// credential goes through the real `SessionGate` in both presets. (Asking
+/// the policy about all ~71,000 understood patterns took 39 to 49 s in a
+/// debug build, nearly all in the policy's own glob compiling; review of
+/// the escalation.)
 ///
 /// A subject the adapter can't bound is `Unknown`, which the policy never
 /// allows (`patterns_we_cannot_bound_are_unknown_and_never_allowed`, and
-/// checked here on a sample); only the others go through the policy.
+/// checked here on a sample).
 #[test]
 fn every_short_pattern_the_policy_allows_reaches_no_credential() {
     let started = Instant::now();
@@ -530,11 +538,7 @@ fn every_short_pattern_the_policy_allows_reaches_no_credential() {
     let home = l.home.display().to_string();
     let cwd = l.cwd.display().to_string();
     let probes: Vec<String> = CREDENTIALS.iter().map(|c| format!("{home}/{c}")).collect();
-    // The brief's alphabet less `-`, dropped (as the brief allows) to stay
-    // under 30 s in a debug build: with it the test took 39 to 47 s on a
-    // 10-core Mac, nearly all in the policy's own glob matching. Ranges are
-    // covered by `r3_globs_inside_the_grammar_*` and `r3_globs_outside_*`.
-    let alphabet = ['{', '}', '[', ']', ',', '.', '/', '~', '*', 'a'];
+    let alphabet = ['{', '}', '[', ']', ',', '.', '/', '~', '*', 'a', '-'];
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -552,7 +556,6 @@ fn every_short_pattern_the_policy_allows_reaches_no_credential() {
     }
     let total = inputs.len();
 
-    // Unknown subjects: checked through the policy on a sample.
     let mut known = vec![];
     let mut unknown_sample = vec![];
     for (i, (pattern, path, base)) in inputs.into_iter().enumerate() {
@@ -567,9 +570,38 @@ fn every_short_pattern_the_policy_allows_reaches_no_credential() {
         }
     }
     let unknown = total - known.len();
-    let split = started.elapsed();
+    let subjects = started.elapsed();
 
-    let (sampled, allowed) = rt.block_on(async {
+    // The oracle on every understood pattern, one thread per core.
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let chunk = known.len().div_ceil(workers).max(1);
+    let reaching: Vec<(atrium_agents::ToolCheck, Vec<String>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = known
+            .chunks(chunk)
+            .map(|part| {
+                let (probes, home) = (&probes, &home);
+                s.spawn(move || {
+                    part.iter()
+                        .filter_map(|(pattern, base, check)| {
+                            let hits = reached(pattern, base, home, probes);
+                            (!hits.is_empty()).then(|| {
+                                (check.clone(), hits.into_iter().map(str::to_owned).collect())
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    let oracle = started.elapsed() - subjects;
+
+    // Through the gate: every reaching pattern, and the Unknown sample.
+    let reaching_count = reaching.len();
+    let (sampled, mut leaks) = rt.block_on(async {
         let mut set = tokio::task::JoinSet::new();
         for check in unknown_sample {
             let gates = gates.clone();
@@ -582,51 +614,36 @@ fn every_short_pattern_the_policy_allows_reaches_no_credential() {
                         check.input
                     );
                 }
+                vec![]
             });
         }
         let sampled = set.len();
-        while let Some(r) = set.join_next().await {
-            r.unwrap();
-        }
-        let mut set = tokio::task::JoinSet::new();
-        let probes = Arc::new(probes);
-        let home = Arc::new(home);
-        for (pattern, base, check) in known {
-            let (gates, probes, home) = (gates.clone(), probes.clone(), home.clone());
+        for (check, hits) in reaching {
+            let gates = gates.clone();
             set.spawn(async move {
-                // Allowed in Home or in FullAccess (the second is asked only
-                // when the first doesn't allow).
-                let mut allowed = false;
-                for g in gates.iter() {
+                let mut leaks = vec![];
+                for (g, preset) in gates.iter().zip(["Home", "FullAccess"]) {
                     if matches!(g.check(&check).await, GateDecision::Allow) {
-                        allowed = true;
-                        break;
+                        for probe in &hits {
+                            leaks.push(format!("{preset} allows {} reaching {probe}", check.input));
+                        }
                     }
                 }
-                if !allowed {
-                    return (false, vec![]);
-                }
-                let leaks = reached(&pattern, &base, &home, &probes)
-                    .into_iter()
-                    .map(|probe| format!("{} reaches {probe}", check.input))
-                    .collect::<Vec<_>>();
-                (true, leaks)
+                leaks
             });
         }
-        let (mut allowed, mut leaks) = (0usize, vec![]);
+        let mut leaks = vec![];
         while let Some(r) = set.join_next().await {
-            let (a, l) = r.unwrap();
-            allowed += usize::from(a);
-            leaks.extend(l);
+            leaks.extend(r.unwrap());
         }
-        (sampled, (allowed, leaks))
+        (sampled, leaks)
     });
-    let (allowed, mut leaks) = allowed;
     leaks.sort();
 
     eprintln!(
-        "exhaustive: {total} patterns ({unknown} Unknown, {sampled} of them through the \
-         policy; {} known, {allowed} allowed); subjects in {split:?}, all in {:?}",
+        "exhaustive: {total} patterns ({unknown} Unknown, {sampled} of them through the gate; \
+         {} understood, {reaching_count} of them reach a credential and went through the gate); \
+         subjects in {subjects:?}, oracle in {oracle:?}, all in {:?}",
         total - unknown,
         started.elapsed()
     );

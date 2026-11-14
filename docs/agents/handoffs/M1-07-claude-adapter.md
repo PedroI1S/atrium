@@ -194,3 +194,20 @@ Limits of the exhaustive check: it is bounded to length 5 and this alphabet (no 
 - `cargo fmt --all --check`: exit 0, no output.
 - `cargo clippy --workspace --all-targets -- -D warnings`: exit 0, no warnings (macOS host).
 - `cargo test -p atrium-agents --no-fail-fast`, three consecutive runs, no flake: unit 25, `claude_adapter` 38, `claude_golden` 20, `claude_normalizer` 60, `claude_policy_e2e` 5, `claude_review` 28, `consistency` 11 passed + 1 ignored. No failures. (`claude_policy_e2e` took 29.4, 35.1 and 39.7 s while other builds were running; alone, its exhaustive test takes 23.6 to 26.2 s.)
+
+### Review fix (Gemini 4 Hydrogen `high`, `reviews/M1-07-claude-adapter-escalation.md`: approve with changes)
+- **Minor 1, the exhaustive test over the 30 s budget** (the reviewer measured 41.2 s standalone and 49.3 s for the binary): fixed in `tests/claude_policy_e2e.rs` only.
+  - The test now checks the same property turned around. "Every allowed pattern reaches no credential" is equivalent to "no pattern that reaches a credential is allowed".
+  - The oracle (`reached`) is cheap. It runs on every understood pattern, one thread per core.
+  - Only the patterns that reach a credential go through the real `SessionGate`, in Home and in FullAccess. The `Unknown` sample also still goes through the gate.
+  - Nearly all the old time was the policy's own `hard_deny` / `ShellGlob` compiling, about 7 ms of CPU per call over about 33,000 calls (seen with `sample`).
+  - Two other approaches were measured and **rejected**:
+    - Calling `DefaultPolicy::evaluate` directly: 26 to 38 s, so the gate wrapper was not the cost.
+    - Asking FullAccess first, with work stealing: 26 to 32 s.
+  - **`-` is back in the alphabet**, so the test now covers all of the brief's `{ } [ ] , . / ~ * a -`. 708,620 patterns: 637,436 `Unknown` (640 of them sampled through the gate) and 71,184 understood. Of those, 341 reach a credential and go through the gate. None is allowed.
+  - **Time:** before, 23.6 to 26.2 s here (41.2 s on the reviewer's run) with `-` dropped, and 38.7 to 46.7 s with it. After, **6.7 to 8.5 s** standalone with `-` included, and 9.0 to 12.6 s for the whole `claude_policy_e2e` binary, with a load average of 24 to 30 from other builds.
+- **Mutation check (not committed):** I set `pattern_forms` to never add the dot forms (`if true || joined.contains("**")`). The test then failed with **196 leaks**, the same count found in the escalation (for example, FullAccess allows `{"path":"..","pattern":"*.*/"}`, which reaches `~/.netrc`). I restored the file with `git checkout` and confirmed that `tools.rs` is unchanged.
+- **Nit 2, for the policy owner (P1, `atrium-core`, not mine):** `search_glob_hit` compiles a single-component glob case-sensitively and matches it against lowercased probes. If a provider's glob ever ran case-insensitively (the macOS default filesystem), `{"path":"..","pattern":".NETRC"}` could slip past it under FullAccess. Today's `globset`/ripgrep matching is case-sensitive, so this is a note, not a finding against M1-07.
+- **DoD after the review fix:**
+  - `cargo build -p atrium-agents --examples`, `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`: exit 0.
+  - `cargo test -p atrium-agents --no-fail-fast`, three runs: unit 25, `claude_adapter` 38, `claude_golden` 20, `claude_normalizer` 60, `claude_policy_e2e` 5, `claude_review` 28, `consistency` 11 passed + 1 ignored. No failures.
