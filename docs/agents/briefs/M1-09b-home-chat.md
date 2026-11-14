@@ -3,7 +3,7 @@
 Model: Opus 5.5 (contract §15, D-048) · Reviewer: Gemini 4 Hydrogen (D-068; it was Gemini 3.8 Flash), read-only, with screenshots · Depends on: M1-09a (written and checked, being reviewed; not yet merged)
 Go: D-059 (rodrigo), D-062 (Pedro) · Branch: `agent/opus/M1-09b-home-chat`, cut from `agent/fable/M1-09a-app-shell` · Worktree: `../atrium-wt/M1-09b-home-chat`
 
-**On rodrigo's shifts (D-065, D-066):** the worker is Claude Fable 5.2, on the same branch. Start from `docs/agents/handoffs/M1-09b-home-chat.md` (status partial) and its "Exact next step". The machine is Linux:
+**On rodrigo's shifts (D-066, D-069):** the worker is Claude Opus 5.5 (Claude Fable 5.2 from D-065 until D-069), on the same branch. Start from `docs/agents/handoffs/M1-09b-home-chat.md` (status partial) and its "Exact next step". The machine is Linux:
 - Where this brief says macOS (screenshots, `startup_bench.py`), run on Linux and report the Linux numbers (private PSS, D-040). The macOS screenshots and the macOS startup gate stay owed to a Pedro shift; say so in the handoff.
 - The GUI lock on Linux is `flock /tmp/atrium-gui-measure.lock <command>` (there is no `lockf`).
 - The agent's shell runs in a container without `git`, `node`, `python3` or the WebKitGTK development files. Run `git`, `pnpm`, `python3` and every `cargo` command that builds `atrium-app` on the host: `distrobox-host-exec <command>` from the worktree.
