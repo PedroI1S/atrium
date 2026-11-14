@@ -51,6 +51,7 @@ The policy decisions (the gate is given to you; tests use a scripted gate), the 
 The CLI's control protocol changed in a way the contract can't express; a must-fix item can't be closed as written; two fix rounds without passing.
 
 ## Escalation (2026-11-14, D-071): Gemini 4 Argon, reviewed by GPT-6.1 Sol
+**On Pedro's shift (D-074, D-075):** the escalation is done by a **Claude Opus 5.5** worker, and reviewed by **Gemini 4 Hydrogen `high`**, read-only, which returns its review as its final message. The `agy` policy refuses path-like literals in file contents, so the test data can't be written through `agy`. The work list below is unchanged.
 Three reviews (`docs/agents/reviews/M1-07-claude-adapter.md`, `-round2.md`, `-round3.md`) show that expanding a glob and then trying to bound it keeps leaking. Read `-round3.md` in full first, then the handoff's "Fix round 1" and "Fix round 2". Same branch, same owned paths. Do these, each with a test that fails first (end to end through `atrium_core::policy::DefaultPolicy`, `Preset::Home` and `Preset::FullAccess`, as `tests/claude_policy_e2e.rs` does):
 1. **The subject of `Glob` and `Grep` follows a small grammar; anything outside it is `ToolSubject::Unknown`.**
    - A backslash anywhere: `Unknown` (as now).

@@ -469,3 +469,11 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
   - **M1-15-store-launch-recovery** (CR-08 and CR-10, once M1-13 is merged): Hydrogen `high` instead of Sonnet, reviewed by Opus 5.5. If its tests need path-like literals, that part goes back to Claude.
   - Hydrogen's PLAN §8.2 rows (fixtures, docs, exploration, triage) and the orchestrator's utility work, as on rodrigo's shifts (D-069).
 - **Not Hydrogen's:** anything that needs `python3` or a GUI (the `agy` allowlist has neither), so M1-09b's macOS checks stay with the orchestrator; security tests and fixes (above); contract changes.
+
+## D-075 — 2026-11-14 — Pedro's go: M1-07 escalation, M1-13 tables, M1-05b, M1-09b's macOS checks
+**Decided by Pedro (driver).** Pedro said "start all" for the work D-074 routed:
+- **M1-07-claude-adapter, escalation:** an Opus 5.5 worker on `agent/sonnet/M1-07-claude-adapter`, from the brief's "Escalation" section. Review by Gemini 4 Hydrogen `high`.
+- **M1-13-adversarial, third part, step 5's tables:** a Sonnet 5.5 worker writes the regression and ordinary-lines tables, commits and stops. The Opus fixes (items 1–4 and 6) follow on the same branch once the tables are in, as part of this go.
+- **M1-05b-daemon-test-gaps** (new brief): Gemini 4 Hydrogen `medium`, reviewed by Sonnet 5.5.
+- **M1-09b's owed macOS checks (D-072):** run by the orchestrator on Pedro's Mac.
+- Not in this go: M1-15 (waits for M1-13's merge), M1-14b (Linux), M1-08.
