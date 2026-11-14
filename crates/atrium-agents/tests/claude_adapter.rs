@@ -1550,6 +1550,67 @@ async fn a_start_dropped_outside_a_runtime_kills_the_process_group() {
     );
 }
 
+/// `ps`'s state letters for `pid` (`Z` for a zombie), if it exists.
+fn process_state(pid: &str) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Escalation (round 3, minor 5): as above, but the leader has already
+/// exited (an unreaped zombie) while its child is still in the group.
+#[tokio::test]
+async fn r3_a_start_dropped_outside_a_runtime_after_the_leader_exited_kills_the_group() {
+    let dir = scratch("start-drop-zombie");
+    let pgid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut cfg = config(&dir, "leader-exits", allow());
+    cfg.env.push(("FAKE_GRANDCHILD".into(), "1".into()));
+    let seen = pgid.clone();
+    cfg.on_spawn = Some(Arc::new(move |id| seen.store(id.pgid, Ordering::SeqCst)));
+    let marker = dir.join("grandchild.pid");
+    let mut fut = Box::pin(start(cfg, opts()));
+    let grandchild = tokio::select! {
+        _ = &mut fut => panic!("the grandchild holds stdout: the handshake never ends"),
+        pid = wait_file(&marker, 10) => pid.trim().to_owned(),
+    };
+    let leader = pgid.load(Ordering::SeqCst).to_string();
+    // Wait (polling `fut` too) until the leader is a zombie.
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        if process_state(&leader).is_some_and(|s| s.starts_with('Z')) {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "the leader never became a zombie: {:?}",
+            process_state(&leader)
+        );
+        tokio::select! {
+            _ = &mut fut => panic!("the handshake ended"),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+    }
+    assert!(alive(&grandchild));
+    std::thread::spawn(move || drop(fut)).join().unwrap();
+    let pgid = pgid.load(Ordering::SeqCst);
+    assert!(pgid > 1);
+    let end = Instant::now() + Duration::from_secs(5);
+    while alive(&grandchild) {
+        if Instant::now() > end {
+            // Leave nothing behind, then fail.
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &grandchild])
+                .status();
+            panic!("the leader's child survived a drop outside a runtime");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!group_alive(pgid));
+}
+
 // ---- enforcement descriptor ----
 
 fn write(path: &Path, text: &str) {

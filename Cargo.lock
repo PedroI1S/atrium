@@ -89,6 +89,7 @@ dependencies = [
  "atrium-core",
  "atrium-host",
  "atrium-protocol",
+ "globset",
  "serde",
  "serde_json",
  "sha2",

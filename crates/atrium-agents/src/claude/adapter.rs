@@ -421,32 +421,40 @@ impl Drop for Proc {
     /// during the handshake, a panicked session task) must not leave the
     /// process group behind: `kill_on_drop` reaches the leader only.
     ///
-    /// The group is signalled without depending on a runtime: on a plain
-    /// thread (or one whose runtime is going away) here and now, with the
-    /// leader still unreaped so its group id can't be reused
-    /// (`kill_recorded` waits a moment for the group to drain, which it
-    /// can't while the leader is an unreaped zombie, so with a runtime that
-    /// wait is on a short-lived thread). With a runtime, a task also
-    /// terminates and reaps the leader.
+    /// The group is killed with `supervise::terminate` (it signals the group
+    /// while the leader is still unreaped, so the group id can't have been
+    /// reused, and only then reaps it), on a runtime of its own, so nothing
+    /// depends on the caller's: here and now on a plain thread, on a
+    /// short-lived thread when the caller has a runtime (which may be going
+    /// away). `kill_recorded` is not enough: it signals nothing once the
+    /// leader has exited, even as an unreaped zombie with its children still
+    /// in the group (round 3, minor 5).
     fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.take() else {
             return;
         };
-        let identity = child.identity.clone();
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                std::thread::spawn(move || {
-                    let _ = supervise::kill_recorded(&identity);
-                });
-                runtime.spawn(async move {
-                    let _ = supervise::terminate(&mut child, Duration::ZERO).await;
-                });
-            }
-            Err(_) => {
-                let _ = supervise::kill_recorded(&identity);
-                // The leader is dead now: reap it.
-                let _ = child.child.try_wait();
-            }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(move || terminate_now(child));
+        } else {
+            terminate_now(child);
+        }
+    }
+}
+
+/// [`supervise::terminate`] with no grace, on a runtime of its own; blocks.
+/// Not to be called from inside a runtime.
+fn terminate_now(mut child: SupervisedChild) {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => {
+            let _ = rt.block_on(supervise::terminate(&mut child, Duration::ZERO));
+        }
+        // No runtime to wait with: signal what can still be proven ours, and
+        // leave the reap to `kill_on_drop`.
+        Err(_) => {
+            let _ = supervise::kill_recorded(&child.identity);
         }
     }
 }

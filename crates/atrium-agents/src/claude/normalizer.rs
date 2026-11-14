@@ -929,6 +929,10 @@ impl ClaudeNormalizer {
                 && !question
                 && self.seen_calls.insert(id.clone())
             {
+                // Inside an established session and an open turn, like any
+                // other call (round 3, minor 6): never held, so never split.
+                self.establish(out);
+                self.ensure_turn(out);
                 self.oversize_call(&id, &name, out);
             }
             return;

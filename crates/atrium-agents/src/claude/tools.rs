@@ -164,11 +164,14 @@ fn canonical_json(v: &Value, out: &mut String) {
 ///   string, the subject is `Unknown`.
 /// - `Glob` needs a `pattern`; `Grep` needs its regex `pattern` (a string)
 ///   and may carry a `glob` filter. Any present-but-bad field is `Unknown`.
-/// - A glob that leaves the root (absolute, `~`, or with `..`, however it is
-///   spelled with braces and classes) puts, besides the root, the directory
-///   it points into and the whole pattern joined to the root in `paths`: the
-///   policy then sees the directory, and runs its own glob matching on the
-///   pattern. One that can't be bounded is `Unknown`.
+/// - The glob follows a small grammar ([`in_grammar`]); anything outside it,
+///   and a root that starts with `~` other than as `~` or `~/…`, is
+///   `Unknown`.
+/// - Every brace expansion with a `/` in it is joined to the root and put in
+///   `paths`, so the policy's own checks see the whole pattern (a credential
+///   glob of more than one component can stay inside its root). One that
+///   leaves the root (absolute, `~`, or with `..`) also puts the directory it
+///   points into there.
 fn search_subject(input: &Value, glob_key: &str, glob_is_required: bool) -> ToolSubject {
     // Both tools need a `pattern` (Glob: the glob itself; Grep: the regex).
     if !matches!(input.get("pattern"), Some(Value::String(p)) if !p.is_empty()) {
@@ -176,7 +179,7 @@ fn search_subject(input: &Value, glob_key: &str, glob_is_required: bool) -> Tool
     }
     let base = match input.get("path") {
         None => ".".to_owned(),
-        Some(Value::String(p)) if !p.is_empty() => p.clone(),
+        Some(Value::String(p)) if !p.is_empty() && tilde_ok(p) => p.clone(),
         Some(_) => return ToolSubject::Unknown,
     };
     let glob = match input.get(glob_key) {
@@ -207,66 +210,126 @@ fn search_subject(input: &Value, glob_key: &str, glob_is_required: bool) -> Tool
 /// on.
 const MAX_EXPANSIONS: usize = 32;
 
-/// Where a glob that leaves its base points: nothing extra if every way it
-/// can be spelled stays inside the base; `None` if that can't be told.
-///
-/// Conservative: braces are expanded (bounded), a character class that could
-/// stand for `.`, `/` or `~`, or be negated, is not understood, and so is a
-/// backslash.
+/// What a glob needs in `paths` besides the base (see [`glob_target`]), or
+/// `None` if it is outside the grammar or can't be bounded.
 fn glob_targets(base: &str, glob: &str) -> Option<Vec<String>> {
-    // On Unix a backslash escapes: too subtle to bound.
-    if glob.contains('\\') || !classes_are_plain(glob) {
+    if !in_grammar(glob) {
         return None;
     }
     let mut out = Vec::new();
     for e in expand_braces(glob)? {
-        out.extend(glob_target(base, &e)?);
+        for p in glob_target(base, &e)? {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        if out.len() > MAX_TARGETS {
+            return None;
+        }
     }
     Some(out)
 }
 
-/// Every `[...]` class is closed, not negated, and holds nothing that can be
-/// `.`, `/` or `~` (nor a range that spans `.` and `/`, nor `[:class:]`).
-fn classes_are_plain(glob: &str) -> bool {
-    let mut chars = glob.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '[' {
-            continue;
-        }
-        let mut closed = false;
-        let mut first = true;
-        let mut prev: Option<char> = None;
-        let mut in_range = false;
-        for c in chars.by_ref() {
-            if c == ']' && !first {
-                closed = true;
-                break;
+/// Most entries a glob may add to `paths` before it is given up on.
+const MAX_TARGETS: usize = 64;
+
+/// A path may start with `~` only as `~` or `~/…`: `~user`, `~*` and the
+/// like may be another user's home, which the policy can't place.
+fn tilde_ok(s: &str) -> bool {
+    !s.starts_with('~') || s == "~" || s.starts_with("~/")
+}
+
+/// The grammar of a `Glob` pattern or a `Grep` glob we understand (the
+/// escalation, D-071), checked on the raw pattern before any expansion, so
+/// braces and classes can't be interleaved to make something else once
+/// expanded:
+///
+/// - no backslash (on Unix it escapes);
+/// - `~` only as [`tilde_ok`] allows;
+/// - a brace group `{…}` holds only ASCII letters, digits, `_`, `-`, `.`
+///   and `,`: no nested group, no empty alternative, no alternative that is
+///   `.` or `..` (so no expansion can make a `..` segment, a `/` or a `~`);
+/// - a class `[…]` holds only ASCII letters, digits, `_`, and ranges within
+///   one of `a-z`, `A-Z`, `0-9` (low to high): no negation, no `[:class:]`,
+///   nothing that can be `.`, `/` or `~`;
+/// - any other `{`, `}`, `[` or `]` is outside it.
+fn in_grammar(glob: &str) -> bool {
+    if glob.contains('\\') || !tilde_ok(glob) {
+        return false;
+    }
+    let chars: Vec<char> = glob.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let body = match chars[i] {
+            '{' => brace_body(&chars[i + 1..]),
+            '[' => class_body(&chars[i + 1..]),
+            '}' | ']' => return false,
+            _ => {
+                i += 1;
+                continue;
             }
-            if first && matches!(c, '!' | '^') {
-                return false;
-            }
-            if matches!(c, '.' | '/' | '~' | '[' | ':') {
-                return false;
-            }
-            if in_range {
-                if let Some(lo) = prev
-                    && lo <= '/'
-                    && c >= '.'
-                {
-                    return false;
-                }
-                in_range = false;
-            } else if c == '-' && prev.is_some() {
-                in_range = true;
-            }
-            prev = Some(c);
-            first = false;
-        }
-        if !closed {
+        };
+        let Some(len) = body else {
             return false;
-        }
+        };
+        // The opening character, the body and the closing one.
+        i += len + 2;
     }
     true
+}
+
+/// The length of a brace group's body (what follows `{`, up to its `}`), if
+/// the group is in the grammar.
+fn brace_body(rest: &[char]) -> Option<usize> {
+    let end = rest.iter().position(|&c| c == '}')?;
+    let body = &rest[..end];
+    if !body
+        .iter()
+        .all(|&c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ','))
+    {
+        return None;
+    }
+    let text: String = body.iter().collect();
+    text.split(',')
+        .all(|alt| !matches!(alt, "" | "." | ".."))
+        .then_some(end)
+}
+
+/// The length of a class's body (what follows `[`, up to its `]`), if the
+/// class is in the grammar.
+fn class_body(rest: &[char]) -> Option<usize> {
+    let end = rest.iter().position(|&c| c == ']')?;
+    let body = &rest[..end];
+    if body.is_empty() {
+        return None;
+    }
+    let one_of = |lo: char, hi: char| {
+        lo <= hi
+            && [
+                char::is_ascii_lowercase,
+                char::is_ascii_uppercase,
+                char::is_ascii_digit,
+            ]
+            .iter()
+            .any(|f| f(&lo) && f(&hi))
+    };
+    let mut k = 0;
+    while k < body.len() {
+        let c = body[k];
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        if body.get(k + 1) == Some(&'-') {
+            // A range: its end is there and in the same run as `c`.
+            if !one_of(c, *body.get(k + 2)?) {
+                return None;
+            }
+            k += 3;
+        } else {
+            k += 1;
+        }
+    }
+    Some(end)
 }
 
 /// All the strings a glob's braces stand for (nested groups included), or
@@ -323,9 +386,15 @@ fn expand_braces(glob: &str) -> Option<Vec<String>> {
     Some(all)
 }
 
-/// What one brace-free glob needs besides the base: nothing if it stays
-/// inside it; the directory it points into and the pattern joined to the
-/// base if it doesn't. `None` if it can't be bounded.
+/// What one brace-free glob needs besides the base:
+///
+/// - inside the base: nothing for a single component (the policy matches it
+///   against file names), the pattern joined to the base for more than one
+///   (round 3, major 3: `.ssh/id_ed25519` from the home stays inside it);
+/// - leaving it: the directory it points into and the pattern joined to the
+///   base.
+///
+/// `None` if it can't be bounded.
 fn glob_target(base: &str, glob: &str) -> Option<Vec<String>> {
     const WILDCARDS: [char; 3] = ['*', '?', '['];
     let first = glob.find(WILDCARDS);
@@ -335,10 +404,6 @@ fn glob_target(base: &str, glob: &str) -> Option<Vec<String>> {
     if climbs(rest) {
         return None;
     }
-    let leaves = prefix.starts_with('/') || prefix.starts_with('~') || climbs(prefix);
-    if !leaves {
-        return Some(vec![]);
-    }
     let join = |p: &str| {
         if p.starts_with('/') || p.starts_with('~') {
             p.to_owned()
@@ -346,16 +411,81 @@ fn glob_target(base: &str, glob: &str) -> Option<Vec<String>> {
             format!("{}/{}", base.trim_end_matches('/'), p)
         }
     };
+    let leaves = prefix.starts_with('/') || prefix.starts_with('~') || climbs(prefix);
+    if !leaves {
+        return if glob.contains('/') {
+            pattern_forms(&join(glob))
+        } else {
+            Some(vec![])
+        };
+    }
     if first.is_none() {
         // No wildcard: the whole thing is the target.
-        return Some(vec![join(glob)]);
+        return pattern_forms(&join(glob));
     }
     let dir = match prefix.rfind('/') {
         Some(i) => &prefix[..=i],
         None if prefix.starts_with('~') => "~",
         None => "",
     };
-    Some(vec![join(dir), join(glob)])
+    let mut out = vec![join(dir)];
+    out.extend(pattern_forms(&join(glob))?);
+    Some(out)
+}
+
+/// Most components of one pattern that start with a wildcard (each doubles
+/// the forms [`pattern_forms`] gives).
+const MAX_WILD_COMPONENTS: usize = 4;
+
+/// The forms of a pattern joined to the base that go into `paths`, so the
+/// policy sees every file the tool's glob can match (the escalation's
+/// exhaustive test). The policy matches a `paths` entry as the shell does:
+/// `*`, `?` or a class never match a leading `.`, and an empty component
+/// matches nothing; the tool's glob has neither rule (`~/*` lists
+/// `~/.netrc`, `..//*` is `../*`). So:
+///
+/// - empty and `.` components are dropped (`a//./b` is `a/b`; a trailing
+///   `/` too, which can only make the match wider);
+/// - unless the pattern has a `**` (the policy then matches it as a whole,
+///   and a dot is not special), every way of putting a `.` in front of the
+///   components that start with a wildcard is added (`~/*` also gives
+///   `~/.*`).
+///
+/// `None` (the subject is then `Unknown`) past [`MAX_WILD_COMPONENTS`].
+fn pattern_forms(joined: &str) -> Option<Vec<String>> {
+    let root = if joined.starts_with('/') { "/" } else { "" };
+    let parts: Vec<&str> = joined
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let wild: Vec<usize> = if joined.contains("**") {
+        vec![]
+    } else {
+        (0..parts.len())
+            .filter(|&i| parts[i].starts_with(['*', '?', '[']))
+            .collect()
+    };
+    if wild.len() > MAX_WILD_COMPONENTS {
+        return None;
+    }
+    let forms = (0..1u32 << wild.len())
+        .map(|mask| {
+            let body: Vec<String> = parts
+                .iter()
+                .enumerate()
+                .map(|(i, c)| match wild.iter().position(|&w| w == i) {
+                    Some(bit) if mask & (1 << bit) != 0 => format!(".{c}"),
+                    _ => (*c).to_owned(),
+                })
+                .collect();
+            match format!("{root}{}", body.join("/")) {
+                // `./` and the like: the base itself.
+                empty if empty.is_empty() => ".".to_owned(),
+                form => form,
+            }
+        })
+        .collect();
+    Some(forms)
 }
 
 #[cfg(test)]

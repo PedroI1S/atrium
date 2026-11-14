@@ -21,7 +21,9 @@
 //! `eof-flood` (an open turn, then thousands of records after stdin closes),
 //! and the round-2 mode `id-clash` (a hook call that reuses the request id of
 //! an open `can_use_tool`, after the file `go_on` appears; every answer is
-//! logged to `responses.jsonl`).
+//! logged to `responses.jsonl`), and the escalation's `leader-exits` (with
+//! `FAKE_GRANDCHILD`: the leader exits before the handshake, its child
+//! stays).
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Write};
@@ -76,6 +78,11 @@ fn main() {
     if mode == "exit" {
         eprintln!("fake claude: refusing to start");
         std::process::exit(3);
+    }
+    if mode == "leader-exits" {
+        // Escalation (round 3, minor 5): the leader exits at once, leaving
+        // its `FAKE_GRANDCHILD` (which holds stdout open) in the group.
+        std::process::exit(0);
     }
     let session_id = "fake-session-1";
     let flooding = Arc::new(AtomicBool::new(false));

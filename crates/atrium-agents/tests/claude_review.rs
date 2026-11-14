@@ -518,8 +518,11 @@ fn f2_a_glob_pattern_that_leaves_the_base_names_its_target() {
     // Tilde.
     let paths = paths_of(&subject("Glob", json!({"pattern":"~/.ssh/*"})));
     assert!(paths.contains(&"~/.ssh/".to_owned()), "{paths:?}");
-    let paths = paths_of(&subject("Glob", json!({"pattern":"~*"})));
-    assert!(paths.contains(&"~".to_owned()), "{paths:?}");
+    // `~*` could be any user's home (round 3, blocker 2).
+    assert_eq!(
+        subject("Glob", json!({"pattern":"~*"})),
+        ToolSubject::Unknown
+    );
 
     // Climbing out of the base: joined to it, for the policy to resolve.
     let paths = paths_of(&subject(
@@ -531,12 +534,13 @@ fn f2_a_glob_pattern_that_leaves_the_base_names_its_target() {
         "{paths:?}"
     );
 
-    // A pattern inside the base adds nothing.
+    // A pattern inside the base adds each expansion with a `/`, joined to
+    // the base (escalation, round 3 major 3; it used to add nothing).
     let s = subject("Glob", json!({"path":"src","pattern":"**/*.{rs,toml}"}));
     assert_eq!(
         s,
         ToolSubject::Paths {
-            paths: vec!["src".into()],
+            paths: vec!["src".into(), "src/**/*.rs".into(), "src/**/*.toml".into()],
             glob: Some("**/*.{rs,toml}".into()),
             recursive: true
         }
@@ -607,7 +611,8 @@ fn f2_a_grep_glob_that_leaves_the_path_names_its_target_too() {
     assert_eq!(
         subject("Grep", json!({"pattern":"k","glob":"../../x/**"})),
         ToolSubject::Paths {
-            paths: vec![".".into(), "./../../x/".into(), "./../../x/**".into()],
+            // The pattern's `.` component is dropped (escalation).
+            paths: vec![".".into(), "./../../x/".into(), "../../x/**".into()],
             glob: Some("../../x/**".into()),
             recursive: true
         }
@@ -660,17 +665,17 @@ fn item8_subjects_of_the_tools_without_a_dedicated_one_are_pinned() {
     ));
 }
 
-/// Braces that hide a root or a tilde are expanded, and the target named
-/// (round 2: they used to be `Unknown`).
+/// Braces that hide a root or a tilde. Round 2 expanded them and named the
+/// target; since the escalation (D-071) a brace group may hold only
+/// letters, digits, `_`, `-`, `.` and `,`, so they are `Unknown`.
 #[test]
-fn f2_braces_that_hide_a_root_are_expanded_and_the_target_named() {
-    for (pattern, target) in [
-        ("{/etc/passwd,x}", "/etc/passwd"),
-        ("{a,/etc/passwd}", "/etc/passwd"),
-        ("{~/x,y}", "~/x"),
-    ] {
-        let paths = paths_of(&subject("Glob", json!({"path":"/work","pattern":pattern})));
-        assert!(paths.contains(&target.to_owned()), "{pattern}: {paths:?}");
+fn f2_braces_that_hide_a_root_are_unknown() {
+    for pattern in ["{/etc/passwd,x}", "{a,/etc/passwd}", "{~/x,y}"] {
+        assert_eq!(
+            subject("Glob", json!({"path":"/work","pattern":pattern})),
+            ToolSubject::Unknown,
+            "{pattern}"
+        );
     }
 }
 
@@ -912,4 +917,255 @@ fn r2_a_late_assistant_record_does_not_complete_a_closed_message_again() {
         )
     });
     assert_eq!(evs.len(), 1, "{evs:?}");
+}
+
+// ---- escalation (D-071), round 3 minor 6: an oversize `can_use_tool` ----
+
+/// Every tool call starts and finishes inside an open turn of an established
+/// session, and finishes only after it started.
+fn assert_calls_inside_turns(evs: &[AgentEvent]) {
+    let mut session = false;
+    let mut turn_open = false;
+    let mut started: Vec<String> = vec![];
+    for e in evs {
+        match e {
+            AgentEvent::SessionStarted { .. } => session = true,
+            AgentEvent::TurnStarted { .. } => turn_open = true,
+            AgentEvent::TurnCompleted { .. } => turn_open = false,
+            AgentEvent::ToolCallStarted { call_id, .. } => {
+                assert!(session && turn_open, "{e:?} outside a turn: {evs:?}");
+                started.push(call_id.clone());
+            }
+            AgentEvent::ToolCallFinished { call_id, .. } => {
+                assert!(session && turn_open, "{e:?} outside a turn: {evs:?}");
+                assert!(started.contains(call_id), "{e:?} never started: {evs:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Variant A of the review: between turns.
+#[test]
+fn r3_an_oversize_can_use_tool_between_turns_is_shown_inside_a_turn() {
+    let mut n = ClaudeNormalizer::new();
+    let mut evs = run(
+        &mut n,
+        vec![user_line("go"), init(), message_start(), result()],
+    );
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })),
+        "{evs:?}"
+    );
+    evs.extend(run(
+        &mut n,
+        vec![can_use("r1", Some("toolu_big"), "Edit", big_input())],
+    ));
+    small_events(&evs);
+    assert!(
+        evs.iter().any(
+            |e| matches!(e, AgentEvent::ToolCallStarted { call_id, .. } if call_id == "toolu_big")
+        ),
+        "the call is not shown: {evs:?}"
+    );
+    assert_calls_inside_turns(&evs);
+}
+
+/// Variant B: before the session started, followed by enough waiting noise
+/// to overflow what is held for it.
+#[test]
+fn r3_an_oversize_can_use_tool_before_init_is_never_split_by_what_waits() {
+    use atrium_protocol::limits::MAX_DIAGNOSTIC_LINES;
+    let mut n = ClaudeNormalizer::new();
+    let mut inputs = vec![
+        user_line("go"),
+        can_use("r1", Some("toolu_big"), "Edit", big_input()),
+    ];
+    for i in 0..MAX_DIAGNOSTIC_LINES - 1 {
+        inputs.push(out(json!({"type":"system","subtype":format!("noise_{i}")})));
+    }
+    inputs.push(message_start());
+    let evs = run(&mut n, inputs);
+    small_events(&evs);
+    assert_well_opened(&evs);
+    let calls: Vec<&AgentEvent> = evs
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::ToolCallStarted { .. } | AgentEvent::ToolCallFinished { .. }
+            )
+        })
+        .collect();
+    assert_eq!(calls.len(), 2, "{evs:?}");
+    assert_calls_inside_turns(&evs);
+}
+
+// ---- escalation (D-071), item 1: the subject grammar of Glob and Grep ----
+
+/// Outside the grammar: `Unknown`, as a `Glob` pattern, as a `Grep` glob,
+/// and (for the tilde rules) as the base.
+#[test]
+fn r3_globs_outside_the_grammar_are_unknown() {
+    let patterns = [
+        // Backslash.
+        "a\\*",
+        // Tilde: only `~` or `~/...`.
+        "~bob/*",
+        "~bob",
+        "~*",
+        "~?na/x",
+        "~a*/.ssh/id_ed25519",
+        "~[a]/x",
+        "~{a,b}/x",
+        // Braces.
+        "{a,}",
+        "{,a}",
+        "{a,,b}",
+        "{}",
+        "{a}x}",
+        "{a,b",
+        "a}",
+        "}{",
+        "{a,{b,c}}",
+        "{.,a}/x",
+        "{..,a}/x",
+        "{a,..}/x",
+        "{a/b,c}",
+        "{~,a}/x",
+        "{a,*}",
+        "{a,[b]}",
+        "{a,b c}",
+        "{a,\u{e9}}",
+        // Classes.
+        "[!a]",
+        "[^a]",
+        "[]a]",
+        "[]",
+        "[a",
+        "a]",
+        "[[:alpha:]]",
+        "[:a]",
+        "[.]",
+        "[/]",
+        "[~]",
+        "[a-Z]",
+        "[z-a]",
+        "[A-z]",
+        "[0-a]",
+        "[a-]",
+        "[-a]",
+        "[a-b-c]",
+        "[+-0]",
+        "[}-\u{7f}]",
+        "[{a],.}]",
+        "[a*]",
+        "[a{]",
+        "[\u{e9}]",
+        // Blocker 1's interleaving.
+        "[{a],.}][{a],.}]/.ssh/id_ed25519",
+        "[{a],/}]/etc/passwd",
+        "[{a],~}]/.ssh/id_ed25519",
+    ];
+    for p in patterns {
+        assert_eq!(
+            subject("Glob", json!({"path":"/work","pattern":p})),
+            ToolSubject::Unknown,
+            "Glob {p:?}"
+        );
+        assert_eq!(
+            subject("Grep", json!({"path":"/work","pattern":"k","glob":p})),
+            ToolSubject::Unknown,
+            "Grep {p:?}"
+        );
+    }
+    for base in ["~bob", "~*", "~bob/x", "~?", "~ana"] {
+        assert_eq!(
+            subject("Glob", json!({"path":base,"pattern":"*.rs"})),
+            ToolSubject::Unknown,
+            "base {base:?}"
+        );
+        assert_eq!(
+            subject("Grep", json!({"path":base,"pattern":"k"})),
+            ToolSubject::Unknown,
+            "Grep base {base:?}"
+        );
+    }
+}
+
+/// Inside the grammar: understood. A brace-free pattern without `/` adds
+/// nothing to the base; every expansion with a `/` is joined to it.
+#[test]
+fn r3_globs_inside_the_grammar_name_every_expansion_with_a_slash() {
+    let cases: &[(&str, &[&str])] = &[
+        ("*.rs", &[]),
+        ("*.[ch]", &[]),
+        ("*.[a-z]", &[]),
+        ("file-[0-9].rs", &[]),
+        ("[A-Za-z_0-9]*", &[]),
+        ("*.{ts,tsx}", &[]),
+        ("*.{d.ts,ts}", &[]),
+        ("{a-b,c_d}", &[]),
+        ("**/*.rs", &["/work/**/*.rs"]),
+        ("src/**/mod.rs", &["/work/src/**/mod.rs"]),
+        (
+            "src/{a,b}/mod.rs",
+            &["/work/src/a/mod.rs", "/work/src/b/mod.rs"],
+        ),
+        (".ssh/id_ed25519", &["/work/.ssh/id_ed25519"]),
+        (".aws/cred*", &["/work/.aws/cred*"]),
+        (".{ssh,x}/id_*", &["/work/.ssh/id_*", "/work/.x/id_*"]),
+        // Leaving the base keeps what round 2 gives it.
+        ("~", &["~"]),
+        // A component that starts with a wildcard is also given with a dot
+        // in front (the policy's `*` skips a leading dot; the tool's does
+        // not); empty and `.` components are dropped.
+        ("~/.ssh/*", &["~/.ssh/", "~/.ssh/*", "~/.ssh/.*"]),
+        (
+            "*//*a",
+            &["/work/*/*a", "/work/.*/*a", "/work/*/.*a", "/work/.*/.*a"],
+        ),
+        ("./x/./y/", &["/work/x/y"]),
+        ("../.aws/cred*", &["/work/../.aws/", "/work/../.aws/cred*"]),
+        ("/etc/pass*", &["/etc/", "/etc/pass*"]),
+    ];
+    for (pattern, extra) in cases {
+        let mut want = vec!["/work".to_owned()];
+        want.extend(extra.iter().map(|s| (*s).to_owned()));
+        assert_eq!(
+            subject("Glob", json!({"path":"/work","pattern":pattern})),
+            ToolSubject::Paths {
+                paths: want,
+                glob: Some((*pattern).into()),
+                recursive: true
+            },
+            "{pattern}"
+        );
+    }
+    // `~` and `~/...` are fine as a base.
+    for base in ["~", "~/work"] {
+        assert!(
+            matches!(
+                subject("Glob", json!({"path":base,"pattern":"*.rs"})),
+                ToolSubject::Paths { .. }
+            ),
+            "{base}"
+        );
+    }
+    // The 32-expansion cap stays.
+    assert_eq!(
+        subject(
+            "Glob",
+            json!({"path":"/work","pattern":"{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}"})
+        ),
+        ToolSubject::Unknown
+    );
+    assert!(matches!(
+        subject(
+            "Glob",
+            json!({"path":"/work","pattern":"{a,b}{a,b}{a,b}{a,b}{a,b}"})
+        ),
+        ToolSubject::Paths { .. }
+    ));
 }
