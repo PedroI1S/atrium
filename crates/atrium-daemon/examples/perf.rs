@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atrium_protocol::PROTOCOL_VERSION;
 use atrium_protocol::agent::SessionCommand;
@@ -274,10 +274,65 @@ fn argument(name: &str, default: u64) -> u64 {
     default
 }
 
+struct SnapshotInfo {
+    name: String,
+    bytes: u64,
+    modified: SystemTime,
+}
+
+/// Waits for `upkeep::snapshot_daily`'s first snapshot to appear and settle.
+async fn wait_for_snapshot(dir: &Path, timeout: Duration) -> Result<SnapshotInfo, Failure> {
+    let deadline = Instant::now() + timeout;
+    let mut stable: Option<(String, u64, SystemTime, u8)> = None;
+    loop {
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for the first daily snapshot".into());
+        }
+        let newest = std::fs::read_dir(dir).ok().and_then(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let meta = e.metadata().ok()?;
+                    if !meta.is_file() || meta.len() == 0 {
+                        return None;
+                    }
+                    let modified = meta.modified().ok()?;
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    Some((name, meta.len(), modified))
+                })
+                .max_by_key(|(_, _, modified)| *modified)
+        });
+        match (newest, &mut stable) {
+            (Some((name, bytes, modified)), Some((s_name, s_bytes, s_mod, count)))
+                if name == *s_name && bytes == *s_bytes && modified == *s_mod =>
+            {
+                *count += 1;
+                if *count >= 4 {
+                    // Let `record_snapshot` finish writing to SQLite after `VACUUM INTO`.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    return Ok(SnapshotInfo {
+                        name,
+                        bytes,
+                        modified,
+                    });
+                }
+            }
+            (Some((name, bytes, modified)), _) => {
+                stable = Some((name, bytes, modified, 1));
+            }
+            (None, _) => {
+                stable = None;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
     let tokens = argument("--tokens", 3_000_000);
     let idle_secs = argument("--idle-secs", 60);
+    let daemon_started = Instant::now();
     let daemon = start_daemon()?;
     let pid = daemon.child.id();
     let socket = daemon.socket();
@@ -346,7 +401,7 @@ async fn main() -> Result<(), Failure> {
         ms(runs[runs.len() - 1])
     );
 
-    // ---- Close, then idle ----
+    // ---- Close, wait for the first daily snapshot, then idle ----
     close(&mut wire, &large.thread_id).await?;
     close(&mut wire, &small.thread_id).await?;
     drop(wire);
@@ -356,7 +411,35 @@ async fn main() -> Result<(), Failure> {
         mib(after_close),
         mib(high_water)
     );
-    println!("idle for {idle_secs} s…");
+    let snapshot = wait_for_snapshot(
+        &daemon.home.path().join("snapshots"),
+        Duration::from_secs(180),
+    )
+    .await?;
+    let window_start = SystemTime::now();
+    let snapshot_ms = snapshot
+        .modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let window_ms = window_start
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let (after_snapshot, high_water_snapshot) = rss_kib(pid);
+    println!(
+        "snapshot finished: {} ({:.0} MiB, modified {} ms); RSS {:.1} MiB (peak {:.1} MiB)",
+        snapshot.name,
+        snapshot.bytes as f64 / (1024.0 * 1024.0),
+        snapshot_ms,
+        mib(after_snapshot),
+        mib(high_water_snapshot)
+    );
+    println!(
+        "idle window starts at {} ms ({:.1} s after daemon start), waiting {idle_secs} s…",
+        window_ms,
+        daemon_started.elapsed().as_secs_f64()
+    );
     tokio::time::sleep(Duration::from_secs(idle_secs)).await;
     let mut samples = Vec::new();
     for _ in 0..10 {
@@ -369,7 +452,7 @@ async fn main() -> Result<(), Failure> {
         .collect();
     samples.sort_unstable();
     println!(
-        "idle RSS, 10 samples from {idle_secs} s after the last activity: median {:.1} MiB, max {:.1} MiB [{}]",
+        "idle RSS, 10 samples from {idle_secs} s after the last activity (snapshot included): median {:.1} MiB, max {:.1} MiB [{}]",
         mib((samples[4] + samples[5]) / 2),
         mib(samples[9]),
         shown.join(", ")

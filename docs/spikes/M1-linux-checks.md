@@ -70,31 +70,94 @@ Read from the code and the tests (`cfg(target_os = "linux")` blocks and the Linu
 ## Daemon
 
 ### L8: idle memory (contract §14, "Daemon idle RSS < 50 MB")
-Command, three times in a row on the same build:
+Command, three times in a row on the same build (2026-11-14):
 
 ```text
 cargo build --profile perf -p atrium-daemon --bin atriumd --example perf
-target/perf/examples/perf          # --tokens 3000000 --idle-secs 60 are the defaults
+cargo run --profile perf -p atrium-daemon --example perf   # --tokens 3000000 --idle-secs 60 are the defaults
 ```
 
-(`target/l8.sh` runs it three times and keeps each run's output.) `perf` starts `atriumd` in a temporary home, loads a 100,000-token synthetic session, replays it three times, loads a 3,000,000-token one, reconnects with a cursor 1,000 events behind 20 times, closes both sessions and drops the clients, waits 60 s, then takes 10 RSS samples 1 s apart. `perf.rs` already did this; the one change is that it also prints the RSS and the process's peak (`VmHWM`) right after the load.
+The earlier L8 window (`perf.rs` before fix round 1) held the daemon's first daily `VACUUM INTO` snapshot (`upkeep::snapshot_daily` fires 60 s after daemon start, ~42 s into the wait), so the 10 samples were taken ~15 s after the snapshot rather than >= 60 s after the last activity. `perf.rs` now waits for the first daily snapshot to finish before starting the 60 s idle window, and prints the snapshot's `modified` timestamp and the idle window's start timestamp as evidence.
+
+Load average before each run: not recorded (`cat /proc/loadavg` and `uptime` were denied by the worker command policy).
 
 | | Run 1 | Run 2 | Run 3 |
 |---|---|---|---|
-| RSS at start | 9.1 MiB | 9.1 MiB | 9.1 MiB |
-| 3M-token load: stored in | 15.1 s (198,555 events/s) | 15.1 s (198,553 events/s) | 15.1 s (198,598 events/s) |
-| Peak RSS during the load (sampled every 250 ms) | 15.3 MiB | 15.3 MiB | 15.4 MiB |
-| Process peak (`VmHWM`) right after the load | 15.3 MiB | 15.3 MiB | 15.4 MiB |
-| RSS right after the sessions closed; process peak | 15.3 MiB; 15.3 MiB | 15.3 MiB; 15.3 MiB | 15.5 MiB; 15.5 MiB |
-| **Idle RSS, median of 10 samples, 60 s after the last activity** | **18.5 MiB** | **18.4 MiB** | **18.5 MiB** |
-| Idle RSS, max of the 10 | 18.5 MiB | 18.4 MiB | 18.5 MiB |
-| Store file | 839 MiB | 839 MiB | 839 MiB |
-| 100k replay (3 runs) | 200.5, 206.6, 188.1 ms | 178.2, 161.0, 157.6 ms | 175.3, 158.7, 164.2 ms |
-| Reconnect, 1,000 events behind, 20 runs: min / median / p95 / max | 2.56 / 3.53 / 6.45 / 7.23 ms | 2.13 / 2.61 / 3.33 / 3.62 ms | 2.15 / 3.31 / 6.74 / 7.70 ms |
+| RSS at start | 9.0 MiB | 9.0 MiB | 9.1 MiB |
+| 3M-token load: stored in | 15.1 s (198,771 events/s) | 15.4 s (195,439 events/s) | 15.1 s (198,627 events/s) |
+| Peak RSS during the load (sampled every 250 ms) | 15.2 MiB | 15.5 MiB | 15.4 MiB |
+| Process peak (`VmHWM`) right after the load | 15.2 MiB | 15.5 MiB | 15.4 MiB |
+| RSS right after the sessions closed; process peak | 15.2 MiB; 15.2 MiB | 15.5 MiB; 15.5 MiB | 15.4 MiB; 15.4 MiB |
+| RSS after first daily snapshot (`VACUUM INTO`); process peak | 18.4 MiB; 18.4 MiB | 18.6 MiB; 18.6 MiB | 18.6 MiB; 18.6 MiB |
+| **Idle RSS, median of 10 samples, 60 s after the last activity (snapshot included)** | **18.4 MiB** | **18.6 MiB** | **18.6 MiB** |
+| Idle RSS, max of the 10 | 18.4 MiB | 18.6 MiB | 18.6 MiB |
+| Store file / snapshot file | 838 MiB / 811 MiB | 839 MiB / 811 MiB | 838 MiB / 811 MiB |
+| 100k replay (3 runs) | 178.0, 166.2, 161.6 ms | 189.0, 164.1, 157.6 ms | 174.5, 191.1, 188.0 ms |
+| Reconnect, cursor 1,000 behind, 20 runs: min / median / p95 / max | 2.39 / 2.77 / 3.23 / 3.41 ms | 1.95 / 2.54 / 3.74 / 3.81 ms | 2.17 / 2.83 / 3.81 / 3.82 ms |
 
-**Gate: median < 50 MB. Met in all three runs (18.4 to 18.5 MiB, which is 19.3 to 19.4 MB).** M1-05's single run, before the review fixes, gave 19.4 MiB, so there is no regression.
+**Gate: median < 50 MB. Met in all three runs (18.4 to 18.6 MiB, which is 19.3 to 19.5 MB).**
 
-Observation: the idle RSS (18.5 MiB) is about 3 MiB above the process peak recorded when the sessions closed (15.3 MiB), and the 10 idle samples are flat. Something grows the resident set by about 3 MiB in the first 60 s after the work ends (not found; nothing in this task looks into it). It is far from the gate.
+Raw output lines:
+
+Run 1:
+```text
+daemon pid 1599322, RSS at start 9.0 MiB
+
+100k-token thread: stored in 0.76 s
+full replay, run 1: 100005 events in 178.0 ms (561785 events/s)
+full replay, run 2: 100005 events in 166.2 ms (601838 events/s)
+full replay, run 3: 100005 events in 161.6 ms (618937 events/s)
+
+3000000-token thread: stored in 15.1 s (198771 events/s), peak RSS during the load 15.2 MiB (sampled every 250 ms), RSS right after 15.2 MiB, the process's peak so far 15.2 MiB
+
+reconnect, cursor 1,000 behind, 20 runs: min 2.39 ms, median 2.77 ms, p95 3.23 ms, max 3.41 ms
+
+sessions closed, clients gone: RSS 15.2 MiB (the process's peak so far 15.2 MiB)
+snapshot finished: atrium-20261114-160525-980.db (811 MiB, modified 1794672326632 ms); RSS 18.4 MiB (peak 18.4 MiB)
+idle window starts at 1794672328513 ms (62.5 s after daemon start), waiting 60 s…
+idle RSS, 10 samples from 60 s after the last activity (snapshot included): median 18.4 MiB, max 18.4 MiB [18.4, 18.4, 18.4, 18.4, 18.4, 18.4, 18.4, 18.4, 18.4, 18.4]
+store file: 838 MiB
+```
+
+Run 2:
+```text
+daemon pid 1601922, RSS at start 9.0 MiB
+
+100k-token thread: stored in 0.76 s
+full replay, run 1: 100005 events in 189.0 ms (529192 events/s)
+full replay, run 2: 100005 events in 164.1 ms (609368 events/s)
+full replay, run 3: 100005 events in 157.6 ms (634662 events/s)
+
+3000000-token thread: stored in 15.4 s (195439 events/s), peak RSS during the load 15.5 MiB (sampled every 250 ms), RSS right after 15.5 MiB, the process's peak so far 15.5 MiB
+
+reconnect, cursor 1,000 behind, 20 runs: min 1.95 ms, median 2.54 ms, p95 3.74 ms, max 3.81 ms
+
+sessions closed, clients gone: RSS 15.5 MiB (the process's peak so far 15.5 MiB)
+snapshot finished: atrium-20261114-160743-701.db (811 MiB, modified 1794672464979 ms); RSS 18.6 MiB (peak 18.6 MiB)
+idle window starts at 1794672466769 ms (63.1 s after daemon start), waiting 60 s…
+idle RSS, 10 samples from 60 s after the last activity (snapshot included): median 18.6 MiB, max 18.6 MiB [18.6, 18.6, 18.6, 18.6, 18.6, 18.6, 18.6, 18.6, 18.6, 18.6]
+store file: 839 MiB
+```
+
+Run 3:
+```text
+daemon pid 1616017, RSS at start 9.1 MiB
+
+100k-token thread: stored in 0.76 s
+full replay, run 1: 100005 events in 174.5 ms (573201 events/s)
+full replay, run 2: 100005 events in 191.1 ms (523328 events/s)
+full replay, run 3: 100005 events in 188.0 ms (532063 events/s)
+
+3000000-token thread: stored in 15.1 s (198627 events/s), peak RSS during the load 15.4 MiB (sampled every 250 ms), RSS right after 15.4 MiB, the process's peak so far 15.4 MiB
+
+reconnect, cursor 1,000 behind, 20 runs: min 2.17 ms, median 2.83 ms, p95 3.81 ms, max 3.82 ms
+
+sessions closed, clients gone: RSS 15.4 MiB (the process's peak so far 15.4 MiB)
+snapshot finished: atrium-20261114-161001-285.db (811 MiB, modified 1794672602715 ms); RSS 18.6 MiB (peak 18.6 MiB)
+idle window starts at 1794672604651 ms (63.4 s after daemon start), waiting 60 s…
+idle RSS, 10 samples from 60 s after the last activity (snapshot included): median 18.6 MiB, max 18.6 MiB [18.6, 18.6, 18.6, 18.6, 18.6, 18.6, 18.6, 18.6, 18.6, 18.6]
+store file: 838 MiB
+```
 
 ## App (M1-14b)
 
