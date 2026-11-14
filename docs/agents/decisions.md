@@ -457,3 +457,15 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
   - Argon's reviews of M1-15, of M1-14a's re-review if still open, and of M1-13's re-review go to Hydrogen.
 - **Rodrigo's shifts keep his own routing** (D-064, D-066 to D-071) unless he decides otherwise.
 - Hydrogen's limit is four at once (D-068). Its `routing.md` rows track how it does on the Argon-class work.
+
+## D-074 — 2026-11-14 — Pedro's shifts: security-test writing goes to Claude, Hydrogen takes Claude work it can do
+**Decided by Pedro (driver).** `scripts/agy-policy.py` stays as it is: it refuses path-like text (`~…`, `../`, absolute paths outside the worktree) in file contents too. So work that has to write such text goes to Claude workers. To balance the load, Gemini 4 Hydrogen takes Claude-bound work it can do within the policy. This refines D-073 on Pedro's shifts.
+- **To Claude (they write credential paths as test data):**
+  - **M1-07's escalation (D-071):** an **Opus 5.5** worker. The author was Sonnet, so this is a step up the ladder, not a change of provider.
+  - **M1-13's third part:** the regression and ordinary-line tables go to a **Sonnet 5.5** worker, the fixes to **Opus 5.5** (as D-069).
+- **Reviews of that work stay cross-provider: Gemini 4 Hydrogen `high`, read-only.** The review is returned as the agent's final message and the orchestrator writes it to `reviews/<id>.md`, because the policy would refuse a review file that quotes the inputs.
+- **To Hydrogen, from Claude** (the orchestrator's judgment of what it can do: Rust or TypeScript work run with `cargo`/`pnpm`, no credential literals, no GUI):
+  - **The M1-05 late-fix test gaps** (tests only, `crates/atrium-daemon/tests/`; `reviews/M1-05-daemon-late-fixes.md` findings 1 and 4). Needs a brief. Reviewed by Sonnet 5.5.
+  - **M1-15-store-launch-recovery** (CR-08 and CR-10, once M1-13 is merged): Hydrogen `high` instead of Sonnet, reviewed by Opus 5.5. If its tests need path-like literals, that part goes back to Claude.
+  - Hydrogen's PLAN §8.2 rows (fixtures, docs, exploration, triage) and the orchestrator's utility work, as on rodrigo's shifts (D-069).
+- **Not Hydrogen's:** anything that needs `python3` or a GUI (the `agy` allowlist has neither), so M1-09b's macOS checks stay with the orchestrator; security tests and fixes (above); contract changes.
