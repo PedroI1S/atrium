@@ -915,6 +915,58 @@ mod unit_tests {
                 Some(stat('Z', LIVE, 501)),
                 Unverifiable,
             ),
+            // A replaced pid is `Unverifiable` before anything else about the
+            // new task is looked at (mutation checks: the order of the tests).
+            (
+                "ENOENT, kernel thread, but pid reused",
+                first,
+                ENOENT,
+                Some(stat('S', PF_KTHREAD, 501)),
+                Unverifiable,
+            ),
+            (
+                "EACCES, zombie, but pid reused",
+                first,
+                EACCES,
+                Some(stat('Z', LIVE, 501)),
+                Unverifiable,
+            ),
+            (
+                "exe ok, start time went backwards",
+                first,
+                Ok(()),
+                Some(stat('S', LIVE, 499)),
+                Unverifiable,
+            ),
+            (
+                "ENOENT, exiting, start time went backwards",
+                first,
+                ENOENT,
+                Some(stat('S', LIVE | PF_EXITING, 499)),
+                Unverifiable,
+            ),
+            (
+                "ENOENT, dead x",
+                first,
+                ENOENT,
+                Some(same('x', LIVE)),
+                NoProcess,
+            ),
+            (
+                "EACCES, dead x",
+                first,
+                EACCES,
+                Some(same('x', LIVE)),
+                NoProcess,
+            ),
+            (
+                "EACCES, dead X",
+                first,
+                EACCES,
+                Some(same('X', LIVE)),
+                NoProcess,
+            ),
+            ("EACCES, /proc entry gone", first, EACCES, None, NoProcess),
             // Other errors stay errors for a live task.
             (
                 "EACCES, live",
