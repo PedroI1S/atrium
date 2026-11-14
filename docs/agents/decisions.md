@@ -438,3 +438,11 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **Same branch and worktree** (`agent/sonnet/M1-07-claude-adapter`, D-066's reading on branch names), same owned paths.
 - **The orchestrator's design rule for the subject** (in the brief's "Escalation" section): stop expanding and bounding arbitrary patterns; accept only a small, explicit grammar and make everything else `Unknown` (which asks). Ordinary patterns (`**/*.rs`, `src/**/mod.rs`, `*.{ts,tsx}`, `src/{a,b}/mod.rs`, `*.[ch]`, `*.[a-z]`) must keep their Allow in Home.
 - The policy engine's side (P1 in `m1-must-fix.md`) stays with `atrium-core`'s owner.
+
+## D-072 — 2026-11-14 — M1-09b merged into `dev` with its macOS checks owed
+**Decided by rodrigo (driver).** M1-09b-home-chat is merged into `dev` at `8e7dffd` after the Gemini 4 Hydrogen review (round 1 approve with changes, fixed by the orchestrator; round 2 approve). Its status is partial only for what this machine can't do:
+- **Owed to a Pedro shift (macOS):** the screenshots in both themes, the `startup_bench.py` gate (median < 400 ms, p90 < 450 ms, idle < 150 MB `phys_footprint`) and the §14 streaming run.
+- **Owed to M1-07 (a real provider):** approvals and questions end to end, "Always…" from a live request, the daemon's stale refusal, Resume, real markdown and usage, a probed agent in Settings.
+- **Linux idle memory over 150 MB is not this task's:** M1-09a's shell measures 219–223 MiB private PSS on the same machine and script (M1-09b: 212–216 MiB). It goes to M1-14b (L3 profiling) and a gate decision.
+- **Open for the drivers, not decided here:** how §14's frame statistic reads on Linux (144 Hz display, 1 ms rAF timestamps; the worker proposes "frames that skip an update", 0.1–0.3 % measured) and batching events in `bridge.rs` (about 10,000 webview script runs a second at 10k tokens/s).
+- The merge unblocks M1-14b (it waited for M1-09b's `app/src/**` and `app/scripts/**`); its dispatch still needs a go.
