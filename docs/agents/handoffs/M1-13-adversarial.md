@@ -241,3 +241,28 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
 ```
 
+
+## Third part: tables (Claude Sonnet 5.5, step 5's tables only)
+
+Two new files, no `src/**` touched, nothing ignored. The fixer needs them red.
+
+**Sizes.**
+- `crates/atrium-core/tests/adversarial_regression.rs`: 21 tests, about 117 engine lines (each run under the review's four settings: home, prefix rules `cd cat pushd popd ls`, one `Any` rule, FullAccess) and about 25 gate checks on a temp folder with a fake HOME (home, any, full). Expected verdicts are the ones the review says are required.
+- `crates/atrium-core/tests/adversarial_ordinary.rs`: 5 tests, 107 lines, each with its verdict in the four settings: finding 6's inputs and their `;`/newline forms, finding 12's nested `cd`s, finding 10's `$PAGER`/`$CLIP` pipes, "tried and held" ordinary lines, here-docs of text, and 43 everyday Home lines (`ls`, `git status`, `cat README.md`, `cargo build`, `rm -rf target`, `cat ~/.zshrc` and so on).
+
+**How dev's verdicts were established (run, not guessed).** I exported `dev`'s `crates/atrium-core/src` (`git archive dev`) over a copy of this branch in a scratch folder (its own target dir), and ran a scratch dump test that prints each line's verdict in the four settings, on dev and on the branch. The ordinary table's rows are dev's output, pasted by script from the JSON, so no hostile text went through a shell. The same two binaries were then run on dev: the ordinary table passes on dev except one test (below), and the regression table's tests for findings 1, 4, 5 (here-docs) and 12 pass on dev, which confirms those four are regressions of the branch.
+
+**One deliberate difference from dev.** `ordinary_heredoc_text_with_a_substitution_is_not_a_false_hard_deny` (round 6 finding 1: `cat > notes-$(date).md <<EOF … sudo make install`) expects the branch's verdict (Ask, Allow with Any/Full), because dev hard-denies it and part 1 correctly fixed that. It passes on the branch and fails on dev.
+
+**Failing on the branch now (14 of the 26 tests; 12 findings' inputs).**
+- Ordinary table, 3 tests: `ordinary_lines_after_a_working_cd` (finding 6: HardDeny for dot-file reads, glob deletes, `find -delete`, `..` after a working `cd`; dev Ask or Allow), `ordinary_nested_cds` (finding 12: `Deny("too large to check")`), `ordinary_pipes_variables_and_heredocs` (finding 10: `| $PAGER` hard-denied as `pipe-to-shell`, `| $CLIP` as `privilege-escalation`; dev Ask).
+- Regression table, 13 tests: `finding_1_a_key_symlinked_into_ssh_is_still_a_credential`, `finding_1_a_folder_of_keys_linked_into_ssh` (Allow; see the tension below), `finding_2_failing_cds_then_a_credential`, `finding_2_failing_cds_joined_by_or` (Ask in home, Allow with rules, Any and Full; required HardDeny), `finding_3_pushd_popd_and_cd_dash_leave_the_cwd_unknown` (Allow with rules, Any, Full; required not Allow), `finding_3_popd_back_into_a_credential_folder_is_a_hard_deny`, `finding_4_a_cd_through_a_symlink_keeps_the_write_check` (Ask in home, Allow with Any/Full), `finding_5_heredoc_to_a_shell_named_with_a_substitution`, `finding_5_payload_for_a_shell_named_with_a_substitution`, `finding_7_text_piped_to_a_shell_is_code_however_it_is_spelled`, `finding_9_wrapper_long_options_and_the_commands_own_dash_c`, `finding_12_seven_nested_cds_are_not_refused`, `finding_13_shell_options_that_take_a_value`, `finding_14_crontab_bodies_and_other_stdin_readers`, and two for finding 11 (`…recursive_search_over_a_hard_linked_credential`, `…hard_link_to_a_credential_kept_outside_home`: stricter than dev, which allows them too).
+- Passing on the branch (guards, must stay green): `finding_4_control_the_same_writes_without_a_cd`, `held_one_failing_cd_forms`, `held_deletes_after_a_failing_cd`, `held_sh_dash_c_forms`, `held_echo_and_printf_into_a_shell` (the review's "tried and held" inputs; the exact lines are my reconstruction from the families the review names, and every one held on the branch).
+- Not covered here: finding 8 (a document), finding 10 as a required verdict (the table pins dev's Ask), findings 5 to 10 of the review's "open findings" list that are not in the review's numbered findings, and the daemon and host findings.
+
+**Judgement calls the fixer should check.**
+- Finding 2's "the same joined by `&&`" is left out: after a failing `cd` the rest of an `&&` chain doesn't run, so a hard deny there could be a false one. `||` and `;`/newline forms are in. The first `||` line I tried (`cd .config || cd n1 || cd n2 || cd gh; cat hosts.yml`) can't reach `~/.config/gh`, so I removed it.
+- Finding 3 asks for "not Allow" (the review's minimum, §9); one separate test pins the hard deny for the `popd` line.
+- Finding 1's linked folder (`~/.ssh/work -> ~/vault/work` holding `id_work`) is in its own test: dev denied it, but M1-03 finding 5 wants a link to an ordinary folder to stay ordinary. A fix that follows only file links turns this test green only if it also decides a folder with a key in it; the review says "decide separately".
+- Findings 7, 9, 13 and 14 use "not Allow" in all four settings (the review gives no exact id); the fixer may tighten them.
+- Not established: the review's "docker exec -i $(docker ps -q) sh" case (round 6 finding 1 as asked, Ask) is not in a table, and I did not run daemon, host or socket tests.
