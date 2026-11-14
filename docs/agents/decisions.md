@@ -492,3 +492,6 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 
 ## D-077 — 2026-11-14 — Pedro's go: M1-05c-snapshot-seam
 **Decided by Pedro (driver).** Go for the follow-up the M1-05b review named (`reviews/M1-05b-daemon-test-gaps.md` §5): a test-only store hook in the daemon's `Options` and a test of the snapshot-ordering rule, plus the review's two test nits. Gemini 4 Hydrogen `medium` (D-076), reviewed by Sonnet 5.5. Brief `M1-05c-snapshot-seam.md`.
+
+## D-078 — 2026-11-14 — An uncertain cwd keeps dev's verdict under Any rules and FullAccess
+**Decided by Pedro (driver).** M1-13's third part (`253c7f4`) makes Home ask when the engine can't know the cwd (after `;`, `||`, `pushd`, `popd`, `cd -`, `cd $VAR`), and prefix, exact and path-glob rules can't cover such a line. **`Any` rules and the FullAccess preset keep `dev`'s behaviour:** they still allow on an uncertain cwd, so a line like `cd -; cat id_rsa` is Allow under them. FullAccess and `Any` mean "don't ask me"; the hard denies on direct credential paths still apply. The orchestrator had recommended asking instead; Pedro chose to keep `dev`'s behaviour. The M1-13 handoff's "Left" item for the owner is closed by this decision.
