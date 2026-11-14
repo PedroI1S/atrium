@@ -12,6 +12,7 @@ Apply the two approved change requests: a resumed thread keeps the effort and pr
 - `docs/contracts/m1.md` §5 and §10 (lifecycle, recovery), §7 (the store).
 - `crates/atrium-core/src/lib.rs` (the `Store` trait), `crates/atrium-core/src/store/**` (`SqliteStore`, its reader and writer), `crates/atrium-daemon/src/upkeep.rs` (`recover`), and where the daemon resumes a thread (`ResumeThread`, the `SessionConfig` and `SessionGate` it builds).
 - `docs/agents/handoffs/M1-05-daemon.md` ("open": CR-08, CR-10), `docs/agents/reviews/M1-05-daemon-codex*.md` (findings 2 and 8).
+- `docs/agents/reviews/M1-14a-linux-host.md`, the last section ("The daemon's flaky tests (N1–N3): causes"): Argon's reading of N1 (the window runs from the moment `pump` stores `SessionEnded` to the end of `run()`, three store round-trips later), of N2, and of N3 (a killed leader stays a zombie in its process group until its parent reaps it, so `group_is_empty` is false and `kill_recorded` answers `Unverified`). Check each against the code before you rely on it.
 - `docs/agents/handoffs/M1-13-adversarial.md`, finding 12: `upkeep::recover()` records `Signal::Recovered` before `close_incarnation`; if the closure fails, `live_processes()` skips that session on the next start and `sessions.process` stays set.
 
 ## Owned paths
