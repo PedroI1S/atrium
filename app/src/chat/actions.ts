@@ -6,6 +6,7 @@ import { command, daemon } from "../daemon/client";
 import { type AgentLaunch, type ProviderProbe, type ThreadSummary, isCommandFailure } from "../daemon/types";
 import { showToast } from "../state";
 import { NEW_THREAD } from "../window-model";
+import { count } from "./perf";
 import { debugBuild, patchView, setMainThread } from "../windows";
 
 export type AgentChoice = { id: string; label: string; launch: AgentLaunch; note?: string };
@@ -110,9 +111,28 @@ export async function resumeThread(threadId: string): Promise<void> {
   }
 }
 
-/** The thread's unread flag is cleared once someone looks at it (contract §8). */
-export function markRead(threadId: string): void {
-  void command({ type: "mark_read", thread_id: threadId }).catch(() => {});
+/** `MarkRead` is sent at most this often per thread. */
+const MARK_READ_INTERVAL_MS = 1_000;
+const lastMarked = new Map<string, number>();
+const marking = new Set<string>();
+
+/**
+ * The thread's unread flag is cleared once someone looks at it (contract §8). While a reply
+ * streams into the chat being looked at, every delta sets the flag again, so this is called at
+ * the event rate: it sends one command per thread per second at most, and only if the chat is
+ * `still` being looked at when its turn comes.
+ */
+export function markRead(threadId: string, still: () => boolean = () => true): void {
+  if (marking.has(threadId)) return;
+  marking.add(threadId);
+  const wait = Math.max(0, (lastMarked.get(threadId) ?? 0) + MARK_READ_INTERVAL_MS - Date.now());
+  setTimeout(() => {
+    marking.delete(threadId);
+    if (!still()) return;
+    lastMarked.set(threadId, Date.now());
+    count("markRead");
+    void command({ type: "mark_read", thread_id: threadId }).catch(() => {});
+  }, wait);
 }
 
 let focused: string | null | undefined;

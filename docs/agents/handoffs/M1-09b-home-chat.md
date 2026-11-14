@@ -35,6 +35,23 @@ This worker:
   | 3 | 9,651 over 31.1 s | 0.4 | 935 / 11,017 / 11,430 / 11,430 | 12 | 765 MiB | 885 MiB |
 
   The window drew about a dozen frames in 30 s: the webview's main thread is blocked for seconds at a time. All 300k tokens arrive and are applied (nothing is lost), but nothing like 60 fps. Cause not yet found when this was written; see below for what was tried after.
+- **§14 streaming run after one fix: 59 fps, but STILL NOT WITHIN THE GATE (marginal). Escalated, not tuned further.** (2026-11-14, same command, `perf` profile, Linux/WebKitGTK on a 60 Hz display, rAF timestamps, window visible in all runs, load average 3.6–4.0 from other workers.)
+
+  Cause of the first result, both found with the work counters now in the report: (1) `ThreadBody` keyed its view on the thread's *summary object*, which changes with every event, so the whole view was torn down, re-viewed in the client (a fresh snapshot) and redrawn at the event rate; it is keyed on the thread id now. (2) `MarkRead` was sent for every summary update of the chat being looked at (each delta sets `unread` again); it is sent at most once a second per thread now, and only while the chat is still shown and the window focused.
+
+  | run | tokens/s | fps | frame p50 / p95 / p99 / max (ms) | frames | over 16.7 ms | over 1.5 × refresh ("long") | dropped | web content peak | app + webviews peak |
+  |---|---:|---:|---|---:|---:|---:|---:|---:|---:|
+  | 1 | 9,990 | 59.1 | 17 / 19 / **34** / 50 | 1,771 | 57.7 % | 26 (1.5 %) | 29 | 188.0 MiB | 284.8 MiB |
+  | 2 | 9,988 | 59.0 | 17 / 18 / **35** / 50 | 1,769 | 58.9 % | 26 (1.5 %) | 29 | 186.9 MiB | 288.7 MiB |
+  | 3 | 9,980 | 59.0 | 17 / 18 / **33** / 51 | 1,770 | 58.9 % | 27 (1.5 %) | 31 | 186.5 MiB | 283.4 MiB |
+
+  Against the gate (at most 1 % of frames over 16.7 ms, p99 at most 33 ms):
+  - **p99: 34, 35, 33 ms. One run of three is within, two are over by 1–2 ms.**
+  - **Frames over 16.7 ms: 58 % as written, which says nothing**: WebKitGTK rounds rAF timestamps to 1 ms and a 60 Hz frame is 16.67 ms, so an on-time frame reads 16 or 17 (p50 reads 17; M0-07 saw the same). The share that skipped a display update (over 1.5 × the refresh interval, M0-07's "long" frames) is **1.5 %**, about one frame a second, each one or two updates late (max 50 ms). That is over 1 % too.
+  - WebContent peak: **187–188 MiB** (web content process; app with all webview processes 283–289 MiB). M0-07 saw 1.05–1.39 GB on macOS at 10k tokens/s.
+  - All 299.5k events were delivered and applied in each run (9,980–9,990 tokens/s).
+
+  Where the main thread's time goes in 30 s (run 1; counters in the report's `work`): applying the per-frame batches of all ten threads, including the visible one's reactive update, virtualizer and follow-the-tail layout, **5.5 s over 17,689 flushes** (0.31 ms each, 18 % of the thread); markdown parse and DOM of the open block 0.2 s (1,974 renders); receiving 299,555 event deliveries 0.14 s; 138 thread-list updates 0.02 s; 29 `MarkRead` commands. Nothing was tuned after the fix. What I would look at next: the roughly once-a-second long frame (a row closing every 4,096 characters mounts and measures a new row, and the tool rows every 4 s), and the cost of one flush per thread per frame (ten rAF callbacks; one shared flush would do).
 - **Release builds can't be used by the harness scripts** (found while measuring): a release build ignores `ATRIUM_HOME` (`lifecycle::default_paths` honours it only with debug assertions), and a release `atriumd` refuses every app ("no app identity is known") until packaging compiles the identity in. So `startup_bench.py` as M1-09a wrote it (release) measured an app that never connects, used the user's real Atrium folders, and left its daemon running there. Both bench scripts now build with the workspace's `perf` profile (optimized, debug assertions on), which honours `ATRIUM_HOME` and connects. `stop_daemon` in `startup_bench.py` now also finds a daemon by its `ATRIUM_HOME` and kills one that ignores SIGINT.
 - **Side effect of my first two streaming attempts (release build): files outside the worktree.** They created `~/.local/share/atrium/` (`atrium.db`, `logs/atriumd.log`, empty `app/`, `snapshots/`) and `$XDG_RUNTIME_DIR/atrium/daemon.lock` on 2026-11-13 08:48, and left a release `atriumd` running (the orchestrator stopped pid 1349294). I did not delete them (outside my worktree); they hold no chats (the app never connected). The orchestrator decides whether to remove them.
 

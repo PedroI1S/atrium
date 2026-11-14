@@ -9,6 +9,7 @@ import { ageLabel } from "../daemon/reduce";
 import type { ToolKind } from "../daemon/types";
 import { type BlockText } from "../chat/blocks";
 import { parseMarkdown } from "../chat/markdown";
+import { timed } from "../chat/perf";
 import { type LinkActions, renderBlocks } from "../chat/render";
 import { cardState } from "../chat/requests";
 import { type ThreadModel, localOf } from "../chat/threads";
@@ -57,7 +58,7 @@ function BlockRow(props: { item: MessageItem; block: BlockText; tick: () => numb
     if (b === seen && b.v === seenV) return;
     seen = b;
     seenV = b.v;
-    el.replaceChildren(renderBlocks(document, parseMarkdown(b.text), linkActions));
+    timed("renderBlock", () => el.replaceChildren(renderBlocks(document, parseMarkdown(b.text), linkActions)));
   });
   return <div ref={el} class="md" classList={{ cont: props.block.cont, reasoning: props.item.role === "reasoning", streaming: !props.block.closed }} />;
 }

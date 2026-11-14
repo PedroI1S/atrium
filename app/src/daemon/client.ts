@@ -5,6 +5,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { createSignal } from "solid-js";
 import { inTauri } from "../platform";
+import { timed } from "../chat/perf";
 import { initialDaemonState, isThreadDelivery, reduce, threadOf } from "./reduce";
 import type { DaemonCommand, Delivery, Frame, Page, ThreadDelivery } from "./types";
 
@@ -48,7 +49,7 @@ export async function attach(): Promise<void> {
   const channel = new Channel<Frame>();
   channel.onmessage = (frame) => {
     try {
-      apply(frame.delivery);
+      timed(`deliver:${frame.delivery.type}`, () => apply(frame.delivery));
     } finally {
       // A delivery that failed to apply is still acknowledged: holding it back would stall
       // the window, and the next snapshot replaces the state anyway.

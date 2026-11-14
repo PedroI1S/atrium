@@ -10,6 +10,7 @@
 import { type Accessor, createSignal } from "solid-js";
 import { command, pageBefore, viewThread } from "../daemon/client";
 import { type CommandFailure, type DaemonCommand, type QuestionAnswer, type RememberScope, type ThreadDelivery, isCommandFailure } from "../daemon/types";
+import { timed } from "./perf";
 import { type Action, type Local, decisionOf } from "./requests";
 import { Transcript, type RequestItem } from "./transcript";
 
@@ -80,7 +81,7 @@ function schedule(entry: Entry): void {
     if (done) return;
     done = true;
     clearTimeout(timer);
-    flush(entry);
+    timed("flush", () => flush(entry));
   };
   const timer = setTimeout(run, FRAME_FALLBACK_MS);
   if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);

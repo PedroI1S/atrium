@@ -108,6 +108,7 @@ def main() -> int:
               f"web content peak {report['peakWebContentMiB']} MiB, app and webviews peak {report['peakAppAndWebviewsMiB']} MiB ({kind})"
               f"{'' if valid else '  INVALID: the window was hidden'}"
               f"  -> {'within' if within else 'OVER'} the gate")
+        print(f"        main-thread work while streaming: {json.dumps(report.get('work', {}))}")
         time.sleep(2)
     print(json.dumps({"kind": "stream-bench", "profile": profile, "memory": kind, "runs": reports}))
     return 0

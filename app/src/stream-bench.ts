@@ -7,6 +7,7 @@
 // Frame times are `requestAnimationFrame` timestamp deltas: WebKitGTK gives a page no
 // presentation timestamps. They don't see compositor or GPU drops.
 
+import { perf, resetPerf } from "./chat/perf";
 import { holdThread } from "./chat/threads";
 import { command, daemon } from "./daemon/client";
 import type { ThreadSummary } from "./daemon/types";
@@ -67,6 +68,7 @@ export async function runStreamBench(): Promise<void> {
   const charsOf = (k: number) => held[k]!.transcript.items.reduce((n, item) => n + (item.kind === "message" && item.role === "assistant" ? item.chars : 0), 0);
   const total = () => held.reduce((n, _m, k) => n + charsOf(k), 0);
   await waitFor("the first tokens", () => charsOf(0) > 0, START_TIMEOUT_MS);
+  resetPerf();
   sampling = true;
   const t0 = performance.now();
   const chars0 = total();
@@ -107,5 +109,7 @@ export async function runStreamBench(): Promise<void> {
     rowsRendered: document.querySelectorAll(".thread-row").length,
     tailGapPx: scroller ? Math.round(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight) : null,
     loadedBytesVisibleThread: held[0]!.transcript.bytes,
+    // Main-thread work while sampling: how many times, and total ms, per kind.
+    work: Object.fromEntries(Object.keys(perf.counts).sort().map((k) => [k, { n: perf.counts[k], ms: Math.round(perf.ms[k] ?? 0) }])),
   });
 }

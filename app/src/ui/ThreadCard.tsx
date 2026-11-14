@@ -73,12 +73,13 @@ function AgentChip() {
 /** A thread's transcript, its pending requests and its composer, while the view holds it. */
 function LiveThread(props: { viewKey: string; thread: ThreadSummary }) {
   const held = holdThread(props.thread.thread_id);
-  onCleanup(held.release);
+  let shown = true;
+  onCleanup(() => { shown = false; held.release(); });
   const model = held.model;
   const running = () => props.thread.state.type === "running" || props.thread.state.type === "starting" || props.thread.state.type === "needs_approval" || props.thread.state.type === "needs_input";
   // Looking at a thread with a new reply reads it (contract §8), while the window has focus.
   createEffect(() => {
-    if (props.thread.unread && windowFocused()) markRead(props.thread.thread_id);
+    if (props.thread.unread && windowFocused()) markRead(props.thread.thread_id, () => shown && windowFocused());
   });
   // The daemon doesn't notify about the chat the user is looking at (contract §8, `SetFocus`).
   createEffect(() => reportFocus(windowFocused() ? props.thread.thread_id : null));
@@ -107,7 +108,7 @@ function LiveThread(props: { viewKey: string; thread: ThreadSummary }) {
 export function ThreadBody(props: { viewKey: string; thread: ThreadSummary | undefined }) {
   return (
     <div class="thread">
-      <Show when={props.thread} keyed fallback={
+      <Show when={props.thread?.thread_id} keyed fallback={
         <>
           <div class="thread-scroll" tabindex="0" role="log" aria-label="Conversation" data-atrium-part="transcript"><Empty thread={undefined} /></div>
           <div class="thread-composer">
@@ -115,7 +116,12 @@ export function ThreadBody(props: { viewKey: string; thread: ThreadSummary | und
           </div>
         </>
       }>
-        {(t) => <LiveThread viewKey={props.viewKey} thread={daemon().threads[t.thread_id] ?? t} />}
+        {/* Keyed by the thread id, never by the summary: a summary changes with every event, and a
+            view that was rebuilt for each one would ask for a new snapshot and redraw everything. */}
+        {(id) => {
+          const first = props.thread!;
+          return <LiveThread viewKey={props.viewKey} thread={daemon().threads[id] ?? first} />;
+        }}
       </Show>
     </div>
   );
