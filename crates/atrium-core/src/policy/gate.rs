@@ -137,21 +137,6 @@ fn identity(_: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// Like [`identity`] but does not follow a symlink: a link inside `~/.ssh`
-/// names the link itself (no resolved path ever has that identity), not its
-/// target.
-#[cfg(unix)]
-fn identity_nofollow(p: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::symlink_metadata(p)
-        .ok()
-        .map(|m| (m.dev(), m.ino()))
-}
-#[cfg(not(unix))]
-fn identity_nofollow(_: &Path) -> Option<(u64, u64)> {
-    None
-}
-
 /// A regular file with more than one link (a hard link, or the original of
 /// one). Its other names can't be found cheaply, so it is never auto-allowed.
 #[cfg(unix)]
@@ -202,12 +187,18 @@ fn alias_fix(p: &Path, roots: &[((u64, u64), PathBuf)]) -> Result<PathBuf, Strin
 /// The roots plus the members of `~/.ssh` (a small folder): a hard link to a
 /// key is the same file. The big trees (browser profiles) aren't walked; a
 /// path inside one is caught through its ancestors.
+///
+/// Every member is identified through links (another name for a key is the
+/// key: review M1-13 finding 1). A folder linked into `~/.ssh` is walked, but
+/// only the files in it are members, not the folder: listing it or `cd`-ing
+/// into it stays ordinary (M1-03 finding 5), reading a file in it doesn't.
 fn ssh_members(home: &Path) -> Vec<PathBuf> {
     const MAX_ENTRIES: usize = 256;
     let mut out = vec![];
     let mut found = 0usize;
-    let mut stack = vec![(home.join(".ssh"), 0u8)];
-    while let Some((dir, depth)) = stack.pop() {
+    // (folder, depth, reached through a link)
+    let mut stack = vec![(home.join(".ssh"), 0u8, false)];
+    while let Some((dir, depth, linked)) = stack.pop() {
         if depth >= 3 || found >= MAX_ENTRIES {
             continue;
         }
@@ -217,10 +208,20 @@ fn ssh_members(home: &Path) -> Vec<PathBuf> {
         for e in rd.flatten().take(MAX_ENTRIES) {
             found += 1;
             let p = e.path();
-            // `file_type` does not follow links: a link to a folder is not
-            // walked and is not a member (see `identity_nofollow`).
-            if e.file_type().is_ok_and(|t| t.is_dir()) {
-                stack.push((p.clone(), depth + 1));
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                match std::fs::metadata(&p) {
+                    Ok(m) if m.is_dir() => stack.push((p, depth + 1, true)),
+                    Ok(_) => out.push(p),
+                    Err(_) => {}
+                }
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push((p.clone(), depth + 1, linked));
+                if linked {
+                    continue;
+                }
             }
             out.push(p);
         }
@@ -257,7 +258,7 @@ fn evaluate_sync(
         roots.extend(
             ssh_members(&c.home)
                 .into_iter()
-                .filter_map(|r| identity_nofollow(&r).map(|id| (id, r))),
+                .filter_map(|r| identity(&r).map(|id| (id, r))),
         );
         for u in &analysis.uses {
             for p in &u.paths {
@@ -270,13 +271,102 @@ fn evaluate_sync(
     // A file with several links may be another name for a credential in a
     // tree the identity map doesn't walk: never auto-allow it, ask instead.
     if matches!(verdict, PolicyVerdict::Allow { .. })
-        && resolved
-            .iter()
-            .any(|p| p.starts_with(&c.home) && multiply_linked_file(p))
+        && !analysis.overflow
+        && reaches_multiply_linked(check, &analysis, &resolved)
     {
         verdict = PolicyVerdict::Ask;
     }
     Ok(Evaluated { verdict, resolved })
+}
+
+/// Commands that read every file below a folder they are given.
+fn recursive_reader(eff: &[String]) -> bool {
+    let Some(first) = eff.first() else {
+        return false;
+    };
+    match shell::base(first) {
+        "rg" | "ag" | "ack" => true,
+        "grep" | "egrep" | "fgrep" => eff[1..].iter().any(|a| {
+            (a.starts_with('-') && !a.starts_with("--") && a.contains(['r', 'R']))
+                || a.starts_with("--recursive")
+                || a.starts_with("--dereference-recursive")
+                || a == "--directories=recurse"
+        }),
+        _ => false,
+    }
+}
+
+/// Whether the call reads a regular file with more than one link: a named
+/// file (anywhere, but not a command being run), a file a glob's folder holds,
+/// or a file below a folder a recursive search is given (review M1-13
+/// finding 11). The search walk is bounded and skips `node_modules` and
+/// `.git` (package managers and local clones hard-link their files there).
+fn reaches_multiply_linked(check: &ToolCheck, a: &deny::Analysis, resolved: &[PathBuf]) -> bool {
+    let recursive_paths = matches!(
+        &check.subject,
+        ToolSubject::Paths {
+            recursive: true,
+            ..
+        }
+    );
+    let mut k = 0usize;
+    for u in &a.uses {
+        let unit = a.units.get(u.unit);
+        let command_word = unit.is_some_and(|x| x.seg.argv.first() == Some(&u.word));
+        let recursive = recursive_paths || unit.is_some_and(|x| recursive_reader(&x.eff));
+        let globby = u.word.contains(['*', '?', '[']);
+        for _ in &u.paths {
+            let Some(p) = resolved.get(k) else {
+                return false;
+            };
+            k += 1;
+            if command_word {
+                continue;
+            }
+            if multiply_linked_file(p) {
+                return true;
+            }
+            if globby
+                && let Some(dir) = p.parent()
+                && tree_has_multiply_linked(dir, 1)
+            {
+                return true;
+            }
+            if recursive && p.is_dir() && tree_has_multiply_linked(p, 8) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A bounded walk (links not followed) looking for a multiply-linked file.
+fn tree_has_multiply_linked(root: &Path, max_depth: u8) -> bool {
+    const BUDGET: usize = 4096;
+    let mut seen = 0usize;
+    let mut stack = vec![(root.to_path_buf(), 0u8)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > BUDGET {
+                return false;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            let p = e.path();
+            if ft.is_dir() {
+                let skip = e.file_name() == "node_modules" || e.file_name() == ".git";
+                if !skip && depth + 1 < max_depth {
+                    stack.push((p, depth + 1));
+                }
+            } else if ft.is_file() && multiply_linked_file(&p) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub struct Evaluated {

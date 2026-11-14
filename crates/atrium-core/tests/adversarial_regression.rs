@@ -16,7 +16,6 @@
 
 mod common_adversarial;
 
-use Want::NotAllow;
 use atrium_agents::{GateDecision, ToolGate};
 use atrium_protocol::agent::ToolKind;
 use atrium_protocol::policy::{Preset, Rule, RuleDecision, RuleMatcher, RuleScope};
@@ -84,6 +83,24 @@ fn h(id: &'static str) -> Want {
     Want::Hard(id)
 }
 
+/// Every line with its own want per setting (`[home, prefix, any, full]`).
+fn run_rows(rows: &[(&str, [Want; 4])]) {
+    let env = Env::home();
+    let mut failures = vec![];
+    for (line, wants) in rows {
+        for ((name, rules, preset), want) in settings().into_iter().zip(wants.iter()) {
+            let v = env.eval_check(&cmd_check(line), &rules, preset);
+            if !matches_want(&v, want) {
+                failures.push(format!(
+                    "[{name}] {line:?}: wanted {want:?}, got {}",
+                    classify(&v)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 // ---------------------------------------------------------------------------
 // Findings 2 and 3: an uncertain working directory
 // ---------------------------------------------------------------------------
@@ -123,22 +140,62 @@ fn finding_2_failing_cds_joined_by_or() {
     )]);
 }
 
-/// Finding 3: `pushd`, `popd` and `cd -` leave the cwd unknown (§9): a
-/// relative path after them never reaches Allow (the review asks for a hard
-/// deny after `popd` where the candidates include the credential folder; the
-/// minimum, which every input here also needs, is that it does not Allow).
+/// Finding 2, the `&&` forms the review also names (third part, fixer's
+/// correction): after `cd X && …` the rest of the chain runs only if every
+/// `cd` worked, so the shell is in the one directory the chain names, which
+/// holds no credential here: dev's verdicts are right (the review's "Allow
+/// with the prefix rules" is not a hole for these). With a `cd -` in the
+/// chain the directory is unknown again and the credential is found.
+#[test]
+fn finding_2_and_chains_follow_only_success() {
+    use Want::{Allow, Ask};
+    run_rows(&[
+        (
+            "cd .config && cd n1 && cd n2 && cd gh && cat hosts.yml",
+            [Ask, Allow, Allow, Allow],
+        ),
+        (
+            "cd /h && cd n1 && cd n2 && cd u/.ssh && cat id_rsa",
+            [Ask, Allow, Allow, Allow],
+        ),
+        (
+            "cd .config && cd nope && cd /tmp && cd - && cd gh && cat hosts.yml",
+            [h(CR), h(CR), h(CR), h(CR)],
+        ),
+        // the end of an `&&` chain brings back where the shell was
+        ("cd proj && ls; cat .npmrc", [h(CR), h(CR), h(CR), h(CR)]),
+        ("false && cd proj; cat .npmrc", [h(CR), h(CR), h(CR), h(CR)]),
+        // `cd X || exit`: past it the shell is in X
+        ("cd build || exit 1; rm -rf *", [Ask, Ask, Allow, Allow]),
+        ("cd build || exit; cat .npmrc", [Ask, Ask, Allow, Allow]),
+    ]);
+}
+
+/// Finding 3: `pushd`, `popd` and `cd -` leave the cwd unknown (§9). Every
+/// directory the line names (home and the start included) is checked for the
+/// hard deny; no rule but `Any` covers the line, and Home asks.
+///
+/// Third-part correction: `cd -` at the start of a line goes to `$OLDPWD`,
+/// which the line doesn't name. With an `Any` rule or FullAccess (which never
+/// ask) these stay Allow, as `cd $X; cat id_rsa` does on dev: the hard deny
+/// can only check directories it can name. The table asked "not Allow" in
+/// all four settings; the review's own fix (2(b)) only reaches rules and Home.
 #[test]
 fn finding_3_pushd_popd_and_cd_dash_leave_the_cwd_unknown() {
-    run_all(&[
+    use Want::{Allow, Ask};
+    run_rows(&[
         (
             "pushd .config; pushd /tmp; pushd /var; popd; popd; cd gh; cat hosts.yml",
-            NotAllow,
+            [h(CR), h(CR), h(CR), h(CR)],
         ),
-        ("cd -; cat id_rsa", NotAllow),
-        ("pushd .ssh; popd; cat id_rsa", NotAllow),
-        ("pushd /tmp; popd; cat .npmrc", NotAllow),
-        ("cd /tmp; cd -; cat id_rsa", NotAllow),
-        ("cd .ssh; cd /tmp; cd -; cat id_rsa", NotAllow),
+        ("cd -; cat id_rsa", [Ask, Ask, Allow, Allow]),
+        ("pushd .ssh; popd; cat id_rsa", [h(CR), h(CR), h(CR), h(CR)]),
+        ("pushd /tmp; popd; cat .npmrc", [h(CR), h(CR), h(CR), h(CR)]),
+        ("cd /tmp; cd -; cat id_rsa", [Ask, Ask, Allow, Allow]),
+        (
+            "cd .ssh; cd /tmp; cd -; cat id_rsa",
+            [h(CR), h(CR), h(CR), h(CR)],
+        ),
     ]);
 }
 
@@ -166,16 +223,25 @@ fn finding_5_heredoc_to_a_shell_named_with_a_substitution() {
         ("s`echo h` <<EOF\nrm -rf ~\nEOF", h(RD)),
         ("ssh host $(echo bash) <<EOF\nrm -rf ~\nEOF", h(RD)),
         ("nsenter -t 1 $(echo sh) <<EOF\nrm -rf ~\nEOF", h(RD)),
+        // the review's "tried and held" case: dev hard-denies it, the branch
+        // asked; the brief wants the branch at least as strict as dev on every
+        // input the review names (a substitution in the arguments of a
+        // command that runs another command may name the shell)
+        (
+            "docker exec -i $(docker ps -q) sh <<EOF\nrm -rf ~\nEOF",
+            h(RD),
+        ),
     ]);
 }
 
-/// Finding 5, the same hole for payloads (not read on dev either): the
-/// minimum is that they don't Allow.
+/// Finding 5, the same hole for payloads (not read on dev either): read as
+/// code, a hard deny (tightened from "not Allow" in the third part).
 #[test]
 fn finding_5_payload_for_a_shell_named_with_a_substitution() {
     run_all(&[
-        ("s$(echo h) -c 'rm -rf ~'", NotAllow),
-        ("s${E}h -c 'rm -rf ~'", NotAllow),
+        ("s$(echo h) -c 'rm -rf ~'", h(RD)),
+        ("s${E}h -c 'rm -rf ~'", h(RD)),
+        ("$(echo rm -rf ~)", h(RD)),
     ]);
 }
 
@@ -185,22 +251,25 @@ fn finding_5_payload_for_a_shell_named_with_a_substitution() {
 
 #[test]
 fn finding_7_text_piped_to_a_shell_is_code_however_it_is_spelled() {
+    // tightened from "not Allow" in the third part: each text is read as
+    // code, so each is the hard deny its command gets written plainly
     run_all(&[
-        ("echo -e 'rm -rf\\t~' | sh", NotAllow),
-        ("echo 'rm -rf\\t~' | sh", NotAllow),
-        ("echo -e 'rm -rf \\x7e' | sh", NotAllow),
-        ("echo -e 'cat .aws/cr\\145dentials' | sh", NotAllow),
-        ("printf 'rm -rf \\176' | sh", NotAllow),
-        ("printf '%b' 'rm -rf \\0176' | sh", NotAllow),
-        ("printf 'cat .aws/credentials%s' | sh", NotAllow),
-        ("printf 'cat .aws/credentials%.0s' x | sh", NotAllow),
-        ("printf 'cat .aws/%.4sentials' credXXX | sh", NotAllow),
-        ("printf '%*s%s' 0 'cat .aws/cred' entials | sh", NotAllow),
-        ("printf 'rm -rf ~\\n' | (sh)", NotAllow),
-        ("yes 'rm -rf ~' | sh", NotAllow),
-        ("sh -c \"$(echo rm -rf ~)\"", NotAllow),
-        ("eval $(echo rm -rf ~)", NotAllow),
-        ("bash -c \"$(cat <<'EOF'\nrm -rf ~\nEOF\n)\"", NotAllow),
+        ("echo -e 'rm -rf\\t~' | sh", h(RD)),
+        ("echo 'rm -rf\\t~' | sh", h(RD)),
+        ("echo -e 'rm -rf \\x7e' | sh", h(RD)),
+        ("echo -e 'cat .aws/cr\\145dentials' | sh", h(CR)),
+        ("printf 'rm -rf \\176' | sh", h(RD)),
+        ("printf '%b' 'rm -rf \\0176' | sh", h(RD)),
+        ("printf 'cat .aws/credentials%s' | sh", h(CR)),
+        ("printf 'cat .aws/credentials%.0s' x | sh", h(CR)),
+        ("printf 'cat .aws/%.4sentials' credXXX | sh", h(CR)),
+        ("printf '%*s%s' 0 'cat .aws/cred' entials | sh", h(CR)),
+        ("printf 'rm -rf ~\\n' | (sh)", h(RD)),
+        ("printf 'rm -rf ~\\n' | { sh; }", h(RD)),
+        ("yes 'rm -rf ~' | sh", h(RD)),
+        ("sh -c \"$(echo rm -rf ~)\"", h(RD)),
+        ("eval $(echo rm -rf ~)", h(RD)),
+        ("bash -c \"$(cat <<'EOF'\nrm -rf ~\nEOF\n)\"", h(RD)),
     ]);
 }
 
@@ -210,23 +279,30 @@ fn finding_7_text_piped_to_a_shell_is_code_however_it_is_spelled() {
 
 #[test]
 fn finding_9_wrapper_long_options_and_the_commands_own_dash_c() {
+    // tightened from "not Allow" in the third part: read, so hard-denied
     run_all(&[
-        ("timeout --signal KILL 5 rm -rf ~", NotAllow),
-        ("timeout --kill-after 3 5 rm -rf ~", NotAllow),
-        ("nice --adjustment 5 rm -rf ~", NotAllow),
-        ("ionice --class 3 rm -rf ~", NotAllow),
-        ("stdbuf --output L rm -rf ~", NotAllow),
-        ("arch -arch x86_64 rm -rf ~", NotAllow),
-        ("flock /tmp/l sudo sh -c 'id'", NotAllow),
-        ("script -q /dev/null sudo sh -c id", NotAllow),
-        ("flock /tmp/l git -c x=y push -f origin main", NotAllow),
-        ("env - rm -rf ~", NotAllow),
-        ("env -iS 'rm -rf ~'", NotAllow),
-        ("env -a foo rm -rf ~", NotAllow),
-        ("env -S 'cat .aws/credentials'", NotAllow),
-        ("env -C .aws cat credentials", NotAllow),
-        ("xargs --max-args 1 rm -rf ~", NotAllow),
-        ("time -f %e rm -rf ~", NotAllow),
+        ("timeout --signal KILL 5 rm -rf ~", h(RD)),
+        ("timeout --kill-after 3 5 rm -rf ~", h(RD)),
+        ("nice --adjustment 5 rm -rf ~", h(RD)),
+        ("ionice --class 3 rm -rf ~", h(RD)),
+        ("stdbuf --output L rm -rf ~", h(RD)),
+        ("arch -arch x86_64 rm -rf ~", h(RD)),
+        ("flock /tmp/l sudo sh -c 'id'", h("privilege-escalation")),
+        (
+            "script -q /dev/null sudo sh -c id",
+            h("privilege-escalation"),
+        ),
+        (
+            "flock /tmp/l git -c x=y push -f origin main",
+            h("force-push-protected"),
+        ),
+        ("env - rm -rf ~", h(RD)),
+        ("env -iS 'rm -rf ~'", h(RD)),
+        ("env -a foo rm -rf ~", h(RD)),
+        ("env -S 'cat .aws/credentials'", h(CR)),
+        ("env -C .aws cat credentials", h(CR)),
+        ("xargs --max-args 1 rm -rf ~", h(RD)),
+        ("time -f %e rm -rf ~", h(RD)),
     ]);
 }
 
@@ -261,12 +337,13 @@ fn finding_12_seven_nested_cds_are_not_refused() {
 
 #[test]
 fn finding_13_shell_options_that_take_a_value() {
+    // tightened from "not Allow" in the third part: read, so hard-denied
     run_all(&[
-        ("bash --rcfile /dev/null -c 'rm -rf ~'", NotAllow),
-        ("bash --init-file /dev/null -c 'rm -rf ~'", NotAllow),
-        ("zsh --emulate sh -c 'rm -rf ~'", NotAllow),
-        ("fish -C true -c 'rm -rf ~'", NotAllow),
-        ("fish --init-command='rm -rf ~'", NotAllow),
+        ("bash --rcfile /dev/null -c 'rm -rf ~'", h(RD)),
+        ("bash --init-file /dev/null -c 'rm -rf ~'", h(RD)),
+        ("zsh --emulate sh -c 'rm -rf ~'", h(RD)),
+        ("fish -C true -c 'rm -rf ~'", h(RD)),
+        ("fish --init-command='rm -rf ~'", h(RD)),
     ]);
 }
 
@@ -276,14 +353,15 @@ fn finding_13_shell_options_that_take_a_value() {
 
 #[test]
 fn finding_14_crontab_bodies_and_other_stdin_readers() {
+    // tightened from "not Allow" in the third part: read, so hard-denied
     run_all(&[
-        ("echo '* * * * * rm -rf ~' | crontab -", NotAllow),
-        ("echo '@reboot rm -rf ~' | crontab -", NotAllow),
-        ("crontab - <<EOF\n* * * * * rm -rf ~\nEOF", NotAllow),
-        ("make -sf - <<EOF\nall:\n\trm -rf ~\nEOF", NotAllow),
-        ("make -f /dev/stdin <<EOF\nall:\n\trm -rf ~\nEOF", NotAllow),
-        ("chroot --userspec u:g /mnt <<EOF\nrm -rf ~\nEOF", NotAllow),
-        ("at now -f x <<EOF\nrm -rf ~\nEOF", NotAllow),
+        ("echo '* * * * * rm -rf ~' | crontab -", h(RD)),
+        ("echo '@reboot rm -rf ~' | crontab -", h(RD)),
+        ("crontab - <<EOF\n* * * * * rm -rf ~\nEOF", h(RD)),
+        ("make -sf - <<EOF\nall:\n\trm -rf ~\nEOF", h(RD)),
+        ("make -f /dev/stdin <<EOF\nall:\n\trm -rf ~\nEOF", h(RD)),
+        ("chroot --userspec u:g /mnt <<EOF\nrm -rf ~\nEOF", h(RD)),
+        ("at now -f x <<EOF\nrm -rf ~\nEOF", h(RD)),
     ]);
 }
 

@@ -1,5 +1,7 @@
 use std::io::{BufRead, BufReader};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
@@ -9,9 +11,11 @@ use std::time::Duration;
 use atrium_host::lifecycle::{
     InstanceLock, LifecycleError, Paths, install_keep_running, secure_dir,
 };
+#[cfg(target_os = "linux")]
 use atrium_host::peer::{AppIdentity, PeerError, verify_app_peer};
 use atrium_host::supervise::{ProcessIdentity, identify, kill_recorded, spawn_group, terminate};
 use atrium_protocol::thread::Cleanup;
+#[cfg(target_os = "linux")]
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
@@ -367,6 +371,14 @@ async fn unlinked_running_executable_is_rejected_by_kill_recorded_and_verify_app
     assert!(!pid_exists(recorded.pid));
 }
 
+// On macOS `/usr/bin/python3` is a stub that execs another Python, so the
+// recorded executable no longer matches, `kill_recorded` refuses (Unverified)
+// without signalling, and the leader never becomes a zombie: the premise of
+// this test holds only on Linux.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "M1-13: python3 stub re-execs on macOS; zombie-leader premise is Linux-only"
+)]
 #[tokio::test]
 async fn kill_recorded_setsid_grandchild_and_unreaped_zombie_leader_boundaries() {
     let mut cmd = Command::new("/usr/bin/python3");

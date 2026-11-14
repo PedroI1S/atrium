@@ -32,6 +32,9 @@ pub struct Analysis {
     pub use_index: HashMap<(usize, String), Vec<usize>>,
     pub unit_cwd: Vec<CwdState>,
     pub cwd_unknown: bool,
+    /// Some command may run in more than one directory, or in one the line
+    /// doesn't name: no rule but `Any` covers the line, and Home asks.
+    pub cwd_uncertain: bool,
     /// Bigger than the checker takes on (line bytes, commands, words, paths).
     pub overflow: bool,
     /// Text the raw-string checks run on.
@@ -84,6 +87,7 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         use_index: HashMap::new(),
         unit_cwd: vec![],
         cwd_unknown: false,
+        cwd_uncertain: false,
         overflow: false,
         raw: vec![],
         start: input.cwd.to_path_buf(),
@@ -184,6 +188,11 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
             a.reasons.push("unknown tool input".into());
         }
     }
+    a.cwd_uncertain = a.cwd_unknown
+        || a.unit_cwd.iter().any(|s| {
+            let c = s.candidates();
+            c.iter().any(|p| *p != c[0])
+        });
     for (idx, u) in a.uses.iter().enumerate() {
         a.use_index
             .entry((u.unit, u.word.clone()))
@@ -544,6 +553,10 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
             .first()
             .is_some_and(|a| matches!(a.as_str(), "/dev/stdin" | "/dev/fd/0" | "-"));
     }
+    // `| $X -s`: a command named at run time, told to read a script
+    if !is_interpreter(b) && shell::maybe_shell(first) {
+        return args.iter().any(|a| a == "-" || a == "-s");
+    }
     if b == "eval" || !is_interpreter(b) {
         return false;
     }
@@ -856,9 +869,18 @@ impl Ctx<'_> {
             }
         }
         // the gate's flat list (symlinks resolved), when it didn't line up
+        // (which word each path belongs to is lost, so each is checked with
+        // the strongest role any word of the call has)
         if a.aligned.is_none() {
+            let role = if a.uses.iter().any(|u| u.role == Role::Write) {
+                Role::Write
+            } else if a.uses.iter().any(|u| u.role == Role::MaybeWrite) {
+                Role::MaybeWrite
+            } else {
+                Role::Read
+            };
             for p in self.input.resolved_paths {
-                if let Some(h) = self.s.hit(p, Role::Read) {
+                if let Some(h) = self.s.hit(p, role) {
                     hits.push(h);
                 }
             }

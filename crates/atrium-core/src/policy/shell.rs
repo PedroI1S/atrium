@@ -10,6 +10,18 @@ use super::{Redirect, RedirectOp, Segment};
 
 const MAX_DEPTH: u8 = 6;
 
+/// How a command is joined to the one after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Join {
+    /// `;`, a newline, `&`, `|` or the end of the line.
+    #[default]
+    Seq,
+    /// `&&`: the next command runs only if this one succeeded.
+    And,
+    /// `||`: the next command runs only if this one failed.
+    Or,
+}
+
 /// One simple command, plus what the lexer saw inside it.
 #[derive(Debug, Clone)]
 pub struct Unit {
@@ -30,6 +42,8 @@ pub struct Unit {
     pub derived: bool,
     /// Non-zero: the units sharing this number are one pipeline.
     pub pipe: u32,
+    /// The operator after this command, as written (top level of its text).
+    pub join: Join,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -39,6 +53,8 @@ pub struct Lexed {
     pub reasons: Vec<String>,
     /// More commands than the checker takes on (`MAX_UNITS`).
     pub overflow: bool,
+    /// Every here-doc and here-string body at this level.
+    pub stdin_texts: Vec<String>,
 }
 
 pub const MAX_UNITS: usize = 512;
@@ -52,6 +68,7 @@ struct Builder {
     piped: bool,
     grouped: bool,
     pipe: u32,
+    join: Join,
 }
 
 static PIPE_IDS: AtomicU32 = AtomicU32::new(1);
@@ -67,6 +84,7 @@ impl Builder {
             proc_sub: false,
             piped,
             grouped,
+            join: Join::Seq,
         }
     }
     fn is_empty(&self) -> bool {
@@ -269,12 +287,19 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 }
                 out.reasons.push("subshell".into());
                 i += 1;
+                // `… | (sh)`: the group's first command reads the pipe
+                let carry = (c == '(' && cur.is_empty() && cur.piped).then_some(cur.pipe);
                 flush!();
                 cur.grouped = paren_depth > 0;
+                if let Some(id) = carry {
+                    cur.piped = true;
+                    cur.pipe = id;
+                }
                 continue;
             }
             '&' if chars.get(i + 1) == Some(&'&') => {
                 i += 2;
+                cur.join = Join::And;
                 flush!();
                 continue;
             }
@@ -310,6 +335,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     cur.pipe = PIPE_IDS.fetch_add(1, Ordering::Relaxed);
                 }
                 let id = cur.pipe;
+                if !is_pipe {
+                    cur.join = Join::Or;
+                }
                 flush!();
                 if is_pipe {
                     cur.piped = true;
@@ -656,6 +684,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             piped,
             grouped,
             pipe,
+            join,
         } = b;
         let seg = Segment {
             assignments,
@@ -676,8 +705,41 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             extra.push(l);
         }
         let mut payload_units: Vec<Unit> = vec![];
-        if let Some(p) = payload_of(&eff) {
-            let l = lex_depth(&p, depth + 1, true);
+        let mut payloads = payloads_of(&eff);
+        payloads.extend(env_payloads(&seg.argv));
+        // the output of a `$(…)` that is run as code: `sh -c "$(echo …)"`,
+        // `eval $(…)`, `$(…)` as the command word
+        let mut code_subs: Vec<String> = payloads
+            .iter()
+            .flat_map(|p| find_substitutions(p))
+            .collect();
+        if let Some(w0) = seg.argv.first()
+            && has_command_substitution(w0)
+        {
+            code_subs.extend(find_substitutions(w0));
+        }
+        // `bash < <(echo …)`, `source <(…)`, `bash <(…)`: a process
+        // substitution a shell runs (part 1's finding 9)
+        if eff
+            .first()
+            .is_some_and(|f| maybe_shell(f) || matches!(base(f), "source" | "."))
+        {
+            for w in seg
+                .argv
+                .iter()
+                .skip(1)
+                .chain(seg.redirects.iter().map(|r| &r.target))
+            {
+                if let Some(b) = w.strip_prefix("<(").and_then(|r| r.strip_suffix(')')) {
+                    code_subs.push(b.to_string());
+                }
+            }
+        }
+        for s in &code_subs {
+            payloads.extend(output_texts(s, depth));
+        }
+        for p in &payloads {
+            let l = lex_depth(p, depth + 1, true);
             out.overflow |= l.overflow;
             payload_units.extend(l.units);
             // reasons of a payload don't matter: the call is `sh -c …`, which
@@ -694,6 +756,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             exec_roots,
             derived,
             pipe,
+            join,
         };
         out.units.push(unit);
         if eff.first().map(|s| base(s)) == Some("find") {
@@ -717,8 +780,17 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     let is_stdin_code = |u: &Unit| {
         u.eff
             .first()
-            .is_some_and(|f| is_shell(base(f)) || matches!(base(f), "eval" | "source" | "."))
+            .is_some_and(|f| maybe_shell(f) || matches!(base(f), "eval" | "source" | "."))
             || reads_stdin_as_script(&u.eff)
+    };
+    // A pipe into a command named at run time (`| $PAGER`) is read only when
+    // it asks for a script on stdin (`-s`, `-`).
+    let is_pipe_code = |u: &Unit| {
+        u.eff.first().is_some_and(|f| {
+            is_shell(f)
+                || matches!(base(f), "eval" | "source" | ".")
+                || (maybe_shell(f) && u.eff[1..].iter().any(|a| a == "-s" || a == "-"))
+        }) || reads_stdin_as_script(&u.eff)
     };
     if out.units.len() > MAX_UNITS {
         out.overflow = true;
@@ -737,7 +809,13 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     || matches!(b, "perl" | "ruby" | "node" | "deno" | "bun" | "php" | "lua")
             })
     };
+    out.stdin_texts = bodies.iter().map(|(_, t)| t.clone()).collect();
+    let is_crontab = |u: &Unit| u.eff.first().is_some_and(|f| base(f) == "crontab");
     for (owner, text) in &bodies {
+        let owner_unit = raw_pos.get(*owner).and_then(|p| out.units.get(*p));
+        if owner_unit.is_some_and(is_crontab) {
+            texts.push(crontab_commands(text));
+        }
         let clearly_text = raw_pos
             .get(*owner)
             .and_then(|p| out.units.get(*p))
@@ -745,6 +823,11 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 !u.seg.argv.first().is_some_and(|w| {
                     (RESERVED.contains(&w.as_str()) && w != "!") || w == "}" || w == ")"
                 }) && !reads_code(u)
+                    // `ssh host $(echo bash) <<EOF`: for a command that runs
+                    // another one, a word built by a substitution may name
+                    // the program that reads the body
+                    && !(u.eff.first().is_some_and(|f| COMMAND_RUNNERS.contains(&base(f)))
+                        && u.seg.argv.iter().any(|w| has_command_substitution(w)))
                     && u.pipe == 0
                     && !u.proc_sub
                     && !u.grouped
@@ -753,20 +836,26 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             texts.push(text.clone());
         }
     }
-    if out.units.iter().any(is_stdin_code) {
+    if out.units.iter().any(is_pipe_code) {
         let mut seen_pipes: Vec<u32> = vec![];
         for u in out
             .units
             .iter()
-            .filter(|u| u.pipe != 0 && u.seg.piped && is_stdin_code(u))
+            .filter(|u| u.pipe != 0 && u.seg.piped && is_pipe_code(u))
         {
             if seen_pipes.contains(&u.pipe) {
                 continue;
             }
             seen_pipes.push(u.pipe);
+            let mut piped: Vec<String> = vec![];
             for prev in out.units.iter().filter(|p| p.pipe == u.pipe) {
-                echo_printf_texts(&prev.eff, &mut texts);
+                echo_printf_texts(&prev.eff, &mut piped);
             }
+            if is_crontab(u) {
+                let jobs: Vec<String> = piped.iter().map(|t| crontab_commands(t)).collect();
+                piped.extend(jobs);
+            }
+            texts.extend(piped);
         }
     }
     let mut extra_units: Vec<Unit> = vec![];
@@ -895,7 +984,10 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
         let n = match b.as_str() {
             "{" | "}" | "!" | "do" | "then" | "else" | "elif" | "if" | "while" | "until"
             | "time" | "builtin" | "nohup" | "coproc" => {
-                if b == "time" || b == "nohup" || b == "builtin" {
+                if b == "time" {
+                    // GNU `time -f FMT -o FILE`
+                    skip(&a, &["-f", "--format", "-o", "--output"], &[])
+                } else if b == "nohup" || b == "builtin" {
                     skip(&a, &[], &[])
                 } else {
                     1
@@ -903,7 +995,7 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
             }
             "command" | "setsid" | "unbuffer" => skip(&a, &[], &[]),
             "caffeinate" => skip(&a, &["-t", "-w"], &[]),
-            "arch" => skip(&a, &["-e", "-d"], &[]),
+            "arch" => skip(&a, &["-e", "-d", "-arch"], &[]),
             "sandbox-exec" => skip(&a, &["-f", "-n", "-p", "-D"], &[]),
             "chroot" => {
                 // `chroot [opts] NEWROOT [COMMAND…]`; without a command it
@@ -911,49 +1003,112 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                 let j = skip(&a, &["--userspec", "--groups"], &[]);
                 if j + 1 < a.len() { j + 1 } else { 0 }
             }
-            "flock" => {
-                // `flock [opts] FILE COMMAND…`, or `flock FILE -c 'string'`
-                // (the string runs through a shell).
-                if let Some(c) = a
-                    .iter()
-                    .position(|w| matches!(w.as_str(), "-c" | "--command"))
-                    && let Some(cmd) = a.get(c + 1).cloned()
-                {
+            "flock" | "script" => {
+                // `flock [opts] FILE COMMAND…` / `flock [opts] FILE -c 'string'`;
+                // macOS `script [opts] FILE [COMMAND…]`, Linux `script -c CMD
+                // [FILE]`. Only the wrapper's own `-c` (before the command
+                // starts) is a shell string; a `-c` later belongs to the
+                // command (`flock l git -c x=y push`, `script f sudo sh -c id`).
+                let with_value: &[&str] = if b == "flock" {
+                    &["-w", "-E", "--timeout", "--wait", "--conflict-exit-code"]
+                } else {
+                    &[
+                        "-F",
+                        "-t",
+                        "-T",
+                        "-I",
+                        "-O",
+                        "-B",
+                        "-E",
+                        "-m",
+                        "--log-io",
+                        "--log-in",
+                        "--log-out",
+                        "--log-timing",
+                        "--echo",
+                        "--logging-format",
+                    ]
+                };
+                let mut j = 1;
+                let mut file_seen = false;
+                let mut shell_string: Option<String> = None;
+                while j < a.len() {
+                    let w = a[j].as_str();
+                    if matches!(w, "-c" | "--command") {
+                        shell_string = a.get(j + 1).cloned();
+                        break;
+                    }
+                    if let Some(v) = w.strip_prefix("--command=") {
+                        shell_string = Some(v.to_string());
+                        break;
+                    }
+                    if with_value.contains(&w) {
+                        j += 2;
+                    } else if w.starts_with('-') && w.len() > 1 && !file_seen {
+                        j += 1;
+                    } else if !file_seen {
+                        file_seen = true;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(cmd) = shell_string {
                     a = vec!["sh".into(), "-c".into(), cmd];
                     continue;
                 }
-                let j = skip(
-                    &a,
-                    &["-w", "-E", "--timeout", "--wait", "--conflict-exit-code"],
-                    &[],
-                );
-                if j + 1 < a.len() { j + 1 } else { 0 }
-            }
-            "script" => {
-                // macOS `script [opts] FILE [COMMAND…]`; Linux `script -c CMD`
-                if let Some(c) = a
-                    .iter()
-                    .position(|w| matches!(w.as_str(), "-c" | "--command"))
-                    && let Some(cmd) = a.get(c + 1).cloned()
-                {
-                    a = vec!["sh".into(), "-c".into(), cmd];
-                    continue;
-                }
-                let j = skip(&a, &["-F", "-t", "-T", "-I", "-O", "-B", "-E", "-m"], &[]);
-                if j + 1 < a.len() { j + 1 } else { 0 }
+                if file_seen && j < a.len() { j } else { 0 }
             }
             "busybox" | "toybox" => 1,
             "exec" => skip(&a, &["-a"], &[]),
-            "nice" => skip(&a, &["-n"], &[]),
-            "ionice" => skip(&a, &["-c", "-n", "-p"], &[]),
-            "stdbuf" => skip(&a, &["-i", "-o", "-e"], &[]),
+            "nice" => skip(&a, &["-n", "--adjustment"], &[]),
+            "ionice" => skip(
+                &a,
+                &[
+                    "-c",
+                    "-n",
+                    "-p",
+                    "-P",
+                    "-u",
+                    "--class",
+                    "--classdata",
+                    "--pid",
+                    "--pgid",
+                    "--uid",
+                ],
+                &[],
+            ),
+            "stdbuf" => skip(
+                &a,
+                &["-i", "-o", "-e", "--input", "--output", "--error"],
+                &[],
+            ),
             "timeout" => {
-                let j = skip(&a, &["-s", "-k"], &[]);
+                let j = skip(&a, &["-s", "-k", "--signal", "--kill-after"], &[]);
                 (j + 1).min(a.len())
             }
             "xargs" => skip(
                 &a,
-                &["-n", "-P", "-I", "-L", "-s", "-d", "-a", "-E", "-J"],
+                &[
+                    "-n",
+                    "-P",
+                    "-I",
+                    "-L",
+                    "-s",
+                    "-d",
+                    "-a",
+                    "-E",
+                    "-J",
+                    "-R",
+                    "-S",
+                    "--max-args",
+                    "--max-procs",
+                    "--max-lines",
+                    "--max-chars",
+                    "--delimiter",
+                    "--arg-file",
+                    "--process-slot-var",
+                ],
                 &[],
             ),
             "env" => {
@@ -964,20 +1119,33 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                         j += 1;
                         break;
                     }
-                    if matches!(w, "-u" | "-C" | "-P" | "--unset" | "--chdir") {
+                    if matches!(
+                        w,
+                        "-u" | "-C" | "-P" | "-a" | "--unset" | "--chdir" | "--argv0"
+                    ) {
                         j += 2;
-                    } else if w == "-S"
-                        || w == "--split-string"
+                    } else if w == "-" {
+                        // `env -`: the same as `-i`
+                        j += 1;
+                    } else if w == "--split-string"
                         || w.starts_with("--split-string=")
-                        || (w.starts_with("-S") && !w.starts_with("--"))
+                        || (w.starts_with('-') && !w.starts_with("--") && w.contains('S'))
                     {
                         // a command line: splice its words in, split like a shell
-                        let (text, width) = if w == "-S" || w == "--split-string" {
+                        // (`-S`, `-S'…'`, `-iS '…'`)
+                        let after_s = if w.starts_with("--") {
+                            ""
+                        } else {
+                            &w[w.find('S').map_or(w.len(), |k| k + 1)..]
+                        };
+                        let (text, width) = if w == "--split-string"
+                            || (!w.starts_with("--") && after_s.is_empty())
+                        {
                             (a.get(j + 1).cloned(), 2)
                         } else if let Some(v) = w.strip_prefix("--split-string=") {
                             (Some(v.to_string()), 1)
                         } else {
-                            (Some(w[2..].to_string()), 1)
+                            (Some(after_s.to_string()), 1)
                         };
                         if let Some(text) = text {
                             let words = split_words(&text);
@@ -1036,12 +1204,64 @@ const SHELLS: &[&str] = &[
     "posh", "elvish", "xonsh",
 ];
 
-/// A shell by name, or a command word that starts with `$` or a backtick
-/// (`$SHELL`, `${SHELL}`, `` `which bash` ``): its value is only known at run
-/// time, so it is assumed to be a shell.
+/// A shell by name, or by the variables that hold one (`$SHELL`, `$BASH`).
 pub fn is_shell(cmd: &str) -> bool {
-    let b = base(cmd);
-    SHELLS.contains(&b) || cmd.starts_with('$') || cmd.starts_with('`')
+    SHELLS.contains(&base(cmd))
+        || matches!(
+            cmd,
+            "$SHELL" | "${SHELL}" | "$BASH" | "${BASH}" | "$0" | "${0}"
+        )
+}
+
+/// A shell by name, or a command word built at run time (`$SHELL`,
+/// `s$(echo h)`, `` `which bash` ``, `s${E}h`), which may be one. Used where
+/// text is handed to the command as a script (here-docs, `-c` payloads); a
+/// pipe into `$PAGER` is not read as code unless it says `-s` or `-`.
+pub fn maybe_shell(cmd: &str) -> bool {
+    is_shell(cmd) || has_substitution_or_var(cmd)
+}
+
+fn has_substitution_or_var(w: &str) -> bool {
+    w.contains('$') || w.contains('`')
+}
+
+/// Commands that run a command named in their arguments somewhere else (a
+/// host, a container, a namespace) and hand it their stdin.
+const COMMAND_RUNNERS: &[&str] = &[
+    "ssh",
+    "mosh",
+    "autossh",
+    "nsenter",
+    "unshare",
+    "docker",
+    "podman",
+    "nerdctl",
+    "kubectl",
+    "oc",
+    "lxc",
+    "incus",
+    "machinectl",
+    "systemd-run",
+    "systemd-nspawn",
+    "firejail",
+    "bwrap",
+    "flatpak-spawn",
+    "toolbox",
+    "distrobox",
+    "distrobox-enter",
+    "multipass",
+    "vagrant",
+    "limactl",
+    "colima",
+    "su",
+    "runuser",
+    "setpriv",
+    "parallel",
+];
+
+/// A word holding a command substitution.
+fn has_command_substitution(w: &str) -> bool {
+    w.contains("$(") || w.contains('`')
 }
 
 /// Commands that run their standard input as a script of commands without
@@ -1051,119 +1271,308 @@ pub fn reads_stdin_as_script(eff: &[String]) -> bool {
         return false;
     };
     let args = &eff[1..];
+    let stdin = |w: &str| matches!(w, "-" | "/dev/stdin" | "/dev/fd/0");
     match base(first) {
-        "at" | "batch" => !args.iter().any(|a| a == "-f" || a.starts_with("-f")),
+        // with `-f FILE` the job comes from the file, but a body given on
+        // stdin is still read as one (it costs nothing to check)
+        "at" | "batch" => true,
         "script" => true,
         "chroot" => {
             // without a command, `chroot NEWROOT` starts a shell
-            args.iter().filter(|a| !a.starts_with('-')).count() <= 1
+            let mut operands = 0;
+            let mut k = 0;
+            while k < args.len() {
+                let a = args[k].as_str();
+                if matches!(a, "--userspec" | "--groups") {
+                    k += 2;
+                    continue;
+                }
+                if !a.starts_with('-') {
+                    operands += 1;
+                }
+                k += 1;
+            }
+            operands <= 1
         }
-        "crontab" => args.iter().any(|a| a == "-"),
+        "crontab" => args.iter().any(|a| stdin(a)),
         "make" | "gmake" => args.iter().enumerate().any(|(i, a)| {
-            a == "-f-"
-                || a == "--file=-"
-                || a == "--makefile=-"
-                || (matches!(a.as_str(), "-f" | "--file" | "--makefile")
-                    && args.get(i + 1).is_some_and(|n| n == "-"))
+            let next_is_stdin = args.get(i + 1).is_some_and(|n| stdin(n));
+            if let Some(v) = a
+                .strip_prefix("--file=")
+                .or_else(|| a.strip_prefix("--makefile="))
+            {
+                return stdin(v);
+            }
+            if matches!(a.as_str(), "--file" | "--makefile") {
+                return next_is_stdin;
+            }
+            // `-f -`, `-f-`, `-sf -`, `-f/dev/stdin`
+            if a.starts_with('-')
+                && !a.starts_with("--")
+                && let Some(k) = a.find('f')
+            {
+                let rest = &a[k + 1..];
+                return if rest.is_empty() {
+                    next_is_stdin
+                } else {
+                    stdin(rest)
+                };
+            }
+            false
         }),
         _ => false,
     }
 }
 
-/// The string a shell or `eval` will run, if the command has one.
-fn unescape_printf_to(s: &str, out: &mut String) {
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.peek().copied() {
-                Some('n') => {
-                    chars.next();
-                    out.push('\n');
-                }
-                Some('t') => {
-                    chars.next();
-                    out.push('\t');
-                }
-                Some('r') => {
-                    chars.next();
-                    out.push('\r');
-                }
-                Some('\\') => {
-                    chars.next();
-                    out.push('\\');
-                }
-                _ => out.push('\\'),
+/// The commands of a crontab: each line without its five schedule fields
+/// (or its `@reboot`-style word); variable lines and comments dropped.
+fn crontab_commands(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let l = line.trim_start();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let skip = if l.starts_with('@') { 1 } else { 5 };
+        let mut rest = l;
+        for _ in 0..skip {
+            rest = rest.trim_start();
+            match rest.find(char::is_whitespace) {
+                Some(k) => rest = &rest[k..],
+                None => rest = "",
             }
-        } else {
+        }
+        let first = l.split_whitespace().next().unwrap_or("");
+        if !l.starts_with('@') && is_assignment_word(first) {
+            continue;
+        }
+        out.push_str(rest.trim_start());
+        out.push('\n');
+    }
+    out
+}
+
+/// Widths above this are not padded (a `%999999999s` must not allocate).
+const MAX_PAD: usize = 256;
+
+/// Decodes one backslash escape at `cs[i]` (just after the `\`), the way
+/// `echo -e`, zsh's and dash's `echo`, `printf` formats and `%b` do.
+/// `octal0`: octal is `\0NNN` (echo, `%b`) rather than `\NNN` (a format).
+/// Returns the index after the escape, or `None` for `\c` (output stops).
+fn unescape_one(cs: &[char], i: usize, octal0: bool, out: &mut String) -> Option<usize> {
+    let Some(&c) = cs.get(i) else {
+        out.push('\\');
+        return Some(i);
+    };
+    let hex = |from: usize, max: usize| -> (u32, usize) {
+        let mut v = 0u32;
+        let mut n = 0;
+        while n < max
+            && let Some(d) = cs.get(from + n).and_then(|c| c.to_digit(16))
+        {
+            v = v.saturating_mul(16).saturating_add(d);
+            n += 1;
+        }
+        (v, n)
+    };
+    let octal = |from: usize, max: usize| -> (u32, usize) {
+        let mut v = 0u32;
+        let mut n = 0;
+        while n < max
+            && let Some(d) = cs.get(from + n).and_then(|c| c.to_digit(8))
+        {
+            v = v * 8 + d;
+            n += 1;
+        }
+        (v, n)
+    };
+    let mut push_code = |v: u32| {
+        if let Some(ch) = char::from_u32(v & 0x10ffff) {
+            out.push(ch);
+        }
+    };
+    let simple = match c {
+        'a' => Some('\x07'),
+        'b' => Some('\x08'),
+        'e' | 'E' => Some('\x1b'),
+        'f' => Some('\x0c'),
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        't' => Some('\t'),
+        'v' => Some('\x0b'),
+        '\\' | '\'' | '"' | '?' => Some(c),
+        _ => None,
+    };
+    if let Some(ch) = simple {
+        out.push(ch);
+        return Some(i + 1);
+    }
+    match c {
+        'c' => None,
+        'x' | 'u' | 'U' => {
+            let max = match c {
+                'x' => 2,
+                'u' => 4,
+                _ => 8,
+            };
+            let (v, n) = hex(i + 1, max);
+            if n == 0 {
+                out.push('\\');
+                out.push(c);
+            } else {
+                push_code(v);
+            }
+            Some(i + 1 + n)
+        }
+        '0' if octal0 => {
+            let (v, n) = octal(i + 1, 3);
+            push_code(v);
+            Some(i + 1 + n)
+        }
+        '0'..='7' if !octal0 => {
+            let (v, n) = octal(i, 3);
+            push_code(v);
+            Some(i + n)
+        }
+        _ => {
+            out.push('\\');
             out.push(c);
+            Some(i + 1)
         }
     }
 }
 
-fn format_printf(fmt: &str, args: &[String]) -> String {
-    let mut out = String::new();
-    if args.is_empty() {
-        unescape_printf_to(fmt, &mut out);
-        return out;
+/// `s` with every escape decoded; `false` when a `\c` stopped the output.
+fn unescape_to(s: &str, octal0: bool, out: &mut String) -> bool {
+    let cs: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] == '\\' {
+            match unescape_one(&cs, i + 1, octal0, out) {
+                Some(n) => i = n,
+                None => return false,
+            }
+        } else {
+            out.push(cs[i]);
+            i += 1;
+        }
     }
+    true
+}
+
+/// What `printf FORMAT ARGS…` prints: the format is reused while arguments
+/// remain; a conversion with no argument left prints nothing (or `0`);
+/// width, precision (`*` takes an argument), `%c` and `%b` are applied.
+fn format_printf(fmt: &str, args: &[String], b_octal0: bool) -> String {
+    let cs: Vec<char> = fmt.chars().collect();
+    let mut out = String::new();
     let mut idx = 0usize;
-    while idx < args.len() {
+    loop {
         let before = idx;
-        let mut chars = fmt.chars().peekable();
-        while let Some(c) = chars.next() {
+        let mut i = 0;
+        while i < cs.len() {
+            let c = cs[i];
             if c == '\\' {
-                match chars.peek().copied() {
-                    Some('n') => {
-                        chars.next();
-                        out.push('\n');
-                    }
-                    Some('t') => {
-                        chars.next();
-                        out.push('\t');
-                    }
-                    Some('r') => {
-                        chars.next();
-                        out.push('\r');
-                    }
-                    Some('\\') => {
-                        chars.next();
-                        out.push('\\');
-                    }
-                    _ => out.push('\\'),
+                match unescape_one(&cs, i + 1, false, &mut out) {
+                    Some(n) => i = n,
+                    None => return out,
                 }
-            } else if c == '%' {
-                if chars.peek() == Some(&'%') {
-                    chars.next();
-                    out.push('%');
-                } else {
-                    while let Some(&p) = chars.peek() {
-                        if matches!(p, '-' | '+' | ' ' | '#' | '.' | '0'..='9') {
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    let conv = chars.next();
-                    if let Some(arg) = args.get(idx) {
-                        if conv == Some('b') {
-                            unescape_printf_to(arg, &mut out);
-                        } else {
-                            out.push_str(arg);
-                        }
-                        idx += 1;
-                    }
-                }
-            } else {
+                continue;
+            }
+            if c != '%' {
                 out.push(c);
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if cs.get(i) == Some(&'%') {
+                out.push('%');
+                i += 1;
+                continue;
+            }
+            let mut next_arg = || {
+                let a = args.get(idx).cloned();
+                if a.is_some() {
+                    idx += 1;
+                }
+                a
+            };
+            let mut left = false;
+            while let Some(&f) = cs.get(i) {
+                if matches!(f, '-' | '+' | ' ' | '#' | '0' | '\'') {
+                    left |= f == '-';
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let number = |i: &mut usize, next_arg: &mut dyn FnMut() -> Option<String>| {
+                if cs.get(*i) == Some(&'*') {
+                    *i += 1;
+                    let v: i64 = next_arg().and_then(|a| a.trim().parse().ok()).unwrap_or(0);
+                    return Some(v);
+                }
+                let mut v: Option<i64> = None;
+                while let Some(d) = cs.get(*i).and_then(|c| c.to_digit(10)) {
+                    v = Some(
+                        v.unwrap_or(0)
+                            .saturating_mul(10)
+                            .saturating_add(i64::from(d)),
+                    );
+                    *i += 1;
+                }
+                v
+            };
+            let width = number(&mut i, &mut next_arg);
+            let precision = if cs.get(i) == Some(&'.') {
+                i += 1;
+                Some(number(&mut i, &mut next_arg).unwrap_or(0))
+            } else {
+                None
+            };
+            while matches!(cs.get(i), Some('h' | 'l' | 'L' | 'q' | 'j' | 'z' | 't')) {
+                i += 1;
+            }
+            let conv = cs.get(i).copied();
+            i += 1;
+            let arg = next_arg();
+            let mut piece = String::new();
+            let mut stop = false;
+            match conv {
+                Some('s') => piece.push_str(arg.as_deref().unwrap_or("")),
+                Some('b') => {
+                    stop = !unescape_to(arg.as_deref().unwrap_or(""), b_octal0, &mut piece);
+                }
+                Some('c') => piece.extend(arg.as_deref().unwrap_or("").chars().next()),
+                Some(_) => piece.push_str(arg.as_deref().unwrap_or("0")),
+                None => {}
+            }
+            if let (Some(p), Some('s' | 'b')) = (precision, conv) {
+                piece = piece.chars().take(p.max(0) as usize).collect();
+            }
+            if let Some(w) = width {
+                let (w, left) = (w.unsigned_abs() as usize, left || w < 0);
+                let n = piece.chars().count();
+                if w > n && w <= MAX_PAD {
+                    let pad = " ".repeat(w - n);
+                    piece = if left { piece + &pad } else { pad + &piece };
+                }
+            }
+            out.push_str(&piece);
+            if stop {
+                return out;
             }
         }
-        if idx == before {
+        if idx == before || idx >= args.len() {
             break;
         }
     }
     out
 }
 
+/// The text `echo`, `printf` or `yes` writes, in every reading a shell might
+/// give it (escapes decoded or not, either octal form). Nothing for other
+/// commands.
 fn echo_printf_texts(eff: &[String], texts: &mut Vec<String>) {
     let Some(first) = eff.first() else {
         return;
@@ -1184,10 +1593,12 @@ fn echo_printf_texts(eff: &[String], texts: &mut Vec<String>) {
             }
             if j < eff.len() {
                 let joined = eff[j..].join(" ");
-                if joined.contains("\\n") {
+                for octal0 in [true, false] {
                     let mut unesc = String::new();
-                    unescape_printf_to(&joined, &mut unesc);
-                    texts.push(unesc);
+                    unescape_to(&joined, octal0, &mut unesc);
+                    if unesc != joined {
+                        texts.push(unesc);
+                    }
                 }
                 texts.push(joined);
             }
@@ -1207,20 +1618,49 @@ fn echo_printf_texts(eff: &[String], texts: &mut Vec<String>) {
             }
             if j < eff.len() {
                 let rest = &eff[j..];
-                let formatted = format_printf(&rest[0], &rest[1..]);
-                texts.push(formatted);
+                for b_octal0 in [true, false] {
+                    texts.push(format_printf(&rest[0], &rest[1..], b_octal0));
+                }
                 if rest.len() > 1 {
                     texts.push(rest[1..].join(" "));
                 }
             }
         }
+        "yes" => {
+            let t = if eff.len() > 1 {
+                eff[1..].join(" ")
+            } else {
+                "y".to_string()
+            };
+            texts.push(t);
+        }
         _ => {}
     }
 }
 
-fn payload_of(eff: &[String]) -> Option<String> {
-    let first = base(eff.first()?);
-    if is_shell(eff.first()?) {
+/// What the commands in `body` write to stdout, as far as the engine can read
+/// it (`echo`, `printf`, `yes`, here-docs and here-strings), for a `$(…)`
+/// whose output is run as code (`sh -c "$(…)"`, `eval $(…)`, `$(…)` as the
+/// command word).
+fn output_texts(body: &str, depth: u8) -> Vec<String> {
+    let l = lex_depth(body, depth + 1, true);
+    let mut texts = l.stdin_texts.clone();
+    for u in &l.units {
+        echo_printf_texts(&u.eff, &mut texts);
+    }
+    texts
+}
+
+/// The strings a shell or `eval` will run: a shell's `-c` string, fish's
+/// `-C`/`--init-command`, `eval`'s arguments. Options that take a value
+/// (`--rcfile F`, `--emulate sh`, `-o pipefail`) are skipped.
+fn payloads_of(eff: &[String]) -> Vec<String> {
+    let mut out = vec![];
+    let Some(f) = eff.first() else {
+        return out;
+    };
+    let first = base(f);
+    if maybe_shell(f) {
         let mut has_c = false;
         let mut j = 1;
         while j < eff.len() {
@@ -1236,10 +1676,23 @@ fn payload_of(eff: &[String]) -> Option<String> {
                 j += 1;
                 continue;
             }
-            if let Some(rest) = w.strip_prefix("--command=") {
-                return Some(rest.to_string());
+            if let Some(rest) = w
+                .strip_prefix("--command=")
+                .or_else(|| w.strip_prefix("--init-command="))
+            {
+                out.push(rest.to_string());
+                j += 1;
+                continue;
             }
-            if matches!(w.as_str(), "-o" | "+o" | "-O" | "+O") {
+            if matches!(w.as_str(), "-C" | "--init-command") {
+                out.extend(eff.get(j + 1).cloned());
+                j += 2;
+                continue;
+            }
+            if matches!(
+                w.as_str(),
+                "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file" | "--emulate"
+            ) {
                 j += 2;
                 continue;
             }
@@ -1250,9 +1703,8 @@ fn payload_of(eff: &[String]) -> Option<String> {
             break;
         }
         if has_c {
-            return eff.get(j).cloned();
+            out.extend(eff.get(j).cloned());
         }
-        None
     } else if first == "eval" {
         let args = if eff.get(1).map(String::as_str) == Some("--") {
             &eff[2..]
@@ -1260,13 +1712,66 @@ fn payload_of(eff: &[String]) -> Option<String> {
             &eff[1..]
         };
         if !args.is_empty() {
-            Some(args.join(" "))
-        } else {
-            None
+            out.push(args.join(" "));
         }
-    } else {
-        None
     }
+    out
+}
+
+/// `env -S 'TEXT'` and `env -C DIR CMD…`: the command line `env` runs, as
+/// text (`cd DIR && CMD…` for `-C`), so its words are checked as paths too.
+fn env_payloads(argv: &[String]) -> Vec<String> {
+    let mut out = vec![];
+    let Some(k) = argv.iter().position(|w| base(w) == "env") else {
+        return out;
+    };
+    let mut chdir: Option<String> = None;
+    let mut j = k + 1;
+    while j < argv.len() {
+        let w = argv[j].as_str();
+        if w == "--" {
+            j += 1;
+            break;
+        }
+        if let Some(t) = w.strip_prefix("--split-string=") {
+            out.push(t.to_string());
+        } else if w == "-S" || w == "--split-string" {
+            out.extend(argv.get(j + 1).cloned());
+            j += 2;
+            continue;
+        } else if w.starts_with('-') && !w.starts_with("--") && w.contains('S') {
+            // `-S'…'`, `-iS 'rm …'`: the rest of the cluster, or the next word
+            let rest = &w[w.find('S').map_or(w.len(), |i| i + 1)..];
+            if rest.is_empty() {
+                out.extend(argv.get(j + 1).cloned());
+                j += 2;
+                continue;
+            }
+            out.push(rest.to_string());
+        } else if w == "-C" || w == "--chdir" {
+            chdir = argv.get(j + 1).cloned();
+            j += 2;
+            continue;
+        } else if let Some(d) = w.strip_prefix("--chdir=") {
+            chdir = Some(d.to_string());
+        } else if matches!(w, "-u" | "--unset" | "-P" | "-a" | "--argv0") {
+            j += 2;
+            continue;
+        } else if !(w.starts_with('-') || is_assignment_word(w)) {
+            break;
+        }
+        j += 1;
+    }
+    if let Some(d) = chdir {
+        let rest: Vec<String> = argv[j.min(argv.len())..].iter().map(|w| quote(w)).collect();
+        out.push(format!("cd {} && {}", quote(&d), rest.join(" ")));
+    }
+    out
+}
+
+/// Single-quotes a word for re-lexing.
+fn quote(w: &str) -> String {
+    format!("'{}'", w.replace('\'', "'\\''"))
 }
 
 /// The directories `find` walks and the index where its expression starts.
@@ -1326,6 +1831,7 @@ fn find_exec_units(eff: &[String], units: &mut Vec<Unit>) {
                     exec_roots: Some(roots.clone()),
                     derived: true,
                     pipe: 0,
+                    join: Join::Seq,
                 });
             }
             k = m;

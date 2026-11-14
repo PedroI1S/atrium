@@ -147,9 +147,6 @@ fn ordinary_lines_after_a_working_cd() {
             "cd proj && rm -rf node_modules",
             ["Ask", "Ask", "Allow", "Allow"],
         ),
-        ("cd proj; cat .npmrc", ["Ask", "Allow", "Allow", "Allow"]),
-        ("cd proj\ncat .npmrc", ["Ask", "Allow", "Allow", "Allow"]),
-        ("cd build; rm -rf *", ["Ask", "Ask", "Allow", "Allow"]),
         (
             "cd proj && cat .gitignore",
             ["Ask", "Allow", "Allow", "Allow"],
@@ -188,7 +185,61 @@ fn ordinary_lines_after_a_working_cd() {
     ]);
 }
 
+/// Third-part corrections (the fixer's, see the handoff): after `;` or a
+/// newline a `cd` may have failed, so the shell may still be in `~`. These
+/// three lines then read `~/.npmrc` or run `rm -rf ~/*`, the same shape as
+/// the review's held hard denies (`cd nope; cat .ssh/id_rsa`, `cd nope; rm
+/// -rf .`). The table had dev's verdicts (Ask; Allow with rules), which is
+/// finding 2. Written with `&&` (above) they keep dev's verdicts.
+#[test]
+fn after_a_cd_that_may_fail_the_old_directory_counts() {
+    check_table(&[
+        (
+            "cd proj; cat .npmrc",
+            [
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+            ],
+        ),
+        (
+            "cd proj\ncat .npmrc",
+            [
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+            ],
+        ),
+        (
+            "cd build; rm -rf *",
+            [
+                "Hard(recursive-delete-outside-cwd)",
+                "Hard(recursive-delete-outside-cwd)",
+                "Hard(recursive-delete-outside-cwd)",
+                "Hard(recursive-delete-outside-cwd)",
+            ],
+        ),
+        // an uncertain cwd asks under rules (brief item 1(2), contract §9);
+        // `Any` and FullAccess allow what isn't hard-denied (dev: Allow with
+        // the prefix rules)
+        ("cd proj; ls", ["Ask", "Ask", "Allow", "Allow"]),
+        ("cd proj; cat README.md", ["Ask", "Ask", "Allow", "Allow"]),
+        // `cd X || exit`: past it the shell is in X
+        (
+            "cd build || exit 1; rm -rf *",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("(cd sub && make)", ["Ask", "Ask", "Allow", "Allow"]),
+    ]);
+}
+
 /// Review finding 12: nested `cd`s. dev never refuses them as "too large".
+/// Third-part correction: seven `cd`s joined by `;` may each fail, so the
+/// shell may be in any of 128 directories: too many to follow, the cwd is
+/// unknown and the prefix rules no longer cover the line (dev: Allow). Joined
+/// by `&&` they keep dev's verdicts.
 #[test]
 fn ordinary_nested_cds() {
     check_table(&[
@@ -206,7 +257,7 @@ fn ordinary_nested_cds() {
         ),
         (
             "cd a; cd b; cd c; cd d; cd e; cd f; cd g; ls",
-            ["Ask", "Allow", "Allow", "Allow"],
+            ["Ask", "Ask", "Allow", "Allow"],
         ),
         ("cd a/b/c/d/e/f/g && ls", ["Ask", "Allow", "Allow", "Allow"]),
         (
@@ -342,6 +393,12 @@ fn ordinary_heredoc_text_with_a_substitution_is_not_a_false_hard_deny() {
         ),
         (
             "cat > notes.md <<EOF\nBuilt $(date)\nsudo make install\nEOF",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        // a substitution in the arguments of an ordinary owner stays text
+        // (only a command that runs another command reads it: finding 5)
+        (
+            "tee notes-$(date).md <<EOF\nsudo make install\nEOF",
             ["Ask", "Ask", "Allow", "Allow"],
         ),
     ]);

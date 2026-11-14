@@ -126,7 +126,8 @@ fn allow_covers(
         return none;
     }
     let command = matches!(input.check.subject, ToolSubject::Command { .. });
-    let simple = command && a.reasons.is_empty() && !part_ids.is_empty();
+    // an uncertain cwd: only `Any` covers it (contract §9: the line asks)
+    let simple = command && a.reasons.is_empty() && !part_ids.is_empty() && !a.cwd_uncertain;
     if rule.path_scope.is_some() && command && !simple {
         return none;
     }
@@ -581,7 +582,11 @@ impl Home<'_> {
             },
             ToolSubject::Command { line, .. } => {
                 let tops = parts(self.a);
-                if tops.is_empty() || !self.a.reasons.is_empty() || line.contains('\n') {
+                if tops.is_empty()
+                    || !self.a.reasons.is_empty()
+                    || self.a.cwd_uncertain
+                    || line.contains('\n')
+                {
                     return PolicyVerdict::Ask;
                 }
                 let mut used_rule = None;

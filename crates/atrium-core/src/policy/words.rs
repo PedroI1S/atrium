@@ -6,7 +6,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use super::RedirectOp;
-use super::shell::{Unit, base};
+use super::shell::{Join, Unit, base};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -58,7 +58,10 @@ pub struct Walk {
 
 pub const MAX_USES: usize = 4096;
 pub const MAX_PATHS: usize = 16384;
-const MAX_CANDIDATES: usize = 16;
+/// Directories a known cwd may be (each `cd` that may fail doubles them).
+const MAX_CANDIDATES: usize = 32;
+/// Directories an unknown cwd is checked against, besides home and the start.
+const MAX_SEEN: usize = 64;
 const MAX_BRACE_RESULTS: usize = 256;
 
 pub type Resolver<'a> = &'a dyn Fn(&str, &Path, &Path) -> PathBuf;
@@ -476,41 +479,33 @@ fn raw_words_of(unit: &Unit) -> Vec<(String, Role)> {
     out
 }
 
-/// Applies a `cd`-like command to the tracked directory.
-#[allow(clippy::too_many_arguments)]
-fn apply_cd(
+/// What a directory change does to the tracked directory.
+enum Cd {
+    /// The shell is in one of these if the command worked (one per
+    /// candidate the command ran in, or one for an absolute target).
+    Moved(Vec<PathBuf>),
+    /// The engine can't say where the shell is (`popd`, `pushd`, `cd -`,
+    /// `cd $X`, a `cd` in a subshell or pipeline); these are the targets it
+    /// can name.
+    Lost(Vec<PathBuf>),
+}
+
+/// The effect of `unit` if it changes directory, resolved against every
+/// directory the shell may be in (`cands`).
+fn cd_effect(
     unit: &Unit,
-    state: &mut CwdState,
-    current: &mut Option<PathBuf>,
-    prev: &mut Option<PathBuf>,
-    seen: &mut Vec<PathBuf>,
+    cands: &[PathBuf],
     start: &Path,
     home: &Path,
     resolve: Resolver<'_>,
-    unknown: &mut bool,
-    overflow: &mut bool,
-) {
-    let Some(first) = unit.eff.first() else {
-        return;
-    };
+) -> Option<Cd> {
+    let first = unit.eff.first()?;
     let name = base(first);
     if !matches!(name, "cd" | "pushd" | "popd" | "chdir") {
-        return;
+        return None;
     }
-    let make_unknown = |seen: &Vec<PathBuf>| {
-        let mut c = vec![home.to_path_buf(), start.to_path_buf()];
-        for s in seen {
-            if !c.contains(s) {
-                c.push(s.clone());
-            }
-        }
-        CwdState::Unknown(c)
-    };
     if name == "popd" {
-        *current = None;
-        *state = make_unknown(seen);
-        *unknown = true;
-        return;
+        return Some(Cd::Lost(vec![]));
     }
     let mut args: Vec<&String> = unit.eff.iter().skip(1).collect();
     while let Some(a) = args.first() {
@@ -520,87 +515,77 @@ fn apply_cd(
             break;
         }
     }
-    let targets: Vec<PathBuf> = match args.as_slice() {
-        [] if name == "pushd" => vec![],
-        [] => vec![home.to_path_buf()],
-        [a] if a.as_str() == "-" => prev.clone().into_iter().collect(),
+    let targets: Option<Vec<PathBuf>> = match args.as_slice() {
+        [] if name == "pushd" => None,
+        [] => Some(vec![home.to_path_buf()]),
+        // `$OLDPWD`: not something the line names
+        [a] if a.as_str() == "-" || a.starts_with("~+") || a.starts_with("~-") => None,
         [a] => {
-            let expanded = expand_home(a, home, current.as_deref().unwrap_or(start));
+            let expanded = expand_home(a, home, start);
             if has_unknown_var(&expanded) || expanded.contains(['*', '?', '[']) {
-                vec![]
+                None
             } else if Path::new(&expanded).is_absolute() {
-                vec![resolve(&expanded, start, home)]
+                Some(vec![resolve(&expanded, start, home)])
             } else {
-                let mut v = vec![];
-                if let Some(c) = current.as_ref() {
-                    v.push(resolve(&expanded, c, home));
-                }
-                for base_dir in [Some(start), prev.as_deref()].into_iter().flatten() {
-                    let p = resolve(&expanded, base_dir, home);
-                    if (!expanded.starts_with("..") || p.starts_with(home) || p.starts_with(start))
-                        && !v.contains(&p)
-                    {
-                        v.push(p);
-                    }
-                }
-                v
+                Some(cands.iter().map(|c| resolve(&expanded, c, home)).collect())
             }
         }
-        _ => vec![],
+        _ => None,
     };
-    if targets.is_empty() {
-        *current = None;
-        *state = make_unknown(seen);
-        *unknown = true;
-        return;
-    }
-    let primary = targets[0].clone();
-    for t in targets {
-        if !seen.contains(&t) {
-            seen.push(t);
+    // `pushd` keeps a stack the line can pop later: never followed.
+    Some(match targets {
+        Some(t) if name != "pushd" && !unit.grouped => Cd::Moved(t),
+        Some(t) => Cd::Lost(t),
+        None => Cd::Lost(vec![]),
+    })
+}
+
+/// Appends up to `MAX_SEEN` directories. No two candidates are compared by
+/// value: the gate (filesystem) and the engine (lexical) must build lists of
+/// the same shape from the same words.
+fn push_seen(seen: &mut Vec<PathBuf>, more: &[PathBuf]) {
+    for p in more {
+        if seen.len() >= MAX_SEEN {
+            return;
         }
-    }
-    if seen.len() > MAX_CANDIDATES {
-        *overflow = true;
-    }
-    *prev = current.take().or_else(|| prev.take());
-    *current = Some(primary);
-    if unit.grouped || *unknown {
-        *state = make_unknown(seen);
-        *unknown = true;
-    } else {
-        *state = CwdState::Known(seen.clone());
+        seen.push(p.clone());
     }
 }
 
+/// An unknown directory: home, the start and every directory the line named.
+fn lost_cands(home: &Path, start: &Path, seen: &[PathBuf]) -> Vec<PathBuf> {
+    let mut v = vec![home.to_path_buf(), start.to_path_buf()];
+    v.extend(seen.iter().cloned());
+    v
+}
+
+/// The next command written at the same level as unit `i`.
+fn next_top(units: &[Unit], i: usize) -> Option<&Unit> {
+    units[i + 1..].iter().find(|u| !u.derived)
+}
+
+/// Resolves every word against every directory the shell may be in.
+///
+/// A `cd` that is followed by `&&` moves the rest of that chain to its
+/// target; after `;`, `||`, a newline or the end of an `&&` chain the shell
+/// may be in the target or where it was before (the `cd` may have failed), so
+/// both stay candidates. A command written as `cd DIR || exit` leaves only the
+/// target. A change the engine can't follow makes the directory unknown:
+/// every directory the line named, home and the start.
 pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) -> Walk {
     let mut w = Walk::default();
-    let mut state = CwdState::Known(vec![start.to_path_buf()]);
-    let mut current: Option<PathBuf> = Some(start.to_path_buf());
-    let mut prev: Option<PathBuf> = None;
-    let mut seen: Vec<PathBuf> = vec![start.to_path_buf()];
+    let mut cands: Vec<PathBuf> = vec![start.to_path_buf()];
+    // where the shell is when an `&&` chain stopped early
+    let mut pool: Vec<PathBuf> = vec![];
+    let mut seen: Vec<PathBuf> = vec![];
     for (i, unit) in units.iter().enumerate() {
-        w.unit_cwd.push(state.clone());
+        w.unit_cwd.push(if w.unknown {
+            CwdState::Unknown(cands.clone())
+        } else {
+            CwdState::Known(cands.clone())
+        });
         for (word, role) in words_of(unit, &mut w.overflow) {
-            let mut paths: Vec<PathBuf> = state
-                .candidates()
-                .into_iter()
-                .map(|c| resolve(&word, c, home))
-                .collect();
-            if seen.len() > 1 && word.starts_with("..") {
-                let rem: PathBuf = Path::new(&word)
-                    .components()
-                    .skip_while(|c| matches!(c, Component::ParentDir | Component::CurDir))
-                    .collect();
-                if let Some(rem_s) = rem.to_str().filter(|s| !s.is_empty()) {
-                    for base_dir in [start, home] {
-                        let p = resolve(rem_s, base_dir, home);
-                        if !paths.contains(&p) {
-                            paths.push(p);
-                        }
-                    }
-                }
-            }
+            let paths: Vec<PathBuf> = cands.iter().map(|c| resolve(&word, c, home)).collect();
             w.total += paths.len();
             if w.uses.len() >= MAX_USES || w.total > MAX_PATHS {
                 w.overflow = true;
@@ -613,20 +598,65 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
                 paths,
             });
         }
-        apply_cd(
-            unit,
-            &mut state,
-            &mut current,
-            &mut prev,
-            &mut seen,
-            start,
-            home,
-            resolve,
-            &mut w.unknown,
-            &mut w.overflow,
-        );
         if w.overflow {
             return w;
+        }
+        // a payload or substitution isn't a link of the chain it sits in
+        let join = if unit.derived { Join::Seq } else { unit.join };
+        match cd_effect(unit, &cands, start, home, resolve) {
+            None => {
+                if join == Join::And && !w.unknown {
+                    pool.extend(cands.iter().cloned());
+                }
+            }
+            Some(Cd::Moved(targets)) => {
+                push_seen(&mut seen, &targets);
+                let exits_on_failure = join == Join::Or
+                    && next_top(units, i).is_some_and(|n| {
+                        n.eff
+                            .first()
+                            .is_some_and(|f| matches!(base(f), "exit" | "return"))
+                    });
+                if w.unknown {
+                    cands = lost_cands(home, start, &seen);
+                } else if join == Join::And {
+                    pool.append(&mut cands);
+                    cands = targets;
+                } else if exits_on_failure {
+                    cands = targets;
+                } else {
+                    let mut next = targets;
+                    next.append(&mut cands);
+                    cands = next;
+                }
+            }
+            Some(Cd::Lost(targets)) => {
+                push_seen(&mut seen, &targets);
+                if !w.unknown {
+                    // (once unknown, `cands` is home, the start and `seen`)
+                    push_seen(&mut seen, &cands);
+                    push_seen(&mut seen, &pool);
+                }
+                pool.clear();
+                w.unknown = true;
+                cands = lost_cands(home, start, &seen);
+            }
+        }
+        if join != Join::And && !pool.is_empty() {
+            if w.unknown {
+                push_seen(&mut seen, &pool);
+                pool.clear();
+                cands = lost_cands(home, start, &seen);
+            } else {
+                cands.append(&mut pool);
+            }
+        }
+        if !w.unknown && cands.len() > MAX_CANDIDATES {
+            // too many to follow: the directory becomes unknown (asks)
+            push_seen(&mut seen, &cands);
+            push_seen(&mut seen, &pool);
+            w.unknown = true;
+            cands = lost_cands(home, start, &seen);
         }
     }
     w

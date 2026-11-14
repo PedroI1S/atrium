@@ -57,27 +57,24 @@ New files in `crates/atrium-core/tests/`: `adversarial_policy.rs` 7 pass + 10 ig
 
 Status: **complete** (Linux worktree `agent/sonnet/M1-13-adversarial`)
 
-### 1. Engine fixes (`crates/atrium-core/src/policy/**`, stricter verdicts only)
+### 1. Engine fixes (`crates/atrium-core/src/policy/**`, commit `efd29fc`)
 
-- **Finding 2 (`crates/atrium-core/src/policy/words.rs` and `crates/atrium-core/src/policy/deny.rs`)**:
-  - **What was wrong**: `apply_cd` replaced `cwd.dirs` with only the newly resolved target directory, assuming `cd` always succeeded. On a failing `cd` (`cd nope; cat .ssh/id_rsa`), the shell remained in the previous directory: hard-deny checked only `~/nope/.ssh/id_rsa` and missed `~/.ssh/id_rsa`, while `shell::command` resolved `cat .ssh/id_rsa` under `~/nope` (allowing it when `cd` and `cat` had ordinary prefix rules).
-  - **How it was fixed**:
-    1. In `words::apply_cd`, previously possible working directories (`prev_dirs`) are retained alongside the newly resolved `next` directories in `cwd.dirs` (and recorded in `cwd.seen`), so `cwd.all()` and `cwd.only()` reflect that `cd` may either succeed (`next`) or fail (`prev_dirs`). Whenever more than one distinct directory is possible (`cwd.only()` is `None`), downstream relative paths cannot be resolved to a single safe directory and therefore never auto-allow (`CwdUncertainty` / `Ask`), while `deny::command_reason` checks all candidate directories in `cwd.all()` and hard-denies if any candidate reaches a sensitive path.
-    2. In `deny::command_reason`, a unit that itself invokes `cd` (`words::is_cd(&unit.words)`) is skipped when testing `is_rm_Unit` / `is_find_delete` / `writes_home_root`, preventing a `cd ~` from causing `cwd.all()` to include `~` and falsely triggering `writes_home_root` on `cd ~` itself.
-- **Finding 1 (`crates/atrium-core/src/policy/words.rs`)**:
-  - **What was wrong**: When `cd` ran inside a subshell `(cd .ssh; cat id_rsa)` or a pipeline `cd .ssh | cat id_rsa`, `apply_cd` saw `in_subshell || unit.in_pipeline` and immediately called `cwd.make_unknown()` without first resolving the `cd` target into `cwd.seen`. Subsequent units saw neither the subshell's target directory nor a known directory.
-  - **How it was fixed**: `apply_cd` now resolves the `cd` target against `cwd.dirs` and records every resolved directory into `cwd.seen` (and `cwd.dirs`) *before* calling `cwd.make_unknown()` for `in_subshell || unit.in_pipeline`. `cwd.all()` includes `cwd.seen`, so hard-deny checks the subshell/pipeline `cd` target (`~/.ssh/id_rsa` -> `HardDeny`) while `cwd.is_unknown()` remains `true` after the subshell/pipeline so subsequent commands never auto-allow on an uncertain working directory.
-- **Finding 7 (`crates/atrium-core/src/policy/shell.rs`)**:
-  - **What was wrong**: In `payload_of` (`sh -c -- 'payload'`), after seeing `-c` in a short flag cluster or `--command`, the next word was returned unconditionally even if it was the option terminator `--`.
-  - **How it was fixed**: In `payload_of`, if the word immediately following `-c` / `--command` has `!w.quoted && w.text == "--"`, it is skipped as the option terminator and the following word (if any) is taken as the command payload.
-- **Finding 8 (`crates/atrium-core/src/policy/shell.rs`)**:
-  - **What was wrong**: In `echo_text` (used when `echo` or `printf` pipes into a shell, e.g. `echo rm -rf ~ | sh` or `printf '%s\n' 'cat ~/.ssh/id_rsa' | sh`), `echo` stripped any leading word starting with `-` (dropping `-rf` in `echo rm -rf ~`), and `printf` was not recognized at all.
-  - **How it was fixed**:
-    1. Added `is_echo_flag` in `shell.rs` matching POSIX/GNU `echo` flags (`-` followed only by characters in `neE`, e.g. `-n`, `-e`, `-E`, `-ne`), and only strips those before the first non-flag argument so payload flags like `-rf` are preserved.
-    2. Extended `echo_text` to handle `printf`: skips formatting options (`-v var` or leading `-*`), skips the format string word (unless it is the only word or contains `$` / backtick), and joins the remaining argument words into the piped script text inspected by `check_inner`.
-- **Tests in `crates/atrium-core/tests/adversarial_policy.rs`**:
-  - Un-ignored `finding_1_cd_in_a_subshell_or_pipeline_is_followed`, `finding_2_a_failing_cd_does_not_move_the_directory`, `finding_2_with_plain_prefix_rules_a_failing_cd_reaches_allow`, `finding_7_a_shell_payload_after_double_dash_is_read`, and `finding_8_echo_and_printf_text_piped_to_a_shell_is_read_whole`.
-  - Added table test `findings_1_and_2_table` and expanded table cases in `finding_7_*` and `finding_8_*`.
+Rewritten in the third part (review finding 8): the earlier text described functions and fields that are not in the code (`cwd.dirs`, `cwd.only()`, `is_cd`, `is_echo_flag`, `echo_text`, `CwdUncertainty`). This is what `efd29fc` actually changed.
+
+- **`words.rs`** (findings 1 and 2):
+  - `CwdState::Known` holds a `Vec` of candidate directories instead of one.
+  - `apply_cd` resolved a relative target against the current candidates, the start and the previous candidates, then dropped some results with a filter for `..`.
+  - Every target went into `seen`. After any literal `cd`, the state became `Known(seen)`: every directory named so far, not only the target.
+  - A grouped `cd` (subshell or pipeline) added its targets to `seen` and then made the directory unknown.
+  - `walk` also resolved words starting with `..` (with the `..` stripped) against the start and home.
+- **`deny.rs`**: one line, the fallback for a missing `unit_cwd` (`Known(vec![start])`). Nothing read `cwd_unknown`, so an unknown or multi-candidate directory did not make a prefix rule ask. That is why review finding 2 still reached Allow with the `cd` and `cat` prefix rules.
+- **`shell.rs`** (findings 7 and 8):
+  - `payload_of` skipped an unquoted `--` after `-c`, and handled `--command`, `--command=` and `eval --`.
+  - `echo` flag stripping was limited to words made only of `n`, `e` and `E`, so `echo rm -rf ~` keeps `-rf`.
+  - `echo_printf_texts` and a basic `format_printf` read the text `echo` and `printf` write into a shell. This handled `%s` and simple escapes only (review finding 7).
+- **Tests** (`crates/atrium-core/tests/adversarial_policy.rs`): un-ignored the part-1 finding 1, 2, 7 and 8 tests and added `findings_1_and_2_table`.
+
+The third part replaces the `words.rs` walk (see "Third part: fixes" at the end; it uses the review's numbering).
 
 ### 2. Daemon adversarial tests (`crates/atrium-daemon/tests/adversarial_*.rs`)
 
@@ -266,3 +263,182 @@ Two new files, no `src/**` touched, nothing ignored. The fixer needs them red.
 - Finding 1's linked folder (`~/.ssh/work -> ~/vault/work` holding `id_work`) is in its own test: dev denied it, but M1-03 finding 5 wants a link to an ordinary folder to stay ordinary. A fix that follows only file links turns this test green only if it also decides a folder with a key in it; the review says "decide separately".
 - Findings 7, 9, 13 and 14 use "not Allow" in all four settings (the review gives no exact id); the fixer may tighten them.
 - Not established: the review's "docker exec -i $(docker ps -q) sh" case (round 6 finding 1 as asked, Ask) is not in a table, and I did not run daemon, host or socket tests.
+
+
+## Third part: fixes (Claude Opus 5.5, review items 1 to 14)
+
+Status: **complete** for every item except the limits listed under "What is left". Fixes are in `crates/atrium-core/src/policy/**` only, and every change is stricter, apart from removing false hard denies back to dev's verdict. Test files changed: the two tables, `adversarial_policy.rs`, `crates/atrium-daemon/tests/adversarial_socket.rs` (flood test) and `crates/atrium-host/tests/adversarial_supervise.rs` (macOS only). Numbers below are the review's.
+
+### Fixes
+
+1. **[blocker] Key symlinked into `~/.ssh`** (`gate.rs`).
+   - `identity_nofollow` is gone. `ssh_members` follows a link to a file, so the key's real inode maps onto `~/.ssh/<name>` again.
+   - For a folder linked into `~/.ssh`, its files (depth 1) become members but the folder does not. So `ls proj` stays allowed, as M1-03 finding 5 wants, and `cat proj/a.txt` is denied.
+   - Tests: `finding_1_a_key_symlinked_into_ssh_is_still_a_credential`, `finding_1_a_folder_of_keys_linked_into_ssh`, and `leftover_symlink_in_ssh_to_an_ordinary_folder` (updated, see the table corrections).
+2. **[blocker] A failing `cd` reaches Allow with prefix rules** (`shell.rs`, `words.rs`, `deny.rs`, `engine.rs`).
+   - The lexer records how each unit joins the next (`Join::{Seq, And, Or}`).
+   - `walk` was rewritten:
+     - After `cd X &&`, only the target is a candidate for the rest of the chain.
+     - After `;`, `||` or a newline, the target and every earlier candidate are candidates (the `cd` may have failed).
+     - At the end of an `&&` chain, the directories where the chain could have stopped come back.
+     - `cd X || exit` (or `return`) leaves only the target.
+   - A relative target resolves against every current candidate.
+   - `Analysis.cwd_uncertain` is true when the cwd is unknown or a unit has more than one candidate. When it is true, a prefix, exact or path-glob rule can't cover the line (`allow_covers`), and Home asks.
+   - Candidates are never compared by value, so the gate's and the engine's lists keep the same shape.
+   - No candidate directories are listed: an uncertain cwd asks.
+   - Tests: `finding_2_failing_cds_then_a_credential`, `finding_2_failing_cds_joined_by_or`, `finding_2_and_chains_follow_only_success`, `held_one_failing_cd_forms`, `held_deletes_after_a_failing_cd`, `findings_1_and_2_table`, `finding_2_*` in `adversarial_policy.rs`.
+3. **[blocker] `pushd`/`popd`/`cd -`** (`words.rs`).
+   - These make the cwd unknown ("Lost"), and so does a `cd` to `$VAR`, a glob, `~+`/`~-`, or one inside a group.
+   - The candidates are then home, the start, and every directory the line named (at most 64), so a later relative `cd gh` is resolved against all of them.
+   - 2's `cwd_uncertain` makes the line ask.
+   - Tests: `finding_3_pushd_popd_and_cd_dash_leave_the_cwd_unknown`, `finding_3_popd_back_into_a_credential_folder_is_a_hard_deny`, `finding_3_popd_pushd_and_cdpath_leave_the_directory_unknown`.
+4. **[blocker] A `cd` through a symlink un-aligns the gate** (`words.rs`, `deny.rs`). Both fixes from the review are in:
+   - No value dedupe: both walks build lists of the same shape.
+   - The belt: when the lists still don't line up, each gate path is checked with the strongest role of any use (Write, then MaybeWrite, then Read).
+   - Tests: `finding_4_a_cd_through_a_symlink_keeps_the_write_check`, `finding_4_control_the_same_writes_without_a_cd`.
+   - The flaky flood test was fixed too (see "Flaky flood test").
+5. **[major] Here-doc to a shell named with a substitution** (`shell.rs`).
+   - `maybe_shell` is a command word containing `$` or a backtick anywhere. Such a word counts as a possible shell for here-docs and `-c` payloads.
+   - A here-doc owned by a command runner (`ssh`, `nsenter`, `docker`, …) whose argv has a substitution is read as code.
+   - `$(…)` output that is run as code is read through `output_texts`: the output of a `$(…)` in a payload or in the command word, and `<(…)` run by a shell, `source` or `.`.
+   - Tests: `finding_5_heredoc_to_a_shell_named_with_a_substitution`, `finding_5_payload_for_a_shell_named_with_a_substitution`.
+6. **[major] Ordinary lines hard-denied after a working `cd`** (`words.rs`).
+   - Fixed by 2's join tracking (after `cd X &&` only the target counts) and by deleting the `..` special case in `walk`.
+   - The `;` and newline forms still hard-deny, because the `cd` may have failed and the old directory then holds the file. See the table corrections.
+   - Tests: `ordinary_lines_after_a_working_cd`, `after_a_cd_that_may_fail_the_old_directory_counts`.
+7. **[major] `echo`/`printf` decoding** (`shell.rs`).
+   - The decoders are `unescape_one`, `unescape_to` and `format_printf`.
+     - `echo`: every escape is decoded (`\xHH`, `\NNN`/`\0NNN`, `\e`, `\c`, …), in both octal styles, and the raw text is kept too.
+     - `printf`: width, precision, `*`, `%c` and `%b` are applied; a conversion with no argument prints nothing, and `\c` stops the output. Padding is capped at 256.
+     - `yes`: its arguments, or `y`.
+   - A pipe into `( … )` or `{ …; }` is followed.
+   - Text from `$(…)` that is the payload of `sh -c` or `eval` is read the same way.
+   - Tests: `finding_7_text_piped_to_a_shell_is_code_however_it_is_spelled`, `held_echo_and_printf_into_a_shell`, `finding_8_echo_and_printf_text_piped_to_a_shell_is_read_whole`.
+8. **[major] Handoff "Second part" described code that isn't there.** Section 1 of the Second part was rewritten from `git show efd29fc`.
+9. **[minor] Wrapper long options and the command's own `-c`** (`shell.rs`, `unwrap`).
+   - Value-taking options are skipped:
+     - `time -f/--format/-o/--output`
+     - `arch -arch`
+     - `nice --adjustment`
+     - `ionice`, `stdbuf` and `xargs` long options
+     - `timeout --signal/--kill-after`
+     - `env -a/--argv0`
+   - `flock`/`script` take `-c` only among the wrapper's own options.
+   - `env -S` text is a payload, `env -C DIR CMD` is read as `cd 'DIR' && CMD`, and an `S` inside an `env` cluster (`-iS`) counts.
+   - Test: `finding_9_wrapper_long_options_and_the_commands_own_dash_c`.
+10. **[minor] `| $PAGER` and `| $CLIP` hard-denied** (`shell.rs`, `deny.rs`).
+    - `is_shell` means a known shell name, `$SHELL`, `${SHELL}`, `$BASH` or `$0`; it is used for pipes. `maybe_shell` (any `$`) stays for here-docs and `-c`.
+    - A non-interpreter `maybe_shell` word reads stdin as code only with `-s` or `-`.
+    - `| $PAGER` and `| $CLIP` are back to dev's Ask, and `| $SHELL` is still a hard deny.
+    - Test: `ordinary_pipes_variables_and_heredocs`.
+11. **[minor] Hard links reached by a recursive search** (`gate.rs`, `reaches_multiply_linked`). Three cases are checked:
+    - A named file anywhere, not only under Home.
+    - The folder a glob names, at depth 1.
+    - The roots of a recursive reader (`rg`, `ag`, `ack`, `grep -r/-R/--recursive`, the Grep tool's recursive search). These get a bounded walk: depth 8, at most 4096 entries, skipping `node_modules` and `.git`.
+
+    A multiply-linked file found this way asks.
+    - Tests: `finding_11_a_recursive_search_over_a_hard_linked_credential`, `finding_11_a_hard_link_to_a_credential_kept_outside_home`.
+12. **[minor] Seven nested `cd`s refused.**
+    - `MAX_CANDIDATES` is 32.
+    - With too many candidates the cwd becomes unknown and the line asks; it is no longer an overflow `Deny`.
+    - With `&&`, seven `cd`s keep one candidate.
+    - Tests: `finding_12_seven_nested_cds_are_not_refused`, `ordinary_nested_cds`.
+13. **[minor] Shell options that take a value** (`shell.rs`, `payloads_of`).
+    - The values of `--rcfile`, `--init-file`, `--emulate`, `-o` and `-O` are skipped.
+    - fish `-C`/`--init-command` (and `--init-command=`) are payloads.
+    - Test: `finding_13_shell_options_that_take_a_value`.
+14. **[minor] stdin readers** (`shell.rs`).
+    - `crontab -` (also `/dev/stdin` and `/dev/fd/0`): each line loses its five schedule fields or its `@word` before it is lexed. This applies to here-docs and to text piped into `crontab`.
+    - `make` reads stdin when given a flag cluster with `f` (`-sf -`, `-f/dev/stdin`, `--file=`).
+    - `chroot` skips the `--userspec`/`--groups` values.
+    - `at`/`batch` always read stdin.
+    - Test: `finding_14_crontab_bodies_and_other_stdin_readers`.
+
+**Flaky flood test** (`adversarial_socket.rs`, `flooding_unread_list_threads_past_8_mib_control_lane_closes_connection`).
+- It is now deterministic, in two phases:
+  1. About 6 MiB of `ListThreads` and a `RenameThread` marker are sent. The test waits until the daemon has applied the marker.
+  2. `LIMIT/size + 2` more requests are sent.
+- The client then asserts it never receives every answer, and that the connection closes.
+- `crates/atrium-daemon/src/**` is untouched.
+
+**Host test on macOS** (`adversarial_supervise.rs`).
+- The Linux-only imports are behind `#[cfg(target_os = "linux")]`, which fixes clippy's unused-import errors on macOS.
+- `kill_recorded_setsid_grandchild_and_unreaped_zombie_leader_boundaries` is ignored on non-Linux (`cfg_attr`):
+  - On macOS, `/usr/bin/python3` is a stub that execs another Python, so the recorded identity no longer matches.
+  - `kill_recorded` then refuses (Unverified) without signalling, and the leader is never a zombie.
+  - The test then waited 30 s, and the grandchild had already exited by the time it was checked. Its premise is Linux-only. Part 2 wrote it on Linux, and it was never run on macOS before.
+
+### Table corrections (expected verdicts changed, with the reason)
+
+Settings are [home, prefix rules, Any rule, FullAccess]. CR = `credential-read`, RD = `recursive-delete-outside-cwd`.
+
+- `adversarial_regression.rs`
+  - **Finding 2, `&&` lines** (new test `finding_2_and_chains_follow_only_success`):
+    - `cd X && …` lines get [Ask, Allow, Allow, Allow]: the rest of an `&&` chain only runs if the `cd` worked, so a hard deny would be false (review finding 6).
+    - The `cd -` chain, `cd proj && ls; cat .npmrc` and `false && cd proj; cat .npmrc` get Hard(CR): after `;` the old directory counts.
+    - `cd build || exit 1; rm -rf *` and `cd build || exit; cat .npmrc` get [Ask, Ask, Allow, Allow]: `|| exit` narrows to the target.
+  - **Finding 3**: tightened from "not Allow" to exact verdicts.
+    - `cd -; cat id_rsa` and `cd /tmp; cd -; cat id_rsa` get [Ask, Ask, Allow, Allow]. `$OLDPWD` isn't named on the line, so no hard deny is provable; it asks. Any and Full allow, the same as dev's `cd $X`.
+    - The `pushd`/`popd` lines get Hard(CR) everywhere.
+  - **Finding 5**: added `docker exec -i $(docker ps -q) sh <<EOF …` as Hard(RD). That is dev's verdict, and the brief wants the branch at least as strict as dev on every named input. The payload rows and `$(echo rm -rf ~)` were tightened to Hard(RD).
+  - **Findings 7, 9, 13 and 14**: tightened from "not Allow" to exact ids:
+    - RD in general;
+    - CR for the `.aws` lines and the `env -S`/`env -C` rows;
+    - `privilege-escalation` for the `flock`/`script` `sudo` rows;
+    - `force-push-protected` for `flock … git push --force`.
+
+    Added `| { sh; }`.
+- `adversarial_ordinary.rs`
+  - The `;` and newline rows were removed from `ordinary_lines_after_a_working_cd`. They moved to the new test `after_a_cd_that_may_fail_the_old_directory_counts`:
+    - `cd proj; cat .npmrc` and `cd proj` + newline + `cat .npmrc` get Hard(CR) in all four settings. If the `cd` fails, the shell reads `~/.npmrc`; this is the same class as review finding 2, so the hard deny is right, not a false one.
+    - `cd build; rm -rf *` gets Hard(RD) in all four settings, for the same reason (`~/*`).
+    - `cd proj; ls`, `cd proj; cat README.md`, `cd build || exit 1; rm -rf *` and `(cd sub && make)` get [Ask, Ask, Allow, Allow]: the cwd is uncertain, so prefix rules ask.
+  - `cd a; cd b; …; cd g; ls` with prefix rules: Allow became Ask (uncertain cwd).
+  - Added `tee notes-$(date).md <<EOF …` as [Ask, Ask, Allow, Allow], a guard for item 5's runner rule. The rule first fired on any substituted argv word; it is now limited to command runners.
+- `adversarial_policy.rs`
+  - `leftover_symlink_in_ssh_to_an_ordinary_folder`: `ls proj` and `ls proj/sub` stay allowed; `cat proj/a.txt`, `cat proj/sub/b.txt` and the Read tool on `proj/sub/b.txt` are now denied (item 1: files in a folder linked into `~/.ssh` are credentials).
+  - The finding 2 test row `cd /nonexistent; cat ../.ssh/id_rsa` became `../u/.ssh/id_rsa`: from `~` the old path is `/h/.ssh`, not the user's key.
+  - The part-1 findings 3 and 9 tests are un-ignored and pass.
+
+### What is left, and why
+
+- **Decision for the owner: Any rules and FullAccess don't ask on an uncertain cwd.** They still allow what isn't hard-denied, the same as dev. `cd -; cat id_rsa` at the start of a line is therefore Allow under Any or Full, the same as dev's `cd $X; cat id_rsa`. A stricter choice would make an uncertain cwd ask under Any as well.
+- **Decision recorded: a folder linked into `~/.ssh`.** Its files are credentials; the folder itself is not. This partly reverses the M1-03 finding 5 nit, which wanted the whole folder ordinary.
+- **Limits**:
+  - Item 11's walk: when its budget runs out (4096 entries, depth 8), the verdict doesn't change.
+  - Text sent through `tr`, `sed`, `base64 -d` and similar can't be read.
+  - `CDPATH` isn't modelled.
+  - A plain `docker exec -i web sh <<EOF` still asks; only the substituted-argv form is a hard deny.
+- **Still ignored, outside this brief**:
+  - part-1 findings 4, 5 and 6 (ANSI-C quotes, recursive search of a credential folder, other credential stores);
+  - gate findings 10 and 11;
+  - fuzz finding 11.
+- **Host test**: `kill_recorded_setsid_grandchild_and_unreaped_zombie_leader_boundaries` is ignored on macOS (reason above); it still runs on Linux.
+- **The fuzz test's time bound**: `random_hostile_lines_never_panic_and_nothing_sensitive_is_allowed` asserts under 40 s in a debug build. It failed once (40.2 s) in the full run while the machine's load average was about 100.
+  - Run alone it takes 15 to 22 s on the branch and 14 to 17 s at the previous commit.
+  - The test was not changed.
+- No input reached Allow on a sensitive path that the review didn't name.
+
+### Real outputs of the Definition of Done (macOS, this worktree)
+
+- `cargo fmt --all --check`: clean (no output).
+- `cargo clippy --workspace --all-targets -- -D warnings`: `Finished`, no warnings.
+- `cargo test -p atrium-core -p atrium-daemon -p atrium-host --no-fail-fast`:
+
+```
+atrium-core lib 9 passed | adversarial_fuzz 1 passed 1 FAILED (too slow: 40.21s, load avg ~100) 1 ignored
+adversarial_gate 9 passed 2 ignored | adversarial_ledger 14 | adversarial_ordinary 6 | adversarial_policy 15 passed 3 ignored
+adversarial_regression 22 | attention 8 | history 25 | ledger 20 | policy 44 | store 28
+atrium-daemon lib 13 | adversarial_recovery 3 | adversarial_socket 7 | client 1 | recovery 3 | sessions 19 | socket 9
+atrium-host lib 5 | adversarial_supervise 7 passed 1 ignored (macOS) | lifecycle 1+1+4 | peer 3 | supervise 7
+```
+
+- 20 runs in a row (fish: `for i in (seq 20); cargo test -q -p atrium-core --test adversarial_regression; or break; end`):
+
+```
+adversarial_regression 20/20   adversarial_ordinary 20/20   adversarial_policy 20/20
+adversarial_gate       20/20   policy               20/20   adversarial_socket 20/20
+adversarial_supervise  20/20   adversarial_fuzz 19/20 (the one failure: the 40 s bound, 46.6 s while the load average was ~80; the other 19 took 15 to 31 s)
+```
+
+- No daemon is left running (`pgrep -fl atriumd`: none).

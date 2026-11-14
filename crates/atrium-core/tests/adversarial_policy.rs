@@ -205,9 +205,12 @@ fn clone_want(w: &Want) -> Want {
     }
 }
 
-/// Round 3 / M1-03 finding 5: a symlink inside `~/.ssh` that points at an
-/// ordinary folder doesn't make that folder sensitive. A hard link to a key
-/// and a symlink to a key still do.
+/// Round 3 / M1-03 finding 5, as decided in the third part (review M1-13
+/// finding 1): a symlink inside `~/.ssh` that points at a folder doesn't make
+/// the folder itself sensitive (listing it stays allowed), but every file
+/// reachable through `~/.ssh` is that file: a file linked into `~/.ssh`, or a
+/// file inside a folder linked into it, is read as a key (hard deny). A hard
+/// link to a key is caught by identity.
 #[test]
 fn leftover_symlink_in_ssh_to_an_ordinary_folder() {
     let t = Tmp::new();
@@ -225,11 +228,16 @@ fn leftover_symlink_in_ssh_to_an_ordinary_folder() {
         let d = block_on(g.gate.check(&cmd_check(line)));
         assert!(matches!(d, GateDecision::Deny { .. }), "{line}: {d:?}");
     };
-    allowed("cat proj/a.txt");
     allowed("ls proj");
-    allowed("cat proj/sub/b.txt");
+    allowed("ls proj/sub");
+    // M1-13 review finding 1: another name for a file in `~/.ssh` is that file
+    denied("cat proj/a.txt");
+    denied("cat proj/sub/b.txt");
     let c = paths_check(ToolKind::Read, "Read", &["proj/sub/b.txt"], false, None);
-    assert_eq!(block_on(g.gate.check(&c)), GateDecision::Allow);
+    assert!(matches!(
+        block_on(g.gate.check(&c)),
+        GateDecision::Deny { .. }
+    ));
     // the link itself, and a key reached through the .ssh folder, stay blocked
     denied("cat .ssh/id_ed25519");
     denied("cat .ssh/proj-link/a.txt");
@@ -913,7 +921,9 @@ fn finding_2_a_failing_cd_does_not_move_the_directory() {
         "cd nope || cat .ssh/id_rsa",
         "cd nope\ncat .ssh/id_rsa",
         "cd nope 2>/dev/null; cat .ssh/id_rsa",
-        "cd /nonexistent; cat ../.ssh/id_rsa",
+        // (third part: was `../.ssh/id_rsa`, which from `~` is `/h/.ssh`, not
+        // the user's key; it held only through a `..` rule the review removed)
+        "cd /nonexistent; cat ../u/.ssh/id_rsa",
         "cd -P nope; cat .ssh/id_rsa",
         "cd \"nope\"; cat .ssh/id_rsa",
         "cd /nonexistent; cd .ssh; cat id_rsa",
@@ -954,7 +964,6 @@ fn finding_2_with_plain_prefix_rules_a_failing_cd_reaches_allow() {
 }
 
 #[test]
-#[ignore = "M1-13 finding 3"]
 fn finding_3_popd_pushd_and_cdpath_leave_the_directory_unknown() {
     hard_everywhere(&[
         "pushd /tmp; popd; cd .ssh; cat id_rsa",
@@ -1044,7 +1053,6 @@ fn findings_1_and_2_table() {
 }
 
 #[test]
-#[ignore = "M1-13 finding 9"]
 fn finding_9_a_process_substitution_that_feeds_a_shell_is_read() {
     hard_everywhere(&[
         "bash < <(echo 'rm -rf ~')",

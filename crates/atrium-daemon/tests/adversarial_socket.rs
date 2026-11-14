@@ -320,12 +320,22 @@ async fn oversized_zero_and_truncated_frames_close_the_connection() {
     rig.stop(true).await;
 }
 
+/// The 8 MiB control lane (N4). Deterministic (third part): the client never
+/// reads while the daemon queues. Phase 1 queues about 6 MiB of answers and
+/// ends with a rename; once the rename shows on another connection, every
+/// earlier command on the flooded one has been answered and is waiting in
+/// its lane (nothing was read; the socket buffers hold far less than one
+/// answer). Phase 2 pushes the lane past 8 MiB. Only then does the client
+/// read: the daemon must end the connection before delivering every answer.
+/// If the limit were not enforced, every answer would arrive and the test
+/// fails at once (it doesn't wait for a close that never comes).
 #[tokio::test]
 async fn flooding_unread_list_threads_past_8_mib_control_lane_closes_connection() {
     let mut rig = Rig::start().await;
     let mut setup = rig.dev().await;
 
     let big_native = "n".repeat(260_000);
+    let mut marker_thread = None;
     for _ in 0..4 {
         let summary = setup.start_thread(native(), Some("flood")).await;
         let mut script = rig.script().await;
@@ -335,31 +345,66 @@ async fn flooding_unread_list_threads_past_8_mib_control_lane_closes_connection(
         setup
             .thread_when(&summary.thread_id, |s| s.state == ThreadState::Ended)
             .await;
+        marker_thread = Some(summary.thread_id);
     }
+    let marker_thread = marker_thread.expect("a thread");
 
     let sample = serde_json::to_vec(&setup.ok(DaemonCommand::ListThreads).await).expect("json");
-    assert!(sample.len() >= 1_000_000, "sample len: {}", sample.len());
-    let needed = (9 * 1024 * 1024) / sample.len() + 3;
+    let size = sample.len();
+    assert!(size >= 1_000_000, "sample len: {size}");
+    const LIMIT: usize = 8 * 1024 * 1024;
+    // phase 1: well below the limit
+    let phase1 = (6 * 1024 * 1024) / size;
+    // phase 2: past it, counting nothing as drained
+    let phase2 = LIMIT / size + 2;
 
     let mut flooded = rig.dev().await;
-    for req_id in 1..=(needed as u64) {
+    let mut req_id = 0u64;
+    let mut sent = 0usize;
+    for _ in 0..phase1 {
+        req_id += 1;
         flooded
             .send(&ClientMessage::Command {
                 request_id: req_id,
                 command: DaemonCommand::ListThreads,
             })
             .await;
+        sent += 1;
+    }
+    req_id += 1;
+    flooded
+        .send(&ClientMessage::Command {
+            request_id: req_id,
+            command: DaemonCommand::RenameThread {
+                thread_id: marker_thread.clone(),
+                title: "phase-1-done".into(),
+            },
+        })
+        .await;
+    sent += 1;
+    // every phase-1 answer is now queued, unread
+    setup
+        .thread_when(&marker_thread, |s| s.title == "phase-1-done")
+        .await;
+    for _ in 0..phase2 {
+        req_id += 1;
+        flooded
+            .send(&ClientMessage::Command {
+                request_id: req_id,
+                command: DaemonCommand::ListThreads,
+            })
+            .await;
+        sent += 1;
     }
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut received_responses = 0usize;
+    let mut received = 0usize;
     while flooded.read().await.is_some() {
-        received_responses += 1;
+        received += 1;
+        assert!(
+            received < sent,
+            "the 8 MiB control lane was not enforced: all {sent} answers arrived"
+        );
     }
-    assert!(
-        received_responses < needed,
-        "flooded connection must close before delivering all {needed} responses (got {received_responses})"
-    );
     assert!(flooded.closed().await);
 
     let threads = setup.ok(DaemonCommand::ListThreads).await;
