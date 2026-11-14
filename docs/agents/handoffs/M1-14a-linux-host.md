@@ -61,3 +61,38 @@ Causes, read from the code (not proven by instrumentation; none of these files i
 - Stopping everything: no process of mine is left (checked with `ps` for `atriumd`, `perf`, `sleep 600`, and the worktree path). The temporary folders of the perf runs are `/tmp/atrium-perf*` (removed by their tempdir guards).
 - `target/` holds scripts I wrote (`loop.sh`, `repeat.sh`, `l8.sh`, `compare*.sh`, `dod.sh`) and the logs; it is git-ignored and not part of the branch. The commands in the report are the cargo lines; the scripts only repeat them.
 - I used a shell heredoc once to append prose (not test data, no `EOF` inside it) to this handoff; the rest of the files were written with the file tools.
+
+## Fix round 1
+
+### Review findings (1–4 and nit)
+- **Finding 1** (`823aa7e`): `judge_exe_read` now treats a changed `pgid` between `first` and `after` stat reads as `ExeVerdict::Unverifiable`.
+- **Nit (`PF_FORKNOEXEC`)** (`823aa7e`): `0x0040_0000` in `supervise.rs` test flags is now labelled `PF_RANDOMIZE` instead of `PF_FORKNOEXEC`.
+- **Finding 2** (`4dcf30a`): `num_threads` (stat field 20) is parsed; a `Z` thread-group leader with other live threads is judged as live and its executable is read from a live thread when `/proc/<pid>/exe` is `ENOENT`, with a new integration test.
+- **Finding 3** (`2cd28c3`): added decision-table rows to `exe_read_decision_table` that kill all four review mutations plus four additional ones.
+- **Finding 4** (`6c61e73`): updated `crates/atrium-daemon/examples/perf.rs` (`wait_for_snapshot`) to wait for `upkeep::snapshot_daily`'s first `VACUUM INTO` snapshot in `ATRIUM_HOME/snapshots` to appear and settle (size > 0, `len` and `modified` unchanged for 4 x 250 ms polls + 1 s settle for `record_snapshot`) before starting the 60 s idle window, instead of sleeping 60 s from session close (which previously overlapped the snapshot at ~42 s). `perf.rs` prints the snapshot's filename, size, `modified` epoch ms, and RSS/peak, followed by the idle window's start epoch ms and elapsed time since daemon start, proving the snapshot finished before the idle window began. `crates/atrium-daemon/src/**` was not modified.
+
+### L8 (three runs after finding 4 fix, gate: median idle RSS < 50 MB)
+Note: `cat /proc/loadavg`, `uptime`, and `ps` were denied by the worker command policy, so load average could not be recorded and process cleanup relies on `perf`'s `ShutdownDaemon { force: true }` and `Daemon::drop` (`kill` + `wait`).
+
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| Idle RSS, median of 10 samples 60 s after last activity (snapshot included) | **18.4 MiB** | **18.6 MiB** | **18.6 MiB** |
+| Idle RSS, max of the 10 | 18.4 MiB | 18.6 MiB | 18.6 MiB |
+| Snapshot finished (`modified` ms) -> idle window start (ms) | `1794672326632` -> `1794672328513` | `1794672464979` -> `1794672466769` | `1794672602715` -> `1794672604651` |
+
+Gate met in all three runs (18.4–18.6 MiB = 19.3–19.5 MB < 50 MB). Full raw outputs are in `docs/spikes/M1-linux-checks.md`.
+
+### Definition of Done (after final edit)
+- `cargo fmt --all --check`: exit 0
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit 0 (`Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 1.13s`)
+- `cargo test -p atrium-host -p atrium-daemon --no-fail-fast`: exit 0:
+  - `atrium-daemon` unit (`src/lib.rs`): `test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s`
+  - `atrium-daemon` bin (`src/main.rs`): `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`
+  - `atrium-daemon` `tests/client.rs`: `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s`
+  - `atrium-daemon` `tests/recovery.rs`: `test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s`
+  - `atrium-daemon` `tests/sessions.rs`: `test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.11s`
+  - `atrium-daemon` `tests/socket.rs`: `test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.68s`
+  - `atrium-host` unit (`src/lib.rs`): `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`
+  - `atrium-host` `tests/lifecycle.rs`: `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s`
+  - `atrium-host` `tests/peer.rs`: `test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s`
+  - `atrium-host` `tests/supervise.rs`: `test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s`
