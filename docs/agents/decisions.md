@@ -432,3 +432,9 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **Not in this go:** M1-13's third part (Hydrogen's tables and the Opus fixes), the M1-05 test-gap task, M1-14b, M1-15.
 
 *Update, same day (orchestrator):* `agy` on the host is now 1.5.8. Before the Hydrogen worker, the hook check of `HANDOFF.md` was re-run with Hydrogen in a scratch worktree (`M1-00-hookcheck-1.5.8`, removed afterwards): `cargo --version` allowed, a write to `.agents/probe.txt` and `git push` denied by the hook, no file written. `scripts/doctor` names 1.5.8 as the tested version. Hydrogen used the tool name `write_file`, which the policy already knows.
+
+## D-071 — 2026-11-14 — M1-07 escalates to Gemini 4 Argon, reviewed by GPT-6.1 Sol
+**Decided by rodrigo (driver).** M1-07's review round 3 is rework again (`reviews/M1-07-claude-adapter-round3.md`): the `Glob`/`Grep` subject, open since round 1, still reaches Allow on credentials (two blockers, one major). Both automatic fix rounds are used, so the task escalates across providers (PLAN §8.3): the author was Sonnet 5.5, the next attempt is **Gemini 4 Argon** (`gemini-4-argon-high`, through `agy`), and its work is reviewed by **GPT-6.1 Sol** (`gpt-6.1-sol`, `codex exec -s read-only`). The orchestrator offered Astra (reviewed by Argon) as its first choice; rodrigo chose Argon, who found the holes.
+- **Same branch and worktree** (`agent/sonnet/M1-07-claude-adapter`, D-066's reading on branch names), same owned paths.
+- **The orchestrator's design rule for the subject** (in the brief's "Escalation" section): stop expanding and bounding arbitrary patterns; accept only a small, explicit grammar and make everything else `Unknown` (which asks). Ordinary patterns (`**/*.rs`, `src/**/mod.rs`, `*.{ts,tsx}`, `src/{a,b}/mod.rs`, `*.[ch]`, `*.[a-z]`) must keep their Allow in Home.
+- The policy engine's side (P1 in `m1-must-fix.md`) stays with `atrium-core`'s owner.
