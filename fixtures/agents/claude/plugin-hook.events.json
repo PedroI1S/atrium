@@ -1,0 +1,253 @@
+[
+  {
+    "type": "session_started",
+    "provider": "claude",
+    "native_session_id": "e34ae1c1-6073-4b99-9752-7346c7c58d4c",
+    "model": "claude-haiku-5-5",
+    "tools": [
+      "Task",
+      "Artifact",
+      "ArtifactComments",
+      "ArtifactData",
+      "AskUserQuestion",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "ExitPlanMode",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebSearch",
+      "Write"
+    ],
+    "enforcement": {
+      "level": "partial",
+      "reasons": [
+        {
+          "code": "external_hooks",
+          "message": "plugin ~/atrium-wt/M1-07-claude-adapter/.orchestration/scratch/record/plugin-hook/plugi ships hooks that run outside the gate"
+        },
+        {
+          "code": "uninspected_config",
+          "message": "Plugin not inspected: ~/atrium-wt/M1-07-claude-adapter/.orchestration/scratch/record/plugin-hook/plugin"
+        }
+      ],
+      "provider": "claude",
+      "cli_version": "2.1.308",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-edit"
+        },
+        {
+          "class": "delete",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "move",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "search",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "execute",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-exec"
+        },
+        {
+          "class": "fetch",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-fetch"
+        },
+        {
+          "class": "mcp",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-mcp"
+        },
+        {
+          "class": "subagent",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-subagent"
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/mcp-allow"
+        }
+      ],
+      "config_sources": [
+        {
+          "kind": "plugin",
+          "path": "~/atrium-wt/M1-07-claude-adapter/.orchestration/scratch/record/plugin-hook/plugin",
+          "sha256": "9dc0ff383c8ea671fc4055f57d86e737c9982a4c7ea7f4b6d3aa1b96e9c3a9e1",
+          "inspected": false
+        }
+      ]
+    }
+  },
+  {
+    "type": "turn_started",
+    "turn": 1
+  },
+  {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Run this exact shell command and report its output: echo plugin-test"
+    }
+  },
+  {
+    "type": "tool_call_started",
+    "call_id": "toolu_01RkQBXDG6Dbw6yxLeVX1tUC",
+    "name": "Bash",
+    "kind": "execute",
+    "title": "echo plugin-test",
+    "input": {
+      "command": "echo plugin-test",
+      "description": "Echo plugin-test string"
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 82,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 7359,
+      "reasoning_tokens": 0,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "quota_updated",
+    "windows": [
+      {
+        "name": "5h",
+        "used_percent": 77.0,
+        "resets_at_ms": 1794522000000
+      },
+      {
+        "name": "weekly",
+        "used_percent": 64.0,
+        "resets_at_ms": 1794708000000
+      }
+    ]
+  },
+  {
+    "type": "tool_call_finished",
+    "call_id": "toolu_01RkQBXDG6Dbw6yxLeVX1tUC",
+    "status": "succeeded",
+    "output": "plugin-test",
+    "error": null,
+    "truncated_bytes": 0
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011Cgyd3zULfmDe5XRyBj4gJ:0",
+    "kind": "assistant",
+    "text": "The command output"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011Cgyd3zULfmDe5XRyBj4gJ:0",
+    "kind": "assistant",
+    "text": " was"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011Cgyd3zULfmDe5XRyBj4gJ:0",
+    "kind": "assistant",
+    "text": ":\n\n```\npl"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011Cgyd3zULfmDe5XRyBj4gJ:0",
+    "kind": "assistant",
+    "text": "ugin-test\n```"
+  },
+  {
+    "type": "message_completed",
+    "message_id": "msg_011Cgyd3zULfmDe5XRyBj4gJ:0",
+    "kind": "assistant",
+    "body": {
+      "type": "streamed",
+      "chars": 44,
+      "deltas": 4,
+      "sha256": "22ad1a87a356a220d201b67ff999ae05573d4f83e27787a4be20893bf2ee7058"
+    }
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 99,
+      "cache_read_tokens": 58305,
+      "cache_write_tokens": 7475,
+      "reasoning_tokens": 0,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 32967,
+    "window_tokens": 1000000
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 99,
+      "cache_read_tokens": 58305,
+      "cache_write_tokens": 7475,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00212795
+    }
+  },
+  {
+    "type": "turn_completed",
+    "turn": 1,
+    "outcome": "completed",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 99,
+      "cache_read_tokens": 58305,
+      "cache_write_tokens": 7475,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00212795
+    }
+  },
+  {
+    "type": "session_ended",
+    "exit_code": 0,
+    "reason": "shutdown"
+  }
+]

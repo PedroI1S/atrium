@@ -2,7 +2,7 @@
   {
     "type": "session_started",
     "provider": "claude",
-    "native_session_id": "320359dd-a52a-49d5-b228-373938dc6be7",
+    "native_session_id": "78e0855b-0cb5-41f7-bbd1-f2532226b600",
     "model": "claude-haiku-5-5",
     "tools": [
       "Task",
@@ -32,19 +32,87 @@
       "Skill",
       "TaskStop",
       "ToolSearch",
-      "WebFetch",
       "WebSearch",
       "Write",
       "mcp__echo__echo"
-    ]
+    ],
+    "enforcement": {
+      "level": "full",
+      "reasons": [],
+      "provider": "claude",
+      "cli_version": "2.1.308",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-edit"
+        },
+        {
+          "class": "delete",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "move",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "search",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "execute",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-exec"
+        },
+        {
+          "class": "fetch",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-fetch"
+        },
+        {
+          "class": "mcp",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-mcp"
+        },
+        {
+          "class": "subagent",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-subagent"
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/mcp-allow"
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Call the echo tool of the MCP server named echo with the text ping, and tell me what it returned."
+    }
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "toolu_01AarWy97RUGg83GpPR4C41i",
+    "call_id": "toolu_01HcK4qFK9bTyRx9LjkzL2t6",
     "name": "ToolSearch",
     "kind": "search",
     "title": "select:mcp__echo__echo",
@@ -55,19 +123,20 @@
   },
   {
     "type": "tool_call_finished",
-    "call_id": "toolu_01AarWy97RUGg83GpPR4C41i",
+    "call_id": "toolu_01HcK4qFK9bTyRx9LjkzL2t6",
     "status": "succeeded",
     "output": "{\"type\":\"tool_reference\",\"tool_name\":\"mcp__echo__echo\"}",
-    "error": null
+    "error": null,
+    "truncated_bytes": 0
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
-      "output_tokens": 132,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 7247,
-      "reasoning_tokens": 48,
+      "output_tokens": 83,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 7416,
+      "reasoning_tokens": 0,
       "cost_usd": null
     }
   },
@@ -76,19 +145,19 @@
     "windows": [
       {
         "name": "5h",
-        "used_percent": 86.0,
-        "resets_at_ms": 1792900200000
+        "used_percent": 78.0,
+        "resets_at_ms": 1794522000000
       },
       {
         "name": "weekly",
-        "used_percent": 9.0,
-        "resets_at_ms": 1793498400000
+        "used_percent": 64.0,
+        "resets_at_ms": 1794708000000
       }
     ]
   },
   {
     "type": "tool_call_started",
-    "call_id": "toolu_01LfUgTxpvGACFgksQ2Dnm7b",
+    "call_id": "toolu_01YEsnU3zp8kVzHruxLthEJP",
     "name": "mcp__echo__echo",
     "kind": "mcp",
     "title": "echo.echo",
@@ -98,270 +167,281 @@
   },
   {
     "type": "tool_call_finished",
-    "call_id": "toolu_01LfUgTxpvGACFgksQ2Dnm7b",
+    "call_id": "toolu_01YEsnU3zp8kVzHruxLthEJP",
     "status": "denied",
     "output": null,
-    "error": "MCP tools are not allowed here"
+    "error": "MCP tools are not allowed here",
+    "truncated_bytes": 0
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 186,
-      "cache_read_tokens": 58077,
-      "cache_write_tokens": 7501,
-      "reasoning_tokens": 48,
+      "output_tokens": 137,
+      "cache_read_tokens": 58362,
+      "cache_write_tokens": 7621,
+      "reasoning_tokens": 0,
       "cost_usd": null
     }
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": "The echo"
+    "text": "The"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " call"
+    "text": " ech"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " did"
+    "text": "o call"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": "n't go"
+    "text": " didn't go"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " through."
+    "text": " through. A PreToolU"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " A PreToolUse h"
+    "text": "se hook denied it with:"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
-    "kind": "assistant",
-    "text": "ook denied it with:"
-  },
-  {
-    "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
     "text": " `Denied by Atr"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
     "text": "ium policy: MCP t"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
     "text": "ools are not allowed here`"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": ". So the echo server"
+    "text": ". So I have"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " returned nothing, and I"
+    "text": " no output"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " don't have a result"
+    "text": " from the ech"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " to"
+    "text": "o server to report"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " report.\n\nI"
+    "text": "."
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " didn't retry or"
+    "text": "\n\nThe block"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " look"
+    "text": " com"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " for another"
+    "text": "es from Atrium polic"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " way to re"
+    "text": "y, not from the ech"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": "ach the server"
+    "text": "o server itself. I ha"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": ", since"
+    "text": "ven't t"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " the"
+    "text": "ried to route"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " hook is a de"
+    "text": " around it."
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": "liberate policy block"
+    "text": " If you"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": ". If you"
+    "text": " want the"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " need"
+    "text": " call to go"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " MCP tools to"
+    "text": " through, the policy would"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " work"
+    "text": " need to allow MCP t"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " in this worktree, that polic"
+    "text": "ools in this wor"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": "y would"
+    "text": "ktree, or you"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " have"
+    "text": " could"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " to change, and that"
+    "text": " run the ech"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": "'s a decision for you or"
+    "text": "o server"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": " wh"
+    "text": "'s"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": "oever owns the Atr"
+    "text": " t"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": "ium polic"
+    "text": "ool y"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": "y."
+    "text": "ourself out"
+  },
+  {
+    "type": "message_delta",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
+    "kind": "assistant",
+    "text": "side this session."
   },
   {
     "type": "message_completed",
-    "message_id": "msg_011CgNDvdsqfMDN9fNd4Rt3b:1",
+    "message_id": "msg_011Cgyd7MyEtaXndshypMCnQ:1",
     "kind": "assistant",
-    "text": "The echo call didn't go through. A PreToolUse hook denied it with: `Denied by Atrium policy: MCP tools are not allowed here`. So the echo server returned nothing, and I don't have a result to report.\n\nI didn't retry or look for another way to reach the server, since the hook is a deliberate policy block. If you need MCP tools to work in this worktree, that policy would have to change, and that's a decision for you or whoever owns the Atrium policy."
-  },
-  {
-    "type": "usage",
-    "usage": {
-      "input_tokens": 6,
-      "output_tokens": 388,
-      "cache_read_tokens": 90993,
-      "cache_write_tokens": 7632,
-      "reasoning_tokens": 100,
-      "cost_usd": null
+    "body": {
+      "type": "streamed",
+      "chars": 449,
+      "deltas": 37,
+      "sha256": "7151b6b3b6e060ac2d1115514386f0abef89425515e6f1a4233b1c42106df271"
     }
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 6,
-      "output_tokens": 388,
-      "cache_read_tokens": 90993,
-      "cache_write_tokens": 7632,
-      "reasoning_tokens": 100,
-      "cost_usd": 0.00263093
+      "output_tokens": 416,
+      "cache_read_tokens": 91456,
+      "cache_write_tokens": 7752,
+      "reasoning_tokens": 135,
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 33506,
+    "window_tokens": 1000000
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 6,
+      "output_tokens": 416,
+      "cache_read_tokens": 91456,
+      "cache_write_tokens": 7752,
+      "reasoning_tokens": 135,
+      "cost_usd": 0.00267356
     }
   },
   {
@@ -370,11 +450,11 @@
     "outcome": "completed",
     "usage": {
       "input_tokens": 6,
-      "output_tokens": 388,
-      "cache_read_tokens": 90993,
-      "cache_write_tokens": 7632,
-      "reasoning_tokens": 100,
-      "cost_usd": 0.00263093
+      "output_tokens": 416,
+      "cache_read_tokens": 91456,
+      "cache_write_tokens": 7752,
+      "reasoning_tokens": 135,
+      "cost_usd": 0.00267356
     }
   },
   {

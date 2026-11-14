@@ -2,7 +2,7 @@
   {
     "type": "session_started",
     "provider": "claude",
-    "native_session_id": "350254a7-4852-4587-a7b0-9331e42d02c1",
+    "native_session_id": "acb05102-0ae4-4546-ac85-f1fca422a164",
     "model": "claude-haiku-5-5",
     "tools": [
       "Task",
@@ -32,56 +32,90 @@
       "Skill",
       "TaskStop",
       "ToolSearch",
-      "WebFetch",
       "WebSearch",
       "Write"
-    ]
+    ],
+    "enforcement": {
+      "level": "full",
+      "reasons": [],
+      "provider": "claude",
+      "cli_version": "2.1.308",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-edit"
+        },
+        {
+          "class": "delete",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "move",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "search",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "execute",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-exec"
+        },
+        {
+          "class": "fetch",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-fetch"
+        },
+        {
+          "class": "mcp",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-mcp"
+        },
+        {
+          "class": "subagent",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-subagent"
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/mcp-allow"
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
-    "type": "question_asked",
-    "request_id": "55fbd66e-cf78-4e6a-81f4-e000fccfe65e",
-    "questions": [
-      {
-        "id": "q0",
-        "prompt": "Which color do you prefer?",
-        "options": [
-          {
-            "id": "o0",
-            "label": "Red",
-            "description": "Choose red as your color."
-          },
-          {
-            "id": "o1",
-            "label": "Green",
-            "description": "Choose green as your color."
-          },
-          {
-            "id": "o2",
-            "label": "Blue",
-            "description": "Choose blue as your color."
-          }
-        ],
-        "multi_select": false,
-        "allow_text": true
-      }
-    ]
-  },
-  {
-    "type": "request_resolved",
-    "request_id": "55fbd66e-cf78-4e6a-81f4-e000fccfe65e",
-    "outcome": "answered"
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Use the AskUserQuestion tool to ask me which color I prefer: red, green or blue. Then tell me my answer in one sentence."
+    }
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
-      "output_tokens": 158,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 7497,
+      "output_tokens": 167,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 6816,
       "reasoning_tokens": 0,
       "cost_usd": null
     }
@@ -91,48 +125,92 @@
     "windows": [
       {
         "name": "5h",
-        "used_percent": 86.0,
-        "resets_at_ms": 1792900200000
+        "used_percent": 74.0,
+        "resets_at_ms": 1794522000000
       },
       {
         "name": "weekly",
-        "used_percent": 9.0,
-        "resets_at_ms": 1793498400000
+        "used_percent": 64.0,
+        "resets_at_ms": 1794708000000
       }
     ]
   },
   {
+    "type": "question_asked",
+    "request_id": "question-1",
+    "questions": [
+      {
+        "id": "q0",
+        "prompt": "Which color do you prefer?",
+        "options": [
+          {
+            "id": "o0",
+            "label": "Red",
+            "description": "Choose red as your favorite color."
+          },
+          {
+            "id": "o1",
+            "label": "Green",
+            "description": "Choose green as your favorite color."
+          },
+          {
+            "id": "o2",
+            "label": "Blue",
+            "description": "Choose blue as your favorite color."
+          }
+        ],
+        "multi_select": false,
+        "allow_text": true
+      }
+    ]
+  },
+  {
+    "type": "request_resolved",
+    "request_id": "question-1",
+    "outcome": "answered"
+  },
+  {
     "type": "message_delta",
-    "message_id": "msg_011CgNDx6CtJhoZyYjws1eXJ:0",
+    "message_id": "msg_011Cgycz9UxPXiQ3Eh9ifLBe:0",
     "kind": "assistant",
     "text": "You prefer red."
   },
   {
     "type": "message_completed",
-    "message_id": "msg_011CgNDx6CtJhoZyYjws1eXJ:0",
+    "message_id": "msg_011Cgycz9UxPXiQ3Eh9ifLBe:0",
     "kind": "assistant",
-    "text": "You prefer red."
-  },
-  {
-    "type": "usage",
-    "usage": {
-      "input_tokens": 4,
-      "output_tokens": 166,
-      "cache_read_tokens": 58327,
-      "cache_write_tokens": 7721,
-      "reasoning_tokens": 0,
-      "cost_usd": null
+    "body": {
+      "type": "streamed",
+      "chars": 15,
+      "deltas": 1,
+      "sha256": "30430b760610742278503784e23cebc57f9c3df7fe448d1f03fc64c4a4dfd662"
     }
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 166,
-      "cache_read_tokens": 58327,
-      "cache_write_tokens": 7721,
+      "output_tokens": 175,
+      "cache_read_tokens": 57762,
+      "cache_write_tokens": 7049,
       "reasoning_tokens": 0,
-      "cost_usd": 0.00221087
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 32532,
+    "window_tokens": 1000000
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 175,
+      "cache_read_tokens": 57762,
+      "cache_write_tokens": 7049,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.0020753200000000003
     }
   },
   {
@@ -141,11 +219,11 @@
     "outcome": "completed",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 166,
-      "cache_read_tokens": 58327,
-      "cache_write_tokens": 7721,
+      "output_tokens": 175,
+      "cache_read_tokens": 57762,
+      "cache_write_tokens": 7049,
       "reasoning_tokens": 0,
-      "cost_usd": 0.00221087
+      "cost_usd": 0.0020753200000000003
     }
   },
   {

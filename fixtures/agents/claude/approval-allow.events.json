@@ -2,7 +2,7 @@
   {
     "type": "session_started",
     "provider": "claude",
-    "native_session_id": "c4fd978b-bde1-4de5-acdd-3a606233f5ee",
+    "native_session_id": "28a732b1-9147-43df-b53d-07abaf6af62c",
     "model": "claude-haiku-5-5",
     "tools": [
       "Task",
@@ -32,51 +32,120 @@
       "Skill",
       "TaskStop",
       "ToolSearch",
-      "WebFetch",
       "WebSearch",
       "Write"
-    ]
+    ],
+    "enforcement": {
+      "level": "full",
+      "reasons": [],
+      "provider": "claude",
+      "cli_version": "2.1.308",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-edit"
+        },
+        {
+          "class": "delete",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "move",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-delete"
+        },
+        {
+          "class": "search",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny"
+        },
+        {
+          "class": "execute",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-exec"
+        },
+        {
+          "class": "fetch",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-fetch"
+        },
+        {
+          "class": "mcp",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-mcp"
+        },
+        {
+          "class": "subagent",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/gate-deny-subagent"
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "intercepted",
+          "evidence": "fixtures/agents/claude/mcp-allow"
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Run this exact shell command and report its output: echo approved"
+    }
+  },
+  {
     "type": "tool_call_started",
-    "call_id": "toolu_014SQESR49e47NHrBMg9vkyz",
+    "call_id": "toolu_01EjSDgAbtc5WdPEd3NcfiEH",
     "name": "Bash",
     "kind": "execute",
     "title": "echo approved",
     "input": {
       "command": "echo approved",
-      "description": "Echo the word approved"
+      "description": "Print the word approved"
     }
   },
   {
     "type": "approval_requested",
-    "request_id": "7a6cb43a-56ee-4dda-8327-a6dc7c0eb9a7",
-    "call_id": "toolu_014SQESR49e47NHrBMg9vkyz",
+    "request_id": "req-1",
+    "call_id": "toolu_01EjSDgAbtc5WdPEd3NcfiEH",
     "name": "Bash",
     "kind": "execute",
     "title": "echo approved",
     "input": {
       "command": "echo approved",
-      "description": "Echo the word approved"
+      "description": "Print the word approved"
     },
-    "reason": null
+    "reason": null,
+    "rememberable": true
   },
   {
     "type": "request_resolved",
-    "request_id": "7a6cb43a-56ee-4dda-8327-a6dc7c0eb9a7",
+    "request_id": "req-1",
     "outcome": "approved"
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 2,
-      "output_tokens": 77,
-      "cache_read_tokens": 25415,
-      "cache_write_tokens": 7314,
+      "output_tokens": 76,
+      "cache_read_tokens": 25473,
+      "cache_write_tokens": 6630,
       "reasoning_tokens": 0,
       "cost_usd": null
     }
@@ -86,67 +155,78 @@
     "windows": [
       {
         "name": "5h",
-        "used_percent": 86.0,
-        "resets_at_ms": 1792900200000
+        "used_percent": 74.0,
+        "resets_at_ms": 1794522000000
       },
       {
         "name": "weekly",
-        "used_percent": 9.0,
-        "resets_at_ms": 1793498400000
+        "used_percent": 64.0,
+        "resets_at_ms": 1794708000000
       }
     ]
   },
   {
     "type": "tool_call_finished",
-    "call_id": "toolu_014SQESR49e47NHrBMg9vkyz",
+    "call_id": "toolu_01EjSDgAbtc5WdPEd3NcfiEH",
     "status": "succeeded",
     "output": "approved",
-    "error": null
+    "error": null,
+    "truncated_bytes": 0
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDw72Ug3hVvi784Krwj:0",
+    "message_id": "msg_011CgycyFGBxNizhu6FJ99e2:0",
     "kind": "assistant",
     "text": "The command `"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDw72Ug3hVvi784Krwj:0",
+    "message_id": "msg_011CgycyFGBxNizhu6FJ99e2:0",
     "kind": "assistant",
     "text": "echo approved` printed:"
   },
   {
     "type": "message_delta",
-    "message_id": "msg_011CgNDw72Ug3hVvi784Krwj:0",
+    "message_id": "msg_011CgycyFGBxNizhu6FJ99e2:0",
     "kind": "assistant",
     "text": "\n\n```\napproved\n```"
   },
   {
     "type": "message_completed",
-    "message_id": "msg_011CgNDw72Ug3hVvi784Krwj:0",
+    "message_id": "msg_011CgycyFGBxNizhu6FJ99e2:0",
     "kind": "assistant",
-    "text": "The command `echo approved` printed:\n\n```\napproved\n```"
-  },
-  {
-    "type": "usage",
-    "usage": {
-      "input_tokens": 4,
-      "output_tokens": 97,
-      "cache_read_tokens": 58144,
-      "cache_write_tokens": 7422,
-      "reasoning_tokens": 0,
-      "cost_usd": null
+    "body": {
+      "type": "streamed",
+      "chars": 54,
+      "deltas": 3,
+      "sha256": "1ba0dd8b63eec23ecec0e3def712cbfc074736feed6a375068277d98e7e38f3f"
     }
   },
   {
     "type": "usage",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 97,
-      "cache_read_tokens": 58144,
-      "cache_write_tokens": 7422,
+      "output_tokens": 96,
+      "cache_read_tokens": 57576,
+      "cache_write_tokens": 6737,
       "reasoning_tokens": 0,
-      "cost_usd": 0.0021147400000000004
+      "cost_usd": null
+    }
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 32232,
+    "window_tokens": 1000000
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 96,
+      "cache_read_tokens": 57576,
+      "cache_write_tokens": 6737,
+      "reasoning_tokens": 0,
+      "cost_usd": 0.00197156
     }
   },
   {
@@ -155,11 +235,11 @@
     "outcome": "completed",
     "usage": {
       "input_tokens": 4,
-      "output_tokens": 97,
-      "cache_read_tokens": 58144,
-      "cache_write_tokens": 7422,
+      "output_tokens": 96,
+      "cache_read_tokens": 57576,
+      "cache_write_tokens": 6737,
       "reasoning_tokens": 0,
-      "cost_usd": 0.0021147400000000004
+      "cost_usd": 0.00197156
     }
   },
   {
