@@ -774,7 +774,10 @@ mod tests {
             // UnixStream buffer).
             let mut received = vec![0u8; 1024];
             theirs.read_exact(&mut received).await.expect("first bytes");
+            assert!(received.len() < large.len());
 
+            // Ending or replacing the subscription purges queued later
+            // frames; the in-flight frame still finishes.
             if replaced {
                 conn.subscribe(&t("a")).expect("replaces");
             } else {
