@@ -498,3 +498,8 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 
 ## D-079 — 2026-11-14 — Pedro's go: M1-13 fourth round (rework) on Opus
 **Decided by Pedro (driver).** The third part's re-review (`reviews/M1-13-adversarial-third-part.md`, Gemini 4 Hydrogen `high`) says **rework**: five blockers (inputs reaching Allow) and two majors (new false hard denies). Go for a rework round by the same Claude Opus 5.5 worker on `agent/sonnet/M1-13-adversarial` (security fixes stay with Claude, D-074), table test first for every input the review names, then a Hydrogen `high` re-review. The review's item 8 is settled by D-078 and is not reopened. The review's minor (fuzz bound) and nit (ignore reason wording) are in this round too.
+
+## D-080 — 2026-11-14 — Pedro's go: M1-13 fifth round, another fix round on Opus
+**Decided by Pedro (driver).** The fourth round's re-review (`reviews/M1-13-adversarial-round4.md`, Hydrogen `high`) says **rework**: seven blockers and one major family of false hard denies. The orchestrator offered a change of approach (a fail-closed shell grammar, with Any/FullAccess-only gaps documented as known limits); Pedro chose **another fix round** of the same kind, by the same Claude Opus 5.5 worker, table test first, then a Hydrogen `high` re-review.
+- This goes past PLAN §8.3's two automatic fix rounds without changing provider: the next rungs (Argon, Astra) are out of use on Pedro's shifts, and Hydrogen can't write these tests through the `agy` policy (D-074). Recorded as a deliberate exception.
+- The re-reviewer gets the previous reviews copied into its worktree's scratch area, since the policy refused the absolute path last time.
