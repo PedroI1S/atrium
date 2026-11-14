@@ -700,3 +700,56 @@ fn f2_braces_that_hide_a_root_are_expanded_and_the_target_named() {
         assert!(paths.contains(&target.to_owned()), "{pattern}: {paths:?}");
     }
 }
+
+// ---- round 2, item 3: the key of a call's input is canonical ----
+
+#[test]
+fn r2_a_ticket_survives_the_input_being_reserialized_with_other_key_order() {
+    let mut n = started();
+    let hook_input =
+        json!({"path":"/etc/hosts","pattern":"root","extra":{"b":1,"a":[{"y":2,"x":1}]}});
+    let can_use_input =
+        json!({"extra":{"a":[{"x":1,"y":2}],"b":1},"pattern":"root","path":"/etc/hosts"});
+    // The serialized forms really differ.
+    assert_ne!(hook_input.to_string(), can_use_input.to_string());
+    run(
+        &mut n,
+        vec![
+            assistant(
+                json!([{"type":"tool_use","id":"toolu_1","name":"Grep","input":hook_input.clone()}]),
+            ),
+            gate(Some("toolu_1"), "Grep", hook_input, ask("T1")),
+        ],
+    );
+    let evs = run(
+        &mut n,
+        vec![can_use("r_can", Some("toolu_1"), "Grep", can_use_input)],
+    );
+    assert!(
+        matches!(&evs[..], [AgentEvent::ApprovalRequested { request_id, .. }] if request_id == "T1"),
+        "{evs:?}"
+    );
+    // Arrays keep their order: a reordered array is another input.
+    let mut n = started();
+    run(
+        &mut n,
+        vec![gate(Some("t"), "Grep", json!({"a":[1,2]}), ask("T1"))],
+    );
+    let evs = run(
+        &mut n,
+        vec![can_use("r", Some("t"), "Grep", json!({"a":[2,1]}))],
+    );
+    assert!(evs.is_empty(), "{evs:?}");
+}
+
+#[test]
+fn r2_our_canonical_text_is_the_policys() {
+    use atrium_protocol::agent::ToolKind;
+    let v = json!({"c":null,"b":"é\n","a":[{"y":2,"x":1}]});
+    let core = atrium_core::policy::canonical_input(ToolKind::Search, "Grep", &v);
+    let core = String::from_utf8(core).unwrap();
+    assert!(
+        core.ends_with(r#"{"a":[{"x":1,"y":2}],"b":"é\n","c":null}"#),
+        "{core}"
+    );
+}

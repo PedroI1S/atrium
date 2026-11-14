@@ -116,8 +116,46 @@ pub fn tool_check(call_id: Option<&str>, name: &str, input: &Value, turn: u32) -
 /// (or none) together with the tool and its exact input, so a ticket made for
 /// one input is never reused for another.
 pub(crate) fn gate_key(call_id: Option<&str>, name: &str, input: &Value) -> String {
-    let digest = Sha256::digest(format!("{name}\0{input}").as_bytes());
+    let mut body = String::new();
+    canonical_json(input, &mut body);
+    let digest = Sha256::digest(format!("{name}\0{body}").as_bytes());
     format!("{}:{digest:x}", call_id.unwrap_or("anon"))
+}
+
+/// JSON with object keys sorted (recursively) and no insignificant
+/// whitespace: what `atrium_core::policy::canonical_input` writes for the
+/// input, so a re-serialized input (the CLI may order keys differently
+/// between a hook call and `can_use_tool`, and `serde_json` here keeps the
+/// wire order) gives the same key. `atrium-core` depends on this crate, so it
+/// can't be called from here; the unit test below and `tests/claude_review.rs` pin the same text.
+fn canonical_json(v: &Value, out: &mut String) {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(k.clone()).to_string());
+                out.push(':');
+                canonical_json(&m[k], out);
+            }
+            out.push('}');
+        }
+        Value::Array(a) => {
+            out.push('[');
+            for (i, x) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical_json(x, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
 }
 
 /// The subject of `Glob` and `Grep`.
@@ -318,4 +356,23 @@ fn glob_target(base: &str, glob: &str) -> Option<Vec<String>> {
         None => "",
     };
     Some(vec![join(dir), join(glob)])
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// The text `atrium_core::policy::canonical_input` writes for the same
+    /// value (`tests/claude_review.rs` checks it against the real function).
+    pub(crate) const CANONICAL: &str = r#"{"a":[{"x":1,"y":2}],"b":"é\n","c":null}"#;
+
+    #[test]
+    fn canonical_json_sorts_keys_and_keeps_array_order() {
+        let v = json!({"c":null,"b":"é\n","a":[{"y":2,"x":1}]});
+        let mut out = String::new();
+        canonical_json(&v, &mut out);
+        assert_eq!(out, CANONICAL);
+    }
 }
