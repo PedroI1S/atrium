@@ -446,3 +446,14 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **Linux idle memory over 150 MB is not this task's:** M1-09a's shell measures 219–223 MiB private PSS on the same machine and script (M1-09b: 212–216 MiB). It goes to M1-14b (L3 profiling) and a gate decision.
 - **Open for the drivers, not decided here:** how §14's frame statistic reads on Linux (144 Hz display, 1 ms rAF timestamps; the worker proposes "frames that skip an update", 0.1–0.3 % measured) and batching events in `bridge.rs` (about 10,000 webview script runs a second at 10k tokens/s).
 - The merge unblocks M1-14b (it waited for M1-09b's `app/src/**` and `app/scripts/**`); its dispatch still needs a go.
+
+## D-073 — 2026-11-14 — Pedro's shifts: Gemini 4 Hydrogen takes the Flash and Argon jobs
+**Decided by Pedro (driver).** In Pedro's tests Gemini 4 Hydrogen performs better than Gemini 4 Argon in most cases. On **Pedro's shifts**:
+- **Every `agy` Flash job goes to Hydrogen** (`gemini-4-hydrogen-medium`, through `scripts/agent-run agy`). This confirms D-068 for his shifts.
+- **Every Gemini 4 Argon job goes to Hydrogen too**: work, reviews and escalations. This replaces the Argon → Sonnet 5.5 routing of D-053 and D-060 on his shifts. The orchestrator picks the effort level per job: `medium` by default, `high` for security, `unsafe` and escalation work, which is what Argon used (`gemini-4-argon-high`, D-071).
+- The rest of D-060 is unchanged on Pedro's shifts: Codex → Sonnet 5.5, Astra → Opus 5.5, Sol → Sonnet 5.5 or, where Flash was the alternative, Hydrogen.
+- **Open tasks this changes, when they run on Pedro's shift:**
+  - M1-07's escalation (D-071, Argon, reviewed by Sol) runs on Hydrogen `high`, reviewed by Sonnet 5.5 (Sol → Sonnet, D-060). Hydrogen and Sonnet are different providers, so the review stays cross-provider.
+  - Argon's reviews of M1-15, of M1-14a's re-review if still open, and of M1-13's re-review go to Hydrogen.
+- **Rodrigo's shifts keep his own routing** (D-064, D-066 to D-071) unless he decides otherwise.
+- Hydrogen's limit is four at once (D-068). Its `routing.md` rows track how it does on the Argon-class work.
