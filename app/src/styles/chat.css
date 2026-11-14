@@ -1,0 +1,127 @@
+/* The chat (M1-09b): transcript rows, rendered markdown, tool steps, approval and question
+ * cards, the inbox and the settings lists. Tokens only; their literals are in base.css and the
+ * themes (see tokens-conformance.test.ts). */
+
+/* ---- the transcript ------------------------------------------------------------------------ */
+.thread-view { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+.thread-row[data-row="tool"], .thread-row[data-row="note"], .thread-row[data-row="request"] { padding-bottom: var(--u15); }
+.you-row { display: flex; justify-content: flex-end; }
+.you { white-space: pre-wrap; overflow-wrap: anywhere; }
+.history-note { max-width: var(--chat-measure); margin: 0 auto var(--u4); color: var(--text-muted); font-size: var(--text-small); text-align: center; }
+.to-tail { position: absolute; left: 50%; bottom: var(--to-tail-offset); transform: translateX(-50%); display: inline-flex; align-items: center; gap: var(--u15); height: var(--btn-height); padding: 0 var(--u3); border-radius: var(--pill-radius); background: var(--overlay-paint); border: var(--hairline) solid var(--border-strong); box-shadow: var(--shadow-overlay); font-size: var(--text-small); color: var(--text-muted); transition: color var(--motion-fast); }
+.to-tail:hover { color: var(--text); }
+
+/* ---- markdown from the agent (DOM nodes built by chat/render.ts, contract §12) -------------- */
+.md { font-size: var(--chat-font-size); line-height: var(--line-chat); overflow-wrap: anywhere; min-width: 0; display: flex; flex-direction: column; gap: var(--u2); }
+.md.reasoning { color: var(--text-muted); font-size: var(--text-row); }
+.md p, .md h1, .md h2, .md h3, .md h4, .md h5, .md h6, .md ul, .md ol, .md blockquote, .md pre { margin: 0; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { font-weight: var(--weight-semibold); line-height: var(--line-ui); letter-spacing: var(--tracking-section); }
+.md h1 { font-size: var(--text-h1); }
+.md h2 { font-size: var(--text-h2); }
+.md h3 { font-size: var(--text-h3); }
+.md h4, .md h5, .md h6 { font-size: var(--chat-font-size); }
+.md ul, .md ol { padding-left: var(--u6); display: flex; flex-direction: column; gap: var(--u1); }
+.md li > ul, .md li > ol { margin-top: var(--u1); }
+.md blockquote { padding-left: var(--u3); border-left: var(--md-quote-bar) solid var(--border-strong); color: var(--text-muted); display: flex; flex-direction: column; gap: var(--u2); }
+.md hr { width: 100%; border: 0; border-top: var(--hairline) solid var(--border-strong); margin: var(--u1) 0; }
+.md pre.md-code { padding: var(--u3) var(--u35); border-radius: var(--btn-radius); background: var(--code-bg); overflow-x: auto; line-height: var(--line-diff); }
+.md pre.md-code code { background: none; padding: 0; border-radius: 0; white-space: pre; overflow-wrap: normal; }
+.md-table { overflow-x: auto; }
+.md-table table { border-collapse: collapse; font-size: var(--text-small); }
+.md-table th { text-align: left; font-weight: var(--weight-medium); color: var(--text-muted); }
+.md-table th, .md-table td { padding: var(--u15) var(--u3); border-bottom: var(--hairline) solid var(--border); vertical-align: top; }
+.md-table .al-l { text-align: left; }
+.md-table .al-c { text-align: center; }
+.md-table .al-r { text-align: right; }
+.md-link { color: var(--info); text-decoration: underline; text-underline-offset: var(--focus-offset); cursor: pointer; }
+.md-nolink { text-decoration: underline dotted; text-underline-offset: var(--focus-offset); }
+.md-img { display: block; max-width: 100%; max-height: var(--md-img-max-height); border-radius: var(--row-radius-sm); }
+.md-img-load { display: inline-flex; align-items: center; height: var(--btn-height-sm); padding: 0 var(--u25); border-radius: var(--btn-radius-sm); border: var(--hairline) solid var(--border-strong); font-size: var(--text-small); color: var(--text-muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.md-img-load:hover { background: var(--hover); color: var(--text); }
+.md-img-refused { color: var(--text-muted); font-size: var(--text-small); }
+
+/* ---- tool steps ------------------------------------------------------------------------------ */
+.tool { display: flex; flex-direction: column; min-width: 0; }
+.tool .step { min-width: 0; }
+.tool-out { margin: var(--u1) 0 var(--u1) var(--u25); padding-left: var(--u3); border-left: var(--hairline) solid var(--border-strong); display: flex; flex-direction: column; gap: var(--u15); min-width: 0; }
+.tool-out p { margin: 0; }
+.tool-pre { margin: 0; padding: var(--u2) var(--u3); border-radius: var(--btn-radius-sm); background: var(--code-bg); font-family: var(--font-code); font-size: var(--text-mono-sm); line-height: var(--line-term); white-space: pre-wrap; overflow-wrap: anywhere; max-height: var(--tool-out-max-height); overflow: auto; -webkit-user-select: text; user-select: text; }
+.tool-err { color: var(--state-failed); font-size: var(--text-small); }
+
+/* ---- notes: session, turn end, errors, limits, the plan ---------------------------------------- */
+.note-row { display: flex; align-items: center; gap: var(--u15); flex-wrap: wrap; font-size: var(--text-label); color: var(--text-muted); padding: 0 var(--u25); min-width: 0; }
+.note-row.err { color: var(--state-failed); font-size: var(--text-small); }
+.note-row .err-msg { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.note-row .tool-pre { flex-basis: 100%; color: var(--text); }
+.plan { display: flex; flex-direction: column; gap: var(--u1); padding: var(--u2) var(--u25); border-radius: var(--row-radius); background: var(--hover); font-size: var(--text-row); }
+.plan-h { display: flex; align-items: center; gap: var(--u15); font-weight: var(--weight-medium); }
+.plan-e { display: flex; align-items: baseline; gap: var(--u2); color: var(--text-muted); }
+.plan-e[data-status="in_progress"] { color: var(--text); }
+.plan-e[data-status="completed"] { text-decoration: line-through; }
+
+/* ---- requests: the row in the transcript, the cards above the composer ------------------------- */
+.req-row { display: flex; align-items: center; gap: var(--u2); min-height: var(--step-height); padding: 0 var(--u25); font-size: var(--text-row); min-width: 0; }
+.req-what { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.req-state { flex: none; color: var(--text-muted); font-size: var(--text-label); }
+.dock { max-width: var(--chat-measure); width: 100%; margin: 0 auto var(--u2); display: flex; flex-direction: column; gap: var(--u2); max-height: var(--dock-max-height); overflow-y: auto; padding: var(--hairline); }
+.dock > p { margin: 0; }
+/* The card takes focus when it appears (its keys act on it), without the user asking: an ink
+   ring would draw a heavy black frame around it. Its own border turns the needs-you colour
+   instead; the buttons inside keep their rings. */
+.ask:focus, .ask:focus-visible { outline: none; border-color: var(--state-needs-you); }
+.ask.done { box-shadow: none; }
+.ask.done:focus { border-color: var(--border-strong); }
+.ask-cmd { white-space: pre-wrap; overflow-wrap: anywhere; max-height: var(--ask-cmd-max-height); overflow: auto; }
+.ask-state { margin: 0; font-size: var(--text-small); color: var(--text-muted); }
+.ask-state[data-kind="stale"], .ask-state[data-kind="failed"] { color: var(--state-failed); }
+.menu { display: flex; flex-direction: column; gap: var(--hairline); padding: var(--u1); border-radius: var(--btn-radius); background: var(--hover); }
+.menu-item { display: flex; flex-direction: column; gap: var(--hairline); padding: var(--u15) var(--u25); border-radius: var(--row-radius-sm); width: 100%; font-size: var(--text-row); }
+.menu-item:hover, .menu-item:focus-visible { background: var(--hover); }
+.menu-item b { font-weight: var(--weight-medium); }
+.menu-item span { color: var(--text-muted); font-size: var(--text-label); white-space: normal; }
+.q { display: flex; flex-direction: column; gap: var(--u2); }
+.q-prompt { margin: 0; font-size: var(--chat-font-size); line-height: var(--line-bubble); overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; }
+.ask.small .q-prompt { font-size: var(--text-row); }
+.q-opts { display: flex; flex-wrap: wrap; gap: var(--u15); }
+.q-opt.on { background: var(--selected); border-color: var(--focus-ring); }
+.q-text { width: 100%; min-height: var(--q-text-height); resize: vertical; border: var(--hairline) solid var(--border-strong); border-radius: var(--btn-radius); background: transparent; padding: var(--u15) var(--u25); font-size: var(--text-row); outline: 0; -webkit-user-select: text; user-select: text; }
+.q-text:focus { border-color: var(--focus-ring); }
+
+/* ---- composer additions ------------------------------------------------------------------------ */
+.chip-sel select { height: var(--chip-height); border-radius: var(--pill-radius); border-color: transparent; background: var(--hover); color: var(--text-muted); font-size: var(--text-label); }
+.send:disabled { background: var(--border-strong); }
+.send.stop { background: transparent; color: var(--text); border: var(--hairline) solid var(--border-strong); }
+.send.stop:hover { background: var(--hover); }
+.send.stop + .send { margin-left: 0; }
+
+/* ---- the inbox --------------------------------------------------------------------------------- */
+.inbox-list { padding: 0 var(--u3) var(--u3); outline: none; }
+.inbox-list > * { max-width: var(--inbox-measure); margin-left: auto; margin-right: auto; }
+.item { align-items: flex-start; }
+.item .open { display: flex; gap: var(--u3); flex: 1; min-width: 0; align-items: flex-start; }
+.item .open > .dot { margin-top: var(--u15); }
+.item .ttl, .item .src { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .cards { display: flex; flex-direction: column; gap: var(--u2); margin-top: var(--u15); }
+.item .ask { box-shadow: none; }
+.statusb .kbd { margin-left: 0; opacity: 1; color: var(--text); }
+.statusb span { white-space: nowrap; }
+.statusb { gap: var(--u35); overflow: hidden; }
+
+/* ---- the panel: an inbox item's preview, usage ------------------------------------------------- */
+.preview { padding: var(--u1) var(--u4) var(--u2); display: flex; flex-direction: column; gap: var(--u2); font-size: var(--text-small); }
+.preview b { font-weight: var(--weight-semibold); font-size: var(--text-title); overflow-wrap: anywhere; }
+.preview p { margin: 0; color: var(--text-muted); overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; }
+.facts-t { padding: var(--u2) var(--u4) 0; font-size: var(--text-label); font-weight: var(--weight-medium); color: var(--text-muted); }
+
+/* ---- settings: agents, remembered approvals ---------------------------------------------------- */
+.s-list { display: flex; flex-direction: column; }
+.s-item { display: flex; align-items: flex-start; gap: var(--u3); min-height: var(--list-row-min-height); padding: var(--u3) 0; border-bottom: var(--hairline) solid var(--border); }
+.s-item > .dot { margin-top: var(--u15); }
+.s-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--u05); }
+.s-main b { font-weight: var(--weight-medium); font-size: var(--text-ui); }
+.s-main span, .s-main p { margin: 0; font-size: var(--text-small); color: var(--text-muted); overflow-wrap: anywhere; }
+.s-main .code { align-self: flex-start; color: var(--text); white-space: pre-wrap; -webkit-user-select: text; user-select: text; }
+.s-empty { margin: var(--u3) 0 0; color: var(--text-muted); font-size: var(--text-small); }
+
+/* A button that reads as a link inside text ("3 more"). */
+.link-btn { padding: 0; border: 0; background: none; font: inherit; color: var(--text); text-decoration: underline; text-underline-offset: var(--hairline); }

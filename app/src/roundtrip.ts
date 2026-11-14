@@ -34,7 +34,7 @@ const STEP_TIMEOUT_MS = 15_000;
 
 interface Check { name: string; pass: boolean; detail: string }
 
-async function until(what: string, test: () => boolean | Promise<boolean>): Promise<void> {
+export async function until(what: string, test: () => boolean | Promise<boolean>): Promise<void> {
   const deadline = Date.now() + STEP_TIMEOUT_MS;
   while (!(await test())) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
@@ -118,11 +118,11 @@ export async function runRoundtripVerify(): Promise<void> {
   followConnection();
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** After a state change: let it render and its transitions end before the picture. */
 const SETTLE_MS = 450;
 
-async function shot(name: string): Promise<void> {
+export async function shot(name: string): Promise<void> {
   await sleep(SETTLE_MS);
   await invoke("take_snapshot", { name });
 }

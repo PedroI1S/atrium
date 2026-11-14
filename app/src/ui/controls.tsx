@@ -4,6 +4,7 @@
 import { ChevronDown } from "lucide-solid";
 import { For, type JSX, splitProps } from "solid-js";
 import type { Tone } from "../daemon/reduce";
+import { platform } from "../windows";
 
 /** A state dot. With `label` it stands alone and is announced; without, a label follows it. */
 export function Dot(props: { tone: Tone; label?: string }) {
@@ -61,6 +62,9 @@ export function Select<T extends string>(props: { value: T; options: { value: T;
     </span>
   );
 }
+
+/** The shortcut modifier as this platform writes it: "⌘J" on macOS, "Ctrl+J" on Linux. */
+export const modKey = (): string => (platform() === "macos" ? "⌘" : "Ctrl+");
 
 export function Kbd(props: { children: string }) {
   return <span class="kbd">{props.children}</span>;

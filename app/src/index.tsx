@@ -9,7 +9,11 @@ import "@fontsource/geist-mono/latin-500.css";
 import "./styles/base.css";
 import "./styles/calm.css";
 import "./styles/shell.css";
+import "./styles/chat.css";
 import { App } from "./App";
+import { chatLivePopout, runChatLive } from "./chat-live";
+import { runChatShots } from "./chat-shots";
+import { runStreamBench } from "./stream-bench";
 import { attach, daemon } from "./daemon/client";
 import { epochNow, markOnce, reportFailure, runHarness, setStage } from "./harness";
 import type { Screen } from "./layout";
@@ -63,12 +67,19 @@ async function boot() {
     setStage("ready");
     await invoke("window_ready", { applied: { ...appliedState(), readyAt: epochNow() } });
   }
-  if (isRoundtrip(info)) {
+  if (info.benchMode === "chat-live") {
+    setStage("chat-live");
+    await (isPopout() ? chatLivePopout() : runChatLive());
+  } else if (info.benchMode === "stream" || info.benchMode === "stream-one") {
+    setStage("stream");
+    if (!isPopout()) await runStreamBench(info.benchMode === "stream-one");
+  } else if (isRoundtrip(info)) {
     setStage("roundtrip");
     const shots = info.benchMode?.startsWith("shots");
     if (isPopout()) await (shots ? shotsPopout() : roundtripPopout());
     else if (info.benchMode === "roundtrip") await runRoundtrip();
     else if (info.benchMode === "shots") await runShots();
+    else if (info.benchMode === "shots-chat") await runChatShots();
     else if (info.benchMode === "shots-incompatible") await runShotsIncompatible();
     else await runRoundtripVerify();
   } else if (info.benchMode && !isPopout()) {
