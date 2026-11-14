@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AgentEvent, StoredEvent } from "../daemon/types";
 import recorded from "./fixtures/approvals.json";
-import { SOFT_BLOCK_CHARS } from "./blocks";
+import { SOFT_BLOCK_CHARS, SOFT_FENCE_CHARS } from "./blocks";
 import { type ApprovalItem, type MessageItem, type QuestionItem, type ToolItem, Transcript } from "./transcript";
 import { cardState } from "./requests";
 
@@ -103,6 +103,37 @@ describe("messages", () => {
     expect(blocks.length).toBe(3);
     expect(blocks.every((b) => b.text.startsWith("```js\n"))).toBe(true);
     expect(blocks[0]!.closed && blocks[1]!.closed && !blocks[2]!.closed).toBe(true);
+  });
+
+  it("a code block of few but long lines is cut too, and one long line in it is cut at the limit, never inside a character", () => {
+    const body = (b: { text: string }) => b.text.replace(/^```js\n/, "").replace(/\n```\n$/, "");
+    const cap = SOFT_FENCE_CHARS + "```js\n".length + "\n```\n".length;
+    // One 1 MiB line (encoded data), token by token and arriving whole; an odd offset puts a
+    // two-unit character across the limit.
+    const line = `x${"😀".repeat(256 * 1024)}`;
+    reset();
+    const streamed = new Transcript();
+    streamed.apply([ev(delta("a1", "```js\n"))]);
+    for (let i = 0; i < line.length; i += 997) streamed.apply([ev(delta("a1", line.slice(i, i + 997)))]);
+    reset();
+    const whole = new Transcript();
+    whole.apply([ev(delta("a1", `\`\`\`js\n${line}`))]);
+    for (const t of [streamed, whole]) {
+      const blocks = messages(t)[0]!.splitter.blocks;
+      expect(blocks.length).toBeGreaterThan(30);
+      expect(blocks.every((b) => b.text.startsWith("```js\n") && b.text.length <= cap)).toBe(true);
+      expect(blocks.every((b) => !/[\ud800-\udbff]$/.test(body(b)))).toBe(true);
+      expect(blocks.slice(1).every((b) => b.cont)).toBe(true);
+      expect(blocks.map((b) => body(b).replace(/\n$/, "")).join("")).toBe(line);
+    }
+    // 150 lines of 1,000 characters: under the line limit, over the character limit.
+    reset();
+    const wide = new Transcript();
+    wide.apply([ev(delta("a1", "```js\n"))]);
+    for (let i = 0; i < 150; i++) wide.apply([ev(delta("a1", `${"w".repeat(1000)}\n`))]);
+    const blocks = messages(wide)[0]!.splitter.blocks;
+    expect(blocks.length).toBeGreaterThan(5);
+    expect(blocks.every((b) => b.text.startsWith("```js\n") && b.text.length <= cap + 1001)).toBe(true);
   });
 });
 

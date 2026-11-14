@@ -59,6 +59,8 @@ export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick
       ref={(el) => props.autofocus && queueMicrotask(() => { if (!typing()) el.focus({ preventScroll: true }); })}
       onKeyDown={(e) => {
         if (props.keys === false || !act() || e.target instanceof HTMLTextAreaElement) return;
+        // With the "Always…" choices open, esc closes them, whatever has focus; it never denies.
+        if (e.key === "Escape" && menu()) { e.preventDefault(); setMenu(false); return; }
         if (performance.now() - shownAt < ARM_AFTER_MS || e.repeat) return;
         // ↵ on a focused button presses that button (Deny stays Deny).
         if (e.key === "Enter" && !(e.target instanceof HTMLButtonElement) && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) { e.preventDefault(); allow(); }

@@ -136,3 +136,11 @@ Third worker (Claude Opus 5.5, rodrigo's machine, 2026-11-14), the escalation fo
 ## Exact next step
 
 For the orchestrator, not a worker: (1) decide how the §14 frame statistic reads on Linux (rAF, 1 ms timestamps) and whether to batch deliveries in `bridge.rs`; (2) measure M1-09a's shell with `startup_bench.py` on this machine to see whether the 212–216 MiB idle is M1-09b's; (3) the macOS shift runs `screenshots.py`, `startup_bench.py` and `stream_bench.py --runs 3` there.
+
+## Review fixes (orchestrator, 2026-11-14)
+
+The Gemini 4 Hydrogen review (`docs/agents/reviews/M1-09b-home-chat.md` on `dev`, **approve with changes**: one minor, two nits) was fixed by the orchestrator (Opus 5.5) as small fixes:
+- **Minor 1, a code block of few but long lines grew without bound:** an open fence is also cut past `SOFT_FENCE_CHARS` (16 KiB), and one long unfinished line inside it is cut at that limit, never inside a character (`chat/blocks.ts`). Test `a code block of few but long lines is cut too, …` in `chat/transcript.test.ts` (a 1 MiB line streamed and whole, 150 lines of 1,000 characters); it fails on the old `blocks.ts` and passes now.
+- **Nit 2, `check_reveal` relied on the webview for control characters:** it refuses them itself, as `check` does (`src-tauri/src/links.rs`); test `a_path_with_a_control_character_is_refused_even_when_it_exists`.
+- **Nit 3, esc with the "Always…" choices open denied the request when focus was on the button:** esc now closes the choices whatever has focus, before the arming delay, and never denies while they are open (`ui/RequestCard.tsx`). No test: the app has no component tests yet.
+- DoD after the fixes: `cargo fmt --all --check` and workspace clippy clean; `cargo test -p atrium-app` 45 + 2; `pnpm typecheck` clean; `pnpm test` 13 files, 261 tests; `pnpm build` built.

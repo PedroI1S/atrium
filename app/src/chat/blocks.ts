@@ -6,7 +6,7 @@
 // Long blocks are cut so no single row grows without bound (a 100k-character paragraph would be
 // re-parsed and re-laid-out every frame): an open paragraph past SOFT_BLOCK_CHARS closes at its
 // last line break (or, with none, its last space; or, with no space either, at the limit), and an open fence past SOFT_FENCE_LINES
-// closes and continues as a second code block. Such a block is marked `cont` so the view joins
+// or SOFT_FENCE_CHARS closes and continues as a second code block (one long line is cut at the limit). Such a block is marked `cont` so the view joins
 // it to the one before. The cost: inline markup that spans a cut (a `**` opened before it) is
 // shown as text on both sides. Only paragraphs over 4 KB without blank lines are affected.
 
@@ -14,6 +14,8 @@
 export const SOFT_BLOCK_CHARS = 4096;
 /** An open fence past this many lines is cut. */
 export const SOFT_FENCE_LINES = 200;
+/** An open fence past this many characters is cut too (few lines, but long ones). */
+export const SOFT_FENCE_CHARS = 4 * SOFT_BLOCK_CHARS;
 
 const HIGH_SURROGATE_FIRST = 0xd800;
 const HIGH_SURROGATE_LAST = 0xdbff;
@@ -166,14 +168,27 @@ export class BlockSplitter {
 
   private softCut(): void {
     if (this.fence) {
-      if (this.fence.lines < SOFT_FENCE_LINES) return;
+      const f = this.fence;
+      if (f.lines < SOFT_FENCE_LINES && this.openText().length <= SOFT_FENCE_CHARS) return;
       // Close this part of the code block and carry on in a new one.
-      const closer = this.fence.marker;
-      const b = this.body + closer + "\n";
-      this.close(b);
-      this.cont = true;
-      this.body = this.fence.opener + "\n";
-      this.fence.lines = 0;
+      const reopen = f.opener + "\n";
+      if (this.body !== reopen) {
+        this.close(this.body + f.marker + "\n");
+        this.cont = true;
+        this.body = reopen;
+        f.lines = 0;
+      }
+      // One long unfinished line (encoded data, a minified file): cut it at the limit, between
+      // two characters, so no code row grows without bound either.
+      while (this.partial.length > SOFT_FENCE_CHARS) {
+        let at = SOFT_FENCE_CHARS;
+        const before = this.partial.charCodeAt(at - 1);
+        // Never between the two halves of one character.
+        if (before >= HIGH_SURROGATE_FIRST && before <= HIGH_SURROGATE_LAST) at--;
+        this.close(reopen + this.partial.slice(0, at) + "\n" + f.marker + "\n");
+        this.cont = true;
+        this.partial = this.partial.slice(at);
+      }
       return;
     }
     const t = this.openText();

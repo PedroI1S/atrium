@@ -77,6 +77,11 @@ pub enum RevealError {
 /// thread's cwd, itself resolved). The result is what gets revealed, never
 /// opened or run.
 pub fn check_reveal(path: &str, folder: &Path) -> Result<PathBuf, RevealError> {
+    // The same character hygiene as `check`, here too: the webview filters, but this command
+    // must not rely on it.
+    if path.chars().any(char::is_control) {
+        return Err(RevealError::NotAbsolute);
+    }
     let path = Path::new(path);
     if !path.is_absolute() || path.as_os_str().len() > MAX_LINK_BYTES {
         return Err(RevealError::NotAbsolute);
@@ -133,6 +138,22 @@ mod tests {
         let dotted = format!("{}/./sub/../notes.md", folder.path().display());
         std::fs::create_dir(folder.path().join("sub")).unwrap();
         assert!(check_reveal(&dotted, folder.path()).is_ok());
+    }
+
+    #[test]
+    fn a_path_with_a_control_character_is_refused_even_when_it_exists() {
+        let folder = tempfile::tempdir().unwrap();
+        for name in ["a\nb.md", "a\tb.md", "a\u{1b}b.md"] {
+            let file = folder.path().join(name);
+            std::fs::write(&file, "x").unwrap();
+            assert!(
+                matches!(
+                    check_reveal(file.to_str().unwrap(), folder.path()),
+                    Err(RevealError::NotAbsolute)
+                ),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]
