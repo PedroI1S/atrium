@@ -281,12 +281,23 @@ impl ClaudeNormalizer {
     /// Emits `SessionStarted` (and the held `TurnStarted`) once the provider
     /// has answered for real.
     fn establish(&mut self, out: &mut Vec<AgentEvent>) {
+        self.establish_with(None, out);
+    }
+
+    /// As [`Self::establish`]. A record that proves the model answered but
+    /// came before (or without) `system/init` establishes the session at
+    /// once, from what the record carries (its model, else nothing; the
+    /// native id stays empty, never invented): whatever needs an answer must
+    /// not wait for an `init` that may never come.
+    fn establish_with(&mut self, model: Option<&str>, out: &mut Vec<AgentEvent>) {
         if self.established {
             return;
         }
-        let Some(init) = &self.init else {
-            return;
-        };
+        let init = self.init.get_or_insert_with(|| InitInfo {
+            session_id: String::new(),
+            model: model.map(str::to_owned),
+            tools: Vec::new(),
+        });
         self.established = true;
         // What `start()` returned; a later descriptor is reported as a change
         // right after.
@@ -315,6 +326,16 @@ impl ClaudeNormalizer {
             self.ensure_turn(out);
         }
         out.append(&mut self.held);
+    }
+
+    /// Keeps events for the session to come: at most [`MAX_DIAGNOSTIC_LINES`],
+    /// the newest (a session that never starts must not grow without bound).
+    fn hold(&mut self, events: Vec<AgentEvent>) {
+        self.held.extend(events);
+        if self.held.len() > MAX_DIAGNOSTIC_LINES {
+            let extra = self.held.len() - MAX_DIAGNOSTIC_LINES;
+            self.held.drain(..extra);
+        }
     }
 
     /// A record arrived outside any turn the client started (a background
@@ -423,7 +444,7 @@ impl ClaudeNormalizer {
             "message_start" => {
                 let model = e.pointer("/message/model").and_then(Value::as_str);
                 if model != Some(SYNTHETIC_MODEL) {
-                    self.establish(out);
+                    self.establish_with(model, out);
                     self.ensure_turn(out);
                 }
             }
@@ -513,7 +534,7 @@ impl ClaudeNormalizer {
             self.synthetic(v, out);
             return;
         }
-        self.establish(out);
+        self.establish_with(msg.get("model").and_then(Value::as_str), out);
         self.ensure_turn(out);
         let mid = str_of(msg, "id").unwrap_or_default();
         let blocks = msg
@@ -869,7 +890,7 @@ impl ClaudeNormalizer {
             if self.established {
                 out.push(ev);
             } else {
-                self.held.push(ev);
+                self.hold(vec![ev]);
             }
         }
         if rejected && !self.rate_limited {
@@ -1370,7 +1391,7 @@ impl Normalizer for ClaudeNormalizer {
         // shown (`Error` then `SessionEnded`, from `Exit`): whatever else
         // this input produced waits for the session, or is dropped with it.
         if !self.established && !matches!(input, AdapterInput::Exit { .. }) {
-            self.held.append(&mut out);
+            self.hold(std::mem::take(&mut out));
         }
         out
     }

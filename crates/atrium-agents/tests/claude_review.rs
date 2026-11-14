@@ -311,33 +311,6 @@ fn f4_a_command_error_before_the_session_starts_waits_for_it() {
     );
 }
 
-#[test]
-fn f4_records_before_any_init_produce_nothing_and_a_pre_session_failure_is_two_events() {
-    let mut n = ClaudeNormalizer::new();
-    let evs = run(
-        &mut n,
-        vec![
-            user_line("go"),
-            message_start(),
-            assistant(json!([{"type":"text","text":"hi"}])),
-            result(),
-        ],
-    );
-    assert!(evs.is_empty(), "{evs:?}");
-    // Nothing was ever shown, so a failed start is just Error + SessionEnded.
-    let evs = run(&mut n, vec![AdapterInput::Exit { code: Some(1) }]);
-    assert!(
-        matches!(
-            &evs[..],
-            [
-                AgentEvent::Error { fatal: true, .. },
-                AgentEvent::SessionEnded { .. }
-            ]
-        ),
-        "{evs:?}"
-    );
-}
-
 // ---- finding 7: tickets follow the call they were made for ----
 
 #[test]
@@ -752,4 +725,164 @@ fn r2_our_canonical_text_is_the_policys() {
         core.ends_with(r#"{"a":[{"x":1,"y":2}],"b":"é\n","c":null}"#),
         "{core}"
     );
+}
+
+// ---- round 2, item 2: nothing that needs an answer is ever held ----
+
+#[test]
+fn r2_records_before_any_init_establish_the_session_from_the_record() {
+    let mut n = ClaudeNormalizer::new();
+    let evs = run(
+        &mut n,
+        vec![
+            user_line("go"),
+            message_start(),
+            assistant(json!([{"type":"text","text":"hi"}])),
+            result(),
+        ],
+    );
+    assert!(
+        matches!(&evs[0], AgentEvent::SessionStarted { model: Some(m), .. } if m == "claude-x"),
+        "{evs:?}"
+    );
+    assert_well_opened(&evs);
+    assert!(
+        matches!(evs.last(), Some(AgentEvent::TurnCompleted { turn: 1, .. })),
+        "{evs:?}"
+    );
+}
+
+#[test]
+fn r2_a_failed_start_with_only_noise_is_still_two_events() {
+    let mut n = ClaudeNormalizer::new();
+    let evs = run(
+        &mut n,
+        vec![
+            user_line("go"),
+            out(json!({"type":"system","subtype":"hook_started"})),
+            AdapterInput::Exit { code: Some(1) },
+        ],
+    );
+    assert!(
+        matches!(
+            &evs[..],
+            [
+                AgentEvent::Error { fatal: true, .. },
+                AgentEvent::SessionEnded { .. }
+            ]
+        ),
+        "{evs:?}"
+    );
+}
+
+/// Case A: an approval or a question before `init` is shown at once.
+#[test]
+fn r2_an_approval_or_question_before_init_is_shown_at_once() {
+    let mut n = ClaudeNormalizer::new();
+    let evs = run(
+        &mut n,
+        vec![
+            user_line("go"),
+            can_use("c1", Some("t1"), "Bash", json!({"command":"ls"})),
+            gate(Some("t1"), "Bash", json!({"command":"ls"}), ask("T1")),
+        ],
+    );
+    assert_well_opened(&evs);
+    assert!(
+        evs.iter().any(
+            |e| matches!(e, AgentEvent::ApprovalRequested { request_id, .. } if request_id == "T1")
+        ),
+        "{evs:?}"
+    );
+
+    let mut n = ClaudeNormalizer::new();
+    let evs = run(
+        &mut n,
+        vec![
+            user_line("go"),
+            can_use(
+                "c1",
+                Some("q1"),
+                "AskUserQuestion",
+                json!({"questions":[{"question":"Q?","options":[{"label":"A"}]}]}),
+            ),
+            AdapterInput::QuestionTicket {
+                id: "c1".into(),
+                ticket: Some(ticket("Q1")),
+            },
+        ],
+    );
+    assert_well_opened(&evs);
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, AgentEvent::QuestionAsked { .. }))
+    );
+}
+
+/// Case B: a `result` before `init` resolves what it shows, and turns stay
+/// in order.
+#[test]
+fn r2_a_result_before_init_resolves_the_request_and_keeps_turns_in_order() {
+    let mut n = ClaudeNormalizer::new();
+    let evs = run(
+        &mut n,
+        vec![
+            user_line("go"),
+            can_use("r1", Some("t1"), "Bash", json!({"command":"ls"})),
+            gate(Some("t1"), "Bash", json!({"command":"ls"}), ask("T1")),
+            result(),
+            init(),
+            message_start(),
+            AdapterInput::Exit { code: Some(0) },
+        ],
+    );
+    assert_well_opened(&evs);
+    let mut open: Option<u32> = None;
+    let mut requested = vec![];
+    let mut resolved = vec![];
+    for e in &evs {
+        match e {
+            AgentEvent::TurnStarted { turn } => {
+                assert!(
+                    open.is_none(),
+                    "turn {turn} started inside another: {evs:?}"
+                );
+                open = Some(*turn);
+            }
+            AgentEvent::TurnCompleted { turn, .. } => {
+                assert_eq!(open.take(), Some(*turn), "{evs:?}");
+            }
+            AgentEvent::ApprovalRequested { request_id, .. } => requested.push(request_id.clone()),
+            AgentEvent::RequestResolved { request_id, .. } => resolved.push(request_id.clone()),
+            _ => {}
+        }
+    }
+    assert!(open.is_none(), "a turn is left open: {evs:?}");
+    assert_eq!(requested, ["T1"]);
+    assert_eq!(resolved, ["T1"]);
+    assert!(matches!(evs.last(), Some(AgentEvent::SessionEnded { .. })));
+}
+
+/// Case C: what waits for the session is bounded.
+#[test]
+fn r2_what_waits_for_the_session_is_bounded() {
+    use atrium_protocol::limits::MAX_DIAGNOSTIC_LINES;
+    let mut n = ClaudeNormalizer::new();
+    let mut inputs = vec![user_line("go")];
+    for i in 0..(MAX_DIAGNOSTIC_LINES * 10) {
+        inputs.push(out(json!({"type":"system","subtype":format!("noise_{i}")})));
+    }
+    assert!(run(&mut n, inputs).is_empty());
+    let evs = run(&mut n, vec![init(), message_start()]);
+    let unmapped: Vec<&AgentEvent> = evs
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Unmapped { .. }))
+        .collect();
+    assert_eq!(unmapped.len(), MAX_DIAGNOSTIC_LINES, "{}", evs.len());
+    // The newest are the ones kept.
+    assert!(matches!(
+        unmapped.last(),
+        Some(AgentEvent::Unmapped { record_type, .. })
+            if *record_type == format!("system/noise_{}", MAX_DIAGNOSTIC_LINES * 10 - 1)
+    ));
 }
