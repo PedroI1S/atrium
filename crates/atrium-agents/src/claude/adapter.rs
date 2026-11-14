@@ -408,15 +408,34 @@ struct Proc {
 impl Drop for Proc {
     /// A `Proc` dropped while its process is still ours (a `start` abandoned
     /// during the handshake, a panicked session task) must not leave the
-    /// process group behind: `kill_on_drop` reaches the leader only. The group
-    /// is killed and reaped by a task.
+    /// process group behind: `kill_on_drop` reaches the leader only.
+    ///
+    /// The group is signalled without depending on a runtime: on a plain
+    /// thread (or one whose runtime is going away) here and now, with the
+    /// leader still unreaped so its group id can't be reused
+    /// (`kill_recorded` waits a moment for the group to drain, which it
+    /// can't while the leader is an unreaped zombie, so with a runtime that
+    /// wait is on a short-lived thread). With a runtime, a task also
+    /// terminates and reaps the leader.
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            runtime.spawn(async move {
-                let _ = supervise::terminate(&mut child, Duration::ZERO).await;
-            });
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let identity = child.identity.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                std::thread::spawn(move || {
+                    let _ = supervise::kill_recorded(&identity);
+                });
+                runtime.spawn(async move {
+                    let _ = supervise::terminate(&mut child, Duration::ZERO).await;
+                });
+            }
+            Err(_) => {
+                let _ = supervise::kill_recorded(&identity);
+                // The leader is dead now: reap it.
+                let _ = child.child.try_wait();
+            }
         }
     }
 }

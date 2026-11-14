@@ -1524,6 +1524,32 @@ async fn a_start_dropped_during_the_handshake_kills_the_process_group() {
     }
 }
 
+/// Round 2, item 6: the same, dropped on a plain thread (no runtime to run
+/// an async reap).
+#[tokio::test]
+async fn a_start_dropped_outside_a_runtime_kills_the_process_group() {
+    let dir = scratch("start-drop-thread");
+    let pgid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut cfg = config(&dir, "no-init", allow());
+    cfg.env.push(("FAKE_GRANDCHILD".into(), "1".into()));
+    let seen = pgid.clone();
+    cfg.on_spawn = Some(Arc::new(move |id| seen.store(id.pgid, Ordering::SeqCst)));
+    let marker = dir.join("grandchild.pid");
+    let mut fut = Box::pin(start(cfg, opts()));
+    tokio::select! {
+        _ = &mut fut => panic!("the fake never answers initialize"),
+        _ = wait_file(&marker, 10) => {}
+    }
+    // No runtime on this thread: `Handle::try_current()` is an error there.
+    std::thread::spawn(move || drop(fut)).join().unwrap();
+    let pgid = pgid.load(Ordering::SeqCst);
+    assert!(pgid > 1);
+    assert!(
+        !group_alive(pgid),
+        "the process group survived a drop outside a runtime"
+    );
+}
+
 // ---- enforcement descriptor ----
 
 fn write(path: &Path, text: &str) {
