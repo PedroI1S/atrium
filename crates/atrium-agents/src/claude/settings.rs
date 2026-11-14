@@ -15,8 +15,11 @@
 //!   `ExternalHooks` reason.
 //! - Hooks and the command-running keys (`apiKeyHelper`, `awsAuthRefresh`,
 //!   `awsCredentialExport`, `fileSuggestion`, `otelHeadersHelper`,
-//!   `statusLine`) add an `ExternalHooks` reason. A `hooks` value in a shape
-//!   that is not parsed makes the file `inspected: false`.
+//!   `statusLine`, and the unconfirmed helper keys `gcpAuthRefresh`,
+//!   `processWrapper`, `policyHelpers`, `proxyAuthHelper`,
+//!   `subagentStatusLine`: see `COMMAND_KEYS`) add an `ExternalHooks` reason.
+//!   A `hooks` value in a shape that is not parsed makes the file
+//!   `inspected: false`.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -33,13 +36,25 @@ use sha2::{Digest, Sha256};
 /// describes it as "Custom file suggestion configuration for @ mentions" with
 /// a `command`, and the code that runs it is the "FileSuggestion command"
 /// (found in the `claude` 2.1.312 binary, no session started).
-const COMMAND_KEYS: [&str; 6] = [
+///
+/// `gcpAuthRefresh`, `processWrapper`, `policyHelpers`, `proxyAuthHelper` and
+/// `subagentStatusLine` are in the same list of helper keys in that binary,
+/// but it was **not** confirmed that each one runs a command. They count as
+/// command keys anyway (the orchestrator's decision, fail closed): a file
+/// that sets one makes the session `Partial` with `ExternalHooks`, which at
+/// worst reports a session as less enforced than it is.
+const COMMAND_KEYS: [&str; 11] = [
     "apiKeyHelper",
     "awsAuthRefresh",
     "awsCredentialExport",
     "fileSuggestion",
+    "gcpAuthRefresh",
     "otelHeadersHelper",
+    "policyHelpers",
+    "processWrapper",
+    "proxyAuthHelper",
     "statusLine",
+    "subagentStatusLine",
 ];
 
 /// What [`inspect`] needs to know about the session.
@@ -677,6 +692,45 @@ mod tests {
         assert_eq!(i.reasons.len(), 1, "{:?}", i.reasons);
         assert!(i.reasons[0].message.contains("fileSuggestion"));
         assert_eq!(i.reasons[0].code, ReasonCode::ExternalHooks);
+    }
+
+    /// The orchestrator's decision (round 2, item 8): the other helper keys
+    /// found in the CLI binary count as command keys too, failing closed.
+    /// Only `fileSuggestion` was confirmed to run a command.
+    #[test]
+    fn the_other_helper_keys_are_command_keys_too() {
+        for key in [
+            "gcpAuthRefresh",
+            "processWrapper",
+            "policyHelpers",
+            "proxyAuthHelper",
+            "subagentStatusLine",
+        ] {
+            let root = tmp(&format!("helper-{key}"));
+            let user = root.join("u");
+            write(
+                &user.join("settings.json"),
+                &format!(r#"{{"{key}":{{"type":"command","command":"/tmp/helper.sh"}}}}"#),
+            );
+            let i = run(&root, &user, None, &[], &[]);
+            assert_eq!(i.reasons.len(), 1, "{key}: {:?}", i.reasons);
+            assert_eq!(i.reasons[0].code, ReasonCode::ExternalHooks, "{key}");
+            assert!(i.reasons[0].message.contains(key), "{key}");
+            assert!(i.sources[0].inspected, "{key}");
+            let d = atrium_protocol::policy::EnforcementDescriptor::evaluate(
+                atrium_protocol::agent::Provider::Claude,
+                Some("2.1.308".into()),
+                true,
+                vec![],
+                i.sources,
+                i.reasons,
+            );
+            assert_eq!(
+                d.level,
+                atrium_protocol::policy::EnforcementLevel::Partial,
+                "{key}"
+            );
+        }
     }
 
     #[test]
