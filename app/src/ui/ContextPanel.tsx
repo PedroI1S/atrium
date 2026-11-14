@@ -4,7 +4,7 @@
 // Changes, Checks, Files and Terminal arrive with workspaces (M2).
 
 import { ChevronsLeft, ChevronsRight, Info } from "lucide-solid";
-import { For, Show, onCleanup } from "solid-js";
+import { For, Show, createSignal, onCleanup } from "solid-js";
 import { holdThread } from "../chat/threads";
 import { daemon } from "../daemon/client";
 import { toneOf } from "../daemon/reduce";
@@ -70,6 +70,24 @@ function UsageFacts(props: { threadId: string }) {
   );
 }
 
+/** Reasons shown before "N more" (a partial session can list one per tool class). */
+const REASONS_SHOWN = 3;
+
+/** Why enforcement is partial: the first few, the rest one click away. */
+function Reasons(props: { reasons: readonly { message: string }[] }) {
+  const [all, setAll] = createSignal(false);
+  const shown = () => (all() ? props.reasons : props.reasons.slice(0, REASONS_SHOWN));
+  const more = () => props.reasons.length - REASONS_SHOWN;
+  return (
+    <>
+      <For each={shown()}>{(r) => <p class="fact-note">{r.message}</p>}</For>
+      <Show when={more() > 0}>
+        <p class="fact-note"><button type="button" class="link-btn" aria-expanded={all()} onClick={() => setAll(!all())}>{all() ? "Show fewer" : `${more()} more`}</button></p>
+      </Show>
+    </>
+  );
+}
+
 function Details(props: { thread: ThreadSummary }) {
   const enforcement = () => props.thread.enforcement;
   return (
@@ -81,7 +99,7 @@ function Details(props: { thread: ThreadSummary }) {
         {(e) => (
           <>
             <Fact label="Enforcement" value={e().level === "full" ? "Full: every tool call passes Atrium's rules" : "Partial: Atrium sees only some of what this agent does"} />
-            <For each={e().reasons}>{(r) => <p class="fact-note">{r.message}</p>}</For>
+            <Reasons reasons={e().reasons} />
             <Fact label="CLI version" value={e().cli_version ? `${e().cli_version}${e().version_tested ? "" : " (not tested with Atrium)"}` : null} />
           </>
         )}

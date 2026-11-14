@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { InboxItem, InboxReason } from "../daemon/types";
-import { filterInbox, groupInbox, itemKey, moveSelection, nextJump, rankInbox } from "./inbox";
+import { filterInbox, groupInbox, itemKey, moveSelection, needsYouCount, nextJump, rankInbox } from "./inbox";
 import { askOf, rememberChoices, subjectOf } from "./requests";
 import type { ApprovalItem } from "./transcript";
 
@@ -37,6 +37,14 @@ describe("inbox order (contract §8)", () => {
     expect(filterInbox(items, "asks").map(itemKey).sort()).toEqual(["@storage_full", "approval-new", "approval-old", "question"]);
     expect(filterInbox(items, "replies").map(itemKey).sort()).toEqual(["reply-new", "reply-old"]);
     expect(filterInbox(items, "all")).toHaveLength(items.length);
+  });
+});
+
+describe("what needs you", () => {
+  it("counts approvals, questions and storage full, not failures or replies", () => {
+    const items = [item("a", "approval", 1), item("q", "question", 2), item(null, "storage_full", 3), item("f", "failed", 4), item("c", "cleanup_unverified", 5), item("r", "reply", 6)];
+    expect(needsYouCount(items)).toBe(3);
+    expect(needsYouCount([item("f", "failed", 1), item("r", "reply", 2)])).toBe(0);
   });
 });
 

@@ -4,7 +4,7 @@
 // Keyboard: J / K move, ↵ opens the chat, A allows once, D denies.
 
 import { For, Show, createEffect, createMemo, onCleanup, onMount } from "solid-js";
-import { GROUP_LABEL, type InboxFilter, filterInbox, groupInbox, itemKey, moveSelection } from "../chat/inbox";
+import { GROUP_LABEL, type InboxFilter, filterInbox, groupInbox, itemKey, moveSelection, needsYouCount } from "../chat/inbox";
 import { type ThreadModel, holdThread, resolveApproval } from "../chat/threads";
 import { daemon } from "../daemon/client";
 import { ageLabel, type Tone } from "../daemon/reduce";
@@ -93,7 +93,7 @@ export function InboxCard() {
   const byKey = createMemo(() => new Map(flat().map((i) => [itemKey(i), i])));
   /** The first asks get their buttons here (see MAX_HELD). */
   const withCards = createMemo(() => new Set(flat().filter((i) => i.reason === "approval" || i.reason === "question").slice(0, MAX_HELD).map(itemKey)));
-  const asks = () => all().filter((i) => i.reason === "approval" || i.reason === "question" || i.reason === "storage_full").length;
+  const asks = () => needsYouCount(all());
 
   // The picked item follows the list: gone from it, the pick moves to the first item.
   createEffect(() => {

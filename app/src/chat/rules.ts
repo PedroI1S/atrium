@@ -38,7 +38,8 @@ export interface RuleText {
 }
 
 export function ruleText(rule: Rule, titleOf: (threadId: string) => string | undefined): RuleText {
-  const tool = rule.tool_name ? ` by ${rule.tool_name}` : "";
+  // The tool in brackets: "by Edit of" read badly when the tool is named after its kind.
+  const tool = rule.tool_name ? ` (${rule.tool_name})` : "";
   let what: string;
   let code: string | null = null;
   switch (rule.matcher.type) {

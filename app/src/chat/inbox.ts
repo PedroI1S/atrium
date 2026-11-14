@@ -67,3 +67,6 @@ export function moveSelection(keys: readonly string[], current: string | null, b
   if (at < 0) return by > 0 ? keys[0]! : keys[keys.length - 1]!;
   return keys[Math.min(keys.length - 1, Math.max(0, at + by))]!;
 }
+
+/** How many items need the user (approvals, questions, storage full): the inbox's "N need you". */
+export const needsYouCount = (items: readonly InboxItem[]): number => items.filter((i) => GROUP_OF[i.reason] === "needs-you").length;

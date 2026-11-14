@@ -44,7 +44,7 @@ describe("how a remembered rule reads (D-054, D-062)", () => {
 
   it("describes path, prefix and any matchers, and deny rules", () => {
     const path = ruleText(rule({ tool_kind: "edit", tool_name: "Write", matcher: { type: "path_glob", glob: "/home/u/notes.md" } }), noTitle);
-    expect(path.what).toBe("every file edit by Write of");
+    expect(path.what).toBe("every file edit (Write) of");
     expect(path.code).toBe("/home/u/notes.md");
     const prefix = ruleText(rule({ matcher: { type: "command_prefix", argv: ["git", "status"] }, origin: { type: "settings" } }), noTitle);
     expect(prefix.what).toBe("commands that start with");

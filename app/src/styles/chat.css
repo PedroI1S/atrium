@@ -65,8 +65,12 @@
 .req-state { flex: none; color: var(--text-muted); font-size: var(--text-label); }
 .dock { max-width: var(--chat-measure); width: 100%; margin: 0 auto var(--u2); display: flex; flex-direction: column; gap: var(--u2); max-height: var(--dock-max-height); overflow-y: auto; padding: var(--hairline); }
 .dock > p { margin: 0; }
-.ask:focus-visible { outline-offset: 0; }
+/* The card takes focus when it appears (its keys act on it), without the user asking: an ink
+   ring would draw a heavy black frame around it. Its own border turns the needs-you colour
+   instead; the buttons inside keep their rings. */
+.ask:focus, .ask:focus-visible { outline: none; border-color: var(--state-needs-you); }
 .ask.done { box-shadow: none; }
+.ask.done:focus { border-color: var(--border-strong); }
 .ask-cmd { white-space: pre-wrap; overflow-wrap: anywhere; max-height: var(--ask-cmd-max-height); overflow: auto; }
 .ask-state { margin: 0; font-size: var(--text-small); color: var(--text-muted); }
 .ask-state[data-kind="stale"], .ask-state[data-kind="failed"] { color: var(--state-failed); }
@@ -118,3 +122,6 @@
 .s-main span, .s-main p { margin: 0; font-size: var(--text-small); color: var(--text-muted); overflow-wrap: anywhere; }
 .s-main .code { align-self: flex-start; color: var(--text); white-space: pre-wrap; -webkit-user-select: text; user-select: text; }
 .s-empty { margin: var(--u3) 0 0; color: var(--text-muted); font-size: var(--text-small); }
+
+/* A button that reads as a link inside text ("3 more"). */
+.link-btn { padding: 0; border: 0; background: none; font: inherit; color: var(--text); text-decoration: underline; text-underline-offset: var(--hairline); }

@@ -4,6 +4,7 @@
 import { House, Inbox, PanelLeft, Plus, Search, SlidersHorizontal } from "lucide-solid";
 import { For, Show } from "solid-js";
 import { daemon } from "../daemon/client";
+import { needsYouCount } from "../chat/inbox";
 import { ageLabel, toneOf } from "../daemon/reduce";
 import { now, screen, setPaletteOpen, setScreen, setSidebarOpen } from "../state";
 import { model, platform, setMainThread } from "../windows";
@@ -14,7 +15,10 @@ export function openThread(threadId: string | null): void {
   setScreen("chat");
 }
 
-const inboxCount = () => daemon().inbox.length;
+// What the Inbox tile says: how many need the user (approvals, questions), as the inbox header
+// does; with none, how many are there to read (failed, replies).
+const needCount = () => needsYouCount(daemon().inbox);
+const readCount = () => daemon().inbox.length;
 
 export function Sidebar() {
   const selected = (id: string | null) => screen() === "chat" && model().mainThread === id;
@@ -27,7 +31,7 @@ export function Sidebar() {
       <div class="tiles">
         <button type="button" class="tile" classList={{ on: screen() === "inbox" }} aria-current={screen() === "inbox" ? "page" : undefined} onClick={() => setScreen("inbox")}>
           <span class="tn"><Inbox class="i sm" aria-hidden="true" />Inbox</span>
-          <span class="ts" classList={{ need: inboxCount() > 0 }}>{inboxCount() > 0 ? `${inboxCount()} need you` : "All clear"}</span>
+          <span class="ts" classList={{ need: needCount() > 0 }}>{needCount() > 0 ? `${needCount()} need you` : readCount() > 0 ? `${readCount()} to read` : "All clear"}</span>
         </button>
         <button type="button" class="tile" classList={{ on: selected(null) }} aria-current={selected(null) ? "page" : undefined} onClick={() => openThread(null)}>
           <span class="tn"><House class="i sm" aria-hidden="true" />Home</span><span class="ts">This computer</span>
@@ -64,8 +68,8 @@ export function SidebarStrip() {
   return (
     <nav class="strip side-strip" aria-label="Navigation" classList={{ lights: platform() === "macos" }}>
       <button type="button" class="sb" aria-label="Show sidebar (⌘B)" title="Show sidebar" onClick={() => setSidebarOpen(true)}><PanelLeft class="i sm" aria-hidden="true" /></button>
-      <button type="button" class="sb" aria-label={inboxCount() > 0 ? `Inbox, ${inboxCount()} need you` : "Inbox"} title="Inbox" onClick={() => setScreen("inbox")}>
-        <Inbox class="i" aria-hidden="true" /><Show when={inboxCount() > 0}><span class="bd" data-state="needs-you" /></Show>
+      <button type="button" class="sb" aria-label={needCount() > 0 ? `Inbox, ${needCount()} need you` : readCount() > 0 ? `Inbox, ${readCount()} to read` : "Inbox"} title="Inbox" onClick={() => setScreen("inbox")}>
+        <Inbox class="i" aria-hidden="true" /><Show when={readCount() > 0}><span class="bd" data-state={needCount() > 0 ? "needs-you" : "ready"} /></Show>
       </button>
       <button type="button" class="sb" aria-label="Home" title="Home" onClick={() => openThread(null)}><House class="i" aria-hidden="true" /></button>
       <span class="sp" />
