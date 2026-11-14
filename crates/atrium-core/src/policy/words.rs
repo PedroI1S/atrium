@@ -528,6 +528,16 @@ fn cd_effect(
         }
     }
     let resolve_all = |a: &str| -> Option<Vec<PathBuf>> {
+        // `~-` ($OLDPWD), `~+` ($PWD), `~+N`/`~-N`, `-N`, `+N` (the
+        // directory stack): not a directory the line names (round 5
+        // blocker 6)
+        let stack_form = |w: &str| {
+            w.strip_prefix(['-', '+'])
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        };
+        if a.starts_with("~+") || a.starts_with("~-") || stack_form(a) {
+            return None;
+        }
         let expanded = expand_home(a, home, start);
         if has_unknown_var(&expanded) || expanded.contains(['*', '?', '[']) {
             None
@@ -583,9 +593,10 @@ fn lost_cands(home: &Path, start: &Path, seen: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Whether the command after unit `i` in the same text is an `exit` that
-/// certainly ends the shell the `cd` ran in: not in a pipeline or a group
-/// (there it leaves only a child), and not `return` (which fails outside a
-/// function and lets the line go on: re-review blocker 3).
+/// certainly ends the shell the `cd` ran in: not in a pipeline, a group or
+/// the background (there it leaves only a child: round 5 blocker 6), and not
+/// `return` (which fails outside a function and lets the line go on:
+/// re-review blocker 3).
 fn exits_after(units: &[Unit], i: usize) -> bool {
     let u = &units[i];
     units[i + 1..]
@@ -593,6 +604,7 @@ fn exits_after(units: &[Unit], i: usize) -> bool {
         .find(|n| n.ctx == u.ctx)
         .is_some_and(|n| {
             n.pipe == 0
+                && !n.background
                 && !n.grouped
                 && !n.seg.piped
                 && n.seg.argv.first().is_some_and(|f| f == "exit")
@@ -612,6 +624,41 @@ struct Level {
     unknown: bool,
     /// The text runs in the shell of the one around it (`eval`, `source`).
     same_shell: bool,
+    /// An `&&` chain ended at the last command: its stopping places join
+    /// the candidates before the next command of this text, not before what
+    /// the last command runs itself (payloads, substitutions, `-exec`),
+    /// which runs only if the chain got that far (round 5 major).
+    pending: bool,
+    /// The join of the last command of this text seen so far.
+    last_join: Join,
+}
+
+/// Ends a stopped `&&` chain: where it may have stopped becomes a candidate.
+fn flush_pool(lv: &mut Level, seen: &mut Vec<PathBuf>, home: &Path, start: &Path, w: &mut Walk) {
+    lv.pending = false;
+    if lv.pool.is_empty() {
+        return;
+    }
+    if lv.unknown {
+        push_seen(seen, &lv.pool);
+        lv.pool.clear();
+        lv.cands = lost_cands(home, start, seen);
+    } else {
+        lv.cands.append(&mut lv.pool);
+    }
+    too_many(lv, seen, home, start, w);
+}
+
+/// Too many candidates to follow: the directory becomes unknown (asks).
+fn too_many(lv: &mut Level, seen: &mut Vec<PathBuf>, home: &Path, start: &Path, w: &mut Walk) {
+    if !lv.unknown && lv.cands.len() > MAX_CANDIDATES {
+        push_seen(seen, &lv.cands);
+        push_seen(seen, &lv.pool);
+        lv.pool.clear();
+        lv.unknown = true;
+        w.unknown = true;
+        lv.cands = lost_cands(home, start, seen);
+    }
 }
 
 /// Resolves every word against every directory the shell may be in.
@@ -638,6 +685,8 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
         pool: vec![],
         unknown: false,
         same_shell: false,
+        pending: false,
+        last_join: Join::Seq,
     }];
     for (i, unit) in units.iter().enumerate() {
         // leave the texts this unit isn't in
@@ -652,10 +701,15 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
             if done.same_shell
                 && let Some(parent) = stack.last_mut()
             {
-                let mut cands = done.cands;
-                cands.extend(done.pool);
-                parent.cands = cands;
+                // the text ran in this shell: past it the shell is where the
+                // text ended; where its chains stopped joins this text's
+                // pool (it counts once this text's own chain is over)
+                parent.cands = done.cands;
                 parent.unknown |= done.unknown;
+                if !done.pool.is_empty() {
+                    parent.pool.extend(done.pool);
+                    parent.pending |= parent.last_join != Join::And;
+                }
             }
         }
         // enter the text it is in
@@ -669,12 +723,17 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
                 pool: vec![],
                 unknown: top.unknown,
                 same_shell: unit.same_shell,
+                pending: false,
+                last_join: Join::Seq,
             };
             stack.push(entered);
         }
         let Some(lv) = stack.last_mut() else {
             return w;
         };
+        if lv.pending {
+            flush_pool(lv, &mut seen, home, start, &mut w);
+        }
         w.unit_cwd.push(if lv.unknown {
             CwdState::Unknown(lv.cands.clone())
         } else {
@@ -731,24 +790,11 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
                 lv.cands = lost_cands(home, start, &seen);
             }
         }
+        lv.last_join = join;
         if join != Join::And && !lv.pool.is_empty() {
-            if lv.unknown {
-                push_seen(&mut seen, &lv.pool);
-                lv.pool.clear();
-                lv.cands = lost_cands(home, start, &seen);
-            } else {
-                lv.cands.append(&mut lv.pool);
-            }
+            lv.pending = true;
         }
-        if !lv.unknown && lv.cands.len() > MAX_CANDIDATES {
-            // too many to follow: the directory becomes unknown (asks)
-            push_seen(&mut seen, &lv.cands);
-            push_seen(&mut seen, &lv.pool);
-            lv.pool.clear();
-            lv.unknown = true;
-            w.unknown = true;
-            lv.cands = lost_cands(home, start, &seen);
-        }
+        too_many(lv, &mut seen, home, start, &mut w);
     }
     w
 }

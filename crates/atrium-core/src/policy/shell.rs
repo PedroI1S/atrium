@@ -54,6 +54,8 @@ pub struct Unit {
     /// `.`), so a `cd` in it moves that shell too; otherwise it runs in a
     /// child (`sh -c`, a substitution, `find -exec`, a pipe).
     pub same_shell: bool,
+    /// Followed by `&`: it runs in the background, in a child.
+    pub background: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,6 +83,7 @@ struct Builder {
     grouped: bool,
     pipe: u32,
     join: Join,
+    background: bool,
 }
 
 static PIPE_IDS: AtomicU32 = AtomicU32::new(1);
@@ -98,6 +101,7 @@ impl Builder {
             piped,
             grouped,
             join: Join::Seq,
+            background: false,
         }
     }
     fn is_empty(&self) -> bool {
@@ -196,6 +200,74 @@ fn find_substitutions(text: &str) -> Vec<String> {
     out
 }
 
+/// The body of a `${…}` starting at `start` (just after the `{`) and the
+/// index of its closing `}`: quotes, escapes and nested `${…}` inside don't
+/// end it (`${x:-"}"}`, `"${x:-"'"}"`). Inside double quotes (`in_dq`) a
+/// single quote is an ordinary character. The flag is false when no closing
+/// `}` was found.
+fn scan_dollar_brace(chars: &[char], start: usize, in_dq: bool) -> (String, usize, bool) {
+    let mut j = start;
+    let mut body = String::new();
+    let mut nest = 0usize;
+    while j < chars.len() {
+        let ch = chars[j];
+        match ch {
+            '}' if nest == 0 => break,
+            '}' => nest -= 1,
+            '{' if j > 0 && chars[j - 1] == '$' => nest += 1,
+            '\\' => {
+                body.push(ch);
+                j += 1;
+                if let Some(&n) = chars.get(j) {
+                    body.push(n);
+                }
+                j += 1;
+                continue;
+            }
+            '\'' | '"' if ch == '"' || !in_dq => {
+                body.push(ch);
+                j += 1;
+                while j < chars.len() && chars[j] != ch {
+                    if ch == '"' && chars[j] == '\\' {
+                        body.push(chars[j]);
+                        j += 1;
+                        if j >= chars.len() {
+                            break;
+                        }
+                    }
+                    body.push(chars[j]);
+                    j += 1;
+                }
+                if j < chars.len() {
+                    body.push(chars[j]);
+                    j += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        body.push(ch);
+        j += 1;
+    }
+    let closed = j < chars.len();
+    (body, j, closed)
+}
+
+/// A `${…}` with no closing `}` where quotes are read the shell's way: a
+/// shell that reads them otherwise ends it at the first `}`, and what
+/// follows is a command line too, checked as one (round 5 blocker 2).
+fn ambiguous_tail(chars: &[char], start: usize, tails: &mut Vec<String>) {
+    if let Some(k) = chars[start.min(chars.len())..]
+        .iter()
+        .position(|c| *c == '}')
+    {
+        let rest: String = chars[start + k + 1..].iter().collect();
+        if !rest.trim().is_empty() {
+            tails.push(rest);
+        }
+    }
+}
+
 pub fn lex(line: &str) -> Lexed {
     lex_depth(line, 0, false)
 }
@@ -231,6 +303,8 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     // feeds (`… | (true; sh)`, `… | { :; sh; }`, `… | if …; then sh; fi`):
     // every command in it may read the pipe (re-review blocker 5).
     let mut groups: Vec<(bool, Option<u32>)> = vec![];
+    // text after an unclosed `${…}` (see `ambiguous_tail`)
+    let mut tails: Vec<String> = vec![];
 
     macro_rules! flush {
         () => {{
@@ -344,6 +418,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             '&' => {
                 out.reasons.push("backgrounding".into());
                 i += 1;
+                cur.background = true;
                 flush!();
                 continue;
             }
@@ -486,6 +561,22 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                                 expansion = true;
                                 i = end;
                             }
+                            '$' if chars.get(i + 1) == Some(&'{') => {
+                                // `"${x:-"'"}"`: the inner quotes belong to
+                                // the expansion (round 5 blocker 2)
+                                let (body, j, closed) = scan_dollar_brace(&chars, i + 2, true);
+                                if !closed {
+                                    ambiguous_tail(&chars, i + 2, &mut tails);
+                                }
+                                word.push_str("${");
+                                word.push_str(&body);
+                                word.push('}');
+                                for sub in find_substitutions(&body) {
+                                    cur.subs.push(sub);
+                                }
+                                expansion = true;
+                                i = (j + 1).min(chars.len());
+                            }
                             '$' => {
                                 expansion = true;
                                 word.push('$');
@@ -524,50 +615,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                         word.push('$');
                         i += 1;
                     } else if chars.get(i + 1) == Some(&'{') {
-                        // `${x:-"}"}`: quotes, escapes and nested `${…}`
-                        // inside don't end it (re-review blocker 5)
-                        let mut j = i + 2;
-                        let mut body = String::new();
-                        let mut nest = 0usize;
-                        while j < chars.len() {
-                            let ch = chars[j];
-                            match ch {
-                                '}' if nest == 0 => break,
-                                '}' => nest -= 1,
-                                '{' if j > 0 && chars[j - 1] == '$' => nest += 1,
-                                '\\' => {
-                                    body.push(ch);
-                                    j += 1;
-                                    if let Some(&n) = chars.get(j) {
-                                        body.push(n);
-                                    }
-                                    j += 1;
-                                    continue;
-                                }
-                                '\'' | '"' => {
-                                    body.push(ch);
-                                    j += 1;
-                                    while j < chars.len() && chars[j] != ch {
-                                        if ch == '"' && chars[j] == '\\' {
-                                            body.push(chars[j]);
-                                            j += 1;
-                                            if j >= chars.len() {
-                                                break;
-                                            }
-                                        }
-                                        body.push(chars[j]);
-                                        j += 1;
-                                    }
-                                    if j < chars.len() {
-                                        body.push(chars[j]);
-                                        j += 1;
-                                    }
-                                    continue;
-                                }
-                                _ => {}
-                            }
-                            body.push(ch);
-                            j += 1;
+                        let (body, j, closed) = scan_dollar_brace(&chars, i + 2, false);
+                        if !closed {
+                            ambiguous_tail(&chars, i + 2, &mut tails);
                         }
                         word.push_str("${");
                         word.push_str(&body);
@@ -716,7 +766,26 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             }
             None => {
                 // `{ …; }` groups, for a pipe into one
-                if cur.argv.is_empty() && cur.assignments.is_empty() && quoted_prefix_empty {
+                // command position: nothing yet, or only words that start
+                // a body (`then {`, `do if …`, `else (…)`) — round 5
+                // blocker 3
+                let command_position = cur.assignments.is_empty()
+                    && cur.argv.iter().all(|w| {
+                        matches!(
+                            w.as_str(),
+                            "then"
+                                | "do"
+                                | "else"
+                                | "elif"
+                                | "!"
+                                | "{"
+                                | "if"
+                                | "while"
+                                | "until"
+                                | "time"
+                        )
+                    });
+                if command_position && quoted_prefix_empty {
                     match word.as_str() {
                         "{" | "if" | "while" | "until" | "for" | "case" | "select" => {
                             groups.push((false, cur.piped.then_some(cur.pipe)));
@@ -763,6 +832,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             grouped,
             pipe,
             join,
+            background,
         } = b;
         let seg = Segment {
             assignments,
@@ -795,11 +865,14 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             .iter()
             .flat_map(|p| find_substitutions(p))
             .collect();
-        if let Some(w0) = seg.argv.first()
-            && has_command_substitution(w0)
-        {
-            code_subs.extend(find_substitutions(w0));
+        // the command word, also behind a wrapper (`env $(…)`, `nohup $(…)`:
+        // round 5 blocker 7)
+        for w0 in [seg.argv.first(), eff.first()].into_iter().flatten() {
+            if has_command_substitution(w0) {
+                code_subs.extend(find_substitutions(w0));
+            }
         }
+        code_subs.dedup();
         // `bash < <(echo …)`, `source <(…)`, `bash <(…)`: a process
         // substitution a shell runs (part 1's finding 9)
         if eff
@@ -847,6 +920,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             ctx: out.ctx,
             level: depth,
             same_shell: false,
+            background,
         };
         out.units.push(unit);
         if eff.first().map(|s| base(s)) == Some("find") {
@@ -882,7 +956,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 // `| s$(echo h)`, `| $(echo sh)`: a word built by running
                 // something may name a shell (a variable alone, `| $PAGER`,
                 // is read only with `-s` or `-`)
-                || has_command_substitution(f)
+                || (has_command_substitution(f) && substituted_may_be_shell_at(f, depth))
                 || (maybe_shell(f) && u.eff[1..].iter().any(|a| a == "-s" || a == "-"))
         }) || reads_stdin_as_script(&u.eff)
     };
@@ -968,6 +1042,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             texts.extend(piped.into_iter().map(|t| (t, same_shell)));
         }
     }
+    texts.extend(tails.into_iter().map(|t| (t, None)));
     let mut extra_units: Vec<Unit> = vec![];
     // a text run in this shell goes right after its owner (and the owner's
     // own payloads), so the directory walk sees its `cd`s in order
@@ -1181,20 +1256,24 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                         shell_string = Some(v.to_string());
                         break;
                     }
-                    // a cluster: `-c'…'`, `-nc'…'`, `-qc 'cmd'` (re-review
-                    // blocker 5); the first value-taking letter ends it
+                    // a cluster: `-c'…'`, `-nc'…'`, `-qc 'cmd'`, `-nw 10`,
+                    // `-nw10` (re-review blocker 5, round 5 blocker 4): the
+                    // first value-taking letter ends it and takes the rest
+                    // of the word, or the next word
                     if w.starts_with('-') && !w.starts_with("--") && w.len() > 2 {
                         let cs: Vec<char> = w[1..].chars().collect();
-                        if let Some(k) = cs.iter().position(|ch| short_value.contains(ch))
-                            && cs[k] == 'c'
-                        {
+                        if let Some(k) = cs.iter().position(|ch| short_value.contains(ch)) {
                             let rest: String = cs[k + 1..].iter().collect();
-                            shell_string = if rest.is_empty() {
-                                a.get(j + 1).cloned()
-                            } else {
-                                Some(rest)
-                            };
-                            break;
+                            if cs[k] == 'c' {
+                                shell_string = if rest.is_empty() {
+                                    a.get(j + 1).cloned()
+                                } else {
+                                    Some(rest)
+                                };
+                                break;
+                            }
+                            j += if rest.is_empty() { 2 } else { 1 };
+                            continue;
                         }
                     }
                     if with_value.contains(&w) {
@@ -1274,24 +1353,21 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                         j += 1;
                         break;
                     }
-                    if matches!(
-                        w,
-                        "-u" | "-C" | "-P" | "-a" | "--unset" | "--chdir" | "--argv0"
-                    ) {
+                    let cluster = env_cluster(w);
+                    if matches!(w, "--unset" | "--chdir" | "--argv0") {
                         j += 2;
                     } else if w == "-" {
                         // `env -`: the same as `-i`
                         j += 1;
                     } else if w == "--split-string"
                         || w.starts_with("--split-string=")
-                        || (w.starts_with('-') && !w.starts_with("--") && w.contains('S'))
+                        || matches!(cluster, Some(('S', _)))
                     {
                         // a command line: splice its words in, split like a shell
                         // (`-S`, `-S'…'`, `-iS '…'`)
-                        let after_s = if w.starts_with("--") {
-                            ""
-                        } else {
-                            &w[w.find('S').map_or(w.len(), |k| k + 1)..]
+                        let after_s = match cluster {
+                            Some((_, rest)) => rest,
+                            None => String::new(),
                         };
                         let (text, width) = if w == "--split-string"
                             || (!w.starts_with("--") && after_s.is_empty())
@@ -1300,7 +1376,7 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                         } else if let Some(v) = w.strip_prefix("--split-string=") {
                             (Some(v.to_string()), 1)
                         } else {
-                            (Some(after_s.to_string()), 1)
+                            (Some(after_s), 1)
                         };
                         if let Some(text) = text {
                             let words = split_words(&text);
@@ -1309,6 +1385,9 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                         } else {
                             j += 1;
                         }
+                    } else if let Some((_, rest)) = cluster {
+                        // `-u NAME`, `-iu PATH`, `-iCproj` (round 5 blocker 4)
+                        j += if rest.is_empty() { 2 } else { 1 };
                     } else if (w.starts_with('-') && w.len() > 1) || is_assignment_word(w) {
                         j += 1;
                     } else {
@@ -1329,6 +1408,22 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
         a.drain(..n);
     }
     a
+}
+
+/// For a short-option cluster of `env` (`-iu`, `-iCproj`, `-S'…'`): the
+/// first letter that takes a value (`u`, `C`, `P`, `a`, `S`) and the rest of
+/// the word after it (its value, or empty when the value is the next word).
+/// `None` when every letter is a flag (or the word isn't a cluster).
+fn env_cluster(w: &str) -> Option<(char, String)> {
+    let flags = w.strip_prefix('-')?;
+    if flags.is_empty() || flags.starts_with('-') {
+        return None;
+    }
+    let cs: Vec<char> = flags.chars().collect();
+    let k = cs
+        .iter()
+        .position(|c| matches!(c, 'u' | 'C' | 'P' | 'a' | 'S'))?;
+    Some((cs[k], cs[k + 1..].iter().collect()))
 }
 
 /// Splits a string into words the way a shell would (quotes, escapes);
@@ -1419,6 +1514,77 @@ pub fn has_command_substitution(w: &str) -> bool {
     w.contains("$(") || w.contains('`')
 }
 
+/// A command word built by a command substitution may name a shell, unless
+/// it plainly can't (round 5): `$(brew --prefix)/bin/jq` ends in a literal
+/// program name that isn't a shell, `$(which less)` looks up a literal name
+/// that isn't one. Anything else (`s$(echo h)`, `$(echo sh)`,
+/// `$(echo /bin)/sh`, `$(x)/bin/$Y`, `$(x)/bin/s*`, output with a space that
+/// splits into more words) may be one.
+pub fn substituted_word_may_be_shell(w: &str) -> bool {
+    substituted_may_be_shell_at(w, 0)
+}
+
+fn substituted_may_be_shell_at(w: &str, depth: u8) -> bool {
+    if !has_command_substitution(w) {
+        return maybe_shell(w);
+    }
+    if depth >= MAX_DEPTH {
+        return true;
+    }
+    let bodies = find_substitutions(w);
+    // known output (`echo`, `printf`, here-strings) that splits into words or
+    // names a shell picks the program itself
+    for body in &bodies {
+        for t in output_texts(body, depth) {
+            let t = t.trim();
+            if t.chars().any(char::is_whitespace)
+                || is_shell(t)
+                || t.rsplit('/').next().is_some_and(is_shell)
+            {
+                return true;
+            }
+        }
+    }
+    let unquoted: String = w.chars().filter(|c| !matches!(c, '"' | '\'')).collect();
+    let literal_name = |n: &str| {
+        !n.is_empty()
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/'))
+    };
+    // `$(brew --prefix)/bin/jq`: a literal program after the last `/`
+    if let Some((_, last)) = unquoted.rsplit_once('/')
+        && !last.contains('\\')
+        && literal_name(last)
+        && !unquoted.ends_with(')')
+        && !unquoted.ends_with('`')
+    {
+        return is_shell(last);
+    }
+    // `$(which less)`, `$(command -v jq)`, `` `type -p jq` ``: the path of a
+    // literal name
+    let whole = unquoted
+        .strip_prefix("$(")
+        .and_then(|r| r.strip_suffix(')'))
+        .or_else(|| unquoted.strip_prefix('`').and_then(|r| r.strip_suffix('`')));
+    if let Some(body) = whole
+        && bodies.len() == 1
+    {
+        let words: Vec<&str> = body.split_whitespace().collect();
+        let name = match words.as_slice() {
+            ["which" | "whence", n] => Some(*n),
+            ["command", "-v" | "-V", n] => Some(*n),
+            ["type", "-p" | "-P", n] => Some(*n),
+            _ => None,
+        };
+        if let Some(n) = name
+            && literal_name(n)
+        {
+            return is_shell(n) || n.contains('/') && is_shell(n.rsplit('/').next().unwrap_or(n));
+        }
+    }
+    true
+}
+
 /// Commands that run their standard input as a script of commands without
 /// being a shell: `at`, `batch`, `crontab -`, `make -f -`, `script`.
 pub fn reads_stdin_as_script(eff: &[String]) -> bool {
@@ -1456,20 +1622,24 @@ pub fn reads_stdin_as_script(eff: &[String]) -> bool {
             let mut file = false;
             while k < args.len() {
                 let a = args[k].as_str();
-                if a == "-u" {
-                    k += 2;
-                    continue;
-                }
                 if stdin(a) {
                     return true;
                 }
                 if let Some(flags) = a.strip_prefix('-') {
-                    if flags.contains(['l', 'r', 'e']) {
+                    // letters up to `u`; after `u` the rest of the word (or
+                    // the next word) is the user name (`-uroot`: round 5
+                    // blocker 5)
+                    let (before, user_next) = match flags.find('u') {
+                        Some(p) => (&flags[..p], p + 1 == flags.len()),
+                        None => (flags, false),
+                    };
+                    if before.contains(['l', 'r', 'e']) {
                         return false;
                     }
-                } else {
-                    file = true;
+                    k += if user_next { 2 } else { 1 };
+                    continue;
                 }
+                file = true;
                 k += 1;
             }
             !file
@@ -1931,27 +2101,34 @@ fn env_payloads(argv: &[String]) -> Vec<String> {
         }
         if let Some(t) = w.strip_prefix("--split-string=") {
             out.push(t.to_string());
-        } else if w == "-S" || w == "--split-string" {
+        } else if w == "--split-string" {
             out.extend(argv.get(j + 1).cloned());
             j += 2;
             continue;
-        } else if w.starts_with('-') && !w.starts_with("--") && w.contains('S') {
-            // `-S'…'`, `-iS 'rm …'`: the rest of the cluster, or the next word
-            let rest = &w[w.find('S').map_or(w.len(), |i| i + 1)..];
-            if rest.is_empty() {
-                out.extend(argv.get(j + 1).cloned());
-                j += 2;
-                continue;
-            }
-            out.push(rest.to_string());
-        } else if w == "-C" || w == "--chdir" {
+        } else if w == "--chdir" {
             chdir = argv.get(j + 1).cloned();
             j += 2;
             continue;
         } else if let Some(d) = w.strip_prefix("--chdir=") {
             chdir = Some(d.to_string());
-        } else if matches!(w, "-u" | "--unset" | "-P" | "-a" | "--argv0") {
+        } else if matches!(w, "--unset" | "--argv0") {
             j += 2;
+            continue;
+        } else if let Some((letter, rest)) = env_cluster(w) {
+            // `-S'…'`, `-iS 'rm …'`, `-iC proj`, `-iCproj`, `-iu PATH`: the
+            // rest of the cluster, or the next word, is the value
+            let next_word = rest.is_empty();
+            let value = if next_word {
+                argv.get(j + 1).cloned()
+            } else {
+                Some(rest)
+            };
+            match letter {
+                'S' => out.extend(value),
+                'C' => chdir = value,
+                _ => {}
+            }
+            j += if next_word { 2 } else { 1 };
             continue;
         } else if !(w.starts_with('-') || is_assignment_word(w)) {
             break;
@@ -2031,6 +2208,7 @@ fn find_exec_units(eff: &[String], units: &mut Vec<Unit>, level: u8) {
                     ctx: CTX_IDS.fetch_add(1, Ordering::Relaxed),
                     level,
                     same_shell: false,
+                    background: false,
                 });
             }
             k = m;

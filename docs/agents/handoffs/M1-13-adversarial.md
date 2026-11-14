@@ -528,7 +528,7 @@ I ran 22 ordinary lines that touch these fixes on dev and on the branch, in all 
 
 - **Owner decision:** `env -C DIR CMD` keeps dev's hard deny (above).
 - **Limits:**
-  - A glob in a folder linked into `~/.ssh` is a hard deny even for `ls vault/*`. The check doesn't single out listers for globs; a plain `ls` of the folder is allowed.
+  - A glob in a folder linked into `~/.ssh` is a hard deny even for a lister: `ls vault/work/*` is denied. `ls vault/*` (a glob that only names the linked folder) is not, and neither is a plain `ls` of the folder. (Wording corrected in the fifth round.)
   - A same-shell text's directory is followed. A child's (`sh -c`, a substitution) is dropped when it ends, which is right for a child. But a `cd` the engine can't follow anywhere in the line still marks the whole line as having an unknown cwd, so Home and prefix rules ask (same as before).
   - A here-doc a child shell reads (`bash <<EOF`) still starts from where the line ends, not from where its owner is (as before; stricter).
 - **Still ignored, outside this brief** (as in the third part): part-1 findings 4, 5 and 6, gate findings 10 and 11, fuzz finding 11.
@@ -553,6 +553,93 @@ atrium-host lib 5 | adversarial_supervise 7 passed 1 ignored (macOS) | lifecycle
 adversarial_regression 20/20   adversarial_ordinary 20/20   adversarial_policy 20/20
 adversarial_gate       20/20   policy               20/20   adversarial_supervise 20/20
 adversarial_fuzz       20/20
+```
+
+- No daemon left running (`pgrep -fl atriumd`: none).
+
+## Fifth round (Claude Opus 5.5, D-080): the round-4 review of `26262aa`
+
+Every review input is a `round_5_*` row: blockers in `adversarial_regression.rs` (7 tests), the major in `adversarial_ordinary.rs` (1 test). Each test failed on `26262aa` and passes now. All changes are in `crates/atrium-core/src/policy/**`. D-078 is unchanged: none of these are uncertain-cwd cases, and the new cwd-root check reads only directories the walk is sure of.
+
+### Blockers
+
+1. **Searches and walkers reaching a folder linked into `~/.ssh`** (`gate.rs`)
+   - The Grep tool with no paths searches the session's folder: that folder is now the root of the linked-folder check.
+   - A recursive reader with no folder operand (`rg x`, `grep -r x`, `rgrep x`, `ag x`, `ack x`, `find -type f`) uses each directory the walk is sure of for that command (`cd vault/work && rg x` is caught).
+   - `rgrep` and `find` were added to the recursive readers.
+   - New tree walkers count as recursive: `cp`/`scp` with `-r`, `-R`, `-a`, `--recursive` or `--archive`, `rsync`, `tar`, `zip -r`, `rm -r`, `mv`, `ditto`, `pax`, `cpio`, `7z`, `rclone`.
+   - Globs are now matched component by component against the linked folder (`vault/*/id_work`, `vault/?ork/*`, `vault/**/id_work`). A glob that goes below the folder is denied. A glob that only names the folder is denied only for a recursive reader or walker (`rg x vault/*`), so `ls vault/*` stays ordinary.
+   - **Verdict choice for the review's `cp -r`, `find -exec cat`, `rm -rf` and `cat vault/*/id_work`:** hard deny (`credential-read`) in every setting, which is stricter than dev (Ask/Allow/Allow). Each of these reads, copies, moves or deletes the key files themselves, which is exactly what the deny list protects. The same goes for `find vault -type f`, which prints only names but is one `-exec` away from the contents.
+   - **Home's `root_ok` is not changed.** The engine has no filesystem access, so it can't know about links. The gate's hard deny runs after the engine and overrides any Allow, Home's included, so the outcome is the same in every setting.
+   - **Cost:** while a folder is linked into `~/.ssh`, a recursive search or copy of any folder that holds it is denied. For example, with `~/vault/work` linked, `rg x` or `tar czf b.tgz ~` run from `~` is denied. Without such a link nothing changes.
+2. **`${…}` inside double quotes** (`shell.rs`, `scan_dollar_brace`): the scan now handles quotes, escapes and nesting inside double quotes too, and there a `'` is an ordinary character. If no closing `}` is found, the text after the first `}` is also lexed as a command.
+3. **Compound commands nested inside a piped compound** (`shell.rs`): a group opener or closer counts only in command position (after `then`, `do`, `else`, `{`, `!` and the like), so inner `fi`, `done`, `}` and `esac` close their own group and the outer group keeps its pipe.
+4. **Option clusters with values** (`shell.rs`):
+   - For `flock` (`w`, `E`, `c`) and `script` (`c`, `F`, `t`, `T`, `I`, `O`, `B`, `E`, `m`), the first letter that takes a value ends the cluster. Its value is the rest of the word or the next word. For `c`, that value is the shell string.
+   - `env` clusters (`-iu PATH`, `-iuPATH`, `-iC proj`, `-iCproj`, `-0iu`) are read the same way, both when unwrapping and for `-S` and `-C` payloads.
+5. **`crontab -uUSER`** (`shell.rs`): the user name after `u` is skipped, whether it is attached or the next word, and is never read as flags. `-l`, `-r` and `-e` before the `u` still count. A file operand still means the job comes from the file.
+6. **Directory-stack `cd`s and an exit that doesn't end this shell** (`words.rs`):
+   - `cd ~-`, `cd ~+`, `cd ~+N`, `cd ~-N`, `cd -N`, `cd +N` and `cd -- ~-` make the directory unknown.
+   - An `exit` that runs in the background (`|| exit 1 &`, `|| exit &`) no longer narrows the candidates. Neither does one in a pipeline (`|& cat`), as before. `! exit` still ends the shell.
+7. **A substituted command word behind a wrapper** (`shell.rs`): the word after the wrappers (`env`, `nohup`, `command`, `builtin`, `time`, `exec`, `nice -n 5`, `timeout 5`, `env -i FOO=1`) is checked for `$(…)` and backticks, and its output is read as code, like a bare first word.
+
+### Major (back to dev's verdict)
+
+- **Change** (`words.rs`, `walk`): when an `&&` chain ends, the places it may have stopped (its pool) no longer join the candidates right away. They join before the next command at the same level. Payloads, substitutions and `-exec` of the chain's last command run only if the whole chain succeeded, so they see only the end of the chain.
+- **`eval` and `source`:** when one of these hands back to the outer level, its pool moves into the outer pool, and the outer chain decides when it counts.
+- **Result:** the review's eight lines and eight neighbours (`bash -c`, `make && sh -c`, `cd a && cd b && sh -c`, `time sh -c`, `eval && eval`, `source /dev/stdin <<<`, backticks, `nohup sh -c`) get dev's verdict, Ask/Ask/Allow/Allow.
+
+### Trade-off: a pipe into a substituted program (fixed)
+
+- **Now dev's verdict (Ask/Ask/Allow/Allow):** `curl … | $(brew --prefix)/bin/jq .`, `"$(brew --prefix)/bin/jq"`, `| $(which less)`, `cat data.json | …`, `echo hi | …` and `| $HOME/bin/jq .`.
+- **How:** `shell::substituted_word_may_be_shell` decides whether such a word may be a shell. It is used by the lexer's pipe check and by `deny.rs`. The raw-text fallback now keeps `$(…)` whole when it splits words.
+- **Not a shell:** a word ending in a literal program name that isn't a shell, or a `$(which|whence|command -v|type -p NAME)` of a literal name that isn't one.
+- **Still a hard deny (`pipe-to-shell`), with rows:** anything else, including `$(echo sh)`, `$(brew --prefix)/bin/sh`, `$(which bash)`, `` `which sh` ``, `$(command -v zsh)`, `$(x)/bin/$Y`, `$(x)/bin/s*`, `s$(echo h)`, `$(echo /bin)/sh`, `$(printf 'sh #')/jq` (known output that splits into words), `$(which $S)` and `$(x)/bin/s\h`.
+- **Known limit:** the output of an unknown command (`$(brew --prefix)`) is not quoted, so it could split into words and name a different program. The engine can't see that output, so it trusts the literal tail, as dev did.
+
+### Neighbouring spellings checked against dev (no new false hard deny)
+
+- Engine lines with the same verdict on dev and on this branch:
+  - `cd proj && make && make test`, `eval "$(ssh-agent -s)" && echo ok`, `echo "${HOME}/x"`, `echo "${x:-'a'}" ; ls`
+  - `env -C proj make` (dev's hard deny, as before), `env -u FOO make`, `env -iu FOO make`
+  - `flock -n /tmp/l make`, `flock -nw 10 /tmp/l make`, `script -q /dev/null make`
+  - `crontab -l`, `crontab -u bob -l`, `crontab -ubob -l`
+  - `cd ~- && ls`, `make || exit 1`, `make || exit 1 &`
+  - `rg TODO src`, `grep -rn TODO src`, `find src -name '*.rs'`, `cp -r src /tmp/x`, `tar czf /tmp/x.tgz src`, `rm -rf build`, `mv a b`
+  - piped `if`/`while` bodies, `cd proj && sh -c 'make'`, `env $(cat .env) make`, `nohup $(which node) server.js`, `ls | $(which wc) -l`, `git log | $(git var GIT_PAGER)`
+- The only difference is `cd - && ls` with prefix rules (dev Allow, branch Ask). `cd -` was already unknown before this round. That's D-078 (an uncertain cwd asks under prefix rules), not a round-5 change.
+- Gate lines with a folder linked into `~/.ssh` that are not denied: `ls vault/work`, `ls vault`, `ls -la vault/work`, `ls vault/*`, `ls vault/w*`, `cat vault/notes.txt`, `cat vault/*.txt`, `cp vault/notes.txt /tmp/n`, `rg x vault/notes.txt`, `cd /tmp && rg x`, `find /tmp -name x`.
+
+### Found by the fixer
+
+- These neighbours reached Allow under Any/Full on `26262aa` and are now hard denies with rows:
+  - `cp -pr`, `cp --recursive`, `rsync -r`, `tar -cf - vault | ssh …`, `ditto`, `zip -qr`, `rm -fr`;
+  - `cd vault/work && rg x`, `cd vault && grep -r x`;
+  - `cat vault/**/id_work`, `cat vault/*/*`, `head vault/[w]ork/id_work`;
+  - `rgrep -n x vault`, `grep -rl x vault/*`, `find vault/w* -type f`;
+  - from inside the linked folder: `grep -rn x`, `grep -rl x .`, `ack x`, `rg -n x`, `find -type f`, `rgrep -n x`, `tar czf /tmp/x.tgz .`, `cp -r . /tmp/exfil`.
+- Fixed while running the DoD: in the new substituted-word check, the nesting depth now carries through the lexer. Before, `$(` repeated 5,000 times overflowed the stack in `engine_never_panics_on_garbage`.
+
+### What is left
+
+- **Owner decision (unchanged):** `env -C DIR CMD` keeps dev's hard deny.
+- **Limits:**
+  - The output of an unknown substitution is trusted to be a single word (see the trade-off above).
+  - The linked-folder check reads only directories the walk is sure of. After a `cd` it can't follow, `rg x` keeps D-078's verdict.
+  - Walkers not on the list (for example `rsync`-like tools under other names) are read only as plain file uses.
+- **Still ignored, outside this brief:** part-1 findings 4, 5 and 6, gate findings 10 and 11, fuzz finding 11.
+
+### Real outputs of the Definition of Done (macOS, this worktree)
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test -p atrium-core -p atrium-daemon -p atrium-host --no-fail-fast`: exit 0, no failures. Test counts that changed: `adversarial_regression` 35 (was 28), `adversarial_ordinary` 8 (was 7). Everything else is as in the fourth round.
+- 20 runs in a row (fish: `for i in (seq 20); cargo test -q -p atrium-core --test adversarial_regression; or break; end`):
+
+```
+adversarial_regression 20/20   adversarial_ordinary 20/20   adversarial_policy 20/20
+adversarial_gate       20/20   policy               20/20   adversarial_ledger   20/20
+adversarial_fuzz       20/20   atrium-core lib      20/20
 ```
 
 - No daemon left running (`pgrep -fl atriumd`: none).

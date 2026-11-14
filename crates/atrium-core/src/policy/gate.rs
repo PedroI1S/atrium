@@ -16,7 +16,7 @@ use atrium_protocol::thread::ThreadId;
 use super::deny;
 use super::engine;
 use super::shell;
-use super::words::{expand_home, normalize};
+use super::words::{self, expand_home, normalize};
 use super::{SessionGate, input_sha256};
 use crate::{ApprovalLedger, Binding, PolicyEngine, PolicyInput, PolicyVerdict, RequestKey, Store};
 
@@ -293,7 +293,7 @@ fn evaluate_sync(
     // recursive search or glob that reaches such a folder, reads keys.
     if !matches!(verdict, PolicyVerdict::HardDeny { .. })
         && !analysis.overflow
-        && reaches_linked_ssh_dir(check, &analysis, &resolved, &ssh.linked_dirs)
+        && reaches_linked_ssh_dir(check, &analysis, &resolved, &ssh.linked_dirs, &c.cwd)
     {
         verdict = PolicyVerdict::HardDeny {
             id: "credential-read",
@@ -318,12 +318,108 @@ fn recursive_reader(eff: &[String]) -> bool {
         return false;
     };
     match shell::base(first) {
-        "rg" | "ag" | "ack" => true,
+        "rg" | "ag" | "ack" | "rgrep" | "find" => true,
         "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" => {
             engine::search_roots(false, &eff[1..]).is_none_or(|s| s.recursive)
         }
         _ => false,
     }
+}
+
+/// A recursive reader given no folder to search, which then searches the
+/// directory it runs in (`rg x`, `grep -r x`, `rgrep x`, `find -type f`).
+/// A line the parser can't read counts as one.
+fn searches_cwd(eff: &[String]) -> bool {
+    let Some(first) = eff.first() else {
+        return false;
+    };
+    let args = &eff[1..];
+    let operands = || args.iter().filter(|a| !a.starts_with('-')).count();
+    match shell::base(first) {
+        "rg" => engine::search_roots(true, args).is_none_or(|s| s.roots.is_empty()),
+        "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" => {
+            engine::search_roots(false, args).is_none_or(|s| s.recursive && s.roots.is_empty())
+        }
+        "rgrep" => engine::search_roots(false, args).is_none_or(|s| s.roots.is_empty()),
+        "ag" | "ack" => operands() <= 1,
+        "find" => args.first().is_none_or(|a| {
+            a.starts_with('-') && !matches!(a.as_str(), "-H" | "-L" | "-P")
+                || matches!(a.as_str(), "(" | "!" | "\\(")
+        }),
+        _ => false,
+    }
+}
+
+/// Commands that walk every file below a folder they are given and copy,
+/// pack, move or delete it (round 5 blocker 1): `cp -r`, `scp -r`, `rsync`,
+/// `tar`, `zip -r`, `rm -r`, `mv`, `ditto`, `pax`, `cpio`, `7z`.
+fn tree_walker(eff: &[String]) -> bool {
+    let Some(first) = eff.first() else {
+        return false;
+    };
+    let args = &eff[1..];
+    let short = |letters: &[char]| {
+        args.iter().any(|a| {
+            a.starts_with('-')
+                && !a.starts_with("--")
+                && a[1..].chars().any(|c| letters.contains(&c))
+        })
+    };
+    let long = |names: &[&str]| {
+        args.iter().any(|a| {
+            names
+                .iter()
+                .any(|n| a == n || a.starts_with(&format!("{n}=")))
+        })
+    };
+    match shell::base(first) {
+        "rsync" | "tar" | "bsdtar" | "gtar" | "mv" | "ditto" | "pax" | "cpio" | "7z" | "7za"
+        | "rclone" => true,
+        "cp" | "gcp" | "scp" => short(&['r', 'R', 'a']) || long(&["--recursive", "--archive"]),
+        "rm" | "grm" => short(&['r', 'R']) || long(&["--recursive"]),
+        "zip" => short(&['r', 'R']) || long(&["--recurse-paths"]),
+        _ => false,
+    }
+}
+
+/// Whether a glob, read component by component, reaches a file inside the
+/// linked folder `d` (`vault/*/id_work`), or with `names_dir` names `d` or a
+/// folder holding it (`vault/*` for a recursive search). `ls vault/*` only
+/// names the folder: it stays ordinary.
+fn glob_reaches(p: &Path, d: &Path, names_dir: bool) -> bool {
+    let comps: Vec<String> = p
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let Some(first_glob) = comps.iter().position(|c| c.contains(['*', '?', '['])) else {
+        return false;
+    };
+    let prefix: PathBuf = comps[..first_glob].iter().collect();
+    let prefix = std::fs::canonicalize(&prefix).unwrap_or(prefix);
+    let Ok(rel) = d.strip_prefix(&prefix) else {
+        return false;
+    };
+    let rel: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let pat = &comps[first_glob..];
+    let matches = |g: &str, name: &str| {
+        globset::GlobBuilder::new(g)
+            .literal_separator(true)
+            .build()
+            .map(|g| g.compile_matcher().is_match(name))
+            .unwrap_or(true)
+    };
+    let n = pat.len().min(rel.len());
+    if !pat.iter().zip(&rel).take(n).all(|(g, r)| matches(g, r)) {
+        return false;
+    }
+    if pat.len() > rel.len() {
+        // `**` or a deeper pattern: the glob goes below the linked folder
+        return true;
+    }
+    names_dir || pat.iter().any(|g| g.contains("**"))
 }
 
 /// The real path of `p`, or of its folder when `p` itself doesn't resolve
@@ -349,6 +445,7 @@ fn reaches_linked_ssh_dir(
     a: &deny::Analysis,
     resolved: &[PathBuf],
     linked: &[PathBuf],
+    cwd: &Path,
 ) -> bool {
     if linked.is_empty() {
         return false;
@@ -360,11 +457,40 @@ fn reaches_linked_ssh_dir(
             ..
         }
     );
+    let reaches_root = |root: &Path| {
+        let real = real_path(root);
+        linked
+            .iter()
+            .any(|d| real.starts_with(d) || d.starts_with(&real))
+    };
+    // A search tool given no paths searches the session's folder (round 5
+    // blocker 1).
+    if let ToolSubject::Paths {
+        paths,
+        recursive: true,
+        ..
+    } = &check.subject
+        && paths.is_empty()
+        && reaches_root(cwd)
+    {
+        return true;
+    }
+    // A recursive reader with no folder operand searches where it runs: each
+    // directory the walk is sure of (an uncertain one keeps D-078's verdict).
+    for (i, u) in a.units.iter().enumerate() {
+        if searches_cwd(&u.eff)
+            && let Some(words::CwdState::Known(cands)) = a.unit_cwd.get(i)
+            && cands.iter().any(|c| reaches_root(c))
+        {
+            return true;
+        }
+    }
     let mut k = 0usize;
     for u in &a.uses {
         let unit = a.units.get(u.unit);
         let command_word = unit.is_some_and(|x| x.seg.argv.first() == Some(&u.word));
-        let recursive = recursive_paths || unit.is_some_and(|x| recursive_reader(&x.eff));
+        let recursive = recursive_paths
+            || unit.is_some_and(|x| recursive_reader(&x.eff) || tree_walker(&x.eff));
         let globby = u.word.contains(['*', '?', '[']);
         for _ in &u.paths {
             let Some(p) = resolved.get(k) else {
@@ -373,6 +499,9 @@ fn reaches_linked_ssh_dir(
             k += 1;
             if command_word {
                 continue;
+            }
+            if globby && linked.iter().any(|d| glob_reaches(p, d, recursive)) {
+                return true;
             }
             let real = real_path(p);
             let is_dir = real.is_dir();

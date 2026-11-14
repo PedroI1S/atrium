@@ -555,7 +555,10 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
     }
     // `| s$(echo h)`: a word built by running something may name a shell;
     // `| $X -s`: a command named by a variable, told to read a script
-    if !is_interpreter(b) && shell::has_command_substitution(first) {
+    if !is_interpreter(b)
+        && shell::has_command_substitution(first)
+        && shell::substituted_word_may_be_shell(first)
+    {
         return true;
     }
     if !is_interpreter(b) && shell::maybe_shell(first) {
@@ -1117,6 +1120,44 @@ impl Ctx<'_> {
     }
 }
 
+/// Words split on blanks, keeping a `$(…)`, `` `…` `` or quoted part whole
+/// (`$(brew --prefix)/bin/jq` is one word), for the raw text check.
+fn raw_words(t: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut tick = false;
+    let mut prev = ' ';
+    for c in t.chars() {
+        match c {
+            _ if quote.is_some() => {
+                if Some(c) == quote {
+                    quote = None;
+                }
+            }
+            '\'' | '"' => quote = Some(c),
+            '`' => tick = !tick,
+            '(' if prev == '$' || depth > 0 => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            c if c.is_whitespace() && depth == 0 && !tick => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                prev = c;
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+        prev = c;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// `curl … | sh` as text, for lines the lexer got wrong.
 fn raw_pipe_to_shell(t: &str) -> bool {
     let l = t.to_lowercase();
@@ -1126,9 +1167,8 @@ fn raw_pipe_to_shell(t: &str) -> bool {
             rest = &rest[i + dl.len()..];
             let seg: &str = rest.split([';', '\n', '&']).next().unwrap_or("");
             if let Some((_, after)) = seg.split_once('|') {
-                let w: Vec<&str> = after.split_whitespace().collect();
-                let eff: Vec<String> =
-                    shell::unwrap(&w.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                let w = raw_words(after);
+                let eff: Vec<String> = shell::unwrap(&w);
                 if reads_stdin_as_code(&eff) {
                     return true;
                 }

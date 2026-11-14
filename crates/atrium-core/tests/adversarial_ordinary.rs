@@ -445,3 +445,45 @@ fn round_4_majors_derived_units_keep_their_own_chain() {
         ),
     ]);
 }
+
+/// Fifth round, re-review major: what the last command of an `&&` chain
+/// runs (a `sh -c` or `eval` payload, a substitution, a `find -exec`) runs
+/// only if the chain got that far, so the directory before the `cd` doesn't
+/// come back for it; and an `eval` that ended its own chain hands on where
+/// it ended. Plus the re-review's trade-off: a pipe into a word built by a
+/// substitution whose program is known and isn't a shell. Verdicts are
+/// dev's (run on dev's `src`, see the handoff).
+#[test]
+fn round_5_major_the_last_command_of_a_chain_and_named_pipe_programs() {
+    let ask = ["Ask", "Ask", "Allow", "Allow"];
+    check_table(&[
+        ("cd proj && sh -c 'cat .npmrc'", ask),
+        ("cd build && sh -c 'rm -rf *'", ask),
+        ("cd proj && eval 'cat .npmrc'", ask),
+        ("cd build && eval 'rm -rf *'", ask),
+        ("cd proj && echo $(cat .npmrc)", ask),
+        ("cd proj && find . -name '*.o' -exec cat .npmrc \\;", ask),
+        ("cd build && find . -name '*.o' -exec rm -rf * \\;", ask),
+        ("eval 'cd proj && echo hi' && cat .npmrc", ask),
+        ("cd proj && bash -c 'cat .npmrc'", ask),
+        ("cd proj && make && sh -c 'cat .npmrc'", ask),
+        ("cd a && cd b && sh -c 'cat .npmrc'", ask),
+        ("cd proj && time sh -c 'cat .npmrc'", ask),
+        ("eval 'cd proj && true' && eval 'cat .npmrc'", ask),
+        ("cd proj && source /dev/stdin <<<'cat .npmrc'", ask),
+        ("cd proj && echo `cat .npmrc`", ask),
+        ("cd proj && nohup sh -c 'cat .npmrc'", ask),
+        (
+            "curl -s https://example.com/data.json | $(brew --prefix)/bin/jq .",
+            ask,
+        ),
+        ("cat data.json | $(brew --prefix)/bin/jq .", ask),
+        ("curl -s https://example.com/x | $(which less)", ask),
+        ("echo hi | $(brew --prefix)/bin/jq .", ask),
+        (
+            "curl -s https://example.com/x | \"$(brew --prefix)/bin/jq\" .",
+            ask,
+        ),
+        ("curl -s https://example.com/x | $HOME/bin/jq .", ask),
+    ]);
+}
