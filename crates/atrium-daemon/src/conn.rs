@@ -748,4 +748,126 @@ mod tests {
         // Replacing one that exists is not one more.
         assert!(conn.subscribe(&t("0")).is_some());
     }
+
+    #[tokio::test]
+    async fn write_loop_finishes_a_started_frame_and_drops_later_ones_when_subscription_ends() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        for replaced in [false, true] {
+            let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a pair");
+            let (_reading, writer) = ours.into_split();
+            let conn = Arc::new(Conn::with_limit(1, ClientRole::Dev, 8_000_000));
+            let sub = conn.subscribe(&t("a")).expect("a subscription");
+            let large: Frame = vec![0xAAu8; 4 * 1024 * 1024].into();
+            let after: Frame = vec![0xBBu8; 1024].into();
+            assert!(conn.feed(sub, Some(EventId(1)), large.clone()).await);
+            assert!(conn.feed(sub, Some(EventId(2)), after).await);
+
+            let writer_task = tokio::spawn({
+                let conn = conn.clone();
+                async move { write_loop(&conn, writer).await }
+            });
+
+            // Read the start of the large frame so we know it is in flight
+            // (written > 0, and still incomplete because 4 MiB exceeds the
+            // UnixStream buffer).
+            let mut received = vec![0u8; 1024];
+            theirs.read_exact(&mut received).await.expect("first bytes");
+
+            if replaced {
+                conn.subscribe(&t("a")).expect("replaces");
+            } else {
+                conn.unsubscribe(&t("a"));
+            }
+            conn.finish();
+
+            let mut chunk = vec![0u8; 16 * 1024];
+            loop {
+                let n = theirs.read(&mut chunk).await.expect("reads");
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..n]);
+                tokio::task::yield_now().await;
+            }
+            writer_task.await.expect("writer task");
+
+            assert_eq!(received.len(), large.len(), "whole first frame, never cut");
+            assert_eq!(received, large.as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn write_some_treats_first_as_true_only_before_any_byte_is_written() {
+        use tokio::io::AsyncReadExt;
+
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a pair");
+        let (_reading, writer) = ours.into_split();
+        let conn = Conn::with_limit(1, ClientRole::Dev, 1_000);
+        let sub = conn.subscribe(&t("a")).expect("a subscription");
+        assert!(conn.feed(sub, Some(EventId(1)), frame(100)).await);
+        let Take::Frame(first_frame, origin) = conn.take() else {
+            panic!("a frame")
+        };
+
+        // Fill the socket buffer so try_write hits WouldBlock (0 bytes written).
+        let mut filler_bytes = 0usize;
+        let filler = [0u8; 4096];
+        loop {
+            match writer.try_write(&filler) {
+                Ok(n) => filler_bytes += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected write error: {err}"),
+            }
+        }
+
+        assert_eq!(
+            conn.write_some(&writer, &first_frame, true, origin)
+                .expect("would block"),
+            Some(0)
+        );
+        // Zero bytes written: last_sent must still be None.
+        assert_eq!(conn.lock().subs.get(&sub).expect("sub").written, None);
+
+        // Drain the filler, end the subscription, and retry with first = true:
+        // because no byte of the frame was written, it must be dropped.
+        let mut drain = vec![0u8; filler_bytes];
+        theirs.read_exact(&mut drain).await.expect("drains filler");
+        writer.writable().await.expect("writable");
+        conn.unsubscribe(&t("a"));
+        assert_eq!(
+            conn.write_some(&writer, &first_frame, true, origin)
+                .expect("dropped"),
+            None
+        );
+
+        // Once at least one byte is written (first = true), subsequent chunks
+        // have first = false and finish even if the subscription ends.
+        let sub2 = conn.subscribe(&t("b")).expect("a subscription");
+        assert!(conn.feed(sub2, Some(EventId(2)), frame(100)).await);
+        let Take::Frame(second_frame, origin2) = conn.take() else {
+            panic!("a frame")
+        };
+        assert_eq!(
+            conn.write_some(&writer, &second_frame[..40], true, origin2)
+                .expect("first chunk"),
+            Some(40)
+        );
+        assert_eq!(
+            conn.lock().subs.get(&sub2).expect("sub2").written,
+            Some(EventId(2))
+        );
+        conn.unsubscribe(&t("b"));
+        assert_eq!(
+            conn.write_some(&writer, &second_frame[40..], false, origin2)
+                .expect("rest of frame"),
+            Some(60)
+        );
+
+        drop(writer);
+        let mut received = Vec::new();
+        theirs.read_to_end(&mut received).await.expect("reads");
+        assert_eq!(received.len(), 100);
+    }
 }
