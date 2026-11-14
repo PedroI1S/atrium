@@ -364,11 +364,22 @@ enum Reply {
 }
 
 impl Reply {
-    fn request_id(&self) -> &str {
+    /// The request this answers, in its own namespace.
+    fn key(&self) -> Req {
         match self {
-            Reply::Hook { request_id } | Reply::CanUse { request_id, .. } => request_id,
+            Reply::Hook { request_id } => Req::Hook(request_id.clone()),
+            Reply::CanUse { request_id, .. } => Req::CanUse(request_id.clone()),
         }
     }
+}
+
+/// A request of the provider. A hook call and a `can_use_tool` request are
+/// two requests even when the CLI gives them the same id: answering one
+/// must not retire the other.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Req {
+    Hook(String),
+    CanUse(String),
 }
 
 /// A `can_use_tool` approval waiting for the client, by ticket id.
@@ -473,9 +484,9 @@ struct Actor {
     /// Requests of the provider (hook calls and `can_use_tool`, by its own
     /// ids) not answered yet. An answer for one that is not here is never
     /// sent: it was withdrawn, or its turn ended.
-    live: HashSet<String>,
-    /// The gate tasks in flight, by the provider's request id.
-    inflight: HashMap<String, AbortHandle>,
+    live: HashSet<Req>,
+    /// The gate tasks in flight, by request.
+    inflight: HashMap<Req, AbortHandle>,
     approvals: HashMap<String, PendingApproval>,
     /// Questions waiting for an answer, by ticket id: (native id, input).
     questions: HashMap<String, (String, Value)>,
@@ -843,7 +854,7 @@ impl Actor {
     }
 
     fn deny_can_use(&mut self, request_id: &str, message: &str) {
-        self.live.remove(request_id);
+        self.live.remove(&Req::CanUse(request_id.to_owned()));
         self.respond(request_id, json!({"behavior": "deny", "message": message}));
     }
 
@@ -1024,10 +1035,13 @@ impl Actor {
 
     /// The provider withdrew a request.
     fn forget_native(&mut self, native: &str) {
-        if let Some(task) = self.inflight.remove(native) {
-            task.abort();
+        // The cancellation names no kind: both are withdrawn.
+        for req in [Req::Hook(native.to_owned()), Req::CanUse(native.to_owned())] {
+            if let Some(task) = self.inflight.remove(&req) {
+                task.abort();
+            }
+            self.live.remove(&req);
         }
-        self.live.remove(native);
         self.approvals.retain(|_, a| a.native != native);
         self.questions.retain(|_, (n, _)| n != native);
     }
@@ -1088,7 +1102,7 @@ impl Actor {
         }
         let call_id = input.get("tool_use_id").and_then(Value::as_str);
         let check = tool_check(call_id, name, &tool_input, self.norm.turn_number());
-        self.live.insert(request_id.clone());
+        self.live.insert(Req::Hook(request_id.clone()));
         self.spawn_gate(Reply::Hook { request_id }, check);
     }
 
@@ -1107,7 +1121,7 @@ impl Actor {
             .get("tool_use_id")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        self.live.insert(request_id.clone());
+        self.live.insert(Req::CanUse(request_id.clone()));
         if name == ASK_USER_QUESTION {
             self.spawn_question(request_id, input);
             return;
@@ -1140,7 +1154,7 @@ impl Actor {
         let gate = self.gate.clone();
         let tx = self.internal_tx.clone();
         let deadline = self.options.gate_deadline;
-        let native = reply.request_id().to_owned();
+        let native = reply.key();
         let task = self.gates.spawn(async move {
             let for_gate = check.clone();
             // The call runs in its own task so a panic is contained, and is
@@ -1180,7 +1194,7 @@ impl Actor {
         let tx = self.internal_tx.clone();
         let deadline = self.options.gate_deadline;
         let turn = Some(self.norm.turn_number());
-        let key = native.clone();
+        let key = Req::CanUse(native.clone());
         let task = self.gates.spawn(async move {
             let inner = tokio::spawn(async move { gate.question_ticket(turn).await });
             let (ticket, failed) = match guarded(deadline, inner).await {
@@ -1208,7 +1222,7 @@ impl Actor {
             &a.input,
             self.norm.turn_number(),
         );
-        let key = a.native.clone();
+        let key = Req::CanUse(a.native.clone());
         let task = self.gates.spawn(async move {
             let (for_gate, ticket) = (check.clone(), a.ticket.clone());
             let inner = tokio::spawn(async move { gate.redeem(&ticket, &for_gate).await });
@@ -1236,9 +1250,9 @@ impl Actor {
     fn on_internal(&mut self, msg: Internal) {
         while self.gates.try_join_next().is_some() {}
         match &msg {
-            Internal::Gate { reply, .. } => self.inflight.remove(reply.request_id()),
+            Internal::Gate { reply, .. } => self.inflight.remove(&reply.key()),
             Internal::Redeem { native, .. } | Internal::Question { native, .. } => {
-                self.inflight.remove(native)
+                self.inflight.remove(&Req::CanUse(native.clone()))
             }
         };
         let failed = match &msg {
@@ -1256,7 +1270,7 @@ impl Actor {
                 // The request may have been withdrawn, or its turn ended,
                 // while the gate decided: then nobody is waiting for the
                 // answer, and a ticket it opened must not outlive it.
-                if self.live.contains(reply.request_id()) {
+                if self.live.contains(&reply.key()) {
                     self.feed(AdapterInput::Gate {
                         check: check.clone(),
                         decision: decision.clone(),
@@ -1272,25 +1286,32 @@ impl Actor {
                 decision,
                 ..
             } => {
-                self.feed(AdapterInput::Redeem {
-                    ticket,
-                    check,
-                    decision: decision.clone(),
-                });
-                // The request may have been withdrawn while the gate decided.
-                if !self.live.remove(&native) || self.proc.is_none() {
-                    return;
+                // The request may have been withdrawn, or its turn ended, while
+                // the gate decided: then nothing is recorded or shown for it
+                // (a refused redeem would otherwise deny a call nobody asks
+                // about any more) and nothing is answered.
+                let req = Req::CanUse(native.clone());
+                if self.live.contains(&req) {
+                    self.feed(AdapterInput::Redeem {
+                        ticket,
+                        check,
+                        decision: decision.clone(),
+                    });
+                    if self.live.remove(&req) && self.proc.is_some() {
+                        let response = match decision {
+                            GateDecision::Allow => {
+                                json!({"behavior": "allow", "updatedInput": input})
+                            }
+                            GateDecision::Deny { reason } => {
+                                json!({"behavior": "deny", "message": deny_text(&reason)})
+                            }
+                            GateDecision::Ask { .. } => {
+                                json!({"behavior": "deny", "message": deny_text("approval needs another decision")})
+                            }
+                        };
+                        self.respond(&native, response);
+                    }
                 }
-                let response = match decision {
-                    GateDecision::Allow => json!({"behavior": "allow", "updatedInput": input}),
-                    GateDecision::Deny { reason } => {
-                        json!({"behavior": "deny", "message": deny_text(&reason)})
-                    }
-                    GateDecision::Ask { .. } => {
-                        json!({"behavior": "deny", "message": deny_text("approval needs another decision")})
-                    }
-                };
-                self.respond(&native, response);
             }
             Internal::Question {
                 native,
@@ -1298,18 +1319,20 @@ impl Actor {
                 input,
                 ..
             } => {
-                self.feed(AdapterInput::QuestionTicket {
-                    id: native.clone(),
-                    ticket: ticket.clone(),
-                });
-                if !self.live.contains(&native) || self.proc.is_none() {
-                    return;
-                }
-                match ticket {
-                    Some(t) => {
-                        self.questions.insert(t.request_id, (native, input));
+                // As for a redeem: a question that is no longer asked is not shown.
+                if self.live.contains(&Req::CanUse(native.clone())) {
+                    self.feed(AdapterInput::QuestionTicket {
+                        id: native.clone(),
+                        ticket: ticket.clone(),
+                    });
+                    if self.proc.is_some() {
+                        match ticket {
+                            Some(t) => {
+                                self.questions.insert(t.request_id, (native, input));
+                            }
+                            None => self.deny_can_use(&native, "Atrium declined the question"),
+                        }
                     }
-                    None => self.deny_can_use(&native, "Atrium declined the question"),
                 }
             }
         }
@@ -1326,7 +1349,7 @@ impl Actor {
         match reply {
             Reply::Hook { request_id } => {
                 // Answered now: the hook call is over.
-                self.live.remove(&request_id);
+                self.live.remove(&Req::Hook(request_id.clone()));
                 match decision {
                     GateDecision::Allow => self.respond_hook(&request_id, "allow", None),
                     GateDecision::Deny { reason } => {
@@ -1341,7 +1364,7 @@ impl Actor {
             }
             Reply::CanUse { request_id, input } => match decision {
                 GateDecision::Allow => {
-                    self.live.remove(&request_id);
+                    self.live.remove(&Req::CanUse(request_id.clone()));
                     self.respond(
                         &request_id,
                         json!({"behavior": "allow", "updatedInput": input}),
@@ -1457,7 +1480,7 @@ impl Actor {
                     },
                 });
                 if let Some((native, input)) = question {
-                    self.live.remove(&native);
+                    self.live.remove(&Req::CanUse(native.clone()));
                     let updated = answered_input(&input, &answers);
                     self.respond(
                         &native,
@@ -1684,6 +1707,7 @@ fn answered_input(input: &Value, answers: &[QuestionAnswer]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atrium_protocol::agent::ToolStatus;
 
     #[test]
     fn answers_are_keyed_by_question_text_with_labels_joined() {
@@ -1712,5 +1736,197 @@ mod tests {
         assert_eq!(out["answers"]["Why?"], "because");
         assert_eq!(out["answers"].as_object().unwrap().len(), 2);
         assert_eq!(out["questions"], input["questions"]);
+    }
+
+    // ---- fix round 2, item 7: `live` is checked before the normalizer ----
+
+    struct NoGate;
+
+    impl ToolGate for NoGate {
+        fn check<'a>(&'a self, _: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+            Box::pin(async { GateDecision::Allow })
+        }
+        fn redeem<'a>(
+            &'a self,
+            _: &'a ApprovalTicket,
+            _: &'a ToolCheck,
+        ) -> BoxFuture<'a, GateDecision> {
+            Box::pin(async { GateDecision::Allow })
+        }
+        fn question_ticket(&self, _: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
+            Box::pin(async { None })
+        }
+    }
+
+    /// An actor with no process, in a folder of its own, that has seen the
+    /// records in `lines`.
+    fn actor(name: &str, lines: &[Value]) -> Actor {
+        let dir =
+            std::env::temp_dir().join(format!("atrium-claude-unit-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let config = SessionConfig {
+            cwd: dir.clone(),
+            model: None,
+            effort: None,
+            permissions: PermissionPolicy::Ask,
+            gate: Arc::new(NoGate),
+            mcp_servers: vec![],
+            resume: None,
+            env: vec![(
+                "CLAUDE_CONFIG_DIR".into(),
+                dir.join("user").display().to_string(),
+            )],
+            program: None,
+            on_spawn: None,
+        };
+        let inputs = DescriptorInputs {
+            cwd: dir.clone(),
+            env: config.env.clone(),
+            setting_sources: None,
+            extra_args: vec![],
+            managed: Some(vec![]),
+            version: None,
+            gate_unreachable: false,
+        };
+        let descriptor = inputs.descriptor();
+        let (events_tx, _events_rx) = mpsc::channel(8);
+        let (_commands_tx, commands_rx) = mpsc::channel(8);
+        let mut a = Actor::new(
+            config,
+            ClaudeOptions::default(),
+            inputs,
+            descriptor,
+            events_tx,
+            commands_rx,
+        )
+        .unwrap();
+        for l in lines {
+            a.feed(AdapterInput::Stdout {
+                line: l.to_string(),
+            });
+        }
+        a.pending.clear();
+        a
+    }
+
+    fn init_line() -> Value {
+        json!({"type":"system","subtype":"init","session_id":"s","model":"m","tools":["Bash"],"cwd":"."})
+    }
+
+    fn bash_call() -> Value {
+        json!({"type":"assistant","message":{"model":"m","id":"msg_1","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"session_id":"s"})
+    }
+
+    fn shown(a: &Actor) -> Vec<&AgentEvent> {
+        a.pending.iter().map(|e| &e.event).collect()
+    }
+
+    fn redeem_denied(native: &str) -> Internal {
+        let input = json!({"command":"ls"});
+        Internal::Redeem {
+            native: native.into(),
+            ticket: ApprovalTicket {
+                request_id: "T1".into(),
+                rememberable: false,
+            },
+            check: tool_check(Some("toolu_1"), "Bash", &input, 1),
+            input,
+            decision: GateDecision::Deny {
+                reason: "expired".into(),
+            },
+            failed: false,
+        }
+    }
+
+    fn is_denied(e: &&AgentEvent) -> bool {
+        matches!(
+            e,
+            AgentEvent::ToolCallFinished {
+                status: ToolStatus::Denied,
+                ..
+            }
+        )
+    }
+
+    /// A redeem that comes back after its request was withdrawn (queued
+    /// before the withdrawal, handled after) shows nothing.
+    #[tokio::test]
+    async fn a_redeem_for_a_request_that_is_not_live_is_not_fed() {
+        let mut a = actor("redeem-not-live", &[init_line(), bash_call()]);
+        a.on_internal(redeem_denied("c1"));
+        assert!(
+            !shown(&a).iter().any(is_denied),
+            "a withdrawn request denied its call: {:?}",
+            shown(&a)
+        );
+        // The same redeem for a live request is shown.
+        let mut a = actor("redeem-live", &[init_line(), bash_call()]);
+        a.live.insert(Req::CanUse("c1".into()));
+        a.on_internal(redeem_denied("c1"));
+        assert!(shown(&a).iter().any(is_denied), "{:?}", shown(&a));
+    }
+
+    /// A hook call and a `can_use_tool` request with one id are two
+    /// requests: the answer for one is not fed because the other is live.
+    #[tokio::test]
+    async fn a_hook_call_does_not_keep_a_can_use_request_of_the_same_id_live() {
+        let input = json!({"command":"ls"});
+        let gate_for_can_use = || Internal::Gate {
+            reply: Reply::CanUse {
+                request_id: "r1".into(),
+                input: input.clone(),
+            },
+            check: tool_check(Some("toolu_1"), "Bash", &input, 1),
+            decision: GateDecision::Deny {
+                reason: "no".into(),
+            },
+            failed: false,
+        };
+        let mut a = actor("namespaces", &[init_line(), bash_call()]);
+        a.live.insert(Req::Hook("r1".into()));
+        a.on_internal(gate_for_can_use());
+        assert!(shown(&a).is_empty(), "{:?}", shown(&a));
+        assert!(a.live.contains(&Req::Hook("r1".into())));
+        // Withdrawing "r1" withdraws both.
+        a.live.insert(Req::CanUse("r1".into()));
+        a.forget_native("r1");
+        assert!(a.live.is_empty());
+    }
+
+    /// A question ticket for a request that is not live is not shown.
+    #[tokio::test]
+    async fn a_question_ticket_for_a_request_that_is_not_live_is_not_fed() {
+        let question = json!({"type":"control_request","request_id":"c1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"toolu_q","input":{"questions":[{"question":"Q?","options":[{"label":"A"},{"label":"B"}]}]}}});
+        let ask = |a: &mut Actor| {
+            a.on_internal(Internal::Question {
+                native: "c1".into(),
+                ticket: Some(ApprovalTicket {
+                    request_id: "Q1".into(),
+                    rememberable: false,
+                }),
+                input: json!({}),
+                failed: false,
+            });
+        };
+        let mut a = actor("question-not-live", &[init_line(), question.clone()]);
+        ask(&mut a);
+        assert!(
+            !shown(&a)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::QuestionAsked { .. })),
+            "{:?}",
+            shown(&a)
+        );
+        let mut a = actor("question-live", &[init_line(), question]);
+        a.live.insert(Req::CanUse("c1".into()));
+        ask(&mut a);
+        assert!(
+            shown(&a)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::QuestionAsked { .. })),
+            "{:?}",
+            shown(&a)
+        );
     }
 }

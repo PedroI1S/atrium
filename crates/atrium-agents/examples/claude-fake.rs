@@ -18,7 +18,10 @@
 //! arguments, before / after the `tool_use` record), `hook-ask-changed` (the
 //! `can_use_tool` that follows an `ask` has another input), `hook-ask-anon2`
 //! (two identical hook calls without ids, then two `can_use_tool`) and
-//! `eof-flood` (an open turn, then thousands of records after stdin closes).
+//! `eof-flood` (an open turn, then thousands of records after stdin closes),
+//! and the round-2 mode `id-clash` (a hook call that reuses the request id of
+//! an open `can_use_tool`, after the file `go_on` appears; every answer is
+//! logged to `responses.jsonl`).
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Write};
@@ -111,6 +114,11 @@ fn main() {
             }
             Some("control_response") => {
                 let id = v.pointer("/response/request_id").and_then(Value::as_str);
+                if mode == "id-clash" {
+                    // Round 2 mode: every answer, in order.
+                    append(&dir, "responses.jsonl", &line);
+                    continue;
+                }
                 if mode == "hook-ask-anon2" && matches!(id, Some("h1" | "h2")) {
                     let which = id.unwrap_or_default();
                     fs::write(dir.join(format!("hook_response_{which}.json")), &line).ok();
@@ -224,6 +232,26 @@ fn main() {
                             thread::sleep(Duration::from_millis(300));
                             emit(&result("success", false));
                         }
+                    }
+                    "id-clash" => {
+                        emit(
+                            &json!({"type":"assistant","message":{"model":"claude-fake","id":"msg_fake","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"session_id":session_id}),
+                        );
+                        emit(
+                            &json!({"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"toolu_1","input":{"command":"ls"}}}),
+                        );
+                        // The test says when to go on (the stdin loop waits).
+                        let gate = dir.join("go_on");
+                        for _ in 0..400 {
+                            if gate.exists() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        // A hook call that uses the same request id.
+                        emit(
+                            &json!({"type":"control_request","request_id":"r1","request":{"subtype":"hook_callback","callback_id":"atrium-pre-tool-use","input":{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"x"},"tool_use_id":"toolu_2"}}}),
+                        );
                     }
                     "canuse-bigargs" | "canuse-bigargs-b" => {
                         let input = json!({"command":"x".repeat(4 * 1024 * 1024 + 16)});

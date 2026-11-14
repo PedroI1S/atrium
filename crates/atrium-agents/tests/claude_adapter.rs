@@ -1739,3 +1739,67 @@ async fn a_recorded_session_replays_to_the_same_events() {
     let replayed = fixture::normalize(&lines, &mut ClaudeNormalizer::new());
     assert_eq!(replayed, live);
 }
+
+// ---- fix round 2: item 7 (live, separate request-id namespaces) ----
+
+/// The lines of `responses.jsonl` so far, as JSON.
+fn responses(dir: &Path) -> Vec<Value> {
+    fs::read_to_string(dir.join("responses.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+async fn wait_response(dir: &Path, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(v) = responses(dir).into_iter().find(|v| pred(v)) {
+            return v;
+        }
+        assert!(Instant::now() < end, "no {what} was answered");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Finding 7 (shared id): a hook call and a `can_use_tool` request with the same
+/// id are two requests. Answering the hook must not make the approval
+/// unanswerable.
+#[tokio::test]
+async fn r2_a_hook_call_and_a_can_use_request_with_one_id_are_separate() {
+    let dir = scratch("r2-id-clash");
+    // Reads are allowed by the hook; the Bash call needs the user.
+    let gate = TestGate::new(|c| {
+        if c.name == "Read" {
+            GateDecision::Allow
+        } else {
+            ask()
+        }
+    });
+    let mut session = start(config(&dir, "id-clash", gate), opts()).await.unwrap();
+    session.commands.send(say("go")).await.unwrap();
+    next_matching(&mut session, 10, |e| {
+        matches!(e, AgentEvent::ApprovalRequested { .. })
+    })
+    .await;
+    write(&dir.join("go_on"), "yes");
+    // The hook call (same id, no behavior field) is answered.
+    wait_response(&dir, "hook call", |v| {
+        v.pointer("/response/response/hookSpecificOutput").is_some()
+    })
+    .await;
+    session
+        .commands
+        .send(SessionCommand::ResolveApproval {
+            request_id: "T1".into(),
+            decision: ApprovalDecision::Allow,
+        })
+        .await
+        .unwrap();
+    let v = wait_response(&dir, "can_use_tool request", |v| {
+        v.pointer("/response/response/behavior").is_some()
+    })
+    .await;
+    assert_eq!(behavior(&v).0, "allow");
+    shutdown(session).await;
+}
