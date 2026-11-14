@@ -1470,9 +1470,15 @@ fn every_check_carries_the_extracted_subject() {
         subject("Grep", json!({"pattern":"foo"})),
         paths(".", None, true)
     );
+    // A pattern with a `/` is also joined to the base, `.` components
+    // dropped (escalation, D-071).
     assert_eq!(
         subject("Glob", json!({"pattern":"**/*.rs"})),
-        paths(".", Some("**/*.rs"), true)
+        ToolSubject::Paths {
+            paths: vec![".".into(), "**/*.rs".into()],
+            glob: Some("**/*.rs".into()),
+            recursive: true,
+        }
     );
     assert_eq!(
         subject("WebFetch", json!({"url":"https://example.com/x"})),
