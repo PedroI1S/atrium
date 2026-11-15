@@ -118,6 +118,8 @@ Non-blocking; it needs the driver's approval because it adds a method to the fro
 
 ## CR-09 — M1-05-daemon (orchestrator, from the Codex review) — 2026-11-11
 
+**Decided (D-082, Pedro): approved.** `Recovered { cleanup: Unverified }` moves `Ended` and `Interrupted { Verified }` to `Interrupted { cleanup: Unverified }`.
+
 Needs the driver's approval, and Pedro's, since it changes what a thread is shown as (contract §8, §10). Found by the review of M1-05 (`reviews/M1-05-daemon-codex.md`, finding 4).
 
 **A thread that was stopped can't be shown as "cleanup unverified" afterwards.** Contract §10 says a thread whose process can't be verified "is never shown as stopped". Contract §8 and `attention::next_state` say `Ended`, `Failed` and `Interrupted` are sticky until the next start, and that a user's stop is `Ended` at once. The two meet in this order:
@@ -157,6 +159,8 @@ Nothing else in the app uses `unsafe`; `window-vibrancy` does its own.
 
 ## CR-12 — M1-13-adversarial (orchestrator, from the worker's finding 6) — 2026-11-12
 
+**Decided (D-082, Pedro): Ask, not hard-deny.** These credential stores become sensitive paths: Home asks, and a remembered rule may allow them. They are not added to the hard-deny list.
+
 **Security default; Pedro decides (D-013).** In Home with no rules, the policy auto-allows reading credential stores that aren't on the contract's hard-deny list (§9, `HARD_DENY_DEFAULTS`). The worker's examples: `cat ~/.cargo/credentials.toml`, `~/.pypirc`, `~/.pgpass`, `~/.vault-token`, `~/.azure/accessTokens.json`, `~/.aws/sso/cache/*`, `~/.config/git/credentials`, shell history files, `~/.env`, and `git show HEAD:.npmrc`. They are tested in `crates/atrium-core/tests/adversarial_*.rs` on `agent/sonnet/M1-13-adversarial`, ignored as "M1-13 finding 6".
 
 **Change proposed:** add these to the hard-deny credential list, with the same identity and hard-link handling as the existing entries. Also make `git show`/`git cat-file` of a path matching a credential name ask rather than auto-allow. Affects `atrium-protocol`/`atrium-core` policy defaults, contract §9, and the Settings text that lists what is protected.
@@ -164,6 +168,8 @@ Nothing else in the app uses `unsafe`; `window-vibrancy` does its own.
 **Related, for the same decision:** findings 1 and 2 (a `cd` inside a subshell or pipeline is not followed; a failing `cd` is assumed to succeed). With two ordinary prefix rules (`cd`, `cat`), `cd nope; cat .ssh/id_rsa` reaches Allow. These are engine fixes rather than contract changes, but they reach Allow on a hard-denied path, so they should be fixed before the M1 gate (worker's handoff has proposed fixes for 1, 2, 7 and 8).
 
 ## CR-13 — M1-09b-home-chat — 2026-11-13
+
+**Decided (D-082, Pedro): approved as proposed** (`approval_at_ms`, `question_at_ms`, both off by default).
 
 Non-blocking for M1-09b; needed by M1-13 and the M1 gate. Asked for by the M1-09b brief.
 
@@ -179,6 +185,8 @@ Affects `atrium-protocol` (`wire.rs`, the bindings, `serde_shape.rs`), `atrium-d
 
 ## CR-14 — M1-09b-home-chat — 2026-11-13
 
+**Decided (D-082, Pedro): approved as proposed.**
+
 Non-blocking; a user-visible setting that does nothing until it lands.
 
 **The daemon's notifier doesn't read per-kind notification settings.** The brief asks for Settings → Notifications with on/off per kind. Contract §8 names the three kinds (`NeedsApproval`, `NeedsInput`, `Failed`) and `hub::thread_changed` posts all of them (subject to focus and `NOTIFY_MIN_INTERVAL`); no setting is consulted. `SetSetting` stores any key, so the switches can be saved, but they change nothing.
@@ -188,6 +196,8 @@ Non-blocking; a user-visible setting that does nothing until it lands.
 **Change proposed:** name the three keys in the contract (§8) and in `atrium-daemon::commands` next to `KEEP_RUNNING_SETTING` (validated as booleans, like it), and have `hub::thread_changed` (or `attention::should_notify`) skip a reason whose setting is `false`. The hub would read them at start and on `SetSetting`. Affects `crates/atrium-daemon/src/{commands,hub,lib}.rs` and contract §8. When it lands, remove the note in `app/src/ui/Settings.tsx`.
 
 ## CR-15 — M1-09b-home-chat — 2026-11-13
+
+**Decided (D-082, Pedro): approved: a `DeclineQuestion` command** (the first form proposed).
 
 Non-blocking; a gap in the wire.
 

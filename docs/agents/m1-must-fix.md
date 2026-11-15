@@ -97,7 +97,7 @@ Each finding is a test marked `#[ignore = "M1-13 finding N"]` on that branch; fi
 
 | # | Sev. | Must fix |
 |---|---|---|
-| S1 | **blocker** | **CR-12** (finding 6): in Home with no rules, reading credential stores outside `HARD_DENY_DEFAULTS` is auto-allowed: `~/.cargo/credentials.toml`, `~/.pypirc`, `~/.pgpass`, `~/.vault-token`, `~/.azure/accessTokens.json`, `~/.aws/sso/cache/*`, `~/.config/git/credentials`, shell history, `~/.env`, and `git show HEAD:.npmrc`. Pedro decides the list (D-013). |
+| S1 | **blocker** | **CR-12** (finding 6; decided D-082: Ask, not hard-deny; fix owed): in Home with no rules, reading credential stores outside `HARD_DENY_DEFAULTS` is auto-allowed: `~/.cargo/credentials.toml`, `~/.pypirc`, `~/.pgpass`, `~/.vault-token`, `~/.azure/accessTokens.json`, `~/.aws/sso/cache/*`, `~/.config/git/credentials`, shell history, `~/.env`, and `git show HEAD:.npmrc`. Pedro decides the list (D-013). |
 | S2 | **blocker** | Finding 2: a failing `cd` is assumed to succeed. With two ordinary prefix rules (`cd`, `cat`), `cd nope; cat .ssh/id_rsa` reaches Allow. Treat the cwd as unknown after any `cd` whose target isn't a known folder. |
 | S3 | major | Finding 1: a `cd` inside `( … )` or a pipeline isn't followed (cwd tracking). Under a broad allow rule this reaches Allow on a hard-denied path. |
 | S4 | major | Finding 8: `echo rm -rf ~ \| sh` (the `-rf` is dropped) and `printf '%s' '…' \| sh`: text piped into a shell must be read as code. |
