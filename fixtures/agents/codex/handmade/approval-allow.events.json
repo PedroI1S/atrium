@@ -4,11 +4,121 @@
     "provider": "codex",
     "native_session_id": "thread-fixture",
     "model": "fixture-model",
-    "tools": []
+    "tools": [],
+    "enforcement": {
+      "level": "partial",
+      "reasons": [
+        {
+          "code": "class_not_intercepted",
+          "message": "Read calls: ProviderGated"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Edit calls: Unknown"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Delete calls: Unknown"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Move calls: Unknown"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Search calls: Unknown"
+        },
+        {
+          "code": "class_not_intercepted",
+          "message": "Execute calls: ProviderGated"
+        },
+        {
+          "code": "class_not_intercepted",
+          "message": "Fetch calls: NotIntercepted"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Mcp calls: Unknown"
+        },
+        {
+          "code": "class_not_intercepted",
+          "message": "Subagent calls: NotIntercepted"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "ProviderSpecific calls: Unknown"
+        }
+      ],
+      "provider": "codex",
+      "cli_version": "0.163.0",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "provider_gated",
+          "evidence": "fixtures/agents/codex/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "delete",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "move",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "search",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "execute",
+          "coverage": "provider_gated",
+          "evidence": "fixtures/agents/codex/gate-deny-execute"
+        },
+        {
+          "class": "fetch",
+          "coverage": "not_intercepted",
+          "evidence": null
+        },
+        {
+          "class": "mcp",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "subagent",
+          "coverage": "not_intercepted",
+          "evidence": null
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "unknown",
+          "evidence": null
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
+  },
+  {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Run python3 -c 'print(42)' after approval. Do not retry if denied."
+    }
   },
   {
     "type": "tool_call_started",
@@ -58,7 +168,8 @@
         ]
       }
     },
-    "reason": null
+    "reason": null,
+    "rememberable": true
   },
   {
     "type": "request_resolved",
@@ -66,33 +177,12 @@
     "outcome": "approved"
   },
   {
-    "type": "tool_call_updated",
-    "call_id": "call-1",
-    "title": null,
-    "kind": "execute",
-    "input": {
-      "id": "call-1",
-      "type": "commandExecution",
-      "command": "python3 -c 'print(42)'",
-      "cwd": "/scratch",
-      "status": "completed",
-      "commandActions": [
-        {
-          "type": "unknown",
-          "command": "python3 -c 'print(42)'"
-        }
-      ],
-      "aggregatedOutput": "42\n"
-    },
-    "output_delta": null,
-    "output": "42\n"
-  },
-  {
     "type": "tool_call_finished",
     "call_id": "call-1",
     "status": "succeeded",
     "output": "42\n",
-    "error": null
+    "error": null,
+    "truncated_bytes": 0
   },
   {
     "type": "message_delta",
@@ -104,7 +194,12 @@
     "type": "message_completed",
     "message_id": "message-1",
     "kind": "assistant",
-    "text": "Done."
+    "body": {
+      "type": "streamed",
+      "chars": 5,
+      "deltas": 1,
+      "sha256": "ed251864987c367e9641fbdc89c1d83e9bf0fa2e3eecef8f301c79f619bfac81"
+    }
   },
   {
     "type": "turn_completed",
@@ -115,6 +210,6 @@
   {
     "type": "session_ended",
     "exit_code": 0,
-    "reason": null
+    "reason": "shutdown"
   }
 ]

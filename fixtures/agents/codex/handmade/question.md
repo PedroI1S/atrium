@@ -8,3 +8,4 @@ Reproduce: `cargo run -p spike-agent-codex --example record -- question`.
 Prompt: Use request_user_input to ask me to choose red or blue.
 
 Hand-made traces demonstrate mapping only; they do not prove provider enforcement.
+Atrium M1 (`f0b1aab`) added the `"dir":"question_ticket"` metadata line; recorded `stdin`/`stdout` wire lines were untouched.

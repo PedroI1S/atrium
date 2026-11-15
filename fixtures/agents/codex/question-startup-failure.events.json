@@ -1,27 +1,17 @@
 [
   {
     "type": "error",
-    "message": "provider exited before session establishment",
-    "fatal": true
-  },
-  {
-    "type": "unmapped",
-    "record_type": "stderr",
-    "raw": "<recorder-stderr>"
-  },
-  {
-    "type": "unmapped",
-    "record_type": "stderr",
-    "raw": "<recorder-stderr>"
-  },
-  {
-    "type": "unmapped",
-    "record_type": "stderr",
-    "raw": "<recorder-stderr>"
+    "message": "codex exited with code 1 before the session started",
+    "fatal": true,
+    "details": [
+      "<recorder-stderr>",
+      "<recorder-stderr>",
+      "<recorder-stderr>"
+    ]
   },
   {
     "type": "session_ended",
     "exit_code": 1,
-    "reason": null
+    "reason": "codex exited with code 1"
   }
 ]

@@ -8,6 +8,7 @@
 {"ms":7,"dir":"stdout","line":"{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\",\"items\":[],\"status\":\"inProgress\",\"error\":null}}}"}
 {"ms":8,"dir":"stdout","line":"{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-fixture\",\"turn\":{\"id\":\"turn-1\",\"items\":[],\"status\":\"inProgress\",\"error\":null}}}"}
 {"ms":9,"dir":"stdout","line":"{\"id\":\"question-1\",\"method\":\"item/tool/requestUserInput\",\"params\":{\"threadId\":\"thread-fixture\",\"turnId\":\"turn-1\",\"itemId\":\"question-tool\",\"isBlocking\":true,\"questions\":[{\"id\":\"color\",\"header\":\"Color\",\"question\":\"Choose a color\",\"isOther\":true,\"isSecret\":false,\"options\":[{\"label\":\"Red\",\"description\":\"Warm\"},{\"label\":\"Blue\",\"description\":\"Cool\"}]}]}}"}
+{"ms":9,"dir":"question_ticket","id":"question-1","ticket":{"request_id":"question-1","rememberable":false}}
 {"ms":10,"dir":"command","command":{"type":"answer_question","request_id":"question-1","answers":[{"question_id":"color","selected":["1"],"text":null}]}}
 {"ms":11,"dir":"stdin","line":"{\"id\":\"question-1\",\"result\":{\"answers\":{\"color\":{\"answers\":[\"Blue\"]}}}}"}
 {"ms":12,"dir":"stdout","line":"{\"method\":\"serverRequest/resolved\",\"params\":{\"threadId\":\"thread-fixture\",\"requestId\":\"question-1\"}}"}

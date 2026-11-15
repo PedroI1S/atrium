@@ -77,6 +77,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub mod claude; // M1-07
+pub mod codex; // M1-08
 pub mod fixture;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
