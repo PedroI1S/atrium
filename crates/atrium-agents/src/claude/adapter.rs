@@ -421,12 +421,12 @@ impl Drop for Proc {
     /// during the handshake, a panicked session task) must not leave the
     /// process group behind: `kill_on_drop` reaches the leader only.
     ///
-    /// The group is killed with `supervise::terminate` (it signals the group
-    /// while the leader is still unreaped, so the group id can't have been
-    /// reused, and only then reaps it), on a runtime of its own, so nothing
-    /// depends on the caller's: here and now on a plain thread, on a
-    /// short-lived thread when the caller has a runtime (which may be going
-    /// away). `kill_recorded` is not enough: it signals nothing once the
+    /// The group is killed with `supervise::terminate_blocking` (it signals the
+    /// group while the leader is still unreaped, so the group id can't have
+    /// been reused, and only then reaps it without relying on any tokio
+    /// runtime's reactor): here and now on a plain thread, on a short-lived
+    /// thread when the caller has a runtime (which may be going away or
+    /// blocked). `kill_recorded` is not enough: it signals nothing once the
     /// leader has exited, even as an unreaped zombie with its children still
     /// in the group (round 3, minor 5).
     fn drop(&mut self) {
@@ -441,22 +441,10 @@ impl Drop for Proc {
     }
 }
 
-/// [`supervise::terminate`] with no grace, on a runtime of its own; blocks.
-/// Not to be called from inside a runtime.
+/// [`supervise::terminate_blocking`] with no grace; blocks without touching any
+/// tokio runtime. Not to be called from inside a runtime.
 fn terminate_now(mut child: SupervisedChild) {
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => {
-            let _ = rt.block_on(supervise::terminate(&mut child, Duration::ZERO));
-        }
-        // No runtime to wait with: signal what can still be proven ours, and
-        // leave the reap to `kill_on_drop`.
-        Err(_) => {
-            let _ = supervise::kill_recorded(&child.identity);
-        }
-    }
+    let _ = supervise::terminate_blocking(&mut child, Duration::ZERO);
 }
 
 struct Actor {

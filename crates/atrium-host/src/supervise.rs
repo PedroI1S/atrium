@@ -98,18 +98,49 @@ pub fn spawn_group(mut command: tokio::process::Command) -> io::Result<Supervise
 /// release its process group id for reuse before the group can be signalled.
 /// Returns `Ok` only once the process group is verified empty (`ESRCH`).
 pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Result<Termination> {
+    let (pid, pgid) = check_unreaped_leader(child)?;
+    let exited_in_grace = wait_until_exited_no_reap(pid, grace).await?;
+    let macos_zombie_eperm = kill_group_while_unreaped(pid, pgid)?;
+
+    let status = child.child.wait().await?;
+    wait_for_group_drain(pgid, GROUP_DRAIN_TIMEOUT).await;
+
+    finish_termination(pgid, macos_zombie_eperm, status, exited_in_grace)
+}
+
+/// Blocking variant of [`terminate`] that does not use any tokio runtime
+/// reactor. Safe to call from `Drop` on a plain thread even while the runtime
+/// that spawned `child` is blocked or shutting down.
+///
+/// Follows the same order as [`terminate`]: check for an early exit without
+/// reaping (`WNOWAIT`), `SIGKILL` the group while the leader is unreaped, wait
+/// for and reap the leader without touching a tokio reactor (through
+/// `waitid(WNOWAIT)` + [`tokio::process::Child::try_wait`], so `Child` marks
+/// itself reaped and `kill_on_drop` does not act again), then verify the group
+/// is empty (`ESRCH`).
+pub fn terminate_blocking(child: &mut SupervisedChild, grace: Duration) -> io::Result<Termination> {
+    let (pid, pgid) = check_unreaped_leader(child)?;
+    let exited_in_grace = wait_until_exited_no_reap_sync(pid, grace)?;
+    let macos_zombie_eperm = kill_group_while_unreaped(pid, pgid)?;
+
+    let status = reap_leader_blocking(&mut child.child, pid)?;
+    wait_for_group_drain_sync(pgid, GROUP_DRAIN_TIMEOUT);
+
+    finish_termination(pgid, macos_zombie_eperm, status, exited_in_grace)
+}
+
+fn check_unreaped_leader(child: &SupervisedChild) -> io::Result<(u32, u32)> {
     if child.child.id().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "supervised child leader was already reaped before terminate",
         ));
     }
+    Ok((child.identity.pid, child.identity.pgid))
+}
 
-    let pid = child.identity.pid;
-    let pgid = child.identity.pgid;
-
-    let exited_in_grace = wait_until_exited_no_reap(pid, grace).await?;
-
+fn kill_group_while_unreaped(pid: u32, pgid: u32) -> io::Result<bool> {
+    let _ = pid;
     // Send SIGKILL to the whole process group while the leader is still an
     // unreaped child (pinned in the process table, so `pgid` cannot have been
     // recycled by the kernel yet).
@@ -119,17 +150,21 @@ pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Resu
     // `kill(-pgid, sig)` returns `EPERM` rather than `0` or `ESRCH`. Once the
     // leader is reaped below, `kill(-pgid, 0)` becomes `ESRCH` if the group
     // truly held only that zombie.
-    let macos_zombie_eperm = match signal_group(pgid, libc::SIGKILL) {
-        Ok(()) => false,
-        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => false,
+    match signal_group(pgid, libc::SIGKILL) {
+        Ok(()) => Ok(false),
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(false),
         #[cfg(target_os = "macos")]
-        Err(err) if err.raw_os_error() == Some(libc::EPERM) && peek_exited(pid)? => true,
-        Err(err) => return Err(err),
-    };
+        Err(err) if err.raw_os_error() == Some(libc::EPERM) && peek_exited(pid)? => Ok(true),
+        Err(err) => Err(err),
+    }
+}
 
-    let status = child.child.wait().await?;
-    wait_for_group_drain(pgid, GROUP_DRAIN_TIMEOUT).await;
-
+fn finish_termination(
+    pgid: u32,
+    macos_zombie_eperm: bool,
+    status: std::process::ExitStatus,
+    exited_in_grace: bool,
+) -> io::Result<Termination> {
     if !group_is_empty(pgid) {
         if macos_zombie_eperm {
             return Err(io::Error::from_raw_os_error(libc::EPERM));
@@ -291,13 +326,82 @@ async fn wait_until_exited_no_reap(pid: u32, grace: Duration) -> io::Result<bool
     }
 }
 
-/// Checks whether child `pid` has exited without reaping it (`WNOWAIT`).
-fn peek_exited(pid: u32) -> io::Result<bool> {
+fn wait_until_exited_no_reap_sync(pid: u32, grace: Duration) -> io::Result<bool> {
+    if peek_exited(pid)? {
+        return Ok(true);
+    }
+    if grace.is_zero() {
+        return Ok(false);
+    }
+    let deadline = std::time::Instant::now() + grace;
+    let mut step = Duration::from_millis(1);
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return peek_exited(pid);
+        }
+        std::thread::sleep(step.min(deadline - now));
+        if peek_exited(pid)? {
+            return Ok(true);
+        }
+        step = (step * 2).min(Duration::from_millis(10));
+    }
+}
+
+fn parse_raw_pid(pid: u32) -> io::Result<i32> {
     let raw_pid = i32::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of i32 range"))?;
     if raw_pid <= 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"));
     }
+    Ok(raw_pid)
+}
+
+/// Waits for child `pid` to exit without reaping it (`WNOWAIT`), then reaps
+/// through [`tokio::process::Child::try_wait`] so tokio marks the child reaped
+/// without touching the spawning runtime's reactor.
+fn reap_leader_blocking(
+    child: &mut tokio::process::Child,
+    pid: u32,
+) -> io::Result<std::process::ExitStatus> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+    let raw_pid = parse_raw_pid(pid)?;
+    loop {
+        // SAFETY: `siginfo_t` is a C POD struct/union valid when all-bits-zero,
+        // and `&mut info` is valid for the duration of `waitid`. `WNOWAIT`
+        // leaves the zombie unreaped so `child.try_wait()` remains sole reaper.
+        let rc = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                raw_pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            if err.raw_os_error() == Some(libc::ECHILD)
+                && let Some(status) = child.try_wait()?
+            {
+                return Ok(status);
+            }
+            return Err(err);
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+    }
+}
+
+/// Checks whether child `pid` has exited without reaping it (`WNOWAIT`).
+fn peek_exited(pid: u32) -> io::Result<bool> {
+    let raw_pid = parse_raw_pid(pid)?;
     loop {
         // SAFETY: `siginfo_t` is a C POD struct/union valid when all-bits-zero.
         // `&mut info` is valid for the duration of `waitid`, and `WNOWAIT`
