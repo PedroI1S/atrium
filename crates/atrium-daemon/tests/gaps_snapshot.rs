@@ -161,6 +161,10 @@ impl Store for GatedStore {
         self.inner.live_processes()
     }
 
+    fn unfinished_incarnations(&self) -> BoxFuture<'_, StoreResult<Vec<(ThreadId, u32)>>> {
+        self.inner.unfinished_incarnations()
+    }
+
     fn rules(&self) -> BoxFuture<'_, StoreResult<(u64, Vec<Rule>)>> {
         self.inner.rules()
     }

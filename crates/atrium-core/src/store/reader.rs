@@ -173,6 +173,36 @@ pub(crate) fn live_processes(c: &Connection) -> StoreResult<Vec<(ThreadId, u32, 
     Ok(out)
 }
 
+pub(crate) fn unfinished_incarnations(c: &Connection) -> StoreResult<Vec<(ThreadId, u32)>> {
+    let mut stmt = c
+        .prepare_cached(
+            "SELECT t.thread_id, t.incarnation \
+             FROM threads t \
+             JOIN sessions s ON s.thread_id = t.thread_id AND s.incarnation = t.incarnation \
+             WHERE t.incarnation > 0 \
+               AND EXISTS ( \
+                   SELECT 1 FROM events e \
+                   WHERE e.thread_id = t.thread_id AND e.incarnation = t.incarnation \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM events e \
+                   WHERE e.thread_id = t.thread_id AND e.incarnation = t.incarnation \
+                     AND e.kind = 'session_ended' \
+               ) \
+             ORDER BY t.thread_id, t.incarnation",
+        )
+        .map_err(sql_err)?;
+    let mut rows = stmt.query([]).map_err(sql_err)?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().map_err(sql_err)? {
+        out.push((
+            ThreadId(r.get(0).map_err(sql_err)?),
+            r.get(1).map_err(sql_err)?,
+        ));
+    }
+    Ok(out)
+}
+
 pub(crate) fn rules(c: &Connection) -> StoreResult<(u64, Vec<Rule>)> {
     // One read transaction: revision and rules come from the same snapshot.
     let c = &c.unchecked_transaction().map_err(sql_err)?;

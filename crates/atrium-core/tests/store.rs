@@ -2010,3 +2010,124 @@ async fn launch_reads_stored_launch_fields_and_current_title() {
         })
     );
 }
+
+#[tokio::test]
+async fn unfinished_incarnations_lists_open_current_incarnations_archived_or_not() {
+    let fx = Fixture::new();
+    let store = fx.open().await;
+
+    // Incarnation 0 and zero-event incarnations are omitted.
+    let unstarted = store.create_thread(new_thread()).await.unwrap().thread_id;
+    let (_zero_events, _) = started_thread(&store).await;
+    assert!(store.unfinished_incarnations().await.unwrap().is_empty());
+
+    // Listed thread with events and no SessionEnded is returned.
+    let (a, ai) = started_thread(&store).await;
+    store
+        .append(&a, ai, vec![env(0, AgentEvent::TurnStarted { turn: 1 })])
+        .await
+        .unwrap();
+
+    // Archived thread with events, a recorded process and `Signal::Recovered`
+    // (ended_ms set, no SessionEnded event yet) is still returned.
+    let (b, bi) = started_thread(&store).await;
+    store
+        .set_process(
+            &b,
+            bi,
+            Some(atrium_host::supervise::ProcessIdentity {
+                pid: 42,
+                pgid: 42,
+                start_time: 100,
+                executable: "/bin/claude".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &b,
+            bi,
+            vec![env(
+                0,
+                AgentEvent::TurnStarted { turn: 1 },
+            )],
+        )
+        .await
+        .unwrap();
+    store
+        .signal(
+            &b,
+            Signal::Recovered {
+                cleanup: Cleanup::Verified,
+            },
+        )
+        .await
+        .unwrap();
+    store.archive(&b).await.unwrap();
+    let mut expected = vec![(a.clone(), ai), (b.clone(), bi)];
+    expected.sort_by(|l, r| l.0.0.cmp(&r.0.0));
+    assert_eq!(store.unfinished_incarnations().await.unwrap(), expected);
+
+    // Storing SessionEnded removes it and clears sessions.process.
+    store
+        .append(
+            &b,
+            bi,
+            vec![env(
+                1,
+                AgentEvent::SessionEnded {
+                    exit_code: Some(0),
+                    reason: None,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.unfinished_incarnations().await.unwrap(), vec![(a.clone(), ai)]);
+    assert!(store.live_processes().await.unwrap().is_empty());
+
+    // Closing A clears it too; a resumed incarnation with 0 events is not listed
+    // until its first event arrives.
+    store
+        .append(
+            &a,
+            ai,
+            vec![env(
+                1,
+                AgentEvent::SessionEnded {
+                    exit_code: Some(0),
+                    reason: None,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    assert!(store.unfinished_incarnations().await.unwrap().is_empty());
+
+    let a2 = store.begin_incarnation(&a).await.unwrap();
+    assert_eq!(a2, 2);
+    assert!(store.unfinished_incarnations().await.unwrap().is_empty());
+    store
+        .append(&a, a2, vec![env(0, AgentEvent::TurnStarted { turn: 1 })])
+        .await
+        .unwrap();
+    assert_eq!(store.unfinished_incarnations().await.unwrap(), vec![(a.clone(), a2)]);
+
+    // Confirm `unstarted` stays omitted and `sessions.process` was cleared for B.
+    let _ = unstarted;
+    drop(store);
+    let conn = rusqlite::Connection::open_with_flags(
+        fx.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let b_process: Option<String> = conn
+        .query_row(
+            "SELECT process FROM sessions WHERE thread_id = ?1 AND incarnation = ?2",
+            rusqlite::params![b.0, bi],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(b_process, None);
+}

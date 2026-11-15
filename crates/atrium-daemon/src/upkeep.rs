@@ -2,7 +2,7 @@
 //! the storage watch and daily snapshots (contract §7), and posting
 //! notifications (contract §8).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -33,43 +33,58 @@ const RESTARTED: &str = "the daemon restarted";
 ///
 /// A closure that can't be stored fails the start: nothing is cleared, and
 /// the next start tries again.
-///
-/// Not covered: an archived thread whose session never ended. The store
-/// lists no archived threads (see the change requests); its requests are
-/// expired with the rest, its open items stay open.
 pub(crate) async fn recover(inner: &Arc<Inner>) -> Result<(), StartError> {
-    // What became of each thread's current incarnation's process.
-    let mut cleanups = HashMap::new();
-    let mut records = Vec::new();
+    let mut cleanups: HashMap<(ThreadId, u32), Cleanup> = HashMap::new();
+    let mut records: Vec<(ThreadId, u32)> = Vec::new();
     for (thread, incarnation, process) in inner.store.live_processes().await? {
         let cleanup = tokio::task::spawn_blocking(move || supervise::kill_recorded(&process))
             .await
             .unwrap_or(Cleanup::Unverified);
-        let current = inner
-            .store
-            .thread(&thread)
-            .await?
-            .is_some_and(|summary| summary.incarnation == incarnation);
-        if current {
-            cleanups.insert(thread.clone(), cleanup);
-            // An archived thread isn't in the list below.
-            close(inner, &thread, incarnation, cleanup).await?;
-        }
+        cleanups.insert((thread.clone(), incarnation), cleanup);
         records.push((thread, incarnation));
     }
+
+    let mut handled: HashSet<ThreadId> = HashSet::new();
+    for (thread, incarnation) in inner.store.unfinished_incarnations().await? {
+        let cleanup = match cleanups.get(&(thread.clone(), incarnation)).copied() {
+            Some(cleanup) => cleanup,
+            None => match inner.store.thread(&thread).await? {
+                Some(summary) => match summary.state {
+                    // Nothing was killed and an earlier failed recovery may have
+                    // already recorded `Unverified`.
+                    ThreadState::Starting => Cleanup::Unverified,
+                    ThreadState::Interrupted { cleanup } => cleanup,
+                    _ => Cleanup::Verified,
+                },
+                None => Cleanup::Verified,
+            },
+        };
+        close(inner, &thread, incarnation, cleanup).await?;
+        handled.insert(thread.clone());
+        // Finding 12: if an earlier recovery wrote `Signal::Recovered` (setting
+        // `ended_ms`) and failed closing, `live_processes` skipped this session;
+        // clear its process record too once closure succeeds.
+        if !cleanups.contains_key(&(thread.clone(), incarnation)) {
+            records.push((thread, incarnation));
+        }
+    }
+
+    // Threads that started an incarnation with zero events (e.g. hung while
+    // `Starting`) do not appear in `unfinished_incarnations`.
     for summary in inner.store.threads().await? {
-        if summary.incarnation == 0 || cleanups.contains_key(&summary.thread_id) {
+        if summary.incarnation == 0 || handled.contains(&summary.thread_id) {
             continue;
         }
-        let cleanup = match summary.state {
-            // A process may have been started and not yet recorded: nothing
-            // was killed, and nothing says it stopped.
-            ThreadState::Starting => Cleanup::Unverified,
-            _ => Cleanup::Verified,
-        };
-        close(inner, &summary.thread_id, summary.incarnation, cleanup).await?;
+        if summary.state == ThreadState::Starting {
+            let cleanup = cleanups
+                .get(&(summary.thread_id.clone(), summary.incarnation))
+                .copied()
+                .unwrap_or(Cleanup::Unverified);
+            close(inner, &summary.thread_id, summary.incarnation, cleanup).await?;
+        }
     }
-    // Only now: a start that failed above finds the records again.
+
+    // Only now: a start that failed above keeps the records for retry.
     for (thread, incarnation) in records {
         inner.store.set_process(&thread, incarnation, None).await?;
     }

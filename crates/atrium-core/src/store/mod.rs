@@ -387,6 +387,10 @@ impl Store for SqliteStore {
         self.shared.read(reader::live_processes)
     }
 
+    fn unfinished_incarnations(&self) -> BoxFuture<'_, StoreResult<Vec<(ThreadId, u32)>>> {
+        self.shared.read(reader::unfinished_incarnations)
+    }
+
     fn rules(&self) -> BoxFuture<'_, StoreResult<(u64, Vec<Rule>)>> {
         self.shared.read(reader::rules)
     }

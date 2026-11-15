@@ -204,6 +204,10 @@ pub trait Store: Send + Sync {
     /// Incarnations with a recorded process and no end: crash recovery.
     fn live_processes(&self) -> BoxFuture<'_, StoreResult<Vec<(ThreadId, u32, ProcessIdentity)>>>;
 
+    /// Every thread's current incarnation that has events and no `SessionEnded`,
+    /// archived or not (CR-10).
+    fn unfinished_incarnations(&self) -> BoxFuture<'_, StoreResult<Vec<(ThreadId, u32)>>>;
+
     fn rules(&self) -> BoxFuture<'_, StoreResult<(u64, Vec<Rule>)>>;
     fn create_rule(&self, rule: Rule) -> BoxFuture<'_, StoreResult<Rule>>;
     fn delete_rule(&self, rule: &RuleId) -> BoxFuture<'_, StoreResult<()>>;
