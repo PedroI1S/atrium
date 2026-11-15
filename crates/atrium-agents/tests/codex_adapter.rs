@@ -775,6 +775,83 @@ async fn question_and_queue_limit_round_trip() {
 }
 
 #[tokio::test]
+async fn decline_question_sends_empty_answers_and_continues_turn() {
+    let dir = scratch("decline-question");
+    let mut session = CodexAdapter::with_options(opts(&dir))
+        .start(config(&dir, "question", allow()), Transport::Local)
+        .await
+        .unwrap();
+    session.commands.send(say("ask")).await.unwrap();
+    let evs = next_matching(&mut session, 5, |e| {
+        matches!(e, AgentEvent::QuestionAsked { .. })
+    })
+    .await;
+    let req_id = evs
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::QuestionAsked { request_id, .. } => Some(request_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+    session
+        .commands
+        .send(SessionCommand::DeclineQuestion {
+            request_id: req_id.clone(),
+        })
+        .await
+        .unwrap();
+    let done = next_matching(&mut session, 5, |e| {
+        matches!(e, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+    assert!(done.iter().any(|e| matches!(
+        e,
+        AgentEvent::RequestResolved {
+            request_id,
+            outcome: RequestOutcome::Cancelled,
+        } if *request_id == req_id
+    )));
+    assert!(done.iter().any(|e| matches!(
+        e,
+        AgentEvent::TurnCompleted {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    )));
+
+    // Unknown request_id produces a non-fatal Error without failing the session.
+    session
+        .commands
+        .send(SessionCommand::DeclineQuestion {
+            request_id: "unknown-q".into(),
+        })
+        .await
+        .unwrap();
+    let err_evs = next_matching(&mut session, 5, |e| {
+        matches!(e, AgentEvent::Error { fatal: false, .. })
+    })
+    .await;
+    assert!(
+        err_evs
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { fatal: false, .. }))
+    );
+
+    let _ = shutdown(session).await;
+
+    let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
+    let reply: Value = wire
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v.get("id").and_then(Value::as_str) == Some("srv-q-1"))
+        .expect("question reply sent to fake server");
+    assert_eq!(reply["result"], serde_json::json!({ "answers": {} }));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn enforcement_inspects_user_dir_and_untested_version() {
     let dir = scratch("enforcement");
     let user_dir = dir.join("custom-codex");

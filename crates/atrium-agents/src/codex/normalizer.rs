@@ -1459,6 +1459,22 @@ impl CodexNormalizer {
                     }),
                 }
             }
+            SessionCommand::DeclineQuestion { request_id } => {
+                match self.take_pending(request_id, false) {
+                    Some(Pending::Question { native }) => {
+                        self.question_reqs.remove(&native);
+                        out.push(AgentEvent::RequestResolved {
+                            request_id: request_id.clone(),
+                            outcome: RequestOutcome::Cancelled,
+                        });
+                    }
+                    _ => out.push(AgentEvent::Error {
+                        message: format!("unknown request: {request_id}"),
+                        fatal: false,
+                        details: Vec::new(),
+                    }),
+                }
+            }
             SessionCommand::Interrupt => {
                 if self.turn_open {
                     self.interrupt_requested = true;

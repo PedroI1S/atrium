@@ -482,6 +482,66 @@ fn question_ticket_none_does_not_ask_client_and_some_asks() {
 }
 
 #[test]
+fn decline_question_resolves_cancelled_and_unknown_emits_non_fatal_error() {
+    let mut norm = CodexNormalizer::new();
+    init_seq(&mut norm);
+    let _ = norm.on_input(&AdapterInput::Command {
+        command: SessionCommand::SendUserMessage { text: "ask".into() },
+    });
+    let _ = norm.on_input(&AdapterInput::Stdout {
+        line: json!({ "method": "turn/started", "params": { "turn": { "id": "t1" } } }).to_string(),
+    });
+    let _ = norm.on_input(&AdapterInput::Stdout {
+        line: json!({
+            "id": "nq-decl",
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "questions": [{
+                    "id": "q-decl",
+                    "question": "Pick",
+                    "options": [{ "label": "A" }]
+                }]
+            }
+        })
+        .to_string(),
+    });
+    let asked = norm.on_input(&AdapterInput::QuestionTicket {
+        id: "nq-decl".into(),
+        ticket: Some(ApprovalTicket {
+            request_id: "qt-decl".into(),
+            rememberable: false,
+        }),
+    });
+    assert!(asked.iter().any(|e| matches!(
+        e,
+        AgentEvent::QuestionAsked { request_id, .. } if request_id == "qt-decl"
+    )));
+
+    let declined = norm.on_input(&AdapterInput::Command {
+        command: SessionCommand::DeclineQuestion {
+            request_id: "qt-decl".into(),
+        },
+    });
+    assert_eq!(
+        declined,
+        vec![AgentEvent::RequestResolved {
+            request_id: "qt-decl".into(),
+            outcome: RequestOutcome::Cancelled,
+        }]
+    );
+
+    let unknown = norm.on_input(&AdapterInput::Command {
+        command: SessionCommand::DeclineQuestion {
+            request_id: "qt-decl".into(),
+        },
+    });
+    assert!(matches!(
+        unknown.as_slice(),
+        [AgentEvent::Error { fatal: false, message, .. }] if message.contains("unknown request")
+    ));
+}
+
+#[test]
 fn plan_rate_limit_and_tool_subjects_map_cleanly() {
     let mut norm = CodexNormalizer::new();
     init_seq(&mut norm);

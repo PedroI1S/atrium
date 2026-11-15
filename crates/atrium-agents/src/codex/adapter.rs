@@ -1388,6 +1388,16 @@ impl Driver {
                     "result": payload,
                 }));
             }
+            SessionCommand::DeclineQuestion { request_id } => {
+                let Some(pending) = self.questions.remove(&request_id) else {
+                    return;
+                };
+                self.live.remove(&pending.native);
+                self.write_value(&json!({
+                    "id": pending.raw_id,
+                    "result": { "answers": {} },
+                }));
+            }
             SessionCommand::Interrupt => {
                 if self.norm.turn_in_flight() {
                     if let Some(tid) = self.norm.native_session_id().map(str::to_owned) {
