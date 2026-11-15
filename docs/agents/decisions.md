@@ -538,3 +538,5 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **Review: Gemini 4 Hydrogen `medium`, read-only**, with the numbers and screenshots (cross-provider, D-084).
 - **Added to the brief:** the Linux idle memory (M1-09a's shell 219–223 MiB, M1-09b 212–216 MiB private PSS, gate 150 MB) is part of L3: say where the memory goes and what is reachable.
 - **Not in this go:** batching events in `bridge.rs`, the §14 frame-statistic wording on Linux and the idle-memory gate itself: those stay open decisions; the worker brings numbers for them.
+
+*Update, same day (orchestrator):* `agy` on the host is now 1.5.9. Before the review, the hook check of `HANDOFF.md` was re-run with Hydrogen in a scratch worktree (`M1-00-hookcheck-1.5.9`, removed afterwards): `cargo --version` allowed, a write to `.agents/probe.txt` and `git push` denied by the hook, no file written; tool names `run_command` and `write_file`, both known to the policy. `scripts/doctor` names 1.5.9 as the tested version. A first review launch had started before the check; it was stopped within a minute, and its worktree was clean.
