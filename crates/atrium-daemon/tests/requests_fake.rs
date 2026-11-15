@@ -1,10 +1,12 @@
 use std::time::Duration;
 
 use atrium_protocol::agent::{
-    AgentEvent, ApprovalDecision, QuestionAnswer, RequestOutcome, SessionCommand, ToolStatus,
-    TurnOutcome,
+    AgentEvent, ApprovalDecision, QuestionAnswer, RequestOutcome, SessionCommand, ToolKind,
+    ToolStatus, TurnOutcome,
 };
-use atrium_protocol::policy::{RememberScope, Rule};
+use atrium_protocol::policy::{
+    RememberScope, Rule, RuleDecision, RuleDraft, RuleMatcher, RuleScope,
+};
 use atrium_protocol::thread::{ThreadId, ThreadState};
 use atrium_protocol::wire::{AgentLaunch, DaemonCommand, ErrorCode, StoredEvent};
 
@@ -157,6 +159,74 @@ async fn fake_approval_allow_and_deny() {
             error: Some(msg),
             ..
         } if msg == "nope"
+    )));
+
+    rig.stop(true).await;
+}
+
+#[tokio::test]
+async fn fake_approval_allow_redeems_through_gate() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+
+    let thread = wire
+        .start_thread(fake_with(60, Some(10), None), Some("redeem check"))
+        .await
+        .thread_id;
+
+    wire.thread_when(&thread, |s| s.state == ThreadState::NeedsApproval)
+        .await;
+    let req = latest_approval_id(&wire.history(&thread).await);
+
+    // Adding a matching deny rule while the approval is pending means Allow
+    // passes the ledger, but gate.redeem re-evaluates policy and refuses.
+    wire.ok(DaemonCommand::CreateRule {
+        rule: RuleDraft {
+            scope: RuleScope::Home,
+            tool_kind: ToolKind::Execute,
+            tool_name: Some("Bash".into()),
+            matcher: RuleMatcher::CommandExact {
+                argv: vec!["echo".into(), "synthetic".into()],
+            },
+            path_scope: None,
+            decision: RuleDecision::Deny,
+        },
+    })
+    .await;
+
+    wire.ok(DaemonCommand::ResolveApproval {
+        thread_id: thread.clone(),
+        incarnation: 1,
+        request_id: req.clone(),
+        decision: ApprovalDecision::Allow,
+        remember: None,
+    })
+    .await;
+
+    wire.thread_when(&thread, |s| s.state == ThreadState::Idle)
+        .await;
+    let history = wire.history(&thread).await;
+    assert!(history.iter().any(|e| matches!(
+        &e.envelope.event,
+        AgentEvent::RequestResolved {
+            request_id,
+            outcome: RequestOutcome::Approved,
+        } if request_id == &req
+    )));
+    assert!(history.iter().any(|e| matches!(
+        &e.envelope.event,
+        AgentEvent::ToolCallFinished {
+            status: ToolStatus::Denied,
+            error: Some(_),
+            ..
+        }
+    )));
+    assert!(!history.iter().any(|e| matches!(
+        &e.envelope.event,
+        AgentEvent::ToolCallFinished {
+            status: ToolStatus::Succeeded,
+            ..
+        }
     )));
 
     rig.stop(true).await;
