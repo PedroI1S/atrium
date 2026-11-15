@@ -8,6 +8,8 @@ export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in
 
 export interface StartupInfo {
   mainEpochMs: number;
+  /** Wall clock (ms since the epoch) at the native startup steps after `main`: `setupStart`, `bridgeStarted`, `windowBuilt`, `setupEnd`. */
+  startupMarks: Record<string, number>;
   label: string;
   /** The thread a pop-out shows; null in the main window. */
   popoutThread: string | null;
@@ -35,7 +37,7 @@ export async function startupInfo(): Promise<StartupInfo> {
   if (inTauri) return invoke<StartupInfo>("startup_info");
   const q = new URLSearchParams(location.search);
   return {
-    mainEpochMs: 0, label: MAIN, popoutThread: null, platform: "linux", debug: true, benchMode: q.get("bench"),
+    mainEpochMs: 0, startupMarks: {}, label: MAIN, popoutThread: null, platform: "linux", debug: true, benchMode: q.get("bench"),
     screen: q.get("screen"), panel: q.get("panel"), advanced: q.has("advanced"), openPalette: q.has("palette"), windows: 1,
     translucency: false, accessibilityOpaque: false, native: { vibrancy: false, dark: false, alpha: 1 }, hasTray: false, snapshot: null,
   };

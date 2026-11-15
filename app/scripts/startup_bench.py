@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
-"""Time to interactive and idle memory of the app shell, with contract §14's statistics.
+"""Time to interactive, the startup profile, idle memory and the cost of a pop-out, with
+contract §14's statistics.
 
-    python3 app/scripts/startup_bench.py [--runs 30] [--memory-launches 9]
+    python3 app/scripts/startup_bench.py [--runs 30] [--memory-launches 9] [--popout-launches 5]
+        [--only tti,memory,popout,breakdown] [--app PATH] [--env NAME=VALUE]… [--out FILE]
 
 Builds the app and the daemon with the workspace's `perf` profile (optimized like `release`,
-with debug assertions on), then, in a throwaway ATRIUM_HOME. Not `--release`: a release build
-ignores ATRIUM_HOME (`lifecycle::default_paths`), so it would use the user's real Atrium
+with debug assertions on), then works in a throwaway ATRIUM_HOME. Not `--release`: a release
+build ignores ATRIUM_HOME (`lifecycle::default_paths`), so it would use the user's real Atrium
 folders and leave its daemon running there, and a release daemon refuses every app until
-packaging gives it the app's identity ("no app identity is known"), so the app would be
-measured while it fails to connect. Then:
+packaging gives it the app's identity ("no app identity is known"). Then:
 
-  1. Cold start (warm launches): one warm-up launch, then `--runs` launches with
-     `ATRIUM_BENCH=startup-exit`; each reports `tti` (from `main` to the later of first
-     paint and first input), in ms. Gate (macOS): median < 400 ms and p90 < 450 ms.
-  2. Idle memory, one window: `--memory-launches` launches with `ATRIUM_BENCH=startup`,
-     each sampled at 1 Hz from 5 s to 65 s after TTI; per launch, the median of its
-     samples. Gate: every launch < 150 MB. The memory is the app's and its webview
-     processes': `phys_footprint` on macOS (`footprint`), private PSS on Linux (D-040).
+  1. tti: cold start (warm launches): one warm-up launch, then `--runs` launches with
+     `ATRIUM_BENCH=startup-exit`. Each reports `tti` (from `main` to the later of first paint and
+     first input) and the startup profile: the script's spawn time, Rust's marks, the webview's
+     navigation timing, boot.js, the bundle's start and each boot stage. Gate (macOS): median
+     < 400 ms and p90 < 450 ms; Linux is a goal (D-041). Median and p90 per phase are printed.
+  2. memory: idle, one window: `--memory-launches` launches with `ATRIUM_BENCH=startup`, each
+     sampled at 1 Hz from 5 s to 65 s after TTI; per launch, the median of its samples. Gate:
+     every launch < 150 MB. macOS: `phys_footprint` of the app and its WebKit processes. Linux
+     (D-040): **private PSS** (PSS without shared-library pages, `linuxmem.py`) summed over the
+     app and its WebKit processes, with full PSS, RSS, USS and GPU memory (DRM fdinfo) beside it,
+     and private PSS per process (UI, web, network, helpers).
+  3. popout (Linux): `--popout-launches` launches with `ATRIUM_BENCH=startup-popout`
+     (`app/src/popout-bench.ts`): the main window shows an idle thread, sampled 5–35 s; the
+     thread moves to its own window, sampled 5–35 s after it is ready. The cost of one pop-out
+     is the difference of the two medians, per launch (D-028: measured, not capped).
+  4. breakdown (Linux, diagnostic): one idle launch, and at 30 s after TTI the private PSS of
+     each process split by kind and by its largest mappings.
 
-The daemon is started by the app and left running between launches, as a user's would be.
-Run it on the machine's own desktop session: it opens windows.
+`--app` measures another binary (an A/B against a saved build; it is not rebuilt). `--env`
+sets a variable for every launch (an experiment, e.g. a WebKit setting). The daemon is
+started by the app and left running between launches, as a user's would be. Run it on the
+machine's own desktop session: it opens windows. Hold the GUI lock while it runs
+(`flock /tmp/atrium-gui-measure.lock python3 app/scripts/startup_bench.py`).
 """
 
 import argparse
@@ -35,10 +49,20 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import linuxmem  # noqa: E402
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 APP = ROOT / "target" / "perf" / "atrium"
 TIMEOUT_S = 60
 WEBKIT = re.compile(r"WebKit\.(WebContent|GPU|Networking)|WebKitWebProcess|WebKitNetworkProcess")
+LINUX = sys.platform.startswith("linux")
+GATE_MB = 150
+MIB_PER_MB = 1_000_000 / 1_048_576  # the budgets are in MB; the numbers are in MiB
+
+
+def mb(mib: float) -> float:
+    return mib / MIB_PER_MB
 
 
 def build() -> None:
@@ -49,55 +73,269 @@ def build() -> None:
     )
 
 
-def report_of(log: pathlib.Path, kind: str) -> dict | None:
+def reports(log: pathlib.Path) -> list[dict]:
+    out = []
     for line in log.read_text(errors="replace").splitlines():
         if line.startswith("ATRIUM_REPORT "):
             report = json.loads(line[len("ATRIUM_REPORT "):])
-            if report.get("kind") == kind:
-                return report
             if report.get("kind") == "failure":
-                raise SystemExit(f"the app failed; see {log}")
+                raise SystemExit(f"the app failed: {report}; log tail:\n{log.read_text(errors='replace')[-1500:]}")
+            out.append(report)
+    return out
+
+
+def launch(app: pathlib.Path, home: pathlib.Path, mode: str, log: pathlib.Path, extra_env: dict) -> tuple[subprocess.Popen, float]:
+    env = dict(os.environ, ATRIUM_HOME=str(home), ATRIUM_BENCH=mode, **extra_env)
+    out = open(log, "wb")
+    spawned = time.time() * 1000
+    return subprocess.Popen([str(app)], env=env, stdout=out, stderr=subprocess.STDOUT), spawned
+
+
+def wait_report(app: subprocess.Popen, log: pathlib.Path, kind: str, test=lambda r: True, timeout=TIMEOUT_S) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for report in reports(log):
+            if report.get("kind") == kind and test(report):
+                return report
+        if app.poll() is not None:
+            raise SystemExit(f"the app exited without a {kind} report; see {log}")
+        time.sleep(0.05)
+    raise SystemExit(f"timed out waiting for {kind}; see {log}")
+
+
+def stop_app(app: subprocess.Popen) -> None:
+    if app.poll() is None:
+        app.kill()
+    app.wait()
+
+
+# -- statistics -------------------------------------------------------------------------------
+
+def p90(values: list[float]) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, round(0.90 * (len(ordered) - 1)))]
+
+
+def median(values: list[float]) -> float:
+    return statistics.median(values)
+
+
+# -- the startup profile ----------------------------------------------------------------------
+
+def stage_at(report: dict, name: str) -> float | None:
+    for stage, at in report.get("profile", {}).get("stages", []):
+        if stage == name:
+            return at
     return None
 
 
-def launch(home: pathlib.Path, mode: str, log: pathlib.Path) -> subprocess.Popen:
-    env = dict(os.environ, ATRIUM_HOME=str(home), ATRIUM_BENCH=mode)
-    out = open(log, "wb")
-    return subprocess.Popen([str(APP)], env=env, stdout=out, stderr=subprocess.STDOUT)
+def phases(report: dict, spawned: float) -> dict[str, float]:
+    """Durations in ms, in boot order, from one startup report (None where a mark is missing)."""
+    p = report.get("profile", {})
+    native = p.get("native", {})
+    nav = p.get("navigation") or {}
+    main = report["mainEpochMs"]
+    points = [
+        ("spawn", spawned),
+        ("main", main),
+        ("setupStart", native.get("setupStart")),
+        ("bridgeStarted", native.get("bridgeStarted")),
+        ("windowBuilt", native.get("windowBuilt")),
+        ("navigationStart", p.get("timeOrigin")),
+        ("htmlLoaded", nav.get("responseEnd")),
+        ("bootJs", report.get("jsStart")),
+        ("moduleStart", p.get("moduleStart")),
+        ("bundleEvaluated", stage_at(report, "subscribe")),
+        ("subscribed", stage_at(report, "startup-info")),
+        ("startupInfo", stage_at(report, "render")),
+        ("mounted", report.get("mounted")),
+        ("firstPaint", report.get("firstPaint")),
+    ]
+    out: dict[str, float] = {}
+    for (a, ta), (b, tb) in zip(points, points[1:]):
+        out[f"{a} → {b}"] = tb - ta if ta is not None and tb is not None else None
+    # After mount, the boot stages before the harness's probe (attach … ready).
+    stages = p.get("stages", [])
+    for (a, ta), (b, tb) in zip(stages, stages[1:]):
+        if a in ("attach", "restore-windows", "after-mount", "native-paint", "ready"):
+            out[f"stage {a}"] = tb - ta
+    first_input = report.get("firstInput")
+    out["firstPaint → firstInput"] = first_input - report["firstPaint"] if first_input is not None else None
+    # The summary rows (cumulative from main, as M0's §2.4 table).
+    out["= spawn → main"] = main - spawned
+    out["= main → first JS (boot.js)"] = report["jsStart"] - main if report.get("jsStart") else None
+    out["= first JS → mounted"] = report["mounted"] - report["jsStart"] if report.get("jsStart") and report.get("mounted") else None
+    out["= main → first paint"] = report["firstPaint"] - main
+    out["= main → input handled"] = first_input - main if first_input is not None else None
+    out["= TTI (main → later of the two)"] = report["tti"]
+    out["= spawn → TTI"] = report["tti"] + main - spawned
+    return out
 
 
-def wait_report(app: subprocess.Popen, log: pathlib.Path) -> dict:
-    deadline = time.monotonic() + TIMEOUT_S
-    while time.monotonic() < deadline:
-        report = report_of(log, "startup")
-        if report is not None:
-            return report
-        if app.poll() is not None:
-            raise SystemExit(f"the app exited without a report; see {log}")
-        time.sleep(0.05)
-    raise SystemExit(f"timed out; see {log}")
+def print_phase_table(rows: list[dict[str, float]]) -> dict:
+    names = list(rows[0].keys())
+    summary = {}
+    print(f"  {'phase':44s} {'median':>8s} {'p90':>8s} {'min':>8s} {'max':>8s}")
+    for name in names:
+        values = [r[name] for r in rows if r.get(name) is not None]
+        if not values:
+            continue
+        summary[name] = {"median": median(values), "p90": p90(values), "min": min(values), "max": max(values)}
+        s = summary[name]
+        print(f"  {name:44s} {s['median']:8.1f} {s['p90']:8.1f} {s['min']:8.1f} {s['max']:8.1f}")
+    return summary
 
+
+# -- memory -----------------------------------------------------------------------------------
 
 def webkit_pids() -> set[int]:
     listing = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
     return {int(line.split(None, 1)[0]) for line in listing.splitlines() if WEBKIT.search(line)}
 
 
-def memory_mib(pid: int) -> float | None:
-    if sys.platform == "darwin":
-        out = subprocess.run(["footprint", "-p", str(pid)], capture_output=True, text=True).stdout
-        found = re.search(r"Footprint:\s+([\d.]+)\s*(KB|MB|GB)", out)
-        if not found:
-            return None
-        value, unit = float(found.group(1)), found.group(2)
-        return value / 1024 if unit == "KB" else value * 1024 if unit == "GB" else value
-    try:
-        rollup = pathlib.Path(f"/proc/{pid}/smaps_rollup").read_text()
-    except OSError:
+def footprint_mib(pid: int) -> float | None:
+    out = subprocess.run(["footprint", "-p", str(pid)], capture_output=True, text=True).stdout
+    found = re.search(r"Footprint:\s+([\d.]+)\s*(KB|MB|GB)", out)
+    if not found:
         return None
-    kib = sum(int(m.group(1)) for m in re.finditer(r"^Private_(?:Clean|Dirty):\s+(\d+) kB", rollup, re.M))
-    return kib / 1024
+    value, unit = float(found.group(1)), found.group(2)
+    return value / 1024 if unit == "KB" else value * 1024 if unit == "GB" else value
 
+
+def mem_sample(app_pid: int, mac_pids: list[int]) -> dict:
+    """One sample in MiB. Linux: D-040's private PSS and the numbers beside it. macOS: footprint."""
+    if not LINUX:
+        values = [footprint_mib(pid) for pid in [app_pid, *mac_pids]]
+        return {"budgeted": sum(v for v in values if v is not None)}
+    s = linuxmem.sample(app_pid)
+    t = s["total"]
+    row = {
+        "budgeted": linuxmem.mib(t["private_pss"]),
+        "pss": linuxmem.mib(t["pss"]), "rss": linuxmem.mib(t["rss"]), "uss": linuxmem.mib(t["uss"]),
+        "anon": linuxmem.mib(t["anon"]), "libDirty": linuxmem.mib(t["lib_dirty"]), "file": linuxmem.mib(t["file"]),
+        "shmem": linuxmem.mib(t["shmem"]), "libClean": linuxmem.mib(t["lib_clean"]),
+        "gpuResident": linuxmem.mib(s["gpu"]["resident"]) if s["gpu"] else None,
+        "gpuTotal": linuxmem.mib(s["gpu"]["total"]) if s["gpu"] else None,
+        "processes": s["processes"],
+    }
+    for role, values in s["roles"].items():
+        row[f"role:{role}"] = linuxmem.mib(values["private_pss"])
+    return row
+
+
+def sample_window(app_pid: int, mac_pids: list[int], seconds: int) -> list[dict]:
+    samples = []
+    for _ in range(seconds):
+        tick = time.monotonic()
+        samples.append(mem_sample(app_pid, mac_pids))
+        time.sleep(max(0.0, 1.0 - (time.monotonic() - tick)))
+    return samples
+
+
+def summarize(samples: list[dict]) -> dict:
+    """Median of every number over the samples, the budgeted number's max, and the longest run
+    of consecutive samples over the gate."""
+    keys = {k for s in samples for k, v in s.items() if isinstance(v, (int, float))}
+    out = {k: median([s[k] for s in samples if s.get(k) is not None]) for k in sorted(keys)}
+    out["max"] = max(s["budgeted"] for s in samples)
+    run = longest = 0
+    for s in samples:
+        run = run + 1 if mb(s["budgeted"]) > GATE_MB else 0
+        longest = max(longest, run)
+    out["longestOverGateS"] = longest
+    return out
+
+
+def mem_line(m: dict) -> str:
+    if not LINUX:
+        return f"footprint {m['budgeted']:.1f} MiB"
+    gpu = f"GPU resident {m['gpuResident']:.1f} / total {m['gpuTotal']:.1f}" if m.get("gpuResident") is not None else "GPU none"
+    roles = ", ".join(f"{k[5:]} {v:.1f}" for k, v in m.items() if k.startswith("role:"))
+    return (f"private PSS {m['budgeted']:.1f} MiB ({mb(m['budgeted']):.1f} MB) [{roles}]; "
+            f"PSS {m['pss']:.1f}, RSS {m['rss']:.1f}, USS {m['uss']:.1f}, {gpu}")
+
+
+def idle_launches(app_path, home, logs, n, extra_env) -> list[dict]:
+    launches = []
+    for run in range(n):
+        before = webkit_pids() if not LINUX else set()
+        log = logs / f"idle-{run}.log"
+        app, _ = launch(app_path, home, "startup", log, extra_env)
+        try:
+            wait_report(app, log, "startup")
+            time.sleep(5)
+            mac = sorted(webkit_pids() - before) if not LINUX else []
+            samples = sample_window(app.pid, mac, 61)
+            # The window must have been measured connected, as a user's is (see `main`).
+            daemon_up = bool(daemons_of(home))
+        finally:
+            stop_app(app)
+        summary = summarize(samples) | {"daemonRunning": daemon_up}
+        launches.append(summary)
+        print(f"  launch {run + 1}: median {mem_line(summary)}; max sample {summary['max']:.1f} MiB"
+              f"{'' if daemon_up else '; NO DAEMON RUNNING: the app was not connected'}")
+    return launches
+
+
+def popout_launches(app_path, home, logs, n, extra_env) -> list[dict]:
+    out = []
+    for run in range(n):
+        log = logs / f"popout-{run}.log"
+        app, _ = launch(app_path, home, "startup-popout", log, extra_env)
+        try:
+            wait_report(app, log, "startup")
+            wait_report(app, log, "popout-stage", lambda r: r["stage"] == "baseline")
+            time.sleep(5)
+            before = summarize(sample_window(app.pid, [], 31))
+            opened = wait_report(app, log, "popout-stage", lambda r: r["stage"] == "open", timeout=90)
+            time.sleep(5)
+            after = summarize(sample_window(app.pid, [], 31))
+        finally:
+            stop_app(app)
+        # A role present on one side only (GTK's SVG loader exits while the baseline is sampled)
+        # counts as 0 on the other, so the per-role deltas add up to the total.
+        keys = [k for k in after if k in before] + sorted(
+            k for k in set(before) ^ set(after) if k.startswith("role:"))
+        delta = {k: after.get(k, 0.0) - before.get(k, 0.0) for k in keys
+                 if isinstance(after.get(k, before.get(k)), (int, float)) and k != "longestOverGateS"}
+        out.append({"before": before, "after": after, "delta": delta, "readyMs": opened.get("readyMs")})
+        roles = ", ".join(f"{k[5:]} {v:+.1f}" for k, v in delta.items() if k.startswith("role:"))
+        gpu = f", GPU resident {delta['gpuResident']:+.1f}" if "gpuResident" in delta else ""
+        print(f"  launch {run + 1}: one window {before['budgeted']:.1f} → with a pop-out {after['budgeted']:.1f} MiB: "
+              f"private PSS {delta['budgeted']:+.1f} MiB [{roles}], PSS {delta.get('pss', 0):+.1f}, RSS {delta.get('rss', 0):+.1f}{gpu}; "
+              f"pop-out ready {opened.get('readyMs', 0):.0f} ms after it was asked for")
+    return out
+
+
+def breakdown(app_path, home, logs, extra_env, top=12) -> dict:
+    log = logs / "breakdown.log"
+    app, _ = launch(app_path, home, "startup", log, extra_env)
+    result = {}
+    try:
+        wait_report(app, log, "startup")
+        time.sleep(30)
+        for pid in linuxmem.app_tree(app.pid):
+            names: dict = {}
+            mem = linuxmem.smaps_kb(pid, names)
+            if mem is None:
+                continue
+            role = linuxmem.role_of(linuxmem.exe_name(pid))
+            biggest = sorted(names.items(), key=lambda kv: -kv[1])[:top]
+            result[f"{role} {pid}"] = {"kinds": {k: linuxmem.mib(v) for k, v in mem.items()},
+                                       "top": [(n, linuxmem.mib(v)) for n, v in biggest]}
+            kinds = ", ".join(f"{k} {linuxmem.mib(v):.1f}" for k, v in mem.items())
+            print(f"  {role} ({linuxmem.exe_name(pid)}, pid {pid}): {kinds}")
+            for name, kb in biggest:
+                print(f"      {linuxmem.mib(kb):7.1f} MiB  {name}")
+        gpu = linuxmem.gpu_kb(linuxmem.app_tree(app.pid))
+        print(f"  GPU (DRM fdinfo): {({k: round(linuxmem.mib(v), 1) for k, v in gpu.items()}) if gpu else 'none'}")
+        result["gpu"] = gpu
+    finally:
+        stop_app(app)
+    return result
+
+
+# -- the daemon -------------------------------------------------------------------------------
 
 def daemons_of(home: pathlib.Path) -> set[int]:
     """Every `atriumd` of this run: the one in the lock file and, on Linux, any whose
@@ -140,69 +378,104 @@ def stop_daemon(home: pathlib.Path) -> None:
         time.sleep(1)
 
 
+# -- conditions -------------------------------------------------------------------------------
+
+def conditions() -> str:
+    load = " ".join(f"{v:.2f}" for v in os.getloadavg())
+    busiest = subprocess.run(["ps", "-eo", "pcpu=,comm=", "--sort=-pcpu"], capture_output=True, text=True).stdout.splitlines()[:5]
+    return f"load average {load}; busiest: " + "; ".join(" ".join(line.split()) for line in busiest)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=30)
     parser.add_argument("--memory-launches", type=int, default=9)
+    parser.add_argument("--popout-launches", type=int, default=5)
+    parser.add_argument("--only", default="tti,memory,popout" if LINUX else "tti,memory")
+    parser.add_argument("--app", type=pathlib.Path, help="measure this binary instead of building")
+    parser.add_argument("--env", action="append", default=[], help="NAME=VALUE for every launch")
+    parser.add_argument("--out", type=pathlib.Path, help="write every number as JSON here")
     args = parser.parse_args()
-    build()
-    home = pathlib.Path(tempfile.mkdtemp(prefix="atrium-bench-", dir="/tmp"))
-    home.chmod(0o700)
-    logs = home / "logs"
+    parts = set(args.only.split(","))
+    extra_env = dict(item.split("=", 1) for item in args.env)
+    app_path = args.app or APP
+    if args.app is None:
+        build()
+    print(f"binary {app_path}; extra env {extra_env or 'none'}")
+    print(f"at start: {conditions()}")
+    # The bench's own logs stay out of ATRIUM_HOME: a `logs` folder made there with the default
+    # mode (0755) is the daemon's log folder, and the daemon then doesn't start at all (silently),
+    # so the app was measured while it retried the connection (found by M1-14b).
+    work = pathlib.Path(tempfile.mkdtemp(prefix="atrium-bench-", dir="/tmp"))
+    home = work / "home"
+    home.mkdir(mode=0o700)
+    logs = work / "bench-logs"
     logs.mkdir()
+    result: dict = {"kind": "startup-bench", "binary": str(app_path), "env": extra_env, "startConditions": conditions()}
     try:
-        ttis = []
-        for run in range(args.runs + 1):
-            log = logs / f"tti-{run}.log"
-            app = launch(home, "startup-exit", log)
-            report = wait_report(app, log)
-            try:
-                app.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                app.kill()
-                app.wait()
-            if run > 0:  # run 0 is the warm-up
-                ttis.append(report["tti"])
-        ttis.sort()
-        p90 = ttis[min(len(ttis) - 1, round(0.90 * (len(ttis) - 1)))]
-        tti_pass = statistics.median(ttis) < 400 and p90 < 450
-        print(f"TTI over {len(ttis)} warm launches: median {statistics.median(ttis):.0f} ms, "
-              f"p90 {p90:.0f} ms, min {ttis[0]:.0f}, max {ttis[-1]:.0f} "
-              f"({'within' if tti_pass else 'OVER'} the macOS gate)")
+        if "tti" in parts:
+            ttis, rows, raw = [], [], []
+            for run in range(args.runs + 1):
+                log = logs / f"tti-{run}.log"
+                app, spawned = launch(app_path, home, "startup-exit", log, extra_env)
+                report = wait_report(app, log, "startup")
+                try:
+                    app.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    stop_app(app)
+                if run > 0:  # run 0 is the warm-up
+                    ttis.append(report["tti"])
+                    rows.append(phases(report, spawned))
+                    raw.append(report | {"spawnEpochMs": spawned})
+            tti_pass = median(ttis) < 400 and p90(ttis) < 450
+            print(f"TTI over {len(ttis)} warm launches: median {median(ttis):.0f} ms, p90 {p90(ttis):.0f} ms, "
+                  f"min {min(ttis):.0f}, max {max(ttis):.0f} ({'within' if tti_pass else 'OVER'} the macOS gate"
+                  f"{'; a goal on Linux, D-041' if LINUX else ''})")
+            print("Startup profile (ms):")
+            result.update(ttiMs=ttis, ttiPass=tti_pass, phases=print_phase_table(rows), phaseRows=rows, reports=raw)
 
-        launches = []
-        for run in range(args.memory_launches):
-            before = webkit_pids()
-            log = logs / f"idle-{run}.log"
-            app = launch(home, "startup", log)
-            try:
-                wait_report(app, log)
-                time.sleep(5)
-                ours = sorted(webkit_pids() - before)
-                samples = []
-                for _ in range(61):
-                    tick = time.monotonic()
-                    values = [memory_mib(pid) for pid in [app.pid, *ours]]
-                    samples.append(sum(v for v in values if v is not None))
-                    time.sleep(max(0.0, 1.0 - (time.monotonic() - tick)))
-            finally:
-                app.kill()
-                app.wait()
-            launches.append({"median": statistics.median(samples), "max": max(samples), "webkitProcesses": len(ours)})
-            print(f"  launch {run + 1}: median {launches[-1]['median']:.1f} MiB, max {launches[-1]['max']:.1f} MiB, "
-                  f"{len(ours)} webview processes")
-        kind = "phys_footprint" if sys.platform == "darwin" else "private PSS"
-        memory_pass = all(launch["median"] < 150 for launch in launches)
-        print(f"Idle memory ({kind}), {len(launches)} launches: worst median "
-              f"{max(l['median'] for l in launches):.1f} MiB, worst sample {max(l['max'] for l in launches):.1f} MiB "
-              f"({'within' if memory_pass else 'OVER'} the gate)")
-        print(json.dumps({"kind": "startup-bench", "ttiMs": ttis, "ttiPass": tti_pass,
-                          "memory": launches, "memoryPass": memory_pass}))
+        if "memory" in parts:
+            kind = "phys_footprint" if not LINUX else "private PSS (D-040)"
+            print(f"Idle memory, one window, {args.memory_launches} launches (median of 1 Hz samples 5–65 s after TTI):")
+            launches = idle_launches(app_path, home, logs, args.memory_launches, extra_env)
+            memory_pass = all(mb(m["budgeted"]) < GATE_MB for m in launches)
+            worst = max(m["budgeted"] for m in launches)
+            print(f"Idle memory ({kind}): per-launch medians {min(m['budgeted'] for m in launches):.1f}–{worst:.1f} MiB "
+                  f"({mb(worst):.1f} MB at worst), worst sample {max(m['max'] for m in launches):.1f} MiB, "
+                  f"longest run over {GATE_MB} MB {max(m['longestOverGateS'] for m in launches)} s "
+                  f"({'within' if memory_pass else 'OVER'} the gate of {GATE_MB} MB)")
+            result.update(memory=launches, memoryPass=memory_pass)
+
+        if "popout" in parts and LINUX:
+            print(f"One pop-out, {args.popout_launches} launches (medians of 1 Hz samples, 5–35 s, before and after):")
+            pops = popout_launches(app_path, home, logs, args.popout_launches, extra_env)
+            costs = [p["delta"]["budgeted"] for p in pops]
+            print(f"Cost of one pop-out (private PSS): median {median(costs):.1f} MiB (min {min(costs):.1f}, max {max(costs):.1f}); "
+                  f"PSS {median([p['delta']['pss'] for p in pops]):.1f}, RSS {median([p['delta']['rss'] for p in pops]):.1f}"
+                  + (f", GPU resident {median([p['delta']['gpuResident'] for p in pops]):.1f}" if all('gpuResident' in p['delta'] for p in pops) else "")
+                  + " MiB (medians)")
+            result.update(popout=pops)
+
+        if "breakdown" in parts and LINUX:
+            print("Breakdown of one idle launch at 30 s after TTI (MiB; `top` is each mapping's counted PSS):")
+            result.update(breakdown=breakdown(app_path, home, logs, extra_env))
+
+        result["endConditions"] = conditions()
+        print(f"at end: {result['endConditions']}")
+        if args.out:
+            args.out.write_text(json.dumps(result, indent=1))
+        print(json.dumps({k: result[k] for k in ("kind", "ttiPass", "memoryPass") if k in result}))
         return 0
     finally:
         stop_daemon(home)
         time.sleep(0.5)
-        shutil.rmtree(home, ignore_errors=True)
+        if sys.exc_info()[0] is not None:
+            # A failed run keeps its logs (the app's and the daemon's) to look at.
+            kept = pathlib.Path(tempfile.mkdtemp(prefix="atrium-bench-failed-", dir="/tmp"))
+            for log in [*logs.glob("*.log"), *(home / "logs").glob("*")]:
+                shutil.copy(log, kept)
+            print(f"logs kept in {kept}", file=sys.stderr)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":

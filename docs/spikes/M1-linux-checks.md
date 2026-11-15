@@ -161,4 +161,174 @@ store file: 838 MiB
 
 ## App (M1-14b)
 
-(Empty on purpose: the app's checks are M1-14b.)
+Branch `agent/opus/M1-14b-linux-app`, 2026-11-15, Claude Opus 5.5. Same machine as above: Intel Core Ultra 7 258V (8 cores), Intel Arc 140V (`xe`), 30 GB; CachyOS, kernel 7.3.3-1-cachyos; GNOME Shell 51.1 on Wayland; webkit2gtk-4.1 2.54.2, GTK 3.24.52, Mesa 26.2.6; one monitor, HDMI-1 2560×1440 at 143.87 Hz. **On battery** (47 %, no charger), `balanced` power profile. cargo 1.99.1, node 26.13.0, pnpm 12.17.0. Every build and run was on the host through `distrobox-host-exec`, every GUI run under `flock /tmp/atrium-gui-measure.lock`, with no build running at the same time. Nothing else heavy ran: each run prints the load average and the busiest processes at its start and end (load 1.6–2.3 for the main bench, 3–4.4 for the interleaved A/B batches, which launch the app back to back; once `snapperd` at 10 % CPU). No other worker ran on the machine.
+
+Builds: the workspace's `perf` profile (`release` optimizations with debug assertions), as M1-09b chose: a `--release` build ignores `ATRIUM_HOME` and a release daemon refuses the app until packaging (see `startup_bench.py`). The harness scripts' raw outputs are in `.orchestration/m1-14b/` in the worktree (git-ignored). A/B runs measured saved copies of each build (`startup_bench.py --app`), with `atriumd` beside them, launched in turn (interleaved) so load drift falls on all of them alike.
+
+### Harness fixes (L2), found while making the numbers real
+
+1. **The idle number was USS, not D-040's private PSS.** `startup_bench.py` summed `Private_Clean + Private_Dirty` from `smaps_rollup`: that leaves out shared anonymous pages and counts private pages of shared libraries. D-040 budgets PSS without shared-library pages. `app/scripts/linuxmem.py` (tested, `test_linuxmem.py`) now reads `/proc/<pid>/smaps` per mapping: a `*.so` mapping's clean pages are left out, its dirty pages (relocations, written `.data`: the process's own copy-on-write memory) count; every other mapping counts at its PSS. So `private PSS = PSS − clean shared-library pages`. The stricter reading of M0's §2.5 table (every page of a library mapping left out) is `private PSS − library dirty pages`, also printed. On this machine the old number (USS, 207–208 MiB) is 56 MiB above D-040's (151–152 MiB).
+2. **Every earlier Linux run of `startup_bench.py` measured an app that never connected.** The script made its `logs` folder inside `ATRIUM_HOME` with mode 0755; that is the daemon's own log folder, and `atriumd` then exits at once, **without writing anything** (no log, no message). The app retried the connection for the whole run. M1-09a's and M1-09b's Linux idle numbers (219–223, 212–216 MiB) come from that state. The bench's logs now live beside `ATRIUM_HOME`, and each idle launch checks that a daemon ran (all 9 did). A daemon that exits silently on a folder mode is worth a look by the daemon's owner (not in this task's paths).
+3. The gate is 150 **MB**; the numbers are MiB. The script now prints both and compares in MB (150 MB = 143.05 MiB). M1-09a's macOS run compared MiB with 150.
+4. Also new in the script: GPU memory from DRM fdinfo (deduplicated by DRM client, memory regions only, as M0's `linuxproc.py`), full PSS, RSS and USS beside private PSS, private PSS per process (UI, web, network, helpers), the longest run of samples over the gate, the cost of one pop-out (`--only popout`), a per-mapping breakdown (`--only breakdown`), `--app` (measure a saved binary) and `--env` (an experiment). `stream_bench.py` reads the same private PSS and adds the GPU peak. The app's processes are found as the app's process tree minus the daemon, not by name (a name match also caught other apps' WebKit processes).
+
+Commands: `python3 app/scripts/startup_bench.py` (TTI, idle memory, pop-out), `python3 app/scripts/startup_bench.py --only breakdown`, `python3 app/scripts/webkit_floor.py`, each under `flock /tmp/atrium-gui-measure.lock`.
+
+### Idle memory, one window (contract §14; D-040, D-085)
+
+9 launches, per launch the median of 1 Hz samples from 5 s to 65 s after TTI, daemon connected in all 9 (`startup_bench.py`; the app as of `abb37ad`, unchanged since; the bench as of `7bea6da`):
+
+| MiB (9 launches) | min | median | max |
+|---|---:|---:|---:|
+| **private PSS (D-040, budgeted)** | **151.4** | **151.7** | **152.5** |
+| = in MB | 158.7 | 159.1 | 160.0 |
+| per process: UI (`atrium`) | 59.6 | 60.5 | 60.8 |
+| per process: web (`WebKitWebProcess`) | 69.0 | 69.4 | 69.6 |
+| per process: network (`WebKitNetworkProcess`) | 22.2 | 22.2 | 22.3 |
+| per process: helpers (`glycin-svg` in `bwrap`: GTK's sandboxed SVG loader) | 4.3 | 4.4 | 4.4 |
+| by kind: anonymous (heap, `WKFastMalloc`, JS heaps, stacks) | 111.9 | 112.5 | 113.0 |
+| by kind: shared libraries' dirty pages (relocations, `.data`) | 27.1 | 27.1 | 27.1 |
+| by kind: other files (the `atrium` binary, caches, fonts) | 12.1 | 12.4 | 12.5 |
+| left out: shared libraries' clean pages | 124.0 | 124.1 | 124.3 |
+| full PSS | 275.4 | 276.0 | 276.8 |
+| RSS (summed) | 453.5 | 454.2 | 455.2 |
+| USS (the old harness number) | 207.2 | 208.0 | 208.5 |
+| GPU, DRM fdinfo, resident = total | 114.6 | 114.6 | 120.6 |
+| each launch's max sample (the first seconds) | 165.4 | 165.8 | 167.8 |
+
+**Gate: every launch < 150 MB. Missed: 158.7–160.0 MB, by 9–10 MB (8.4–9.5 MiB).** Every sample of every launch is over 150 MB (61 of 61), so this is a steady level, not an excursion. Escalated (brief: "the idle budget is missed"); the decision is the drivers' (D-085).
+
+**Where it goes** (one idle launch at 30 s, `--only breakdown`; each mapping's counted PSS, MiB):
+- UI process 61.0: `[heap]` 18.8 (glibc malloc: Rust, GTK/GLib, WebKit's UI side), `WKFastMalloc` 12.4 (WebKit's allocator in the UI process), the `atrium` binary's own pages 7.9 (a 14.6 MB executable), other anonymous 6.1, `libwebkit2gtk` dirty 3.1, JavaScriptCore's JIT and structure heaps 3.5 (in the UI process), Mesa (`libgallium` 1.6, `libLLVM` 1.3: the UI process sets up EGL to show the web process's DMA-BUF frames).
+- Web process 70.4: `WKFastMalloc` 26.6, other anonymous 17.6, `[heap]` 5.7, JS gigacage 3.5, JS structure and JIT 4.0, `libwebkit2gtk` dirty 3.1, Mesa 2.9, Mesa's shader cache index 1.3.
+- Network process 22.2: `WKFastMalloc` 11.9, `libwebkit2gtk` dirty 3.1, JIT 2.0.
+
+**What is WebKitGTK's and what is Atrium's.** `app/scripts/webkit_floor.py` opens one plain WebKitWebView (same library, same window size) and samples it the same way (3 launches each, medians):
+
+| private PSS, MiB | UI | web | network | helpers | total | GPU |
+|---|---:|---:|---:|---:|---:|---:|
+| **WebKitGTK's MiniBrowser (C, GTK 3), `about:blank`** | 51.2 | 46.6 | 22.3 | 4.4 | **124.5** (130.5 MB) | 82.3 |
+| PyGObject window, `about:blank` | 72.1 (Python) | 45.6–47.6 | 22.3 | 4.3 | 144.3–146.2 | 98.2 |
+| PyGObject window, one paragraph of text | 72.0–74.2 | 45.9 | 22.3 | 4.3–4.4 | 144.6–146.6 | 108.4 |
+| PyGObject window, Atrium's built page in browser mode (no Tauri, no daemon, empty shell) | 72.0–72.2 | 62.6–64.7 | 20.1–21.7 | 4.4 | 159.6–162.9 | 126.0 |
+| **Atrium** (above) | 60.5 | 69.4 | 22.2 | 4.4 | **151.7** | 114.6 |
+
+- **WebKitGTK's floor for one window on this machine is about 124.5 MiB (130.5 MB)**: a blank page in WebKitGTK's own browser. The network process (22 MiB) and the sandboxed SVG loader (4.4 MiB) are entirely WebKitGTK's and GTK's; Atrium's are the same size.
+- **Atrium adds about 27 MiB over that floor**: about 9 MiB in the UI process (60.5 against MiniBrowser's 51.2: the Rust binary's own pages are 7.9 of it) and about 23 MiB in the web process (69.4 against 46.6). Of the web process's 23, the page alone costs about 17 (Atrium's page in a plain WebKitGTK view, no Tauri: 62.6–64.7), and running inside Tauri with the daemon's state about 6 more.
+- The gate leaves Atrium 18.5 MiB above MiniBrowser's floor (143.05 − 124.5); it uses 27. **It needs about 9 MiB less** to pass on this machine.
+
+**What changes could reach (measured where tried):**
+
+| Change | Private PSS, MiB (launches) | Effect | Cost |
+|---|---|---|---|
+| none (above) | 151.4–152.5 (9) | — | — |
+| `WEBKIT_DISABLE_DMABUF_RENDERER=1` | **135.9–138.1 (3)**, 142.5–144.8 MB | −14 (web −12, UI −2.5); GPU 114.6 → 5.6 | **Streaming collapses** (below: 19.8 % long frames, p99 115 ms) and TTI +75 ms (471 vs 396, interleaved). Not usable. |
+| `WEBKIT_DISABLE_COMPOSITING_MODE=1` | 151.0–151.8 (3) | none; GPU 130.7 | TTI 397 / 413 (not interleaved; head 377 / 391 an hour earlier) |
+| `MALLOC_ARENA_MAX=2` | 151.0–153.5 (3) | none | — |
+| Size-optimised binary (`opt-level = "s"`, `lto = "fat"`, `codegen-units = 1` through `CARGO_PROFILE_PERF_*`; 7.8 MB instead of 14.6) | 149.5–149.7 (3), against 151.7–153.0 for head in the same interleaved batch (3) | **−2.5** (UI process only: 57.9 vs 58.7–60.7) | TTI 394 / 410 vs 386 / 404 (20 each, interleaved): no difference beyond noise. A profile change in `Cargo.toml` (not this task's paths); slower release builds |
+| Atrium's page without its web fonts (in a plain WebKitGTK view) | web process 61.1–63.0 vs 66.0–66.1 (2 each) | −3 to −5 | not a proposal: the design's fonts |
+
+Not tried, with what the numbers say about them: the page with the CSS and none of the app (11 elements, a 97 kB bundle) costs 48.3–49.9 MiB in the web process of a plain view, against 66.0 with the app and 45.6–47.6 for a blank page, so the app's JavaScript and DOM are about 17 MiB of it; lazy-loading what an idle window doesn't show (Settings, the inbox cards, markdown, the chat view) would cut an unknown part of that. The 6 MiB of Tauri and daemon state in the web process and the UI process's glibc heap (18.8, shared with GTK and WebKit) were not split further. The measured Atrium-side savings add up to about 2.5 MiB (the binary); none reaches 9 MiB alone. **My reading: no single change I measured gets one window under 150 MB on WebKitGTK 2.54; it needs about 9 MiB of Atrium's 27, which is a size project (the binary, a lazily loaded bundle, less state in the web process), not a fix. The drivers decide** whether the Linux gate moves (for example to "floor + N", with MiniBrowser's floor measured on the same machine) or stays and becomes a project.
+
+### Cost of one pop-out (D-028, D-040: measured, not capped)
+
+`startup_bench.py --only popout`, 5 launches. The main window shows an idle thread (the fake agent, 1 s of text, then idle), sampled 5–35 s; the thread moves to its own window, sampled 5–35 s after the window reports ready; the cost is the difference of the medians.
+
+| MiB, 5 launches | median | min | max |
+|---|---:|---:|---:|
+| **private PSS added by one pop-out** | **66.9** | 64.2 | 69.8 |
+| of which: a second `WebKitWebProcess` | 66.5 | 63.9 | 69.0 |
+| of which: UI process | 4.9 | 4.5 | 5.0 |
+| of which: network process | −0.2 | −0.2 | 0.0 |
+| of which: GTK's SVG loader (exits during the run) | −4.3 | −4.4 | −4.3 |
+| full PSS | 69.9 | 67.0 | 72.6 |
+| RSS | 201.8 | 199.4 | 204.8 |
+| GPU resident | 68.2 | 64.2 | 70.4 |
+| the pop-out ready after it was asked for | 229 ms | 228 | 231 |
+
+**The 66.9 is the change in the total, and it is about 4.3 MiB low:** in all five launches GTK's sandboxed SVG loader (`glycin-svg`) was alive in the baseline and had exited by the second sample, so the pop-out's own cost (UI + web + network) is **71.2 MiB** (median; 68.5–74.0) (orchestrator, from `bench-1.json`, after the review; `startup_bench.py` now prints the helper's row). Each window gets its own web process; the network process is shared. One window showing a thread (the pop-out baseline) is 158.6–162.7 MiB, against 151.7 idle. M0 measured ~75 MB of PSS and ~88 MB of GPU per pop-out; macOS's budget is ~35 MB (D-028).
+
+### Startup profile (L3; D-041)
+
+`startup_bench.py`, 30 warm launches (one warm-up discarded), `ATRIUM_BENCH=startup-exit`. New marks (all wall-clock ms since the epoch, a clock read each): the script's spawn time; Rust's `setupStart`, `bridgeStarted`, `windowBuilt`, `setupEnd` (`app/src-tauri/src/lib.rs`, the measurement hook the brief allows; there was none); the webview's navigation timing (`performance.timeOrigin`, the document's `responseEnd`); `boot.js`; the bundle's first module (`app/src/startup-mark.ts`); the start of every boot stage (`setStage`, already there); mount; first paint (the second animation frame after mount, unchanged); input handled. TTI is unchanged: from `main` to the later of first paint and the handled probe key. The marks cost nothing measurable (head 396 ms vs the build without them 402 ms, interleaved, 30 each).
+
+Load average 2.0 at start, 1.6 at the end:
+
+| phase (ms) | median | p90 | min | max | whose |
+|---|---:|---:|---:|---:|---|
+| spawn → `main` | 30 | 40 | 23 | 43 | the loader and the libraries' constructors (`LD_DEBUG=statistics`: relocation 2–3 ms of it) |
+| `main` → `setup` | 35 | 41 | 33 | 44 | Tauri and GTK start |
+| `setup` → bridge started | 0 | 0 | 0 | 1 | Atrium |
+| bridge started → main window built | 115 | 122 | 100 | 132 | wry/WebKitGTK: window, web context, web view |
+| window built → navigation start | 86 | 91 | 74 | 96 | the web process starting (DMA-BUF renderer set-up included) |
+| navigation → HTML loaded | 3 | 3 | 2 | 3 | |
+| HTML → `boot.js` | 11 | 14 | 0 | 15 | parsing, the stylesheet |
+| `boot.js` → bundle starts | 10 | 11 | 9 | 12 | fetching and compiling the 273 kB bundle |
+| bundle evaluated | 2 | 2 | 1 | 2 | Atrium |
+| subscribe (3 `listen` calls) | 12 | 19 | 8 | 20 | Atrium + Tauri IPC |
+| `startup_info` | 4 | 5 | 3 | 7 | Atrium + Tauri IPC |
+| render → mounted | 8 | 9 | 7 | 11 | Atrium (SolidJS) |
+| **mounted → first paint** | **88** | **96** | 82 | 106 | style, layout and fonts (below) |
+| first paint → input handled | 0 | 1 | 0 | 1 | |
+| **= `main` → first JS (`boot.js`)** | **252** | 257 | 233 | 266 | |
+| **= first JS → mounted** | **35** | 42 | 31 | 44 | |
+| **= `main` → first paint** | **376** | 391 | 350 | 405 | |
+| **= TTI (`main` → later of the two)** | **377** | **391** | 350 | 405 | |
+| = spawn → TTI | 406 | 424 | 381 | 434 | |
+
+Against M0's §2.4 (TTI 472 ms from exec, main → JS 212, JS → mounted 143): JS → mounted is now 35 ms (the shell paints from one startup call), and the pre-JS block is larger (252) because the window and the web process start in it; M0's harness also measured from exec, M1's from `main` (about 30 ms later).
+
+The same TTI depends on the load: interleaved runs at load 3.3–4.4 gave a median of 396–402 ms and p90 425–441 ms for the same build (below); M1-09b measured 513 ms at load 7.4.
+
+**Which phase can be shortened, and by what.**
+- **Mounted → first paint (88 ms): the fonts. Fix measured: preload the five bundled fonts in `app/index.html`.** Bisected in a plain WebKitGTK view (`webkit_floor.py --seconds 0`, first contentful paint from navigation start, 15 launches each, interleaved): the shell is 108 elements and 12 SVGs; without the CSS it paints at 37 ms, with the CSS and no app DOM at 27 ms, with both at 97–110 ms. Shadows, border radii and the SVGs don't matter (±5 ms). The fonts do: one generic family for everything 55 ms; without the macOS-only names 90; the web fonts with generic fallbacks only 77. WebKitGTK meets the first layout with the web fonts still loading and resolves each family's fallback stack through fontconfig first. **With the fonts preloaded in `<head>`, first paint is at 49–52 ms instead of 105–110.** In the app (30 launches each, interleaved, load 3.3–4.4):
+
+  | build | TTI median | TTI p90 | mounted → first paint | spawn → TTI |
+  |---|---:|---:|---:|---:|
+  | head | 402 | 425 | 100 | 438 |
+  | **fonts preloaded in `index.html`** | **345** | **362** | **34** | **374** |
+  | fonts preloaded from the bundle (`<link rel=preload>` added by the first module) | 405 | 429 | 100 | 438 |
+  | no web fonts at all | 393 | 410 | 91 | 429 |
+  | the daemon attach moved after the first paint | 404 | 432 | 99 | 437 |
+
+  **−57 ms median, −63 ms p90.** Preloading from the bundle starts the loads about 20 ms later and gains nothing: it must be in the document's `<head>`. The change is five lines in `app/index.html`, which is not in this task's paths, so it is **not landed**; Vite rewrites the paths to the same hashed assets the CSS uses (checked: same five files, no duplicate):
+
+  ```html
+  <link rel="preload" href="./node_modules/@fontsource/instrument-sans/files/instrument-sans-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="./node_modules/@fontsource/instrument-sans/files/instrument-sans-latin-500-normal.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="./node_modules/@fontsource/instrument-sans/files/instrument-sans-latin-600-normal.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="./node_modules/@fontsource/geist-mono/files/geist-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="./node_modules/@fontsource/geist-mono/files/geist-mono-latin-500-normal.woff2" as="font" type="font/woff2" crossorigin />
+  ```
+  (before `<script src="/boot.js">`). Low risk: 71 kB of fonts the page loads anyway, earlier. Unmeasured on macOS. Dropping the macOS-only names from the theme's font stacks on Linux (`-apple-system`, `BlinkMacSystemFont`, `SF Mono`, `Menlo`) would save a further few ms where a fallback is still resolved; that is a theme file, not measured in the app.
+- **Window built (115 ms) and the web process start (86 ms): WebKitGTK's.** `WEBKIT_DISABLE_DMABUF_RENDERER=1` makes the web process start 50 ms sooner but the first frame 30–40 ms later, and breaks streaming; compositing off (397 / 413) and the sandbox off (`WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS`, for attribution only: 403 / 431) gain nothing (not interleaved; head was 377 / 391 an hour earlier). Nothing in Atrium's code runs in these 200 ms except the window's options.
+- **`main` → setup (35 ms) and spawn → `main` (30 ms): GTK, Tauri and the libraries' constructors.** Not Atrium's to shorten.
+- **Atrium's own JavaScript (35 ms from `boot.js` to mounted)**: small; the three `listen` calls (12 ms) could be one, a few ms at most.
+
+### D-041 recommendation
+
+With the font preload, TTI from `main` is **345 ms median, 362 ms p90 at load 3.3–4.4** on a laptop on battery in the `balanced` profile (spawn → TTI 374 / 390); without it, 377 / 391 at load 2 and 396–402 / 425–441 at load 3.3–4.4. **400 ms is reachable on Linux.** I recommend making it a gate on Linux with the macOS statistic (30 warm launches, median < 400 ms and p90 < 450 ms, measured from `main` by `startup_bench.py`) **once the font preload is merged**, with two conditions written into §14: the run states its load average and starts below 2.5 with no build running, and the spawn → TTI figure is reported beside it. Without the preload the median sits 0–25 ms under 400 ms and a busy machine pushes it over, which would make the gate flaky. The remaining 345 ms is mostly WebKitGTK's own (window 115, web process 86, start-up 65), so later UI work should not be allowed to eat the 55 ms of margin unnoticed: the profile table above is printed by every `startup_bench.py` run.
+
+### M1-09a's and M1-09b's runs on Linux
+
+All on the commit measured above (perf build for the benches, debug build for the checks), each alone under the GUI lock, 2026-11-15 04:28–04:32. Load average 4–7 during these (the debug build had finished a minute earlier; the 1-minute average lags).
+
+| Run | Result |
+|---|---|
+| `python3 app/scripts/live_check.py` (M1-09a) | **12/12 passed**: draft through a pop-out and back, a forced return, the daemon killed and restarted by the app (pid 1928541 → 1928893), the thread listed as interrupted, a crash and relaunch with the draft and thread back, the running daemon reused |
+| `python3 app/scripts/screenshots.py <dir>` (M1-09a, M1-09b) | **28 pictures, all three runs report `pass`** (`real`, `chat`, `refused`); in `.orchestration/m1-14b/screens/` in the worktree (git-ignored) |
+| `python3 app/scripts/chat_check.py` (M1-09b) | **12/12 passed** (daemon killed mid-stream, pid 1930859 → 1931157) |
+| `python3 app/scripts/stream_bench.py --runs 3` (§14, M1-09b) | below |
+| Tray | **Not checked: this desktop (GNOME Shell 51.1) has no tray support.** Not worked around. |
+
+**L1.** Settings → Appearance on Linux says "Atrium uses opaque windows on Linux." under the essentials, and the Advanced card's Blur strength row says "Atrium uses opaque windows on Linux. This only affects overlays." Nothing mentions a compositor (`grep -ri compositor app/src` finds only a comment in the stream bench). M1-09a shipped it right; nothing changed. Pictures: `settings-advanced-light.png`, `settings-advanced-dark.png` in the folder above. Seen and left (new UI is out of scope): the Window opacity and Blur rows above the note keep their macOS hints ("Lets the desktop show through") while disabled.
+
+**§14 streaming run** (10 threads × 1,000 tok/s × 30 s, rAF timestamps, window visible in every run, display at 143.87 Hz; WebKitGTK paces a busy page at 60 Hz, M1-09b's note):
+
+| run | tok/s | fps | frame p50 / p95 / p99 / max (ms) | over 16.7 ms as read | over 17.7 ms | long (> 1.5 × interval) | web process peak | app + webviews peak | GPU resident peak |
+|---|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | 9,994 | 59.8 | 17 / 19 / **21** / 54 | 57.6 % | 16.9 % | **6 (0.3 %)** | 123.1 | 218.9 | 423.9 |
+| 2 | 9,989 | 59.6 | 17 / 18 / **22** / 60 | 59.9 % | 12.9 % | **8 (0.4 %)** | 122.9 | 216.0 | 422.0 |
+| 3 | 9,990 | 59.9 | 17 / 18 / **21** / 34 | 58.0 % | 15.8 % | **3 (0.2 %)** | 126.8 | 217.6 | 415.9 |
+
+Memory in MiB of D-040's private PSS. **p99 21–22 ms (gate ≤ 33): within. Frames that skipped an update (over 1.5 × the interval, M1-09b's proposed reading) 0.2–0.4 %: within 1 %.** The literal "≤ 1 % over 16.7 ms" can't be read with 1 ms rAF timestamps (an on-time frame reads 17): the open decision M1-09b left (D-085 keeps it open). The web process peak is 123–127 MiB of private PSS (M1-09b's 179–183 were USS). **GPU memory grows from 115 MiB idle to 416–424 MiB while streaming**: D-040 says it is watched for growth; it has no budget. With `WEBKIT_DISABLE_DMABUF_RENDERER=1` (one run): 61.6 fps but p99 115 ms, 19.8 % long frames, 1,557 updates dropped, web process 210 MiB: the shared-memory path can't stream at this rate.
