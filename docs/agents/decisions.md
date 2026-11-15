@@ -585,3 +585,6 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 
 ## D-094 — 2026-11-15 — Pedro: review M1-15 and M1-17
 **Decided by Pedro (driver).** After stopping the first M1-15 review ("dont"), Pedro said "yeah you can review both". M1-15 gets its Opus 5.5 review as D-090 planned, restarted from the beginning; M1-17 gets its Sonnet 5.5 review as D-091 planned. Both read-only, in scratch clones that are deleted afterwards.
+
+## D-095 — 2026-11-15 — Pedro's go: M1-17 fix round; the daemon keeps its logs-folder check
+**Decided by Pedro (driver):** "Fix, keep the check". The Sonnet review (`reviews/M1-17-daemon-start-refusal.md`) found that a start racing a daemon already starting now parks the client in `Failed` (F1, major), and that the new `secure_dir(logs_dir)` in `Daemon::start` is a new refusal rather than the fix (F2). **Pedro keeps that check**: a daemon refuses an insecure logs folder however it was started (the orchestrator had recommended dropping it). The same Hydrogen `medium` worker fixes F1 and the minors F3–F5, and corrects the handoff's diagnosis (the silence was the launcher's). The orchestrator checks the fixes and merges.
