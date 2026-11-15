@@ -109,6 +109,10 @@ fn harness_settings(opacity: Option<&str>, theme: Option<&str>) -> Settings {
 struct AppState {
     /// Wall clock at the top of [`run`], for the startup timings.
     main_epoch_ms: f64,
+    /// Wall clock at the native startup steps after `run`'s top (`setup`
+    /// entered, the bridge started, the main window built), for the startup
+    /// profile (M1-14b, L3). Written once, in [`setup`].
+    startup_marks: Mutex<BTreeMap<&'static str, f64>>,
     harness: bool,
     paths: Paths,
     shell: Mutex<ShellState>,
@@ -152,6 +156,8 @@ fn system_dark(window: &WebviewWindow) -> bool {
 #[serde(rename_all = "camelCase")]
 struct StartupInfo {
     main_epoch_ms: f64,
+    /// Wall clock at the native startup steps (see `AppState::startup_marks`).
+    startup_marks: BTreeMap<&'static str, f64>,
     label: String,
     /// The thread a pop-out shows; `None` in the main window.
     popout_thread: Option<String>,
@@ -178,6 +184,7 @@ fn startup_info(window: WebviewWindow, state: State<'_, AppState>) -> StartupInf
     let snapshot = lock(&state.shell).clone();
     StartupInfo {
         main_epoch_ms: state.main_epoch_ms,
+        startup_marks: lock(&state.startup_marks).clone(),
         label: window.label().into(),
         popout_thread: snapshot
             .popouts
@@ -850,6 +857,7 @@ fn setup(
     main_epoch_ms: f64,
     paths: Paths,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut startup_marks = BTreeMap::from([("setupStart", epoch_ms())]);
     let handle = app.handle().clone();
     let harness = harness_run();
     let app_dir = bridge::app_dir(&paths)?;
@@ -881,9 +889,11 @@ fn setup(
     }
     let options = bridge::client_options(&paths);
     let bridge = tauri::async_runtime::block_on(async move { Bridge::start(options) });
+    startup_marks.insert("bridgeStarted", epoch_ms());
 
     app.manage(AppState {
         main_epoch_ms,
+        startup_marks: Mutex::new(startup_marks),
         harness,
         paths: paths.clone(),
         shell: Mutex::new(ShellState::restore(settings.clone(), &session)),
@@ -897,6 +907,7 @@ fn setup(
     });
 
     let main = build_main(&handle, &settings)?;
+    record_startup_mark(&handle, "windowBuilt");
     apply_native(&handle, &main, &settings, false);
     #[cfg(target_os = "macos")]
     macos::observe_accessibility(handle.clone());
@@ -913,7 +924,12 @@ fn setup(
         // gets throttled timers and no animation frames.
         let _ = main.set_focus();
     }
+    record_startup_mark(&handle, "setupEnd");
     Ok(())
+}
+
+fn record_startup_mark(app: &AppHandle, name: &'static str) {
+    lock(&app.state::<AppState>().startup_marks).insert(name, epoch_ms());
 }
 
 /// Runs the app until it exits.

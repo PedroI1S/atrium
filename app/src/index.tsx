@@ -1,4 +1,6 @@
 /* @refresh reload */
+// First: the time the bundle started evaluating (startup profile, M1-14b).
+import "./startup-mark";
 import { invoke } from "@tauri-apps/api/core";
 import { render } from "solid-js/web";
 import "@fontsource/instrument-sans/latin-400.css";
@@ -13,6 +15,7 @@ import "./styles/chat.css";
 import { App } from "./App";
 import { chatLivePopout, runChatLive } from "./chat-live";
 import { runChatShots } from "./chat-shots";
+import { runPopoutBench } from "./popout-bench";
 import { runStreamBench } from "./stream-bench";
 import { attach, daemon } from "./daemon/client";
 import { epochNow, markOnce, reportFailure, runHarness, setStage } from "./harness";
@@ -85,6 +88,7 @@ async function boot() {
   } else if (info.benchMode && !isPopout()) {
     setStage("harness");
     await runHarness(info, () => ({ connection: daemon().connection.type, threads: daemon().order.length }));
+    if (info.benchMode === "startup-popout") await runPopoutBench();
   }
 }
 
