@@ -576,3 +576,6 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **N8 → M1-07c-leader-sigkill: Claude Opus 5.5** (D-076's exception: process-signal code in `atrium-host`, possibly `unsafe`), **reviewed by Gemini 4 Hydrogen `high`**. Brief `briefs/M1-07c-leader-sigkill.md`.
 - **N9 (new in `m1-must-fix.md`, the daemon's silent exit) → M1-17-daemon-start-refusal: Gemini 4 Hydrogen `medium`**, reviewed by Sonnet 5.5. Brief `briefs/M1-17-daemon-start-refusal.md`.
 - **Not in this go:** the macOS benchmarks and font-preload A/B (D-087; they still wait for a quiet machine).
+
+## D-092 — 2026-11-15 — Pedro's go: M1-13 seventh round
+**Decided by Pedro (driver):** "Seventh round". The round-6 re-review (`reviews/M1-13-adversarial-round6.md`, Hydrogen `high`) says rework but converging: six blockers (none reaching Allow in Home with no rules), one major false hard deny. The same Claude Opus 5.5 worker fixes each by its invariant, not its spelling (the review's "Convergence assessment"), with tables of neighbouring spellings, then a Hydrogen `high` re-review. Same recorded exception to PLAN §8.3 as D-080, D-081 and D-088.
