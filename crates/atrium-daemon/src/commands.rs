@@ -249,6 +249,44 @@ pub(crate) async fn run(
                 .await?;
             Ok(Value::Null)
         }
+        DaemonCommand::DeclineQuestion {
+            thread_id,
+            incarnation,
+            request_id,
+        } => {
+            let key = RequestKey {
+                thread: thread_id.clone(),
+                incarnation,
+                request_id: request_id.clone(),
+            };
+            let live = inner.session_of(&thread_id, Some(incarnation));
+            let _resolving = match &live {
+                Ok(live) => Some(live.requests.lock().await),
+                Err(_) => None,
+            };
+            let requests = inner.store.requests();
+            match requests.current_incarnation(&thread_id).await {
+                Ok(Some(cur)) if incarnation == cur => {}
+                Ok(Some(_)) => return Err(ledger_failure(LedgerError::StaleIncarnation)),
+                Ok(None) => return Err(ledger_failure(LedgerError::Unknown)),
+                Err(_) => return Err(ledger_failure(LedgerError::Store)),
+            }
+            // Questions have no binding; an approval must not be dismissed through this door.
+            if requests
+                .binding(&key)
+                .await
+                .map_err(|_| ledger_failure(LedgerError::Store))?
+                .is_some()
+            {
+                return Err(ledger_failure(LedgerError::Unknown));
+            }
+            inner.ledger.withdraw(&key).await.map_err(ledger_failure)?;
+            live.as_ref()
+                .map_err(Clone::clone)?
+                .send(SessionCommand::DeclineQuestion { request_id })
+                .await?;
+            Ok(Value::Null)
+        }
         DaemonCommand::ResumeThread { thread_id } => resume_thread(inner, &thread_id).await,
         DaemonCommand::ArchiveThread { thread_id } => {
             inner.listed(&thread_id)?;
@@ -492,10 +530,12 @@ async fn thread_command(
             live.stop();
         }
         // These have their own commands, so the ledger sees them first.
-        SessionCommand::ResolveApproval { .. } | SessionCommand::AnswerQuestion { .. } => {
+        SessionCommand::ResolveApproval { .. }
+        | SessionCommand::AnswerQuestion { .. }
+        | SessionCommand::DeclineQuestion { .. } => {
             return Err(failure(
                 ErrorCode::Invalid,
-                "use ResolveApproval or AnswerQuestion",
+                "use ResolveApproval, AnswerQuestion, or DeclineQuestion",
             ));
         }
     }

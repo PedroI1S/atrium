@@ -529,6 +529,16 @@ fn agent_session_commands() {
         }),
     );
 
+    round_trip(
+        &SessionCommand::DeclineQuestion {
+            request_id: "q1".into(),
+        },
+        json!({
+            "type": "decline_question",
+            "request_id": "q1"
+        }),
+    );
+
     round_trip(&SessionCommand::Interrupt, json!({"type": "interrupt"}));
     round_trip(&SessionCommand::Shutdown, json!({"type": "shutdown"}));
 }
@@ -1055,6 +1065,19 @@ fn wire_client_messages_and_daemon_commands() {
             "incarnation": 1,
             "request_id": "q1",
             "answers": []
+        }),
+    );
+    round_trip(
+        &DaemonCommand::DeclineQuestion {
+            thread_id: ThreadId("t1".into()),
+            incarnation: 1,
+            request_id: "q1".into(),
+        },
+        json!({
+            "type": "decline_question",
+            "thread_id": "t1",
+            "incarnation": 1,
+            "request_id": "q1"
         }),
     );
     round_trip(

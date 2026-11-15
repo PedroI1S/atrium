@@ -176,7 +176,8 @@ pub enum AgentEvent {
         rememberable: bool,
     },
     /// The agent asked the user something. Answer with
-    /// [`SessionCommand::AnswerQuestion`].
+    /// [`SessionCommand::AnswerQuestion`] or dismiss with
+    /// [`SessionCommand::DeclineQuestion`].
     QuestionAsked {
         request_id: String,
         questions: Vec<Question>,
@@ -417,6 +418,8 @@ pub enum SessionCommand {
         request_id: String,
         answers: Vec<QuestionAnswer>,
     },
+    /// Dismiss a pending question so the turn can continue without an answer.
+    DeclineQuestion { request_id: String },
     /// Stop the current turn; the session stays usable.
     Interrupt,
     /// End the session and the provider process.

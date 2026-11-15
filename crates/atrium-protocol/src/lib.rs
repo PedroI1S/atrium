@@ -19,4 +19,4 @@ pub mod wire;
 
 /// Bumped on any breaking change to the modules above. App and daemon ship
 /// together; a mismatch is `Incompatible`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;

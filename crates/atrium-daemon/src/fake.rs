@@ -118,7 +118,9 @@ impl Agent {
             Some(SessionCommand::Shutdown) | None => self.stopping = true,
             // It asks for nothing, so there is nothing to resolve or answer.
             Some(
-                SessionCommand::ResolveApproval { .. } | SessionCommand::AnswerQuestion { .. },
+                SessionCommand::ResolveApproval { .. }
+                | SessionCommand::AnswerQuestion { .. }
+                | SessionCommand::DeclineQuestion { .. },
             ) => {}
         }
     }

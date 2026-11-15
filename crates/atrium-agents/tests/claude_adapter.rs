@@ -1045,6 +1045,53 @@ async fn questions_use_the_gates_question_ticket() {
         "B"
     );
     shutdown(session).await;
+
+    // Declined: denies the control request so the turn can continue cleanly.
+    let dir = scratch("q-decline");
+    let mut session = start(config(&dir, "canuse-question", allow()), opts())
+        .await
+        .unwrap();
+    session.commands.send(say("go")).await.unwrap();
+    let evs = next_matching(&mut session, 10, |e| {
+        matches!(e, AgentEvent::QuestionAsked { .. })
+    })
+    .await;
+    let Some(AgentEvent::QuestionAsked { request_id, .. }) = evs.last() else {
+        unreachable!()
+    };
+    assert_eq!(request_id, "Q1");
+    session
+        .commands
+        .send(SessionCommand::DeclineQuestion {
+            request_id: request_id.clone(),
+        })
+        .await
+        .unwrap();
+    let evs = next_matching(&mut session, 10, |e| {
+        matches!(
+            e,
+            AgentEvent::RequestResolved {
+                outcome: RequestOutcome::Cancelled,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        AgentEvent::RequestResolved {
+            request_id,
+            outcome: RequestOutcome::Cancelled,
+        } if request_id == "Q1"
+    )));
+    let v: Value =
+        serde_json::from_str(&wait_file(&dir.join("canuse_response.json"), 10).await).unwrap();
+    assert_eq!(v["response"]["response"]["behavior"], "deny");
+    assert_eq!(
+        v["response"]["response"]["message"],
+        "The user declined to answer."
+    );
+    shutdown(session).await;
 }
 
 /// The session reports its process before the handshake, and the user
