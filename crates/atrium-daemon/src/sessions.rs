@@ -49,6 +49,13 @@ pub(crate) struct Live {
     commands: Mutex<Option<mpsc::Sender<SessionCommand>>>,
     turn: AtomicBool,
     stop: watch::Sender<bool>,
+    /// Set as soon as this incarnation stops or commits a terminal event
+    /// (`Ended`, `Failed`, `Interrupted`), so a `ResumeThread` waits for
+    /// teardown instead of racing with it.
+    terminal: AtomicBool,
+    /// Set once `run()` has removed `self` from `Inner::sessions` and finished
+    /// its final store cleanup.
+    done: watch::Sender<bool>,
     /// Held while events that end requests (a resolution, a turn's or the
     /// session's end) are stored and the ledger follows them, and while a
     /// resolution is checked by the ledger and passed to the session. So a
@@ -64,6 +71,8 @@ impl Live {
             commands: Mutex::new(None),
             turn: AtomicBool::new(false),
             stop: watch::channel(false).0,
+            terminal: AtomicBool::new(false),
+            done: watch::channel(false).0,
             requests: tokio::sync::Mutex::new(()),
         }
     }
@@ -74,6 +83,24 @@ impl Live {
 
     pub(crate) fn turn_running(&self) -> bool {
         self.turn.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_terminal(&self) {
+        self.terminal.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+
+    fn finish(&self) {
+        self.mark_terminal();
+        self.done.send_replace(true);
+    }
+
+    pub(crate) async fn finished(&self) {
+        let mut rx = self.done.subscribe();
+        let _ = rx.wait_for(|done| *done).await;
     }
 
     fn sender(&self) -> Option<mpsc::Sender<SessionCommand>> {
@@ -90,6 +117,7 @@ impl Live {
     /// Tells the session to end. Works at any point of its life, the start
     /// included.
     pub(crate) fn stop(&self) {
+        self.mark_terminal();
         self.stop.send_replace(true);
         if let Some(sender) = self.sender() {
             // A full queue is fine: the pump sees the flag and, if the
@@ -184,6 +212,24 @@ fn shows_in_summary(events: &[StoredEvent], unread: bool) -> bool {
 }
 
 impl Inner {
+    /// Waits for any finishing session on `thread` to finish tearing down, or
+    /// refuses immediately if an active (non-terminal) session holds the slot.
+    pub(crate) async fn wait_if_ending(&self, thread: &ThreadId) -> Result<(), Failure> {
+        loop {
+            let existing = self.sessions().get(thread).cloned();
+            match existing {
+                Some(live) if live.is_terminal() => live.finished().await,
+                Some(_) => {
+                    return Err(failure(
+                        ErrorCode::Invalid,
+                        "the thread already has a session",
+                    ));
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+
     /// Begins a new incarnation of `thread` and starts its session in the
     /// background. Returns the thread as it is while starting.
     pub(crate) async fn launch(
@@ -192,15 +238,28 @@ impl Inner {
         launch: Launch,
     ) -> Result<ThreadSummary, Failure> {
         let live = Arc::new(Live::new());
-        {
-            let mut sessions = self.sessions();
-            if sessions.contains_key(thread) {
-                return Err(failure(
-                    ErrorCode::Invalid,
-                    "the thread already has a session",
-                ));
+        loop {
+            let waiting = {
+                let mut sessions = self.sessions();
+                match sessions.get(thread) {
+                    Some(existing) if existing.is_terminal() => Some(existing.clone()),
+                    Some(_) => {
+                        return Err(failure(
+                            ErrorCode::Invalid,
+                            "the thread already has a session",
+                        ));
+                    }
+                    None => {
+                        sessions.insert(thread.clone(), live.clone());
+                        None
+                    }
+                }
+            };
+            if let Some(existing) = waiting {
+                existing.finished().await;
+            } else {
+                break;
             }
-            sessions.insert(thread.clone(), live.clone());
         }
         let begun = async {
             let incarnation = self.store.begin_incarnation(thread).await?;
@@ -211,7 +270,16 @@ impl Inner {
         let (incarnation, summary) = match begun {
             Ok(begun) => begun,
             Err(error) => {
-                self.sessions().remove(thread);
+                let mut sessions = self.sessions();
+                if sessions
+                    .get(thread)
+                    .is_some_and(|current| Arc::ptr_eq(current, &live))
+                {
+                    sessions.remove(thread);
+                }
+                drop(sessions);
+                live.finish();
+                self.quieter.notify_waiters();
                 return Err(store_failure(error));
             }
         };
@@ -315,12 +383,27 @@ impl Inner {
             Some(live) if ends_requests => Some(live.requests.lock().await),
             _ => None,
         };
+        let terminal_in_batch = batch.iter().any(|envelope| {
+            matches!(
+                envelope.event,
+                AgentEvent::SessionEnded { .. } | AgentEvent::Error { fatal: true, .. }
+            )
+        });
+        let fatal_in_batch = batch
+            .iter()
+            .any(|envelope| matches!(envelope.event, AgentEvent::Error { fatal: true, .. }));
+        if terminal_in_batch && let Some(live) = live {
+            live.mark_terminal();
+        }
         let stored = {
             let _publishing = self.publish.lock().await;
             let stored = self.store.append(thread, incarnation, batch).await?;
             self.hub().publish(thread, &stored);
             stored
         };
+        if fatal_in_batch && let Some(live) = live {
+            live.stop();
+        }
         // The ledger's expiry is driven by what was stored (contract §5).
         for event in &stored {
             match &event.envelope.event {
@@ -539,6 +622,7 @@ impl Inner {
                     Err(StoreError::ReadOnly { .. }) => {
                         closing_only = true;
                         out.reason.get_or_insert_with(|| "storage is full".into());
+                        live.mark_terminal();
                         if self
                             .store
                             .signal(thread, Signal::StorageReadOnly)
@@ -590,6 +674,33 @@ async fn run(
         Stopped,
         Failed(String),
     }
+    struct SessionGuard {
+        inner: Arc<Inner>,
+        thread: ThreadId,
+        live: Arc<Live>,
+    }
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            {
+                let mut sessions = self.inner.sessions();
+                if sessions
+                    .get(&self.thread)
+                    .is_some_and(|current| Arc::ptr_eq(current, &self.live))
+                {
+                    sessions.remove(&self.thread);
+                }
+            }
+            self.live.finish();
+            self.inner.quieter.notify_waiters();
+        }
+    }
+
+    let _guard = SessionGuard {
+        inner: inner.clone(),
+        thread: thread.clone(),
+        live: live.clone(),
+    };
     let mut stop = live.stop.subscribe();
     let process = Arc::new(Process::default());
     let started = match &launch.agent {
@@ -687,6 +798,7 @@ async fn run(
             ..Pumped::default()
         },
     };
+    live.mark_terminal();
     live.set_sender(None);
     live.turn.store(false, Ordering::Relaxed);
     if first_message_lost {
@@ -756,16 +868,6 @@ async fn run(
             inner.refresh_thread(&thread).await;
         }
     }
-    {
-        let mut sessions = inner.sessions();
-        if sessions
-            .get(&thread)
-            .is_some_and(|current| Arc::ptr_eq(current, &live))
-        {
-            sessions.remove(&thread);
-        }
-    }
-    inner.quieter.notify_waiters();
 }
 
 /// Stops every session and waits for them to end (the daemon is stopping).

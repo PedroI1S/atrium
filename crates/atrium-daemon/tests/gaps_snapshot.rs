@@ -145,6 +145,10 @@ impl Store for GatedStore {
         self.inner.resume_id(thread)
     }
 
+    fn launch(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<Option<NewThread>>> {
+        self.inner.launch(thread)
+    }
+
     fn open_items(
         &self,
         thread: &ThreadId,
@@ -155,6 +159,10 @@ impl Store for GatedStore {
 
     fn live_processes(&self) -> BoxFuture<'_, StoreResult<Vec<(ThreadId, u32, ProcessIdentity)>>> {
         self.inner.live_processes()
+    }
+
+    fn unfinished_incarnations(&self) -> BoxFuture<'_, StoreResult<Vec<(ThreadId, u32)>>> {
+        self.inner.unfinished_incarnations()
     }
 
     fn rules(&self) -> BoxFuture<'_, StoreResult<(u64, Vec<Rule>)>> {

@@ -145,7 +145,7 @@ fn table() -> Vec<Row> {
             Signal::Recovered {
                 cleanup: Cleanup::Unverified,
             },
-            "UUUUUU====",
+            "UUUUUU=U=U",
         ),
         sig(
             "Signal::Recovered(Verified)",
@@ -805,4 +805,37 @@ fn exit_code_decides_ended_or_interrupted() {
             first
         );
     }
+}
+
+#[test]
+fn unverified_recovery_overrides_ended_and_verified_interrupted_but_not_failed() {
+    let recover_unverified = AttentionInput::Signal(&Signal::Recovered {
+        cleanup: Cleanup::Unverified,
+    });
+    let unverified = ThreadState::Interrupted {
+        cleanup: Cleanup::Unverified,
+    };
+
+    assert_eq!(
+        next_state(&ThreadState::Ended, Pending::default(), recover_unverified),
+        unverified
+    );
+    assert_eq!(
+        next_state(
+            &ThreadState::Interrupted {
+                cleanup: Cleanup::Verified,
+            },
+            Pending::default(),
+            recover_unverified
+        ),
+        unverified
+    );
+
+    let failed = ThreadState::Failed {
+        message: "auth rejected".into(),
+    };
+    assert_eq!(
+        next_state(&failed, Pending::default(), recover_unverified),
+        failed
+    );
 }

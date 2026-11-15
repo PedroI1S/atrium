@@ -10,11 +10,11 @@ use std::time::Duration;
 use atrium_agents::GateDecision;
 use atrium_daemon::{KEEP_RUNNING_SETTING, NotifyReason};
 use atrium_protocol::agent::{
-    AgentEvent, ApprovalDecision, MessageBody, MessageKind, Question, QuestionAnswer,
+    AgentEvent, ApprovalDecision, MessageBody, MessageKind, Provider, Question, QuestionAnswer,
     RequestOutcome, SessionCommand, ToolKind, ToolStatus, TurnOutcome,
 };
 use atrium_protocol::policy::{
-    RememberScope, Rule, RuleDecision, RuleDraft, RuleMatcher, RuleOrigin, RuleScope,
+    Preset, RememberScope, Rule, RuleDecision, RuleDraft, RuleMatcher, RuleOrigin, RuleScope,
 };
 use atrium_protocol::thread::{Cleanup, InboxItem, InboxReason, ThreadId, ThreadState};
 use atrium_protocol::wire::{
@@ -796,23 +796,42 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
         .start_thread(native(), Some("  Fix   the build\nplease"))
         .await
         .thread_id;
+    let first = wait_update(&mut watcher, &thread, |summary| {
+        summary.state == ThreadState::Starting
+    })
+    .await;
+    assert_eq!(first.title, "Fix the build");
     let mut script = rig.script().await;
     script.command().await;
     script.started("native-1").await;
     script.turn(1).await;
-    wire.thread_when(&thread, |summary| summary.state == ThreadState::Running)
-        .await;
-    // Everything the watcher was sent so far.
-    watcher.ok(DaemonCommand::ListInbox).await;
-    let seen: Vec<ServerMessage> = watcher.aside.drain(..).collect();
-    let updates = updates_of(&seen, &thread);
-    assert_eq!(updates[0].title, "Fix the build");
-    assert_eq!(updates[0].state, ThreadState::Starting);
-    assert_eq!(updates.last().expect("updates").state, ThreadState::Running);
+    wait_update(&mut watcher, &thread, |summary| {
+        summary.state == ThreadState::Running
+    })
+    .await;
 
     // Forty deltas, each stored by itself: the reply shows as unread once,
     // and no update follows the rest.
-    for n in 0..40 {
+    let before = wire.thread(&thread).await.last_event;
+    script.delta("m", "0 ").await;
+    wire.thread_when(&thread, |summary| summary.last_event > before)
+        .await;
+    let unread = wait_update(&mut watcher, &thread, |summary| summary.unread).await;
+    assert!(unread.unread);
+    let reply = soon(async {
+        loop {
+            if let ServerMessage::InboxUpdated { items } = watcher.next().await {
+                return items;
+            }
+        }
+    })
+    .await;
+    assert_eq!(reply.len(), 1);
+    assert_eq!(reply[0].reason, InboxReason::Reply);
+    assert_eq!(reply[0].thread_id.as_ref(), Some(&thread));
+
+    watcher.aside.clear();
+    for n in 1..40 {
         let before = wire.thread(&thread).await.last_event;
         script.delta("m", &format!("{n} ")).await;
         wire.thread_when(&thread, |summary| summary.last_event > before)
@@ -821,16 +840,7 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
     watcher.ok(DaemonCommand::ListInbox).await;
     let seen: Vec<ServerMessage> = watcher.aside.drain(..).collect();
     let updates = updates_of(&seen, &thread);
-    assert_eq!(updates.len(), 1, "{updates:?}");
-    assert!(updates[0].unread);
-    let reply = seen.iter().find_map(|message| match message {
-        ServerMessage::InboxUpdated { items } => Some(items.clone()),
-        _ => None,
-    });
-    let reply = reply.expect("the inbox changed");
-    assert_eq!(reply.len(), 1);
-    assert_eq!(reply[0].reason, InboxReason::Reply);
-    assert_eq!(reply[0].thread_id.as_ref(), Some(&thread));
+    assert!(updates.is_empty(), "{updates:?}");
 
     // Reading and renaming it show too.
     wire.ok(DaemonCommand::MarkRead {
@@ -850,17 +860,33 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
         .await,
         ErrorCode::Invalid
     );
-    watcher.ok(DaemonCommand::ListInbox).await;
-    let seen: Vec<ServerMessage> = watcher.aside.drain(..).collect();
-    let last = updates_of(&seen, &thread).pop().expect("an update");
-    assert!(!last.unread);
-    assert_eq!(last.title, "Build fix");
-    assert!(seen.contains(&ServerMessage::InboxUpdated { items: Vec::new() }));
+    let mut saw_cleared_inbox = false;
+    let mut saw_renamed = false;
+    soon(async {
+        while !(saw_cleared_inbox && saw_renamed) {
+            match watcher.next().await {
+                ServerMessage::InboxUpdated { items } if items.is_empty() => {
+                    saw_cleared_inbox = true;
+                }
+                ServerMessage::ThreadUpdated { summary }
+                    if summary.thread_id == thread
+                        && !summary.unread
+                        && summary.title == "Build fix" =>
+                {
+                    saw_renamed = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
 
     // An approval is in the inbox and posts a notification, once.
     script.ask(1, "a.txt").await;
-    wire.thread_when(&thread, |summary| summary.pending_approvals == 1)
-        .await;
+    wait_update(&mut watcher, &thread, |summary| {
+        summary.pending_approvals == 1
+    })
+    .await;
     let items = inbox(&mut watcher).await;
     assert_eq!(items[0].reason, InboxReason::Approval);
     assert_eq!(items[0].detail.as_deref(), Some("touch a.txt"));
@@ -880,8 +906,10 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
         })
         .await;
     other.ask(1, "b.txt").await;
-    wire.thread_when(&focused, |summary| summary.pending_approvals == 1)
-        .await;
+    wait_update(&mut watcher, &focused, |summary| {
+        summary.pending_approvals == 1
+    })
+    .await;
     assert_eq!(rig.notes().len(), 1);
 
     // Archived by one connection: it leaves the list for every watcher,
@@ -927,6 +955,8 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
     let all = late.subscribe_inbox().await;
     assert_eq!(all["threads"].as_array().expect("threads").len(), 1);
     assert_eq!(all["inbox"][0]["reason"], "approval");
+    other.ended(Some(0)).await;
+    rig.stop(true).await;
 }
 
 #[tokio::test]
@@ -1388,6 +1418,7 @@ async fn a_process_the_adapter_left_running_is_killed_or_reported() {
     let status = soon(reaping).await.expect("joins").expect("waits");
     assert!(!status.success(), "it was killed");
     assert!(!alive(pid));
+    rig.stop(true).await;
 }
 
 #[tokio::test]
@@ -1442,6 +1473,7 @@ async fn a_dead_provider_nobody_reaped_is_not_called_stopped() {
     assert!(inbox(&mut wire).await.iter().any(|item| {
         item.reason == InboxReason::CleanupUnverified && item.thread_id.as_ref() == Some(&thread)
     }));
+    rig.stop(true).await;
 }
 
 #[tokio::test]
@@ -1541,5 +1573,249 @@ async fn the_synthetic_agent_says_when_it_does_not_queue_a_message() {
     // Not a failure of the session.
     assert_eq!(wire.thread(&thread).await.state, ThreadState::Running);
     wire.ok(shutdown(&thread)).await;
+    rig.stop(true).await;
+}
+
+#[tokio::test]
+async fn a_stopped_session_with_unverified_cleanup_becomes_interrupted() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    *rig.adapter.start.lock().expect("lock") = Start::Process;
+    let thread = wire.start_thread(native(), Some("go")).await.thread_id;
+    let mut script = rig.script().await;
+    script.command().await;
+    script.started("native-1").await;
+    script.turn(1).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Running)
+        .await;
+    // User stops the session (moves to Ended), then the stream drops without
+    // SessionEnded and nobody reaps the provider process.
+    wire.ok(shutdown(&thread)).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Ended)
+        .await;
+    assert_eq!(script.command().await, SessionCommand::Shutdown);
+    script.die();
+    let summary = wire
+        .thread_when(&thread, |summary| {
+            matches!(summary.state, ThreadState::Interrupted { .. })
+        })
+        .await;
+    assert_eq!(
+        summary.state,
+        ThreadState::Interrupted {
+            cleanup: Cleanup::Unverified
+        }
+    );
+    soon(async {
+        while kinds(&wire.history(&thread).await).last() != Some(&"session_ended") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        wire.thread(&thread).await.state,
+        ThreadState::Interrupted {
+            cleanup: Cleanup::Unverified
+        }
+    );
+    assert!(inbox(&mut wire).await.iter().any(|item| {
+        item.reason == InboxReason::CleanupUnverified && item.thread_id.as_ref() == Some(&thread)
+    }));
+    rig.stop(true).await;
+}
+
+#[tokio::test]
+async fn resume_keeps_effort_and_non_home_preset() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    let launch = AgentLaunch::Native {
+        provider: Provider::Claude,
+        model: Some("claude-sonnet".into()),
+        effort: Some("high".into()),
+        preset: Preset::FullAccess,
+    };
+    let thread = wire.start_thread(launch, Some("go")).await.thread_id;
+    let mut script = rig.script().await;
+    assert_eq!(script.config.model.as_deref(), Some("claude-sonnet"));
+    assert_eq!(script.config.effort.as_deref(), Some("high"));
+    assert_eq!(
+        script.config.permissions,
+        atrium_agents::PermissionPolicy::FullAccess
+    );
+    assert_eq!(
+        script
+            .config
+            .gate
+            .check(&Script::write_check(1, "a.txt"))
+            .await,
+        GateDecision::Allow
+    );
+    script.command().await;
+    script.started("native-1").await;
+    script.ended(Some(0)).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Ended)
+        .await;
+
+    wire.ok(DaemonCommand::ResumeThread {
+        thread_id: thread.clone(),
+    })
+    .await;
+    let mut resumed = rig.script().await;
+    assert_eq!(resumed.config.model.as_deref(), Some("claude-sonnet"));
+    assert_eq!(resumed.config.effort.as_deref(), Some("high"));
+    assert_eq!(
+        resumed.config.permissions,
+        atrium_agents::PermissionPolicy::FullAccess
+    );
+    assert_eq!(
+        resumed
+            .config
+            .gate
+            .check(&Script::write_check(1, "a.txt"))
+            .await,
+        GateDecision::Allow
+    );
+    resumed.started("native-1").await;
+    resumed.ended(Some(0)).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Ended)
+        .await;
+    rig.stop(true).await;
+}
+
+async fn wait_update(
+    watcher: &mut Wire,
+    thread: &ThreadId,
+    check: impl Fn(&atrium_protocol::thread::ThreadSummary) -> bool,
+) -> atrium_protocol::thread::ThreadSummary {
+    soon(async {
+        loop {
+            if let ServerMessage::ThreadUpdated { summary } = watcher.next().await
+                && summary.thread_id == *thread
+                && check(&summary)
+            {
+                return summary;
+            }
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn resume_right_after_final_state_in_a_tight_loop() {
+    let mut rig = Rig::start().await;
+    let mut watcher = rig.dev().await;
+    assert_eq!(
+        watcher.subscribe_inbox().await,
+        json!({ "threads": [], "inbox": [] })
+    );
+    let mut wire = rig.dev().await;
+    let thread = wire.start_thread(native(), None).await.thread_id;
+    let mut script = Some(rig.script().await);
+    script.as_mut().unwrap().started("native-1").await;
+    wait_update(&mut watcher, &thread, |s| s.state == ThreadState::Idle).await;
+
+    let mut expected_incarnation = 1u64;
+    for round in 0..201u64 {
+        match round % 4 {
+            // 0: Ended via SessionEnded(0)
+            0 => {
+                script.take().unwrap().ended(Some(0)).await;
+                wait_update(&mut watcher, &thread, |s| {
+                    s.incarnation as u64 == expected_incarnation && s.state == ThreadState::Ended
+                })
+                .await;
+            }
+            // 1: Interrupted via SessionEnded(1)
+            1 => {
+                script.take().unwrap().ended(Some(1)).await;
+                wait_update(&mut watcher, &thread, |s| {
+                    s.incarnation as u64 == expected_incarnation
+                        && matches!(s.state, ThreadState::Interrupted { .. })
+                })
+                .await;
+            }
+            // 2: Failed via Start::Fail (then reset to Start::Script to resume again)
+            2 => {
+                script.take().unwrap().ended(Some(0)).await;
+                wait_update(&mut watcher, &thread, |s| {
+                    s.incarnation as u64 == expected_incarnation && s.state == ThreadState::Ended
+                })
+                .await;
+                *rig.adapter.start.lock().expect("lock") = Start::Fail;
+                let failed = wire
+                    .ok(DaemonCommand::ResumeThread {
+                        thread_id: thread.clone(),
+                    })
+                    .await;
+                expected_incarnation += 1;
+                assert_eq!(failed["incarnation"], expected_incarnation);
+                wait_update(&mut watcher, &thread, |s| {
+                    s.incarnation as u64 == expected_incarnation
+                        && matches!(s.state, ThreadState::Failed { .. })
+                })
+                .await;
+                *rig.adapter.start.lock().expect("lock") = Start::Script;
+            }
+            // 3: Ended immediately via user Shutdown while provider finishes asynchronously
+            _ => {
+                let mut ending_script = script.take().unwrap();
+                tokio::spawn(async move {
+                    if ending_script.command().await == SessionCommand::Shutdown {
+                        ending_script.ended(Some(0)).await;
+                    }
+                });
+                wire.ok(shutdown(&thread)).await;
+                wait_update(&mut watcher, &thread, |s| {
+                    s.incarnation as u64 == expected_incarnation && s.state == ThreadState::Ended
+                })
+                .await;
+            }
+        }
+
+        let resumed = wire
+            .ok(DaemonCommand::ResumeThread {
+                thread_id: thread.clone(),
+            })
+            .await;
+        expected_incarnation += 1;
+        assert_eq!(resumed["incarnation"], expected_incarnation);
+
+        let mut next = rig.script().await;
+        next.started("native-1").await;
+        wait_update(&mut watcher, &thread, |s| {
+            s.incarnation as u64 == expected_incarnation && s.state == ThreadState::Idle
+        })
+        .await;
+        script = Some(next);
+    }
+
+    // Two concurrent ResumeThreads right after Ended: one wins, one is refused.
+    script.take().unwrap().ended(Some(0)).await;
+    wait_update(&mut watcher, &thread, |s| {
+        s.incarnation as u64 == expected_incarnation && s.state == ThreadState::Ended
+    })
+    .await;
+    let mut second_wire = rig.dev().await;
+    let (a, b) = tokio::join!(
+        wire.command(DaemonCommand::ResumeThread {
+            thread_id: thread.clone(),
+        }),
+        second_wire.command(DaemonCommand::ResumeThread {
+            thread_id: thread.clone(),
+        }),
+    );
+    match (a, b) {
+        (Ok(val), Err((ErrorCode::Invalid, _))) | (Err((ErrorCode::Invalid, _)), Ok(val)) => {
+            assert_eq!(val["incarnation"], expected_incarnation + 1);
+        }
+        other => panic!("expected exactly one winner and one Invalid refusal: {other:?}"),
+    }
+    let mut last = rig.script().await;
+    last.started("native-1").await;
+    last.ended(Some(0)).await;
+    wait_update(&mut watcher, &thread, |s| {
+        s.incarnation as u64 == expected_incarnation + 1 && s.state == ThreadState::Ended
+    })
+    .await;
     rig.stop(true).await;
 }

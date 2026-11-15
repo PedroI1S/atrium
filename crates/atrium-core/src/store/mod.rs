@@ -367,6 +367,11 @@ impl Store for SqliteStore {
         self.shared.read(move |c| reader::resume_id(c, &thread))
     }
 
+    fn launch(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<Option<NewThread>>> {
+        let thread = thread.clone();
+        self.shared.read(move |c| reader::launch(c, &thread))
+    }
+
     fn open_items(
         &self,
         thread: &ThreadId,
@@ -380,6 +385,10 @@ impl Store for SqliteStore {
 
     fn live_processes(&self) -> BoxFuture<'_, StoreResult<Vec<(ThreadId, u32, ProcessIdentity)>>> {
         self.shared.read(reader::live_processes)
+    }
+
+    fn unfinished_incarnations(&self) -> BoxFuture<'_, StoreResult<Vec<(ThreadId, u32)>>> {
+        self.shared.read(reader::unfinished_incarnations)
     }
 
     fn rules(&self) -> BoxFuture<'_, StoreResult<(u64, Vec<Rule>)>> {

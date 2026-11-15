@@ -10,9 +10,9 @@ use atrium_protocol::wire::{EventId, StoredEvent};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 
-use super::codec::{from_json, stored_event};
+use super::codec::{from_json, stored_event, str_enum};
 use super::sql_err;
-use crate::StoreResult;
+use crate::{NewThread, StoreResult};
 use atrium_protocol::limits;
 
 pub(crate) struct ReaderPool {
@@ -121,6 +121,47 @@ pub(crate) fn resume_id(c: &Connection, thread: &ThreadId) -> StoreResult<Option
     .map_err(sql_err)
 }
 
+pub(crate) fn launch(c: &Connection, thread: &ThreadId) -> StoreResult<Option<NewThread>> {
+    struct LaunchRow {
+        provider: String,
+        model: Option<String>,
+        effort: Option<String>,
+        preset: String,
+        location: String,
+        title: String,
+    }
+
+    let row = c
+        .query_row(
+            "SELECT provider, model, effort, preset, location, title \
+             FROM threads WHERE thread_id = ?1",
+            [&thread.0],
+            |r| {
+                Ok(LaunchRow {
+                    provider: r.get(0)?,
+                    model: r.get(1)?,
+                    effort: r.get(2)?,
+                    preset: r.get(3)?,
+                    location: r.get(4)?,
+                    title: r.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sql_err)?;
+    match row {
+        Some(row) => Ok(Some(NewThread {
+            provider: str_enum(&row.provider)?,
+            model: row.model,
+            effort: row.effort,
+            preset: str_enum(&row.preset)?,
+            location: from_json(&row.location)?,
+            title: row.title,
+        })),
+        None => Ok(None),
+    }
+}
+
 pub(crate) fn live_processes(c: &Connection) -> StoreResult<Vec<(ThreadId, u32, ProcessIdentity)>> {
     let mut stmt = c
         .prepare_cached(
@@ -136,6 +177,36 @@ pub(crate) fn live_processes(c: &Connection) -> StoreResult<Vec<(ThreadId, u32, 
             ThreadId(r.get(0).map_err(sql_err)?),
             r.get(1).map_err(sql_err)?,
             from_json(&process)?,
+        ));
+    }
+    Ok(out)
+}
+
+pub(crate) fn unfinished_incarnations(c: &Connection) -> StoreResult<Vec<(ThreadId, u32)>> {
+    let mut stmt = c
+        .prepare_cached(
+            "SELECT t.thread_id, t.incarnation \
+             FROM threads t \
+             JOIN sessions s ON s.thread_id = t.thread_id AND s.incarnation = t.incarnation \
+             WHERE t.incarnation > 0 \
+               AND EXISTS ( \
+                   SELECT 1 FROM events e \
+                   WHERE e.thread_id = t.thread_id AND e.incarnation = t.incarnation \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM events e \
+                   WHERE e.thread_id = t.thread_id AND e.incarnation = t.incarnation \
+                     AND e.kind = 'session_ended' \
+               ) \
+             ORDER BY t.thread_id, t.incarnation",
+        )
+        .map_err(sql_err)?;
+    let mut rows = stmt.query([]).map_err(sql_err)?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().map_err(sql_err)? {
+        out.push((
+            ThreadId(r.get(0).map_err(sql_err)?),
+            r.get(1).map_err(sql_err)?,
         ));
     }
     Ok(out)

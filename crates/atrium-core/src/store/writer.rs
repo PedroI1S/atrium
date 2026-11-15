@@ -977,7 +977,8 @@ fn apply(
         AgentEvent::SessionEnded { exit_code, .. } => {
             tx.prepare_cached(
                 "UPDATE sessions SET ended_ms = COALESCE(ended_ms, ?3), \
-                 exit_code = COALESCE(exit_code, ?4) WHERE thread_id = ?1 AND incarnation = ?2",
+                 exit_code = COALESCE(exit_code, ?4), process = NULL \
+                 WHERE thread_id = ?1 AND incarnation = ?2",
             )
             .map_err(sql_err)?
             .execute(params![t, inc, env.at_ms as i64, exit_code])

@@ -193,6 +193,9 @@ pub trait Store: Send + Sync {
     /// The native session id of the latest incarnation that has one.
     fn resume_id(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<Option<String>>>;
 
+    /// The thread's launch settings (with its current title), or `None` if unknown.
+    fn launch(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<Option<NewThread>>>;
+
     fn open_items(
         &self,
         thread: &ThreadId,
@@ -200,6 +203,10 @@ pub trait Store: Send + Sync {
     ) -> BoxFuture<'_, StoreResult<OpenItems>>;
     /// Incarnations with a recorded process and no end: crash recovery.
     fn live_processes(&self) -> BoxFuture<'_, StoreResult<Vec<(ThreadId, u32, ProcessIdentity)>>>;
+
+    /// Every thread's current incarnation that has events and no `SessionEnded`,
+    /// archived or not (CR-10).
+    fn unfinished_incarnations(&self) -> BoxFuture<'_, StoreResult<Vec<(ThreadId, u32)>>>;
 
     fn rules(&self) -> BoxFuture<'_, StoreResult<(u64, Vec<Rule>)>>;
     fn create_rule(&self, rule: Rule) -> BoxFuture<'_, StoreResult<Rule>>;
