@@ -563,3 +563,9 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 
 ## D-089 — 2026-11-15 — Pedro's go: M1-16 fix round
 **Decided by Pedro (driver):** "Yes, fix round". The Sonnet review (`reviews/M1-16-requests-and-notifications.md`) asked two fixes before merge: the fake approval must run `echo synthetic` as the contract says, and a test must pin that Allow redeems the ticket (the "skip `gate.redeem`" mutation survives). The same Hydrogen `high` worker also takes the minors that are its to fix (the racy wait in `requests_fake.rs`, the two untested edges, a silent skip when `question_ticket` returns `None`, and the handoff's wrong "blocked" notes). The contract's missing `RequestResolved` detail stays with the orchestrator. The orchestrator checks the fixes (the mutation re-run) and merges; no second review unless the fixes go beyond these.
+
+## D-090 — 2026-11-15 — Pedro's go: start M1-15 now, ahead of M1-13's merge
+**Decided by Pedro (driver):** "start m1-15 for now".
+- **M1-15-store-launch-recovery: Gemini 4 Hydrogen `high`** (D-074, D-076), **reviewed by Opus 5.5**, read-only. Branch `agent/hydrogen/M1-15-store-launch-recovery`, from `dev` after M1-16's merge. It carries CR-08, CR-10, M1-13's finding 12, N1–N3 and now **CR-09** (D-082), whose code is `attention::next_state` plus a daemon test.
+- **The brief's "M1-13 merged" dependency is waived.** M1-13's adversarial tests (its recovery tests among them) aren't on `dev`, so the worker can't run them. When M1-13 merges, the orchestrator runs them against M1-15's branch before M1-15 merges. M1-15 doesn't touch `policy/**`, so the two branches shouldn't conflict in code.
+- The brief was rewritten for this shift: the Linux-container rules became the `agy` policy's, and CR-09 was moved from "out of scope" to step 0.
