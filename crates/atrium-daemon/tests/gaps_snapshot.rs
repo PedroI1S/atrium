@@ -220,6 +220,8 @@ fn fake(duration_ms: u64) -> AgentLaunch {
         chunk_chars: 16,
         duration_ms,
         tool_call_every_ms: 0,
+        approval_at_ms: None,
+        question_at_ms: None,
     }
 }
 

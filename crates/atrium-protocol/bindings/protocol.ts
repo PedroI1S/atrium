@@ -109,7 +109,11 @@ preset: Preset } |
  *  `tokens_per_second` (1 token ≈ 4 chars) for `duration_ms`, with a tool
  *  call every `tool_call_every_ms` (0 = none), then `TurnCompleted`.
  */
-{ type: "fake"; tokens_per_second: number; chunk_chars: number; duration_ms: number; tool_call_every_ms: number };
+{ type: "fake"; tokens_per_second: number; chunk_chars: number; duration_ms: number; tool_call_every_ms: number; 
+/**  When set, ask one Bash approval at this offset (ms) into each turn. */
+approval_at_ms?: number | null; 
+/**  When set, ask one question at this offset (ms) into each turn. */
+question_at_ms?: number | null };
 
 export type ApprovalDecision = { type: "allow" } | 
 /**  `message` is passed to the agent as the reason, when the provider supports it. */

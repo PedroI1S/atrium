@@ -9,15 +9,19 @@
 //! contract's order.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
-use atrium_agents::{COMMAND_BUFFER, EVENT_BUFFER, MAX_QUEUED_MESSAGES, Session};
+use atrium_agents::{
+    ApprovalTicket, COMMAND_BUFFER, EVENT_BUFFER, GateDecision, MAX_QUEUED_MESSAGES, Session,
+    ToolCheck, ToolGate,
+};
 use atrium_protocol::agent::{
-    AgentEvent, AgentEventEnvelope, MessageBody, MessageKind, Provider, SessionCommand, ToolKind,
-    ToolStatus, TurnOutcome, Usage,
+    AgentEvent, AgentEventEnvelope, ApprovalDecision, MessageBody, MessageKind, Provider, Question,
+    QuestionOption, RequestOutcome, SessionCommand, ToolKind, ToolStatus, TurnOutcome, Usage,
 };
 use atrium_protocol::limits::MAX_INLINE_MESSAGE_BYTES;
-use atrium_protocol::policy::EnforcementDescriptor;
+use atrium_protocol::policy::{EnforcementDescriptor, ToolSubject};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -38,6 +42,8 @@ pub(crate) struct Params {
     pub(crate) chunk_chars: u32,
     pub(crate) duration_ms: u64,
     pub(crate) tool_call_every_ms: u64,
+    pub(crate) approval_at_ms: Option<u64>,
+    pub(crate) question_at_ms: Option<u64>,
 }
 
 /// Nothing is intercepted because nothing runs: reported as it is, Partial.
@@ -45,11 +51,12 @@ fn descriptor() -> EnforcementDescriptor {
     EnforcementDescriptor::evaluate(PROVIDER, None, false, Vec::new(), Vec::new(), Vec::new())
 }
 
-pub(crate) fn start(params: Params, message: Option<String>) -> Session {
+pub(crate) fn start(params: Params, message: Option<String>, gate: Arc<dyn ToolGate>) -> Session {
     let (events, receiver) = mpsc::channel(EVENT_BUFFER);
     let (commands, inbox) = mpsc::channel(COMMAND_BUFFER);
     let agent = Agent {
         params,
+        gate,
         events,
         commands: inbox,
         seq: 0,
@@ -72,6 +79,7 @@ struct Gone;
 
 struct Agent {
     params: Params,
+    gate: Arc<dyn ToolGate>,
     events: mpsc::Sender<AgentEventEnvelope>,
     commands: mpsc::Receiver<SessionCommand>,
     seq: u64,
@@ -247,6 +255,8 @@ impl Agent {
             chunk_chars,
             duration_ms,
             tool_call_every_ms,
+            approval_at_ms,
+            question_at_ms,
         } = self.params;
         let chunk: String = "synthetic tokens "
             .chars()
@@ -257,9 +267,13 @@ impl Agent {
         let message_id = format!("a{turn}");
         let (mut hash, mut chars, mut deltas, mut tools) = (Sha256::new(), 0u64, 0u64, 0u64);
         let started = Instant::now();
+        let mut paused = Duration::ZERO;
+        let mut approval_done = approval_at_ms.is_none();
+        let mut question_done = question_at_ms.is_none();
         let mut tick = tokio::time::interval(Duration::from_millis(5));
         loop {
-            let elapsed = (started.elapsed().as_millis() as u64).min(duration_ms);
+            let elapsed =
+                ((started.elapsed().saturating_sub(paused)).as_millis() as u64).min(duration_ms);
             let due = elapsed.saturating_mul(u64::from(tokens_per_second) * 4) / 1000;
             while chars + chunk_len <= due && !self.interrupted && !self.stopping {
                 self.emit(AgentEvent::MessageDelta {
@@ -296,6 +310,29 @@ impl Agent {
                 })
                 .await?;
             }
+            if !approval_done
+                && !self.interrupted
+                && !self.stopping
+                && approval_at_ms.is_some_and(|at| elapsed >= at)
+            {
+                approval_done = true;
+                tools += 1;
+                let wait_started = Instant::now();
+                self.run_approval(turn, tools).await?;
+                paused += wait_started.elapsed();
+                continue;
+            }
+            if !question_done
+                && !self.interrupted
+                && !self.stopping
+                && question_at_ms.is_some_and(|at| elapsed >= at)
+            {
+                question_done = true;
+                let wait_started = Instant::now();
+                self.run_question(turn).await?;
+                paused += wait_started.elapsed();
+                continue;
+            }
             if elapsed >= duration_ms || self.interrupted || self.stopping {
                 break;
             }
@@ -329,6 +366,224 @@ impl Agent {
                 output_tokens: Some(chars / 4),
                 ..Usage::default()
             }),
+        })
+        .await
+    }
+
+    async fn run_approval(&mut self, turn: u32, tool_index: u64) -> Result<(), Gone> {
+        let call_id = format!("c{turn}-{tool_index}");
+        let command = "touch synthetic";
+        let input = json!({ "command": command });
+        let check = ToolCheck {
+            call_id: Some(call_id.clone()),
+            name: "Bash".into(),
+            kind: ToolKind::Execute,
+            title: Some(command.into()),
+            input: input.clone(),
+            subject: ToolSubject::Command {
+                line: command.into(),
+                cwd: None,
+            },
+            turn,
+        };
+        match self.gate.check(&check).await {
+            GateDecision::Allow => {
+                self.emit(AgentEvent::ToolCallStarted {
+                    call_id: call_id.clone(),
+                    name: check.name,
+                    kind: check.kind,
+                    title: check.title,
+                    input,
+                })
+                .await?;
+                self.emit(AgentEvent::ToolCallFinished {
+                    call_id,
+                    status: ToolStatus::Succeeded,
+                    output: Some("synthetic\n".into()),
+                    error: None,
+                    truncated_bytes: 0,
+                })
+                .await
+            }
+            GateDecision::Deny { reason } => {
+                self.emit(AgentEvent::ToolCallStarted {
+                    call_id: call_id.clone(),
+                    name: check.name,
+                    kind: check.kind,
+                    title: check.title,
+                    input,
+                })
+                .await?;
+                self.emit(AgentEvent::ToolCallFinished {
+                    call_id,
+                    status: ToolStatus::Denied,
+                    output: None,
+                    error: Some(reason),
+                    truncated_bytes: 0,
+                })
+                .await
+            }
+            GateDecision::Ask { ticket } => {
+                self.emit(AgentEvent::ToolCallStarted {
+                    call_id: call_id.clone(),
+                    name: check.name.clone(),
+                    kind: check.kind,
+                    title: check.title.clone(),
+                    input: input.clone(),
+                })
+                .await?;
+                self.emit(AgentEvent::ApprovalRequested {
+                    request_id: ticket.request_id.clone(),
+                    call_id: Some(call_id.clone()),
+                    name: check.name.clone(),
+                    kind: check.kind,
+                    title: check.title.clone(),
+                    input,
+                    reason: Some("synthetic approval".into()),
+                    rememberable: ticket.rememberable,
+                })
+                .await?;
+                self.resolve_approval(call_id, ticket, &check).await
+            }
+        }
+    }
+
+    async fn resolve_approval(
+        &mut self,
+        call_id: String,
+        ticket: ApprovalTicket,
+        check: &ToolCheck,
+    ) -> Result<(), Gone> {
+        let decision = loop {
+            match self.commands.recv().await {
+                Some(SessionCommand::ResolveApproval {
+                    request_id,
+                    decision,
+                }) if request_id == ticket.request_id => break Some(decision),
+                other => {
+                    self.on_command(other);
+                    self.report_rejected().await?;
+                    if self.interrupted || self.stopping {
+                        break None;
+                    }
+                }
+            }
+        };
+        match decision {
+            None => {
+                self.emit(AgentEvent::RequestResolved {
+                    request_id: ticket.request_id,
+                    outcome: RequestOutcome::Cancelled,
+                })
+                .await?;
+                self.emit(AgentEvent::ToolCallFinished {
+                    call_id,
+                    status: ToolStatus::Cancelled,
+                    output: None,
+                    error: None,
+                    truncated_bytes: 0,
+                })
+                .await
+            }
+            Some(ApprovalDecision::Allow) => {
+                self.emit(AgentEvent::RequestResolved {
+                    request_id: ticket.request_id.clone(),
+                    outcome: RequestOutcome::Approved,
+                })
+                .await?;
+                let finished = match self.gate.redeem(&ticket, check).await {
+                    GateDecision::Allow => AgentEvent::ToolCallFinished {
+                        call_id,
+                        status: ToolStatus::Succeeded,
+                        output: Some("synthetic\n".into()),
+                        error: None,
+                        truncated_bytes: 0,
+                    },
+                    GateDecision::Deny { reason } => AgentEvent::ToolCallFinished {
+                        call_id,
+                        status: ToolStatus::Denied,
+                        output: None,
+                        error: Some(reason),
+                        truncated_bytes: 0,
+                    },
+                    GateDecision::Ask { .. } => AgentEvent::ToolCallFinished {
+                        call_id,
+                        status: ToolStatus::Denied,
+                        output: None,
+                        error: Some("approval could not be redeemed".into()),
+                        truncated_bytes: 0,
+                    },
+                };
+                self.emit(finished).await
+            }
+            Some(ApprovalDecision::Deny { message }) => {
+                self.emit(AgentEvent::RequestResolved {
+                    request_id: ticket.request_id,
+                    outcome: RequestOutcome::Denied,
+                })
+                .await?;
+                self.emit(AgentEvent::ToolCallFinished {
+                    call_id,
+                    status: ToolStatus::Denied,
+                    output: None,
+                    error: message.or_else(|| Some("Denied.".into())),
+                    truncated_bytes: 0,
+                })
+                .await
+            }
+        }
+    }
+
+    async fn run_question(&mut self, turn: u32) -> Result<(), Gone> {
+        let Some(ticket) = self.gate.question_ticket(Some(turn)).await else {
+            return Ok(());
+        };
+        self.emit(AgentEvent::QuestionAsked {
+            request_id: ticket.request_id.clone(),
+            questions: vec![Question {
+                id: "q1".into(),
+                prompt: "Which synthetic path should I take?".into(),
+                options: vec![
+                    QuestionOption {
+                        id: "fast".into(),
+                        label: "Continue".into(),
+                        description: Some("Keep running the synthetic turn".into()),
+                    },
+                    QuestionOption {
+                        id: "careful".into(),
+                        label: "Double-check".into(),
+                        description: Some("Proceed with extra care".into()),
+                    },
+                ],
+                multi_select: false,
+                allow_text: true,
+            }],
+        })
+        .await?;
+        let outcome = loop {
+            match self.commands.recv().await {
+                Some(SessionCommand::AnswerQuestion { request_id, .. })
+                    if request_id == ticket.request_id =>
+                {
+                    break RequestOutcome::Answered;
+                }
+                Some(SessionCommand::DeclineQuestion { request_id })
+                    if request_id == ticket.request_id =>
+                {
+                    break RequestOutcome::Cancelled;
+                }
+                other => {
+                    self.on_command(other);
+                    self.report_rejected().await?;
+                    if self.interrupted || self.stopping {
+                        break RequestOutcome::Cancelled;
+                    }
+                }
+            }
+        };
+        self.emit(AgentEvent::RequestResolved {
+            request_id: ticket.request_id,
+            outcome,
         })
         .await
     }

@@ -386,12 +386,16 @@ async fn start_thread(
             chunk_chars,
             duration_ms,
             tool_call_every_ms,
+            approval_at_ms,
+            question_at_ms,
         } => (
             Agent::Fake(fake::Params {
                 tokens_per_second,
                 chunk_chars,
                 duration_ms,
                 tool_call_every_ms,
+                approval_at_ms,
+                question_at_ms,
             }),
             fake::PROVIDER,
             None,

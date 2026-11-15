@@ -884,13 +884,36 @@ fn wire_types_and_messages() {
             chunk_chars: 4,
             duration_ms: 5000,
             tool_call_every_ms: 1000,
+            approval_at_ms: None,
+            question_at_ms: None,
         },
         json!({
             "type": "fake",
             "tokens_per_second": 100,
             "chunk_chars": 4,
             "duration_ms": 5000,
-            "tool_call_every_ms": 1000
+            "tool_call_every_ms": 1000,
+            "approval_at_ms": null,
+            "question_at_ms": null
+        }),
+    );
+    round_trip(
+        &AgentLaunch::Fake {
+            tokens_per_second: 100,
+            chunk_chars: 4,
+            duration_ms: 5000,
+            tool_call_every_ms: 1000,
+            approval_at_ms: Some(250),
+            question_at_ms: Some(500),
+        },
+        json!({
+            "type": "fake",
+            "tokens_per_second": 100,
+            "chunk_chars": 4,
+            "duration_ms": 5000,
+            "tool_call_every_ms": 1000,
+            "approval_at_ms": 250,
+            "question_at_ms": 500
         }),
     );
 
@@ -1503,6 +1526,27 @@ fn serde_default_fields_omitted() {
             question_id: "q1".into(),
             selected: vec![],
             text: Some("my custom answer".into()),
+        }
+    );
+
+    // 7. AgentLaunch::Fake with `approval_at_ms` and `question_at_ms` omitted
+    let json_fake = json!({
+        "type": "fake",
+        "tokens_per_second": 100,
+        "chunk_chars": 4,
+        "duration_ms": 5000,
+        "tool_call_every_ms": 1000
+    });
+    let launch: AgentLaunch = serde_json::from_value(json_fake).unwrap();
+    assert_eq!(
+        launch,
+        AgentLaunch::Fake {
+            tokens_per_second: 100,
+            chunk_chars: 4,
+            duration_ms: 5000,
+            tool_call_every_ms: 1000,
+            approval_at_ms: None,
+            question_at_ms: None,
         }
     );
 }

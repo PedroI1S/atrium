@@ -359,6 +359,12 @@ pub enum AgentLaunch {
         chunk_chars: u32,
         duration_ms: u64,
         tool_call_every_ms: u64,
+        /// When set, ask one Bash approval at this offset (ms) into each turn.
+        #[serde(default)]
+        approval_at_ms: Option<u64>,
+        /// When set, ask one question at this offset (ms) into each turn.
+        #[serde(default)]
+        question_at_ms: Option<u64>,
     },
 }
 
