@@ -561,9 +561,12 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
         return match shell::substituted_program(first) {
             None => true,
             Some(name) => {
+                // then the wrappers in front of what it names (`$(which env)
+                // sh`, `$(which timeout) 5 bash`: round 7 item 5)
                 let mut e = eff.to_vec();
                 e[0] = name;
-                reads_stdin_as_code(&e)
+                let (u, unknown) = shell::unwrap_checked(&e);
+                unknown || (!u.is_empty() && u != eff && reads_stdin_as_code(&u))
             }
         };
     }

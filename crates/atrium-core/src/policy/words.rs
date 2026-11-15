@@ -63,6 +63,8 @@ const MAX_CANDIDATES: usize = 32;
 /// Directories an unknown cwd is checked against, besides home and the start.
 const MAX_SEEN: usize = 64;
 const MAX_BRACE_RESULTS: usize = 256;
+/// The longest `{x..y}` sequence expanded.
+const MAX_SEQUENCE: usize = 64;
 
 pub type Resolver<'a> = &'a dyn Fn(&str, &Path, &Path) -> PathBuf;
 
@@ -325,7 +327,8 @@ fn has_unknown_var(w: &str) -> bool {
     w.contains('$') || w.contains('`')
 }
 
-/// `a{b,c}d` → `abd`, `acd` (comma lists only). `None` when it would make
+/// `a{b,c}d` → `abd`, `acd`; `{1..3}`, `{a..c}`, `{01..10..2}` as the
+/// shell's sequence expressions (round 7 item 1). `None` when it would make
 /// more than a few hundred words.
 fn brace_expand(w: &str) -> Option<Vec<String>> {
     let mut work = vec![w.to_string()];
@@ -334,7 +337,8 @@ fn brace_expand(w: &str) -> Option<Vec<String>> {
         let cs: Vec<char> = x.chars().collect();
         // matching braces and their top-level commas, in one pass
         let mut stack: Vec<(usize, Vec<usize>)> = vec![];
-        let mut best: Option<(usize, usize, Vec<usize>)> = None;
+        // (open, close, the words between them)
+        let mut best: Option<(usize, usize, Vec<String>)> = None;
         for (i, &c) in cs.iter().enumerate() {
             match c {
                 '{' => stack.push((i, vec![])),
@@ -344,27 +348,39 @@ fn brace_expand(w: &str) -> Option<Vec<String>> {
                     }
                 }
                 '}' => {
-                    if let Some((open, commas)) = stack.pop()
-                        && !commas.is_empty()
-                        && (open == 0 || cs[open - 1] != '$')
-                        && best.as_ref().is_none_or(|b| open < b.0)
+                    let Some((open, commas)) = stack.pop() else {
+                        continue;
+                    };
+                    if (open > 0 && cs[open - 1] == '$')
+                        || best.as_ref().is_some_and(|b| open >= b.0)
                     {
-                        best = Some((open, i, commas));
+                        continue;
                     }
+                    let alts = if commas.is_empty() {
+                        let inner: String = cs[open + 1..i].iter().collect();
+                        match brace_sequence(&inner) {
+                            Some(v) => v,
+                            None => continue,
+                        }
+                    } else {
+                        let mut bounds = vec![open];
+                        bounds.extend(commas);
+                        bounds.push(i);
+                        (0..bounds.len() - 1)
+                            .map(|k| cs[bounds[k] + 1..bounds[k + 1]].iter().collect())
+                            .collect()
+                    };
+                    best = Some((open, i, alts));
                 }
                 _ => {}
             }
         }
         match best {
             None => out.push(x),
-            Some((open, close, commas)) => {
+            Some((open, close, alts)) => {
                 let pre: String = cs[..open].iter().collect();
                 let post: String = cs[close + 1..].iter().collect();
-                let mut bounds = vec![open];
-                bounds.extend(commas);
-                bounds.push(close);
-                for k in 0..bounds.len() - 1 {
-                    let alt: String = cs[bounds[k] + 1..bounds[k + 1]].iter().collect();
+                for alt in alts {
                     work.push(format!("{pre}{alt}{post}"));
                 }
             }
@@ -372,6 +388,74 @@ fn brace_expand(w: &str) -> Option<Vec<String>> {
         if work.len() + out.len() > MAX_BRACE_RESULTS {
             return None;
         }
+    }
+    Some(out)
+}
+
+/// A sequence expression's words: `1..3`, `a..c`, `05..1..2`. `None`: not
+/// a sequence, or a long one (the braces stay as written: a path check then
+/// can't read the word and asks).
+fn brace_sequence(inner: &str) -> Option<Vec<String>> {
+    let parts: Vec<&str> = inner.split("..").collect();
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    let step: i64 = match parts.get(2) {
+        Some(s) => s.parse::<i64>().ok()?.checked_abs()?.max(1),
+        None => 1,
+    };
+    let (a, b) = (parts[0], parts[1]);
+    let letter = |s: &str| {
+        let mut it = s.chars();
+        match (it.next(), it.next()) {
+            (Some(c), None) if c.is_ascii_alphabetic() => Some(c),
+            _ => None,
+        }
+    };
+    let mut out = vec![];
+    if let (Some(x), Some(y)) = (letter(a), letter(b)) {
+        let (x, y) = (x as i64, y as i64);
+        let dir = if x <= y { 1 } else { -1 };
+        let mut v = x;
+        while (dir == 1 && v <= y) || (dir == -1 && v >= y) {
+            if out.len() >= MAX_SEQUENCE {
+                return None;
+            }
+            out.push(char::from(u8::try_from(v).ok()?).to_string());
+            v += dir * step;
+        }
+        return Some(out);
+    }
+    let int = |s: &str| {
+        let d = s.strip_prefix(['-', '+']).unwrap_or(s);
+        if d.is_empty() || !d.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        s.parse::<i64>().ok()
+    };
+    let (x, y) = (int(a)?, int(b)?);
+    // a leading zero pads every word to the wider end
+    let padded = |s: &str| {
+        let d = s.strip_prefix('-').unwrap_or(s);
+        d.len() > 1 && d.starts_with('0')
+    };
+    let width = if padded(a) || padded(b) {
+        a.len().max(b.len())
+    } else {
+        0
+    };
+    let dir = if x <= y { 1 } else { -1 };
+    let mut v = x;
+    while (dir == 1 && v <= y) || (dir == -1 && v >= y) {
+        if out.len() >= MAX_SEQUENCE {
+            return None;
+        }
+        out.push(if v < 0 {
+            format!("-{:0>w$}", -v, w = width.saturating_sub(1))
+        } else {
+            format!("{v:0>width$}")
+        });
+        v = v.checked_add(dir * step)?;
     }
     Some(out)
 }
@@ -491,9 +575,11 @@ enum Cd {
 }
 
 /// The effect of `unit` if it changes directory, resolved against every
-/// directory the shell may be in (`cands`).
+/// directory the shell may be in (`cands`). `followed`: where it goes can be
+/// followed (not in a pipeline or the background).
 fn cd_effect(
     unit: &Unit,
+    followed: bool,
     cands: &[PathBuf],
     start: &Path,
     home: &Path,
@@ -567,7 +653,7 @@ fn cd_effect(
     };
     // `pushd` keeps a stack the line can pop later: never followed.
     Some(match targets {
-        Some(t) if readable && name != "pushd" && !unit.grouped => Cd::Moved(t),
+        Some(t) if readable && name != "pushd" && followed => Cd::Moved(t),
         Some(t) => Cd::Lost(t),
         None => Cd::Lost(vec![]),
     })
@@ -636,6 +722,10 @@ struct Level {
     /// The text ran where its owner may be in a child (round 6 item 7):
     /// past it the shell is where it was or where the text ended.
     union: bool,
+    /// The last command of this text seen so far came after `||` and may
+    /// not have run (round 7 item 2): a text it runs in this shell (`||
+    /// eval …`, `|| source …`) then adds to where the shell may be.
+    last_skippable: bool,
     /// The compound commands open at this point, outermost first.
     frames: Vec<Frame>,
 }
@@ -724,6 +814,7 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
         last_join: Join::Seq,
         last_close: None,
         union: false,
+        last_skippable: false,
         frames: vec![],
     }];
     for (i, unit) in units.iter().enumerate() {
@@ -779,7 +870,8 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
                 pending: false,
                 last_join: Join::Seq,
                 last_close: None,
-                union: unit.shell_union,
+                union: unit.shell_union || (unit.same_shell && top.last_skippable),
+                last_skippable: false,
                 frames: vec![],
             };
             stack.push(entered);
@@ -859,10 +951,18 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
         if w.overflow {
             return w;
         }
-        let join = unit.join;
+        // a command piped into the next one doesn't end a chain: the
+        // pipeline's status is its last command's
+        let mid_pipe = unit.pipe != 0
+            && units[i + 1..]
+                .iter()
+                .find(|n| n.ctx == unit.ctx && n.level == unit.level)
+                .is_some_and(|n| n.pipe == unit.pipe);
+        let join = if mid_pipe { Join::And } else { unit.join };
         // after `||` this command may not run (`a || cd x && y`: `y` may run
         // where the shell was): where it was stays a candidate
         let skipped_from = lv.last_join == Join::Or && !lv.unknown;
+        let lv_skippable = lv.last_join == Join::Or;
         let entry = if skipped_from {
             lv.cands.clone()
         } else {
@@ -873,7 +973,15 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
             .frames
             .iter()
             .any(|f| matches!(f.kind, Compound::Loop | Compound::Func));
-        let effect = match cd_effect(unit, &lv.cands, start, home, resolve) {
+        // a `cd` in a `( … )` group is followed inside it, and where it went
+        // stays a candidate after it (the group's frame adds where the shell
+        // was: round 7 major); in a pipeline or the background it is lost
+        let in_paren = unit.compound.iter().any(|c| c.0 == Compound::Paren)
+            && unit.pipe == 0
+            && !unit.seg.piped
+            && !unit.background;
+        let followed = !unit.grouped || in_paren;
+        let effect = match cd_effect(unit, followed, &lv.cands, start, home, resolve) {
             Some(Cd::Moved(t)) if repeats => Some(Cd::Lost(t)),
             e => e,
         };
@@ -916,6 +1024,7 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
         }
         lv.last_join = join;
         lv.last_close = unit.close_join;
+        lv.last_skippable = lv_skippable;
         if join != Join::And && !lv.pool.is_empty() {
             lv.pending = true;
         }

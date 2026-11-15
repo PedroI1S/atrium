@@ -428,6 +428,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     let mut groups: Vec<(Compound, Option<u32>, u32)> = vec![];
     // `f()` was just read: the next compound is a function body
     let mut fn_def = false;
+    // a `( … )` group just closed: redirections that follow are its own
+    // (`(true) > /dev/null && x`), and so is the join after them
+    let mut after_paren = false;
     // text after an unclosed `${…}` (see `ambiguous_tail`)
     let mut tails: Vec<String> = vec![];
 
@@ -444,6 +447,10 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     }
     macro_rules! flush {
         () => {{
+            #[allow(unused_assignments)]
+            {
+                after_paren = false;
+            }
             let next = fresh!();
             let mut b = std::mem::replace(&mut cur, next);
             if !b.is_empty() {
@@ -521,11 +528,15 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     while matches!(chars.get(k), Some(' ' | '\t')) {
                         k += 1;
                     }
-                    if chars.get(k) == Some(&')')
-                        && cur.assignments.is_empty()
-                        && (cur.argv.len() == 1
-                            || (cur.argv.len() == 2 && cur.argv[0] == "function"))
-                    {
+                    // at any command position: after `{`, `!`, `time -p`,
+                    // `coproc`, `then`, … too (round 7 item 4)
+                    let n = cur.argv.len();
+                    let def_position = n >= 1
+                        && (opens_body(&cur.argv[..n - 1])
+                            || (n >= 2
+                                && cur.argv[n - 2] == "function"
+                                && opens_body(&cur.argv[..n - 2])));
+                    if chars.get(k) == Some(&')') && cur.assignments.is_empty() && def_position {
                         out.reasons.push("function definition".into());
                         i = k + 1;
                         // the name and the body are one command: its place
@@ -561,12 +572,13 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     }
                     cur = fresh!();
                     cur.grouped = cur.grouped || paren_depth > 0;
+                    after_paren = true;
                 }
                 continue;
             }
             '&' if chars.get(i + 1) == Some(&'&') => {
                 i += 2;
-                if cur.is_empty()
+                if group_tail(&cur, after_paren)
                     && let Some(last) = raw_units.last_mut()
                 {
                     // `( … ) && x`
@@ -603,6 +615,15 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 } else {
                     2
                 };
+                // `( … ) | x`: the group's place in the chain is the
+                // pipeline's (round 7 major)
+                if is_pipe
+                    && after_paren
+                    && group_tail(&cur, after_paren)
+                    && let Some(last) = raw_units.last_mut()
+                {
+                    last.close_join = Some(Join::And);
+                }
                 // Both ends of a pipeline are not in plain sequence.
                 cur.grouped |= is_pipe;
                 if is_pipe && cur.pipe == 0 {
@@ -610,7 +631,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 }
                 let id = cur.pipe;
                 if !is_pipe {
-                    if cur.is_empty()
+                    if group_tail(&cur, after_paren)
                         && let Some(last) = raw_units.last_mut()
                     {
                         // `( … ) || x`
@@ -982,6 +1003,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                         fn_def = false;
                     }
                 }
+                after_paren = false;
                 if cur.argv.is_empty() && assign_name_end.is_some() {
                     let n = assign_name_end.unwrap_or(0);
                     cur.assignments
@@ -1035,6 +1057,32 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         if unknown_option {
             out.reasons.push("unknown wrapper option".into());
         }
+        // the other ways its wrappers can be read (round 7 item 6): each is
+        // checked as a command of its own
+        let mut other_readings: Vec<Vec<String>> = if unknown_option {
+            unwrap_readings(&seg.argv)
+                .into_iter()
+                .skip(1)
+                .filter(|e| !e.is_empty())
+                .collect()
+        } else {
+            vec![]
+        };
+        // a command word built by a substitution that names a program
+        // plainly (`$(which sudo) id`, `$(which env) rm -rf ~`) is also read
+        // as that program, behind its wrappers (round 7, beside item 5)
+        if let Some(f) = eff.first()
+            && has_command_substitution(f)
+            && let Some(name) = substituted_program_at(f, depth)
+        {
+            let mut e = eff.clone();
+            e[0] = name;
+            for r in unwrap_readings(&e) {
+                if !r.is_empty() && r != eff && !other_readings.contains(&r) {
+                    other_readings.push(r);
+                }
+            }
+        }
         if let Some(first) = seg.argv.first()
             && RESERVED.contains(&first.as_str())
         {
@@ -1054,6 +1102,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         // in a pipeline, a group or the background it may run in a child
         let owner_maybe_child = pipe != 0 || grouped || background || piped;
         let mut payloads = payloads_of(&eff);
+        for e in &other_readings {
+            payloads.extend(payloads_of(e));
+        }
         payloads.extend(env_payloads(&seg.argv));
         // the output of a `$(…)` that is run as code: `sh -c "$(echo …)"`,
         // `eval $(…)`, `$(…)` as the command word
@@ -1122,9 +1173,34 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             close_join,
             shell_union: false,
         };
+        let readings: Vec<Unit> = other_readings
+            .into_iter()
+            .map(|e| Unit {
+                eff: e,
+                subs: vec![],
+                grouped: true,
+                derived: true,
+                pipe: 0,
+                join: Join::Seq,
+                ctx: CTX_IDS.fetch_add(1, Ordering::Relaxed),
+                level: depth + 1,
+                compound: vec![],
+                close_join: None,
+                ..unit.clone()
+            })
+            .collect();
         out.units.push(unit);
         if eff.first().map(|s| base(s)) == Some("find") {
             find_exec_units(&eff, &mut out.units, depth + 1);
+        }
+        for u in readings {
+            if u.eff.first().map(|s| base(s)) == Some("find") {
+                let e = u.eff.clone();
+                out.units.push(u);
+                find_exec_units(&e, &mut out.units, depth + 1);
+            } else {
+                out.units.push(u);
+            }
         }
         for l in extra {
             for mut u in l.units {
@@ -1160,8 +1236,12 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     && substituted_program_at(f, depth).is_none_or(|n| {
                         let mut e = u.eff.clone();
                         e[0] = n;
-                        is_shell(&e[0])
-                            || matches!(e[0].as_str(), "eval" | "source" | ".")
+                        // the wrappers in front of it too (round 7 item 5)
+                        let (e, unknown) = unwrap_checked(&e);
+                        unknown
+                            || e.first().is_some_and(|f| {
+                                maybe_shell(f) || matches!(base(f), "eval" | "source" | ".")
+                            })
                             || reads_stdin_as_script(&e)
                     }))
                 || (maybe_shell(f) && u.eff[1..].iter().any(|a| a == "-s" || a == "-"))
@@ -1339,6 +1419,12 @@ const RESERVED: &[&str] = &[
     "function", "select", "{", "}", "!", "[[", "coproc",
 ];
 
+/// Whether the command being read is only what follows a `( … )` group
+/// (nothing, or its redirections): a join here is the group's.
+fn group_tail(cur: &Builder, after_paren: bool) -> bool {
+    cur.is_empty() || (after_paren && cur.argv.is_empty() && cur.assignments.is_empty())
+}
+
 fn fix_dup(op: RedirectOp, word: &str) -> RedirectOp {
     // `>&file` writes both stdout and stderr to the file; `<&file` is an error.
     if op == RedirectOp::Dup && !(word == "-" || word.chars().all(|c| c.is_ascii_digit())) {
@@ -1420,9 +1506,21 @@ pub fn base(s: &str) -> &str {
 struct Opts {
     flags: &'static str,
     vals: &'static str,
+    /// Short options whose value is optional (`xargs -i[R]`): only an
+    /// attached value is theirs.
     opt_vals: &'static str,
+    /// Short options whose value is optional in one implementation and
+    /// needed in another (util-linux `script -t[file]`, BSD `script -t
+    /// time`): a separate word is read both ways (round 7 item 6).
+    either_vals: &'static str,
     long_flags: &'static [&'static str],
     long_vals: &'static [&'static str],
+    /// Long options whose value is optional (`xargs --replace[=R]`): only a
+    /// value after `=` is theirs.
+    long_opt_vals: &'static [&'static str],
+    /// Long spellings of `either_vals` (`script --timing[=file]`): a
+    /// separate word is read both ways.
+    long_either_vals: &'static [&'static str],
     numeric: bool,
 }
 
@@ -1430,8 +1528,11 @@ const NO_OPTS: Opts = Opts {
     flags: "",
     vals: "",
     opt_vals: "",
+    either_vals: "",
     long_flags: &["--help", "--version"],
     long_vals: &[],
+    long_opt_vals: &[],
+    long_either_vals: &[],
     numeric: false,
 };
 
@@ -1441,8 +1542,11 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
         flags,
         vals,
         opt_vals: "",
+        either_vals: "",
         long_flags,
         long_vals,
+        long_opt_vals: &[],
+        long_either_vals: &[],
         numeric: false,
     };
     Some(match name {
@@ -1463,7 +1567,7 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
         ),
         "command" => o("pvV", "", &[], &[]),
         "setsid" => o(
-            "cfw",
+            "cfwhV",
             "",
             &["--ctty", "--fork", "--wait", "--help", "--version"],
             &[],
@@ -1472,8 +1576,8 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
         "caffeinate" => o("dimsu", "tw", &[], &[]),
         "sandbox-exec" => o("", "fnpD", &[], &[]),
         "chroot" => o(
-            "",
-            "",
+            "n",
+            "Ggu",
             &["--skip-chdir", "--help", "--version"],
             &["--userspec", "--groups"],
         ),
@@ -1483,7 +1587,7 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
             ..o("", "n", &["--help", "--version"], &["--adjustment"])
         },
         "ionice" => o(
-            "th",
+            "thV",
             "cnpPu",
             &["--ignore", "--help", "--version"],
             &["--class", "--classdata", "--pid", "--pgid", "--uid"],
@@ -1495,7 +1599,7 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
             &["--input", "--output", "--error"],
         ),
         "timeout" => o(
-            "fv",
+            "fpv",
             "sk",
             &[
                 "--foreground",
@@ -1508,6 +1612,7 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
         ),
         "xargs" => Opts {
             opt_vals: "iel",
+            long_opt_vals: &["--replace", "--eof", "--max-lines"],
             ..o(
                 "0oprtx",
                 "nPILsdaEJRS",
@@ -1521,9 +1626,6 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
                     "--show-limits",
                     "--help",
                     "--version",
-                    "--replace",
-                    "--eof",
-                    "--max-lines",
                 ],
                 &[
                     "--max-args",
@@ -1536,7 +1638,7 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
             )
         },
         "chrt" => o(
-            "abdfiomrRv",
+            "abdefimorRvhV",
             "TPD",
             &[
                 "--all-tasks",
@@ -1547,6 +1649,8 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
                 "--other",
                 "--rr",
                 "--reset-on-fork",
+                "--ext",
+                "--max",
                 "--verbose",
                 "--help",
                 "--version",
@@ -1554,13 +1658,13 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
             &["--sched-runtime", "--sched-period", "--sched-deadline"],
         ),
         "taskset" => o(
-            "ac",
+            "achV",
             "",
             &["--all-tasks", "--cpu-list", "--help", "--version"],
             &[],
         ),
         "flock" => o(
-            "sexnuoFh",
+            "sexnuoFhV",
             "wE",
             &[
                 "--shared",
@@ -1576,30 +1680,34 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
             ],
             &["--timeout", "--wait", "--conflict-exit-code"],
         ),
-        // util-linux and BSD `script` (`c` is read by the caller)
-        "script" => o(
-            "adeFfkpqrh",
-            "EItTOBmo",
-            &[
-                "--append",
-                "--return",
-                "--flush",
-                "--force",
-                "--quiet",
-                "--help",
-                "--version",
-            ],
-            &[
-                "--log-io",
-                "--log-in",
-                "--log-out",
-                "--log-timing",
-                "--echo",
-                "--logging-format",
-                "--output-limit",
-                "--timing",
-            ],
-        ),
+        // util-linux and BSD `script` (`c` is read by the caller):
+        // util-linux `-t[file]`/`--timing[=file]`, BSD `-t time`
+        "script" => Opts {
+            either_vals: "t",
+            long_either_vals: &["--timing"],
+            ..o(
+                "adeFfkpqrwhV",
+                "EITOBmo",
+                &[
+                    "--append",
+                    "--return",
+                    "--flush",
+                    "--force",
+                    "--quiet",
+                    "--help",
+                    "--version",
+                ],
+                &[
+                    "--log-io",
+                    "--log-in",
+                    "--log-out",
+                    "--log-timing",
+                    "--echo",
+                    "--logging-format",
+                    "--output-limit",
+                ],
+            )
+        },
         _ => return None,
     })
 }
@@ -1611,6 +1719,15 @@ enum Opt {
     Words(usize),
     Shell(Option<String>),
     Unknown,
+    /// A value that is optional in one implementation and needed in
+    /// another, given as the next word: 1 or 2 words (round 7 item 6).
+    Either,
+    /// A long flag written with `=value` (`taskset --cpu-list=0-3`), or
+    /// short flags with something after them that isn't a flag (`taskset
+    /// -c0-3`): `getopt` rejects it, so what runs isn't known; read as the
+    /// flag alone, and as the flag followed by the rest as its own word (the
+    /// rest starts at this byte of the word).
+    Split(usize),
 }
 
 fn read_opt(a: &[String], j: usize, o: &Opts, shell_c: bool) -> Opt {
@@ -1630,8 +1747,17 @@ fn read_opt(a: &[String], j: usize, o: &Opts, shell_c: bool) -> Opt {
         if o.long_vals.contains(&name.as_str()) {
             return Opt::Words(if has_val { 1 } else { 2 });
         }
-        if o.long_flags.contains(&name.as_str()) {
+        if o.long_opt_vals.contains(&name.as_str()) {
             return Opt::Words(1);
+        }
+        if o.long_either_vals.contains(&name.as_str()) {
+            return if has_val { Opt::Words(1) } else { Opt::Either };
+        }
+        if o.long_flags.contains(&name.as_str()) {
+            return match w.find('=') {
+                Some(at) => Opt::Split(at),
+                None => Opt::Words(1),
+            };
         }
         return Opt::Unknown;
     }
@@ -1651,11 +1777,22 @@ fn read_opt(a: &[String], j: usize, o: &Opts, shell_c: bool) -> Opt {
         if o.vals.contains(*c) {
             return Opt::Words(if rest.is_empty() { 2 } else { 1 });
         }
+        if o.either_vals.contains(*c) {
+            return if rest.is_empty() {
+                Opt::Either
+            } else {
+                Opt::Words(1)
+            };
+        }
         if o.opt_vals.contains(*c) {
             return Opt::Words(1);
         }
         if !o.flags.contains(*c) {
-            return Opt::Unknown;
+            return if k == 0 {
+                Opt::Unknown
+            } else {
+                Opt::Split(1 + cs[..k].iter().map(|c| c.len_utf8()).sum::<usize>())
+            };
         }
     }
     Opt::Words(1)
@@ -1671,17 +1808,76 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
 }
 
 /// [`unwrap`], and whether a wrapper had an option its table doesn't know
-/// (round 6 item 5): the command it runs is then not known for sure, and
-/// the line must not be allowed by a rule (it is read as if the option were
-/// a flag, as before).
+/// (round 6 item 5) or one that can be read more than one way (round 7 item
+/// 6): the command it runs is then not known for sure, and the line must
+/// not be allowed by a rule (it is read as if the option were a flag, as
+/// before).
 pub fn unwrap_checked(argv: &[String]) -> (Vec<String>, bool) {
+    let (eff, unknown, choices) = unwrap_reading(argv, 0);
+    (eff, unknown || choices > 0)
+}
+
+/// Every way the wrappers in front of `argv` can be read (round 7 item 6):
+/// the first is [`unwrap_checked`]'s; the others differ in an option whose
+/// value may or may not be the next word. At most 16.
+pub fn unwrap_readings(argv: &[String]) -> Vec<Vec<String>> {
+    let (first, _, choices) = unwrap_reading(argv, 0);
+    let mut out = vec![first];
+    for mask in 1..(1u32 << choices.min(4)) {
+        let e = unwrap_reading(argv, mask).0;
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// One option word read for one reading: how many words it uses, or the
+/// shell string of `-c`. `mask` picks, bit by bit, the reading of each
+/// option that can be read two ways (`choices` counts them).
+fn take_opt(
+    a: &mut Vec<String>,
+    j: usize,
+    o: &Opts,
+    shell_c: bool,
+    mask: u32,
+    choices: &mut u32,
+    unknown: &mut bool,
+) -> Opt {
+    let mut pick = || {
+        let bit = *choices < 32 && (mask >> *choices) & 1 == 1;
+        *choices += 1;
+        bit
+    };
+    match read_opt(a, j, o, shell_c) {
+        Opt::Unknown => {
+            *unknown = true;
+            Opt::Words(1)
+        }
+        Opt::Either => Opt::Words(if pick() { 2 } else { 1 }),
+        Opt::Split(at) => {
+            *unknown = true;
+            if pick() {
+                let w = a[j].clone();
+                let (head, rest) = w.split_at(at);
+                let rest = rest.strip_prefix('=').unwrap_or(rest);
+                a.splice(j..=j, [head.to_string(), rest.to_string()]);
+            }
+            Opt::Words(1)
+        }
+        r => r,
+    }
+}
+
+fn unwrap_reading(argv: &[String], mask: u32) -> (Vec<String>, bool, u32) {
     let mut a: Vec<String> = argv.to_vec();
     let mut unknown = false;
+    let mut choices = 0u32;
     for _ in 0..8 {
         let Some(first) = a.first() else { break };
         let b = base(first).to_string();
         // options with a table, then `operands` words before the command
-        let mut table = |a: &[String], o: &Opts, operands: usize| -> usize {
+        let mut table = |a: &mut Vec<String>, o: &Opts, operands: usize| -> usize {
             let mut j = 1;
             while j < a.len() {
                 let w = a[j].as_str();
@@ -1692,13 +1888,9 @@ pub fn unwrap_checked(argv: &[String]) -> (Vec<String>, bool) {
                 if !is_option(w) {
                     break;
                 }
-                match read_opt(a, j, o, false) {
+                match take_opt(a, j, o, false, mask, &mut choices, &mut unknown) {
                     Opt::Words(n) => j += n,
-                    Opt::Shell(_) => j += 1,
-                    Opt::Unknown => {
-                        unknown = true;
-                        j += 1;
-                    }
+                    _ => j += 1,
                 }
             }
             (j + operands).min(a.len())
@@ -1713,7 +1905,7 @@ pub fn unwrap_checked(argv: &[String]) -> (Vec<String>, bool) {
                 if matches!(b.as_str(), "busybox" | "toybox") {
                     1
                 } else {
-                    table(&a, &o, 0)
+                    table(&mut a, &o, 0)
                 }
             }
             "timeout" | "chrt" | "taskset" => {
@@ -1727,7 +1919,7 @@ pub fn unwrap_checked(argv: &[String]) -> (Vec<String>, bool) {
                 {
                     0
                 } else {
-                    table(&a, &o, 1)
+                    table(&mut a, &o, 1)
                 }
             }
             "arch" => {
@@ -1750,7 +1942,7 @@ pub fn unwrap_checked(argv: &[String]) -> (Vec<String>, bool) {
                 // `chroot [opts] NEWROOT [COMMAND…]`; without a command it
                 // starts a shell (see `reads_stdin_as_script`).
                 let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
-                let j = table(&a, &o, 0);
+                let j = table(&mut a, &o, 0);
                 if j + 1 < a.len() { j + 1 } else { 0 }
             }
             "flock" | "script" => {
@@ -1776,19 +1968,28 @@ pub fn unwrap_checked(argv: &[String]) -> (Vec<String>, bool) {
                         break;
                     }
                     if is_option(w) {
-                        match read_opt(&a, j, &o, true) {
+                        match take_opt(&mut a, j, &o, true, mask, &mut choices, &mut unknown) {
                             Opt::Words(n) => j += n,
                             Opt::Shell(s) => {
                                 shell_string = s;
                                 break;
                             }
-                            Opt::Unknown => {
-                                unknown = true;
-                                j += 1;
-                            }
+                            _ => j += 1,
                         }
                     } else if !file_seen {
                         file_seen = true;
+                        // `script FILE CMD…`: read also as if the command
+                        // started at FILE (round 7 item 6: whatever a
+                        // `-t`/`--timing` before it took, the command is
+                        // checked from the first word that may start it)
+                        let bit = b == "script" && j + 1 < a.len() && {
+                            let bit = choices < 32 && (mask >> choices) & 1 == 1;
+                            choices += 1;
+                            bit
+                        };
+                        if bit {
+                            break;
+                        }
                         j += 1;
                     } else {
                         break;
@@ -1890,7 +2091,7 @@ pub fn unwrap_checked(argv: &[String]) -> (Vec<String>, bool) {
         }
         a.drain(..n);
     }
-    (a, unknown)
+    (a, unknown, choices)
 }
 
 /// The flag letters of an `env` cluster before its first value letter are

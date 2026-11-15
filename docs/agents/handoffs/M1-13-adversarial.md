@@ -790,3 +790,26 @@ adversarial_regression 44 | attention 8 | history 25 | ledger 20 | policy 44 | s
 adversarial_regression 20/20   adversarial_ordinary 20/20   adversarial_policy 20/20
 adversarial_gate       20/20   policy               20/20   adversarial_fuzz     20/20
 ```
+
+## Seventh round (D-092): stopped
+
+Stopped by the coordinator (usage limit) before the 20/20 loops; work-in-progress commit. It compiles, and `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace --no-fail-fast` all pass.
+
+Done (each has a generated `round_7_*` table in `adversarial_regression.rs`; all 7 tables were checked to fail on eb0aa88):
+
+- **Item 1 (globs).** `expand_glob` returns `None` (Maybe, so it asks) when any component has a `$`, a backtick or a brace. A gate path word with a `$` or a backtick is Maybe. `words::brace_expand` now expands `{x..y[..n]}` sequences, letters and integers, up to 64 words; a longer one stays literal.
+- **Item 2 (`||` before `eval`/`source`/`.`).** The walk records whether the last command came after `||` (`Level::last_skippable`). Same-shell text it runs is unioned with where the shell was, never put in its place.
+- **Item 3 (`ag`/`ack`).** Both tables were audited against the real option lists. `ag -A/-B/-C` and `--after/--before/--context`, and `ack --context`, are optional values read both ways (`long_opt_vals`). The missing entries were added.
+- **Item 4 (`NAME()`).** A definition is recognised at any command position (`opens_body` on the words before the name, with or without `function`).
+- **Item 5 (substituted wrappers).** `deny::reads_stdin_as_code` and `shell::is_pipe_code` unwrap after `substituted_program`.
+  - Beside it, not named by the review: any command word built by a substitution that names a program is also read as that program behind its wrappers, for every hard deny. On eb0aa88, `$(which sudo) id`, `$(which env) rm -rf ~/` and `$(which git) push --force` reached Allow. Test: `round_7_beside_item_5_generated_substituted_command_words`.
+- **Item 6 (wrapper tables).**
+  - `unwrap_readings` and the `Opt::Either`/`Opt::Split` cases give every reading. Wrapper options that can be read more than one way add the reason "unknown wrapper option", and the other readings become derived units, so hard deny checks each one.
+  - These forms are read both ways: `script -t`/`--timing`, a long flag with `=value` (`taskset --cpu-list=0-3`), and short flags followed by letters they don't take (`taskset -c0-3`).
+  - `script FILE CMD` is also read as if the command started at FILE.
+  - The flags of `setsid`, `chroot`, `ionice`, `timeout`, `chrt`, `taskset` and `flock` were audited, and `xargs --replace/--eof/--max-lines` were moved to optional long values.
+- **Major 7.** Redirections after `( … )` keep the group's join (`after_paren` and `group_tail`), and so does `( … ) | x`. A command piped into the next one no longer ends an `&&` chain: this also fixes `cd proj && ls | wc -l && cat .npmrc`, which eb0aa88 hard-denied. A `cd` inside `( … )` is followed in the group, and the group's frame adds where the shell was.
+  - `cd proj && (cd /tmp && true) && cat .npmrc` stays a hard deny, as on dev. Part 1's finding 1 needs subshell `cd`s to stay candidates, and `/tmp/.npmrc` is one.
+  - Ordinary table: `round_7_major_generated_redirected_and_piped_compounds_in_a_cd_chain` (324 lines) and `round_7_ordinary_lines_keep_devs_verdict`.
+
+Not done: the 20/20 loops of the six binaries, and a final review of this section. `script FILE CMD` now asks under a `script` prefix rule; this is the fail-closed fallback.

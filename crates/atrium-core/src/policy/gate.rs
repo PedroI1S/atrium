@@ -341,6 +341,9 @@ struct ReaderOpts {
     vals: &'static str,
     opt_vals: &'static str,
     long_vals: &'static [&'static str],
+    /// Long options whose value is optional (`ag --context [N]`, `ack
+    /// --context[=N]`): `--name=v` takes it, `--name v` is read both ways.
+    long_opt_vals: &'static [&'static str],
     long_flags: &'static [&'static str],
     /// Short options whose value is the pattern (`ag -g PAT`, `ack -g RE`)
     /// or that take no pattern (`ack -f`): the positional words are paths.
@@ -382,6 +385,15 @@ fn readings(args: &[String], o: &ReaderOpts) -> Option<Vec<(Vec<String>, bool)>>
                 if !has_val {
                     j += 1;
                 }
+            } else if o.long_opt_vals.contains(&name) {
+                if !has_val {
+                    if out.len() >= 16 {
+                        return None;
+                    }
+                    let with: Vec<(Vec<String>, bool, bool)> =
+                        out.iter().map(|r| (r.0.clone(), r.1, true)).collect();
+                    out.extend(with);
+                }
             } else if !o.long_flags.contains(&name) {
                 return None;
             }
@@ -421,13 +433,17 @@ fn readings(args: &[String], o: &ReaderOpts) -> Option<Vec<(Vec<String>, bool)>>
     Some(out.into_iter().map(|r| (r.0, r.1)).collect())
 }
 
+// The Silver Searcher's `getopt_long` table (`src/options.c`): `-A`, `-B`,
+// `-C` and their long names take an optional number (read both ways).
 const AG_OPTS: ReaderOpts = ReaderOpts {
     flags: "aDcFfHhiLlnoQRrSsvVtuUwz0",
-    vals: "ABCGgmpW",
-    opt_vals: "",
+    vals: "GgmpW",
+    opt_vals: "ABC",
     long_vals: &[
+        "ackmate-dir-filter",
         "depth",
         "file-search-regex",
+        "filename-pattern",
         "ignore",
         "ignore-dir",
         "max-count",
@@ -439,10 +455,11 @@ const AG_OPTS: ReaderOpts = ReaderOpts {
         "color-match",
         "color-path",
     ],
+    long_opt_vals: &["after", "before", "context"],
     long_flags: &[
-        "after",
-        "before",
-        "context",
+        "ackmate",
+        "affinity",
+        "noaffinity",
         "all-types",
         "all-text",
         "unrestricted",
@@ -450,6 +467,7 @@ const AG_OPTS: ReaderOpts = ReaderOpts {
         "ignore-case",
         "smart-case",
         "case-sensitive",
+        "fixed-strings",
         "literal",
         "files-with-matches",
         "files-without-matches",
@@ -457,6 +475,8 @@ const AG_OPTS: ReaderOpts = ReaderOpts {
         "column",
         "nocolor",
         "color",
+        "color-win-ansi",
+        "debug",
         "noheading",
         "heading",
         "nobreak",
@@ -464,9 +484,11 @@ const AG_OPTS: ReaderOpts = ReaderOpts {
         "follow",
         "nofollow",
         "skip-vcs-ignores",
+        "search-binary",
         "search-zip",
         "silent",
         "stats",
+        "stats-only",
         "vimgrep",
         "word-regexp",
         "only-matching",
@@ -477,22 +499,36 @@ const AG_OPTS: ReaderOpts = ReaderOpts {
         "nofilename",
         "numbers",
         "nonumbers",
+        "line-numbers",
         "group",
         "nogroup",
         "invert-match",
+        "match",
+        "mmap",
+        "nommap",
         "multiline",
         "nomultiline",
+        "nopager",
+        "parallel",
         "passthrough",
+        "passthru",
+        "print-all-files",
         "print-long-lines",
+        "recurse",
+        "norecurse",
     ],
     no_pattern: "g",
 };
 
+// ack 3's `Getopt::Long` table: `-C`/`--context` take an optional number
+// (read both ways); `-A`/`-B` and their long names need one.
 const ACK_OPTS: ReaderOpts = ReaderOpts {
     flags: "iISvwQlLchHo1nrRsxfk",
     vals: "ABmgt",
     opt_vals: "C",
     long_vals: &[
+        "after-context",
+        "before-context",
         "type",
         "ignore-dir",
         "noignore-dir",
@@ -500,6 +536,7 @@ const ACK_OPTS: ReaderOpts = ReaderOpts {
         "output",
         "max-count",
     ],
+    long_opt_vals: &["context"],
     long_flags: &[
         "ignore-case",
         "smart-case",
@@ -523,7 +560,6 @@ const ACK_OPTS: ReaderOpts = ReaderOpts {
         "recurse",
         "no-recurse",
         "sort-files",
-        "context",
         "nopager",
     ],
     no_pattern: "gf",
@@ -624,11 +660,16 @@ fn expand_glob(p: &Path) -> Option<Vec<PathBuf>> {
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
     let is_pat = |c: &str| c.contains(['*', '?', '[', '{']);
-    let first = comps.iter().position(|c| is_pat(c))?;
-    let prefix: PathBuf = comps[..first].iter().collect();
-    if prefix.to_string_lossy().contains(['$', '`']) {
+    // A `$`, a backtick or a brace left in any component (round 7 item 1):
+    // the shell expands it to something the pattern doesn't show
+    // (`~/${DIR}/work/*`, `~/$(echo v*)/w`); comma lists and ranges were
+    // expanded before (`words::brace_expand`), so a brace still here is one
+    // this walk can't read.
+    if comps.iter().any(|c| c.contains(['$', '`', '{', '}'])) {
         return None;
     }
+    let first = comps.iter().position(|c| is_pat(c))?;
+    let prefix: PathBuf = comps[..first].iter().collect();
     let mut seen = 0usize;
     // (folder, index of the next component, folders `**` went down)
     let mut stack: Vec<(PathBuf, usize, usize)> = vec![(prefix, first, 0)];
@@ -794,6 +835,12 @@ fn reaches_linked_ssh_dir(
             };
             k += 1;
             if command_word {
+                continue;
+            }
+            // a word the shell expands at run time (`$X`, a backtick) may
+            // name anything (round 7 item 1)
+            if p.to_string_lossy().contains(['$', '`']) {
+                maybe = true;
                 continue;
             }
             if globby {

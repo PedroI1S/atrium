@@ -734,3 +734,110 @@ fn round_6_ordinary_lines_keep_devs_verdict() {
         (". ./env.sh && make", ["Ask", "Ask", "Allow", "Allow"]),
     ]);
 }
+
+/// Round 7 major: a compound (or a plain command) with a redirection or a
+/// pipe after it, in a `cd proj &&` chain, keeps its place in the chain: the
+/// `.npmrc` read after it is in `proj`, as dev reads it (eb0aa88 hard-denied
+/// these). Generated: compounds × what follows them × what comes after.
+/// Home asks, `Any` and FullAccess allow, prefix rules never hard-deny.
+#[test]
+fn round_7_major_generated_redirected_and_piped_compounds_in_a_cd_chain() {
+    let compounds = [
+        "(true)",
+        "(ls; true)",
+        "(make)",
+        "{ true; }",
+        "if true; then true; fi",
+        "for f in a b; do true; done",
+        "true",
+        "ls",
+        // a `cd` in a subshell stays a candidate, inside `proj` (dev
+        // hard-denied this one)
+        "(cd sub && make)",
+    ];
+    let after = [
+        "",
+        " > /dev/null",
+        " 2>&1 > /dev/null",
+        " >> out.log",
+        " < /dev/null",
+        " 2>/dev/null",
+        " | cat",
+        " |& cat",
+        " 2>&1 | cat",
+        " | cat | cat",
+        " | wc -l",
+        " | grep x | wc -l",
+    ];
+    let tails = ["&& cat .npmrc", "&& cat .npmrc && ls", "&& { cat .npmrc; }"];
+    let env = Env::home();
+    let mut failures = vec![];
+    let mut n = 0;
+    for c in compounds {
+        for a in after {
+            for t in tails {
+                let line = format!("cd proj && {c}{a} {t}");
+                n += 1;
+                let got: Vec<String> = settings()
+                    .iter()
+                    .map(|(_, rules, preset)| {
+                        code(&env.eval_check(&cmd_check(&line), rules, *preset))
+                    })
+                    .collect();
+                let ok = got[0] == "Ask"
+                    && matches!(got[1].as_str(), "Ask" | "Allow")
+                    && got[2] == "Allow"
+                    && got[3] == "Allow";
+                if !ok {
+                    failures.push(format!("{line:?}: got {got:?}"));
+                }
+            }
+        }
+    }
+    assert!(n > 300, "{n}");
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Round 7: ordinary lines next to the other findings keep dev's verdict
+/// (a function defined after `{` or `!`, `||` before an `eval` that
+/// doesn't move, wrapper options, `ag`/`ack` context options, brace
+/// sequences).
+#[test]
+fn round_7_ordinary_lines_keep_devs_verdict() {
+    check_table(&[
+        ("{ f() { true; }; } && f", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "! f() { true; } && echo ok",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("f() { true; } && f", ["Ask", "Ask", "Allow", "Allow"]),
+        ("time make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("time -p make", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "false || eval 'echo hi' && ls",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("true || cd /tmp && ls", ["Ask", "Ask", "Allow", "Allow"]),
+        ("script out.log", ["Ask", "Ask", "Allow", "Allow"]),
+        ("script -q out.log make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("timeout -k 2 5 make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("taskset -c 0-3 make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("taskset 0x3 make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("xargs --replace=X echo X", ["Ask", "Ask", "Allow", "Allow"]),
+        ("ag --context=3 TODO src", ["Ask", "Ask", "Allow", "Allow"]),
+        ("ag -C 3 TODO src", ["Ask", "Ask", "Allow", "Allow"]),
+        ("ack --context=3 TODO src", ["Ask", "Ask", "Allow", "Allow"]),
+        ("ack -C 3 TODO src", ["Ask", "Ask", "Allow", "Allow"]),
+        ("echo {1..5}", ["Ask", "Ask", "Allow", "Allow"]),
+        ("mkdir -p dir{1..3}", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "for i in {1..10}; do echo $i; done",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("cat proj/{a..c}.md", ["Ask", "Ask", "Allow", "Allow"]),
+        ("echo {1..1000}", ["Ask", "Ask", "Allow", "Allow"]),
+        ("(cd proj && make)", ["Ask", "Ask", "Allow", "Allow"]),
+        ("(cd proj && make) > log", ["Ask", "Ask", "Allow", "Allow"]),
+        ("(cd proj && ls) | wc -l", ["Ask", "Ask", "Allow", "Allow"]),
+    ]);
+}
