@@ -129,6 +129,30 @@ pub fn inspect(input: InspectInput<'_>) -> Inspection {
         record_profile(&mut out, &profile_name, &parsed_configs);
     }
 
+    // Rules (.rules) and plugins folders are outside Atrium's parser and may
+    // alter provider gating (`prefix_rule` allow-prefixes, plugin MCP/hooks).
+    let mut rules_dirs: Vec<PathBuf> = vec![
+        PathBuf::from(std::path::MAIN_SEPARATOR_STR)
+            .join("etc")
+            .join("codex")
+            .join("rules"),
+    ];
+    let mut plugin_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = &user_dir {
+        rules_dirs.push(dir.join("rules"));
+        plugin_dirs.push(dir.join("plugins"));
+    }
+    rules_dirs.push(project_dir.join("rules"));
+    plugin_dirs.push(project_dir.join("plugins"));
+
+    for rdir in rules_dirs {
+        inspect_rules_dir(&mut out, &rdir, input.env);
+    }
+    for pdir in plugin_dirs {
+        inspect_plugins_dir(&mut out, &pdir, input.env);
+    }
+    record_config_plugins(&mut out, &parsed_configs);
+
     out
 }
 
@@ -175,7 +199,7 @@ fn has_hooks_feature(table: &toml::Table) -> bool {
     if table
         .get("features")
         .and_then(toml::Value::as_table)
-        .and_then(|f| f.get("codex_hooks"))
+        .and_then(|f| f.get("hooks"))
         .and_then(toml::Value::as_bool)
         == Some(true)
     {
@@ -185,6 +209,151 @@ fn has_hooks_feature(table: &toml::Table) -> bool {
         .get("hooks")
         .and_then(toml::Value::as_table)
         .is_some_and(|h| !h.is_empty())
+}
+
+fn inspect_rules_dir(out: &mut Inspection, dir: &Path, env: &[(String, String)]) {
+    let entries = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == ErrorKind::NotFound => return,
+        Err(_) => {
+            out.sources.push(ConfigSource {
+                kind: ConfigSourceKind::Other,
+                path: display_path(dir, env),
+                sha256: None,
+                inspected: false,
+            });
+            return;
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rules"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let sha = fs::read(&path).ok().map(|b| sha256_hex(&b));
+        out.sources.push(ConfigSource {
+            kind: ConfigSourceKind::Other,
+            path: display_path(&path, env),
+            sha256: sha,
+            inspected: false,
+        });
+    }
+}
+
+fn inspect_plugins_dir(out: &mut Inspection, dir: &Path, env: &[(String, String)]) {
+    let entries = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == ErrorKind::NotFound => return,
+        Err(_) => {
+            out.sources.push(ConfigSource {
+                kind: ConfigSourceKind::Plugin,
+                path: display_path(dir, env),
+                sha256: None,
+                inspected: false,
+            });
+            return;
+        }
+    };
+    let mut subdirs = Vec::new();
+    let mut has_files = false;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+        } else if path.is_file() {
+            has_files = true;
+        }
+    }
+    subdirs.sort();
+    for pdir in subdirs {
+        let shown = display_path(&pdir, env);
+        let mut sha = None;
+        for rel in ["hooks/hooks.json", "hooks.json"] {
+            if let Ok(bytes) = fs::read(pdir.join(rel)) {
+                sha = Some(sha256_hex(&bytes));
+                out.reasons.push(EnforcementReason {
+                    code: ReasonCode::ExternalHooks,
+                    message: format!("Codex plugin ships hooks outside Atrium ({shown})"),
+                });
+                break;
+            }
+        }
+        if sha.is_none() {
+            for rel in [
+                ".codex-plugin/plugin.json",
+                "plugin.json",
+                "manifest.json",
+                "config.toml",
+            ] {
+                if let Ok(bytes) = fs::read(pdir.join(rel)) {
+                    sha = Some(sha256_hex(&bytes));
+                    break;
+                }
+            }
+        }
+        out.sources.push(ConfigSource {
+            kind: ConfigSourceKind::Plugin,
+            path: shown,
+            sha256: sha,
+            inspected: false,
+        });
+    }
+    if has_files
+        && out
+            .sources
+            .iter()
+            .all(|s| s.kind != ConfigSourceKind::Plugin)
+    {
+        out.sources.push(ConfigSource {
+            kind: ConfigSourceKind::Plugin,
+            path: display_path(dir, env),
+            sha256: None,
+            inspected: false,
+        });
+    }
+}
+
+fn record_config_plugins(out: &mut Inspection, parsed_configs: &[(String, toml::Table)]) {
+    for (shown, table) in parsed_configs {
+        let Some(plugins) = table.get("plugins").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        let mut names: Vec<&String> = plugins.keys().collect();
+        names.sort();
+        for name in names {
+            let val = &plugins[name];
+            if val
+                .as_table()
+                .and_then(|t| t.get("enabled"))
+                .and_then(toml::Value::as_bool)
+                == Some(false)
+            {
+                continue;
+            }
+            if val
+                .as_table()
+                .and_then(|t| t.get("hooks"))
+                .and_then(toml::Value::as_table)
+                .is_some_and(|h| !h.is_empty())
+            {
+                out.reasons.push(EnforcementReason {
+                    code: ReasonCode::ExternalHooks,
+                    message: format!("plugin '{name}' configures hooks outside Atrium ({shown})"),
+                });
+            }
+            let bytes = toml::to_string(val)
+                .map(String::into_bytes)
+                .unwrap_or_default();
+            out.sources.push(ConfigSource {
+                kind: ConfigSourceKind::Plugin,
+                path: format!("{shown}#plugins.{name}"),
+                sha256: Some(sha256_hex(&bytes)),
+                inspected: false,
+            });
+        }
+    }
 }
 
 fn record_profile(out: &mut Inspection, name: &str, parsed_configs: &[(String, toml::Table)]) {
@@ -457,6 +626,80 @@ mod tests {
                 .iter()
                 .any(|r| r.code == ReasonCode::ExternalHooks)
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn features_hooks_key_adds_external_hooks_reason() {
+        let root = tmp_dir("features-hooks");
+        let user = root.join("u");
+        fs::create_dir_all(&user).unwrap();
+        fs::write(user.join("config.toml"), "[features]\nhooks = true\n").unwrap();
+        let i = inspect(InspectInput {
+            cwd: &root,
+            env: &[],
+            profile: None,
+            args: &[],
+            user_dir: Some(user.to_str().unwrap()),
+        });
+        assert!(
+            i.reasons
+                .iter()
+                .any(|r| r.code == ReasonCode::ExternalHooks),
+            "expected ExternalHooks for [features] hooks = true, got {:?}",
+            i.reasons
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rules_and_plugins_are_recorded_from_home_as_uninspected() {
+        let root = tmp_dir("rules-plugins");
+        let home = root.join("home");
+        let codex = home.join(".codex");
+        let rules = codex.join("rules");
+        let plugin = codex.join("plugins").join("sample-plugin");
+        let work = root.join("work");
+        fs::create_dir_all(&rules).unwrap();
+        fs::create_dir_all(plugin.join("hooks")).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        fs::write(
+            rules.join("default.rules"),
+            "prefix_rule(pattern=[\"git\"], decision=\"allow\")\n",
+        )
+        .unwrap();
+        fs::write(plugin.join("hooks").join("hooks.json"), "{\"hooks\":{}}").unwrap();
+
+        let env = vec![("HOME".to_owned(), home.display().to_string())];
+        let i = inspect(InspectInput {
+            cwd: &work,
+            env: &env,
+            profile: None,
+            args: &[],
+            user_dir: None,
+        });
+        let rule_src = i
+            .sources
+            .iter()
+            .find(|s| s.path.ends_with(".codex/rules/default.rules"))
+            .expect("rules file source recorded");
+        assert_eq!(rule_src.kind, ConfigSourceKind::Other);
+        assert!(!rule_src.inspected);
+        assert!(rule_src.sha256.is_some());
+
+        let plugin_src = i
+            .sources
+            .iter()
+            .find(|s| s.kind == ConfigSourceKind::Plugin && s.path.ends_with("sample-plugin"))
+            .expect("plugin dir source recorded");
+        assert!(!plugin_src.inspected);
+        assert!(plugin_src.sha256.is_some());
+        assert!(
+            i.reasons
+                .iter()
+                .any(|r| r.code == ReasonCode::ExternalHooks)
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 }

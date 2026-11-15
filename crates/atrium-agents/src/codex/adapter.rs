@@ -146,13 +146,57 @@ pub fn process_args(
     Ok(args)
 }
 
-/// Builds `thread/start` or `thread/resume` parameters implementing D-050 and D-088.
-pub fn thread_params(config: &SessionConfig) -> Value {
-    let (sandbox, approval_policy) = match config.permissions {
+fn expected_thread_policy(permissions: PermissionPolicy) -> (&'static str, &'static str) {
+    match permissions {
         PermissionPolicy::ReadOnly => ("read-only", "untrusted"),
         PermissionPolicy::Ask => ("workspace-write", "untrusted"),
         PermissionPolicy::FullAccess => ("danger-full-access", "never"),
-    };
+    }
+}
+
+fn normalize_sandbox_name(s: &str) -> &str {
+    match s {
+        "readOnly" | "read-only" => "read-only",
+        "workspaceWrite" | "workspace-write" => "workspace-write",
+        "dangerFullAccess" | "danger-full-access" => "danger-full-access",
+        other => other,
+    }
+}
+
+fn verify_effective_policy(permissions: PermissionPolicy, result: &Value) -> Result<(), String> {
+    let (expected_sandbox, expected_approval) = expected_thread_policy(permissions);
+    let actual_approval = result
+        .get("approvalPolicy")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "codex thread response omitted or non-string approvalPolicy (expected '{expected_approval}')"
+            )
+        })?;
+    if actual_approval != expected_approval {
+        return Err(format!(
+            "codex effective approvalPolicy mismatch: requested '{expected_approval}', got '{actual_approval}'"
+        ));
+    }
+    let sandbox_raw = result
+        .pointer("/sandbox/type")
+        .and_then(Value::as_str)
+        .or_else(|| result.get("sandbox").and_then(Value::as_str))
+        .ok_or_else(|| {
+            format!("codex thread response omitted sandbox type (expected '{expected_sandbox}')")
+        })?;
+    let actual_sandbox = normalize_sandbox_name(sandbox_raw);
+    if actual_sandbox != expected_sandbox {
+        return Err(format!(
+            "codex effective sandbox mismatch: requested '{expected_sandbox}', got '{sandbox_raw}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Builds `thread/start` or `thread/resume` parameters implementing D-050 and D-088.
+pub fn thread_params(config: &SessionConfig) -> Value {
+    let (sandbox, approval_policy) = expected_thread_policy(config.permissions);
     let mut params = json!({
         "cwd": config.cwd.display().to_string(),
         "sandbox": sandbox,
@@ -292,14 +336,6 @@ fn build_descriptor(
         user_dir: user_dir_str.as_deref(),
     });
     let mut reasons = inspect.reasons;
-    for src in &inspect.sources {
-        if !src.inspected {
-            reasons.push(EnforcementReason {
-                code: ReasonCode::UninspectedConfig,
-                message: format!("configuration source could not be inspected ({})", src.path),
-            });
-        }
-    }
     if gate_failed {
         reasons.push(EnforcementReason {
             code: ReasonCode::GateUnreachable,
@@ -816,6 +852,27 @@ impl Driver {
                         .filter(|e| !e.is_null())
                         .and_then(|e| e.get("message").and_then(Value::as_str))
                         .map(str::to_owned);
+                    let policy_err =
+                        if id_matches && rpc_err.is_none() && expected_id == "atrium-thread" {
+                            parsed
+                                .as_ref()
+                                .and_then(|v| v.get("result"))
+                                .map(|res| verify_effective_policy(self.config.permissions, res))
+                                .unwrap_or_else(|| {
+                                    Err("codex thread response missing result object".into())
+                                })
+                                .err()
+                        } else {
+                            None
+                        };
+                    if let Some(msg) = policy_err {
+                        let code = self.stop_process(Duration::ZERO).await;
+                        self.feed(AdapterInput::Stderr {
+                            line: format!("atrium: {msg}"),
+                        });
+                        self.feed(AdapterInput::Exit { code });
+                        return Err(AdapterError::Handshake(msg));
+                    }
                     self.feed(AdapterInput::Stdout { line });
                     if let Some(err_msg) = rpc_err {
                         let code = self.stop_process(Duration::ZERO).await;

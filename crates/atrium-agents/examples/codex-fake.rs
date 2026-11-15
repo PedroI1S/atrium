@@ -157,6 +157,24 @@ fn main() {
                     .pointer("/params/threadId")
                     .and_then(Value::as_str)
                     .unwrap_or("thread-fake");
+                let req_approval = req
+                    .pointer("/params/approvalPolicy")
+                    .and_then(Value::as_str)
+                    .unwrap_or("untrusted");
+                let req_sandbox = match req
+                    .pointer("/params/sandbox")
+                    .and_then(Value::as_str)
+                    .unwrap_or("read-only")
+                {
+                    "read-only" => "readOnly",
+                    "workspace-write" => "workspaceWrite",
+                    "danger-full-access" => "dangerFullAccess",
+                    other => other,
+                };
+                let effective_approval =
+                    env::var("FAKE_EFFECTIVE_APPROVAL").unwrap_or_else(|_| req_approval.to_owned());
+                let effective_sandbox =
+                    env::var("FAKE_EFFECTIVE_SANDBOX").unwrap_or_else(|_| req_sandbox.to_owned());
                 emit(
                     &out_tx,
                     json!({
@@ -165,6 +183,11 @@ fn main() {
                             "thread": {
                                 "id": tid,
                                 "cliVersion": "0.163.0"
+                            },
+                            "approvalPolicy": effective_approval,
+                            "sandbox": {
+                                "type": effective_sandbox,
+                                "networkAccess": false
                             }
                         }
                     }),

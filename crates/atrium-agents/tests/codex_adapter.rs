@@ -1041,3 +1041,69 @@ async fn unverified_legacy_permissions_and_grant_root_requests_are_declined() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn thread_start_effective_policy_mismatch_refuses_start() {
+    for (env_key, env_val, expected_substr) in [
+        (
+            "FAKE_EFFECTIVE_APPROVAL",
+            "never",
+            "approvalPolicy mismatch",
+        ),
+        (
+            "FAKE_EFFECTIVE_SANDBOX",
+            "dangerFullAccess",
+            "sandbox mismatch",
+        ),
+    ] {
+        let dir = scratch("policy-mismatch");
+        let mut cfg = config(&dir, "simple", allow());
+        cfg.permissions = PermissionPolicy::ReadOnly;
+        cfg.env.push((env_key.into(), env_val.into()));
+
+        let tap_inputs = Arc::new(Mutex::new(Vec::new()));
+        let tap_ref = tap_inputs.clone();
+        let mut options = opts(&dir);
+        options.tap = Some(Arc::new(move |input: &AdapterInput| {
+            tap_ref.lock().unwrap().push(input.clone());
+        }));
+
+        let err = CodexAdapter::with_options(options)
+            .start(cfg, Transport::Local)
+            .await
+            .unwrap_err();
+        let AdapterError::Handshake(msg) = err else {
+            panic!("expected Handshake error, got {err:?}");
+        };
+        assert!(
+            msg.contains(expected_substr),
+            "unexpected error message: {msg}"
+        );
+        let pid = fs::read_to_string(dir.join("pids.txt")).ok();
+        if let Some(p) = pid
+            && !p.trim().is_empty()
+        {
+            assert!(!alive(&p), "child still alive after policy mismatch");
+        }
+        let inputs = tap_inputs.lock().unwrap().clone();
+        let evs = atrium_agents::fixture::normalize(
+            &inputs
+                .iter()
+                .enumerate()
+                .map(|(i, input)| atrium_agents::fixture::FixtureLine {
+                    ms: i as u64,
+                    input: input.clone(),
+                })
+                .collect::<Vec<_>>(),
+            &mut atrium_agents::codex::CodexNormalizer::new(),
+        );
+        assert!(matches!(
+            evs.as_slice(),
+            [
+                AgentEvent::Error { fatal: true, .. },
+                AgentEvent::SessionEnded { .. }
+            ]
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
