@@ -56,7 +56,8 @@ def window(uri: str) -> None:
         # The page's own clock: navigation start → first contentful paint, and the window's
         # process start (`t0`, from the script) is not comparable, so only page-relative times.
         script = ("JSON.stringify({fcp: (performance.getEntriesByType('paint').find(p => p.name === 'first-contentful-paint') || {}).startTime ?? null,"
-                  " dcl: performance.getEntriesByType('navigation')[0]?.domContentLoadedEventStart ?? null})")
+                  " dcl: performance.getEntriesByType('navigation')[0]?.domContentLoadedEventStart ?? null,"
+                  " elements: document.getElementsByTagName('*').length, svgs: document.getElementsByTagName('svg').length})")
 
         def done(v, result):
             try:
