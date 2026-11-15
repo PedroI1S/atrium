@@ -56,7 +56,9 @@ mod server;
 mod sessions;
 mod upkeep;
 
-pub use commands::KEEP_RUNNING_SETTING;
+pub use commands::{
+    KEEP_RUNNING_SETTING, NOTIFY_APPROVAL_SETTING, NOTIFY_FAILED_SETTING, NOTIFY_QUESTION_SETTING,
+};
 pub use hub::{Notification, NotifyReason};
 pub use upkeep::CommandNotifier;
 
@@ -354,7 +356,12 @@ impl Daemon {
         upkeep::recover(&inner).await?;
         commands::reconcile_service(&inner).await;
         let threads = inner.store.threads().await?;
-        inner.hub().load(threads);
+        let settings = inner.store.settings().await?;
+        {
+            let mut hub = inner.hub();
+            hub.load(threads);
+            hub.load_notify_settings(&settings);
+        }
 
         let listener = server::bind(&inner.options.paths.socket)?;
         tokio::spawn(upkeep::watch_storage(inner.clone()));

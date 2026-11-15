@@ -60,8 +60,7 @@ async function setDaemonSetting(key: string, value: boolean): Promise<void> {
 }
 
 /**
- * Notifications per kind (contract §8 names the three). On unless switched off. The daemon
- * stores these settings but its notifier doesn't read them yet (change request CR-14).
+ * Notifications per kind (contract §8 names the three). On unless switched off.
  */
 const NOTIFY: { id: string; key: string; label: string; hint: string }[] = [
   { id: "notify-approval", key: "notify_approval", label: "An agent needs your approval", hint: "A command or a change is waiting for you to allow or deny it" },
@@ -277,7 +276,7 @@ export function SettingsCard() {
             <Show when={section().id === "agents"}><AgentsList /></Show>
             <Show when={section().id === "approvals"}><RulesList /></Show>
             <Show when={section().id === "notifications"}>
-              <p class="note">Atrium's background service posts these. It doesn't read these switches yet, so for now it notifies for all three.</p>
+              <p class="note">Atrium's background service posts these.</p>
             </Show>
             <Show when={section().id !== "appearance" && !connected()}><p class="note">These settings belong to Atrium's background service, which isn't connected right now.</p></Show>
             <Show when={section().id === "appearance"}><OpacityNote /></Show>

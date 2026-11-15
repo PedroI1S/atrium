@@ -41,6 +41,18 @@ const MAX_SETTING_KEY_BYTES: usize = 128;
 /// The setting behind "keep agents running after quitting" (contract §10).
 pub const KEEP_RUNNING_SETTING: &str = "keep_agents_running";
 
+/// Notification switches (contract §8). On unless explicitly set to `false`.
+pub const NOTIFY_APPROVAL_SETTING: &str = "notify_approval";
+pub const NOTIFY_QUESTION_SETTING: &str = "notify_question";
+pub const NOTIFY_FAILED_SETTING: &str = "notify_failed";
+
+fn is_notify_setting(key: &str) -> bool {
+    matches!(
+        key,
+        NOTIFY_APPROVAL_SETTING | NOTIFY_QUESTION_SETTING | NOTIFY_FAILED_SETTING
+    )
+}
+
 /// How long one provider's probe may take.
 const PROBE_PATIENCE: Duration = Duration::from_secs(15);
 
@@ -661,6 +673,21 @@ async fn set_setting(inner: &Arc<Inner>, key: String, new: Value) -> Result<Valu
             }
             return Ok(Value::Null);
         }
+    }
+    if is_notify_setting(&key) {
+        let Value::Bool(enabled) = new else {
+            return Err(failure(
+                ErrorCode::Invalid,
+                format!("{key} is true or false"),
+            ));
+        };
+        inner
+            .store
+            .set_setting(&key, Value::Bool(enabled))
+            .await
+            .map_err(store_failure)?;
+        inner.hub().set_notify_setting(&key, enabled);
+        return Ok(Value::Null);
     }
     inner
         .store
