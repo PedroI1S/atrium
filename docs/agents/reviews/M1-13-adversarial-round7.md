@@ -155,3 +155,23 @@ The fix pattern **is converging**, and every remaining regression/omission excep
   - `store`: `28 passed; 0 failed; 0 ignored` (`37.33s`)
   - `Doc-tests atrium_core`: `0 tests` (`0.00s`)
 - `cargo test -p atrium-core --test adversarial_fuzz` (standalone; bare `time` blocked by workspace command allowlist) -> exit `0`: `2 passed; 0 failed; 1 ignored; finished in 12.76s`.
+
+---
+
+## Orchestrator's check against `dev` (2026-11-15, Pedro: "Check against dev")
+
+Every evidence line of this review, evaluated on `dev` (`e4e869b`'s policy) and on `ccb1b60` with the same probe test (the branch's `common_adversarial` helpers, dropped into scratch checkouts of both trees; not committed). Engine settings: Home with no rules, prefix rules (`cd cat ls curl script flock xargs env timeout nice`), one Any rule, FullAccess. Gate settings (B2, M6): Home, Any, FullAccess, on a temp home.
+
+| Finding | Lines | `dev` | `ccb1b60` |
+|---|---:|---|---|
+| B1 `$(which eval)`/`$(which source)`/`$(which .)` | 4 | ask ask Allow Allow | **same** |
+| B1 `env --chd .. cat .ssh/id_rsa` | 1 | ask **Allow** Allow Allow | ask ask Allow Allow (stricter) |
+| B2 inbound symlink into `.ssh` via glob or `-L` | 4 | ask Allow Allow | **same** |
+| B3 `script -c`/`flock -c` from a download | 4 | 3 same; `script -q /dev/null -c bash`: ask Allow Allow Allow | that one: ask ask Allow Allow (stricter) |
+| B4 nested substitutions | 10 | ask ask Allow Allow | **same** |
+| B5 abbreviated long options (`timeout --sig`, `nice --adj`, `flock --time`, `script --comm`, `env --arg0`, `env --spl`) | 7 | ask **Allow** Allow Allow | ask ask Allow Allow (stricter) |
+| B5 `xargs -l/-e/-i` | 4 | ask Allow Allow Allow | **same** |
+| **M6 `ag --filename-pattern`, `ack --match` with a folder linked into `.ssh`** | 2 | ask Allow Allow | **hard deny ×3 (regression)** |
+| Controls (`ag -g`, `ack -C 2`, `cat proj/vault_link/id_rsa`) | 3 | — | same as `dev` |
+
+**Reading:** none of the five blockers is a regression. On every hostile line the branch is as strict as `dev` or stricter (9 lines move from Allow to Ask under prefix rules). They are gaps `dev` already has. The only line where the branch is worse than `dev` is the major: a false hard deny, which no rule can override.
