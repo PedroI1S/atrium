@@ -548,3 +548,9 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **The reviewer changed from Sonnet 5.5 to Opus 5.5.** The fix adds an `unsafe` `waitid` block in `atrium-host`, and D-053 gives every changed `unsafe` block there an Opus audit. Opus is still a different provider from the author.
 - **Review verdict: approve** (`reviews/M1-07b-proc-drop-linux.md`).
 - **The orchestrator re-ran the checks on the branch:** fmt, workspace clippy, `claude_adapter` 5/5, and `cargo test --workspace` (495 passed, 0 failed, 1 ignored). All clean.
+
+## D-087 — 2026-11-15 — Pedro's go: M1-16 review and the owed macOS checks, in parallel
+**Decided by Pedro (driver):** "do both paralel".
+- **M1-16-requests-and-notifications review:** Claude Sonnet 5.5, read-only (cross-provider: the author is Hydrogen), on `99e227e`. It checks what the worker didn't run: the 20-run loops, `scripts/check-protocol-ts`, the bindings file, contract §6.2/§8 rev 3.1, the Claude decline's shape and owned paths.
+- **macOS checks, run by the orchestrator (no worker):** `cargo test -p atrium-host -p atrium-agents` on `dev` (M1-07b's `terminate_blocking` on macOS); M1-09b's `startup_bench.py` and `stream_bench.py --runs 3` under `lockf`; the font-preload TTI check. The benchmarks run only while no build is going, so they wait for the reviewer's compiles.
+- **Not in this go:** M1-13 (resume, redo or fail-closed), N8, the daemon's silent exit, M1-08.
