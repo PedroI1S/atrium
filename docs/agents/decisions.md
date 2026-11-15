@@ -569,3 +569,10 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **M1-15-store-launch-recovery: Gemini 4 Hydrogen `high`** (D-074, D-076), **reviewed by Opus 5.5**, read-only. Branch `agent/hydrogen/M1-15-store-launch-recovery`, from `dev` after M1-16's merge. It carries CR-08, CR-10, M1-13's finding 12, N1–N3 and now **CR-09** (D-082), whose code is `attention::next_state` plus a daemon test.
 - **The brief's "M1-13 merged" dependency is waived.** M1-13's adversarial tests (its recovery tests among them) aren't on `dev`, so the worker can't run them. When M1-13 merges, the orchestrator runs them against M1-15's branch before M1-15 merges. M1-15 doesn't touch `policy/**`, so the two branches shouldn't conflict in code.
 - The brief was rewritten for this shift: the Linux-container rules became the `agy` policy's, and CR-09 was moved from "out of scope" to step 0.
+
+## D-091 — 2026-11-15 — Pedro's go: the small items (contract erratum, N8, N9)
+**Decided by Pedro (driver):** "lets fix those small itens".
+- **Contract erratum (rev 3.1, §6.2):** the sentence on an adapter that can't dismiss a question named a `RequestResolved` detail that doesn't exist. It now says: `RequestResolved { outcome: Cancelled }`, then `Error { fatal: false }` saying the provider can't dismiss a question, then the turn is interrupted. No wire change. Written by the orchestrator, found by M1-16's review.
+- **N8 → M1-07c-leader-sigkill: Claude Opus 5.5** (D-076's exception: process-signal code in `atrium-host`, possibly `unsafe`), **reviewed by Gemini 4 Hydrogen `high`**. Brief `briefs/M1-07c-leader-sigkill.md`.
+- **N9 (new in `m1-must-fix.md`, the daemon's silent exit) → M1-17-daemon-start-refusal: Gemini 4 Hydrogen `medium`**, reviewed by Sonnet 5.5. Brief `briefs/M1-17-daemon-start-refusal.md`.
+- **Not in this go:** the macOS benchmarks and font-preload A/B (D-087; they still wait for a quiet machine).
