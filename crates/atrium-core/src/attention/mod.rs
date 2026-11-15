@@ -51,6 +51,25 @@ pub fn next_state(
         return ThreadState::Starting;
     }
 
+    // An unverified cleanup stays visible even after Ended or a verified exit
+    // (CR-09): Failed keeps its error message and stays Failed.
+    if matches!(
+        input,
+        AttentionInput::Signal(Signal::Recovered {
+            cleanup: Cleanup::Unverified,
+        })
+    ) && matches!(
+        current,
+        ThreadState::Ended
+            | ThreadState::Interrupted {
+                cleanup: Cleanup::Verified,
+            }
+    ) {
+        return ThreadState::Interrupted {
+            cleanup: Cleanup::Unverified,
+        };
+    }
+
     // Failed, Ended and Interrupted stay until the next start.
     if matches!(
         current,

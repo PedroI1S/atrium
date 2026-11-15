@@ -1543,3 +1543,51 @@ async fn the_synthetic_agent_says_when_it_does_not_queue_a_message() {
     wire.ok(shutdown(&thread)).await;
     rig.stop(true).await;
 }
+
+#[tokio::test]
+async fn a_stopped_session_with_unverified_cleanup_becomes_interrupted() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    *rig.adapter.start.lock().expect("lock") = Start::Process;
+    let thread = wire.start_thread(native(), Some("go")).await.thread_id;
+    let mut script = rig.script().await;
+    script.command().await;
+    script.started("native-1").await;
+    script.turn(1).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Running)
+        .await;
+    // User stops the session (moves to Ended), then the stream drops without
+    // SessionEnded and nobody reaps the provider process.
+    wire.ok(shutdown(&thread)).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Ended)
+        .await;
+    assert_eq!(script.command().await, SessionCommand::Shutdown);
+    script.die();
+    let summary = wire
+        .thread_when(&thread, |summary| {
+            matches!(summary.state, ThreadState::Interrupted { .. })
+        })
+        .await;
+    assert_eq!(
+        summary.state,
+        ThreadState::Interrupted {
+            cleanup: Cleanup::Unverified
+        }
+    );
+    soon(async {
+        while kinds(&wire.history(&thread).await).last() != Some(&"session_ended") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        wire.thread(&thread).await.state,
+        ThreadState::Interrupted {
+            cleanup: Cleanup::Unverified
+        }
+    );
+    assert!(inbox(&mut wire).await.iter().any(|item| {
+        item.reason == InboxReason::CleanupUnverified && item.thread_id.as_ref() == Some(&thread)
+    }));
+    rig.stop(true).await;
+}
