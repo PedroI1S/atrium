@@ -222,7 +222,7 @@ Commands: `python3 app/scripts/startup_bench.py` (TTI, idle memory, pop-out), `p
 | Change | Private PSS, MiB (launches) | Effect | Cost |
 |---|---|---|---|
 | none (above) | 151.4–152.5 (9) | — | — |
-| `WEBKIT_DISABLE_DMABUF_RENDERER=1` | **135.9–138.1 (3)**, 142.5–144.8 MB | −14 (web −12, UI −2.5); GPU 114.6 → 5.6 | **Streaming collapses** (below: 19.8 % long frames, p99 115 ms) and TTI +76 ms (472 vs 396, interleaved). Not usable. |
+| `WEBKIT_DISABLE_DMABUF_RENDERER=1` | **135.9–138.1 (3)**, 142.5–144.8 MB | −14 (web −12, UI −2.5); GPU 114.6 → 5.6 | **Streaming collapses** (below: 19.8 % long frames, p99 115 ms) and TTI +75 ms (471 vs 396, interleaved). Not usable. |
 | `WEBKIT_DISABLE_COMPOSITING_MODE=1` | 151.0–151.8 (3) | none; GPU 130.7 | TTI 397 / 413 (not interleaved; head 377 / 391 an hour earlier) |
 | `MALLOC_ARENA_MAX=2` | 151.0–153.5 (3) | none | — |
 | Size-optimised binary (`opt-level = "s"`, `lto = "fat"`, `codegen-units = 1` through `CARGO_PROFILE_PERF_*`; 7.8 MB instead of 14.6) | 149.5–149.7 (3), against 151.7–153.0 for head in the same interleaved batch (3) | **−2.5** (UI process only: 57.9 vs 58.7–60.7) | TTI 394 / 410 vs 386 / 404 (20 each, interleaved): no difference beyond noise. A profile change in `Cargo.toml` (not this task's paths); slower release builds |
@@ -239,13 +239,14 @@ Not tried, with what the numbers say about them: the page with the CSS and none 
 | **private PSS added by one pop-out** | **66.9** | 64.2 | 69.8 |
 | of which: a second `WebKitWebProcess` | 66.5 | 63.9 | 69.0 |
 | of which: UI process | 4.9 | 4.5 | 5.0 |
-| of which: network process | 0.0 | −0.2 | 0.0 |
+| of which: network process | −0.2 | −0.2 | 0.0 |
+| of which: GTK's SVG loader (exits during the run) | −4.3 | −4.4 | −4.3 |
 | full PSS | 69.9 | 67.0 | 72.6 |
-| RSS | 201.8 | 199.3 | 204.8 |
+| RSS | 201.8 | 199.4 | 204.8 |
 | GPU resident | 68.2 | 64.2 | 70.4 |
 | the pop-out ready after it was asked for | 229 ms | 228 | 231 |
 
-Each window gets its own web process; the network process is shared. One window showing a thread (the pop-out baseline) is 158.6–162.7 MiB, against 151.7 idle. M0 measured ~75 MB of PSS and ~88 MB of GPU per pop-out; macOS's budget is ~35 MB (D-028).
+**The 66.9 is the change in the total, and it is about 4.3 MiB low:** in all five launches GTK's sandboxed SVG loader (`glycin-svg`) was alive in the baseline and had exited by the second sample, so the pop-out's own cost (UI + web + network) is **71.2 MiB** (median; 68.5–74.0) (orchestrator, from `bench-1.json`, after the review; `startup_bench.py` now prints the helper's row). Each window gets its own web process; the network process is shared. One window showing a thread (the pop-out baseline) is 158.6–162.7 MiB, against 151.7 idle. M0 measured ~75 MB of PSS and ~88 MB of GPU per pop-out; macOS's budget is ~35 MB (D-028).
 
 ### Startup profile (L3; D-041)
 

@@ -292,7 +292,12 @@ def popout_launches(app_path, home, logs, n, extra_env) -> list[dict]:
             after = summarize(sample_window(app.pid, [], 31))
         finally:
             stop_app(app)
-        delta = {k: after[k] - before[k] for k in after if k in before and isinstance(after[k], (int, float)) and k != "longestOverGateS"}
+        # A role present on one side only (GTK's SVG loader exits while the baseline is sampled)
+        # counts as 0 on the other, so the per-role deltas add up to the total.
+        keys = [k for k in after if k in before] + sorted(
+            k for k in set(before) ^ set(after) if k.startswith("role:"))
+        delta = {k: after.get(k, 0.0) - before.get(k, 0.0) for k in keys
+                 if isinstance(after.get(k, before.get(k)), (int, float)) and k != "longestOverGateS"}
         out.append({"before": before, "after": after, "delta": delta, "readyMs": opened.get("readyMs")})
         roles = ", ".join(f"{k[5:]} {v:+.1f}" for k, v in delta.items() if k.startswith("role:"))
         gpu = f", GPU resident {delta['gpuResident']:+.1f}" if "gpuResident" in delta else ""
