@@ -594,3 +594,10 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 
 ## D-097 — 2026-11-15 — Pedro's go: M1-15 fix round
 **Decided by Pedro (driver):** "Yes, fix round". The Opus review (`reviews/M1-15-store-launch-recovery.md`: approve with changes) asked for: the recovery regression fixed (a non-archived thread stopped while its provider was starting, then a daemon crash, is never closed and can stay `Ended` with an unverified process) with a test; three behaviour changes documented (`SessionEnded` clears `process`; a stored fatal `Error` stops the session; an archived incarnation with no events is still never closed); two doc comments fixed. The same Hydrogen `high` worker does them; the minors it can fix in its paths too. The orchestrator checks the fix (the regression test must fail on `cc8978d`), resolves the contract text conflict with `dev` when merging (keep both sentences), and merges.
+
+## D-098 — 2026-11-15 — Pedro's go: fix M1-13's major 5, then merge
+**Decided by Pedro (driver):** "Fix M5, then merge". This ends M1-13's rounds (D-096).
+- **The fix.** The round-8 review's only regression against `dev` is major 5: `searches_cwd` strips `rg`'s `-L`/`--follow` before pairing flags with values, so it swallows a value (`rg -e -L safe_sub`, `rg -rL pat safe_sub`, `rg -g -L pat safe_sub`, `rg -f -L safe_sub`, `rg --file -L safe_sub`, `rg -e --follow safe_sub`). With a folder linked into `~/.ssh` in the cwd, these become a hard deny.
+  - The same Opus worker fixes only that, with a test per form.
+  - The orchestrator checks that the test fails on `b336b2c` and that the six forms match `dev`'s verdicts, then merges and runs the full checks.
+- **Known limits, not fixed before the merge.** Blockers 1–4 of `reviews/M1-13-adversarial-round8.md` are marked "same as dev" by the reviewer. They are recorded as known limits for a follow-up policy task, together with CR-12 and P1.
