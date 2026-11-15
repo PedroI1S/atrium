@@ -539,10 +539,17 @@ fn is_interpreter(cmd: &str) -> bool {
         )
 }
 
-fn reads_stdin_as_code(eff: &[String]) -> bool {
+pub(crate) fn reads_stdin_as_code(eff: &[String]) -> bool {
+    reads_stdin_as_code_at(eff, 0)
+}
+
+fn reads_stdin_as_code_at(eff: &[String], depth: u8) -> bool {
     let Some(first) = eff.first() else {
         return false;
     };
+    if depth > 4 {
+        return true;
+    }
     let b = base(first);
     let args = &eff[1..];
     if shell::reads_stdin_as_script(eff) {
@@ -566,7 +573,7 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
                 let mut e = eff.to_vec();
                 e[0] = name;
                 let (u, unknown) = shell::unwrap_checked(&e);
-                unknown || (!u.is_empty() && u != eff && reads_stdin_as_code(&u))
+                unknown || (!u.is_empty() && u != eff && reads_stdin_as_code_at(&u, depth + 1))
             }
         };
     }
@@ -591,7 +598,16 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
             || (!shell && matches!(a.as_str(), "--eval" | "--command" | "--print"))
     });
     if code_flag {
-        return false;
+        // `sh -c bash`, `script -c bash f`, `flock -c bash l` (unwrapped to
+        // `sh -c …`): the code given may itself read the script on stdin
+        // (round 8 blocker 3)
+        return shell
+            && shell::shell_c_code(eff).is_some_and(|code| {
+                shell::lex(&code)
+                    .units
+                    .iter()
+                    .any(|u| reads_stdin_as_code_at(&u.eff, depth + 1))
+            });
     }
     // `bash -o pipefail`: the option's value isn't a script
     let mut positional = false;

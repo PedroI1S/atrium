@@ -809,7 +809,33 @@ Done (each has a generated `round_7_*` table in `adversarial_regression.rs`; all
   - `script FILE CMD` is also read as if the command started at FILE.
   - The flags of `setsid`, `chroot`, `ionice`, `timeout`, `chrt`, `taskset` and `flock` were audited, and `xargs --replace/--eof/--max-lines` were moved to optional long values.
 - **Major 7.** Redirections after `( … )` keep the group's join (`after_paren` and `group_tail`), and so does `( … ) | x`. A command piped into the next one no longer ends an `&&` chain: this also fixes `cd proj && ls | wc -l && cat .npmrc`, which eb0aa88 hard-denied. A `cd` inside `( … )` is followed in the group, and the group's frame adds where the shell was.
-  - `cd proj && (cd /tmp && true) && cat .npmrc` stays a hard deny, as on dev. Part 1's finding 1 needs subshell `cd`s to stay candidates, and `/tmp/.npmrc` is one.
+  - (Corrected in round 8, review nit 7.) `cd proj && (cd /tmp && true) && cat .npmrc` is **not** a hard deny on this branch: it is Ask, Ask, Allow, Allow (dev hard-denies it, a false hard deny). A `cd` inside `( … )` is followed and stays a candidate (Part 1's finding 1), but `/tmp/.npmrc` is not a credential: only `~/.npmrc` is. `cd proj && (cd ~ && true) && cat .npmrc` stays a hard deny.
   - Ordinary table: `round_7_major_generated_redirected_and_piped_compounds_in_a_cd_chain` (324 lines) and `round_7_ordinary_lines_keep_devs_verdict`.
 
-Not done: the 20/20 loops of the six binaries, and a final review of this section. `script FILE CMD` now asks under a `script` prefix rule; this is the fail-closed fallback.
+The open items of this stopped round (the 20/20 loops) are closed in round 8 below. `script FILE CMD` asks under a `script` prefix rule; this is the fail-closed fallback.
+
+## Eighth round (D-096): the round-7 re-review of `ccb1b60`
+
+Every item has a generated `round_8_*` table that fails on ccb1b60 and passes now (checked on a `git archive ccb1b60` tree with the current tests).
+
+- **M6 (regression, first).** With `~/.ssh/work -> ~/vault/work` and cwd `~/vault`, `ag --filename-pattern '*.rs' safe_sub` and `ack --match pat safe_sub` were false hard denies. The reader tables now have `long_no_pattern` (`ag --filename-pattern`, `ack --match`), read like the short `-g`/`-f`.
+  - Audit of the `no_pattern` handling of all reader tables: `rg -f`/`--file`, `grep -f`/`--file` (a pattern file) were Ask; the gate reads them as `-e`/`--regexp`, so every positional word is a folder.
+  - Test: `adversarial_ordinary.rs::round_8_major_6_searches_given_a_folder_beside_a_linked_one` (16 lines, dev's Ask/Allow/Allow).
+  - Still differs from dev: `ag --filename-pattern X` and `ack --match X` with **no** folder, from `~/vault`, are hard denies, as `ag -g X` is since round 6 (they search the cwd, which holds a linked folder).
+- **B1 (same-shell owners).** `same_shell_owner` and the pipe/stdin checks use `runs_here`: `eval`/`source`/`.` as the first word, or as the first word of any reading after resolving substitutions and wrappers (`$(which eval)`, `$(which env) eval`, `$(which source)`, `$(which .)`). `env`'s long options match by unique GNU prefix (`env_long`: `--chd` is `--chdir`, `--spl` is `--split-string`, …), in the walk and in `env_payloads`. Test: `round_8_blocker_1_…`.
+  - Same as the plain form, not a hard deny: `cd proj && $(which source) ./helper.sh && cat .npmrc` asks like `cd proj && source ./helper.sh && cat .npmrc` (the script's text is unknown; existing design gap, as on dev).
+- **B3 (`script -c`, `flock -c`).** Their argument is shell code: the reading is unwrapped to `sh -c CODE`, and `reads_stdin_as_code` and the pipe-to-shell check lex `CODE` (bounded depth 4), bare and substituted (`curl … | script -c bash /dev/null`, `| flock -c bash /tmp/l`, `| $(which script) -c bash …`). Test: `round_8_blocker_3_…`.
+- **B4 (iterated substitutions).** `unwrap_reading` resolves a substituted command word at each step of its (12-step) loop, and `find -exec` units push one unit per reading: `$(which env) $(which sudo) id`, `$(which timeout) 5 $(which rm) -rf ~/`, `$(which env) $(which find) . -exec $(which sudo) id \;`. Test: `round_8_blocker_4_…`.
+- **B5 (unknown and abbreviated options).** `Opt::Unknown` long flags without `=` are read both ways (one word, or two) in every wrapper table and in `env`; long options match by unique prefix (more than 3 letters) in every table; `xargs -l`/`-e`/`-i` are optional values read both ways. Test: `round_8_blocker_5_…`.
+- **B2 (links into `~/.ssh` from elsewhere).** In the gate, `reaches_tree_through_links` runs after the linked-dir checks, over the credential trees (canonical `sensitive_roots`) plus the folders linked into `~/.ssh`:
+  - every path a glob matches is resolved (`real_path`) and is a hard deny when it is inside a tree, or is a credential file itself (`proj/c*/credentials` with `proj/cloud -> ~/.aws`); a recursive reader also when it names a folder holding a tree. `ls GLOB` (not recursive) is exempt: it only lists names.
+  - a following search (`rg -L`/`--follow`, `grep -R`, `find -L`/`-follow`, `ag -f`/`--follow`, `ack --follow`) walks its folders (or its cwd) for links into a tree: a bounded walk (4096 entries, depth 16) that asks when it runs out.
+  - Test: `round_8_blocker_2_…` (gate, real temp folders).
+  - Changed old test: `adversarial_gate.rs::globs_expand_against_the_real_folder` moved `cat proj/*` from Ask to the deny list: its `proj` holds links to keys, so the hard deny is right.
+  - Left: an inbound link reached without a glob or a following search (`cat proj/vault_link/id_rsa`) is the existing real-path check (a hard deny); a link created by the same command line, or a following search whose folder is a substitution, isn't seen (it asks only when the path is unknown).
+- **Nit 7.** The round-7 claim about `cd proj && (cd /tmp && true) && cat .npmrc` is corrected above.
+- **Ordinary lines.** `round_8_ordinary_lines_keep_devs_verdict` (18 lines: `timeout --sig`, `env --chd proj make`, `xargs -I {}`, `flock -c make`, `script -c make`, `$(which env) make test`, `$(which source) .venv/bin/activate`, …) all at dev's Ask/Ask/Allow/Allow. No ordinary line differs from dev except the `ag --filename-pattern X`/`ack --match X` cwd searches above, and `cd proj && (cd /tmp && true) && cat .npmrc` (dev's false hard deny, now Ask/Ask/Allow/Allow, since round 7).
+
+DoD: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace --no-fail-fast` pass. 20-run loops on the final code: `adversarial_regression`, `adversarial_ordinary`, `adversarial_policy`, `adversarial_gate`, `policy` and `adversarial_fuzz` each passed 20/20.
+
+Open for the owner (not closed in this round): `source FILE`/`eval "$X"` with unknown text don't make the cwd unknown (as on dev); `env -C DIR CMD` keeps dev's false hard deny (unchanged, by the rules).

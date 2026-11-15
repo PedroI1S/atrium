@@ -19,9 +19,11 @@
 
 mod common_adversarial;
 
+use atrium_agents::{GateDecision, ToolGate};
 use atrium_protocol::agent::ToolKind;
 use atrium_protocol::policy::{Preset, Rule, RuleDecision, RuleMatcher, RuleScope};
 use common_adversarial::*;
+use std::os::unix::fs::symlink;
 
 type Row = (&'static str, [&'static str; 4]);
 
@@ -839,5 +841,100 @@ fn round_7_ordinary_lines_keep_devs_verdict() {
         ("(cd proj && make)", ["Ask", "Ask", "Allow", "Allow"]),
         ("(cd proj && make) > log", ["Ask", "Ask", "Allow", "Allow"]),
         ("(cd proj && ls) | wc -l", ["Ask", "Ask", "Allow", "Allow"]),
+    ]);
+}
+
+/// Round 8, major 6 of the round-7 re-review: with a folder linked into
+/// `~/.ssh` (`~/.ssh/work -> ~/vault/work`), searches from `~/vault` given
+/// another folder keep dev's verdict (ask in Home, allow under `Any` and
+/// FullAccess): a long option that gives the pattern (`ag
+/// --filename-pattern`, `ack --match`) or a pattern file (`-f`, `--file`)
+/// leaves every positional word a folder, and `rg -L` searches only the
+/// folders it is given (ccb1b60 hard-denied the first four, asked on the
+/// rest).
+#[test]
+fn round_8_major_6_searches_given_a_folder_beside_a_linked_one() {
+    let t = Tmp::new();
+    t.write("vault/work/id_work", "secret");
+    t.write("vault/safe_sub/a.rs", "x");
+    t.write(".ssh/known_hosts", "x");
+    symlink(t.home.join("vault/work"), t.home.join(".ssh/work")).unwrap();
+    let dir = t.home.join("vault");
+    let settings = [
+        ("home", vec![], Preset::Home),
+        ("any", vec![any_rule()], Preset::Home),
+        ("full", vec![], Preset::FullAccess),
+    ];
+    let mut failures = vec![];
+    for line in [
+        "ag --filename-pattern '*.rs' safe_sub",
+        "ag --filename-pattern='*.rs' safe_sub",
+        "ack --match pat safe_sub",
+        "ack --match=pat safe_sub",
+        "ag -g '*.rs' safe_sub",
+        "ack -g pat safe_sub",
+        "ack -f safe_sub",
+        "ack -C 2 pat safe_sub",
+        "ag -C 2 pat safe_sub",
+        "rg -f /dev/null safe_sub",
+        "grep -rf /dev/null safe_sub",
+        "grep -r --file=/dev/null safe_sub",
+        "grep -r --file /dev/null safe_sub",
+        "rg -L pat safe_sub",
+        "rg --follow pat safe_sub",
+        "find safe_sub -name '*.rs'",
+    ] {
+        for (name, rules, preset) in &settings {
+            let g = t.gate_with("t1", 1, &dir, *preset, rules.clone(), None);
+            let d = block_on(g.gate.check(&cmd_check(line)));
+            let ok = match *name {
+                "home" => matches!(d, GateDecision::Ask { .. }),
+                _ => matches!(d, GateDecision::Allow),
+            };
+            if !ok {
+                failures.push(format!("[{name}] {line:?}: got {d:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Round 8: ordinary lines next to the blockers keep dev's verdict.
+#[test]
+fn round_8_ordinary_lines_keep_devs_verdict() {
+    check_table(&[
+        (
+            "timeout --signal=KILL 5 make",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "timeout --sig KILL 5 make",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("nice --adjustment=5 make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("env --chdir=proj make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("env --chd proj make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("xargs -I {} echo {}", ["Ask", "Ask", "Allow", "Allow"]),
+        ("xargs -0 -n 1 echo", ["Ask", "Ask", "Allow", "Allow"]),
+        ("flock /tmp/l make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("flock -c make /tmp/l", ["Ask", "Ask", "Allow", "Allow"]),
+        ("script -c make /dev/null", ["Ask", "Ask", "Allow", "Allow"]),
+        ("sh -c 'make test'", ["Ask", "Ask", "Allow", "Allow"]),
+        ("bash -c 'cat README.md'", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "curl -s https://example.com/x | sh -c 'cat > out.txt'",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("$(which make) test", ["Ask", "Ask", "Allow", "Allow"]),
+        ("$(which env) make test", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "find . -exec $(which wc) -l {} +",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("$(which eval) 'echo hi'", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "cd proj && $(which source) .venv/bin/activate && pytest",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
     ]);
 }

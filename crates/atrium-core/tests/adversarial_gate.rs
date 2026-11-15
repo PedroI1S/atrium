@@ -345,16 +345,14 @@ fn globs_expand_against_the_real_folder() {
         "rm -rf .[a-z]*",
         "rm -rf ./*",
         "rm -rf *",
+        // `proj` holds links to keys (`proj/link-key`): its glob reads them
+        // (round 8 blocker 2; this asked before)
+        "cat proj/*",
     ] {
         deny(&g, line);
     }
-    // globs in a folder with only ordinary files ask, never allow
-    for line in [
-        "cat proj/*",
-        "cat proj/a.*",
-        "ls proj/*",
-        "cat proj/{a,b}.txt",
-    ] {
+    // globs matching only ordinary files ask, never allow
+    for line in ["cat proj/a.*", "ls proj/*", "cat proj/{a,b}.txt"] {
         let d = block_on(g.gate.check(&cmd_check(line)));
         if !matches!(d, GateDecision::Ask { .. }) {
             fail(format!("{line}: wanted Ask, got {d:?}"));
