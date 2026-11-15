@@ -1107,3 +1107,187 @@ async fn thread_start_effective_policy_mismatch_refuses_start() {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+#[tokio::test]
+async fn saturation_declines_approvals_questions_and_reports_dropped_events() {
+    use tokio::sync::Notify;
+
+    const PENDING_LIMIT: usize = 4096;
+
+    struct SlowAskGate {
+        started: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+        seen_asks: Arc<AtomicUsize>,
+    }
+
+    impl ToolGate for SlowAskGate {
+        fn check<'a>(&'a self, _tool: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let notify = self.notify.clone();
+            let seen_asks = self.seen_asks.clone();
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::AcqRel);
+                while !release.load(Ordering::Acquire) {
+                    notify.notified().await;
+                }
+                let n = seen_asks.fetch_add(1, Ordering::AcqRel);
+                GateDecision::Ask {
+                    ticket: ApprovalTicket {
+                        request_id: format!("sat-req-{n}"),
+                        rememberable: false,
+                    },
+                }
+            })
+        }
+
+        fn redeem<'a>(
+            &'a self,
+            _ticket: &'a ApprovalTicket,
+            _tool: &'a ToolCheck,
+        ) -> BoxFuture<'a, GateDecision> {
+            Box::pin(async {
+                panic!("redeem should not be called when approval was declined at PENDING_LIMIT");
+            })
+        }
+
+        fn question_ticket(
+            &self,
+            _turn: Option<u32>,
+        ) -> BoxFuture<'static, Option<ApprovalTicket>> {
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let notify = self.notify.clone();
+            let seen_asks = self.seen_asks.clone();
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::AcqRel);
+                while !release.load(Ordering::Acquire) {
+                    notify.notified().await;
+                }
+                let n = seen_asks.fetch_add(1, Ordering::AcqRel);
+                Some(ApprovalTicket {
+                    request_id: format!("sat-q-{n}"),
+                    rememberable: false,
+                })
+            })
+        }
+    }
+
+    let dir = scratch("saturation-requests");
+    let gate = Arc::new(SlowAskGate {
+        started: Arc::new(AtomicUsize::new(0)),
+        release: Arc::new(AtomicBool::new(false)),
+        notify: Arc::new(Notify::new()),
+        seen_asks: Arc::new(AtomicUsize::new(0)),
+    });
+    let stdout_count = Arc::new(AtomicUsize::new(0));
+    let sc = stdout_count.clone();
+
+    let mut cfg = config(&dir, "flood-then-ask", gate.clone());
+    cfg.env.push(("FAKE_FLOOD_COUNT".into(), "5500".into()));
+    let mut options = opts(&dir);
+    options.tap = Some(Arc::new(move |input: &AdapterInput| {
+        if matches!(input, AdapterInput::Stdout { .. }) {
+            sc.fetch_add(1, Ordering::AcqRel);
+        }
+    }));
+
+    let session = CodexAdapter::with_options(options)
+        .start(cfg, Transport::Local)
+        .await
+        .unwrap();
+
+    session.commands.send(say("saturate")).await.unwrap();
+
+    let wait_end = Instant::now() + Duration::from_secs(5);
+    let min_stdout = PENDING_LIMIT + session.events.max_capacity() + 5;
+    while (session.events.len() < session.events.max_capacity()
+        || gate.started.load(Ordering::Acquire) < 2
+        || stdout_count.load(Ordering::Acquire) < min_stdout)
+        && Instant::now() < wait_end
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        session.events.len(),
+        session.events.max_capacity(),
+        "event channel should be full"
+    );
+    assert_eq!(
+        gate.started.load(Ordering::Acquire),
+        2,
+        "both approval and question gates started"
+    );
+
+    // Release both slow gate calls while Driver::pending is sitting at PENDING_LIMIT.
+    gate.release.store(true, Ordering::Release);
+    gate.notify.notify_waiters();
+
+    // Wait for Codex fake server to record both declines in responses.jsonl.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap_or_default();
+        let has_cmd_decline = wire.lines().any(|l| {
+            serde_json::from_str::<Value>(l).ok().is_some_and(|v| {
+                v.get("id").and_then(Value::as_str) == Some("srv-sat-cmd")
+                    && v.pointer("/result/decision").and_then(Value::as_str) == Some("decline")
+            })
+        });
+        let has_q_decline = wire.lines().any(|l| {
+            serde_json::from_str::<Value>(l).ok().is_some_and(|v| {
+                v.get("id").and_then(Value::as_str) == Some("srv-sat-q")
+                    && v.get("result") == Some(&serde_json::json!({ "answers": {} }))
+            })
+        });
+        if has_cmd_decline && has_q_decline {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for saturation declines in responses.jsonl: {wire}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Trigger shutdown while `pending` is still full so remaining buffered deltas
+    // arrive during shutdown, get dropped past PENDING_LIMIT, and are counted/reported.
+    let evs = shutdown(session).await;
+
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, AgentEvent::ApprovalRequested { .. })),
+        "saturated approval must be declined rather than emitted unread"
+    );
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, AgentEvent::QuestionAsked { .. })),
+        "saturated question must be declined rather than emitted unread"
+    );
+    let non_fatal_errors: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Error {
+                fatal: false,
+                message,
+                ..
+            } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        non_fatal_errors
+            .iter()
+            .any(|m| m.contains("declined") && m.contains("PENDING_LIMIT")),
+        "expected decline saturation errors, got {non_fatal_errors:?}"
+    );
+    assert!(
+        non_fatal_errors
+            .iter()
+            .any(|m| m.contains("dropped") && m.contains("non-terminal")),
+        "expected dropped non-terminal event report, got {non_fatal_errors:?}"
+    );
+    assert!(matches!(evs.last(), Some(AgentEvent::SessionEnded { .. })));
+
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use atrium_host::supervise::{self, ProcessIdentity, SupervisedChild};
 use atrium_protocol::agent::{
-    AgentEvent, AgentEventEnvelope, ApprovalDecision, Provider, QuestionAnswer, SessionCommand,
+    AgentEvent, AgentEventEnvelope, ApprovalDecision, Provider, QuestionAnswer, RequestOutcome,
+    SessionCommand,
 };
 use atrium_protocol::limits::{
     MAX_DIAGNOSTIC_LINE_BYTES, MAX_PARTIAL_ARGS_BYTES, MAX_PENDING_REQUESTS,
@@ -507,6 +508,7 @@ async fn start_session(
         seq: 0,
         pending: VecDeque::new(),
         closing_tail: VecDeque::new(),
+        dropped_events: 0,
         events_tx,
         cmd_rx: Some(cmd_rx),
         out_rx: Some(out_rx),
@@ -679,6 +681,7 @@ struct Driver {
     seq: u64,
     pending: VecDeque<AgentEventEnvelope>,
     closing_tail: VecDeque<AgentEventEnvelope>,
+    dropped_events: u64,
     events_tx: mpsc::Sender<AgentEventEnvelope>,
     cmd_rx: Option<mpsc::Receiver<SessionCommand>>,
     out_rx: Option<mpsc::Receiver<Out>>,
@@ -708,12 +711,127 @@ impl Driver {
         self.enqueue_events(events);
     }
 
+    fn is_pending_saturated(&self) -> bool {
+        self.pending.len() >= PENDING_LIMIT || !self.closing_tail.is_empty()
+    }
+
+    fn take_dropped_error(&mut self) -> Option<AgentEvent> {
+        if self.dropped_events == 0 {
+            return None;
+        }
+        let count = std::mem::take(&mut self.dropped_events);
+        Some(AgentEvent::Error {
+            message: format!(
+                "dropped {count} non-terminal event(s) because event buffer exceeded PENDING_LIMIT ({PENDING_LIMIT})"
+            ),
+            fatal: false,
+            details: Vec::new(),
+        })
+    }
+
+    fn push_tail_event(&mut self, ev: AgentEvent, at_ms: u64) {
+        let is_ended = matches!(ev, AgentEvent::SessionEnded { .. });
+        // Reserve one slot in `closing_tail` so `SessionEnded` can always be delivered.
+        let limit = if is_ended {
+            TERMINAL_TAIL_EVENTS
+        } else {
+            TERMINAL_TAIL_EVENTS.saturating_sub(1)
+        };
+        if is_ended && self.closing_tail.len() >= TERMINAL_TAIL_EVENTS {
+            self.closing_tail.pop_front();
+        }
+        if self.closing_tail.len() < limit {
+            self.closing_tail.push_back(AgentEventEnvelope {
+                incarnation: 0,
+                seq: self.seq,
+                at_ms,
+                event: ev,
+            });
+            self.seq += 1;
+        }
+    }
+
+    fn emit_saturation_error(&mut self, message: String) {
+        let at_ms = self.start.elapsed().as_millis() as u64;
+        let ev = AgentEvent::Error {
+            message,
+            fatal: false,
+            details: Vec::new(),
+        };
+        if !self.is_pending_saturated() {
+            self.pending.push_back(AgentEventEnvelope {
+                incarnation: 0,
+                seq: self.seq,
+                at_ms,
+                event: ev,
+            });
+            self.seq += 1;
+        } else {
+            self.push_tail_event(ev, at_ms);
+        }
+    }
+
+    fn cancel_overflow_request(&mut self, request_id: String, is_question: bool, at_ms: u64) {
+        if is_question {
+            if let Some(pending) = self.questions.remove(&request_id) {
+                self.live.remove(&pending.native);
+                self.decline_question_request(&pending.raw_id);
+            }
+        } else if let Some(pending) = self.approvals.remove(&request_id) {
+            self.live.remove(&pending.native);
+            self.decline_server_request(&pending.raw_id, &pending.method);
+        }
+        let kind = if is_question { "question" } else { "approval" };
+        self.push_tail_event(
+            AgentEvent::RequestResolved {
+                request_id,
+                outcome: RequestOutcome::Cancelled,
+            },
+            at_ms,
+        );
+        self.push_tail_event(
+            AgentEvent::Error {
+                message: format!(
+                    "declined {kind} request because event buffer exceeded PENDING_LIMIT ({PENDING_LIMIT})"
+                ),
+                fatal: false,
+                details: Vec::new(),
+            },
+            at_ms,
+        );
+    }
+
     fn enqueue_events(&mut self, events: Vec<AgentEvent>) {
         let at_ms = self.start.elapsed().as_millis() as u64;
+        let mut overflow_requests: Vec<(String, bool)> = Vec::new();
         for ev in events {
-            let is_ended = matches!(ev, AgentEvent::SessionEnded { .. });
-            let is_terminal = is_closing_event(&ev);
-            if self.pending.len() < PENDING_LIMIT {
+            if !self.is_pending_saturated() {
+                if let Some(err) = self.take_dropped_error() {
+                    self.pending.push_back(AgentEventEnvelope {
+                        incarnation: 0,
+                        seq: self.seq,
+                        at_ms,
+                        event: err,
+                    });
+                    self.seq += 1;
+                    if self.is_pending_saturated() {
+                        match ev {
+                            AgentEvent::ApprovalRequested { request_id, .. } => {
+                                overflow_requests.push((request_id, false));
+                            }
+                            AgentEvent::QuestionAsked { request_id, .. } => {
+                                overflow_requests.push((request_id, true));
+                            }
+                            other if is_closing_event(&other) => {
+                                self.push_tail_event(other, at_ms);
+                            }
+                            _ => {
+                                self.dropped_events += 1;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 self.pending.push_back(AgentEventEnvelope {
                     incarnation: 0,
                     seq: self.seq,
@@ -721,20 +839,32 @@ impl Driver {
                     event: ev,
                 });
                 self.seq += 1;
-            } else if is_terminal {
-                if self.closing_tail.len() >= TERMINAL_TAIL_EVENTS && is_ended {
-                    self.closing_tail.pop_front();
-                }
-                if self.closing_tail.len() < TERMINAL_TAIL_EVENTS {
-                    self.closing_tail.push_back(AgentEventEnvelope {
-                        incarnation: 0,
-                        seq: self.seq,
-                        at_ms,
-                        event: ev,
-                    });
-                    self.seq += 1;
+            } else {
+                match ev {
+                    AgentEvent::ApprovalRequested { request_id, .. } => {
+                        overflow_requests.push((request_id, false));
+                    }
+                    AgentEvent::QuestionAsked { request_id, .. } => {
+                        overflow_requests.push((request_id, true));
+                    }
+                    other if is_closing_event(&other) => {
+                        if matches!(
+                            other,
+                            AgentEvent::TurnCompleted { .. } | AgentEvent::SessionEnded { .. }
+                        ) && let Some(err) = self.take_dropped_error()
+                        {
+                            self.push_tail_event(err, at_ms);
+                        }
+                        self.push_tail_event(other, at_ms);
+                    }
+                    _ => {
+                        self.dropped_events += 1;
+                    }
                 }
             }
+        }
+        for (req_id, is_question) in overflow_requests {
+            self.cancel_overflow_request(req_id, is_question, at_ms);
         }
     }
 
@@ -927,6 +1057,7 @@ impl Driver {
     fn discard(&mut self) {
         self.pending.clear();
         self.closing_tail.clear();
+        self.dropped_events = 0;
         self.clear_requests();
     }
 
@@ -942,7 +1073,7 @@ impl Driver {
                 break;
             }
 
-            let paused_stdout = self.pending.len() >= PENDING_LIMIT && !self.shutting_down;
+            let paused_stdout = self.is_pending_saturated() && !self.shutting_down;
             let has_pending = !self.pending.is_empty() || !self.closing_tail.is_empty();
             let events_tx = self.events_tx.clone();
             let next_deadline = earliest_deadline(self.interrupt_deadline, self.shutdown_deadline);
@@ -1007,7 +1138,23 @@ impl Driver {
     }
 
     fn flush_pending(&mut self) {
-        while let Some(front) = self.pending.front().or_else(|| self.closing_tail.front()) {
+        loop {
+            if self.pending.is_empty()
+                && self.closing_tail.is_empty()
+                && let Some(err) = self.take_dropped_error()
+            {
+                let at_ms = self.start.elapsed().as_millis() as u64;
+                self.pending.push_back(AgentEventEnvelope {
+                    incarnation: 0,
+                    seq: self.seq,
+                    at_ms,
+                    event: err,
+                });
+                self.seq += 1;
+            }
+            let Some(front) = self.pending.front().or_else(|| self.closing_tail.front()) else {
+                break;
+            };
             let is_main = !self.pending.is_empty();
             if self.events_tx.try_send(front.clone()).is_ok() {
                 if is_main {
@@ -1029,8 +1176,19 @@ impl Driver {
             .or_else(|| self.closing_tail.pop_front())
         {
             if self.events_tx.send(ev).await.is_err() {
-                break;
+                return;
             }
+        }
+        if let Some(err) = self.take_dropped_error() {
+            let at_ms = self.start.elapsed().as_millis() as u64;
+            let env = AgentEventEnvelope {
+                incarnation: 0,
+                seq: self.seq,
+                at_ms,
+                event: err,
+            };
+            self.seq += 1;
+            let _ = self.events_tx.send(env).await;
         }
     }
 
@@ -1095,11 +1253,7 @@ impl Driver {
         if self.live.contains(&native)
             || self.live.len() + self.approvals.len() + self.questions.len() >= MAX_PENDING_REQUESTS
         {
-            if method == "item/tool/requestUserInput" {
-                self.decline_question_request(id_val);
-            } else {
-                self.decline_server_request(id_val, method);
-            }
+            self.decline_native_request(id_val, method);
             return;
         }
 
@@ -1109,6 +1263,14 @@ impl Driver {
         ) {
             // Decline unmapped legacy / turn-scoped permission requests until verified live (X3).
             self.decline_server_request(id_val, method);
+            return;
+        }
+
+        if self.is_pending_saturated() {
+            self.decline_native_request(id_val, method);
+            self.emit_saturation_error(format!(
+                "declined {method} because event buffer exceeded PENDING_LIMIT ({PENDING_LIMIT})"
+            ));
             return;
         }
 
@@ -1321,6 +1483,26 @@ impl Driver {
                 let Some(mut meta) = meta else {
                     return;
                 };
+                let (decision, saturated_decline) = if matches!(decision, GateDecision::Ask { .. })
+                    && (self.is_pending_saturated() || self.pending.len() + 2 > PENDING_LIMIT)
+                {
+                    self.live.remove(&native);
+                    self.decline_server_request(&meta.raw_id, &meta.method);
+                    self.emit_saturation_error(format!(
+                        "declined {} because event buffer exceeded PENDING_LIMIT ({PENDING_LIMIT})",
+                        meta.method
+                    ));
+                    (
+                        GateDecision::Deny {
+                            reason: format!(
+                                "event buffer exceeded PENDING_LIMIT ({PENDING_LIMIT})"
+                            ),
+                        },
+                        true,
+                    )
+                } else {
+                    (decision, false)
+                };
                 self.feed(AdapterInput::Gate {
                     check: check.clone(),
                     decision: decision.clone(),
@@ -1332,7 +1514,9 @@ impl Driver {
                     }
                     GateDecision::Deny { .. } => {
                         self.live.remove(&native);
-                        self.decline_server_request(&meta.raw_id, &meta.method);
+                        if !saturated_decline {
+                            self.decline_server_request(&meta.raw_id, &meta.method);
+                        }
                     }
                     GateDecision::Ask { ticket } => {
                         meta.call_id = check.call_id;
@@ -1391,6 +1575,16 @@ impl Driver {
                 let Some(meta) = meta else {
                     return;
                 };
+                let ticket = if ticket.is_some() && self.is_pending_saturated() {
+                    self.live.remove(&native);
+                    self.decline_question_request(&meta.raw_id);
+                    self.emit_saturation_error(format!(
+                        "declined question request {native} because event buffer exceeded PENDING_LIMIT ({PENDING_LIMIT})"
+                    ));
+                    None
+                } else {
+                    ticket
+                };
                 self.feed(AdapterInput::QuestionTicket {
                     id: native.clone(),
                     ticket: ticket.clone(),
@@ -1407,8 +1601,9 @@ impl Driver {
                         );
                     }
                     None => {
-                        self.live.remove(&native);
-                        self.decline_question_request(&meta.raw_id);
+                        if self.live.remove(&native) {
+                            self.decline_question_request(&meta.raw_id);
+                        }
                     }
                 }
             }
@@ -1617,6 +1812,14 @@ impl Driver {
             _ => json!({ "decision": "decline" }),
         };
         self.write_value(&json!({ "id": raw_id, "result": result }));
+    }
+
+    fn decline_native_request(&mut self, raw_id: &Value, method: &str) {
+        if method == "item/tool/requestUserInput" {
+            self.decline_question_request(raw_id);
+        } else {
+            self.decline_server_request(raw_id, method);
+        }
     }
 
     fn decline_question_request(&mut self, raw_id: &Value) {

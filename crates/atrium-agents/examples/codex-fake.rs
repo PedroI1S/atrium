@@ -252,6 +252,94 @@ fn main() {
                             }
                         });
                     }
+                    "flood-then-ask" => {
+                        let tx_flood = out_tx.clone();
+                        let flag = interrupted.clone();
+                        let tid_flood = turn_id.clone();
+                        let count: usize = env::var("FAKE_FLOOD_COUNT")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(5000);
+                        thread::spawn(move || {
+                            emit(
+                                &tx_flood,
+                                json!({
+                                    "method": "item/started",
+                                    "params": {
+                                        "threadId": "thread-fake",
+                                        "turnId": tid_flood,
+                                        "item": {
+                                            "type": "commandExecution",
+                                            "id": "call-sat-1",
+                                            "command": "cat public.txt",
+                                            "cwd": "/scratch",
+                                            "status": "inProgress"
+                                        }
+                                    }
+                                }),
+                            );
+                            emit(
+                                &tx_flood,
+                                json!({
+                                    "id": "srv-sat-cmd",
+                                    "method": "item/commandExecution/requestApproval",
+                                    "params": {
+                                        "threadId": "thread-fake",
+                                        "turnId": tid_flood,
+                                        "itemId": "call-sat-1",
+                                        "command": "cat public.txt",
+                                        "cwd": "/scratch"
+                                    }
+                                }),
+                            );
+                            emit(
+                                &tx_flood,
+                                json!({
+                                    "id": "srv-sat-q",
+                                    "method": "item/tool/requestUserInput",
+                                    "params": {
+                                        "threadId": "thread-fake",
+                                        "turnId": tid_flood,
+                                        "itemId": "item-sat-q",
+                                        "questions": [{
+                                            "id": "color",
+                                            "header": "Color",
+                                            "question": "Pick",
+                                            "options": [{ "label": "Blue", "description": "b" }]
+                                        }]
+                                    }
+                                }),
+                            );
+                            emit(
+                                &tx_flood,
+                                json!({
+                                    "method": "item/started",
+                                    "params": {
+                                        "threadId": "thread-fake",
+                                        "turnId": tid_flood,
+                                        "item": { "type": "agentMessage", "id": "msg-sat-flood", "text": "" }
+                                    }
+                                }),
+                            );
+                            for i in 0..count {
+                                if flag.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                emit(
+                                    &tx_flood,
+                                    json!({
+                                        "method": "item/agentMessage/delta",
+                                        "params": {
+                                            "threadId": "thread-fake",
+                                            "turnId": tid_flood,
+                                            "itemId": "msg-sat-flood",
+                                            "delta": format!("d{i}:")
+                                        }
+                                    }),
+                                );
+                            }
+                        });
+                    }
                     "delayed-turn" => {
                         let delay_ms: u64 = env::var("FAKE_TURN_DELAY_MS")
                             .ok()
