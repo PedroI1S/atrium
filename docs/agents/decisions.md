@@ -515,3 +515,9 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **CR-14, approved as proposed.** `notify_approval`, `notify_question` and `notify_failed` are named in contract §8 and validated like `KEEP_RUNNING_SETTING`; the daemon skips a kind whose switch is `false`; the note in `app/src/ui/Settings.tsx` goes when it lands.
 - **CR-15, approved: `DaemonCommand::DeclineQuestion { thread_id, incarnation, request_id }`**, checked by the ledger like `AnswerQuestion`, resolved as `RequestOutcome::Cancelled`, with the adapter passing the provider's own "dismissed" answer on; the question card gets a "Decline" button besides "Stop the turn".
 - CR-13, CR-14 and CR-15 change the wire or the contract: they go through the protocol bindings check (`scripts/check-protocol-ts`) and a contract revision note.
+
+## D-083 — 2026-11-14 — Pedro's go: M1-16 (CR-13, CR-14, CR-15); contract revision 3.1
+**Decided by Pedro (driver).** Go for M1-16-requests-and-notifications: CR-13 (the fake agent raises an approval and a question), CR-14 (per-kind notification switches) and CR-15 (`DeclineQuestion`), as D-082 decided them. Gemini 4 Hydrogen `high` (D-076), reviewed by Sonnet 5.5. Brief `M1-16-requests-and-notifications.md`.
+- The orchestrator wrote **contract revision 3.1** (`docs/contracts/m1.md`): the five CRs of D-082 in §6.2, §8 and §9, each marked "(rev 3.1)".
+- **Orchestrator's call, for Pedro to overturn:** `PROTOCOL_VERSION` goes from 1 to 2, because `DeclineQuestion` is a command a version-1 daemon doesn't know; an app and a daemon of different versions then meet as `Incompatible` and §10's replacement runs, instead of the command failing at random.
+- CR-09 goes into M1-15; CR-12 into a policy task after M1-13 merges.
