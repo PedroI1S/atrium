@@ -63,10 +63,7 @@ fn fixture_paths() -> Vec<(String, PathBuf)> {
     }
     let hm = base.join("handmade");
     for name in HANDMADE {
-        out.push((
-            format!("handmade/{name}"),
-            hm.join(format!("{name}.jsonl")),
-        ));
+        out.push((format!("handmade/{name}"), hm.join(format!("{name}.jsonl"))));
     }
     out
 }
@@ -137,7 +134,10 @@ fn recorded_simple_and_multi_turn_conform_to_m1() {
             ..
         }
     )));
-    assert!(matches!(simple.last(), Some(AgentEvent::SessionEnded { .. })));
+    assert!(matches!(
+        simple.last(),
+        Some(AgentEvent::SessionEnded { .. })
+    ));
 
     let multi = normalize_fixture(&base.join("multi-turn.jsonl"));
     let turns: Vec<u32> = multi
@@ -249,7 +249,10 @@ fn startup_failures_emit_only_fatal_error_and_session_ended() {
             events.first(),
             Some(AgentEvent::Error { fatal: true, .. })
         ));
-        assert!(matches!(events.last(), Some(AgentEvent::SessionEnded { .. })));
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::SessionEnded { .. })
+        ));
     }
 }
 
@@ -327,7 +330,15 @@ fn handmade_patch_question_interrupt_and_quota_conform() {
     assert!(cancel_req_pos < turn_done_pos);
 
     let quota = normalize_fixture(&hm.join("quota-usage.jsonl"));
-    assert!(quota.iter().any(|e| matches!(e, AgentEvent::QuotaUpdated { .. })));
-    assert!(quota.iter().any(|e| matches!(e, AgentEvent::ContextUpdated { .. })));
+    assert!(
+        quota
+            .iter()
+            .any(|e| matches!(e, AgentEvent::QuotaUpdated { .. }))
+    );
+    assert!(
+        quota
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextUpdated { .. }))
+    );
     assert!(quota.iter().any(|e| matches!(e, AgentEvent::Usage { .. })));
 }

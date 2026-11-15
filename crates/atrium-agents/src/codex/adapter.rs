@@ -53,6 +53,10 @@ pub struct CodexOptions {
     pub profile: Option<String>,
     /// Extra CLI arguments placed before `app-server`.
     pub extra_args: Vec<String>,
+    /// Override for the handshake startup timeout (defaults to [`STARTUP_TIMEOUT`]).
+    pub startup_timeout: Option<Duration>,
+    /// Override for the user config directory inspected for enforcement reporting.
+    pub user_dir: Option<PathBuf>,
     /// Optional fixture / telemetry tap receiving every raw [`AdapterInput`].
     pub tap: Option<InputTap>,
 }
@@ -62,6 +66,8 @@ impl std::fmt::Debug for CodexOptions {
         f.debug_struct("CodexOptions")
             .field("profile", &self.profile)
             .field("extra_args", &self.extra_args)
+            .field("startup_timeout", &self.startup_timeout)
+            .field("user_dir", &self.user_dir)
             .field("tap", &self.tap.as_ref().map(|_| ".."))
             .finish()
     }
@@ -215,8 +221,12 @@ fn append_mcp_overrides(args: &mut Vec<String>, server: &McpServer) -> Result<()
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        let mut pairs = Vec::with_capacity(env_map.len());
+        for (k, v) in env_map {
+            pairs.push(format!("{} = {}", toml_literal(&k)?, toml_literal(&v)?));
+        }
         args.push("-c".into());
-        args.push(format!("{prefix}.env={}", toml_literal(&env_map)?));
+        args.push(format!("{prefix}.env={{ {} }}", pairs.join(", ")));
     }
     Ok(())
 }
@@ -273,12 +283,13 @@ fn build_descriptor(
     cli_version: Option<String>,
     gate_failed: bool,
 ) -> EnforcementDescriptor {
+    let user_dir_str = opts.user_dir.as_ref().map(|p| p.display().to_string());
     let inspect = settings::inspect(InspectInput {
         cwd: &config.cwd,
         env: &config.env,
         profile: opts.profile.as_deref(),
         args: &opts.extra_args,
-        user_dir: None,
+        user_dir: user_dir_str.as_deref(),
     });
     let mut reasons = inspect.reasons;
     for src in &inspect.sources {
@@ -664,18 +675,29 @@ impl Driver {
     fn enqueue_events(&mut self, events: Vec<AgentEvent>) {
         let at_ms = self.start.elapsed().as_millis() as u64;
         for ev in events {
+            let is_ended = matches!(ev, AgentEvent::SessionEnded { .. });
             let is_terminal = is_closing_event(&ev);
-            let env = AgentEventEnvelope {
-                incarnation: 0,
-                seq: self.seq,
-                at_ms,
-                event: ev,
-            };
-            self.seq += 1;
             if self.pending.len() < PENDING_LIMIT {
-                self.pending.push_back(env);
-            } else if is_terminal && self.closing_tail.len() < TERMINAL_TAIL_EVENTS {
-                self.closing_tail.push_back(env);
+                self.pending.push_back(AgentEventEnvelope {
+                    incarnation: 0,
+                    seq: self.seq,
+                    at_ms,
+                    event: ev,
+                });
+                self.seq += 1;
+            } else if is_terminal {
+                if self.closing_tail.len() >= TERMINAL_TAIL_EVENTS && is_ended {
+                    self.closing_tail.pop_front();
+                }
+                if self.closing_tail.len() < TERMINAL_TAIL_EVENTS {
+                    self.closing_tail.push_back(AgentEventEnvelope {
+                        incarnation: 0,
+                        seq: self.seq,
+                        at_ms,
+                        event: ev,
+                    });
+                    self.seq += 1;
+                }
             }
         }
     }
@@ -694,7 +716,8 @@ impl Driver {
     }
 
     async fn handshake(&mut self) -> Result<(), AdapterError> {
-        let deadline = TokioInstant::now() + STARTUP_TIMEOUT;
+        let timeout = self.options.startup_timeout.unwrap_or(STARTUP_TIMEOUT);
+        let deadline = TokioInstant::now() + timeout;
         self.write_value(&json!({
             "id": "atrium-init",
             "method": "initialize",
@@ -836,7 +859,8 @@ impl Driver {
                     });
                     self.feed(AdapterInput::Exit { code });
                     return Err(AdapterError::Handshake(format!(
-                        "codex did not answer {expected_id} within {STARTUP_TIMEOUT:?}"
+                        "codex did not answer {expected_id} within {:?}",
+                        self.options.startup_timeout.unwrap_or(STARTUP_TIMEOUT)
                     )));
                 }
             }
@@ -920,6 +944,7 @@ impl Driver {
             }
         }
 
+        self.cmd_rx = None;
         self.abort_inflight();
         self.flush_final().await;
     }
