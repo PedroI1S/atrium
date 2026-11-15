@@ -938,3 +938,62 @@ fn round_8_ordinary_lines_keep_devs_verdict() {
         ),
     ]);
 }
+
+/// Gate verdicts in `~/vault` with `~/.ssh/work -> ~/vault/work`, under
+/// [home, any, full], for each line and its wanted verdicts.
+fn vault_gate_table(table: &[(&str, [&str; 3])]) {
+    let t = Tmp::new();
+    t.write("vault/work/id_work", "secret");
+    t.write("vault/safe_sub/a.rs", "x");
+    t.write(".ssh/known_hosts", "x");
+    symlink(t.home.join("vault/work"), t.home.join(".ssh/work")).unwrap();
+    let dir = t.home.join("vault");
+    let settings = [
+        ("home", vec![], Preset::Home),
+        ("any", vec![any_rule()], Preset::Home),
+        ("full", vec![], Preset::FullAccess),
+    ];
+    let mut failures = vec![];
+    for (line, want) in table {
+        for (k, (name, rules, preset)) in settings.iter().enumerate() {
+            let g = t.gate_with("t1", 1, &dir, *preset, rules.clone(), None);
+            let d = block_on(g.gate.check(&cmd_check(line)));
+            let got = match d {
+                GateDecision::Allow => "Allow",
+                GateDecision::Ask { .. } => "Ask",
+                _ => "Deny",
+            };
+            if got != want[k] {
+                failures.push(format!("[{name}] {line:?}: got {d:?}, wanted {}", want[k]));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Round-8 review major 5 (D-098): a `-L` / `--follow` given as the value
+/// of a value-taking `rg` flag stays a value, and an attached value
+/// (`-rL`: replace with "L") is kept as is. b336b2c stripped them before
+/// the flags were paired with values and hard-denied every line here.
+#[test]
+fn round_8_fix_rg_follow_given_as_a_value_keeps_devs_verdict() {
+    vault_gate_table(&[
+        ("rg -e -L safe_sub", ["Allow", "Allow", "Allow"]),
+        ("rg -e --follow safe_sub", ["Allow", "Allow", "Allow"]),
+        ("rg -rL pat safe_sub", ["Allow", "Allow", "Allow"]),
+        ("rg -g -L pat safe_sub", ["Allow", "Allow", "Allow"]),
+        ("rg -f -L safe_sub", ["Ask", "Allow", "Allow"]),
+        ("rg --file -L safe_sub", ["Ask", "Allow", "Allow"]),
+    ]);
+}
+
+/// Round-8 fix (D-098): a real `-L` / `--follow` given a folder keeps
+/// today's verdict (and dev's).
+#[test]
+fn round_8_fix_rg_real_follow_flag_keeps_its_verdict() {
+    vault_gate_table(&[
+        ("rg -L pat safe_sub", ["Ask", "Allow", "Allow"]),
+        ("rg --follow pat safe_sub", ["Ask", "Allow", "Allow"]),
+        ("rg -iL pat safe_sub", ["Ask", "Allow", "Allow"]),
+    ]);
+}

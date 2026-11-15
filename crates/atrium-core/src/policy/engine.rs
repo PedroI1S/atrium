@@ -401,6 +401,18 @@ pub(crate) struct Searched {
 /// Splits an `rg`/`grep` command into search roots; `None` for a flag it
 /// doesn't know (the command then asks).
 pub(crate) fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
+    roots_of(is_rg, false, args)
+}
+
+/// [`search_roots`] for `rg` that also reads `-L` / `--follow` as plain
+/// flags (round-8 major 5, D-098): the gate checks the links they follow
+/// itself, and the flag/value pairing stays the parser's, so a `-L` given
+/// as the value of `-e`, `-g`, `-r`, `--file`, … stays a value.
+pub(crate) fn rg_roots_following(args: &[String]) -> Option<Searched> {
+    roots_of(true, true, args)
+}
+
+fn roots_of(is_rg: bool, follow: bool, args: &[String]) -> Option<Searched> {
     let (bs, vs, bl, vl) = if is_rg {
         (RG_BOOL_S, RG_VAL_S, RG_BOOL_L, RG_VAL_L)
     } else {
@@ -429,6 +441,9 @@ pub(crate) fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
                 Some((n, _)) => (n, true),
                 None => (rest, false),
             };
+            if follow && name == "follow" && !has_val {
+                continue;
+            }
             if name == "files" || name == "type-list" {
                 files_mode = true;
             }
@@ -464,6 +479,9 @@ pub(crate) fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
                 }
                 if !is_rg && matches!(c, 'r' | 'd') {
                     recursive = true;
+                }
+                if follow && *c == 'L' {
+                    continue;
                 }
                 if *c == 'e' {
                     have_pattern_flag = true;

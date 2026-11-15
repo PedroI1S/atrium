@@ -636,32 +636,10 @@ fn searches_cwd(eff: &[String]) -> Option<bool> {
         .collect();
     let args = args.as_slice();
     match shell::base(first) {
-        "rg" => {
-            // `-L` / `--follow` change which files, not where it searches
-            // (links below the roots are `follows_links`'s business)
-            let mut dd = false;
-            let args: Vec<String> = args
-                .iter()
-                .filter_map(|a| {
-                    if dd || !a.starts_with('-') {
-                        return Some(a.clone());
-                    }
-                    if a == "--" {
-                        dd = true;
-                        return Some(a.clone());
-                    }
-                    if a == "--follow" {
-                        return None;
-                    }
-                    if !a.starts_with("--") {
-                        let rest: String = a[1..].chars().filter(|c| *c != 'L').collect();
-                        return (!rest.is_empty()).then(|| format!("-{rest}"));
-                    }
-                    Some(a.clone())
-                })
-                .collect();
-            engine::search_roots(true, &args).map(|s| s.roots.is_empty())
-        }
+        // `-L` / `--follow` change which files, not where it searches
+        // (links below the roots are `follows_links`'s business); the
+        // parser pairs flags with values, so `-e -L` keeps `-L` a value
+        "rg" => engine::rg_roots_following(args).map(|s| s.roots.is_empty()),
         b @ ("grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" | "rgrep") => {
             // `-R` follows every link below the roots: the same roots
             let args: Vec<String> = args

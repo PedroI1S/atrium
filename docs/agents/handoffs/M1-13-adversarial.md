@@ -839,3 +839,12 @@ Every item has a generated `round_8_*` table that fails on ccb1b60 and passes no
 DoD: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace --no-fail-fast` pass. 20-run loops on the final code: `adversarial_regression`, `adversarial_ordinary`, `adversarial_policy`, `adversarial_gate`, `policy` and `adversarial_fuzz` each passed 20/20.
 
 Open for the owner (not closed in this round): `source FILE`/`eval "$X"` with unknown text don't make the cwd unknown (as on dev); `env -C DIR CMD` keeps dev's false hard deny (unchanged, by the rules).
+
+## Round 8 fix (D-098): round-8 review major 5
+
+The only change: in the gate's `searches_cwd`, `rg` stripped `--follow` and every `L` of a short cluster before the parser paired flags with values. A `-L` given as a value (`rg -e -L safe_sub`, `rg -g -L pat safe_sub`, `rg -f -L safe_sub`, `rg --file -L safe_sub`, `rg -e --follow safe_sub`) or inside an attached value (`rg -rL pat safe_sub`: replace with "L") shifted the pairing, so b336b2c hard-denied those lines from `~/vault` (with `~/.ssh/work -> ~/vault/work`), where dev allows or asks.
+
+- Fix: the gate calls `engine::rg_roots_following`, the same parser as `search_roots` (one table) that also reads `-L` and `--follow` as plain flags, only where the parser sees a flag. `search_roots` itself (Home's read-only list) is unchanged.
+- Tests (`adversarial_ordinary.rs`): `round_8_fix_rg_follow_given_as_a_value_keeps_devs_verdict` (the six lines, at dev's verdicts; fails on b336b2c) and `round_8_fix_rg_real_follow_flag_keeps_its_verdict` (`rg -L pat safe_sub`, `rg --follow pat safe_sub`, `rg -iL pat safe_sub`: Ask/Allow/Allow, as before and on dev).
+- Not changed: `follows_links` still treats any `L` in an `rg` short word as following. That only adds a bounded link walk below the folders given, so it can't allow more. With no folder given, `rg -L pat` from `~/vault` stays a hard deny: the round-6 design for a cwd that holds a linked folder.
+- DoD: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test -p atrium-core` pass.
