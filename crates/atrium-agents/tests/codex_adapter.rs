@@ -975,3 +975,69 @@ fn codex_tool_check_extracts_subjects_uniformly() {
         }
     );
 }
+
+#[tokio::test]
+async fn unverified_legacy_permissions_and_grant_root_requests_are_declined() {
+    let dir = scratch("unverified-approvals");
+    let gate = TestGate::new(|_| GateDecision::Allow);
+    let mut session = CodexAdapter::with_options(opts(&dir))
+        .start(
+            config(&dir, "unverified-approvals", gate.clone()),
+            Transport::Local,
+        )
+        .await
+        .unwrap();
+    session.commands.send(say("go")).await.unwrap();
+    let evs = next_matching(&mut session, 10, |e| {
+        matches!(e, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+
+    assert!(
+        gate.checks.lock().unwrap().is_empty(),
+        "none of the unverified approval shapes may reach the gate"
+    );
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, AgentEvent::ApprovalRequested { .. }))
+    );
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        AgentEvent::ToolCallFinished {
+            call_id,
+            status: ToolStatus::Denied,
+            ..
+        } if call_id == "unv-fc-1"
+    )));
+
+    let _ = shutdown(session).await;
+
+    let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
+    let replies: std::collections::HashMap<String, Value> = wire
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| {
+            let id = v.get("id")?.as_str()?.to_owned();
+            let res = v.get("result")?.clone();
+            Some((id, res))
+        })
+        .collect();
+    assert_eq!(
+        replies.get("srv-unv-exec"),
+        Some(&serde_json::json!({ "decision": "denied" }))
+    );
+    assert_eq!(
+        replies.get("srv-unv-patch"),
+        Some(&serde_json::json!({ "decision": "denied" }))
+    );
+    assert_eq!(
+        replies.get("srv-unv-perm"),
+        Some(&serde_json::json!({ "permissions": {}, "scope": "turn" }))
+    );
+    assert_eq!(
+        replies.get("srv-unv-grantroot"),
+        Some(&serde_json::json!({ "decision": "decline" }))
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

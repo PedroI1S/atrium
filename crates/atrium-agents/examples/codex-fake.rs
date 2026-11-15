@@ -96,6 +96,7 @@ fn main() {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let mut turn_num: u64 = 0;
+    let mut unverified_replies: usize = 0;
 
     while let Some(Ok(line)) = lines.next() {
         let Ok(req) = serde_json::from_str::<Value>(&line) else {
@@ -409,6 +410,78 @@ fn main() {
                             }),
                         );
                     }
+                    "unverified-approvals" => {
+                        emit(
+                            &out_tx,
+                            json!({
+                                "id": "srv-unv-exec",
+                                "method": "execCommandApproval",
+                                "params": {
+                                    "conversationId": "thread-fake",
+                                    "callId": "unv-exec-1",
+                                    "command": ["bash", "-lc", "echo hi"],
+                                    "cwd": "/scratch"
+                                }
+                            }),
+                        );
+                        emit(
+                            &out_tx,
+                            json!({
+                                "id": "srv-unv-patch",
+                                "method": "applyPatchApproval",
+                                "params": {
+                                    "conversationId": "thread-fake",
+                                    "callId": "unv-patch-1",
+                                    "fileChanges": { "/scratch/a.txt": { "type": "update" } }
+                                }
+                            }),
+                        );
+                        emit(
+                            &out_tx,
+                            json!({
+                                "id": "srv-unv-perm",
+                                "method": "item/permissions/requestApproval",
+                                "params": {
+                                    "threadId": "thread-fake",
+                                    "turnId": turn_id,
+                                    "itemId": "unv-perm-1",
+                                    "permissions": {
+                                        "fileSystem": { "write": ["/scratch"] },
+                                        "network": { "enabled": true }
+                                    }
+                                }
+                            }),
+                        );
+                        emit(
+                            &out_tx,
+                            json!({
+                                "method": "item/started",
+                                "params": {
+                                    "threadId": "thread-fake",
+                                    "turnId": turn_id,
+                                    "item": {
+                                        "type": "fileChange",
+                                        "id": "unv-fc-1",
+                                        "status": "inProgress",
+                                        "changes": [{ "path": "/scratch/out.txt", "kind": { "type": "update", "move_path": null }, "diff": "+x" }]
+                                    }
+                                }
+                            }),
+                        );
+                        emit(
+                            &out_tx,
+                            json!({
+                                "id": "srv-unv-grantroot",
+                                "method": "item/fileChange/requestApproval",
+                                "params": {
+                                    "threadId": "thread-fake",
+                                    "turnId": turn_id,
+                                    "itemId": "unv-fc-1",
+                                    "grantRoot": "/"
+                                }
+                            }),
+                        );
+                    }
                     _ => {
                         let msg_id = format!("msg-{turn_num}");
                         emit_text_turn(&out_tx, &turn_id, &msg_id, "hello from fake codex");
@@ -550,6 +623,39 @@ fn main() {
                             "msg-q",
                             &format!("answers:{answers}"),
                         );
+                    } else if req_id.starts_with("srv-unv-") {
+                        emit(
+                            &out_tx,
+                            json!({
+                                "method": "serverRequest/resolved",
+                                "params": { "threadId": "thread-fake", "requestId": req_id }
+                            }),
+                        );
+                        unverified_replies += 1;
+                        if unverified_replies == 4 {
+                            emit(
+                                &out_tx,
+                                json!({
+                                    "method": "item/completed",
+                                    "params": {
+                                        "threadId": "thread-fake",
+                                        "turnId": format!("turn-{turn_num}"),
+                                        "item": {
+                                            "type": "fileChange",
+                                            "id": "unv-fc-1",
+                                            "status": "declined",
+                                            "changes": [{ "path": "/scratch/out.txt", "kind": { "type": "update", "move_path": null }, "diff": "+x" }]
+                                        }
+                                    }
+                                }),
+                            );
+                            emit_text_turn(
+                                &out_tx,
+                                &format!("turn-{turn_num}"),
+                                "msg-unv",
+                                "all unverified declined",
+                            );
+                        }
                     }
                 }
             }

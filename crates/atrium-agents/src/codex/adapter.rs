@@ -1035,7 +1035,22 @@ impl Driver {
 
     fn on_server_request(&mut self, id_val: &Value, method: &str, params: &Value) {
         let native = id_key(id_val);
-        if self.live.len() + self.approvals.len() + self.questions.len() >= MAX_PENDING_REQUESTS {
+        if self.live.contains(&native)
+            || self.live.len() + self.approvals.len() + self.questions.len() >= MAX_PENDING_REQUESTS
+        {
+            if method == "item/tool/requestUserInput" {
+                self.decline_question_request(id_val);
+            } else {
+                self.decline_server_request(id_val, method);
+            }
+            return;
+        }
+
+        if matches!(
+            method,
+            "execCommandApproval" | "applyPatchApproval" | "item/permissions/requestApproval"
+        ) {
+            // Decline unmapped legacy / turn-scoped permission requests until verified live (X3).
             self.decline_server_request(id_val, method);
             return;
         }
@@ -1067,6 +1082,12 @@ impl Driver {
             && !payload.get("item").is_some_and(|i| !i.is_null())
         {
             payload["item"] = item.clone();
+        }
+
+        if method == "item/fileChange/requestApproval" && has_grant_root(&payload) {
+            // Decline writable-root expansion requests until X1/X3 verifies `accept` semantics.
+            self.decline_server_request(id_val, method);
+            return;
         }
 
         if payload.to_string().len() > MAX_PARTIAL_ARGS_BYTES {
@@ -1330,10 +1351,7 @@ impl Driver {
                     }
                     None => {
                         self.live.remove(&native);
-                        self.write_value(&json!({
-                            "id": meta.raw_id,
-                            "result": { "answers": {} }
-                        }));
+                        self.decline_question_request(&meta.raw_id);
                     }
                 }
             }
@@ -1529,7 +1547,6 @@ impl Driver {
     fn accept_server_request(&mut self, raw_id: &Value, method: &str, _payload: &Value) {
         let result = match method {
             "mcpServer/elicitation/request" => json!({ "action": "accept" }),
-            "item/permissions/requestApproval" => json!({ "scope": "turn" }),
             _ => json!({ "decision": "accept" }),
         };
         self.write_value(&json!({ "id": raw_id, "result": result }));
@@ -1539,9 +1556,17 @@ impl Driver {
         let result = match method {
             "mcpServer/elicitation/request" => json!({ "action": "decline" }),
             "item/permissions/requestApproval" => json!({ "permissions": {}, "scope": "turn" }),
+            "execCommandApproval" | "applyPatchApproval" => json!({ "decision": "denied" }),
             _ => json!({ "decision": "decline" }),
         };
         self.write_value(&json!({ "id": raw_id, "result": result }));
+    }
+
+    fn decline_question_request(&mut self, raw_id: &Value) {
+        self.write_value(&json!({
+            "id": raw_id,
+            "result": { "answers": {} },
+        }));
     }
 
     fn forget_native(&mut self, native: &str) {
@@ -1581,6 +1606,21 @@ impl Driver {
             });
         }
     }
+}
+
+fn has_grant_root(params: &Value) -> bool {
+    [
+        "/grantRoot",
+        "/grant_root",
+        "/item/grantRoot",
+        "/item/grant_root",
+    ]
+    .iter()
+    .any(|ptr| match params.pointer(ptr) {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    })
 }
 
 fn id_key(v: &Value) -> String {
