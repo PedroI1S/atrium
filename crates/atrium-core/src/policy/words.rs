@@ -818,6 +818,12 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
             if lv.pending {
                 flush_pool(lv, &mut seen, home, start, &mut w);
             }
+            // after `||` the compound may not run at all
+            let kind = if kind == Compound::Brace && lv.last_join == Join::Or {
+                Compound::Cond
+            } else {
+                kind
+            };
             lv.frames.push(Frame {
                 id,
                 kind,
@@ -854,6 +860,14 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
             return w;
         }
         let join = unit.join;
+        // after `||` this command may not run (`a || cd x && y`: `y` may run
+        // where the shell was): where it was stays a candidate
+        let skipped_from = lv.last_join == Join::Or && !lv.unknown;
+        let entry = if skipped_from {
+            lv.cands.clone()
+        } else {
+            vec![]
+        };
         // a `cd` in a loop or a function body may run any number of times
         let repeats = lv
             .frames
@@ -863,6 +877,7 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
             Some(Cd::Moved(t)) if repeats => Some(Cd::Lost(t)),
             e => e,
         };
+        let moved = effect.is_some();
         match effect {
             None => {
                 if join == Join::And {
@@ -895,6 +910,9 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
                 w.unknown = true;
                 lv.cands = lost_cands(home, start, &seen);
             }
+        }
+        if skipped_from && moved && !lv.unknown {
+            lv.cands.extend(entry);
         }
         lv.last_join = join;
         lv.last_close = unit.close_join;

@@ -291,13 +291,19 @@ fn evaluate_sync(
     let mut verdict = policy.evaluate(&input, rules);
     // A file below a folder linked into `~/.ssh`, at any depth, or a
     // recursive search or glob that reaches such a folder, reads keys.
-    if !matches!(verdict, PolicyVerdict::HardDeny { .. })
-        && !analysis.overflow
-        && reaches_linked_ssh_dir(check, &analysis, &resolved, &ssh.linked_dirs, &c.cwd)
-    {
-        verdict = PolicyVerdict::HardDeny {
-            id: "credential-read",
-        };
+    // Maybe (options or a glob it can't read): never auto-allow, ask.
+    if !matches!(verdict, PolicyVerdict::HardDeny { .. }) && !analysis.overflow {
+        match reaches_linked_ssh_dir(check, &analysis, &resolved, &ssh.linked_dirs, &c.cwd) {
+            Reach::Yes => {
+                verdict = PolicyVerdict::HardDeny {
+                    id: "credential-read",
+                };
+            }
+            Reach::Maybe if matches!(verdict, PolicyVerdict::Allow { .. }) => {
+                verdict = PolicyVerdict::Ask;
+            }
+            _ => {}
+        }
     }
     // A file with several links may be another name for a credential in a
     // tree the identity map doesn't walk: never auto-allow it, ask instead.
@@ -486,7 +492,14 @@ const ACK_OPTS: ReaderOpts = ReaderOpts {
     flags: "iISvwQlLchHo1nrRsxfk",
     vals: "ABmgt",
     opt_vals: "C",
-    long_vals: &["type", "ignore-dir", "noignore-dir", "match", "output", "max-count"],
+    long_vals: &[
+        "type",
+        "ignore-dir",
+        "noignore-dir",
+        "match",
+        "output",
+        "max-count",
+    ],
     long_flags: &[
         "ignore-case",
         "smart-case",
@@ -589,44 +602,110 @@ fn tree_walker(eff: &[String]) -> bool {
     }
 }
 
-/// Whether a glob, read component by component, reaches a file inside the
-/// linked folder `d` (`vault/*/id_work`), or with `names_dir` names `d` or a
-/// folder holding it (`vault/*` for a recursive search). `ls vault/*` only
-/// names the folder: it stays ordinary.
-fn glob_reaches(p: &Path, d: &Path, names_dir: bool) -> bool {
+/// Whether a call reaches a folder linked into `~/.ssh`: surely, maybe (it
+/// asks), or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    No,
+    Maybe,
+    Yes,
+}
+
+/// What a glob expands to on the filesystem, as the shell would expand it
+/// (round 6 item 1): component by component from its literal prefix, `**`
+/// as zero or more folders, `{a,b}` as alternation. Bounded: `None` when the
+/// walk is too big or a component can't be read as a pattern (the caller
+/// asks).
+fn expand_glob(p: &Path) -> Option<Vec<PathBuf>> {
+    const MAX_ENTRIES: usize = 4096;
+    const MAX_DEPTH: usize = 12;
     let comps: Vec<String> = p
         .components()
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
-    let Some(first_glob) = comps.iter().position(|c| c.contains(['*', '?', '['])) else {
-        return false;
-    };
-    let prefix: PathBuf = comps[..first_glob].iter().collect();
-    let prefix = std::fs::canonicalize(&prefix).unwrap_or(prefix);
-    let Ok(rel) = d.strip_prefix(&prefix) else {
-        return false;
-    };
-    let rel: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .collect();
-    let pat = &comps[first_glob..];
-    let matches = |g: &str, name: &str| {
-        globset::GlobBuilder::new(g)
+    let is_pat = |c: &str| c.contains(['*', '?', '[', '{']);
+    let first = comps.iter().position(|c| is_pat(c))?;
+    let prefix: PathBuf = comps[..first].iter().collect();
+    if prefix.to_string_lossy().contains(['$', '`']) {
+        return None;
+    }
+    let mut seen = 0usize;
+    // (folder, index of the next component, folders `**` went down)
+    let mut stack: Vec<(PathBuf, usize, usize)> = vec![(prefix, first, 0)];
+    let mut out = vec![];
+    while let Some((dir, k, deep)) = stack.pop() {
+        if k == comps.len() {
+            out.push(dir);
+            continue;
+        }
+        let c = comps[k].as_str();
+        if !is_pat(c) {
+            let next = dir.join(c);
+            // a glob only expands to names that exist
+            if std::fs::symlink_metadata(&next).is_ok() {
+                stack.push((next, k + 1, deep));
+            }
+            continue;
+        }
+        if c == "**" {
+            // zero folders here, or one more and `**` again
+            stack.push((dir.clone(), k + 1, deep));
+            if deep > MAX_DEPTH {
+                return None;
+            }
+        }
+        let m = globset::GlobBuilder::new(c)
             .literal_separator(true)
             .build()
-            .map(|g| g.compile_matcher().is_match(name))
-            .unwrap_or(true)
+            .ok()?
+            .compile_matcher();
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > MAX_ENTRIES {
+                return None;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') && !c.starts_with('.') {
+                continue;
+            }
+            let path = dir.join(&name);
+            if c == "**" {
+                if stack.len() > MAX_ENTRIES {
+                    return None;
+                }
+                // `**` ends at this entry, or goes on below it
+                stack.push((path.clone(), k + 1, deep));
+                if path.is_dir() {
+                    stack.push((path, k, deep + 1));
+                }
+            } else if m.is_match(&name) {
+                stack.push((path, k + 1, deep));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Whether a glob reaches a file inside the linked folder `d`, or with
+/// `names_dir` (a recursive reader or walker) names `d` or a folder holding
+/// it. `ls vault/*` only names the folder: it stays ordinary.
+fn glob_reaches(p: &Path, d: &Path, names_dir: bool) -> Reach {
+    let Some(found) = expand_glob(p) else {
+        return Reach::Maybe;
     };
-    let n = pat.len().min(rel.len());
-    if !pat.iter().zip(&rel).take(n).all(|(g, r)| matches(g, r)) {
-        return false;
+    for f in found {
+        let real = real_path(&f);
+        if real.starts_with(d) && real != *d {
+            return Reach::Yes;
+        }
+        if names_dir && d.starts_with(&real) {
+            return Reach::Yes;
+        }
     }
-    if pat.len() > rel.len() {
-        // `**` or a deeper pattern: the glob goes below the linked folder
-        return true;
-    }
-    names_dir || pat.iter().any(|g| g.contains("**"))
+    Reach::No
 }
 
 /// The real path of `p`, or of its folder when `p` itself doesn't resolve
@@ -653,9 +732,9 @@ fn reaches_linked_ssh_dir(
     resolved: &[PathBuf],
     linked: &[PathBuf],
     cwd: &Path,
-) -> bool {
+) -> Reach {
     if linked.is_empty() {
-        return false;
+        return Reach::No;
     }
     let recursive_paths = matches!(
         &check.subject,
@@ -680,7 +759,7 @@ fn reaches_linked_ssh_dir(
         && paths.is_empty()
         && reaches_root(cwd)
     {
-        return true;
+        return Reach::Yes;
     }
     // A recursive reader with no folder operand searches where it runs: each
     // directory the walk is sure of (an uncertain one keeps D-078's verdict).
@@ -708,35 +787,41 @@ fn reaches_linked_ssh_dir(
         let command_word = unit.is_some_and(|x| x.seg.argv.first() == Some(&u.word));
         let recursive = recursive_paths
             || unit.is_some_and(|x| recursive_reader(&x.eff) || tree_walker(&x.eff));
-        let globby = u.word.contains(['*', '?', '[']);
+        let globby = u.word.contains(['*', '?', '[', '{']);
         for _ in &u.paths {
             let Some(p) = resolved.get(k) else {
-                return false;
+                return Reach::Maybe;
             };
             k += 1;
             if command_word {
                 continue;
             }
-            if globby && linked.iter().any(|d| glob_reaches(p, d, recursive)) {
-                return true;
+            if globby {
+                for d in linked {
+                    match glob_reaches(p, d, recursive) {
+                        Reach::Yes => return Reach::Yes,
+                        Reach::Maybe => maybe = true,
+                        Reach::No => {}
+                    }
+                }
             }
             let real = real_path(p);
             let is_dir = real.is_dir();
             for d in linked {
                 let inside = real.starts_with(d) && real != *d;
                 if inside && !is_dir {
-                    return true;
+                    return Reach::Yes;
                 }
                 if globby && real.parent().is_some_and(|parent| parent.starts_with(d)) {
-                    return true;
+                    return Reach::Yes;
                 }
                 if recursive && (real.starts_with(d) || d.starts_with(&real)) {
-                    return true;
+                    return Reach::Yes;
                 }
             }
         }
     }
-    false
+    if maybe { Reach::Maybe } else { Reach::No }
 }
 
 /// Whether the call reads a regular file with more than one link: a named

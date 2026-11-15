@@ -644,19 +644,149 @@ adversarial_fuzz       20/20   atrium-core lib      20/20
 
 - No daemon left running (`pgrep -fl atriumd`: none).
 
-## Sixth round (D-081): stopped mid-way, work in progress (2026-11-14)
+## Sixth round (Claude Opus 5.5, D-081, D-088): the round-5 review of `5a8c57c`
 
-The Opus 5.5 worker was **stopped by the orchestrator at Pedro's request** while working on item 5. Its last note was "Now rewrite unwrap with a table-driven option reader." Nothing of this round had been committed. The orchestrator committed the worktree as it was, as a work-in-progress commit, so it survives the handoff.
+The round-5 review's "Convergence assessment" asked for fixes to mechanisms, not spellings, so each item below gives:
+- the mechanism;
+- the general rule now implemented;
+- the table of neighbouring spellings, generated where possible, in `crates/atrium-core/tests/adversarial_regression.rs` (`round_6_*`) and `adversarial_ordinary.rs`;
+- the fix.
 
-**State: does not compile.** `cargo check -p atrium-core` fails with `E0433: cannot find type Reach` at `crates/atrium-core/src/policy/gate.rs:700`: a helper enum used by the new `searches_cwd` code was never written. No test or DoD has run on this state. The last good commit is `5a8c57c` (round five, reviewed in `reviews/M1-13-adversarial-round5.md`: rework).
+Every `round_6_*` test fails on `5a8c57c`, except `round_6_ordinary_lines_keep_devs_verdict`, which is a no-regression table. All of them pass now. Changes are only in `crates/atrium-core/src/policy/**`.
 
-**What the diff shows, per item of the round-5 review's root-cause list.** The orchestrator read this from the diff; it has not been checked.
-1. `glob_reaches` and `**`: no change visible.
-2. Recursive readers' options: **in progress.** `gate.rs` has a table-driven `ReaderOpts`, `readings`, `AG_OPTS`, `ACK_OPTS` and a new `searches_cwd`, which is the code that doesn't compile. Not visible yet: `find` through `shell::find_roots`.
-3. Nested quoting in `${…}`: **looks written.** `shell.rs` has `scan_paren_n`, `skip_dq`, `scan_dollar_brace_n` and a `MAX_SCAN_NEST` limit that fails closed. `adversarial_regression.rs` has the generated test `round_6_item_3_generated_quote_and_substitution_prefixes`, with its generators `gen_unquoted` and `gen_dquoted`.
-4. Command position and chain state: **in progress.** `shell.rs` has `Compound` and `opens_body`; `words.rs` has `Frame` and `close_frame`.
-5. Wrapper option reader: **started.** `shell.rs` has `Opts`, `NO_OPTS`, `wrapper_opts`, `Opt`, `read_opt` and `is_option`. The rewrite of `unwrap` that would use them had just begun.
-6. Script readers piped into a substituted word: no change visible.
-7. `eval`/`source` in a pipeline: nothing visible apart from the `words.rs` frame work.
+The orchestrator's reading of the work-in-progress commit `87d6679` was partly wrong. Items 3, 4, 6 and 7, and most of item 5, were already written there. What was missing was the gate side of items 1 and 2: the `Reach` enum, glob expansion, the reader tables, and `find` through `find_roots`.
 
-**To resume:** start from this commit and finish items 2, 4 and 5. Then do items 1, 6 and 7, write the "Sixth round" tables for the neighbouring spellings, and run the DoD. Then comes the Hydrogen `high` re-review, which can read the earlier reviews in the worktree's git-ignored `.orchestration/review-input/`. Alternatively, reset to `5a8c57c` and redo the round. The brief for the round is the orchestrator's message recorded in D-081 and the round-5 review's "Convergence assessment".
+D-078 is kept: an uncertain cwd under Any/FullAccess keeps dev's Allow, and the cwd-root checks read only directories the walk is sure of. `env -C` is unchanged (still open for Pedro). New fail-closed paths end at Ask, never at a new hard deny.
+
+### Item 1: globs reaching a folder linked into `~/.ssh` (`gate.rs`)
+
+- **Mechanism:** `glob_reaches` compared pattern components with the linked folder's components one to one, so `**` matched exactly one folder. A glob whose prefix didn't resolve was missed.
+- **Rule:** a glob is expanded on the filesystem the way the shell expands it (`expand_glob`):
+  - it goes component by component from its literal prefix;
+  - `**` matches zero or more components, files included when it is last;
+  - `{a,b}` is alternation, and dot-files are skipped unless the pattern names them;
+  - a literal component matches only a name that exists.
+  - The result is a hit when any expansion is inside the linked folder. A recursive reader or walker is also a hit when an expansion is the folder or a folder above it (`rg x vault/*`).
+  - When the expansion can't be done (more than 4,096 entries, `**` more than 12 deep, a component globset can't read, `$` or a backtick in the prefix), the result is `Reach::Maybe`, which turns an Allow into an Ask.
+  - `reaches_linked_ssh_dir` now returns `Reach { No, Maybe, Yes }`. Yes gives a hard deny (`credential-read`); Maybe gives Ask.
+- **Table** (`round_6_items_1_and_2_…`):
+  - 15 glob shapes × 5 readers (`cat`, `head -n 1`, `cp -t /tmp`, `grep x`, `tar czf`). Shapes: `~/**/id_work`, `~/**/id_*`, `~/**/*`, `~/*/**/id_work`, `~/**/work/*`, `~/**/w*/*`, `~/v*/w*/id_work`, `~/vault/**/id_work`, `~/vault/**`, `~/{vault,x}/work/id_work`, `~/vault/{work,x}/*`, `~/vault/*/*`, `vault/**/id_work`, `./**/id_work`, `~/**/../vault/work/*`.
+  - 4 folder globs × 5 recursive readers or walkers.
+  - All are Deny in home, any and full.
+  - Not denied: `ls ~/vault/*`, `ls vault/*`, `ls ~/**/notes.txt`, `cat ~/**/notes.txt`, `cat ~/proj/**/*.rs`, `cat ~/{proj,x}/src/main.rs`, and others.
+
+### Item 2: recursive readers given no folder (`gate.rs`, `shell.rs`)
+
+- **Mechanism:** `searches_cwd` guessed. For `find` it looked only at the first word, so `find -L` and `find -H` were missed. For `ag` and `ack` it counted words not starting with `-`, so `-C 3` hid the search of the cwd.
+- **Rule:** each reader's options are read with a table.
+  - `find`: through `shell::find_roots_explicit`, the same parser `find_roots` and `-exec` use. Its table covers GNU `-H -L -P -O<n> -D x` and BSD `-E -X -d -s -x -f PATH`, where `-f` gives a root. With no root it walks `.`.
+  - `rg` and `grep`: through `engine::search_roots`, the parser Home's read-only list uses. `-R` is read as `-r`, since it has the same roots.
+  - `ag` and `ack`: through new tables (`AG_OPTS`, `ACK_OPTS`). `-g` and `-f` mean there is no pattern word. A short option whose value is optional (`ack -C [N]`) gives two readings, and the folder is searched if either reading leaves no path.
+  - An option the table doesn't know gives `None`. If the unit's known cwd holds the linked folder, that is `Reach::Maybe` (Ask), not a hard deny.
+- **Table:** 46 reader spellings × three ways to be in the folder holding the link (`cd vault && …`, cwd `vault`, cwd `vault/work`): Deny everywhere.
+  - Reader spellings include `find -L/-H/-P/-O3/-D tree/-E/-X/-s/-x`, `find -L -exec cat {} +`, `rg -C 3 x`, `rg -tpy x`, `grep -R x`, `grep -r -C 3 x`, `rgrep -C 3 x`, `ag -C 3 x`, `ag -G pat x`, `ag -g pat`, `ack -C 3 x`, `ack -C x`, `ack -f` and `ack --type rust x`.
+  - Not denied: `cd proj && rg x`, `cd proj && find -L . -name '*.rs'`, `ag -C 3 x proj`, `ack -C 3 x proj`, `find -L proj -name '*.rs'`.
+
+### Item 3: quoting inside `${…}`, `$(…)`, `"…"` and backticks (`shell.rs`)
+
+- **Mechanism:** `scan_dollar_brace` didn't skip `$(…)` or backticks, and `scan_paren` skipped a `"…"` without its own `$(…)`. A quote inside a nested substitution then ended the wrong construct.
+- **Rule:** every scanner skips every construct the shell reads inside it, using the same scanners, at any depth:
+  - in `$(…)`: quotes, `${…}`, backticks, and nested `$(…)` and `$((…))`;
+  - in `"…"` (`skip_dq`): `$(…)`, backticks and `${…}`;
+  - in `${…}`: all of them, with `'` counting only outside double quotes.
+  - Past `MAX_SCAN_NEST` (128) a scanner reports the construct as unclosed (fail closed: unterminated, so it asks, and the `${` ambiguous tail is still lexed).
+- **Table:** a property test, `round_6_item_3_generated_quote_and_substitution_prefixes`.
+  - Generators build words valid in unquoted and double-quoted contexts by nesting `"…"`, `$(…)`, `${x:-…}` and backticks to depth 2, plus selected depth-3 words. The leaves hold `'"'`, `"'"`, `'}'`, `')'`, `\"`, `\)`, `\}` and similar.
+  - For each word P, `echo P ; rm -rf ~`, `echo P && rm -rf ~` and `echo P<newline>rm -rf ~` must be hard denies in all four settings. That is more than 1,000 lines.
+
+### Item 4: command position and chain state (`shell.rs`, `words.rs`)
+
+- **Mechanism:**
+  - A reserved word opened or closed a compound only after a short list of words, so `function f {`, `coproc {` and `coproc N {` were missed, and their `}` popped the outer piped group.
+  - Chain state was flat: an internal `;` inside a compound ended the enclosing `&&` chain (the round-5 major).
+- **Rule, command position:** `opens_body` accepts every word that can precede a command: `then`, `do`, `else`, `elif`, `!`, `{`, `if`, `while`, `until`, `time [-p]`, `coproc [NAME]` and `function NAME`.
+  - `NAME()` / `NAME ()` is read as a function definition: the next compound is its body, and the name and body are one command in the chain.
+  - Compounds have a kind (`Compound::{Paren, Brace, Cond, Loop, Func}`) and a number unique to that compound.
+  - A closer with no open compound, or a compound still open at the end, adds the reason "unbalanced compound" (Ask).
+- **Rule, chain state:** every unit carries the compounds it is inside. The walk keeps a `Frame` per open compound, holding the `&&` chain around it.
+  - On entry, the outer chain is put aside.
+  - At the end, the compound's stopping places join the outer chain's pool, which decides when they count.
+  - A body that may not run (`if`, `case`, loops, functions, `coproc`, and a `{ }` after `||`) leaves the entry directory as a candidate.
+  - A `cd` in a loop or function body may repeat, so it makes the directory unknown.
+  - A `( … )` group's place in the chain is the join written after it (`close_join`).
+- **Also fixed (not named by the review; found by the generator):**
+  - After `||` the next command may be skipped. `make || cd /tmp && cat ~/.ssh/id_rsa` and `true || { cd /tmp && true; } && cat …` reached Allow under Any/Full on dev and on `5a8c57c`. They now keep the old directory as a candidate and are hard denies.
+  - The candidate is added only when the skipped command moved, so `a || b || c` doesn't grow the list.
+- **Tables:**
+  - `round_6_item_4_generated_compounds_inside_a_piped_compound`: 18 compound shapes, each nested inside every other, inside 7 piped containers (2,268 lines). Each is `echo 'rm -rf ~' | …; sh; …` and must be a hard deny.
+  - `round_6_item_4_generated_chain_state_keeps_the_old_directory` (105 lines):
+    - `cd /tmp && C ; cat …` and `|| cat …` for every compound;
+    - 10 bodies that may not run × 3 `cd` forms × `;`/`&&`;
+    - loops and functions that repeat `cd ..`;
+    - `(cd /tmp) && …` and similar.
+    - All are `credential-read`.
+  - `adversarial_ordinary.rs::round_6_major_generated_compounds_inside_a_cd_chain`: 20 compound shapes × 4 tails (`cd proj && C && cat .npmrc`, `cd build && C && rm -rf *`, `… && sh -c …`, and the compound twice), all at dev's Ask/Ask/Allow/Allow. The review's seven lines are among them.
+
+### Item 5: one option reader for every wrapper (`shell.rs`)
+
+- **Mechanism:** most wrappers had a list of exact value-taking words. A cluster ending in a value letter (`exec -ca foo`, `caffeinate -it 5`, `ionice -tc 2`, `xargs -tI {}`) left the value as the command. `flock` and `script` stopped reading options after their file.
+- **Rule:** `unwrap` now runs on one table-driven reader, `read_opt` with `wrapper_opts`.
+  - Each wrapper's table lists short flags, short options with a value (the rest of the word or the next word), short options with an optional attached value (`xargs -i{}`), long flags and long options with a value (`--opt v` or `--opt=v`), and bare numbers (`nice -10`).
+  - The table covers `time`, `nohup`, `builtin`, `command`, `setsid`, `unbuffer`, `caffeinate`, `sandbox-exec`, `chroot`, `exec`, `nice`, `ionice`, `stdbuf`, `timeout`, `xargs`, `chrt`, `taskset`, `flock`, `script`, `busybox`/`toybox`, `arch` (multi-letter) and `env` (its own cluster reader).
+  - `flock` and `script` read their options after the file too, which is the stricter reading. `script` gains `-o`/`--output-limit`, and `-F` is now a flag.
+  - `chrt -p` and `taskset -p` act on a process: no command.
+  - **Fail closed:** an option the table doesn't know is read as a flag, as before, and adds the reason "unknown wrapper option". A prefix or exact rule then can't allow the line (Ask), while Any and FullAccess keep dev's Allow.
+- **Tables:**
+  - `round_6_item_5_generated_wrapper_option_clusters`: for 16 wrappers, every flag letter clustered with every value letter in several shapes: `-fv V`, `-fvV`, `-f -v V`, `-v V -f`, `-vV`, `-v V`, all flags together. Each comes with `rm -rf ~` and with `sh -c 'rm -rf ~'`. `flock` and `script` also have their options after the file, and there are nested wrappers. More than 500 lines, all `recursive-delete-outside-cwd`.
+  - `round_6_item_5_unknown_wrapper_options_never_reach_allow_by_prefix`: `W -Z`, `W --zzz` and `W -Z9` with a prefix rule for `W`: never Allow.
+
+### Item 6: a substituted word naming an interpreter (`shell.rs`, `deny.rs`)
+
+- **Mechanism:** `substituted_word_may_be_shell` answered only "is it a shell?", so `$(which python3)` and `$(which crontab)` passed.
+- **Rule:** `shell::substituted_program` returns the program a substituted word plainly names, or `None` when it may be anything. It handles a literal tail after `/`; `which`, `whence`, `command -v` and `type -p` of a literal name; and `$(echo NAME)` (one known word). `None` is read as a shell.
+  - `deny.rs` replaces the word with that program and reads the command again with `reads_stdin_as_code`, so interpreters, `crontab`, `at`, `script` and `make -f -` all count.
+  - The lexer does the same for shells, `eval`, `source` and `reads_stdin_as_script`.
+- **Table:** `round_6_item_6_generated_substituted_interpreters`: 18 programs × 9 spellings (`$(which N)`, `$(command -v N)`, backticks, `$(type -p N)`, `$(echo N)`, quoted, `$(brew --prefix)/bin/N`, `$(whence N)`), plus `$(which make) -f -`. All are pipe-to-shell.
+  - The same 9 spellings with jq, less, wc, cat, grep, sort, head and tee keep dev's Ask/Ask/Allow/Allow (checked against dev).
+
+### Item 7: `eval` and `source` that may run in a child (`shell.rs`, `words.rs`)
+
+- **Mechanism:** a same-shell text always replaced the parent's candidates, even when its owner was in a pipeline (a subshell in bash, the current shell in zsh).
+- **Rule:** `Unit::shell_union` is set when the owner is in a pipeline, a group, a subshell or the background, or when its stdin text came through a pipe. Then the walk unions the parent's candidates with where the text ended, and never drops them. An unknown cwd in the text makes the parent unknown.
+- **Table:** `round_6_item_7_generated_same_shell_text_in_a_child`: 6 owners × 6 contexts (`echo hi | O &&`, `… | O ;`, `(O) &&`, `O &`, `{ O; } | cat;`, `O | cat &&`) plus 4 stdin forms. All are `credential-read`.
+
+### Ordinary lines against dev
+
+- `round_6_ordinary_lines_keep_devs_verdict` has 87 lines, all at dev's verdict, probed on dev and on this branch.
+- They include `nice -n 10 make`, `nice -10 make`, `xargs -I {} echo {}`, `xargs -tI {} echo {}`, `timeout 5 cargo test`, `timeout -s KILL 5 cargo test`, `find -L . -name '*.rs'`, `stdbuf -oL make`, `ionice -c3 -n7 make`, `caffeinate -dims make`, `exec -a foo make`, `env -iu FOO make`, `flock -w 10 /tmp/l make`, `chrt -f 10 make`, `taskset -c 0 make`, and `arch -arm64 make`.
+- They also include compound commands in `&&` chains, function definitions, piped loops, `curl … | $(brew --prefix)/bin/jq .`, `git log | $(git var GIT_PAGER)`, `eval "$(ssh-agent -s)"`, `source .venv/bin/activate && pytest`, `rg`, `ag`, `ack`, `cp -r`, `tar` and `rm -rf build`.
+- Together with the 80 generated major lines and the 72 good-program lines of item 6, nothing differs from dev.
+
+### What is left
+
+- **Owner decision, unchanged:** `env -C DIR CMD` keeps dev's hard deny.
+- **Limits:**
+  - A glob expansion bigger than 4,096 entries or deeper than 12 folders asks (only while a folder is linked into `~/.ssh`).
+  - The output of an unknown substitution is assumed not to split into words (as in round 5).
+  - Wrappers not in the table (`sudo`, `doas`, `watch`, …) are not unwrapped (as before).
+  - `if` and `case` conditions are read as part of the body (the stricter reading).
+- **Still ignored, outside this brief:** part-1 findings 4, 5 and 6, gate findings 10 and 11, fuzz finding 11.
+
+### Real outputs of the Definition of Done (macOS, this worktree)
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --no-fail-fast`: exit 0, no failures, and no daemon left running (`pgrep -fl atriumd`: none). Test counts for atrium-core:
+
+```
+atrium-core lib 9 | adversarial_fuzz 2 passed 1 ignored (13.8 s) | adversarial_gate 9 passed 2 ignored
+adversarial_ledger 14 | adversarial_ordinary 10 | adversarial_policy 15 passed 3 ignored
+adversarial_regression 44 | attention 8 | history 25 | ledger 20 | policy 44 | store 28
+```
+
+- 20 runs in a row (fish: `for i in (seq 20); cargo test -q -p atrium-core --test adversarial_regression; or break; end`):
+
+```
+adversarial_regression 20/20   adversarial_ordinary 20/20   adversarial_policy 20/20
+adversarial_gate       20/20   policy               20/20   adversarial_fuzz     20/20
+```

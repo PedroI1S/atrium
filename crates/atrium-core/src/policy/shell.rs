@@ -173,7 +173,11 @@ fn scan_paren(chars: &[char], start: usize) -> (String, usize, bool) {
 
 fn scan_paren_n(chars: &[char], start: usize, n: u16) -> (String, usize, bool) {
     if n > MAX_SCAN_NEST {
-        return (chars[start.min(chars.len())..].iter().collect(), chars.len(), false);
+        return (
+            chars[start.min(chars.len())..].iter().collect(),
+            chars.len(),
+            false,
+        );
     }
     let mut depth = 1usize;
     let mut i = start;
@@ -215,7 +219,11 @@ fn scan_paren_n(chars: &[char], start: usize, n: u16) -> (String, usize, bool) {
         }
         i += 1;
     }
-    (chars[start.min(chars.len())..].iter().collect(), chars.len(), false)
+    (
+        chars[start.min(chars.len())..].iter().collect(),
+        chars.len(),
+        false,
+    )
 }
 
 /// From just after an opening `"`: the index just past the closing `"`, and
@@ -312,7 +320,13 @@ fn scan_dollar_brace_n(chars: &[char], start: usize, in_dq: bool, n: u16) -> (St
         return (chars[start..].iter().collect(), chars.len(), false);
     }
     let mut j = start;
-    let unclosed = || (chars[start..].iter().collect::<String>(), chars.len(), false);
+    let unclosed = || {
+        (
+            chars[start..].iter().collect::<String>(),
+            chars.len(),
+            false,
+        )
+    };
     while j < chars.len() {
         match chars[j] {
             '}' => return (chars[start..j].iter().collect(), j, true),
@@ -514,6 +528,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     {
                         out.reasons.push("function definition".into());
                         i = k + 1;
+                        // the name and the body are one command: its place
+                        // in a chain is the join after the body
+                        cur.join = Join::And;
                         flush!();
                         fn_def = true;
                         continue;
@@ -534,7 +551,10 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     // the commands inside belong to the group
                     flush!();
                     paren_depth = paren_depth.saturating_sub(1);
-                    if groups.last().is_some_and(|g| matches!(g.0, Compound::Paren | Compound::Func)) {
+                    if groups
+                        .last()
+                        .is_some_and(|g| matches!(g.0, Compound::Paren | Compound::Func))
+                    {
                         groups.pop();
                     } else {
                         // `case x in a)`: a pattern, not a group
@@ -942,7 +962,11 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                         _ => None,
                     };
                     if let Some(kind) = kind {
-                        let kind = if std::mem::take(&mut fn_def) { Compound::Func } else { kind };
+                        let kind = if std::mem::take(&mut fn_def) {
+                            Compound::Func
+                        } else {
+                            kind
+                        };
                         groups.push((
                             kind,
                             cur.piped.then_some(cur.pipe),
@@ -1290,7 +1314,7 @@ fn opens_body(argv: &[String]) -> bool {
             }
             "function" => {
                 // `function NAME` (its body comes next)
-                if k + 2 != argv.len() {
+                if k + 1 >= argv.len() {
                     return false;
                 }
                 k += 2;
@@ -1298,7 +1322,7 @@ fn opens_body(argv: &[String]) -> bool {
             "coproc" => {
                 k += 1;
                 // `coproc NAME {`
-                if k + 1 == argv.len() && is_name(&argv[k]) {
+                if k < argv.len() && is_name(&argv[k]) && argv.get(k + 1).is_none_or(|w| w == "{") {
                     k += 1;
                 }
             }
@@ -1427,11 +1451,23 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
         "time" => o(
             "apqvVlh",
             "fo",
-            &["--append", "--portability", "--quiet", "--verbose", "--help", "--version"],
+            &[
+                "--append",
+                "--portability",
+                "--quiet",
+                "--verbose",
+                "--help",
+                "--version",
+            ],
             &["--format", "--output"],
         ),
         "command" => o("pvV", "", &[], &[]),
-        "setsid" => o("cfw", "", &["--ctty", "--fork", "--wait", "--help", "--version"], &[]),
+        "setsid" => o(
+            "cfw",
+            "",
+            &["--ctty", "--fork", "--wait", "--help", "--version"],
+            &[],
+        ),
         "unbuffer" => o("p", "", &[], &[]),
         "caffeinate" => o("dimsu", "tw", &[], &[]),
         "sandbox-exec" => o("", "fnpD", &[], &[]),
@@ -1452,11 +1488,22 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
             &["--ignore", "--help", "--version"],
             &["--class", "--classdata", "--pid", "--pgid", "--uid"],
         ),
-        "stdbuf" => o("", "ioe", &["--help", "--version"], &["--input", "--output", "--error"]),
+        "stdbuf" => o(
+            "",
+            "ioe",
+            &["--help", "--version"],
+            &["--input", "--output", "--error"],
+        ),
         "timeout" => o(
             "fv",
             "sk",
-            &["--foreground", "--preserve-status", "--verbose", "--help", "--version"],
+            &[
+                "--foreground",
+                "--preserve-status",
+                "--verbose",
+                "--help",
+                "--version",
+            ],
             &["--signal", "--kill-after"],
         ),
         "xargs" => Opts {
@@ -1506,7 +1553,12 @@ fn wrapper_opts(name: &str) -> Option<Opts> {
             ],
             &["--sched-runtime", "--sched-period", "--sched-deadline"],
         ),
-        "taskset" => o("ac", "", &["--all-tasks", "--cpu-list", "--help", "--version"], &[]),
+        "taskset" => o(
+            "ac",
+            "",
+            &["--all-tasks", "--cpu-list", "--help", "--version"],
+            &[],
+        ),
         "flock" => o(
             "sexnuoFh",
             "wE",

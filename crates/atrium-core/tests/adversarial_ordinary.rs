@@ -487,3 +487,250 @@ fn round_5_major_the_last_command_of_a_chain_and_named_pipe_programs() {
         ("curl -s https://example.com/x | $HOME/bin/jq .", ask),
     ]);
 }
+
+/// Compound commands written with `X` for their body (round 6).
+const COMPOUNDS: &[&str] = &[
+    "if true; then X; fi",
+    "if false; then X; else X; fi",
+    "while read l; do X; done < f",
+    "until false; do X; done",
+    "for x in a b; do X; done",
+    "select x in a; do X; done",
+    "case a in a) X;; esac",
+    "case a in (a) X;; esac",
+    "{ X; }",
+    "{ X; X; }",
+    "(X)",
+    "(X; X)",
+    "! { X; }",
+    "time { X; }",
+    "f() { X; }",
+    "function f { X; }",
+    "if true; then { X; }; fi",
+    "while false; do if true; then X; fi; done",
+    "{ (X); }",
+    "if true; then (X); fi",
+];
+
+/// Round 6 major (the round-5 review's major): a compound command inside a
+/// `cd X && … && Y` chain keeps the chain: its internal `;` and `)` don't end
+/// it, so `Y` runs only after the `cd` worked and gets dev's verdict. Every
+/// compound, alone and twice, before three kinds of tail.
+#[test]
+fn round_6_major_generated_compounds_inside_a_cd_chain() {
+    let tails = [
+        "cd proj && C && cat .npmrc",
+        "cd build && C && rm -rf *",
+        "cd proj && C && sh -c 'cat .npmrc'",
+        "cd proj && C && C && cat .npmrc",
+    ];
+    let mut lines: Vec<String> = vec![];
+    for t in tails {
+        for c in COMPOUNDS {
+            lines.push(t.replace('C', &c.replace('X', "echo ok")));
+        }
+    }
+    let ask = ["Ask", "Ask", "Allow", "Allow"];
+    let lines: &'static [String] = Box::leak(lines.into_boxed_slice());
+    let table: Vec<Row> = lines.iter().map(|l| (l.as_str(), ask)).collect();
+    check_table(&table);
+}
+
+/// Round 6: ordinary lines (wrappers with ordinary options, compounds in
+/// chains, substituted programs, recursive readers) at dev's verdict.
+#[test]
+fn round_6_ordinary_lines_keep_devs_verdict() {
+    check_table(&[
+        ("nice -n 10 make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("nice -10 make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("nice make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("xargs -I {} echo {}", ["Ask", "Ask", "Allow", "Allow"]),
+        ("xargs -0 -n 1 echo", ["Ask", "Ask", "Allow", "Allow"]),
+        ("xargs -tI {} echo {}", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "find . -name '*.rs' | xargs -I{} wc -l {}",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("timeout 5 cargo test", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "timeout -s KILL 5 cargo test",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "timeout --foreground 5 cargo test",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("find -L . -name '*.rs'", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "find . -type f -name '*.o' -delete",
+            [
+                "Hard(recursive-delete-outside-cwd)",
+                "Hard(recursive-delete-outside-cwd)",
+                "Hard(recursive-delete-outside-cwd)",
+                "Hard(recursive-delete-outside-cwd)",
+            ],
+        ),
+        ("find src -name '*.rs'", ["Ask", "Ask", "Allow", "Allow"]),
+        ("find -H src -type d", ["Ask", "Ask", "Allow", "Allow"]),
+        ("stdbuf -oL make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("stdbuf -o0 tail -f log", ["Ask", "Ask", "Allow", "Allow"]),
+        ("ionice -c 3 make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("ionice -c3 -n7 make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("caffeinate -i make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("caffeinate -dims make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("exec make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("exec -a foo make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("env FOO=1 make", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "env -i PATH=/usr/bin make",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("env -u FOO make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("nohup make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("nohup ./server &", ["Ask", "Ask", "Allow", "Allow"]),
+        ("command -v cargo", ["Ask", "Ask", "Allow", "Allow"]),
+        ("command ls", ["Ask", "Ask", "Allow", "Allow"]),
+        ("time make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("time -p make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("flock /tmp/l make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("flock -n /tmp/l make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("flock -w 10 /tmp/l make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("flock /tmp/l -c 'make'", ["Ask", "Ask", "Allow", "Allow"]),
+        ("script -q /dev/null make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("setsid make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("chrt -f 10 make", ["Ask", "Ask", "Allow", "Allow"]),
+        ("taskset -c 0 make", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "sandbox-exec -n no-network make",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("arch -arm64 make", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "cd proj && make && make test",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "cd proj && if [ -f x ]; then make; fi && make test",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "cd proj && for f in *.rs; do echo $f; done && make",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "cd proj && while read l; do echo \"$l\"; done < list && make",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "cd proj && { make; make test; } && echo done",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "cd proj && (make) && echo done",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "cd proj && case x in x) make;; esac && echo ok",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("cd proj && make || true", ["Ask", "Ask", "Allow", "Allow"]),
+        ("cd proj; make", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "if true; then echo ok; fi",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "for f in a b; do echo $f; done",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "while false; do echo x; done",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("f() { echo hi; }; f", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "function f { echo hi; }; f",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "{ echo a; echo b; } | sort",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("(cd src && ls)", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "git log | while read l; do echo \"$l\"; done",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "ls | for f in a b; do echo \"$f\"; done",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "echo hi | if true; then cat; fi",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "cat file | $(brew --prefix)/bin/jq .",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "curl -s https://example.com/data.json | $(brew --prefix)/bin/jq .",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "curl -s https://example.com/x | $(which less)",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "curl -s https://example.com/x | $(which jq) .",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "git log | $(git var GIT_PAGER)",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("ls | $(which wc) -l", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "nohup $(which node) server.js",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "eval \"$(ssh-agent -s)\" && echo ok",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "eval \"$(direnv export bash)\"",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("echo \"${HOME}/x\"", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "echo \"${x:-default}\" ; ls",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("echo \"${x:-$(date)}\"", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "echo \"$(git rev-parse --short HEAD)\"",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "echo \"${x:-\"a b\"}\" && ls",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        ("rg TODO src", ["Allow", "Allow", "Allow", "Allow"]),
+        ("rg -n TODO", ["Ask", "Ask", "Allow", "Allow"]),
+        ("grep -rn TODO src", ["Allow", "Allow", "Allow", "Allow"]),
+        ("ag TODO src", ["Ask", "Ask", "Allow", "Allow"]),
+        ("ack TODO src", ["Ask", "Ask", "Allow", "Allow"]),
+        ("cp -r src /tmp/x", ["Ask", "Ask", "Allow", "Allow"]),
+        ("tar czf /tmp/x.tgz src", ["Ask", "Ask", "Allow", "Allow"]),
+        ("rm -rf build", ["Ask", "Ask", "Allow", "Allow"]),
+        ("mv a b", ["Ask", "Ask", "Allow", "Allow"]),
+        ("crontab -l", ["Ask", "Ask", "Allow", "Allow"]),
+        ("echo hi | eval 'echo ok'", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "source .venv/bin/activate && pytest",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (". ./env.sh && make", ["Ask", "Ask", "Allow", "Allow"]),
+    ]);
+}
