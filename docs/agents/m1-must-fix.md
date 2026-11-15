@@ -111,6 +111,19 @@ Each finding is a test marked `#[ignore = "M1-13 finding N"]` on that branch; fi
 | S13 | **blocker** | From the security review (`reviews/M1-13-adversarial.md`, 2026-11-14): S2 is **not closed** on the branch, and the branch has regressions against `dev` (a key symlinked into `~/.ssh` readable without asking; a `cd` through a symlink loses the write check; false hard denies after a working `cd`). `dev` doesn't have the regressions: the branch must not be merged before the rework (the brief's "Third part"). |
 | S12 | — | Still to write (M1-13's remaining scope): the daemon and host adversarial tests (socket roles, `Hello` across the deadline, full control lane, many replaced subscriptions, a store read failing during replay, `kill_recorded` `Unverified`, a recovery closure that fails, the slow-command limit). |
 
+### M1-13 merged (`02c13bc`, D-098): known limits left open
+
+Rounds 3–8 worked through S2–S13 (the handoff says how each was handled); S1 is CR-12, still owed. The last review, `reviews/M1-13-adversarial-round8.md` (Hydrogen `high`), found **no Allow regression against `dev`**. Its one regression (major 5, a false hard deny in `rg -L` value pairing) was fixed in `e5ab941` before the merge. The four blockers below remain open; the reviewer marked each **same as `dev`**: `dev` doesn't catch them either. They go to the follow-up policy task, with CR-12 and P1, written by Claude.
+
+| # | Sev. | Known limit (D-098) |
+|---|---|---|
+| K1 | blocker | Round 8, finding 1: `runs_here` (`eval`/`source`/`.`), `env_payloads` and `<(...)` process substitutions read only the main reading of the line, not `other_readings` or substituted words. |
+| K2 | blocker | Round 8, finding 2: `reaches_tree_through_links` misses two-hop symlinks, drops `expand_glob`'s `None`, leaves out `atrium_*_paths`, and skips abbreviated long flags. |
+| K3 | blocker | Round 8, finding 3: `shell_c_code` stops at `-o`/`+o`/`-O`/`+O` values; `long_name` ignores 1–2 letter GNU prefixes (`script --c`, `flock --c`). |
+| K4 | blocker | Round 8, finding 4: `find_exec_units` doesn't extract `payloads_of`, `env_payloads` or `code_subs` from `-exec` commands. |
+| K6 | — | On merged `dev`, 7 tests are still ignored. 6 are marked `#[ignore = "M1-13 finding N"]`: findings 4 (S7), 5 (S8), 6 (S1, CR-12), 10 (S11), and 11 (S5) twice. Fixing a finding means un-ignoring its test. |
+| K5 | minor | `rg -L pat` with no folder, run from a working folder that holds a link into `~/.ssh`, is a hard deny (`dev`: Ask/Allow/Allow). This is round 6's design, not a regression from the fix. |
+
 ## From the M1 Linux checks (`handoffs/M1-14a-linux-host.md` on `agent/sonnet/M1-14a-linux-host`; 2026-11-13)
 
 Found by running the daemon's tests 30 times in a row on Linux (6 of 30 runs failed; the base commit fails the same way, so M1-14a's change is not the cause). **Must be fixed before the M1 gate:** N1.
