@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use atrium_host::lifecycle::{
     InstanceLock, LifecycleError, Paths, default_paths, install_keep_running, remove_keep_running,
-    secure_dir, spawn_detached,
+    secure_dir, spawn_detached, spawn_detached_wait,
 };
 use atrium_host::supervise::{ProcessIdentity, identify};
 
@@ -488,4 +488,62 @@ fn default_paths_and_keep_running_service_use_temporary_home_and_xdg_only() {
             "real HOME LaunchAgents must never be touched by tests"
         );
     }
+}
+
+#[test]
+fn spawn_detached_wait_returns_stderr_on_early_exit_and_pipes_when_log_unopenable() {
+    let tmp = TempDir::new("detached-wait");
+    let log = tmp.path().join("logs/daemon.log");
+    let ready = tmp.path().join("ready.sock");
+
+    // 1. Log opens normally, process writes stderr and exits within startup_wait.
+    let err = spawn_detached_wait(
+        Path::new("/bin/sh"),
+        &[
+            "-c".to_string(),
+            "echo 'refused: bad runtime dir' >&2; exit 1".to_string(),
+        ],
+        &log,
+        &ready,
+        Duration::from_secs(2),
+    )
+    .expect_err("early exit must return Err");
+    assert!(
+        err.to_string().contains("refused: bad runtime dir"),
+        "expected stderr in error, got: {err}"
+    );
+
+    // 2. Log cannot be opened (symlink), process writes stderr and exits -> captured via pipe.
+    let sym_log = tmp.path().join("sym.log");
+    std::os::unix::fs::symlink(&log, &sym_log).unwrap();
+    let err_pipe = spawn_detached_wait(
+        Path::new("/bin/sh"),
+        &[
+            "-c".to_string(),
+            "echo 'piped refusal reason' >&2; exit 1".to_string(),
+        ],
+        &sym_log,
+        &ready,
+        Duration::from_secs(2),
+    )
+    .expect_err("unopenable log with early exit must return piped stderr");
+    assert!(
+        err_pipe.to_string().contains("piped refusal reason"),
+        "expected piped stderr in error, got: {err_pipe}"
+    );
+
+    // 3. Log cannot be opened AND process stays alive -> killed and log error returned.
+    let err_alive = spawn_detached_wait(
+        Path::new("/bin/sh"),
+        &["-c".to_string(), "sleep 30".to_string()],
+        &sym_log,
+        &ready,
+        Duration::from_millis(80),
+    )
+    .expect_err("unopenable log with live process must fail");
+    let msg = err_alive.to_string();
+    assert!(
+        msg.contains("started") && msg.contains("stopped") && msg.contains("symlink"),
+        "expected started-then-stopped log-open error, got: {msg}"
+    );
 }

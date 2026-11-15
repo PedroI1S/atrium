@@ -67,6 +67,38 @@ enum Ended {
     Refused(ConnectionState),
 }
 
+fn is_transient_start_error(error: &io::Error, socket: &Path) -> bool {
+    error.kind() == io::ErrorKind::AddrInUse
+        || error
+            .to_string()
+            .contains("another daemon is already running")
+        || socket.exists()
+}
+
+/// Reduces a potentially multi-line start-up error (e.g. a log or stderr tail)
+/// to a single relevant line for `ConnectionState::Failed { message }`, which
+/// has no separate details field.
+fn one_line_failure(error: &io::Error) -> String {
+    let text = error.to_string();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines
+        .iter()
+        .rev()
+        .find(|line| {
+            line.contains("unsafe ")
+                || line.contains("refused")
+                || line.contains("panicked at")
+                || line.contains("error:")
+        })
+        .or_else(|| lines.last())
+        .map(|line| (*line).to_string())
+        .unwrap_or_else(|| "starting the daemon failed".to_string())
+}
+
 fn failed(message: impl Into<String>) -> Ended {
     Ended::Refused(ConnectionState::Failed {
         message: message.into(),
@@ -141,8 +173,32 @@ pub(crate) async fn run(
                 if attempt % START_EVERY == 1
                     && let Some(start) = options.start_daemon.clone()
                 {
-                    // Its result shows in whether the next attempts connect.
-                    let _ = tokio::task::spawn_blocking(move || start()).await;
+                    let failure = match tokio::task::spawn_blocking(move || start()).await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => {
+                            if is_transient_start_error(&error, &options.socket) {
+                                None
+                            } else {
+                                Some(one_line_failure(&error))
+                            }
+                        }
+                        Err(join_error) => {
+                            Some(format!("starting the daemon failed: {join_error}"))
+                        }
+                    };
+                    if let Some(message) = failure {
+                        shared.with_connection(|s| {
+                            s.disconnected(ConnectionState::Failed { message });
+                        });
+                        match control.recv().await {
+                            Some(Control::Reconnect) => {
+                                attempt = 0;
+                                early = 0;
+                                continue;
+                            }
+                            Some(Control::Shutdown) | None => break,
+                        }
+                    }
                 }
                 tokio::select! {
                     message = control.recv() => match message {
@@ -396,4 +452,31 @@ fn verify_socket(socket: &Path) -> Result<(), SocketError> {
         return Err(SocketError::Unsafe("it belongs to another user".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_line_failure_picks_relevant_single_line() {
+        let multi = io::Error::other(
+            "starting atriumd\nunsafe runtime directory /tmp/x: permissions 0755, expected 0700\nsome trailing noise",
+        );
+        assert_eq!(
+            one_line_failure(&multi),
+            "unsafe runtime directory /tmp/x: permissions 0755, expected 0700"
+        );
+
+        let panic_tail = io::Error::other(
+            "thread 'main' panicked at src/main.rs:10:5:\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+        );
+        assert_eq!(
+            one_line_failure(&panic_tail),
+            "thread 'main' panicked at src/main.rs:10:5:"
+        );
+
+        let plain = io::Error::other("line one\nline two\n");
+        assert_eq!(one_line_failure(&plain), "line two");
+    }
 }

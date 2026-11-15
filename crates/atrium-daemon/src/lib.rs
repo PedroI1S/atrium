@@ -295,6 +295,7 @@ impl Daemon {
         let paths = options.paths.clone();
         secure_dir(&paths.runtime_dir)?;
         secure_dir(&paths.data_dir)?;
+        secure_dir(&paths.logs_dir)?;
         // Before the stale socket is removed (contract §10).
         let lock = InstanceLock::acquire(&paths)?;
         let store: Arc<SqliteStore> =

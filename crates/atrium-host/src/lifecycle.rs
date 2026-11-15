@@ -19,13 +19,25 @@ impl Drop for InstanceLock {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
-    #[error("another daemon is running (pid {0:?})")]
+    #[error("{}", format_already_running(*.0))]
     AlreadyRunning(Option<u32>),
     /// The runtime directory is a symlink, not owned by the user, or not 0700.
     #[error("unsafe runtime directory {0}: {1}")]
     UnsafeDir(PathBuf, String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+fn format_already_running(pid: Option<u32>) -> String {
+    match pid {
+        Some(pid) => {
+            format!("another daemon is already running (pid {pid}), expected only one instance")
+        }
+        None => {
+            "another daemon is already running (lock held, unknown pid), expected only one instance"
+                .into()
+        }
+    }
 }
 
 /// `~/Library/Application Support/Atrium` on macOS, `$XDG_RUNTIME_DIR/atrium`
@@ -99,13 +111,13 @@ pub fn secure_dir(dir: &Path) -> Result<(), LifecycleError> {
     if meta.file_type().is_symlink() {
         return Err(LifecycleError::UnsafeDir(
             dir.to_path_buf(),
-            "directory is a symlink".into(),
+            "directory is a symlink, expected a 0700 directory".into(),
         ));
     }
     if !meta.is_dir() {
         return Err(LifecycleError::UnsafeDir(
             dir.to_path_buf(),
-            "path is not a directory".into(),
+            "path is not a directory, expected a 0700 directory".into(),
         ));
     }
     if meta.uid() != my_uid {
@@ -142,13 +154,13 @@ impl InstanceLock {
             if existing.file_type().is_symlink() {
                 return Err(LifecycleError::UnsafeDir(
                     paths.lock.clone(),
-                    "lock file is a symlink".into(),
+                    "lock file is a symlink, expected a 0600 regular file".into(),
                 ));
             }
             if !existing.is_file() {
                 return Err(LifecycleError::UnsafeDir(
                     paths.lock.clone(),
-                    "lock path is not a regular file".into(),
+                    "lock path is not a regular file, expected a 0600 regular file".into(),
                 ));
             }
             if existing.uid() != my_uid {
@@ -175,7 +187,7 @@ impl InstanceLock {
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
                 return Err(LifecycleError::UnsafeDir(
                     paths.lock.clone(),
-                    "lock file is a symlink".into(),
+                    "lock file is a symlink, expected a 0600 regular file".into(),
                 ));
             }
             Err(e) => return Err(LifecycleError::Io(e)),
@@ -185,7 +197,7 @@ impl InstanceLock {
         if !fd_meta.is_file() {
             return Err(LifecycleError::UnsafeDir(
                 paths.lock.clone(),
-                "lock path is not a regular file".into(),
+                "lock path is not a regular file, expected a 0600 regular file".into(),
             ));
         }
         if fd_meta.uid() != my_uid {
@@ -237,25 +249,20 @@ impl InstanceLock {
     }
 }
 
-/// Starts `atriumd` detached (new session, stdio to the log file), for the
-/// app when it finds no daemon. The log is opened with `O_NOFOLLOW`, created
-/// mode 0600, and refused if it exists with another owner or a looser mode.
-/// Returns its pid.
-///
-/// `atriumd` handles `SIGTERM` by exiting once no turn is running, and
-/// `SIGINT` by interrupting running turns (resumable) and exiting now.
-pub fn spawn_detached(executable: &Path, args: &[String], log: &Path) -> std::io::Result<u32> {
+fn detached_command(
+    executable: &Path,
+    args: &[String],
+    stdout: std::process::Stdio,
+    stderr: std::process::Stdio,
+) -> std::process::Command {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-
-    let stdout_log = open_private_log(log)?;
-    let stderr_log = stdout_log.try_clone()?;
 
     let mut cmd = Command::new(executable);
     cmd.args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_log))
-        .stderr(Stdio::from(stderr_log));
+        .stdout(stdout)
+        .stderr(stderr);
 
     // SAFETY: `setsid` is async-signal-safe (POSIX.1-2008), takes no arguments,
     // and touches no Rust heap or shared state between `fork` and `exec`.
@@ -268,9 +275,10 @@ pub fn spawn_detached(executable: &Path, args: &[String], log: &Path) -> std::io
         });
     }
 
-    let mut child = cmd.spawn()?;
-    let pid = child.id();
+    cmd
+}
 
+fn reap_in_background(mut child: std::process::Child) {
     // Reap in the background if the daemon exits while this caller is still
     // running, without killing the daemon if this caller exits first.
     let _ = std::thread::Builder::new()
@@ -278,8 +286,179 @@ pub fn spawn_detached(executable: &Path, args: &[String], log: &Path) -> std::io
         .spawn(move || {
             let _ = child.wait();
         });
+}
 
+/// Starts `atriumd` detached (new session, stdio to the log file), for the
+/// app when it finds no daemon. The log is opened with `O_NOFOLLOW`, created
+/// mode 0600, and refused if it exists with another owner or a looser mode.
+/// Returns its pid.
+///
+/// `atriumd` handles `SIGTERM` by exiting once no turn is running, and
+/// `SIGINT` by interrupting running turns (resumable) and exiting now.
+pub fn spawn_detached(executable: &Path, args: &[String], log: &Path) -> std::io::Result<u32> {
+    use std::process::Stdio;
+
+    let stdout_log = open_private_log(log)?;
+    let stderr_log = stdout_log.try_clone()?;
+    let mut cmd = detached_command(
+        executable,
+        args,
+        Stdio::from(stdout_log),
+        Stdio::from(stderr_log),
+    );
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    reap_in_background(child);
     Ok(pid)
+}
+
+/// Starts `executable` detached and waits up to `startup_wait` for either
+/// `ready` (such as the daemon's socket) to appear or the process to exit.
+///
+/// If the process exits within `startup_wait`, returns an error with the last
+/// lines it wrote to the log (or stderr). If `log` itself cannot be opened,
+/// captures stderr through a pipe during `startup_wait` so a start-up refusal
+/// is still returned; if the process stays alive without a private log, kills
+/// it and returns the log-open error.
+pub fn spawn_detached_wait(
+    executable: &Path,
+    args: &[String],
+    log: &Path,
+    ready: &Path,
+    startup_wait: std::time::Duration,
+) -> std::io::Result<u32> {
+    use std::process::Stdio;
+
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX_STDERR_BYTES: usize = 8192;
+    const MAX_STDERR_LINES: usize = 5;
+
+    match open_private_log(log) {
+        Ok(stdout_log) => {
+            let start_offset = stdout_log.metadata().map(|m| m.len()).unwrap_or(0);
+            let stderr_log = stdout_log.try_clone()?;
+            let mut cmd = detached_command(
+                executable,
+                args,
+                Stdio::from(stdout_log),
+                Stdio::from(stderr_log),
+            );
+            let mut child = cmd.spawn()?;
+            let pid = child.id();
+            let deadline = std::time::Instant::now() + startup_wait;
+
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let tail = read_new_log_tail(
+                            log,
+                            start_offset,
+                            MAX_STDERR_BYTES,
+                            MAX_STDERR_LINES,
+                        );
+                        let message = if tail.is_empty() {
+                            format!("daemon exited during startup ({status})")
+                        } else {
+                            tail
+                        };
+                        return Err(std::io::Error::other(message));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        reap_in_background(child);
+                        return Err(err);
+                    }
+                }
+                if ready.exists() || std::time::Instant::now() >= deadline {
+                    reap_in_background(child);
+                    return Ok(pid);
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+        Err(log_err) => {
+            let mut cmd = detached_command(executable, args, Stdio::null(), Stdio::piped());
+            let mut child = cmd.spawn()?;
+            let deadline = std::time::Instant::now() + startup_wait;
+
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        let tail =
+                            read_pipe_tail(child.stderr.take(), MAX_STDERR_BYTES, MAX_STDERR_LINES);
+                        if !tail.is_empty() {
+                            return Err(std::io::Error::other(tail));
+                        }
+                        return Err(log_err);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        // Never leave a daemon running without a private log file.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(err);
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    // Never leave a daemon running without a private log file.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(std::io::Error::new(
+                        log_err.kind(),
+                        format!(
+                            "daemon was started and then stopped because its log could not be opened: {log_err}"
+                        ),
+                    ));
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+}
+
+fn tail_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+fn read_new_log_tail(log: &Path, start_offset: u64, max_bytes: usize, max_lines: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(log) else {
+        return String::new();
+    };
+    let end = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let from = start_offset.max(end.saturating_sub(max_bytes as u64));
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if file.take(max_bytes as u64).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    tail_lines(&text, max_lines)
+}
+
+fn read_pipe_tail(
+    pipe: Option<std::process::ChildStderr>,
+    max_bytes: usize,
+    max_lines: usize,
+) -> String {
+    use std::io::Read;
+
+    let Some(stderr) = pipe else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    let _ = stderr.take(max_bytes as u64).read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    tail_lines(&text, max_lines)
 }
 
 /// "Keep agents running after quitting": a launchd LaunchAgent (macOS) or a
