@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use atrium_host::supervise::{ProcessIdentity, identify, kill_recorded, spawn_group, terminate};
+use atrium_host::supervise::{
+    ProcessIdentity, identify, kill_recorded, spawn_group, terminate, terminate_blocking,
+};
 use atrium_protocol::thread::Cleanup;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -365,6 +367,127 @@ fn kill_recorded_never_signals_the_callers_own_process_group() {
     let me = identify(std::process::id()).unwrap().expect("own identity");
     assert_eq!(kill_recorded(&me), Cleanup::Unverified);
     // Still alive to assert this.
+}
+
+#[test]
+fn terminate_blocking_kills_group_with_grandchild_while_spawning_runtime_is_blocked() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current_thread runtime");
+
+    let (mut sup, pid_a, pid_b) = rt.block_on(async {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(
+                "sh -c 'sleep 60 & echo $!; wait' & \
+                 mid=$!; \
+                 echo $mid; \
+                 wait",
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut sup = spawn_group(cmd).expect("spawn_group");
+        let stdout = sup.child.stdout.take().expect("stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let pid_a: u32 = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("pid line 1")
+            .trim()
+            .parse()
+            .expect("parse pid_a");
+        let pid_b: u32 = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("pid line 2")
+            .trim()
+            .parse()
+            .expect("parse pid_b");
+        (sup, pid_a, pid_b)
+    });
+
+    let leader_pid = sup.identity.pid;
+    let _guard = KillGroupGuard(sup.identity.pgid);
+    for pid in [leader_pid, pid_a, pid_b] {
+        assert!(pid_exists(pid), "expected pid {pid} alive before terminate");
+    }
+
+    // Keep the spawning `current_thread` runtime alive and blocked in `join()`
+    // while another thread terminates and reaps the child without a runtime.
+    let term = std::thread::spawn(move || {
+        let term = terminate_blocking(&mut sup, Duration::ZERO).expect("terminate_blocking");
+        assert!(
+            sup.child.id().is_none(),
+            "tokio Child must record the leader as reaped"
+        );
+        drop(sup);
+        term
+    })
+    .join()
+    .expect("terminate thread");
+
+    assert!(term.killed);
+    assert_eq!(term.exit_code, None);
+    for pid in [leader_pid, pid_a, pid_b] {
+        assert!(
+            !pid_exists(pid),
+            "pid {pid} must be gone after terminate_blocking"
+        );
+        assert_eq!(identify(pid).unwrap(), None);
+    }
+}
+
+#[test]
+fn terminate_blocking_after_spawning_runtime_dropped_handles_early_exit_leader() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current_thread runtime");
+
+    let (mut sup, grandchild_pid) = rt.block_on(async {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 60 >/dev/null 2>&1 </dev/null & echo $!; exit 7")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut sup = spawn_group(cmd).expect("spawn_group");
+        let stdout = sup.child.stdout.take().expect("stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let grandchild_pid: u32 = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("grandchild pid line")
+            .trim()
+            .parse()
+            .expect("parse grandchild_pid");
+        assert!(lines.next_line().await.unwrap().is_none());
+        (sup, grandchild_pid)
+    });
+    drop(rt);
+
+    let leader_pid = sup.identity.pid;
+    let _guard = KillGroupGuard(sup.identity.pgid);
+    assert!(pid_exists(grandchild_pid));
+
+    let term = terminate_blocking(&mut sup, Duration::from_secs(2)).expect("terminate_blocking");
+    assert!(!term.killed, "leader exited before grace expired");
+    assert_eq!(term.exit_code, Some(7));
+    assert!(sup.child.id().is_none());
+    drop(sup);
+
+    for pid in [leader_pid, grandchild_pid] {
+        assert!(
+            !pid_exists(pid),
+            "pid {pid} must be gone after terminate_blocking"
+        );
+        assert_eq!(identify(pid).unwrap(), None);
+    }
 }
 
 /// A process whose main thread has exited while a worker thread still runs:
