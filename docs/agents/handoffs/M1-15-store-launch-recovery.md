@@ -131,3 +131,43 @@ All commands exited with code `0` with `0 failed` and `0 ignored`:
 
 ### 4. `scripts/check-protocol-ts`
 - **Not run (blocked):** denied by worker pre-tool hook (`'scripts/check-protocol-ts' is not on the worker allowlist`).
+
+---
+
+## Fix round 1 (D-097)
+
+Addressed the Opus review (`.orchestration/review-input/M1-15-store-launch-recovery.md`) of `cc8978d` in separate commits:
+
+### 1. MAJOR — Zero-event non-`Starting` listed thread regression (`upkeep::recover`)
+- **Fix (`crates/atrium-daemon/src/upkeep.rs`, commit `31dfe58`):** In `recover`'s fallback loop over `inner.store.threads()`, restored closing every listed thread with `incarnation > 0` not already handled by `unfinished_incarnations()`, using `cleanups` (`kill_recorded` result) when a live process was recorded, and otherwise `Cleanup::Unverified` for `Starting`, `cleanup` for `Interrupted { cleanup }`, or `Cleanup::Verified` otherwise. `close()` now returns `Result<bool, StartError>` so that a retried closure of a zero-event thread without a `cleanups` entry also clears its `sessions.process` record without touching historical already-ended threads.
+- **Test (`crates/atrium-daemon/tests/recovery.rs`):** Added `a_thread_stopped_while_starting_with_unverified_process_is_recovered` (thread in `Starting` with a recorded process whose `start_time` mismatches a live `sleep`, stopped via `Signal::Stopped` -> `Ended` with zero events, then `Rig::boot`).
+  - **Failure on `cc8978d`'s `upkeep.rs`:** Ran `cargo test -p atrium-daemon --test recovery a_thread_stopped_while_starting_with_unverified_process_is_recovered` before editing `upkeep.rs` and observed `FAILED`: `assertion left == right failed: left: Ended, right: Interrupted { cleanup: Unverified }`.
+  - **After fix:** Passes with state `ThreadState::Interrupted { cleanup: Cleanup::Unverified }`, history `["session_ended"]`, and `0` recorded processes remaining.
+
+### 2. Behaviour & Gap Documentation
+- **(a) `SessionEnded` clearing `sessions.process`:** `crates/atrium-core/src/store/writer.rs` sets `process = NULL` in the same SQLite transaction that sets `ended_ms` and `exit_code` for `AgentEvent::SessionEnded`, preventing any crash window between storing `SessionEnded` and `set_process(..., None)` and clearing the record if a resume closes an unclosed incarnation. Documented in the CR-10 sentence of `docs/contracts/m1.md` (§10, commit `4bf8839`).
+- **(b) Fatal `Error` stopping the session (`crates/atrium-daemon/src/sessions.rs`, `store_batch`):** When an event batch contains `AgentEvent::Error { fatal: true, .. }`, `store_batch` calls `live.mark_terminal()` before `store.append` + `hub().publish` so a client seeing `ThreadState::Failed` can immediately send `ResumeThread` (N1). Because `wait_if_ending` and `launch` wait on `live.finished()`, `"terminal"` must mean `"ending"`: calling `live.stop()` immediately after publishing ensures the pump shuts down the session (bounded by `STOP_PATIENCE`) even if the adapter did not close its event stream on its own.
+- **(c) Remaining gap:** An archived thread whose current incarnation has zero events (e.g. archived while `Starting` before a daemon crash) is still never closed, because CR-10 approved `Store::unfinished_incarnations()` only for incarnations that have stored events (`has events`).
+
+### 3. Doc Comments (`b7af9eb`)
+- **`crates/atrium-daemon/src/upkeep.rs` (`recover`):** Updated the doc comment to describe closing `Store::unfinished_incarnations()` (archived threads included) plus the zero-event listed-thread fallback, the CR-09 unverified-cleanup exception, and deferred `sessions.process` clearing.
+- **`crates/atrium-core/src/attention/mod.rs` (`next_state`):** Added the CR-09 exception (`Signal::Recovered { cleanup: Unverified }` moves `Ended` and `Interrupted { cleanup: Verified }` to `Interrupted { cleanup: Unverified }`, while `Failed` keeps its message and stays `Failed`).
+
+### 4. Minors (`c918761`)
+- **Done:**
+  - **`commands.rs` (`resume_thread`):** Loaded `stored` via `inner.store.launch(thread)` before looking up the adapter so both the adapter lookup and `Launch.provider` use the single `stored.provider` source.
+  - **N2 test (`crates/atrium-daemon/tests/sessions.rs`, `the_inbox_stream_follows_threads_without_following_every_token`):** Replaced the `ListInbox` barrier check after `MarkRead`/`RenameThread` with waiting directly on `watcher.next()` for both `InboxUpdated { items: [] }` and `ThreadUpdated` (`!unread && title == "Build fix"`).
+  - **Ended/exited process record test (`crates/atrium-daemon/tests/recovery.rs`):** Added `process_records_on_ended_or_exited_incarnations_are_cleared`, verifying both that `SessionEnded` atomically clears `sessions.process` and that a session marked `ended_ms` via `Signal::Exited` before `SessionEnded` (skipped by `live_processes()`) is found by `unfinished_incarnations()`, closed on boot, and has its `sessions.process` cleared. Note on older builds: a pre-existing orphan row left by an older build with both `SessionEnded` stored and `sessions.process` non-NULL is listed by neither `live_processes` nor `unfinished_incarnations` and remains untouched and harmless (nothing reads it).
+- **Left:**
+  - `crates/atrium-daemon/tests/sessions.rs` (`39 more deltas` negative check): kept the `ListInbox` barrier drain because you cannot await the absence of an event on an open stream without a barrier or timeout.
+  - `crates/atrium-daemon/src/sessions.rs` (`wait_if_ending` / `launch`): left without an independent timeout on `live.finished()`, since teardown is bounded by `live.stop()` (`STOP_PATIENCE` + `kill_recorded` drain).
+  - `crates/atrium-daemon/src/upkeep.rs` (`watch_storage`): left publishing `Signal::StorageReadOnly` before `live.stop()`; unreachable in practice because `can_start_turns` refuses resumes while storage is full.
+  - N3 (`crates/atrium-host/src/supervise.rs`): outside M1-15 owned paths (`kill_recorded` `EPERM`/zombie handling).
+
+### Fix Round 1 DoD Outputs (After Final Code/Contract Edits)
+- **`cargo fmt --all --check`:** exited `0` (no output).
+- **`cargo clippy --workspace --all-targets -- -D warnings`:** exited `0` (clean across `atrium-core`, `atrium-daemon`, `atrium-agents`).
+- **`cargo test -p atrium-core -p atrium-daemon -p atrium-client -q`:** exited `0`, **242 passed; 0 failed; 0 ignored**:
+  - `atrium-client`: `28` (`lib`) + `11` (`tests/socket.rs`) = `39 passed; 0 failed`
+  - `atrium-core`: `9` (`lib`) + `9` (`attention`) + `25` (`history`) + `20` (`ledger`) + `44` (`policy`) + `30` (`store`) = `137 passed; 0 failed`
+  - `atrium-daemon`: `15` (`lib`) + `1` (`client`) + `2` (`gaps_full_storage`) + `2` (`gaps_snapshot`) + `7` (`recovery`) + `6` (`requests_fake`) + `2` (`requests_notifications`) + `22` (`sessions`) + `9` (`socket`) = `66 passed; 0 failed`
