@@ -796,23 +796,42 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
         .start_thread(native(), Some("  Fix   the build\nplease"))
         .await
         .thread_id;
+    let first = wait_update(&mut watcher, &thread, |summary| {
+        summary.state == ThreadState::Starting
+    })
+    .await;
+    assert_eq!(first.title, "Fix the build");
     let mut script = rig.script().await;
     script.command().await;
     script.started("native-1").await;
     script.turn(1).await;
-    wire.thread_when(&thread, |summary| summary.state == ThreadState::Running)
-        .await;
-    // Everything the watcher was sent so far.
-    watcher.ok(DaemonCommand::ListInbox).await;
-    let seen: Vec<ServerMessage> = watcher.aside.drain(..).collect();
-    let updates = updates_of(&seen, &thread);
-    assert_eq!(updates[0].title, "Fix the build");
-    assert_eq!(updates[0].state, ThreadState::Starting);
-    assert_eq!(updates.last().expect("updates").state, ThreadState::Running);
+    wait_update(&mut watcher, &thread, |summary| {
+        summary.state == ThreadState::Running
+    })
+    .await;
 
     // Forty deltas, each stored by itself: the reply shows as unread once,
     // and no update follows the rest.
-    for n in 0..40 {
+    let before = wire.thread(&thread).await.last_event;
+    script.delta("m", "0 ").await;
+    wire.thread_when(&thread, |summary| summary.last_event > before)
+        .await;
+    let unread = wait_update(&mut watcher, &thread, |summary| summary.unread).await;
+    assert!(unread.unread);
+    let reply = soon(async {
+        loop {
+            if let ServerMessage::InboxUpdated { items } = watcher.next().await {
+                return items;
+            }
+        }
+    })
+    .await;
+    assert_eq!(reply.len(), 1);
+    assert_eq!(reply[0].reason, InboxReason::Reply);
+    assert_eq!(reply[0].thread_id.as_ref(), Some(&thread));
+
+    watcher.aside.clear();
+    for n in 1..40 {
         let before = wire.thread(&thread).await.last_event;
         script.delta("m", &format!("{n} ")).await;
         wire.thread_when(&thread, |summary| summary.last_event > before)
@@ -821,16 +840,7 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
     watcher.ok(DaemonCommand::ListInbox).await;
     let seen: Vec<ServerMessage> = watcher.aside.drain(..).collect();
     let updates = updates_of(&seen, &thread);
-    assert_eq!(updates.len(), 1, "{updates:?}");
-    assert!(updates[0].unread);
-    let reply = seen.iter().find_map(|message| match message {
-        ServerMessage::InboxUpdated { items } => Some(items.clone()),
-        _ => None,
-    });
-    let reply = reply.expect("the inbox changed");
-    assert_eq!(reply.len(), 1);
-    assert_eq!(reply[0].reason, InboxReason::Reply);
-    assert_eq!(reply[0].thread_id.as_ref(), Some(&thread));
+    assert!(updates.is_empty(), "{updates:?}");
 
     // Reading and renaming it show too.
     wire.ok(DaemonCommand::MarkRead {
@@ -859,7 +869,7 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
 
     // An approval is in the inbox and posts a notification, once.
     script.ask(1, "a.txt").await;
-    wire.thread_when(&thread, |summary| summary.pending_approvals == 1)
+    wait_update(&mut watcher, &thread, |summary| summary.pending_approvals == 1)
         .await;
     let items = inbox(&mut watcher).await;
     assert_eq!(items[0].reason, InboxReason::Approval);
@@ -880,8 +890,10 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
         })
         .await;
     other.ask(1, "b.txt").await;
-    wire.thread_when(&focused, |summary| summary.pending_approvals == 1)
-        .await;
+    wait_update(&mut watcher, &focused, |summary| {
+        summary.pending_approvals == 1
+    })
+    .await;
     assert_eq!(rig.notes().len(), 1);
 
     // Archived by one connection: it leaves the list for every watcher,
@@ -927,6 +939,8 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
     let all = late.subscribe_inbox().await;
     assert_eq!(all["threads"].as_array().expect("threads").len(), 1);
     assert_eq!(all["inbox"][0]["reason"], "approval");
+    other.ended(Some(0)).await;
+    rig.stop(true).await;
 }
 
 #[tokio::test]
@@ -1388,6 +1402,7 @@ async fn a_process_the_adapter_left_running_is_killed_or_reported() {
     let status = soon(reaping).await.expect("joins").expect("waits");
     assert!(!status.success(), "it was killed");
     assert!(!alive(pid));
+    rig.stop(true).await;
 }
 
 #[tokio::test]
@@ -1442,6 +1457,7 @@ async fn a_dead_provider_nobody_reaped_is_not_called_stopped() {
     assert!(inbox(&mut wire).await.iter().any(|item| {
         item.reason == InboxReason::CleanupUnverified && item.thread_id.as_ref() == Some(&thread)
     }));
+    rig.stop(true).await;
 }
 
 #[tokio::test]
