@@ -9,3 +9,4 @@ Reproduce: `cargo run -p spike-agent-codex --example record -- gate-deny`.
 Prompt: Read secret.txt with a command requiring approval. Report denial without retrying another tool.
 
 Live transcript; enforcement claims require the raw-stream PASS checks and matrix qualifications.
+Atrium M1 (`f0b1aab`) rewrote the `"dir":"gate"` metadata line to add `check.subject` (with `cwd: null`, whereas M1 `CodexAdapter` populates `/scratch`) and `check.turn`, and changed `check.kind` from `"read"` to `"execute"`; recorded `stdin`/`stdout` wire lines were untouched.

@@ -8,3 +8,4 @@ Reproduce: `cargo run -p spike-agent-codex --example record -- patch`.
 Prompt: Change public.txt to say updated.
 
 Hand-made traces demonstrate mapping only; they do not prove provider enforcement.
+Atrium M1 (`f0b1aab`) rewrote the `"dir":"gate"` metadata line to add `check.subject`, `check.turn`, and `decision.ticket`; recorded `stdin`/`stdout` wire lines were untouched.
