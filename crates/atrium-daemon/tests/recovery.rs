@@ -402,10 +402,7 @@ async fn an_archived_unfinished_thread_is_closed_on_next_start() {
             .map(|s| s.thread_id)
             .collect();
         assert_eq!(listed, vec![first.clone()]);
-        let unfinished = store
-            .unfinished_incarnations()
-            .await
-            .expect("unfinished");
+        let unfinished = store.unfinished_incarnations().await.expect("unfinished");
         assert!(unfinished.contains(&(archived.clone(), 1)));
         assert!(unfinished.contains(&(tool_thread.clone(), 1)));
         tool_thread

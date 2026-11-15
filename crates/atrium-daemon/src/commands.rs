@@ -502,7 +502,12 @@ async fn resume_thread(inner: &Arc<Inner>, thread: &ThreadId) -> Result<Value, F
         .launch(thread)
         .await
         .map_err(store_failure)?
-        .ok_or_else(|| failure(ErrorCode::UnknownThread, format!("unknown thread {thread:?}")))?;
+        .ok_or_else(|| {
+            failure(
+                ErrorCode::UnknownThread,
+                format!("unknown thread {thread:?}"),
+            )
+        })?;
     let launch = Launch {
         agent: Agent::Native(adapter),
         provider: stored.provider,

@@ -1988,7 +1988,10 @@ async fn concurrent_reads_and_writes_complete() {
 async fn launch_reads_stored_launch_fields_and_current_title() {
     let fx = Fixture::new();
     let store = fx.open().await;
-    assert_eq!(store.launch(&ThreadId("missing".into())).await.unwrap(), None);
+    assert_eq!(
+        store.launch(&ThreadId("missing".into())).await.unwrap(),
+        None
+    );
 
     let new = NewThread {
         provider: Provider::Claude,
@@ -1999,7 +2002,10 @@ async fn launch_reads_stored_launch_fields_and_current_title() {
         title: "initial".into(),
     };
     let created = store.create_thread(new.clone()).await.unwrap();
-    assert_eq!(store.launch(&created.thread_id).await.unwrap(), Some(new.clone()));
+    assert_eq!(
+        store.launch(&created.thread_id).await.unwrap(),
+        Some(new.clone())
+    );
 
     store.rename(&created.thread_id, "renamed").await.unwrap();
     assert_eq!(
@@ -2045,14 +2051,7 @@ async fn unfinished_incarnations_lists_open_current_incarnations_archived_or_not
         .await
         .unwrap();
     store
-        .append(
-            &b,
-            bi,
-            vec![env(
-                0,
-                AgentEvent::TurnStarted { turn: 1 },
-            )],
-        )
+        .append(&b, bi, vec![env(0, AgentEvent::TurnStarted { turn: 1 })])
         .await
         .unwrap();
     store
@@ -2084,7 +2083,10 @@ async fn unfinished_incarnations_lists_open_current_incarnations_archived_or_not
         )
         .await
         .unwrap();
-    assert_eq!(store.unfinished_incarnations().await.unwrap(), vec![(a.clone(), ai)]);
+    assert_eq!(
+        store.unfinished_incarnations().await.unwrap(),
+        vec![(a.clone(), ai)]
+    );
     assert!(store.live_processes().await.unwrap().is_empty());
 
     // Closing A clears it too; a resumed incarnation with 0 events is not listed
@@ -2112,7 +2114,10 @@ async fn unfinished_incarnations_lists_open_current_incarnations_archived_or_not
         .append(&a, a2, vec![env(0, AgentEvent::TurnStarted { turn: 1 })])
         .await
         .unwrap();
-    assert_eq!(store.unfinished_incarnations().await.unwrap(), vec![(a.clone(), a2)]);
+    assert_eq!(
+        store.unfinished_incarnations().await.unwrap(),
+        vec![(a.clone(), a2)]
+    );
 
     // Confirm `unstarted` stays omitted and `sessions.process` was cleared for B.
     let _ = unstarted;

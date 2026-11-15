@@ -122,7 +122,14 @@ pub(crate) fn resume_id(c: &Connection, thread: &ThreadId) -> StoreResult<Option
 }
 
 pub(crate) fn launch(c: &Connection, thread: &ThreadId) -> StoreResult<Option<NewThread>> {
-    let row: Option<(String, Option<String>, Option<String>, String, String, String)> = c
+    let row: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        String,
+    )> = c
         .query_row(
             "SELECT provider, model, effort, preset, location, title \
              FROM threads WHERE thread_id = ?1",

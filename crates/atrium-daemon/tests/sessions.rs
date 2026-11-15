@@ -869,8 +869,10 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
 
     // An approval is in the inbox and posts a notification, once.
     script.ask(1, "a.txt").await;
-    wait_update(&mut watcher, &thread, |summary| summary.pending_approvals == 1)
-        .await;
+    wait_update(&mut watcher, &thread, |summary| {
+        summary.pending_approvals == 1
+    })
+    .await;
     let items = inbox(&mut watcher).await;
     assert_eq!(items[0].reason, InboxReason::Approval);
     assert_eq!(items[0].detail.as_deref(), Some("touch a.txt"));
