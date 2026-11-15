@@ -32,6 +32,9 @@ pub struct Analysis {
     pub use_index: HashMap<(usize, String), Vec<usize>>,
     pub unit_cwd: Vec<CwdState>,
     pub cwd_unknown: bool,
+    /// Some command may run in more than one directory, or in one the line
+    /// doesn't name: no rule but `Any` covers the line, and Home asks.
+    pub cwd_uncertain: bool,
     /// Bigger than the checker takes on (line bytes, commands, words, paths).
     pub overflow: bool,
     /// Text the raw-string checks run on.
@@ -84,6 +87,7 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         use_index: HashMap::new(),
         unit_cwd: vec![],
         cwd_unknown: false,
+        cwd_uncertain: false,
         overflow: false,
         raw: vec![],
         start: input.cwd.to_path_buf(),
@@ -184,6 +188,11 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
             a.reasons.push("unknown tool input".into());
         }
     }
+    a.cwd_uncertain = a.cwd_unknown
+        || a.unit_cwd.iter().any(|s| {
+            let c = s.candidates();
+            c.iter().any(|p| *p != c[0])
+        });
     for (idx, u) in a.uses.iter().enumerate() {
         a.use_index
             .entry((u.unit, u.word.clone()))
@@ -530,16 +539,46 @@ fn is_interpreter(cmd: &str) -> bool {
         )
 }
 
-fn reads_stdin_as_code(eff: &[String]) -> bool {
+pub(crate) fn reads_stdin_as_code(eff: &[String]) -> bool {
+    reads_stdin_as_code_at(eff, 0)
+}
+
+fn reads_stdin_as_code_at(eff: &[String], depth: u8) -> bool {
     let Some(first) = eff.first() else {
         return false;
     };
+    if depth > 4 {
+        return true;
+    }
     let b = base(first);
     let args = &eff[1..];
+    if shell::reads_stdin_as_script(eff) {
+        return true;
+    }
     if matches!(b, "source" | ".") {
         return args
             .first()
             .is_some_and(|a| matches!(a.as_str(), "/dev/stdin" | "/dev/fd/0" | "-"));
+    }
+    // `| s$(echo h)`: a word built by running something may name a shell;
+    // `| $X -s`: a command named by a variable, told to read a script
+    // a word built by a substitution that names a program plainly is read
+    // as that program (`$(which python3)`: an interpreter, round 6 item 6)
+    if !is_interpreter(b) && shell::has_command_substitution(first) {
+        return match shell::substituted_program(first) {
+            None => true,
+            Some(name) => {
+                // then the wrappers in front of what it names (`$(which env)
+                // sh`, `$(which timeout) 5 bash`: round 7 item 5)
+                let mut e = eff.to_vec();
+                e[0] = name;
+                let (u, unknown) = shell::unwrap_checked(&e);
+                unknown || (!u.is_empty() && u != eff && reads_stdin_as_code_at(&u, depth + 1))
+            }
+        };
+    }
+    if !is_interpreter(b) && shell::maybe_shell(first) {
+        return args.iter().any(|a| a == "-" || a == "-s");
     }
     if b == "eval" || !is_interpreter(b) {
         return false;
@@ -559,7 +598,16 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
             || (!shell && matches!(a.as_str(), "--eval" | "--command" | "--print"))
     });
     if code_flag {
-        return false;
+        // `sh -c bash`, `script -c bash f`, `flock -c bash l` (unwrapped to
+        // `sh -c …`): the code given may itself read the script on stdin
+        // (round 8 blocker 3)
+        return shell
+            && shell::shell_c_code(eff).is_some_and(|code| {
+                shell::lex(&code)
+                    .units
+                    .iter()
+                    .any(|u| reads_stdin_as_code_at(&u.eff, depth + 1))
+            });
     }
     // `bash -o pipefail`: the option's value isn't a script
     let mut positional = false;
@@ -771,7 +819,7 @@ impl Ctx<'_> {
                 .unit_cwd
                 .get(i)
                 .cloned()
-                .unwrap_or(CwdState::Known(self.a.start.clone()));
+                .unwrap_or_else(|| CwdState::Known(vec![self.a.start.clone()]));
             for c in cwd.candidates() {
                 out.push(lexical_resolve(word, c, self.home()));
             }
@@ -853,9 +901,18 @@ impl Ctx<'_> {
             }
         }
         // the gate's flat list (symlinks resolved), when it didn't line up
+        // (which word each path belongs to is lost, so each is checked with
+        // the strongest role any word of the call has)
         if a.aligned.is_none() {
+            let role = if a.uses.iter().any(|u| u.role == Role::Write) {
+                Role::Write
+            } else if a.uses.iter().any(|u| u.role == Role::MaybeWrite) {
+                Role::MaybeWrite
+            } else {
+                Role::Read
+            };
             for p in self.input.resolved_paths {
-                if let Some(h) = self.s.hit(p, Role::Read) {
+                if let Some(h) = self.s.hit(p, role) {
                     hits.push(h);
                 }
             }
@@ -1088,6 +1145,44 @@ impl Ctx<'_> {
     }
 }
 
+/// Words split on blanks, keeping a `$(…)`, `` `…` `` or quoted part whole
+/// (`$(brew --prefix)/bin/jq` is one word), for the raw text check.
+fn raw_words(t: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut tick = false;
+    let mut prev = ' ';
+    for c in t.chars() {
+        match c {
+            _ if quote.is_some() => {
+                if Some(c) == quote {
+                    quote = None;
+                }
+            }
+            '\'' | '"' => quote = Some(c),
+            '`' => tick = !tick,
+            '(' if prev == '$' || depth > 0 => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            c if c.is_whitespace() && depth == 0 && !tick => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                prev = c;
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+        prev = c;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// `curl … | sh` as text, for lines the lexer got wrong.
 fn raw_pipe_to_shell(t: &str) -> bool {
     let l = t.to_lowercase();
@@ -1097,9 +1192,8 @@ fn raw_pipe_to_shell(t: &str) -> bool {
             rest = &rest[i + dl.len()..];
             let seg: &str = rest.split([';', '\n', '&']).next().unwrap_or("");
             if let Some((_, after)) = seg.split_once('|') {
-                let w: Vec<&str> = after.split_whitespace().collect();
-                let eff: Vec<String> =
-                    shell::unwrap(&w.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                let w = raw_words(after);
+                let eff: Vec<String> = shell::unwrap(&w);
                 if reads_stdin_as_code(&eff) {
                     return true;
                 }

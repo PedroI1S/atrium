@@ -14,8 +14,9 @@ use atrium_protocol::policy::{
 use atrium_protocol::thread::ThreadId;
 
 use super::deny;
+use super::engine;
 use super::shell;
-use super::words::{expand_home, normalize};
+use super::words::{self, expand_home, normalize};
 use super::{SessionGate, input_sha256};
 use crate::{ApprovalLedger, Binding, PolicyEngine, PolicyInput, PolicyVerdict, RequestKey, Store};
 
@@ -137,6 +138,18 @@ fn identity(_: &Path) -> Option<(u64, u64)> {
     None
 }
 
+/// A regular file with more than one link (a hard link, or the original of
+/// one). Its other names can't be found cheaply, so it is never auto-allowed.
+#[cfg(unix)]
+fn multiply_linked_file(p: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file() && m.nlink() > 1)
+}
+#[cfg(not(unix))]
+fn multiply_linked_file(_: &Path) -> bool {
+    false
+}
+
 const FIRMLINK: &str = "/System/Volumes/Data";
 
 /// Aliases of sensitive paths (`/.vol/<dev>/<ino>`, the Data firmlink, hard
@@ -172,16 +185,34 @@ fn alias_fix(p: &Path, roots: &[((u64, u64), PathBuf)]) -> Result<PathBuf, Strin
     Ok(p)
 }
 
-/// The roots plus the members of `~/.ssh` (a small folder): a hard link to a
-/// key is the same file. The big trees (browser profiles) aren't walked; a
-/// path inside one is caught through its ancestors.
-fn expand_roots(home: &Path, roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    const MAX_ENTRIES: usize = 256;
-    let mut out = roots;
+/// The members of `~/.ssh` (a small folder): a hard link to a key is the
+/// same file. The big trees (browser profiles) aren't walked; a path inside
+/// one is caught through its ancestors.
+///
+/// Every member is identified through links (another name for a key is the
+/// key: review M1-13 finding 1). A folder linked into `~/.ssh` is walked, but
+/// only the files in it are members, not the folder: listing it or `cd`-ing
+/// into it stays ordinary (M1-03 finding 5), reading a file in it doesn't.
+/// The real paths of those linked folders are returned too: every file below
+/// one, at any depth, is a key, and a recursive search that reaches one reads
+/// keys (re-review blocker 1).
+struct SshTree {
+    members: Vec<PathBuf>,
+    linked_dirs: Vec<PathBuf>,
+}
+
+fn ssh_members(home: &Path) -> SshTree {
+    const MAX_ENTRIES: usize = 1024;
+    const MAX_DEPTH: u8 = 8;
+    let mut out = SshTree {
+        members: vec![],
+        linked_dirs: vec![],
+    };
     let mut found = 0usize;
-    let mut stack = vec![(home.join(".ssh"), 0u8)];
-    while let Some((dir, depth)) = stack.pop() {
-        if depth >= 3 || found >= MAX_ENTRIES {
+    // (folder, depth, reached through a link)
+    let mut stack = vec![(home.join(".ssh"), 0u8, false)];
+    while let Some((dir, depth, linked)) = stack.pop() {
+        if depth >= MAX_DEPTH || found >= MAX_ENTRIES {
             continue;
         }
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -190,10 +221,29 @@ fn expand_roots(home: &Path, roots: Vec<PathBuf>) -> Vec<PathBuf> {
         for e in rd.flatten().take(MAX_ENTRIES) {
             found += 1;
             let p = e.path();
-            if e.file_type().is_ok_and(|t| t.is_dir()) {
-                stack.push((p.clone(), depth + 1));
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                match std::fs::metadata(&p) {
+                    Ok(m) if m.is_dir() => {
+                        if let Ok(real) = std::fs::canonicalize(&p)
+                            && !out.linked_dirs.contains(&real)
+                        {
+                            out.linked_dirs.push(real);
+                        }
+                        stack.push((p, depth + 1, true));
+                    }
+                    Ok(_) => out.members.push(p),
+                    Err(_) => {}
+                }
+                continue;
             }
-            out.push(p);
+            if ft.is_dir() {
+                stack.push((p.clone(), depth + 1, linked));
+                if linked {
+                    continue;
+                }
+            }
+            out.members.push(p);
         }
     }
     out
@@ -218,15 +268,19 @@ fn evaluate_sync(
         preset,
     };
     let analysis = deny::analyze_with(&input, &fs_resolve);
+    let ssh = ssh_members(&c.home);
     let mut resolved = vec![];
     if !analysis.overflow {
-        let roots: Vec<((u64, u64), PathBuf)> = expand_roots(
-            &c.home,
-            deny::sensitive_roots(&c.home, &c.atrium_data_paths, &c.atrium_protected_paths),
-        )
-        .into_iter()
-        .filter_map(|r| identity(&r).map(|id| (id, r)))
-        .collect();
+        let mut roots: Vec<((u64, u64), PathBuf)> =
+            deny::sensitive_roots(&c.home, &c.atrium_data_paths, &c.atrium_protected_paths)
+                .into_iter()
+                .filter_map(|r| identity(&r).map(|id| (id, r)))
+                .collect();
+        roots.extend(
+            ssh.members
+                .iter()
+                .filter_map(|r| identity(r).map(|id| (id, r.clone()))),
+        );
         for u in &analysis.uses {
             for p in &u.paths {
                 resolved.push(alias_fix(p, &roots)?);
@@ -234,8 +288,874 @@ fn evaluate_sync(
         }
     }
     input.resolved_paths = &resolved;
-    let verdict = policy.evaluate(&input, rules);
+    let mut verdict = policy.evaluate(&input, rules);
+    // A file below a folder linked into `~/.ssh`, at any depth, or a
+    // recursive search or glob that reaches such a folder, reads keys.
+    // Maybe (options or a glob it can't read): never auto-allow, ask.
+    if !matches!(verdict, PolicyVerdict::HardDeny { .. }) && !analysis.overflow {
+        match reaches_linked_ssh_dir(check, &analysis, &resolved, &ssh.linked_dirs, &c.cwd) {
+            Reach::Yes => {
+                verdict = PolicyVerdict::HardDeny {
+                    id: "credential-read",
+                };
+            }
+            Reach::Maybe if matches!(verdict, PolicyVerdict::Allow { .. }) => {
+                verdict = PolicyVerdict::Ask;
+            }
+            _ => {}
+        }
+    }
+    // A link from elsewhere into a credential tree (`proj/keys -> ~/.ssh`),
+    // reached through a glob or a search that follows links (round 8
+    // blocker 2).
+    if !matches!(verdict, PolicyVerdict::HardDeny { .. }) && !analysis.overflow {
+        let mut trees: Vec<PathBuf> = deny::sensitive_roots(&c.home, &[], &[])
+            .iter()
+            .filter_map(|r| std::fs::canonicalize(r).ok())
+            .collect();
+        trees.extend(ssh.linked_dirs.iter().cloned());
+        match reaches_tree_through_links(check, &analysis, &resolved, &trees) {
+            Reach::Yes => {
+                verdict = PolicyVerdict::HardDeny {
+                    id: "credential-read",
+                };
+            }
+            Reach::Maybe if matches!(verdict, PolicyVerdict::Allow { .. }) => {
+                verdict = PolicyVerdict::Ask;
+            }
+            _ => {}
+        }
+    }
+    // A file with several links may be another name for a credential in a
+    // tree the identity map doesn't walk: never auto-allow it, ask instead.
+    if matches!(verdict, PolicyVerdict::Allow { .. })
+        && !analysis.overflow
+        && reaches_multiply_linked(check, &analysis, &resolved)
+    {
+        verdict = PolicyVerdict::Ask;
+    }
     Ok(Evaluated { verdict, resolved })
+}
+
+/// Commands that read every file below a folder they are given. `grep`'s
+/// spellings are read by the same parser Home's read-only list uses, so the
+/// two can't drift; a `grep` line it can't parse counts as recursive.
+fn recursive_reader(eff: &[String]) -> bool {
+    let Some(first) = eff.first() else {
+        return false;
+    };
+    match shell::base(first) {
+        "rg" | "ag" | "ack" | "rgrep" | "find" => true,
+        "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" => {
+            engine::search_roots(false, &eff[1..]).is_none_or(|s| s.recursive)
+        }
+        _ => false,
+    }
+}
+
+/// The positional words of an option-taking command, read with an option
+/// table, for each way it can be read: a short option whose value is
+/// optional (`ack -C [N]`) followed by a separate word gives two readings.
+/// `None`: an option the table doesn't know.
+struct ReaderOpts {
+    flags: &'static str,
+    vals: &'static str,
+    opt_vals: &'static str,
+    long_vals: &'static [&'static str],
+    /// Long options whose value is optional (`ag --context [N]`, `ack
+    /// --context[=N]`): `--name=v` takes it, `--name v` is read both ways.
+    long_opt_vals: &'static [&'static str],
+    long_flags: &'static [&'static str],
+    /// Short options whose value is the pattern (`ag -g PAT`, `ack -g RE`)
+    /// or that take no pattern (`ack -f`): the positional words are paths.
+    no_pattern: &'static str,
+    /// The same for long options (`ag --filename-pattern PAT`, `ack --match
+    /// RE`): round 8, review major 6.
+    long_no_pattern: &'static [&'static str],
+}
+
+fn readings(args: &[String], o: &ReaderOpts) -> Option<Vec<(Vec<String>, bool)>> {
+    // (positional words, the pattern came from an option, the next word is
+    // an optional value this reading takes)
+    let mut out: Vec<(Vec<String>, bool, bool)> = vec![(vec![], false, false)];
+    let mut j = 0;
+    let mut dd = false;
+    while j < args.len() {
+        let w = args[j].as_str();
+        j += 1;
+        if dd || !w.starts_with('-') || w == "-" {
+            for r in &mut out {
+                if r.2 {
+                    r.2 = false;
+                } else {
+                    r.0.push(w.to_string());
+                }
+            }
+            continue;
+        }
+        for r in &mut out {
+            r.2 = false;
+        }
+        if w == "--" {
+            dd = true;
+            continue;
+        }
+        if let Some(long) = w.strip_prefix("--") {
+            let (name, has_val) = match long.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (long, false),
+            };
+            if o.long_no_pattern.contains(&name) {
+                for r in &mut out {
+                    r.1 = true;
+                }
+            }
+            if o.long_vals.contains(&name) {
+                if !has_val {
+                    j += 1;
+                }
+            } else if o.long_opt_vals.contains(&name) {
+                if !has_val {
+                    if out.len() >= 16 {
+                        return None;
+                    }
+                    let with: Vec<(Vec<String>, bool, bool)> =
+                        out.iter().map(|r| (r.0.clone(), r.1, true)).collect();
+                    out.extend(with);
+                }
+            } else if !o.long_flags.contains(&name) {
+                return None;
+            }
+            continue;
+        }
+        let cs: Vec<char> = w[1..].chars().collect();
+        for (k, c) in cs.iter().enumerate() {
+            let attached = k + 1 < cs.len();
+            if o.no_pattern.contains(*c) {
+                for r in &mut out {
+                    r.1 = true;
+                }
+            }
+            if o.vals.contains(*c) {
+                if !attached {
+                    j += 1;
+                }
+                break;
+            }
+            if o.opt_vals.contains(*c) {
+                if !attached {
+                    if out.len() >= 16 {
+                        return None;
+                    }
+                    // with the value (it takes the next word), and without
+                    let with: Vec<(Vec<String>, bool, bool)> =
+                        out.iter().map(|r| (r.0.clone(), r.1, true)).collect();
+                    out.extend(with);
+                }
+                break;
+            }
+            if !o.flags.contains(*c) {
+                return None;
+            }
+        }
+    }
+    Some(out.into_iter().map(|r| (r.0, r.1)).collect())
+}
+
+// The Silver Searcher's `getopt_long` table (`src/options.c`): `-A`, `-B`,
+// `-C` and their long names take an optional number (read both ways).
+const AG_OPTS: ReaderOpts = ReaderOpts {
+    flags: "aDcFfHhiLlnoQRrSsvVtuUwz0",
+    vals: "GgmpW",
+    opt_vals: "ABC",
+    long_vals: &[
+        "ackmate-dir-filter",
+        "depth",
+        "file-search-regex",
+        "filename-pattern",
+        "ignore",
+        "ignore-dir",
+        "max-count",
+        "pager",
+        "path-to-ignore",
+        "width",
+        "workers",
+        "color-line-number",
+        "color-match",
+        "color-path",
+    ],
+    long_opt_vals: &["after", "before", "context"],
+    long_flags: &[
+        "ackmate",
+        "affinity",
+        "noaffinity",
+        "all-types",
+        "all-text",
+        "unrestricted",
+        "hidden",
+        "ignore-case",
+        "smart-case",
+        "case-sensitive",
+        "fixed-strings",
+        "literal",
+        "files-with-matches",
+        "files-without-matches",
+        "count",
+        "column",
+        "nocolor",
+        "color",
+        "color-win-ansi",
+        "debug",
+        "noheading",
+        "heading",
+        "nobreak",
+        "break",
+        "follow",
+        "nofollow",
+        "skip-vcs-ignores",
+        "search-binary",
+        "search-zip",
+        "silent",
+        "stats",
+        "stats-only",
+        "vimgrep",
+        "word-regexp",
+        "only-matching",
+        "null",
+        "print0",
+        "one-device",
+        "filename",
+        "nofilename",
+        "numbers",
+        "nonumbers",
+        "line-numbers",
+        "group",
+        "nogroup",
+        "invert-match",
+        "match",
+        "mmap",
+        "nommap",
+        "multiline",
+        "nomultiline",
+        "nopager",
+        "parallel",
+        "passthrough",
+        "passthru",
+        "print-all-files",
+        "print-long-lines",
+        "recurse",
+        "norecurse",
+    ],
+    no_pattern: "g",
+    long_no_pattern: &["filename-pattern"],
+};
+
+// ack 3's `Getopt::Long` table: `-C`/`--context` take an optional number
+// (read both ways); `-A`/`-B` and their long names need one.
+const ACK_OPTS: ReaderOpts = ReaderOpts {
+    flags: "iISvwQlLchHo1nrRsxfk",
+    vals: "ABmgt",
+    opt_vals: "C",
+    long_vals: &[
+        "after-context",
+        "before-context",
+        "type",
+        "ignore-dir",
+        "noignore-dir",
+        "match",
+        "output",
+        "max-count",
+    ],
+    long_opt_vals: &["context"],
+    long_flags: &[
+        "ignore-case",
+        "smart-case",
+        "invert-match",
+        "word-regexp",
+        "literal",
+        "files-with-matches",
+        "files-without-matches",
+        "count",
+        "no-filename",
+        "with-filename",
+        "column",
+        "nocolor",
+        "color",
+        "noheading",
+        "heading",
+        "nobreak",
+        "break",
+        "follow",
+        "nofollow",
+        "recurse",
+        "no-recurse",
+        "sort-files",
+        "nopager",
+    ],
+    no_pattern: "gf",
+    long_no_pattern: &["match"],
+};
+
+/// Whether a recursive reader searches the directory it runs in, because it
+/// was given no folder (round 6 item 2): `Some(true)` under some reading of
+/// its options, `None` when its options can't be read (the caller asks).
+/// `find` reads its roots with `shell::find_roots_explicit`, `rg` and
+/// `grep` with the parser Home's read-only list uses (`-R` read as `-r`),
+/// `ag` and `ack` with their option tables.
+fn searches_cwd(eff: &[String]) -> Option<bool> {
+    let first = eff.first()?;
+    let args = &eff[1..];
+    // `-f FILE` / `--file FILE` give the patterns like `-e`: every
+    // positional word is then a root (round 8, beside major 6)
+    let mut dd = false;
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| {
+            if dd || !a.starts_with('-') {
+                return a.clone();
+            }
+            if a == "--" {
+                dd = true;
+                return a.clone();
+            }
+            if a == "--file" {
+                "--regexp".into()
+            } else if let Some(v) = a.strip_prefix("--file=") {
+                format!("--regexp={v}")
+            } else if !a.starts_with("--")
+                && matches!(
+                    shell::base(first),
+                    "rg" | "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" | "rgrep"
+                )
+            {
+                a.replacen('f', "e", 1)
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    let args = args.as_slice();
+    match shell::base(first) {
+        // `-L` / `--follow` change which files, not where it searches
+        // (links below the roots are `follows_links`'s business); the
+        // parser pairs flags with values, so `-e -L` keeps `-L` a value
+        "rg" => engine::rg_roots_following(args).map(|s| s.roots.is_empty()),
+        b @ ("grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" | "rgrep") => {
+            // `-R` follows every link below the roots: the same roots
+            let args: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if a.starts_with('-') && !a.starts_with("--") {
+                        a.replace('R', "r")
+                    } else if a == "--dereference-recursive" {
+                        "--recursive".into()
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect();
+            engine::search_roots(false, &args)
+                .map(|s| (s.recursive || b == "rgrep") && s.roots.is_empty())
+        }
+        b @ ("ag" | "ack") => {
+            let o = if b == "ag" { &AG_OPTS } else { &ACK_OPTS };
+            let rs = readings(args, o)?;
+            Some(
+                rs.iter()
+                    .any(|(ws, no_pattern)| ws.len() <= usize::from(!*no_pattern)),
+            )
+        }
+        "find" => Some(!shell::find_roots_explicit(eff).2),
+        _ => Some(false),
+    }
+}
+
+/// Commands that walk every file below a folder they are given and copy,
+/// pack, move or delete it (round 5 blocker 1): `cp -r`, `scp -r`, `rsync`,
+/// `tar`, `zip -r`, `rm -r`, `mv`, `ditto`, `pax`, `cpio`, `7z`.
+fn tree_walker(eff: &[String]) -> bool {
+    let Some(first) = eff.first() else {
+        return false;
+    };
+    let args = &eff[1..];
+    let short = |letters: &[char]| {
+        args.iter().any(|a| {
+            a.starts_with('-')
+                && !a.starts_with("--")
+                && a[1..].chars().any(|c| letters.contains(&c))
+        })
+    };
+    let long = |names: &[&str]| {
+        args.iter().any(|a| {
+            names
+                .iter()
+                .any(|n| a == n || a.starts_with(&format!("{n}=")))
+        })
+    };
+    match shell::base(first) {
+        "rsync" | "tar" | "bsdtar" | "gtar" | "mv" | "ditto" | "pax" | "cpio" | "7z" | "7za"
+        | "rclone" => true,
+        "cp" | "gcp" | "scp" => short(&['r', 'R', 'a']) || long(&["--recursive", "--archive"]),
+        "rm" | "grm" => short(&['r', 'R']) || long(&["--recursive"]),
+        "zip" => short(&['r', 'R']) || long(&["--recurse-paths"]),
+        _ => false,
+    }
+}
+
+/// Whether a call reaches a folder linked into `~/.ssh`: surely, maybe (it
+/// asks), or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    No,
+    Maybe,
+    Yes,
+}
+
+/// What a glob expands to on the filesystem, as the shell would expand it
+/// (round 6 item 1): component by component from its literal prefix, `**`
+/// as zero or more folders, `{a,b}` as alternation. Bounded: `None` when the
+/// walk is too big or a component can't be read as a pattern (the caller
+/// asks).
+fn expand_glob(p: &Path) -> Option<Vec<PathBuf>> {
+    const MAX_ENTRIES: usize = 4096;
+    const MAX_DEPTH: usize = 12;
+    let comps: Vec<String> = p
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let is_pat = |c: &str| c.contains(['*', '?', '[', '{']);
+    // A `$`, a backtick or a brace left in any component (round 7 item 1):
+    // the shell expands it to something the pattern doesn't show
+    // (`~/${DIR}/work/*`, `~/$(echo v*)/w`); comma lists and ranges were
+    // expanded before (`words::brace_expand`), so a brace still here is one
+    // this walk can't read.
+    if comps.iter().any(|c| c.contains(['$', '`', '{', '}'])) {
+        return None;
+    }
+    let first = comps.iter().position(|c| is_pat(c))?;
+    let prefix: PathBuf = comps[..first].iter().collect();
+    let mut seen = 0usize;
+    // (folder, index of the next component, folders `**` went down)
+    let mut stack: Vec<(PathBuf, usize, usize)> = vec![(prefix, first, 0)];
+    let mut out = vec![];
+    while let Some((dir, k, deep)) = stack.pop() {
+        if k == comps.len() {
+            out.push(dir);
+            continue;
+        }
+        let c = comps[k].as_str();
+        if !is_pat(c) {
+            let next = dir.join(c);
+            // a glob only expands to names that exist
+            if std::fs::symlink_metadata(&next).is_ok() {
+                stack.push((next, k + 1, deep));
+            }
+            continue;
+        }
+        if c == "**" {
+            // zero folders here, or one more and `**` again
+            stack.push((dir.clone(), k + 1, deep));
+            if deep > MAX_DEPTH {
+                return None;
+            }
+        }
+        let m = globset::GlobBuilder::new(c)
+            .literal_separator(true)
+            .build()
+            .ok()?
+            .compile_matcher();
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > MAX_ENTRIES {
+                return None;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') && !c.starts_with('.') {
+                continue;
+            }
+            let path = dir.join(&name);
+            if c == "**" {
+                if stack.len() > MAX_ENTRIES {
+                    return None;
+                }
+                // `**` ends at this entry, or goes on below it
+                stack.push((path.clone(), k + 1, deep));
+                if path.is_dir() {
+                    stack.push((path, k, deep + 1));
+                }
+            } else if m.is_match(&name) {
+                stack.push((path, k + 1, deep));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Whether a glob reaches a file inside the linked folder `d`, or with
+/// `names_dir` (a recursive reader or walker) names `d` or a folder holding
+/// it. `ls vault/*` only names the folder: it stays ordinary.
+fn glob_reaches(p: &Path, d: &Path, names_dir: bool) -> Reach {
+    let Some(found) = expand_glob(p) else {
+        return Reach::Maybe;
+    };
+    for f in found {
+        let real = real_path(&f);
+        if real.starts_with(d) && real != *d {
+            return Reach::Yes;
+        }
+        if names_dir && d.starts_with(&real) {
+            return Reach::Yes;
+        }
+    }
+    Reach::No
+}
+
+/// The real path of `p`, or of its folder when `p` itself doesn't resolve
+/// (a glob, a file not made yet).
+fn real_path(p: &Path) -> PathBuf {
+    if let Ok(r) = std::fs::canonicalize(p) {
+        return r;
+    }
+    if let (Some(dir), Some(name)) = (p.parent(), p.file_name())
+        && let Ok(r) = std::fs::canonicalize(dir)
+    {
+        return r.join(name);
+    }
+    p.to_path_buf()
+}
+
+/// Whether the call reaches a folder linked into `~/.ssh`: a file below one
+/// (any depth), a glob in one, or a recursive search of one or of a folder
+/// holding one (re-review blocker 1). Listing or entering the folder stays
+/// ordinary.
+fn reaches_linked_ssh_dir(
+    check: &ToolCheck,
+    a: &deny::Analysis,
+    resolved: &[PathBuf],
+    linked: &[PathBuf],
+    cwd: &Path,
+) -> Reach {
+    if linked.is_empty() {
+        return Reach::No;
+    }
+    let recursive_paths = matches!(
+        &check.subject,
+        ToolSubject::Paths {
+            recursive: true,
+            ..
+        }
+    );
+    let reaches_root = |root: &Path| {
+        let real = real_path(root);
+        linked
+            .iter()
+            .any(|d| real.starts_with(d) || d.starts_with(&real))
+    };
+    // A search tool given no paths searches the session's folder (round 5
+    // blocker 1).
+    if let ToolSubject::Paths {
+        paths,
+        recursive: true,
+        ..
+    } = &check.subject
+        && paths.is_empty()
+        && reaches_root(cwd)
+    {
+        return Reach::Yes;
+    }
+    // A recursive reader with no folder operand searches where it runs: each
+    // directory the walk is sure of (an uncertain one keeps D-078's verdict).
+    // Options it can't read: it may, so it asks (round 6 item 2).
+    let mut maybe = false;
+    for (i, u) in a.units.iter().enumerate() {
+        if !recursive_reader(&u.eff) {
+            continue;
+        }
+        let Some(words::CwdState::Known(cands)) = a.unit_cwd.get(i) else {
+            continue;
+        };
+        if !cands.iter().any(|c| reaches_root(c)) {
+            continue;
+        }
+        match searches_cwd(&u.eff) {
+            Some(true) => return Reach::Yes,
+            Some(false) => {}
+            None => maybe = true,
+        }
+    }
+    let mut k = 0usize;
+    for u in &a.uses {
+        let unit = a.units.get(u.unit);
+        let command_word = unit.is_some_and(|x| x.seg.argv.first() == Some(&u.word));
+        let recursive = recursive_paths
+            || unit.is_some_and(|x| recursive_reader(&x.eff) || tree_walker(&x.eff));
+        let globby = u.word.contains(['*', '?', '[', '{']);
+        for _ in &u.paths {
+            let Some(p) = resolved.get(k) else {
+                return Reach::Maybe;
+            };
+            k += 1;
+            if command_word {
+                continue;
+            }
+            // a word the shell expands at run time (`$X`, a backtick) may
+            // name anything (round 7 item 1)
+            if p.to_string_lossy().contains(['$', '`']) {
+                maybe = true;
+                continue;
+            }
+            if globby {
+                for d in linked {
+                    match glob_reaches(p, d, recursive) {
+                        Reach::Yes => return Reach::Yes,
+                        Reach::Maybe => maybe = true,
+                        Reach::No => {}
+                    }
+                }
+            }
+            let real = real_path(p);
+            let is_dir = real.is_dir();
+            for d in linked {
+                let inside = real.starts_with(d) && real != *d;
+                if inside && !is_dir {
+                    return Reach::Yes;
+                }
+                if globby && real.parent().is_some_and(|parent| parent.starts_with(d)) {
+                    return Reach::Yes;
+                }
+                if recursive && (real.starts_with(d) || d.starts_with(&real)) {
+                    return Reach::Yes;
+                }
+            }
+        }
+    }
+    if maybe { Reach::Maybe } else { Reach::No }
+}
+
+/// Whether a search follows the links it meets below its roots (`rg -L`,
+/// `grep -R`, `find -L`, `find … -follow`, `ag -f`, `ack --follow`).
+fn follows_links(eff: &[String]) -> bool {
+    let Some(first) = eff.first() else {
+        return false;
+    };
+    let args = &eff[1..];
+    let short = |c: char| {
+        args.iter()
+            .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(c))
+    };
+    let long = |n: &str| args.iter().any(|a| a == n);
+    match shell::base(first) {
+        "rg" => short('L') || long("--follow"),
+        "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" | "rgrep" => {
+            short('R') || long("--dereference-recursive")
+        }
+        "find" => args.iter().any(|a| a == "-L" || a == "-follow"),
+        "ag" => short('f') || long("--follow"),
+        "ack" => long("--follow"),
+        _ => false,
+    }
+}
+
+/// Whether a real path is in a credential tree (or, with `names_dir`, names
+/// one or a folder holding one).
+fn in_trees(real: &Path, trees: &[PathBuf], names_dir: bool) -> bool {
+    trees
+        .iter()
+        // a credential file itself (`~/.aws/credentials`) counts; a tree's
+        // own folder only for a reader that walks into it
+        .any(|t| {
+            (real.starts_with(t) && (real != t || !real.is_dir()))
+                || (names_dir && t.starts_with(real))
+        })
+}
+
+/// A bounded walk below `root` for a link into a credential tree: Yes, No,
+/// or Maybe when the walk is too big.
+fn links_below(root: &Path, trees: &[PathBuf]) -> Reach {
+    const BUDGET: usize = 4096;
+    const MAX_DEPTH: u8 = 16;
+    let mut seen = 0usize;
+    let mut stack = vec![(root.to_path_buf(), 0u8)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > BUDGET || depth > MAX_DEPTH {
+                return Reach::Maybe;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            let p = e.path();
+            if ft.is_symlink() {
+                if let Ok(real) = std::fs::canonicalize(&p)
+                    && (in_trees(&real, trees, true) || trees.contains(&real))
+                {
+                    return Reach::Yes;
+                }
+            } else if ft.is_dir() {
+                stack.push((p, depth + 1));
+            }
+        }
+    }
+    Reach::No
+}
+
+/// Whether the call reaches a credential tree through a link from
+/// elsewhere (round 8 blocker 2): a glob whose matches resolve into one, or
+/// a search that follows links below its roots (or where it runs) meeting a
+/// link into one.
+fn reaches_tree_through_links(
+    check: &ToolCheck,
+    a: &deny::Analysis,
+    resolved: &[PathBuf],
+    trees: &[PathBuf],
+) -> Reach {
+    let mut maybe = false;
+    let recursive_paths = matches!(
+        &check.subject,
+        ToolSubject::Paths {
+            recursive: true,
+            ..
+        }
+    );
+    for (i, u) in a.units.iter().enumerate() {
+        if !(recursive_reader(&u.eff) && follows_links(&u.eff)) {
+            continue;
+        }
+        // options it can't read: it may search there (it asks)
+        let sure = match searches_cwd(&u.eff) {
+            Some(false) => continue,
+            Some(true) => true,
+            None => false,
+        };
+        if let Some(words::CwdState::Known(cands)) = a.unit_cwd.get(i) {
+            for c in cands {
+                match links_below(c, trees) {
+                    Reach::Yes if sure => return Reach::Yes,
+                    Reach::No => {}
+                    _ => maybe = true,
+                }
+            }
+        }
+    }
+    let mut k = 0usize;
+    for u in &a.uses {
+        let unit = a.units.get(u.unit);
+        let command_word = unit.is_some_and(|x| x.seg.argv.first() == Some(&u.word));
+        let recursive = recursive_paths
+            || unit.is_some_and(|x| recursive_reader(&x.eff) || tree_walker(&x.eff));
+        let follows = unit.is_some_and(|x| follows_links(&x.eff));
+        // `ls proj/*` only names what it lists
+        let lister = !recursive
+            && unit.is_some_and(|x| x.eff.first().is_some_and(|f| shell::base(f) == "ls"));
+        let globby = u.word.contains(['*', '?', '[']);
+        for _ in &u.paths {
+            let Some(p) = resolved.get(k) else {
+                return Reach::Maybe;
+            };
+            k += 1;
+            if command_word {
+                continue;
+            }
+            let mut targets = vec![p.clone()];
+            if globby && let Some(found) = expand_glob(p) {
+                targets = found;
+            }
+            for f in &targets {
+                if globby && !lister {
+                    let real = real_path(f);
+                    if in_trees(&real, trees, recursive) {
+                        return Reach::Yes;
+                    }
+                }
+                if recursive && follows && f.is_dir() {
+                    match links_below(f, trees) {
+                        Reach::Yes => return Reach::Yes,
+                        Reach::Maybe => maybe = true,
+                        Reach::No => {}
+                    }
+                }
+            }
+        }
+    }
+    if maybe { Reach::Maybe } else { Reach::No }
+}
+
+/// Whether the call reads a regular file with more than one link: a named
+/// file (anywhere, but not a command being run), a file a glob's folder holds,
+/// or a file below a folder a recursive search is given (review M1-13
+/// finding 11). The search walk is bounded and skips `node_modules` and
+/// `.git` (package managers and local clones hard-link their files there).
+fn reaches_multiply_linked(check: &ToolCheck, a: &deny::Analysis, resolved: &[PathBuf]) -> bool {
+    let recursive_paths = matches!(
+        &check.subject,
+        ToolSubject::Paths {
+            recursive: true,
+            ..
+        }
+    );
+    let mut k = 0usize;
+    for u in &a.uses {
+        let unit = a.units.get(u.unit);
+        let command_word = unit.is_some_and(|x| x.seg.argv.first() == Some(&u.word));
+        let recursive = recursive_paths || unit.is_some_and(|x| recursive_reader(&x.eff));
+        let globby = u.word.contains(['*', '?', '[']);
+        for _ in &u.paths {
+            let Some(p) = resolved.get(k) else {
+                return false;
+            };
+            k += 1;
+            if command_word {
+                continue;
+            }
+            if multiply_linked_file(p) {
+                return true;
+            }
+            if globby
+                && let Some(dir) = p.parent()
+                && tree_has_multiply_linked(dir, 1)
+            {
+                return true;
+            }
+            if recursive && p.is_dir() && tree_has_multiply_linked(p, 8) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A bounded walk (links not followed) looking for a multiply-linked file.
+fn tree_has_multiply_linked(root: &Path, max_depth: u8) -> bool {
+    const BUDGET: usize = 4096;
+    let mut seen = 0usize;
+    let mut stack = vec![(root.to_path_buf(), 0u8)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > BUDGET {
+                return false;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            let p = e.path();
+            if ft.is_dir() {
+                let skip = e.file_name() == "node_modules" || e.file_name() == ".git";
+                if !skip && depth + 1 < max_depth {
+                    stack.push((p, depth + 1));
+                }
+            } else if ft.is_file() && multiply_linked_file(&p) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub struct Evaluated {

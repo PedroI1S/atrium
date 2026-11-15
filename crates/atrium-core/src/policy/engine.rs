@@ -126,7 +126,8 @@ fn allow_covers(
         return none;
     }
     let command = matches!(input.check.subject, ToolSubject::Command { .. });
-    let simple = command && a.reasons.is_empty() && !part_ids.is_empty();
+    // an uncertain cwd: only `Any` covers it (contract §9: the line asks)
+    let simple = command && a.reasons.is_empty() && !part_ids.is_empty() && !a.cwd_uncertain;
     if rule.path_scope.is_some() && command && !simple {
         return none;
     }
@@ -392,14 +393,26 @@ const GREP_VAL_L: &[&str] = &[
     "group-separator",
 ];
 
-struct Searched {
-    roots: Vec<String>,
-    recursive: bool,
+pub(crate) struct Searched {
+    pub(crate) roots: Vec<String>,
+    pub(crate) recursive: bool,
 }
 
 /// Splits an `rg`/`grep` command into search roots; `None` for a flag it
 /// doesn't know (the command then asks).
-fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
+pub(crate) fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
+    roots_of(is_rg, false, args)
+}
+
+/// [`search_roots`] for `rg` that also reads `-L` / `--follow` as plain
+/// flags (round-8 major 5, D-098): the gate checks the links they follow
+/// itself, and the flag/value pairing stays the parser's, so a `-L` given
+/// as the value of `-e`, `-g`, `-r`, `--file`, … stays a value.
+pub(crate) fn rg_roots_following(args: &[String]) -> Option<Searched> {
+    roots_of(true, true, args)
+}
+
+fn roots_of(is_rg: bool, follow: bool, args: &[String]) -> Option<Searched> {
     let (bs, vs, bl, vl) = if is_rg {
         (RG_BOOL_S, RG_VAL_S, RG_BOOL_L, RG_VAL_L)
     } else {
@@ -428,6 +441,9 @@ fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
                 Some((n, _)) => (n, true),
                 None => (rest, false),
             };
+            if follow && name == "follow" && !has_val {
+                continue;
+            }
             if name == "files" || name == "type-list" {
                 files_mode = true;
             }
@@ -463,6 +479,9 @@ fn search_roots(is_rg: bool, args: &[String]) -> Option<Searched> {
                 }
                 if !is_rg && matches!(c, 'r' | 'd') {
                     recursive = true;
+                }
+                if follow && *c == 'L' {
+                    continue;
                 }
                 if *c == 'e' {
                     have_pattern_flag = true;
@@ -581,7 +600,11 @@ impl Home<'_> {
             },
             ToolSubject::Command { line, .. } => {
                 let tops = parts(self.a);
-                if tops.is_empty() || !self.a.reasons.is_empty() || line.contains('\n') {
+                if tops.is_empty()
+                    || !self.a.reasons.is_empty()
+                    || self.a.cwd_uncertain
+                    || line.contains('\n')
+                {
                     return PolicyVerdict::Ask;
                 }
                 let mut used_rule = None;
