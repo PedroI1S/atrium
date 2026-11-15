@@ -372,7 +372,7 @@ impl Agent {
 
     async fn run_approval(&mut self, turn: u32, tool_index: u64) -> Result<(), Gone> {
         let call_id = format!("c{turn}-{tool_index}");
-        let command = "touch synthetic";
+        let command = "echo synthetic";
         let input = json!({ "command": command });
         let check = ToolCheck {
             call_id: Some(call_id.clone()),
