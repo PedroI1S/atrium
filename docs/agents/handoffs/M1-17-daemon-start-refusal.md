@@ -5,11 +5,11 @@ Branch: `agent/hydrogen/M1-17-daemon-start-refusal`
 ## Where the reason was lost (and evidence)
 
 1. **Client start-up loop discarded `start_daemon` errors (`crates/atrium-client/src/connection.rs`):**
-   `run()` previously executed `let _ = tokio::task::spawn_blocking(move || start()).await;`, ignoring any `Err` returned by `start_daemon` (including `secure_dir` and `open_private_log` failures from `start_daemon_hook` in `app/src-tauri/src/bridge.rs`) and continuing the reconnect loop silently.
+   `run()` previously executed `let _ = tokio::task::spawn_blocking(move || start()).await;`, ignoring any `Err` returned by `start_daemon` (including `open_private_log`'s `secure_dir` refusal on `logs_dir` from `start_daemon_hook` in `app/src-tauri/src/bridge.rs`) and continuing the reconnect loop silently. Because `open_private_log` refused before `cmd.spawn()`, no daemon was spawned at all.
 2. **Detached launcher returned immediately without observing early exit (`crates/atrium-host/src/lifecycle.rs`, `app/src-tauri/src/bridge.rs`):**
-   `spawn_detached` returned `Ok(pid)` right after `cmd.spawn()`, so if `atriumd` started and immediately exited with a refusal on stderr/log (for example, `InstanceLock::acquire` or `secure_dir`), the launcher reported `Ok(())`. In addition, `open_private_log` fails when `logs` is mode `0755` or a symlink, so without a piped-stderr fallback during the start-up wait, any refusal written by `atriumd` had nowhere to go if `spawn_detached` ran.
+   `spawn_detached` returned `Ok(pid)` right after `cmd.spawn()`, so if `atriumd` started and immediately exited with a refusal on stderr/log (for example, `InstanceLock::acquire` or `secure_dir` on `runtime_dir`/`data_dir`), the launcher reported `Ok(())`. In addition, `open_private_log` fails when `logs` is mode `0755` or a symlink, so without a piped-stderr fallback during the start-up wait, any refusal written by `atriumd` had nowhere to go if `spawn_detached` ran.
 3. **Daemon start-up checks (`crates/atrium-daemon/src/lib.rs`, `crates/atrium-host/src/lifecycle.rs`):**
-   `Daemon::start` checked `secure_dir` on `runtime_dir` and `data_dir`, but not `logs_dir`. And `LifecycleError` variants for symlinks, non-regular files, and `AlreadyRunning` did not state the expected state in every message.
+   On `dev`, `atriumd` itself starts with a `0755` `logs` folder (it only checked `secure_dir` on `runtime_dir` and `data_dir`); the silence N9 saw came from the launcher (`open_private_log` / the hook's `secure_dir` refused, the client discarded the `Err`, and no daemon was spawned). Adding `secure_dir(&paths.logs_dir)` in `Daemon::start` is therefore a new daemon-side refusal, kept by Pedro's decision D-095. `LifecycleError` variants for symlinks, non-regular files, and `AlreadyRunning` were also updated to state the expected state in every message.
 
 Evidence is exercised in:
 - `crates/atrium-daemon/tests/start_refusal.rs`:
