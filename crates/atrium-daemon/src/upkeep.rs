@@ -70,17 +70,29 @@ pub(crate) async fn recover(inner: &Arc<Inner>) -> Result<(), StartError> {
     }
 
     // Threads that started an incarnation with zero events (e.g. hung while
-    // `Starting`) do not appear in `unfinished_incarnations`.
+    // `Starting`, or stopped while `Starting`) do not appear in
+    // `unfinished_incarnations`.
     for summary in inner.store.threads().await? {
         if summary.incarnation == 0 || handled.contains(&summary.thread_id) {
             continue;
         }
-        if summary.state == ThreadState::Starting {
-            let cleanup = cleanups
-                .get(&(summary.thread_id.clone(), summary.incarnation))
-                .copied()
-                .unwrap_or(Cleanup::Unverified);
-            close(inner, &summary.thread_id, summary.incarnation, cleanup).await?;
+        let cleanup = match cleanups
+            .get(&(summary.thread_id.clone(), summary.incarnation))
+            .copied()
+        {
+            Some(cleanup) => cleanup,
+            None => match summary.state {
+                // A process may have been started and not yet recorded: nothing
+                // was killed, and nothing says it stopped.
+                ThreadState::Starting => Cleanup::Unverified,
+                ThreadState::Interrupted { cleanup } => cleanup,
+                _ => Cleanup::Verified,
+            },
+        };
+        if close(inner, &summary.thread_id, summary.incarnation, cleanup).await?
+            && !cleanups.contains_key(&(summary.thread_id.clone(), summary.incarnation))
+        {
+            records.push((summary.thread_id, summary.incarnation));
         }
     }
 
@@ -92,15 +104,17 @@ pub(crate) async fn recover(inner: &Arc<Inner>) -> Result<(), StartError> {
     Ok(())
 }
 
-/// Closes one incarnation a previous daemon left unfinished.
+/// Closes one incarnation a previous daemon left unfinished. Returns `true`
+/// if it stored the closing sequence, or `false` if `SessionEnded` was
+/// already present.
 async fn close(
     inner: &Arc<Inner>,
     thread: &ThreadId,
     incarnation: u32,
     cleanup: Cleanup,
-) -> Result<(), StartError> {
+) -> Result<bool, StartError> {
     if inner.incarnation_ended(thread, incarnation).await? {
-        return Ok(());
+        return Ok(false);
     }
     // The signal first: the `SessionEnded` among the closing events settles
     // the thread's state, and an unverified cleanup must not be lost under
@@ -112,7 +126,7 @@ async fn close(
     inner
         .close_incarnation(thread, incarnation, None, Some(RESTARTED.into()), None)
         .await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Returns once the daemon is stopping.

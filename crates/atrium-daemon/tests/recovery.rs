@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use atrium_core::store::{Migration, SqliteStore, StoreOptions};
-use atrium_core::{NewThread, OpenItems, Store};
+use atrium_core::{NewThread, OpenItems, Signal, Store};
 use atrium_daemon::{Daemon, Options, StartError};
 use atrium_protocol::agent::{
     AgentEvent, AgentEventEnvelope, ApprovalDecision, MessageKind, Provider, SessionCommand,
@@ -622,5 +622,82 @@ async fn failed_recovery_closure_retries_and_clears_process_record() {
             .is_empty()
     );
     drop(store);
+    assert_recorded_processes_count(&rig.paths.store, 0).await;
+}
+
+#[tokio::test]
+async fn a_thread_stopped_while_starting_with_unverified_process_is_recovered() {
+    let folder = common::folder();
+    let paths = common::paths(folder.path());
+    atrium_host::lifecycle::secure_dir(&paths.data_dir).expect("secures data dir");
+
+    let mut command = tokio::process::Command::new("sleep");
+    command.arg("600");
+    let mut spawned = atrium_host::supervise::spawn_group(command).expect("spawns sleep");
+    let mut mismatched = spawned.identity.clone();
+    mismatched.start_time = mismatched.start_time.wrapping_add(1);
+
+    let thread = {
+        let store = SqliteStore::open(&paths.store, StoreOptions::default())
+            .await
+            .expect("opens store");
+        let thread = store
+            .create_thread(NewThread {
+                provider: Provider::Claude,
+                model: None,
+                effort: None,
+                preset: Preset::Home,
+                location: Location::Home,
+                title: "stopped-while-starting".into(),
+            })
+            .await
+            .expect("creates thread")
+            .thread_id;
+        let inc = store
+            .begin_incarnation(&thread)
+            .await
+            .expect("begins incarnation");
+        store
+            .signal(&thread, Signal::Starting)
+            .await
+            .expect("signals starting");
+        store
+            .set_process(&thread, inc, Some(mismatched))
+            .await
+            .expect("records process");
+        // User stops the thread while it is still starting (zero events stored),
+        // then the daemon dies.
+        let summary = store
+            .signal(&thread, Signal::Stopped)
+            .await
+            .expect("signals stopped");
+        assert_eq!(summary.state, ThreadState::Ended);
+        assert!(
+            store
+                .unfinished_incarnations()
+                .await
+                .expect("unfinished")
+                .is_empty()
+        );
+        thread
+    };
+
+    let mut rig = Rig::in_folder(folder);
+    rig.boot(|_| {}).await;
+    let mut wire = rig.dev().await;
+    let summary = wire.thread(&thread).await;
+    let history = kinds(&wire.history(&thread).await);
+    drop(wire);
+    rig.stop(true).await;
+    let _ = spawned.child.kill().await;
+    let _ = spawned.child.wait().await;
+
+    assert_eq!(
+        summary.state,
+        ThreadState::Interrupted {
+            cleanup: Cleanup::Unverified
+        }
+    );
+    assert_eq!(history, ["session_ended"]);
     assert_recorded_processes_count(&rig.paths.store, 0).await;
 }
