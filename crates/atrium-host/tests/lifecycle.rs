@@ -541,8 +541,9 @@ fn spawn_detached_wait_returns_stderr_on_early_exit_and_pipes_when_log_unopenabl
         Duration::from_millis(80),
     )
     .expect_err("unopenable log with live process must fail");
+    let msg = err_alive.to_string();
     assert!(
-        err_alive.to_string().contains("symlink"),
-        "expected log-open error, got: {err_alive}"
+        msg.contains("started") && msg.contains("stopped") && msg.contains("symlink"),
+        "expected started-then-stopped log-open error, got: {msg}"
     );
 }

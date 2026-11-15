@@ -348,15 +348,22 @@ pub fn spawn_detached_wait(
             let deadline = std::time::Instant::now() + startup_wait;
 
             loop {
-                if let Some(status) = child.try_wait()? {
-                    let tail =
-                        read_new_log_tail(log, start_offset, MAX_STDERR_BYTES, MAX_STDERR_LINES);
-                    let message = if tail.is_empty() {
-                        format!("daemon exited during startup ({status})")
-                    } else {
-                        tail
-                    };
-                    return Err(std::io::Error::other(message));
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let tail =
+                            read_new_log_tail(log, start_offset, MAX_STDERR_BYTES, MAX_STDERR_LINES);
+                        let message = if tail.is_empty() {
+                            format!("daemon exited during startup ({status})")
+                        } else {
+                            tail
+                        };
+                        return Err(std::io::Error::other(message));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        reap_in_background(child);
+                        return Err(err);
+                    }
                 }
                 if ready.exists() || std::time::Instant::now() >= deadline {
                     reap_in_background(child);
@@ -371,19 +378,33 @@ pub fn spawn_detached_wait(
             let deadline = std::time::Instant::now() + startup_wait;
 
             loop {
-                if let Some(_status) = child.try_wait()? {
-                    let tail =
-                        read_pipe_tail(child.stderr.take(), MAX_STDERR_BYTES, MAX_STDERR_LINES);
-                    if !tail.is_empty() {
-                        return Err(std::io::Error::other(tail));
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        let tail =
+                            read_pipe_tail(child.stderr.take(), MAX_STDERR_BYTES, MAX_STDERR_LINES);
+                        if !tail.is_empty() {
+                            return Err(std::io::Error::other(tail));
+                        }
+                        return Err(log_err);
                     }
-                    return Err(log_err);
+                    Ok(None) => {}
+                    Err(err) => {
+                        // Never leave a daemon running without a private log file.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(err);
+                    }
                 }
                 if std::time::Instant::now() >= deadline {
                     // Never leave a daemon running without a private log file.
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(log_err);
+                    return Err(std::io::Error::new(
+                        log_err.kind(),
+                        format!(
+                            "daemon was started and then stopped because its log could not be opened: {log_err}"
+                        ),
+                    ));
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
