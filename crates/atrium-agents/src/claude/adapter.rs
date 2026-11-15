@@ -1484,6 +1484,17 @@ impl Actor {
                     );
                 }
             }
+            SessionCommand::DeclineQuestion { request_id } => {
+                let question = self.questions.remove(&request_id);
+                self.feed(AdapterInput::Command {
+                    command: SessionCommand::DeclineQuestion {
+                        request_id: request_id.clone(),
+                    },
+                });
+                if let Some((native, _input)) = question {
+                    self.deny_can_use(&native, "The user declined to answer.");
+                }
+            }
         }
     }
 

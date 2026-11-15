@@ -32,6 +32,42 @@ pub enum NotifyReason {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NotifySwitches {
+    approval: bool,
+    question: bool,
+    failed: bool,
+}
+
+impl Default for NotifySwitches {
+    fn default() -> Self {
+        Self {
+            approval: true,
+            question: true,
+            failed: true,
+        }
+    }
+}
+
+impl NotifySwitches {
+    fn enabled(self, reason: NotifyReason) -> bool {
+        match reason {
+            NotifyReason::Approval => self.approval,
+            NotifyReason::Question => self.question,
+            NotifyReason::Failed => self.failed,
+        }
+    }
+
+    fn set(&mut self, key: &str, enabled: bool) {
+        match key {
+            crate::commands::NOTIFY_APPROVAL_SETTING => self.approval = enabled,
+            crate::commands::NOTIFY_QUESTION_SETTING => self.question = enabled,
+            crate::commands::NOTIFY_FAILED_SETTING => self.failed = enabled,
+            _ => {}
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Hub {
     /// Connections that asked for the inbox.
@@ -45,6 +81,7 @@ pub(crate) struct Hub {
     focus: HashMap<ConnId, ThreadId>,
     storage_full_since: Option<u64>,
     notified: HashMap<ThreadId, u64>,
+    notify: NotifySwitches,
     connections: HashMap<ConnId, Arc<Conn>>,
 }
 
@@ -55,6 +92,19 @@ impl Hub {
             .map(|summary| (summary.thread_id.clone(), summary))
             .collect();
         self.ranked = self.rank();
+    }
+
+    pub(crate) fn load_notify_settings(&mut self, settings: &[(String, Value)]) {
+        self.notify = NotifySwitches::default();
+        for (key, value) in settings {
+            if let Some(enabled) = value.as_bool() {
+                self.notify.set(key, enabled);
+            }
+        }
+    }
+
+    pub(crate) fn set_notify_setting(&mut self, key: &str, enabled: bool) {
+        self.notify.set(key, enabled);
     }
 
     fn rank(&self) -> Vec<InboxItem> {
@@ -164,14 +214,15 @@ impl Hub {
             _ => None,
         };
         let focused = self.focus.values().any(|focused| *focused == id);
-        let notify = reason.filter(|_| {
-            attention::should_notify(
-                &previous.state,
-                &summary.state,
-                focused,
-                self.notified.get(&id).copied(),
-                now_ms,
-            )
+        let notify = reason.filter(|r| {
+            self.notify.enabled(*r)
+                && attention::should_notify(
+                    &previous.state,
+                    &summary.state,
+                    focused,
+                    self.notified.get(&id).copied(),
+                    now_ms,
+                )
         });
         self.threads.insert(id.clone(), summary.clone());
         self.to_inbox(

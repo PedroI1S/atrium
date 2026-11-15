@@ -1173,6 +1173,18 @@ impl ClaudeNormalizer {
                     _ => out.push(unknown_request(request_id)),
                 }
             }
+            SessionCommand::DeclineQuestion { request_id } => {
+                match self.take_pending(request_id, false) {
+                    Some(Pending::Question { native }) => {
+                        self.can_use.remove(&native);
+                        out.push(AgentEvent::RequestResolved {
+                            request_id: request_id.clone(),
+                            outcome: RequestOutcome::Cancelled,
+                        });
+                    }
+                    _ => out.push(unknown_request(request_id)),
+                }
+            }
             SessionCommand::Interrupt => {
                 if self.turn_open {
                     self.interrupt_requested = true;

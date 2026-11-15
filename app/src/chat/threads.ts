@@ -203,10 +203,12 @@ export function answerQuestion(threadId: string, r: RequestItem, answers: Questi
   return send(threadId, r, "answer", { type: "answer_question", thread_id: threadId, incarnation: r.incarnation, request_id: r.requestId, answers });
 }
 
-/**
- * Declining a question: the wire has no "decline" (CR in the handoff), so the turn is stopped,
- * which withdraws the question.
- */
+/** Decline a question without stopping the turn (contract §6.2, CR-15). */
+export function declineQuestion(threadId: string, r: RequestItem): Promise<void> {
+  return send(threadId, r, "decline", { type: "decline_question", thread_id: threadId, incarnation: r.incarnation, request_id: r.requestId });
+}
+
+/** Stop the whole turn instead of answering or declining the question. */
 export function stopTurnForQuestion(threadId: string, r: RequestItem): Promise<void> {
   return send(threadId, r, "cancel", { type: "thread_command", thread_id: threadId, command: { type: "interrupt" } });
 }

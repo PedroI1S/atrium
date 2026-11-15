@@ -206,6 +206,7 @@ impl Sanitizer {
                 }
             }
             SessionCommand::ResolveApproval { .. }
+            | SessionCommand::DeclineQuestion { .. }
             | SessionCommand::Interrupt
             | SessionCommand::Shutdown => {}
         }
