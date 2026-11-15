@@ -543,3 +543,8 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 
 ## D-086 — 2026-11-15 — rodrigo's go: M1-07b-proc-drop-linux (N7)
 **Decided by rodrigo (driver).** Go for fixing N7: on Linux, a Claude adapter `Proc` dropped outside a runtime hangs its thread for ever, and `claude_adapter`'s test binary never ends. The brief is `briefs/M1-07b-proc-drop-linux.md`. **Gemini 4 Hydrogen `high`** (D-084: Rust run with `cargo`, no credential literals, no GUI; `high` for process-lifecycle work), reviewed by **Sonnet 5.5**, read-only. Branch `agent/hydrogen/M1-07b-proc-drop-linux`.
+
+*Update, same day (orchestrator):*
+- **The reviewer changed from Sonnet 5.5 to Opus 5.5.** The fix adds an `unsafe` `waitid` block in `atrium-host`, and D-053 gives every changed `unsafe` block there an Opus audit. Opus is still a different provider from the author.
+- **Review verdict: approve** (`reviews/M1-07b-proc-drop-linux.md`).
+- **The orchestrator re-ran the checks on the branch:** fmt, workspace clippy, `claude_adapter` 5/5, and `cargo test --workspace` (495 passed, 0 failed, 1 ignored). All clean.
