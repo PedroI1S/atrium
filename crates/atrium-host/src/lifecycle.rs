@@ -350,8 +350,12 @@ pub fn spawn_detached_wait(
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        let tail =
-                            read_new_log_tail(log, start_offset, MAX_STDERR_BYTES, MAX_STDERR_LINES);
+                        let tail = read_new_log_tail(
+                            log,
+                            start_offset,
+                            MAX_STDERR_BYTES,
+                            MAX_STDERR_LINES,
+                        );
                         let message = if tail.is_empty() {
                             format!("daemon exited during startup ({status})")
                         } else {

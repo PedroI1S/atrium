@@ -5,9 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atrium_client::{Client, ClientOptions, ConnectionState, StartDaemon};
-use atrium_host::lifecycle::{
-    InstanceLock, Paths, default_paths, secure_dir, spawn_detached_wait,
-};
+use atrium_host::lifecycle::{InstanceLock, Paths, default_paths, secure_dir, spawn_detached_wait};
 use atrium_protocol::PROTOCOL_VERSION;
 use atrium_protocol::wire::{ClientMessage, ClientRole, FrameKind, ServerMessage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
