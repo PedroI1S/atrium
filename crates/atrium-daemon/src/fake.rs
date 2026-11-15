@@ -536,6 +536,12 @@ impl Agent {
 
     async fn run_question(&mut self, turn: u32) -> Result<(), Gone> {
         let Some(ticket) = self.gate.question_ticket(Some(turn)).await else {
+            // Same as ToolGate::question_ticket and the native Claude adapter:
+            // emit no AgentEvent when no ticket is issued, and log via
+            // atriumd's stderr convention since there is no provider to deny.
+            eprintln!(
+                "atriumd: fake agent turn {turn}: gate returned no question ticket; question skipped"
+            );
             return Ok(());
         };
         self.emit(AgentEvent::QuestionAsked {
