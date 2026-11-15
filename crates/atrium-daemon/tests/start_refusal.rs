@@ -6,7 +6,11 @@ use std::time::Duration;
 
 use atrium_client::{Client, ClientOptions, ConnectionState, StartDaemon};
 use atrium_host::lifecycle::{InstanceLock, Paths, secure_dir, spawn_detached_wait};
-use atrium_protocol::wire::ClientRole;
+use atrium_protocol::PROTOCOL_VERSION;
+use atrium_protocol::wire::{ClientMessage, ClientRole, FrameKind, ServerMessage};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 fn temp_home(prefix: &str) -> tempfile::TempDir {
@@ -157,7 +161,7 @@ async fn symlinked_logs_dir_refusal_reaches_stderr_and_client() {
 }
 
 #[tokio::test]
-async fn held_instance_lock_refusal_reaches_stderr_and_client() {
+async fn held_instance_lock_refusal_reaches_stderr_and_client_keeps_retrying() {
     let home = temp_home("atrium-n9-lock-");
     let paths = paths_for(home.path());
     secure_dir(&paths.runtime_dir).expect("runtime dir");
@@ -176,17 +180,141 @@ async fn held_instance_lock_refusal_reaches_stderr_and_client() {
         "stderr must name already running and holder pid: {stderr}"
     );
 
+    let refused = Arc::new(Notify::new());
+    let refused_signal = Arc::clone(&refused);
+    let inner = start_hook_for(home.path(), &paths);
+    let hook: StartDaemon = Arc::new(move || {
+        let res = inner();
+        assert!(res.is_err(), "start_hook must see AlreadyRunning error");
+        refused_signal.notify_one();
+        res
+    });
+
     let client = Client::start(ClientOptions {
         socket: paths.socket.clone(),
         name: "n9-lock-test".into(),
         role: ClientRole::Dev,
-        start_daemon: Some(start_hook_for(home.path(), &paths)),
+        start_daemon: Some(hook),
     });
-    let message = wait_for_failed(&client).await;
-    assert!(
-        message.contains("already running") && message.contains(&std::process::id().to_string()),
-        "client failure must carry lock refusal, got: {message}"
-    );
+
+    timeout(Duration::from_secs(5), refused.notified())
+        .await
+        .expect("start_hook runs and sees refusal");
+
+    let mut rx = client.connection();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let state = rx.borrow_and_update().clone();
+            assert!(
+                !matches!(state, ConnectionState::Failed { .. }),
+                "held instance lock must not park client in Failed: {state:?}"
+            );
+            if matches!(state, ConnectionState::Connecting { attempt } if attempt >= 3) {
+                break;
+            }
+            rx.changed().await.expect("connection watch open");
+        }
+    })
+    .await
+    .expect("client keeps retrying in Connecting");
+
     client.shutdown();
+    drop(lock);
+}
+
+#[tokio::test]
+async fn held_instance_lock_connects_once_socket_appears() {
+    let home = temp_home("atrium-n9-lock-race-");
+    let paths = paths_for(home.path());
+    secure_dir(&paths.runtime_dir).expect("runtime dir");
+    secure_dir(&paths.logs_dir).expect("logs dir");
+    let lock = InstanceLock::acquire(&paths).expect("hold instance lock");
+
+    let refused = Arc::new(Notify::new());
+    let refused_signal = Arc::clone(&refused);
+    let inner = start_hook_for(home.path(), &paths);
+    let hook: StartDaemon = Arc::new(move || {
+        let res = inner();
+        if res.is_err() {
+            refused_signal.notify_one();
+        }
+        res
+    });
+
+    let client = Client::start(ClientOptions {
+        socket: paths.socket.clone(),
+        name: "n9-lock-race-test".into(),
+        role: ClientRole::Dev,
+        start_daemon: Some(hook),
+    });
+
+    // Wait for the first start attempt to fail with "another daemon is already running".
+    timeout(Duration::from_secs(5), refused.notified())
+        .await
+        .expect("start_hook sees refused start");
+
+    assert!(
+        !matches!(
+            *client.connection().borrow(),
+            ConnectionState::Failed { .. }
+        ),
+        "client must not park in Failed after raced start"
+    );
+
+    // The lock holder now binds the socket shortly after the refused start.
+    let listener = UnixListener::bind(&paths.socket).expect("bind socket while holding lock");
+    let accept_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept client");
+        let len = stream.read_u32().await.expect("hello len");
+        let kind = stream.read_u8().await.expect("hello kind");
+        assert_eq!(kind, FrameKind::Control as u8);
+        let mut buf = vec![0u8; len as usize - 1];
+        stream.read_exact(&mut buf).await.expect("hello body");
+        let msg: ClientMessage = serde_json::from_slice(&buf).expect("parse hello");
+        assert!(matches!(msg, ClientMessage::Hello { .. }));
+
+        let welcome = ServerMessage::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "test".into(),
+            daemon_pid: std::process::id(),
+            role: ClientRole::Dev,
+        };
+        let payload = serde_json::to_vec(&welcome).expect("encode welcome");
+        stream
+            .write_u32(u32::try_from(payload.len() + 1).expect("len u32"))
+            .await
+            .expect("write welcome len");
+        stream
+            .write_u8(FrameKind::Control as u8)
+            .await
+            .expect("write welcome kind");
+        stream
+            .write_all(&payload)
+            .await
+            .expect("write welcome body");
+        stream.flush().await.expect("flush welcome");
+        // Keep stream open until client shuts down.
+        let mut discard = [0u8; 16];
+        let _ = stream.read(&mut discard).await;
+    });
+
+    let mut rx = client.connection();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let state = rx.borrow_and_update().clone();
+            if let ConnectionState::Failed { message } = state {
+                panic!("client unexpectedly entered Failed: {message}");
+            }
+            if matches!(state, ConnectionState::Connected { .. }) {
+                break;
+            }
+            rx.changed().await.expect("connection watch open");
+        }
+    })
+    .await
+    .expect("client reaches Connected once socket appears");
+
+    client.shutdown();
+    let _ = accept_task.await;
     drop(lock);
 }

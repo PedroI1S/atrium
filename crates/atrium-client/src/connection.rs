@@ -67,6 +67,14 @@ enum Ended {
     Refused(ConnectionState),
 }
 
+fn is_transient_start_error(error: &io::Error, socket: &Path) -> bool {
+    error.kind() == io::ErrorKind::AddrInUse
+        || error
+            .to_string()
+            .contains("another daemon is already running")
+        || socket.exists()
+}
+
 fn failed(message: impl Into<String>) -> Ended {
     Ended::Refused(ConnectionState::Failed {
         message: message.into(),
@@ -143,7 +151,13 @@ pub(crate) async fn run(
                 {
                     let failure = match tokio::task::spawn_blocking(move || start()).await {
                         Ok(Ok(())) => None,
-                        Ok(Err(error)) => Some(error.to_string()),
+                        Ok(Err(error)) => {
+                            if is_transient_start_error(&error, &options.socket) {
+                                None
+                            } else {
+                                Some(error.to_string())
+                            }
+                        }
                         Err(join_error) => {
                             Some(format!("starting the daemon failed: {join_error}"))
                         }
