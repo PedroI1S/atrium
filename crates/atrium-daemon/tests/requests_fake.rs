@@ -1,6 +1,6 @@
 use atrium_protocol::agent::{
-    AgentEvent, ApprovalDecision, QuestionAnswer, RequestOutcome, SessionCommand, ToolKind,
-    ToolStatus, TurnOutcome,
+    AgentEvent, ApprovalDecision, MessageKind, QuestionAnswer, RequestOutcome, SessionCommand,
+    ToolKind, ToolStatus, TurnOutcome,
 };
 use atrium_protocol::policy::{
     RememberScope, Rule, RuleDecision, RuleDraft, RuleMatcher, RuleScope,
@@ -399,6 +399,24 @@ async fn fake_question_answered_declined_and_checked_by_ledger() {
         .await,
         ErrorCode::Invalid
     );
+    // Unknown request id returns the same ErrorCode for AnswerQuestion and DeclineQuestion.
+    let answer_unknown = wire
+        .refused(DaemonCommand::AnswerQuestion {
+            thread_id: thread.clone(),
+            incarnation: 1,
+            request_id: "unknown-request".into(),
+            answers: vec![],
+        })
+        .await;
+    let decline_unknown = wire
+        .refused(DaemonCommand::DeclineQuestion {
+            thread_id: thread.clone(),
+            incarnation: 1,
+            request_id: "unknown-request".into(),
+        })
+        .await;
+    assert_eq!(decline_unknown, answer_unknown);
+    assert_eq!(decline_unknown, ErrorCode::Expired);
 
     // Answer turn 1.
     wire.ok(DaemonCommand::AnswerQuestion {
@@ -426,6 +444,44 @@ async fn fake_question_answered_declined_and_checked_by_ledger() {
         .await,
         ErrorCode::Expired
     );
+
+    // Streaming continues after the answer until turn 1 completes.
+    let history = wire.history(&thread).await;
+    let resolved_at = history
+        .iter()
+        .position(|e| {
+            matches!(
+                &e.envelope.event,
+                AgentEvent::RequestResolved {
+                    request_id,
+                    outcome: RequestOutcome::Answered,
+                } if request_id == &req1
+            )
+        })
+        .expect("RequestResolved(Answered) in history");
+    let after_answer = &history[resolved_at + 1..];
+    assert!(after_answer.iter().any(|e| matches!(
+        &e.envelope.event,
+        AgentEvent::MessageDelta {
+            kind: MessageKind::Assistant,
+            ..
+        }
+    )));
+    assert!(after_answer.iter().any(|e| matches!(
+        &e.envelope.event,
+        AgentEvent::MessageCompleted {
+            kind: MessageKind::Assistant,
+            ..
+        }
+    )));
+    assert!(matches!(
+        after_answer.last().map(|e| &e.envelope.event),
+        Some(AgentEvent::TurnCompleted {
+            turn: 1,
+            outcome: TurnOutcome::Completed,
+            ..
+        })
+    ));
 
     // Turn 2 asks again; DeclineQuestion resolves it as Cancelled and the turn still completes.
     wire.ok(say(&thread, "ask twice")).await;
