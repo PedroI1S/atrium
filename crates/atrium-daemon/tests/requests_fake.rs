@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use atrium_protocol::agent::{
     AgentEvent, ApprovalDecision, QuestionAnswer, RequestOutcome, SessionCommand, ToolKind,
     ToolStatus, TurnOutcome,
@@ -8,11 +6,13 @@ use atrium_protocol::policy::{
     RememberScope, Rule, RuleDecision, RuleDraft, RuleMatcher, RuleScope,
 };
 use atrium_protocol::thread::{ThreadId, ThreadState};
-use atrium_protocol::wire::{AgentLaunch, DaemonCommand, ErrorCode, StoredEvent};
+use atrium_protocol::wire::{
+    AgentLaunch, ClientMessage, DaemonCommand, ErrorCode, ServerMessage, StoredEvent,
+};
 
 mod common;
 
-use common::{Rig, kinds};
+use common::{Rig, Wire, kinds, soon};
 
 fn fake_with(
     duration_ms: u64,
@@ -76,6 +76,28 @@ fn latest_question(history: &[StoredEvent]) -> (String, String) {
             _ => None,
         })
         .expect("question_asked in history")
+}
+
+async fn wait_turn_completed(wire: &mut Wire, thread: &ThreadId, expected_turn: u32) {
+    let _ = wire.subscribed(thread, None).await;
+    soon(async {
+        loop {
+            if let ServerMessage::Event { event } = wire.next().await
+                && event.thread_id == *thread
+                && matches!(
+                    event.envelope.event,
+                    AgentEvent::TurnCompleted { turn, .. } if turn == expected_turn
+                )
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    wire.send(&ClientMessage::Unsubscribe {
+        thread_id: thread.clone(),
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -264,7 +286,7 @@ async fn fake_approval_always_creates_rule_and_skips_next_turn() {
 
     // Turn two runs the same Bash command and succeeds without asking.
     wire.ok(say(&thread, "turn two")).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_turn_completed(&mut wire, &thread, 2).await;
     let idle = wire
         .thread_when(&thread, |s| s.state == ThreadState::Idle)
         .await;
