@@ -540,3 +540,6 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **Not in this go:** batching events in `bridge.rs`, the §14 frame-statistic wording on Linux and the idle-memory gate itself: those stay open decisions; the worker brings numbers for them.
 
 *Update, same day (orchestrator):* `agy` on the host is now 1.5.9. Before the review, the hook check of `HANDOFF.md` was re-run with Hydrogen in a scratch worktree (`M1-00-hookcheck-1.5.9`, removed afterwards): `cargo --version` allowed, a write to `.agents/probe.txt` and `git push` denied by the hook, no file written; tool names `run_command` and `write_file`, both known to the policy. `scripts/doctor` names 1.5.9 as the tested version. A first review launch had started before the check; it was stopped within a minute, and its worktree was clean.
+
+## D-086 — 2026-11-15 — rodrigo's go: M1-07b-proc-drop-linux (N7)
+**Decided by rodrigo (driver).** Go for fixing N7: on Linux, a Claude adapter `Proc` dropped outside a runtime hangs its thread for ever, and `claude_adapter`'s test binary never ends. The brief is `briefs/M1-07b-proc-drop-linux.md`. **Gemini 4 Hydrogen `high`** (D-084: Rust run with `cargo`, no credential literals, no GUI; `high` for process-lifecycle work), reviewed by **Sonnet 5.5**, read-only. Branch `agent/hydrogen/M1-07b-proc-drop-linux`.
