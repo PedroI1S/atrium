@@ -554,3 +554,9 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **M1-16-requests-and-notifications review:** Claude Sonnet 5.5, read-only (cross-provider: the author is Hydrogen), on `99e227e`. It checks what the worker didn't run: the 20-run loops, `scripts/check-protocol-ts`, the bindings file, contract §6.2/§8 rev 3.1, the Claude decline's shape and owned paths.
 - **macOS checks, run by the orchestrator (no worker):** `cargo test -p atrium-host -p atrium-agents` on `dev` (M1-07b's `terminate_blocking` on macOS); M1-09b's `startup_bench.py` and `stream_bench.py --runs 3` under `lockf`; the font-preload TTI check. The benchmarks run only while no build is going, so they wait for the reviewer's compiles.
 - **Not in this go:** M1-13 (resume, redo or fail-closed), N8, the daemon's silent exit, M1-08.
+
+## D-088 — 2026-11-15 — Pedro's go: resume M1-13's sixth round; M1-08 to Hydrogen
+**Decided by Pedro (driver):** "resume round six of m13, also dispatch m1-08 to hydrogen".
+- **M1-13 sixth round (D-081) resumes** from the work-in-progress commit `87d6679` (not reset to `5a8c57c`), by the same Claude Opus 5.5 worker, whose conversation is continued. The plan is the branch handoff's "To resume": finish items 2, 4 and 5, then 1, 6 and 7, the "Sixth round" tables, the DoD; then a Hydrogen `high` re-review. Same recorded exception to PLAN §8.3 as D-080 and D-081.
+- **M1-08-codex-adapter: Gemini 4 Hydrogen `high`** (D-076; `high` because approvals are redeemed through the policy gate), replacing Argon in the brief. **Review: Opus 5.5, read-only** (cross-provider; Opus because of the gate path). Branch `agent/hydrogen/M1-08-codex-adapter`, worktree `../atrium-wt/M1-08-codex-adapter`. No live Codex run (the brief's X1–X3 stay for a live task).
+- **Effect on D-087:** the macOS benchmarks wait until both builds are quiet.

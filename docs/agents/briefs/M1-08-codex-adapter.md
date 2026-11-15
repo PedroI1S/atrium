@@ -1,7 +1,9 @@
 # M1-08-codex-adapter: Codex adapter (production, fixtures)
 
-Model: Gemini 4 Argon · Reviewer: Sonnet 5.5 · Depends on: contract (M1 rev 3), M1-10 merged (dispatched after it)
-Branch: `agent/argon/M1-08-codex-adapter` · Worktree: `../atrium-wt/M1-08-codex-adapter`
+Model: Gemini 4 Hydrogen (`gemini-4-hydrogen-high`, `scripts/agent-run agy`; D-076, D-088; was Argon) · Reviewer: Opus 5.5 (read-only; approvals go through the gate) · Depends on: contract (M1 rev 3.1), M1-10 and M1-07 merged
+Go: D-088 (Pedro, 2026-11-15) · Branch: `agent/hydrogen/M1-08-codex-adapter` · Worktree: `../atrium-wt/M1-08-codex-adapter`
+
+**For the Hydrogen run (D-088):** the merged Claude adapter (`crates/atrium-agents/src/claude/**`, M1-07) is the model to follow for tickets, `gate.redeem`, `ToolSubject`, spawning, closing and the goldens. Contract rev 3.1 adds `SessionCommand::DeclineQuestion` (M1-16, not merged yet): you don't need to handle it. If the worker policy refuses a literal you need (a `~/.codex/…` path in a `ConfigSource` or a test), write it without the literal if you can (build it from `HOME` at run time) and list any you couldn't in the handoff; the orchestrator adds them.
 
 ## Goal
 Fold the M0-02 spike into `atrium-agents` as the production Codex adapter on the M1 contract, against the recorded fixtures. Codex can't run live on this shift (D-047): the live checks are a separate task on rodrigo's shift.
