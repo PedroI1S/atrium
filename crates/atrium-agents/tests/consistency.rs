@@ -1201,7 +1201,6 @@ mod tests {
 }
 
 #[test]
-#[ignore = "M1-07, M1-08: fixtures regenerate for rev 3"]
 fn consistency_all_fixtures() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
