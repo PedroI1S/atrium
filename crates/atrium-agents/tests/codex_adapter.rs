@@ -544,11 +544,28 @@ async fn gate_allow_deny_and_redeem_flow() {
             ..
         }
     )));
-    assert_eq!(gate.redeems.lock().unwrap().len(), 1);
+    {
+        let checks = gate.checks.lock().unwrap();
+        let redeems = gate.redeems.lock().unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(redeems.len(), 1);
+        assert_eq!(
+            redeems[0].1, checks[0],
+            "redeem check must equal check built from stored request"
+        );
+        assert_ne!(redeems[0].1.input, serde_json::json!({}));
+    }
     let _ = shutdown(session).await;
+    let wire1 = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
+    let reply1: Value = wire1
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v.get("id").and_then(Value::as_str) == Some("srv-cmd-1"))
+        .expect("srv-cmd-1 reply written");
+    assert_eq!(reply1["result"]["decision"], "accept");
     let _ = fs::remove_dir_all(&dir);
 
-    // 2) Ask -> Allow -> Redeem Deny => tool denied
+    // 2) Ask -> Allow -> Redeem Deny => tool denied and Codex receives decline
     let dir2 = scratch("gate-redeem-deny");
     let gate2 = TestGate::asking(GateDecision::Deny {
         reason: "policy updated".into(),
@@ -595,7 +612,31 @@ async fn gate_allow_deny_and_redeem_flow() {
             ..
         }
     )));
+    assert!(!done2.iter().any(|e| matches!(
+        e,
+        AgentEvent::ToolCallFinished {
+            status: ToolStatus::Succeeded,
+            ..
+        }
+    )));
+    {
+        let checks2 = gate2.checks.lock().unwrap();
+        let redeems2 = gate2.redeems.lock().unwrap();
+        assert_eq!(checks2.len(), 1);
+        assert_eq!(redeems2.len(), 1);
+        assert_eq!(redeems2[0].1, checks2[0]);
+    }
     let _ = shutdown(session2).await;
+    let wire2 = fs::read_to_string(dir2.join("responses.jsonl")).unwrap();
+    let reply2: Value = wire2
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v.get("id").and_then(Value::as_str) == Some("srv-cmd-1"))
+        .expect("srv-cmd-1 reply written");
+    assert_eq!(
+        reply2["result"]["decision"], "decline",
+        "redeem Deny must answer Codex with decline"
+    );
     let _ = fs::remove_dir_all(&dir2);
 }
 
