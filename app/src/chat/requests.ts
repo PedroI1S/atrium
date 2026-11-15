@@ -12,7 +12,7 @@ export type Local =
   | { status: "accepted"; action: Action }
   | { status: "refused"; action: Action; code: ErrorCode | null; message: string; unknownOutcome: boolean };
 
-export type Action = "allow" | "deny" | "answer" | "cancel";
+export type Action = "allow" | "deny" | "answer" | "decline" | "cancel";
 
 export type CardState =
   /** Pending: the buttons work. */
@@ -46,7 +46,11 @@ export const STALE_TEXT = "This request expired: the turn moved on, and nothing 
 export function cardState(request: RequestItem, local: Local | undefined): CardState {
   if (request.outcome !== null) {
     const here = local !== undefined && local.status !== "refused";
-    return { kind: "resolved", here, outcome: request.outcome, text: (here ? RESOLVED_HERE : RESOLVED_ELSEWHERE)[request.outcome] };
+    const text =
+      request.outcome === "cancelled" && here && local.action === "decline"
+        ? "Declined"
+        : (here ? RESOLVED_HERE : RESOLVED_ELSEWHERE)[request.outcome];
+    return { kind: "resolved", here, outcome: request.outcome, text };
   }
   if (local?.status === "refused" && local.code === "expired") return { kind: "stale", text: STALE_TEXT };
   if (request.stale) return { kind: "stale", text: STALE_TEXT };

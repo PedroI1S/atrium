@@ -7,7 +7,7 @@ import { ChevronDown } from "lucide-solid";
 import { For, Show, createSignal } from "solid-js";
 import type { QuestionAnswer, RememberScope } from "../daemon/types";
 import { type CardState, answersComplete, askOf, canAct, cardState, rememberChoices, subjectOf } from "../chat/requests";
-import { answerQuestion, localOf, resolveApproval, stopTurnForQuestion } from "../chat/threads";
+import { answerQuestion, declineQuestion, localOf, resolveApproval, stopTurnForQuestion } from "../chat/threads";
 import type { ApprovalItem, QuestionItem, RequestItem } from "../chat/transcript";
 import { Dot, Kbd } from "./controls";
 import { askedAgo } from "./Transcript";
@@ -17,8 +17,8 @@ function StateLine(props: { state: CardState }) {
     const s = props.state;
     switch (s.kind) {
       case "fresh": return null;
-      case "sending": return s.action === "allow" ? "Allowing…" : s.action === "deny" ? "Denying…" : s.action === "cancel" ? "Stopping the turn…" : "Sending your answer…";
-      case "sent": return s.action === "allow" ? "Allowed. Waiting for the agent." : s.action === "deny" ? "Denied. Waiting for the agent." : s.action === "cancel" ? "Stopping the turn…" : "Answered. Waiting for the agent.";
+      case "sending": return s.action === "allow" ? "Allowing…" : s.action === "deny" ? "Denying…" : s.action === "decline" ? "Declining…" : s.action === "cancel" ? "Stopping the turn…" : "Sending your answer…";
+      case "sent": return s.action === "allow" ? "Allowed. Waiting for the agent." : s.action === "deny" ? "Denied. Waiting for the agent." : s.action === "decline" ? "Declined. Waiting for the agent." : s.action === "cancel" ? "Stopping the turn…" : "Answered. Waiting for the agent.";
       default: return s.text;
     }
   };
@@ -167,6 +167,7 @@ export function QuestionCard(props: { threadId: string; item: QuestionItem; tick
       <Show when={canAct(state())}>
         <div class="ask-act">
           <button type="button" class="btn pri" classList={{ sm: props.small }} disabled={!ready()} onClick={submit}>Answer<Kbd>↵</Kbd></button>
+          <button type="button" class="btn ghost" classList={{ sm: props.small }} title="Tell the agent you don't want to answer and let its turn continue." onClick={() => void declineQuestion(props.threadId, props.item)}>Decline</button>
           <button type="button" class="btn ghost" classList={{ sm: props.small }} title="The agent gets no answer; its turn stops." onClick={() => void stopTurnForQuestion(props.threadId, props.item)}>Stop the turn</button>
         </div>
       </Show>

@@ -221,14 +221,14 @@ impl Inner {
         Ok(summary)
     }
 
-    fn session_config(
-        self: &Arc<Self>,
+    fn session_gate(
+        &self,
         thread: &ThreadId,
         incarnation: u32,
-        launch: &Launch,
-        process: &Arc<Process>,
-    ) -> SessionConfig {
-        let gate = SessionGate::new(
+        preset: Preset,
+        provider: Provider,
+    ) -> Arc<dyn atrium_agents::ToolGate> {
+        Arc::new(SessionGate::new(
             SessionGateConfig {
                 thread: thread.clone(),
                 incarnation,
@@ -236,13 +236,23 @@ impl Inner {
                 home: self.home.clone(),
                 atrium_data_paths: self.data_paths.clone(),
                 atrium_protected_paths: self.protected_paths.clone(),
-                preset: launch.preset,
-                provider: launch.provider,
+                preset,
+                provider,
             },
             self.policy.clone(),
             self.ledger.clone(),
             Arc::new(StoreRules(self.store.clone())),
-        );
+        ))
+    }
+
+    fn session_config(
+        self: &Arc<Self>,
+        thread: &ThreadId,
+        incarnation: u32,
+        launch: &Launch,
+        process: &Arc<Process>,
+    ) -> SessionConfig {
+        let gate = self.session_gate(thread, incarnation, launch.preset, launch.provider);
         // The process is recorded as soon as it exists, before the
         // handshake, so a daemon that dies meanwhile finds it at its next
         // start. The callback can't wait, so a task does the write.
@@ -268,7 +278,7 @@ impl Inner {
                 Preset::FullAccess => PermissionPolicy::FullAccess,
                 Preset::Careful | Preset::Normal | Preset::Trusted => PermissionPolicy::Ask,
             },
-            gate: Arc::new(gate),
+            gate,
             // MCP servers are the daemon's to add, never the client's; M1
             // has none.
             mcp_servers: Vec::new(),
@@ -583,7 +593,10 @@ async fn run(
     let mut stop = live.stop.subscribe();
     let process = Arc::new(Process::default());
     let started = match &launch.agent {
-        Agent::Fake(params) => Started::Session(fake::start(*params, launch.message.take())),
+        Agent::Fake(params) => {
+            let gate = inner.session_gate(&thread, incarnation, launch.preset, launch.provider);
+            Started::Session(fake::start(*params, launch.message.take(), gate))
+        }
         Agent::Native(adapter) => {
             let config = inner.session_config(&thread, incarnation, &launch, &process);
             tokio::select! {

@@ -560,3 +560,25 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **M1-13 sixth round (D-081) resumes** from the work-in-progress commit `87d6679` (not reset to `5a8c57c`), by the same Claude Opus 5.5 worker, whose conversation is continued. The plan is the branch handoff's "To resume": finish items 2, 4 and 5, then 1, 6 and 7, the "Sixth round" tables, the DoD; then a Hydrogen `high` re-review. Same recorded exception to PLAN §8.3 as D-080 and D-081.
 - **M1-08-codex-adapter: Gemini 4 Hydrogen `high`** (D-076; `high` because approvals are redeemed through the policy gate), replacing Argon in the brief. **Review: Opus 5.5, read-only** (cross-provider; Opus because of the gate path). Branch `agent/hydrogen/M1-08-codex-adapter`, worktree `../atrium-wt/M1-08-codex-adapter`. No live Codex run (the brief's X1–X3 stay for a live task).
 - **Effect on D-087:** the macOS benchmarks wait until both builds are quiet.
+
+## D-089 — 2026-11-15 — Pedro's go: M1-16 fix round
+**Decided by Pedro (driver):** "Yes, fix round". The Sonnet review (`reviews/M1-16-requests-and-notifications.md`) asked two fixes before merge: the fake approval must run `echo synthetic` as the contract says, and a test must pin that Allow redeems the ticket (the "skip `gate.redeem`" mutation survives). The same Hydrogen `high` worker also takes the minors that are its to fix (the racy wait in `requests_fake.rs`, the two untested edges, a silent skip when `question_ticket` returns `None`, and the handoff's wrong "blocked" notes). The contract's missing `RequestResolved` detail stays with the orchestrator. The orchestrator checks the fixes (the mutation re-run) and merges; no second review unless the fixes go beyond these.
+
+## D-090 — 2026-11-15 — Pedro's go: start M1-15 now, ahead of M1-13's merge
+**Decided by Pedro (driver):** "start m1-15 for now".
+- **M1-15-store-launch-recovery: Gemini 4 Hydrogen `high`** (D-074, D-076), **reviewed by Opus 5.5**, read-only. Branch `agent/hydrogen/M1-15-store-launch-recovery`, from `dev` after M1-16's merge. It carries CR-08, CR-10, M1-13's finding 12, N1–N3 and now **CR-09** (D-082), whose code is `attention::next_state` plus a daemon test.
+- **The brief's "M1-13 merged" dependency is waived.** M1-13's adversarial tests (its recovery tests among them) aren't on `dev`, so the worker can't run them. When M1-13 merges, the orchestrator runs them against M1-15's branch before M1-15 merges. M1-15 doesn't touch `policy/**`, so the two branches shouldn't conflict in code.
+- The brief was rewritten for this shift: the Linux-container rules became the `agy` policy's, and CR-09 was moved from "out of scope" to step 0.
+
+## D-091 — 2026-11-15 — Pedro's go: the small items (contract erratum, N8, N9)
+**Decided by Pedro (driver):** "lets fix those small itens".
+- **Contract erratum (rev 3.1, §6.2):** the sentence on an adapter that can't dismiss a question named a `RequestResolved` detail that doesn't exist. It now says: `RequestResolved { outcome: Cancelled }`, then `Error { fatal: false }` saying the provider can't dismiss a question, then the turn is interrupted. No wire change. Written by the orchestrator, found by M1-16's review.
+- **N8 → M1-07c-leader-sigkill: Claude Opus 5.5** (D-076's exception: process-signal code in `atrium-host`, possibly `unsafe`), **reviewed by Gemini 4 Hydrogen `high`**. Brief `briefs/M1-07c-leader-sigkill.md`.
+- **N9 (new in `m1-must-fix.md`, the daemon's silent exit) → M1-17-daemon-start-refusal: Gemini 4 Hydrogen `medium`**, reviewed by Sonnet 5.5. Brief `briefs/M1-17-daemon-start-refusal.md`.
+- **Not in this go:** the macOS benchmarks and font-preload A/B (D-087; they still wait for a quiet machine).
+
+## D-092 — 2026-11-15 — Pedro's go: M1-13 seventh round
+**Decided by Pedro (driver):** "Seventh round". The round-6 re-review (`reviews/M1-13-adversarial-round6.md`, Hydrogen `high`) says rework but converging: six blockers (none reaching Allow in Home with no rules), one major false hard deny. The same Claude Opus 5.5 worker fixes each by its invariant, not its spelling (the review's "Convergence assessment"), with tables of neighbouring spellings, then a Hydrogen `high` re-review. Same recorded exception to PLAN §8.3 as D-080, D-081 and D-088.
+
+## D-093 — 2026-11-15 — Pedro's go: M1-08 fix round
+**Decided by Pedro (driver):** "Yes, fix round". The Opus review (`reviews/M1-08-codex-adapter.md`: approve with changes) asked eight things before merge. The same Hydrogen `high` worker does them, starting by merging `dev` into its branch: the merge is allowed for this round only, because the branch predates M1-16 and doesn't compile on `dev` without handling `DeclineQuestion`. The orchestrator checks the fixes (re-running the two surviving mutations); a second Opus look only if the approval path changes beyond the review's asks.

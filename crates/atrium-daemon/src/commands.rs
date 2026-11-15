@@ -41,6 +41,18 @@ const MAX_SETTING_KEY_BYTES: usize = 128;
 /// The setting behind "keep agents running after quitting" (contract §10).
 pub const KEEP_RUNNING_SETTING: &str = "keep_agents_running";
 
+/// Notification switches (contract §8). On unless explicitly set to `false`.
+pub const NOTIFY_APPROVAL_SETTING: &str = "notify_approval";
+pub const NOTIFY_QUESTION_SETTING: &str = "notify_question";
+pub const NOTIFY_FAILED_SETTING: &str = "notify_failed";
+
+fn is_notify_setting(key: &str) -> bool {
+    matches!(
+        key,
+        NOTIFY_APPROVAL_SETTING | NOTIFY_QUESTION_SETTING | NOTIFY_FAILED_SETTING
+    )
+}
+
 /// How long one provider's probe may take.
 const PROBE_PATIENCE: Duration = Duration::from_secs(15);
 
@@ -249,6 +261,44 @@ pub(crate) async fn run(
                 .await?;
             Ok(Value::Null)
         }
+        DaemonCommand::DeclineQuestion {
+            thread_id,
+            incarnation,
+            request_id,
+        } => {
+            let key = RequestKey {
+                thread: thread_id.clone(),
+                incarnation,
+                request_id: request_id.clone(),
+            };
+            let live = inner.session_of(&thread_id, Some(incarnation));
+            let _resolving = match &live {
+                Ok(live) => Some(live.requests.lock().await),
+                Err(_) => None,
+            };
+            let requests = inner.store.requests();
+            match requests.current_incarnation(&thread_id).await {
+                Ok(Some(cur)) if incarnation == cur => {}
+                Ok(Some(_)) => return Err(ledger_failure(LedgerError::StaleIncarnation)),
+                Ok(None) => return Err(ledger_failure(LedgerError::Unknown)),
+                Err(_) => return Err(ledger_failure(LedgerError::Store)),
+            }
+            // Questions have no binding; an approval must not be dismissed through this door.
+            if requests
+                .binding(&key)
+                .await
+                .map_err(|_| ledger_failure(LedgerError::Store))?
+                .is_some()
+            {
+                return Err(ledger_failure(LedgerError::Unknown));
+            }
+            inner.ledger.withdraw(&key).await.map_err(ledger_failure)?;
+            live.as_ref()
+                .map_err(Clone::clone)?
+                .send(SessionCommand::DeclineQuestion { request_id })
+                .await?;
+            Ok(Value::Null)
+        }
         DaemonCommand::ResumeThread { thread_id } => resume_thread(inner, &thread_id).await,
         DaemonCommand::ArchiveThread { thread_id } => {
             inner.listed(&thread_id)?;
@@ -348,12 +398,16 @@ async fn start_thread(
             chunk_chars,
             duration_ms,
             tool_call_every_ms,
+            approval_at_ms,
+            question_at_ms,
         } => (
             Agent::Fake(fake::Params {
                 tokens_per_second,
                 chunk_chars,
                 duration_ms,
                 tool_call_every_ms,
+                approval_at_ms,
+                question_at_ms,
             }),
             fake::PROVIDER,
             None,
@@ -492,10 +546,12 @@ async fn thread_command(
             live.stop();
         }
         // These have their own commands, so the ledger sees them first.
-        SessionCommand::ResolveApproval { .. } | SessionCommand::AnswerQuestion { .. } => {
+        SessionCommand::ResolveApproval { .. }
+        | SessionCommand::AnswerQuestion { .. }
+        | SessionCommand::DeclineQuestion { .. } => {
             return Err(failure(
                 ErrorCode::Invalid,
-                "use ResolveApproval or AnswerQuestion",
+                "use ResolveApproval, AnswerQuestion, or DeclineQuestion",
             ));
         }
     }
@@ -617,6 +673,21 @@ async fn set_setting(inner: &Arc<Inner>, key: String, new: Value) -> Result<Valu
             }
             return Ok(Value::Null);
         }
+    }
+    if is_notify_setting(&key) {
+        let Value::Bool(enabled) = new else {
+            return Err(failure(
+                ErrorCode::Invalid,
+                format!("{key} is true or false"),
+            ));
+        };
+        inner
+            .store
+            .set_setting(&key, Value::Bool(enabled))
+            .await
+            .map_err(store_failure)?;
+        inner.hub().set_notify_setting(&key, enabled);
+        return Ok(Value::Null);
     }
     inner
         .store

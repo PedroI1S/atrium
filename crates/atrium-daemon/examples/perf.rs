@@ -170,6 +170,8 @@ fn fake(tokens: u64, tokens_per_second: u32) -> AgentLaunch {
         chunk_chars: 4,
         duration_ms: tokens * 1000 / u64::from(tokens_per_second),
         tool_call_every_ms: 0,
+        approval_at_ms: None,
+        question_at_ms: None,
     }
 }
 

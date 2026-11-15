@@ -1113,6 +1113,8 @@ async fn the_synthetic_agent_runs_turns_and_stops() {
         chunk_chars: 16,
         duration_ms,
         tool_call_every_ms: 100,
+        approval_at_ms: None,
+        question_at_ms: None,
     };
     let thread = wire.start_thread(fake(300), Some("hi")).await.thread_id;
     wire.thread_when(&thread, |summary| summary.state == ThreadState::Idle)
@@ -1218,6 +1220,8 @@ async fn the_synthetic_agent_runs_turns_and_stops() {
                 chunk_chars: 1,
                 duration_ms: 0,
                 tool_call_every_ms: 0,
+                approval_at_ms: None,
+                question_at_ms: None,
             },
             Some(&text),
         )
@@ -1505,6 +1509,8 @@ async fn the_synthetic_agent_says_when_it_does_not_queue_a_message() {
                 chunk_chars: 16,
                 duration_ms: 600_000,
                 tool_call_every_ms: 0,
+                approval_at_ms: None,
+                question_at_ms: None,
             },
             Some("hi"),
         )

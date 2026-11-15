@@ -48,7 +48,8 @@ call_id: string | null; name: string; kind: ToolKind; title: string | null; inpu
 rememberable?: boolean } | 
 /**
  *  The agent asked the user something. Answer with
- *  [`SessionCommand::AnswerQuestion`].
+ *  [`SessionCommand::AnswerQuestion`] or dismiss with
+ *  [`SessionCommand::DeclineQuestion`].
  */
 { type: "question_asked"; request_id: string; questions: Question[] } | 
 /**  Closes an `ApprovalRequested` or `QuestionAsked`. Exactly once each. */
@@ -108,7 +109,11 @@ preset: Preset } |
  *  `tokens_per_second` (1 token ≈ 4 chars) for `duration_ms`, with a tool
  *  call every `tool_call_every_ms` (0 = none), then `TurnCompleted`.
  */
-{ type: "fake"; tokens_per_second: number; chunk_chars: number; duration_ms: number; tool_call_every_ms: number };
+{ type: "fake"; tokens_per_second: number; chunk_chars: number; duration_ms: number; tool_call_every_ms: number; 
+/**  When set, ask one Bash approval at this offset (ms) into each turn. */
+approval_at_ms?: number | null; 
+/**  When set, ask one question at this offset (ms) into each turn. */
+question_at_ms?: number | null };
 
 export type ApprovalDecision = { type: "allow" } | 
 /**  `message` is passed to the agent as the reason, when the provider supports it. */
@@ -215,6 +220,12 @@ message: string | null } |
 { type: "resolve_approval"; thread_id: ThreadId; incarnation: number; request_id: string; decision: ApprovalDecision; remember: RememberScope | null } | 
 /**  Same ledger checks as `ResolveApproval`. */
 { type: "answer_question"; thread_id: ThreadId; incarnation: number; request_id: string; answers: QuestionAnswer[] } | 
+/**
+ *  Dismiss a pending question without stopping the turn. App-only.
+ *  Same ledger checks as `AnswerQuestion`, resolving as
+ *  [`crate::agent::RequestOutcome::Cancelled`].
+ */
+{ type: "decline_question"; thread_id: ThreadId; incarnation: number; request_id: string } | 
 /**
  *  Starts a new incarnation from the last native session id.
  *  Value: [`ThreadSummary`].
@@ -528,6 +539,8 @@ export type SessionCommand =
  *  `Error { fatal: false }`.
  */
 { type: "send_user_message"; text: string } | { type: "resolve_approval"; request_id: string; decision: ApprovalDecision } | { type: "answer_question"; request_id: string; answers: QuestionAnswer[] } | 
+/**  Dismiss a pending question so the turn can continue without an answer. */
+{ type: "decline_question"; request_id: string } | 
 /**  Stop the current turn; the session stays usable. */
 { type: "interrupt" } | 
 /**  End the session and the provider process. */

@@ -253,6 +253,14 @@ pub enum DaemonCommand {
         request_id: String,
         answers: Vec<QuestionAnswer>,
     },
+    /// Dismiss a pending question without stopping the turn. App-only.
+    /// Same ledger checks as `AnswerQuestion`, resolving as
+    /// [`crate::agent::RequestOutcome::Cancelled`].
+    DeclineQuestion {
+        thread_id: ThreadId,
+        incarnation: u32,
+        request_id: String,
+    },
     /// Starts a new incarnation from the last native session id.
     /// Value: [`ThreadSummary`].
     ResumeThread {
@@ -351,6 +359,12 @@ pub enum AgentLaunch {
         chunk_chars: u32,
         duration_ms: u64,
         tool_call_every_ms: u64,
+        /// When set, ask one Bash approval at this offset (ms) into each turn.
+        #[serde(default)]
+        approval_at_ms: Option<u64>,
+        /// When set, ask one question at this offset (ms) into each turn.
+        #[serde(default)]
+        question_at_ms: Option<u64>,
     },
 }
 

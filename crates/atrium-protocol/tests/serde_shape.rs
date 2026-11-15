@@ -529,6 +529,16 @@ fn agent_session_commands() {
         }),
     );
 
+    round_trip(
+        &SessionCommand::DeclineQuestion {
+            request_id: "q1".into(),
+        },
+        json!({
+            "type": "decline_question",
+            "request_id": "q1"
+        }),
+    );
+
     round_trip(&SessionCommand::Interrupt, json!({"type": "interrupt"}));
     round_trip(&SessionCommand::Shutdown, json!({"type": "shutdown"}));
 }
@@ -874,13 +884,36 @@ fn wire_types_and_messages() {
             chunk_chars: 4,
             duration_ms: 5000,
             tool_call_every_ms: 1000,
+            approval_at_ms: None,
+            question_at_ms: None,
         },
         json!({
             "type": "fake",
             "tokens_per_second": 100,
             "chunk_chars": 4,
             "duration_ms": 5000,
-            "tool_call_every_ms": 1000
+            "tool_call_every_ms": 1000,
+            "approval_at_ms": null,
+            "question_at_ms": null
+        }),
+    );
+    round_trip(
+        &AgentLaunch::Fake {
+            tokens_per_second: 100,
+            chunk_chars: 4,
+            duration_ms: 5000,
+            tool_call_every_ms: 1000,
+            approval_at_ms: Some(250),
+            question_at_ms: Some(500),
+        },
+        json!({
+            "type": "fake",
+            "tokens_per_second": 100,
+            "chunk_chars": 4,
+            "duration_ms": 5000,
+            "tool_call_every_ms": 1000,
+            "approval_at_ms": 250,
+            "question_at_ms": 500
         }),
     );
 
@@ -1055,6 +1088,19 @@ fn wire_client_messages_and_daemon_commands() {
             "incarnation": 1,
             "request_id": "q1",
             "answers": []
+        }),
+    );
+    round_trip(
+        &DaemonCommand::DeclineQuestion {
+            thread_id: ThreadId("t1".into()),
+            incarnation: 1,
+            request_id: "q1".into(),
+        },
+        json!({
+            "type": "decline_question",
+            "thread_id": "t1",
+            "incarnation": 1,
+            "request_id": "q1"
         }),
     );
     round_trip(
@@ -1480,6 +1526,27 @@ fn serde_default_fields_omitted() {
             question_id: "q1".into(),
             selected: vec![],
             text: Some("my custom answer".into()),
+        }
+    );
+
+    // 7. AgentLaunch::Fake with `approval_at_ms` and `question_at_ms` omitted
+    let json_fake = json!({
+        "type": "fake",
+        "tokens_per_second": 100,
+        "chunk_chars": 4,
+        "duration_ms": 5000,
+        "tool_call_every_ms": 1000
+    });
+    let launch: AgentLaunch = serde_json::from_value(json_fake).unwrap();
+    assert_eq!(
+        launch,
+        AgentLaunch::Fake {
+            tokens_per_second: 100,
+            chunk_chars: 4,
+            duration_ms: 5000,
+            tool_call_every_ms: 1000,
+            approval_at_ms: None,
+            question_at_ms: None,
         }
     );
 }

@@ -1081,6 +1081,43 @@ fn a_question_is_shown_only_with_the_gates_ticket() {
 }
 
 #[test]
+fn a_question_can_be_declined_without_ending_the_turn() {
+    let (mut n, _) = started();
+    run(&mut n, vec![ask_question("r1", "q1")]);
+    let evs = run(
+        &mut n,
+        vec![question_ticket("r1", Some(ticket("Q1", false)))],
+    );
+    assert!(
+        matches!(&evs[..], [AgentEvent::QuestionAsked { request_id, .. }] if request_id == "Q1"),
+        "{evs:?}"
+    );
+    let evs = run(
+        &mut n,
+        vec![command(SessionCommand::DeclineQuestion {
+            request_id: "Q1".into(),
+        })],
+    );
+    assert!(
+        matches!(
+            &evs[..],
+            [AgentEvent::RequestResolved {
+                request_id,
+                outcome: RequestOutcome::Cancelled,
+            }] if request_id == "Q1"
+        ),
+        "{evs:?}"
+    );
+    let evs = run(
+        &mut n,
+        vec![command(SessionCommand::DeclineQuestion {
+            request_id: "Q1".into(),
+        })],
+    );
+    assert!(matches!(&evs[..], [AgentEvent::Error { fatal: false, .. }]));
+}
+
+#[test]
 fn a_declined_question_is_never_shown() {
     let (mut n, _) = started();
     run(&mut n, vec![ask_question("r1", "q1")]);
