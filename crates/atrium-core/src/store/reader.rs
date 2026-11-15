@@ -122,39 +122,41 @@ pub(crate) fn resume_id(c: &Connection, thread: &ThreadId) -> StoreResult<Option
 }
 
 pub(crate) fn launch(c: &Connection, thread: &ThreadId) -> StoreResult<Option<NewThread>> {
-    let row: Option<(
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-        String,
-    )> = c
+    struct LaunchRow {
+        provider: String,
+        model: Option<String>,
+        effort: Option<String>,
+        preset: String,
+        location: String,
+        title: String,
+    }
+
+    let row = c
         .query_row(
             "SELECT provider, model, effort, preset, location, title \
              FROM threads WHERE thread_id = ?1",
             [&thread.0],
             |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
+                Ok(LaunchRow {
+                    provider: r.get(0)?,
+                    model: r.get(1)?,
+                    effort: r.get(2)?,
+                    preset: r.get(3)?,
+                    location: r.get(4)?,
+                    title: r.get(5)?,
+                })
             },
         )
         .optional()
         .map_err(sql_err)?;
     match row {
-        Some((provider, model, effort, preset, location, title)) => Ok(Some(NewThread {
-            provider: str_enum(&provider)?,
-            model,
-            effort,
-            preset: str_enum(&preset)?,
-            location: from_json(&location)?,
-            title,
+        Some(row) => Ok(Some(NewThread {
+            provider: str_enum(&row.provider)?,
+            model: row.model,
+            effort: row.effort,
+            preset: str_enum(&row.preset)?,
+            location: from_json(&row.location)?,
+            title: row.title,
         })),
         None => Ok(None),
     }
