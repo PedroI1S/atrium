@@ -1,9 +1,9 @@
 # M1-14b-linux-app: Linux checks for the app (L1, L2 harness, L3 profiling)
 
-Model: Claude Opus 5.5 (D-069; it was Claude Fable 5.2 under D-065) · Reviewer: Gemini 4 Hydrogen (D-068; read-only, with the numbers and screenshots) · Depends on: M1-09a (merged), **M1-09b merged** (it owns `app/src/**` and `app/scripts/**` until then)
-Go: D-059 (rodrigo), D-066 · Branch: `agent/fable/M1-14b-linux-app` · Worktree: `../atrium-wt/M1-14b-linux-app`
+Model: Claude Opus 5.5 (D-069, D-085: not Hydrogen, because it needs a GUI and `python3`, outside the `agy` allowlist) · Reviewer: Gemini 4 Hydrogen `medium` (D-068, D-084; read-only, with the numbers and screenshots) · Depends on: M1-09a (merged), **M1-09b merged** (it owns `app/src/**` and `app/scripts/**` until then)
+Go: D-059 (rodrigo), D-066, D-085 · Branch: `agent/opus/M1-14b-linux-app` · Worktree: `../atrium-wt/M1-14b-linux-app`
 
-The second half of M1-14 (contract §15). The first half, M1-14a, covers the host crate and the daemon. **Not dispatched until M1-09b is merged into `dev`.**
+The second half of M1-14 (contract §15). The first half, M1-14a, covers the host crate and the daemon (merged). M1-09b is merged (D-072).
 
 ## Goal
 Make the app's Linux numbers real and repeatable: the harnesses report what D-040 budgets, WebKitGTK's startup is profiled so the driver can decide D-041's open point, and M1-09a's scripts and M1-09b's runs are checked on Linux.
@@ -26,6 +26,7 @@ Make the app's Linux numbers real and repeatable: the harnesses report what D-04
 1. **L1.** On Linux, Settings → Appearance says "Atrium uses opaque windows on Linux" for blur strength, and nothing blames the compositor. Check what M1-09a shipped; fix what is off; screenshot.
 2. **L2.** `startup_bench.py` on Linux reports private PSS as the budgeted number, with full PSS, RSS and GPU memory (DRM fdinfo) beside it, summed over the app and its WebKit processes, with §14's statistics. Add the cost of one pop-out window (measured, not capped). Run it and report.
 3. **L3.** Profile WebKitGTK startup with marks for: process start → `main`, `main` → first JS, SolidJS mount, input-ready, first paint. 30 warm launches, median and p90 per phase, release build. Say which phase can be shortened and by what (name the change and its measured effect if you try it); don't land a risky startup change without the numbers. End with a recommendation for D-041: whether 400 ms can become a gate on Linux.
+   **Idle memory (D-085):** on this machine M1-09a's shell idles at 219–223 MiB private PSS and M1-09b at 212–216 MiB (gate 150 MB, one window). Break it down by process (UI, WebKit web and network processes) and by mapping where you can (`smaps_rollup`, `smaps`), say what is WebKitGTK's floor and what is Atrium's, and what a change could reach. Bring numbers; the gate decision is the drivers'.
 4. **M1-09a's and M1-09b's runs on Linux:** `live_check.py`, `screenshots.py`, M1-09b's streaming run (§14: 10 threads × 1k tok/s × 30 s). Report pass/fail and numbers. The tray can't be checked on this desktop (no tray support): say so, don't work around it.
 
 ## Definition of Done

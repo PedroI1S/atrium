@@ -521,3 +521,20 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - The orchestrator wrote **contract revision 3.1** (`docs/contracts/m1.md`): the five CRs of D-082 in §6.2, §8 and §9, each marked "(rev 3.1)".
 - **Orchestrator's call, for Pedro to overturn:** `PROTOCOL_VERSION` goes from 1 to 2, because `DeclineQuestion` is a command a version-1 daemon doesn't know; an app and a daemon of different versions then meet as `Incompatible` and §10's replacement runs, instead of the command failing at random.
 - CR-09 goes into M1-15; CR-12 into a policy task after M1-13 merges.
+
+## D-084 — 2026-11-15 — rodrigo's shifts adopt Pedro's routing (D-073, D-074, D-076)
+**Decided by rodrigo (driver).** rodrigo asked to copy Pedro's agent routing and use it on his own shifts. From this shift on, **rodrigo's shifts route work exactly as Pedro's do**:
+- **Gemini 4 Hydrogen first** (D-076): every new task, review or follow-up goes to Hydrogen through `scripts/agent-run agy` (`medium`; `high` for security, `unsafe` and escalation work), unless it needs `python3`, a GUI or another command outside the `agy` allowlist; writes path-like text the policy refuses; is a security fix, an `unsafe` change or a contract change; or Hydrogen already failed it. Those keep their Claude routing.
+- **Hydrogen takes the Flash and Argon jobs** (D-073), work, reviews and escalations.
+- **Security-test writing goes to Claude** (D-074); Hydrogen takes the Claude work it can do within the policy.
+- **The rest of D-060 that D-073 kept**: Codex → Sonnet 5.5, GPT-6 Astra → Opus 5.5, GPT-6.1 Sol → Sonnet 5.5 or Hydrogen. rodrigo's accounts are not out of usage, so he can bring Codex, Sol or Argon back for a task by saying so.
+- **Reviews stay cross-provider:** Hydrogen reviews Claude's work; Claude (Sonnet 5.5 by default, Opus 5.5 for security) reviews Hydrogen's. At most four Hydrogen jobs at once (D-068).
+- **Kept from rodrigo's own decisions:** Opus 5.5 is the orchestrator (D-069), parallel workers (D-065), a worker that hits a usage limit is paused, not re-routed.
+- **Replaces** D-064's "the original workflow holds on rodrigo's shifts" and D-069's Hydrogen list; both shifts now follow the same routing. Pedro's later routing decisions do not carry over automatically: each driver records his own.
+
+## D-085 — 2026-11-15 — rodrigo's go: M1-14b-linux-app
+**Decided by rodrigo (driver).** Go for M1-14b-linux-app (brief `briefs/M1-14b-linux-app.md`, D-059, D-066), unblocked by M1-09b's merge (D-072).
+- **Worker: Claude Opus 5.5** (Claude subagent), not Hydrogen: the task needs a GUI and `python3`, both outside the `agy` allowlist (D-076's first exception). Branch `agent/opus/M1-14b-linux-app` (D-069), worktree `../atrium-wt/M1-14b-linux-app`.
+- **Review: Gemini 4 Hydrogen `medium`, read-only**, with the numbers and screenshots (cross-provider, D-084).
+- **Added to the brief:** the Linux idle memory (M1-09a's shell 219–223 MiB, M1-09b 212–216 MiB private PSS, gate 150 MB) is part of L3: say where the memory goes and what is reachable.
+- **Not in this go:** batching events in `bridge.rs`, the §14 frame-statistic wording on Linux and the idle-memory gate itself: those stay open decisions; the worker brings numbers for them.
