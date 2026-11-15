@@ -193,6 +193,9 @@ pub trait Store: Send + Sync {
     /// The native session id of the latest incarnation that has one.
     fn resume_id(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<Option<String>>>;
 
+    /// The thread's launch settings (with its current title), or `None` if unknown.
+    fn launch(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<Option<NewThread>>>;
+
     fn open_items(
         &self,
         thread: &ThreadId,

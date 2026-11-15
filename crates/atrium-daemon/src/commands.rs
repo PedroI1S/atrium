@@ -494,14 +494,18 @@ async fn resume_thread(inner: &Arc<Inner>, thread: &ThreadId) -> Result<Value, F
             .await
             .map_err(store_failure)?;
     }
-    // The store doesn't give back the effort and preset a thread was
-    // started with (CR-08): Home, M1's only preset in use, and no effort.
+    let stored = inner
+        .store
+        .launch(thread)
+        .await
+        .map_err(store_failure)?
+        .ok_or_else(|| failure(ErrorCode::UnknownThread, format!("unknown thread {thread:?}")))?;
     let launch = Launch {
         agent: Agent::Native(adapter),
-        provider: summary.provider,
-        model: summary.model,
-        effort: None,
-        preset: Preset::Home,
+        provider: stored.provider,
+        model: stored.model,
+        effort: stored.effort,
+        preset: stored.preset,
         resume: Some(resume),
         message: None,
     };

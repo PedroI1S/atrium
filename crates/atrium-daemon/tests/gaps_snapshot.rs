@@ -145,6 +145,10 @@ impl Store for GatedStore {
         self.inner.resume_id(thread)
     }
 
+    fn launch(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<Option<NewThread>>> {
+        self.inner.launch(thread)
+    }
+
     fn open_items(
         &self,
         thread: &ThreadId,

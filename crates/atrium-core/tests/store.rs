@@ -1983,3 +1983,30 @@ async fn concurrent_reads_and_writes_complete() {
     }
     assert_eq!(store.events_after(&t, None, 1000).await.unwrap().len(), 200);
 }
+
+#[tokio::test]
+async fn launch_reads_stored_launch_fields_and_current_title() {
+    let fx = Fixture::new();
+    let store = fx.open().await;
+    assert_eq!(store.launch(&ThreadId("missing".into())).await.unwrap(), None);
+
+    let new = NewThread {
+        provider: Provider::Claude,
+        model: Some("claude-sonnet".into()),
+        effort: Some("high".into()),
+        preset: Preset::FullAccess,
+        location: Location::Home,
+        title: "initial".into(),
+    };
+    let created = store.create_thread(new.clone()).await.unwrap();
+    assert_eq!(store.launch(&created.thread_id).await.unwrap(), Some(new.clone()));
+
+    store.rename(&created.thread_id, "renamed").await.unwrap();
+    assert_eq!(
+        store.launch(&created.thread_id).await.unwrap(),
+        Some(NewThread {
+            title: "renamed".into(),
+            ..new
+        })
+    );
+}

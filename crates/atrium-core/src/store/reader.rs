@@ -10,9 +10,9 @@ use atrium_protocol::wire::{EventId, StoredEvent};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 
-use super::codec::{from_json, stored_event};
+use super::codec::{from_json, stored_event, str_enum};
 use super::sql_err;
-use crate::StoreResult;
+use crate::{NewThread, StoreResult};
 use atrium_protocol::limits;
 
 pub(crate) struct ReaderPool {
@@ -119,6 +119,38 @@ pub(crate) fn resume_id(c: &Connection, thread: &ThreadId) -> StoreResult<Option
     )
     .optional()
     .map_err(sql_err)
+}
+
+pub(crate) fn launch(c: &Connection, thread: &ThreadId) -> StoreResult<Option<NewThread>> {
+    let row: Option<(String, Option<String>, Option<String>, String, String, String)> = c
+        .query_row(
+            "SELECT provider, model, effort, preset, location, title \
+             FROM threads WHERE thread_id = ?1",
+            [&thread.0],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_err)?;
+    match row {
+        Some((provider, model, effort, preset, location, title)) => Ok(Some(NewThread {
+            provider: str_enum(&provider)?,
+            model,
+            effort,
+            preset: str_enum(&preset)?,
+            location: from_json(&location)?,
+            title,
+        })),
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn live_processes(c: &Connection) -> StoreResult<Vec<(ThreadId, u32, ProcessIdentity)>> {

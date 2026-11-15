@@ -367,6 +367,11 @@ impl Store for SqliteStore {
         self.shared.read(move |c| reader::resume_id(c, &thread))
     }
 
+    fn launch(&self, thread: &ThreadId) -> BoxFuture<'_, StoreResult<Option<NewThread>>> {
+        let thread = thread.clone();
+        self.shared.read(move |c| reader::launch(c, &thread))
+    }
+
     fn open_items(
         &self,
         thread: &ThreadId,

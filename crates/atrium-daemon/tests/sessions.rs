@@ -10,11 +10,11 @@ use std::time::Duration;
 use atrium_agents::GateDecision;
 use atrium_daemon::{KEEP_RUNNING_SETTING, NotifyReason};
 use atrium_protocol::agent::{
-    AgentEvent, ApprovalDecision, MessageBody, MessageKind, Question, QuestionAnswer,
+    AgentEvent, ApprovalDecision, MessageBody, MessageKind, Provider, Question, QuestionAnswer,
     RequestOutcome, SessionCommand, ToolKind, ToolStatus, TurnOutcome,
 };
 use atrium_protocol::policy::{
-    RememberScope, Rule, RuleDecision, RuleDraft, RuleMatcher, RuleOrigin, RuleScope,
+    Preset, RememberScope, Rule, RuleDecision, RuleDraft, RuleMatcher, RuleOrigin, RuleScope,
 };
 use atrium_protocol::thread::{Cleanup, InboxItem, InboxReason, ThreadId, ThreadState};
 use atrium_protocol::wire::{
@@ -1589,5 +1589,63 @@ async fn a_stopped_session_with_unverified_cleanup_becomes_interrupted() {
     assert!(inbox(&mut wire).await.iter().any(|item| {
         item.reason == InboxReason::CleanupUnverified && item.thread_id.as_ref() == Some(&thread)
     }));
+    rig.stop(true).await;
+}
+
+#[tokio::test]
+async fn resume_keeps_effort_and_non_home_preset() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    let launch = AgentLaunch::Native {
+        provider: Provider::Claude,
+        model: Some("claude-sonnet".into()),
+        effort: Some("high".into()),
+        preset: Preset::FullAccess,
+    };
+    let thread = wire.start_thread(launch, Some("go")).await.thread_id;
+    let mut script = rig.script().await;
+    assert_eq!(script.config.model.as_deref(), Some("claude-sonnet"));
+    assert_eq!(script.config.effort.as_deref(), Some("high"));
+    assert_eq!(
+        script.config.permissions,
+        atrium_agents::PermissionPolicy::FullAccess
+    );
+    assert_eq!(
+        script
+            .config
+            .gate
+            .check(&Script::write_check(1, "a.txt"))
+            .await,
+        GateDecision::Allow
+    );
+    script.command().await;
+    script.started("native-1").await;
+    script.ended(Some(0)).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Ended)
+        .await;
+
+    wire.ok(DaemonCommand::ResumeThread {
+        thread_id: thread.clone(),
+    })
+    .await;
+    let mut resumed = rig.script().await;
+    assert_eq!(resumed.config.model.as_deref(), Some("claude-sonnet"));
+    assert_eq!(resumed.config.effort.as_deref(), Some("high"));
+    assert_eq!(
+        resumed.config.permissions,
+        atrium_agents::PermissionPolicy::FullAccess
+    );
+    assert_eq!(
+        resumed
+            .config
+            .gate
+            .check(&Script::write_check(1, "a.txt"))
+            .await,
+        GateDecision::Allow
+    );
+    resumed.started("native-1").await;
+    resumed.ended(Some(0)).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Ended)
+        .await;
     rig.stop(true).await;
 }
