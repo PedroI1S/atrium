@@ -860,12 +860,26 @@ async fn the_inbox_stream_follows_threads_without_following_every_token() {
         .await,
         ErrorCode::Invalid
     );
-    watcher.ok(DaemonCommand::ListInbox).await;
-    let seen: Vec<ServerMessage> = watcher.aside.drain(..).collect();
-    let last = updates_of(&seen, &thread).pop().expect("an update");
-    assert!(!last.unread);
-    assert_eq!(last.title, "Build fix");
-    assert!(seen.contains(&ServerMessage::InboxUpdated { items: Vec::new() }));
+    let mut saw_cleared_inbox = false;
+    let mut saw_renamed = false;
+    soon(async {
+        while !(saw_cleared_inbox && saw_renamed) {
+            match watcher.next().await {
+                ServerMessage::InboxUpdated { items } if items.is_empty() => {
+                    saw_cleared_inbox = true;
+                }
+                ServerMessage::ThreadUpdated { summary }
+                    if summary.thread_id == thread
+                        && !summary.unread
+                        && summary.title == "Build fix" =>
+                {
+                    saw_renamed = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
 
     // An approval is in the inbox and posts a notification, once.
     script.ask(1, "a.txt").await;

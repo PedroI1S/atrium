@@ -468,14 +468,25 @@ async fn resume_thread(inner: &Arc<Inner>, thread: &ThreadId) -> Result<Value, F
             "a synthetic thread can't be resumed",
         ));
     }
+    let stored = inner
+        .store
+        .launch(thread)
+        .await
+        .map_err(store_failure)?
+        .ok_or_else(|| {
+            failure(
+                ErrorCode::UnknownThread,
+                format!("unknown thread {thread:?}"),
+            )
+        })?;
     let adapter = inner
         .adapters
-        .get(&summary.provider)
+        .get(&stored.provider)
         .cloned()
         .ok_or_else(|| {
             failure(
                 ErrorCode::Invalid,
-                format!("no adapter for {:?} in this daemon", summary.provider),
+                format!("no adapter for {:?} in this daemon", stored.provider),
             )
         })?;
     // Wait for any already-ending session on this thread to complete its final
@@ -497,17 +508,6 @@ async fn resume_thread(inner: &Arc<Inner>, thread: &ThreadId) -> Result<Value, F
             .await
             .map_err(store_failure)?;
     }
-    let stored = inner
-        .store
-        .launch(thread)
-        .await
-        .map_err(store_failure)?
-        .ok_or_else(|| {
-            failure(
-                ErrorCode::UnknownThread,
-                format!("unknown thread {thread:?}"),
-            )
-        })?;
     let launch = Launch {
         agent: Agent::Native(adapter),
         provider: stored.provider,

@@ -701,3 +701,127 @@ async fn a_thread_stopped_while_starting_with_unverified_process_is_recovered() 
     assert_eq!(history, ["session_ended"]);
     assert_recorded_processes_count(&rig.paths.store, 0).await;
 }
+
+#[tokio::test]
+async fn process_records_on_ended_or_exited_incarnations_are_cleared() {
+    let folder = common::folder();
+    let paths = common::paths(folder.path());
+    atrium_host::lifecycle::secure_dir(&paths.data_dir).expect("secures data dir");
+
+    let mut cmd_a = tokio::process::Command::new("sleep");
+    cmd_a.arg("600");
+    let mut proc_a = atrium_host::supervise::spawn_group(cmd_a).expect("spawns sleep a");
+    let mut cmd_b = tokio::process::Command::new("sleep");
+    cmd_b.arg("600");
+    let mut proc_b = atrium_host::supervise::spawn_group(cmd_b).expect("spawns sleep b");
+
+    let (ended_thread, exited_thread) = {
+        let store = SqliteStore::open(&paths.store, StoreOptions::default())
+            .await
+            .expect("opens store");
+        let ended_thread = store
+            .create_thread(NewThread {
+                provider: Provider::Claude,
+                model: None,
+                effort: None,
+                preset: Preset::Home,
+                location: Location::Home,
+                title: "session-ended-clears-process".into(),
+            })
+            .await
+            .expect("creates ended thread")
+            .thread_id;
+        let inc_a = store
+            .begin_incarnation(&ended_thread)
+            .await
+            .expect("begins inc a");
+        store
+            .set_process(&ended_thread, inc_a, Some(proc_a.identity.clone()))
+            .await
+            .expect("records proc a");
+        store
+            .append(
+                &ended_thread,
+                inc_a,
+                vec![AgentEventEnvelope {
+                    incarnation: inc_a,
+                    seq: 0,
+                    at_ms: 1,
+                    event: AgentEvent::SessionEnded {
+                        exit_code: Some(0),
+                        reason: None,
+                    },
+                }],
+            )
+            .await
+            .expect("appends SessionEnded");
+
+        let exited_thread = store
+            .create_thread(NewThread {
+                provider: Provider::Claude,
+                model: None,
+                effort: None,
+                preset: Preset::Home,
+                location: Location::Home,
+                title: "exited-signal-clears-process-on-recovery".into(),
+            })
+            .await
+            .expect("creates exited thread")
+            .thread_id;
+        let inc_b = store
+            .begin_incarnation(&exited_thread)
+            .await
+            .expect("begins inc b");
+        store
+            .set_process(&exited_thread, inc_b, Some(proc_b.identity.clone()))
+            .await
+            .expect("records proc b");
+        store
+            .append(
+                &exited_thread,
+                inc_b,
+                vec![AgentEventEnvelope {
+                    incarnation: inc_b,
+                    seq: 0,
+                    at_ms: 1,
+                    event: AgentEvent::TurnStarted { turn: 1 },
+                }],
+            )
+            .await
+            .expect("appends TurnStarted");
+        // Sets `sessions.ended_ms` before `SessionEnded` is stored (simulating
+        // a crash before `close_incarnation` and `set_process(None)` run).
+        store
+            .signal(&exited_thread, Signal::Exited { code: Some(0) })
+            .await
+            .expect("signals exited");
+        assert!(store.live_processes().await.expect("live").is_empty());
+        assert_eq!(
+            store.unfinished_incarnations().await.expect("unfinished"),
+            vec![(exited_thread.clone(), inc_b)]
+        );
+        (ended_thread, exited_thread)
+    };
+
+    // Thread A's `sessions.process` was already cleared atomically by SessionEnded;
+    // only thread B still has a process record before recovery.
+    assert_recorded_processes_count(&paths.store, 1).await;
+
+    let mut rig = Rig::in_folder(folder);
+    rig.boot(|_| {}).await;
+    let mut wire = rig.dev().await;
+    assert_eq!(wire.thread(&ended_thread).await.state, ThreadState::Ended);
+    assert_eq!(wire.thread(&exited_thread).await.state, ThreadState::Ended);
+    assert_eq!(
+        kinds(&wire.history(&exited_thread).await),
+        ["turn_started", "turn_completed", "session_ended"]
+    );
+    drop(wire);
+    rig.stop(true).await;
+
+    let _ = proc_a.child.kill().await;
+    let _ = proc_a.child.wait().await;
+    let _ = proc_b.child.kill().await;
+    let _ = proc_b.child.wait().await;
+    assert_recorded_processes_count(&rig.paths.store, 0).await;
+}
