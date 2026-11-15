@@ -4,48 +4,136 @@
     "provider": "codex",
     "native_session_id": "thread-fixture",
     "model": "fixture-model",
-    "tools": []
+    "tools": [],
+    "enforcement": {
+      "level": "partial",
+      "reasons": [
+        {
+          "code": "class_not_intercepted",
+          "message": "Read calls: ProviderGated"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Edit calls: Unknown"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Delete calls: Unknown"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Move calls: Unknown"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Search calls: Unknown"
+        },
+        {
+          "code": "class_not_intercepted",
+          "message": "Execute calls: ProviderGated"
+        },
+        {
+          "code": "class_not_intercepted",
+          "message": "Fetch calls: NotIntercepted"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Mcp calls: Unknown"
+        },
+        {
+          "code": "class_not_intercepted",
+          "message": "Subagent calls: NotIntercepted"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "ProviderSpecific calls: Unknown"
+        }
+      ],
+      "provider": "codex",
+      "cli_version": "0.163.0",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "provider_gated",
+          "evidence": "fixtures/agents/codex/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "delete",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "move",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "search",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "execute",
+          "coverage": "provider_gated",
+          "evidence": "fixtures/agents/codex/gate-deny-execute"
+        },
+        {
+          "class": "fetch",
+          "coverage": "not_intercepted",
+          "evidence": null
+        },
+        {
+          "class": "mcp",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "subagent",
+          "coverage": "not_intercepted",
+          "evidence": null
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "unknown",
+          "evidence": null
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
   },
   {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Reply with exactly hello."
+    }
+  },
+  {
     "type": "quota_updated",
     "windows": [
       {
-        "name": "primary",
+        "name": "5h",
         "used_percent": 45.0,
         "resets_at_ms": 1800000000000
       },
       {
-        "name": "secondary",
+        "name": "7d",
         "used_percent": 10.0,
         "resets_at_ms": 1800500000000
       }
     ]
-  },
-  {
-    "type": "usage",
-    "usage": {
-      "input_tokens": 10,
-      "output_tokens": 2,
-      "cache_read_tokens": 1,
-      "cache_write_tokens": 0,
-      "reasoning_tokens": 1,
-      "cost_usd": null
-    }
-  },
-  {
-    "type": "usage",
-    "usage": {
-      "input_tokens": 25,
-      "output_tokens": 2,
-      "cache_read_tokens": 1,
-      "cache_write_tokens": 0,
-      "reasoning_tokens": 1,
-      "cost_usd": null
-    }
   },
   {
     "type": "plan_updated",
@@ -58,15 +146,20 @@
   },
   {
     "type": "message_delta",
-    "message_id": "reason-1:summary",
+    "message_id": "reason-1",
     "kind": "reasoning",
     "text": "Thinking."
   },
   {
     "type": "message_completed",
-    "message_id": "reason-1:summary",
+    "message_id": "reason-1",
     "kind": "reasoning",
-    "text": "Thinking."
+    "body": {
+      "type": "streamed",
+      "chars": 9,
+      "deltas": 1,
+      "sha256": "c1c34e78fef31c012b4191b8f7c2e91d8f3334d58ef2206050c2d104b3af3204"
+    }
   },
   {
     "type": "unmapped",
@@ -88,7 +181,28 @@
     "type": "message_completed",
     "message_id": "message-1",
     "kind": "assistant",
-    "text": "hello"
+    "body": {
+      "type": "streamed",
+      "chars": 5,
+      "deltas": 1,
+      "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    }
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 12,
+    "window_tokens": null
+  },
+  {
+    "type": "usage",
+    "usage": {
+      "input_tokens": 25,
+      "output_tokens": 2,
+      "cache_read_tokens": 1,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
+      "cost_usd": null
+    }
   },
   {
     "type": "turn_completed",
@@ -98,8 +212,8 @@
       "input_tokens": 25,
       "output_tokens": 2,
       "cache_read_tokens": 1,
-      "cache_write_tokens": 0,
-      "reasoning_tokens": 1,
+      "cache_write_tokens": null,
+      "reasoning_tokens": null,
       "cost_usd": null
     }
   },
@@ -108,20 +222,40 @@
     "turn": 2
   },
   {
+    "type": "message_completed",
+    "message_id": "user:2",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "again"
+    }
+  },
+  {
+    "type": "rate_limited",
+    "resets_at_ms": 1800500000000,
+    "message": "quota exhausted"
+  },
+  {
+    "type": "error",
+    "message": "quota exhausted",
+    "fatal": false,
+    "details": []
+  },
+  {
+    "type": "context_updated",
+    "used_tokens": 8,
+    "window_tokens": null
+  },
+  {
     "type": "usage",
     "usage": {
       "input_tokens": 5,
       "output_tokens": 3,
       "cache_read_tokens": 1,
       "cache_write_tokens": null,
-      "reasoning_tokens": 0,
+      "reasoning_tokens": null,
       "cost_usd": null
     }
-  },
-  {
-    "type": "rate_limited",
-    "resets_at_ms": 1800000000000,
-    "message": "quota exhausted"
   },
   {
     "type": "turn_completed",
@@ -132,13 +266,13 @@
       "output_tokens": 3,
       "cache_read_tokens": 1,
       "cache_write_tokens": null,
-      "reasoning_tokens": 0,
+      "reasoning_tokens": null,
       "cost_usd": null
     }
   },
   {
     "type": "session_ended",
     "exit_code": 0,
-    "reason": null
+    "reason": "shutdown"
   }
 ]

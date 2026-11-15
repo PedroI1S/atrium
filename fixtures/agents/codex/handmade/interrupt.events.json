@@ -4,11 +4,121 @@
     "provider": "codex",
     "native_session_id": "thread-fixture",
     "model": "fixture-model",
-    "tools": []
+    "tools": [],
+    "enforcement": {
+      "level": "partial",
+      "reasons": [
+        {
+          "code": "class_not_intercepted",
+          "message": "Read calls: ProviderGated"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Edit calls: Unknown"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Delete calls: Unknown"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Move calls: Unknown"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Search calls: Unknown"
+        },
+        {
+          "code": "class_not_intercepted",
+          "message": "Execute calls: ProviderGated"
+        },
+        {
+          "code": "class_not_intercepted",
+          "message": "Fetch calls: NotIntercepted"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "Mcp calls: Unknown"
+        },
+        {
+          "code": "class_not_intercepted",
+          "message": "Subagent calls: NotIntercepted"
+        },
+        {
+          "code": "coverage_unknown",
+          "message": "ProviderSpecific calls: Unknown"
+        }
+      ],
+      "provider": "codex",
+      "cli_version": "0.163.0",
+      "version_tested": true,
+      "coverage": [
+        {
+          "class": "read",
+          "coverage": "provider_gated",
+          "evidence": "fixtures/agents/codex/gate-deny"
+        },
+        {
+          "class": "edit",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "delete",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "move",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "search",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "execute",
+          "coverage": "provider_gated",
+          "evidence": "fixtures/agents/codex/gate-deny-execute"
+        },
+        {
+          "class": "fetch",
+          "coverage": "not_intercepted",
+          "evidence": null
+        },
+        {
+          "class": "mcp",
+          "coverage": "unknown",
+          "evidence": null
+        },
+        {
+          "class": "subagent",
+          "coverage": "not_intercepted",
+          "evidence": null
+        },
+        {
+          "class": "provider_specific",
+          "coverage": "unknown",
+          "evidence": null
+        }
+      ],
+      "config_sources": []
+    }
   },
   {
     "type": "turn_started",
     "turn": 1
+  },
+  {
+    "type": "message_completed",
+    "message_id": "user:1",
+    "kind": "user",
+    "body": {
+      "type": "inline",
+      "text": "Run sleep 60, then say done."
+    }
   },
   {
     "type": "tool_call_started",
@@ -58,19 +168,21 @@
         ]
       }
     },
-    "reason": null
-  },
-  {
-    "type": "request_resolved",
-    "request_id": "17",
-    "outcome": "cancelled"
+    "reason": null,
+    "rememberable": true
   },
   {
     "type": "tool_call_finished",
     "call_id": "call-1",
     "status": "cancelled",
     "output": null,
-    "error": null
+    "error": null,
+    "truncated_bytes": 0
+  },
+  {
+    "type": "request_resolved",
+    "request_id": "17",
+    "outcome": "cancelled"
   },
   {
     "type": "turn_completed",
@@ -81,6 +193,6 @@
   {
     "type": "session_ended",
     "exit_code": 0,
-    "reason": null
+    "reason": "shutdown"
   }
 ]

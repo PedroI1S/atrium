@@ -208,7 +208,7 @@ pub struct CodexNormalizer {
 
     prev_totals: Totals,
     turn_totals: Option<Totals>,
-    turn_context: Option<(u64, u64)>,
+    turn_context: Option<(u64, Option<u64>)>,
     rate_limited: bool,
     last_reset_ms: Option<u64>,
     last_quota: Option<Vec<QuotaWindow>>,
@@ -1122,10 +1122,8 @@ impl CodexNormalizer {
             return;
         }
         self.turn_totals = Some(totals);
-        if let (Some(used), Some(window)) = (
-            tu.pointer("/last/totalTokens").and_then(Value::as_u64),
-            tu.get("modelContextWindow").and_then(Value::as_u64),
-        ) {
+        if let Some(used) = tu.pointer("/last/totalTokens").and_then(Value::as_u64) {
+            let window = tu.get("modelContextWindow").and_then(Value::as_u64);
             self.turn_context = Some((used, window));
         }
     }
@@ -1255,7 +1253,7 @@ impl CodexNormalizer {
         if let Some((used, window)) = self.turn_context.take() {
             out.push(AgentEvent::ContextUpdated {
                 used_tokens: used,
-                window_tokens: Some(window),
+                window_tokens: window,
             });
         }
         let usage = self.consume_turn_usage();
