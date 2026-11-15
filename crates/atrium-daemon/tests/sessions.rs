@@ -1649,3 +1649,141 @@ async fn resume_keeps_effort_and_non_home_preset() {
         .await;
     rig.stop(true).await;
 }
+
+async fn wait_update(
+    watcher: &mut Wire,
+    thread: &ThreadId,
+    check: impl Fn(&atrium_protocol::thread::ThreadSummary) -> bool,
+) -> atrium_protocol::thread::ThreadSummary {
+    soon(async {
+        loop {
+            if let ServerMessage::ThreadUpdated { summary } = watcher.next().await
+                && summary.thread_id == *thread
+                && check(&summary)
+            {
+                return summary;
+            }
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn resume_right_after_final_state_in_a_tight_loop() {
+    let mut rig = Rig::start().await;
+    let mut watcher = rig.dev().await;
+    assert_eq!(
+        watcher.subscribe_inbox().await,
+        json!({ "threads": [], "inbox": [] })
+    );
+    let mut wire = rig.dev().await;
+    let thread = wire.start_thread(native(), None).await.thread_id;
+    let mut script = Some(rig.script().await);
+    script.as_mut().unwrap().started("native-1").await;
+    wait_update(&mut watcher, &thread, |s| s.state == ThreadState::Idle).await;
+
+    let mut expected_incarnation = 1u64;
+    for round in 0..201u64 {
+        match round % 4 {
+            // 0: Ended via SessionEnded(0)
+            0 => {
+                script.take().unwrap().ended(Some(0)).await;
+                wait_update(&mut watcher, &thread, |s| {
+                    s.incarnation as u64 == expected_incarnation && s.state == ThreadState::Ended
+                })
+                .await;
+            }
+            // 1: Interrupted via SessionEnded(1)
+            1 => {
+                script.take().unwrap().ended(Some(1)).await;
+                wait_update(&mut watcher, &thread, |s| {
+                    s.incarnation as u64 == expected_incarnation
+                        && matches!(s.state, ThreadState::Interrupted { .. })
+                })
+                .await;
+            }
+            // 2: Failed via Start::Fail (then reset to Start::Script to resume again)
+            2 => {
+                script.take().unwrap().ended(Some(0)).await;
+                wait_update(&mut watcher, &thread, |s| {
+                    s.incarnation as u64 == expected_incarnation && s.state == ThreadState::Ended
+                })
+                .await;
+                *rig.adapter.start.lock().expect("lock") = Start::Fail;
+                let failed = wire
+                    .ok(DaemonCommand::ResumeThread {
+                        thread_id: thread.clone(),
+                    })
+                    .await;
+                expected_incarnation += 1;
+                assert_eq!(failed["incarnation"], expected_incarnation);
+                wait_update(&mut watcher, &thread, |s| {
+                    s.incarnation as u64 == expected_incarnation
+                        && matches!(s.state, ThreadState::Failed { .. })
+                })
+                .await;
+                *rig.adapter.start.lock().expect("lock") = Start::Script;
+            }
+            // 3: Ended immediately via user Shutdown while provider finishes asynchronously
+            _ => {
+                let mut ending_script = script.take().unwrap();
+                tokio::spawn(async move {
+                    if ending_script.command().await == SessionCommand::Shutdown {
+                        ending_script.ended(Some(0)).await;
+                    }
+                });
+                wire.ok(shutdown(&thread)).await;
+                wait_update(&mut watcher, &thread, |s| {
+                    s.incarnation as u64 == expected_incarnation && s.state == ThreadState::Ended
+                })
+                .await;
+            }
+        }
+
+        let resumed = wire
+            .ok(DaemonCommand::ResumeThread {
+                thread_id: thread.clone(),
+            })
+            .await;
+        expected_incarnation += 1;
+        assert_eq!(resumed["incarnation"], expected_incarnation);
+
+        let mut next = rig.script().await;
+        next.started("native-1").await;
+        wait_update(&mut watcher, &thread, |s| {
+            s.incarnation as u64 == expected_incarnation && s.state == ThreadState::Idle
+        })
+        .await;
+        script = Some(next);
+    }
+
+    // Two concurrent ResumeThreads right after Ended: one wins, one is refused.
+    script.take().unwrap().ended(Some(0)).await;
+    wait_update(&mut watcher, &thread, |s| {
+        s.incarnation as u64 == expected_incarnation && s.state == ThreadState::Ended
+    })
+    .await;
+    let mut second_wire = rig.dev().await;
+    let (a, b) = tokio::join!(
+        wire.command(DaemonCommand::ResumeThread {
+            thread_id: thread.clone(),
+        }),
+        second_wire.command(DaemonCommand::ResumeThread {
+            thread_id: thread.clone(),
+        }),
+    );
+    match (a, b) {
+        (Ok(val), Err((ErrorCode::Invalid, _))) | (Err((ErrorCode::Invalid, _)), Ok(val)) => {
+            assert_eq!(val["incarnation"], expected_incarnation + 1);
+        }
+        other => panic!("expected exactly one winner and one Invalid refusal: {other:?}"),
+    }
+    let mut last = rig.script().await;
+    last.started("native-1").await;
+    last.ended(Some(0)).await;
+    wait_update(&mut watcher, &thread, |s| {
+        s.incarnation as u64 == expected_incarnation + 1 && s.state == ThreadState::Ended
+    })
+    .await;
+    rig.stop(true).await;
+}

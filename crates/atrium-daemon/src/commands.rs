@@ -478,6 +478,9 @@ async fn resume_thread(inner: &Arc<Inner>, thread: &ThreadId) -> Result<Value, F
                 format!("no adapter for {:?} in this daemon", summary.provider),
             )
         })?;
+    // Wait for any already-ending session on this thread to complete its final
+    // teardown before checking/closing open items or launching the next one.
+    inner.wait_if_ending(thread).await?;
     // The incarnation before is closed first. It is, unless storing its
     // closing events failed when its session ended: that is tried again
     // here, and the thread isn't resumed until it succeeds, or the open
@@ -543,7 +546,10 @@ async fn thread_command(
         }
         SessionCommand::Shutdown => {
             let live = inner.session_of(thread, None)?;
-            // The user asked, so the exit that follows is `Ended`.
+            // The user asked, so the exit that follows is `Ended`. Mark
+            // terminal before publishing `Ended` so an immediate resume waits
+            // for teardown instead of racing with it.
+            live.mark_terminal();
             if inner.store.signal(thread, Signal::Stopped).await.is_ok() {
                 inner.refresh_thread(thread).await;
             }
