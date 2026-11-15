@@ -555,11 +555,17 @@ fn reads_stdin_as_code(eff: &[String]) -> bool {
     }
     // `| s$(echo h)`: a word built by running something may name a shell;
     // `| $X -s`: a command named by a variable, told to read a script
-    if !is_interpreter(b)
-        && shell::has_command_substitution(first)
-        && shell::substituted_word_may_be_shell(first)
-    {
-        return true;
+    // a word built by a substitution that names a program plainly is read
+    // as that program (`$(which python3)`: an interpreter, round 6 item 6)
+    if !is_interpreter(b) && shell::has_command_substitution(first) {
+        return match shell::substituted_program(first) {
+            None => true,
+            Some(name) => {
+                let mut e = eff.to_vec();
+                e[0] = name;
+                reads_stdin_as_code(&e)
+            }
+        };
     }
     if !is_interpreter(b) && shell::maybe_shell(first) {
         return args.iter().any(|a| a == "-" || a == "-s");

@@ -326,27 +326,234 @@ fn recursive_reader(eff: &[String]) -> bool {
     }
 }
 
-/// A recursive reader given no folder to search, which then searches the
-/// directory it runs in (`rg x`, `grep -r x`, `rgrep x`, `find -type f`).
-/// A line the parser can't read counts as one.
-fn searches_cwd(eff: &[String]) -> bool {
-    let Some(first) = eff.first() else {
-        return false;
-    };
-    let args = &eff[1..];
-    let operands = || args.iter().filter(|a| !a.starts_with('-')).count();
-    match shell::base(first) {
-        "rg" => engine::search_roots(true, args).is_none_or(|s| s.roots.is_empty()),
-        "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" => {
-            engine::search_roots(false, args).is_none_or(|s| s.recursive && s.roots.is_empty())
+/// The positional words of an option-taking command, read with an option
+/// table, for each way it can be read: a short option whose value is
+/// optional (`ack -C [N]`) followed by a separate word gives two readings.
+/// `None`: an option the table doesn't know.
+struct ReaderOpts {
+    flags: &'static str,
+    vals: &'static str,
+    opt_vals: &'static str,
+    long_vals: &'static [&'static str],
+    long_flags: &'static [&'static str],
+    /// Short options whose value is the pattern (`ag -g PAT`, `ack -g RE`)
+    /// or that take no pattern (`ack -f`): the positional words are paths.
+    no_pattern: &'static str,
+}
+
+fn readings(args: &[String], o: &ReaderOpts) -> Option<Vec<(Vec<String>, bool)>> {
+    // (positional words, the pattern came from an option, the next word is
+    // an optional value this reading takes)
+    let mut out: Vec<(Vec<String>, bool, bool)> = vec![(vec![], false, false)];
+    let mut j = 0;
+    let mut dd = false;
+    while j < args.len() {
+        let w = args[j].as_str();
+        j += 1;
+        if dd || !w.starts_with('-') || w == "-" {
+            for r in &mut out {
+                if r.2 {
+                    r.2 = false;
+                } else {
+                    r.0.push(w.to_string());
+                }
+            }
+            continue;
         }
-        "rgrep" => engine::search_roots(false, args).is_none_or(|s| s.roots.is_empty()),
-        "ag" | "ack" => operands() <= 1,
-        "find" => args.first().is_none_or(|a| {
-            a.starts_with('-') && !matches!(a.as_str(), "-H" | "-L" | "-P")
-                || matches!(a.as_str(), "(" | "!" | "\\(")
-        }),
-        _ => false,
+        for r in &mut out {
+            r.2 = false;
+        }
+        if w == "--" {
+            dd = true;
+            continue;
+        }
+        if let Some(long) = w.strip_prefix("--") {
+            let (name, has_val) = match long.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (long, false),
+            };
+            if o.long_vals.contains(&name) {
+                if !has_val {
+                    j += 1;
+                }
+            } else if !o.long_flags.contains(&name) {
+                return None;
+            }
+            continue;
+        }
+        let cs: Vec<char> = w[1..].chars().collect();
+        for (k, c) in cs.iter().enumerate() {
+            let attached = k + 1 < cs.len();
+            if o.no_pattern.contains(*c) {
+                for r in &mut out {
+                    r.1 = true;
+                }
+            }
+            if o.vals.contains(*c) {
+                if !attached {
+                    j += 1;
+                }
+                break;
+            }
+            if o.opt_vals.contains(*c) {
+                if !attached {
+                    if out.len() >= 16 {
+                        return None;
+                    }
+                    // with the value (it takes the next word), and without
+                    let with: Vec<(Vec<String>, bool, bool)> =
+                        out.iter().map(|r| (r.0.clone(), r.1, true)).collect();
+                    out.extend(with);
+                }
+                break;
+            }
+            if !o.flags.contains(*c) {
+                return None;
+            }
+        }
+    }
+    Some(out.into_iter().map(|r| (r.0, r.1)).collect())
+}
+
+const AG_OPTS: ReaderOpts = ReaderOpts {
+    flags: "aDcFfHhiLlnoQRrSsvVtuUwz0",
+    vals: "ABCGgmpW",
+    opt_vals: "",
+    long_vals: &[
+        "depth",
+        "file-search-regex",
+        "ignore",
+        "ignore-dir",
+        "max-count",
+        "pager",
+        "path-to-ignore",
+        "width",
+        "workers",
+        "color-line-number",
+        "color-match",
+        "color-path",
+    ],
+    long_flags: &[
+        "after",
+        "before",
+        "context",
+        "all-types",
+        "all-text",
+        "unrestricted",
+        "hidden",
+        "ignore-case",
+        "smart-case",
+        "case-sensitive",
+        "literal",
+        "files-with-matches",
+        "files-without-matches",
+        "count",
+        "column",
+        "nocolor",
+        "color",
+        "noheading",
+        "heading",
+        "nobreak",
+        "break",
+        "follow",
+        "nofollow",
+        "skip-vcs-ignores",
+        "search-zip",
+        "silent",
+        "stats",
+        "vimgrep",
+        "word-regexp",
+        "only-matching",
+        "null",
+        "print0",
+        "one-device",
+        "filename",
+        "nofilename",
+        "numbers",
+        "nonumbers",
+        "group",
+        "nogroup",
+        "invert-match",
+        "multiline",
+        "nomultiline",
+        "passthrough",
+        "print-long-lines",
+    ],
+    no_pattern: "g",
+};
+
+const ACK_OPTS: ReaderOpts = ReaderOpts {
+    flags: "iISvwQlLchHo1nrRsxfk",
+    vals: "ABmgt",
+    opt_vals: "C",
+    long_vals: &["type", "ignore-dir", "noignore-dir", "match", "output", "max-count"],
+    long_flags: &[
+        "ignore-case",
+        "smart-case",
+        "invert-match",
+        "word-regexp",
+        "literal",
+        "files-with-matches",
+        "files-without-matches",
+        "count",
+        "no-filename",
+        "with-filename",
+        "column",
+        "nocolor",
+        "color",
+        "noheading",
+        "heading",
+        "nobreak",
+        "break",
+        "follow",
+        "nofollow",
+        "recurse",
+        "no-recurse",
+        "sort-files",
+        "context",
+        "nopager",
+    ],
+    no_pattern: "gf",
+};
+
+/// Whether a recursive reader searches the directory it runs in, because it
+/// was given no folder (round 6 item 2): `Some(true)` under some reading of
+/// its options, `None` when its options can't be read (the caller asks).
+/// `find` reads its roots with `shell::find_roots_explicit`, `rg` and
+/// `grep` with the parser Home's read-only list uses (`-R` read as `-r`),
+/// `ag` and `ack` with their option tables.
+fn searches_cwd(eff: &[String]) -> Option<bool> {
+    let first = eff.first()?;
+    let args = &eff[1..];
+    match shell::base(first) {
+        "rg" => engine::search_roots(true, args).map(|s| s.roots.is_empty()),
+        b @ ("grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" | "rgrep") => {
+            // `-R` follows every link below the roots: the same roots
+            let args: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if a.starts_with('-') && !a.starts_with("--") {
+                        a.replace('R', "r")
+                    } else if a == "--dereference-recursive" {
+                        "--recursive".into()
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect();
+            engine::search_roots(false, &args)
+                .map(|s| (s.recursive || b == "rgrep") && s.roots.is_empty())
+        }
+        b @ ("ag" | "ack") => {
+            let o = if b == "ag" { &AG_OPTS } else { &ACK_OPTS };
+            let rs = readings(args, o)?;
+            Some(
+                rs.iter()
+                    .any(|(ws, no_pattern)| ws.len() <= usize::from(!*no_pattern)),
+            )
+        }
+        "find" => Some(!shell::find_roots_explicit(eff).2),
+        _ => Some(false),
     }
 }
 
@@ -477,12 +684,22 @@ fn reaches_linked_ssh_dir(
     }
     // A recursive reader with no folder operand searches where it runs: each
     // directory the walk is sure of (an uncertain one keeps D-078's verdict).
+    // Options it can't read: it may, so it asks (round 6 item 2).
+    let mut maybe = false;
     for (i, u) in a.units.iter().enumerate() {
-        if searches_cwd(&u.eff)
-            && let Some(words::CwdState::Known(cands)) = a.unit_cwd.get(i)
-            && cands.iter().any(|c| reaches_root(c))
-        {
-            return true;
+        if !recursive_reader(&u.eff) {
+            continue;
+        }
+        let Some(words::CwdState::Known(cands)) = a.unit_cwd.get(i) else {
+            continue;
+        };
+        if !cands.iter().any(|c| reaches_root(c)) {
+            continue;
+        }
+        match searches_cwd(&u.eff) {
+            Some(true) => return Reach::Yes,
+            Some(false) => {}
+            None => maybe = true,
         }
     }
     let mut k = 0usize;

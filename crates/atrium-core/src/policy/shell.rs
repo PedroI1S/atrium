@@ -56,6 +56,33 @@ pub struct Unit {
     pub same_shell: bool,
     /// Followed by `&`: it runs in the background, in a child.
     pub background: bool,
+    /// The compound commands of its text it is inside, outermost first, each
+    /// with a number unique to that compound (round 6 item 4): the directory
+    /// walk keeps one `&&` chain per compound and joins it to the chain
+    /// around it when the compound ends.
+    pub compound: Vec<(Compound, u32)>,
+    /// The join written right after a `( … )` group this command ends
+    /// (`(true) && x`): the group's own place in the chain around it.
+    pub close_join: Option<Join>,
+    /// With `same_shell`: the owner (`eval`, `source`) may run in a child
+    /// instead (in a pipeline, a group or the background), so the shell
+    /// after it may be where it was or where the text ended (round 6 item 7).
+    pub shell_union: bool,
+}
+
+/// What kind of compound command a command is inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compound {
+    /// `( … )`: a subshell.
+    Paren,
+    /// `{ …; }`: runs once, in this shell.
+    Brace,
+    /// `if`, `case`, `coproc`: the body may not run (or runs in a child).
+    Cond,
+    /// `while`, `until`, `for`, `select`: the body runs any number of times.
+    Loop,
+    /// A function body: runs only when called, any number of times.
+    Func,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -84,10 +111,13 @@ struct Builder {
     pipe: u32,
     join: Join,
     background: bool,
+    compound: Vec<(Compound, u32)>,
+    close_join: Option<Join>,
 }
 
 static PIPE_IDS: AtomicU32 = AtomicU32::new(1);
 static CTX_IDS: AtomicU32 = AtomicU32::new(1);
+static GROUP_IDS: AtomicU32 = AtomicU32::new(1);
 
 impl Builder {
     fn new(piped: bool, grouped: bool) -> Self {
@@ -102,6 +132,8 @@ impl Builder {
             grouped,
             join: Join::Seq,
             background: false,
+            compound: vec![],
+            close_join: None,
         }
     }
     fn is_empty(&self) -> bool {
@@ -123,9 +155,26 @@ fn is_name(s: &str) -> bool {
     it.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// How deeply the scanners below may nest (`$(` in `"` in `${` …) before
+/// they give up and report the construct as unclosed (fail closed).
+const MAX_SCAN_NEST: u16 = 128;
+
 /// `start` is just after the opening delimiter; returns the body and the
 /// index just past the matching `)`.
+///
+/// Round 6 item 3: every scanner skips every quoting construct the shell
+/// reads inside it with the same scanners, at any depth: in a `$(…)`,
+/// quotes, `${…}`, `` `…` `` and nested `$(…)`/`$((…))`; in a `"…"`,
+/// `$(…)`, `` `…` `` and `${…}`; in a `${…}`, all of them (a `'` only
+/// outside double quotes).
 fn scan_paren(chars: &[char], start: usize) -> (String, usize, bool) {
+    scan_paren_n(chars, start, 0)
+}
+
+fn scan_paren_n(chars: &[char], start: usize, n: u16) -> (String, usize, bool) {
+    if n > MAX_SCAN_NEST {
+        return (chars[start.min(chars.len())..].iter().collect(), chars.len(), false);
+    }
     let mut depth = 1usize;
     let mut i = start;
     while i < chars.len() {
@@ -138,13 +187,22 @@ fn scan_paren(chars: &[char], start: usize) -> (String, usize, bool) {
                 }
             }
             '"' => {
-                i += 1;
-                while i < chars.len() && chars[i] != '"' {
-                    if chars[i] == '\\' {
-                        i += 1;
-                    }
-                    i += 1;
+                let (end, _) = skip_dq(chars, i + 1, n + 1);
+                i = end;
+                continue;
+            }
+            '`' => {
+                let (_, end, _) = scan_backtick(chars, i + 1);
+                i = end;
+                continue;
+            }
+            '$' if chars.get(i + 1) == Some(&'{') => {
+                let (_, j, closed) = scan_dollar_brace_n(chars, i + 2, false, n + 1);
+                if !closed {
+                    return (chars[start..].iter().collect(), chars.len(), false);
                 }
+                i = j + 1;
+                continue;
             }
             '(' => depth += 1,
             ')' => {
@@ -157,7 +215,46 @@ fn scan_paren(chars: &[char], start: usize) -> (String, usize, bool) {
         }
         i += 1;
     }
-    (chars[start..].iter().collect(), chars.len(), false)
+    (chars[start.min(chars.len())..].iter().collect(), chars.len(), false)
+}
+
+/// From just after an opening `"`: the index just past the closing `"`, and
+/// whether there was one. `$(…)`, `` `…` `` and `${…}` inside are skipped
+/// whole (their quotes are their own).
+fn skip_dq(chars: &[char], start: usize, n: u16) -> (usize, bool) {
+    if n > MAX_SCAN_NEST {
+        return (chars.len(), false);
+    }
+    let mut i = start;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => return (i + 1, true),
+            '\\' => i += 2,
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                let (_, end, ok) = scan_paren_n(chars, i + 2, n + 1);
+                if !ok {
+                    return (chars.len(), false);
+                }
+                i = end;
+            }
+            '$' if chars.get(i + 1) == Some(&'{') => {
+                let (_, j, closed) = scan_dollar_brace_n(chars, i + 2, true, n + 1);
+                if !closed {
+                    return (chars.len(), false);
+                }
+                i = j + 1;
+            }
+            '`' => {
+                let (_, end, ok) = scan_backtick(chars, i + 1);
+                if !ok {
+                    return (chars.len(), false);
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    (chars.len(), false)
 }
 
 fn scan_backtick(chars: &[char], start: usize) -> (String, usize, bool) {
@@ -201,56 +298,67 @@ fn find_substitutions(text: &str) -> Vec<String> {
 }
 
 /// The body of a `${…}` starting at `start` (just after the `{`) and the
-/// index of its closing `}`: quotes, escapes and nested `${…}` inside don't
-/// end it (`${x:-"}"}`, `"${x:-"'"}"`). Inside double quotes (`in_dq`) a
-/// single quote is an ordinary character. The flag is false when no closing
-/// `}` was found.
+/// index of its closing `}`: quotes, escapes, `$(…)`, `` `…` `` and nested
+/// `${…}` inside don't end it (`${x:-"}"}`, `"${x:-"'"}"`,
+/// `"${x:-$(echo '"')}"`). Inside double quotes (`in_dq`) a single quote is
+/// an ordinary character. The flag is false when no closing `}` was found.
 fn scan_dollar_brace(chars: &[char], start: usize, in_dq: bool) -> (String, usize, bool) {
-    let mut j = start;
-    let mut body = String::new();
-    let mut nest = 0usize;
-    while j < chars.len() {
-        let ch = chars[j];
-        match ch {
-            '}' if nest == 0 => break,
-            '}' => nest -= 1,
-            '{' if j > 0 && chars[j - 1] == '$' => nest += 1,
-            '\\' => {
-                body.push(ch);
-                j += 1;
-                if let Some(&n) = chars.get(j) {
-                    body.push(n);
-                }
-                j += 1;
-                continue;
-            }
-            '\'' | '"' if ch == '"' || !in_dq => {
-                body.push(ch);
-                j += 1;
-                while j < chars.len() && chars[j] != ch {
-                    if ch == '"' && chars[j] == '\\' {
-                        body.push(chars[j]);
-                        j += 1;
-                        if j >= chars.len() {
-                            break;
-                        }
-                    }
-                    body.push(chars[j]);
-                    j += 1;
-                }
-                if j < chars.len() {
-                    body.push(chars[j]);
-                    j += 1;
-                }
-                continue;
-            }
-            _ => {}
-        }
-        body.push(ch);
-        j += 1;
+    scan_dollar_brace_n(chars, start, in_dq, 0)
+}
+
+fn scan_dollar_brace_n(chars: &[char], start: usize, in_dq: bool, n: u16) -> (String, usize, bool) {
+    let start = start.min(chars.len());
+    if n > MAX_SCAN_NEST {
+        return (chars[start..].iter().collect(), chars.len(), false);
     }
-    let closed = j < chars.len();
-    (body, j, closed)
+    let mut j = start;
+    let unclosed = || (chars[start..].iter().collect::<String>(), chars.len(), false);
+    while j < chars.len() {
+        match chars[j] {
+            '}' => return (chars[start..j].iter().collect(), j, true),
+            '\\' => j += 2,
+            '$' if chars.get(j + 1) == Some(&'(') => {
+                let (_, end, ok) = scan_paren_n(chars, j + 2, n + 1);
+                if !ok {
+                    return unclosed();
+                }
+                j = end;
+            }
+            '$' if chars.get(j + 1) == Some(&'{') => {
+                let (_, k, closed) = scan_dollar_brace_n(chars, j + 2, in_dq, n + 1);
+                if !closed {
+                    return unclosed();
+                }
+                j = k + 1;
+            }
+            '`' => {
+                let (_, end, ok) = scan_backtick(chars, j + 1);
+                if !ok {
+                    return unclosed();
+                }
+                j = end;
+            }
+            '"' => {
+                let (end, ok) = skip_dq(chars, j + 1, n + 1);
+                if !ok {
+                    return unclosed();
+                }
+                j = end;
+            }
+            '\'' if !in_dq => {
+                j += 1;
+                while j < chars.len() && chars[j] != '\'' {
+                    j += 1;
+                }
+                if j >= chars.len() {
+                    return unclosed();
+                }
+                j += 1;
+            }
+            _ => j += 1,
+        }
+    }
+    unclosed()
 }
 
 /// A `${…}` with no closing `}` where quotes are read the shell's way: a
@@ -302,11 +410,14 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     // `for`, `case`, `select` bodies (`false`); `Some(pipe)` for one a pipe
     // feeds (`… | (true; sh)`, `… | { :; sh; }`, `… | if …; then sh; fi`):
     // every command in it may read the pipe (re-review blocker 5).
-    let mut groups: Vec<(bool, Option<u32>)> = vec![];
+    // (kind, the pipe feeding it, its number)
+    let mut groups: Vec<(Compound, Option<u32>, u32)> = vec![];
+    // `f()` was just read: the next compound is a function body
+    let mut fn_def = false;
     // text after an unclosed `${…}` (see `ambiguous_tail`)
     let mut tails: Vec<String> = vec![];
 
-    macro_rules! flush {
+    macro_rules! fresh {
         () => {{
             let mut next = Builder::new(false, paren_depth > 0);
             if let Some(id) = groups.iter().rev().find_map(|g| g.1) {
@@ -314,8 +425,15 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 next.grouped = true;
                 next.pipe = id;
             }
-            let b = std::mem::replace(&mut cur, next);
+            next
+        }};
+    }
+    macro_rules! flush {
+        () => {{
+            let next = fresh!();
+            let mut b = std::mem::replace(&mut cur, next);
             if !b.is_empty() {
+                b.compound = groups.iter().map(|g| (g.0, g.2)).collect();
                 raw_units.push(b);
             }
         }};
@@ -381,25 +499,59 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 continue;
             }
             '(' | ')' => {
-                if c == '(' {
-                    paren_depth += 1;
-                } else {
-                    paren_depth = paren_depth.saturating_sub(1);
-                }
                 out.reasons.push("subshell".into());
                 i += 1;
-                // `… | (sh)`: the group's commands read the pipe
                 if c == '(' {
-                    groups.push((true, (cur.is_empty() && cur.piped).then_some(cur.pipe)));
-                } else if groups.last().is_some_and(|g| g.0) {
-                    groups.pop();
+                    // `f()` / `f ()`: a function definition, not a subshell
+                    let mut k = i;
+                    while matches!(chars.get(k), Some(' ' | '\t')) {
+                        k += 1;
+                    }
+                    if chars.get(k) == Some(&')')
+                        && cur.assignments.is_empty()
+                        && (cur.argv.len() == 1
+                            || (cur.argv.len() == 2 && cur.argv[0] == "function"))
+                    {
+                        out.reasons.push("function definition".into());
+                        i = k + 1;
+                        flush!();
+                        fn_def = true;
+                        continue;
+                    }
+                    // `… | (sh)`: the group's commands read the pipe
+                    let g = (cur.is_empty() && cur.piped).then_some(cur.pipe);
+                    let kind = if std::mem::take(&mut fn_def) {
+                        Compound::Func
+                    } else {
+                        Compound::Paren
+                    };
+                    flush!();
+                    paren_depth += 1;
+                    groups.push((kind, g, GROUP_IDS.fetch_add(1, Ordering::Relaxed)));
+                    cur = fresh!();
+                    cur.grouped = true;
+                } else {
+                    // the commands inside belong to the group
+                    flush!();
+                    paren_depth = paren_depth.saturating_sub(1);
+                    if groups.last().is_some_and(|g| matches!(g.0, Compound::Paren | Compound::Func)) {
+                        groups.pop();
+                    } else {
+                        // `case x in a)`: a pattern, not a group
+                    }
+                    cur = fresh!();
+                    cur.grouped = cur.grouped || paren_depth > 0;
                 }
-                flush!();
-                cur.grouped = cur.grouped || paren_depth > 0;
                 continue;
             }
             '&' if chars.get(i + 1) == Some(&'&') => {
                 i += 2;
+                if cur.is_empty()
+                    && let Some(last) = raw_units.last_mut()
+                {
+                    // `( … ) && x`
+                    last.close_join = Some(Join::And);
+                }
                 cur.join = Join::And;
                 flush!();
                 continue;
@@ -438,6 +590,12 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 }
                 let id = cur.pipe;
                 if !is_pipe {
+                    if cur.is_empty()
+                        && let Some(last) = raw_units.last_mut()
+                    {
+                        // `( … ) || x`
+                        last.close_join = Some(Join::Or);
+                    }
                     cur.join = Join::Or;
                 }
                 flush!();
@@ -769,31 +927,35 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 // command position: nothing yet, or only words that start
                 // a body (`then {`, `do if …`, `else (…)`) — round 5
                 // blocker 3
-                let command_position = cur.assignments.is_empty()
-                    && cur.argv.iter().all(|w| {
-                        matches!(
-                            w.as_str(),
-                            "then"
-                                | "do"
-                                | "else"
-                                | "elif"
-                                | "!"
-                                | "{"
-                                | "if"
-                                | "while"
-                                | "until"
-                                | "time"
-                        )
-                    });
+                let command_position = cur.assignments.is_empty() && opens_body(&cur.argv);
                 if command_position && quoted_prefix_empty {
-                    match word.as_str() {
-                        "{" | "if" | "while" | "until" | "for" | "case" | "select" => {
-                            groups.push((false, cur.piped.then_some(cur.pipe)));
+                    let kind = match word.as_str() {
+                        "{" if std::mem::take(&mut fn_def)
+                            || cur.argv.iter().any(|w| w == "function") =>
+                        {
+                            Some(Compound::Func)
                         }
-                        "}" | "fi" | "done" | "esac" if groups.last().is_some_and(|g| !g.0) => {
+                        "{" if cur.argv.iter().any(|w| w == "coproc") => Some(Compound::Cond),
+                        "{" => Some(Compound::Brace),
+                        "if" | "case" => Some(Compound::Cond),
+                        "while" | "until" | "for" | "select" => Some(Compound::Loop),
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        let kind = if std::mem::take(&mut fn_def) { Compound::Func } else { kind };
+                        groups.push((
+                            kind,
+                            cur.piped.then_some(cur.pipe),
+                            GROUP_IDS.fetch_add(1, Ordering::Relaxed),
+                        ));
+                    } else if matches!(word.as_str(), "}" | "fi" | "done" | "esac") {
+                        if groups.last().is_some_and(|g| g.0 != Compound::Paren) {
                             groups.pop();
+                        } else {
+                            out.reasons.push("unbalanced compound".into());
                         }
-                        _ => {}
+                    } else {
+                        fn_def = false;
                     }
                 }
                 if cur.argv.is_empty() && assign_name_end.is_some() {
@@ -807,6 +969,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         }
     }
     flush!();
+    if !groups.is_empty() {
+        out.reasons.push("unbalanced compound".into());
+    }
     if pending.is_some() {
         out.reasons.push("redirect without target".into());
     }
@@ -833,6 +998,8 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             pipe,
             join,
             background,
+            compound,
+            close_join,
         } = b;
         let seg = Segment {
             assignments,
@@ -840,7 +1007,10 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             redirects,
             piped,
         };
-        let eff = unwrap(&seg.argv);
+        let (eff, unknown_option) = unwrap_checked(&seg.argv);
+        if unknown_option {
+            out.reasons.push("unknown wrapper option".into());
+        }
         if let Some(first) = seg.argv.first()
             && RESERVED.contains(&first.as_str())
         {
@@ -857,6 +1027,8 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         let same_shell_owner = eff
             .first()
             .is_some_and(|f| matches!(base(f), "eval" | "source" | "."));
+        // in a pipeline, a group or the background it may run in a child
+        let owner_maybe_child = pipe != 0 || grouped || background || piped;
         let mut payloads = payloads_of(&eff);
         payloads.extend(env_payloads(&seg.argv));
         // the output of a `$(…)` that is run as code: `sh -c "$(echo …)"`,
@@ -899,6 +1071,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             payload_units.extend(l.units.into_iter().map(|mut u| {
                 if u.ctx == l.ctx {
                     u.same_shell = same_shell_owner;
+                    u.shell_union = same_shell_owner && owner_maybe_child;
                 }
                 u
             }));
@@ -921,6 +1094,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             level: depth,
             same_shell: false,
             background,
+            compound,
+            close_join,
+            shell_union: false,
         };
         out.units.push(unit);
         if eff.first().map(|s| base(s)) == Some("find") {
@@ -956,7 +1132,14 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 // `| s$(echo h)`, `| $(echo sh)`: a word built by running
                 // something may name a shell (a variable alone, `| $PAGER`,
                 // is read only with `-s` or `-`)
-                || (has_command_substitution(f) && substituted_may_be_shell_at(f, depth))
+                || (has_command_substitution(f)
+                    && substituted_program_at(f, depth).is_none_or(|n| {
+                        let mut e = u.eff.clone();
+                        e[0] = n;
+                        is_shell(&e[0])
+                            || matches!(e[0].as_str(), "eval" | "source" | ".")
+                            || reads_stdin_as_script(&e)
+                    }))
                 || (maybe_shell(f) && u.eff[1..].iter().any(|a| a == "-s" || a == "-"))
         }) || reads_stdin_as_script(&u.eff)
     };
@@ -965,7 +1148,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         return out;
     }
     // (text, where its owner is when the text runs in this shell)
-    let mut texts: Vec<(String, Option<usize>)> = vec![];
+    let mut texts: Vec<(String, Option<usize>, bool)> = vec![];
     // A body is shell-fed (lexed for the hard-deny list) unless it is clearly
     // text: its owner is a simple command that isn't a shell, `eval`,
     // `source` or an interpreter, and whose output isn't piped or
@@ -983,7 +1166,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     for (owner, text) in &bodies {
         let owner_unit = raw_pos.get(*owner).and_then(|p| out.units.get(*p));
         if owner_unit.is_some_and(is_crontab) {
-            texts.push((crontab_commands(text), None));
+            texts.push((crontab_commands(text), None, false));
         }
         let same_shell = raw_pos.get(*owner).copied().filter(|p| {
             out.units.get(*p).is_some_and(|u| {
@@ -992,6 +1175,9 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     .is_some_and(|f| matches!(base(f), "eval" | "source" | "."))
             })
         });
+        let union = same_shell
+            .and_then(|p| out.units.get(p))
+            .is_some_and(|u| u.pipe != 0 || u.grouped || u.background || u.seg.piped);
         let clearly_text = raw_pos
             .get(*owner)
             .and_then(|p| out.units.get(*p))
@@ -1009,7 +1195,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                     && !u.grouped
             });
         if !clearly_text {
-            texts.push((text.clone(), same_shell));
+            texts.push((text.clone(), same_shell, union));
         }
     }
     if out.units.iter().any(is_pipe_code) {
@@ -1039,15 +1225,16 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 .first()
                 .is_some_and(|f| matches!(base(f), "eval" | "source" | "."))
                 .then_some(k);
-            texts.extend(piped.into_iter().map(|t| (t, same_shell)));
+            // ... in a child for other shells: both (round 6 item 7)
+            texts.extend(piped.into_iter().map(|t| (t, same_shell, true)));
         }
     }
-    texts.extend(tails.into_iter().map(|t| (t, None)));
+    texts.extend(tails.into_iter().map(|t| (t, None, false)));
     let mut extra_units: Vec<Unit> = vec![];
     // a text run in this shell goes right after its owner (and the owner's
     // own payloads), so the directory walk sees its `cd`s in order
     let mut placed: Vec<(usize, Vec<Unit>)> = vec![];
-    for (t, owner) in &texts {
+    for (t, owner, union) in &texts {
         let l = lex_depth(t, depth + 1, true);
         out.overflow |= l.overflow;
         let mut units = vec![];
@@ -1055,6 +1242,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             u.derived = true;
             if u.ctx == l.ctx {
                 u.same_shell = owner.is_some();
+                u.shell_union = owner.is_some() && *union;
             }
             units.push(u);
         }
@@ -1082,6 +1270,42 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     out.reasons.sort();
     out.reasons.dedup();
     out
+}
+
+/// Whether the words read so far leave the next word in command position,
+/// where a reserved word opens or closes a compound command: nothing yet, or
+/// only words that can precede a command (`then`, `do`, `else`, `elif`,
+/// `!`, `{`, `if`, `while`, `until`, `time [-p]`, `coproc [NAME]`,
+/// `function NAME`) — round 6 item 4.
+fn opens_body(argv: &[String]) -> bool {
+    let mut k = 0;
+    while k < argv.len() {
+        match argv[k].as_str() {
+            "then" | "do" | "else" | "elif" | "!" | "{" | "if" | "while" | "until" => k += 1,
+            "time" => {
+                k += 1;
+                if argv.get(k).is_some_and(|w| w == "-p") {
+                    k += 1;
+                }
+            }
+            "function" => {
+                // `function NAME` (its body comes next)
+                if k + 2 != argv.len() {
+                    return false;
+                }
+                k += 2;
+            }
+            "coproc" => {
+                k += 1;
+                // `coproc NAME {`
+                if k + 1 == argv.len() && is_name(&argv[k]) {
+                    k += 1;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Words that start compound commands; a segment starting with one can't be
@@ -1164,13 +1388,248 @@ pub fn base(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
 }
 
+/// The options a wrapper takes (round 6 item 5): short letters that are
+/// flags, that take a value (the rest of the word, or the next word), or
+/// that take an optional value only when attached (`xargs -i{}`); long
+/// options that are flags or take a value (`--opt v`, `--opt=v`); and
+/// whether a bare number is an option (`nice -10`).
+struct Opts {
+    flags: &'static str,
+    vals: &'static str,
+    opt_vals: &'static str,
+    long_flags: &'static [&'static str],
+    long_vals: &'static [&'static str],
+    numeric: bool,
+}
+
+const NO_OPTS: Opts = Opts {
+    flags: "",
+    vals: "",
+    opt_vals: "",
+    long_flags: &["--help", "--version"],
+    long_vals: &[],
+    numeric: false,
+};
+
+/// The option table of a wrapper `unwrap` strips, by name.
+fn wrapper_opts(name: &str) -> Option<Opts> {
+    let o = |flags, vals, long_flags, long_vals| Opts {
+        flags,
+        vals,
+        opt_vals: "",
+        long_flags,
+        long_vals,
+        numeric: false,
+    };
+    Some(match name {
+        "nohup" | "builtin" | "busybox" | "toybox" => NO_OPTS,
+        // bash `time -p`; GNU `time -f FMT -o FILE -a -q -v`; BSD `-l -h`
+        "time" => o(
+            "apqvVlh",
+            "fo",
+            &["--append", "--portability", "--quiet", "--verbose", "--help", "--version"],
+            &["--format", "--output"],
+        ),
+        "command" => o("pvV", "", &[], &[]),
+        "setsid" => o("cfw", "", &["--ctty", "--fork", "--wait", "--help", "--version"], &[]),
+        "unbuffer" => o("p", "", &[], &[]),
+        "caffeinate" => o("dimsu", "tw", &[], &[]),
+        "sandbox-exec" => o("", "fnpD", &[], &[]),
+        "chroot" => o(
+            "",
+            "",
+            &["--skip-chdir", "--help", "--version"],
+            &["--userspec", "--groups"],
+        ),
+        "exec" => o("cl", "a", &[], &[]),
+        "nice" => Opts {
+            numeric: true,
+            ..o("", "n", &["--help", "--version"], &["--adjustment"])
+        },
+        "ionice" => o(
+            "th",
+            "cnpPu",
+            &["--ignore", "--help", "--version"],
+            &["--class", "--classdata", "--pid", "--pgid", "--uid"],
+        ),
+        "stdbuf" => o("", "ioe", &["--help", "--version"], &["--input", "--output", "--error"]),
+        "timeout" => o(
+            "fv",
+            "sk",
+            &["--foreground", "--preserve-status", "--verbose", "--help", "--version"],
+            &["--signal", "--kill-after"],
+        ),
+        "xargs" => Opts {
+            opt_vals: "iel",
+            ..o(
+                "0oprtx",
+                "nPILsdaEJRS",
+                &[
+                    "--null",
+                    "--interactive",
+                    "--no-run-if-empty",
+                    "--verbose",
+                    "--exit",
+                    "--open-tty",
+                    "--show-limits",
+                    "--help",
+                    "--version",
+                    "--replace",
+                    "--eof",
+                    "--max-lines",
+                ],
+                &[
+                    "--max-args",
+                    "--max-procs",
+                    "--max-chars",
+                    "--delimiter",
+                    "--arg-file",
+                    "--process-slot-var",
+                ],
+            )
+        },
+        "chrt" => o(
+            "abdfiomrRv",
+            "TPD",
+            &[
+                "--all-tasks",
+                "--batch",
+                "--deadline",
+                "--fifo",
+                "--idle",
+                "--other",
+                "--rr",
+                "--reset-on-fork",
+                "--verbose",
+                "--help",
+                "--version",
+            ],
+            &["--sched-runtime", "--sched-period", "--sched-deadline"],
+        ),
+        "taskset" => o("ac", "", &["--all-tasks", "--cpu-list", "--help", "--version"], &[]),
+        "flock" => o(
+            "sexnuoFh",
+            "wE",
+            &[
+                "--shared",
+                "--exclusive",
+                "--nonblock",
+                "--nb",
+                "--unlock",
+                "--close",
+                "--no-fork",
+                "--verbose",
+                "--help",
+                "--version",
+            ],
+            &["--timeout", "--wait", "--conflict-exit-code"],
+        ),
+        // util-linux and BSD `script` (`c` is read by the caller)
+        "script" => o(
+            "adeFfkpqrh",
+            "EItTOBmo",
+            &[
+                "--append",
+                "--return",
+                "--flush",
+                "--force",
+                "--quiet",
+                "--help",
+                "--version",
+            ],
+            &[
+                "--log-io",
+                "--log-in",
+                "--log-out",
+                "--log-timing",
+                "--echo",
+                "--logging-format",
+                "--output-limit",
+                "--timing",
+            ],
+        ),
+        _ => return None,
+    })
+}
+
+/// One option word read with a table: how many words it uses (1 or 2), or
+/// `None` when the table doesn't know it. `shell_c`: the letter whose value
+/// is a shell string (`flock -c`, `script -c`), returned when met.
+enum Opt {
+    Words(usize),
+    Shell(Option<String>),
+    Unknown,
+}
+
+fn read_opt(a: &[String], j: usize, o: &Opts, shell_c: bool) -> Opt {
+    let w = a[j].as_str();
+    if let Some(long) = w.strip_prefix("--") {
+        let (name, has_val) = match long.split_once('=') {
+            Some((n, _)) => (n, true),
+            None => (long, false),
+        };
+        let name = format!("--{name}");
+        if shell_c && name == "--command" {
+            return Opt::Shell(match w.split_once('=') {
+                Some((_, v)) => Some(v.to_string()),
+                None => a.get(j + 1).cloned(),
+            });
+        }
+        if o.long_vals.contains(&name.as_str()) {
+            return Opt::Words(if has_val { 1 } else { 2 });
+        }
+        if o.long_flags.contains(&name.as_str()) {
+            return Opt::Words(1);
+        }
+        return Opt::Unknown;
+    }
+    let cs: Vec<char> = w[1..].chars().collect();
+    if o.numeric && cs.iter().all(|c| c.is_ascii_digit()) {
+        return Opt::Words(1);
+    }
+    for (k, c) in cs.iter().enumerate() {
+        let rest: String = cs[k + 1..].iter().collect();
+        if shell_c && *c == 'c' {
+            return Opt::Shell(if rest.is_empty() {
+                a.get(j + 1).cloned()
+            } else {
+                Some(rest)
+            });
+        }
+        if o.vals.contains(*c) {
+            return Opt::Words(if rest.is_empty() { 2 } else { 1 });
+        }
+        if o.opt_vals.contains(*c) {
+            return Opt::Words(1);
+        }
+        if !o.flags.contains(*c) {
+            return Opt::Unknown;
+        }
+    }
+    Opt::Words(1)
+}
+
+fn is_option(w: &str) -> bool {
+    w.starts_with('-') && w.len() > 1
+}
+
 /// Strips reserved words and transparent wrappers off the front of `argv`.
 pub fn unwrap(argv: &[String]) -> Vec<String> {
+    unwrap_checked(argv).0
+}
+
+/// [`unwrap`], and whether a wrapper had an option its table doesn't know
+/// (round 6 item 5): the command it runs is then not known for sure, and
+/// the line must not be allowed by a rule (it is read as if the option were
+/// a flag, as before).
+pub fn unwrap_checked(argv: &[String]) -> (Vec<String>, bool) {
     let mut a: Vec<String> = argv.to_vec();
+    let mut unknown = false;
     for _ in 0..8 {
         let Some(first) = a.first() else { break };
         let b = base(first).to_string();
-        let skip = |a: &[String], flags_with_value: &[&str], bare: &[&str]| -> usize {
+        // options with a table, then `operands` words before the command
+        let mut table = |a: &[String], o: &Opts, operands: usize| -> usize {
             let mut j = 1;
             while j < a.len() {
                 let w = a[j].as_str();
@@ -1178,108 +1637,104 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                     j += 1;
                     break;
                 }
-                if flags_with_value.contains(&w) {
-                    j += 2;
-                } else if bare.contains(&w) || (w.starts_with('-') && w.len() > 1 && w != "-") {
-                    j += 1;
-                } else {
+                if !is_option(w) {
                     break;
                 }
+                match read_opt(a, j, o, false) {
+                    Opt::Words(n) => j += n,
+                    Opt::Shell(_) => j += 1,
+                    Opt::Unknown => {
+                        unknown = true;
+                        j += 1;
+                    }
+                }
             }
-            j.min(a.len())
+            (j + operands).min(a.len())
         };
         let n = match b.as_str() {
             "{" | "}" | "!" | "do" | "then" | "else" | "elif" | "if" | "while" | "until"
-            | "time" | "builtin" | "nohup" | "coproc" => {
-                if b == "time" {
-                    // GNU `time -f FMT -o FILE`
-                    skip(&a, &["-f", "--format", "-o", "--output"], &[])
-                } else if b == "nohup" || b == "builtin" {
-                    skip(&a, &[], &[])
-                } else {
+            | "coproc" => 1,
+            "time" | "nohup" | "builtin" | "command" | "setsid" | "unbuffer" | "caffeinate"
+            | "sandbox-exec" | "exec" | "nice" | "ionice" | "stdbuf" | "xargs" | "busybox"
+            | "toybox" => {
+                let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
+                if matches!(b.as_str(), "busybox" | "toybox") {
                     1
+                } else {
+                    table(&a, &o, 0)
                 }
             }
-            "command" | "setsid" | "unbuffer" => skip(&a, &[], &[]),
-            "caffeinate" => skip(&a, &["-t", "-w"], &[]),
-            "arch" => skip(&a, &["-e", "-d", "-arch"], &[]),
-            "sandbox-exec" => skip(&a, &["-f", "-n", "-p", "-D"], &[]),
+            "timeout" | "chrt" | "taskset" => {
+                let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
+                // `chrt -p` / `taskset -p` act on a process: no command
+                if b != "timeout"
+                    && a[1..]
+                        .iter()
+                        .take_while(|w| is_option(w))
+                        .any(|w| !w.starts_with("--") && w.contains('p') || w == "--pid")
+                {
+                    0
+                } else {
+                    table(&a, &o, 1)
+                }
+            }
+            "arch" => {
+                // `arch [-32|-64|-x86_64|-arm64|…] [-c] [-e VAR=v] [-d VAR] CMD`
+                let mut j = 1;
+                while j < a.len() && is_option(&a[j]) {
+                    match a[j].as_str() {
+                        "-arch" | "-e" | "-d" => j += 2,
+                        "-c" | "-h" | "-32" | "-64" | "-x86_64" | "-arm64" | "-arm64e"
+                        | "-i386" | "-x86_64h" => j += 1,
+                        _ => {
+                            unknown = true;
+                            j += 1;
+                        }
+                    }
+                }
+                j.min(a.len())
+            }
             "chroot" => {
                 // `chroot [opts] NEWROOT [COMMAND…]`; without a command it
                 // starts a shell (see `reads_stdin_as_script`).
-                let j = skip(&a, &["--userspec", "--groups"], &[]);
+                let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
+                let j = table(&a, &o, 0);
                 if j + 1 < a.len() { j + 1 } else { 0 }
             }
             "flock" | "script" => {
                 // `flock [opts] FILE COMMAND…` / `flock [opts] FILE -c 'string'`;
                 // macOS `script [opts] FILE [COMMAND…]`, Linux `script -c CMD
-                // [FILE]`. Only the wrapper's own `-c` (before the command
-                // starts) is a shell string; a `-c` later belongs to the
-                // command (`flock l git -c x=y push`, `script f sudo sh -c id`).
-                // short options that take a value (the rest of a cluster, or
-                // the next word): the `-c` among them is the shell string
-                let short_value: &[char] = if b == "flock" {
-                    &['w', 'E', 'c']
-                } else {
-                    &['c', 'F', 't', 'T', 'I', 'O', 'B', 'E', 'm']
-                };
-                let with_value: &[&str] = if b == "flock" {
-                    &["-w", "-E", "--timeout", "--wait", "--conflict-exit-code"]
-                } else {
-                    &[
-                        "-F",
-                        "-t",
-                        "-T",
-                        "-I",
-                        "-O",
-                        "-B",
-                        "-E",
-                        "-m",
-                        "--log-io",
-                        "--log-in",
-                        "--log-out",
-                        "--log-timing",
-                        "--echo",
-                        "--logging-format",
-                    ]
-                };
+                // [FILE]`. The wrapper's own options may come after FILE too
+                // (read as options: the stricter reading). Only the
+                // wrapper's own `-c` is a shell string; a `-c` after the
+                // command starts belongs to the command
+                // (`flock l git -c x=y push`, `script f sudo sh -c id`).
+                let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
                 let mut j = 1;
                 let mut file_seen = false;
                 let mut shell_string: Option<String> = None;
                 while j < a.len() {
                     let w = a[j].as_str();
-                    if matches!(w, "-c" | "--command") {
-                        shell_string = a.get(j + 1).cloned();
+                    if w == "--" {
+                        j += 1;
+                        if !file_seen && j < a.len() {
+                            file_seen = true;
+                            j += 1;
+                        }
                         break;
                     }
-                    if let Some(v) = w.strip_prefix("--command=") {
-                        shell_string = Some(v.to_string());
-                        break;
-                    }
-                    // a cluster: `-c'…'`, `-nc'…'`, `-qc 'cmd'`, `-nw 10`,
-                    // `-nw10` (re-review blocker 5, round 5 blocker 4): the
-                    // first value-taking letter ends it and takes the rest
-                    // of the word, or the next word
-                    if w.starts_with('-') && !w.starts_with("--") && w.len() > 2 {
-                        let cs: Vec<char> = w[1..].chars().collect();
-                        if let Some(k) = cs.iter().position(|ch| short_value.contains(ch)) {
-                            let rest: String = cs[k + 1..].iter().collect();
-                            if cs[k] == 'c' {
-                                shell_string = if rest.is_empty() {
-                                    a.get(j + 1).cloned()
-                                } else {
-                                    Some(rest)
-                                };
+                    if is_option(w) {
+                        match read_opt(&a, j, &o, true) {
+                            Opt::Words(n) => j += n,
+                            Opt::Shell(s) => {
+                                shell_string = s;
                                 break;
                             }
-                            j += if rest.is_empty() { 2 } else { 1 };
-                            continue;
+                            Opt::Unknown => {
+                                unknown = true;
+                                j += 1;
+                            }
                         }
-                    }
-                    if with_value.contains(&w) {
-                        j += 2;
-                    } else if w.starts_with('-') && w.len() > 1 && !file_seen {
-                        j += 1;
                     } else if !file_seen {
                         file_seen = true;
                         j += 1;
@@ -1293,58 +1748,6 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                 }
                 if file_seen && j < a.len() { j } else { 0 }
             }
-            "busybox" | "toybox" => 1,
-            "exec" => skip(&a, &["-a"], &[]),
-            "nice" => skip(&a, &["-n", "--adjustment"], &[]),
-            "ionice" => skip(
-                &a,
-                &[
-                    "-c",
-                    "-n",
-                    "-p",
-                    "-P",
-                    "-u",
-                    "--class",
-                    "--classdata",
-                    "--pid",
-                    "--pgid",
-                    "--uid",
-                ],
-                &[],
-            ),
-            "stdbuf" => skip(
-                &a,
-                &["-i", "-o", "-e", "--input", "--output", "--error"],
-                &[],
-            ),
-            "timeout" => {
-                let j = skip(&a, &["-s", "-k", "--signal", "--kill-after"], &[]);
-                (j + 1).min(a.len())
-            }
-            "xargs" => skip(
-                &a,
-                &[
-                    "-n",
-                    "-P",
-                    "-I",
-                    "-L",
-                    "-s",
-                    "-d",
-                    "-a",
-                    "-E",
-                    "-J",
-                    "-R",
-                    "-S",
-                    "--max-args",
-                    "--max-procs",
-                    "--max-lines",
-                    "--max-chars",
-                    "--delimiter",
-                    "--arg-file",
-                    "--process-slot-var",
-                ],
-                &[],
-            ),
             "env" => {
                 let mut j = 1;
                 while j < a.len() {
@@ -1387,8 +1790,36 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
                         }
                     } else if let Some((_, rest)) = cluster {
                         // `-u NAME`, `-iu PATH`, `-iCproj` (round 5 blocker 4)
+                        if !env_flags_ok(w) {
+                            unknown = true;
+                        }
                         j += if rest.is_empty() { 2 } else { 1 };
-                    } else if (w.starts_with('-') && w.len() > 1) || is_assignment_word(w) {
+                    } else if w.starts_with("--") {
+                        let name = w.split_once('=').map_or(w, |(n, _)| n);
+                        if !matches!(
+                            name,
+                            "--ignore-environment"
+                                | "--null"
+                                | "--unset"
+                                | "--chdir"
+                                | "--argv0"
+                                | "--debug"
+                                | "--block-signal"
+                                | "--default-signal"
+                                | "--ignore-signal"
+                                | "--list-signal-handling"
+                                | "--help"
+                                | "--version"
+                        ) {
+                            unknown = true;
+                        }
+                        j += 1;
+                    } else if is_option(w) {
+                        if !env_flags_ok(w) {
+                            unknown = true;
+                        }
+                        j += 1;
+                    } else if is_assignment_word(w) {
                         j += 1;
                     } else {
                         break;
@@ -1407,7 +1838,16 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
         }
         a.drain(..n);
     }
-    a
+    (a, unknown)
+}
+
+/// The flag letters of an `env` cluster before its first value letter are
+/// all known (`-i`, `-0`, `-v`).
+fn env_flags_ok(w: &str) -> bool {
+    w[1..]
+        .chars()
+        .take_while(|c| !matches!(c, 'u' | 'C' | 'P' | 'a' | 'S'))
+        .all(|c| matches!(c, 'i' | '0' | 'v'))
 }
 
 /// For a short-option cluster of `env` (`-iu`, `-iCproj`, `-S'…'`): the
@@ -1514,35 +1954,31 @@ pub fn has_command_substitution(w: &str) -> bool {
     w.contains("$(") || w.contains('`')
 }
 
-/// A command word built by a command substitution may name a shell, unless
-/// it plainly can't (round 5): `$(brew --prefix)/bin/jq` ends in a literal
-/// program name that isn't a shell, `$(which less)` looks up a literal name
-/// that isn't one. Anything else (`s$(echo h)`, `$(echo sh)`,
-/// `$(echo /bin)/sh`, `$(x)/bin/$Y`, `$(x)/bin/s*`, output with a space that
-/// splits into more words) may be one.
-pub fn substituted_word_may_be_shell(w: &str) -> bool {
-    substituted_may_be_shell_at(w, 0)
+/// The program a command word built by a command substitution names, when
+/// it plainly names one (round 5, round 6 item 6): `$(brew --prefix)/bin/jq`
+/// ends in a literal name, `$(which less)` (`command -v`, `type -p`,
+/// `whence`) looks up a literal name, `$(echo node)` prints one word.
+/// `None` when it may be anything (`s$(echo h)`, `$(x)/bin/$Y`, `$(x)/bin/s*`,
+/// known output with a space that splits into more words): the caller then
+/// reads it as a shell.
+pub fn substituted_program(w: &str) -> Option<String> {
+    substituted_program_at(w, 0)
 }
 
-fn substituted_may_be_shell_at(w: &str, depth: u8) -> bool {
-    if !has_command_substitution(w) {
-        return maybe_shell(w);
-    }
-    if depth >= MAX_DEPTH {
-        return true;
+fn substituted_program_at(w: &str, depth: u8) -> Option<String> {
+    if !has_command_substitution(w) || depth >= MAX_DEPTH {
+        return None;
     }
     let bodies = find_substitutions(w);
-    // known output (`echo`, `printf`, here-strings) that splits into words or
-    // names a shell picks the program itself
+    let mut outputs: Vec<String> = vec![];
     for body in &bodies {
         for t in output_texts(body, depth) {
-            let t = t.trim();
-            if t.chars().any(char::is_whitespace)
-                || is_shell(t)
-                || t.rsplit('/').next().is_some_and(is_shell)
-            {
-                return true;
+            let t = t.trim().to_string();
+            // output that splits into words picks the program itself
+            if t.chars().any(char::is_whitespace) {
+                return None;
             }
+            outputs.push(t);
         }
     }
     let unquoted: String = w.chars().filter(|c| !matches!(c, '"' | '\'')).collect();
@@ -1551,6 +1987,7 @@ fn substituted_may_be_shell_at(w: &str, depth: u8) -> bool {
             && n.chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/'))
     };
+    let last_of = |n: &str| n.rsplit('/').next().unwrap_or(n).to_string();
     // `$(brew --prefix)/bin/jq`: a literal program after the last `/`
     if let Some((_, last)) = unquoted.rsplit_once('/')
         && !last.contains('\\')
@@ -1558,10 +1995,8 @@ fn substituted_may_be_shell_at(w: &str, depth: u8) -> bool {
         && !unquoted.ends_with(')')
         && !unquoted.ends_with('`')
     {
-        return is_shell(last);
+        return Some(last.to_string());
     }
-    // `$(which less)`, `$(command -v jq)`, `` `type -p jq` ``: the path of a
-    // literal name
     let whole = unquoted
         .strip_prefix("$(")
         .and_then(|r| r.strip_suffix(')'))
@@ -1569,6 +2004,7 @@ fn substituted_may_be_shell_at(w: &str, depth: u8) -> bool {
     if let Some(body) = whole
         && bodies.len() == 1
     {
+        // `$(which less)`, `$(command -v jq)`, `` `type -p jq` ``
         let words: Vec<&str> = body.split_whitespace().collect();
         let name = match words.as_slice() {
             ["which" | "whence", n] => Some(*n),
@@ -1576,13 +2012,17 @@ fn substituted_may_be_shell_at(w: &str, depth: u8) -> bool {
             ["type", "-p" | "-P", n] => Some(*n),
             _ => None,
         };
-        if let Some(n) = name
-            && literal_name(n)
+        if let Some(n) = name {
+            return literal_name(n).then(|| last_of(n));
+        }
+        // `$(echo node)`: one known word
+        if let [one] = outputs.as_slice()
+            && literal_name(one)
         {
-            return is_shell(n) || n.contains('/') && is_shell(n.rsplit('/').next().unwrap_or(n));
+            return Some(last_of(one));
         }
     }
-    true
+    None
 }
 
 /// Commands that run their standard input as a script of commands without
@@ -2148,20 +2588,43 @@ fn quote(w: &str) -> String {
 }
 
 /// The directories `find` walks and the index where its expression starts.
-/// Skips the leading options (`-H -L -P -E -X -O<n> -D <x>`).
+/// Skips the leading options with a table (round 6 item 2): GNU `-H -L -P`,
+/// `-O<n>`, `-D <debug>`; BSD `-E -X -d -s -x` and `-f PATH` (a root).
+/// Without a root `find` walks `.`.
 pub fn find_roots(eff: &[String]) -> (Vec<String>, usize) {
+    let (roots, j, _) = find_roots_explicit(eff);
+    (roots, j)
+}
+
+/// [`find_roots`], and whether a root was written (`false`: it walks `.`,
+/// the directory it runs in).
+pub fn find_roots_explicit(eff: &[String]) -> (Vec<String>, usize, bool) {
+    let mut roots = vec![];
     let mut j = 1;
     while j < eff.len() {
         let w = eff[j].as_str();
-        if matches!(w, "-H" | "-L" | "-P" | "-E" | "-X") || (w.starts_with("-O") && w.len() > 2) {
+        if w == "--" {
             j += 1;
-        } else if w == "-D" {
+            break;
+        }
+        if w == "-D" {
             j += 2;
+        } else if w == "-f" {
+            if let Some(r) = eff.get(j + 1) {
+                roots.push(r.clone());
+            }
+            j += 2;
+        } else if (w.starts_with("-O") && w.len() > 2 && w[2..].chars().all(|c| c.is_ascii_digit()))
+            || (w.len() > 1
+                && w.starts_with('-')
+                && !w.starts_with("--")
+                && w[1..].chars().all(|c| "HLPEXdsx".contains(c)))
+        {
+            j += 1;
         } else {
             break;
         }
     }
-    let mut roots = vec![];
     while j < eff.len() {
         let w = eff[j].as_str();
         if (w.starts_with('-') && w != "-") || w == "!" || w == "(" {
@@ -2170,10 +2633,11 @@ pub fn find_roots(eff: &[String]) -> (Vec<String>, usize) {
         roots.push(eff[j].clone());
         j += 1;
     }
+    let explicit = !roots.is_empty();
     if roots.is_empty() {
         roots.push(".".into());
     }
-    (roots, j.min(eff.len()))
+    (roots, j.min(eff.len()), explicit)
 }
 
 /// `find … -exec CMD … ;` becomes its own unit so hard-deny sees `CMD`.
@@ -2209,6 +2673,9 @@ fn find_exec_units(eff: &[String], units: &mut Vec<Unit>, level: u8) {
                     level,
                     same_shell: false,
                     background: false,
+                    compound: vec![],
+                    close_join: None,
+                    shell_union: false,
                 });
             }
             k = m;

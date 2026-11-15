@@ -643,3 +643,20 @@ adversarial_fuzz       20/20   atrium-core lib      20/20
 ```
 
 - No daemon left running (`pgrep -fl atriumd`: none).
+
+## Sixth round (D-081): stopped mid-way, work in progress (2026-11-14)
+
+The Opus 5.5 worker was **stopped by the orchestrator at Pedro's request** while working on item 5. Its last note was "Now rewrite unwrap with a table-driven option reader." Nothing of this round had been committed. The orchestrator committed the worktree as it was, as a work-in-progress commit, so it survives the handoff.
+
+**State: does not compile.** `cargo check -p atrium-core` fails with `E0433: cannot find type Reach` at `crates/atrium-core/src/policy/gate.rs:700`: a helper enum used by the new `searches_cwd` code was never written. No test or DoD has run on this state. The last good commit is `5a8c57c` (round five, reviewed in `reviews/M1-13-adversarial-round5.md`: rework).
+
+**What the diff shows, per item of the round-5 review's root-cause list.** The orchestrator read this from the diff; it has not been checked.
+1. `glob_reaches` and `**`: no change visible.
+2. Recursive readers' options: **in progress.** `gate.rs` has a table-driven `ReaderOpts`, `readings`, `AG_OPTS`, `ACK_OPTS` and a new `searches_cwd`, which is the code that doesn't compile. Not visible yet: `find` through `shell::find_roots`.
+3. Nested quoting in `${…}`: **looks written.** `shell.rs` has `scan_paren_n`, `skip_dq`, `scan_dollar_brace_n` and a `MAX_SCAN_NEST` limit that fails closed. `adversarial_regression.rs` has the generated test `round_6_item_3_generated_quote_and_substitution_prefixes`, with its generators `gen_unquoted` and `gen_dquoted`.
+4. Command position and chain state: **in progress.** `shell.rs` has `Compound` and `opens_body`; `words.rs` has `Frame` and `close_frame`.
+5. Wrapper option reader: **started.** `shell.rs` has `Opts`, `NO_OPTS`, `wrapper_opts`, `Opt`, `read_opt` and `is_option`. The rewrite of `unwrap` that would use them had just begun.
+6. Script readers piped into a substituted word: no change visible.
+7. `eval`/`source` in a pipeline: nothing visible apart from the `words.rs` frame work.
+
+**To resume:** start from this commit and finish items 2, 4 and 5. Then do items 1, 6 and 7, write the "Sixth round" tables for the neighbouring spellings, and run the DoD. Then comes the Hydrogen `high` re-review, which can read the earlier reviews in the worktree's git-ignored `.orchestration/review-input/`. Alternatively, reset to `5a8c57c` and redo the round. The brief for the round is the orchestrator's message recorded in D-081 and the round-5 review's "Convergence assessment".

@@ -6,7 +6,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use super::RedirectOp;
-use super::shell::{Join, Unit, base};
+use super::shell::{Compound, Join, Unit, base};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -631,6 +631,41 @@ struct Level {
     pending: bool,
     /// The join of the last command of this text seen so far.
     last_join: Join,
+    /// `close_join` of the last command of this text seen so far.
+    last_close: Option<Join>,
+    /// The text ran where its owner may be in a child (round 6 item 7):
+    /// past it the shell is where it was or where the text ended.
+    union: bool,
+    /// The compound commands open at this point, outermost first.
+    frames: Vec<Frame>,
+}
+
+/// One open compound command of a text (round 6 item 4): its commands keep
+/// their own `&&` chain; the chain around it is put aside until it ends.
+struct Frame {
+    id: u32,
+    kind: Compound,
+    /// Where the shell was when the compound started.
+    entry: Vec<PathBuf>,
+    /// The chain around it, put aside.
+    saved_pool: Vec<PathBuf>,
+    saved_last_join: Join,
+}
+
+/// Ends the innermost compound: the shell carries on where its commands left
+/// it (and, unless it is a `{ …; }` that always runs once, where it was
+/// before: the body may not have run); where its chain may have stopped
+/// joins the chain around it, which decides when that counts.
+fn close_frame(lv: &mut Level) {
+    let Some(f) = lv.frames.pop() else { return };
+    let inner = std::mem::take(&mut lv.pool);
+    lv.pool = f.saved_pool;
+    lv.pool.extend(inner);
+    if f.kind != Compound::Brace && !lv.unknown {
+        lv.cands.extend(f.entry);
+    }
+    lv.last_join = f.saved_last_join;
+    lv.pending = false;
 }
 
 /// Ends a stopped `&&` chain: where it may have stopped becomes a candidate.
@@ -687,6 +722,9 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
         same_shell: false,
         pending: false,
         last_join: Join::Seq,
+        last_close: None,
+        union: false,
+        frames: vec![],
     }];
     for (i, unit) in units.iter().enumerate() {
         // leave the texts this unit isn't in
@@ -697,16 +735,31 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
             if !other {
                 break;
             }
-            let Some(done) = stack.pop() else { break };
+            let Some(mut done) = stack.pop() else { break };
+            while !done.frames.is_empty() {
+                close_frame(&mut done);
+            }
             if done.same_shell
                 && let Some(parent) = stack.last_mut()
             {
                 // the text ran in this shell: past it the shell is where the
                 // text ended; where its chains stopped joins this text's
-                // pool (it counts once this text's own chain is over)
-                parent.cands = done.cands;
-                parent.unknown |= done.unknown;
-                if !done.pool.is_empty() {
+                // pool (it counts once this text's own chain is over). When
+                // it may have run in a child, the shell may also still be
+                // where it was (round 6 item 7).
+                if done.unknown && !parent.unknown {
+                    push_seen(&mut seen, &parent.cands);
+                    push_seen(&mut seen, &parent.pool);
+                    parent.pool.clear();
+                    parent.unknown = true;
+                    w.unknown = true;
+                    parent.cands = lost_cands(home, start, &seen);
+                } else if done.union {
+                    parent.cands.extend(done.cands);
+                } else {
+                    parent.cands = done.cands;
+                }
+                if !done.pool.is_empty() && !parent.unknown {
                     parent.pool.extend(done.pool);
                     parent.pending |= parent.last_join != Join::And;
                 }
@@ -725,12 +778,56 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
                 same_shell: unit.same_shell,
                 pending: false,
                 last_join: Join::Seq,
+                last_close: None,
+                union: unit.shell_union,
+                frames: vec![],
             };
             stack.push(entered);
         }
         let Some(lv) = stack.last_mut() else {
             return w;
         };
+        // leave the compounds this unit isn't in, enter the ones it is in
+        let common = lv
+            .frames
+            .iter()
+            .zip(&unit.compound)
+            .take_while(|(f, c)| f.id == c.1)
+            .count();
+        if lv.frames.len() > common {
+            while lv.frames.len() > common {
+                close_frame(lv);
+            }
+            let closer = unit
+                .seg
+                .argv
+                .first()
+                .is_some_and(|f| matches!(f.as_str(), "}" | "fi" | "done" | "esac"));
+            if !closer {
+                // `( … ) && x`: the group's place in the chain is the join
+                // written after it (none read: a `;`)
+                let j = lv.last_close.unwrap_or(Join::Seq);
+                if j == Join::And {
+                    lv.pool.extend(lv.cands.iter().cloned());
+                }
+                lv.last_join = j;
+                lv.pending = j != Join::And && !lv.pool.is_empty();
+            }
+        }
+        for &(kind, id) in &unit.compound[common..] {
+            if lv.pending {
+                flush_pool(lv, &mut seen, home, start, &mut w);
+            }
+            lv.frames.push(Frame {
+                id,
+                kind,
+                entry: lv.cands.clone(),
+                saved_pool: std::mem::take(&mut lv.pool),
+                saved_last_join: lv.last_join,
+            });
+            lv.last_join = Join::Seq;
+        }
+        too_many(lv, &mut seen, home, start, &mut w);
         if lv.pending {
             flush_pool(lv, &mut seen, home, start, &mut w);
         }
@@ -757,7 +854,16 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
             return w;
         }
         let join = unit.join;
-        match cd_effect(unit, &lv.cands, start, home, resolve) {
+        // a `cd` in a loop or a function body may run any number of times
+        let repeats = lv
+            .frames
+            .iter()
+            .any(|f| matches!(f.kind, Compound::Loop | Compound::Func));
+        let effect = match cd_effect(unit, &lv.cands, start, home, resolve) {
+            Some(Cd::Moved(t)) if repeats => Some(Cd::Lost(t)),
+            e => e,
+        };
+        match effect {
             None => {
                 if join == Join::And {
                     lv.pool.extend(lv.cands.iter().cloned());
@@ -791,6 +897,7 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
             }
         }
         lv.last_join = join;
+        lv.last_close = unit.close_join;
         if join != Join::And && !lv.pool.is_empty() {
             lv.pending = true;
         }
