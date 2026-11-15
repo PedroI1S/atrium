@@ -61,6 +61,10 @@ GATE_MB = 150
 MIB_PER_MB = 1_000_000 / 1_048_576  # the budgets are in MB; the numbers are in MiB
 
 
+def mb(mib: float) -> float:
+    return mib / MIB_PER_MB
+
+
 def build() -> None:
     subprocess.run(["pnpm", "build"], cwd=ROOT / "app", check=True, stdout=subprocess.DEVNULL)
     subprocess.run(
@@ -75,7 +79,7 @@ def reports(log: pathlib.Path) -> list[dict]:
         if line.startswith("ATRIUM_REPORT "):
             report = json.loads(line[len("ATRIUM_REPORT "):])
             if report.get("kind") == "failure":
-                raise SystemExit(f"the app failed; see {log}")
+                raise SystemExit(f"the app failed: {report}; log tail:\n{log.read_text(errors='replace')[-1500:]}")
             out.append(report)
     return out
 
@@ -236,7 +240,7 @@ def summarize(samples: list[dict]) -> dict:
     out["max"] = max(s["budgeted"] for s in samples)
     run = longest = 0
     for s in samples:
-        run = run + 1 if s["budgeted"] * MIB_PER_MB > GATE_MB else 0
+        run = run + 1 if mb(s["budgeted"]) > GATE_MB else 0
         longest = max(longest, run)
     out["longestOverGateS"] = longest
     return out
@@ -247,7 +251,7 @@ def mem_line(m: dict) -> str:
         return f"footprint {m['budgeted']:.1f} MiB"
     gpu = f"GPU resident {m['gpuResident']:.1f} / total {m['gpuTotal']:.1f}" if m.get("gpuResident") is not None else "GPU none"
     roles = ", ".join(f"{k[5:]} {v:.1f}" for k, v in m.items() if k.startswith("role:"))
-    return (f"private PSS {m['budgeted']:.1f} MiB ({m['budgeted'] / MIB_PER_MB:.1f} MB) [{roles}]; "
+    return (f"private PSS {m['budgeted']:.1f} MiB ({mb(m['budgeted']):.1f} MB) [{roles}]; "
             f"PSS {m['pss']:.1f}, RSS {m['rss']:.1f}, USS {m['uss']:.1f}, {gpu}")
 
 
@@ -262,11 +266,14 @@ def idle_launches(app_path, home, logs, n, extra_env) -> list[dict]:
             time.sleep(5)
             mac = sorted(webkit_pids() - before) if not LINUX else []
             samples = sample_window(app.pid, mac, 61)
+            # The window must have been measured connected, as a user's is (see `main`).
+            daemon_up = bool(daemons_of(home))
         finally:
             stop_app(app)
-        summary = summarize(samples)
+        summary = summarize(samples) | {"daemonRunning": daemon_up}
         launches.append(summary)
-        print(f"  launch {run + 1}: median {mem_line(summary)}; max sample {summary['max']:.1f} MiB")
+        print(f"  launch {run + 1}: median {mem_line(summary)}; max sample {summary['max']:.1f} MiB"
+              f"{'' if daemon_up else '; NO DAEMON RUNNING: the app was not connected'}")
     return launches
 
 
@@ -391,9 +398,13 @@ def main() -> int:
         build()
     print(f"binary {app_path}; extra env {extra_env or 'none'}")
     print(f"at start: {conditions()}")
-    home = pathlib.Path(tempfile.mkdtemp(prefix="atrium-bench-", dir="/tmp"))
-    home.chmod(0o700)
-    logs = home / "logs"
+    # The bench's own logs stay out of ATRIUM_HOME: a `logs` folder made there with the default
+    # mode (0755) is the daemon's log folder, and the daemon then doesn't start at all (silently),
+    # so the app was measured while it retried the connection (found by M1-14b).
+    work = pathlib.Path(tempfile.mkdtemp(prefix="atrium-bench-", dir="/tmp"))
+    home = work / "home"
+    home.mkdir(mode=0o700)
+    logs = work / "bench-logs"
     logs.mkdir()
     result: dict = {"kind": "startup-bench", "binary": str(app_path), "env": extra_env, "startConditions": conditions()}
     try:
@@ -422,10 +433,10 @@ def main() -> int:
             kind = "phys_footprint" if not LINUX else "private PSS (D-040)"
             print(f"Idle memory, one window, {args.memory_launches} launches (median of 1 Hz samples 5–65 s after TTI):")
             launches = idle_launches(app_path, home, logs, args.memory_launches, extra_env)
-            memory_pass = all(m["budgeted"] * MIB_PER_MB < GATE_MB for m in launches)
+            memory_pass = all(mb(m["budgeted"]) < GATE_MB for m in launches)
             worst = max(m["budgeted"] for m in launches)
             print(f"Idle memory ({kind}): per-launch medians {min(m['budgeted'] for m in launches):.1f}–{worst:.1f} MiB "
-                  f"({worst / MIB_PER_MB:.1f} MB at worst), worst sample {max(m['max'] for m in launches):.1f} MiB, "
+                  f"({mb(worst):.1f} MB at worst), worst sample {max(m['max'] for m in launches):.1f} MiB, "
                   f"longest run over {GATE_MB} MB {max(m['longestOverGateS'] for m in launches)} s "
                   f"({'within' if memory_pass else 'OVER'} the gate of {GATE_MB} MB)")
             result.update(memory=launches, memoryPass=memory_pass)
@@ -453,7 +464,13 @@ def main() -> int:
     finally:
         stop_daemon(home)
         time.sleep(0.5)
-        shutil.rmtree(home, ignore_errors=True)
+        if sys.exc_info()[0] is not None:
+            # A failed run keeps its logs (the app's and the daemon's) to look at.
+            kept = pathlib.Path(tempfile.mkdtemp(prefix="atrium-bench-failed-", dir="/tmp"))
+            for log in [*logs.glob("*.log"), *(home / "logs").glob("*")]:
+                shutil.copy(log, kept)
+            print(f"logs kept in {kept}", file=sys.stderr)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":
