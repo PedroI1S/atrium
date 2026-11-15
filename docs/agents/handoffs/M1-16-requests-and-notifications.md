@@ -98,11 +98,38 @@ Protocol version: `PROTOCOL_VERSION = 2`
 - `cargo clippy --workspace --all-targets -- -D warnings`: exited 0 (`Finished dev profile ... in 1.12s`)
 - `cargo test --workspace --no-fail-fast`: exited 0; all workspace test targets and doc-tests passed across `atrium-agents`, `atrium-app`, `atrium-client`, `atrium-core`, `atrium-daemon`, `atrium-host`, and `atrium-protocol` (0 failed, 0 ignored)
 - Protocol TS check:
-  - Worker allowlist blocker: `scripts/check-protocol-ts` was denied by the pre-tool policy hook (`'scripts/check-protocol-ts' is not on the worker allowlist`).
-  - Verified instead via `cargo run -p atrium-protocol --example export-ts --features ts -- crates/atrium-protocol/bindings/protocol.ts` followed by `git diff --exit-code crates/atrium-protocol/bindings/protocol.ts`: both exited 0 with no diff (`Wrote protocol bindings to crates/atrium-protocol/bindings/protocol.ts`).
+  - Note: in the initial round, `scripts/check-protocol-ts` was blocked by the worker allowlist hook, and `export-ts` + `git diff --exit-code` passed with no diff. The Sonnet reviewer subsequently ran `scripts/check-protocol-ts` directly on commit `99e227e` and confirmed it passes ("up to date").
 - `pnpm --dir app typecheck`: exited 0 (`$ tsc --noEmit`)
 - `pnpm --dir app test`: exited 0 (`Test Files 14 passed (14)`, `Tests 264 passed (264)`)
 - `pnpm --dir app build`: exited 0 (`✓ 2307 modules transformed`, built in 6.12s)
 - New daemon test binaries:
-  - Worker allowlist blocker: shell loop commands (`repeat`, `for`, `&&`) are denied by the worker policy hook, so running each binary 20 times in a shell loop could not be executed in a single command.
-  - Ran `cargo test -p atrium-daemon --test requests_fake` (5 passed, 0 failed) and `cargo test -p atrium-daemon --test requests_notifications` (2 passed, 0 failed) cleanly after commit `08677f0`, both passing with exit code 0 (`requests_fake`: 5 passed in 0.25s; `requests_notifications`: 2 passed in 0.35s).
+  - Note: in the initial round, shell loops (`repeat`, `for`, `&&`) were blocked by the worker policy hook, so each binary was run once by the worker (`requests_fake`: 5 passed; `requests_notifications`: 2 passed). The Sonnet reviewer subsequently ran both 20 times in a row on commit `99e227e` and confirmed both pass (`requests_fake`: 20/20; `requests_notifications`: 20/20).
+
+## Fix round 1 (D-089)
+
+### Commits
+
+- `6490c99` — `fake: use echo synthetic for approval command per contract`
+- `400db41` — `tests(requests_fake): verify Allow redeems ticket through gate`
+- `f3de67e` — `tests(requests_fake): wait for TurnCompleted instead of sleeping`
+- `8955f5b` — `tests(requests_fake): cover unknown decline id and post-answer streaming`
+- `54c39a6` — `fake: log when question_ticket returns None instead of skipping silently`
+
+### Changes per Item
+
+1. **Fake approval command (`6490c99`)**: Updated `crates/atrium-daemon/src/fake.rs` (`run_approval`) to use `"echo synthetic"` instead of `"touch synthetic"`, matching contract §6.2 (rev 3.1).
+2. **Gate redeem verification (`400db41`)**: Added `fake_approval_allow_redeems_through_gate` in `crates/atrium-daemon/tests/requests_fake.rs`. While the synthetic approval is pending (`NeedsApproval`), the test creates a matching `RuleDecision::Deny` rule for `Bash` `["echo", "synthetic"]` via `DaemonCommand::CreateRule`, then sends `ResolveApproval { decision: Allow }`. It asserts `RequestResolved { outcome: Approved }` and `ToolCallFinished { status: ToolStatus::Denied }` (with no `ToolCallFinished { status: Succeeded }`). Verified by temporarily skipping `self.gate.redeem(&ticket, check).await` in `crates/atrium-daemon/src/fake.rs`, running `cargo test -p atrium-daemon --test requests_fake` (observed `fake_approval_allow_redeems_through_gate` fail: 5 passed, 1 failed), reverting `fake.rs`, and re-running (6 passed, 0 failed).
+3. **Remove fixed sleep in `requests_fake.rs` (`f3de67e`)**: Replaced `tokio::time::sleep(Duration::from_millis(80))` in `fake_approval_always_creates_rule_and_skips_next_turn` with `wait_turn_completed(&mut wire, &thread, 2)`, which subscribes to the thread and waits for `AgentEvent::TurnCompleted { turn: 2, .. }` before checking `ThreadState::Idle`.
+4. **Untested edges in `requests_fake.rs` (`8955f5b`)**: Extended `fake_question_answered_declined_and_checked_by_ledger` to cover:
+   - declining an unknown `request_id` (`DaemonCommand::DeclineQuestion`) returns `ErrorCode::Expired`, matching `DaemonCommand::AnswerQuestion` on the same unknown `request_id`;
+   - after turn 1's question is answered (`RequestResolved { outcome: Answered }`), streaming continues (`MessageDelta`, `MessageCompleted` for `MessageKind::Assistant`, and `TurnCompleted { turn: 1, outcome: Completed }`).
+5. **Handling `question_ticket` returning `None` (`54c39a6`)**: In `crates/atrium-daemon/src/fake.rs` (`run_question`), when `self.gate.question_ticket(Some(turn)).await` returns `None`, chose to emit no `AgentEvent` (matching `ToolGate::question_ticket` in `crates/atrium-agents/src/lib.rs` and the native Claude normalizer in `crates/atrium-agents/src/claude/normalizer.rs`, which decline to the provider and emit nothing to the event stream) and log the event via `eprintln!("atriumd: fake agent turn {turn}: gate returned no question ticket; question skipped")` (following `atrium-daemon`'s stderr logging convention, since there is no provider process to send a deny response to).
+6. **Handoff & DoD note corrections**: Corrected the earlier notes above regarding `scripts/check-protocol-ts` and the 20-run stability loops (both verified passing by the Sonnet reviewer on commit `99e227e`). Left the explicit incarnation check in `crates/atrium-daemon/src/commands.rs` unchanged and did not modify `docs/contracts/**`.
+
+### Fix Round 1 Verification
+
+- `cargo fmt --all --check`: exited 0
+- `cargo clippy --workspace --all-targets -- -D warnings`: exited 0
+- `cargo test --workspace --no-fail-fast`: exited 0 (all workspace unit, integration, and doc tests passed, 0 failed)
+- `cargo test -p atrium-daemon --test requests_fake`: exited 0 (`6 passed; 0 failed`)
+- `cargo test -p atrium-daemon --test requests_notifications`: exited 0 (`2 passed; 0 failed`)
