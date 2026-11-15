@@ -582,3 +582,6 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 
 ## D-093 — 2026-11-15 — Pedro's go: M1-08 fix round
 **Decided by Pedro (driver):** "Yes, fix round". The Opus review (`reviews/M1-08-codex-adapter.md`: approve with changes) asked eight things before merge. The same Hydrogen `high` worker does them, after the orchestrator merged `dev` into its branch (`4af4b39`; the worker policy refuses `git merge`), because the branch predated M1-16 and doesn't compile on `dev` without handling `DeclineQuestion`. The orchestrator checks the fixes (re-running the two surviving mutations); a second Opus look only if the approval path changes beyond the review's asks.
+
+## D-094 — 2026-11-15 — Pedro: review M1-15 and M1-17
+**Decided by Pedro (driver).** After stopping the first M1-15 review ("dont"), Pedro said "yeah you can review both". M1-15 gets its Opus 5.5 review as D-090 planned, restarted from the beginning; M1-17 gets its Sonnet 5.5 review as D-091 planned. Both read-only, in scratch clones that are deleted afterwards.
