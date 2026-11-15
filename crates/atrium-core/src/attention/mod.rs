@@ -28,8 +28,11 @@ pub enum AttentionInput<'a> {
 ///   the sticky states below, which it never leaves.
 /// - Sticky until the next `Signal::Starting`: `Failed` (after a fatal
 ///   `Error`), `Ended` and `Interrupted`; the `TurnCompleted`,
-///   `SessionEnded` and `Signal::Exited` that follow keep them. `Paused`
-///   (after `RateLimited`) is kept by those closing events too.
+///   `SessionEnded` and `Signal::Exited` that follow keep them. Exception
+///   (CR-09): `Signal::Recovered { cleanup: Unverified }` moves `Ended` and
+///   `Interrupted { cleanup: Verified }` to `Interrupted { cleanup: Unverified }`
+///   (`Failed` keeps its message and stays `Failed`). `Paused` (after
+///   `RateLimited`) is kept by those closing events too.
 /// - Otherwise, the end of a session (`SessionEnded`, or `Signal::Exited`
 ///   if it comes first): exit code `Some(0)` → `Ended`; any other code or
 ///   `None` → `Interrupted { cleanup: Verified }`. (The closing

@@ -24,12 +24,17 @@ const RESTARTED: &str = "the daemon restarted";
 /// any session starts:
 /// 1. every recorded process is checked and its group killed
 ///    (`supervise::kill_recorded`);
-/// 2. every listed thread whose current incarnation has no `SessionEnded`
+/// 2. every unfinished current incarnation reported by
+///    `Store::unfinished_incarnations` (archived threads included), plus every
+///    remaining listed thread with `incarnation > 0` (the zero-event fallback),
 ///    is closed from the store's projections, whatever its state says (a
 ///    user's stop or full storage settles the state before the closing
 ///    events are stored). It becomes `Interrupted` with the cleanup's
-///    result, unless its state was settled already;
-/// 3. the ledger expires everything.
+///    result, unless its state was settled already (with CR-09's exception:
+///    an unverified cleanup moves `Ended` and `Interrupted { Verified }` to
+///    `Interrupted { Unverified }`);
+/// 3. recorded `sessions.process` entries are cleared once every closure
+///    succeeds, and the ledger expires everything.
 ///
 /// A closure that can't be stored fails the start: nothing is cleared, and
 /// the next start tries again.
