@@ -6,7 +6,6 @@ use atrium_protocol::thread::{ThreadId, ThreadState};
 use atrium_protocol::wire::{AgentLaunch, DaemonCommand, ErrorCode};
 use serde_json::{Value, json};
 
-#[allow(dead_code)]
 mod common;
 
 use common::{Rig, Start, native};

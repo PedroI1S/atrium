@@ -8,7 +8,6 @@ use atrium_protocol::policy::{RememberScope, Rule};
 use atrium_protocol::thread::{ThreadId, ThreadState};
 use atrium_protocol::wire::{AgentLaunch, DaemonCommand, ErrorCode, StoredEvent};
 
-#[allow(dead_code)]
 mod common;
 
 use common::{Rig, kinds};
