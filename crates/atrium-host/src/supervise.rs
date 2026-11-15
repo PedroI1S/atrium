@@ -88,19 +88,26 @@ pub fn spawn_group(mut command: tokio::process::Command) -> io::Result<Supervise
 }
 
 /// After the adapter's provider-specific soft stop: waits up to `grace` for
-/// the leader, then `SIGKILL`s the whole group, and only then reaps the
-/// leader (so the group id can't be reused in between; use `WNOWAIT` to see
-/// an early exit without reaping). Also kills the group when the leader
-/// exited on its own but descendants remain.
+/// the leader, then `SIGKILL`s the whole group and the leader itself (by pid,
+/// in case it has moved to another process group), and only then reaps the
+/// leader (so neither its pid nor the group id can be reused in between; an
+/// early exit is seen with `WNOWAIT`, without reaping). Also kills the group
+/// when the leader exited on its own but descendants remain.
 ///
 /// The caller must **not** reap `child.child` itself first (adapters call
 /// `terminate`, never `wait` or `try_wait`); reaping the leader early would
-/// release its process group id for reuse before the group can be signalled.
-/// Returns `Ok` only once the process group is verified empty (`ESRCH`).
+/// release its pid and process group id for reuse before they can be
+/// signalled. Returns `Ok` only once the process group is verified empty
+/// (`ESRCH`).
+///
+/// How long it takes: up to `grace`, then the reap of the `SIGKILL`ed leader
+/// (prompt, unless the kernel holds it, e.g. in uninterruptible sleep), then
+/// up to 2 s for the rest of the group to drain.
 pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Result<Termination> {
     let (pid, pgid) = check_unreaped_leader(child)?;
     let exited_in_grace = wait_until_exited_no_reap(pid, grace).await?;
     let macos_zombie_eperm = kill_group_while_unreaped(pid, pgid)?;
+    kill_leader_while_unreaped(&mut child.child)?;
 
     let status = child.child.wait().await?;
     wait_for_group_drain(pgid, GROUP_DRAIN_TIMEOUT).await;
@@ -113,15 +120,25 @@ pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Resu
 /// that spawned `child` is blocked or shutting down.
 ///
 /// Follows the same order as [`terminate`]: check for an early exit without
-/// reaping (`WNOWAIT`), `SIGKILL` the group while the leader is unreaped, wait
-/// for and reap the leader without touching a tokio reactor (through
-/// `waitid(WNOWAIT)` + [`tokio::process::Child::try_wait`], so `Child` marks
-/// itself reaped and `kill_on_drop` does not act again), then verify the group
-/// is empty (`ESRCH`).
+/// reaping (`WNOWAIT`), `SIGKILL` the group and then the leader by pid while
+/// the leader is unreaped, wait for and reap the leader without touching a
+/// tokio reactor (through `waitid(WNOWAIT)` + [`tokio::process::Child::try_wait`],
+/// so `Child` marks itself reaped and `kill_on_drop` does not act again), then
+/// verify the group is empty (`ESRCH`).
+///
+/// The caller must **not** reap `child.child` first, through tokio or
+/// otherwise (`waitpid(-1)` included): only a reap through tokio is detected,
+/// and any other one releases the pid and group id before they are signalled.
+///
+/// It blocks the calling thread for up to `grace`, then for the reap of the
+/// `SIGKILL`ed leader (prompt, but unbounded if the kernel holds the leader,
+/// e.g. in uninterruptible sleep), then for up to 2 s while the rest of the
+/// group drains.
 pub fn terminate_blocking(child: &mut SupervisedChild, grace: Duration) -> io::Result<Termination> {
     let (pid, pgid) = check_unreaped_leader(child)?;
     let exited_in_grace = wait_until_exited_no_reap_sync(pid, grace)?;
     let macos_zombie_eperm = kill_group_while_unreaped(pid, pgid)?;
+    kill_leader_while_unreaped(&mut child.child)?;
 
     let status = reap_leader_blocking(&mut child.child, pid)?;
     wait_for_group_drain_sync(pgid, GROUP_DRAIN_TIMEOUT);
@@ -139,8 +156,10 @@ fn check_unreaped_leader(child: &SupervisedChild) -> io::Result<(u32, u32)> {
     Ok((child.identity.pid, child.identity.pgid))
 }
 
-fn kill_group_while_unreaped(pid: u32, pgid: u32) -> io::Result<bool> {
-    let _ = pid;
+fn kill_group_while_unreaped(
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] pid: u32,
+    pgid: u32,
+) -> io::Result<bool> {
     // Send SIGKILL to the whole process group while the leader is still an
     // unreaped child (pinned in the process table, so `pgid` cannot have been
     // recycled by the kernel yet).
@@ -155,6 +174,20 @@ fn kill_group_while_unreaped(pid: u32, pgid: u32) -> io::Result<bool> {
         Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(false),
         #[cfg(target_os = "macos")]
         Err(err) if err.raw_os_error() == Some(libc::EPERM) && peek_exited(pid)? => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+/// `SIGKILL`s the leader by pid, for a leader that has left its process
+/// group (`setpgid` after [`spawn_group`]), which the group kill misses. The
+/// leader is still an unreaped child of this process, so its pid can't have
+/// been reused. Goes through std's `Child::kill` (via tokio's `start_kill`),
+/// which sends nothing once the child is reaped. A leader that is already a
+/// zombie may answer `ESRCH` (XNU); it is dead, so that is not an error.
+fn kill_leader_while_unreaped(child: &mut tokio::process::Child) -> io::Result<()> {
+    match child.start_kill() {
+        Ok(()) => Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -386,11 +419,9 @@ fn reap_leader_blocking(
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            if err.raw_os_error() == Some(libc::ECHILD)
-                && let Some(status) = child.try_wait()?
-            {
-                return Ok(status);
-            }
+            // `ECHILD` (someone else reaped the leader, e.g. `waitpid(-1)`)
+            // is returned as is: std holds no cached status (the
+            // `try_wait` above returned `None`), so retrying can't recover it.
             return Err(err);
         }
         if let Some(status) = child.try_wait()? {
