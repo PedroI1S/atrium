@@ -14,7 +14,8 @@ ATRIUM_BENCH=stream (app/src/stream-bench.ts), which starts 10 synthetic threads
 Per run it prints the app's frame statistics (requestAnimationFrame deltas: WebKitGTK gives a
 page no presentation timestamps) against the gate (at most 1 % of frames over 16.7 ms, p99 at
 most 33 ms), and the peak memory while it ran, sampled at 1 Hz: the web content process, and
-the app with all its webview processes (private PSS on Linux, `phys_footprint` on macOS).
+the app with all its webview processes (D-040's private PSS on Linux, from `linuxmem.py`, with
+the GPU memory peak beside it; `phys_footprint` on macOS).
 
 The window must stay visible and uncovered: a hidden window gets no animation frames, and such
 a run is reported as invalid. Run it on the machine's own desktop session.
@@ -29,8 +30,9 @@ import sys
 import tempfile
 import time
 
+import linuxmem
 import startup_bench
-from startup_bench import ROOT, memory_mib, report_of, stop_daemon, webkit_pids
+from startup_bench import LINUX, ROOT, footprint_mib, reports, stop_daemon, webkit_pids
 
 TIMEOUT_S = 180
 
@@ -43,10 +45,9 @@ def one_run(app_path: pathlib.Path, run: int, mode: str = "stream") -> dict:
     home = pathlib.Path(tempfile.mkdtemp(prefix="atrium-stream-", dir="/tmp"))
     home.chmod(0o700)
     log = home / "app.log"
-    startup_bench.APP = app_path
-    before = webkit_pids()
-    app = startup_bench.launch(home, mode, log)
-    peak_web = peak_total = 0.0
+    before = webkit_pids() if not LINUX else set()
+    app, _ = startup_bench.launch(app_path, home, mode, log, {})
+    peak_web = peak_total = peak_gpu = 0.0
     samples = 0
     try:
         deadline = time.monotonic() + TIMEOUT_S
@@ -57,14 +58,21 @@ def one_run(app_path: pathlib.Path, run: int, mode: str = "stream") -> dict:
             if app.poll() is not None:
                 raise SystemExit(f"the app exited without a report; see {log}")
             tick = time.monotonic()
-            ours = sorted(webkit_pids() - before)
-            web = [memory_mib(pid) or 0.0 for pid in ours if "WebContent" in command_of(pid) or "WebKitWebProcess" in command_of(pid)]
-            rest = [memory_mib(pid) or 0.0 for pid in [app.pid, *ours]]
-            peak_web = max(peak_web, max(web, default=0.0))
-            peak_total = max(peak_total, sum(rest))
+            if LINUX:
+                # D-040's private PSS (linuxmem.py): the web process, and the app's whole tree.
+                sample = linuxmem.sample(app.pid)
+                peak_web = max(peak_web, linuxmem.mib(sample["roles"].get("web", {}).get("private_pss", 0)))
+                peak_total = max(peak_total, linuxmem.mib(sample["total"]["private_pss"]))
+                peak_gpu = max(peak_gpu, linuxmem.mib(sample["gpu"]["resident"]) if sample["gpu"] else 0.0)
+            else:
+                ours = sorted(webkit_pids() - before)
+                web = [footprint_mib(pid) or 0.0 for pid in ours if "WebContent" in command_of(pid)]
+                rest = [footprint_mib(pid) or 0.0 for pid in [app.pid, *ours]]
+                peak_web = max(peak_web, max(web, default=0.0))
+                peak_total = max(peak_total, sum(rest))
             samples += 1
             time.sleep(max(0.0, 1.0 - (time.monotonic() - tick)))
-            report = report_of(log, "stream")
+            report = next((r for r in reports(log) if r.get("kind") == "stream"), None)
     except SystemExit:
         # Say why before the folder goes: the log is the only record of a failed run.
         print(f"run {run} failed; the end of its log:\n{log.read_text(errors='replace')[-3000:]}")
@@ -77,6 +85,7 @@ def one_run(app_path: pathlib.Path, run: int, mode: str = "stream") -> dict:
     report["run"] = run
     report["peakWebContentMiB"] = round(peak_web, 1)
     report["peakAppAndWebviewsMiB"] = round(peak_total, 1)
+    report["peakGpuResidentMiB"] = round(peak_gpu, 1) if LINUX else None
     report["memorySamples"] = samples
     return report
 
@@ -95,7 +104,7 @@ def main() -> int:
         cwd=ROOT, check=True,
     )
     app_path = ROOT / "target" / profile / "atrium"
-    kind = "phys_footprint" if sys.platform == "darwin" else "private PSS"
+    kind = "phys_footprint" if not LINUX else "private PSS, D-040"
     reports = []
     for run in range(1, args.runs + 1):
         report = one_run(app_path, run, args.mode)
@@ -103,11 +112,13 @@ def main() -> int:
         frame = report["frameMs"]
         valid = not report["hidden"] and report["hiddenDuring"] == 0 and report["frames"] > 0
         within = report["overGateFramePct"] <= 1.0 and frame["p99"] <= 33
+        gpu = f", GPU resident peak {report['peakGpuResidentMiB']} MiB" if LINUX else ""
         print(f"run {run}: {report['tokensPerSecond']} tokens/s over {report['seconds']} s, {report['fps']} fps, "
               f"frame p50 {frame['p50']} / p95 {frame['p95']} / p99 {frame['p99']} / max {frame['max']} ms, "
               f"{report['overGateFramePct']} % of {report['frames']} frames over 16.7 ms ({report.get('overGateBeyondResolutionPct')} % over it by more than the 1 ms timestamp resolution), "
               f"{report['longFrames']} long frames ({report['longFramesPct']} %, over 1.5 refresh intervals; {report['droppedFrames']} updates dropped), "
               f"web content peak {report['peakWebContentMiB']} MiB, app and webviews peak {report['peakAppAndWebviewsMiB']} MiB ({kind})"
+              f"{gpu}"
               f"{'' if valid else '  INVALID: the window was hidden'}"
               f"  -> {'within' if within else 'OVER'} the gate")
         print(f"        main-thread work while streaming: {json.dumps(report.get('work', {}))}")

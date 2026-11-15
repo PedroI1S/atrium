@@ -194,7 +194,7 @@ def sample(root: int) -> dict:
         mem = smaps_kb(pid)
         if mem is None:
             continue
-        role = roles.setdefault(role_of(exe_name(pid)), dict.fromkeys(KEYS, 0) | {"count": 0})
+        role = roles.setdefault("ui" if pid == root else role_of(exe_name(pid)), dict.fromkeys(KEYS, 0) | {"count": 0})
         role["count"] += 1
         for k in KEYS:
             total[k] += mem[k]
