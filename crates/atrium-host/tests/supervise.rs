@@ -626,3 +626,338 @@ fn main() {
         assert!(!pid_exists(pid));
     }
 }
+
+// ---- M1-07c (N8): a leader that leaves its group, SIGTERM-ignoring leaders,
+// and a group that holds only the zombie leader.
+
+/// `kill(-pgid, 0)`: `true` while the group has any member (a zombie counts).
+fn group_exists(pgid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pgid) else {
+        return false;
+    };
+    if raw <= 1 {
+        return false;
+    }
+    // SAFETY: Signal 0 only checks existence and permission; `raw > 1`, so
+    // `-raw <= -2` never addresses every process or the caller's group 0.
+    let rc = unsafe { libc::kill(-raw, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+const LEAVE_GROUP_HELPER_ENV: &str = "ATRIUM_SUPERVISE_LEAVE_GROUP_HELPER";
+
+/// In helper mode (the env var set), this test binary is the provider leader:
+/// it moves itself out of the group `spawn_group` gave it, prints `LEFT <pgid>`
+/// and sleeps. A process-group leader can't `setsid` (`EPERM`) and
+/// `setpgid(0, 0)` would keep it in its own group, so it joins a new group
+/// made by a short-lived child of its own, which it then kills and reaps.
+/// Without the env var this test does nothing.
+#[test]
+fn helper_leader_leaves_its_group() {
+    use std::os::unix::process::CommandExt;
+
+    if std::env::var_os(LEAVE_GROUP_HELPER_ENV).is_none() {
+        return;
+    }
+    let mut kid = std::process::Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("helper: spawn group maker");
+    let new_pgid = i32::try_from(kid.id()).expect("helper: pid fits i32");
+    // SAFETY: `setpgid` has no memory-safety preconditions. It moves only
+    // this process into `new_pgid`, the group of its own live child in the
+    // same session.
+    let rc = unsafe { libc::setpgid(0, new_pgid) };
+    assert_eq!(
+        rc,
+        0,
+        "helper: setpgid: {}",
+        std::io::Error::last_os_error()
+    );
+    let _ = kid.kill();
+    let _ = kid.wait();
+    println!("LEFT {new_pgid}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    // Backstop only: the parent test kills this process long before.
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+fn leave_group_command() -> Command {
+    let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.arg("--exact")
+        .arg("helper_leader_leaves_its_group")
+        .arg("--nocapture")
+        .arg("--quiet")
+        .env(LEAVE_GROUP_HELPER_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    cmd
+}
+
+/// Reads stdout up to `LEFT <pgid>` and checks the leader really moved.
+async fn wait_until_left(sup: &mut atrium_host::supervise::SupervisedChild) -> u32 {
+    let stdout = sup.child.stdout.take().expect("stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let new_pgid: u32 = loop {
+        let line = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("helper exited before LEFT");
+        if let Some(rest) = line.trim().strip_prefix("LEFT ") {
+            break rest.parse().expect("parse new pgid");
+        }
+    };
+    let old_pgid = sup.identity.pgid;
+    assert_ne!(new_pgid, old_pgid);
+    let live = identify(sup.identity.pid)
+        .unwrap()
+        .expect("leader alive after leaving");
+    assert_eq!(live.pgid, new_pgid, "the leader must be in its new group");
+    assert!(
+        !group_exists(old_pgid),
+        "the old group must hold nobody now"
+    );
+    new_pgid
+}
+
+#[tokio::test]
+async fn terminate_kills_a_leader_that_left_its_group() {
+    let mut sup = spawn_group(leave_group_command()).expect("spawn_group");
+    let (leader_pid, old_pgid) = (sup.identity.pid, sup.identity.pgid);
+    let new_pgid = wait_until_left(&mut sup).await;
+
+    let started = std::time::Instant::now();
+    // Bounded: on code that never signals the leader by pid, this times out
+    // (and dropping `sup` then kills the leader through `kill_on_drop`).
+    let term = tokio::time::timeout(Duration::from_secs(10), terminate(&mut sup, Duration::ZERO))
+        .await
+        .expect("terminate must not wait for a leader outside its group")
+        .expect("terminate");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(term.killed);
+    assert_eq!(term.exit_code, None);
+    assert!(!pid_exists(leader_pid), "the leader must be gone");
+    assert!(!group_exists(old_pgid), "the old group must be gone");
+    assert!(
+        !group_exists(new_pgid),
+        "the leader's new group must be gone"
+    );
+}
+
+#[test]
+fn terminate_blocking_kills_a_leader_that_left_its_group() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current_thread runtime");
+    let (mut sup, new_pgid) = rt.block_on(async {
+        let mut sup = spawn_group(leave_group_command()).expect("spawn_group");
+        let new_pgid = wait_until_left(&mut sup).await;
+        (sup, new_pgid)
+    });
+    let (leader_pid, old_pgid) = (sup.identity.pid, sup.identity.pgid);
+
+    let started = std::time::Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let term = terminate_blocking(&mut sup, Duration::ZERO);
+        let reaped = sup.child.id().is_none();
+        let _ = tx.send((term, reaped));
+    });
+    let Ok((term, reaped)) = rx.recv_timeout(Duration::from_secs(10)) else {
+        // Bounded: the worker is blocked reaping the leader, which is still
+        // unreaped, so its pid is ours to kill. Then fail.
+        drop(KillPidGuard(leader_pid));
+        let _ = worker.join();
+        panic!("terminate_blocking waited for a leader outside its group");
+    };
+    worker.join().expect("terminate thread");
+    let term = term.expect("terminate_blocking");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(reaped, "tokio Child must record the leader as reaped");
+    assert!(term.killed);
+    assert_eq!(term.exit_code, None);
+    assert!(!pid_exists(leader_pid), "the leader must be gone");
+    assert!(!group_exists(old_pgid), "the old group must be gone");
+    assert!(
+        !group_exists(new_pgid),
+        "the leader's new group must be gone"
+    );
+    drop(rt);
+}
+
+/// A leader that ignores `SIGTERM`, with a `sleep` child in its group.
+fn ignores_sigterm_command() -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("trap '' TERM; echo ready; while :; do sleep 1; done")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    cmd
+}
+
+/// Waits for `ready`, then sends the soft stop (`SIGTERM`) to the leader,
+/// which this test spawned and nobody has reaped.
+async fn ready_then_sigterm(sup: &mut atrium_host::supervise::SupervisedChild) {
+    let stdout = sup.child.stdout.take().expect("stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let line = lines.next_line().await.unwrap().expect("ready line");
+    assert_eq!(line.trim(), "ready");
+    let raw = i32::try_from(sup.identity.pid).unwrap();
+    assert!(raw > 1);
+    // SAFETY: `raw > 1` is this test's own unreaped child, so the pid can't
+    // have been reused; `kill` has no memory-safety preconditions.
+    let rc = unsafe { libc::kill(raw, libc::SIGTERM) };
+    assert_eq!(rc, 0);
+}
+
+const SOFT_GRACE: Duration = Duration::from_millis(300);
+
+#[tokio::test]
+async fn terminate_kills_a_leader_ignoring_sigterm_after_the_grace() {
+    let mut sup = spawn_group(ignores_sigterm_command()).expect("spawn_group");
+    let (leader_pid, pgid) = (sup.identity.pid, sup.identity.pgid);
+    ready_then_sigterm(&mut sup).await;
+
+    let started = std::time::Instant::now();
+    let term = tokio::time::timeout(Duration::from_secs(10), terminate(&mut sup, SOFT_GRACE))
+        .await
+        .expect("terminate bounded")
+        .expect("terminate");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= SOFT_GRACE, "returned after {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "returned after {elapsed:?}"
+    );
+    assert!(
+        term.killed,
+        "the leader ignored SIGTERM: it had to be killed"
+    );
+    assert_eq!(term.exit_code, None);
+    assert!(!pid_exists(leader_pid));
+    assert!(!group_exists(pgid));
+}
+
+#[test]
+fn terminate_blocking_kills_a_leader_ignoring_sigterm_after_the_grace() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current_thread runtime");
+    let mut sup = rt.block_on(async {
+        let mut sup = spawn_group(ignores_sigterm_command()).expect("spawn_group");
+        ready_then_sigterm(&mut sup).await;
+        sup
+    });
+    let (leader_pid, pgid) = (sup.identity.pid, sup.identity.pgid);
+
+    let started = std::time::Instant::now();
+    let term = terminate_blocking(&mut sup, SOFT_GRACE).expect("terminate_blocking");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= SOFT_GRACE, "returned after {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "returned after {elapsed:?}"
+    );
+    assert!(
+        term.killed,
+        "the leader ignored SIGTERM: it had to be killed"
+    );
+    assert_eq!(term.exit_code, None);
+    assert!(sup.child.id().is_none());
+    assert!(!pid_exists(leader_pid));
+    assert!(!group_exists(pgid));
+    drop(sup);
+    drop(rt);
+}
+
+/// `waitid(P_PID, WEXITED | WNOHANG | WNOWAIT)`: `true` once child `pid` is a
+/// waitable zombie; it is left unreaped.
+fn exited_unreaped(pid: u32) -> bool {
+    let raw = i32::try_from(pid).unwrap();
+    assert!(raw > 1);
+    // SAFETY: `siginfo_t` is a C POD valid when all-bits-zero and `&mut info`
+    // outlives the call. `WNOWAIT` leaves the zombie for tokio to reap.
+    // `si_pid` is read only after `rc == 0`, when `waitid` has either filled
+    // the `SIGCHLD` variant or (with `WNOHANG`, nothing to report) left the
+    // zeroed `info` as is, so the union read sees initialised bytes.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            raw as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+        #[cfg(target_os = "macos")]
+        let si_pid = info.si_pid;
+        #[cfg(target_os = "linux")]
+        let si_pid = info.si_pid();
+        si_pid != 0
+    }
+}
+
+/// Waits until the group's only member, the leader, is a waitable, unreaped
+/// zombie. On macOS that is the state where `kill(-pgid, _)` answers `EPERM`
+/// (XNU `killpg1`), so `terminate_blocking` takes its `EPERM` branch; on
+/// Linux the group kill succeeds on the zombie.
+fn wait_for_zombie_only_group(pid: u32, pgid: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !exited_unreaped(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the leader never exited"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let raw = i32::try_from(pgid).unwrap();
+    assert!(raw > 1);
+    // SAFETY: Signal 0 only checks existence and permission; `raw > 1`.
+    let rc = unsafe { libc::kill(-raw, 0) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    #[cfg(target_os = "macos")]
+    assert!(
+        rc != 0 && errno == Some(libc::EPERM),
+        "XNU answers EPERM for a group of zombies (rc {rc}, errno {errno:?})"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(rc, 0, "a zombie still counts as a group member ({errno:?})");
+}
+
+#[test]
+fn terminate_blocking_with_only_the_zombie_leader_in_the_group() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current_thread runtime");
+    for round in 0..20 {
+        let mut sup = rt.block_on(async {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg("exit 3")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            spawn_group(cmd).expect("spawn_group")
+        });
+        let (pid, pgid) = (sup.identity.pid, sup.identity.pgid);
+        wait_for_zombie_only_group(pid, pgid);
+
+        let term = terminate_blocking(&mut sup, Duration::ZERO)
+            .unwrap_or_else(|e| panic!("terminate_blocking, round {round}: {e}"));
+        assert!(!term.killed, "round {round}: the leader had exited");
+        assert_eq!(term.exit_code, Some(3), "round {round}");
+        assert!(sup.child.id().is_none(), "round {round}");
+        assert!(!pid_exists(pid), "round {round}");
+        assert!(!group_exists(pgid), "round {round}");
+    }
+}
