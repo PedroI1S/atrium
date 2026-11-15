@@ -141,8 +141,26 @@ pub(crate) async fn run(
                 if attempt % START_EVERY == 1
                     && let Some(start) = options.start_daemon.clone()
                 {
-                    // Its result shows in whether the next attempts connect.
-                    let _ = tokio::task::spawn_blocking(move || start()).await;
+                    let failure = match tokio::task::spawn_blocking(move || start()).await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(join_error) => {
+                            Some(format!("starting the daemon failed: {join_error}"))
+                        }
+                    };
+                    if let Some(message) = failure {
+                        shared.with_connection(|s| {
+                            s.disconnected(ConnectionState::Failed { message });
+                        });
+                        match control.recv().await {
+                            Some(Control::Reconnect) => {
+                                attempt = 0;
+                                early = 0;
+                                continue;
+                            }
+                            Some(Control::Shutdown) | None => break,
+                        }
+                    }
                 }
                 tokio::select! {
                     message = control.recv() => match message {

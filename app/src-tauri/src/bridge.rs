@@ -200,7 +200,7 @@ pub fn daemon_executable() -> io::Result<PathBuf> {
 /// The hook the client runs when nothing listens on the socket.
 pub fn start_daemon_hook(paths: &Paths) -> StartDaemon {
     let log = paths.logs_dir.join("atriumd.log");
-    let logs_dir = paths.logs_dir.clone();
+    let socket = paths.socket.clone();
     Arc::new(move || {
         let executable = daemon_executable()?;
         if !executable.is_file() {
@@ -209,8 +209,14 @@ pub fn start_daemon_hook(paths: &Paths) -> StartDaemon {
                 format!("atriumd was not found at {}", executable.display()),
             ));
         }
-        lifecycle::secure_dir(&logs_dir).map_err(io::Error::other)?;
-        lifecycle::spawn_detached(&executable, &[], &log).map(|_| ())
+        lifecycle::spawn_detached_wait(
+            &executable,
+            &[],
+            &log,
+            &socket,
+            std::time::Duration::from_millis(500),
+        )
+        .map(|_| ())
     })
 }
 
