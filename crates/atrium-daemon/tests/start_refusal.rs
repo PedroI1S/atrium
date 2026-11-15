@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atrium_client::{Client, ClientOptions, ConnectionState, StartDaemon};
-use atrium_host::lifecycle::{InstanceLock, Paths, secure_dir, spawn_detached_wait};
+use atrium_host::lifecycle::{
+    InstanceLock, Paths, default_paths, secure_dir, spawn_detached_wait,
+};
 use atrium_protocol::PROTOCOL_VERSION;
 use atrium_protocol::wire::{ClientMessage, ClientRole, FrameKind, ServerMessage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -317,4 +319,60 @@ async fn held_instance_lock_connects_once_socket_appears() {
     client.shutdown();
     let _ = accept_task.await;
     drop(lock);
+}
+
+#[tokio::test]
+async fn default_paths_0755_logs_dir_refuses_open_private_log_and_falls_back_to_stderr_pipe() {
+    if std::env::var_os("ATRIUM_N9_SUBPROCESS").as_deref()
+        == Some(std::ffi::OsStr::new("pipe-fallback"))
+    {
+        let paths = default_paths().expect("default_paths with ATRIUM_HOME");
+        let log = paths.logs_dir.join("atriumd.log");
+        let socket = paths.socket.clone();
+        let hook: StartDaemon = Arc::new(move || {
+            spawn_detached_wait(
+                Path::new(env!("CARGO_BIN_EXE_atriumd")),
+                &[],
+                &log,
+                &socket,
+                Duration::from_millis(500),
+            )
+            .map(|_| ())
+        });
+        let client = Client::start(ClientOptions {
+            socket: paths.socket.clone(),
+            name: "n9-pipe-fallback-test".into(),
+            role: ClientRole::Dev,
+            start_daemon: Some(hook),
+        });
+        let message = wait_for_failed(&client).await;
+        assert!(
+            message.contains(&paths.logs_dir.display().to_string())
+                && message.contains("0755")
+                && message.contains("expected 0700"),
+            "client failure must carry piped stderr refusal, got: {message}"
+        );
+        assert!(
+            !paths.logs_dir.join("atriumd.log").exists(),
+            "open_private_log must refuse 0755 logs_dir without creating atriumd.log"
+        );
+        client.shutdown();
+        return;
+    }
+
+    let home = temp_home("atrium-n9-pipe-");
+    let logs_dir = home.path().join("logs");
+    std::fs::create_dir(&logs_dir).expect("create logs dir");
+    std::fs::set_permissions(&logs_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod 0755");
+
+    let status = Command::new(std::env::current_exe().expect("current_exe"))
+        .arg("--exact")
+        .arg("default_paths_0755_logs_dir_refuses_open_private_log_and_falls_back_to_stderr_pipe")
+        .env("ATRIUM_N9_SUBPROCESS", "pipe-fallback")
+        .env("ATRIUM_HOME", home.path())
+        .env("HOME", home.path())
+        .status()
+        .expect("run pipe-fallback subtest");
+    assert!(status.success(), "pipe-fallback subtest failed: {status}");
 }
