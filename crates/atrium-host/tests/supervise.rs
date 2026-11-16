@@ -271,6 +271,142 @@ async fn gone_leader_with_live_descendant_in_group_is_not_verified() {
     assert_eq!(kill_recorded(&recorded), Cleanup::Verified);
 }
 
+const GONE_LEADER_HELPER_ENV: &str = "ATRIUM_SUPERVISE_GONE_LEADER_HELPER";
+const GONE_LEADER_MEMBER_ENV: &str = "ATRIUM_SUPERVISE_GONE_LEADER_MEMBER";
+
+#[test]
+fn helper_gone_leader_spawns_member_holding_stdin() {
+    if std::env::var_os(GONE_LEADER_MEMBER_ENV).is_some() {
+        let mut buf = [0u8; 1];
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut buf);
+        return;
+    }
+    if std::env::var_os(GONE_LEADER_HELPER_ENV).is_none() {
+        return;
+    }
+    // Spawn a member in the same process group (no `process_group(0)`),
+    // inheriting stdin so the parent test controls when it exits. The helper
+    // exits without waiting so the member is reparented to init.
+    #[allow(clippy::zombie_processes)]
+    let child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .arg("--exact")
+        .arg("helper_gone_leader_spawns_member_holding_stdin")
+        .arg("--nocapture")
+        .arg("--quiet")
+        .env(GONE_LEADER_MEMBER_ENV, "1")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn group member");
+    println!("MEMBER:{}", child.id());
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+async fn spawn_gone_leader_with_holding_member() -> (
+    ProcessIdentity,
+    u32,
+    tokio::process::ChildStdin,
+    KillGroupGuard,
+    KillPidGuard,
+) {
+    let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.arg("--exact")
+        .arg("helper_gone_leader_spawns_member_holding_stdin")
+        .arg("--nocapture")
+        .arg("--quiet")
+        .env(GONE_LEADER_HELPER_ENV, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut sup = spawn_group(cmd).expect("spawn_group");
+    let recorded = sup.identity.clone();
+    let group_guard = KillGroupGuard(recorded.pgid);
+    let stdin = sup.child.stdin.take().expect("stdin");
+    let stdout = sup.child.stdout.take().expect("stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let member_pid: u32 = loop {
+        let line = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("helper exited before MEMBER");
+        if let Some(rest) = line.trim().strip_prefix("MEMBER:") {
+            break rest.parse().expect("parse member_pid");
+        }
+    };
+    let member_guard = KillPidGuard(member_pid);
+
+    // Reap ONLY the leader so `identify(recorded.pid)` is `Ok(None)` while
+    // the group member remains alive in `recorded.pgid`.
+    let status = sup.child.wait().await.expect("reap leader");
+    assert!(status.success());
+
+    assert_eq!(identify(recorded.pid).unwrap(), None, "leader must be gone");
+    let member_id = identify(member_pid)
+        .unwrap()
+        .expect("member must still be alive");
+    assert_eq!(member_id.pgid, recorded.pgid);
+
+    (recorded, member_pid, stdin, group_guard, member_guard)
+}
+
+#[tokio::test]
+async fn kill_recorded_returns_verified_when_gone_leader_group_drains_within_timeout() {
+    let (recorded, member_pid, stdin, _group_guard, _member_guard) =
+        spawn_gone_leader_with_holding_member().await;
+
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(stdin);
+    });
+    let started = std::time::Instant::now();
+    let cleanup = kill_recorded(&recorded);
+    let elapsed = started.elapsed();
+    releaser.join().expect("releaser");
+
+    assert_eq!(cleanup, Cleanup::Verified);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "expected drain well under GROUP_DRAIN_TIMEOUT, took {elapsed:?}"
+    );
+    assert!(!pid_exists(member_pid));
+    assert!(!group_exists(recorded.pgid));
+}
+
+#[tokio::test]
+async fn kill_recorded_returns_unverified_and_leaves_member_alive_when_drain_times_out() {
+    let (recorded, member_pid, stdin, _group_guard, _member_guard) =
+        spawn_gone_leader_with_holding_member().await;
+
+    let started = std::time::Instant::now();
+    let cleanup = kill_recorded(&recorded);
+    let elapsed = started.elapsed();
+
+    assert_eq!(cleanup, Cleanup::Unverified);
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3),
+        "expected drain timeout around 2s, took {elapsed:?}"
+    );
+    assert!(
+        pid_exists(member_pid),
+        "group member outliving timeout must still be alive (nothing killed)"
+    );
+    assert!(
+        identify(member_pid).unwrap().is_some(),
+        "group member identity must still be inspectable (alive, not killed)"
+    );
+
+    drop(stdin);
+    for _ in 0..100 {
+        if !pid_exists(member_pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[test]
 fn kill_recorded_kills_matching_live_orphan_group() {
     use std::os::unix::process::CommandExt;
@@ -960,4 +1096,82 @@ fn terminate_blocking_with_only_the_zombie_leader_in_the_group() {
         assert!(!pid_exists(pid), "round {round}");
         assert!(!group_exists(pgid), "round {round}");
     }
+}
+
+/// Waits only until `kill(-pgid, 0)` returns `EPERM` on macOS (without waiting
+/// for `waitid` to report the child as a waitable zombie). That hits XNU's
+/// mid-exit window where `killpg1` already returns `EPERM` while `peek_exited`
+/// is still `false` (M1-07c / N10). On Linux, falls back to waiting for a
+/// waitable zombie.
+fn wait_for_mid_exit_eperm_group(
+    #[cfg_attr(target_os = "macos", allow(unused_variables))] pid: u32,
+    pgid: u32,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        let raw = i32::try_from(pgid).unwrap();
+        assert!(raw > 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: Signal 0 only checks existence and permission; `raw > 1`.
+            let rc = unsafe { libc::kill(-raw, 0) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if rc != 0 && errno == Some(libc::EPERM) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader never entered EPERM exit state (rc {rc}, errno {errno:?})"
+            );
+            std::thread::yield_now();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    wait_for_zombie_only_group(pid, pgid);
+}
+
+#[test]
+fn terminate_blocking_handles_macos_mid_exit_eperm() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current_thread runtime");
+    let mut sup = rt.block_on(async {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("exit 3")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        spawn_group(cmd).expect("spawn_group")
+    });
+    let (pid, pgid) = (sup.identity.pid, sup.identity.pgid);
+    wait_for_mid_exit_eperm_group(pid, pgid);
+
+    let term = terminate_blocking(&mut sup, Duration::ZERO).expect("terminate_blocking");
+    assert_eq!(term.exit_code, Some(3));
+    assert!(sup.child.id().is_none());
+    assert!(!pid_exists(pid));
+    assert!(!group_exists(pgid));
+}
+
+#[tokio::test]
+async fn terminate_handles_macos_mid_exit_eperm() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("exit 3")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut sup = spawn_group(cmd).expect("spawn_group");
+    let (pid, pgid) = (sup.identity.pid, sup.identity.pgid);
+    wait_for_mid_exit_eperm_group(pid, pgid);
+
+    let term = terminate(&mut sup, Duration::ZERO)
+        .await
+        .expect("terminate");
+    assert_eq!(term.exit_code, Some(3));
+    assert!(sup.child.id().is_none());
+    assert!(!pid_exists(pid));
+    assert!(!group_exists(pgid));
 }
