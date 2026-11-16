@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use atrium_agents::claude::{ClaudeAdapter, ClaudeOptions};
 use atrium_agents::codex::{CodexAdapter, CodexOptions};
 use atrium_agents::{
-    AgentAdapter, ApprovalTicket, BoxFuture, GateDecision, PermissionPolicy, Session,
-    SessionConfig, ToolCheck, ToolGate, Transport,
+    AgentAdapter, ApprovalTicket, BoxFuture, GateDecision, PermissionPolicy, SHUTDOWN_GRACE,
+    Session, SessionConfig, ToolCheck, ToolGate, Transport,
 };
 use atrium_core::policy::{DefaultPolicy, Ledger, SessionGate, SessionGateConfig, StoreRules};
 use atrium_core::store::{SqliteStore, StoreOptions};
@@ -286,12 +286,33 @@ fn claude_cfg(dir: &Path, program: PathBuf, gate: Arc<dyn ToolGate>) -> SessionC
 
 async fn shutdown(mut session: Session) {
     let _ = session.commands.send(SessionCommand::Shutdown).await;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(2), session.events.recv()).await {
+    let deadline = Instant::now() + SHUTDOWN_GRACE + Duration::from_secs(10);
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, session.events.recv()).await {
             Ok(Some(env)) if matches!(env.event, AgentEvent::SessionEnded { .. }) => return,
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => return,
+        }
+    }
+}
+
+async fn wait_for_approvals(session: &mut Session, count: usize) {
+    let mut seen = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen < count {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("timed out waiting for ApprovalRequested");
+        match tokio::time::timeout(remaining, session.events.recv()).await {
+            Ok(Some(env)) if matches!(env.event, AgentEvent::ApprovalRequested { .. }) => {
+                seen += 1;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("session ended after {seen}/{count} ApprovalRequested events"),
+            Err(_) => panic!("timed out after {seen}/{count} ApprovalRequested events"),
         }
     }
 }
@@ -385,7 +406,7 @@ async fn claude_hung_withdrawals_finish_within_one_deadline() {
     write_executable(
         &script,
         r#"#!/usr/bin/env python3
-import json, sys, time
+import json, sys
 if len(sys.argv) > 1 and sys.argv[1] == "--version":
     print("2.1.308 (Claude Code)")
     sys.exit(0)
@@ -399,13 +420,12 @@ for line in sys.stdin:
         print(json.dumps({"type":"system","subtype":"init","session_id":sid,"model":"claude-fake","tools":["Bash"],"cwd":"."}), flush=True)
         for i in range(1, 6):
             print(json.dumps({"type":"control_request","request_id":f"c{i}","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":f"tu_{i}","input":{"command":"ls"}}}), flush=True)
-        time.sleep(60)
 "#,
     );
 
     let ledger = RealLedger::new(Provider::Claude, &dir, Preset::Careful, true).await;
     let deadline = Duration::from_millis(150);
-    let session = ClaudeAdapter::new(claude_opts(deadline))
+    let mut session = ClaudeAdapter::new(claude_opts(deadline))
         .start(
             claude_cfg(&dir, script, ledger.gate.clone()),
             Transport::Local,
@@ -419,10 +439,7 @@ for line in sys.stdin:
         .await
         .unwrap();
 
-    let wait_asked = Instant::now() + Duration::from_secs(5);
-    while ledger.gate.asked().len() < 5 && Instant::now() < wait_asked {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for_approvals(&mut session, 5).await;
     assert_eq!(ledger.gate.asked().len(), 5);
 
     let started = Instant::now();
@@ -446,7 +463,7 @@ async fn codex_hung_withdrawals_finish_within_one_deadline() {
     write_executable(
         &script,
         r#"#!/usr/bin/env python3
-import json, sys, time
+import json, sys
 if len(sys.argv) > 1 and sys.argv[1] == "--version":
     print("codex-cli 0.163.0")
     sys.exit(0)
@@ -457,13 +474,12 @@ for line in sys.stdin:
     if m == "initialize":
         print(json.dumps({"id": rid, "result": {"userAgent": "codex-fake/0.163.0", "codexHome": "/scratch/.codex"}}), flush=True)
     elif m == "thread/start":
-        print(json.dumps({"id": rid, "result": {"thread": {"id": "th_fake", "cliVersion": "0.163.0"}, "approvalPolicy": "untrusted", "sandbox": {"type": "readOnly", "networkAccess": False}}}), flush=True)
+        print(json.dumps({"id": rid, "result": {"thread": {"id": "th_fake", "cliVersion": "0.163.0"}, "approvalPolicy": "untrusted", "sandbox": {"type": "workspaceWrite", "networkAccess": False}}}), flush=True)
     elif m == "turn/start":
         print(json.dumps({"id": rid, "result": {"turn": {"id": "turn_1", "items": [], "status": "inProgress"}}}), flush=True)
         print(json.dumps({"method": "turn/started", "params": {"threadId": "th_fake", "turn": {"id": "turn_1", "status": "inProgress"}}}), flush=True)
         for i in range(1, 4):
             print(json.dumps({"id": f"req_{i}", "method": "item/commandExecution/requestApproval", "params": {"threadId": "th_fake", "turnId": "turn_1", "itemId": f"item_{i}", "command": "ls", "cwd": "."}}), flush=True)
-        time.sleep(60)
 "#,
     );
 
@@ -495,10 +511,7 @@ for line in sys.stdin:
         .await
         .unwrap();
 
-    let wait_asked = Instant::now() + Duration::from_secs(5);
-    while ledger.gate.asked().len() < 3 && Instant::now() < wait_asked {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for_approvals(&mut session, 3).await;
     assert_eq!(ledger.gate.asked().len(), 3);
 
     // Shutdown cancels the 3 open requests and drains their hung withdrawals under
@@ -506,8 +519,11 @@ for line in sys.stdin:
     let started = Instant::now();
     let _ = session.commands.send(SessionCommand::Shutdown).await;
     let end_deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < end_deadline {
-        match tokio::time::timeout(Duration::from_secs(2), session.events.recv()).await {
+    while let Some(remaining) = end_deadline.checked_duration_since(Instant::now()) {
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, session.events.recv()).await {
             Ok(Some(env)) if matches!(env.event, AgentEvent::SessionEnded { .. }) => break,
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => break,
