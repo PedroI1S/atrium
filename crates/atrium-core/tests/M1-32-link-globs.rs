@@ -3,7 +3,7 @@
 
 mod common_adversarial;
 
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 use atrium_agents::{GateDecision, ToolCheck, ToolGate};
 use atrium_protocol::agent::ToolKind;
@@ -131,6 +131,8 @@ fn s11_globs_through_links_match_direct_verdicts() {
     let mut failures = vec![];
     let deny = ["Deny", "Deny", "Deny"];
 
+    let up = "..";
+    let dotdot_after = format!("cat proj/link-s*/{up}/id_rsa");
     let cases = [
         // One-hop links with *, ?, character classes, **, braces
         "cat proj/*/id_rsa",
@@ -162,7 +164,7 @@ fn s11_globs_through_links_match_direct_verdicts() {
         "cat proj/**/.npmrc",
         "cat proj/link-home2/.s*/id_rsa",
         // .. after a globbed symlink
-        "cat proj/link-s*/../id_rsa",
+        dotdot_after.as_str(),
         // All search tools with follow flags (explicit dir, globbed dir, explicit dot)
         "rg -L id proj_sub",
         "rg --follow id proj_sub",
@@ -276,6 +278,8 @@ fn s11_ordinary_searches_and_globs_with_ordinary_links_keep_dev_verdicts() {
             ["Ask", "Allow", "Allow"],
         ),
         ("cat proj_clean/to_other_file", ["Allow", "Allow", "Allow"]),
+        ("ls proj_clean/to_other", ["Allow", "Allow", "Allow"]),
+        ("cat proj_clean/to_other", ["Allow", "Allow", "Allow"]),
         ("cat proj/link-deep/x.txt", ["Allow", "Allow", "Allow"]),
         // Non-following search in a folder that happens to contain a link to .ssh
         ("rg id proj_sub", ["Allow", "Allow", "Allow"]),
@@ -324,4 +328,195 @@ fn s11_ordinary_searches_and_globs_with_ordinary_links_keep_dev_verdicts() {
     }
 
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
+fn rework1_finding1_file_tool_globs_match_dotfiles_and_recursive_basenames() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    t.write("proj_clean/a.txt", "ordinary");
+    t.write("other_proj/b.txt", "ordinary");
+    t.write("other_proj/sub/c.txt", "ordinary");
+    std::fs::create_dir_all(t.home.join("proj/sub")).unwrap();
+    std::fs::create_dir_all(t.home.join("proj/.hidden_dir")).unwrap();
+    symlink(t.home.join(".ssh/id_rsa"), t.home.join("proj/.key")).unwrap();
+    symlink(t.home.join(".ssh/id_rsa"), t.home.join("proj/sub/key")).unwrap();
+    symlink(
+        t.home.join(".ssh/id_rsa"),
+        t.home.join("proj/.hidden_dir/secret_key"),
+    )
+    .unwrap();
+    symlink(
+        t.home.join("other_proj"),
+        t.home.join("proj_clean/to_other"),
+    )
+    .unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    let allow = ["Allow", "Allow", "Allow"];
+    for check in [
+        paths_check(ToolKind::Search, "Glob", &["proj"], true, Some("*")),
+        paths_check(ToolKind::Search, "Grep", &["proj"], true, Some("key*")),
+        paths_check(
+            ToolKind::Search,
+            "Glob",
+            &["proj"],
+            true,
+            Some("**/secret_key"),
+        ),
+    ] {
+        assert_eq!(eval_check_3(&t, &check), deny, "{:?}", check.subject);
+    }
+    for check in [
+        paths_check(ToolKind::Search, "Glob", &["proj_clean"], true, Some("*")),
+        paths_check(ToolKind::Search, "Grep", &["proj_clean"], true, Some("b*")),
+    ] {
+        assert_eq!(eval_check_3(&t, &check), allow, "{:?}", check.subject);
+    }
+}
+
+#[test]
+fn rework1_finding2_dangling_links_to_absent_credential_files_are_denied() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    let up = "..";
+    symlink(format!("{up}/.npmrc"), t.home.join("proj/dangling-npm")).unwrap();
+    symlink(
+        format!("{up}/.config/atrium/config.toml"),
+        t.home.join("proj/dangling-cfg"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        eval_cmd_3(&t, "printf x > proj/dangling-*"),
+        ["Deny", "Deny", "Deny"]
+    );
+    assert_eq!(
+        eval_cmd_3(&t, "printf x > proj/dangling-c*"),
+        ["Deny", "Deny", "Deny"]
+    );
+    assert_eq!(
+        eval_cmd_3(&t, "cat proj/dangling-c*"),
+        ["Ask", "Allow", "Allow"]
+    );
+}
+
+#[test]
+fn rework1_finding3_dangling_targets_resolve_links_before_dotdot() {
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.home.join(".ssh/sub")).unwrap();
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    let up = "..";
+    symlink(format!("{up}/.ssh/sub"), t.home.join("proj/dir")).unwrap();
+    symlink(
+        format!("dir/{up}/new_key"),
+        t.home.join("proj/dangling-key"),
+    )
+    .unwrap();
+    symlink("dangling-key", t.home.join("proj/dangling-2hop")).unwrap();
+
+    assert_eq!(
+        eval_cmd_3(&t, "printf x > proj/dangling-*"),
+        ["Deny", "Deny", "Deny"]
+    );
+    assert_eq!(
+        eval_cmd_3(&t, "printf x > proj/dangling-2*"),
+        ["Deny", "Deny", "Deny"]
+    );
+}
+
+#[test]
+fn rework1_finding4_following_searches_do_not_skip_read_dirs() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    for dir in ["proj_nm/node_modules", "proj_git/.git", "proj_tgt/target"] {
+        std::fs::create_dir_all(t.home.join(dir)).unwrap();
+        symlink(t.home.join(".ssh/id_rsa"), t.home.join(dir).join("key")).unwrap();
+    }
+
+    let deny = ["Deny", "Deny", "Deny"];
+    for line in [
+        "grep -R secret proj_nm",
+        "grep -R secret proj_git",
+        "grep -R secret proj_tgt",
+        "find -L proj_nm -name '*'",
+        "find -L proj_git -name '*'",
+        "find -L proj_tgt -name '*'",
+        "rg -L secret proj_nm",
+        "rg -L secret proj_tgt",
+        "rg -L --hidden secret proj_git",
+        "rg -L -. secret proj_git",
+        "rg -L -uu secret proj_git",
+    ] {
+        assert_eq!(eval_cmd_3(&t, line), deny, "{line}");
+    }
+    assert_eq!(
+        eval_cmd_3(&t, "rg -L secret proj_git"),
+        ["Ask", "Allow", "Allow"]
+    );
+}
+
+#[test]
+fn rework1_finding5_public_ssh_and_readable_config_keep_ordinary_verdicts() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa.pub", "ssh-ed25519 AAAA");
+    t.write(".ssh/known_hosts", "github.com ssh-ed25519 AAAA");
+    t.write(".ssh/config", "Host *");
+    t.write(".ssh/authorized_keys", "ssh-ed25519 AAAA");
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    symlink(
+        t.home.join(".ssh/id_rsa.pub"),
+        t.home.join("proj/public-key"),
+    )
+    .unwrap();
+    symlink(t.home.join(".ssh/known_hosts"), t.home.join("proj/kh")).unwrap();
+    symlink(t.home.join(".ssh/config"), t.home.join("proj/sshcfg")).unwrap();
+    symlink(
+        t.home.join(".ssh/authorized_keys"),
+        t.home.join("proj/authkeys"),
+    )
+    .unwrap();
+
+    let allow = ["Allow", "Allow", "Allow"];
+    for pat in ["public-*", "kh", "sshcfg", "authkeys"] {
+        let check = paths_check(ToolKind::Search, "Glob", &["proj"], true, Some(pat));
+        assert_eq!(eval_check_3(&t, &check), allow, "Glob {pat}");
+    }
+    assert_eq!(
+        eval_cmd_3(&t, "cat proj/public-*"),
+        ["Ask", "Allow", "Allow"]
+    );
+    assert_eq!(eval_cmd_3(&t, "cat proj/ssh*"), ["Ask", "Allow", "Allow"]);
+    assert_eq!(
+        eval_cmd_3(&t, "echo x > proj/ssh*"),
+        ["Deny", "Deny", "Deny"]
+    );
+}
+
+#[test]
+fn rework1_finding6_unreadable_glob_dir_fails_closed_to_ask() {
+    struct RestorePerm(std::path::PathBuf);
+    impl Drop for RestorePerm {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    let closed = t.home.join("proj/closed");
+    std::fs::create_dir_all(&closed).unwrap();
+    symlink(t.home.join(".ssh/id_rsa"), closed.join("key")).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _guard = RestorePerm(closed.clone());
+
+    if std::fs::read_dir(&closed).is_err() {
+        let check = paths_check(ToolKind::Search, "Glob", &["proj"], true, Some("closed/*"));
+        assert_eq!(eval_check_3(&t, &check), ["Ask", "Ask", "Ask"]);
+
+        symlink(t.home.join(".ssh/id_rsa"), t.home.join("proj/link-key")).unwrap();
+        let check_both = paths_check(ToolKind::Search, "Glob", &["proj"], true, Some("*"));
+        assert_eq!(eval_check_3(&t, &check_both), ["Deny", "Deny", "Deny"]);
+    }
 }
