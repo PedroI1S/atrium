@@ -25,6 +25,8 @@ export type SettingsSection = "general" | "appearance" | "agents" | "approvals" 
 export const [settingsSection, setSettingsSectionSignal] = createSignal<SettingsSection>("general");
 export const [advancedOpen, setAdvancedOpen] = createSignal(false);
 export const [settingsQuery, setSettingsQuery] = createSignal<string | null>(null);
+/** The rules editor in Settings → Approvals is open. */
+export const [ruleFormOpen, setRuleFormOpen] = createSignal(false);
 /** Row to briefly highlight after a settings search jump. */
 export const [highlightRow, setHighlightRow] = createSignal<string | null>(null);
 
