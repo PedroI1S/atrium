@@ -53,3 +53,13 @@ The M1-20 gate audit (`docs/agents/reviews/M1-20-gate-audit.md`, majors 1-5 and 
 - PLAN and the contract disagree about what an item should do.
 
 Write it down in the handoff, and go on with the other items.
+
+## Round 2 (D-113): fix the Argon review
+Review: `docs/agents/reviews/M1-23-ui-gaps.md` (verdict rework). The orchestrator confirmed blockers 1 and 2 against `crates/atrium-core/src/policy/engine.rs` and `shell.rs`. Fix, on the same branch:
+1. **Blocker 1.** The rules editor must never create a `command_prefix` (or `command_exact`) **allow** rule whose leading command, after stripping wrapper words, is a shell, `eval`/`source`/`.`, or a wrapper (`env`, `exec`, `command`, `nohup`, `time`, `nice`, `xargs`, `sudo`, `doas`, …), or an interpreter with an inline-code flag (`python* -c`, `node -e/--eval/-p`, `ruby -e`, `perl -e/-E`, `osascript -e`, `deno eval`, …). Refuse with a clear error. Base the list on what `shell.rs` treats as wrappers and payload runners (read it, don't guess). For other runners (`python3`, `node`, `npx`, …) warn whatever the argv length is. Deny rules on these stay allowed.
+2. **Blocker 2.** Don't offer "Only for paths inside" on command rules (`command_prefix`, `command_exact`, `any` with kind Commands) or on deny rules, and drop `execute` from the `path_glob` kinds. Fix the test and the `gap-shots.ts` example that show such rules. In the handoff, escalate the engine limit (`all_paths` adds the cwd, so a scoped command rule can't match below Home, and `path_scope_ok` uses `all` for deny too).
+3. **Major 3.** Linux save dialog: use `gtk::FileChooserNative` (or otherwise hide/destroy the dialog correctly). You can't build it here; make it as plainly correct as you can and say so.
+4. **Minors 4–7 and nits 8–9**, as the review suggests: `splitCommand`/`checkGlob` refusing what the engine never matches (word-initial `#`, control chars and U+2028/9, empty words, reserved first words, bad bracket globs, trailing `\`); the broad-glob and `any` warnings; export over an existing file (no overwrite prompt, a clear message, ask again); archive from a pop-out; checkbox focus vs Inbox keys and module-level batch state; `quoteArg` and `~`; `X` with two approval cards.
+5. New tests for each; demo still 3 runs in a row; update screenshots that changed; append a "Round 2" section to the handoff.
+
+Escalate (don't do): any change to the daemon, protocol or policy crates, including a daemon-side `CreateRule` guard.

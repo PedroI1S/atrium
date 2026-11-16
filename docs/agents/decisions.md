@@ -730,3 +730,6 @@ Pedro decided the open gate items:
 
 ## D-112 — 2026-11-16 — Pedro: Argon reviews M1-24, M1-25 and M1-26
 Pedro asked for Gemini 4 Argon `high` to review the three D-111 tasks when they finish, instead of Sonnet. Argon and the Hydrogen authors are both Gemini models, so this is a same-provider review, by the driver's choice. **Withdrawn the same day:** once told that Argon and Hydrogen are both Gemini models, Pedro kept the Sonnet reviews (cross-provider) for all three.
+
+## D-113 — 2026-11-16 — Pedro: M1-23 fix round
+After Argon's review (rework: 2 rules-editor blockers, 1 major in the Linux save dialog, 4 minors, 2 nits; `docs/agents/reviews/M1-23-ui-gaps.md`), Pedro chose a fix round ("Yes, fix round"). Same worker model (Claude Opus 5.5, D-109), same branch and worktree, owned paths unchanged. The daemon-side guard for blocker 1 (`CreateRule` refusing shell/runner prefixes) is outside M1-23's paths; it is only noted for a possible CR, not decided.
