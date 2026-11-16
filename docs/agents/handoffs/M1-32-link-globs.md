@@ -1,66 +1,60 @@
 # M1-32-link-globs: handoff
 
-**State: S11 complete (`477fe81f`); K5 blocked (needs driver/orchestrator decision).**
+**State: S11 complete (rework round 1 fixed); K5 closed under D-125.**
 
-Brief read from `dev`: `docs/agents/briefs/M1-32-link-globs.md`.
+Brief read from `dev`: `docs/agents/briefs/M1-32-link-globs.md` (including scope change D-125: K5 is closed as correct behaviour; scope is S11 only).
 
 ---
 
-## What this round did
+## What this task did
 
-1. Inspected `477fe81f` (S11) and `dev` (`174a2802`) across `crates/atrium-core/src/policy/gate.rs`, `crates/atrium-core/tests/M1-32-link-globs.rs`, `crates/atrium-core/tests/adversarial_gate.rs`, `crates/atrium-core/tests/adversarial_regression.rs`, and `crates/atrium-core/tests/adversarial_m1_18.rs`.
-2. Confirmed **S11 is implemented and tested** in `477fe81f`:
+1. Implemented **S11** in `477fe81` and fixed all 7 findings from `.orchestration/review-input/review-round1.md` in rework round 1:
    - `crates/atrium-core/src/policy/gate.rs`:
-     - `evaluate_sync` (~327, ~347) passes `&c.cwd` and `&c.home` into `reaches_tree_through_links`.
-     - `expand_glob` (~797–884) returns `Option<GlobExpansion>` (`matches`, `truncated`), tracks visited `(canonical_dir, comp_idx)` for `**` to avoid spinning on ancestor/loop links, and sets `truncated = true` instead of discarding shallow matches when `deep > MAX_DEPTH`.
-     - `real_path` (~911–936) follows dangling symlinks by hand (`symlink_metadata` + `read_link` + `resolve_fs(&normalize(&target), 1)`), resolving relative targets against the canonicalized parent.
-     - Added `raw_glob_pattern`, `expand_targets`, `first_tree_hit`, and `ToolSubject::Paths { glob: Some(..), .. }` handling plus `..`-after-glob resolution against `unit_cwd` inside `reaches_tree_through_links` (~1419–1640).
+     - `evaluate_sync` (~318–401) builds `real_sensitive` (`deny::sensitive` on `resolve_fs`-resolved `home`/`atrium_data_paths`/`atrium_protected_paths`), passes `TreeKind::Sensitive` for `sensitive_roots`/`atrium_*` and `TreeKind::Raw` for `ssh.linked_dirs`/`ask_roots`, and passes `&c.cwd`, `&c.home`, and `Some(&real_sensitive)` / `None` to `reaches_tree_through_links`.
+     - `expand_glob` / `expand_glob_with` (~849–964) supports file-tool dotfile matching (`include_dotfiles = true`), tracks `(canonical_dir, comp_idx)` for `**`, sets `truncated = true` on `MAX_DEPTH`/`MAX_ENTRIES` while preserving already-found matches, and propagates `read_dir`, entry, `symlink_metadata`, and `metadata` errors (other than `NotFound` or non-directory targets) as `truncated = true`.
+     - `real_path` (~992–1079) resolves symlinks (including dangling ones) component-by-component in filesystem order so `..` applies after preceding links.
+     - `trees_of` (~1485–1496) retains absent protected roots using `resolve_fs(r, 0)` instead of dropping canonicalization failures.
+     - `in_trees` (~1500–1525) applies `deny::Sensitive::hit(real, role)` for `TreeKind::Sensitive` targets so `.pub`, `known_hosts`, and read-only `.ssh/config` / `authorized_keys` keep their contract §9 exceptions.
+     - `prune_mode` / `is_pruned` / `links_below` (~1527–1676) prunes directories only when the specific invocation excludes them (`grep*`/`find` prune nothing; `rg`/`ag` prune `.git` only unless `--hidden`/`-.`/`-u(u)` is set or flags are unreadable; `ack` prunes `.git`/`node_modules` unless `--noignore-dir` is set or flags are unreadable; walkers retain `.git`/`node_modules`/`target` pruning).
+     - `raw_glob_pattern`, `expand_targets`, `first_tree_hit`, and `reaches_tree_through_links` (~1685–1923) evaluate `ToolSubject::Paths { glob: Some(..), .. }` with file-tool dotfile matching and recursive basename expansion (`**/<trimmed>`) when `recursive == true` for single-component globs.
    - `crates/atrium-core/tests/adversarial_gate.rs`: removed `#[ignore = "M1-13 finding 10"]` on `finding_10_a_glob_that_reaches_a_credential_through_a_link_is_blocked` (~571).
-   - `crates/atrium-core/tests/M1-32-link-globs.rs`: added 327 lines of tests covering S11.
-3. Ran `cargo fmt --all --check` and `cargo check -p atrium-core --tests` (D-123: workers do not run `cargo test` or `cargo clippy`); both exited `0`.
-4. **Stopped on K5** without editing `gate.rs` further because implementing K5 as written in the brief directly conflicts with existing tests on `dev`, the brief's owned-path rules, and the "no line more permissive than `dev`" rule (details below).
+   - `crates/atrium-core/tests/M1-32-link-globs.rs`: added S11 tests, ordinary-folder rows (`ls proj_clean/to_other`, `cat proj_clean/to_other`), and regression tests for rework round 1 findings 1–6.
+2. **K5 closed under D-125:** `cwd=proj|rg -L pat` keeps `["Deny", "Deny", "Deny"]` as asserted in `crates/atrium-core/tests/adversarial_m1_18.rs:1030`.
+3. Ran `cargo fmt --all` and `cargo check -p atrium-core --tests` (D-123: workers do not run `cargo test` or `cargo clippy`); both exited `0`.
 
 ---
 
-## Why K5 is blocked
+## Rework round 1
 
-The brief asks for:
-> K5: `rg -L` (and `--follow`, `grep -R`, `find -L`) with no folder named, from a folder that holds a link into a sensitive tree: ask in Home (`dev`'s verdict), not a hard deny; keep the hard deny when the line names the credential.
-
-1. **Breaks existing non-owned tests on `dev`:**
-   `dev` already asserts `Deny` (across `Home`, `Any`, and `FullAccess`) for following searches with no folder (or `.`) from a directory holding a link into `~/.ssh`:
-   - `crates/atrium-core/tests/adversarial_regression.rs:2401-2404` (`round_8_blocker_2_generated_inbound_links_through_globs_and_following_searches`): `"cwd=proj|rg -L id"`, `"cwd=proj|find -L ."`, `"cwd=proj|grep -R id ."`, `"cwd=proj|ag --follow id"` all require `GateDecision::Deny` in `Home`, `Any`, and `FullAccess`.
-   - `crates/atrium-core/tests/adversarial_m1_18.rs:930-932, 1030` (`gate_rows`): `"cwd=proj_2hop|rg -L id"`, `"cwd=proj_3hop|rg -L id"`, `"cwd=proj_2hop|grep -R id ."`, `"cwd=proj_3hop|grep -R id ."`, `"cwd=proj_2hop|ag --fol id"`, `"cwd=proj_3hop|ag --fol id"`, and `"cwd=proj|rg -L pat"` all assert `["Deny", "Deny", "Deny"]`.
-   - `crates/atrium-core/tests/adversarial_regression.rs:1749-1779` (`round_6_item_2_readers_without_a_folder_from_linked_dir`): `"cwd=vault|grep -R x"`, `"cwd=vault|find -L -print"`, `"cwd=vault|rg x"`, etc. (where `~/.ssh/work -> ~/vault/work`) require `GateDecision::Deny` in all settings.
-   - The brief's rules forbid modifying existing test files other than removing the `#[ignore]` at `adversarial_gate.rs:571`.
-2. **Violates "no line more permissive than `dev`" and creates a real credential leak:**
-   - The brief's `(`dev`: Ask/Allow/Allow)` note comes from `docs/agents/m1-must-fix.md`, which referred to *pre-M1-13* `dev` (`02c13bc^`). On current `dev` (`174a2802`), `cwd=proj|rg -L pat` is `["Deny", "Deny", "Deny"]`.
-   - Returning `["Ask", "Allow", "Allow"]` would be more permissive than `dev` and would let `FullAccess` or an `Any`-rule session run `rg -L id_rsa` in `proj` (with `proj/vault_link -> ~/.ssh`) and read `~/.ssh/id_rsa` without hard-denying.
-   - Even changing only `Home` to `Ask` (`["Ask", "Deny", "Deny"]`) still makes `Home` more permissive than `dev` and still fails `adversarial_regression.rs` and `adversarial_m1_18.rs` (both check `Preset::Home` for `Deny`).
-3. **Owned-paths boundary for round-6 `reaches_linked_ssh_dir`:**
-   - The round-6 case (`cwd=vault` with `~/.ssh/work -> ~/vault/work`, cited in `docs/agents/handoffs/M1-13-adversarial.md:849`) is enforced by `reaches_linked_ssh_dir` (`gate.rs:942-1044`) and its caller (`gate.rs:302-314`), which are outside M1-32's owned lines (`reaches_tree_through_links` and its callers at `~320-350`).
-
-Note: cases that *are* ordinary on `dev` — `rg -L pat safe_sub` from `proj`/`vault`, `rg -e -L` / `rg -f -L` / `rg -rL pat` with `-L` as an option value, and `cwd=asks|rg -L x` for `ask_roots` (CR-12) — already return `["Ask", "Allow", "Allow"]` on `dev`.
-
-**Decision needed:** Either grant an exception for K5 under D-120 (keeping `dev`'s `Deny` on `cwd=proj|rg -L pat` etc.), or widen M1-32's owned paths to update `adversarial_regression.rs` / `adversarial_m1_18.rs` / `M1-32-link-globs.rs` and confirm what verdict (`Ask/Allow/Allow` vs `Ask/Deny/Deny`) is wanted.
+- **Finding 1 (blocker — file-tool globs inherit shell matching semantics):** fixed in `expand_glob_with` and `reaches_tree_through_links` (`include_dotfiles = true` and `**/<trimmed>` basename expansion for recursive single-component file-tool globs); pinned by `rework1_finding1_file_tool_globs_match_dotfiles_and_recursive_basenames` in `crates/atrium-core/tests/M1-32-link-globs.rs`.
+- **Finding 2 (major — dangling links to absent credential files lose protection):** fixed in `trees_of` using `resolve_fs(r, 0)` instead of filtering out `std::fs::canonicalize` failures; pinned by `rework1_finding2_dangling_links_to_absent_credential_files_are_denied` in `crates/atrium-core/tests/M1-32-link-globs.rs`.
+- **Finding 3 (major — dangling targets normalize `..` before resolving intermediate links):** fixed in `real_path` (`gate.rs:992-1079`) by resolving components and symlinks in filesystem order before applying `..`; pinned by `rework1_finding3_dangling_targets_resolve_links_before_dotdot` in `crates/atrium-core/tests/M1-32-link-globs.rs`. (The sibling `normalize(&target)` call in `resolve_fs` at `gate.rs:84` is outside M1-32's owned paths and is escalated below.)
+- **Finding 4 (blocker — following searches silently skip directories the command reads):** fixed in `prune_mode` / `is_pruned` / `links_below` so `grep -R` and `find -L` prune nothing, `rg -L` / `ag` prune `.git` only when hidden search is not enabled and flags parse cleanly, and `ack` prunes `.git`/`node_modules` unless `--noignore-dir` or unknown flags; pinned by `rework1_finding4_following_searches_do_not_skip_read_dirs` in `crates/atrium-core/tests/M1-32-link-globs.rs`.
+- **Finding 5 (major — public SSH files become hard-denied through file-tool globs):** fixed in `in_trees` / `first_tree_hit` / `evaluate_sync` using `deny::Sensitive::hit(real, role)` for `TreeKind::Sensitive` targets (preserving `.pub`, `known_hosts`, and read-only `.ssh/config` / `authorized_keys`); pinned by `rework1_finding5_public_ssh_and_readable_config_keep_ordinary_verdicts` in `crates/atrium-core/tests/M1-32-link-globs.rs`.
+- **Finding 6 (major — unreadable glob directories are treated as successfully checked):** fixed in `expand_glob_with` by treating `read_dir`, directory-entry, `symlink_metadata`, and `metadata` errors (other than `NotFound` or non-directory targets) as `truncated = true` while preserving any already-found matches; pinned by `rework1_finding6_unreadable_glob_dir_fails_closed_to_ask` in `crates/atrium-core/tests/M1-32-link-globs.rs`.
+- **Finding 7 (minor — handoff still requests the already-decided K5 change):** fixed in `docs/agents/handoffs/M1-32-link-globs.md` by recording K5 as closed under D-125 and removing the blocked/decision-needed request.
+- **Test gaps:** added `rework1_finding1_*`..`rework1_finding6_*` and explicit ordinary-folder rows (`ls proj_clean/to_other`, `cat proj_clean/to_other` -> `["Allow", "Allow", "Allow"]`) in `crates/atrium-core/tests/M1-32-link-globs.rs`.
 
 ---
 
-## Tests added (in `477fe81f`) and expected behavior on `dev`
+## Escalated (outside owned paths)
 
-Under D-123, `cargo test` was not run by this worker; the `dev` vs branch comparison below is by inspection of `git show dev:crates/atrium-core/src/policy/gate.rs` vs `HEAD`.
+- `crates/atrium-core/src/policy/gate.rs:84` (`resolve_fs`): calls `resolve_fs(&normalize(&target), hops + 1)` on dangling symlinks, which still normalizes `..` lexically before resolving preceding intermediate symlinks for non-globbed direct paths (e.g., `printf x > proj/dangling-key` where `dangling-key -> dir/../new_key` and `dir -> ../.ssh/sub`). Left untouched because `resolve_fs` (~40–112) is outside M1-32's owned paths (`reaches_tree_through_links` and its helpers, and its callers at ~320–350).
+
+---
+
+## Tests added and expected behavior on `dev`
+
+Under D-123, `cargo test` was not run by this worker; compilation was verified with `cargo check -p atrium-core --tests`.
 
 1. `crates/atrium-core/tests/M1-32-link-globs.rs`:
-   - `s11_globs_through_links_match_direct_verdicts`: pins `["Deny", "Deny", "Deny"]` for one-hop and two-hop symlinks with `*`/`?`/`[...]`/`**`/`{a,b}`, dangling symlinks (one-hop, two-hop, relative inside a linked dir), links to ancestors of credential trees (`proj/link-home`, `proj/link-home2`), `..` after a globbed symlink (`cat proj/link-s*/../id_rsa`), and follow-flag searches (`rg -L`, `rg --follow`, `grep -R`, `grep --dereference-recursive`, `grep --deref`, `find -L`, `find ... -follow`, `ag -f`, `ag --follow`, `ack --follow`) on folders/globs/`.` holding links to `.ssh` or `~`.
-     - **Expected to fail on `dev`'s code:** dangling link globs (`cat proj/dangling*`, `cat proj/dangling-*`, `cat proj/dangling-2*`, `echo x > proj/dangling*`, `cat proj/link-sub/dangling_*`) because `dev`'s `real_path` does not follow dangling symlinks; `**` globs with ancestor/loop links (`cat proj/**`, `cat proj/**/id_rsa`, `cat proj/**/.ssh/id_rsa`, `cat proj/**/.npmrc`) because `dev`'s `expand_glob` returns `None` (`Ask`) on `MAX_DEPTH` without `visited` or `truncated`; and `cat proj/link-s*/../id_rsa` (`dev` does not re-resolve `..` after a glob component against `unit_cwd`).
-   - `s11_file_tool_globs_through_links_are_blocked`: pins `["Deny", "Deny", "Deny"]` for 9 `ToolSubject::Paths` (`Glob`/`Grep`) checks with `*/id_rsa`, `link-*`, `dangling*`, `**/id_rsa`, `[l]ink-ssh/id_rsa`, `proj/*/id_rsa`, `link-key`, `*/*/.ssh/id_rsa`.
-     - **Expected to fail on `dev`'s code:** all 9 checks (`dev`'s `reaches_tree_through_links` does not evaluate `ToolSubject::Paths { glob: Some(..), .. }`).
-   - `s11_unbounded_brace_globs_fail_closed_to_ask`: pins `["Ask", "Ask", "Ask"]` for `cat proj/{1..65}` and `["Deny", "Deny", "Deny"]` for brace-expansion overflow.
-     - **Expected on `dev`:** passes (same `words::brace_expand` / `analysis.overflow` behavior).
-   - `s11_ordinary_searches_and_globs_with_ordinary_links_keep_dev_verdicts`: pins `dev`'s verdicts (`Allow` or `Ask/Allow/Allow`) for searches/globs in `proj_clean` (symlinks to `other_proj`) and non-following searches (`rg id proj_sub`, `grep -r id proj_sub`) in a folder holding a symlink to `.ssh`, plus 3 `Glob` tool checks.
-     - **Expected on `dev`:** passes.
+   - `s11_globs_through_links_match_direct_verdicts`: pins `["Deny", "Deny", "Deny"]` for one-hop and two-hop symlinks with `*`/`?`/`[...]`/`**`/`{a,b}`, dangling symlinks, links to ancestors of credential trees, `..` after a globbed symlink, and follow-flag searches.
+   - `s11_file_tool_globs_through_links_are_blocked`: pins `["Deny", "Deny", "Deny"]` for 9 `ToolSubject::Paths` checks.
+   - `s11_unbounded_brace_globs_fail_closed_to_ask`: pins `["Ask", "Ask", "Ask"]` for `cat proj/{1..65}` and `["Deny", "Deny", "Deny"]` for brace overflow.
+   - `s11_ordinary_searches_and_globs_with_ordinary_links_keep_dev_verdicts`: pins `dev` verdicts for ordinary searches, folder operands (`ls proj_clean/to_other`, `cat proj_clean/to_other`), globs, and non-following searches in folders with `.ssh` links.
+   - `rework1_finding1_*` .. `rework1_finding6_*`: pin each of findings 1–6 (reproducing cases that fail prior to `gate.rs` rework round 1 fixes and pass after).
 2. `crates/atrium-core/tests/adversarial_gate.rs`:
-   - `finding_10_a_glob_that_reaches_a_credential_through_a_link_is_blocked` (~571): un-ignored in `477fe81f`; pins `Deny` in `Home` for `cat proj/*/id_ed25519` and `cat proj/link-*`. (Already returned `Deny` on `dev` since M1-13 round 8, though previously `#[ignore]`.)
+   - `finding_10_a_glob_that_reaches_a_credential_through_a_link_is_blocked` (~571): un-ignored in `477fe81`.
 
 ---
 
