@@ -170,10 +170,44 @@ git diff a3b2a60 --stat
 # 5. Verify new/un-ignored tests fail on dev's src (restore afterwards)
 git checkout a3b2a60 -- crates/atrium-core/src crates/atrium-daemon/src crates/atrium-agents/src app/src/daemon/client.ts
 cargo test -p atrium-core --test adversarial_policy finding_4_ansi_c_quoted_words_are_decoded
-cargo test -p atrium-core --test adversarial_fuzz random_spellings_of_sensitive_paths_are_always_hard_denied
 cargo test -p atrium-core --test M1-28-ansi-c-words
 cargo test -p atrium-daemon --test M1-28-followups
+cargo test -p atrium-daemon --test adversarial_socket flooding_unread_list_threads_past_8_mib_control_lane_closes_connection
 cargo test -p atrium-agents --test M1-28-followups
 pnpm --dir app test -- client.test.ts
 git checkout HEAD -- crates/atrium-core/src crates/atrium-daemon/src crates/atrium-agents/src app/src/daemon/client.ts
 ```
+
+---
+
+## 7. Rework round 1
+
+1. **`M1-28-ansi-c-words.rs:173` (`s7_ansi_c_quoting_is_not_treated_as_keyword_or_tilde`):**
+   - **Wrong test expectation fixed:** `cat $'~'/.ssh/id_rsa` already returns `Hard(credential-read)` on `dev` because `deny::raw_hit` (`crates/atrium-core/src/policy/deny.rs:733-743`) strips `'"'`, `'\''`, and `'\\'` from the raw line (`cat $~/.ssh/id_rsa`) and matches `"~/.ssh/id_rsa"`. In addition, `crates/atrium-core/tests/adversarial_policy.rs:383` (`SENSITIVE_HARD`) explicitly requires `"cat $'~/.ssh/id_rsa'"` (along with `"cat '~'/.ssh/id_rsa"`, `"cat \"~/.ssh/id_rsa\""`, `"cat ~\"/.ssh/id_rsa\""`) to be `HardDeny` everywhere. Making `cat $'~'/.ssh/id_rsa` return `Ask` would violate the brief's policy rule ("no line more permissive than `dev`") and require modifying `deny.rs` outside owned paths.
+   - Updated `s7_ansi_c_quoting_is_not_treated_as_keyword_or_tilde` in [`crates/atrium-core/tests/M1-28-ansi-c-words.rs`](crates/atrium-core/tests/M1-28-ansi-c-words.rs) to assert `HardDeny` for `cat $'~'/.ssh/id_rsa` (matching `dev`), and `["Ask", "Ask", "Allow", "Allow"]` for `cat $'~'/notes.txt`, `cat $'~'root/notes.txt`, `$'if' true`, and `$'FOO'=1 cat notes.txt`.
+
+2. **`adversarial_fuzz.rs:422` (`random_spellings_of_sensitive_paths_are_always_hard_denied`):**
+   - **Investigation:** The engine **does** fold case (and APFS `ſ` → `s`) for Atrium's own folders on both macOS and Linux: `deny::lower` (`deny.rs:378-387`) runs unconditionally without `cfg!(target_os)`, `data` (`atrium_data_paths`, `deny.rs:480`) and `protected` (`atrium_protected_paths`, `deny.rs:481`) are lowercased, `hit` (`deny.rs:506`) and `glob_hit` (`deny.rs:595`) lowercase the candidate path, and `crates/atrium-core/tests/adversarial_gate.rs:152` (`"cat .Local/Share/Atrium/atrium.db"`) requires case-folding for Atrium's folders.
+   - **Actual cause of iteration 1 failure (`FOO=1 less -- $HOME/.l""ocal/SH?RE//ATRIUM/atrium.db` -> `Ask`):** Even in lowercase (`sh?re/atrium/atrium.db`), `deny::Sensitive::glob_hit` (`deny.rs:594-619`) stops its literal `prefix` at `/h/u/.local` (before `sh?re`) and only checks `probes()` (`deny.rs:586-590`: `{data}` and `{data}/x`), which neither matches `.../atrium.db` nor matches wildcards inside tree directory names. That exact `deny.rs` fix (`probes` / `glob_hit`, `deny.rs:560-815`) belongs to **`M1-30-tree-wildcards`** (not yet merged on `dev`) and is explicitly outside M1-28's owned paths ("If the fix needs a change elsewhere, stop that part and say so in the handoff: don't make it").
+   - **Action:** Left `deny.rs` untouched, restored `#[ignore = "M1-13 finding 11 (requires M1-30 deny.rs glob_hit)"]` on [`crates/atrium-core/tests/adversarial_fuzz.rs`](crates/atrium-core/tests/adversarial_fuzz.rs#L422) so M1-28 passes verification on `dev` without crossing into `M1-30`'s owned paths, and added `cd $HOME/.l""ocal/SH?RE//ATRIUM; less atrium.db` and `cd .l""ocal/SH?RE/ATRIUM; cat atrium.db` to `finding_11_cd_glob_reaching_sensitive_dirs_is_caught` in [`crates/atrium-core/tests/M1-28-ansi-c-words.rs`](crates/atrium-core/tests/M1-28-ansi-c-words.rs) to pin `cd_effect` case-folding on Atrium's own folders.
+
+3. **`crates/atrium-agents/tests/M1-28-followups.rs`:**
+   - **`codex_hung_withdrawals_finish_within_one_deadline`:** Changed `fake-codex-3.py`'s `thread/start` sandbox response from `"readOnly"` to `"workspaceWrite"` to match `PermissionPolicy::Ask` (`"workspace-write"`), matching `examples/codex-fake.rs:170`.
+   - **`claude_hung_withdrawals_finish_within_one_deadline` (and Codex shutdown wait):** Both fake scripts (`fake-claude-5.py` and `fake-codex-3.py`) ended with `time.sleep(60)`, which prevented them from seeing stdin EOF when `stop_process` closed stdin, forcing `stop_process` to wait the full `SHUTDOWN_GRACE` (5 s) before `drain_withdrawals` even started. Meanwhile, `shutdown()` (and the Codex shutdown loop) used a `2 s` per-`recv` timeout (`Duration::from_secs(2)`) that returned early before `stop_process(5 s)` or `REDEEM_TIMEOUT(10 s)` + `drain_withdrawals` ran, leaving `withdrawn().len() == 0`. Removed `time.sleep(60)` so the fakes exit immediately on stdin EOF, added `wait_for_approvals` so all `Internal::Gate` tickets are confirmed in `approvals` before `Shutdown`, and changed `shutdown()` and the Codex wait loop to await `SessionEnded` against the remaining overall deadline (`SHUTDOWN_GRACE + 10 s` / `20 s`).
+
+4. **N10 (`crates/atrium-daemon/tests/adversarial_socket.rs` and `crates/atrium-daemon/src/conn.rs`):**
+   - **Root causes found:**
+     1. In [`crates/atrium-daemon/tests/adversarial_socket.rs`](crates/atrium-daemon/tests/adversarial_socket.rs), Phase 1 had a `RenameThread("phase-1-done")` barrier before reading, but Phase 2 immediately entered `while flooded.read().await.is_some()` right after writing the Phase 2 commands. On Linux, the client drained responses concurrently while the daemon was still running the Phase 2 `ListThreads` queries, keeping `outbox.control_bytes` below `8 MiB` so all 17 responses arrived in 0.6 s.
+     2. In [`crates/atrium-daemon/src/conn.rs`](crates/atrium-daemon/src/conn.rs), `write_loop` awaited `tokio::time::timeout(WRITE_STALL, writing)` (`WRITE_STALL = 30 s`) without selecting on `conn.closed()`. When a client didn't read and `push_control` tripped `MAX_CONTROL_BYTES` (`conn.close()`), `write_loop` remained blocked in `writer.writable().await` for up to 30 s instead of closing the socket promptly (which would exceed the test's `SOON = 20 s` timeout once Phase 2 stops draining early).
+   - **Fixes:**
+     - In [`crates/atrium-daemon/src/conn.rs`](crates/atrium-daemon/src/conn.rs), added `tokio::select! { biased; () = conn.closed() => break, res = tokio::time::timeout(WRITE_STALL, writing) => ... }` in `write_loop` so exceeding `MAX_CONTROL_BYTES` closes the socket immediately.
+     - In [`crates/atrium-daemon/tests/adversarial_socket.rs`](crates/atrium-daemon/tests/adversarial_socket.rs), sized `phase2 = (LIMIT + 4 * 1024 * 1024) / size + 2` from the 8 MiB lane limit, appended `RenameThread("phase-2-done")`, and raced `setup.thread_when(..., "phase-2-done")` against non-draining `Unsubscribe` probe writes until the daemon closes `flooded`, only draining `flooded` afterwards to assert `received < sent` and `closed`.
+
+5. **`app/src-tauri` `bridge::tests::batch_bounds_are_respected_for_count_and_bytes`:**
+   - `git diff dev -- app/src-tauri/` is empty (no launcher or Rust app code was modified on this branch), and `batch_bounds_are_respected_for_count_and_bytes` uses an in-process `Scripted` daemon without spawning `atriumd`, so none of our changes in `atrium-core`, `atrium-daemon`, `atrium-agents`, or `app/src/daemon/client.ts` can affect it.
+
+6. **Checks run after rework round 1 (D-123):**
+   - `cargo fmt --all`: exited 0
+   - `cargo check -p atrium-core --tests`: exited 0 (0 warnings)
+   - `cargo check -p atrium-agents --tests`: exited 0 (0 warnings)
+   - `cargo check -p atrium-daemon --tests`: exited 0 (0 warnings)
