@@ -330,7 +330,7 @@ fn has_unknown_var(w: &str) -> bool {
 /// `a{b,c}d` → `abd`, `acd`; `{1..3}`, `{a..c}`, `{01..10..2}` as the
 /// shell's sequence expressions (round 7 item 1). `None` when it would make
 /// more than a few hundred words.
-fn brace_expand(w: &str) -> Option<Vec<String>> {
+pub(crate) fn brace_expand(w: &str) -> Option<Vec<String>> {
     let mut work = vec![w.to_string()];
     let mut out = vec![];
     while let Some(x) = work.pop() {

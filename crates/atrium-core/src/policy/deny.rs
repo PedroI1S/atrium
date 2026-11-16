@@ -13,7 +13,7 @@ use globset::GlobBuilder;
 use serde_json::Value;
 
 use super::shell::{self, Unit, base, is_shell};
-use super::words::{self, CwdState, Role, Use, Walk, lexical_resolve};
+use super::words::{self, CwdState, Role, Use, Walk, lexical_resolve, normalize};
 use crate::PolicyInput;
 
 const MAX_BYTES: usize = 128 * 1024;
@@ -291,6 +291,35 @@ const BROWSER_FILES: &[&str] = &[
 ];
 const SSH_PROBES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "x"];
 
+/// Credential stores that ask (contract §9 rev 3.1, CR-12, D-082): not
+/// hard-denied, but Home never auto-allows a call that reads, searches or
+/// names them. Relative to home (compared in lower case). (`~/.git-credentials` is on the
+/// hard-deny list and stays there.)
+const ASK_FILES: &[&str] = &[
+    ".cargo/credentials.toml",
+    ".cargo/credentials",
+    ".pypirc",
+    ".pgpass",
+    ".vault-token",
+    ".azure/accessTokens.json",
+    ".config/git/credentials",
+    ".env",
+    // shell history files
+    ".bash_history",
+    ".zsh_history",
+    ".zhistory",
+    ".sh_history",
+    ".ksh_history",
+    ".history",
+    ".local/share/fish/fish_history",
+    ".config/fish/fish_history",
+];
+/// Folders whose every file asks: `~/.aws/sso/cache/`, and macOS
+/// Terminal's per-session shell histories.
+const ASK_TREES: &[&str] = &[".aws/sso/cache", ".zsh_sessions", ".bash_sessions"];
+/// `~/.azure/msal_token_cache.*`: (folder, file name prefix).
+const ASK_NAME_PREFIXES: &[(&str, &str)] = &[(".azure", "msal_token_cache.")];
+
 pub struct Sensitive {
     home: String,
     data: Vec<String>,
@@ -376,6 +405,14 @@ impl Sensitive {
             all.push(abs(r));
         }
         all.push(abs(".ssh"));
+        // the credential stores that ask (CR-12): a recursive search of a
+        // folder holding one asks
+        for r in ASK_FILES.iter().chain(ASK_TREES) {
+            all.push(abs(&r.to_lowercase()));
+        }
+        for (dir, pre) in ASK_NAME_PREFIXES {
+            all.push(abs(&format!("{dir}/{pre}")));
+        }
         all.iter().any(|s| under(s, &pl).is_some())
     }
 
@@ -436,6 +473,52 @@ impl Sensitive {
 
     pub fn is_ssh_dir(&self, p: &Path) -> bool {
         lower(p) == format!("{}/.ssh", self.home)
+    }
+
+    /// A credential store that asks (CR-12): `p` is one, or is inside one
+    /// of its folders.
+    pub fn ask_hit(&self, p: &Path) -> bool {
+        let pl = lower(p);
+        let Some(rest) = under(&pl, &self.home) else {
+            return false;
+        };
+        ASK_FILES.iter().any(|f| f.to_lowercase() == rest)
+            || ASK_TREES.iter().any(|t| under(rest, t).is_some())
+            || ASK_NAME_PREFIXES.iter().any(|(dir, pre)| {
+                under(rest, dir).is_some_and(|r| !r.contains('/') && r.starts_with(pre))
+            })
+    }
+
+    /// Representative paths of the credential stores that ask.
+    fn ask_probes(&self) -> Vec<String> {
+        let abs = |rel: &str| format!("{}/{rel}", self.home);
+        let mut v: Vec<String> = ASK_FILES.iter().map(|f| abs(&f.to_lowercase())).collect();
+        for t in ASK_TREES {
+            v.push(abs(t));
+            v.push(format!("{}/x.json", abs(t)));
+        }
+        for (dir, pre) in ASK_NAME_PREFIXES {
+            v.push(abs(&format!("{dir}/{pre}json")));
+            v.push(abs(&format!("{dir}/{pre}bin")));
+        }
+        v
+    }
+
+    /// A search over `roots` scoped by `glob` (matched against file names
+    /// or whole paths) that can reach a credential store that asks.
+    pub fn ask_search_glob_hit(&self, roots: &[PathBuf], glob: &str) -> bool {
+        let Ok(g) = GlobBuilder::new(&glob.to_lowercase())
+            .literal_separator(false)
+            .build()
+        else {
+            return true;
+        };
+        let g = g.compile_matcher();
+        self.ask_probes().iter().any(|probe| {
+            let name = probe.rsplit('/').next().unwrap_or(probe);
+            (g.is_match(name) || g.is_match(probe))
+                && roots.iter().any(|r| under(probe, &lower(r)).is_some())
+        })
     }
 
     /// Raw-text check: home-anchored credential paths and Atrium's data.
@@ -602,11 +685,11 @@ fn reads_stdin_as_code_at(eff: &[String], depth: u8) -> bool {
         // `sh -c …`): the code given may itself read the script on stdin
         // (round 8 blocker 3)
         return shell
-            && shell::shell_c_code(eff).is_some_and(|code| {
-                shell::lex(&code)
+            && shell::shell_c_codes(eff).iter().any(|code| {
+                shell::lex(code)
                     .units
                     .iter()
-                    .any(|u| reads_stdin_as_code_at(&u.eff, depth + 1))
+                    .any(|u| u.readings().any(|e| reads_stdin_as_code_at(e, depth + 1)))
             });
     }
     // `bash -o pipefail`: the option's value isn't a script
@@ -937,6 +1020,20 @@ impl Ctx<'_> {
         {
             hits.extend(self.search_glob_hit(paths, g));
         }
+        // a search glob that leaves its roots (M1-18, P1): each expansion
+        // that leaves is checked as a path pattern of its own
+        if let Some(esc) = glob_escape(self.input) {
+            for p in &esc.patterns {
+                let globby = p.to_string_lossy().contains(['*', '?', '[']);
+                hits.extend(self.s.hit(p, Role::Read));
+                if globby {
+                    hits.extend(self.s.glob_hit(p, Role::Read));
+                }
+                if self.s.is_ssh_dir(p) {
+                    hits.push("credential-read");
+                }
+            }
+        }
 
         for (i, u) in a.units.iter().enumerate() {
             let eff = &u.eff;
@@ -1055,14 +1152,18 @@ impl Ctx<'_> {
             }
             // pipe-to-shell
             if DOWNLOADERS.contains(&b) && u.pipe != 0 {
+                // in any reading of its wrappers (M1-18, K1)
                 let downstream = a.units.iter().enumerate().any(|(j, v)| {
-                    j > i && v.pipe == u.pipe && v.seg.piped && reads_stdin_as_code(&v.eff)
+                    j > i
+                        && v.pipe == u.pipe
+                        && v.seg.piped
+                        && v.readings().any(reads_stdin_as_code)
                 });
                 if downstream {
                     hits.push("pipe-to-shell");
                 }
             }
-            if is_executor(eff) && u.subs.iter().any(|s| contains_downloader(s)) {
+            if u.readings().any(is_executor) && u.subs.iter().any(|s| contains_downloader(s)) {
                 hits.push("pipe-to-shell");
             }
         }
@@ -1145,6 +1246,104 @@ impl Ctx<'_> {
     }
 }
 
+/// What a search subject's `glob` can name outside every path the subject
+/// gives (M1-18, P1). `patterns`: each brace expansion that leaves, made
+/// absolute (`/h/u/.ssh/id_*`); `unknown`: a form whose reach can't be read
+/// (a backslash, `~user`, a component made of classes and `?` that can be
+/// `.` or `..`, too many expansions).
+#[derive(Debug, Default)]
+pub struct GlobEscape {
+    pub patterns: Vec<PathBuf>,
+    pub unknown: bool,
+}
+
+impl GlobEscape {
+    pub fn leaves(&self) -> bool {
+        self.unknown || !self.patterns.is_empty()
+    }
+}
+
+/// A pattern component that can match `.` or `..` without being written
+/// so: only classes, `?` and dots (`[.][.]`, `.[.]`, `??`). `*` is left
+/// out: a directory walk never lists `.` or `..`.
+fn may_be_dot_component(c: &str) -> bool {
+    if !c.contains(['[', '?']) || c.contains('*') {
+        return false;
+    }
+    let Ok(g) = GlobBuilder::new(c).literal_separator(true).build() else {
+        return true;
+    };
+    let m = g.compile_matcher();
+    m.is_match(".") || m.is_match("..")
+}
+
+/// [`GlobEscape`] for the check's subject; `None` without a glob.
+pub fn glob_escape(input: &PolicyInput<'_>) -> Option<GlobEscape> {
+    let ToolSubject::Paths {
+        paths,
+        glob: Some(glob),
+        ..
+    } = &input.check.subject
+    else {
+        return None;
+    };
+    let home = input.home;
+    let cwd = input.cwd;
+    let roots: Vec<PathBuf> = if paths.is_empty() {
+        vec![cwd.to_path_buf()]
+    } else {
+        paths
+            .iter()
+            .take(words::MAX_USES)
+            .map(|p| lexical_resolve(p, cwd, home))
+            .collect()
+    };
+    let mut out = GlobEscape::default();
+    if glob.contains('\\') || glob.contains('\0') {
+        out.unknown = true;
+        return Some(out);
+    }
+    let Some(expansions) = words::brace_expand(glob) else {
+        out.unknown = true;
+        return Some(out);
+    };
+    let is_pat = |c: &str| c.contains(['*', '?', '[']);
+    for e in expansions {
+        if e.is_empty() {
+            continue;
+        }
+        if e.starts_with('~') && !(e == "~" || e.starts_with("~/")) {
+            out.unknown = true;
+            continue;
+        }
+        if e.split('/').any(may_be_dot_component) {
+            out.unknown = true;
+            continue;
+        }
+        let anchored = e.starts_with('/') || e.starts_with('~');
+        let joined: Vec<PathBuf> = if anchored {
+            vec![lexical_resolve(&e, cwd, home)]
+        } else {
+            roots.iter().map(|r| normalize(&r.join(&e))).collect()
+        };
+        for abs in joined {
+            // the folder the walk starts from: the literal components
+            let mut start = PathBuf::new();
+            for c in abs.components() {
+                if is_pat(&c.as_os_str().to_string_lossy()) {
+                    break;
+                }
+                start.push(c.as_os_str());
+            }
+            let inside = roots.iter().any(|r| start.starts_with(r));
+            if !inside && !out.patterns.contains(&abs) {
+                out.patterns.push(abs);
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Words split on blanks, keeping a `$(…)`, `` `…` `` or quoted part whole
 /// (`$(brew --prefix)/bin/jq` is one word), for the raw text check.
 fn raw_words(t: &str) -> Vec<String> {
@@ -1219,6 +1418,30 @@ pub fn hard_deny(input: &PolicyInput<'_>, a: &Analysis) -> Option<&'static str> 
 
 pub fn sensitive(input: &PolicyInput<'_>) -> Sensitive {
     Sensitive::new(input)
+}
+
+/// The credential stores that ask (CR-12), absolute: files and folders
+/// (`~/.azure/msal_token_cache.*` are found by listing `~/.azure`).
+pub fn ask_roots(home: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = ASK_FILES
+        .iter()
+        .chain(ASK_TREES)
+        .map(|r| home.join(r))
+        .collect();
+    for (dir, pre) in ASK_NAME_PREFIXES {
+        if let Ok(rd) = std::fs::read_dir(home.join(dir)) {
+            for e in rd.flatten().take(256) {
+                if e.file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .starts_with(pre)
+                {
+                    v.push(e.path());
+                }
+            }
+        }
+    }
+    v
 }
 
 /// Every credential, `~/.ssh`, browser and Atrium location, absolute.

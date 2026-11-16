@@ -393,6 +393,11 @@ const GREP_VAL_L: &[&str] = &[
     "group-separator",
 ];
 
+/// GNU `grep`'s long option names (both tables), for reading a prefix.
+pub(crate) fn grep_long_names() -> impl Iterator<Item = &'static str> {
+    GREP_BOOL_L.iter().chain(GREP_VAL_L).copied()
+}
+
 pub(crate) struct Searched {
     pub(crate) roots: Vec<String>,
     pub(crate) recursive: bool,
@@ -502,6 +507,108 @@ fn roots_of(is_rg: bool, follow: bool, args: &[String]) -> Option<Searched> {
     Some(Searched { roots, recursive })
 }
 
+/// Credential names a committed file can have (CR-12: `git show
+/// REV:PATH` of a path whose name matches a credential asks): the
+/// hard-deny list's files and the stores that ask, by their path below home
+/// or, for names that are distinctive, by file name alone; private keys
+/// (`id_*` but `.pub`); anything below a credential folder.
+const GIT_CRED_SUFFIXES: &[&str] = &[
+    ".aws/credentials",
+    ".docker/config.json",
+    ".kube/config",
+    ".config/gh/hosts.yml",
+    ".claude/.credentials.json",
+    ".codex/auth.json",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".config/git/credentials",
+    ".azure/accesstokens.json",
+];
+const GIT_CRED_NAMES: &[&str] = &[
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".claude.json",
+    ".pypirc",
+    ".pgpass",
+    ".vault-token",
+    ".env",
+    ".bash_history",
+    ".zsh_history",
+    ".zhistory",
+    ".sh_history",
+    ".ksh_history",
+    ".history",
+    "fish_history",
+    "accesstokens.json",
+];
+const GIT_CRED_DIRS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".config/gcloud",
+    ".gemini",
+    ".aws/sso/cache",
+    "library/keychains",
+];
+
+/// Whether a `git show`/`git log`/`git diff` argument names a committed file
+/// whose name matches a credential: `REV:PATH`, `:PATH`, `:N:PATH` or a
+/// pathspec.
+fn git_names_credential(arg: &str) -> bool {
+    if arg.starts_with('-') && !arg.contains(':') {
+        return false;
+    }
+    let path = match arg.split_once(':') {
+        // `:0:path`, `HEAD:path`, `:path`
+        Some((_, rest)) => match rest.split_once(':') {
+            Some((n, p)) if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() => p,
+            _ => rest,
+        },
+        None => arg,
+    };
+    let l = path.to_lowercase().replace('ſ', "s");
+    let parts: Vec<&str> = l
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let Some(name) = parts.last() else {
+        return false;
+    };
+    let joined = parts.join("/");
+    if GIT_CRED_NAMES.contains(name)
+        || name.starts_with("msal_token_cache.")
+        || (["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
+            .iter()
+            .any(|k| name.starts_with(k))
+            && !name.ends_with(".pub"))
+    {
+        return true;
+    }
+    if GIT_CRED_SUFFIXES
+        .iter()
+        .any(|s| joined == *s || joined.ends_with(&format!("/{s}")))
+    {
+        return true;
+    }
+    // below a credential folder (`.ssh/x`, `a/.gnupg/y`), but not public
+    // ssh files
+    GIT_CRED_DIRS.iter().any(|d| {
+        let at = |i: usize| parts[i..].join("/");
+        (0..parts.len()).any(|i| {
+            let rest = at(i);
+            rest.strip_prefix(d)
+                .and_then(|r| r.strip_prefix('/'))
+                .is_some_and(|r| {
+                    !r.is_empty()
+                        && !(*d == ".ssh"
+                            && (name.ends_with(".pub")
+                                || name.starts_with("known_hosts")
+                                || matches!(*name, "config" | "authorized_keys")))
+                })
+        })
+    })
+}
+
 struct Home<'a> {
     input: &'a PolicyInput<'a>,
     a: &'a Analysis,
@@ -526,9 +633,24 @@ impl Home<'_> {
         out
     }
 
+    /// Whether a path the call names is a credential store that asks
+    /// (CR-12): ours, the gate's (symlinks resolved, hard links mapped onto
+    /// the store), and, when the gate's list didn't line up, its flat list.
+    fn names_ask_store(&self, unit: Option<usize>) -> bool {
+        let hit = self.a.uses.iter().enumerate().any(|(idx, u)| {
+            unit.is_none_or(|i| u.unit == i)
+                && self.a.all_paths(idx).iter().any(|p| self.s.ask_hit(p))
+        });
+        hit || (self.a.aligned.is_none()
+            && self.input.resolved_paths.iter().any(|p| self.s.ask_hit(p)))
+    }
+
     fn readonly(&self, i: usize) -> bool {
         let u = &self.a.units[i];
         if !u.seg.assignments.is_empty() || !harmless(u) || u.seg.argv.is_empty() {
+            return false;
+        }
+        if self.names_ask_store(Some(i)) {
             return false;
         }
         let argv = &u.seg.argv;
@@ -550,6 +672,11 @@ impl Home<'_> {
             .iter()
             .any(|a| a.starts_with("--exec-path") || a.starts_with("--config-env"))
         {
+            return false;
+        }
+        // `git show HEAD:.npmrc`: a committed file named like a credential
+        // (CR-12)
+        if entry.prefix.first() == Some(&"git") && args.iter().any(|a| git_names_credential(a)) {
             return false;
         }
         let is_rg = entry.prefix == ["rg"];
@@ -578,8 +705,28 @@ impl Home<'_> {
         match &input.check.subject {
             ToolSubject::None => PolicyVerdict::Allow { rule: None },
             ToolSubject::Paths {
-                paths, recursive, ..
+                paths,
+                recursive,
+                glob,
             } => match input.check.kind {
+                // a credential store that asks (CR-12)
+                ToolKind::Read | ToolKind::Search if self.names_ask_store(None) => {
+                    PolicyVerdict::Ask
+                }
+                ToolKind::Search
+                    if glob.as_ref().is_some_and(|g| {
+                        let roots: Vec<PathBuf> = if paths.is_empty() {
+                            vec![input.cwd.to_path_buf()]
+                        } else {
+                            (0..self.a.uses.len())
+                                .flat_map(|i| self.a.all_paths(i).into_iter().cloned())
+                                .collect()
+                        };
+                        self.s.ask_search_glob_hit(&roots, g)
+                    }) =>
+                {
+                    PolicyVerdict::Ask
+                }
                 ToolKind::Read => PolicyVerdict::Allow { rule: None },
                 ToolKind::Search => {
                     if *recursive {
@@ -640,6 +787,12 @@ impl PolicyEngine for DefaultPolicy {
                 reason: reason.unwrap_or_default(),
                 rule,
             };
+        }
+        // A search glob that can name files outside every path the subject
+        // gives (M1-18, P1): what it reads isn't known, so, like an
+        // `Unknown` subject, it can only be hard-denied (above) or asked.
+        if deny::glob_escape(input).is_some_and(|e| e.leaves()) {
+            return PolicyVerdict::Ask;
         }
         let unknown = matches!(input.check.subject, ToolSubject::Unknown);
         let command = matches!(input.check.subject, ToolSubject::Command { .. });

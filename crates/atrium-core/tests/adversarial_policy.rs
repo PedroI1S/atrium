@@ -1076,32 +1076,69 @@ fn finding_5_a_recursive_search_of_a_folder_with_a_credential_file_is_blocked() 
 }
 
 /// Credential-bearing files that the contract's hard-deny list does not name.
-/// Each is auto-allowed in Home today: the finding is the list (a contract
-/// change, CR in `change-requests.md`).
+/// CR-12 (contract §9 rev 3.1, D-082) decided them: they ask in Home, and are
+/// not hard-denied (a rule or an approval may allow them).
 const OUTSIDE_THE_LIST: &[&str] = &[
     "cat ~/.config/git/credentials",
     "cat ~/.pgpass",
     "cat ~/.pypirc",
-    "cat ~/.gem/credentials",
     "cat ~/.cargo/credentials.toml",
     "cat ~/.cargo/credentials",
-    "cat ~/.terraform.d/credentials.tfrc.json",
     "cat ~/.azure/accessTokens.json",
+    "cat ~/.azure/msal_token_cache.json",
     "cat ~/.vault-token",
     "cat ~/.aws/sso/cache/x.json",
-    "cat ~/.config/op/config",
-    "cat ~/.yarnrc.yml",
     "cat ~/.zsh_history",
     "cat ~/.bash_history",
+    "cat ~/.local/share/fish/fish_history",
     "cat ~/.env",
     "git show HEAD:.npmrc",
     "git show :.ssh/id_rsa",
+    "git cat-file -p HEAD:.pypirc",
 ];
 
+/// Stores the review named that the CR-12 list does not: they stay
+/// auto-allowed in Home until the contract's list names them.
+const NOT_IN_THE_CR_12_LIST: &[&str] = &[
+    "cat ~/.gem/credentials",
+    "cat ~/.terraform.d/credentials.tfrc.json",
+    "cat ~/.config/op/config",
+    "cat ~/.yarnrc.yml",
+];
+
+/// Asserts Home asks (never Allow, never a hard deny), and that an
+/// allow-everything rule and FullAccess allow (CR-12: not hard-denied).
+fn asks_in_home_only(lines: &[&str]) {
+    let env = Env::home();
+    let any = allow_everything();
+    let mut failures = vec![];
+    for line in lines {
+        let c = cmd_check(line);
+        let home = env.eval_check(&c, &[], Preset::Home);
+        if !matches!(home, atrium_core::PolicyVerdict::Ask) {
+            failures.push(format!("{line:?} [home]: {}", classify(&home)));
+        }
+        for (label, v) in [
+            ("home+any-rule", env.eval_check(&c, &any, Preset::Home)),
+            ("full-access", env.eval_check(&c, &[], Preset::FullAccess)),
+        ] {
+            if !matches!(v, atrium_core::PolicyVerdict::Allow { .. }) {
+                failures.push(format!("{line:?} [{label}]: {}", classify(&v)));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 #[test]
-#[ignore = "M1-13 finding 6"]
-fn finding_6_other_credential_stores_are_hard_denied() {
-    hard_everywhere(OUTSIDE_THE_LIST);
+fn finding_6_other_credential_stores_ask_in_home() {
+    asks_in_home_only(OUTSIDE_THE_LIST);
+}
+
+#[test]
+#[ignore = "M1-13 finding 6: not in the CR-12 list (contract §9 rev 3.1)"]
+fn finding_6_stores_outside_the_cr_12_list_ask_in_home() {
+    asks_in_home_only(NOT_IN_THE_CR_12_LIST);
 }
 
 // ---------------------------------------------------------------------------

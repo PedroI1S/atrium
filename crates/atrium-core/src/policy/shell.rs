@@ -68,6 +68,16 @@ pub struct Unit {
     /// instead (in a pipeline, a group or the background), so the shell
     /// after it may be where it was or where the text ended (round 6 item 7).
     pub shell_union: bool,
+    /// The other readings of its wrappers (`eff` is the first): every check
+    /// of what the command runs looks at all of them (M1-18, K1).
+    pub alt: Vec<Vec<String>>,
+}
+
+impl Unit {
+    /// `eff` and every other reading of the command's wrappers.
+    pub fn readings(&self) -> impl Iterator<Item = &[String]> {
+        std::iter::once(self.eff.as_slice()).chain(self.alt.iter().map(Vec::as_slice))
+    }
 }
 
 /// What kind of compound command a command is inside.
@@ -1098,48 +1108,19 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         // `eval` and `source` run their text in this shell
         // (also when a substitution names them: `$(which eval)`, `$(which
         // env) eval`: round 8 blocker 1)
-        let same_shell_owner = runs_here(&eff, depth);
-        // in a pipeline, a group or the background it may run in a child
-        let owner_maybe_child = pipe != 0 || grouped || background || piped;
-        let mut payloads = payloads_of(&eff);
-        for e in &other_readings {
-            payloads.extend(payloads_of(e));
-        }
-        payloads.extend(env_payloads(&seg.argv));
-        // the output of a `$(…)` that is run as code: `sh -c "$(echo …)"`,
-        // `eval $(…)`, `$(…)` as the command word
-        let mut code_subs: Vec<String> = payloads
-            .iter()
-            .flat_map(|p| find_substitutions(p))
-            .collect();
-        // the command word, also behind a wrapper (`env $(…)`, `nohup $(…)`:
-        // round 5 blocker 7)
-        for w0 in [seg.argv.first(), eff.first()].into_iter().flatten() {
-            if has_command_substitution(w0) {
-                code_subs.extend(find_substitutions(w0));
-            }
-        }
-        code_subs.dedup();
-        // `bash < <(echo …)`, `source <(…)`, `bash <(…)`: a process
-        // substitution a shell runs (part 1's finding 9)
-        if eff
-            .first()
-            .is_some_and(|f| maybe_shell(f) || matches!(base(f), "source" | "."))
-        {
-            for w in seg
-                .argv
-                .iter()
-                .skip(1)
-                .chain(seg.redirects.iter().map(|r| &r.target))
-            {
-                if let Some(b) = w.strip_prefix("<(").and_then(|r| r.strip_suffix(')')) {
-                    code_subs.push(b.to_string());
-                }
-            }
-        }
-        for s in &code_subs {
-            payloads.extend(output_texts(s, depth));
-        }
+        // Every reading of the wrappers counts (M1-18, K1): `command -Z X
+        // eval …` runs `eval` in the reading where `-Z` takes `X`.
+        let mut effs: Vec<Vec<String>> = vec![eff.clone()];
+        effs.extend(other_readings.iter().cloned());
+        let here: Vec<bool> = effs.iter().map(|e| runs_here(e, depth)).collect();
+        let same_shell_owner = here.iter().any(|h| *h);
+        // in a pipeline, a group or the background it may run in a child;
+        // when only some readings run the text here, the shell after it may
+        // be where it was or where the text ended
+        let owner_maybe_child =
+            pipe != 0 || grouped || background || piped || !here.iter().all(|h| *h);
+        let targets: Vec<String> = seg.redirects.iter().map(|r| r.target.clone()).collect();
+        let payloads = code_texts(&seg.argv, &effs, &targets, depth);
         for p in &payloads {
             let l = lex_depth(p, depth + 1, true);
             out.overflow |= l.overflow;
@@ -1172,6 +1153,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             compound,
             close_join,
             shell_union: false,
+            alt: other_readings.clone(),
         };
         let readings: Vec<Unit> = other_readings
             .into_iter()
@@ -1186,18 +1168,19 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
                 level: depth + 1,
                 compound: vec![],
                 close_join: None,
+                alt: vec![],
                 ..unit.clone()
             })
             .collect();
         out.units.push(unit);
         if eff.first().map(|s| base(s)) == Some("find") {
-            find_exec_units(&eff, &mut out.units, depth + 1);
+            find_exec_units(&eff, &mut out, depth + 1);
         }
         for u in readings {
             if u.eff.first().map(|s| base(s)) == Some("find") {
                 let e = u.eff.clone();
                 out.units.push(u);
-                find_exec_units(&e, &mut out.units, depth + 1);
+                find_exec_units(&e, &mut out, depth + 1);
             } else {
                 out.units.push(u);
             }
@@ -1217,43 +1200,12 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     // Text fed to a shell on stdin (here-docs, here-strings, `echo … | sh`) is
     // a command line too. Any shell, `eval` or `source` marks it; each text is
     // lexed once.
-    let is_stdin_code = |u: &Unit| {
-        u.eff.first().is_some_and(|f| maybe_shell(f))
-            || runs_here(&u.eff, depth)
-            || reads_stdin_as_script(&u.eff)
-    };
+    // Every reading of a command's wrappers counts (M1-18, K1).
+    let is_stdin_code =
+        |u: &Unit| u.readings().any(|e| stdin_code_eff(e, depth)) || runs_here_any(u, depth);
     // A pipe into a command named at run time (`| $PAGER`) is read only when
     // it asks for a script on stdin (`-s`, `-`).
-    let is_pipe_code = |u: &Unit| {
-        u.eff.first().is_some_and(|f| {
-            is_shell(f)
-                || matches!(base(f), "eval" | "source" | ".")
-                // `| s$(echo h)`, `| $(echo sh)`: a word built by running
-                // something may name a shell (a variable alone, `| $PAGER`,
-                // is read only with `-s` or `-`)
-                || (has_command_substitution(f)
-                    && substituted_program_at(f, depth).is_none_or(|n| {
-                        let mut e = u.eff.clone();
-                        e[0] = n;
-                        // the wrappers in front of it too (round 7 item 5)
-                        let (e, unknown) = unwrap_checked(&e);
-                        unknown
-                            || e.first().is_some_and(|f| {
-                                maybe_shell(f) || matches!(base(f), "eval" | "source" | ".")
-                            })
-                            || reads_stdin_as_script(&e)
-                    }))
-                || (maybe_shell(f) && u.eff[1..].iter().any(|a| a == "-s" || a == "-"))
-        }) || reads_stdin_as_script(&u.eff)
-            || runs_here(&u.eff, depth)
-            // `| sh -c bash`, `| script -c bash f`, `| $(which script) -c
-            // bash f` (round 8 blocker 3)
-            || unwrap_readings(&u.eff, depth).iter().any(|e| {
-                is_shell(e.first().map_or("", |f| f.as_str()))
-                    && shell_c_code(e).is_some()
-                    && super::deny::reads_stdin_as_code(e)
-            })
-    };
+    let is_pipe_code = |u: &Unit| u.readings().any(|e| pipe_code_eff(e, depth));
     if out.units.len() > MAX_UNITS {
         out.overflow = true;
         return out;
@@ -1266,10 +1218,12 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
     // process-substituted. Groups, loops, subshells and anything piped count.
     let reads_code = |u: &Unit| {
         is_stdin_code(u)
-            || u.eff.first().is_some_and(|f| {
-                let b = base(f);
-                b.starts_with("python")
-                    || matches!(b, "perl" | "ruby" | "node" | "deno" | "bun" | "php" | "lua")
+            || u.readings().any(|e| {
+                e.first().is_some_and(|f| {
+                    let b = base(f);
+                    b.starts_with("python")
+                        || matches!(b, "perl" | "ruby" | "node" | "deno" | "bun" | "php" | "lua")
+                })
             })
     };
     out.stdin_texts = bodies.iter().map(|(_, t)| t.clone()).collect();
@@ -1282,10 +1236,15 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
         let same_shell = raw_pos
             .get(*owner)
             .copied()
-            .filter(|p| out.units.get(*p).is_some_and(|u| runs_here(&u.eff, depth)));
-        let union = same_shell
-            .and_then(|p| out.units.get(p))
-            .is_some_and(|u| u.pipe != 0 || u.grouped || u.background || u.seg.piped);
+            .filter(|p| out.units.get(*p).is_some_and(|u| runs_here_any(u, depth)));
+        // in a child, or only in some readings of its wrappers: both
+        let union = same_shell.and_then(|p| out.units.get(p)).is_some_and(|u| {
+            u.pipe != 0
+                || u.grouped
+                || u.background
+                || u.seg.piped
+                || !u.readings().all(|e| runs_here(e, depth))
+        });
         let clearly_text = raw_pos
             .get(*owner)
             .and_then(|p| out.units.get(*p))
@@ -1328,7 +1287,7 @@ fn lex_depth(line: &str, depth: u8, derived: bool) -> Lexed {
             }
             // a pipeline's commands run in children, except (zsh) its last
             // one: `… | source /dev/stdin` may run in this shell
-            let same_shell = runs_here(&u.eff, depth).then_some(k);
+            let same_shell = runs_here_any(u, depth).then_some(k);
             // ... in a child for other shells: both (round 6 item 7)
             texts.extend(piped.into_iter().map(|t| (t, same_shell, true)));
         }
@@ -1858,20 +1817,176 @@ fn runs_here(eff: &[String], depth: u8) -> bool {
             && unwrap_readings(eff, depth).iter().any(|e| here(e)))
 }
 
-/// The code a shell is given with `-c` (`sh -c CODE`, `bash -ec CODE`).
-pub fn shell_c_code(eff: &[String]) -> Option<String> {
-    let mut seen_c = false;
-    for a in eff.iter().skip(1) {
-        if a.starts_with('-') && !a.starts_with("--") && a.len() > 1 {
-            seen_c |= a[1..].contains('c');
-            continue;
+/// [`runs_here`] for any reading of a unit's wrappers.
+fn runs_here_any(u: &Unit, depth: u8) -> bool {
+    u.readings().any(|e| runs_here(e, depth))
+}
+
+/// Whether one reading of a command reads a script on stdin: a shell (or a
+/// word that may name one), `eval`/`source`/`.`, or a stdin script reader.
+fn stdin_code_eff(e: &[String], depth: u8) -> bool {
+    e.first().is_some_and(|f| maybe_shell(f)) || runs_here(e, depth) || reads_stdin_as_script(e)
+}
+
+/// Whether one reading of a command runs what is piped into it as code.
+fn pipe_code_eff(e: &[String], depth: u8) -> bool {
+    e.first().is_some_and(|f| {
+        is_shell(f)
+            || matches!(base(f), "eval" | "source" | ".")
+            // `| s$(echo h)`, `| $(echo sh)`: a word built by running
+            // something may name a shell (a variable alone, `| $PAGER`,
+            // is read only with `-s` or `-`)
+            || (has_command_substitution(f)
+                && substituted_program_at(f, depth).is_none_or(|n| {
+                    let mut e = e.to_vec();
+                    e[0] = n;
+                    // the wrappers in front of it too (round 7 item 5)
+                    let (e, unknown) = unwrap_checked(&e);
+                    unknown
+                        || e.first().is_some_and(|f| {
+                            maybe_shell(f) || matches!(base(f), "eval" | "source" | ".")
+                        })
+                        || reads_stdin_as_script(&e)
+                }))
+            || (maybe_shell(f) && e[1..].iter().any(|a| a == "-s" || a == "-"))
+    }) || reads_stdin_as_script(e)
+        || runs_here(e, depth)
+        // `| sh -c bash`, `| script -c bash f`, `| $(which script) -c
+        // bash f` (round 8 blocker 3)
+        || unwrap_readings(e, depth).iter().any(|r| {
+            is_shell(r.first().map_or("", |f| f.as_str()))
+                && !shell_c_codes(r).is_empty()
+                && super::deny::reads_stdin_as_code(r)
+        })
+}
+
+/// The text a command runs as code, from every reading of its wrappers
+/// (`effs`) and every step of unwrapping them (M1-18, K1 and K4): a
+/// shell's `-c` string, `eval`'s words, `env -S`/`env -C` (also when a
+/// substitution names `env`: `$(which env) -C ..`), the output of a `$(…)`
+/// run as code or as the command word, and a process substitution a shell
+/// or `source` runs (`bash <(…)`, `bash < <(…)`).
+fn code_texts(argv: &[String], effs: &[Vec<String>], targets: &[String], depth: u8) -> Vec<String> {
+    let mut payloads: Vec<String> = vec![];
+    let add = |v: Vec<String>, out: &mut Vec<String>| {
+        for p in v {
+            if !out.contains(&p) {
+                out.push(p);
+            }
         }
-        if a.starts_with('+') || a.starts_with("--") {
-            continue;
-        }
-        return seen_c.then(|| a.clone());
+    };
+    for e in effs {
+        add(payloads_of(e), &mut payloads);
     }
-    None
+    add(env_payloads(argv), &mut payloads);
+    for step in unwrap_steps(argv, depth) {
+        if step.first().is_some_and(|f| base(f) == "env") {
+            add(env_payloads(&step), &mut payloads);
+        }
+    }
+    // the output of a `$(…)` that is run as code: `sh -c "$(echo …)"`,
+    // `eval $(…)`, `$(…)` as the command word
+    let mut code_subs: Vec<String> = payloads
+        .iter()
+        .flat_map(|p| find_substitutions(p))
+        .collect();
+    // the command word, also behind a wrapper (`env $(…)`, `nohup $(…)`:
+    // round 5 blocker 7), in every reading
+    for w0 in argv
+        .first()
+        .into_iter()
+        .chain(effs.iter().filter_map(|e| e.first()))
+    {
+        if has_command_substitution(w0) {
+            code_subs.extend(find_substitutions(w0));
+        }
+    }
+    // `bash < <(echo …)`, `source <(…)`, `bash <(…)`: a process
+    // substitution a shell runs (part 1's finding 9), in any reading
+    if effs.iter().any(|e| {
+        e.first()
+            .is_some_and(|f| maybe_shell(f) || matches!(base(f), "source" | "."))
+    }) {
+        for w in argv.iter().skip(1).chain(targets) {
+            if let Some(b) = w.strip_prefix("<(").and_then(|r| r.strip_suffix(')')) {
+                code_subs.push(b.to_string());
+            }
+        }
+    }
+    let mut seen: Vec<&String> = vec![];
+    for s in &code_subs {
+        if seen.contains(&s) {
+            continue;
+        }
+        seen.push(s);
+        add(output_texts(s, depth), &mut payloads);
+    }
+    payloads
+}
+
+/// Where a shell's options end, read two ways (M1-18, K3): as before (every
+/// option one word) and the way the shell reads them, where each `o` or `O`
+/// in a cluster (`-o NAME`, `+O NAME`, `-eo pipefail`) and `--rcfile`,
+/// `--init-file` and `--emulate` take the next word. For each reading:
+/// whether `-c` (or `--command`) was given, and the index of the first
+/// operand.
+fn shell_operand_starts(eff: &[String]) -> Vec<(bool, usize)> {
+    let mut out = vec![];
+    for valued in [false, true] {
+        let mut seen_c = false;
+        let mut j = 1;
+        while j < eff.len() {
+            let a = eff[j].as_str();
+            if a == "--" {
+                j += 1;
+                break;
+            }
+            if a == "--command" {
+                seen_c = true;
+                j += 1;
+                continue;
+            }
+            if a.starts_with("--") {
+                j += if valued && matches!(a, "--rcfile" | "--init-file" | "--emulate") {
+                    2
+                } else {
+                    1
+                };
+                continue;
+            }
+            if (a.starts_with('-') || a.starts_with('+')) && a.len() > 1 {
+                let letters = &a[1..];
+                if a.starts_with('-') {
+                    seen_c |= letters.contains('c');
+                }
+                j += 1;
+                if valued {
+                    j += letters.chars().filter(|c| matches!(c, 'o' | 'O')).count();
+                }
+                continue;
+            }
+            break;
+        }
+        if !out.contains(&(seen_c, j)) {
+            out.push((seen_c, j));
+        }
+    }
+    out
+}
+
+/// The code a shell is given with `-c` (`sh -c CODE`, `bash -ec CODE`,
+/// `bash -o errexit -c CODE`), under every reading of its options.
+pub fn shell_c_codes(eff: &[String]) -> Vec<String> {
+    let mut out = vec![];
+    for (seen_c, j) in shell_operand_starts(eff) {
+        if seen_c
+            && let Some(code) = eff.get(j)
+            && !out.contains(code)
+        {
+            out.push(code.clone());
+        }
+    }
+    out
 }
 
 /// Every way the wrappers in front of `argv` can be read (round 7 item 6):
@@ -1910,6 +2025,24 @@ fn take_opt(
         *choices += 1;
         bit
     };
+    // A one-letter long prefix (`script --c`, `flock --c`): GNU
+    // `getopt_long` takes it for `--command` when it is unique, and refuses
+    // it when it isn't. Read both ways: as `--command`, and as an option the
+    // table doesn't know (M1-18, K3).
+    if shell_c
+        && let Some(long) = a[j].strip_prefix("--")
+        && let name = long.split_once('=').map_or(long, |(n, _)| n)
+        && name.len() == 1
+        && "command".starts_with(name)
+    {
+        *unknown = true;
+        if pick() {
+            return Opt::Shell(match long.split_once('=') {
+                Some((_, v)) => Some(v.to_string()),
+                None => a.get(j + 1).cloned(),
+            });
+        }
+    }
     match read_opt(a, j, o, shell_c) {
         // an option the table doesn't know may take the next word as its
         // value or not: both (round 8 blocker 5)
@@ -1933,7 +2066,28 @@ fn take_opt(
     }
 }
 
+/// Every intermediate argv of every reading of the wrappers in front of
+/// `argv` (substituted command words resolved): `env -i $(which env) -C ..
+/// cat x` passes through `env -C .. cat x` (M1-18, K1).
+fn unwrap_steps(argv: &[String], depth: u8) -> Vec<Vec<String>> {
+    let mut steps: Vec<Vec<String>> = vec![];
+    let (_, _, choices) = unwrap_reading_steps(argv, 0, Some(depth), Some(&mut steps));
+    for mask in 1..(1u32 << choices.min(4)) {
+        unwrap_reading_steps(argv, mask, Some(depth), Some(&mut steps));
+    }
+    steps
+}
+
 fn unwrap_reading(argv: &[String], mask: u32, resolve: Option<u8>) -> (Vec<String>, bool, u32) {
+    unwrap_reading_steps(argv, mask, resolve, None)
+}
+
+fn unwrap_reading_steps(
+    argv: &[String],
+    mask: u32,
+    resolve: Option<u8>,
+    mut steps: Option<&mut Vec<Vec<String>>>,
+) -> (Vec<String>, bool, u32) {
     let mut a: Vec<String> = argv.to_vec();
     let mut unknown = false;
     let mut choices = 0u32;
@@ -1945,6 +2099,12 @@ fn unwrap_reading(argv: &[String], mask: u32, resolve: Option<u8>) -> (Vec<Strin
         {
             a[0] = name;
             continue;
+        }
+        if let Some(st) = steps.as_deref_mut()
+            && st.len() < 64
+            && !st.contains(&a)
+        {
+            st.push(a.clone());
         }
         let b = base(first).to_string();
         // options with a table, then `operands` words before the command
@@ -2850,6 +3010,12 @@ fn payloads_of(eff: &[String]) -> Vec<String> {
         if has_c {
             out.extend(eff.get(j).cloned());
         }
+        // and as the shell reads its options (`-eo pipefail -c CODE`: K3)
+        for code in shell_c_codes(eff) {
+            if !out.contains(&code) {
+                out.push(code);
+            }
+        }
     } else if first == "eval" {
         let args = if eff.get(1).map(String::as_str) == Some("--") {
             &eff[2..]
@@ -3033,8 +3199,12 @@ pub fn find_roots_explicit(eff: &[String]) -> (Vec<String>, usize, bool) {
     (roots, j.min(eff.len()), explicit)
 }
 
-/// `find … -exec CMD … ;` becomes its own unit so hard-deny sees `CMD`.
-fn find_exec_units(eff: &[String], units: &mut Vec<Unit>, level: u8) {
+/// `find … -exec CMD … ;` becomes its own unit so hard-deny sees `CMD`, in
+/// every reading of its wrappers; what `CMD` runs as code (`sh -c …`,
+/// `env -C DIR …`, `eval`, a substitution) becomes units too, read the same
+/// way as for a command written on the line (M1-18, K4), and a `find` it
+/// runs is read again.
+fn find_exec_units(eff: &[String], out: &mut Lexed, level: u8) {
     let (roots, j) = find_roots(eff);
     let mut k = j;
     while k < eff.len() {
@@ -3045,25 +3215,28 @@ fn find_exec_units(eff: &[String], units: &mut Vec<Unit>, level: u8) {
                 argv.push(eff[m].clone());
                 m += 1;
             }
+            k = m + 1;
+            if argv.is_empty() {
+                continue;
+            }
             // every reading of its wrappers and substituted words (`-exec
             // $(which sudo) id`: round 8 blocker 4)
             let mut effs = vec![unwrap(&argv)];
-            if !argv.is_empty() {
-                for r in unwrap_readings(&argv, level) {
-                    if !r.is_empty() && !effs.contains(&r) {
-                        effs.push(r);
-                    }
+            for r in unwrap_readings(&argv, level) {
+                if !r.is_empty() && !effs.contains(&r) {
+                    effs.push(r);
                 }
             }
-            for e in effs.into_iter().filter(|_| !argv.is_empty()) {
-                units.push(Unit {
+            let payloads = code_texts(&argv, &effs, &[], level);
+            for e in &effs {
+                out.units.push(Unit {
                     seg: Segment {
                         assignments: vec![],
                         argv: argv.clone(),
                         redirects: vec![],
                         piped: false,
                     },
-                    eff: e,
+                    eff: e.clone(),
                     subs: vec![],
                     proc_sub: false,
                     grouped: true,
@@ -3078,9 +3251,26 @@ fn find_exec_units(eff: &[String], units: &mut Vec<Unit>, level: u8) {
                     compound: vec![],
                     close_join: None,
                     shell_union: false,
+                    alt: vec![],
                 });
+                if level < MAX_DEPTH && e.first().is_some_and(|f| base(f) == "find") {
+                    find_exec_units(e, out, level + 1);
+                }
             }
-            k = m;
+            // `find` runs it in a child: nothing it runs moves this shell
+            for p in &payloads {
+                let l = lex_depth(p, level + 1, true);
+                out.overflow |= l.overflow;
+                for mut u in l.units {
+                    u.derived = true;
+                    out.units.push(u);
+                }
+            }
+            if out.units.len() > MAX_UNITS {
+                out.overflow = true;
+                return;
+            }
+            continue;
         }
         k += 1;
     }
