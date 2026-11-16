@@ -1062,7 +1062,6 @@ fn finding_9_a_process_substitution_that_feeds_a_shell_is_read() {
 }
 
 #[test]
-#[ignore = "M1-13 finding 5"]
 fn finding_5_a_recursive_search_of_a_folder_with_a_credential_file_is_blocked() {
     hard_everywhere(&[
         "rg pat .aws",

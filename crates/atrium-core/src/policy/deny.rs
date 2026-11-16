@@ -1227,6 +1227,34 @@ impl Ctx<'_> {
         {
             hits.extend(self.search_glob_hit(paths, g, *recursive));
         }
+        // recursive search over a folder that holds a hard-denied path (S8)
+        if let ToolSubject::Paths {
+            paths,
+            recursive: true,
+            ..
+        } = &self.input.check.subject
+        {
+            if paths.is_empty() {
+                if let Some(h) = self.dir_contains_hard_deny(self.input.cwd) {
+                    hits.push(h);
+                }
+            } else {
+                for idx in 0..a.uses.len() {
+                    for p in a.all_paths(idx) {
+                        if let Some(h) = self.dir_contains_hard_deny(p) {
+                            hits.push(h);
+                        }
+                    }
+                }
+                if a.aligned.is_none() {
+                    for p in self.input.resolved_paths {
+                        if let Some(h) = self.dir_contains_hard_deny(p) {
+                            hits.push(h);
+                        }
+                    }
+                }
+            }
+        }
         // a search glob that leaves its roots (M1-18, P1): each expansion
         // that leaves is checked as a path pattern of its own
         if let Some(esc) = &self.a.glob_escape {
@@ -1373,8 +1401,124 @@ impl Ctx<'_> {
             if u.readings().any(is_executor) && u.subs.iter().any(|s| contains_downloader(s)) {
                 hits.push("pipe-to-shell");
             }
+            // recursive search of a folder holding a hard-denied path (S8)
+            for eff_r in u.readings() {
+                if let Some(spec) = recursive_search_roots(eff_r) {
+                    self.check_search_roots(i, &spec, &mut hits);
+                }
+            }
         }
         hits
+    }
+
+    fn dir_contains_hard_deny(&self, p: &Path) -> Option<&'static str> {
+        if let Some(h) = self.s.hit(p, Role::Read) {
+            return Some(h);
+        }
+        let pl = lower(p);
+        let rest = under(&pl, &self.s.home)?;
+        // `~` itself keeps `dev`'s verdict; `~/.config` is kept as `Ask` by
+        // `policy.rs` (`whole_home_recursive_search_asks` and `hard_deny_table`).
+        if rest.is_empty() || rest == ".config" {
+            return None;
+        }
+        for d in &self.s.data {
+            if under(d, &pl).is_some() {
+                return Some("atrium-self");
+            }
+        }
+        if under(".ssh", rest).is_some()
+            || CRED_FILES.iter().any(|f| under(f, rest).is_some())
+            || CRED_TREES.iter().any(|t| under(t, rest).is_some())
+            || BROWSER_ROOTS
+                .iter()
+                .any(|b| under(b, rest).is_some() || under(rest, b).is_some())
+        {
+            return Some("credential-read");
+        }
+        None
+    }
+
+    fn check_search_roots(&self, i: usize, spec: &SearchRootSpec, hits: &mut Vec<&'static str>) {
+        if spec.base_dirs.is_empty() {
+            if spec.roots.is_empty() {
+                if spec.searches_cwd_when_empty {
+                    let cwd = self
+                        .a
+                        .unit_cwd
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| CwdState::Known(vec![self.a.start.clone()]));
+                    for c in cwd.candidates() {
+                        if let Some(h) = self.dir_contains_hard_deny(c) {
+                            hits.push(h);
+                        }
+                        if let Some(al) = &self.a.aligned {
+                            for (idx, u) in self.a.uses.iter().enumerate() {
+                                for (k, lp) in u.paths.iter().enumerate() {
+                                    if lp == c
+                                        && let Some(rp) = al[idx].get(k)
+                                        && let Some(h) = self.dir_contains_hard_deny(rp)
+                                    {
+                                        hits.push(h);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            for r in &spec.roots {
+                let expanded = words::brace_expand(r).unwrap_or_else(|| vec![r.clone()]);
+                for er in expanded {
+                    for p in self.target_paths(i, &er) {
+                        if let Some(h) = self.dir_contains_hard_deny(&p) {
+                            hits.push(h);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let mut bases: Vec<PathBuf> = vec![];
+        for (idx, b) in spec.base_dirs.iter().enumerate() {
+            let expanded = words::brace_expand(b).unwrap_or_else(|| vec![b.clone()]);
+            if idx == 0 {
+                for eb in expanded {
+                    bases.extend(self.target_paths(i, &eb));
+                }
+            } else {
+                let mut next = vec![];
+                for prev in &bases {
+                    for eb in &expanded {
+                        next.push(lexical_resolve(eb, prev, self.home()));
+                    }
+                }
+                bases = next;
+            }
+        }
+        if spec.roots.is_empty() {
+            if spec.searches_cwd_when_empty {
+                for b in &bases {
+                    if let Some(h) = self.dir_contains_hard_deny(b) {
+                        hits.push(h);
+                    }
+                }
+            }
+            return;
+        }
+        for r in &spec.roots {
+            let expanded = words::brace_expand(r).unwrap_or_else(|| vec![r.clone()]);
+            for er in expanded {
+                for b in &bases {
+                    let p = lexical_resolve(&er, b, self.home());
+                    if let Some(h) = self.dir_contains_hard_deny(&p) {
+                        hits.push(h);
+                    }
+                }
+            }
+        }
     }
 
     /// `~/.ssh` itself: listing it is fine; searching, copying or writing into
@@ -1491,6 +1635,713 @@ impl Ctx<'_> {
             }
         }
         None
+    }
+}
+
+struct SearchRootSpec {
+    roots: Vec<String>,
+    base_dirs: Vec<String>,
+    searches_cwd_when_empty: bool,
+}
+
+struct SearchOpts {
+    val_s: &'static str,
+    val_l: &'static [&'static str],
+    pat_s: &'static str,
+    pat_l: &'static [&'static str],
+    opt_num_s: &'static str,
+    opt_num_l: &'static [&'static str],
+    eq_only_l: &'static [&'static str],
+    bool_l: &'static [&'static str],
+    long_prefixes: bool,
+    always_recursive: bool,
+    check_grep_recursion: bool,
+    exec_s: &'static str,
+    exec_l: &'static [&'static str],
+    root_val_l: &'static [&'static str],
+    base_val_l: &'static [&'static str],
+    skip_parens: bool,
+}
+
+fn eq_folded(a: &str, lower_lit: &str) -> bool {
+    if a.is_ascii() {
+        a.eq_ignore_ascii_case(lower_lit)
+    } else {
+        a.to_lowercase().replace('ſ', "s") == lower_lit
+    }
+}
+
+fn resolve_long_opt<'a>(name: &'a str, o: &SearchOpts) -> &'a str {
+    if !o.long_prefixes || name.is_empty() {
+        return name;
+    }
+    let all = o
+        .val_l
+        .iter()
+        .chain(o.bool_l.iter())
+        .chain(o.opt_num_l.iter())
+        .chain(o.eq_only_l.iter())
+        .chain(o.exec_l.iter())
+        .chain(o.root_val_l.iter())
+        .chain(o.base_val_l.iter())
+        .copied();
+    let mut exact = false;
+    for candidate in all.clone() {
+        if candidate == name {
+            exact = true;
+            break;
+        }
+    }
+    if exact || name.len() < 3 {
+        return name;
+    }
+    let mut found: Option<&'static str> = None;
+    for candidate in all {
+        if candidate.starts_with(name) {
+            if let Some(prev) = found {
+                if prev != candidate {
+                    return name;
+                }
+            } else {
+                found = Some(candidate);
+            }
+        }
+    }
+    found.unwrap_or(name)
+}
+
+fn parse_search_opts(args: &[String], o: &SearchOpts) -> Option<SearchRootSpec> {
+    let mut recursive = o.always_recursive;
+    let mut have_pattern = false;
+    let mut dd = false;
+    let mut positional: Vec<String> = vec![];
+    let mut extra_roots: Vec<String> = vec![];
+    let mut base_dirs: Vec<String> = vec![];
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if dd || !a.starts_with('-') || a == "-" {
+            if !dd && o.skip_parens && (a == "(" || a == ")") {
+                continue;
+            }
+            positional.push(a.to_string());
+            continue;
+        }
+        if a == "--" {
+            dd = true;
+            continue;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let (raw_name, val_eq) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            let name = resolve_long_opt(raw_name, o);
+            if o.exec_l.contains(&name) {
+                while i < args.len() && args[i] != ";" {
+                    i += 1;
+                }
+                if i < args.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            if o.pat_l.contains(&name) {
+                have_pattern = true;
+            }
+            if o.check_grep_recursion && matches!(name, "recursive" | "dereference-recursive") {
+                recursive = true;
+            }
+            if o.root_val_l.contains(&name) {
+                let v = match val_eq {
+                    Some(v) => Some(v.to_string()),
+                    None => {
+                        let next = args.get(i).cloned();
+                        if next.is_some() {
+                            i += 1;
+                        }
+                        next
+                    }
+                };
+                if let Some(v) = v {
+                    extra_roots.push(v);
+                }
+            } else if o.base_val_l.contains(&name) {
+                let v = match val_eq {
+                    Some(v) => Some(v.to_string()),
+                    None => {
+                        let next = args.get(i).cloned();
+                        if next.is_some() {
+                            i += 1;
+                        }
+                        next
+                    }
+                };
+                if let Some(v) = v {
+                    base_dirs.push(v);
+                }
+            } else if o.val_l.contains(&name) {
+                let val = match val_eq {
+                    Some(v) => Some(v),
+                    None => {
+                        let next = args.get(i).map(String::as_str);
+                        if next.is_some() {
+                            i += 1;
+                        }
+                        next
+                    }
+                };
+                if o.check_grep_recursion
+                    && name == "directories"
+                    && let Some(v) = val
+                    && v.len() >= 3
+                    && "recurse".starts_with(v)
+                {
+                    recursive = true;
+                }
+            } else if o.opt_num_l.contains(&name)
+                && val_eq.is_none()
+                && args
+                    .get(i)
+                    .is_some_and(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()))
+            {
+                i += 1;
+            }
+        } else {
+            let cs: Vec<char> = a[1..].chars().collect();
+            for (k, c) in cs.iter().enumerate() {
+                let attached: String = cs[k + 1..].iter().collect();
+                if o.exec_s.contains(*c) {
+                    while i < args.len() && args[i] != ";" {
+                        i += 1;
+                    }
+                    if i < args.len() {
+                        i += 1;
+                    }
+                    break;
+                }
+                if o.pat_s.contains(*c) {
+                    have_pattern = true;
+                }
+                if o.check_grep_recursion && matches!(*c, 'r' | 'R') {
+                    recursive = true;
+                }
+                if o.val_s.contains(*c) {
+                    let val = if !attached.is_empty() {
+                        Some(attached.as_str())
+                    } else {
+                        let next = args.get(i).map(String::as_str);
+                        if next.is_some() {
+                            i += 1;
+                        }
+                        next
+                    };
+                    if o.check_grep_recursion
+                        && *c == 'd'
+                        && let Some(v) = val
+                        && v.len() >= 3
+                        && "recurse".starts_with(v)
+                    {
+                        recursive = true;
+                    }
+                    break;
+                }
+                if o.opt_num_s.contains(*c) {
+                    if attached.is_empty()
+                        && args
+                            .get(i)
+                            .is_some_and(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()))
+                    {
+                        i += 1;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    if !recursive {
+        return None;
+    }
+    let skip = usize::from(!have_pattern);
+    let mut roots: Vec<String> = positional.into_iter().skip(skip).collect();
+    let saw_stdin = roots.iter().any(|r| r == "-");
+    roots.retain(|r| r != "-");
+    roots.extend(extra_roots);
+    Some(SearchRootSpec {
+        roots,
+        base_dirs,
+        searches_cwd_when_empty: !saw_stdin,
+    })
+}
+
+fn strip_git_pathspec_magic(arg: &str) -> Option<String> {
+    let Some(after) = arg.strip_prefix(':') else {
+        return Some(arg.to_string());
+    };
+    let mut s = after;
+    loop {
+        if let Some(rest) = s.strip_prefix('(') {
+            let mut depth = 1usize;
+            let mut end = None;
+            for (idx, ch) in rest.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(idx);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end_idx = end?;
+            let inner = &rest[..end_idx];
+            if inner.split(',').any(|k| k.trim() == "exclude") {
+                return None;
+            }
+            s = &rest[end_idx + 1..];
+        } else if s.starts_with(['!', '^']) {
+            return None;
+        } else if let Some(rest) = s.strip_prefix(['/', ':']) {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+fn git_grep_roots(eff: &[String]) -> Option<SearchRootSpec> {
+    let first = eff.first()?;
+    if !eq_folded(base(first), "git") {
+        return None;
+    }
+    let mut base_dirs = vec![];
+    let mut i = 1;
+    while i < eff.len() {
+        let w = eff[i].as_str();
+        if w == "-C" {
+            if let Some(d) = eff.get(i + 1) {
+                base_dirs.push(d.clone());
+            }
+            i += 2;
+        } else if let Some(d) = w.strip_prefix("-C")
+            && !d.is_empty()
+        {
+            base_dirs.push(d.to_string());
+            i += 1;
+        } else if w == "--work-tree" {
+            if let Some(d) = eff.get(i + 1) {
+                base_dirs.push(d.clone());
+            }
+            i += 2;
+        } else if let Some(d) = w.strip_prefix("--work-tree=") {
+            base_dirs.push(d.to_string());
+            i += 1;
+        } else if matches!(
+            w,
+            "-c" | "--git-dir" | "--namespace" | "--super-prefix" | "--config-env"
+        ) {
+            i += 2;
+        } else if w.starts_with('-') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if eff.get(i).is_none_or(|s| !eq_folded(s, "grep")) {
+        return None;
+    }
+    const GIT_GREP_OPTS: SearchOpts = SearchOpts {
+        val_s: "efABCm",
+        val_l: &[
+            "regexp",
+            "file",
+            "max-depth",
+            "threads",
+            "after-context",
+            "before-context",
+            "context",
+            "max-count",
+            "parent-basename",
+        ],
+        pat_s: "ef",
+        pat_l: &["regexp", "file"],
+        opt_num_s: "",
+        opt_num_l: &[],
+        eq_only_l: &["color", "open-files-in-pager"],
+        bool_l: &[],
+        long_prefixes: false,
+        always_recursive: true,
+        check_grep_recursion: false,
+        exec_s: "",
+        exec_l: &[],
+        root_val_l: &[],
+        base_val_l: &[],
+        skip_parens: true,
+    };
+    let args = &eff[i + 1..];
+    // Before `--`, positional 0 (if no `-e`/`-f`) is `<pattern>`; everything
+    // after `--` is a pathspec directly.
+    if let Some(dd_idx) = args.iter().position(|a| a == "--") {
+        let mut roots = vec![];
+        for p in &args[dd_idx + 1..] {
+            if let Some(cleaned) = strip_git_pathspec_magic(p) {
+                roots.push(cleaned);
+            }
+        }
+        return Some(SearchRootSpec {
+            roots,
+            base_dirs,
+            searches_cwd_when_empty: true,
+        });
+    }
+    let mut spec = parse_search_opts(args, &GIT_GREP_OPTS)?;
+    spec.roots = spec
+        .roots
+        .into_iter()
+        .filter_map(|p| strip_git_pathspec_magic(&p))
+        .collect();
+    spec.base_dirs = base_dirs;
+    Some(spec)
+}
+
+fn recursive_search_roots(eff: &[String]) -> Option<SearchRootSpec> {
+    let first = eff.first()?;
+    let b = base(first);
+    let b_fold = if b.is_ascii() {
+        b.to_ascii_lowercase()
+    } else {
+        b.to_lowercase().replace('ſ', "s")
+    };
+    const RG_OPTS: SearchOpts = SearchOpts {
+        val_s: "egtTmABCdjMErf",
+        val_l: &[
+            "regexp",
+            "file",
+            "glob",
+            "iglob",
+            "type",
+            "type-not",
+            "max-count",
+            "after-context",
+            "before-context",
+            "context",
+            "max-depth",
+            "maxdepth",
+            "threads",
+            "max-columns",
+            "encoding",
+            "replace",
+            "colors",
+            "color",
+            "sort",
+            "sortr",
+            "max-filesize",
+            "path-separator",
+            "engine",
+            "context-separator",
+            "type-add",
+            "type-clear",
+            "field-context-separator",
+            "field-match-separator",
+            "dfa-size-limit",
+            "regex-size-limit",
+            "ignore-file",
+            "pre",
+            "pre-glob",
+            "hostname-bin",
+        ],
+        pat_s: "ef",
+        pat_l: &["regexp", "file", "files", "type-list"],
+        opt_num_s: "",
+        opt_num_l: &[],
+        eq_only_l: &[],
+        bool_l: &[],
+        long_prefixes: false,
+        always_recursive: true,
+        check_grep_recursion: false,
+        exec_s: "",
+        exec_l: &[],
+        root_val_l: &[],
+        base_val_l: &[],
+        skip_parens: false,
+    };
+    const GREP_OPTS: SearchOpts = SearchOpts {
+        val_s: "efmABCdD",
+        val_l: &[
+            "regexp",
+            "file",
+            "max-count",
+            "after-context",
+            "before-context",
+            "context",
+            "directories",
+            "devices",
+            "include",
+            "exclude",
+            "exclude-from",
+            "exclude-dir",
+            "label",
+            "binary-files",
+            "group-separator",
+        ],
+        pat_s: "ef",
+        pat_l: &["regexp", "file"],
+        opt_num_s: "",
+        opt_num_l: &[],
+        eq_only_l: &["color", "colour"],
+        bool_l: &[
+            "ignore-case",
+            "no-ignore-case",
+            "invert-match",
+            "line-number",
+            "count",
+            "files-with-matches",
+            "files-without-match",
+            "only-matching",
+            "quiet",
+            "silent",
+            "no-messages",
+            "word-regexp",
+            "line-regexp",
+            "no-filename",
+            "with-filename",
+            "extended-regexp",
+            "fixed-strings",
+            "basic-regexp",
+            "perl-regexp",
+            "text",
+            "null-data",
+            "null",
+            "byte-offset",
+            "initial-tab",
+            "recursive",
+            "dereference-recursive",
+            "no-group-separator",
+            "help",
+            "version",
+            "unix-byte-offsets",
+            "line-buffered",
+            "mmap",
+        ],
+        long_prefixes: true,
+        always_recursive: false,
+        check_grep_recursion: true,
+        exec_s: "",
+        exec_l: &[],
+        root_val_l: &[],
+        base_val_l: &[],
+        skip_parens: false,
+    };
+    const RGREP_OPTS: SearchOpts = SearchOpts {
+        always_recursive: true,
+        ..GREP_OPTS
+    };
+    const FD_OPTS: SearchOpts = SearchOpts {
+        val_s: "dteEcCjSo",
+        val_l: &[
+            "max-depth",
+            "maxdepth",
+            "min-depth",
+            "exact-depth",
+            "type",
+            "extension",
+            "exclude",
+            "ignore-file",
+            "color",
+            "threads",
+            "max-results",
+            "size",
+            "changed-within",
+            "changed-before",
+            "owner",
+            "path-separator",
+            "max-buffer-time",
+            "format",
+        ],
+        pat_s: "",
+        pat_l: &[],
+        opt_num_s: "",
+        opt_num_l: &[],
+        eq_only_l: &[],
+        bool_l: &[],
+        long_prefixes: false,
+        always_recursive: true,
+        check_grep_recursion: false,
+        exec_s: "xX",
+        exec_l: &["exec", "exec-batch"],
+        root_val_l: &["search-path"],
+        base_val_l: &["base-directory"],
+        skip_parens: false,
+    };
+    const AG_OPTS: SearchOpts = SearchOpts {
+        val_s: "GgmpW",
+        val_l: &[
+            "ackmate-dir-filter",
+            "depth",
+            "file-search-regex",
+            "filename-pattern",
+            "ignore",
+            "ignore-dir",
+            "max-count",
+            "pager",
+            "path-to-ignore",
+            "width",
+            "workers",
+            "color-line-number",
+            "color-match",
+            "color-path",
+        ],
+        pat_s: "g",
+        pat_l: &["filename-pattern"],
+        opt_num_s: "ABC",
+        opt_num_l: &["after", "before", "context"],
+        eq_only_l: &[],
+        bool_l: &[
+            "ackmate",
+            "affinity",
+            "noaffinity",
+            "all-types",
+            "all-text",
+            "unrestricted",
+            "hidden",
+            "ignore-case",
+            "smart-case",
+            "case-sensitive",
+            "fixed-strings",
+            "literal",
+            "files-with-matches",
+            "files-without-match",
+            "count",
+            "column",
+            "nocolor",
+            "color",
+            "color-win-ansi",
+            "debug",
+            "noheading",
+            "heading",
+            "nobreak",
+            "break",
+            "follow",
+            "nofollow",
+            "skip-vcs-ignores",
+            "search-binary",
+            "search-zip",
+            "silent",
+            "stats",
+            "stats-only",
+            "vimgrep",
+            "word-regexp",
+            "only-matching",
+            "null",
+            "print0",
+            "one-device",
+            "filename",
+            "nofilename",
+            "numbers",
+            "nonumbers",
+            "line-numbers",
+            "group",
+            "nogroup",
+            "invert-match",
+            "match",
+            "mmap",
+            "nommap",
+            "multiline",
+            "nomultiline",
+            "nopager",
+            "parallel",
+            "passthrough",
+            "passthru",
+            "print-all-files",
+            "print-long-lines",
+            "recurse",
+            "norecurse",
+        ],
+        long_prefixes: true,
+        always_recursive: true,
+        check_grep_recursion: false,
+        exec_s: "",
+        exec_l: &[],
+        root_val_l: &[],
+        base_val_l: &[],
+        skip_parens: false,
+    };
+    const ACK_OPTS: SearchOpts = SearchOpts {
+        val_s: "ABmgt",
+        val_l: &[
+            "after-context",
+            "before-context",
+            "type",
+            "ignore-dir",
+            "noignore-dir",
+            "match",
+            "output",
+            "max-count",
+            "pager",
+            "color-filename",
+            "color-lineno",
+            "color-match",
+            "files-from",
+        ],
+        pat_s: "gf",
+        pat_l: &["match"],
+        opt_num_s: "C",
+        opt_num_l: &["context"],
+        eq_only_l: &[],
+        bool_l: &[
+            "ignore-case",
+            "smart-case",
+            "invert-match",
+            "word-regexp",
+            "literal",
+            "files-with-matches",
+            "files-without-match",
+            "count",
+            "no-filename",
+            "with-filename",
+            "column",
+            "nocolor",
+            "color",
+            "noheading",
+            "heading",
+            "nobreak",
+            "break",
+            "follow",
+            "nofollow",
+            "recurse",
+            "no-recurse",
+            "sort-files",
+            "nopager",
+        ],
+        long_prefixes: true,
+        always_recursive: true,
+        check_grep_recursion: false,
+        exec_s: "",
+        exec_l: &[],
+        root_val_l: &[],
+        base_val_l: &[],
+        skip_parens: false,
+    };
+    let args = &eff[1..];
+    match b_fold.as_str() {
+        "rg" => parse_search_opts(args, &RG_OPTS),
+        "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" => parse_search_opts(args, &GREP_OPTS),
+        "rgrep" => parse_search_opts(args, &RGREP_OPTS),
+        "find" => Some(SearchRootSpec {
+            roots: shell::find_roots(eff).0,
+            base_dirs: vec![],
+            searches_cwd_when_empty: false,
+        }),
+        "fd" | "fdfind" => parse_search_opts(args, &FD_OPTS),
+        "ag" => parse_search_opts(args, &AG_OPTS),
+        "ack" => parse_search_opts(args, &ACK_OPTS),
+        "git" => git_grep_roots(eff),
+        _ => None,
     }
 }
 
