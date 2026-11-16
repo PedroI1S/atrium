@@ -261,3 +261,16 @@ Review: `docs/agents/reviews/M1-23-ui-gaps-round2.md`. Commits:
 ### Left open
 - The Linux build of `save.rs` (CI or a Linux machine).
 - The escalations above.
+
+## Round 3 follow-up (review 3, finding 1)
+Argon approved with changes (`.orchestration/review-input/M1-23-review3.md`). It confirmed the globset class parsing, and I kept it as is. Changes in `rule-form.ts` `commandRisk`, covering both prefix and exact allow rules:
+- **`bun exec`:** `exec` moved from bun's verbs to its inline-code subcommands, because it runs a shell string. `bun exec …` and `bun --silent exec …` are now refused.
+- **Package runners** (`npx`, `pnpx`, `bunx`, `uvx`, `pipx`): a `c` anywhere in a single-dash option word is refused, as for interpreters. This catches `-yc 'sh'` and `-c'sh'`. Exact rules must also name a package, so `npx`, `npx -y` and `uvx` alone are refused.
+- **Standard input:** `-`, `/dev/stdin`, `/dev/fd/0` and `/proc/self/fd/0` are refused as the script, in any case.
+- **Interpreters with no script operand** (or only a verb, as in `deno run`) are refused for exact rules too. Without a script the interpreter reads code from its input, so an exact rule on `python3` would cover `echo … | python3` in Home. Exact rules that name a script or module still pass: `python3 -m pytest`, `python3 -u build.py`, `npx -y prettier`.
+
+Checks:
+- `pnpm typecheck` and `pnpm build` pass.
+- `pnpm test`: 354 tests pass (4 new tests covering these cases).
+- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` pass.
+- `m1_demo.py` under the GUI lock: 27/27, one run. The demo itself is unchanged.

@@ -276,3 +276,36 @@ describe("rules editor: round 3 minors", () => {
     for (const good of ["/a/[\\]", "/a/[\\]]", "/a/[a-c-e]", "/a/[a-c-b]", "/a/[a\\-z]"]) expect(globSyntaxError(good), good).toBeNull();
   });
 });
+
+describe("rules editor: round 3 follow-up (review 3, finding 1)", () => {
+  const refused = (command: string, matcher: "command_prefix" | "command_exact" = "command_prefix") => {
+    const v = validateRule(form({ matcher, command }), ctx);
+    return !v.ok && v.errors.command !== undefined;
+  };
+  it("refuses bun exec, which runs a shell string", () => {
+    for (const c of ["bun exec 'rm -rf build'", "bun exec echo", "bun --silent exec sh", "BUN EXEC x"]) {
+      expect(refused(c), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+  });
+  it("refuses -c in a package runner's option cluster or with its value attached", () => {
+    for (const c of ["npx -yc sh", "npx -c'sh'", "npx prettier -yc sh", "npx prettier -c'sh'", "pnpx -Yc x", "bunx -c x", "uvx --CALL=x pkg"]) {
+      expect(refused(c, "command_exact"), c).toBe(true);
+      expect(refused(c), c).toBe(true);
+    }
+  });
+  it("refuses a script read from standard input, by any name", () => {
+    for (const c of ["python3 /dev/stdin", "node /dev/fd/0", "perl /DEV/STDIN", "ruby -", "python3 -u /proc/self/fd/0"]) {
+      expect(refused(c), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+  });
+  it("refuses exact rules with no script or package: the interpreter would read code from its input", () => {
+    for (const c of ["python3", "python3 -u", "node", "perl", "ruby", "php", "lua", "osascript", "deno", "deno run", "bun", "bun run", "npx", "npx -y", "uvx"]) {
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+    for (const c of ["python3 -m pytest", "python3 -u build.py", "npx -y prettier", "node build.js", "deno run x.ts", "bun run build"]) {
+      expect(refused(c, "command_exact"), c).toBe(false);
+    }
+  });
+});

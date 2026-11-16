@@ -100,7 +100,7 @@ const INTERPRETERS = new Map<string, Interpreter>([
   ["python", { short: "c", long: [], sub: [], verbs: [] }],
   ["node", { short: "ep", long: ["--eval", "--print"], sub: [], verbs: [] }],
   ["deno", { short: "", long: ["--eval", "--eval-file"], sub: ["eval", "repl"], verbs: ["run", "test", "task", "bench", "serve", "x", "install", "compile", "jupyter"] }],
-  ["bun", { short: "ep", long: ["--eval", "--print"], sub: ["eval", "repl"], verbs: ["run", "test", "x", "exec", "create", "build"] }],
+  ["bun", { short: "ep", long: ["--eval", "--print"], sub: ["eval", "repl", "exec"], verbs: ["run", "test", "x", "create", "build"] }],
   ["ruby", { short: "e", long: [], sub: [], verbs: [] }],
   ["perl", { short: "e", long: [], sub: [], verbs: [] }],
   ["php", { short: "rbef", long: ["--run", "--process-code", "--process-begin", "--process-end", "--process-file"], sub: [], verbs: [] }],
@@ -114,6 +114,8 @@ const PWSH_SHORT = new Set(["c", "e", "ec", "cwa"]);
 const PACKAGE_RUNNERS = new Set(["npx", "pnpx", "bunx", "uvx", "pipx"]);
 /** `npx -c` / `--call` runs a shell command. */
 const RUNNER_CODE = new Set(["-c", "--call"]);
+/** Script names that mean standard input (`shell.rs` `reads_stdin_as_script`, `deny.rs`). Lower-cased. */
+const STDIN = new Set(["-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"]);
 /** `find` options that run a command for each file (`shell.rs` `find_exec_units`). */
 const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 
@@ -183,9 +185,14 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
         if (short !== "" && [...lw.slice(1)].some((c) => short.includes(c))) return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line (${w} holds a code flag), and Atrium wouldn't check it.` };
       } else operands.push(lw);
     }
-    if (operands.includes("-")) return { refuse: `A rule can't allow ${name} -: it runs code read from its input, and Atrium wouldn't check it.` };
+    const stdin = operands.find((o) => STDIN.has(o));
+    if (stdin !== undefined) return { refuse: `A rule can't allow ${name} ${stdin}: it runs code read from its input, and Atrium wouldn't check it.` };
     const subcommand = operands[0];
     if (subcommand !== undefined && sub.includes(subcommand)) return { refuse: `A rule can't allow ${name} ${subcommand}: it runs code written on the command line, and Atrium wouldn't check it.` };
+    // With no script (or only a verb such as `deno run`), the interpreter reads code from its
+    // input, so even an exact rule would allow `echo … | python3` (round 3 follow-up).
+    const verb = subcommand !== undefined && verbs.includes(subcommand) ? 1 : 0;
+    if (operands.length <= verb) return { refuse: `A rule can't allow ${argv.slice(0, 1).join(" ")} without the script it runs: without one, ${name} reads code from its input. ${NAME_A_SCRIPT}` };
     if (prefix) {
       // The script must come right after the command (after a verb such as `deno run`, right
       // after the verb): an interpreter reads its own options only before the script, so words
@@ -197,10 +204,15 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
     return { warn: `This allows the ${name} script it names${prefix ? ", with whatever arguments follow," : ""} whatever the script does.` };
   }
   if (PACKAGE_RUNNERS.has(name)) {
-    const code = args.find((w) => RUNNER_CODE.has(w.toLowerCase()) || w.toLowerCase().startsWith("--call="));
+    // `-c` also in a cluster or with its value attached (`-yc 'sh'`, `-c'sh'`), as for interpreters.
+    const code = args.find((w) => {
+      const lw = w.toLowerCase();
+      return RUNNER_CODE.has(lw) || lw.startsWith("--call=") || (isOption(w) && !lw.startsWith("--") && lw.slice(1).includes("c"));
+    });
     if (code) return { refuse: `A rule can't allow ${name} ${code}: it runs a shell command, and Atrium wouldn't check it.` };
     // The package right after the runner, as for interpreters: an option before it could be `-c` added later.
     if (prefix && (args[0] === undefined || args[0].startsWith("-"))) return { refuse: `A prefix rule on ${name} must name the package right after it, like ${name} prettier, with no options before it.` };
+    if (!args.some((w) => !w.startsWith("-"))) return { refuse: `A rule on ${name} must name the package it runs, like ${name} prettier.` };
     return { warn: `This allows the package ${name} runs, whatever it does.` };
   }
   if (name === "find") {
