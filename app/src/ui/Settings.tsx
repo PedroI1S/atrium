@@ -4,16 +4,21 @@
 // and Notifications through `SECTIONS`.
 
 import { ChevronLeft, ChevronRight, Search, X } from "lucide-solid";
-import { For, Match, Show, Switch, createResource, createSignal } from "solid-js";
+import { For, Match, Show, Switch, createResource, createSignal, lazy } from "solid-js";
 import { probes, providerName, refetchProbes } from "../chat/actions";
 import { ruleText } from "../chat/rules";
 import { command, daemon } from "../daemon/client";
 import { type Rule, isCommandFailure } from "../daemon/types";
 import { type SettingRow, type SettingsSectionSpec, registerSection, searchSettings } from "../settings-registry";
-import { advancedOpen, highlightRow, setAdvancedOpen, setHighlightRow, setScreen, setSettingsQuery, setSettingsSection, settingsQuery, settingsSection, showToast, type SettingsSection } from "../state";
+import { DetailsLink } from "./Enforcement";
+import { advancedOpen, highlightRow, ruleFormOpen, setRuleFormOpen, setAdvancedOpen, setHighlightRow, setScreen, setSettingsQuery, setSettingsSection, settingsQuery, settingsSection, showToast, type SettingsSection } from "../state";
 import { MAX_BLUR_STRENGTH, MIN_ALPHA, type AppearanceSettings } from "../window-model";
 import { accessibilityOpaque, effectiveSettings, nativeError, nativeSupported, patchSettings, platform } from "../windows";
 import { Dot, IconButton, Range, Seg, Select, Spacer, Toggle } from "./controls";
+
+// Loaded when first shown, not at startup.
+const RuleEditor = lazy(() => import("./RuleEditor"));
+const SecurityPage = lazy(() => import("./Security"));
 
 type Opt = { value: string; label: string };
 export type Control =
@@ -22,7 +27,9 @@ export type Control =
   | { kind: "range"; value: () => number; min: number; max: number; format: (v: number) => string; set: (v: number) => void; disabled?: () => boolean; wide?: boolean }
   | { kind: "select"; value: () => string; options: Opt[]; set: (v: string) => void }
   /** A button, for rows whose content is a list below them (Agents, Approvals). */
-  | { kind: "action"; text: string; run: () => void; disabled?: () => boolean };
+  | { kind: "action"; text: string; run: () => void; disabled?: () => boolean }
+  /** No control: the row heads what follows it (Security). */
+  | { kind: "none" };
 type Row = SettingRow<Control>;
 
 const s = effectiveSettings;
@@ -129,8 +136,18 @@ export const SECTIONS: SettingsSectionSpec<Control>[] = [
   registerSection<Control>({
     id: "approvals", label: "Approvals",
     essentials: [
-      { id: "rules", label: "Remembered approvals", hint: "Made by “Always…” on an approval. Each one matches an exact command or path, in any folder.",
+      { id: "rules", label: "Remembered approvals", hint: "Made by “Always…” on an approval, or added here. Some actions are always blocked, whatever the rules: see Security.",
         control: { kind: "action", text: "Refresh", run: () => void refetchRules(), disabled: () => !connected() || rules.loading } },
+      { id: "add-rule", label: "Add a rule", hint: "Allow or deny a command, the commands that start with one, or a path, without waiting to be asked",
+        control: { kind: "action", text: "Add a rule…", run: () => setRuleFormOpen(true), disabled: () => !connected() || ruleFormOpen() } },
+    ],
+    advanced: [],
+  }),
+  registerSection<Control>({
+    id: "security", label: "Security",
+    essentials: [
+      { id: "always-blocked", label: "Always blocked (for calls Atrium sees)", hint: "No rule or approval allows these. It isn't a machine-wide ban: code you allowed to run can still do anything you can.", control: { kind: "none" } },
+      { id: "known-limits", label: "Known limits", hint: "What Atrium's checks don't cover: git config, other programs running as you, code that was allowed to run", control: { kind: "none" } },
     ],
     advanced: [],
   }),
@@ -160,6 +177,7 @@ function AgentsList() {
                     <span>Installed{e().cli_version ? ` · version ${e().cli_version}${e().version_tested ? "" : " (not tested with Atrium)"}` : ""}</span>
                     <span>{e().level === "full" ? "Enforcement: full. Every tool call passes Atrium's rules before it runs." : "Enforcement: partial. Atrium sees only some of what this agent does:"}</span>
                     <For each={e().reasons}>{(r) => <span>• {r.message}</span>}</For>
+                    <span><DetailsLink descriptor={e()} subject={providerName(p.provider)} /></span>
                   </>
                 )}
               </Show>
@@ -207,7 +225,7 @@ function ControlView(props: { row: Row }) {
       <Match when={c.kind === "toggle" && c}>{(x) => <Toggle label={props.row.label} on={x().value()} onChange={x().set} disabled={x().disabled?.()} />}</Match>
       <Match when={c.kind === "range" && c}>{(x) => <Range label={props.row.label} value={x().value()} min={x().min} max={x().max} format={x().format} onInput={x().set} disabled={x().disabled?.()} wide={x().wide} />}</Match>
       <Match when={c.kind === "select" && c}>{(x) => <Select label={props.row.label} value={x().value()} options={x().options} onChange={x().set} />}</Match>
-      <Match when={c.kind === "action" && c}>{(x) => <button type="button" class="btn sm" disabled={x().disabled?.()} onClick={x().run}>{x().text}</button>}</Match>
+      <Match when={c.kind === "action" && c}>{(x) => <button type="button" class="btn sm" data-atrium-part={`setting-action-${props.row.id}`} disabled={x().disabled?.()} onClick={x().run}>{x().text}</button>}</Match>
     </Switch>
   );
 }
@@ -272,9 +290,14 @@ export function SettingsCard() {
               </For>
             </div>
           }>
-            <For each={section().essentials}>{(row) => <RowView row={row} />}</For>
+            <Show when={section().id === "security"} fallback={<For each={section().essentials}>{(row) => <RowView row={row} />}</For>}>
+              <SecurityPage rows={section().essentials} row={(row) => <RowView row={row as Row} />} />
+            </Show>
             <Show when={section().id === "agents"}><AgentsList /></Show>
-            <Show when={section().id === "approvals"}><RulesList /></Show>
+            <Show when={section().id === "approvals"}>
+              <RulesList />
+              <Show when={ruleFormOpen()}><RuleEditor onDone={() => { setRuleFormOpen(false); void refetchRules(); }} /></Show>
+            </Show>
             <Show when={section().id === "notifications"}>
               <p class="note">Atrium's background service posts these.</p>
             </Show>

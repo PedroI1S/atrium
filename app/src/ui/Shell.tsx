@@ -2,17 +2,19 @@
 // the right column as floating cards. Pop-out windows get minimal chrome (§3 Popped-out windows).
 
 import { Pin, Undo2 } from "lucide-solid";
-import { Match, Show, Switch } from "solid-js";
+import { Match, Show, Switch, createEffect } from "solid-js";
+import { mainChatLeft } from "../chat/thread-actions";
 import { daemon } from "../daemon/client";
 import { clampWidth, rightColumn } from "../layout";
 import { advancedOpen, keepOnTop, panelOpen, panelWidth, screen, setKeepOnTopSignal, setPanelWidth, setSidebarWidth, sidebarOpen, sidebarWidth } from "../state";
-import { bringBack, ownsView, platform, popoutThread, setKeepOnTop } from "../windows";
+import { bringBack, model, ownsView, platform, popoutThread, setKeepOnTop, setMainThread } from "../windows";
 import { ConnectionBanner } from "./ConnectionBanner";
 import { ContextPanel, PanelStrip } from "./ContextPanel";
 import { IconButton, Spacer } from "./controls";
 import { InboxCard } from "./InboxCard";
 import { AdvancedCard, SettingsCard } from "./Settings";
 import { Sidebar, SidebarStrip } from "./Sidebar";
+import { ThreadMenu } from "./ThreadActions";
 import { ThreadBody, ThreadCard, ThreadTitle } from "./ThreadCard";
 import { WindowControls } from "./WindowControls";
 
@@ -52,6 +54,17 @@ export function MainWindow() {
   let side: HTMLDivElement | undefined;
   let panel: HTMLDivElement | undefined;
   const right = () => rightColumn(screen(), panelOpen(), advancedOpen());
+  // The chat the main card shows, while it is listed: when it leaves the list (archived in a
+  // pop-out, or by another client), the card goes back to a new chat.
+  let wasListed: string | null = null;
+  createEffect(() => {
+    const id = model().mainThread;
+    const d = daemon();
+    const listed = id !== null && id in d.threads;
+    // The screen stays as it is (Settings stays Settings).
+    if (mainChatLeft(id, wasListed, listed, d.loaded)) setMainThread(null);
+    wasListed = listed ? id : null;
+  });
   const widths = () => ({
     ...(sidebarWidth() === null ? {} : { "--sidebar-w": `${sidebarWidth()}px` }),
     ...(panelWidth() === null ? {} : { "--panel-w": `${panelWidth()}px` }),
@@ -99,6 +112,7 @@ export function PopoutWindow() {
           {(t) => <ThreadTitle thread={t()} />}
         </Show>
         <Spacer />
+        <Show when={thread()}>{(t) => <ThreadMenu small thread={t()} />}</Show>
         <IconButton small label="Keep on top" on={keepOnTop()} onClick={() => { const next = !keepOnTop(); setKeepOnTopSignal(next); void setKeepOnTop(next); }}><Pin class="i sm" aria-hidden="true" /></IconButton>
         <IconButton small label="Move back into the main window" onClick={() => void bringBack(threadId())}><Undo2 class="i sm" aria-hidden="true" /></IconButton>
         <WindowControls />

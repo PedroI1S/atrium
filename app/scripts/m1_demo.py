@@ -10,13 +10,22 @@ app with ATRIUM_BENCH=m1-demo (app/src/m1-demo.ts) and walks through M1's promis
   2. Fake approval (`approval_at_ms`): Allow, Deny, "Always" rule + next turn skips asking;
   3. Fake question (`question_at_ms`): Answer, Decline, streaming continues both times;
   4. Inbox lists threads with their states, and marking a thread read works;
-  5. Cmd+J jumps through inbox items in rank order;
+  5. Cmd+J jumps through inbox items in rank order, and Cmd+Shift+J back;
   6. Notifications: Settings toggle persists in the live daemon (toggle only), and the daemon's
      recording notifier suite (`requests_notifications`) proves per-kind posting and suppression;
-  7. Stop a turn / Shutdown to Ended / verify fake resume refusal (plus daemon-only scripted-adapter N1 test);
+  7. Stop a turn / End session from the thread menu to Ended / verify fake resume refusal (plus
+     daemon-only scripted-adapter N1 test);
   8. Kill the daemon mid-turn: the app reconnects and the thread shows `Interrupted`;
-  9. Export the thread to Markdown and JSONL: both private (0600) files exist with transcript;
- 10. Archive removes the thread from lists and inbox.
+  9. Rename the thread, then export it to Markdown and JSONL from the thread menu (the save
+     dialog is bypassed in bench mode): both private (0600) files exist with the transcript, and
+     exporting to the same name again is refused with a clear message (never replaced);
+ 10. Archive from the thread menu (confirmed) removes the thread from lists and inbox;
+ 11. Batch: select all approvals in the inbox, X on a focused checkbox unselects the third,
+     Allow once two together, Deny the third; the result clears on leaving the inbox;
+ 12. Settings: the rules editor refuses a compound command and an allow rule on `bash -c`,
+     offers no path limit on a command rule, then adds a command-prefix rule;
+     Security lists what is always blocked and the known limits;
+ 13. The enforcement badge opens the details (coverage, policy, isolation).
 
 Exit status 0 only if every check passed. Run on the machine's desktop session: it opens
 windows. `--keep` leaves ATRIUM_HOME, logs, and exported files in place.
@@ -83,7 +92,7 @@ def verify_exports(export_paths: dict) -> list[tuple[str, bool, str]]:
     md_mode = stat.S_IMODE(md_path.stat().st_mode) if md_ok else None
     md_body = md_path.read_text(encoding="utf-8", errors="replace") if md_ok else ""
     out.append((
-        "9b. Markdown export file exists (0600) and contains transcript",
+        "9c. Markdown export file exists (0600) and contains transcript",
         md_ok and md_mode == 0o600 and expected_text in md_body and "synthetic tokens" in md_body,
         f"exists={md_ok} mode={oct(md_mode) if md_mode is not None else None} bytes={len(md_body.encode('utf-8'))}",
     ))
@@ -101,7 +110,7 @@ def verify_exports(export_paths: dict) -> list[tuple[str, bool, str]]:
         except json.JSONDecodeError:
             jsonl_valid = False
     out.append((
-        "9c. JSONL export file exists (0600), parses as JSONL, and contains transcript",
+        "9d. JSONL export file exists (0600), parses as JSONL, and contains transcript",
         jsonl_ok and jsonl_mode == 0o600 and jsonl_valid and expected_text in jsonl_body and "synthetic tokens" in jsonl_body,
         f"exists={jsonl_ok} mode={oct(jsonl_mode) if jsonl_mode is not None else None} lines={len(jsonl_lines)} valid_json={jsonl_valid}",
     ))
@@ -228,7 +237,7 @@ def main() -> int:
         cleanup()
         signal.signal(signal.SIGTERM, prev_sigterm)
 
-    # Step 6b & Step 7c: daemon-level checks using the recording notifier and N1 tight loop.
+    # Step 6b & Step 7d: daemon-level checks using the recording notifier and N1 tight loop.
     notif_ok, notif_detail = run_cargo_test(
         ["-p", "atrium-daemon", "--test", "requests_notifications"],
         min_passed=2,
@@ -246,7 +255,7 @@ def main() -> int:
         min_passed=1,
     )
     results.append((
-        "7c (daemon test, scripted adapter). N1 resume after Ended/Interrupted/Failed/Shutdown",
+        "7d (daemon test, scripted adapter). N1 resume after Ended/Interrupted/Failed/Shutdown",
         n1_ok,
         n1_detail,
     ))

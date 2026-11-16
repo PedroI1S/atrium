@@ -90,6 +90,7 @@ async function boot() {
     else if (info.benchMode === "roundtrip") await runRoundtrip();
     else if (info.benchMode === "shots") await runShots();
     else if (info.benchMode === "shots-chat") await runChatShots();
+    else if (info.benchMode === "shots-gaps") await (await import("./gap-shots")).runGapShots();
     else if (info.benchMode === "shots-incompatible") await runShotsIncompatible();
     else await runRoundtripVerify();
   } else if (info.benchMode && !isPopout()) {

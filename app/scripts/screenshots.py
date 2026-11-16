@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Screenshots of the app shell for reviews (Linux).
 
-    python3 app/scripts/screenshots.py <out-dir> [real] [chat] [refused]
+    python3 app/scripts/screenshots.py <out-dir> [real] [chat] [refused] [gaps]
 
-Starts the app three times, each in a throwaway ATRIUM_HOME (name the runs to do only some):
+Starts the app four times, each in a throwaway ATRIUM_HOME (name the runs to do only some):
   - real: against a real daemon it starts itself, with synthetic threads: the main window in
     light and dark (a chat streaming from the fake agent), the sidebar hidden, the panel
     minimized, the inbox, Settings with its Advanced card, and a thread in its own window;
@@ -13,7 +13,11 @@ Starts the app three times, each in a throwaway ATRIUM_HOME (name the runs to do
     an approval card and its "Always…" choices, a question form, the inbox with items,
     Settings → Agents, Approvals and Notifications, and a refused approval; light and dark;
   - refused: against a stand-in daemon that refuses the app as an older version would: the
-    banner.
+    banner;
+  - gaps (M1-23): against a real daemon, with the chat scenes seeded as above (app/src/gap-shots.ts):
+    the thread menu, renaming, the archive confirmation, the enforcement details, batch
+    approvals selected and their (real) refusals, the rules editor (valid, refused, and an allow rule on a shell refused), Settings →
+    Security and the palette's "This chat" commands; light and dark.
 
 The pictures are the webviews' own snapshots (the desktop session lets no script capture
 windows). Run `python3 app/scripts/live_check.py` first, or build the same way: this script
@@ -37,7 +41,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 APP = ROOT / "target" / "debug" / "atrium"
 TIMEOUT_S = 120
 # Run name -> (ATRIUM_BENCH mode, pictures it takes).
-RUNS = {"real": ("shots", 9), "chat": ("shots-chat", 18), "refused": ("shots-incompatible", 1)}
+RUNS = {"real": ("shots", 9), "chat": ("shots-chat", 18), "refused": ("shots-incompatible", 1), "gaps": ("shots-gaps", 22)}
 
 
 def run_app(home: pathlib.Path, mode: str, shots: pathlib.Path, log: pathlib.Path) -> None:

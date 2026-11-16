@@ -18,11 +18,11 @@ import { setInboxPick, setPanel, setScreen, setSettingsSection } from "./state";
 import { openThread } from "./ui/Sidebar";
 import { patchSettings, patchView } from "./windows";
 
-const MINUTE_MS = 60_000;
+export const MINUTE_MS = 60_000;
 /** Seeded event ids start far above anything a fresh daemon assigns. */
 const FIRST_SEED_ID = 1_000_000;
 /** How long the client may take to say it doesn't know a seeded thread. */
-const UNKNOWN_THREAD_WAIT_MS = 700;
+export const UNKNOWN_THREAD_WAIT_MS = 700;
 const STREAM_TICK_MS = 40;
 const FENCE = "`".repeat(3);
 const lines = (...l: string[]) => l.join(String.fromCharCode(10));
@@ -31,7 +31,7 @@ const ENFORCEMENT: EnforcementDescriptor = { level: "full", reasons: [], provide
 
 let nextId = FIRST_SEED_ID;
 
-class Seed {
+export class Seed {
   readonly events: StoredEvent[] = [];
   private seq = 0;
   constructor(readonly id: string, readonly title: string, private at: number) {}
@@ -112,7 +112,7 @@ const ANSWER_3_WORDS = "I'm applying the first option now: the commit touches on
 const QUESTION = "The refresh-rate setting can apply to every display or only to 60 Hz ones. Which do you want?";
 const FAILURE = "The agent stopped: its sign-in expired. Sign in again with the agent's own command, then resume.";
 
-function seeds(now: number) {
+export function seeds(now: number) {
   const stream = new Seed("seed-stream", "Why does the nightly build fail?", now - 6 * MINUTE_MS).start()
     .user(1, "Why does the nightly build fail on the release branch?")
     .says("a1", ANSWER_1)
@@ -161,13 +161,13 @@ function seeds(now: number) {
   return { all: [stream, approval, question, failed, reply], stream, approval, question, summaries, inbox };
 }
 
-const click = (selector: string): boolean => {
+export const click = (selector: string): boolean => {
   const el = document.querySelector<HTMLElement>(selector);
   el?.click();
   return el !== null;
 };
 
-async function both(name: string): Promise<void> {
+export async function both(name: string): Promise<void> {
   await patchSettings({ theme: "light" });
   await shot(`${name}-light`);
   await patchSettings({ theme: "dark" });

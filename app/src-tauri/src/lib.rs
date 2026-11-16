@@ -18,6 +18,7 @@ pub mod links;
 mod macos;
 pub mod native;
 pub mod presence;
+pub mod save;
 pub mod shell;
 pub mod snapshot;
 pub mod upgrade;
@@ -653,6 +654,24 @@ fn reveal_path(path: String) -> Result<(), String> {
     links::reveal(&resolved).map_err(|error| error.to_string())
 }
 
+/// "Export…" (contract §13): where to save, from the platform's own dialog.
+/// `null` when the user cancels, and whether something is already at the
+/// path. The daemon writes the file (`ExportThread`).
+#[tauri::command]
+async fn ask_save_path(
+    app: AppHandle,
+    title: String,
+    name: String,
+) -> Result<Option<save::SavePick>, String> {
+    save::ask_save_path(&app, title, name).await
+}
+
+/// The read-only lists Settings → Security shows (the hard-deny list).
+#[tauri::command]
+fn safety_info() -> save::SafetyInfo {
+    save::safety_info()
+}
+
 // -- harness --------------------------------------------------------------------------------
 
 /// Each window reports, after mounting and applying its appearance, what it
@@ -967,6 +986,8 @@ pub fn run() -> ExitCode {
             replace_daemon,
             open_link,
             reveal_path,
+            ask_save_path,
+            safety_info,
             window_ready,
             ready_states,
             write_report,

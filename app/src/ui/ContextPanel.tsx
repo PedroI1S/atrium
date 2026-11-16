@@ -12,6 +12,7 @@ import type { InboxItem, ThreadSummary, Usage } from "../daemon/types";
 import { inboxPick, screen, setPanel } from "../state";
 import { model, ownsView } from "../windows";
 import { IconButton, Spacer } from "./controls";
+import { DetailsLink } from "./Enforcement";
 import { openThread } from "./Sidebar";
 import { providerLabel } from "./ThreadCard";
 
@@ -100,6 +101,7 @@ function Details(props: { thread: ThreadSummary }) {
           <>
             <Fact label="Enforcement" value={e().level === "full" ? "Full: every tool call passes Atrium's rules" : "Partial: Atrium sees only some of what this agent does"} />
             <Reasons reasons={e().reasons} />
+            <p class="fact-note"><DetailsLink descriptor={e()} subject={props.thread.title || "Untitled chat"} /></p>
             <Fact label="CLI version" value={e().cli_version ? `${e().cli_version}${e().version_tested ? "" : " (not tested with Atrium)"}` : null} />
           </>
         )}
