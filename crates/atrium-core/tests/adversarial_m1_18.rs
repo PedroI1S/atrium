@@ -1229,3 +1229,187 @@ fn k4_find_exec_payloads() {
 fn k4_ordinary_lines_keep_devs_verdict() {
     run_rows(&rows_of("K4 ordinary"));
 }
+
+// ---------------------------------------------------------------------------
+// Fix round 1 (D-101): rows the Hydrogen worker's policy refused to write
+// (parent-dir and credential literals), added by the orchestrator. Each list
+// is the handoff's "Tests for the orchestrator to add". `dev`'s verdicts are
+// in the comments.
+// ---------------------------------------------------------------------------
+
+fn run_subject_list(rows: Vec<SubjectRow>) {
+    let mut failures = vec![];
+    for r in rows {
+        for ((name, rules, preset), want) in subject_settings(r.check.kind)
+            .into_iter()
+            .zip(r.want.iter())
+        {
+            let got = short(&eval_subject(&r, &rules, preset));
+            if !want_ok(&got, want) {
+                failures.push(format!(
+                    "[{}][{name}] {}: wanted {want}, got {got}",
+                    r.item, r.label
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// P1, review blocker 1: `**` before a parent-dir step can match no folder,
+/// so the glob leaves its roots before `normalize` sees the `..`.
+/// `dev`: Allow everywhere.
+#[test]
+fn fix1_p1_globstar_before_parent_dir() {
+    use ToolKind::Search;
+    let cr = ["CR", "CR", "CR"];
+    let d100 = ["Ask", "Allow", "Allow"];
+    let allow = ["Allow", "Allow", "Allow"];
+    let mut v = vec![];
+    for root in ["~/proj", "/h/u/proj"] {
+        for recursive in [true, false] {
+            for g in [
+                "**/../.ssh/id_rsa",
+                "**/../.aws/credentials",
+                "src/**/../../.ssh/id_rsa",
+                "**/**/../.ssh/id_rsa",
+                "**//../.ssh/id_rsa",
+                "./**/../.ssh/id_rsa",
+                "**/./../.ssh/id_rsa",
+                "{**,x}/../.ssh/id_rsa",
+                "/h/u/proj/**/../.ssh/id_rsa",
+                "~/proj/**/../.ssh/id_rsa",
+            ] {
+                v.push(subject("P1 fix1", Search, &[root], Some(g), recursive, cr));
+            }
+            for g in [
+                "**/../other/*.rs",
+                "src/**/../../other/*.rs",
+                "~/proj/**/..",
+                "**/..",
+            ] {
+                v.push(subject(
+                    "P1 fix1",
+                    Search,
+                    &[root],
+                    Some(g),
+                    recursive,
+                    d100,
+                ));
+            }
+            for g in ["src/**/../other/*.rs", "a/**/b/../c/*.rs"] {
+                v.push(subject(
+                    "P1 fix1",
+                    Search,
+                    &[root],
+                    Some(g),
+                    recursive,
+                    allow,
+                ));
+            }
+        }
+    }
+    run_subject_list(v);
+}
+
+/// D-100 keeps rule precedence: a path rule doesn't turn an escaping glob
+/// into Allow in Home, and a rule's Deny wins over Any and FullAccess.
+#[test]
+fn fix1_d100_rule_precedence() {
+    let check = paths_check(
+        ToolKind::Search,
+        "Glob",
+        &["~/proj"],
+        true,
+        Some("../other/*.rs"),
+    );
+    let eval = |rules: Vec<Rule>, preset: Preset| {
+        let mut env = Env::home();
+        env.cwd = format!("{HOME}/proj").into();
+        short(&env.eval_check(&check, &rules, preset))
+    };
+    let path_allow = rule(
+        RuleScope::Global,
+        ToolKind::Search,
+        RuleMatcher::PathGlob {
+            glob: format!("{HOME}/proj/**"),
+        },
+        RuleDecision::Allow,
+        "proj",
+    );
+    let any_deny = rule(
+        RuleScope::Global,
+        ToolKind::Search,
+        RuleMatcher::Any,
+        RuleDecision::Deny,
+        "no",
+    );
+    assert_eq!(eval(vec![path_allow], Preset::Home), "Ask");
+    let got = eval(
+        vec![any_rule(ToolKind::Search), any_deny.clone()],
+        Preset::Home,
+    );
+    assert!(want_ok(&got, "Deny"), "Any Allow + Any Deny in Home: {got}");
+    let got = eval(vec![any_deny], Preset::FullAccess);
+    assert!(want_ok(&got, "Deny"), "Any Deny under FullAccess: {got}");
+    // and without rules, D-100's own split
+    assert_eq!(eval(vec![], Preset::Home), "Ask");
+    assert_eq!(eval(vec![], Preset::FullAccess), "Allow");
+}
+
+/// K1, review blocker 2: `env` with an unknown option still has its `-C`,
+/// `-S`, `eval` and process-substitution payloads read.
+/// `dev`: Ask / Ask / Allow / Allow.
+#[test]
+fn fix1_k1_env_unknown_options_keep_payloads() {
+    let mut v = vec![];
+    for l in [
+        "env -Z X -C .. cat .ssh/id_rsa",
+        "env --zzz X -C .. cat .ssh/id_rsa",
+        "env --zzz X --chd .. cat .ssh/id_rsa",
+        "env --zzz X --chdir=.. cat .ssh/id_rsa",
+        "env -Z X --chdir=.. cat .ssh/id_rsa",
+        "env -Z X -S 'cat ../.ssh/id_rsa'",
+        "env --zzz X -S 'cat ../.ssh/id_rsa'",
+    ] {
+        v.push(row("K1 fix1", format!("cwd=proj|{l}"), H_CR));
+    }
+    v.push(row(
+        "K1 fix1",
+        "cwd=proj|env -Z X eval 'cd ~/.ssh && true' && cat id_rsa",
+        H_CR,
+    ));
+    for l in [
+        "env -Z X bash <(echo 'rm -rf ~')",
+        "env -Z X source <(echo 'rm -rf ~')",
+    ] {
+        v.push(row("K1 fix1", format!("cwd=proj|{l}"), H_RD));
+    }
+    run_rows(&v);
+}
+
+/// CR-12, review blocker 3: a home-anchored glob with `recursive: false`
+/// still names the store. `dev`: Allow everywhere.
+#[test]
+fn fix1_cr12_home_anchored_non_recursive_globs() {
+    use ToolKind::Search;
+    let asks = ["Ask", "Allow", "Allow"];
+    let v = ["~/.cargo/credentials.toml", "$HOME/.cargo/credentials.toml"]
+        .into_iter()
+        .map(|g| subject("CR-12 fix1", Search, &["~"], Some(g), false, asks))
+        .collect();
+    run_subject_list(v);
+}
+
+/// K1, still open after fix round 1 (found by the orchestrator while adding
+/// these rows): two unknown options in a row hide `-C`. Allow under Any and
+/// FullAccess, the same as `dev` (Ask / Ask / Allow / Allow).
+#[test]
+#[ignore = "M1-18 fix1: two unknown env options in a row"]
+fn fix1_k1_two_unknown_env_options_in_a_row() {
+    run_rows(&[row(
+        "K1 fix1",
+        "cwd=proj|env -Z X --yyy Y -C .. cat .ssh/id_rsa",
+        H_CR,
+    )]);
+}
