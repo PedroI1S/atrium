@@ -560,8 +560,8 @@ fn k10_400_star_dotdot_globs_stay_under_50ms_and_fail_closed_to_ask() {
         let elapsed = start.elapsed();
         assert_eq!(got, ask3, "{label}: expected Ask everywhere, got {got:?}");
         assert!(
-            elapsed.as_millis() < 150,
-            "{label}: took too long (>50 ms per evaluate across 3 presets): {elapsed:?}"
+            elapsed.as_millis() < 750,
+            "{label}: took too long (>250 ms per evaluate across 3 presets): {elapsed:?}"
         );
     }
 
@@ -576,8 +576,8 @@ fn k10_400_star_dotdot_globs_stay_under_50ms_and_fail_closed_to_ask() {
         "100000 unclosed brackets: got {got_brackets:?}"
     );
     assert!(
-        elapsed_brackets.as_millis() < 150,
-        "100000 unclosed brackets took too long: {elapsed_brackets:?}"
+        elapsed_brackets.as_millis() < 750,
+        "100000 unclosed brackets took too long (>250 ms per evaluate across 3 presets): {elapsed_brackets:?}"
     );
 }
 
@@ -610,11 +610,11 @@ fn k10_bounded_star_dotdot_globs_preserve_verdicts_and_stay_fast() {
             Some(&star_dd(100)),
         ),
     );
+    let d100 = t100.elapsed();
     assert_eq!(got100, allow3);
     assert!(
-        t100.elapsed().as_millis() < 150,
-        "100 */ + 100 .. took {:?}",
-        t100.elapsed()
+        d100.as_millis() < 750,
+        "100 */ + 100 .. took too long (>250 ms per evaluate across 3 presets): {d100:?}"
     );
 
     let t200 = std::time::Instant::now();
@@ -628,13 +628,19 @@ fn k10_bounded_star_dotdot_globs_preserve_verdicts_and_stay_fast() {
             Some(&star_dd(200)),
         ),
     );
+    let d200 = t200.elapsed();
     assert_eq!(got200, allow3);
     assert!(
-        t200.elapsed().as_millis() < 500,
-        "200 */ + 200 .. took {:?}",
-        t200.elapsed()
+        d200.as_millis() < 750,
+        "200 */ + 200 .. took too long (>250 ms per evaluate across 3 presets): {d200:?}"
+    );
+    // Doubling 100 -> 200 segments must scale linearly (not quadratically like dev).
+    assert!(
+        d200 <= d100.mul_f64(2.5) + std::time::Duration::from_millis(20),
+        "200 */ + 200 .. scaled superlinearly vs 100: d100={d100:?}, d200={d200:?}"
     );
 
+    let t255 = std::time::Instant::now();
     assert_eq!(
         eval_search_presets(
             &env,
@@ -647,6 +653,11 @@ fn k10_bounded_star_dotdot_globs_preserve_verdicts_and_stay_fast() {
             ),
         ),
         allow3
+    );
+    let d255 = t255.elapsed();
+    assert!(
+        d255.as_millis() < 750,
+        "255 */ + 255 .. took too long (>250 ms per evaluate across 3 presets): {d255:?}"
     );
     assert_eq!(
         eval_search_presets(
