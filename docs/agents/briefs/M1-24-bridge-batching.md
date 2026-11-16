@@ -1,6 +1,6 @@
 # M1-24-bridge-batching: deliver daemon events to the webview in batches
 
-Model: Gemini 4 Hydrogen (`gemini-4-hydrogen-high`, `scripts/agent-run agy`; D-111) · Reviewer: Sonnet 5.5 (read-only, cross-provider) · Depends on: nothing open
+Model: Gemini 4 Hydrogen (`gemini-4-hydrogen-high`, `scripts/agent-run agy`; D-111) · Reviewer: Gemini 4 Argon `high` (read-only; Pedro, D-112) · Depends on: nothing open
 Go: D-111 (Pedro: batching in `bridge.rs` now, in M1) · Branch: `agent/hydrogen/M1-24-bridge-batching` · Worktree: `../atrium-wt/M1-24-bridge-batching`
 
 ## Goal

@@ -727,3 +727,6 @@ Pedro decided the open gate items:
 - **S5, S7, S8, S11 and K5:** fixed after M1-18 merges (same files), with the four extra credential stores (CR-17).
 - **P2:** fixed now, with a `SessionGate` withdraw call (CR-18).
 `env -C` was already settled (it keeps dev's hard deny); it is removed from the open list.
+
+## D-112 — 2026-11-16 — Pedro: Argon reviews M1-24, M1-25 and M1-26
+Pedro asked for Gemini 4 Argon `high` to review the three D-111 tasks when they finish, instead of Sonnet. Argon and the Hydrogen authors are both Gemini models, so this is a same-provider review, by the driver's choice.
