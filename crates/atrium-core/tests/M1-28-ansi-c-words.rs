@@ -167,16 +167,19 @@ fn s7_ordinary_and_fail_closed_ansi_c_keep_safe_verdicts() {
 
 #[test]
 fn s7_ansi_c_quoting_is_not_treated_as_keyword_or_tilde() {
-    // `$'~'/.ssh/id_rsa` is literal `~`, not tilde-expanded to `$HOME/.ssh/id_rsa`
-    // (which would be HardDeny).
-    let env = Env::home();
-    assert_eq!(
-        verdict_code(&env.cmd(r"cat $'~'/.ssh/id_rsa")),
-        "Ask",
-        "quoted tilde must not expand to HOME"
-    );
-    // `$'if' true` is a quoted word, not the `if` reserved word, and stays Ask (no hard deny).
-    assert_eq!(verdict_code(&env.cmd(r"$'if' true")), "Ask");
+    // `cat $'~'/.ssh/id_rsa` still hits `deny::raw_hit` (and matches `SENSITIVE_HARD`
+    // `cat $'~/.ssh/id_rsa'` in `adversarial_policy.rs`), so it stays HardDeny as on `dev`.
+    hard_everywhere(&[r"cat $'~'/.ssh/id_rsa"]);
+
+    check_table(&[
+        // Ordinary paths starting with `$'~'` keep safe verdicts (no false hard deny).
+        (r"cat $'~'/notes.txt", ["Ask", "Ask", "Allow", "Allow"]),
+        (r"cat $'~'root/notes.txt", ["Ask", "Ask", "Allow", "Allow"]),
+        // `$'if' true` is a quoted word, not the `if` reserved word.
+        (r"$'if' true", ["Ask", "Ask", "Allow", "Allow"]),
+        // `$'FOO'=1` is not treated as an env assignment.
+        (r"$'FOO'=1 cat notes.txt", ["Ask", "Ask", "Allow", "Allow"]),
+    ]);
 }
 
 #[test]
@@ -185,6 +188,8 @@ fn finding_11_cd_glob_reaching_sensitive_dirs_is_caught() {
         "cd .s?h; cat id_rsa",
         "cd .a*s; cat credentials",
         "cd .local/sh*re/atrium; cat atrium.db",
+        r#"cd $HOME/.l""ocal/SH?RE//ATRIUM; less atrium.db"#,
+        r#"cd .l""ocal/SH?RE/ATRIUM; cat atrium.db"#,
         "cd .gnupg/priv*te-keys-v1.d; cat x.key",
         "cd .gnupg/sub*; cat x.key",
         "cd ~/x/../.s?h//; cat id_rsa",
