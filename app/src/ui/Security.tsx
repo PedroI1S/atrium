@@ -43,14 +43,63 @@ function AlwaysBlocked() {
   );
 }
 
-/*
- * CR-12 (rev 3.1, D-082), lands after M1-18 merges: the credential stores that always ask
- * (never auto-allowed in Home, but not blocked: an approval or a rule may allow them). The
- * Settings page "that lists what is protected names them" (contract §9). Its list mounts here,
- * between Always blocked and Known limits, read from the app like `hardDeny`.
+export interface AskStore {
+  id: string;
+  title: string;
+  paths: string;
+}
+
+/**
+ * Credential stores that always ask in Home (contract §9; CR-12, CR-17, D-082): never
+ * auto-allowed, but not hard-denied — an approval or a remembered rule may allow them.
  */
+export const ASK_STORES: readonly AskStore[] = [
+  {
+    id: "packages",
+    title: "Package & registry credentials",
+    paths: "~/.cargo/credentials.toml, ~/.cargo/credentials, ~/.pypirc, ~/.gem/credentials, ~/.yarnrc.yml",
+  },
+  {
+    id: "cloud-infra",
+    title: "Cloud, database & secret-manager configs",
+    paths: "~/.aws/sso/cache/, ~/.azure/accessTokens.json, ~/.azure/msal_token_cache.*, ~/.terraform.d/credentials.tfrc.json, ~/.config/op/config, ~/.vault-token, ~/.pgpass",
+  },
+  {
+    id: "git-env",
+    title: "Git credentials & environment files",
+    paths: "~/.config/git/credentials, ~/.env, and git show / git cat-file on committed credential files",
+  },
+  {
+    id: "shell-history",
+    title: "Shell history files",
+    paths: "~/.bash_history, ~/.zsh_history, ~/.zhistory, ~/.sh_history, ~/.ksh_history, ~/.history, ~/.local/share/fish/fish_history, ~/.config/fish/fish_history, ~/.zsh_sessions/, ~/.bash_sessions/",
+  },
+];
+
 function CredentialStoresThatAsk(): JSX.Element {
-  return null;
+  return (
+    <div class="s-sec" data-atrium-part="ask-stores-section">
+      <div class="row">
+        <div class="rl">
+          <b>Credential stores that ask</b>
+          <span>Home never reads or searches these without asking. Unlike Always blocked, you can approve once or add a rule.</span>
+        </div>
+      </div>
+      <div class="s-list" data-atrium-part="ask-stores">
+        <For each={ASK_STORES}>
+          {(s) => (
+            <div class="s-item" data-id={s.id}>
+              <Dot tone="needs-you" />
+              <div class="s-main">
+                <b>{s.title}</b>
+                <span>{s.paths}</span>
+              </div>
+            </div>
+          )}
+        </For>
+      </div>
+    </div>
+  );
 }
 
 const LIMITS: { id: string; title: string; text: string }[] = [

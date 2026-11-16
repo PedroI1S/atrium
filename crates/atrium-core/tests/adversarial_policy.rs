@@ -1136,7 +1136,6 @@ fn finding_6_other_credential_stores_ask_in_home() {
 }
 
 #[test]
-#[ignore = "M1-13 finding 6: not in the CR-12 list (contract §9 rev 3.1)"]
 fn finding_6_stores_outside_the_cr_12_list_ask_in_home() {
     asks_in_home_only(NOT_IN_THE_CR_12_LIST);
 }

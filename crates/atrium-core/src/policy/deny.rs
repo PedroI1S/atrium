@@ -451,6 +451,11 @@ const ASK_FILES: &[&str] = &[
     ".azure/accessTokens.json",
     ".config/git/credentials",
     ".env",
+    // CR-17
+    ".gem/credentials",
+    ".terraform.d/credentials.tfrc.json",
+    ".config/op/config",
+    ".yarnrc.yml",
     // shell history files
     ".bash_history",
     ".zsh_history",
