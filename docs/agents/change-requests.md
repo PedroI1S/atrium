@@ -206,3 +206,27 @@ Non-blocking; a gap in the wire.
 **What M1-09b does until this is decided:** the question card's second button is "Stop the turn" (it sends `SessionCommand::Interrupt`, and says so in its tooltip); the ledger then cancels the question with the turn.
 
 **Change proposed:** either `DaemonCommand::DeclineQuestion { thread_id, incarnation, request_id }`, checked by the ledger like `AnswerQuestion` and resolved as `RequestOutcome::Cancelled` (the adapter passes the provider's own "dismissed" answer on), or a documented convention that `AnswerQuestion` with empty `answers` means declined. The first is clearer in the ledger and in the events. Affects `atrium-protocol` (`wire.rs`, bindings), the ledger (`atrium-core`), the adapters (M1-07, M1-08) and contract §5.
+
+## CR-16 — M1 gate decisions — 2026-11-16
+
+**Decided (D-111, Pedro): approved.**
+
+**One damaged message makes a whole thread impossible to export.** Contract §6.1 makes a message that fails verification a hard error at reconstruction, and `ExportThread` fails with it (`handoffs/M1-11-export.md`). The store keeps such a message and only logs it.
+
+**Change:** `ExportThread` exports the thread anyway. The damaged message is written as a clearly marked placeholder (Markdown: a "damaged message" note; JSONL: an entry marked damaged with the reason and the event range, never the patched content), and the export's result reports how many messages were damaged so the app can warn. Reconstruction for display keeps §6.1's hard error. Affects contract §6.1 and §13, `atrium-core` history/export, `atrium-daemon` `ExportThread`'s value, and the app's export action (M1-23).
+
+## CR-17 — M1 gate decisions — 2026-11-16
+
+**Decided (D-111, Pedro): approved.**
+
+**Four credential stores aren't on CR-12's ask list:** `~/.gem/credentials`, `~/.terraform.d/credentials.tfrc.json`, `~/.config/op/config`, `~/.yarnrc.yml` (M1-13's finding 6, kept as the ignored test `finding_6_stores_outside_the_cr_12_list_ask_in_home`).
+
+**Change:** add them to CR-12's list in contract §9: they ask in Home, like the others, and are never hard-denied (D-082). The Settings list (M1-23) shows them. Done in the task that fixes S5, S7, S8, S11 and K5 after M1-18 merges.
+
+## CR-18 — M1 gate decisions — 2026-11-16
+
+**Decided (D-111, Pedro): approved; fix in M1.**
+
+**P2: a withdrawn request's ticket stays pending until the turn ends.** A ticket opened by an `Ask` whose request is then withdrawn (cancelled, or never followed by `can_use_tool`) stays `pending` in the ledger and counts against `MAX_PENDING_REQUESTS`. `SessionGate` has no call to withdraw it.
+
+**Change:** add a withdraw call to `SessionGate` (contract §3/§7), which resolves the ticket as cancelled (`RequestResolved { cancelled }`) and frees its slot; the Claude and Codex adapters call it when a request is withdrawn. A test proves that withdrawn tickets no longer count against the limit.

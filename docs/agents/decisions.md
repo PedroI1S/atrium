@@ -716,3 +716,14 @@ The M1-20 gate audit's UI gaps are built now, in M1, not moved to M2: thread ren
 
 ## D-110 — 2026-11-16 — Pedro: one more M1-18 round for what Argon's round-3 review left
 D-105 said fix round 2 was the last one. After Argon's review of it (rework; no regression vs dev; gaps all same as dev or stricter), Pedro chose "Not yet" on the merge and then asked to fix what's left on Hydrogen before deciding: the glob normalizer gaps (`*/..`, dot-and-slash classes, brace overflow, `ASK_TREES` probes), unbounded wrappers (split `-S` arguments, `security`/`secret-tool`/interpreters, every wrapper not only `env`/`command`), a cap on glob variants, and the two new Home asks. Same rules: nothing more permissive than dev, no new hard deny on an ordinary line. The review after this round goes to Argon, then the merge decision to Pedro.
+
+## D-111 — 2026-11-16 — Pedro: the open M1 gate decisions
+Pedro decided the open gate items:
+- **Linux idle memory:** the Linux gate is < 165 MB private PSS (measured 158.7–160 MB, WebKitGTK's floor); macOS stays < 150 MB. Contract §14 and PLAN updated.
+- **Linux TTI (D-041):** a gate on Linux too, with the macOS statistic (30 warm launches, median < 400 ms, p90 < 450 ms), measured from `main`, starting at load < 2.5 with no build running, spawn → TTI reported beside it.
+- **§14 frame statistic on Linux:** with whole-millisecond rAF timestamps, "over 16.7 ms" reads as a frame over 1.5 × the refresh interval; p99 ≤ 33 ms unchanged.
+- **Batching in `bridge.rs`:** now, in M1 (deliveries batched per animation frame).
+- **A damaged message in an export:** export with the message marked damaged (CR-16).
+- **S5, S7, S8, S11 and K5:** fixed after M1-18 merges (same files), with the four extra credential stores (CR-17).
+- **P2:** fixed now, with a `SessionGate` withdraw call (CR-18).
+`env -C` was already settled (it keeps dev's hard deny); it is removed from the open list.

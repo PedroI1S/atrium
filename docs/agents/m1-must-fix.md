@@ -8,7 +8,7 @@ Each row below starts with its state: ✅ done (with evidence), 🟡 in progress
 - **In progress:** M1-18 (S1/CR-12, P1, K1–K4; K6's finding 6). M1-08L, rodrigo's live Codex checks (X1–X3).
 - **Open blockers:** none outside M1-18.
 - **Open, minor:** S5, S7, S8, S11 (their tests are still ignored); K5; N3 and N6 need Linux runs (rodrigo; M1-19 merged); P2. N5 and L10 are "later".
-- **Decisions:** the Linux idle-memory gate; the Linux TTI gate (D-041); §14's frame statistic on Linux; `env -C`; batching in `bridge.rs`; one damaged message failing an export.
+- **Decided (D-111):** Linux idle memory < 165 MB; Linux TTI is a gate; the Linux frame statistic counts frames over 1.5 × the interval; `bridge.rs` batching now; damaged messages export marked (CR-16); S5/S7/S8/S11/K5 + four more stores (CR-17) after M1-18; P2 now (CR-18).
 - **The gate itself (PLAN §8):**
   - the demo end to end, with all checks green;
   - the Argon + Astra security and architecture review;

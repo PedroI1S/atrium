@@ -702,8 +702,8 @@ trust = "untrusted"         # default for free tiers; changing it requires confi
 
 ## 4. Performance budgets (targets)
 
-- Cold start to interactive: < 400 ms (macOS, M-series). On Linux it's the same goal but not a gate until M1's WebKitGTK startup profiling (D-041). Reconnecting to a running daemon with full state: < 100 ms.
-- App idle memory (excluding agents and Chromium): < 150 MB with one window; each popped-out window adds about 35 MB, which is accepted (D-028). Measured as `phys_footprint` on macOS and as private PSS (PSS without shared-library pages) on Linux, with GPU memory reported but not budgeted (D-040). Daemon idle RSS: < 50 MB.
+- Cold start to interactive: < 400 ms (macOS, M-series). On Linux it's a gate too, with a load condition (D-041, D-111). Reconnecting to a running daemon with full state: < 100 ms.
+- App idle memory (excluding agents and Chromium): < 150 MB with one window (< 165 MB on Linux, WebKitGTK's floor, D-111); each popped-out window adds about 35 MB, which is accepted (D-028). Measured as `phys_footprint` on macOS and as private PSS (PSS without shared-library pages) on Linux, with GPU memory reported but not budgeted (D-040). Daemon idle RSS: < 50 MB.
 - Token streaming: 60 fps, no dropped input with 10 active threads. 60 fps is the target on every display, high-refresh ones included; no 120 Hz promise for now (D-042).
 - Browser pane: ≥ 30 fps screencast, < 80 ms input-to-frame locally.
 - Conflict radar: an incremental update in < 200 ms per thread change.
