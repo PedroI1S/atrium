@@ -785,26 +785,6 @@ impl Sensitive {
             return true;
         }
         // Prefix-named stores (`~/.azure/msal_token_cache.*`) with any extension.
-        const PREFIX_PROBES: &[&str] = &[
-            "msal_token_cache.json",
-            "msal_token_cache.bin",
-            "msal_token_cache.db",
-            "msal_token_cache.txt",
-            "msal_token_cache.cache",
-        ];
-        let matches_prefix_pat = |file_pat: &str, pre: &str, generic_dir: bool| -> bool {
-            if !comp_glob_matches_impl(file_pat, pre, true) {
-                return false;
-            }
-            if !generic_dir {
-                return true;
-            }
-            file_pat.starts_with(pre)
-                || file_pat.starts_with("msal_")
-                || PREFIX_PROBES
-                    .iter()
-                    .any(|f| comp_glob_matches_impl(file_pat, f, false))
-        };
         for (dir, pre) in ASK_NAME_PREFIXES {
             let dir_abs = format!("{}/{dir}", self.home);
             for rl in &root_lowers {
@@ -813,7 +793,14 @@ impl Sensitive {
                 };
                 for norm in variants {
                     if dir_rel.is_empty() {
-                        if !norm.contains('/') && matches_prefix_pat(norm, pre, true) {
+                        if !norm.contains('/') {
+                            if matches_ask_name_prefix_pat(norm, pre) {
+                                return true;
+                            }
+                        } else if let Some((dir_pat, file_pat)) = norm.rsplit_once('/')
+                            && (dir_pat == "**" || dir_pat == dir_abs)
+                            && matches_ask_name_prefix_pat(file_pat, pre)
+                        {
                             return true;
                         }
                         continue;
@@ -827,8 +814,7 @@ impl Sensitive {
                                     let m = g.compile_matcher();
                                     m.is_match(dir_rel) || m.is_match(&dir_abs)
                                 });
-                        let generic_dir = matches!(dir_pat.rsplit('/').next(), Some("**" | "*"));
-                        if dir_match && matches_prefix_pat(file_pat, pre, generic_dir) {
+                        if dir_match && matches_ask_name_prefix_pat(file_pat, pre) {
                             return true;
                         }
                     }
@@ -1195,9 +1181,42 @@ impl<'a> Comp<'a> {
         match self {
             Self::GlobStar => true,
             Self::Literal(s) => s.starts_with(pre),
-            Self::Pattern { raw, .. } => comp_glob_matches_impl(raw, pre, true),
+            Self::Pattern { raw, .. } => matches_ask_name_prefix_pat(raw, pre),
         }
     }
+}
+
+const ASK_PREFIX_PROBES: &[&str] = &[
+    "msal_token_cache.json",
+    "msal_token_cache.bin",
+    "msal_token_cache.db",
+    "msal_token_cache.txt",
+    "msal_token_cache.cache",
+];
+
+/// Whether `file_pat` can match an ask-store file prefixed with `pre`
+/// (`msal_token_cache.*`), without falsely catching unrelated extensions like `*.rs`.
+fn matches_ask_name_prefix_pat(file_pat: &str, pre: &str) -> bool {
+    if file_pat == "**" {
+        return true;
+    }
+    if file_pat.contains('{') {
+        let Some(exps) = words::brace_expand(file_pat) else {
+            return true;
+        };
+        return exps.iter().any(|e| matches_ask_name_prefix_pat(e, pre));
+    }
+    if !comp_glob_dp(file_pat, pre, true) {
+        return false;
+    }
+    file_pat.starts_with(pre)
+        || file_pat.starts_with("msal_")
+        || file_pat.split_once('.').is_some_and(|(stem, _)| {
+            !stem.contains('*') && comp_glob_dp(stem, pre.trim_end_matches('.'), false)
+        })
+        || ASK_PREFIX_PROBES
+            .iter()
+            .any(|f| comp_glob_dp(file_pat, f, false))
 }
 
 fn split_comps(path: &str) -> Vec<&str> {
