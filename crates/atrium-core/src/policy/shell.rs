@@ -3778,165 +3778,6 @@ fn push_bounded_vec(out: &mut Vec<Vec<String>>, val: Vec<String>, unbounded: &mu
     }
 }
 
-/// Fail-closed expansion for an unknown `env` or `command` invocation:
-/// treats every remaining non-option word as a possible start of the payload
-/// and collects every `-C`/`--chdir` and `-S`/`--split-string` value.
-#[allow(clippy::too_many_arguments)]
-struct EnvReach {
-    cmd_starts: Vec<usize>,
-    split_vals: Vec<(usize, String)>,
-    chdir_vals: Vec<(usize, String)>,
-}
-
-/// Reachability scan for an `env` or `command` invocation with unknown
-/// options: skips arbitrarily many known options and `NAME=value` assignments,
-/// and returns `None` only when unknown options or candidate command starts
-/// exceed `MAX_UNKNOWN_STARTS` (K9).
-fn env_reach(a: &[String], is_env: bool) -> Option<EnvReach> {
-    let mut reachable = vec![false; a.len() + 1];
-    if a.len() > 1 {
-        reachable[1] = true;
-    }
-    let mut cmd_starts: Vec<usize> = vec![];
-    let mut split_vals: Vec<(usize, String)> = vec![];
-    let mut chdir_vals: Vec<(usize, String)> = vec![];
-    let mut unknown_opts = 0usize;
-    let cmd_opts = (!is_env).then(|| wrapper_opts("command").unwrap_or(NO_OPTS));
-
-    for i in 1..a.len() {
-        if !reachable[i] {
-            continue;
-        }
-        let w = a[i].as_str();
-        if w == "--" {
-            if i + 1 < a.len() && !cmd_starts.contains(&(i + 1)) {
-                cmd_starts.push(i + 1);
-            }
-        } else if is_env && is_assignment_word(w) {
-            reachable[i + 1] = true;
-        } else if is_env && w == "-" {
-            reachable[i + 1] = true;
-        } else if is_option(w) {
-            if is_env {
-                let long = if w.starts_with("--") {
-                    env_long(w)
-                } else {
-                    None
-                };
-                let lw = long.as_deref().unwrap_or(w);
-                if lw == "--split-string" {
-                    if let Some(v) = a.get(i + 1) {
-                        split_vals.push((i + 2, v.clone()));
-                    }
-                } else if let Some(v) = lw.strip_prefix("--split-string=") {
-                    split_vals.push((i + 1, v.to_string()));
-                } else if lw == "--chdir" {
-                    if let Some(v) = a.get(i + 1) {
-                        chdir_vals.push((i, v.clone()));
-                    }
-                } else if let Some(v) = lw.strip_prefix("--chdir=") {
-                    chdir_vals.push((i, v.to_string()));
-                } else if w.starts_with('-') && !w.starts_with("--") {
-                    for (pos, _) in w[1..].match_indices('S') {
-                        let after = &w[1 + pos + 1..];
-                        if !after.is_empty() {
-                            split_vals.push((i + 1, after.to_string()));
-                        } else if let Some(v) = a.get(i + 1) {
-                            split_vals.push((i + 2, v.clone()));
-                        }
-                    }
-                    for (pos, _) in w[1..].match_indices('C') {
-                        let after = &w[1 + pos + 1..];
-                        if !after.is_empty() {
-                            chdir_vals.push((i, after.to_string()));
-                        } else if let Some(v) = a.get(i + 1) {
-                            chdir_vals.push((i, v.clone()));
-                        }
-                    }
-                }
-
-                if matches!(lw, "--unset" | "--chdir" | "--argv0" | "--split-string") {
-                    if i + 2 <= a.len() {
-                        reachable[i + 2] = true;
-                    }
-                } else if lw.starts_with("--") {
-                    let name = lw.split_once('=').map_or(lw, |(n, _)| n);
-                    let known_one = lw.starts_with("--split-string=")
-                        || lw.starts_with("--chdir=")
-                        || lw.starts_with("--unset=")
-                        || lw.starts_with("--argv0=")
-                        || matches!(
-                            name,
-                            "--block-signal" | "--default-signal" | "--ignore-signal"
-                        )
-                        || (!lw.contains('=')
-                            && matches!(
-                                name,
-                                "--ignore-environment"
-                                    | "--null"
-                                    | "--debug"
-                                    | "--list-signal-handling"
-                                    | "--help"
-                                    | "--version"
-                            ));
-                    if known_one {
-                        reachable[i + 1] = true;
-                    } else {
-                        unknown_opts += 1;
-                        reachable[i + 1] = true;
-                        if !w.contains('=') && i + 2 <= a.len() {
-                            reachable[i + 2] = true;
-                        }
-                    }
-                } else if env_flags_ok(w) {
-                    if matches!(env_cluster(w), Some((_, ref rest)) if rest.is_empty()) {
-                        if i + 2 <= a.len() {
-                            reachable[i + 2] = true;
-                        }
-                    } else {
-                        reachable[i + 1] = true;
-                    }
-                } else {
-                    unknown_opts += 1;
-                    reachable[i + 1] = true;
-                    if i + 2 <= a.len() {
-                        reachable[i + 2] = true;
-                    }
-                }
-            } else {
-                let o = cmd_opts.as_ref().unwrap_or(&NO_OPTS);
-                match read_opt(a, i, o, false) {
-                    Opt::Words(1) | Opt::Shell(_) => reachable[i + 1] = true,
-                    Opt::Words(2) => {
-                        if i + 2 <= a.len() {
-                            reachable[i + 2] = true;
-                        }
-                    }
-                    _ => {
-                        unknown_opts += 1;
-                        reachable[i + 1] = true;
-                        if !w.contains('=') && i + 2 <= a.len() {
-                            reachable[i + 2] = true;
-                        }
-                    }
-                }
-            }
-        } else if !cmd_starts.contains(&i) {
-            cmd_starts.push(i);
-        }
-
-        if unknown_opts > MAX_UNKNOWN_STARTS || cmd_starts.len() > MAX_UNKNOWN_STARTS {
-            return None;
-        }
-    }
-
-    Some(EnvReach {
-        cmd_starts,
-        split_vals,
-        chdir_vals,
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn expand_nested_reading(
     cand: &[String],
@@ -3972,10 +3813,10 @@ fn expand_nested_reading(
     }
 }
 
-/// Fail-closed expansion for an unknown `env` or `command` (or wrapper)
-/// invocation: collects reachable command starts, `-C`/`--chdir` and
-/// `-S`/`--split-string` values.
 #[allow(clippy::too_many_arguments)]
+/// Fail-closed expansion for an unknown `env` or `command` invocation:
+/// treats every remaining non-option word as a possible start of the payload
+/// and collects every `-C`/`--chdir` and `-S`/`--split-string` value.
 fn expand_unknown_env_cmd(
     a: &[String],
     is_env: bool,
@@ -3986,30 +3827,53 @@ fn expand_unknown_env_cmd(
     unbounded: &mut bool,
     rec_depth: u8,
 ) {
-    if rec_depth > 4 {
+    if rec_depth > 4 || a.len() > MAX_UNKNOWN_STARTS {
         *unbounded = true;
         return;
     }
-    let is_command = !is_env && a.first().is_some_and(|s| cmd_name(s) == "command");
-    let (cmd_starts, split_vals, chdir_vals) = if is_env || is_command {
-        let Some(reach) = env_reach(a, is_env) else {
-            *unbounded = true;
-            return;
-        };
-        (reach.cmd_starts, reach.split_vals, reach.chdir_vals)
-    } else {
-        if a.len() > MAX_UNKNOWN_STARTS {
-            *unbounded = true;
-            return;
+    let mut split_vals: Vec<(usize, String)> = vec![];
+    let mut chdir_vals: Vec<(usize, String)> = vec![];
+    if is_env {
+        for m in 1..a.len() {
+            let w = &a[m];
+            let long = if w.starts_with("--") {
+                env_long(w)
+            } else {
+                None
+            };
+            let lw = long.as_deref().unwrap_or(w.as_str());
+            if lw == "--split-string" {
+                if let Some(v) = a.get(m + 1) {
+                    split_vals.push((m + 2, v.clone()));
+                }
+            } else if let Some(v) = lw.strip_prefix("--split-string=") {
+                split_vals.push((m + 1, v.to_string()));
+            } else if lw == "--chdir" {
+                if let Some(v) = a.get(m + 1) {
+                    chdir_vals.push((m, v.clone()));
+                }
+            } else if let Some(v) = lw.strip_prefix("--chdir=") {
+                chdir_vals.push((m, v.to_string()));
+            } else if w.starts_with('-') && !w.starts_with("--") {
+                for (pos, _) in w[1..].match_indices('S') {
+                    let after = &w[1 + pos + 1..];
+                    if !after.is_empty() {
+                        split_vals.push((m + 1, after.to_string()));
+                    } else if let Some(v) = a.get(m + 1) {
+                        split_vals.push((m + 2, v.clone()));
+                    }
+                }
+                for (pos, _) in w[1..].match_indices('C') {
+                    let after = &w[1 + pos + 1..];
+                    if !after.is_empty() {
+                        chdir_vals.push((m, after.to_string()));
+                    } else if let Some(v) = a.get(m + 1) {
+                        chdir_vals.push((m, v.clone()));
+                    }
+                }
+            }
         }
-        let starts: Vec<usize> = (1..a.len())
-            .filter(|&i| {
-                let w = &a[i];
-                w != "--" && !is_assignment_word(w) && !is_option(w)
-            })
-            .collect();
-        (starts, vec![], vec![])
-    };
+    }
 
     let with_tail = |tail: usize, s: &str| -> String {
         if tail >= a.len() {
@@ -4031,32 +3895,36 @@ fn expand_unknown_env_cmd(
         let mut sp = sw;
         sp.extend_from_slice(&a[*tail..]);
         if !sp.is_empty() {
-            if let Some(r) = readings.as_deref_mut() {
-                push_bounded_vec(r, sp.clone(), unbounded);
-            }
-            if sp[0].starts_with('-') || is_assignment_word(&sp[0]) {
-                let mut wrapped = vec!["env".to_string()];
-                wrapped.extend(sp);
-                expand_unknown_env_cmd(
-                    &wrapped,
-                    true,
-                    depth,
-                    cache,
-                    readings.as_deref_mut(),
-                    payloads.as_deref_mut(),
-                    unbounded,
-                    rec_depth + 1,
-                );
+            if sp.len() > MAX_UNKNOWN_STARTS {
+                *unbounded = true;
             } else {
-                expand_nested_reading(
-                    &sp,
-                    depth,
-                    cache,
-                    readings.as_deref_mut(),
-                    payloads.as_deref_mut(),
-                    unbounded,
-                    rec_depth,
-                );
+                if let Some(r) = readings.as_deref_mut() {
+                    push_bounded_vec(r, sp.clone(), unbounded);
+                }
+                if sp[0].starts_with('-') || is_assignment_word(&sp[0]) {
+                    let mut wrapped = vec!["env".to_string()];
+                    wrapped.extend(sp);
+                    expand_unknown_env_cmd(
+                        &wrapped,
+                        true,
+                        depth,
+                        cache,
+                        readings.as_deref_mut(),
+                        payloads.as_deref_mut(),
+                        unbounded,
+                        rec_depth + 1,
+                    );
+                } else {
+                    expand_nested_reading(
+                        &sp,
+                        depth,
+                        cache,
+                        readings.as_deref_mut(),
+                        payloads.as_deref_mut(),
+                        unbounded,
+                        rec_depth,
+                    );
+                }
             }
         }
     }
@@ -4087,7 +3955,11 @@ fn expand_unknown_env_cmd(
         }
     }
 
-    for i in cmd_starts {
+    for i in 1..a.len() {
+        let w = &a[i];
+        if w == "--" || is_assignment_word(w) || is_option(w) {
+            continue;
+        }
         let cand = &a[i..];
         let mut resolved = cand.to_vec();
         if has_command_substitution(&resolved[0])
