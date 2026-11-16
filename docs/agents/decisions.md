@@ -621,3 +621,16 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **Where they're allowed.** P1's search globs that can leave their roots, and whose expansions can't hit the hard-deny list, keep `dev`'s Allow under FullAccess and under an Any rule. Examples: `../other/*.rs`, `/etc/*.conf`.
 - **Elsewhere it is unchanged.** They still ask in Home and under prefix rules. They are still hard-denied when an expansion can hit the hard-deny list, and a rule's deny still wins.
 - **When it lands.** M1-18 makes this one change in `engine.rs::evaluate`, with tests, after its Hydrogen review. That way the reviewer reads a fixed tree, and the change can ride with any review fixes.
+
+## D-101 — 2026-11-16 — Pedro's go: M1-18 fix round on Hydrogen, review on Argon
+**Decided by Pedro (driver):** "yes but run the fix round on hydrogen itself, review on argon".
+
+**The fix round.** Gemini 4 Hydrogen `high` works on the same branch (`agent/opus/M1-18-policy-followup`), with `reviews/M1-18-policy-followup.md` as its input. It fixes:
+- the performance regression (`lex_depth` re-lexing nested `$(...)`): back within the fuzz and garbage test limits, close to round 8's times;
+- the three same-as-`dev` gaps: P1 `**` then `..`; K1 `env` with unknown options; CR-12 multi-part relative globs and git pathspec magic;
+- the minors where cheap;
+- D-100: escaping globs that can't hit the hard-deny list are allowed under FullAccess and an Any rule.
+
+**The review.** Gemini 4 Argon `high`, read-only. Author and reviewer are both Gemini models, a recorded exception to cross-provider review (PLAN §8), Pedro's call. This also lifts D-015's pause on Argon for this review.
+
+**Known constraint (D-074).** The `agy` policy refuses credential paths as literals. If a test can't be written for that reason, the worker lists the exact line and expected verdicts in its handoff, and the orchestrator (Claude) adds those tests before the merge.
