@@ -16,7 +16,7 @@ Starts the app four times, each in a throwaway ATRIUM_HOME (name the runs to do 
     banner;
   - gaps (M1-23): against a real daemon, with the chat scenes seeded as above (app/src/gap-shots.ts):
     the thread menu, renaming, the archive confirmation, the enforcement details, batch
-    approvals selected and their (real) refusals, the rules editor (valid and refused), Settings →
+    approvals selected and their (real) refusals, the rules editor (valid, refused, and an allow rule on a shell refused), Settings →
     Security and the palette's "This chat" commands; light and dark.
 
 The pictures are the webviews' own snapshots (the desktop session lets no script capture
@@ -41,7 +41,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 APP = ROOT / "target" / "debug" / "atrium"
 TIMEOUT_S = 120
 # Run name -> (ATRIUM_BENCH mode, pictures it takes).
-RUNS = {"real": ("shots", 9), "chat": ("shots-chat", 18), "refused": ("shots-incompatible", 1), "gaps": ("shots-gaps", 20)}
+RUNS = {"real": ("shots", 9), "chat": ("shots-chat", 18), "refused": ("shots-incompatible", 1), "gaps": ("shots-gaps", 22)}
 
 
 def run_app(home: pathlib.Path, mode: str, shots: pathlib.Path, log: pathlib.Path) -> None:

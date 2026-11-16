@@ -140,7 +140,7 @@ Branch: `agent/opus/M1-23-ui-gaps`, cut from `dev` at `4bf9874e`. Worker: Claude
 - `settings-rule-editor`, `settings-rule-editor-refused`, `settings-security`;
 - `palette-this-chat`.
 
-To regenerate them: `python3 app/scripts/screenshots.py gaps`, under the GUI lock. They come from `app/src/gap-shots.ts`.
+To regenerate them: `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock python3 app/scripts/screenshots.py docs/agents/handoffs/M1-23-ui-gaps gaps` (the first argument is the output folder; corrected in round 2). They come from `app/src/gap-shots.ts`.
 
 How the pictures were made:
 - The chats are seeded in the window.
@@ -156,3 +156,57 @@ How the pictures were made:
 - **The brief's context list points at PLAN §3.2 and §3.13.** Those sections are adapters and browser, not threads and rules. I worked from §3.4, §3.12 and contract §3, §4 and §9.
 - **CR-12** is a marked spot in code only, with no visible placeholder.
 - No daemon, protocol, policy, store or agent crate changed. `app/src-tauri` changed only for `ask_save_path` and `safety_info`.
+
+## Round 2 (D-113): the Argon review
+
+Branch `agent/opus/M1-23-ui-gaps`, on top of `eb5997ec`. Commits: `e534d7bb` (rules editor), `03a620df` (inbox, archive, quoting), `ced96fa2` (save dialog, export), and the commit with this section.
+
+| # | Finding | Result | What changed |
+|---|---|---|---|
+| 1 | Blocker: allow rules on shells, wrappers, inline code | Fixed | `commandRisk` in `app/src/chat/rule-form.ts`. Allow rules (prefix **and** exact) are refused when the first word (by basename) is one of these: a shell (`shell.rs` `SHELLS`); `eval`, `source` or `.`; a wrapper `unwrap_reading` strips (`time nohup builtin command setsid unbuffer caffeinate sandbox-exec exec nice ionice stdbuf xargs busybox toybox timeout chrt taskset arch chroot flock script env`), plus `sudo doas su runuser setpriv pkexec`. They are also refused for an interpreter given inline code: `python*` `-c`, `node`/`bun` `-e -p --eval --print`, `ruby -e`, `perl -e/-E`, `php -r…`, `lua -e`, `osascript -e`, `deno eval`. The flag also counts inside a cluster such as `perl -lne` or `python3 -Ic`. `find` with `-exec`, `-execdir`, `-ok` or `-okdir` is refused too. Every wrapper is refused, rather than stripped and the rest checked. That is stricter than the brief needs, and needs no option tables in TS. Warned, at any argv length: interpreters with no inline code, `npx pnpx bunx uvx pipx`, `shell.rs` `COMMAND_RUNNERS` (`ssh`, `docker`, …), and plain `find`. Deny rules on all of these are still allowed and get no warning. The command field's hint says what can't be allowed. |
+| 2 | Blocker: path limit on command and deny rules | Fixed in the UI; engine limit **escalated** | `PATH_KINDS` no longer has `execute`. "Only for paths inside" now shows only when `pathScopeOffered` is true: an allow rule that is a path glob, or `any` of a non-`execute` kind. `validateRule` drops a leftover limit from any other rule, so `path_scope` is `null`, and an invalid leftover can't block it. The test and the `gap-shots.ts` example that showed scoped command rules were changed. |
+| 3 | Major: Linux GTK save dialog left on screen | Fixed, **not compiled here** | `save.rs` uses `gtk::FileChooserNative::new(Some(title), None::<&gtk::Window>, Save, Some("_Save"), Some("_Cancel"))`. Its `run()` hides the dialog before it returns, and dropping the last reference frees it. There is no `close()`. I checked the signature, `NativeDialogExt::run -> ResponseType` and the `FileChooserExt` methods against docs.rs for gtk 0.18.2. The Linux `cfg` doesn't build on this Mac, so this code is checked by reading only. |
+| 4 | Minor: input the engine never matches | Fixed | `splitCommand` refuses these: a `#` that starts a word (a quoted `#`, or `a#b`, is fine); control characters (C0 except tab, DEL, C1) and U+2028/U+2029; an empty command name (`''`, `""`); and a first word from `shell.rs` `RESERVED`, even quoted. Empty arguments such as `grep -e '' x` are still allowed. New `globSyntaxError` mirrors the `globset` 0.4.21 parser. It catches a dangling `\`, an unclosed class (`[`, `[]`, `[!]`, `][`), a range that goes down (`[z-a]`, `[z--]`), and unpaired braces. A leading `]` or `-` in a class and nested braces are accepted, as globset accepts them. `broadGlob` warns on `/`, `/*`, `/**`, `/**/*`, and on the home folder (`~`, `~/*`, `~/**`, `~/**/*`). The `any` warning now shows with a path limit too ("…inside that folder…", or "…in your home folder…"; a whole-disk limit gets the plain warning). |
+| 5 | Minor: export over an existing file | Fixed | `ask_save_path` returns `{ path, exists }` (`SavePick`, which uses `symlink_metadata`, so a dangling symlink also counts as there). `pickNewPath` in `thread-actions.ts` toasts *"That file already exists, and an export never replaces a file: pick a new name."* and opens the dialog again, with the title ending in ": pick a new name". It gives up after 5 taken picks. Linux turns off GTK's overwrite confirmation. NSSavePanel has no public switch for its "Replace?" prompt, so the panel's message now reads "Atrium never replaces a file: pick a new name." If the daemon still refuses with AlreadyExists (a race, or bench mode), the toast uses the same clear wording. |
+| 6 | Minor: archive from a pop-out | Fixed | `confirmArchive` calls `bringBack(threadId)` when this window is a pop-out or another window owns the view (`archiveClosesPopout`). From the pop-out itself, that closes the window. In the main window, a new effect (`mainChatLeft`) clears `mainThread` when the chat it shows leaves the list after being listed: archived in a pop-out, or by another client. The screen stays as it is (Settings stays Settings). |
+| 7 | Minor: checkbox focus vs Inbox keys; module-level batch state | Fixed | The key guard skips only text inputs, so J, K, A, D, X and ↵ work from a batch checkbox. The batch bar also takes the keys, so "Select all" keeps them. `selection`, `batchBusy` and `batchResult` now live inside `InboxCard` and reach the cards as a `Batch` prop, so leaving the inbox drops them. A and D act on the approval card that holds focus, when there is one. |
+| 8 | Nit: `quoteArg` and `~` | Fixed | `~` and `~/…` stay unquoted. `~/a b` reads `~/'a b'`. `~bob` and `a~b` are still quoted. |
+| 9 | Nit: `X` with two approval cards | Fixed | Each approval card carries `data-batch-key`. `xKeys` makes X toggle the focused card. Without one, X toggles every selectable approval of the picked chat as a group (`toggledGroup`). |
+
+### Escalated (not done: daemon, policy or protocol crates)
+- **Engine path-scope limit (`crates/atrium-core/src/policy/engine.rs`).** `all_paths` adds `a.start`, the command's cwd, to every command's paths. Every non-flag word is also resolved against the cwd as a path. `path_scope_ok` requires **all** of them to match. So a `path_scope` on a command rule never matches in a Home chat (cwd = `~`, and Claude's `Bash` has no cwd), and `PathGlob` rules of kind `execute` never match there either. `deny_matches` also uses `path_scope_ok`, which is `all`, so a scoped deny rule lets a call through as soon as one of its paths is outside the scope. The UI no longer offers these rules. Rules made before this, or by other clients, still can be. Two fixes are possible: in the engine, scope commands by their named paths only and use `any` for deny; or have the daemon refuse such drafts in `CreateRule`.
+- **Daemon-side `CreateRule` guard.** The daemon accepts any `RuleDraft`, including an allow `CommandPrefix` on `sh`, `bash -c`, `env` or `sudo`. Such a rule breaks the `shell.rs` assumption that no rule allows a prefix of `sh` ("reasons of a payload don't matter"). The UI now refuses these drafts, but another client on the socket can still create one (and contract §4 lets any same-UID process talk to the socket). Recommended: the same refusal list in `create_rule`, or `allow_covers` refusing a part whose `eff[0]` is a shell, `eval`, a wrapper or a runner. Prefix allow rules on `find` also cover `find … -exec/-delete`, because derived `-exec` units aren't checked against allow rules. The UI warns about this; the engine may want to stop such a rule from covering `-exec`.
+
+### Definition of done (round 2)
+| Command | Result |
+|---|---|
+| `pnpm typecheck` (app/) | pass |
+| `pnpm test` (app/) | pass: 19 files, 338 tests (317 before; new tests in `rule-form`, `rules`, `batch`, `thread-actions`) |
+| `pnpm build` (app/) | pass; `RuleEditor` is still a lazy chunk (15.1 kB) |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass (macOS: the Linux `run_dialog` isn't compiled) |
+| `cargo test -p atrium-app --no-fail-fast` | pass: 47 unit tests (new: `a_save_pick_says_whether_something_is_already_there`) + 2 `delivery_shapes` |
+| `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock python3 app/scripts/m1_demo.py`, 3 runs in a row | **27/27, 27/27, 27/27** |
+
+Only `atrium-app` changed among the Rust crates, so the workspace tests weren't rerun.
+
+New demo checks:
+- 9b: exporting to the same name again is refused, with the clear message.
+- 11: X on a focused checkbox unselects that approval, and the batch result clears when you leave the inbox and come back.
+- 12a: an allow rule on `bash -c 'cargo test'` is refused, a command rule shows no path field, and the rule that gets created has `path_scope: null`.
+
+`m1_demo.py`'s docstring and `docs/demos/M1-demo.md` were updated.
+
+### Screenshots: **not refreshed**
+Every capture failed with `screencapture exit status: 1` ("could not create image from window"). The session's screen was locked (`CGSSessionScreenIsLocked=Yes`; a full-screen capture came out black). In this round, `gap-shots.ts` no longer types a path limit, and it adds the shot `settings-rule-editor-shell-refused`; `screenshots.py` now expects 22 gap shots. So these pictures in `docs/agents/handoffs/M1-23-ui-gaps/` are **out of date**:
+- `settings-rule-editor-{light,dark}.png` still shows the old field and a scoped command rule;
+- `settings-rule-editor-shell-refused-{light,dark}.png` doesn't exist yet.
+
+The batch, archive and export surfaces look the same as before. Once the screen is unlocked, regenerate with:
+`/usr/bin/lockf -k /tmp/atrium-gui-measure.lock python3 app/scripts/screenshots.py docs/agents/handoffs/M1-23-ui-gaps gaps`
+That run also writes a `gaps.log` there, which should be deleted.
+
+### Left open
+- The screenshots above.
+- Linux build of `save.rs` (CI or a Linux machine).
+- The two escalations.
