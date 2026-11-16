@@ -3,7 +3,7 @@
 // one chat. Checked as typed (chat/rule-form.ts), then sent as one `CreateRule`.
 
 import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
-import { ANY_KINDS, type Field, type MatcherKind, PATH_KINDS, type RuleForm, emptyRuleForm, validateRule } from "../chat/rule-form";
+import { ANY_KINDS, type Field, type MatcherKind, PATH_KINDS, type RuleForm, emptyRuleForm, pathScopeOffered, validateRule } from "../chat/rule-form";
 import { ruleText } from "../chat/rules";
 import { command, daemon } from "../daemon/client";
 import { type Rule, type ToolKind, isCommandFailure } from "../daemon/types";
@@ -103,14 +103,17 @@ export default function RuleEditor(props: { onDone: () => void }) {
       </div>
       <Show when={isCommand()}>
         <TextField label="Command" part="command" placeholder={form().matcher === "command_prefix" ? "cargo test" : "rm -rf build"} value={form().command} error={error("command")}
-          hint={form().matcher === "command_prefix" ? "Matches a simple command whose words start with these, in order. Quote a word with spaces." : "Matches only this command, word for word."}
+          hint={form().matcher === "command_prefix" ? "Matches a simple command whose words start with these, in order. Quote a word with spaces. Shells, wrappers like env or sudo, and inline code can't be allowed." : "Matches only this command, word for word."}
           onInput={(v) => set({ command: v })} />
       </Show>
       <Show when={form().matcher === "path_glob"}>
         <TextField label="Path or glob" part="glob" placeholder="~/projects/notes/**" value={form().glob} error={error("glob")} hint="A full path; * matches within a folder, ** across folders." onInput={(v) => set({ glob: v })} />
       </Show>
       <TextField label="Only for the tool named (optional)" part="tool" placeholder="Bash" value={form().toolName} error={error("toolName")} hint="The agent's own name for the tool. Empty: any tool of this kind." onInput={(v) => set({ toolName: v })} />
-      <TextField label="Only for paths inside (optional)" part="path-scope" placeholder="~/projects/**" value={form().pathScope} error={error("pathScope")} hint="Every path the call touches must match." onInput={(v) => set({ pathScope: v })} />
+      {/* Only where the engine can match it: allow rules about file calls (rule-form.ts). */}
+      <Show when={pathScopeOffered(form())}>
+        <TextField label="Only for paths inside (optional)" part="path-scope" placeholder="~/projects/**" value={form().pathScope} error={error("pathScope")} hint="Every path the call touches must match." onInput={(v) => set({ pathScope: v })} />
+      </Show>
       <div class="fld">
         <b>Applies in</b>
         <div class="fld-row">

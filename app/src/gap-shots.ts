@@ -133,13 +133,16 @@ export async function runGapShots(): Promise<void> {
   click('[data-atrium-part="setting-action-add-rule"]');
   await until("the rules editor", () => document.querySelector('[data-atrium-part="rule-command"]') !== null);
   typeInto('[data-atrium-part="rule-command"]', "cargo test");
-  typeInto('[data-atrium-part="rule-path-scope"]', "/home/you/projects/**");
   await until("the preview", () => document.querySelector('[data-atrium-part="rule-preview"]') !== null);
   document.querySelector('[data-atrium-part="rule-editor"]')?.scrollIntoView({ block: "end" });
   await both("settings-rule-editor");
   typeInto('[data-atrium-part="rule-command"]', "cargo test && rm -rf target");
   await until("the error", () => document.querySelector('[data-atrium-part="rule-editor"] .err') !== null);
   await both("settings-rule-editor-refused");
+  // Round 2 blocker 1: an allow rule on a shell is refused.
+  typeInto('[data-atrium-part="rule-command"]', "bash -c 'cargo test'");
+  await until("the shell's error", () => document.querySelector('[data-atrium-part="rule-editor"] .err')?.textContent?.includes("can't allow bash") === true);
+  await both("settings-rule-editor-shell-refused");
   click('[data-atrium-part="rule-editor"] .btn.ghost');
 
   // 7. Settings → Security.

@@ -634,6 +634,14 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
   await waitFor("the command's error", () => document.querySelector('[data-atrium-part="rule-editor"] .err') !== null);
   const refusedText = document.querySelector('[data-atrium-part="rule-editor"] .err')?.textContent;
   await sleep(SAMPLE_GAP_MS);
+  // Round 2 blocker 1: an allow rule on a shell would allow whatever it runs.
+  typeInto(commandField!, "bash -c 'cargo test'");
+  await click("Add allow rule (refused: a shell)", () => document.querySelector<HTMLElement>('[data-atrium-part="rule-add"]'));
+  await waitFor("the shell's error", () => document.querySelector('[data-atrium-part="rule-editor"] .err')?.textContent?.includes("can't allow bash") === true);
+  const shellRefusedText = document.querySelector('[data-atrium-part="rule-editor"] .err')?.textContent;
+  // Round 2 blocker 2: a command rule has no "Only for paths inside".
+  const commandPathScope = document.querySelector('[data-atrium-part="rule-path-scope"]') !== null;
+  await sleep(SAMPLE_GAP_MS);
   const rulesAfterRefused = (await command<Rule[]>({ type: "list_rules" })).length;
   typeInto(commandField!, "cargo test");
   await waitFor("the rule preview", () => document.querySelector('[data-atrium-part="rule-preview"]')?.textContent?.includes("cargo test") === true);
@@ -643,8 +651,10 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
   const rulesAfter = await command<Rule[]>({ type: "list_rules" });
   const made = rulesAfter.find((r) => r.origin.type === "settings" && r.matcher.type === "command_prefix" && r.matcher.argv.join(" ") === "cargo test");
   await waitFor("the new rule in the list", () => Array.from(document.querySelectorAll('[data-atrium-part="rules"] .s-item')).some((el) => el.textContent?.includes("commands that start with") && el.textContent.includes("cargo test")));
-  await check("12a. Rules editor refuses a compound command, then adds a command-prefix allow rule", rulesAfterRefused === rulesBefore && made !== undefined && made.decision === "allow" && made.scope.type === "global" && made.tool_kind === "execute", {
+  await check("12a. Rules editor refuses a compound command and an allow rule on bash -c, offers no path limit on commands, then adds a command-prefix allow rule", rulesAfterRefused === rulesBefore && !commandPathScope && made !== undefined && made.decision === "allow" && made.scope.type === "global" && made.tool_kind === "execute" && made.path_scope === null, {
     refusedText,
+    shellRefusedText,
+    commandPathScope,
     preview,
     rulesBefore,
     rulesAfterRefused,
