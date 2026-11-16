@@ -19,8 +19,10 @@ app with ATRIUM_BENCH=m1-demo (app/src/m1-demo.ts) and walks through M1's promis
   9. Rename the thread, then export it to Markdown and JSONL from the thread menu (the save
      dialog is bypassed in bench mode): both private (0600) files exist with the transcript;
  10. Archive from the thread menu (confirmed) removes the thread from lists and inbox;
- 11. Batch: select all approvals in the inbox, Allow once two together, Deny the third;
- 12. Settings: the rules editor refuses a compound command, then adds a command-prefix rule;
+ 11. Batch: select all approvals in the inbox, X on a focused checkbox unselects the third,
+     Allow once two together, Deny the third; the result clears on leaving the inbox;
+ 12. Settings: the rules editor refuses a compound command and an allow rule on `bash -c`,
+     offers no path limit on a command rule, then adds a command-prefix rule;
      Security lists what is always blocked and the known limits;
  13. The enforcement badge opens the details (coverage, policy, isolation).
 

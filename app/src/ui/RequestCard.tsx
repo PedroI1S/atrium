@@ -38,7 +38,7 @@ const ARM_AFTER_MS = 600;
 const typing = () => document.activeElement instanceof HTMLTextAreaElement || document.activeElement instanceof HTMLInputElement;
 
 /** The inbox's batch selection for one approval (PLAN §3.4). */
-export interface Pick { checked: boolean; toggle: () => void }
+export interface Pick { key: string; checked: boolean; toggle: () => void }
 
 export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick: () => number; small?: boolean; autofocus?: boolean; keys?: boolean; pick?: Pick }) {
   const state = () => (props.tick(), cardState(props.item, localOf(props.threadId, props.item)));
@@ -57,6 +57,7 @@ export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick
       aria-label={askOf(props.item)}
       data-atrium-part="approval"
       data-state={state().kind}
+      data-batch-key={props.pick?.key}
       tabindex="-1"
       // Focus never leaves a field the user is typing in.
       ref={(el) => props.autofocus && queueMicrotask(() => { if (!typing()) el.focus({ preventScroll: true }); })}

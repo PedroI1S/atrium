@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ThreadState, ThreadSummary } from "../daemon/types";
-import { MAX_TITLE_CHARS, cleanTitle, exportFileName, hasLiveSession, sizeLabel } from "./thread-actions";
+import { MAX_TITLE_CHARS, cleanTitle, exportFileName, hasLiveSession, sizeLabel, mainChatLeft } from "./thread-actions";
 
 describe("rename: the title the daemon will keep", () => {
   it("takes the first line with text and collapses spaces", () => {
@@ -55,5 +55,17 @@ describe("sizes", () => {
     expect(sizeLabel(12)).toBe("12 bytes");
     expect(sizeLabel(4096)).toBe("4 KB");
     expect(sizeLabel(3 * 1024 * 1024)).toBe("3.0 MB");
+  });
+});
+
+describe("the main card when its chat leaves the list (round 2, minor 6)", () => {
+  it("goes back to a new chat only when a listed chat leaves", () => {
+    expect(mainChatLeft("t1", "t1", false, true)).toBe(true);
+    expect(mainChatLeft("t1", "t1", true, true)).toBe(false);
+    // Not before the list loads, nor for a chat it never listed (a new chat being created).
+    expect(mainChatLeft("t1", "t1", false, false)).toBe(false);
+    expect(mainChatLeft("t1", null, false, true)).toBe(false);
+    expect(mainChatLeft("t2", "t1", false, true)).toBe(false);
+    expect(mainChatLeft(null, "t1", false, true)).toBe(false);
   });
 });

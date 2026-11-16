@@ -44,6 +44,23 @@ export function selectAll(selection: ReadonlySet<string>, offered: readonly stri
   return allState(selection, offered) === "all" ? new Set() : new Set(offered);
 }
 
+/** Selects every key of a group, or clears them all when they all already are; other keys stay. */
+export function toggledGroup(selection: ReadonlySet<string>, keys: readonly string[]): Set<string> {
+  const next = new Set(selection);
+  if (keys.length && keys.every((k) => next.has(k))) for (const k of keys) next.delete(k);
+  else for (const k of keys) next.add(k);
+  return next;
+}
+
+/**
+ * What the inbox's X toggles (round 2, nit 9): the approval card that holds focus, when it can be
+ * in the batch; otherwise every approval of the picked item's chat that can.
+ */
+export function xKeys(targets: readonly Pick<BatchTarget, "key" | "threadId">[], focusedKey: string | null, threadId: string | null): string[] {
+  if (focusedKey !== null && targets.some((t) => t.key === focusedKey)) return [focusedKey];
+  return threadId === null ? [] : targets.filter((t) => t.threadId === threadId).map((t) => t.key);
+}
+
 export type ItemOutcome = { ok: true } | { ok: false; reason: string };
 
 /** How one request of the batch ended, from what this window recorded for it. */

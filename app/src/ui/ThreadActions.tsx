@@ -6,7 +6,7 @@ import { For, Show, createSignal, onCleanup } from "solid-js";
 import { FORMAT_LABEL, archiveThread, endSession, exportThread, hasLiveSession, setRenaming } from "../chat/thread-actions";
 import { daemon } from "../daemon/client";
 import type { ExportFormat, ThreadSummary } from "../daemon/types";
-import { model } from "../windows";
+import { bringBack, isPopout, model, ownsView } from "../windows";
 import { askConfirm } from "./Confirm";
 import { IconButton } from "./controls";
 import { openThread } from "./Sidebar";
@@ -45,10 +45,16 @@ export async function confirmArchive(threadId: string): Promise<void> {
   });
   if (!ok) return;
   if (await archiveThread(threadId)) {
+    // A pop-out of the archived chat closes (round 2, minor 6): from the pop-out itself this
+    // closes this window, and nothing after it runs there.
+    if (archiveClosesPopout(threadId)) await bringBack(threadId);
     // The main card doesn't keep showing a chat that left the list.
     if (model().mainThread === threadId) openThread(null);
   }
 }
+
+/** Whether archiving this chat must close a pop-out: this window is one, or another window shows it. */
+export const archiveClosesPopout = (threadId: string): boolean => isPopout() || !ownsView(threadId);
 
 const exportAction = (t: ThreadSummary, format: ExportFormat): ThreadAction => ({
   id: `export-${format}`,

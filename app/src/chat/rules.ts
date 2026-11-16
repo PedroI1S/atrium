@@ -16,9 +16,13 @@ const KIND: Record<ToolKind, string> = {
   other: "tool call",
 };
 
-/** One argument as a shell would need it written, so the argv reads back exactly. */
+/**
+ * One argument as a shell would need it written, so the argv reads back exactly. A leading `~` or
+ * `~/` stays unquoted: the rule holds it as typed, and quoting it would read as a folder named ~.
+ */
 export function quoteArg(arg: string): string {
-  if (arg !== "" && /^[\w@%+=:,./-]+$/.test(arg)) return arg;
+  if (arg !== "" && /^(~(\/|$))?[\w@%+=:,./-]*$/.test(arg)) return arg;
+  if (arg.startsWith("~/")) return `~/${quoteArg(arg.slice(2))}`;
   return `'${arg.replaceAll("'", "'\\''")}'`;
 }
 

@@ -32,6 +32,12 @@ describe("how a remembered rule reads (D-054, D-062)", () => {
     expect(quoteArg("a;b")).toBe("'a;b'");
     expect(quoteArg("$HOME")).toBe("'$HOME'");
     expect(quoteArg("src/main.rs")).toBe("src/main.rs");
+    // Round 2 nit 8: ~ and ~/… read as the home folder, so they stay unquoted.
+    expect(argvLine(["ls", "~/src"])).toBe("ls ~/src");
+    expect(quoteArg("~")).toBe("~");
+    expect(quoteArg("~bob")).toBe("'~bob'");
+    expect(quoteArg("a~b")).toBe("'a~b'");
+    expect(quoteArg("~/a b")).toBe("~/'a b'");
   });
 
   it("says where it applies, and that it is in any folder", () => {

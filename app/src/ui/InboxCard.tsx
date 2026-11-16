@@ -5,7 +5,7 @@
 // Keyboard: J / K move, ↵ opens the chat, A allows once, D denies, X selects.
 
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, untrack } from "solid-js";
-import { type BatchSummary, type BatchTarget, allState, batchKey, outcomeOf, pruned, selectAll, summarize, toggled } from "../chat/batch";
+import { type BatchSummary, type BatchTarget, allState, batchKey, outcomeOf, pruned, selectAll, summarize, toggled, toggledGroup, xKeys } from "../chat/batch";
 import { GROUP_LABEL, type InboxFilter, filterInbox, groupInbox, itemKey, moveSelection, needsYouCount } from "../chat/inbox";
 import { canAct, cardState, subjectOf } from "../chat/requests";
 import { type ThreadModel, holdThread, localOf, resolveApproval } from "../chat/threads";
@@ -45,17 +45,18 @@ const held = new Map<string, ThreadModel>();
 /** Bumped when `held` changes, so the batch sees cards come and go. */
 const [heldTick, setHeldTick] = createSignal(0);
 
-/** Approvals selected for the batch, by `batchKey`. */
-const [selection, setSelection] = createSignal<ReadonlySet<string>>(new Set());
-const [batchBusy, setBatchBusy] = createSignal(false);
-const [batchResult, setBatchResult] = createSignal<BatchSummary | null>(null);
-function toggleSelected(key: string): void {
-  setBatchResult(null);
-  setSelection(toggled(selection(), key));
-}
+/**
+ * The batch selection as the cards see it. It lives in `InboxCard`, so leaving the inbox drops
+ * the selection and the last result (round 2, minor 7).
+ */
+interface Batch { has: (key: string) => boolean; toggle: (key: string) => void }
+
+/** The approval card holding focus, as its batch key (round 2, nit 9). */
+const focusedCardKey = (target: EventTarget | null): string | null =>
+  target instanceof Element ? target.closest<HTMLElement>('[data-atrium-part="approval"]')?.dataset.batchKey ?? null : null;
 
 /** The pending requests of one thread, as cards. Views the thread while it is shown. */
-function Cards(props: { threadId: string }) {
+function Cards(props: { threadId: string; batch: Batch }) {
   const hold = holdThread(props.threadId);
   held.set(props.threadId, hold.model);
   setHeldTick((n) => n + 1);
@@ -71,7 +72,7 @@ function Cards(props: { threadId: string }) {
         <For each={pending().slice(0, MAX_CARDS)}>
           {(request) => {
             const key = batchKey(props.threadId, request);
-            const pick = request.kind === "approval" ? { get checked() { return selection().has(key); }, toggle: () => toggleSelected(key) } : undefined;
+            const pick = request.kind === "approval" ? { key, get checked() { return props.batch.has(key); }, toggle: () => props.batch.toggle(key) } : undefined;
             return <RequestCard threadId={props.threadId} item={request} tick={hold.model.tick} small keys={false} pick={pick} />;
           }}
         </For>
@@ -81,7 +82,7 @@ function Cards(props: { threadId: string }) {
   );
 }
 
-function Item(props: { item: InboxItem; cards: boolean }) {
+function Item(props: { item: InboxItem; cards: boolean; batch: Batch }) {
   const key = () => itemKey(props.item);
   const reason = () => REASON[props.item.reason];
   let row!: HTMLDivElement;
@@ -99,13 +100,19 @@ function Item(props: { item: InboxItem; cards: boolean }) {
           </span>
           <span class="tm">{ageLabel(props.item.since_ms, now())}</span>
         </button>
-        <Show when={props.cards && props.item.thread_id} keyed>{(id) => <Cards threadId={id} />}</Show>
+        <Show when={props.cards && props.item.thread_id} keyed>{(id) => <Cards threadId={id} batch={props.batch} />}</Show>
       </div>
     </div>
   );
 }
 
 export function InboxCard() {
+  /** Approvals selected for the batch, by `batchKey`. */
+  const [selection, setSelection] = createSignal<ReadonlySet<string>>(new Set());
+  const [batchBusy, setBatchBusy] = createSignal(false);
+  const [batchResult, setBatchResult] = createSignal<BatchSummary | null>(null);
+  const select = (next: Set<string>) => { setBatchResult(null); setSelection(next); };
+  const batch: Batch = { has: (key) => selection().has(key), toggle: (key) => select(toggled(selection(), key)) };
   const all = () => daemon().inbox;
   const groups = createMemo(() => groupInbox(filterInbox(all(), inboxFilter())));
   const flat = createMemo(() => groups().flatMap((g) => g.items));
@@ -169,24 +176,28 @@ export function InboxCard() {
   });
 
   const picked = () => { const k = inboxPick(); return k === null ? undefined : byKey().get(k); };
-  const decide = (action: "allow" | "deny") => {
+  /** A and D act on the approval card holding focus, else on the picked item's first approval. */
+  const decide = (action: "allow" | "deny", focused: string | null) => {
     const item = picked();
     if (!item?.thread_id) return;
-    const request = held.get(item.thread_id)?.transcript.pending().find((r) => r.kind === "approval");
+    const pending = held.get(item.thread_id)?.transcript.pending() ?? [];
+    const request = pending.find((r) => r.kind === "approval" && batchKey(item.thread_id!, r) === focused) ?? pending.find((r) => r.kind === "approval");
     if (request) void resolveApproval(item.thread_id, request, action);
   };
   const onKey = (e: KeyboardEvent) => {
     if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
-    if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+    // A batch checkbox keeps the inbox's keys (round 2, minor 7); a text field doesn't.
+    const checkbox = e.target instanceof HTMLInputElement && e.target.type === "checkbox";
+    if (e.target instanceof HTMLTextAreaElement || (e.target instanceof HTMLInputElement && !checkbox) || e.target instanceof HTMLSelectElement) return;
     const k = e.key.toLowerCase();
     const take = (f: () => void) => { e.preventDefault(); f(); };
     if (k === "j" || e.key === "ArrowDown") take(() => setInboxPick(moveSelection(keys(), inboxPick(), 1)));
     else if (k === "k" || e.key === "ArrowUp") take(() => setInboxPick(moveSelection(keys(), inboxPick(), -1)));
     // ↵ on a focused button presses that button.
     else if (e.key === "Enter" && !(e.target instanceof HTMLButtonElement)) take(() => { const id = picked()?.thread_id; if (id) openThread(id); });
-    else if (k === "a") take(() => decide("allow"));
-    else if (k === "d") take(() => decide("deny"));
-    else if (k === "x") take(() => { const id = picked()?.thread_id; const t = targets().find((x) => x.threadId === id); if (t) toggleSelected(t.key); });
+    else if (k === "a") take(() => decide("allow", focusedCardKey(e.target)));
+    else if (k === "d") take(() => decide("deny", focusedCardKey(e.target)));
+    else if (k === "x") take(() => { const keys = xKeys(targets(), focusedCardKey(e.target), picked()?.thread_id ?? null); if (keys.length) select(toggledGroup(selection(), keys)); });
   };
 
   return (
@@ -198,11 +209,11 @@ export function InboxCard() {
         <Seg label="Show" value={inboxFilter()} options={FILTERS} onChange={setInboxFilter} />
       </header>
       <Show when={targets().length || batchResult()}>
-        <div class="batch-bar" data-atrium-part="batch-bar">
+        <div class="batch-bar" data-atrium-part="batch-bar" onKeyDown={onKey}>
           <Show when={targets().length}>
             <label>
               <input type="checkbox" data-atrium-part="batch-all" checked={allState(selection(), offered()) === "all"} ref={(el) => createEffect(() => { el.indeterminate = allState(selection(), offered()) === "some"; })}
-                onChange={() => { setBatchResult(null); setSelection(selectAll(selection(), offered())); }} />
+                onChange={() => select(selectAll(selection(), offered()))} />
               Select all approvals ({targets().length})
             </label>
             <Spacer />
@@ -236,7 +247,7 @@ export function InboxCard() {
               <>
                 <div class="igrp">{GROUP_LABEL[name]}<span>{items().length}</span></div>
                 <For each={items().map(itemKey)}>
-                  {(key) => <Show when={byKey().get(key)}>{(item) => <Item item={item()} cards={withCards().has(key)} />}</Show>}
+                  {(key) => <Show when={byKey().get(key)}>{(item) => <Item item={item()} cards={withCards().has(key)} batch={batch} />}</Show>}
                 </For>
               </>
             );

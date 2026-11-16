@@ -116,6 +116,15 @@ export async function endSession(threadId: string): Promise<boolean> {
   }
 }
 
+/**
+ * Whether the main card should give way to the new-chat view: the chat it shows was in the list
+ * and has left it (archived from a pop-out, or by another client; round 2, minor 6). Not before
+ * the list has loaded, and not for a chat the list never had.
+ */
+export function mainChatLeft(mainThread: string | null, wasListed: string | null, listed: boolean, loaded: boolean): boolean {
+  return loaded && mainThread !== null && mainThread === wasListed && !listed;
+}
+
 /** Archives a thread: its session ends and it leaves every list (contract §10). */
 export async function archiveThread(threadId: string): Promise<boolean> {
   try {

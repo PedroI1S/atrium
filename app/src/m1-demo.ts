@@ -597,9 +597,12 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
   await waitFor("three approvals with checkboxes in the inbox", () => batchThreads.every((id) => daemon().threads[id]?.state.type === "needs_approval" && pickOf(id) !== null));
   await click("Select all approvals", () => document.querySelector<HTMLElement>('[data-atrium-part="batch-all"]'));
   await waitFor("all three selected", () => batchThreads.every((id) => pickOf(id)?.checked === true));
-  // Leave the third one out of the Allow batch.
-  pickOf(batchThreads[2]!)!.click();
+  // Leave the third one out of the Allow batch: X on its focused checkbox (round 2: the inbox's
+  // keys work from a checkbox, and X toggles the card that holds focus).
+  pickOf(batchThreads[2]!)!.focus();
+  key(pickOf(batchThreads[2]!)!, { key: "x" });
   await waitFor("two selected", () => pickOf(batchThreads[2]!)?.checked === false && document.querySelector('[data-atrium-part="batch-allow"]')?.textContent === "Allow once (2)");
+  const xFromCheckbox = pickOf(batchThreads[0]!)?.checked === true && pickOf(batchThreads[1]!)?.checked === true;
   await click("Allow once (2)", () => document.querySelector<HTMLElement>('[data-atrium-part="batch-allow"]'));
   await waitFor("the two allowed approvals to resolve", () => batchHolds.slice(0, 2).every((h) => approvalItems(h.model)[0]?.outcome === "approved"));
   await waitFor("the Allow summary", () => document.querySelector('[data-atrium-part="batch-result"]')?.textContent?.startsWith("Allowed 2.") === true);
@@ -609,11 +612,19 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
   await waitFor("the denied approval to resolve", () => approvalItems(batchHolds[2]!.model)[0]?.outcome === "denied");
   await waitFor("the Deny summary", () => document.querySelector('[data-atrium-part="batch-result"]')?.textContent?.startsWith("Denied 1.") === true);
   const denySummary = document.querySelector('[data-atrium-part="batch-result"]')?.textContent;
+  // Leaving the inbox drops the last result (round 2, minor 7).
+  setScreen("settings");
+  await waitFor("the inbox to close", () => document.querySelector('[data-atrium-part="inbox"]') === null);
+  setScreen("inbox");
+  await waitFor("the inbox again", () => document.querySelector('[data-atrium-part="inbox"]') !== null);
+  const resultAfterReturn = document.querySelector('[data-atrium-part="batch-result"]') !== null;
   await waitFor("the batch threads to finish their turns", () => batchThreads.every((id) => daemon().threads[id]?.state.type === "idle"));
   const outcomes = batchHolds.map((h) => approvalItems(h.model)[0]?.outcome);
   const toolStatuses = batchHolds.map((h) => toolItems(h.model)[0]?.status);
-  await check("11. Batch: select all, Allow once two together, Deny the third", outcomes.join() === "approved,approved,denied" && toolStatuses.join() === "succeeded,succeeded,denied", {
+  await check("11. Batch: select all, X unselects the third from its checkbox, Allow once two together, Deny the third; the result clears on leaving", outcomes.join() === "approved,approved,denied" && toolStatuses.join() === "succeeded,succeeded,denied" && xFromCheckbox && !resultAfterReturn, {
     outcomes,
+    xFromCheckbox,
+    resultAfterReturn,
     toolStatuses,
     allowSummary,
     denySummary,

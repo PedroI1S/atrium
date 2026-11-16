@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type BatchTarget, allState, batchKey, outcomeOf, pruned, selectAll, summarize, toggled } from "./batch";
+import { type BatchTarget, allState, batchKey, outcomeOf, pruned, selectAll, summarize, toggled, toggledGroup, xKeys } from "./batch";
 import type { ApprovalItem } from "./transcript";
 
 const target = (key: string, chat = "Chat"): BatchTarget => ({ key, threadId: key, request: {} as ApprovalItem, chat, subject: `cmd ${key}` });
@@ -49,5 +49,29 @@ describe("batch outcomes", () => {
     expect(summarize("deny", [{ target: target("a"), outcome: { ok: true } }]).text).toBe("Denied 1.");
     expect(summarize("deny", [{ target: target("a"), outcome: { ok: false, reason: "x" } }, { target: target("b"), outcome: { ok: false, reason: "y" } }]).text).toBe("2 weren't denied:");
     expect(summarize("allow", []).text).toBe("Nothing was selected.");
+  });
+});
+
+describe("the X key (round 2, nit 9)", () => {
+  const targets = [
+    { key: "t1:0:a", threadId: "t1" },
+    { key: "t1:0:b", threadId: "t1" },
+    { key: "t2:0:c", threadId: "t2" },
+  ];
+  it("toggles the focused approval card when it can be in the batch", () => {
+    expect(xKeys(targets, "t1:0:b", "t1")).toEqual(["t1:0:b"]);
+    expect(xKeys(targets, "t2:0:c", "t1")).toEqual(["t2:0:c"]);
+  });
+  it("otherwise toggles every approval of the picked chat, not just the first", () => {
+    expect(xKeys(targets, null, "t1")).toEqual(["t1:0:a", "t1:0:b"]);
+    expect(xKeys(targets, "t1:0:gone", "t1")).toEqual(["t1:0:a", "t1:0:b"]);
+    expect(xKeys(targets, null, "t3")).toEqual([]);
+    expect(xKeys(targets, null, null)).toEqual([]);
+  });
+  it("selects a group, or clears it when all of it is selected, leaving other keys alone", () => {
+    expect([...toggledGroup(new Set(["x"]), ["a", "b"])].sort()).toEqual(["a", "b", "x"]);
+    expect([...toggledGroup(new Set(["a", "x"]), ["a", "b"])].sort()).toEqual(["a", "b", "x"]);
+    expect([...toggledGroup(new Set(["a", "b", "x"]), ["a", "b"])]).toEqual(["x"]);
+    expect([...toggledGroup(new Set(["x"]), [])]).toEqual(["x"]);
   });
 });
