@@ -58,7 +58,8 @@ impl SavePick {
 }
 
 /// What the save dialog says under its title: an export never replaces a
-/// file.
+/// file. macOS only: GTK's chooser has no message line.
+#[cfg(target_os = "macos")]
 const SAVE_MESSAGE: &str = "Atrium never replaces a file: pick a new name.";
 
 /// Asks where to save a file named `name` (the user may change it). `None`

@@ -103,7 +103,7 @@ export default function RuleEditor(props: { onDone: () => void }) {
       </div>
       <Show when={isCommand()}>
         <TextField label="Command" part="command" placeholder={form().matcher === "command_prefix" ? "cargo test" : "rm -rf build"} value={form().command} error={error("command")}
-          hint={form().matcher === "command_prefix" ? "Matches a simple command whose words start with these, in order. Quote a word with spaces. Shells, wrappers like env or sudo, and inline code can't be allowed." : "Matches only this command, word for word."}
+          hint={form().matcher === "command_prefix" ? "Matches a simple command whose words start with these, in order. Quote a word with spaces. Shells, wrappers like env or sudo, and inline code can't be allowed; for python3, node and the like, put the script right after the command." : "Matches only this command, word for word."}
           onInput={(v) => set({ command: v })} />
       </Show>
       <Show when={form().matcher === "path_glob"}>

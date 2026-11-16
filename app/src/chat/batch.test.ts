@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type BatchTarget, allState, batchKey, outcomeOf, pruned, selectAll, summarize, toggled, toggledGroup, xKeys } from "./batch";
+import { type BatchTarget, allState, batchKey, outcomeOf, pruned, selectAll, summarize, toggled, keyTargets, toggledGroup } from "./batch";
 import type { ApprovalItem } from "./transcript";
 
 const target = (key: string, chat = "Chat"): BatchTarget => ({ key, threadId: key, request: {} as ApprovalItem, chat, subject: `cmd ${key}` });
@@ -52,21 +52,28 @@ describe("batch outcomes", () => {
   });
 });
 
-describe("the X key (round 2, nit 9)", () => {
+describe("what A, D and X act on (round 2 nit 9, round 3 blocker 2)", () => {
   const targets = [
     { key: "t1:0:a", threadId: "t1" },
     { key: "t1:0:b", threadId: "t1" },
     { key: "t2:0:c", threadId: "t2" },
   ];
-  it("toggles the focused approval card when it can be in the batch", () => {
-    expect(xKeys(targets, "t1:0:b", "t1")).toEqual(["t1:0:b"]);
-    expect(xKeys(targets, "t2:0:c", "t1")).toEqual(["t2:0:c"]);
+  const keys = (focused: string | null, thread: string | null, group: boolean) => keyTargets(targets, focused, thread, group).map((t) => t.key);
+  it("acts on the focused card only, even when another chat is picked", () => {
+    expect(keys("t1:0:b", "t1", true)).toEqual(["t1:0:b"]);
+    expect(keys("t1:0:b", "t1", false)).toEqual(["t1:0:b"]);
+    // Focus on another row's card: that card, never the picked chat's.
+    expect(keys("t2:0:c", "t1", false)).toEqual(["t2:0:c"]);
   });
-  it("otherwise toggles every approval of the picked chat, not just the first", () => {
-    expect(xKeys(targets, null, "t1")).toEqual(["t1:0:a", "t1:0:b"]);
-    expect(xKeys(targets, "t1:0:gone", "t1")).toEqual(["t1:0:a", "t1:0:b"]);
-    expect(xKeys(targets, null, "t3")).toEqual([]);
-    expect(xKeys(targets, null, null)).toEqual([]);
+  it("never falls back when the focused card can't be answered (answered, expired, gone)", () => {
+    expect(keys("t1:0:gone", "t1", false)).toEqual([]);
+    expect(keys("t1:0:gone", "t1", true)).toEqual([]);
+  });
+  it("with no card focused, acts on the picked chat's cards only", () => {
+    expect(keys(null, "t1", false)).toEqual(["t1:0:a"]);
+    expect(keys(null, "t1", true)).toEqual(["t1:0:a", "t1:0:b"]);
+    expect(keys(null, "t3", false)).toEqual([]);
+    expect(keys(null, null, true)).toEqual([]);
   });
   it("selects a group, or clears it when all of it is selected, leaving other keys alone", () => {
     expect([...toggledGroup(new Set(["x"]), ["a", "b"])].sort()).toEqual(["a", "b", "x"]);

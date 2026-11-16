@@ -53,12 +53,17 @@ export function toggledGroup(selection: ReadonlySet<string>, keys: readonly stri
 }
 
 /**
- * What the inbox's X toggles (round 2, nit 9): the approval card that holds focus, when it can be
- * in the batch; otherwise every approval of the picked item's chat that can.
+ * What the inbox's A, D and X act on (round 2 nit 9, round 3 blocker 2). With focus in an approval
+ * card, that card, if it can still be answered, and nothing else: never another card or another
+ * chat's. With no card focused, the picked chat's cards: the first for A and D (`group` false),
+ * every one for X (`group` true). `focusedKey` is the focused card's key, or null when focus
+ * isn't in an approval card.
  */
-export function xKeys(targets: readonly Pick<BatchTarget, "key" | "threadId">[], focusedKey: string | null, threadId: string | null): string[] {
-  if (focusedKey !== null && targets.some((t) => t.key === focusedKey)) return [focusedKey];
-  return threadId === null ? [] : targets.filter((t) => t.threadId === threadId).map((t) => t.key);
+export function keyTargets<T extends Pick<BatchTarget, "key" | "threadId">>(targets: readonly T[], focusedKey: string | null, threadId: string | null, group: boolean): T[] {
+  if (focusedKey !== null) return targets.filter((t) => t.key === focusedKey);
+  if (threadId === null) return [];
+  const mine = targets.filter((t) => t.threadId === threadId);
+  return group ? mine : mine.slice(0, 1);
 }
 
 export type ItemOutcome = { ok: true } | { ok: false; reason: string };

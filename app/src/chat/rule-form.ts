@@ -59,10 +59,12 @@ const MAX_TOOL_NAME_CHARS = 100;
 const MAX_GLOB_CHARS = 1000;
 const MAX_COMMAND_CHARS = 4000;
 
-// What a command allow rule must never be about (round 2, blocker 1). The policy engine
+// What a command allow rule must never be about (rounds 2 and 3, blocker 1). The policy engine
 // (`atrium-core` `policy/shell.rs`) reads the code a shell, `eval` or a wrapper runs as derived
 // units and drops their reasons, on the assumption that no rule allows a prefix of `sh`; an allow
 // rule matches the outer argv only. So a rule on any of these would allow whatever they run.
+// The check fails closed: names are folded the way the disk folds them, an option word counts as
+// inline code if it holds a code flag letter anywhere, and what it can't read is refused.
 
 /** `shell.rs` `SHELLS`. */
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh", "mksh", "yash", "rbash", "posh", "elvish", "xonsh"]);
@@ -70,74 +72,145 @@ const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh"
 const RUNS_HERE = new Set(["eval", "source", "."]);
 /**
  * The wrappers `shell.rs` `unwrap_reading` strips to find the command they run, and the ones
- * that run it as another user or in another root.
+ * that run it as another user or in another root (`deny.rs` `PRIV`, `chroot`, …).
  */
 const WRAPPERS = new Set([
   "time", "nohup", "builtin", "command", "setsid", "unbuffer", "caffeinate", "sandbox-exec", "exec", "nice", "ionice", "stdbuf", "xargs", "busybox", "toybox",
   "timeout", "chrt", "taskset", "arch", "chroot", "flock", "script", "env",
-  "sudo", "doas", "su", "runuser", "setpriv", "pkexec",
+  "sudo", "sudoedit", "doas", "su", "runuser", "setpriv", "pkexec", "run0",
 ]);
 /** `shell.rs` `COMMAND_RUNNERS`: run a command somewhere else (a host, a container). */
 const REMOTE_RUNNERS = new Set([
   "ssh", "mosh", "autossh", "nsenter", "unshare", "docker", "podman", "nerdctl", "kubectl", "oc", "lxc", "incus", "machinectl", "systemd-run", "systemd-nspawn",
   "firejail", "bwrap", "flatpak-spawn", "toolbox", "distrobox", "distrobox-enter", "multipass", "vagrant", "limactl", "colima", "parallel",
 ]);
-/** Interpreters, and how each is given code inline: short letters (also in a cluster, `perl -ne`), long options, subcommands. */
-const INLINE_CODE: Record<string, { short: string; long: readonly string[]; sub?: readonly string[] }> = {
-  python: { short: "c", long: [] },
-  node: { short: "ep", long: ["--eval", "--print"] },
-  deno: { short: "", long: [], sub: ["eval"] },
-  bun: { short: "ep", long: ["--eval", "--print"] },
-  ruby: { short: "e", long: [] },
-  perl: { short: "eE", long: [] },
-  php: { short: "rRBEF", long: ["--run", "--process-code", "--process-begin", "--process-end", "--process-file"] },
-  lua: { short: "e", long: [] },
-  osascript: { short: "e", long: [] },
-};
-/** Run scripts or packages whose content the rule doesn't pin. */
-const SCRIPT_RUNNERS = new Set(["npx", "pnpx", "bunx", "uvx", "pipx"]);
+
+interface Interpreter {
+  /** Short flags that take code (compared case-insensitively, anywhere in a `-…` word). */
+  short: string;
+  /** Long flags that take code, with or without `=…`. */
+  long: readonly string[];
+  /** Subcommands that take code (`deno eval`). */
+  sub: readonly string[];
+  /** Subcommands that come before the script, so they don't name it (`deno run`). */
+  verbs: readonly string[];
+}
+/** `deny.rs` `is_interpreter`, and how each is given code inline. Keys are folded names. */
+const INTERPRETERS = new Map<string, Interpreter>([
+  ["python", { short: "c", long: [], sub: [], verbs: [] }],
+  ["node", { short: "ep", long: ["--eval", "--print"], sub: [], verbs: [] }],
+  ["deno", { short: "", long: ["--eval", "--eval-file"], sub: ["eval", "repl"], verbs: ["run", "test", "task", "bench", "serve", "x", "install", "compile", "jupyter"] }],
+  ["bun", { short: "ep", long: ["--eval", "--print"], sub: ["eval", "repl"], verbs: ["run", "test", "x", "exec", "create", "build"] }],
+  ["ruby", { short: "e", long: [], sub: [], verbs: [] }],
+  ["perl", { short: "e", long: [], sub: [], verbs: [] }],
+  ["php", { short: "rbef", long: ["--run", "--process-code", "--process-begin", "--process-end", "--process-file"], sub: [], verbs: [] }],
+  ["lua", { short: "e", long: [], sub: [], verbs: [] }],
+  ["osascript", { short: "e", long: [], sub: [], verbs: [] }],
+]);
+/** PowerShell's options that take code; it accepts any unambiguous prefix, with `-`, `--` or `/`. */
+const PWSH_CODE = ["command", "encodedcommand", "commandwithargs"];
+const PWSH_SHORT = new Set(["c", "e", "ec", "cwa"]);
+/** Run a package or tool by name: the rule must name it. */
+const PACKAGE_RUNNERS = new Set(["npx", "pnpx", "bunx", "uvx", "pipx"]);
+/** `npx -c` / `--call` runs a shell command. */
+const RUNNER_CODE = new Set(["-c", "--call"]);
 /** `find` options that run a command for each file (`shell.rs` `find_exec_units`). */
 const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 
-const base = (word: string): string => word.split("/").pop() ?? word;
-const interpreterOf = (name: string): keyof typeof INLINE_CODE | null =>
-  /^python[0-9.]*$/.test(name) ? "python" : name in INLINE_CODE ? (name as keyof typeof INLINE_CODE) : null;
+/**
+ * A command name as the disk resolves it (macOS APFS is case-insensitive): the basename,
+ * lower-cased (which also folds K, U+212A, to k), with ſ (U+017F) folded to s, as `deny.rs` `lower`.
+ */
+export function foldName(word: string): string {
+  const b = word.split("/").pop() ?? word;
+  return b.toLowerCase().replaceAll("ſ", "s");
+}
+const isOption = (w: string): boolean => w.length > 1 && w.startsWith("-");
+
+function interpreterOf(name: string): { key: string; spec: Interpreter } | "pwsh" | null {
+  if (name === "pwsh" || name === "powershell" || name.startsWith("pwsh") || name.startsWith("powershell")) return "pwsh";
+  // `deny.rs` reads any name starting with `python` as Python (`python3.12`, `python3-dbg`).
+  const key = name.startsWith("python") ? "python" : name;
+  const spec = INTERPRETERS.get(key);
+  return spec ? { key, spec } : null;
+}
 
 export type CommandRisk = { refuse: string } | { warn: string } | null;
 
+const NAME_A_SCRIPT = "Name the script right after it, like python3 scripts/build.py, with no options before it: otherwise the rule would also allow code written on the command line.";
+
 /**
- * Whether an allow rule on this argv (a prefix or an exact command) would allow more than the
- * command it names. Refused: a shell, `eval`/`source`/`.`, a wrapper, an interpreter given code
- * inline, `find -exec`. Warned: an interpreter or a runner (it runs whatever script or package
- * it is given), `find`. Deny rules on any of them are fine.
+ * Whether an allow rule on this argv would allow more than the command it names. Fails closed.
+ * Refused, prefix or exact: a shell, `eval`/`source`/`.`, a wrapper, an interpreter or runner
+ * given code inline, PowerShell given code, `find -exec`. Refused for a prefix rule only: an
+ * interpreter, package runner or `find` with nothing after it that names the script, package or
+ * file (a prefix rule on `find` at all: it would also allow `-exec` added later). Warned: what
+ * the rule then allows still runs code it doesn't pin. Deny rules on any of them are fine.
  */
-export function commandRisk(argv: readonly string[]): CommandRisk {
+export function commandRisk(argv: readonly string[], matcher: "command_prefix" | "command_exact" = "command_prefix"): CommandRisk {
   const first = argv[0];
   if (first === undefined) return null;
-  const name = base(first);
+  const name = foldName(first);
+  const args = argv.slice(1);
+  const prefix = matcher === "command_prefix";
   if (SHELLS.has(name)) return { refuse: `A rule can't allow ${name}: it would allow every command run through it. Write the command itself.` };
   if (RUNS_HERE.has(name)) return { refuse: `A rule can't allow ${name}: it runs whatever text follows it. Write the command itself.` };
   if (WRAPPERS.has(name)) return { refuse: `A rule can't allow ${name}: it runs the command that follows it, and Atrium wouldn't check that one. Write the command without ${name}.` };
+
   const interp = interpreterOf(name);
-  if (interp !== null) {
-    const { short, long, sub } = INLINE_CODE[interp]!;
-    for (const [i, w] of argv.entries()) {
-      if (i === 0) continue;
-      if (w === "--") break;
-      const inline = long.some((l) => w === l || w.startsWith(`${l}=`))
-        || (short !== "" && /^-[A-Za-z]+$/.test(w) && [...w.slice(1)].some((c) => short.includes(c)))
-        || (i === 1 && sub?.includes(w) === true);
-      if (inline) return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line, and Atrium wouldn't check it.` };
+  if (interp === "pwsh") {
+    for (const w of args) {
+      const opt = w.toLowerCase().replace(/^(--?|\/)/, "");
+      if (w === opt) continue;
+      const bare = opt.split(/[:=]/)[0]!;
+      if (PWSH_SHORT.has(bare) || (bare !== "" && PWSH_CODE.some((c) => c.startsWith(bare)))) {
+        return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line, and Atrium wouldn't check it.` };
+      }
     }
-    return { warn: `This allows every script ${name} is given${argv.length > 1 ? " after these words" : ""}, whatever the script does.` };
+    // Windows PowerShell reads bare words as a command; pwsh as a file. Only a named .ps1 is clear.
+    if (!args.some((w) => !w.startsWith("-") && /\.ps1$/i.test(w))) return { refuse: `A rule can allow ${name} only with the script it runs, like ${name} -File build.ps1.` };
+    return { warn: `This allows the script ${name} runs, whatever the script does.` };
+  }
+  if (interp !== null) {
+    const { short, long, sub, verbs } = interp.spec;
+    const operands: string[] = [];
+    for (const w of args) {
+      const lw = w.toLowerCase();
+      if (lw.startsWith("--")) {
+        if (long.some((l) => lw === l || lw.startsWith(`${l}=`))) return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line, and Atrium wouldn't check it.` };
+      } else if (isOption(w)) {
+        // A flag letter anywhere in the word: `-c'code'` attached, `-0777ne`, `-Ic`.
+        if (short !== "" && [...lw.slice(1)].some((c) => short.includes(c))) return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line (${w} holds a code flag), and Atrium wouldn't check it.` };
+      } else operands.push(lw);
+    }
+    if (operands.includes("-")) return { refuse: `A rule can't allow ${name} -: it runs code read from its input, and Atrium wouldn't check it.` };
+    const subcommand = operands[0];
+    if (subcommand !== undefined && sub.includes(subcommand)) return { refuse: `A rule can't allow ${name} ${subcommand}: it runs code written on the command line, and Atrium wouldn't check it.` };
+    if (prefix) {
+      // The script must come right after the command (after a verb such as `deno run`, right
+      // after the verb): an interpreter reads its own options only before the script, so words
+      // added after it go to the script. An option before it could take code added later.
+      const at = verbs.length && args[0] !== undefined && verbs.includes(args[0].toLowerCase()) ? 1 : 0;
+      const named = args[at];
+      if (named === undefined || named.startsWith("-")) return { refuse: `A prefix rule can't allow ${argv.slice(0, at + 1).join(" ")}${named === undefined ? " alone" : ` ${named}`}. ${NAME_A_SCRIPT}` };
+    }
+    return { warn: `This allows the ${name} script it names${prefix ? ", with whatever arguments follow," : ""} whatever the script does.` };
+  }
+  if (PACKAGE_RUNNERS.has(name)) {
+    const code = args.find((w) => RUNNER_CODE.has(w.toLowerCase()) || w.toLowerCase().startsWith("--call="));
+    if (code) return { refuse: `A rule can't allow ${name} ${code}: it runs a shell command, and Atrium wouldn't check it.` };
+    // The package right after the runner, as for interpreters: an option before it could be `-c` added later.
+    if (prefix && (args[0] === undefined || args[0].startsWith("-"))) return { refuse: `A prefix rule on ${name} must name the package right after it, like ${name} prettier, with no options before it.` };
+    return { warn: `This allows the package ${name} runs, whatever it does.` };
   }
   if (name === "find") {
-    const exec = argv.find((w) => FIND_EXEC.has(w));
+    const exec = args.find((w) => FIND_EXEC.has(w.toLowerCase()));
     if (exec) return { refuse: `A rule can't allow find ${exec}: it runs another command for each file, and Atrium wouldn't check that one.` };
-    return { warn: "This also allows find … -exec and -delete, which run commands or delete files." };
+    if (prefix) return { refuse: "A prefix rule on find would also allow find … -exec or -delete added after it: use “This exact command” instead." };
+    if (args.some((w) => w.toLowerCase() === "-delete")) return { warn: "This allows find to delete what it matches." };
+    return null;
   }
   if (REMOTE_RUNNERS.has(name)) return { warn: `This allows whatever ${name} runs (on a host, in a container), whatever follows these words.` };
-  if (SCRIPT_RUNNERS.has(name)) return { warn: `This allows every package ${name} runs, whatever it does.` };
   return null;
 }
 
@@ -155,8 +228,30 @@ export type Split = { ok: true; argv: string[] } | { ok: false; error: string };
  * command not simple (operators, redirects, `$`, backquotes, unquoted globs, brace expansion,
  * a leading NAME=value) is refused: no rule would ever match it.
  */
+/**
+ * Whether the `{` at `at` starts a brace expansion as `shell.rs` reads it: a `,` or `..` at depth
+ * 1 before its `}`, counting nested braces, stopping at a blank or an operator; too far to tell
+ * (256 characters) counts as one.
+ */
+export function expandsBraces(line: string, at: number): boolean {
+  let depth = 1;
+  let has = false;
+  for (let j = at + 1; j < line.length && depth > 0; j++) {
+    if (j - at > 256) return true;
+    const c = line[j]!;
+    if (c === "{") depth++;
+    else if (c === "}") depth--;
+    else if (c === "," && depth === 1) has = true;
+    else if (c === "." && depth === 1 && line[j + 1] === ".") has = true;
+    else if (" \t\n;&|".includes(c)) break;
+  }
+  return depth === 0 && has;
+}
+
 export function splitCommand(line: string): Split {
   if (line.length > MAX_COMMAND_CHARS) return { ok: false, error: "The command is too long" };
+  // The engine never allows a command holding a line break, quoted or not.
+  if (/[\n\r]/.test(line)) return { ok: false, error: "A rule matches one line: remove the line break" };
   // The policy's lexer refuses control characters (but tab, which splits words, and the line
   // breaks below) and the Unicode line and paragraph separators.
   if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]/.test(line)) return { ok: false, error: "Remove the control character: a command with one never matches a rule" };
@@ -215,11 +310,7 @@ export function splitCommand(line: string): Split {
     if (";&|<>()".includes(c)) return fail("A rule matches one simple command: remove ; & | < > ( )");
     if (c === "$" || c === "`") return fail("Rules match commands as written: remove $ and backquotes");
     if ("*?[".includes(c)) return fail("Quote * ? [ to match them literally: a command with a glob never matches a rule");
-    if (c === "{") {
-      const close = line.indexOf("}", i);
-      const inner = close < 0 ? "" : line.slice(i + 1, close);
-      if (inner.includes(",") || inner.includes("..")) return fail("Quote { } to match it literally: brace expansion never matches a rule");
-    }
+    if (c === "{" && expandsBraces(line, i)) return fail("Quote { } to match it literally: brace expansion never matches a rule");
     if (c === "~" && !inWord) {
       const next = line[i + 1];
       if (next !== undefined && next !== "/" && next !== " " && next !== "\t") return fail("~name isn't supported: write the full path");
@@ -256,6 +347,10 @@ export function globSyntaxError(glob: string): string | null {
     else if (c === "}") {
       if (--depth < 0) return "A } has no {";
     } else if (c === "[") {
+      // globset 0.4.21 `parse_class`, checked by building globs with it (round 3): no escapes
+      // inside a class (`[\]` is a class holding a backslash); a leading `]` or `-` is literal; a `-`
+      // after a range extends that range from its start, so `[a-c-e]` builds and `[a-z-_]`
+      // doesn't (`_` sorts before `a`).
       let k = i + 1;
       if (cs[k] === "!" || cs[k] === "^") k++;
       let first = true;
@@ -305,7 +400,7 @@ export function checkGlob(input: string, home: string | null): Glob {
 }
 
 /**
- * Whether "Only for paths inside" can be set (round 2, blocker 2). The engine checks a path scope
+ * Whether "Only for paths inside" can be set (round 2 blocker 2, round 3 major 3). The engine checks a path scope
  * against every path of the call, a command's working folder included, and with `all` for deny
  * rules too. So it is offered only on allow rules about file calls: on a command rule it would
  * never match in a Home chat (cwd = ~), and on a deny rule it would let a call through as soon as
@@ -313,8 +408,10 @@ export function checkGlob(input: string, home: string | null): Glob {
  */
 export function pathScopeOffered(form: Pick<RuleForm, "decision" | "matcher" | "toolKind">): boolean {
   if (form.decision !== "allow") return false;
-  if (form.matcher === "path_glob") return true;
-  return form.matcher === "any" && form.toolKind !== "execute" && ANY_KINDS.includes(form.toolKind);
+  // File calls only (round 3, major 3): web requests, MCP and other calls have no paths the
+  // engine reads, so a limit there would never match.
+  // A path rule's kind is always a file kind (validateRule makes it one).
+  return form.matcher === "path_glob" || (form.matcher === "any" && PATH_KINDS.includes(form.toolKind));
 }
 
 /** How much of the disk a glob covers, when it is everything or the whole home folder. */
@@ -351,7 +448,7 @@ export function validateRule(form: RuleForm, ctx: { home: string | null; threadE
       const split = splitCommand(form.command.trim());
       if (!split.ok) errors.command = split.error;
       else {
-        const risk = form.decision === "allow" ? commandRisk(split.argv) : null;
+        const risk = form.decision === "allow" ? commandRisk(split.argv, form.matcher) : null;
         if (risk && "refuse" in risk) errors.command = risk.refuse;
         else {
           matcher = { type: form.matcher, argv: split.argv };

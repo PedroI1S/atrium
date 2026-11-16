@@ -604,10 +604,33 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
   await waitFor("all three selected", () => batchThreads.every((id) => pickOf(id)?.checked === true));
   // Leave the third one out of the Allow batch: X on its focused checkbox (round 2: the inbox's
   // keys work from a checkbox, and X toggles the card that holds focus).
+  const pickedRow = () => document.querySelector<HTMLElement>('[data-atrium-part="inbox-item"].on')?.dataset.thread;
   pickOf(batchThreads[2]!)!.focus();
+  // Round 3 blocker 2: focus moving into a row picks it.
+  await waitFor("focus to pick the third row", () => pickedRow() === batchThreads[2]);
   key(pickOf(batchThreads[2]!)!, { key: "x" });
   await waitFor("two selected", () => pickOf(batchThreads[2]!)?.checked === false && document.querySelector('[data-atrium-part="batch-allow"]')?.textContent === "Allow once (2)");
   const xFromCheckbox = pickOf(batchThreads[0]!)?.checked === true && pickOf(batchThreads[1]!)?.checked === true;
+  // J from a checkbox moves the pick and focus together; X then toggles the newly picked row,
+  // never the row whose checkbox had focus.
+  pickOf(batchThreads[0]!)!.focus();
+  await waitFor("focus to pick the first row", () => pickedRow() === batchThreads[0]);
+  key(pickOf(batchThreads[0]!)!, { key: "j" });
+  await waitFor("J to move the pick", () => pickedRow() !== batchThreads[0]);
+  const afterJ = pickedRow();
+  const focusOnList = document.activeElement === document.querySelector('[data-atrium-part="inbox"]');
+  const before = batchThreads.map((id) => pickOf(id)?.checked);
+  key(document.activeElement ?? document.body, { key: "x" });
+  const pickedBatch = afterJ !== undefined && batchThreads.includes(afterJ);
+  if (pickedBatch) await waitFor("X to toggle the picked row", () => pickOf(afterJ)?.checked !== before[batchThreads.indexOf(afterJ)]);
+  else await sleep(SAMPLE_GAP_MS);
+  // Only the picked row changed (or nothing, when the picked row has no approval).
+  const othersKept = batchThreads.every((id, i) => id === afterJ || pickOf(id)?.checked === before[i]);
+  if (pickedBatch) {
+    key(document.activeElement ?? document.body, { key: "x" });
+    await waitFor("X again to restore it", () => batchThreads.every((id, i) => pickOf(id)?.checked === before[i]));
+  }
+  const jThenX = focusOnList && othersKept;
   await click("Allow once (2)", () => document.querySelector<HTMLElement>('[data-atrium-part="batch-allow"]'));
   await waitFor("the two allowed approvals to resolve", () => batchHolds.slice(0, 2).every((h) => approvalItems(h.model)[0]?.outcome === "approved"));
   await waitFor("the Allow summary", () => document.querySelector('[data-atrium-part="batch-result"]')?.textContent?.startsWith("Allowed 2.") === true);
@@ -626,9 +649,13 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
   await waitFor("the batch threads to finish their turns", () => batchThreads.every((id) => daemon().threads[id]?.state.type === "idle"));
   const outcomes = batchHolds.map((h) => approvalItems(h.model)[0]?.outcome);
   const toolStatuses = batchHolds.map((h) => toolItems(h.model)[0]?.status);
-  await check("11. Batch: select all, X unselects the third from its checkbox, Allow once two together, Deny the third; the result clears on leaving", outcomes.join() === "approved,approved,denied" && toolStatuses.join() === "succeeded,succeeded,denied" && xFromCheckbox && !resultAfterReturn, {
+  await check("11. Batch: select all, X unselects the third from its checkbox, J from a checkbox then X acts on the new pick, Allow once two together, Deny the third; the result clears on leaving", outcomes.join() === "approved,approved,denied" && toolStatuses.join() === "succeeded,succeeded,denied" && xFromCheckbox && jThenX && !resultAfterReturn, {
     outcomes,
     xFromCheckbox,
+    jThenX,
+    afterJ,
+    pickedBatch,
+    focusOnList,
     resultAfterReturn,
     toolStatuses,
     allowSummary,

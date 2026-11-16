@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PATH_KINDS, broadGlob, checkGlob, commandRisk, emptyRuleForm, globSyntaxError, pathScopeOffered, type RuleForm, splitCommand, validateRule } from "./rule-form";
+import { PATH_KINDS, broadGlob, expandsBraces, foldName, checkGlob, commandRisk, emptyRuleForm, globSyntaxError, pathScopeOffered, type RuleForm, splitCommand, validateRule } from "./rule-form";
 
 const HOME = "/Users/me";
 const ctx = { home: HOME, threadExists: (id: string) => id === "t1" };
@@ -75,7 +75,7 @@ describe("rules editor: the draft", () => {
   });
   it("warns when an allow rule is broader than it may look", () => {
     const runner = validateRule(form({ command: "python3 scripts/build.py" }), ctx);
-    expect(runner.ok && runner.warnings[0]).toMatch(/every script python3 is given after these words/);
+    expect(runner.ok && runner.warnings[0]).toMatch(/python3 script it names, with whatever arguments follow/);
     const every = validateRule(form({ matcher: "any", toolKind: "execute" }), ctx);
     expect(every.ok && every.warnings).toEqual(["This allows every command without asking."]);
     const root = validateRule(form({ matcher: "path_glob", glob: "/**" }), ctx);
@@ -118,15 +118,17 @@ describe("rules editor: allow rules on shells, wrappers and inline code (round 2
       expect(refused(c), c).toBe(true);
     }
   });
-  it("warns, whatever the argv length, on interpreters, script and remote runners, and find", () => {
-    for (const c of ["python3", "python3 -m pytest", "node", "node build.js", "npx", "npx -y prettier", "ssh host", "docker", "docker run img", "find", "find . -name x"]) {
+  it("warns on interpreters and runners that name their script or package, and on remote runners", () => {
+    for (const c of ["python3 scripts/build.py", "node build.js", "npx prettier", "ssh host", "docker", "docker run img", "deno run x.ts", "bun x.ts"]) {
       const v = validateRule(form({ command: c }), ctx);
       expect(v.ok && v.warnings.length, c).toBe(1);
     }
-    expect(commandRisk(["deno", "run", "x.ts"])).toMatchObject({ warn: expect.any(String) });
-    expect(commandRisk(["python3", "--", "-c"])).toMatchObject({ warn: expect.any(String) });
     expect(commandRisk(["cargo", "test"])).toBeNull();
     expect(commandRisk(["git", "-c", "x=y", "status"])).toBeNull();
+    // Exact rules can name the interpreter's options: nothing can be added after them.
+    expect(commandRisk(["python3", "-m", "pytest"], "command_exact")).toMatchObject({ warn: expect.any(String) });
+    expect(commandRisk(["find", ".", "-name", "x"], "command_exact")).toBeNull();
+    expect(commandRisk(["find", ".", "-delete"], "command_exact")).toMatchObject({ warn: expect.any(String) });
   });
   it("allows deny rules on all of them", () => {
     for (const c of ["bash", "sh -c", "sudo", "env", "python3 -c", "find . -exec"]) {
@@ -188,5 +190,89 @@ describe("rules editor: where a path limit is offered (round 2, blocker 2)", () 
     }
     // An invalid leftover limit doesn't block a rule that can't have one.
     expect(validateRule(form({ command: "cargo test", pathScope: "relative" }), ctx).ok).toBe(true);
+  });
+});
+
+describe("rules editor: the allow check fails closed (round 3, blocker 1)", () => {
+  const refused = (command: string, matcher: "command_prefix" | "command_exact" = "command_prefix") => {
+    const v = validateRule(form({ matcher, command }), ctx);
+    return !v.ok && v.errors.command !== undefined;
+  };
+  it("folds names as the disk does: case, ſ and K (U+212A), any folder", () => {
+    for (const c of ["/bin/BASH -c 'ls'", "Bash -c x", "/usr/bin/ENV ls", "SUDO ls", "Python3 -c 'x'", "/bin/baſh", "/bin/\u212Ash", "FIND . -exec rm {} +", "Find . -EXEC rm {} +", "EVAL x", "Source x", "NoHup make", "RUN0 ls", "/usr/bin/SUDOEDIT f", "PERL -E x"]) {
+      expect(refused(c), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+  });
+  it("never trips on Object.prototype names", () => {
+    for (const c of ["constructor x", "toString", "__proto__ x", "hasOwnProperty", "valueOf -c"]) {
+      expect(() => validateRule(form({ command: c }), ctx), c).not.toThrow();
+      expect(validateRule(form({ command: c }), ctx).ok, c).toBe(true);
+    }
+  });
+  it("finds a code flag anywhere in an option word: attached code, digit clusters, any case", () => {
+    for (const c of [`python3 -c'import os; os.system("sh")'`, `python3 -c"print(1)"`, "python3 -Ic x", "python3 -IC x", `node -e"1"`, "node -pe 1", "node --EVAL=1", "node --print", `perl -e'system("sh")'`, `perl -0e 'x'`, `perl -0777ne 'x'`, `ruby -0e 'x'`, `ruby -e'x'`, `php -r'x;'`, `lua -e'x'`, "osascript -e x", "bun -e 1", "bun --eval=1", "python3.12 -c x", "python3-dbg -c x"]) {
+      expect(refused(c), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+  });
+  it("checks the subcommand on the first word that isn't an option", () => {
+    for (const c of ["deno eval 1", "deno -q eval 1", "deno --quiet eval 1", "bun eval 1", "bun --silent eval 1", "deno repl --eval 1", "Deno EVAL 1"]) {
+      expect(refused(c), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+  });
+  it("refuses PowerShell given code, by any prefix PowerShell accepts", () => {
+    for (const c of ["pwsh -c x", "pwsh -Command x", "pwsh -com x", "pwsh --command x", "pwsh /c x", "pwsh -EncodedCommand AA", "pwsh -ec AA", "pwsh -e AA", "pwsh -en AA", "pwsh -cwa x", "pwsh -CommandWithArgs x", "powershell -NoProfile -Command x", "pwsh.exe -c x", "pwsh -command:x"]) {
+      expect(refused(c), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+    // Only a named script is clear: Windows PowerShell reads bare words as a command.
+    expect(refused("pwsh")).toBe(true);
+    expect(refused("powershell build")).toBe(true);
+    expect(refused("pwsh -File build.ps1")).toBe(false);
+    expect(refused("pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1")).toBe(false);
+  });
+  it("refuses deny.rs's PRIV wrappers", () => {
+    for (const c of ["run0 ls", "sudoedit /etc/hosts", "pkexec ls", "doas ls", "su -c x"]) expect(refused(c), c).toBe(true);
+  });
+  it("refuses a prefix rule on an interpreter, runner or find unless the script, package or file comes right after it", () => {
+    for (const c of ["python3", "python3 -u", "python3 -m pytest", "python3 -W ignore", "python3 -- x.py", "node", "node --inspect", "perl", "deno", "deno run", "deno run --allow-all x.ts", "bun", "bun run", "bun test", "npx", "npx -y prettier", "npx -p pkg cmd", "uvx", "find", "find .", "find . -name x", "python3 -", "python3 x.py -"]) {
+      expect(refused(c), c).toBe(true);
+    }
+    for (const c of ["python3 scripts/build.py", "python3 x.py --flag", "node build.js", "deno run x.ts", "bun run build", "npx prettier --write", "uvx ruff"]) {
+      expect(refused(c), c).toBe(false);
+    }
+    // Fail closed: a code flag anywhere counts, even after the script (where it is the script's).
+    expect(refused("perl tool.pl -e", "command_exact")).toBe(true);
+    // Exact rules can't grow, so options are fine there.
+    for (const c of ["python3 -m pytest", "python3 -u build.py", "npx -y prettier", "find . -name x"]) expect(refused(c, "command_exact"), c).toBe(false);
+    for (const c of ["npx -c 'sh'", "npx --call=x", "pnpx -c x"]) expect(refused(c, "command_exact"), c).toBe(true);
+  });
+  it("explains the rule in the error text", () => {
+    const v = validateRule(form({ command: "python3 -u" }), ctx);
+    expect(!v.ok && v.errors.command).toMatch(/right after it, like python3 scripts\/build.py/);
+    const f = validateRule(form({ command: "find ." }), ctx);
+    expect(!f.ok && f.errors.command).toMatch(/This exact command/);
+    expect(foldName("/usr/bin/Baſh")).toBe("bash");
+    expect(foldName("\u212Ash")).toBe("ksh");
+  });
+});
+
+describe("rules editor: round 3 minors", () => {
+  it("refuses a line break anywhere, quoted too", () => {
+    for (const c of ["echo 'a\nb'", 'echo "a\rb"', "a\nb"]) expect(splitCommand(c), JSON.stringify(c)).toEqual({ ok: false, error: "A rule matches one line: remove the line break" });
+  });
+  it("reads brace expansion with nested braces, as shell.rs does", () => {
+    for (const bad of ["echo {{a},b}", "echo {a,{b}}", "echo {1..3}", "echo x{a,b}y"]) expect(splitCommand(bad).ok, bad).toBe(false);
+    for (const good of ["echo {}", "echo {a}", "echo {{a}}", "find . -exec x {} +", "echo {a b,c}"]) expect(splitCommand(good).ok, good).toBe(true);
+    expect(expandsBraces("{{a},b}", 0)).toBe(true);
+    expect(expandsBraces("{{a},b}", 1)).toBe(false);
+  });
+  it("matches globset 0.4.21 on classes (checked by building each glob with it)", () => {
+    // globset refuses these ("invalid range"): a `-` after a range extends it from its start.
+    for (const bad of ["/a/[a-z-_]", "/a/[a-z-0]", "/a/[\\"]) expect(globSyntaxError(bad), bad).not.toBeNull();
+    // and builds these: no escapes inside a class.
+    for (const good of ["/a/[\\]", "/a/[\\]]", "/a/[a-c-e]", "/a/[a-c-b]", "/a/[a\\-z]"]) expect(globSyntaxError(good), good).toBeNull();
   });
 });

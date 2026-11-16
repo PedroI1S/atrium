@@ -5,7 +5,7 @@
 // Keyboard: J / K move, ↵ opens the chat, A allows once, D denies, X selects.
 
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, untrack } from "solid-js";
-import { type BatchSummary, type BatchTarget, allState, batchKey, outcomeOf, pruned, selectAll, summarize, toggled, toggledGroup, xKeys } from "../chat/batch";
+import { type BatchSummary, type BatchTarget, allState, batchKey, outcomeOf, pruned, selectAll, summarize, keyTargets, toggled, toggledGroup } from "../chat/batch";
 import { GROUP_LABEL, type InboxFilter, filterInbox, groupInbox, itemKey, moveSelection, needsYouCount } from "../chat/inbox";
 import { canAct, cardState, subjectOf } from "../chat/requests";
 import { type ThreadModel, holdThread, localOf, resolveApproval } from "../chat/threads";
@@ -90,7 +90,10 @@ function Item(props: { item: InboxItem; cards: boolean; batch: Batch }) {
     if (inboxPick() === key()) row.scrollIntoView({ block: "nearest" });
   });
   return (
-    <div class="item" role="listitem" ref={row} classList={{ on: inboxPick() === key() }} data-atrium-part="inbox-item" data-reason={props.item.reason} data-thread={props.item.thread_id ?? undefined} onPointerDown={() => setInboxPick(key())}>
+    <div class="item" role="listitem" ref={row} classList={{ on: inboxPick() === key() }} data-atrium-part="inbox-item" data-reason={props.item.reason} data-thread={props.item.thread_id ?? undefined} onPointerDown={() => setInboxPick(key())}
+      // Focus moving into the row (Tab into a card, a checkbox) picks it, so the pick and the
+      // focused card are never in different rows (round 3, blocker 2).
+      onFocusIn={() => setInboxPick(key())}>
       <div class="body">
         <button type="button" class="open" disabled={props.item.thread_id === null} title={props.item.thread_id ? "Open the chat" : undefined} onFocus={() => setInboxPick(key())} onClick={() => props.item.thread_id && openThread(props.item.thread_id)}>
           <Dot tone={reason().tone} />
@@ -176,13 +179,15 @@ export function InboxCard() {
   });
 
   const picked = () => { const k = inboxPick(); return k === null ? undefined : byKey().get(k); };
-  /** A and D act on the approval card holding focus, else on the picked item's first approval. */
+  /** A and D: the focused approval card, or with none focused the picked chat's first (`keyTargets`). */
   const decide = (action: "allow" | "deny", focused: string | null) => {
-    const item = picked();
-    if (!item?.thread_id) return;
-    const pending = held.get(item.thread_id)?.transcript.pending() ?? [];
-    const request = pending.find((r) => r.kind === "approval" && batchKey(item.thread_id!, r) === focused) ?? pending.find((r) => r.kind === "approval");
-    if (request) void resolveApproval(item.thread_id, request, action);
+    const [t] = keyTargets(targets(), focused, picked()?.thread_id ?? null, false);
+    if (t) void resolveApproval(t.threadId, t.request, action);
+  };
+  /** J and K move the pick, and focus with it: focus never stays in the row left behind. */
+  const move = (by: 1 | -1) => {
+    setInboxPick(moveSelection(keys(), inboxPick(), by));
+    list.focus({ preventScroll: true });
   };
   const onKey = (e: KeyboardEvent) => {
     if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
@@ -191,13 +196,13 @@ export function InboxCard() {
     if (e.target instanceof HTMLTextAreaElement || (e.target instanceof HTMLInputElement && !checkbox) || e.target instanceof HTMLSelectElement) return;
     const k = e.key.toLowerCase();
     const take = (f: () => void) => { e.preventDefault(); f(); };
-    if (k === "j" || e.key === "ArrowDown") take(() => setInboxPick(moveSelection(keys(), inboxPick(), 1)));
-    else if (k === "k" || e.key === "ArrowUp") take(() => setInboxPick(moveSelection(keys(), inboxPick(), -1)));
+    if (k === "j" || e.key === "ArrowDown") take(() => move(1));
+    else if (k === "k" || e.key === "ArrowUp") take(() => move(-1));
     // ↵ on a focused button presses that button.
     else if (e.key === "Enter" && !(e.target instanceof HTMLButtonElement)) take(() => { const id = picked()?.thread_id; if (id) openThread(id); });
     else if (k === "a") take(() => decide("allow", focusedCardKey(e.target)));
     else if (k === "d") take(() => decide("deny", focusedCardKey(e.target)));
-    else if (k === "x") take(() => { const keys = xKeys(targets(), focusedCardKey(e.target), picked()?.thread_id ?? null); if (keys.length) select(toggledGroup(selection(), keys)); });
+    else if (k === "x") take(() => { const ks = keyTargets(targets(), focusedCardKey(e.target), picked()?.thread_id ?? null, true).map((t) => t.key); if (ks.length) select(toggledGroup(selection(), ks)); });
   };
 
   return (
