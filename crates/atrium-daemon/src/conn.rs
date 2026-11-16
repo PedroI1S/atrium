@@ -511,9 +511,13 @@ pub(crate) async fn write_loop(conn: &Conn, mut writer: OwnedWriteHalf) {
             }
             std::io::Result::Ok(())
         };
-        match tokio::time::timeout(WRITE_STALL, writing).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(_) => break,
+        tokio::select! {
+            biased;
+            () = conn.closed() => break,
+            res = tokio::time::timeout(WRITE_STALL, writing) => match res {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => break,
+            },
         }
     }
     conn.close();
