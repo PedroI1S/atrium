@@ -770,3 +770,6 @@ Pedro chose "Reopen them" for the limits recorded before D-120. Each goes into a
 - **K10** (slow `*/..` globs): M1-31, widened to the glob normalizer.
 - **The M1-23 escalations** (path-scope semantics, `find -exec` and inline code under prefix rules, no daemon-side `CreateRule` guard): M1-29 (queued, not started), widened to the engine's rule matchers and the daemon's `create_rule`; its reviewer becomes Opus (security).
 The running tasks (M1-27, M1-30, M1-31) take the added scope in their next round, before their review.
+
+## D-122 — 2026-11-16 — Pedro: fold the open follow-up minors into M1-28
+Pedro chose "Yes, fold them in" for the minors and nits still open in the reviews of tasks merged before D-120: M1-22 (login-shell `PATH`, the daemon's piped stderr, two nits), M1-24 (log every error in a batch), M1-25 (a damaged plus open message test), M1-26 (parallel withdrawals under one deadline, tickets leaked by `clear_requests`, a fake-provider `tool_result` test), and a check that M1-21's findings were all addressed. They go into M1-28 (queued, not started), widened to those paths; no new task.

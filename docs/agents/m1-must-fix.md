@@ -136,6 +136,16 @@ Rounds 3–8 worked through S2–S13 (the handoff says how each was handled); S1
 | K6 | — | 🟡 M1-18 covered CR-12's list; finding 6 stays ignored for the four stores CR-17 adds (post-M1-18 batch). On merged `dev`, 7 tests are still ignored. 6 are marked `#[ignore = "M1-13 finding N"]`: findings 4 (S7), 5 (S8), 6 (S1, CR-12), 10 (S11), and 11 (S5) twice. Fixing a finding means un-ignoring its test. |
 | K5 | minor | 🟡 **In M1-32** (D-119, reopened D-121). `rg -L pat` with no folder, run from a working folder that holds a link into `~/.ssh`, is a hard deny (`dev`: Ask/Allow/Allow). This is round 6's design, not a regression from the fix. |
 
+### Open minors from merged reviews (D-122, in M1-28)
+
+| # | Sev. | Item |
+|---|---|---|
+| F1 | minor | 🟡 **In M1-28.** M1-22: merge the login shell's `PATH` (nvm, asdf, mise); the daemon's piped stderr can fill; two nits. |
+| F2 | minor | 🟡 **In M1-28.** M1-24: `client.ts` logs only the first error in a batch. |
+| F3 | minor | 🟡 **In M1-28.** M1-25: no test with a damaged message plus one still open. |
+| F4 | minor | 🟡 **In M1-28.** M1-26: withdrawals awaited one at a time; `clear_requests` can leak a ticket; no fake-provider `tool_result` test. |
+| F5 | — | 🟡 **In M1-28.** M1-21: confirm every review finding was addressed in `fdabc1b8`. |
+
 ### M1-23's escalations (reopened by D-121, in M1-29)
 
 | # | Sev. | Limit |
