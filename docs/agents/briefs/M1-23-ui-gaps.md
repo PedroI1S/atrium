@@ -63,3 +63,17 @@ Review: `docs/agents/reviews/M1-23-ui-gaps.md` (verdict rework). The orchestrato
 5. New tests for each; demo still 3 runs in a row; update screenshots that changed; append a "Round 2" section to the handoff.
 
 Escalate (don't do): any change to the daemon, protocol or policy crates, including a daemon-side `CreateRule` guard.
+
+## Round 3 (D-116): fail-closed rule check, Inbox targeting
+Review: `docs/agents/reviews/M1-23-ui-gaps-round2.md` (rework). Fix, on the same branch:
+1. **Blocker 1, fail closed.** Rework `commandRisk` so it doesn't depend on listing spellings:
+   - Fold every command name before comparing: basename, lowercase, and the APFS folds `deny.rs` uses (`ſ`→`s`, `K` (U+212A)→`k`; read `deny.rs` for the full set). Use `Object.hasOwn` (or a `Map`) for every table lookup.
+   - For an interpreter, refuse an allow rule if any option word (starting with `-`, not `--`) contains an inline-code flag letter anywhere in it, whatever comes before or after (attached code, digit clusters like `-0e`, `-0777ne`); match long flags with or without `=`, case-insensitively; and check the subcommand (`eval`, …) on the first non-option word, not only `argv[1]`. Add `bun eval`, `pwsh`/`powershell` (`-c`, `-command`, `-encodedcommand`, `-ec`, `-e`, prefixes PowerShell accepts), `run0`, `sudoedit`, and anything else `deny.rs`'s `is_interpreter` and `PRIV` list.
+   - Refuse `command_prefix` allow rules on interpreters, `npx`-style runners and `find` unless the rule names a script, package or path after the command (so `python3 scripts/build.py` is fine, `python3` alone or `python3 -u` isn't; `find` alone or `find .` isn't). Pick a clear rule and explain it in the error text.
+   - When in doubt, refuse with a clear message. Add tests for every spelling in the review plus case/APFS variants.
+2. **Blocker 2, Inbox targeting.** `A`/`D`/`X` act only on the card with keyboard focus, or, with no card focused, on the picked thread's card; never fall back across threads. Keep `inboxPick` in step with focus (`onFocusIn` on the row) and move focus with `J`/`K`. Tests for: focus on another row's card, `J` from a checkbox then `X`/`A`.
+3. **Major 3.** Offer "Only for paths inside" only for allow rules on file-call kinds (`PATH_KINDS`).
+4. **Minors 4-5.** `#[cfg(target_os = "macos")]` on `SAVE_MESSAGE`; the glob class fixes (`[a-z-_]`, `\` inside a class); refuse line breaks; brace depth in `splitCommand`.
+5. Tests, demo 3 runs in a row, a "Round 3" section in the handoff. Try regenerating the screenshots (`/usr/bin/lockf -k /tmp/atrium-gui-measure.lock python3 app/scripts/screenshots.py docs/agents/handoffs/M1-23-ui-gaps gaps`, then delete `gaps.log`); if the screen is locked again, say so.
+
+Escalate (don't do): the engine matching shell and wrapper names case-sensitively (`shell.rs`), so `/bin/BASH -c '…'` payloads aren't read even without a rule; a daemon-side `CreateRule` guard.

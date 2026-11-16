@@ -739,3 +739,6 @@ Asked how M1-18 should finish after Argon's round-4 review (two "same as dev" bl
 
 ## D-115 — 2026-11-16 — Pedro: one more M1-18 round
 After Argon's review of fix round 4 (all 20 lines closed, 0 regressions vs dev; two "same as dev" edge cases left and a nit; `docs/agents/reviews/M1-18-policy-followup-round5.md`), Pedro chose "One more round" over merging with known limits (the orchestrator had recommended merging). Fix round 5 goes to Gemini 4 Hydrogen `high`; Argon reviews it.
+
+## D-116 — 2026-11-16 — Pedro: M1-23 round 3, fail-closed rule check
+After Argon's review of M1-23 round 2 (rework: the rules editor's refusal misses attached inline code, digit clusters, `deno -q eval`, `bun eval`, `pwsh`, case and APFS lookalikes, and crashes on `constructor`; Inbox `A`/`D` can resolve another thread's approval; `docs/agents/reviews/M1-23-ui-gaps-round2.md`), Pedro chose a fail-closed round 3 over patching the listed spellings: names compared case- and APFS-folded, any option word carrying an inline-code flag letter refused, and prefix allow rules on interpreters and `find` refused unless a script or path is named. Same worker (Claude Opus 5.5). The engine's case-sensitive shell matching (`/bin/BASH -c` payloads aren't read) is outside M1-23; it is noted for a CR.
