@@ -126,3 +126,27 @@ git checkout HEAD -- crates/atrium-core/src/policy/deny.rs
 
 ### Not done (D-123)
 - `cargo test` and `cargo clippy` were not run by this worker per D-123; left for the verification task.
+
+---
+
+## Rework round 2 (`2a9be1d`)
+
+### Root cause of the two K10 failures
+Both `deny.rs:2744` (`glob_norm_tests::k10_normalizer_work_is_linear_and_bounded`) and `M1-31-credential-folder-search.rs:561` (`500 **/ + 500 ../`) came from the same early-break bug in `apply_dotdot_run`:
+- On `500 **/ + 500 ../` (`abs = false`), each step added two `(0, rem)` entries to `dotdot_tails`. At `step_idx = 252`, `dotdot_tails` held `254` items (`2 + 254 = 256 <= 256`), so dedup did not run (`tails_before` at `step_idx = 253` was `254`, including a duplicate). At `step_idx = 253`, pushing two more items triggered `dotdot_tails.dedup()`, shrinking `dotdot_tails.len()` back to `254 == tails_before`.
+- `if next_active == active && dotdot_tails.len() == tails_before { break; }` mistook that post-dedup length match for a fixed point, broke early at `256` variants, and returned `Some(...)` instead of failing closed (`None`).
+- Because `search_variants_from_cands` then returned `unbounded = false`, while `escape_from_cands` on `/h/u/proj/` + `500 **/ + 500 ../` (`abs = true`) converged in 4 steps with `glob_leaves = true` and `unbounded = false`, `DefaultPolicy::evaluate` treated it as a bounded escaping glob (`Ask` in `Home`, `Allow` under `Any(Search)` and `FullAccess`) instead of failing closed (`unknown = true` -> `Ask` everywhere).
+
+### Changes
+- `crates/atrium-core/src/policy/deny.rs` (`2a9be1d`):
+  - Fixed `apply_dotdot_run` to compute `let tails_added = dotdot_tails.len() > tails_before;` **before** `dotdot_tails.dedup()` and break only when `next_active == active && !tails_added`. On `500 **/ + 500 ../`, `step_idx = 254` now hits `257 > MAX_GLOB_VARIANTS` and returns `None`, setting `unbounded = true` in `search_variants_from_cands` so `DefaultPolicy::evaluate` returns `Ask` in `Home`, `Any(Search)`, and `FullAccess`.
+  - Counted `..` segments scanned in `normalize_glob_variants` (`iter.peek()`) and each reconstructed output state against `arena.step()`, capped `*total_work` on `apply_dotdot_run` failure via `.min(max_work)`, and updated `*total_work` after output reconstruction.
+  - Added `can_branch` on `NormArena` so non-branching globs (no `**`/`..`) skip `intern` HashMap lookups/inserts, and cleared `last_rb = None` in `widen_pattern_dots` / `widen_pattern_slashes` when no unescaped `]` exists.
+  - Updated linear work assertions in `glob_norm_tests::k10_normalizer_work_is_linear_and_bounded` and added an explicit `MAX_GLOB_WORK` budget-exhaustion test (`star_dd(200)` + `1,000 a/` -> `201 <= 256` variants, returns `None` with `budget_work == MAX_GLOB_WORK`).
+
+### Checks run by this worker (D-123)
+- `cargo fmt --all` — passed (exit 0).
+- `cargo check -p atrium-core --tests` — passed in 0.48 s with 0 warnings.
+
+### Not done (D-123)
+- `cargo test` and `cargo clippy` were not run by this worker per D-123; left for the verification task.
