@@ -5,8 +5,8 @@ M0 spikes are merged as spikes: they answered their questions, but they aren't p
 ## Where M1 stands (orchestrator, 2026-11-16)
 
 Each row below starts with its state: ✅ done (with evidence), 🟡 in progress, ⬜ open, ➡️ belongs to a later milestone. Open before the M1 gate:
-- **In progress:** M1-18 (S1/CR-12, P1, K1–K4; K6's finding 6). M1-08L, rodrigo's live Codex checks (X1–X3).
-- **Open blockers:** none outside M1-18. **CR-19** (engine shell/wrapper/`sudo` names matched case-sensitively; Argon: high for the gate) is approved for the post-M1-18 batch (D-118).
+- **Done:** M1-18 merged (`fb77f20b`, 2026-11-16): S1/CR-12, P1, K1–K4 closed, with known limits K7–K10 below. **In progress:** M1-08L, rodrigo's live Codex checks (X1–X3).
+- **Open blockers:** none. **CR-19** (engine shell/wrapper/`sudo` names matched case-sensitively; Argon: high for the gate) is approved for the post-M1-18 batch (D-118).
 - **Open, minor:** S5, S7, S8, S11 (their tests are still ignored); K5; N3 and N6 need Linux runs (rodrigo; M1-19 merged). N5 and L10 are "later".
 - **Decided (D-111):** Linux idle memory < 165 MB; Linux TTI is a gate; the Linux frame statistic counts frames over 1.5 × the interval; `bridge.rs` batching now; damaged messages export marked (CR-16, ✅ M1-25 merged); S5/S7/S8/S11/K5 + four more stores (CR-17) after M1-18; P2 now (CR-18, ✅ M1-26 merged).
 - **The gate itself (PLAN §8):**
@@ -109,7 +109,7 @@ Each finding is a test marked `#[ignore = "M1-13 finding N"]` on that branch; fi
 
 | # | Sev. | Must fix |
 |---|---|---|
-| S1 | **blocker** | 🟡 **In M1-18** (fix round running). **CR-12** (finding 6; decided D-082: Ask, not hard-deny; fix owed): in Home with no rules, reading credential stores outside `HARD_DENY_DEFAULTS` is auto-allowed: `~/.cargo/credentials.toml`, `~/.pypirc`, `~/.pgpass`, `~/.vault-token`, `~/.azure/accessTokens.json`, `~/.aws/sso/cache/*`, `~/.config/git/credentials`, shell history, `~/.env`, and `git show HEAD:.npmrc`. Pedro decides the list (D-013). |
+| S1 | **blocker** | ✅ **Done:** M1-18 merged `fb77f20b` (D-099–D-115; last reviews `reviews/M1-18-policy-followup-round5.md`, Argon, and `-round6.md`, Sonnet: no Allow on a sensitive path beyond dev). The finding-6 test stays ignored only for the four stores CR-17 adds. **CR-12** (finding 6; decided D-082: Ask, not hard-deny; fix owed): in Home with no rules, reading credential stores outside `HARD_DENY_DEFAULTS` is auto-allowed: `~/.cargo/credentials.toml`, `~/.pypirc`, `~/.pgpass`, `~/.vault-token`, `~/.azure/accessTokens.json`, `~/.aws/sso/cache/*`, `~/.config/git/credentials`, shell history, `~/.env`, and `git show HEAD:.npmrc`. Pedro decides the list (D-013). |
 | S2 | **blocker** | ✅ **Done:** M1-13 rounds 3–8, merged `02c13bc`. Finding 2: a failing `cd` is assumed to succeed. With two ordinary prefix rules (`cd`, `cat`), `cd nope; cat .ssh/id_rsa` reaches Allow. Treat the cwd as unknown after any `cd` whose target isn't a known folder. |
 | S3 | major | ✅ **Done:** M1-13 rounds 3–8, merged `02c13bc`. Finding 1: a `cd` inside `( … )` or a pipeline isn't followed (cwd tracking). Under a broad allow rule this reaches Allow on a hard-denied path. |
 | S4 | major | ✅ **Done:** M1-13 rounds 3–8, merged `02c13bc`. Finding 8: `echo rm -rf ~ \| sh` (the `-rf` is dropped) and `printf '%s' '…' \| sh`: text piped into a shell must be read as code. |
@@ -129,12 +129,23 @@ Rounds 3–8 worked through S2–S13 (the handoff says how each was handled); S1
 
 | # | Sev. | Known limit (D-098) |
 |---|---|---|
-| K1 | blocker | 🟡 **In M1-18.** Round 8, finding 1: `runs_here` (`eval`/`source`/`.`), `env_payloads` and `<(...)` process substitutions read only the main reading of the line, not `other_readings` or substituted words. |
-| K2 | blocker | 🟡 **In M1-18.** Round 8, finding 2: `reaches_tree_through_links` misses two-hop symlinks, drops `expand_glob`'s `None`, leaves out `atrium_*_paths`, and skips abbreviated long flags. |
-| K3 | blocker | 🟡 **In M1-18.** Round 8, finding 3: `shell_c_code` stops at `-o`/`+o`/`-O`/`+O` values; `long_name` ignores 1–2 letter GNU prefixes (`script --c`, `flock --c`). |
-| K4 | blocker | 🟡 **In M1-18.** Round 8, finding 4: `find_exec_units` doesn't extract `payloads_of`, `env_payloads` or `code_subs` from `-exec` commands. |
-| K6 | — | ⬜ M1-18 un-ignores finding 6. On merged `dev`, 7 tests are still ignored. 6 are marked `#[ignore = "M1-13 finding N"]`: findings 4 (S7), 5 (S8), 6 (S1, CR-12), 10 (S11), and 11 (S5) twice. Fixing a finding means un-ignoring its test. |
+| K1 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 1: `runs_here` (`eval`/`source`/`.`), `env_payloads` and `<(...)` process substitutions read only the main reading of the line, not `other_readings` or substituted words. |
+| K2 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 2: `reaches_tree_through_links` misses two-hop symlinks, drops `expand_glob`'s `None`, leaves out `atrium_*_paths`, and skips abbreviated long flags. |
+| K3 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 3: `shell_c_code` stops at `-o`/`+o`/`-O`/`+O` values; `long_name` ignores 1–2 letter GNU prefixes (`script --c`, `flock --c`). |
+| K4 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 4: `find_exec_units` doesn't extract `payloads_of`, `env_payloads` or `code_subs` from `-exec` commands. |
+| K6 | — | 🟡 M1-18 covered CR-12's list; finding 6 stays ignored for the four stores CR-17 adds (post-M1-18 batch). On merged `dev`, 7 tests are still ignored. 6 are marked `#[ignore = "M1-13 finding N"]`: findings 4 (S7), 5 (S8), 6 (S1, CR-12), 10 (S11), and 11 (S5) twice. Fixing a finding means un-ignoring its test. |
 | K5 | minor | ⬜ **Open.** `rg -L pat` with no folder, run from a working folder that holds a link into `~/.ssh`, is a hard deny (`dev`: Ask/Allow/Allow). This is round 6's design, not a regression from the fix. |
+
+### M1-18 merged (`fb77f20b`, 2026-11-16): known limits
+
+Five fix rounds (D-099–D-115). The last reviews found no Allow on a sensitive path that `dev` doesn't already allow, no false hard deny and no needless ask on ordinary lines (`reviews/M1-18-policy-followup-round6.md`, Sonnet, D-117). Left, by the driver's merge decision:
+
+| # | Sev. | Known limit |
+|---|---|---|
+| K7 | minor | ⬜ `sh -c` scripts that are only a positional-parameter expansion (`sh -c '$0' 'cat .ssh/id_rsa'`) aren't resolved to what they run: Ask in Home and under prefix rules, Allow under Any and FullAccess. Same as `dev`. |
+| K8 | nit | ⬜ A `**` search rooted at the home folder asks in Home, because it could reach `.zsh_sessions` (CR-12 trees). |
+| K9 | nit | ⬜ `env` with more than about 24 words before the command fails closed to Ask in every setting, including Any and FullAccess. |
+| K10 | nit | ⬜ Search globs with 400 or more `*/` segments followed by as many `..` segments take a few seconds to evaluate, then ask. |
 
 ## From the M1 Linux checks (`handoffs/M1-14a-linux-host.md` on `agent/sonnet/M1-14a-linux-host`; 2026-11-13)
 
@@ -159,6 +170,6 @@ For the policy engine, not the adapter (the adapter's own findings are fixed in 
 
 | # | Sev. | Must fix |
 |---|---|---|
-| P1 | major | 🟡 **In M1-18.** **The policy trusts a search subject's `glob` to stay under its `paths`.** `deny.rs` `search_glob_hit` only looks at probes under the subject's roots, and `Home::evaluate` checks the roots alone, so a `ToolSubject::Paths { paths: [cwd], glob }` whose `glob` is absolute, starts with `~`, climbs with `..`, or does either through braces or a character class (`{a,}/home/…`, `.{.,.}/.ssh/…`, `[.][.]/…`) is allowed although it names files outside every root. M1-07 closes it in the Claude adapter's subject (such patterns become extra paths or `Unknown`), but every adapter builds subjects, so the engine should refuse or ask for a `glob` that can leave its roots. For M1-13's follow-up or the policy's owner; test with the patterns in the round-2 review. |
+| P1 | major | ✅ **Done in M1-18** (`fb77f20b`): search globs are normalized and checked against every root, failing closed past the variant cap. **The policy trusts a search subject's `glob` to stay under its `paths`.** `deny.rs` `search_glob_hit` only looks at probes under the subject's roots, and `Home::evaluate` checks the roots alone, so a `ToolSubject::Paths { paths: [cwd], glob }` whose `glob` is absolute, starts with `~`, climbs with `..`, or does either through braces or a character class (`{a,}/home/…`, `.{.,.}/.ssh/…`, `[.][.]/…`) is allowed although it names files outside every root. M1-07 closes it in the Claude adapter's subject (such patterns become extra paths or `Unknown`), but every adapter builds subjects, so the engine should refuse or ask for a `glob` that can leave its roots. For M1-13's follow-up or the policy's owner; test with the patterns in the round-2 review. |
 | P2 | minor | ✅ **Fixed** (M1-26, merged `ea9b93f7`; CR-18, D-111): `SessionGate::withdraw` cancels an open ticket (never approves; idempotent) and frees its `MAX_PENDING_REQUESTS` slot; the Claude and Codex adapters call it on provider cancel, turn end, exit and unmatched asks. Tests fill the limit, withdraw, reopen. |
 
