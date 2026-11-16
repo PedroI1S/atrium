@@ -1,11 +1,14 @@
 // The inbox card: one ranked list across every thread (PLAN §3.4, contract §8), grouped as
 // approvals and questions, failed, ready for you. Approvals and questions carry their buttons
 // on the item (the same cards as the chat, compact), so most asks are answered from here.
-// Keyboard: J / K move, ↵ opens the chat, A allows once, D denies.
+// Approvals can be selected and allowed once or denied together (PLAN §3.4).
+// Keyboard: J / K move, ↵ opens the chat, A allows once, D denies, X selects.
 
-import { For, Show, createEffect, createMemo, onCleanup, onMount } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, untrack } from "solid-js";
+import { type BatchSummary, type BatchTarget, allState, batchKey, outcomeOf, pruned, selectAll, summarize, toggled } from "../chat/batch";
 import { GROUP_LABEL, type InboxFilter, filterInbox, groupInbox, itemKey, moveSelection, needsYouCount } from "../chat/inbox";
-import { type ThreadModel, holdThread, resolveApproval } from "../chat/threads";
+import { canAct, cardState, subjectOf } from "../chat/requests";
+import { type ThreadModel, holdThread, localOf, resolveApproval } from "../chat/threads";
 import { daemon } from "../daemon/client";
 import { ageLabel, type Tone } from "../daemon/reduce";
 import type { InboxItem } from "../daemon/types";
@@ -37,15 +40,28 @@ const MAX_CARDS = 2;
  */
 const MAX_HELD = 12;
 
-/** The models of the items whose buttons show here, by thread id (for the A and D keys). */
+/** The models of the items whose buttons show here, by thread id (for the A and D keys and the batch). */
 const held = new Map<string, ThreadModel>();
+/** Bumped when `held` changes, so the batch sees cards come and go. */
+const [heldTick, setHeldTick] = createSignal(0);
+
+/** Approvals selected for the batch, by `batchKey`. */
+const [selection, setSelection] = createSignal<ReadonlySet<string>>(new Set());
+const [batchBusy, setBatchBusy] = createSignal(false);
+const [batchResult, setBatchResult] = createSignal<BatchSummary | null>(null);
+function toggleSelected(key: string): void {
+  setBatchResult(null);
+  setSelection(toggled(selection(), key));
+}
 
 /** The pending requests of one thread, as cards. Views the thread while it is shown. */
 function Cards(props: { threadId: string }) {
   const hold = holdThread(props.threadId);
   held.set(props.threadId, hold.model);
+  setHeldTick((n) => n + 1);
   onCleanup(() => {
     held.delete(props.threadId);
+    setHeldTick((n) => n + 1);
     hold.release();
   });
   const pending = () => (hold.model.tick(), hold.model.transcript.pending());
@@ -53,7 +69,11 @@ function Cards(props: { threadId: string }) {
     <Show when={pending().length}>
       <div class="cards">
         <For each={pending().slice(0, MAX_CARDS)}>
-          {(request) => <RequestCard threadId={props.threadId} item={request} tick={hold.model.tick} small keys={false} />}
+          {(request) => {
+            const key = batchKey(props.threadId, request);
+            const pick = request.kind === "approval" ? { get checked() { return selection().has(key); }, toggle: () => toggleSelected(key) } : undefined;
+            return <RequestCard threadId={props.threadId} item={request} tick={hold.model.tick} small keys={false} pick={pick} />;
+          }}
         </For>
         <Show when={pending().length > MAX_CARDS}><span class="src">{pending().length - MAX_CARDS} more in the chat</span></Show>
       </div>
@@ -95,6 +115,47 @@ export function InboxCard() {
   const withCards = createMemo(() => new Set(flat().filter((i) => i.reason === "approval" || i.reason === "question").slice(0, MAX_HELD).map(itemKey)));
   const asks = () => needsYouCount(all());
 
+  /** The approvals shown here that can still be answered: what the batch acts on. */
+  const targets = createMemo<BatchTarget[]>(() => {
+    heldTick();
+    const out: BatchTarget[] = [];
+    for (const item of flat()) {
+      const id = item.thread_id;
+      if (id === null || !withCards().has(itemKey(item))) continue;
+      const m = held.get(id);
+      if (!m) continue;
+      m.tick();
+      for (const r of m.transcript.pending().slice(0, MAX_CARDS)) {
+        if (r.kind !== "approval" || !canAct(cardState(r, localOf(id, r)))) continue;
+        out.push({ key: batchKey(id, r), threadId: id, request: r, chat: item.title || "Untitled chat", subject: subjectOf(r).text });
+      }
+    }
+    return out;
+  });
+  const offered = createMemo(() => targets().map((t) => t.key));
+  const chosen = () => targets().filter((t) => selection().has(t.key));
+  // An approval answered elsewhere, or expired, leaves the selection.
+  createEffect(() => {
+    const keys = offered();
+    const current = untrack(selection);
+    const next = pruned(current, keys);
+    if (next.size !== current.size) setSelection(next);
+  });
+  const runBatch = async (action: "allow" | "deny") => {
+    const batch = chosen();
+    if (!batch.length || batchBusy()) return;
+    setBatchBusy(true);
+    setBatchResult(null);
+    try {
+      // Each one goes through the ledger alone; one that fails doesn't stop the others.
+      await Promise.all(batch.map((t) => resolveApproval(t.threadId, t.request, action)));
+      setBatchResult(summarize(action, batch.map((t) => ({ target: t, outcome: outcomeOf(localOf(t.threadId, t.request)) }))));
+      setSelection(new Set<string>());
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
   // The picked item follows the list: gone from it, the pick moves to the first item.
   createEffect(() => {
     const pick = inboxPick();
@@ -125,6 +186,7 @@ export function InboxCard() {
     else if (e.key === "Enter" && !(e.target instanceof HTMLButtonElement)) take(() => { const id = picked()?.thread_id; if (id) openThread(id); });
     else if (k === "a") take(() => decide("allow"));
     else if (k === "d") take(() => decide("deny"));
+    else if (k === "x") take(() => { const id = picked()?.thread_id; const t = targets().find((x) => x.threadId === id); if (t) toggleSelected(t.key); });
   };
 
   return (
@@ -135,6 +197,30 @@ export function InboxCard() {
         <Spacer />
         <Seg label="Show" value={inboxFilter()} options={FILTERS} onChange={setInboxFilter} />
       </header>
+      <Show when={targets().length || batchResult()}>
+        <div class="batch-bar" data-atrium-part="batch-bar">
+          <Show when={targets().length}>
+            <label>
+              <input type="checkbox" data-atrium-part="batch-all" checked={allState(selection(), offered()) === "all"} ref={(el) => createEffect(() => { el.indeterminate = allState(selection(), offered()) === "some"; })}
+                onChange={() => { setBatchResult(null); setSelection(selectAll(selection(), offered())); }} />
+              Select all approvals ({targets().length})
+            </label>
+            <Spacer />
+            <button type="button" class="btn pri sm" data-atrium-part="batch-allow" disabled={!chosen().length || batchBusy()} onClick={() => void runBatch("allow")}>Allow once{chosen().length ? ` (${chosen().length})` : ""}</button>
+            <button type="button" class="btn sm" data-atrium-part="batch-deny" disabled={!chosen().length || batchBusy()} onClick={() => void runBatch("deny")}>Deny{chosen().length ? ` (${chosen().length})` : ""}</button>
+          </Show>
+          <Show when={batchResult()}>
+            {(r) => (
+              <div class="batch-result" role="status" data-atrium-part="batch-result" data-failed={r().failures.length ? "" : undefined}>
+                {r().text}
+                <Show when={r().failures.length}>
+                  <ul><For each={r().failures}>{(f) => <li>{f.chat}: <span class="code">{f.subject}</span>: {f.reason}</li>}</For></ul>
+                </Show>
+              </div>
+            )}
+          </Show>
+        </div>
+      </Show>
       <div class="inbox-list" role="list" aria-label="Inbox" tabindex="0" ref={list} data-atrium-part="inbox" onKeyDown={onKey}>
         {/* Keyed by group name and item key (strings): an inbox update keeps every item that is
             still listed, so its cards and their thread views aren't torn down and set up again. */}
@@ -162,6 +248,7 @@ export function InboxCard() {
         <span><Kbd>↵</Kbd> open</span>
         <span><Kbd>A</Kbd> allow once</span>
         <span><Kbd>D</Kbd> deny</span>
+        <span><Kbd>X</Kbd> select</span>
         <Spacer />
         <span><Kbd>{`${modKey()}J`}</Kbd> <Kbd>{modKey() === "⌘" ? "⌘⇧J" : "Ctrl+Shift+J"}</Kbd> next or previous item that needs you, from anywhere</span>
       </footer>

@@ -37,7 +37,10 @@ const ARM_AFTER_MS = 600;
 
 const typing = () => document.activeElement instanceof HTMLTextAreaElement || document.activeElement instanceof HTMLInputElement;
 
-export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick: () => number; small?: boolean; autofocus?: boolean; keys?: boolean }) {
+/** The inbox's batch selection for one approval (PLAN §3.4). */
+export interface Pick { checked: boolean; toggle: () => void }
+
+export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick: () => number; small?: boolean; autofocus?: boolean; keys?: boolean; pick?: Pick }) {
   const state = () => (props.tick(), cardState(props.item, localOf(props.threadId, props.item)));
   const subject = () => subjectOf(props.item);
   const choices = () => rememberChoices(props.item);
@@ -68,7 +71,11 @@ export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick
       }}
     >
       <div class="ask-h">
-        <Dot tone={act() ? "needs-you" : state().kind === "stale" ? "idle" : "ready"} />
+        <Show when={props.pick && act()} fallback={<Dot tone={act() ? "needs-you" : state().kind === "stale" ? "idle" : "ready"} />}>
+          <label class="ask-pick" title="Select for Allow once or Deny together">
+            <input type="checkbox" data-atrium-part="batch-pick" checked={props.pick!.checked} aria-label={`Select: ${askOf(props.item)} ${subject().text}`} onChange={() => props.pick!.toggle()} />
+          </label>
+        </Show>
         {askOf(props.item)}
         <span class="ask-mode">{props.item.name} · {askedAgo(props.item.at)}</span>
       </div>
@@ -175,10 +182,10 @@ export function QuestionCard(props: { threadId: string; item: QuestionItem; tick
   );
 }
 
-export function RequestCard(props: { threadId: string; item: RequestItem; tick: () => number; small?: boolean; autofocus?: boolean; keys?: boolean }) {
+export function RequestCard(props: { threadId: string; item: RequestItem; tick: () => number; small?: boolean; autofocus?: boolean; keys?: boolean; pick?: Pick }) {
   return (
     <Show when={props.item.kind === "approval"} fallback={<QuestionCard threadId={props.threadId} item={props.item as QuestionItem} tick={props.tick} small={props.small} />}>
-      <ApprovalCard threadId={props.threadId} item={props.item as ApprovalItem} tick={props.tick} small={props.small} autofocus={props.autofocus} keys={props.keys} />
+      <ApprovalCard threadId={props.threadId} item={props.item as ApprovalItem} tick={props.tick} small={props.small} autofocus={props.autofocus} keys={props.keys} pick={props.pick} />
     </Show>
   );
 }
