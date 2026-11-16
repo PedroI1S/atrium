@@ -615,3 +615,9 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 **The bar:** no line becomes more permissive than `dev`, and no new hard deny lands on an ordinary command (the lesson of round 8's major 5).
 
 **Not included:** K5 and the other ignored findings (4, 5, 10, 11).
+
+## D-100 — 2026-11-16 — Pedro: escaping search globs are allowed under FullAccess and Any rules
+**Decided by Pedro (driver):** "Allow there".
+- **Where they're allowed.** P1's search globs that can leave their roots, and whose expansions can't hit the hard-deny list, keep `dev`'s Allow under FullAccess and under an Any rule. Examples: `../other/*.rs`, `/etc/*.conf`.
+- **Elsewhere it is unchanged.** They still ask in Home and under prefix rules. They are still hard-denied when an expansion can hit the hard-deny list, and a rule's deny still wins.
+- **When it lands.** M1-18 makes this one change in `engine.rs::evaluate`, with tests, after its Hydrogen review. That way the reviewer reads a fixed tree, and the change can ride with any review fixes.
