@@ -643,3 +643,17 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
   - Linux: −57 ms median TTI, the reason to keep it.
   - macOS (`docs/spikes/M1-macos-checks.md`): no measurable gain, within ±6 ms on a busy machine.
 - **Revisit:** drop it later if a quiet re-measure still shows a gap this small.
+
+## D-103 — 2026-11-16 — Pedro's go: Hydrogen workers for the small open fixes; old branches cleaned
+**Decided by Pedro (driver):** "launch hydrogen workers for those small code fixes, also i think there are some old branches in git that were suposed to be deleted".
+- **M1-19-host-supervision** (`briefs/M1-19-host-supervision.md`): N3, N6 and N10, all in `atrium-host` `supervise.rs`, so they make one task.
+  - Worker: Gemini 4 Hydrogen `high`.
+  - Review: Opus 5.5, because these paths sit beside `unsafe` `libc` calls (D-053), and it keeps the review cross-provider.
+  - Linux-only paths go to rodrigo's next shift.
+- **What doesn't go to Hydrogen now, and why:**
+  - P2 needs a new `SessionGate` call to withdraw a ticket, which is a contract change (§5). It goes to a CR if it ever bites.
+  - S5, S7, S8, S11 and K5 are in the policy files M1-18 is changing, and their tests need credential literals the `agy` policy refuses (D-074). They go to Claude after M1-18 merges.
+- **Branches:**
+  - The local `agent/*` branches already merged into `dev` are deleted locally.
+  - Remote `agent/*` branches go once `origin/dev` contains them.
+  - The orchestrator recorded the deletions in the session log.
