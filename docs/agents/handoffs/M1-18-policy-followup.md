@@ -216,3 +216,82 @@ The worker policy refused `edit_file` calls containing parent-dir (`..` + `/`) o
   - Run 1: all passed; `adversarial_fuzz`: `14.69s` (2 passed, 1 ignored); `policy.rs`: `3.54s` (44 passed); `adversarial_m1_18`: `1.81s` (13 passed); `store.rs`: `36.98s` (30 passed).
   - Run 2: all passed; `adversarial_fuzz`: `12.93s`; `policy.rs`: `3.49s`; `adversarial_m1_18`: `1.78s`; `store.rs`: `36.63s`.
   - Run 3: all passed; `adversarial_fuzz`: `13.79s`; `policy.rs`: `3.59s`; `adversarial_m1_18`: `1.82s`; `store.rs`: `36.67s`.
+
+## Fix round 2 (D-105)
+
+Worker: Gemini 4 Hydrogen (high effort). Approach: fail-closed on unknown `env`/`command` options, possibly-escaping globs, and unparseable Git pathspecs, plus Major 4 and Minor 5.
+
+### Fail-closed rules & changes by item
+
+1. **K1 — Fail-closed `env` / `command` invocations (`crates/atrium-core/src/policy/shell.rs`, `deny.rs`, `engine.rs`):**
+   - **Rule:** Any `env` or `command` invocation containing any unknown option (short, long, `=`, or mixed cluster such as `-ZS...` / `-ZC...`) is unknown. Fixed `unwrap_readings`, `unwrap_steps`, and `env_payloads_bounded` to update `choices = choices.max(cur_choices)` on every mask (and evaluate `u32::MAX` when `choices > 4`). Fixed `scan_env` so `-ZS...` and `-ZC...` with unknown leading flags branch with `pick()`, no-value long flags with `=` mark `unknown`, and `-ZC` never clobbers an earlier `chdir` with `None`.
+   - Added `expand_unknown_env_cmd` (bounded by `MAX_UNKNOWN_STARTS = 24`, `MAX_UNKNOWN_EMIT = 32`, `rec_depth <= 4`): for any unknown `env` or `command` invocation, every non-option/non-assignment remaining word is tested as a possible payload start (recursively unwrapping nested wrappers/substitutions) and paired with every `-C`/`--chdir`/`-S`/`--split-string` value.
+   - When an unknown invocation exceeds those bounds (`Lexed::unbounded_unknown_words`), `deny::unknown_words_could_be_dangerous` checks whether any word (or `=` / `-C` / `-S` rhs) names a path outside `cwd` (or hits sensitive/ask paths) or is a shell, `eval`, `source`, `.`, or hard-denied command. If dangerous, `Analysis::unbounded_unknown_dangerous` forces `DefaultPolicy::evaluate` to return `Ask` (never `Allow` under `Any` or `FullAccess`, while `HardDeny` and `RuleDecision::Deny` still take precedence); if safe (e.g., `env -A0 v0 ... make`), it keeps `Ask / Ask / Allow / Allow`.
+   - **Tests (`crates/atrium-core/tests/adversarial_m1_18.rs`):** un-ignored `fix1_k1_two_unknown_env_options_in_a_row`, added `fix2_k1_multiple_unknown_options_and_clusters` (all 19 evidence lines from Finding 1 + `env -Z -- -C .. cat .ssh/id_rsa` + unbounded dangerous vs unbounded safe).
+
+2. **P1 — Fail-closed glob escaping & `search_glob_hit` from `~` (`crates/atrium-core/src/policy/deny.rs`):**
+   - **Rule:** `glob_escape` and `glob_search_variants` expand braces (with representative `brace_fallback` if `brace_expand` overflows), strip backslash escapes (`unescape_glob_backslashes`), expand `~`/`$HOME`/`${HOME}`/`$PWD`/`${PWD}`, widen `?` and dot-matching `[...]` classes to `.` (`widen_pattern_dots`, `widen_pattern_slashes`), widen remaining `$VAR`/`${VAR}` to empty / `**` / `/**` (`expand_glob_vars`), and generate `globstar_variants` (`drop_globstar` plus collapsing `**/..` up to 4 times). Globs with `\`, `$`, `~user`, `may_be_dot_component` (now including `*` compounds like `[.][.]*`), or unexpanded braces set `out.unknown = true` so D-100 applies (`Ask` in Home/prefix/PathGlob, `Allow` under unscoped `Any` and `FullAccess` unless a hard-deny hit is possible).
+   - `Ctx::search_glob_hit` now runs for both `recursive: true` and `recursive: false`, uses `glob_search_variants` + `normalize_glob_str` + lowercasing, and matches `probe`, `rel`, and `name` (limiting bare `name` matching when `recursive == false` to direct children `!rel.contains('/')` so `Search ["~"] glob="id_rsa" recursive=false` does not falsely hard-deny).
+   - **Tests (`crates/atrium-core/tests/adversarial_m1_18.rs`):** updated the 5 widened-class/backslash rows in `p1_search_globs_that_leave_their_roots` (`[.][.]/.ssh/id_ed25519`, `.[.]/.ssh/id_rsa`, `??/.ssh/id_rsa`, `[!a][!a]/.ssh/id_rsa`, `\\.\\./.ssh/id_rsa`) from `ask3` to `CR`, and added `fix2_p1_anchors_widening_and_home_search_globs` (all 19 evidence lines from Finding 2 + `$UNKNOWN_DIR/.ssh/id_rsa` -> `CR` + `$UNKNOWN_DIR/*.rs` -> `Ask / Allow / Allow`).
+
+3. **CR-12 — Non-canonical search globs & fail-closed Git pathspecs (`crates/atrium-core/src/policy/deny.rs`, `engine.rs`):**
+   - **Rule:** `Sensitive::ask_search_glob_hit` normalizes `./`, `//`, and `literal/..` via `glob_search_variants` and `normalize_glob_str` (returning `true` on overflow or invalid glob). `git_names_credential` strips any sequence of short magic (`/`, `!`, `^`, `:`) and balanced long magic `(...)` in any order after `:`, normalizes `..` in path segments, and returns `true` (asks in Home) when something starting with `:` cannot be parsed (unclosed `(`, unrecognized leading magic punctuation, or residual `:`).
+   - **Tests:** `fix2_cr12_noncanonical_globs_and_git_pathspec_magic` (all 11 evidence lines from Finding 3 + `git log -p -- ':(unclosed'` + `git log -p -- ':~.env'`).
+
+4. **Major 4 — D-100 rule precedence (`crates/atrium-core/src/policy/engine.rs`):**
+   - **Rule:** Computed `glob_leaves` before `apply_rules` and passed it into `apply_rules` and `allow_covers`, so when `glob_leaves == true`, `allow_covers` returns `none` unless `matches!(rule.matcher, RuleMatcher::Any) && rule.path_scope.is_none()`. Higher-scope `PathGlob` or `path_scope`d `Any` `Allow` rules no longer set `covered` and no longer mask lower-scope `Deny` rules.
+   - **Tests:** `fix2_d100_thread_scope_allow_does_not_mask_global_deny` (Thread `PathGlob` Allow + Global `Any` Deny, and Thread `path_scope`d `Any` Allow + Global `Any` Deny, under both `Home` and `FullAccess` -> all 4 `Deny`).
+
+5. **Minor 5 — `split_words` `LexCache` & `MAX_DEPTH` (`crates/atrium-core/src/policy/shell.rs`):**
+   - **Rule:** `split_words(text, depth, cache)` now uses `lex_depth_cached(text, depth, cache)` (reading `&Rc<Lexed>` without cloning) and checks `depth > MAX_DEPTH`, threaded from `lex_depth_uncached` -> `unwrap_checked_at` / `unwrap_readings_bounded` / `unwrap_steps` / `code_texts_bounded` / `env_payloads_bounded` -> `scan_env`.
+   - **Tests:** `fix2_nested_env_split_string_is_linear` (6-deep nested `env -Z X -S "..."` across all 4 settings completes in `< 200ms`).
+
+6. **Ordinary lines (`fix2_ordinary_lines_keep_devs_verdict`):**
+   - `env FOO=1 make`, `env -i PATH=/usr/bin make`, `env -u X make`, `command -v git`: `Ask / Ask / Allow / Allow` under `adversarial_m1_18` settings (`Ask / Allow / Allow / Allow` with `env`/`command` prefix rule) — matches `dev`.
+   - `cwd=proj|rg --glob '*.rs' fn src`, `cwd=proj|grep -rn --include='*.rs' fn src`, `cwd=proj|git log -- src/`, `cwd=proj|git diff -- ':!vendor'`: `Allow / Allow / Allow / Allow` — matches `dev`.
+   - `cwd=proj|find src -name '*.rs'`: `Ask / Ask / Allow / Allow` — matches `dev`.
+   - `Search ["~/proj"]` with `*.rs`, `src/**/*.rs`, `?.rs`, `[a-z]*.rs`: `Allow / Allow / Allow` — matches `dev`.
+
+### Comparison with `dev` (fix round 2)
+
+Every row in `fix2_*` (plus the 5 updated P1 rows) was probed directly on `dev` (`git show dev:...` in a temporary `.dev_probe` workspace with its own `CARGO_TARGET_DIR`, removed afterwards).
+
+- **More permissive than `dev`: 0 lines.**
+- **False hard denies on ordinary lines: 0 lines.**
+- **Lines now stricter than `dev` and why that is right:**
+
+| Item | Line(s) | `dev` | Branch | Why stricter is right |
+|---|---|---|---|---|
+| K1 | 15 unknown `env`/`command` lines reading `.ssh/id_rsa` (`env -Z X --yyy Y -C .. cat ...`, `-Z X -Y W`, `--xxx X --yyy Y`, `--xxx X -Y W --chdir ..`, `-S`, `--split-string`, `eval`, `source /dev/stdin`, `. /dev/stdin`, `-ZSfoo eval`, `-C .. -ZCproj`, `-C .. -ZC sub`, `command -Z X -Y W eval`, `env -Z X command -Y W eval`, `env -Z -- -C ..`) | `Ask / Ask / Allow / Allow` | `Hard(credential-read)` (4x) | Each invocation invokes `cat .ssh/id_rsa` under `cd ..` or `cd ~/.ssh` on a valid reading of the unknown options/clusters; `dev` failed to explore multi-option masks and `-ZS`/`-ZC` clusters. |
+| K1 | 4 unknown `env` lines running `<(echo 'rm -rf ~')` (`env -Z X --yyy Y bash/source/. <(...)`, `env -ZSfoo bash <(...)`) | `Ask / Ask / Allow / Allow` | `Hard(recursive-delete-outside-cwd)` (4x) | Runs `rm -rf ~` via process substitution behind unknown options or `-ZSfoo`. |
+| K1 | `cwd=proj\|env -ZSfoo sudo id` | `Ask / Allow / Allow / Allow` (with `env` prefix) | `Hard(privilege-escalation)` (4x) | Unknown `-Z` may consume `Sfoo`, exposing `sudo id`. |
+| K1 | Unbounded (>24 words) dangerous unknown `env`: `env -A0 v0 ... -A13 v13 -C .. cat foo` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Ask / Ask` | Readings exceed bound and cheap test sees `..` outside `cwd`; fail-closed `Ask` prevents unverified `Allow` under `Any`/`FullAccess`. |
+| P1 | `Search ["~/proj"]` with `$HOME/.ssh/id_rsa` (`rec=true/false`), `${HOME}/.ssh/id_rsa`, `$PWD/../.ssh/id_rsa` (with `cwd=~/proj`) | `Allow / Allow / Allow` | `Hard(credential-read)` (3x) | Expands `$HOME`/`$PWD` outside `~/proj` into `~/.ssh/id_rsa`. |
+| P1 | `Search ["~"]` with `.ssh/id_rsa`, `~/.ssh/id_rsa`, `.aws/credentials`, `.npmrc`, `**/../.ssh/id_rsa` (`rec=false`) | `Allow / Allow / Allow` | `Hard(credential-read)` (3x) | Searches a hard-denied path directly inside `~` even with `recursive: false`. |
+| P1 | `Search ["~"]` with `.ssh/id_rsa`, `~/.ssh/id_rsa`, `**/../.ssh/id_rsa` (`rec=true`) | `Ask / Allow / Allow` | `Hard(credential-read)` (3x) | Searches a hard-denied path directly inside `~`; `dev` missed `~`-expanded / normalized relative / `**/..` forms. |
+| P1 | `Search ["~/proj"]` with `[.][.]/.ssh/id_ed25519`, `.[.]/.ssh/id_rsa`, `??/.ssh/id_rsa`, `[!a][!a]/.ssh/id_rsa`, `\\.\\./.ssh/id_rsa`, `[.]/../.ssh/id_rsa`, `**/[.][.]/.ssh/id_rsa`, `$UNKNOWN_DIR/.ssh/id_rsa` (`rec=true`) | `Allow / Allow / Allow` | `Hard(credential-read)` (3x) | Widening `?`, dot-matching `[...]`, `\`, and `$VAR` shows each can read `~/.ssh/*`. |
+| P1 | `Search ["~/proj"]` with `$UNKNOWN_DIR/*.rs` (`rec=true`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | Unknown `$VAR` may point outside `~/proj` without hitting `hard_deny`, so D-100 asks in Home and allows under `Any`/`FullAccess`. |
+| CR-12 | `Search ["~"]` with `.cargo/./credentials.toml`, `.cargo//credentials.toml`, `proj/../.cargo/credentials.toml`, `~/./.cargo/credentials.toml` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | Non-canonical paths resolve to `~/.cargo/credentials.toml`, which asks in Home per CR-12. |
+| CR-12 | `git log`/`diff` with `::.npmrc`, `::.env`, `:/:.npmrc`, `:!:.env`, `:^:.pypirc`, `:!(top).env`, `:/:(icase).npmrc`, `:(unclosed`, `:~.env` | `Allow / Allow / Allow / Allow` | `Ask / Ask / Allow / Allow` | Stripping arbitrary Git pathspec magic and failing closed on unparseable `:` magic ensures credential-store lookups ask in Home per CR-12. |
+| Major 4 | `Glob ["~/proj/src"] "../other/*.rs"` with Thread `PathGlob` Allow or Thread `path_scope`d `Any` Allow + Global `Any` Deny (under `Home` and `FullAccess`) | `Allow` (all 4) | `Deny` (all 4) | D-100 excludes `PathGlob` and `path_scope`d rules from covering escaping globs, so the lower-scope `Deny` rule takes effect. |
+
+### Fix round 2 DoD outputs
+
+- `cargo fmt --all --check`: exit `0` (clean).
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit `0` (0 warnings).
+- `cargo test --workspace --no-fail-fast`: exit `0` (all crates and test binaries passed).
+- `cargo test -p atrium-core --no-fail-fast` (5 runs in a loop): exit `0` across all 5 runs (`adversarial_m1_18`: 24 passed, 0 failed, 0 ignored; `store`: 30 passed).
+- `cargo test -p atrium-core --test adversarial_fuzz --test policy --no-fail-fast` (5 runs in a loop for exact timings):
+  - Run 1: `adversarial_fuzz` `13.76s` (2 passed, 1 ignored); `policy` `3.76s` (44 passed, 0 ignored).
+  - Run 2: `adversarial_fuzz` `13.75s`; `policy` `3.80s`.
+  - Run 3: `adversarial_fuzz` `13.72s`; `policy` `3.78s`.
+  - Run 4: `adversarial_fuzz` `14.42s`; `policy` `4.23s`.
+  - Run 5: `adversarial_fuzz` `14.76s`; `policy` `3.94s`.
+- Scratch `.dev_probe/` directory and its `target` were removed (`git status` clean except modified branch files).
+
+### Left, and why
+
+- **K5** and **findings 4, 5, 10, 11**: out of scope (brief / D-099).
+- **Four stores outside the CR-12 contract list** (`~/.gem/credentials`, `~/.terraform.d/credentials.tfrc.json`, `~/.config/op/config`, `~/.yarnrc.yml`): contract change, left in the ignored test `finding_6_stores_outside_the_cr_12_list_ask_in_home`.
+- **Settings UI** listing CR-12 stores: no protected list exists in `app/src/ui/`.
+

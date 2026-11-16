@@ -104,6 +104,9 @@ pub struct Lexed {
     pub reasons: Vec<String>,
     /// More commands than the checker takes on (`MAX_UNITS`).
     pub overflow: bool,
+    /// Words of an unknown `env`/`command` invocation whose readings could not
+    /// be bounded (M1-18, K1 fail-closed).
+    pub unbounded_unknown_words: Vec<Vec<String>>,
     /// Every here-doc and here-string body at this level.
     pub stdin_texts: Vec<String>,
     /// The number of this text (`Unit::ctx`).
@@ -1117,18 +1120,24 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
             redirects,
             piped,
         };
-        let (eff, unknown_option) = unwrap_checked(&seg.argv);
+        let (eff, unknown_option) = unwrap_checked_at(&seg.argv, depth, cache);
         if unknown_option {
             out.reasons.push("unknown wrapper option".into());
         }
         // the other ways its wrappers can be read (round 7 item 6): each is
         // checked as a command of its own
         let mut other_readings: Vec<Vec<String>> = if unknown_option {
-            unwrap_readings(&seg.argv, depth, cache)
-                .into_iter()
-                .skip(1)
-                .filter(|e| !e.is_empty())
-                .collect()
+            let mut readings = Vec::new();
+            for e in
+                unwrap_readings_bounded(&seg.argv, depth, cache, &mut out.unbounded_unknown_words)
+                    .into_iter()
+                    .skip(1)
+            {
+                if !e.is_empty() && !readings.contains(&e) {
+                    readings.push(e);
+                }
+            }
+            readings
         } else {
             vec![]
         };
@@ -1156,6 +1165,8 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
         for body in &subs {
             let l = lex_depth_fresh(body, depth + 1, cache);
             out.overflow |= l.overflow;
+            out.unbounded_unknown_words
+                .extend(l.unbounded_unknown_words.iter().cloned());
             extra.push(l);
         }
         let mut payload_units: Vec<Unit> = vec![];
@@ -1174,10 +1185,19 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
         let owner_maybe_child =
             pipe != 0 || grouped || background || piped || !here.iter().all(|h| *h);
         let targets: Vec<String> = seg.redirects.iter().map(|r| r.target.clone()).collect();
-        let payloads = code_texts(&seg.argv, &effs, &targets, depth, cache);
+        let payloads = code_texts_bounded(
+            &seg.argv,
+            &effs,
+            &targets,
+            depth,
+            cache,
+            &mut out.unbounded_unknown_words,
+        );
         for p in &payloads {
             let l = lex_depth_fresh(p, depth + 1, cache);
             out.overflow |= l.overflow;
+            out.unbounded_unknown_words
+                .extend(l.unbounded_unknown_words.iter().cloned());
             payload_units.extend(l.units.into_iter().map(|mut u| {
                 if u.ctx == l.ctx {
                     u.same_shell = same_shell_owner;
@@ -1354,6 +1374,8 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
     for (t, owner, union) in &texts {
         let l = lex_depth_fresh(t, depth + 1, cache);
         out.overflow |= l.overflow;
+        out.unbounded_unknown_words
+            .extend(l.unbounded_unknown_words.iter().cloned());
         let mut units = vec![];
         for mut u in l.units {
             u.derived = true;
@@ -1855,7 +1877,12 @@ pub fn unwrap(argv: &[String]) -> Vec<String> {
 /// not be allowed by a rule (it is read as if the option were a flag, as
 /// before).
 pub fn unwrap_checked(argv: &[String]) -> (Vec<String>, bool) {
-    let (eff, unknown, choices) = unwrap_reading(argv, 0, None, None);
+    let mut cache = LexCache::default();
+    unwrap_checked_at(argv, 0, &mut cache)
+}
+
+fn unwrap_checked_at(argv: &[String], depth: u8, cache: &mut LexCache) -> (Vec<String>, bool) {
+    let (eff, unknown, choices) = unwrap_reading(argv, 0, Some(depth), Some(cache));
     (eff, unknown || choices > 0)
 }
 
@@ -1922,12 +1949,13 @@ fn pipe_code_eff(e: &[String], depth: u8, cache: &mut LexCache) -> bool {
 /// substitution names `env`: `$(which env) -C ..`), the output of a `$(…)`
 /// run as code or as the command word, and a process substitution a shell
 /// or `source` runs (`bash <(…)`, `bash < <(…)`).
-fn code_texts(
+fn code_texts_bounded(
     argv: &[String],
     effs: &[Vec<String>],
     targets: &[String],
     depth: u8,
     cache: &mut LexCache,
+    unbounded_words: &mut Vec<Vec<String>>,
 ) -> Vec<String> {
     let mut payloads: Vec<String> = vec![];
     let add = |v: Vec<String>, out: &mut Vec<String>| {
@@ -1940,10 +1968,16 @@ fn code_texts(
     for e in effs {
         add(payloads_of(e), &mut payloads);
     }
-    add(env_payloads(argv), &mut payloads);
+    add(
+        env_payloads_bounded(argv, depth, cache, unbounded_words),
+        &mut payloads,
+    );
     for step in unwrap_steps(argv, depth, cache) {
         if step.first().is_some_and(|f| base(f) == "env") {
-            add(env_payloads(&step), &mut payloads);
+            add(
+                env_payloads_bounded(&step, depth, cache, unbounded_words),
+                &mut payloads,
+            );
         }
     }
     // the output of a `$(…)` that is run as code: `sh -c "$(echo …)"`,
@@ -2058,14 +2092,80 @@ pub fn shell_c_codes(eff: &[String]) -> Vec<String> {
 /// A command word built by a substitution that names a program plainly is
 /// read as that program, at every step (`$(which env) $(which sudo) id`:
 /// round 8 blocker 4); `depth` bounds the substitutions read.
+const MAX_UNKNOWN_STARTS: usize = 24;
+const MAX_UNKNOWN_EMIT: usize = 32;
+
 fn unwrap_readings(argv: &[String], depth: u8, cache: &mut LexCache) -> Vec<Vec<String>> {
-    let (first, _, choices) = unwrap_reading(argv, 0, Some(depth), Some(cache));
+    let mut unused = vec![];
+    unwrap_readings_bounded(argv, depth, cache, &mut unused)
+}
+
+fn unwrap_readings_bounded(
+    argv: &[String],
+    depth: u8,
+    cache: &mut LexCache,
+    unbounded_words: &mut Vec<Vec<String>>,
+) -> Vec<Vec<String>> {
+    let mut invs: Vec<(Vec<String>, bool)> = vec![];
+    let mut unbounded = false;
+    let (first, _, mut choices) = unwrap_reading_steps(
+        argv,
+        0,
+        Some(depth),
+        None,
+        Some(cache),
+        Some(&mut invs),
+        &mut unbounded,
+    );
     let mut out = vec![first];
-    for mask in 1..(1u32 << choices.min(4)) {
-        let e = unwrap_reading(argv, mask, Some(depth), Some(cache)).0;
+    let mut mask = 1u32;
+    while mask < (1u32 << choices.min(4)) {
+        let (e, _, cur_choices) = unwrap_reading_steps(
+            argv,
+            mask,
+            Some(depth),
+            None,
+            Some(cache),
+            Some(&mut invs),
+            &mut unbounded,
+        );
+        choices = choices.max(cur_choices);
         if !out.contains(&e) {
             out.push(e);
         }
+        mask += 1;
+    }
+    if choices > 4 {
+        let (e, _, _) = unwrap_reading_steps(
+            argv,
+            u32::MAX,
+            Some(depth),
+            None,
+            Some(cache),
+            Some(&mut invs),
+            &mut unbounded,
+        );
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    for (inv, is_env) in invs {
+        expand_unknown_env_cmd(
+            &inv,
+            is_env,
+            depth,
+            cache,
+            Some(&mut out),
+            None,
+            &mut unbounded,
+            0,
+        );
+        if unbounded && !unbounded_words.contains(&inv) {
+            unbounded_words.push(inv);
+        }
+    }
+    if unbounded && unbounded_words.is_empty() {
+        unbounded_words.push(argv.to_vec());
     }
     out
 }
@@ -2133,9 +2233,54 @@ fn take_opt(
 /// cat x` passes through `env -C .. cat x` (M1-18, K1).
 fn unwrap_steps(argv: &[String], depth: u8, cache: &mut LexCache) -> Vec<Vec<String>> {
     let mut steps: Vec<Vec<String>> = vec![];
-    let (_, _, choices) = unwrap_reading_steps(argv, 0, Some(depth), Some(&mut steps), Some(cache));
-    for mask in 1..(1u32 << choices.min(4)) {
-        unwrap_reading_steps(argv, mask, Some(depth), Some(&mut steps), Some(cache));
+    let mut invs: Vec<(Vec<String>, bool)> = vec![];
+    let mut unbounded = false;
+    let mut choices = 0u32;
+    let mut mask = 0u32;
+    loop {
+        let (_, _, cur_choices) = unwrap_reading_steps(
+            argv,
+            mask,
+            Some(depth),
+            Some(&mut steps),
+            Some(cache),
+            Some(&mut invs),
+            &mut unbounded,
+        );
+        choices = choices.max(cur_choices);
+        mask += 1;
+        if mask >= (1u32 << choices.min(4)) {
+            break;
+        }
+    }
+    if choices > 4 {
+        unwrap_reading_steps(
+            argv,
+            u32::MAX,
+            Some(depth),
+            Some(&mut steps),
+            Some(cache),
+            Some(&mut invs),
+            &mut unbounded,
+        );
+    }
+    let mut extra_readings: Vec<Vec<String>> = vec![];
+    for (inv, is_env) in invs {
+        expand_unknown_env_cmd(
+            &inv,
+            is_env,
+            depth,
+            cache,
+            Some(&mut extra_readings),
+            None,
+            &mut unbounded,
+            0,
+        );
+    }
+    for r in extra_readings {
+        if steps.len() < 64 && !steps.contains(&r) {
+            steps.push(r);
+        }
     }
     steps
 }
@@ -2146,7 +2291,8 @@ fn unwrap_reading(
     resolve: Option<u8>,
     cache: Option<&mut LexCache>,
 ) -> (Vec<String>, bool, u32) {
-    unwrap_reading_steps(argv, mask, resolve, None, cache)
+    let mut unbounded = false;
+    unwrap_reading_steps(argv, mask, resolve, None, cache, None, &mut unbounded)
 }
 
 fn unwrap_reading_steps(
@@ -2155,7 +2301,11 @@ fn unwrap_reading_steps(
     resolve: Option<u8>,
     mut steps: Option<&mut Vec<Vec<String>>>,
     mut cache: Option<&mut LexCache>,
+    mut unknown_invs: Option<&mut Vec<(Vec<String>, bool)>>,
+    unbounded: &mut bool,
 ) -> (Vec<String>, bool, u32) {
+    let mut local_cache = LexCache::default();
+    let depth = resolve.unwrap_or(0);
     let mut a: Vec<String> = argv.to_vec();
     let mut unknown = false;
     let mut choices = 0u32;
@@ -2165,10 +2315,7 @@ fn unwrap_reading_steps(
             && has_command_substitution(first)
             && let Some(name) = match cache.as_deref_mut() {
                 Some(c) => substituted_program_at(first, d, c),
-                None => {
-                    let mut tmp = LexCache::default();
-                    substituted_program_at(first, d, &mut tmp)
-                }
+                None => substituted_program_at(first, d, &mut local_cache),
             }
         {
             a[0] = name;
@@ -2182,7 +2329,12 @@ fn unwrap_reading_steps(
         }
         let b = base(first).to_string();
         // options with a table, then `operands` words before the command
-        let mut table = |a: &mut Vec<String>, o: &Opts, operands: usize| -> usize {
+        let table = |a: &mut Vec<String>,
+                     o: &Opts,
+                     operands: usize,
+                     choices: &mut u32,
+                     unk: &mut bool|
+         -> usize {
             let mut j = 1;
             while j < a.len() {
                 let w = a[j].as_str();
@@ -2193,13 +2345,15 @@ fn unwrap_reading_steps(
                 if !is_option(w) {
                     break;
                 }
-                match take_opt(a, j, o, false, mask, &mut choices, &mut unknown) {
+                match take_opt(a, j, o, false, mask, choices, unk) {
                     Opt::Words(n) => j += n,
                     _ => j += 1,
                 }
             }
             (j + operands).min(a.len())
         };
+        let mut step_unknown = false;
+        let orig_a = (b == "env" || b == "command").then(|| a.clone());
         let n = match b.as_str() {
             "{" | "}" | "!" | "do" | "then" | "else" | "elif" | "if" | "while" | "until"
             | "coproc" => 1,
@@ -2210,7 +2364,7 @@ fn unwrap_reading_steps(
                 if matches!(b.as_str(), "busybox" | "toybox") {
                     1
                 } else {
-                    table(&mut a, &o, 0)
+                    table(&mut a, &o, 0, &mut choices, &mut step_unknown)
                 }
             }
             "timeout" | "chrt" | "taskset" => {
@@ -2224,7 +2378,7 @@ fn unwrap_reading_steps(
                 {
                     0
                 } else {
-                    table(&mut a, &o, 1)
+                    table(&mut a, &o, 1, &mut choices, &mut step_unknown)
                 }
             }
             "arch" => {
@@ -2236,7 +2390,7 @@ fn unwrap_reading_steps(
                         "-c" | "-h" | "-32" | "-64" | "-x86_64" | "-arm64" | "-arm64e"
                         | "-i386" | "-x86_64h" => j += 1,
                         _ => {
-                            unknown = true;
+                            step_unknown = true;
                             j += 1;
                         }
                     }
@@ -2247,7 +2401,7 @@ fn unwrap_reading_steps(
                 // `chroot [opts] NEWROOT [COMMAND…]`; without a command it
                 // starts a shell (see `reads_stdin_as_script`).
                 let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
-                let j = table(&mut a, &o, 0);
+                let j = table(&mut a, &o, 0, &mut choices, &mut step_unknown);
                 if j + 1 < a.len() { j + 1 } else { 0 }
             }
             "flock" | "script" => {
@@ -2273,7 +2427,7 @@ fn unwrap_reading_steps(
                         break;
                     }
                     if is_option(w) {
-                        match take_opt(&mut a, j, &o, true, mask, &mut choices, &mut unknown) {
+                        match take_opt(&mut a, j, &o, true, mask, &mut choices, &mut step_unknown) {
                             Opt::Words(n) => j += n,
                             Opt::Shell(s) => {
                                 shell_string = s;
@@ -2302,15 +2456,29 @@ fn unwrap_reading_steps(
                 }
                 if let Some(cmd) = shell_string {
                     a = vec!["sh".into(), "-c".into(), cmd];
+                    unknown |= step_unknown;
                     continue;
                 }
                 if file_seen && j < a.len() { j } else { 0 }
             }
-            "env" => scan_env(&mut a, 1, mask, &mut choices, &mut unknown)
-                .cmd_index
-                .min(a.len()),
+            "env" => {
+                let c = cache.as_deref_mut().unwrap_or(&mut local_cache);
+                let scan = scan_env(&mut a, 1, mask, &mut choices, &mut step_unknown, depth, c);
+                *unbounded |= scan.unbounded;
+                scan.cmd_index.min(a.len())
+            }
             _ => break,
         };
+        unknown |= step_unknown;
+        if step_unknown
+            && let Some(orig) = orig_a
+            && let Some(invs) = unknown_invs.as_deref_mut()
+        {
+            let entry = (orig, b == "env");
+            if !invs.contains(&entry) {
+                invs.push(entry);
+            }
+        }
         if n == 0 {
             break;
         }
@@ -2350,9 +2518,12 @@ fn env_cluster(w: &str) -> Option<(char, String)> {
 
 /// Splits a string into words the way a shell would (quotes, escapes);
 /// assignments stay words. Used for `env -S`.
-fn split_words(text: &str) -> Vec<String> {
-    let l = lex(text);
-    match l.units.into_iter().find(|u| !u.derived) {
+fn split_words(text: &str, depth: u8, cache: &mut LexCache) -> (Vec<String>, bool) {
+    let l = lex_depth_cached(text, depth, cache);
+    if depth > MAX_DEPTH {
+        return (text.split_whitespace().map(str::to_string).collect(), true);
+    }
+    let words = match l.units.iter().find(|u| !u.derived) {
         Some(u) => {
             let mut w: Vec<String> = u
                 .seg
@@ -2360,11 +2531,12 @@ fn split_words(text: &str) -> Vec<String> {
                 .iter()
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
-            w.extend(u.seg.argv);
+            w.extend(u.seg.argv.iter().cloned());
             w
         }
         None => text.split_whitespace().map(str::to_string).collect(),
-    }
+    };
+    (words, false)
 }
 
 fn is_assignment_word(w: &str) -> bool {
@@ -3060,6 +3232,7 @@ struct EnvScan {
     chdir: Option<String>,
     split_texts: Vec<String>,
     cmd_index: usize,
+    unbounded: bool,
 }
 
 /// Scans `env` options starting at `start`, reading unknown long and short
@@ -3071,6 +3244,8 @@ fn scan_env(
     mask: u32,
     choices: &mut u32,
     unknown: &mut bool,
+    depth: u8,
+    cache: &mut LexCache,
 ) -> EnvScan {
     let mut pick = || {
         let bit = *choices < 32 && (mask >> *choices) & 1 == 1;
@@ -3080,6 +3255,7 @@ fn scan_env(
     let mut chdir: Option<String> = None;
     let mut split_texts: Vec<String> = vec![];
     let mut splices = 0usize;
+    let mut unbounded = false;
     let mut j = start;
     while j < a.len() {
         // `--chd`, `--spl`, `--arg`: GNU prefixes (round 8 blocker 1)
@@ -3109,6 +3285,13 @@ fn scan_env(
             || w.starts_with("--split-string=")
             || matches!(cluster, Some(('S', _)))
         {
+            if cluster.is_some() && !env_flags_ok(w) {
+                *unknown = true;
+                if pick() {
+                    j += 1;
+                    continue;
+                }
+            }
             // a command line: splice its words in, split like a shell
             // (`-S`, `-S'…'`, `-iS '…'`)
             let after_s = match cluster {
@@ -3127,10 +3310,16 @@ fn scan_env(
                 split_texts.push(text.clone());
                 if splices < 16 {
                     splices += 1;
-                    let words = split_words(&text);
+                    let (words, depth_exceeded) = split_words(&text, depth + 1, cache);
+                    if depth_exceeded {
+                        *unknown = true;
+                        unbounded = true;
+                    }
                     let end = (j + width).min(a.len());
                     a.splice(j..end, words);
                 } else {
+                    *unknown = true;
+                    unbounded = true;
                     j += width;
                 }
             } else {
@@ -3142,40 +3331,43 @@ fn scan_env(
             if !ok {
                 *unknown = true;
             }
+            if !ok && !rest.is_empty() && pick() {
+                j += 1;
+                continue;
+            }
             let take_two = if !ok && rest.is_empty() {
                 !pick()
             } else {
                 rest.is_empty()
             };
             if letter == 'C' {
-                chdir = if rest.is_empty() {
+                if rest.is_empty() {
                     if take_two {
-                        a.get(j + 1).cloned()
-                    } else {
-                        None
+                        chdir = a.get(j + 1).cloned();
                     }
                 } else {
-                    Some(rest)
-                };
+                    chdir = Some(rest);
+                }
             }
             j += if take_two { 2 } else { 1 };
         } else if w.starts_with("--") {
             let name = w.split_once('=').map_or(w, |(n, _)| n);
-            if !matches!(
+            let known_no_val = matches!(
                 name,
                 "--ignore-environment"
                     | "--null"
-                    | "--unset"
-                    | "--chdir"
-                    | "--argv0"
                     | "--debug"
-                    | "--block-signal"
-                    | "--default-signal"
-                    | "--ignore-signal"
                     | "--list-signal-handling"
                     | "--help"
                     | "--version"
-            ) {
+            );
+            let known_opt_val = matches!(
+                name,
+                "--block-signal" | "--default-signal" | "--ignore-signal"
+            );
+            let known_val = matches!(name, "--unset" | "--chdir" | "--argv0");
+            if (known_no_val && w.contains('=')) || (!known_no_val && !known_opt_val && !known_val)
+            {
                 *unknown = true;
                 // its value may be the next word (round 8 blocker 5)
                 if !w.contains('=') && pick() {
@@ -3201,10 +3393,210 @@ fn scan_env(
         chdir,
         split_texts,
         cmd_index: j,
+        unbounded,
     }
 }
 
-fn env_payloads(argv: &[String]) -> Vec<String> {
+fn push_bounded_str(out: &mut Vec<String>, val: String, unbounded: &mut bool) {
+    if out.contains(&val) {
+        return;
+    }
+    if out.len() < MAX_UNKNOWN_EMIT {
+        out.push(val);
+    } else {
+        *unbounded = true;
+    }
+}
+
+fn push_bounded_vec(out: &mut Vec<Vec<String>>, val: Vec<String>, unbounded: &mut bool) {
+    if val.is_empty() || out.contains(&val) {
+        return;
+    }
+    if out.len() < MAX_UNKNOWN_EMIT {
+        out.push(val);
+    } else {
+        *unbounded = true;
+    }
+}
+
+/// Fail-closed expansion for an unknown `env` or `command` invocation:
+/// treats every remaining non-option word as a possible start of the payload
+/// and collects every `-C`/`--chdir` and `-S`/`--split-string` value.
+#[allow(clippy::too_many_arguments)]
+fn expand_unknown_env_cmd(
+    a: &[String],
+    is_env: bool,
+    depth: u8,
+    cache: &mut LexCache,
+    mut readings: Option<&mut Vec<Vec<String>>>,
+    mut payloads: Option<&mut Vec<String>>,
+    unbounded: &mut bool,
+    rec_depth: u8,
+) {
+    if rec_depth > 4 || a.len() > MAX_UNKNOWN_STARTS {
+        *unbounded = true;
+        return;
+    }
+    let mut split_vals: Vec<(usize, String)> = vec![];
+    let mut chdir_vals: Vec<(usize, String)> = vec![];
+    if is_env {
+        for m in 1..a.len() {
+            let w = &a[m];
+            let long = if w.starts_with("--") {
+                env_long(w)
+            } else {
+                None
+            };
+            let lw = long.as_deref().unwrap_or(w.as_str());
+            if lw == "--split-string" {
+                if let Some(v) = a.get(m + 1) {
+                    split_vals.push((m, v.clone()));
+                }
+            } else if let Some(v) = lw.strip_prefix("--split-string=") {
+                split_vals.push((m, v.to_string()));
+            } else if lw == "--chdir" {
+                if let Some(v) = a.get(m + 1) {
+                    chdir_vals.push((m, v.clone()));
+                }
+            } else if let Some(v) = lw.strip_prefix("--chdir=") {
+                chdir_vals.push((m, v.to_string()));
+            } else if w.starts_with('-') && !w.starts_with("--") {
+                for (pos, _) in w[1..].match_indices('S') {
+                    let after = &w[1 + pos + 1..];
+                    if !after.is_empty() {
+                        split_vals.push((m, after.to_string()));
+                    } else if let Some(v) = a.get(m + 1) {
+                        split_vals.push((m, v.clone()));
+                    }
+                }
+                for (pos, _) in w[1..].match_indices('C') {
+                    let after = &w[1 + pos + 1..];
+                    if !after.is_empty() {
+                        chdir_vals.push((m, after.to_string()));
+                    } else if let Some(v) = a.get(m + 1) {
+                        chdir_vals.push((m, v.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    for (m, s) in &split_vals {
+        if let Some(p) = payloads.as_deref_mut() {
+            push_bounded_str(p, s.clone(), unbounded);
+        }
+        let (sw, depth_exceeded) = split_words(s, depth + 1, cache);
+        if depth_exceeded {
+            *unbounded = true;
+        }
+        let mut sp = sw;
+        sp.extend_from_slice(&a[*m + 1..]);
+        if !sp.is_empty() {
+            if sp.len() > MAX_UNKNOWN_STARTS {
+                *unbounded = true;
+            } else {
+                if let Some(r) = readings.as_deref_mut() {
+                    push_bounded_vec(r, sp.clone(), unbounded);
+                }
+                if sp[0].starts_with('-') || is_assignment_word(&sp[0]) {
+                    let mut wrapped = vec!["env".to_string()];
+                    wrapped.extend(sp);
+                    expand_unknown_env_cmd(
+                        &wrapped,
+                        true,
+                        depth,
+                        cache,
+                        readings.as_deref_mut(),
+                        payloads.as_deref_mut(),
+                        unbounded,
+                        rec_depth + 1,
+                    );
+                } else {
+                    let b0 = base(&sp[0]);
+                    if b0 == "env" || b0 == "command" {
+                        expand_unknown_env_cmd(
+                            &sp,
+                            b0 == "env",
+                            depth,
+                            cache,
+                            readings.as_deref_mut(),
+                            payloads.as_deref_mut(),
+                            unbounded,
+                            rec_depth + 1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    for i in 1..a.len() {
+        let w = &a[i];
+        if w == "--" || is_assignment_word(w) || is_option(w) {
+            continue;
+        }
+        let cand = &a[i..];
+        let mut resolved = cand.to_vec();
+        if has_command_substitution(&resolved[0])
+            && let Some(name) = substituted_program_at(&resolved[0], depth, cache)
+        {
+            resolved[0] = name;
+        }
+        if let Some(r) = readings.as_deref_mut() {
+            push_bounded_vec(r, resolved.clone(), unbounded);
+        }
+        let b0 = base(&resolved[0]).to_string();
+        if b0 == "env" || b0 == "command" {
+            expand_unknown_env_cmd(
+                &resolved,
+                b0 == "env",
+                depth,
+                cache,
+                readings.as_deref_mut(),
+                payloads.as_deref_mut(),
+                unbounded,
+                rec_depth + 1,
+            );
+        } else if wrapper_opts(&b0).is_some() {
+            let mut local_unbounded = vec![];
+            for r_sub in unwrap_readings_bounded(&resolved, depth, cache, &mut local_unbounded) {
+                if let Some(r) = readings.as_deref_mut() {
+                    push_bounded_vec(r, r_sub, unbounded);
+                }
+            }
+            if !local_unbounded.is_empty() {
+                *unbounded = true;
+            }
+        }
+        if is_env && let Some(p) = payloads.as_deref_mut() {
+            for (m, d) in &chdir_vals {
+                if *m < i {
+                    let rest: Vec<String> = cand.iter().map(|cw| quote(cw)).collect();
+                    push_bounded_str(
+                        p,
+                        format!("cd {} && {}", quote(d), rest.join(" ")),
+                        unbounded,
+                    );
+                }
+            }
+        }
+    }
+
+    if is_env && let Some(p) = payloads {
+        for (_, d) in &chdir_vals {
+            for (_, s) in &split_vals {
+                push_bounded_str(p, format!("cd {} && {s}", quote(d)), unbounded);
+            }
+        }
+    }
+}
+
+fn env_payloads_bounded(
+    argv: &[String],
+    depth: u8,
+    cache: &mut LexCache,
+    unbounded_words: &mut Vec<Vec<String>>,
+) -> Vec<String> {
     let mut out = vec![];
     let Some(k) = argv.iter().position(|w| base(w) == "env") else {
         return out;
@@ -3216,27 +3608,58 @@ fn env_payloads(argv: &[String]) -> Vec<String> {
     };
     let mut choices = 0u32;
     let mut mask = 0u32;
-    loop {
+    let mut any_unknown = false;
+    let mut unbounded = false;
+    let mut run_mask = |m: u32,
+                        out_push: &mut dyn FnMut(String),
+                        any_unknown: &mut bool,
+                        unbounded: &mut bool|
+     -> u32 {
         let mut a = argv[k..].to_vec();
         let mut cur_choices = 0u32;
         let mut unknown = false;
-        let res = scan_env(&mut a, 1, mask, &mut cur_choices, &mut unknown);
-        if mask == 0 {
-            choices = cur_choices;
-        }
+        let res = scan_env(&mut a, 1, m, &mut cur_choices, &mut unknown, depth, cache);
+        *any_unknown |= unknown;
+        *unbounded |= res.unbounded;
         for t in res.split_texts {
-            push(t);
+            out_push(t);
         }
         if let Some(d) = res.chdir {
             let rest: Vec<String> = a[res.cmd_index.min(a.len())..]
                 .iter()
                 .map(|w| quote(w))
                 .collect();
-            push(format!("cd {} && {}", quote(&d), rest.join(" ")));
+            out_push(format!("cd {} && {}", quote(&d), rest.join(" ")));
         }
+        cur_choices
+    };
+    loop {
+        let cur_choices = run_mask(mask, &mut push, &mut any_unknown, &mut unbounded);
+        choices = choices.max(cur_choices);
         mask += 1;
         if mask >= (1u32 << choices.min(4)) {
             break;
+        }
+    }
+    if choices > 4 {
+        run_mask(u32::MAX, &mut push, &mut any_unknown, &mut unbounded);
+    }
+    if any_unknown || unbounded {
+        expand_unknown_env_cmd(
+            &argv[k..],
+            true,
+            depth,
+            cache,
+            None,
+            Some(&mut out),
+            &mut unbounded,
+            0,
+        );
+        if unbounded {
+            let slice = argv[k..].to_vec();
+            if !unbounded_words.contains(&slice) {
+                unbounded_words.push(slice);
+            }
         }
     }
     out
@@ -3322,13 +3745,21 @@ fn find_exec_units(eff: &[String], out: &mut Lexed, level: u8, cache: &mut LexCa
             }
             // every reading of its wrappers and substituted words (`-exec
             // $(which sudo) id`: round 8 blocker 4)
-            let mut effs = vec![unwrap(&argv)];
-            for r in unwrap_readings(&argv, level, cache) {
+            let mut effs = vec![unwrap_checked_at(&argv, level, cache).0];
+            for r in unwrap_readings_bounded(&argv, level, cache, &mut out.unbounded_unknown_words)
+            {
                 if !r.is_empty() && !effs.contains(&r) {
                     effs.push(r);
                 }
             }
-            let payloads = code_texts(&argv, &effs, &[], level, cache);
+            let payloads = code_texts_bounded(
+                &argv,
+                &effs,
+                &[],
+                level,
+                cache,
+                &mut out.unbounded_unknown_words,
+            );
             for e in &effs {
                 out.units.push(Unit {
                     seg: Segment {
@@ -3362,6 +3793,8 @@ fn find_exec_units(eff: &[String], out: &mut Lexed, level: u8, cache: &mut LexCa
             for p in &payloads {
                 let l = lex_depth_fresh(p, level + 1, cache);
                 out.overflow |= l.overflow;
+                out.unbounded_unknown_words
+                    .extend(l.unbounded_unknown_words.iter().cloned());
                 for mut u in l.units {
                     u.derived = true;
                     out.units.push(u);

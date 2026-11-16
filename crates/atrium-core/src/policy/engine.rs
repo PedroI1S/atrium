@@ -119,10 +119,15 @@ fn allow_covers(
     a: &Analysis,
     paths: &[PathBuf],
     part_ids: &[usize],
+    glob_leaves: bool,
 ) -> Vec<bool> {
     let n = part_ids.len().max(1);
     let none = vec![false; n];
     if !name_matches(rule, input) || matches!(input.check.subject, ToolSubject::Unknown) {
+        return none;
+    }
+    // D-100: an escaping search glob is covered only by an unscoped `Any` rule.
+    if glob_leaves && !(matches!(rule.matcher, RuleMatcher::Any) && rule.path_scope.is_none()) {
         return none;
     }
     let command = matches!(input.check.subject, ToolSubject::Command { .. });
@@ -176,7 +181,12 @@ struct RuleOutcome {
     any_allow: bool,
 }
 
-fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOutcome {
+fn apply_rules(
+    input: &PolicyInput<'_>,
+    a: &Analysis,
+    rules: &[Rule],
+    glob_leaves: bool,
+) -> RuleOutcome {
     let paths = all_paths(input, a);
     let part_ids = if matches!(input.check.subject, ToolSubject::Command { .. }) {
         parts(a)
@@ -208,7 +218,7 @@ fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOut
             };
         }
         for r in ranked.iter().filter(|r| r.decision == RuleDecision::Allow) {
-            let c = allow_covers(r, input, a, &paths, &part_ids);
+            let c = allow_covers(r, input, a, &paths, &part_ids, glob_leaves);
             let is_any = matches!(r.matcher, RuleMatcher::Any)
                 && r.path_scope.is_none()
                 && !c.is_empty()
@@ -590,16 +600,47 @@ fn git_names_credential(arg: &str) -> bool {
     if arg.starts_with('-') && !arg.starts_with("-L") {
         return false;
     }
-    let path = if let Some(after) = arg.strip_prefix(":(") {
-        after.split_once(')').map_or(after, |(_, p)| p)
-    } else if let Some(after) = arg.strip_prefix(':') {
+    let path = if let Some(after) = arg.strip_prefix(':') {
         if let Some((n, p)) = after.split_once(':')
             && !n.is_empty()
             && n.chars().all(|c| c.is_ascii_digit())
         {
             p
         } else {
-            after.trim_start_matches(['/', '!', '^'])
+            let mut s = after;
+            loop {
+                if let Some(rest) = s.strip_prefix('(') {
+                    let mut depth = 1usize;
+                    let mut end = None;
+                    for (idx, ch) in rest.char_indices() {
+                        match ch {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = Some(idx);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let Some(end_idx) = end else {
+                        // Unclosed `:(...` pathspec magic: fail closed.
+                        return true;
+                    };
+                    s = &rest[end_idx + 1..];
+                } else if let Some(rest) = s.strip_prefix(['/', '!', '^', ':']) {
+                    s = rest;
+                } else {
+                    break;
+                }
+            }
+            if s.starts_with(['~', '@', '#', '+', '=', '%', '&', '$', '\\']) || s.contains(':') {
+                // Unrecognized `:` magic or unparsed prefix: fail closed.
+                return true;
+            }
+            s
         }
     } else if let Some((_, rest)) = arg.split_once(':') {
         rest
@@ -607,10 +648,16 @@ fn git_names_credential(arg: &str) -> bool {
         arg
     };
     let l = path.to_lowercase().replace('ſ', "s");
-    let parts: Vec<&str> = l
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect();
+    let mut parts: Vec<&str> = vec![];
+    for c in l.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(c),
+        }
+    }
     let Some(name) = parts.last() else {
         return false;
     };
@@ -818,7 +865,8 @@ impl PolicyEngine for DefaultPolicy {
         if let Some(id) = deny::hard_deny(input, &a) {
             return PolicyVerdict::HardDeny { id };
         }
-        let out = apply_rules(input, &a, rules);
+        let glob_leaves = deny::glob_escape(input).is_some_and(|e| e.leaves());
+        let out = apply_rules(input, &a, rules, glob_leaves);
         if let Some((reason, rule)) = out.deny {
             return PolicyVerdict::Deny {
                 reason: reason.unwrap_or_default(),
@@ -829,8 +877,8 @@ impl PolicyEngine for DefaultPolicy {
         // gives (M1-18, P1; D-100): hard-denied (above) if an expansion hits
         // the hard-deny list, otherwise allowed by FullAccess or an Any rule
         // and asked in Home/Normal/Trusted/Careful and under prefix/scoped rules.
-        let glob_leaves = deny::glob_escape(input).is_some_and(|e| e.leaves());
-        let unknown = matches!(input.check.subject, ToolSubject::Unknown);
+        let unknown =
+            matches!(input.check.subject, ToolSubject::Unknown) || a.unbounded_unknown_dangerous;
         let command = matches!(input.check.subject, ToolSubject::Command { .. });
         if !unknown
             && (!glob_leaves || out.any_allow)

@@ -736,6 +736,11 @@ pub fn subject_rows() -> Vec<SubjectRow> {
         "~/.npmrc",
         "../.git-credentials",
         "/h/u/.local/share/atrium/db",
+        "[.][.]/.ssh/id_ed25519",
+        ".[.]/.ssh/id_rsa",
+        "??/.ssh/id_rsa",
+        "[!a][!a]/.ssh/id_rsa",
+        "\\.\\./.ssh/id_rsa",
     ] {
         let id = if g.contains("atrium") { "AS" } else { "CR" };
         let want = if id == "AS" { ["AS", "AS", "AS"] } else { cr };
@@ -744,13 +749,8 @@ pub fn subject_rows() -> Vec<SubjectRow> {
         }
     }
     // leaves, can't be bounded, or names nothing on the hard-deny list: asks
-    // in every setting (like an `Unknown` subject)
+    // in Home and under prefix/PathGlob rules, allows under Any and FullAccess (D-100)
     for g in [
-        "[.][.]/.ssh/id_ed25519",
-        ".[.]/.ssh/id_rsa",
-        "??/.ssh/id_rsa",
-        "[!a][!a]/.ssh/id_rsa",
-        "\\.\\./.ssh/id_rsa",
         "~root/.ssh/*",
         "/etc/*.conf",
         "/etc/passwd",
@@ -1405,11 +1405,276 @@ fn fix1_cr12_home_anchored_non_recursive_globs() {
 /// these rows): two unknown options in a row hide `-C`. Allow under Any and
 /// FullAccess, the same as `dev` (Ask / Ask / Allow / Allow).
 #[test]
-#[ignore = "M1-18 fix1: two unknown env options in a row"]
 fn fix1_k1_two_unknown_env_options_in_a_row() {
     run_rows(&[row(
         "K1 fix1",
         "cwd=proj|env -Z X --yyy Y -C .. cat .ssh/id_rsa",
         H_CR,
     )]);
+}
+
+/// K1, fix round 2 (D-105): any mix/count of unknown options and `-ZS…`/`-ZC…`
+/// clusters in `env` and `command`, plus unbounded unknown invocations.
+#[test]
+fn fix2_k1_multiple_unknown_options_and_clusters() {
+    let ask_all = ["Ask", "Ask", "Ask", "Ask"];
+    let mut v = vec![];
+    for l in [
+        "env -Z X --yyy Y -C .. cat .ssh/id_rsa",
+        "env -Z X -Y W -C .. cat .ssh/id_rsa",
+        "env --xxx X --yyy Y -C .. cat .ssh/id_rsa",
+        "env --xxx X -Y W --chdir .. cat .ssh/id_rsa",
+        "env -Z X --yyy Y -S 'cat ../.ssh/id_rsa'",
+        "env -Z X --yyy Y --split-string 'cat ../.ssh/id_rsa'",
+        "env -Z X --yyy Y eval 'cd ~/.ssh && true' && cat id_rsa",
+        "env -Z X --yyy Y source /dev/stdin <<<'cd ~/.ssh && true' && cat id_rsa",
+        "env -Z X --yyy Y . /dev/stdin <<<'cd ~/.ssh && true' && cat id_rsa",
+        "env -ZSfoo eval 'cd ~/.ssh && true' && cat id_rsa",
+        "env -C .. -ZCproj cat .ssh/id_rsa",
+        "env -C .. -ZC sub cat .ssh/id_rsa",
+        "command -Z X -Y W eval 'cd ~/.ssh && true' && cat id_rsa",
+        "env -Z X command -Y W eval 'cd ~/.ssh && true' && cat id_rsa",
+        "env -Z -- -C .. cat .ssh/id_rsa",
+    ] {
+        v.push(row("K1 fix2", format!("cwd=proj|{l}"), H_CR));
+    }
+    for l in [
+        "env -Z X --yyy Y bash <(echo 'rm -rf ~')",
+        "env -Z X --yyy Y source <(echo 'rm -rf ~')",
+        "env -Z X --yyy Y . <(echo 'rm -rf ~')",
+        "env -ZSfoo bash <(echo 'rm -rf ~')",
+    ] {
+        v.push(row("K1 fix2", format!("cwd=proj|{l}"), H_RD));
+    }
+    v.push(row("K1 fix2", "cwd=proj|env -ZSfoo sudo id", H_PE));
+
+    // Unbounded (> 24 words) unknown `env` with dangerous word -> Ask everywhere
+    let many_opts: Vec<String> = (0..14).map(|i| format!("-A{i} v{i}")).collect();
+    let unbounded_bad = format!("cwd=proj|env {} -C .. cat foo", many_opts.join(" "));
+    v.push(row("K1 fix2 unbounded", unbounded_bad, ask_all));
+
+    // Unbounded (> 24 words) unknown `env` with only safe local words -> keeps Ask / Ask / Allow / Allow
+    let unbounded_ok = format!("cwd=proj|env {} make", many_opts.join(" "));
+    v.push(row("K1 fix2 unbounded safe", unbounded_ok, DEV_ASK));
+
+    run_rows(&v);
+}
+
+/// P1, fix round 2 (D-105): `$HOME`/`$PWD`/`$VAR` anchors, widened character
+/// classes / `?` / `\`, and `search_glob_hit` from `~` (including `recursive: false`).
+#[test]
+fn fix2_p1_anchors_widening_and_home_search_globs() {
+    use ToolKind::Search;
+    let cr = ["CR", "CR", "CR"];
+    let d100 = ["Ask", "Allow", "Allow"];
+    let mut v = vec![];
+    for (paths, glob, recursive) in [
+        (&["~/proj"][..], "$HOME/.ssh/id_rsa", true),
+        (&["~/proj"][..], "$HOME/.ssh/id_rsa", false),
+        (&["~/proj"][..], "${HOME}/.ssh/id_rsa", true),
+        (&["~/proj"][..], "$PWD/../.ssh/id_rsa", true),
+        (&["~"][..], ".ssh/id_rsa", false),
+        (&["~"][..], "~/.ssh/id_rsa", false),
+        (&["~"][..], ".aws/credentials", false),
+        (&["~"][..], ".npmrc", false),
+        (&["~"][..], "**/../.ssh/id_rsa", false),
+        (&["~"][..], ".ssh/id_rsa", true),
+        (&["~"][..], "~/.ssh/id_rsa", true),
+        (&["~"][..], "**/../.ssh/id_rsa", true),
+        (&["~/proj"][..], "[.][.]/.ssh/id_ed25519", true),
+        (&["~/proj"][..], ".[.]/.ssh/id_rsa", true),
+        (&["~/proj"][..], "??/.ssh/id_rsa", true),
+        (&["~/proj"][..], "[!a][!a]/.ssh/id_rsa", true),
+        (&["~/proj"][..], "\\.\\./.ssh/id_rsa", true),
+        (&["~/proj"][..], "[.]/../.ssh/id_rsa", true),
+        (&["~/proj"][..], "**/[.][.]/.ssh/id_rsa", true),
+        (&["~/proj"][..], "$UNKNOWN_DIR/.ssh/id_rsa", true),
+    ] {
+        v.push(subject("P1 fix2", Search, paths, Some(glob), recursive, cr));
+    }
+    v.push(subject(
+        "P1 fix2",
+        Search,
+        &["~/proj"],
+        Some("$UNKNOWN_DIR/*.rs"),
+        true,
+        d100,
+    ));
+    run_subject_list(v);
+}
+
+/// CR-12, fix round 2 (D-105): normalized relative/home globs in
+/// `ask_search_glob_hit`, and arbitrary short/long/`:-`terminated git pathspec
+/// magic (fail-closed on unparseable `:` magic).
+#[test]
+fn fix2_cr12_noncanonical_globs_and_git_pathspec_magic() {
+    use ToolKind::Search;
+    let ask_subj = ["Ask", "Allow", "Allow"];
+    let subj_rows: Vec<SubjectRow> = [
+        ".cargo/./credentials.toml",
+        ".cargo//credentials.toml",
+        "proj/../.cargo/credentials.toml",
+        "~/./.cargo/credentials.toml",
+    ]
+    .into_iter()
+    .map(|g| subject("CR-12 fix2", Search, &["~"], Some(g), false, ask_subj))
+    .collect();
+    run_subject_list(subj_rows);
+
+    let cmd_rows: Vec<Row> = [
+        "git log -p -- '::.npmrc'",
+        "git diff HEAD~1 -- '::.env'",
+        "git log -p -- ':/:.npmrc'",
+        "git diff HEAD~1 -- ':!:.env'",
+        "git log -p -- ':^:.pypirc'",
+        "git log -p -- ':!(top).env'",
+        "git log -p -- ':/:(icase).npmrc'",
+        "git log -p -- ':(unclosed'",
+        "git log -p -- ':~.env'",
+    ]
+    .into_iter()
+    .map(|l| row("CR-12 fix2", l, DEV_ASK))
+    .collect();
+    run_rows(&cmd_rows);
+}
+
+/// Major 4, fix round 2 (D-105): higher-scope `PathGlob` or `path_scope`d
+/// `Any` Allow rules must not cover an escaping glob and mask a lower-scope
+/// `Deny` rule.
+#[test]
+fn fix2_d100_thread_scope_allow_does_not_mask_global_deny() {
+    let check = paths_check(
+        ToolKind::Search,
+        "Glob",
+        &["~/proj/src"],
+        true,
+        Some("../other/*.rs"),
+    );
+    let eval = |rules: Vec<Rule>, preset: Preset| {
+        let mut env = Env::home();
+        env.cwd = format!("{HOME}/proj").into();
+        short(&env.eval_check(&check, &rules, preset))
+    };
+    let thread_scope = RuleScope::Thread {
+        thread_id: Env::home().thread,
+    };
+    let thread_path_allow = rule(
+        thread_scope.clone(),
+        ToolKind::Search,
+        RuleMatcher::PathGlob {
+            glob: format!("{HOME}/proj/**"),
+        },
+        RuleDecision::Allow,
+        "thread-path",
+    );
+    let thread_scoped_any_allow = Rule {
+        path_scope: Some(format!("{HOME}/proj/**")),
+        ..rule(
+            thread_scope,
+            ToolKind::Search,
+            RuleMatcher::Any,
+            RuleDecision::Allow,
+            "thread-scoped-any",
+        )
+    };
+    let global_deny = rule(
+        RuleScope::Global,
+        ToolKind::Search,
+        RuleMatcher::Any,
+        RuleDecision::Deny,
+        "global-deny",
+    );
+    for allow in [thread_path_allow, thread_scoped_any_allow] {
+        for preset in [Preset::Home, Preset::FullAccess] {
+            let got = eval(vec![allow.clone(), global_deny.clone()], preset);
+            assert!(
+                want_ok(&got, "Deny"),
+                "expected Deny under {preset:?} with {}: got {got}",
+                allow.id.0
+            );
+        }
+    }
+}
+
+/// Minor 5, fix round 2 (D-105): `split_words` uses the shared `LexCache` and
+/// respects `MAX_DEPTH`, keeping nested `env -S` linear.
+#[test]
+fn fix2_nested_env_split_string_is_linear() {
+    let mut cmd = "make".to_string();
+    for _ in 0..6 {
+        let escaped = cmd.replace('\\', "\\\\").replace('"', "\\\"");
+        cmd = format!("env -Z X -S \"{escaped}\"");
+    }
+    let start = std::time::Instant::now();
+    for (_, rules, preset) in engine_settings(ToolKind::Execute) {
+        let v = eval_line(&cmd, &rules, preset);
+        assert!(
+            matches!(v, PolicyVerdict::Ask | PolicyVerdict::Allow { .. }),
+            "unexpected verdict {v:?} on nested harmless env -S"
+        );
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 200,
+        "nested env -S took too long: {elapsed:?}"
+    );
+}
+
+/// Ordinary lines keep `dev`'s verdicts under the fail-closed round-2 rules.
+#[test]
+fn fix2_ordinary_lines_keep_devs_verdict() {
+    let allow_all = ["Allow", "Allow", "Allow", "Allow"];
+    let rows = vec![
+        row("ordinary", "env FOO=1 make", DEV_ASK),
+        row("ordinary", "env -i PATH=/usr/bin make", DEV_ASK),
+        row("ordinary", "env -u X make", DEV_ASK),
+        row("ordinary", "command -v git", DEV_ASK),
+        row("ordinary", "cwd=proj|rg --glob '*.rs' fn src", allow_all),
+        row(
+            "ordinary",
+            "cwd=proj|grep -rn --include='*.rs' fn src",
+            allow_all,
+        ),
+        row("ordinary", "cwd=proj|find src -name '*.rs'", DEV_ASK),
+        row("ordinary", "cwd=proj|git log -- src/", allow_all),
+        row("ordinary", "cwd=proj|git diff -- ':!vendor'", allow_all),
+    ];
+    run_rows(&rows);
+
+    let subj_allow = ["Allow", "Allow", "Allow"];
+    let subj_rows = vec![
+        subject(
+            "ordinary",
+            ToolKind::Search,
+            &["~/proj"],
+            Some("*.rs"),
+            true,
+            subj_allow,
+        ),
+        subject(
+            "ordinary",
+            ToolKind::Search,
+            &["~/proj"],
+            Some("src/**/*.rs"),
+            true,
+            subj_allow,
+        ),
+        subject(
+            "ordinary",
+            ToolKind::Search,
+            &["~/proj"],
+            Some("?.rs"),
+            true,
+            subj_allow,
+        ),
+        subject(
+            "ordinary",
+            ToolKind::Search,
+            &["~/proj"],
+            Some("[a-z]*.rs"),
+            true,
+            subj_allow,
+        ),
+    ];
+    run_subject_list(subj_rows);
 }

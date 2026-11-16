@@ -37,10 +37,104 @@ pub struct Analysis {
     pub cwd_uncertain: bool,
     /// Bigger than the checker takes on (line bytes, commands, words, paths).
     pub overflow: bool,
+    /// An unknown `env`/`command` invocation whose readings could not be
+    /// bounded and whose words may be dangerous (M1-18, K1 fail-closed).
+    pub unbounded_unknown_dangerous: bool,
     /// Text the raw-string checks run on.
     pub raw: Vec<String>,
     /// The starting directory of a command.
     pub start: PathBuf,
+}
+
+fn unknown_tok_dangerous(tok: &str, cwd: &Path, home: &Path, s: &Sensitive) -> bool {
+    if tok.is_empty() {
+        return false;
+    }
+    if tok.contains(['$', '`', '*', '?', '[', '{', ';', '|', '&', '\n'])
+        || tok.starts_with(['/', '~'])
+        || tok.contains("..")
+        || tok.contains("<(")
+        || tok.contains(">(")
+    {
+        return true;
+    }
+    if !tok.starts_with('-') {
+        let p = lexical_resolve(tok, cwd, home);
+        if !p.starts_with(cwd)
+            || s.hit(&p, Role::Write).is_some()
+            || s.ask_hit(&p)
+            || s.is_or_contains(&p)
+        {
+            return true;
+        }
+    }
+    if shell::maybe_shell(tok) {
+        return true;
+    }
+    let b = base(tok);
+    matches!(
+        b,
+        "eval"
+            | "source"
+            | "."
+            | "exec"
+            | "command"
+            | "env"
+            | "xargs"
+            | "find"
+            | "osascript"
+            | "crontab"
+            | "rm"
+            | "dd"
+            | "shred"
+            | "wipefs"
+            | "blkdiscard"
+            | "mke2fs"
+            | "diskutil"
+            | "curl"
+            | "wget"
+            | "fetch"
+            | "git"
+    ) || PRIV.contains(&b)
+        || b.starts_with("mkfs")
+        || b.starts_with("newfs")
+        || words::is_known_writer(&[tok.to_string()])
+}
+
+fn unknown_words_could_be_dangerous(
+    invocations: &[Vec<String>],
+    cwd: &Path,
+    home: &Path,
+    s: &Sensitive,
+) -> bool {
+    invocations.iter().any(|words| {
+        words.iter().skip(1).any(|w| {
+            if unknown_tok_dangerous(w, cwd, home, s) {
+                return true;
+            }
+            if let Some((_, val)) = w.split_once('=')
+                && val
+                    .split_whitespace()
+                    .any(|t| unknown_tok_dangerous(t, cwd, home, s))
+            {
+                return true;
+            }
+            if w.starts_with('-') && !w.starts_with("--") {
+                for flag in ['C', 'S'] {
+                    if let Some(pos) = w[1..].find(flag) {
+                        let after = &w[1 + pos + 1..];
+                        if after
+                            .split_whitespace()
+                            .any(|t| unknown_tok_dangerous(t, cwd, home, s))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        })
+    })
 }
 
 fn strings_of(v: &Value, out: &mut Vec<String>) {
@@ -89,9 +183,11 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         cwd_unknown: false,
         cwd_uncertain: false,
         overflow: false,
+        unbounded_unknown_dangerous: false,
         raw: vec![],
         start: input.cwd.to_path_buf(),
     };
+    let s_for_unknown = Sensitive::new(input);
     let lex_cmd = |a: &mut Analysis, line: &str, start: &Path| {
         if line.len() > MAX_BYTES {
             a.overflow = true;
@@ -100,6 +196,14 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         let l = shell::lex(line);
         a.units = l.units;
         a.reasons = l.reasons;
+        if !l.unbounded_unknown_words.is_empty() {
+            a.unbounded_unknown_dangerous = unknown_words_could_be_dangerous(
+                &l.unbounded_unknown_words,
+                start,
+                home,
+                &s_for_unknown,
+            );
+        }
         if l.overflow || a.units.len() > MAX_UNITS {
             a.overflow = true;
             return;
@@ -509,12 +613,17 @@ impl Sensitive {
     /// store that asks.
     pub fn ask_search_glob_hit(&self, roots: &[PathBuf], glob: &str) -> bool {
         let home_path = Path::new(&self.home);
-        let expanded = words::expand_home(glob, home_path, home_path);
-        let norm = expanded.trim_start_matches("./").to_lowercase();
-        let Ok(g) = GlobBuilder::new(&norm).literal_separator(false).build() else {
+        let (variants, unbounded) = glob_search_variants(glob, home_path, home_path);
+        if unbounded {
             return true;
-        };
-        let g = g.compile_matcher();
+        }
+        let mut matchers = Vec::with_capacity(variants.len());
+        for norm in &variants {
+            let Ok(g) = GlobBuilder::new(norm).literal_separator(false).build() else {
+                return true;
+            };
+            matchers.push(g.compile_matcher());
+        }
         let root_lowers: Vec<String> = roots.iter().map(|r| lower(r)).collect();
         self.ask_probes().iter().any(|probe| {
             let name = probe.rsplit('/').next().unwrap_or(probe);
@@ -522,7 +631,9 @@ impl Sensitive {
                 let Some(rel) = under(probe, rl) else {
                     return false;
                 };
-                g.is_match(name) || g.is_match(probe) || (!rel.is_empty() && g.is_match(rel))
+                matchers.iter().any(|g| {
+                    g.is_match(name) || g.is_match(probe) || (!rel.is_empty() && g.is_match(rel))
+                })
             })
         })
     }
@@ -1022,9 +1133,8 @@ impl Ctx<'_> {
             recursive,
             ..
         } = &self.input.check.subject
-            && *recursive
         {
-            hits.extend(self.search_glob_hit(paths, g));
+            hits.extend(self.search_glob_hit(paths, g, *recursive));
         }
         // a search glob that leaves its roots (M1-18, P1): each expansion
         // that leaves is checked as a path pattern of its own
@@ -1222,30 +1332,52 @@ impl Ctx<'_> {
         })
     }
 
-    fn search_glob_hit(&self, roots: &[String], glob: &str) -> Option<&'static str> {
-        let g = GlobBuilder::new(glob)
-            .literal_separator(false)
-            .build()
-            .ok()?
-            .compile_matcher();
-        let root_paths: Vec<PathBuf> = if roots.is_empty() {
-            vec![self.input.cwd.to_path_buf()]
+    fn search_glob_hit(
+        &self,
+        roots: &[String],
+        glob: &str,
+        recursive: bool,
+    ) -> Option<&'static str> {
+        let (variants, _) = glob_search_variants(glob, self.input.cwd, self.home());
+        let matchers: Vec<globset::GlobMatcher> = variants
+            .iter()
+            .filter_map(|norm| {
+                GlobBuilder::new(norm)
+                    .literal_separator(false)
+                    .build()
+                    .ok()
+                    .map(|g| g.compile_matcher())
+            })
+            .collect();
+        if matchers.is_empty() {
+            return None;
+        }
+        let root_lowers: Vec<String> = if roots.is_empty() {
+            vec![lower(self.input.cwd)]
         } else {
             roots
                 .iter()
-                .map(|r| lexical_resolve(r, self.input.cwd, self.home()))
+                .map(|r| lower(&lexical_resolve(r, self.input.cwd, self.home())))
                 .collect()
         };
         for probe in self.s.probes() {
             let pp = Path::new(&probe);
             let name = pp.file_name()?.to_string_lossy().to_string();
-            if (g.is_match(&name) || g.is_match(&probe))
-                && self.s.hit(pp, Role::Read).is_some()
-                && root_paths
-                    .iter()
-                    .any(|r| under(&probe, &lower(r)).is_some())
-            {
-                return self.s.hit(pp, Role::Read);
+            let Some(hit) = self.s.hit(pp, Role::Read) else {
+                continue;
+            };
+            for rl in &root_lowers {
+                let Some(rel) = under(&probe, rl) else {
+                    continue;
+                };
+                let name_allowed = recursive || !rel.contains('/');
+                if matchers.iter().any(|g| {
+                    (name_allowed && g.is_match(&name))
+                        || g.is_match(&probe)
+                        || (!rel.is_empty() && g.is_match(rel))
+                }) {
+                    return Some(hit);
+                }
             }
         }
         None
@@ -1256,7 +1388,7 @@ impl Ctx<'_> {
 /// gives (M1-18, P1). `patterns`: each brace expansion that leaves, made
 /// absolute (`/h/u/.ssh/id_*`); `unknown`: a form whose reach can't be read
 /// (a backslash, `~user`, a component made of classes and `?` that can be
-/// `.` or `..`, too many expansions).
+/// `.` or `..`, `$VAR`, too many expansions).
 #[derive(Debug, Default)]
 pub struct GlobEscape {
     pub patterns: Vec<PathBuf>,
@@ -1270,10 +1402,10 @@ impl GlobEscape {
 }
 
 /// A pattern component that can match `.` or `..` without being written
-/// so: only classes, `?` and dots (`[.][.]`, `.[.]`, `??`). `*` is left
-/// out: a directory walk never lists `.` or `..`.
+/// so (`[.][.]`, `.[.]`, `??`, `[.][.]*`). Plain `*` / `**` are left out:
+/// a directory walk never lists `.` or `..` for `*`.
 fn may_be_dot_component(c: &str) -> bool {
-    if !c.contains(['[', '?']) || c.contains('*') {
+    if c == "*" || c == "**" || !c.contains(['[', '?']) {
         return false;
     }
     let Ok(g) = GlobBuilder::new(c).literal_separator(true).build() else {
@@ -1281,6 +1413,308 @@ fn may_be_dot_component(c: &str) -> bool {
     };
     let m = g.compile_matcher();
     m.is_match(".") || m.is_match("..")
+}
+
+fn unescape_glob_backslashes(g: &str) -> String {
+    let mut out = String::with_capacity(g.len());
+    let mut chars = g.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            } else {
+                out.push('\\');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Normalizes `./`, `//`, and `literal/..` steps in a glob pattern while
+/// keeping `**` and wildcard components intact.
+fn normalize_glob_str(g: &str) -> String {
+    let abs = g.starts_with('/');
+    let mut out: Vec<&str> = vec![];
+    for c in g.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                if out
+                    .last()
+                    .is_some_and(|p| *p != ".." && *p != "**" && !p.contains(['*', '?', '[']))
+                {
+                    out.pop();
+                } else if !abs || !out.is_empty() {
+                    out.push("..");
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    if abs {
+        format!("/{}", out.join("/"))
+    } else if out.is_empty() {
+        ".".to_string()
+    } else {
+        out.join("/")
+    }
+}
+
+/// Widens `?` and any character class `[...]` that can match `.` to `.`.
+fn widen_pattern_dots(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = s[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        if ch == '?' {
+            out.push('.');
+            i += len;
+        } else if ch == '[' {
+            let mut j = i + 1;
+            if j < bytes.len() && (bytes[j] == b'!' || bytes[j] == b'^') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                j += 1;
+            }
+            while j < bytes.len() && bytes[j] != b']' {
+                if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                let class = &s[i..=j];
+                let can_dot = GlobBuilder::new(class)
+                    .literal_separator(true)
+                    .build()
+                    .map_or(true, |g| g.compile_matcher().is_match("."));
+                if can_dot {
+                    out.push('.');
+                } else {
+                    out.push_str(class);
+                }
+                i = j + 1;
+            } else {
+                out.push(ch);
+                i += len;
+            }
+        } else {
+            out.push(ch);
+            i += len;
+        }
+    }
+    out
+}
+
+/// If a `[...]` class can contain or span `/`, returns a variant replacing it
+/// with `/`.
+fn widen_pattern_slashes(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = s[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        if ch == '[' {
+            let mut j = i + 1;
+            if j < bytes.len() && (bytes[j] == b'!' || bytes[j] == b'^') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                j += 1;
+            }
+            while j < bytes.len() && bytes[j] != b']' {
+                if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                let class = &s[i..=j];
+                let inner = &s[i + 1..j];
+                let has_slash = inner.contains('/')
+                    || inner
+                        .as_bytes()
+                        .windows(3)
+                        .any(|w| w[1] == b'-' && w[0] <= b'/' && b'/' <= w[2]);
+                if has_slash {
+                    out.push('/');
+                    changed = true;
+                } else {
+                    out.push_str(class);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(ch);
+        i += len;
+    }
+    changed.then_some(out)
+}
+
+/// Widens `$VAR` / `${VAR}` in a glob as possibly an empty string, `**`, or
+/// any absolute path `/**`.
+fn expand_glob_vars(s: &str) -> Vec<String> {
+    if !s.contains('$') {
+        return vec![];
+    }
+    let mut as_globstar = String::new();
+    let mut as_empty = String::new();
+    let mut first_abs: Option<String> = None;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let end = if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                s[i + 2..].find('}').map_or(bytes.len(), |k| i + 2 + k + 1)
+            } else {
+                let mut k = i + 1;
+                while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                    k += 1;
+                }
+                k
+            };
+            as_globstar.push_str("**");
+            if first_abs.is_none() {
+                let rest = &s[end..];
+                first_abs = Some(if rest.starts_with('/') || rest.is_empty() {
+                    format!("/**{rest}")
+                } else {
+                    format!("/**/{rest}")
+                });
+            }
+            i = end;
+        } else {
+            let ch = s[i..].chars().next().unwrap();
+            as_globstar.push(ch);
+            as_empty.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    let mut out = vec![as_globstar, as_empty];
+    if let Some(a) = first_abs {
+        out.push(a);
+    }
+    out
+}
+
+/// Generates representative expansions when `brace_expand` exceeds its cap.
+fn brace_fallback(g: &str) -> Vec<String> {
+    let pick_alt = |mode: usize| -> String {
+        let mut out = String::new();
+        let cs: Vec<char> = g.chars().collect();
+        let mut i = 0;
+        while i < cs.len() {
+            if cs[i] == '{' && !(i > 0 && cs[i - 1] == '$') {
+                let mut depth = 1usize;
+                let mut j = i + 1;
+                let mut comma = None;
+                while j < cs.len() && depth > 0 {
+                    match cs[j] {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        ',' if depth == 1 && comma.is_none() => comma = Some(j),
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    let inner_end = j - 1;
+                    let chosen = match mode {
+                        0 => &cs[i + 1..comma.unwrap_or(inner_end)],
+                        _ => &[],
+                    };
+                    out.extend(chosen);
+                    i = j;
+                    continue;
+                }
+            }
+            out.push(cs[i]);
+            i += 1;
+        }
+        out
+    };
+    vec![pick_alt(0), pick_alt(1)]
+}
+
+fn globstar_variants(e: &str) -> Vec<String> {
+    let mut out = vec![e.to_string()];
+    let mut work = e.to_string();
+    for _ in 0..4 {
+        let parts: Vec<&str> = work.split('/').collect();
+        let Some(idx) = parts.windows(2).position(|w| w[0] == "**" && w[1] == "..") else {
+            break;
+        };
+        let mut next_parts = Vec::with_capacity(parts.len() - 1);
+        next_parts.extend_from_slice(&parts[..=idx]);
+        next_parts.extend_from_slice(&parts[idx + 2..]);
+        work = next_parts.join("/");
+        if !out.contains(&work) {
+            out.push(work.clone());
+        }
+    }
+    let len = out.len();
+    for i in 0..len {
+        if let Some(d) = drop_globstar(&out[i])
+            && !out.contains(&d)
+        {
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn glob_search_variants(glob: &str, cwd: &Path, home: &Path) -> (Vec<String>, bool) {
+    let mut unbounded = false;
+    let mut raw = vec![glob.to_string()];
+    if glob.contains('\\') {
+        raw.push(unescape_glob_backslashes(glob));
+    }
+    let mut expanded = vec![];
+    for r in raw {
+        if let Some(exps) = words::brace_expand(&r) {
+            expanded.extend(exps);
+        } else {
+            unbounded = true;
+            expanded.extend(brace_fallback(&r));
+        }
+    }
+    let mut out = vec![];
+    for e in expanded {
+        if e.is_empty() {
+            continue;
+        }
+        let h = words::expand_home(&e, home, cwd);
+        let mut cands = vec![h.clone()];
+        let dots = widen_pattern_dots(&h);
+        if dots != h {
+            cands.push(dots);
+        }
+        if let Some(sl) = widen_pattern_slashes(&h) {
+            cands.push(sl);
+        }
+        if h.contains('$') {
+            cands.extend(expand_glob_vars(&h));
+        }
+        for cand in cands {
+            for gv in globstar_variants(&cand) {
+                let norm = normalize_glob_str(&gv).to_lowercase().replace('ſ', "s");
+                if !norm.is_empty() && !out.contains(&norm) {
+                    out.push(norm);
+                }
+            }
+        }
+    }
+    (out, unbounded)
 }
 
 /// [`GlobEscape`] for the check's subject; `None` without a glob.
@@ -1305,29 +1739,57 @@ pub fn glob_escape(input: &PolicyInput<'_>) -> Option<GlobEscape> {
             .collect()
     };
     let mut out = GlobEscape::default();
-    if glob.contains('\\') || glob.contains('\0') {
+    if glob.contains('\0') {
         out.unknown = true;
         return Some(out);
     }
-    let Some(expansions) = words::brace_expand(glob) else {
+    let mut raw = vec![glob.to_string()];
+    if glob.contains('\\') {
         out.unknown = true;
-        return Some(out);
-    };
+        raw.push(unescape_glob_backslashes(glob));
+    }
+    let mut expansions = vec![];
+    for r in raw {
+        if let Some(exps) = words::brace_expand(&r) {
+            expansions.extend(exps);
+        } else {
+            out.unknown = true;
+            expansions.extend(brace_fallback(&r));
+        }
+    }
     for e in expansions {
         if e.is_empty() {
             continue;
         }
-        if e.starts_with('~') && !(e == "~" || e.starts_with("~/")) {
+        let expanded = words::expand_home(&e, home, cwd);
+        if expanded.starts_with('~') && !(expanded == "~" || expanded.starts_with("~/")) {
             out.unknown = true;
             continue;
         }
-        if e.split('/').any(may_be_dot_component) {
+        if expanded.split('/').any(may_be_dot_component) {
             out.unknown = true;
-            continue;
         }
-        check_escape_variant(&e, &roots, cwd, home, &mut out);
-        if let Some(zero_star) = drop_globstar(&e) {
-            check_escape_variant(&zero_star, &roots, cwd, home, &mut out);
+        let mut cands = vec![expanded.clone()];
+        let dots = widen_pattern_dots(&expanded);
+        if dots != expanded {
+            cands.push(dots.clone());
+        }
+        if let Some(sl) = widen_pattern_slashes(&expanded) {
+            out.unknown = true;
+            cands.push(sl);
+        }
+        if expanded.contains('$') {
+            out.unknown = true;
+            for dv in expand_glob_vars(&expanded) {
+                let d_dots = widen_pattern_dots(&dv);
+                cands.push(dv);
+                cands.push(d_dots);
+            }
+        }
+        for cand in cands {
+            for gv in globstar_variants(&cand) {
+                check_escape_variant(&gv, &roots, cwd, home, &mut out);
+            }
         }
     }
     Some(out)
