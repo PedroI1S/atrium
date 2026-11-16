@@ -504,20 +504,26 @@ impl Sensitive {
         v
     }
 
-    /// A search over `roots` scoped by `glob` (matched against file names
-    /// or whole paths) that can reach a credential store that asks.
+    /// A search over `roots` scoped by `glob` (matched against file names,
+    /// paths relative to a root, or whole paths) that can reach a credential
+    /// store that asks.
     pub fn ask_search_glob_hit(&self, roots: &[PathBuf], glob: &str) -> bool {
-        let Ok(g) = GlobBuilder::new(&glob.to_lowercase())
-            .literal_separator(false)
-            .build()
-        else {
+        let home_path = Path::new(&self.home);
+        let expanded = words::expand_home(glob, home_path, home_path);
+        let norm = expanded.trim_start_matches("./").to_lowercase();
+        let Ok(g) = GlobBuilder::new(&norm).literal_separator(false).build() else {
             return true;
         };
         let g = g.compile_matcher();
+        let root_lowers: Vec<String> = roots.iter().map(|r| lower(r)).collect();
         self.ask_probes().iter().any(|probe| {
             let name = probe.rsplit('/').next().unwrap_or(probe);
-            (g.is_match(name) || g.is_match(probe))
-                && roots.iter().any(|r| under(probe, &lower(r)).is_some())
+            root_lowers.iter().any(|rl| {
+                let Some(rel) = under(probe, rl) else {
+                    return false;
+                };
+                g.is_match(name) || g.is_match(probe) || (!rel.is_empty() && g.is_match(rel))
+            })
         })
     }
 
@@ -1307,7 +1313,6 @@ pub fn glob_escape(input: &PolicyInput<'_>) -> Option<GlobEscape> {
         out.unknown = true;
         return Some(out);
     };
-    let is_pat = |c: &str| c.contains(['*', '?', '[']);
     for e in expansions {
         if e.is_empty() {
             continue;
@@ -1320,28 +1325,60 @@ pub fn glob_escape(input: &PolicyInput<'_>) -> Option<GlobEscape> {
             out.unknown = true;
             continue;
         }
-        let anchored = e.starts_with('/') || e.starts_with('~');
-        let joined: Vec<PathBuf> = if anchored {
-            vec![lexical_resolve(&e, cwd, home)]
-        } else {
-            roots.iter().map(|r| normalize(&r.join(&e))).collect()
-        };
-        for abs in joined {
-            // the folder the walk starts from: the literal components
-            let mut start = PathBuf::new();
-            for c in abs.components() {
-                if is_pat(&c.as_os_str().to_string_lossy()) {
-                    break;
-                }
-                start.push(c.as_os_str());
-            }
-            let inside = roots.iter().any(|r| start.starts_with(r));
-            if !inside && !out.patterns.contains(&abs) {
-                out.patterns.push(abs);
-            }
+        check_escape_variant(&e, &roots, cwd, home, &mut out);
+        if let Some(zero_star) = drop_globstar(&e) {
+            check_escape_variant(&zero_star, &roots, cwd, home, &mut out);
         }
     }
     Some(out)
+}
+
+fn drop_globstar(e: &str) -> Option<String> {
+    if !e.split('/').any(|c| c == "**") {
+        return None;
+    }
+    let kept: Vec<&str> = e
+        .split('/')
+        .filter(|&c| !c.is_empty() && c != "**")
+        .collect();
+    Some(if e.starts_with('/') {
+        format!("/{}", kept.join("/"))
+    } else {
+        kept.join("/")
+    })
+}
+
+fn check_escape_variant(
+    variant: &str,
+    roots: &[PathBuf],
+    cwd: &Path,
+    home: &Path,
+    out: &mut GlobEscape,
+) {
+    if variant.is_empty() {
+        return;
+    }
+    let is_pat = |c: &str| c.contains(['*', '?', '[']);
+    let anchored = variant.starts_with('/') || variant.starts_with('~');
+    let joined: Vec<PathBuf> = if anchored {
+        vec![lexical_resolve(variant, cwd, home)]
+    } else {
+        roots.iter().map(|r| normalize(&r.join(variant))).collect()
+    };
+    for abs in joined {
+        // the folder the walk starts from: the literal components
+        let mut start = PathBuf::new();
+        for c in abs.components() {
+            if is_pat(&c.as_os_str().to_string_lossy()) {
+                break;
+            }
+            start.push(c.as_os_str());
+        }
+        let inside = roots.iter().any(|r| start.starts_with(r));
+        if !inside && !out.patterns.contains(&abs) {
+            out.patterns.push(abs);
+        }
+    }
 }
 
 /// Words split on blanks, keeping a `$(…)`, `` `…` `` or quoted part whole

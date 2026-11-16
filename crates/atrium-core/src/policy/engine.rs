@@ -173,6 +173,7 @@ struct RuleOutcome {
     deny: Option<(Option<String>, Option<RuleId>)>,
     covered: Vec<bool>,
     allow_rule: Option<RuleId>,
+    any_allow: bool,
 }
 
 fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOutcome {
@@ -185,6 +186,7 @@ fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOut
     let n = part_ids.len().max(1);
     let mut covered = vec![false; n];
     let mut allow_rule: Option<RuleId> = None;
+    let mut any_allow = false;
     for rank in 0..3u8 {
         let ranked: Vec<&Rule> = rules
             .iter()
@@ -202,10 +204,18 @@ fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOut
                 )),
                 covered,
                 allow_rule,
+                any_allow,
             };
         }
         for r in ranked.iter().filter(|r| r.decision == RuleDecision::Allow) {
             let c = allow_covers(r, input, a, &paths, &part_ids);
+            let is_any = matches!(r.matcher, RuleMatcher::Any)
+                && r.path_scope.is_none()
+                && !c.is_empty()
+                && c.iter().all(|hit| *hit);
+            if is_any {
+                any_allow = true;
+            }
             for (slot, hit) in covered.iter_mut().zip(c) {
                 if hit && !*slot {
                     *slot = true;
@@ -218,6 +228,7 @@ fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOut
         deny: None,
         covered,
         allow_rule,
+        any_allow,
     }
 }
 
@@ -257,9 +268,9 @@ fn forbidden_flag(entry: &ReadOnlyCommand, args: &[String]) -> bool {
     false
 }
 
-const RG_BOOL_S: &str = "iSsnNHIlcovwxuaUFPq0pb";
-const RG_VAL_S: &str = "egtTmABCdjMEr";
-const RG_BOOL_L: &[&str] = &[
+pub(crate) const RG_BOOL_S: &str = "iSsnNHIlcovwxuaUFPq0pb";
+pub(crate) const RG_VAL_S: &str = "egtTmABCdjMEr";
+pub(crate) const RG_BOOL_L: &[&str] = &[
     "hidden",
     "no-ignore",
     "no-ignore-vcs",
@@ -313,7 +324,7 @@ const RG_BOOL_L: &[&str] = &[
     "glob-case-insensitive",
     "no-glob-case-insensitive",
 ];
-const RG_VAL_L: &[&str] = &[
+pub(crate) const RG_VAL_L: &[&str] = &[
     "regexp",
     "glob",
     "iglob",
@@ -344,9 +355,9 @@ const RG_VAL_L: &[&str] = &[
     "dfa-size-limit",
     "regex-size-limit",
 ];
-const GREP_BOOL_S: &str = "ivnclLoqswxhHEFGPaIrRzZbTUy0123456789";
-const GREP_VAL_S: &str = "emABCdD";
-const GREP_BOOL_L: &[&str] = &[
+pub(crate) const GREP_BOOL_S: &str = "ivnclLoqswxhHEFGPaIrRzZbTUy0123456789";
+pub(crate) const GREP_VAL_S: &str = "emABCdD";
+pub(crate) const GREP_BOOL_L: &[&str] = &[
     "ignore-case",
     "no-ignore-case",
     "invert-match",
@@ -375,7 +386,7 @@ const GREP_BOOL_L: &[&str] = &[
     "dereference-recursive",
     "no-group-separator",
 ];
-const GREP_VAL_L: &[&str] = &[
+pub(crate) const GREP_VAL_L: &[&str] = &[
     "regexp",
     "max-count",
     "after-context",
@@ -548,23 +559,52 @@ const GIT_CRED_DIRS: &[&str] = &[
     ".config/gcloud",
     ".gemini",
     ".aws/sso/cache",
+    ".zsh_sessions",
+    ".bash_sessions",
     "library/keychains",
 ];
 
+fn is_git_key_name(name: &str) -> bool {
+    const CODE_EXTS: &[&str] = &[
+        "pub", "rs", "ts", "tsx", "js", "jsx", "py", "go", "c", "cc", "cpp", "h", "hpp", "java",
+        "rb", "md", "html", "css", "svg", "png",
+    ];
+    ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
+        .iter()
+        .any(|k| {
+            name == *k
+                || name.strip_prefix(k).is_some_and(|r| {
+                    r.starts_with(['.', '-', '_'])
+                        && !r
+                            .rsplit('.')
+                            .next()
+                            .is_some_and(|ext| CODE_EXTS.contains(&ext))
+                })
+        })
+}
+
 /// Whether a `git show`/`git log`/`git diff` argument names a committed file
 /// whose name matches a credential: `REV:PATH`, `:PATH`, `:N:PATH` or a
-/// pathspec.
+/// pathspec (including `:(magic)PATH` and short magic `:/`, `:!`, `:^`).
 fn git_names_credential(arg: &str) -> bool {
-    if arg.starts_with('-') && !arg.contains(':') {
+    if arg.starts_with('-') && !arg.starts_with("-L") {
         return false;
     }
-    let path = match arg.split_once(':') {
-        // `:0:path`, `HEAD:path`, `:path`
-        Some((_, rest)) => match rest.split_once(':') {
-            Some((n, p)) if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() => p,
-            _ => rest,
-        },
-        None => arg,
+    let path = if let Some(after) = arg.strip_prefix(":(") {
+        after.split_once(')').map_or(after, |(_, p)| p)
+    } else if let Some(after) = arg.strip_prefix(':') {
+        if let Some((n, p)) = after.split_once(':')
+            && !n.is_empty()
+            && n.chars().all(|c| c.is_ascii_digit())
+        {
+            p
+        } else {
+            after.trim_start_matches(['/', '!', '^'])
+        }
+    } else if let Some((_, rest)) = arg.split_once(':') {
+        rest
+    } else {
+        arg
     };
     let l = path.to_lowercase().replace('ſ', "s");
     let parts: Vec<&str> = l
@@ -577,10 +617,7 @@ fn git_names_credential(arg: &str) -> bool {
     let joined = parts.join("/");
     if GIT_CRED_NAMES.contains(name)
         || name.starts_with("msal_token_cache.")
-        || (["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
-            .iter()
-            .any(|k| name.starts_with(k))
-            && !name.ends_with(".pub"))
+        || is_git_key_name(name)
     {
         return true;
     }
@@ -789,14 +826,14 @@ impl PolicyEngine for DefaultPolicy {
             };
         }
         // A search glob that can name files outside every path the subject
-        // gives (M1-18, P1): what it reads isn't known, so, like an
-        // `Unknown` subject, it can only be hard-denied (above) or asked.
-        if deny::glob_escape(input).is_some_and(|e| e.leaves()) {
-            return PolicyVerdict::Ask;
-        }
+        // gives (M1-18, P1; D-100): hard-denied (above) if an expansion hits
+        // the hard-deny list, otherwise allowed by FullAccess or an Any rule
+        // and asked in Home/Normal/Trusted/Careful and under prefix/scoped rules.
+        let glob_leaves = deny::glob_escape(input).is_some_and(|e| e.leaves());
         let unknown = matches!(input.check.subject, ToolSubject::Unknown);
         let command = matches!(input.check.subject, ToolSubject::Command { .. });
         if !unknown
+            && (!glob_leaves || out.any_allow)
             && out.covered.iter().all(|c| *c)
             && (command && !parts(&a).is_empty() || !command)
         {
@@ -806,6 +843,13 @@ impl PolicyEngine for DefaultPolicy {
         }
         if unknown {
             return PolicyVerdict::Ask;
+        }
+        if glob_leaves {
+            return if input.preset == Preset::FullAccess {
+                PolicyVerdict::Allow { rule: None }
+            } else {
+                PolicyVerdict::Ask
+            };
         }
         match input.preset {
             Preset::Home | Preset::Normal | Preset::Trusted => {

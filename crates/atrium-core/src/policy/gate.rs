@@ -1034,6 +1034,65 @@ fn long_is(arg: &str, full: &str, names: &[&str]) -> bool {
 /// `grep -R`, `find -L`, `find … -follow`, `ag -f`, `ack --follow`, `cp -L`,
 /// `tar -h`, `rsync -L`, `zip -r`, `scp -r`), with long options read by
 /// unique prefix (`grep --deref`, `ag --fol`: M1-18, K2).
+fn reader_flag_tokens<'a>(
+    args: &'a [String],
+    bool_s: &str,
+    val_s: &str,
+    bool_l: &[&str],
+    val_l: &[&str],
+    allow_long_prefix: bool,
+) -> Option<(Vec<char>, Vec<&'a str>)> {
+    let mut shorts = vec![];
+    let mut longs = vec![];
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            break;
+        }
+        i += 1;
+        if !a.starts_with('-') || a == "-" {
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix("--") {
+            let (name, has_val) = rest
+                .split_once('=')
+                .map_or((rest, false), |(n, _)| (n, true));
+            let all: Vec<&str> = bool_l.iter().chain(val_l.iter()).copied().collect();
+            let is_val = val_l.contains(&name)
+                || (allow_long_prefix && val_l.iter().any(|f| long_is(a, f, &all)));
+            let is_bool = bool_l.contains(&name)
+                || (allow_long_prefix && bool_l.iter().any(|f| long_is(a, f, &all)));
+            if is_val {
+                longs.push(a);
+                if !has_val {
+                    i += 1;
+                }
+            } else if is_bool {
+                longs.push(a);
+            } else {
+                return None;
+            }
+        } else {
+            let cs: Vec<char> = a[1..].chars().collect();
+            for (k, c) in cs.iter().enumerate() {
+                if val_s.contains(*c) {
+                    shorts.push(*c);
+                    if k + 1 == cs.len() {
+                        i += 1;
+                    }
+                    break;
+                }
+                if !bool_s.contains(*c) {
+                    return None;
+                }
+                shorts.push(*c);
+            }
+        }
+    }
+    Some((shorts, longs))
+}
+
 fn follows_links(eff: &[String]) -> Follow {
     let Some(first) = eff.first() else {
         return Follow::No;
@@ -1052,13 +1111,82 @@ fn follows_links(eff: &[String]) -> Follow {
         .chain(engine::grep_long_names())
         .collect();
     match shell::base(first) {
-        "rg" => yes(short('L') || args.iter().any(|a| a == "--follow")),
+        "rg" => {
+            let bool_s = format!("{}L", engine::RG_BOOL_S);
+            let val_s = format!("{}f", engine::RG_VAL_S);
+            let bool_l: Vec<&str> = std::iter::once("follow")
+                .chain(engine::RG_BOOL_L.iter().copied())
+                .collect();
+            let val_l: Vec<&str> = std::iter::once("file")
+                .chain(engine::RG_VAL_L.iter().copied())
+                .collect();
+            if let Some((shorts, longs)) =
+                reader_flag_tokens(args, &bool_s, &val_s, &bool_l, &val_l, false)
+            {
+                yes(shorts.contains(&'L') || longs.contains(&"--follow"))
+            } else {
+                yes(short('L') || args.iter().any(|a| a == "--follow"))
+            }
+        }
         "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" | "rgrep" => {
-            yes(short('R') || long("dereference-recursive", &grep_longs))
+            let val_s = format!("{}f", engine::GREP_VAL_S);
+            let val_l: Vec<&str> = std::iter::once("file")
+                .chain(engine::GREP_VAL_L.iter().copied())
+                .collect();
+            if let Some((shorts, longs)) = reader_flag_tokens(
+                args,
+                engine::GREP_BOOL_S,
+                &val_s,
+                engine::GREP_BOOL_L,
+                &val_l,
+                true,
+            ) {
+                yes(shorts.contains(&'R')
+                    || longs
+                        .iter()
+                        .any(|a| long_is(a, "dereference-recursive", &grep_longs)))
+            } else {
+                yes(short('R') || long("dereference-recursive", &grep_longs))
+            }
         }
         "find" => yes(args.iter().any(|a| a == "-L" || a == "-follow")),
-        "ag" => yes(short('f') || long("follow", &ag_long_names())),
-        "ack" => yes(long("follow", &ack_long_names())),
+        "ag" => {
+            let bool_s = format!("{}{}", AG_OPTS.flags, AG_OPTS.opt_vals);
+            let bool_l: Vec<&str> = AG_OPTS.long_flags.to_vec();
+            let val_l: Vec<&str> = AG_OPTS
+                .long_vals
+                .iter()
+                .chain(AG_OPTS.long_opt_vals.iter())
+                .copied()
+                .collect();
+            if let Some((shorts, longs)) =
+                reader_flag_tokens(args, &bool_s, AG_OPTS.vals, &bool_l, &val_l, true)
+            {
+                yes(shorts.contains(&'f')
+                    || longs.iter().any(|a| long_is(a, "follow", &ag_long_names())))
+            } else {
+                yes(short('f') || long("follow", &ag_long_names()))
+            }
+        }
+        "ack" => {
+            let bool_s = format!("{}{}", ACK_OPTS.flags, ACK_OPTS.opt_vals);
+            let bool_l: Vec<&str> = ACK_OPTS.long_flags.to_vec();
+            let val_l: Vec<&str> = ACK_OPTS
+                .long_vals
+                .iter()
+                .chain(ACK_OPTS.long_opt_vals.iter())
+                .copied()
+                .collect();
+            if let Some((_, longs)) =
+                reader_flag_tokens(args, &bool_s, ACK_OPTS.vals, &bool_l, &val_l, true)
+            {
+                yes(longs
+                    .iter()
+                    .any(|a| long_is(a, "follow", &ack_long_names())))
+            } else {
+                yes(long("follow", &ack_long_names()))
+            }
+        }
         // GNU `cp -L/--dereference`, BSD `cp -L`; `cp -r` follows links on
         // some systems (BSD's legacy `-r`): maybe
         "cp" | "gcp" => {
@@ -1210,11 +1338,19 @@ fn links_below<'a>(root: &Path, trees: &'a [Tree]) -> (Reach, Option<&'a Tree>) 
             continue;
         };
         for e in rd.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir()
+                && matches!(
+                    e.file_name().to_str(),
+                    Some(".git" | "node_modules" | "target")
+                )
+            {
+                continue;
+            }
             seen += 1;
             if seen > BUDGET || depth > MAX_DEPTH {
                 return (Reach::Maybe, None);
             }
-            let Ok(ft) = e.file_type() else { continue };
             let p = e.path();
             if ft.is_symlink() {
                 let Ok(real) = std::fs::canonicalize(&p) else {
