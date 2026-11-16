@@ -568,7 +568,6 @@ fn glob_forms_the_gate_cannot_resolve_never_reach_allow_in_home() {
 }
 
 #[test]
-#[ignore = "M1-13 finding 10"]
 fn finding_10_a_glob_that_reaches_a_credential_through_a_link_is_blocked() {
     let t = world();
     let g = t.gate(Preset::Home, vec![]);

@@ -324,7 +324,7 @@ fn evaluate_sync(
         trees.extend(trees_of(&ssh.linked_dirs, "credential-read", true));
         trees.extend(trees_of(&c.atrium_data_paths, "atrium-self", true));
         trees.extend(trees_of(&c.atrium_protected_paths, "atrium-self", false));
-        match reaches_tree_through_links(check, &analysis, &resolved, &trees) {
+        match reaches_tree_through_links(check, &analysis, &resolved, &trees, &c.cwd, &c.home) {
             (Reach::Yes, t) => {
                 verdict = PolicyVerdict::HardDeny {
                     id: t.map_or("credential-read", |t| t.id),
@@ -344,7 +344,9 @@ fn evaluate_sync(
         && matches!(preset, Preset::Home | Preset::Normal | Preset::Trusted)
     {
         let asks = trees_of(&deny::ask_roots(&c.home), "credential-read", true);
-        if reaches_tree_through_links(check, &analysis, &resolved, &asks).0 != Reach::No {
+        if reaches_tree_through_links(check, &analysis, &resolved, &asks, &c.cwd, &c.home).0
+            != Reach::No
+        {
             let careful = PolicyInput {
                 preset: Preset::Careful,
                 ..input
@@ -787,7 +789,12 @@ enum Reach {
 /// as zero or more folders, `{a,b}` as alternation. Bounded: `None` when the
 /// walk is too big or a component can't be read as a pattern (the caller
 /// asks).
-fn expand_glob(p: &Path) -> Option<Vec<PathBuf>> {
+struct GlobExpansion {
+    matches: Vec<PathBuf>,
+    truncated: bool,
+}
+
+fn expand_glob(p: &Path) -> Option<GlobExpansion> {
     const MAX_ENTRIES: usize = 4096;
     const MAX_DEPTH: usize = 12;
     let comps: Vec<String> = p
@@ -806,9 +813,11 @@ fn expand_glob(p: &Path) -> Option<Vec<PathBuf>> {
     let first = comps.iter().position(|c| is_pat(c))?;
     let prefix: PathBuf = comps[..first].iter().collect();
     let mut seen = 0usize;
+    let mut visited: std::collections::HashSet<(PathBuf, usize)> = std::collections::HashSet::new();
     // (folder, index of the next component, folders `**` went down)
     let mut stack: Vec<(PathBuf, usize, usize)> = vec![(prefix, first, 0)];
     let mut out = vec![];
+    let mut truncated = false;
     while let Some((dir, k, deep)) = stack.pop() {
         if k == comps.len() {
             out.push(dir);
@@ -826,8 +835,14 @@ fn expand_glob(p: &Path) -> Option<Vec<PathBuf>> {
         if c == "**" {
             // zero folders here, or one more and `**` again
             stack.push((dir.clone(), k + 1, deep));
+            if let Ok(real_dir) = std::fs::canonicalize(&dir)
+                && !visited.insert((real_dir, k))
+            {
+                continue;
+            }
             if deep > MAX_DEPTH {
-                return None;
+                truncated = true;
+                continue;
             }
         }
         let m = globset::GlobBuilder::new(c)
@@ -862,17 +877,20 @@ fn expand_glob(p: &Path) -> Option<Vec<PathBuf>> {
             }
         }
     }
-    Some(out)
+    Some(GlobExpansion {
+        matches: out,
+        truncated,
+    })
 }
 
 /// Whether a glob reaches a file inside the linked folder `d`, or with
 /// `names_dir` (a recursive reader or walker) names `d` or a folder holding
 /// it. `ls vault/*` only names the folder: it stays ordinary.
 fn glob_reaches(p: &Path, d: &Path, names_dir: bool) -> Reach {
-    let Some(found) = expand_glob(p) else {
+    let Some(exp) = expand_glob(p) else {
         return Reach::Maybe;
     };
-    for f in found {
+    for f in exp.matches {
         let real = real_path(&f);
         if real.starts_with(d) && real != *d {
             return Reach::Yes;
@@ -881,14 +899,33 @@ fn glob_reaches(p: &Path, d: &Path, names_dir: bool) -> Reach {
             return Reach::Yes;
         }
     }
-    Reach::No
+    if exp.truncated {
+        Reach::Maybe
+    } else {
+        Reach::No
+    }
 }
 
-/// The real path of `p`, or of its folder when `p` itself doesn't resolve
-/// (a glob, a file not made yet).
+/// The real path of `p`, following dangling symlinks by hand or falling back
+/// to its deepest existing ancestor when `p` itself doesn't exist.
 fn real_path(p: &Path) -> PathBuf {
     if let Ok(r) = std::fs::canonicalize(p) {
         return r;
+    }
+    if let Ok(md) = std::fs::symlink_metadata(p)
+        && md.is_symlink()
+        && let Ok(t) = std::fs::read_link(p)
+    {
+        let target = if t.is_absolute() {
+            t
+        } else {
+            let parent = p
+                .parent()
+                .and_then(|dir| std::fs::canonicalize(dir).ok())
+                .unwrap_or_else(|| p.parent().unwrap_or(Path::new("/")).to_path_buf());
+            parent.join(t)
+        };
+        return resolve_fs(&normalize(&target), 1);
     }
     if let (Some(dir), Some(name)) = (p.parent(), p.file_name())
         && let Ok(r) = std::fs::canonicalize(dir)
@@ -1376,11 +1413,74 @@ fn links_below<'a>(root: &Path, trees: &'a [Tree]) -> (Reach, Option<&'a Tree>) 
 /// blocker 2, M1-18 K2): a glob whose matches resolve into one, or a search
 /// or walker that follows links below its roots (or where it runs) meeting
 /// a link into one. A glob that can't be expanded may reach one (Maybe).
+/// Resolves only the literal prefix before the first glob/expansion component
+/// so parent segments after a wildcard are preserved for `expand_glob` instead
+/// of being collapsed lexically against the wildcard.
+fn raw_glob_pattern(word: &str, cwd: &Path, home: &Path) -> PathBuf {
+    let w = expand_home(word, home, cwd);
+    let p = Path::new(&w);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    let comps: Vec<_> = abs.components().collect();
+    let is_pat = |c: &std::path::Component<'_>| {
+        c.as_os_str()
+            .to_string_lossy()
+            .contains(['*', '?', '[', '{', '}', '$', '`'])
+    };
+    let Some(first) = comps.iter().position(is_pat) else {
+        return resolve_fs(&abs, 0);
+    };
+    let prefix: PathBuf = comps[..first].iter().collect();
+    let mut out = if prefix.as_os_str().is_empty() {
+        PathBuf::new()
+    } else {
+        resolve_fs(&prefix, 0)
+    };
+    for c in &comps[first..] {
+        out.push(c.as_os_str());
+    }
+    out
+}
+
+/// Expands `p` on disk, marking `maybe` if the walk hits a cap or cannot read
+/// a component; returns the original `p` on `None` so callers can still walk it
+/// if it is a directory.
+fn expand_targets(p: &Path, maybe: &mut bool) -> Vec<PathBuf> {
+    match expand_glob(p) {
+        Some(exp) => {
+            if exp.truncated {
+                *maybe = true;
+            }
+            exp.matches
+        }
+        None => {
+            *maybe = true;
+            vec![p.to_path_buf()]
+        }
+    }
+}
+
+fn first_tree_hit<'a>(
+    targets: &[PathBuf],
+    trees: &'a [Tree],
+    names_dir: bool,
+    write: bool,
+) -> Option<&'a Tree> {
+    targets
+        .iter()
+        .find_map(|f| in_trees(&real_path(f), trees, names_dir, write))
+}
+
 fn reaches_tree_through_links<'a>(
     check: &ToolCheck,
     a: &deny::Analysis,
     resolved: &[PathBuf],
     trees: &'a [Tree],
+    cwd: &Path,
+    home: &Path,
 ) -> (Reach, Option<&'a Tree>) {
     if trees.is_empty() {
         return (Reach::No, None);
@@ -1414,6 +1514,56 @@ fn reaches_tree_through_links<'a>(
             }
         }
     }
+    if let ToolSubject::Paths {
+        paths,
+        glob: Some(g),
+        recursive,
+    } = &check.subject
+    {
+        let write = !matches!(check.kind, ToolKind::Read | ToolKind::Search);
+        let roots: Vec<PathBuf> = if paths.is_empty() {
+            vec![resolve_fs(cwd, 0)]
+        } else {
+            resolved.to_vec()
+        };
+        let Some(exps) = words::brace_expand(g) else {
+            return (Reach::Maybe, None);
+        };
+        for gv in exps {
+            if gv.is_empty() {
+                continue;
+            }
+            let h = words::expand_home(&gv, home, cwd);
+            if let Some(rest) = h.strip_prefix('~')
+                && !rest.is_empty()
+                && !rest.starts_with('/')
+            {
+                maybe = true;
+                continue;
+            }
+            let cands: Vec<PathBuf> = if h.starts_with('/') {
+                vec![raw_glob_pattern(&h, cwd, home)]
+            } else {
+                roots
+                    .iter()
+                    .map(|r| raw_glob_pattern(&h, r, home))
+                    .collect()
+            };
+            for p in cands {
+                let globby = p
+                    .to_string_lossy()
+                    .contains(['*', '?', '[', '{', '}', '$', '`']);
+                let targets = if globby {
+                    expand_targets(&p, &mut maybe)
+                } else {
+                    vec![p]
+                };
+                if let Some(t) = first_tree_hit(&targets, trees, *recursive, write) {
+                    return (Reach::Yes, Some(t));
+                }
+            }
+        }
+    }
     let mut k = 0usize;
     for u in &a.uses {
         let unit = a.units.get(u.unit);
@@ -1425,7 +1575,6 @@ fn reaches_tree_through_links<'a>(
         // `ls proj/*` only names what it lists
         let lister = !recursive
             && unit.is_some_and(|x| x.eff.first().is_some_and(|f| shell::base(f) == "ls"));
-        let globby = u.word.contains(['*', '?', '[']);
         for _ in &u.paths {
             let Some(p) = resolved.get(k) else {
                 return (Reach::Maybe, None);
@@ -1434,27 +1583,50 @@ fn reaches_tree_through_links<'a>(
             if command_word {
                 continue;
             }
-            let mut targets = vec![p.clone()];
-            if globby {
-                match expand_glob(p) {
-                    Some(found) => targets = found,
-                    // a glob this walk can't expand may match anything
-                    // (M1-18, K2)
-                    None => maybe = true,
-                }
+            let ps = p.to_string_lossy();
+            let globby = ps.contains(['*', '?', '['])
+                || (unit.is_some() && ps.contains(['{', '}', '$', '`']));
+            let targets = if globby {
+                expand_targets(p, &mut maybe)
+            } else {
+                vec![p.clone()]
+            };
+            if globby
+                && !lister
+                && let Some(t) = first_tree_hit(&targets, trees, recursive, write)
+            {
+                return (Reach::Yes, Some(t));
             }
-            for f in &targets {
-                if globby && !lister {
-                    let real = real_path(f);
-                    if let Some(t) = in_trees(&real, trees, recursive, write) {
-                        return (Reach::Yes, Some(t));
+            if recursive && follow != Follow::No {
+                for f in &targets {
+                    if f.is_dir() {
+                        match links_below(f, trees) {
+                            (Reach::Yes, t) if follow == Follow::Yes => return (Reach::Yes, t),
+                            (Reach::No, _) => {}
+                            _ => maybe = true,
+                        }
                     }
                 }
-                if recursive && follow != Follow::No && f.is_dir() {
-                    match links_below(f, trees) {
-                        (Reach::Yes, t) if follow == Follow::Yes => return (Reach::Yes, t),
-                        (Reach::No, _) => {}
-                        _ => maybe = true,
+            }
+        }
+        if !command_word
+            && !lister
+            && u.word.contains("..")
+            && u.word.contains(['*', '?', '['])
+            && let Some(exps) = words::brace_expand(&u.word)
+        {
+            let unit_cwds: Vec<&Path> = a
+                .unit_cwd
+                .get(u.unit)
+                .map(|s| s.candidates().into_iter().map(PathBuf::as_path).collect())
+                .filter(|v: &Vec<&Path>| !v.is_empty())
+                .unwrap_or_else(|| vec![cwd]);
+            for ev in exps {
+                for uc in &unit_cwds {
+                    let raw_p = raw_glob_pattern(&ev, uc, home);
+                    let targets = expand_targets(&raw_p, &mut maybe);
+                    if let Some(t) = first_tree_hit(&targets, trees, recursive, write) {
+                        return (Reach::Yes, Some(t));
                     }
                 }
             }
