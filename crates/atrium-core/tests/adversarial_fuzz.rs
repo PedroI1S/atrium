@@ -419,7 +419,6 @@ fn shape(rng: &mut Rng, path: &str, parts: &[&str]) -> String {
 }
 
 #[test]
-#[ignore = "M1-13 finding 11"]
 fn random_spellings_of_sensitive_paths_are_always_hard_denied() {
     let env = Env::home();
     let any = allow_everything();

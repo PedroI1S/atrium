@@ -974,7 +974,6 @@ fn finding_3_popd_pushd_and_cdpath_leave_the_directory_unknown() {
 }
 
 #[test]
-#[ignore = "M1-13 finding 4"]
 fn finding_4_ansi_c_quoted_words_are_decoded() {
     hard_everywhere(&["cat $'.ssh/\\x69d_rsa'", "cat $'\\056ssh/id_rsa'"]);
 }

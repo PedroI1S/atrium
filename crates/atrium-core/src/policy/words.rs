@@ -5,8 +5,301 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use globset::GlobBuilder;
+
 use super::RedirectOp;
 use super::shell::{Compound, Join, Unit, base};
+
+pub(super) struct AnsiCDecode {
+    pub decoded: String,
+    pub next_index: usize,
+    pub closed: bool,
+    pub control_char: bool,
+    pub bad_escape: bool,
+}
+
+fn is_refused_control(c: char) -> bool {
+    (c.is_control() && !matches!(c, '\n' | '\t' | '\r')) || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// Decodes a bash ANSI-C quoted span `$'…'` starting at `quote_idx` (the `'`).
+/// Supports all bash `$'…'` escapes (`\a \b \e \E \f \n \r \t \v \\ \' \" \?`,
+/// `\nnn` octal, `\xHH`, `\uHHHH`, `\UHHHHHHHH`, `\cX`). Sets flags so the
+/// lexer fails closed on unterminated quotes, NUL, refused control characters,
+/// or unknown/malformed escapes.
+pub(super) fn decode_ansi_c(chars: &[char], quote_idx: usize) -> AnsiCDecode {
+    let mut i = quote_idx + 1;
+    let mut out = String::new();
+    let mut pending_bytes: Vec<u8> = Vec::new();
+    let mut closed = false;
+    let mut saw_nul = false;
+    let mut control_char = false;
+    let mut bad_escape = false;
+
+    let push_char = |c: char, out: &mut String, saw_nul: &mut bool, control_char: &mut bool| {
+        if c == '\0' {
+            *control_char = true;
+            *saw_nul = true;
+            return;
+        }
+        if is_refused_control(c) {
+            *control_char = true;
+        }
+        if !*saw_nul {
+            out.push(c);
+        }
+    };
+
+    let flush_bytes = |pending: &mut Vec<u8>,
+                       out: &mut String,
+                       saw_nul: &mut bool,
+                       control_char: &mut bool,
+                       bad_escape: &mut bool| {
+        if pending.is_empty() {
+            return;
+        }
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                for ch in s.chars() {
+                    push_char(ch, out, saw_nul, control_char);
+                }
+            }
+            Err(_) => {
+                *bad_escape = true;
+            }
+        }
+        pending.clear();
+    };
+
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                closed = true;
+                i += 1;
+                break;
+            }
+            '\\' => {
+                i += 1;
+                let Some(&esc) = chars.get(i) else {
+                    bad_escape = true;
+                    break;
+                };
+                match esc {
+                    'a' | 'b' | 'e' | 'E' | 'f' | 'n' | 'r' | 't' | 'v' | '\\' | '\'' | '"'
+                    | '?' => {
+                        let ch = match esc {
+                            'a' => '\x07',
+                            'b' => '\x08',
+                            'e' | 'E' => '\x1b',
+                            'f' => '\x0c',
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            'v' => '\x0b',
+                            '\\' => '\\',
+                            '\'' => '\'',
+                            '"' => '"',
+                            _ => '?',
+                        };
+                        flush_bytes(
+                            &mut pending_bytes,
+                            &mut out,
+                            &mut saw_nul,
+                            &mut control_char,
+                            &mut bad_escape,
+                        );
+                        push_char(ch, &mut out, &mut saw_nul, &mut control_char);
+                        i += 1;
+                    }
+                    '0'..='7' => {
+                        let mut val: u32 = 0;
+                        let mut count = 0;
+                        while count < 3
+                            && let Some(&d) = chars.get(i)
+                            && ('0'..='7').contains(&d)
+                        {
+                            val = val * 8 + (d as u32 - '0' as u32);
+                            i += 1;
+                            count += 1;
+                        }
+                        if val > 0xff {
+                            bad_escape = true;
+                        }
+                        let byte = (val & 0xff) as u8;
+                        if byte == 0 {
+                            flush_bytes(
+                                &mut pending_bytes,
+                                &mut out,
+                                &mut saw_nul,
+                                &mut control_char,
+                                &mut bad_escape,
+                            );
+                            control_char = true;
+                            saw_nul = true;
+                        } else if !saw_nul {
+                            pending_bytes.push(byte);
+                        }
+                    }
+                    'x' => {
+                        i += 1;
+                        let mut val: u32 = 0;
+                        let mut count = 0;
+                        while count < 2
+                            && let Some(&d) = chars.get(i)
+                            && let Some(digit) = d.to_digit(16)
+                        {
+                            val = val * 16 + digit;
+                            i += 1;
+                            count += 1;
+                        }
+                        if count == 0 {
+                            bad_escape = true;
+                            flush_bytes(
+                                &mut pending_bytes,
+                                &mut out,
+                                &mut saw_nul,
+                                &mut control_char,
+                                &mut bad_escape,
+                            );
+                            if !saw_nul {
+                                out.push_str("\\x");
+                            }
+                        } else {
+                            let byte = val as u8;
+                            if byte == 0 {
+                                flush_bytes(
+                                    &mut pending_bytes,
+                                    &mut out,
+                                    &mut saw_nul,
+                                    &mut control_char,
+                                    &mut bad_escape,
+                                );
+                                control_char = true;
+                                saw_nul = true;
+                            } else if !saw_nul {
+                                pending_bytes.push(byte);
+                            }
+                        }
+                    }
+                    'u' | 'U' => {
+                        let max_digits = if esc == 'u' { 4 } else { 8 };
+                        i += 1;
+                        flush_bytes(
+                            &mut pending_bytes,
+                            &mut out,
+                            &mut saw_nul,
+                            &mut control_char,
+                            &mut bad_escape,
+                        );
+                        let mut val: u32 = 0;
+                        let mut count = 0;
+                        while count < max_digits
+                            && let Some(&d) = chars.get(i)
+                            && let Some(digit) = d.to_digit(16)
+                        {
+                            val = val * 16 + digit;
+                            i += 1;
+                            count += 1;
+                        }
+                        if count == 0 {
+                            bad_escape = true;
+                            if !saw_nul {
+                                out.push('\\');
+                                out.push(esc);
+                            }
+                        } else if let Some(ch) = char::from_u32(val) {
+                            push_char(ch, &mut out, &mut saw_nul, &mut control_char);
+                        } else {
+                            bad_escape = true;
+                        }
+                    }
+                    'c' => {
+                        i += 1;
+                        flush_bytes(
+                            &mut pending_bytes,
+                            &mut out,
+                            &mut saw_nul,
+                            &mut control_char,
+                            &mut bad_escape,
+                        );
+                        match chars.get(i).copied() {
+                            None => {
+                                bad_escape = true;
+                            }
+                            Some('\'') => {
+                                bad_escape = true;
+                                closed = true;
+                                i += 1;
+                                break;
+                            }
+                            Some('\\') => {
+                                i += 1;
+                                if chars.get(i) == Some(&'\\') {
+                                    i += 1;
+                                }
+                                push_char('\x1c', &mut out, &mut saw_nul, &mut control_char);
+                            }
+                            Some('?') => {
+                                i += 1;
+                                push_char('\x7f', &mut out, &mut saw_nul, &mut control_char);
+                            }
+                            Some(x) if x.is_ascii() => {
+                                i += 1;
+                                let ctrl = ((x as u8).to_ascii_uppercase() & 0x1f) as char;
+                                push_char(ctrl, &mut out, &mut saw_nul, &mut control_char);
+                            }
+                            Some(_) => {
+                                i += 1;
+                                bad_escape = true;
+                            }
+                        }
+                    }
+                    other => {
+                        flush_bytes(
+                            &mut pending_bytes,
+                            &mut out,
+                            &mut saw_nul,
+                            &mut control_char,
+                            &mut bad_escape,
+                        );
+                        bad_escape = true;
+                        if !saw_nul {
+                            out.push('\\');
+                            out.push(other);
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            ch => {
+                flush_bytes(
+                    &mut pending_bytes,
+                    &mut out,
+                    &mut saw_nul,
+                    &mut control_char,
+                    &mut bad_escape,
+                );
+                push_char(ch, &mut out, &mut saw_nul, &mut control_char);
+                i += 1;
+            }
+        }
+    }
+
+    flush_bytes(
+        &mut pending_bytes,
+        &mut out,
+        &mut saw_nul,
+        &mut control_char,
+        &mut bad_escape,
+    );
+    AnsiCDecode {
+        decoded: out,
+        next_index: i,
+        closed,
+        control_char,
+        bad_escape,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -577,6 +870,283 @@ enum Cd {
 /// The effect of `unit` if it changes directory, resolved against every
 /// directory the shell may be in (`cands`). `followed`: where it goes can be
 /// followed (not in a pipeline or the background).
+/// Directories under `home` that hold credentials or Atrium data/config, or
+/// lead to them; a `cd <glob>` that can match any of them includes them in
+/// `Cd::Lost` so subsequent commands are checked against those directories.
+const SENSITIVE_CD_DIRS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".aws/sso",
+    ".aws/sso/cache",
+    ".docker",
+    ".kube",
+    ".config",
+    ".config/gh",
+    ".config/gcloud",
+    ".config/git",
+    ".config/fish",
+    ".config/atrium",
+    ".config/google-chrome",
+    ".config/google-chrome/default",
+    ".config/chromium",
+    ".config/chromium/default",
+    ".config/bravesoftware",
+    ".config/bravesoftware/default",
+    ".config/microsoft-edge",
+    ".config/microsoft-edge/default",
+    ".config/vivaldi",
+    ".config/vivaldi/default",
+    ".mozilla",
+    ".claude",
+    ".codex",
+    ".gnupg",
+    ".gnupg/private-keys-v1.d",
+    ".gemini",
+    ".cargo",
+    ".azure",
+    ".zsh_sessions",
+    ".bash_sessions",
+    ".local",
+    ".local/share",
+    ".local/share/atrium",
+    ".local/share/fish",
+    "Library",
+    "Library/Keychains",
+    "Library/Cookies",
+    "Library/Application Support",
+    "Library/Application Support/Google",
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Google/Chrome/Default",
+    "Library/Application Support/Chromium",
+    "Library/Application Support/Chromium/Default",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/Microsoft Edge/Default",
+    "Library/Application Support/BraveSoftware",
+    "Library/Application Support/BraveSoftware/Default",
+    "Library/Application Support/Firefox",
+    "Library/Application Support/Arc",
+    "Library/Application Support/Vivaldi",
+    "Library/Application Support/Vivaldi/Default",
+];
+
+/// Credential and Atrium trees where any subdirectory inside them is sensitive.
+const SENSITIVE_CD_TREES: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".config/gcloud",
+    ".gemini",
+    "Library/Keychains",
+    ".local/share/atrium",
+    ".config/atrium",
+    ".aws/sso/cache",
+    ".zsh_sessions",
+    ".bash_sessions",
+];
+
+const MAX_CD_GLOB_VARIANTS: usize = 16;
+
+fn normalize_cd_glob(pat: &str) -> Vec<Vec<String>> {
+    let abs = pat.starts_with('/');
+    let folded = pat.replace('ſ', "s");
+    let mut states: Vec<Vec<String>> = vec![vec![]];
+    for comp in folded.split('/') {
+        match comp {
+            "" | "." => {}
+            "**" => {
+                for st in &mut states {
+                    if st.last().map(String::as_str) != Some("**") {
+                        st.push("**".to_string());
+                    }
+                }
+            }
+            ".." => {
+                let mut next = Vec::new();
+                for mut st in states {
+                    match st.last().map(String::as_str) {
+                        None => {
+                            if !abs {
+                                st.push("..".to_string());
+                            }
+                            next.push(st);
+                        }
+                        Some("..") => {
+                            st.push("..".to_string());
+                            next.push(st);
+                        }
+                        Some("**") => {
+                            next.push(st.clone());
+                            st.pop();
+                            next.push(st.clone());
+                            if !st.is_empty() {
+                                st.pop();
+                                next.push(st);
+                            }
+                        }
+                        Some(last) if !last.contains(['*', '?', '[']) => {
+                            st.pop();
+                            next.push(st);
+                        }
+                        Some(_) => {
+                            let mut popped = st.clone();
+                            popped.pop();
+                            next.push(popped);
+                            st.push("..".to_string());
+                            next.push(st);
+                        }
+                    }
+                    if next.len() >= MAX_CD_GLOB_VARIANTS {
+                        break;
+                    }
+                }
+                next.sort();
+                next.dedup();
+                next.truncate(MAX_CD_GLOB_VARIANTS);
+                states = next;
+            }
+            other => {
+                for st in &mut states {
+                    st.push(other.to_string());
+                }
+            }
+        }
+    }
+    states
+}
+
+fn leading_class_matches_dot(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix('[') else {
+        return false;
+    };
+    if rest.starts_with(['!', '^']) {
+        return false;
+    }
+    let mut chars = rest.char_indices();
+    if rest.starts_with(']') {
+        // `[]...` puts `]` first in the class.
+        let _ = chars.next();
+    }
+    let mut prev_esc = false;
+    for (idx, ch) in chars {
+        if prev_esc {
+            prev_esc = false;
+            continue;
+        }
+        if ch == '\\' {
+            prev_esc = true;
+            continue;
+        }
+        if ch == ']' {
+            let class = &p[..=idx + 1];
+            return GlobBuilder::new(class)
+                .literal_separator(true)
+                .build()
+                .is_ok_and(|g| g.compile_matcher().is_match("."));
+        }
+    }
+    false
+}
+
+fn cd_comp_matches(pat: &str, cand: &str) -> bool {
+    if cand.starts_with('.') && !(pat.starts_with('.') || leading_class_matches_dot(pat)) {
+        return false;
+    }
+    GlobBuilder::new(pat)
+        .literal_separator(true)
+        .case_insensitive(true)
+        .build()
+        .is_ok_and(|g| g.compile_matcher().is_match(cand))
+}
+
+fn cd_comps_match(pat: &[String], cand: &[&str]) -> bool {
+    pat.len() == cand.len() && pat.iter().zip(cand).all(|(p, c)| cd_comp_matches(p, c))
+}
+
+fn cd_glob_matches(
+    expanded: &str,
+    cands: &[PathBuf],
+    start: &Path,
+    home: &Path,
+    resolve: Resolver<'_>,
+) -> Vec<PathBuf> {
+    let home_str = home.to_string_lossy();
+    let home_trimmed = home_str.trim_end_matches('/');
+    let mut raw_patterns: Vec<String> = Vec::new();
+    if Path::new(expanded).is_absolute() {
+        raw_patterns.push(expanded.to_string());
+    } else {
+        for c in cands {
+            let cs = c.to_string_lossy();
+            let base_c = cs.trim_end_matches('/');
+            let pat = format!("{base_c}/{expanded}");
+            if !raw_patterns.contains(&pat) {
+                raw_patterns.push(pat);
+            }
+        }
+    }
+
+    let mut variants: Vec<Vec<String>> = Vec::new();
+    for raw in &raw_patterns {
+        for v in normalize_cd_glob(raw) {
+            if !variants.contains(&v) {
+                variants.push(v);
+            }
+        }
+    }
+
+    let mut matched: Vec<PathBuf> = Vec::new();
+    let mut push_target = |raw_path: String| {
+        let p = resolve(&raw_path, start, home);
+        if !matched.contains(&p) {
+            matched.push(p);
+        }
+    };
+
+    let home_comps: Vec<String> = home_trimmed
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.replace('ſ', "s"))
+        .collect();
+
+    let matches_variant = |var: &[String], target_comps: &[&str]| -> bool {
+        if var.iter().any(|c| c == "**") {
+            let pat_str = format!("/{}", var.join("/"));
+            let cand_str = format!("/{}", target_comps.join("/"));
+            GlobBuilder::new(&pat_str)
+                .literal_separator(true)
+                .case_insensitive(true)
+                .build()
+                .is_ok_and(|g| g.compile_matcher().is_match(&cand_str))
+        } else {
+            cd_comps_match(var, target_comps)
+        }
+    };
+
+    for rel in SENSITIVE_CD_DIRS {
+        let mut target: Vec<&str> = home_comps.iter().map(String::as_str).collect();
+        target.extend(rel.split('/'));
+        if variants.iter().any(|v| matches_variant(v, &target)) {
+            push_target(format!("{home_trimmed}/{rel}"));
+        }
+    }
+    for tree in SENSITIVE_CD_TREES {
+        let mut target: Vec<&str> = home_comps.iter().map(String::as_str).collect();
+        target.extend(tree.split('/'));
+        if variants.iter().any(|v| {
+            v.len() > target.len()
+                && !v.iter().any(|c| c == "**")
+                && cd_comps_match(&v[..target.len()], &target)
+        }) {
+            push_target(format!("{home_trimmed}/{tree}/x"));
+        }
+    }
+    let app_comps = ["Applications", "Atrium.app"];
+    if variants.iter().any(|v| matches_variant(v, &app_comps)) {
+        push_target("/Applications/Atrium.app".to_string());
+    }
+
+    matched
+}
+
 fn cd_effect(
     unit: &Unit,
     followed: bool,
@@ -613,7 +1183,8 @@ fn cd_effect(
             break;
         }
     }
-    let resolve_all = |a: &str| -> Option<Vec<PathBuf>> {
+    let mut glob_cd = false;
+    let mut resolve_all = |a: &str| -> Option<Vec<PathBuf>> {
         // `~-` ($OLDPWD), `~+` ($PWD), `~+N`/`~-N`, `-N`, `+N` (the
         // directory stack): not a directory the line names (round 5
         // blocker 6)
@@ -625,8 +1196,11 @@ fn cd_effect(
             return None;
         }
         let expanded = expand_home(a, home, start);
-        if has_unknown_var(&expanded) || expanded.contains(['*', '?', '[']) {
+        if has_unknown_var(&expanded) {
             None
+        } else if expanded.contains(['*', '?', '[']) {
+            glob_cd = true;
+            Some(cd_glob_matches(&expanded, cands, start, home, resolve))
         } else if Path::new(&expanded).is_absolute() {
             Some(vec![resolve(&expanded, start, home)])
         } else {
@@ -653,7 +1227,7 @@ fn cd_effect(
     };
     // `pushd` keeps a stack the line can pop later: never followed.
     Some(match targets {
-        Some(t) if readable && name != "pushd" && followed => Cd::Moved(t),
+        Some(t) if readable && !glob_cd && name != "pushd" && followed => Cd::Moved(t),
         Some(t) => Cd::Lost(t),
         None => Cd::Lost(vec![]),
     })

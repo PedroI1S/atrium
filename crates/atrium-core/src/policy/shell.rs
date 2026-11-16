@@ -885,9 +885,20 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
                         cur.subs.push(body);
                         i = end;
                     } else if chars.get(i + 1) == Some(&'\'') {
-                        // ANSI-C quoting: contents are escape sequences.
-                        word.push('$');
-                        i += 1;
+                        // ANSI-C quoting: decode `$'…'` escapes into the word.
+                        let res = super::words::decode_ansi_c(&chars, i + 1);
+                        quoted_prefix_empty = false;
+                        word.push_str(&res.decoded);
+                        i = res.next_index;
+                        if !res.closed {
+                            out.reasons.push("unterminated quote".into());
+                        }
+                        if res.control_char {
+                            out.reasons.push("control character".into());
+                        }
+                        if res.bad_escape {
+                            out.reasons.push("malformed escape".into());
+                        }
                     } else if chars.get(i + 1) == Some(&'{') {
                         let (body, j, closed) = scan_dollar_brace(&chars, i + 2, false);
                         if !closed {
