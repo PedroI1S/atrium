@@ -97,6 +97,14 @@ pub enum Compound {
     Func,
 }
 
+/// An unknown wrapper invocation whose readings exceeded the bounded search
+/// limit, together with whether the command sits downstream of a pipe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnboundedUnknown {
+    pub words: Vec<String>,
+    pub piped: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Lexed {
     pub units: Vec<Unit>,
@@ -104,9 +112,9 @@ pub struct Lexed {
     pub reasons: Vec<String>,
     /// More commands than the checker takes on (`MAX_UNITS`).
     pub overflow: bool,
-    /// Words of an unknown `env`/`command` invocation whose readings could not
-    /// be bounded (M1-18, K1 fail-closed).
-    pub unbounded_unknown_words: Vec<Vec<String>>,
+    /// Words of an unknown wrapper invocation whose readings could not be
+    /// bounded (M1-18, K1 fail-closed).
+    pub unbounded_unknown_words: Vec<UnboundedUnknown>,
     /// Every here-doc and here-string body at this level.
     pub stdin_texts: Vec<String>,
     /// The number of this text (`Unit::ctx`).
@@ -1128,10 +1136,15 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
         // checked as a command of its own
         let mut other_readings: Vec<Vec<String>> = if unknown_option {
             let mut readings = Vec::new();
-            for e in
-                unwrap_readings_bounded(&seg.argv, depth, cache, &mut out.unbounded_unknown_words)
-                    .into_iter()
-                    .skip(1)
+            for e in unwrap_readings_bounded(
+                &seg.argv,
+                depth,
+                cache,
+                piped,
+                &mut out.unbounded_unknown_words,
+            )
+            .into_iter()
+            .skip(1)
             {
                 if !e.is_empty() && !readings.contains(&e) {
                     readings.push(e);
@@ -1191,6 +1204,7 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
             &targets,
             depth,
             cache,
+            piped,
             &mut out.unbounded_unknown_words,
         );
         for p in &payloads {
@@ -1955,7 +1969,8 @@ fn code_texts_bounded(
     targets: &[String],
     depth: u8,
     cache: &mut LexCache,
-    unbounded_words: &mut Vec<Vec<String>>,
+    piped: bool,
+    unbounded_words: &mut Vec<UnboundedUnknown>,
 ) -> Vec<String> {
     let mut payloads: Vec<String> = vec![];
     let add = |v: Vec<String>, out: &mut Vec<String>| {
@@ -1969,13 +1984,13 @@ fn code_texts_bounded(
         add(payloads_of(e), &mut payloads);
     }
     add(
-        env_payloads_bounded(argv, depth, cache, unbounded_words),
+        env_payloads_bounded(argv, depth, cache, piped, unbounded_words),
         &mut payloads,
     );
     for step in unwrap_steps(argv, depth, cache) {
         if step.first().is_some_and(|f| base(f) == "env") {
             add(
-                env_payloads_bounded(&step, depth, cache, unbounded_words),
+                env_payloads_bounded(&step, depth, cache, piped, unbounded_words),
                 &mut payloads,
             );
         }
@@ -2097,14 +2112,15 @@ const MAX_UNKNOWN_EMIT: usize = 32;
 
 fn unwrap_readings(argv: &[String], depth: u8, cache: &mut LexCache) -> Vec<Vec<String>> {
     let mut unused = vec![];
-    unwrap_readings_bounded(argv, depth, cache, &mut unused)
+    unwrap_readings_bounded(argv, depth, cache, false, &mut unused)
 }
 
 fn unwrap_readings_bounded(
     argv: &[String],
     depth: u8,
     cache: &mut LexCache,
-    unbounded_words: &mut Vec<Vec<String>>,
+    piped: bool,
+    unbounded_words: &mut Vec<UnboundedUnknown>,
 ) -> Vec<Vec<String>> {
     let mut invs: Vec<(Vec<String>, bool)> = vec![];
     let mut unbounded = false;
@@ -2148,8 +2164,13 @@ fn unwrap_readings_bounded(
         if !out.contains(&e) {
             out.push(e);
         }
+        if invs.is_empty() {
+            unbounded = true;
+        }
     }
+    let mut any_pushed = false;
     for (inv, is_env) in invs {
+        let mut inv_unbounded = false;
         expand_unknown_env_cmd(
             &inv,
             is_env,
@@ -2157,15 +2178,25 @@ fn unwrap_readings_bounded(
             cache,
             Some(&mut out),
             None,
-            &mut unbounded,
+            &mut inv_unbounded,
             0,
         );
-        if unbounded && !unbounded_words.contains(&inv) {
-            unbounded_words.push(inv);
+        if inv_unbounded {
+            any_pushed = true;
+            let entry = UnboundedUnknown { words: inv, piped };
+            if !unbounded_words.contains(&entry) {
+                unbounded_words.push(entry);
+            }
         }
     }
-    if unbounded && unbounded_words.is_empty() {
-        unbounded_words.push(argv.to_vec());
+    if unbounded && !any_pushed {
+        let entry = UnboundedUnknown {
+            words: argv.to_vec(),
+            piped,
+        };
+        if !unbounded_words.contains(&entry) {
+            unbounded_words.push(entry);
+        }
     }
     out
 }
@@ -2353,7 +2384,10 @@ fn unwrap_reading_steps(
             (j + operands).min(a.len())
         };
         let mut step_unknown = false;
-        let orig_a = (b == "env" || b == "command").then(|| a.clone());
+        let orig_a = (unknown_invs.is_some()
+            && (b == "env" || b == "arch" || wrapper_opts(&b).is_some())
+            && a[1..].iter().any(|w| is_option(w)))
+        .then(|| a.clone());
         let n = match b.as_str() {
             "{" | "}" | "!" | "do" | "then" | "else" | "elif" | "if" | "while" | "until"
             | "coproc" => 1,
@@ -2455,6 +2489,15 @@ fn unwrap_reading_steps(
                     }
                 }
                 if let Some(cmd) = shell_string {
+                    if step_unknown
+                        && let Some(orig) = orig_a
+                        && let Some(invs) = unknown_invs.as_deref_mut()
+                    {
+                        let entry = (orig, false);
+                        if !invs.contains(&entry) {
+                            invs.push(entry);
+                        }
+                    }
                     a = vec!["sh".into(), "-c".into(), cmd];
                     unknown |= step_unknown;
                     continue;
@@ -3524,8 +3567,44 @@ fn expand_unknown_env_cmd(
                             unbounded,
                             rec_depth + 1,
                         );
+                    } else if wrapper_opts(b0).is_some() || b0 == "arch" {
+                        let mut local_unbounded = vec![];
+                        for r_sub in
+                            unwrap_readings_bounded(&sp, depth, cache, false, &mut local_unbounded)
+                        {
+                            if let Some(r) = readings.as_deref_mut() {
+                                push_bounded_vec(r, r_sub, unbounded);
+                            }
+                        }
+                        if !local_unbounded.is_empty() {
+                            *unbounded = true;
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    let is_script_or_flock = matches!(a.first().map(|s| base(s)), Some("script" | "flock"));
+    if is_script_or_flock && let Some(r) = readings.as_deref_mut() {
+        for m in 1..a.len() {
+            let w = a[m].as_str();
+            let cmd = if w == "-c"
+                || (w.starts_with("--")
+                    && !w.contains('=')
+                    && w.len() >= 3
+                    && "--command".starts_with(w))
+            {
+                a.get(m + 1).cloned()
+            } else if let Some((name, val)) = w.split_once('=') {
+                (name.len() >= 3 && "--command".starts_with(name)).then(|| val.to_string())
+            } else if w.starts_with('-') && !w.starts_with("--") && w.ends_with('c') {
+                a.get(m + 1).cloned()
+            } else {
+                None
+            };
+            if let Some(c) = cmd {
+                push_bounded_vec(r, vec!["sh".into(), "-c".into(), c], unbounded);
             }
         }
     }
@@ -3557,9 +3636,11 @@ fn expand_unknown_env_cmd(
                 unbounded,
                 rec_depth + 1,
             );
-        } else if wrapper_opts(&b0).is_some() {
+        } else if wrapper_opts(&b0).is_some() || b0 == "arch" {
             let mut local_unbounded = vec![];
-            for r_sub in unwrap_readings_bounded(&resolved, depth, cache, &mut local_unbounded) {
+            for r_sub in
+                unwrap_readings_bounded(&resolved, depth, cache, false, &mut local_unbounded)
+            {
                 if let Some(r) = readings.as_deref_mut() {
                     push_bounded_vec(r, r_sub, unbounded);
                 }
@@ -3595,7 +3676,8 @@ fn env_payloads_bounded(
     argv: &[String],
     depth: u8,
     cache: &mut LexCache,
-    unbounded_words: &mut Vec<Vec<String>>,
+    piped: bool,
+    unbounded_words: &mut Vec<UnboundedUnknown>,
 ) -> Vec<String> {
     let mut out = vec![];
     let Some(k) = argv.iter().position(|w| base(w) == "env") else {
@@ -3656,9 +3738,12 @@ fn env_payloads_bounded(
             0,
         );
         if unbounded {
-            let slice = argv[k..].to_vec();
-            if !unbounded_words.contains(&slice) {
-                unbounded_words.push(slice);
+            let entry = UnboundedUnknown {
+                words: argv[k..].to_vec(),
+                piped,
+            };
+            if !unbounded_words.contains(&entry) {
+                unbounded_words.push(entry);
             }
         }
     }
@@ -3746,8 +3831,13 @@ fn find_exec_units(eff: &[String], out: &mut Lexed, level: u8, cache: &mut LexCa
             // every reading of its wrappers and substituted words (`-exec
             // $(which sudo) id`: round 8 blocker 4)
             let mut effs = vec![unwrap_checked_at(&argv, level, cache).0];
-            for r in unwrap_readings_bounded(&argv, level, cache, &mut out.unbounded_unknown_words)
-            {
+            for r in unwrap_readings_bounded(
+                &argv,
+                level,
+                cache,
+                false,
+                &mut out.unbounded_unknown_words,
+            ) {
                 if !r.is_empty() && !effs.contains(&r) {
                     effs.push(r);
                 }
@@ -3758,6 +3848,7 @@ fn find_exec_units(eff: &[String], out: &mut Lexed, level: u8, cache: &mut LexCa
                 &[],
                 level,
                 cache,
+                false,
                 &mut out.unbounded_unknown_words,
             );
             for e in &effs {

@@ -295,3 +295,77 @@ Every row in `fix2_*` (plus the 5 updated P1 rows) was probed directly on `dev` 
 - **Four stores outside the CR-12 contract list** (`~/.gem/credentials`, `~/.terraform.d/credentials.tfrc.json`, `~/.config/op/config`, `~/.yarnrc.yml`): contract change, left in the ignored test `finding_6_stores_outside_the_cr_12_list_ask_in_home`.
 - **Settings UI** listing CR-12 stores: no protected list exists in `app/src/ui/`.
 
+## Fix round 3 (D-110)
+
+Worker: Gemini 4 Hydrogen (high effort). Closed all four findings from Argon's round-3 review (`rework` on `4b794cf`) while keeping 0 lines more permissive than `dev` and 0 false hard denies on ordinary lines.
+
+### Changes by item
+
+1. **Finding 1 — Single glob normalizer, dot+slash widening, brace overflow, and `ASK_TREES` (`crates/atrium-core/src/policy/deny.rs`, `engine.rs`):**
+   - Replaced `normalize_glob_str` and `words::normalize` inside `check_escape_variant` with one shared normalizer `normalize_glob_variants(g, cap)` used by both `glob_search_variants` (`search_glob_hit`, `ask_search_glob_hit`) and `check_escape_variant` (`glob_escape`). A `..` step after a single-component wildcard (`*/..`, `p*/..`, `[a-z]/..`, `?/..`) branches into both the popped form (wildcard segment and `..` removed) and the as-written form; literal `seg/..` always pops.
+   - Extracted shared `expand_glob_candidates` used by both `glob_escape` and `glob_search_variants`, applying `widen_pattern_slashes` to both the base candidate and `widen_pattern_dots(&b)` (and `widen_pattern_dots` to slash-widened candidates), so `[.][.][/].ssh/id_rsa`, `??[/].ssh/id_rsa`, and `proj[/][.][.][/].ssh/id_rsa` are all caught as `Hard(credential-read)`.
+   - Removed `brace_fallback` sampling on `words::brace_expand` overflow: when `brace_expand` returns `None`, `expand_glob_candidates` sets `unbounded = true` and clears `variants`. `GlobEscape::unbounded` causes `ask_search_glob_hit` to return `true` and `DefaultPolicy::evaluate` to return `Ask` everywhere (Home, Prefix, Any, FullAccess), while `RuleDecision::Deny` and any direct `HardDeny` still win. Updated `p1_search_globs_that_leave_their_roots` for `{a,b,c}.../../../x` (`["Ask", "Ask", "Ask"]`).
+   - Updated `Sensitive::ask_search_glob_hit` so any normalized glob variant with a directory prefix matching an `ASK_TREES` entry (`.aws/sso/cache`, `.zsh_sessions`, `.bash_sessions`) relative to a search root (or absolute) asks in Home even for non-recursive filename-filtered searches like `.zsh_sessions/*.session`.
+
+2. **Finding 2 — Unbounded wrappers, `-S`/`-C` separate args, `security`/`secret-tool`/piped interpreters (`crates/atrium-core/src/policy/shell.rs`, `deny.rs`):**
+   - `Lexed::unbounded_unknown_words` now stores `UnboundedUnknown { words, piped }`, preserving whether each unbounded wrapper sits downstream of a pipe (`seg.piped`). Fixed `unwrap_readings_bounded` to track `inv_unbounded` per invocation and handle `choices > 4` when `invs.is_empty()`.
+   - In `unknown_words_could_be_dangerous`, a separate argument word after `-S`/`--split-string`, `-C`/`--chdir` (including GNU long prefixes and `-xS`/`-xC` clusters), or `script`/`flock` `-c`/`--command` is split on whitespace and checked via `unknown_tok_dangerous`, matching the attached forms.
+   - Added `"security"` and `"secret-tool"` to `unknown_tok_dangerous`, and `piped && is_interpreter(tok)` (which covers `python*`, `node`, `perl`, `ruby`, `deno`, `bun`, `php`, `lua`, `pwsh`, and shells).
+   - `unwrap_reading_steps` now records `orig_a` whenever `step_unknown` is `true` for every wrapper the parser unwraps (`nice`, `nohup`, `time`, `xargs`, `stdbuf`, `setsid`, `timeout`, `ionice`, `chrt`, `taskset`, `chroot`, `flock`, `script`, `exec`, `builtin`, `unbuffer`, `caffeinate`, `sandbox-exec`, `arch`, `env`, `command`), plus `script`/`flock` `-c` handling in `expand_unknown_env_cmd` and `orig_a` recording on `Opt::Shell` (`script -Z ... -c ...`).
+
+3. **Finding 3 — Performance & glob variant cap (`crates/atrium-core/src/policy/deny.rs`, `engine.rs`):**
+   - Capped generated variants in `expand_glob_candidates`, `glob_search_variants`, and `normalize_glob_variants` at `MAX_GLOB_VARIANTS = 256` (failing closed with `unbounded = true` -> `Ask` everywhere, identical to brace overflow).
+   - Cached `glob_escape` and `glob_search` on `Analysis` (computed once per `analyze_with` call instead of 3 times per `evaluate`) and added `class_may_match_dot` fast path in `may_be_dot_component`/`widen_pattern_dots` to skip compiling `GlobBuilder` regexes for plain `[a-z]`/`[A-Z]`/`[0-9]` classes.
+   - `fix3_finding3_glob_variant_cap_performance` evaluates `{1..64}{a,b,c,d}/[a-z]/$VAR/**/../**/../**/../**/../*.rs` across all 3 presets (`Home`, `Any`, `FullAccess`) in well under 50 ms (~30 ms standalone, passing reliably in full parallel runs).
+
+4. **Finding 4 — `git log -L` and `[,-0]` glob class (`crates/atrium-core/src/policy/engine.rs`, `deny.rs`):**
+   - Added `git_args_name_credential` and `parse_git_line_range` in `engine.rs` to parse `-L <spec>`, `-L<spec>`, `--line-range <spec>`, and `--line-range=<spec>` as `start,end:file` or `:funcname:file` (`rsplit_once(':')` so `func` regexes with `::` work) and check only the `<file>` part via `git_path_is_credential` (failing closed on unparseable specs). Note: attached `-L:main:src/lib.rs` and `-L1,20:src/lib.rs` still return `Ask` in Home because `'c'` in `src` matches `GIT_FORBIDDEN`'s `"-c"` in `forbidden_flag` on both `dev` and this branch (`-L :main:src/lib.rs`, `-L 1,20:src/lib.rs`, `-L:main:a.txt`, `-L1,20:a.txt`, `--line-range=1,20:src/lib.rs`, and `--line-range :main:src/lib.rs` all return `Allow` x4).
+   - Checked `globset` 0.4 directly (asserted in `fix3_finding4_git_line_range_and_glob_class`): in `globset`, `[,-0]` and `[/]` BOTH match `'/'` (`is_match("/") == true`) even when `GlobBuilder::literal_separator(true)` is set (as well as `literal_separator(false)` used in `search_glob_hit` / `ask_search_glob_hit`). Per the rule *"If the matcher can match `/` through a class, keep the widening and say so"*, `widen_pattern_slashes` keeps the widening on `[,-0]` (`[,-0]*.rs` stays `Ask / Allow / Allow`).
+
+### Tests (`crates/atrium-core/tests/adversarial_m1_18.rs`)
+
+- Added `fix3_finding1_glob_normalization_overflow_and_ask_trees` (all 18 evidence lines from Finding 1 + `*/../../.ssh/id_rsa`, `.bash_sessions/*.history`, `.aws/sso/cache/*.txt`).
+- Added `fix3_finding2_unbounded_wrappers_and_interpreters` (all 10 evidence lines from Finding 2 + `-C ..`/`--chdir ..` + `time`/`xargs`/`stdbuf`/`setsid`/`timeout` + all 8 non-shell interpreters piped from `curl`).
+- Added `fix3_finding3_glob_variant_cap_performance` (worst-case glob, asserts `["Ask", "Ask", "Ask"]` and `< 50 ms`).
+- Added `fix3_finding4_git_line_range_and_glob_class` (`-L`/`--line-range` safe & credential forms + `globset` `is_match("/")` assertions + `[,-0]*.rs`).
+- Added `fix3_ordinary_lines_keep_devs_verdict` (`nice`, `nohup`, `time`, `xargs`, `timeout`, unbounded benign `nice`, `git log -L 1,20:src/lib.rs`, `git log -L :main:src/lib.rs`, `rg --glob '*.{rs,toml}'`, `[A-Z]*.md`, `?.txt`, `*/mod.rs`, `*/../src/*.rs`).
+- Verified all 5 `fix3_*` tests fail on `4b794cf` before the code fixes and pass now.
+
+### Comparison with `dev` (fix round 3)
+
+Probed directly against `dev` in a temporary `.dev_probe/` copy (with `dev`'s `policy/{deny,engine,gate,shell,words}.rs` restored via `git show dev:...` and `CARGO_TARGET_DIR=.dev_probe/target`, removed afterwards).
+- **More permissive than `dev`: 0 lines.**
+- **False hard denies on ordinary lines: 0 lines.**
+- **Ordinary lines matching `dev`:**
+  - `cwd=proj|nice -n 5 cargo test`, `nohup make`, `time cargo build`, `xargs -n 1 echo`, `timeout 30 cargo test`, `cwd=proj|nice -A0 v0 ... -A13 v13 make`: `Ask / Ask / Allow / Allow` (`dev`: same).
+  - `cwd=proj|git log -L 1,20:src/lib.rs`, `git log -L :main:src/lib.rs`, `git log -L1,20:a.txt`, `git log -L:main:a.txt`, `git log --line-range=1,20:src/lib.rs`, `git log --line-range :main:src/lib.rs`: `Allow (all 4)` (`dev`: same).
+  - `cwd=proj|git log -L:main:src/lib.rs`, `git log -L1,20:src/lib.rs`, `rg --glob '[A-Z]*.md' TODO`: `Ask / Ask / Allow / Allow` (`dev`: same).
+  - `cwd=proj|rg --glob '*.{rs,toml}' fn src`, `rg --glob '[A-Z]*.md' TODO src`, `rg --glob '?.txt' x src`, `rg --glob '*/mod.rs' fn src`: `Allow (all 4)` (`dev`: same).
+  - `Search ["~/proj"]` (`rec=true`) with `*.{rs,toml}`, `[A-Z]*.md`, `?.txt`, `*/mod.rs`, `*/../src/*.rs`: `Allow (all 3)` (`dev`: same).
+- **Lines now stricter than `dev` and why that is right:**
+
+| Item | Line(s) | `dev` | Branch | Why stricter is right |
+|---|---|---|---|---|
+| F1 | `Search ["~"]` `*/../.ssh/id_rsa` (`rec=false`), `p*/../.ssh/id_rsa` (`rec=false`), `[a-z]/../.ssh/id_rsa` (`rec=false`), `?/../.ssh/id_rsa` (`rec=false`); `Search ["~/.aws"]` `*/../credentials` (`rec=false`); `Search ["~/proj"]` `*/../../.ssh/id_rsa` (`rec=false/true`); `Search ["~/proj"]` `[.][.][/].ssh/id_rsa`, `??[/].ssh/id_rsa`; `Search ["~"]` `proj[/][.][.][/].ssh/id_rsa` | `Allow (3x)` | `Hard(credential-read)` (3x) | Single normalizer pops `wildcard/..` and dot+slash widening combines `[.]`/`??` with `[/]`, exposing `~/.ssh/id_rsa` and `~/.aws/credentials`. |
+| F1 | `Search ["~"]` `*/../.ssh/id_rsa` (`rec=true`), `[a-z]/../.ssh/id_rsa` (`rec=true`); `Search ["~/.aws"]` `*/../credentials` (`rec=true`) | `Ask / Allow / Allow` | `Hard(credential-read)` (3x) | Same: reaches hard-denied credentials under `Any` and `FullAccess` too. |
+| F1 | `Search ["~"]` `*/../.cargo/credentials.toml`, `[a-z]/../.pypirc`, `.zsh_sessions/*.session`, `.bash_sessions/*.history`, `.aws/sso/cache/*.txt`; `Search ["~/.cargo"]` `*/../credentials.toml`; `Search ["~/.aws"]` `*/../sso/cache/*` (`rec=false`) | `Allow (3x)` | `Ask / Allow / Allow` | Normalized globs and `ASK_TREES` prefix matching catch non-recursive CR-12 store/tree searches in Home. |
+| F1 / F3 | `Search ["~/proj"]` `{a,../.ssh}/id_rsa{1..20}{1..20}`, `{a,/h/u/.ssh/id_rsa}{1..20}{1..20}`, `{a,b,c}.../../../x`, `{1..64}{a,b,c,d}/[a-z]/$VAR/**/../**/../**/../**/../*.rs` | `Allow (3x)` | `Ask / Ask / Ask` | Brace or 256-variant cap overflow cannot decide whether an alternative hits hard-deny; fails closed to `Ask` everywhere without sampling. |
+| F2 | 24 unbounded (`>24` words) wrapper lines: `env -A0..-A12` with `-S 'cat .ssh/id_rsa'`, `-S 'cat .npmrc'`, `-S 'cat .pypirc'`, `-S 'sudo id'`, `--split-string 'sudo id'`, `-C .. cat foo`, `--chdir .. cat foo`, `security dump-keychain`, `secret-tool lookup foo bar`, `curl ... \| env ... <9 interpreters>`, and `nice`/`time`/`xargs`/`stdbuf`/`setsid`/`timeout` `... sudo id` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Ask / Ask` | Exceeds reading bound while containing dangerous split `-S`/`-C`, credential tools, piped interpreters, or `sudo`; fails closed to `Ask` under `Any`/`FullAccess`. |
+| F2 | `cwd=proj\|nohup -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 eval 'cd /h/u/.ssh && true' && cat id_rsa` | `Ask / Ask / Allow / Allow` | `Hard(credential-read)` (4x) | `nohup` unknown options now feed `expand_unknown_env_cmd`, exposing `eval 'cd /h/u/.ssh && true'`. |
+| F4 | `cwd=proj\|git log -L :main:.env`, `git log -L 1,20:.env`, `git log --line-range=:main:.pypirc` | `Allow (4x)` | `Ask / Ask / Allow / Allow` | Extracted `<file>` from `-L` / `--line-range` matches CR-12 credential names. |
+| F4 | `Search ["~/proj"]` `[,-0]*.rs` (`rec=true`) | `Allow (3x)` | `Ask / Allow / Allow` | Kept widening because `globset` 0.4 matches `'/'` on `[,-0]` even with `literal_separator(true)`. |
+
+### Fix round 3 DoD outputs
+
+- `cargo fmt --all --check`: exit `0`.
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit `0`.
+- `cargo test --workspace --no-fail-fast`: exit `0` (all crates and doc-tests passed).
+- `cargo test -p atrium-core --no-fail-fast` (5 runs in a loop): exit `0` across all 5 runs (`adversarial_m1_18`: 29 passed, 0 failed, 0 ignored; `store`: 30 passed).
+- `cargo test -p atrium-core --test adversarial_fuzz --test policy --no-fail-fast` (5 runs in a loop for exact timings):
+  - Run 1: `adversarial_fuzz` `22.96s` (`2 passed; 0 failed; 1 ignored`); `policy` `4.90s` (`44 passed; 0 failed; 0 ignored`).
+  - Run 2: `adversarial_fuzz` `17.67s`; `policy` `4.89s`.
+  - Run 3: `adversarial_fuzz` `16.77s`; `policy` `5.30s`.
+  - Run 4: `adversarial_fuzz` `17.31s`; `policy` `5.54s`.
+  - Run 5: `adversarial_fuzz` `16.03s`; `policy` `4.93s`.
+- Scratch `.dev_probe/` directory and its target were removed.
+

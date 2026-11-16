@@ -596,8 +596,54 @@ fn is_git_key_name(name: &str) -> bool {
 /// Whether a `git show`/`git log`/`git diff` argument names a committed file
 /// whose name matches a credential: `REV:PATH`, `:PATH`, `:N:PATH` or a
 /// pathspec (including `:(magic)PATH` and short magic `:/`, `:!`, `:^`).
+/// Extracts `<file>` from `git log -L` / `--line-range` (`start,end:file` or `:funcname:file`).
+fn parse_git_line_range(spec: &str) -> Option<&str> {
+    if let Some(after) = spec.strip_prefix(':') {
+        let (func, file) = after.rsplit_once(':')?;
+        (!func.is_empty() && !file.is_empty()).then_some(file)
+    } else {
+        let (range, file) = spec.rsplit_once(':')?;
+        (!range.is_empty() && !file.is_empty()).then_some(file)
+    }
+}
+
+/// Whether `git show`/`git log`/`git diff` arguments name a committed file
+/// whose name matches a credential.
+fn git_args_name_credential(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            return args[i + 1..].iter().any(|a| git_names_credential(a));
+        }
+        let line_spec = if arg == "-L" || arg == "--line-range" {
+            i += 1;
+            match args.get(i) {
+                Some(s) => Some(s.as_str()),
+                None => return true,
+            }
+        } else if let Some(s) = arg.strip_prefix("-L") {
+            Some(s)
+        } else {
+            arg.strip_prefix("--line-range=")
+        };
+        if let Some(spec) = line_spec {
+            let Some(file) = parse_git_line_range(spec) else {
+                return true;
+            };
+            if git_path_is_credential(file) {
+                return true;
+            }
+        } else if git_names_credential(arg) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn git_names_credential(arg: &str) -> bool {
-    if arg.starts_with('-') && !arg.starts_with("-L") {
+    if arg.starts_with('-') {
         return false;
     }
     let path = if let Some(after) = arg.strip_prefix(':') {
@@ -647,6 +693,10 @@ fn git_names_credential(arg: &str) -> bool {
     } else {
         arg
     };
+    git_path_is_credential(path)
+}
+
+fn git_path_is_credential(path: &str) -> bool {
     let l = path.to_lowercase().replace('ſ', "s");
     let mut parts: Vec<&str> = vec![];
     for c in l.split('/') {
@@ -760,7 +810,7 @@ impl Home<'_> {
         }
         // `git show HEAD:.npmrc`: a committed file named like a credential
         // (CR-12)
-        if entry.prefix.first() == Some(&"git") && args.iter().any(|a| git_names_credential(a)) {
+        if entry.prefix.first() == Some(&"git") && git_args_name_credential(args) {
             return false;
         }
         let is_rg = entry.prefix == ["rg"];
@@ -865,7 +915,9 @@ impl PolicyEngine for DefaultPolicy {
         if let Some(id) = deny::hard_deny(input, &a) {
             return PolicyVerdict::HardDeny { id };
         }
-        let glob_leaves = deny::glob_escape(input).is_some_and(|e| e.leaves());
+        let esc = a.glob_escape.as_ref();
+        let glob_leaves = esc.is_some_and(deny::GlobEscape::leaves);
+        let glob_unbounded = esc.is_some_and(|e| e.unbounded);
         let out = apply_rules(input, &a, rules, glob_leaves);
         if let Some((reason, rule)) = out.deny {
             return PolicyVerdict::Deny {
@@ -877,8 +929,10 @@ impl PolicyEngine for DefaultPolicy {
         // gives (M1-18, P1; D-100): hard-denied (above) if an expansion hits
         // the hard-deny list, otherwise allowed by FullAccess or an Any rule
         // and asked in Home/Normal/Trusted/Careful and under prefix/scoped rules.
-        let unknown =
-            matches!(input.check.subject, ToolSubject::Unknown) || a.unbounded_unknown_dangerous;
+        // When glob expansion overflows (brace or variant cap), Ask everywhere.
+        let unknown = matches!(input.check.subject, ToolSubject::Unknown)
+            || a.unbounded_unknown_dangerous
+            || glob_unbounded;
         let command = matches!(input.check.subject, ToolSubject::Command { .. });
         if !unknown
             && (!glob_leaves || out.any_allow)
