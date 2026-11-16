@@ -1593,8 +1593,11 @@ impl Ctx<'_> {
         if unbounded {
             return None;
         }
+        let probes = self.s.probes();
+        let has_dotdot_probe = probes.iter().any(|p| p.split('/').any(|s| s == ".."));
         let matchers: Vec<globset::GlobMatcher> = variants
             .iter()
+            .filter(|norm| has_dotdot_probe || !norm.split('/').any(|s| s == ".."))
             .filter_map(|norm| {
                 GlobBuilder::new(norm)
                     .literal_separator(false)
@@ -1614,7 +1617,7 @@ impl Ctx<'_> {
                 .map(|r| lower(&lexical_resolve(r, self.input.cwd, self.home())))
                 .collect()
         };
-        for probe in self.s.probes() {
+        for probe in probes {
             let pp = Path::new(&probe);
             let name = pp.file_name()?.to_string_lossy().to_string();
             let Some(hit) = self.s.hit(pp, Role::Read) else {
@@ -2364,23 +2367,40 @@ const MAX_GLOB_VARIANTS: usize = 256;
 /// Upper bound on state transitions per glob check so pathological globs fail
 /// closed to Ask in linear/bounded time (K10).
 const MAX_GLOB_WORK: usize = 100_000;
+/// Upper bound on total reconstructed bytes across normalized variants.
+const MAX_NORM_OUTPUT_BYTES: usize = 512 * 1024;
 
-struct NormNode<'a> {
+struct NormNode {
     parent: usize,
-    seg: &'a str,
+    seg_id: u32,
+    count: usize,
 }
 
 struct NormArena<'a> {
-    nodes: Vec<NormNode<'a>>,
-    intern: HashMap<(usize, &'a str), usize>,
+    nodes: Vec<NormNode>,
+    segs: Vec<&'a str>,
+    seg_ids: HashMap<&'a str, u32>,
+    last_seg: (&'a str, u32),
+    intern: HashMap<(usize, u32, usize), usize>,
     work: usize,
     budget: usize,
 }
 
 impl<'a> NormArena<'a> {
     fn new(budget: usize) -> Self {
+        let mut seg_ids = HashMap::new();
+        seg_ids.insert("", 0);
+        seg_ids.insert("..", 1);
+        seg_ids.insert("**", 2);
         Self {
-            nodes: vec![NormNode { parent: 0, seg: "" }],
+            nodes: vec![NormNode {
+                parent: 0,
+                seg_id: 0,
+                count: 0,
+            }],
+            segs: vec!["", "..", "**"],
+            seg_ids,
+            last_seg: ("", 0),
             intern: HashMap::new(),
             work: 0,
             budget,
@@ -2392,21 +2412,49 @@ impl<'a> NormArena<'a> {
         self.work <= self.budget
     }
 
-    fn push(&mut self, id: usize, seg: &'a str) -> Option<usize> {
+    fn intern_seg(&mut self, seg: &'a str) -> u32 {
+        if seg == self.last_seg.0 {
+            return self.last_seg.1;
+        }
+        let id = if let Some(&existing) = self.seg_ids.get(seg) {
+            existing
+        } else {
+            let next = self.segs.len() as u32;
+            self.segs.push(seg);
+            self.seg_ids.insert(seg, next);
+            next
+        };
+        self.last_seg = (seg, id);
+        id
+    }
+
+    fn push_seg(&mut self, parent: usize, seg_id: u32, count: usize) -> Option<usize> {
         if !self.step() {
             return None;
         }
-        if let Some(&existing) = self.intern.get(&(id, seg)) {
+        if let Some(&existing) = self.intern.get(&(parent, seg_id, count)) {
             return Some(existing);
         }
         let next = self.nodes.len();
-        self.nodes.push(NormNode { parent: id, seg });
-        self.intern.insert((id, seg), next);
+        self.nodes.push(NormNode {
+            parent,
+            seg_id,
+            count,
+        });
+        self.intern.insert((parent, seg_id, count), next);
         Some(next)
     }
 
-    fn last(&self, id: usize) -> Option<&'a str> {
-        (id != 0).then(|| self.nodes[id].seg)
+    fn is_dotdot(&self, id: usize) -> bool {
+        self.nodes[id].seg_id == 1
+    }
+
+    fn is_globstar(&self, id: usize) -> bool {
+        self.nodes[id].seg_id == 2
+    }
+
+    fn last_seg(&self, id: usize) -> Option<&'a str> {
+        (id != 0).then(|| self.segs[self.nodes[id].seg_id as usize])
     }
 
     fn pop(&self, id: usize) -> usize {
@@ -2418,64 +2466,120 @@ impl<'a> NormArena<'a> {
 /// `ask_search_glob_hit`: collapses curdir, empty segments, and `literal/..`,
 /// and treats `..` after a single-component wildcard as possibly popping that
 /// segment (emitting both popped and as-written forms).
-fn apply_dotdot<'a>(
+fn apply_one_dotdot<'a>(
     id: usize,
     abs: bool,
-    out: &mut Vec<usize>,
-    cap: usize,
+    rem: usize,
+    next_active: &mut Vec<usize>,
+    dotdot_tails: &mut Vec<(usize, usize)>,
     arena: &mut NormArena<'a>,
 ) -> bool {
     if !arena.step() {
         return false;
     }
-    if out.len() > cap.saturating_mul(4).max(16) {
-        out.sort_unstable();
-        out.dedup();
-        if out.len() > cap {
-            return false;
-        }
-    }
-    match arena.last(id) {
+    match arena.last_seg(id) {
         None => {
-            let next = if abs {
-                id
+            if abs {
+                next_active.push(id);
             } else {
-                let Some(p) = arena.push(id, "..") else {
-                    return false;
-                };
-                p
-            };
-            out.push(next);
+                dotdot_tails.push((id, rem));
+            }
         }
         Some("..") => {
-            let Some(next) = arena.push(id, "..") else {
-                return false;
-            };
-            out.push(next);
+            let node = &arena.nodes[id];
+            dotdot_tails.push((node.parent, node.count + rem));
         }
         Some("**") => {
             // `**` matches >= 2 segments: absorbs `..` and stays `**`.
-            out.push(id);
+            next_active.push(id);
             // `**` matches 1 segment: cancelled by `..`.
             let parent = arena.pop(id);
-            out.push(parent);
+            if arena.is_dotdot(parent) {
+                let node = &arena.nodes[parent];
+                dotdot_tails.push((node.parent, node.count + (rem - 1)));
+            } else {
+                next_active.push(parent);
+            }
             // `**` matches 0 segments: `..` acts on what preceded `**`.
-            if !apply_dotdot(parent, abs, out, cap, arena) {
+            if !apply_one_dotdot(parent, abs, rem, next_active, dotdot_tails, arena) {
                 return false;
             }
         }
         Some(last) if !last.contains(['*', '?', '[']) => {
-            out.push(arena.pop(id));
+            next_active.push(arena.pop(id));
         }
         Some(_) => {
-            out.push(arena.pop(id));
-            let Some(next) = arena.push(id, "..") else {
-                return false;
-            };
-            out.push(next);
+            next_active.push(arena.pop(id));
+            dotdot_tails.push((id, rem));
         }
     }
     true
+}
+
+/// Collapses a run of `run` consecutive `..` segments in linear time per
+/// active state + popped depth instead of stepping `..`-ending states
+/// quadratically across the run.
+fn apply_dotdot_run<'a>(
+    states: &[usize],
+    abs: bool,
+    run: usize,
+    cap: usize,
+    arena: &mut NormArena<'a>,
+) -> Option<Vec<usize>> {
+    let mut active = Vec::with_capacity(states.len());
+    let mut dotdot_tails: Vec<(usize, usize)> = Vec::new();
+    for &st in states {
+        if arena.is_dotdot(st) {
+            if !arena.step() {
+                return None;
+            }
+            let node = &arena.nodes[st];
+            dotdot_tails.push((node.parent, node.count + run));
+        } else {
+            active.push(st);
+        }
+    }
+    for step_idx in 0..run {
+        if active.is_empty() {
+            break;
+        }
+        let rem = run - step_idx;
+        let tails_before = dotdot_tails.len();
+        let mut next_active = Vec::with_capacity(active.len());
+        for &st in &active {
+            if !apply_one_dotdot(st, abs, rem, &mut next_active, &mut dotdot_tails, arena) {
+                return None;
+            }
+        }
+        next_active.sort_unstable();
+        next_active.dedup();
+        if next_active.len() + dotdot_tails.len() > cap {
+            dotdot_tails.sort_unstable();
+            dotdot_tails.dedup();
+            if next_active.len() + dotdot_tails.len() > cap {
+                return None;
+            }
+        }
+        if next_active == active && dotdot_tails.len() == tails_before {
+            break;
+        }
+        active = next_active;
+    }
+    dotdot_tails.sort_unstable();
+    dotdot_tails.dedup();
+    if active.len() + dotdot_tails.len() > cap {
+        return None;
+    }
+    for (parent, count) in dotdot_tails {
+        let id = arena.push_seg(parent, 1, count)?;
+        active.push(id);
+    }
+    active.sort_unstable();
+    active.dedup();
+    if active.len() > cap {
+        return None;
+    }
+    Some(active)
 }
 
 fn normalize_glob_variants(
@@ -2488,7 +2592,8 @@ fn normalize_glob_variants(
     let abs = g.starts_with('/');
     let mut arena = NormArena::new(remaining_work);
     let mut states: Vec<usize> = vec![0];
-    for c in g.split('/') {
+    let mut iter = g.split('/').peekable();
+    while let Some(c) = iter.next() {
         match c {
             "" | "." => {
                 if !arena.step() {
@@ -2498,8 +2603,8 @@ fn normalize_glob_variants(
             }
             "**" => {
                 for st in &mut states {
-                    if arena.last(*st) != Some("**") {
-                        let Some(next) = arena.push(*st, c) else {
+                    if !arena.is_globstar(*st) {
+                        let Some(next) = arena.push_seg(*st, 2, 1) else {
                             *total_work = max_work;
                             return None;
                         };
@@ -2513,24 +2618,33 @@ fn normalize_glob_variants(
                 states.dedup();
             }
             ".." => {
-                let mut next = Vec::with_capacity(states.len());
-                for st in states {
-                    if !apply_dotdot(st, abs, &mut next, cap, &mut arena) {
-                        *total_work = total_work.saturating_add(arena.work);
-                        return None;
+                let mut run = 1usize;
+                while let Some(&next_seg) = iter.peek() {
+                    match next_seg {
+                        "" | "." => {
+                            iter.next();
+                            if !arena.step() {
+                                *total_work = max_work;
+                                return None;
+                            }
+                        }
+                        ".." => {
+                            iter.next();
+                            run += 1;
+                        }
+                        _ => break,
                     }
                 }
-                next.sort_unstable();
-                next.dedup();
-                if next.len() > cap {
+                let Some(next_states) = apply_dotdot_run(&states, abs, run, cap, &mut arena) else {
                     *total_work = total_work.saturating_add(arena.work);
                     return None;
-                }
-                states = next;
+                };
+                states = next_states;
             }
             _ => {
+                let seg_id = arena.intern_seg(c);
                 for st in &mut states {
-                    let Some(next) = arena.push(*st, c) else {
+                    let Some(next) = arena.push_seg(*st, seg_id, 1) else {
                         *total_work = max_work;
                         return None;
                     };
@@ -2543,11 +2657,23 @@ fn normalize_glob_variants(
     let mut out = Vec::with_capacity(states.len());
     let mut seen = std::collections::HashSet::with_capacity(states.len());
     let mut segs: Vec<&str> = vec![];
+    let mut total_bytes = 0usize;
     for mut id in states {
         segs.clear();
+        let mut seg_bytes = if abs { 1 } else { 0 };
         while id != 0 {
-            segs.push(arena.nodes[id].seg);
-            id = arena.nodes[id].parent;
+            let node = &arena.nodes[id];
+            let seg = arena.segs[node.seg_id as usize];
+            let add_bytes = node.count.saturating_mul(seg.len() + 1);
+            if total_bytes.saturating_add(seg_bytes + add_bytes) > MAX_NORM_OUTPUT_BYTES {
+                *total_work = max_work;
+                return None;
+            }
+            seg_bytes += add_bytes;
+            for _ in 0..node.count {
+                segs.push(seg);
+            }
+            id = node.parent;
         }
         segs.reverse();
         let s = if abs {
@@ -2557,11 +2683,86 @@ fn normalize_glob_variants(
         } else {
             segs.join("/")
         };
+        total_bytes += s.len();
         if seen.insert(s.clone()) {
             out.push(s);
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod glob_norm_tests {
+    use super::*;
+
+    #[test]
+    fn k10_normalizer_work_is_linear_and_bounded() {
+        let star_dd = |n: usize| format!("{}{}", "*/".repeat(n), "../".repeat(n));
+
+        for (n, expected_variants, max_work) in [
+            (100usize, 101usize, 350usize),
+            (200, 201, 650),
+            (255, 256, 800),
+        ] {
+            let mut work = 0usize;
+            let norms =
+                normalize_glob_variants(&star_dd(n), MAX_GLOB_VARIANTS, &mut work, MAX_GLOB_WORK)
+                    .expect("within MAX_GLOB_VARIANTS");
+            assert_eq!(norms.len(), expected_variants, "n={n}");
+            assert!(
+                work <= max_work,
+                "n={n}: expected linear work <= {max_work}, got {work}"
+            );
+        }
+
+        // Doubling n from 100 to 200 no more than doubles normalizer work.
+        let mut w100 = 0usize;
+        let mut w200 = 0usize;
+        let _ = normalize_glob_variants(&star_dd(100), MAX_GLOB_VARIANTS, &mut w100, MAX_GLOB_WORK);
+        let _ = normalize_glob_variants(&star_dd(200), MAX_GLOB_VARIANTS, &mut w200, MAX_GLOB_WORK);
+        assert!(
+            w200 <= w100 * 2,
+            "doubling 100->200 should at most double work: w100={w100}, w200={w200}"
+        );
+
+        // 400..20000 */ + .. fail closed at cap=256 in linear O(n) steps.
+        for n in [400usize, 2000, 20_000] {
+            let mut work = 0usize;
+            let norms =
+                normalize_glob_variants(&star_dd(n), MAX_GLOB_VARIANTS, &mut work, MAX_GLOB_WORK);
+            assert!(norms.is_none(), "n={n} should trip MAX_GLOB_VARIANTS");
+            assert!(
+                work <= n + MAX_GLOB_VARIANTS + 16,
+                "n={n}: expected bounded work <= {}, got {work}",
+                n + MAX_GLOB_VARIANTS + 16
+            );
+        }
+
+        // 500 **/ + 500 .. fails closed in bounded steps.
+        let mut ss_work = 0usize;
+        let ss_glob = format!("{}{}", "**/".repeat(500), "../".repeat(500));
+        assert!(
+            normalize_glob_variants(&ss_glob, MAX_GLOB_VARIANTS, &mut ss_work, MAX_GLOB_WORK)
+                .is_none()
+        );
+        assert!(ss_work <= 2_000, "500 **/ + 500 .. work={ss_work}");
+
+        // `search_variants_from_cands` filters out useless `..` variants for ~/proj.
+        let cands =
+            expand_glob_candidates(&star_dd(200), Path::new("/h/u/proj"), Path::new("/h/u"));
+        let (variants, unbounded) = search_variants_from_cands(
+            &[PathBuf::from("/h/u/proj")],
+            Path::new("/h/u/proj"),
+            Path::new("/h/u"),
+            &cands,
+        );
+        assert!(!unbounded);
+        assert!(
+            variants.len() <= 4,
+            "expected filtered variants <= 4, got {}: {variants:?}",
+            variants.len()
+        );
+    }
 }
 
 /// Widens `?` and any character class `[...]` that can match `.` to `.`.
@@ -2815,6 +3016,25 @@ fn search_variants_from_cands(
     if cands.unbounded {
         return (vec![], true);
     }
+    let home_lower = lower(home);
+    let home_has_dotdot = home_lower.split('/').any(|s| s == "..");
+    let root_lowers: Vec<String> = roots.iter().map(|r| lower(r)).collect();
+    let mut tree_may_hit = false;
+    let mut max_tree_slashes = 0usize;
+    for t in ASK_TREES {
+        let t_abs = format!("{home_lower}/{t}");
+        for rl in &root_lowers {
+            if under(rl, &t_abs).is_some() {
+                continue;
+            }
+            if let Some(tree_rel) = under(&t_abs, rl) {
+                tree_may_hit = true;
+                max_tree_slashes = max_tree_slashes
+                    .max(tree_rel.bytes().filter(|&b| b == b'/').count())
+                    .max(t_abs.bytes().filter(|&b| b == b'/').count());
+            }
+        }
+    }
     let mut out = vec![];
     let mut seen = std::collections::HashSet::new();
     let mut unjoined_norm = 0usize;
@@ -2834,7 +3054,34 @@ fn search_variants_from_cands(
         }
         for n in norms {
             let norm = fold(&n);
-            if !norm.is_empty() && seen.insert(norm.clone()) {
+            if norm.is_empty() {
+                continue;
+            }
+            // Variants containing a `..` segment cannot match probe paths
+            // (and have valid glob syntax when free of `[`/`{`/`\`), so skip
+            // them unless `ask_search_glob_hit`'s `tree_targets` prefix check
+            // could inspect the segment prefix before `..`.
+            if !home_has_dotdot
+                && !norm.contains(['[', '{', '\\'])
+                && norm.split('/').any(|s| s == "..")
+            {
+                if !tree_may_hit {
+                    continue;
+                }
+                let mut prefix_segs = 0usize;
+                for seg in norm.split('/') {
+                    if seg == ".." {
+                        break;
+                    }
+                    if seg != "**" {
+                        prefix_segs += 1;
+                    }
+                }
+                if prefix_segs == 0 || prefix_segs > max_tree_slashes + 2 {
+                    continue;
+                }
+            }
+            if seen.insert(norm.clone()) {
                 out.push(norm);
             }
         }
