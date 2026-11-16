@@ -142,11 +142,25 @@ fn folded_shells_match_lowercase_verdicts() {
             "credential-read",
         ),
         (
+            "/bin/BASH -c 'rm -rf ~'",
+            &["/bin/BASH"][..],
+            "/bin/bash -c 'rm -rf ~'",
+            &["/bin/bash"][..],
+            "recursive-delete-outside-cwd",
+        ),
+        (
             "Bash -c 'cat ~/.ssh/id_rsa'",
             &["Bash"][..],
             "bash -c 'cat ~/.ssh/id_rsa'",
             &["bash"][..],
             "credential-read",
+        ),
+        (
+            "Bash -c 'sudo id'",
+            &["Bash"][..],
+            "bash -c 'sudo id'",
+            &["bash"][..],
+            "privilege-escalation",
         ),
         (
             "/bin/ba\u{017f}h -c 'cat ~/.ssh/id_rsa'",
@@ -156,11 +170,25 @@ fn folded_shells_match_lowercase_verdicts() {
             "credential-read",
         ),
         (
+            "/bin/ba\u{017f}h -c 'rm -rf ~'",
+            &["/bin/ba\u{017f}h"][..],
+            "/bin/bash -c 'rm -rf ~'",
+            &["/bin/bash"][..],
+            "recursive-delete-outside-cwd",
+        ),
+        (
             "/bin/\u{212a}sh -c 'cat ~/.ssh/id_rsa'",
             &["/bin/\u{212a}sh"][..],
             "/bin/ksh -c 'cat ~/.ssh/id_rsa'",
             &["/bin/ksh"][..],
             "credential-read",
+        ),
+        (
+            "/bin/\u{212a}sh -c 'rm -rf ~'",
+            &["/bin/\u{212a}sh"][..],
+            "/bin/ksh -c 'rm -rf ~'",
+            &["/bin/ksh"][..],
+            "recursive-delete-outside-cwd",
         ),
     ];
     for (folded, pf, lower, pl, id) in cases {
