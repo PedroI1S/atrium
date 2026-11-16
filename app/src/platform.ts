@@ -77,10 +77,13 @@ export async function revealPath(path: string): Promise<void> {
  * Where to save a file, from the platform's save dialog ("Export…"); null when cancelled. In the
  * M1 demo (`setSaveDirOverride`) no dialog opens: the file goes to the demo's folder.
  */
-export async function askSavePath(title: string, name: string): Promise<string | null> {
-  if (saveDirOverride !== null) return `${saveDirOverride}/${name}`;
+/** Where the user chose to save, and whether something is already there. */
+export interface SavePick { path: string; exists: boolean }
+
+export async function askSavePath(title: string, name: string): Promise<SavePick | null> {
+  if (saveDirOverride !== null) return { path: `${saveDirOverride}/${name}`, exists: false };
   if (!inTauri) return null;
-  return invoke<string | null>("ask_save_path", { title, name });
+  return invoke<SavePick | null>("ask_save_path", { title, name });
 }
 
 let saveDirOverride: string | null = null;

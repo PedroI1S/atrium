@@ -20,7 +20,7 @@
 //  13. The enforcement badge opens the details: coverage, policy and isolation apart.
 
 import { markRead, sendMessage, startChat, type AgentChoice } from "./chat/actions";
-import { exportFileName } from "./chat/thread-actions";
+import { EXISTS_TEXT, exportFileName } from "./chat/thread-actions";
 import { type ThreadModel, holdThread } from "./chat/threads";
 import { command, daemon } from "./daemon/client";
 import { type AgentLaunch, type Rule, type ThreadSummary, isCommandFailure } from "./daemon/types";
@@ -544,12 +544,17 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
   await menuAction("export-jsonl");
   await waitFor("the JSONL export toast", () => toast()?.text.includes(jsonlPath) === true);
   const jsonlToast = toast()?.text;
-  await check("9b. Export as Markdown and as JSONL from the thread menu writes both files", Boolean(mdToast?.startsWith("Exported") && jsonlToast?.startsWith("Exported")), {
+  // Round 2 minor 5: the same name again is refused, never replaced, and the app says so.
+  await menuAction("export-markdown");
+  await waitFor("the already-exists toast", () => toast()?.text === `Couldn't export the chat: ${EXISTS_TEXT}`);
+  const againToast = toast()?.text;
+  await check("9b. Export as Markdown and as JSONL from the thread menu writes both files; the same name again is refused with a clear message", Boolean(mdToast?.startsWith("Exported") && jsonlToast?.startsWith("Exported")), {
     thread: t1,
     mdPath,
     mdToast,
     jsonlPath,
     jsonlToast,
+    againToast,
   });
 
   // ---------------------------------------------------------------------------

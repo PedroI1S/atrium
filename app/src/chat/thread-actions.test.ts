@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ThreadState, ThreadSummary } from "../daemon/types";
-import { MAX_TITLE_CHARS, cleanTitle, exportFileName, hasLiveSession, sizeLabel, mainChatLeft } from "./thread-actions";
+import { MAX_TITLE_CHARS, cleanTitle, exportFileName, hasLiveSession, sizeLabel, mainChatLeft, pickNewPath, exportFailureText, EXISTS_TEXT } from "./thread-actions";
 
 describe("rename: the title the daemon will keep", () => {
   it("takes the first line with text and collapses spaces", () => {
@@ -67,5 +67,31 @@ describe("the main card when its chat leaves the list (round 2, minor 6)", () =>
     expect(mainChatLeft("t1", null, false, true)).toBe(false);
     expect(mainChatLeft("t2", "t1", false, true)).toBe(false);
     expect(mainChatLeft(null, "t1", false, true)).toBe(false);
+  });
+});
+
+describe("export never over an existing file (round 2, minor 5)", () => {
+  const asker = (picks: ({ path: string; exists: boolean } | null)[]) => {
+    const titles: string[] = [];
+    const ask = async (title: string, _name: string) => { titles.push(title); return picks.shift() ?? null; };
+    return { ask, titles };
+  };
+  it("asks again, saying why, until the user picks a new name", async () => {
+    const { ask, titles } = asker([{ path: "/x/a.md", exists: true }, { path: "/x/b.md", exists: false }]);
+    const notes: string[] = [];
+    expect(await pickNewPath(ask, "Export", "a.md", (t) => notes.push(t))).toBe("/x/b.md");
+    expect(notes).toEqual([EXISTS_TEXT]);
+    expect(titles).toEqual(["Export", "Export: pick a new name"]);
+  });
+  it("stops when the user cancels, or keeps picking taken names", async () => {
+    expect(await pickNewPath(asker([{ path: "/x/a.md", exists: true }, null]).ask, "Export", "a.md", () => {})).toBeNull();
+    const taken = Array.from({ length: 10 }, () => ({ path: "/x/a.md", exists: true }));
+    const notes: string[] = [];
+    expect(await pickNewPath(asker(taken).ask, "Export", "a.md", (t) => notes.push(t))).toBeNull();
+    expect(notes.length).toBe(5);
+  });
+  it("words the daemon's refusal of a taken path", () => {
+    expect(exportFailureText({ kind: "rejected", code: "invalid", message: "something already exists at the export path" })).toBe(`Couldn't export the chat: ${EXISTS_TEXT}`);
+    expect(exportFailureText({ kind: "rejected", code: "invalid", message: "the export folder doesn't exist" })).toBe("Couldn't export the chat: the export folder doesn't exist");
   });
 });

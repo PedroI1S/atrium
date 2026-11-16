@@ -5,7 +5,7 @@
 import { createSignal } from "solid-js";
 import { command, daemon } from "../daemon/client";
 import { type ExportFormat, type ThreadSummary, isCommandFailure } from "../daemon/types";
-import { askSavePath } from "../platform";
+import { type SavePick, askSavePath } from "../platform";
 import { showToast } from "../state";
 
 /** The daemon's limit (`atrium-daemon` `MAX_TITLE_CHARS`): longer titles are cut there. */
@@ -82,6 +82,32 @@ export async function renameThread(threadId: string, input: string): Promise<boo
   }
 }
 
+/** What the app says when the user picks a file that is already there (round 2, minor 5). */
+export const EXISTS_TEXT = "That file already exists, and an export never replaces a file: pick a new name.";
+/** How many times the dialog opens again for a taken name before the export gives up. */
+const MAX_ASKS = 5;
+
+/**
+ * Asks where to save until the user picks a path with nothing at it, or cancels. The daemon writes
+ * an export only as a new file (contract §13), so a taken path is never sent: the app says why and
+ * asks again, the title saying so too.
+ */
+export async function pickNewPath(ask: (title: string, name: string) => Promise<SavePick | null>, title: string, name: string, notify: (text: string) => void): Promise<string | null> {
+  for (let asked = 0; asked < MAX_ASKS; asked++) {
+    const pick = await ask(asked === 0 ? title : `${title}: pick a new name`, name);
+    if (pick === null) return null;
+    if (!pick.exists) return pick.path;
+    notify(EXISTS_TEXT);
+  }
+  return null;
+}
+
+/** A refused export, in words; a file that appeared at the path since the dialog says what to do. */
+export function exportFailureText(e: unknown): string {
+  const text = failureText(e);
+  return /already exists/.test(text) ? `Couldn't export the chat: ${EXISTS_TEXT}` : `Couldn't export the chat: ${text}`;
+}
+
 /**
  * Exports a thread to a file the user picks (contract §13). The daemon writes it: redacted, mode
  * 0600, and only as a new file. Resolves with the path, or null when cancelled or refused.
@@ -89,7 +115,7 @@ export async function renameThread(threadId: string, input: string): Promise<boo
 export async function exportThread(threadId: string, format: ExportFormat): Promise<string | null> {
   let path: string | null;
   try {
-    path = await askSavePath(`Export “${titleOf(threadId)}” as ${FORMAT_LABEL[format]}`, exportFileName(titleOf(threadId), format));
+    path = await pickNewPath(askSavePath, `Export “${titleOf(threadId)}” as ${FORMAT_LABEL[format]}`, exportFileName(titleOf(threadId), format), showToast);
   } catch (e) {
     showToast(`Couldn't open the save dialog: ${failureText(e)}`);
     return null;
@@ -100,7 +126,7 @@ export async function exportThread(threadId: string, format: ExportFormat): Prom
     showToast(`Exported ${sizeLabel(bytes)} to ${path}`);
     return path;
   } catch (e) {
-    showToast(`Couldn't export the chat: ${failureText(e)}`);
+    showToast(exportFailureText(e));
     return null;
   }
 }

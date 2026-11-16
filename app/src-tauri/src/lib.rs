@@ -655,13 +655,14 @@ fn reveal_path(path: String) -> Result<(), String> {
 }
 
 /// "Export…" (contract §13): where to save, from the platform's own dialog.
-/// `null` when the user cancels. The daemon writes the file (`ExportThread`).
+/// `null` when the user cancels, and whether something is already at the
+/// path. The daemon writes the file (`ExportThread`).
 #[tauri::command]
 async fn ask_save_path(
     app: AppHandle,
     title: String,
     name: String,
-) -> Result<Option<String>, String> {
+) -> Result<Option<save::SavePick>, String> {
     save::ask_save_path(&app, title, name).await
 }
 
