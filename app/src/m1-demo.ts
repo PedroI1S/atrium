@@ -6,21 +6,27 @@
 //   2. Fake approval (`approval_at_ms`): Allow once, Deny next turn, "Always" rule + next turn skips;
 //   3. Fake question (`question_at_ms`): Answer, Decline next turn (streaming continues both times);
 //   4. Inbox lists threads with their states, and marking a thread read works;
-//   5. ⌘J jumps through inbox items in rank order;
+//   5. ⌘J jumps through inbox items in rank order, and ⌘⇧J back;
 //   6. Settings → Notifications toggle only (daemon recording notifier
 //      checked separately by m1_demo.py via `cargo test -p atrium-daemon --test requests_notifications`);
-//   7. Stop a turn / Shutdown to Ended / verify fake Resume refusal;
+//   7. Stop a turn / End session from the thread menu to Ended / verify fake Resume refusal;
 //   8. Kill the daemon mid-turn: the app reconnects and the thread shows `Interrupted`;
-//   9. Export a thread to Markdown and JSONL;
-//  10. Archive a thread (`archive_thread`).
+//   9. Rename a thread and export it to Markdown and JSONL from the thread menu (the save
+//      dialog is bypassed: files go to the demo's folder);
+//  10. Archive a thread from the thread menu, after confirming;
+//  11. Batch approve and deny in the inbox;
+//  12. Settings: add a rule in the rules editor (a bad command is refused first), and
+//      Security lists what is always blocked and the known limits;
+//  13. The enforcement badge opens the details: coverage, policy and isolation apart.
 
 import { markRead, sendMessage, startChat, type AgentChoice } from "./chat/actions";
+import { exportFileName } from "./chat/thread-actions";
 import { type ThreadModel, holdThread } from "./chat/threads";
 import { command, daemon } from "./daemon/client";
 import { type AgentLaunch, type Rule, type ThreadSummary, isCommandFailure } from "./daemon/types";
-import { writeReport } from "./platform";
+import { setSaveDirOverride, writeReport } from "./platform";
 import { sleep } from "./roundtrip";
-import { screen, setScreen, setSettingsSection, windowFocused } from "./state";
+import { screen, setScreen, setSettingsSection, toast, windowFocused } from "./state";
 import { openThread } from "./ui/Sidebar";
 import { NEW_THREAD } from "./window-model";
 import { model, patchView } from "./windows";
@@ -89,6 +95,23 @@ async function click(what: string, find: () => HTMLElement | null): Promise<void
     return target !== null && !(target as HTMLButtonElement).disabled;
   });
   target!.click();
+}
+
+/** Opens the main card's thread menu and picks an action. */
+async function menuAction(id: string): Promise<void> {
+  await click("thread menu button", () => document.querySelector<HTMLElement>('.card.main [data-atrium-part="thread-menu-button"]'));
+  await click(`thread menu: ${id}`, () => document.querySelector<HTMLElement>(`[data-atrium-part="thread-menu"] [data-action="${id}"]`));
+}
+
+/** Types into a field the way a user does: the value, then an input event (Solid's onInput). */
+function typeInto(el: HTMLInputElement, text: string): void {
+  el.focus();
+  el.value = text;
+  el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+}
+
+function key(target: EventTarget, init: KeyboardEventInit): void {
+  target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
 }
 
 function formatErr(e: unknown): string {
@@ -364,6 +387,25 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
     expected: [tInboxApproval, tInboxQuestion, tInboxApproval],
   });
 
+  // ⌘⇧J goes back: from the approval (first) it wraps to the question (last), then back again.
+  const dispatchCmdShiftJ = () => key(window, { key: "J", metaKey: true, shiftKey: true });
+  dispatchCmdShiftJ();
+  await waitFor("⌘⇧J jump 1 back to the question thread (wraps)", () => screen() === "chat" && model().mainThread === tInboxQuestion);
+  const back1 = model().mainThread;
+  dispatchCmdShiftJ();
+  await waitFor("⌘⇧J jump 2 back to the approval thread", () => screen() === "chat" && model().mainThread === tInboxApproval);
+  const back2 = model().mainThread;
+  setScreen("inbox");
+  dispatchCmdShiftJ();
+  await waitFor("⌘⇧J from the inbox to the last item", () => screen() === "chat" && model().mainThread === tInboxQuestion);
+  const back3 = model().mainThread;
+  await check("5b. Cmd+Shift+J goes to the previous item, wrapping; from the inbox to the last", back1 === tInboxQuestion && back2 === tInboxApproval && back3 === tInboxQuestion, {
+    back1,
+    back2,
+    back3,
+    expected: [tInboxQuestion, tInboxApproval, tInboxQuestion],
+  });
+
   // Clean up the pending inbox approval/question threads so they don't linger.
   await command({ type: "thread_command", thread_id: tInboxApproval, command: { type: "interrupt" } });
   await command({ type: "thread_command", thread_id: tInboxQuestion, command: { type: "interrupt" } });
@@ -422,10 +464,19 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
     note: stateAfterStop === "idle" ? "Stop sends Interrupt (ends turn to idle); Shutdown ends session to ended" : "ended",
   });
 
-  // End the session via Shutdown so it reaches `ended`, then verify `resume_thread` on a
-  // synthetic (`atrium-fake:`) thread is refused (real resume is tested in the human demo + 7c).
-  await command({ type: "thread_command", thread_id: t7, command: { type: "shutdown" } });
+  // End the session from the thread menu (Shutdown) so it reaches `ended`, after confirming,
+  // then verify `resume_thread` on a synthetic (`atrium-fake:`) thread is refused (real resume
+  // is tested in the human demo + 7d).
+  await menuAction("end");
+  await click("End session confirmation", () => document.querySelector<HTMLElement>('[data-atrium-part="confirm-ok"]'));
   await waitFor("step 7 thread to reach ended", () => daemon().threads[t7]?.state.type === "ended");
+  await click("thread menu button (after End session)", () => document.querySelector<HTMLElement>('.card.main [data-atrium-part="thread-menu-button"]'));
+  const endDisabled = document.querySelector<HTMLButtonElement>('[data-atrium-part="thread-menu"] [data-action="end"]')?.disabled === true;
+  key(document.querySelector('[data-atrium-part="thread-menu"]')!, { key: "Escape" });
+  await check("7b. End session from the thread menu (confirmed) reaches Ended; the item is then off", daemon().threads[t7]?.state.type === "ended" && endDisabled, {
+    state: daemon().threads[t7]?.state.type,
+    endItemDisabled: endDisabled,
+  });
   let refused = false;
   let resumeDetail = "";
   try {
@@ -435,7 +486,7 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
     refused = isCommandFailure(e) && e.kind === "rejected" && e.code === "invalid" && e.message.includes("can't be resumed");
     resumeDetail = formatErr(e);
   }
-  await check("7b. resume of a synthetic thread is refused (fake-agent limit; real resume: human demo + 7c)", refused, resumeDetail);
+  await check("7c. resume of a synthetic thread is refused (fake-agent limit; real resume: human demo + 7d)", refused, resumeDetail);
   h7.release();
 
   // ---------------------------------------------------------------------------
@@ -463,26 +514,58 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
   h8.release();
 
   // ---------------------------------------------------------------------------
-  // 9. Export the thread to Markdown and JSONL
+  // 9. Rename, then export to Markdown and JSONL, from the thread menu
   // ---------------------------------------------------------------------------
   if (!exportDir) throw new Error("m1-demo requires an export directory (ATRIUM_BENCH=m1-demo:<dir>)");
-  const mdPath = `${exportDir}/thread.md`;
-  const jsonlPath = `${exportDir}/thread.jsonl`;
-  const mdRes = await command<{ bytes: number }>({ type: "export_thread", thread_id: t1, format: "markdown", path: mdPath });
-  const jsonlRes = await command<{ bytes: number }>({ type: "export_thread", thread_id: t1, format: "jsonl", path: jsonlPath });
-  await check("9a. Export command writes Markdown and JSONL files", mdRes.bytes > 0 && jsonlRes.bytes > 0, {
+  // The save dialog is bypassed: "Export…" saves into the demo's folder under the suggested name.
+  setSaveDirOverride(exportDir);
+  setScreen("chat");
+  openThread(t1);
+  await waitFor("step 9 thread header", () => model().mainThread === t1 && document.querySelector('.card.main [data-atrium-part="thread-menu-button"]') !== null);
+  const renamed = "M1 demo: renamed chat";
+  await menuAction("rename");
+  let renameField: HTMLInputElement | null = null;
+  await waitFor("the rename field", () => (renameField = document.querySelector<HTMLInputElement>('[data-atrium-part="rename"]')) !== null && document.activeElement === renameField);
+  typeInto(renameField!, `  ${renamed}  `);
+  key(renameField!, { key: "Enter" });
+  await waitFor("the daemon to store the new title", () => daemon().threads[t1]?.title === renamed);
+  await waitFor("the header to show the new title", () => document.querySelector(".card.main .head .title")?.textContent === renamed && document.querySelector('[data-atrium-part="rename"]') === null);
+  await check("9a. Rename from the thread menu stores the title and the header shows it", daemon().threads[t1]?.title === renamed, {
+    thread: t1,
+    title: daemon().threads[t1]?.title,
+    sidebar: Array.from(document.querySelectorAll(".chat-row .t")).some((el) => el.textContent === renamed),
+  });
+
+  const mdPath = `${exportDir}/${exportFileName(renamed, "markdown")}`;
+  const jsonlPath = `${exportDir}/${exportFileName(renamed, "jsonl")}`;
+  await menuAction("export-markdown");
+  await waitFor("the Markdown export toast", () => toast()?.text.includes(mdPath) === true);
+  const mdToast = toast()?.text;
+  await menuAction("export-jsonl");
+  await waitFor("the JSONL export toast", () => toast()?.text.includes(jsonlPath) === true);
+  const jsonlToast = toast()?.text;
+  await check("9b. Export as Markdown and as JSONL from the thread menu writes both files", Boolean(mdToast?.startsWith("Exported") && jsonlToast?.startsWith("Exported")), {
     thread: t1,
     mdPath,
-    mdBytes: mdRes.bytes,
+    mdToast,
     jsonlPath,
-    jsonlBytes: jsonlRes.bytes,
+    jsonlToast,
   });
 
   // ---------------------------------------------------------------------------
-  // 10. Archive, if M1 has it
+  // 10. Archive from the thread menu, after confirming
   // ---------------------------------------------------------------------------
-  await command({ type: "archive_thread", thread_id: t1 });
+  await menuAction("archive");
+  await waitFor("the archive confirmation", () => document.querySelector('[data-atrium-part="confirm"]') !== null);
+  // Cancelling keeps the thread.
+  await click("Cancel in the confirmation", () => Array.from(document.querySelectorAll<HTMLElement>('[data-atrium-part="confirm"] button')).find((b) => b.textContent === "Cancel") ?? null);
+  await waitFor("the confirmation to close", () => document.querySelector('[data-atrium-part="confirm"]') === null);
+  await sleep(SAMPLE_GAP_MS);
+  const keptAfterCancel = t1 in daemon().threads;
+  await menuAction("archive");
+  await click("Archive confirmation", () => document.querySelector<HTMLElement>('[data-atrium-part="confirm-ok"]'));
   await waitFor("archived thread to leave daemon state", () => !(t1 in daemon().threads) && !daemon().order.includes(t1));
+  await waitFor("the main card to go back to Home", () => model().mainThread === null);
   const listedAfterArchive = await command<ThreadSummary[]>({ type: "list_threads" });
   let rejectedAfterArchive = false;
   try {
@@ -490,10 +573,110 @@ async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promis
   } catch (e) {
     rejectedAfterArchive = isCommandFailure(e) && e.kind === "rejected" && e.code === "unknown_thread";
   }
-  await check("10. Archive removes thread from lists and inbox", !listedAfterArchive.some((t) => t.thread_id === t1) && rejectedAfterArchive, {
+  await check("10. Archive from the thread menu (cancel keeps it; confirm archives) removes it from lists and inbox", keptAfterCancel && !listedAfterArchive.some((t) => t.thread_id === t1) && rejectedAfterArchive, {
     archived: t1,
+    keptAfterCancel,
     inList: listedAfterArchive.some((t) => t.thread_id === t1),
     rejectedUnknownThread: rejectedAfterArchive,
+  });
+
+  // ---------------------------------------------------------------------------
+  // 11. Batch approve and deny in the inbox
+  // ---------------------------------------------------------------------------
+  setScreen("inbox");
+  const batchThreads: string[] = [];
+  for (let i = 1; i <= 3; i++) {
+    batchThreads.push((await command<ThreadSummary>({
+      type: "start_thread",
+      agent: { type: "fake", tokens_per_second: 160, chunk_chars: 16, duration_ms: 300, tool_call_every_ms: 0, approval_at_ms: 40 },
+      message: `Batch approval ${i}`,
+    })).thread_id);
+  }
+  const batchHolds = batchThreads.map((id) => holdThread(id));
+  const pickOf = (id: string) => document.querySelector<HTMLInputElement>(`[data-atrium-part="inbox-item"][data-thread="${id}"] [data-atrium-part="batch-pick"]`);
+  await waitFor("three approvals with checkboxes in the inbox", () => batchThreads.every((id) => daemon().threads[id]?.state.type === "needs_approval" && pickOf(id) !== null));
+  await click("Select all approvals", () => document.querySelector<HTMLElement>('[data-atrium-part="batch-all"]'));
+  await waitFor("all three selected", () => batchThreads.every((id) => pickOf(id)?.checked === true));
+  // Leave the third one out of the Allow batch.
+  pickOf(batchThreads[2]!)!.click();
+  await waitFor("two selected", () => pickOf(batchThreads[2]!)?.checked === false && document.querySelector('[data-atrium-part="batch-allow"]')?.textContent === "Allow once (2)");
+  await click("Allow once (2)", () => document.querySelector<HTMLElement>('[data-atrium-part="batch-allow"]'));
+  await waitFor("the two allowed approvals to resolve", () => batchHolds.slice(0, 2).every((h) => approvalItems(h.model)[0]?.outcome === "approved"));
+  await waitFor("the Allow summary", () => document.querySelector('[data-atrium-part="batch-result"]')?.textContent?.startsWith("Allowed 2.") === true);
+  const allowSummary = document.querySelector('[data-atrium-part="batch-result"]')?.textContent;
+  await click("the third approval's checkbox", () => pickOf(batchThreads[2]!));
+  await click("Deny (1)", () => document.querySelector<HTMLElement>('[data-atrium-part="batch-deny"]'));
+  await waitFor("the denied approval to resolve", () => approvalItems(batchHolds[2]!.model)[0]?.outcome === "denied");
+  await waitFor("the Deny summary", () => document.querySelector('[data-atrium-part="batch-result"]')?.textContent?.startsWith("Denied 1.") === true);
+  const denySummary = document.querySelector('[data-atrium-part="batch-result"]')?.textContent;
+  await waitFor("the batch threads to finish their turns", () => batchThreads.every((id) => daemon().threads[id]?.state.type === "idle"));
+  const outcomes = batchHolds.map((h) => approvalItems(h.model)[0]?.outcome);
+  const toolStatuses = batchHolds.map((h) => toolItems(h.model)[0]?.status);
+  await check("11. Batch: select all, Allow once two together, Deny the third", outcomes.join() === "approved,approved,denied" && toolStatuses.join() === "succeeded,succeeded,denied", {
+    outcomes,
+    toolStatuses,
+    allowSummary,
+    denySummary,
+  });
+  for (const h of batchHolds) h.release();
+
+  // ---------------------------------------------------------------------------
+  // 12. Settings: add a rule in the rules editor; Security lists what is always blocked
+  // ---------------------------------------------------------------------------
+  setScreen("settings");
+  setSettingsSection("approvals");
+  await click("Add a rule…", () => document.querySelector<HTMLElement>('[data-atrium-part="setting-action-add-rule"]'));
+  let commandField: HTMLInputElement | null = null;
+  await waitFor("the rules editor", () => (commandField = document.querySelector<HTMLInputElement>('[data-atrium-part="rule-command"]')) !== null);
+  const rulesBefore = (await command<Rule[]>({ type: "list_rules" })).length;
+  typeInto(commandField!, "cargo test && rm -rf target");
+  await click("Add allow rule (refused)", () => document.querySelector<HTMLElement>('[data-atrium-part="rule-add"]'));
+  await waitFor("the command's error", () => document.querySelector('[data-atrium-part="rule-editor"] .err') !== null);
+  const refusedText = document.querySelector('[data-atrium-part="rule-editor"] .err')?.textContent;
+  await sleep(SAMPLE_GAP_MS);
+  const rulesAfterRefused = (await command<Rule[]>({ type: "list_rules" })).length;
+  typeInto(commandField!, "cargo test");
+  await waitFor("the rule preview", () => document.querySelector('[data-atrium-part="rule-preview"]')?.textContent?.includes("cargo test") === true);
+  const preview = document.querySelector('[data-atrium-part="rule-preview"]')?.textContent;
+  await click("Add allow rule", () => document.querySelector<HTMLElement>('[data-atrium-part="rule-add"]'));
+  await waitFor("the rules editor to close", () => document.querySelector('[data-atrium-part="rule-editor"]') === null);
+  const rulesAfter = await command<Rule[]>({ type: "list_rules" });
+  const made = rulesAfter.find((r) => r.origin.type === "settings" && r.matcher.type === "command_prefix" && r.matcher.argv.join(" ") === "cargo test");
+  await waitFor("the new rule in the list", () => Array.from(document.querySelectorAll('[data-atrium-part="rules"] .s-item')).some((el) => el.textContent?.includes("commands that start with") && el.textContent.includes("cargo test")));
+  await check("12a. Rules editor refuses a compound command, then adds a command-prefix allow rule", rulesAfterRefused === rulesBefore && made !== undefined && made.decision === "allow" && made.scope.type === "global" && made.tool_kind === "execute", {
+    refusedText,
+    preview,
+    rulesBefore,
+    rulesAfterRefused,
+    made,
+  });
+
+  setSettingsSection("security");
+  await waitFor("Security's lists", () => document.querySelectorAll('[data-atrium-part="always-blocked"] .s-item').length > 0 && document.querySelector('[data-atrium-part="known-limits"]') !== null);
+  const blocked = Array.from(document.querySelectorAll<HTMLElement>('[data-atrium-part="always-blocked"] .s-item')).map((el) => el.dataset.id);
+  const limits = Array.from(document.querySelectorAll<HTMLElement>('[data-atrium-part="known-limits"] .s-item')).map((el) => el.dataset.id);
+  const heading = document.querySelector("#setting-always-blocked .rl b")?.textContent;
+  await check("12b. Settings → Security lists Always blocked (HARD_DENY_DEFAULTS) and the git config and same-user limits", heading === "Always blocked (for calls Atrium sees)" && blocked.length === 7 && blocked.includes("credential-read") && limits.includes("git-config") && limits.includes("same-user"), {
+    heading,
+    blocked,
+    limits,
+  });
+
+  // ---------------------------------------------------------------------------
+  // 13. The enforcement badge opens the details
+  // ---------------------------------------------------------------------------
+  setScreen("chat");
+  openThread(batchThreads[0]!);
+  await click("the enforcement badge", () => document.querySelector<HTMLElement>('.card.main [data-atrium-part="enforcement-badge"]'));
+  await waitFor("the enforcement details", () => document.querySelectorAll('[data-atrium-part="enforcement-coverage"] .enf-row').length > 0);
+  const coverageRowsShown = document.querySelectorAll('[data-atrium-part="enforcement-coverage"] .enf-row').length;
+  const sections = ["coverage", "policy", "isolation"].filter((x) => document.querySelector(`[data-atrium-part="enforcement-${x}"]`) !== null);
+  key(document.querySelector('[data-atrium-part="enforcement-details"]')!, { key: "Escape" });
+  await waitFor("the details to close", () => document.querySelector('[data-atrium-part="enforcement-details"]') === null);
+  await check("13. Enforcement badge opens the details: coverage per tool class, then policy and isolation apart", coverageRowsShown === 10 && sections.length === 3, {
+    level: daemon().threads[batchThreads[0]!]?.enforcement?.level,
+    coverageRowsShown,
+    sections,
   });
 
   await writeReport({

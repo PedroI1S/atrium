@@ -89,7 +89,7 @@ function Item(props: { item: InboxItem; cards: boolean }) {
     if (inboxPick() === key()) row.scrollIntoView({ block: "nearest" });
   });
   return (
-    <div class="item" role="listitem" ref={row} classList={{ on: inboxPick() === key() }} data-atrium-part="inbox-item" data-reason={props.item.reason} onPointerDown={() => setInboxPick(key())}>
+    <div class="item" role="listitem" ref={row} classList={{ on: inboxPick() === key() }} data-atrium-part="inbox-item" data-reason={props.item.reason} data-thread={props.item.thread_id ?? undefined} onPointerDown={() => setInboxPick(key())}>
       <div class="body">
         <button type="button" class="open" disabled={props.item.thread_id === null} title={props.item.thread_id ? "Open the chat" : undefined} onFocus={() => setInboxPick(key())} onClick={() => props.item.thread_id && openThread(props.item.thread_id)}>
           <Dot tone={reason().tone} />

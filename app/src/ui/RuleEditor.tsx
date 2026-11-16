@@ -61,7 +61,7 @@ export default function RuleEditor(props: { onDone: () => void }) {
     if (!r.ok) return null;
     const rule: Rule = { ...r.draft, id: "preview", origin: { type: "settings" }, created_at_ms: Date.now() };
     const t = ruleText(rule, titleOf);
-    return `${t.decision} ${t.what}${t.code ? ` ${t.code}` : ""}. ${t.where}.`;
+    return `${t.decision} ${t.what}${t.code ? ` ${t.code}` : ""} · ${t.where}`;
   };
   const threads = () => daemon().order.map((id) => ({ value: id, label: titleOf(id) || "Untitled chat" }));
   const isCommand = () => form().matcher === "command_prefix" || form().matcher === "command_exact";
