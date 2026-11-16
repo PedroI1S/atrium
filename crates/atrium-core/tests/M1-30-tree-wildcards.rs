@@ -3,10 +3,13 @@
 
 mod common_adversarial;
 
+use atrium_agents::{GateDecision, ToolGate};
 use atrium_core::PolicyVerdict;
 use atrium_protocol::agent::ToolKind;
 use atrium_protocol::policy::{Preset, RuleDecision, RuleMatcher, RuleScope};
-use common_adversarial::{Env, HOME, Want, classify, cmd_check, paths_check, rule, run_table};
+use common_adversarial::{
+    Env, HOME, Tmp, Want, block_on, classify, cmd_check, paths_check, rule, run_table,
+};
 
 const CR: &str = "credential-read";
 const AS: &str = "atrium-self";
@@ -734,14 +737,16 @@ fn globstar_tree_leaf_rules_preserve_ordinary_globs_and_block_sensitive_trees() 
             ("cat ~/.config/**/*.rs", ["Ask", "Ask", "Allow", "Allow"]),
         ],
     );
-    let read_ordinary = paths_check(ToolKind::Read, "Read", &["~/**/*.rs"], false, None);
-    assert!(
-        matches!(
-            env.eval_check(&read_ordinary, &[], Preset::Home),
-            PolicyVerdict::Allow { .. }
-        ),
-        "Read ~/**/*.rs should Allow"
-    );
+    for path in ["~/**/*.rs", "~/**/*.md", "~/.azure/*.rs"] {
+        let read_ordinary = paths_check(ToolKind::Read, "Read", &[path], false, None);
+        assert!(
+            matches!(
+                env.eval_check(&read_ordinary, &[], Preset::Home),
+                PolicyVerdict::Allow { .. }
+            ),
+            "Read {path} should Allow"
+        );
+    }
 
     // `**` ending at or inside a sensitive tree (or matching files inside one) stays blocked.
     run_table(
@@ -763,7 +768,13 @@ fn globstar_tree_leaf_rules_preserve_ordinary_globs_and_block_sensitive_trees() 
             ("cat ~/.config/g*chrome/**", Want::Hard(CR)),
         ],
     );
-    for path in ["~/.z*/**", "~/**/.z*/*.session"] {
+    for path in [
+        "~/.z*/**",
+        "~/**/.z*/*.session",
+        "~/**/msal_token_cache.*",
+        "~/.[a]zure/*",
+        "~/.[a]zure/*.json",
+    ] {
         let c = paths_check(ToolKind::Read, "Read", &[path], false, None);
         let v = env.eval_check(&c, &[], Preset::Home);
         assert!(
@@ -800,31 +811,33 @@ fn k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree() {
         );
     };
 
-    // Home-wide `**` searches whose later components cannot match any ask-tree file: Allow.
+    // Home-wide `**` searches whose later components cannot match any ask-tree/ask-file: Allow.
     for glob in [
         "**/*.rs",
         "**/*.md",
-        "**/*.toml",
         "**/*/*.rs",
         "*/*.rs",
         "src/**/*.rs",
         "**/src/*.rs",
-        "**/*.{rs,toml}",
+        "**/*.{rs,md}",
         "**/m*.rs",
+        ".azure/*.rs",
     ] {
         check_search(&["~"], false, glob, ["Allow", "Allow", "Allow"]);
     }
     check_search(&["~/.azure"], false, "*.rs", ["Allow", "Allow", "Allow"]);
 
-    // Searches whose later components can match an ask-tree / ask-prefix file: Ask in Home.
+    // Searches whose later components can match an ask-tree / ask-file / ask-prefix: Ask in Home.
     for glob in [
         "**/*.session",
         "**/*/*.session",
         "**/*.history",
-        "**/*.json",
-        "**/*",
-        "**",
-        "**/",
+        "**/token.json",
+        "**/cache.json",
+        "**/*.cache",
+        // `.cargo/credentials.toml` is in ASK_FILES (CR-12), so `**/*.toml` must Ask.
+        "**/*.toml",
+        "**/*.{rs,toml}",
         "**/*.{rs,session}",
         "**/[0-9]*.session",
         "**/*token*",
@@ -837,6 +850,19 @@ fn k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree() {
         ".az*/msal_token_cache.db",
     ] {
         check_search(&["~"], false, glob, ["Ask", "Allow", "Allow"]);
+    }
+    // Catch-all globs or `**/*.json` reach hard-denied CRED_FILES (`.docker/config.json`, `.netrc`).
+    for glob in ["**/*.json", "**/*", "**", "**/"] {
+        check_search(
+            &["~"],
+            false,
+            glob,
+            [
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+            ],
+        );
     }
     check_search(
         &["~/.zsh_sessions"],
@@ -863,4 +889,27 @@ fn k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree() {
             ),
         ],
     );
+}
+
+#[test]
+fn session_gate_blocks_wildcarded_credential_and_atrium_trees_when_absent_on_disk() {
+    // Pins S5 through the real filesystem gate when target dirs/files do not exist on disk
+    // (so `gate.rs:expand_glob` returns empty and `deny.rs:glob_hit` must block lexically).
+    let t = Tmp::new();
+    let g = t.gate(Preset::Home, vec![]);
+    for line in [
+        "cat ~/.g*/nonexistent",
+        "cat ~/.gem*/oauth_creds.json",
+        "cat ~/.con*/gcloud/credentials.db",
+        "cat ~/.local/share/atr*/missing.db",
+        "rm ~/.config/atr*/new.toml",
+        "echo x > ~/.config/atr*/new.toml",
+        "cat ~/.s?h/nonexistent",
+    ] {
+        let d = block_on(g.gate.check(&cmd_check(line)));
+        assert!(
+            matches!(d, GateDecision::Deny { .. }),
+            "{line}: wanted Deny, got {d:?}"
+        );
+    }
 }
