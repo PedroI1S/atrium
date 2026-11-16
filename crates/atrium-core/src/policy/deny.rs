@@ -12,7 +12,7 @@ use atrium_protocol::policy::{HARD_DENY_DEFAULTS, ToolSubject};
 use globset::GlobBuilder;
 use serde_json::Value;
 
-use super::shell::{self, Unit, base, is_shell};
+use super::shell::{self, Unit, cmd_name, is_shell};
 use super::words::{self, CwdState, Role, Use, Walk, lexical_resolve};
 use crate::PolicyInput;
 
@@ -75,7 +75,8 @@ fn unknown_tok_dangerous(tok: &str, cwd: &Path, home: &Path, s: &Sensitive, pipe
     if shell::maybe_shell(tok) || (piped && is_interpreter(tok)) {
         return true;
     }
-    let b = base(tok);
+    let b = cmd_name(tok);
+    let b = b.as_ref();
     matches!(
         b,
         "eval"
@@ -115,7 +116,9 @@ fn unknown_words_could_be_dangerous(
 ) -> bool {
     invocations.iter().any(|inv| {
         let words = &inv.words;
-        let is_script_or_flock = matches!(words.first().map(|w| base(w)), Some("script" | "flock"));
+        let is_script_or_flock = words
+            .first()
+            .is_some_and(|w| matches!(cmd_name(w).as_ref(), "script" | "flock"));
         (1..words.len()).any(|i| {
             let w = &words[i];
             if unknown_tok_dangerous(w, cwd, home, s, inv.piped) {
@@ -919,8 +922,8 @@ fn reads_stdin_as_code_at(eff: &[String], depth: u8) -> bool {
 
 fn is_executor(eff: &[String]) -> bool {
     eff.first().is_some_and(|f| {
-        let b = base(f);
-        is_interpreter(b) || matches!(b, "eval" | "source" | ".")
+        let b = cmd_name(f);
+        is_interpreter(b.as_ref()) || matches!(b.as_ref(), "eval" | "source" | ".")
     })
 }
 
@@ -928,12 +931,12 @@ fn contains_downloader(body: &str) -> bool {
     shell::lex(body).units.iter().any(|u| {
         u.eff
             .first()
-            .is_some_and(|f| DOWNLOADERS.contains(&base(f)))
+            .is_some_and(|f| DOWNLOADERS.contains(&cmd_name(f).as_ref()))
     })
 }
 
 fn force_push(eff: &[String]) -> bool {
-    if eff.first().map(|f| base(f)) != Some("git") {
+    if !eff.first().is_some_and(|f| cmd_name(f) == "git") {
         return false;
     }
     // skip git's own options up to the subcommand
@@ -1037,7 +1040,7 @@ fn force_push(eff: &[String]) -> bool {
 }
 
 fn rm_recursive(eff: &[String]) -> Option<Vec<String>> {
-    if eff.first().map(|f| base(f)) != Some("rm") {
+    if !eff.first().is_some_and(|f| cmd_name(f) == "rm") {
         return None;
     }
     let mut rec = false;
@@ -1061,7 +1064,7 @@ fn rm_recursive(eff: &[String]) -> Option<Vec<String>> {
 
 /// `find … -delete`: its roots, and whether the expression has any filter.
 fn find_delete(eff: &[String]) -> Option<(Vec<String>, bool)> {
-    if eff.first().map(|f| base(f)) != Some("find") || !eff.iter().any(|a| a == "-delete") {
+    if !eff.first().is_some_and(|f| cmd_name(f) == "find") || !eff.iter().any(|a| a == "-delete") {
         return None;
     }
     let (roots, j) = shell::find_roots(eff);
@@ -1245,7 +1248,8 @@ impl Ctx<'_> {
         for (i, u) in a.units.iter().enumerate() {
             let eff = &u.eff;
             let Some(first) = eff.first() else { continue };
-            let b = base(first);
+            let b = cmd_name(first);
+            let b = b.as_ref();
             // privilege escalation
             if PRIV.contains(&b)
                 || (b == "osascript"
@@ -1389,8 +1393,7 @@ impl Ctx<'_> {
             Some(unit) => unit
                 .eff
                 .first()
-                .map(|f| base(f))
-                .is_some_and(|c| !LISTERS.contains(&c)),
+                .is_some_and(|f| !LISTERS.contains(&cmd_name(f).as_ref())),
             None => {
                 let k = self.input.check.kind;
                 u.role == Role::Write
