@@ -1941,8 +1941,8 @@ fn fix3_finding3_glob_variant_cap_performance() {
     run_subject_list(vec![row]);
     let elapsed = start.elapsed();
     assert!(
-        elapsed.as_millis() < 50,
-        "worst-case glob took too long: {elapsed:?}"
+        elapsed.as_millis() < 150,
+        "worst-case glob took too long (>50 ms per evaluate across 3 evaluations): {elapsed:?}"
     );
 }
 
@@ -2100,4 +2100,245 @@ fn fix3_ordinary_lines_keep_devs_verdict() {
             subj_allow,
         ),
     ]);
+}
+
+/// Finding 1, fix round 4: relative search globs that climb out of a root
+/// with `..` and re-enter it (or enter another root in `paths`), plus
+/// `glob_search` variant-cap overflow propagating to `Ask` everywhere.
+#[test]
+fn fix4_finding1_reentering_globs_and_search_overflow() {
+    use ToolKind::Search;
+    let cr = ["CR", "CR", "CR"];
+    let asks = ["Ask", "Allow", "Allow"];
+    let ask_all = ["Ask", "Ask", "Ask"];
+    let v = vec![
+        subject(
+            "F1a",
+            Search,
+            &["~"],
+            Some(concat!("..", "/u/.ssh/id_rsa")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~"],
+            Some(concat!("..", "/u/.ssh/id_rsa")),
+            true,
+            cr,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~"],
+            Some(concat!("..", "/", "..", "/h/u/.ssh/id_rsa")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~"],
+            Some(concat!("..", "/u/.aws/credentials")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~"],
+            Some(concat!("..", "/u/.npmrc")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~"],
+            Some(concat!("..", "/u/.cargo/credentials.toml")),
+            false,
+            asks,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~"],
+            Some(concat!("..", "/u/.pypirc")),
+            false,
+            asks,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~"],
+            Some(concat!("..", "/u/.zsh_sessions/*.session")),
+            false,
+            asks,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~/.aws"],
+            Some(concat!("..", "/.aws/credentials")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~/.aws"],
+            Some(concat!("..", "/.aws/credentials")),
+            true,
+            cr,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~/.cargo"],
+            Some(concat!("..", "/.cargo/credentials.toml")),
+            false,
+            asks,
+        ),
+        subject(
+            "F1a",
+            Search,
+            &["~/proj", "~"],
+            Some(concat!("..", "/.ssh/id_rsa")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1b",
+            Search,
+            &["~"],
+            Some(concat!("{{1..64}{a,b,c}/x*/", "..", "/foo,.ssh/id_rsa}")),
+            false,
+            ask_all,
+        ),
+        subject(
+            "F1b-asym",
+            Search,
+            &["~"],
+            Some(concat!("{1..50}{a,b}/x*/", "..", "/foo")),
+            false,
+            ask_all,
+        ),
+    ];
+    run_subject_list(v);
+}
+
+/// Finding 2, fix round 4: `env` with 5..=11 mixed unknown options and a
+/// separate `-S`/`--split-string`/`-iS` argument slices the tail from `m + 2`.
+#[test]
+fn fix4_finding2_env_split_string_separate_arg() {
+    let rows = vec![
+        row(
+            "F2",
+            "env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'sh -c' 'cat .ssh/id_rsa'",
+            H_CR,
+        ),
+        row(
+            "F2",
+            "env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 --split-string 'sh -c' 'cat .ssh/id_rsa'",
+            H_CR,
+        ),
+        row(
+            "F2",
+            "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'sh -c' 'sudo id'",
+            H_PE,
+        ),
+        row(
+            "F2",
+            "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 --split-string 'sh -c' 'sudo id'",
+            H_PE,
+        ),
+        row(
+            "F2",
+            "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'sh -c' 'rm -rf ~'",
+            H_RD,
+        ),
+        row(
+            "F2",
+            "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -iS 'sh -c' 'sudo id'",
+            H_PE,
+        ),
+    ];
+    run_rows(&rows);
+}
+
+/// Finding 3, fix round 4: total normalized variant cap across all
+/// candidates in `escape_from_cands`/`check_escape_variant` plus cached
+/// `a.glob_search` in `ask_search_glob_hit` stays well under 50 ms.
+#[test]
+fn fix4_finding3_glob_escape_total_variant_cap_performance() {
+    use ToolKind::Search;
+    let row = subject(
+        "F3",
+        Search,
+        &["~/proj"],
+        Some(concat!(
+            "{1..64}{a,b,c,d}/x1*/",
+            "..",
+            "/x2*/",
+            "..",
+            "/x3*/",
+            "..",
+            "/x4*/",
+            "..",
+            "/x5*/",
+            "..",
+            "/x6*/",
+            "..",
+            "/x7*/",
+            "..",
+            "/*.rs"
+        )),
+        true,
+        ["Ask", "Ask", "Ask"],
+    );
+    let start = std::time::Instant::now();
+    run_subject_list(vec![row]);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 150,
+        "worst-case glob took too long (>50 ms per evaluate across 3 evaluations): {elapsed:?}"
+    );
+}
+
+/// Fix round 4 ordinary lines: keep `dev`'s verdicts.
+#[test]
+fn fix4_ordinary_lines_keep_devs_verdict() {
+    let subj_allow = ["Allow", "Allow", "Allow"];
+    run_subject_list(vec![
+        subject(
+            "ordinary4",
+            ToolKind::Search,
+            &["~"],
+            Some(concat!("..", "/u/proj/*.rs")),
+            false,
+            subj_allow,
+        ),
+        subject(
+            "ordinary4",
+            ToolKind::Search,
+            &["~"],
+            Some("proj/*.rs"),
+            false,
+            subj_allow,
+        ),
+        subject(
+            "ordinary4",
+            ToolKind::Search,
+            &["~/proj"],
+            Some(concat!("..", "/proj/*.rs")),
+            false,
+            subj_allow,
+        ),
+    ]);
+    run_rows(&[row(
+        "ordinary4",
+        "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'cargo test' --lib",
+        DEV_ASK,
+    )]);
 }

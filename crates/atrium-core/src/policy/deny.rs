@@ -46,8 +46,8 @@ pub struct Analysis {
     pub start: PathBuf,
     /// Cached `glob_escape` result for `ToolSubject::Paths`.
     pub glob_escape: Option<GlobEscape>,
-    /// Cached `(variants, unbounded)` for `search_glob_hit`.
-    glob_search: Option<(Vec<String>, bool)>,
+    /// Cached `(variants, unbounded)` for `search_glob_hit` and `ask_search_glob_hit`.
+    pub glob_search: Option<(Vec<String>, bool)>,
 }
 
 fn unknown_tok_dangerous(tok: &str, cwd: &Path, home: &Path, s: &Sensitive, piped: bool) -> bool {
@@ -273,9 +273,18 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
                 pseudo(&mut a, p, role);
             }
             if let Some(g) = glob {
+                let roots: Vec<PathBuf> = if paths.is_empty() {
+                    vec![input.cwd.to_path_buf()]
+                } else {
+                    paths
+                        .iter()
+                        .take(words::MAX_USES)
+                        .map(|p| lexical_resolve(p, input.cwd, home))
+                        .collect()
+                };
                 let cands = expand_glob_candidates(g, input.cwd, home);
-                a.glob_search = Some(search_variants_from_cands(&cands));
-                a.glob_escape = Some(escape_from_cands(paths, input.cwd, home, &cands));
+                a.glob_search = Some(search_variants_from_cands(&roots, input.cwd, home, &cands));
+                a.glob_escape = Some(escape_from_cands(&roots, input.cwd, home, &cands));
             }
         }
         ToolSubject::Fetch { url } => {
@@ -645,14 +654,26 @@ impl Sensitive {
     /// A search over `roots` scoped by `glob` (matched against file names,
     /// paths relative to a root, or whole paths) that can reach a credential
     /// store that asks.
-    pub fn ask_search_glob_hit(&self, roots: &[PathBuf], glob: &str) -> bool {
-        let home_path = Path::new(&self.home);
-        let (variants, unbounded) = glob_search_variants(glob, home_path, home_path);
+    pub fn ask_search_glob_hit(
+        &self,
+        roots: &[PathBuf],
+        glob: &str,
+        cached: Option<&(Vec<String>, bool)>,
+    ) -> bool {
+        let owned;
+        let (variants, unbounded) = match cached {
+            Some((v, u)) => (v.as_slice(), *u),
+            None => {
+                let home_path = Path::new(&self.home);
+                owned = glob_search_variants(roots, glob, home_path, home_path);
+                (owned.0.as_slice(), owned.1)
+            }
+        };
         if unbounded {
             return true;
         }
         let mut matchers = Vec::with_capacity(variants.len());
-        for norm in &variants {
+        for norm in variants {
             let Ok(g) = GlobBuilder::new(norm).literal_separator(false).build() else {
                 return true;
             };
@@ -673,29 +694,34 @@ impl Sensitive {
             return true;
         }
         // Any search of an ASK_TREE with a filename filter (`.zsh_sessions/*.session`).
+        let mut tree_targets: Vec<(String, String)> = vec![];
         for t in ASK_TREES {
             let t_abs = format!("{}/{t}", self.home);
             for rl in &root_lowers {
                 if under(rl, &t_abs).is_some() {
                     return true;
                 }
-                let Some(tree_rel) = under(&t_abs, rl) else {
-                    continue;
-                };
-                for norm in &variants {
-                    for (idx, _) in norm.match_indices('/') {
-                        if idx == 0 {
-                            continue;
-                        }
-                        let dir_pat = &norm[..idx];
-                        let Ok(g) = GlobBuilder::new(dir_pat).literal_separator(true).build()
-                        else {
-                            return true;
-                        };
-                        let m = g.compile_matcher();
-                        if m.is_match(tree_rel) || m.is_match(&t_abs) {
-                            return true;
-                        }
+                if let Some(tree_rel) = under(&t_abs, rl) {
+                    tree_targets.push((tree_rel.to_string(), t_abs.clone()));
+                }
+            }
+        }
+        if !tree_targets.is_empty() {
+            for norm in variants {
+                for (idx, _) in norm.match_indices('/') {
+                    if idx == 0 {
+                        continue;
+                    }
+                    let dir_pat = &norm[..idx];
+                    let Ok(g) = GlobBuilder::new(dir_pat).literal_separator(true).build() else {
+                        return true;
+                    };
+                    let m = g.compile_matcher();
+                    if tree_targets
+                        .iter()
+                        .any(|(tree_rel, t_abs)| m.is_match(tree_rel) || m.is_match(t_abs))
+                    {
+                        return true;
                     }
                 }
             }
@@ -1407,7 +1433,16 @@ impl Ctx<'_> {
         let (variants, unbounded) = match &self.a.glob_search {
             Some((v, u)) => (v.as_slice(), *u),
             None => {
-                owned = glob_search_variants(glob, self.input.cwd, self.home());
+                let resolved_roots: Vec<PathBuf> = if roots.is_empty() {
+                    vec![self.input.cwd.to_path_buf()]
+                } else {
+                    roots
+                        .iter()
+                        .take(words::MAX_USES)
+                        .map(|r| lexical_resolve(r, self.input.cwd, self.home()))
+                        .collect()
+                };
+                owned = glob_search_variants(&resolved_roots, glob, self.input.cwd, self.home());
                 (owned.0.as_slice(), owned.1)
             }
         };
@@ -1871,48 +1906,82 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
     res
 }
 
-fn search_variants_from_cands(cands: &GlobCandidates) -> (Vec<String>, bool) {
+fn search_variants_from_cands(
+    roots: &[PathBuf],
+    cwd: &Path,
+    home: &Path,
+    cands: &GlobCandidates,
+) -> (Vec<String>, bool) {
     if cands.unbounded {
         return (vec![], true);
     }
     let mut out = vec![];
-    for gv in &cands.variants {
-        let Some(norms) = normalize_glob_variants(gv, MAX_GLOB_VARIANTS) else {
-            return (vec![], true);
+    let mut seen = std::collections::HashSet::new();
+    let mut total_norm = 0usize;
+    let mut push_norms = |pat: &str| -> bool {
+        let remaining = MAX_GLOB_VARIANTS.saturating_sub(total_norm);
+        if remaining == 0 {
+            return false;
+        }
+        let Some(norms) = normalize_glob_variants(pat, remaining) else {
+            return false;
         };
+        total_norm += norms.len();
+        if total_norm > MAX_GLOB_VARIANTS {
+            return false;
+        }
         for n in norms {
             let norm = n.to_lowercase().replace('ſ', "s");
-            if !norm.is_empty() && !out.contains(&norm) {
+            if !norm.is_empty() && seen.insert(norm.clone()) {
                 if out.len() >= MAX_GLOB_VARIANTS {
-                    return (vec![], true);
+                    return false;
                 }
                 out.push(norm);
+            }
+        }
+        true
+    };
+    for gv in &cands.variants {
+        if gv.is_empty() {
+            continue;
+        }
+        if !push_norms(gv) {
+            return (vec![], true);
+        }
+        let anchored = gv.starts_with('/') || gv.starts_with('~');
+        if !anchored {
+            for r in roots {
+                let joined = format!("{}/{}", r.to_string_lossy().trim_end_matches('/'), gv);
+                if !push_norms(&joined) {
+                    return (vec![], true);
+                }
+            }
+        } else {
+            let expanded = words::expand_home(gv, home, cwd);
+            if expanded != *gv && !push_norms(&expanded) {
+                return (vec![], true);
             }
         }
     }
     (out, false)
 }
 
-fn glob_search_variants(glob: &str, cwd: &Path, home: &Path) -> (Vec<String>, bool) {
+fn glob_search_variants(
+    roots: &[PathBuf],
+    glob: &str,
+    cwd: &Path,
+    home: &Path,
+) -> (Vec<String>, bool) {
     let cands = expand_glob_candidates(glob, cwd, home);
-    search_variants_from_cands(&cands)
+    search_variants_from_cands(roots, cwd, home, &cands)
 }
 
 fn escape_from_cands(
-    paths: &[String],
+    roots: &[PathBuf],
     cwd: &Path,
     home: &Path,
     cands: &GlobCandidates,
 ) -> GlobEscape {
-    let roots: Vec<PathBuf> = if paths.is_empty() {
-        vec![cwd.to_path_buf()]
-    } else {
-        paths
-            .iter()
-            .take(words::MAX_USES)
-            .map(|p| lexical_resolve(p, cwd, home))
-            .collect()
-    };
     let mut out = GlobEscape {
         patterns: vec![],
         unknown: cands.unknown,
@@ -1921,8 +1990,9 @@ fn escape_from_cands(
     if cands.unbounded {
         return out;
     }
+    let mut total_norm = 0usize;
     for gv in &cands.variants {
-        check_escape_variant(gv, &roots, cwd, home, &mut out);
+        check_escape_variant(gv, roots, cwd, home, &mut total_norm, &mut out);
         if out.unbounded {
             break;
         }
@@ -1950,6 +2020,7 @@ fn check_escape_variant(
     roots: &[PathBuf],
     cwd: &Path,
     home: &Path,
+    total_norm: &mut usize,
     out: &mut GlobEscape,
 ) {
     if variant.is_empty() {
@@ -1966,11 +2037,23 @@ fn check_escape_variant(
             .collect()
     };
     for j in raw_joined {
-        let Some(norms) = normalize_glob_variants(&j, MAX_GLOB_VARIANTS) else {
+        let remaining = MAX_GLOB_VARIANTS.saturating_sub(*total_norm);
+        if remaining == 0 {
+            out.unbounded = true;
+            out.unknown = true;
+            return;
+        }
+        let Some(norms) = normalize_glob_variants(&j, remaining) else {
             out.unbounded = true;
             out.unknown = true;
             return;
         };
+        *total_norm += norms.len();
+        if *total_norm > MAX_GLOB_VARIANTS {
+            out.unbounded = true;
+            out.unknown = true;
+            return;
+        }
         for n in norms {
             let abs = PathBuf::from(&n);
             // the folder the walk starts from: the literal components

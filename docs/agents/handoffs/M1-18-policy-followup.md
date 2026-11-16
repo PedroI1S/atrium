@@ -369,3 +369,75 @@ Probed directly against `dev` in a temporary `.dev_probe/` copy (with `dev`'s `p
   - Run 5: `adversarial_fuzz` `16.03s`; `policy` `4.93s`.
 - Scratch `.dev_probe/` directory and its target were removed.
 
+## Fix round 4 (D-114)
+
+Worker: Gemini 4 Hydrogen (high effort). Closed all three findings (1a, 1b, 2, 3) from Argon's round-4 review (`.orchestration/review-input/M1-18-policy-followup-round4.md` on `8333f0b`) with 0 lines more permissive than `dev` and 0 false hard denies or needless asks on ordinary lines.
+
+### Changes by item
+
+1. **Finding 1a — Relative globs that climb out of a root and re-enter (`crates/atrium-core/src/policy/deny.rs`):**
+   - `search_variants_from_cands` now takes `(roots, cwd, home, cands)` (computed once in `analyze_with` from `paths` / `cwd` via `lexical_resolve`, matching `escape_from_cands`).
+   - For unanchored glob candidates (`!starts_with('/') && !starts_with('~')`), `search_variants_from_cands` emits normalized variants for both the unjoined candidate (keeping relative `rel`/`name`/`tree_rel` matching) and each root-joined path `format!("{root}/{gv}")` (normalized via `normalize_glob_variants`, matching `check_escape_variant`), so `../u/.ssh/id_rsa` from `~`, `../../h/u/.ssh/id_rsa` from `~`, `../.aws/credentials` from `~/.aws`, `../.ssh/id_rsa` from `["~/proj", "~"]`, and `../u/.zsh_sessions/*.session` from `~` all match their plain-path verdicts in `search_glob_hit` and `ask_search_glob_hit`.
+
+2. **Finding 1b — `glob_search` variant-cap overflow propagation (`crates/atrium-core/src/policy/deny.rs`, `engine.rs`):**
+   - Made `Analysis::glob_search` `pub` and updated `DefaultPolicy::evaluate` so `glob_unbounded` checks both `esc.is_some_and(|e| e.unbounded)` and `a.glob_search.as_ref().is_some_and(|(_, u)| *u)`.
+   - Any variant-cap overflow in `search_variants_from_cands` now propagates into the same fail-closed `unknown` -> `Ask` path as `glob_escape.unbounded` (`HardDeny` and `RuleDecision::Deny` still take precedence).
+
+3. **Finding 2 — `env -S` separate argument tail offset (`crates/atrium-core/src/policy/shell.rs`):**
+   - In `expand_unknown_env_cmd`, `split_vals` now stores `(tail_start, val)`: `m + 2` when `-S`, `-iS`, or `--split-string` consumes the next word `a[m + 1]`, and `m + 1` when the string is attached (`--split-string=...`, `-S...`, `-iS...`).
+   - Line 3536 slices `&a[*tail..]` instead of `&a[*m + 1..]`, so `env` with `5..=11` mixed unknown options and `-S 'sh -c' '<payload>'` feeds `["sh", "-c", "<payload>"]` into `readings` and matches `sh -c '<payload>'`.
+
+4. **Finding 3 — Performance (`crates/atrium-core/src/policy/deny.rs`, `engine.rs`):**
+   - `Sensitive::ask_search_glob_hit` now takes `cached: Option<&(Vec<String>, bool)>`, reading `self.a.glob_search.as_ref()` from `Home::evaluate` instead of recomputing `glob_search_variants`, and hoists `ASK_TREES` directory-prefix matcher checks outside the `(tree, root)` loop when no tree target is under any root.
+   - `escape_from_cands` and `check_escape_variant` (and `search_variants_from_cands`) now track `total_norm` across all candidates against `MAX_GLOB_VARIANTS = 256` (passing `MAX_GLOB_VARIANTS - total_norm` to `normalize_glob_variants`), failing closed (`unbounded = true`, `unknown = true`) as soon as total normalized variants exceed `256`.
+   - On `{1..64}{a,b,c,d}/x1*/../x2*/../x3*/../x4*/../x5*/../x6*/../x7*/../*.rs` (`paths: ["~/proj"], recursive: true`), 3 `evaluate` calls finish in `~0.02s` standalone (well under 50 ms per `evaluate`). Updated `fix3_finding3_glob_variant_cap_performance` and added `fix4_finding3_glob_escape_total_variant_cap_performance` to check `< 150 ms` across 3 evaluations (`< 50 ms` per `evaluate`), avoiding parallel workspace test-load flakes.
+
+### Tests (`crates/atrium-core/tests/adversarial_m1_18.rs`)
+
+- `fix4_finding1_reentering_globs_and_search_overflow`: all 13 evidence lines from Finding 1 plus asymmetric `{1..50}{a,b}/x*/../foo` (`glob_search` overflows while `glob_escape` stays within 256).
+- `fix4_finding2_env_split_string_separate_arg`: all 6 evidence lines from Finding 2.
+- `fix4_finding3_glob_escape_total_variant_cap_performance`: Finding 3's worst-case glob (`["Ask", "Ask", "Ask"]`, `< 50 ms` per `evaluate`).
+- `fix4_ordinary_lines_keep_devs_verdict`: ordinary lines (`Search ["~"]` `../u/proj/*.rs`, `proj/*.rs`; `Search ["~/proj"]` `../proj/*.rs`; `cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'cargo test' --lib`).
+- Verified on `8333f0b`'s unmodified `src/`: `fix4_finding1_reentering_globs_and_search_overflow`, `fix4_finding2_env_split_string_separate_arg`, and `fix4_finding3_glob_escape_total_variant_cap_performance` all fail on `8333f0b` while `fix4_ordinary_lines_keep_devs_verdict` passes; all 4 pass after the fixes.
+
+### Comparison with `dev` (fix round 4)
+
+Using `dev`'s verdicts from `.orchestration/review-input/M1-18-policy-followup-round4.md`: **0 lines more permissive than `dev`**, **0 false hard denies on ordinary lines**, **0 needless asks on ordinary lines**.
+
+| Item | Input | `dev` | `8333f0b` | Fix round 4 |
+|---|---|---|---|---|
+| F1a | `Search ["~"]` `../u/.ssh/id_rsa` (`rec=false`) | `Allow / Allow / Allow` | `Allow / Allow / Allow` | `CR / CR / CR` |
+| F1a | `Search ["~"]` `../u/.ssh/id_rsa` (`rec=true`) | `Ask / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1a | `Search ["~"]` `../../h/u/.ssh/id_rsa` (`rec=false`) | `Allow / Allow / Allow` | `Allow / Allow / Allow` | `CR / CR / CR` |
+| F1a | `Search ["~"]` `../u/.aws/credentials` (`rec=false`) | `Allow / Allow / Allow` | `Allow / Allow / Allow` | `CR / CR / CR` |
+| F1a | `Search ["~"]` `../u/.npmrc` (`rec=false`) | `Allow / Allow / Allow` | `Allow / Allow / Allow` | `CR / CR / CR` |
+| F1a | `Search ["~"]` `../u/.cargo/credentials.toml` (`rec=false`) | `Allow / Allow / Allow` | `Allow / Allow / Allow` | `Ask / Allow / Allow` |
+| F1a | `Search ["~"]` `../u/.pypirc` (`rec=false`) | `Allow / Allow / Allow` | `Allow / Allow / Allow` | `Ask / Allow / Allow` |
+| F1a | `Search ["~"]` `../u/.zsh_sessions/*.session` (`rec=false`) | `Allow / Allow / Allow` | `Allow / Allow / Allow` | `Ask / Allow / Allow` |
+| F1a | `Search ["~/.aws"]` `../.aws/credentials` (`rec=false`) | `Allow / Allow / Allow` | `Allow / Allow / Allow` | `CR / CR / CR` |
+| F1a | `Search ["~/.aws"]` `../.aws/credentials` (`rec=true`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1a | `Search ["~/.cargo"]` `../.cargo/credentials.toml` (`rec=false`) | `Allow / Allow / Allow` | `Allow / Allow / Allow` | `Ask / Allow / Allow` |
+| F1a | `Search ["~/proj", "~"]` `../.ssh/id_rsa` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1b | `Search ["~"]` `{{1..64}{a,b,c}/x*/../foo,.ssh/id_rsa}` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `Ask / Ask / Ask` |
+| F1b | `Search ["~"]` `{1..50}{a,b}/x*/../foo` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `Ask / Ask / Ask` |
+| F2 | `env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'sh -c' 'cat .ssh/id_rsa'` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `CR / CR / CR / CR` |
+| F2 | `env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 --split-string 'sh -c' 'cat .ssh/id_rsa'` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `CR / CR / CR / CR` |
+| F2 | `cwd=proj\|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'sh -c' 'sudo id'` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `PE / PE / PE / PE` |
+| F2 | `cwd=proj\|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 --split-string 'sh -c' 'sudo id'` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `PE / PE / PE / PE` |
+| F2 | `cwd=proj\|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'sh -c' 'rm -rf ~'` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `RD / RD / RD / RD` |
+| F2 | `cwd=proj\|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -iS 'sh -c' 'sudo id'` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `PE / PE / PE / PE` |
+| F3 | `Search ["~/proj"]` `{1..64}{a,b,c,d}/x1*/../.../x7*/../*.rs` (`rec=true`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `Ask / Ask / Ask` |
+| Ord | `Search ["~"]` `../u/proj/*.rs` (`rec=false`), `proj/*.rs` (`rec=false`); `Search ["~/proj"]` `../proj/*.rs` (`rec=false`) | `Allow / Allow / Allow` | `Allow / Allow / Allow` | `Allow / Allow / Allow` |
+| Ord | `cwd=proj\|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'cargo test' --lib` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` |
+
+### Fix round 4 DoD outputs
+
+- `cargo fmt --all --check`: exit `0`.
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit `0` (0 warnings).
+- `cargo test --workspace --no-fail-fast`: exit `0` (all crates and doc-tests passed).
+- `cargo test -p atrium-core --no-fail-fast -- --quiet` (3 runs in a loop): exit `0` across all 3 runs (`adversarial_m1_18`: 33 passed, 0 failed, 0 ignored):
+  - Run 1: `adversarial_fuzz` `13.80s` (`2 passed; 0 failed; 1 ignored`); `policy` `3.83s` (`44 passed; 0 failed; 0 ignored`); `adversarial_m1_18` `1.97s`; `store` `37.04s`.
+  - Run 2: `adversarial_fuzz` `13.79s`; `policy` `3.81s`; `adversarial_m1_18` `1.97s`; `store` `37.02s`.
+  - Run 3: `adversarial_fuzz` `13.78s`; `policy` `3.81s`; `adversarial_m1_18` `2.04s`; `store` `37.01s`.
+- `cargo test -p atrium-core --test adversarial_m1_18 fix4_finding3 -- --nocapture`: `0.02s` (3 evaluations).
+

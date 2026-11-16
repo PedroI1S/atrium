@@ -856,7 +856,8 @@ impl Home<'_> {
                                 .flat_map(|i| self.a.all_paths(i).into_iter().cloned())
                                 .collect()
                         };
-                        self.s.ask_search_glob_hit(&roots, g)
+                        self.s
+                            .ask_search_glob_hit(&roots, g, self.a.glob_search.as_ref())
                     }) =>
                 {
                     PolicyVerdict::Ask
@@ -917,7 +918,8 @@ impl PolicyEngine for DefaultPolicy {
         }
         let esc = a.glob_escape.as_ref();
         let glob_leaves = esc.is_some_and(deny::GlobEscape::leaves);
-        let glob_unbounded = esc.is_some_and(|e| e.unbounded);
+        let glob_unbounded =
+            esc.is_some_and(|e| e.unbounded) || a.glob_search.as_ref().is_some_and(|(_, u)| *u);
         let out = apply_rules(input, &a, rules, glob_leaves);
         if let Some((reason, rule)) = out.deny {
             return PolicyVerdict::Deny {

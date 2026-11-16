@@ -3493,10 +3493,10 @@ fn expand_unknown_env_cmd(
             let lw = long.as_deref().unwrap_or(w.as_str());
             if lw == "--split-string" {
                 if let Some(v) = a.get(m + 1) {
-                    split_vals.push((m, v.clone()));
+                    split_vals.push((m + 2, v.clone()));
                 }
             } else if let Some(v) = lw.strip_prefix("--split-string=") {
-                split_vals.push((m, v.to_string()));
+                split_vals.push((m + 1, v.to_string()));
             } else if lw == "--chdir" {
                 if let Some(v) = a.get(m + 1) {
                     chdir_vals.push((m, v.clone()));
@@ -3507,9 +3507,9 @@ fn expand_unknown_env_cmd(
                 for (pos, _) in w[1..].match_indices('S') {
                     let after = &w[1 + pos + 1..];
                     if !after.is_empty() {
-                        split_vals.push((m, after.to_string()));
+                        split_vals.push((m + 1, after.to_string()));
                     } else if let Some(v) = a.get(m + 1) {
-                        split_vals.push((m, v.clone()));
+                        split_vals.push((m + 2, v.clone()));
                     }
                 }
                 for (pos, _) in w[1..].match_indices('C') {
@@ -3524,7 +3524,7 @@ fn expand_unknown_env_cmd(
         }
     }
 
-    for (m, s) in &split_vals {
+    for (tail, s) in &split_vals {
         if let Some(p) = payloads.as_deref_mut() {
             push_bounded_str(p, s.clone(), unbounded);
         }
@@ -3533,7 +3533,7 @@ fn expand_unknown_env_cmd(
             *unbounded = true;
         }
         let mut sp = sw;
-        sp.extend_from_slice(&a[*m + 1..]);
+        sp.extend_from_slice(&a[*tail..]);
         if !sp.is_empty() {
             if sp.len() > MAX_UNKNOWN_STARTS {
                 *unbounded = true;
