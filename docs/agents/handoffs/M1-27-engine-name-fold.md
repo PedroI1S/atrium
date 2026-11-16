@@ -25,9 +25,17 @@ In `crates/atrium-core/src/policy/shell.rs`:
    - Scripts that are positional/special-parameter expansions that cannot be resolved exactly (missing `$0`/`$1`/`$@`, modifiers/indirection like `${1:-echo}` / `${!1}`, unbraced `$10`, `$#`, or operands containing `$`/`\``) fail closed by propagating an `unresolvable` flag to `code_texts_bounded` (line ~2001, caller of `payloads_of_checked`, 10 lines above `shell_c_codes`), which pushes `UnboundedUnknown { words: e.clone(), piped }` into `unbounded_words` so `engine.rs` returns `Ask` everywhere (including under `Any` and `FullAccess`).
    - Note on owned range: `code_texts_bounded` (~2001) is the direct caller of `payloads_of`; it was updated (+11/−1 lines) because `payloads_of` had no `unbounded_words` parameter. No edits touch the word reader (~700–950).
 2. **K9 (`expand_unknown_env_cmd` + `env_reach` + `expand_nested_reading`):**
-   - Added `env_reach(a, is_env)` for `env` and `command` invocations with unknown options: computes reachability across known 1-word options, known 2-word options (`-u`/`-C`/`-P`/`-a`/`-S`, `--unset`/`--chdir`/`--argv0`/`--split-string`, GNU abbreviations via `env_long`), `NAME=value` assignments (for `env`), and `--`, collecting only genuinely reachable `-S`/`-C` options and candidate command starts.
-   - Removed the `a.len() > MAX_UNKNOWN_STARTS` (24) bailout for `env` and `command` (and the `sp.len() > MAX_UNKNOWN_STARTS` bailout on `-S` splices) and instead fail closed (`*unbounded = true`) only when `unknown_opts > MAX_UNKNOWN_STARTS` (24) or `cmd_starts.len() > MAX_UNKNOWN_STARTS` (24) (in addition to `rec_depth > 4` and `MAX_UNKNOWN_EMIT = 32`).
-   - Non-`env`/`command` wrappers (`script`, `flock`, `timeout`, etc.) retain the existing `a.len() > MAX_UNKNOWN_STARTS` guard.
+   - Added `env_reach(a, is_env)` for `env` and `command` invocations with unknown options (superseded in Rework round 1 below).
+
+### Rework round 1
+1. **Clippy identical-blocks fix + K9 unknown-option fail-closed restoration (`crates/atrium-core/src/policy/shell.rs`):**
+   - Removed `EnvReach` and `env_reach` (which also contained the `clippy::if_same_then_else` identical blocks at `:3815`/`3817`).
+   - Restored `expand_unknown_env_cmd`'s `a.len() > MAX_UNKNOWN_STARTS` and `sp.len() > MAX_UNKNOWN_STARTS` fail-closed bounds (while keeping `cmd_name` folding for CR-19 and `expand_nested_reading` to avoid duplicating nested-wrapper expansion).
+   - Long `env` lines made exclusively of known options (`-i`, `-0`, `-v`, `-u`, `-C`, `-P`, `-a`, `-S`, `--ignore-environment`, `--unset`, `--chdir`, `--argv0`, `--split-string`, `--block-signal`, `--default-signal`, `--ignore-signal`, `--list-signal-handling`, `--debug`, `--null`, `--`) and `NAME=value` assignments are scanned completely by `scan_env` without entering `expand_unknown_env_cmd` and match their short-form verdicts.
+   - Any `env` invocation with unknown options that exceeds `MAX_UNKNOWN_STARTS` (24) words fails closed (`unbounded = true`), preserving `fix2_k1_multiple_unknown_options_and_clusters` (`env -A0 v0 ... -A13 v13 -C .. cat foo` → `Ask` everywhere) and `fix3_finding2_unbounded_wrappers_and_interpreters` (`env -A0 -A1 v1 ... -A12 v12 -S 'cat .ssh/id_rsa'` / `'cat .pypirc'` → `Ask` everywhere).
+2. **K9 tests re-checked (`crates/atrium-core/tests/M1-27-engine-name-fold.rs`):**
+   - Updated `k9_long_readable_env_matches_short_form` so every short/long matching case uses only **known** `env` options and `NAME=value` assignments (including `-i`, `-u`, `--ignore-environment`, `--unset=`, `-0`, `-v`, `--debug`, `--list-signal-handling`, `--block-signal=`, `--default-signal=`, `--ignore-signal=`, `-S`, `-C`, `--`, and folded `ENV`).
+   - Updated `k9_genuinely_unbounded_env_still_fails_closed` to pin fail-closed (`Ask` everywhere, never `Allow`) when >24-word `env` lines contain unknown options (even a single `-Z` with 28 `NAME=value` assignments, `-A0 ... -A12` with `-S 'cat .ssh/id_rsa'` or `-S 'cat .pypirc'`, and 26 unknown flags/pairs).
 
 ## Tests added in `crates/atrium-core/tests/M1-27-engine-name-fold.rs`
 
@@ -46,16 +54,15 @@ In `crates/atrium-core/src/policy/shell.rs`:
 - `k7_unresolvable_positional_sh_c_fails_closed_ask_everywhere`:
   - Pins `Ask` in Home, Prefix, Any, FullAccess for `sh -c '$0'`, `sh -c '$1' x`, `sh -c '$@' x`, `sh -c '$*' x`, `sh -c '${1:-echo}' x`, `sh -c '${!1}' x y`, `sh -c '$10' x`, `sh -c '$#' x`, `sh -c '$0' "$FOO"`, and `bash -eo pipefail -c '$0'`.
 - `k9_long_readable_env_matches_short_form`:
-  - Pins matching verdicts between long (>24 words) readable `env` lines and their short forms across Home, Prefix, Any, FullAccess: 28 `NAME=value` assignments before/after `-Z`, 14 `-u` options + `-i` before/after `-Z`, 5 unknown options (`choices > 4`) + 14 `-u` options + 28 assignments, `-Z /bin/echo` with 30 arguments, `-Z -S 'K01=1 … K28=28'`, and 0-unknown long `env`.
-  - Pins `HardDeny` in all 4 settings for long readable `env` with `cat ~/.ssh/id_rsa`, `-C .. -S 'sh -c' 'cat ~/.ssh/id_rsa'`, and `rm -rf ~`.
+  - Pins matching verdicts between long (>24 words) known-option `env` lines and their short forms across Home, Prefix, Any, FullAccess (28 `NAME=value` assignments, `-i` + 14 `-u` + 28 assignments, `--ignore-environment` + 14 `--unset=` + 28 assignments, `--debug`/`--list-signal-handling`/`--block-signal=`/`--default-signal=`/`--ignore-signal=`, `--` + 30 command args, `-S 'K01=1 … K28=28'`, `-C proj`, and folded `ENV`).
+  - Pins `HardDeny` in all 4 settings for long known-option `env` with `cat ~/.ssh/id_rsa`, `-C .. -S 'sh -c' 'cat ~/.ssh/id_rsa'`, and `rm -rf ~`.
 - `k9_genuinely_unbounded_env_still_fails_closed`:
-  - Pins `Ask` in Home, Prefix, Any, FullAccess for `env` with 26 unknown flags (`-Z01 … -Z26 /bin/echo hi`) and 26 unknown option-value pairs (`-Z01 v01 … -Z26 v26 /bin/echo hi`), and never `Allow` on `env -Z01 … -Z26 cat ~/.ssh/id_rsa`.
+  - Pins `Ask` in Home, Prefix, Any, FullAccess for >24-word `env` lines with unknown options (`env K01=1…K28=28 -Z /bin/echo hi`, `env -Z K01=1…K28=28 /bin/echo hi`, `env -A0…-A12 v12 -S 'cat .ssh/id_rsa'`, `env -A0…-A12 v12 -S 'cat .pypirc'`, 26 unknown flags, 26 unknown option-value pairs), and never `Allow` on `env -Z01 … -Z26 cat ~/.ssh/id_rsa`.
 
 ## Tests expected to fail on `dev`'s code
-- **CR-19 tests:** `folded_shells_match_lowercase_verdicts`, `folded_wrappers_match_lowercase_verdicts`, `folded_interpreters_and_substitutions_match_lowercase` (on `dev`, folded names are not recognized, so they get `Ask`/`Allow` instead of `HardDeny`/lowercase verdicts).
+- **CR-19 tests:** `folded_shells_match_lowercase_verdicts`, `folded_wrappers_match_lowercase_verdicts`, `folded_interpreters_and_substitutions_match_lowercase`, and the `ENV -i …` check in `k9_long_readable_env_matches_short_form` (on `dev`, folded names are not recognized, so they get `Ask`/`Allow` instead of `HardDeny`/lowercase verdicts).
 - **K7 tests:** `k7_positional_sh_c_resolves_to_payload_verdicts` (`dev` does not resolve `$0`/`$1`/`$@`/`$*` in `sh -c`, so it `Ask`s in Home and `Allow`s under `Any`/`FullAccess` instead of `HardDeny`, and misses `curl … | sh -c '$0' bash`) and `k7_unresolvable_positional_sh_c_fails_closed_ask_everywhere` (`dev` `Allow`s unresolvable positional `-c` scripts under `Any` and `FullAccess`).
-- **K9 tests:** `k9_long_readable_env_matches_short_form` (`dev` hits `a.len() > 24` in `expand_unknown_env_cmd` on every long `-Z` case and `Ask`s in `Any` and `FullAccess` instead of matching the short form's `Allow`).
-- Expected to **pass** on `dev`: `rule_matching_keeps_original_case`, `ordinary_lines_with_capitals_keep_dev_verdicts`, and `k9_genuinely_unbounded_env_still_fails_closed`.
+- Expected to **pass** on `dev`: `rule_matching_keeps_original_case`, `ordinary_lines_with_capitals_keep_dev_verdicts`, `k9_genuinely_unbounded_env_still_fails_closed`, and the lowercase known-option `env` checks in `k9_long_readable_env_matches_short_form`.
 
 ## Checks run in this round (D-123)
 - `cargo fmt --all` — ran after final edit, exited 0.
