@@ -73,6 +73,13 @@ async function boot() {
   if (info.benchMode === "chat-live") {
     setStage("chat-live");
     await (isPopout() ? chatLivePopout() : runChatLive());
+  } else if (info.benchMode === "m1-demo" || info.benchMode?.startsWith("m1-demo:")) {
+    setStage("m1-demo");
+    const exportDir = info.benchMode.startsWith("m1-demo:") ? info.benchMode.slice("m1-demo:".length) : null;
+    if (!isPopout()) {
+      const { runM1Demo } = await import("./m1-demo");
+      await runM1Demo(exportDir);
+    }
   } else if (info.benchMode === "stream" || info.benchMode === "stream-one") {
     setStage("stream");
     if (!isPopout()) await runStreamBench(info.benchMode === "stream-one");
