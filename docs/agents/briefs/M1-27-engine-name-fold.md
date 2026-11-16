@@ -39,3 +39,6 @@ Owned paths widen to `shell.rs` `shell_c_codes` (~2090–2110), `payloads_of` (~
 - [ ] Show your new tests (and the un-ignored ones) fail on `dev`'s code and pass now: check out `dev`'s versions of the src files you changed, run, restore.
 - [ ] `git diff dev --stat` touches only your owned paths.
 - [ ] Handoff `docs/agents/handoffs/M1-27-engine-name-fold.md`: what changed and where, a verdict table (dev vs now) for every line you tested, ordinary-line checks, the outputs, anything escalated.
+
+## Added scope (D-120, orchestrator, 2026-11-16): review round 1
+The Codex review (`reviews/M1-27-engine-name-fold.md`, finding 1) shows that folded names still miss hard-deny comparisons in `deny.rs`, at the privilege-tool (`PRIV`) sites and any other place that compares a command name. Owned paths widen to **those name comparisons only**, folding them through the same helper as `shell.rs`. Other tasks own other ranges of `deny.rs` (M1-29: the CR-12 list; M1-30: `ASK_TREES` and the glob matchers; M1-31: `check`…`search_glob_hit` and the normalizer). Keep each edit to the comparison line, and list every `deny.rs` hunk in the handoff, so the merges can be checked with `git merge-tree`.
