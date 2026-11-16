@@ -53,3 +53,6 @@ Plus every minor and nit still open in the reviews of tasks merged before D-120 
 - [ ] Show your new tests (and the un-ignored ones) fail on `dev`'s code and pass now: check out `dev`'s versions of the src files you changed, run, restore.
 - [ ] `git diff dev --stat` touches only your owned paths.
 - [ ] Handoff `docs/agents/handoffs/M1-28-ansi-c-words.md`: what changed and where, a verdict table (dev vs now) for every line you tested, ordinary-line checks, the outputs, anything escalated.
+
+## Added scope (D-120, from M1-30; orchestrator, 2026-11-16)
+- **M1-13 finding 11 in `adversarial_fuzz.rs`** (`random_spellings_of_sensitive_paths_are_always_hard_denied`, `#[ignore = "M1-13 finding 11"]` at ~422): its `shape_pick == 8` builds `cd <glob>; <reader> <file>`, and the fix is in `words.rs` `cd_effect` (~628). M1-30 can't reach it, because that is outside its paths. Owned paths widen to `cd_effect` and to removing that `#[ignore]`. A `cd` into a glob that could reach a credential or Atrium folder must leave the reader's file judged as if it were under every folder the glob can match; fail closed (Ask, or hard deny where the plain path is hard-denied), never Allow.
