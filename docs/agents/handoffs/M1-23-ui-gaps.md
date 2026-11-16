@@ -137,7 +137,7 @@ Branch: `agent/opus/M1-23-ui-gaps`, cut from `dev` at `4bf9874e`. Worker: Claude
 - `thread-menu`, `thread-rename`, `confirm-archive`;
 - `enforcement-badge`, `enforcement-details`;
 - `inbox-batch-selected`, `inbox-batch-result`;
-- `settings-rule-editor`, `settings-rule-editor-refused`, `settings-security`;
+- `settings-rule-editor`, `settings-rule-editor-refused`, `settings-rule-editor-shell-refused` (round 2), `settings-security`;
 - `palette-this-chat`.
 
 To regenerate them: `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock python3 app/scripts/screenshots.py docs/agents/handoffs/M1-23-ui-gaps gaps` (the first argument is the output folder; corrected in round 2). They come from `app/src/gap-shots.ts`.
@@ -210,3 +210,54 @@ That run also writes a `gaps.log` there, which should be deleted.
 - The screenshots above.
 - Linux build of `save.rs` (CI or a Linux machine).
 - The two escalations.
+
+## Round 3 (D-116): fail-closed rule check, Inbox targeting
+
+Review: `docs/agents/reviews/M1-23-ui-gaps-round2.md`. Commits:
+- `1761ff6d`: the code;
+- the commit with this section: the screenshots, refreshed.
+
+| # | Finding | Result | What changed |
+|---|---|---|---|
+| 1 | Blocker: `commandRisk` spellings | Fixed, fail closed | See "How the check reads a command" below. |
+| 2 | Blocker: A/D/X on the wrong thread | Fixed | New `keyTargets` in `batch.ts`, shared by A, D and X. With focus in an approval card, they act on that card only, and only if it can still be answered; otherwise nothing happens, with no fallback to another card or another chat. With no card focused, A and D act on the picked chat's first approval, and X on all of that chat's approvals. Each row's `onFocusIn` sets `inboxPick`, so focus and pick are always in the same row. J and K move the pick and put focus back on the list. |
+| 3 | Major: path limit on non-file kinds | Fixed | `pathScopeOffered`: allow rules only, and only for path globs (always a file kind) or `any` of a `PATH_KINDS` kind. Web requests, MCP and other calls get no limit. |
+| 4 | Minor: `SAVE_MESSAGE` on Linux | Fixed | It now has `#[cfg(target_os = "macos")]`. |
+| 5a | Minor: glob classes | **Checked against globset; kept** | A temporary probe test built each glob with globset 0.4.21 (the engine's version), then was deleted and not committed. Results: `[a-z-_]` and `[a-z-0]` fail ("invalid range; 'a' > '_'"); `[\]`, `[\]]`, `[a-c-e]`, `[a-c-b]` and `[a\-z]` build; `[\` fails ("unclosed character class"). The round-2 checker already matched all of that. The review's fix would refuse `[\]`, which globset accepts, and accept `[a-z-_]`, which globset refuses. Tests now pin the probed results, and the code comment cites them. |
+| 5b | Minor: line breaks, brace depth | Fixed | `splitCommand` refuses `\n` and `\r` anywhere, quoted or not. New `expandsBraces` follows `shell.rs`'s scan: depth counting, a `,` or `..` at depth 1, stop at a blank or an operator, 256-character cap. So `echo {{a},b}` is refused, and `{}`, `{a}` and `{{a}}` stay allowed. |
+
+### How the check reads a command (`rule-form.ts` `commandRisk`, allow rules only)
+- **Names are folded** with `foldName`: the basename, lowercased (which also turns U+212A into `k`), then `ſ` to `s`, as `deny.rs` `lower` does. Every table is a `Set` or a `Map`, so names such as `constructor` and `__proto__` no longer crash it.
+- **Refused for both prefix and exact rules:**
+  - Shells, `eval`/`source`/`.`, and every wrapper, now including `sudoedit` and `run0` from `deny.rs` `PRIV`.
+  - For interpreters (`deny.rs` `is_interpreter`: `python*`, perl, ruby, node, deno, bun, php, lua, osascript, pwsh), any single-dash option word that holds a code-flag letter anywhere, compared case-insensitively. That covers attached code (`-c'…'`), digit clusters (`-0777ne`) and `-Ic`.
+  - Long code flags, with or without `=`, in any case.
+  - `eval` or `repl` as the first word that isn't an option (`deno -q eval`, `bun eval`).
+  - `-` as an operand (code from stdin).
+  - PowerShell (`pwsh`, `powershell`, also with `.exe`) given `-c`, `-e`, `-ec`, `-cwa`, or any prefix of `command`, `encodedcommand` or `commandwithargs`, written with `-`, `--` or `/`. Without a named `.ps1`, PowerShell is refused too, because Windows PowerShell reads bare words as a command.
+  - `npx`-style runners given `-c` or `--call`, and `find` with `-exec`, `-execdir`, `-ok` or `-okdir` (folded).
+- **Refused for prefix rules only:**
+  - An interpreter or package runner unless the script or package comes **right after the command**, with no option before it. For deno and bun, "right after" means after a verb such as `run`. An interpreter reads its own options only before the script, so words added after it go to the script. An option before the script could take code added later: `python3 -W ignore` would cover `python3 -W ignore -c …`. So `python3 -u build.py` and `npx -y prettier` work as exact rules only.
+  - Any prefix rule on `find`, because it would also cover `-exec` or `-delete` added later. The error points to "This exact command".
+- **Fail closed:** a code-flag letter after the script also refuses the rule (`perl tool.pl -e`).
+- **Warned:** an allowed interpreter or runner rule, remote runners, and an exact `find … -delete`.
+- The error texts say what to write instead, and the field's hint mentions putting the script right after the command.
+
+### Escalated (not changed)
+- **`shell.rs` matches shell and wrapper names case-sensitively.** `/bin/BASH -c '…'`, `Bash`, `ENV` and `/bin/baſh` aren't read as a shell or wrapper, so their payloads are never lexed. This holds even without any rule, and APFS resolves those names to the same binaries. The engine should fold names the way `deny.rs` `lower` does.
+- **Daemon-side `CreateRule` guard.** This is unchanged from round 2: the daemon accepts any draft, so other clients on the socket can create the rules the UI refuses.
+- **Round 2's engine escalations still stand:** the path-scope `all`/cwd behaviour, and derived `find -exec` units not being checked against allow rules.
+
+### Definition of done (round 3)
+| Command | Result |
+|---|---|
+| `pnpm typecheck`, `pnpm build` | pass |
+| `pnpm test` | pass: 19 files, 350 tests (338 before). New tests cover every spelling in the review plus case and APFS variants, `Object.prototype` names, PowerShell prefixes, the prefix-needs-a-script rule, `keyTargets` (focus on another row's card, a focused card that can't be answered, no focus), line breaks, nested braces, and the probed globset results. |
+| `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `cargo test -p atrium-app --no-fail-fast` | pass: 47 + 2 |
+| `m1_demo.py` under the GUI lock, 3 runs in a row | **27/27, 27/27, 27/27**. Step 11 now also checks that focusing a row's checkbox picks that row, and that J from a checkbox moves the pick and focus to the list; X then toggles only the newly picked row. |
+| Screenshots | **Refreshed** (the screen was unlocked): all 22, light and dark, under `docs/agents/handoffs/M1-23-ui-gaps/`, including the new `settings-rule-editor-shell-refused-*`. `settings-rule-editor-*` no longer has the path field. `gaps.log` deleted. This replaces round 2's "not refreshed" note. |
+
+### Left open
+- The Linux build of `save.rs` (CI or a Linux machine).
+- The escalations above.
