@@ -941,6 +941,10 @@ fn round_5_blocker_1_searches_and_walkers_reaching_a_folder_linked_into_ssh() {
     );
     // listing stays ordinary (M1-03 finding 5), and so does a glob that only
     // names the linked folder itself
+    let empty_outside = Tmp::new();
+    std::fs::remove_dir_all(&empty_outside.home).unwrap();
+    let cd_empty_outside = format!("cd {} && rg x", empty_outside.root.display());
+    let find_empty_outside = format!("find {} -name x", empty_outside.root.display());
     let g = t.gate(Preset::Home, vec![]);
     for line in [
         "ls vault/work",
@@ -951,8 +955,8 @@ fn round_5_blocker_1_searches_and_walkers_reaching_a_folder_linked_into_ssh() {
         "cat vault/*.txt",
         "cp vault/notes.txt /tmp/n",
         "rg x vault/notes.txt",
-        "cd /tmp && rg x",
-        "find /tmp -name x",
+        cd_empty_outside.as_str(),
+        find_empty_outside.as_str(),
         "ls vault/w*",
     ] {
         let d = block_on(g.gate.check(&cmd_check(line)));
