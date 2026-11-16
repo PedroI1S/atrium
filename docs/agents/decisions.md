@@ -634,3 +634,12 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 **The review.** Gemini 4 Argon `high`, read-only. Author and reviewer are both Gemini models, a recorded exception to cross-provider review (PLAN §8), Pedro's call. This also lifts D-015's pause on Argon for this review.
 
 **Known constraint (D-074).** The `agy` policy refuses credential paths as literals. If a test can't be written for that reason, the worker lists the exact line and expected verdicts in its handoff, and the orchestrator (Claude) adds those tests before the merge.
+
+## D-102 — 2026-11-16 — Pedro: land the font preload for now
+**Decided by Pedro (driver):** "lets keep it for now, we can drop it later if the gaps is still this small".
+- **What landed.** The five `<link rel="preload">` lines from M1-14b's report (`docs/spikes/M1-linux-checks.md`) are in `app/index.html`, before `boot.js`. The orchestrator landed them.
+- **Checked.** `pnpm build` maps them to the same five hashed font files the CSS uses, with no duplicates. Typecheck passes and the 264 app tests pass.
+- **What the measurements showed.**
+  - Linux: −57 ms median TTI, the reason to keep it.
+  - macOS (`docs/spikes/M1-macos-checks.md`): no measurable gain, within ±6 ms on a busy machine.
+- **Revisit:** drop it later if a quiet re-measure still shows a gap this small.

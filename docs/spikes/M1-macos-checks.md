@@ -44,4 +44,4 @@ Interleaved runs: 3 rounds × 10 warm launches each, of the binaries `atrium-hea
 
 - **Rounds 1 and 2 are within ±6 ms of each other.**
 - **Round 3's gap comes from the load, not the preload.** Head was measured while the load average jumped to 14, and preload ran after the peak.
-- **Conclusion:** on macOS the font preload makes no difference to TTI that this machine can measure. A quiet re-run would only firm this up. It's Pedro's decision whether to keep the preload (open item D-041 / font preload).
+- **Conclusion:** on macOS the font preload makes no difference to TTI that this machine can measure. A quiet re-run would only firm this up. **Decision D-102:** Pedro kept it for now, for Linux's gain, and it has landed in `app/index.html`. It can be dropped later if a quiet re-run still shows a gap this small.
