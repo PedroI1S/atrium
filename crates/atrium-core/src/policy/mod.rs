@@ -17,10 +17,12 @@ mod deny;
 mod engine;
 mod gate;
 mod ledger;
+pub mod rule_check;
 mod shell;
 mod words;
 
 pub use gate::{RulesSource, SessionGateConfig, StoreRules, fs_resolve};
+pub use rule_check::{command_allow_risk, fold_name, validate_rule_draft};
 
 /// Canonical bytes of a tool call's input for binding approvals: JSON with
 /// object keys sorted, no insignificant whitespace, numbers as serde_json

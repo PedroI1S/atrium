@@ -18,7 +18,7 @@ use atrium_core::{
 use atrium_host::lifecycle;
 use atrium_protocol::agent::SessionCommand;
 use atrium_protocol::limits::REPLAY_PAGE_EVENTS;
-use atrium_protocol::policy::{Preset, Rule, RuleDraft, RuleId, RuleMatcher, RuleOrigin};
+use atrium_protocol::policy::{Preset, Rule, RuleDraft, RuleId, RuleOrigin};
 use atrium_protocol::thread::{Location, ThreadId, ThreadSummary};
 use atrium_protocol::wire::{
     AgentLaunch, DaemonCommand, ErrorCode, EventId, ExportFormat, ProviderProbe, StoredEvent,
@@ -607,10 +607,8 @@ async fn probe(inner: &Arc<Inner>, preset: Preset) -> Result<Value, Failure> {
 }
 
 async fn create_rule(inner: &Arc<Inner>, draft: RuleDraft) -> Result<Value, Failure> {
-    if let RuleMatcher::CommandPrefix { argv } | RuleMatcher::CommandExact { argv } = &draft.matcher
-        && argv.is_empty()
-    {
-        return Err(failure(ErrorCode::Invalid, "the rule's command is empty"));
+    if let Err(reason) = atrium_core::policy::validate_rule_draft(&draft) {
+        return Err(failure(ErrorCode::Invalid, reason));
     }
     let now = now_ms();
     let rule = Rule {

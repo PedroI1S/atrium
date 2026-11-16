@@ -12,6 +12,7 @@ use globset::GlobBuilder;
 
 use super::DefaultPolicy;
 use super::deny::{self, Analysis, Sensitive};
+use super::rule_check;
 use super::shell::Unit;
 use crate::{PolicyEngine, PolicyInput, PolicyVerdict};
 
@@ -30,17 +31,49 @@ fn glob_matches(glob: &str, p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Every path the call names, ours and the gate's, plus the cwd of a command.
+fn looks_like_path(w: &str) -> bool {
+    if w.is_empty() || w.contains(char::is_whitespace) || w.contains('\0') {
+        return false;
+    }
+    w.starts_with(['/', '~'])
+        || w == "."
+        || w == ".."
+        || w.starts_with("./")
+        || w.starts_with("../")
+        || w.starts_with("$HOME")
+        || w.starts_with("${HOME}")
+        || w.starts_with("$PWD")
+        || w.starts_with("${PWD}")
+        || (w.contains('/') && !w.contains("://"))
+        || (w.starts_with('.') && w.len() > 1 && !w.starts_with(".."))
+}
+
+fn is_command_path(a: &Analysis, u: &super::words::Use) -> bool {
+    if u.unit == usize::MAX {
+        return true;
+    }
+    if a.units.get(u.unit).is_some_and(|unit| {
+        unit.seg
+            .redirects
+            .iter()
+            .any(|r| r.op != super::RedirectOp::Dup && r.target == u.word)
+    }) {
+        return true;
+    }
+    looks_like_path(&u.word)
+}
+
+/// Every path the call names, ours and the gate's (without the working folder
+/// or command words that aren't paths).
 fn all_paths(input: &PolicyInput<'_>, a: &Analysis) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = vec![];
-    for idx in 0..a.uses.len() {
-        v.extend(a.all_paths(idx).into_iter().cloned());
+    for (idx, u) in a.uses.iter().enumerate() {
+        if is_command_path(a, u) {
+            v.extend(a.all_paths(idx).into_iter().cloned());
+        }
     }
-    if a.aligned.is_none() {
+    if a.aligned.is_none() && a.uses.is_empty() {
         v.extend(input.resolved_paths.iter().cloned());
-    }
-    if matches!(input.check.subject, ToolSubject::Command { .. }) {
-        v.push(a.start.clone());
     }
     v
 }
@@ -64,7 +97,10 @@ fn scope_rank(r: &Rule, input: &PolicyInput<'_>) -> Option<u8> {
 fn path_scope_ok(rule: &Rule, paths: &[PathBuf]) -> bool {
     match &rule.path_scope {
         None => true,
-        Some(g) => !paths.is_empty() && paths.iter().all(|p| glob_matches(g, p)),
+        Some(g) => match rule.decision {
+            RuleDecision::Allow => !paths.is_empty() && paths.iter().all(|p| glob_matches(g, p)),
+            RuleDecision::Deny => paths.iter().any(|p| glob_matches(g, p)),
+        },
     }
 }
 
@@ -112,16 +148,61 @@ fn deny_matches(rule: &Rule, input: &PolicyInput<'_>, a: &Analysis, paths: &[Pat
     }
 }
 
-/// Which parts (segments, or the whole call) an allow rule covers.
+fn rule_covers_argv(
+    rule: &Rule,
+    argv: &[String],
+    has_derived: bool,
+    for_wrapper_eff: bool,
+) -> bool {
+    if argv.is_empty() {
+        return false;
+    }
+    if for_wrapper_eff
+        && (rule_check::is_wrapper(&argv[0]) || rule_check::is_shell_or_runs_here(&argv[0]))
+    {
+        return false;
+    }
+    match &rule.matcher {
+        RuleMatcher::CommandPrefix { argv: prefix } => {
+            if !prefix_of(argv, prefix) || rule_check::command_prefix_blocked(argv, prefix) {
+                return false;
+            }
+            if rule_check::is_find(&argv[0])
+                && !has_derived
+                && argv[1..].iter().any(|w| {
+                    matches!(
+                        w.to_lowercase().as_str(),
+                        "-exec" | "-execdir" | "-ok" | "-okdir"
+                    )
+                })
+            {
+                return false;
+            }
+            true
+        }
+        RuleMatcher::CommandExact { argv: exact } => {
+            !exact.is_empty()
+                && argv == exact.as_slice()
+                && !rule_check::command_exact_blocked(argv)
+        }
+        RuleMatcher::Any | RuleMatcher::PathGlob { .. } => false,
+    }
+}
+
+/// Which slots in `unit_ids` (or the whole call when `unit_ids` is empty) an
+/// allow rule covers. When `unit_ids` contains command units, `as_eff` selects
+/// `u.eff` (for wrapper targets) instead of `u.seg.argv`.
 fn allow_covers(
     rule: &Rule,
     input: &PolicyInput<'_>,
     a: &Analysis,
     paths: &[PathBuf],
-    part_ids: &[usize],
+    unit_ids: &[usize],
     glob_leaves: bool,
+    has_derived: bool,
+    as_eff: bool,
 ) -> Vec<bool> {
-    let n = part_ids.len().max(1);
+    let n = unit_ids.len().max(1);
     let none = vec![false; n];
     if !name_matches(rule, input) || matches!(input.check.subject, ToolSubject::Unknown) {
         return none;
@@ -132,7 +213,7 @@ fn allow_covers(
     }
     let command = matches!(input.check.subject, ToolSubject::Command { .. });
     // an uncertain cwd: only `Any` covers it (contract §9: the line asks)
-    let simple = command && a.reasons.is_empty() && !part_ids.is_empty() && !a.cwd_uncertain;
+    let simple = command && a.reasons.is_empty() && !parts(a).is_empty() && !a.cwd_uncertain;
     if rule.path_scope.is_some() && command && !simple {
         return none;
     }
@@ -141,27 +222,18 @@ fn allow_covers(
     }
     match &rule.matcher {
         RuleMatcher::Any => vec![true; n],
-        RuleMatcher::CommandPrefix { argv } => {
-            if !simple {
+        RuleMatcher::CommandPrefix { .. } | RuleMatcher::CommandExact { .. } => {
+            if !simple || unit_ids.is_empty() {
                 return none;
             }
-            part_ids
+            unit_ids
                 .iter()
                 .map(|&i| {
                     let u = &a.units[i];
-                    u.seg.assignments.is_empty() && harmless(u) && prefix_of(&u.seg.argv, argv)
-                })
-                .collect()
-        }
-        RuleMatcher::CommandExact { argv } => {
-            if !simple || argv.is_empty() {
-                return none;
-            }
-            part_ids
-                .iter()
-                .map(|&i| {
-                    let u = &a.units[i];
-                    u.seg.assignments.is_empty() && harmless(u) && u.seg.argv == *argv
+                    let argv = if as_eff { &u.eff } else { &u.seg.argv };
+                    u.seg.assignments.is_empty()
+                        && harmless(u)
+                        && rule_covers_argv(rule, argv, has_derived, as_eff)
                 })
                 .collect()
         }
@@ -188,13 +260,40 @@ fn apply_rules(
     glob_leaves: bool,
 ) -> RuleOutcome {
     let paths = all_paths(input, a);
-    let part_ids = if matches!(input.check.subject, ToolSubject::Command { .. }) {
-        parts(a)
+    let command = matches!(input.check.subject, ToolSubject::Command { .. });
+    let part_ids = if command { parts(a) } else { vec![] };
+    let derived_ids: Vec<usize> = if command {
+        a.units
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| u.derived)
+            .map(|(i, _)| i)
+            .collect()
     } else {
         vec![]
     };
+    let wrapper_eff_ids: Vec<usize> = if command {
+        a.units
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| {
+                u.eff != u.seg.argv
+                    || u.seg
+                        .argv
+                        .first()
+                        .is_some_and(|f| rule_check::is_wrapper(f))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        vec![]
+    };
+    let has_derived = !derived_ids.is_empty();
     let n = part_ids.len().max(1);
     let mut covered = vec![false; n];
+    let mut top_non_cmd = vec![false; n];
+    let mut derived_covered = vec![false; derived_ids.len()];
+    let mut eff_covered = vec![false; wrapper_eff_ids.len()];
     let mut allow_rule: Option<RuleId> = None;
     let mut any_allow = false;
     for rank in 0..3u8 {
@@ -202,7 +301,10 @@ fn apply_rules(
             .iter()
             .filter(|r| scope_rank(r, input) == Some(rank))
             .collect();
-        if !covered.iter().all(|c| *c)
+        let all_done = covered.iter().all(|c| *c)
+            && derived_covered.iter().all(|c| *c)
+            && eff_covered.iter().all(|c| *c);
+        if !all_done
             && let Some(r) = ranked
                 .iter()
                 .find(|r| r.decision == RuleDecision::Deny && deny_matches(r, input, a, &paths))
@@ -218,19 +320,73 @@ fn apply_rules(
             };
         }
         for r in ranked.iter().filter(|r| r.decision == RuleDecision::Allow) {
-            let c = allow_covers(r, input, a, &paths, &part_ids, glob_leaves);
+            let c = allow_covers(
+                r,
+                input,
+                a,
+                &paths,
+                &part_ids,
+                glob_leaves,
+                has_derived,
+                false,
+            );
             let is_any = matches!(r.matcher, RuleMatcher::Any)
                 && r.path_scope.is_none()
                 && !c.is_empty()
                 && c.iter().all(|hit| *hit);
+            let is_non_cmd = matches!(r.matcher, RuleMatcher::Any | RuleMatcher::PathGlob { .. });
             if is_any {
                 any_allow = true;
             }
-            for (slot, hit) in covered.iter_mut().zip(c) {
-                if hit && !*slot {
+            for (k, (slot, hit)) in covered.iter_mut().zip(&c).enumerate() {
+                if *hit && !*slot {
                     *slot = true;
+                    if is_non_cmd {
+                        top_non_cmd[k] = true;
+                    }
                     allow_rule.get_or_insert_with(|| r.id.clone());
                 }
+            }
+            if !derived_ids.is_empty() {
+                let dc = allow_covers(
+                    r,
+                    input,
+                    a,
+                    &paths,
+                    &derived_ids,
+                    glob_leaves,
+                    has_derived,
+                    false,
+                );
+                for (slot, hit) in derived_covered.iter_mut().zip(dc) {
+                    if hit && !*slot {
+                        *slot = true;
+                    }
+                }
+            }
+            if !wrapper_eff_ids.is_empty() {
+                let ec = allow_covers(
+                    r,
+                    input,
+                    a,
+                    &paths,
+                    &wrapper_eff_ids,
+                    glob_leaves,
+                    has_derived,
+                    true,
+                );
+                for (slot, hit) in eff_covered.iter_mut().zip(ec) {
+                    if hit && !*slot {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+    }
+    if !derived_covered.iter().all(|c| *c) || !eff_covered.iter().all(|c| *c) {
+        for (slot, &non_cmd) in covered.iter_mut().zip(&top_non_cmd) {
+            if !non_cmd {
+                *slot = false;
             }
         }
     }
@@ -544,6 +700,9 @@ const GIT_CRED_SUFFIXES: &[&str] = &[
     ".cargo/credentials.toml",
     ".config/git/credentials",
     ".azure/accesstokens.json",
+    ".gem/credentials",
+    ".terraform.d/credentials.tfrc.json",
+    ".config/op/config",
 ];
 const GIT_CRED_NAMES: &[&str] = &[
     ".netrc",
@@ -554,6 +713,8 @@ const GIT_CRED_NAMES: &[&str] = &[
     ".pgpass",
     ".vault-token",
     ".env",
+    ".yarnrc.yml",
+    "credentials.tfrc.json",
     ".bash_history",
     ".zsh_history",
     ".zhistory",
