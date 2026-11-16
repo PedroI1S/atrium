@@ -441,3 +441,72 @@ Using `dev`'s verdicts from `.orchestration/review-input/M1-18-policy-followup-r
   - Run 3: `adversarial_fuzz` `13.78s`; `policy` `3.81s`; `adversarial_m1_18` `2.04s`; `store` `37.01s`.
 - `cargo test -p atrium-core --test adversarial_m1_18 fix4_finding3 -- --nocapture`: `0.02s` (3 evaluations).
 
+## Fix round 5 (D-115)
+
+Worker: Gemini 4 Hydrogen (high effort). Closed all three findings (1, 2, 3) from Argon's round-5 review (`.orchestration/review-input/M1-18-policy-followup-round5.md` on `a702441`) with 0 lines more permissive than `dev`, 0 false hard denies on ordinary lines, and 0 regressions on ordinary globs/commands.
+
+### Changes by item
+
+1. **Finding 1 — `**` and `..` collapsing whenever normalization brings them together (`crates/atrium-core/src/policy/deny.rs`):**
+   - Moved `**` + `..` handling directly into `normalize_glob_variants` via `apply_dotdot` and collapsed consecutive `**` segments in `normalize_glob_variants`.
+   - Whenever `".."` meets `Some("**")` on the normalized stack (after dropping `.` and empty segments, popping `literal/..`, or branching on `wildcard/..`), `apply_dotdot` emits all three semantic cases:
+     1. `**` matches `>= 2` segments (absorbs `..`, keeps `**`);
+     2. `**` matches `1` segment (`..` cancels `**`, popping `**`);
+     3. `**` matches `0` segments (pops `**` and recursively applies `..` via `apply_dotdot` to what preceded `**`).
+   - Removed `globstar_variants` and `drop_globstar` from `expand_glob_candidates`: every `**/..` interaction (including `**/./../.ssh/id_rsa`, `**//../.ssh/id_rsa`, `**/sub/../../.ssh/id_rsa`, `**/x*/../../.ssh/id_rsa`, `**/./././..`, `**/a/b/../../..`, `**/x*/y*/../../..`) is now resolved uniformly inside `normalize_glob_variants` without doubling every `**` candidate upfront.
+
+2. **Finding 2 — `env -C` paired with separate `-S` argument tail (`crates/atrium-core/src/policy/shell.rs`):**
+   - In `expand_unknown_env_cmd`, added `with_tail(tail, s)` which appends the single-quoted tail words `&a[tail..]` to `s` whenever `tail < a.len()`.
+   - Updated both payload-building loops over `split_vals` in `expand_unknown_env_cmd` to use `with_tail(*tail, s)`:
+     - the standalone `split_vals` `payloads` push (handling `-S 'cd .. && sh -c' 'cat .ssh/id_rsa'`), and
+     - the `chdir_vals` × `split_vals` pairing loop (producing `"cd '..' && sh -c 'cat .ssh/id_rsa'"` for `-C .. -S 'sh -c' 'cat .ssh/id_rsa'` and all `--chdir` / `--split-string` / `-iS` / `-vS` / attached / separate combinations).
+
+3. **Finding 3 (nit) — Separate variant budget for unjoined and root-joined search forms (`crates/atrium-core/src/policy/deny.rs`):**
+   - In `search_variants_from_cands`, tracked `unjoined_norm` and `joined_norm` independently against `MAX_GLOB_VARIANTS = 256` (instead of counting `1 + R` against a single 256 cap or truncating `out.len()` at 256).
+   - Combined with removing the 2x `drop_globstar` duplication in `expand_glob_candidates`, ordinary globs up to `MAX_BRACE_RESULTS = 256` expansions (`{1..64}{a,b}.rs`, `{1..64}{a,b}/**/*.rs`, `{{1..64}{a,b},extra}.rs`, `{{1..32}{a,b},extra}/**/*.rs`, `{{1..64}{a,b},extra}/**/*.rs`, `{1..64}{a,b,c,d}/**/*.rs`) stay within budget and keep `dev`'s `["Allow", "Allow", "Allow"]`. Globs exceeding 256 braces or 256 normalized variants (`{{1..64}{a,b,c,d},extra}.rs`, `{{1..64}{a,b,c,d},extra}/**/*.rs`) still fail closed to `["Ask", "Ask", "Ask"]`.
+
+### Tests (`crates/atrium-core/tests/adversarial_m1_18.rs`)
+
+- `fix5_finding1_globstar_and_parent_after_normalization`: all 8 evidence lines from Finding 1 (`Hard(credential-read)` across Home / Any / FullAccess), 3 CR-12 store/tree globs via `**` + normalization + `..` (`Ask / Allow / Allow`), and the 6 extra spellings (`**/./././..`, `**/a/b/../../..`, `**/x*/y*/../../..` and their `.ssh/id_rsa` counterparts).
+- `fix5_finding2_env_chdir_with_separate_split_string`: all 8 evidence lines from Finding 2 plus `--chd .. --spl`, `-S sh -c 'cat .ssh/id_rsa'`, `-S 'cd .. && sh -c' 'cat .ssh/id_rsa'`, `sudo id` (`H_PE`), and `rm -rf ~` (`H_RD`).
+- `fix5_finding3_glob_variant_budget`: `{1..64}{a,b}.rs`, `{1..64}{a,b}/**/*.rs`, `{{1..64}{a,b},extra}.rs`, `{1..32}{a,b}/**/*.rs`, `{{1..32}{a,b},extra}/**/*.rs`, `{{1..64}{a,b},extra}/**/*.rs`, `{1..64}{a,b,c,d}/**/*.rs` -> `["Allow", "Allow", "Allow"]`; `{{1..64}{a,b,c,d},extra}.rs` and `{{1..64}{a,b,c,d},extra}/**/*.rs` -> `["Ask", "Ask", "Ask"]`.
+- `fix5_ordinary_lines_keep_devs_verdict`: `**/*.rs`, `src/**/./mod.rs`, `**/../sibling/*.rs` from `~/proj` (`Ask / Allow / Allow`), `{1..50}{a,b}/x*/../foo` from `~` (`Allow / Allow / Allow`), and `cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -C .. -S 'cargo test' --lib` (`Ask / Ask / Allow / Allow`).
+- Updated `F1b-asym` in `fix4_finding1_reentering_globs_and_search_overflow` to `Search ["/"]` `**/{1..50}{a,b}/../../foo` (`200 <= 256` in `glob_escape`, `300 > 256` unjoined in `glob_search` -> `["Ask", "Ask", "Ask"]`), since `{1..50}{a,b}/x*/../foo` is now `200 <= 256` in both budgets and returns `["Allow", "Allow", "Allow"]` like `dev`.
+- Verified against `a702441`'s unmodified `crates/atrium-core/src/policy/{deny,shell}.rs` via `git restore --source=a702441` (and restored `HEAD` immediately after): all 4 `fix5_*` tests failed on `a702441` and all 37 tests in `adversarial_m1_18` pass now.
+
+### Comparison with `dev` (fix round 5)
+
+Using `dev`'s verdicts from `.orchestration/review-input/M1-18-policy-followup-round5.md`: **0 lines more permissive than `dev`**, **0 false hard denies on ordinary lines**, **0 regressions on ordinary globs/commands**.
+
+| Item | Input | `dev` | `a702441` | Fix round 5 |
+|---|---|---|---|---|
+| F1 | `Search ["~"]` `**/./../.ssh/id_rsa` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1 | `Search ["~"]` `**/./../.ssh/id_rsa` (`rec=true`) | `Ask / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1 | `Search ["~"]` `**//../.ssh/id_rsa` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1 | `Search ["~"]` `**/sub/../../.ssh/id_rsa` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1 | `Search ["~"]` `**/x*/../../.ssh/id_rsa` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1 | `Search ["~"]` `**/./../.aws/credentials` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1 | `Search ["~"]` `**/./../.npmrc` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1 | `Search ["~/proj"]` `**/./../../.ssh/id_rsa` (`rec=true`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F1 | `Search ["~"]` CR-12 stores (`**/./../.cargo/credentials.toml`, `**//../.pypirc`, `**/sub/../../.zsh_sessions/*.session`, `rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `Ask / Allow / Allow` |
+| F1 | `Search ["~/proj"]` `**/./././..`, `**/a/b/../../..`, `**/x*/y*/../../..` (`rec=true`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `Ask / Allow / Allow` |
+| F1 | `Search ["~/proj"]` `**/./././../.ssh/id_rsa`, `**/a/b/../../../.ssh/id_rsa`, `**/x*/y*/../../../.ssh/id_rsa` (`rec=false`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `CR / CR / CR` |
+| F2 | `cwd=proj\|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -C .. -S 'sh -c' 'cat .ssh/id_rsa'` (and `--chdir .. --split-string`, `--chdir=.. -S`, `-C.. -S`, `-C .. -iS`, `-C .. -vS`, `-C .. -S'sh -c'`, `-C .. --split-string='sh -c'`, `--chd .. --spl`, `-C .. -S sh -c`, `-S 'cd .. && sh -c'`) | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `CR / CR / CR / CR` |
+| F2 | `cwd=proj\|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -C .. -S 'sh -c' 'sudo id'` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `PE / PE / PE / PE` |
+| F2 | `cwd=proj\|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -C .. -S 'sh -c' 'rm -rf ~'` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `RD / RD / RD / RD` |
+| F3 | `Search ["~/proj"]` `{1..64}{a,b}.rs`, `{1..64}{a,b}/**/*.rs`, `{{1..64}{a,b},extra}.rs`, `{1..32}{a,b}/**/*.rs`, `{{1..32}{a,b},extra}/**/*.rs`, `{{1..64}{a,b},extra}/**/*.rs`, `{1..64}{a,b,c,d}/**/*.rs` (`rec=true`) | `Allow / Allow / Allow` | `Ask / Ask / Ask` (except `{1..64}{a,b}.rs`, `{1..32}{a,b}/**/*.rs`) | `Allow / Allow / Allow` |
+| F3 | `Search ["~/proj"]` `{{1..64}{a,b,c,d},extra}.rs`, `{{1..64}{a,b,c,d},extra}/**/*.rs` (`rec=true`) | `Allow / Allow / Allow` | `Ask / Ask / Ask` | `Ask / Ask / Ask` |
+| Ord | `Search ["~/proj"]` `**/*.rs`, `src/**/./mod.rs` (`rec=true`); `Search ["~"]` `{1..50}{a,b}/x*/../foo` (`rec=false`) | `Allow / Allow / Allow` | `Allow` (`{1..50}...`: `Ask`) | `Allow / Allow / Allow` |
+| Ord | `Search ["~/proj"]` `**/../sibling/*.rs` (`rec=true`) | `Allow / Allow / Allow` | `Ask / Allow / Allow` | `Ask / Allow / Allow` |
+| Ord | `cwd=proj\|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -C .. -S 'cargo test' --lib` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` | `Ask / Ask / Allow / Allow` |
+
+### Fix round 5 DoD outputs
+
+- `cargo fmt --all --check`: exit `0`.
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit `0` (0 warnings).
+- `cargo test --workspace --no-fail-fast`: exit `0` (all crates and doc-tests passed; an earlier run had a single transient timing failure in `atrium-host --test supervise::terminate_blocking_kills_a_leader_that_left_its_group`, and the subsequent full `cargo test --workspace --no-fail-fast` passed cleanly).
+- `cargo test -p atrium-core --no-fail-fast -- --quiet` (3 runs in a loop): exit `0` across all 3 runs (`adversarial_m1_18`: 37 passed, 0 failed, 0 ignored):
+  - Run 1: `adversarial_fuzz` `13.88s` (`2 passed; 0 failed; 1 ignored`); `policy` `3.83s` (`44 passed; 0 failed; 0 ignored`); `adversarial_m1_18` `2.05s`; `store` `37.15s`.
+  - Run 2: `adversarial_fuzz` `13.98s`; `policy` `3.83s`; `adversarial_m1_18` `3.37s`; `store` `44.16s`.
+  - Run 3: `adversarial_fuzz` `19.78s`; `policy` `5.56s`; `adversarial_m1_18` `4.30s`; `store` `47.56s`.
+
