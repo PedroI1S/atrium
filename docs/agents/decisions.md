@@ -704,3 +704,6 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
   - `⌘⇧J`.
 
   Whether each lands in M1 or moves to M2 through a CR is Pedro's call. Also his: the Linux idle-memory gate, and the open S5/S7/S8/S11.
+
+## D-107 — 2026-11-16 — Pedro: M1-19 adds the drain wait before merging
+Pedro chose to add the Opus reviewer's optional fix before merging M1-19: in `kill_recorded`, when the recorded leader is gone, wait up to `GROUP_DRAIN_TIMEOUT` for the group to drain (no signal sent) before the single `group_is_empty` check. Verified still requires `ESRCH`. Hydrogen runs the fix round. Whatever N3 root cause 1 leaves after that stays a known fail-safe limit, measured on Linux by rodrigo (100+ runs). The orchestrator also sent M1-21 into a fix round on Hydrogen for the Sonnet review's findings, under D-104.
