@@ -492,3 +492,212 @@ fn gate_blocks_symlinks_into_credential_folders() {
         assert_eq!(d, GateDecision::Allow, "{line}: got {d:?}");
     }
 }
+
+fn eval_search_presets(env: &Env, check: &ToolCheck) -> [String; 3] {
+    let any_search = rule(
+        RuleScope::Global,
+        ToolKind::Search,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "any-search",
+    );
+    [
+        classify(&env.eval_check(check, &[], Preset::Home)),
+        classify(&env.eval_check(check, &[any_search], Preset::Home)),
+        classify(&env.eval_check(check, &[], Preset::FullAccess)),
+    ]
+}
+
+#[test]
+fn k10_400_star_dotdot_globs_stay_under_50ms_and_fail_closed_to_ask() {
+    let env = Env::home();
+    let ask3 = ["Ask".to_string(), "Ask".to_string(), "Ask".to_string()];
+
+    let star_dd = |n: usize| format!("{}{}", "*/".repeat(n), "../".repeat(n));
+    let star_dd_noslash = |n: usize| format!("{}..{}", "*/".repeat(n), "/..".repeat(n - 1));
+
+    let cases = [
+        ("400 */ + 400 ..", vec!["~/proj"], star_dd_noslash(400)),
+        ("400 */ + 400 ../", vec!["~/proj"], star_dd(400)),
+        ("500 */ + 500 ../", vec!["~"], star_dd(500)),
+        ("2000 */ + 2000 ../", vec!["~/proj"], star_dd(2000)),
+        (
+            "20000 */ + 20000 ../ (~100 KB)",
+            vec!["~/proj"],
+            star_dd(20_000),
+        ),
+        (
+            "400 */ + 400 ../.ssh/id_rsa",
+            vec!["~"],
+            format!("{}.ssh/id_rsa", star_dd(400)),
+        ),
+        (
+            "500 **/ + 500 ../",
+            vec!["~/proj"],
+            format!("{}{}", "**/".repeat(500), "../".repeat(500)),
+        ),
+        (
+            "200 */ + 200 ../ + 20000 a/ (work budget)",
+            vec!["~/proj"],
+            format!("{}{}", star_dd(200), "a/".repeat(20_000)),
+        ),
+        (
+            "256 brace * 400 segments (work budget)",
+            vec!["~/proj"],
+            format!("{{1..64}}{{a,b,c,d}}/{}", "a/".repeat(400)),
+        ),
+        (
+            "over MAX_BYTES (> 128 KiB)",
+            vec!["~/proj"],
+            "a".repeat(128 * 1024 + 1),
+        ),
+    ];
+
+    for (label, roots, glob) in cases {
+        let check = paths_check(ToolKind::Search, "Grep", &roots, true, Some(&glob));
+        let start = std::time::Instant::now();
+        let got = eval_search_presets(&env, &check);
+        let elapsed = start.elapsed();
+        assert_eq!(got, ask3, "{label}: expected Ask everywhere, got {got:?}");
+        assert!(
+            elapsed.as_millis() < 150,
+            "{label}: took too long (>50 ms per evaluate across 3 presets): {elapsed:?}"
+        );
+    }
+
+    let brackets = "[".repeat(100_000);
+    let bracket_check = paths_check(ToolKind::Search, "Grep", &["~/proj"], true, Some(&brackets));
+    let start = std::time::Instant::now();
+    let got_brackets = eval_search_presets(&env, &bracket_check);
+    let elapsed_brackets = start.elapsed();
+    assert_eq!(
+        got_brackets,
+        ["Ask".to_string(), "Allow".to_string(), "Allow".to_string()],
+        "100000 unclosed brackets: got {got_brackets:?}"
+    );
+    assert!(
+        elapsed_brackets.as_millis() < 150,
+        "100000 unclosed brackets took too long: {elapsed_brackets:?}"
+    );
+}
+
+#[test]
+fn k10_bounded_star_dotdot_globs_preserve_verdicts_and_stay_fast() {
+    let env = Env::home();
+    let allow3 = [
+        "Allow".to_string(),
+        "Allow".to_string(),
+        "Allow".to_string(),
+    ];
+    let ask_home3 = ["Ask".to_string(), "Allow".to_string(), "Allow".to_string()];
+    let ask3 = ["Ask".to_string(), "Ask".to_string(), "Ask".to_string()];
+    let cr3 = [
+        "Hard(credential-read)".to_string(),
+        "Hard(credential-read)".to_string(),
+        "Hard(credential-read)".to_string(),
+    ];
+
+    let star_dd = |n: usize| format!("{}{}", "*/".repeat(n), "../".repeat(n));
+
+    let t100 = std::time::Instant::now();
+    let got100 = eval_search_presets(
+        &env,
+        &paths_check(
+            ToolKind::Search,
+            "Grep",
+            &["~/proj"],
+            true,
+            Some(&star_dd(100)),
+        ),
+    );
+    assert_eq!(got100, allow3);
+    assert!(
+        t100.elapsed().as_millis() < 150,
+        "100 */ + 100 .. took {:?}",
+        t100.elapsed()
+    );
+
+    let t200 = std::time::Instant::now();
+    let got200 = eval_search_presets(
+        &env,
+        &paths_check(
+            ToolKind::Search,
+            "Grep",
+            &["~/proj"],
+            true,
+            Some(&star_dd(200)),
+        ),
+    );
+    assert_eq!(got200, allow3);
+    assert!(
+        t200.elapsed().as_millis() < 500,
+        "200 */ + 200 .. took {:?}",
+        t200.elapsed()
+    );
+
+    assert_eq!(
+        eval_search_presets(
+            &env,
+            &paths_check(
+                ToolKind::Search,
+                "Grep",
+                &["~/proj"],
+                true,
+                Some(&star_dd(255)),
+            ),
+        ),
+        allow3
+    );
+    assert_eq!(
+        eval_search_presets(
+            &env,
+            &paths_check(
+                ToolKind::Search,
+                "Grep",
+                &["~/proj"],
+                true,
+                Some(&star_dd(256)),
+            ),
+        ),
+        ask3
+    );
+    assert_eq!(
+        eval_search_presets(
+            &env,
+            &paths_check(
+                ToolKind::Search,
+                "Grep",
+                &["~"],
+                true,
+                Some(&format!("{}.ssh/id_rsa", star_dd(200))),
+            ),
+        ),
+        cr3
+    );
+    assert_eq!(
+        eval_search_presets(
+            &env,
+            &paths_check(
+                ToolKind::Search,
+                "Grep",
+                &["~"],
+                true,
+                Some(&format!("{}.cargo/credentials.toml", star_dd(100))),
+            ),
+        ),
+        ask_home3
+    );
+    assert_eq!(
+        eval_search_presets(
+            &env,
+            &paths_check(
+                ToolKind::Search,
+                "Grep",
+                &["~/proj"],
+                true,
+                Some(&format!("{}../*.rs", star_dd(100))),
+            ),
+        ),
+        ask_home3
+    );
+}

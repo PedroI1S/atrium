@@ -1647,12 +1647,14 @@ struct SearchRootSpec {
 struct SearchOpts {
     val_s: &'static str,
     val_l: &'static [&'static str],
+    extra_val_l: &'static [&'static str],
     pat_s: &'static str,
     pat_l: &'static [&'static str],
     opt_num_s: &'static str,
     opt_num_l: &'static [&'static str],
     eq_only_l: &'static [&'static str],
     bool_l: &'static [&'static str],
+    extra_bool_l: &'static [&'static str],
     long_prefixes: bool,
     always_recursive: bool,
     check_grep_recursion: bool,
@@ -1663,11 +1665,19 @@ struct SearchOpts {
     skip_parens: bool,
 }
 
+fn fold(s: &str) -> String {
+    if s.is_ascii() {
+        s.to_ascii_lowercase()
+    } else {
+        s.to_lowercase().replace('ſ', "s")
+    }
+}
+
 fn eq_folded(a: &str, lower_lit: &str) -> bool {
     if a.is_ascii() {
         a.eq_ignore_ascii_case(lower_lit)
     } else {
-        a.to_lowercase().replace('ſ', "s") == lower_lit
+        fold(a) == lower_lit
     }
 }
 
@@ -1678,7 +1688,9 @@ fn resolve_long_opt<'a>(name: &'a str, o: &SearchOpts) -> &'a str {
     let all = o
         .val_l
         .iter()
+        .chain(o.extra_val_l.iter())
         .chain(o.bool_l.iter())
+        .chain(o.extra_bool_l.iter())
         .chain(o.opt_num_l.iter())
         .chain(o.eq_only_l.iter())
         .chain(o.exec_l.iter())
@@ -1753,45 +1765,28 @@ fn parse_search_opts(args: &[String], o: &SearchOpts) -> Option<SearchRootSpec> 
             if o.check_grep_recursion && matches!(name, "recursive" | "dereference-recursive") {
                 recursive = true;
             }
-            if o.root_val_l.contains(&name) {
-                let v = match val_eq {
-                    Some(v) => Some(v.to_string()),
-                    None => {
-                        let next = args.get(i).cloned();
-                        if next.is_some() {
-                            i += 1;
-                        }
-                        next
-                    }
-                };
-                if let Some(v) = v {
-                    extra_roots.push(v);
-                }
-            } else if o.base_val_l.contains(&name) {
-                let v = match val_eq {
-                    Some(v) => Some(v.to_string()),
-                    None => {
-                        let next = args.get(i).cloned();
-                        if next.is_some() {
-                            i += 1;
-                        }
-                        next
-                    }
-                };
-                if let Some(v) = v {
-                    base_dirs.push(v);
-                }
-            } else if o.val_l.contains(&name) {
-                let val = match val_eq {
+            let take_long_val = |idx: &mut usize| -> Option<&str> {
+                match val_eq {
                     Some(v) => Some(v),
                     None => {
-                        let next = args.get(i).map(String::as_str);
+                        let next = args.get(*idx).map(String::as_str);
                         if next.is_some() {
-                            i += 1;
+                            *idx += 1;
                         }
                         next
                     }
-                };
+                }
+            };
+            if o.root_val_l.contains(&name) {
+                if let Some(v) = take_long_val(&mut i) {
+                    extra_roots.push(v.to_string());
+                }
+            } else if o.base_val_l.contains(&name) {
+                if let Some(v) = take_long_val(&mut i) {
+                    base_dirs.push(v.to_string());
+                }
+            } else if o.val_l.contains(&name) || o.extra_val_l.contains(&name) {
+                let val = take_long_val(&mut i);
                 if o.check_grep_recursion
                     && name == "directories"
                     && let Some(v) = val
@@ -1968,12 +1963,14 @@ fn git_grep_roots(eff: &[String]) -> Option<SearchRootSpec> {
             "max-count",
             "parent-basename",
         ],
+        extra_val_l: &[],
         pat_s: "ef",
         pat_l: &["regexp", "file"],
         opt_num_s: "",
         opt_num_l: &[],
         eq_only_l: &["color", "open-files-in-pager"],
         bool_l: &[],
+        extra_bool_l: &[],
         long_prefixes: false,
         always_recursive: true,
         check_grep_recursion: false,
@@ -2011,56 +2008,18 @@ fn git_grep_roots(eff: &[String]) -> Option<SearchRootSpec> {
 
 fn recursive_search_roots(eff: &[String]) -> Option<SearchRootSpec> {
     let first = eff.first()?;
-    let b = base(first);
-    let b_fold = if b.is_ascii() {
-        b.to_ascii_lowercase()
-    } else {
-        b.to_lowercase().replace('ſ', "s")
-    };
+    let b_fold = fold(base(first));
     const RG_OPTS: SearchOpts = SearchOpts {
         val_s: "egtTmABCdjMErf",
-        val_l: &[
-            "regexp",
-            "file",
-            "glob",
-            "iglob",
-            "type",
-            "type-not",
-            "max-count",
-            "after-context",
-            "before-context",
-            "context",
-            "max-depth",
-            "maxdepth",
-            "threads",
-            "max-columns",
-            "encoding",
-            "replace",
-            "colors",
-            "color",
-            "sort",
-            "sortr",
-            "max-filesize",
-            "path-separator",
-            "engine",
-            "context-separator",
-            "type-add",
-            "type-clear",
-            "field-context-separator",
-            "field-match-separator",
-            "dfa-size-limit",
-            "regex-size-limit",
-            "ignore-file",
-            "pre",
-            "pre-glob",
-            "hostname-bin",
-        ],
+        val_l: super::engine::RG_VAL_L,
+        extra_val_l: &["file", "ignore-file", "pre", "pre-glob", "hostname-bin"],
         pat_s: "ef",
         pat_l: &["regexp", "file", "files", "type-list"],
         opt_num_s: "",
         opt_num_l: &[],
         eq_only_l: &[],
         bool_l: &[],
+        extra_bool_l: &[],
         long_prefixes: false,
         always_recursive: true,
         check_grep_recursion: false,
@@ -2089,39 +2048,14 @@ fn recursive_search_roots(eff: &[String]) -> Option<SearchRootSpec> {
             "binary-files",
             "group-separator",
         ],
+        extra_val_l: &[],
         pat_s: "ef",
         pat_l: &["regexp", "file"],
         opt_num_s: "",
         opt_num_l: &[],
         eq_only_l: &["color", "colour"],
-        bool_l: &[
-            "ignore-case",
-            "no-ignore-case",
-            "invert-match",
-            "line-number",
-            "count",
-            "files-with-matches",
-            "files-without-match",
-            "only-matching",
-            "quiet",
-            "silent",
-            "no-messages",
-            "word-regexp",
-            "line-regexp",
-            "no-filename",
-            "with-filename",
-            "extended-regexp",
-            "fixed-strings",
-            "basic-regexp",
-            "perl-regexp",
-            "text",
-            "null-data",
-            "null",
-            "byte-offset",
-            "initial-tab",
-            "recursive",
-            "dereference-recursive",
-            "no-group-separator",
+        bool_l: super::engine::GREP_BOOL_L,
+        extra_bool_l: &[
             "help",
             "version",
             "unix-byte-offsets",
@@ -2163,12 +2097,14 @@ fn recursive_search_roots(eff: &[String]) -> Option<SearchRootSpec> {
             "max-buffer-time",
             "format",
         ],
+        extra_val_l: &[],
         pat_s: "",
         pat_l: &[],
         opt_num_s: "",
         opt_num_l: &[],
         eq_only_l: &[],
         bool_l: &[],
+        extra_bool_l: &[],
         long_prefixes: false,
         always_recursive: true,
         check_grep_recursion: false,
@@ -2196,6 +2132,7 @@ fn recursive_search_roots(eff: &[String]) -> Option<SearchRootSpec> {
             "color-match",
             "color-path",
         ],
+        extra_val_l: &[],
         pat_s: "g",
         pat_l: &["filename-pattern"],
         opt_num_s: "ABC",
@@ -2262,6 +2199,7 @@ fn recursive_search_roots(eff: &[String]) -> Option<SearchRootSpec> {
             "recurse",
             "norecurse",
         ],
+        extra_bool_l: &[],
         long_prefixes: true,
         always_recursive: true,
         check_grep_recursion: false,
@@ -2288,6 +2226,7 @@ fn recursive_search_roots(eff: &[String]) -> Option<SearchRootSpec> {
             "color-match",
             "files-from",
         ],
+        extra_val_l: &[],
         pat_s: "gf",
         pat_l: &["match"],
         opt_num_s: "C",
@@ -2318,6 +2257,7 @@ fn recursive_search_roots(eff: &[String]) -> Option<SearchRootSpec> {
             "sort-files",
             "nopager",
         ],
+        extra_bool_l: &[],
         long_prefixes: true,
         always_recursive: true,
         check_grep_recursion: false,
@@ -2421,17 +2361,73 @@ fn unescape_glob_backslashes(g: &str) -> String {
 /// Normalizes `./`, `//`, and `literal/..` steps in a glob pattern while
 /// keeping `**` and wildcard components intact.
 const MAX_GLOB_VARIANTS: usize = 256;
+/// Upper bound on state transitions per glob check so pathological globs fail
+/// closed to Ask in linear/bounded time (K10).
+const MAX_GLOB_WORK: usize = 100_000;
+
+struct NormNode<'a> {
+    parent: usize,
+    seg: &'a str,
+}
+
+struct NormArena<'a> {
+    nodes: Vec<NormNode<'a>>,
+    intern: HashMap<(usize, &'a str), usize>,
+    work: usize,
+    budget: usize,
+}
+
+impl<'a> NormArena<'a> {
+    fn new(budget: usize) -> Self {
+        Self {
+            nodes: vec![NormNode { parent: 0, seg: "" }],
+            intern: HashMap::new(),
+            work: 0,
+            budget,
+        }
+    }
+
+    fn step(&mut self) -> bool {
+        self.work += 1;
+        self.work <= self.budget
+    }
+
+    fn push(&mut self, id: usize, seg: &'a str) -> Option<usize> {
+        if !self.step() {
+            return None;
+        }
+        if let Some(&existing) = self.intern.get(&(id, seg)) {
+            return Some(existing);
+        }
+        let next = self.nodes.len();
+        self.nodes.push(NormNode { parent: id, seg });
+        self.intern.insert((id, seg), next);
+        Some(next)
+    }
+
+    fn last(&self, id: usize) -> Option<&'a str> {
+        (id != 0).then(|| self.nodes[id].seg)
+    }
+
+    fn pop(&self, id: usize) -> usize {
+        self.nodes[id].parent
+    }
+}
 
 /// Single normalizer for both `glob_escape` and `search_glob_hit` /
 /// `ask_search_glob_hit`: collapses curdir, empty segments, and `literal/..`,
 /// and treats `..` after a single-component wildcard as possibly popping that
 /// segment (emitting both popped and as-written forms).
 fn apply_dotdot<'a>(
-    mut st: Vec<&'a str>,
+    id: usize,
     abs: bool,
-    out: &mut Vec<Vec<&'a str>>,
+    out: &mut Vec<usize>,
     cap: usize,
+    arena: &mut NormArena<'a>,
 ) -> bool {
+    if !arena.step() {
+        return false;
+    }
     if out.len() > cap.saturating_mul(4).max(16) {
         out.sort_unstable();
         out.dedup();
@@ -2439,53 +2435,78 @@ fn apply_dotdot<'a>(
             return false;
         }
     }
-    match st.last().copied() {
+    match arena.last(id) {
         None => {
-            if !abs {
-                st.push("..");
-            }
-            out.push(st);
+            let next = if abs {
+                id
+            } else {
+                let Some(p) = arena.push(id, "..") else {
+                    return false;
+                };
+                p
+            };
+            out.push(next);
         }
         Some("..") => {
-            st.push("..");
-            out.push(st);
+            let Some(next) = arena.push(id, "..") else {
+                return false;
+            };
+            out.push(next);
         }
         Some("**") => {
             // `**` matches >= 2 segments: absorbs `..` and stays `**`.
-            out.push(st.clone());
+            out.push(id);
             // `**` matches 1 segment: cancelled by `..`.
-            st.pop();
-            out.push(st.clone());
+            let parent = arena.pop(id);
+            out.push(parent);
             // `**` matches 0 segments: `..` acts on what preceded `**`.
-            if !apply_dotdot(st, abs, out, cap) {
+            if !apply_dotdot(parent, abs, out, cap, arena) {
                 return false;
             }
         }
         Some(last) if !last.contains(['*', '?', '[']) => {
-            st.pop();
-            out.push(st);
+            out.push(arena.pop(id));
         }
         Some(_) => {
-            let mut popped = st.clone();
-            popped.pop();
-            out.push(popped);
-            st.push("..");
-            out.push(st);
+            out.push(arena.pop(id));
+            let Some(next) = arena.push(id, "..") else {
+                return false;
+            };
+            out.push(next);
         }
     }
     true
 }
 
-fn normalize_glob_variants(g: &str, cap: usize) -> Option<Vec<String>> {
+fn normalize_glob_variants(
+    g: &str,
+    cap: usize,
+    total_work: &mut usize,
+    max_work: usize,
+) -> Option<Vec<String>> {
+    let remaining_work = max_work.checked_sub(*total_work)?;
     let abs = g.starts_with('/');
-    let mut states: Vec<Vec<&str>> = vec![vec![]];
+    let mut arena = NormArena::new(remaining_work);
+    let mut states: Vec<usize> = vec![0];
     for c in g.split('/') {
         match c {
-            "" | "." => {}
+            "" | "." => {
+                if !arena.step() {
+                    *total_work = max_work;
+                    return None;
+                }
+            }
             "**" => {
                 for st in &mut states {
-                    if st.last().copied() != Some("**") {
-                        st.push(c);
+                    if arena.last(*st) != Some("**") {
+                        let Some(next) = arena.push(*st, c) else {
+                            *total_work = max_work;
+                            return None;
+                        };
+                        *st = next;
+                    } else if !arena.step() {
+                        *total_work = max_work;
+                        return None;
                     }
                 }
                 states.sort_unstable();
@@ -2494,34 +2515,49 @@ fn normalize_glob_variants(g: &str, cap: usize) -> Option<Vec<String>> {
             ".." => {
                 let mut next = Vec::with_capacity(states.len());
                 for st in states {
-                    if !apply_dotdot(st, abs, &mut next, cap) {
+                    if !apply_dotdot(st, abs, &mut next, cap, &mut arena) {
+                        *total_work = total_work.saturating_add(arena.work);
                         return None;
                     }
                 }
                 next.sort_unstable();
                 next.dedup();
                 if next.len() > cap {
+                    *total_work = total_work.saturating_add(arena.work);
                     return None;
                 }
                 states = next;
             }
             _ => {
                 for st in &mut states {
-                    st.push(c);
+                    let Some(next) = arena.push(*st, c) else {
+                        *total_work = max_work;
+                        return None;
+                    };
+                    *st = next;
                 }
             }
         }
     }
+    *total_work = total_work.saturating_add(arena.work);
     let mut out = Vec::with_capacity(states.len());
-    for st in states {
+    let mut seen = std::collections::HashSet::with_capacity(states.len());
+    let mut segs: Vec<&str> = vec![];
+    for mut id in states {
+        segs.clear();
+        while id != 0 {
+            segs.push(arena.nodes[id].seg);
+            id = arena.nodes[id].parent;
+        }
+        segs.reverse();
         let s = if abs {
-            format!("/{}", st.join("/"))
-        } else if st.is_empty() {
+            format!("/{}", segs.join("/"))
+        } else if segs.is_empty() {
             ".".to_string()
         } else {
-            st.join("/")
+            segs.join("/")
         };
-        if !out.contains(&s) {
+        if seen.insert(s.clone()) {
             out.push(s);
         }
     }
@@ -2531,6 +2567,7 @@ fn normalize_glob_variants(g: &str, cap: usize) -> Option<Vec<String>> {
 /// Widens `?` and any character class `[...]` that can match `.` to `.`.
 fn widen_pattern_dots(s: &str) -> String {
     let bytes = s.as_bytes();
+    let last_rb = s.rfind(']');
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -2539,7 +2576,7 @@ fn widen_pattern_dots(s: &str) -> String {
         if ch == '?' {
             out.push('.');
             i += len;
-        } else if ch == '[' {
+        } else if ch == '[' && last_rb.is_some_and(|end| i < end) {
             let mut j = i + 1;
             if j < bytes.len() && (bytes[j] == b'!' || bytes[j] == b'^') {
                 j += 1;
@@ -2578,13 +2615,14 @@ fn widen_pattern_dots(s: &str) -> String {
 /// with `/`.
 fn widen_pattern_slashes(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
+    let last_rb = s.rfind(']');
     let mut out = String::with_capacity(s.len());
     let mut changed = false;
     let mut i = 0;
     while i < bytes.len() {
         let ch = s[i..].chars().next().unwrap();
         let len = ch.len_utf8();
-        if ch == '[' {
+        if ch == '[' && last_rb.is_some_and(|end| i < end) {
             let mut j = i + 1;
             if j < bytes.len() && (bytes[j] == b'!' || bytes[j] == b'^') {
                 j += 1;
@@ -2680,7 +2718,8 @@ struct GlobCandidates {
 /// capped at `MAX_GLOB_VARIANTS` without sampling on overflow.
 fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates {
     let mut res = GlobCandidates::default();
-    if glob.contains('\0') {
+    if glob.len() > MAX_BYTES || glob.contains('\0') {
+        res.unknown = true;
         res.unbounded = true;
         return res;
     }
@@ -2780,12 +2819,13 @@ fn search_variants_from_cands(
     let mut seen = std::collections::HashSet::new();
     let mut unjoined_norm = 0usize;
     let mut joined_norm = 0usize;
+    let mut work = 0usize;
     let mut push_norms = |pat: &str, total: &mut usize| -> bool {
         let remaining = MAX_GLOB_VARIANTS.saturating_sub(*total);
         if remaining == 0 {
             return false;
         }
-        let Some(norms) = normalize_glob_variants(pat, remaining) else {
+        let Some(norms) = normalize_glob_variants(pat, remaining, &mut work, MAX_GLOB_WORK) else {
             return false;
         };
         *total += norms.len();
@@ -2793,7 +2833,7 @@ fn search_variants_from_cands(
             return false;
         }
         for n in norms {
-            let norm = n.to_lowercase().replace('ſ', "s");
+            let norm = fold(&n);
             if !norm.is_empty() && seen.insert(norm.clone()) {
                 out.push(norm);
             }
@@ -2850,8 +2890,9 @@ fn escape_from_cands(
         return out;
     }
     let mut total_norm = 0usize;
+    let mut work = 0usize;
     for gv in &cands.variants {
-        check_escape_variant(gv, roots, cwd, home, &mut total_norm, &mut out);
+        check_escape_variant(gv, roots, cwd, home, &mut total_norm, &mut work, &mut out);
         if out.unbounded {
             break;
         }
@@ -2865,6 +2906,7 @@ fn check_escape_variant(
     cwd: &Path,
     home: &Path,
     total_norm: &mut usize,
+    work: &mut usize,
     out: &mut GlobEscape,
 ) {
     if variant.is_empty() {
@@ -2887,7 +2929,7 @@ fn check_escape_variant(
             out.unknown = true;
             return;
         }
-        let Some(norms) = normalize_glob_variants(&j, remaining) else {
+        let Some(norms) = normalize_glob_variants(&j, remaining, work, MAX_GLOB_WORK) else {
             out.unbounded = true;
             out.unknown = true;
             return;
