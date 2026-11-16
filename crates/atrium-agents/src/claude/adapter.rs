@@ -475,8 +475,8 @@ struct Actor {
     /// In-flight gate calls; aborted when the session ends.
     gates: JoinSet<()>,
 
-    /// Gate keys the hook answered `ask` for, with the gate's ticket.
-    hook_asked: HashMap<String, VecDeque<ApprovalTicket>>,
+    /// Gate keys the hook answered `ask` for, with `(tool_use_id, ticket)`.
+    hook_asked: HashMap<String, VecDeque<(Option<String>, ApprovalTicket)>>,
     /// Requests of the provider (hook calls and `can_use_tool`, by its own
     /// ids) not answered yet. An answer for one that is not here is never
     /// sent: it was withdrawn, or its turn ended.
@@ -484,8 +484,13 @@ struct Actor {
     /// The gate tasks in flight, by request.
     inflight: HashMap<Req, AbortHandle>,
     approvals: HashMap<String, PendingApproval>,
+    /// Approvals currently in flight for `gate.redeem`, by native `can_use_tool` id.
+    redeeming: HashMap<String, ApprovalTicket>,
     /// Questions waiting for an answer, by ticket id: (native id, input).
     questions: HashMap<String, (String, Value)>,
+    /// Tickets withdrawn by the provider, turn end, or unmatched hook `Ask`,
+    /// drained asynchronously via `ToolGate::withdraw`.
+    pending_withdrawals: Vec<ApprovalTicket>,
 
     mcp_dir: Option<TempDir>,
     mcp_path: PathBuf,
@@ -542,7 +547,9 @@ impl Actor {
             live: HashSet::new(),
             inflight: HashMap::new(),
             approvals: HashMap::new(),
+            redeeming: HashMap::new(),
             questions: HashMap::new(),
+            pending_withdrawals: Vec::new(),
             mcp_dir: Some(mcp_dir),
             mcp_path,
         })
@@ -861,6 +868,7 @@ impl Actor {
         let mut alive = tokio::time::interval(ALIVE_POLL);
         alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            self.drain_withdrawals().await;
             if self.shutting_down {
                 break;
             }
@@ -937,7 +945,9 @@ impl Actor {
                 self.pending.clear();
             }
         }
-        self.gates.abort_all();
+        self.clear_requests();
+        self.drain_internal_withdrawals();
+        self.drain_withdrawals().await;
         self.commands_rx = None;
         // Closing events reach a receiver that was not reading as soon as it
         // drains; the task ends when everything is delivered or the receiver
@@ -969,20 +979,89 @@ impl Actor {
         // wrote while winding down must not use it up.
         self.finishing = true;
         self.clear_requests();
+        self.drain_internal_withdrawals();
+        self.drain_withdrawals().await;
         self.feed(AdapterInput::Exit { code });
         // The generated MCP config (it can hold credentials) goes with the
         // process, not with the delivery of the last events.
         self.mcp_dir = None;
     }
 
+    fn queue_withdraw(&mut self, ticket: ApprovalTicket) {
+        self.pending_withdrawals.push(ticket);
+    }
+
+    async fn drain_withdrawals(&mut self) {
+        let tickets = std::mem::take(&mut self.pending_withdrawals);
+        let deadline = self.options.gate_deadline;
+        for ticket in tickets {
+            let gate = self.gate.clone();
+            let inner = tokio::spawn(async move { gate.withdraw(&ticket).await });
+            let _ = guarded(deadline, inner).await;
+        }
+    }
+
+    fn drain_internal_withdrawals(&mut self) {
+        while let Ok(msg) = self.internal_rx.try_recv() {
+            match msg {
+                Internal::Gate {
+                    decision: GateDecision::Ask { ticket },
+                    ..
+                } => self.queue_withdraw(ticket),
+                Internal::Question {
+                    ticket: Some(ticket),
+                    ..
+                } => self.queue_withdraw(ticket),
+                Internal::Redeem {
+                    ticket, decision, ..
+                } if !matches!(decision, GateDecision::Allow) => self.queue_withdraw(ticket),
+                _ => {}
+            }
+        }
+    }
+
+    fn withdraw_hook_for_call(&mut self, call_id: &str) {
+        let mut withdrawn = Vec::new();
+        self.hook_asked.retain(|_, queue| {
+            let mut i = 0;
+            while i < queue.len() {
+                if queue[i].0.as_deref() == Some(call_id) {
+                    if let Some((_, ticket)) = queue.remove(i) {
+                        withdrawn.push(ticket);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            !queue.is_empty()
+        });
+        for ticket in withdrawn {
+            self.queue_withdraw(ticket);
+        }
+    }
+
     fn clear_requests(&mut self) {
         // Nothing in flight can still be answered.
         self.gates.abort_all();
         self.inflight.clear();
-        self.hook_asked.clear();
+        for (_, queue) in self.hook_asked.drain() {
+            for (_, ticket) in queue {
+                self.pending_withdrawals.push(ticket);
+            }
+        }
         self.live.clear();
-        self.approvals.clear();
-        self.questions.clear();
+        for (_, a) in self.approvals.drain() {
+            self.pending_withdrawals.push(a.ticket);
+        }
+        for (_, ticket) in self.redeeming.drain() {
+            self.pending_withdrawals.push(ticket);
+        }
+        for (request_id, _) in self.questions.drain() {
+            self.pending_withdrawals.push(ApprovalTicket {
+                request_id,
+                rememberable: false,
+            });
+        }
     }
 
     // ---- provider output ---------------------------------------------------------
@@ -1019,6 +1098,7 @@ impl Actor {
                     self.forget_native(rid);
                 }
             }
+            Some("user") => self.on_user(&v),
             Some("result") => {
                 // The turn is over: nothing it was waiting for can run.
                 self.interrupt_deadline = None;
@@ -1026,6 +1106,19 @@ impl Actor {
                 self.dispatch_next();
             }
             _ => {}
+        }
+    }
+
+    fn on_user(&mut self, v: &Value) {
+        let Some(items) = v.pointer("/message/content").and_then(Value::as_array) else {
+            return;
+        };
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("tool_result")
+                && let Some(id) = item.get("tool_use_id").and_then(Value::as_str)
+            {
+                self.withdraw_hook_for_call(id);
+            }
         }
     }
 
@@ -1038,8 +1131,32 @@ impl Actor {
             }
             self.live.remove(&req);
         }
-        self.approvals.retain(|_, a| a.native != native);
-        self.questions.retain(|_, (n, _)| n != native);
+        let mut withdrawn = Vec::new();
+        self.approvals.retain(|_, a| {
+            if a.native == native {
+                withdrawn.push(a.ticket.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(ticket) = self.redeeming.remove(native) {
+            withdrawn.push(ticket);
+        }
+        self.questions.retain(|request_id, (n, _)| {
+            if n == native {
+                withdrawn.push(ApprovalTicket {
+                    request_id: request_id.clone(),
+                    rememberable: false,
+                });
+                false
+            } else {
+                true
+            }
+        });
+        for ticket in withdrawn {
+            self.queue_withdraw(ticket);
+        }
     }
 
     fn on_control_request(&mut self, v: &Value, big: bool) {
@@ -1105,7 +1222,14 @@ impl Actor {
     fn on_can_use(&mut self, request_id: String, req: &Value, big: bool) {
         let name = req.get("tool_name").and_then(Value::as_str).unwrap_or("");
         let input = req.get("input").cloned().unwrap_or(Value::Null);
+        let tool_use_id = req
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if big && input.to_string().len() > MAX_PARTIAL_ARGS_BYTES {
+            if let Some(id) = &tool_use_id {
+                self.withdraw_hook_for_call(id);
+            }
             // Never shown to the gate (contract §6: oversize arguments).
             self.respond(
                 &request_id,
@@ -1113,10 +1237,6 @@ impl Actor {
             );
             return;
         }
-        let tool_use_id = req
-            .get("tool_use_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         self.live.insert(Req::CanUse(request_id.clone()));
         if name == ASK_USER_QUESTION {
             self.spawn_question(request_id, input);
@@ -1135,6 +1255,11 @@ impl Actor {
                 },
             );
             return;
+        }
+        // Any earlier hook Ask for this tool_use_id (e.g. input changed before
+        // can_use_tool) will not be matched now.
+        if let Some(id) = &tool_use_id {
+            self.withdraw_hook_for_call(id);
         }
         // Nobody asked the gate about this one: it does now.
         let check = tool_check(
@@ -1178,11 +1303,11 @@ impl Actor {
     /// The oldest ticket the hook got for this call and input.
     fn take_hook_ticket(&mut self, key: &str) -> Option<ApprovalTicket> {
         let queue = self.hook_asked.get_mut(key)?;
-        let ticket = queue.pop_front();
+        let (_, ticket) = queue.pop_front()?;
         if queue.is_empty() {
             self.hook_asked.remove(key);
         }
-        ticket
+        Some(ticket)
     }
 
     fn spawn_question(&mut self, native: String, input: Value) {
@@ -1272,6 +1397,8 @@ impl Actor {
                         decision: decision.clone(),
                     });
                     self.on_gate_decision(reply, check, decision);
+                } else if let GateDecision::Ask { ticket } = decision {
+                    self.queue_withdraw(ticket);
                 }
             }
             Internal::Redeem {
@@ -1282,6 +1409,7 @@ impl Actor {
                 decision,
                 ..
             } => {
+                self.redeeming.remove(&native);
                 // The request may have been withdrawn, or its turn ended, while
                 // the gate decided: then nothing is recorded or shown for it
                 // (a refused redeem would otherwise deny a call nobody asks
@@ -1289,24 +1417,31 @@ impl Actor {
                 let req = Req::CanUse(native.clone());
                 if self.live.contains(&req) {
                     self.feed(AdapterInput::Redeem {
-                        ticket,
+                        ticket: ticket.clone(),
                         check,
                         decision: decision.clone(),
                     });
                     if self.live.remove(&req) && self.proc.is_some() {
-                        let response = match decision {
+                        let response = match &decision {
                             GateDecision::Allow => {
                                 json!({"behavior": "allow", "updatedInput": input})
                             }
                             GateDecision::Deny { reason } => {
-                                json!({"behavior": "deny", "message": deny_text(&reason)})
+                                json!({"behavior": "deny", "message": deny_text(reason)})
                             }
                             GateDecision::Ask { .. } => {
                                 json!({"behavior": "deny", "message": deny_text("approval needs another decision")})
                             }
                         };
                         self.respond(&native, response);
+                        if !matches!(decision, GateDecision::Allow) {
+                            self.queue_withdraw(ticket);
+                        }
+                    } else {
+                        self.queue_withdraw(ticket);
                     }
+                } else {
+                    self.queue_withdraw(ticket);
                 }
             }
             Internal::Question {
@@ -1328,7 +1463,11 @@ impl Actor {
                             }
                             None => self.deny_can_use(&native, "Atrium declined the question"),
                         }
+                    } else if let Some(t) = ticket {
+                        self.queue_withdraw(t);
                     }
+                } else if let Some(t) = ticket {
+                    self.queue_withdraw(t);
                 }
             }
         }
@@ -1340,6 +1479,9 @@ impl Actor {
     fn on_gate_decision(&mut self, reply: Reply, check: ToolCheck, decision: GateDecision) {
         // A gate answer for a process that is gone has nobody to hear it.
         if self.proc.is_none() {
+            if let GateDecision::Ask { ticket } = decision {
+                self.queue_withdraw(ticket);
+            }
             return;
         }
         match reply {
@@ -1353,7 +1495,10 @@ impl Actor {
                     }
                     GateDecision::Ask { ticket } => {
                         let key = gate_key(check.call_id.as_deref(), &check.name, &check.input);
-                        self.hook_asked.entry(key).or_default().push_back(ticket);
+                        self.hook_asked
+                            .entry(key)
+                            .or_default()
+                            .push_back((check.call_id, ticket));
                         self.respond_hook(&request_id, "ask", None);
                     }
                 }
@@ -1457,7 +1602,10 @@ impl Actor {
                     return;
                 };
                 match decision {
-                    ApprovalDecision::Allow => self.spawn_redeem(a),
+                    ApprovalDecision::Allow => {
+                        self.redeeming.insert(a.native.clone(), a.ticket.clone());
+                        self.spawn_redeem(a);
+                    }
                     ApprovalDecision::Deny { message } => {
                         let text = message.unwrap_or_else(|| "Denied by the user".into());
                         self.deny_can_use(&a.native, &text);
@@ -1492,6 +1640,10 @@ impl Actor {
                     },
                 });
                 if let Some((native, _input)) = question {
+                    self.queue_withdraw(ApprovalTicket {
+                        request_id,
+                        rememberable: false,
+                    });
                     self.deny_can_use(&native, "The user declined to answer.");
                 }
             }
@@ -1934,6 +2086,84 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::QuestionAsked { .. })),
             "{:?}",
             shown(&a)
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawing_hook_ask_and_redeeming_tickets_queues_gate_withdraw() {
+        // 1. A hook Ask followed by tool_result (never followed by can_use_tool)
+        //    is queued for withdrawal.
+        let mut a = actor("hook-tool-result", &[init_line(), bash_call()]);
+        let input = json!({"command": "ls"});
+        let check = tool_check(Some("toolu_1"), "Bash", &input, 1);
+        let key = gate_key(Some("toolu_1"), "Bash", &input);
+        a.hook_asked.entry(key).or_default().push_back((
+            Some("toolu_1".into()),
+            ApprovalTicket {
+                request_id: "H1".into(),
+                rememberable: false,
+            },
+        ));
+        let tool_result = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok", "is_error": false}]
+            },
+            "session_id": "s"
+        });
+        a.on_stdout(tool_result.to_string(), true);
+        assert!(a.hook_asked.is_empty());
+        assert_eq!(
+            a.pending_withdrawals
+                .iter()
+                .map(|t| t.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["H1"]
+        );
+
+        // 2. An approval currently redeeming that gets cancelled via control_cancel_request
+        //    is queued for withdrawal.
+        let mut a = actor("redeeming-cancel", &[init_line(), bash_call()]);
+        a.live.insert(Req::CanUse("c1".into()));
+        a.redeeming.insert(
+            "c1".into(),
+            ApprovalTicket {
+                request_id: "R1".into(),
+                rememberable: false,
+            },
+        );
+        a.forget_native("c1");
+        assert_eq!(
+            a.pending_withdrawals
+                .iter()
+                .map(|t| t.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["R1"]
+        );
+
+        // 3. An in-flight Gate Ask arriving after the request left `live` is queued for withdrawal.
+        let mut a = actor("late-ask", &[init_line(), bash_call()]);
+        a.on_internal(Internal::Gate {
+            reply: Reply::CanUse {
+                request_id: "c1".into(),
+                input,
+            },
+            check,
+            decision: GateDecision::Ask {
+                ticket: ApprovalTicket {
+                    request_id: "L1".into(),
+                    rememberable: false,
+                },
+            },
+            failed: false,
+        });
+        assert_eq!(
+            a.pending_withdrawals
+                .iter()
+                .map(|t| t.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["L1"]
         );
     }
 }

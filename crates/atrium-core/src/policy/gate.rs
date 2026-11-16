@@ -1346,6 +1346,21 @@ impl SessionGate {
         }
         Ok(GateDecision::Allow)
     }
+
+    /// Withdraws an open ticket as cancelled, freeing its ledger slot and
+    /// preventing future redemption. Idempotent: resolved, redeemed, or
+    /// unknown tickets are a no-op and never fail the turn.
+    pub async fn withdraw(&self, ticket: &ApprovalTicket) {
+        let key = RequestKey {
+            thread: self.config.thread.clone(),
+            incarnation: self.config.incarnation,
+            request_id: ticket.request_id.clone(),
+        };
+        if let Ok(mut m) = self.opened.lock() {
+            m.remove(&ticket.request_id);
+        }
+        let _ = self.ledger.withdraw(&key).await;
+    }
 }
 
 impl ToolGate for SessionGate {
@@ -1376,5 +1391,9 @@ impl ToolGate for SessionGate {
                 .await
                 .ok()
         })
+    }
+
+    fn withdraw<'a>(&'a self, ticket: &'a ApprovalTicket) -> BoxFuture<'a, ()> {
+        Box::pin(self.withdraw(ticket))
     }
 }

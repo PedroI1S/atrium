@@ -431,6 +431,7 @@ struct PendingQuestion {
     raw_id: Value,
     native: String,
     questions: Value,
+    ticket: Option<ApprovalTicket>,
 }
 
 async fn start_session(
@@ -521,6 +522,7 @@ async fn start_session(
         questions: HashMap::new(),
         live: HashSet::new(),
         inflight: HashMap::new(),
+        pending_withdrawals: Vec::new(),
         turn_seq: 0,
         interrupt_deadline: None,
         shutdown_deadline: None,
@@ -694,6 +696,7 @@ struct Driver {
     questions: HashMap<String, PendingQuestion>,
     live: HashSet<String>,
     inflight: HashMap<String, tokio::task::JoinHandle<()>>,
+    pending_withdrawals: Vec<ApprovalTicket>,
     turn_seq: u32,
     interrupt_deadline: Option<TokioInstant>,
     shutdown_deadline: Option<TokioInstant>,
@@ -776,10 +779,16 @@ impl Driver {
             if let Some(pending) = self.questions.remove(&request_id) {
                 self.live.remove(&pending.native);
                 self.decline_question_request(&pending.raw_id);
+                if let Some(ticket) = pending.ticket {
+                    self.queue_withdraw(ticket);
+                }
             }
         } else if let Some(pending) = self.approvals.remove(&request_id) {
             self.live.remove(&pending.native);
             self.decline_server_request(&pending.raw_id, &pending.method);
+            if !pending.ticket.request_id.is_empty() {
+                self.queue_withdraw(pending.ticket);
+            }
         }
         let kind = if is_question { "question" } else { "approval" };
         self.push_tail_event(
@@ -1063,6 +1072,7 @@ impl Driver {
 
     async fn run(mut self) {
         loop {
+            self.drain_withdrawals().await;
             self.flush_pending();
 
             if self.norm.wants_end() && !self.shutting_down {
@@ -1133,7 +1143,9 @@ impl Driver {
         }
 
         self.cmd_rx = None;
-        self.abort_inflight();
+        self.clear_requests();
+        self.drain_internal_withdrawals();
+        self.drain_withdrawals().await;
         self.flush_final().await;
     }
 
@@ -1455,6 +1467,7 @@ impl Driver {
                 raw_id,
                 native: native.clone(),
                 questions,
+                ticket: None,
             },
         );
         self.inflight.insert(format!("question:{native}"), handle);
@@ -1478,14 +1491,21 @@ impl Driver {
                     self.mark_gate_failed();
                 }
                 if !self.live.contains(&native) {
+                    if let GateDecision::Ask { ticket } = decision {
+                        self.queue_withdraw(ticket);
+                    }
                     return;
                 }
                 let Some(mut meta) = meta else {
+                    if let GateDecision::Ask { ticket } = decision {
+                        self.queue_withdraw(ticket);
+                    }
                     return;
                 };
-                let (decision, saturated_decline) = if matches!(decision, GateDecision::Ask { .. })
+                let (decision, saturated_decline) = if let GateDecision::Ask { ticket } = &decision
                     && (self.is_pending_saturated() || self.pending.len() + 2 > PENDING_LIMIT)
                 {
+                    self.queue_withdraw(ticket.clone());
                     self.live.remove(&native);
                     self.decline_server_request(&meta.raw_id, &meta.method);
                     self.emit_saturation_error(format!(
@@ -1539,13 +1559,15 @@ impl Driver {
                     self.mark_gate_failed();
                 }
                 if !self.live.remove(&native) {
+                    self.queue_withdraw(ticket);
                     return;
                 }
                 let Some(meta) = meta else {
+                    self.queue_withdraw(ticket);
                     return;
                 };
                 self.feed(AdapterInput::Redeem {
-                    ticket,
+                    ticket: ticket.clone(),
                     check,
                     decision: decision.clone(),
                 });
@@ -1554,6 +1576,7 @@ impl Driver {
                         self.accept_server_request(&meta.raw_id, &meta.method, &meta.payload);
                     }
                     GateDecision::Deny { .. } | GateDecision::Ask { .. } => {
+                        self.queue_withdraw(ticket);
                         self.decline_server_request(&meta.raw_id, &meta.method);
                     }
                 }
@@ -1570,20 +1593,28 @@ impl Driver {
                     self.mark_gate_failed();
                 }
                 if !self.live.contains(&native) {
+                    if let Some(t) = ticket {
+                        self.queue_withdraw(t);
+                    }
                     return;
                 }
                 let Some(meta) = meta else {
+                    if let Some(t) = ticket {
+                        self.queue_withdraw(t);
+                    }
                     return;
                 };
-                let ticket = if ticket.is_some() && self.is_pending_saturated() {
-                    self.live.remove(&native);
-                    self.decline_question_request(&meta.raw_id);
-                    self.emit_saturation_error(format!(
-                        "declined question request {native} because event buffer exceeded PENDING_LIMIT ({PENDING_LIMIT})"
-                    ));
-                    None
-                } else {
-                    ticket
+                let ticket = match ticket {
+                    Some(t) if self.is_pending_saturated() => {
+                        self.queue_withdraw(t);
+                        self.live.remove(&native);
+                        self.decline_question_request(&meta.raw_id);
+                        self.emit_saturation_error(format!(
+                            "declined question request {native} because event buffer exceeded PENDING_LIMIT ({PENDING_LIMIT})"
+                        ));
+                        None
+                    }
+                    other => other,
                 };
                 self.feed(AdapterInput::QuestionTicket {
                     id: native.clone(),
@@ -1592,11 +1623,12 @@ impl Driver {
                 match ticket {
                     Some(t) => {
                         self.questions.insert(
-                            t.request_id,
+                            t.request_id.clone(),
                             PendingQuestion {
                                 raw_id: meta.raw_id,
                                 native: meta.native,
                                 questions,
+                                ticket: Some(t),
                             },
                         );
                     }
@@ -1662,6 +1694,9 @@ impl Driver {
                 let Some(pending) = self.questions.remove(&request_id) else {
                     return;
                 };
+                if let Some(ticket) = pending.ticket {
+                    self.queue_withdraw(ticket);
+                }
                 self.live.remove(&pending.native);
                 self.write_value(&json!({
                     "id": pending.raw_id,
@@ -1829,6 +1864,37 @@ impl Driver {
         }));
     }
 
+    fn queue_withdraw(&mut self, ticket: ApprovalTicket) {
+        self.pending_withdrawals.push(ticket);
+    }
+
+    async fn drain_withdrawals(&mut self) {
+        let tickets = std::mem::take(&mut self.pending_withdrawals);
+        for ticket in tickets {
+            let gate = self.gate.clone();
+            let _ = guarded(REDEEM_TIMEOUT, async move { gate.withdraw(&ticket).await }).await;
+        }
+    }
+
+    fn drain_internal_withdrawals(&mut self) {
+        while let Ok(msg) = self.internal_rx.try_recv() {
+            match msg {
+                Internal::Gate {
+                    decision: GateDecision::Ask { ticket },
+                    ..
+                } => self.queue_withdraw(ticket),
+                Internal::Question {
+                    ticket: Some(ticket),
+                    ..
+                } => self.queue_withdraw(ticket),
+                Internal::Redeem {
+                    ticket, decision, ..
+                } if !matches!(decision, GateDecision::Allow) => self.queue_withdraw(ticket),
+                _ => {}
+            }
+        }
+    }
+
     fn forget_native(&mut self, native: &str) {
         self.live.remove(native);
         for prefix in ["gate:", "redeem:", "question:"] {
@@ -1836,15 +1902,45 @@ impl Driver {
                 h.abort();
             }
         }
-        self.approvals.retain(|_, a| a.native != native);
-        self.questions.retain(|_, q| q.native != native);
+        let mut withdrawn = Vec::new();
+        self.approvals.retain(|_, a| {
+            if a.native == native {
+                if !a.ticket.request_id.is_empty() {
+                    withdrawn.push(a.ticket.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.questions.retain(|_, q| {
+            if q.native == native {
+                if let Some(t) = q.ticket.clone() {
+                    withdrawn.push(t);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        for ticket in withdrawn {
+            self.queue_withdraw(ticket);
+        }
     }
 
     fn clear_requests(&mut self) {
         self.abort_inflight();
         self.live.clear();
-        self.approvals.clear();
-        self.questions.clear();
+        for (_, a) in self.approvals.drain() {
+            if !a.ticket.request_id.is_empty() {
+                self.pending_withdrawals.push(a.ticket);
+            }
+        }
+        for (_, q) in self.questions.drain() {
+            if let Some(ticket) = q.ticket {
+                self.pending_withdrawals.push(ticket);
+            }
+        }
     }
 
     fn abort_inflight(&mut self) {
@@ -1985,6 +2081,14 @@ async fn recv_out(rx: &mut Option<mpsc::Receiver<Out>>) -> Option<Out> {
 
 /// Runs a gate future with panic + timeout containment so a broken gate can't
 /// wedge or crash the adapter driver task.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn guarded<T>(
     limit: Duration,
     fut: impl std::future::Future<Output = T> + Send + 'static,
@@ -1993,6 +2097,7 @@ where
     T: Send + 'static,
 {
     let joined = tokio::spawn(fut);
+    let _guard = AbortOnDrop(joined.abort_handle());
     tokio::time::timeout(limit, joined)
         .await
         .ok()

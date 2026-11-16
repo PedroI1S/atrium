@@ -239,6 +239,13 @@ pub trait ToolGate: Send + Sync {
     /// gate is unreachable: the adapter then declines the question to the
     /// provider and emits nothing for it.
     fn question_ticket(&self, turn: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>>;
+
+    /// Withdraws an open approval or question ticket as cancelled (provider
+    /// cancelled it, turn ended, or an `Ask` was never followed by a matching
+    /// request), freeing its ledger slot. Idempotent and never fails the turn.
+    fn withdraw<'a>(&'a self, _ticket: &'a ApprovalTicket) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 /// A ledger entry's handle. `request_id` is what the events and commands use.
