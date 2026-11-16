@@ -736,3 +736,6 @@ After Argon's review (rework: 2 rules-editor blockers, 1 major in the Linux save
 
 ## D-114 — 2026-11-16 — Pedro: one small M1-18 round
 Asked how M1-18 should finish after Argon's round-4 review (two "same as dev" blockers and a slow synthetic glob; `docs/agents/reviews/M1-18-policy-followup-round4.md`), Pedro chose "small m1-18 round" over merging with known limits. Fix round 4 goes to Gemini 4 Hydrogen `high`: relative `..` re-entry globs, propagating the search-variant overflow, the `env -S` off-by-one, and the variant total cap. Argon reviews it (D-101).
+
+## D-115 — 2026-11-16 — Pedro: one more M1-18 round
+After Argon's review of fix round 4 (all 20 lines closed, 0 regressions vs dev; two "same as dev" edge cases left and a nit; `docs/agents/reviews/M1-18-policy-followup-round5.md`), Pedro chose "One more round" over merging with known limits (the orchestrator had recommended merging). Fix round 5 goes to Gemini 4 Hydrogen `high`; Argon reviews it.
