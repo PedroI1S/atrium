@@ -1,6 +1,7 @@
 //! `DefaultPolicy`: hard deny, then rules (thread, Home, global), then the
 //! preset. Pure: everything comes in `PolicyInput`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use atrium_protocol::agent::ToolKind;
@@ -31,8 +32,8 @@ fn glob_matches(glob: &str, p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn looks_like_path(w: &str) -> bool {
-    if w.is_empty() || w.contains(char::is_whitespace) || w.contains('\0') {
+fn looks_like_path_word(w: &str) -> bool {
+    if w.is_empty() || w.contains('\0') || w.contains("://") {
         return false;
     }
     w.starts_with(['/', '~'])
@@ -48,27 +49,596 @@ fn looks_like_path(w: &str) -> bool {
         || (w.starts_with('.') && w.len() > 1 && !w.starts_with(".."))
 }
 
-fn is_command_path(a: &Analysis, u: &super::words::Use) -> bool {
-    if u.unit == usize::MAX {
-        return true;
+fn push_expanded_path(word: &str, out: &mut HashSet<String>) {
+    if word.is_empty() || word.contains('\0') || word.contains("://") {
+        return;
     }
-    if a.units.get(u.unit).is_some_and(|unit| {
-        unit.seg
-            .redirects
-            .iter()
-            .any(|r| r.op != super::RedirectOp::Dup && r.target == u.word)
-    }) {
-        return true;
+    if word.contains('{')
+        && let Some(expanded) = super::words::brace_expand(word)
+    {
+        for w in expanded {
+            out.insert(w);
+        }
+        return;
     }
-    looks_like_path(&u.word)
+    out.insert(word.to_string());
+}
+
+fn is_generic_path_long_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--file"
+            | "--output"
+            | "--out-dir"
+            | "--manifest-path"
+            | "--target-dir"
+            | "--git-dir"
+            | "--work-tree"
+            | "--exec-path"
+            | "--directory"
+            | "--target-directory"
+            | "--chdir"
+            | "--cwd"
+            | "--prefix"
+            | "--dir"
+            | "--reference"
+            | "--from-file"
+            | "--exclude-from"
+            | "--files-from"
+            | "--arg-file"
+            | "--cookie"
+            | "--cookie-jar"
+            | "--upload-file"
+            | "--config"
+            | "--output-document"
+            | "--path"
+            | "--root"
+    )
+}
+
+fn is_cmd_path_short_flag(cmd: &str, ch: char) -> bool {
+    match cmd {
+        "cp" | "mv" | "ln" | "install" => ch == 't',
+        "touch" | "truncate" => ch == 'r',
+        "sort" => matches!(ch, 'o' | 'T'),
+        "tree" => ch == 'o',
+        "sed" | "awk" | "gawk" | "mawk" | "jq" => ch == 'f',
+        "tar" => matches!(ch, 'f' | 'C' | 'T' | 'X'),
+        "diff" => ch == 'X',
+        "curl" | "wget" => matches!(ch, 'o' | 'O' | 'T' | 'c' | 'K'),
+        "xargs" => ch == 'a',
+        "git" => ch == 'C',
+        _ => false,
+    }
+}
+
+fn is_cmd_nonpath_value_flag(cmd: &str, w: &str) -> bool {
+    let long = w.starts_with("--");
+    if long {
+        return match cmd {
+            "head" | "tail" => matches!(w, "--lines" | "--bytes"),
+            "ls" => matches!(
+                w,
+                "--ignore"
+                    | "--hide"
+                    | "--sort"
+                    | "--time"
+                    | "--color"
+                    | "--format"
+                    | "--quoting-style"
+                    | "--time-style"
+                    | "--block-size"
+            ),
+            "cp" | "mv" | "ln" | "install" => {
+                matches!(w, "--suffix" | "--mode" | "--owner" | "--group")
+            }
+            "mkdir" => w == "--mode",
+            "touch" => matches!(w, "--date" | "--time"),
+            "truncate" | "shred" => matches!(w, "--size" | "--iterations"),
+            "sort" => matches!(
+                w,
+                "--key" | "--field-separator" | "--buffer-size" | "--parallel"
+            ),
+            "cut" => matches!(
+                w,
+                "--bytes" | "--characters" | "--delimiter" | "--fields" | "--output-delimiter"
+            ),
+            "uniq" => matches!(w, "--skip-fields" | "--skip-chars" | "--check-chars"),
+            "diff" => matches!(w, "--exclude" | "--starting-file" | "--label"),
+            "sed" | "awk" | "gawk" | "mawk" => matches!(w, "--expression" | "--assign"),
+            "jq" => matches!(w, "--arg" | "--argjson"),
+            "tar" => matches!(w, "--exclude" | "--transform" | "--strip-components"),
+            "curl" | "wget" => matches!(
+                w,
+                "--data"
+                    | "--header"
+                    | "--request"
+                    | "--user-agent"
+                    | "--user"
+                    | "--max-time"
+                    | "--connect-timeout"
+            ),
+            "xargs" => matches!(
+                w,
+                "--max-args" | "--max-procs" | "--max-lines" | "--replace"
+            ),
+            _ => false,
+        };
+    }
+    if !w.starts_with('-') || w.len() < 2 {
+        return false;
+    }
+    let last = w.chars().last().unwrap_or('\0');
+    match cmd {
+        "head" | "tail" => matches!(last, 'n' | 'c'),
+        "ls" => matches!(last, 'w' | 'T' | 'I'),
+        "cp" | "mv" | "ln" => last == 'S',
+        "mkdir" => last == 'm',
+        "install" => matches!(last, 'm' | 'o' | 'g' | 'S'),
+        "touch" => matches!(last, 'd' | 't'),
+        "truncate" => last == 's',
+        "shred" => matches!(last, 'n' | 's'),
+        "tree" => matches!(last, 'L' | 'P' | 'I'),
+        "sort" => matches!(last, 'k' | 't' | 'S'),
+        "cut" => matches!(last, 'b' | 'c' | 'd' | 'f'),
+        "uniq" => matches!(last, 'f' | 's' | 'w'),
+        "diff" => matches!(last, 'U' | 'u' | 'C' | 'I' | 'x' | 'S'),
+        "sed" => last == 'e',
+        "awk" | "gawk" | "mawk" => matches!(last, 'e' | 'F' | 'v'),
+        "curl" | "wget" => matches!(last, 'X' | 'H' | 'A' | 'u' | 'd' | 'm'),
+        "xargs" => matches!(last, 'n' | 'P' | 'L' | 'I' | 'd' | 's' | 'E'),
+        "ag" | "ack" => matches!(last, 'A' | 'B' | 'C' | 'G' | 'm'),
+        _ => false,
+    }
+}
+
+fn collect_explicit_flag_paths(cmd: &str, args: &[String], out: &mut HashSet<String>) {
+    for w in args {
+        if let Some((flag, val)) = w.split_once('=') {
+            if flag.starts_with("--")
+                && (is_generic_path_long_flag(flag) || looks_like_path_word(val))
+            {
+                push_expanded_path(val, out);
+            }
+        } else if w.starts_with('-') && !w.starts_with("--") && w.len() > 2 {
+            let cs: Vec<char> = w[1..].chars().collect();
+            for k in 0..cs.len().saturating_sub(1) {
+                let rest: String = cs[k + 1..].iter().collect();
+                let rest = rest.strip_prefix('=').unwrap_or(&rest);
+                if is_cmd_path_short_flag(cmd, cs[k]) || looks_like_path_word(rest) {
+                    push_expanded_path(rest, out);
+                }
+            }
+        }
+    }
+}
+
+fn collect_generic_operands(cmd: &str, args: &[String], out: &mut HashSet<String>) {
+    let mut after_dd = false;
+    let mut skip_first_positional = matches!(cmd, "chmod" | "chown" | "chgrp" | "ag" | "ack");
+    let mut need_script = matches!(cmd, "sed" | "awk" | "gawk" | "mawk" | "jq");
+    let mut has_reference = false;
+    let mut i = 0;
+    while i < args.len() {
+        let w = args[i].as_str();
+        if after_dd {
+            if w != "-" {
+                push_expanded_path(w, out);
+            }
+            i += 1;
+            continue;
+        }
+        if w == "--" {
+            after_dd = true;
+            i += 1;
+            continue;
+        }
+        if let Some((flag, val)) = w.split_once('=')
+            && flag.starts_with("--")
+        {
+            if flag == "--reference" {
+                has_reference = true;
+            }
+            if matches!(flag, "--file" | "--from-file" | "--expression") {
+                need_script = false;
+            }
+            if is_generic_path_long_flag(flag) || looks_like_path_word(val) {
+                push_expanded_path(val, out);
+            }
+            i += 1;
+            continue;
+        }
+        if w.starts_with("--") {
+            if w == "--reference" {
+                has_reference = true;
+            }
+            if matches!(w, "--file" | "--from-file" | "--expression") {
+                need_script = false;
+            }
+            if is_generic_path_long_flag(w) {
+                if let Some(next) = args.get(i + 1) {
+                    push_expanded_path(next, out);
+                }
+                i += 2;
+                continue;
+            }
+            if is_cmd_nonpath_value_flag(cmd, w) {
+                i += if matches!(w, "--arg" | "--argjson") {
+                    3
+                } else {
+                    2
+                };
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if w.starts_with('-') && w.len() > 1 {
+            let cs: Vec<char> = w[1..].chars().collect();
+            for k in 0..cs.len().saturating_sub(1) {
+                let rest: String = cs[k + 1..].iter().collect();
+                let rest = rest.strip_prefix('=').unwrap_or(&rest);
+                if is_cmd_path_short_flag(cmd, cs[k]) || looks_like_path_word(rest) {
+                    push_expanded_path(rest, out);
+                }
+            }
+            if matches!(cmd, "sed" | "awk" | "gawk" | "mawk" | "jq")
+                && cs.iter().any(|c| matches!(c, 'e' | 'f'))
+            {
+                need_script = false;
+            }
+            if matches!(cmd, "ag" | "ack") && cs.contains(&'g') {
+                skip_first_positional = false;
+            }
+            let last = cs[cs.len() - 1];
+            if is_cmd_path_short_flag(cmd, last) {
+                if let Some(next) = args.get(i + 1) {
+                    push_expanded_path(next, out);
+                }
+                i += 2;
+                continue;
+            }
+            if is_cmd_nonpath_value_flag(cmd, w) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if cmd == "test" || cmd == "[" {
+            if matches!(w, "]" | "=" | "!=" | "-a" | "-o" | "!") {
+                i += 1;
+                continue;
+            }
+            if w != "-" {
+                push_expanded_path(w, out);
+            }
+            i += 1;
+            continue;
+        }
+        if cmd == "dd"
+            && let Some((k, v)) = w.split_once('=')
+            && !k.is_empty()
+        {
+            if matches!(k, "if" | "of") || looks_like_path_word(v) {
+                push_expanded_path(v, out);
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(cmd, "curl" | "wget") && w.contains("://") {
+            i += 1;
+            continue;
+        }
+        if (skip_first_positional && !has_reference) || need_script {
+            skip_first_positional = false;
+            need_script = false;
+            i += 1;
+            continue;
+        }
+        if w != "-" {
+            push_expanded_path(w, out);
+            if let Some((k, v)) = w.split_once('=')
+                && !k.is_empty()
+                && looks_like_path_word(v)
+            {
+                push_expanded_path(v, out);
+            }
+        }
+        i += 1;
+    }
+}
+
+fn unit_path_words(unit: &Unit) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for r in &unit.seg.redirects {
+        if r.op != super::RedirectOp::Dup {
+            push_expanded_path(&r.target, &mut out);
+        }
+    }
+    if let Some(first) = unit.seg.argv.first()
+        && first.contains('/')
+    {
+        push_expanded_path(first, &mut out);
+    }
+    for (_, v) in &unit.seg.assignments {
+        if looks_like_path_word(v) {
+            push_expanded_path(v, &mut out);
+        }
+    }
+    if unit.eff != unit.seg.argv && unit.seg.argv.len() > unit.eff.len() {
+        for w in &unit.seg.argv[1..unit.seg.argv.len() - unit.eff.len()] {
+            if let Some((_, v)) = w.split_once('=') {
+                if looks_like_path_word(v) {
+                    push_expanded_path(v, &mut out);
+                }
+            } else if looks_like_path_word(w) {
+                push_expanded_path(w, &mut out);
+            }
+        }
+    }
+    let Some(first) = unit.eff.first() else {
+        return out;
+    };
+    let cmd = rule_check::fold_name(first);
+    let args = &unit.eff[1..];
+    match cmd.as_str() {
+        "rg" | "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" => {
+            if let Some(s) = search_roots(cmd == "rg", args) {
+                for r in s.roots {
+                    push_expanded_path(&r, &mut out);
+                }
+                collect_explicit_flag_paths(cmd.as_str(), args, &mut out);
+            } else {
+                collect_generic_operands(cmd.as_str(), args, &mut out);
+            }
+        }
+        "find" => {
+            let (roots, expr_idx, explicit) = super::shell::find_roots_explicit(&unit.eff);
+            if explicit {
+                for r in roots {
+                    push_expanded_path(&r, &mut out);
+                }
+            }
+            let mut i = expr_idx;
+            while i < unit.eff.len() {
+                let w = unit.eff[i].as_str();
+                let lw = w.to_lowercase();
+                if matches!(lw.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+                    while i < unit.eff.len() && unit.eff[i] != ";" && unit.eff[i] != "+" {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if matches!(lw.as_str(), "-fprint" | "-fprint0" | "-fprintf" | "-fls") {
+                    if let Some(next) = unit.eff.get(i + 1) {
+                        push_expanded_path(next, &mut out);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if looks_like_path_word(w) {
+                    push_expanded_path(w, &mut out);
+                }
+                i += 1;
+            }
+        }
+        "echo" | "printf" | "true" | "false" | "pwd" | "id" | "whoami" | "uname" | "date"
+        | "sleep" | "which" | "whereis" | "type" | "kill" | "pkill" | "pgrep" | "ps"
+        | "hostname" | "printenv" | "export" | "unset" | "set" | "alias" | "unalias"
+        | "history" | "jobs" | "fg" | "bg" | "wait" | "exit" | "return" | "break" | "continue"
+        | "shift" | "read" | "env" => {
+            for w in args {
+                if let Some((_, v)) = w.split_once('=') {
+                    if looks_like_path_word(v) {
+                        push_expanded_path(v, &mut out);
+                    }
+                } else if looks_like_path_word(w) {
+                    push_expanded_path(w, &mut out);
+                }
+            }
+        }
+        "git" | "cargo" | "npm" | "pnpm" | "yarn" | "bun" | "deno" | "uv" | "pip" | "pip3"
+        | "poetry" | "rustup" | "go" | "docker" | "podman" | "kubectl" | "helm" | "terraform"
+        | "tofu" | "gh" | "make" | "just" | "cmake" | "ctest" | "npx" | "pnpx" | "bunx" | "uvx"
+        | "pipx" => {
+            let mut subcommand: Option<&str> = None;
+            let mut after_dd = false;
+            let mut i = 0;
+            while i < args.len() {
+                let w = args[i].as_str();
+                if after_dd {
+                    if cmd == "git" || looks_like_path_word(w) {
+                        push_expanded_path(w, &mut out);
+                    }
+                    i += 1;
+                    continue;
+                }
+                if w == "--" {
+                    after_dd = true;
+                    i += 1;
+                    continue;
+                }
+                if let Some((flag, val)) = w.split_once('=')
+                    && flag.starts_with("--")
+                {
+                    if is_generic_path_long_flag(flag) || looks_like_path_word(val) {
+                        push_expanded_path(val, &mut out);
+                    }
+                    i += 1;
+                    continue;
+                }
+                if matches!(
+                    w,
+                    "-C" | "--chdir"
+                        | "--git-dir"
+                        | "--work-tree"
+                        | "--exec-path"
+                        | "--manifest-path"
+                        | "--target-dir"
+                        | "--cwd"
+                        | "--prefix"
+                        | "--dir"
+                        | "-f"
+                        | "--file"
+                        | "-o"
+                        | "--output"
+                        | "--out-dir"
+                ) {
+                    if let Some(next) = args.get(i + 1) {
+                        push_expanded_path(next, &mut out);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if matches!(
+                    w,
+                    "-c" | "--config-env"
+                        | "-p"
+                        | "--package"
+                        | "--bin"
+                        | "--lib"
+                        | "--test"
+                        | "--bench"
+                        | "--example"
+                        | "--features"
+                        | "--target"
+                        | "--profile"
+                        | "-j"
+                        | "--jobs"
+                        | "--color"
+                        | "-m"
+                        | "--message"
+                        | "-b"
+                        | "--branch"
+                        | "-t"
+                        | "--tag"
+                        | "-n"
+                        | "--namespace"
+                        | "--context"
+                        | "--filter"
+                        | "-F"
+                        | "--template"
+                ) {
+                    if let Some(next) = args.get(i + 1)
+                        && looks_like_path_word(next)
+                    {
+                        push_expanded_path(next, &mut out);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if w.starts_with('-') {
+                    collect_explicit_flag_paths(
+                        cmd.as_str(),
+                        std::slice::from_ref(&args[i]),
+                        &mut out,
+                    );
+                    i += 1;
+                    continue;
+                }
+                if subcommand.is_none() {
+                    subcommand = Some(w);
+                    i += 1;
+                    continue;
+                }
+                let git_file_sub = cmd == "git"
+                    && subcommand.is_some_and(|s| {
+                        matches!(
+                            s,
+                            "add" | "rm" | "mv" | "restore" | "stage" | "apply" | "am"
+                        )
+                    });
+                if git_file_sub || looks_like_path_word(w) {
+                    push_expanded_path(w, &mut out);
+                }
+                i += 1;
+            }
+        }
+        _ if rule_check::is_shell_or_runs_here(&cmd)
+            || cmd.starts_with("python")
+            || cmd.starts_with("pwsh")
+            || cmd.starts_with("powershell")
+            || matches!(
+                cmd.as_str(),
+                "node" | "ruby" | "perl" | "php" | "lua" | "osascript"
+            ) =>
+        {
+            let mut after_dd = false;
+            let mut found_script = false;
+            let mut i = 0;
+            while i < args.len() {
+                let w = args[i].as_str();
+                if after_dd {
+                    if w != "-" {
+                        push_expanded_path(w, &mut out);
+                    }
+                    i += 1;
+                    continue;
+                }
+                if w == "--" {
+                    after_dd = true;
+                    i += 1;
+                    continue;
+                }
+                if !found_script && w.starts_with('-') {
+                    let lw = w.to_lowercase();
+                    if matches!(w, "-c" | "-e" | "-p" | "-r" | "-W" | "-X" | "-Q" | "-m")
+                        || matches!(
+                            lw.as_str(),
+                            "--eval"
+                                | "--print"
+                                | "--run"
+                                | "-command"
+                                | "--command"
+                                | "-encodedcommand"
+                                | "-ec"
+                                | "-cwa"
+                                | "-commandwithargs"
+                        )
+                    {
+                        i += 2;
+                        continue;
+                    }
+                    if matches!(w, "-I" | "-File") || lw == "-file" {
+                        if let Some(next) = args.get(i + 1) {
+                            push_expanded_path(next, &mut out);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    collect_explicit_flag_paths(
+                        cmd.as_str(),
+                        std::slice::from_ref(&args[i]),
+                        &mut out,
+                    );
+                    i += 1;
+                    continue;
+                }
+                if w != "-" {
+                    found_script = true;
+                    push_expanded_path(w, &mut out);
+                }
+                i += 1;
+            }
+        }
+        _ => collect_generic_operands(cmd.as_str(), args, &mut out),
+    }
+    out
 }
 
 /// Every path the call names, ours and the gate's (without the working folder
 /// or command words that aren't paths).
 fn all_paths(input: &PolicyInput<'_>, a: &Analysis) -> Vec<PathBuf> {
+    let unit_paths: Vec<HashSet<String>> = a.units.iter().map(unit_path_words).collect();
     let mut v: Vec<PathBuf> = vec![];
     for (idx, u) in a.uses.iter().enumerate() {
-        if is_command_path(a, u) {
+        let keep = u.unit == usize::MAX
+            || unit_paths
+                .get(u.unit)
+                .is_some_and(|words| words.contains(&u.word));
+        if keep {
             v.extend(a.all_paths(idx).into_iter().cloned());
         }
     }
@@ -148,10 +718,65 @@ fn deny_matches(rule: &Rule, input: &PolicyInput<'_>, a: &Analysis, paths: &[Pat
     }
 }
 
+/// Verifies that every `-exec`/`-execdir`/`-ok`/`-okdir` clause of this `find`
+/// unit had its derived units extracted by `shell.rs`.
+fn find_exec_extracted_for_unit(a: &Analysis, unit_idx: usize, argv: &[String]) -> bool {
+    if super::shell::base(&argv[0]) != "find" {
+        return false;
+    }
+    let (_, expr_start) = super::shell::find_roots(argv);
+    let is_exec_kw_ci = |w: &str| {
+        matches!(
+            w.to_lowercase().as_str(),
+            "-exec" | "-execdir" | "-ok" | "-okdir"
+        )
+    };
+    if argv[1..expr_start.min(argv.len())]
+        .iter()
+        .any(|w| is_exec_kw_ci(w))
+    {
+        return false;
+    }
+    let mut clause_count = 0usize;
+    let mut k = expr_start;
+    while k < argv.len() {
+        let w = argv[k].as_str();
+        if is_exec_kw_ci(w) {
+            if !matches!(w, "-exec" | "-execdir" | "-ok" | "-okdir") {
+                return false;
+            }
+            let mut m = k + 1;
+            let mut body_len = 0usize;
+            while m < argv.len() && argv[m] != ";" && argv[m] != "+" {
+                body_len += 1;
+                m += 1;
+            }
+            if body_len == 0 {
+                return false;
+            }
+            clause_count += 1;
+            k = m + 1;
+            continue;
+        }
+        k += 1;
+    }
+    if clause_count == 0 {
+        return false;
+    }
+    let owned_exec = a.units.get(unit_idx + 1..).map_or(0, |tail| {
+        tail.iter()
+            .take_while(|u| u.derived)
+            .filter(|u| u.exec_roots.is_some())
+            .count()
+    });
+    owned_exec >= clause_count
+}
+
 fn rule_covers_argv(
+    a: &Analysis,
+    unit_idx: usize,
     rule: &Rule,
     argv: &[String],
-    has_derived: bool,
     for_wrapper_eff: bool,
 ) -> bool {
     if argv.is_empty() {
@@ -168,13 +793,13 @@ fn rule_covers_argv(
                 return false;
             }
             if rule_check::is_find(&argv[0])
-                && !has_derived
                 && argv[1..].iter().any(|w| {
                     matches!(
                         w.to_lowercase().as_str(),
                         "-exec" | "-execdir" | "-ok" | "-okdir"
                     )
                 })
+                && !find_exec_extracted_for_unit(a, unit_idx, argv)
             {
                 return false;
             }
@@ -194,7 +819,6 @@ struct AllowCtx<'a> {
     a: &'a Analysis,
     paths: &'a [PathBuf],
     glob_leaves: bool,
-    has_derived: bool,
 }
 
 /// Which slots in `unit_ids` (or the whole call when `unit_ids` is empty) an
@@ -233,14 +857,15 @@ fn allow_covers(ctx: &AllowCtx<'_>, rule: &Rule, unit_ids: &[usize], as_eff: boo
                     let argv = if as_eff { &u.eff } else { &u.seg.argv };
                     u.seg.assignments.is_empty()
                         && harmless(u)
-                        && rule_covers_argv(rule, argv, ctx.has_derived, as_eff)
+                        && rule_covers_argv(ctx.a, i, rule, argv, as_eff)
                 })
                 .collect()
         }
         RuleMatcher::PathGlob { glob } => {
-            let ok = !ctx.paths.is_empty()
-                && (!command || simple)
-                && ctx.paths.iter().all(|p| glob_matches(glob, p));
+            if command || !rule_check::is_path_kind(rule.tool_kind) {
+                return none;
+            }
+            let ok = !ctx.paths.is_empty() && ctx.paths.iter().all(|p| glob_matches(glob, p));
             vec![ok; n]
         }
     }
@@ -288,13 +913,11 @@ fn apply_rules(
     } else {
         vec![]
     };
-    let has_derived = !derived_ids.is_empty();
     let allow_ctx = AllowCtx {
         input,
         a,
         paths: &paths,
         glob_leaves,
-        has_derived,
     };
     let n = part_ids.len().max(1);
     let mut covered = vec![false; n];
