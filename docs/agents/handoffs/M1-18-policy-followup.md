@@ -124,4 +124,11 @@ CR = credential-read, RD = recursive-delete-outside-cwd, PE = privilege-escalati
 
 ## Definition of Done
 
-DOD_PLACEHOLDER
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --no-fail-fast`: all suites pass (59 result lines, 0 failed).
+- `cargo test -p atrium-core` 20 runs in a row: 0 failures in every run; final run 264 passed, 0 failed, 6 ignored (K5, findings 4, 5, 10, 11, and the four stores outside the CR-12 list).
+- `scripts/check-protocol-ts`: not needed (no protocol change).
+- The scratch `dev` worktree and its target folder were removed.
+
+Commits: one WIP commit with the code, tests and handoff (made at the coordinator's request after a rate-limit stop, so it was not split into per-item commits), then this DoD update.
