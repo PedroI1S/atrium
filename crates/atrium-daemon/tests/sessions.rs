@@ -1076,6 +1076,7 @@ async fn an_export_is_private_and_removed_when_it_fails() {
         .await;
     let text = std::fs::read_to_string(&markdown).expect("the export");
     assert_eq!(answer["bytes"], text.len() as u64);
+    assert_eq!(answer["damaged"], 0);
     assert!(text.contains("The answer is 42."), "{text}");
     let mode = std::fs::metadata(&markdown)
         .expect("stat")
@@ -1087,6 +1088,7 @@ async fn an_export_is_private_and_removed_when_it_fails() {
     let answer = wire.ok(export(&thread, ExportFormat::Jsonl, &jsonl)).await;
     let text = std::fs::read_to_string(&jsonl).expect("the export");
     assert_eq!(answer["bytes"], text.len() as u64);
+    assert_eq!(answer["damaged"], 0);
     assert!(text.lines().count() >= 4);
 
     // Never over something that exists, never a relative path, never into
@@ -1114,8 +1116,8 @@ async fn an_export_is_private_and_removed_when_it_fails() {
     );
     assert!(!rig.home.join("nobody.md").exists());
 
-    // A message that doesn't match its completion fails the export, and
-    // what was written before it goes with the file.
+    // A message that doesn't match its completion still exports as a marked
+    // placeholder (CR-16), reporting the count in `damaged`.
     let damaged = wire.start_thread(native(), Some("go")).await.thread_id;
     let mut script = rig.script().await;
     script.started("native-2").await;
@@ -1125,13 +1127,76 @@ async fn an_export_is_private_and_removed_when_it_fails() {
     script.turn_done(1).await;
     wire.thread_when(&damaged, |summary| summary.state == ThreadState::Idle)
         .await;
-    let broken = rig.home.join("damaged.md");
-    assert_eq!(
-        wire.refused(export(&damaged, ExportFormat::Markdown, &broken))
-            .await,
-        ErrorCode::Internal
-    );
-    assert!(!broken.exists(), "the partial export was removed");
+    let damaged_md = rig.home.join("damaged.md");
+    let answer = wire
+        .ok(export(&damaged, ExportFormat::Markdown, &damaged_md))
+        .await;
+    let text = std::fs::read_to_string(&damaged_md).expect("damaged export");
+    assert_eq!(answer["bytes"], text.len() as u64);
+    assert_eq!(answer["damaged"], 1);
+    assert!(text.contains("⚠ Damaged message"), "{text}");
+    assert!(!text.contains("one "), "{text}");
+}
+
+#[tokio::test]
+async fn export_thread_with_damaged_message_succeeds_with_damaged_count() {
+    let mut rig = Rig::start().await;
+    let mut wire = rig.dev().await;
+    let (thread, mut script) = running(&mut rig, &mut wire).await;
+    script.delta("m1", "First ").await;
+    script.delta("m1", "reply.").await;
+    script.completed("m1", &["First ", "reply."]).await;
+    script.delta("m2", "DAMAGED_FRAG_ONE ").await;
+    script.delta("m2", "DAMAGED_FRAG_TWO").await;
+    script.completed("m2", &["completely different"]).await;
+    script.delta("m3", "After.").await;
+    script.completed("m3", &["After."]).await;
+    script.turn_done(1).await;
+    wire.thread_when(&thread, |summary| summary.state == ThreadState::Idle)
+        .await;
+
+    let export = |format, path: &std::path::Path| DaemonCommand::ExportThread {
+        thread_id: thread.clone(),
+        format,
+        path: path.to_string_lossy().into_owned(),
+    };
+
+    let md_path = rig.home.join("damaged-thread.md");
+    let md_answer = wire.ok(export(ExportFormat::Markdown, &md_path)).await;
+    let md_text = std::fs::read_to_string(&md_path).expect("markdown export");
+    assert_eq!(md_answer["bytes"], md_text.len() as u64);
+    assert_eq!(md_answer["damaged"], 1);
+    assert!(md_text.contains("First reply."), "{md_text}");
+    assert!(md_text.contains("After."), "{md_text}");
+    assert!(md_text.contains("⚠ Damaged message"), "{md_text}");
+    assert!(md_text.contains("`m2`"), "{md_text}");
+    for leaked in [
+        "DAMAGED_FRAG_ONE",
+        "DAMAGED_FRAG_TWO",
+        "completely different",
+    ] {
+        assert!(!md_text.contains(leaked), "leaked {leaked}:\n{md_text}");
+    }
+
+    let jsonl_path = rig.home.join("damaged-thread.jsonl");
+    let jsonl_answer = wire.ok(export(ExportFormat::Jsonl, &jsonl_path)).await;
+    let jsonl_text = std::fs::read_to_string(&jsonl_path).expect("jsonl export");
+    assert_eq!(jsonl_answer["bytes"], jsonl_text.len() as u64);
+    assert_eq!(jsonl_answer["damaged"], 1);
+    assert!(jsonl_text.contains("First reply."), "{jsonl_text}");
+    assert!(jsonl_text.contains("After."), "{jsonl_text}");
+    assert!(jsonl_text.contains("\"damaged\":true"), "{jsonl_text}");
+    assert!(jsonl_text.contains("\"message_id\":\"m2\""), "{jsonl_text}");
+    for leaked in [
+        "DAMAGED_FRAG_ONE",
+        "DAMAGED_FRAG_TWO",
+        "completely different",
+    ] {
+        assert!(
+            !jsonl_text.contains(leaked),
+            "leaked {leaked}:\n{jsonl_text}"
+        );
+    }
 }
 
 #[tokio::test]

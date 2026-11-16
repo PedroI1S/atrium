@@ -244,7 +244,7 @@ message: string | null } |
 { type: "list_rules" } | 
 /**  The daemon assigns id, origin (`Settings`) and time. Value: `Rule`. */
 { type: "create_rule"; rule: RuleDraft } | { type: "delete_rule"; rule_id: RuleId } | 
-/**  Writes `path` (mode 0600). Value: `{"bytes": u64}`. */
+/**  Writes `path` (mode 0600). Value: `{"bytes": u64, "damaged": u32}`. */
 { type: "export_thread"; thread_id: ThreadId; format: ExportFormat; path: string } | 
 /**  Value: `{key: value}` for every setting. */
 { type: "get_settings" } | { type: "set_setting"; key: string; value: Value } | 

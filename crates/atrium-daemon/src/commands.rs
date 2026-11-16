@@ -810,22 +810,22 @@ fn write_export(
     format: ExportFormat,
     path: &Path,
     home: &str,
-) -> Result<u64, Failure> {
+) -> Result<history::ExportReport, Failure> {
     let file = history::create_export_file(path).map_err(|error| export_error(&error))?;
     let redactor = Redactor::new(home, &[]);
     let mut out = io::BufWriter::new(file);
-    let written = history::export_thread(&mut pages, format, &redactor, &mut out)
+    let written = history::export_thread_report(&mut pages, format, &redactor, &mut out)
         .map_err(|error| match error {
             history::HistoryError::Io(error) => export_error(&error),
             integrity => failure(ErrorCode::Internal, integrity.to_string()),
         })
-        .and_then(|bytes| match pages.failed.take() {
+        .and_then(|report| match pages.failed.take() {
             Some(failed) => Err(failed),
-            None => Ok(bytes),
+            None => Ok(report),
         })
-        .and_then(|bytes| {
+        .and_then(|report| {
             out.flush()
-                .map(|()| bytes)
+                .map(|()| report)
                 .map_err(|error| export_error(&error))
         });
     if written.is_err() {
@@ -865,10 +865,10 @@ async fn export(
         failed: None,
     };
     let home = inner.home.to_string_lossy().into_owned();
-    let bytes = tokio::task::spawn_blocking(move || write_export(pages, format, &path, &home))
+    let report = tokio::task::spawn_blocking(move || write_export(pages, format, &path, &home))
         .await
         .map_err(|error| failure(ErrorCode::Internal, error.to_string()))??;
-    Ok(json!({ "bytes": bytes }))
+    Ok(json!({ "bytes": report.bytes, "damaged": report.damaged }))
 }
 
 #[cfg(test)]

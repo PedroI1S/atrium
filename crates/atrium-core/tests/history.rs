@@ -4,7 +4,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 use atrium_core::history::{
-    HistoryError, Redactor, create_export_file, export_thread, reconstruct_message,
+    ExportReport, HistoryError, Redactor, create_export_file, export_thread, export_thread_report,
+    reconstruct_message,
 };
 use atrium_protocol::agent::{
     AgentEvent, AgentEventEnvelope, MessageBody, MessageKind, PlanEntry, PlanStatus, Provider,
@@ -315,7 +316,13 @@ fn reconstruct_rejects_hash_or_length_mismatch() {
 }
 
 #[test]
-fn export_fails_on_a_message_that_does_not_match_its_completion() {
+fn damaged_message_fails_reconstruct_but_exports_as_placeholder() {
+    let body = streamed(&["one ", "two", " three"]);
+    match reconstruct_message("m1", &["one ", "two"], &body) {
+        Err(HistoryError::Integrity { message_id }) => assert_eq!(message_id, "m1"),
+        other => panic!("expected an integrity error, got {other:?}"),
+    }
+
     let mut thread = Thread::new();
     thread
         .start(Vec::new())
@@ -323,13 +330,26 @@ fn export_fails_on_a_message_that_does_not_match_its_completion() {
         .push(AgentEvent::MessageCompleted {
             message_id: "m1".into(),
             kind: MessageKind::Assistant,
-            body: streamed(&["one ", "two", " three"]),
+            body,
         });
     for format in BOTH {
-        match thread.try_export(format) {
-            Err(HistoryError::Integrity { message_id }) => assert_eq!(message_id, "m1"),
-            other => panic!("expected an integrity error, got {other:?}"),
-        }
+        let mut out = Vec::new();
+        let report = export_thread_report(
+            &mut thread.events.clone().into_iter(),
+            format,
+            &redactor(),
+            &mut out,
+        )
+        .expect("damaged thread exports");
+        assert_eq!(
+            report,
+            ExportReport {
+                bytes: out.len() as u64,
+                damaged: 1,
+            }
+        );
+        let text = String::from_utf8(out).expect("UTF-8");
+        assert!(!text.contains("one "), "{text}");
     }
 }
 
@@ -1417,4 +1437,195 @@ fn an_export_lands_in_its_file() {
     assert_eq!(bytes, written.len() as u64);
     assert_eq!(written, thread.export(ExportFormat::Jsonl));
     assert_eq!(written.lines().count(), 3);
+}
+
+#[test]
+fn export_writes_placeholder_for_damaged_message_and_keeps_other_messages() {
+    let mut thread = Thread::new();
+    thread
+        .start(Vec::new())
+        .inline("u1", MessageKind::User, "Hello")
+        .message("m1", MessageKind::Assistant, &["First ", "reply."])
+        .deltas("m2", MessageKind::Assistant, &["broken ", "piece"])
+        .push(AgentEvent::MessageCompleted {
+            message_id: "m2".into(),
+            kind: MessageKind::Assistant,
+            body: streamed(&["other ", "words"]),
+        })
+        .message(
+            "m3",
+            MessageKind::Assistant,
+            &["Later reply with ", ANTHROPIC],
+        )
+        .end();
+
+    let md = thread.export(ExportFormat::Markdown);
+    assert!(md.contains("First reply."), "{md}");
+    assert!(md.contains("Later reply with [redacted]"), "{md}");
+    assert!(
+        md.contains("⚠ Damaged message (id `m2`, events 6–8): left out of the export"),
+        "{md}"
+    );
+    assert!(!md.contains(ANTHROPIC), "{md}");
+
+    let jsonl = thread.export(ExportFormat::Jsonl);
+    let lines: Vec<Value> = jsonl
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON line"))
+        .collect();
+    let damaged: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line.get("damaged") == Some(&json!(true)))
+        .collect();
+    assert_eq!(damaged.len(), 1, "{jsonl}");
+    let entry = damaged[0];
+    assert_eq!(entry["type"], "damaged_message");
+    assert_eq!(entry["message_id"], "m2");
+    assert_eq!(entry["events"], json!({ "first": 6, "last": 8 }));
+    assert!(
+        entry["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "{entry}"
+    );
+    assert!(entry.get("text").is_none(), "{entry}");
+    assert!(entry.get("body").is_none(), "{entry}");
+    assert!(entry.get("deltas").is_none(), "{entry}");
+    assert!(entry.get("envelope").is_none(), "{entry}");
+
+    let healthy: Vec<StoredEvent> = lines
+        .into_iter()
+        .filter(|line| line.get("damaged") != Some(&json!(true)))
+        .map(|line| serde_json::from_value(line).expect("healthy lines stay StoredEvent"))
+        .collect();
+    assert!(
+        healthy.iter().any(|e| matches!(
+            &e.envelope.event,
+            AgentEvent::MessageCompleted {
+                message_id,
+                body: MessageBody::Inline { text },
+                ..
+            } if message_id == "m1" && text == "First reply."
+        )),
+        "{healthy:?}"
+    );
+    assert!(
+        healthy.iter().any(|e| matches!(
+            &e.envelope.event,
+            AgentEvent::MessageCompleted {
+                message_id,
+                body: MessageBody::Inline { text },
+                ..
+            } if message_id == "m3" && text == "Later reply with [redacted]"
+        )),
+        "{healthy:?}"
+    );
+    assert!(!jsonl.contains(ANTHROPIC), "{jsonl}");
+
+    for (format, expected) in [(ExportFormat::Markdown, &md), (ExportFormat::Jsonl, &jsonl)] {
+        let mut out = Vec::new();
+        let report = export_thread_report(
+            &mut thread.events.clone().into_iter(),
+            format,
+            &redactor(),
+            &mut out,
+        )
+        .expect("exports");
+        assert_eq!(
+            report,
+            ExportReport {
+                bytes: expected.len() as u64,
+                damaged: 1,
+            }
+        );
+        assert_eq!(out, expected.as_bytes());
+    }
+}
+
+#[test]
+fn export_never_writes_any_fragment_of_a_damaged_message() {
+    const FRAG_A: &str = "SECRET_FRAGMENT_ALPHA";
+    const FRAG_B: &str = "SECRET_FRAGMENT_BETA";
+    const FRAG_INLINE: &str = "SECRET_INLINE_GAMMA";
+
+    let mut thread = Thread::new();
+    let bad_hash = match streamed(&[FRAG_A, FRAG_B]) {
+        MessageBody::Streamed { chars, deltas, .. } => MessageBody::Streamed {
+            chars,
+            deltas,
+            sha256: "0".repeat(64),
+        },
+        MessageBody::Inline { .. } => unreachable!(),
+    };
+    let bad_chars = match streamed(&[FRAG_A, FRAG_B]) {
+        MessageBody::Streamed { deltas, sha256, .. } => MessageBody::Streamed {
+            chars: 999,
+            deltas,
+            sha256,
+        },
+        MessageBody::Inline { .. } => unreachable!(),
+    };
+    let bad_id = format!("{HOME}/{CANARY}");
+    thread
+        .start(Vec::new())
+        // 1. sha256 mismatch
+        .deltas("d1", MessageKind::Assistant, &[FRAG_A, FRAG_B])
+        .push(AgentEvent::MessageCompleted {
+            message_id: "d1".into(),
+            kind: MessageKind::Assistant,
+            body: bad_hash,
+        })
+        // 2. char count mismatch
+        .deltas("d2", MessageKind::Assistant, &[FRAG_A, FRAG_B])
+        .push(AgentEvent::MessageCompleted {
+            message_id: "d2".into(),
+            kind: MessageKind::Assistant,
+            body: bad_chars,
+        })
+        // 3. delta count mismatch
+        .deltas("d3", MessageKind::Assistant, &[FRAG_A, CANARY])
+        .push(AgentEvent::MessageCompleted {
+            message_id: "d3".into(),
+            kind: MessageKind::Assistant,
+            body: streamed(&[FRAG_A]),
+        })
+        // 4. inline body after deltas
+        .deltas("d4", MessageKind::Assistant, &[FRAG_A])
+        .push(AgentEvent::MessageCompleted {
+            message_id: "d4".into(),
+            kind: MessageKind::Assistant,
+            body: MessageBody::Inline {
+                text: FRAG_INLINE.into(),
+            },
+        })
+        // 5. streamed completion with no deltas, plus sensitive message_id
+        .push(AgentEvent::MessageCompleted {
+            message_id: bad_id,
+            kind: MessageKind::Assistant,
+            body: streamed(&[FRAG_B]),
+        })
+        .end();
+
+    for format in BOTH {
+        let mut out = Vec::new();
+        let report = export_thread_report(
+            &mut thread.events.clone().into_iter(),
+            format,
+            &redactor(),
+            &mut out,
+        )
+        .expect("exports");
+        assert_eq!(
+            report,
+            ExportReport {
+                bytes: out.len() as u64,
+                damaged: 5,
+            }
+        );
+        let out = String::from_utf8(out).expect("UTF-8");
+        for forbidden in [FRAG_A, FRAG_B, FRAG_INLINE, CANARY, HOME] {
+            assert!(
+                !out.contains(forbidden),
+                "{format:?} leaked {forbidden:?}:\n{out}"
+            );
+        }
+    }
 }

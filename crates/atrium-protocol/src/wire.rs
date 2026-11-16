@@ -289,7 +289,7 @@ pub enum DaemonCommand {
     DeleteRule {
         rule_id: RuleId,
     },
-    /// Writes `path` (mode 0600). Value: `{"bytes": u64}`.
+    /// Writes `path` (mode 0600). Value: `{"bytes": u64, "damaged": u32}`.
     ExportThread {
         thread_id: ThreadId,
         format: ExportFormat,

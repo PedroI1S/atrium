@@ -15,7 +15,7 @@ mod export;
 mod file;
 mod redact;
 
-pub use export::export_thread;
+pub use export::{ExportReport, export_thread, export_thread_report};
 pub use file::create_export_file;
 pub use redact::Redactor;
 
@@ -39,25 +39,25 @@ pub fn reconstruct_message(
     deltas: &[&str],
     body: &MessageBody,
 ) -> Result<String, HistoryError> {
-    verify_message(message_id, deltas.concat(), deltas.len() as u64, body)
+    verify_message_reason(deltas.concat(), deltas.len() as u64, body).map_err(|_| {
+        HistoryError::Integrity {
+            message_id: message_id.to_owned(),
+        }
+    })
 }
 
 /// [`reconstruct_message`] for deltas that were already joined into `text`
 /// (the export joins them as they arrive, so a message of millions of deltas
-/// costs one string).
-fn verify_message(
-    message_id: &str,
+/// costs one string). Returns a static reason on mismatch, never any text.
+pub(super) fn verify_message_reason(
     text: String,
     deltas: u64,
     body: &MessageBody,
-) -> Result<String, HistoryError> {
-    let integrity = || HistoryError::Integrity {
-        message_id: message_id.to_owned(),
-    };
+) -> Result<String, &'static str> {
     match body {
         MessageBody::Inline { text: whole } => {
             if deltas != 0 {
-                return Err(integrity());
+                return Err("inline body after deltas");
             }
             Ok(whole.clone())
         }
@@ -66,11 +66,14 @@ fn verify_message(
             deltas: count,
             sha256,
         } => {
-            if deltas != *count
-                || text.chars().count() as u64 != *chars
-                || hex(&Sha256::digest(text.as_bytes())) != *sha256
-            {
-                return Err(integrity());
+            if deltas != *count {
+                return Err("delta count differs");
+            }
+            if text.chars().count() as u64 != *chars {
+                return Err("chars differ");
+            }
+            if hex(&Sha256::digest(text.as_bytes())) != *sha256 {
+                return Err("sha256 differs");
             }
             Ok(text)
         }
