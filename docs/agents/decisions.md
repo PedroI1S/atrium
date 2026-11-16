@@ -748,3 +748,13 @@ Argon's review of M1-18 fix round 5 failed at once: agy reported "Individual quo
 
 ## D-118 — 2026-11-16 — Pedro: CR-19, fold shell and wrapper names in the engine
 Pedro approved CR-19 (the engine matches shell, wrapper and privilege-tool names case-sensitively; Argon: high for the M1 gate), to be fixed in the post-M1-18 Hydrogen batch with S5, S7, S8, S11, K5 and CR-17, since it touches the same files.
+
+## D-119 — 2026-11-16 — Pedro: the post-M1-18 batch, split
+Pedro asked to "break up the hydrogen batch as much as you can without conflicts" and approved the split ("Yes, start four"). Six Gemini 4 Hydrogen `high` tasks, each owning separate functions and line ranges in the policy files, with its own test file:
+- M1-27-engine-name-fold (CR-19; review: Opus, security);
+- M1-28-ansi-c-words (S7; Sonnet);
+- M1-29-cr17-stores (CR-17; Sonnet);
+- M1-30-tree-wildcards (S5; Sonnet);
+- M1-31-credential-folder-search (S8; Sonnet);
+- M1-32-link-globs (S11 + K5; review: Opus, security).
+M1-27, M1-30, M1-31 and M1-32 start first (at most 4 Hydrogen jobs, D-104); M1-28 and M1-29 follow as slots free up. Reviews are Claude (cross-provider) while Argon's quota is out (D-117). Merges go one at a time, each checked against the latest `dev`.
