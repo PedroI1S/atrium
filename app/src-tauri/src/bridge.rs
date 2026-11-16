@@ -827,7 +827,9 @@ mod tests {
 
         drop(handle);
         client.shutdown();
-        let _ = task.await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("forward ends");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -921,7 +923,9 @@ mod tests {
         drop(handle);
         drop(receiver_a);
         task_a.abort();
-        let _ = task_a.await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), task_a)
+            .await
+            .expect("forward ends");
 
         // Part B: byte bound (MAX_BATCH_BYTES = 256 KiB) and oversized lone delivery.
         let window_b = client.open_window("bytes");
@@ -973,7 +977,9 @@ mod tests {
 
         drop(handle_b);
         client.shutdown();
-        let _ = task_b.await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), task_b)
+            .await
+            .expect("forward ends");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1069,6 +1075,8 @@ mod tests {
 
         drop(handle);
         client.shutdown();
-        let _ = task.await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("forward ends");
     }
 }
