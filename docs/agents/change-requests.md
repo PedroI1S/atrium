@@ -230,3 +230,11 @@ Non-blocking; a gap in the wire.
 **P2: a withdrawn request's ticket stays pending until the turn ends.** A ticket opened by an `Ask` whose request is then withdrawn (cancelled, or never followed by `can_use_tool`) stays `pending` in the ledger and counts against `MAX_PENDING_REQUESTS`. `SessionGate` has no call to withdraw it.
 
 **Change:** add a withdraw call to `SessionGate` (contract §3/§7), which resolves the ticket as cancelled (`RequestResolved { cancelled }`) and frees its slot; the Claude and Codex adapters call it when a request is withdrawn. A test proves that withdrawn tickets no longer count against the limit.
+
+## CR-19 — M1-23 round-3 review — 2026-11-16
+
+**Decided (D-118, Pedro): approved; fix in the post-M1-18 batch.**
+
+**The policy engine matches shell, wrapper and privilege-tool names case-sensitively.** macOS filesystems ignore case, so `/bin/BASH -c "…"`, `/usr/bin/ENV rm -rf ~`, `SUDO id` and `/bin/baſh -c "…"` run the real programs. But `shell.rs` (`SHELLS`, `unwrap_reading`, `payloads_of`, `env_payloads`) and `deny.rs` (`PRIV`, `is_interpreter`) compare the basename as written. So the wrapper isn't unwrapped, the `-c` payload isn't read, and `SUDO` isn't flagged as privilege escalation, even with no rules at all. Argon (review of M1-23 round 3, `docs/agents/reviews/M1-23-ui-gaps-round3.md`) rated it high for the M1 gate. The rules editor already folds names (M1-23).
+
+**Change:** fold the command basename before every name comparison in `shell.rs` and `deny.rs`: lowercase (which also folds K U+212A), plus `ſ`→`s`, the same folds `deny.rs` already uses for paths. Tests: each spelling above gets the same verdict as its lowercase form, in every setting; no ordinary line changes. Done in the task that fixes S5, S7, S8, S11, K5 and CR-17 after M1-18 merges (same files).

@@ -745,3 +745,6 @@ After Argon's review of M1-23 round 2 (rework: the rules editor's refusal misses
 
 ## D-117 — 2026-11-16 — Pedro: Sonnet reviews M1-18 round 5
 Argon's review of M1-18 fix round 5 failed at once: agy reported "Individual quota reached" for Gemini 4 Argon, resetting in about 6.4 days. Pedro chose Claude Sonnet 5.5 to review it instead (cross-provider: Hydrogen wrote the round), over the orchestrator's suggestion of Opus.
+
+## D-118 — 2026-11-16 — Pedro: CR-19, fold shell and wrapper names in the engine
+Pedro approved CR-19 (the engine matches shell, wrapper and privilege-tool names case-sensitively; Argon: high for the M1 gate), to be fixed in the post-M1-18 Hydrogen batch with S5, S7, S8, S11, K5 and CR-17, since it touches the same files.
