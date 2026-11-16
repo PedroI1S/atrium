@@ -612,24 +612,17 @@ impl Sensitive {
             return Some(h);
         }
         let glob = ShellGlob::new(&pl);
-        for d in &self.data {
-            if glob.matches_tree(d)
-                || glob.matches_exact(d)
-                || glob.matches_exact(&format!("{d}/x"))
-                || glob.matches_exact(&format!("{d}/atrium.db"))
-            {
-                return Some("atrium-self");
-            }
-        }
-        if role != Role::Read {
-            for d in &self.protected {
-                if glob.matches_tree(d)
+        let matches_dir_list = |dirs: &[String]| {
+            dirs.iter().any(|d| {
+                glob.matches_tree(d)
                     || glob.matches_exact(d)
                     || glob.matches_exact(&format!("{d}/x"))
-                {
-                    return Some("atrium-self");
-                }
-            }
+                    || glob.matches_exact(&format!("{d}/atrium.db"))
+            })
+        };
+        if matches_dir_list(&self.data) || (role != Role::Read && matches_dir_list(&self.protected))
+        {
+            return Some("atrium-self");
         }
         let home_tails = glob.tails_after(&self.home);
         if home_tails.is_empty() {
@@ -792,44 +785,104 @@ impl Sensitive {
             return true;
         }
         // Prefix-named stores (`~/.azure/msal_token_cache.*`) with any extension.
+        const PREFIX_PROBES: &[&str] = &[
+            "msal_token_cache.json",
+            "msal_token_cache.bin",
+            "msal_token_cache.db",
+            "msal_token_cache.txt",
+            "msal_token_cache.cache",
+        ];
+        let matches_prefix_pat = |file_pat: &str, pre: &str, generic_dir: bool| -> bool {
+            if !comp_glob_matches_impl(file_pat, pre, true) {
+                return false;
+            }
+            if !generic_dir {
+                return true;
+            }
+            file_pat.starts_with(pre)
+                || file_pat.starts_with("msal_")
+                || PREFIX_PROBES
+                    .iter()
+                    .any(|f| comp_glob_matches_impl(file_pat, f, false))
+        };
         for (dir, pre) in ASK_NAME_PREFIXES {
             let dir_abs = format!("{}/{dir}", self.home);
             for rl in &root_lowers {
-                if under(rl, &dir_abs).is_some() {
-                    return true;
-                }
                 let Some(dir_rel) = under(&dir_abs, rl) else {
                     continue;
                 };
                 for norm in variants {
+                    if dir_rel.is_empty() {
+                        if !norm.contains('/') && matches_prefix_pat(norm, pre, true) {
+                            return true;
+                        }
+                        continue;
+                    }
                     if let Some((dir_pat, file_pat)) = norm.rsplit_once('/') {
-                        let dir_match = if dir_pat.is_empty() {
-                            false
-                        } else {
-                            GlobBuilder::new(dir_pat)
+                        let dir_match = !dir_pat.is_empty()
+                            && GlobBuilder::new(dir_pat)
                                 .literal_separator(false)
                                 .build()
                                 .map_or(true, |g| {
                                     let m = g.compile_matcher();
                                     m.is_match(dir_rel) || m.is_match(&dir_abs)
-                                })
-                        };
-                        if dir_match && glob_matches_prefix(file_pat, pre) {
+                                });
+                        let generic_dir = matches!(dir_pat.rsplit('/').next(), Some("**" | "*"));
+                        if dir_match && matches_prefix_pat(file_pat, pre, generic_dir) {
                             return true;
                         }
-                    } else if norm
-                        .chars()
-                        .next()
-                        .is_some_and(|c| pre.starts_with(c) || c == '?')
-                        && glob_matches_prefix(norm, pre)
-                    {
-                        return true;
                     }
                 }
             }
         }
         // Any search of an ASK_TREE with a filename filter (`.zsh_sessions/*.session`).
-        let mut tree_targets: Vec<(String, String)> = vec![];
+        // A generic `**` / `*` directory wildcard (`**/*.rs`) asks only when its
+        // later components could match a file in an ask tree (`**/*.session`, `**/*`).
+        const ASK_TREE_FILES: &[(&str, &[&str])] = &[
+            (
+                ".aws/sso/cache",
+                &[
+                    "0.json",
+                    "a.json",
+                    "x.json",
+                    "cache.json",
+                    "token.json",
+                    "0",
+                    "a",
+                    "x",
+                ],
+            ),
+            (
+                ".zsh_sessions",
+                &[
+                    "0.session",
+                    "a.session",
+                    "x.session",
+                    "0.history",
+                    "a.history",
+                    "x.history",
+                    "0.historynew",
+                    "0.zsh",
+                    "0",
+                    "a",
+                    "x",
+                ],
+            ),
+            (
+                ".bash_sessions",
+                &[
+                    "0.history",
+                    "a.history",
+                    "x.history",
+                    "0.historynew",
+                    "0.session",
+                    "0",
+                    "a",
+                    "x",
+                ],
+            ),
+        ];
+        let mut tree_targets: Vec<(&str, String, String)> = vec![];
         for t in ASK_TREES {
             let t_abs = format!("{}/{t}", self.home);
             for rl in &root_lowers {
@@ -837,7 +890,7 @@ impl Sensitive {
                     return true;
                 }
                 if let Some(tree_rel) = under(&t_abs, rl) {
-                    tree_targets.push((tree_rel.to_string(), t_abs.clone()));
+                    tree_targets.push((*t, tree_rel.to_string(), t_abs.clone()));
                 }
             }
         }
@@ -848,15 +901,35 @@ impl Sensitive {
                         continue;
                     }
                     let dir_pat = &norm[..idx];
+                    let rest = &norm[idx + 1..];
                     let Ok(g) = GlobBuilder::new(dir_pat).literal_separator(true).build() else {
                         return true;
                     };
                     let m = g.compile_matcher();
-                    if tree_targets
-                        .iter()
-                        .any(|(tree_rel, t_abs)| m.is_match(tree_rel) || m.is_match(t_abs))
-                    {
-                        return true;
+                    let generic_dir = matches!(dir_pat.rsplit('/').next(), Some("**" | "*"));
+                    let rest_matcher = if generic_dir && !rest.is_empty() {
+                        match GlobBuilder::new(rest).literal_separator(false).build() {
+                            Ok(rg) => Some(rg.compile_matcher()),
+                            Err(_) => return true,
+                        }
+                    } else {
+                        None
+                    };
+                    for (tree, tree_rel, t_abs) in &tree_targets {
+                        if !(m.is_match(tree_rel) || m.is_match(t_abs)) {
+                            continue;
+                        }
+                        if !generic_dir || rest.is_empty() {
+                            return true;
+                        }
+                        let rm = rest_matcher.as_ref().unwrap();
+                        let files = ASK_TREE_FILES
+                            .iter()
+                            .find(|(k, _)| k == tree)
+                            .map_or(&[][..], |(_, f)| *f);
+                        if files.iter().any(|f| rm.is_match(f)) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -965,270 +1038,117 @@ fn class_matches_char(class: &str, ch: char) -> bool {
     hit ^ neg
 }
 
+fn pat_starts_with_dot(p: &str) -> bool {
+    p.starts_with('.')
+        || (p.starts_with('[')
+            && first_class_end(p).is_some_and(|end| class_matches_char(&p[..=end], '.')))
+}
+
 fn brace_branch_dot_ok(c: &str) -> bool {
     let Some(exps) = words::brace_expand(c) else {
         return true;
     };
-    exps.iter().any(|e| {
-        e.starts_with('.')
-            || (e.starts_with('[')
-                && first_class_end(e).is_some_and(|end| class_matches_char(&e[..=end], '.')))
-    })
+    exps.iter().any(|e| pat_starts_with_dot(e))
 }
 
-fn comp_glob_matches(pat: &str, tgt: &str) -> bool {
+enum GlobAtom<'a> {
+    Lit(char),
+    Any,
+    Star,
+    Class(&'a str),
+}
+
+fn next_glob_atom(pat: &str) -> Option<(GlobAtom<'_>, usize)> {
+    let ch = pat.chars().next()?;
+    let len = ch.len_utf8();
+    if ch == '\\' {
+        let lit = pat[len..].chars().next()?;
+        return Some((GlobAtom::Lit(lit), len + lit.len_utf8()));
+    }
+    if ch == '*' {
+        return Some((GlobAtom::Star, len));
+    }
+    if ch == '?' {
+        return Some((GlobAtom::Any, len));
+    }
+    if ch == '['
+        && let Some(rel_end) = first_class_end(pat)
+    {
+        return Some((GlobAtom::Class(&pat[..=rel_end]), rel_end + 1));
+    }
+    Some((GlobAtom::Lit(ch), len))
+}
+
+fn comp_glob_matches_impl(pat: &str, tgt: &str, prefix: bool) -> bool {
     if pat.contains('{') {
         let Some(exps) = words::brace_expand(pat) else {
             return true;
         };
-        return exps.iter().any(|e| comp_glob_matches_no_brace(e, tgt));
+        return exps.iter().any(|e| comp_glob_dp(e, tgt, prefix));
     }
-    comp_glob_matches_no_brace(pat, tgt)
+    comp_glob_dp(pat, tgt, prefix)
 }
 
-fn comp_glob_matches_no_brace(pat: &str, tgt: &str) -> bool {
+fn comp_glob_dp(pat: &str, tgt: &str, prefix: bool) -> bool {
     if pat == tgt {
         return true;
     }
-    if tgt.starts_with('.')
-        && !pat.starts_with('.')
-        && !(pat.starts_with('[')
-            && first_class_end(pat).is_some_and(|e| class_matches_char(&pat[..=e], '.')))
-    {
+    if tgt.starts_with('.') && !pat_starts_with_dot(pat) {
         return false;
     }
     let tc: Vec<char> = tgt.chars().collect();
     let m = tc.len();
-    if m < 64 {
-        let mut mask = 1u64;
-        let all_bits = if m == 63 {
-            u64::MAX
-        } else {
-            (1u64 << (m + 1)) - 1
+    if prefix && m == 0 {
+        return true;
+    }
+    let (mut dp_stack, mut next_stack) = ([false; 64], [false; 64]);
+    let (mut dp_heap, mut next_heap) = (Vec::new(), Vec::new());
+    let (mut dp, mut next): (&mut [bool], &mut [bool]) = if m < 64 {
+        (&mut dp_stack[..=m], &mut next_stack[..=m])
+    } else {
+        dp_heap.resize(m + 1, false);
+        next_heap.resize(m + 1, false);
+        (&mut dp_heap, &mut next_heap)
+    };
+    dp[0] = true;
+    let mut i = 0;
+    while i < pat.len() {
+        let Some((atom, step)) = next_glob_atom(&pat[i..]) else {
+            return false;
         };
-        let bytes = pat.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let ch = pat[i..].chars().next().unwrap();
-            let len = ch.len_utf8();
-            if ch == '\\' {
-                i += len;
-                let Some(lit) = pat[i..].chars().next() else {
-                    return false;
-                };
-                i += lit.len_utf8();
-                let mut next = 0u64;
-                let mut rem = mask & ((1u64 << m) - 1);
-                while rem != 0 {
-                    let k = rem.trailing_zeros() as usize;
-                    rem &= rem - 1;
-                    if tc[k] == lit {
-                        next |= 1u64 << (k + 1);
-                    }
+        i += step;
+        match atom {
+            GlobAtom::Star => {
+                if let Some(first_true) = (0..=m).find(|&k| dp[k]) {
+                    dp[first_true..=m].fill(true);
                 }
-                mask = next;
-            } else if ch == '*' {
-                i += len;
-                if mask != 0 {
-                    let low = mask.trailing_zeros();
-                    mask |= all_bits & !((1u64 << low) - 1);
-                }
-            } else if ch == '?' {
-                i += len;
-                mask = (mask << 1) & all_bits;
-            } else if ch == '['
-                && let Some(rel_end) = first_class_end(&pat[i..])
-            {
-                let class = &pat[i..=i + rel_end];
-                i += rel_end + 1;
-                let mut next = 0u64;
-                let mut rem = mask & ((1u64 << m) - 1);
-                while rem != 0 {
-                    let k = rem.trailing_zeros() as usize;
-                    rem &= rem - 1;
-                    if class_matches_char(class, tc[k]) {
-                        next |= 1u64 << (k + 1);
-                    }
-                }
-                mask = next;
-            } else {
-                i += len;
-                let mut next = 0u64;
-                let mut rem = mask & ((1u64 << m) - 1);
-                while rem != 0 {
-                    let k = rem.trailing_zeros() as usize;
-                    rem &= rem - 1;
-                    if tc[k] == ch {
-                        next |= 1u64 << (k + 1);
-                    }
-                }
-                mask = next;
             }
-            if mask == 0 {
-                return false;
+            atom => {
+                next.fill(false);
+                for k in 0..m {
+                    if dp[k] {
+                        let ok = match atom {
+                            GlobAtom::Any => true,
+                            GlobAtom::Lit(lit) => tc[k] == lit,
+                            GlobAtom::Class(cls) => class_matches_char(cls, tc[k]),
+                            GlobAtom::Star => unreachable!(),
+                        };
+                        if ok {
+                            next[k + 1] = true;
+                        }
+                    }
+                }
+                std::mem::swap(&mut dp, &mut next);
             }
         }
-        return (mask & (1u64 << m)) != 0;
-    }
-    let mut dp = vec![false; m + 1];
-    dp[0] = true;
-    let bytes = pat.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = pat[i..].chars().next().unwrap();
-        let len = ch.len_utf8();
-        if ch == '\\' {
-            i += len;
-            let Some(lit) = pat[i..].chars().next() else {
-                return false;
-            };
-            i += lit.len_utf8();
-            let mut next = vec![false; m + 1];
-            for k in 0..m {
-                if dp[k] && tc[k] == lit {
-                    next[k + 1] = true;
-                }
-            }
-            dp = next;
-        } else if ch == '*' {
-            i += len;
-            if let Some(first_true) = (0..=m).find(|&k| dp[k]) {
-                for slot in &mut dp[first_true..=m] {
-                    *slot = true;
-                }
-            }
-        } else if ch == '?' {
-            i += len;
-            let mut next = vec![false; m + 1];
-            for k in 0..m {
-                if dp[k] {
-                    next[k + 1] = true;
-                }
-            }
-            dp = next;
-        } else if ch == '['
-            && let Some(rel_end) = first_class_end(&pat[i..])
-        {
-            let class = &pat[i..=i + rel_end];
-            i += rel_end + 1;
-            let mut next = vec![false; m + 1];
-            for k in 0..m {
-                if dp[k] && class_matches_char(class, tc[k]) {
-                    next[k + 1] = true;
-                }
-            }
-            dp = next;
-        } else {
-            i += len;
-            let mut next = vec![false; m + 1];
-            for k in 0..m {
-                if dp[k] && tc[k] == ch {
-                    next[k + 1] = true;
-                }
-            }
-            dp = next;
+        if prefix && dp[m] {
+            return true;
         }
         if !dp.iter().any(|&b| b) {
             return false;
         }
     }
     dp[m]
-}
-
-fn glob_matches_prefix(pat: &str, pre: &str) -> bool {
-    if pat.contains('{') {
-        let Some(exps) = words::brace_expand(pat) else {
-            return true;
-        };
-        return exps.iter().any(|e| glob_matches_prefix_no_brace(e, pre));
-    }
-    glob_matches_prefix_no_brace(pat, pre)
-}
-
-fn glob_matches_prefix_no_brace(pat: &str, pre: &str) -> bool {
-    let pre_chars: Vec<char> = pre.chars().collect();
-    let m = pre_chars.len();
-    let mut dp = vec![false; m + 1];
-    dp[0] = true;
-    let mut done = m == 0;
-    let bytes = pat.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = pat[i..].chars().next().unwrap();
-        let len = ch.len_utf8();
-        if ch == '\\' {
-            i += len;
-            let Some(lit) = pat[i..].chars().next() else {
-                return false;
-            };
-            i += lit.len_utf8();
-            let mut next = vec![false; m + 1];
-            for k in 0..m {
-                if dp[k] && pre_chars[k] == lit {
-                    next[k + 1] = true;
-                }
-            }
-            if next[m] {
-                done = true;
-            }
-            dp = next;
-        } else if ch == '*' {
-            i += len;
-            let start = usize::from(pre_chars.first() == Some(&'.'));
-            if let Some(first_true) = (start..=m).find(|&k| dp[k]) {
-                for slot in &mut dp[first_true..=m] {
-                    *slot = true;
-                }
-                if m > 0 {
-                    done = true;
-                }
-            }
-        } else if ch == '?' {
-            i += len;
-            let mut next = vec![false; m + 1];
-            for k in 0..m {
-                if dp[k] && (k > 0 || pre_chars[0] != '.') {
-                    next[k + 1] = true;
-                }
-            }
-            if next[m] {
-                done = true;
-            }
-            dp = next;
-        } else if ch == '['
-            && let Some(rel_end) = first_class_end(&pat[i..])
-        {
-            let class = &pat[i..=i + rel_end];
-            i += rel_end + 1;
-            let dot_ok = class_matches_char(class, '.');
-            let mut next = vec![false; m + 1];
-            for k in 0..m {
-                if dp[k]
-                    && (k > 0 || pre_chars[0] != '.' || dot_ok)
-                    && class_matches_char(class, pre_chars[k])
-                {
-                    next[k + 1] = true;
-                }
-            }
-            if next[m] {
-                done = true;
-            }
-            dp = next;
-        } else {
-            i += len;
-            let mut next = vec![false; m + 1];
-            for k in 0..m {
-                if dp[k] && pre_chars[k] == ch {
-                    next[k + 1] = true;
-                }
-            }
-            if next[m] {
-                done = true;
-            }
-            dp = next;
-        }
-    }
-    done || dp[m]
 }
 
 enum Comp<'a> {
@@ -1245,10 +1165,7 @@ impl<'a> Comp<'a> {
         if !c.contains(['*', '?', '[', '{']) {
             return Self::Literal(c);
         }
-        let dot_ok = c.starts_with('.')
-            || (c.starts_with('[')
-                && first_class_end(c).is_some_and(|e| class_matches_char(&c[..=e], '.')))
-            || (c.starts_with('{') && brace_branch_dot_ok(c));
+        let dot_ok = pat_starts_with_dot(c) || (c.starts_with('{') && brace_branch_dot_ok(c));
         Self::Pattern { raw: c, dot_ok }
     }
 
@@ -1257,7 +1174,7 @@ impl<'a> Comp<'a> {
             Self::GlobStar => true,
             Self::Literal(s) => *s == target,
             Self::Pattern { raw, dot_ok } => {
-                (*dot_ok || !target.starts_with('.')) && comp_glob_matches(raw, target)
+                (*dot_ok || !target.starts_with('.')) && comp_glob_matches_impl(raw, target, false)
             }
         }
     }
@@ -1278,7 +1195,7 @@ impl<'a> Comp<'a> {
         match self {
             Self::GlobStar => true,
             Self::Literal(s) => s.starts_with(pre),
-            Self::Pattern { raw, .. } => glob_matches_prefix(raw, pre),
+            Self::Pattern { raw, .. } => comp_glob_matches_impl(raw, pre, true),
         }
     }
 }
@@ -1336,13 +1253,18 @@ impl Tail<'_> {
         reach_indices(self.parts, true, &tgt).contains(&self.parts.len())
     }
 
-    fn matches_tree(&self, tree: &str) -> bool {
+    fn matches_tree_impl(&self, tree: &str, strictly_under: bool) -> bool {
         let tgt = split_comps(tree);
         let Some((&leaf, parents)) = tgt.split_last() else {
             return false;
         };
         if !self.has_globstar {
-            return self.parts.len() >= tgt.len()
+            let len_ok = if strictly_under {
+                self.parts.len() > tgt.len()
+            } else {
+                self.parts.len() >= tgt.len()
+            };
+            return len_ok
                 && self.parts[..tgt.len()]
                     .iter()
                     .zip(&tgt)
@@ -1362,7 +1284,7 @@ impl Tail<'_> {
                     }
                 }
                 comp => {
-                    if comp.matches(leaf) {
+                    if comp.matches(leaf) && (!strictly_under || idx + 1 < self.parts.len()) {
                         return true;
                     }
                 }
@@ -1371,39 +1293,12 @@ impl Tail<'_> {
         false
     }
 
+    fn matches_tree(&self, tree: &str) -> bool {
+        self.matches_tree_impl(tree, false)
+    }
+
     fn matches_strictly_under(&self, root: &str) -> bool {
-        let tgt = split_comps(root);
-        let Some((&leaf, parents)) = tgt.split_last() else {
-            return false;
-        };
-        if !self.has_globstar {
-            return self.parts.len() > tgt.len()
-                && self.parts[..tgt.len()]
-                    .iter()
-                    .zip(&tgt)
-                    .all(|(p, t)| p.matches(t));
-        }
-        for idx in reach_indices(self.parts, true, parents) {
-            if idx >= self.parts.len() {
-                continue;
-            }
-            match &self.parts[idx] {
-                Comp::GlobStar => {
-                    if self.parts[idx..]
-                        .iter()
-                        .all(|c| matches!(c, Comp::GlobStar))
-                    {
-                        return true;
-                    }
-                }
-                comp => {
-                    if comp.matches(leaf) && idx + 1 < self.parts.len() {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        self.matches_tree_impl(root, true)
     }
 
     fn matches_ssh_secret(&self, role: Role) -> bool {
@@ -1483,26 +1378,19 @@ impl<'a> ShellGlob<'a> {
         }
     }
 
-    fn matches_exact(&self, target: &str) -> bool {
-        if self.abs != target.starts_with('/') {
-            return false;
-        }
+    fn as_tail(&self) -> Tail<'_> {
         Tail {
             parts: &self.parts,
             has_globstar: self.has_globstar,
         }
-        .matches_exact(target)
+    }
+
+    fn matches_exact(&self, target: &str) -> bool {
+        self.abs == target.starts_with('/') && self.as_tail().matches_exact(target)
     }
 
     fn matches_tree(&self, tree: &str) -> bool {
-        if self.abs != tree.starts_with('/') {
-            return false;
-        }
-        Tail {
-            parts: &self.parts,
-            has_globstar: self.has_globstar,
-        }
-        .matches_tree(tree)
+        self.abs == tree.starts_with('/') && self.as_tail().matches_tree(tree)
     }
 
     fn tails_after(&self, prefix: &str) -> Vec<Tail<'_>> {
