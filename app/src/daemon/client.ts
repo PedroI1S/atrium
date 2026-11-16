@@ -3,7 +3,7 @@
 // delivery path (contract §11).
 
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { createSignal } from "solid-js";
+import { batch as solidBatch, createSignal } from "solid-js";
 import { inTauri } from "../platform";
 import { timed } from "../chat/perf";
 import { initialDaemonState, isThreadDelivery, reduce, threadOf } from "./reduce";
@@ -43,20 +43,50 @@ export function apply(delivery: Delivery): void {
   }
 }
 
+export type ChannelFrame = Frame | { batch: Frame[] };
+
+const NO_ERROR = Symbol();
+
+function applyOne(item: Frame): unknown {
+  try {
+    timed(`deliver:${item.delivery.type}`, () => apply(item.delivery));
+    return NO_ERROR;
+  } catch (error) {
+    return error;
+  } finally {
+    // A delivery that failed to apply is still acknowledged: holding it back would stall
+    // the window, and the next snapshot replaces the state anyway.
+    applied = item.seq;
+  }
+}
+
+/** Handles one incoming frame (a single delivery or a batch). Exported for tests. */
+export function receiveFrame(incoming: ChannelFrame): void {
+  let firstError: unknown = NO_ERROR;
+  if ("batch" in incoming) {
+    if (incoming.batch.length === 0) return;
+    solidBatch(() => {
+      for (const item of incoming.batch) {
+        const err = applyOne(item);
+        if (err !== NO_ERROR && firstError === NO_ERROR) firstError = err;
+      }
+    });
+  } else {
+    firstError = applyOne(incoming);
+  }
+  scheduleAck();
+  if (firstError !== NO_ERROR) throw firstError;
+}
+
 /** Starts receiving. Called once, before the first render; a reloaded webview calls it again. */
 export async function attach(): Promise<void> {
   if (!inTauri) return;
-  const channel = new Channel<Frame>();
-  channel.onmessage = (frame) => {
-    try {
-      timed(`deliver:${frame.delivery.type}`, () => apply(frame.delivery));
-    } finally {
-      // A delivery that failed to apply is still acknowledged: holding it back would stall
-      // the window, and the next snapshot replaces the state anyway.
-      applied = frame.seq;
-      scheduleAck();
-    }
-  };
+  const channel = new Channel<ChannelFrame>();
+  channel.onmessage = receiveFrame;
+  if (ackTimer !== undefined) {
+    clearTimeout(ackTimer);
+    ackTimer = undefined;
+  }
   applied = 0;
   acknowledged = 0;
   await invoke("bridge_attach", { channel });
