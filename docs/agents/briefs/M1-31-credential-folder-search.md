@@ -36,3 +36,6 @@ Owned paths widen to the glob normalizer in `deny.rs` (`apply_dotdot`, `normaliz
 - [ ] Show your new tests (and the un-ignored ones) fail on `dev`'s code and pass now: check out `dev`'s versions of the src files you changed, run, restore.
 - [ ] `git diff dev --stat` touches only your owned paths.
 - [ ] Handoff `docs/agents/handoffs/M1-31-credential-folder-search.md`: what changed and where, a verdict table (dev vs now) for every line you tested, ordinary-line checks, the outputs, anything escalated.
+
+## Added scope (D-120, orchestrator, 2026-11-16): N9
+`adversarial_regression.rs` `round_5_blocker_1_searches_and_walkers_reaching_a_folder_linked_into_ssh` fails on Linux on `dev` too. Its fixture lives under `std::env::temp_dir()`, which is `/tmp` on Linux, so the "ordinary" lines `cd /tmp && rg x` and `find /tmp -name x` really reach the fake `.ssh`. Change only those two lines of the test: point them at a folder outside the fixture (a fresh empty temp folder, made the same way). Don't weaken anything else.
