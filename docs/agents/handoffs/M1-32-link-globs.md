@@ -1,6 +1,6 @@
 # M1-32-link-globs: handoff
 
-**State: S11 complete (rework round 1 fixed); K5 closed under D-125.**
+**State: S11 complete (rework round 2 fixed); K5 closed under D-125.**
 
 Brief read from `dev`: `docs/agents/briefs/M1-32-link-globs.md` (including scope change D-125: K5 is closed as correct behaviour; scope is S11 only).
 
@@ -34,6 +34,15 @@ Brief read from `dev`: `docs/agents/briefs/M1-32-link-globs.md` (including scope
 - **Finding 6 (major — unreadable glob directories are treated as successfully checked):** fixed in `expand_glob_with` by treating `read_dir`, directory-entry, `symlink_metadata`, and `metadata` errors (other than `NotFound` or non-directory targets) as `truncated = true` while preserving any already-found matches; pinned by `rework1_finding6_unreadable_glob_dir_fails_closed_to_ask` in `crates/atrium-core/tests/M1-32-link-globs.rs`.
 - **Finding 7 (minor — handoff still requests the already-decided K5 change):** fixed in `docs/agents/handoffs/M1-32-link-globs.md` by recording K5 as closed under D-125 and removing the blocked/decision-needed request.
 - **Test gaps:** added `rework1_finding1_*`..`rework1_finding6_*` and explicit ordinary-folder rows (`ls proj_clean/to_other`, `cat proj_clean/to_other` -> `["Allow", "Allow", "Allow"]`) in `crates/atrium-core/tests/M1-32-link-globs.rs`.
+
+---
+
+## Rework round 2
+
+- **Regression in `adversarial_m1_18::k2_links_at_any_hop_unexpanded_globs_and_following_walkers` (`cat big_dir/*/id_rsa`):**
+  - Root cause: in rework round 1 (`9de4899`), `expand_glob_with` (`crates/atrium-core/src/policy/gate.rs:933,943`) changed `seen > MAX_ENTRIES` and `stack.len() > MAX_ENTRIES` from `return None;` to `truncated = true; break;`. On `big_dir` (4150 dirs + `z_ssh -> ~/.ssh`), `read_dir` pushed up to 4096 entries onto `stack` before breaking (including `z_ssh` depending on filesystem iteration order), and the subsequent literal component `"id_rsa"` (`!is_pat`) skipped `read_dir` and resolved `big_dir/z_ssh/id_rsa` via `symlink_metadata`, turning the over-budget glob from `Ask` (`Reach::Maybe`) into `HardDeny` (`Reach::Yes`).
+  - Fix: restored `return None` in `expand_glob_with` when `seen > MAX_ENTRIES` or `stack.len() > MAX_ENTRIES` (matching `dev` for over-budget glob walks while keeping `truncated = true` for unreadable directories / I/O errors from Finding 6 and `MAX_DEPTH` in `**`).
+  - Pinned by `rework2_over_budget_glob_and_non_ssh_id_rsa_do_not_hard_deny` in `crates/atrium-core/tests/M1-32-link-globs.rs` (verifies `cat big_dir/*/id_rsa` -> `["Ask", "Ask", "Ask"]`, `cat plain/*/id_rsa` -> `["Ask", "Allow", "Allow"]`, and `Glob` `plain` `id_rsa` -> `["Allow", "Allow", "Allow"]`).
 
 ---
 

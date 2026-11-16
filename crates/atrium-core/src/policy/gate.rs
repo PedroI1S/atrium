@@ -931,8 +931,9 @@ fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
             };
             seen += 1;
             if seen > MAX_ENTRIES {
-                truncated = true;
-                break;
+                // Over-budget walks cannot be verified without depending on
+                // directory iteration order; fail closed to Ask (`None`).
+                return None;
             }
             let name = e.file_name().to_string_lossy().to_string();
             if !include_dotfiles && name.starts_with('.') && !c.starts_with('.') {
@@ -941,8 +942,7 @@ fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
             let path = dir.join(&name);
             if c == "**" {
                 if stack.len() > MAX_ENTRIES {
-                    truncated = true;
-                    break;
+                    return None;
                 }
                 // `**` ends at this entry, or goes on below it
                 stack.push((path.clone(), k + 1, deep));
