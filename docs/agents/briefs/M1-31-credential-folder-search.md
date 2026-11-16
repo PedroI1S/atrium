@@ -19,6 +19,10 @@ S8 (M1-13 finding 5): `rg x ~/.aws` (a recursive search of a folder that holds a
 1. A recursive search (rg, grep -r, find, fd, ag, ack, git grep with a pathspec, and the `Paths { recursive: true }` subject) whose root is a folder that contains a hard-denied path (`~/.aws`, `~/.ssh`, `~/.gnupg`, …, and their ancestors up to but not including `~` itself) is a hard deny. A search of `~` itself keeps `dev`'s verdict (it would make every home-wide search a hard deny). CR-12 stores keep asking (D-082).
 2. Tests: each tool and spelling on each hard-denied folder, relative and home-anchored; non-recursive reads of the folder listing (`ls ~/.aws`) keep `dev`'s verdict; ordinary recursive searches (`rg x src`, `rg x ~/proj`, `rg x ~`) keep `dev`'s verdict. Un-ignore finding 5.
 
+## Added scope (D-121: reopened known limit, done in this task's next round)
+Owned paths widen to the glob normalizer in `deny.rs` (`apply_dotdot`, `normalize_glob_variants` and their helpers, ~1518–2075).
+- **K10:** search globs with 400 or more `*/` segments followed by as many `..` take a few seconds to evaluate (cost roughly quadratic until the variant cap trips). Make the normalizer's cost linear or bounded per glob (for example, a work budget that fails closed to Ask once spent, or collapsing runs of `wildcard/..` in one step), so any glob up to the input size limit evaluates in well under 50 ms, with the same verdicts.
+
 ## Rules
 - Work only in your worktree; commit on your branch only. Never push, merge or rebase. Never run a real provider.
 - Five other tasks (M1-27 to M1-32) change the policy code at the same time. Stay inside your owned paths and the line ranges named there. If the fix needs a change elsewhere, stop that part and say so in the handoff: don't make it.

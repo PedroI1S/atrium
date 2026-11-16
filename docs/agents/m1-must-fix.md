@@ -6,7 +6,7 @@ M0 spikes are merged as spikes: they answered their questions, but they aren't p
 
 Each row below starts with its state: ✅ done (with evidence), 🟡 in progress, ⬜ open, ➡️ belongs to a later milestone. Open before the M1 gate:
 - **Done:** M1-18 merged (`fb77f20b`, 2026-11-16): S1/CR-12, P1, K1–K4 closed, with known limits K7–K10 below. **In progress:** M1-08L, rodrigo's live Codex checks (X1–X3).
-- **Open blockers:** none. **CR-19** (engine shell/wrapper/`sudo` names matched case-sensitively; Argon: high for the gate) is approved for the post-M1-18 batch (D-118).
+- **Open blockers:** none. **D-120/D-121:** every known limit is reopened and assigned to the M1-27 batch (K5, K7–K10, R1–R3). **CR-19** (engine shell/wrapper/`sudo` names matched case-sensitively; Argon: high for the gate) is approved for the post-M1-18 batch (D-118).
 - **Open, minor:** S5, S7, S8, S11 (their tests are still ignored); K5; N3 and N6 need Linux runs (rodrigo; M1-19 merged). N5 and L10 are "later".
 - **Decided (D-111):** Linux idle memory < 165 MB; Linux TTI is a gate; the Linux frame statistic counts frames over 1.5 × the interval; `bridge.rs` batching now; damaged messages export marked (CR-16, ✅ M1-25 merged); S5/S7/S8/S11/K5 + four more stores (CR-17) after M1-18; P2 now (CR-18, ✅ M1-26 merged).
 - **The gate itself (PLAN §8):**
@@ -134,18 +134,26 @@ Rounds 3–8 worked through S2–S13 (the handoff says how each was handled); S1
 | K3 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 3: `shell_c_code` stops at `-o`/`+o`/`-O`/`+O` values; `long_name` ignores 1–2 letter GNU prefixes (`script --c`, `flock --c`). |
 | K4 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 4: `find_exec_units` doesn't extract `payloads_of`, `env_payloads` or `code_subs` from `-exec` commands. |
 | K6 | — | 🟡 M1-18 covered CR-12's list; finding 6 stays ignored for the four stores CR-17 adds (post-M1-18 batch). On merged `dev`, 7 tests are still ignored. 6 are marked `#[ignore = "M1-13 finding N"]`: findings 4 (S7), 5 (S8), 6 (S1, CR-12), 10 (S11), and 11 (S5) twice. Fixing a finding means un-ignoring its test. |
-| K5 | minor | ⬜ **Open.** `rg -L pat` with no folder, run from a working folder that holds a link into `~/.ssh`, is a hard deny (`dev`: Ask/Allow/Allow). This is round 6's design, not a regression from the fix. |
+| K5 | minor | 🟡 **In M1-32** (D-119, reopened D-121). `rg -L pat` with no folder, run from a working folder that holds a link into `~/.ssh`, is a hard deny (`dev`: Ask/Allow/Allow). This is round 6's design, not a regression from the fix. |
+
+### M1-23's escalations (reopened by D-121, in M1-29)
+
+| # | Sev. | Limit |
+|---|---|---|
+| R1 | major | 🟡 **In M1-29.** Rule path scope: `all_paths` adds the cwd and every path-like word, and `path_scope_ok` uses `all` for deny rules too, so a scoped command rule never matches in Home and a scoped deny rule fails open on multi-path calls. |
+| R2 | major | 🟡 **In M1-29.** Allow rules cover only top-level units: a prefix rule on `find` covers `find -exec <cmd>`, one on `python3` covers `python3 -c '<code>'`. |
+| R3 | minor | 🟡 **In M1-29.** No daemon-side `CreateRule` guard: any socket client can create an allow rule on a shell, wrapper or privilege tool. |
 
 ### M1-18 merged (`fb77f20b`, 2026-11-16): known limits
 
-Five fix rounds (D-099–D-115). The last reviews found no Allow on a sensitive path that `dev` doesn't already allow, no false hard deny and no needless ask on ordinary lines (`reviews/M1-18-policy-followup-round6.md`, Sonnet, D-117). Left, by the driver's merge decision:
+Five fix rounds (D-099–D-115). The last reviews found no Allow on a sensitive path that `dev` doesn't already allow, no false hard deny and no needless ask on ordinary lines (`reviews/M1-18-policy-followup-round6.md`, Sonnet, D-117). Left at the merge; **reopened by D-121** (the 100% gate, D-120) and assigned to the M1-27 batch:
 
 | # | Sev. | Known limit |
 |---|---|---|
-| K7 | minor | ⬜ `sh -c` scripts that are only a positional-parameter expansion (`sh -c '$0' 'cat .ssh/id_rsa'`) aren't resolved to what they run: Ask in Home and under prefix rules, Allow under Any and FullAccess. Same as `dev`. |
-| K8 | nit | ⬜ A `**` search rooted at the home folder asks in Home, because it could reach `.zsh_sessions` (CR-12 trees). |
-| K9 | nit | ⬜ `env` with more than about 24 words before the command fails closed to Ask in every setting, including Any and FullAccess. |
-| K10 | nit | ⬜ Search globs with 400 or more `*/` segments followed by as many `..` segments take a few seconds to evaluate, then ask. |
+| K7 | minor | 🟡 **In M1-27** (D-121). `sh -c` scripts that are only a positional-parameter expansion (`sh -c '$0' 'cat .ssh/id_rsa'`) aren't resolved to what they run: Ask in Home and under prefix rules, Allow under Any and FullAccess. Same as `dev`. |
+| K8 | nit | 🟡 **In M1-30** (D-121). A `**` search rooted at the home folder asks in Home, because it could reach `.zsh_sessions` (CR-12 trees). |
+| K9 | nit | 🟡 **In M1-27** (D-121). `env` with more than about 24 words before the command fails closed to Ask in every setting, including Any and FullAccess. |
+| K10 | nit | 🟡 **In M1-31** (D-121). Search globs with 400 or more `*/` segments followed by as many `..` segments take a few seconds to evaluate, then ask. |
 
 ## From the M1 Linux checks (`handoffs/M1-14a-linux-host.md` on `agent/sonnet/M1-14a-linux-host`; 2026-11-13)
 

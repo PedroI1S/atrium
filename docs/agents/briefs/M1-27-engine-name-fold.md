@@ -21,6 +21,11 @@ CR-19 (`docs/agents/change-requests.md`): the engine compares command basenames 
 1. Fold names as `deny.rs` folds paths (lowercase plus `ſ`→`s`) at every place that compares a command name to a list or a literal, in the owned ranges. Keep the original word for anything printed or matched against rules (rules are matched as written; the rule editor already refuses folded spellings of shells).
 2. Tests: `/bin/BASH -c 'cat ~/.ssh/id_rsa'`, `Bash -c`, `/bin/baſh -c`, `/usr/bin/ENV rm -rf ~`, `ENV -S 'sh -c' '…'`, `SUDO id`, `Sudo -i`, `PYTHON3 -c '…'`, `NICE sudo id`, `/bin/Ksh -c` (K as U+212A) each get the same verdict as the lowercase form, in Home, under a prefix rule, Any and FullAccess. Ordinary lines with capitals (`Makefile`-style commands, `./Build.sh`, `CMake`) keep `dev`'s verdict.
 
+## Added scope (D-121: reopened known limits, done in this task's next round)
+Owned paths widen to `shell.rs` `shell_c_codes` (~2090–2110), `payloads_of` (~3161) and `expand_unknown_env_cmd` (~3469–3680). Still not the word reader (~700–950).
+- **K7:** `sh -c` scripts that are only a positional-parameter expansion (`sh -c '$0' 'cat .ssh/id_rsa'`, `sh -c '"$1"' x 'cat …'`, `bash -c '$@' …`, `${0}`, `"$*"`) must resolve to the words they expand to, so the payload is checked like `sh -c 'cat .ssh/id_rsa'`. Where it can't be resolved exactly, fail closed (Ask everywhere), never Allow.
+- **K9:** `env` with more than about 24 words before the command (`MAX_UNKNOWN_STARTS`) asks in every setting, including Any and FullAccess. Make long but readable `env` lines (many known options, many `NAME=value` assignments) get the same verdict as the short form; keep failing closed only when the line truly can't be read within a bounded cost.
+
 ## Rules
 - Work only in your worktree; commit on your branch only. Never push, merge or rebase. Never run a real provider.
 - Five other tasks (M1-27 to M1-32) change the policy code at the same time. Stay inside your owned paths and the line ranges named there. If the fix needs a change elsewhere, stop that part and say so in the handoff: don't make it.

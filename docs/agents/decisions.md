@@ -761,3 +761,12 @@ M1-27, M1-30, M1-31 and M1-32 start first (at most 4 Hydrogen jobs, D-104); M1-2
 
 ## D-120 — 2026-11-16 — Pedro: the task gate is 100%
 Pedro: "M1 was supposed to have 14 tasks and it has come to 34 … we should stop overlooking things in the task gates; if it's not 100%, just rework until it gets there." From now on a task merges only when its last review is "approve" with no open findings. Every finding, whatever its severity and including "same as `dev`" gaps in the task's area, is fixed in the same task through rework rounds; a fix that needs other paths widens that task (or joins the running task that owns them), never a new task. Non-converging rounds escalate the model (PLAN §8.3). Only the driver grants exceptions, each recorded here. Written into PLAN §8.4, `docs/agents/README.md` and `CLAUDE.md`. It applies to M1-27 to M1-32, which are running now. The known limits recorded before this decision (K7–K10 and earlier) stay as decided unless the driver reopens them.
+
+## D-121 — 2026-11-16 — Pedro: reopen M1's known limits under the 100% gate
+Pedro chose "Reopen them" for the limits recorded before D-120. Each goes into a task of the M1-27 batch that owns (or now owns) its code, never a new task:
+- **K5** (`rg -L`'s false block): already in M1-32.
+- **K7** (`sh -c '$0'` positional scripts) and **K9** (long `env` lines ask everywhere): M1-27, widened to `shell_c_codes`, `payloads_of` and `expand_unknown_env_cmd`.
+- **K8** (a home-wide `**` search asks in Home): M1-30 (its owned range).
+- **K10** (slow `*/..` globs): M1-31, widened to the glob normalizer.
+- **The M1-23 escalations** (path-scope semantics, `find -exec` and inline code under prefix rules, no daemon-side `CreateRule` guard): M1-29 (queued, not started), widened to the engine's rule matchers and the daemon's `create_rule`; its reviewer becomes Opus (security).
+The running tasks (M1-27, M1-30, M1-31) take the added scope in their next round, before their review.

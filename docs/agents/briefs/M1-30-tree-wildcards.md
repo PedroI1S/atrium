@@ -19,6 +19,9 @@ S5 (M1-13 finding 11): a wildcard in the name of a credential tree or Atrium fol
 1. When a path component of a word or glob is a pattern, test it against the names of the hard-denied and ask trees (and Atrium's folders) as a pattern, not as a literal: if it could match a sensitive name, treat the path as touching that tree, with the same verdict as the plain name.
 2. Tests: `*`, `?`, classes and braces in each component of each tree name, home-anchored and relative, in reads, searches and command words; ordinary globs (`~/.config/*/settings.json`, `~/Documents/*.md`, `src/*.rs`) keep `dev`'s verdict. Un-ignore both finding-11 tests.
 
+## Added scope (D-121: reopened known limit, done in this task's next round)
+- **K8:** a `**` search rooted at the home folder (`Search ["~"] **/*.rs`, `rg --glob '**/*.rs' x ~`) asks in Home, because `ask_search_glob_hit`'s ASK_TREES check (inside your owned range) treats `**` as possibly reaching `.zsh_sessions`. Make it ask only when the glob's later components could match a file in an ask tree (`**/*.session`, `**/*`), not for `**/*.rs`. Keep the CR-12 trees asking for globs that can match their files.
+
 ## Rules
 - Work only in your worktree; commit on your branch only. Never push, merge or rebase. Never run a real provider.
 - Five other tasks (M1-27 to M1-32) change the policy code at the same time. Stay inside your owned paths and the line ranges named there. If the fix needs a change elsewhere, stop that part and say so in the handoff: don't make it.

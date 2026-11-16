@@ -1,7 +1,7 @@
 # M1-32-link-globs: globs that reach a credential through a symlink; `rg -L`'s false block (S11, K5)
 
 Model: Gemini 4 Hydrogen (`gemini-4-hydrogen-high`, `scripts/agent-run agy`) · Reviewer: Claude Opus 5.5 (read-only, cross-provider; security) · Depends on: nothing open (runs on `dev` after M1-18)
-Go: D-111; D-119 (Pedro: the batch split into M1-27 to M1-32) · Branch: `agent/hydrogen/M1-32-link-globs` · Worktree: `../atrium-wt/M1-32-link-globs`
+Go: D-111; K5 reopened under D-121; D-119 (Pedro: the batch split into M1-27 to M1-32) · Branch: `agent/hydrogen/M1-32-link-globs` · Worktree: `../atrium-wt/M1-32-link-globs`
 
 ## Goal
 Two symlink items, in the same code:
