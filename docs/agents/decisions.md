@@ -657,3 +657,20 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
   - The local `agent/*` branches already merged into `dev` are deleted locally.
   - Remote `agent/*` branches go once `origin/dev` contains them.
   - The orchestrator recorded the deletions in the session log.
+
+## D-104 — 2026-11-16 — Pedro: more freedom for Hydrogen, more tasks in parallel
+**Decided by Pedro (driver):** "hydrogen wont make the same mistakes as flash, you can give it a little more freedom, run more of the pending tasks, and break them off in multiple agents to acelarate the process".
+
+**The worker policy (`scripts/agy-policy.py`), loosened by the orchestrator** (tested against 16 sample calls):
+- **File tools** check only the arguments that name a path, no longer the content being written. Tests may now contain `~/.ssh`, `../` or credential paths as literals. This lifts D-074's routing reason for test writing. Paths outside the worktree, and `.agents/`, are still refused.
+- **Shell:**
+  - loops are allowed (`for … do … done`, `seq`, `sleep`, `time`), so workers can run their own 20-run checks;
+  - also allowed: `python3`, `scripts/check-protocol-ts`, `scripts/doctor`;
+  - read-only git is allowed (`ls-tree`, `cat-file`, `merge-base`, `rev-list`, `shortlog`, `describe`).
+- **Still refused:** network tools, nested shells, command substitution, `~` and `../` in command lines, and `git push`/`merge`/`rebase`/`switch`.
+
+**New tasks, in parallel with M1-19** (Hydrogen `high`, within the limit of four Hydrogen jobs):
+- **M1-20-gate-audit** (`briefs/M1-20-gate-audit.md`): a read-only, evidence-backed check of PLAN's M1 scope, contract rev 3 and the promotion additions against `dev`, for the gate review.
+- **M1-21-demo** (`briefs/M1-21-demo.md`): the gate demo. It is scripted end to end with the fake agent, comes with a written live-demo script, and is reviewed by Sonnet 5.5.
+
+**Waiting on M1-18's merge** (same policy files): S5, S7, S8, S11, K5, and the Settings list of protected paths (CR-12). Hydrogen now takes these too.

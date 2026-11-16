@@ -31,11 +31,19 @@ ALLOWED = {
     "find", "sed", "awk", "mkdir", "touch", "cp", "mv", "basename", "dirname",
     "date", "tee",
     "cargo", "rustc", "rustfmt", "pnpm", "npm", "node", "tsc",
+    # D-104: loops for repeated test runs, and the repo's own check scripts.
+    "for", "done", "seq", "sleep", "python3",
+    "scripts/check-protocol-ts", "./scripts/check-protocol-ts", "scripts/doctor", "./scripts/doctor",
 }
+# Words that only prefix another command (`do cargo test`, `time cargo test`):
+# stripped, then the rest is checked as a command of its own (D-104).
+PREFIXES = {"do", "then", "else", "time"}
 # git subcommands a worker may use on its own branch.
 GIT_ALLOWED = {
     "status", "diff", "log", "show", "add", "commit", "rev-parse", "ls-files",
     "blame", "grep", "branch", "restore", "mv", "rm",
+    # D-104: read-only inspection.
+    "ls-tree", "cat-file", "merge-base", "rev-list", "shortlog", "describe",
 }
 GIT_DENIED_FLAGS = {"-D", "-d", "-m", "-M", "--delete", "--move", "-f", "--force"}
 # Patterns that are never allowed anywhere in the command line.
@@ -73,8 +81,8 @@ def decide(cmdline: str, roots: list[str]) -> tuple[str, str]:
             words = shlex.split(segment)
         except ValueError:
             return "deny", "could not parse command"
-        while words and re.fullmatch(r"[A-Z_][A-Z0-9_]*=\S*", words[0]):
-            words = words[1:]  # leading VAR=value assignments
+        while words and (re.fullmatch(r"[A-Z_][A-Z0-9_]*=\S*", words[0]) or words[0] in PREFIXES):
+            words = words[1:]  # leading VAR=value assignments and loop/time prefixes
         if not words:
             continue
         cmd = words[0]
@@ -137,8 +145,25 @@ WRITE_TOOLS = {
 }
 
 
+# Argument names that hold a path. Only these are checked, so a file's content
+# (a test with `~/.ssh` or `../` in it, say) is not mistaken for a path (D-104).
+PATH_KEY = re.compile(r"path|file|dir|target(?!content)|uri|cwd|root", re.I)
+
+
+def path_strings(value, key=""):
+    if isinstance(value, str):
+        if PATH_KEY.search(key) and not re.search(r"content|instruction|description|query|pattern", key, re.I):
+            yield value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from path_strings(v, k)
+    elif isinstance(value, list):
+        for v in value:
+            yield from path_strings(v, key)
+
+
 def check_paths(args: dict, roots: list[str], writing: bool = False) -> tuple[str, str]:
-    for value in strings(args):
+    for value in path_strings(args):
         if writing and (value.startswith(".agents") or "/.agents/" in value or value.endswith("/.agents")):
             return "deny", "workers may not modify .agents/ (agent configuration and policy)"
         if value.startswith("~") or "../" in value:
