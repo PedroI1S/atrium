@@ -104,7 +104,9 @@ pub fn spawn_group(mut command: tokio::process::Command) -> io::Result<Supervise
 ///
 /// How long it takes: up to `grace`, then the reap of the `SIGKILL`ed leader
 /// (prompt, unless the kernel holds it, e.g. in uninterruptible sleep), then
-/// up to 2 s for the rest of the group to drain.
+/// up to 2 s for the rest of the group to drain. On macOS, a group kill that
+/// answers `EPERM` while the leader is exiting adds up to 50 ms
+/// (`MACOS_EPERM_EXIT_POLL`).
 pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Result<Termination> {
     let (pid, pgid) = check_unreaped_leader(child)?;
     let exited_in_grace = wait_until_exited_no_reap(pid, grace).await?;
@@ -135,7 +137,8 @@ pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Resu
 /// It blocks the calling thread for up to `grace`, then for the reap of the
 /// `SIGKILL`ed leader (prompt, but unbounded if the kernel holds the leader,
 /// e.g. in uninterruptible sleep), then for up to 2 s while the rest of the
-/// group drains.
+/// group drains. On macOS, a group kill that answers `EPERM` while the leader
+/// is exiting adds up to 50 ms (`MACOS_EPERM_EXIT_POLL`).
 pub fn terminate_blocking(child: &mut SupervisedChild, grace: Duration) -> io::Result<Termination> {
     let (pid, pgid) = check_unreaped_leader(child)?;
     let exited_in_grace = wait_until_exited_no_reap_sync(pid, grace)?;
