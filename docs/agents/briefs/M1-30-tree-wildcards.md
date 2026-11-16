@@ -35,3 +35,6 @@ S5 (M1-13 finding 11): a wildcard in the name of a credential tree or Atrium fol
 - [ ] Show your new tests (and the un-ignored ones) fail on `dev`'s code and pass now: check out `dev`'s versions of the src files you changed, run, restore.
 - [ ] `git diff dev --stat` touches only your owned paths.
 - [ ] Handoff `docs/agents/handoffs/M1-30-tree-wildcards.md`: what changed and where, a verdict table (dev vs now) for every line you tested, ordinary-line checks, the outputs, anything escalated.
+
+## Added scope (D-120, orchestrator, 2026-11-16): the fuzz test, after M1-28
+`adversarial_fuzz.rs` `random_spellings_of_sensitive_paths_are_always_hard_denied` (M1-13 finding 11) needs two fixes. One is M1-28's: the `cd <glob>` shape, in `words.rs` `cd_effect`. The other is this task's: case-folded and wildcard spellings of Atrium's own folders, such as `$HOME/.l""ocal/SH?RE//ATRIUM/atrium.db`, which ask today, in `deny.rs` `glob_hit`/`probes`. Fix this task's half now, with its own test. **M1-28 merges first.** This task then rebases on `dev` and removes that `#[ignore]` as its last step, so the full fuzz test passes before its final review.
