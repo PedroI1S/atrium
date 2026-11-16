@@ -56,7 +56,28 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
 ## Checks run by this worker (D-123)
 
 - `cargo fmt --all`: exited 0.
-- `cargo check -p atrium-core --tests`: exited 0 (7.45s, 0 warnings).
+- `cargo check -p atrium-core --tests`: exited 0 (7.45s, 0 warnings on initial pass; 0.49s, 0 warnings in rework round 1).
+
+## Rework round 1
+
+1. **`Read ~/**/*.rs` failure at `crates/atrium-core/tests/M1-30-tree-wildcards.rs:738`:**
+   - **Root cause:** `Sensitive::ask_hit` called `Tail::matches_dir_and_name_prefix(".azure", "msal_token_cache.")` -> `Comp::matches_prefix`, which used `comp_glob_matches_impl("*.rs", "msal_token_cache.", true)`. Because `comp_glob_dp` with `prefix = true` short-circuits as soon as `GlobAtom::Star` fills `dp[m] = true`, `*.rs` falsely matched the prefix `"msal_token_cache."`. Meanwhile `ask_search_glob_hit` had its own `PREFIX_PROBES` / `matches_prefix_pat` filter.
+   - **Fix (`crates/atrium-core/src/policy/deny.rs`):** Extracted a shared `ASK_PREFIX_PROBES` + `matches_ask_name_prefix_pat(file_pat, pre)` helper used by both `Comp::matches_prefix` (for `ask_hit` / `Tail::matches_dir_and_name_prefix`) and `Sensitive::ask_search_glob_hit` (also handling `dir_rel.is_empty()` with `**/` or `dir_abs/`). Now `Read ~/**/*.rs`, `Read ~/**/*.md`, `Read ~/.azure/*.rs`, and `Search ["~"] false ".azure/*.rs"` allow in Home, while `~/**/msal_token_cache.*`, `~/.[a]zure/*`, and `~/.[a]zure/*.json` continue to ask.
+
+2. **`k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree` expectations (`crates/atrium-core/tests/M1-30-tree-wildcards.rs`):**
+   - **`**/*.toml` and `**/*.{rs,toml}`:** The test expected `Allow` in Home, which was wrong: `ASK_FILES` (CR-12) includes `.cargo/credentials.toml`, so `ask_probes()` matches `~/.cargo/credentials.toml` against `**/*.toml` (just as on `dev`). Per the brief, K8 suppresses false positives from `ASK_TREES` when later components cannot match a file in an ask tree, while keeping CR-12 ask files/trees asking for globs that can match their files. Moved `**/*.toml` and `**/*.{rs,toml}` to the `Ask` list (`["Ask", "Allow", "Allow"]`), and added `**/*.{rs,md}` and `.azure/*.rs` to the `Allow` list.
+   - **`**/*.json`, `**/*`, `**`, `**/`:** These were in the `["Ask", "Allow", "Allow"]` loop after `**/*.toml` (not reached when `**/*.toml` failed). In `DefaultPolicy::evaluate`, `hard_deny` (`search_glob_hit`) runs before `ask_search_glob_hit`, and `CRED_FILES` probes (`.docker/config.json`, `.netrc`, `.claude.json`, `.codex/auth.json`, etc.) match those globs -> `Hard(credential-read)` in all presets (same as `dev`). Moved them to assert `["Hard(credential-read)", "Hard(credential-read)", "Hard(credential-read)"]`, and added `**/token.json`, `**/cache.json`, and `**/*.cache` to the `["Ask", "Allow", "Allow"]` list to exercise `.aws/sso/cache` and `ASK_NAME_PREFIXES` without hitting `CRED_FILES`.
+
+3. **Full workspace test failure investigation (9/10 failing in 0.03s, 7 in `common_adversarial/mod.rs:180`):**
+   - Audited `crates/atrium-core/tests/M1-30-tree-wildcards.rs`, `crates/atrium-core/tests/common_adversarial/mod.rs`, and `crates/atrium-core/src/policy/` for any global/shared state, `std::env` mutation, real `$HOME`/`/tmp` usage, or test-order dependency:
+     - `DefaultPolicy::new().evaluate(...)` in `engine.rs`/`deny.rs` is pure (zero filesystem reads, zero `std::env`, zero mutable globals; `shell.rs` only uses monotonic `AtomicU32` IDs for equality within one lex call).
+     - All existing tests in `M1-30-tree-wildcards.rs` use stack-local `Env::home()` / `env_with_app_support()` with virtual `HOME = "/h/u"` and `resolved_paths: &[]`.
+     - Notably, only 7 tests in `M1-30-tree-wildcards.rs` call `run_table` (`common_adversarial/mod.rs:180`): tests 1–6 plus test 9 (`globstar_tree_leaf_rules_preserve_ordinary_globs_and_block_sensitive_trees`), which only reaches `run_table` (line 747) if `Read ~/**/*.rs` (line 738) passes — which happens on `dev`'s `deny.rs` (where 9/10 tests fail in ~0.03s and 7 fail at `common_adversarial/mod.rs:180`, while only `ordinary_globs_keep_expected_verdicts` passes).
+   - The new `SessionGate` test added in rework round 1 uses its own isolated `common_adversarial::Tmp::new()` temp directory (unique per PID + atomic counter, cleaned up on `Drop`) and never touches real `$HOME` or shared fixtures.
+
+4. **`adversarial_gate.rs` (`finding_11_a_glob_inside_atriums_folder_names_is_blocked`):**
+   - Explained why it already passes on `dev`: `adversarial_gate.rs`'s `world()` fixture creates `.gnupg/private-keys-v1.d/k.key`, `.local/share/atrium/atrium.db`, and `.config/atrium/config.toml` on disk, so `gate.rs:expand_glob` expands every entry in `GLOB_IN_ATRIUM_NAMES` to existing disk paths and passes them in `resolved_paths` to `Sensitive::hit`, which hard-denies them even on `dev`.
+   - Kept `adversarial_gate.rs` untouched beyond removing `#[ignore]` (per brief's owned-paths rule: new tests go in `M1-30-tree-wildcards.rs`), and added `session_gate_blocks_wildcarded_credential_and_atrium_trees_when_absent_on_disk` in `crates/atrium-core/tests/M1-30-tree-wildcards.rs`. It tests wildcarded credential and Atrium folders (`.g*/nonexistent`, `.gem*/oauth_creds.json`, `.con*/gcloud/credentials.db`, `.local/share/atr*/missing.db`, `.config/atr*/new.toml`, `.s?h/nonexistent`) through `SessionGate` when those targets do not exist on disk (`gate.rs:expand_glob` returns empty, so `dev` returns `Ask` and fails, while this branch returns `Deny` and passes).
 
 ## Commands for the verification task (DoD)
 
@@ -64,5 +85,5 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
 2. `cargo clippy --workspace --all-targets -- -D warnings`
 3. `cargo test --workspace --no-fail-fast`
 4. Run `cargo test -p atrium-core` 3 times in a loop and record timings for `adversarial_fuzz` and `policy` (no slowdown).
-5. Checkout `dev:crates/atrium-core/src/policy/deny.rs`, run `cargo test -p atrium-core --test M1-30-tree-wildcards --test adversarial_gate`, confirm the S5/K8 tests fail on `dev`, then restore `HEAD`'s `deny.rs` and re-verify pass.
-6. Confirm `git diff dev --stat` / `git diff 5e693ad6..HEAD --stat` touches only owned paths (`crates/atrium-core/src/policy/deny.rs`, `crates/atrium-core/tests/M1-30-tree-wildcards.rs`, `crates/atrium-core/tests/adversarial_gate.rs`, `docs/agents/handoffs/M1-30-tree-wildcards.md`).
+5. Checkout `dev:crates/atrium-core/src/policy/deny.rs`, run `cargo test -p atrium-core --test M1-30-tree-wildcards`, confirm the 10 S5/K8 tests (all except `ordinary_globs_keep_expected_verdicts`) fail on `dev`, then restore `HEAD`'s `deny.rs` and re-verify all 11 tests pass. (Note: `adversarial_gate::finding_11_a_glob_inside_atriums_folder_names_is_blocked` passes on `dev` because `world()` materializes the target files on disk; `session_gate_blocks_wildcarded_credential_and_atrium_trees_when_absent_on_disk` pins the `SessionGate` behavior against `dev`.)
+6. Confirm `git diff 5e693ad6..HEAD --stat` touches only owned paths (`crates/atrium-core/src/policy/deny.rs`, `crates/atrium-core/tests/M1-30-tree-wildcards.rs`, `crates/atrium-core/tests/adversarial_gate.rs`, `docs/agents/handoffs/M1-30-tree-wildcards.md`).
