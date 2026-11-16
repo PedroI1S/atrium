@@ -530,17 +530,25 @@ fn ordinary_globs_keep_expected_verdicts() {
                 "cat ~/Documents/[A-Z]*.md",
                 ["Ask", "Ask", "Allow", "Allow"],
             ),
-            // Note: `~/.config/*/settings.json` has `*` matching `gcloud` in CRED_TREES
-            // (`.config/gcloud`), matching `cat ~/.config/*/*` (already HardDeny on dev).
+            // Ordinary globs inside ~/.config, ~/.local/share, ~/Library, ~, src must keep `dev`'s verdict.
             (
                 "cat ~/.config/*/settings.json",
-                [
-                    "Hard(credential-read)",
-                    "Hard(credential-read)",
-                    "Hard(credential-read)",
-                    "Hard(credential-read)",
-                ],
+                ["Ask", "Ask", "Allow", "Allow"],
             ),
+            (
+                "cat ~/.config/*/README.md",
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            (
+                "cat ~/.local/share/*/notes.md",
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            ("cat ~/Library/*/notes.md", ["Ask", "Ask", "Allow", "Allow"]),
+            ("cat ~/*/*/notes.md", ["Ask", "Ask", "Allow", "Allow"]),
+            ("cat **/*.rs", ["Ask", "Ask", "Allow", "Allow"]),
+            ("ls **/*.rs", ["Ask", "Ask", "Allow", "Allow"]),
+            ("cat src/**/mod.rs", ["Ask", "Ask", "Allow", "Allow"]),
+            ("ls src/**/mod.rs", ["Ask", "Ask", "Allow", "Allow"]),
         ],
     );
 }
@@ -910,6 +918,235 @@ fn session_gate_blocks_wildcarded_credential_and_atrium_trees_when_absent_on_dis
         assert!(
             matches!(d, GateDecision::Deny { .. }),
             "{line}: wanted Deny, got {d:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "escalated: requires changing Sensitive::search_glob_hit (owned by M1-31)"]
+fn rework_round2_finding_1_non_escaping_search_globs_escalated() {
+    let env = Env::home();
+    let any_search = vec![rule(
+        RuleScope::Global,
+        ToolKind::Search,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "any-search",
+    )];
+    for (glob, want_id) in [
+        (".g*/private-keys-v1.d/k.key", CR),
+        (".local/share/atr*/missing.db", AS),
+    ] {
+        let c = paths_check(ToolKind::Search, "Search", &["~"], false, Some(glob));
+        for (label, rules, preset) in [
+            ("home", &[][..], Preset::Home),
+            ("any", any_search.as_slice(), Preset::Home),
+            ("full", &[][..], Preset::FullAccess),
+        ] {
+            let v = env.eval_check(&c, rules, preset);
+            assert!(
+                matches!(v, PolicyVerdict::HardDeny { id, .. } if id == want_id),
+                "Search [~] {glob:?} [{label}]: expected Hard({want_id}), got {}",
+                classify(&v)
+            );
+        }
+    }
+}
+
+#[test]
+fn rework_round2_regressions() {
+    let env = Env::home();
+    let any_read = vec![rule(
+        RuleScope::Global,
+        ToolKind::Read,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "any-read",
+    )];
+    let any_search = vec![rule(
+        RuleScope::Global,
+        ToolKind::Search,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "any-search",
+    )];
+
+    // Finding 3: POSIX named character classes.
+    run_table(
+        &env,
+        &[
+            ("cat ~/.s[[:alpha:]]h/id_rsa", Want::Hard(CR)),
+            ("cat ~/.[[:punct:]]sh/id_rsa", Want::Hard(CR)),
+            ("cat ~/.g[[:alpha:]]upg/secring.gpg", Want::Hard(CR)),
+            (
+                "cat ~/.config/[[:alpha:]]cloud/credentials.db",
+                Want::Hard(CR),
+            ),
+            (
+                "cat ~/.local/share/[[:alpha:]]trium/atrium.db",
+                Want::Hard(AS),
+            ),
+            ("cat ~/.s[![:digit:]]h/id_rsa", Want::Hard(CR)),
+        ],
+    );
+    check_4_settings(
+        &env,
+        &[(
+            "cat ~/.s[[:digit:]]h/id_rsa",
+            ["Ask", "Ask", "Allow", "Allow"],
+        )],
+    );
+
+    // Finding 4: `**` leaf exception must cover Atrium data artifacts including WAL, SHM, logs, snapshots.
+    run_table(
+        &env,
+        &[
+            ("cat ~/.local/**/atrium.db-wal", Want::Hard(AS)),
+            ("cat ~/.local/**/atrium.db-shm", Want::Hard(AS)),
+            ("cat ~/.local/**/atrium.db-journal", Want::Hard(AS)),
+            ("cat ~/**/atrium.db-wal", Want::Hard(AS)),
+            ("cat ~/.local/**/snapshots/t1.json", Want::Hard(AS)),
+            ("cat ~/.local/**/logs/daemon.log", Want::Hard(AS)),
+            ("rm ~/.config/**/atrium.sock", Want::Hard(AS)),
+            ("rm ~/.config/**/config.toml", Want::Hard(AS)),
+        ],
+    );
+    check_4_settings(
+        &env,
+        &[
+            (
+                "cat ~/.config/**/config.toml",
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            ("cat ~/.local/**/*.rs", ["Ask", "Ask", "Allow", "Allow"]),
+        ],
+    );
+
+    // Finding 5 & 6: K8 filename families and Azure prefix matching across arbitrary extensions.
+    let check_paths_3 =
+        |kind: ToolKind, name: &str, paths: &[&str], glob: Option<&str>, want: [&str; 3]| {
+            let c = paths_check(kind, name, paths, false, glob);
+            let any_rules = match kind {
+                ToolKind::Read => any_read.as_slice(),
+                ToolKind::Search => any_search.as_slice(),
+                _ => &[],
+            };
+            let got: Vec<String> = [
+                (&[][..], Preset::Home),
+                (any_rules, Preset::Home),
+                (&[][..], Preset::FullAccess),
+            ]
+            .into_iter()
+            .map(|(rules, preset)| classify(&env.eval_check(&c, rules, preset)))
+            .collect();
+            assert!(
+                got.iter().map(String::as_str).eq(want.iter().copied()),
+                "{name} {paths:?} glob={glob:?}: wanted {want:?}, got {got:?}"
+            );
+        };
+
+    // Finding 5: valid session-file searches with arbitrary stems must Ask in Home.
+    for glob in [
+        "**/b.session",
+        "**/b.history",
+        "**/foo.historynew",
+        "**/my.zsh",
+        "**/abc.json",
+    ] {
+        check_paths_3(
+            ToolKind::Search,
+            "Search",
+            &["~"],
+            Some(glob),
+            ["Ask", "Allow", "Allow"],
+        );
+    }
+    for glob in ["**/b.rs", "**/a.session.bak", "**/.DS_Store"] {
+        check_paths_3(
+            ToolKind::Search,
+            "Search",
+            &["~"],
+            Some(glob),
+            ["Allow", "Allow", "Allow"],
+        );
+    }
+
+    // Finding 6: Azure `msal_token_cache.*` with arbitrary extensions.
+    for path in [
+        "~/.a?ure/*token_cache.custom",
+        "~/.a?ure/msal_token_cache.custom",
+        "~/.a?ure/msal_*.custom",
+        "~/.a?ure/*.custom",
+        "~/.a?ure/[m]sal_token_cache.xyz",
+        "~/.a?ure/*token_cache.rs",
+    ] {
+        check_paths_3(
+            ToolKind::Read,
+            "Read",
+            &[path],
+            None,
+            ["Ask", "Allow", "Allow"],
+        );
+    }
+    for glob in [".a?ure/*token_cache.custom", "**/*token_cache.custom"] {
+        check_paths_3(
+            ToolKind::Search,
+            "Search",
+            &["~"],
+            Some(glob),
+            ["Ask", "Allow", "Allow"],
+        );
+    }
+
+    // Finding 7: bare `*` at tree leaf preserves ordinary globs while keeping `*` / `*/*` / `g*` blocked.
+    run_table(
+        &env,
+        &[
+            ("cat ~/.config/*", Want::Hard(CR)),
+            ("cat ~/.config/*/*", Want::Hard(CR)),
+            ("cat ~/.config/g*/settings.json", Want::Hard(CR)),
+        ],
+    );
+
+    // Finding 8: singleton class spellings of exempt SSH files stay Allow/Ask; broader patterns HardDeny.
+    for path in [
+        "~/.s?h/confi[g]",
+        "~/.s?h/[c]onfi[g]",
+        "~/.s?h/{confi[g],[c]onfig}",
+        "~/.s?h/[a]uthorized_keys",
+        "~/.s?h/id_rsa.pu[b]",
+        "~/.s?h/known_host[s]",
+    ] {
+        check_paths_3(
+            ToolKind::Read,
+            "Read",
+            &[path],
+            None,
+            ["Allow", "Allow", "Allow"],
+        );
+    }
+    check_4_settings(
+        &env,
+        &[("cat ~/.s?h/confi[g]", ["Ask", "Ask", "Allow", "Allow"])],
+    );
+    run_table(&env, &[("rm ~/.s?h/confi[g]", Want::Hard(CR))]);
+    for path in [
+        "~/.s?h/confi[gh]",
+        "~/.s?h/confi?",
+        "~/.s?h/confi*",
+        "~/.s?h/{config,id_rsa}",
+        "~/.s?h/id_rsa.pu[bc]",
+    ] {
+        check_paths_3(
+            ToolKind::Read,
+            "Read",
+            &[path],
+            None,
+            [
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+                "Hard(credential-read)",
+            ],
         );
     }
 }
