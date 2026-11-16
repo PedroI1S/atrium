@@ -674,3 +674,19 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **M1-21-demo** (`briefs/M1-21-demo.md`): the gate demo. It is scripted end to end with the fake agent, comes with a written live-demo script, and is reviewed by Sonnet 5.5.
 
 **Waiting on M1-18's merge** (same policy files): S5, S7, S8, S11, K5, and the Settings list of protected paths (CR-12). Hydrogen now takes these too.
+
+## D-105 — 2026-11-16 — Pedro: M1-18's last round is fail-closed, then merge
+**Decided by Pedro (driver):** "Fail-closed round".
+
+**Why:** the Argon review of fix round 1 (`reviews/M1-18-policy-followup-round2.md`) found no Allow regression against `dev`. It did find new spellings around K1, P1 and CR-12, the same convergence pattern as M1-13.
+
+**What fix round 2 does** (Gemini 4 Hydrogen `high`; review Gemini 4 Argon `high`, as D-101):
+- **Stop parsing new spellings and fail closed.** Whatever the parser can't fully read counts as unknown:
+  - an `env`/`command` invocation with any option it doesn't know: its payload is read in every way, or the line asks;
+  - a glob with `$`, `\`, `?` or a character class that could stand for a dot or a slash, or a path that isn't canonical: treated as possibly escaping and possibly naming a store;
+  - git pathspec magic it can't fully strip: treated as naming whatever follows.
+
+  The hard-deny check still runs on everything that can be read.
+- **Fix the rest:** major 4 (an `Allow` path rule at a higher scope masking a lower `Deny` under D-100) and minor 5 (`split_words` and the lex cache).
+
+**After the round:** whatever the Argon review says, the orchestrator brings M1-18 to Pedro for a merge decision, with anything left recorded as a known limit.
