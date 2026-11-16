@@ -690,3 +690,17 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
 - **Fix the rest:** major 4 (an `Allow` path rule at a higher scope masking a lower `Deny` under D-100) and minor 5 (`split_words` and the lex cache).
 
 **After the round:** whatever the Argon review says, the orchestrator brings M1-18 to Pedro for a merge decision, with anything left recorded as a known limit.
+
+## D-106 — 2026-11-16 — Orchestrator, under Pedro's D-104 go: M1-22, `atriumd` registers its adapters
+- **The finding.** M1-20's gate audit (`reviews/M1-20-gate-audit.md`, blocker 1) found that the built `atriumd` registers no agent adapters: `main.rs` never fills `Options::adapters`. Only the tests do. The orchestrator confirmed it in the code. So a real Home chat with Claude Code or Codex can't start, and no test runs the real binary with a native launch.
+- **The task.** It is a blocker and a small fix, inside D-104's "run more of the pending tasks":
+  - M1-22-daemon-adapters (`briefs/M1-22-daemon-adapters.md`) goes to Gemini 4 Hydrogen `high`, reviewed by Sonnet 5.5;
+  - it adds a test against the real binary.
+- **Left for Pedro.** The audit's other gaps are UI surfaces PLAN lists for M1 that `dev` lacks:
+  - export, rename and archive actions;
+  - the rules editor, and the Settings safety disclosures (including CR-12's list);
+  - the enforcement details view;
+  - batch approve/deny;
+  - `⌘⇧J`.
+
+  Whether each lands in M1 or moves to M2 through a CR is Pedro's call. Also his: the Linux idle-memory gate, and the open S5/S7/S8/S11.
