@@ -257,5 +257,141 @@ async fn create_rule_refuses_unsafe_command_allow_rules_and_invalid_path_scopes(
         .await;
     }
 
+    // 7. Rework round 3: option values without scripts, git CLI exec config, invalid matcher/kind, malformed rules
+    let before_count = serde_json::from_value::<Vec<atrium_protocol::policy::Rule>>(
+        wire.ok(DaemonCommand::ListRules).await,
+    )
+    .expect("rules")
+    .len();
+
+    let round3_refused = [
+        // Finding 4: interpreter/runner option values mistaken for scripts or packages
+        cmd_draft(
+            RuleDecision::Allow,
+            exact(&["python3", "-W", "ignore"]),
+            None,
+        ),
+        cmd_draft(RuleDecision::Allow, exact(&["python3", "-X", "dev"]), None),
+        cmd_draft(RuleDecision::Allow, exact(&["python3", "-m"]), None),
+        cmd_draft(RuleDecision::Allow, exact(&["node", "-r", "preload"]), None),
+        cmd_draft(RuleDecision::Allow, exact(&["npx", "-p", "prettier"]), None),
+        // Finding 3: git command-line shell aliases / exec options
+        cmd_draft(RuleDecision::Allow, prefix(&["git", "-c"]), None),
+        cmd_draft(
+            RuleDecision::Allow,
+            exact(&["git", "-c", "alias.clean=!rm -f victim", "clean"]),
+            None,
+        ),
+        cmd_draft(
+            RuleDecision::Allow,
+            prefix(&["git", "--exec-path=/tmp/bin"]),
+            None,
+        ),
+        // Finding 5: Execute PathGlob (and command matcher with non-Execute kind)
+        RuleDraft {
+            scope: RuleScope::Global,
+            tool_kind: ToolKind::Execute,
+            tool_name: None,
+            matcher: RuleMatcher::PathGlob {
+                glob: "/h/u/work/**".into(),
+            },
+            path_scope: Some("/h/u/work/**".into()),
+            decision: RuleDecision::Allow,
+        },
+        RuleDraft {
+            scope: RuleScope::Global,
+            tool_kind: ToolKind::Execute,
+            tool_name: None,
+            matcher: RuleMatcher::PathGlob {
+                glob: "/h/u/work/**".into(),
+            },
+            path_scope: None,
+            decision: RuleDecision::Allow,
+        },
+        RuleDraft {
+            scope: RuleScope::Global,
+            tool_kind: ToolKind::Read,
+            tool_name: None,
+            matcher: prefix(&["cat"]),
+            path_scope: None,
+            decision: RuleDecision::Allow,
+        },
+        // Finding 6: malformed globs (relative, unexpanded ~, .., .) and command control chars / newlines
+        RuleDraft {
+            scope: RuleScope::Global,
+            tool_kind: ToolKind::Edit,
+            tool_name: None,
+            matcher: RuleMatcher::PathGlob {
+                glob: "relative/**".into(),
+            },
+            path_scope: None,
+            decision: RuleDecision::Allow,
+        },
+        RuleDraft {
+            scope: RuleScope::Global,
+            tool_kind: ToolKind::Edit,
+            tool_name: None,
+            matcher: RuleMatcher::PathGlob {
+                glob: "~/work/**".into(),
+            },
+            path_scope: None,
+            decision: RuleDecision::Allow,
+        },
+        RuleDraft {
+            scope: RuleScope::Global,
+            tool_kind: ToolKind::Edit,
+            tool_name: None,
+            matcher: RuleMatcher::PathGlob {
+                glob: "/tmp/../etc/**".into(),
+            },
+            path_scope: None,
+            decision: RuleDecision::Allow,
+        },
+        RuleDraft {
+            scope: RuleScope::Global,
+            tool_kind: ToolKind::Read,
+            tool_name: None,
+            matcher: RuleMatcher::Any,
+            path_scope: Some("relative/**".into()),
+            decision: RuleDecision::Allow,
+        },
+        cmd_draft(RuleDecision::Allow, exact(&["cat", "a\nb"]), None),
+        cmd_draft(RuleDecision::Deny, prefix(&["cat", "a\x1bb"]), None),
+        RuleDraft {
+            scope: RuleScope::Global,
+            tool_kind: ToolKind::Edit,
+            tool_name: Some("two words".into()),
+            matcher: RuleMatcher::Any,
+            path_scope: None,
+            decision: RuleDecision::Allow,
+        },
+    ];
+    for rule in round3_refused {
+        let code = wire
+            .refused(DaemonCommand::CreateRule { rule: rule.clone() })
+            .await;
+        assert_eq!(code, ErrorCode::Invalid, "expected Invalid for {rule:?}");
+    }
+
+    // Verify none of the refused malformed rules were persisted
+    let after_count = serde_json::from_value::<Vec<atrium_protocol::policy::Rule>>(
+        wire.ok(DaemonCommand::ListRules).await,
+    )
+    .expect("rules")
+    .len();
+    assert_eq!(after_count, before_count);
+
+    // Valid exact interpreter with value flag + script, and git commit -c HEAD, succeed
+    for matcher in [
+        exact(&["python3", "-W", "ignore", "build.py"]),
+        prefix(&["git"]),
+        exact(&["git", "commit", "-c", "HEAD"]),
+    ] {
+        wire.ok(DaemonCommand::CreateRule {
+            rule: cmd_draft(RuleDecision::Allow, matcher, None),
+        })
+        .await;
+    }
+
     rig.stop(true).await;
 }

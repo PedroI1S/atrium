@@ -776,3 +776,477 @@ fn xargs_and_inline_code_and_shells_never_bypass_prefix_rules() {
     ));
     let _ = DefaultPolicy::new();
 }
+
+// ---------------------------------------------------------------------------
+// 4. Rework round 3: review findings & CR-17 test gaps
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round3_finding1_path_scope_retains_bare_and_whitespace_operands() {
+    let home = Env::home();
+    let mut in_work = Env::home();
+    in_work.cwd = format!("{HOME}/work").into();
+
+    let allow_cp_work = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["cp"]),
+        RuleDecision::Allow,
+        Some("/h/u/work/**"),
+        "allow-cp-work",
+    )];
+    let deny_rm_work = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["rm"]),
+        RuleDecision::Deny,
+        Some("/h/u/work/**"),
+        "deny-rm-work",
+    )];
+
+    // Exact reviewer cases: bare destination outside scope must Ask; bare filename in work under Deny must Deny
+    assert_eq!(
+        classify(&home.cmd_rules("cp /h/u/work/a.txt b.txt", &allow_cp_work)),
+        "Ask"
+    );
+    assert!(matches!(
+        in_work.cmd_rules("rm a.txt", &deny_rm_work),
+        PolicyVerdict::Deny { .. }
+    ));
+
+    // Whitespace-containing operands (quoted) are retained and checked against scope
+    assert_eq!(
+        classify(&home.cmd_rules("cp /h/u/work/a.txt \"my file.txt\"", &allow_cp_work)),
+        "Ask"
+    );
+    assert_eq!(
+        classify(&home.cmd_rules(
+            "cp /h/u/work/a.txt \"/h/u/work/my file.txt\"",
+            &allow_cp_work
+        )),
+        "Allow"
+    );
+    assert!(matches!(
+        in_work.cmd_rules("rm \"my file.txt\"", &deny_rm_work),
+        PolicyVerdict::Deny { .. }
+    ));
+
+    // Resolved symlink identities for bare filenames are retained by SessionGate
+    let t = Tmp::new();
+    t.write("work/a.txt", "inside");
+    t.write("outside.txt", "outside");
+    std::fs::create_dir_all(t.home.join("work")).unwrap();
+    symlink(t.home.join("outside.txt"), t.home.join("work/link.txt")).unwrap();
+    let work_glob = format!("{}/work/**", t.home.display());
+    let g_allow = t.gate(
+        Preset::Home,
+        vec![scoped_rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["cp"]),
+            RuleDecision::Allow,
+            Some(&work_glob),
+            "cp-work",
+        )],
+    );
+    assert!(matches!(
+        block_on(g_allow.gate.check(&cmd_check("cp work/a.txt out.txt"))),
+        GateDecision::Ask { .. }
+    ));
+    assert!(matches!(
+        block_on(
+            g_allow
+                .gate
+                .check(&cmd_check("cp work/a.txt work/link.txt"))
+        ),
+        GateDecision::Ask { .. }
+    ));
+    let g_in_work = t.gate_with(
+        "t1",
+        1,
+        &t.home.join("work"),
+        Preset::Home,
+        vec![scoped_rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["rm"]),
+            RuleDecision::Deny,
+            Some(&work_glob),
+            "rm-work",
+        )],
+        None,
+    );
+    assert!(matches!(
+        block_on(g_in_work.gate.check(&cmd_check("rm a.txt"))),
+        GateDecision::Deny { .. }
+    ));
+    let mut work_env = Env::home();
+    work_env.cwd = format!("{HOME}/work").into();
+    // `rm -rf` flag letters don't masquerade as paths, while operand `a.txt` is checked
+    assert_eq!(
+        classify(&home.cmd_rules(
+            "rm -rf ~/work/a.txt",
+            &[scoped_rule(
+                RuleScope::Global,
+                ToolKind::Execute,
+                prefix(&["rm"]),
+                RuleDecision::Allow,
+                Some("/h/u/work/**"),
+                "allow-rm-work",
+            )]
+        )),
+        "Allow"
+    );
+    assert_eq!(
+        classify(&work_env.cmd_rules(
+            "head -n 5 a.txt",
+            &[scoped_rule(
+                RuleScope::Global,
+                ToolKind::Execute,
+                prefix(&["head"]),
+                RuleDecision::Allow,
+                Some("/h/u/work/**"),
+                "allow-head-work",
+            )]
+        )),
+        "Allow"
+    );
+}
+
+#[test]
+fn round3_finding2_per_command_find_derived_guard_and_folded_spelling() {
+    let env = Env::home();
+    let rules = vec![
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["find"]),
+            RuleDecision::Allow,
+            "allow-find",
+        ),
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["/usr/bin/FIND"]),
+            RuleDecision::Allow,
+            "allow-upper-find",
+        ),
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["echo"]),
+            RuleDecision::Allow,
+            "allow-echo",
+        ),
+    ];
+
+    // Reviewer's exact case: first `find` supplies a covered `echo` derived unit,
+    // second `/usr/bin/FIND` runs unextracted `-exec rm {} +` -> must Ask.
+    assert_eq!(
+        classify(&env.cmd_rules(
+            "find ./safe -exec echo {} + ; /usr/bin/FIND ./safe -exec rm {} +",
+            &rules
+        )),
+        "Ask"
+    );
+    // Mixed-case `-EXEC` on second `find` also fails closed -> must Ask.
+    assert_eq!(
+        classify(&env.cmd_rules(
+            "find ./safe -exec echo {} + ; find ./safe -EXEC rm {} +",
+            &rules
+        )),
+        "Ask"
+    );
+    // Both extracted and covered -> Allow.
+    assert_eq!(
+        classify(&env.cmd_rules(
+            "find ./safe -exec echo a {} + ; find ./safe -exec echo b {} +",
+            &rules
+        )),
+        "Allow"
+    );
+}
+
+#[test]
+fn round3_finding3_git_prefix_does_not_cover_cli_shell_aliases() {
+    let env = Env::home();
+    let git_prefix = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["git"]),
+        RuleDecision::Allow,
+        "allow-git",
+    )];
+
+    // Reviewer's exact case: command-line `-c alias.clean='!rm -f victim' clean` must Ask
+    assert_eq!(
+        classify(&env.cmd_rules("git -c alias.clean='!rm -f victim' clean", &git_prefix)),
+        "Ask"
+    );
+    assert_eq!(
+        classify(&env.cmd_rules("git -c core.fsmonitor='rm -rf .' status", &git_prefix)),
+        "Ask"
+    );
+    assert_eq!(
+        classify(&env.cmd_rules("git --exec-path=/tmp/bin status", &git_prefix)),
+        "Ask"
+    );
+    assert_eq!(
+        classify(&env.cmd_rules("git --config-env=core.pager=MY_PAGER log", &git_prefix)),
+        "Ask"
+    );
+    // Ordinary git commands (including `git commit -c HEAD` where `-c` is `--reedit-message`) stay Allow
+    assert_eq!(classify(&env.cmd_rules("git status", &git_prefix)), "Allow");
+    assert_eq!(
+        classify(&env.cmd_rules("git commit -c HEAD", &git_prefix)),
+        "Allow"
+    );
+}
+
+#[test]
+fn round3_finding4_interpreter_option_values_not_mistaken_for_scripts() {
+    let env = Env::home();
+    let rules = vec![
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            exact(&["python3", "-W", "ignore"]),
+            RuleDecision::Allow,
+            "exact-py-w",
+        ),
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["echo"]),
+            RuleDecision::Allow,
+            "allow-echo",
+        ),
+    ];
+
+    // Reviewer's exact case: `ignore` is `-W`'s value, not a script -> pipeline must Ask
+    assert_eq!(
+        classify(&env.cmd_rules("echo 'print(1)' | python3 -W ignore", &rules)),
+        "Ask"
+    );
+
+    // Valid exact rule with `-W ignore` AND a named script still Allows
+    let valid_exact = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        exact(&["python3", "-W", "ignore", "build.py"]),
+        RuleDecision::Allow,
+        "exact-py-w-script",
+    )];
+    assert_eq!(
+        classify(&env.cmd_rules("python3 -W ignore build.py", &valid_exact)),
+        "Allow"
+    );
+}
+
+#[test]
+fn round3_finding5_execute_path_glob_cannot_allow_commands() {
+    let env = Env::home();
+    let bad_rule = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        RuleMatcher::PathGlob {
+            glob: "/h/u/work/**".into(),
+        },
+        RuleDecision::Allow,
+        Some("/h/u/work/**"),
+        "bad-exec-path",
+    )];
+
+    // Reviewer's exact case: invalid Execute + PathGlob rule must not allow commands
+    assert_eq!(
+        classify(&env.cmd_rules("python3 -c pass /h/u/work/input", &bad_rule)),
+        "Ask"
+    );
+}
+
+#[test]
+fn round3_finding8_and_cr17_test_gaps() {
+    let env = Env::home();
+    let any_exec = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "any-exec",
+    )];
+
+    // Finding 8: `~/.git-credentials` is HardDeny(credential-read), even with Allow Any
+    for rules in [&[][..], &any_exec[..]] {
+        assert!(matches!(
+            env.cmd_rules("cat ~/.git-credentials", rules),
+            PolicyVerdict::HardDeny {
+                id: "credential-read"
+            }
+        ));
+    }
+
+    // CR-17 `..` traversal spellings and glob spellings ask in Home
+    for line in [
+        "cat ~/proj/../.gem/credentials",
+        "cat .terraform.d/../.terraform.d/credentials.tfrc.json",
+        "cat ~/.config/op/../op/config",
+        "cat ~/proj/../.yarnrc.yml",
+        "cat ~/.gem/*",
+        "cat ~/.config/op/*",
+    ] {
+        assert_eq!(classify(&env.cmd(line)), "Ask", "{line}");
+    }
+    for p in [
+        "proj/../.gem/credentials",
+        "proj/../.terraform.d/credentials.tfrc.json",
+        "proj/../.config/op/config",
+        "proj/../.yarnrc.yml",
+    ] {
+        let read = paths_check(ToolKind::Read, "Read", &[p], false, None);
+        assert_eq!(
+            classify(&env.eval_check(&read, &[], Preset::Home)),
+            "Ask",
+            "Read {p}"
+        );
+    }
+    for (dir, pat) in [
+        ("~/.gem", "*credentials*"),
+        ("~/.terraform.d", "credentials*"),
+        ("~/.config/op", "*"),
+        ("~", "*.yml"),
+    ] {
+        let search = paths_check(ToolKind::Search, "Glob", &[dir], true, Some(pat));
+        assert_eq!(
+            classify(&env.eval_check(&search, &[], Preset::Home)),
+            "Ask",
+            "Search {dir} {pat}"
+        );
+    }
+
+    // CR-17 linked Search calls and remembered rules through symlinks in SessionGate
+    let t = Tmp::new();
+    t.write(".gem/credentials", "gem-secret");
+    t.write(".terraform.d/credentials.tfrc.json", "tf-secret");
+    t.write(".config/op/config", "op-secret");
+    t.write(".yarnrc.yml", "yarn-secret");
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    symlink(t.home.join(".gem"), t.home.join("proj/gem_dir_sym")).unwrap();
+    symlink(t.home.join(".config/op"), t.home.join("proj/op_dir_sym")).unwrap();
+    symlink(t.home.join(".gem/credentials"), t.home.join("proj/gem_sym")).unwrap();
+    symlink(t.home.join(".yarnrc.yml"), t.home.join("proj/yarn_sym")).unwrap();
+    std::fs::hard_link(
+        t.home.join(".terraform.d/credentials.tfrc.json"),
+        t.home.join("proj/tf_hard"),
+    )
+    .unwrap();
+
+    let g_home = t.gate(Preset::Home, vec![]);
+    for dir in ["proj/gem_dir_sym", "proj/op_dir_sym"] {
+        let search = paths_check(ToolKind::Search, "Grep", &[dir], true, None);
+        assert!(
+            matches!(
+                block_on(g_home.gate.check(&search)),
+                GateDecision::Ask { .. }
+            ),
+            "Search {dir}"
+        );
+        let rg_cmd = cmd_check(&format!("rg secret {dir}"));
+        assert!(
+            matches!(
+                block_on(g_home.gate.check(&rg_cmd)),
+                GateDecision::Ask { .. }
+            ),
+            "rg {dir}"
+        );
+    }
+
+    // Remembered rules allow CR-17 symlinked reads & searches
+    let gem_glob = t
+        .home
+        .join(".gem/credentials")
+        .to_string_lossy()
+        .to_string();
+    let g_rules = t.gate(
+        Preset::Home,
+        vec![
+            rule(
+                RuleScope::Global,
+                ToolKind::Read,
+                RuleMatcher::PathGlob { glob: gem_glob },
+                RuleDecision::Allow,
+                "allow-gem-read",
+            ),
+            rule(
+                RuleScope::Global,
+                ToolKind::Read,
+                RuleMatcher::Any,
+                RuleDecision::Allow,
+                "allow-any-read",
+            ),
+            rule(
+                RuleScope::Global,
+                ToolKind::Search,
+                RuleMatcher::Any,
+                RuleDecision::Allow,
+                "allow-any-search",
+            ),
+        ],
+    );
+    assert_eq!(
+        block_on(g_rules.gate.check(&paths_check(
+            ToolKind::Read,
+            "Read",
+            &["proj/gem_sym"],
+            false,
+            None
+        ))),
+        GateDecision::Allow
+    );
+    assert_eq!(
+        block_on(g_rules.gate.check(&paths_check(
+            ToolKind::Read,
+            "Read",
+            &["proj/yarn_sym"],
+            false,
+            None
+        ))),
+        GateDecision::Allow
+    );
+    assert_eq!(
+        block_on(g_rules.gate.check(&paths_check(
+            ToolKind::Search,
+            "Grep",
+            &["proj/gem_dir_sym"],
+            true,
+            None
+        ))),
+        GateDecision::Allow
+    );
+
+    // DefaultPolicy allows hard-linked CR-17 store once mapped to its canonical ask-store path
+    // (Note: SessionGate::evaluate_sync in gate.rs still forces Ask via reaches_multiply_linked;
+    // gate.rs is outside M1-29's owned paths and escalated in the handoff.)
+    let read_hard = paths_check(ToolKind::Read, "Read", &["proj/tf_hard"], false, None);
+    let mapped_input = atrium_core::PolicyInput {
+        check: &read_hard,
+        thread: &env.thread,
+        provider: atrium_protocol::agent::Provider::Claude,
+        cwd: &env.cwd,
+        home: &env.home,
+        atrium_data_paths: &env.data,
+        atrium_protected_paths: &env.prot,
+        resolved_paths: &[env.home.join(".terraform.d/credentials.tfrc.json")],
+        preset: Preset::Home,
+    };
+    let read_any = vec![rule(
+        RuleScope::Global,
+        ToolKind::Read,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "allow-any-read",
+    )];
+    assert!(matches!(
+        atrium_core::PolicyEngine::evaluate(&DefaultPolicy::new(), &mapped_input, &read_any),
+        PolicyVerdict::Allow { .. }
+    ));
+}
