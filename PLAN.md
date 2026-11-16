@@ -929,6 +929,11 @@ docs/agents/
 └─ routing.md               scoreboard per model × task type (8.6)
 ```
 
+**Workers write, one verification task tests (D-123, Pedro, 2026-11-16).** Running several workers that each build and test the whole workspace overloads the machine (M1-27 batch: four cold builds at once, load ~100, 25+ minutes for small fixes). So:
+- **Workers only write code and tests.** They may run `cargo fmt` and a `cargo check` of their own crate. They don't run test suites, clippy over the workspace, benches or GUI scripts.
+- **One verification task at a time** runs the Definition of Done for finished branches, one branch after another, in one shared build folder: fmt, clippy, the tests (including showing that new tests fail on `dev`'s code), benches and demos. It writes the results into the task's handoff.
+- A branch that fails verification goes back to its worker with the failing output, as a rework round (the task gate below).
+
 **Definition of done for every task**:
 - `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test -p <owned crates>`
 - `pnpm typecheck && pnpm test` for frontend tasks

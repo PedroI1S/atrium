@@ -28,7 +28,7 @@ A task merges only when its last cross-provider review is "approve" with **no op
 1. Work **only** in your worktree and **only** in the paths your brief lists as owned.
 2. Never change a contract (types, traits, schemas marked as contract). Append a request to `change-requests.md` instead and stop.
 3. Never commit to `main`, merge, or push. Commit only on your own branch.
-4. Before finishing, run every Definition of Done command from your brief and paste the results into your handoff.
+4. **Write code and tests; don't run test suites (D-123).** You may run `cargo fmt` and `cargo check` on your own crate. A separate verification task runs the Definition of Done for your branch and adds the results to your handoff. If your brief asks you to run tests or benches, leave them to that task and list in your handoff the exact commands it should run.
 5. Always write `handoffs/<id>.md`, even if you failed. Say what blocked you.
 6. **Never put test data in a shell heredoc**, and never write command lines that touch real credentials as shell text. Write test inputs with the file tools, or as Rust string literals in a test. On 2026-11-12 a heredoc in a worker's shell ended early at an `EOF` inside its data, and the lines after it ran in `~`, printing credential files into a tool-result file (session log 2026-11-12 #2). Tests that need a home folder use a temp folder and a fake `HOME`.
 

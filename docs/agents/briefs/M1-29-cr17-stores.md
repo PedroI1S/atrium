@@ -41,6 +41,8 @@ Plus three rule-matching limits that M1-23's reviews escalated and D-121 reopene
 - Don't create extra target directories or copies of the repo (the disk is small). Remove scratch output you create.
 
 ## Definition of Done
+**D-123:** you write code and tests only (plus `cargo fmt` and `cargo check` on your crate). A separate verification task runs everything below on your branch; in your handoff, list the exact commands it should run, including the check that your new tests fail on `dev`'s code.
+
 - [ ] `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --no-fail-fast`.
 - [ ] `cargo test -p atrium-core` 3 times in a loop, with the times of `adversarial_fuzz` and the `policy` binary (no slowdown).
 - [ ] Show your new tests (and the un-ignored ones) fail on `dev`'s code and pass now: check out `dev`'s versions of the src files you changed, run, restore.

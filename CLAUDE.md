@@ -18,6 +18,7 @@ Rules:
 
 - **Never start milestone work** (contracts, briefs, dispatching workers) without an explicit go from the current driver for that phase. Approving one step is not permission for the next.
 - Contracts and milestone gates are approved by the driver. Record who decided in `decisions.md`.
+- **Workers only write; one verification task tests (D-123, PLAN §8.4):** briefs tell workers to write code and tests, with at most `cargo fmt` and `cargo check` on their crate. Run the Definition of Done for finished branches in a single verification task, one branch at a time, with one shared build folder. Never let several workers build and test the workspace at once.
 - **Task gate at 100% (D-120, PLAN §8.4):** merge a task only when its last review is "approve" with no open findings. Send every finding back to the same task as rework, whatever its severity; never open a new task for a finding or merge with known limits unless the driver records an exception. Don't offer "merge with known limits" as an option.
 - **Push policy (D-005, D-007)**:
   - Plan, docs and orchestration tooling (`PLAN.md`, `docs/`, `scripts/`, `.gitignore`, `CLAUDE.md`, `AGENTS.md`) are pushed to `dev` right away.
