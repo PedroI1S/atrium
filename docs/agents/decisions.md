@@ -742,3 +742,6 @@ After Argon's review of fix round 4 (all 20 lines closed, 0 regressions vs dev; 
 
 ## D-116 — 2026-11-16 — Pedro: M1-23 round 3, fail-closed rule check
 After Argon's review of M1-23 round 2 (rework: the rules editor's refusal misses attached inline code, digit clusters, `deno -q eval`, `bun eval`, `pwsh`, case and APFS lookalikes, and crashes on `constructor`; Inbox `A`/`D` can resolve another thread's approval; `docs/agents/reviews/M1-23-ui-gaps-round2.md`), Pedro chose a fail-closed round 3 over patching the listed spellings: names compared case- and APFS-folded, any option word carrying an inline-code flag letter refused, and prefix allow rules on interpreters and `find` refused unless a script or path is named. Same worker (Claude Opus 5.5). The engine's case-sensitive shell matching (`/bin/BASH -c` payloads aren't read) is outside M1-23; it is noted for a CR.
+
+## D-117 — 2026-11-16 — Pedro: Sonnet reviews M1-18 round 5
+Argon's review of M1-18 fix round 5 failed at once: agy reported "Individual quota reached" for Gemini 4 Argon, resetting in about 6.4 days. Pedro chose Claude Sonnet 5.5 to review it instead (cross-provider: Hydrogen wrote the round), over the orchestrator's suggestion of Opus.
