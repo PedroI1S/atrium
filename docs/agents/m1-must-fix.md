@@ -134,7 +134,7 @@ Rounds 3–8 worked through S2–S13 (the handoff says how each was handled); S1
 | K3 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 3: `shell_c_code` stops at `-o`/`+o`/`-O`/`+O` values; `long_name` ignores 1–2 letter GNU prefixes (`script --c`, `flock --c`). |
 | K4 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 4: `find_exec_units` doesn't extract `payloads_of`, `env_payloads` or `code_subs` from `-exec` commands. |
 | K6 | — | 🟡 M1-18 covered CR-12's list; finding 6 stays ignored for the four stores CR-17 adds (post-M1-18 batch). On merged `dev`, 7 tests are still ignored. 6 are marked `#[ignore = "M1-13 finding N"]`: findings 4 (S7), 5 (S8), 6 (S1, CR-12), 10 (S11), and 11 (S5) twice. Fixing a finding means un-ignoring its test. |
-| K5 | minor | 🟡 **In M1-32** (D-119, reopened D-121). `rg -L pat` with no folder, run from a working folder that holds a link into `~/.ssh`, is a hard deny (`dev`: Ask/Allow/Allow). This is round 6's design, not a regression from the fix. |
+| K5 | minor | ✅ **Closed, correct behaviour (D-125, rodrigo):** the hard deny stays. `rg -L pat` with no folder named, from a folder that holds a link into `~/.ssh`, follows the link and reads the keys; `dev`'s old Ask/Allow/Allow would have allowed that under Any and FullAccess. |
 
 ### Open minors from merged reviews (D-122, in M1-28)
 

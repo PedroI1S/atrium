@@ -35,3 +35,6 @@ Two symlink items, in the same code:
 - [ ] Show your new tests (and the un-ignored ones) fail on `dev`'s code and pass now: check out `dev`'s versions of the src files you changed, run, restore.
 - [ ] `git diff dev --stat` touches only your owned paths.
 - [ ] Handoff `docs/agents/handoffs/M1-32-link-globs.md`: what changed and where, a verdict table (dev vs now) for every line you tested, ordinary-line checks, the outputs, anything escalated.
+
+## Scope change (D-125, rodrigo, 2026-11-16)
+K5 is closed as correct behaviour: the hard deny stays. This task's scope is S11 only.

@@ -782,3 +782,9 @@ Seeing the M1-27 batch take 25+ minutes for small fixes (four workers each build
 - **Every review on rodrigo's shifts goes to Codex**: GPT-6.1 Sol (`gpt-6.1-sol`, reasoning `high`), through `codex exec -s read-only` run in the task's worktree. It replaces the Claude reviewers (Sonnet or Opus) named in D-119 and D-121, and Argon. The review is the agent's final message; the orchestrator writes it to `reviews/<id>.md`.
 - Codex is OpenAI and the batch's writer is Gemini 4 Hydrogen, so the reviews stay cross-provider. Work written by Claude is reviewed by Codex too, which also keeps it cross-provider.
 - **Writers stay as D-084 routes them**: Hydrogen `high`. **D-123 holds**: at most four writers at once on this machine (8 cores, 30 GB; Hydrogen's cap, D-068; D-123's "two" was for Pedro's laptop), and one verification run at a time, done by the orchestrator in a shared target folder.
+
+## D-125 — 2026-11-16 — rodrigo: K5 keeps the hard deny
+**Decided by rodrigo (driver).** K5 (`rg -L pat`, `--follow`, `grep -R` or `find -L` with no folder named, run from a folder that holds a link into `~/.ssh`) **stays a hard deny in every setting**. It is not changed to Ask.
+- **Why:** the M1-32 worker pointed out that the line follows the link and reads the contents of `~/.ssh`, so it is a real credential read. `dev`'s old verdict was Ask/Allow/Allow, which would let Any and FullAccess read private keys. Five tests on `dev` assert the hard deny in all three settings.
+- **K5 is closed as correct behaviour.** This is not a known limit, so D-120 needs no exception for it. M1-32's scope is S11 only.
+- **Security defaults are unchanged**, since this keeps `dev`'s current behaviour. D-013 gives such changes to Pedro, who can reopen K5.
