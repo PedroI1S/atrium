@@ -156,6 +156,7 @@
 .enf-row > span:first-child { width: var(--enf-class-width); flex: none; font-weight: var(--weight-medium); }
 .enf-cov { display: inline-flex; align-items: center; gap: var(--u15); flex: 1; min-width: 0; }
 .enf-ev { flex-basis: 100%; padding-left: calc(var(--enf-class-width) + var(--u3)); color: var(--text-muted); font-size: var(--text-label); }
+.enf-ev.code { background: none; border-radius: 0; }
 .enf-src { display: flex; flex-direction: column; gap: var(--u05); font-size: var(--text-small); }
 .enf-src .code { color: var(--text-muted); overflow-wrap: anywhere; }
 
