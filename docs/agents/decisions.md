@@ -601,3 +601,17 @@ Pedro took over from rodrigo's shift (2026-11-12) and asked to continue where it
   - The same Opus worker fixes only that, with a test per form.
   - The orchestrator checks that the test fails on `b336b2c` and that the six forms match `dev`'s verdicts, then merges and runs the full checks.
 - **Known limits, not fixed before the merge.** Blockers 1–4 of `reviews/M1-13-adversarial-round8.md` are marked "same as dev" by the reviewer. They are recorded as known limits for a follow-up policy task, together with CR-12 and P1.
+
+## D-099 — 2026-11-15 — Pedro's go: M1-18 policy follow-up
+**Decided by Pedro (driver):** "Start policy task". M1-18-policy-followup (`briefs/M1-18-policy-followup.md`) takes:
+- CR-12: the credential stores that ask (contract §9 rev 3.1);
+- P1: search globs that leave their roots;
+- K1–K4: M1-13's round-8 blockers 1–4, left as known limits by D-098.
+
+**Routing:**
+- Worker: Claude Opus 5.5. The tests need credential paths as literals (D-074), and it is security work.
+- Review: Gemini 4 Hydrogen `high`, read-only, cross-provider.
+
+**The bar:** no line becomes more permissive than `dev`, and no new hard deny lands on an ordinary command (the lesson of round 8's major 5).
+
+**Not included:** K5 and the other ignored findings (4, 5, 10, 11).
