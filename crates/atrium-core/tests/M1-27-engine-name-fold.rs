@@ -612,6 +612,10 @@ fn k9_long_readable_env_matches_short_form() {
         .map(|i| format!("-u A{i:02}"))
         .collect::<Vec<_>>()
         .join(" ");
+    let long_unsets_14: String = (1..=14)
+        .map(|i| format!("--unset=A{i:02}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let args_30: String = (1..=30)
         .map(|i| format!("a{i:02}"))
         .collect::<Vec<_>>()
@@ -619,55 +623,59 @@ fn k9_long_readable_env_matches_short_form() {
 
     let long_vs_short = [
         (
-            format!("env {assigns_28} -Z /bin/echo hi"),
-            "env -Z /bin/echo hi",
-        ),
-        (
-            format!("env -Z {assigns_28} /bin/echo hi"),
-            "env -Z /bin/echo hi",
-        ),
-        (
-            format!("env -i {unsets_14} -Z /bin/echo hi"),
-            "env -Z -i -u A01 /bin/echo hi",
-        ),
-        (
-            format!("env -Z -i {unsets_14} /bin/echo hi"),
-            "env -Z -i -u A01 /bin/echo hi",
-        ),
-        (
-            format!("env -Z1 -Z2 -Z3 -Z4 -Z5 {unsets_14} {assigns_28} /bin/echo hi"),
-            "env -Z1 -Z2 -Z3 -Z4 -Z5 /bin/echo hi",
-        ),
-        (
-            format!("env -Z /bin/echo {args_30}"),
-            "env -Z /bin/echo a01",
-        ),
-        (
-            format!("env -Z -S '{assigns_28}' /bin/echo hi"),
-            "env -Z /bin/echo hi",
+            format!("env {assigns_28} /bin/echo hi"),
+            "env K01=1 /bin/echo hi",
         ),
         (
             format!("env -i {unsets_14} {assigns_28} /bin/echo hi"),
             "env -i -u A01 K01=1 /bin/echo hi",
         ),
+        (
+            format!("env --ignore-environment {long_unsets_14} {assigns_28} /bin/echo hi"),
+            "env -i -u A01 K01=1 /bin/echo hi",
+        ),
+        (
+            format!(
+                "env -0 -v --debug --list-signal-handling --block-signal=INT --default-signal=TERM --ignore-signal=HUP {unsets_14} {assigns_28} /bin/echo hi"
+            ),
+            "env -0 -v /bin/echo hi",
+        ),
+        (
+            format!("env -i {unsets_14} {assigns_28} -- /bin/echo {args_30}"),
+            "env -i -u A01 K01=1 -- /bin/echo a01",
+        ),
+        (
+            format!("env -i {unsets_14} -S '{assigns_28}' /bin/echo hi"),
+            "env -i -u A01 K01=1 /bin/echo hi",
+        ),
+        (
+            format!("env -i {unsets_14} {assigns_28} -C proj /bin/echo hi"),
+            "env -i -u A01 K01=1 -C proj /bin/echo hi",
+        ),
     ];
     for (long, short) in long_vs_short {
         assert_matches_lowercase(&long, &["env"], short, &["env"]);
     }
+    assert_matches_lowercase(
+        &format!("ENV -i {unsets_14} {assigns_28} /bin/echo hi"),
+        &["ENV"],
+        "env -i -u A01 K01=1 /bin/echo hi",
+        &["env"],
+    );
 
-    // Long readable `env` still catches hard-deny payloads.
+    // Long readable `env` with known options still catches hard-deny payloads.
     assert_hard_denied_all_settings(
-        &format!("env -i {unsets_14} {assigns_28} -Z cat ~/.ssh/id_rsa"),
+        &format!("env -i {unsets_14} {assigns_28} cat ~/.ssh/id_rsa"),
         &["env"],
         "credential-read",
     );
     assert_hard_denied_all_settings(
-        &format!("env -Z -i {unsets_14} -C .. -S 'sh -c' 'cat ~/.ssh/id_rsa'"),
+        &format!("env -i {unsets_14} -C .. -S 'sh -c' 'cat ~/.ssh/id_rsa'"),
         &["env"],
         "credential-read",
     );
     assert_hard_denied_all_settings(
-        &format!("env {assigns_28} -Z rm -rf ~"),
+        &format!("env {assigns_28} rm -rf ~"),
         &["env"],
         "recursive-delete-outside-cwd",
     );
@@ -675,6 +683,12 @@ fn k9_long_readable_env_matches_short_form() {
 
 #[test]
 fn k9_genuinely_unbounded_env_still_fails_closed() {
+    let assigns_28: String = (1..=28)
+        .map(|i| format!("K{i:02}={i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let many_12: Vec<String> = (1..=12).map(|i| format!("-A{i} v{i}")).collect();
+    let opts_12 = format!("-A0 {}", many_12.join(" "));
     let unknown_26_flags: String = (1..=26)
         .map(|i| format!("-Z{i:02}"))
         .collect::<Vec<_>>()
@@ -684,6 +698,11 @@ fn k9_genuinely_unbounded_env_still_fails_closed() {
         .collect::<Vec<_>>()
         .join(" ");
 
+    // Unknown options past `MAX_UNKNOWN_STARTS` fail closed (Ask everywhere), even with known assignments.
+    assert_ask_all_settings(&format!("env {assigns_28} -Z /bin/echo hi"), &["env"]);
+    assert_ask_all_settings(&format!("env -Z {assigns_28} /bin/echo hi"), &["env"]);
+    assert_ask_all_settings(&format!("env {opts_12} -S 'cat .ssh/id_rsa'"), &["env"]);
+    assert_ask_all_settings(&format!("env {opts_12} -S 'cat .pypirc'"), &["env"]);
     assert_ask_all_settings(&format!("env {unknown_26_flags} /bin/echo hi"), &["env"]);
     assert_ask_all_settings(&format!("env {unknown_26_pairs} /bin/echo hi"), &["env"]);
     assert_ne!(
