@@ -119,10 +119,15 @@ fn allow_covers(
     a: &Analysis,
     paths: &[PathBuf],
     part_ids: &[usize],
+    glob_leaves: bool,
 ) -> Vec<bool> {
     let n = part_ids.len().max(1);
     let none = vec![false; n];
     if !name_matches(rule, input) || matches!(input.check.subject, ToolSubject::Unknown) {
+        return none;
+    }
+    // D-100: an escaping search glob is covered only by an unscoped `Any` rule.
+    if glob_leaves && !(matches!(rule.matcher, RuleMatcher::Any) && rule.path_scope.is_none()) {
         return none;
     }
     let command = matches!(input.check.subject, ToolSubject::Command { .. });
@@ -173,9 +178,15 @@ struct RuleOutcome {
     deny: Option<(Option<String>, Option<RuleId>)>,
     covered: Vec<bool>,
     allow_rule: Option<RuleId>,
+    any_allow: bool,
 }
 
-fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOutcome {
+fn apply_rules(
+    input: &PolicyInput<'_>,
+    a: &Analysis,
+    rules: &[Rule],
+    glob_leaves: bool,
+) -> RuleOutcome {
     let paths = all_paths(input, a);
     let part_ids = if matches!(input.check.subject, ToolSubject::Command { .. }) {
         parts(a)
@@ -185,6 +196,7 @@ fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOut
     let n = part_ids.len().max(1);
     let mut covered = vec![false; n];
     let mut allow_rule: Option<RuleId> = None;
+    let mut any_allow = false;
     for rank in 0..3u8 {
         let ranked: Vec<&Rule> = rules
             .iter()
@@ -202,10 +214,18 @@ fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOut
                 )),
                 covered,
                 allow_rule,
+                any_allow,
             };
         }
         for r in ranked.iter().filter(|r| r.decision == RuleDecision::Allow) {
-            let c = allow_covers(r, input, a, &paths, &part_ids);
+            let c = allow_covers(r, input, a, &paths, &part_ids, glob_leaves);
+            let is_any = matches!(r.matcher, RuleMatcher::Any)
+                && r.path_scope.is_none()
+                && !c.is_empty()
+                && c.iter().all(|hit| *hit);
+            if is_any {
+                any_allow = true;
+            }
             for (slot, hit) in covered.iter_mut().zip(c) {
                 if hit && !*slot {
                     *slot = true;
@@ -218,6 +238,7 @@ fn apply_rules(input: &PolicyInput<'_>, a: &Analysis, rules: &[Rule]) -> RuleOut
         deny: None,
         covered,
         allow_rule,
+        any_allow,
     }
 }
 
@@ -257,9 +278,9 @@ fn forbidden_flag(entry: &ReadOnlyCommand, args: &[String]) -> bool {
     false
 }
 
-const RG_BOOL_S: &str = "iSsnNHIlcovwxuaUFPq0pb";
-const RG_VAL_S: &str = "egtTmABCdjMEr";
-const RG_BOOL_L: &[&str] = &[
+pub(crate) const RG_BOOL_S: &str = "iSsnNHIlcovwxuaUFPq0pb";
+pub(crate) const RG_VAL_S: &str = "egtTmABCdjMEr";
+pub(crate) const RG_BOOL_L: &[&str] = &[
     "hidden",
     "no-ignore",
     "no-ignore-vcs",
@@ -313,7 +334,7 @@ const RG_BOOL_L: &[&str] = &[
     "glob-case-insensitive",
     "no-glob-case-insensitive",
 ];
-const RG_VAL_L: &[&str] = &[
+pub(crate) const RG_VAL_L: &[&str] = &[
     "regexp",
     "glob",
     "iglob",
@@ -344,9 +365,9 @@ const RG_VAL_L: &[&str] = &[
     "dfa-size-limit",
     "regex-size-limit",
 ];
-const GREP_BOOL_S: &str = "ivnclLoqswxhHEFGPaIrRzZbTUy0123456789";
-const GREP_VAL_S: &str = "emABCdD";
-const GREP_BOOL_L: &[&str] = &[
+pub(crate) const GREP_BOOL_S: &str = "ivnclLoqswxhHEFGPaIrRzZbTUy0123456789";
+pub(crate) const GREP_VAL_S: &str = "emABCdD";
+pub(crate) const GREP_BOOL_L: &[&str] = &[
     "ignore-case",
     "no-ignore-case",
     "invert-match",
@@ -375,7 +396,7 @@ const GREP_BOOL_L: &[&str] = &[
     "dereference-recursive",
     "no-group-separator",
 ];
-const GREP_VAL_L: &[&str] = &[
+pub(crate) const GREP_VAL_L: &[&str] = &[
     "regexp",
     "max-count",
     "after-context",
@@ -392,6 +413,11 @@ const GREP_VAL_L: &[&str] = &[
     "binary-files",
     "group-separator",
 ];
+
+/// GNU `grep`'s long option names (both tables), for reading a prefix.
+pub(crate) fn grep_long_names() -> impl Iterator<Item = &'static str> {
+    GREP_BOOL_L.iter().chain(GREP_VAL_L).copied()
+}
 
 pub(crate) struct Searched {
     pub(crate) roots: Vec<String>,
@@ -502,6 +528,221 @@ fn roots_of(is_rg: bool, follow: bool, args: &[String]) -> Option<Searched> {
     Some(Searched { roots, recursive })
 }
 
+/// Credential names a committed file can have (CR-12: `git show
+/// REV:PATH` of a path whose name matches a credential asks): the
+/// hard-deny list's files and the stores that ask, by their path below home
+/// or, for names that are distinctive, by file name alone; private keys
+/// (`id_*` but `.pub`); anything below a credential folder.
+const GIT_CRED_SUFFIXES: &[&str] = &[
+    ".aws/credentials",
+    ".docker/config.json",
+    ".kube/config",
+    ".config/gh/hosts.yml",
+    ".claude/.credentials.json",
+    ".codex/auth.json",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".config/git/credentials",
+    ".azure/accesstokens.json",
+];
+const GIT_CRED_NAMES: &[&str] = &[
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".claude.json",
+    ".pypirc",
+    ".pgpass",
+    ".vault-token",
+    ".env",
+    ".bash_history",
+    ".zsh_history",
+    ".zhistory",
+    ".sh_history",
+    ".ksh_history",
+    ".history",
+    "fish_history",
+    "accesstokens.json",
+];
+const GIT_CRED_DIRS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".config/gcloud",
+    ".gemini",
+    ".aws/sso/cache",
+    ".zsh_sessions",
+    ".bash_sessions",
+    "library/keychains",
+];
+
+fn is_git_key_name(name: &str) -> bool {
+    const CODE_EXTS: &[&str] = &[
+        "pub", "rs", "ts", "tsx", "js", "jsx", "py", "go", "c", "cc", "cpp", "h", "hpp", "java",
+        "rb", "md", "html", "css", "svg", "png",
+    ];
+    ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
+        .iter()
+        .any(|k| {
+            name == *k
+                || name.strip_prefix(k).is_some_and(|r| {
+                    r.starts_with(['.', '-', '_'])
+                        && !r
+                            .rsplit('.')
+                            .next()
+                            .is_some_and(|ext| CODE_EXTS.contains(&ext))
+                })
+        })
+}
+
+/// Whether a `git show`/`git log`/`git diff` argument names a committed file
+/// whose name matches a credential: `REV:PATH`, `:PATH`, `:N:PATH` or a
+/// pathspec (including `:(magic)PATH` and short magic `:/`, `:!`, `:^`).
+/// Extracts `<file>` from `git log -L` / `--line-range` (`start,end:file` or `:funcname:file`).
+fn parse_git_line_range(spec: &str) -> Option<&str> {
+    if let Some(after) = spec.strip_prefix(':') {
+        let (func, file) = after.rsplit_once(':')?;
+        (!func.is_empty() && !file.is_empty()).then_some(file)
+    } else {
+        let (range, file) = spec.rsplit_once(':')?;
+        (!range.is_empty() && !file.is_empty()).then_some(file)
+    }
+}
+
+/// Whether `git show`/`git log`/`git diff` arguments name a committed file
+/// whose name matches a credential.
+fn git_args_name_credential(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            return args[i + 1..].iter().any(|a| git_names_credential(a));
+        }
+        let line_spec = if arg == "-L" || arg == "--line-range" {
+            i += 1;
+            match args.get(i) {
+                Some(s) => Some(s.as_str()),
+                None => return true,
+            }
+        } else if let Some(s) = arg.strip_prefix("-L") {
+            Some(s)
+        } else {
+            arg.strip_prefix("--line-range=")
+        };
+        if let Some(spec) = line_spec {
+            let Some(file) = parse_git_line_range(spec) else {
+                return true;
+            };
+            if git_path_is_credential(file) {
+                return true;
+            }
+        } else if git_names_credential(arg) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn git_names_credential(arg: &str) -> bool {
+    if arg.starts_with('-') {
+        return false;
+    }
+    let path = if let Some(after) = arg.strip_prefix(':') {
+        if let Some((n, p)) = after.split_once(':')
+            && !n.is_empty()
+            && n.chars().all(|c| c.is_ascii_digit())
+        {
+            p
+        } else {
+            let mut s = after;
+            loop {
+                if let Some(rest) = s.strip_prefix('(') {
+                    let mut depth = 1usize;
+                    let mut end = None;
+                    for (idx, ch) in rest.char_indices() {
+                        match ch {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = Some(idx);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let Some(end_idx) = end else {
+                        // Unclosed `:(...` pathspec magic: fail closed.
+                        return true;
+                    };
+                    s = &rest[end_idx + 1..];
+                } else if let Some(rest) = s.strip_prefix(['/', '!', '^', ':']) {
+                    s = rest;
+                } else {
+                    break;
+                }
+            }
+            if s.starts_with(['~', '@', '#', '+', '=', '%', '&', '$', '\\']) || s.contains(':') {
+                // Unrecognized `:` magic or unparsed prefix: fail closed.
+                return true;
+            }
+            s
+        }
+    } else if let Some((_, rest)) = arg.split_once(':') {
+        rest
+    } else {
+        arg
+    };
+    git_path_is_credential(path)
+}
+
+fn git_path_is_credential(path: &str) -> bool {
+    let l = path.to_lowercase().replace('ſ', "s");
+    let mut parts: Vec<&str> = vec![];
+    for c in l.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(c),
+        }
+    }
+    let Some(name) = parts.last() else {
+        return false;
+    };
+    let joined = parts.join("/");
+    if GIT_CRED_NAMES.contains(name)
+        || name.starts_with("msal_token_cache.")
+        || is_git_key_name(name)
+    {
+        return true;
+    }
+    if GIT_CRED_SUFFIXES
+        .iter()
+        .any(|s| joined == *s || joined.ends_with(&format!("/{s}")))
+    {
+        return true;
+    }
+    // below a credential folder (`.ssh/x`, `a/.gnupg/y`), but not public
+    // ssh files
+    GIT_CRED_DIRS.iter().any(|d| {
+        let at = |i: usize| parts[i..].join("/");
+        (0..parts.len()).any(|i| {
+            let rest = at(i);
+            rest.strip_prefix(d)
+                .and_then(|r| r.strip_prefix('/'))
+                .is_some_and(|r| {
+                    !r.is_empty()
+                        && !(*d == ".ssh"
+                            && (name.ends_with(".pub")
+                                || name.starts_with("known_hosts")
+                                || matches!(*name, "config" | "authorized_keys")))
+                })
+        })
+    })
+}
+
 struct Home<'a> {
     input: &'a PolicyInput<'a>,
     a: &'a Analysis,
@@ -526,9 +767,24 @@ impl Home<'_> {
         out
     }
 
+    /// Whether a path the call names is a credential store that asks
+    /// (CR-12): ours, the gate's (symlinks resolved, hard links mapped onto
+    /// the store), and, when the gate's list didn't line up, its flat list.
+    fn names_ask_store(&self, unit: Option<usize>) -> bool {
+        let hit = self.a.uses.iter().enumerate().any(|(idx, u)| {
+            unit.is_none_or(|i| u.unit == i)
+                && self.a.all_paths(idx).iter().any(|p| self.s.ask_hit(p))
+        });
+        hit || (self.a.aligned.is_none()
+            && self.input.resolved_paths.iter().any(|p| self.s.ask_hit(p)))
+    }
+
     fn readonly(&self, i: usize) -> bool {
         let u = &self.a.units[i];
         if !u.seg.assignments.is_empty() || !harmless(u) || u.seg.argv.is_empty() {
+            return false;
+        }
+        if self.names_ask_store(Some(i)) {
             return false;
         }
         let argv = &u.seg.argv;
@@ -550,6 +806,11 @@ impl Home<'_> {
             .iter()
             .any(|a| a.starts_with("--exec-path") || a.starts_with("--config-env"))
         {
+            return false;
+        }
+        // `git show HEAD:.npmrc`: a committed file named like a credential
+        // (CR-12)
+        if entry.prefix.first() == Some(&"git") && git_args_name_credential(args) {
             return false;
         }
         let is_rg = entry.prefix == ["rg"];
@@ -578,8 +839,29 @@ impl Home<'_> {
         match &input.check.subject {
             ToolSubject::None => PolicyVerdict::Allow { rule: None },
             ToolSubject::Paths {
-                paths, recursive, ..
+                paths,
+                recursive,
+                glob,
             } => match input.check.kind {
+                // a credential store that asks (CR-12)
+                ToolKind::Read | ToolKind::Search if self.names_ask_store(None) => {
+                    PolicyVerdict::Ask
+                }
+                ToolKind::Search
+                    if glob.as_ref().is_some_and(|g| {
+                        let roots: Vec<PathBuf> = if paths.is_empty() {
+                            vec![input.cwd.to_path_buf()]
+                        } else {
+                            (0..self.a.uses.len())
+                                .flat_map(|i| self.a.all_paths(i).into_iter().cloned())
+                                .collect()
+                        };
+                        self.s
+                            .ask_search_glob_hit(&roots, g, self.a.glob_search.as_ref())
+                    }) =>
+                {
+                    PolicyVerdict::Ask
+                }
                 ToolKind::Read => PolicyVerdict::Allow { rule: None },
                 ToolKind::Search => {
                     if *recursive {
@@ -634,16 +916,28 @@ impl PolicyEngine for DefaultPolicy {
         if let Some(id) = deny::hard_deny(input, &a) {
             return PolicyVerdict::HardDeny { id };
         }
-        let out = apply_rules(input, &a, rules);
+        let esc = a.glob_escape.as_ref();
+        let glob_leaves = esc.is_some_and(deny::GlobEscape::leaves);
+        let glob_unbounded =
+            esc.is_some_and(|e| e.unbounded) || a.glob_search.as_ref().is_some_and(|(_, u)| *u);
+        let out = apply_rules(input, &a, rules, glob_leaves);
         if let Some((reason, rule)) = out.deny {
             return PolicyVerdict::Deny {
                 reason: reason.unwrap_or_default(),
                 rule,
             };
         }
-        let unknown = matches!(input.check.subject, ToolSubject::Unknown);
+        // A search glob that can name files outside every path the subject
+        // gives (M1-18, P1; D-100): hard-denied (above) if an expansion hits
+        // the hard-deny list, otherwise allowed by FullAccess or an Any rule
+        // and asked in Home/Normal/Trusted/Careful and under prefix/scoped rules.
+        // When glob expansion overflows (brace or variant cap), Ask everywhere.
+        let unknown = matches!(input.check.subject, ToolSubject::Unknown)
+            || a.unbounded_unknown_dangerous
+            || glob_unbounded;
         let command = matches!(input.check.subject, ToolSubject::Command { .. });
         if !unknown
+            && (!glob_leaves || out.any_allow)
             && out.covered.iter().all(|c| *c)
             && (command && !parts(&a).is_empty() || !command)
         {
@@ -653,6 +947,13 @@ impl PolicyEngine for DefaultPolicy {
         }
         if unknown {
             return PolicyVerdict::Ask;
+        }
+        if glob_leaves {
+            return if input.preset == Preset::FullAccess {
+                PolicyVerdict::Allow { rule: None }
+            } else {
+                PolicyVerdict::Ask
+            };
         }
         match input.preset {
             Preset::Home | Preset::Normal | Preset::Trusted => {

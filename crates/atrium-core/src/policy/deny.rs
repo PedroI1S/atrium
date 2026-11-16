@@ -37,10 +37,131 @@ pub struct Analysis {
     pub cwd_uncertain: bool,
     /// Bigger than the checker takes on (line bytes, commands, words, paths).
     pub overflow: bool,
+    /// An unknown `env`/`command` invocation whose readings could not be
+    /// bounded and whose words may be dangerous (M1-18, K1 fail-closed).
+    pub unbounded_unknown_dangerous: bool,
     /// Text the raw-string checks run on.
     pub raw: Vec<String>,
     /// The starting directory of a command.
     pub start: PathBuf,
+    /// Cached `glob_escape` result for `ToolSubject::Paths`.
+    pub glob_escape: Option<GlobEscape>,
+    /// Cached `(variants, unbounded)` for `search_glob_hit` and `ask_search_glob_hit`.
+    pub glob_search: Option<(Vec<String>, bool)>,
+}
+
+fn unknown_tok_dangerous(tok: &str, cwd: &Path, home: &Path, s: &Sensitive, piped: bool) -> bool {
+    if tok.is_empty() {
+        return false;
+    }
+    if tok.contains(['$', '`', '*', '?', '[', '{', ';', '|', '&', '\n'])
+        || tok.starts_with(['/', '~'])
+        || tok.contains("..")
+        || tok.contains("<(")
+        || tok.contains(">(")
+    {
+        return true;
+    }
+    if !tok.starts_with('-') {
+        let p = lexical_resolve(tok, cwd, home);
+        if !p.starts_with(cwd)
+            || s.hit(&p, Role::Write).is_some()
+            || s.ask_hit(&p)
+            || s.is_or_contains(&p)
+        {
+            return true;
+        }
+    }
+    if shell::maybe_shell(tok) || (piped && is_interpreter(tok)) {
+        return true;
+    }
+    let b = base(tok);
+    matches!(
+        b,
+        "eval"
+            | "source"
+            | "."
+            | "exec"
+            | "command"
+            | "env"
+            | "xargs"
+            | "find"
+            | "osascript"
+            | "crontab"
+            | "security"
+            | "secret-tool"
+            | "rm"
+            | "dd"
+            | "shred"
+            | "wipefs"
+            | "blkdiscard"
+            | "mke2fs"
+            | "diskutil"
+            | "curl"
+            | "wget"
+            | "fetch"
+            | "git"
+    ) || PRIV.contains(&b)
+        || b.starts_with("mkfs")
+        || b.starts_with("newfs")
+        || words::is_known_writer(&[tok.to_string()])
+}
+
+fn unknown_words_could_be_dangerous(
+    invocations: &[shell::UnboundedUnknown],
+    cwd: &Path,
+    home: &Path,
+    s: &Sensitive,
+) -> bool {
+    invocations.iter().any(|inv| {
+        let words = &inv.words;
+        let is_script_or_flock = matches!(words.first().map(|w| base(w)), Some("script" | "flock"));
+        (1..words.len()).any(|i| {
+            let w = &words[i];
+            if unknown_tok_dangerous(w, cwd, home, s, inv.piped) {
+                return true;
+            }
+            if let Some((_, val)) = w.split_once('=')
+                && val
+                    .split_whitespace()
+                    .any(|t| unknown_tok_dangerous(t, cwd, home, s, inv.piped))
+            {
+                return true;
+            }
+            if w.starts_with('-') && !w.starts_with("--") {
+                for flag in ['C', 'S'] {
+                    if let Some(pos) = w[1..].find(flag) {
+                        let after = &w[1 + pos + 1..];
+                        if after
+                            .split_whitespace()
+                            .any(|t| unknown_tok_dangerous(t, cwd, home, s, inv.piped))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            // Separate argument word after -S/--split-string, -C/--chdir, or script/flock -c/--command.
+            let takes_split_arg = (w.starts_with("--")
+                && !w.contains('=')
+                && w.len() >= 3
+                && ("--split-string".starts_with(w)
+                    || "--chdir".starts_with(w)
+                    || (is_script_or_flock && "--command".starts_with(w))))
+                || (w.starts_with('-')
+                    && !w.starts_with("--")
+                    && (w.ends_with(['S', 'C']) || (is_script_or_flock && w.ends_with('c'))));
+            if takes_split_arg
+                && let Some(next) = words.get(i + 1)
+                && next
+                    .split_whitespace()
+                    .any(|t| unknown_tok_dangerous(t, cwd, home, s, inv.piped))
+            {
+                return true;
+            }
+            false
+        })
+    })
 }
 
 fn strings_of(v: &Value, out: &mut Vec<String>) {
@@ -89,9 +210,13 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         cwd_unknown: false,
         cwd_uncertain: false,
         overflow: false,
+        unbounded_unknown_dangerous: false,
         raw: vec![],
         start: input.cwd.to_path_buf(),
+        glob_escape: None,
+        glob_search: None,
     };
+    let s_for_unknown = Sensitive::new(input);
     let lex_cmd = |a: &mut Analysis, line: &str, start: &Path| {
         if line.len() > MAX_BYTES {
             a.overflow = true;
@@ -100,6 +225,14 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         let l = shell::lex(line);
         a.units = l.units;
         a.reasons = l.reasons;
+        if !l.unbounded_unknown_words.is_empty() {
+            a.unbounded_unknown_dangerous = unknown_words_could_be_dangerous(
+                &l.unbounded_unknown_words,
+                start,
+                home,
+                &s_for_unknown,
+            );
+        }
         if l.overflow || a.units.len() > MAX_UNITS {
             a.overflow = true;
             return;
@@ -128,7 +261,7 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
             a.raw.push(line.clone());
             lex_cmd(&mut a, line, &start);
         }
-        ToolSubject::Paths { paths, .. } => {
+        ToolSubject::Paths { paths, glob, .. } => {
             let role = match check.kind {
                 ToolKind::Read | ToolKind::Search => Role::Read,
                 _ => Role::Write,
@@ -138,6 +271,20 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
             }
             for p in paths.iter().take(words::MAX_USES) {
                 pseudo(&mut a, p, role);
+            }
+            if let Some(g) = glob {
+                let roots: Vec<PathBuf> = if paths.is_empty() {
+                    vec![input.cwd.to_path_buf()]
+                } else {
+                    paths
+                        .iter()
+                        .take(words::MAX_USES)
+                        .map(|p| lexical_resolve(p, input.cwd, home))
+                        .collect()
+                };
+                let cands = expand_glob_candidates(g, input.cwd, home);
+                a.glob_search = Some(search_variants_from_cands(&roots, input.cwd, home, &cands));
+                a.glob_escape = Some(escape_from_cands(&roots, input.cwd, home, &cands));
             }
         }
         ToolSubject::Fetch { url } => {
@@ -291,6 +438,35 @@ const BROWSER_FILES: &[&str] = &[
 ];
 const SSH_PROBES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "x"];
 
+/// Credential stores that ask (contract §9 rev 3.1, CR-12, D-082): not
+/// hard-denied, but Home never auto-allows a call that reads, searches or
+/// names them. Relative to home (compared in lower case). (`~/.git-credentials` is on the
+/// hard-deny list and stays there.)
+const ASK_FILES: &[&str] = &[
+    ".cargo/credentials.toml",
+    ".cargo/credentials",
+    ".pypirc",
+    ".pgpass",
+    ".vault-token",
+    ".azure/accessTokens.json",
+    ".config/git/credentials",
+    ".env",
+    // shell history files
+    ".bash_history",
+    ".zsh_history",
+    ".zhistory",
+    ".sh_history",
+    ".ksh_history",
+    ".history",
+    ".local/share/fish/fish_history",
+    ".config/fish/fish_history",
+];
+/// Folders whose every file asks: `~/.aws/sso/cache/`, and macOS
+/// Terminal's per-session shell histories.
+const ASK_TREES: &[&str] = &[".aws/sso/cache", ".zsh_sessions", ".bash_sessions"];
+/// `~/.azure/msal_token_cache.*`: (folder, file name prefix).
+const ASK_NAME_PREFIXES: &[(&str, &str)] = &[(".azure", "msal_token_cache.")];
+
 pub struct Sensitive {
     home: String,
     data: Vec<String>,
@@ -376,6 +552,14 @@ impl Sensitive {
             all.push(abs(r));
         }
         all.push(abs(".ssh"));
+        // the credential stores that ask (CR-12): a recursive search of a
+        // folder holding one asks
+        for r in ASK_FILES.iter().chain(ASK_TREES) {
+            all.push(abs(&r.to_lowercase()));
+        }
+        for (dir, pre) in ASK_NAME_PREFIXES {
+            all.push(abs(&format!("{dir}/{pre}")));
+        }
         all.iter().any(|s| under(s, &pl).is_some())
     }
 
@@ -436,6 +620,113 @@ impl Sensitive {
 
     pub fn is_ssh_dir(&self, p: &Path) -> bool {
         lower(p) == format!("{}/.ssh", self.home)
+    }
+
+    /// A credential store that asks (CR-12): `p` is one, or is inside one
+    /// of its folders.
+    pub fn ask_hit(&self, p: &Path) -> bool {
+        let pl = lower(p);
+        let Some(rest) = under(&pl, &self.home) else {
+            return false;
+        };
+        ASK_FILES.iter().any(|f| f.to_lowercase() == rest)
+            || ASK_TREES.iter().any(|t| under(rest, t).is_some())
+            || ASK_NAME_PREFIXES.iter().any(|(dir, pre)| {
+                under(rest, dir).is_some_and(|r| !r.contains('/') && r.starts_with(pre))
+            })
+    }
+
+    /// Representative paths of the credential stores that ask.
+    fn ask_probes(&self) -> Vec<String> {
+        let abs = |rel: &str| format!("{}/{rel}", self.home);
+        let mut v: Vec<String> = ASK_FILES.iter().map(|f| abs(&f.to_lowercase())).collect();
+        for t in ASK_TREES {
+            v.push(abs(t));
+            v.push(format!("{}/x.json", abs(t)));
+        }
+        for (dir, pre) in ASK_NAME_PREFIXES {
+            v.push(abs(&format!("{dir}/{pre}json")));
+            v.push(abs(&format!("{dir}/{pre}bin")));
+        }
+        v
+    }
+
+    /// A search over `roots` scoped by `glob` (matched against file names,
+    /// paths relative to a root, or whole paths) that can reach a credential
+    /// store that asks.
+    pub fn ask_search_glob_hit(
+        &self,
+        roots: &[PathBuf],
+        glob: &str,
+        cached: Option<&(Vec<String>, bool)>,
+    ) -> bool {
+        let owned;
+        let (variants, unbounded) = match cached {
+            Some((v, u)) => (v.as_slice(), *u),
+            None => {
+                let home_path = Path::new(&self.home);
+                owned = glob_search_variants(roots, glob, home_path, home_path);
+                (owned.0.as_slice(), owned.1)
+            }
+        };
+        if unbounded {
+            return true;
+        }
+        let mut matchers = Vec::with_capacity(variants.len());
+        for norm in variants {
+            let Ok(g) = GlobBuilder::new(norm).literal_separator(false).build() else {
+                return true;
+            };
+            matchers.push(g.compile_matcher());
+        }
+        let root_lowers: Vec<String> = roots.iter().map(|r| lower(r)).collect();
+        if self.ask_probes().iter().any(|probe| {
+            let name = probe.rsplit('/').next().unwrap_or(probe);
+            root_lowers.iter().any(|rl| {
+                let Some(rel) = under(probe, rl) else {
+                    return false;
+                };
+                matchers.iter().any(|g| {
+                    g.is_match(name) || g.is_match(probe) || (!rel.is_empty() && g.is_match(rel))
+                })
+            })
+        }) {
+            return true;
+        }
+        // Any search of an ASK_TREE with a filename filter (`.zsh_sessions/*.session`).
+        let mut tree_targets: Vec<(String, String)> = vec![];
+        for t in ASK_TREES {
+            let t_abs = format!("{}/{t}", self.home);
+            for rl in &root_lowers {
+                if under(rl, &t_abs).is_some() {
+                    return true;
+                }
+                if let Some(tree_rel) = under(&t_abs, rl) {
+                    tree_targets.push((tree_rel.to_string(), t_abs.clone()));
+                }
+            }
+        }
+        if !tree_targets.is_empty() {
+            for norm in variants {
+                for (idx, _) in norm.match_indices('/') {
+                    if idx == 0 {
+                        continue;
+                    }
+                    let dir_pat = &norm[..idx];
+                    let Ok(g) = GlobBuilder::new(dir_pat).literal_separator(true).build() else {
+                        return true;
+                    };
+                    let m = g.compile_matcher();
+                    if tree_targets
+                        .iter()
+                        .any(|(tree_rel, t_abs)| m.is_match(tree_rel) || m.is_match(t_abs))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Raw-text check: home-anchored credential paths and Atrium's data.
@@ -602,11 +893,11 @@ fn reads_stdin_as_code_at(eff: &[String], depth: u8) -> bool {
         // `sh -c …`): the code given may itself read the script on stdin
         // (round 8 blocker 3)
         return shell
-            && shell::shell_c_code(eff).is_some_and(|code| {
-                shell::lex(&code)
+            && shell::shell_c_codes(eff).iter().any(|code| {
+                shell::lex(code)
                     .units
                     .iter()
-                    .any(|u| reads_stdin_as_code_at(&u.eff, depth + 1))
+                    .any(|u| u.readings().any(|e| reads_stdin_as_code_at(e, depth + 1)))
             });
     }
     // `bash -o pipefail`: the option's value isn't a script
@@ -933,9 +1224,22 @@ impl Ctx<'_> {
             recursive,
             ..
         } = &self.input.check.subject
-            && *recursive
         {
-            hits.extend(self.search_glob_hit(paths, g));
+            hits.extend(self.search_glob_hit(paths, g, *recursive));
+        }
+        // a search glob that leaves its roots (M1-18, P1): each expansion
+        // that leaves is checked as a path pattern of its own
+        if let Some(esc) = &self.a.glob_escape {
+            for p in &esc.patterns {
+                let globby = p.to_string_lossy().contains(['*', '?', '[']);
+                hits.extend(self.s.hit(p, Role::Read));
+                if globby {
+                    hits.extend(self.s.glob_hit(p, Role::Read));
+                }
+                if self.s.is_ssh_dir(p) {
+                    hits.push("credential-read");
+                }
+            }
         }
 
         for (i, u) in a.units.iter().enumerate() {
@@ -1055,14 +1359,18 @@ impl Ctx<'_> {
             }
             // pipe-to-shell
             if DOWNLOADERS.contains(&b) && u.pipe != 0 {
+                // in any reading of its wrappers (M1-18, K1)
                 let downstream = a.units.iter().enumerate().any(|(j, v)| {
-                    j > i && v.pipe == u.pipe && v.seg.piped && reads_stdin_as_code(&v.eff)
+                    j > i
+                        && v.pipe == u.pipe
+                        && v.seg.piped
+                        && v.readings().any(reads_stdin_as_code)
                 });
                 if downstream {
                     hits.push("pipe-to-shell");
                 }
             }
-            if is_executor(eff) && u.subs.iter().any(|s| contains_downloader(s)) {
+            if u.readings().any(is_executor) && u.subs.iter().any(|s| contains_downloader(s)) {
                 hits.push("pipe-to-shell");
             }
         }
@@ -1115,33 +1423,650 @@ impl Ctx<'_> {
         })
     }
 
-    fn search_glob_hit(&self, roots: &[String], glob: &str) -> Option<&'static str> {
-        let g = GlobBuilder::new(glob)
-            .literal_separator(false)
-            .build()
-            .ok()?
-            .compile_matcher();
-        let root_paths: Vec<PathBuf> = if roots.is_empty() {
-            vec![self.input.cwd.to_path_buf()]
+    fn search_glob_hit(
+        &self,
+        roots: &[String],
+        glob: &str,
+        recursive: bool,
+    ) -> Option<&'static str> {
+        let owned;
+        let (variants, unbounded) = match &self.a.glob_search {
+            Some((v, u)) => (v.as_slice(), *u),
+            None => {
+                let resolved_roots: Vec<PathBuf> = if roots.is_empty() {
+                    vec![self.input.cwd.to_path_buf()]
+                } else {
+                    roots
+                        .iter()
+                        .take(words::MAX_USES)
+                        .map(|r| lexical_resolve(r, self.input.cwd, self.home()))
+                        .collect()
+                };
+                owned = glob_search_variants(&resolved_roots, glob, self.input.cwd, self.home());
+                (owned.0.as_slice(), owned.1)
+            }
+        };
+        if unbounded {
+            return None;
+        }
+        let matchers: Vec<globset::GlobMatcher> = variants
+            .iter()
+            .filter_map(|norm| {
+                GlobBuilder::new(norm)
+                    .literal_separator(false)
+                    .build()
+                    .ok()
+                    .map(|g| g.compile_matcher())
+            })
+            .collect();
+        if matchers.is_empty() {
+            return None;
+        }
+        let root_lowers: Vec<String> = if roots.is_empty() {
+            vec![lower(self.input.cwd)]
         } else {
             roots
                 .iter()
-                .map(|r| lexical_resolve(r, self.input.cwd, self.home()))
+                .map(|r| lower(&lexical_resolve(r, self.input.cwd, self.home())))
                 .collect()
         };
         for probe in self.s.probes() {
             let pp = Path::new(&probe);
             let name = pp.file_name()?.to_string_lossy().to_string();
-            if (g.is_match(&name) || g.is_match(&probe))
-                && self.s.hit(pp, Role::Read).is_some()
-                && root_paths
-                    .iter()
-                    .any(|r| under(&probe, &lower(r)).is_some())
-            {
-                return self.s.hit(pp, Role::Read);
+            let Some(hit) = self.s.hit(pp, Role::Read) else {
+                continue;
+            };
+            for rl in &root_lowers {
+                let Some(rel) = under(&probe, rl) else {
+                    continue;
+                };
+                let name_allowed = recursive || !rel.contains('/');
+                if matchers.iter().any(|g| {
+                    (name_allowed && g.is_match(&name))
+                        || g.is_match(&probe)
+                        || (!rel.is_empty() && g.is_match(rel))
+                }) {
+                    return Some(hit);
+                }
             }
         }
         None
+    }
+}
+
+/// What a search subject's `glob` can name outside every path the subject
+/// gives (M1-18, P1). `patterns`: each brace expansion that leaves, made
+/// absolute (`/h/u/.ssh/id_*`); `unknown`: a form whose reach can't be read
+/// (a backslash, `~user`, a component made of classes and `?` that can be
+/// `.` or `..`, `$VAR`, too many expansions).
+#[derive(Debug, Default)]
+pub struct GlobEscape {
+    pub patterns: Vec<PathBuf>,
+    pub unknown: bool,
+    pub unbounded: bool,
+}
+
+impl GlobEscape {
+    pub fn leaves(&self) -> bool {
+        self.unbounded || self.unknown || !self.patterns.is_empty()
+    }
+}
+
+/// A pattern component that can match `.` or `..` without being written
+/// so (`[.][.]`, `.[.]`, `??`, `[.][.]*`). Plain `*` / `**` are left out:
+/// a directory walk never lists `.` or `..` for `*`.
+fn class_may_match_dot(class: &str) -> bool {
+    let inner = &class[1..class.len() - 1];
+    if !inner.contains(['!', '^', '.', '\\'])
+        && !inner
+            .as_bytes()
+            .windows(3)
+            .any(|w| w[1] == b'-' && w[0] <= b'.' && b'.' <= w[2])
+    {
+        return false;
+    }
+    GlobBuilder::new(class)
+        .literal_separator(true)
+        .build()
+        .map_or(true, |g| g.compile_matcher().is_match("."))
+}
+
+fn may_be_dot_component(c: &str) -> bool {
+    if c == "*" || c == "**" || !c.contains(['[', '?']) {
+        return false;
+    }
+    if !c.contains('?')
+        && c.starts_with('[')
+        && c.ends_with(']')
+        && !c[1..c.len() - 1].contains(['[', ']'])
+        && !class_may_match_dot(c)
+    {
+        return false;
+    }
+    let Ok(g) = GlobBuilder::new(c).literal_separator(true).build() else {
+        return true;
+    };
+    let m = g.compile_matcher();
+    m.is_match(".") || m.is_match("..")
+}
+
+fn unescape_glob_backslashes(g: &str) -> String {
+    let mut out = String::with_capacity(g.len());
+    let mut chars = g.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            } else {
+                out.push('\\');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Normalizes `./`, `//`, and `literal/..` steps in a glob pattern while
+/// keeping `**` and wildcard components intact.
+const MAX_GLOB_VARIANTS: usize = 256;
+
+/// Single normalizer for both `glob_escape` and `search_glob_hit` /
+/// `ask_search_glob_hit`: collapses curdir, empty segments, and `literal/..`,
+/// and treats `..` after a single-component wildcard as possibly popping that
+/// segment (emitting both popped and as-written forms).
+fn apply_dotdot<'a>(
+    mut st: Vec<&'a str>,
+    abs: bool,
+    out: &mut Vec<Vec<&'a str>>,
+    cap: usize,
+) -> bool {
+    if out.len() > cap.saturating_mul(4).max(16) {
+        out.sort_unstable();
+        out.dedup();
+        if out.len() > cap {
+            return false;
+        }
+    }
+    match st.last().copied() {
+        None => {
+            if !abs {
+                st.push("..");
+            }
+            out.push(st);
+        }
+        Some("..") => {
+            st.push("..");
+            out.push(st);
+        }
+        Some("**") => {
+            // `**` matches >= 2 segments: absorbs `..` and stays `**`.
+            out.push(st.clone());
+            // `**` matches 1 segment: cancelled by `..`.
+            st.pop();
+            out.push(st.clone());
+            // `**` matches 0 segments: `..` acts on what preceded `**`.
+            if !apply_dotdot(st, abs, out, cap) {
+                return false;
+            }
+        }
+        Some(last) if !last.contains(['*', '?', '[']) => {
+            st.pop();
+            out.push(st);
+        }
+        Some(_) => {
+            let mut popped = st.clone();
+            popped.pop();
+            out.push(popped);
+            st.push("..");
+            out.push(st);
+        }
+    }
+    true
+}
+
+fn normalize_glob_variants(g: &str, cap: usize) -> Option<Vec<String>> {
+    let abs = g.starts_with('/');
+    let mut states: Vec<Vec<&str>> = vec![vec![]];
+    for c in g.split('/') {
+        match c {
+            "" | "." => {}
+            "**" => {
+                for st in &mut states {
+                    if st.last().copied() != Some("**") {
+                        st.push(c);
+                    }
+                }
+                states.sort_unstable();
+                states.dedup();
+            }
+            ".." => {
+                let mut next = Vec::with_capacity(states.len());
+                for st in states {
+                    if !apply_dotdot(st, abs, &mut next, cap) {
+                        return None;
+                    }
+                }
+                next.sort_unstable();
+                next.dedup();
+                if next.len() > cap {
+                    return None;
+                }
+                states = next;
+            }
+            _ => {
+                for st in &mut states {
+                    st.push(c);
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(states.len());
+    for st in states {
+        let s = if abs {
+            format!("/{}", st.join("/"))
+        } else if st.is_empty() {
+            ".".to_string()
+        } else {
+            st.join("/")
+        };
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    Some(out)
+}
+
+/// Widens `?` and any character class `[...]` that can match `.` to `.`.
+fn widen_pattern_dots(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = s[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        if ch == '?' {
+            out.push('.');
+            i += len;
+        } else if ch == '[' {
+            let mut j = i + 1;
+            if j < bytes.len() && (bytes[j] == b'!' || bytes[j] == b'^') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                j += 1;
+            }
+            while j < bytes.len() && bytes[j] != b']' {
+                if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                let class = &s[i..=j];
+                if class_may_match_dot(class) {
+                    out.push('.');
+                } else {
+                    out.push_str(class);
+                }
+                i = j + 1;
+            } else {
+                out.push(ch);
+                i += len;
+            }
+        } else {
+            out.push(ch);
+            i += len;
+        }
+    }
+    out
+}
+
+/// If a `[...]` class can contain or span `/`, returns a variant replacing it
+/// with `/`.
+fn widen_pattern_slashes(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = s[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        if ch == '[' {
+            let mut j = i + 1;
+            if j < bytes.len() && (bytes[j] == b'!' || bytes[j] == b'^') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                j += 1;
+            }
+            while j < bytes.len() && bytes[j] != b']' {
+                if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                let class = &s[i..=j];
+                let inner = &s[i + 1..j];
+                let has_slash = inner.contains('/')
+                    || inner
+                        .as_bytes()
+                        .windows(3)
+                        .any(|w| w[1] == b'-' && w[0] <= b'/' && b'/' <= w[2]);
+                if has_slash {
+                    out.push('/');
+                    changed = true;
+                } else {
+                    out.push_str(class);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(ch);
+        i += len;
+    }
+    changed.then_some(out)
+}
+
+/// Widens `$VAR` / `${VAR}` in a glob as possibly an empty string, `**`, or
+/// any absolute path `/**`.
+fn expand_glob_vars(s: &str) -> Vec<String> {
+    if !s.contains('$') {
+        return vec![];
+    }
+    let mut as_globstar = String::new();
+    let mut as_empty = String::new();
+    let mut first_abs: Option<String> = None;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let end = if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                s[i + 2..].find('}').map_or(bytes.len(), |k| i + 2 + k + 1)
+            } else {
+                let mut k = i + 1;
+                while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                    k += 1;
+                }
+                k
+            };
+            as_globstar.push_str("**");
+            if first_abs.is_none() {
+                let rest = &s[end..];
+                first_abs = Some(if rest.starts_with('/') || rest.is_empty() {
+                    format!("/**{rest}")
+                } else {
+                    format!("/**/{rest}")
+                });
+            }
+            i = end;
+        } else {
+            let ch = s[i..].chars().next().unwrap();
+            as_globstar.push(ch);
+            as_empty.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    let mut out = vec![as_globstar, as_empty];
+    if let Some(a) = first_abs {
+        out.push(a);
+    }
+    out
+}
+
+#[derive(Default)]
+struct GlobCandidates {
+    variants: Vec<String>,
+    unknown: bool,
+    unbounded: bool,
+}
+
+/// Shared brace-expansion, home-expansion, and dot/slash/`$VAR` widening,
+/// capped at `MAX_GLOB_VARIANTS` without sampling on overflow.
+fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates {
+    let mut res = GlobCandidates::default();
+    if glob.contains('\0') {
+        res.unbounded = true;
+        return res;
+    }
+    let mut raw = vec![glob.to_string()];
+    if glob.contains('\\') {
+        res.unknown = true;
+        raw.push(unescape_glob_backslashes(glob));
+    }
+    let mut expansions = vec![];
+    for r in raw {
+        if let Some(exps) = words::brace_expand(&r) {
+            expansions.extend(exps);
+        } else {
+            res.unknown = true;
+            res.unbounded = true;
+            res.variants.clear();
+            return res;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for e in expansions {
+        if e.is_empty() {
+            continue;
+        }
+        let h = words::expand_home(&e, home, cwd);
+        if let Some(rest) = h.strip_prefix('~')
+            && !rest.is_empty()
+            && !rest.starts_with('/')
+        {
+            res.unknown = true;
+            continue;
+        }
+        if h.split('/').any(may_be_dot_component) {
+            res.unknown = true;
+        }
+        let mut bases = vec![h.clone()];
+        if h.contains('$') {
+            res.unknown = true;
+            bases.extend(expand_glob_vars(&h));
+        }
+        let mut cands = vec![];
+        for b in bases {
+            if !cands.contains(&b) {
+                cands.push(b.clone());
+            }
+            let dots = widen_pattern_dots(&b);
+            if dots != b && !cands.contains(&dots) {
+                cands.push(dots.clone());
+            }
+            if let Some(sl) = widen_pattern_slashes(&b) {
+                res.unknown = true;
+                if !cands.contains(&sl) {
+                    cands.push(sl.clone());
+                }
+                let sl_dots = widen_pattern_dots(&sl);
+                if sl_dots != sl && !cands.contains(&sl_dots) {
+                    cands.push(sl_dots);
+                }
+            }
+            if dots != b
+                && let Some(dots_sl) = widen_pattern_slashes(&dots)
+            {
+                res.unknown = true;
+                if !cands.contains(&dots_sl) {
+                    cands.push(dots_sl);
+                }
+            }
+        }
+        for cand in cands {
+            if cand.is_empty() {
+                continue;
+            }
+            if seen.insert(cand.clone()) {
+                if res.variants.len() >= MAX_GLOB_VARIANTS {
+                    res.unknown = true;
+                    res.unbounded = true;
+                    res.variants.clear();
+                    return res;
+                }
+                res.variants.push(cand);
+            }
+        }
+    }
+    res
+}
+
+fn search_variants_from_cands(
+    roots: &[PathBuf],
+    cwd: &Path,
+    home: &Path,
+    cands: &GlobCandidates,
+) -> (Vec<String>, bool) {
+    if cands.unbounded {
+        return (vec![], true);
+    }
+    let mut out = vec![];
+    let mut seen = std::collections::HashSet::new();
+    let mut unjoined_norm = 0usize;
+    let mut joined_norm = 0usize;
+    let mut push_norms = |pat: &str, total: &mut usize| -> bool {
+        let remaining = MAX_GLOB_VARIANTS.saturating_sub(*total);
+        if remaining == 0 {
+            return false;
+        }
+        let Some(norms) = normalize_glob_variants(pat, remaining) else {
+            return false;
+        };
+        *total += norms.len();
+        if *total > MAX_GLOB_VARIANTS {
+            return false;
+        }
+        for n in norms {
+            let norm = n.to_lowercase().replace('ſ', "s");
+            if !norm.is_empty() && seen.insert(norm.clone()) {
+                out.push(norm);
+            }
+        }
+        true
+    };
+    for gv in &cands.variants {
+        if gv.is_empty() {
+            continue;
+        }
+        if !push_norms(gv, &mut unjoined_norm) {
+            return (vec![], true);
+        }
+        let anchored = gv.starts_with('/') || gv.starts_with('~');
+        if !anchored {
+            for r in roots {
+                let joined = format!("{}/{}", r.to_string_lossy().trim_end_matches('/'), gv);
+                if !push_norms(&joined, &mut joined_norm) {
+                    return (vec![], true);
+                }
+            }
+        } else {
+            let expanded = words::expand_home(gv, home, cwd);
+            if expanded != *gv && !push_norms(&expanded, &mut joined_norm) {
+                return (vec![], true);
+            }
+        }
+    }
+    (out, false)
+}
+
+fn glob_search_variants(
+    roots: &[PathBuf],
+    glob: &str,
+    cwd: &Path,
+    home: &Path,
+) -> (Vec<String>, bool) {
+    let cands = expand_glob_candidates(glob, cwd, home);
+    search_variants_from_cands(roots, cwd, home, &cands)
+}
+
+fn escape_from_cands(
+    roots: &[PathBuf],
+    cwd: &Path,
+    home: &Path,
+    cands: &GlobCandidates,
+) -> GlobEscape {
+    let mut out = GlobEscape {
+        patterns: vec![],
+        unknown: cands.unknown,
+        unbounded: cands.unbounded,
+    };
+    if cands.unbounded {
+        return out;
+    }
+    let mut total_norm = 0usize;
+    for gv in &cands.variants {
+        check_escape_variant(gv, roots, cwd, home, &mut total_norm, &mut out);
+        if out.unbounded {
+            break;
+        }
+    }
+    out
+}
+
+fn check_escape_variant(
+    variant: &str,
+    roots: &[PathBuf],
+    cwd: &Path,
+    home: &Path,
+    total_norm: &mut usize,
+    out: &mut GlobEscape,
+) {
+    if variant.is_empty() {
+        return;
+    }
+    let is_pat = |c: &str| c.contains(['*', '?', '[']);
+    let anchored = variant.starts_with('/') || variant.starts_with('~');
+    let raw_joined: Vec<String> = if anchored {
+        vec![words::expand_home(variant, home, cwd)]
+    } else {
+        roots
+            .iter()
+            .map(|r| format!("{}/{}", r.to_string_lossy().trim_end_matches('/'), variant))
+            .collect()
+    };
+    for j in raw_joined {
+        let remaining = MAX_GLOB_VARIANTS.saturating_sub(*total_norm);
+        if remaining == 0 {
+            out.unbounded = true;
+            out.unknown = true;
+            return;
+        }
+        let Some(norms) = normalize_glob_variants(&j, remaining) else {
+            out.unbounded = true;
+            out.unknown = true;
+            return;
+        };
+        *total_norm += norms.len();
+        if *total_norm > MAX_GLOB_VARIANTS {
+            out.unbounded = true;
+            out.unknown = true;
+            return;
+        }
+        for n in norms {
+            let abs = PathBuf::from(&n);
+            // the folder the walk starts from: the literal components
+            let mut start = PathBuf::new();
+            for c in abs.components() {
+                if is_pat(&c.as_os_str().to_string_lossy()) {
+                    break;
+                }
+                start.push(c.as_os_str());
+            }
+            let inside = roots.iter().any(|r| start.starts_with(r));
+            if !inside && !out.patterns.contains(&abs) {
+                if out.patterns.len() >= MAX_GLOB_VARIANTS {
+                    out.unbounded = true;
+                    out.unknown = true;
+                    return;
+                }
+                out.patterns.push(abs);
+            }
+        }
     }
 }
 
@@ -1219,6 +2144,30 @@ pub fn hard_deny(input: &PolicyInput<'_>, a: &Analysis) -> Option<&'static str> 
 
 pub fn sensitive(input: &PolicyInput<'_>) -> Sensitive {
     Sensitive::new(input)
+}
+
+/// The credential stores that ask (CR-12), absolute: files and folders
+/// (`~/.azure/msal_token_cache.*` are found by listing `~/.azure`).
+pub fn ask_roots(home: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = ASK_FILES
+        .iter()
+        .chain(ASK_TREES)
+        .map(|r| home.join(r))
+        .collect();
+    for (dir, pre) in ASK_NAME_PREFIXES {
+        if let Ok(rd) = std::fs::read_dir(home.join(dir)) {
+            for e in rd.flatten().take(256) {
+                if e.file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .starts_with(pre)
+                {
+                    v.push(e.path());
+                }
+            }
+        }
+    }
+    v
 }
 
 /// Every credential, `~/.ssh`, browser and Atrium location, absolute.
