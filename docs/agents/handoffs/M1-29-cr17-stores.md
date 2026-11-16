@@ -138,3 +138,11 @@ git diff a3b2a60 --stat
   - `cargo fmt --all` — passed (exit 0)
   - `cargo check -p atrium-core --tests` — passed (exit 0, 0 warnings)
   - `cargo check -p atrium-daemon --tests` — passed (exit 0, 0 warnings)
+
+## Rework round 2
+
+- **`app/src/ui/security.test.ts` (`pnpm typecheck` fix):**
+  - Imported `type JSX` from `"solid-js"`, typed `SecurityRow = { id: string; label: string }` for `rows`, passed the explicit props type argument `<{ rows: readonly SecurityRow[]; row: (row: SecurityRow) => JSX.Element }>` to `createComponent(SecurityPage, ...)`, and typed the `row` callback parameter `(r: SecurityRow)`.
+  - `app/src/ui/Security.tsx` types were left untouched and no `any` was added; the file stays `.test.ts` so `app/vite.config.ts` (`src/**/*.test.ts`) continues to pick it up.
+- **Checks run after rework round 2 (D-123):**
+  - `cargo fmt --all` and `cargo check` only (`pnpm` not run here per D-123; verification task should re-run `pnpm --dir app typecheck` and `pnpm --dir app test`).

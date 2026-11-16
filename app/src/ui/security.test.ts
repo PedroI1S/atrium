@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { createComponent } from "solid-js";
+import { createComponent, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -50,19 +50,24 @@ describe("Settings → Security credential stores that ask (CR-12, CR-17)", () =
   it("renders the ask-stores list inside SecurityPage", async () => {
     const host = document.createElement("div");
     document.body.appendChild(host);
-    const rows = [
+    type SecurityRow = { id: string; label: string };
+    const rows: SecurityRow[] = [
       { id: "always-blocked", label: "Always blocked (for calls Atrium sees)" },
       { id: "known-limits", label: "Known limits" },
     ];
     dispose = render(
-      () => createComponent(SecurityPage, {
-        rows,
-        row: (r) => {
-          const el = document.createElement("div");
-          el.textContent = r.label;
-          return el;
-        },
-      }),
+      () =>
+        createComponent<{ rows: readonly SecurityRow[]; row: (row: SecurityRow) => JSX.Element }>(
+          SecurityPage,
+          {
+            rows,
+            row: (r: SecurityRow) => {
+              const el = document.createElement("div");
+              el.textContent = r.label;
+              return el;
+            },
+          },
+        ),
       host,
     );
     await Promise.resolve();
