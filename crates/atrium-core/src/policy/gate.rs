@@ -316,15 +316,62 @@ fn evaluate_sync(
     // or Atrium's own paths, reached through a glob or a search or walker
     // that follows links (round 8 blocker 2, M1-18 K2).
     if !matches!(verdict, PolicyVerdict::HardDeny { .. }) && !analysis.overflow {
+        let real_home = resolve_fs(&c.home, 0);
+        let real_data: Vec<PathBuf> = c
+            .atrium_data_paths
+            .iter()
+            .map(|p| resolve_fs(p, 0))
+            .collect();
+        let real_protected: Vec<PathBuf> = c
+            .atrium_protected_paths
+            .iter()
+            .map(|p| resolve_fs(p, 0))
+            .collect();
+        let real_input = PolicyInput {
+            check,
+            thread: &c.thread,
+            provider: c.provider,
+            cwd: &c.cwd,
+            home: &real_home,
+            atrium_data_paths: &real_data,
+            atrium_protected_paths: &real_protected,
+            resolved_paths: &[],
+            preset,
+        };
+        let real_sensitive = deny::sensitive(&real_input);
         let mut trees = trees_of(
             &deny::sensitive_roots(&c.home, &[], &[]),
             "credential-read",
             true,
+            TreeKind::Sensitive,
         );
-        trees.extend(trees_of(&ssh.linked_dirs, "credential-read", true));
-        trees.extend(trees_of(&c.atrium_data_paths, "atrium-self", true));
-        trees.extend(trees_of(&c.atrium_protected_paths, "atrium-self", false));
-        match reaches_tree_through_links(check, &analysis, &resolved, &trees, &c.cwd, &c.home) {
+        trees.extend(trees_of(
+            &ssh.linked_dirs,
+            "credential-read",
+            true,
+            TreeKind::Raw,
+        ));
+        trees.extend(trees_of(
+            &c.atrium_data_paths,
+            "atrium-self",
+            true,
+            TreeKind::Sensitive,
+        ));
+        trees.extend(trees_of(
+            &c.atrium_protected_paths,
+            "atrium-self",
+            false,
+            TreeKind::Sensitive,
+        ));
+        match reaches_tree_through_links(
+            check,
+            &analysis,
+            &resolved,
+            &trees,
+            &c.cwd,
+            &c.home,
+            Some(&real_sensitive),
+        ) {
             (Reach::Yes, t) => {
                 verdict = PolicyVerdict::HardDeny {
                     id: t.map_or("credential-read", |t| t.id),
@@ -343,8 +390,13 @@ fn evaluate_sync(
         && !analysis.overflow
         && matches!(preset, Preset::Home | Preset::Normal | Preset::Trusted)
     {
-        let asks = trees_of(&deny::ask_roots(&c.home), "credential-read", true);
-        if reaches_tree_through_links(check, &analysis, &resolved, &asks, &c.cwd, &c.home).0
+        let asks = trees_of(
+            &deny::ask_roots(&c.home),
+            "credential-read",
+            true,
+            TreeKind::Raw,
+        );
+        if reaches_tree_through_links(check, &analysis, &resolved, &asks, &c.cwd, &c.home, None).0
             != Reach::No
         {
             let careful = PolicyInput {
@@ -795,6 +847,10 @@ struct GlobExpansion {
 }
 
 fn expand_glob(p: &Path) -> Option<GlobExpansion> {
+    expand_glob_with(p, false)
+}
+
+fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
     const MAX_ENTRIES: usize = 4096;
     const MAX_DEPTH: usize = 12;
     let comps: Vec<String> = p
@@ -826,9 +882,16 @@ fn expand_glob(p: &Path) -> Option<GlobExpansion> {
         let c = comps[k].as_str();
         if !is_pat(c) {
             let next = dir.join(c);
-            // a glob only expands to names that exist
-            if std::fs::symlink_metadata(&next).is_ok() {
-                stack.push((next, k + 1, deep));
+            // a glob only expands to names that exist; permission/loop errors fail closed
+            match std::fs::symlink_metadata(&next) {
+                Ok(_) => stack.push((next, k + 1, deep)),
+                Err(e) => {
+                    let not_there = e.kind() == std::io::ErrorKind::NotFound
+                        || std::fs::metadata(&dir).is_ok_and(|m| !m.is_dir());
+                    if !not_there {
+                        truncated = true;
+                    }
+                }
             }
             continue;
         }
@@ -850,27 +913,44 @@ fn expand_glob(p: &Path) -> Option<GlobExpansion> {
             .build()
             .ok()?
             .compile_matcher();
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                let not_dir = e.kind() == std::io::ErrorKind::NotFound
+                    || std::fs::metadata(&dir).is_ok_and(|m| !m.is_dir());
+                if !not_dir {
+                    truncated = true;
+                }
+                continue;
+            }
         };
-        for e in rd.flatten() {
+        for entry in rd {
+            let Ok(e) = entry else {
+                truncated = true;
+                continue;
+            };
             seen += 1;
             if seen > MAX_ENTRIES {
-                return None;
+                truncated = true;
+                break;
             }
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') && !c.starts_with('.') {
+            if !include_dotfiles && name.starts_with('.') && !c.starts_with('.') {
                 continue;
             }
             let path = dir.join(&name);
             if c == "**" {
                 if stack.len() > MAX_ENTRIES {
-                    return None;
+                    truncated = true;
+                    break;
                 }
                 // `**` ends at this entry, or goes on below it
                 stack.push((path.clone(), k + 1, deep));
-                if path.is_dir() {
-                    stack.push((path, k, deep + 1));
+                match std::fs::metadata(&path) {
+                    Ok(md) if md.is_dir() => stack.push((path, k, deep + 1)),
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => truncated = true,
                 }
             } else if m.is_match(&name) {
                 stack.push((path, k + 1, deep));
@@ -906,33 +986,96 @@ fn glob_reaches(p: &Path, d: &Path, names_dir: bool) -> Reach {
     }
 }
 
-/// The real path of `p`, following dangling symlinks by hand or falling back
-/// to its deepest existing ancestor when `p` itself doesn't exist.
+/// The real path of `p`, following symlinks (including dangling ones) in
+/// filesystem order so `..` applies after preceding links, falling back to
+/// the deepest existing ancestor when a tail does not exist.
 fn real_path(p: &Path) -> PathBuf {
     if let Ok(r) = std::fs::canonicalize(p) {
         return r;
     }
-    if let Ok(md) = std::fs::symlink_metadata(p)
-        && md.is_symlink()
-        && let Ok(t) = std::fs::read_link(p)
-    {
-        let target = if t.is_absolute() {
-            t
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    enum Seg {
+        Root(OsString),
+        Cur,
+        Parent,
+        Normal(OsString),
+    }
+
+    let push_comps = |q: &mut VecDeque<Seg>, path: &Path, front: bool| {
+        let segs: Vec<Seg> = path
+            .components()
+            .map(|c| match c {
+                Component::Prefix(pre) => Seg::Root(pre.as_os_str().to_os_string()),
+                Component::RootDir => Seg::Root(OsString::from("/")),
+                Component::CurDir => Seg::Cur,
+                Component::ParentDir => Seg::Parent,
+                Component::Normal(n) => Seg::Normal(n.to_os_string()),
+            })
+            .collect();
+        if front {
+            for s in segs.into_iter().rev() {
+                q.push_front(s);
+            }
         } else {
-            let parent = p
-                .parent()
-                .and_then(|dir| std::fs::canonicalize(dir).ok())
-                .unwrap_or_else(|| p.parent().unwrap_or(Path::new("/")).to_path_buf());
-            parent.join(t)
-        };
-        return resolve_fs(&normalize(&target), 1);
+            q.extend(segs);
+        }
+    };
+
+    let mut queue = VecDeque::new();
+    push_comps(&mut queue, p, false);
+    let mut cur = PathBuf::new();
+    let mut hops = 0u8;
+
+    while let Some(seg) = queue.pop_front() {
+        match seg {
+            Seg::Root(r) => {
+                if r == "/" {
+                    if cur.as_os_str().is_empty() {
+                        cur.push("/");
+                    } else {
+                        cur.push(Component::RootDir.as_os_str());
+                    }
+                } else {
+                    cur = PathBuf::from(r);
+                }
+            }
+            Seg::Cur => {
+                if cur.as_os_str().is_empty() {
+                    cur.push(".");
+                }
+            }
+            Seg::Parent => match cur.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    cur.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => cur.push(".."),
+            },
+            Seg::Normal(name) => {
+                cur.push(&name);
+                if hops < MAX_HOPS
+                    && let Ok(md) = std::fs::symlink_metadata(&cur)
+                    && md.is_symlink()
+                    && let Ok(target) = std::fs::read_link(&cur)
+                {
+                    hops += 1;
+                    if target.is_absolute() {
+                        cur.clear();
+                    } else {
+                        cur.pop();
+                    }
+                    push_comps(&mut queue, &target, true);
+                    continue;
+                }
+                if let Ok(canon) = std::fs::canonicalize(&cur) {
+                    cur = canon;
+                }
+            }
+        }
     }
-    if let (Some(dir), Some(name)) = (p.parent(), p.file_name())
-        && let Ok(r) = std::fs::canonicalize(dir)
-    {
-        return r.join(name);
-    }
-    p.to_path_buf()
+    cur
 }
 
 /// Whether the call reaches a folder linked into `~/.ssh`: a file below one
@@ -1321,6 +1464,12 @@ fn ack_long_names() -> Vec<&'static str> {
 /// A place a link may lead into: a credential tree or file (reading or
 /// writing it is a hard deny), Atrium's data (the same) or Atrium's
 /// protected paths (only writing), or a credential store that asks (CR-12).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeKind {
+    Sensitive,
+    Raw,
+}
+
 struct Tree {
     path: PathBuf,
     id: &'static str,
@@ -1330,38 +1479,160 @@ struct Tree {
     /// credential trees, as since round 8); for Atrium's paths only the
     /// folder itself counts.
     held: bool,
+    kind: TreeKind,
 }
 
-fn trees_of(paths: &[PathBuf], id: &'static str, read: bool) -> Vec<Tree> {
+fn trees_of(paths: &[PathBuf], id: &'static str, read: bool, kind: TreeKind) -> Vec<Tree> {
     paths
         .iter()
-        .filter_map(|r| std::fs::canonicalize(r).ok())
-        .map(|path| Tree {
-            path,
+        .map(|r| Tree {
+            path: resolve_fs(r, 0),
             id,
             read,
             held: id == "credential-read",
+            kind,
         })
         .collect()
 }
 
 /// The tree a real path is in (or, with `names_dir`, names or holds), for a
 /// use of this role.
-fn in_trees<'a>(real: &Path, trees: &'a [Tree], names_dir: bool, write: bool) -> Option<&'a Tree> {
+fn in_trees<'a>(
+    real: &Path,
+    trees: &'a [Tree],
+    names_dir: bool,
+    role: words::Role,
+    sensitive: Option<&deny::Sensitive>,
+) -> Option<&'a Tree> {
+    let write = role != words::Role::Read;
     trees.iter().find(|t| {
-        (t.read || write)
-            // a credential file itself (`~/.aws/credentials`) counts; a
-            // tree's own folder only for a reader that walks into it
-            && ((real.starts_with(&t.path) && (real != t.path || !real.is_dir()))
-                || (names_dir && (t.path == real || (t.held && t.path.starts_with(real)))))
+        if !(t.read || write) {
+            return false;
+        }
+        if names_dir && (t.path == real || (t.held && t.path.starts_with(real))) {
+            return true;
+        }
+        if !(real.starts_with(&t.path) && (real != t.path || !real.is_dir())) {
+            return false;
+        }
+        match (t.kind, sensitive) {
+            (TreeKind::Sensitive, Some(s)) => {
+                (names_dir && real.is_dir()) || s.hit(real, role).is_some()
+            }
+            _ => true,
+        }
     })
+}
+
+#[derive(Clone, Copy)]
+enum PruneDirs {
+    None,
+    GitOnly,
+    AckDefault,
+    VcsAndBuild,
+}
+
+fn prune_mode(eff: &[String]) -> PruneDirs {
+    let Some(first) = eff.first() else {
+        return PruneDirs::None;
+    };
+    let args = &eff[1..];
+    match shell::base(first) {
+        "rg" => {
+            let bool_s = format!("{}L", engine::RG_BOOL_S);
+            let val_s = format!("{}f", engine::RG_VAL_S);
+            let bool_l: Vec<&str> = std::iter::once("follow")
+                .chain(engine::RG_BOOL_L.iter().copied())
+                .collect();
+            let val_l: Vec<&str> = std::iter::once("file")
+                .chain(engine::RG_VAL_L.iter().copied())
+                .collect();
+            let Some((shorts, longs)) =
+                reader_flag_tokens(args, &bool_s, &val_s, &bool_l, &val_l, false)
+            else {
+                return PruneDirs::None;
+            };
+            let u_count = shorts.iter().filter(|&&c| c == 'u').count()
+                + longs.iter().filter(|&&a| a == "--unrestricted").count();
+            let hidden = longs.contains(&"--hidden") || u_count >= 2;
+            if hidden {
+                PruneDirs::None
+            } else {
+                PruneDirs::GitOnly
+            }
+        }
+        "ag" => {
+            let bool_s = format!("{}{}", AG_OPTS.flags, AG_OPTS.opt_vals);
+            let bool_l: Vec<&str> = AG_OPTS.long_flags.to_vec();
+            let val_l: Vec<&str> = AG_OPTS
+                .long_vals
+                .iter()
+                .chain(AG_OPTS.long_opt_vals.iter())
+                .copied()
+                .collect();
+            let Some((shorts, longs)) =
+                reader_flag_tokens(args, &bool_s, AG_OPTS.vals, &bool_l, &val_l, true)
+            else {
+                return PruneDirs::None;
+            };
+            let names = ag_long_names();
+            let hidden = shorts.contains(&'u')
+                || longs
+                    .iter()
+                    .any(|a| long_is(a, "hidden", &names) || long_is(a, "unrestricted", &names));
+            if hidden {
+                PruneDirs::None
+            } else {
+                PruneDirs::GitOnly
+            }
+        }
+        "ack" => {
+            let bool_s = format!("{}{}", ACK_OPTS.flags, ACK_OPTS.opt_vals);
+            let bool_l: Vec<&str> = ACK_OPTS.long_flags.to_vec();
+            let val_l: Vec<&str> = ACK_OPTS
+                .long_vals
+                .iter()
+                .chain(ACK_OPTS.long_opt_vals.iter())
+                .copied()
+                .collect();
+            let Some((_, longs)) =
+                reader_flag_tokens(args, &bool_s, ACK_OPTS.vals, &bool_l, &val_l, true)
+            else {
+                return PruneDirs::None;
+            };
+            let names = ack_long_names();
+            let no_ignore = longs.iter().any(|a| long_is(a, "noignore-dir", &names));
+            if no_ignore {
+                PruneDirs::None
+            } else {
+                PruneDirs::AckDefault
+            }
+        }
+        "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" | "rgrep" | "find" => PruneDirs::None,
+        _ => PruneDirs::VcsAndBuild,
+    }
+}
+
+fn is_pruned(prune: PruneDirs, name: Option<&str>) -> bool {
+    match (prune, name) {
+        (PruneDirs::None, _) => false,
+        (PruneDirs::GitOnly, Some(".git")) => true,
+        (PruneDirs::AckDefault, Some(".git" | "node_modules")) => true,
+        (PruneDirs::VcsAndBuild, Some(".git" | "node_modules" | "target")) => true,
+        _ => false,
+    }
 }
 
 /// A bounded walk below `root`, following the links it meets the way a
 /// following search does (a link to a folder is walked too, at any number
 /// of hops: M1-18, K2), for a link into a tree: Yes (with the tree), No, or
 /// Maybe when the walk is too big.
-fn links_below<'a>(root: &Path, trees: &'a [Tree]) -> (Reach, Option<&'a Tree>) {
+fn links_below<'a>(
+    root: &Path,
+    trees: &'a [Tree],
+    prune: PruneDirs,
+    sensitive: Option<&deny::Sensitive>,
+) -> (Reach, Option<&'a Tree>) {
     const BUDGET: usize = 4096;
     const MAX_DEPTH: u8 = 16;
     let mut seen = 0usize;
@@ -1376,12 +1647,7 @@ fn links_below<'a>(root: &Path, trees: &'a [Tree]) -> (Reach, Option<&'a Tree>) 
         };
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir()
-                && matches!(
-                    e.file_name().to_str(),
-                    Some(".git" | "node_modules" | "target")
-                )
-            {
+            if ft.is_dir() && is_pruned(prune, e.file_name().to_str()) {
                 continue;
             }
             seen += 1;
@@ -1393,7 +1659,7 @@ fn links_below<'a>(root: &Path, trees: &'a [Tree]) -> (Reach, Option<&'a Tree>) 
                 let Ok(real) = std::fs::canonicalize(&p) else {
                     continue;
                 };
-                if let Some(t) = in_trees(&real, trees, true, false) {
+                if let Some(t) = in_trees(&real, trees, true, words::Role::Read, sensitive) {
                     return (Reach::Yes, Some(t));
                 }
                 // a link to a folder elsewhere: walk it too, once
@@ -1448,8 +1714,8 @@ fn raw_glob_pattern(word: &str, cwd: &Path, home: &Path) -> PathBuf {
 /// Expands `p` on disk, marking `maybe` if the walk hits a cap or cannot read
 /// a component; returns the original `p` on `None` so callers can still walk it
 /// if it is a directory.
-fn expand_targets(p: &Path, maybe: &mut bool) -> Vec<PathBuf> {
-    match expand_glob(p) {
+fn expand_targets(p: &Path, include_dotfiles: bool, maybe: &mut bool) -> Vec<PathBuf> {
+    match expand_glob_with(p, include_dotfiles) {
         Some(exp) => {
             if exp.truncated {
                 *maybe = true;
@@ -1467,11 +1733,12 @@ fn first_tree_hit<'a>(
     targets: &[PathBuf],
     trees: &'a [Tree],
     names_dir: bool,
-    write: bool,
+    role: words::Role,
+    sensitive: Option<&deny::Sensitive>,
 ) -> Option<&'a Tree> {
     targets
         .iter()
-        .find_map(|f| in_trees(&real_path(f), trees, names_dir, write))
+        .find_map(|f| in_trees(&real_path(f), trees, names_dir, role, sensitive))
 }
 
 fn reaches_tree_through_links<'a>(
@@ -1481,6 +1748,7 @@ fn reaches_tree_through_links<'a>(
     trees: &'a [Tree],
     cwd: &Path,
     home: &Path,
+    sensitive: Option<&deny::Sensitive>,
 ) -> (Reach, Option<&'a Tree>) {
     if trees.is_empty() {
         return (Reach::No, None);
@@ -1504,9 +1772,10 @@ fn reaches_tree_through_links<'a>(
             Some(true) => follow == Follow::Yes,
             None => false,
         };
+        let prune = prune_mode(&u.eff);
         if let Some(words::CwdState::Known(cands)) = a.unit_cwd.get(i) {
             for c in cands {
-                match links_below(c, trees) {
+                match links_below(c, trees, prune, sensitive) {
                     (Reach::Yes, t) if sure => return (Reach::Yes, t),
                     (Reach::No, _) => {}
                     _ => maybe = true,
@@ -1514,13 +1783,17 @@ fn reaches_tree_through_links<'a>(
             }
         }
     }
+    let file_tool = matches!(check.subject, ToolSubject::Paths { .. });
     if let ToolSubject::Paths {
         paths,
         glob: Some(g),
         recursive,
     } = &check.subject
     {
-        let write = !matches!(check.kind, ToolKind::Read | ToolKind::Search);
+        let role = match check.kind {
+            ToolKind::Read | ToolKind::Search => words::Role::Read,
+            _ => words::Role::Write,
+        };
         let roots: Vec<PathBuf> = if paths.is_empty() {
             vec![resolve_fs(cwd, 0)]
         } else {
@@ -1544,21 +1817,30 @@ fn reaches_tree_through_links<'a>(
             let cands: Vec<PathBuf> = if h.starts_with('/') {
                 vec![raw_glob_pattern(&h, cwd, home)]
             } else {
-                roots
-                    .iter()
-                    .map(|r| raw_glob_pattern(&h, r, home))
-                    .collect()
+                let mut v = Vec::with_capacity(roots.len() * 2);
+                let trimmed = h.trim_end_matches('/');
+                let basename_recursive = *recursive
+                    && !trimmed.is_empty()
+                    && !trimmed.contains('/')
+                    && !matches!(trimmed, "." | ".." | "**");
+                for r in &roots {
+                    v.push(raw_glob_pattern(&h, r, home));
+                    if basename_recursive {
+                        v.push(raw_glob_pattern(&format!("**/{trimmed}"), r, home));
+                    }
+                }
+                v
             };
             for p in cands {
                 let globby = p
                     .to_string_lossy()
                     .contains(['*', '?', '[', '{', '}', '$', '`']);
                 let targets = if globby {
-                    expand_targets(&p, &mut maybe)
+                    expand_targets(&p, true, &mut maybe)
                 } else {
                     vec![p]
                 };
-                if let Some(t) = first_tree_hit(&targets, trees, *recursive, write) {
+                if let Some(t) = first_tree_hit(&targets, trees, *recursive, role, sensitive) {
                     return (Reach::Yes, Some(t));
                 }
             }
@@ -1571,7 +1853,8 @@ fn reaches_tree_through_links<'a>(
         let recursive = recursive_paths
             || unit.is_some_and(|x| recursive_reader(&x.eff) || tree_walker(&x.eff));
         let follow = unit.map_or(Follow::No, |x| follows_links(&x.eff));
-        let write = u.role != words::Role::Read;
+        let prune = unit.map_or(PruneDirs::None, |x| prune_mode(&x.eff));
+        let include_dotfiles = unit.is_none() && file_tool;
         // `ls proj/*` only names what it lists
         let lister = !recursive
             && unit.is_some_and(|x| x.eff.first().is_some_and(|f| shell::base(f) == "ls"));
@@ -1587,20 +1870,20 @@ fn reaches_tree_through_links<'a>(
             let globby = ps.contains(['*', '?', '['])
                 || (unit.is_some() && ps.contains(['{', '}', '$', '`']));
             let targets = if globby {
-                expand_targets(p, &mut maybe)
+                expand_targets(p, include_dotfiles, &mut maybe)
             } else {
                 vec![p.clone()]
             };
             if globby
                 && !lister
-                && let Some(t) = first_tree_hit(&targets, trees, recursive, write)
+                && let Some(t) = first_tree_hit(&targets, trees, recursive, u.role, sensitive)
             {
                 return (Reach::Yes, Some(t));
             }
             if recursive && follow != Follow::No {
                 for f in &targets {
                     if f.is_dir() {
-                        match links_below(f, trees) {
+                        match links_below(f, trees, prune, sensitive) {
                             (Reach::Yes, t) if follow == Follow::Yes => return (Reach::Yes, t),
                             (Reach::No, _) => {}
                             _ => maybe = true,
@@ -1624,8 +1907,8 @@ fn reaches_tree_through_links<'a>(
             for ev in exps {
                 for uc in &unit_cwds {
                     let raw_p = raw_glob_pattern(&ev, uc, home);
-                    let targets = expand_targets(&raw_p, &mut maybe);
-                    if let Some(t) = first_tree_hit(&targets, trees, recursive, write) {
+                    let targets = expand_targets(&raw_p, include_dotfiles, &mut maybe);
+                    if let Some(t) = first_tree_hit(&targets, trees, recursive, u.role, sensitive) {
                         return (Reach::Yes, Some(t));
                     }
                 }
