@@ -2219,8 +2219,8 @@ fn fix4_finding1_reentering_globs_and_search_overflow() {
         subject(
             "F1b-asym",
             Search,
-            &["~"],
-            Some(concat!("{1..50}{a,b}/x*/", "..", "/foo")),
+            &["/"],
+            Some(concat!("**", "/{1..50}{a,b}/", "..", "/", "..", "/foo")),
             false,
             ask_all,
         ),
@@ -2339,6 +2339,353 @@ fn fix4_ordinary_lines_keep_devs_verdict() {
     run_rows(&[row(
         "ordinary4",
         "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'cargo test' --lib",
+        DEV_ASK,
+    )]);
+}
+
+/// Finding 1, fix round 5: `**` and `..` collapsing whenever normalization
+/// brings them together (after dropping `.`, empty segments, `seg/..`, or
+/// `wildcard/..`), reaching the plain-path verdict.
+#[test]
+fn fix5_finding1_globstar_and_parent_after_normalization() {
+    use ToolKind::Search;
+    let cr = ["CR", "CR", "CR"];
+    let asks = ["Ask", "Allow", "Allow"];
+    let v = vec![
+        // Review Finding 1 evidence lines
+        subject(
+            "F1-r5",
+            Search,
+            &["~"],
+            Some(concat!("**", "/./", "..", "/.ssh/id_rsa")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1-r5",
+            Search,
+            &["~"],
+            Some(concat!("**", "/./", "..", "/.ssh/id_rsa")),
+            true,
+            cr,
+        ),
+        subject(
+            "F1-r5",
+            Search,
+            &["~"],
+            Some(concat!("**", "//", "..", "/.ssh/id_rsa")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1-r5",
+            Search,
+            &["~"],
+            Some(concat!("**", "/sub/", "..", "/", "..", "/.ssh/id_rsa")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1-r5",
+            Search,
+            &["~"],
+            Some(concat!("**", "/x*/", "..", "/", "..", "/.ssh/id_rsa")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1-r5",
+            Search,
+            &["~"],
+            Some(concat!("**", "/./", "..", "/.aws/credentials")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1-r5",
+            Search,
+            &["~"],
+            Some(concat!("**", "/./", "..", "/.npmrc")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1-r5",
+            Search,
+            &["~/proj"],
+            Some(concat!("**", "/./", "..", "/", "..", "/.ssh/id_rsa")),
+            true,
+            cr,
+        ),
+        // CR-12 stores via `**` + normalization + `..`
+        subject(
+            "F1-r5-cr12",
+            Search,
+            &["~"],
+            Some(concat!("**", "/./", "..", "/.cargo/credentials.toml")),
+            false,
+            asks,
+        ),
+        subject(
+            "F1-r5-cr12",
+            Search,
+            &["~"],
+            Some(concat!("**", "//", "..", "/.pypirc")),
+            false,
+            asks,
+        ),
+        subject(
+            "F1-r5-cr12",
+            Search,
+            &["~"],
+            Some(concat!(
+                "**",
+                "/sub/",
+                "..",
+                "/",
+                "..",
+                "/.zsh_sessions/*.session"
+            )),
+            false,
+            asks,
+        ),
+        // Extra spellings from prompt
+        subject(
+            "F1-r5-extra",
+            Search,
+            &["~/proj"],
+            Some(concat!("**", "/./././", "..")),
+            true,
+            asks,
+        ),
+        subject(
+            "F1-r5-extra",
+            Search,
+            &["~/proj"],
+            Some(concat!("**", "/./././", "..", "/.ssh/id_rsa")),
+            false,
+            cr,
+        ),
+        subject(
+            "F1-r5-extra",
+            Search,
+            &["~/proj"],
+            Some(concat!("**", "/a/b/", "..", "/", "..", "/", "..")),
+            true,
+            asks,
+        ),
+        subject(
+            "F1-r5-extra",
+            Search,
+            &["~/proj"],
+            Some(concat!(
+                "**",
+                "/a/b/",
+                "..",
+                "/",
+                "..",
+                "/",
+                "..",
+                "/.ssh/id_rsa"
+            )),
+            false,
+            cr,
+        ),
+        subject(
+            "F1-r5-extra",
+            Search,
+            &["~/proj"],
+            Some(concat!("**", "/x*/y*/", "..", "/", "..", "/", "..")),
+            true,
+            asks,
+        ),
+        subject(
+            "F1-r5-extra",
+            Search,
+            &["~/proj"],
+            Some(concat!(
+                "**",
+                "/x*/y*/",
+                "..",
+                "/",
+                "..",
+                "/",
+                "..",
+                "/.ssh/id_rsa"
+            )),
+            false,
+            cr,
+        ),
+    ];
+    run_subject_list(v);
+}
+
+/// Finding 2, fix round 5: `env` with `5..=11` unknown options combining `-C` /
+/// `--chdir` with a separate `-S` / `--split-string` argument appends `&a[*tail..]`
+/// when pairing `chdir_vals` with `split_vals`.
+#[test]
+fn fix5_finding2_env_chdir_with_separate_split_string() {
+    let opts = "-Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4";
+    let mut rows = vec![];
+    for l in [
+        format!("env {opts} -C .. -S 'sh -c' 'cat .ssh/id_rsa'"),
+        format!("env {opts} --chdir .. --split-string 'sh -c' 'cat .ssh/id_rsa'"),
+        format!("env {opts} --chdir=.. -S 'sh -c' 'cat .ssh/id_rsa'"),
+        format!("env {opts} -C.. -S 'sh -c' 'cat .ssh/id_rsa'"),
+        format!("env {opts} -C .. -iS 'sh -c' 'cat .ssh/id_rsa'"),
+        format!("env {opts} -C .. -vS 'sh -c' 'cat .ssh/id_rsa'"),
+        format!("env {opts} -C .. -S'sh -c' 'cat .ssh/id_rsa'"),
+        format!("env {opts} -C .. --split-string='sh -c' 'cat .ssh/id_rsa'"),
+        format!("env {opts} --chd .. --spl 'sh -c' 'cat .ssh/id_rsa'"),
+        format!("env {opts} -C .. -S sh -c 'cat .ssh/id_rsa'"),
+    ] {
+        rows.push(row("F2-r5", format!("cwd=proj|{l}"), H_CR));
+    }
+    rows.push(row(
+        "F2-r5-cd-split",
+        format!("cwd=proj|env {opts} -S 'cd .. && sh -c' 'cat .ssh/id_rsa'"),
+        H_CR,
+    ));
+    rows.push(row(
+        "F2-r5-pe",
+        format!("cwd=proj|env {opts} -C .. -S 'sh -c' 'sudo id'"),
+        H_PE,
+    ));
+    rows.push(row(
+        "F2-r5-rd",
+        format!("cwd=proj|env {opts} -C .. -S 'sh -c' 'rm -rf ~'"),
+        H_RD,
+    ));
+    run_rows(&rows);
+}
+
+/// Finding 3, fix round 5: `search_variants_from_cands` gives root-joined forms
+/// their own `MAX_GLOB_VARIANTS` budget and does not double `**` candidates,
+/// keeping `dev`'s `Allow` up to 256 expansions while failing closed past 256.
+#[test]
+fn fix5_finding3_glob_variant_budget() {
+    use ToolKind::Search;
+    let allow = ["Allow", "Allow", "Allow"];
+    let ask_all = ["Ask", "Ask", "Ask"];
+    run_subject_list(vec![
+        subject(
+            "F3-r5-128",
+            Search,
+            &["~/proj"],
+            Some("{1..64}{a,b}.rs"),
+            true,
+            allow,
+        ),
+        subject(
+            "F3-r5-128-star",
+            Search,
+            &["~/proj"],
+            Some("{1..64}{a,b}/**/*.rs"),
+            true,
+            allow,
+        ),
+        subject(
+            "F3-r5-129",
+            Search,
+            &["~/proj"],
+            Some("{{1..64}{a,b},extra}.rs"),
+            true,
+            allow,
+        ),
+        subject(
+            "F3-r5-64-star",
+            Search,
+            &["~/proj"],
+            Some("{1..32}{a,b}/**/*.rs"),
+            true,
+            allow,
+        ),
+        subject(
+            "F3-r5-65-star",
+            Search,
+            &["~/proj"],
+            Some("{{1..32}{a,b},extra}/**/*.rs"),
+            true,
+            allow,
+        ),
+        subject(
+            "F3-r5-129-star",
+            Search,
+            &["~/proj"],
+            Some("{{1..64}{a,b},extra}/**/*.rs"),
+            true,
+            allow,
+        ),
+        subject(
+            "F3-r5-256-star",
+            Search,
+            &["~/proj"],
+            Some("{1..64}{a,b,c,d}/**/*.rs"),
+            true,
+            allow,
+        ),
+        subject(
+            "F3-r5-257-over",
+            Search,
+            &["~/proj"],
+            Some("{{1..64}{a,b,c,d},extra}.rs"),
+            true,
+            ask_all,
+        ),
+        subject(
+            "F3-r5-257-star-over",
+            Search,
+            &["~/proj"],
+            Some("{{1..64}{a,b,c,d},extra}/**/*.rs"),
+            true,
+            ask_all,
+        ),
+    ]);
+}
+
+/// Fix round 5 ordinary lines: keep `dev`'s verdicts.
+#[test]
+fn fix5_ordinary_lines_keep_devs_verdict() {
+    use ToolKind::Search;
+    let allow = ["Allow", "Allow", "Allow"];
+    let asks = ["Ask", "Allow", "Allow"];
+    run_subject_list(vec![
+        subject(
+            "ordinary5",
+            Search,
+            &["~/proj"],
+            Some("**/*.rs"),
+            true,
+            allow,
+        ),
+        subject(
+            "ordinary5",
+            Search,
+            &["~/proj"],
+            Some("src/**/./mod.rs"),
+            true,
+            allow,
+        ),
+        subject(
+            "ordinary5",
+            Search,
+            &["~/proj"],
+            Some(concat!("**", "/", "..", "/sibling/*.rs")),
+            true,
+            asks,
+        ),
+        subject(
+            "ordinary5",
+            Search,
+            &["~"],
+            Some(concat!("{1..50}{a,b}/x*/", "..", "/foo")),
+            false,
+            allow,
+        ),
+    ]);
+    run_rows(&[row(
+        "ordinary5",
+        "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -C .. -S 'cargo test' --lib",
         DEV_ASK,
     )]);
 }

@@ -1575,37 +1575,76 @@ const MAX_GLOB_VARIANTS: usize = 256;
 /// `ask_search_glob_hit`: collapses curdir, empty segments, and `literal/..`,
 /// and treats `..` after a single-component wildcard as possibly popping that
 /// segment (emitting both popped and as-written forms).
+fn apply_dotdot<'a>(
+    mut st: Vec<&'a str>,
+    abs: bool,
+    out: &mut Vec<Vec<&'a str>>,
+    cap: usize,
+) -> bool {
+    if out.len() > cap.saturating_mul(4).max(16) {
+        out.sort_unstable();
+        out.dedup();
+        if out.len() > cap {
+            return false;
+        }
+    }
+    match st.last().copied() {
+        None => {
+            if !abs {
+                st.push("..");
+            }
+            out.push(st);
+        }
+        Some("..") => {
+            st.push("..");
+            out.push(st);
+        }
+        Some("**") => {
+            // `**` matches >= 2 segments: absorbs `..` and stays `**`.
+            out.push(st.clone());
+            // `**` matches 1 segment: cancelled by `..`.
+            st.pop();
+            out.push(st.clone());
+            // `**` matches 0 segments: `..` acts on what preceded `**`.
+            if !apply_dotdot(st, abs, out, cap) {
+                return false;
+            }
+        }
+        Some(last) if !last.contains(['*', '?', '[']) => {
+            st.pop();
+            out.push(st);
+        }
+        Some(_) => {
+            let mut popped = st.clone();
+            popped.pop();
+            out.push(popped);
+            st.push("..");
+            out.push(st);
+        }
+    }
+    true
+}
+
 fn normalize_glob_variants(g: &str, cap: usize) -> Option<Vec<String>> {
     let abs = g.starts_with('/');
     let mut states: Vec<Vec<&str>> = vec![vec![]];
     for c in g.split('/') {
         match c {
             "" | "." => {}
+            "**" => {
+                for st in &mut states {
+                    if st.last().copied() != Some("**") {
+                        st.push(c);
+                    }
+                }
+                states.sort_unstable();
+                states.dedup();
+            }
             ".." => {
                 let mut next = Vec::with_capacity(states.len());
-                for mut st in states {
-                    match st.last().copied() {
-                        None => {
-                            if !abs {
-                                st.push("..");
-                            }
-                            next.push(st);
-                        }
-                        Some("..") | Some("**") => {
-                            st.push("..");
-                            next.push(st);
-                        }
-                        Some(last) if !last.contains(['*', '?', '[']) => {
-                            st.pop();
-                            next.push(st);
-                        }
-                        Some(_) => {
-                            let mut popped = st.clone();
-                            popped.pop();
-                            next.push(popped);
-                            st.push("..");
-                            next.push(st);
-                        }
+                for st in states {
+                    if !apply_dotdot(st, abs, &mut next, cap) {
+                        return None;
                     }
                 }
                 next.sort_unstable();
@@ -1779,33 +1818,6 @@ fn expand_glob_vars(s: &str) -> Vec<String> {
     out
 }
 
-fn globstar_variants(e: &str) -> Vec<String> {
-    let mut out = vec![e.to_string()];
-    let mut work = e.to_string();
-    for _ in 0..16 {
-        let parts: Vec<&str> = work.split('/').collect();
-        let Some(idx) = parts.windows(2).position(|w| w[0] == "**" && w[1] == "..") else {
-            break;
-        };
-        let mut next_parts = Vec::with_capacity(parts.len() - 1);
-        next_parts.extend_from_slice(&parts[..=idx]);
-        next_parts.extend_from_slice(&parts[idx + 2..]);
-        work = next_parts.join("/");
-        if !out.contains(&work) {
-            out.push(work.clone());
-        }
-    }
-    let len = out.len();
-    for i in 0..len {
-        if let Some(d) = drop_globstar(&out[i])
-            && !out.contains(&d)
-        {
-            out.push(d);
-        }
-    }
-    out
-}
-
 #[derive(Default)]
 struct GlobCandidates {
     variants: Vec<String>,
@@ -1813,7 +1825,7 @@ struct GlobCandidates {
     unbounded: bool,
 }
 
-/// Shared brace-expansion, home-expansion, dot/slash/`$VAR`/`**` widening,
+/// Shared brace-expansion, home-expansion, and dot/slash/`$VAR` widening,
 /// capped at `MAX_GLOB_VARIANTS` without sampling on overflow.
 fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates {
     let mut res = GlobCandidates::default();
@@ -1887,19 +1899,17 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
             }
         }
         for cand in cands {
-            for gv in globstar_variants(&cand) {
-                if gv.is_empty() {
-                    continue;
+            if cand.is_empty() {
+                continue;
+            }
+            if seen.insert(cand.clone()) {
+                if res.variants.len() >= MAX_GLOB_VARIANTS {
+                    res.unknown = true;
+                    res.unbounded = true;
+                    res.variants.clear();
+                    return res;
                 }
-                if seen.insert(gv.clone()) {
-                    if res.variants.len() >= MAX_GLOB_VARIANTS {
-                        res.unknown = true;
-                        res.unbounded = true;
-                        res.variants.clear();
-                        return res;
-                    }
-                    res.variants.push(gv);
-                }
+                res.variants.push(cand);
             }
         }
     }
@@ -1917,25 +1927,23 @@ fn search_variants_from_cands(
     }
     let mut out = vec![];
     let mut seen = std::collections::HashSet::new();
-    let mut total_norm = 0usize;
-    let mut push_norms = |pat: &str| -> bool {
-        let remaining = MAX_GLOB_VARIANTS.saturating_sub(total_norm);
+    let mut unjoined_norm = 0usize;
+    let mut joined_norm = 0usize;
+    let mut push_norms = |pat: &str, total: &mut usize| -> bool {
+        let remaining = MAX_GLOB_VARIANTS.saturating_sub(*total);
         if remaining == 0 {
             return false;
         }
         let Some(norms) = normalize_glob_variants(pat, remaining) else {
             return false;
         };
-        total_norm += norms.len();
-        if total_norm > MAX_GLOB_VARIANTS {
+        *total += norms.len();
+        if *total > MAX_GLOB_VARIANTS {
             return false;
         }
         for n in norms {
             let norm = n.to_lowercase().replace('ſ', "s");
             if !norm.is_empty() && seen.insert(norm.clone()) {
-                if out.len() >= MAX_GLOB_VARIANTS {
-                    return false;
-                }
                 out.push(norm);
             }
         }
@@ -1945,20 +1953,20 @@ fn search_variants_from_cands(
         if gv.is_empty() {
             continue;
         }
-        if !push_norms(gv) {
+        if !push_norms(gv, &mut unjoined_norm) {
             return (vec![], true);
         }
         let anchored = gv.starts_with('/') || gv.starts_with('~');
         if !anchored {
             for r in roots {
                 let joined = format!("{}/{}", r.to_string_lossy().trim_end_matches('/'), gv);
-                if !push_norms(&joined) {
+                if !push_norms(&joined, &mut joined_norm) {
                     return (vec![], true);
                 }
             }
         } else {
             let expanded = words::expand_home(gv, home, cwd);
-            if expanded != *gv && !push_norms(&expanded) {
+            if expanded != *gv && !push_norms(&expanded, &mut joined_norm) {
                 return (vec![], true);
             }
         }
@@ -1998,21 +2006,6 @@ fn escape_from_cands(
         }
     }
     out
-}
-
-fn drop_globstar(e: &str) -> Option<String> {
-    if !e.split('/').any(|c| c == "**") {
-        return None;
-    }
-    let kept: Vec<&str> = e
-        .split('/')
-        .filter(|&c| !c.is_empty() && c != "**")
-        .collect();
-    Some(if e.starts_with('/') {
-        format!("/{}", kept.join("/"))
-    } else {
-        kept.join("/")
-    })
 }
 
 fn check_escape_variant(

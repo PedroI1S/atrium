@@ -3524,9 +3524,18 @@ fn expand_unknown_env_cmd(
         }
     }
 
+    let with_tail = |tail: usize, s: &str| -> String {
+        if tail >= a.len() {
+            s.to_string()
+        } else {
+            let tail_words: Vec<String> = a[tail..].iter().map(|w| quote(w)).collect();
+            format!("{s} {}", tail_words.join(" "))
+        }
+    };
+
     for (tail, s) in &split_vals {
         if let Some(p) = payloads.as_deref_mut() {
-            push_bounded_str(p, s.clone(), unbounded);
+            push_bounded_str(p, with_tail(*tail, s), unbounded);
         }
         let (sw, depth_exceeded) = split_words(s, depth + 1, cache);
         if depth_exceeded {
@@ -3665,8 +3674,9 @@ fn expand_unknown_env_cmd(
 
     if is_env && let Some(p) = payloads {
         for (_, d) in &chdir_vals {
-            for (_, s) in &split_vals {
-                push_bounded_str(p, format!("cd {} && {s}", quote(d)), unbounded);
+            for (tail, s) in &split_vals {
+                let cmd = with_tail(*tail, s);
+                push_bounded_str(p, format!("cd {} && {cmd}", quote(d)), unbounded);
             }
         }
     }
