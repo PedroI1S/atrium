@@ -271,6 +271,142 @@ async fn gone_leader_with_live_descendant_in_group_is_not_verified() {
     assert_eq!(kill_recorded(&recorded), Cleanup::Verified);
 }
 
+const GONE_LEADER_HELPER_ENV: &str = "ATRIUM_SUPERVISE_GONE_LEADER_HELPER";
+const GONE_LEADER_MEMBER_ENV: &str = "ATRIUM_SUPERVISE_GONE_LEADER_MEMBER";
+
+#[test]
+fn helper_gone_leader_spawns_member_holding_stdin() {
+    if std::env::var_os(GONE_LEADER_MEMBER_ENV).is_some() {
+        let mut buf = [0u8; 1];
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut buf);
+        return;
+    }
+    if std::env::var_os(GONE_LEADER_HELPER_ENV).is_none() {
+        return;
+    }
+    // Spawn a member in the same process group (no `process_group(0)`),
+    // inheriting stdin so the parent test controls when it exits. The helper
+    // exits without waiting so the member is reparented to init.
+    #[allow(clippy::zombie_processes)]
+    let child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .arg("--exact")
+        .arg("helper_gone_leader_spawns_member_holding_stdin")
+        .arg("--nocapture")
+        .arg("--quiet")
+        .env(GONE_LEADER_MEMBER_ENV, "1")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn group member");
+    println!("MEMBER:{}", child.id());
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+async fn spawn_gone_leader_with_holding_member() -> (
+    ProcessIdentity,
+    u32,
+    tokio::process::ChildStdin,
+    KillGroupGuard,
+    KillPidGuard,
+) {
+    let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.arg("--exact")
+        .arg("helper_gone_leader_spawns_member_holding_stdin")
+        .arg("--nocapture")
+        .arg("--quiet")
+        .env(GONE_LEADER_HELPER_ENV, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut sup = spawn_group(cmd).expect("spawn_group");
+    let recorded = sup.identity.clone();
+    let group_guard = KillGroupGuard(recorded.pgid);
+    let stdin = sup.child.stdin.take().expect("stdin");
+    let stdout = sup.child.stdout.take().expect("stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let member_pid: u32 = loop {
+        let line = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("helper exited before MEMBER");
+        if let Some(rest) = line.trim().strip_prefix("MEMBER:") {
+            break rest.parse().expect("parse member_pid");
+        }
+    };
+    let member_guard = KillPidGuard(member_pid);
+
+    // Reap ONLY the leader so `identify(recorded.pid)` is `Ok(None)` while
+    // the group member remains alive in `recorded.pgid`.
+    let status = sup.child.wait().await.expect("reap leader");
+    assert!(status.success());
+
+    assert_eq!(identify(recorded.pid).unwrap(), None, "leader must be gone");
+    let member_id = identify(member_pid)
+        .unwrap()
+        .expect("member must still be alive");
+    assert_eq!(member_id.pgid, recorded.pgid);
+
+    (recorded, member_pid, stdin, group_guard, member_guard)
+}
+
+#[tokio::test]
+async fn kill_recorded_returns_verified_when_gone_leader_group_drains_within_timeout() {
+    let (recorded, member_pid, stdin, _group_guard, _member_guard) =
+        spawn_gone_leader_with_holding_member().await;
+
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(stdin);
+    });
+    let started = std::time::Instant::now();
+    let cleanup = kill_recorded(&recorded);
+    let elapsed = started.elapsed();
+    releaser.join().expect("releaser");
+
+    assert_eq!(cleanup, Cleanup::Verified);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "expected drain well under GROUP_DRAIN_TIMEOUT, took {elapsed:?}"
+    );
+    assert!(!pid_exists(member_pid));
+    assert!(!group_exists(recorded.pgid));
+}
+
+#[tokio::test]
+async fn kill_recorded_returns_unverified_and_leaves_member_alive_when_drain_times_out() {
+    let (recorded, member_pid, stdin, _group_guard, _member_guard) =
+        spawn_gone_leader_with_holding_member().await;
+
+    let started = std::time::Instant::now();
+    let cleanup = kill_recorded(&recorded);
+    let elapsed = started.elapsed();
+
+    assert_eq!(cleanup, Cleanup::Unverified);
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3),
+        "expected drain timeout around 2s, took {elapsed:?}"
+    );
+    assert!(
+        pid_exists(member_pid),
+        "group member outliving timeout must still be alive (nothing killed)"
+    );
+    assert!(
+        identify(member_pid).unwrap().is_some(),
+        "group member identity must still be inspectable (alive, not killed)"
+    );
+
+    drop(stdin);
+    for _ in 0..100 {
+        if !pid_exists(member_pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[test]
 fn kill_recorded_kills_matching_live_orphan_group() {
     use std::os::unix::process::CommandExt;

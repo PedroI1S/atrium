@@ -273,16 +273,17 @@ pub fn identify(pid: u32) -> io::Result<Option<ProcessIdentity>> {
 }
 
 /// Daemon recovery. If the leader still matches `recorded`, kills the group,
-/// waits for it to drain, and returns `Verified` only if the group is
-/// actually empty (`Unverified` if any member remains). If the leader is
-/// gone: `Verified` if the group is empty too (`kill(-pgid, 0)` fails with
-/// `ESRCH`), otherwise `Unverified` and nothing is killed (after a crash the
-/// group id may have been reused, and start times can't prove descent). If
-/// the pid now belongs to another executable or can't be inspected:
-/// `Unverified`, nothing killed.
+/// waits up to `GROUP_DRAIN_TIMEOUT` for it to drain, and returns `Verified`
+/// only if the group is actually empty (`Unverified` if any member remains).
+/// If the leader is gone: waits up to `GROUP_DRAIN_TIMEOUT` for the group to
+/// drain without signalling it, then returns `Verified` if the group is empty
+/// (`kill(-pgid, 0)` fails with `ESRCH`), otherwise `Unverified` and nothing is
+/// killed (after a crash the group id may have been reused, and start times
+/// can't prove descent). If the pid now belongs to another executable or can't
+/// be inspected: `Unverified`, nothing killed.
 ///
-/// This function blocks briefly while waiting for a signalled process group to
-/// drain; async callers should run it on `tokio::task::spawn_blocking`.
+/// This function blocks briefly while waiting for a process group to drain;
+/// async callers should run it on `tokio::task::spawn_blocking`.
 pub fn kill_recorded(recorded: &ProcessIdentity) -> Cleanup {
     if recorded.pid <= 1
         || recorded.pgid <= 1
@@ -295,6 +296,7 @@ pub fn kill_recorded(recorded: &ProcessIdentity) -> Cleanup {
     match identify(recorded.pid) {
         Err(_) => Cleanup::Unverified,
         Ok(None) => {
+            wait_for_group_drain_sync(recorded.pgid, GROUP_DRAIN_TIMEOUT);
             if group_is_empty(recorded.pgid) {
                 Cleanup::Verified
             } else {
@@ -1054,6 +1056,8 @@ mod unit_tests {
         let same = |state, flags| stat(state, flags, 500);
         // A thread-group leader that has exited while its worker runs.
         let leader_z = with_threads(stat('Z', LIVE | PF_EXITING, 500), 2);
+        // A thread-group leader that is mid-exit (not yet Z) while its worker runs.
+        let leader_exiting = with_threads(stat('S', LIVE | PF_EXITING, 500), 2);
         let table = [
             // The read worked.
             (
@@ -1265,6 +1269,13 @@ mod unit_tests {
                 Unverifiable,
             ),
             (
+                "exiting leader (not yet Z) with a worker, exe read from the worker",
+                leader_exiting,
+                Ok(()),
+                Some(leader_exiting),
+                Identity,
+            ),
+            (
                 "exiting leader (not yet Z) with a worker, no exe",
                 with_threads(first, 2),
                 ENOENT,
@@ -1297,6 +1308,13 @@ mod unit_tests {
                 leader_z,
                 ENOENT,
                 Some(stat('Z', LIVE | PF_EXITING, 500)),
+                NoProcess,
+            ),
+            (
+                "exiting leader, the worker is gone by the second read",
+                with_threads(first, 2),
+                ENOENT,
+                Some(same('S', LIVE | PF_EXITING)),
                 NoProcess,
             ),
             (
