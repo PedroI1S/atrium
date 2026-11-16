@@ -719,3 +719,148 @@ fn non_cd_fuzz_spellings_of_sensitive_paths_are_always_hard_denied() {
         }
     }
 }
+
+#[test]
+fn globstar_tree_leaf_rules_preserve_ordinary_globs_and_block_sensitive_trees() {
+    let env = Env::home();
+    // Ordinary `**` globs must not falsely match `**` as the leaf of a sensitive tree.
+    check_4_settings(
+        &env,
+        &[
+            ("cat ~/**/*.rs", ["Ask", "Ask", "Allow", "Allow"]),
+            ("cat ~/**/notes.txt", ["Ask", "Ask", "Allow", "Allow"]),
+            ("cat ~/.local/**/*.rs", ["Ask", "Ask", "Allow", "Allow"]),
+            ("cat ~/Library/**/*.md", ["Ask", "Ask", "Allow", "Allow"]),
+            ("cat ~/.config/**/*.rs", ["Ask", "Ask", "Allow", "Allow"]),
+        ],
+    );
+    let read_ordinary = paths_check(ToolKind::Read, "Read", &["~/**/*.rs"], false, None);
+    assert!(
+        matches!(
+            env.eval_check(&read_ordinary, &[], Preset::Home),
+            PolicyVerdict::Allow { .. }
+        ),
+        "Read ~/**/*.rs should Allow"
+    );
+
+    // `**` ending at or inside a sensitive tree (or matching files inside one) stays blocked.
+    run_table(
+        &env,
+        &[
+            ("cat ~/**", Want::AnyHard),
+            ("cat ~/.local/**", Want::Hard(AS)),
+            ("cat ~/.local/share/**", Want::Hard(AS)),
+            ("cat ~/.local/share/atr*/**", Want::Hard(AS)),
+            ("cat ~/.local/**/atrium.db", Want::Hard(AS)),
+            ("cat ~/**/atrium.db", Want::Hard(AS)),
+            ("cat ~/.g*/**", Want::Hard(CR)),
+            ("cat ~/.gnupg/**", Want::Hard(CR)),
+            ("cat ~/**/.gnupg/secring.gpg", Want::Hard(CR)),
+            ("cat ~/**/.g*/secring.gpg", Want::Hard(CR)),
+            ("cat ~/**/.local/share/atr*/atrium.db", Want::Hard(AS)),
+            ("cat ~/.s?h/**", Want::Hard(CR)),
+            ("cat ~/**/.s?h/id_rsa", Want::Hard(CR)),
+            ("cat ~/.config/g*chrome/**", Want::Hard(CR)),
+        ],
+    );
+    for path in ["~/.z*/**", "~/**/.z*/*.session"] {
+        let c = paths_check(ToolKind::Read, "Read", &[path], false, None);
+        let v = env.eval_check(&c, &[], Preset::Home);
+        assert!(
+            matches!(v, PolicyVerdict::Ask),
+            "Read {path}: expected Ask, got {}",
+            classify(&v)
+        );
+    }
+}
+
+#[test]
+fn k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree() {
+    let env = Env::home();
+    let any_search = vec![rule(
+        RuleScope::Global,
+        ToolKind::Search,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "any-search",
+    )];
+    let check_search = |paths: &[&str], rec: bool, glob: &str, want: [&str; 3]| {
+        let c = paths_check(ToolKind::Search, "Search", paths, rec, Some(glob));
+        let got: Vec<String> = [
+            (&[][..], Preset::Home),
+            (any_search.as_slice(), Preset::Home),
+            (&[][..], Preset::FullAccess),
+        ]
+        .into_iter()
+        .map(|(rules, preset)| classify(&env.eval_check(&c, rules, preset)))
+        .collect();
+        assert!(
+            got.iter().map(String::as_str).eq(want.iter().copied()),
+            "Search {paths:?} rec={rec} glob={glob:?}: wanted {want:?}, got {got:?}"
+        );
+    };
+
+    // Home-wide `**` searches whose later components cannot match any ask-tree file: Allow.
+    for glob in [
+        "**/*.rs",
+        "**/*.md",
+        "**/*.toml",
+        "**/*/*.rs",
+        "*/*.rs",
+        "src/**/*.rs",
+        "**/src/*.rs",
+        "**/*.{rs,toml}",
+        "**/m*.rs",
+    ] {
+        check_search(&["~"], false, glob, ["Allow", "Allow", "Allow"]);
+    }
+    check_search(&["~/.azure"], false, "*.rs", ["Allow", "Allow", "Allow"]);
+
+    // Searches whose later components can match an ask-tree / ask-prefix file: Ask in Home.
+    for glob in [
+        "**/*.session",
+        "**/*/*.session",
+        "**/*.history",
+        "**/*.json",
+        "**/*",
+        "**",
+        "**/",
+        "**/*.{rs,session}",
+        "**/[0-9]*.session",
+        "**/*token*",
+        "**/msal_token_cache.db",
+        "**/.zsh_sessions/*.txt",
+        ".zsh_sessions/*.session",
+        ".bash_sessions/*.history",
+        ".aws/sso/cache/*.txt",
+        ".z*/*.session",
+        ".az*/msal_token_cache.db",
+    ] {
+        check_search(&["~"], false, glob, ["Ask", "Allow", "Allow"]);
+    }
+    check_search(
+        &["~/.zsh_sessions"],
+        false,
+        "*.rs",
+        ["Ask", "Allow", "Allow"],
+    );
+    check_search(
+        &["~/.azure"],
+        false,
+        "msal_token_cache.db",
+        ["Ask", "Allow", "Allow"],
+    );
+
+    // Recursive searches rooted at `~` still ask in Home (engine root_ok rejects `~`).
+    check_search(&["~"], true, "**/*.rs", ["Ask", "Allow", "Allow"]);
+    check_4_settings(
+        &env,
+        &[
+            ("rg --glob '**/*.rs' x ~", ["Ask", "Ask", "Allow", "Allow"]),
+            (
+                "rg --glob '**/*.rs' x ~/proj",
+                ["Allow", "Allow", "Allow", "Allow"],
+            ),
+        ],
+    );
+}
