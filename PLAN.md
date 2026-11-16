@@ -891,12 +891,20 @@ Hydrogen   →  Sonnet 5.5 / Sol 6.1  →  Opus 5.5 / Argon / Astra
    - Each brief lists the **paths the agent owns**. Touching anything outside them, or changing a contract, means stopping and filing a *change request* to Opus rather than editing.
    - Hydrogen writes tests and fixtures in parallel against the frozen contracts.
 3. **Integration (serial)**:
-   - Finished tasks enter a merge queue in dependency order. Each one is rebased, re-checked, cross-reviewed and merged.
+   - Finished tasks enter a merge queue in dependency order. Each one is rebased, re-checked, cross-reviewed, reworked until the review has no open findings (the task gate below), and merged.
    - Opus handles integration fixes and contract change requests. A contract change means bumping the contract and notifying the affected tasks.
 4. **Gate**:
-   - The milestone demo runs end to end. All checks are green.
+   - The milestone demo runs end to end. All checks are green. Every task passed its task gate at 100%; the milestone carries no known limits except the driver's recorded exceptions.
    - Argon + Astra do a security and architecture review where relevant.
    - Pedro signs off, and open questions get decided.
+
+**Task gate: 100%, or rework until it is (D-120, Pedro, 2026-11-16).** M1 was planned as 14 tasks and grew past 30, because tasks merged with open findings that came back later as new tasks and extra rounds. So:
+- **A task merges only at 100%:** its last review is "approve" with **no open findings**. Nothing is merged with "approve with changes" left open, a known limit, a "same as `dev`" gap, a deferred minor or nit, or a follow-up task.
+- **Every finding is fixed inside the same task**, on the same branch, whatever its severity: review → rework → review again, until a review finds nothing. "Same as `dev`" is not a reason to leave a gap the task's area can close.
+- **No new task for a finding.** If a fix needs paths outside the task's owned paths, the orchestrator widens that task's owned paths, unless another running task owns them, in which case the finding goes into that task's next round.
+- **Rounds that don't converge escalate the model** (8.3), not the task count: after 2 rework rounds that still leave blockers or majors, the next round goes to a stronger model from another provider, with the same brief.
+- **Only the driver can grant an exception** (split a finding into its own task, or accept a limit). Each exception is a decision in `decisions.md` that says why.
+- **Fewer surprises up front:** the contract phase writes each brief with its full requirement list, the adversarial and ordinary cases it must pass, and the reviewer's checklist, so that the gate audit finds no missing work.
 
 **Concurrency limits** (human review bandwidth is the real limit):
 

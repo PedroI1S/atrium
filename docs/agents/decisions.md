@@ -758,3 +758,6 @@ Pedro asked to "break up the hydrogen batch as much as you can without conflicts
 - M1-31-credential-folder-search (S8; Sonnet);
 - M1-32-link-globs (S11 + K5; review: Opus, security).
 M1-27, M1-30, M1-31 and M1-32 start first (at most 4 Hydrogen jobs, D-104); M1-28 and M1-29 follow as slots free up. Reviews are Claude (cross-provider) while Argon's quota is out (D-117). Merges go one at a time, each checked against the latest `dev`.
+
+## D-120 — 2026-11-16 — Pedro: the task gate is 100%
+Pedro: "M1 was supposed to have 14 tasks and it has come to 34 … we should stop overlooking things in the task gates; if it's not 100%, just rework until it gets there." From now on a task merges only when its last review is "approve" with no open findings. Every finding, whatever its severity and including "same as `dev`" gaps in the task's area, is fixed in the same task through rework rounds; a fix that needs other paths widens that task (or joins the running task that owns them), never a new task. Non-converging rounds escalate the model (PLAN §8.3). Only the driver grants exceptions, each recorded here. Written into PLAN §8.4, `docs/agents/README.md` and `CLAUDE.md`. It applies to M1-27 to M1-32, which are running now. The known limits recorded before this decision (K7–K10 and earlier) stay as decided unless the driver reopens them.

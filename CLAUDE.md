@@ -18,6 +18,7 @@ Rules:
 
 - **Never start milestone work** (contracts, briefs, dispatching workers) without an explicit go from the current driver for that phase. Approving one step is not permission for the next.
 - Contracts and milestone gates are approved by the driver. Record who decided in `decisions.md`.
+- **Task gate at 100% (D-120, PLAN §8.4):** merge a task only when its last review is "approve" with no open findings. Send every finding back to the same task as rework, whatever its severity; never open a new task for a finding or merge with known limits unless the driver records an exception. Don't offer "merge with known limits" as an option.
 - **Push policy (D-005, D-007)**:
   - Plan, docs and orchestration tooling (`PLAN.md`, `docs/`, `scripts/`, `.gitignore`, `CLAUDE.md`, `AGENTS.md`) are pushed to `dev` right away.
   - Atrium's own code is pushed to `dev` at handoffs, and is merged to `main` only at milestone gates after sign-off.

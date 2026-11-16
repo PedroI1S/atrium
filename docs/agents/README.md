@@ -15,6 +15,14 @@ How Atrium is built by a team of agents. The full rules are in [PLAN.md §8](../
 | `HANDOFF.md` | — | Two-person handoff protocol and end-of-shift checklist |
 | `sessions/<date>-<n>.md` | Orchestrator | Log of each orchestrator session: dispatched, decided, escalated, open. Read first by a fresh session. |
 
+## The task gate (D-120)
+
+A task merges only when its last cross-provider review is "approve" with **no open findings** (PLAN §8.4). Every finding, including minors, nits and "same as `dev`" gaps in the task's area, is fixed in the same task through rework rounds. No follow-up tasks and no known limits, unless the driver records an exception in `decisions.md`.
+
+**Reviewers:** report every finding you see; don't mark anything "acceptable as a known limit" or "for a later task". The verdict is "approve" only when nothing is left to fix.
+
+**Workers:** a rework round fixes every open finding from the review, not only the blockers.
+
 ## Rules for workers
 
 1. Work **only** in your worktree and **only** in the paths your brief lists as owned.
