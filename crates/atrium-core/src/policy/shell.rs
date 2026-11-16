@@ -1998,7 +1998,17 @@ fn code_texts_bounded(
         }
     };
     for e in effs {
-        add(payloads_of(e), &mut payloads);
+        let (ps, unresolvable) = payloads_of_checked(e);
+        add(ps, &mut payloads);
+        if unresolvable {
+            let entry = UnboundedUnknown {
+                words: e.clone(),
+                piped,
+            };
+            if !unbounded_words.contains(&entry) {
+                unbounded_words.push(entry);
+            }
+        }
     }
     add(
         env_payloads_bounded(argv, depth, cache, piped, unbounded_words),
@@ -2104,17 +2114,272 @@ fn shell_operand_starts(eff: &[String]) -> Vec<(bool, usize)> {
 
 /// The code a shell is given with `-c` (`sh -c CODE`, `bash -ec CODE`,
 /// `bash -o errexit -c CODE`), under every reading of its options.
-pub fn shell_c_codes(eff: &[String]) -> Vec<String> {
-    let mut out = vec![];
-    for (seen_c, j) in shell_operand_starts(eff) {
-        if seen_c
-            && let Some(code) = eff.get(j)
-            && !out.contains(code)
-        {
-            out.push(code.clone());
+#[derive(Clone, Copy)]
+enum PosRef {
+    Index(usize),
+    All,
+}
+
+enum PosResolve {
+    Plain,
+    Resolved(String),
+    Unresolved(Option<String>),
+}
+
+/// Parses a `sh -c` script that consists solely of positional-parameter
+/// expansions (`$0`, `"$1"`, `${0}`, `$@`, `"$*"`, etc.). Returns `None` for
+/// ordinary scripts or named variables, `Some(Err(()))` for unresolvable
+/// positional/special-parameter forms (`${1:-…}`, `$10`, `$#`, `$0foo`).
+fn parse_pos_script(code: &str) -> Option<Result<Vec<(PosRef, bool)>, ()>> {
+    let s = code.trim();
+    if s.is_empty() || !s.contains('$') {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    let mut items: Vec<(PosRef, bool)> = vec![];
+
+    let parse_dollar = |pos: &mut usize, has_items: bool| -> Result<PosRef, Option<()>> {
+        *pos += 1;
+        if *pos >= n {
+            return Err(if has_items { Some(()) } else { None });
+        }
+        if bytes[*pos] == b'{' {
+            let start = *pos + 1;
+            let Some(rel_end) = s[start..].find('}') else {
+                return Err(if has_items { Some(()) } else { None });
+            };
+            let end = start + rel_end;
+            let inner = &s[start..end];
+            *pos = end + 1;
+            if inner.is_empty() {
+                return Err(if has_items { Some(()) } else { None });
+            }
+            if inner.bytes().all(|b| b.is_ascii_digit()) {
+                return inner
+                    .parse::<usize>()
+                    .map(PosRef::Index)
+                    .map_err(|_| Some(()));
+            }
+            if inner == "@" || inner == "*" {
+                return Ok(PosRef::All);
+            }
+            if inner.as_bytes().first().is_some_and(|b| {
+                b.is_ascii_digit() || matches!(b, b'@' | b'*' | b'#' | b'?' | b'-' | b'!' | b'$')
+            }) {
+                return Err(Some(()));
+            }
+            return Err(if has_items { Some(()) } else { None });
+        }
+        if bytes[*pos].is_ascii_digit() {
+            if *pos + 1 < n && bytes[*pos + 1].is_ascii_digit() {
+                return Err(Some(()));
+            }
+            let idx = (bytes[*pos] - b'0') as usize;
+            *pos += 1;
+            return Ok(PosRef::Index(idx));
+        }
+        if matches!(bytes[*pos], b'@' | b'*') {
+            *pos += 1;
+            return Ok(PosRef::All);
+        }
+        if matches!(bytes[*pos], b'#' | b'?' | b'-' | b'!' | b'$') {
+            return Err(Some(()));
+        }
+        Err(if has_items { Some(()) } else { None })
+    };
+
+    while i < n {
+        while i < n && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            let mut in_quote_items = false;
+            loop {
+                while i < n && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i >= n {
+                    return if !items.is_empty() {
+                        Some(Err(()))
+                    } else {
+                        None
+                    };
+                }
+                if bytes[i] == b'"' {
+                    if !in_quote_items {
+                        return None;
+                    }
+                    i += 1;
+                    break;
+                }
+                if bytes[i] != b'$' {
+                    return None;
+                }
+                match parse_dollar(&mut i, !items.is_empty()) {
+                    Ok(r) => {
+                        items.push((r, true));
+                        in_quote_items = true;
+                    }
+                    Err(Some(())) => return Some(Err(())),
+                    Err(None) => return None,
+                }
+                if i < n && bytes[i] != b'"' && !bytes[i].is_ascii_whitespace() {
+                    return Some(Err(()));
+                }
+            }
+            if i < n && !bytes[i].is_ascii_whitespace() {
+                return if matches!(bytes[i], b';' | b'|' | b'&' | b'<' | b'>') {
+                    None
+                } else {
+                    Some(Err(()))
+                };
+            }
+        } else if bytes[i] == b'$' {
+            match parse_dollar(&mut i, !items.is_empty()) {
+                Ok(r) => items.push((r, false)),
+                Err(Some(())) => return Some(Err(())),
+                Err(None) => return None,
+            }
+            if i < n && !bytes[i].is_ascii_whitespace() {
+                return if matches!(bytes[i], b';' | b'|' | b'&' | b'<' | b'>') {
+                    None
+                } else {
+                    Some(Err(()))
+                };
+            }
+        } else {
+            return None;
         }
     }
-    out
+
+    if items.is_empty() {
+        None
+    } else {
+        Some(Ok(items))
+    }
+}
+
+fn resolve_positional_script(code: &str, pos: &[String]) -> PosResolve {
+    let items = match parse_pos_script(code) {
+        None => return PosResolve::Plain,
+        Some(Err(())) => return PosResolve::Unresolved(None),
+        Some(Ok(v)) => v,
+    };
+
+    if let [(r, quoted)] = items.as_slice() {
+        return match r {
+            PosRef::Index(idx) => {
+                let Some(val) = pos.get(*idx) else {
+                    return PosResolve::Unresolved(None);
+                };
+                if val.contains(['$', '`']) {
+                    PosResolve::Unresolved(Some(val.clone()))
+                } else {
+                    PosResolve::Resolved(val.clone())
+                }
+            }
+            PosRef::All => {
+                if pos.len() <= 1 {
+                    return PosResolve::Unresolved(None);
+                }
+                let args = &pos[1..];
+                let has_var = args.iter().any(|w| w.contains(['$', '`']));
+                let resolved = if args.len() == 1 {
+                    args[0].clone()
+                } else if *quoted {
+                    args.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" ")
+                } else {
+                    let parts: Vec<String> = args
+                        .iter()
+                        .flat_map(|w| w.split_ascii_whitespace())
+                        .map(quote)
+                        .collect();
+                    if parts.is_empty() {
+                        return PosResolve::Unresolved(None);
+                    }
+                    parts.join(" ")
+                };
+                if has_var {
+                    PosResolve::Unresolved(Some(resolved))
+                } else {
+                    PosResolve::Resolved(resolved)
+                }
+            }
+        };
+    }
+
+    let mut words: Vec<String> = vec![];
+    let mut has_var = false;
+    for (r, quoted) in items {
+        match r {
+            PosRef::Index(idx) => {
+                let Some(val) = pos.get(idx) else {
+                    return PosResolve::Unresolved(None);
+                };
+                has_var |= val.contains(['$', '`']);
+                if quoted {
+                    words.push(quote(val));
+                } else {
+                    words.extend(val.split_ascii_whitespace().map(quote));
+                }
+            }
+            PosRef::All => {
+                if pos.len() > 1 {
+                    for val in &pos[1..] {
+                        has_var |= val.contains(['$', '`']);
+                        if quoted {
+                            words.push(quote(val));
+                        } else {
+                            words.extend(val.split_ascii_whitespace().map(quote));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if words.is_empty() {
+        return PosResolve::Unresolved(None);
+    }
+    let resolved = words.join(" ");
+    if has_var {
+        PosResolve::Unresolved(Some(resolved))
+    } else {
+        PosResolve::Resolved(resolved)
+    }
+}
+
+fn shell_c_codes_checked(eff: &[String]) -> (Vec<String>, bool) {
+    let mut out = vec![];
+    let mut unresolvable = false;
+    for (seen_c, j) in shell_operand_starts(eff) {
+        if seen_c && let Some(code) = eff.get(j) {
+            let pos = eff.get(j + 1..).unwrap_or(&[]);
+            let resolved = match resolve_positional_script(code, pos) {
+                PosResolve::Plain => Some(code.clone()),
+                PosResolve::Resolved(s) => Some(s),
+                PosResolve::Unresolved(opt) => {
+                    unresolvable = true;
+                    opt.or_else(|| Some(code.clone()))
+                }
+            };
+            if let Some(c) = resolved
+                && !out.contains(&c)
+            {
+                out.push(c);
+            }
+        }
+    }
+    (out, unresolvable)
+}
+
+pub fn shell_c_codes(eff: &[String]) -> Vec<String> {
+    shell_c_codes_checked(eff).0
 }
 
 /// Every way the wrappers in front of `argv` can be read (round 7 item 6):
@@ -3190,14 +3455,16 @@ fn output_texts(body: &str, depth: u8, cache: &mut LexCache) -> Vec<String> {
 /// The strings a shell or `eval` will run: a shell's `-c` string, fish's
 /// `-C`/`--init-command`, `eval`'s arguments. Options that take a value
 /// (`--rcfile F`, `--emulate sh`, `-o pipefail`) are skipped.
-fn payloads_of(eff: &[String]) -> Vec<String> {
+fn payloads_of_checked(eff: &[String]) -> (Vec<String>, bool) {
     let mut out = vec![];
+    let mut unresolvable = false;
     let Some(f) = eff.first() else {
-        return out;
+        return (out, false);
     };
     let first = cmd_name(f);
     if maybe_shell(f) {
         let mut has_c = false;
+        let mut inline_cmds: Vec<String> = vec![];
         let mut j = 1;
         while j < eff.len() {
             let w = &eff[j];
@@ -3212,10 +3479,12 @@ fn payloads_of(eff: &[String]) -> Vec<String> {
                 j += 1;
                 continue;
             }
-            if let Some(rest) = w
-                .strip_prefix("--command=")
-                .or_else(|| w.strip_prefix("--init-command="))
-            {
+            if let Some(rest) = w.strip_prefix("--command=") {
+                inline_cmds.push(rest.to_string());
+                j += 1;
+                continue;
+            }
+            if let Some(rest) = w.strip_prefix("--init-command=") {
                 out.push(rest.to_string());
                 j += 1;
                 continue;
@@ -3238,11 +3507,26 @@ fn payloads_of(eff: &[String]) -> Vec<String> {
             }
             break;
         }
-        if has_c {
-            out.extend(eff.get(j).cloned());
+        let mut push_c = |code: &str, pos: &[String]| match resolve_positional_script(code, pos) {
+            PosResolve::Plain => out.push(code.to_string()),
+            PosResolve::Resolved(s) => out.push(s),
+            PosResolve::Unresolved(opt) => {
+                unresolvable = true;
+                if let Some(s) = opt {
+                    out.push(s);
+                }
+            }
+        };
+        for code in inline_cmds {
+            push_c(&code, eff.get(j..).unwrap_or(&[]));
+        }
+        if has_c && let Some(code) = eff.get(j) {
+            push_c(code, eff.get(j + 1..).unwrap_or(&[]));
         }
         // and as the shell reads its options (`-eo pipefail -c CODE`: K3)
-        for code in shell_c_codes(eff) {
+        let (c_codes, c_unres) = shell_c_codes_checked(eff);
+        unresolvable |= c_unres;
+        for code in c_codes {
             if !out.contains(&code) {
                 out.push(code);
             }
@@ -3257,7 +3541,7 @@ fn payloads_of(eff: &[String]) -> Vec<String> {
             out.push(args.join(" "));
         }
     }
-    out
+    (out, unresolvable)
 }
 
 /// `env -S 'TEXT'` and `env -C DIR CMD…`: the command line `env` runs, as
@@ -3498,6 +3782,200 @@ fn push_bounded_vec(out: &mut Vec<Vec<String>>, val: Vec<String>, unbounded: &mu
 /// treats every remaining non-option word as a possible start of the payload
 /// and collects every `-C`/`--chdir` and `-S`/`--split-string` value.
 #[allow(clippy::too_many_arguments)]
+struct EnvReach {
+    cmd_starts: Vec<usize>,
+    split_vals: Vec<(usize, String)>,
+    chdir_vals: Vec<(usize, String)>,
+}
+
+/// Reachability scan for an `env` or `command` invocation with unknown
+/// options: skips arbitrarily many known options and `NAME=value` assignments,
+/// and returns `None` only when unknown options or candidate command starts
+/// exceed `MAX_UNKNOWN_STARTS` (K9).
+fn env_reach(a: &[String], is_env: bool) -> Option<EnvReach> {
+    let mut reachable = vec![false; a.len() + 1];
+    if a.len() > 1 {
+        reachable[1] = true;
+    }
+    let mut cmd_starts: Vec<usize> = vec![];
+    let mut split_vals: Vec<(usize, String)> = vec![];
+    let mut chdir_vals: Vec<(usize, String)> = vec![];
+    let mut unknown_opts = 0usize;
+    let cmd_opts = (!is_env).then(|| wrapper_opts("command").unwrap_or(NO_OPTS));
+
+    for i in 1..a.len() {
+        if !reachable[i] {
+            continue;
+        }
+        let w = a[i].as_str();
+        if w == "--" {
+            if i + 1 < a.len() && !cmd_starts.contains(&(i + 1)) {
+                cmd_starts.push(i + 1);
+            }
+        } else if is_env && is_assignment_word(w) {
+            reachable[i + 1] = true;
+        } else if is_env && w == "-" {
+            reachable[i + 1] = true;
+        } else if is_option(w) {
+            if is_env {
+                let long = if w.starts_with("--") {
+                    env_long(w)
+                } else {
+                    None
+                };
+                let lw = long.as_deref().unwrap_or(w);
+                if lw == "--split-string" {
+                    if let Some(v) = a.get(i + 1) {
+                        split_vals.push((i + 2, v.clone()));
+                    }
+                } else if let Some(v) = lw.strip_prefix("--split-string=") {
+                    split_vals.push((i + 1, v.to_string()));
+                } else if lw == "--chdir" {
+                    if let Some(v) = a.get(i + 1) {
+                        chdir_vals.push((i, v.clone()));
+                    }
+                } else if let Some(v) = lw.strip_prefix("--chdir=") {
+                    chdir_vals.push((i, v.to_string()));
+                } else if w.starts_with('-') && !w.starts_with("--") {
+                    for (pos, _) in w[1..].match_indices('S') {
+                        let after = &w[1 + pos + 1..];
+                        if !after.is_empty() {
+                            split_vals.push((i + 1, after.to_string()));
+                        } else if let Some(v) = a.get(i + 1) {
+                            split_vals.push((i + 2, v.clone()));
+                        }
+                    }
+                    for (pos, _) in w[1..].match_indices('C') {
+                        let after = &w[1 + pos + 1..];
+                        if !after.is_empty() {
+                            chdir_vals.push((i, after.to_string()));
+                        } else if let Some(v) = a.get(i + 1) {
+                            chdir_vals.push((i, v.clone()));
+                        }
+                    }
+                }
+
+                if matches!(lw, "--unset" | "--chdir" | "--argv0" | "--split-string") {
+                    if i + 2 <= a.len() {
+                        reachable[i + 2] = true;
+                    }
+                } else if lw.starts_with("--") {
+                    let name = lw.split_once('=').map_or(lw, |(n, _)| n);
+                    let known_one = lw.starts_with("--split-string=")
+                        || lw.starts_with("--chdir=")
+                        || lw.starts_with("--unset=")
+                        || lw.starts_with("--argv0=")
+                        || matches!(
+                            name,
+                            "--block-signal" | "--default-signal" | "--ignore-signal"
+                        )
+                        || (!lw.contains('=')
+                            && matches!(
+                                name,
+                                "--ignore-environment"
+                                    | "--null"
+                                    | "--debug"
+                                    | "--list-signal-handling"
+                                    | "--help"
+                                    | "--version"
+                            ));
+                    if known_one {
+                        reachable[i + 1] = true;
+                    } else {
+                        unknown_opts += 1;
+                        reachable[i + 1] = true;
+                        if !w.contains('=') && i + 2 <= a.len() {
+                            reachable[i + 2] = true;
+                        }
+                    }
+                } else if env_flags_ok(w) {
+                    if matches!(env_cluster(w), Some((_, ref rest)) if rest.is_empty()) {
+                        if i + 2 <= a.len() {
+                            reachable[i + 2] = true;
+                        }
+                    } else {
+                        reachable[i + 1] = true;
+                    }
+                } else {
+                    unknown_opts += 1;
+                    reachable[i + 1] = true;
+                    if i + 2 <= a.len() {
+                        reachable[i + 2] = true;
+                    }
+                }
+            } else {
+                let o = cmd_opts.as_ref().unwrap_or(&NO_OPTS);
+                match read_opt(a, i, o, false) {
+                    Opt::Words(1) | Opt::Shell(_) => reachable[i + 1] = true,
+                    Opt::Words(2) => {
+                        if i + 2 <= a.len() {
+                            reachable[i + 2] = true;
+                        }
+                    }
+                    _ => {
+                        unknown_opts += 1;
+                        reachable[i + 1] = true;
+                        if !w.contains('=') && i + 2 <= a.len() {
+                            reachable[i + 2] = true;
+                        }
+                    }
+                }
+            }
+        } else if !cmd_starts.contains(&i) {
+            cmd_starts.push(i);
+        }
+
+        if unknown_opts > MAX_UNKNOWN_STARTS || cmd_starts.len() > MAX_UNKNOWN_STARTS {
+            return None;
+        }
+    }
+
+    Some(EnvReach {
+        cmd_starts,
+        split_vals,
+        chdir_vals,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_nested_reading(
+    cand: &[String],
+    depth: u8,
+    cache: &mut LexCache,
+    mut readings: Option<&mut Vec<Vec<String>>>,
+    payloads: Option<&mut Vec<String>>,
+    unbounded: &mut bool,
+    rec_depth: u8,
+) {
+    let b0 = cmd_name(&cand[0]).into_owned();
+    if b0 == "env" || b0 == "command" {
+        expand_unknown_env_cmd(
+            cand,
+            b0 == "env",
+            depth,
+            cache,
+            readings,
+            payloads,
+            unbounded,
+            rec_depth + 1,
+        );
+    } else if wrapper_opts(&b0).is_some() || b0 == "arch" {
+        let mut local_unbounded = vec![];
+        for r_sub in unwrap_readings_bounded(cand, depth, cache, false, &mut local_unbounded) {
+            if let Some(r) = readings.as_deref_mut() {
+                push_bounded_vec(r, r_sub, unbounded);
+            }
+        }
+        if !local_unbounded.is_empty() {
+            *unbounded = true;
+        }
+    }
+}
+
+/// Fail-closed expansion for an unknown `env` or `command` (or wrapper)
+/// invocation: collects reachable command starts, `-C`/`--chdir` and
+/// `-S`/`--split-string` values.
+#[allow(clippy::too_many_arguments)]
 fn expand_unknown_env_cmd(
     a: &[String],
     is_env: bool,
@@ -3508,53 +3986,30 @@ fn expand_unknown_env_cmd(
     unbounded: &mut bool,
     rec_depth: u8,
 ) {
-    if rec_depth > 4 || a.len() > MAX_UNKNOWN_STARTS {
+    if rec_depth > 4 {
         *unbounded = true;
         return;
     }
-    let mut split_vals: Vec<(usize, String)> = vec![];
-    let mut chdir_vals: Vec<(usize, String)> = vec![];
-    if is_env {
-        for m in 1..a.len() {
-            let w = &a[m];
-            let long = if w.starts_with("--") {
-                env_long(w)
-            } else {
-                None
-            };
-            let lw = long.as_deref().unwrap_or(w.as_str());
-            if lw == "--split-string" {
-                if let Some(v) = a.get(m + 1) {
-                    split_vals.push((m + 2, v.clone()));
-                }
-            } else if let Some(v) = lw.strip_prefix("--split-string=") {
-                split_vals.push((m + 1, v.to_string()));
-            } else if lw == "--chdir" {
-                if let Some(v) = a.get(m + 1) {
-                    chdir_vals.push((m, v.clone()));
-                }
-            } else if let Some(v) = lw.strip_prefix("--chdir=") {
-                chdir_vals.push((m, v.to_string()));
-            } else if w.starts_with('-') && !w.starts_with("--") {
-                for (pos, _) in w[1..].match_indices('S') {
-                    let after = &w[1 + pos + 1..];
-                    if !after.is_empty() {
-                        split_vals.push((m + 1, after.to_string()));
-                    } else if let Some(v) = a.get(m + 1) {
-                        split_vals.push((m + 2, v.clone()));
-                    }
-                }
-                for (pos, _) in w[1..].match_indices('C') {
-                    let after = &w[1 + pos + 1..];
-                    if !after.is_empty() {
-                        chdir_vals.push((m, after.to_string()));
-                    } else if let Some(v) = a.get(m + 1) {
-                        chdir_vals.push((m, v.clone()));
-                    }
-                }
-            }
+    let is_command = !is_env && a.first().is_some_and(|s| cmd_name(s) == "command");
+    let (cmd_starts, split_vals, chdir_vals) = if is_env || is_command {
+        let Some(reach) = env_reach(a, is_env) else {
+            *unbounded = true;
+            return;
+        };
+        (reach.cmd_starts, reach.split_vals, reach.chdir_vals)
+    } else {
+        if a.len() > MAX_UNKNOWN_STARTS {
+            *unbounded = true;
+            return;
         }
-    }
+        let starts: Vec<usize> = (1..a.len())
+            .filter(|&i| {
+                let w = &a[i];
+                w != "--" && !is_assignment_word(w) && !is_option(w)
+            })
+            .collect();
+        (starts, vec![], vec![])
+    };
 
     let with_tail = |tail: usize, s: &str| -> String {
         if tail >= a.len() {
@@ -3576,52 +4031,32 @@ fn expand_unknown_env_cmd(
         let mut sp = sw;
         sp.extend_from_slice(&a[*tail..]);
         if !sp.is_empty() {
-            if sp.len() > MAX_UNKNOWN_STARTS {
-                *unbounded = true;
+            if let Some(r) = readings.as_deref_mut() {
+                push_bounded_vec(r, sp.clone(), unbounded);
+            }
+            if sp[0].starts_with('-') || is_assignment_word(&sp[0]) {
+                let mut wrapped = vec!["env".to_string()];
+                wrapped.extend(sp);
+                expand_unknown_env_cmd(
+                    &wrapped,
+                    true,
+                    depth,
+                    cache,
+                    readings.as_deref_mut(),
+                    payloads.as_deref_mut(),
+                    unbounded,
+                    rec_depth + 1,
+                );
             } else {
-                if let Some(r) = readings.as_deref_mut() {
-                    push_bounded_vec(r, sp.clone(), unbounded);
-                }
-                if sp[0].starts_with('-') || is_assignment_word(&sp[0]) {
-                    let mut wrapped = vec!["env".to_string()];
-                    wrapped.extend(sp);
-                    expand_unknown_env_cmd(
-                        &wrapped,
-                        true,
-                        depth,
-                        cache,
-                        readings.as_deref_mut(),
-                        payloads.as_deref_mut(),
-                        unbounded,
-                        rec_depth + 1,
-                    );
-                } else {
-                    let b0 = cmd_name(&sp[0]);
-                    if b0 == "env" || b0 == "command" {
-                        expand_unknown_env_cmd(
-                            &sp,
-                            b0 == "env",
-                            depth,
-                            cache,
-                            readings.as_deref_mut(),
-                            payloads.as_deref_mut(),
-                            unbounded,
-                            rec_depth + 1,
-                        );
-                    } else if wrapper_opts(b0.as_ref()).is_some() || b0 == "arch" {
-                        let mut local_unbounded = vec![];
-                        for r_sub in
-                            unwrap_readings_bounded(&sp, depth, cache, false, &mut local_unbounded)
-                        {
-                            if let Some(r) = readings.as_deref_mut() {
-                                push_bounded_vec(r, r_sub, unbounded);
-                            }
-                        }
-                        if !local_unbounded.is_empty() {
-                            *unbounded = true;
-                        }
-                    }
-                }
+                expand_nested_reading(
+                    &sp,
+                    depth,
+                    cache,
+                    readings.as_deref_mut(),
+                    payloads.as_deref_mut(),
+                    unbounded,
+                    rec_depth,
+                );
             }
         }
     }
@@ -3652,11 +4087,7 @@ fn expand_unknown_env_cmd(
         }
     }
 
-    for i in 1..a.len() {
-        let w = &a[i];
-        if w == "--" || is_assignment_word(w) || is_option(w) {
-            continue;
-        }
+    for i in cmd_starts {
         let cand = &a[i..];
         let mut resolved = cand.to_vec();
         if has_command_substitution(&resolved[0])
@@ -3667,31 +4098,15 @@ fn expand_unknown_env_cmd(
         if let Some(r) = readings.as_deref_mut() {
             push_bounded_vec(r, resolved.clone(), unbounded);
         }
-        let b0 = cmd_name(&resolved[0]).into_owned();
-        if b0 == "env" || b0 == "command" {
-            expand_unknown_env_cmd(
-                &resolved,
-                b0 == "env",
-                depth,
-                cache,
-                readings.as_deref_mut(),
-                payloads.as_deref_mut(),
-                unbounded,
-                rec_depth + 1,
-            );
-        } else if wrapper_opts(&b0).is_some() || b0 == "arch" {
-            let mut local_unbounded = vec![];
-            for r_sub in
-                unwrap_readings_bounded(&resolved, depth, cache, false, &mut local_unbounded)
-            {
-                if let Some(r) = readings.as_deref_mut() {
-                    push_bounded_vec(r, r_sub, unbounded);
-                }
-            }
-            if !local_unbounded.is_empty() {
-                *unbounded = true;
-            }
-        }
+        expand_nested_reading(
+            &resolved,
+            depth,
+            cache,
+            readings.as_deref_mut(),
+            payloads.as_deref_mut(),
+            unbounded,
+            rec_depth,
+        );
         if is_env && let Some(p) = payloads.as_deref_mut() {
             for (m, d) in &chdir_vals {
                 if *m < i {
