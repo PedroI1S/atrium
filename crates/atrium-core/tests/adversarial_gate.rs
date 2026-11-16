@@ -579,7 +579,6 @@ fn finding_10_a_glob_that_reaches_a_credential_through_a_link_is_blocked() {
 }
 
 #[test]
-#[ignore = "M1-13 finding 11"]
 fn finding_11_a_glob_inside_atriums_folder_names_is_blocked() {
     let t = world();
     let g = t.gate(Preset::Home, vec![]);
