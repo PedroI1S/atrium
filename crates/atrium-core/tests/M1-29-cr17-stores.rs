@@ -465,6 +465,8 @@ fn path_scope_allow_and_deny_for_commands_and_file_tools() {
 #[test]
 fn find_prefix_rules_require_derived_units_to_be_covered_and_reject_delete() {
     let env = Env::home();
+    let mut proj = Env::home();
+    proj.cwd = format!("{HOME}/proj").into();
     let find_rule = vec![rule(
         RuleScope::Global,
         ToolKind::Execute,
@@ -486,10 +488,10 @@ fn find_prefix_rules_require_derived_units_to_be_covered_and_reject_delete() {
             classify(&env.cmd_rules("find . -name '*.rs'", rules)),
             "Allow"
         );
-        // `-delete` is never covered by a prefix rule on `find`
-        assert_eq!(classify(&env.cmd_rules("find . -delete", rules)), "Ask");
+        // Filtered `-delete` in a project folder is inside cwd (not hard-denied),
+        // yet never covered by a prefix rule on `find` or `find .`.
         assert_eq!(
-            classify(&env.cmd_rules("find . -name '*.o' -delete", rules)),
+            classify(&proj.cmd_rules("find . -name '*.o' -delete", rules)),
             "Ask"
         );
         // `-exec` / `-execdir` / `-ok` / `-okdir` ask without a covering rule
@@ -507,6 +509,38 @@ fn find_prefix_rules_require_derived_units_to_be_covered_and_reject_delete() {
                 "{exec_cmd}"
             );
         }
+    }
+
+    // `-delete` targeting a subfolder strictly inside the working folder is not
+    // hard-denied, yet never covered by a `find` prefix rule (even unfiltered).
+    assert_eq!(
+        classify(&env.cmd_rules("find build -delete", &find_rule)),
+        "Ask"
+    );
+    assert_eq!(
+        classify(&env.cmd_rules("find build -name '*.o' -delete", &find_rule)),
+        "Ask"
+    );
+    assert_eq!(
+        classify(&proj.cmd_rules("find build -delete", &find_rule)),
+        "Ask"
+    );
+
+    // Deleting `~` or unfiltered `.` keeps the existing safety hard deny.
+    for (ctx, line) in [
+        (&env, "find . -delete"),
+        (&env, "find . -name '*.o' -delete"),
+        (&proj, "find . -delete"),
+    ] {
+        assert!(
+            matches!(
+                ctx.cmd_rules(line, &find_rule),
+                PolicyVerdict::HardDeny {
+                    id: "recursive-delete-outside-cwd"
+                }
+            ),
+            "{line}"
+        );
     }
 
     // Uppercase `FIND . -EXEC` also fails closed
@@ -562,16 +596,27 @@ fn find_prefix_rules_require_derived_units_to_be_covered_and_reject_delete() {
         PolicyVerdict::Deny { .. }
     ));
 
-    // Exact rule on `find . -delete` keeps working
+    // Exact rule on `-delete` inside the working folder keeps working
     let exact_delete = vec![rule(
         RuleScope::Global,
         ToolKind::Execute,
-        exact(&["find", ".", "-delete"]),
+        exact(&["find", "build", "-delete"]),
         RuleDecision::Allow,
         "exact-del",
     )];
     assert_eq!(
-        classify(&env.cmd_rules("find . -delete", &exact_delete)),
+        classify(&env.cmd_rules("find build -delete", &exact_delete)),
+        "Allow"
+    );
+    let exact_proj_delete = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        exact(&["find", ".", "-name", "*.o", "-delete"]),
+        RuleDecision::Allow,
+        "exact-proj-del",
+    )];
+    assert_eq!(
+        classify(&proj.cmd_rules("find . -name '*.o' -delete", &exact_proj_delete)),
         "Allow"
     );
 }
