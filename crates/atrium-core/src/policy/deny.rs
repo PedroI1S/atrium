@@ -821,11 +821,11 @@ const DOWNLOADERS: &[&str] = &["curl", "wget", "fetch"];
 const PRIV: &[&str] = &["sudo", "sudoedit", "su", "doas", "pkexec", "run0"];
 
 fn is_interpreter(cmd: &str) -> bool {
-    let b = base(cmd);
-    is_shell(b)
+    let b = shell::cmd_name(cmd);
+    is_shell(cmd)
         || b.starts_with("python")
         || matches!(
-            b,
+            b.as_ref(),
             "perl" | "ruby" | "node" | "deno" | "bun" | "php" | "lua" | "osascript" | "pwsh"
         )
 }
@@ -841,12 +841,12 @@ fn reads_stdin_as_code_at(eff: &[String], depth: u8) -> bool {
     if depth > 4 {
         return true;
     }
-    let b = base(first);
+    let b = shell::cmd_name(first);
     let args = &eff[1..];
     if shell::reads_stdin_as_script(eff) {
         return true;
     }
-    if matches!(b, "source" | ".") {
+    if matches!(b.as_ref(), "source" | ".") {
         return args
             .first()
             .is_some_and(|a| matches!(a.as_str(), "/dev/stdin" | "/dev/fd/0" | "-"));
@@ -855,7 +855,7 @@ fn reads_stdin_as_code_at(eff: &[String], depth: u8) -> bool {
     // `| $X -s`: a command named by a variable, told to read a script
     // a word built by a substitution that names a program plainly is read
     // as that program (`$(which python3)`: an interpreter, round 6 item 6)
-    if !is_interpreter(b) && shell::has_command_substitution(first) {
+    if !is_interpreter(first) && shell::has_command_substitution(first) {
         return match shell::substituted_program(first) {
             None => true,
             Some(name) => {
@@ -868,17 +868,17 @@ fn reads_stdin_as_code_at(eff: &[String], depth: u8) -> bool {
             }
         };
     }
-    if !is_interpreter(b) && shell::maybe_shell(first) {
+    if !is_interpreter(first) && shell::maybe_shell(first) {
         return args.iter().any(|a| a == "-" || a == "-s");
     }
-    if b == "eval" || !is_interpreter(b) {
+    if b == "eval" || !is_interpreter(first) {
         return false;
     }
     if args.iter().any(|a| a == "-" || a == "-s") {
         return true;
     }
     // For a shell only `-c` means code follows; `-e`, `-E`, `-m` are options.
-    let shell = is_shell(b);
+    let shell = is_shell(first);
     let code_flag = args.iter().any(|a| {
         a.starts_with('-')
             && !a.starts_with("--")

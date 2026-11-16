@@ -1261,11 +1261,11 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
             })
             .collect();
         out.units.push(unit);
-        if eff.first().map(|s| base(s)) == Some("find") {
+        if eff.first().is_some_and(|s| cmd_name(s) == "find") {
             find_exec_units(&eff, &mut out, depth + 1, cache);
         }
         for u in readings {
-            if u.eff.first().map(|s| base(s)) == Some("find") {
+            if u.eff.first().is_some_and(|s| cmd_name(s) == "find") {
                 let e = u.eff.clone();
                 out.units.push(u);
                 find_exec_units(&e, &mut out, depth + 1, cache);
@@ -1310,14 +1310,17 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
         is_stdin_code(u, cache)
             || u.readings().any(|e| {
                 e.first().is_some_and(|f| {
-                    let b = base(f);
+                    let b = cmd_name(f);
                     b.starts_with("python")
-                        || matches!(b, "perl" | "ruby" | "node" | "deno" | "bun" | "php" | "lua")
+                        || matches!(
+                            b.as_ref(),
+                            "perl" | "ruby" | "node" | "deno" | "bun" | "php" | "lua"
+                        )
                 })
             })
     };
     out.stdin_texts = bodies.iter().map(|(_, t)| t.clone()).collect();
-    let is_crontab = |u: &Unit| u.eff.first().is_some_and(|f| base(f) == "crontab");
+    let is_crontab = |u: &Unit| u.eff.first().is_some_and(|f| cmd_name(f) == "crontab");
     for (owner, text) in &bodies {
         let owner_unit = raw_pos.get(*owner).and_then(|p| out.units.get(*p));
         if owner_unit.is_some_and(is_crontab) {
@@ -1346,7 +1349,10 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
                     // `ssh host $(echo bash) <<EOF`: for a command that runs
                     // another one, a word built by a substitution may name
                     // the program that reads the body
-                    && !(u.eff.first().is_some_and(|f| COMMAND_RUNNERS.contains(&base(f)))
+                    && !(u
+                        .eff
+                        .first()
+                        .is_some_and(|f| COMMAND_RUNNERS.contains(&cmd_name(f).as_ref()))
                         && u.seg.argv.iter().any(|w| has_command_substitution(w)))
                     && u.pipe == 0
                     && !u.proc_sub
@@ -1545,6 +1551,17 @@ fn lex_redirect(
 
 pub fn base(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
+}
+
+/// Command basename folded the way macOS/APFS folds names (lowercase, which
+/// maps K U+212A to k, plus ſ U+017F to s). Borrows when already folded.
+pub(crate) fn cmd_name(s: &str) -> std::borrow::Cow<'_, str> {
+    let b = base(s);
+    if b.bytes().all(|c| c.is_ascii() && !c.is_ascii_uppercase()) {
+        std::borrow::Cow::Borrowed(b)
+    } else {
+        std::borrow::Cow::Owned(b.to_lowercase().replace('ſ', "s"))
+    }
 }
 
 /// The options a wrapper takes (round 6 item 5): short letters that are
@@ -1905,7 +1922,7 @@ fn unwrap_checked_at(argv: &[String], depth: u8, cache: &mut LexCache) -> (Vec<S
 fn runs_here(eff: &[String], depth: u8, cache: &mut LexCache) -> bool {
     let here = |e: &[String]| {
         e.first()
-            .is_some_and(|f| matches!(base(f), "eval" | "source" | "."))
+            .is_some_and(|f| matches!(cmd_name(f).as_ref(), "eval" | "source" | "."))
     };
     here(eff)
         || (eff.iter().any(|w| has_command_substitution(w))
@@ -1929,7 +1946,7 @@ fn stdin_code_eff(e: &[String], depth: u8, cache: &mut LexCache) -> bool {
 fn pipe_code_eff(e: &[String], depth: u8, cache: &mut LexCache) -> bool {
     e.first().is_some_and(|f| {
         is_shell(f)
-            || matches!(base(f), "eval" | "source" | ".")
+            || matches!(cmd_name(f).as_ref(), "eval" | "source" | ".")
             // `| s$(echo h)`, `| $(echo sh)`: a word built by running
             // something may name a shell (a variable alone, `| $PAGER`,
             // is read only with `-s` or `-`)
@@ -1941,7 +1958,7 @@ fn pipe_code_eff(e: &[String], depth: u8, cache: &mut LexCache) -> bool {
                     let (e, unknown) = unwrap_checked(&e);
                     unknown
                         || e.first().is_some_and(|f| {
-                            maybe_shell(f) || matches!(base(f), "eval" | "source" | ".")
+                            maybe_shell(f) || matches!(cmd_name(f).as_ref(), "eval" | "source" | ".")
                         })
                         || reads_stdin_as_script(&e)
                 }))
@@ -1988,7 +2005,7 @@ fn code_texts_bounded(
         &mut payloads,
     );
     for step in unwrap_steps(argv, depth, cache) {
-        if step.first().is_some_and(|f| base(f) == "env") {
+        if step.first().is_some_and(|f| cmd_name(f) == "env") {
             add(
                 env_payloads_bounded(&step, depth, cache, piped, unbounded_words),
                 &mut payloads,
@@ -2016,7 +2033,7 @@ fn code_texts_bounded(
     // substitution a shell runs (part 1's finding 9), in any reading
     if effs.iter().any(|e| {
         e.first()
-            .is_some_and(|f| maybe_shell(f) || matches!(base(f), "source" | "."))
+            .is_some_and(|f| maybe_shell(f) || matches!(cmd_name(f).as_ref(), "source" | "."))
     }) {
         for w in argv.iter().skip(1).chain(targets) {
             if let Some(b) = w.strip_prefix("<(").and_then(|r| r.strip_suffix(')')) {
@@ -2358,7 +2375,11 @@ fn unwrap_reading_steps(
         {
             st.push(a.clone());
         }
-        let b = base(first).to_string();
+        let is_reserved = matches!(
+            base(first),
+            "{" | "}" | "!" | "do" | "then" | "else" | "elif" | "if" | "while" | "until" | "coproc"
+        );
+        let b = cmd_name(first).into_owned();
         // options with a table, then `operands` words before the command
         let table = |a: &mut Vec<String>,
                      o: &Opts,
@@ -2384,133 +2405,144 @@ fn unwrap_reading_steps(
             (j + operands).min(a.len())
         };
         let mut step_unknown = false;
-        let orig_a = (unknown_invs.is_some()
+        let orig_a = (!is_reserved
+            && unknown_invs.is_some()
             && (b == "env" || b == "arch" || wrapper_opts(&b).is_some())
             && a[1..].iter().any(|w| is_option(w)))
         .then(|| a.clone());
-        let n = match b.as_str() {
-            "{" | "}" | "!" | "do" | "then" | "else" | "elif" | "if" | "while" | "until"
-            | "coproc" => 1,
-            "time" | "nohup" | "builtin" | "command" | "setsid" | "unbuffer" | "caffeinate"
-            | "sandbox-exec" | "exec" | "nice" | "ionice" | "stdbuf" | "xargs" | "busybox"
-            | "toybox" => {
-                let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
-                if matches!(b.as_str(), "busybox" | "toybox") {
-                    1
-                } else {
-                    table(&mut a, &o, 0, &mut choices, &mut step_unknown)
-                }
-            }
-            "timeout" | "chrt" | "taskset" => {
-                let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
-                // `chrt -p` / `taskset -p` act on a process: no command
-                if b != "timeout"
-                    && a[1..]
-                        .iter()
-                        .take_while(|w| is_option(w))
-                        .any(|w| !w.starts_with("--") && w.contains('p') || w == "--pid")
-                {
-                    0
-                } else {
-                    table(&mut a, &o, 1, &mut choices, &mut step_unknown)
-                }
-            }
-            "arch" => {
-                // `arch [-32|-64|-x86_64|-arm64|…] [-c] [-e VAR=v] [-d VAR] CMD`
-                let mut j = 1;
-                while j < a.len() && is_option(&a[j]) {
-                    match a[j].as_str() {
-                        "-arch" | "-e" | "-d" => j += 2,
-                        "-c" | "-h" | "-32" | "-64" | "-x86_64" | "-arm64" | "-arm64e"
-                        | "-i386" | "-x86_64h" => j += 1,
-                        _ => {
-                            step_unknown = true;
-                            j += 1;
-                        }
+        let n = if is_reserved {
+            1
+        } else {
+            match b.as_str() {
+                "time" | "nohup" | "builtin" | "command" | "setsid" | "unbuffer" | "caffeinate"
+                | "sandbox-exec" | "exec" | "nice" | "ionice" | "stdbuf" | "xargs" | "busybox"
+                | "toybox" => {
+                    let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
+                    if matches!(b.as_str(), "busybox" | "toybox") {
+                        1
+                    } else {
+                        table(&mut a, &o, 0, &mut choices, &mut step_unknown)
                     }
                 }
-                j.min(a.len())
-            }
-            "chroot" => {
-                // `chroot [opts] NEWROOT [COMMAND…]`; without a command it
-                // starts a shell (see `reads_stdin_as_script`).
-                let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
-                let j = table(&mut a, &o, 0, &mut choices, &mut step_unknown);
-                if j + 1 < a.len() { j + 1 } else { 0 }
-            }
-            "flock" | "script" => {
-                // `flock [opts] FILE COMMAND…` / `flock [opts] FILE -c 'string'`;
-                // macOS `script [opts] FILE [COMMAND…]`, Linux `script -c CMD
-                // [FILE]`. The wrapper's own options may come after FILE too
-                // (read as options: the stricter reading). Only the
-                // wrapper's own `-c` is a shell string; a `-c` after the
-                // command starts belongs to the command
-                // (`flock l git -c x=y push`, `script f sudo sh -c id`).
-                let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
-                let mut j = 1;
-                let mut file_seen = false;
-                let mut shell_string: Option<String> = None;
-                while j < a.len() {
-                    let w = a[j].as_str();
-                    if w == "--" {
-                        j += 1;
-                        if !file_seen && j < a.len() {
-                            file_seen = true;
-                            j += 1;
-                        }
-                        break;
+                "timeout" | "chrt" | "taskset" => {
+                    let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
+                    // `chrt -p` / `taskset -p` act on a process: no command
+                    if b != "timeout"
+                        && a[1..]
+                            .iter()
+                            .take_while(|w| is_option(w))
+                            .any(|w| !w.starts_with("--") && w.contains('p') || w == "--pid")
+                    {
+                        0
+                    } else {
+                        table(&mut a, &o, 1, &mut choices, &mut step_unknown)
                     }
-                    if is_option(w) {
-                        match take_opt(&mut a, j, &o, true, mask, &mut choices, &mut step_unknown) {
-                            Opt::Words(n) => j += n,
-                            Opt::Shell(s) => {
-                                shell_string = s;
-                                break;
+                }
+                "arch" => {
+                    // `arch [-32|-64|-x86_64|-arm64|…] [-c] [-e VAR=v] [-d VAR] CMD`
+                    let mut j = 1;
+                    while j < a.len() && is_option(&a[j]) {
+                        match a[j].as_str() {
+                            "-arch" | "-e" | "-d" => j += 2,
+                            "-c" | "-h" | "-32" | "-64" | "-x86_64" | "-arm64" | "-arm64e"
+                            | "-i386" | "-x86_64h" => j += 1,
+                            _ => {
+                                step_unknown = true;
+                                j += 1;
                             }
-                            _ => j += 1,
                         }
-                    } else if !file_seen {
-                        file_seen = true;
-                        // `script FILE CMD…`: read also as if the command
-                        // started at FILE (round 7 item 6: whatever a
-                        // `-t`/`--timing` before it took, the command is
-                        // checked from the first word that may start it)
-                        let bit = b == "script" && j + 1 < a.len() && {
-                            let bit = choices < 32 && (mask >> choices) & 1 == 1;
-                            choices += 1;
-                            bit
-                        };
-                        if bit {
+                    }
+                    j.min(a.len())
+                }
+                "chroot" => {
+                    // `chroot [opts] NEWROOT [COMMAND…]`; without a command it
+                    // starts a shell (see `reads_stdin_as_script`).
+                    let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
+                    let j = table(&mut a, &o, 0, &mut choices, &mut step_unknown);
+                    if j + 1 < a.len() { j + 1 } else { 0 }
+                }
+                "flock" | "script" => {
+                    // `flock [opts] FILE COMMAND…` / `flock [opts] FILE -c 'string'`;
+                    // macOS `script [opts] FILE [COMMAND…]`, Linux `script -c CMD
+                    // [FILE]`. The wrapper's own options may come after FILE too
+                    // (read as options: the stricter reading). Only the
+                    // wrapper's own `-c` is a shell string; a `-c` after the
+                    // command starts belongs to the command
+                    // (`flock l git -c x=y push`, `script f sudo sh -c id`).
+                    let o = wrapper_opts(&b).unwrap_or(NO_OPTS);
+                    let mut j = 1;
+                    let mut file_seen = false;
+                    let mut shell_string: Option<String> = None;
+                    while j < a.len() {
+                        let w = a[j].as_str();
+                        if w == "--" {
+                            j += 1;
+                            if !file_seen && j < a.len() {
+                                file_seen = true;
+                                j += 1;
+                            }
                             break;
                         }
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if let Some(cmd) = shell_string {
-                    if step_unknown
-                        && let Some(orig) = orig_a
-                        && let Some(invs) = unknown_invs.as_deref_mut()
-                    {
-                        let entry = (orig, false);
-                        if !invs.contains(&entry) {
-                            invs.push(entry);
+                        if is_option(w) {
+                            match take_opt(
+                                &mut a,
+                                j,
+                                &o,
+                                true,
+                                mask,
+                                &mut choices,
+                                &mut step_unknown,
+                            ) {
+                                Opt::Words(n) => j += n,
+                                Opt::Shell(s) => {
+                                    shell_string = s;
+                                    break;
+                                }
+                                _ => j += 1,
+                            }
+                        } else if !file_seen {
+                            file_seen = true;
+                            // `script FILE CMD…`: read also as if the command
+                            // started at FILE (round 7 item 6: whatever a
+                            // `-t`/`--timing` before it took, the command is
+                            // checked from the first word that may start it)
+                            let bit = b == "script" && j + 1 < a.len() && {
+                                let bit = choices < 32 && (mask >> choices) & 1 == 1;
+                                choices += 1;
+                                bit
+                            };
+                            if bit {
+                                break;
+                            }
+                            j += 1;
+                        } else {
+                            break;
                         }
                     }
-                    a = vec!["sh".into(), "-c".into(), cmd];
-                    unknown |= step_unknown;
-                    continue;
+                    if let Some(cmd) = shell_string {
+                        if step_unknown
+                            && let Some(orig) = orig_a
+                            && let Some(invs) = unknown_invs.as_deref_mut()
+                        {
+                            let entry = (orig, false);
+                            if !invs.contains(&entry) {
+                                invs.push(entry);
+                            }
+                        }
+                        a = vec!["sh".into(), "-c".into(), cmd];
+                        unknown |= step_unknown;
+                        continue;
+                    }
+                    if file_seen && j < a.len() { j } else { 0 }
                 }
-                if file_seen && j < a.len() { j } else { 0 }
+                "env" => {
+                    let c = cache.as_deref_mut().unwrap_or(&mut local_cache);
+                    let scan = scan_env(&mut a, 1, mask, &mut choices, &mut step_unknown, depth, c);
+                    *unbounded |= scan.unbounded;
+                    scan.cmd_index.min(a.len())
+                }
+                _ => break,
             }
-            "env" => {
-                let c = cache.as_deref_mut().unwrap_or(&mut local_cache);
-                let scan = scan_env(&mut a, 1, mask, &mut choices, &mut step_unknown, depth, c);
-                *unbounded |= scan.unbounded;
-                scan.cmd_index.min(a.len())
-            }
-            _ => break,
         };
         unknown |= step_unknown;
         if step_unknown
@@ -2593,7 +2625,7 @@ const SHELLS: &[&str] = &[
 
 /// A shell by name, or by the variables that hold one (`$SHELL`, `$BASH`).
 pub fn is_shell(cmd: &str) -> bool {
-    SHELLS.contains(&base(cmd))
+    SHELLS.contains(&cmd_name(cmd).as_ref())
         || matches!(
             cmd,
             "$SHELL" | "${SHELL}" | "$BASH" | "${BASH}" | "$0" | "${0}"
@@ -2705,9 +2737,9 @@ fn substituted_program_at(w: &str, depth: u8, cache: &mut LexCache) -> Option<St
         // `$(which less)`, `$(command -v jq)`, `` `type -p jq` ``
         let words: Vec<&str> = body.split_whitespace().collect();
         let name = match words.as_slice() {
-            ["which" | "whence", n] => Some(*n),
-            ["command", "-v" | "-V", n] => Some(*n),
-            ["type", "-p" | "-P", n] => Some(*n),
+            [w0, n] if matches!(cmd_name(w0).as_ref(), "which" | "whence") => Some(*n),
+            [w0, "-v" | "-V", n] if cmd_name(w0) == "command" => Some(*n),
+            [w0, "-p" | "-P", n] if cmd_name(w0) == "type" => Some(*n),
             _ => None,
         };
         if let Some(n) = name {
@@ -2731,7 +2763,7 @@ pub fn reads_stdin_as_script(eff: &[String]) -> bool {
     };
     let args = &eff[1..];
     let stdin = |w: &str| matches!(w, "-" | "/dev/stdin" | "/dev/fd/0");
-    match base(first) {
+    match cmd_name(first).as_ref() {
         // with `-f FILE` the job comes from the file, but a body given on
         // stdin is still read as one (it costs nothing to check)
         "at" | "batch" => true,
@@ -3081,7 +3113,7 @@ fn echo_printf_texts(eff: &[String], texts: &mut Vec<String>) {
     let Some(first) = eff.first() else {
         return;
     };
-    match base(first) {
+    match cmd_name(first).as_ref() {
         "echo" => {
             let mut j = 1;
             while j < eff.len() {
@@ -3163,7 +3195,7 @@ fn payloads_of(eff: &[String]) -> Vec<String> {
     let Some(f) = eff.first() else {
         return out;
     };
-    let first = base(f);
+    let first = cmd_name(f);
     if maybe_shell(f) {
         let mut has_c = false;
         let mut j = 1;
@@ -3564,7 +3596,7 @@ fn expand_unknown_env_cmd(
                         rec_depth + 1,
                     );
                 } else {
-                    let b0 = base(&sp[0]);
+                    let b0 = cmd_name(&sp[0]);
                     if b0 == "env" || b0 == "command" {
                         expand_unknown_env_cmd(
                             &sp,
@@ -3576,7 +3608,7 @@ fn expand_unknown_env_cmd(
                             unbounded,
                             rec_depth + 1,
                         );
-                    } else if wrapper_opts(b0).is_some() || b0 == "arch" {
+                    } else if wrapper_opts(b0.as_ref()).is_some() || b0 == "arch" {
                         let mut local_unbounded = vec![];
                         for r_sub in
                             unwrap_readings_bounded(&sp, depth, cache, false, &mut local_unbounded)
@@ -3594,7 +3626,9 @@ fn expand_unknown_env_cmd(
         }
     }
 
-    let is_script_or_flock = matches!(a.first().map(|s| base(s)), Some("script" | "flock"));
+    let is_script_or_flock = a
+        .first()
+        .is_some_and(|s| matches!(cmd_name(s).as_ref(), "script" | "flock"));
     if is_script_or_flock && let Some(r) = readings.as_deref_mut() {
         for m in 1..a.len() {
             let w = a[m].as_str();
@@ -3633,7 +3667,7 @@ fn expand_unknown_env_cmd(
         if let Some(r) = readings.as_deref_mut() {
             push_bounded_vec(r, resolved.clone(), unbounded);
         }
-        let b0 = base(&resolved[0]).to_string();
+        let b0 = cmd_name(&resolved[0]).into_owned();
         if b0 == "env" || b0 == "command" {
             expand_unknown_env_cmd(
                 &resolved,
@@ -3690,7 +3724,7 @@ fn env_payloads_bounded(
     unbounded_words: &mut Vec<UnboundedUnknown>,
 ) -> Vec<String> {
     let mut out = vec![];
-    let Some(k) = argv.iter().position(|w| base(w) == "env") else {
+    let Some(k) = argv.iter().position(|w| cmd_name(w) == "env") else {
         return out;
     };
     let mut push = |p: String| {
@@ -3886,7 +3920,7 @@ fn find_exec_units(eff: &[String], out: &mut Lexed, level: u8, cache: &mut LexCa
                     shell_union: false,
                     alt: vec![],
                 });
-                if level < MAX_DEPTH && e.first().is_some_and(|f| base(f) == "find") {
+                if level < MAX_DEPTH && e.first().is_some_and(|f| cmd_name(f) == "find") {
                     find_exec_units(e, out, level + 1, cache);
                 }
             }
