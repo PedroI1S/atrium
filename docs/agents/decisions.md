@@ -729,4 +729,4 @@ Pedro decided the open gate items:
 `env -C` was already settled (it keeps dev's hard deny); it is removed from the open list.
 
 ## D-112 — 2026-11-16 — Pedro: Argon reviews M1-24, M1-25 and M1-26
-Pedro asked for Gemini 4 Argon `high` to review the three D-111 tasks when they finish, instead of Sonnet. Argon and the Hydrogen authors are both Gemini models, so this is a same-provider review, by the driver's choice.
+Pedro asked for Gemini 4 Argon `high` to review the three D-111 tasks when they finish, instead of Sonnet. Argon and the Hydrogen authors are both Gemini models, so this is a same-provider review, by the driver's choice. **Withdrawn the same day:** once told that Argon and Hydrogen are both Gemini models, Pedro kept the Sonnet reviews (cross-provider) for all three.
