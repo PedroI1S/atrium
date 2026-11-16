@@ -733,3 +733,6 @@ Pedro asked for Gemini 4 Argon `high` to review the three D-111 tasks when they 
 
 ## D-113 — 2026-11-16 — Pedro: M1-23 fix round
 After Argon's review (rework: 2 rules-editor blockers, 1 major in the Linux save dialog, 4 minors, 2 nits; `docs/agents/reviews/M1-23-ui-gaps.md`), Pedro chose a fix round ("Yes, fix round"). Same worker model (Claude Opus 5.5, D-109), same branch and worktree, owned paths unchanged. The daemon-side guard for blocker 1 (`CreateRule` refusing shell/runner prefixes) is outside M1-23's paths; it is only noted for a possible CR, not decided.
+
+## D-114 — 2026-11-16 — Pedro: one small M1-18 round
+Asked how M1-18 should finish after Argon's round-4 review (two "same as dev" blockers and a slow synthetic glob; `docs/agents/reviews/M1-18-policy-followup-round4.md`), Pedro chose "small m1-18 round" over merging with known limits. Fix round 4 goes to Gemini 4 Hydrogen `high`: relative `..` re-entry globs, propagating the search-variant overflow, the `env -S` off-by-one, and the variant total cap. Argon reviews it (D-101).
