@@ -140,6 +140,13 @@ pub(crate) fn is_find(word: &str) -> bool {
     fold_name(word) == "find"
 }
 
+pub(crate) fn is_path_kind(kind: ToolKind) -> bool {
+    matches!(
+        kind,
+        ToolKind::Read | ToolKind::Edit | ToolKind::Delete | ToolKind::Move | ToolKind::Search
+    )
+}
+
 fn is_option(w: &str) -> bool {
     w.len() > 1 && w.starts_with('-')
 }
@@ -191,13 +198,179 @@ fn check_pwsh_risk(name: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn interpreter_value_flag(name: &str, raw: &str, lw: &str) -> bool {
+    match name {
+        "node" => {
+            matches!(raw, "-r" | "-C")
+                || matches!(
+                    lw,
+                    "--require"
+                        | "--import"
+                        | "--loader"
+                        | "--experimental-loader"
+                        | "--experimental-specifier-resolution"
+                        | "--input-type"
+                        | "--conditions"
+                        | "--title"
+                        | "--max-old-space-size"
+                        | "--env-file"
+                        | "--watch-path"
+                        | "--redirect-warnings"
+                        | "--diagnostic-dir"
+                        | "--cpu-prof-dir"
+                        | "--heap-prof-dir"
+                        | "--test-name-pattern"
+                )
+        }
+        "deno" => {
+            matches!(raw, "-c" | "-L")
+                || matches!(
+                    lw,
+                    "--config"
+                        | "--import-map"
+                        | "--lock"
+                        | "--env"
+                        | "--env-file"
+                        | "--ext"
+                        | "--log-level"
+                        | "--location"
+                        | "--cert"
+                        | "--v8-flags"
+                )
+        }
+        "bun" => {
+            matches!(raw, "-c" | "-r")
+                || matches!(
+                    lw,
+                    "--config"
+                        | "--cwd"
+                        | "--env-file"
+                        | "--preload"
+                        | "--port"
+                        | "--define"
+                        | "--loader"
+                )
+        }
+        "ruby" => {
+            matches!(raw, "-I" | "-r" | "-C" | "-E" | "-F" | "-K")
+                || matches!(
+                    lw,
+                    "--encoding" | "--external-encoding" | "--internal-encoding"
+                )
+        }
+        "perl" => matches!(raw, "-I" | "-M" | "-m" | "-F" | "-D" | "-x"),
+        "php" => matches!(raw, "-c" | "-d" | "-z" | "-S" | "-t"),
+        "lua" => raw == "-l",
+        "osascript" => matches!(raw, "-l" | "-s"),
+        _ => false,
+    }
+}
+
+fn interpreter_bool_or_attached(name: &str, raw: &str, lw: &str) -> bool {
+    if lw.starts_with("--") && lw.contains('=') {
+        return true;
+    }
+    match name {
+        "node" => {
+            matches!(raw, "-v" | "-h" | "-c")
+                || matches!(
+                    lw,
+                    "--version"
+                        | "--help"
+                        | "--check"
+                        | "--no-deprecation"
+                        | "--throw-deprecation"
+                        | "--trace-deprecation"
+                        | "--trace-warnings"
+                        | "--no-warnings"
+                        | "--zero-fill-buffers"
+                        | "--preserve-symlinks"
+                        | "--preserve-symlinks-main"
+                        | "--watch"
+                        | "--test"
+                        | "--enable-source-maps"
+                        | "--experimental-vm-modules"
+                        | "--no-experimental-fetch"
+                )
+        }
+        "deno" => {
+            matches!(raw, "-A" | "-q" | "-r" | "-h" | "-V")
+                || matches!(
+                    lw,
+                    "--allow-all"
+                        | "--allow-read"
+                        | "--allow-write"
+                        | "--allow-net"
+                        | "--allow-env"
+                        | "--allow-run"
+                        | "--allow-ffi"
+                        | "--allow-sys"
+                        | "--allow-hrtime"
+                        | "--quiet"
+                        | "--reload"
+                        | "--no-check"
+                        | "--watch"
+                        | "--cached-only"
+                        | "--no-lock"
+                        | "--no-remote"
+                        | "--unstable"
+                        | "--help"
+                        | "--version"
+                )
+                || lw.starts_with("--allow-")
+                || lw.starts_with("--unstable-")
+        }
+        "bun" => {
+            matches!(raw, "-b" | "-h" | "-v")
+                || matches!(
+                    lw,
+                    "--hot"
+                        | "--watch"
+                        | "--bun"
+                        | "--smol"
+                        | "--silent"
+                        | "--no-install"
+                        | "--prefer-offline"
+                        | "--production"
+                        | "--help"
+                        | "--version"
+                )
+        }
+        "ruby" => {
+            matches!(lw, "--verbose" | "--version")
+                || ((raw.starts_with("-I")
+                    || raw.starts_with("-r")
+                    || raw.starts_with("-E")
+                    || raw.starts_with("-W")
+                    || raw.starts_with("-0")
+                    || raw.starts_with("-i"))
+                    && raw.len() > 2)
+                || (!raw.starts_with("--") && raw[1..].chars().all(|c| "wvVTsnapld0y".contains(c)))
+        }
+        "perl" => {
+            ((raw.starts_with("-I")
+                || raw.starts_with("-M")
+                || raw.starts_with("-m")
+                || raw.starts_with("-0")
+                || raw.starts_with("-i"))
+                && raw.len() > 2)
+                || (!raw.starts_with("--")
+                    && raw[1..].chars().all(|c| "wWvVTtsnpald0cuU".contains(c)))
+        }
+        "php" => !raw.starts_with("--") && raw[1..].chars().all(|c| "nqwlsmvih".contains(c)),
+        "lua" => matches!(raw, "-i" | "-v" | "-W"),
+        "osascript" => matches!(raw, "-i" | "-o"),
+        _ => false,
+    }
+}
+
 fn check_interpreter_risk(
     name: &str,
     spec: &InterpreterSpec,
     args: &[String],
     prefix: bool,
 ) -> Result<(), String> {
-    let mut operands: Vec<String> = Vec::new();
+    // Scan all args for inline-code flags (fail closed, even after a script name).
     for w in args {
         let lw = w.to_lowercase();
         if lw.starts_with("--") {
@@ -210,31 +383,143 @@ fn check_interpreter_risk(
                     "an allow rule can't allow `{name} {w}`: it runs inline code"
                 ));
             }
-        } else if is_option(w) {
-            if !spec.short.is_empty() && lw[1..].chars().any(|c| spec.short.contains(c)) {
-                return Err(format!(
-                    "an allow rule can't allow `{name} {w}`: it holds an inline-code flag"
-                ));
-            }
-        } else {
-            operands.push(lw);
+        } else if is_option(w)
+            && !spec.short.is_empty()
+            && lw[1..].chars().any(|c| spec.short.contains(c))
+        {
+            return Err(format!(
+                "an allow rule can't allow `{name} {w}`: it holds an inline-code flag"
+            ));
         }
     }
-    if let Some(stdin) = operands.iter().find(|o| STDIN.contains(&o.as_str())) {
+
+    // Identify the script / module operand while consuming known option values
+    // and failing closed on unknown options before the script.
+    let is_python = name.starts_with("python");
+    let mut verb_seen = false;
+    let mut found_target = false;
+    let mut i = 0;
+    while i < args.len() {
+        let w = &args[i];
+        let lw = w.to_lowercase();
+        if w == "--" {
+            if let Some(next) = args.get(i + 1) {
+                let ln = next.to_lowercase();
+                if STDIN.contains(&ln.as_str()) {
+                    return Err(format!(
+                        "an allow rule can't allow `{name} {next}`: it reads code from standard input"
+                    ));
+                }
+                if !verb_seen && spec.sub.contains(&ln.as_str()) {
+                    return Err(format!(
+                        "an allow rule can't allow `{name} {next}`: it runs inline code"
+                    ));
+                }
+                found_target = true;
+            }
+            break;
+        }
+        if !is_option(w) {
+            if STDIN.contains(&lw.as_str()) {
+                return Err(format!(
+                    "an allow rule can't allow `{name} {w}`: it reads code from standard input"
+                ));
+            }
+            if !verb_seen && spec.sub.contains(&lw.as_str()) {
+                return Err(format!(
+                    "an allow rule can't allow `{name} {w}`: it runs inline code"
+                ));
+            }
+            if !verb_seen && !spec.verbs.is_empty() && spec.verbs.contains(&lw.as_str()) {
+                verb_seen = true;
+                i += 1;
+                continue;
+            }
+            found_target = true;
+            break;
+        }
+
+        if is_python {
+            if w == "-m" {
+                if args
+                    .get(i + 1)
+                    .is_some_and(|m| !m.is_empty() && !m.starts_with('-'))
+                {
+                    found_target = true;
+                    break;
+                }
+                return Err(format!(
+                    "an allow rule for `{name}` must name the script or module it runs"
+                ));
+            }
+            if w.starts_with("-m") && w.len() > 2 {
+                found_target = true;
+                break;
+            }
+            if matches!(w.as_str(), "-W" | "-X" | "-Q" | "--check-hash-based-pycs") {
+                if i + 1 >= args.len() {
+                    return Err(format!(
+                        "an allow rule for `{name}` must name the script it runs"
+                    ));
+                }
+                i += 2;
+                continue;
+            }
+            if w.starts_with("--check-hash-based-pycs=")
+                || ((w.starts_with("-W") || w.starts_with("-X") || w.starts_with("-Q"))
+                    && w.len() > 2)
+            {
+                i += 1;
+                continue;
+            }
+            if matches!(
+                lw.as_str(),
+                "--version"
+                    | "--help"
+                    | "--help-all"
+                    | "--help-env"
+                    | "--help-xoptions"
+                    | "--verbose"
+                    | "--quiet"
+                    | "--isolated"
+                    | "--ignore-environment"
+                    | "--no-site"
+                    | "--no-user-site"
+                    | "--skip-source-first-line"
+                    | "--bytes-warning"
+                    | "--dont-write-bytecode"
+                    | "--optimize"
+                    | "--inspect"
+                    | "--unbuffered"
+            ) || (!w.starts_with("--") && w[1..].chars().all(|c| "bBdEhiIOqsSuvVx".contains(c)))
+            {
+                i += 1;
+                continue;
+            }
+            return Err(format!(
+                "an allow rule for `{name}` must name the script it runs"
+            ));
+        }
+
+        if interpreter_value_flag(name, w, &lw) {
+            if i + 1 >= args.len() {
+                return Err(format!(
+                    "an allow rule for `{name}` must name the script it runs"
+                ));
+            }
+            i += 2;
+            continue;
+        }
+        if interpreter_bool_or_attached(name, w, &lw) {
+            i += 1;
+            continue;
+        }
         return Err(format!(
-            "an allow rule can't allow `{name} {stdin}`: it reads code from standard input"
+            "an allow rule for `{name}` must name the script it runs"
         ));
     }
-    let subcommand = operands.first().map(String::as_str);
-    if let Some(sub) = subcommand
-        && spec.sub.contains(&sub)
-    {
-        return Err(format!(
-            "an allow rule can't allow `{name} {sub}`: it runs inline code"
-        ));
-    }
-    let verb = usize::from(subcommand.is_some_and(|s| spec.verbs.contains(&s)));
-    if operands.len() <= verb {
+
+    if !found_target {
         return Err(format!(
             "an allow rule for `{name}` must name the script it runs"
         ));
@@ -271,12 +556,189 @@ fn check_package_runner_risk(name: &str, args: &[String], prefix: bool) -> Resul
             "a prefix allow rule for `{name}` must name the package right after it"
         ));
     }
-    if !args.iter().any(|w| !w.starts_with('-')) {
+    let mut i = 0;
+    let mut found_pkg = false;
+    while i < args.len() {
+        let w = &args[i];
+        let lw = w.to_lowercase();
+        if w == "--" {
+            found_pkg = args
+                .get(i + 1)
+                .is_some_and(|next| !next.is_empty() && next != "-");
+            break;
+        }
+        if !is_option(w) {
+            if w != "-" {
+                found_pkg = true;
+                break;
+            }
+            i += 1;
+            continue;
+        }
+        if lw.starts_with("--") && lw.contains('=') {
+            i += 1;
+            continue;
+        }
+        if matches!(
+            lw.as_str(),
+            "-p" | "--package"
+                | "--from"
+                | "--with"
+                | "--with-editable"
+                | "--with-requirements"
+                | "--python"
+                | "--index-url"
+                | "--extra-index-url"
+                | "--node-options"
+                | "-n"
+                | "--cache"
+                | "--userconfig"
+        ) {
+            if i + 1 >= args.len() {
+                return Err(format!(
+                    "an allow rule for `{name}` must name the package it runs"
+                ));
+            }
+            i += 2;
+            continue;
+        }
+        if matches!(
+            lw.as_str(),
+            "-y" | "--yes"
+                | "-q"
+                | "--quiet"
+                | "--no"
+                | "--no-install"
+                | "--offline"
+                | "--prefer-offline"
+                | "--ignore-existing"
+                | "--isolated"
+                | "--no-cache"
+                | "--no-build-isolation"
+                | "--system"
+                | "--verbose"
+                | "-v"
+                | "-h"
+                | "--help"
+                | "--version"
+                | "--shell-auto-fallback"
+        ) || (!lw.starts_with("--") && lw[1..].chars().all(|c| "yqnhv".contains(c)))
+        {
+            i += 1;
+            continue;
+        }
+        return Err(format!(
+            "an allow rule for `{name}` must name the package it runs"
+        ));
+    }
+    if !found_pkg {
         return Err(format!(
             "an allow rule for `{name}` must name the package it runs"
         ));
     }
     Ok(())
+}
+
+fn git_config_is_exec(kv: &str) -> bool {
+    let (key, val) = kv.split_once('=').unwrap_or((kv, ""));
+    let lk = key.to_ascii_lowercase();
+    val.trim_start().starts_with('!')
+        || lk.starts_with("alias.")
+        || (lk.starts_with("merge.") && lk.ends_with(".driver"))
+        || (lk.starts_with("filter.")
+            && (lk.ends_with(".clean") || lk.ends_with(".smudge") || lk.ends_with(".process")))
+        || (lk.starts_with("diff.")
+            && (lk.ends_with(".command") || lk.ends_with(".textconv") || lk == "diff.external"))
+        || lk.starts_with("credential.")
+        || lk.starts_with("uploadpack.")
+        || lk.starts_with("receive.")
+        || lk.starts_with("gpg.")
+        || lk.starts_with("remote.")
+        || lk.starts_with("protocol.")
+        || matches!(
+            lk.as_str(),
+            "core.fsmonitor"
+                | "core.sshcommand"
+                | "core.askpass"
+                | "core.editor"
+                | "core.pager"
+                | "core.gitproxy"
+                | "sequence.editor"
+                | "browser"
+        )
+}
+
+/// Returns `(has_any_cli_config_or_exec, has_dangerous_exec_config)` for `git`.
+fn git_cli_exec_config(args: &[String]) -> (bool, bool) {
+    let mut has_any = false;
+    let mut has_dangerous = false;
+    let mut i = 0;
+    while i < args.len() {
+        let w = args[i].as_str();
+        if w == "--" {
+            break;
+        }
+        if w == "-c" {
+            has_any = true;
+            if args.get(i + 1).is_none_or(|kv| git_config_is_exec(kv)) {
+                has_dangerous = true;
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(kv) = w.strip_prefix("-c")
+            && !kv.is_empty()
+        {
+            has_any = true;
+            if git_config_is_exec(kv) {
+                has_dangerous = true;
+            }
+            i += 1;
+            continue;
+        }
+        if w == "--config-env" || w == "--exec-path" {
+            has_any = true;
+            has_dangerous = true;
+            i += 2;
+            continue;
+        }
+        if w.starts_with("--config-env=") || w.starts_with("--exec-path=") {
+            has_any = true;
+            has_dangerous = true;
+            i += 1;
+            continue;
+        }
+        if matches!(
+            w,
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" | "--list-cmds"
+        ) {
+            i += 2;
+            continue;
+        }
+        if w.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    for w in args {
+        if w == "--" {
+            break;
+        }
+        if matches!(
+            w.as_str(),
+            "--ext-diff" | "--config-env" | "--exec-path" | "--upload-pack" | "--receive-pack"
+        ) || w.starts_with("--config-env=")
+            || w.starts_with("--exec-path=")
+            || w.starts_with("--upload-pack=")
+            || w.starts_with("--receive-pack=")
+            || w.starts_with("--exec=")
+        {
+            has_any = true;
+            has_dangerous = true;
+        }
+    }
+    (has_any, has_dangerous)
 }
 
 /// Checks whether an allow command rule (`CommandPrefix` or `CommandExact`)
@@ -305,6 +767,15 @@ pub fn command_allow_risk(argv: &[String], prefix: bool) -> Result<(), String> {
     if PACKAGE_RUNNERS.contains(&name.as_str()) {
         return check_package_runner_risk(&name, args, prefix);
     }
+    if name == "git" {
+        let (has_any, has_dangerous) = git_cli_exec_config(args);
+        if (prefix && has_any) || has_dangerous {
+            return Err(
+                "an allow rule can't allow `git` with command-line configuration or exec options"
+                    .into(),
+            );
+        }
+    }
     if name == "find" {
         if let Some(exec) = args
             .iter()
@@ -319,12 +790,58 @@ pub fn command_allow_risk(argv: &[String], prefix: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_abs_glob(glob: &str, label: &str) -> Result<(), String> {
+    if glob.is_empty() || glob.chars().count() > 1000 || glob.contains(['\n', '\r', '\0']) {
+        return Err(format!("invalid {label}"));
+    }
+    if !glob.starts_with('/') {
+        return Err(format!("{label} must be an absolute path starting with /"));
+    }
+    if glob.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err(format!("{label} cannot contain . or .. segments"));
+    }
+    if GlobBuilder::new(glob)
+        .literal_separator(true)
+        .build()
+        .is_err()
+    {
+        return Err(format!("invalid {label}"));
+    }
+    Ok(())
+}
+
 /// Validates a `RuleDraft` from `CreateRule`, matching the app's rules editor.
 pub fn validate_rule_draft(draft: &RuleDraft) -> Result<(), String> {
+    if let Some(tn) = &draft.tool_name
+        && (tn.is_empty()
+            || tn.chars().count() > 100
+            || tn.chars().any(|c| {
+                c.is_whitespace() || c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+            }))
+    {
+        return Err("invalid tool name".into());
+    }
+
     match &draft.matcher {
         RuleMatcher::CommandPrefix { argv } | RuleMatcher::CommandExact { argv } => {
+            if draft.tool_kind != ToolKind::Execute {
+                return Err("command rules must have tool_kind Execute".into());
+            }
             if argv.is_empty() || argv.first().is_some_and(String::is_empty) {
                 return Err("the rule's command is empty".into());
+            }
+            let total_chars: usize = argv.iter().map(|s| s.chars().count()).sum::<usize>()
+                + argv.len().saturating_sub(1);
+            if total_chars > 4000 {
+                return Err("the rule's command is too long".into());
+            }
+            if argv.iter().any(|w| {
+                w.chars()
+                    .any(|c| (c.is_control() && c != '\t') || matches!(c, '\u{2028}' | '\u{2029}'))
+            }) {
+                return Err(
+                    "command rules cannot contain line breaks or control characters".into(),
+                );
             }
             if RESERVED.contains(&fold_name(&argv[0]).as_str()) {
                 return Err("a command rule must start with a simple command".into());
@@ -337,37 +854,29 @@ pub fn validate_rule_draft(draft: &RuleDraft) -> Result<(), String> {
             }
         }
         RuleMatcher::PathGlob { glob } => {
-            if glob.is_empty()
-                || GlobBuilder::new(glob)
-                    .literal_separator(true)
-                    .build()
-                    .is_err()
-            {
-                return Err("invalid path glob".into());
+            if !is_path_kind(draft.tool_kind) {
+                return Err("path rules are only allowed for file tools".into());
+            }
+            validate_abs_glob(glob, "path glob")?;
+        }
+        RuleMatcher::Any => {
+            if draft.tool_kind == ToolKind::Think {
+                return Err("rules cannot target Think".into());
             }
         }
-        RuleMatcher::Any => {}
     }
 
     if let Some(scope) = &draft.path_scope {
-        let is_path_kind = matches!(
-            draft.tool_kind,
-            ToolKind::Read | ToolKind::Edit | ToolKind::Delete | ToolKind::Move | ToolKind::Search
-        );
         let offered = draft.decision == RuleDecision::Allow
-            && (matches!(draft.matcher, RuleMatcher::PathGlob { .. })
-                || (matches!(draft.matcher, RuleMatcher::Any) && is_path_kind));
+            && is_path_kind(draft.tool_kind)
+            && matches!(
+                draft.matcher,
+                RuleMatcher::PathGlob { .. } | RuleMatcher::Any
+            );
         if !offered {
             return Err("path scope is only allowed on allow rules for file tools".into());
         }
-        if scope.is_empty()
-            || GlobBuilder::new(scope)
-                .literal_separator(true)
-                .build()
-                .is_err()
-        {
-            return Err("invalid path scope glob".into());
-        }
+        validate_abs_glob(scope, "path scope glob")?;
     }
 
     Ok(())
@@ -397,7 +906,7 @@ fn find_has_empty_exec(args: &[String]) -> bool {
 
 /// Whether `CommandPrefix` `rule_prefix` must be refused for `argv` at
 /// evaluation time (shells, `eval`/`source`/`.`, `find -delete`, malformed
-/// `find -exec`, or interpreters/runners with inline code or no pinned script).
+/// `find -exec`, `git -c`/exec config, or interpreters/runners with inline code or no pinned script).
 pub(crate) fn command_prefix_blocked(argv: &[String], rule_prefix: &[String]) -> bool {
     let Some(first) = argv.first().filter(|s| !s.is_empty()) else {
         return true;
@@ -405,6 +914,9 @@ pub(crate) fn command_prefix_blocked(argv: &[String], rule_prefix: &[String]) ->
     let name = fold_name(first);
     let args = &argv[1..];
     if SHELLS.contains(&name.as_str()) || RUNS_HERE.contains(&name.as_str()) {
+        return true;
+    }
+    if name == "git" && git_cli_exec_config(args).0 {
         return true;
     }
     if name == "find" {
@@ -432,6 +944,9 @@ pub(crate) fn command_exact_blocked(argv: &[String]) -> bool {
     };
     let name = fold_name(first);
     if SHELLS.contains(&name.as_str()) || RUNS_HERE.contains(&name.as_str()) {
+        return true;
+    }
+    if name == "git" && git_cli_exec_config(&argv[1..]).1 {
         return true;
     }
     if is_pwsh(&name)
