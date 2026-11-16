@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use atrium_agents::claude::{ClaudeAdapter, ClaudeOptions};
+use atrium_agents::codex::CodexAdapter;
 use atrium_daemon::{AppIdentitySource, CommandNotifier, DAEMON_VERSION, Daemon, Options};
 use atrium_host::lifecycle::default_paths;
 use tokio::signal::unix::{SignalKind, signal};
@@ -81,6 +83,10 @@ async fn run(dev_socket: bool) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         AppIdentitySource::None
     };
+    options.adapters = vec![
+        Arc::new(ClaudeAdapter::new(ClaudeOptions::default())),
+        Arc::new(CodexAdapter::new()),
+    ];
     options.notifier = Arc::new(CommandNotifier);
     options.manage_service = true;
 
