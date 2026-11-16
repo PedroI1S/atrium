@@ -29,7 +29,8 @@
 //! read. So every event reaches a subscriber exactly once, from the store or
 //! from the hub.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -66,6 +67,78 @@ use hub::Hub;
 use sessions::Live;
 
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Environment variable that disables `atriumd`'s automatic `PATH` extension
+/// when set to `"1"`.
+pub const NO_PATH_EXTRAS_ENV: &str = "ATRIUM_NO_PATH_EXTRAS";
+
+/// Default `PATH` additions for GUI and service launches whose inherited `PATH`
+/// is minimal (`/usr/bin:/bin:/usr/sbin:/sbin`).
+///
+/// Relative entries are resolved under `$HOME`; absolute entries are used as
+/// given. User-local directories come first so a user-installed CLI precedes
+/// Homebrew or system directories.
+pub const DEFAULT_PATH_EXTRAS: &[&str] = &[
+    ".local/bin",
+    ".claude/local",
+    ".npm-global/bin",
+    ".bun/bin",
+    ".cargo/bin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+];
+
+/// Merges `existing` `PATH` entries with `candidates` that satisfy `exists`.
+///
+/// Keeps every non-empty entry from `existing` first, in order, then appends
+/// each candidate (joining relative entries onto `home`, or skipping them if
+/// `home` is empty) that `exists` accepts and is not already present.
+/// De-duplicates entries (including trailing-slash variants) while preserving
+/// the first occurrence's raw bytes, including non-UTF-8 entries.
+pub fn provider_path<'a>(
+    existing: Option<&OsStr>,
+    home: &Path,
+    candidates: impl IntoIterator<Item = &'a str>,
+    exists: impl Fn(&Path) -> bool,
+) -> OsString {
+    let mut entries: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    if let Some(raw) = existing {
+        for entry in std::env::split_paths(raw) {
+            if entry.as_os_str().is_empty() {
+                continue;
+            }
+            if seen.insert(entry.clone()) {
+                entries.push(entry);
+            }
+        }
+    }
+
+    let has_home = !home.as_os_str().is_empty();
+    for candidate in candidates {
+        let candidate_path = Path::new(candidate);
+        let resolved = if candidate_path.is_absolute() {
+            candidate_path.to_path_buf()
+        } else if has_home {
+            home.join(candidate_path)
+        } else {
+            continue;
+        };
+        if seen.contains(&resolved) {
+            continue;
+        }
+        if std::env::join_paths(std::iter::once(&resolved)).is_err() {
+            continue;
+        }
+        if exists(&resolved) && seen.insert(resolved.clone()) {
+            entries.push(resolved);
+        }
+    }
+
+    std::env::join_paths(&entries)
+        .unwrap_or_else(|_| existing.map(OsStr::to_os_string).unwrap_or_default())
+}
 
 /// Slow commands that may run beside their connections' readers at once.
 const MAX_SLOW_COMMANDS: usize = 8;
@@ -423,5 +496,146 @@ impl Daemon {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         eprintln!("atriumd: something still held the daemon's state at exit");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+
+    use super::{DEFAULT_PATH_EXTRAS, provider_path};
+
+    #[test]
+    fn provider_path_keeps_existing_first_and_appends_in_order() {
+        let home = Path::new("/home/alice");
+        let allowed: HashSet<&Path> = [
+            Path::new("/home/alice/.local/bin"),
+            Path::new("/home/alice/.cargo/bin"),
+            Path::new("/opt/homebrew/bin"),
+        ]
+        .into_iter()
+        .collect();
+
+        let merged = provider_path(
+            Some(OsStr::new("/custom/bin:/usr/bin")),
+            home,
+            DEFAULT_PATH_EXTRAS.iter().copied(),
+            |path| allowed.contains(path),
+        );
+
+        let parts: Vec<PathBuf> = std::env::split_paths(&merged).collect();
+        assert_eq!(
+            parts,
+            vec![
+                PathBuf::from("/custom/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/home/alice/.local/bin"),
+                PathBuf::from("/home/alice/.cargo/bin"),
+                PathBuf::from("/opt/homebrew/bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_path_skips_missing_dirs() {
+        let merged = provider_path(
+            Some(OsStr::new("/usr/bin:/bin")),
+            Path::new("/home/alice"),
+            DEFAULT_PATH_EXTRAS.iter().copied(),
+            |_| false,
+        );
+        assert_eq!(merged, OsStr::new("/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn provider_path_deduplicates_including_trailing_slashes() {
+        let home = Path::new("/home/alice");
+        let merged = provider_path(
+            Some(OsStr::new(
+                "/home/alice/.local/bin/:/opt/homebrew/bin:/home/alice/.local/bin:/usr/bin/:/usr/bin",
+            )),
+            home,
+            DEFAULT_PATH_EXTRAS.iter().copied(),
+            |_| true,
+        );
+
+        let parts: Vec<PathBuf> = std::env::split_paths(&merged).collect();
+        assert_eq!(
+            parts,
+            vec![
+                PathBuf::from("/home/alice/.local/bin/"),
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/bin/"),
+                PathBuf::from("/home/alice/.claude/local"),
+                PathBuf::from("/home/alice/.npm-global/bin"),
+                PathBuf::from("/home/alice/.bun/bin"),
+                PathBuf::from("/home/alice/.cargo/bin"),
+                PathBuf::from("/usr/local/bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_path_handles_unset_and_empty_path() {
+        let home = Path::new("/home/alice");
+        let only_local = |path: &Path| path == Path::new("/home/alice/.local/bin");
+
+        let from_none = provider_path(None, home, DEFAULT_PATH_EXTRAS.iter().copied(), only_local);
+        assert_eq!(from_none, OsStr::new("/home/alice/.local/bin"));
+
+        let from_empty = provider_path(
+            Some(OsStr::new("")),
+            home,
+            DEFAULT_PATH_EXTRAS.iter().copied(),
+            only_local,
+        );
+        assert_eq!(from_empty, OsStr::new("/home/alice/.local/bin"));
+
+        let from_colons = provider_path(
+            Some(OsStr::new(":/usr/bin::/bin:")),
+            home,
+            DEFAULT_PATH_EXTRAS.iter().copied(),
+            only_local,
+        );
+        assert_eq!(
+            from_colons,
+            OsStr::new("/usr/bin:/bin:/home/alice/.local/bin")
+        );
+
+        let all_empty = provider_path(None, home, DEFAULT_PATH_EXTRAS.iter().copied(), |_| false);
+        assert_eq!(all_empty, OsStr::new(""));
+    }
+
+    #[test]
+    fn provider_path_preserves_non_utf8_entries() {
+        let existing = OsStr::from_bytes(b"/opt/\xff/bin:/usr/bin:/opt/\xff/bin/");
+        let merged = provider_path(
+            Some(existing),
+            Path::new("/home/alice"),
+            DEFAULT_PATH_EXTRAS.iter().copied(),
+            |path| path == Path::new("/home/alice/.local/bin"),
+        );
+
+        assert_eq!(
+            merged.as_bytes(),
+            b"/opt/\xff/bin:/usr/bin:/home/alice/.local/bin"
+        );
+    }
+
+    #[test]
+    fn provider_path_skips_home_candidates_when_home_empty() {
+        let merged = provider_path(
+            Some(OsStr::new("/usr/bin")),
+            Path::new(""),
+            DEFAULT_PATH_EXTRAS.iter().copied(),
+            |_| true,
+        );
+        assert_eq!(
+            merged,
+            OsStr::new("/usr/bin:/opt/homebrew/bin:/usr/local/bin")
+        );
     }
 }

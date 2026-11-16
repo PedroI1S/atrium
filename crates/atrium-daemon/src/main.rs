@@ -9,13 +9,17 @@
 //! - `SIGTERM`: exit once no turn is running. `SIGINT`: stop sessions now
 //!   (resumable) and exit.
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use atrium_agents::claude::{ClaudeAdapter, ClaudeOptions};
 use atrium_agents::codex::CodexAdapter;
-use atrium_daemon::{AppIdentitySource, CommandNotifier, DAEMON_VERSION, Daemon, Options};
+use atrium_daemon::{
+    AppIdentitySource, CommandNotifier, DAEMON_VERSION, DEFAULT_PATH_EXTRAS, Daemon,
+    NO_PATH_EXTRAS_ENV, Options, provider_path,
+};
 use atrium_host::lifecycle::default_paths;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -47,6 +51,7 @@ fn main() -> ExitCode {
     if dev_socket && !cfg!(debug_assertions) {
         eprintln!("atriumd: --dev-socket is ignored by release builds");
     }
+    extend_provider_path();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKER_THREADS)
         .enable_all()
@@ -63,6 +68,34 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("atriumd: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+fn extend_provider_path() {
+    if std::env::var_os(NO_PATH_EXTRAS_ENV).as_deref() == Some(OsStr::new("1")) {
+        return;
+    }
+    let existing = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let merged = provider_path(
+        existing.as_deref(),
+        &home,
+        DEFAULT_PATH_EXTRAS.iter().copied(),
+        |path| path.is_dir(),
+    );
+    if existing.is_none() && merged.is_empty() {
+        return;
+    }
+    if existing.as_deref() != Some(merged.as_os_str()) {
+        // SAFETY: called in `main()` before building the Tokio runtime or
+        // spawning any threads, so no other thread can concurrently read or
+        // mutate the process environment.
+        unsafe {
+            std::env::set_var("PATH", &merged);
         }
     }
 }
