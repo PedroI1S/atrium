@@ -99,3 +99,54 @@ No other missing `Options` wiring gaps were found in `main.rs`.
 
 - Nothing within `M1-22-daemon-adapters` scope.
 - Pre-existing out-of-scope items remain as on `dev`: release `AppIdentitySource::None` in `crates/atrium-daemon/src/main.rs` (M8 packaging), the 6 pre-existing `M1-13` `#[ignore]` tests in `atrium-core`, and the Linux-only `#[ignore]` test in `atrium-host/tests/adversarial_supervise.rs` on macOS.
+
+## Fix round 1 (D-108: GUI/service `PATH` extension & review fixes)
+
+### Changes
+
+- **`crates/atrium-daemon/src/lib.rs` (`provider_path`, `DEFAULT_PATH_EXTRAS`, `NO_PATH_EXTRAS_ENV`):**
+  - Added `provider_path(existing: Option<&OsStr>, home: &Path, candidates, exists: impl Fn(&Path) -> bool) -> OsString`: keeps every non-empty entry from `existing` first in order, then appends each candidate (relative paths joined onto non-empty `home`; absolute paths used as-is) for which `exists` returns `true` and that is not already present. De-duplicates entries (including trailing-slash variants via `Path` component equality) while preserving the first occurrence's raw bytes, including non-UTF-8 entries.
+  - `DEFAULT_PATH_EXTRAS` order places `$HOME` directories first and system/Homebrew directories after: `$HOME/.local/bin`, `$HOME/.claude/local`, `$HOME/.npm-global/bin`, `$HOME/.bun/bin`, `$HOME/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin`. Because `$HOME/.local/bin` precedes `/opt/homebrew/bin` and `/usr/local/bin`, user-installed CLIs (and the test's fake `claude`) are resolved ahead of any system/Homebrew binary when inherited `PATH` is minimal.
+- **`crates/atrium-daemon/src/main.rs` (`extend_provider_path`):**
+  - Called in `main()` right before `tokio::runtime::Builder::new_multi_thread()` while the process is single-threaded, with a `// SAFETY:` comment and tightly scoped `#[allow(unsafe_code)]` around `extend_provider_path` for `std::env::set_var("PATH", &merged)` (unsafe in Rust edition 2024).
+  - Checks `ATRIUM_NO_PATH_EXTRAS=1` (`NO_PATH_EXTRAS_ENV`): when set to `"1"`, skips extending `PATH`.
+  - **Why `ATRIUM_NO_PATH_EXTRAS=1` is safe to ship:** it is strictly subtractive/opt-out — it only prevents `atriumd` from appending extra directories to its inherited `PATH` and cannot grant access to or execute any binary that was not already on `PATH`.
+- **`crates/atrium-daemon/tests/binary_adapters.rs`:**
+  - Redirected `atriumd`'s stderr to a file (`atriumd.stderr`) inside each test's temp directory instead of `Stdio::piped()`, avoiding pipe-buffer blocking if a daemon writes to stderr (review minor).
+  - Updated `atriumd_registers_claude_and_codex_adapters` to set `ATRIUM_NO_PATH_EXTRAS=1` while keeping `PATH` pointing to the empty temp directory, so it still can never reach any real CLI.
+  - Added `atriumd_discovers_claude_in_home_local_bin_when_path_minimal`: runs `atriumd` with `PATH=<empty temp dir>`, `HOME=<temp home>`, `ATRIUM_NO_PATH_EXTRAS` unset, and a minimal fake shell script at `$HOME/.local/bin/claude` (mode `0700`) that prints `9.9.9 (Claude Code)` and exits `0` only when invoked with `--version` (matching `crates/atrium-agents/src/claude/adapter.rs::cli_version`) and exits `1` otherwise. Sends only `ProbeProviders { preset: Preset::Home }` (never starts a thread) and asserts only on Claude's `cli_version == Some("9.9.9")` so the test does not depend on what may exist in `/opt/homebrew/bin` or `/usr/local/bin`.
+
+### Unit tests (`crates/atrium-daemon/src/lib.rs`)
+
+`cargo test -p atrium-daemon --lib provider_path` (`6 passed; 0 failed`):
+- `provider_path_keeps_existing_first_and_appends_in_order`
+- `provider_path_skips_missing_dirs`
+- `provider_path_deduplicates_including_trailing_slashes`
+- `provider_path_handles_unset_and_empty_path`
+- `provider_path_preserves_non_utf8_entries`
+- `provider_path_skips_home_candidates_when_home_empty`
+
+### Binary test before and after `main.rs` fix
+
+- **Failing run without `extend_provider_path` in `main.rs`:**
+  Command: `cargo test -p atrium-daemon --test binary_adapters` (exited `101`, 1 passed / 1 failed):
+  ```text
+  thread 'atriumd_discovers_claude_in_home_local_bin_when_path_minimal' (43024311) panicked at crates/atrium-daemon/tests/binary_adapters.rs:265:5:
+  assertion `left == right` failed
+    left: None
+   right: Some("9.9.9")
+  ```
+- **Passing run with `extend_provider_path` in `main.rs`:**
+  Command: `cargo test -p atrium-daemon --test binary_adapters` (exited `0`, `2 passed; 0 failed`).
+
+### Fix round 1 DoD outputs
+
+- `cargo fmt --all --check`: exited `0`.
+- `cargo clippy --workspace --all-targets -- -D warnings`: exited `0`.
+- `cargo test --workspace --no-fail-fast`: exited `0` (all workspace unit, integration, and doc tests passed; pre-existing `#[ignore]` counts unchanged).
+- `cargo test -p atrium-daemon -- -q`: exited `0`: unit `21`, `adversarial_recovery` `3`, `adversarial_socket` `7`, `binary_adapters` `2`, `client` `1`, `gaps_full_storage` `2`, `gaps_snapshot` `2`, `recovery` `7`, `requests_fake` `6`, `requests_notifications` `2`, `sessions` `22`, `socket` `9`, `start_refusal` `5` (`89 passed, 0 failed`).
+- Both binary tests 20 consecutive runs (`for i in 1 2 ... 20; do cargo test -p atrium-daemon --test binary_adapters -q && echo "RUN $i OK" || echo "RUN $i FAIL"; done`): `RUN 1 OK` through `RUN 20 OK` (`20/20` passed, `2 passed; 0 failed` per run, `0.41s`–`0.44s` each).
+
+### Follow-ups
+
+- **Login shell `PATH` discovery (deferred from this round):** CLIs managed via `nvm`, `asdf`, `mise`, or custom shell init live outside the fixed `DEFAULT_PATH_EXTRAS` directories. A follow-up can merge the user's login shell `PATH` (e.g., `$SHELL -ilc` with a short timeout) before the runtime starts.
