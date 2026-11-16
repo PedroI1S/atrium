@@ -7,8 +7,8 @@ M0 spikes are merged as spikes: they answered their questions, but they aren't p
 Each row below starts with its state: ✅ done (with evidence), 🟡 in progress, ⬜ open, ➡️ belongs to a later milestone. Open before the M1 gate:
 - **In progress:** M1-18 (S1/CR-12, P1, K1–K4; K6's finding 6). M1-08L, rodrigo's live Codex checks (X1–X3).
 - **Open blockers:** none outside M1-18.
-- **Open, minor:** S5, S7, S8, S11 (their tests are still ignored); K5; N3 and N6 need Linux runs (rodrigo; M1-19 merged); P2. N5 and L10 are "later".
-- **Decided (D-111):** Linux idle memory < 165 MB; Linux TTI is a gate; the Linux frame statistic counts frames over 1.5 × the interval; `bridge.rs` batching now; damaged messages export marked (CR-16, ✅ M1-25 merged); S5/S7/S8/S11/K5 + four more stores (CR-17) after M1-18; P2 now (CR-18, M1-26 approved, not merged).
+- **Open, minor:** S5, S7, S8, S11 (their tests are still ignored); K5; N3 and N6 need Linux runs (rodrigo; M1-19 merged). N5 and L10 are "later".
+- **Decided (D-111):** Linux idle memory < 165 MB; Linux TTI is a gate; the Linux frame statistic counts frames over 1.5 × the interval; `bridge.rs` batching now; damaged messages export marked (CR-16, ✅ M1-25 merged); S5/S7/S8/S11/K5 + four more stores (CR-17) after M1-18; P2 now (CR-18, ✅ M1-26 merged).
 - **The gate itself (PLAN §8):**
   - the demo end to end, with all checks green;
   - the Argon + Astra security and architecture review;
@@ -160,5 +160,5 @@ For the policy engine, not the adapter (the adapter's own findings are fixed in 
 | # | Sev. | Must fix |
 |---|---|---|
 | P1 | major | 🟡 **In M1-18.** **The policy trusts a search subject's `glob` to stay under its `paths`.** `deny.rs` `search_glob_hit` only looks at probes under the subject's roots, and `Home::evaluate` checks the roots alone, so a `ToolSubject::Paths { paths: [cwd], glob }` whose `glob` is absolute, starts with `~`, climbs with `..`, or does either through braces or a character class (`{a,}/home/…`, `.{.,.}/.ssh/…`, `[.][.]/…`) is allowed although it names files outside every root. M1-07 closes it in the Claude adapter's subject (such patterns become extra paths or `Unknown`), but every adapter builds subjects, so the engine should refuse or ask for a `glob` that can leave its roots. For M1-13's follow-up or the policy's owner; test with the patterns in the round-2 review. |
-| P2 | minor | ⬜ **Open** (minor, bounded by the turn). A ticket opened by an `Ask` whose request is then withdrawn (cancelled, or never followed by `can_use_tool`) stays `pending` in the ledger until the turn ends and counts against `MAX_PENDING_REQUESTS`. The adapter can't withdraw it: `SessionGate` has no call for that. A change request if it ever bites; bounded by the turn today. |
+| P2 | minor | ✅ **Fixed** (M1-26, merged `ea9b93f7`; CR-18, D-111): `SessionGate::withdraw` cancels an open ticket (never approves; idempotent) and frees its `MAX_PENDING_REQUESTS` slot; the Claude and Codex adapters call it on provider cancel, turn end, exit and unmatched asks. Tests fill the limit, withdraw, reopen. |
 
