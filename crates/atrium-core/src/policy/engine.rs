@@ -189,35 +189,35 @@ fn rule_covers_argv(
     }
 }
 
+struct AllowCtx<'a> {
+    input: &'a PolicyInput<'a>,
+    a: &'a Analysis,
+    paths: &'a [PathBuf],
+    glob_leaves: bool,
+    has_derived: bool,
+}
+
 /// Which slots in `unit_ids` (or the whole call when `unit_ids` is empty) an
 /// allow rule covers. When `unit_ids` contains command units, `as_eff` selects
 /// `u.eff` (for wrapper targets) instead of `u.seg.argv`.
-fn allow_covers(
-    rule: &Rule,
-    input: &PolicyInput<'_>,
-    a: &Analysis,
-    paths: &[PathBuf],
-    unit_ids: &[usize],
-    glob_leaves: bool,
-    has_derived: bool,
-    as_eff: bool,
-) -> Vec<bool> {
+fn allow_covers(ctx: &AllowCtx<'_>, rule: &Rule, unit_ids: &[usize], as_eff: bool) -> Vec<bool> {
     let n = unit_ids.len().max(1);
     let none = vec![false; n];
-    if !name_matches(rule, input) || matches!(input.check.subject, ToolSubject::Unknown) {
+    if !name_matches(rule, ctx.input) || matches!(ctx.input.check.subject, ToolSubject::Unknown) {
         return none;
     }
     // D-100: an escaping search glob is covered only by an unscoped `Any` rule.
-    if glob_leaves && !(matches!(rule.matcher, RuleMatcher::Any) && rule.path_scope.is_none()) {
+    if ctx.glob_leaves && !(matches!(rule.matcher, RuleMatcher::Any) && rule.path_scope.is_none()) {
         return none;
     }
-    let command = matches!(input.check.subject, ToolSubject::Command { .. });
+    let command = matches!(ctx.input.check.subject, ToolSubject::Command { .. });
     // an uncertain cwd: only `Any` covers it (contract §9: the line asks)
-    let simple = command && a.reasons.is_empty() && !parts(a).is_empty() && !a.cwd_uncertain;
+    let simple =
+        command && ctx.a.reasons.is_empty() && !parts(ctx.a).is_empty() && !ctx.a.cwd_uncertain;
     if rule.path_scope.is_some() && command && !simple {
         return none;
     }
-    if !path_scope_ok(rule, paths) {
+    if !path_scope_ok(rule, ctx.paths) {
         return none;
     }
     match &rule.matcher {
@@ -229,18 +229,18 @@ fn allow_covers(
             unit_ids
                 .iter()
                 .map(|&i| {
-                    let u = &a.units[i];
+                    let u = &ctx.a.units[i];
                     let argv = if as_eff { &u.eff } else { &u.seg.argv };
                     u.seg.assignments.is_empty()
                         && harmless(u)
-                        && rule_covers_argv(rule, argv, has_derived, as_eff)
+                        && rule_covers_argv(rule, argv, ctx.has_derived, as_eff)
                 })
                 .collect()
         }
         RuleMatcher::PathGlob { glob } => {
-            let ok = !paths.is_empty()
+            let ok = !ctx.paths.is_empty()
                 && (!command || simple)
-                && paths.iter().all(|p| glob_matches(glob, p));
+                && ctx.paths.iter().all(|p| glob_matches(glob, p));
             vec![ok; n]
         }
     }
@@ -289,6 +289,13 @@ fn apply_rules(
         vec![]
     };
     let has_derived = !derived_ids.is_empty();
+    let allow_ctx = AllowCtx {
+        input,
+        a,
+        paths: &paths,
+        glob_leaves,
+        has_derived,
+    };
     let n = part_ids.len().max(1);
     let mut covered = vec![false; n];
     let mut top_non_cmd = vec![false; n];
@@ -320,16 +327,7 @@ fn apply_rules(
             };
         }
         for r in ranked.iter().filter(|r| r.decision == RuleDecision::Allow) {
-            let c = allow_covers(
-                r,
-                input,
-                a,
-                &paths,
-                &part_ids,
-                glob_leaves,
-                has_derived,
-                false,
-            );
+            let c = allow_covers(&allow_ctx, r, &part_ids, false);
             let is_any = matches!(r.matcher, RuleMatcher::Any)
                 && r.path_scope.is_none()
                 && !c.is_empty()
@@ -348,16 +346,7 @@ fn apply_rules(
                 }
             }
             if !derived_ids.is_empty() {
-                let dc = allow_covers(
-                    r,
-                    input,
-                    a,
-                    &paths,
-                    &derived_ids,
-                    glob_leaves,
-                    has_derived,
-                    false,
-                );
+                let dc = allow_covers(&allow_ctx, r, &derived_ids, false);
                 for (slot, hit) in derived_covered.iter_mut().zip(dc) {
                     if hit && !*slot {
                         *slot = true;
@@ -365,16 +354,7 @@ fn apply_rules(
                 }
             }
             if !wrapper_eff_ids.is_empty() {
-                let ec = allow_covers(
-                    r,
-                    input,
-                    a,
-                    &paths,
-                    &wrapper_eff_ids,
-                    glob_leaves,
-                    has_derived,
-                    true,
-                );
+                let ec = allow_covers(&allow_ctx, r, &wrapper_eff_ids, true);
                 for (slot, hit) in eff_covered.iter_mut().zip(ec) {
                     if hit && !*slot {
                         *slot = true;
