@@ -2114,10 +2114,74 @@ fn shell_operand_starts(eff: &[String]) -> Vec<(bool, usize)> {
 
 /// The code a shell is given with `-c` (`sh -c CODE`, `bash -ec CODE`,
 /// `bash -o errexit -c CODE`), under every reading of its options.
-#[derive(Clone, Copy)]
-enum PosRef {
+#[derive(Clone, Debug)]
+enum PosKind {
     Index(usize),
     All,
+    Star,
+    Slice {
+        star: bool,
+        offset: usize,
+        len: Option<usize>,
+    },
+    Unresolvable,
+}
+
+#[derive(Clone, Debug)]
+enum TokenPiece {
+    Raw(String),
+    EmptyQuote(String),
+    Pos {
+        raw: String,
+        kind: PosKind,
+        quoted: bool,
+    },
+    Sub {
+        prefix: String,
+        body: String,
+        suffix: String,
+    },
+    OtherDollar(String),
+}
+
+impl TokenPiece {
+    fn raw_str(&self) -> String {
+        match self {
+            Self::Raw(s) | Self::EmptyQuote(s) | Self::OtherDollar(s) => s.clone(),
+            Self::Pos { raw, .. } => raw.clone(),
+            Self::Sub {
+                prefix,
+                body,
+                suffix,
+            } => format!("{prefix}{body}{suffix}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum WordAnalysis {
+    Plain,
+    SinglePos {
+        kind: PosKind,
+        quoted: bool,
+        has_empty_affix: bool,
+    },
+    UnresolvablePos,
+}
+
+struct PosTok {
+    raw: String,
+    lit: Option<String>,
+    is_assign: bool,
+    ifs_assign: bool,
+    is_redirect: bool,
+    pieces: Vec<TokenPiece>,
+    analysis: WordAnalysis,
+}
+
+enum ScriptItem {
+    Tok(PosTok),
+    Sep(String),
 }
 
 enum PosResolve {
@@ -2126,229 +2190,1190 @@ enum PosResolve {
     Unresolved(Option<String>),
 }
 
-/// Parses a `sh -c` script that consists solely of positional-parameter
-/// expansions (`$0`, `"$1"`, `${0}`, `$@`, `"$*"`, etc.). Returns `None` for
-/// ordinary scripts or named variables, `Some(Err(()))` for unresolvable
-/// positional/special-parameter forms (`${1:-…}`, `$10`, `$#`, `$0foo`).
-fn parse_pos_script(code: &str) -> Option<Result<Vec<(PosRef, bool)>, ()>> {
-    let s = code.trim();
-    if s.is_empty() || !s.contains('$') {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    let n = bytes.len();
-    let mut i = 0;
-    let mut items: Vec<(PosRef, bool)> = vec![];
+fn is_shell_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
 
-    let parse_dollar = |pos: &mut usize, has_items: bool| -> Result<PosRef, Option<()>> {
-        *pos += 1;
-        if *pos >= n {
-            return Err(if has_items { Some(()) } else { None });
+fn is_pos_command_runner(cmd: &str) -> bool {
+    let b = cmd_name(cmd);
+    let b = b.as_ref();
+    is_shell(cmd)
+        || wrapper_opts(b).is_some()
+        || matches!(
+            b,
+            "env"
+                | "arch"
+                | "find"
+                | "script"
+                | "flock"
+                | "eval"
+                | "source"
+                | "."
+                | "sudo"
+                | "sudoedit"
+                | "su"
+                | "doas"
+                | "pkexec"
+                | "run0"
+        )
+}
+
+fn classify_brace_param(inner: &str) -> Option<PosKind> {
+    if inner.is_empty() {
+        return Some(PosKind::Unresolvable);
+    }
+    if inner.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(
+            inner
+                .parse::<usize>()
+                .map(PosKind::Index)
+                .unwrap_or(PosKind::Unresolvable),
+        );
+    }
+    if inner == "@" {
+        return Some(PosKind::All);
+    }
+    if inner == "*" {
+        return Some(PosKind::Star);
+    }
+    if let Some(rest) = inner
+        .strip_prefix("@:")
+        .or_else(|| inner.strip_prefix("*:"))
+    {
+        let star = inner.starts_with('*');
+        let (off_s, len_opt) = match rest.split_once(':') {
+            Some((o, l)) => (o.trim_ascii(), Some(l.trim_ascii())),
+            None => (rest.trim_ascii(), None),
+        };
+        let Ok(offset) = off_s.parse::<usize>() else {
+            return Some(PosKind::Unresolvable);
+        };
+        if offset == 0 {
+            return Some(PosKind::Unresolvable);
         }
-        if bytes[*pos] == b'{' {
-            let start = *pos + 1;
-            let Some(rel_end) = s[start..].find('}') else {
-                return Err(if has_items { Some(()) } else { None });
-            };
-            let end = start + rel_end;
-            let inner = &s[start..end];
-            *pos = end + 1;
-            if inner.is_empty() {
-                return Err(if has_items { Some(()) } else { None });
+        let len = match len_opt {
+            Some(ls) => match ls.parse::<usize>() {
+                Ok(l) => Some(l),
+                Err(_) => return Some(PosKind::Unresolvable),
+            },
+            None => None,
+        };
+        return Some(PosKind::Slice { star, offset, len });
+    }
+    let first = inner.as_bytes()[0];
+    if first.is_ascii_digit() || matches!(first, b'@' | b'*' | b'#' | b'?' | b'-' | b'!' | b'$') {
+        return Some(PosKind::Unresolvable);
+    }
+    None
+}
+
+fn scan_dollar_piece(
+    chars: &[char],
+    i: &mut usize,
+    in_dq: bool,
+    pieces: &mut Vec<TokenPiece>,
+    unterminated: &mut bool,
+) {
+    let n = chars.len();
+    if *i + 1 >= n {
+        pieces.push(TokenPiece::Raw("$".into()));
+        *i += 1;
+        return;
+    }
+    let next = chars[*i + 1];
+    if !in_dq && next == '\'' {
+        let start = *i;
+        *i += 2;
+        while *i < n {
+            if chars[*i] == '\\' && *i + 1 < n {
+                *i += 2;
+            } else if chars[*i] == '\'' {
+                *i += 1;
+                break;
+            } else {
+                *i += 1;
             }
-            if inner.bytes().all(|b| b.is_ascii_digit()) {
-                return inner
-                    .parse::<usize>()
-                    .map(PosRef::Index)
-                    .map_err(|_| Some(()));
-            }
-            if inner == "@" || inner == "*" {
-                return Ok(PosRef::All);
-            }
-            if inner.as_bytes().first().is_some_and(|b| {
-                b.is_ascii_digit() || matches!(b, b'@' | b'*' | b'#' | b'?' | b'-' | b'!' | b'$')
-            }) {
-                return Err(Some(()));
-            }
-            return Err(if has_items { Some(()) } else { None });
         }
-        if bytes[*pos].is_ascii_digit() {
-            if *pos + 1 < n && bytes[*pos + 1].is_ascii_digit() {
-                return Err(Some(()));
-            }
-            let idx = (bytes[*pos] - b'0') as usize;
-            *pos += 1;
-            return Ok(PosRef::Index(idx));
+        pieces.push(TokenPiece::Raw(chars[start..*i].iter().collect()));
+        return;
+    }
+    if next == '(' {
+        let is_arith = chars.get(*i + 2) == Some(&'(');
+        let (body, end, ok) = scan_paren(chars, *i + 2);
+        *i = end;
+        if !ok {
+            *unterminated = true;
         }
-        if matches!(bytes[*pos], b'@' | b'*') {
-            *pos += 1;
-            return Ok(PosRef::All);
+        if is_arith {
+            pieces.push(TokenPiece::OtherDollar(format!("$({body})")));
+        } else {
+            pieces.push(TokenPiece::Sub {
+                prefix: "$(".into(),
+                body,
+                suffix: ")".into(),
+            });
         }
-        if matches!(bytes[*pos], b'#' | b'?' | b'-' | b'!' | b'$') {
-            return Err(Some(()));
+        return;
+    }
+    if next == '{' {
+        let (inner, j, closed) = scan_dollar_brace(chars, *i + 2, in_dq);
+        *i = if closed {
+            (j + 1).min(n)
+        } else {
+            *unterminated = true;
+            n
+        };
+        let raw = if closed {
+            format!("${{{inner}}}")
+        } else {
+            format!("${{{inner}")
+        };
+        match classify_brace_param(&inner) {
+            Some(kind) => pieces.push(TokenPiece::Pos {
+                raw,
+                kind,
+                quoted: in_dq,
+            }),
+            None => pieces.push(TokenPiece::OtherDollar(raw)),
         }
-        Err(if has_items { Some(()) } else { None })
+        return;
+    }
+    if next.is_ascii_digit() {
+        let mut end = *i + 2;
+        while end < n && chars[end].is_ascii_digit() {
+            end += 1;
+        }
+        let kind = if end > *i + 2 {
+            PosKind::Unresolvable
+        } else {
+            PosKind::Index((next as u8 - b'0') as usize)
+        };
+        let raw: String = chars[*i..end].iter().collect();
+        *i = end;
+        pieces.push(TokenPiece::Pos {
+            raw,
+            kind,
+            quoted: in_dq,
+        });
+        return;
+    }
+    if next == '@' {
+        *i += 2;
+        pieces.push(TokenPiece::Pos {
+            raw: "$@".into(),
+            kind: PosKind::All,
+            quoted: in_dq,
+        });
+        return;
+    }
+    if next == '*' {
+        *i += 2;
+        pieces.push(TokenPiece::Pos {
+            raw: "$*".into(),
+            kind: PosKind::Star,
+            quoted: in_dq,
+        });
+        return;
+    }
+    if matches!(next, '#' | '?' | '-' | '!' | '$') {
+        *i += 2;
+        pieces.push(TokenPiece::Pos {
+            raw: format!("${next}"),
+            kind: PosKind::Unresolvable,
+            quoted: in_dq,
+        });
+        return;
+    }
+    if next.is_ascii_alphabetic() || next == '_' {
+        let mut end = *i + 2;
+        while end < n && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+            end += 1;
+        }
+        let raw: String = chars[*i..end].iter().collect();
+        *i = end;
+        pieces.push(TokenPiece::OtherDollar(raw));
+        return;
+    }
+    *i += 1;
+    pieces.push(TokenPiece::Raw("$".into()));
+}
+
+fn scan_pos_word(chars: &[char], i: &mut usize) -> PosTok {
+    let n = chars.len();
+    let start = *i;
+    let mut pieces: Vec<TokenPiece> = vec![];
+    let mut lit = String::new();
+    let mut lit_valid = true;
+    let mut unterminated = false;
+
+    let push_raw = |pieces: &mut Vec<TokenPiece>, ch: char| {
+        if let Some(TokenPiece::Raw(s)) = pieces.last_mut() {
+            s.push(ch);
+        } else {
+            pieces.push(TokenPiece::Raw(ch.to_string()));
+        }
     };
 
-    while i < n {
-        while i < n && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= n {
+    while *i < n {
+        let c = chars[*i];
+        if matches!(c, ' ' | '\t' | '\r' | '\n' | ';' | '&' | '|' | '(' | ')')
+            || ((c == '<' || c == '>') && chars.get(*i + 1) != Some(&'('))
+        {
             break;
         }
-        if bytes[i] == b'"' {
-            i += 1;
-            let mut in_quote_items = false;
-            loop {
-                while i < n && bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                if i >= n {
-                    return if !items.is_empty() {
-                        Some(Err(()))
-                    } else {
-                        None
-                    };
-                }
-                if bytes[i] == b'"' {
-                    if !in_quote_items {
-                        return None;
+        match c {
+            '\\' => {
+                if let Some(&nxt) = chars.get(*i + 1) {
+                    if nxt != '\n' {
+                        lit.push(nxt);
                     }
-                    i += 1;
-                    break;
+                    push_raw(&mut pieces, '\\');
+                    push_raw(&mut pieces, nxt);
+                    *i += 2;
+                } else {
+                    push_raw(&mut pieces, '\\');
+                    *i += 1;
                 }
-                if bytes[i] != b'$' {
-                    return None;
-                }
-                match parse_dollar(&mut i, !items.is_empty()) {
-                    Ok(r) => {
-                        items.push((r, true));
-                        in_quote_items = true;
+            }
+            '\'' => {
+                let q_start = *i;
+                *i += 1;
+                let mut content = String::new();
+                let mut closed = false;
+                while *i < n {
+                    if chars[*i] == '\'' {
+                        closed = true;
+                        *i += 1;
+                        break;
                     }
-                    Err(Some(())) => return Some(Err(())),
-                    Err(None) => return None,
+                    content.push(chars[*i]);
+                    *i += 1;
                 }
-                if i < n && bytes[i] != b'"' && !bytes[i].is_ascii_whitespace() {
-                    return Some(Err(()));
+                if !closed {
+                    unterminated = true;
+                }
+                let raw_seg: String = chars[q_start..*i].iter().collect();
+                if content.is_empty() && closed {
+                    pieces.push(TokenPiece::EmptyQuote(raw_seg));
+                } else {
+                    lit.push_str(&content);
+                    pieces.push(TokenPiece::Raw(raw_seg));
                 }
             }
-            if i < n && !bytes[i].is_ascii_whitespace() {
-                return if matches!(bytes[i], b';' | b'|' | b'&' | b'<' | b'>') {
-                    None
+            '"' => {
+                let q_start = *i;
+                *i += 1;
+                let mut inner_pieces: Vec<TokenPiece> = vec![];
+                let mut closed = false;
+                while *i < n {
+                    match chars[*i] {
+                        '"' => {
+                            closed = true;
+                            *i += 1;
+                            break;
+                        }
+                        '\\' if matches!(
+                            chars.get(*i + 1),
+                            Some('$' | '`' | '"' | '\\' | '\n')
+                        ) =>
+                        {
+                            let nxt = chars[*i + 1];
+                            if nxt != '\n' {
+                                lit.push(nxt);
+                            }
+                            push_raw(&mut inner_pieces, '\\');
+                            push_raw(&mut inner_pieces, nxt);
+                            *i += 2;
+                        }
+                        '$' => {
+                            lit_valid = false;
+                            scan_dollar_piece(chars, i, true, &mut inner_pieces, &mut unterminated);
+                        }
+                        '`' => {
+                            lit_valid = false;
+                            let (body, end, ok) = scan_backtick(chars, *i + 1);
+                            *i = end;
+                            if !ok {
+                                unterminated = true;
+                            }
+                            inner_pieces.push(TokenPiece::Sub {
+                                prefix: "`".into(),
+                                body,
+                                suffix: "`".into(),
+                            });
+                        }
+                        ch => {
+                            lit.push(ch);
+                            push_raw(&mut inner_pieces, ch);
+                            *i += 1;
+                        }
+                    }
+                }
+                if !closed {
+                    unterminated = true;
+                }
+                if inner_pieces.is_empty() && closed {
+                    pieces.push(TokenPiece::EmptyQuote(chars[q_start..*i].iter().collect()));
+                } else if closed
+                    && inner_pieces.len() == 1
+                    && matches!(inner_pieces[0], TokenPiece::Pos { .. })
+                {
+                    pieces.extend(inner_pieces);
                 } else {
-                    Some(Err(()))
-                };
+                    let mut raw_dq = String::from("\"");
+                    for p in inner_pieces {
+                        match p {
+                            TokenPiece::Pos { raw, kind, .. } => {
+                                if !raw_dq.is_empty() {
+                                    pieces.push(TokenPiece::Raw(std::mem::take(&mut raw_dq)));
+                                }
+                                pieces.push(TokenPiece::Pos {
+                                    raw,
+                                    kind,
+                                    quoted: true,
+                                });
+                            }
+                            TokenPiece::Sub {
+                                prefix,
+                                body,
+                                suffix,
+                            } => {
+                                if !raw_dq.is_empty() {
+                                    pieces.push(TokenPiece::Raw(std::mem::take(&mut raw_dq)));
+                                }
+                                pieces.push(TokenPiece::Sub {
+                                    prefix,
+                                    body,
+                                    suffix,
+                                });
+                            }
+                            other => raw_dq.push_str(&other.raw_str()),
+                        }
+                    }
+                    if closed {
+                        raw_dq.push('"');
+                    }
+                    if !raw_dq.is_empty() {
+                        pieces.push(TokenPiece::Raw(raw_dq));
+                    }
+                }
             }
-        } else if bytes[i] == b'$' {
-            match parse_dollar(&mut i, !items.is_empty()) {
-                Ok(r) => items.push((r, false)),
-                Err(Some(())) => return Some(Err(())),
-                Err(None) => return None,
+            '$' => {
+                let before = pieces.len();
+                scan_dollar_piece(chars, i, false, &mut pieces, &mut unterminated);
+                if !matches!(pieces.get(before), Some(TokenPiece::Raw(_)))
+                    || chars.get(start) == Some(&'$')
+                {
+                    lit_valid = false;
+                }
             }
-            if i < n && !bytes[i].is_ascii_whitespace() {
-                return if matches!(bytes[i], b';' | b'|' | b'&' | b'<' | b'>') {
-                    None
-                } else {
-                    Some(Err(()))
-                };
+            '`' => {
+                lit_valid = false;
+                let (body, end, ok) = scan_backtick(chars, *i + 1);
+                *i = end;
+                if !ok {
+                    unterminated = true;
+                }
+                pieces.push(TokenPiece::Sub {
+                    prefix: "`".into(),
+                    body,
+                    suffix: "`".into(),
+                });
             }
-        } else {
-            return None;
+            '<' | '>' => {
+                lit_valid = false;
+                let (body, end, ok) = scan_paren(chars, *i + 2);
+                *i = end;
+                if !ok {
+                    unterminated = true;
+                }
+                pieces.push(TokenPiece::Sub {
+                    prefix: format!("{c}("),
+                    body,
+                    suffix: ")".into(),
+                });
+            }
+            ch => {
+                lit.push(ch);
+                push_raw(&mut pieces, ch);
+                *i += 1;
+            }
         }
     }
 
-    if items.is_empty() {
-        None
+    let raw: String = chars[start..*i].iter().collect();
+    let has_pos = pieces.iter().any(|p| matches!(p, TokenPiece::Pos { .. }));
+    let analysis = if !has_pos {
+        WordAnalysis::Plain
+    } else if unterminated {
+        WordAnalysis::UnresolvablePos
     } else {
-        Some(Ok(items))
+        let mut pos_count = 0usize;
+        let mut only_empty_affixes = true;
+        let mut has_empty_affix = false;
+        let mut found: Option<(PosKind, bool)> = None;
+        for p in &pieces {
+            match p {
+                TokenPiece::EmptyQuote(_) => has_empty_affix = true,
+                TokenPiece::Pos { kind, quoted, .. } => {
+                    pos_count += 1;
+                    found = Some((kind.clone(), *quoted));
+                }
+                TokenPiece::Raw(s) if s.is_empty() => {}
+                _ => {
+                    only_empty_affixes = false;
+                    break;
+                }
+            }
+        }
+        if only_empty_affixes && pos_count == 1 {
+            let (kind, quoted) = found.expect("pos_count == 1");
+            if matches!(kind, PosKind::Unresolvable) {
+                WordAnalysis::UnresolvablePos
+            } else {
+                WordAnalysis::SinglePos {
+                    kind,
+                    quoted,
+                    has_empty_affix,
+                }
+            }
+        } else {
+            WordAnalysis::UnresolvablePos
+        }
+    };
+
+    let eq_lhs = raw.split_once('=').map(|(lhs, _)| lhs);
+    let is_assign = eq_lhs.is_some_and(is_shell_ident);
+    let ifs_assign = eq_lhs == Some("IFS");
+    PosTok {
+        raw,
+        lit: lit_valid.then_some(lit),
+        is_assign,
+        ifs_assign,
+        is_redirect: false,
+        pieces,
+        analysis,
     }
 }
 
-fn resolve_positional_script(code: &str, pos: &[String]) -> PosResolve {
-    let items = match parse_pos_script(code) {
-        None => return PosResolve::Plain,
-        Some(Err(())) => return PosResolve::Unresolved(None),
-        Some(Ok(v)) => v,
+fn scan_pos_script(code: &str) -> Vec<ScriptItem> {
+    let chars: Vec<char> = code.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    let mut items: Vec<ScriptItem> = vec![];
+    let mut expect_redirect_target = false;
+    let mut pending_heredocs: Vec<(String, bool)> = vec![];
+
+    let is_delim_after = |idx: usize| -> bool {
+        idx >= n
+            || matches!(
+                chars[idx],
+                ' ' | '\t' | '\r' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>'
+            )
     };
 
-    if let [(r, quoted)] = items.as_slice() {
-        return match r {
-            PosRef::Index(idx) => {
-                let Some(val) = pos.get(*idx) else {
-                    return PosResolve::Unresolved(None);
-                };
-                if val.contains(['$', '`']) {
-                    PosResolve::Unresolved(Some(val.clone()))
-                } else {
-                    PosResolve::Resolved(val.clone())
-                }
-            }
-            PosRef::All => {
-                if pos.len() <= 1 {
-                    return PosResolve::Unresolved(None);
-                }
-                let args = &pos[1..];
-                let has_var = args.iter().any(|w| w.contains(['$', '`']));
-                let resolved = if args.len() == 1 {
-                    args[0].clone()
-                } else if *quoted {
-                    args.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" ")
-                } else {
-                    let parts: Vec<String> = args
-                        .iter()
-                        .flat_map(|w| w.split_ascii_whitespace())
-                        .map(quote)
-                        .collect();
-                    if parts.is_empty() {
-                        return PosResolve::Unresolved(None);
-                    }
-                    parts.join(" ")
-                };
-                if has_var {
-                    PosResolve::Unresolved(Some(resolved))
-                } else {
-                    PosResolve::Resolved(resolved)
-                }
-            }
-        };
-    }
-
-    let mut words: Vec<String> = vec![];
-    let mut has_var = false;
-    for (r, quoted) in items {
-        match r {
-            PosRef::Index(idx) => {
-                let Some(val) = pos.get(idx) else {
-                    return PosResolve::Unresolved(None);
-                };
-                has_var |= val.contains(['$', '`']);
-                if quoted {
-                    words.push(quote(val));
-                } else {
-                    words.extend(val.split_ascii_whitespace().map(quote));
-                }
-            }
-            PosRef::All => {
-                if pos.len() > 1 {
-                    for val in &pos[1..] {
-                        has_var |= val.contains(['$', '`']);
-                        if quoted {
-                            words.push(quote(val));
-                        } else {
-                            words.extend(val.split_ascii_whitespace().map(quote));
+    while i < n {
+        let c = chars[i];
+        if matches!(c, ' ' | '\t' | '\r') {
+            i += 1;
+            continue;
+        }
+        if c == '\n' {
+            i += 1;
+            expect_redirect_target = false;
+            items.push(ScriptItem::Sep("\n".into()));
+            if !pending_heredocs.is_empty() {
+                let delims = std::mem::take(&mut pending_heredocs);
+                for (delim, strip_tabs) in delims {
+                    while i < n {
+                        let line_start = i;
+                        while i < n && chars[i] != '\n' {
+                            i += 1;
+                        }
+                        let mut line: String = chars[line_start..i].iter().collect();
+                        if strip_tabs {
+                            line = line.trim_start_matches('\t').to_string();
+                        }
+                        if i < n && chars[i] == '\n' {
+                            i += 1;
+                        }
+                        if line == delim {
+                            break;
                         }
                     }
                 }
             }
+            continue;
+        }
+        if c == '#' {
+            while i < n && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == ';' {
+            expect_redirect_target = false;
+            let sep = if chars.get(i + 1) == Some(&';') && chars.get(i + 2) == Some(&'&') {
+                i += 3;
+                ";;&"
+            } else if chars.get(i + 1) == Some(&';') {
+                i += 2;
+                ";;"
+            } else if chars.get(i + 1) == Some(&'&') {
+                i += 2;
+                ";&"
+            } else {
+                i += 1;
+                ";"
+            };
+            items.push(ScriptItem::Sep(sep.into()));
+            continue;
+        }
+        if c == '&' {
+            if chars.get(i + 1) == Some(&'>') {
+                let end = if chars.get(i + 2) == Some(&'>') {
+                    i + 3
+                } else {
+                    i + 2
+                };
+                let raw: String = chars[i..end].iter().collect();
+                i = end;
+                expect_redirect_target = true;
+                items.push(ScriptItem::Tok(PosTok {
+                    raw,
+                    lit: None,
+                    is_assign: false,
+                    ifs_assign: false,
+                    is_redirect: true,
+                    pieces: vec![],
+                    analysis: WordAnalysis::Plain,
+                }));
+                continue;
+            }
+            expect_redirect_target = false;
+            let sep = if chars.get(i + 1) == Some(&'&') {
+                i += 2;
+                "&&"
+            } else {
+                i += 1;
+                "&"
+            };
+            items.push(ScriptItem::Sep(sep.into()));
+            continue;
+        }
+        if c == '|' {
+            expect_redirect_target = false;
+            let sep = if chars.get(i + 1) == Some(&'|') {
+                i += 2;
+                "||"
+            } else if chars.get(i + 1) == Some(&'&') {
+                i += 2;
+                "|&"
+            } else {
+                i += 1;
+                "|"
+            };
+            items.push(ScriptItem::Sep(sep.into()));
+            continue;
+        }
+        if c == '(' || c == ')' {
+            expect_redirect_target = false;
+            i += 1;
+            items.push(ScriptItem::Sep(c.to_string()));
+            continue;
+        }
+        if (c == '{' || c == '}') && is_delim_after(i + 1) {
+            expect_redirect_target = false;
+            i += 1;
+            items.push(ScriptItem::Sep(c.to_string()));
+            continue;
+        }
+
+        let mut d_end = i;
+        while d_end < n && chars[d_end].is_ascii_digit() {
+            d_end += 1;
+        }
+        if d_end < n
+            && (chars[d_end] == '<' || chars[d_end] == '>')
+            && chars.get(d_end + 1) != Some(&'(')
+        {
+            let op_start = d_end;
+            let op_c = chars[op_start];
+            let mut end = op_start + 1;
+            let mut is_heredoc = false;
+            let mut strip_tabs = false;
+            let mut needs_target = true;
+            if op_c == '<' && chars.get(end) == Some(&'<') {
+                end += 1;
+                if chars.get(end) == Some(&'<') {
+                    end += 1;
+                } else {
+                    is_heredoc = true;
+                    if chars.get(end) == Some(&'-') {
+                        end += 1;
+                        strip_tabs = true;
+                    }
+                }
+            } else if op_c == '>' && matches!(chars.get(end), Some('>' | '|')) {
+                end += 1;
+            } else if (op_c == '<' || op_c == '>') && chars.get(end) == Some(&'&') {
+                end += 1;
+                let mut f_end = end;
+                while f_end < n && (chars[f_end].is_ascii_digit() || chars[f_end] == '-') {
+                    f_end += 1;
+                }
+                if f_end > end {
+                    end = f_end;
+                    needs_target = false;
+                }
+            } else if op_c == '<' && chars.get(end) == Some(&'>') {
+                end += 1;
+            }
+            let raw: String = chars[i..end].iter().collect();
+            i = end;
+            items.push(ScriptItem::Tok(PosTok {
+                raw,
+                lit: None,
+                is_assign: false,
+                ifs_assign: false,
+                is_redirect: true,
+                pieces: vec![],
+                analysis: WordAnalysis::Plain,
+            }));
+            if is_heredoc {
+                while i < n && matches!(chars[i], ' ' | '\t') {
+                    i += 1;
+                }
+                if i < n && !matches!(chars[i], '\n' | ';' | '&' | '|' | '(' | ')') {
+                    let mut dtok = scan_pos_word(&chars, &mut i);
+                    dtok.is_redirect = true;
+                    if let Some(d) = dtok.lit.clone() {
+                        pending_heredocs.push((d, strip_tabs));
+                    }
+                    items.push(ScriptItem::Tok(dtok));
+                }
+            } else if needs_target {
+                expect_redirect_target = true;
+            }
+            continue;
+        }
+
+        let mut tok = scan_pos_word(&chars, &mut i);
+        if expect_redirect_target {
+            tok.is_redirect = true;
+            expect_redirect_target = false;
+        }
+        items.push(ScriptItem::Tok(tok));
+    }
+    items
+}
+
+fn expand_single_pos(
+    kind: &PosKind,
+    quoted: bool,
+    has_empty_affix: bool,
+    cur_pos: Option<&[String]>,
+    ifs_dirty: bool,
+) -> Result<Vec<String>, Option<Vec<String>>> {
+    let Some(pos) = cur_pos else {
+        return Err(None);
+    };
+    let is_star = matches!(kind, PosKind::Star | PosKind::Slice { star: true, .. });
+    if ifs_dirty && (!quoted || is_star) {
+        return Err(None);
+    }
+    let vals: Vec<&str> = match kind {
+        PosKind::Index(idx) => {
+            let Some(v) = pos.get(*idx) else {
+                return Err(None);
+            };
+            vec![v.as_str()]
+        }
+        PosKind::All | PosKind::Star => {
+            if pos.len() <= 1 {
+                return Err(None);
+            }
+            pos[1..].iter().map(String::as_str).collect()
+        }
+        PosKind::Slice { offset, len, .. } => {
+            if *offset == 0 || *offset >= pos.len() {
+                return Err(None);
+            }
+            let slice = &pos[*offset..];
+            let taken = match len {
+                Some(l) => &slice[..(*l).min(slice.len())],
+                None => slice,
+            };
+            if taken.is_empty() {
+                return Err(None);
+            }
+            taken.iter().map(String::as_str).collect()
+        }
+        PosKind::Unresolvable => return Err(None),
+    };
+
+    let has_var = vals.iter().any(|v| v.contains(['$', '`']));
+    if quoted {
+        let words: Vec<String> = if is_star {
+            vec![vals.join(" ")]
+        } else {
+            vals.into_iter().map(str::to_string).collect()
+        };
+        let quoted_words: Vec<String> = words.iter().map(|w| quote(w)).collect();
+        if has_var {
+            Err(Some(quoted_words))
+        } else {
+            Ok(quoted_words)
+        }
+    } else {
+        let has_glob = vals.iter().any(|v| v.contains(['*', '?', '[']));
+        let split_words: Vec<String> = vals
+            .iter()
+            .flat_map(|v| v.split_ascii_whitespace().map(str::to_string))
+            .collect();
+        if split_words.is_empty() {
+            return Err(None);
+        }
+        let quoted_words: Vec<String> = split_words.iter().map(|w| quote(w)).collect();
+        let affix_unsafe = has_empty_affix
+            && (vals[0].is_empty()
+                || vals[0].starts_with(|c: char| c.is_ascii_whitespace())
+                || vals.last().is_some_and(|l| {
+                    l.is_empty() || l.ends_with(|c: char| c.is_ascii_whitespace())
+                }));
+        if has_var || has_glob || affix_unsafe {
+            Err(Some(quoted_words))
+        } else {
+            Ok(quoted_words)
         }
     }
-    if words.is_empty() {
+}
+
+fn apply_set_builtin(
+    args: &[&PosTok],
+    cur_pos: &mut Option<Vec<String>>,
+    ifs_dirty: bool,
+    conditional: bool,
+) -> Result<bool, ()> {
+    if args.is_empty() {
+        return Ok(false);
+    }
+    let mut k = 0;
+    let mut sets_params = false;
+    while k < args.len() {
+        let tok = args[k];
+        if !matches!(tok.analysis, WordAnalysis::Plain) {
+            return Err(());
+        }
+        let Some(lit) = tok.lit.as_deref() else {
+            return Err(());
+        };
+        if lit == "--" || lit == "-" {
+            sets_params = true;
+            k += 1;
+            break;
+        }
+        if lit.starts_with('-') || lit.starts_with('+') {
+            if matches!(lit, "-o" | "+o") {
+                k += 2;
+                continue;
+            }
+            k += 1;
+            continue;
+        }
+        sets_params = true;
+        break;
+    }
+    if !sets_params {
+        return Ok(false);
+    }
+    if conditional {
+        *cur_pos = None;
+        return Err(());
+    }
+    let Some(base_pos) = cur_pos.as_deref() else {
+        return Err(());
+    };
+    let mut new_pos = vec![base_pos.first().cloned().unwrap_or_default()];
+    for tok in &args[k..] {
+        match &tok.analysis {
+            WordAnalysis::Plain => {
+                let Some(lit) = tok.lit.as_deref() else {
+                    *cur_pos = None;
+                    return Err(());
+                };
+                if tok.raw.contains(['*', '?', '[']) && !tok.raw.starts_with(['\'', '"']) {
+                    *cur_pos = None;
+                    return Err(());
+                }
+                new_pos.push(lit.to_string());
+            }
+            WordAnalysis::SinglePos {
+                kind,
+                quoted,
+                has_empty_affix,
+            } => {
+                let Ok(expanded) =
+                    expand_single_pos(kind, *quoted, *has_empty_affix, Some(base_pos), ifs_dirty)
+                else {
+                    *cur_pos = None;
+                    return Err(());
+                };
+                for q in expanded {
+                    new_pos.extend(lex(&q).units.into_iter().flat_map(|u| u.seg.argv));
+                }
+            }
+            WordAnalysis::UnresolvablePos => {
+                *cur_pos = None;
+                return Err(());
+            }
+        }
+    }
+    *cur_pos = Some(new_pos);
+    Ok(true)
+}
+
+fn rebuild_plain_tok(
+    t: &PosTok,
+    cur_pos: Option<&[String]>,
+    depth: u8,
+    any_pos_touched: &mut bool,
+    unresolvable: &mut bool,
+) -> String {
+    if t.pieces.is_empty() {
+        return t.raw.clone();
+    }
+    let mut s = String::new();
+    for p in &t.pieces {
+        match p {
+            TokenPiece::Sub {
+                prefix,
+                body,
+                suffix,
+            } => match resolve_positional_script_depth(body, cur_pos, depth + 1) {
+                PosResolve::Plain => {
+                    s.push_str(prefix);
+                    s.push_str(body);
+                    s.push_str(suffix);
+                }
+                PosResolve::Resolved(r) => {
+                    *any_pos_touched = true;
+                    s.push_str(prefix);
+                    s.push_str(&r);
+                    s.push_str(suffix);
+                }
+                PosResolve::Unresolved(opt) => {
+                    *any_pos_touched = true;
+                    *unresolvable = true;
+                    s.push_str(prefix);
+                    s.push_str(opt.as_deref().unwrap_or(body));
+                    s.push_str(suffix);
+                }
+            },
+            other => s.push_str(&other.raw_str()),
+        }
+    }
+    s
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_tok_list(
+    slice: &[&PosTok],
+    cur_pos: Option<&[String]>,
+    ifs_dirty: bool,
+    depth: u8,
+    any_pos_touched: &mut bool,
+    unresolvable: &mut bool,
+    words: &mut Vec<String>,
+) {
+    for t in slice {
+        match &t.analysis {
+            WordAnalysis::Plain => words.push(rebuild_plain_tok(
+                t,
+                cur_pos,
+                depth,
+                any_pos_touched,
+                unresolvable,
+            )),
+            WordAnalysis::SinglePos {
+                kind,
+                quoted,
+                has_empty_affix,
+            } => {
+                *any_pos_touched = true;
+                match expand_single_pos(kind, *quoted, *has_empty_affix, cur_pos, ifs_dirty) {
+                    Ok(ws) => words.extend(ws),
+                    Err(opt) => {
+                        *unresolvable = true;
+                        if let Some(ws) = opt {
+                            words.extend(ws);
+                        } else {
+                            words.push(t.raw.clone());
+                        }
+                    }
+                }
+            }
+            WordAnalysis::UnresolvablePos => {
+                *any_pos_touched = true;
+                *unresolvable = true;
+                words.push(t.raw.clone());
+            }
+        }
+    }
+}
+
+fn resolve_positional_script(code: &str, pos: &[String]) -> PosResolve {
+    resolve_positional_script_depth(code, Some(pos), 0)
+}
+
+fn resolve_positional_script_depth(
+    code: &str,
+    init_pos: Option<&[String]>,
+    depth: u8,
+) -> PosResolve {
+    if !code.contains('$') {
+        return PosResolve::Plain;
+    }
+    if depth > 4 {
         return PosResolve::Unresolved(None);
     }
-    let resolved = words.join(" ");
-    if has_var {
-        PosResolve::Unresolved(Some(resolved))
+
+    let items = scan_pos_script(code);
+    let mut cur_pos: Option<Vec<String>> = init_pos.map(<[String]>::to_vec);
+    let mut ifs_dirty = false;
+    let mut cond_depth: usize = 0;
+    let mut paren_depth: usize = 0;
+
+    let mut any_pos_touched = false;
+    let mut unresolvable = false;
+    let mut out_parts: Vec<String> = vec![];
+
+    let mut idx = 0;
+    let mut prev_sep: Option<&str> = None;
+    while idx < items.len() {
+        match &items[idx] {
+            ScriptItem::Sep(sep) => {
+                match sep.as_str() {
+                    "(" => paren_depth += 1,
+                    ")" => paren_depth = paren_depth.saturating_sub(1),
+                    _ => {}
+                }
+                if !out_parts.is_empty()
+                    && !matches!(
+                        out_parts.last().map(String::as_str),
+                        Some(";" | "\n" | "&&" | "||" | "|" | "|&" | "&" | "(" | "{")
+                    )
+                {
+                    out_parts.push(sep.clone());
+                } else if matches!(sep.as_str(), "(" | ")" | "{" | "}") {
+                    out_parts.push(sep.clone());
+                }
+                prev_sep = Some(sep.as_str());
+                idx += 1;
+            }
+            ScriptItem::Tok(_) => {
+                let start = idx;
+                while idx < items.len() && matches!(items[idx], ScriptItem::Tok(_)) {
+                    idx += 1;
+                }
+                let next_sep = match items.get(idx) {
+                    Some(ScriptItem::Sep(s)) => Some(s.as_str()),
+                    _ => None,
+                };
+                let toks: Vec<&PosTok> = items[start..idx]
+                    .iter()
+                    .filter_map(|it| match it {
+                        ScriptItem::Tok(t) => Some(t),
+                        ScriptItem::Sep(_) => None,
+                    })
+                    .collect();
+
+                if toks.iter().any(|t| t.ifs_assign) {
+                    ifs_dirty = true;
+                }
+
+                let mut prefix_out: Vec<String> = vec![];
+                let mut cmd_idx = 0;
+                let mut in_for_header = false;
+                let mut is_closing_kw = false;
+                while cmd_idx < toks.len() {
+                    let t = toks[cmd_idx];
+                    if t.is_redirect || t.is_assign {
+                        cmd_idx += 1;
+                        continue;
+                    }
+                    let lit = t.lit.as_deref();
+                    if matches!(
+                        lit,
+                        Some("if" | "case" | "while" | "until" | "for" | "select")
+                    ) {
+                        cond_depth += 1;
+                        if matches!(lit, Some("for" | "select" | "case")) {
+                            in_for_header = true;
+                            break;
+                        }
+                        cmd_idx += 1;
+                        continue;
+                    }
+                    if matches!(
+                        lit,
+                        Some("then" | "elif" | "else" | "do" | "time" | "!" | "coproc")
+                    ) {
+                        cmd_idx += 1;
+                        continue;
+                    }
+                    if matches!(lit, Some("fi" | "done" | "esac")) {
+                        cond_depth = cond_depth.saturating_sub(1);
+                        is_closing_kw = true;
+                        break;
+                    }
+                    break;
+                }
+
+                let in_conditional = cond_depth > 0
+                    || paren_depth > 0
+                    || matches!(prev_sep, Some("&&" | "||" | "|" | "|&"))
+                    || matches!(next_sep, Some("|" | "|&"));
+
+                if in_for_header || is_closing_kw || cmd_idx >= toks.len() {
+                    for t in &toks {
+                        out_parts.push(rebuild_plain_tok(
+                            t,
+                            cur_pos.as_deref(),
+                            depth,
+                            &mut any_pos_touched,
+                            &mut unresolvable,
+                        ));
+                    }
+                    continue;
+                }
+
+                let cmd_tok = toks[cmd_idx];
+                let mut stmt_omitted = false;
+                let mut stmt_words: Vec<String> = vec![];
+
+                for t in &toks[..cmd_idx] {
+                    prefix_out.push(rebuild_plain_tok(
+                        t,
+                        cur_pos.as_deref(),
+                        depth,
+                        &mut any_pos_touched,
+                        &mut unresolvable,
+                    ));
+                }
+
+                match &cmd_tok.analysis {
+                    WordAnalysis::Plain => {
+                        let cmd_lit = cmd_tok.lit.as_deref();
+                        if cmd_lit == Some("shift") && cmd_idx + 2 >= toks.len() {
+                            let shift_n = if cmd_idx + 1 == toks.len() {
+                                Some(1usize)
+                            } else {
+                                toks[cmd_idx + 1]
+                                    .lit
+                                    .as_deref()
+                                    .and_then(|s| s.parse::<usize>().ok())
+                            };
+                            match (in_conditional, shift_n, cur_pos.as_mut()) {
+                                (false, Some(n), Some(p)) if p.len() > n => {
+                                    p.drain(1..1 + n);
+                                    stmt_omitted = true;
+                                }
+                                _ => {
+                                    cur_pos = None;
+                                    for t in &toks[cmd_idx..] {
+                                        stmt_words.push(rebuild_plain_tok(
+                                            t,
+                                            cur_pos.as_deref(),
+                                            depth,
+                                            &mut any_pos_touched,
+                                            &mut unresolvable,
+                                        ));
+                                    }
+                                }
+                            }
+                        } else if cmd_lit == Some("set") {
+                            match apply_set_builtin(
+                                &toks[cmd_idx + 1..],
+                                &mut cur_pos,
+                                ifs_dirty,
+                                in_conditional,
+                            ) {
+                                Ok(true) => stmt_omitted = true,
+                                Ok(false) | Err(()) => {
+                                    for t in &toks[cmd_idx..] {
+                                        stmt_words.push(rebuild_plain_tok(
+                                            t,
+                                            cur_pos.as_deref(),
+                                            depth,
+                                            &mut any_pos_touched,
+                                            &mut unresolvable,
+                                        ));
+                                    }
+                                }
+                            }
+                        } else if cmd_lit.is_some_and(is_pos_command_runner) {
+                            stmt_words.push(rebuild_plain_tok(
+                                cmd_tok,
+                                cur_pos.as_deref(),
+                                depth,
+                                &mut any_pos_touched,
+                                &mut unresolvable,
+                            ));
+                            expand_tok_list(
+                                &toks[cmd_idx + 1..],
+                                cur_pos.as_deref(),
+                                ifs_dirty,
+                                depth,
+                                &mut any_pos_touched,
+                                &mut unresolvable,
+                                &mut stmt_words,
+                            );
+                        } else {
+                            for t in &toks[cmd_idx..] {
+                                stmt_words.push(rebuild_plain_tok(
+                                    t,
+                                    cur_pos.as_deref(),
+                                    depth,
+                                    &mut any_pos_touched,
+                                    &mut unresolvable,
+                                ));
+                            }
+                        }
+                    }
+                    WordAnalysis::SinglePos { .. } | WordAnalysis::UnresolvablePos => {
+                        expand_tok_list(
+                            &toks[cmd_idx..],
+                            cur_pos.as_deref(),
+                            ifs_dirty,
+                            depth,
+                            &mut any_pos_touched,
+                            &mut unresolvable,
+                            &mut stmt_words,
+                        );
+                    }
+                }
+
+                if !stmt_omitted {
+                    out_parts.extend(prefix_out);
+                    out_parts.extend(stmt_words);
+                }
+            }
+        }
+    }
+
+    if !any_pos_touched && !unresolvable {
+        return PosResolve::Plain;
+    }
+    let resolved = out_parts.join(" ");
+    if unresolvable {
+        PosResolve::Unresolved((!resolved.trim().is_empty()).then_some(resolved))
+    } else if resolved.trim().is_empty() {
+        PosResolve::Unresolved(None)
     } else {
         PosResolve::Resolved(resolved)
     }
