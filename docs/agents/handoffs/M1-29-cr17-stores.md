@@ -58,7 +58,8 @@
 | `cp ~/work/a.txt ~/other/b.txt` | Deny `cp`, `path_scope: ~/work/**` | `Ask` (fail open) | `Deny` |
 | `Edit ["~/work/a.rs", "~/other/b.rs"]` | Deny `Edit Any`, `path_scope: ~/work/**` | `Ask` (fail open) | `Deny` |
 | `find . -name '*.rs'` | Allow prefix `find` | `Allow` | `Allow` (unchanged) |
-| `find . -delete` | Allow prefix `find` | `Allow` | `Ask` |
+| `find build -delete` (and `find . -name '*.o' -delete` in `~/proj`) | Allow prefix `find` (or `find .`) | `Allow` | `Ask` |
+| `find . -delete` (in Home or unfiltered in `~/proj`) | Allow prefix `find` | `Hard(recursive-delete-outside-cwd)` | `Hard(recursive-delete-outside-cwd)` (unchanged) |
 | `find . -exec rm {} +` | Allow prefix `find` | `Allow` | `Ask` |
 | `find . -exec echo {} +` | Allow prefix `find` + `echo` | `Allow` | `Allow` |
 | `echo a \| xargs rm` | Allow prefix `echo` + `xargs` | `Allow` | `Ask` |
@@ -126,3 +127,14 @@ git diff a3b2a60 --stat
 
 - Under **D-123**, `cargo test`, `cargo clippy`, and `pnpm` were not run by this worker.
 - `app/src/ui/Security.tsx` renders the CR-12 + CR-17 list directly in `ASK_STORES` (as permitted by the brief's owned paths, since `app/src-tauri/src/save.rs`, `app/src/platform.ts`, and `crates/atrium-protocol/src/policy.rs` are not owned paths).
+
+## Rework round 1
+
+- **`crates/atrium-core/src/policy/engine.rs` (`clippy::too_many_arguments`):** Grouped the per-evaluation arguments of `allow_covers` (`input`, `a`, `paths`, `glob_leaves`, `has_derived`) into `AllowCtx<'a>`, constructed once in `apply_rules` and passed by reference to all three `allow_covers` calls (`&part_ids`, `&derived_ids`, `&wrapper_eff_ids`). `allow_covers` now takes 4 arguments instead of 8 without silencing the lint.
+- **`crates/atrium-core/tests/M1-29-cr17-stores.rs:490` (`find_prefix_rules_require_derived_units_to_be_covered_and_reject_delete`):** Updated the test cases so the `-delete` prefix-rejection checks target paths strictly inside the working folder (or filtered inside a non-home project folder `~/proj`):
+  - **Why the original expectation (`Ask` for `find . -delete` and `find . -name '*.o' -delete` in `Env::home()`, and `Allow` for `exact(&["find", ".", "-delete"])`) was wrong:** Per contract §9 (`HARD_DENY_DEFAULTS`, checked before any rules; `DefaultPolicy` / `deny.rs::delete_blocked`), recursive deletes targeting `~`, outside `cwd`, or unfiltered `cwd` itself are hard-denied as `HardDeny { id: "recursive-delete-outside-cwd" }`. In `Env::home()`, `cwd == ~`, so `.` resolves to `~`, and even in a project folder `~/proj`, unfiltered `find . -delete` deletes `cwd` itself. Per the brief ("no new hard deny on an ordinary line that `dev` allows or asks about"; hard deny for recursive deletes outside the working folder stays), those lines are supposed to be `Hard(recursive-delete-outside-cwd)` both on `dev` and now.
+  - Replaced the prefix-rejection checks with `proj.cmd_rules("find . -name '*.o' -delete", rules)` (where `proj.cwd = /h/u/proj`, filtered so `delete_blocked` does not fire; `Allow` on `dev`, `Ask` now under both `find` and `find .` prefix rules) and `env.cmd_rules("find build -delete", &find_rule)` / `env.cmd_rules("find build -name '*.o' -delete", &find_rule)` / `proj.cmd_rules("find build -delete", &find_rule)` (`Allow` on `dev`, `Ask` now), plus exact-rule checks for `find build -delete` in `env` and `find . -name '*.o' -delete` in `proj` (`Allow`), and explicitly asserted `HardDeny { id: "recursive-delete-outside-cwd" }` for `find . -delete` (in `env` and `proj`) and `find . -name '*.o' -delete` in `env`.
+- **Checks run after rework round 1 (D-123):**
+  - `cargo fmt --all` — passed (exit 0)
+  - `cargo check -p atrium-core --tests` — passed (exit 0, 0 warnings)
+  - `cargo check -p atrium-daemon --tests` — passed (exit 0, 0 warnings)
