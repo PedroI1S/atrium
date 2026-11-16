@@ -353,6 +353,42 @@ enum Internal {
         input: Value,
         failed: bool,
     },
+    Withdraw(ApprovalTicket),
+}
+
+struct OrphanGuard {
+    ticket: Option<ApprovalTicket>,
+    tx: mpsc::UnboundedSender<Internal>,
+    gate: Arc<dyn ToolGate>,
+}
+
+impl OrphanGuard {
+    fn arm(
+        ticket: Option<ApprovalTicket>,
+        tx: mpsc::UnboundedSender<Internal>,
+        gate: Arc<dyn ToolGate>,
+    ) -> Self {
+        Self { ticket, tx, gate }
+    }
+
+    fn disarm(&mut self) {
+        self.ticket = None;
+    }
+}
+
+impl Drop for OrphanGuard {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        if let Err(mpsc::error::SendError(Internal::Withdraw(ticket))) =
+            self.tx.send(Internal::Withdraw(ticket))
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let gate = self.gate.clone();
+            handle.spawn(async move { gate.withdraw(&ticket).await });
+        }
+    }
 }
 
 /// What to do with a gate decision.
@@ -946,6 +982,7 @@ impl Actor {
             }
         }
         self.clear_requests();
+        while self.gates.join_next().await.is_some() {}
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.commands_rx = None;
@@ -979,6 +1016,7 @@ impl Actor {
         // wrote while winding down must not use it up.
         self.finishing = true;
         self.clear_requests();
+        while self.gates.join_next().await.is_some() {}
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.feed(AdapterInput::Exit { code });
@@ -993,12 +1031,18 @@ impl Actor {
 
     async fn drain_withdrawals(&mut self) {
         let tickets = std::mem::take(&mut self.pending_withdrawals);
-        let deadline = self.options.gate_deadline;
+        if tickets.is_empty() {
+            return;
+        }
+        let mut set = JoinSet::new();
         for ticket in tickets {
             let gate = self.gate.clone();
-            let inner = tokio::spawn(async move { gate.withdraw(&ticket).await });
-            let _ = guarded(deadline, inner).await;
+            set.spawn(async move { gate.withdraw(&ticket).await });
         }
+        let _ = timeout(self.options.gate_deadline, async {
+            while set.join_next().await.is_some() {}
+        })
+        .await;
     }
 
     fn drain_internal_withdrawals(&mut self) {
@@ -1015,6 +1059,7 @@ impl Actor {
                 Internal::Redeem {
                     ticket, decision, ..
                 } if !matches!(decision, GateDecision::Allow) => self.queue_withdraw(ticket),
+                Internal::Withdraw(ticket) => self.queue_withdraw(ticket),
                 _ => {}
             }
         }
@@ -1278,11 +1323,27 @@ impl Actor {
         let native = reply.key();
         let task = self.gates.spawn(async move {
             let for_gate = check.clone();
+            let tx_orphan = tx.clone();
+            let gate_orphan = gate.clone();
             // The call runs in its own task so a panic is contained, and is
             // aborted if this task is (session end) or the deadline passes.
-            let inner = tokio::spawn(async move { gate.check(&for_gate).await });
+            let inner = tokio::spawn(async move {
+                let d = gate.check(&for_gate).await;
+                let guard = OrphanGuard::arm(
+                    match &d {
+                        GateDecision::Ask { ticket } => Some(ticket.clone()),
+                        _ => None,
+                    },
+                    tx_orphan,
+                    gate_orphan,
+                );
+                (d, guard)
+            });
             let (decision, failed) = match guarded(deadline, inner).await {
-                Ok(d) => (d, false),
+                Ok((d, mut guard)) => {
+                    guard.disarm();
+                    (d, false)
+                }
                 Err(why) => (
                     GateDecision::Deny {
                         reason: why.reason().into(),
@@ -1317,9 +1378,18 @@ impl Actor {
         let turn = Some(self.norm.turn_number());
         let key = Req::CanUse(native.clone());
         let task = self.gates.spawn(async move {
-            let inner = tokio::spawn(async move { gate.question_ticket(turn).await });
+            let tx_orphan = tx.clone();
+            let gate_orphan = gate.clone();
+            let inner = tokio::spawn(async move {
+                let t = gate.question_ticket(turn).await;
+                let guard = OrphanGuard::arm(t.clone(), tx_orphan, gate_orphan);
+                (t, guard)
+            });
             let (ticket, failed) = match guarded(deadline, inner).await {
-                Ok(t) => (t, false),
+                Ok((t, mut guard)) => {
+                    guard.disarm();
+                    (t, false)
+                }
                 Err(_) => (None, true),
             };
             let _ = tx.send(Internal::Question {
@@ -1370,16 +1440,22 @@ impl Actor {
 
     fn on_internal(&mut self, msg: Internal) {
         while self.gates.try_join_next().is_some() {}
+        if let Internal::Withdraw(ticket) = msg {
+            self.queue_withdraw(ticket);
+            return;
+        }
         match &msg {
             Internal::Gate { reply, .. } => self.inflight.remove(&reply.key()),
             Internal::Redeem { native, .. } | Internal::Question { native, .. } => {
                 self.inflight.remove(&Req::CanUse(native.clone()))
             }
+            Internal::Withdraw(_) => None,
         };
         let failed = match &msg {
             Internal::Gate { failed, .. }
             | Internal::Redeem { failed, .. }
             | Internal::Question { failed, .. } => *failed,
+            Internal::Withdraw(_) => false,
         };
         match msg {
             Internal::Gate {
@@ -1470,6 +1546,7 @@ impl Actor {
                     self.queue_withdraw(t);
                 }
             }
+            Internal::Withdraw(_) => {}
         }
         if failed {
             self.gate_failed();

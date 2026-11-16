@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::Instant as TokioInstant;
 
 use super::normalizer::{CodexNormalizer, DEADLINE_INTERRUPT, DEADLINE_RECORD_TOO_LARGE, coverage};
@@ -1870,10 +1871,18 @@ impl Driver {
 
     async fn drain_withdrawals(&mut self) {
         let tickets = std::mem::take(&mut self.pending_withdrawals);
+        if tickets.is_empty() {
+            return;
+        }
+        let mut set = JoinSet::new();
         for ticket in tickets {
             let gate = self.gate.clone();
-            let _ = guarded(REDEEM_TIMEOUT, async move { gate.withdraw(&ticket).await }).await;
+            set.spawn(async move { gate.withdraw(&ticket).await });
         }
+        let _ = tokio::time::timeout(REDEEM_TIMEOUT, async {
+            while set.join_next().await.is_some() {}
+        })
+        .await;
     }
 
     fn drain_internal_withdrawals(&mut self) {
