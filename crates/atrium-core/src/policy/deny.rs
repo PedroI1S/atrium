@@ -2382,6 +2382,7 @@ struct NormArena<'a> {
     seg_ids: HashMap<&'a str, u32>,
     last_seg: (&'a str, u32),
     intern: HashMap<(usize, u32, usize), usize>,
+    can_branch: bool,
     work: usize,
     budget: usize,
 }
@@ -2402,6 +2403,7 @@ impl<'a> NormArena<'a> {
             seg_ids,
             last_seg: ("", 0),
             intern: HashMap::new(),
+            can_branch: false,
             work: 0,
             budget,
         }
@@ -2432,7 +2434,9 @@ impl<'a> NormArena<'a> {
         if !self.step() {
             return None;
         }
-        if let Some(&existing) = self.intern.get(&(parent, seg_id, count)) {
+        if self.can_branch
+            && let Some(&existing) = self.intern.get(&(parent, seg_id, count))
+        {
             return Some(existing);
         }
         let next = self.nodes.len();
@@ -2441,7 +2445,9 @@ impl<'a> NormArena<'a> {
             seg_id,
             count,
         });
-        self.intern.insert((parent, seg_id, count), next);
+        if self.can_branch {
+            self.intern.insert((parent, seg_id, count), next);
+        }
         Some(next)
     }
 
@@ -2553,6 +2559,7 @@ fn apply_dotdot_run<'a>(
         }
         next_active.sort_unstable();
         next_active.dedup();
+        let tails_added = dotdot_tails.len() > tails_before;
         if next_active.len() + dotdot_tails.len() > cap {
             dotdot_tails.sort_unstable();
             dotdot_tails.dedup();
@@ -2560,7 +2567,7 @@ fn apply_dotdot_run<'a>(
                 return None;
             }
         }
-        if next_active == active && dotdot_tails.len() == tails_before {
+        if next_active == active && !tails_added {
             break;
         }
         active = next_active;
@@ -2602,6 +2609,7 @@ fn normalize_glob_variants(
                 }
             }
             "**" => {
+                arena.can_branch = true;
                 for st in &mut states {
                     if !arena.is_globstar(*st) {
                         let Some(next) = arena.push_seg(*st, 2, 1) else {
@@ -2618,6 +2626,7 @@ fn normalize_glob_variants(
                 states.dedup();
             }
             ".." => {
+                arena.can_branch = true;
                 let mut run = 1usize;
                 while let Some(&next_seg) = iter.peek() {
                     match next_seg {
@@ -2630,13 +2639,17 @@ fn normalize_glob_variants(
                         }
                         ".." => {
                             iter.next();
+                            if !arena.step() {
+                                *total_work = max_work;
+                                return None;
+                            }
                             run += 1;
                         }
                         _ => break,
                     }
                 }
                 let Some(next_states) = apply_dotdot_run(&states, abs, run, cap, &mut arena) else {
-                    *total_work = total_work.saturating_add(arena.work);
+                    *total_work = total_work.saturating_add(arena.work).min(max_work);
                     return None;
                 };
                 states = next_states;
@@ -2653,12 +2666,15 @@ fn normalize_glob_variants(
             }
         }
     }
-    *total_work = total_work.saturating_add(arena.work);
     let mut out = Vec::with_capacity(states.len());
     let mut seen = std::collections::HashSet::with_capacity(states.len());
     let mut segs: Vec<&str> = vec![];
     let mut total_bytes = 0usize;
     for mut id in states {
+        if !arena.step() {
+            *total_work = max_work;
+            return None;
+        }
         segs.clear();
         let mut seg_bytes = if abs { 1 } else { 0 };
         while id != 0 {
@@ -2688,6 +2704,7 @@ fn normalize_glob_variants(
             out.push(s);
         }
     }
+    *total_work = total_work.saturating_add(arena.work);
     Some(out)
 }
 
@@ -2700,9 +2717,9 @@ mod glob_norm_tests {
         let star_dd = |n: usize| format!("{}{}", "*/".repeat(n), "../".repeat(n));
 
         for (n, expected_variants, max_work) in [
-            (100usize, 101usize, 350usize),
-            (200, 201, 650),
-            (255, 256, 800),
+            (100usize, 101usize, 550usize),
+            (200, 201, 1_050),
+            (255, 256, 1_350),
         ] {
             let mut work = 0usize;
             let norms =
@@ -2732,9 +2749,9 @@ mod glob_norm_tests {
                 normalize_glob_variants(&star_dd(n), MAX_GLOB_VARIANTS, &mut work, MAX_GLOB_WORK);
             assert!(norms.is_none(), "n={n} should trip MAX_GLOB_VARIANTS");
             assert!(
-                work <= n + MAX_GLOB_VARIANTS + 16,
+                work <= 2 * n + MAX_GLOB_VARIANTS + 16,
                 "n={n}: expected bounded work <= {}, got {work}",
-                n + MAX_GLOB_VARIANTS + 16
+                2 * n + MAX_GLOB_VARIANTS + 16
             );
         }
 
@@ -2746,6 +2763,21 @@ mod glob_norm_tests {
                 .is_none()
         );
         assert!(ss_work <= 2_000, "500 **/ + 500 .. work={ss_work}");
+
+        // A glob within MAX_GLOB_VARIANTS (201 <= 256) that genuinely needs more
+        // than MAX_GLOB_WORK steps exhausts the work budget and fails closed.
+        let mut budget_work = 0usize;
+        let budget_glob = format!("{}{}", star_dd(200), "a/".repeat(1_000));
+        assert!(
+            normalize_glob_variants(
+                &budget_glob,
+                MAX_GLOB_VARIANTS,
+                &mut budget_work,
+                MAX_GLOB_WORK
+            )
+            .is_none()
+        );
+        assert_eq!(budget_work, MAX_GLOB_WORK);
 
         // `search_variants_from_cands` filters out useless `..` variants for ~/proj.
         let cands =
@@ -2768,7 +2800,7 @@ mod glob_norm_tests {
 /// Widens `?` and any character class `[...]` that can match `.` to `.`.
 fn widen_pattern_dots(s: &str) -> String {
     let bytes = s.as_bytes();
-    let last_rb = s.rfind(']');
+    let mut last_rb = s.rfind(']');
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -2801,6 +2833,7 @@ fn widen_pattern_dots(s: &str) -> String {
                 }
                 i = j + 1;
             } else {
+                last_rb = None;
                 out.push(ch);
                 i += len;
             }
@@ -2816,7 +2849,7 @@ fn widen_pattern_dots(s: &str) -> String {
 /// with `/`.
 fn widen_pattern_slashes(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
-    let last_rb = s.rfind(']');
+    let mut last_rb = s.rfind(']');
     let mut out = String::with_capacity(s.len());
     let mut changed = false;
     let mut i = 0;
@@ -2855,6 +2888,7 @@ fn widen_pattern_slashes(s: &str) -> Option<String> {
                 i = j + 1;
                 continue;
             }
+            last_rb = None;
         }
         out.push(ch);
         i += len;
