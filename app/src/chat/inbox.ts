@@ -48,12 +48,26 @@ export type Jump = { kind: "thread"; threadId: string } | { kind: "inbox" } | { 
  * item with no thread (storage full) opens the inbox itself.
  */
 export function nextJump(items: readonly InboxItem[], current: string | null): Jump {
+  return jump(items, current, 1);
+}
+
+/**
+ * ⌘⇧J: the previous item, in inbox order, before the one being looked at. From a thread that
+ * isn't in the inbox it is the last item; from the first it wraps to the last.
+ */
+export function prevJump(items: readonly InboxItem[], current: string | null): Jump {
+  return jump(items, current, -1);
+}
+
+function jump(items: readonly InboxItem[], current: string | null, by: 1 | -1): Jump {
   const ranked = rankInbox(items);
   if (!ranked.length) return { kind: "none" };
-  const at = current === null ? -1 : ranked.findIndex((i) => i.thread_id === current);
+  const found = current === null ? -1 : ranked.findIndex((i) => i.thread_id === current);
+  // Not in the list: start just outside it, so one step lands on the first (or last) item.
+  const at = found >= 0 ? found : by > 0 ? -1 : ranked.length;
   // Skip the thread being looked at (a thread appears once, but be safe about repeats).
   for (let step = 1; step <= ranked.length; step++) {
-    const item = ranked[(at + step + ranked.length) % ranked.length]!;
+    const item = ranked[(((at + by * step) % ranked.length) + ranked.length) % ranked.length]!;
     if (item.thread_id === null) return { kind: "inbox" };
     if (item.thread_id !== current) return { kind: "thread", threadId: item.thread_id };
   }

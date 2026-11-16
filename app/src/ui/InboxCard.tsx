@@ -163,7 +163,7 @@ export function InboxCard() {
         <span><Kbd>A</Kbd> allow once</span>
         <span><Kbd>D</Kbd> deny</span>
         <Spacer />
-        <span><Kbd>{`${modKey()}J`}</Kbd> next item that needs you, from anywhere</span>
+        <span><Kbd>{`${modKey()}J`}</Kbd> <Kbd>{modKey() === "⌘" ? "⌘⇧J" : "Ctrl+Shift+J"}</Kbd> next or previous item that needs you, from anywhere</span>
       </footer>
     </>
   );

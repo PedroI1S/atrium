@@ -6,7 +6,7 @@ import { isCommandFailure } from "../daemon/types";
 import { paletteOpen, panelOpen, setPanel, setPaletteOpen, setScreen, setSidebarOpen, showToast, sidebarOpen } from "../state";
 import { MAIN } from "../window-model";
 import { bringBack, debugBuild, isPopout, model, ownsView, patchSettings, popOut } from "../windows";
-import { jumpToNext } from "./jump";
+import { jumpToNext, jumpToPrev } from "./jump";
 import { openThread } from "./Sidebar";
 
 interface Command {
@@ -39,6 +39,7 @@ function sections(): Section[] {
   ];
   const go: Command[] = isPopout() ? [] : [
     { id: "next", label: "Go to the next chat that needs you", hint: "⌘J", run: jumpToNext },
+    { id: "prev", label: "Go to the previous chat that needs you", hint: "⌘⇧J", run: jumpToPrev },
     { id: "inbox", label: "Go to Inbox", run: () => setScreen("inbox") },
     { id: "new-chat", label: "New chat", run: () => openThread(null) },
     { id: "settings", label: "Open Settings", hint: "⌘,", run: () => setScreen("settings") },

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { InboxItem, InboxReason } from "../daemon/types";
-import { filterInbox, groupInbox, itemKey, moveSelection, needsYouCount, nextJump, rankInbox } from "./inbox";
+import { filterInbox, groupInbox, itemKey, moveSelection, needsYouCount, nextJump, prevJump, rankInbox } from "./inbox";
 import { askOf, rememberChoices, subjectOf } from "./requests";
 import type { ApprovalItem } from "./transcript";
 
@@ -67,6 +67,32 @@ describe("⌘J order", () => {
     expect(nextJump([item(null, "storage_full", 1), ...items], null)).toEqual({ kind: "inbox" });
     expect(nextJump([], "x")).toEqual({ kind: "none" });
     expect(nextJump([item("only", "approval", 1)], "only")).toEqual({ kind: "none" });
+  });
+
+  it("⌘⇧J from a thread that isn't in the inbox goes to the last item", () => {
+    expect(prevJump(items, null)).toEqual({ kind: "thread", threadId: "r" });
+    expect(prevJump(items, "elsewhere")).toEqual({ kind: "thread", threadId: "r" });
+  });
+
+  it("⌘⇧J from an item goes to the previous one in inbox order, wrapping at the start", () => {
+    expect(prevJump(items, "r")).toEqual({ kind: "thread", threadId: "q" });
+    expect(prevJump(items, "q")).toEqual({ kind: "thread", threadId: "a2" });
+    expect(prevJump(items, "a2")).toEqual({ kind: "thread", threadId: "a1" });
+    expect(prevJump(items, "a1")).toEqual({ kind: "thread", threadId: "r" });
+  });
+
+  it("⌘⇧J and ⌘J undo each other", () => {
+    for (const id of ["a1", "a2", "q", "r"]) {
+      const next = nextJump(items, id);
+      expect(next.kind).toBe("thread");
+      expect(prevJump(items, (next as { threadId: string }).threadId)).toEqual({ kind: "thread", threadId: id });
+    }
+  });
+
+  it("⌘⇧J: storage full opens the inbox; nothing to do says so", () => {
+    expect(prevJump([...items, item(null, "storage_full", 1)], "a1")).toEqual({ kind: "inbox" });
+    expect(prevJump([], "x")).toEqual({ kind: "none" });
+    expect(prevJump([item("only", "approval", 1)], "only")).toEqual({ kind: "none" });
   });
 
   it("J and K move the selection and stop at the ends", () => {
