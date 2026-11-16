@@ -21,7 +21,7 @@ export function setPanel(next: { open?: boolean; tab?: PanelTab }): void {
 export const [sidebarWidth, setSidebarWidth] = createSignal<number | null>(null);
 export const [panelWidth, setPanelWidth] = createSignal<number | null>(null);
 
-export type SettingsSection = "general" | "appearance" | "agents" | "approvals" | "notifications";
+export type SettingsSection = "general" | "appearance" | "agents" | "approvals" | "security" | "notifications";
 export const [settingsSection, setSettingsSectionSignal] = createSignal<SettingsSection>("general");
 export const [advancedOpen, setAdvancedOpen] = createSignal(false);
 export const [settingsQuery, setSettingsQuery] = createSignal<string | null>(null);

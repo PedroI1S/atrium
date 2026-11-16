@@ -2,6 +2,8 @@ import { Show, onCleanup, onMount } from "solid-js";
 import { PROBE_KEY, markOnce } from "./harness";
 import { advancedOpen, paletteOpen, panelOpen, setAdvancedOpen, setPanel, setPaletteOpen, setScreen, setSidebarOpen, sidebarOpen, toast } from "./state";
 import { jumpToNext, jumpToPrev } from "./ui/jump";
+import { ConfirmHost } from "./ui/Confirm";
+import { EnforcementHost } from "./ui/Enforcement";
 import { Palette } from "./ui/Palette";
 import { MainWindow, PopoutWindow } from "./ui/Shell";
 import { isPopout } from "./windows";
@@ -26,6 +28,8 @@ export function App() {
     <div class="app" data-atrium-part="window" data-window={isPopout() ? "popout" : "main"}>
       <Show when={isPopout()} fallback={<MainWindow />}><PopoutWindow /></Show>
       <Palette />
+      <ConfirmHost />
+      <EnforcementHost />
       <div class="toast-region" role="status" aria-live="polite">
         <Show when={toast()}>{(t) => <div class="toast">{t().text}</div>}</Show>
       </div>

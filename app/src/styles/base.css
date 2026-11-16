@@ -99,6 +99,16 @@
   --inbox-row-height: 54px;
   --fact-label-width: 96px;
 
+  /* M1-23: the thread menu, dialogs (confirm, enforcement details), the rules editor, batch bar */
+  --menu-width: 280px;
+  --sheet-width: 460px;
+  --sheet-width-wide: 680px;
+  --sheet-max-height: 72vh;
+  --title-edit-width: 360px;
+  --enf-class-width: 170px;
+  --field-width: 300px;
+  --check-size: 15px;
+
   /* chat (M1-09b): transcript rows, markdown, tool output, request cards, the inbox, settings lists */
   --text-h1: 19px;
   --text-h2: 17px;

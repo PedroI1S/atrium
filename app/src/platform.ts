@@ -72,3 +72,29 @@ export async function openLink(url: string): Promise<void> {
 export async function revealPath(path: string): Promise<void> {
   if (inTauri) await invoke("reveal_path", { path });
 }
+
+/**
+ * Where to save a file, from the platform's save dialog ("Export…"); null when cancelled. In the
+ * M1 demo (`setSaveDirOverride`) no dialog opens: the file goes to the demo's folder.
+ */
+export async function askSavePath(title: string, name: string): Promise<string | null> {
+  if (saveDirOverride !== null) return `${saveDirOverride}/${name}`;
+  if (!inTauri) return null;
+  return invoke<string | null>("ask_save_path", { title, name });
+}
+
+let saveDirOverride: string | null = null;
+/** Harness runs only: save into this folder without asking. */
+export function setSaveDirOverride(dir: string | null): void {
+  saveDirOverride = dir;
+}
+
+/** One entry of the hard-deny list (`HARD_DENY_DEFAULTS`). */
+export interface HardDeny { id: string; description: string }
+export interface SafetyInfo { hardDeny: HardDeny[]; home: string | null }
+
+/** The read-only lists Settings shows; empty in a browser. */
+export async function safetyInfo(): Promise<SafetyInfo> {
+  if (!inTauri) return { hardDeny: [], home: null };
+  return invoke<SafetyInfo>("safety_info");
+}

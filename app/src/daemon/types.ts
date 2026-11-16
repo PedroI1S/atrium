@@ -6,7 +6,7 @@
 import type { ErrorCode, EventId, InboxItem, StoredEvent, ThreadId, ThreadSummary } from "../../../crates/atrium-protocol/bindings/protocol";
 
 export type {
-  AgentEvent, AgentLaunch, ApprovalDecision, DaemonCommand, EnforcementDescriptor, ErrorCode, EventId, InboxItem, InboxReason, MessageKind, PlanEntry,
+  AgentEvent, AgentLaunch, ApprovalDecision, ClassCoverage, ConfigSource, ConfigSourceKind, Coverage, DaemonCommand, EnforcementDescriptor, ErrorCode, EventId, ExportFormat, RuleDecision, RuleDraft, ToolClass, InboxItem, InboxReason, MessageKind, PlanEntry,
   Provider, ProviderProbe, Question, QuestionAnswer, QuestionOption, RememberScope, RequestOutcome, Rule, RuleMatcher, RuleScope, ServerMessage,
   StoredEvent, ThreadId, ThreadState, ThreadSummary, ToolKind, ToolStatus, TurnOutcome, Usage, Value,
 } from "../../../crates/atrium-protocol/bindings/protocol";

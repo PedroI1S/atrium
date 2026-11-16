@@ -13,6 +13,7 @@ import { IconButton, Spacer } from "./controls";
 import { InboxCard } from "./InboxCard";
 import { AdvancedCard, SettingsCard } from "./Settings";
 import { Sidebar, SidebarStrip } from "./Sidebar";
+import { ThreadMenu } from "./ThreadActions";
 import { ThreadBody, ThreadCard, ThreadTitle } from "./ThreadCard";
 import { WindowControls } from "./WindowControls";
 
@@ -99,6 +100,7 @@ export function PopoutWindow() {
           {(t) => <ThreadTitle thread={t()} />}
         </Show>
         <Spacer />
+        <Show when={thread()}>{(t) => <ThreadMenu small thread={t()} />}</Show>
         <IconButton small label="Keep on top" on={keepOnTop()} onClick={() => { const next = !keepOnTop(); setKeepOnTopSignal(next); void setKeepOnTop(next); }}><Pin class="i sm" aria-hidden="true" /></IconButton>
         <IconButton small label="Move back into the main window" onClick={() => void bringBack(threadId())}><Undo2 class="i sm" aria-hidden="true" /></IconButton>
         <WindowControls />

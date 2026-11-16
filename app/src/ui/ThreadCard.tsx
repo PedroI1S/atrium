@@ -5,6 +5,7 @@
 import { ChevronDown, ExternalLink, RotateCcw } from "lucide-solid";
 import { For, Show, createEffect, onCleanup } from "solid-js";
 import { agent, agentChoices, markRead, probes, reportFocus, resumeThread, sendMessage, sending, setAgent, startChat, stopTurn } from "../chat/actions";
+import { MAX_TITLE_CHARS, renameThread, renaming, setRenaming } from "../chat/thread-actions";
 import { type ThreadModel, holdThread } from "../chat/threads";
 import { windowFocused } from "../state";
 import { daemon } from "../daemon/client";
@@ -13,18 +14,58 @@ import type { ThreadSummary } from "../daemon/types";
 import { NEW_THREAD } from "../window-model";
 import { bringBack, focusPopout, model, ownsView, popOut } from "../windows";
 import { Composer } from "./Composer";
+import { EnforcementBadge } from "./Enforcement";
 import { RequestCard } from "./RequestCard";
+import { ThreadMenu } from "./ThreadActions";
 import { TranscriptView } from "./Transcript";
 import { IconButton, Pill, Spacer } from "./controls";
 
 const PROVIDER: Record<ThreadSummary["provider"], string> = { claude: "Claude Code", codex: "Codex", agy: "Gemini", acp: "ACP" };
 export const providerLabel = (t: ThreadSummary): string => (t.model ? `${PROVIDER[t.provider]} · ${t.model}` : PROVIDER[t.provider]);
 
+/** The title, or the field that renames it ("Rename" in the ⋯ menu or the palette). */
+/**
+ * A blur this soon after the field appears is focus coming back to whatever opened it (the
+ * palette or the menu closing), not the user leaving: the field keeps focus.
+ */
+const RENAME_SETTLE_MS = 400;
+
+function TitleText(props: { thread: ThreadSummary }) {
+  let cancelled = false;
+  let shownAt = 0;
+  const done = (input: HTMLInputElement) => {
+    if (renaming() !== props.thread.thread_id) return;
+    setRenaming(null);
+    if (!cancelled) void renameThread(props.thread.thread_id, input.value);
+  };
+  return (
+    <Show when={renaming() === props.thread.thread_id} fallback={<span class="title">{props.thread.title || "Untitled chat"}</span>}>
+      <input
+        class="title-edit"
+        aria-label="Chat name"
+        data-atrium-part="rename"
+        maxLength={MAX_TITLE_CHARS}
+        value={props.thread.title}
+        ref={(el) => { cancelled = false; shownAt = performance.now(); queueMicrotask(() => { el.focus(); el.select(); }); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); done(e.currentTarget); }
+          else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelled = true; done(e.currentTarget); }
+        }}
+        onBlur={(e) => {
+          const el = e.currentTarget;
+          if (performance.now() - shownAt < RENAME_SETTLE_MS) { setTimeout(() => el.focus()); return; }
+          done(el);
+        }}
+      />
+    </Show>
+  );
+}
+
 /** Header of a thread's view, in the main window and (compact) in a pop-out. */
 export function ThreadTitle(props: { thread: ThreadSummary }) {
   return (
     <>
-      <span class="title">{props.thread.title || "Untitled chat"}</span>
+      <TitleText thread={props.thread} />
       <Pill tone={toneOf(props.thread).tone} text={toneOf(props.thread).label} />
     </>
   );
@@ -159,9 +200,11 @@ export function ThreadCard() {
                 <button type="button" class="btn sm" title="Starts the agent again from where it was cut off" onClick={() => void resumeThread(t().thread_id)}><RotateCcw class="i xs" aria-hidden="true" />Resume</button>
               </Show>
               <span class="chip">{providerLabel(t())}</span>
+              <EnforcementBadge thread={t()} />
               <Show when={ownsView(t().thread_id)}>
                 <IconButton label="Open in new window" onClick={() => void popOut(t().thread_id)}><ExternalLink class="i" aria-hidden="true" /></IconButton>
               </Show>
+              <ThreadMenu thread={t()} />
             </>
           )}
         </Show>

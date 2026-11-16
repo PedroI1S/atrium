@@ -2,12 +2,13 @@ import { Dialog } from "@kobalte/core/dialog";
 import { CornerDownLeft } from "lucide-solid";
 import { For, createEffect, createMemo, createSignal } from "solid-js";
 import { command, daemon, reconnect } from "../daemon/client";
-import { isCommandFailure } from "../daemon/types";
-import { paletteOpen, panelOpen, setPanel, setPaletteOpen, setScreen, setSidebarOpen, showToast, sidebarOpen } from "../state";
+import { type ThreadSummary, isCommandFailure } from "../daemon/types";
+import { paletteOpen, panelOpen, screen, setPanel, setPaletteOpen, setScreen, setSidebarOpen, showToast, sidebarOpen } from "../state";
 import { MAIN } from "../window-model";
-import { bringBack, debugBuild, isPopout, model, ownsView, patchSettings, popOut } from "../windows";
+import { bringBack, debugBuild, isPopout, model, ownsView, patchSettings, popOut, popoutThread } from "../windows";
 import { jumpToNext, jumpToPrev } from "./jump";
 import { openThread } from "./Sidebar";
+import { threadActions } from "./ThreadActions";
 
 interface Command {
   id: string;
@@ -31,8 +32,16 @@ function startFakeThread(): void {
     .catch((e) => showToast(isCommandFailure(e) ? e.message : String(e)));
 }
 
+/** The chat this window shows: the pop-out's, or the main card's while it shows a chat. */
+function shownThread(): ThreadSummary | undefined {
+  const id = isPopout() ? popoutThread() : screen() === "chat" ? model().mainThread : null;
+  return id ? daemon().threads[id] : undefined;
+}
+
 function sections(): Section[] {
   const current = model().mainThread;
+  const shown = shownThread();
+  const thisChat: Command[] = shown ? threadActions(shown).filter((a) => !a.disabled).map((a) => ({ id: `chat-action-${a.id}`, label: `This chat: ${a.label}`, hint: a.hint, run: a.run })) : [];
   const windows: Command[] = isPopout() ? [] : [
     ...(current && ownsView(current) && daemon().threads[current] ? [{ id: "pop-current", label: "Move this chat to a new window", run: () => void popOut(current) }] : []),
     ...Object.entries(model().popouts).filter(([label]) => label !== MAIN).map(([label, popout]) => ({ id: `back-${label}`, label: `Bring back: ${titleOf(popout.threadId)}`, run: () => void bringBack(popout.threadId) })),
@@ -58,6 +67,7 @@ function sections(): Section[] {
   ] : [];
   return [
     { label: "Go", options: go },
+    { label: "This chat", options: thisChat },
     { label: "Chats", options: chats },
     { label: "Windows", options: windows },
     { label: "Look", options: look },
