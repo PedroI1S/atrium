@@ -45,28 +45,55 @@ use atrium_protocol::thread::ThreadId;
 use atrium_protocol::wire::{EventId, ExportFormat, StoredEvent};
 use serde_json::Value;
 
-use super::{HistoryError, Redactor, verify_message};
+use super::{HistoryError, Redactor, verify_message_reason};
+
+/// Summary of a completed export.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExportReport {
+    pub bytes: u64,
+    pub damaged: u32,
+}
 
 /// Writes one thread's events as Markdown or JSONL, redacted with `redactor`.
 /// Returns bytes written. User messages (`MessageKind::User`) are included
 /// and redacted like the rest.
 ///
 /// `events` are the thread's stored events, oldest first, from its first
-/// event. A message that doesn't match its completion fails the export with
-/// [`HistoryError::Integrity`]; what was written before that stays in `out`,
-/// so the caller removes the file.
+/// event. A message that doesn't match its completion is written as a marked
+/// placeholder without its raw pieces (CR-16); use [`export_thread_report`]
+/// to also get how many messages were damaged.
 pub fn export_thread(
     events: &mut dyn Iterator<Item = StoredEvent>,
     format: ExportFormat,
     redactor: &Redactor,
     out: &mut dyn Write,
 ) -> Result<u64, HistoryError> {
+    export_thread_report(events, format, redactor, out).map(|report| report.bytes)
+}
+
+/// Like [`export_thread`], also returning how many messages were damaged.
+pub fn export_thread_report(
+    events: &mut dyn Iterator<Item = StoredEvent>,
+    format: ExportFormat,
+    redactor: &Redactor,
+    out: &mut dyn Write,
+) -> Result<ExportReport, HistoryError> {
     let mut out = Counted { out, bytes: 0 };
     let mut markdown = Markdown::new(redactor);
-    let mut write = |event: StoredEvent| -> Result<(), HistoryError> {
-        match format {
-            ExportFormat::Jsonl => write_jsonl(&event, redactor, &mut out),
-            ExportFormat::Markdown => markdown.write(&event, &mut out),
+    let mut damaged: u32 = 0;
+    let mut write = |item: Folded| -> Result<(), HistoryError> {
+        match item {
+            Folded::Event(event) => match format {
+                ExportFormat::Jsonl => write_jsonl(&event, redactor, &mut out),
+                ExportFormat::Markdown => markdown.write(&event, &mut out),
+            },
+            Folded::Damaged(msg) => {
+                damaged = damaged.saturating_add(1);
+                match format {
+                    ExportFormat::Jsonl => write_damaged_jsonl(&msg, redactor, &mut out),
+                    ExportFormat::Markdown => markdown.write_damaged(&msg, &mut out),
+                }
+            }
         }
     };
     let mut fold = Fold::default();
@@ -75,7 +102,10 @@ pub fn export_thread(
     }
     fold.finish(&mut write)?;
     out.out.flush()?;
-    Ok(out.bytes)
+    Ok(ExportReport {
+        bytes: out.bytes,
+        damaged,
+    })
 }
 
 struct Counted<'a> {
@@ -97,6 +127,56 @@ fn write_jsonl(
     out: &mut Counted<'_>,
 ) -> Result<(), HistoryError> {
     let mut value = serde_json::to_value(event).map_err(io::Error::from)?;
+    redactor.value(&mut value);
+    let mut line = serde_json::to_vec(&value).map_err(io::Error::from)?;
+    line.push(b'\n');
+    Ok(out.write(&line)?)
+}
+
+#[derive(serde::Serialize)]
+struct DamagedEventRange {
+    first: EventId,
+    last: EventId,
+}
+
+#[derive(serde::Serialize)]
+struct DamagedJsonl<'a> {
+    damaged: bool,
+    #[serde(rename = "type")]
+    kind_tag: &'static str,
+    id: EventId,
+    thread_id: &'a ThreadId,
+    incarnation: u32,
+    seq: u64,
+    at_ms: u64,
+    message_id: &'a str,
+    kind: MessageKind,
+    events: DamagedEventRange,
+    reason: &'a str,
+}
+
+fn write_damaged_jsonl(
+    msg: &DamagedMessage,
+    redactor: &Redactor,
+    out: &mut Counted<'_>,
+) -> Result<(), HistoryError> {
+    let entry = DamagedJsonl {
+        damaged: true,
+        kind_tag: "damaged_message",
+        id: msg.head.id,
+        thread_id: &msg.head.thread_id,
+        incarnation: msg.head.incarnation,
+        seq: msg.head.seq,
+        at_ms: msg.head.at_ms,
+        message_id: &msg.message_id,
+        kind: msg.kind,
+        events: DamagedEventRange {
+            first: msg.first_id,
+            last: msg.head.id,
+        },
+        reason: msg.reason,
+    };
+    let mut value = serde_json::to_value(&entry).map_err(io::Error::from)?;
     redactor.value(&mut value);
     let mut line = serde_json::to_vec(&value).map_err(io::Error::from)?;
     line.push(b'\n');
@@ -133,12 +213,26 @@ impl Head {
 }
 
 struct OpenMessage {
+    first_id: EventId,
     /// Of the latest delta.
     head: Head,
     message_id: String,
     kind: MessageKind,
     text: String,
     deltas: u64,
+}
+
+struct DamagedMessage {
+    head: Head,
+    first_id: EventId,
+    message_id: String,
+    kind: MessageKind,
+    reason: &'static str,
+}
+
+enum Folded {
+    Event(StoredEvent),
+    Damaged(DamagedMessage),
 }
 
 struct OpenCall {
@@ -149,7 +243,7 @@ struct OpenCall {
     last_output: Option<Head>,
 }
 
-type Emit<'a> = &'a mut dyn FnMut(StoredEvent) -> Result<(), HistoryError>;
+type Emit<'a> = &'a mut dyn FnMut(Folded) -> Result<(), HistoryError>;
 
 /// Joins streamed pieces (see the module docs). Message and call ids are
 /// scoped to an incarnation, so everything is keyed by both. Few items are
@@ -205,6 +299,7 @@ impl Fold {
                         open.deltas += 1;
                     }
                     None => self.messages.push(OpenMessage {
+                        first_id: head.id,
                         head,
                         message_id,
                         kind,
@@ -219,19 +314,27 @@ impl Fold {
                 kind,
                 body,
             } => {
-                let (text, deltas) = match self.message(incarnation, &message_id) {
+                let (first_id, text, deltas) = match self.message(incarnation, &message_id) {
                     Some(at) => {
                         let open = self.messages.remove(at);
-                        (open.text, open.deltas)
+                        (open.first_id, open.text, open.deltas)
                     }
-                    None => (String::new(), 0),
+                    None => (head.id, String::new(), 0),
                 };
-                let text = verify_message(&message_id, text, deltas, &body)?;
-                emit(head.with(AgentEvent::MessageCompleted {
-                    message_id,
-                    kind,
-                    body: MessageBody::Inline { text },
-                }))
+                match verify_message_reason(text, deltas, &body) {
+                    Ok(text) => emit(Folded::Event(head.with(AgentEvent::MessageCompleted {
+                        message_id,
+                        kind,
+                        body: MessageBody::Inline { text },
+                    }))),
+                    Err(reason) => emit(Folded::Damaged(DamagedMessage {
+                        head,
+                        first_id,
+                        message_id,
+                        kind,
+                        reason,
+                    })),
+                }
             }
             AgentEvent::ToolCallStarted {
                 call_id,
@@ -241,13 +344,13 @@ impl Fold {
                 input,
             } => {
                 self.call(incarnation, &call_id);
-                emit(head.with(AgentEvent::ToolCallStarted {
+                emit(Folded::Event(head.with(AgentEvent::ToolCallStarted {
                     call_id,
                     name,
                     kind,
                     title,
                     input,
-                }))
+                })))
             }
             AgentEvent::ToolCallUpdated {
                 call_id,
@@ -271,14 +374,14 @@ impl Fold {
                 if title.is_none() && kind.is_none() && input.is_none() {
                     return Ok(());
                 }
-                emit(head.with(AgentEvent::ToolCallUpdated {
+                emit(Folded::Event(head.with(AgentEvent::ToolCallUpdated {
                     call_id,
                     title,
                     kind,
                     input,
                     output_delta: None,
                     output: None,
-                }))
+                })))
             }
             AgentEvent::ToolCallFinished {
                 call_id,
@@ -291,19 +394,19 @@ impl Fold {
                 let streamed = self.calls.remove(at).output;
                 // A final output replaces what was streamed.
                 let output = output.or((!streamed.is_empty()).then_some(streamed));
-                emit(head.with(AgentEvent::ToolCallFinished {
+                emit(Folded::Event(head.with(AgentEvent::ToolCallFinished {
                     call_id,
                     status,
                     output,
                     error,
                     truncated_bytes,
-                }))
+                })))
             }
             event @ AgentEvent::SessionEnded { .. } => {
                 self.close(Some(incarnation), emit)?;
-                emit(head.with(event))
+                emit(Folded::Event(head.with(event)))
             }
-            event => emit(head.with(event)),
+            event => emit(Folded::Event(head.with(event))),
         }
     }
 
@@ -372,7 +475,7 @@ impl Fold {
             }));
         }
         tail.sort_by_key(|e| e.id);
-        tail.into_iter().try_for_each(emit)
+        tail.into_iter().map(Folded::Event).try_for_each(emit)
     }
 }
 
@@ -397,6 +500,35 @@ impl<'a> Markdown<'a> {
             tools: HashMap::new(),
             questions: HashMap::new(),
         }
+    }
+
+    fn write_damaged(
+        &mut self,
+        damaged: &DamagedMessage,
+        out: &mut Counted<'_>,
+    ) -> Result<(), HistoryError> {
+        let mut md = Block::new(self.redactor);
+        if !self.titled {
+            self.titled = true;
+            md.raw("# Thread ")
+                .line(&damaged.head.thread_id.0)
+                .raw("\n\n");
+        }
+        md.raw("⚠ Damaged message (id ")
+            .code(&damaged.message_id)
+            .raw(", ");
+        if damaged.first_id == damaged.head.id {
+            md.raw("event ").uint(damaged.first_id.0);
+        } else {
+            md.raw("events ")
+                .uint(damaged.first_id.0)
+                .raw("–")
+                .uint(damaged.head.id.0);
+        }
+        md.raw("): left out of the export (")
+            .raw(damaged.reason)
+            .raw(").\n");
+        Ok(out.write(md.finish().as_bytes())?)
     }
 
     fn write(&mut self, stored: &StoredEvent, out: &mut Counted<'_>) -> Result<(), HistoryError> {
