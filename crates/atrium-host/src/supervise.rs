@@ -44,6 +44,8 @@ pub struct Termination {
 }
 
 const GROUP_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "macos")]
+const MACOS_EPERM_EXIT_POLL: Duration = Duration::from_millis(50);
 
 /// Spawns `command` as the leader of a new process group, with
 /// `kill_on_drop`, and records its identity.
@@ -106,7 +108,7 @@ pub fn spawn_group(mut command: tokio::process::Command) -> io::Result<Supervise
 pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Result<Termination> {
     let (pid, pgid) = check_unreaped_leader(child)?;
     let exited_in_grace = wait_until_exited_no_reap(pid, grace).await?;
-    let macos_zombie_eperm = kill_group_while_unreaped(pid, pgid)?;
+    let macos_zombie_eperm = kill_group_while_unreaped(pid, pgid).await?;
     kill_leader_while_unreaped(&mut child.child)?;
 
     let status = child.child.wait().await?;
@@ -137,7 +139,7 @@ pub async fn terminate(child: &mut SupervisedChild, grace: Duration) -> io::Resu
 pub fn terminate_blocking(child: &mut SupervisedChild, grace: Duration) -> io::Result<Termination> {
     let (pid, pgid) = check_unreaped_leader(child)?;
     let exited_in_grace = wait_until_exited_no_reap_sync(pid, grace)?;
-    let macos_zombie_eperm = kill_group_while_unreaped(pid, pgid)?;
+    let macos_zombie_eperm = kill_group_while_unreaped_blocking(pid, pgid)?;
     kill_leader_while_unreaped(&mut child.child)?;
 
     let status = reap_leader_blocking(&mut child.child, pid)?;
@@ -156,25 +158,67 @@ fn check_unreaped_leader(child: &SupervisedChild) -> io::Result<(u32, u32)> {
     Ok((child.identity.pid, child.identity.pgid))
 }
 
-fn kill_group_while_unreaped(
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] pid: u32,
-    pgid: u32,
-) -> io::Result<bool> {
+enum GroupKillOutcome {
+    Done,
+    #[cfg(target_os = "macos")]
+    CheckMacosEperm(io::Error),
+}
+
+fn try_kill_group(pgid: u32) -> io::Result<GroupKillOutcome> {
     // Send SIGKILL to the whole process group while the leader is still an
     // unreaped child (pinned in the process table, so `pgid` cannot have been
     // recycled by the kernel yet).
     //
     // XNU quirk (`bsd/kern/kern_sig.c`, `killpg1`): when `pgfind(pgid)` finds
-    // the group solely because of unreaped `SZOMB` members (`nfound == 0`),
-    // `kill(-pgid, sig)` returns `EPERM` rather than `0` or `ESRCH`. Once the
-    // leader is reaped below, `kill(-pgid, 0)` becomes `ESRCH` if the group
-    // truly held only that zombie.
+    // the group solely because of exiting or unreaped `SZOMB` members
+    // (`nfound == 0`), `kill(-pgid, sig)` returns `EPERM` rather than `0` or
+    // `ESRCH`. If the leader is still mid-exit, `waitid(WNOWAIT)` may briefly
+    // report `false` before `SZOMB` is visible; callers poll `peek_exited`
+    // up to `MACOS_EPERM_EXIT_POLL` before treating `EPERM` as a real error.
+    // Once the leader is reaped below, `kill(-pgid, 0)` becomes `ESRCH` if
+    // the group truly held only that zombie.
     match signal_group(pgid, libc::SIGKILL) {
-        Ok(()) => Ok(false),
-        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        Ok(()) => Ok(GroupKillOutcome::Done),
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(GroupKillOutcome::Done),
         #[cfg(target_os = "macos")]
-        Err(err) if err.raw_os_error() == Some(libc::EPERM) && peek_exited(pid)? => Ok(true),
+        Err(err) if err.raw_os_error() == Some(libc::EPERM) => {
+            Ok(GroupKillOutcome::CheckMacosEperm(err))
+        }
         Err(err) => Err(err),
+    }
+}
+
+async fn kill_group_while_unreaped(
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] pid: u32,
+    pgid: u32,
+) -> io::Result<bool> {
+    match try_kill_group(pgid)? {
+        GroupKillOutcome::Done => Ok(false),
+        #[cfg(target_os = "macos")]
+        GroupKillOutcome::CheckMacosEperm(err) => {
+            if wait_until_exited_no_reap(pid, MACOS_EPERM_EXIT_POLL).await? {
+                Ok(true)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn kill_group_while_unreaped_blocking(
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] pid: u32,
+    pgid: u32,
+) -> io::Result<bool> {
+    match try_kill_group(pgid)? {
+        GroupKillOutcome::Done => Ok(false),
+        #[cfg(target_os = "macos")]
+        GroupKillOutcome::CheckMacosEperm(err) => {
+            if wait_until_exited_no_reap_sync(pid, MACOS_EPERM_EXIT_POLL)? {
+                Ok(true)
+            } else {
+                Err(err)
+            }
+        }
     }
 }
 
@@ -477,13 +521,64 @@ fn peek_exited(pid: u32) -> io::Result<bool> {
     }
 }
 
+#[cfg(target_os = "linux")]
+const VFORK_EXEC_POLL: Duration = Duration::from_millis(50);
+
+/// Whether an observed child executable is still the parent's `mm` across a
+/// Linux `CLONE_VFORK` wake before `exec_mmap` swaps `tsk->mm`.
+#[cfg(any(target_os = "linux", test))]
+fn is_pre_exec_vfork_exe(
+    observed: &std::path::Path,
+    self_exe: &std::path::Path,
+    expected_exe: &std::path::Path,
+) -> bool {
+    observed == self_exe && expected_exe != self_exe
+}
+
+#[cfg(target_os = "linux")]
+fn identify_after_vfork_exec(
+    pid: u32,
+    expected_exe: &std::path::Path,
+) -> io::Result<Option<ProcessIdentity>> {
+    let self_exe = std::fs::read_link("/proc/self/exe").ok();
+    let deadline = std::time::Instant::now() + VFORK_EXEC_POLL;
+    let mut first_try = true;
+    loop {
+        let Some(id) = identify(pid)? else {
+            return Ok(None);
+        };
+        let Some(self_exe) = self_exe.as_deref() else {
+            return Ok(Some(id));
+        };
+        if !is_pre_exec_vfork_exe(&id.executable, self_exe, expected_exe) {
+            return Ok(Some(id));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(Some(id));
+        }
+        if first_try {
+            first_try = false;
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1).min(deadline - now));
+        }
+    }
+}
+
 fn identify_spawned(
     pid: u32,
     raw_program: &std::path::Path,
     raw_cwd: Option<&std::path::Path>,
     path_override: Option<&std::ffi::OsStr>,
 ) -> io::Result<ProcessIdentity> {
-    if let Some(id) = identify(pid)? {
+    let executable = resolve_spawn_executable(raw_program, raw_cwd, path_override);
+    #[cfg(target_os = "linux")]
+    let id = identify_after_vfork_exec(pid, &executable)?;
+    #[cfg(not(target_os = "linux"))]
+    let id = identify(pid)?;
+
+    if let Some(id) = id {
         return Ok(id);
     }
     // The child we just spawned has not been waited on yet, so if `identify`
@@ -495,7 +590,6 @@ fn identify_spawned(
     let raw_pid = i32::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of i32 range"))?;
     let (pgid, start_time) = platform_zombie_timings(raw_pid)?;
-    let executable = resolve_spawn_executable(raw_program, raw_cwd, path_override);
     Ok(ProcessIdentity {
         pid,
         pgid,
@@ -750,11 +844,12 @@ enum ExeVerdict {
 ///   task (`Unverifiable`).
 /// - Read succeeded and it is the same task: `Identity`.
 /// - Read failed: `NoProcess` if the task is dead (`X`/`x`, or `Z` with no other
-///   thread: see `LinuxStat::is_dead`), is exiting
-///   (`PF_EXITING`: it has dropped its `mm`, and with it `exe`, but is not
-///   `Z` yet) or is a kernel thread (`PF_KTHREAD`: never has an `exe`) and
-///   the error is `ENOENT`. Any other failure of a live task, `ENOENT` of an
-///   ordinary live process included, stays `Unverifiable`.
+///   thread: see `LinuxStat::is_dead`), is exiting with no other thread
+///   (`PF_EXITING` with `num_threads <= 1`: it has dropped its `mm`, and with
+///   it `exe`, but is not `Z` yet) or is a kernel thread (`PF_KTHREAD`: never
+///   has an `exe`) and the error is `ENOENT`. Any other failure of a live
+///   task, `ENOENT` of an ordinary live process or a multithreaded process
+///   whose leader is exiting included, stays `Unverifiable`.
 ///
 /// Nothing here turns a failure into an `Identity`.
 #[cfg(any(target_os = "linux", test))]
@@ -774,7 +869,10 @@ fn judge_exe_read(
     match exe {
         Ok(()) => ExeVerdict::Identity,
         Err(_) if after.is_dead() => ExeVerdict::NoProcess,
-        Err(io::ErrorKind::NotFound) if after.flags & (PF_EXITING | PF_KTHREAD) != 0 => {
+        Err(io::ErrorKind::NotFound)
+            if (after.flags & PF_EXITING != 0 && after.num_threads <= 1)
+                || after.flags & PF_KTHREAD != 0 =>
+        {
             ExeVerdict::NoProcess
         }
         Err(_) => ExeVerdict::Unverifiable,
@@ -794,18 +892,19 @@ fn read_linux_stat(pid: u32) -> io::Result<Option<LinuxStat>> {
     }
 }
 
-/// `/proc/<pid>/exe`. For a thread-group leader that has exited while other
-/// threads run (`Z` with `num_threads > 1`) the leader has no `mm` and the link
-/// is `ENOENT`, though the process lives: then a live thread's link, which is
-/// the same executable (threads share the `mm`), is read instead. If there is
-/// none, the leader's own error stands.
+/// `/proc/<pid>/exe`. For a thread-group leader that is exiting or has exited
+/// while other threads run (`num_threads > 1`), the leader may already have
+/// dropped its `mm` so its link is `ENOENT` even while the process lives
+/// (whatever `first.state` was): then a live thread's link, which is the same
+/// executable (threads share the `mm`), is read instead. If there is none,
+/// the leader's own error stands.
 #[cfg(target_os = "linux")]
 fn read_linux_exe(pid: u32, first: &LinuxStat) -> io::Result<PathBuf> {
     let own = std::fs::read_link(format!("/proc/{pid}/exe"));
     let Err(err) = &own else {
         return own;
     };
-    if err.kind() != io::ErrorKind::NotFound || first.state != 'Z' || first.num_threads <= 1 {
+    if err.kind() != io::ErrorKind::NotFound || first.num_threads <= 1 {
         return own;
     }
     let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
@@ -999,6 +1098,20 @@ mod unit_tests {
                 Some(in_group(same('Z', LIVE), 9000)),
                 Unverifiable,
             ),
+            (
+                "exe ok, process group went down",
+                first,
+                Ok(()),
+                Some(in_group(same('S', LIVE), 50)),
+                Unverifiable,
+            ),
+            (
+                "ENOENT, kernel thread, process group went down",
+                first,
+                ENOENT,
+                Some(in_group(same('S', PF_KTHREAD), 0)),
+                Unverifiable,
+            ),
             // ENOENT: only dead, exiting or kernel threads are "no process".
             (
                 "ENOENT, exiting",
@@ -1146,7 +1259,14 @@ mod unit_tests {
                 leader_z,
                 ENOENT,
                 Some(leader_z),
-                NoProcess,
+                Unverifiable,
+            ),
+            (
+                "exiting leader (not yet Z) with a worker, no exe",
+                with_threads(first, 2),
+                ENOENT,
+                Some(with_threads(same('S', LIVE | PF_EXITING), 2)),
+                Unverifiable,
             ),
             (
                 "Z leader with a worker, no exe, no exiting flag",
@@ -1191,5 +1311,15 @@ mod unit_tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn vfork_pre_exec_predicate_detects_parent_exe_only() {
+        let self_exe = std::path::Path::new("/usr/bin/atriumd");
+        let sleep_exe = std::path::Path::new("/usr/bin/sleep");
+
+        assert!(is_pre_exec_vfork_exe(self_exe, self_exe, sleep_exe));
+        assert!(!is_pre_exec_vfork_exe(sleep_exe, self_exe, sleep_exe));
+        assert!(!is_pre_exec_vfork_exe(self_exe, self_exe, self_exe));
     }
 }

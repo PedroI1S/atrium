@@ -961,3 +961,81 @@ fn terminate_blocking_with_only_the_zombie_leader_in_the_group() {
         assert!(!group_exists(pgid), "round {round}");
     }
 }
+
+/// Waits only until `kill(-pgid, 0)` returns `EPERM` on macOS (without waiting
+/// for `waitid` to report the child as a waitable zombie). That hits XNU's
+/// mid-exit window where `killpg1` already returns `EPERM` while `peek_exited`
+/// is still `false` (M1-07c / N10). On Linux, falls back to waiting for a
+/// waitable zombie.
+fn wait_for_mid_exit_eperm_group(
+    #[cfg_attr(target_os = "macos", allow(unused_variables))] pid: u32,
+    pgid: u32,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        let raw = i32::try_from(pgid).unwrap();
+        assert!(raw > 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: Signal 0 only checks existence and permission; `raw > 1`.
+            let rc = unsafe { libc::kill(-raw, 0) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if rc != 0 && errno == Some(libc::EPERM) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader never entered EPERM exit state (rc {rc}, errno {errno:?})"
+            );
+            std::thread::yield_now();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    wait_for_zombie_only_group(pid, pgid);
+}
+
+#[test]
+fn terminate_blocking_handles_macos_mid_exit_eperm() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current_thread runtime");
+    let mut sup = rt.block_on(async {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("exit 3")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        spawn_group(cmd).expect("spawn_group")
+    });
+    let (pid, pgid) = (sup.identity.pid, sup.identity.pgid);
+    wait_for_mid_exit_eperm_group(pid, pgid);
+
+    let term = terminate_blocking(&mut sup, Duration::ZERO).expect("terminate_blocking");
+    assert_eq!(term.exit_code, Some(3));
+    assert!(sup.child.id().is_none());
+    assert!(!pid_exists(pid));
+    assert!(!group_exists(pgid));
+}
+
+#[tokio::test]
+async fn terminate_handles_macos_mid_exit_eperm() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("exit 3")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut sup = spawn_group(cmd).expect("spawn_group");
+    let (pid, pgid) = (sup.identity.pid, sup.identity.pgid);
+    wait_for_mid_exit_eperm_group(pid, pgid);
+
+    let term = terminate(&mut sup, Duration::ZERO)
+        .await
+        .expect("terminate");
+    assert_eq!(term.exit_code, Some(3));
+    assert!(sup.child.id().is_none());
+    assert!(!pid_exists(pid));
+    assert!(!group_exists(pgid));
+}
