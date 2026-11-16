@@ -15,7 +15,6 @@ import "./styles/chat.css";
 import { App } from "./App";
 import { chatLivePopout, runChatLive } from "./chat-live";
 import { runChatShots } from "./chat-shots";
-import { runM1Demo } from "./m1-demo";
 import { runPopoutBench } from "./popout-bench";
 import { runStreamBench } from "./stream-bench";
 import { attach, daemon } from "./daemon/client";
@@ -77,7 +76,10 @@ async function boot() {
   } else if (info.benchMode === "m1-demo" || info.benchMode?.startsWith("m1-demo:")) {
     setStage("m1-demo");
     const exportDir = info.benchMode.startsWith("m1-demo:") ? info.benchMode.slice("m1-demo:".length) : null;
-    if (!isPopout()) await runM1Demo(exportDir);
+    if (!isPopout()) {
+      const { runM1Demo } = await import("./m1-demo");
+      await runM1Demo(exportDir);
+    }
   } else if (info.benchMode === "stream" || info.benchMode === "stream-one") {
     setStage("stream");
     if (!isPopout()) await runStreamBench(info.benchMode === "stream-one");

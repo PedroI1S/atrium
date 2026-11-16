@@ -11,9 +11,9 @@ app with ATRIUM_BENCH=m1-demo (app/src/m1-demo.ts) and walks through M1's promis
   3. Fake question (`question_at_ms`): Answer, Decline, streaming continues both times;
   4. Inbox lists threads with their states, and marking a thread read works;
   5. Cmd+J jumps through inbox items in rank order;
-  6. Notifications: Settings toggles persist in the live daemon, and the daemon's recording
-     notifier suite (`requests_notifications`) proves per-kind posting and suppression;
-  7. Stop a turn / Shutdown to Ended / attempt Resume right after Ended (plus daemon N1 check);
+  6. Notifications: Settings toggle persists in the live daemon (toggle only), and the daemon's
+     recording notifier suite (`requests_notifications`) proves per-kind posting and suppression;
+  7. Stop a turn / Shutdown to Ended / verify fake resume refusal (plus daemon-only scripted-adapter N1 test);
   8. Kill the daemon mid-turn: the app reconnects and the thread shows `Interrupted`;
   9. Export the thread to Markdown and JSONL: both private (0600) files exist with transcript;
  10. Archive removes the thread from lists and inbox.
@@ -25,6 +25,7 @@ windows. `--keep` leaves ATRIUM_HOME, logs, and exported files in place.
 import json
 import os
 import pathlib
+import re
 import shutil
 import signal
 import stat
@@ -36,7 +37,19 @@ import time
 from live_check import App, ROOT, alive, build, daemon_pid
 
 
-def run_cargo_test(test_args: list[str]) -> tuple[bool, str]:
+def all_daemon_pids(home: pathlib.Path) -> set[int]:
+    pids: set[int] = set()
+    if not home.exists():
+        return pids
+    for lock in home.rglob("*.lock"):
+        try:
+            pids.add(int(json.loads(lock.read_text())["pid"]))
+        except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError):
+            continue
+    return pids
+
+
+def run_cargo_test(test_args: list[str], min_passed: int = 1) -> tuple[bool, str]:
     proc = subprocess.run(
         ["cargo", "test", *test_args],
         cwd=ROOT,
@@ -44,14 +57,20 @@ def run_cargo_test(test_args: list[str]) -> tuple[bool, str]:
         stderr=subprocess.STDOUT,
         text=True,
     )
-    summary_line = ""
-    for line in proc.stdout.splitlines():
-        if "test result:" in line:
-            summary_line = line.strip()
+    result_lines = [ln.strip() for ln in proc.stdout.splitlines() if "test result:" in ln]
+    passed = 0
+    for ln in result_lines:
+        m = re.search(r"(\d+)\s+passed\b", ln)
+        if m:
+            passed += int(m.group(1))
+    summary_line = result_lines[-1] if result_lines else ""
     if not summary_line:
         lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
         summary_line = lines[-1] if lines else f"exit {proc.returncode}"
-    return proc.returncode == 0, summary_line
+    ok = proc.returncode == 0 and bool(result_lines) and passed >= min_passed
+    if proc.returncode == 0 and passed < min_passed:
+        summary_line = f"{summary_line} (expected >= {min_passed} passed, got {passed})"
+    return ok, summary_line
 
 
 def verify_exports(export_paths: dict) -> list[tuple[str, bool, str]]:
@@ -102,7 +121,50 @@ def main() -> int:
     export_files: list[pathlib.Path] = []
     app = None
     daemons: set[int] = set()
+    cleaned = False
 
+    def cleanup() -> None:
+        nonlocal cleaned
+        if cleaned:
+            return
+        cleaned = True
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if app is not None:
+            app.kill()
+        daemons.update(all_daemon_pids(home))
+        for pid in list(daemons):
+            if alive(pid):
+                try:
+                    os.kill(pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            daemons.update(all_daemon_pids(home))
+            if not any(alive(pid) for pid in daemons):
+                break
+            time.sleep(0.1)
+        for pid in list(daemons):
+            if alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        kill_deadline = time.monotonic() + 0.5
+        while time.monotonic() < kill_deadline and any(alive(pid) for pid in daemons):
+            time.sleep(0.05)
+        if keep:
+            print(f"kept: {home}")
+            for p in export_files:
+                if p.exists():
+                    print(f"kept export: {p}")
+        else:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def handle_sigterm(_signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signal.SIGTERM)
+
+    prev_sigterm = signal.signal(signal.SIGTERM, handle_sigterm)
     try:
         app = App(home, f"m1-demo:{export_dir}", home / "app.log")
         try:
@@ -113,6 +175,7 @@ def main() -> int:
             if kill_req["kind"] == "failure":
                 raise SystemExit(f"the app failed at stage {kill_req.get('stage')}: {kill_req.get('error')}")
 
+            daemons.update(all_daemon_pids(home))
             old_daemon = daemon_pid(home)
             daemons.add(old_daemon)
             os.kill(old_daemon, signal.SIGKILL)
@@ -124,13 +187,26 @@ def main() -> int:
             if report["kind"] == "failure":
                 raise SystemExit(f"the app failed at stage {report.get('stage')}: {report.get('error')}")
         except BaseException:
+            if app is not None:
+                partial = [
+                    (r["name"], r["pass"], r["detail"])
+                    for r in app.reports()
+                    if r.get("kind") == "m1-demo-check"
+                ]
+                if partial:
+                    print("--- partial checks before failure ---", file=sys.stderr)
+                    for name, ok, detail in partial:
+                        print(f"{'ok  ' if ok else 'FAIL'} {name}  {detail}", file=sys.stderr)
             if (home / "app.log").exists():
                 print("--- app.log ---", file=sys.stderr)
                 print((home / "app.log").read_text(errors="replace"), file=sys.stderr)
                 print("--- end app.log ---", file=sys.stderr)
             raise
 
-        new_daemon = daemon_pid(home)
+        current_pids = all_daemon_pids(home)
+        daemons.update(current_pids)
+        live_new = [p for p in current_pids if p != old_daemon and alive(p)]
+        new_daemon = live_new[0] if live_new else daemon_pid(home)
         daemons.add(new_daemon)
 
         for check in report["checks"]:
@@ -149,39 +225,28 @@ def main() -> int:
         if export_paths:
             results.extend(verify_exports(export_paths))
     finally:
-        if app is not None:
-            app.kill()
-        try:
-            daemons.add(daemon_pid(home))
-        except (SystemExit, OSError):
-            pass
-        for pid in daemons:
-            if alive(pid):
-                os.kill(pid, signal.SIGINT)
-        if keep:
-            print(f"kept: {home}")
-            for p in export_files:
-                if p.exists():
-                    print(f"kept export: {p}")
-        else:
-            time.sleep(0.5)
-            shutil.rmtree(home, ignore_errors=True)
-            for p in export_files:
-                p.unlink(missing_ok=True)
+        cleanup()
+        signal.signal(signal.SIGTERM, prev_sigterm)
 
     # Step 6b & Step 7c: daemon-level checks using the recording notifier and N1 tight loop.
-    notif_ok, notif_detail = run_cargo_test(["-p", "atrium-daemon", "--test", "requests_notifications"])
+    notif_ok, notif_detail = run_cargo_test(
+        ["-p", "atrium-daemon", "--test", "requests_notifications"],
+        min_passed=2,
+    )
     results.append((
         "6b. Daemon recording notifier posts approval/question/failed and respects off-switches",
         notif_ok,
         notif_detail,
     ))
-    n1_ok, n1_detail = run_cargo_test([
-        "-p", "atrium-daemon", "--test", "sessions",
-        "resume_right_after_final_state_in_a_tight_loop",
-    ])
+    n1_ok, n1_detail = run_cargo_test(
+        [
+            "-p", "atrium-daemon", "--test", "sessions",
+            "resume_right_after_final_state_in_a_tight_loop",
+        ],
+        min_passed=1,
+    )
     results.append((
-        "7c. Daemon N1 regression test (resume right after Ended/Interrupted/Failed/Shutdown)",
+        "7c (daemon test, scripted adapter). N1 resume after Ended/Interrupted/Failed/Shutdown",
         n1_ok,
         n1_detail,
     ))

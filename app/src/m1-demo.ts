@@ -7,9 +7,9 @@
 //   3. Fake question (`question_at_ms`): Answer, Decline next turn (streaming continues both times);
 //   4. Inbox lists threads with their states, and marking a thread read works;
 //   5. ⌘J jumps through inbox items in rank order;
-//   6. Settings → Notifications toggles persist in daemon settings (daemon recording notifier
+//   6. Settings → Notifications toggle only (daemon recording notifier
 //      checked separately by m1_demo.py via `cargo test -p atrium-daemon --test requests_notifications`);
-//   7. Stop a turn / Shutdown to Ended / attempt Resume after Ended;
+//   7. Stop a turn / Shutdown to Ended / verify fake Resume refusal;
 //   8. Kill the daemon mid-turn: the app reconnects and the thread shows `Interrupted`;
 //   9. Export a thread to Markdown and JSONL;
 //  10. Archive a thread (`archive_thread`).
@@ -99,17 +99,25 @@ function formatErr(e: unknown): string {
 }
 
 export async function runM1Demo(exportDir: string | null): Promise<void> {
+  const checks: Check[] = [];
   try {
-    await runM1DemoInner(exportDir);
+    await runM1DemoInner(exportDir, checks);
   } catch (e) {
-    throw new Error(formatErr(e));
+    const err = formatErr(e);
+    try {
+      await writeReport({ kind: "m1-demo-failure", checks, error: err });
+    } catch {
+      // Best-effort partial check report; index.tsx's reportFailure still reports the error.
+    }
+    throw new Error(err);
   }
 }
 
-async function runM1DemoInner(exportDir: string | null): Promise<void> {
-  const checks: Check[] = [];
-  const check = (name: string, pass: boolean, detail: unknown) => {
-    checks.push({ name, pass, detail: typeof detail === "string" ? detail : JSON.stringify(detail) });
+async function runM1DemoInner(exportDir: string | null, checks: Check[]): Promise<void> {
+  const check = async (name: string, pass: boolean, detail: unknown) => {
+    const detailStr = typeof detail === "string" ? detail : JSON.stringify(detail);
+    checks.push({ name, pass, detail: detailStr });
+    await writeReport({ kind: "m1-demo-check", name, pass, detail: detailStr });
   };
 
   const connected = () => daemon().connection.type === "connected" && daemon().loaded;
@@ -134,7 +142,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   const c2 = assistantChars(h1.model);
   await waitFor("step 1 turn to become idle", () => daemon().threads[t1]?.state.type === "idle");
   const tools1 = toolItems(h1.model);
-  check("1. Home chat with the fake agent streams", model().mainThread === t1 && c2 > c1 && tools1.length > 0 && document.querySelector(".you")?.textContent === step1Msg, {
+  await check("1. Home chat with the fake agent streams", model().mainThread === t1 && c2 > c1 && tools1.length > 0 && document.querySelector(".you")?.textContent === step1Msg, {
     thread: t1,
     chars: [c1, c2, assistantChars(h1.model)],
     tools: tools1.length,
@@ -163,7 +171,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   await waitFor("step 2a turn to finish idle", () => daemon().threads[t2]?.state.type === "idle");
   const req2a = approvalItems(h2.model)[0];
   const tool2a = toolItems(h2.model)[0];
-  check("2a. Fake approval shows NeedsApproval in queue and Allow succeeds", inQueue && req2a?.outcome === "approved" && tool2a?.status === "succeeded", {
+  await check("2a. Fake approval shows NeedsApproval in queue and Allow succeeds", inQueue && req2a?.outcome === "approved" && tool2a?.status === "succeeded", {
     inQueue,
     outcome: req2a?.outcome,
     toolStatus: tool2a?.status,
@@ -181,7 +189,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   await waitFor("step 2b turn to finish idle", () => daemon().threads[t2]?.state.type === "idle");
   const req2b = approvalItems(h2.model)[1];
   const tool2b = toolItems(h2.model)[1];
-  check("2b. Next turn approval Deny denies the call", req2b?.outcome === "denied" && tool2b?.status === "denied", {
+  await check("2b. Next turn approval Deny denies the call", req2b?.outcome === "denied" && tool2b?.status === "denied", {
     outcome: req2b?.outcome,
     toolStatus: tool2b?.status,
   });
@@ -209,7 +217,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
     toolItems(h2.model)[3]?.status === "succeeded" &&
     daemon().threads[t2]?.state.type === "idle",
   );
-  check("2c. Always creates a rule and the next turn runs without asking", ruleCreated && approvalItems(h2.model).length === 3 && toolItems(h2.model)[3]?.status === "succeeded", {
+  await check("2c. Always creates a rule and the next turn runs without asking", ruleCreated && approvalItems(h2.model).length === 3 && toolItems(h2.model)[3]?.status === "succeeded", {
     rulesCount: rulesAfterAlways.length,
     approvalsAsked: approvalItems(h2.model).length,
     turn4ToolStatus: toolItems(h2.model)[3]?.status,
@@ -238,7 +246,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   await waitFor("step 3a turn to finish idle", () => daemon().threads[t3]?.state.type === "idle");
   const q3a = questionItems(h3.model)[0];
   const charsAfterAnswer = assistantChars(h3.model);
-  check("3a. Fake question shows NeedsInput form and Answer resumes streaming", q3a?.outcome === "answered" && charsAfterAnswer > charsBeforeAnswer, {
+  await check("3a. Fake question shows NeedsInput form and Answer resumes streaming", q3a?.outcome === "answered" && charsAfterAnswer > charsBeforeAnswer, {
     outcome: q3a?.outcome,
     chars: [charsBeforeAnswer, charsAfterAnswer],
   });
@@ -259,7 +267,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   await waitFor("step 3b turn to finish idle", () => daemon().threads[t3]?.state.type === "idle");
   const q3b = questionItems(h3.model)[1];
   const charsAfterDecline = assistantChars(h3.model);
-  check("3b. Next turn Decline resolves question as cancelled and streaming continues", q3b?.outcome === "cancelled" && charsAfterDecline > charsBeforeDecline, {
+  await check("3b. Next turn Decline resolves question as cancelled and streaming continues", q3b?.outcome === "cancelled" && charsAfterDecline > charsBeforeDecline, {
     outcome: q3b?.outcome,
     chars: [charsBeforeDecline, charsAfterDecline],
   });
@@ -308,7 +316,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   const idxApp = domReasons.indexOf("approval");
   const idxQ = domReasons.indexOf("question");
   const idxRep = domReasons.indexOf("reply");
-  check("4a. Inbox lists threads with their states in rank order", idxApp !== -1 && idxQ !== -1 && idxRep !== -1 && idxApp < idxQ && idxQ < idxRep, {
+  await check("4a. Inbox lists threads with their states in rank order", idxApp !== -1 && idxQ !== -1 && idxRep !== -1 && idxApp < idxQ && idxQ < idxRep, {
     domReasons,
     inboxCount: daemon().inbox.length,
   });
@@ -325,7 +333,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
     await waitFor("unread flag cleared by mark_read", () => daemon().threads[tInboxUnread]?.unread === false);
   }
   await waitFor("reply item removed from inbox", () => !daemon().inbox.some((i) => i.thread_id === tInboxUnread));
-  check("4b. Marking a thread read clears unread and removes its reply inbox item", daemon().threads[tInboxUnread]?.unread === false && !daemon().inbox.some((i) => i.thread_id === tInboxUnread), {
+  await check("4b. Marking a thread read clears unread and removes its reply inbox item", daemon().threads[tInboxUnread]?.unread === false && !daemon().inbox.some((i) => i.thread_id === tInboxUnread), {
     mode: markMode,
     remainingInbox: daemon().inbox.map((i) => ({ thread: i.thread_id, reason: i.reason })),
   });
@@ -349,7 +357,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   await waitFor("⌘J jump 3 to wrap back to approval thread", () => screen() === "chat" && model().mainThread === tInboxApproval);
   const jump3 = model().mainThread;
 
-  check("5. Cmd+J cycles through inbox threads in rank order", jump1 === tInboxApproval && jump2 === tInboxQuestion && jump3 === tInboxApproval, {
+  await check("5. Cmd+J cycles through inbox threads in rank order", jump1 === tInboxApproval && jump2 === tInboxQuestion && jump3 === tInboxApproval, {
     jump1,
     jump2,
     jump3,
@@ -361,7 +369,8 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   await command({ type: "thread_command", thread_id: tInboxQuestion, command: { type: "interrupt" } });
 
   // ---------------------------------------------------------------------------
-  // 6. Notifications: Settings → Notifications toggles (daemon notifier checked by m1_demo.py)
+  // 6. Notifications: Settings → Notifications toggle only (posting & suppression tested via
+  //    the daemon recording notifier in `cargo test -p atrium-daemon --test requests_notifications`)
   // ---------------------------------------------------------------------------
   setScreen("settings");
   setSettingsSection("notifications");
@@ -377,13 +386,13 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   await waitFor("notify_approval=true in daemon settings", async () => (await command<Record<string, unknown>>({ type: "get_settings" }))["notify_approval"] === true);
   const onSettings = await command<Record<string, unknown>>({ type: "get_settings" });
 
-  check("6a. Settings -> Notifications toggles persist in daemon settings", offSettings["notify_approval"] === false && onSettings["notify_approval"] === true, {
+  await check("6a. Settings -> Notifications toggle persists in daemon settings (settings toggle only)", offSettings["notify_approval"] === false && onSettings["notify_approval"] === true, {
     afterOff: offSettings["notify_approval"],
     afterOn: onSettings["notify_approval"],
   });
 
   // ---------------------------------------------------------------------------
-  // 7. Stop a turn; thread ends; resume it
+  // 7. Stop a turn; Shutdown to Ended; verify fake resume refusal
   // ---------------------------------------------------------------------------
   setScreen("chat");
   const t7Summary = await startChat(
@@ -395,32 +404,38 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   const h7 = holdThread(t7);
   await waitFor("step 7 thread running with streamed text", () => daemon().threads[t7]?.state.type === "running" && assistantChars(h7.model) > 0);
   await click("Composer Stop button", () => document.querySelector<HTMLElement>('[data-atrium-part="composer"] button[aria-label="Stop the turn"]'));
-  await waitFor("step 7 thread state after Stop", () => daemon().threads[t7]?.state.type !== "running");
+  await waitFor("step 7 thread state after Stop and Stopped note", () =>
+    daemon().threads[t7]?.state.type !== "running" &&
+    h7.model.transcript.items.some((i) => i.kind === "note" && i.note.type === "turn_completed" && i.note.outcome === "interrupted"),
+  );
   const stateAfterStop = daemon().threads[t7]?.state.type;
-  check("7a. Stop ends the running turn", stateAfterStop === "idle" || stateAfterStop === "ended", {
+  const hasStoppedNote = h7.model.transcript.items.some(
+    (i) => i.kind === "note" && i.note.type === "turn_completed" && i.note.outcome === "interrupted",
+  );
+  const charsAtStop = assistantChars(h7.model);
+  await sleep(SAMPLE_GAP_MS);
+  const charsAfterStopWait = assistantChars(h7.model);
+  await check("7a. Stop ends the running turn", (stateAfterStop === "idle" || stateAfterStop === "ended") && hasStoppedNote && charsAfterStopWait === charsAtStop, {
     stateAfterStop,
+    hasStoppedNote,
+    chars: [charsAtStop, charsAfterStopWait],
     note: stateAfterStop === "idle" ? "Stop sends Interrupt (ends turn to idle); Shutdown ends session to ended" : "ended",
   });
 
-  // End the session via Shutdown so it reaches `ended`, then attempt `resume_thread` right after `ended`.
+  // End the session via Shutdown so it reaches `ended`, then verify `resume_thread` on a
+  // synthetic (`atrium-fake:`) thread is refused (real resume is tested in the human demo + 7c).
   await command({ type: "thread_command", thread_id: t7, command: { type: "shutdown" } });
   await waitFor("step 7 thread to reach ended", () => daemon().threads[t7]?.state.type === "ended");
-  let resumeOk = false;
+  let refused = false;
   let resumeDetail = "";
   try {
     const resumed = await command<ThreadSummary>({ type: "resume_thread", thread_id: t7 });
-    await waitFor("resumed incarnation to stream", () => resumed.incarnation === 2 && daemon().threads[t7]?.incarnation === 2);
-    resumeOk = true;
-    resumeDetail = `incarnation=${resumed.incarnation}`;
+    resumeDetail = `unexpectedly resumed (incarnation=${resumed.incarnation})`;
   } catch (e) {
-    resumeOk = false;
-    resumeDetail = isCommandFailure(e)
-      ? e.kind === "rejected"
-        ? `${e.kind} (${e.code}): ${e.message}`
-        : `${e.kind}: ${e.message}`
-      : String(e);
+    refused = isCommandFailure(e) && e.kind === "rejected" && e.code === "invalid" && e.message.includes("can't be resumed");
+    resumeDetail = formatErr(e);
   }
-  check("7b. Resume synthetic thread right after Ended streams a new incarnation", resumeOk, resumeDetail);
+  await check("7b. resume of a synthetic thread is refused (fake-agent limit; real resume: human demo + 7c)", refused, resumeDetail);
   h7.release();
 
   // ---------------------------------------------------------------------------
@@ -441,7 +456,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   await waitFor("app to reconnect and show Interrupted", () => connected() && daemon().threads[t8]?.state.type === "interrupted", RECONNECT_TIMEOUT_MS);
   await waitFor("step 8 transcript to close", () => transcriptClosed(h8.model), RECONNECT_TIMEOUT_MS);
   const charsAfterKill = assistantChars(h8.model);
-  check("8. Kill daemon mid-turn: app reconnects and thread shows Interrupted", daemon().threads[t8]?.state.type === "interrupted" && transcriptClosed(h8.model) && charsAfterKill >= charsBeforeKill, {
+  await check("8. Kill daemon mid-turn: app reconnects and thread shows Interrupted", daemon().threads[t8]?.state.type === "interrupted" && transcriptClosed(h8.model) && charsAfterKill >= charsBeforeKill, {
     state: daemon().threads[t8]?.state.type,
     chars: [charsBeforeKill, charsAfterKill],
   });
@@ -455,7 +470,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   const jsonlPath = `${exportDir}/thread.jsonl`;
   const mdRes = await command<{ bytes: number }>({ type: "export_thread", thread_id: t1, format: "markdown", path: mdPath });
   const jsonlRes = await command<{ bytes: number }>({ type: "export_thread", thread_id: t1, format: "jsonl", path: jsonlPath });
-  check("9a. Export command writes Markdown and JSONL files", mdRes.bytes > 0 && jsonlRes.bytes > 0, {
+  await check("9a. Export command writes Markdown and JSONL files", mdRes.bytes > 0 && jsonlRes.bytes > 0, {
     thread: t1,
     mdPath,
     mdBytes: mdRes.bytes,
@@ -475,7 +490,7 @@ async function runM1DemoInner(exportDir: string | null): Promise<void> {
   } catch (e) {
     rejectedAfterArchive = isCommandFailure(e) && e.kind === "rejected" && e.code === "unknown_thread";
   }
-  check("10. Archive removes thread from lists and inbox", !listedAfterArchive.some((t) => t.thread_id === t1) && rejectedAfterArchive, {
+  await check("10. Archive removes thread from lists and inbox", !listedAfterArchive.some((t) => t.thread_id === t1) && rejectedAfterArchive, {
     archived: t1,
     inList: listedAfterArchive.some((t) => t.thread_id === t1),
     rejectedUnknownThread: rejectedAfterArchive,

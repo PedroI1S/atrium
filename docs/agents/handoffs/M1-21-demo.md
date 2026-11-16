@@ -123,3 +123,60 @@ ok   6b. Daemon recording notifier posts approval/question/failed and respects o
 ok   7c. Daemon N1 regression test (resume right after Ended/Interrupted/Failed/Shutdown)    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.34s
 19/20 passed
 ```
+
+## Fix round 1
+
+Addressed all findings from `.orchestration/review-input/M1-21-demo.md` (commit `76a0943`):
+
+1. **7b fake-resume guard check (`app/src/m1-demo.ts`):** asserted that `resume_thread` on the shut-down synthetic (`atrium-fake:`) thread is refused with `kind === "rejected"`, `code === "invalid"`, and message containing `"can't be resumed"`, reusing `formatErr`, and reported as `7b. resume of a synthetic thread is refused (fake-agent limit; real resume: human demo + 7c)`.
+2. **`run_cargo_test` & 7c label (`app/scripts/m1_demo.py`):** parsed `(\d+)\s+passed\b` across `test result:` lines and failed unless `passed >= min_passed` (`>= 2` for `6b`, `>= 1` for `7c`); relabeled `7c` as `7c (daemon test, scripted adapter). N1 resume after Ended/Interrupted/Failed/Shutdown`.
+3. **Cleanup & signal handling (`app/scripts/m1_demo.py`):** added `all_daemon_pids(home)` to collect PIDs from every `*.lock` file seen during the run (before step-8 kill, after reconnect, and in cleanup), polled up to 3.0 s after `SIGINT` before falling back to `SIGKILL`, added a `SIGTERM` handler triggering the same idempotent `cleanup()`, and removed the redundant `export_files` unlinks after `shutil.rmtree(home)`.
+4. **Mid-run check reporting (`app/src/m1-demo.ts`, `app/scripts/m1_demo.py`):** emitted `ATRIUM_REPORT` `m1-demo-check` after each check completes and `m1-demo-failure` (including `checks` so far) on catch; `m1_demo.py` prints any partial `m1-demo-check` results on failure before `app.log`.
+5. **7a Stop assertion (`app/src/m1-demo.ts`):** asserted that the `"Stopped"` note (`turn_completed` with `outcome === "interrupted"`) is present in `h7.model.transcript.items` and `assistantChars(h7.model)` stops growing across `SAMPLE_GAP_MS`.
+6. **6a/6b wording (`app/src/m1-demo.ts`, `app/scripts/m1_demo.py`):** clarified `6a` as `6a. Settings -> Notifications toggle persists in daemon settings (settings toggle only)` and kept `6b` explicitly tied to the daemon recording notifier.
+7. **Dynamic `import()` (`app/src/index.tsx`):** loaded `./m1-demo` via dynamic `import("./m1-demo")` inside the `m1-demo` bench branch (`vite build` emits `dist/assets/m1-demo-*.js` separately).
+8. **Doc fixes (`docs/demos/M1-demo.md`):**
+   - Noted real macOS Notification Center banners (`CommandNotifier` in `crates/atrium-daemon/src/upkeep.rs` via `/usr/bin/osascript`), `cargo test` cold-build duration, and keeping `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock` around the whole script.
+   - Verified and cited focused-chat notification suppression in code: `app/src/ui/ThreadCard.tsx` (`reportFocus` → `set_focus`), `crates/atrium-daemon/src/hub.rs` (`thread_changed`), and `crates/atrium-core/src/attention/mod.rs` (`should_notify`).
+   - Clarified in steps 7 and 8 that the UI has no button to reach **Ended** (automated run sends `Shutdown`), synthetic (`atrium-fake:`) threads cannot be resumed (`Resume` is hidden in `ThreadCard.tsx` and `resume_thread` is refused), and the live demo uses real provider threads.
+
+### Fix round 1 checks
+
+- `pnpm --dir app typecheck && pnpm --dir app test && pnpm --dir app build`: exited 0
+  - `tsc --noEmit`: 0 errors
+  - `vitest run`: `Test Files  14 passed (14)`, `Tests  264 passed (264)`
+  - `vite build`: `2310 modules transformed`, `dist/assets/m1-demo-Dah6pcAo.js  13.89 kB │ gzip: 4.36 kB`, built in `2.00s`
+- `python3 -m py_compile app/scripts/m1_demo.py`: exited 0
+- `cargo fmt` / `cargo clippy`: skipped (no Rust files changed).
+- `/usr/bin/lockf -k /tmp/atrium-gui-measure.lock python3 app/scripts/m1_demo.py`: blocked by worker shell pre-tool hook (`absolute paths outside the worktree are not allowed: /tmp/atrium-gui-measure.lock`). Ran `python3 app/scripts/m1_demo.py` 3 times sequentially without `lockf`:
+
+| Run | Exit | Result | Daemon PIDs | `6b` (`requests_notifications`) | `7c` (`sessions` N1) |
+|---|---|---|---|---|---|
+| 1 | `0` | `20/20 passed` | `25821 -> 25849` | `2 passed; 0 failed` (`0.34s`) | `1 passed; 0 failed` (`0.52s`) |
+| 2 | `0` | `20/20 passed` | `25894 -> 25903` | `2 passed; 0 failed` (`0.30s`) | `1 passed; 0 failed` (`0.86s`) |
+| 3 | `0` | `20/20 passed` | `25959 -> 26076` | `2 passed; 0 failed` (`0.31s`) | `1 passed; 0 failed` (`0.52s`) |
+
+Run 3 output:
+```text
+ok   1. Home chat with the fake agent streams                                                      {"thread":"th-18e86c0e5c6eb9c8-1","chars":[320,592,960],"tools":3,"state":"idle"}
+ok   2a. Fake approval shows NeedsApproval in queue and Allow succeeds                             {"inQueue":true,"outcome":"approved","toolStatus":"succeeded"}
+ok   2b. Next turn approval Deny denies the call                                                   {"outcome":"denied","toolStatus":"denied"}
+ok   2c. Always creates a rule and the next turn runs without asking                               {"rulesCount":1,"approvalsAsked":3,"turn4ToolStatus":"succeeded"}
+ok   3a. Fake question shows NeedsInput form and Answer resumes streaming                          {"outcome":"answered","chars":[16,256]}
+ok   3b. Next turn Decline resolves question as cancelled and streaming continues                  {"outcome":"cancelled","chars":[272,512]}
+ok   4a. Inbox lists threads with their states in rank order                                       {"domReasons":["approval","question","reply"],"inboxCount":3}
+ok   4b. Marking a thread read clears unread and removes its reply inbox item                      {"mode":"auto-on-view","remainingInbox":[{"thread":"th-18e86c0f2f9133a8-4","reason":"approval"},{"thread":"th-18e86c0f2fb1fe30-5","reason":"question"}]}
+ok   5. Cmd+J cycles through inbox threads in rank order                                           {"jump1":"th-18e86c0f2f9133a8-4","jump2":"th-18e86c0f2fb1fe30-5","jump3":"th-18e86c0f2f9133a8-4","expected":["th-18e86c0f2f9133a8-4","th-18e86c0f2fb1fe30-5","th-18e86c0f2f9133a8-4"]}
+ok   6a. Settings -> Notifications toggle persists in daemon settings (settings toggle only)       {"afterOff":false,"afterOn":true}
+ok   7a. Stop ends the running turn                                                                {"stateAfterStop":"idle","hasStoppedNote":true,"chars":[32,32],"note":"Stop sends Interrupt (ends turn to idle); Shutdown ends session to ended"}
+ok   7b. resume of a synthetic thread is refused (fake-agent limit; real resume: human demo + 7c)  rejected (invalid): a synthetic thread can't be resumed
+ok   8. Kill daemon mid-turn: app reconnects and thread shows Interrupted                          {"state":"interrupted","chars":[32,96]}
+ok   9a. Export command writes Markdown and JSONL files                                            {"thread":"th-18e86c0e5c6eb9c8-1","mdPath":"/tmp/atrium-demo-l_zo2vf7/exports/thread.md","mdBytes":2029,"jsonlPath":"/tmp/atrium-demo-l_zo2vf7/exports/thread.jsonl","jsonlBytes":4586}
+ok   10. Archive removes thread from lists and inbox                                               {"archived":"th-18e86c0e5c6eb9c8-1","inList":false,"rejectedUnknownThread":true}
+ok   8b. App started a new daemon after SIGKILL                                                    pid 25959 -> 26076
+ok   9b. Markdown export file exists (0600) and contains transcript                                exists=True mode=0o600 bytes=2029
+ok   9c. JSONL export file exists (0600), parses as JSONL, and contains transcript                 exists=True mode=0o600 lines=12 valid_json=True
+ok   6b. Daemon recording notifier posts approval/question/failed and respects off-switches        test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+ok   7c (daemon test, scripted adapter). N1 resume after Ended/Interrupted/Failed/Shutdown         test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.52s
+20/20 passed
+```

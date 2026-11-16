@@ -4,13 +4,15 @@ A one-page walkthrough for demonstrating Milestone 1 (Daemon + Home + attention)
 
 ## Automated run (synthetic agent, no real provider)
 
-Run under the GUI lock so desktop measurements do not overlap:
+Run under the GUI lock so desktop measurements do not overlap (keep `lockf` around the whole script):
 
 ```fish
 /usr/bin/lockf -k /tmp/atrium-gui-measure.lock python3 app/scripts/m1_demo.py
 ```
 
-Pass `--keep` to inspect the throwaway `ATRIUM_HOME` directory, `app.log`, and exported `.md` / `.jsonl` files afterwards. Related live checks: `python3 app/scripts/live_check.py` (pop-out windows, drafts, app crash recovery) and `python3 app/scripts/chat_check.py` (pop-out mid-stream + daemon kill).
+- **Desktop banners & build time:** the automated run opens app windows and posts real macOS Notification Center banners (`CommandNotifier` in `crates/atrium-daemon/src/upkeep.rs` invokes `/usr/bin/osascript` on macOS). After the app section finishes, `m1_demo.py` runs `cargo test` (daemon recording notifier + scripted-adapter N1 resume test) with no timeout; a cold Rust test build can take several minutes.
+- **Fake-agent limit:** step `7b` asserts that `resume_thread` on a synthetic (`atrium-fake:`) thread is refused (`invalid`), while real resume is checked by the scripted-adapter daemon test (`7c`) and the live demo below.
+- Pass `--keep` to inspect the throwaway `ATRIUM_HOME` directory, `app.log`, and exported `.md` / `.jsonl` files afterwards. Related live checks: `python3 app/scripts/live_check.py` (pop-out windows, drafts, app crash recovery) and `python3 app/scripts/chat_check.py` (pop-out mid-stream + daemon kill).
 
 ---
 
@@ -45,16 +47,16 @@ Launch the app (`cargo run -p atrium-app --features custom-protocol` or the buil
 
 6. **Notifications**
    - Open **Settings (`⌘,`) → Notifications** and confirm the three switches (**An agent needs your approval**, **An agent has a question**, **A chat failed**) are on.
-   - Start an approval-triggering turn, then switch to **Inbox** or unfocus the Atrium window (notifications are suppressed for the focused chat).
+   - Start an approval-triggering turn, then switch to **Inbox** or unfocus the Atrium window (notifications are suppressed for the focused chat: `ThreadCard.tsx` calls `reportFocus` → `set_focus`, and `crates/atrium-daemon/src/hub.rs` `thread_changed` / `crates/atrium-core/src/attention/mod.rs` `should_notify` return `false` when `focused` is true).
    - **Expect:** a macOS notification banner appears. Turn off **An agent needs your approval** and repeat — no approval notification is posted. Turn it back on.
 
 7. **Stop & Resume**
-   - Start a long turn and click the square **Stop the turn** button in the composer — **Expect:** the turn ends (`Stopped`, thread returns to **Idle**).
-   - In a thread whose session ended or was interrupted, click **Resume** in the thread header (when **Interrupted**) or send a new message in the composer — **Expect:** a new incarnation starts from the stored native session ID and continues the conversation.
+   - Start a long turn and click the square **Stop the turn** button in the composer — **Expect:** the turn ends (`Stopped`, thread returns to **Idle**). Note: the UI has no button to reach **Ended** (the automated run sends `Shutdown` over the daemon protocol).
+   - In a real provider thread (**Claude Code** or **Codex**) whose session was interrupted or ended, click **Resume** in the thread header (visible when **Interrupted**) or send a new message in the composer — **Expect:** a new incarnation starts from the stored native session ID and continues the conversation. *(Fake `atrium-fake:` threads cannot be resumed; `atriumd` refuses `resume_thread` and `ThreadCard.tsx` hides the **Resume** button for them.)*
 
 8. **Daemon kill & recovery**
-   - Start a streaming turn, then kill the daemon (`pkill -9 atriumd`).
-   - **Expect:** the connection banner appears, Atrium launches a fresh `atriumd` and reconnects, and the cut-off thread transitions to **Interrupted** with its partial transcript intact. Click **Resume** in the header to continue it.
+   - Start a streaming turn with a real provider thread, then kill the daemon (`pkill -9 atriumd`).
+   - **Expect:** the connection banner appears, Atrium launches a fresh `atriumd` and reconnects, and the cut-off thread transitions to **Interrupted** with its partial transcript intact. Click **Resume** in the header to continue it *(available for real provider threads; hidden for synthetic `fake` threads)*.
 
 9. **Export & Archive (protocol/daemon status in M1)**
    - *Note:* `export_thread` (Markdown & JSONL, mode `0600`, home path & secret redaction) and `archive_thread` are implemented in `atriumd` and verified by `app/scripts/m1_demo.py`, but do not yet have UI buttons in the M1 app shell.
