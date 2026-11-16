@@ -788,3 +788,8 @@ Seeing the M1-27 batch take 25+ minutes for small fixes (four workers each build
 - **Why:** the M1-32 worker pointed out that the line follows the link and reads the contents of `~/.ssh`, so it is a real credential read. `dev`'s old verdict was Ask/Allow/Allow, which would let Any and FullAccess read private keys. Five tests on `dev` assert the hard deny in all three settings.
 - **K5 is closed as correct behaviour.** This is not a known limit, so D-120 needs no exception for it. M1-32's scope is S11 only.
 - **Security defaults are unchanged**, since this keeps `dev`'s current behaviour. D-013 gives such changes to Pedro, who can reopen K5.
+
+## D-126 — 2026-11-16 — rodrigo: wait for Hydrogen's quota
+rodrigo's Gemini 4 Hydrogen quota ran out at about 19:17 (-03:00), and resets around 20:56. **rodrigo chose to wait** rather than move the writers to Claude (D-047: a worker that hits a limit is paused, not re-routed).
+- Paused: M1-32's rework 2 (stopped midway; the orchestrator committed its uncommitted work as WIP, `3b43254`, unchecked), M1-30's rework 3 (didn't start) and M1-29's rework 4 (prompt ready).
+- Not paused, because they don't use Hydrogen: the orchestrator's verifications and the Codex reviews.
