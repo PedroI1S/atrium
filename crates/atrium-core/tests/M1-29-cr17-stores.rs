@@ -1577,10 +1577,12 @@ fn round5_finding4_gate_hardlink_remembered_rule() {
         ))),
         GateDecision::Allow
     );
-    assert_eq!(
+    // A shell command through the hard link keeps dev's answer: it asks
+    // even under an Execute Any rule (adversarial_m1_18 `cat asks2/hl`).
+    assert!(matches!(
         block_on(g_rules.gate.check(&cmd_check("cat proj/tf_hard"))),
-        GateDecision::Allow
-    );
+        GateDecision::Ask { .. }
+    ));
     assert!(matches!(
         block_on(g_rules.gate.check(&paths_check(
             ToolKind::Read,

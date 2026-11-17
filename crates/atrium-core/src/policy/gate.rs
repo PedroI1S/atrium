@@ -373,7 +373,14 @@ fn evaluate_sync(
             ),
             PolicyVerdict::Allow { .. }
         );
-        let known_ask_ids: &[(u64, u64)] = if rule_allowed { &ask_ids } else { &[] };
+        // Only a file tool naming the alias literally: a shell command keeps
+        // dev's conservative answer (a hard link asks there whatever the rules).
+        let file_tool = matches!(&check.subject, ToolSubject::Paths { .. });
+        let known_ask_ids: &[(u64, u64)] = if rule_allowed && file_tool {
+            &ask_ids
+        } else {
+            &[]
+        };
         if reaches_multiply_linked(check, &analysis, &resolved, known_ask_ids) {
             verdict = PolicyVerdict::Ask;
         }
@@ -1516,16 +1523,16 @@ fn reaches_multiply_linked(
             if command_word {
                 continue;
             }
-            if multiply_linked_file(p) && !is_known_ask_file(p, known_ask_ids) {
+            if multiply_linked_file(p) && (globby || !is_known_ask_file(p, known_ask_ids)) {
                 return true;
             }
             if globby
                 && let Some(dir) = p.parent()
-                && tree_has_multiply_linked(dir, 1, known_ask_ids)
+                && tree_has_multiply_linked(dir, 1)
             {
                 return true;
             }
-            if recursive && p.is_dir() && tree_has_multiply_linked(p, 8, known_ask_ids) {
+            if recursive && p.is_dir() && tree_has_multiply_linked(p, 8) {
                 return true;
             }
         }
@@ -1533,7 +1540,8 @@ fn reaches_multiply_linked(
     false
 }
 
-fn tree_has_multiply_linked(root: &Path, max_depth: u8, known_ask_ids: &[(u64, u64)]) -> bool {
+/// A bounded walk (links not followed) looking for a multiply-linked file.
+fn tree_has_multiply_linked(root: &Path, max_depth: u8) -> bool {
     const BUDGET: usize = 4096;
     let mut seen = 0usize;
     let mut stack = vec![(root.to_path_buf(), 0u8)];
@@ -1553,10 +1561,7 @@ fn tree_has_multiply_linked(root: &Path, max_depth: u8, known_ask_ids: &[(u64, u
                 if !skip && depth + 1 < max_depth {
                     stack.push((p, depth + 1));
                 }
-            } else if ft.is_file()
-                && multiply_linked_file(&p)
-                && !is_known_ask_file(&p, known_ask_ids)
-            {
+            } else if ft.is_file() && multiply_linked_file(&p) {
                 return true;
             }
         }
