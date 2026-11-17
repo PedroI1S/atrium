@@ -1177,16 +1177,18 @@ impl Ctx<'_> {
         let a = self.a;
 
         // paths, per use
+        let mut glob_seen: Vec<(String, Role)> = vec![];
         for (idx, u) in a.uses.iter().enumerate() {
             let globby = u.word.contains(['*', '?', '[']);
-            for p in a.all_paths(idx) {
+            let aligned_slice = a.aligned.as_ref().map(|al| al[idx].as_slice());
+            for p in u.paths.iter().chain(aligned_slice.into_iter().flatten()) {
                 if let Some(h) = self.s.hit(p, u.role) {
                     hits.push(h);
                 }
                 if self.s.is_ssh_dir(p) && self.ssh_dir_hit(u) {
                     hits.push("credential-read");
                 }
-                if globby && let Some(h) = self.s.glob_hit(p, u.role) {
+                if globby && let Some(h) = self.fast_glob_hit(p, u.role, &mut glob_seen) {
                     hits.push(h);
                 }
             }
@@ -1240,7 +1242,12 @@ impl Ctx<'_> {
                 }
             } else {
                 for idx in 0..a.uses.len() {
-                    for p in a.all_paths(idx) {
+                    let aligned_slice = a.aligned.as_ref().map(|al| al[idx].as_slice());
+                    for p in a.uses[idx]
+                        .paths
+                        .iter()
+                        .chain(aligned_slice.into_iter().flatten())
+                    {
                         if let Some(h) = self.dir_contains_hard_deny(p) {
                             hits.push(h);
                         }
@@ -1655,6 +1662,146 @@ impl Ctx<'_> {
         }
         None
     }
+
+    fn might_glob_hit_probe(&self, pl: &str) -> bool {
+        const BROWSER_PROBE_FILES: &[&str] =
+            &["cookies", "login data", "cookies.sqlite", "logins.json"];
+        if pl.contains("**") {
+            let bp_end = pl.find(['*', '?', '[', '{', '\\']).unwrap_or(pl.len());
+            let bp = &pl[..bp_end];
+            if bp.is_empty() || self.s.home.starts_with(bp) {
+                return true;
+            }
+            if self.s.data.iter().any(|d| {
+                d.starts_with(bp)
+                    || bp
+                        .strip_prefix(d.as_str())
+                        .is_some_and(|r| r.is_empty() || "/x".starts_with(r))
+            }) {
+                return true;
+            }
+            let after_home = if self.s.home == "/" {
+                bp.strip_prefix('/')
+            } else {
+                bp.strip_prefix(&self.s.home)
+                    .and_then(|r| r.strip_prefix('/'))
+            };
+            let Some(rel_bp) = after_home else {
+                return false;
+            };
+            return CRED_FILES.iter().any(|f| f.starts_with(rel_bp))
+                || CRED_TREES.iter().any(|t| {
+                    t.starts_with(rel_bp)
+                        || rel_bp
+                            .strip_prefix(t)
+                            .is_some_and(|r| r.is_empty() || "/x".starts_with(r))
+                })
+                || SSH_PROBES.iter().any(|n| {
+                    ".ssh/".starts_with(rel_bp)
+                        || rel_bp
+                            .strip_prefix(".ssh/")
+                            .is_some_and(|r| n.starts_with(r))
+                })
+                || BROWSER_ROOTS.iter().any(|b| {
+                    b.starts_with(rel_bp)
+                        || rel_bp.strip_prefix(b).is_some_and(|r| {
+                            r.is_empty()
+                                || r.strip_prefix('/').is_some_and(|rem| {
+                                    BROWSER_PROBE_FILES.iter().any(|f| f.starts_with(rem))
+                                        || "default".starts_with(rem)
+                                        || rem.strip_prefix("default/").is_some_and(|f_rem| {
+                                            BROWSER_PROBE_FILES.iter().any(|f| f.starts_with(f_rem))
+                                        })
+                                })
+                        })
+                });
+        }
+
+        fn seg_ok(c: &str, q: &str) -> bool {
+            (c.starts_with(['.', '{', '\\']) || !q.starts_with('.'))
+                && (c.contains(['*', '?', '[', '{', '\\']) || c == q)
+        }
+        fn slice_matches_iter<'a, I: Iterator<Item = &'a str>>(pat: &[&str], probe: I) -> bool {
+            let mut idx = 0usize;
+            for q in probe {
+                if idx >= pat.len() || !seg_ok(pat[idx], q) {
+                    return false;
+                }
+                idx += 1;
+            }
+            idx == pat.len()
+        }
+        let pl_segs: Vec<&str> = pl.split('/').collect();
+        for d in &self.s.data {
+            if slice_matches_iter(&pl_segs, d.split('/'))
+                || slice_matches_iter(&pl_segs, d.split('/').chain(std::iter::once("x")))
+            {
+                return true;
+            }
+        }
+        let home_segs: Vec<&str> = self.s.home.split('/').collect();
+        if pl_segs.len() <= home_segs.len()
+            || !pl_segs[..home_segs.len()]
+                .iter()
+                .zip(&home_segs)
+                .all(|(c, q)| seg_ok(c, q))
+        {
+            return false;
+        }
+        let rel = &pl_segs[home_segs.len()..];
+        if !rel[0].starts_with(['.', '{', '\\'])
+            && (rel.len() == 1
+                || (!rel[0].contains(['*', '?', '[', '{', '\\']) && rel[0] != "library"))
+        {
+            return false;
+        }
+        CRED_FILES
+            .iter()
+            .any(|f| slice_matches_iter(rel, f.split('/')))
+            || CRED_TREES.iter().any(|t| {
+                slice_matches_iter(rel, t.split('/'))
+                    || slice_matches_iter(rel, t.split('/').chain(std::iter::once("x")))
+            })
+            || (rel.len() == 2
+                && seg_ok(rel[0], ".ssh")
+                && SSH_PROBES.iter().any(|n| seg_ok(rel[1], n)))
+            || BROWSER_ROOTS.iter().any(|b| {
+                BROWSER_PROBE_FILES.iter().any(|f| {
+                    slice_matches_iter(rel, b.split('/').chain(std::iter::once(*f)))
+                        || slice_matches_iter(rel, b.split('/').chain(["default", *f]))
+                })
+            })
+    }
+
+    fn fast_glob_hit(
+        &self,
+        p: &Path,
+        role: Role,
+        glob_seen: &mut Vec<(String, Role)>,
+    ) -> Option<&'static str> {
+        let pl = lower(p);
+        if glob_seen.iter().any(|(prev, r)| *r == role && *prev == pl) {
+            return None;
+        }
+        glob_seen.push((pl.clone(), role));
+        let mut prefix = PathBuf::new();
+        for c in Path::new(&pl).components() {
+            let s = c.as_os_str().to_string_lossy();
+            if s.contains(['*', '?', '[']) {
+                break;
+            }
+            prefix.push(c.as_os_str());
+        }
+        if let Some(h) = self.s.hit(&prefix, role)
+            && prefix.as_os_str() != "/"
+        {
+            return Some(h);
+        }
+        if !self.might_glob_hit_probe(&pl) {
+            return None;
+        }
+        self.s.glob_hit(p, role)
+    }
 }
 
 struct SearchRootSpec {
@@ -2027,7 +2174,21 @@ fn git_grep_roots(eff: &[String]) -> Option<SearchRootSpec> {
 
 fn recursive_search_roots(eff: &[String]) -> Option<SearchRootSpec> {
     let first = eff.first()?;
-    let b_fold = fold(base(first));
+    let mut ascii_buf = [0u8; 6];
+    let owned_fold: String;
+    let b_raw = base(first);
+    let b_fold: &str = if b_raw.is_ascii() {
+        if b_raw.len() > 6 {
+            return None;
+        }
+        for (dst, src) in ascii_buf.iter_mut().zip(b_raw.bytes()) {
+            *dst = src.to_ascii_lowercase();
+        }
+        std::str::from_utf8(&ascii_buf[..b_raw.len()]).unwrap_or("")
+    } else {
+        owned_fold = fold(b_raw);
+        owned_fold.as_str()
+    };
     const RG_OPTS: SearchOpts = SearchOpts {
         val_s: "egtTmABCdjMErf",
         val_l: super::engine::RG_VAL_L,
@@ -2287,7 +2448,7 @@ fn recursive_search_roots(eff: &[String]) -> Option<SearchRootSpec> {
         skip_parens: false,
     };
     let args = &eff[1..];
-    match b_fold.as_str() {
+    match b_fold {
         "rg" => parse_search_opts(args, &RG_OPTS),
         "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" => parse_search_opts(args, &GREP_OPTS),
         "rgrep" => parse_search_opts(args, &RGREP_OPTS),
@@ -2382,9 +2543,39 @@ fn unescape_glob_backslashes(g: &str) -> String {
 const MAX_GLOB_VARIANTS: usize = 256;
 /// Upper bound on state transitions per glob check so pathological globs fail
 /// closed to Ask in linear/bounded time (K10).
-const MAX_GLOB_WORK: usize = 100_000;
+const MAX_GLOB_WORK: usize = 20_000;
 /// Upper bound on total reconstructed bytes across normalized variants.
 const MAX_NORM_OUTPUT_BYTES: usize = 512 * 1024;
+
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl std::hash::Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517cc1b727220a95);
+        }
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(i)).wrapping_mul(0x517cc1b727220a95);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+}
+
+type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+type FxMap<K, V> = HashMap<K, V, FxBuildHasher>;
+type FxSet<T> = std::collections::HashSet<T, FxBuildHasher>;
+
+const SEG_SYNTAX_META: u8 = 1;
+const SEG_PAT: u8 = 2;
 
 struct NormNode {
     parent: usize,
@@ -2400,9 +2591,11 @@ struct NormNode {
 struct NormArena<'a> {
     nodes: Vec<NormNode>,
     segs: Vec<&'a str>,
-    seg_ids: HashMap<&'a str, u32>,
+    seg_flags: Vec<u8>,
+    seg_ids: FxMap<&'a str, u32>,
     last_seg: (&'a str, u32),
-    intern: HashMap<(usize, u32, usize), usize>,
+    intern_buckets: Vec<u32>,
+    intern_len: usize,
     can_branch: bool,
     work: usize,
     budget: usize,
@@ -2410,7 +2603,7 @@ struct NormArena<'a> {
 
 impl<'a> NormArena<'a> {
     fn new(budget: usize) -> Self {
-        let mut seg_ids = HashMap::new();
+        let mut seg_ids = FxMap::default();
         seg_ids.insert("", 0);
         seg_ids.insert("..", 1);
         seg_ids.insert("**", 2);
@@ -2426,9 +2619,11 @@ impl<'a> NormArena<'a> {
                 non_globstar_before_dd: 0,
             }],
             segs: vec!["", "..", "**"],
+            seg_flags: vec![0, 0, SEG_PAT],
             seg_ids,
             last_seg: ("", 0),
-            intern: HashMap::new(),
+            intern_buckets: Vec::new(),
+            intern_len: 0,
             can_branch: false,
             work: 0,
             budget,
@@ -2444,6 +2639,74 @@ impl<'a> NormArena<'a> {
         self.work <= self.budget
     }
 
+    fn intern_hash(parent: usize, seg_id: u32, count: usize) -> usize {
+        let mut h = (parent as u64).wrapping_mul(0x517cc1b727220a95);
+        h = (h.rotate_left(5) ^ u64::from(seg_id)).wrapping_mul(0x517cc1b727220a95);
+        h = (h.rotate_left(5) ^ (count as u64)).wrapping_mul(0x517cc1b727220a95);
+        (h ^ (h >> 32)) as usize
+    }
+
+    fn intern_find(&self, parent: usize, seg_id: u32, count: usize) -> Option<usize> {
+        if self.intern_buckets.is_empty() {
+            return None;
+        }
+        let mask = self.intern_buckets.len() - 1;
+        let mut slot = Self::intern_hash(parent, seg_id, count) & mask;
+        loop {
+            let cur = self.intern_buckets[slot];
+            if cur == u32::MAX {
+                return None;
+            }
+            let n = &self.nodes[cur as usize];
+            if n.parent == parent && n.seg_id == seg_id && n.count == count {
+                return Some(cur as usize);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    fn intern_insert(&mut self, parent: usize, seg_id: u32, count: usize, node_id: usize) {
+        if self.intern_buckets.is_empty() {
+            self.intern_buckets = vec![u32::MAX; 1024];
+        } else if (self.intern_len + 1) * 2 > self.intern_buckets.len() {
+            let new_cap = self.intern_buckets.len() * 2;
+            let old = std::mem::replace(&mut self.intern_buckets, vec![u32::MAX; new_cap]);
+            let mask = new_cap - 1;
+            for cur in old {
+                if cur == u32::MAX {
+                    continue;
+                }
+                let n = &self.nodes[cur as usize];
+                let mut slot = Self::intern_hash(n.parent, n.seg_id, n.count) & mask;
+                while self.intern_buckets[slot] != u32::MAX {
+                    slot = (slot + 1) & mask;
+                }
+                self.intern_buckets[slot] = cur;
+            }
+        }
+        let mask = self.intern_buckets.len() - 1;
+        let mut slot = Self::intern_hash(parent, seg_id, count) & mask;
+        while self.intern_buckets[slot] != u32::MAX {
+            slot = (slot + 1) & mask;
+        }
+        self.intern_buckets[slot] = node_id as u32;
+        self.intern_len += 1;
+    }
+
+    fn enable_branch(&mut self) {
+        if self.can_branch {
+            return;
+        }
+        self.can_branch = true;
+        for id in 1..self.nodes.len() {
+            let (parent, seg_id, count) = {
+                let n = &self.nodes[id];
+                (n.parent, n.seg_id, n.count)
+            };
+            self.intern_insert(parent, seg_id, count, id);
+        }
+    }
+
     fn intern_seg(&mut self, seg: &'a str) -> u32 {
         if seg == self.last_seg.0 {
             return self.last_seg.1;
@@ -2452,7 +2715,17 @@ impl<'a> NormArena<'a> {
             existing
         } else {
             let next = self.segs.len() as u32;
+            let mut flags = 0u8;
+            for b in seg.bytes() {
+                match b {
+                    b'[' => flags |= SEG_SYNTAX_META | SEG_PAT,
+                    b'{' | b'\\' => flags |= SEG_SYNTAX_META,
+                    b'*' | b'?' => flags |= SEG_PAT,
+                    _ => {}
+                }
+            }
             self.segs.push(seg);
+            self.seg_flags.push(flags);
             self.seg_ids.insert(seg, next);
             next
         };
@@ -2465,17 +2738,17 @@ impl<'a> NormArena<'a> {
             return None;
         }
         if self.can_branch
-            && let Some(&existing) = self.intern.get(&(parent, seg_id, count))
+            && let Some(existing) = self.intern_find(parent, seg_id, count)
         {
             return Some(existing);
         }
         let next = self.nodes.len();
         let p = &self.nodes[parent];
-        let seg = self.segs[seg_id as usize];
+        let flags = self.seg_flags[seg_id as usize];
         let is_dd = seg_id == 1;
         let has_dotdot = p.has_dotdot || is_dd;
-        let has_syntax_meta = p.has_syntax_meta || seg.contains(['[', '{', '\\']);
-        let is_pat_seg = seg.contains(['*', '?', '[']);
+        let has_syntax_meta = p.has_syntax_meta || (flags & SEG_SYNTAX_META) != 0;
+        let is_pat_seg = (flags & SEG_PAT) != 0;
         let seen_pat = p.seen_pat || is_pat_seg;
         let literal_prefix_id = if p.seen_pat {
             p.literal_prefix_id
@@ -2501,7 +2774,7 @@ impl<'a> NormArena<'a> {
             non_globstar_before_dd,
         });
         if self.can_branch {
-            self.intern.insert((parent, seg_id, count), next);
+            self.intern_insert(parent, seg_id, count, next);
         }
         Some(next)
     }
@@ -2714,7 +2987,7 @@ where
                 }
             }
             "**" => {
-                arena.can_branch = true;
+                arena.enable_branch();
                 for st in &mut states {
                     if !arena.is_globstar(*st) {
                         let Some(next) = arena.push_seg(*st, 2, 1) else {
@@ -2731,7 +3004,7 @@ where
                 states.dedup();
             }
             ".." => {
-                arena.can_branch = true;
+                arena.enable_branch();
                 let mut run = 1usize;
                 while let Some(&next_seg) = iter.peek() {
                     match next_seg {
@@ -2781,7 +3054,7 @@ where
         return None;
     }
     let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = FxSet::default();
     let mut segs: Vec<u32> = vec![];
     let mut total_bytes = 0usize;
     for id in states {
@@ -3133,7 +3406,9 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
     }
     let mut expansions = vec![];
     for r in raw {
-        if let Some(exps) = words::brace_expand(&r) {
+        if !r.contains('{') {
+            expansions.push(r);
+        } else if let Some(exps) = words::brace_expand(&r) {
             expansions.extend(exps);
         } else {
             res.unknown = true;
@@ -3142,12 +3417,16 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
             return res;
         }
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = FxSet::default();
     for e in expansions {
         if e.is_empty() {
             continue;
         }
-        let h = words::expand_home(&e, home, cwd);
+        let h = if e.starts_with(['~', '$']) {
+            words::expand_home(&e, home, cwd)
+        } else {
+            e
+        };
         if let Some(rest) = h.strip_prefix('~')
             && !rest.is_empty()
             && !rest.starts_with('/')
@@ -3155,24 +3434,37 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
             res.unknown = true;
             continue;
         }
-        if h.split('/').any(may_be_dot_component) {
+        let has_q_or_lb = h.contains(['?', '[']);
+        if has_q_or_lb && h.split('/').any(may_be_dot_component) {
             res.unknown = true;
         }
-        let mut bases = vec![h.clone()];
-        if h.contains('$') {
+        let bases = if h.contains('$') {
             res.unknown = true;
-            bases.extend(expand_glob_vars(&h));
-        }
+            let mut b = vec![h.clone()];
+            b.extend(expand_glob_vars(&h));
+            b
+        } else {
+            vec![h]
+        };
         let mut cands = vec![];
         for b in bases {
+            let b_has_q_or_lb = b.contains(['?', '[']);
+            let b_has_lb = b.contains('[');
+            if !b_has_q_or_lb {
+                if !cands.contains(&b) {
+                    cands.push(b);
+                }
+                continue;
+            }
             if !cands.contains(&b) {
                 cands.push(b.clone());
             }
             let dots = widen_pattern_dots(&b);
-            if dots != b && !cands.contains(&dots) {
+            let dots_changed = dots != b;
+            if dots_changed && !cands.contains(&dots) {
                 cands.push(dots.clone());
             }
-            if let Some(sl) = widen_pattern_slashes(&b) {
+            if b_has_lb && let Some(sl) = widen_pattern_slashes(&b) {
                 res.unknown = true;
                 if !cands.contains(&sl) {
                     cands.push(sl.clone());
@@ -3182,7 +3474,8 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
                     cands.push(sl_dots);
                 }
             }
-            if dots != b
+            if dots_changed
+                && b_has_lb
                 && let Some(dots_sl) = widen_pattern_slashes(&dots)
             {
                 res.unknown = true;
@@ -3238,7 +3531,7 @@ fn search_variants_from_cands(
         }
     }
     let mut out = vec![];
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = FxSet::default();
     let mut unjoined_norm = 0usize;
     let mut joined_norm = 0usize;
     let mut work = 0usize;
@@ -3368,7 +3661,7 @@ fn check_escape_variant(
             .map(|r| format!("{}/{}", r.to_string_lossy().trim_end_matches('/'), variant))
             .collect()
     };
-    let mut inside_cache: HashMap<(usize, bool), bool> = HashMap::new();
+    let mut inside_cache: FxMap<(usize, bool), bool> = FxMap::default();
     let mut prefix_segs_buf: Vec<u32> = Vec::new();
     for j in raw_joined {
         inside_cache.clear();
