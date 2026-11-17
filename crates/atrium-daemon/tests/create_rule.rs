@@ -476,7 +476,9 @@ async fn create_rule_refuses_unsafe_command_allow_rules_and_invalid_path_scopes(
     let existing = wire.start_thread(common::native(), None).await.thread_id;
     wire.ok(DaemonCommand::CreateRule {
         rule: RuleDraft {
-            scope: RuleScope::Thread { thread_id: existing },
+            scope: RuleScope::Thread {
+                thread_id: existing,
+            },
             tool_kind: ToolKind::Execute,
             tool_name: None,
             matcher: prefix(&["cargo", "test"]),
