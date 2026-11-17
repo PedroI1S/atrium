@@ -237,3 +237,21 @@ git checkout HEAD -- crates/atrium-core/src crates/atrium-daemon/src crates/atri
 - `cargo check -p atrium-core --tests`: exited 0 (0 warnings)
 - `cargo check -p atrium-daemon --tests`: exited 0 (0 warnings)
 - `cargo check -p atrium-agents --tests`: exited 0 (0 warnings)
+
+---
+
+## 9. Rework round 3
+
+1. **Clippy `unneeded_concat` (`crates/atrium-core/tests/M1-28-ansi-c-words.rs:254`):**
+   - Replaced single-argument `concat!("cd .ss?/*/..; cat id_rsa")` with `"cd .ss?/*/..; cat id_rsa"` (now at line 258 after added `\c` test cases).
+2. **`s7_ansi_c_hidden_paths_commands_and_payloads_are_hard_denied` (`echo $(printf $'\c\''; $'\x73udo' id)` -> `Ask`):**
+   - **Root cause:** In [`crates/atrium-core/src/policy/words.rs`](crates/atrium-core/src/policy/words.rs) `decode_ansi_c`, the `'c'` -> `Some('\\')` branch only consumed a second `'\\'` (for `\c\\`), leaving `\'` in `\c\'` unconsumed. Consequently `decode_ansi_c` closed at the escaped `'` of `\'` instead of the real closing `'`, leaving `scan_paren_n` (and the word reader) pointing at the trailing `'` to enter an unclosed single-quote loop across `; $'\x73udo' id)`.
+   - **Fix:** Updated the `'c'` -> `Some('\\')` branch in `decode_ansi_c` to also handle `chars.get(i) == Some(&'\'')` by consuming the escaped `'` and pushing `'\x1c'` and `'\''`, so the scan advances to the real closing `'`. Added regression rows for `\c\\`, `\c`, `${x:-$'\c\''}`, and unterminated `$'\c\'` in [`crates/atrium-core/tests/M1-28-ansi-c-words.rs`](crates/atrium-core/tests/M1-28-ansi-c-words.rs).
+3. **`f1_an_ask_after_the_turn_ended_is_not_reused_by_the_next_turn` (`crates/atrium-agents/tests/claude_adapter.rs:236`: `"timed out; saw []"`):**
+   - **Root cause:** In turn 2 of `f1_an_ask_after_the_turn_ended_is_not_reused_by_the_next_turn`, `SlowGate::check` #1 is intentionally never released before `result` ends the turn and `shutdown(session)` runs. Because `ClaudeOptions::default().gate_deadline` is `20 s`, `wait_for_in_flight_gates()` blocked `finish()` (for 20 s before `AdapterInput::Exit`) and then blocked `run()` a second time (another 20 s before flushing `SessionEnded`), causing `shutdown()`'s 10 s `next_matching(..., ended)` to time out with `saw []`.
+   - **Fix:** In [`crates/atrium-agents/src/claude/adapter.rs`](crates/atrium-agents/src/claude/adapter.rs), removed the duplicate `wait_for_in_flight_gates()` call from `run()` (keeping it in `finish()`, which runs on every exit path) and capped `wait_for_in_flight_gates()` at `self.options.gate_deadline.min(Duration::from_millis(500))` so a hung/abandoned gate never stalls `SessionEnded` past shutdown timeouts while quick in-flight DB checks (such as `claude_clear_requests_withdraws_pending_insert_before_check_returns`) still settle before `SessionEnded` and slower gates still withdraw via `OrphanGuard::drop`.
+
+**Checks run after rework round 3 (D-123):**
+- `cargo fmt --all`: exited 0
+- `cargo check -p atrium-core --tests`: exited 0 (0 warnings)
+- `cargo check -p atrium-agents --tests`: exited 0 (0 warnings)
