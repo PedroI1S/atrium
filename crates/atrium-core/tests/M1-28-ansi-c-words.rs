@@ -125,6 +125,18 @@ fn s7_ansi_c_hidden_paths_commands_and_payloads_are_hard_denied() {
         // NUL truncates the C word in bash, so `.ssh/id_rsa\x00.txt` still hits `.ssh/id_rsa`
         r"cat $'.ssh/id_rsa\x00.txt'",
         r"cat $'.ssh/id_rsa\0foo'",
+        // Locale-translated double quotes ($"…")
+        r#"$"sudo" id"#,
+        r#"cat $".aws/credentials""#,
+        r#"cat < $".aws/credentials""#,
+        r#"cat $"$HOME/.ssh/id_rsa""#,
+        r#"sh -c $"cat ~/.ssh/id_rsa""#,
+        // Nested substitution scanners must respect $'…' escape boundaries
+        r"echo $(printf $'\')'; $'\x73udo' id)",
+        r"echo $(printf $'\\\''; $'\x73udo' id)",
+        r"echo $(printf $'\c\''; $'\x73udo' id)",
+        r"echo $(printf $'\')'; cat ~/.ssh/id_rsa)",
+        r"echo ${x:-$'}'}; $'\x73udo' id",
     ]);
 }
 
@@ -162,6 +174,37 @@ fn s7_ordinary_and_fail_closed_ansi_c_keep_safe_verdicts() {
         (r"cat $'ok\U00000000'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"cat $'ok\c@'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"cat $'unterminated", ["Ask", "Ask", "Allow", "Allow"]),
+        // Invalid bytes/scalars must preserve word identity (no false HardDeny)
+        (
+            r"cat $'\xff.aws/credentials'",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            r"cat $'\ud800.aws/credentials'",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            r"cat $'\U00110000.aws/credentials'",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            r"cat $'\x2e\xffssh/id_rsa'",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (r"$'\xffsudo'", ["Ask", "Ask", "Allow", "Allow"]),
+        (r"$'\xff'sudo", ["Ask", "Ask", "Allow", "Allow"]),
+        // Existing dev baseline for unreadable words (Ask in Home/prefix, Allow in Any/Full)
+        ("cat 'unterminated", ["Ask", "Ask", "Allow", "Allow"]),
+        ("ls \u{1}", ["Ask", "Ask", "Allow", "Allow"]),
+        // Ordinary $"…" locale-quoted strings keep safe verdicts (fail closed in Home/prefix)
+        (r#"echo $"hello""#, ["Ask", "Ask", "Allow", "Allow"]),
+        (r#"cat $"notes.txt""#, ["Ask", "Ask", "Allow", "Allow"]),
+        (r#"$"if" true"#, ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            r#"$"FOO"=1 cat notes.txt"#,
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (r"echo $(printf $'\')')", ["Ask", "Ask", "Allow", "Allow"]),
     ]);
 }
 
@@ -198,6 +241,32 @@ fn finding_11_cd_glob_reaching_sensitive_dirs_is_caught() {
         "cd .s?h/../.aws; cat credentials",
     ]);
 
+    hard_everywhere(&[
+        // M1-30 finding 2: wildcarded `cd` under wrapper
+        concat!("timeout 5 cd ~", "/.a?s; xxd credentials;"),
+        // Finding 4: browser profiles and descendants
+        "cd .config/google-chr?me/Profile*; cat 'Login Data'",
+        "cd 'Library/Application Support/Firef?x/Profiles/abc'; cat logins.json",
+        "cd .config/braves?ftware/Profile2; cat Cookies",
+        // Finding 5: synthetic subtree candidates preserve directory depth & globstar
+        concat!("cd .ss?/*/*; cat ..", "/../id_rsa"),
+        concat!("cd .ss?/**; cat ..", "/../id_rsa"),
+        concat!("cd .ss?/*/..; cat id_rsa"),
+        concat!(
+            "cd .config/google-chr?me/Profile*/Sub; cat ..",
+            "/'Login Data'"
+        ),
+        concat!("cd .gnupg/*/*; cat ..", "/../secring.gpg"),
+        "cd **/.ss?; cat id_rsa",
+        // Finding 6: Bash POSIX named character classes
+        "cd .s[[:lower:]]h; cat id_rsa",
+        "cd .s[[:alpha:]]h; cat id_rsa",
+        "cd .s[[:alnum:]]h; cat id_rsa",
+        "cd [[:punct:]]ssh; cat id_rsa",
+        "cd .s[[:bogus:]]h; cat id_rsa",
+        "cd .config/google-chr[[:lower:]]me/Profile[[:digit:]]; cat 'Login Data'",
+    ]);
+
     check_table(&[
         // `cd <glob>` always leaves cwd unknown (never Cd::Moved -> Allow)
         (
@@ -208,9 +277,22 @@ fn finding_11_cd_glob_reaching_sensitive_dirs_is_caught() {
             "cd .c*rgo && cat credentials.toml",
             ["Ask", "Ask", "Allow", "Allow"],
         ),
+        // Non-matching POSIX classes must not falsely match dotfiles or sensitive dirs
+        (
+            "cd [[:lower:]]ssh; cat id_rsa",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        (
+            "cd .s[[:digit:]]h; cat id_rsa",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
         // Ordinary glob cd keeps dev's verdict and is never falsely hard-denied
         ("cd src*; cat README.md", ["Ask", "Ask", "Allow", "Allow"]),
         ("cd *; cat README.md", ["Ask", "Ask", "Allow", "Allow"]),
+        (
+            "cd [[:lower:]]*; cat README.md",
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
         ("cd p*/sub; ls", ["Ask", "Ask", "Allow", "Allow"]),
     ]);
 }

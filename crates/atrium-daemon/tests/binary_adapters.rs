@@ -58,7 +58,7 @@ impl DaemonProcess {
     async fn wait_for_socket(&mut self, socket: &Path) {
         let deadline = tokio::time::Instant::now() + SOON;
         loop {
-            if socket.exists() {
+            if socket.exists() && tokio::net::UnixStream::connect(socket).await.is_ok() {
                 return;
             }
             if let Some(child) = self.child.as_mut()
@@ -192,6 +192,10 @@ async fn atriumd_registers_claude_and_codex_adapters() {
             .await;
         assert_eq!(failed.provider, provider);
 
+        let missing_cause = std::fs::File::open(root.path().join("definitely-missing"))
+            .unwrap_err()
+            .to_string();
+        let expected_error = format!("failed to start the provider: {missing_cause}");
         let history = wire.history(&summary.thread_id).await;
         let has_spawn_error = history.iter().any(|stored| {
             matches!(
@@ -200,7 +204,7 @@ async fn atriumd_registers_claude_and_codex_adapters() {
                     fatal: true,
                     message,
                     ..
-                } if message.contains("failed to start the provider")
+                } if *message == expected_error
             )
         });
         assert!(

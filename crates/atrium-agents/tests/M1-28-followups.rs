@@ -48,6 +48,7 @@ struct SpyGate {
     withdrawn: Mutex<Vec<ApprovalTicket>>,
     hang_withdraw: bool,
     on_asked: Option<Arc<Notify>>,
+    check_barrier: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 impl SpyGate {
@@ -58,6 +59,7 @@ impl SpyGate {
             withdrawn: Mutex::default(),
             hang_withdraw,
             on_asked: None,
+            check_barrier: None,
         })
     }
 
@@ -68,6 +70,22 @@ impl SpyGate {
             withdrawn: Mutex::default(),
             hang_withdraw: false,
             on_asked: Some(on_asked),
+            check_barrier: None,
+        })
+    }
+
+    fn with_check_barrier(
+        inner: Arc<SessionGate>,
+        on_inserted: Arc<Notify>,
+        allow_return: Arc<Notify>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            asked: Mutex::default(),
+            withdrawn: Mutex::default(),
+            hang_withdraw: false,
+            on_asked: None,
+            check_barrier: Some((on_inserted, allow_return)),
         })
     }
 
@@ -99,6 +117,10 @@ impl ToolGate for SpyGate {
                 if let Some(n) = &self.on_asked {
                     n.notify_one();
                 }
+            }
+            if let Some((on_inserted, allow_return)) = &self.check_barrier {
+                on_inserted.notify_one();
+                allow_return.notified().await;
             }
             d
         })
@@ -246,6 +268,58 @@ impl RealLedger {
             thread: s.thread_id,
             inc,
             gate: SpyGate::with_notify(inner, on_asked),
+        }
+    }
+
+    async fn with_check_barrier(
+        provider: Provider,
+        home: &Path,
+        preset: Preset,
+        on_inserted: Arc<Notify>,
+        allow_return: Arc<Notify>,
+    ) -> Self {
+        let dir = scratch("ledger-barrier");
+        let store = Arc::new(
+            SqliteStore::open(&dir.join("atrium.db"), StoreOptions::default())
+                .await
+                .unwrap(),
+        );
+        let ledger = Arc::new(Ledger::new(store.requests()));
+        let s = store
+            .create_thread(NewThread {
+                provider,
+                model: None,
+                effort: None,
+                preset,
+                location: Location::Home,
+                title: "m1-28-barrier".into(),
+            })
+            .await
+            .unwrap();
+        let inc = store.begin_incarnation(&s.thread_id).await.unwrap();
+        store.signal(&s.thread_id, Signal::Starting).await.unwrap();
+        let canon_home = fs::canonicalize(home).unwrap();
+        let inner = Arc::new(SessionGate::new(
+            SessionGateConfig {
+                thread: s.thread_id.clone(),
+                incarnation: inc,
+                cwd: canon_home.clone(),
+                home: canon_home,
+                atrium_data_paths: vec![],
+                atrium_protected_paths: vec![],
+                preset,
+                provider,
+            },
+            Arc::new(DefaultPolicy::new()),
+            ledger,
+            Arc::new(StoreRules(store.clone())),
+        ));
+        Self {
+            dir,
+            store,
+            thread: s.thread_id,
+            inc,
+            gate: SpyGate::with_check_barrier(inner, on_inserted, allow_return),
         }
     }
 
@@ -617,6 +691,108 @@ for line in sys.stdin:
             "round {round} leaked ticket"
         );
         assert_eq!(ledger.open_count().await, 0, "round {round}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_clear_requests_withdraws_pending_insert_before_check_returns() {
+    for mode in ["result", "shutdown"] {
+        let dir = scratch(&format!("claude-pending-insert-{mode}"));
+        let script = dir.join("fake-claude-pending.py");
+        let trigger = dir.join("emit_result");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/usr/bin/env python3
+import json, os, sys, time
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("2.1.308 (Claude Code)")
+    sys.exit(0)
+trigger = {trigger:?}
+sid = "fake-pending"
+for line in sys.stdin:
+    v = json.loads(line)
+    t = v.get("type")
+    if t == "control_request" and v.get("request", {{}}).get("subtype") == "initialize":
+        print(json.dumps({{"type":"control_response","response":{{"subtype":"success","request_id":v["request_id"],"response":{{"commands":[]}}}}}}), flush=True)
+    elif t == "user":
+        print(json.dumps({{"type":"system","subtype":"init","session_id":sid,"model":"claude-fake","tools":["Read"],"cwd":"."}}), flush=True)
+        print(json.dumps({{"type":"control_request","request_id":"h1","request":{{"subtype":"hook_callback","callback_id":"atrium-pre-tool-use","input":{{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{{"file_path":"x"}},"tool_use_id":"toolu_1"}}}}}}), flush=True)
+        deadline = time.monotonic() + 5.0
+        while not os.path.exists(trigger) and time.monotonic() < deadline:
+            time.sleep(0.002)
+        print(json.dumps({{"type":"result","subtype":"success","session_id":sid,"is_error":False,"num_turns":1,"duration_ms":1}}), flush=True)
+"#,
+                trigger = trigger.display().to_string(),
+            ),
+        );
+
+        let on_inserted = Arc::new(Notify::new());
+        let allow_return = Arc::new(Notify::new());
+        let ledger = RealLedger::with_check_barrier(
+            Provider::Claude,
+            &dir,
+            Preset::Careful,
+            on_inserted.clone(),
+            allow_return.clone(),
+        )
+        .await;
+        let mut session = ClaudeAdapter::new(claude_opts(Duration::from_secs(5)))
+            .start(
+                claude_cfg(&dir, script, ledger.gate.clone()),
+                Transport::Local,
+            )
+            .await
+            .unwrap();
+
+        session
+            .commands
+            .send(SessionCommand::SendUserMessage { text: "go".into() })
+            .await
+            .unwrap();
+
+        // Wait until the SQLite approval insert has committed, while `gate.check`
+        // has NOT yet returned to `ClaudeAdapter`.
+        tokio::time::timeout(Duration::from_secs(5), on_inserted.notified())
+            .await
+            .expect("approval insert committed");
+        assert_eq!(ledger.open_count().await, 1, "{mode}: row inserted");
+
+        if mode == "result" {
+            fs::write(&trigger, "now").unwrap();
+            // Wait for `result` -> `TurnCompleted` so `clear_requests()` runs
+            // before `gate.check` returns.
+            let end_deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < end_deadline {
+                if let Ok(Some(env)) =
+                    tokio::time::timeout(Duration::from_secs(2), session.events.recv()).await
+                    && matches!(env.event, AgentEvent::TurnCompleted { .. })
+                {
+                    break;
+                }
+            }
+            allow_return.notify_one();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        } else {
+            // Cancel via Shutdown while `gate.check` is still paused; unblock it
+            // shortly after `finish()` starts cancelling in-flight gates.
+            let release = allow_return.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                release.notify_one();
+            });
+        }
+
+        shutdown(session).await;
+
+        assert_eq!(ledger.gate.asked().len(), 1, "{mode}");
+        assert_eq!(
+            ledger.gate.withdrawn(),
+            ledger.gate.asked(),
+            "{mode} leaked pending ticket inserted before check returned"
+        );
+        assert_eq!(ledger.open_count().await, 0, "{mode}");
         let _ = fs::remove_dir_all(&dir);
     }
 }
