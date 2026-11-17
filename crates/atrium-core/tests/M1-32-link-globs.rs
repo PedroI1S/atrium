@@ -527,8 +527,10 @@ fn rework2_over_budget_glob_and_non_ssh_id_rsa_do_not_hard_deny() {
     t.write(".ssh/id_rsa", "secret");
     t.write("plain/sub/id_rsa", "not-an-ssh-key");
     std::fs::create_dir_all(t.home.join("big_dir")).unwrap();
+    std::fs::create_dir_all(t.home.join("big_plain")).unwrap();
     for i in 0..4150 {
         std::fs::create_dir(t.home.join(format!("big_dir/d{i:04}"))).unwrap();
+        std::fs::create_dir(t.home.join(format!("big_plain/d{i:04}"))).unwrap();
     }
     symlink(t.home.join(".ssh"), t.home.join("big_dir/z_ssh")).unwrap();
 
@@ -537,9 +539,46 @@ fn rework2_over_budget_glob_and_non_ssh_id_rsa_do_not_hard_deny() {
         ["Ask", "Ask", "Ask"]
     );
     assert_eq!(
+        eval_cmd_3(&t, "cat big_plain/*/id_rsa"),
+        ["Ask", "Ask", "Ask"]
+    );
+    assert_eq!(
         eval_cmd_3(&t, "cat plain/*/id_rsa"),
         ["Ask", "Allow", "Allow"]
     );
-    let check = paths_check(ToolKind::Search, "Glob", &["plain"], true, Some("id_rsa"));
-    assert_eq!(eval_check_3(&t, &check), ["Allow", "Allow", "Allow"]);
+    for check in [
+        paths_check(ToolKind::Search, "Glob", &["plain"], true, Some("id_rsa")),
+        paths_check(ToolKind::Search, "Glob", &["plain"], true, Some("*/id_rsa")),
+    ] {
+        assert_eq!(
+            eval_check_3(&t, &check),
+            ["Allow", "Allow", "Allow"],
+            "{:?}",
+            check.subject
+        );
+    }
+    for check in [
+        paths_check(
+            ToolKind::Search,
+            "Glob",
+            &["big_dir"],
+            true,
+            Some("*/id_rsa"),
+        ),
+        paths_check(ToolKind::Search, "Glob", &["big_dir"], true, Some("id_rsa")),
+        paths_check(
+            ToolKind::Search,
+            "Glob",
+            &["big_plain"],
+            true,
+            Some("*/id_rsa"),
+        ),
+    ] {
+        assert_eq!(
+            eval_check_3(&t, &check),
+            ["Ask", "Ask", "Ask"],
+            "{:?}",
+            check.subject
+        );
+    }
 }
