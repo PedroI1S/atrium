@@ -84,13 +84,17 @@ Tests 1–4 fail with the previous `gate.rs` (`5bec74e`) and pass now; test 5 on
 
 Commands run: `cargo fmt --all --check` ok; `cargo clippy -p atrium-core --all-targets -- -D warnings` ok; `cargo test -p atrium-core`: `M1-32-link-globs` 21/21, `adversarial_gate`, `adversarial_m1_18::k2_*` and every other verdict test pass. The only failures are the known ones (`round_5_blocker_1` N9, `adversarial_fuzz` and `adversarial_m1_18::fix4` timing N11) plus timing caps that are flaky under load: `fix2_nested_env…`, `policy::engine_never_panics_on_garbage` (fails on `dev`'s `gate.rs` too) and `policy::pipe_to_shell_fan_out…` (engine only, does not touch `gate.rs`; passed 1 of 3 runs here, around its 2 s cap).
 
-Limit: hard links of a credential outside every store are matched by identity only for literal operands (`alias_fix`, outside the owned range), not for glob matches; the reviewer's fixtures assume single links.
+Added scope (D-120, brief "Added scope"), both former limits closed:
+- **`resolve_fs` (~84):** now delegates to `real_path`, so every caller follows links in filesystem order before `..`; ordinary paths resolve as before (canonical when they exist, deepest existing part plus tail otherwise). Test: `added_scope_resolve_fs_follows_links_before_dotdot` (`fs_resolve("proj/dangling-key")` → `~/.ssh/new_key`; `printf x > proj/dangling-key`, `cat proj/dangling-key` → Deny ×3; `proj/a.txt` and `proj/missing/../a.txt` unchanged).
+- **`alias_fix` for globs and walks:** the credential identity map (dev, inode) used for named paths is installed for the link check (`with_identity_roots`); every glob match, literal re-resolution, walked link target and multiply-linked file met on a following walk goes through `identity_hit` (`alias_fix` + the plain classifier), charged to the same per-check budget. Test: `added_scope_hard_links_met_by_globs_and_walks_match_by_identity` (`cat proj/h*`, Glob `h*`, `grep -R secret proj`, `tar --dereference …` → Deny ×3; an ordinary hard link keeps its verdict).
+- Both tests fail with the previous `gate.rs` (`d09a373`) and pass now. Re-run: clippy clean; `M1-32-link-globs` 23/23; same failure set as above (known N9/N11 plus the load-sensitive timing caps), no verdict test fails.
+- Note: a non-following recursive read (`grep -r` without dereference) is not walked by the link check, as on `dev`; a hard link inside it is handled by `dev`'s rules for the walked folder, not by this check.
 
 ---
 
 ## Escalated (outside owned paths)
 
-- `crates/atrium-core/src/policy/gate.rs:84` (`resolve_fs`): calls `resolve_fs(&normalize(&target), hops + 1)` on dangling symlinks, which still normalizes `..` lexically before resolving preceding intermediate symlinks for non-globbed direct paths (e.g., `printf x > proj/dangling-key` where `dangling-key -> dir/../new_key` and `dir -> ../.ssh/sub`). Left untouched because `resolve_fs` (~40–112) is outside M1-32's owned paths (`reaches_tree_through_links` and its helpers, and its callers at ~320–350).
+None: `resolve_fs` was brought into scope by D-120 and fixed above.
 
 ---
 

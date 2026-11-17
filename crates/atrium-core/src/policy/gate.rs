@@ -64,51 +64,12 @@ pub fn fs_resolve(word: &str, cwd: &Path, home: &Path) -> PathBuf {
     resolve_fs(&abs, 0)
 }
 
-fn resolve_fs(p: &Path, hops: u8) -> PathBuf {
-    let mut head = p.to_path_buf();
-    let mut tail: Vec<OsString> = vec![];
-    let base = loop {
-        match std::fs::canonicalize(&head) {
-            Ok(c) => break c,
-            Err(_) => {
-                if hops < MAX_HOPS
-                    && let Ok(md) = std::fs::symlink_metadata(&head)
-                    && md.is_symlink()
-                    && let Ok(t) = std::fs::read_link(&head)
-                {
-                    let target = if t.is_absolute() {
-                        t
-                    } else {
-                        head.parent().unwrap_or(Path::new("/")).join(t)
-                    };
-                    break resolve_fs(&normalize(&target), hops + 1);
-                }
-                match head.file_name() {
-                    Some(n) => {
-                        tail.push(n.to_owned());
-                        head.pop();
-                    }
-                    None => {
-                        let n = normalize(&head);
-                        if n == head || hops >= MAX_HOPS {
-                            break head;
-                        }
-                        // `missing/..`: start over on the cleaned-up path
-                        let mut rebuilt = n;
-                        for t in tail.into_iter().rev() {
-                            rebuilt.push(t);
-                        }
-                        return resolve_fs(&rebuilt, hops + 1);
-                    }
-                }
-            }
-        }
-    };
-    let mut out = base;
-    for t in tail.into_iter().rev() {
-        out.push(t);
-    }
-    out
+/// The real path of `p`: links followed in filesystem order before `..`
+/// (a dangling `dir/../new_key` where `dir` is a link lands where the
+/// filesystem puts it), the deepest existing part canonicalized and the
+/// rest kept. One resolver for every caller (D-120 added scope).
+fn resolve_fs(p: &Path, _hops: u8) -> PathBuf {
+    real_path(p)
 }
 
 /// Escapes glob metacharacters so the pattern matches only `p`.
@@ -270,12 +231,12 @@ fn evaluate_sync(
     let analysis = deny::analyze_with(&input, &fs_resolve);
     let ssh = ssh_members(&c.home);
     let mut resolved = vec![];
+    let mut roots: Vec<((u64, u64), PathBuf)> = vec![];
     if !analysis.overflow {
-        let mut roots: Vec<((u64, u64), PathBuf)> =
-            deny::sensitive_roots(&c.home, &c.atrium_data_paths, &c.atrium_protected_paths)
-                .into_iter()
-                .filter_map(|r| identity(&r).map(|id| (id, r)))
-                .collect();
+        roots = deny::sensitive_roots(&c.home, &c.atrium_data_paths, &c.atrium_protected_paths)
+            .into_iter()
+            .filter_map(|r| identity(&r).map(|id| (id, r)))
+            .collect();
         roots.extend(
             ssh.members
                 .iter()
@@ -375,18 +336,21 @@ fn evaluate_sync(
             false,
             TreeKind::Sensitive,
         ));
-        match reaches_tree_through_links(
-            check,
-            &analysis,
-            &resolved,
-            &trees,
-            &c.cwd,
-            &c.home,
-            Some(&real_sensitive),
-        ) {
+        let reach = with_identity_roots(&roots, deny::sensitive(&input), || {
+            reaches_tree_through_links(
+                check,
+                &analysis,
+                &resolved,
+                &trees,
+                &c.cwd,
+                &c.home,
+                Some(&real_sensitive),
+            )
+        });
+        match reach {
             (Reach::Yes, t) => {
                 verdict = PolicyVerdict::HardDeny {
-                    id: t.map_or("credential-read", |t| t.id),
+                    id: t.unwrap_or("credential-read"),
                 };
             }
             (Reach::Maybe, _) if matches!(verdict, PolicyVerdict::Allow { .. }) => {
@@ -904,6 +868,58 @@ fn with_link_budget<T>(f: impl FnOnce() -> T) -> T {
         LINK_BUDGET_OUT.with(|o| o.replace(false)),
     );
     f()
+}
+
+/// The credential identities (dev, inode) of the current check and the
+/// classifier for their plain spellings: a hard link to a credential met by
+/// a glob or a walk is matched like a named path (`alias_fix`).
+struct IdentityRoots {
+    roots: Vec<((u64, u64), PathBuf)>,
+    plain: deny::Sensitive,
+}
+
+thread_local! {
+    static IDENTITY_ROOTS: std::cell::RefCell<Option<IdentityRoots>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_identity_roots<T>(
+    roots: &[((u64, u64), PathBuf)],
+    plain: deny::Sensitive,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<IdentityRoots>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            IDENTITY_ROOTS.with(|r| *r.borrow_mut() = prev);
+        }
+    }
+    let prev = IDENTITY_ROOTS.with(|r| {
+        r.borrow_mut().replace(IdentityRoots {
+            roots: roots.to_vec(),
+            plain,
+        })
+    });
+    let _reset = Reset(prev);
+    f()
+}
+
+/// The credential a real path is by identity (a hard link, or a store
+/// reached under another name), on the check's budget.
+fn identity_hit(real: &Path, role: words::Role) -> Option<&'static str> {
+    IDENTITY_ROOTS.with(|r| {
+        let r = r.borrow();
+        let ctx = r.as_ref()?;
+        if ctx.roots.is_empty() || !spend(real.components().count()) {
+            return None;
+        }
+        let alias = alias_fix(real, &ctx.roots).ok()?;
+        if alias == real {
+            return None;
+        }
+        ctx.plain.hit(&alias, role)
+    })
 }
 
 fn expand_glob(p: &Path) -> Option<GlobExpansion> {
@@ -1728,12 +1744,12 @@ fn is_pruned(prune: PruneDirs, name: Option<&str>) -> bool {
 /// following search does (a link to a folder is walked too, at any number
 /// of hops: M1-18, K2), for a link into a tree: Yes (with the tree), No, or
 /// Maybe when the walk is too big.
-fn links_below<'a>(
+fn links_below(
     root: &Path,
-    trees: &'a [Tree],
+    trees: &[Tree],
     prune: PruneDirs,
     sensitive: Option<&deny::Sensitive>,
-) -> (Reach, Option<&'a Tree>) {
+) -> (Reach, Option<&'static str>) {
     const BUDGET: usize = 4096;
     const MAX_DEPTH: u8 = 16;
     let mut seen = 0usize;
@@ -1795,13 +1811,21 @@ fn links_below<'a>(
                         continue;
                     }
                 };
-                if let Some(t) = in_trees(&real, trees, true, words::Role::Read, sensitive) {
-                    return (Reach::Yes, Some(t));
+                if let Some(id) = in_trees(&real, trees, true, words::Role::Read, sensitive)
+                    .map(|t| t.id)
+                    .or_else(|| identity_hit(&real, words::Role::Read))
+                {
+                    return (Reach::Yes, Some(id));
                 }
                 // a link to a folder elsewhere: walk it too, once
                 if real.is_dir() && !visited.contains(&real) {
                     visited.push(real.clone());
                     stack.push((real, depth + 1, bulk));
+                }
+            } else if ft.is_file() && multiply_linked_file(&p) {
+                // a hard link to a credential, met on the walk
+                if let Some(id) = identity_hit(&p, words::Role::Read) {
+                    return (Reach::Yes, Some(id));
                 }
             } else if ft.is_dir() {
                 let into_bulk = bulk
@@ -1877,33 +1901,36 @@ fn expand_targets(p: &Path, include_dotfiles: bool, maybe: &mut bool) -> Vec<Pat
     }
 }
 
-fn first_tree_hit<'a>(
+fn first_tree_hit(
     targets: &[PathBuf],
-    trees: &'a [Tree],
+    trees: &[Tree],
     names_dir: bool,
     role: words::Role,
     sensitive: Option<&deny::Sensitive>,
-) -> Option<&'a Tree> {
+) -> Option<&'static str> {
     targets.iter().find_map(|f| {
         // out of budget: the caller's `Maybe` comes from `budget_spent`
         if !spend(1) {
             return None;
         }
-        in_trees(&real_path(f), trees, names_dir, role, sensitive)
+        let real = real_path(f);
+        in_trees(&real, trees, names_dir, role, sensitive)
+            .map(|t| t.id)
+            .or_else(|| identity_hit(&real, role))
     })
 }
 
 /// One link check under one shared filesystem budget (review round 3
 /// finding 5): a check that runs out can't show it is safe, so it is Maybe.
-fn reaches_tree_through_links<'a>(
+fn reaches_tree_through_links(
     check: &ToolCheck,
     a: &deny::Analysis,
     resolved: &[PathBuf],
-    trees: &'a [Tree],
+    trees: &[Tree],
     cwd: &Path,
     home: &Path,
     sensitive: Option<&deny::Sensitive>,
-) -> (Reach, Option<&'a Tree>) {
+) -> (Reach, Option<&'static str>) {
     with_link_budget(|| {
         match reaches_tree_through_links_once(check, a, resolved, trees, cwd, home, sensitive) {
             (Reach::Yes, t) => (Reach::Yes, t),
@@ -1913,15 +1940,15 @@ fn reaches_tree_through_links<'a>(
     })
 }
 
-fn reaches_tree_through_links_once<'a>(
+fn reaches_tree_through_links_once(
     check: &ToolCheck,
     a: &deny::Analysis,
     resolved: &[PathBuf],
-    trees: &'a [Tree],
+    trees: &[Tree],
     cwd: &Path,
     home: &Path,
     sensitive: Option<&deny::Sensitive>,
-) -> (Reach, Option<&'a Tree>) {
+) -> (Reach, Option<&'static str>) {
     if trees.is_empty() {
         return (Reach::No, None);
     }
@@ -2093,8 +2120,11 @@ fn reaches_tree_through_links_once<'a>(
                 if u.paths.contains(&real) {
                     continue;
                 }
-                if let Some(t) = in_trees(&real, trees, recursive, u.role, sensitive) {
-                    return (Reach::Yes, Some(t));
+                if let Some(id) = in_trees(&real, trees, recursive, u.role, sensitive)
+                    .map(|t| t.id)
+                    .or_else(|| identity_hit(&real, u.role))
+                {
+                    return (Reach::Yes, Some(id));
                 }
             }
         }

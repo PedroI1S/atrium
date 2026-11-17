@@ -805,3 +805,60 @@ fn rework3_finding5_one_budget_per_check() {
     let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some(&distinct));
     assert_eq!(eval_check_3(&t, &check), ["Ask", "Ask", "Ask"]);
 }
+
+// ---- Added scope (D-120): resolve_fs order and identity for globs/walks ----
+
+#[test]
+fn added_scope_resolve_fs_follows_links_before_dotdot() {
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.home.join(".ssh/sub")).unwrap();
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    let up = "..";
+    symlink(format!("{up}/.ssh/sub"), t.home.join("proj/dir")).unwrap();
+    symlink(
+        format!("dir/{up}/new_key"),
+        t.home.join("proj/dangling-key"),
+    )
+    .unwrap();
+
+    // the resolver itself (every caller's view of the path)
+    assert_eq!(
+        atrium_core::policy::fs_resolve("proj/dangling-key", &t.home, &t.home),
+        t.home.join(".ssh/new_key")
+    );
+    // ordinary paths keep their resolution
+    t.write("proj/a.txt", "x");
+    assert_eq!(
+        atrium_core::policy::fs_resolve("proj/a.txt", &t.home, &t.home),
+        t.home.join("proj/a.txt")
+    );
+    assert_eq!(
+        atrium_core::policy::fs_resolve("proj/missing/../a.txt", &t.home, &t.home),
+        t.home.join("proj/a.txt")
+    );
+    let deny = ["Deny", "Deny", "Deny"];
+    assert_eq!(eval_cmd_3(&t, "printf x > proj/dangling-key"), deny);
+    assert_eq!(eval_cmd_3(&t, "cat proj/dangling-key"), deny);
+}
+
+#[test]
+fn added_scope_hard_links_met_by_globs_and_walks_match_by_identity() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    t.write("proj/a.txt", "ordinary");
+    std::fs::hard_link(t.home.join(".ssh/id_rsa"), t.home.join("proj/hl")).unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    assert_eq!(eval_cmd_3(&t, "cat proj/h*"), deny);
+    let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("h*"));
+    assert_eq!(eval_check_3(&t, &check), deny);
+    assert_eq!(eval_cmd_3(&t, "grep -R secret proj"), deny);
+    assert_eq!(eval_cmd_3(&t, "tar --dereference -cf out.tar proj"), deny);
+    // an ordinary hard link keeps its verdict
+    t.write("other/x.txt", "ordinary");
+    std::fs::hard_link(t.home.join("other/x.txt"), t.home.join("other/y.txt")).unwrap();
+    assert_eq!(
+        eval_cmd_3(&t, "cat other/y*"),
+        eval_cmd_3(&t, "cat other/y.txt")
+    );
+}
