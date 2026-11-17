@@ -582,3 +582,120 @@ fn rework2_over_budget_glob_and_non_ssh_id_rsa_do_not_hard_deny() {
         );
     }
 }
+
+// ---- Escalation (D-127): review round 2 findings 1-5 ----
+
+struct RestorePerm2(std::path::PathBuf);
+impl Drop for RestorePerm2 {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[test]
+fn rework2_finding1_relocated_ssh_store_keeps_credential_protection() {
+    let t = Tmp::new();
+    t.write("vault/id_rsa", "secret");
+    t.write("vault/id_rsa.pub", "public");
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    symlink("vault", t.home.join(".ssh")).unwrap();
+    let up = "..";
+    symlink(format!("{up}/vault/id_rsa"), t.home.join("proj/key")).unwrap();
+    symlink(format!("{up}/vault/id_rsa.pub"), t.home.join("proj/pub")).unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    assert_eq!(eval_cmd_3(&t, "cat proj/key*"), deny);
+    let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("key*"));
+    assert_eq!(eval_check_3(&t, &check), deny);
+    // the public-file exception still holds through the relocated store
+    assert_eq!(eval_cmd_3(&t, "cat proj/pub*"), ["Ask", "Allow", "Allow"]);
+    let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("pub*"));
+    assert_eq!(eval_check_3(&t, &check), ["Allow", "Allow", "Allow"]);
+}
+
+#[test]
+fn rework2_finding2_non_utf8_link_names_are_resolved_by_their_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    let name = std::ffi::OsStr::from_bytes(&[b'k', 0xff]);
+    let up = "..";
+    symlink(format!("{up}/.ssh/id_rsa"), t.home.join("proj").join(name)).unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    assert_eq!(eval_cmd_3(&t, "cat proj/k*"), deny);
+    let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("k*"));
+    assert_eq!(eval_check_3(&t, &check), deny);
+}
+
+#[test]
+fn rework2_finding3_dereferencing_tar_walks_pruned_dirs() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    for dir in ["proj/node_modules", "proj_git/.git", "proj_tgt/target"] {
+        std::fs::create_dir_all(t.home.join(dir)).unwrap();
+        symlink(t.home.join(".ssh/id_rsa"), t.home.join(dir).join("key")).unwrap();
+    }
+    let deny = ["Deny", "Deny", "Deny"];
+    for line in [
+        "tar --dereference -cf out.tar proj",
+        "tar --dereference -cf out.tar proj_git",
+        "tar --dereference -cf out.tar proj_tgt",
+        "tar -h -cf out.tar proj",
+    ] {
+        assert_eq!(eval_cmd_3(&t, line), deny, "{line}");
+    }
+}
+
+#[test]
+fn rework2_finding4_unreadable_dir_in_following_search_fails_closed() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    t.write("proj/a.txt", "ordinary");
+    let closed = t.home.join("proj/closed");
+    std::fs::create_dir_all(&closed).unwrap();
+    let up = "..";
+    symlink(format!("{up}/{up}/.ssh/id_rsa"), closed.join("key")).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _guard = RestorePerm2(closed.clone());
+    if std::fs::read_dir(&closed).is_ok() {
+        return; // running as root: the folder is readable
+    }
+    assert_eq!(
+        eval_cmd_3(&t, "grep -R secret proj"),
+        ["Ask", "Ask", "Ask"]
+    );
+}
+
+#[test]
+fn rework2_finding5_file_tool_dangling_targets_resolve_links_before_dotdot() {
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.home.join(".ssh/sub")).unwrap();
+    std::fs::create_dir_all(t.home.join("proj/sub")).unwrap();
+    let up = "..";
+    symlink(format!("{up}/{up}/.ssh/sub"), t.home.join("proj/sub/dir")).unwrap();
+    symlink(
+        format!("dir/{up}/new_key"),
+        t.home.join("proj/sub/dangling-key"),
+    )
+    .unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    let read = paths_check(
+        ToolKind::Read,
+        "Read",
+        &["proj/sub/dangling-key"],
+        false,
+        None,
+    );
+    assert_eq!(eval_check_3(&t, &read), deny);
+    let glob = paths_check(
+        ToolKind::Search,
+        "Glob",
+        &["proj"],
+        true,
+        Some("sub/dangling-key"),
+    );
+    assert_eq!(eval_check_3(&t, &glob), deny);
+}
