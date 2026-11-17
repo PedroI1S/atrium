@@ -174,3 +174,39 @@ Both `deny.rs:2744` (`glob_norm_tests::k10_normalizer_work_is_linear_and_bounded
 
 ### Not done (D-123)
 - `cargo test` and `cargo clippy` were not run by this worker per D-123; left for the verification task.
+
+---
+
+## Rework round 4 (`af17263`)
+
+### Root causes
+1. **`M1-31-credential-folder-search.rs:562` (`200 */ + 200 ../ + 20000 a/` taking 6.10 s):**
+   - `normalize_glob_filtered` counted every component against `MAX_GLOB_WORK`, but `MAX_GLOB_WORK = 100_000` allowed `200,000` `NormArena::push_seg` calls per `evaluate` (`600,000` across 3 presets) with `can_branch = true`. Each `push_seg` performed a `std::collections::HashMap` (SipHash) `get` and `insert` on `(parent, seg_id, count)` plus two `str::contains` scans (`['[', '{', '\\']` and `['*', '?', '[']`), costing ~6.10 s in unoptimized debug builds on Linux.
+   - `expand_glob_candidates` also called `words::brace_expand` (allocating a 41k-`char` `Vec<char>`), `words::expand_home`, `may_be_dot_component`, `widen_pattern_dots`, and `widen_pattern_slashes` even when the glob contained no `{`, `~`, `$`, `?`, or `[`.
+2. **N11 (`fix4` 322 ms vs 150 ms; `random_hostile_lines` 221 s vs 60 s on `dev` on Linux):**
+   - `fix4` (`{1..64}{a,b,c,d}/x1*/../.../x7*/../*.rs`): on `dev`, `normalize_glob_variants` + `escape_from_cands` expanded 768 `Vec<&str>` paths and `PathBuf`s, and `expand_glob_candidates` ran `expand_home`, `widen_pattern_dots`, and `widen_pattern_slashes` on all 256 brace expansions (all without `~`, `$`, `?`, `[`).
+   - `random_hostile_lines` (40,000 lines × 3 `evaluate` calls + `parse_command`): inside owned paths, `Ctx::check` called `self.s.glob_hit(p, u.role)` on every globby word (`*`, `?`, `[`, `*.rs` in `ALPHABET`), which compiled multiple `GlobBuilder` regexes (`ShellGlob::new`) and allocated ~137 `String`s (`Sensitive::probes()`) + 137 `Vec<&str>` splits even when the path could not match any probe (e.g., `/h/u/*`, `/h/u/*.rs`, `/h/u/?`, `/h/u/[`). `recursive_search_roots` also allocated `fold(base(first))` on every command unit.
+
+### Changes (`crates/atrium-core/src/policy/deny.rs`)
+- **Work budget & `NormArena` (`af17263`):**
+  - Lowered `MAX_GLOB_WORK` from `100_000` to `20_000` (still >7× `255 */ + 255 ../`, and tripped cleanly by `200 */ + 200 ../ + 1000 a/`, `200 */ + 200 ../ + 20000 a/`, and `256 brace * 400 segments`).
+  - Replaced `NormArena::intern: HashMap<(usize, u32, usize), usize>` with a lazy open-addressed `Vec<u32>` (`intern_buckets` + `enable_branch`), replaced SipHash `HashMap`/`HashSet` in `NormArena`, `normalize_glob_filtered`, `expand_glob_candidates`, `search_variants_from_cands`, and `check_escape_variant` with deterministic `FxHasher` (`FxMap`/`FxSet`), and precomputed `seg_flags` once per segment in `NormArena::intern_seg`.
+  - Fast-pathed `expand_glob_candidates` to skip `words::brace_expand` when `!r.contains('{')`, `words::expand_home` when `!e.starts_with(['~', '$'])`, `may_be_dot_component` / `widen_pattern_dots` when `!s.contains(['?', '['])`, and `widen_pattern_slashes` when `!s.contains('[')`.
+- **`Ctx::check` & `recursive_search_roots` (`af17263`):**
+  - Added `Ctx::fast_glob_hit` + `Ctx::might_glob_hit_probe`: deduplicates `(lower(p), role)` within `Ctx::check`, runs the same literal-prefix `self.s.hit(&prefix, role)` check as `Sensitive::glob_hit`, and pre-checks segment counts, hidden-dot rules, and literal segments (or `byte_prefix` for `**`) against `CRED_FILES`, `CRED_TREES`, `SSH_PROBES`, `BROWSER_ROOTS`, and `self.s.data` with zero regex compilations before falling through to `self.s.glob_hit`.
+  - Iterated `u.paths` / `a.aligned` directly in `Ctx::check` without allocating `Vec<&PathBuf>` per use.
+  - Replaced `fold(base(first))` in `recursive_search_roots` with an ASCII stack-buffer `[u8; 6]` fold and early `len > 6` exit.
+
+### Bottlenecks outside owned paths for N11 (`random_hostile_lines`)
+Per the N11 brief instruction (*"If the time is outside your paths, name the function in the handoff"*), if `random_hostile_lines` still spends significant time on Linux after bypassing `ShellGlob::new` in `Ctx::check`, the remaining hotspots outside our owned paths are:
+- `deny::Sensitive::new` (`crates/atrium-core/src/policy/deny.rs`, called 3 times per `DefaultPolicy::evaluate` — including unconditionally in `deny::analyze_with` even when `unbounded_unknown_words` is empty, in `deny::hard_deny`, and in `engine::DefaultPolicy::evaluate` — allocating ~56 `format!` strings per call).
+- `deny::Sensitive::glob_hit` / `ShellGlob::new` / `Sensitive::probes` (`crates/atrium-core/src/policy/deny.rs`, lines ~567–814) when a pattern passes `might_glob_hit_probe` (e.g., `**` under `home`).
+- `shell::lex_depth_uncached` / `shell::code_texts_bounded` (calls `shell::unwrap_steps` unconditionally per unit) / `shell::unwrap_readings_bounded` (`crates/atrium-core/src/policy/shell.rs`).
+- `words::brace_expand` (`crates/atrium-core/src/policy/words.rs`, allocates `String` + `Vec<char>` per word in `words_of` even when `!w.contains('{')`).
+
+### Checks run by this worker (D-123)
+- `cargo fmt --all` — passed (exit 0).
+- `cargo check -p atrium-core --tests` — passed in 3.95 s with 0 warnings.
+
+### Not done (D-123)
+- `cargo test` and `cargo clippy` were not run by this worker per D-123; left for the verification task (including timing checks on `k10_400_star_dotdot_globs_stay_under_50ms_and_fail_closed_to_ask`, `fix4_finding3_glob_escape_total_variant_cap_performance`, and `random_hostile_lines_never_panic_and_nothing_sensitive_is_allowed`).
