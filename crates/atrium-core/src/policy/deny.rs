@@ -616,140 +616,213 @@ impl Sensitive {
 
     /// A word with glob characters: does the pattern reach a sensitive path?
     fn glob_hit(&self, pattern: &Path, role: Role) -> Option<&'static str> {
-        let pl = lower(pattern);
-        // literal directory prefix
-        let mut prefix = PathBuf::new();
-        for c in Path::new(&pl).components() {
-            let s = c.as_os_str().to_string_lossy();
-            if s.contains(['*', '?', '[']) {
-                break;
+        with_lower_path(pattern, |pl| {
+            // literal directory prefix
+            let hit_prefix = if !(pl.contains("/./")
+                || pl.contains("/../")
+                || pl.ends_with("/.")
+                || pl.ends_with("/.."))
+            {
+                let prefix_str = match pl.find(['*', '?', '[']) {
+                    Some(meta) => match pl[..meta].rfind('/') {
+                        Some(0) => "/",
+                        Some(i) => &pl[..i],
+                        None => "",
+                    },
+                    None => pl,
+                };
+                if !prefix_str.is_empty() && prefix_str != "/" {
+                    self.hit(Path::new(prefix_str), role)
+                } else {
+                    None
+                }
+            } else {
+                let mut prefix = PathBuf::new();
+                for c in Path::new(pl).components() {
+                    let s = c.as_os_str().to_string_lossy();
+                    if s.contains(['*', '?', '[']) {
+                        break;
+                    }
+                    prefix.push(c.as_os_str());
+                }
+                if prefix.as_os_str() != "/" {
+                    self.hit(&prefix, role)
+                } else {
+                    None
+                }
+            };
+            if let Some(h) = hit_prefix {
+                return Some(h);
             }
-            prefix.push(c.as_os_str());
-        }
-        if let Some(h) = self.hit(&prefix, role)
-            && prefix.as_os_str() != "/"
-        {
-            return Some(h);
-        }
-        let glob = ShellGlob::new(&pl);
-        let matches_dir_list = |dirs: &[String], files: &[&str], subtrees: &[&str]| {
-            dirs.iter().any(|d| {
-                glob.matches_tree(d)
-                    || glob.matches_exact(d)
-                    || files
-                        .iter()
-                        .any(|f| glob.matches_exact(&format!("{d}/{f}")))
-                    || subtrees
-                        .iter()
-                        .any(|st| glob.matches_tree(&format!("{d}/{st}")))
-            })
-        };
-        if matches_dir_list(&self.data, Self::DATA_PROBE_FILES, &["snapshots", "logs"])
-            || (role != Role::Read
-                && matches_dir_list(&self.protected, Self::PROTECTED_PROBE_FILES, &[]))
-        {
-            return Some("atrium-self");
-        }
-        let home_tails = glob.tails_after(&self.home);
-        if home_tails.is_empty() {
-            return None;
-        }
-        for f in CRED_FILES {
-            if home_tails.iter().any(|t| t.matches_exact(f)) {
+            if !pl.contains("**")
+                && !path_could_reach_root(pl, &self.home)
+                && !self.data.iter().any(|d| path_could_reach_root(pl, d))
+                && (role == Role::Read
+                    || !self.protected.iter().any(|d| path_could_reach_root(pl, d)))
+            {
+                return None;
+            }
+            let glob = ShellGlob::new(pl);
+            let tail_all = glob.as_tail();
+            let matches_dir_list = |dirs: &[String], files: &[&str], subtrees: &[&str]| {
+                dirs.iter().any(|d| {
+                    if glob.abs != d.starts_with('/') {
+                        return false;
+                    }
+                    let d_segs = Segs::from_str(d);
+                    if !glob.has_globstar && glob.parts().len() < d_segs.len() {
+                        return false;
+                    }
+                    tail_all.matches_tree_segs(d_segs.as_slice())
+                        || tail_all.matches_exact_segs(d_segs.as_slice())
+                        || files.iter().any(|f| {
+                            let segs = d_segs.extended_with(f);
+                            tail_all.matches_exact_segs(segs.as_slice())
+                        })
+                        || subtrees.iter().any(|st| {
+                            let segs = d_segs.extended_with(st);
+                            tail_all.matches_tree_segs(segs.as_slice())
+                        })
+                })
+            };
+            if matches_dir_list(&self.data, Self::DATA_PROBE_FILES, &["snapshots", "logs"])
+                || (role != Role::Read
+                    && matches_dir_list(&self.protected, Self::PROTECTED_PROBE_FILES, &[]))
+            {
+                return Some("atrium-self");
+            }
+            let home_tails = glob.tails_after(&self.home);
+            if home_tails.is_empty() {
+                return None;
+            }
+            let tails = home_tails.as_slice();
+            for f in CRED_FILES {
+                let f_segs = Segs::from_str(f);
+                if tails
+                    .iter()
+                    .any(|t| t.matches_exact_segs(f_segs.as_slice()))
+                {
+                    return Some("credential-read");
+                }
+            }
+            for tree in CRED_TREES {
+                let t_segs = Segs::from_str(tree);
+                let tx_segs = t_segs.extended_with("x");
+                if tails.iter().any(|t| {
+                    t.matches_tree_segs(t_segs.as_slice())
+                        || t.matches_exact_segs(t_segs.as_slice())
+                        || t.matches_exact_segs(tx_segs.as_slice())
+                }) {
+                    return Some("credential-read");
+                }
+            }
+            if tails.iter().any(|t| t.matches_ssh_secret(role))
+                || SSH_PROBES.iter().any(|n| {
+                    let segs = Segs::from_strs(&[".ssh", n]);
+                    tails.iter().any(|t| t.matches_exact_segs(segs.as_slice()))
+                })
+            {
                 return Some("credential-read");
             }
-        }
-        for tree in CRED_TREES {
-            if home_tails.iter().any(|t| {
-                t.matches_tree(tree)
-                    || t.matches_exact(tree)
-                    || t.matches_exact(&format!("{tree}/x"))
-            }) {
-                return Some("credential-read");
-            }
-        }
-        if home_tails.iter().any(|t| t.matches_ssh_secret(role))
-            || SSH_PROBES.iter().any(|n| {
-                let rel = format!(".ssh/{n}");
-                home_tails.iter().any(|t| t.matches_exact(&rel))
-            })
-        {
-            return Some("credential-read");
-        }
-        if let Some(last) = glob.parts.last() {
-            let last_is_browser =
-                matches!(last, Comp::GlobStar) || BROWSER_FILES.iter().any(|f| last.matches(f));
-            if last_is_browser {
-                for b in BROWSER_ROOTS {
-                    if home_tails.iter().any(|t| {
-                        t.matches_strictly_under(b)
-                            || BROWSER_FILES.iter().any(|f| {
-                                t.matches_exact(&format!("{b}/{f}"))
-                                    || t.matches_exact(&format!("{b}/default/{f}"))
-                            })
-                    }) {
-                        return Some("credential-read");
+            let has_deep_tail = tails.iter().any(|t| t.has_globstar || t.parts.len() >= 2);
+            if has_deep_tail && let Some(last) = glob.parts().last() {
+                let last_is_browser =
+                    matches!(last, Comp::GlobStar) || BROWSER_FILES.iter().any(|f| last.matches(f));
+                if last_is_browser {
+                    for b in BROWSER_ROOTS {
+                        let b_segs = Segs::from_str(b);
+                        let b_def_segs = b_segs.extended_with("default");
+                        if tails.iter().any(|t| {
+                            t.matches_strictly_under_segs(b_segs.as_slice())
+                                || BROWSER_FILES.iter().any(|f| {
+                                    let bf = b_segs.extended_with(f);
+                                    let bdf = b_def_segs.extended_with(f);
+                                    t.matches_exact_segs(bf.as_slice())
+                                        || t.matches_exact_segs(bdf.as_slice())
+                                })
+                        }) {
+                            return Some("credential-read");
+                        }
                     }
                 }
             }
-        }
-        None
+            None
+        })
     }
 
     pub fn is_ssh_dir(&self, p: &Path) -> bool {
-        let pl = lower(p);
-        if pl == format!("{}/.ssh", self.home) {
-            return true;
-        }
-        if !pl.contains(['*', '?', '[']) {
-            return false;
-        }
-        let glob = ShellGlob::new(&pl);
-        glob.tails_after(&self.home)
-            .iter()
-            .any(|t| t.matches_exact(".ssh"))
+        with_lower_path(p, |pl| {
+            if under(pl, &self.home) == Some(".ssh") {
+                return true;
+            }
+            if !pl.contains(['*', '?', '[']) {
+                return false;
+            }
+            let last = pl.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+            if last != "**" && !Comp::from_part(last).matches(".ssh") {
+                return false;
+            }
+            let glob = ShellGlob::new(pl);
+            glob.tails_after(&self.home)
+                .as_slice()
+                .iter()
+                .any(|t| t.matches_exact(".ssh"))
+        })
     }
 
     /// A credential store that asks (CR-12): `p` is one, or is inside one
     /// of its folders.
     pub fn ask_hit(&self, p: &Path) -> bool {
-        let pl = lower(p);
-        if let Some(rest) = under(&pl, &self.home)
-            && (ASK_FILES.iter().any(|f| f.to_lowercase() == rest)
-                || ASK_TREES.iter().any(|t| under(rest, t).is_some())
-                || ASK_NAME_PREFIXES.iter().any(|(dir, pre)| {
-                    under(rest, dir).is_some_and(|r| !r.contains('/') && r.starts_with(pre))
-                }))
-        {
-            return true;
-        }
-        if !pl.contains(['*', '?', '[']) {
-            return false;
-        }
-        let glob = ShellGlob::new(&pl);
-        let home_tails = glob.tails_after(&self.home);
-        if home_tails.is_empty() {
-            return false;
-        }
-        if ASK_FILES.iter().any(|f| {
-            let fl = f.to_lowercase();
-            home_tails.iter().any(|t| t.matches_exact(&fl))
-        }) {
-            return true;
-        }
-        if ASK_TREES.iter().any(|tr| {
-            home_tails.iter().any(|t| {
-                t.matches_tree(tr)
-                    || t.matches_exact(tr)
-                    || t.matches_exact(&format!("{tr}/x.json"))
+        with_lower_path(p, |pl| {
+            if let Some(rest) = under(pl, &self.home)
+                && (ASK_FILES.iter().any(|f| {
+                    (f.is_ascii() && f.eq_ignore_ascii_case(rest))
+                        || (!f.is_ascii() && f.to_lowercase() == rest)
+                }) || ASK_TREES.iter().any(|t| under(rest, t).is_some())
+                    || ASK_NAME_PREFIXES.iter().any(|(dir, pre)| {
+                        under(rest, dir).is_some_and(|r| !r.contains('/') && r.starts_with(pre))
+                    }))
+            {
+                return true;
+            }
+            if !pl.contains(['*', '?', '[']) {
+                return false;
+            }
+            if !pl.contains("**") && !path_could_reach_root(pl, &self.home) {
+                return false;
+            }
+            let glob = ShellGlob::new(pl);
+            let home_tails = glob.tails_after(&self.home);
+            if home_tails.is_empty() {
+                return false;
+            }
+            let tails = home_tails.as_slice();
+            if ASK_FILES.iter().any(|f| {
+                with_lower_str(f, |fl| {
+                    let f_segs = Segs::from_str(fl);
+                    tails
+                        .iter()
+                        .any(|t| t.matches_exact_segs(f_segs.as_slice()))
+                })
+            }) {
+                return true;
+            }
+            if ASK_TREES.iter().any(|tr| {
+                let t_segs = Segs::from_str(tr);
+                let tx_segs = t_segs.extended_with("x.json");
+                tails.iter().any(|t| {
+                    t.matches_tree_segs(t_segs.as_slice())
+                        || t.matches_exact_segs(t_segs.as_slice())
+                        || t.matches_exact_segs(tx_segs.as_slice())
+                })
+            }) {
+                return true;
+            }
+            ASK_NAME_PREFIXES.iter().any(|(dir, pre)| {
+                tails
+                    .iter()
+                    .any(|t| t.matches_dir_and_name_prefix(dir, pre))
             })
-        }) {
-            return true;
-        }
-        ASK_NAME_PREFIXES.iter().any(|(dir, pre)| {
-            home_tails
-                .iter()
-                .any(|t| t.matches_dir_and_name_prefix(dir, pre))
         })
     }
 
@@ -831,16 +904,19 @@ impl Sensitive {
                         }
                         continue;
                     }
-                    if let Some((dir_pat, file_pat)) = norm.rsplit_once('/') {
-                        let dir_match = !dir_pat.is_empty()
-                            && GlobBuilder::new(dir_pat)
+                    if let Some((dir_pat, file_pat)) = norm.rsplit_once('/')
+                        && !dir_pat.is_empty()
+                        && matches_ask_name_prefix_pat(file_pat, pre)
+                    {
+                        let dir_match = dir_pat == "**"
+                            || GlobBuilder::new(dir_pat)
                                 .literal_separator(false)
                                 .build()
                                 .map_or(true, |g| {
                                     let m = g.compile_matcher();
                                     m.is_match(dir_rel) || m.is_match(&dir_abs)
                                 });
-                        if dir_match && matches_ask_name_prefix_pat(file_pat, pre) {
+                        if dir_match {
                             return true;
                         }
                     }
@@ -870,26 +946,44 @@ impl Sensitive {
                     }
                     let dir_pat = &norm[..idx];
                     let rest = &norm[idx + 1..];
+                    let generic_dir = matches!(dir_pat.rsplit('/').next(), Some("**" | "*"));
+                    if dir_pat == "**" {
+                        if !generic_dir || rest.is_empty() {
+                            return true;
+                        }
+                        if tree_targets
+                            .iter()
+                            .any(|(tree, _, _)| ask_tree_matches_rest(tree, rest))
+                            || GlobBuilder::new(rest)
+                                .literal_separator(false)
+                                .build()
+                                .is_err()
+                        {
+                            return true;
+                        }
+                        continue;
+                    }
                     let Ok(g) = GlobBuilder::new(dir_pat).literal_separator(true).build() else {
                         return true;
                     };
                     let m = g.compile_matcher();
-                    let generic_dir = matches!(dir_pat.rsplit('/').next(), Some("**" | "*"));
-                    if generic_dir
-                        && !rest.is_empty()
-                        && GlobBuilder::new(rest)
-                            .literal_separator(false)
-                            .build()
-                            .is_err()
-                    {
-                        return true;
-                    }
+                    let mut rest_checked = false;
                     for (tree, tree_rel, t_abs) in &tree_targets {
                         if !(m.is_match(tree_rel) || m.is_match(t_abs)) {
                             continue;
                         }
                         if !generic_dir || rest.is_empty() || ask_tree_matches_rest(tree, rest) {
                             return true;
+                        }
+                        if !rest_checked {
+                            rest_checked = true;
+                            if GlobBuilder::new(rest)
+                                .literal_separator(false)
+                                .build()
+                                .is_err()
+                            {
+                                return true;
+                            }
                         }
                     }
                 }
@@ -934,6 +1028,193 @@ impl Sensitive {
             }
         }
         None
+    }
+}
+
+fn trim_trailing_slash(s: &str, trim_slash: bool) -> &str {
+    if !trim_slash {
+        return s;
+    }
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() { "/" } else { trimmed }
+}
+
+fn with_lower_or<R>(
+    s: Option<&str>,
+    trim_slash: bool,
+    fallback: impl FnOnce() -> String,
+    f: impl FnOnce(&str) -> R,
+) -> R {
+    if let Some(s) = s {
+        let mut is_ascii = true;
+        let mut has_upper = false;
+        for &b in s.as_bytes() {
+            if !b.is_ascii() {
+                is_ascii = false;
+                break;
+            }
+            has_upper |= b.is_ascii_uppercase();
+        }
+        if is_ascii {
+            if !has_upper {
+                return f(trim_trailing_slash(s, trim_slash));
+            }
+            if s.len() <= 512 {
+                let mut buf = [0u8; 512];
+                let n = s.len();
+                buf[..n].copy_from_slice(s.as_bytes());
+                buf[..n].make_ascii_lowercase();
+                let lower_s = std::str::from_utf8(&buf[..n]).unwrap();
+                return f(trim_trailing_slash(lower_s, trim_slash));
+            }
+        }
+    }
+    f(&fallback())
+}
+
+fn with_lower_path<R>(p: &Path, f: impl FnOnce(&str) -> R) -> R {
+    with_lower_or(p.to_str(), true, || lower(p), f)
+}
+
+fn with_lower_str<R>(s: &str, f: impl FnOnce(&str) -> R) -> R {
+    with_lower_or(Some(s), false, || s.to_lowercase(), f)
+}
+
+fn path_could_reach_root(pl: &str, root: &str) -> bool {
+    if root.contains("//") {
+        return true;
+    }
+    let first_meta = pl.find(['*', '?', '[', '{', '\\']).unwrap_or(pl.len());
+    let Some(slash) = pl[..first_meta].rfind('/') else {
+        return true;
+    };
+    let raw_dir = &pl[..slash];
+    if raw_dir.contains("//") {
+        return true;
+    }
+    let ld = raw_dir.trim_end_matches('/');
+    let ld = if ld.is_empty() { "/" } else { ld };
+    under(root, ld).is_some() || under(ld, root).is_some()
+}
+
+const MAX_STACK_SEGS: usize = 16;
+
+enum Segs<'a> {
+    Stack {
+        buf: [&'a str; MAX_STACK_SEGS],
+        len: usize,
+    },
+    Heap(Vec<&'a str>),
+}
+
+impl<'a> Segs<'a> {
+    fn from_str(s: &'a str) -> Self {
+        Self::from_strs(&[s])
+    }
+
+    fn from_strs(parts: &[&'a str]) -> Self {
+        let mut buf = [""; MAX_STACK_SEGS];
+        let mut len = 0;
+        let mut heap: Option<Vec<&'a str>> = None;
+        for &part in parts {
+            for seg in part.split('/').filter(|s| !s.is_empty()) {
+                if let Some(v) = &mut heap {
+                    v.push(seg);
+                } else if len < MAX_STACK_SEGS {
+                    buf[len] = seg;
+                    len += 1;
+                } else {
+                    let mut v = Vec::with_capacity(24);
+                    v.extend_from_slice(&buf[..len]);
+                    v.push(seg);
+                    heap = Some(v);
+                }
+            }
+        }
+        match heap {
+            Some(v) => Self::Heap(v),
+            None => Self::Stack { buf, len },
+        }
+    }
+
+    fn extended_with(&self, extra: &'a str) -> Self {
+        let base = self.as_slice();
+        let mut buf = [""; MAX_STACK_SEGS];
+        let mut len = 0;
+        let mut heap: Option<Vec<&'a str>> = None;
+        if base.len() <= MAX_STACK_SEGS {
+            buf[..base.len()].copy_from_slice(base);
+            len = base.len();
+        } else {
+            heap = Some(base.to_vec());
+        }
+        for seg in extra.split('/').filter(|s| !s.is_empty()) {
+            if let Some(v) = &mut heap {
+                v.push(seg);
+            } else if len < MAX_STACK_SEGS {
+                buf[len] = seg;
+                len += 1;
+            } else {
+                let mut v = Vec::with_capacity(24);
+                v.extend_from_slice(&buf[..len]);
+                v.push(seg);
+                heap = Some(v);
+            }
+        }
+        match heap {
+            Some(v) => Self::Heap(v),
+            None => Self::Stack { buf, len },
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Stack { len, .. } => *len,
+            Self::Heap(v) => v.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[&'a str] {
+        match self {
+            Self::Stack { buf, len } => &buf[..*len],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
+enum BoolDp {
+    Stack {
+        a: [bool; 64],
+        b: [bool; 64],
+        len: usize,
+    },
+    Heap {
+        a: Vec<bool>,
+        b: Vec<bool>,
+    },
+}
+
+impl BoolDp {
+    fn new(m: usize) -> Self {
+        if m < 64 {
+            Self::Stack {
+                a: [false; 64],
+                b: [false; 64],
+                len: m + 1,
+            }
+        } else {
+            Self::Heap {
+                a: vec![false; m + 1],
+                b: vec![false; m + 1],
+            }
+        }
+    }
+
+    fn pair(&mut self) -> (&mut [bool], &mut [bool]) {
+        match self {
+            Self::Stack { a, b, len } => (&mut a[..*len], &mut b[..*len]),
+            Self::Heap { a, b } => (a.as_mut_slice(), b.as_mut_slice()),
+        }
     }
 }
 
@@ -1105,27 +1386,14 @@ fn comp_glob_matches_impl(pat: &str, tgt: &str, prefix: bool) -> bool {
     comp_glob_dp(pat, tgt, prefix)
 }
 
-fn comp_glob_dp(pat: &str, tgt: &str, prefix: bool) -> bool {
-    if pat == tgt {
-        return true;
-    }
-    if tgt.starts_with('.') && !pat_starts_with_dot(pat) {
-        return false;
-    }
-    let tc: Vec<char> = tgt.chars().collect();
-    let m = tc.len();
-    if prefix && m == 0 {
-        return true;
-    }
-    let (mut dp_stack, mut next_stack) = ([false; 64], [false; 64]);
-    let (mut dp_heap, mut next_heap) = (Vec::new(), Vec::new());
-    let (mut dp, mut next): (&mut [bool], &mut [bool]) = if m < 64 {
-        (&mut dp_stack[..=m], &mut next_stack[..=m])
-    } else {
-        dp_heap.resize(m + 1, false);
-        next_heap.resize(m + 1, false);
-        (&mut dp_heap, &mut next_heap)
-    };
+fn comp_glob_dp_slice(
+    pat: &str,
+    prefix: bool,
+    m: usize,
+    matches_at: impl Fn(usize, &GlobAtom<'_>) -> bool,
+) -> bool {
+    let mut dp_buf = BoolDp::new(m);
+    let (mut dp, mut next) = dp_buf.pair();
     dp[0] = true;
     let mut i = 0;
     while i < pat.len() {
@@ -1142,16 +1410,8 @@ fn comp_glob_dp(pat: &str, tgt: &str, prefix: bool) -> bool {
             atom => {
                 next.fill(false);
                 for k in 0..m {
-                    if dp[k] {
-                        let ok = match atom {
-                            GlobAtom::Any => true,
-                            GlobAtom::Lit(lit) => tc[k] == lit,
-                            GlobAtom::Class(cls) => class_matches_char(cls, tc[k]),
-                            GlobAtom::Star => unreachable!(),
-                        };
-                        if ok {
-                            next[k + 1] = true;
-                        }
+                    if dp[k] && matches_at(k, &atom) {
+                        next[k + 1] = true;
                     }
                 }
                 std::mem::swap(&mut dp, &mut next);
@@ -1167,6 +1427,55 @@ fn comp_glob_dp(pat: &str, tgt: &str, prefix: bool) -> bool {
     dp[m]
 }
 
+fn comp_glob_dp(pat: &str, tgt: &str, prefix: bool) -> bool {
+    if pat == tgt {
+        return true;
+    }
+    if tgt.starts_with('.') && !pat_starts_with_dot(pat) {
+        return false;
+    }
+    if !prefix {
+        if !pat.contains(['*', '?', '[', '\\']) {
+            return false;
+        }
+        let first_meta = pat.find(['*', '?', '[', '\\']).unwrap_or(pat.len());
+        if first_meta > 0 && !tgt.starts_with(&pat[..first_meta]) {
+            return false;
+        }
+        if let Some(last_meta) = pat.rfind(['*', '?', ']', '\\']) {
+            let suf = &pat[last_meta + 1..];
+            if !suf.is_empty() && !tgt.ends_with(suf) {
+                return false;
+            }
+        }
+    }
+    if tgt.is_ascii() {
+        let tb = tgt.as_bytes();
+        let m = tb.len();
+        if prefix && m == 0 {
+            return true;
+        }
+        return comp_glob_dp_slice(pat, prefix, m, |k, atom| match atom {
+            GlobAtom::Any => true,
+            GlobAtom::Lit(lit) => lit.is_ascii() && tb[k] == (*lit as u8),
+            GlobAtom::Class(cls) => class_matches_char(cls, tb[k] as char),
+            GlobAtom::Star => unreachable!(),
+        });
+    }
+    let tc: Vec<char> = tgt.chars().collect();
+    let m = tc.len();
+    if prefix && m == 0 {
+        return true;
+    }
+    comp_glob_dp_slice(pat, prefix, m, |k, atom| match atom {
+        GlobAtom::Any => true,
+        GlobAtom::Lit(lit) => tc[k] == *lit,
+        GlobAtom::Class(cls) => class_matches_char(cls, tc[k]),
+        GlobAtom::Star => unreachable!(),
+    })
+}
+
+#[derive(Clone, Copy)]
 enum Comp<'a> {
     GlobStar,
     Literal(&'a str),
@@ -1181,7 +1490,8 @@ impl<'a> Comp<'a> {
         if !c.contains(['*', '?', '[', '{']) {
             return Self::Literal(c);
         }
-        let dot_ok = pat_starts_with_dot(c) || (c.starts_with('{') && brace_branch_dot_ok(c));
+        let dot_ok = pat_starts_with_dot(c)
+            || (c.starts_with('{') && c.contains(['.', '[']) && brace_branch_dot_ok(c));
         Self::Pattern { raw: c, dot_ok }
     }
 
@@ -1356,10 +1666,11 @@ fn glob_matches_stem_suffix(pat: &str, suf: &str) -> bool {
         }
         return dp1;
     }
-    let sc: Vec<char> = suf.chars().collect();
-    let m = sc.len();
+    let sb = suf.as_bytes();
+    let m = sb.len();
+    let mut dp_buf = BoolDp::new(m);
+    let (mut dp, mut next) = dp_buf.pair();
     let mut dp_stem = true;
-    let mut dp = vec![false; m + 1];
     dp[0] = true;
     let mut i = 0;
     while i < pat.len() {
@@ -1377,17 +1688,17 @@ fn glob_matches_stem_suffix(pat: &str, suf: &str) -> bool {
             }
             atom => {
                 let next_stem = dp_stem && atom_matches_stem_char(&atom, false);
-                let mut next = vec![false; m + 1];
+                next.fill(false);
                 if next_stem {
                     next[0] = true;
                 }
                 for k in 0..m {
-                    if dp[k] && atom_matches_char(&atom, sc[k]) {
+                    if dp[k] && atom_matches_char(&atom, sb[k] as char) {
                         next[k + 1] = true;
                     }
                 }
                 dp_stem = next_stem;
-                dp = next;
+                std::mem::swap(&mut dp, &mut next);
                 if !dp_stem && !dp.iter().any(|&b| b) {
                     return false;
                 }
@@ -1432,9 +1743,10 @@ fn ask_tree_matches_rest(tree: &str, rest: &str) -> bool {
 
 /// Whether `pat` can match `<pre><ext>` for any extension `<ext>` (0+ non-`/` chars).
 fn glob_matches_name_prefix(pat: &str, pre: &str) -> bool {
-    let pc: Vec<char> = pre.chars().collect();
-    let m = pc.len();
-    let mut dp = vec![false; m + 1];
+    let pb = pre.as_bytes();
+    let m = pb.len();
+    let mut dp_buf = BoolDp::new(m);
+    let (mut dp, mut next) = dp_buf.pair();
     dp[0] = true;
     let mut i = 0;
     while i < pat.len() {
@@ -1449,16 +1761,16 @@ fn glob_matches_name_prefix(pat: &str, pre: &str) -> bool {
                 }
             }
             atom => {
-                let mut next = vec![false; m + 1];
+                next.fill(false);
                 for k in 0..m {
-                    if dp[k] && atom_matches_char(&atom, pc[k]) {
+                    if dp[k] && atom_matches_char(&atom, pb[k] as char) {
                         next[k + 1] = true;
                     }
                 }
                 if dp[m] && atom_matches_stem_char(&atom, false) {
                     next[m] = true;
                 }
-                dp = next;
+                std::mem::swap(&mut dp, &mut next);
                 if !dp.iter().any(|&b| b) {
                     return false;
                 }
@@ -1500,44 +1812,93 @@ fn matches_ask_name_prefix_pat(file_pat: &str, pre: &str) -> bool {
     true
 }
 
-fn split_comps(path: &str) -> Vec<&str> {
-    path.split('/').filter(|s| !s.is_empty()).collect()
+enum IdxBuf {
+    Stack {
+        buf: [usize; MAX_STACK_SEGS],
+        len: usize,
+    },
+    Heap(Vec<usize>),
 }
 
-fn reach_indices(parts: &[Comp<'_>], has_globstar: bool, tgt: &[&str]) -> Vec<usize> {
+impl IdxBuf {
+    fn new() -> Self {
+        Self::Stack {
+            buf: [0; MAX_STACK_SEGS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, v: usize) {
+        match self {
+            Self::Stack { buf, len } if *len < MAX_STACK_SEGS => {
+                buf[*len] = v;
+                *len += 1;
+            }
+            Self::Stack { buf, len } => {
+                let mut heap = Vec::with_capacity(24);
+                heap.extend_from_slice(&buf[..*len]);
+                heap.push(v);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(heap) => heap.push(v),
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::Stack { buf, len } => &buf[..*len],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
+fn reach_indices(parts: &[Comp<'_>], has_globstar: bool, tgt: &[&str]) -> IdxBuf {
     let n = parts.len();
     let m = tgt.len();
+    let mut out = IdxBuf::new();
     if !has_globstar {
         if n >= m && parts[..m].iter().zip(tgt).all(|(p, t)| p.matches(t)) {
-            return vec![m];
+            out.push(m);
         }
-        return vec![];
+        return out;
     }
-    let mut dp = vec![vec![false; m + 1]; n + 1];
-    dp[0][0] = true;
-    for i in 0..n {
-        for j in 0..=m {
-            if !dp[i][j] {
-                continue;
-            }
-            match &parts[i] {
-                Comp::GlobStar => {
-                    dp[i + 1][j] = true;
-                    if j < m {
-                        dp[i][j + 1] = true;
+    let mut dp_buf = BoolDp::new(m);
+    let (mut cur, mut next) = dp_buf.pair();
+    cur[0] = true;
+    for (i, part) in parts.iter().enumerate() {
+        match part {
+            Comp::GlobStar => {
+                for j in 0..m {
+                    if cur[j] {
+                        cur[j + 1] = true;
                     }
                 }
-                comp => {
-                    if j < m && comp.matches(tgt[j]) {
-                        dp[i + 1][j + 1] = true;
+                if cur[m] {
+                    out.push(i);
+                }
+                next.copy_from_slice(cur);
+            }
+            comp => {
+                if cur[m] {
+                    out.push(i);
+                }
+                next.fill(false);
+                for j in 0..m {
+                    if cur[j] && comp.matches(tgt[j]) {
+                        next[j + 1] = true;
                     }
                 }
             }
         }
+        std::mem::swap(&mut cur, &mut next);
     }
-    (0..=n).filter(|&i| dp[i][m]).collect()
+    if cur[m] {
+        out.push(n);
+    }
+    out
 }
 
+#[derive(Clone, Copy)]
 struct Tail<'a> {
     parts: &'a [Comp<'a>],
     has_globstar: bool,
@@ -1545,16 +1906,21 @@ struct Tail<'a> {
 
 impl Tail<'_> {
     fn matches_exact(&self, target: &str) -> bool {
-        let tgt = split_comps(target);
-        if !self.has_globstar {
-            return self.parts.len() == tgt.len()
-                && self.parts.iter().zip(&tgt).all(|(p, t)| p.matches(t));
-        }
-        reach_indices(self.parts, true, &tgt).contains(&self.parts.len())
+        let tgt = Segs::from_str(target);
+        self.matches_exact_segs(tgt.as_slice())
     }
 
-    fn matches_tree_impl(&self, tree: &str, strictly_under: bool) -> bool {
-        let tgt = split_comps(tree);
+    fn matches_exact_segs(&self, tgt: &[&str]) -> bool {
+        if !self.has_globstar {
+            return self.parts.len() == tgt.len()
+                && self.parts.iter().zip(tgt).all(|(p, t)| p.matches(t));
+        }
+        reach_indices(self.parts, true, tgt)
+            .as_slice()
+            .contains(&self.parts.len())
+    }
+
+    fn matches_tree_impl_segs(&self, tgt: &[&str], strictly_under: bool) -> bool {
         let Some((&leaf, parents)) = tgt.split_last() else {
             return false;
         };
@@ -1582,16 +1948,17 @@ impl Tail<'_> {
                 && leaf_matches(leaf_idx);
         }
         reach_indices(self.parts, true, parents)
-            .into_iter()
-            .any(|idx| idx < self.parts.len() && leaf_matches(idx))
+            .as_slice()
+            .iter()
+            .any(|&idx| idx < self.parts.len() && leaf_matches(idx))
     }
 
-    fn matches_tree(&self, tree: &str) -> bool {
-        self.matches_tree_impl(tree, false)
+    fn matches_tree_segs(&self, tgt: &[&str]) -> bool {
+        self.matches_tree_impl_segs(tgt, false)
     }
 
-    fn matches_strictly_under(&self, root: &str) -> bool {
-        self.matches_tree_impl(root, true)
+    fn matches_strictly_under_segs(&self, tgt: &[&str]) -> bool {
+        self.matches_tree_impl_segs(tgt, true)
     }
 
     fn matches_ssh_secret(&self, role: Role) -> bool {
@@ -1632,8 +1999,8 @@ impl Tail<'_> {
     }
 
     fn matches_dir_and_name_prefix(&self, dir: &str, pre: &str) -> bool {
-        let tgt = split_comps(dir);
-        for idx in reach_indices(self.parts, self.has_globstar, &tgt) {
+        let tgt = Segs::from_str(dir);
+        for &idx in reach_indices(self.parts, self.has_globstar, tgt.as_slice()).as_slice() {
             let sub = &self.parts[idx..];
             if sub.is_empty() {
                 continue;
@@ -1650,20 +2017,101 @@ impl Tail<'_> {
     }
 }
 
+enum CompBuf<'a> {
+    Stack {
+        buf: [Comp<'a>; MAX_STACK_SEGS],
+        len: usize,
+    },
+    Heap(Vec<Comp<'a>>),
+}
+
+impl<'a> CompBuf<'a> {
+    fn as_slice(&self) -> &[Comp<'a>] {
+        match self {
+            Self::Stack { buf, len } => &buf[..*len],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
+enum TailBuf<'a> {
+    Stack { buf: [Tail<'a>; 4], len: usize },
+    Heap(Vec<Tail<'a>>),
+}
+
+impl<'a> TailBuf<'a> {
+    fn new() -> Self {
+        Self::Stack {
+            buf: [Tail {
+                parts: &[],
+                has_globstar: false,
+            }; 4],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, t: Tail<'a>) {
+        match self {
+            Self::Stack { buf, len } if *len < 4 => {
+                buf[*len] = t;
+                *len += 1;
+            }
+            Self::Stack { buf, len } => {
+                let mut heap = Vec::with_capacity(8);
+                heap.extend_from_slice(&buf[..*len]);
+                heap.push(t);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(heap) => heap.push(t),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    fn as_slice(&self) -> &[Tail<'a>] {
+        match self {
+            Self::Stack { buf, len } => &buf[..*len],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
 /// Shell globbing: `*` and `?` don't cross `/` and don't match a leading dot.
 struct ShellGlob<'a> {
     abs: bool,
-    parts: Vec<Comp<'a>>,
+    parts: CompBuf<'a>,
     has_globstar: bool,
 }
 
 impl<'a> ShellGlob<'a> {
     fn new(pattern: &'a str) -> Self {
-        let parts: Vec<Comp<'a>> = split_comps(pattern)
-            .into_iter()
-            .map(Comp::from_part)
-            .collect();
-        let has_globstar = parts.iter().any(|c| matches!(c, Comp::GlobStar));
+        let mut buf = [Comp::GlobStar; MAX_STACK_SEGS];
+        let mut len = 0;
+        let mut heap: Option<Vec<Comp<'a>>> = None;
+        let mut has_globstar = false;
+        for seg in pattern.split('/').filter(|s| !s.is_empty()) {
+            let c = Comp::from_part(seg);
+            if matches!(c, Comp::GlobStar) {
+                has_globstar = true;
+            }
+            if let Some(v) = &mut heap {
+                v.push(c);
+            } else if len < MAX_STACK_SEGS {
+                buf[len] = c;
+                len += 1;
+            } else {
+                let mut v = Vec::with_capacity(24);
+                v.extend_from_slice(&buf[..len]);
+                v.push(c);
+                heap = Some(v);
+            }
+        }
+        let parts = match heap {
+            Some(v) => CompBuf::Heap(v),
+            None => CompBuf::Stack { buf, len },
+        };
         Self {
             abs: pattern.starts_with('/'),
             parts,
@@ -1671,38 +2119,34 @@ impl<'a> ShellGlob<'a> {
         }
     }
 
+    fn parts(&self) -> &[Comp<'a>] {
+        self.parts.as_slice()
+    }
+
     fn as_tail(&self) -> Tail<'_> {
         Tail {
-            parts: &self.parts,
+            parts: self.parts(),
             has_globstar: self.has_globstar,
         }
     }
 
-    fn matches_exact(&self, target: &str) -> bool {
-        self.abs == target.starts_with('/') && self.as_tail().matches_exact(target)
-    }
-
-    fn matches_tree(&self, tree: &str) -> bool {
-        self.abs == tree.starts_with('/') && self.as_tail().matches_tree(tree)
-    }
-
-    fn tails_after(&self, prefix: &str) -> Vec<Tail<'_>> {
+    fn tails_after(&self, prefix: &str) -> TailBuf<'_> {
+        let mut out = TailBuf::new();
         if self.abs != prefix.starts_with('/') {
-            return vec![];
+            return out;
         }
-        let tgt = split_comps(prefix);
-        reach_indices(&self.parts, self.has_globstar, &tgt)
-            .into_iter()
-            .map(|idx| {
-                let parts = &self.parts[idx..];
-                let has_globstar =
-                    self.has_globstar && parts.iter().any(|c| matches!(c, Comp::GlobStar));
-                Tail {
-                    parts,
-                    has_globstar,
-                }
-            })
-            .collect()
+        let tgt = Segs::from_str(prefix);
+        let all_parts = self.parts();
+        for &idx in reach_indices(all_parts, self.has_globstar, tgt.as_slice()).as_slice() {
+            let parts = &all_parts[idx..];
+            let has_globstar =
+                self.has_globstar && parts.iter().any(|c| matches!(c, Comp::GlobStar));
+            out.push(Tail {
+                parts,
+                has_globstar,
+            });
+        }
+        out
     }
 }
 
