@@ -1239,8 +1239,8 @@ fn round3_finding8_and_cr17_test_gaps() {
     );
 
     // DefaultPolicy allows hard-linked CR-17 store once mapped to its canonical ask-store path
-    // (Note: SessionGate::evaluate_sync in gate.rs still forces Ask via reaches_multiply_linked;
-    // gate.rs is outside M1-29's owned paths and escalated in the handoff.)
+    // (and SessionGate::check also preserves Allow for positively identified ask-store aliases
+    // under explicit rules — see `round5_finding4_gate_hardlink_remembered_rule`).
     let read_hard = paths_check(ToolKind::Read, "Read", &["proj/tf_hard"], false, None);
     let mapped_input = atrium_core::PolicyInput {
         check: &read_hard,
@@ -1286,10 +1286,7 @@ fn round5_finding1_path_filtering_retains_script_and_git_pathspec_operands() {
     )];
     // `sed 'w /h/u/out.txt' /h/u/work/input.txt`: script writes outside scope -> Ask
     assert_eq!(
-        classify(&home.cmd_rules(
-            "sed 'w /h/u/out.txt' /h/u/work/input.txt",
-            &allow_sed_work
-        )),
+        classify(&home.cmd_rules("sed 'w /h/u/out.txt' /h/u/work/input.txt", &allow_sed_work)),
         "Ask"
     );
     assert_eq!(
@@ -1346,10 +1343,7 @@ fn round5_finding1_path_filtering_retains_script_and_git_pathspec_operands() {
         "allow-diff-work",
     )];
     assert_eq!(
-        classify(&home.cmd_rules(
-            "diff -u /h/u/other/a.txt /h/u/work/b.txt",
-            &allow_diff_work
-        )),
+        classify(&home.cmd_rules("diff -u /h/u/other/a.txt /h/u/work/b.txt", &allow_diff_work)),
         "Ask"
     );
     let deny_diff_work = vec![scoped_rule(
@@ -1381,7 +1375,10 @@ fn round5_finding1_path_filtering_retains_script_and_git_pathspec_operands() {
         "git checkout a.txt",
     ] {
         assert!(
-            matches!(in_work.cmd_rules(cmd, &deny_git_work), PolicyVerdict::Deny { .. }),
+            matches!(
+                in_work.cmd_rules(cmd, &deny_git_work),
+                PolicyVerdict::Deny { .. }
+            ),
             "expected Deny for {cmd}"
         );
     }
@@ -1447,7 +1444,14 @@ fn round5_finding2_pwsh_option_values_and_inline_code() {
     let good_pwsh_rule = vec![rule(
         RuleScope::Global,
         ToolKind::Execute,
-        prefix(&["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "build.ps1"]),
+        prefix(&[
+            "pwsh",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "build.ps1",
+        ]),
         RuleDecision::Allow,
         "allow-pwsh-build",
     )];

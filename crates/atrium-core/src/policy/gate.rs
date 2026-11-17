@@ -270,6 +270,7 @@ fn evaluate_sync(
     let analysis = deny::analyze_with(&input, &fs_resolve);
     let ssh = ssh_members(&c.home);
     let mut resolved = vec![];
+    let mut ask_ids: Vec<(u64, u64)> = vec![];
     if !analysis.overflow {
         let mut roots: Vec<((u64, u64), PathBuf)> =
             deny::sensitive_roots(&c.home, &c.atrium_data_paths, &c.atrium_protected_paths)
@@ -283,11 +284,12 @@ fn evaluate_sync(
         );
         // the credential stores that ask (CR-12): the same identity and
         // hard-link handling
-        roots.extend(
-            deny::ask_roots(&c.home)
-                .into_iter()
-                .filter_map(|r| identity(&r).map(|id| (id, r))),
-        );
+        for r in deny::ask_roots(&c.home) {
+            if let Some(id) = identity(&r) {
+                ask_ids.push(id);
+                roots.push((id, r));
+            }
+        }
         for u in &analysis.uses {
             for p in &u.paths {
                 resolved.push(alias_fix(p, &roots)?);
@@ -358,12 +360,23 @@ fn evaluate_sync(
         }
     }
     // A file with several links may be another name for a credential in a
-    // tree the identity map doesn't walk: never auto-allow it, ask instead.
-    if matches!(verdict, PolicyVerdict::Allow { .. })
-        && !analysis.overflow
-        && reaches_multiply_linked(check, &analysis, &resolved)
-    {
-        verdict = PolicyVerdict::Ask;
+    // tree the identity map doesn't walk: never auto-allow it, ask instead,
+    // except when an explicit rule authorizes a positively identified ask-store alias.
+    if matches!(verdict, PolicyVerdict::Allow { .. }) && !analysis.overflow {
+        let rule_allowed = matches!(
+            policy.evaluate(
+                &PolicyInput {
+                    preset: Preset::Careful,
+                    ..input
+                },
+                rules,
+            ),
+            PolicyVerdict::Allow { .. }
+        );
+        let known_ask_ids: &[(u64, u64)] = if rule_allowed { &ask_ids } else { &[] };
+        if reaches_multiply_linked(check, &analysis, &resolved, known_ask_ids) {
+            verdict = PolicyVerdict::Ask;
+        }
     }
     Ok(Evaluated { verdict, resolved })
 }
@@ -1472,7 +1485,16 @@ fn reaches_tree_through_links<'a>(
 /// or a file below a folder a recursive search is given (review M1-13
 /// finding 11). The search walk is bounded and skips `node_modules` and
 /// `.git` (package managers and local clones hard-link their files there).
-fn reaches_multiply_linked(check: &ToolCheck, a: &deny::Analysis, resolved: &[PathBuf]) -> bool {
+fn is_known_ask_file(p: &Path, known_ask_ids: &[(u64, u64)]) -> bool {
+    !known_ask_ids.is_empty() && identity(p).is_some_and(|id| known_ask_ids.contains(&id))
+}
+
+fn reaches_multiply_linked(
+    check: &ToolCheck,
+    a: &deny::Analysis,
+    resolved: &[PathBuf],
+    known_ask_ids: &[(u64, u64)],
+) -> bool {
     let recursive_paths = matches!(
         &check.subject,
         ToolSubject::Paths {
@@ -1494,16 +1516,16 @@ fn reaches_multiply_linked(check: &ToolCheck, a: &deny::Analysis, resolved: &[Pa
             if command_word {
                 continue;
             }
-            if multiply_linked_file(p) {
+            if multiply_linked_file(p) && !is_known_ask_file(p, known_ask_ids) {
                 return true;
             }
             if globby
                 && let Some(dir) = p.parent()
-                && tree_has_multiply_linked(dir, 1)
+                && tree_has_multiply_linked(dir, 1, known_ask_ids)
             {
                 return true;
             }
-            if recursive && p.is_dir() && tree_has_multiply_linked(p, 8) {
+            if recursive && p.is_dir() && tree_has_multiply_linked(p, 8, known_ask_ids) {
                 return true;
             }
         }
@@ -1511,8 +1533,7 @@ fn reaches_multiply_linked(check: &ToolCheck, a: &deny::Analysis, resolved: &[Pa
     false
 }
 
-/// A bounded walk (links not followed) looking for a multiply-linked file.
-fn tree_has_multiply_linked(root: &Path, max_depth: u8) -> bool {
+fn tree_has_multiply_linked(root: &Path, max_depth: u8, known_ask_ids: &[(u64, u64)]) -> bool {
     const BUDGET: usize = 4096;
     let mut seen = 0usize;
     let mut stack = vec![(root.to_path_buf(), 0u8)];
@@ -1532,7 +1553,10 @@ fn tree_has_multiply_linked(root: &Path, max_depth: u8) -> bool {
                 if !skip && depth + 1 < max_depth {
                     stack.push((p, depth + 1));
                 }
-            } else if ft.is_file() && multiply_linked_file(&p) {
+            } else if ft.is_file()
+                && multiply_linked_file(&p)
+                && !is_known_ask_file(&p, known_ask_ids)
+            {
                 return true;
             }
         }
