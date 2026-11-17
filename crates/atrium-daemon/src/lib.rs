@@ -109,7 +109,7 @@ pub fn is_fish_shell(shell: &Path) -> bool {
 /// Command passed to `$SHELL -ilc` to print `PATH` between sentinel markers.
 pub fn login_shell_path_command(shell: &Path) -> &'static str {
     if is_fish_shell(shell) {
-        "printf '__ATRIUM_PATH_START__'; string join : -- $PATH; printf '__ATRIUM_PATH_END__'"
+        "printf '__ATRIUM_PATH_START__'; string join -n : -- $PATH; printf '__ATRIUM_PATH_END__'"
     } else {
         "printf '__ATRIUM_PATH_START__%s__ATRIUM_PATH_END__' \"$PATH\""
     }
@@ -807,7 +807,8 @@ mod tests {
         assert!(!is_fish_shell(Path::new("/bin/bash")));
 
         assert!(
-            login_shell_path_command(Path::new("/opt/homebrew/bin/fish")).contains("string join")
+            login_shell_path_command(Path::new("/opt/homebrew/bin/fish"))
+                .contains("string join -n")
         );
         assert!(login_shell_path_command(Path::new("/bin/zsh")).contains("$PATH"));
 
