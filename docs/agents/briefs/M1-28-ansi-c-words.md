@@ -59,3 +59,11 @@ Plus every minor and nit still open in the reviews of tasks merged before D-120 
 
 ## Added scope (D-120, orchestrator, 2026-11-16): N10
 `crates/atrium-daemon/tests/adversarial_socket.rs` `flooding_unread_list_threads_past_8_mib_control_lane_closes_connection` fails on Linux every run, on `dev` too: "the 8 MiB control lane was not enforced: all 17 answers arrived" (0.6 s). Find out whether the test is sized for macOS socket buffers (Linux's are larger) or the daemon doesn't enforce the lane on Linux. Make the test size its flood from the lane limit, not from the kernel buffer, so that it fails for a daemon that never closes the connection, and fix the daemon if that is the cause. Owned paths widen to that test and the daemon's per-connection lane code.
+
+## Added scope (D-120, orchestrator, 2026-11-17): N12
+`dev` fails three more tests on Linux, some only intermittently:
+- `atrium-daemon` `socket::replay_then_live_delivers_every_event_once_and_in_order`;
+- `socket::a_reader_that_stops_lags_alone`, which this task's rework 4 already worked on;
+- the app's `markdown.test.ts` "pathological emphasis and brackets parse quickly".
+
+Make all three deterministic on Linux. Owned paths widen to those tests, the daemon's connection and lane code, and `app/src/chat/markdown.ts`. Fix the code if it is a race or a slowdown; fix the test only if the test is wrong.

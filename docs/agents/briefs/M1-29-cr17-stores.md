@@ -48,3 +48,6 @@ Plus three rule-matching limits that M1-23's reviews escalated and D-121 reopene
 - [ ] Show your new tests (and the un-ignored ones) fail on `dev`'s code and pass now: check out `dev`'s versions of the src files you changed, run, restore.
 - [ ] `git diff dev --stat` touches only your owned paths.
 - [ ] Handoff `docs/agents/handoffs/M1-29-cr17-stores.md`: what changed and where, a verdict table (dev vs now) for every line you tested, ordinary-line checks, the outputs, anything escalated.
+
+## Added scope (D-120, orchestrator, 2026-11-17)
+The Opus escalation (D-129) changed `gate.rs`'s hard-link Ask exemption (review round 2, finding 4). M1-32 owns `gate.rs`, so the owned paths widen to that one hunk. **M1-29 merges before M1-32**, and M1-32 rebases on top.
