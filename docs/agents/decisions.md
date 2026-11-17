@@ -805,3 +805,6 @@ M1-29-cr17-stores went through five Hydrogen `high` rounds and two Codex reviews
 
 ## D-130 — 2026-11-17 — M1-27 escalates to Opus 5.5 (orchestrator, under PLAN §8.3)
 M1-27-engine-name-fold went through four Hydrogen `high` rounds. Codex review round 2 (`reviews/M1-27-engine-name-fold-round2.md`) still found 5 blockers, all in K7's positional resolution (`set --`, here-documents, functions and background jobs, unbounded allocation), plus open round-1 items. The rounds don't converge, so **an Opus 5.5 worker** continues, with a fail-closed design: resolve only exact, simple positional cases and Ask for everything else. The review stays with Codex. Same reasoning as D-127 to D-129.
+
+## D-131 — 2026-11-17 — M1-30 escalates to Opus 5.5 (orchestrator, under PLAN §8.3)
+M1-30-tree-wildcards went through five Hydrogen `high` rounds. Codex review round 2 (`reviews/M1-30-tree-wildcards-round2.md`) still found 6 majors: round 1's contained-search bypass, unbounded recursion, cubic work and verdict gaps. **An Opus 5.5 worker** continues, with the fail-closed design used for M1-31 and M1-32: one bounded matcher, and Ask whenever a match can't be decided within budget. The review stays with Codex.
