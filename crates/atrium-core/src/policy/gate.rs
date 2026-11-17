@@ -1907,7 +1907,14 @@ fn reaches_tree_through_links<'a>(
             for ev in exps {
                 for uc in &unit_cwds {
                     let raw_p = raw_glob_pattern(&ev, uc, home);
-                    let targets = expand_targets(&raw_p, include_dotfiles, &mut maybe);
+                    let globby = raw_p
+                        .to_string_lossy()
+                        .contains(['*', '?', '[', '{', '}', '$', '`']);
+                    let targets = if globby {
+                        expand_targets(&raw_p, include_dotfiles, &mut maybe)
+                    } else {
+                        vec![raw_p]
+                    };
                     if let Some(t) = first_tree_hit(&targets, trees, recursive, u.role, sensitive) {
                         return (Reach::Yes, Some(t));
                     }
