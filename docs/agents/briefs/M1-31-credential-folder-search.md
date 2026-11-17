@@ -39,3 +39,10 @@ Owned paths widen to the glob normalizer in `deny.rs` (`apply_dotdot`, `normaliz
 
 ## Added scope (D-120, orchestrator, 2026-11-16): N9
 `adversarial_regression.rs` `round_5_blocker_1_searches_and_walkers_reaching_a_folder_linked_into_ssh` fails on Linux on `dev` too. Its fixture lives under `std::env::temp_dir()`, which is `/tmp` on Linux, so the "ordinary" lines `cd /tmp && rg x` and `find /tmp -name x` really reach the fake `.ssh`. Change only those two lines of the test: point them at a folder outside the fixture (a fresh empty temp folder, made the same way). Don't weaken anything else.
+
+## Added scope (D-120, orchestrator, 2026-11-17): N11
+On Linux, `dev` itself fails two timing tests even on a quiet machine:
+- `adversarial_fuzz::random_hostile_lines_never_panic_and_nothing_sensitive_is_allowed`: 221 s, against a limit of 60 s;
+- `adversarial_m1_18::fix4_finding3_glob_escape_total_variant_cap_performance`: 322 ms, against 150 ms.
+
+Both pass on macOS. Find where the time goes: most likely the glob normalizer or the variant expansion, which this task owns. Bound it so both pass on Linux with their current limits. Don't raise the limits. If the time is outside your paths, name the function in the handoff.
