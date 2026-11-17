@@ -150,3 +150,27 @@ Both `deny.rs:2744` (`glob_norm_tests::k10_normalizer_work_is_linear_and_bounded
 
 ### Not done (D-123)
 - `cargo test` and `cargo clippy` were not run by this worker per D-123; left for the verification task.
+
+---
+
+## Rework round 3 (`ee57576`)
+
+### Root cause of the `200 */ + 200 ..` timeout (766–807 ms)
+- Although `apply_dotdot_run` stepped `NormArena` in linear `O(n)` time (`~1,000` steps for `n = 200`), the output loop in `normalize_glob_variants` (`while id != 0`) only called `arena.step()` once per state (`201` times) and still reconstructed all `201` variant strings of lengths `0, 2, 4, …, 400` segments (`40,200` segments / `~100 KB` per normalizer call, `O(n^2)`), cloned/hashed them in `seen`, and then passed them to `search_variants_from_cands` (which called `fold(&n)` + `split('/')` on all `201` strings before discarding the `200` `..` variants) and `check_escape_variant` (which built `PathBuf` + `components()` for all `201` strings before discarding all `201` in-root variants).
+- Across the 3 calls per `evaluate` (`search_variants_from_cands` unjoined + joined, and `escape_from_cands` joined) × 3 presets (`eval_search_presets`), `9` calls reconstructed `~361,800` segments and `~3+ MB` of temporary strings/hashes in unoptimized debug mode, scaling quadratically (`4×` from `n = 100` to `n = 200`, ~200 ms -> 766–807 ms), while `400 */ + 400 ..` tripped `cap = 256` before reaching output reconstruction.
+
+### Changes
+- `crates/atrium-core/src/policy/deny.rs` (`ee57576`):
+  - Added per-node metadata on `NormNode` (`has_dotdot`, `has_syntax_meta`, `seen_pat`, `literal_prefix_id`, `non_globstar_before_dd`) maintained in `O(1)` in `NormArena::push_seg`.
+  - Added `normalize_glob_filtered` + `reconstruct_node_path` (counting `arena.step_n(count.max(1))` during path reconstruction so all reconstruction work is also bounded by `MAX_GLOB_WORK`), while keeping `total_count` (`states.len()`) checked against `MAX_GLOB_VARIANTS` (`256`) so `255 */ + 255 ..` preserves `Allow` and `256 */ + 256 ..` still fails closed to `Ask`.
+  - Updated `search_variants_from_cands` to filter useless `..` variants (when `!home_has_dotdot && !node.has_syntax_meta && node.has_dotdot`, outside `ASK_TREES` depth `max_tree_slashes + 2`) **before** string reconstruction and `fold`.
+  - Updated `check_escape_variant` to memoize `inside` by `(literal_prefix_id, is_curdir)` **before** reconstructing full pattern strings, skipping all in-root `*/..` variants in `O(1)` per state.
+  - Updated `Sensitive::check`'s `glob_escape` loop to skip `ShellGlob` regex compilation on escaping `..` patterns when `!home_has_dotdot`, checking only the literal prefix via `self.s.hit`.
+  - Updated `glob_norm_tests::k10_normalizer_work_is_linear_and_bounded` to test `normalize_glob_filtered`, unfiltered `normalize_glob_variants`, and `search_variants_from_cands` + `escape_from_cands` on `n = 200, 255, 256`.
+
+### Checks run by this worker (D-123)
+- `cargo fmt --all` — passed (exit 0).
+- `cargo check -p atrium-core --tests` — passed in 7.66 s with 0 warnings.
+
+### Not done (D-123)
+- `cargo test` and `cargo clippy` were not run by this worker per D-123; left for the verification task.
