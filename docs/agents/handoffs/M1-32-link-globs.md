@@ -41,8 +41,10 @@ Brief read from `dev`: `docs/agents/briefs/M1-32-link-globs.md` (including scope
 
 - **Regression in `adversarial_m1_18::k2_links_at_any_hop_unexpanded_globs_and_following_walkers` (`cat big_dir/*/id_rsa`):**
   - Root cause: in rework round 1 (`9de4899`), `expand_glob_with` (`crates/atrium-core/src/policy/gate.rs:933,943`) changed `seen > MAX_ENTRIES` and `stack.len() > MAX_ENTRIES` from `return None;` to `truncated = true; break;`. On `big_dir` (4150 dirs + `z_ssh -> ~/.ssh`), `read_dir` pushed up to 4096 entries onto `stack` before breaking (including `z_ssh` depending on filesystem iteration order), and the subsequent literal component `"id_rsa"` (`!is_pat`) skipped `read_dir` and resolved `big_dir/z_ssh/id_rsa` via `symlink_metadata`, turning the over-budget glob from `Ask` (`Reach::Maybe`) into `HardDeny` (`Reach::Yes`).
-  - Fix: restored `return None` in `expand_glob_with` when `seen > MAX_ENTRIES` or `stack.len() > MAX_ENTRIES` (matching `dev` for over-budget glob walks while keeping `truncated = true` for unreadable directories / I/O errors from Finding 6 and `MAX_DEPTH` in `**`).
-  - Pinned by `rework2_over_budget_glob_and_non_ssh_id_rsa_do_not_hard_deny` in `crates/atrium-core/tests/M1-32-link-globs.rs` (verifies `cat big_dir/*/id_rsa` -> `["Ask", "Ask", "Ask"]`, `cat plain/*/id_rsa` -> `["Ask", "Allow", "Allow"]`, and `Glob` `plain` `id_rsa` -> `["Allow", "Allow", "Allow"]`).
+  - Fix (kept from WIP `3b43254` and verified): restored `return None` in `expand_glob_with` when `seen > MAX_ENTRIES` or `stack.len() > MAX_ENTRIES` (matching `dev` for over-budget glob walks while keeping `truncated = true` for unreadable directories / I/O errors from Finding 6 and `MAX_DEPTH` in `**`).
+  - Additional check/fix in `reaches_tree_through_links` (`crates/atrium-core/src/policy/gate.rs`): in the `u.word.contains("..") && u.word.contains(['*', '?', '['])` brace-expansion branch, gated `expand_targets(&raw_p, ...)` on `raw_p` containing glob/meta characters (`['*', '?', '[', '{', '}', '$', '`']`), matching the other two glob-expansion call sites so non-glob brace branches are not treated as failed glob expansions (`maybe = true`).
+  - Pinned by `rework2_over_budget_glob_and_non_ssh_id_rsa_do_not_hard_deny` in `crates/atrium-core/tests/M1-32-link-globs.rs` (verifies `cat big_dir/*/id_rsa` -> `["Ask", "Ask", "Ask"]`, `cat big_plain/*/id_rsa` -> `["Ask", "Ask", "Ask"]`, `cat plain/*/id_rsa` -> `["Ask", "Allow", "Allow"]`, `Glob` `plain` `id_rsa` / `*/id_rsa` -> `["Allow", "Allow", "Allow"]`, and `Glob` `big_dir` / `big_plain` -> `["Ask", "Ask", "Ask"]`).
+  - Ran `cargo fmt --all` and `cargo check -p atrium-core --tests` (D-123); both exited `0`.
 
 ---
 
@@ -62,6 +64,7 @@ Under D-123, `cargo test` was not run by this worker; compilation was verified w
    - `s11_unbounded_brace_globs_fail_closed_to_ask`: pins `["Ask", "Ask", "Ask"]` for `cat proj/{1..65}` and `["Deny", "Deny", "Deny"]` for brace overflow.
    - `s11_ordinary_searches_and_globs_with_ordinary_links_keep_dev_verdicts`: pins `dev` verdicts for ordinary searches, folder operands (`ls proj_clean/to_other`, `cat proj_clean/to_other`), globs, and non-following searches in folders with `.ssh` links.
    - `rework1_finding1_*` .. `rework1_finding6_*`: pin each of findings 1–6 (reproducing cases that fail prior to `gate.rs` rework round 1 fixes and pass after).
+   - `rework2_over_budget_glob_and_non_ssh_id_rsa_do_not_hard_deny`: pins `["Ask", "Ask", "Ask"]` for over-budget globs (`big_dir/*/id_rsa`, `big_plain/*/id_rsa`, and `Glob` over `big_dir`/`big_plain`) and ordinary verdicts (`["Ask", "Allow", "Allow"]` / `["Allow", "Allow", "Allow"]`) for `id_rsa` outside `~/.ssh`.
 2. `crates/atrium-core/tests/adversarial_gate.rs`:
    - `finding_10_a_glob_that_reaches_a_credential_through_a_link_is_blocked` (~571): un-ignored in `477fe81`.
 
