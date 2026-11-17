@@ -1258,11 +1258,27 @@ impl Ctx<'_> {
         // a search glob that leaves its roots (M1-18, P1): each expansion
         // that leaves is checked as a path pattern of its own
         if let Some(esc) = &self.a.glob_escape {
+            let home_has_dotdot = self.home().to_string_lossy().contains("..");
             for p in &esc.patterns {
                 let globby = p.to_string_lossy().contains(['*', '?', '[']);
                 hits.extend(self.s.hit(p, Role::Read));
                 if globby {
-                    hits.extend(self.s.glob_hit(p, Role::Read));
+                    if !home_has_dotdot
+                        && p.components().any(|c| c == std::path::Component::ParentDir)
+                    {
+                        let mut prefix = PathBuf::new();
+                        for c in p.components() {
+                            if c.as_os_str().to_string_lossy().contains(['*', '?', '[']) {
+                                break;
+                            }
+                            prefix.push(c.as_os_str());
+                        }
+                        if prefix.as_os_str() != "/" {
+                            hits.extend(self.s.hit(&prefix, Role::Read));
+                        }
+                    } else {
+                        hits.extend(self.s.glob_hit(p, Role::Read));
+                    }
                 }
                 if self.s.is_ssh_dir(p) {
                     hits.push("credential-read");
@@ -2374,6 +2390,11 @@ struct NormNode {
     parent: usize,
     seg_id: u32,
     count: usize,
+    has_dotdot: bool,
+    has_syntax_meta: bool,
+    seen_pat: bool,
+    literal_prefix_id: usize,
+    non_globstar_before_dd: u32,
 }
 
 struct NormArena<'a> {
@@ -2398,6 +2419,11 @@ impl<'a> NormArena<'a> {
                 parent: 0,
                 seg_id: 0,
                 count: 0,
+                has_dotdot: false,
+                has_syntax_meta: false,
+                seen_pat: false,
+                literal_prefix_id: 0,
+                non_globstar_before_dd: 0,
             }],
             segs: vec!["", "..", "**"],
             seg_ids,
@@ -2410,7 +2436,11 @@ impl<'a> NormArena<'a> {
     }
 
     fn step(&mut self) -> bool {
-        self.work += 1;
+        self.step_n(1)
+    }
+
+    fn step_n(&mut self, n: usize) -> bool {
+        self.work = self.work.saturating_add(n);
         self.work <= self.budget
     }
 
@@ -2440,10 +2470,35 @@ impl<'a> NormArena<'a> {
             return Some(existing);
         }
         let next = self.nodes.len();
+        let p = &self.nodes[parent];
+        let seg = self.segs[seg_id as usize];
+        let is_dd = seg_id == 1;
+        let has_dotdot = p.has_dotdot || is_dd;
+        let has_syntax_meta = p.has_syntax_meta || seg.contains(['[', '{', '\\']);
+        let is_pat_seg = seg.contains(['*', '?', '[']);
+        let seen_pat = p.seen_pat || is_pat_seg;
+        let literal_prefix_id = if p.seen_pat {
+            p.literal_prefix_id
+        } else if is_pat_seg {
+            parent
+        } else {
+            next
+        };
+        let non_globstar_before_dd = if p.has_dotdot || is_dd || seg_id == 2 {
+            p.non_globstar_before_dd
+        } else {
+            p.non_globstar_before_dd
+                .saturating_add(count.min(u32::MAX as usize) as u32)
+        };
         self.nodes.push(NormNode {
             parent,
             seg_id,
             count,
+            has_dotdot,
+            has_syntax_meta,
+            seen_pat,
+            literal_prefix_id,
+            non_globstar_before_dd,
         });
         if self.can_branch {
             self.intern.insert((parent, seg_id, count), next);
@@ -2589,12 +2644,62 @@ fn apply_dotdot_run<'a>(
     Some(active)
 }
 
-fn normalize_glob_variants(
+fn reconstruct_node_path(
+    arena: &mut NormArena<'_>,
+    mut id: usize,
+    abs: bool,
+    seg_ids_buf: &mut Vec<u32>,
+    total_bytes: Option<(usize, usize)>,
+) -> Option<String> {
+    seg_ids_buf.clear();
+    let mut seg_bytes = if abs { 1 } else { 0 };
+    while id != 0 {
+        let (parent, seg_id, count) = {
+            let node = &arena.nodes[id];
+            (node.parent, node.seg_id, node.count)
+        };
+        let seg_len = arena.segs[seg_id as usize].len();
+        let add_bytes = count.saturating_mul(seg_len + 1);
+        if let Some((cur, max_b)) = total_bytes
+            && cur.saturating_add(seg_bytes + add_bytes) > max_b
+        {
+            return None;
+        }
+        if !arena.step_n(count.max(1)) {
+            return None;
+        }
+        seg_bytes += add_bytes;
+        seg_ids_buf.resize(seg_ids_buf.len() + count, seg_id);
+        id = parent;
+    }
+    seg_ids_buf.reverse();
+    if seg_ids_buf.is_empty() {
+        return Some(if abs {
+            "/".to_string()
+        } else {
+            ".".to_string()
+        });
+    }
+    let mut out = String::with_capacity(seg_bytes);
+    for (idx, &sid) in seg_ids_buf.iter().enumerate() {
+        if abs || idx > 0 {
+            out.push('/');
+        }
+        out.push_str(arena.segs[sid as usize]);
+    }
+    Some(out)
+}
+
+fn normalize_glob_filtered<F>(
     g: &str,
     cap: usize,
     total_work: &mut usize,
     max_work: usize,
-) -> Option<Vec<String>> {
+    mut keep: F,
+) -> Option<(usize, Vec<String>)>
+where
+    F: FnMut(&mut NormArena<'_>, usize, bool) -> Option<bool>,
+{
     let remaining_work = max_work.checked_sub(*total_work)?;
     let abs = g.starts_with('/');
     let mut arena = NormArena::new(remaining_work);
@@ -2666,38 +2771,41 @@ fn normalize_glob_variants(
             }
         }
     }
-    let mut out = Vec::with_capacity(states.len());
-    let mut seen = std::collections::HashSet::with_capacity(states.len());
-    let mut segs: Vec<&str> = vec![];
+    if arena.can_branch && states.len() > 1 {
+        states.sort_unstable();
+        states.dedup();
+    }
+    let total_count = states.len();
+    if total_count > cap {
+        *total_work = total_work.saturating_add(arena.work).min(max_work);
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut segs: Vec<u32> = vec![];
     let mut total_bytes = 0usize;
-    for mut id in states {
+    for id in states {
         if !arena.step() {
             *total_work = max_work;
             return None;
         }
-        segs.clear();
-        let mut seg_bytes = if abs { 1 } else { 0 };
-        while id != 0 {
-            let node = &arena.nodes[id];
-            let seg = arena.segs[node.seg_id as usize];
-            let add_bytes = node.count.saturating_mul(seg.len() + 1);
-            if total_bytes.saturating_add(seg_bytes + add_bytes) > MAX_NORM_OUTPUT_BYTES {
-                *total_work = max_work;
+        match keep(&mut arena, id, abs) {
+            None => {
+                *total_work = total_work.saturating_add(arena.work).min(max_work);
                 return None;
             }
-            seg_bytes += add_bytes;
-            for _ in 0..node.count {
-                segs.push(seg);
-            }
-            id = node.parent;
+            Some(false) => continue,
+            Some(true) => {}
         }
-        segs.reverse();
-        let s = if abs {
-            format!("/{}", segs.join("/"))
-        } else if segs.is_empty() {
-            ".".to_string()
-        } else {
-            segs.join("/")
+        let Some(s) = reconstruct_node_path(
+            &mut arena,
+            id,
+            abs,
+            &mut segs,
+            Some((total_bytes, MAX_NORM_OUTPUT_BYTES)),
+        ) else {
+            *total_work = max_work;
+            return None;
         };
         total_bytes += s.len();
         if seen.insert(s.clone()) {
@@ -2705,7 +2813,17 @@ fn normalize_glob_variants(
         }
     }
     *total_work = total_work.saturating_add(arena.work);
-    Some(out)
+    Some((total_count, out))
+}
+
+#[cfg(test)]
+fn normalize_glob_variants(
+    g: &str,
+    cap: usize,
+    total_work: &mut usize,
+    max_work: usize,
+) -> Option<Vec<String>> {
+    normalize_glob_filtered(g, cap, total_work, max_work, |_, _, _| Some(true)).map(|(_, v)| v)
 }
 
 #[cfg(test)]
@@ -2722,21 +2840,50 @@ mod glob_norm_tests {
             (255, 256, 1_350),
         ] {
             let mut work = 0usize;
-            let norms =
-                normalize_glob_variants(&star_dd(n), MAX_GLOB_VARIANTS, &mut work, MAX_GLOB_WORK)
-                    .expect("within MAX_GLOB_VARIANTS");
-            assert_eq!(norms.len(), expected_variants, "n={n}");
+            let (total, kept) = normalize_glob_filtered(
+                &star_dd(n),
+                MAX_GLOB_VARIANTS,
+                &mut work,
+                MAX_GLOB_WORK,
+                |arena, id, _| Some(!arena.nodes[id].has_dotdot),
+            )
+            .expect("within MAX_GLOB_VARIANTS");
+            assert_eq!(total, expected_variants, "n={n}");
+            assert_eq!(kept, vec!["."], "n={n}");
             assert!(
                 work <= max_work,
                 "n={n}: expected linear work <= {max_work}, got {work}"
             );
         }
 
-        // Doubling n from 100 to 200 no more than doubles normalizer work.
+        // Unfiltered reconstruction preserves every variant when within budget.
+        let mut small_work = 0usize;
+        let small = normalize_glob_variants(
+            &star_dd(20),
+            MAX_GLOB_VARIANTS,
+            &mut small_work,
+            MAX_GLOB_WORK,
+        )
+        .expect("n=20 within MAX_GLOB_VARIANTS");
+        assert_eq!(small.len(), 21);
+
+        // Doubling n from 100 to 200 no more than doubles filtered normalizer work.
         let mut w100 = 0usize;
         let mut w200 = 0usize;
-        let _ = normalize_glob_variants(&star_dd(100), MAX_GLOB_VARIANTS, &mut w100, MAX_GLOB_WORK);
-        let _ = normalize_glob_variants(&star_dd(200), MAX_GLOB_VARIANTS, &mut w200, MAX_GLOB_WORK);
+        let _ = normalize_glob_filtered(
+            &star_dd(100),
+            MAX_GLOB_VARIANTS,
+            &mut w100,
+            MAX_GLOB_WORK,
+            |arena, id, _| Some(!arena.nodes[id].has_dotdot),
+        );
+        let _ = normalize_glob_filtered(
+            &star_dd(200),
+            MAX_GLOB_VARIANTS,
+            &mut w200,
+            MAX_GLOB_WORK,
+            |arena, id, _| Some(!arena.nodes[id].has_dotdot),
+        );
         assert!(
             w200 <= w100 * 2,
             "doubling 100->200 should at most double work: w100={w100}, w200={w200}"
@@ -2779,21 +2926,42 @@ mod glob_norm_tests {
         );
         assert_eq!(budget_work, MAX_GLOB_WORK);
 
-        // `search_variants_from_cands` filters out useless `..` variants for ~/proj.
-        let cands =
-            expand_glob_candidates(&star_dd(200), Path::new("/h/u/proj"), Path::new("/h/u"));
-        let (variants, unbounded) = search_variants_from_cands(
+        // `search_variants_from_cands` and `escape_from_cands` filter out useless
+        // `..` / in-root variants before reconstructing strings for 100..255,
+        // and still trip `MAX_GLOB_VARIANTS` at 256.
+        for n in [200usize, 255] {
+            let cands =
+                expand_glob_candidates(&star_dd(n), Path::new("/h/u/proj"), Path::new("/h/u"));
+            let (variants, unbounded) = search_variants_from_cands(
+                &[PathBuf::from("/h/u/proj")],
+                Path::new("/h/u/proj"),
+                Path::new("/h/u"),
+                &cands,
+            );
+            assert!(!unbounded, "n={n}");
+            assert!(
+                variants.len() <= 4,
+                "n={n}: expected filtered variants <= 4, got {}: {variants:?}",
+                variants.len()
+            );
+            let esc = escape_from_cands(
+                &[PathBuf::from("/h/u/proj")],
+                Path::new("/h/u/proj"),
+                Path::new("/h/u"),
+                &cands,
+            );
+            assert!(!esc.unbounded, "n={n}");
+            assert!(esc.patterns.is_empty(), "n={n}: {:?}", esc.patterns);
+        }
+        let cands256 =
+            expand_glob_candidates(&star_dd(256), Path::new("/h/u/proj"), Path::new("/h/u"));
+        let (_, unbounded256) = search_variants_from_cands(
             &[PathBuf::from("/h/u/proj")],
             Path::new("/h/u/proj"),
             Path::new("/h/u"),
-            &cands,
+            &cands256,
         );
-        assert!(!unbounded);
-        assert!(
-            variants.len() <= 4,
-            "expected filtered variants <= 4, got {}: {variants:?}",
-            variants.len()
-        );
+        assert!(unbounded256);
     }
 }
 
@@ -3079,10 +3247,32 @@ fn search_variants_from_cands(
         if remaining == 0 {
             return false;
         }
-        let Some(norms) = normalize_glob_variants(pat, remaining, &mut work, MAX_GLOB_WORK) else {
+        let Some((norm_count, norms)) = normalize_glob_filtered(
+            pat,
+            remaining,
+            &mut work,
+            MAX_GLOB_WORK,
+            |arena, id, abs| {
+                // Variants containing a `..` segment cannot match probe paths
+                // (and have valid glob syntax when free of `[`/`{`/`\`), so skip
+                // them before string reconstruction unless `ask_search_glob_hit`'s
+                // `tree_targets` prefix check could inspect the prefix before `..`.
+                let node = &arena.nodes[id];
+                if !home_has_dotdot && !node.has_syntax_meta && node.has_dotdot {
+                    if !tree_may_hit {
+                        return Some(false);
+                    }
+                    let prefix_segs = (abs as usize) + (node.non_globstar_before_dd as usize);
+                    if prefix_segs == 0 || prefix_segs > max_tree_slashes + 2 {
+                        return Some(false);
+                    }
+                }
+                Some(true)
+            },
+        ) else {
             return false;
         };
-        *total += norms.len();
+        *total += norm_count;
         if *total > MAX_GLOB_VARIANTS {
             return false;
         }
@@ -3090,30 +3280,6 @@ fn search_variants_from_cands(
             let norm = fold(&n);
             if norm.is_empty() {
                 continue;
-            }
-            // Variants containing a `..` segment cannot match probe paths
-            // (and have valid glob syntax when free of `[`/`{`/`\`), so skip
-            // them unless `ask_search_glob_hit`'s `tree_targets` prefix check
-            // could inspect the segment prefix before `..`.
-            if !home_has_dotdot
-                && !norm.contains(['[', '{', '\\'])
-                && norm.split('/').any(|s| s == "..")
-            {
-                if !tree_may_hit {
-                    continue;
-                }
-                let mut prefix_segs = 0usize;
-                for seg in norm.split('/') {
-                    if seg == ".." {
-                        break;
-                    }
-                    if seg != "**" {
-                        prefix_segs += 1;
-                    }
-                }
-                if prefix_segs == 0 || prefix_segs > max_tree_slashes + 2 {
-                    continue;
-                }
             }
             if seen.insert(norm.clone()) {
                 out.push(norm);
@@ -3193,7 +3359,6 @@ fn check_escape_variant(
     if variant.is_empty() {
         return;
     }
-    let is_pat = |c: &str| c.contains(['*', '?', '[']);
     let anchored = variant.starts_with('/') || variant.starts_with('~');
     let raw_joined: Vec<String> = if anchored {
         vec![words::expand_home(variant, home, cwd)]
@@ -3203,19 +3368,47 @@ fn check_escape_variant(
             .map(|r| format!("{}/{}", r.to_string_lossy().trim_end_matches('/'), variant))
             .collect()
     };
+    let mut inside_cache: HashMap<(usize, bool), bool> = HashMap::new();
+    let mut prefix_segs_buf: Vec<u32> = Vec::new();
     for j in raw_joined {
+        inside_cache.clear();
         let remaining = MAX_GLOB_VARIANTS.saturating_sub(*total_norm);
         if remaining == 0 {
             out.unbounded = true;
             out.unknown = true;
             return;
         }
-        let Some(norms) = normalize_glob_variants(&j, remaining, work, MAX_GLOB_WORK) else {
+        let Some((norm_count, norms)) =
+            normalize_glob_filtered(&j, remaining, work, MAX_GLOB_WORK, |arena, id, abs| {
+                let prefix_id = arena.nodes[id].literal_prefix_id;
+                let is_curdir = prefix_id == 0 && !abs && id == 0;
+                let key = (prefix_id, is_curdir);
+                if let Some(&inside) = inside_cache.get(&key) {
+                    return Some(!inside);
+                }
+                let start = if prefix_id == 0 {
+                    if abs {
+                        PathBuf::from("/")
+                    } else if is_curdir {
+                        PathBuf::from(".")
+                    } else {
+                        PathBuf::new()
+                    }
+                } else {
+                    let s =
+                        reconstruct_node_path(arena, prefix_id, abs, &mut prefix_segs_buf, None)?;
+                    PathBuf::from(s)
+                };
+                let inside = roots.iter().any(|r| start.starts_with(r));
+                inside_cache.insert(key, inside);
+                Some(!inside)
+            })
+        else {
             out.unbounded = true;
             out.unknown = true;
             return;
         };
-        *total_norm += norms.len();
+        *total_norm += norm_count;
         if *total_norm > MAX_GLOB_VARIANTS {
             out.unbounded = true;
             out.unknown = true;
@@ -3223,16 +3416,7 @@ fn check_escape_variant(
         }
         for n in norms {
             let abs = PathBuf::from(&n);
-            // the folder the walk starts from: the literal components
-            let mut start = PathBuf::new();
-            for c in abs.components() {
-                if is_pat(&c.as_os_str().to_string_lossy()) {
-                    break;
-                }
-                start.push(c.as_os_str());
-            }
-            let inside = roots.iter().any(|r| start.starts_with(r));
-            if !inside && !out.patterns.contains(&abs) {
+            if !out.patterns.contains(&abs) {
                 if out.patterns.len() >= MAX_GLOB_VARIANTS {
                     out.unbounded = true;
                     out.unknown = true;
