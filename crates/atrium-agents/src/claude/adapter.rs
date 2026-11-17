@@ -46,7 +46,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atrium_host::supervise::{self, ProcessIdentity, SupervisedChild};
@@ -63,9 +63,9 @@ use atrium_protocol::policy::{
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
-use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
+use tokio::time::{Instant as TokioInstant, sleep_until, timeout, timeout_at};
 
 use super::normalizer::{ClaudeNormalizer, DEADLINE_INTERRUPT, DEADLINE_RECORD_TOO_LARGE};
 use super::settings::{InspectInput, Inspection, inspect};
@@ -356,10 +356,34 @@ enum Internal {
     Withdraw(ApprovalTicket),
 }
 
+struct InFlightCheck {
+    count: Arc<AtomicUsize>,
+    settled: Arc<Notify>,
+}
+
+impl InFlightCheck {
+    fn enter(count: &Arc<AtomicUsize>, settled: &Arc<Notify>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self {
+            count: count.clone(),
+            settled: settled.clone(),
+        }
+    }
+}
+
+impl Drop for InFlightCheck {
+    fn drop(&mut self) {
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.settled.notify_waiters();
+        }
+    }
+}
+
 struct OrphanGuard {
     ticket: Option<ApprovalTicket>,
     tx: mpsc::UnboundedSender<Internal>,
     gate: Arc<dyn ToolGate>,
+    in_flight: Option<InFlightCheck>,
 }
 
 impl OrphanGuard {
@@ -367,8 +391,18 @@ impl OrphanGuard {
         ticket: Option<ApprovalTicket>,
         tx: mpsc::UnboundedSender<Internal>,
         gate: Arc<dyn ToolGate>,
+        in_flight: Option<InFlightCheck>,
     ) -> Self {
-        Self { ticket, tx, gate }
+        Self {
+            ticket,
+            tx,
+            gate,
+            in_flight,
+        }
+    }
+
+    fn set_ticket(&mut self, ticket: Option<ApprovalTicket>) {
+        self.ticket = ticket;
     }
 
     fn disarm(&mut self) {
@@ -378,15 +412,17 @@ impl OrphanGuard {
 
 impl Drop for OrphanGuard {
     fn drop(&mut self) {
-        let Some(ticket) = self.ticket.take() else {
-            return;
-        };
-        if let Err(mpsc::error::SendError(Internal::Withdraw(ticket))) =
-            self.tx.send(Internal::Withdraw(ticket))
+        let in_flight = self.in_flight.take();
+        if let Some(ticket) = self.ticket.take()
+            && let Err(mpsc::error::SendError(Internal::Withdraw(ticket))) =
+                self.tx.send(Internal::Withdraw(ticket))
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
             let gate = self.gate.clone();
-            handle.spawn(async move { gate.withdraw(&ticket).await });
+            handle.spawn(async move {
+                let _keep_inflight = in_flight;
+                gate.withdraw(&ticket).await;
+            });
         }
     }
 }
@@ -510,6 +546,10 @@ struct Actor {
     shutting_down: bool,
     /// In-flight gate calls; aborted when the session ends.
     gates: JoinSet<()>,
+    /// Number of inner `gate.check` / `gate.question_ticket` tasks still running
+    /// or holding an unclaimed `OrphanGuard`, so shutdown drains their withdrawals.
+    gate_in_flight: Arc<AtomicUsize>,
+    gate_settled: Arc<Notify>,
 
     /// Gate keys the hook answered `ask` for, with `(tool_use_id, ticket)`.
     hook_asked: HashMap<String, VecDeque<(Option<String>, ApprovalTicket)>>,
@@ -579,6 +619,8 @@ impl Actor {
             queue: VecDeque::new(),
             shutting_down: false,
             gates: JoinSet::new(),
+            gate_in_flight: Arc::new(AtomicUsize::new(0)),
+            gate_settled: Arc::new(Notify::new()),
             hook_asked: HashMap::new(),
             live: HashSet::new(),
             inflight: HashMap::new(),
@@ -983,6 +1025,7 @@ impl Actor {
         }
         self.clear_requests();
         while self.gates.join_next().await.is_some() {}
+        self.wait_for_in_flight_gates().await;
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.commands_rx = None;
@@ -1017,6 +1060,7 @@ impl Actor {
         self.finishing = true;
         self.clear_requests();
         while self.gates.join_next().await.is_some() {}
+        self.wait_for_in_flight_gates().await;
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.feed(AdapterInput::Exit { code });
@@ -1027,6 +1071,19 @@ impl Actor {
 
     fn queue_withdraw(&mut self, ticket: ApprovalTicket) {
         self.pending_withdrawals.push(ticket);
+    }
+
+    async fn wait_for_in_flight_gates(&self) {
+        let deadline = TokioInstant::now() + self.options.gate_deadline;
+        while self.gate_in_flight.load(Ordering::Acquire) > 0 {
+            let notified = self.gate_settled.notified();
+            if self.gate_in_flight.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            if timeout_at(deadline, notified).await.is_err() {
+                break;
+            }
+        }
     }
 
     async fn drain_withdrawals(&mut self) {
@@ -1321,32 +1378,46 @@ impl Actor {
         let tx = self.internal_tx.clone();
         let deadline = self.options.gate_deadline;
         let native = reply.key();
+        let in_flight = InFlightCheck::enter(&self.gate_in_flight, &self.gate_settled);
         let task = self.gates.spawn(async move {
             let for_gate = check.clone();
             let tx_orphan = tx.clone();
             let gate_orphan = gate.clone();
-            // The call runs in its own task so a panic is contained, and is
-            // aborted if this task is (session end) or the deadline passes.
-            let inner = tokio::spawn(async move {
+            let (res_tx, res_rx) = oneshot::channel();
+            // Run `gate.check` to completion without aborting on cancellation or
+            // timeout so an already-queued DB insert cannot leak an approval row.
+            tokio::spawn(async move {
+                let mut guard = OrphanGuard::arm(None, tx_orphan, gate_orphan, Some(in_flight));
                 let d = gate.check(&for_gate).await;
-                let guard = OrphanGuard::arm(
-                    match &d {
-                        GateDecision::Ask { ticket } => Some(ticket.clone()),
-                        _ => None,
-                    },
-                    tx_orphan,
-                    gate_orphan,
-                );
-                (d, guard)
-            });
-            let (decision, failed) = match guarded(deadline, inner).await {
-                Ok((d, mut guard)) => {
-                    guard.disarm();
-                    (d, false)
+                if let GateDecision::Ask { ticket } = &d {
+                    guard.set_ticket(Some(ticket.clone()));
                 }
-                Err(why) => (
+                let _ = res_tx.send((d, guard));
+            });
+            let (decision, failed) = match timeout(deadline, res_rx).await {
+                Ok(Ok((d, mut guard))) => {
+                    if tx
+                        .send(Internal::Gate {
+                            reply,
+                            check,
+                            decision: d,
+                            failed: false,
+                        })
+                        .is_ok()
+                    {
+                        guard.disarm();
+                    }
+                    return;
+                }
+                Ok(Err(_)) => (
                     GateDecision::Deny {
-                        reason: why.reason().into(),
+                        reason: GuardFail::Panicked.reason().into(),
+                    },
+                    true,
+                ),
+                Err(_) => (
+                    GateDecision::Deny {
+                        reason: GuardFail::TimedOut.reason().into(),
                     },
                     true,
                 ),
@@ -1377,20 +1448,33 @@ impl Actor {
         let deadline = self.options.gate_deadline;
         let turn = Some(self.norm.turn_number());
         let key = Req::CanUse(native.clone());
+        let in_flight = InFlightCheck::enter(&self.gate_in_flight, &self.gate_settled);
         let task = self.gates.spawn(async move {
             let tx_orphan = tx.clone();
             let gate_orphan = gate.clone();
-            let inner = tokio::spawn(async move {
+            let (res_tx, res_rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let mut guard = OrphanGuard::arm(None, tx_orphan, gate_orphan, Some(in_flight));
                 let t = gate.question_ticket(turn).await;
-                let guard = OrphanGuard::arm(t.clone(), tx_orphan, gate_orphan);
-                (t, guard)
+                guard.set_ticket(t.clone());
+                let _ = res_tx.send((t, guard));
             });
-            let (ticket, failed) = match guarded(deadline, inner).await {
-                Ok((t, mut guard)) => {
-                    guard.disarm();
-                    (t, false)
+            let (ticket, failed) = match timeout(deadline, res_rx).await {
+                Ok(Ok((t, mut guard))) => {
+                    if tx
+                        .send(Internal::Question {
+                            native,
+                            ticket: t,
+                            input,
+                            failed: false,
+                        })
+                        .is_ok()
+                    {
+                        guard.disarm();
+                    }
+                    return;
                 }
-                Err(_) => (None, true),
+                Err(_) | Ok(Err(_)) => (None, true),
             };
             let _ = tx.send(Internal::Question {
                 native,
