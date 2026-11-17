@@ -82,6 +82,8 @@ Findings:
 
 Tests 1–4 fail with the previous `gate.rs` (`5bec74e`) and pass now; test 5 on the previous code is the reviewer's ~4·10⁹-entry walk (stopped, not run to the end).
 
+Commands run: `cargo fmt --all --check` ok; `cargo clippy -p atrium-core --all-targets -- -D warnings` ok; `cargo test -p atrium-core`: `M1-32-link-globs` 21/21, `adversarial_gate`, `adversarial_m1_18::k2_*` and every other verdict test pass. The only failures are the known ones (`round_5_blocker_1` N9, `adversarial_fuzz` and `adversarial_m1_18::fix4` timing N11) plus timing caps that are flaky under load: `fix2_nested_env…`, `policy::engine_never_panics_on_garbage` (fails on `dev`'s `gate.rs` too) and `policy::pipe_to_shell_fan_out…` (engine only, does not touch `gate.rs`; passed 1 of 3 runs here, around its 2 s cap).
+
 Limit: hard links of a credential outside every store are matched by identity only for literal operands (`alias_fix`, outside the owned range), not for glob matches; the reviewer's fixtures assume single links.
 
 ---
