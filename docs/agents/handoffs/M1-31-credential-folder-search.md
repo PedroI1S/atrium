@@ -210,3 +210,62 @@ Per the N11 brief instruction (*"If the time is outside your paths, name the fun
 
 ### Not done (D-123)
 - `cargo test` and `cargo clippy` were not run by this worker per D-123; left for the verification task (including timing checks on `k10_400_star_dotdot_globs_stay_under_50ms_and_fail_closed_to_ask`, `fix4_finding3_glob_escape_total_variant_cap_performance`, and `random_hostile_lines_never_panic_and_nothing_sensitive_is_allowed`).
+
+---
+
+## Escalation (Opus, D-128)
+
+### Profile findings (debug build, Linux; timing prints + gdb stack sampling)
+- **The normalizer itself was not the main cost.** For `20000 */ + 20000 ../` the arena tripped its budget correctly, but `analyze` still took 110–190 ms in `expand_glob_candidates` alone. Microbenchmarks on a 100 KB glob: `str::contains([char; N])` (a multi-char pattern) runs at **~0.9 µs/byte** unoptimized, against ~2 ns/byte for a single-char `contains` (memchr). Every `contains(['?', '['])` scan of a long glob cost ~90 ms.
+- **The work before and after the budget was unbounded:** the budget covered only arena steps. Byte scans, `FxHasher` (a per-byte loop), `fold`, joined `format!`s, `words::brace_expand` (74 ms for `{1..64}{a,b,c,d}/` + 400 `a/`, 290 ms per evaluate), one regex compile per `?`/`[` component in `may_be_dot_component` (10 s for `*?[ab]/` × 10 000), one per class in `class_may_match_dot` (6.4 s for 256 braces × 60 `[.]`), and the downstream `GlobBuilder` compiles of long variants (2.5 s for a 128 000-byte literal, 4 s for `[a]` × 30 000) all sat outside it. Each Hydrogen round fixed the stage that the next failing test hit.
+- **N11 `random_hostile_lines` (fuzz):** 48 samples. Nothing landed in the glob normalizer. The time goes to `shell::lex_depth_uncached`/`lex` (~30 %), `deny::Sensitive::new` plus its drop (~30 %; it is built three times per `evaluate`: `analyze_with`, `hard_deny`, `engine::Home`), `words::walk`/`words_of`, and `Ctx::check` (~30 %). Inside `Ctx::check`, `fast_glob_hit` → `Sensitive::glob_hit` → `ShellGlob::new` regex compiles are ~8 %.
+- **`engine_never_panics_on_garbage`:** the slow part is the `hostile` block. `ls {a,b}×20000` takes **9.4 s** in `words::brace_expand` (it re-collects a `Vec<char>` and rescans the whole 100 KB word for every work item). `ls {a,b}×2000` takes 0.9 s. Nothing here is glob-normalizer work.
+- **`fix2_nested_env_split_string_is_linear`:** ~28 ms per evaluate in shell lexing (`env -S` unwrapping) and `Sensitive::new`. No glob work.
+
+### Mechanism (`deny.rs`, commit `b09639c`)
+- **One `GlobBudget` per glob check**, carried on `GlobCandidates`. It is a `Cell` counter capped at `MAX_GLOB_WORK = 20 000`. `expand_glob_candidates` creates it, and `search_variants_from_cands` and `escape_from_cands` draw from the same counter. Every stage charges it:
+  - brace and home expansion;
+  - every candidate and widened candidate (1 step + 1 per 64 bytes);
+  - `..` collapsing and the arena (unchanged, now on the shared counter);
+  - reconstruction (components + bytes/64);
+  - joined strings;
+  - `fold`ed outputs;
+  - every regex compile: `class_may_match_dot` and `may_be_dot_component` (64 + 4 + len/4), the search matchers including the `ASK_TREES` dir-prefix matchers (4 + len/4 each), and the per-component `ShellGlob` matchers for escaping patterns.
+- **Cheap lower-bound gates before each stage,** so a shape that can't fit stops at memchr speed:
+  - the component count before normalizing, which equals the minimum number of arena steps;
+  - `brace_estimate` (an upper bound on the number of words × the components and bytes outside the braces) before calling `words::brace_expand`.
+- **When the budget runs out,** the stage reports unbounded, and the check fails closed to Ask everywhere (the existing `glob_unbounded` path).
+- **Verdicts:**
+  - A valid pattern of three or more characters skips the dot-probe compile, because it can't match `.` or `..`. That rule is exact.
+  - A matcher that is over budget is parsed first. A pattern that doesn't parse is never compiled, so it costs nothing. This keeps the 100 000 unclosed-brackets verdict (Ask / Allow / Allow).
+  - Repeated classes are memoized.
+- **Constant-factor fixes:**
+  - `has_any` (a single-char memchr per char) replaces the `[char; N]` `contains` calls;
+  - `widen_pattern_dots` and `widen_pattern_slashes` copy runs between specials with `find`/`push_str`;
+  - `FxHasher::write` hashes 8 bytes per round.
+- **Verdict changes, fail-closed only:** a glob now asks everywhere when its estimated or real total work exceeds the budget. For example, `[a]` × 30 000 under `~/proj` was Allow in Home on `dev` and is now Ask. Every verdict-asserting test in `atrium-core` passes.
+
+### Times (debug, Linux; single test unless noted)
+| Test | Before (branch `e240dbb` / `dev`) | After |
+|---|---|---|
+| K10 `k10_400_star_dotdot…` worst case | 958 ms (256 brace × 400), 1.7 s (20000 `*/`+`../`), 6.1 s earlier shape | ≤ 41 ms per case (2000 `*/`+`../`); 20000 case 27 ms; 256 brace 1 ms; 100 000 brackets 324 ms over 3 presets (limit 750) |
+| K10 whole binary | 14.3 s | 3.7–5.3 s, passes in parallel |
+| `fix4_finding3_glob_escape_total_variant_cap_performance` | ~320 ms | 40–90 ms (limit 150) |
+| `fix3_finding3_glob_variant_cap_performance` | passed | passes alone; failed once at 310 ms during the full parallel run (CPU contention) |
+| `adversarial_fuzz::random_hostile_lines…` | 97 s (branch), 221 s (`dev`) | 96.7 s: **still fails**, the time is outside owned paths (see above) |
+| `policy::engine_never_panics_on_garbage` | ~10 s | 10.6 s: **still fails**, `words::brace_expand` (9.4 s on `ls {a,b}×20000`) |
+| `fix2_nested_env_split_string_is_linear` | 120–290 ms | 200–580 ms, noisy: **still fails**, shell lexing / `Sensitive::new` |
+| Throwaway stress (31 glob shapes × 2 root sets, Paths subject) | worst 10 s | worst 310 ms per evaluate |
+
+### Not done: functions outside owned paths (named per N11)
+- `words::brace_expand` (`words.rs`): quadratic in word length × results. Fix: bound total output bytes, or count the words before materializing them. This blocks `engine_never_panics_on_garbage`, and `rg x --glob '{1..64}{a,b,c,d}<4 KB>'` takes 1 s on the command path.
+- `deny::Sensitive::new`: built three times per `evaluate` (`analyze_with`, `hard_deny`, `engine`); build it once and share it.
+- `shell::lex_depth_uncached` / `lex`, `words::walk`.
+- `Sensitive::glob_hit` / `ShellGlob::new` (the `probes…is_match` range).
+- Together these make up the fuzz and `fix2` time.
+- `policy::pipe_to_shell_fan_out_is_linear_and_denied` fails only under full-suite load; it passes alone.
+
+### Checks
+- `cargo fmt --all --check`: clean.
+- `cargo clippy -p atrium-core --all-targets -- -D warnings`: clean.
+- `cargo test -p atrium-core`: every verdict test passes, including N9 `round_5_blocker_1`. The only failures are the timing tests listed above.
