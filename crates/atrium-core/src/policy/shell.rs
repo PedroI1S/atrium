@@ -3162,14 +3162,13 @@ fn resolve_positional_script_depth(
                     ")" => paren_depth = paren_depth.saturating_sub(1),
                     _ => {}
                 }
-                if !out_parts.is_empty()
+                if (!out_parts.is_empty()
                     && !matches!(
                         out_parts.last().map(String::as_str),
                         Some(";" | "\n" | "&&" | "||" | "|" | "|&" | "&" | "(" | "{")
-                    )
+                    ))
+                    || matches!(sep.as_str(), "(" | ")" | "{" | "}")
                 {
-                    out_parts.push(sep.clone());
-                } else if matches!(sep.as_str(), "(" | ")" | "{" | "}") {
                     out_parts.push(sep.clone());
                 }
                 prev_sep = Some(sep.as_str());
