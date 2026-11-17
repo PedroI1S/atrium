@@ -112,6 +112,58 @@ fn is_cmd_path_short_flag(cmd: &str, ch: char) -> bool {
     }
 }
 
+fn is_script_cmd(cmd: &str) -> bool {
+    matches!(cmd, "sed" | "awk" | "gawk" | "mawk")
+}
+
+fn is_explicit_rel_or_var_path(w: &str) -> bool {
+    w.starts_with("~/")
+        || w == "~"
+        || w.starts_with("./")
+        || w.starts_with("../")
+        || w.starts_with("$HOME")
+        || w.starts_with("${HOME}")
+        || w.starts_with("$PWD")
+        || w.starts_with("${PWD}")
+}
+
+fn is_sed_file_cmd(tok: &str) -> bool {
+    let trimmed =
+        tok.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, ',' | '$' | '!' | ';'));
+    matches!(trimmed, "w" | "r" | "W" | "R")
+        || trimmed.ends_with("/w")
+        || trimmed.ends_with("/r")
+        || trimmed.ends_with(";w")
+        || trimmed.ends_with(";r")
+        || trimmed.ends_with("|w")
+        || trimmed.ends_with("|r")
+}
+
+fn push_script_path_tokens(cmd: &str, script: &str, out: &mut HashSet<String>) {
+    if !is_script_cmd(cmd) {
+        return;
+    }
+    let mut prev: Option<&str> = None;
+    for tok in script.split_whitespace().take(64) {
+        let t = tok.trim_matches(|c| "\"'{}();".contains(c));
+        if t.is_empty() {
+            continue;
+        }
+        let after_cmd = if cmd == "sed" {
+            prev.is_some_and(is_sed_file_cmd)
+        } else {
+            prev.is_some_and(|p| {
+                matches!(p, ">" | ">>" | "<") || p.ends_with('>') || p.ends_with('<')
+            })
+        };
+        let quoted_path = tok.contains('"') && looks_like_path_word(t);
+        if after_cmd || is_explicit_rel_or_var_path(t) || quoted_path {
+            push_expanded_path(t, out);
+        }
+        prev = Some(t);
+    }
+}
+
 fn is_cmd_nonpath_value_flag(cmd: &str, w: &str) -> bool {
     let long = w.starts_with("--");
     if long {
@@ -123,7 +175,6 @@ fn is_cmd_nonpath_value_flag(cmd: &str, w: &str) -> bool {
                     | "--hide"
                     | "--sort"
                     | "--time"
-                    | "--color"
                     | "--format"
                     | "--quoting-style"
                     | "--time-style"
@@ -182,10 +233,11 @@ fn is_cmd_nonpath_value_flag(cmd: &str, w: &str) -> bool {
         "sort" => matches!(last, 'k' | 't' | 'S'),
         "cut" => matches!(last, 'b' | 'c' | 'd' | 'f'),
         "uniq" => matches!(last, 'f' | 's' | 'w'),
-        "diff" => matches!(last, 'U' | 'u' | 'C' | 'I' | 'x' | 'S'),
+        "diff" => matches!(last, 'U' | 'C' | 'I' | 'x' | 'S'),
         "sed" => last == 'e',
         "awk" | "gawk" | "mawk" => matches!(last, 'e' | 'F' | 'v'),
-        "curl" | "wget" => matches!(last, 'X' | 'H' | 'A' | 'u' | 'd' | 'm'),
+        "curl" => matches!(last, 'X' | 'H' | 'A' | 'u' | 'd' | 'm'),
+        "wget" => matches!(last, 'A' | 'R' | 'U' | 'T' | 'Q' | 't'),
         "xargs" => matches!(last, 'n' | 'P' | 'L' | 'I' | 'd' | 's' | 'E'),
         "ag" | "ack" => matches!(last, 'A' | 'B' | 'C' | 'G' | 'm'),
         _ => false,
@@ -242,6 +294,9 @@ fn collect_generic_operands(cmd: &str, args: &[String], out: &mut HashSet<String
             if matches!(flag, "--file" | "--from-file" | "--expression") {
                 need_script = false;
             }
+            if flag == "--expression" {
+                push_script_path_tokens(cmd, val, out);
+            }
             if is_generic_path_long_flag(flag) || looks_like_path_word(val) {
                 push_expanded_path(val, out);
             }
@@ -255,6 +310,13 @@ fn collect_generic_operands(cmd: &str, args: &[String], out: &mut HashSet<String
             if matches!(w, "--file" | "--from-file" | "--expression") {
                 need_script = false;
             }
+            if w == "--expression" && is_script_cmd(cmd) {
+                if let Some(next) = args.get(i + 1) {
+                    push_script_path_tokens(cmd, next, out);
+                }
+                i += 2;
+                continue;
+            }
             if is_generic_path_long_flag(w) {
                 if let Some(next) = args.get(i + 1) {
                     push_expanded_path(next, out);
@@ -263,6 +325,11 @@ fn collect_generic_operands(cmd: &str, args: &[String], out: &mut HashSet<String
                 continue;
             }
             if is_cmd_nonpath_value_flag(cmd, w) {
+                if let Some(next) = args.get(i + 1)
+                    && looks_like_path_word(next)
+                {
+                    push_expanded_path(next, out);
+                }
                 i += if matches!(w, "--arg" | "--argjson") {
                     3
                 } else {
@@ -278,19 +345,27 @@ fn collect_generic_operands(cmd: &str, args: &[String], out: &mut HashSet<String
             for k in 0..cs.len().saturating_sub(1) {
                 let rest: String = cs[k + 1..].iter().collect();
                 let rest = rest.strip_prefix('=').unwrap_or(&rest);
+                if cs[k] == 'e' && is_script_cmd(cmd) {
+                    push_script_path_tokens(cmd, rest, out);
+                }
                 if is_cmd_path_short_flag(cmd, cs[k]) || looks_like_path_word(rest) {
                     push_expanded_path(rest, out);
                 }
             }
-            if matches!(cmd, "sed" | "awk" | "gawk" | "mawk" | "jq")
-                && cs.iter().any(|c| matches!(c, 'e' | 'f'))
-            {
+            if (is_script_cmd(cmd) || cmd == "jq") && cs.iter().any(|c| matches!(c, 'e' | 'f')) {
                 need_script = false;
             }
             if matches!(cmd, "ag" | "ack") && cs.contains(&'g') {
                 skip_first_positional = false;
             }
             let last = cs[cs.len() - 1];
+            if last == 'e' && is_script_cmd(cmd) {
+                if let Some(next) = args.get(i + 1) {
+                    push_script_path_tokens(cmd, next, out);
+                }
+                i += 2;
+                continue;
+            }
             if is_cmd_path_short_flag(cmd, last) {
                 if let Some(next) = args.get(i + 1) {
                     push_expanded_path(next, out);
@@ -299,6 +374,11 @@ fn collect_generic_operands(cmd: &str, args: &[String], out: &mut HashSet<String
                 continue;
             }
             if is_cmd_nonpath_value_flag(cmd, w) {
+                if let Some(next) = args.get(i + 1)
+                    && looks_like_path_word(next)
+                {
+                    push_expanded_path(next, out);
+                }
                 i += 2;
                 continue;
             }
@@ -330,14 +410,24 @@ fn collect_generic_operands(cmd: &str, args: &[String], out: &mut HashSet<String
             i += 1;
             continue;
         }
-        if (skip_first_positional && !has_reference) || need_script {
+        if skip_first_positional && !has_reference {
             skip_first_positional = false;
+            if !(matches!(cmd, "chmod" | "chown" | "chgrp") && looks_like_path_word(w)) {
+                i += 1;
+                continue;
+            }
+        }
+        if need_script {
             need_script = false;
+            push_script_path_tokens(cmd, w, out);
             i += 1;
             continue;
         }
         if w != "-" {
             push_expanded_path(w, out);
+            if is_script_cmd(cmd) {
+                push_script_path_tokens(cmd, w, out);
+            }
             if let Some((k, v)) = w.split_once('=')
                 && !k.is_empty()
                 && looks_like_path_word(v)
@@ -480,12 +570,13 @@ fn unit_path_words(unit: &Unit) -> HashSet<String> {
                         | "--cwd"
                         | "--prefix"
                         | "--dir"
-                        | "-f"
                         | "--file"
                         | "-o"
                         | "--output"
                         | "--out-dir"
-                ) {
+                ) || (w == "-f" && cmd != "git")
+                    || (cmd == "git" && matches!(w, "-F" | "--template"))
+                {
                     if let Some(next) = args.get(i + 1) {
                         push_expanded_path(next, &mut out);
                     }
@@ -512,15 +603,15 @@ fn unit_path_words(unit: &Unit) -> HashSet<String> {
                         | "--message"
                         | "-b"
                         | "--branch"
-                        | "-t"
                         | "--tag"
                         | "-n"
                         | "--namespace"
                         | "--context"
                         | "--filter"
-                        | "-F"
                         | "--template"
-                ) {
+                ) || (w == "-F" && cmd != "git")
+                    || (w == "-t" && !matches!(cmd.as_str(), "git" | "docker" | "podman"))
+                {
                     if let Some(next) = args.get(i + 1)
                         && looks_like_path_word(next)
                     {
@@ -543,14 +634,32 @@ fn unit_path_words(unit: &Unit) -> HashSet<String> {
                     i += 1;
                     continue;
                 }
-                let git_file_sub = cmd == "git"
+                let git_nonpath_sub = cmd == "git"
                     && subcommand.is_some_and(|s| {
                         matches!(
                             s,
-                            "add" | "rm" | "mv" | "restore" | "stage" | "apply" | "am"
+                            "push"
+                                | "fetch"
+                                | "pull"
+                                | "remote"
+                                | "branch"
+                                | "tag"
+                                | "merge"
+                                | "rebase"
+                                | "switch"
+                                | "cherry-pick"
+                                | "revert"
+                                | "config"
+                                | "rev-parse"
+                                | "symbolic-ref"
+                                | "for-each-ref"
+                                | "show-ref"
+                                | "describe"
+                                | "help"
+                                | "version"
                         )
                     });
-                if git_file_sub || looks_like_path_word(w) {
+                if (cmd == "git" && !git_nonpath_sub) || looks_like_path_word(w) {
                     push_expanded_path(w, &mut out);
                 }
                 i += 1;
