@@ -1025,7 +1025,6 @@ impl Actor {
         }
         self.clear_requests();
         while self.gates.join_next().await.is_some() {}
-        self.wait_for_in_flight_gates().await;
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.commands_rx = None;
@@ -1074,7 +1073,11 @@ impl Actor {
     }
 
     async fn wait_for_in_flight_gates(&self) {
-        let deadline = TokioInstant::now() + self.options.gate_deadline;
+        // Bound the shutdown wait so a hung/unanswered gate (e.g. an abandoned
+        // check on a finished turn) never blocks SessionEnded past shutdown
+        // deadlines; slower gates still withdraw via OrphanGuard::drop.
+        let cap = self.options.gate_deadline.min(Duration::from_millis(500));
+        let deadline = TokioInstant::now() + cap;
         while self.gate_in_flight.load(Ordering::Acquire) > 0 {
             let notified = self.gate_settled.notified();
             if self.gate_in_flight.load(Ordering::Acquire) == 0 {
