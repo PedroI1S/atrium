@@ -2485,10 +2485,12 @@ impl GlobEscape {
 
 /// A pattern component that can match `.` or `..` without being written
 /// so (`[.][.]`, `.[.]`, `??`, `[.][.]*`). Plain `*` / `**` are left out:
-/// a directory walk never lists `.` or `..` for `*`.
-fn class_may_match_dot(class: &str) -> bool {
+/// a directory walk never lists `.` or `..` for `*`. Each regex compile is
+/// charged to the glob check's budget (D-128); once it is spent the answer
+/// is "may match" and the check fails closed.
+fn class_may_match_dot(class: &str, budget: &GlobBudget) -> bool {
     let inner = &class[1..class.len() - 1];
-    if !inner.contains(['!', '^', '.', '\\'])
+    if !has_any(inner, &['!', '^', '.', '\\'])
         && !inner
             .as_bytes()
             .windows(3)
@@ -2496,29 +2498,155 @@ fn class_may_match_dot(class: &str) -> bool {
     {
         return false;
     }
-    GlobBuilder::new(class)
+    if let Some(&hit) = budget.class_memo.borrow().get(class) {
+        return hit;
+    }
+    if !budget.charge(DOT_PROBE_COMPILE_STEPS + compile_steps(class)) {
+        return true;
+    }
+    let hit = GlobBuilder::new(class)
         .literal_separator(true)
         .build()
-        .map_or(true, |g| g.compile_matcher().is_match("."))
+        .map_or(true, |g| g.compile_matcher().is_match("."));
+    budget
+        .class_memo
+        .borrow_mut()
+        .insert(class.to_string(), hit);
+    hit
 }
 
-fn may_be_dot_component(c: &str) -> bool {
-    if c == "*" || c == "**" || !c.contains(['[', '?']) {
+fn may_be_dot_component(c: &str, budget: &GlobBudget) -> bool {
+    if c == "*" || c == "**" || !has_any(c, &['[', '?']) {
         return false;
     }
     if !c.contains('?')
         && c.starts_with('[')
         && c.ends_with(']')
-        && !c[1..c.len() - 1].contains(['[', ']'])
-        && !class_may_match_dot(c)
+        && !has_any(&c[1..c.len() - 1], &['[', ']'])
+        && !class_may_match_dot(c, budget)
     {
         return false;
     }
     let Ok(g) = GlobBuilder::new(c).literal_separator(true).build() else {
         return true;
     };
+    // A valid pattern that needs three or more characters can't match `.`
+    // or `..`: no regex needed.
+    if min_match_len_over_2(c) {
+        return false;
+    }
+    if !budget.charge(DOT_PROBE_COMPILE_STEPS + compile_steps(c)) {
+        return true;
+    }
     let m = g.compile_matcher();
     m.is_match(".") || m.is_match("..")
+}
+
+/// Budget steps for compiling one glob into a regex (D-128): a fixed cost
+/// plus one step per four pattern bytes.
+const GLOB_COMPILE_STEPS: usize = 4;
+
+/// Extra steps for a regex compiled only to test one component against `.`
+/// and `..` (its whole cost is the compile, measured at ~100 µs
+/// unoptimized).
+const DOT_PROBE_COMPILE_STEPS: usize = 64;
+
+fn compile_steps(pattern: &str) -> usize {
+    GLOB_COMPILE_STEPS + pattern.len() / 4
+}
+
+/// Whether every string a (valid) glob component matches has at least three
+/// characters. Conservative: brace groups give `false`, a class counts as
+/// one character, `*` as none.
+fn min_match_len_over_2(c: &str) -> bool {
+    if c.contains('{') {
+        return false;
+    }
+    let b = c.as_bytes();
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'*' => {}
+            b'\\' => {
+                n += 1;
+                i += 1;
+                while i + 1 < b.len() && b[i + 1] & 0xC0 == 0x80 {
+                    i += 1;
+                }
+            }
+            b'[' => {
+                n += 1;
+                let mut j = i + 1;
+                if j < b.len() && (b[j] == b'!' || b[j] == b'^') {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b']' {
+                    j += 1;
+                }
+                while j < b.len() && b[j] != b']' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                i = j;
+            }
+            x if x & 0xC0 == 0x80 => {}
+            _ => n += 1,
+        }
+        if n > 2 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Patterns longer than this that would overrun the budget are parsed first:
+/// one that never compiles costs no matching steps.
+const GLOB_PARSE_FREE_BYTES: usize = 256;
+
+/// Budget steps for the regexes the search checks build from one search
+/// variant (D-128): the whole pattern, plus each `dir/` prefix when an
+/// `ASK_TREES` folder lies under a root (`ask_search_glob_hit`).
+fn search_match_steps(pattern: &str, dir_prefixes: bool, left: usize) -> usize {
+    let mut steps = compile_steps(pattern);
+    if dir_prefixes {
+        let mut from = 1usize;
+        while from < pattern.len()
+            && let Some(k) = pattern[from..].find('/')
+        {
+            steps = steps.saturating_add(compile_steps(&pattern[..from + k]));
+            if steps > MAX_GLOB_WORK {
+                break;
+            }
+            from += k + 1;
+        }
+    }
+    // Over budget: parse (cheap) before failing closed, since a pattern
+    // that doesn't parse is never compiled.
+    if steps > left
+        && pattern.len() > GLOB_PARSE_FREE_BYTES
+        && GlobBuilder::new(pattern)
+            .literal_separator(false)
+            .build()
+            .is_err()
+    {
+        return 0;
+    }
+    steps
+}
+
+/// Budget steps for the per-component regexes `Sensitive::glob_hit` builds
+/// for one escaping pattern (`..` patterns are checked by prefix only).
+fn escape_match_steps(pattern: &str) -> usize {
+    if !has_any(pattern, &['*', '?', '[']) || pattern.split('/').any(|s| s == "..") {
+        return 0;
+    }
+    if pattern.contains("**") {
+        return compile_steps(pattern);
+    }
+    components_upto(pattern, MAX_GLOB_WORK)
+        .saturating_mul(GLOB_COMPILE_STEPS)
+        .saturating_add(pattern.len())
 }
 
 fn unescape_glob_backslashes(g: &str) -> String {
@@ -2556,7 +2684,13 @@ impl std::hash::Hasher for FxHasher {
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
+        // Eight bytes per round: unoptimized builds pay per loop iteration.
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for c in chunks {
+            let w = u64::from_le_bytes(*c);
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517cc1b727220a95);
+        }
+        for &b in rest {
             self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517cc1b727220a95);
         }
     }
@@ -2938,7 +3072,7 @@ fn reconstruct_node_path(
         {
             return None;
         }
-        if !arena.step_n(count.max(1)) {
+        if !arena.step_n(count.max(1) + add_bytes / GLOB_BYTES_PER_STEP) {
             return None;
         }
         seg_bytes += add_bytes;
@@ -2974,6 +3108,11 @@ where
     F: FnMut(&mut NormArena<'_>, usize, bool) -> Option<bool>,
 {
     let remaining_work = max_work.checked_sub(*total_work)?;
+    // The normalizer spends at least one step per component (D-128).
+    if components_upto(g, remaining_work) > remaining_work {
+        *total_work = max_work;
+        return None;
+    }
     let abs = g.starts_with('/');
     let mut arena = NormArena::new(remaining_work);
     let mut states: Vec<usize> = vec![0];
@@ -3239,12 +3378,33 @@ mod glob_norm_tests {
 }
 
 /// Widens `?` and any character class `[...]` that can match `.` to `.`.
-fn widen_pattern_dots(s: &str) -> String {
+fn widen_pattern_dots(s: &str, budget: &GlobBudget) -> String {
     let bytes = s.as_bytes();
     let mut last_rb = s.rfind(']');
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
+    let (mut next_q, mut next_lb): (Option<usize>, Option<usize>) = (None, None);
     while i < bytes.len() {
+        // Copy the run before the next `?` or class-opening `[` at memchr
+        // speed (D-128); each cached position is searched for again only
+        // once passed.
+        let q = match next_q {
+            Some(q) if q >= i => q,
+            _ => s[i..].find('?').map_or(bytes.len(), |k| i + k),
+        };
+        let lb = match (next_lb, last_rb) {
+            (Some(lb), Some(_)) if lb >= i => lb,
+            (_, Some(end)) if i < end => s[i..end].find('[').map_or(bytes.len(), |k| i + k),
+            _ => bytes.len(),
+        };
+        next_q = Some(q);
+        next_lb = Some(lb);
+        let next = q.min(lb);
+        if next > i {
+            out.push_str(&s[i..next]);
+            i = next;
+            continue;
+        }
         let ch = s[i..].chars().next().unwrap();
         let len = ch.len_utf8();
         if ch == '?' {
@@ -3267,7 +3427,7 @@ fn widen_pattern_dots(s: &str) -> String {
             }
             if j < bytes.len() && bytes[j] == b']' {
                 let class = &s[i..=j];
-                if class_may_match_dot(class) {
+                if class_may_match_dot(class, budget) {
                     out.push('.');
                 } else {
                     out.push_str(class);
@@ -3291,10 +3451,25 @@ fn widen_pattern_dots(s: &str) -> String {
 fn widen_pattern_slashes(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut last_rb = s.rfind(']');
+    // No `[` before the last `]`: no class, nothing to widen (D-128).
+    let first_lb = s.find('[')?;
+    if last_rb.is_none_or(|end| first_lb >= end) {
+        return None;
+    }
     let mut out = String::with_capacity(s.len());
     let mut changed = false;
     let mut i = 0;
     while i < bytes.len() {
+        // Copy the run before the next class-opening `[` at memchr speed.
+        let next = match last_rb {
+            Some(end) if i < end => s[i..end].find('[').map_or(bytes.len(), |k| i + k),
+            _ => bytes.len(),
+        };
+        if next > i {
+            out.push_str(&s[i..next]);
+            i = next;
+            continue;
+        }
         let ch = s[i..].chars().next().unwrap();
         let len = ch.len_utf8();
         if ch == '[' && last_rb.is_some_and(|end| i < end) {
@@ -3388,16 +3563,172 @@ struct GlobCandidates {
     variants: Vec<String>,
     unknown: bool,
     unbounded: bool,
+    /// The one step budget for this glob check (D-128): candidate expansion,
+    /// `search_variants_from_cands` and `escape_from_cands` all draw from it.
+    budget: GlobBudget,
+}
+
+/// One step budget for a whole glob check (D-128). A unit is one path
+/// component handled by the normalizer, or `GLOB_BYTES_PER_STEP` bytes of
+/// glob text copied, scanned or hashed. Brace/home expansion, `..`
+/// collapsing, variant generation and reconstruction all charge the same
+/// counter, and every stage checks a cheap lower bound of its cost before
+/// starting, so the whole check stops (failing closed to Ask) as soon as
+/// `MAX_GLOB_WORK` is spent, whatever the input's shape.
+#[derive(Default)]
+struct GlobBudget {
+    used: std::cell::Cell<usize>,
+    /// `class_may_match_dot` answers, so a repeated class compiles once.
+    class_memo: std::cell::RefCell<FxMap<String, bool>>,
+}
+
+/// Bytes of glob text per budget step.
+const GLOB_BYTES_PER_STEP: usize = 64;
+
+impl GlobBudget {
+    fn left(&self) -> usize {
+        MAX_GLOB_WORK.saturating_sub(self.used.get())
+    }
+
+    /// Charges `n` steps; false (and the budget is spent) when over.
+    fn charge(&self, n: usize) -> bool {
+        let used = self.used.get().saturating_add(n);
+        if used > MAX_GLOB_WORK {
+            self.used.set(MAX_GLOB_WORK);
+            return false;
+        }
+        self.used.set(used);
+        true
+    }
+
+    fn charge_bytes(&self, len: usize) -> bool {
+        self.charge(1 + len / GLOB_BYTES_PER_STEP)
+    }
+
+    /// Runs `f` with the remaining work as a `(total_work, max_work)` pair,
+    /// the form `normalize_glob_filtered` takes.
+    fn with_work<R>(&self, f: impl FnOnce(&mut usize) -> R) -> R {
+        let mut used = self.used.get();
+        let r = f(&mut used);
+        self.used.set(used.min(MAX_GLOB_WORK));
+        r
+    }
+}
+
+/// Number of `/`-separated components of `s`, counting at most `limit + 1`
+/// (memchr-speed: no per-byte loop in debug builds).
+fn components_upto(s: &str, limit: usize) -> usize {
+    let mut n = 1usize;
+    let mut rest = s;
+    while let Some(i) = rest.find('/') {
+        n += 1;
+        if n > limit {
+            return n;
+        }
+        rest = &rest[i + 1..];
+    }
+    n
+}
+
+/// Whether `s` contains any of `chars`, one memchr pass per char (a
+/// `[char; N]` pattern walks the string char by char, which is ~1 µs/byte
+/// unoptimized).
+fn has_any(s: &str, chars: &[char]) -> bool {
+    chars.iter().any(|&c| s.contains(c))
+}
+
+/// An upper bound on the words `words::brace_expand` makes from `g` (capped
+/// at `MAX_GLOB_VARIANTS + 1`), and the `/`-separated components and bytes
+/// outside any brace (present in every word). One byte pass.
+fn brace_estimate(g: &str) -> (usize, usize, usize) {
+    let b = g.as_bytes();
+    let mut stack: Vec<(usize, usize)> = vec![];
+    let mut count = 1usize;
+    let mut outside = 1usize;
+    let mut outside_bytes = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'{' => stack.push((i, 1)),
+            b',' => {
+                if let Some(top) = stack.last_mut() {
+                    top.1 += 1;
+                }
+            }
+            b'}' => {
+                if let Some((open, alts)) = stack.pop() {
+                    let n = if alts > 1 {
+                        alts
+                    } else {
+                        brace_sequence_len(&g[open + 1..i])
+                    };
+                    count = count.saturating_mul(n).min(MAX_GLOB_VARIANTS + 1);
+                }
+            }
+            b'/' if stack.is_empty() => outside += 1,
+            _ => {}
+        }
+        if stack.is_empty() {
+            outside_bytes += 1;
+        }
+        i += 1;
+    }
+    (count, outside, outside_bytes)
+}
+
+/// Upper bound on a `{x..y[..s]}` sequence's length (1 when it isn't one).
+fn brace_sequence_len(inner: &str) -> usize {
+    let parts: Vec<&str> = inner.split("..").collect();
+    if !(2..=3).contains(&parts.len()) {
+        return 1;
+    }
+    let val = |s: &str| -> Option<i64> {
+        let mut it = s.chars();
+        match (it.next(), it.next()) {
+            (Some(c), None) if c.is_ascii_alphabetic() => Some(c as i64),
+            _ => s.parse::<i64>().ok(),
+        }
+    };
+    match (val(parts[0]), val(parts[1])) {
+        (Some(x), Some(y)) => {
+            let step = parts
+                .get(2)
+                .and_then(|s| s.parse::<i64>().ok())
+                .map_or(1, |s| s.unsigned_abs().max(1));
+            usize::try_from(x.abs_diff(y) / step + 1)
+                .unwrap_or(usize::MAX)
+                .min(MAX_GLOB_VARIANTS + 1)
+        }
+        _ => 1,
+    }
 }
 
 /// Shared brace-expansion, home-expansion, and dot/slash/`$VAR` widening,
-/// capped at `MAX_GLOB_VARIANTS` without sampling on overflow.
+/// capped at `MAX_GLOB_VARIANTS` without sampling on overflow. Starts the
+/// glob check's step budget (D-128) and charges every word it makes.
 fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates {
     let mut res = GlobCandidates::default();
-    if glob.len() > MAX_BYTES || glob.contains('\0') {
+    let fail = |mut res: GlobCandidates| {
         res.unknown = true;
         res.unbounded = true;
-        return res;
+        res.variants.clear();
+        res.budget.charge(MAX_GLOB_WORK + 1);
+        res
+    };
+    if glob.len() > MAX_BYTES || glob.contains('\0') {
+        return fail(res);
+    }
+    // Cheap lower bound first: every word keeps the components outside
+    // braces, and the normalizer spends at least a step on each of them.
+    let has_brace = glob.contains('{');
+    let floor = if has_brace {
+        let (words, outside, outside_bytes) = brace_estimate(glob);
+        words.saturating_mul(outside + outside_bytes / GLOB_BYTES_PER_STEP)
+    } else {
+        components_upto(glob, MAX_GLOB_WORK)
+    };
+    if floor > res.budget.left() || !res.budget.charge_bytes(glob.len()) {
+        return fail(res);
     }
     let mut raw = vec![glob.to_string()];
     if glob.contains('\\') {
@@ -3406,21 +3737,21 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
     }
     let mut expansions = vec![];
     for r in raw {
-        if !r.contains('{') {
+        if !has_brace || !r.contains('{') {
             expansions.push(r);
         } else if let Some(exps) = words::brace_expand(&r) {
             expansions.extend(exps);
         } else {
-            res.unknown = true;
-            res.unbounded = true;
-            res.variants.clear();
-            return res;
+            return fail(res);
         }
     }
     let mut seen = FxSet::default();
     for e in expansions {
         if e.is_empty() {
             continue;
+        }
+        if !res.budget.charge_bytes(e.len()) {
+            return fail(res);
         }
         let h = if e.starts_with(['~', '$']) {
             words::expand_home(&e, home, cwd)
@@ -3434,9 +3765,19 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
             res.unknown = true;
             continue;
         }
-        let has_q_or_lb = h.contains(['?', '[']);
-        if has_q_or_lb && h.split('/').any(may_be_dot_component) {
-            res.unknown = true;
+        let has_q_or_lb = has_any(&h, &['?', '[']);
+        if has_q_or_lb {
+            if !res.budget.charge(components_upto(&h, MAX_GLOB_WORK)) {
+                return fail(res);
+            }
+            let mut memo: FxMap<&str, bool> = FxMap::default();
+            if h.split('/').any(|c| {
+                *memo
+                    .entry(c)
+                    .or_insert_with(|| may_be_dot_component(c, &res.budget))
+            }) {
+                res.unknown = true;
+            }
         }
         let bases = if h.contains('$') {
             res.unknown = true;
@@ -3448,8 +3789,8 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
         };
         let mut cands = vec![];
         for b in bases {
-            let b_has_q_or_lb = b.contains(['?', '[']);
             let b_has_lb = b.contains('[');
+            let b_has_q_or_lb = b_has_lb || b.contains('?');
             if !b_has_q_or_lb {
                 if !cands.contains(&b) {
                     cands.push(b);
@@ -3459,7 +3800,7 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
             if !cands.contains(&b) {
                 cands.push(b.clone());
             }
-            let dots = widen_pattern_dots(&b);
+            let dots = widen_pattern_dots(&b, &res.budget);
             let dots_changed = dots != b;
             if dots_changed && !cands.contains(&dots) {
                 cands.push(dots.clone());
@@ -3469,7 +3810,7 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
                 if !cands.contains(&sl) {
                     cands.push(sl.clone());
                 }
-                let sl_dots = widen_pattern_dots(&sl);
+                let sl_dots = widen_pattern_dots(&sl, &res.budget);
                 if sl_dots != sl && !cands.contains(&sl_dots) {
                     cands.push(sl_dots);
                 }
@@ -3488,12 +3829,12 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
             if cand.is_empty() {
                 continue;
             }
+            if !res.budget.charge_bytes(cand.len()) {
+                return fail(res);
+            }
             if seen.insert(cand.clone()) {
                 if res.variants.len() >= MAX_GLOB_VARIANTS {
-                    res.unknown = true;
-                    res.unbounded = true;
-                    res.variants.clear();
-                    return res;
+                    return fail(res);
                 }
                 res.variants.push(cand);
             }
@@ -3534,18 +3875,14 @@ fn search_variants_from_cands(
     let mut seen = FxSet::default();
     let mut unjoined_norm = 0usize;
     let mut joined_norm = 0usize;
-    let mut work = 0usize;
+    let budget = &cands.budget;
     let mut push_norms = |pat: &str, total: &mut usize| -> bool {
         let remaining = MAX_GLOB_VARIANTS.saturating_sub(*total);
         if remaining == 0 {
             return false;
         }
-        let Some((norm_count, norms)) = normalize_glob_filtered(
-            pat,
-            remaining,
-            &mut work,
-            MAX_GLOB_WORK,
-            |arena, id, abs| {
+        let Some((norm_count, norms)) = budget.with_work(|work| {
+            normalize_glob_filtered(pat, remaining, work, MAX_GLOB_WORK, |arena, id, abs| {
                 // Variants containing a `..` segment cannot match probe paths
                 // (and have valid glob syntax when free of `[`/`{`/`\`), so skip
                 // them before string reconstruction unless `ask_search_glob_hit`'s
@@ -3561,8 +3898,8 @@ fn search_variants_from_cands(
                     }
                 }
                 Some(true)
-            },
-        ) else {
+            })
+        }) else {
             return false;
         };
         *total += norm_count;
@@ -3570,11 +3907,17 @@ fn search_variants_from_cands(
             return false;
         }
         for n in norms {
+            if !budget.charge_bytes(n.len()) {
+                return false;
+            }
             let norm = fold(&n);
             if norm.is_empty() {
                 continue;
             }
             if seen.insert(norm.clone()) {
+                if !budget.charge(search_match_steps(&norm, tree_may_hit, budget.left())) {
+                    return false;
+                }
                 out.push(norm);
             }
         }
@@ -3590,6 +3933,9 @@ fn search_variants_from_cands(
         let anchored = gv.starts_with('/') || gv.starts_with('~');
         if !anchored {
             for r in roots {
+                if !budget.charge_bytes(gv.len() + r.as_os_str().len()) {
+                    return (vec![], true);
+                }
                 let joined = format!("{}/{}", r.to_string_lossy().trim_end_matches('/'), gv);
                 if !push_norms(&joined, &mut joined_norm) {
                     return (vec![], true);
@@ -3630,9 +3976,16 @@ fn escape_from_cands(
         return out;
     }
     let mut total_norm = 0usize;
-    let mut work = 0usize;
     for gv in &cands.variants {
-        check_escape_variant(gv, roots, cwd, home, &mut total_norm, &mut work, &mut out);
+        check_escape_variant(
+            gv,
+            roots,
+            cwd,
+            home,
+            &mut total_norm,
+            &cands.budget,
+            &mut out,
+        );
         if out.unbounded {
             break;
         }
@@ -3646,13 +3999,26 @@ fn check_escape_variant(
     cwd: &Path,
     home: &Path,
     total_norm: &mut usize,
-    work: &mut usize,
+    budget: &GlobBudget,
     out: &mut GlobEscape,
 ) {
     if variant.is_empty() {
         return;
     }
     let anchored = variant.starts_with('/') || variant.starts_with('~');
+    let joined_bytes = if anchored {
+        variant.len() + home.as_os_str().len().max(cwd.as_os_str().len())
+    } else {
+        roots
+            .iter()
+            .map(|r| variant.len() + r.as_os_str().len())
+            .sum()
+    };
+    if !budget.charge_bytes(joined_bytes) {
+        out.unbounded = true;
+        out.unknown = true;
+        return;
+    }
     let raw_joined: Vec<String> = if anchored {
         vec![words::expand_home(variant, home, cwd)]
     } else {
@@ -3671,7 +4037,7 @@ fn check_escape_variant(
             out.unknown = true;
             return;
         }
-        let Some((norm_count, norms)) =
+        let Some((norm_count, norms)) = budget.with_work(|work| {
             normalize_glob_filtered(&j, remaining, work, MAX_GLOB_WORK, |arena, id, abs| {
                 let prefix_id = arena.nodes[id].literal_prefix_id;
                 let is_curdir = prefix_id == 0 && !abs && id == 0;
@@ -3696,7 +4062,7 @@ fn check_escape_variant(
                 inside_cache.insert(key, inside);
                 Some(!inside)
             })
-        else {
+        }) else {
             out.unbounded = true;
             out.unknown = true;
             return;
@@ -3708,8 +4074,18 @@ fn check_escape_variant(
             return;
         }
         for n in norms {
+            if !budget.charge_bytes(n.len()) {
+                out.unbounded = true;
+                out.unknown = true;
+                return;
+            }
             let abs = PathBuf::from(&n);
             if !out.patterns.contains(&abs) {
+                if !budget.charge(escape_match_steps(&n)) {
+                    out.unbounded = true;
+                    out.unknown = true;
+                    return;
+                }
                 if out.patterns.len() >= MAX_GLOB_VARIANTS {
                     out.unbounded = true;
                     out.unknown = true;
