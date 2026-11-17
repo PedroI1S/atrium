@@ -862,3 +862,39 @@ fn added_scope_hard_links_met_by_globs_and_walks_match_by_identity() {
         eval_cmd_3(&t, "cat other/y.txt")
     );
 }
+
+#[test]
+fn added_scope_non_following_walks_check_hard_links_by_identity() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    t.write("proj/a.txt", "ordinary");
+    t.write("proj/sub/b.txt", "ordinary");
+    std::fs::hard_link(t.home.join(".ssh/id_rsa"), t.home.join("proj/sub/h")).unwrap();
+    t.write("clean/a.txt", "ordinary");
+    t.write("clean/x.txt", "ordinary");
+    std::fs::hard_link(t.home.join("clean/x.txt"), t.home.join("clean/y.txt")).unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    for line in [
+        "grep -r secret proj",
+        "rg secret proj",
+        "find proj -type f -exec cat {} +",
+        "tar -cf - proj",
+    ] {
+        assert_eq!(eval_cmd_3(&t, line), deny, "{line}");
+        // ordinary tree (an ordinary hard link inside): not hard-denied
+        let clean = line.replace("proj", "clean");
+        assert_ne!(eval_cmd_3(&t, &clean), deny, "{clean}");
+    }
+}
+
+#[test]
+fn added_scope_non_reading_walks_do_not_hard_deny_on_hard_links() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    t.write("proj/a.txt", "ordinary");
+    std::fs::hard_link(t.home.join(".ssh/id_rsa"), t.home.join("proj/h")).unwrap();
+    for line in ["rm -r proj", "mv proj proj2"] {
+        assert_ne!(eval_cmd_3(&t, line), ["Deny", "Deny", "Deny"], "{line}");
+    }
+}

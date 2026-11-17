@@ -1744,11 +1744,15 @@ fn is_pruned(prune: PruneDirs, name: Option<&str>) -> bool {
 /// following search does (a link to a folder is walked too, at any number
 /// of hops: M1-18, K2), for a link into a tree: Yes (with the tree), No, or
 /// Maybe when the walk is too big.
+/// With `follow` false the walk is the command's own non-following one: links
+/// are not entered, but a hard link to a credential (a regular file with more
+/// than one name) is checked by identity, since it can't be "not followed".
 fn links_below(
     root: &Path,
     trees: &[Tree],
     prune: PruneDirs,
     sensitive: Option<&deny::Sensitive>,
+    follow: bool,
 ) -> (Reach, Option<&'static str>) {
     const BUDGET: usize = 4096;
     const MAX_DEPTH: u8 = 16;
@@ -1803,6 +1807,9 @@ fn links_below(
                 return (Reach::Maybe, None);
             }
             let p = e.path();
+            if ft.is_symlink() && !follow {
+                continue;
+            }
             if ft.is_symlink() {
                 let real = match std::fs::canonicalize(&p) {
                     Ok(r) => r,
@@ -1962,20 +1969,31 @@ fn reaches_tree_through_links_once(
     );
     for (i, u) in a.units.iter().enumerate() {
         let follow = follows_links(&u.eff);
-        if !recursive_reader(&u.eff) || follow == Follow::No {
+        if !recursive_reader(&u.eff) {
             continue;
         }
         // options it can't read: it may search there (it asks)
-        let sure = match searches_cwd_with(&u.eff, true) {
+        let reads_cwd = match searches_cwd_with(&u.eff, true) {
             Some(false) => continue,
-            Some(true) => follow == Follow::Yes,
+            Some(true) => true,
             None => false,
         };
         let prune = prune_mode(&u.eff);
         if let Some(words::CwdState::Known(cands)) = a.unit_cwd.get(i) {
             for c in cands {
-                match links_below(c, trees, prune, sensitive) {
-                    (Reach::Yes, t) if sure => return (Reach::Yes, t),
+                // what it reads without following: hard links are sure hits
+                match links_below(c, trees, prune, sensitive, false) {
+                    (Reach::Yes, t) if reads_cwd => return (Reach::Yes, t),
+                    (Reach::No, _) => {}
+                    _ => maybe = true,
+                }
+                if follow == Follow::No {
+                    continue;
+                }
+                match links_below(c, trees, prune, sensitive, true) {
+                    (Reach::Yes, t) if reads_cwd && follow == Follow::Yes => {
+                        return (Reach::Yes, t);
+                    }
                     (Reach::No, _) => {}
                     _ => maybe = true,
                 }
@@ -2062,6 +2080,13 @@ fn reaches_tree_through_links_once(
         let follow = unit.map_or(Follow::No, |x| follows_links(&x.eff));
         let prune = unit.map_or(PruneDirs::None, |x| prune_mode(&x.eff));
         let include_dotfiles = unit.is_none() && file_tool;
+        let reads_contents = (u.role == words::Role::Read
+            || unit.is_some_and(|x| recursive_reader(&x.eff) || tree_walker(&x.eff)))
+            && unit.is_none_or(|x| {
+                !x.eff
+                    .first()
+                    .is_some_and(|f| matches!(shell::base(f), "rm" | "grm" | "mv"))
+            });
         // `ls proj/*` only names what it lists
         let lister = !recursive
             && unit.is_some_and(|x| x.eff.first().is_some_and(|f| shell::base(f) == "ls"));
@@ -2087,14 +2112,29 @@ fn reaches_tree_through_links_once(
             {
                 return (Reach::Yes, Some(t));
             }
-            if recursive && follow != Follow::No {
+            if recursive {
                 for f in &targets {
-                    if f.is_dir() {
-                        match links_below(f, trees, prune, sensitive) {
-                            (Reach::Yes, t) if follow == Follow::Yes => return (Reach::Yes, t),
+                    if !f.is_dir() {
+                        continue;
+                    }
+                    // the tree it reads without following: hard links to a
+                    // credential are read whatever the command follows
+                    // (only a tree whose files are opened: not `rm -r`/`mv`,
+                    // which move or unlink names)
+                    if reads_contents {
+                        match links_below(f, trees, prune, sensitive, false) {
+                            (Reach::Yes, t) => return (Reach::Yes, t),
                             (Reach::No, _) => {}
                             _ => maybe = true,
                         }
+                    }
+                    if follow == Follow::No {
+                        continue;
+                    }
+                    match links_below(f, trees, prune, sensitive, true) {
+                        (Reach::Yes, t) if follow == Follow::Yes => return (Reach::Yes, t),
+                        (Reach::No, _) => {}
+                        _ => maybe = true,
                     }
                 }
             }
