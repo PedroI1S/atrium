@@ -88,7 +88,7 @@ Added scope (D-120, brief "Added scope"), both former limits closed:
 - **`resolve_fs` (~84):** now delegates to `real_path`, so every caller follows links in filesystem order before `..`; ordinary paths resolve as before (canonical when they exist, deepest existing part plus tail otherwise). Test: `added_scope_resolve_fs_follows_links_before_dotdot` (`fs_resolve("proj/dangling-key")` → `~/.ssh/new_key`; `printf x > proj/dangling-key`, `cat proj/dangling-key` → Deny ×3; `proj/a.txt` and `proj/missing/../a.txt` unchanged).
 - **`alias_fix` for globs and walks:** the credential identity map (dev, inode) used for named paths is installed for the link check (`with_identity_roots`); every glob match, literal re-resolution, walked link target and multiply-linked file met on a following walk goes through `identity_hit` (`alias_fix` + the plain classifier), charged to the same per-check budget. Test: `added_scope_hard_links_met_by_globs_and_walks_match_by_identity` (`cat proj/h*`, Glob `h*`, `grep -R secret proj`, `tar --dereference …` → Deny ×3; an ordinary hard link keeps its verdict).
 - Both tests fail with the previous `gate.rs` (`d09a373`) and pass now. Re-run: clippy clean; `M1-32-link-globs` 23/23; same failure set as above (known N9/N11 plus the load-sensitive timing caps), no verdict test fails.
-- Note: a non-following recursive read (`grep -r` without dereference) is not walked by the link check, as on `dev`; a hard link inside it is handled by `dev`'s rules for the walked folder, not by this check.
+- Note: a non-following recursive read (`grep -r` without dereference) is not walked by the link check, as on `dev`. Whether a hard-linked credential inside such a folder is caught was not checked in this task; flagged for the reviewer.
 
 ---
 
