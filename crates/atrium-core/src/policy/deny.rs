@@ -967,7 +967,7 @@ fn posix_class_matches(name: &str, ch: char) -> Option<bool> {
         "lower" => ch.is_ascii_lowercase(),
         "print" => ch.is_ascii_graphic() || ch == ' ',
         "punct" => ch.is_ascii_punctuation(),
-        "space" => ch.is_ascii_whitespace(),
+        "space" => ch.is_ascii_whitespace() || ch == '\x0B',
         "upper" => ch.is_ascii_uppercase(),
         "word" => ch.is_ascii_alphanumeric() || ch == '_',
         "xdigit" => ch.is_ascii_hexdigit(),
