@@ -30,7 +30,7 @@ use atrium_protocol::wire::{ClientRole, CommandResult, ErrorCode, EventId, Serve
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::codec::{self, Frame};
 
@@ -162,6 +162,9 @@ pub(crate) struct Conn {
     wake: Notify,
     /// Wakes feeders waiting for room, and tells them of ended subscriptions.
     room: Notify,
+    /// Becomes `true` once [`Conn::close`] closes the connection, without
+    /// spurious wakeups from `room`.
+    closed: watch::Sender<bool>,
     max_event_bytes: usize,
 }
 
@@ -175,6 +178,7 @@ impl Conn {
             outbox: Mutex::new(Outbox::default()),
             wake: Notify::new(),
             room: Notify::new(),
+            closed: watch::channel(false).0,
             max_event_bytes,
         }
     }
@@ -183,6 +187,7 @@ impl Conn {
         self.outbox.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.lock().closed
     }
@@ -198,6 +203,11 @@ impl Conn {
         outbox.subs.clear();
         outbox.by_thread.clear();
         drop(outbox);
+        self.closed.send_if_modified(|is_closed| {
+            let changed = !*is_closed;
+            *is_closed = true;
+            changed
+        });
         self.wake.notify_one();
         self.room.notify_waiters();
     }
@@ -222,15 +232,8 @@ impl Conn {
 
     /// Returns once the connection is closed.
     pub(crate) async fn closed(&self) {
-        loop {
-            let notified = self.room.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.is_closed() {
-                return;
-            }
-            notified.await;
-        }
+        let mut closed = self.closed.subscribe();
+        let _ = closed.wait_for(|is_closed| *is_closed).await;
     }
 
     /// Queues a control-lane message.
@@ -489,6 +492,7 @@ enum Take {
 /// Writes the connection's frames until it closes or a write fails or
 /// stalls. The connection is closed when this returns.
 pub(crate) async fn write_loop(conn: &Conn, mut writer: OwnedWriteHalf) {
+    let mut closed = conn.closed.subscribe();
     loop {
         let (frame, origin) = match conn.take() {
             Take::Frame(frame, origin) => (frame, origin),
@@ -513,7 +517,7 @@ pub(crate) async fn write_loop(conn: &Conn, mut writer: OwnedWriteHalf) {
         };
         tokio::select! {
             biased;
-            () = conn.closed() => break,
+            _ = closed.wait_for(|is_closed| *is_closed) => break,
             res = tokio::time::timeout(WRITE_STALL, writing) => match res {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) | Err(_) => break,
@@ -876,5 +880,127 @@ mod tests {
         let mut received = Vec::new();
         theirs.read_to_end(&mut received).await.expect("reads");
         assert_eq!(received.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn write_loop_does_not_close_when_stalled_reader_lags() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a pair");
+        let (_reading, writer) = ours.into_split();
+
+        // Fill the socket buffer so `write_loop` parks on `writer.writable()`.
+        let mut filler_bytes = 0usize;
+        let filler = [0xEEu8; 4096];
+        loop {
+            match writer.try_write(&filler) {
+                Ok(n) => filler_bytes += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected write error: {err}"),
+            }
+        }
+
+        let conn = Arc::new(Conn::with_limit(1, ClientRole::Dev, 100));
+        let sub = conn.subscribe(&t("a")).expect("a subscription");
+        assert!(conn.go_live(sub));
+        let ev1 = codec::encode(&ServerMessage::ReplayDone {
+            thread_id: t("a"),
+            last: None,
+        })
+        .expect("encodes");
+        assert_eq!(conn.push_live(sub, EventId(1), &ev1), Pushed::Queued);
+
+        let writer_task = tokio::spawn({
+            let conn = conn.clone();
+            async move { write_loop(&conn, writer).await }
+        });
+        tokio::task::yield_now().await;
+
+        // Exceed the event lane while `write_loop` is stalled: `room` wakes
+        // feeders, but must not wake or close `write_loop`.
+        assert_eq!(conn.push_live(sub, EventId(2), &frame(80)), Pushed::Queued);
+        assert_eq!(conn.push_live(sub, EventId(3), &frame(80)), Pushed::Lagged);
+        tokio::task::yield_now().await;
+        assert!(!conn.is_closed());
+        assert!(!writer_task.is_finished());
+
+        conn.ok(42, Value::Null);
+        conn.finish();
+
+        let mut drain = vec![0u8; filler_bytes];
+        theirs.read_exact(&mut drain).await.expect("drains filler");
+
+        let mut messages = Vec::new();
+        loop {
+            let Ok(len) = theirs.read_u32().await else {
+                break;
+            };
+            let kind = theirs.read_u8().await.expect("kind");
+            assert_eq!(kind, 0);
+            let mut payload = vec![0u8; len as usize - 1];
+            theirs.read_exact(&mut payload).await.expect("payload");
+            messages
+                .push(serde_json::from_slice::<ServerMessage>(&payload).expect("server message"));
+        }
+        writer_task.await.expect("writer task");
+
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                ServerMessage::SubscriptionLagged { thread_id, .. } if *thread_id == t("a")
+            )),
+            "expected SubscriptionLagged, got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, ServerMessage::Response { request_id: 42, .. })),
+            "expected Response 42, got {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_loop_exits_promptly_when_closed_while_stalled() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a pair");
+        let (_reading, writer) = ours.into_split();
+
+        let mut filler_bytes = 0usize;
+        let filler = [0xEEu8; 4096];
+        loop {
+            match writer.try_write(&filler) {
+                Ok(n) => filler_bytes += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected write error: {err}"),
+            }
+        }
+
+        let conn = Arc::new(Conn::with_limit(1, ClientRole::Dev, 100));
+        conn.ok(1, Value::Null);
+
+        let writer_task = tokio::spawn({
+            let conn = conn.clone();
+            async move { write_loop(&conn, writer).await }
+        });
+        tokio::task::yield_now().await;
+
+        // Overflow `MAX_CONTROL_BYTES` while the socket buffer is full.
+        for _ in 0..9 {
+            conn.control_frame(frame(1024 * 1024), Coalesce::Keep);
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("write_loop exited promptly")
+            .expect("writer task");
+        assert!(conn.is_closed());
+
+        let mut drain = vec![0u8; filler_bytes];
+        theirs.read_exact(&mut drain).await.expect("drains filler");
+        let mut tail = [0u8; 16];
+        assert_eq!(theirs.read(&mut tail).await.expect("eof"), 0);
     }
 }

@@ -255,3 +255,19 @@ git checkout HEAD -- crates/atrium-core/src crates/atrium-daemon/src crates/atri
 - `cargo fmt --all`: exited 0
 - `cargo check -p atrium-core --tests`: exited 0 (0 warnings)
 - `cargo check -p atrium-agents --tests`: exited 0 (0 warnings)
+
+---
+
+## 10. Rework round 4
+
+1. **Decoupled `Conn::closed` from `self.room` in [`crates/atrium-daemon/src/conn.rs`](crates/atrium-daemon/src/conn.rs):**
+   - **What the N10 change did:** Rework round 1 (`69efd34`) added `() = conn.closed() => break` to `write_loop`'s `tokio::select!`. Because `Conn::closed` awaited `self.room.notified()` — the same `tokio::sync::Notify` used by `feed`, `take`, `push_live`, `subscribe`, and `unsubscribe` — marking a stalled reader's subscription as lagged (`push_live` calling `self.room.notify_waiters()`) woke `write_loop` spuriously mid-`writing` (while parked on `writer.writable().await`) and forced a re-poll of `conn.closed()` and `writing`.
+   - **Fix:** Added a dedicated `closed: tokio::sync::watch::Sender<bool>` field (initialized to `false`, set to `true` via `send_if_modified` only inside `Conn::close()`, not `Conn::finish()`). Updated `Conn::closed(&self)` to subscribe and `wait_for(|is_closed| *is_closed)`, and subscribed once at the top of `write_loop` (`let mut closed = conn.closed.subscribe();` with `_ = closed.wait_for(|is_closed| *is_closed) => break`). Now `write_loop` (and `server::connection`) wakes on the close branch **only** when `Conn::close()` actually closes the connection (such as overflowing `MAX_CONTROL_BYTES` in N10's flood test), never when `push_live` marks a slow reader lagged or `take` drains frames.
+   - **Unit tests added in [`crates/atrium-daemon/src/conn.rs`](crates/atrium-daemon/src/conn.rs):**
+     - `write_loop_does_not_close_when_stalled_reader_lags`: fills the socket buffer so `write_loop` parks in `writer.writable().await`, triggers `Pushed::Lagged` via `push_live`, asserts `!conn.is_closed()` and `!writer_task.is_finished()`, then drains and verifies `SubscriptionLagged` and a subsequent `ok` response arrive.
+     - `write_loop_exits_promptly_when_closed_while_stalled`: fills the socket buffer, overflows `MAX_CONTROL_BYTES` via `control_frame`, and asserts `write_loop` exits within 2 s and closes the peer stream (N10 flood path).
+   - **Note for verification (D-123):** Under D-123 this worker cannot run `cargo test`. By inspection, `Conn::closed` cannot return when `outbox.closed == false`, and the only timer that closes a live silent peer in `write_loop` is `WRITE_STALL` (`30 s`); if `a_reader_that_stops_lags_alone` ever exceeds `30 s` before `stalled.ok` begins reading, `WRITE_STALL` closes `stalled` and causes `tests/common/mod.rs:537` to panic at `~33 s`. Please run `cargo test -p atrium-daemon --test socket a_reader_that_stops_lags_alone` (in a loop) and `cargo test -p atrium-daemon --test adversarial_socket flooding_unread_list_threads_past_8_mib_control_lane_closes_connection`.
+
+**Checks run after rework round 4 (D-123):**
+- `cargo fmt --all`: exited 0
+- `cargo check -p atrium-daemon --tests`: exited 0 (0 warnings)
