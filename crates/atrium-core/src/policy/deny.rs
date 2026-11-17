@@ -1099,11 +1099,13 @@ fn path_could_reach_root(pl: &str, root: &str) -> bool {
 
 const MAX_STACK_SEGS: usize = 16;
 
+struct SegsStack<'a> {
+    buf: [&'a str; MAX_STACK_SEGS],
+    len: usize,
+}
+
 enum Segs<'a> {
-    Stack {
-        buf: [&'a str; MAX_STACK_SEGS],
-        len: usize,
-    },
+    Stack(Box<SegsStack<'a>>),
     Heap(Vec<&'a str>),
 }
 
@@ -1133,7 +1135,7 @@ impl<'a> Segs<'a> {
         }
         match heap {
             Some(v) => Self::Heap(v),
-            None => Self::Stack { buf, len },
+            None => Self::Stack(Box::new(SegsStack { buf, len })),
         }
     }
 
@@ -1163,20 +1165,20 @@ impl<'a> Segs<'a> {
         }
         match heap {
             Some(v) => Self::Heap(v),
-            None => Self::Stack { buf, len },
+            None => Self::Stack(Box::new(SegsStack { buf, len })),
         }
     }
 
     fn len(&self) -> usize {
         match self {
-            Self::Stack { len, .. } => *len,
+            Self::Stack(s) => s.len,
             Self::Heap(v) => v.len(),
         }
     }
 
     fn as_slice(&self) -> &[&'a str] {
         match self {
-            Self::Stack { buf, len } => &buf[..*len],
+            Self::Stack(s) => &s.buf[..s.len],
             Self::Heap(v) => v.as_slice(),
         }
     }
@@ -2017,18 +2019,20 @@ impl Tail<'_> {
     }
 }
 
+struct CompBufStack<'a> {
+    buf: [Comp<'a>; MAX_STACK_SEGS],
+    len: usize,
+}
+
 enum CompBuf<'a> {
-    Stack {
-        buf: [Comp<'a>; MAX_STACK_SEGS],
-        len: usize,
-    },
+    Stack(Box<CompBufStack<'a>>),
     Heap(Vec<Comp<'a>>),
 }
 
 impl<'a> CompBuf<'a> {
     fn as_slice(&self) -> &[Comp<'a>] {
         match self {
-            Self::Stack { buf, len } => &buf[..*len],
+            Self::Stack(s) => &s.buf[..s.len],
             Self::Heap(v) => v.as_slice(),
         }
     }
@@ -2110,7 +2114,7 @@ impl<'a> ShellGlob<'a> {
         }
         let parts = match heap {
             Some(v) => CompBuf::Heap(v),
-            None => CompBuf::Stack { buf, len },
+            None => CompBuf::Stack(Box::new(CompBufStack { buf, len })),
         };
         Self {
             abs: pattern.starts_with('/'),

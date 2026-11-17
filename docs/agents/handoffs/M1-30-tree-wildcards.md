@@ -63,7 +63,7 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
 ## Checks run by this worker (D-123)
 
 - `cargo fmt --all`: exited 0.
-- `cargo check -p atrium-core --tests`: exited 0 (7.45s, 0 warnings on initial pass; 0.49s, 0 warnings in rework round 1; 0.51s, 0 warnings in rework round 2; 5.42s, 0 warnings in rework round 3; 8.73s, 0 warnings in rework round 4).
+- `cargo check -p atrium-core --tests`: exited 0 (7.45s, 0 warnings on initial pass; 0.49s, 0 warnings in rework round 1; 0.51s, 0 warnings in rework round 2; 5.42s, 0 warnings in rework round 3; 8.73s, 0 warnings in rework round 4; 7.36s, 0 warnings in rework round 5).
 
 ## Rework round 1
 
@@ -117,6 +117,10 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
    - **Component glob DP (`comp_glob_dp`) & `Comp::from_part`:** Added fast literal prefix/suffix checks when `!prefix`, zero-alloc ASCII byte-slice matching in `comp_glob_dp`, and `c.contains(['.', '['])` guard in `Comp::from_part` before calling `brace_branch_dot_ok` (so `{a,b}...` without `.`/`[` skips `words::brace_expand`). Replaced per-atom `Vec<bool>` allocations in `glob_matches_stem_suffix` and `glob_matches_name_prefix` with `BoolDp`.
    - **`ask_search_glob_hit` (`ASK_NAME_PREFIXES` / `ASK_TREES`):** Checked `matches_ask_name_prefix_pat` before compiling `GlobBuilder::new(dir_pat)`, skipped `GlobBuilder::new(dir_pat)` when `dir_pat == "**"`, and deferred `GlobBuilder::new(rest)` validation until after `dir_pat` matches a tree and `ask_tree_matches_rest` returns `false`.
    - **Note on `policy::engine_never_panics_on_garbage`:** By inspection of `policy.rs:2234-2269`, `words.rs:464-478`, and `engine.rs:908-915`, all five `hostile` inputs inside the timed `started..elapsed()` block (`hostile[0]` > `MAX_BYTES`, `hostile[1..=2]` `brace_expand` overflow, `hostile[3]` > `MAX_UNITS`, `hostile[4]` > `MAX_USES`) set `a.overflow = true` in `deny::analyze` and return `PolicyVerdict::Deny` at `engine.rs:910` before `hard_deny` or `Home` matchers run; the 20,000 random-line loop before `started` does exercise `is_ssh_dir`, `glob_hit`, and `ask_hit`, and `fix2_nested_env_split_string_is_linear` exercises `is_ssh_dir` and `ask_hit` across `uses` and `unknown_tok_dangerous`. All edits stay strictly inside the owned `deny.rs` range (`563..=816` on `dev`).
+
+## Rework round 5
+
+- **Clippy `large_enum_variant` (`crates/atrium-core/src/policy/deny.rs`):** Boxed the large `Stack` variant's payload in `Segs<'a>` (`Box<SegsStack<'a>>`) and `CompBuf<'a>` (`Box<CompBufStack<'a>>`) without silencing the lint and with no behaviour change.
 
 ## Commands for the verification task (DoD)
 
