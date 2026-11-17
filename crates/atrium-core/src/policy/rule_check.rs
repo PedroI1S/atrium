@@ -3,7 +3,7 @@
 //! mirrors the app rules editor (`app/src/chat/rule-form.ts`).
 
 use atrium_protocol::agent::ToolKind;
-use atrium_protocol::policy::{RuleDecision, RuleDraft, RuleMatcher};
+use atrium_protocol::policy::{RuleDecision, RuleDraft, RuleMatcher, RuleScope};
 use globset::GlobBuilder;
 
 /// `shell.rs` `SHELLS`.
@@ -113,7 +113,13 @@ const PWSH_SHORT: &[&str] = &["c", "e", "ec", "cwa"];
 
 const PACKAGE_RUNNERS: &[&str] = &["npx", "pnpx", "bunx", "uvx", "pipx"];
 const RUNNER_CODE: &[&str] = &["-c", "--call"];
-const STDIN: &[&str] = &["-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"];
+const STDIN: &[&str] = &[
+    "-",
+    "/dev/stdin",
+    "/dev/fd/0",
+    "/proc/self/fd/0",
+    "/proc/thread-self/fd/0",
+];
 const FIND_EXEC: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
 const RESERVED: &[&str] = &[
     "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
@@ -169,15 +175,95 @@ fn interpreter_spec(folded_name: &str) -> Option<&'static InterpreterSpec> {
     }
 }
 
+fn normalize_posix_path(raw: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in raw.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    format!("/{}", parts.join("/"))
+        .to_lowercase()
+        .replace('ſ', "s")
+}
+
+fn is_stdin_script_path(raw: &str) -> bool {
+    if raw == "-" {
+        return true;
+    }
+    if !raw.starts_with('/') {
+        return false;
+    }
+    let norm = normalize_posix_path(raw);
+    STDIN.contains(&norm.as_str())
+}
+
+fn is_ps1_script(w: &str) -> bool {
+    !w.is_empty() && !is_stdin_script_path(w) && w.to_ascii_lowercase().ends_with(".ps1")
+}
+
+fn pwsh_option_body(w: &str) -> Option<&str> {
+    if w == "-" || w == "--" {
+        return None;
+    }
+    if let Some(rest) = w.strip_prefix("--").or_else(|| w.strip_prefix('-')) {
+        return Some(rest);
+    }
+    // On Unix `/path/to/script.ps1` starts with `/`, so only single-segment
+    // `/Option` (that isn't a `.ps1` file in `/`) counts as a PowerShell flag.
+    if let Some(rest) = w.strip_prefix('/')
+        && !rest.contains('/')
+        && !rest.to_ascii_lowercase().ends_with(".ps1")
+    {
+        return Some(rest);
+    }
+    None
+}
+
+fn pwsh_is_file_opt(bare: &str) -> bool {
+    bare == "f" || (bare.len() >= 2 && "file".starts_with(bare))
+}
+
+fn pwsh_is_value_opt(bare: &str) -> bool {
+    matches!(bare, "wd" | "ep" | "w" | "if" | "of" | "ea")
+        || (bare.len() >= 2
+            && ("workingdirectory".starts_with(bare)
+                || "executionpolicy".starts_with(bare)
+                || "windowstyle".starts_with(bare)
+                || "inputformat".starts_with(bare)
+                || "outputformat".starts_with(bare)
+                || "encodedarguments".starts_with(bare)
+                || "settingsfile".starts_with(bare)
+                || "custompipename".starts_with(bare)))
+        || (bare.len() >= 3 && "configurationname".starts_with(bare))
+        || (bare.len() >= 14 && "configurationfile".starts_with(bare))
+}
+
+fn pwsh_is_bool_opt(bare: &str) -> bool {
+    matches!(bare, "?" | "h" | "v" | "l" | "i" | "sta" | "mta" | "wa")
+        || (bare.len() >= 2
+            && ("help".starts_with(bare)
+                || "version".starts_with(bare)
+                || "wait".starts_with(bare)
+                || "login".starts_with(bare)
+                || "interactive".starts_with(bare)))
+        || (bare.len() >= 3
+            && ("nologo".starts_with(bare)
+                || "noexit".starts_with(bare)
+                || "noprofile".starts_with(bare)
+                || "noninteractive".starts_with(bare)))
+        || (bare.len() >= 4 && "noprofileloadtime".starts_with(bare))
+}
+
 fn check_pwsh_risk(name: &str, args: &[String]) -> Result<(), String> {
     for w in args {
-        let lw = w.to_lowercase();
-        let opt = lw
-            .strip_prefix("--")
-            .or_else(|| lw.strip_prefix('-'))
-            .or_else(|| lw.strip_prefix('/'));
-        if let Some(opt) = opt {
-            let bare = opt.split([':', '=']).next().unwrap_or("");
+        if let Some(opt) = pwsh_option_body(w) {
+            let lw = opt.to_lowercase();
+            let bare = lw.split([':', '=']).next().unwrap_or("");
             if PWSH_SHORT.contains(&bare)
                 || (!bare.is_empty() && PWSH_CODE.iter().any(|c| c.starts_with(bare)))
             {
@@ -187,10 +273,66 @@ fn check_pwsh_risk(name: &str, args: &[String]) -> Result<(), String> {
             }
         }
     }
-    if !args
-        .iter()
-        .any(|w| !w.starts_with('-') && w.to_ascii_lowercase().ends_with(".ps1"))
-    {
+
+    let mut found_script = false;
+    let mut i = 0;
+    while i < args.len() {
+        let w = &args[i];
+        if w == "--" {
+            if args.get(i + 1).is_some_and(|next| is_ps1_script(next)) {
+                found_script = true;
+            }
+            break;
+        }
+        let Some(opt) = pwsh_option_body(w) else {
+            if is_ps1_script(w) {
+                found_script = true;
+                break;
+            }
+            return Err(format!(
+                "an allow rule for `{name}` must name a .ps1 script"
+            ));
+        };
+        let lw = opt.to_lowercase();
+        let (bare, attached) = match lw.find([':', '=']) {
+            Some(pos) => (&lw[..pos], Some(&opt[pos + 1..])),
+            None => (lw.as_str(), None),
+        };
+        if pwsh_is_file_opt(bare) {
+            let script = match attached {
+                Some(s) => Some(s),
+                None => args.get(i + 1).map(String::as_str),
+            };
+            if script.is_some_and(is_ps1_script) {
+                found_script = true;
+                break;
+            }
+            return Err(format!(
+                "an allow rule for `{name}` must name a .ps1 script"
+            ));
+        }
+        if pwsh_is_value_opt(bare) {
+            if attached.is_some() {
+                i += 1;
+            } else if i + 1 < args.len() {
+                i += 2;
+            } else {
+                return Err(format!(
+                    "an allow rule for `{name}` must name a .ps1 script"
+                ));
+            }
+            continue;
+        }
+        if pwsh_is_bool_opt(bare) {
+            i += 1;
+            continue;
+        }
+        return Err(format!(
+            "an allow rule for `{name}` must name a .ps1 script"
+        ));
+    }
+
+    if !found_script {
         return Err(format!(
             "an allow rule for `{name}` must name a .ps1 script"
         ));
@@ -405,7 +547,7 @@ fn check_interpreter_risk(
         if w == "--" {
             if let Some(next) = args.get(i + 1) {
                 let ln = next.to_lowercase();
-                if STDIN.contains(&ln.as_str()) {
+                if is_stdin_script_path(next) {
                     return Err(format!(
                         "an allow rule can't allow `{name} {next}`: it reads code from standard input"
                     ));
@@ -420,7 +562,7 @@ fn check_interpreter_risk(
             break;
         }
         if !is_option(w) {
-            if STDIN.contains(&lw.as_str()) {
+            if is_stdin_script_path(w) {
                 return Err(format!(
                     "an allow rule can't allow `{name} {w}`: it reads code from standard input"
                 ));
@@ -812,6 +954,16 @@ fn validate_abs_glob(glob: &str, label: &str) -> Result<(), String> {
 
 /// Validates a `RuleDraft` from `CreateRule`, matching the app's rules editor.
 pub fn validate_rule_draft(draft: &RuleDraft) -> Result<(), String> {
+    if let RuleScope::Thread { thread_id } = &draft.scope
+        && (thread_id.0.trim().is_empty()
+            || thread_id
+                .0
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')))
+    {
+        return Err("thread scope requires a valid thread id".into());
+    }
+
     if let Some(tn) = &draft.tool_name
         && (tn.is_empty()
             || tn.chars().count() > 100

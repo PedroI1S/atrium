@@ -18,7 +18,7 @@ use atrium_core::{
 use atrium_host::lifecycle;
 use atrium_protocol::agent::SessionCommand;
 use atrium_protocol::limits::REPLAY_PAGE_EVENTS;
-use atrium_protocol::policy::{Preset, Rule, RuleDraft, RuleId, RuleOrigin};
+use atrium_protocol::policy::{Preset, Rule, RuleDraft, RuleId, RuleOrigin, RuleScope};
 use atrium_protocol::thread::{Location, ThreadId, ThreadSummary};
 use atrium_protocol::wire::{
     AgentLaunch, DaemonCommand, ErrorCode, EventId, ExportFormat, ProviderProbe, StoredEvent,
@@ -609,6 +609,19 @@ async fn probe(inner: &Arc<Inner>, preset: Preset) -> Result<Value, Failure> {
 async fn create_rule(inner: &Arc<Inner>, draft: RuleDraft) -> Result<Value, Failure> {
     if let Err(reason) = atrium_core::policy::validate_rule_draft(&draft) {
         return Err(failure(ErrorCode::Invalid, reason));
+    }
+    if let RuleScope::Thread { thread_id } = &draft.scope
+        && inner
+            .store
+            .thread(thread_id)
+            .await
+            .map_err(store_failure)?
+            .is_none()
+    {
+        return Err(failure(
+            ErrorCode::Invalid,
+            "unknown thread for thread-scoped rule",
+        ));
     }
     let now = now_ms();
     let rule = Rule {
