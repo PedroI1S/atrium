@@ -11,7 +11,7 @@ Brief read from `dev`: `docs/agents/briefs/M1-32-link-globs.md` (including scope
 1. Implemented **S11** in `477fe81` and fixed all 7 findings from `.orchestration/review-input/review-round1.md` in rework round 1:
    - `crates/atrium-core/src/policy/gate.rs`:
      - `evaluate_sync` (~318–401) builds `real_sensitive` (`deny::sensitive` on `resolve_fs`-resolved `home`/`atrium_data_paths`/`atrium_protected_paths`), passes `TreeKind::Sensitive` for `sensitive_roots`/`atrium_*` and `TreeKind::Raw` for `ssh.linked_dirs`/`ask_roots`, and passes `&c.cwd`, `&c.home`, and `Some(&real_sensitive)` / `None` to `reaches_tree_through_links`.
-     - `expand_glob` / `expand_glob_with` (~849–964) supports file-tool dotfile matching (`include_dotfiles = true`), tracks `(canonical_dir, comp_idx)` for `**`, sets `truncated = true` on `MAX_DEPTH`/`MAX_ENTRIES` while preserving already-found matches, and propagates `read_dir`, entry, `symlink_metadata`, and `metadata` errors (other than `NotFound` or non-directory targets) as `truncated = true`.
+     - `expand_glob` / `expand_glob_with` (~849–964) supports file-tool dotfile matching (`include_dotfiles = true`), tracks `(canonical_dir, comp_idx)` for `**`, sets `truncated = true` on `MAX_DEPTH` (keeping already-found matches) but returns `None` (the whole glob asks, matches discarded) when the `MAX_ENTRIES` budget is exhausted (see rework round 2), and propagates `read_dir`, entry, `symlink_metadata`, and `metadata` errors (other than `NotFound` or non-directory targets) as `truncated = true`.
      - `real_path` (~992–1079) resolves symlinks (including dangling ones) component-by-component in filesystem order so `..` applies after preceding links.
      - `trees_of` (~1485–1496) retains absent protected roots using `resolve_fs(r, 0)` instead of dropping canonicalization failures.
      - `in_trees` (~1500–1525) applies `deny::Sensitive::hit(real, role)` for `TreeKind::Sensitive` targets so `.pub`, `known_hosts`, and read-only `.ssh/config` / `authorized_keys` keep their contract §9 exceptions.
@@ -45,6 +45,21 @@ Brief read from `dev`: `docs/agents/briefs/M1-32-link-globs.md` (including scope
   - Additional check/fix in `reaches_tree_through_links` (`crates/atrium-core/src/policy/gate.rs`): in the `u.word.contains("..") && u.word.contains(['*', '?', '['])` brace-expansion branch, gated `expand_targets(&raw_p, ...)` on `raw_p` containing glob/meta characters (`['*', '?', '[', '{', '}', '$', '`']`), matching the other two glob-expansion call sites so non-glob brace branches are not treated as failed glob expansions (`maybe = true`).
   - Pinned by `rework2_over_budget_glob_and_non_ssh_id_rsa_do_not_hard_deny` in `crates/atrium-core/tests/M1-32-link-globs.rs` (verifies `cat big_dir/*/id_rsa` -> `["Ask", "Ask", "Ask"]`, `cat big_plain/*/id_rsa` -> `["Ask", "Ask", "Ask"]`, `cat plain/*/id_rsa` -> `["Ask", "Allow", "Allow"]`, `Glob` `plain` `id_rsa` / `*/id_rsa` -> `["Allow", "Allow", "Allow"]`, and `Glob` `big_dir` / `big_plain` -> `["Ask", "Ask", "Ask"]`).
   - Ran `cargo fmt --all` and `cargo check -p atrium-core --tests` (D-123); both exited `0`.
+
+---
+
+## Escalation (Opus, D-127)
+
+Review round 2 (`.orchestration/review-input/review-round2.md`), all findings closed in `crates/atrium-core/src/policy/gate.rs`; each test reproduces the reviewer's case and failed before the fix (commit "failing regressions for review round 2 findings 1-5"):
+
+- **Finding 1 (blocker, relocated `~/.ssh -> vault`):** fixed — `Tree` keeps a `logical` spelling (root's folder resolved, its name kept) and `in_trees` classifies a Sensitive target by both its real path and that alias, so the public-file exceptions still apply. Test: `rework2_finding1_relocated_ssh_store_keeps_credential_protection` (`cat proj/key*`, Glob `key*` → Deny ×3; `pub*` keeps Ask/Allow/Allow and Allow ×3).
+- **Finding 2 (blocker, non-UTF-8 link names):** fixed — `expand_glob_with` matches and joins the entry's own `OsString`/`e.path()`, no lossy copy. Test: `rework2_finding2_non_utf8_link_names_are_resolved_by_their_bytes` (`cat proj/k*`, Glob `k*` → Deny ×3).
+- **Finding 3 (blocker, `tar --dereference` skipping `node_modules`/`.git`/`target`):** fixed — `prune_mode` defaults to `PruneDirs::None`; only rg/ag/ack prune what they really skip; `VcsAndBuild` removed. `.git`/`node_modules`/`target` are now walked on a separate 65536-entry budget in `links_below`, so ordinary `cp -r`/`zip -r repo_with_git` keep `dev`'s Ask/Allow/Allow (`adversarial_m1_18::k2_*`). Test: `rework2_finding3_dereferencing_tar_walks_pruned_dirs`.
+
+Commands run (Opus may run tests): `cargo fmt --all --check` ok; `cargo clippy -p atrium-core --all-targets -- -D warnings` ok; `cargo test -p atrium-core`: all pass except the known Linux/timing failures also seen on `dev` (`adversarial_regression::round_5_blocker_1` N9, `adversarial_fuzz::random_hostile_lines…`, `adversarial_m1_18::fix4…` N11), plus `policy::engine_never_panics_on_garbage` (10.1 s, fails identically with `dev`'s `gate.rs`) and `adversarial_m1_18::fix2_nested_env_split_string_is_linear` (flaky 120–290 ms around a 200 ms cap; flaky identically before this escalation).
+- **Finding 4 (major, unreadable folder in a following search):** fixed — `links_below` turns `read_dir`, entry, `file_type` and link-`canonicalize` errors (other than not-found, not-a-dir, link loop) into `Reach::Maybe`, keeping a sure hit. Test: `rework2_finding4_unreadable_dir_in_following_search_fails_closed` (`grep -R secret proj` → Ask ×3).
+- **Finding 5 (major, file-tool dangling target `dir/../new_key`):** fixed inside the owned range — `raw_glob_pattern` no longer resolves a pattern-free path lexically (callers `real_path` it), and `reaches_tree_through_links` re-resolves each literal use with `real_path` from its raw spelling when that differs from the lexical resolution. Test: `rework2_finding5_file_tool_dangling_targets_resolve_links_before_dotdot` (Read and Glob → Deny ×3). `resolve_fs` itself (~line 84) is still unchanged (see Escalated).
+- **Finding 6 (nit, handoff entry-cap wording):** fixed in the summary above.
 
 ---
 

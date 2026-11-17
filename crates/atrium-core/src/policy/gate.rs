@@ -935,11 +935,13 @@ fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
                 // directory iteration order; fail closed to Ask (`None`).
                 return None;
             }
-            let name = e.file_name().to_string_lossy().to_string();
-            if !include_dotfiles && name.starts_with('.') && !c.starts_with('.') {
+            // the entry's own bytes: a lossy copy would name another path
+            let name = e.file_name();
+            if !include_dotfiles && name.as_encoded_bytes().starts_with(b".") && !c.starts_with('.')
+            {
                 continue;
             }
-            let path = dir.join(&name);
+            let path = e.path();
             if c == "**" {
                 if stack.len() > MAX_ENTRIES {
                     return None;
@@ -952,7 +954,7 @@ fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                     Err(_) => truncated = true,
                 }
-            } else if m.is_match(&name) {
+            } else if m.is_match(Path::new(&name)) {
                 stack.push((path, k + 1, deep));
             }
         }
@@ -1480,17 +1482,28 @@ struct Tree {
     /// folder itself counts.
     held: bool,
     kind: TreeKind,
+    /// The root's own spelling (its folder resolved, its name kept), so a
+    /// relocated store (`~/.ssh -> vault`) is still classified by its name.
+    logical: PathBuf,
 }
 
 fn trees_of(paths: &[PathBuf], id: &'static str, read: bool, kind: TreeKind) -> Vec<Tree> {
     paths
         .iter()
-        .map(|r| Tree {
-            path: resolve_fs(r, 0),
-            id,
-            read,
-            held: id == "credential-read",
-            kind,
+        .map(|r| {
+            let path = resolve_fs(r, 0);
+            let logical = match (r.parent(), r.file_name()) {
+                (Some(par), Some(name)) => resolve_fs(par, 0).join(name),
+                _ => path.clone(),
+            };
+            Tree {
+                path,
+                id,
+                read,
+                held: id == "credential-read",
+                kind,
+                logical,
+            }
         })
         .collect()
 }
@@ -1517,7 +1530,13 @@ fn in_trees<'a>(
         }
         match (t.kind, sensitive) {
             (TreeKind::Sensitive, Some(s)) => {
-                (names_dir && real.is_dir()) || s.hit(real, role).is_some()
+                let alias = match real.strip_prefix(&t.path) {
+                    Ok(rest) if !rest.as_os_str().is_empty() => t.logical.join(rest),
+                    _ => t.logical.clone(),
+                };
+                (names_dir && real.is_dir())
+                    || s.hit(real, role).is_some()
+                    || s.hit(&alias, role).is_some()
             }
             _ => true,
         }
@@ -1529,7 +1548,6 @@ enum PruneDirs {
     None,
     GitOnly,
     AckDefault,
-    VcsAndBuild,
 }
 
 fn prune_mode(eff: &[String]) -> PruneDirs {
@@ -1608,8 +1626,8 @@ fn prune_mode(eff: &[String]) -> PruneDirs {
                 PruneDirs::AckDefault
             }
         }
-        "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" | "rgrep" | "find" => PruneDirs::None,
-        _ => PruneDirs::VcsAndBuild,
+        // grep, find and the walkers (tar, cp, rsync, zip, ...) skip nothing
+        _ => PruneDirs::None,
     }
 }
 
@@ -1618,7 +1636,6 @@ fn is_pruned(prune: PruneDirs, name: Option<&str>) -> bool {
         (PruneDirs::None, _) => false,
         (PruneDirs::GitOnly, Some(".git")) => true,
         (PruneDirs::AckDefault, Some(".git" | "node_modules")) => true,
-        (PruneDirs::VcsAndBuild, Some(".git" | "node_modules" | "target")) => true,
         _ => false,
     }
 }
@@ -1640,24 +1657,59 @@ fn links_below<'a>(
     if let Ok(r) = std::fs::canonicalize(root) {
         visited.push(r);
     }
-    let mut stack = vec![(root.to_path_buf(), 0u8)];
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
+    // an error that leaves part of the walk unchecked (not a missing path,
+    // a non-folder or a link loop): Maybe, unless a sure hit turns up
+    let unchecked = |e: &std::io::Error| {
+        !(matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) || e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()))
+    };
+    // The folders a walker reads but a project fills with many entries
+    // (`.git`, `node_modules`, `target`): walked (round 2 finding 3), on a
+    // budget of their own so an ordinary repo still fits.
+    const BULK_BUDGET: usize = 65536;
+    let mut bulk_seen = 0usize;
+    let mut maybe = false;
+    let mut stack = vec![(root.to_path_buf(), 0u8, false)];
+    while let Some((dir, depth, bulk)) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                maybe |= unchecked(&e);
+                continue;
+            }
         };
-        for e in rd.flatten() {
-            let Ok(ft) = e.file_type() else { continue };
+        for e in rd {
+            let Ok(e) = e else {
+                maybe = true;
+                continue;
+            };
+            let Ok(ft) = e.file_type() else {
+                maybe = true;
+                continue;
+            };
             if ft.is_dir() && is_pruned(prune, e.file_name().to_str()) {
                 continue;
             }
-            seen += 1;
-            if seen > BUDGET || depth > MAX_DEPTH {
+            let over = if bulk {
+                bulk_seen += 1;
+                bulk_seen > BULK_BUDGET
+            } else {
+                seen += 1;
+                seen > BUDGET
+            };
+            if over || depth > MAX_DEPTH {
                 return (Reach::Maybe, None);
             }
             let p = e.path();
             if ft.is_symlink() {
-                let Ok(real) = std::fs::canonicalize(&p) else {
-                    continue;
+                let real = match std::fs::canonicalize(&p) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        maybe |= unchecked(&e);
+                        continue;
+                    }
                 };
                 if let Some(t) = in_trees(&real, trees, true, words::Role::Read, sensitive) {
                     return (Reach::Yes, Some(t));
@@ -1665,14 +1717,23 @@ fn links_below<'a>(
                 // a link to a folder elsewhere: walk it too, once
                 if real.is_dir() && !visited.contains(&real) {
                     visited.push(real.clone());
-                    stack.push((real, depth + 1));
+                    stack.push((real, depth + 1, bulk));
                 }
             } else if ft.is_dir() {
-                stack.push((p, depth + 1));
+                let into_bulk = bulk
+                    || matches!(
+                        e.file_name().to_str(),
+                        Some(".git" | "node_modules" | "target")
+                    );
+                stack.push((p, depth + 1, into_bulk));
             }
         }
     }
-    (Reach::No, None)
+    if maybe {
+        (Reach::Maybe, None)
+    } else {
+        (Reach::No, None)
+    }
 }
 
 /// Whether the call reaches a tree through a link from elsewhere (round 8
@@ -1697,7 +1758,10 @@ fn raw_glob_pattern(word: &str, cwd: &Path, home: &Path) -> PathBuf {
             .contains(['*', '?', '[', '{', '}', '$', '`'])
     };
     let Some(first) = comps.iter().position(is_pat) else {
-        return resolve_fs(&abs, 0);
+        // no pattern: callers resolve it with `real_path`, which follows
+        // links before `..` (a lexical resolve here loses a dangling target
+        // such as `dir/../new_key`)
+        return abs;
     };
     let prefix: PathBuf = comps[..first].iter().collect();
     let mut out = if prefix.as_os_str().is_empty() {
@@ -1889,6 +1953,28 @@ fn reaches_tree_through_links<'a>(
                             _ => maybe = true,
                         }
                     }
+                }
+            }
+        }
+        // A literal path the lexical resolver spelled differently from the
+        // filesystem (a dangling link to `dir/../new_key` where `dir` is a
+        // link: round 2 finding 5): check where the filesystem takes it.
+        if !command_word && !u.word.contains(['*', '?', '[', '{', '}', '$', '`']) {
+            let unit_cwds: Vec<&Path> = a
+                .unit_cwd
+                .get(u.unit)
+                .map(|s| s.candidates().into_iter().map(PathBuf::as_path).collect())
+                .filter(|v: &Vec<&Path>| !v.is_empty())
+                .unwrap_or_else(|| vec![cwd]);
+            for uc in &unit_cwds {
+                let w = expand_home(&u.word, home, uc);
+                let raw = uc.join(&w);
+                let real = real_path(&raw);
+                if u.paths.contains(&real) {
+                    continue;
+                }
+                if let Some(t) = in_trees(&real, trees, recursive, u.role, sensitive) {
+                    return (Reach::Yes, Some(t));
                 }
             }
         }
