@@ -976,7 +976,7 @@ fn rework_round2_regressions() {
         &env,
         &[
             ("cat ~/.s[[:alpha:]]h/id_rsa", Want::Hard(CR)),
-            ("cat ~/.[[:punct:]]sh/id_rsa", Want::Hard(CR)),
+            ("cat ~/[[:punct:]]ssh/id_rsa", Want::Hard(CR)),
             ("cat ~/.g[[:alpha:]]upg/secring.gpg", Want::Hard(CR)),
             (
                 "cat ~/.config/[[:alpha:]]cloud/credentials.db",
@@ -991,10 +991,16 @@ fn rework_round2_regressions() {
     );
     check_4_settings(
         &env,
-        &[(
-            "cat ~/.s[[:digit:]]h/id_rsa",
-            ["Ask", "Ask", "Allow", "Allow"],
-        )],
+        &[
+            (
+                "cat ~/.s[[:digit:]]h/id_rsa",
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            (
+                "cat ~/.[[:punct:]]sh/id_rsa",
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+        ],
     );
 
     // Finding 4: `**` leaf exception must cover Atrium data artifacts including WAL, SHM, logs, snapshots.
@@ -1149,4 +1155,75 @@ fn rework_round2_regressions() {
             ],
         );
     }
+}
+
+#[test]
+fn posix_named_classes_match_real_character_sets() {
+    let env = Env::home();
+    // Each row: (class_name, component matching `.ssh`, component NOT matching `.ssh`).
+    // `.ssh` consists of `.` (punct/graph/print), `s`, `s`, `h` (lower/alpha/alnum/word/graph/print).
+    const CLASSES: &[(&str, &str, &str)] = &[
+        ("alpha", ".s[[:alpha:]]h", "[[:alpha:]]ssh"),
+        ("alnum", ".s[[:alnum:]]h", "[[:alnum:]]ssh"),
+        ("lower", ".s[[:lower:]]h", "[[:lower:]]ssh"),
+        ("upper", ".s[![:upper:]]h", ".s[[:upper:]]h"),
+        ("punct", "[[:punct:]]ssh", ".[[:punct:]]sh"),
+        ("print", ".s[[:print:]]h", ".s[![:print:]]h"),
+        ("graph", ".s[[:graph:]]h", ".s[![:graph:]]h"),
+        ("space", ".s[![:space:]]h", ".s[[:space:]]h"),
+        ("digit", ".s[![:digit:]]h", ".s[[:digit:]]h"),
+        ("xdigit", ".s[![:xdigit:]]h", ".s[[:xdigit:]]h"),
+        ("word", ".s[[:word:]]h", "[[:word:]]ssh"),
+        ("blank", ".s[![:blank:]]h", ".s[[:blank:]]h"),
+        ("cntrl", ".s[![:cntrl:]]h", ".s[[:cntrl:]]h"),
+    ];
+
+    for (class_name, matching_comp, non_matching_comp) in CLASSES {
+        let match_cmd = format!("cat ~/{matching_comp}/id_rsa");
+        let v = env.cmd(&match_cmd);
+        assert!(
+            matches!(v, PolicyVerdict::HardDeny { id } if id == CR),
+            "POSIX class {class_name}: expected {match_cmd:?} to HardDeny({CR}), got {}",
+            classify(&v)
+        );
+
+        let non_match_cmd = format!("cat ~/{non_matching_comp}/id_rsa");
+        check_4_settings(&env, &[(&non_match_cmd, ["Ask", "Ask", "Allow", "Allow"])]);
+    }
+
+    // Cross-checks verifying membership boundaries for `.` and `s` and `^` negation.
+    run_table(
+        &env,
+        &[
+            ("cat ~/[[:print:]]ssh/id_rsa", Want::Hard(CR)),
+            ("cat ~/[[:graph:]]ssh/id_rsa", Want::Hard(CR)),
+            ("cat ~/.s[^[:digit:]]h/id_rsa", Want::Hard(CR)),
+            ("cat ~/.[[:xdigit:]]ws/credentials", Want::Hard(CR)),
+        ],
+    );
+    check_4_settings(
+        &env,
+        &[
+            (
+                "cat ~/.s[![:alpha:]]h/id_rsa",
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            (
+                "cat ~/.s[![:alnum:]]h/id_rsa",
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            (
+                "cat ~/.s[![:lower:]]h/id_rsa",
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            (
+                "cat ~/.s[![:word:]]h/id_rsa",
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            (
+                "cat ~/[![:punct:]]ssh/id_rsa",
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+        ],
+    );
 }
