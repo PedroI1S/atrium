@@ -563,8 +563,24 @@ fn folded_deny_hard_denies_and_mixed_paths_match_lowercase() {
         assert_hard_denied_all_settings(folded, pf, id);
     }
 
-    // `LISTERS` folding in `ssh_dir_hit` keeps `LS ~/.ssh` matching `ls ~/.ssh` (non-hard-deny).
-    assert_matches_lowercase("LS ~/.ssh", &["LS"], "ls ~/.ssh", &["ls"]);
+    // `LISTERS` folding in `ssh_dir_hit` keeps `LS ~/.ssh` from being falsely
+    // hard-denied, while `HOME_READONLY_COMMANDS` in `engine.rs` remains
+    // case-sensitive (per CR-19, only `shell.rs` and `deny.rs` fold names; on
+    // Linux `LS` is an unknown command, not `ls`), so Home asks and rule/FullAccess
+    // settings match `ls ~/.ssh` (`Allow`).
+    assert_eq!(eval("LS ~/.ssh", &[], Preset::Home), PolicyVerdict::Ask);
+    assert_eq!(
+        eval("LS ~/.ssh", &[prefix_rule(&["LS"])], Preset::Home),
+        eval("ls ~/.ssh", &[prefix_rule(&["ls"])], Preset::Home)
+    );
+    assert_eq!(
+        eval("LS ~/.ssh", &[any_rule()], Preset::Home),
+        eval("ls ~/.ssh", &[any_rule()], Preset::Home)
+    );
+    assert_eq!(
+        eval("LS ~/.ssh", &[], Preset::FullAccess),
+        eval("ls ~/.ssh", &[], Preset::FullAccess)
+    );
 }
 
 fn assert_ask_all_settings(line: &str, prefix: &[&str]) {
@@ -756,14 +772,31 @@ fn k7_positional_sh_c_resolves_to_payload_verdicts() {
         &["sh"],
     );
 
-    // Finding 4: single-value expansions quote each word so literal `;` inside
-    // data is not reinterpreted as a shell operator (keeps `dev`'s Ask/Allow/Allow/Allow).
-    for ordinary in [
-        "sh -c '$0' 'echo hello ; sudo id'",
-        "sh -c '$@' _ 'echo hello ; sudo id'",
-        "sh -c '\"$1\"' x 'echo hello ; sudo id'",
+    // Quoted `"$1"` / `"$*"` resolves exactly to a single command word (so
+    // `'cat ~/.ssh/id_rsa'` is literally one command name, not `cat` reading
+    // the key), but `deny.rs` `raw_hit` (Contract §9 raw-text check) still
+    // hard-denies any line containing `~/.ssh/id_rsa`, matching `dev`.
+    assert_hard_denied_all_settings(
         "sh -c '\"$1\"' x 'cat ~/.ssh/id_rsa'",
+        &["sh"],
+        "credential-read",
+    );
+    assert_hard_denied_all_settings(
         "bash -c '\"$*\"' x cat ~/.ssh/id_rsa",
+        &["bash"],
+        "credential-read",
+    );
+
+    // Finding 4: single-value expansions quote each word so literal `;` and
+    // spaces inside data are not reinterpreted as shell operators or word
+    // splits (keeps `dev`'s Ask/Allow/Allow/Allow).
+    for (ordinary, prefix) in [
+        ("sh -c '$0' 'echo hello ; sudo id'", &["sh"][..]),
+        ("sh -c '$@' _ 'echo hello ; sudo id'", &["sh"][..]),
+        ("sh -c '\"$1\"' x 'echo hello ; sudo id'", &["sh"][..]),
+        ("sh -c '\"$1\"' x 'sudo id'", &["sh"][..]),
+        ("sh -c '\"$1\"' x 'cat .ssh/id_rsa'", &["sh"][..]),
+        ("bash -c '\"$*\"' x sudo id", &["bash"][..]),
     ] {
         assert_eq!(
             eval(ordinary, &[], Preset::Home),
@@ -771,11 +804,11 @@ fn k7_positional_sh_c_resolves_to_payload_verdicts() {
             "Home: {ordinary}"
         );
         assert_eq!(
-            eval(ordinary, &[prefix_rule(&["sh"])], Preset::Home),
+            eval(ordinary, &[prefix_rule(prefix)], Preset::Home),
             PolicyVerdict::Allow {
                 rule: Some(RuleId("r-prefix".into()))
             },
-            "Prefix(sh): {ordinary}"
+            "Prefix: {ordinary}"
         );
         assert_eq!(
             eval(ordinary, &[any_rule()], Preset::Home),
