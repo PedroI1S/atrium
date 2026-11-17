@@ -799,3 +799,6 @@ M1-32-link-globs had two Hydrogen `high` fix rounds after the Codex review round
 
 ## D-128 — 2026-11-17 — M1-31 escalates to Opus 5.5 (orchestrator, under PLAN §8.3)
 M1-31-credential-folder-search went through four Hydrogen `high` rework rounds. K10's cost bound still fails (`k10_400…`: the work budget doesn't stop the work), and N11's fuzz timing improved but still fails (97 s, against 60 s). The rounds don't converge, so the model escalates: **an Opus 5.5 worker** continues on the same branch. The review stays with Codex. Same reasoning as D-127; the driver can overturn it.
+
+## D-129 — 2026-11-17 — M1-29 escalates to Opus 5.5 (orchestrator, under PLAN §8.3)
+M1-29-cr17-stores went through five Hydrogen `high` rounds and two Codex reviews (both rework). Rework 5 then regressed two existing tests in `adversarial_m1_18.rs` (`cr_12_through_links_asks_in_home`, `k2_links_at_any_hop…`). The rounds don't converge, so **an Opus 5.5 worker** continues on the same branch. The review stays with Codex. Same reasoning as D-127 and D-128.
