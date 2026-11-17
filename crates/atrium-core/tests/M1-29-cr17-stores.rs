@@ -1634,3 +1634,22 @@ fn round5_finding6_exact_git_safe_config_allow() {
         "Ask"
     );
 }
+
+/// D-129: a stdin name after the script (`python3 x.py -`) is refused, as on
+/// dev's editor; the Rust check and the editor agree.
+#[test]
+fn escalation_stdin_name_after_script_is_refused() {
+    use atrium_core::policy::command_allow_risk;
+    let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+    for c in [
+        "python3 x.py -",
+        "python3 x.py /dev/./stdin",
+        "node x.js /dev/fd/0",
+    ] {
+        assert!(command_allow_risk(&argv(c), true).is_err(), "{c}");
+        assert!(command_allow_risk(&argv(c), false).is_err(), "{c}");
+    }
+    for c in ["python3 x.py --flag", "python3 scripts/build.py"] {
+        assert!(command_allow_risk(&argv(c), true).is_ok(), "{c}");
+    }
+}

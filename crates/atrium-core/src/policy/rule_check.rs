@@ -535,6 +535,14 @@ fn check_interpreter_risk(
         }
     }
 
+    // Fail closed, as the editor does: a stdin name anywhere (`python3 x.py -`)
+    // may be read as code.
+    if let Some(w) = args.iter().find(|w| is_stdin_script_path(w)) {
+        return Err(format!(
+            "an allow rule can't allow `{name} {w}`: it reads code from standard input"
+        ));
+    }
+
     // Identify the script / module operand while consuming known option values
     // and failing closed on unknown options before the script.
     let is_python = name.starts_with("python");

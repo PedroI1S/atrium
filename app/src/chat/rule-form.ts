@@ -450,6 +450,9 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
         if (short !== "" && [...lw.slice(1)].some((c) => short.includes(c))) return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line (${w} holds a code flag), and Atrium wouldn't check it.` };
       }
     }
+    // Fail closed, as on dev: a stdin name anywhere (`python3 x.py -`) may be read as code.
+    const stdinArg = args.find((w) => isStdinPath(w));
+    if (stdinArg !== undefined) return { refuse: `A rule can't allow ${name} ${stdinArg}: it runs code read from its input, and Atrium wouldn't check it.` };
     const refuseNoScript = (): CommandRisk => ({ refuse: `A rule can't allow ${argv.slice(0, 1).join(" ")} without the script it runs: without one, ${name} reads code from its input. ${NAME_A_SCRIPT}` });
     const isPython = key === "python";
     let verbSeen = false;

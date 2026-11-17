@@ -192,3 +192,22 @@ git diff a3b2a60 --stat
   - `cargo check -p atrium-core --tests` — passed (exit 0, 0 warnings)
   - `cargo check -p atrium-daemon --tests` — passed (exit 0, 0 warnings)
   - Under D-123, `cargo test`, `cargo clippy`, and `pnpm` were not run here; the verification task should run the DoD commands listed above (including `pnpm --dir app typecheck` and `pnpm --dir app test`).
+
+## Escalation (Opus, D-129)
+
+Round-2 findings and the tests that pin them (reviewer's exact cases):
+- F1 [major] path filtering (sed script output, bare git pathspec): `M1-29-cr17-stores.rs::round5_finding1_path_filtering_retains_script_and_git_pathspec_operands`.
+- F2 [major] pwsh option value as a fake script: `round5_finding2_pwsh_option_values_and_inline_code`; daemon refusal in `crates/atrium-daemon/tests/create_rule.rs` (`pwsh -WorkingDirectory work.ps1`); editor parity in `rule-form.test.ts` "rework round 5 parity".
+- F3 [major] `/dev/./stdin` and other stdin spellings: `round5_finding3_stdin_alias_normalization`; editor parity in `rule-form.test.ts`.
+- F4 [minor] Read Allow rule on a hard-linked CR-17 store: `round5_finding4_gate_hardlink_remembered_rule` (SessionGate, `Read ["proj/tf_hard"]` -> Allow; unknown hard link -> Ask).
+- F5 [minor] editor `python3 -W ignore`: `rule-form.test.ts` "rework round 5 parity" (refused, matching `create_rule.rs`).
+- F6 [minor] §9 exact git `-c` wording: contract §9 now states the safe-`-c` exact exception; `round5_finding6_exact_git_safe_config_allow`, `create_rule.rs`, `rule-form.test.ts` finding 6.
+- F7 [minor] malformed/unknown thread scope: `create_rule.rs` (empty, blank and unknown thread ids -> Invalid, rule count unchanged; an existing thread succeeds).
+
+The two regressions (`adversarial_m1_18::cr_12_through_links_asks_in_home`, `k2_links_at_any_hop_unexpanded_globs_and_following_walkers`): rework 5's F4 fix in `gate.rs` exempted known ask-store hard links whenever a rule allowed the call, for commands and inside glob/tree walks too, so `cat asks2/hl` and `find -L clean -name '*.rs'` (glob over Home, which holds the hard-linked `.pgpass`) went to Allow under an Execute Any rule. Fixed (`74f3e94`): the exemption applies only to a file tool (`ToolSubject::Paths`) naming the alias literally (not a glob); shell commands and the glob/recursive walks keep `dev`'s ask. `round5_finding4` was adjusted accordingly: `cat proj/tf_hard` under an Execute Any rule now asserts Ask (it asserted Allow, contradicting dev's test). Note: `gate.rs` is outside the brief's owned paths (rework 5 touched it to close F4); the driver should record this.
+
+Known failures not ours: `fix4_finding3_glob_escape_total_variant_cap_performance` fails alone here also with `dev`'s policy sources (155-326 ms vs 50 ms, debug build); `fix2` fails only under load.
+
+Also fixed in the escalation: rework 5's editor parity change dropped dev's refusal of a stdin name after the script (`rule-form.test.ts` "fails closed (round 3, blocker 1)", `python3 x.py -`). The editor and `rule_check.rs` now both refuse a stdin name anywhere in an interpreter's arguments; pinned by `escalation_stdin_name_after_script_is_refused` and the existing editor test.
+
+Other failures seen here and checked: `socket::replay_then_live_delivers_every_event_once_and_in_order` and `a_reader_that_stops_lags_alone` fail alone with `dev`'s policy and `commands.rs` too (not ours). `requests_notifications` and `markdown.test.ts` "pathological emphasis" failed only under the full parallel load and pass alone.
