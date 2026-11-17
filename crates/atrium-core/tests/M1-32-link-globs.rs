@@ -662,10 +662,7 @@ fn rework2_finding4_unreadable_dir_in_following_search_fails_closed() {
     if std::fs::read_dir(&closed).is_ok() {
         return; // running as root: the folder is readable
     }
-    assert_eq!(
-        eval_cmd_3(&t, "grep -R secret proj"),
-        ["Ask", "Ask", "Ask"]
-    );
+    assert_eq!(eval_cmd_3(&t, "grep -R secret proj"), ["Ask", "Ask", "Ask"]);
 }
 
 #[test]
