@@ -207,6 +207,11 @@ fn scan_paren_n(chars: &[char], start: usize, n: u16) -> (String, usize, bool) {
     while i < chars.len() {
         match chars[i] {
             '\\' => i += 1,
+            '$' if chars.get(i + 1) == Some(&'\'') => {
+                let res = super::words::decode_ansi_c(chars, i + 1);
+                i = res.next_index;
+                continue;
+            }
             '\'' => {
                 i += 1;
                 while i < chars.len() && chars[i] != '\'' {
@@ -382,6 +387,13 @@ fn scan_dollar_brace_n(chars: &[char], start: usize, in_dq: bool, n: u16) -> (St
                 }
                 j = end;
             }
+            '$' if !in_dq && chars.get(j + 1) == Some(&'\'') => {
+                let res = super::words::decode_ansi_c(chars, j + 1);
+                if !res.closed {
+                    return unclosed();
+                }
+                j = res.next_index;
+            }
             '\'' if !in_dq => {
                 j += 1;
                 while j < chars.len() && chars[j] != '\'' {
@@ -467,6 +479,87 @@ fn lex_depth_fresh(line: &str, depth: u8, cache: &mut LexCache) -> Lexed {
     let mut l = (*lex_depth_cached(line, depth, cache)).clone();
     refresh_ids(&mut l);
     l
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_double_quoted(
+    chars: &[char],
+    mut i: usize,
+    word: &mut String,
+    cur: &mut Builder,
+    expansion: &mut bool,
+    tails: &mut Vec<String>,
+    reasons: &mut Vec<String>,
+) -> usize {
+    let mut closed = false;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => {
+                closed = true;
+                i += 1;
+                break;
+            }
+            '\\' if matches!(chars.get(i + 1), Some('$' | '`' | '"' | '\\' | '\n')) => {
+                if chars[i + 1] != '\n' {
+                    word.push(chars[i + 1]);
+                }
+                i += 2;
+            }
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                let (body, end, ok) = scan_paren(chars, i + 2);
+                if !ok {
+                    reasons.push("unterminated substitution".into());
+                }
+                word.push_str("$(");
+                word.push_str(&body);
+                word.push(')');
+                cur.subs.push(body);
+                *expansion = true;
+                i = end;
+            }
+            '`' => {
+                let (body, end, ok) = scan_backtick(chars, i + 1);
+                if !ok {
+                    reasons.push("unterminated substitution".into());
+                }
+                word.push('`');
+                word.push_str(&body);
+                word.push('`');
+                cur.subs.push(body);
+                *expansion = true;
+                i = end;
+            }
+            '$' if chars.get(i + 1) == Some(&'{') => {
+                // `"${x:-"'"}"`: the inner quotes belong to
+                // the expansion (round 5 blocker 2)
+                let (body, j, closed) = scan_dollar_brace(chars, i + 2, true);
+                if !closed {
+                    ambiguous_tail(chars, i + 2, tails);
+                }
+                word.push_str("${");
+                word.push_str(&body);
+                word.push('}');
+                for sub in find_substitutions(&body) {
+                    cur.subs.push(sub);
+                }
+                *expansion = true;
+                i = (j + 1).min(chars.len());
+            }
+            '$' => {
+                *expansion = true;
+                word.push('$');
+                i += 1;
+            }
+            ch => {
+                word.push(ch);
+                i += 1;
+            }
+        }
+    }
+    if !closed {
+        reasons.push("unterminated quote".into());
+    }
+    i
 }
 
 fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache) -> Lexed {
@@ -791,80 +884,16 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
                     }
                 }
                 '"' => {
-                    i += 1;
                     quoted_prefix_empty = false;
-                    let mut closed = false;
-                    while i < chars.len() {
-                        match chars[i] {
-                            '"' => {
-                                closed = true;
-                                i += 1;
-                                break;
-                            }
-                            '\\' if matches!(
-                                chars.get(i + 1),
-                                Some('$' | '`' | '"' | '\\' | '\n')
-                            ) =>
-                            {
-                                if chars[i + 1] != '\n' {
-                                    word.push(chars[i + 1]);
-                                }
-                                i += 2;
-                            }
-                            '$' if chars.get(i + 1) == Some(&'(') => {
-                                let (body, end, ok) = scan_paren(&chars, i + 2);
-                                if !ok {
-                                    out.reasons.push("unterminated substitution".into());
-                                }
-                                word.push_str("$(");
-                                word.push_str(&body);
-                                word.push(')');
-                                cur.subs.push(body);
-                                expansion = true;
-                                i = end;
-                            }
-                            '`' => {
-                                let (body, end, ok) = scan_backtick(&chars, i + 1);
-                                if !ok {
-                                    out.reasons.push("unterminated substitution".into());
-                                }
-                                word.push('`');
-                                word.push_str(&body);
-                                word.push('`');
-                                cur.subs.push(body);
-                                expansion = true;
-                                i = end;
-                            }
-                            '$' if chars.get(i + 1) == Some(&'{') => {
-                                // `"${x:-"'"}"`: the inner quotes belong to
-                                // the expansion (round 5 blocker 2)
-                                let (body, j, closed) = scan_dollar_brace(&chars, i + 2, true);
-                                if !closed {
-                                    ambiguous_tail(&chars, i + 2, &mut tails);
-                                }
-                                word.push_str("${");
-                                word.push_str(&body);
-                                word.push('}');
-                                for sub in find_substitutions(&body) {
-                                    cur.subs.push(sub);
-                                }
-                                expansion = true;
-                                i = (j + 1).min(chars.len());
-                            }
-                            '$' => {
-                                expansion = true;
-                                word.push('$');
-                                i += 1;
-                            }
-                            ch => {
-                                word.push(ch);
-                                i += 1;
-                            }
-                        }
-                    }
-                    if !closed {
-                        out.reasons.push("unterminated quote".into());
-                    }
+                    i = read_double_quoted(
+                        &chars,
+                        i + 1,
+                        &mut word,
+                        &mut cur,
+                        &mut expansion,
+                        &mut tails,
+                        &mut out.reasons,
+                    );
                 }
                 '$' => {
                     expansion = true;
@@ -899,6 +928,19 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
                         if res.bad_escape {
                             out.reasons.push("malformed escape".into());
                         }
+                    } else if chars.get(i + 1) == Some(&'"') {
+                        // Locale-translated double quotes `$"…"`: parsed like `"…"`,
+                        // keeping `expansion = true` so unknown translation fails closed.
+                        quoted_prefix_empty = false;
+                        i = read_double_quoted(
+                            &chars,
+                            i + 2,
+                            &mut word,
+                            &mut cur,
+                            &mut expansion,
+                            &mut tails,
+                            &mut out.reasons,
+                        );
                     } else if chars.get(i + 1) == Some(&'{') {
                         let (body, j, closed) = scan_dollar_brace(&chars, i + 2, false);
                         if !closed {

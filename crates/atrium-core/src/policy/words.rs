@@ -5,8 +5,6 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use globset::GlobBuilder;
-
 use super::RedirectOp;
 use super::shell::{Compound, Join, Unit, base};
 
@@ -55,20 +53,32 @@ pub(super) fn decode_ansi_c(chars: &[char], quote_idx: usize) -> AnsiCDecode {
                        saw_nul: &mut bool,
                        control_char: &mut bool,
                        bad_escape: &mut bool| {
-        if pending.is_empty() {
-            return;
-        }
-        match std::str::from_utf8(pending) {
-            Ok(s) => {
-                for ch in s.chars() {
-                    push_char(ch, out, saw_nul, control_char);
+        while !pending.is_empty() {
+            match std::str::from_utf8(pending) {
+                Ok(s) => {
+                    for ch in s.chars() {
+                        push_char(ch, out, saw_nul, control_char);
+                    }
+                    pending.clear();
+                }
+                Err(err) => {
+                    let valid_up_to = err.valid_up_to();
+                    if valid_up_to > 0
+                        && let Ok(s) = std::str::from_utf8(&pending[..valid_up_to])
+                    {
+                        for ch in s.chars() {
+                            push_char(ch, out, saw_nul, control_char);
+                        }
+                    }
+                    *bad_escape = true;
+                    // Preserve word identity: never discard invalid bytes so
+                    // `$'\xff.aws/credentials'` cannot collapse to `.aws/credentials`.
+                    push_char('\u{FFFD}', out, saw_nul, control_char);
+                    let skip = err.error_len().unwrap_or(pending.len() - valid_up_to);
+                    pending.drain(..valid_up_to + skip);
                 }
             }
-            Err(_) => {
-                *bad_escape = true;
-            }
         }
-        pending.clear();
     };
 
     while i < chars.len() {
@@ -81,7 +91,15 @@ pub(super) fn decode_ansi_c(chars: &[char], quote_idx: usize) -> AnsiCDecode {
             '\\' => {
                 i += 1;
                 let Some(&esc) = chars.get(i) else {
+                    flush_bytes(
+                        &mut pending_bytes,
+                        &mut out,
+                        &mut saw_nul,
+                        &mut control_char,
+                        &mut bad_escape,
+                    );
                     bad_escape = true;
+                    push_char('\\', &mut out, &mut saw_nul, &mut control_char);
                     break;
                 };
                 match esc {
@@ -211,6 +229,7 @@ pub(super) fn decode_ansi_c(chars: &[char], quote_idx: usize) -> AnsiCDecode {
                             push_char(ch, &mut out, &mut saw_nul, &mut control_char);
                         } else {
                             bad_escape = true;
+                            push_char('\u{FFFD}', &mut out, &mut saw_nul, &mut control_char);
                         }
                     }
                     'c' => {
@@ -225,9 +244,12 @@ pub(super) fn decode_ansi_c(chars: &[char], quote_idx: usize) -> AnsiCDecode {
                         match chars.get(i).copied() {
                             None => {
                                 bad_escape = true;
+                                push_char('\\', &mut out, &mut saw_nul, &mut control_char);
+                                push_char('c', &mut out, &mut saw_nul, &mut control_char);
                             }
                             Some('\'') => {
                                 bad_escape = true;
+                                push_char('\u{FFFD}', &mut out, &mut saw_nul, &mut control_char);
                                 closed = true;
                                 i += 1;
                                 break;
@@ -251,6 +273,7 @@ pub(super) fn decode_ansi_c(chars: &[char], quote_idx: usize) -> AnsiCDecode {
                             Some(_) => {
                                 i += 1;
                                 bad_escape = true;
+                                push_char('\u{FFFD}', &mut out, &mut saw_nul, &mut control_char);
                             }
                         }
                     }
@@ -874,59 +897,24 @@ enum Cd {
 /// lead to them; a `cd <glob>` that can match any of them includes them in
 /// `Cd::Lost` so subsequent commands are checked against those directories.
 const SENSITIVE_CD_DIRS: &[&str] = &[
-    ".ssh",
     ".aws",
     ".aws/sso",
-    ".aws/sso/cache",
     ".docker",
     ".kube",
     ".config",
     ".config/gh",
-    ".config/gcloud",
     ".config/git",
     ".config/fish",
-    ".config/atrium",
-    ".config/google-chrome",
-    ".config/google-chrome/default",
-    ".config/chromium",
-    ".config/chromium/default",
-    ".config/bravesoftware",
-    ".config/bravesoftware/default",
-    ".config/microsoft-edge",
-    ".config/microsoft-edge/default",
-    ".config/vivaldi",
-    ".config/vivaldi/default",
-    ".mozilla",
     ".claude",
     ".codex",
-    ".gnupg",
-    ".gnupg/private-keys-v1.d",
-    ".gemini",
     ".cargo",
     ".azure",
-    ".zsh_sessions",
-    ".bash_sessions",
     ".local",
     ".local/share",
-    ".local/share/atrium",
     ".local/share/fish",
     "Library",
-    "Library/Keychains",
-    "Library/Cookies",
     "Library/Application Support",
     "Library/Application Support/Google",
-    "Library/Application Support/Google/Chrome",
-    "Library/Application Support/Google/Chrome/Default",
-    "Library/Application Support/Chromium",
-    "Library/Application Support/Chromium/Default",
-    "Library/Application Support/Microsoft Edge",
-    "Library/Application Support/Microsoft Edge/Default",
-    "Library/Application Support/BraveSoftware",
-    "Library/Application Support/BraveSoftware/Default",
-    "Library/Application Support/Firefox",
-    "Library/Application Support/Arc",
-    "Library/Application Support/Vivaldi",
-    "Library/Application Support/Vivaldi/Default",
 ];
 
 /// Credential and Atrium trees where any subdirectory inside them is sensitive.
@@ -941,6 +929,20 @@ const SENSITIVE_CD_TREES: &[&str] = &[
     ".aws/sso/cache",
     ".zsh_sessions",
     ".bash_sessions",
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Chromium",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/BraveSoftware",
+    "Library/Application Support/Firefox",
+    "Library/Application Support/Arc",
+    "Library/Application Support/Vivaldi",
+    "Library/Cookies",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/bravesoftware",
+    ".config/microsoft-edge",
+    ".config/vivaldi",
+    ".mozilla",
 ];
 
 const MAX_CD_GLOB_VARIANTS: usize = 16;
@@ -1013,52 +1015,233 @@ fn normalize_cd_glob(pat: &str) -> Vec<Vec<String>> {
     states
 }
 
+enum BracketItem {
+    Char(char),
+    Range(char, char),
+    Posix(String),
+    Wildcard,
+}
+
+/// Parses a bash bracket expression `[...]` starting at `start` (`p[start] == '['`).
+/// Supports `[!...]`/`[^...]`, leading `]`, ranges `a-z`, POSIX named classes
+/// `[:lower:]` etc., and collating/equivalence classes `[.x.]`/`[=x=]`.
+fn parse_bracket(p: &[char], start: usize) -> Option<(usize, bool, Vec<BracketItem>)> {
+    let mut i = start + 1;
+    if i >= p.len() {
+        return None;
+    }
+    let negated = matches!(p.get(i), Some('!' | '^'));
+    if negated {
+        i += 1;
+    }
+    let mut items = Vec::new();
+    if p.get(i) == Some(&']') {
+        items.push(BracketItem::Char(']'));
+        i += 1;
+    }
+    while i < p.len() {
+        if p[i] == ']' {
+            return Some((i + 1, negated, items));
+        }
+        if p[i] == '[' && matches!(p.get(i + 1), Some(':' | '.' | '=')) {
+            let delim = p[i + 1];
+            if let Some(rel_end) = p[i + 2..]
+                .windows(2)
+                .position(|w| w[0] == delim && w[1] == ']')
+            {
+                let end = i + 2 + rel_end;
+                if delim == ':' {
+                    let name: String = p[i + 2..end].iter().collect();
+                    items.push(BracketItem::Posix(name));
+                } else {
+                    items.push(BracketItem::Wildcard);
+                }
+                i = end + 2;
+                continue;
+            }
+        }
+        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+            items.push(BracketItem::Range(p[i], p[i + 2]));
+            i += 3;
+        } else {
+            items.push(BracketItem::Char(p[i]));
+            i += 1;
+        }
+    }
+    None
+}
+
+fn posix_class_matches(name: &str, ch: char) -> Option<bool> {
+    Some(match name {
+        "alnum" => ch.is_ascii_alphanumeric(),
+        // `cd` matching is case-insensitive, so `[:lower:]` and `[:upper:]` match either case.
+        "alpha" | "lower" | "upper" => ch.is_ascii_alphabetic(),
+        "ascii" => ch.is_ascii(),
+        "blank" => matches!(ch, ' ' | '\t'),
+        "cntrl" => ch.is_ascii_control(),
+        "digit" => ch.is_ascii_digit(),
+        "graph" => ch.is_ascii_graphic(),
+        "print" => ch.is_ascii_graphic() || ch == ' ',
+        "punct" => ch.is_ascii_punctuation(),
+        "space" => ch.is_ascii_whitespace(),
+        "word" => ch.is_ascii_alphanumeric() || ch == '_',
+        "xdigit" => ch.is_ascii_hexdigit(),
+        _ => return None,
+    })
+}
+
+fn bracket_matches_char(negated: bool, items: &[BracketItem], ch: char) -> bool {
+    let ch_l = ch.to_ascii_lowercase();
+    let ch_u = ch.to_ascii_uppercase();
+    let mut matched = false;
+    for item in items {
+        let hit = match item {
+            BracketItem::Char(c) => c.to_ascii_lowercase() == ch_l,
+            BracketItem::Range(lo, hi) => {
+                (*lo..=*hi).contains(&ch)
+                    || (lo.to_ascii_lowercase()..=hi.to_ascii_lowercase()).contains(&ch_l)
+                    || (lo.to_ascii_uppercase()..=hi.to_ascii_uppercase()).contains(&ch_u)
+            }
+            BracketItem::Posix(name) => match posix_class_matches(name, ch) {
+                Some(b) => b,
+                None => return true,
+            },
+            BracketItem::Wildcard => return true,
+        };
+        if hit {
+            matched = true;
+            break;
+        }
+    }
+    if negated { !matched } else { matched }
+}
+
 fn leading_class_matches_dot(p: &str) -> bool {
-    let Some(rest) = p.strip_prefix('[') else {
+    let cs: Vec<char> = p.chars().collect();
+    if cs.first() != Some(&'[') {
+        return false;
+    }
+    let Some((_, negated, items)) = parse_bracket(&cs, 0) else {
         return false;
     };
-    if rest.starts_with(['!', '^']) {
+    if negated {
         return false;
     }
-    let mut chars = rest.char_indices();
-    if rest.starts_with(']') {
-        // `[]...` puts `]` first in the class.
-        let _ = chars.next();
-    }
-    let mut prev_esc = false;
-    for (idx, ch) in chars {
-        if prev_esc {
-            prev_esc = false;
-            continue;
-        }
-        if ch == '\\' {
-            prev_esc = true;
-            continue;
-        }
-        if ch == ']' {
-            let class = &p[..=idx + 1];
-            return GlobBuilder::new(class)
-                .literal_separator(true)
-                .build()
-                .is_ok_and(|g| g.compile_matcher().is_match("."));
-        }
-    }
-    false
+    bracket_matches_char(false, &items, '.')
 }
 
 fn cd_comp_matches(pat: &str, cand: &str) -> bool {
     if cand.starts_with('.') && !(pat.starts_with('.') || leading_class_matches_dot(pat)) {
         return false;
     }
-    GlobBuilder::new(pat)
-        .literal_separator(true)
-        .case_insensitive(true)
-        .build()
-        .is_ok_and(|g| g.compile_matcher().is_match(cand))
+    let p: Vec<char> = pat.chars().collect();
+    let c: Vec<char> = cand.chars().collect();
+    let mut dp = vec![false; c.len() + 1];
+    dp[0] = true;
+    let mut pi = 0;
+    while pi < p.len() {
+        match p[pi] {
+            '*' => {
+                for ci in 1..=c.len() {
+                    dp[ci] |= dp[ci - 1];
+                }
+                pi += 1;
+            }
+            '?' => {
+                for ci in (1..=c.len()).rev() {
+                    dp[ci] = dp[ci - 1];
+                }
+                dp[0] = false;
+                pi += 1;
+            }
+            '[' => {
+                if let Some((next_pi, negated, items)) = parse_bracket(&p, pi) {
+                    for ci in (1..=c.len()).rev() {
+                        dp[ci] = dp[ci - 1] && bracket_matches_char(negated, &items, c[ci - 1]);
+                    }
+                    dp[0] = false;
+                    pi = next_pi;
+                } else {
+                    for ci in (1..=c.len()).rev() {
+                        dp[ci] = dp[ci - 1] && c[ci - 1] == '[';
+                    }
+                    dp[0] = false;
+                    pi += 1;
+                }
+            }
+            ch => {
+                let ch_l = ch.to_ascii_lowercase();
+                for ci in (1..=c.len()).rev() {
+                    dp[ci] = dp[ci - 1] && c[ci - 1].to_ascii_lowercase() == ch_l;
+                }
+                dp[0] = false;
+                pi += 1;
+            }
+        }
+    }
+    dp[c.len()]
 }
 
 fn cd_comps_match(pat: &[String], cand: &[&str]) -> bool {
     pat.len() == cand.len() && pat.iter().zip(cand).all(|(p, c)| cd_comp_matches(p, c))
+}
+
+fn cd_comps_match_globstar(pat: &[String], cand: &[&str]) -> bool {
+    let mut dp = vec![false; cand.len() + 1];
+    dp[0] = true;
+    for p in pat {
+        if p == "**" {
+            for j in 1..=cand.len() {
+                if !cand[j - 1].starts_with('.') {
+                    dp[j] |= dp[j - 1];
+                }
+            }
+        } else {
+            for j in (1..=cand.len()).rev() {
+                dp[j] = dp[j - 1] && cd_comp_matches(p, cand[j - 1]);
+            }
+            dp[0] = false;
+        }
+    }
+    dp[cand.len()]
+}
+
+fn push_tree_tail(base: &str, tail: &[String], push_target: &mut impl FnMut(String)) {
+    if tail.is_empty() {
+        push_target(base.to_string());
+        return;
+    }
+    let concretize_comp = |c: &str| -> String {
+        if c.contains(['*', '?', '[']) {
+            "x".to_string()
+        } else {
+            c.to_string()
+        }
+    };
+    if let Some(first_gs) = tail.iter().position(|c| c == "**") {
+        let pre: Vec<String> = tail[..first_gs]
+            .iter()
+            .map(|c| concretize_comp(c))
+            .collect();
+        let post: Vec<String> = tail[first_gs + 1..]
+            .iter()
+            .filter(|c| c.as_str() != "**")
+            .map(|c| concretize_comp(c))
+            .collect();
+        for depth in 0..=3 {
+            let mut comps = pre.clone();
+            comps.extend(std::iter::repeat_n("x".to_string(), depth));
+            comps.extend(post.iter().cloned());
+            if comps.is_empty() {
+                push_target(base.to_string());
+            } else {
+                push_target(format!("{base}/{}", comps.join("/")));
+            }
+        }
+    } else {
+        let comps: Vec<String> = tail.iter().map(|c| concretize_comp(c)).collect();
+        push_target(format!("{base}/{}", comps.join("/")));
+    }
 }
 
 fn cd_glob_matches(
@@ -1109,19 +1292,13 @@ fn cd_glob_matches(
 
     let matches_variant = |var: &[String], target_comps: &[&str]| -> bool {
         if var.iter().any(|c| c == "**") {
-            let pat_str = format!("/{}", var.join("/"));
-            let cand_str = format!("/{}", target_comps.join("/"));
-            GlobBuilder::new(&pat_str)
-                .literal_separator(true)
-                .case_insensitive(true)
-                .build()
-                .is_ok_and(|g| g.compile_matcher().is_match(&cand_str))
+            cd_comps_match_globstar(var, target_comps)
         } else {
             cd_comps_match(var, target_comps)
         }
     };
 
-    for rel in SENSITIVE_CD_DIRS {
+    for rel in SENSITIVE_CD_DIRS.iter().chain(SENSITIVE_CD_TREES.iter()) {
         let mut target: Vec<&str> = home_comps.iter().map(String::as_str).collect();
         target.extend(rel.split('/'));
         if variants.iter().any(|v| matches_variant(v, &target)) {
@@ -1131,17 +1308,37 @@ fn cd_glob_matches(
     for tree in SENSITIVE_CD_TREES {
         let mut target: Vec<&str> = home_comps.iter().map(String::as_str).collect();
         target.extend(tree.split('/'));
-        if variants.iter().any(|v| {
-            v.len() > target.len()
-                && !v.iter().any(|c| c == "**")
-                && cd_comps_match(&v[..target.len()], &target)
-        }) {
-            push_target(format!("{home_trimmed}/{tree}/x"));
+        let tree_base = format!("{home_trimmed}/{tree}");
+        for v in &variants {
+            if v.iter().any(|c| c == "**") {
+                for k in 1..=v.len() {
+                    if cd_comps_match_globstar(&v[..k], &target) {
+                        push_tree_tail(&tree_base, &v[k..], &mut push_target);
+                    }
+                }
+            } else if v.len() > target.len() && cd_comps_match(&v[..target.len()], &target) {
+                push_tree_tail(&tree_base, &v[target.len()..], &mut push_target);
+            }
         }
     }
     let app_comps = ["Applications", "Atrium.app"];
-    if variants.iter().any(|v| matches_variant(v, &app_comps)) {
-        push_target("/Applications/Atrium.app".to_string());
+    for v in &variants {
+        if matches_variant(v, &app_comps) {
+            push_target("/Applications/Atrium.app".to_string());
+        }
+        if v.iter().any(|c| c == "**") {
+            for k in 1..=v.len() {
+                if cd_comps_match_globstar(&v[..k], &app_comps) {
+                    push_tree_tail("/Applications/Atrium.app", &v[k..], &mut push_target);
+                }
+            }
+        } else if v.len() > app_comps.len() && cd_comps_match(&v[..app_comps.len()], &app_comps) {
+            push_tree_tail(
+                "/Applications/Atrium.app",
+                &v[app_comps.len()..],
+                &mut push_target,
+            );
+        }
     }
 
     matched
