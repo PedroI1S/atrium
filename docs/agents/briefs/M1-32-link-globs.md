@@ -38,3 +38,8 @@ Two symlink items, in the same code:
 
 ## Scope change (D-125, rodrigo, 2026-11-16)
 K5 is closed as correct behaviour: the hard deny stays. This task's scope is S11 only.
+
+## Added scope (D-120, orchestrator, 2026-11-17)
+The Opus escalation left two items outside the owned range, and a review would flag them. The owned paths widen to:
+- `gate.rs` `resolve_fs` (~84): resolve links in order before `..`, as the owned range now does;
+- `alias_fix`: match hard-linked credentials by identity for glob matches too, not only for directly named paths.
