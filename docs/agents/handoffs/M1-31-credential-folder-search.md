@@ -269,3 +269,41 @@ Per the N11 brief instruction (*"If the time is outside your paths, name the fun
 - `cargo fmt --all --check`: clean.
 - `cargo clippy -p atrium-core --all-targets -- -D warnings`: clean.
 - `cargo test -p atrium-core`: every verdict test passes, including N9 `round_5_blocker_1`. The only failures are the timing tests listed above.
+
+---
+
+## Escalation round 2 (the rest of N11)
+
+Code change: commit `4395d62`.
+
+### Changes
+- **`words::brace_expand` (`words.rs`).** Words without `{` return at once. A new `brace_results_lower_bound` does one linear pass that pairs braces exactly as `brace_expand` does. It takes the product of the comma counts of the top-level brace groups that hold no other group and have no `$` before them; every such group picks a word independently in every result. When the product is over `MAX_BRACE_RESULTS`, it returns `None`, the same answer the full expansion gave, without expanding. A fail-closed budget, `MAX_BRACE_WORK` (2 M characters scanned), bounds every other shape: past it the word counts as too large, as past `MAX_BRACE_RESULTS`.
+- **`Sensitive::new` → `Sensitive::shared` (`deny.rs`).**
+  - Built once per evaluate: `Analysis::sensitive: Rc<Sensitive>`, used by `analyze_with`, `hard_deny`'s `Ctx` and the engine's `Home` (`Ctx::s` and `Home::s` are now `&Sensitive`). The unused `deny::sensitive` was removed.
+  - Also reused across evaluates on one thread while home and Atrium's data and protected paths stay equal (a one-entry thread-local cache, keyed on those paths).
+- **`shell::lex` (`shell.rs`).** A thread-local memo of the last 4 top-level lexes. A hit is cloned and gets fresh ids through `refresh_ids`, the same way `lex_depth_fresh` already serves cached sub-lexes. One fuzz iteration lexes the same line four times (three evaluates and `parse_command`); it now lexes it once.
+- **`Ctx::might_glob_hit_probe` (`deny.rs`, owned range).**
+  - Single-char `has_any` scans replace the multi-char `contains([...])` calls.
+  - Browser-store probes check the segment count (root + 1 or root + 2) before walking segments.
+- **Verdicts:** no verdict test changed. The only new answer is "too large" for a brace word that would scan more than 2 M characters, which is fail-closed.
+
+### Hunks in `shell.rs` / `words.rs` (merge check with M1-28)
+- `shell.rs`: one hunk, `pub fn lex` and the `LEX_MEMO` constant above it (~442–472). It doesn't touch the ANSI-C decoder.
+- `words.rs`:
+  - `MAX_BRACE_WORK` const after `MAX_BRACE_RESULTS` (~66);
+  - three hunks at the top of `brace_expand`: the fast path, the lower-bound check and the `scanned` budget (~337–350);
+  - new fn `brace_results_lower_bound`, appended at the end of the file (~1049).
+  - `cd_effect` is not touched.
+
+### Times (debug, Linux)
+| Test | Before (round 1, `527a866`) | After |
+|---|---|---|
+| `adversarial_fuzz::random_hostile_lines…` (60 s cap) | 96.7 s (`dev` 221 s) | 52.9 / 53.4 s |
+| `policy::engine_never_panics_on_garbage` (10 s cap on the hostile block) | 10.6 s (`ls {a,b}×20000` alone 9.4 s) | passes; `ls {a,b}×20000` 101 ms, `×2000` 11 ms |
+| `adversarial_m1_18::fix2_nested_env_split_string_is_linear` (200 ms) | 200–580 ms | 150 ms (whole test run) |
+| `policy::pipe_to_shell_fan_out_is_linear_and_denied` | passes alone | 2.2–2.4 s alone, passes. It failed once in the full parallel run; it does so at round 1's commit too (CPU contention). |
+
+### Checks
+- `cargo fmt --all --check`: clean.
+- `cargo clippy -p atrium-core --all-targets -- -D warnings`: clean.
+- `cargo test -p atrium-core`: all pass except the one parallel-load failure of `pipe_to_shell_fan_out…` above. That test passes 3/3 alone.
