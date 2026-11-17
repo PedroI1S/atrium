@@ -46,3 +46,11 @@ On Linux, `dev` itself fails two timing tests even on a quiet machine:
 - `adversarial_m1_18::fix4_finding3_glob_escape_total_variant_cap_performance`: 322 ms, against 150 ms.
 
 Both pass on macOS. Find where the time goes: most likely the glob normalizer or the variant expansion, which this task owns. Bound it so both pass on Linux with their current limits. Don't raise the limits. If the time is outside your paths, name the function in the handoff.
+
+## Added scope (D-120, orchestrator, 2026-11-17): the rest of N11
+The Opus escalation (D-128) bounded the glob work. K10 and `fix4` now pass. Its profile puts the rest of N11's time outside the old owned paths, so the paths widen to these three items, and only these:
+- `words::brace_expand`: its cost is quadratic in word length. It blocks `policy::engine_never_panics_on_garbage` (`ls {a,b}`×20000, 9.4 s).
+- `Sensitive::new`: built three times per evaluate. Build it once and share it.
+- `shell::lex_depth_uncached` / `lex`: the shell lexing cost that dominates `adversarial_fuzz::random_hostile_lines…` and `adversarial_m1_18::fix2_nested_env_split_string_is_linear`.
+
+M1-28 owns the ANSI-C decoder and `cd_effect` in the same files. Don't touch those, and list every hunk in the handoff for the merge check.
