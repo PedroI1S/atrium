@@ -63,7 +63,7 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
 ## Checks run by this worker (D-123)
 
 - `cargo fmt --all`: exited 0.
-- `cargo check -p atrium-core --tests`: exited 0 (7.45s, 0 warnings on initial pass; 0.49s, 0 warnings in rework round 1; 0.51s, 0 warnings in rework round 2; 5.42s, 0 warnings in rework round 3).
+- `cargo check -p atrium-core --tests`: exited 0 (7.45s, 0 warnings on initial pass; 0.49s, 0 warnings in rework round 1; 0.51s, 0 warnings in rework round 2; 5.42s, 0 warnings in rework round 3; 8.73s, 0 warnings in rework round 4).
 
 ## Rework round 1
 
@@ -106,6 +106,17 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
 2. **Real character sets for all 13 POSIX named classes (`crates/atrium-core/src/policy/deny.rs`, `crates/atrium-core/tests/M1-30-tree-wildcards.rs`):**
    - Audited `posix_class_matches` in `deny.rs` for all 13 classes (`alpha`, `alnum`, `lower`, `upper`, `punct`, `print`, `graph`, `space`, `digit`, `xdigit`, `word`, `blank`, `cntrl`): updated `"space"` to `ch.is_ascii_whitespace() || ch == '\x0B'` so vertical tab (`\x0B`) is included alongside `' '`, `'\t'`, `'\n'`, `'\x0C'`, `'\r'`; confirmed the remaining 12 classes already match their real ASCII/C-locale character sets (`is_ascii_alphabetic`, `is_ascii_alphanumeric`, `is_ascii_lowercase`, `is_ascii_uppercase`, `is_ascii_punctuation`, `is_ascii_graphic() || ' '`, `is_ascii_graphic`, `is_ascii_digit`, `is_ascii_hexdigit`, `is_ascii_alphanumeric() || '_'`, `' ' | '\t'`, `is_ascii_control`).
    - Added `posix_named_classes_match_real_character_sets` in `crates/atrium-core/tests/M1-30-tree-wildcards.rs`, with a table naming all 13 classes and testing for each one a component matching `.ssh` (`Hard(credential-read)`) and a component not matching `.ssh` (`["Ask", "Ask", "Allow", "Allow"]`), plus cross-checks on `.`/`s` boundaries and `^` negation.
+
+## Rework round 4
+
+1. **Per-word and per-command performance optimizations (`crates/atrium-core/src/policy/deny.rs`):**
+   - **Zero-allocation path lowercasing (`with_lower_or` / `with_lower_path` / `with_lower_str`):** `glob_hit`, `is_ssh_dir`, and `ask_hit` now avoid `lower(p)` (`String` allocation + `.replace('ſ', "s")`) for ASCII paths without uppercase (and use a 512-byte stack buffer for ASCII paths with uppercase), falling back to `lower(p)` only for non-ASCII or > 512-byte paths.
+   - **`is_ssh_dir` fast path:** Replaced `format!("{}/.ssh", self.home)` with `under(pl, &self.home) == Some(".ssh")`, and when `pl` contains glob metacharacters, checks whether the final component is `"**"` or matches `".ssh"` before building `ShellGlob` or running `tails_after`.
+   - **`ask_hit` fast path:** Replaced the 16 per-word `f.to_lowercase()` allocations in `ASK_FILES` matching with `eq_ignore_ascii_case` (literal branch) and stack-lowercased `with_lower_str` (glob branch); added `path_could_reach_root` before `ShellGlob::new` when `!pl.contains("**")`.
+   - **`glob_hit` & `ShellGlob` / `Tail` stack buffers:** Replaced `split_comps` (`Vec<&str>` allocations) and `format!("{d}/{f}")` / `format!("{tree}/x")` / `format!(".ssh/{n}")` / `format!("{b}/{f}")` allocations with stack-backed `Segs`, `CompBuf`, `IdxBuf`, `TailBuf`, and `BoolDp` buffers (with heap fallback only above stack capacities). Added `path_could_reach_root` early exit, zero-alloc `hit_prefix` slicing when no `/./`/`/../`, `has_deep_tail` guard before `BROWSER_FILES`/`BROWSER_ROOTS`, and 1D DP in `reach_indices` (eliminating `Vec<Vec<bool>>`).
+   - **Component glob DP (`comp_glob_dp`) & `Comp::from_part`:** Added fast literal prefix/suffix checks when `!prefix`, zero-alloc ASCII byte-slice matching in `comp_glob_dp`, and `c.contains(['.', '['])` guard in `Comp::from_part` before calling `brace_branch_dot_ok` (so `{a,b}...` without `.`/`[` skips `words::brace_expand`). Replaced per-atom `Vec<bool>` allocations in `glob_matches_stem_suffix` and `glob_matches_name_prefix` with `BoolDp`.
+   - **`ask_search_glob_hit` (`ASK_NAME_PREFIXES` / `ASK_TREES`):** Checked `matches_ask_name_prefix_pat` before compiling `GlobBuilder::new(dir_pat)`, skipped `GlobBuilder::new(dir_pat)` when `dir_pat == "**"`, and deferred `GlobBuilder::new(rest)` validation until after `dir_pat` matches a tree and `ask_tree_matches_rest` returns `false`.
+   - **Note on `policy::engine_never_panics_on_garbage`:** By inspection of `policy.rs:2234-2269`, `words.rs:464-478`, and `engine.rs:908-915`, all five `hostile` inputs inside the timed `started..elapsed()` block (`hostile[0]` > `MAX_BYTES`, `hostile[1..=2]` `brace_expand` overflow, `hostile[3]` > `MAX_UNITS`, `hostile[4]` > `MAX_USES`) set `a.overflow = true` in `deny::analyze` and return `PolicyVerdict::Deny` at `engine.rs:910` before `hard_deny` or `Home` matchers run; the 20,000 random-line loop before `started` does exercise `is_ssh_dir`, `glob_hit`, and `ask_hit`, and `fix2_nested_env_split_string_is_linear` exercises `is_ssh_dir` and `ask_hit` across `uses` and `unknown_tok_dangerous`. All edits stay strictly inside the owned `deny.rs` range (`563..=816` on `dev`).
 
 ## Commands for the verification task (DoD)
 
