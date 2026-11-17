@@ -802,3 +802,6 @@ M1-31-credential-folder-search went through four Hydrogen `high` rework rounds. 
 
 ## D-129 — 2026-11-17 — M1-29 escalates to Opus 5.5 (orchestrator, under PLAN §8.3)
 M1-29-cr17-stores went through five Hydrogen `high` rounds and two Codex reviews (both rework). Rework 5 then regressed two existing tests in `adversarial_m1_18.rs` (`cr_12_through_links_asks_in_home`, `k2_links_at_any_hop…`). The rounds don't converge, so **an Opus 5.5 worker** continues on the same branch. The review stays with Codex. Same reasoning as D-127 and D-128.
+
+## D-130 — 2026-11-17 — M1-27 escalates to Opus 5.5 (orchestrator, under PLAN §8.3)
+M1-27-engine-name-fold went through four Hydrogen `high` rounds. Codex review round 2 (`reviews/M1-27-engine-name-fold-round2.md`) still found 5 blockers, all in K7's positional resolution (`set --`, here-documents, functions and background jobs, unbounded allocation), plus open round-1 items. The rounds don't converge, so **an Opus 5.5 worker** continues, with a fail-closed design: resolve only exact, simple positional cases and Ask for everything else. The review stays with Codex. Same reasoning as D-127 to D-129.
