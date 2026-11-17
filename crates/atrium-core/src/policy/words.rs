@@ -258,8 +258,14 @@ pub(super) fn decode_ansi_c(chars: &[char], quote_idx: usize) -> AnsiCDecode {
                                 i += 1;
                                 if chars.get(i) == Some(&'\\') {
                                     i += 1;
+                                    push_char('\x1c', &mut out, &mut saw_nul, &mut control_char);
+                                } else if chars.get(i) == Some(&'\'') {
+                                    i += 1;
+                                    push_char('\x1c', &mut out, &mut saw_nul, &mut control_char);
+                                    push_char('\'', &mut out, &mut saw_nul, &mut control_char);
+                                } else {
+                                    push_char('\x1c', &mut out, &mut saw_nul, &mut control_char);
                                 }
-                                push_char('\x1c', &mut out, &mut saw_nul, &mut control_char);
                             }
                             Some('?') => {
                                 i += 1;

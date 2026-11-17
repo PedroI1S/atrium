@@ -135,8 +135,11 @@ fn s7_ansi_c_hidden_paths_commands_and_payloads_are_hard_denied() {
         r"echo $(printf $'\')'; $'\x73udo' id)",
         r"echo $(printf $'\\\''; $'\x73udo' id)",
         r"echo $(printf $'\c\''; $'\x73udo' id)",
+        r"echo $(printf $'\c\\'; $'\x73udo' id)",
+        r"echo $(printf $'\c'; $'\x73udo' id)",
         r"echo $(printf $'\')'; cat ~/.ssh/id_rsa)",
         r"echo ${x:-$'}'}; $'\x73udo' id",
+        r"echo ${x:-$'\c\''}; $'\x73udo' id",
     ]);
 }
 
@@ -168,6 +171,7 @@ fn s7_ordinary_and_fail_closed_ansi_c_keep_safe_verdicts() {
         (r"cat $'\U00110000'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"cat $'\xff'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"cat $'\c'", ["Ask", "Ask", "Allow", "Allow"]),
+        (r"cat $'\c\'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"cat $'\c\''", ["Ask", "Ask", "Allow", "Allow"]),
         (r"cat $'ok\x00'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"cat $'ok\u0000'", ["Ask", "Ask", "Allow", "Allow"]),
@@ -251,7 +255,7 @@ fn finding_11_cd_glob_reaching_sensitive_dirs_is_caught() {
         // Finding 5: synthetic subtree candidates preserve directory depth & globstar
         concat!("cd .ss?/*/*; cat ..", "/../id_rsa"),
         concat!("cd .ss?/**; cat ..", "/../id_rsa"),
-        concat!("cd .ss?/*/..; cat id_rsa"),
+        "cd .ss?/*/..; cat id_rsa",
         concat!(
             "cd .config/google-chr?me/Profile*/Sub; cat ..",
             "/'Login Data'"
