@@ -67,3 +67,5 @@ Plus every minor and nit still open in the reviews of tasks merged before D-120 
 - the app's `markdown.test.ts` "pathological emphasis and brackets parse quickly".
 
 Make all three deterministic on Linux. Owned paths widen to those tests, the daemon's connection and lane code, and `app/src/chat/markdown.ts`. Fix the code if it is a race or a slowdown; fix the test only if the test is wrong.
+
+- Also `atrium-agents` `gate_withdraw::codex_adapter_withdraws_interrupted_approval_and_question_and_saturation` (fails 1 run in 3 alone on Linux), in the withdrawal code this task already owns (D-122).
