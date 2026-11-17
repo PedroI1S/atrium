@@ -33,8 +33,9 @@ Status: **ready for DoD verification** (D-123: worker wrote code and tests only;
   9. `globstar_tree_leaf_rules_preserve_ordinary_globs_and_block_sensitive_trees` *(added in round 1)*: pins the `**` tree-leaf fix — confirms `cat ~/**/*.rs`, `cat ~/**/notes.txt`, `cat ~/.local/**/*.rs`, `cat ~/Library/**/*.md`, `cat ~/.config/**/*.rs` stay `Ask / Ask / Allow / Allow` and `Read ~/**/*.rs` stays `Allow`, while `cat ~/**`, `cat ~/.local/**`, `cat ~/.local/share/atr*/**`, `cat ~/.local/**/atrium.db`, `cat ~/**/atrium.db`, `cat ~/.g*/**`, `cat ~/**/.g*/secring.gpg`, `cat ~/.s?h/**`, `cat ~/.config/g*chrome/**`, `Read ~/.z*/**`, and `Read ~/**/.z*/*.session` remain blocked/asked.
   10. `k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree` *(added in round 1)*: pins K8 — non-recursive `Search ["~"]` with `**/*.rs`, `**/*.md`, `**/*/*.rs`, `*/*.rs`, `src/**/*.rs`, `**/src/*.rs`, `**/*.{rs,md}`, `**/m*.rs`, `.azure/*.rs` (and `Search ["~/.azure"] *.rs`) returns `Allow / Allow / Allow`; non-recursive `Search ["~"]` with `**/*.session`, `**/*/*.session`, `**/*.history`, `**/token.json`, `**/cache.json`, `**/*.cache`, `**/*.toml`, `**/*.{rs,toml}`, `**/*.{rs,session}`, `**/[0-9]*.session`, `**/*token*`, `**/msal_token_cache.db`, `**/.zsh_sessions/*.txt`, `.zsh_sessions/*.session`, `.bash_sessions/*.history`, `.aws/sso/cache/*.txt`, `.z*/*.session`, `.az*/msal_token_cache.db` (and `Search ["~/.zsh_sessions"] *.rs`, `Search ["~/.azure"] msal_token_cache.db`) returns `Ask / Allow / Allow`; catch-all/credential-matching `**/*.json`, `**/*`, `**`, `**/` return `Hard(credential-read)` in all 3 settings; recursive `Search ["~"] **/*.rs` and `rg --glob '**/*.rs' x ~` remain `Ask` in Home (`rg --glob '**/*.rs' x ~/proj` is `Allow`).
   11. `session_gate_blocks_wildcarded_credential_and_atrium_trees_when_absent_on_disk` *(added in round 1)*: pins S5 through `SessionGate` when targets do not exist on disk.
-  12. `rework_round2_regressions` *(added in round 2)*: pins fixes for round 1 review findings 3–8 (POSIX named classes, Atrium WAL/SHM/journal/snapshots/logs under `**`, K8 filename-family matching for `**/b.session`/`**/b.history`, Azure `msal_token_cache.*` arbitrary extensions, bare `*` leaf rule preserving `~/.config/*/settings.json`, and singleton class spellings of `.ssh/config` / `authorized_keys` / `.pub` / `known_hosts`).
+  12. `rework_round2_regressions` *(added in round 2, updated in round 3)*: pins fixes for round 1 review findings 3–8 (POSIX named classes including `~/[[:punct:]]ssh/id_rsa` matching `.ssh` and `~/.[[:punct:]]sh/id_rsa` not matching `.ssh`, Atrium WAL/SHM/journal/snapshots/logs under `**`, K8 filename-family matching for `**/b.session`/`**/b.history`, Azure `msal_token_cache.*` arbitrary extensions, bare `*` leaf rule preserving `~/.config/*/settings.json`, and singleton class spellings of `.ssh/config` / `authorized_keys` / `.pub` / `known_hosts`).
   13. `rework_round2_finding_1_non_escaping_search_globs_escalated` *(`#[ignore]`, added in round 2)*: reproduces review finding 1 (`Search ["~"] false ".g*/private-keys-v1.d/k.key"` and `".local/share/atr*/missing.db"`), which requires changing `Sensitive::search_glob_hit` (owned by M1-31).
+  14. `posix_named_classes_match_real_character_sets` *(added in round 3)*: table test covering all 13 POSIX named classes (`alpha`, `alnum`, `lower`, `upper`, `punct`, `print`, `graph`, `space`, `digit`, `xdigit`, `word`, `blank`, `cntrl`), naming for each class a component that matches `.ssh` (`Hard(credential-read)`) and one that does not (`Ask / Ask / Allow / Allow`), plus `.` / `s` boundary and `^` negation cross-checks.
 
 ## Tests expected to fail on `dev`'s code
 
@@ -51,6 +52,7 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
   - `k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree` (`dev` returns `Ask` instead of `Allow` in Home for `Search ["~"] **/*.rs` and the other non-recursive `**/*.{md,...}` home searches; `.az*/msal_token_cache.db` returns `Allow` instead of `Ask` on `dev`)
   - `session_gate_blocks_wildcarded_credential_and_atrium_trees_when_absent_on_disk` (`dev` returns `Ask` instead of `Deny` when wildcarded directories do not exist on disk)
   - `rework_round2_regressions` (`dev` fails on POSIX classes, WAL under `**`, Azure `msal_token_cache.*`, and `cat ~/.config/g*/settings.json`)
+  - `posix_named_classes_match_real_character_sets` (`dev` fails on POSIX named classes matching `.ssh`)
 - Note: `ordinary_globs_keep_expected_verdicts` is expected to **pass** on `dev` (verifying no regressions on ordinary globs, including `cat ~/.config/*/settings.json` -> `Ask / Ask / Allow / Allow`). `adversarial_gate::finding_11_a_glob_inside_atriums_folder_names_is_blocked` also passes on `dev` because `world()` creates the target files on disk.
 
 ## Escalated / outside owned paths
@@ -61,7 +63,7 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
 ## Checks run by this worker (D-123)
 
 - `cargo fmt --all`: exited 0.
-- `cargo check -p atrium-core --tests`: exited 0 (7.45s, 0 warnings on initial pass; 0.49s, 0 warnings in rework round 1; 0.51s, 0 warnings in rework round 2).
+- `cargo check -p atrium-core --tests`: exited 0 (7.45s, 0 warnings on initial pass; 0.49s, 0 warnings in rework round 1; 0.51s, 0 warnings in rework round 2; 5.42s, 0 warnings in rework round 3).
 
 ## Rework round 1
 
@@ -96,11 +98,20 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
 8. **Finding 8 (singleton class spellings of readable SSH config hard-denied):** fixed (`Comp::is_singleton_literal`, `pat_is_singleton_literal`, `pat_is_public_ssh_name` in `Tail::matches_ssh_secret` so singleton class/brace spellings like `confi[g]` keep `Allow`/`Ask` while broader patterns like `confi[gh]`/`confi?`/`{config,id_rsa}` stay `HardDeny`); pinned by `rework_round2_regressions` (`Read ~/.s?h/confi[g]`, `cat ~/.s?h/confi[g]`, `rm ~/.s?h/confi[g]`).
 9. **Finding 9 (handoff reported superseded K8/ordinary-glob verdicts):** fixed by updating the K8 summary, ordinary-glob baseline note, and verification instructions in `docs/agents/handoffs/M1-30-tree-wildcards.md`.
 
+## Rework round 3
+
+1. **`rework_round2_regressions` failure on `"cat ~/.[[:punct:]]sh/id_rsa"` (`crates/atrium-core/tests/M1-30-tree-wildcards.rs`):**
+   - **Why the test expectation was wrong:** `.[[:punct:]]sh` requires a literal `.`, followed by a single punctuation character, followed by `sh`. Because `.ssh` has `'s'` (not punctuation) as its second character, `.[[:punct:]]sh` does **not** match `.ssh` (so `cat ~/.[[:punct:]]sh/id_rsa` returns `Ask` in Home and `Allow` under Any/FullAccess). By contrast, `~/[[:punct:]]ssh/id_rsa` places `[[:punct:]]` at the leading `.` position (where `.` is ASCII punctuation) and therefore matches `.ssh` (`Hard(credential-read)`).
+   - **Fix (`crates/atrium-core/tests/M1-30-tree-wildcards.rs`):** Replaced `("cat ~/.[[:punct:]]sh/id_rsa", Want::Hard(CR))` with `("cat ~/[[:punct:]]ssh/id_rsa", Want::Hard(CR))` in `run_table`, and added `("cat ~/.[[:punct:]]sh/id_rsa", ["Ask", "Ask", "Allow", "Allow"])` to `check_4_settings`.
+2. **Real character sets for all 13 POSIX named classes (`crates/atrium-core/src/policy/deny.rs`, `crates/atrium-core/tests/M1-30-tree-wildcards.rs`):**
+   - Audited `posix_class_matches` in `deny.rs` for all 13 classes (`alpha`, `alnum`, `lower`, `upper`, `punct`, `print`, `graph`, `space`, `digit`, `xdigit`, `word`, `blank`, `cntrl`): updated `"space"` to `ch.is_ascii_whitespace() || ch == '\x0B'` so vertical tab (`\x0B`) is included alongside `' '`, `'\t'`, `'\n'`, `'\x0C'`, `'\r'`; confirmed the remaining 12 classes already match their real ASCII/C-locale character sets (`is_ascii_alphabetic`, `is_ascii_alphanumeric`, `is_ascii_lowercase`, `is_ascii_uppercase`, `is_ascii_punctuation`, `is_ascii_graphic() || ' '`, `is_ascii_graphic`, `is_ascii_digit`, `is_ascii_hexdigit`, `is_ascii_alphanumeric() || '_'`, `' ' | '\t'`, `is_ascii_control`).
+   - Added `posix_named_classes_match_real_character_sets` in `crates/atrium-core/tests/M1-30-tree-wildcards.rs`, with a table naming all 13 classes and testing for each one a component matching `.ssh` (`Hard(credential-read)`) and a component not matching `.ssh` (`["Ask", "Ask", "Allow", "Allow"]`), plus cross-checks on `.`/`s` boundaries and `^` negation.
+
 ## Commands for the verification task (DoD)
 
 1. `cargo fmt --all --check`
 2. `cargo clippy --workspace --all-targets -- -D warnings`
 3. `cargo test --workspace --no-fail-fast`
 4. Run `cargo test -p atrium-core` 3 times in a loop and record timings for `adversarial_fuzz` and `policy` (no slowdown).
-5. Checkout `dev:crates/atrium-core/src/policy/deny.rs`, run `cargo test -p atrium-core --test M1-30-tree-wildcards`, confirm the 11 S5/K8/rework tests fail on `dev` while `ordinary_globs_keep_expected_verdicts` passes on `dev`, then restore `HEAD`'s `deny.rs` and re-verify all 12 un-ignored tests pass (`rework_round2_finding_1_non_escaping_search_globs_escalated` remains `#[ignore]` pending M1-31's `search_glob_hit` fix).
+5. Checkout `dev:crates/atrium-core/src/policy/deny.rs`, run `cargo test -p atrium-core --test M1-30-tree-wildcards`, confirm the 12 S5/K8/rework tests fail on `dev` while `ordinary_globs_keep_expected_verdicts` passes on `dev`, then restore `HEAD`'s `deny.rs` and re-verify all 13 un-ignored tests pass (`rework_round2_finding_1_non_escaping_search_globs_escalated` remains `#[ignore]` pending M1-31's `search_glob_hit` fix).
 6. Confirm `git diff 5e693ad6..HEAD --stat` touches only owned paths (`crates/atrium-core/src/policy/deny.rs`, `crates/atrium-core/tests/M1-30-tree-wildcards.rs`, `crates/atrium-core/tests/adversarial_gate.rs`, `docs/agents/handoffs/M1-30-tree-wildcards.md`).
