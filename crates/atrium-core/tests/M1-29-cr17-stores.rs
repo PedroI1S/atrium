@@ -1067,7 +1067,7 @@ fn round3_finding5_execute_path_glob_cannot_allow_commands() {
 #[test]
 fn round3_finding8_and_cr17_test_gaps() {
     let env = Env::home();
-    let any_exec = vec![rule(
+    let any_exec = [rule(
         RuleScope::Global,
         ToolKind::Execute,
         RuleMatcher::Any,
@@ -1113,7 +1113,7 @@ fn round3_finding8_and_cr17_test_gaps() {
         ("~/.gem", "*credentials*"),
         ("~/.terraform.d", "credentials*"),
         ("~/.config/op", "*"),
-        ("~", "*.yml"),
+        ("~", ".yarnrc*"),
     ] {
         let search = paths_check(ToolKind::Search, "Glob", &[dir], true, Some(pat));
         assert_eq!(
@@ -1122,6 +1122,14 @@ fn round3_finding8_and_cr17_test_gaps() {
             "Search {dir} {pat}"
         );
     }
+    // Recursive `*.yml` search from `~` reaches `~/.config/gh/hosts.yml` (hard-denied in `CRED_FILES`).
+    let yml_search = paths_check(ToolKind::Search, "Glob", &["~"], true, Some("*.yml"));
+    assert!(matches!(
+        env.eval_check(&yml_search, &[], Preset::Home),
+        PolicyVerdict::HardDeny {
+            id: "credential-read"
+        }
+    ));
 
     // CR-17 linked Search calls and remembered rules through symlinks in SessionGate
     let t = Tmp::new();

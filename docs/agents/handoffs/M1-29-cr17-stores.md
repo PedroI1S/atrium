@@ -161,3 +161,16 @@ git diff a3b2a60 --stat
   - `cargo fmt --all` — passed (exit 0)
   - `cargo check -p atrium-core --tests` — passed (exit 0, 0 warnings)
   - `cargo check -p atrium-daemon --tests` — passed (exit 0, 0 warnings)
+
+## Rework round 4
+
+- **Clippy (`crates/atrium-core/tests/M1-29-cr17-stores.rs:1070`):** Replaced `let any_exec = vec![rule(...)];` with `let any_exec = [rule(...)];` in `round3_finding8_and_cr17_test_gaps` to eliminate `clippy::useless_vec`.
+- **`Search ~ *.yml` (`crates/atrium-core/tests/M1-29-cr17-stores.rs:1116–1128`):**
+  - **Hard-denied store matched:** **`~/.config/gh/hosts.yml`** (`CRED_FILES` at `crates/atrium-core/src/policy/deny.rs:405`).
+  - **Depth-1 check:** No listed hard-denied store (`CRED_FILES`, `CRED_TREES`, `BROWSER_FILES`, `SSH_PROBES`) is a `*.yml` file directly in `~` itself; depth-1 entries in `CRED_FILES` are `.netrc`, `.git-credentials`, `.npmrc`, and `.claude.json`, while `.config/gh/hosts.yml` sits at depth 3.
+  - **Why the test hit `HardDeny { id: "credential-read" }`:** `round3_finding8_and_cr17_test_gaps` passed `recursive: true` (`paths_check(ToolKind::Search, "Glob", &["~"], true, Some("*.yml"))`), which represents a recursive search under `~` matching `*.yml` filenames (shared with recursive `Grep` `--glob '*.yml'`). Under `recursive: true` (`deny.rs:1488`, `name_allowed = recursive || !rel.contains('/')`), `search_glob_hit` matches `hosts.yml` in `~/.config/gh/hosts.yml` and rightly hard-denies. (Flagged for the owner of `deny.rs`: even when `recursive: false`, `search_glob_hit` at `deny.rs:1461` compiles globs with `.literal_separator(false)` and evaluates `g.is_match(&probe) || (!rel.is_empty() && g.is_match(rel))`, so `*` crosses `/` and still matches `.config/gh/hosts.yml`; `deny.rs` below `ASK_TREES` is outside M1-29's owned paths and was left untouched.)
+  - **Test fix:** Changed the CR-17 search case for `~/.yarnrc.yml` from `("~", "*.yml")` to `("~", ".yarnrc*")` (`Ask`), and added an explicit assertion pinning recursive `Search ~ *.yml` (`recursive: true`) -> `HardDeny { id: "credential-read" }`.
+- **Checks run after rework round 4 (D-123):**
+  - `cargo fmt --all` — passed (exit 0)
+  - `cargo check -p atrium-core --tests` — passed (exit 0, 0 warnings)
+  - `cargo check -p atrium-daemon --tests` — passed (exit 0, 0 warnings)
