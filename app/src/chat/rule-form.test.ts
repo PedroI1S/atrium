@@ -124,7 +124,10 @@ describe("rules editor: allow rules on shells, wrappers and inline code (round 2
       expect(v.ok && v.warnings.length, c).toBe(1);
     }
     expect(commandRisk(["cargo", "test"])).toBeNull();
-    expect(commandRisk(["git", "-c", "x=y", "status"])).toBeNull();
+    // Finding 6: prefix git with -c is refused; safe exact git -c is allowed; dangerous git -c is refused.
+    expect(commandRisk(["git", "-c", "x=y", "status"])).toMatchObject({ refuse: expect.any(String) });
+    expect(commandRisk(["git", "-c", "color.ui=false", "status"], "command_exact")).toBeNull();
+    expect(commandRisk(["git", "-c", "alias.clean=!rm -f victim", "clean"], "command_exact")).toMatchObject({ refuse: expect.any(String) });
     // Exact rules can name the interpreter's options: nothing can be added after them.
     expect(commandRisk(["python3", "-m", "pytest"], "command_exact")).toMatchObject({ warn: expect.any(String) });
     expect(commandRisk(["find", ".", "-name", "x"], "command_exact")).toBeNull();
@@ -307,5 +310,42 @@ describe("rules editor: round 3 follow-up (review 3, finding 1)", () => {
     for (const c of ["python3 -m pytest", "python3 -u build.py", "npx -y prettier", "node build.js", "deno run x.ts", "bun run build"]) {
       expect(refused(c, "command_exact"), c).toBe(false);
     }
+  });
+});
+
+describe("rules editor: rework round 5 parity with rule_check.rs", () => {
+  const refused = (command: string, matcher: "command_prefix" | "command_exact" = "command_prefix") => {
+    const v = validateRule(form({ matcher, command }), ctx);
+    return !v.ok && v.errors.command !== undefined;
+  };
+  it("refuses PowerShell option values masquerading as .ps1 scripts and unknown options (finding 2)", () => {
+    for (const c of ["pwsh -WorkingDirectory work.ps1", "pwsh -wd work.ps1", "pwsh -WorkingDirectory=work.ps1", "pwsh /WorkingDirectory work.ps1", "pwsh -UnknownOpt work.ps1", "pwsh -File", "pwsh -File -"]) {
+      expect(refused(c), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+    expect(refused("pwsh /h/u/build.ps1")).toBe(false);
+    expect(refused("pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1")).toBe(false);
+  });
+  it("refuses normalized stdin path aliases (finding 3)", () => {
+    for (const c of ["python3 /dev/./stdin", "python3 ///dev//stdin", "python3 /dev/foo/../stdin", "node /dev/./fd/0", "perl /proc/self/./fd/0", "ruby /proc/thread-self/fd/0"]) {
+      expect(refused(c), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+  });
+  it("refuses exact interpreter/runner rules whose option value was mistaken for a script (finding 5)", () => {
+    for (const c of ["python3 -W ignore", "python3 -X dev", "python3 -m", "node -r preload", "npx -p prettier"]) {
+      expect(refused(c, "command_exact"), c).toBe(true);
+      expect(refused(c, "command_prefix"), c).toBe(true);
+    }
+    expect(refused("python3 -W ignore build.py", "command_exact")).toBe(false);
+  });
+  it("refuses dangerous git CLI config/exec options in both prefix and exact rules (finding 6)", () => {
+    for (const c of ["git -c alias.clean='!rm -f victim' clean", "git -c core.fsmonitor=evil status", "git --exec-path=/tmp/bin status", "git --config-env=core.sshCommand=X fetch", "git --ext-diff diff", "git --upload-pack=/tmp/up clone x"]) {
+      expect(refused(c, "command_prefix"), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+    expect(refused("git -c color.ui=false status", "command_prefix")).toBe(true);
+    expect(refused("git -c color.ui=false status", "command_exact")).toBe(false);
+    expect(refused("git commit -c HEAD", "command_exact")).toBe(false);
   });
 });

@@ -500,8 +500,11 @@ fn find_prefix_rules_require_derived_units_to_be_covered_and_reject_delete() {
             "find . -execdir rm {} +",
             "find . -ok rm {} ;",
             "find . -okdir rm {} ;",
+            r"find . -ok rm {} \;",
+            r"find . -okdir rm {} \;",
             "find . -exec echo {} +",
             "find . -exec sh -c 'rm -rf build' ;",
+            r"find . -exec sh -c 'rm -rf build' \;",
         ] {
             assert_eq!(
                 classify(&env.cmd_rules(exec_cmd, rules)),
@@ -569,6 +572,10 @@ fn find_prefix_rules_require_derived_units_to_be_covered_and_reject_delete() {
     ];
     assert_eq!(
         classify(&env.cmd_rules("find . -exec echo {} +", &find_and_echo)),
+        "Allow"
+    );
+    assert_eq!(
+        classify(&env.cmd_rules(r"find . -ok echo {} \;", &find_and_echo)),
         "Allow"
     );
 
@@ -1257,4 +1264,367 @@ fn round3_finding8_and_cr17_test_gaps() {
         atrium_core::PolicyEngine::evaluate(&DefaultPolicy::new(), &mapped_input, &read_any),
         PolicyVerdict::Allow { .. }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// 6. Rework round 5: reproducing cases for review-round2.md findings 1-4 & 6
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round5_finding1_path_filtering_retains_script_and_git_pathspec_operands() {
+    let home = Env::home();
+    let mut in_work = Env::home();
+    in_work.cwd = format!("{HOME}/work").into();
+
+    let allow_sed_work = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["sed"]),
+        RuleDecision::Allow,
+        Some("/h/u/work/**"),
+        "allow-sed-work",
+    )];
+    // `sed 'w /h/u/out.txt' /h/u/work/input.txt`: script writes outside scope -> Ask
+    assert_eq!(
+        classify(&home.cmd_rules(
+            "sed 'w /h/u/out.txt' /h/u/work/input.txt",
+            &allow_sed_work
+        )),
+        "Ask"
+    );
+    assert_eq!(
+        classify(&home.cmd_rules(
+            "sed -e 'w /h/u/out.txt' /h/u/work/input.txt",
+            &allow_sed_work
+        )),
+        "Ask"
+    );
+    assert_eq!(
+        classify(&home.cmd_rules("sed 'w out.txt' /h/u/work/input.txt", &allow_sed_work)),
+        "Ask"
+    );
+    // Ordinary sed scripts and in-scope script writes keep Allow
+    assert_eq!(
+        classify(&home.cmd_rules(
+            "sed 'w /h/u/work/out.txt' /h/u/work/input.txt",
+            &allow_sed_work
+        )),
+        "Allow"
+    );
+    assert_eq!(
+        classify(&home.cmd_rules("sed 's/foo/bar/' /h/u/work/input.txt", &allow_sed_work)),
+        "Allow"
+    );
+    assert_eq!(
+        classify(&home.cmd_rules("sed '/foo/d' /h/u/work/input.txt", &allow_sed_work)),
+        "Allow"
+    );
+
+    let allow_awk_work = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["awk"]),
+        RuleDecision::Allow,
+        Some("/h/u/work/**"),
+        "allow-awk-work",
+    )];
+    assert_eq!(
+        classify(&home.cmd_rules(
+            "awk '{ print > \"/h/u/out.txt\" }' /h/u/work/input.txt",
+            &allow_awk_work
+        )),
+        "Ask"
+    );
+
+    // `diff -u` is a boolean flag, not a value-taking flag
+    let allow_diff_work = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["diff"]),
+        RuleDecision::Allow,
+        Some("/h/u/work/**"),
+        "allow-diff-work",
+    )];
+    assert_eq!(
+        classify(&home.cmd_rules(
+            "diff -u /h/u/other/a.txt /h/u/work/b.txt",
+            &allow_diff_work
+        )),
+        "Ask"
+    );
+    let deny_diff_work = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["diff"]),
+        RuleDecision::Deny,
+        Some("/h/u/work/**"),
+        "deny-diff-work",
+    )];
+    assert!(matches!(
+        home.cmd_rules("diff -u /h/u/work/a.txt /h/u/other/b.txt", &deny_diff_work),
+        PolicyVerdict::Deny { .. }
+    ));
+
+    // Git pathspecs in `cwd=/h/u/work` under Deny prefix `["git"]` scoped `/h/u/work/**`
+    let deny_git_work = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["git"]),
+        RuleDecision::Deny,
+        Some("/h/u/work/**"),
+        "deny-git-work",
+    )];
+    for cmd in [
+        "git status a.txt",
+        "git diff a.txt",
+        "git log a.txt",
+        "git checkout a.txt",
+    ] {
+        assert!(
+            matches!(in_work.cmd_rules(cmd, &deny_git_work), PolicyVerdict::Deny { .. }),
+            "expected Deny for {cmd}"
+        );
+    }
+    // Non-path ref/remote arguments for `git push` stay Ask under scoped Deny
+    assert_eq!(
+        classify(&in_work.cmd_rules("git push origin main", &deny_git_work)),
+        "Ask"
+    );
+
+    // Scoped Allow `git` fails closed on pathspec/unknown operands outside scope
+    let allow_git_work = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["git"]),
+        RuleDecision::Allow,
+        Some("/h/u/work/**"),
+        "allow-git-work",
+    )];
+    assert_eq!(
+        classify(&home.cmd_rules("git -C ~/work/repo status a.txt", &allow_git_work)),
+        "Ask"
+    );
+    assert_eq!(
+        classify(&home.cmd_rules("git -C ~/work/repo push origin main", &allow_git_work)),
+        "Allow"
+    );
+}
+
+#[test]
+fn round5_finding2_pwsh_option_values_and_inline_code() {
+    let env = Env::home();
+    let bad_pwsh_rule = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["pwsh", "-WorkingDirectory", "work.ps1"]),
+        RuleDecision::Allow,
+        "allow-pwsh-wd",
+    )];
+    assert_eq!(
+        classify(&env.cmd_rules(
+            "pwsh -WorkingDirectory work.ps1 -Command 'Remove-Item victim'",
+            &bad_pwsh_rule
+        )),
+        "Ask"
+    );
+
+    let bad_pwsh_ep = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["pwsh", "-ExecutionPolicy", "Bypass"]),
+        RuleDecision::Allow,
+        "allow-pwsh-ep",
+    )];
+    assert_eq!(
+        classify(&env.cmd_rules(
+            "pwsh -ExecutionPolicy Bypass -Command 'Remove-Item victim'",
+            &bad_pwsh_ep
+        )),
+        "Ask"
+    );
+
+    // Valid pinned script rule still allows script invocation
+    let good_pwsh_rule = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "build.ps1"]),
+        RuleDecision::Allow,
+        "allow-pwsh-build",
+    )];
+    assert_eq!(
+        classify(&env.cmd_rules(
+            "pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1",
+            &good_pwsh_rule
+        )),
+        "Allow"
+    );
+}
+
+#[test]
+fn round5_finding3_stdin_alias_normalization() {
+    let env = Env::home();
+    let rules = vec![
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["echo"]),
+            RuleDecision::Allow,
+            "allow-echo",
+        ),
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["python3", "/dev/./stdin"]),
+            RuleDecision::Allow,
+            "allow-py-dot-stdin",
+        ),
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["node", "/dev//fd/0"]),
+            RuleDecision::Allow,
+            "allow-node-fd0",
+        ),
+        rule(
+            RuleScope::Global,
+            ToolKind::Execute,
+            prefix(&["perl", "/proc/self/./fd/0"]),
+            RuleDecision::Allow,
+            "allow-perl-proc-fd0",
+        ),
+    ];
+    for line in [
+        "echo 'print(1)' | python3 /dev/./stdin",
+        "echo 'console.log(1)' | node /dev//fd/0",
+        "echo 'print 1' | perl /proc/self/./fd/0",
+    ] {
+        assert_eq!(classify(&env.cmd_rules(line, &rules)), "Ask", "{line}");
+    }
+}
+
+#[test]
+fn round5_finding4_gate_hardlink_remembered_rule() {
+    let t = Tmp::new();
+    t.write(".terraform.d/credentials.tfrc.json", "tf-secret");
+    t.write("other/plain.txt", "plain");
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    std::fs::hard_link(
+        t.home.join(".terraform.d/credentials.tfrc.json"),
+        t.home.join("proj/tf_hard"),
+    )
+    .unwrap();
+    std::fs::hard_link(
+        t.home.join("other/plain.txt"),
+        t.home.join("proj/unknown_hard"),
+    )
+    .unwrap();
+
+    // Without rules in Home: Ask
+    let g_no_rules = t.gate(Preset::Home, vec![]);
+    assert!(matches!(
+        block_on(g_no_rules.gate.check(&paths_check(
+            ToolKind::Read,
+            "Read",
+            &["proj/tf_hard"],
+            false,
+            None
+        ))),
+        GateDecision::Ask { .. }
+    ));
+
+    // With Read Allow Any rule in Home: positively identified ask-store alias -> Allow,
+    // including the original store once multiply-linked; unknown hard link stays Ask.
+    let g_rules = t.gate(
+        Preset::Home,
+        vec![
+            rule(
+                RuleScope::Global,
+                ToolKind::Read,
+                RuleMatcher::Any,
+                RuleDecision::Allow,
+                "allow-any-read",
+            ),
+            rule(
+                RuleScope::Global,
+                ToolKind::Execute,
+                RuleMatcher::Any,
+                RuleDecision::Allow,
+                "allow-any-exec",
+            ),
+        ],
+    );
+    assert_eq!(
+        block_on(g_rules.gate.check(&paths_check(
+            ToolKind::Read,
+            "Read",
+            &["proj/tf_hard"],
+            false,
+            None
+        ))),
+        GateDecision::Allow
+    );
+    assert_eq!(
+        block_on(g_rules.gate.check(&paths_check(
+            ToolKind::Read,
+            "Read",
+            &[".terraform.d/credentials.tfrc.json"],
+            false,
+            None
+        ))),
+        GateDecision::Allow
+    );
+    assert_eq!(
+        block_on(g_rules.gate.check(&cmd_check("cat proj/tf_hard"))),
+        GateDecision::Allow
+    );
+    assert!(matches!(
+        block_on(g_rules.gate.check(&paths_check(
+            ToolKind::Read,
+            "Read",
+            &["proj/unknown_hard"],
+            false,
+            None
+        ))),
+        GateDecision::Ask { .. }
+    ));
+}
+
+#[test]
+fn round5_finding6_exact_git_safe_config_allow() {
+    let env = Env::home();
+    let exact_safe = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        exact(&["git", "-c", "color.ui=false", "status"]),
+        RuleDecision::Allow,
+        "allow-git-exact-safe",
+    )];
+    assert_eq!(
+        classify(&env.cmd_rules("git -c color.ui=false status", &exact_safe)),
+        "Allow"
+    );
+
+    let prefix_git = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["git"]),
+        RuleDecision::Allow,
+        "allow-git-prefix",
+    )];
+    assert_eq!(
+        classify(&env.cmd_rules("git -c color.ui=false status", &prefix_git)),
+        "Ask"
+    );
+
+    let exact_dangerous = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        exact(&["git", "-c", "alias.clean=!rm -f victim", "clean"]),
+        RuleDecision::Allow,
+        "allow-git-exact-danger",
+    )];
+    assert_eq!(
+        classify(&env.cmd_rules("git -c alias.clean='!rm -f victim' clean", &exact_dangerous)),
+        "Ask"
+    );
 }

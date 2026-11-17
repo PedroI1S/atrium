@@ -386,12 +386,105 @@ async fn create_rule_refuses_unsafe_command_allow_rules_and_invalid_path_scopes(
         exact(&["python3", "-W", "ignore", "build.py"]),
         prefix(&["git"]),
         exact(&["git", "commit", "-c", "HEAD"]),
+        exact(&["git", "-c", "color.ui=false", "status"]),
     ] {
         wire.ok(DaemonCommand::CreateRule {
             rule: cmd_draft(RuleDecision::Allow, matcher, None),
         })
         .await;
     }
+
+    // 8. Rework round 5: pwsh option-value scripts, normalized stdin paths, safe git exact vs prefix, thread scopes
+    let round5_before_count = serde_json::from_value::<Vec<atrium_protocol::policy::Rule>>(
+        wire.ok(DaemonCommand::ListRules).await,
+    )
+    .expect("rules")
+    .len();
+
+    let round5_refused_both: &[&[&str]] = &[
+        // Finding 2: PowerShell option values cannot masquerade as .ps1 scripts
+        &["pwsh", "-WorkingDirectory", "work.ps1"],
+        &["pwsh", "-wd", "work.ps1"],
+        &["pwsh", "-WorkingDirectory=work.ps1"],
+        &["pwsh", "/WorkingDirectory", "work.ps1"],
+        &["pwsh", "-UnknownOpt", "work.ps1"],
+        &["pwsh", "-File"],
+        &["pwsh", "-File", "-"],
+        // Finding 3: normalized stdin aliases
+        &["python3", "/dev/./stdin"],
+        &["python3", "///dev//stdin"],
+        &["python3", "/dev/foo/../stdin"],
+        &["node", "/dev/./fd/0"],
+        &["perl", "/proc/self/./fd/0"],
+        &["ruby", "/proc/thread-self/fd/0"],
+    ];
+    for argv in round5_refused_both {
+        for matcher in [prefix(argv), exact(argv)] {
+            let code = wire
+                .refused(DaemonCommand::CreateRule {
+                    rule: cmd_draft(RuleDecision::Allow, matcher.clone(), None),
+                })
+                .await;
+            assert_eq!(code, ErrorCode::Invalid, "expected Invalid for {matcher:?}");
+        }
+    }
+
+    // Finding 6: prefix `git -c color.ui=false status` is refused (exact already succeeded above)
+    assert_eq!(
+        wire.refused(DaemonCommand::CreateRule {
+            rule: cmd_draft(
+                RuleDecision::Allow,
+                prefix(&["git", "-c", "color.ui=false", "status"]),
+                None,
+            ),
+        })
+        .await,
+        ErrorCode::Invalid
+    );
+
+    // Finding 7: malformed / unknown thread scopes are refused with Invalid and not stored
+    for bad_tid in ["", "   ", "nonexistent-thread"] {
+        let code = wire
+            .refused(DaemonCommand::CreateRule {
+                rule: RuleDraft {
+                    scope: RuleScope::Thread {
+                        thread_id: atrium_protocol::thread::ThreadId(bad_tid.into()),
+                    },
+                    tool_kind: ToolKind::Execute,
+                    tool_name: None,
+                    matcher: prefix(&["cargo", "test"]),
+                    path_scope: None,
+                    decision: RuleDecision::Allow,
+                },
+            })
+            .await;
+        assert_eq!(
+            code,
+            ErrorCode::Invalid,
+            "expected Invalid for thread_id={bad_tid:?}"
+        );
+    }
+
+    let round5_after_count = serde_json::from_value::<Vec<atrium_protocol::policy::Rule>>(
+        wire.ok(DaemonCommand::ListRules).await,
+    )
+    .expect("rules")
+    .len();
+    assert_eq!(round5_after_count, round5_before_count);
+
+    // A thread-scoped rule targeting an existing thread succeeds
+    let existing = wire.start_thread(common::native(), None).await.thread_id;
+    wire.ok(DaemonCommand::CreateRule {
+        rule: RuleDraft {
+            scope: RuleScope::Thread { thread_id: existing },
+            tool_kind: ToolKind::Execute,
+            tool_name: None,
+            matcher: prefix(&["cargo", "test"]),
+            path_scope: None,
+            decision: RuleDecision::Allow,
+        },
+    })
+    .await;
 
     rig.stop(true).await;
 }

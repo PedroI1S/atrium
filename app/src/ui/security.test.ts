@@ -1,5 +1,7 @@
 // @vitest-environment happy-dom
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createComponent, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -44,6 +46,28 @@ describe("Settings → Security credential stores that ask (CR-12, CR-17)", () =
       "~/.local/share/fish/fish_history",
     ]) {
       expect(joined, store).toContain(store);
+    }
+  });
+
+  it("matches every ASK_FILES, ASK_TREES, and ASK_NAME_PREFIXES entry in core deny.rs", () => {
+    const denyRs = readFileSync(join(import.meta.dirname, "../../../crates/atrium-core/src/policy/deny.rs"), "utf8");
+    const extractStrings = (constName: string): string[] => {
+      const m = new RegExp(`const ${constName}:[^=]*=\\s*&\\[([\\s\\S]*?)\\];`).exec(denyRs);
+      if (!m) throw new Error(`${constName} not found in deny.rs`);
+      return Array.from(m[1]!.matchAll(/"([^"]+)"/g), (hit) => hit[1]!);
+    };
+    const joined = ASK_STORES.map((s) => s.paths).join(" ");
+    for (const rel of extractStrings("ASK_FILES")) {
+      expect(joined, `ASK_FILES: ~/${rel}`).toContain(`~/${rel}`);
+    }
+    for (const tree of extractStrings("ASK_TREES")) {
+      expect(joined, `ASK_TREES: ~/${tree}/`).toContain(`~/${tree}/`);
+    }
+    const prefixBlock = /const ASK_NAME_PREFIXES:[^=]*=\s*&\[([\s\S]*?)\];/.exec(denyRs);
+    if (!prefixBlock) throw new Error("ASK_NAME_PREFIXES not found in deny.rs");
+    for (const pair of prefixBlock[1]!.matchAll(/\("([^"]+)",\s*"([^"]+)"\)/g)) {
+      const entry = `~/${pair[1]}/${pair[2]}*`;
+      expect(joined, `ASK_NAME_PREFIXES: ${entry}`).toContain(entry);
     }
   });
 
