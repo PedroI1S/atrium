@@ -339,12 +339,24 @@ fn evaluate_sync(
             preset,
         };
         let real_sensitive = deny::sensitive(&real_input);
-        let mut trees = trees_of(
+        // The canonical credential set: every store and every member of
+        // `~/.ssh` (a key linked out of it: review round 3 finding 3), at its
+        // real path, classified by its home spelling.
+        let in_home = Some((c.home.as_path(), real_home.as_path()));
+        let mut trees = trees_in_home(
             &deny::sensitive_roots(&c.home, &[], &[]),
             "credential-read",
             true,
             TreeKind::Sensitive,
+            in_home,
         );
+        trees.extend(trees_in_home(
+            &ssh.members,
+            "credential-read",
+            true,
+            TreeKind::Sensitive,
+            in_home,
+        ));
         trees.extend(trees_of(
             &ssh.linked_dirs,
             "credential-read",
@@ -846,6 +858,54 @@ struct GlobExpansion {
     truncated: bool,
 }
 
+thread_local! {
+    /// The filesystem work left for the current link check (review round 3
+    /// finding 5): one budget across every walk, expansion and resolution
+    /// of a check. `None` outside a check (no limit beyond each walk's own).
+    static LINK_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static LINK_BUDGET_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Filesystem operations one link check may do, all walks together.
+const LINK_CHECK_BUDGET: usize = 1 << 18;
+
+/// Spends `n` operations of the current check's budget; false (and marks
+/// the check unfinished) once it is gone.
+fn spend(n: usize) -> bool {
+    LINK_BUDGET.with(|b| match b.get() {
+        None => true,
+        Some(left) if left >= n => {
+            b.set(Some(left - n));
+            true
+        }
+        Some(_) => {
+            b.set(Some(0));
+            LINK_BUDGET_OUT.with(|o| o.set(true));
+            false
+        }
+    })
+}
+
+fn budget_spent() -> bool {
+    LINK_BUDGET_OUT.with(std::cell::Cell::get)
+}
+
+/// Runs `f` with a fresh budget for one link check.
+fn with_link_budget<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<usize>, bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LINK_BUDGET.with(|b| b.set(self.0));
+            LINK_BUDGET_OUT.with(|o| o.set(self.1));
+        }
+    }
+    let _reset = Reset(
+        LINK_BUDGET.with(|b| b.replace(Some(LINK_CHECK_BUDGET))),
+        LINK_BUDGET_OUT.with(|o| o.replace(false)),
+    );
+    f()
+}
+
 fn expand_glob(p: &Path) -> Option<GlobExpansion> {
     expand_glob_with(p, false)
 }
@@ -853,20 +913,20 @@ fn expand_glob(p: &Path) -> Option<GlobExpansion> {
 fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
     const MAX_ENTRIES: usize = 4096;
     const MAX_DEPTH: usize = 12;
-    let comps: Vec<String> = p
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .collect();
-    let is_pat = |c: &str| c.contains(['*', '?', '[', '{']);
+    // the components' own bytes (review round 3 finding 2): only a pattern
+    // component is read as text, and one that isn't text can't be matched
+    let comps: Vec<OsString> = p.components().map(|c| c.as_os_str().to_owned()).collect();
+    let text = |c: &OsString| c.to_string_lossy().into_owned();
+    let is_pat = |c: &OsString| text(c).contains(['*', '?', '[', '{']);
     // A `$`, a backtick or a brace left in any component (round 7 item 1):
     // the shell expands it to something the pattern doesn't show
     // (`~/${DIR}/work/*`, `~/$(echo v*)/w`); comma lists and ranges were
     // expanded before (`words::brace_expand`), so a brace still here is one
     // this walk can't read.
-    if comps.iter().any(|c| c.contains(['$', '`', '{', '}'])) {
+    if comps.iter().any(|c| text(c).contains(['$', '`', '{', '}'])) {
         return None;
     }
-    let first = comps.iter().position(|c| is_pat(c))?;
+    let first = comps.iter().position(&is_pat)?;
     let prefix: PathBuf = comps[..first].iter().collect();
     let mut seen = 0usize;
     let mut visited: std::collections::HashSet<(PathBuf, usize)> = std::collections::HashSet::new();
@@ -879,8 +939,12 @@ fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
             out.push(dir);
             continue;
         }
-        let c = comps[k].as_str();
-        if !is_pat(c) {
+        let c_os = &comps[k];
+        if !is_pat(c_os) {
+            if !spend(1) {
+                return None;
+            }
+            let c = c_os;
             let next = dir.join(c);
             // a glob only expands to names that exist; permission/loop errors fail closed
             match std::fs::symlink_metadata(&next) {
@@ -895,6 +959,7 @@ fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
             }
             continue;
         }
+        let c = c_os.to_str()?;
         if c == "**" {
             // zero folders here, or one more and `**` again
             stack.push((dir.clone(), k + 1, deep));
@@ -930,7 +995,7 @@ fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
                 continue;
             };
             seen += 1;
-            if seen > MAX_ENTRIES {
+            if seen > MAX_ENTRIES || !spend(1) {
                 // Over-budget walks cannot be verified without depending on
                 // directory iteration order; fail closed to Ask (`None`).
                 return None;
@@ -1488,13 +1553,31 @@ struct Tree {
 }
 
 fn trees_of(paths: &[PathBuf], id: &'static str, read: bool, kind: TreeKind) -> Vec<Tree> {
+    trees_in_home(paths, id, read, kind, None)
+}
+
+/// The trees at `paths`: each one's real path (links followed in order) and,
+/// for classifying what is found there, its whole spelling below the
+/// resolved home (`~/.config/gcloud` stays that even when `~/.config` or the
+/// store itself is a link elsewhere: review round 3 finding 1).
+fn trees_in_home(
+    paths: &[PathBuf],
+    id: &'static str,
+    read: bool,
+    kind: TreeKind,
+    home: Option<(&Path, &Path)>,
+) -> Vec<Tree> {
     paths
         .iter()
         .map(|r| {
-            let path = resolve_fs(r, 0);
-            let logical = match (r.parent(), r.file_name()) {
-                (Some(par), Some(name)) => resolve_fs(par, 0).join(name),
-                _ => path.clone(),
+            let path = real_path(r);
+            let logical = match home.and_then(|(h, real_h)| Some((r.strip_prefix(h).ok()?, real_h)))
+            {
+                Some((rest, real_h)) => real_h.join(rest),
+                None => match (r.parent(), r.file_name()) {
+                    (Some(par), Some(name)) => resolve_fs(par, 0).join(name),
+                    _ => path.clone(),
+                },
             };
             Tree {
                 path,
@@ -1522,7 +1605,8 @@ fn in_trees<'a>(
         if !(t.read || write) {
             return false;
         }
-        if names_dir && (t.path == real || (t.held && t.path.starts_with(real))) {
+        // a folder named or held; a file (an `~/.ssh` member) is classified below
+        if names_dir && real.is_dir() && (t.path == real || (t.held && t.path.starts_with(real))) {
             return true;
         }
         if !(real.starts_with(&t.path) && (real != t.path || !real.is_dir())) {
@@ -1699,7 +1783,7 @@ fn links_below<'a>(
                 seen += 1;
                 seen > BUDGET
             };
-            if over || depth > MAX_DEPTH {
+            if over || depth > MAX_DEPTH || !spend(1) {
                 return (Reach::Maybe, None);
             }
             let p = e.path();
@@ -1800,12 +1884,36 @@ fn first_tree_hit<'a>(
     role: words::Role,
     sensitive: Option<&deny::Sensitive>,
 ) -> Option<&'a Tree> {
-    targets
-        .iter()
-        .find_map(|f| in_trees(&real_path(f), trees, names_dir, role, sensitive))
+    targets.iter().find_map(|f| {
+        // out of budget: the caller's `Maybe` comes from `budget_spent`
+        if !spend(1) {
+            return None;
+        }
+        in_trees(&real_path(f), trees, names_dir, role, sensitive)
+    })
 }
 
+/// One link check under one shared filesystem budget (review round 3
+/// finding 5): a check that runs out can't show it is safe, so it is Maybe.
 fn reaches_tree_through_links<'a>(
+    check: &ToolCheck,
+    a: &deny::Analysis,
+    resolved: &[PathBuf],
+    trees: &'a [Tree],
+    cwd: &Path,
+    home: &Path,
+    sensitive: Option<&deny::Sensitive>,
+) -> (Reach, Option<&'a Tree>) {
+    with_link_budget(|| {
+        match reaches_tree_through_links_once(check, a, resolved, trees, cwd, home, sensitive) {
+            (Reach::Yes, t) => (Reach::Yes, t),
+            _ if budget_spent() => (Reach::Maybe, None),
+            r => r,
+        }
+    })
+}
+
+fn reaches_tree_through_links_once<'a>(
     check: &ToolCheck,
     a: &deny::Analysis,
     resolved: &[PathBuf],
@@ -1858,16 +1966,21 @@ fn reaches_tree_through_links<'a>(
             ToolKind::Read | ToolKind::Search => words::Role::Read,
             _ => words::Role::Write,
         };
-        let roots: Vec<PathBuf> = if paths.is_empty() {
+        // the same root or alternative twice is the same walk
+        let mut roots: Vec<PathBuf> = if paths.is_empty() {
             vec![resolve_fs(cwd, 0)]
         } else {
             resolved.to_vec()
         };
+        let mut seen_root = std::collections::HashSet::new();
+        roots.retain(|r| seen_root.insert(r.clone()));
         let Some(exps) = words::brace_expand(g) else {
             return (Reach::Maybe, None);
         };
+        let mut seen_gv = std::collections::HashSet::new();
+        let mut seen_cand = std::collections::HashSet::new();
         for gv in exps {
-            if gv.is_empty() {
+            if gv.is_empty() || !seen_gv.insert(gv.clone()) {
                 continue;
             }
             let h = words::expand_home(&gv, home, cwd);
@@ -1896,6 +2009,9 @@ fn reaches_tree_through_links<'a>(
                 v
             };
             for p in cands {
+                if !seen_cand.insert(p.clone()) {
+                    continue;
+                }
                 let globby = p
                     .to_string_lossy()
                     .contains(['*', '?', '[', '{', '}', '$', '`']);
@@ -1959,7 +2075,11 @@ fn reaches_tree_through_links<'a>(
         // A literal path the lexical resolver spelled differently from the
         // filesystem (a dangling link to `dir/../new_key` where `dir` is a
         // link: round 2 finding 5): check where the filesystem takes it.
-        if !command_word && !u.word.contains(['*', '?', '[', '{', '}', '$', '`']) {
+        // A file tool's path is literal whatever it holds (`key[1]`: review
+        // round 3 finding 4); a shell word with metacharacters is a pattern.
+        if !command_word
+            && (unit.is_none() || !u.word.contains(['*', '?', '[', '{', '}', '$', '`']))
+        {
             let unit_cwds: Vec<&Path> = a
                 .unit_cwd
                 .get(u.unit)

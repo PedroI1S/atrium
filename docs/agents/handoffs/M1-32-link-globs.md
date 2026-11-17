@@ -15,7 +15,7 @@ Brief read from `dev`: `docs/agents/briefs/M1-32-link-globs.md` (including scope
      - `real_path` (~992–1079) resolves symlinks (including dangling ones) component-by-component in filesystem order so `..` applies after preceding links.
      - `trees_of` (~1485–1496) retains absent protected roots using `resolve_fs(r, 0)` instead of dropping canonicalization failures.
      - `in_trees` (~1500–1525) applies `deny::Sensitive::hit(real, role)` for `TreeKind::Sensitive` targets so `.pub`, `known_hosts`, and read-only `.ssh/config` / `authorized_keys` keep their contract §9 exceptions.
-     - `prune_mode` / `is_pruned` / `links_below` (~1527–1676) prunes directories only when the specific invocation excludes them (`grep*`/`find` prune nothing; `rg`/`ag` prune `.git` only unless `--hidden`/`-.`/`-u(u)` is set or flags are unreadable; `ack` prunes `.git`/`node_modules` unless `--noignore-dir` is set or flags are unreadable; walkers retain `.git`/`node_modules`/`target` pruning).
+     - `prune_mode` / `is_pruned` / `links_below` (~1527–1676) prunes directories only when the specific invocation excludes them (`grep*`/`find` prune nothing; `rg`/`ag` prune `.git` only unless `--hidden`/`-.`/`-u(u)` is set or flags are unreadable; `ack` prunes `.git`/`node_modules` unless `--noignore-dir` is set or flags are unreadable; walkers (tar, cp, zip, rsync, ...) prune nothing; `.git`/`node_modules`/`target` are walked on a separate 65536-entry budget, all inside the check's single shared budget).
      - `raw_glob_pattern`, `expand_targets`, `first_tree_hit`, and `reaches_tree_through_links` (~1685–1923) evaluate `ToolSubject::Paths { glob: Some(..), .. }` with file-tool dotfile matching and recursive basename expansion (`**/<trimmed>`) when `recursive == true` for single-component globs.
    - `crates/atrium-core/tests/adversarial_gate.rs`: removed `#[ignore = "M1-13 finding 10"]` on `finding_10_a_glob_that_reaches_a_credential_through_a_link_is_blocked` (~571).
    - `crates/atrium-core/tests/M1-32-link-globs.rs`: added S11 tests, ordinary-folder rows (`ls proj_clean/to_other`, `cat proj_clean/to_other`), and regression tests for rework round 1 findings 1–6.
@@ -60,6 +60,29 @@ Commands run (Opus may run tests): `cargo fmt --all --check` ok; `cargo clippy -
 - **Finding 4 (major, unreadable folder in a following search):** fixed — `links_below` turns `read_dir`, entry, `file_type` and link-`canonicalize` errors (other than not-found, not-a-dir, link loop) into `Reach::Maybe`, keeping a sure hit. Test: `rework2_finding4_unreadable_dir_in_following_search_fails_closed` (`grep -R secret proj` → Ask ×3).
 - **Finding 5 (major, file-tool dangling target `dir/../new_key`):** fixed inside the owned range — `raw_glob_pattern` no longer resolves a pattern-free path lexically (callers `real_path` it), and `reaches_tree_through_links` re-resolves each literal use with `real_path` from its raw spelling when that differs from the lexical resolution. Test: `rework2_finding5_file_tool_dangling_targets_resolve_links_before_dotdot` (Read and Glob → Deny ×3). `resolve_fs` itself (~line 84) is still unchanged (see Escalated).
 - **Finding 6 (nit, handoff entry-cap wording):** fixed in the summary above.
+
+---
+
+## Escalation round 2 (D-127, review 3)
+
+Approach change (coordinator): one fail-closed rule instead of case-by-case fixes, all in `gate.rs`'s owned range:
+
+- **Rule A, canonical credential set:** each store root (`deny::sensitive_roots`) *and each member of `~/.ssh`* becomes a tree at its real path (`real_path`, links followed in order), classified through its whole spelling below the resolved home (`trees_in_home`). Every candidate (glob match, walked link, literal path) is resolved with `real_path` and compared with that set; `Sensitive::hit` on the real path or the home spelling keeps the `.pub`/`known_hosts`/read-only-config exceptions. A file tree (an SSH member) is never "named as a folder", so public members stay ordinary.
+- **Rule B, bytes, not text:** glob expansion keeps every component, prefix and entry name as `OsString`; only a pattern component is read as text, and one that is not UTF-8 makes the expansion fail (Maybe → Ask).
+- **Rule C, literal means literal:** a file tool's path is re-resolved with `real_path` whatever characters it holds; only shell words treat metacharacters as patterns.
+- **Rule D, one budget per check:** `reaches_tree_through_links` runs under one shared budget (`LINK_CHECK_BUDGET` = 262144 filesystem operations: glob entries, literal lookups, walk entries, target resolutions). Running out makes the check Maybe (Ask, never Allow); a definite hit stays a hard deny. Roots, brace alternatives and candidates are deduplicated first. Unreadable folders, read errors and undecodable names already fail closed (round 2 findings 4 and 6 of round 1).
+
+Findings:
+- **Finding 1 (blocker, relocated parent `~/.config -> config_store`):** closed by rule A. Test: `rework3_finding1_relocated_parent_of_a_store_keeps_protection`.
+- **Finding 2 (blocker, non-UTF-8 glob prefix):** closed by rule B. Test: `rework3_finding2_non_utf8_glob_prefix_is_kept_by_its_bytes`.
+- **Finding 3 (blocker, `~/.ssh/id_rsa -> ../vault/key`):** closed by rule A (SSH members in the set). Test: `rework3_finding3_ssh_member_linked_out_of_ssh_is_protected`.
+- **Finding 4 (major, Read `proj/dangling-key[1]`):** closed by rule C. Test: `rework3_finding4_literal_file_tool_path_with_brackets_is_resolved`.
+- **Finding 5 (major, per-walk caps):** closed by rule D. Test: `rework3_finding5_one_budget_per_check` (the reviewer's 4096 roots × 256 alternatives finishes quickly and is not denied; 256 distinct alternatives over 4096 entries exceed the budget → Ask ×3).
+- **Finding 6 (nit, stale pruning line):** fixed in the summary above.
+
+Tests 1–4 fail with the previous `gate.rs` (`5bec74e`) and pass now; test 5 on the previous code is the reviewer's ~4·10⁹-entry walk (stopped, not run to the end).
+
+Limit: hard links of a credential outside every store are matched by identity only for literal operands (`alias_fix`, outside the owned range), not for glob matches; the reviewer's fixtures assume single links.
 
 ---
 

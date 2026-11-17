@@ -696,3 +696,112 @@ fn rework2_finding5_file_tool_dangling_targets_resolve_links_before_dotdot() {
     );
     assert_eq!(eval_check_3(&t, &glob), deny);
 }
+
+// ---- Escalation round 2 (D-127): review round 3 findings 1-5 ----
+
+#[test]
+fn rework3_finding1_relocated_parent_of_a_store_keeps_protection() {
+    let t = Tmp::new();
+    std::fs::rename(t.home.join(".config"), t.home.join("config_store")).unwrap();
+    t.write("config_store/gcloud/token", "secret");
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    symlink("config_store", t.home.join(".config")).unwrap();
+    let up = "..";
+    symlink(
+        format!("{up}/config_store/gcloud/token"),
+        t.home.join("proj/key"),
+    )
+    .unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    assert_eq!(eval_cmd_3(&t, "cat proj/key*"), deny);
+    let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("key*"));
+    assert_eq!(eval_check_3(&t, &check), deny);
+}
+
+#[test]
+fn rework3_finding2_non_utf8_glob_prefix_is_kept_by_its_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    let store = t.home.join(std::ffi::OsStr::from_bytes(b"store\xff"));
+    std::fs::create_dir_all(&store).unwrap();
+    let up = "..";
+    symlink(format!("{up}/.ssh/id_rsa"), store.join("key")).unwrap();
+    symlink(
+        std::ffi::OsStr::from_bytes(b"store\xff"),
+        t.home.join("proj"),
+    )
+    .unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    assert_eq!(eval_cmd_3(&t, "cat proj/key*"), deny);
+    let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("key*"));
+    assert_eq!(eval_check_3(&t, &check), deny);
+}
+
+#[test]
+fn rework3_finding3_ssh_member_linked_out_of_ssh_is_protected() {
+    let t = Tmp::new();
+    t.write("vault/key", "secret");
+    std::fs::create_dir_all(t.home.join(".ssh")).unwrap();
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    let up = "..";
+    symlink(format!("{up}/vault/key"), t.home.join(".ssh/id_rsa")).unwrap();
+    symlink(format!("{up}/vault/key"), t.home.join("proj/key")).unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    assert_eq!(eval_cmd_3(&t, "cat proj/key*"), deny);
+    let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("key*"));
+    assert_eq!(eval_check_3(&t, &check), deny);
+}
+
+#[test]
+fn rework3_finding4_literal_file_tool_path_with_brackets_is_resolved() {
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.home.join(".ssh/sub")).unwrap();
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    let up = "..";
+    symlink(format!("{up}/.ssh/sub"), t.home.join("proj/dir")).unwrap();
+    symlink(
+        format!("dir/{up}/new_key"),
+        t.home.join("proj/dangling-key[1]"),
+    )
+    .unwrap();
+
+    let read = paths_check(
+        ToolKind::Read,
+        "Read",
+        &["proj/dangling-key[1]"],
+        false,
+        None,
+    );
+    assert_eq!(eval_check_3(&t, &read), ["Deny", "Deny", "Deny"]);
+}
+
+#[test]
+fn rework3_finding5_one_budget_per_check() {
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    for i in 0..4096 {
+        t.write(&format!("proj/ka{i:04}"), "ordinary");
+    }
+    // the reviewer's case: 4096 identical roots x 256 identical alternatives
+    let roots: Vec<&str> = vec!["proj"; 4096];
+    let same = format!("k{{{}}}*", vec!["a"; 256].join(","));
+    let start = std::time::Instant::now();
+    let check = paths_check(ToolKind::Search, "Glob", &roots, false, Some(&same));
+    let got = eval_check_3(&t, &check);
+    assert!(!got.contains(&"Deny"), "{got:?}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "took {:?}",
+        start.elapsed()
+    );
+    // 256 distinct alternatives over the same 4096 entries: more work than
+    // one check may do, so it can't be shown safe and asks
+    let alts: Vec<String> = (0..256).map(|i| format!("x{i}")).collect();
+    let distinct = format!("{{{}}}*", alts.join(","));
+    let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some(&distinct));
+    assert_eq!(eval_check_3(&t, &check), ["Ask", "Ask", "Ask"]);
+}
