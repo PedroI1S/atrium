@@ -119,6 +119,283 @@ const STDIN = new Set(["-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"]);
 /** `find` options that run a command for each file (`shell.rs` `find_exec_units`). */
 const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 
+function normalizePosixPath(raw: string): string {
+  const parts: string[] = [];
+  for (const seg of raw.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg);
+  }
+  return `/${parts.join("/")}`.toLowerCase().replaceAll("ſ", "s");
+}
+
+function isStdinPath(raw: string): boolean {
+  if (raw === "-") return true;
+  if (!raw.startsWith("/")) return false;
+  const norm = normalizePosixPath(raw);
+  return STDIN.has(norm) || norm === "/proc/thread-self/fd/0";
+}
+
+function isPs1Script(w: string): boolean {
+  return w !== "" && !isStdinPath(w) && /\.ps1$/i.test(w);
+}
+
+function pwshOptionBody(w: string): string | null {
+  if (w === "-" || w === "--") return null;
+  if (w.startsWith("--")) return w.slice(2);
+  if (w.startsWith("-")) return w.slice(1);
+  if (w.startsWith("/")) {
+    const rest = w.slice(1);
+    if (!rest.includes("/") && !/\.ps1$/i.test(rest)) return rest;
+  }
+  return null;
+}
+
+const pwshIsFileOpt = (bare: string): boolean => bare === "f" || (bare.length >= 2 && "file".startsWith(bare));
+
+function pwshIsValueOpt(bare: string): boolean {
+  if (bare === "wd" || bare === "ep" || bare === "w" || bare === "if" || bare === "of" || bare === "ea") return true;
+  if (bare.length >= 2 && (
+    "workingdirectory".startsWith(bare) ||
+    "executionpolicy".startsWith(bare) ||
+    "windowstyle".startsWith(bare) ||
+    "inputformat".startsWith(bare) ||
+    "outputformat".startsWith(bare) ||
+    "encodedarguments".startsWith(bare) ||
+    "settingsfile".startsWith(bare) ||
+    "custompipename".startsWith(bare)
+  )) return true;
+  if (bare.length >= 3 && "configurationname".startsWith(bare)) return true;
+  if (bare.length >= 14 && "configurationfile".startsWith(bare)) return true;
+  return false;
+}
+
+function pwshIsBoolOpt(bare: string): boolean {
+  if (bare === "?" || bare === "h" || bare === "v" || bare === "l" || bare === "i" || bare === "sta" || bare === "mta" || bare === "wa") return true;
+  if (bare.length >= 2 && ("help".startsWith(bare) || "version".startsWith(bare) || "wait".startsWith(bare) || "login".startsWith(bare) || "interactive".startsWith(bare))) return true;
+  if (bare.length >= 3 && ("nologo".startsWith(bare) || "noexit".startsWith(bare) || "noprofile".startsWith(bare) || "noninteractive".startsWith(bare))) return true;
+  if (bare.length >= 4 && "noprofileloadtime".startsWith(bare)) return true;
+  return false;
+}
+
+function checkPwshRisk(name: string, args: readonly string[]): CommandRisk {
+  for (const w of args) {
+    const opt = pwshOptionBody(w);
+    if (opt === null) continue;
+    const bare = opt.toLowerCase().split(/[:=]/)[0]!;
+    if (PWSH_SHORT.has(bare) || (bare !== "" && PWSH_CODE.some((c) => c.startsWith(bare)))) {
+      return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line, and Atrium wouldn't check it.` };
+    }
+  }
+  const refuseNoScript = (): CommandRisk => ({ refuse: `A rule can allow ${name} only with the script it runs, like ${name} -File build.ps1.` });
+  let foundScript = false;
+  let i = 0;
+  while (i < args.length) {
+    const w = args[i]!;
+    if (w === "--") {
+      if (args[i + 1] !== undefined && isPs1Script(args[i + 1]!)) foundScript = true;
+      break;
+    }
+    const opt = pwshOptionBody(w);
+    if (opt === null) {
+      if (isPs1Script(w)) {
+        foundScript = true;
+        break;
+      }
+      return refuseNoScript();
+    }
+    const lw = opt.toLowerCase();
+    const sep = lw.search(/[:=]/);
+    const bare = sep >= 0 ? lw.slice(0, sep) : lw;
+    const attached = sep >= 0 ? opt.slice(sep + 1) : null;
+    if (pwshIsFileOpt(bare)) {
+      const script = attached ?? args[i + 1];
+      if (script !== undefined && isPs1Script(script)) {
+        foundScript = true;
+        break;
+      }
+      return refuseNoScript();
+    }
+    if (pwshIsValueOpt(bare)) {
+      if (attached !== null) i += 1;
+      else if (i + 1 < args.length) i += 2;
+      else return refuseNoScript();
+      continue;
+    }
+    if (pwshIsBoolOpt(bare)) {
+      i += 1;
+      continue;
+    }
+    return refuseNoScript();
+  }
+  if (!foundScript) return refuseNoScript();
+  return { warn: `This allows the script ${name} runs, whatever the script does.` };
+}
+
+function interpreterValueFlag(key: string, raw: string, lw: string): boolean {
+  switch (key) {
+    case "node":
+      return raw === "-r" || raw === "-C" || [
+        "--require", "--import", "--loader", "--experimental-loader",
+        "--experimental-specifier-resolution", "--input-type", "--conditions",
+        "--title", "--max-old-space-size", "--env-file", "--watch-path",
+        "--redirect-warnings", "--diagnostic-dir", "--cpu-prof-dir",
+        "--heap-prof-dir", "--test-name-pattern",
+      ].includes(lw);
+    case "deno":
+      return raw === "-c" || raw === "-L" || [
+        "--config", "--import-map", "--lock", "--env", "--env-file",
+        "--ext", "--log-level", "--location", "--cert", "--v8-flags",
+      ].includes(lw);
+    case "bun":
+      return raw === "-c" || raw === "-r" || [
+        "--config", "--cwd", "--env-file", "--preload", "--port", "--define", "--loader",
+      ].includes(lw);
+    case "ruby":
+      return ["-I", "-r", "-C", "-E", "-F", "-K"].includes(raw) || [
+        "--encoding", "--external-encoding", "--internal-encoding",
+      ].includes(lw);
+    case "perl":
+      return ["-I", "-M", "-m", "-F", "-D", "-x"].includes(raw);
+    case "php":
+      return ["-c", "-d", "-z", "-S", "-t"].includes(raw);
+    case "lua":
+      return raw === "-l";
+    case "osascript":
+      return raw === "-l" || raw === "-s";
+    default:
+      return false;
+  }
+}
+
+function interpreterBoolOrAttached(key: string, raw: string, lw: string): boolean {
+  if (lw.startsWith("--") && lw.includes("=")) return true;
+  switch (key) {
+    case "node":
+      return ["-v", "-h", "-c"].includes(raw) || [
+        "--version", "--help", "--check", "--no-deprecation", "--throw-deprecation",
+        "--trace-deprecation", "--trace-warnings", "--no-warnings", "--zero-fill-buffers",
+        "--preserve-symlinks", "--preserve-symlinks-main", "--watch", "--test",
+        "--enable-source-maps", "--experimental-vm-modules", "--no-experimental-fetch",
+      ].includes(lw);
+    case "deno":
+      return ["-A", "-q", "-r", "-h", "-V"].includes(raw) || [
+        "--allow-all", "--allow-read", "--allow-write", "--allow-net", "--allow-env",
+        "--allow-run", "--allow-ffi", "--allow-sys", "--allow-hrtime", "--quiet",
+        "--reload", "--no-check", "--watch", "--cached-only", "--no-lock",
+        "--no-remote", "--unstable", "--help", "--version",
+      ].includes(lw) || lw.startsWith("--allow-") || lw.startsWith("--unstable-");
+    case "bun":
+      return ["-b", "-h", "-v"].includes(raw) || [
+        "--hot", "--watch", "--bun", "--smol", "--silent", "--no-install",
+        "--prefer-offline", "--production", "--help", "--version",
+      ].includes(lw);
+    case "ruby":
+      return lw === "--verbose" || lw === "--version"
+        || ((raw.startsWith("-I") || raw.startsWith("-r") || raw.startsWith("-E") || raw.startsWith("-W") || raw.startsWith("-0") || raw.startsWith("-i")) && raw.length > 2)
+        || (!raw.startsWith("--") && [...raw.slice(1)].every((c) => "wvVTsnapld0y".includes(c)));
+    case "perl":
+      return ((raw.startsWith("-I") || raw.startsWith("-M") || raw.startsWith("-m") || raw.startsWith("-0") || raw.startsWith("-i")) && raw.length > 2)
+        || (!raw.startsWith("--") && [...raw.slice(1)].every((c) => "wWvVTtsnpald0cuU".includes(c)));
+    case "php":
+      return !raw.startsWith("--") && [...raw.slice(1)].every((c) => "nqwlsmvih".includes(c));
+    case "lua":
+      return raw === "-i" || raw === "-v" || raw === "-W";
+    case "osascript":
+      return raw === "-i" || raw === "-o";
+    default:
+      return false;
+  }
+}
+
+function gitConfigIsExec(kv: string): boolean {
+  const eq = kv.indexOf("=");
+  const key = (eq >= 0 ? kv.slice(0, eq) : kv).toLowerCase();
+  const val = eq >= 0 ? kv.slice(eq + 1) : "";
+  return (
+    val.trimStart().startsWith("!")
+    || key.startsWith("alias.")
+    || (key.startsWith("merge.") && key.endsWith(".driver"))
+    || (key.startsWith("filter.") && (key.endsWith(".clean") || key.endsWith(".smudge") || key.endsWith(".process")))
+    || (key.startsWith("diff.") && (key.endsWith(".command") || key.endsWith(".textconv") || key === "diff.external"))
+    || key.startsWith("credential.")
+    || key.startsWith("uploadpack.")
+    || key.startsWith("receive.")
+    || key.startsWith("gpg.")
+    || key.startsWith("remote.")
+    || key.startsWith("protocol.")
+    || [
+      "core.fsmonitor",
+      "core.sshcommand",
+      "core.askpass",
+      "core.editor",
+      "core.pager",
+      "core.gitproxy",
+      "sequence.editor",
+      "browser",
+    ].includes(key)
+  );
+}
+
+function gitCliExecConfig(args: readonly string[]): { hasAny: boolean; hasDangerous: boolean } {
+  let hasAny = false;
+  let hasDangerous = false;
+  let i = 0;
+  while (i < args.length) {
+    const w = args[i]!;
+    if (w === "--") break;
+    if (w === "-c") {
+      hasAny = true;
+      const kv = args[i + 1];
+      if (kv === undefined || gitConfigIsExec(kv)) hasDangerous = true;
+      i += 2;
+      continue;
+    }
+    if (w.startsWith("-c") && w.length > 2) {
+      hasAny = true;
+      if (gitConfigIsExec(w.slice(2))) hasDangerous = true;
+      i += 1;
+      continue;
+    }
+    if (w === "--config-env" || w === "--exec-path") {
+      hasAny = true;
+      hasDangerous = true;
+      i += 2;
+      continue;
+    }
+    if (w.startsWith("--config-env=") || w.startsWith("--exec-path=")) {
+      hasAny = true;
+      hasDangerous = true;
+      i += 1;
+      continue;
+    }
+    if (["-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--list-cmds"].includes(w)) {
+      i += 2;
+      continue;
+    }
+    if (w.startsWith("-")) {
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  for (const w of args) {
+    if (w === "--") break;
+    if (
+      ["--ext-diff", "--config-env", "--exec-path", "--upload-pack", "--receive-pack"].includes(w)
+      || w.startsWith("--config-env=")
+      || w.startsWith("--exec-path=")
+      || w.startsWith("--upload-pack=")
+      || w.startsWith("--receive-pack=")
+      || w.startsWith("--exec=")
+    ) {
+      hasAny = true;
+      hasDangerous = true;
+    }
+  }
+  return { hasAny, hasDangerous };
+}
+
 /**
  * A command name as the disk resolves it (macOS APFS is case-insensitive): the basename,
  * lower-cased (which also folds K, U+212A, to k), with ſ (U+017F) folded to s, as `deny.rs` `lower`.
@@ -160,22 +437,10 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
   if (WRAPPERS.has(name)) return { refuse: `A rule can't allow ${name}: it runs the command that follows it, and Atrium wouldn't check that one. Write the command without ${name}.` };
 
   const interp = interpreterOf(name);
-  if (interp === "pwsh") {
-    for (const w of args) {
-      const opt = w.toLowerCase().replace(/^(--?|\/)/, "");
-      if (w === opt) continue;
-      const bare = opt.split(/[:=]/)[0]!;
-      if (PWSH_SHORT.has(bare) || (bare !== "" && PWSH_CODE.some((c) => c.startsWith(bare)))) {
-        return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line, and Atrium wouldn't check it.` };
-      }
-    }
-    // Windows PowerShell reads bare words as a command; pwsh as a file. Only a named .ps1 is clear.
-    if (!args.some((w) => !w.startsWith("-") && /\.ps1$/i.test(w))) return { refuse: `A rule can allow ${name} only with the script it runs, like ${name} -File build.ps1.` };
-    return { warn: `This allows the script ${name} runs, whatever the script does.` };
-  }
+  if (interp === "pwsh") return checkPwshRisk(name, args);
   if (interp !== null) {
-    const { short, long, sub, verbs } = interp.spec;
-    const operands: string[] = [];
+    const { key, spec } = interp;
+    const { short, long, sub, verbs } = spec;
     for (const w of args) {
       const lw = w.toLowerCase();
       if (lw.startsWith("--")) {
@@ -183,16 +448,81 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
       } else if (isOption(w)) {
         // A flag letter anywhere in the word: `-c'code'` attached, `-0777ne`, `-Ic`.
         if (short !== "" && [...lw.slice(1)].some((c) => short.includes(c))) return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line (${w} holds a code flag), and Atrium wouldn't check it.` };
-      } else operands.push(lw);
+      }
     }
-    const stdin = operands.find((o) => STDIN.has(o));
-    if (stdin !== undefined) return { refuse: `A rule can't allow ${name} ${stdin}: it runs code read from its input, and Atrium wouldn't check it.` };
-    const subcommand = operands[0];
-    if (subcommand !== undefined && sub.includes(subcommand)) return { refuse: `A rule can't allow ${name} ${subcommand}: it runs code written on the command line, and Atrium wouldn't check it.` };
-    // With no script (or only a verb such as `deno run`), the interpreter reads code from its
-    // input, so even an exact rule would allow `echo … | python3` (round 3 follow-up).
-    const verb = subcommand !== undefined && verbs.includes(subcommand) ? 1 : 0;
-    if (operands.length <= verb) return { refuse: `A rule can't allow ${argv.slice(0, 1).join(" ")} without the script it runs: without one, ${name} reads code from its input. ${NAME_A_SCRIPT}` };
+    const refuseNoScript = (): CommandRisk => ({ refuse: `A rule can't allow ${argv.slice(0, 1).join(" ")} without the script it runs: without one, ${name} reads code from its input. ${NAME_A_SCRIPT}` });
+    const isPython = key === "python";
+    let verbSeen = false;
+    let foundTarget = false;
+    let i = 0;
+    while (i < args.length) {
+      const w = args[i]!;
+      const lw = w.toLowerCase();
+      if (w === "--") {
+        const next = args[i + 1];
+        if (next !== undefined) {
+          if (isStdinPath(next)) return { refuse: `A rule can't allow ${name} ${next}: it runs code read from its input, and Atrium wouldn't check it.` };
+          if (!verbSeen && sub.includes(next.toLowerCase())) return { refuse: `A rule can't allow ${name} ${next}: it runs code written on the command line, and Atrium wouldn't check it.` };
+          foundTarget = true;
+        }
+        break;
+      }
+      if (!isOption(w)) {
+        if (isStdinPath(w)) return { refuse: `A rule can't allow ${name} ${w}: it runs code read from its input, and Atrium wouldn't check it.` };
+        if (!verbSeen && sub.includes(lw)) return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line, and Atrium wouldn't check it.` };
+        if (!verbSeen && verbs.length > 0 && verbs.includes(lw)) {
+          verbSeen = true;
+          i += 1;
+          continue;
+        }
+        foundTarget = true;
+        break;
+      }
+      if (isPython) {
+        if (w === "-m") {
+          const mod = args[i + 1];
+          if (mod !== undefined && mod !== "" && !mod.startsWith("-")) {
+            foundTarget = true;
+            break;
+          }
+          return refuseNoScript();
+        }
+        if (w.startsWith("-m") && w.length > 2) {
+          foundTarget = true;
+          break;
+        }
+        if (w === "-W" || w === "-X" || w === "-Q" || w === "--check-hash-based-pycs") {
+          if (i + 1 >= args.length) return refuseNoScript();
+          i += 2;
+          continue;
+        }
+        if (w.startsWith("--check-hash-based-pycs=") || ((w.startsWith("-W") || w.startsWith("-X") || w.startsWith("-Q")) && w.length > 2)) {
+          i += 1;
+          continue;
+        }
+        if ([
+          "--version", "--help", "--help-all", "--help-env", "--help-xoptions", "--verbose",
+          "--quiet", "--isolated", "--ignore-environment", "--no-site", "--no-user-site",
+          "--skip-source-first-line", "--bytes-warning", "--dont-write-bytecode", "--optimize",
+          "--inspect", "--unbuffered",
+        ].includes(lw) || (!w.startsWith("--") && [...w.slice(1)].every((c) => "bBdEhiIOqsSuvVx".includes(c)))) {
+          i += 1;
+          continue;
+        }
+        return refuseNoScript();
+      }
+      if (interpreterValueFlag(key, w, lw)) {
+        if (i + 1 >= args.length) return refuseNoScript();
+        i += 2;
+        continue;
+      }
+      if (interpreterBoolOrAttached(key, w, lw)) {
+        i += 1;
+        continue;
+      }
+      return refuseNoScript();
+    }
+    if (!foundTarget) return refuseNoScript();
     if (prefix) {
       // The script must come right after the command (after a verb such as `deno run`, right
       // after the verb): an interpreter reads its own options only before the script, so words
@@ -212,8 +542,54 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
     if (code) return { refuse: `A rule can't allow ${name} ${code}: it runs a shell command, and Atrium wouldn't check it.` };
     // The package right after the runner, as for interpreters: an option before it could be `-c` added later.
     if (prefix && (args[0] === undefined || args[0].startsWith("-"))) return { refuse: `A prefix rule on ${name} must name the package right after it, like ${name} prettier, with no options before it.` };
-    if (!args.some((w) => !w.startsWith("-"))) return { refuse: `A rule on ${name} must name the package it runs, like ${name} prettier.` };
+    let i = 0;
+    let foundPkg = false;
+    while (i < args.length) {
+      const w = args[i]!;
+      const lw = w.toLowerCase();
+      if (w === "--") {
+        const next = args[i + 1];
+        foundPkg = next !== undefined && next !== "" && next !== "-";
+        break;
+      }
+      if (!isOption(w)) {
+        if (w !== "-") {
+          foundPkg = true;
+          break;
+        }
+        i += 1;
+        continue;
+      }
+      if (lw.startsWith("--") && lw.includes("=")) {
+        i += 1;
+        continue;
+      }
+      if ([
+        "-p", "--package", "--from", "--with", "--with-editable", "--with-requirements",
+        "--python", "--index-url", "--extra-index-url", "--node-options", "-n", "--cache", "--userconfig",
+      ].includes(lw)) {
+        if (i + 1 >= args.length) return { refuse: `A rule on ${name} must name the package it runs, like ${name} prettier.` };
+        i += 2;
+        continue;
+      }
+      if ([
+        "-y", "--yes", "-q", "--quiet", "--no", "--no-install", "--offline", "--prefer-offline",
+        "--ignore-existing", "--isolated", "--no-cache", "--no-build-isolation", "--system",
+        "--verbose", "-v", "-h", "--help", "--version", "--shell-auto-fallback",
+      ].includes(lw) || (!lw.startsWith("--") && [...lw.slice(1)].every((c) => "yqnhv".includes(c)))) {
+        i += 1;
+        continue;
+      }
+      return { refuse: `A rule on ${name} must name the package it runs, like ${name} prettier.` };
+    }
+    if (!foundPkg) return { refuse: `A rule on ${name} must name the package it runs, like ${name} prettier.` };
     return { warn: `This allows the package ${name} runs, whatever it does.` };
+  }
+  if (name === "git") {
+    const { hasAny, hasDangerous } = gitCliExecConfig(args);
+    if ((prefix && hasAny) || hasDangerous) {
+      return { refuse: "A rule can't allow git with command-line configuration or exec options: it can run arbitrary commands." };
+    }
   }
   if (name === "find") {
     const exec = args.find((w) => FIND_EXEC.has(w.toLowerCase()));
