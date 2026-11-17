@@ -63,6 +63,9 @@ const MAX_CANDIDATES: usize = 32;
 /// Directories an unknown cwd is checked against, besides home and the start.
 const MAX_SEEN: usize = 64;
 const MAX_BRACE_RESULTS: usize = 256;
+/// Characters `brace_expand` may scan in total before it gives up (N11):
+/// past this the word counts as too large, as past `MAX_BRACE_RESULTS`.
+const MAX_BRACE_WORK: usize = 2_000_000;
 /// The longest `{x..y}` sequence expanded.
 const MAX_SEQUENCE: usize = 64;
 
@@ -331,9 +334,20 @@ fn has_unknown_var(w: &str) -> bool {
 /// shell's sequence expressions (round 7 item 1). `None` when it would make
 /// more than a few hundred words.
 pub(crate) fn brace_expand(w: &str) -> Option<Vec<String>> {
+    if !w.contains('{') {
+        return Some(vec![w.to_string()]);
+    }
+    if brace_results_lower_bound(w) > MAX_BRACE_RESULTS {
+        return None;
+    }
     let mut work = vec![w.to_string()];
     let mut out = vec![];
+    let mut scanned = 0usize;
     while let Some(x) = work.pop() {
+        scanned = scanned.saturating_add(x.len());
+        if scanned > MAX_BRACE_WORK {
+            return None;
+        }
         let cs: Vec<char> = x.chars().collect();
         // matching braces and their top-level commas, in one pass
         let mut stack: Vec<(usize, Vec<usize>)> = vec![];
@@ -1031,4 +1045,53 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
         too_many(lv, &mut seen, home, start, &mut w);
     }
     w
+}
+
+/// A lower bound on the words `brace_expand` makes from `w` (N11): the
+/// product of the comma counts of the top-level brace pairs with no pair
+/// inside them and no `$` before them. Each such group picks one of its
+/// words independently in every result. One pass, so a word with thousands
+/// of groups is refused without being expanded.
+fn brace_results_lower_bound(w: &str) -> usize {
+    let cs: Vec<char> = w.chars().collect();
+    // (open, close, top-level commas, has a pair inside)
+    let mut stack: Vec<(usize, usize, bool)> = vec![];
+    let mut pairs: Vec<(usize, usize, usize, bool)> = vec![];
+    for (i, &c) in cs.iter().enumerate() {
+        match c {
+            '{' => stack.push((i, 0, false)),
+            ',' => {
+                if let Some(top) = stack.last_mut() {
+                    top.1 += 1;
+                }
+            }
+            '}' => {
+                if let Some((open, commas, inner)) = stack.pop() {
+                    pairs.push((open, i, commas, inner));
+                    if let Some(parent) = stack.last_mut() {
+                        parent.2 = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // pairs close in order; a pair is top-level when no later-closing pair
+    // opened before it
+    pairs.sort_unstable_by_key(|p| p.0);
+    let mut bound = 1usize;
+    let mut reach: Option<usize> = None;
+    for &(open, close, commas, inner) in &pairs {
+        let nested = reach.is_some_and(|r| close < r);
+        if !nested {
+            reach = Some(close);
+            if !inner && commas > 0 && !(open > 0 && cs[open - 1] == '$') {
+                bound = bound.saturating_mul(commas + 1);
+                if bound > MAX_BRACE_RESULTS {
+                    return bound;
+                }
+            }
+        }
+    }
+    bound
 }

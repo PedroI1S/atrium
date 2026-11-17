@@ -439,9 +439,37 @@ fn refresh_ids(l: &mut Lexed) {
     }
 }
 
+/// Lines lexed recently on this thread (N11): one evaluate lexes the same line
+/// in `analyze` and in `parse_command`, and callers often check one line
+/// several times. A hit is a copy with fresh ids, as `lex_depth_fresh` makes.
+const LEX_MEMO: usize = 4;
+
 pub fn lex(line: &str) -> Lexed {
+    thread_local! {
+        static MEMO: std::cell::RefCell<Vec<(String, Rc<Lexed>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let hit = MEMO.with(|m| {
+        m.borrow()
+            .iter()
+            .find(|(l, _)| l == line)
+            .map(|(_, r)| Rc::clone(r))
+    });
+    if let Some(r) = hit {
+        let mut l = (*r).clone();
+        refresh_ids(&mut l);
+        return l;
+    }
     let mut cache = LexCache::default();
-    lex_depth_uncached(line, 0, false, &mut cache)
+    let l = lex_depth_uncached(line, 0, false, &mut cache);
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= LEX_MEMO {
+            m.remove(0);
+        }
+        m.push((line.to_string(), Rc::new(l.clone())));
+    });
+    l
 }
 
 fn lex_depth_cached(line: &str, depth: u8, cache: &mut LexCache) -> Rc<Lexed> {

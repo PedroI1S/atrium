@@ -746,7 +746,7 @@ fn git_path_is_credential(path: &str) -> bool {
 struct Home<'a> {
     input: &'a PolicyInput<'a>,
     a: &'a Analysis,
-    s: Sensitive,
+    s: &'a Sensitive,
 }
 
 impl Home<'_> {
@@ -960,7 +960,7 @@ impl PolicyEngine for DefaultPolicy {
                 let h = Home {
                     input,
                     a: &a,
-                    s: deny::sensitive(input),
+                    s: &a.sensitive,
                 };
                 h.evaluate(&out.covered, out.allow_rule)
             }

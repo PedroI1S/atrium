@@ -48,6 +48,9 @@ pub struct Analysis {
     pub glob_escape: Option<GlobEscape>,
     /// Cached `(variants, unbounded)` for `search_glob_hit` and `ask_search_glob_hit`.
     pub glob_search: Option<(Vec<String>, bool)>,
+    /// The sensitive-path lists for this input, built once per evaluate and
+    /// shared by the analysis, the hard-deny check and Home (N11).
+    pub sensitive: std::rc::Rc<Sensitive>,
 }
 
 fn unknown_tok_dangerous(tok: &str, cwd: &Path, home: &Path, s: &Sensitive, piped: bool) -> bool {
@@ -215,8 +218,8 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         start: input.cwd.to_path_buf(),
         glob_escape: None,
         glob_search: None,
+        sensitive: Sensitive::shared(input),
     };
-    let s_for_unknown = Sensitive::new(input);
     let lex_cmd = |a: &mut Analysis, line: &str, start: &Path| {
         if line.len() > MAX_BYTES {
             a.overflow = true;
@@ -230,7 +233,7 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
                 &l.unbounded_unknown_words,
                 start,
                 home,
-                &s_for_unknown,
+                &a.sensitive,
             );
         }
         if l.overflow || a.units.len() > MAX_UNITS {
@@ -475,6 +478,34 @@ pub struct Sensitive {
 }
 
 impl Sensitive {
+    /// `new`, built once per evaluate and reused across evaluates on the
+    /// same thread while home and Atrium's paths stay the same (N11).
+    pub fn shared(input: &PolicyInput<'_>) -> std::rc::Rc<Self> {
+        type Key = (PathBuf, Vec<PathBuf>, Vec<PathBuf>);
+        thread_local! {
+            static LAST: std::cell::RefCell<Option<(Key, std::rc::Rc<Sensitive>)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        LAST.with(|last| {
+            let mut last = last.borrow_mut();
+            if let Some(((h, d, p), s)) = last.as_ref()
+                && h == input.home
+                && d.as_slice() == input.atrium_data_paths
+                && p.as_slice() == input.atrium_protected_paths
+            {
+                return s.clone();
+            }
+            let s = std::rc::Rc::new(Self::new(input));
+            let key = (
+                input.home.to_path_buf(),
+                input.atrium_data_paths.to_vec(),
+                input.atrium_protected_paths.to_vec(),
+            );
+            *last = Some((key, s.clone()));
+            s
+        })
+    }
+
     pub fn new(input: &PolicyInput<'_>) -> Self {
         let home = lower(input.home);
         let data: Vec<String> = input.atrium_data_paths.iter().map(|p| lower(p)).collect();
@@ -1081,7 +1112,7 @@ fn find_delete(eff: &[String]) -> Option<(Vec<String>, bool)> {
 struct Ctx<'a> {
     input: &'a PolicyInput<'a>,
     a: &'a Analysis,
-    s: Sensitive,
+    s: &'a Sensitive,
 }
 
 impl Ctx<'_> {
@@ -1719,7 +1750,7 @@ impl Ctx<'_> {
 
         fn seg_ok(c: &str, q: &str) -> bool {
             (c.starts_with(['.', '{', '\\']) || !q.starts_with('.'))
-                && (c.contains(['*', '?', '[', '{', '\\']) || c == q)
+                && (has_any(c, &['*', '?', '[', '{', '\\']) || c == q)
         }
         fn slice_matches_iter<'a, I: Iterator<Item = &'a str>>(pat: &[&str], probe: I) -> bool {
             let mut idx = 0usize;
@@ -1751,7 +1782,7 @@ impl Ctx<'_> {
         let rel = &pl_segs[home_segs.len()..];
         if !rel[0].starts_with(['.', '{', '\\'])
             && (rel.len() == 1
-                || (!rel[0].contains(['*', '?', '[', '{', '\\']) && rel[0] != "library"))
+                || (!has_any(rel[0], &['*', '?', '[', '{', '\\']) && rel[0] != "library"))
         {
             return false;
         }
@@ -1766,10 +1797,17 @@ impl Ctx<'_> {
                 && seg_ok(rel[0], ".ssh")
                 && SSH_PROBES.iter().any(|n| seg_ok(rel[1], n)))
             || BROWSER_ROOTS.iter().any(|b| {
-                BROWSER_PROBE_FILES.iter().any(|f| {
-                    slice_matches_iter(rel, b.split('/').chain(std::iter::once(*f)))
-                        || slice_matches_iter(rel, b.split('/').chain(["default", *f]))
-                })
+                // a probe is the root plus one or two segments: check the
+                // length before walking segments (N11)
+                let nb = b.split('/').count();
+                (rel.len() == nb + 1
+                    && BROWSER_PROBE_FILES
+                        .iter()
+                        .any(|f| slice_matches_iter(rel, b.split('/').chain(std::iter::once(*f)))))
+                    || (rel.len() == nb + 2
+                        && BROWSER_PROBE_FILES
+                            .iter()
+                            .any(|f| slice_matches_iter(rel, b.split('/').chain(["default", *f]))))
             })
     }
 
@@ -1787,7 +1825,7 @@ impl Ctx<'_> {
         let mut prefix = PathBuf::new();
         for c in Path::new(&pl).components() {
             let s = c.as_os_str().to_string_lossy();
-            if s.contains(['*', '?', '[']) {
+            if has_any(&s, &['*', '?', '[']) {
                 break;
             }
             prefix.push(c.as_os_str());
@@ -4160,17 +4198,13 @@ pub fn hard_deny(input: &PolicyInput<'_>, a: &Analysis) -> Option<&'static str> 
     let ctx = Ctx {
         input,
         a,
-        s: Sensitive::new(input),
+        s: &a.sensitive,
     };
     let hits = ctx.check();
     HARD_DENY_DEFAULTS
         .iter()
         .map(|d| d.id)
         .find(|id| hits.contains(id))
-}
-
-pub fn sensitive(input: &PolicyInput<'_>) -> Sensitive {
-    Sensitive::new(input)
 }
 
 /// The credential stores that ask (CR-12), absolute: files and folders
