@@ -472,6 +472,8 @@ pub struct Sensitive {
     data: Vec<String>,
     protected: Vec<String>,
     raw_forms: Vec<(String, &'static str)>,
+    /// The glob matcher's sensitive shapes, built on first use (D-131).
+    specs: std::sync::OnceLock<Specs>,
 }
 
 impl Sensitive {
@@ -498,6 +500,7 @@ impl Sensitive {
             data,
             protected,
             raw_forms,
+            specs: std::sync::OnceLock::new(),
         }
     }
 
@@ -563,26 +566,30 @@ impl Sensitive {
         all.iter().any(|s| under(s, &pl).is_some())
     }
 
-    const DATA_PROBE_FILES: &[&str] = &[
-        "x",
-        "db",
+    /// Atrium's data files (`lifecycle.rs`: the store and its WAL/SHM/journal,
+    /// the development app identity). The one list both the probes and the
+    /// glob matcher read.
+    const DATA_FILES: &[&str] = &[
         "atrium.db",
         "atrium.db-wal",
         "atrium.db-shm",
         "atrium.db-journal",
         "app-identity.json",
-        "snapshots/x",
-        "logs/x",
     ];
-    const PROTECTED_PROBE_FILES: &[&str] = &[
-        "x",
+    /// Atrium's data subfolders (`lifecycle.rs`: snapshots, logs).
+    const DATA_SUBTREES: &[&str] = &["snapshots", "logs"];
+    /// Atrium's runtime and config files in a protected folder
+    /// (`lifecycle.rs`: `daemon.sock`, `daemon.lock`; the config file).
+    const PROTECTED_FILES: &[&str] = &[
+        "daemon.sock",
+        "daemon.lock",
         "config.toml",
         "atrium.sock",
         "atrium.lock",
-        "daemon.lock",
     ];
 
-    /// Representative sensitive paths a glob could be hitting.
+    /// Representative sensitive paths a glob could be hitting (`dev`'s
+    /// sample set: the floor every glob check keeps).
     fn probes(&self) -> Vec<String> {
         let abs = |rel: &str| format!("{}/{rel}", self.home);
         let mut v = vec![];
@@ -607,222 +614,115 @@ impl Sensitive {
         }
         for d in &self.data {
             v.push(d.clone());
-            for f in Self::DATA_PROBE_FILES {
+            v.push(format!("{d}/x"));
+            for f in Self::DATA_FILES {
                 v.push(format!("{d}/{f}"));
+            }
+            for st in Self::DATA_SUBTREES {
+                v.push(format!("{d}/{st}/x"));
             }
         }
         v
     }
 
+    /// The sensitive shapes, built once per `Sensitive` on first use.
+    fn specs(&self) -> &Specs {
+        self.specs.get_or_init(|| Specs::build(self))
+    }
+
     /// A word with glob characters: does the pattern reach a sensitive path?
     fn glob_hit(&self, pattern: &Path, role: Role) -> Option<&'static str> {
-        with_lower_path(pattern, |pl| {
-            // literal directory prefix
-            let hit_prefix = if !(pl.contains("/./")
-                || pl.contains("/../")
-                || pl.ends_with("/.")
-                || pl.ends_with("/.."))
-            {
-                let prefix_str = match pl.find(['*', '?', '[']) {
-                    Some(meta) => match pl[..meta].rfind('/') {
-                        Some(0) => "/",
-                        Some(i) => &pl[..i],
-                        None => "",
-                    },
-                    None => pl,
-                };
-                if !prefix_str.is_empty() && prefix_str != "/" {
-                    self.hit(Path::new(prefix_str), role)
-                } else {
-                    None
+        let pl = lower(pattern);
+        // literal directory prefix
+        let mut prefix = PathBuf::new();
+        for c in Path::new(&pl).components() {
+            let s = c.as_os_str().to_string_lossy();
+            if s.contains(['*', '?', '[', '{']) {
+                break;
+            }
+            prefix.push(c.as_os_str());
+        }
+        if prefix.as_os_str() != "/"
+            && !prefix.as_os_str().is_empty()
+            && let Some(h) = self.hit(&prefix, role)
+        {
+            return Some(h);
+        }
+        self.glob_str_hit(&pl, role)
+    }
+
+    /// The shared glob check (D-131) for a lower-case absolute pattern:
+    /// `dev`'s probes, then the keyed sensitive shapes.
+    fn glob_str_hit(&self, pl: &str, role: Role) -> Option<&'static str> {
+        if !pl.starts_with('/') {
+            return None;
+        }
+        let specs = self.specs();
+        let mut budget = Budget::new();
+        let (pats, keyed) = PathPat::parse_all(pl);
+        for pp in &pats {
+            for (probe, id) in &specs.floor {
+                if path_meets(pp, probe, role, false, &mut budget) {
+                    return Some(id);
                 }
-            } else {
-                let mut prefix = PathBuf::new();
-                for c in Path::new(pl).components() {
-                    let s = c.as_os_str().to_string_lossy();
-                    if s.contains(['*', '?', '[']) {
-                        break;
-                    }
-                    prefix.push(c.as_os_str());
-                }
-                if prefix.as_os_str() != "/" {
-                    self.hit(&prefix, role)
-                } else {
-                    None
-                }
-            };
-            if let Some(h) = hit_prefix {
-                return Some(h);
             }
-            if !pl.contains("**")
-                && !path_could_reach_root(pl, &self.home)
-                && !self.data.iter().any(|d| path_could_reach_root(pl, d))
-                && (role == Role::Read
-                    || !self.protected.iter().any(|d| path_could_reach_root(pl, d)))
-            {
-                return None;
-            }
-            let glob = ShellGlob::new(pl);
-            let tail_all = glob.as_tail();
-            let matches_dir_list = |dirs: &[String], files: &[&str], subtrees: &[&str]| {
-                dirs.iter().any(|d| {
-                    if glob.abs != d.starts_with('/') {
-                        return false;
-                    }
-                    let d_segs = Segs::from_str(d);
-                    if !glob.has_globstar && glob.parts().len() < d_segs.len() {
-                        return false;
-                    }
-                    tail_all.matches_tree_segs(d_segs.as_slice())
-                        || tail_all.matches_exact_segs(d_segs.as_slice())
-                        || files.iter().any(|f| {
-                            let segs = d_segs.extended_with(f);
-                            tail_all.matches_exact_segs(segs.as_slice())
-                        })
-                        || subtrees.iter().any(|st| {
-                            let segs = d_segs.extended_with(st);
-                            tail_all.matches_tree_segs(segs.as_slice())
-                        })
-                })
-            };
-            if matches_dir_list(&self.data, Self::DATA_PROBE_FILES, &["snapshots", "logs"])
-                || (role != Role::Read
-                    && matches_dir_list(&self.protected, Self::PROTECTED_PROBE_FILES, &[]))
-            {
-                return Some("atrium-self");
-            }
-            let home_tails = glob.tails_after(&self.home);
-            if home_tails.is_empty() {
-                return None;
-            }
-            let tails = home_tails.as_slice();
-            for f in CRED_FILES {
-                let f_segs = Segs::from_str(f);
-                if tails
-                    .iter()
-                    .any(|t| t.matches_exact_segs(f_segs.as_slice()))
+            for s in &specs.hard {
+                if (role != Role::Read || !s.write_only)
+                    && path_meets(pp, &s.comps, role, keyed, &mut budget)
                 {
-                    return Some("credential-read");
+                    return Some(s.id);
                 }
             }
-            for tree in CRED_TREES {
-                let t_segs = Segs::from_str(tree);
-                let tx_segs = t_segs.extended_with("x");
-                if tails.iter().any(|t| {
-                    t.matches_tree_segs(t_segs.as_slice())
-                        || t.matches_exact_segs(t_segs.as_slice())
-                        || t.matches_exact_segs(tx_segs.as_slice())
-                }) {
-                    return Some("credential-read");
-                }
-            }
-            if tails.iter().any(|t| t.matches_ssh_secret(role))
-                || SSH_PROBES.iter().any(|n| {
-                    let segs = Segs::from_strs(&[".ssh", n]);
-                    tails.iter().any(|t| t.matches_exact_segs(segs.as_slice()))
-                })
-            {
-                return Some("credential-read");
-            }
-            let has_deep_tail = tails.iter().any(|t| t.has_globstar || t.parts.len() >= 2);
-            if has_deep_tail && let Some(last) = glob.parts().last() {
-                let last_is_browser =
-                    matches!(last, Comp::GlobStar) || BROWSER_FILES.iter().any(|f| last.matches(f));
-                if last_is_browser {
-                    for b in BROWSER_ROOTS {
-                        let b_segs = Segs::from_str(b);
-                        let b_def_segs = b_segs.extended_with("default");
-                        if tails.iter().any(|t| {
-                            t.matches_strictly_under_segs(b_segs.as_slice())
-                                || BROWSER_FILES.iter().any(|f| {
-                                    let bf = b_segs.extended_with(f);
-                                    let bdf = b_def_segs.extended_with(f);
-                                    t.matches_exact_segs(bf.as_slice())
-                                        || t.matches_exact_segs(bdf.as_slice())
-                                })
-                        }) {
-                            return Some("credential-read");
-                        }
-                    }
-                }
-            }
-            None
-        })
+        }
+        None
     }
 
     pub fn is_ssh_dir(&self, p: &Path) -> bool {
-        with_lower_path(p, |pl| {
-            if under(pl, &self.home) == Some(".ssh") {
-                return true;
-            }
-            if !pl.contains(['*', '?', '[']) {
-                return false;
-            }
-            let last = pl.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
-            if last != "**" && !Comp::from_part(last).matches(".ssh") {
-                return false;
-            }
-            let glob = ShellGlob::new(pl);
-            glob.tails_after(&self.home)
-                .as_slice()
-                .iter()
-                .any(|t| t.matches_exact(".ssh"))
-        })
+        let pl = lower(p);
+        if under(&pl, &self.home) == Some(".ssh") {
+            return true;
+        }
+        if !pl.contains(['*', '?', '[', '{']) {
+            return false;
+        }
+        let specs = self.specs();
+        let mut budget = Budget::new();
+        let (pats, keyed) = PathPat::parse_all(&pl);
+        pats.iter()
+            .any(|pp| path_meets(pp, &specs.ssh_dir, Role::Read, keyed, &mut budget))
     }
 
     /// A credential store that asks (CR-12): `p` is one, or is inside one
     /// of its folders.
     pub fn ask_hit(&self, p: &Path) -> bool {
-        with_lower_path(p, |pl| {
-            if let Some(rest) = under(pl, &self.home)
-                && (ASK_FILES.iter().any(|f| {
-                    (f.is_ascii() && f.eq_ignore_ascii_case(rest))
-                        || (!f.is_ascii() && f.to_lowercase() == rest)
-                }) || ASK_TREES.iter().any(|t| under(rest, t).is_some())
-                    || ASK_NAME_PREFIXES.iter().any(|(dir, pre)| {
-                        under(rest, dir).is_some_and(|r| !r.contains('/') && r.starts_with(pre))
-                    }))
-            {
-                return true;
-            }
-            if !pl.contains(['*', '?', '[']) {
-                return false;
-            }
-            if !pl.contains("**") && !path_could_reach_root(pl, &self.home) {
-                return false;
-            }
-            let glob = ShellGlob::new(pl);
-            let home_tails = glob.tails_after(&self.home);
-            if home_tails.is_empty() {
-                return false;
-            }
-            let tails = home_tails.as_slice();
-            if ASK_FILES.iter().any(|f| {
-                with_lower_str(f, |fl| {
-                    let f_segs = Segs::from_str(fl);
-                    tails
-                        .iter()
-                        .any(|t| t.matches_exact_segs(f_segs.as_slice()))
-                })
-            }) {
-                return true;
-            }
-            if ASK_TREES.iter().any(|tr| {
-                let t_segs = Segs::from_str(tr);
-                let tx_segs = t_segs.extended_with("x.json");
-                tails.iter().any(|t| {
-                    t.matches_tree_segs(t_segs.as_slice())
-                        || t.matches_exact_segs(t_segs.as_slice())
-                        || t.matches_exact_segs(tx_segs.as_slice())
-                })
-            }) {
-                return true;
-            }
-            ASK_NAME_PREFIXES.iter().any(|(dir, pre)| {
-                tails
-                    .iter()
-                    .any(|t| t.matches_dir_and_name_prefix(dir, pre))
-            })
+        let pl = lower(p);
+        if let Some(rest) = under(&pl, &self.home)
+            && (ASK_FILES.iter().any(|f| f.to_lowercase() == rest)
+                || ASK_TREES.iter().any(|t| under(rest, t).is_some())
+                || ASK_NAME_PREFIXES.iter().any(|(dir, pre)| {
+                    under(rest, dir).is_some_and(|r| !r.contains('/') && r.starts_with(pre))
+                }))
+        {
+            return true;
+        }
+        if !pl.contains(['*', '?', '[', '{']) {
+            return false;
+        }
+        self.ask_glob_str_hit(&pl)
+    }
+
+    fn ask_glob_str_hit(&self, pl: &str) -> bool {
+        if !pl.starts_with('/') {
+            return false;
+        }
+        let specs = self.specs();
+        let mut budget = Budget::new();
+        let (pats, keyed) = PathPat::parse_all(pl);
+        pats.iter().any(|pp| {
+            specs
+                .ask
+                .iter()
+                .any(|s| path_meets(pp, &s.comps, Role::Read, keyed, &mut budget))
         })
     }
 
@@ -883,113 +783,15 @@ impl Sensitive {
         }) {
             return true;
         }
-        // Prefix-named stores (`~/.azure/msal_token_cache.*`) with any extension.
-        for (dir, pre) in ASK_NAME_PREFIXES {
-            let dir_abs = format!("{}/{dir}", self.home);
-            for rl in &root_lowers {
-                let Some(dir_rel) = under(&dir_abs, rl) else {
-                    continue;
-                };
-                for norm in variants {
-                    if dir_rel.is_empty() {
-                        if !norm.contains('/') {
-                            if matches_ask_name_prefix_pat(norm, pre) {
-                                return true;
-                            }
-                        } else if let Some((dir_pat, file_pat)) = norm.rsplit_once('/')
-                            && (dir_pat == "**" || dir_pat == dir_abs)
-                            && matches_ask_name_prefix_pat(file_pat, pre)
-                        {
-                            return true;
-                        }
-                        continue;
-                    }
-                    if let Some((dir_pat, file_pat)) = norm.rsplit_once('/')
-                        && !dir_pat.is_empty()
-                        && matches_ask_name_prefix_pat(file_pat, pre)
-                    {
-                        let dir_match = dir_pat == "**"
-                            || GlobBuilder::new(dir_pat)
-                                .literal_separator(false)
-                                .build()
-                                .map_or(true, |g| {
-                                    let m = g.compile_matcher();
-                                    m.is_match(dir_rel) || m.is_match(&dir_abs)
-                                });
-                        if dir_match {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        // Any search of an ASK_TREE with a filename filter (`.zsh_sessions/*.session`).
-        // A generic `**` / `*` directory wildcard (`**/*.rs`) asks only when its
-        // later components could match a file in an ask tree's filename family.
-        let mut tree_targets: Vec<(&str, String, String)> = vec![];
+        // A search rooted inside a folder whose every file asks.
         for t in ASK_TREES {
             let t_abs = format!("{}/{t}", self.home);
-            for rl in &root_lowers {
-                if under(rl, &t_abs).is_some() {
-                    return true;
-                }
-                if let Some(tree_rel) = under(&t_abs, rl) {
-                    tree_targets.push((*t, tree_rel.to_string(), t_abs.clone()));
-                }
+            if root_lowers.iter().any(|rl| under(rl, &t_abs).is_some()) {
+                return true;
             }
         }
-        if !tree_targets.is_empty() {
-            for norm in variants {
-                for (idx, _) in norm.match_indices('/') {
-                    if idx == 0 {
-                        continue;
-                    }
-                    let dir_pat = &norm[..idx];
-                    let rest = &norm[idx + 1..];
-                    let generic_dir = matches!(dir_pat.rsplit('/').next(), Some("**" | "*"));
-                    if dir_pat == "**" {
-                        if !generic_dir || rest.is_empty() {
-                            return true;
-                        }
-                        if tree_targets
-                            .iter()
-                            .any(|(tree, _, _)| ask_tree_matches_rest(tree, rest))
-                            || GlobBuilder::new(rest)
-                                .literal_separator(false)
-                                .build()
-                                .is_err()
-                        {
-                            return true;
-                        }
-                        continue;
-                    }
-                    let Ok(g) = GlobBuilder::new(dir_pat).literal_separator(true).build() else {
-                        return true;
-                    };
-                    let m = g.compile_matcher();
-                    let mut rest_checked = false;
-                    for (tree, tree_rel, t_abs) in &tree_targets {
-                        if !(m.is_match(tree_rel) || m.is_match(t_abs)) {
-                            continue;
-                        }
-                        if !generic_dir || rest.is_empty() || ask_tree_matches_rest(tree, rest) {
-                            return true;
-                        }
-                        if !rest_checked {
-                            rest_checked = true;
-                            if GlobBuilder::new(rest)
-                                .literal_separator(false)
-                                .build()
-                                .is_err()
-                            {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        false
+        // The anchored forms of the filter, through the shared matcher (K8).
+        variants.iter().any(|v| self.ask_glob_str_hit(v))
     }
 
     /// Raw-text check: home-anchored credential paths and Atrium's data.
@@ -1031,610 +833,628 @@ impl Sensitive {
     }
 }
 
-fn trim_trailing_slash(s: &str, trim_slash: bool) -> &str {
-    if !trim_slash {
-        return s;
+// ---------------------------------------------------------------------------
+// The bounded glob-component matcher (D-131)
+// ---------------------------------------------------------------------------
+//
+// One matcher decides whether a path pattern (`*`, `?`, `[...]` with POSIX
+// classes and ranges, `**`, braces expanded within a budget) can name a
+// sensitive path. Sensitive paths are written as *shapes*: a list of
+// components, each a literal name, a name glob (`*.session`,
+// `msal_token_cache.*`), a set of names, "any one name", "any number of
+// names", or "an SSH name that isn't public". Both levels are dynamic
+// programs over (pattern position, shape position) with a step budget, so
+// adjacent globstars and long patterns cost linear-bounded work and nothing
+// recurses. When the budget runs out the answer is "can match" (fail
+// closed: the shape's own verdict, never Allow).
+//
+// *Keys* keep ordinary globs ordinary: a shape marks the components that
+// name it (a tree's folder, a store's file name). A component that matches
+// every name (`*`, `***`, `?*`, `**`) only counts against a key when every
+// later pattern component also matches everything (`~/.config/*/*`,
+// `~/**`), so `~/.config/*/settings.json` and `~/**/*.rs` stay ordinary
+// while `~/.g*/k.key` and `~/**/b.session` don't.
+
+/// Work allowed per query, in DP states.
+const MATCH_BUDGET: u64 = 4_000_000;
+/// Brace expansions read exactly; more and the pattern is widened.
+const MAX_PATH_VARIANTS: usize = 64;
+
+struct Budget(u64);
+
+impl Budget {
+    fn new() -> Self {
+        Self(MATCH_BUDGET)
     }
-    let trimmed = s.trim_end_matches('/');
-    if trimmed.is_empty() { "/" } else { trimmed }
-}
-
-fn with_lower_or<R>(
-    s: Option<&str>,
-    trim_slash: bool,
-    fallback: impl FnOnce() -> String,
-    f: impl FnOnce(&str) -> R,
-) -> R {
-    if let Some(s) = s {
-        let mut is_ascii = true;
-        let mut has_upper = false;
-        for &b in s.as_bytes() {
-            if !b.is_ascii() {
-                is_ascii = false;
-                break;
-            }
-            has_upper |= b.is_ascii_uppercase();
+    /// Spends `n` steps; `false` once the budget is gone.
+    fn take(&mut self, n: u64) -> bool {
+        if self.0 < n {
+            self.0 = 0;
+            return false;
         }
-        if is_ascii {
-            if !has_upper {
-                return f(trim_trailing_slash(s, trim_slash));
-            }
-            if s.len() <= 512 {
-                let mut buf = [0u8; 512];
-                let n = s.len();
-                buf[..n].copy_from_slice(s.as_bytes());
-                buf[..n].make_ascii_lowercase();
-                let lower_s = std::str::from_utf8(&buf[..n]).unwrap();
-                return f(trim_trailing_slash(lower_s, trim_slash));
-            }
-        }
-    }
-    f(&fallback())
-}
-
-fn with_lower_path<R>(p: &Path, f: impl FnOnce(&str) -> R) -> R {
-    with_lower_or(p.to_str(), true, || lower(p), f)
-}
-
-fn with_lower_str<R>(s: &str, f: impl FnOnce(&str) -> R) -> R {
-    with_lower_or(Some(s), false, || s.to_lowercase(), f)
-}
-
-fn path_could_reach_root(pl: &str, root: &str) -> bool {
-    if root.contains("//") {
-        return true;
-    }
-    let first_meta = pl.find(['*', '?', '[', '{', '\\']).unwrap_or(pl.len());
-    let Some(slash) = pl[..first_meta].rfind('/') else {
-        return true;
-    };
-    let raw_dir = &pl[..slash];
-    if raw_dir.contains("//") {
-        return true;
-    }
-    let ld = raw_dir.trim_end_matches('/');
-    let ld = if ld.is_empty() { "/" } else { ld };
-    under(root, ld).is_some() || under(ld, root).is_some()
-}
-
-const MAX_STACK_SEGS: usize = 16;
-
-struct SegsStack<'a> {
-    buf: [&'a str; MAX_STACK_SEGS],
-    len: usize,
-}
-
-enum Segs<'a> {
-    Stack(Box<SegsStack<'a>>),
-    Heap(Vec<&'a str>),
-}
-
-impl<'a> Segs<'a> {
-    fn from_str(s: &'a str) -> Self {
-        Self::from_strs(&[s])
-    }
-
-    fn from_strs(parts: &[&'a str]) -> Self {
-        let mut buf = [""; MAX_STACK_SEGS];
-        let mut len = 0;
-        let mut heap: Option<Vec<&'a str>> = None;
-        for &part in parts {
-            for seg in part.split('/').filter(|s| !s.is_empty()) {
-                if let Some(v) = &mut heap {
-                    v.push(seg);
-                } else if len < MAX_STACK_SEGS {
-                    buf[len] = seg;
-                    len += 1;
-                } else {
-                    let mut v = Vec::with_capacity(24);
-                    v.extend_from_slice(&buf[..len]);
-                    v.push(seg);
-                    heap = Some(v);
-                }
-            }
-        }
-        match heap {
-            Some(v) => Self::Heap(v),
-            None => Self::Stack(Box::new(SegsStack { buf, len })),
-        }
-    }
-
-    fn extended_with(&self, extra: &'a str) -> Self {
-        let base = self.as_slice();
-        let mut buf = [""; MAX_STACK_SEGS];
-        let mut len = 0;
-        let mut heap: Option<Vec<&'a str>> = None;
-        if base.len() <= MAX_STACK_SEGS {
-            buf[..base.len()].copy_from_slice(base);
-            len = base.len();
-        } else {
-            heap = Some(base.to_vec());
-        }
-        for seg in extra.split('/').filter(|s| !s.is_empty()) {
-            if let Some(v) = &mut heap {
-                v.push(seg);
-            } else if len < MAX_STACK_SEGS {
-                buf[len] = seg;
-                len += 1;
-            } else {
-                let mut v = Vec::with_capacity(24);
-                v.extend_from_slice(&buf[..len]);
-                v.push(seg);
-                heap = Some(v);
-            }
-        }
-        match heap {
-            Some(v) => Self::Heap(v),
-            None => Self::Stack(Box::new(SegsStack { buf, len })),
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Self::Stack(s) => s.len,
-            Self::Heap(v) => v.len(),
-        }
-    }
-
-    fn as_slice(&self) -> &[&'a str] {
-        match self {
-            Self::Stack(s) => &s.buf[..s.len],
-            Self::Heap(v) => v.as_slice(),
-        }
+        self.0 -= n;
+        true
     }
 }
 
-enum BoolDp {
-    Stack {
-        a: [bool; 64],
-        b: [bool; 64],
-        len: usize,
+/// A one-character set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CSet {
+    Lit(char),
+    /// `?`
+    Any,
+    /// `[...]`: ASCII membership as a bitmap, and whether non-ASCII
+    /// characters are in it (all of them, read conservatively).
+    Class {
+        bits: u128,
+        hi: bool,
     },
-    Heap {
-        a: Vec<bool>,
-        b: Vec<bool>,
-    },
+    /// A class this matcher can't read (an unknown `[:name:]`): any char.
+    Unknown,
 }
 
-impl BoolDp {
-    fn new(m: usize) -> Self {
-        if m < 64 {
-            Self::Stack {
-                a: [false; 64],
-                b: [false; 64],
-                len: m + 1,
-            }
-        } else {
-            Self::Heap {
-                a: vec![false; m + 1],
-                b: vec![false; m + 1],
-            }
-        }
-    }
-
-    fn pair(&mut self) -> (&mut [bool], &mut [bool]) {
-        match self {
-            Self::Stack { a, b, len } => (&mut a[..*len], &mut b[..*len]),
-            Self::Heap { a, b } => (a.as_mut_slice(), b.as_mut_slice()),
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Atom {
+    Star,
+    One(CSet),
 }
 
-fn posix_bracket_end(bytes: &[u8], start: usize) -> Option<usize> {
-    if start + 1 >= bytes.len() || bytes[start] != b'[' {
-        return None;
-    }
-    let kind = bytes[start + 1];
-    if !matches!(kind, b':' | b'.' | b'=') {
-        return None;
-    }
-    let mut k = start + 2;
-    while k + 1 < bytes.len() {
-        if bytes[k] == kind && bytes[k + 1] == b']' {
-            return Some(k + 2);
-        }
-        k += 1;
-    }
-    None
-}
-
-fn posix_class_matches(name: &str, ch: char) -> Option<bool> {
+fn posix_class(name: &str, c: char) -> Option<bool> {
     Some(match name {
-        "alnum" => ch.is_ascii_alphanumeric(),
-        "alpha" => ch.is_ascii_alphabetic(),
-        "ascii" => ch.is_ascii(),
-        "blank" => ch == ' ' || ch == '\t',
-        "cntrl" => ch.is_ascii_control(),
-        "digit" => ch.is_ascii_digit(),
-        "graph" => ch.is_ascii_graphic(),
-        "lower" => ch.is_ascii_lowercase(),
-        "print" => ch.is_ascii_graphic() || ch == ' ',
-        "punct" => ch.is_ascii_punctuation(),
-        "space" => ch.is_ascii_whitespace() || ch == '\x0B',
-        "upper" => ch.is_ascii_uppercase(),
-        "word" => ch.is_ascii_alphanumeric() || ch == '_',
-        "xdigit" => ch.is_ascii_hexdigit(),
+        "alpha" => c.is_ascii_alphabetic(),
+        "alnum" => c.is_ascii_alphanumeric(),
+        "lower" => c.is_ascii_lowercase(),
+        "upper" => c.is_ascii_uppercase(),
+        "digit" => c.is_ascii_digit(),
+        "xdigit" => c.is_ascii_hexdigit(),
+        "punct" => c.is_ascii_punctuation(),
+        "graph" => c.is_ascii_graphic(),
+        "print" => c.is_ascii_graphic() || c == ' ',
+        "space" => c.is_ascii_whitespace() || c == '\x0b',
+        "blank" => c == ' ' || c == '\t',
+        "cntrl" => c.is_ascii_control(),
+        "word" => c.is_ascii_alphanumeric() || c == '_',
         _ => return None,
     })
 }
 
-fn first_class_end(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    if bytes.first().copied() != Some(b'[') {
-        return None;
-    }
-    let mut j = 1;
-    if j < bytes.len() && (bytes[j] == b'!' || bytes[j] == b'^') {
-        j += 1;
-    }
-    if j < bytes.len() && bytes[j] == b']' {
-        j += 1;
-    }
-    while j < bytes.len() && bytes[j] != b']' {
-        if bytes[j] == b'\\' && j + 1 < bytes.len() {
-            j += 2;
-        } else if let Some(after) = posix_bracket_end(bytes, j) {
-            j = after;
-        } else {
-            j += 1;
+fn add_range(lo: char, hi: char, bits: &mut u128) -> bool {
+    for c in 1u8..0x80 {
+        let ch = char::from(c);
+        if lo <= ch && ch <= hi {
+            *bits |= 1u128 << c;
         }
     }
-    (j < bytes.len() && bytes[j] == b']').then_some(j)
+    u32::from(hi) >= 0x80
 }
 
-fn next_class_char(s: &str) -> (char, bool, &str) {
-    let mut it = s.chars();
-    let c = it.next().unwrap();
-    if c == '\\'
-        && let Some(next) = it.next()
-    {
-        return (next, true, it.as_str());
-    }
-    (c, false, it.as_str())
-}
-
-fn class_matches_char(class: &str, ch: char) -> bool {
-    let inner = &class[1..class.len() - 1];
-    let (neg, mut rest) = if let Some(r) = inner.strip_prefix(['!', '^']) {
-        (true, r)
-    } else {
-        (false, inner)
-    };
-    let mut hit = false;
-    while !rest.is_empty() {
-        if let Some(after) = posix_bracket_end(rest.as_bytes(), 0) {
-            let expr = &rest[..after];
-            if let Some(name) = expr.strip_prefix("[:").and_then(|s| s.strip_suffix(":]"))
-                && let Some(m) = posix_class_matches(name, ch)
-            {
-                if m {
-                    hit = true;
-                }
-                rest = &rest[after..];
-                continue;
-            }
-            // Unsupported POSIX bracket syntax (`[=..=]`, `[..]` or unknown `[:..:]`):
-            // fail closed so it counts as possibly matching.
-            return true;
-        }
-        let (a, esc, after_a) = next_class_char(rest);
-        if !esc
-            && let Some(after_dash) = after_a.strip_prefix('-')
-            && !after_dash.is_empty()
-        {
-            let (b, _, after_b) = next_class_char(after_dash);
-            if a <= ch && ch <= b {
-                hit = true;
-            }
-            rest = after_b;
-        } else {
-            if a == ch {
-                hit = true;
-            }
-            rest = after_a;
-        }
-    }
-    hit ^ neg
-}
-
-fn pat_starts_with_dot(p: &str) -> bool {
-    p.starts_with('.')
-        || (p.starts_with('[')
-            && first_class_end(p).is_some_and(|end| class_matches_char(&p[..=end], '.')))
-}
-
-fn brace_branch_dot_ok(c: &str) -> bool {
-    let Some(exps) = words::brace_expand(c) else {
-        return true;
-    };
-    exps.iter().any(|e| pat_starts_with_dot(e))
-}
-
-enum GlobAtom<'a> {
-    Lit(char),
-    Any,
-    Star,
-    Class(&'a str),
-}
-
-fn next_glob_atom(pat: &str) -> Option<(GlobAtom<'_>, usize)> {
-    let ch = pat.chars().next()?;
-    let len = ch.len_utf8();
-    if ch == '\\' {
-        let lit = pat[len..].chars().next()?;
-        return Some((GlobAtom::Lit(lit), len + lit.len_utf8()));
-    }
-    if ch == '*' {
-        return Some((GlobAtom::Star, len));
-    }
-    if ch == '?' {
-        return Some((GlobAtom::Any, len));
-    }
-    if ch == '['
-        && let Some(rel_end) = first_class_end(pat)
-    {
-        return Some((GlobAtom::Class(&pat[..=rel_end]), rel_end + 1));
-    }
-    Some((GlobAtom::Lit(ch), len))
-}
-
-fn comp_glob_matches_impl(pat: &str, tgt: &str, prefix: bool) -> bool {
-    if pat.contains('{') {
-        let Some(exps) = words::brace_expand(pat) else {
-            return true;
-        };
-        return exps.iter().any(|e| comp_glob_dp(e, tgt, prefix));
-    }
-    comp_glob_dp(pat, tgt, prefix)
-}
-
-fn comp_glob_dp_slice(
-    pat: &str,
-    prefix: bool,
-    m: usize,
-    matches_at: impl Fn(usize, &GlobAtom<'_>) -> bool,
-) -> bool {
-    let mut dp_buf = BoolDp::new(m);
-    let (mut dp, mut next) = dp_buf.pair();
-    dp[0] = true;
-    let mut i = 0;
-    while i < pat.len() {
-        let Some((atom, step)) = next_glob_atom(&pat[i..]) else {
-            return false;
-        };
-        i += step;
-        match atom {
-            GlobAtom::Star => {
-                if let Some(first_true) = (0..=m).find(|&k| dp[k]) {
-                    dp[first_true..=m].fill(true);
-                }
-            }
-            atom => {
-                next.fill(false);
-                for k in 0..m {
-                    if dp[k] && matches_at(k, &atom) {
-                        next[k + 1] = true;
+/// A class body (without brackets and negation) as a set; `None` when it
+/// names an unknown `[:class:]`.
+fn class_set(body: &str, neg: bool) -> Option<CSet> {
+    let cs: Vec<char> = body.chars().collect();
+    let mut bits: u128 = 0;
+    let mut hi = false;
+    let mut k = 0;
+    while k < cs.len() {
+        if cs[k] == '[' && cs.get(k + 1) == Some(&':') {
+            let rest: String = cs[k + 2..].iter().collect();
+            if let Some(end) = rest.find(":]") {
+                let name = &rest[..end];
+                for c in 1u8..0x80 {
+                    if posix_class(name, char::from(c))? {
+                        bits |= 1u128 << c;
                     }
                 }
-                std::mem::swap(&mut dp, &mut next);
+                k += 2 + name.chars().count() + 2;
+                continue;
             }
         }
-        if prefix && dp[m] {
-            return true;
-        }
-        if !dp.iter().any(|&b| b) {
-            return false;
-        }
-    }
-    dp[m]
-}
-
-fn comp_glob_dp(pat: &str, tgt: &str, prefix: bool) -> bool {
-    if pat == tgt {
-        return true;
-    }
-    if tgt.starts_with('.') && !pat_starts_with_dot(pat) {
-        return false;
-    }
-    if !prefix {
-        if !pat.contains(['*', '?', '[', '\\']) {
-            return false;
-        }
-        let first_meta = pat.find(['*', '?', '[', '\\']).unwrap_or(pat.len());
-        if first_meta > 0 && !tgt.starts_with(&pat[..first_meta]) {
-            return false;
-        }
-        if let Some(last_meta) = pat.rfind(['*', '?', ']', '\\']) {
-            let suf = &pat[last_meta + 1..];
-            if !suf.is_empty() && !tgt.ends_with(suf) {
-                return false;
-            }
+        let (lo, nk) = if cs[k] == '\\' && k + 1 < cs.len() {
+            (cs[k + 1], k + 2)
+        } else {
+            (cs[k], k + 1)
+        };
+        if nk + 1 < cs.len() && cs[nk] == '-' {
+            let (h, nk2) = if cs[nk + 1] == '\\' && nk + 2 < cs.len() {
+                (cs[nk + 2], nk + 3)
+            } else {
+                (cs[nk + 1], nk + 2)
+            };
+            hi |= add_range(lo, h, &mut bits);
+            k = nk2;
+        } else {
+            hi |= add_range(lo, lo, &mut bits);
+            k = nk;
         }
     }
-    if tgt.is_ascii() {
-        let tb = tgt.as_bytes();
-        let m = tb.len();
-        if prefix && m == 0 {
-            return true;
+    let nul = !1u128; // NUL is never in a name
+    Some(if neg {
+        CSet::Class {
+            bits: !bits & nul,
+            hi: !hi,
         }
-        return comp_glob_dp_slice(pat, prefix, m, |k, atom| match atom {
-            GlobAtom::Any => true,
-            GlobAtom::Lit(lit) => lit.is_ascii() && tb[k] == (*lit as u8),
-            GlobAtom::Class(cls) => class_matches_char(cls, tb[k] as char),
-            GlobAtom::Star => unreachable!(),
-        });
-    }
-    let tc: Vec<char> = tgt.chars().collect();
-    let m = tc.len();
-    if prefix && m == 0 {
-        return true;
-    }
-    comp_glob_dp_slice(pat, prefix, m, |k, atom| match atom {
-        GlobAtom::Any => true,
-        GlobAtom::Lit(lit) => tc[k] == *lit,
-        GlobAtom::Class(cls) => class_matches_char(cls, tc[k]),
-        GlobAtom::Star => unreachable!(),
+    } else {
+        CSet::Class {
+            bits: bits & nul,
+            hi,
+        }
     })
 }
 
-#[derive(Clone, Copy)]
-enum Comp<'a> {
-    GlobStar,
-    Literal(&'a str),
-    Pattern { raw: &'a str, dot_ok: bool },
+/// The byte index of the `]` closing the class opened at `start`.
+fn class_end(pat: &str, start: usize) -> Option<usize> {
+    let b = pat.as_bytes();
+    let mut j = start + 1;
+    if matches!(b.get(j), Some(b'!' | b'^')) {
+        j += 1;
+    }
+    if b.get(j) == Some(&b']') {
+        j += 1;
+    }
+    while j < b.len() {
+        match b[j] {
+            b'[' if b.get(j + 1) == Some(&b':') => match pat[j + 2..].find(":]") {
+                Some(e) => j += 2 + e + 2,
+                None => j += 1,
+            },
+            b'\\' => j += 2,
+            b']' => return Some(j),
+            _ => j += 1,
+        }
+    }
+    None
 }
 
-impl<'a> Comp<'a> {
-    fn from_part(c: &'a str) -> Self {
-        if c == "**" {
-            return Self::GlobStar;
+fn parse_atoms(pat: &str) -> Vec<Atom> {
+    let mut out = Vec::with_capacity(pat.len());
+    let mut it = pat.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        match c {
+            '*' => {
+                if out.last() != Some(&Atom::Star) {
+                    out.push(Atom::Star);
+                }
+            }
+            '?' => out.push(Atom::One(CSet::Any)),
+            '\\' => match it.next() {
+                Some((_, e)) => out.push(Atom::One(CSet::Lit(e))),
+                None => out.push(Atom::One(CSet::Lit('\\'))),
+            },
+            '[' => match class_end(pat, i) {
+                Some(end) => {
+                    let inner = &pat[i + 1..end];
+                    let (neg, body) = match inner.strip_prefix(['!', '^']) {
+                        Some(b) => (true, b),
+                        None => (false, inner),
+                    };
+                    out.push(Atom::One(class_set(body, neg).unwrap_or(CSet::Unknown)));
+                    while it.peek().is_some_and(|(k, _)| *k <= end) {
+                        it.next();
+                    }
+                }
+                None => out.push(Atom::One(CSet::Lit('['))),
+            },
+            _ => out.push(Atom::One(CSet::Lit(c))),
         }
-        if !c.contains(['*', '?', '[', '{']) {
-            return Self::Literal(c);
-        }
-        let dot_ok = pat_starts_with_dot(c)
-            || (c.starts_with('{') && c.contains(['.', '[']) && brace_branch_dot_ok(c));
-        Self::Pattern { raw: c, dot_ok }
     }
+    out
+}
 
-    fn matches(&self, target: &str) -> bool {
+/// The characters tried for a set: ASCII, and `é` for every non-ASCII one.
+fn universe() -> impl Iterator<Item = char> {
+    (1u8..0x80).map(char::from).chain(std::iter::once('é'))
+}
+
+impl CSet {
+    fn has(&self, c: char) -> bool {
         match self {
-            Self::GlobStar => true,
-            Self::Literal(s) => *s == target,
-            Self::Pattern { raw, dot_ok } => {
-                (*dot_ok || !target.starts_with('.')) && comp_glob_matches_impl(raw, target, false)
+            CSet::Lit(l) => *l == c,
+            CSet::Any | CSet::Unknown => true,
+            CSet::Class { bits, hi } => {
+                let u = u32::from(c);
+                if u < 0x80 {
+                    bits & (1u128 << u) != 0
+                } else {
+                    *hi
+                }
             }
         }
     }
 
-    fn is_bare_star(&self) -> bool {
-        matches!(self, Self::Pattern { raw: "*", .. })
-    }
-
-    fn is_catchall(&self) -> bool {
-        matches!(self, Self::GlobStar) || self.is_bare_star()
-    }
-
-    fn is_singleton_literal(&self, s: &str) -> bool {
+    /// The one character this set matches, if it matches exactly one.
+    fn singleton(&self) -> Option<char> {
         match self {
-            Self::GlobStar => false,
-            Self::Literal(l) => *l == s,
-            Self::Pattern { raw, .. } => pat_is_singleton_literal(raw, s),
-        }
-    }
-
-    fn is_public_ssh_name(&self) -> bool {
-        match self {
-            Self::GlobStar => false,
-            Self::Literal(s) => s.ends_with(".pub") || s.starts_with("known_hosts"),
-            Self::Pattern { raw, .. } => pat_is_public_ssh_name(raw),
-        }
-    }
-
-    fn matches_prefix(&self, pre: &str) -> bool {
-        match self {
-            Self::GlobStar => true,
-            Self::Literal(s) => s.starts_with(pre),
-            Self::Pattern { raw, .. } => matches_ask_name_prefix_pat(raw, pre),
+            CSet::Lit(l) => Some(*l),
+            CSet::Any | CSet::Unknown => None,
+            CSet::Class { bits, hi } => {
+                (!*hi && bits.count_ones() == 1).then(|| char::from(bits.trailing_zeros() as u8))
+            }
         }
     }
 }
 
-fn atom_matches_char(atom: &GlobAtom<'_>, ch: char) -> bool {
-    match atom {
-        GlobAtom::Any => true,
-        GlobAtom::Lit(lit) => *lit == ch,
-        GlobAtom::Class(cls) => class_matches_char(cls, ch),
-        GlobAtom::Star => unreachable!(),
+/// One character step of a component DP: a set, and whether it may be a
+/// name's leading `.` (`*` and `?` can't, as in the shell).
+fn sets_meet(x: CSet, x_dot: bool, y: CSet, y_dot: bool, first: bool) -> bool {
+    let ok = |c: char| c != '/' && (!first || c != '.' || (x_dot && y_dot));
+    if let CSet::Lit(l) = x {
+        return ok(l) && y.has(l);
     }
+    if let CSet::Lit(l) = y {
+        return ok(l) && x.has(l);
+    }
+    universe().any(|c| ok(c) && x.has(c) && y.has(c))
 }
 
-fn atom_matches_stem_char(atom: &GlobAtom<'_>, forbid_dot: bool) -> bool {
-    match atom {
-        GlobAtom::Any => true,
-        GlobAtom::Lit(c) => *c != '/' && (!forbid_dot || *c != '.'),
-        GlobAtom::Class(cls) => {
-            !cls.is_ascii()
-                || (1u8..=127).any(|b| {
-                    b != b'/' && (!forbid_dot || b != b'.') && class_matches_char(cls, b as char)
-                })
+/// Whether two name patterns share a (non-empty) name. `loose`: `*` and `?`
+/// in `a` may match a leading dot (globset's `**` patterns). `None`: out of
+/// budget.
+fn comp_intersect(a: &[Atom], b: &[Atom], loose: bool, budget: &mut Budget) -> Option<bool> {
+    let (la, lb) = (a.len(), b.len());
+    let w = lb + 1;
+    let n = (la + 1) * w * 2;
+    if !budget.take(n as u64) {
+        return None;
+    }
+    let mut seen = vec![false; n];
+    let mut stack = vec![(0usize, 0usize, false)];
+    while let Some((i, j, s)) = stack.pop() {
+        let id = (i * w + j) * 2 + usize::from(s);
+        if seen[id] {
+            continue;
         }
-        GlobAtom::Star => unreachable!(),
+        seen[id] = true;
+        if i == la && j == lb && s {
+            return Some(true);
+        }
+        if i < la && a[i] == Atom::Star {
+            stack.push((i + 1, j, s));
+        }
+        if j < lb && b[j] == Atom::Star {
+            stack.push((i, j + 1, s));
+        }
+        if i >= la || j >= lb {
+            continue;
+        }
+        let (xa, xdot, ni, astay) = match a[i] {
+            Atom::Star => (CSet::Any, loose, i, true),
+            Atom::One(x) => (x, !matches!(x, CSet::Any) || loose, i + 1, false),
+        };
+        let (yb, ydot, nj, bstay) = match b[j] {
+            Atom::Star => (CSet::Any, false, j, true),
+            Atom::One(y) => (y, !matches!(y, CSet::Any), j + 1, false),
+        };
+        if astay && bstay {
+            continue;
+        }
+        if sets_meet(xa, xdot, yb, ydot, !s) {
+            stack.push((ni, nj, true));
+        }
     }
+    Some(false)
 }
 
-fn class_is_singleton_char(cls: &str, expected: char) -> bool {
-    if !cls.is_ascii() || !expected.is_ascii() || !class_matches_char(cls, expected) {
+/// A component that matches every name a directory listing gives (`*`,
+/// `***`, `?*`, `*[!.]*`): it doesn't single anything out.
+fn atoms_catchall(atoms: &[Atom]) -> bool {
+    let mut stars = 0;
+    let mut ones = 0;
+    for a in atoms {
+        match a {
+            Atom::Star => stars += 1,
+            Atom::One(CSet::Any) => ones += 1,
+            Atom::One(c @ CSet::Class { .. }) => {
+                if universe().any(|ch| ch != '.' && ch != '/' && !c.has(ch)) {
+                    return false;
+                }
+                ones += 1;
+            }
+            Atom::One(_) => return false,
+        }
+    }
+    stars > 0 && ones <= 1
+}
+
+/// Whether a name pattern can match an SSH file that isn't public
+/// (`*.pub`, `known_hosts*`, and at the top `config`/`authorized_keys`
+/// unless written).
+fn atoms_may_be_secret(atoms: &[Atom], top: bool, role: Role) -> bool {
+    let single = |a: &Atom| match a {
+        Atom::One(s) => s.singleton(),
+        Atom::Star => None,
+    };
+    let prefix: String = atoms.iter().map_while(single).collect();
+    let suffix: String = {
+        let mut v: Vec<char> = atoms.iter().rev().map_while(single).collect();
+        v.reverse();
+        v.into_iter().collect()
+    };
+    if suffix.ends_with(".pub") || prefix.starts_with("known_hosts") {
         return false;
     }
-    let exp_b = expected as u8;
-    (0u8..=127).all(|b| b == exp_b || !class_matches_char(cls, b as char))
+    let literal = prefix.chars().count() == atoms.len();
+    !(top && role != Role::Write && literal && (prefix == "config" || prefix == "authorized_keys"))
 }
 
-fn atom_is_singleton_char(atom: &GlobAtom<'_>, expected: char) -> bool {
-    match atom {
-        GlobAtom::Lit(c) => *c == expected,
-        GlobAtom::Class(cls) => class_is_singleton_char(cls, expected),
-        GlobAtom::Any | GlobAtom::Star => false,
-    }
+/// A pattern path component.
+enum PComp {
+    GlobStar,
+    Pat {
+        atoms: Vec<Atom>,
+        catchall: bool,
+        /// The name, when the component has no wildcard.
+        lit: Option<String>,
+    },
 }
 
-fn pat_is_singleton_literal(pat: &str, target: &str) -> bool {
-    if pat.contains('{') {
-        let Some(exps) = words::brace_expand(pat) else {
-            return false;
-        };
-        return !exps.is_empty() && exps.iter().all(|e| pat_is_singleton_literal(e, target));
-    }
-    let tc: Vec<char> = target.chars().collect();
-    let mut k = 0;
-    let mut i = 0;
-    while i < pat.len() {
-        let Some((atom, step)) = next_glob_atom(&pat[i..]) else {
-            return false;
-        };
-        i += step;
-        if k >= tc.len() || !atom_is_singleton_char(&atom, tc[k]) {
-            return false;
+struct PathPat {
+    comps: Vec<PComp>,
+    /// `tail_catchall[i]`: every component from `i` on matches everything.
+    tail_catchall: Vec<bool>,
+    globstar: bool,
+}
+
+/// Widens a pattern whose braces expand too far: each outermost brace
+/// group becomes `*`, or the rest of the path `/**` when one holds a `/`.
+fn widen_braces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    let mut slash = false;
+    for c in s.chars() {
+        match c {
+            '{' => {
+                if depth == 0 {
+                    slash = false;
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if slash {
+                        let cut = out.rfind('/').unwrap_or(0);
+                        out.truncate(cut);
+                        out.push_str("/**");
+                        return out;
+                    }
+                    out.push('*');
+                }
+            }
+            '/' if depth > 0 => slash = true,
+            _ if depth > 0 => {}
+            _ => out.push(c),
         }
-        k += 1;
     }
-    k == tc.len()
+    if depth > 0 {
+        let cut = out.rfind('/').unwrap_or(0);
+        out.truncate(cut);
+        out.push_str("/**");
+    }
+    out
 }
 
-fn pat_is_public_ssh_name(pat: &str) -> bool {
-    if pat.contains('{') {
-        let Some(exps) = words::brace_expand(pat) else {
-            return false;
-        };
-        return !exps.is_empty() && exps.iter().all(|e| pat_is_public_ssh_name(e));
+impl PathPat {
+    /// The brace expansions of `s`, parsed; `keyed` is `false` when they
+    /// were too many and the pattern was widened (then nothing is ordinary).
+    fn parse_all(s: &str) -> (Vec<PathPat>, bool) {
+        match words::brace_expand(s) {
+            Some(v) if v.len() <= MAX_PATH_VARIANTS => {
+                (v.iter().map(|x| PathPat::parse(x)).collect(), true)
+            }
+            _ => (vec![PathPat::parse(&widen_braces(s))], false),
+        }
     }
-    if pat.ends_with(".pub") || pat.starts_with("known_hosts") {
-        return true;
+
+    fn parse(s: &str) -> Self {
+        let mut comps: Vec<PComp> = vec![];
+        for part in s.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if !matches!(comps.last(), Some(PComp::GlobStar) | None) {
+                        comps.pop();
+                    }
+                }
+                "**" => {
+                    if !matches!(comps.last(), Some(PComp::GlobStar)) {
+                        comps.push(PComp::GlobStar);
+                    }
+                }
+                _ => {
+                    let atoms = parse_atoms(part);
+                    let lit = atoms
+                        .iter()
+                        .map(|a| match a {
+                            Atom::One(CSet::Lit(c)) => Some(*c),
+                            _ => None,
+                        })
+                        .collect::<Option<String>>();
+                    let catchall = atoms_catchall(&atoms);
+                    comps.push(PComp::Pat {
+                        atoms,
+                        catchall,
+                        lit,
+                    });
+                }
+            }
+        }
+        let mut tail_catchall = vec![true; comps.len() + 1];
+        for i in (0..comps.len()).rev() {
+            let c = match &comps[i] {
+                PComp::GlobStar => true,
+                PComp::Pat { catchall, .. } => *catchall,
+            };
+            tail_catchall[i] = c && tail_catchall[i + 1];
+        }
+        let globstar = comps.iter().any(|c| matches!(c, PComp::GlobStar));
+        Self {
+            comps,
+            tail_catchall,
+            globstar,
+        }
     }
-    let mut atoms = vec![];
-    let mut i = 0;
-    while i < pat.len() {
-        let Some((atom, step)) = next_glob_atom(&pat[i..]) else {
-            return false;
-        };
-        atoms.push(atom);
-        i += step;
-    }
-    const PUB_CHARS: &[char] = &['.', 'p', 'u', 'b'];
-    const KH_CHARS: &[char] = &['k', 'n', 'o', 'w', 'n', '_', 'h', 'o', 's', 't', 's'];
-    (atoms.len() >= PUB_CHARS.len()
-        && atoms[atoms.len() - PUB_CHARS.len()..]
-            .iter()
-            .zip(PUB_CHARS)
-            .all(|(a, &c)| atom_is_singleton_char(a, c)))
-        || (atoms.len() >= KH_CHARS.len()
-            && atoms[..KH_CHARS.len()]
-                .iter()
-                .zip(KH_CHARS)
-                .all(|(a, &c)| atom_is_singleton_char(a, c)))
 }
 
+/// A component of a sensitive shape.
+#[derive(Debug)]
+enum SComp {
+    Lit(String),
+    /// A name glob (`*.session`).
+    Glob(String),
+    /// One of these names.
+    Names(&'static [&'static str]),
+    /// Any one name.
+    One,
+    /// Any number of names (zero included).
+    Any,
+    /// An SSH file name that isn't public (`true`: directly in `~/.ssh`).
+    Secret(bool),
+    /// A name with this prefix, written with a literal run of at least
+    /// four of the prefix's own characters.
+    Named(&'static str),
+}
+
+struct Shape {
+    comps: Vec<(SComp, bool)>,
+    id: &'static str,
+    /// Only a write touches it (Atrium's protected folders).
+    write_only: bool,
+}
+
+/// The sensitive shapes, from the same lists `Sensitive::hit` reads.
+struct Specs {
+    /// `dev`'s probes, matched without keys.
+    floor: Vec<(Vec<(SComp, bool)>, &'static str)>,
+    hard: Vec<Shape>,
+    ask: Vec<Shape>,
+    ssh_dir: Vec<(SComp, bool)>,
+}
+
+fn lits(path: &str) -> Vec<(SComp, bool)> {
+    path.split('/')
+        .filter(|c| !c.is_empty())
+        .map(|c| (SComp::Lit(c.to_string()), false))
+        .collect()
+}
+
+/// `path` and everything below it; its last name is the key.
+fn tree_shape(path: &str) -> Vec<(SComp, bool)> {
+    let mut v = lits(path);
+    if let Some(l) = v.last_mut() {
+        l.1 = true;
+    }
+    v.push((SComp::Any, false));
+    v
+}
+
+/// The file `path`; its name is the key.
+fn file_shape(path: &str) -> Vec<(SComp, bool)> {
+    let mut v = lits(path);
+    if let Some(l) = v.last_mut() {
+        l.1 = true;
+    }
+    v
+}
+
+impl Specs {
+    fn build(s: &Sensitive) -> Self {
+        let home = &s.home;
+        let abs = |rel: &str| format!("{home}/{rel}");
+        let floor = s
+            .probes()
+            .into_iter()
+            .filter_map(|p| {
+                let id = s.hit(Path::new(&p), Role::Read)?;
+                Some((lits(&p), id))
+            })
+            .collect();
+        let shape = |comps, id, write_only| Shape {
+            comps,
+            id,
+            write_only,
+        };
+        let mut hard = vec![];
+        for d in &s.data {
+            hard.push(shape(tree_shape(d), "atrium-self", false));
+            for f in Sensitive::DATA_FILES {
+                hard.push(shape(file_shape(&format!("{d}/{f}")), "atrium-self", false));
+            }
+            for st in Sensitive::DATA_SUBTREES {
+                hard.push(shape(
+                    tree_shape(&format!("{d}/{st}")),
+                    "atrium-self",
+                    false,
+                ));
+            }
+        }
+        for p in &s.protected {
+            hard.push(shape(tree_shape(p), "atrium-self", true));
+            for f in Sensitive::PROTECTED_FILES {
+                hard.push(shape(file_shape(&format!("{p}/{f}")), "atrium-self", true));
+            }
+        }
+        const CR: &str = "credential-read";
+        for f in CRED_FILES {
+            hard.push(shape(file_shape(&abs(f)), CR, false));
+        }
+        for t in CRED_TREES {
+            hard.push(shape(tree_shape(&abs(t)), CR, false));
+        }
+        let ssh_dir = file_shape(&abs(".ssh"));
+        let mut top = file_shape(&abs(".ssh"));
+        top.push((SComp::Secret(true), false));
+        hard.push(shape(top, CR, false));
+        let mut deep = file_shape(&abs(".ssh"));
+        deep.extend([
+            (SComp::One, false),
+            (SComp::Any, false),
+            (SComp::Secret(false), false),
+        ]);
+        hard.push(shape(deep, CR, false));
+        for n in SSH_PROBES.iter().filter(|n| **n != "x") {
+            hard.push(shape(file_shape(&abs(&format!(".ssh/{n}"))), CR, false));
+        }
+        for b in BROWSER_ROOTS {
+            let mut v = lits(&abs(b));
+            v.push((SComp::Any, false));
+            v.push((SComp::Names(BROWSER_FILES), true));
+            hard.push(shape(v, CR, false));
+        }
+        let mut ask = vec![];
+        for f in ASK_FILES {
+            ask.push(shape(file_shape(&abs(&f.to_lowercase())), "ask", false));
+        }
+        for t in ASK_TREES {
+            ask.push(shape(tree_shape(&abs(t)), "ask", false));
+        }
+        for (t, sufs) in ASK_TREE_SUFFIXES {
+            for suf in *sufs {
+                let mut v = lits(&abs(t));
+                v.push((SComp::Glob(format!("*{suf}")), true));
+                ask.push(shape(v, "ask", false));
+            }
+        }
+        for (dir, pre) in ASK_NAME_PREFIXES {
+            let mut v = file_shape(&abs(dir));
+            v.push((SComp::Glob(format!("{pre}*")), true));
+            ask.push(shape(v, "ask", false));
+            // Past the folder by a `**`: only a file name that spells part of
+            // the store's name (`*token_cache.custom`), not `*.rs`.
+            let mut v = lits(&abs(dir));
+            v.push((SComp::Named(pre), true));
+            ask.push(shape(v, "ask", false));
+        }
+        Self {
+            floor,
+            hard,
+            ask,
+            ssh_dir,
+        }
+    }
+}
+
+/// The file-name families of the folders whose every file asks: a `**`
+/// that passes the folder still asks when its file name can be one.
 const ASK_TREE_SUFFIXES: &[(&str, &[&str])] = &[
     (".aws/sso/cache", &[".json"]),
     (
@@ -1644,514 +1464,89 @@ const ASK_TREE_SUFFIXES: &[(&str, &[&str])] = &[
     (".bash_sessions", &[".history", ".historynew", ".session"]),
 ];
 
-/// Whether `pat` can match `<stem><suf>` (for non-empty `suf`: any non-`/` stem;
-/// for empty `suf`: a non-empty stem with no `.` or `/`).
-fn glob_matches_stem_suffix(pat: &str, suf: &str) -> bool {
-    if suf.is_empty() {
-        let (mut dp0, mut dp1) = (true, false);
-        let mut i = 0;
-        while i < pat.len() {
-            let Some((atom, step)) = next_glob_atom(&pat[i..]) else {
-                return true;
-            };
-            i += step;
-            match atom {
-                GlobAtom::Star => dp1 |= dp0,
-                atom => {
-                    if !atom_matches_stem_char(&atom, true) {
-                        return false;
-                    }
-                    dp1 = dp0 || dp1;
-                    dp0 = false;
-                }
-            }
+/// Whether pattern component `p` can match shape component `s`.
+fn comp_meets(p: &PComp, s: &SComp, role: Role, loose: bool, budget: &mut Budget) -> bool {
+    let PComp::Pat { atoms, lit, .. } = p else {
+        return true;
+    };
+    let mut against = |name: &str| -> bool {
+        if let Some(l) = lit {
+            return l == name;
         }
-        return dp1;
-    }
-    let sb = suf.as_bytes();
-    let m = sb.len();
-    let mut dp_buf = BoolDp::new(m);
-    let (mut dp, mut next) = dp_buf.pair();
-    let mut dp_stem = true;
-    dp[0] = true;
-    let mut i = 0;
-    while i < pat.len() {
-        let Some((atom, step)) = next_glob_atom(&pat[i..]) else {
-            return true;
-        };
-        i += step;
-        match atom {
-            GlobAtom::Star => {
-                if dp_stem {
-                    dp.fill(true);
-                } else if let Some(first) = dp.iter().position(|&b| b) {
-                    dp[first..=m].fill(true);
-                }
-            }
-            atom => {
-                let next_stem = dp_stem && atom_matches_stem_char(&atom, false);
-                next.fill(false);
-                if next_stem {
-                    next[0] = true;
-                }
-                for k in 0..m {
-                    if dp[k] && atom_matches_char(&atom, sb[k] as char) {
-                        next[k + 1] = true;
-                    }
-                }
-                dp_stem = next_stem;
-                std::mem::swap(&mut dp, &mut next);
-                if !dp_stem && !dp.iter().any(|&b| b) {
-                    return false;
-                }
-            }
+        comp_intersect(atoms, &parse_atoms(name), loose, budget).unwrap_or(true)
+    };
+    match s {
+        SComp::Named(pre) => {
+            comp_intersect(atoms, &parse_atoms(&format!("{pre}*")), loose, budget).unwrap_or(true)
+                && spells_part_of(atoms, pre)
         }
+        SComp::One | SComp::Any => true,
+        SComp::Lit(name) => against(name),
+        SComp::Names(names) => names.iter().any(|n| against(n)),
+        SComp::Glob(g) => comp_intersect(atoms, &parse_atoms(g), loose, budget).unwrap_or(true),
+        SComp::Secret(top) => atoms_may_be_secret(atoms, *top, role),
     }
-    dp[m]
 }
 
-fn ask_tree_matches_file_pat(tree: &str, pat: &str) -> bool {
-    if pat == "**" || pat == "*" {
-        return true;
-    }
-    if pat.contains('{') {
-        let Some(exps) = words::brace_expand(pat) else {
-            return true;
-        };
-        return exps.iter().any(|e| ask_tree_matches_file_pat(tree, e));
-    }
-    if glob_matches_stem_suffix(pat, "") {
-        return true;
-    }
-    ASK_TREE_SUFFIXES
-        .iter()
-        .find(|(k, _)| *k == tree)
-        .is_some_and(|(_, sufs)| sufs.iter().any(|suf| glob_matches_stem_suffix(pat, suf)))
-}
-
-fn ask_tree_matches_rest(tree: &str, rest: &str) -> bool {
-    let mut tail = rest;
-    while let Some(r) = tail.strip_prefix("**/") {
-        tail = r;
-    }
-    if tail == "**" || tail == "*" {
-        return true;
-    }
-    if tail.contains('/') {
+/// Whether pattern `p` can name a path of shape `s`. `keyed`: a component
+/// matching every name only counts against a key when all later ones do too.
+/// Out of budget: `true` (fail closed).
+fn path_meets(
+    p: &PathPat,
+    s: &[(SComp, bool)],
+    role: Role,
+    keyed: bool,
+    budget: &mut Budget,
+) -> bool {
+    let (n, m) = (p.comps.len(), s.len());
+    let s_any = s.iter().any(|c| matches!(c.0, SComp::Any));
+    if !p.globstar && !s_any && n != m {
         return false;
     }
-    ask_tree_matches_file_pat(tree, tail)
-}
-
-/// Whether `pat` can match `<pre><ext>` for any extension `<ext>` (0+ non-`/` chars).
-fn glob_matches_name_prefix(pat: &str, pre: &str) -> bool {
-    let pb = pre.as_bytes();
-    let m = pb.len();
-    let mut dp_buf = BoolDp::new(m);
-    let (mut dp, mut next) = dp_buf.pair();
-    dp[0] = true;
-    let mut i = 0;
-    while i < pat.len() {
-        let Some((atom, step)) = next_glob_atom(&pat[i..]) else {
-            return true;
-        };
-        i += step;
-        match atom {
-            GlobAtom::Star => {
-                if let Some(first) = dp.iter().position(|&b| b) {
-                    dp[first..=m].fill(true);
-                }
-            }
-            atom => {
-                next.fill(false);
-                for k in 0..m {
-                    if dp[k] && atom_matches_char(&atom, pb[k] as char) {
-                        next[k + 1] = true;
-                    }
-                }
-                if dp[m] && atom_matches_stem_char(&atom, false) {
-                    next[m] = true;
-                }
-                std::mem::swap(&mut dp, &mut next);
-                if !dp.iter().any(|&b| b) {
-                    return false;
-                }
-            }
-        }
-    }
-    dp[m]
-}
-
-const NON_CACHE_EXTS: &[&str] = &[
-    "rs", "md", "ts", "tsx", "js", "jsx", "py", "go", "c", "h", "cpp", "hpp", "java", "rb", "css",
-    "scss", "html", "svg", "png", "jpg", "jpeg", "gif", "ico", "woff", "woff2", "lock",
-];
-
-/// Whether `file_pat` can match an ask-store file prefixed with `pre`
-/// (`msal_token_cache.*`) across arbitrary extensions, without falsely catching
-/// ordinary source/doc globs like `*.rs`, `*.md`, or `m*.rs`.
-fn matches_ask_name_prefix_pat(file_pat: &str, pre: &str) -> bool {
-    if file_pat == "**" {
+    // `**` patterns follow globset (search globs, `dev`): `*` may match a dot.
+    let loose = p.globstar;
+    let w = m + 1;
+    if !budget.take(((n + 1) * w) as u64) {
         return true;
     }
-    if file_pat.contains('{') {
-        let Some(exps) = words::brace_expand(file_pat) else {
+    let mut seen = vec![false; (n + 1) * w];
+    let mut stack = vec![(0usize, 0usize)];
+    while let Some((i, j)) = stack.pop() {
+        if seen[i * w + j] {
+            continue;
+        }
+        seen[i * w + j] = true;
+        if i == n && j == m {
             return true;
+        }
+        if i < n && matches!(p.comps[i], PComp::GlobStar) {
+            stack.push((i + 1, j));
+        }
+        if j < m && matches!(s[j].0, SComp::Any) {
+            stack.push((i, j + 1));
+        }
+        if i >= n || j >= m {
+            continue;
+        }
+        let (ni, pstay, pcatch) = match &p.comps[i] {
+            PComp::GlobStar => (i, true, true),
+            PComp::Pat { catchall, .. } => (i + 1, false, *catchall),
         };
-        return exps.iter().any(|e| matches_ask_name_prefix_pat(e, pre));
-    }
-    if !glob_matches_name_prefix(file_pat, pre) {
-        return false;
-    }
-    if let Some((stem_pat, ext)) = file_pat.rsplit_once('.')
-        && NON_CACHE_EXTS.contains(&ext)
-        && ["a", "main", "mod", "lib", "readme"]
-            .iter()
-            .any(|w| comp_glob_dp(stem_pat, w, false))
-    {
-        return false;
-    }
-    true
-}
-
-enum IdxBuf {
-    Stack {
-        buf: [usize; MAX_STACK_SEGS],
-        len: usize,
-    },
-    Heap(Vec<usize>),
-}
-
-impl IdxBuf {
-    fn new() -> Self {
-        Self::Stack {
-            buf: [0; MAX_STACK_SEGS],
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, v: usize) {
-        match self {
-            Self::Stack { buf, len } if *len < MAX_STACK_SEGS => {
-                buf[*len] = v;
-                *len += 1;
-            }
-            Self::Stack { buf, len } => {
-                let mut heap = Vec::with_capacity(24);
-                heap.extend_from_slice(&buf[..*len]);
-                heap.push(v);
-                *self = Self::Heap(heap);
-            }
-            Self::Heap(heap) => heap.push(v),
-        }
-    }
-
-    fn as_slice(&self) -> &[usize] {
-        match self {
-            Self::Stack { buf, len } => &buf[..*len],
-            Self::Heap(v) => v.as_slice(),
-        }
-    }
-}
-
-fn reach_indices(parts: &[Comp<'_>], has_globstar: bool, tgt: &[&str]) -> IdxBuf {
-    let n = parts.len();
-    let m = tgt.len();
-    let mut out = IdxBuf::new();
-    if !has_globstar {
-        if n >= m && parts[..m].iter().zip(tgt).all(|(p, t)| p.matches(t)) {
-            out.push(m);
-        }
-        return out;
-    }
-    let mut dp_buf = BoolDp::new(m);
-    let (mut cur, mut next) = dp_buf.pair();
-    cur[0] = true;
-    for (i, part) in parts.iter().enumerate() {
-        match part {
-            Comp::GlobStar => {
-                for j in 0..m {
-                    if cur[j] {
-                        cur[j + 1] = true;
-                    }
-                }
-                if cur[m] {
-                    out.push(i);
-                }
-                next.copy_from_slice(cur);
-            }
-            comp => {
-                if cur[m] {
-                    out.push(i);
-                }
-                next.fill(false);
-                for j in 0..m {
-                    if cur[j] && comp.matches(tgt[j]) {
-                        next[j + 1] = true;
-                    }
-                }
-            }
-        }
-        std::mem::swap(&mut cur, &mut next);
-    }
-    if cur[m] {
-        out.push(n);
-    }
-    out
-}
-
-#[derive(Clone, Copy)]
-struct Tail<'a> {
-    parts: &'a [Comp<'a>],
-    has_globstar: bool,
-}
-
-impl Tail<'_> {
-    fn matches_exact(&self, target: &str) -> bool {
-        let tgt = Segs::from_str(target);
-        self.matches_exact_segs(tgt.as_slice())
-    }
-
-    fn matches_exact_segs(&self, tgt: &[&str]) -> bool {
-        if !self.has_globstar {
-            return self.parts.len() == tgt.len()
-                && self.parts.iter().zip(tgt).all(|(p, t)| p.matches(t));
-        }
-        reach_indices(self.parts, true, tgt)
-            .as_slice()
-            .contains(&self.parts.len())
-    }
-
-    fn matches_tree_impl_segs(&self, tgt: &[&str], strictly_under: bool) -> bool {
-        let Some((&leaf, parents)) = tgt.split_last() else {
-            return false;
+        let (nj, sstay) = match s[j].0 {
+            SComp::Any => (j, true),
+            _ => (j + 1, false),
         };
-        let leaf_matches = |idx: usize| -> bool {
-            match &self.parts[idx] {
-                Comp::GlobStar => self.parts[idx..].iter().all(Comp::is_catchall),
-                comp => {
-                    if !comp.matches(leaf) {
-                        return false;
-                    }
-                    if strictly_under {
-                        return idx + 1 < self.parts.len();
-                    }
-                    !comp.is_bare_star() || self.parts[idx + 1..].iter().all(Comp::is_catchall)
-                }
-            }
-        };
-        if !self.has_globstar {
-            let leaf_idx = tgt.len() - 1;
-            return self.parts.len() >= tgt.len()
-                && self.parts[..leaf_idx]
-                    .iter()
-                    .zip(parents)
-                    .all(|(p, t)| p.matches(t))
-                && leaf_matches(leaf_idx);
+        if pstay && sstay {
+            continue;
         }
-        reach_indices(self.parts, true, parents)
-            .as_slice()
-            .iter()
-            .any(|&idx| idx < self.parts.len() && leaf_matches(idx))
-    }
-
-    fn matches_tree_segs(&self, tgt: &[&str]) -> bool {
-        self.matches_tree_impl_segs(tgt, false)
-    }
-
-    fn matches_strictly_under_segs(&self, tgt: &[&str]) -> bool {
-        self.matches_tree_impl_segs(tgt, true)
-    }
-
-    fn matches_ssh_secret(&self, role: Role) -> bool {
-        for idx in 0..self.parts.len() {
-            if idx > 0 && !self.has_globstar {
-                break;
-            }
-            let prefix_ok = idx == 0
-                || self.parts[..idx]
-                    .iter()
-                    .all(|c| matches!(c, Comp::GlobStar));
-            if !prefix_ok {
-                continue;
-            }
-            let matched_ssh = match &self.parts[idx] {
-                Comp::GlobStar => self.parts[idx..]
-                    .iter()
-                    .all(|c| matches!(c, Comp::GlobStar)),
-                comp => comp.matches(".ssh"),
-            };
-            if !matched_ssh {
-                continue;
-            }
-            let sub = &self.parts[idx + 1..];
-            if sub.is_empty() {
-                continue;
-            }
-            let public = sub.last().is_some_and(Comp::is_public_ssh_name);
-            let readable_config = role != Role::Write
-                && sub.len() == 1
-                && (sub[0].is_singleton_literal("config")
-                    || sub[0].is_singleton_literal("authorized_keys"));
-            if !(public || readable_config) {
-                return true;
-            }
+        if keyed && s[j].1 && pcatch && !p.tail_catchall[i + 1] {
+            continue;
         }
-        false
-    }
-
-    fn matches_dir_and_name_prefix(&self, dir: &str, pre: &str) -> bool {
-        let tgt = Segs::from_str(dir);
-        for &idx in reach_indices(self.parts, self.has_globstar, tgt.as_slice()).as_slice() {
-            let sub = &self.parts[idx..];
-            if sub.is_empty() {
-                continue;
-            }
-            if sub[..sub.len() - 1]
-                .iter()
-                .all(|c| matches!(c, Comp::GlobStar))
-                && sub.last().is_some_and(|c| c.matches_prefix(pre))
-            {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-struct CompBufStack<'a> {
-    buf: [Comp<'a>; MAX_STACK_SEGS],
-    len: usize,
-}
-
-enum CompBuf<'a> {
-    Stack(Box<CompBufStack<'a>>),
-    Heap(Vec<Comp<'a>>),
-}
-
-impl<'a> CompBuf<'a> {
-    fn as_slice(&self) -> &[Comp<'a>] {
-        match self {
-            Self::Stack(s) => &s.buf[..s.len],
-            Self::Heap(v) => v.as_slice(),
+        if comp_meets(&p.comps[i], &s[j].0, role, loose, budget) {
+            stack.push((ni, nj));
         }
     }
-}
-
-enum TailBuf<'a> {
-    Stack { buf: [Tail<'a>; 4], len: usize },
-    Heap(Vec<Tail<'a>>),
-}
-
-impl<'a> TailBuf<'a> {
-    fn new() -> Self {
-        Self::Stack {
-            buf: [Tail {
-                parts: &[],
-                has_globstar: false,
-            }; 4],
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, t: Tail<'a>) {
-        match self {
-            Self::Stack { buf, len } if *len < 4 => {
-                buf[*len] = t;
-                *len += 1;
-            }
-            Self::Stack { buf, len } => {
-                let mut heap = Vec::with_capacity(8);
-                heap.extend_from_slice(&buf[..*len]);
-                heap.push(t);
-                *self = Self::Heap(heap);
-            }
-            Self::Heap(heap) => heap.push(t),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.as_slice().is_empty()
-    }
-
-    fn as_slice(&self) -> &[Tail<'a>] {
-        match self {
-            Self::Stack { buf, len } => &buf[..*len],
-            Self::Heap(v) => v.as_slice(),
-        }
-    }
-}
-
-/// Shell globbing: `*` and `?` don't cross `/` and don't match a leading dot.
-struct ShellGlob<'a> {
-    abs: bool,
-    parts: CompBuf<'a>,
-    has_globstar: bool,
-}
-
-impl<'a> ShellGlob<'a> {
-    fn new(pattern: &'a str) -> Self {
-        let mut buf = [Comp::GlobStar; MAX_STACK_SEGS];
-        let mut len = 0;
-        let mut heap: Option<Vec<Comp<'a>>> = None;
-        let mut has_globstar = false;
-        for seg in pattern.split('/').filter(|s| !s.is_empty()) {
-            let c = Comp::from_part(seg);
-            if matches!(c, Comp::GlobStar) {
-                has_globstar = true;
-            }
-            if let Some(v) = &mut heap {
-                v.push(c);
-            } else if len < MAX_STACK_SEGS {
-                buf[len] = c;
-                len += 1;
-            } else {
-                let mut v = Vec::with_capacity(24);
-                v.extend_from_slice(&buf[..len]);
-                v.push(c);
-                heap = Some(v);
-            }
-        }
-        let parts = match heap {
-            Some(v) => CompBuf::Heap(v),
-            None => CompBuf::Stack(Box::new(CompBufStack { buf, len })),
-        };
-        Self {
-            abs: pattern.starts_with('/'),
-            parts,
-            has_globstar,
-        }
-    }
-
-    fn parts(&self) -> &[Comp<'a>] {
-        self.parts.as_slice()
-    }
-
-    fn as_tail(&self) -> Tail<'_> {
-        Tail {
-            parts: self.parts(),
-            has_globstar: self.has_globstar,
-        }
-    }
-
-    fn tails_after(&self, prefix: &str) -> TailBuf<'_> {
-        let mut out = TailBuf::new();
-        if self.abs != prefix.starts_with('/') {
-            return out;
-        }
-        let tgt = Segs::from_str(prefix);
-        let all_parts = self.parts();
-        for &idx in reach_indices(all_parts, self.has_globstar, tgt.as_slice()).as_slice() {
-            let parts = &all_parts[idx..];
-            let has_globstar =
-                self.has_globstar && parts.iter().any(|c| matches!(c, Comp::GlobStar));
-            out.push(Tail {
-                parts,
-                has_globstar,
-            });
-        }
-        out
-    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -2831,7 +2226,11 @@ impl Ctx<'_> {
                 }
             }
         }
-        None
+        // The anchored forms of the filter, through the shared matcher
+        // (D-131): `~/.g*/private-keys-v1.d/k.key` names a file no probe has.
+        variants
+            .iter()
+            .find_map(|v| self.s.glob_str_hit(v, Role::Read))
     }
 }
 
@@ -3520,4 +2919,27 @@ pub fn sensitive_roots(home: &Path, data: &[PathBuf], protected: &[PathBuf]) -> 
     v.extend(data.iter().cloned());
     v.extend(protected.iter().cloned());
     v
+}
+
+/// Whether the pattern holds a literal run of four or more characters that
+/// is part of `name` (`*token_cache.custom` spells part of
+/// `msal_token_cache.`; `*.rs` and `m*.rs` don't).
+fn spells_part_of(atoms: &[Atom], name: &str) -> bool {
+    let mut run = String::new();
+    for a in atoms.iter().chain(std::iter::once(&Atom::Star)) {
+        match a {
+            Atom::One(s) if s.singleton().is_some() => run.extend(s.singleton()),
+            _ => {
+                let cs: Vec<char> = run.chars().collect();
+                if cs
+                    .windows(4)
+                    .any(|w| name.contains(&w.iter().collect::<String>()))
+                {
+                    return true;
+                }
+                run.clear();
+            }
+        }
+    }
+    false
 }

@@ -745,7 +745,7 @@ fn globstar_tree_leaf_rules_preserve_ordinary_globs_and_block_sensitive_trees() 
             ("cat ~/.config/**/*.rs", ["Ask", "Ask", "Allow", "Allow"]),
         ],
     );
-    for path in ["~/**/*.rs", "~/**/*.md", "~/.azure/*.rs"] {
+    for path in ["~/**/*.rs", "~/**/*.md"] {
         let read_ordinary = paths_check(ToolKind::Read, "Read", &[path], false, None);
         assert!(
             matches!(
@@ -829,11 +829,13 @@ fn k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree() {
         "**/src/*.rs",
         "**/*.{rs,md}",
         "**/m*.rs",
-        ".azure/*.rs",
     ] {
         check_search(&["~"], false, glob, ["Allow", "Allow", "Allow"]);
     }
-    check_search(&["~/.azure"], false, "*.rs", ["Allow", "Allow", "Allow"]);
+    // Round 2 finding 6: an explicit Azure folder keeps `msal_token_cache.*`
+    // for every extension, so `*.rs` there can be `msal_token_cache.rs`.
+    check_search(&["~"], false, ".azure/*.rs", ["Ask", "Allow", "Allow"]);
+    check_search(&["~/.azure"], false, "*.rs", ["Ask", "Allow", "Allow"]);
 
     // Searches whose later components can match an ask-tree / ask-file / ask-prefix: Ask in Home.
     for glob in [
@@ -923,8 +925,7 @@ fn session_gate_blocks_wildcarded_credential_and_atrium_trees_when_absent_on_dis
 }
 
 #[test]
-#[ignore = "escalated: requires changing Sensitive::search_glob_hit (owned by M1-31)"]
-fn rework_round2_finding_1_non_escaping_search_globs_escalated() {
+fn review2_finding_1_contained_search_globs_reach_sensitive_trees() {
     let env = Env::home();
     let any_search = vec![rule(
         RuleScope::Global,
@@ -1224,6 +1225,170 @@ fn posix_named_classes_match_real_character_sets() {
                 "cat ~/[![:punct:]]ssh/id_rsa",
                 ["Ask", "Ask", "Allow", "Allow"],
             ),
+        ],
+    );
+}
+
+/// Verdicts of a `Read` of `path` in Home, Home with `Any → Allow`, and
+/// FullAccess.
+fn read_verdicts(env: &Env, path: &str) -> [String; 3] {
+    let any_read = vec![rule(
+        RuleScope::Global,
+        ToolKind::Read,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "any-read",
+    )];
+    let c = paths_check(ToolKind::Read, "Read", &[path], false, None);
+    [
+        classify(&env.eval_check(&c, &[], Preset::Home)),
+        classify(&env.eval_check(&c, &any_read, Preset::Home)),
+        classify(&env.eval_check(&c, &[], Preset::FullAccess)),
+    ]
+}
+
+fn check_reads(env: &Env, rows: &[(&str, [&str; 3])]) {
+    let mut failures = vec![];
+    for (path, want) in rows {
+        let got = read_verdicts(env, path);
+        if got.iter().map(String::as_str).ne(want.iter().copied()) {
+            failures.push(format!("Read {path:?}: wanted {want:?}, got {got:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Round 2, finding 2: `{g}` is not a brace expansion; it used to recurse
+/// forever. It is the literal name `confi{g}`, a secret in `~/.ssh`.
+#[test]
+fn review2_finding_2_literal_braces_terminate_and_hard_deny() {
+    let env = Env::home();
+    let hard = format!("Hard({CR})");
+    check_reads(
+        &env,
+        &[
+            ("~/.s?h/confi{g}", [&hard, &hard, &hard]),
+            ("~/.ssh/confi{g}", [&hard, &hard, &hard]),
+            ("~/.s?h/{config}", [&hard, &hard, &hard]),
+        ],
+    );
+    run_table(
+        &env,
+        &[
+            ("cat ~/.s?h/confi{g}", Want::Hard(CR)),
+            ("cat ~/.s?h/{{{{{{g}}}}}}", Want::Hard(CR)),
+        ],
+    );
+}
+
+/// Round 2, finding 3: 4,096 adjacent globstars are one globstar; the
+/// verdict stays ordinary and the work stays bounded.
+#[test]
+fn review2_finding_3_adjacent_globstars_are_bounded() {
+    let env = Env::home();
+    let line = format!("cat ~/{}notes.txt", "**/".repeat(4096));
+    let t = std::time::Instant::now();
+    check_4_settings(&env, &[(line.as_str(), ["Ask", "Ask", "Allow", "Allow"])]);
+    let deep = format!("cat ~/{}notes.txt", "*/".repeat(4096));
+    check_4_settings(&env, &[(deep.as_str(), ["Ask", "Ask", "Allow", "Allow"])]);
+    // A generous ceiling: the cubic version took minutes.
+    assert!(t.elapsed() < std::time::Duration::from_secs(20));
+    run_table(
+        &env,
+        &[(
+            &format!("cat ~/{}.g*/k.key", "**/".repeat(4096)),
+            Want::Hard(CR),
+        )],
+    );
+}
+
+/// Round 2, finding 4: a `Read` path (not only a search) whose file name
+/// can be a session file asks.
+#[test]
+fn review2_finding_4_session_families_ask_for_read_paths() {
+    let env = Env::home();
+    check_reads(
+        &env,
+        &[
+            ("~/**/b.session", ["Ask", "Allow", "Allow"]),
+            ("~/**/b.history", ["Ask", "Allow", "Allow"]),
+            ("~/**/*.historynew", ["Ask", "Allow", "Allow"]),
+            ("~/**/*.rs", ["Allow", "Allow", "Allow"]),
+            ("~/**/b.txt", ["Allow", "Allow", "Allow"]),
+        ],
+    );
+}
+
+/// Round 2, finding 5: Atrium's real socket name, under the production
+/// runtime-path shape.
+#[test]
+fn review2_finding_5_globstar_reaches_the_daemon_socket() {
+    let mut env = Env::home();
+    env.prot.push("/run/user/1000/atrium".into());
+    run_table(
+        &env,
+        &[
+            ("rm /run/user/1000/**/daemon.sock", Want::Hard(AS)),
+            ("rm /run/user/1000/**/daemon.lock", Want::Hard(AS)),
+            ("rm /run/user/*/atr*/daemon.sock", Want::Hard(AS)),
+            ("rm /run/user/1000/atrium/daemon.sock", Want::Hard(AS)),
+        ],
+    );
+}
+
+/// Round 2, finding 6: an explicit Azure folder keeps the
+/// `msal_token_cache.*` rule for every extension.
+#[test]
+fn review2_finding_6_azure_cache_keeps_every_extension() {
+    let env = Env::home();
+    check_reads(
+        &env,
+        &[
+            ("~/.a?ure/m*.rs", ["Ask", "Allow", "Allow"]),
+            ("~/.azure/m*.rs", ["Ask", "Allow", "Allow"]),
+            ("~/.a?ure/*token_cache.custom", ["Ask", "Allow", "Allow"]),
+            ("~/.a?ure/config", ["Allow", "Allow", "Allow"]),
+            ("~/**/m*.rs", ["Allow", "Allow", "Allow"]),
+        ],
+    );
+}
+
+/// Round 2, finding 7: spellings of `*` that match every name are as
+/// ordinary as `*`.
+#[test]
+fn review2_finding_7_catchall_spellings_stay_ordinary() {
+    let env = Env::home();
+    let ordinary = ["Ask", "Ask", "Allow", "Allow"];
+    check_4_settings(
+        &env,
+        &[
+            ("cat ~/.config/*/settings.json", ordinary),
+            ("cat ~/.config/***/settings.json", ordinary),
+            ("cat ~/.config/?*/settings.json", ordinary),
+            ("cat ~/.config/*?*/settings.json", ordinary),
+            ("cat ~/.config/[!.]*/settings.json", ordinary),
+        ],
+    );
+    run_table(
+        &env,
+        &[
+            ("cat ~/.config/g*/settings.json", Want::Hard(CR)),
+            ("cat ~/.config/***/*", Want::Hard(CR)),
+        ],
+    );
+}
+
+/// Round 2, finding 6 (read side of the `**` case): a `**` past `.azure`
+/// asks when the file name spells part of the cache's name.
+#[test]
+fn review2_finding_6_globstar_names_the_azure_cache() {
+    let env = Env::home();
+    check_reads(
+        &env,
+        &[
+            ("~/**/*token_cache.custom", ["Ask", "Allow", "Allow"]),
+            ("~/**/msal_*", ["Ask", "Allow", "Allow"]),
+            ("~/**/*.custom", ["Allow", "Allow", "Allow"]),
         ],
     );
 }
