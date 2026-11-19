@@ -307,3 +307,30 @@ Code change: commit `4395d62`.
 - `cargo fmt --all --check`: clean.
 - `cargo clippy -p atrium-core --all-targets -- -D warnings`: clean.
 - `cargo test -p atrium-core`: all pass except the one parallel-load failure of `pipe_to_shell_fan_out…` above. That test passes 3/3 alone.
+
+---
+
+## Escalation round 3 (`fix3_finding3_glob_variant_cap_performance` regression)
+
+Code: commit `961bb7a` (`deny.rs` only).
+
+### Profile
+- Input: `{1..64}{a,b,c,d}/[a-z]/$VAR/**/../**/../**/../**/../*.rs`.
+- Per evaluate, nearly all the time is in `expand_glob_candidates`. `hard_deny` takes ~0.2 ms, and search and escape return at once, because expansion already reports unbounded.
+- Expansion walks about 84 brace words through home expansion, `$VAR` widening, dot widening, slash widening and the dot check before `MAX_GLOB_VARIANTS` trips. Round 1 made the dot-check memo per word, so the `[a-z]` component was re-checked for every word. Each word also pays budget hashing.
+- The verification failures (164–300 ms) happened under heavy load (load average ~20 from parallel verification jobs). On a quiet machine (load ~1) both `2215897` and this fix finish the test in ≤ 10 ms, so most of the overrun was CPU contention. The fix still removes the extra work.
+
+### Fix
+- **Exact variant floor, before any widening.** Every kept brace word `h` is always a candidate, and so is its `**` widening of `$VAR` when `h` has a `$`. When those alone exceed `MAX_GLOB_VARIANTS`, the full pass would trip the cap too, so expansion fails closed right away with the same result: unknown + unbounded → Ask everywhere. The floor only runs when there are more than 128 words.
+- **Shared dot-check memo.** `may_be_dot_component` answers are kept in `GlobBudget::dot_memo`, shared by every word.
+
+### Times (debug, Linux, alone)
+| Test | Before | After |
+|---|---|---|
+| `fix3_finding3_glob_variant_cap_performance` (150 ms) | 164–300 ms under load; ~100 ms on a moderately loaded run | ≤ 10 ms quiet; 70–110 ms in 4 of 5 runs under load ~20 (1 of 5 failed at 317 ms) |
+| `fix4`, K10, fuzz | pass | pass (full `cargo test -p atrium-core` run, quiet machine) |
+
+### Checks
+- `cargo fmt --all --check`: clean.
+- `cargo clippy -p atrium-core --all-targets -- -D warnings`: clean.
+- `cargo test -p atrium-core`: all pass.
