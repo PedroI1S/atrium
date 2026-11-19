@@ -1,6 +1,6 @@
 # Handoff: M1-30-tree-wildcards (S5 + K8)
 
-Status: **ready for DoD verification** (D-123: worker wrote code and tests only; ran `cargo fmt --all` and `cargo check -p atrium-core --tests`).
+Status: **ready for DoD verification** after the D-131 escalation (Opus). The "Escalation (Opus, D-131)" section below supersedes the matcher descriptions in sections 1, 2 and rework rounds 1–5.
 
 ## What changed and where
 
@@ -13,10 +13,8 @@ Status: **ready for DoD verification** (D-123: worker wrote code and tests only;
   - Added `ShellGlob::as_tail` and a shared `matches_dir_list` closure in `glob_hit` for `self.data` / `self.protected`.
 - Verified the late `**` tree-leaf fix in `Tail::matches_tree_impl`: when `reach_indices` reaches `Comp::GlobStar` before a sensitive tree's leaf, it only matches if the remaining components are all `Comp::GlobStar` (`~/.local/**`, `~/.g*/**`), so ordinary `**` globs (`cat ~/**/*.rs`, `cat ~/**/notes.txt`) are not falsely hard-denied.
 
-### 2. K8 (`crates/atrium-core/src/policy/deny.rs`, `Sensitive::ask_search_glob_hit`)
-- Fixed two causes of needless `Ask` on home-wide `**` searches such as `Search ["~"] **/*.rs` (`recursive: false`):
-  - **`ASK_TREES` check:** when a directory prefix matching an ask tree ends in a generic catch-all component (`**` or `*`, e.g. `**` in `**/*.rs` or `**/*` in `**/*/*.rs`), `ask_search_glob_hit` now checks the remaining glob components (`rest`) against representative ask-tree filenames (`ASK_TREE_FILES`: `.aws/sso/cache` `0.json`/`a.json`/`x.json`/`cache.json`/`token.json`/`0`/`a`/`x`; `.zsh_sessions` and `.bash_sessions` `.session`/`.history`/`.historynew`/`.zsh`/`0`/`a`/`x`). Globs whose suffix cannot match an ask-tree file (`**/*.rs`, `**/*.md`, `**/*.toml`, `**/*/*.rs`, `*/*.rs`) return `false` (`Allow`), while `**/*.session`, `**/*/*.session`, `**/*.history`, `**/*.json`, `**/*`, `**`, `**/`, and explicit ask-tree paths (`.zsh_sessions/*.session`, `.z*/*.session`, `**/.zsh_sessions/*.txt`) still return `true` (`Ask`).
-  - **`ASK_NAME_PREFIXES` check (`.azure/msal_token_cache.*`):** fixed the WIP regression where `under(rl, &dir_abs).is_some()` matched `rl == ~/.azure` unconditionally and `glob_matches_prefix("*.rs", "msal_token_cache.")` returned `true` (making `Search ["~"] **/*.rs` and `Search ["~/.azure"] *.rs` ask). For generic directory wildcards (`**` / `*`) or root `~/.azure`, `file_pat` must also match the `msal_` / `msal_token_cache.` prefix or a representative cache filename (`.json`, `.bin`, `.db`, `.txt`, `.cache`), while explicit `.az*/msal_token_cache.db` continues to ask.
+### 2. K8 (`deny.rs`, now the shared matcher; see "Escalation (Opus, D-131)")
+- A non-recursive home `**` search asks only when the glob's file name can be a file of an ask tree (`*.session`, `*.history`, `*.historynew`, `*.zsh`, `.aws/sso/cache/*.json`) or an ask store. Final verdicts in Home: `**/*.rs`, `**/*.md`, `**/*/*.rs`, `**/m*.rs` → Allow; `**/*.session`, `**/b.session`, `**/*.history`, `**/token.json`, `**/*.toml` and `**/*.{rs,toml}` (both via `.cargo/credentials.toml`), `**/*token*` → Ask; `**/*.json`, `**/*`, `**`, `**/` → Hard(credential-read) (they reach `.docker/config.json` and other credential files). `.azure/*.rs` now asks (round 2 finding 6).
 - Note on `rg --glob '**/*.rs' x ~` and `Search ["~"] **/*.rs` (`recursive: true`): in `crates/atrium-core/src/policy/engine.rs` (outside M1-30 owned paths), recursive searches rooted directly at `~` still return `Ask` in Home because `Home::root_ok(~)` is `false` (walking all of `~` reaches `.ssh`/`.gnupg`/etc. regardless of `--glob`), whereas `rg --glob '**/*.rs' x ~/proj` returns `Allow`.
 
 ### 3. Tests (`crates/atrium-core/tests/M1-30-tree-wildcards.rs` and `adversarial_gate.rs`)
@@ -130,3 +128,37 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
 4. Run `cargo test -p atrium-core` 3 times in a loop and record timings for `adversarial_fuzz` and `policy` (no slowdown).
 5. Checkout `dev:crates/atrium-core/src/policy/deny.rs`, run `cargo test -p atrium-core --test M1-30-tree-wildcards`, confirm the 12 S5/K8/rework tests fail on `dev` while `ordinary_globs_keep_expected_verdicts` passes on `dev`, then restore `HEAD`'s `deny.rs` and re-verify all 13 un-ignored tests pass (`rework_round2_finding_1_non_escaping_search_globs_escalated` remains `#[ignore]` pending M1-31's `search_glob_hit` fix).
 6. Confirm `git diff 5e693ad6..HEAD --stat` touches only owned paths (`crates/atrium-core/src/policy/deny.rs`, `crates/atrium-core/tests/M1-30-tree-wildcards.rs`, `crates/atrium-core/tests/adversarial_gate.rs`, `docs/agents/handoffs/M1-30-tree-wildcards.md`).
+
+## Escalation (Opus, D-131)
+
+### Matcher design
+One bounded glob-component matcher in `deny.rs` replaces `ShellGlob`/`Tail`/`Comp`, `ASK_TREE_SUFFIXES` helpers, the Azure prefix helpers and the singleton/public-name helpers.
+- **Components:** a pattern component becomes atoms: `*`, and one-character sets (literal, `?`, `[...]` with `!`/`^`, ranges, escapes and all 13 POSIX classes, stored as an ASCII bitmap plus a non-ASCII flag). An unknown `[:name:]` matches any character, so it fails closed. An unclosed `[` is literal. Braces are expanded once at path level with `words::brace_expand`, up to 64 variants. When a pattern has more variants, or a group that won't close, it is widened (a group becomes `*`, or `/**` when the group holds a `/`) and checked **without keys**, so the check gets stricter. A brace that isn't an expansion (`{g}`) stays literal, so nothing recurses.
+- **Component DP** (`comp_intersect`): states (pattern atom, target atom, started), with a stack and a visited bitmap. It answers "do these two name globs share a non-empty name?". It handles names against patterns and patterns against patterns (`m*.rs` against `msal_token_cache.*`). `*` and `?` never match a leading `.` unless the pattern holds a `**` (globset, `dev`'s search semantics).
+- **Path DP** (`path_meets`): states (pattern component, shape component). Adjacent `**` are merged while parsing, and `..` pops lexically. Shapes are built once per `Sensitive` (`OnceLock`) from the lists the engine already reads: `CRED_FILES`, `CRED_TREES`, `SSH_PROBES`, `BROWSER_ROOTS`/`BROWSER_FILES`, `ASK_FILES`, `ASK_TREES` (+ `ASK_TREE_SUFFIXES`), `ASK_NAME_PREFIXES`, the data and protected folders, and `Sensitive::DATA_FILES`/`DATA_SUBTREES`/`PROTECTED_FILES`. That is now the single artifact list, read by both the probes and the shapes, and it includes `daemon.sock`. Shape components: a literal; a name glob; a set of names; one name; any number of names; an SSH name that isn't public (exact on singleton atoms: forced `.pub` suffix, forced `known_hosts` prefix, literal `config`/`authorized_keys` at the top level when not writing); and an Azure cache name spelled with a literal run of at least four of the prefix's characters.
+- **Keys:** each shape marks the components that name it (a tree's folder, a file's name). A pattern component that matches every listed name (`*`, `***`, `?*`, `*[!.]*`, `**`) only counts against a key when every later component also does. This keeps `~/.config/*/settings.json`, `~/**/*.rs`, `src/**/mod.rs` and `*.{ts,tsx}` ordinary, while `~/.g*/k.key`, `~/**/b.session`, `~/.config/*/*` and `~/**` are not.
+- **Floor:** `dev`'s probes are still matched without keys, so no line is more permissive than `dev`.
+- **Budget:** 4,000,000 DP states per query. A check that runs out of budget answers "can match", so the shape's own verdict applies (hard deny or Ask), never Allow.
+- **Callers:** `glob_hit`, `is_ssh_dir`, `ask_hit` (globs), `ask_search_glob_hit` and `Ctx::search_glob_hit` all use it. Both search checks run every anchored variant of the filter through it. `words::cd_effect` (M1-28) was not touched; `Sensitive::glob_str_hit(pattern, role)` is ready for it.
+
+### Findings and the tests that pin them (`crates/atrium-core/tests/M1-30-tree-wildcards.rs`)
+- R2-1 / R1-1 (contained search globs `.g*/private-keys-v1.d/k.key`, `.local/share/atr*/missing.db`): `review2_finding_1_contained_search_globs_reach_sensitive_trees` (un-ignored, renamed).
+- R2-2 (literal braces recurse forever, `~/.s?h/confi{g}`): `review2_finding_2_literal_braces_terminate_and_hard_deny`.
+- R2-3 (4,096 adjacent globstars, cubic work): `review2_finding_3_adjacent_globstars_are_bounded`.
+- R2-4 (`Read ~/**/b.session`, `~/**/b.history`): `review2_finding_4_session_families_ask_for_read_paths`.
+- R2-5 (`rm /run/user/1000/**/daemon.sock`): `review2_finding_5_globstar_reaches_the_daemon_socket`.
+- R2-6 (`~/.a?ure/m*.rs`): `review2_finding_6_azure_cache_keeps_every_extension` and `review2_finding_6_globstar_names_the_azure_cache`. Changed expectation: `Read ~/.azure/*.rs`, `Search ["~"] .azure/*.rs` and `Search ["~/.azure"] *.rs` now Ask in Home (they can match `msal_token_cache.rs`).
+- R2-7 (`cat ~/.config/***/settings.json`): `review2_finding_7_catchall_spellings_stay_ordinary`.
+- R2-8 (stale K8 summary): sections 2 and 3 above were rewritten.
+- R1-3 to R1-8: still pinned by `rework_round2_regressions` and `posix_named_classes_match_real_character_sets`, now passing on the new matcher.
+- R1-2 (`cd <glob>`): still M1-28's (`words::cd_effect`). `adversarial_fuzz.rs`'s ignored test stays ignored until M1-28 merges (brief's last step).
+
+### Commands run (Opus)
+- `cargo fmt -p atrium-core`: clean.
+- `cargo clippy -p atrium-core --all-targets -- -D warnings`: no warnings.
+- `cargo test -p atrium-core --test M1-30-tree-wildcards`: 21 passed, 0 ignored (about 28 s, mostly the 30,000-iteration fuzz).
+- `cargo test -p atrium-core --no-fail-fast`: everything passes except `round_5_blocker_1_searches_and_walkers_reaching_a_folder_linked_into_ssh` (the known `dev` N9 failure). The timing tests (`random_hostile_lines`, `fix2`, `fix4`, `engine_never_panics`, `pipe_to_shell`) passed.
+
+### Not done / left for others
+- The "fails on `dev`" check (DoD step 5) and the workspace-wide DoD: these belong to the verification task (D-123).
+- `atrium-host/src/lifecycle.rs` still spells `daemon.sock`/`daemon.lock`/`atrium.db` itself. `atrium-host` doesn't depend on `atrium-core`, so the policy's list (`Sensitive::DATA_FILES`/`PROTECTED_FILES`) is a parallel copy. Sharing one constant, for example in `atrium-protocol`, is outside this task.
