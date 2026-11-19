@@ -51,3 +51,11 @@ Plus three rule-matching limits that M1-23's reviews escalated and D-121 reopene
 
 ## Added scope (D-120, orchestrator, 2026-11-17)
 The Opus escalation (D-129) changed `gate.rs`'s hard-link Ask exemption (review round 2, finding 4). M1-32 owns `gate.rs`, so the owned paths widen to that one hunk. **M1-29 merges before M1-32**, and M1-32 rebases on top.
+
+## Added scope (D-120, orchestrator, 2026-11-18): files the escalation touched
+The Opus escalation (D-129) closed review rounds 2 and 3 in files outside the owned list. The owned paths widen to:
+- `app/src/ui/rule-form.ts` and its test: the editor must refuse what the daemon refuses (brief item 5);
+- `engine.rs` `git_path_is_credential`: just below the owned CR-12 list;
+- `policy/rule_check.rs`'s stdin check.
+
+Each hunk is listed in the handoff.
