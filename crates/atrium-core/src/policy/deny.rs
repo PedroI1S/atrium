@@ -3618,6 +3618,9 @@ struct GlobBudget {
     used: std::cell::Cell<usize>,
     /// `class_may_match_dot` answers, so a repeated class compiles once.
     class_memo: std::cell::RefCell<FxMap<String, bool>>,
+    /// `may_be_dot_component` answers, shared by every candidate, so a
+    /// component repeated across brace words compiles once.
+    dot_memo: std::cell::RefCell<FxMap<String, bool>>,
 }
 
 /// Bytes of glob text per budget step.
@@ -3783,6 +3786,38 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
             return fail(res);
         }
     }
+    // Every kept word makes itself a candidate, and a word with `$` also its
+    // `**` widening: when those alone pass `MAX_GLOB_VARIANTS` the full
+    // widening below would trip the cap too, so stop before doing it.
+    if expansions.len() > MAX_GLOB_VARIANTS / 2 {
+        let mut floor: FxSet<String> = FxSet::default();
+        for e in &expansions {
+            if e.is_empty() {
+                continue;
+            }
+            let h = if e.starts_with(['~', '$']) {
+                words::expand_home(e, home, cwd)
+            } else {
+                e.clone()
+            };
+            if let Some(rest) = h.strip_prefix('~')
+                && !rest.is_empty()
+                && !rest.starts_with('/')
+            {
+                continue;
+            }
+            if h.contains('$')
+                && let Some(g) = expand_glob_vars(&h).into_iter().next()
+                && !g.is_empty()
+            {
+                floor.insert(g);
+            }
+            floor.insert(h);
+            if floor.len() > MAX_GLOB_VARIANTS {
+                return fail(res);
+            }
+        }
+    }
     let mut seen = FxSet::default();
     for e in expansions {
         if e.is_empty() {
@@ -3808,11 +3843,13 @@ fn expand_glob_candidates(glob: &str, cwd: &Path, home: &Path) -> GlobCandidates
             if !res.budget.charge(components_upto(&h, MAX_GLOB_WORK)) {
                 return fail(res);
             }
-            let mut memo: FxMap<&str, bool> = FxMap::default();
             if h.split('/').any(|c| {
-                *memo
-                    .entry(c)
-                    .or_insert_with(|| may_be_dot_component(c, &res.budget))
+                if let Some(&hit) = res.budget.dot_memo.borrow().get(c) {
+                    return hit;
+                }
+                let hit = may_be_dot_component(c, &res.budget);
+                res.budget.dot_memo.borrow_mut().insert(c.to_string(), hit);
+                hit
             }) {
                 res.unknown = true;
             }
