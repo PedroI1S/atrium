@@ -42,3 +42,6 @@ Owned paths widen to `shell.rs` `shell_c_codes` (~2090–2110), `payloads_of` (~
 
 ## Added scope (D-120, orchestrator, 2026-11-16): review round 1
 The Codex review (`reviews/M1-27-engine-name-fold.md`, finding 1) shows that folded names still miss hard-deny comparisons in `deny.rs`, at the privilege-tool (`PRIV`) sites and any other place that compares a command name. Owned paths widen to **those name comparisons only**, folding them through the same helper as `shell.rs`. Other tasks own other ranges of `deny.rs` (M1-29: the CR-12 list; M1-30: `ASK_TREES` and the glob matchers; M1-31: `check`…`search_glob_hit` and the normalizer). Keep each edit to the comparison line, and list every `deny.rs` hunk in the handoff, so the merges can be checked with `git merge-tree`.
+
+## Added scope (D-120, orchestrator, 2026-11-18)
+The Opus escalation (D-130) changed `code_texts_bounded`, the only caller of the K7 resolver and the place that holds the fail-closed marker (about 10 lines). The owned paths widen to it (review round 2, finding 9).
