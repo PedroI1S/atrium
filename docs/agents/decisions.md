@@ -808,3 +808,6 @@ M1-27-engine-name-fold went through four Hydrogen `high` rounds. Codex review ro
 
 ## D-131 — 2026-11-17 — M1-30 escalates to Opus 5.5 (orchestrator, under PLAN §8.3)
 M1-30-tree-wildcards went through five Hydrogen `high` rounds. Codex review round 2 (`reviews/M1-30-tree-wildcards-round2.md`) still found 6 majors: round 1's contained-search bypass, unbounded recursion, cubic work and verdict gaps. **An Opus 5.5 worker** continues, with the fail-closed design used for M1-31 and M1-32: one bounded matcher, and Ask whenever a match can't be decided within budget. The review stays with Codex.
+
+## D-132 — 2026-11-18 — M1-28 escalates to Opus 5.5 (orchestrator, under PLAN §8.3)
+M1-28-ansi-c-words went through five Hydrogen `high` rounds. Codex review round 2 (`reviews/M1-28-ansi-c-words-round2.md`) still found 4 majors and 2 minors: unreadable ANSI-C words that Allow, `cd` candidates in globbed folders, a withdrawal channel that is never drained, and quadratic markdown. **An Opus 5.5 worker** continues. The review stays with Codex. Same reasoning as D-127 to D-131.
