@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use atrium_host::supervise::{self, ProcessIdentity, SupervisedChild};
@@ -19,7 +20,7 @@ use atrium_protocol::policy::{EnforcementDescriptor, EnforcementReason, ReasonCo
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::Instant as TokioInstant;
 
@@ -386,6 +387,79 @@ enum Internal {
         questions: Value,
         failed: bool,
     },
+    Withdraw(ApprovalTicket),
+}
+
+struct InFlightCheck {
+    count: Arc<AtomicUsize>,
+    settled: Arc<Notify>,
+}
+
+impl InFlightCheck {
+    fn enter(count: &Arc<AtomicUsize>, settled: &Arc<Notify>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self {
+            count: count.clone(),
+            settled: settled.clone(),
+        }
+    }
+}
+
+impl Drop for InFlightCheck {
+    fn drop(&mut self) {
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.settled.notify_waiters();
+        }
+    }
+}
+
+struct OrphanGuard {
+    ticket: Option<ApprovalTicket>,
+    tx: mpsc::Sender<Internal>,
+    gate: Arc<dyn ToolGate>,
+    in_flight: Option<InFlightCheck>,
+}
+
+impl OrphanGuard {
+    fn arm(
+        tx: mpsc::Sender<Internal>,
+        gate: Arc<dyn ToolGate>,
+        in_flight: Option<InFlightCheck>,
+    ) -> Self {
+        Self {
+            ticket: None,
+            tx,
+            gate,
+            in_flight,
+        }
+    }
+
+    fn set_ticket(&mut self, ticket: Option<ApprovalTicket>) {
+        self.ticket = ticket;
+    }
+
+    fn disarm(&mut self) {
+        self.ticket = None;
+    }
+}
+
+impl Drop for OrphanGuard {
+    fn drop(&mut self) {
+        let in_flight = self.in_flight.take();
+        if let Some(ticket) = self.ticket.take()
+            && self
+                .tx
+                .try_send(Internal::Withdraw(ticket.clone()))
+                .is_err()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let gate = self.gate.clone();
+            handle.spawn(async move {
+                let _keep_inflight = in_flight;
+                gate.withdraw(&ticket).await;
+            });
+        }
+    }
 }
 
 struct Proc {
@@ -524,6 +598,8 @@ async fn start_session(
         live: HashSet::new(),
         inflight: HashMap::new(),
         pending_withdrawals: Vec::new(),
+        gate_in_flight: Arc::new(AtomicUsize::new(0)),
+        gate_settled: Arc::new(Notify::new()),
         turn_seq: 0,
         interrupt_deadline: None,
         shutdown_deadline: None,
@@ -698,6 +774,8 @@ struct Driver {
     live: HashSet<String>,
     inflight: HashMap<String, tokio::task::JoinHandle<()>>,
     pending_withdrawals: Vec<ApprovalTicket>,
+    gate_in_flight: Arc<AtomicUsize>,
+    gate_settled: Arc<Notify>,
     turn_seq: u32,
     interrupt_deadline: Option<TokioInstant>,
     shutdown_deadline: Option<TokioInstant>,
@@ -1145,6 +1223,7 @@ impl Driver {
 
         self.cmd_rx = None;
         self.clear_requests();
+        self.wait_for_in_flight_gates().await;
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.flush_final().await;
@@ -1347,18 +1426,44 @@ impl Driver {
         let tx = self.internal_tx.clone();
         let key = native.clone();
         let check_gate = check.clone();
+        let in_flight = InFlightCheck::enter(&self.gate_in_flight, &self.gate_settled);
         let handle = tokio::spawn(async move {
-            let (decision, failed) =
-                match guarded(GATE_TIMEOUT, async move { gate.check(&check_gate).await }).await {
-                    Some(d) => (d, false),
-                    None => (
-                        GateDecision::Deny {
-                            reason: "Atrium policy gate timed out or panicked".into(),
-                        },
-                        true,
-                    ),
-                };
-            // Preserve `raw_id` / `method` / `payload` on `Driver::approvals` via a pre-insert or carry through internal.
+            let tx_orphan = tx.clone();
+            let gate_orphan = gate.clone();
+            let (res_tx, res_rx) = oneshot::channel();
+            // Run `gate.check` to completion without aborting on cancellation
+            // so an already-inserted ledger ticket cannot leak.
+            tokio::spawn(async move {
+                let mut guard = OrphanGuard::arm(tx_orphan, gate_orphan, Some(in_flight));
+                let d = gate.check(&check_gate).await;
+                if let GateDecision::Ask { ticket } = &d {
+                    guard.set_ticket(Some(ticket.clone()));
+                }
+                let _ = res_tx.send((d, guard));
+            });
+            let (decision, failed) = match tokio::time::timeout(GATE_TIMEOUT, res_rx).await {
+                Ok(Ok((d, mut guard))) => {
+                    if tx
+                        .send(Internal::Gate {
+                            native: key,
+                            check,
+                            decision: d,
+                            failed: false,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        guard.disarm();
+                    }
+                    return;
+                }
+                Ok(Err(_)) | Err(_) => (
+                    GateDecision::Deny {
+                        reason: "Atrium policy gate timed out or panicked".into(),
+                    },
+                    true,
+                ),
+            };
             let _ = tx
                 .send(Internal::Gate {
                     native: key,
@@ -1442,17 +1547,35 @@ impl Driver {
         let tx = self.internal_tx.clone();
         let key = native.clone();
         let q_clone = questions.clone();
+        let in_flight = InFlightCheck::enter(&self.gate_in_flight, &self.gate_settled);
         let handle = tokio::spawn(async move {
-            let (ticket, failed) =
-                match guarded(
-                    GATE_TIMEOUT,
-                    async move { gate.question_ticket(turn).await },
-                )
-                .await
-                {
-                    Some(t) => (t, false),
-                    None => (None, true),
-                };
+            let tx_orphan = tx.clone();
+            let gate_orphan = gate.clone();
+            let (res_tx, res_rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let mut guard = OrphanGuard::arm(tx_orphan, gate_orphan, Some(in_flight));
+                let t = gate.question_ticket(turn).await;
+                guard.set_ticket(t.clone());
+                let _ = res_tx.send((t, guard));
+            });
+            let (ticket, failed) = match tokio::time::timeout(GATE_TIMEOUT, res_rx).await {
+                Ok(Ok((t, mut guard))) => {
+                    if tx
+                        .send(Internal::Question {
+                            native: key,
+                            ticket: t,
+                            questions: q_clone,
+                            failed: false,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        guard.disarm();
+                    }
+                    return;
+                }
+                Ok(Err(_)) | Err(_) => (None, true),
+            };
             let _ = tx
                 .send(Internal::Question {
                     native: key,
@@ -1606,7 +1729,10 @@ impl Driver {
                     return;
                 };
                 let ticket = match ticket {
-                    Some(t) if self.is_pending_saturated() => {
+                    Some(t)
+                        if self.is_pending_saturated()
+                            || self.pending.len() + 2 > PENDING_LIMIT =>
+                    {
                         self.queue_withdraw(t);
                         self.live.remove(&native);
                         self.decline_question_request(&meta.raw_id);
@@ -1639,6 +1765,9 @@ impl Driver {
                         }
                     }
                 }
+            }
+            Internal::Withdraw(ticket) => {
+                self.queue_withdraw(ticket);
             }
         }
     }
@@ -1869,6 +1998,22 @@ impl Driver {
         self.pending_withdrawals.push(ticket);
     }
 
+    async fn wait_for_in_flight_gates(&self) {
+        let cap = REDEEM_TIMEOUT.min(Duration::from_millis(500));
+        let deadline = TokioInstant::now() + cap;
+        while self.gate_in_flight.load(Ordering::Acquire) > 0 {
+            let notified = self.gate_settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.gate_in_flight.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break;
+            }
+        }
+    }
+
     async fn drain_withdrawals(&mut self) {
         let tickets = std::mem::take(&mut self.pending_withdrawals);
         if tickets.is_empty() {
@@ -1899,6 +2044,7 @@ impl Driver {
                 Internal::Redeem {
                     ticket, decision, ..
                 } if !matches!(decision, GateDecision::Allow) => self.queue_withdraw(ticket),
+                Internal::Withdraw(ticket) => self.queue_withdraw(ticket),
                 _ => {}
             }
         }
