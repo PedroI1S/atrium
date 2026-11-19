@@ -1837,8 +1837,16 @@ fn review3_finding4_relative_stdin_paths() {
         (&in_fd, "0", "echo 'print(1)' | python3 0"),
         (&in_fd, "./0", "echo 'print(1)' | python3 ./0"),
         (&in_proc, "self/fd/0", "echo 'print(1)' | python3 self/fd/0"),
-        (&in_dev, "../dev/stdin", "echo 'print(1)' | python3 ../dev/stdin"),
-        (&in_dev, "x/../stdin", "echo 'print(1)' | python3 x/../stdin"),
+        (
+            &in_dev,
+            "../dev/stdin",
+            "echo 'print(1)' | python3 ../dev/stdin",
+        ),
+        (
+            &in_dev,
+            "x/../stdin",
+            "echo 'print(1)' | python3 x/../stdin",
+        ),
     ] {
         let rules = vec![
             echo.clone(),
@@ -1855,8 +1863,44 @@ fn review3_finding4_relative_stdin_paths() {
         assert!(command_allow_risk(&a, true).is_err(), "{script}");
         assert!(command_allow_risk(&a, false).is_err(), "{script}");
     }
-    for ok in ["build.py", "./scripts/build.py", "tools/stdin.py", "x.py 0", "x.py stdin"] {
-        let a: Vec<String> = std::iter::once("python3").chain(ok.split(' ')).map(String::from).collect();
+    for ok in [
+        "build.py",
+        "./scripts/build.py",
+        "tools/stdin.py",
+        "x.py 0",
+        "x.py stdin",
+    ] {
+        let a: Vec<String> = std::iter::once("python3")
+            .chain(ok.split(' '))
+            .map(String::from)
+            .collect();
         assert!(command_allow_risk(&a, true).is_ok(), "{ok}");
     }
+}
+
+/// Review 3, finding 3 (general rule): a prefix rule on `git` alone doesn't
+/// cover an alias or an external `git-NAME` program; one that names the
+/// subcommand does.
+#[test]
+fn review3_finding3_git_aliases_and_external_subcommands() {
+    let mut repo = Env::home();
+    repo.cwd = format!("{HOME}/repo").into();
+    let git = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["git"]),
+        RuleDecision::Allow,
+        "allow-git",
+    )];
+    for line in ["git st", "git lfs pull", "git -C sub co main"] {
+        assert_eq!(classify(&repo.cmd_rules(line, &git)), "Ask", "{line}");
+    }
+    let lfs = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["git", "lfs"]),
+        RuleDecision::Allow,
+        "allow-git-lfs",
+    )];
+    assert_eq!(classify(&repo.cmd_rules("git lfs pull", &lfs)), "Allow");
 }

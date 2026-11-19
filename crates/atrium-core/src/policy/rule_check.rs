@@ -849,9 +849,13 @@ fn git_config_is_exec(kv: &str) -> bool {
         || lk.starts_with("gpg.")
         || lk.starts_with("remote.")
         || lk.starts_with("protocol.")
+        || lk.starts_with("include.")
+        || lk.starts_with("includeif.")
+        || lk.starts_with("hook.")
         || matches!(
             lk.as_str(),
             "core.fsmonitor"
+                | "core.hookspath"
                 | "core.sshcommand"
                 | "core.askpass"
                 | "core.editor"
@@ -927,12 +931,305 @@ fn git_cli_exec_config(args: &[String]) -> (bool, bool) {
             || w.starts_with("--upload-pack=")
             || w.starts_with("--receive-pack=")
             || w.starts_with("--exec=")
+            || git_long_abbrev(w, &["upload-pack", "receive-pack", "exec", "ext-diff"], 3)
         {
             has_any = true;
             has_dangerous = true;
         }
     }
+    if git_subcommand_runs_code(args) {
+        has_any = true;
+        has_dangerous = true;
+    }
     (has_any, has_dangerous)
+}
+
+/// Whether `w` is `--NAME[=…]` where NAME is an abbreviation (at least
+/// `min` letters) of one of `full`: Git's option parser takes unambiguous
+/// prefixes of long options.
+fn git_long_abbrev(w: &str, full: &[&str], min: usize) -> bool {
+    let Some(body) = w.strip_prefix("--") else {
+        return false;
+    };
+    let name = body.split_once('=').map_or(body, |(n, _)| n);
+    name.len() >= min && full.iter().any(|f| f.starts_with(name))
+}
+
+/// Git's global options that take a separate value.
+const GIT_GLOBAL_VALUE_OPTS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--list-cmds",
+    "--config-env",
+    "--exec-path",
+    "--attr-source",
+];
+
+/// The index in `args` of Git's subcommand, after the global options.
+fn git_subcommand(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        let w = args[i].as_str();
+        if w == "--" {
+            return None;
+        }
+        if GIT_GLOBAL_VALUE_OPTS.contains(&w) {
+            i += 2;
+            continue;
+        }
+        if w.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// Git's own subcommands. Anything else is an alias (which may be a `!`
+/// shell command) or a `git-NAME` program on `PATH`: code a prefix rule on
+/// `git` alone never checked.
+const GIT_BUILTINS: &[&str] = &[
+    "add",
+    "am",
+    "annotate",
+    "apply",
+    "archive",
+    "backfill",
+    "bisect",
+    "blame",
+    "branch",
+    "bugreport",
+    "bundle",
+    "cat-file",
+    "check-attr",
+    "check-ignore",
+    "check-mailmap",
+    "check-ref-format",
+    "checkout",
+    "checkout-index",
+    "cherry",
+    "cherry-pick",
+    "clean",
+    "clone",
+    "column",
+    "commit",
+    "commit-graph",
+    "commit-tree",
+    "config",
+    "count-objects",
+    "describe",
+    "diagnose",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "fast-export",
+    "fast-import",
+    "fetch",
+    "fetch-pack",
+    "fmt-merge-msg",
+    "for-each-ref",
+    "format-patch",
+    "fsck",
+    "gc",
+    "get-tar-commit-id",
+    "grep",
+    "hash-object",
+    "help",
+    "index-pack",
+    "init",
+    "init-db",
+    "interpret-trailers",
+    "log",
+    "ls-files",
+    "ls-remote",
+    "ls-tree",
+    "mailinfo",
+    "mailsplit",
+    "maintenance",
+    "merge",
+    "merge-base",
+    "merge-file",
+    "merge-index",
+    "merge-tree",
+    "mktag",
+    "mktree",
+    "multi-pack-index",
+    "mv",
+    "name-rev",
+    "notes",
+    "pack-objects",
+    "pack-refs",
+    "prune",
+    "prune-packed",
+    "pull",
+    "push",
+    "range-diff",
+    "read-tree",
+    "rebase",
+    "reflog",
+    "refs",
+    "remote",
+    "repack",
+    "replace",
+    "replay",
+    "request-pull",
+    "rerere",
+    "reset",
+    "restore",
+    "rev-list",
+    "rev-parse",
+    "revert",
+    "rm",
+    "send-pack",
+    "shortlog",
+    "show",
+    "show-branch",
+    "show-index",
+    "show-ref",
+    "sparse-checkout",
+    "stage",
+    "stash",
+    "status",
+    "stripspace",
+    "submodule",
+    "switch",
+    "symbolic-ref",
+    "tag",
+    "unpack-file",
+    "unpack-objects",
+    "update-index",
+    "update-ref",
+    "update-server-info",
+    "var",
+    "verify-commit",
+    "verify-pack",
+    "verify-tag",
+    "version",
+    "whatchanged",
+    "worktree",
+    "write-tree",
+];
+
+/// Subcommands that run a program or script the line names or that only
+/// config names (tools, hooks, helpers, a shell): never covered.
+const GIT_RUNS_CODE: &[&str] = &[
+    "filter-branch",
+    "for-each-repo",
+    "instaweb",
+    "send-email",
+    "mergetool",
+    "difftool",
+    "credential",
+    "credential-cache",
+    "credential-store",
+    "shell",
+    "hook",
+    "gui",
+    "citool",
+    "web--browse",
+    "daemon",
+];
+
+/// Whether Git's subcommand runs code the line passes it: `rebase
+/// --exec`/`-x`, `submodule foreach`, `bisect run`, `grep -O`, a remote
+/// helper (`--upload-pack`, `clone`/`ls-remote -u`, `--exec`), a `config`
+/// write of a key that runs code, or a subcommand from `GIT_RUNS_CODE`.
+fn git_subcommand_runs_code(args: &[String]) -> bool {
+    let Some(s) = git_subcommand(args) else {
+        return false;
+    };
+    let sub = args[s].as_str();
+    if GIT_RUNS_CODE.contains(&sub) {
+        return true;
+    }
+    let rest: Vec<&str> = args[s + 1..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|w| *w != "--")
+        .collect();
+    let short_has = |w: &str, ch: char| {
+        w.len() > 1 && w.starts_with('-') && !w.starts_with("--") && w[1..].contains(ch)
+    };
+    match sub {
+        "rebase" => rest
+            .iter()
+            .any(|w| short_has(w, 'x') || git_long_abbrev(w, &["exec"], 2)),
+        "submodule" => rest.contains(&"foreach"),
+        "bisect" => rest.contains(&"run"),
+        "grep" => rest
+            .iter()
+            .any(|w| short_has(w, 'O') || git_long_abbrev(w, &["open-files-in-pager"], 4)),
+        "clone" | "ls-remote" => rest.iter().any(|w| short_has(w, 'u')),
+        "config" => git_config_writes_exec(&rest),
+        _ => false,
+    }
+}
+
+/// Whether a `git config` line writes (or opens an editor on) a key that
+/// runs code. Reads (`--get`, `get`, `--list`, …) don't.
+fn git_config_writes_exec(rest: &[&str]) -> bool {
+    const VALUE_OPTS: &[&str] = &[
+        "-f",
+        "--file",
+        "--blob",
+        "--type",
+        "--default",
+        "--comment",
+        "--value",
+        "--url",
+    ];
+    let mut positional: Vec<&str> = vec![];
+    let mut i = 0;
+    while i < rest.len() {
+        let w = rest[i];
+        if matches!(w, "-e" | "--edit" | "edit") {
+            return true;
+        }
+        if VALUE_OPTS.contains(&w) {
+            i += 2;
+            continue;
+        }
+        if w.starts_with('-') {
+            if w.starts_with("--get")
+                || matches!(w, "-l" | "--list" | "--unset" | "--unset-all")
+                || w.starts_with("--remove-section")
+                || w.starts_with("--rename-section")
+            {
+                return false;
+            }
+            i += 1;
+            continue;
+        }
+        positional.push(w);
+        i += 1;
+    }
+    if let Some(verb) = positional.first() {
+        match *verb {
+            "get" | "list" | "unset" | "remove-section" | "rename-section" => return false,
+            "set" => positional.remove(0),
+            _ => "",
+        };
+    }
+    match positional.as_slice() {
+        [key, _value, ..] => git_config_is_exec(key),
+        _ => false,
+    }
+}
+
+/// Whether a prefix rule leaves Git's subcommand open (`git` alone) and the
+/// line runs one that isn't Git's own.
+fn git_unpinned_external(argv_args: &[String], rule_prefix: &[String]) -> bool {
+    let Some(s) = git_subcommand(argv_args) else {
+        return false;
+    };
+    // `rule_prefix[0]` is `git`; the subcommand is pinned if the prefix reaches it
+    s + 1 >= rule_prefix.len() && !GIT_BUILTINS.contains(&argv_args[s].as_str())
 }
 
 /// Checks whether an allow command rule (`CommandPrefix` or `CommandExact`)
@@ -1120,7 +1417,7 @@ pub(crate) fn command_prefix_blocked(argv: &[String], rule_prefix: &[String]) ->
     if SHELLS.contains(&name.as_str()) || RUNS_HERE.contains(&name.as_str()) {
         return true;
     }
-    if name == "git" && git_cli_exec_config(args).0 {
+    if name == "git" && (git_cli_exec_config(args).0 || git_unpinned_external(args, rule_prefix)) {
         return true;
     }
     if name == "find" {

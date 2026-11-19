@@ -146,7 +146,11 @@ fn sed_script_files(script: &str) -> Option<Vec<String>> {
         while *i < n && c[*i] != '\n' {
             *i += 1;
         }
-        c[start..*i].iter().collect::<String>().trim_start().to_string()
+        c[start..*i]
+            .iter()
+            .collect::<String>()
+            .trim_start()
+            .to_string()
     };
     // until an unescaped `d` (a newline inside is fine for `s`)
     let delimited = |i: &mut usize, d: char| -> Option<()> {
@@ -238,7 +242,8 @@ fn sed_script_files(script: &str) -> Option<Vec<String>> {
                 delimited(&mut i, d)?;
                 delimited(&mut i, d)?;
                 if cmd == 's' {
-                    while i < n && matches!(c[i], 'g' | 'p' | 'i' | 'I' | 'm' | 'M' | 'e' | '0'..='9')
+                    while i < n
+                        && matches!(c[i], 'g' | 'p' | 'i' | 'I' | 'm' | 'M' | 'e' | '0'..='9')
                     {
                         i += 1;
                     }
@@ -295,9 +300,8 @@ fn push_script_path_tokens(cmd: &str, script: &str, out: &mut HashSet<String>) {
         if t.is_empty() {
             continue;
         }
-        let after_cmd = prev.is_some_and(|p| {
-            matches!(p, ">" | ">>" | "<") || p.ends_with('>') || p.ends_with('<')
-        });
+        let after_cmd = prev
+            .is_some_and(|p| matches!(p, ">" | ">>" | "<") || p.ends_with('>') || p.ends_with('<'));
         let quoted_path = tok.contains('"') && looks_like_path_word(t);
         if after_cmd || is_explicit_rel_or_var_path(t) || quoted_path {
             push_expanded_path(t, out);
@@ -898,7 +902,11 @@ fn all_paths(input: &PolicyInput<'_>, a: &Analysis) -> Vec<PathBuf> {
     // file named inside a script, `w/out.txt` with no space): resolve it
     // lexically, or fail closed.
     for (unit, words) in unit_paths.iter().enumerate() {
-        let cwds = a.unit_cwd.get(unit).map(|c| c.candidates()).unwrap_or_default();
+        let cwds = a
+            .unit_cwd
+            .get(unit)
+            .map(|c| c.candidates())
+            .unwrap_or_default();
         for w in words {
             if a.use_index.contains_key(&(unit, w.clone())) {
                 continue;
@@ -942,9 +950,15 @@ fn lexical_paths(word: &str, home: &Path, cwds: &[&PathBuf]) -> Option<Vec<PathB
         (vec![home.to_path_buf()], "")
     } else if let Some(r) = word.strip_prefix("~/") {
         (vec![home.to_path_buf()], r)
-    } else if let Some(r) = word.strip_prefix("${HOME}").or_else(|| word.strip_prefix("$HOME")) {
+    } else if let Some(r) = word
+        .strip_prefix("${HOME}")
+        .or_else(|| word.strip_prefix("$HOME"))
+    {
         (vec![home.to_path_buf()], r)
-    } else if let Some(r) = word.strip_prefix("${PWD}").or_else(|| word.strip_prefix("$PWD")) {
+    } else if let Some(r) = word
+        .strip_prefix("${PWD}")
+        .or_else(|| word.strip_prefix("$PWD"))
+    {
         (cwds.iter().map(|c| (*c).clone()).collect(), r)
     } else if word.starts_with('/') {
         (vec![PathBuf::from("/")], word)
@@ -1869,18 +1883,24 @@ fn git_glob_reaches_credential(pattern: &str) -> bool {
     // only such files: like `is_git_key_name`, those aren't keys, and a file
     // below a credential folder counts only when the pattern names the folder.
     let joined = parts.join("/");
-    let code_ext = joined
-        .rsplit_once('.')
-        .is_some_and(|(_, ext)| !ext.contains(['*', '?', '[', '/', '\\']) && GIT_CODE_EXTS.contains(&ext));
+    let code_ext = joined.rsplit_once('.').is_some_and(|(_, ext)| {
+        !ext.contains(['*', '?', '[', '/', '\\']) && GIT_CODE_EXTS.contains(&ext)
+    });
     GIT_CRED_NAMES.iter().any(|n| hits(n))
         || GIT_CRED_SUFFIXES.iter().any(|s| hits(s))
         || GIT_CRED_DIRS
             .iter()
             .any(|d| (!code_ext || joined.contains(d)) && hits(&format!("{d}/?*")))
         || (!code_ext
-            && ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "msal_token_cache."]
-                .iter()
-                .any(|k| hits(&format!("{k}*"))))
+            && [
+                "id_rsa",
+                "id_dsa",
+                "id_ecdsa",
+                "id_ed25519",
+                "msal_token_cache.",
+            ]
+            .iter()
+            .any(|k| hits(&format!("{k}*"))))
 }
 
 const GIT_CODE_EXTS: &[&str] = &[
