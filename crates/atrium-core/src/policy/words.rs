@@ -333,11 +333,17 @@ fn has_unknown_var(w: &str) -> bool {
 /// `a{b,c}d` → `abd`, `acd`; `{1..3}`, `{a..c}`, `{01..10..2}` as the
 /// shell's sequence expressions (round 7 item 1). `None` when it would make
 /// more than a few hundred words.
+/// A chosen brace pair's words: a sequence's, or the commas to cut at.
+type BraceWords = Result<Vec<String>, Vec<usize>>;
+
 pub(crate) fn brace_expand(w: &str) -> Option<Vec<String>> {
     if !w.contains('{') {
         return Some(vec![w.to_string()]);
     }
-    if brace_results_lower_bound(w) > MAX_BRACE_RESULTS {
+    // A `$` before a group stops it expanding, and a word may pick one in
+    // (`{,$}{a,b}`): groups are independent only without `$` (review 1,
+    // finding 10).
+    if !w.contains('$') && brace_results_lower_bound(w) > MAX_BRACE_RESULTS {
         return None;
     }
     let mut work = vec![w.to_string()];
@@ -349,40 +355,46 @@ pub(crate) fn brace_expand(w: &str) -> Option<Vec<String>> {
             return None;
         }
         let cs: Vec<char> = x.chars().collect();
-        // matching braces and their top-level commas, in one pass
-        let mut stack: Vec<(usize, Vec<usize>)> = vec![];
-        // (open, close, the words between them)
-        let mut best: Option<(usize, usize, Vec<String>)> = None;
+        // matching braces and their top-level commas, in one pass:
+        // (open, commas, holds another pair)
+        let mut stack: Vec<(usize, Vec<usize>, bool)> = vec![];
+        // (open, close, the sequence's words, or the commas to split at).
+        // Comma words are cut only for the pair finally chosen, and a pair
+        // holding another pair is never a sequence (`brace_sequence` refuses
+        // any `{`), so nested interiors are never copied again (review 1,
+        // finding 7).
+        let mut best: Option<(usize, usize, BraceWords)> = None;
         for (i, &c) in cs.iter().enumerate() {
             match c {
-                '{' => stack.push((i, vec![])),
+                '{' => stack.push((i, vec![], false)),
                 ',' => {
                     if let Some(top) = stack.last_mut() {
                         top.1.push(i);
                     }
                 }
                 '}' => {
-                    let Some((open, commas)) = stack.pop() else {
+                    let Some((open, commas, nested)) = stack.pop() else {
                         continue;
                     };
+                    if let Some(parent) = stack.last_mut() {
+                        parent.2 = true;
+                    }
                     if (open > 0 && cs[open - 1] == '$')
                         || best.as_ref().is_some_and(|b| open >= b.0)
                     {
                         continue;
                     }
                     let alts = if commas.is_empty() {
+                        if nested {
+                            continue;
+                        }
                         let inner: String = cs[open + 1..i].iter().collect();
                         match brace_sequence(&inner) {
-                            Some(v) => v,
+                            Some(v) => Ok(v),
                             None => continue,
                         }
                     } else {
-                        let mut bounds = vec![open];
-                        bounds.extend(commas);
-                        bounds.push(i);
-                        (0..bounds.len() - 1)
-                            .map(|k| cs[bounds[k] + 1..bounds[k + 1]].iter().collect())
-                            .collect()
+                        Err(commas)
                     };
                     best = Some((open, i, alts));
                 }
@@ -392,6 +404,17 @@ pub(crate) fn brace_expand(w: &str) -> Option<Vec<String>> {
         match best {
             None => out.push(x),
             Some((open, close, alts)) => {
+                let alts: Vec<String> = match alts {
+                    Ok(v) => v,
+                    Err(commas) => {
+                        let mut bounds = vec![open];
+                        bounds.extend(commas);
+                        bounds.push(close);
+                        (0..bounds.len() - 1)
+                            .map(|k| cs[bounds[k] + 1..bounds[k + 1]].iter().collect())
+                            .collect()
+                    }
+                };
                 let pre: String = cs[..open].iter().collect();
                 let post: String = cs[close + 1..].iter().collect();
                 for alt in alts {

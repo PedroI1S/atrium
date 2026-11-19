@@ -934,7 +934,8 @@ impl PolicyEngine for DefaultPolicy {
         // When glob expansion overflows (brace or variant cap), Ask everywhere.
         let unknown = matches!(input.check.subject, ToolSubject::Unknown)
             || a.unbounded_unknown_dangerous
-            || glob_unbounded;
+            || glob_unbounded
+            || a.glob_work_exhausted.get();
         let command = matches!(input.check.subject, ToolSubject::Command { .. });
         if !unknown
             && (!glob_leaves || out.any_allow)

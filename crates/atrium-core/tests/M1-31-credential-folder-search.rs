@@ -712,3 +712,194 @@ fn k10_bounded_star_dotdot_globs_preserve_verdicts_and_stay_fast() {
         ask_home3
     );
 }
+
+// ---------------------------------------------------------------------------
+// Review 1 (Codex, rework): one test per finding, each the reviewer's case.
+// ---------------------------------------------------------------------------
+
+const ASK4: [&str; 4] = ["Ask", "Ask", "Ask", "Ask"];
+
+fn want4(w: [&str; 4]) -> [String; 4] {
+    w.map(str::to_string)
+}
+
+/// Finding 1: an equivalent but differently spelled home (`/h//u`) on the
+/// same thread must not lend its sensitive-path strings to `/h/u`.
+#[test]
+fn review1_f1_sensitive_cache_is_keyed_by_the_strings_it_uses() {
+    let mut odd = Env::home();
+    odd.home = "/h//u".into();
+    let none = ToolCheck {
+        call_id: None,
+        name: "T".into(),
+        kind: ToolKind::Read,
+        title: None,
+        input: serde_json::json!({}),
+        subject: ToolSubject::None,
+        turn: 1,
+    };
+    let _ = odd.eval_check(&none, &[], Preset::FullAccess);
+    let env = Env::home();
+    let c = paths_check(
+        ToolKind::Read,
+        "Read",
+        &["/h/u/.aws/credentials"],
+        false,
+        None,
+    );
+    assert_eq!(
+        classify(&env.eval_check(&c, &[], Preset::FullAccess)),
+        format!("Hard({CR})")
+    );
+}
+
+/// Finding 2: a recursive root written as a glob that names a credential
+/// folder is the same hard deny as the folder itself.
+#[test]
+fn review1_f2_globbed_recursive_roots_are_hard_denied() {
+    let env = Env::home();
+    let hard = [CR, CR, CR, CR].map(|id| format!("Hard({id})"));
+    for line in [
+        "rg x ~/.aw[s]",
+        "grep -r x ~/.ss[h]",
+        "rg x ~/.gnup?",
+        "rg x '/h/u/.aw*'",
+    ] {
+        assert_eq!(eval_all_settings(&env, &cmd_check(line)), hard, "{line}");
+    }
+    let c = paths_check(ToolKind::Search, "Grep", &["~/.aw[s]"], true, None);
+    assert_eq!(eval_all_settings(&env, &c), hard, "Paths ~/.aw[s]");
+    // a glob root that names no such folder is not a hard deny
+    let got = eval_all_settings(&env, &cmd_check("rg x ~/pro[j]"));
+    assert!(
+        got.iter().all(|v| !v.starts_with("Hard")),
+        "~/pro[j]: {got:?}"
+    );
+}
+
+/// Finding 4: an ordinary file below a browser root is not a folder holding
+/// credentials; the profile folder itself still is.
+#[test]
+fn review1_f4_ordinary_browser_profile_files_keep_devs_verdict() {
+    let env = Env::home();
+    let got = eval_all_settings(
+        &env,
+        &cmd_check("rg x ~/.config/google-chrome/Default/Preferences"),
+    );
+    assert!(
+        got.iter().all(|v| !v.starts_with("Hard")),
+        "Preferences: {got:?}"
+    );
+    assert_eq!(got[0], "Allow", "Preferences in Home: {got:?}");
+    let hard = [CR, CR, CR, CR].map(|id| format!("Hard({id})"));
+    for line in [
+        "rg x ~/.config/google-chrome/Default",
+        "rg x '~/.config/google-chrome/Profile 2'",
+        "rg x ~/.config/google-chrome",
+        "rg x ~/.mozilla/firefox/abcd.default-release",
+    ] {
+        assert_eq!(eval_all_settings(&env, &cmd_check(line)), hard, "{line}");
+    }
+}
+
+/// Finding 5: grep's last directory action wins; `skip` and `read` turn
+/// `-r` off again.
+#[test]
+fn review1_f5_grep_directories_skip_or_read_clears_recursion() {
+    let env = Env::home();
+    let plain = eval_all_settings(&env, &cmd_check("grep -d skip x ~/.aws"));
+    for line in [
+        "grep -r -d skip x ~/.aws",
+        "grep -r --directories=skip x ~/.aws",
+        "grep -r -d read x ~/.aws",
+        "grep -R --directories=read x ~/.aws",
+        "grep -rdskip x ~/.aws",
+    ] {
+        assert_eq!(eval_all_settings(&env, &cmd_check(line)), plain, "{line}");
+    }
+    let hard = [CR, CR, CR, CR].map(|id| format!("Hard({id})"));
+    for line in [
+        "grep -d skip -r x ~/.aws",
+        "grep -d skip --directories=recurse x ~/.aws",
+    ] {
+        assert_eq!(eval_all_settings(&env, &cmd_check(line)), hard, "{line}");
+    }
+}
+
+/// Finding 6: a numeric range spanning all of i64 must not overflow.
+#[test]
+fn review1_f6_full_i64_brace_range_does_not_panic() {
+    let env = Env::home();
+    let c = paths_check(
+        ToolKind::Search,
+        "Grep",
+        &["~/proj"],
+        true,
+        Some("{9223372036854775807..-9223372036854775808}"),
+    );
+    // no panic; like any sequence too long to expand (`{1..65}`), the
+    // braces stay as written and the verdict is the same
+    let got = eval_search_presets(&env, &c);
+    let long = paths_check(ToolKind::Search, "Grep", &["~/proj"], true, Some("{1..65}"));
+    assert_eq!(got, eval_search_presets(&env, &long));
+}
+
+/// Finding 7: deeply nested braces cost linear work.
+#[test]
+fn review1_f7_nested_braces_are_linear() {
+    let env = Env::home();
+    let g = "{".repeat(30_000) + "x" + &"}".repeat(30_000);
+    let c = paths_check(ToolKind::Search, "Grep", &["~/proj"], true, Some(&g));
+    let start = std::time::Instant::now();
+    let _ = eval_search_presets(&env, &c);
+    let el = start.elapsed();
+    assert!(el.as_millis() < 750, "nested braces (Paths): {el:?}");
+    let start = std::time::Instant::now();
+    let _ = eval_all_settings(&env, &cmd_check(&format!("rg x {g}")));
+    let el = start.elapsed();
+    assert!(el.as_millis() < 1000, "nested braces (command): {el:?}");
+}
+
+/// Finding 8: repeated `git -C` bases are capped, and past the cap the line
+/// asks in every setting.
+#[test]
+fn review1_f8_repeated_git_bases_are_capped_and_ask() {
+    let env = Env::home();
+    let line = format!("git {}grep pat", "-C '{a,b}' ".repeat(32));
+    let start = std::time::Instant::now();
+    let got = eval_all_settings(&env, &cmd_check(&line));
+    let el = start.elapsed();
+    assert!(el.as_millis() < 1000, "git -C x32: {el:?}");
+    assert_eq!(got, want4(ASK4), "git -C x32");
+    // a few bases still get the full check
+    let hard = [CR, CR, CR, CR].map(|id| format!("Hard({id})"));
+    assert_eq!(
+        eval_all_settings(&env, &cmd_check("git -C ~ -C '{.aws,proj}' grep pat")),
+        hard
+    );
+}
+
+/// Finding 9: a command glob too big for the check's budget asks in every
+/// setting instead of passing as "no sensitive match".
+#[test]
+fn review1_f9_command_glob_matchers_are_budgeted() {
+    let env = Env::home();
+    let line = format!("rg x ~/**/{}", "[a]".repeat(30_000));
+    let start = std::time::Instant::now();
+    let got = eval_all_settings(&env, &cmd_check(&line));
+    let el = start.elapsed();
+    assert_eq!(got, want4(ASK4), "huge command glob");
+    assert!(el.as_millis() < 1000, "huge command glob: {el:?}");
+}
+
+/// Finding 10: groups after a possible `$` are not independent; the
+/// shortcut must not refuse a word the expander handles.
+#[test]
+fn review1_f10_brace_shortcut_does_not_refuse_dollar_words() {
+    let env = Env::home();
+    let line = format!("cat '{}'", "{,$}".repeat(9));
+    assert_eq!(
+        classify(&env.eval_check(&cmd_check(&line), &[], Preset::FullAccess)),
+        "Allow"
+    );
+}

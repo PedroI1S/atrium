@@ -51,6 +51,10 @@ pub struct Analysis {
     /// The sensitive-path lists for this input, built once per evaluate and
     /// shared by the analysis, the hard-deny check and Home (N11).
     pub sensitive: std::rc::Rc<Sensitive>,
+    /// The hard-deny check ran out of its glob step budget (command globs,
+    /// globbed search roots, `git -C` bases): it could not finish, so the
+    /// engine asks in every preset (K10; review 1, findings 8 and 9).
+    pub glob_work_exhausted: std::cell::Cell<bool>,
 }
 
 fn unknown_tok_dangerous(tok: &str, cwd: &Path, home: &Path, s: &Sensitive, piped: bool) -> bool {
@@ -219,6 +223,7 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         glob_escape: None,
         glob_search: None,
         sensitive: Sensitive::shared(input),
+        glob_work_exhausted: std::cell::Cell::new(false),
     };
     let lex_cmd = |a: &mut Analysis, line: &str, start: &Path| {
         if line.len() > MAX_BYTES {
@@ -481,32 +486,29 @@ impl Sensitive {
     /// `new`, built once per evaluate and reused across evaluates on the
     /// same thread while home and Atrium's paths stay the same (N11).
     pub fn shared(input: &PolicyInput<'_>) -> std::rc::Rc<Self> {
-        type Key = (PathBuf, Vec<PathBuf>, Vec<PathBuf>);
         thread_local! {
-            static LAST: std::cell::RefCell<Option<(Key, std::rc::Rc<Sensitive>)>> =
+            static LAST: std::cell::RefCell<Option<std::rc::Rc<Sensitive>>> =
                 const { std::cell::RefCell::new(None) };
         }
+        // The key is exactly what `new` builds from: the lowered home and
+        // Atrium paths, compared by value (review 1, finding 1).
+        let (home, data, protected) = Self::lowered(input);
         LAST.with(|last| {
             let mut last = last.borrow_mut();
-            if let Some(((h, d, p), s)) = last.as_ref()
-                && h == input.home
-                && d.as_slice() == input.atrium_data_paths
-                && p.as_slice() == input.atrium_protected_paths
+            if let Some(s) = last.as_ref()
+                && s.home == home
+                && s.data == data
+                && s.protected == protected
             {
                 return s.clone();
             }
-            let s = std::rc::Rc::new(Self::new(input));
-            let key = (
-                input.home.to_path_buf(),
-                input.atrium_data_paths.to_vec(),
-                input.atrium_protected_paths.to_vec(),
-            );
-            *last = Some((key, s.clone()));
+            let s = std::rc::Rc::new(Self::from_lowered(home, data, protected));
+            *last = Some(s.clone());
             s
         })
     }
 
-    pub fn new(input: &PolicyInput<'_>) -> Self {
+    fn lowered(input: &PolicyInput<'_>) -> (String, Vec<String>, Vec<String>) {
         let home = lower(input.home);
         let data: Vec<String> = input.atrium_data_paths.iter().map(|p| lower(p)).collect();
         let protected: Vec<String> = input
@@ -514,6 +516,11 @@ impl Sensitive {
             .iter()
             .map(|p| lower(p))
             .collect();
+        (home, data, protected)
+    }
+
+    /// Every field derives from these three values only.
+    fn from_lowered(home: String, data: Vec<String>, protected: Vec<String>) -> Self {
         let mut raw_forms = vec![];
         for rel in CRED_FILES.iter().chain(CRED_TREES.iter()) {
             for anchor in ["~/", "$home/", "${home}/"] {
@@ -1113,6 +1120,8 @@ struct Ctx<'a> {
     input: &'a PolicyInput<'a>,
     a: &'a Analysis,
     s: &'a Sensitive,
+    /// Step budget for the matchers this check builds (K10).
+    budget: GlobBudget,
 }
 
 impl Ctx<'_> {
@@ -1465,7 +1474,75 @@ impl Ctx<'_> {
         hits
     }
 
+    /// Charges the check's glob budget; once it is spent the check can't
+    /// finish and the engine asks everywhere.
+    fn spend(&self, steps: usize) -> bool {
+        if self.budget.charge(steps) {
+            return true;
+        }
+        self.a.glob_work_exhausted.set(true);
+        false
+    }
+
+    /// A recursive root written as a glob (`~/.aw[s]`, `~/.ss?`): the
+    /// folders it can name, among those that hold hard-denied paths and
+    /// their ancestors below home, matched with shell rules (review 1,
+    /// finding 2).
+    fn glob_root_hit(&self, pl: &str) -> Option<&'static str> {
+        let home = &self.s.home;
+        let mut cands: Vec<String> = vec![];
+        let mut add = |rel: &str| {
+            let mut end = 0usize;
+            for seg in rel.split('/') {
+                end += seg.len();
+                let c = format!("{home}/{}", &rel[..end]);
+                if !cands.contains(&c) {
+                    cands.push(c);
+                }
+                end += 1;
+            }
+        };
+        for f in CRED_FILES {
+            add(f);
+        }
+        for t in CRED_TREES {
+            add(&format!("{t}/x"));
+        }
+        for n in SSH_PROBES {
+            add(&format!(".ssh/{n}"));
+        }
+        for b in BROWSER_ROOTS {
+            add(&format!("{b}/default/cookies"));
+        }
+        for d in &self.s.data {
+            if let Some(rel) = under(d, home)
+                && !rel.is_empty()
+            {
+                add(rel);
+            }
+        }
+        if !self.spend(shell_glob_steps(pl) + cands.len() / 4) {
+            return None;
+        }
+        let g = ShellGlob::new(pl);
+        cands
+            .iter()
+            .filter(|c| g.is_match(c))
+            .find_map(|c| self.dir_contains_literal(Path::new(c)))
+    }
+
     fn dir_contains_hard_deny(&self, p: &Path) -> Option<&'static str> {
+        if let Some(h) = self.dir_contains_literal(p) {
+            return Some(h);
+        }
+        let pl = lower(p);
+        if has_any(&pl, &['*', '?', '[']) {
+            return self.glob_root_hit(&pl);
+        }
+        None
+    }
+
+    fn dir_contains_literal(&self, p: &Path) -> Option<&'static str> {
         if let Some(h) = self.s.hit(p, Role::Read) {
             return Some(h);
         }
@@ -1484,9 +1561,10 @@ impl Ctx<'_> {
         if under(".ssh", rest).is_some()
             || CRED_FILES.iter().any(|f| under(f, rest).is_some())
             || CRED_TREES.iter().any(|t| under(t, rest).is_some())
-            || BROWSER_ROOTS
-                .iter()
-                .any(|b| under(b, rest).is_some() || under(rest, b).is_some())
+            || BROWSER_ROOTS.iter().any(|b| {
+                under(b, rest).is_some()
+                    || under(rest, b).is_some_and(|r| browser_profile_dir(b, r))
+            })
         {
             return Some("credential-read");
         }
@@ -1535,21 +1613,39 @@ impl Ctx<'_> {
             }
             return;
         }
+        // Each `-C` multiplies the candidate folders: dedupe them and cap the
+        // product before building it; past the cap the check asks (review 1,
+        // finding 8).
         let mut bases: Vec<PathBuf> = vec![];
         for (idx, b) in spec.base_dirs.iter().enumerate() {
             let expanded = words::brace_expand(b).unwrap_or_else(|| vec![b.clone()]);
             if idx == 0 {
                 for eb in expanded {
-                    bases.extend(self.target_paths(i, &eb));
+                    for p in self.target_paths(i, &eb) {
+                        if !bases.contains(&p) {
+                            bases.push(p);
+                        }
+                    }
                 }
             } else {
+                if bases.len().saturating_mul(expanded.len()) > MAX_SEARCH_BASES {
+                    self.a.glob_work_exhausted.set(true);
+                    return;
+                }
                 let mut next = vec![];
                 for prev in &bases {
                     for eb in &expanded {
-                        next.push(lexical_resolve(eb, prev, self.home()));
+                        let p = lexical_resolve(eb, prev, self.home());
+                        if !next.contains(&p) {
+                            next.push(p);
+                        }
                     }
                 }
                 bases = next;
+            }
+            if bases.len() > MAX_SEARCH_BASES {
+                self.a.glob_work_exhausted.set(true);
+                return;
             }
         }
         if spec.roots.is_empty() {
@@ -1838,6 +1934,11 @@ impl Ctx<'_> {
         if !self.might_glob_hit_probe(&pl) {
             return None;
         }
+        // `glob_hit` compiles the pattern and matches every probe (review 1,
+        // finding 9)
+        if !self.spend(shell_glob_steps(&pl) + GLOB_PROBE_MATCH_STEPS) {
+            return None;
+        }
         self.s.glob_hit(p, role)
     }
 }
@@ -1926,6 +2027,19 @@ fn resolve_long_opt<'a>(name: &'a str, o: &SearchOpts) -> &'a str {
     found.unwrap_or(name)
 }
 
+/// `grep -d ACTION` / `--directories=ACTION`, by unambiguous prefix as grep
+/// reads it: `Some(true)` for `recurse`, `Some(false)` for `read` or `skip`
+/// (the last one given wins; review 1, finding 5), `None` otherwise.
+fn grep_directories_action(v: &str) -> Option<bool> {
+    if v.len() >= 3 && "recurse".starts_with(v) {
+        Some(true)
+    } else if (v.len() >= 3 && "read".starts_with(v)) || (!v.is_empty() && "skip".starts_with(v)) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn parse_search_opts(args: &[String], o: &SearchOpts) -> Option<SearchRootSpec> {
     let mut recursive = o.always_recursive;
     let mut have_pattern = false;
@@ -1994,10 +2108,9 @@ fn parse_search_opts(args: &[String], o: &SearchOpts) -> Option<SearchRootSpec> 
                 if o.check_grep_recursion
                     && name == "directories"
                     && let Some(v) = val
-                    && v.len() >= 3
-                    && "recurse".starts_with(v)
+                    && let Some(r) = grep_directories_action(v)
                 {
-                    recursive = true;
+                    recursive = r;
                 }
             } else if o.opt_num_l.contains(&name)
                 && val_eq.is_none()
@@ -2039,10 +2152,9 @@ fn parse_search_opts(args: &[String], o: &SearchOpts) -> Option<SearchRootSpec> 
                     if o.check_grep_recursion
                         && *c == 'd'
                         && let Some(v) = val
-                        && v.len() >= 3
-                        && "recurse".starts_with(v)
+                        && let Some(r) = grep_directories_action(v)
                     {
-                        recursive = true;
+                        recursive = r;
                     }
                     break;
                 }
@@ -3683,23 +3795,30 @@ fn has_any(s: &str, chars: &[char]) -> bool {
 /// outside any brace (present in every word). One byte pass.
 fn brace_estimate(g: &str) -> (usize, usize, usize) {
     let b = g.as_bytes();
-    let mut stack: Vec<(usize, usize)> = vec![];
+    // (open, alternatives, holds a pair): a pair holding another pair is never
+    // a sequence, so its interior is not rescanned (review 1, finding 7).
+    let mut stack: Vec<(usize, usize, bool)> = vec![];
     let mut count = 1usize;
     let mut outside = 1usize;
     let mut outside_bytes = 0usize;
     let mut i = 0usize;
     while i < b.len() {
         match b[i] {
-            b'{' => stack.push((i, 1)),
+            b'{' => stack.push((i, 1, false)),
             b',' => {
                 if let Some(top) = stack.last_mut() {
                     top.1 += 1;
                 }
             }
             b'}' => {
-                if let Some((open, alts)) = stack.pop() {
+                if let Some((open, alts, nested)) = stack.pop() {
+                    if let Some(parent) = stack.last_mut() {
+                        parent.2 = true;
+                    }
                     let n = if alts > 1 {
                         alts
+                    } else if nested {
+                        1
                     } else {
                         brace_sequence_len(&g[open + 1..i])
                     };
@@ -3736,7 +3855,8 @@ fn brace_sequence_len(inner: &str) -> usize {
                 .get(2)
                 .and_then(|s| s.parse::<i64>().ok())
                 .map_or(1, |s| s.unsigned_abs().max(1));
-            usize::try_from(x.abs_diff(y) / step + 1)
+            // saturating: `{i64::MAX..i64::MIN}` spans u64::MAX (review 1, finding 6)
+            usize::try_from((x.abs_diff(y) / step).saturating_add(1))
                 .unwrap_or(usize::MAX)
                 .min(MAX_GLOB_VARIANTS + 1)
         }
@@ -4236,6 +4356,7 @@ pub fn hard_deny(input: &PolicyInput<'_>, a: &Analysis) -> Option<&'static str> 
         input,
         a,
         s: &a.sensitive,
+        budget: GlobBudget::default(),
     };
     let hits = ctx.check();
     HARD_DENY_DEFAULTS
@@ -4278,3 +4399,54 @@ pub fn sensitive_roots(home: &Path, data: &[PathBuf], protected: &[PathBuf]) -> 
     v.extend(protected.iter().cloned());
     v
 }
+
+/// Whether `r` (below browser root `b`, lowered) names a profile folder,
+/// which holds the browser's credential files. The policy is lexical, so a
+/// root below `b` counts as a folder only when it is spelled like one: a
+/// Chromium-style profile (`Default`, `Profile 2`, `Guest Profile`, `System
+/// Profile`) or a Firefox profile folder (`firefox`, `profiles`, and
+/// `<dir>/<name>.default*` below them). Other paths below `b`, such as
+/// `Default/Preferences`, keep `dev`'s verdict; their own names are still
+/// checked by `Sensitive::hit` (review 1, finding 4).
+fn browser_profile_dir(b: &str, r: &str) -> bool {
+    if r.is_empty() {
+        return true;
+    }
+    let firefox = b == ".mozilla" || b.ends_with("/firefox");
+    let mut segs = r.split('/');
+    let first = segs.next().unwrap_or("");
+    let second = segs.next();
+    if segs.next().is_some() {
+        return false;
+    }
+    if firefox {
+        let container = matches!(first, "firefox" | "profiles");
+        return match second {
+            None => container || first.contains(".default"),
+            Some(s) => container && s.contains(".default"),
+        };
+    }
+    second.is_none()
+        && (first == "default"
+            || first.starts_with("profile ")
+            || first == "guest profile"
+            || first == "system profile")
+}
+
+/// Budget steps for the regexes `ShellGlob::new` builds from `pattern`: one
+/// for the whole pattern when it has `**`, else one per component.
+fn shell_glob_steps(pattern: &str) -> usize {
+    if pattern.contains("**") {
+        return compile_steps(pattern);
+    }
+    components_upto(pattern, MAX_GLOB_WORK)
+        .saturating_mul(GLOB_COMPILE_STEPS)
+        .saturating_add(pattern.len() / 4)
+}
+
+/// Budget steps for matching one compiled glob against every probe path.
+const GLOB_PROBE_MATCH_STEPS: usize = 32;
+
+/// Candidate base folders (`git -C a -C b …`) one recursive search may run
+/// from before the check gives up and asks.
+const MAX_SEARCH_BASES: usize = 64;
