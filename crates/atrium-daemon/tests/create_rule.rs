@@ -488,5 +488,59 @@ async fn create_rule_refuses_unsafe_command_allow_rules_and_invalid_path_scopes(
     })
     .await;
 
+    // 9. Review 3 (D-129): Git execution payloads and relative stdin
+    // scripts are refused, prefix and exact, and nothing is stored.
+    let review3_before = serde_json::from_value::<Vec<atrium_protocol::policy::Rule>>(
+        wire.ok(DaemonCommand::ListRules).await,
+    )
+    .expect("rules")
+    .len();
+    let review3_refused: &[&[&str]] = &[
+        &["git", "rebase", "--exec", "touch victim", "HEAD~1"],
+        &["git", "rebase", "-x", "touch victim", "HEAD~1"],
+        &["git", "rebase", "-xtouch victim", "HEAD~1"],
+        &["git", "submodule", "foreach", "touch victim"],
+        &["git", "bisect", "run", "./t.sh"],
+        &["git", "difftool", "-x", "touch victim"],
+        &["git", "grep", "-Otouch victim", "x"],
+        &["git", "clone", "-u", "touch victim", "x"],
+        &["git", "push", "--exec", "touch victim", "origin"],
+        &["git", "config", "core.fsmonitor", "touch victim"],
+        &["git", "config", "alias.st", "!touch victim"],
+        &["git", "-c", "core.hooksPath=/tmp/h", "commit"],
+        &["python3", "./stdin"],
+        &["python3", "../dev/stdin"],
+        &["node", "fd/0"],
+    ];
+    for argv in review3_refused {
+        for matcher in [prefix(argv), exact(argv)] {
+            let code = wire
+                .refused(DaemonCommand::CreateRule {
+                    rule: cmd_draft(RuleDecision::Allow, matcher.clone(), None),
+                })
+                .await;
+            assert_eq!(code, ErrorCode::Invalid, "expected Invalid for {matcher:?}");
+        }
+    }
+    let review3_after = serde_json::from_value::<Vec<atrium_protocol::policy::Rule>>(
+        wire.ok(DaemonCommand::ListRules).await,
+    )
+    .expect("rules")
+    .len();
+    assert_eq!(review3_after, review3_before);
+    // ordinary ones still succeed
+    for matcher in [
+        exact(&["git", "rebase", "HEAD~1"]),
+        exact(&["git", "cherry-pick", "-x", "abc"]),
+        exact(&["git", "config", "user.name"]),
+        prefix(&["git", "lfs"]),
+        prefix(&["python3", "tools/stdin.py"]),
+    ] {
+        wire.ok(DaemonCommand::CreateRule {
+            rule: cmd_draft(RuleDecision::Allow, matcher, None),
+        })
+        .await;
+    }
+
     rig.stop(true).await;
 }
