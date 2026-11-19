@@ -1686,8 +1686,7 @@ fn review3_finding1_git_pathspec_globs_reach_credentials() {
         "git show HEAD -- 'src/*.rs'",
         "git log -- 'docs/*.md'",
     ] {
-        let now = classify(&repo.cmd(line));
-        assert_ne!(now, "Deny", "{line}");
+        assert_eq!(classify(&repo.cmd(line)), "Allow", "{line}");
     }
 }
 

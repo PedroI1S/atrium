@@ -1569,7 +1569,122 @@ fn git_names_credential(arg: &str) -> bool {
     git_path_is_credential(path)
 }
 
+/// One token of a Git pathspec read as a glob: `*` any run (Git's default
+/// pathspec `*` crosses `/`), `?` and a `[...]` class any one character
+/// (a superset: fails closed), anything else literal.
+#[derive(Clone, Copy, PartialEq)]
+enum GlobTok {
+    Star,
+    One,
+    Lit(char),
+}
+
+fn glob_toks(p: &str) -> Vec<GlobTok> {
+    let mut out = vec![];
+    let mut it = p.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '*' => {
+                if out.last() != Some(&GlobTok::Star) {
+                    out.push(GlobTok::Star);
+                }
+            }
+            '?' => out.push(GlobTok::One),
+            '[' => {
+                // skip to the closing `]` (or the end); one character
+                for d in it.by_ref() {
+                    if d == ']' {
+                        break;
+                    }
+                }
+                out.push(GlobTok::One);
+            }
+            '\\' => out.push(GlobTok::Lit(it.next().unwrap_or('\\'))),
+            c => out.push(GlobTok::Lit(c)),
+        }
+    }
+    out
+}
+
+/// Whether some string matches both glob token lists.
+fn globs_intersect(a: &[GlobTok], b: &[GlobTok]) -> bool {
+    let (n, m) = (a.len(), b.len());
+    // memo[i][j]: 0 unknown, 1 false, 2 true
+    let mut memo = vec![0u8; (n + 1) * (m + 1)];
+    fn go(a: &[GlobTok], b: &[GlobTok], i: usize, j: usize, memo: &mut [u8]) -> bool {
+        let m = b.len();
+        let k = i * (m + 1) + j;
+        if memo[k] != 0 {
+            return memo[k] == 2;
+        }
+        let r = if i == a.len() && j == m {
+            true
+        } else if i < a.len() && a[i] == GlobTok::Star {
+            go(a, b, i + 1, j, memo) || (j < m && go(a, b, i, j + 1, memo))
+        } else if j < m && b[j] == GlobTok::Star {
+            go(a, b, i, j + 1, memo) || (i < a.len() && go(a, b, i + 1, j, memo))
+        } else if i < a.len() && j < m {
+            let ok = match (a[i], b[j]) {
+                (GlobTok::Lit(x), GlobTok::Lit(y)) => x == y,
+                _ => true,
+            };
+            ok && go(a, b, i + 1, j + 1, memo)
+        } else {
+            false
+        };
+        memo[k] = if r { 2 } else { 1 };
+        r
+    }
+    go(a, b, 0, 0, &mut memo)
+}
+
+/// A pathspec with glob characters: whether it can match a committed
+/// credential (any name, suffix or file below a credential folder, at any
+/// depth). Fails closed: classes match any character, `*` crosses `/`.
+fn git_glob_reaches_credential(pattern: &str) -> bool {
+    let l = pattern.to_lowercase().replace('ſ', "s");
+    let mut parts: Vec<&str> = vec![];
+    for c in l.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(c),
+        }
+    }
+    let p = glob_toks(&parts.join("/"));
+    let hits = |target: &str| {
+        globs_intersect(&p, &glob_toks(target))
+            || globs_intersect(&p, &glob_toks(&format!("*/{target}")))
+    };
+    // A pattern ending in a literal source-code extension (`*.rs`) reaches
+    // only such files: like `is_git_key_name`, those aren't keys, and a file
+    // below a credential folder counts only when the pattern names the folder.
+    let joined = parts.join("/");
+    let code_ext = joined
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| !ext.contains(['*', '?', '[', '/', '\\']) && GIT_CODE_EXTS.contains(&ext));
+    GIT_CRED_NAMES.iter().any(|n| hits(n))
+        || GIT_CRED_SUFFIXES.iter().any(|s| hits(s))
+        || GIT_CRED_DIRS
+            .iter()
+            .any(|d| (!code_ext || joined.contains(d)) && hits(&format!("{d}/?*")))
+        || (!code_ext
+            && ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "msal_token_cache."]
+                .iter()
+                .any(|k| hits(&format!("{k}*"))))
+}
+
+const GIT_CODE_EXTS: &[&str] = &[
+    "pub", "rs", "ts", "tsx", "js", "jsx", "py", "go", "c", "cc", "cpp", "h", "hpp", "java", "rb",
+    "md", "html", "css", "svg", "png",
+];
+
 fn git_path_is_credential(path: &str) -> bool {
+    if path.contains(['*', '?', '[']) && git_glob_reaches_credential(path) {
+        return true;
+    }
     let l = path.to_lowercase().replace('ſ', "s");
     let mut parts: Vec<&str> = vec![];
     for c in l.split('/') {
