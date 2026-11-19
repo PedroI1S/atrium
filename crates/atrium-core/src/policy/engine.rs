@@ -127,20 +127,166 @@ fn is_explicit_rel_or_var_path(w: &str) -> bool {
         || w.starts_with("${PWD}")
 }
 
-fn is_sed_file_cmd(tok: &str) -> bool {
-    let trimmed =
-        tok.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, ',' | '$' | '!' | ';'));
-    matches!(trimmed, "w" | "r" | "W" | "R")
-        || trimmed.ends_with("/w")
-        || trimmed.ends_with("/r")
-        || trimmed.ends_with(";w")
-        || trimmed.ends_with(";r")
-        || trimmed.ends_with("|w")
-        || trimmed.ends_with("|r")
+/// A path word whose target can't be read lexically (an unparsed `sed`
+/// script, a variable, a glob): an allow scope never covers it, a deny scope
+/// always matches it (fail closed). Real paths never hold a NUL.
+const UNRESOLVED: &str = "\0unresolved";
+
+/// The files a `sed` script reads or writes: the `r`/`R`/`w`/`W` commands
+/// and the `s` command's `w` flag, whatever the delimiter, with or without a
+/// space before the name (the name runs to the end of the line). `None`
+/// when the script can't be read: the caller fails closed.
+fn sed_script_files(script: &str) -> Option<Vec<String>> {
+    let c: Vec<char> = script.chars().collect();
+    let n = c.len();
+    let mut out = vec![];
+    let mut i = 0usize;
+    let rest_of_line = |i: &mut usize| -> String {
+        let start = *i;
+        while *i < n && c[*i] != '\n' {
+            *i += 1;
+        }
+        c[start..*i].iter().collect::<String>().trim_start().to_string()
+    };
+    // until an unescaped `d` (a newline inside is fine for `s`)
+    let delimited = |i: &mut usize, d: char| -> Option<()> {
+        while *i < n {
+            if c[*i] == '\\' {
+                *i += 2;
+                continue;
+            }
+            if c[*i] == d {
+                *i += 1;
+                return Some(());
+            }
+            *i += 1;
+        }
+        None
+    };
+    let addr = |i: &mut usize| -> Option<()> {
+        if *i < n && c[*i].is_ascii_digit() {
+            while *i < n && (c[*i].is_ascii_digit() || c[*i] == '~') {
+                *i += 1;
+            }
+        } else if *i < n && c[*i] == '$' {
+            *i += 1;
+        } else if *i < n && (c[*i] == '/' || c[*i] == '\\') {
+            let d = if c[*i] == '\\' {
+                *i += 1;
+                *c.get(*i)?
+            } else {
+                '/'
+            };
+            *i += 1;
+            delimited(i, d)?;
+            while *i < n && matches!(c[*i], 'I' | 'M') {
+                *i += 1;
+            }
+        }
+        Some(())
+    };
+    let ws = |i: &mut usize| {
+        while *i < n && matches!(c[*i], ' ' | '\t') {
+            *i += 1;
+        }
+    };
+    loop {
+        while i < n && (c[i].is_whitespace() || c[i] == ';') {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        if c[i] == '#' {
+            rest_of_line(&mut i);
+            continue;
+        }
+        addr(&mut i)?;
+        ws(&mut i);
+        if i < n && c[i] == ',' {
+            i += 1;
+            ws(&mut i);
+            if i < n && matches!(c[i], '+' | '~') {
+                i += 1;
+            }
+            addr(&mut i)?;
+            ws(&mut i);
+        }
+        while i < n && c[i] == '!' {
+            i += 1;
+            ws(&mut i);
+        }
+        let Some(&cmd) = c.get(i) else {
+            return None;
+        };
+        i += 1;
+        match cmd {
+            '{' | '}' | '=' | 'd' | 'D' | 'g' | 'G' | 'h' | 'H' | 'n' | 'N' | 'p' | 'P' | 'x'
+            | 'z' | 'F' => {}
+            'q' | 'Q' | 'l' | 'L' => {
+                ws(&mut i);
+                while i < n && c[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            's' | 'y' => {
+                let d = *c.get(i)?;
+                if d == '\\' || d == '\n' {
+                    return None;
+                }
+                i += 1;
+                delimited(&mut i, d)?;
+                delimited(&mut i, d)?;
+                if cmd == 's' {
+                    while i < n && matches!(c[i], 'g' | 'p' | 'i' | 'I' | 'm' | 'M' | 'e' | '0'..='9')
+                    {
+                        i += 1;
+                    }
+                    if i < n && c[i] == 'w' {
+                        i += 1;
+                        out.push(rest_of_line(&mut i));
+                    }
+                }
+            }
+            'r' | 'R' | 'w' | 'W' => out.push(rest_of_line(&mut i)),
+            // text, labels, a command to run, a version: not files
+            'a' | 'i' | 'c' | 'e' => loop {
+                let line = rest_of_line(&mut i);
+                if !line.ends_with('\\') || i >= n {
+                    break;
+                }
+                i += 1;
+            },
+            'b' | 't' | 'T' | ':' | 'v' => {
+                while i < n && !matches!(c[i], ';' | '\n') {
+                    i += 1;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 fn push_script_path_tokens(cmd: &str, script: &str, out: &mut HashSet<String>) {
     if !is_script_cmd(cmd) {
+        return;
+    }
+    if cmd == "sed" {
+        match sed_script_files(script) {
+            Some(files) => {
+                for f in files {
+                    if f.is_empty() {
+                        out.insert(UNRESOLVED.to_string());
+                    } else {
+                        push_expanded_path(&f, out);
+                    }
+                }
+            }
+            None => {
+                out.insert(UNRESOLVED.to_string());
+            }
+        }
         return;
     }
     let mut prev: Option<&str> = None;
@@ -149,13 +295,9 @@ fn push_script_path_tokens(cmd: &str, script: &str, out: &mut HashSet<String>) {
         if t.is_empty() {
             continue;
         }
-        let after_cmd = if cmd == "sed" {
-            prev.is_some_and(is_sed_file_cmd)
-        } else {
-            prev.is_some_and(|p| {
-                matches!(p, ">" | ">>" | "<") || p.ends_with('>') || p.ends_with('<')
-            })
-        };
+        let after_cmd = prev.is_some_and(|p| {
+            matches!(p, ">" | ">>" | "<") || p.ends_with('>') || p.ends_with('<')
+        });
         let quoted_path = tok.contains('"') && looks_like_path_word(t);
         if after_cmd || is_explicit_rel_or_var_path(t) || quoted_path {
             push_expanded_path(t, out);
@@ -425,7 +567,8 @@ fn collect_generic_operands(cmd: &str, args: &[String], out: &mut HashSet<String
         }
         if w != "-" {
             push_expanded_path(w, out);
-            if is_script_cmd(cmd) {
+            // sed's operands after the script are input files only
+            if is_script_cmd(cmd) && cmd != "sed" {
                 push_script_path_tokens(cmd, w, out);
             }
             if let Some((k, v)) = w.split_once('=')
@@ -751,6 +894,21 @@ fn all_paths(input: &PolicyInput<'_>, a: &Analysis) -> Vec<PathBuf> {
             v.extend(a.all_paths(idx).into_iter().cloned());
         }
     }
+    // A word the command reads as a path that the walk didn't resolve (a
+    // file named inside a script, `w/out.txt` with no space): resolve it
+    // lexically, or fail closed.
+    for (unit, words) in unit_paths.iter().enumerate() {
+        let cwds = a.unit_cwd.get(unit).map(|c| c.candidates()).unwrap_or_default();
+        for w in words {
+            if a.use_index.contains_key(&(unit, w.clone())) {
+                continue;
+            }
+            match lexical_paths(w, input.home, &cwds) {
+                Some(ps) => v.extend(ps),
+                None => v.push(PathBuf::from(UNRESOLVED)),
+            }
+        }
+    }
     if a.aligned.is_none() && a.uses.is_empty() {
         v.extend(input.resolved_paths.iter().cloned());
     }
@@ -773,12 +931,61 @@ fn scope_rank(r: &Rule, input: &PolicyInput<'_>) -> Option<u8> {
     }
 }
 
+/// `word` made absolute without the filesystem (`~`, `$HOME`, `$PWD`, the
+/// command's cwd candidates; `.`/`..` folded). `None` when it holds anything
+/// that only the shell or the command expands.
+fn lexical_paths(word: &str, home: &Path, cwds: &[&PathBuf]) -> Option<Vec<PathBuf>> {
+    if word == UNRESOLVED || word.is_empty() {
+        return None;
+    }
+    let (bases, rest): (Vec<PathBuf>, &str) = if word == "~" {
+        (vec![home.to_path_buf()], "")
+    } else if let Some(r) = word.strip_prefix("~/") {
+        (vec![home.to_path_buf()], r)
+    } else if let Some(r) = word.strip_prefix("${HOME}").or_else(|| word.strip_prefix("$HOME")) {
+        (vec![home.to_path_buf()], r)
+    } else if let Some(r) = word.strip_prefix("${PWD}").or_else(|| word.strip_prefix("$PWD")) {
+        (cwds.iter().map(|c| (*c).clone()).collect(), r)
+    } else if word.starts_with('/') {
+        (vec![PathBuf::from("/")], word)
+    } else {
+        (cwds.iter().map(|c| (*c).clone()).collect(), word)
+    };
+    if bases.is_empty()
+        || rest.starts_with('~')
+        || rest.contains(['*', '?', '[', '$', '`', '\\', '\0'])
+    {
+        return None;
+    }
+    Some(
+        bases
+            .into_iter()
+            .map(|b| {
+                let mut p = b;
+                for seg in rest.split('/') {
+                    match seg {
+                        "" | "." => {}
+                        ".." => {
+                            p.pop();
+                        }
+                        s => p.push(s),
+                    }
+                }
+                p
+            })
+            .collect(),
+    )
+}
+
 fn path_scope_ok(rule: &Rule, paths: &[PathBuf]) -> bool {
+    let unresolved = paths.iter().any(|p| p.as_os_str() == UNRESOLVED);
     match &rule.path_scope {
         None => true,
         Some(g) => match rule.decision {
-            RuleDecision::Allow => !paths.is_empty() && paths.iter().all(|p| glob_matches(g, p)),
-            RuleDecision::Deny => paths.iter().any(|p| glob_matches(g, p)),
+            RuleDecision::Allow => {
+                !unresolved && !paths.is_empty() && paths.iter().all(|p| glob_matches(g, p))
+            }
+            RuleDecision::Deny => unresolved || paths.iter().any(|p| glob_matches(g, p)),
         },
     }
 }
