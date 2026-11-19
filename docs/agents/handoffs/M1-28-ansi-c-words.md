@@ -271,3 +271,48 @@ git checkout HEAD -- crates/atrium-core/src crates/atrium-daemon/src crates/atri
 **Checks run after rework round 4 (D-123):**
 - `cargo fmt --all`: exited 0
 - `cargo check -p atrium-daemon --tests`: exited 0 (0 warnings)
+
+---
+
+## 11. Rework round 5
+
+1. **Clippy `while_let_loop` ([`crates/atrium-daemon/src/conn.rs`](crates/atrium-daemon/src/conn.rs)):**
+   - Replaced `loop { let Ok(len) = theirs.read_u32().await else { break; }; ... }` with `while let Ok(len) = theirs.read_u32().await { ... }` in `write_loop_does_not_close_when_stalled_reader_lags`.
+
+2. **N12: `atrium-daemon` `socket::a_reader_that_stops_lags_alone` and `socket::replay_then_live_delivers_every_event_once_and_in_order`:**
+   - **Race found (`ReplayDone` sent before `go_live`):** In [`crates/atrium-daemon/src/server.rs`](crates/atrium-daemon/src/server.rs) `feed`, when `page.is_empty()` was first seen, `feed` queued `ReplayDone` into `conn.feed` *before* acquiring `inner.publish.lock().await`, re-checking `events_after`, and calling `inner.hub().go_live(...)`. As a result, a client (`stalled` in `a_reader_that_stops_lags_alone`) could read `ReplayDone` off the wire and the test could start emitting its 48 bursts before `stalled`'s `feed` task acquired `inner.publish`. If `store_batch` acquired `publish` first, `stalled`'s `feed` saw a non-empty `page`, remained in replay (`conn.feed`, which blocks waiting for room instead of lagging), stalled forever once the 1 MiB event lane filled, and never produced `SubscriptionLagged`.
+   - **Fix:** Added `GoLive` / `Conn::go_live_with_done` ([`crates/atrium-daemon/src/conn.rs`](crates/atrium-daemon/src/conn.rs)) and `Hub::go_live_with_done` ([`crates/atrium-daemon/src/hub.rs`](crates/atrium-daemon/src/hub.rs)), and updated [`crates/atrium-daemon/src/server.rs`](crates/atrium-daemon/src/server.rs) `feed` so when `events_after` is empty under `inner.publish`, `ReplayDone` is queued and `sub` is marked live atomically while `inner.publish` is still held (falling back to `conn.feed` without holding `publish` only if the event lane is currently full). Added unit test `go_live_with_done_queues_done_and_marks_live_atomically` in [`crates/atrium-daemon/src/conn.rs`](crates/atrium-daemon/src/conn.rs).
+   - **Slowdown / runtime scheduling in `write_loop` (`replay_then_live_delivers_every_event_once_and_in_order`):** In `replay_then_live_delivers_every_event_once_and_in_order`, 8 subscribers each read ~30,000 events (~240,000 frames total) under `SOON = 20 s`. Previously `write_loop` allocated a `tokio::time::timeout(WRITE_STALL, ...)` timer, a `closed.wait_for(...)` future, a `tokio::select!`, and `writer.writable().await` for every single frame. Updated `write_loop` in [`crates/atrium-daemon/src/conn.rs`](crates/atrium-daemon/src/conn.rs) with a synchronous `write_some` fast path that drains immediately writable frames without per-frame timer/select overhead (yielding every 64 frames via `tokio::task::yield_now().await` so feeders/readers are not starved) and enters `tokio::select!` + `WRITE_STALL` only when `write_some` hits `WouldBlock` (`Ok(Some(0))`) or needs to await `writable()`.
+
+3. **N12: `atrium-agents` `gate_withdraw::codex_adapter_withdraws_interrupted_approval_and_question_and_saturation`:**
+   - **Race found:** In Part 3 (`flood-then-ask`), `gate_withdraw.rs` waits until `stdout_count >= 4096 + session.events.max_capacity() + 5` (`5125`) and `hold.2 == 2`. Because 8 setup stdout lines (`initialize`, `thread/start`, `turn/start`, `turn/started`, `item/started`, `requestApproval`, `requestUserInput`, `item/started`) produce only 2 `events_tx` items (`TurnStarted`, `ToolCallStarted`), `stdout_count == 5125` corresponds to `self.pending.len() == 4095` (`PENDING_LIMIT - 1`). On a `current_thread` runtime, `Driver::run` can yield on tokio's coop budget right at `pending.len() == 4095`, and because `tokio::select!` is `biased;` with `internal_rx` ahead of `out_rx`, `Internal::Gate` and `Internal::Question` race on `spawn_blocking` completion: `Internal::Gate` checked `self.is_pending_saturated() || self.pending.len() + 2 > PENDING_LIMIT` (`4095 + 2 > 4096`, true), whereas `Internal::Question` checked only `self.is_pending_saturated()` (`4095 >= 4096`, false). Whenever `Internal::Question` arrived first at `pending.len() == 4095`, it accepted `QuestionAsked` into slot 4096 instead of declining and withdrawing its ticket.
+   - **Fix:** Updated `Internal::Question` in [`crates/atrium-agents/src/codex/adapter.rs`](crates/atrium-agents/src/codex/adapter.rs) to check `self.is_pending_saturated() || self.pending.len() + 2 > PENDING_LIMIT`, matching `Internal::Gate`. Also ported `OrphanGuard` / `InFlightCheck` / `Internal::Withdraw` / `wait_for_in_flight_gates` (capped at `REDEEM_TIMEOUT.min(Duration::from_millis(500))`) to `spawn_gate` and `spawn_question` in [`crates/atrium-agents/src/codex/adapter.rs`](crates/atrium-agents/src/codex/adapter.rs) so `clear_requests` or `forget_native` aborting an outer inflight handle can never orphan a ledger ticket opened by `gate.check` / `gate.question_ticket`.
+
+4. **N12: `app/src/chat/markdown.ts` ("pathological emphasis and brackets parse quickly"):**
+   - **Slowdowns found:**
+     1. `processEmphasis` stored `Node` references in `openersBottom`. When an interleaved opener/closer pair was matched and removed or cut from the doubly-linked `List` (as happens on `"**_".repeat(10_000)`), `openersBottom.get(key)` pointed to a detached node that `opener = opener.prev` could never reach, degrading emphasis matching to $O(N^2)$ rescans back to `list.head`.
+     2. `]` searched `list.tail` backwards linearly on every close bracket (and deactivated earlier `[` nodes linearly to `list.head` on every link).
+     3. Unmatched backtick runs and `](` link tails without `)` could rescan forward repeatedly; `flanking` also ran regexes and allocated closures per delimiter run.
+   - **Fix in [`app/src/chat/markdown.ts`](app/src/chat/markdown.ts):**
+     - Added monotonic `Node.seq` assigned on `List.push` (and preserved on inserted `em`/`strong`/`del` nodes via `found.seq`) and keyed `openersBottom` on numeric `seq` (`Math.max(floorSeq, closer.seq - 1)`), keeping `processEmphasis` strictly $O(N)$ even when delimiter nodes are removed or cut.
+     - Replaced backward bracket scans with an $O(1)$ `brackets` stack (stopping link-nesting deactivation as soon as an already-inactive `[` is reached).
+     - Cached failed backtick run lengths (`failedBacktickLens`), added a lazy `lastParen` bound and `depth > 32` cap in `linkTail`, and added an ASCII fast path in `isWs`/`isPunctuation` for `flanking`.
+
+**Checks run after rework round 5 (D-123):**
+- `cargo fmt --all`: exited 0
+- `cargo check -p atrium-daemon --tests`: exited 0 (0 warnings)
+- `cargo check -p atrium-agents --tests`: exited 0 (0 warnings)
+
+**Additional verification commands for rework round 5:**
+```fish
+cargo clippy --workspace --all-targets -- -D warnings
+for i in (seq 1 10)
+    cargo test -p atrium-daemon --test socket replay_then_live_delivers_every_event_once_and_in_order || break
+    cargo test -p atrium-daemon --test socket a_reader_that_stops_lags_alone || break
+    cargo test -p atrium-agents --test gate_withdraw codex_adapter_withdraws_interrupted_approval_and_question_and_saturation || break
+end
+cargo test -p atrium-daemon conn::tests::go_live_with_done_queues_done_and_marks_live_atomically
+pnpm --dir app typecheck
+pnpm --dir app test -- markdown.test.ts
+pnpm --dir app build
+```
