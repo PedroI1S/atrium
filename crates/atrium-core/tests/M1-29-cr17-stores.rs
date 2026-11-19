@@ -1653,3 +1653,211 @@ fn escalation_stdin_name_after_script_is_refused() {
         assert!(command_allow_risk(&argv(c), true).is_ok(), "{c}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Escalation round 2 (review 3, D-129)
+// ---------------------------------------------------------------------------
+
+/// Review 3, finding 1: a quoted Git pathspec glob that can match a
+/// credential store asks; an ordinary glob keeps dev's verdict.
+#[test]
+fn review3_finding1_git_pathspec_globs_reach_credentials() {
+    let mut repo = Env::home();
+    repo.cwd = format!("{HOME}/repo").into();
+    for line in [
+        "git show HEAD -- '.gem/cred*'",
+        "git show HEAD -- .gem/cred*",
+        "git show HEAD -- '.terraform.d/credentials*'",
+        "git show HEAD -- '.config/op/*'",
+        "git show HEAD -- '.yarnrc.*'",
+        "git log -p -- '.gem/*'",
+        "git diff HEAD~1 -- '*/.gem/credentials'",
+        "git show HEAD -- ':(glob).gem/cred*'",
+        "git show HEAD -- '.ya?nrc.yml'",
+        "git show HEAD -- '.gem/[c]redentials'",
+        "git show HEAD -- '*'",
+        "git show HEAD -- 'sub/*'",
+    ] {
+        assert_eq!(classify(&repo.cmd(line)), "Ask", "{line}");
+    }
+    // ordinary: dev's verdict
+    for line in [
+        "git show HEAD -- '*.rs'",
+        "git show HEAD -- 'src/*.rs'",
+        "git log -- 'docs/*.md'",
+    ] {
+        let now = classify(&repo.cmd(line));
+        assert_ne!(now, "Deny", "{line}");
+    }
+}
+
+/// Review 3, finding 2: any `s` delimiter, attached `w` filenames and the
+/// `w`/`r` commands are read as paths for path scopes.
+#[test]
+fn review3_finding2_sed_delimiters_and_path_scopes() {
+    let home = Env::home();
+    let allow = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["sed"]),
+        RuleDecision::Allow,
+        Some("/h/u/work/**"),
+        "allow-sed-work",
+    )];
+    let deny = vec![scoped_rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["sed"]),
+        RuleDecision::Deny,
+        Some("/h/u/work/**"),
+        "deny-sed-work",
+    )];
+    for line in [
+        "sed 's:a:b:w /h/u/out.txt' /h/u/work/input.txt",
+        "sed 's|a|b|w /h/u/out.txt' /h/u/work/input.txt",
+        "sed 's#a#b#gw /h/u/out.txt' /h/u/work/input.txt",
+        "sed 's,a,b,2pw /h/u/out.txt' /h/u/work/input.txt",
+        "sed 's:a:b:w/h/u/out.txt' /h/u/work/input.txt",
+        "sed -e 's@a@b@w /h/u/out.txt' /h/u/work/input.txt",
+        "sed '1w /h/u/out.txt' /h/u/work/input.txt",
+        "sed '/x/w /h/u/out.txt' /h/u/work/input.txt",
+        "sed '\\%x%w /h/u/out.txt' /h/u/work/input.txt",
+        "sed '$r /h/u/secret.txt' /h/u/work/input.txt",
+        "sed 's:a:b:' -e 's:c:d:w /h/u/out.txt' /h/u/work/input.txt",
+    ] {
+        assert_eq!(classify(&home.cmd_rules(line, &allow)), "Ask", "{line}");
+    }
+    for line in [
+        "sed 's:a:b:w /h/u/work/out.txt' /h/u/other/input.txt",
+        "sed 's|a|b|w /h/u/work/out.txt' /h/u/other/input.txt",
+        "sed 's:a:b:w/h/u/work/out.txt' /h/u/other/input.txt",
+    ] {
+        assert!(
+            matches!(home.cmd_rules(line, &deny), PolicyVerdict::Deny { .. }),
+            "{line}"
+        );
+    }
+    // inside the scope: still covered
+    for line in [
+        "sed 's:a:b:w /h/u/work/out.txt' /h/u/work/input.txt",
+        "sed 's:a:b:g' /h/u/work/input.txt",
+        "sed -n '/x/p' /h/u/work/input.txt",
+    ] {
+        assert_eq!(classify(&home.cmd_rules(line, &allow)), "Allow", "{line}");
+    }
+}
+
+/// Review 3, finding 3: Git options and subcommands that run code are never
+/// covered by a prefix rule on `git`, and the rule check refuses them.
+#[test]
+fn review3_finding3_git_execution_payloads() {
+    use atrium_core::policy::command_allow_risk;
+    let mut repo = Env::home();
+    repo.cwd = format!("{HOME}/repo").into();
+    let git = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["git"]),
+        RuleDecision::Allow,
+        "allow-git",
+    )];
+    let runs_code = [
+        "git rebase --exec 'touch victim' HEAD~1",
+        "git rebase --exec='touch victim' HEAD~1",
+        "git rebase -x 'touch victim' HEAD~1",
+        "git rebase -x'touch victim' HEAD~1",
+        "git rebase -i -x 'touch victim' HEAD~1",
+        "git submodule foreach 'touch victim'",
+        "git submodule --quiet foreach 'touch victim'",
+        "git bisect run ./t.sh",
+        "git difftool -x 'touch victim'",
+        "git difftool --extcmd='touch victim'",
+        "git grep -O'touch victim' x",
+        "git grep --open-files-in-pager=vi x",
+        "git filter-branch --tree-filter 'touch victim'",
+        "git fetch --upload-pack='touch victim' origin",
+        "git clone -u 'touch victim' x y",
+        "git push --receive-pack='touch victim' origin",
+        "git archive --remote=x --exec='touch victim' HEAD",
+        "git ls-remote --upload-pack 'touch victim' origin",
+        "git config core.fsmonitor 'touch victim'",
+        "git config --global alias.st '!touch victim'",
+        "git config set core.pager 'touch victim'",
+        "git -c core.fsmonitor='touch victim' status",
+        "git -c alias.x='!touch victim' x",
+        "git --exec-path=/tmp status",
+    ];
+    let argv = |s: &str| match parse_command(s, repo.cwd.as_path()) {
+        atrium_core::policy::ParsedCommand::Segments(segs) => segs[0].argv.clone(),
+        other => panic!("{s}: {other:?}"),
+    };
+    for line in runs_code {
+        assert_eq!(classify(&repo.cmd_rules(line, &git)), "Ask", "{line}");
+        let a = argv(line);
+        assert!(command_allow_risk(&a, false).is_err(), "exact: {line}");
+        assert!(command_allow_risk(&a, true).is_err(), "prefix: {line}");
+    }
+    // ordinary git lines keep their verdict under the rule
+    for line in [
+        "git status",
+        "git rebase HEAD~1",
+        "git cherry-pick -x abc",
+        "git commit -c HEAD",
+        "git grep -n x",
+        "git fetch -u origin",
+        "git config user.name",
+        "git config --get core.editor",
+        "git log --oneline",
+    ] {
+        assert_eq!(classify(&repo.cmd_rules(line, &git)), "Allow", "{line}");
+    }
+}
+
+/// Review 3, finding 4: a relative script path that resolves to standard
+/// input is refused and not covered.
+#[test]
+fn review3_finding4_relative_stdin_paths() {
+    use atrium_core::policy::command_allow_risk;
+    let mut in_dev = Env::home();
+    in_dev.cwd = "/dev".into();
+    let mut in_fd = Env::home();
+    in_fd.cwd = "/dev/fd".into();
+    let mut in_proc = Env::home();
+    in_proc.cwd = "/proc".into();
+    let echo = rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["echo"]),
+        RuleDecision::Allow,
+        "allow-echo",
+    );
+    for (env, script, line) in [
+        (&in_dev, "./stdin", "echo 'print(1)' | python3 ./stdin"),
+        (&in_dev, "stdin", "echo 'print(1)' | python3 stdin"),
+        (&in_dev, "fd/0", "echo 'print(1)' | python3 fd/0"),
+        (&in_fd, "0", "echo 'print(1)' | python3 0"),
+        (&in_fd, "./0", "echo 'print(1)' | python3 ./0"),
+        (&in_proc, "self/fd/0", "echo 'print(1)' | python3 self/fd/0"),
+        (&in_dev, "../dev/stdin", "echo 'print(1)' | python3 ../dev/stdin"),
+        (&in_dev, "x/../stdin", "echo 'print(1)' | python3 x/../stdin"),
+    ] {
+        let rules = vec![
+            echo.clone(),
+            rule(
+                RuleScope::Global,
+                ToolKind::Execute,
+                prefix(&["python3", script]),
+                RuleDecision::Allow,
+                "allow-py",
+            ),
+        ];
+        assert_eq!(classify(&env.cmd_rules(line, &rules)), "Ask", "{line}");
+        let a = vec!["python3".to_string(), script.to_string()];
+        assert!(command_allow_risk(&a, true).is_err(), "{script}");
+        assert!(command_allow_risk(&a, false).is_err(), "{script}");
+    }
+    for ok in ["build.py", "./scripts/build.py", "tools/stdin.py"] {
+        let a = vec!["python3".to_string(), ok.to_string()];
+        assert!(command_allow_risk(&a, true).is_ok(), "{ok}");
+    }
+}
