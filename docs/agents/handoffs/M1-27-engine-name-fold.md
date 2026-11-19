@@ -1,6 +1,6 @@
 # M1-27-engine-name-fold: handoff
 
-**State: ready for verification (D-123).** Branch: `agent/hydrogen/M1-27-engine-name-fold`.
+**State: escalation (Opus, D-130) done; ready for review round 3.** Branch: `agent/hydrogen/M1-27-engine-name-fold`. Finding 8 needs a driver decision (see the Escalation section).
 Under D-123, this round wrote code and tests only (`cargo fmt --all` and `cargo check -p atrium-core --tests` passed; `cargo test` and `cargo clippy` were left for the verification task).
 
 ## Summary of changes
@@ -124,3 +124,29 @@ cargo test --workspace --no-fail-fast
 for i in 1 2 3; do cargo test -p atrium-core; done
 # Plus check M1-27-engine-name-fold fails on dev's src/{shell.rs,deny.rs} and passes on HEAD
 ```
+
+## Escalation (Opus, D-130)
+
+**K7 rule.** The shell's positional state is no longer modelled. The ~1,260-line modeller (`scan_pos_script`, `apply_set_builtin`, `resolve_positional_script_depth`, …) is gone; `shell.rs` `resolve_positional_script` (next to `shell_c_codes`) resolves only this shape: a POSIX shell (`sh bash dash ash ksh mksh posh yash`) `-c` script that is **one simple command** of safe literals, single-quoted text, double-quoted text and `$N`/`${N}`/`$@`/`$*`/`"$@"`/`"$*"`, with no operator, newline, redirection, here-document, other expansion, glob, brace, tilde, comment, backslash, assignment, or compound/state word (`set shift eval read source getopts for while if { …`). Every referenced value must be on the line, with no `$`/`` ` `` and no `{}` in command position. `$@`/`$*` need operands and are refused under `xargs`/`parallel`/`find`. Sizes are checked before anything is built: script ≤ 1 KiB, ≤ 64 operands, ≤ 64 words, reading ≤ 16 KiB.
+- Quoted expansions → `Resolved` (exact; replaces the script as the payload).
+- Unquoted expansions (IFS may come from the environment) and `"$*"` with several operands → `Unresolved(Some(default-IFS reading))`. The script and the reading are both checked, and the line is marked `UnboundedUnknown`. Result: Ask everywhere, or the hard deny the default reading reaches. Default IFS is space/tab/newline only.
+- Anything else that may use positional parameters (any `$` naming one, `${…}` with a non-name, `$argv`/`$BASH_ARGV`, and, with operands, `eval`/`source`/`.`/`getopts`/`for x;`) → `Unresolved(None)`. The script is kept as written (as on `dev`, so here-document bodies are still read), plus the Ask-everywhere marker.
+
+Findings (round 2), each with its pinning test in `tests/M1-27-engine-name-fold.rs`:
+1. Here-document body dropped: fixed. Non-shape scripts are kept verbatim. `k7_here_document_body_is_still_checked`.
+2. `set $1`, `command shift`: fixed. Not the shape, so it fails closed. `k7_unresolvable_positional_sh_c_fails_closed`.
+3. `shift &`, function bodies: fixed, same way. `k7_unresolvable_positional_sh_c_fails_closed`.
+4. `set --` with brace/glob words: fixed, same way. `k7_unresolvable_positional_sh_c_fails_closed`.
+5. `set --; "$0"` inventing an empty `$0`: fixed. Fails closed, and a missing `$0` is never invented. `k7_unresolvable_positional_sh_c_fails_closed`.
+6. `\r` false hard deny: fixed. The default IFS is space/tab/newline. `k7_unquoted_expansion_asks_or_hard_denies_on_default_reading`.
+7. Over-1 GiB allocation: fixed. The budget is checked before building. `k7_reading_size_is_bounded_before_allocation` (hangs over 60 s on the old code; quick now).
+8. K9 unreadable `env` (`env -Z01 … -Z26 echo hi` → Ask/Ask/Allow/Allow): **not changed; needs a driver decision.** It is the same class of line as `adversarial_m1_18::fix2_k1_multiple_unknown_options_and_clusters` row "K1 fix2 unbounded safe" (`env -A0 v0 … -A13 v13 make`), which pins `DEV_ASK` (Ask/Ask/Allow/Allow), and the over-bound `-S 'sudo id'` rows there pin Ask rather than HardDeny. An unconditional Ask marker breaks the first; raising the bound to read the line breaks the second. The over-bound check is not blind: every word goes through `unknown_tok_dangerous`, which flags shells, wrappers, `eval`, privilege tools, downloaders and outside or sensitive paths. Pinned as it stands by `k9_genuinely_unbounded_env_still_fails_closed`. To close it, the driver must pick which pin wins.
+9. Caller range: **kept and justified.** `code_texts_bounded` (`shell.rs` ~1998–2012) is the only caller of `payloads_of`, and the only place that holds `unbounded_words`. The hunk adds about 10 lines: the `unresolvable` flag becomes an `UnboundedUnknown` entry, and `may_append_operands(argv)` is passed in. No sibling task owns this function, and the word reader is untouched. Please record it in the brief's owned paths, as D-120 did for `deny.rs`. Pinned by every `Unresolved` case in `k7_unresolvable_positional_sh_c_fails_closed`.
+
+Round-1 K7 items (2, 3, 4) are re-pinned in the same tests. The old K7 tests that pinned the modeller's exact resolution of `shift`/`set`/`""$@` cases now expect fail-closed results; the old `$0 'echo hi'`-equals-`echo hi` expectation is now Ask everywhere (unquoted, so not exact).
+
+### Checks run (escalation)
+- `cargo clippy -p atrium-core --all-targets -- -D warnings`: clean.
+- `cargo test -p atrium-core --no-fail-fast`: everything passes except `adversarial_regression::round_5_blocker_1_searches_and_walkers_reaching_a_folder_linked_into_ssh` (known `dev` failure on Linux, N9). The task file passes 14/14; `adversarial_m1_18` passes 37/37; `policy` passes 44/44; `adversarial_fuzz` passes 2/2 (54 s, machine shared with other worktrees' test runs).
+- `adversarial_m1_18 fix3_finding3_glob_variant_cap_performance` alone: ok (0.01 s).
+- The new tests on the previous HEAD's `shell.rs` (`2c7760c`): `k7_here_document_body_is_still_checked`, `k7_unresolvable_positional_sh_c_fails_closed` and `k7_unquoted_expansion_asks_or_hard_denies_on_default_reading` fail; `k7_reading_size_is_bounded_before_allocation` ran for over 60 s and was killed; `k7_exact_shape_resolves_to_payload_verdicts` passes (a regression pin).
