@@ -131,9 +131,28 @@ function normalizePosixPath(raw: string): string {
 
 function isStdinPath(raw: string): boolean {
   if (raw === "-") return true;
-  if (!raw.startsWith("/")) return false;
-  const norm = normalizePosixPath(raw);
-  return STDIN.has(norm) || norm === "/proc/thread-self/fd/0";
+  if (raw.startsWith("/")) {
+    const norm = normalizePosixPath(raw);
+    return STDIN.has(norm) || norm === "/proc/thread-self/fd/0" || /^\/proc\/[^/]+\/fd\/0$/.test(norm);
+  }
+  // Relative (`rule_check.rs` `is_stdin_script_path`): the cwd is unknown, so any
+  // spelling that resolves to standard input from some folder counts.
+  const parts: string[] = [];
+  for (const seg of raw.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg.toLowerCase().replaceAll("ſ", "s"));
+  }
+  if (parts.length === 0) return false;
+  const tail = `/${parts.join("/")}`;
+  if ([...STDIN, "/proc/thread-self/fd/0"].some((s) => s.startsWith("/") && s.endsWith(tail))) return true;
+  const want = ["proc", "", "fd", "0"];
+  return parts.length <= 4 && parts.every((p, k) => { const w = want[want.length - parts.length + k]!; return w === "" || p === w; });
+}
+
+/** `-` or an absolute standard-input path: refused anywhere in an interpreter's arguments. */
+function isStdinName(raw: string): boolean {
+  return raw === "-" || (raw.startsWith("/") && isStdinPath(raw));
 }
 
 function isPs1Script(w: string): boolean {
@@ -324,8 +343,12 @@ function gitConfigIsExec(kv: string): boolean {
     || key.startsWith("gpg.")
     || key.startsWith("remote.")
     || key.startsWith("protocol.")
+    || key.startsWith("include.")
+    || key.startsWith("includeif.")
+    || key.startsWith("hook.")
     || [
       "core.fsmonitor",
+      "core.hookspath",
       "core.sshcommand",
       "core.askpass",
       "core.editor",
@@ -388,12 +411,106 @@ function gitCliExecConfig(args: readonly string[]): { hasAny: boolean; hasDanger
       || w.startsWith("--upload-pack=")
       || w.startsWith("--receive-pack=")
       || w.startsWith("--exec=")
+      || gitLongAbbrev(w, ["upload-pack", "receive-pack", "exec", "ext-diff"], 3)
     ) {
       hasAny = true;
       hasDangerous = true;
     }
   }
+  if (gitSubcommandRunsCode(args)) {
+    hasAny = true;
+    hasDangerous = true;
+  }
   return { hasAny, hasDangerous };
+}
+
+/** `--NAME[=…]` with NAME an abbreviation (at least `min` letters) of one of `full` (`rule_check.rs` `git_long_abbrev`). */
+function gitLongAbbrev(w: string, full: readonly string[], min: number): boolean {
+  if (!w.startsWith("--")) return false;
+  const body = w.slice(2);
+  const eq = body.indexOf("=");
+  const name = eq >= 0 ? body.slice(0, eq) : body;
+  return name.length >= min && full.some((f) => f.startsWith(name));
+}
+
+const GIT_GLOBAL_VALUE_OPTS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--list-cmds", "--config-env", "--exec-path", "--attr-source"]);
+
+/** The index of Git's subcommand after the global options (`rule_check.rs` `git_subcommand`). */
+function gitSubcommand(args: readonly string[]): number | null {
+  let i = 0;
+  while (i < args.length) {
+    const w = args[i]!;
+    if (w === "--") return null;
+    if (GIT_GLOBAL_VALUE_OPTS.has(w)) { i += 2; continue; }
+    if (w.startsWith("-")) { i += 1; continue; }
+    return i;
+  }
+  return null;
+}
+
+/** Git's own subcommands (`rule_check.rs` `GIT_BUILTINS`): anything else is an alias or a `git-NAME` program. */
+const GIT_BUILTINS = new Set([
+  "add", "am", "annotate", "apply", "archive", "backfill", "bisect", "blame", "branch", "bugreport", "bundle", "cat-file", "check-attr", "check-ignore", "check-mailmap",
+  "check-ref-format", "checkout", "checkout-index", "cherry", "cherry-pick", "clean", "clone", "column", "commit", "commit-graph", "commit-tree", "config", "count-objects", "describe",
+  "diagnose", "diff", "diff-files", "diff-index", "diff-tree", "fast-export", "fast-import", "fetch", "fetch-pack", "fmt-merge-msg", "for-each-ref", "format-patch", "fsck", "gc",
+  "get-tar-commit-id", "grep", "hash-object", "help", "index-pack", "init", "init-db", "interpret-trailers", "log", "ls-files", "ls-remote", "ls-tree", "mailinfo", "mailsplit",
+  "maintenance", "merge", "merge-base", "merge-file", "merge-index", "merge-tree", "mktag", "mktree", "multi-pack-index", "mv", "name-rev", "notes", "pack-objects", "pack-refs",
+  "prune", "prune-packed", "pull", "push", "range-diff", "read-tree", "rebase", "reflog", "refs", "remote", "repack", "replace", "replay", "request-pull", "rerere", "reset", "restore",
+  "rev-list", "rev-parse", "revert", "rm", "send-pack", "shortlog", "show", "show-branch", "show-index", "show-ref", "sparse-checkout", "stage", "stash", "status", "stripspace",
+  "submodule", "switch", "symbolic-ref", "tag", "unpack-file", "unpack-objects", "update-index", "update-ref", "update-server-info", "var", "verify-commit", "verify-pack",
+  "verify-tag", "version", "whatchanged", "worktree", "write-tree",
+]);
+
+/** Subcommands that run a program the line or config names (`rule_check.rs` `GIT_RUNS_CODE`). */
+const GIT_RUNS_CODE = new Set(["filter-branch", "for-each-repo", "instaweb", "send-email", "mergetool", "difftool", "credential", "credential-cache", "credential-store", "shell", "hook", "gui", "citool", "web--browse", "daemon"]);
+
+/** Whether Git's subcommand runs code the line passes it (`rule_check.rs` `git_subcommand_runs_code`). */
+function gitSubcommandRunsCode(args: readonly string[]): boolean {
+  const s = gitSubcommand(args);
+  if (s === null) return false;
+  const sub = args[s]!;
+  if (GIT_RUNS_CODE.has(sub)) return true;
+  const rest: string[] = [];
+  for (const w of args.slice(s + 1)) {
+    if (w === "--") break;
+    rest.push(w);
+  }
+  const shortHas = (w: string, ch: string) => w.length > 1 && w.startsWith("-") && !w.startsWith("--") && w.slice(1).includes(ch);
+  switch (sub) {
+    case "rebase": return rest.some((w) => shortHas(w, "x") || gitLongAbbrev(w, ["exec"], 2));
+    case "submodule": return rest.includes("foreach");
+    case "bisect": return rest.includes("run");
+    case "grep": return rest.some((w) => shortHas(w, "O") || gitLongAbbrev(w, ["open-files-in-pager"], 4));
+    case "clone":
+    case "ls-remote": return rest.some((w) => shortHas(w, "u"));
+    case "config": return gitConfigWritesExec(rest);
+    default: return false;
+  }
+}
+
+/** Whether `git config` writes (or opens an editor on) a key that runs code (`rule_check.rs` `git_config_writes_exec`). */
+function gitConfigWritesExec(rest: readonly string[]): boolean {
+  const VALUE_OPTS = new Set(["-f", "--file", "--blob", "--type", "--default", "--comment", "--value", "--url"]);
+  const positional: string[] = [];
+  let i = 0;
+  while (i < rest.length) {
+    const w = rest[i]!;
+    if (w === "-e" || w === "--edit" || w === "edit") return true;
+    if (VALUE_OPTS.has(w)) { i += 2; continue; }
+    if (w.startsWith("-")) {
+      if (w.startsWith("--get") || ["-l", "--list", "--unset", "--unset-all"].includes(w) || w.startsWith("--remove-section") || w.startsWith("--rename-section")) return false;
+      i += 1;
+      continue;
+    }
+    positional.push(w);
+    i += 1;
+  }
+  const verb = positional[0];
+  if (verb !== undefined) {
+    if (["get", "list", "unset", "remove-section", "rename-section"].includes(verb)) return false;
+    if (verb === "set") positional.shift();
+  }
+  return positional.length >= 2 && gitConfigIsExec(positional[0]!);
 }
 
 /**
@@ -451,7 +568,7 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
       }
     }
     // Fail closed, as on dev: a stdin name anywhere (`python3 x.py -`) may be read as code.
-    const stdinArg = args.find((w) => isStdinPath(w));
+    const stdinArg = args.find((w) => isStdinName(w));
     if (stdinArg !== undefined) return { refuse: `A rule can't allow ${name} ${stdinArg}: it runs code read from its input, and Atrium wouldn't check it.` };
     const refuseNoScript = (): CommandRisk => ({ refuse: `A rule can't allow ${argv.slice(0, 1).join(" ")} without the script it runs: without one, ${name} reads code from its input. ${NAME_A_SCRIPT}` });
     const isPython = key === "python";

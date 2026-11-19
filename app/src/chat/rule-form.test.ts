@@ -349,3 +349,34 @@ describe("rules editor: rework round 5 parity with rule_check.rs", () => {
     expect(refused("git commit -c HEAD", "command_exact")).toBe(false);
   });
 });
+
+describe("rules editor: review 3 parity with rule_check.rs (D-129)", () => {
+  const refused = (command: string, matcher: "command_prefix" | "command_exact" = "command_prefix") => {
+    const v = validateRule(form({ matcher, command }), ctx);
+    return !v.ok && v.errors.command !== undefined;
+  };
+  it("refuses git options and subcommands that run code, prefix and exact (finding 3)", () => {
+    for (const c of [
+      "git rebase --exec 'touch victim' HEAD~1", "git rebase -x 'touch victim' HEAD~1", "git rebase --exe=x HEAD~1",
+      "git submodule foreach 'touch victim'", "git bisect run ./t.sh", "git difftool -x vi", "git grep -Ovi x",
+      "git clone -u 'touch victim' x", "git push --exec x origin", "git fetch --upload-p=x origin",
+      "git config core.fsmonitor 'touch victim'", "git config --global alias.st '!touch victim'", "git config set core.pager x",
+      "git -c core.hooksPath=/tmp/h commit", "git filter-branch --tree-filter x",
+    ]) {
+      expect(refused(c, "command_prefix"), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+    for (const c of ["git rebase HEAD~1", "git cherry-pick -x abc", "git config user.name", "git config --get core.editor", "git fetch -u origin", "git grep -n x"]) {
+      expect(refused(c, "command_exact"), c).toBe(false);
+    }
+  });
+  it("refuses relative script paths that can resolve to standard input (finding 4)", () => {
+    for (const c of ["python3 ./stdin", "python3 stdin", "python3 fd/0", "python3 ../dev/stdin", "python3 x/../stdin", "node self/fd/0", "python3 /proc/123/fd/0"]) {
+      expect(refused(c, "command_prefix"), c).toBe(true);
+      expect(refused(c, "command_exact"), c).toBe(true);
+    }
+    for (const c of ["python3 build.py", "python3 tools/stdin.py", "python3 x.py 0", "python3 x.py stdin"]) {
+      expect(refused(c, "command_prefix"), c).toBe(false);
+    }
+  });
+});
