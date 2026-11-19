@@ -334,3 +334,45 @@ Code: commit `961bb7a` (`deny.rs` only).
 - `cargo fmt --all --check`: clean.
 - `cargo clippy -p atrium-core --all-targets -- -D warnings`: clean.
 - `cargo test -p atrium-core`: all pass.
+
+---
+
+## Escalation round 4 (review 1)
+
+Code: commit `3856a57`. Tests: `review1_f1` … `review1_f10` in `crates/atrium-core/tests/M1-31-credential-folder-search.rs`, one per finding, each the reviewer's case. Every one fails on `dfeff03` (f6 panics with `attempt to add with overflow`, f8 hangs for more than 60 s) and passes now.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | The `Sensitive` cache was keyed by `Path` equality (`/h//u` == `/h/u`) but built from `lower()` strings | The key is now exactly what the constructor consumes: the lowered home, data and protected strings, compared by value with the cached `Sensitive`'s own fields (`Sensitive::shared` / `lowered` / `from_lowered`). Every field of `Sensitive` derives from those three values only, so a hit is exact. `Sensitive::new` is removed. |
+| 2 | Globbed recursive roots (`rg x ~/.aw[s]`) were taken literally | `dir_contains_hard_deny` sends a root with `*`, `?` or `[` to a new `Ctx::glob_root_hit`. It matches the root, with `ShellGlob`'s shell rules (separators, leading dot), against every folder below home that holds a hard-denied path, and their ancestors: the parents of `CRED_FILES`, `CRED_TREES`, `.ssh` and its probes, the browser roots' `default/cookies`, and Atrium's data folders. It then applies the literal check to each match. The compile is charged to the check's budget. |
+| 3 | The `.config` exception | **Not changed: needs a driver decision.** `crates/atrium-core/tests/policy.rs` asserts `("rg token ~/.config", Ask)` (line 388) and Paths `~/.config` recursive → Ask (`whole_home_recursive_search_asks`, line 938). The brief forbids editing existing test files except un-ignoring. Removing the exception fails those two `dev` tests. The driver should choose: either keep the exception (and record it in `decisions.md`), or authorize changing those two `policy.rs` expectations. Once decided, it's a one-line change in `dir_contains_literal`. |
+| 4 | Every path below a browser root counted as a folder holding credentials | The reverse containment applies only when the remainder below the root is spelled as a profile folder (`browser_profile_dir`): Chromium `Default`, `Profile N`, `Guest Profile`, `System Profile`; Firefox `firefox`, `profiles`, `*.default*`. Other paths (`Default/Preferences`) keep `dev`'s verdict, and `Sensitive::hit` still checks their own names. The policy is lexical and can't know whether a deeper path is a folder, so a deep folder such as `Default/Network` also keeps `dev`'s verdict. That residual is the cost of not adding new hard denies on ordinary files. |
+| 5 | `grep -d skip` / `--directories=skip` didn't clear `-r` | `grep_directories_action`: `recurse` → recursive, `read`/`skip` (by unambiguous prefix) → not. The last option given wins, in argument order. |
+| 6 | `brace_sequence_len` overflowed on `{i64::MAX..i64::MIN}` | Saturating `+ 1`. The verdict equals any too-long sequence (`{1..65}`): bash leaves the braces as written, so this is not an oversized expansion. **The reviewer expected Ask; I kept `dev`'s verdict (Allow) because nothing is expanded.** |
+| 7 | Nested braces were quadratic | `brace_estimate` and `words::brace_expand` track "holds another pair" per stack entry and never re-read a nested interior: such a pair can't be a sequence (`brace_sequence` refuses `{`). `brace_expand` now cuts comma words only for the pair it finally chooses. `{`×30000 `x` `}`×30000: linear, under the test's 750 ms per 3 presets. |
+| 8 | Repeated `git -C` bases multiplied without a cap | Bases are deduplicated, and the product is checked against `MAX_SEARCH_BASES` (64) before it is built. Past the cap, `Analysis::glob_work_exhausted` is set and the engine asks in every preset. |
+| 9 | Command glob matchers bypassed `GlobBudget` | `Ctx` has its own `GlobBudget`. `fast_glob_hit` charges `shell_glob_steps` plus the probe matching before `Sensitive::glob_hit`, and `glob_root_hit` charges too. When the budget is spent, `glob_work_exhausted` is set, the engine's `unknown` includes it, and the line asks everywhere. |
+| 10 | The brace lower bound assumed independent groups even with `$` | The shortcut is skipped for any word containing `$`; the scan budget still bounds those. |
+
+### Hunks in `words.rs` (merge check with M1-28)
+- `brace_expand` only (~336–420): the `BraceWords` type alias above it, the `$` guard on the shortcut, and the `(open, commas, nested)` stack with deferred comma cutting.
+- `brace_results_lower_bound` is unchanged from round 2.
+- `shell.rs`: no change this round.
+- The ANSI-C decoder and `cd_effect` are untouched.
+
+### Other files
+- `engine.rs`: `unknown` also checks `a.glob_work_exhausted`.
+- `deny.rs`: `Analysis` gains `glob_work_exhausted`, and `Ctx` gains `budget`.
+
+### Times (debug, Linux; load ~7 during these runs; the earlier rounds' runs were taken at load ~20)
+| Test | `dfeff03` (now) | `3856a57` |
+|---|---|---|
+| `adversarial_fuzz` binary | 11.4 s | 6.6 s |
+| `engine_never_panics_on_garbage` | — | 3.3 s |
+| `fix2` / `fix3` / `fix4` | ≤ 0.01 s | ≤ 0.01 s |
+| K10 tests | — | 0.05 s |
+
+### Checks
+- `cargo fmt --all --check`: clean.
+- `cargo clippy -p atrium-core --all-targets -- -D warnings`: clean.
+- `cargo test -p atrium-core`: all 16 binaries pass.
