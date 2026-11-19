@@ -144,6 +144,15 @@ impl Outbox {
     }
 }
 
+/// Result of trying to queue `ReplayDone` and go live atomically.
+pub(crate) enum GoLive {
+    Live,
+    /// The subscription is already over (closed, replaced, unsubscribed).
+    Gone,
+    /// The event lane is full; wait for room without holding `Inner::publish`.
+    Full(Frame),
+}
+
 /// What happened to an event pushed for a subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pushed {
@@ -366,6 +375,30 @@ impl Conn {
         }
     }
 
+    /// Queues `ReplayDone` and marks `sub` live under the outbox lock, so a
+    /// client that sees `ReplayDone` is already live.
+    pub(crate) fn go_live_with_done(&self, sub: SubId, done: Frame) -> GoLive {
+        let mut outbox = self.lock();
+        if outbox.closed || !outbox.subs.get(&sub).is_some_and(|state| !state.live) {
+            return GoLive::Gone;
+        }
+        if !outbox.has_room(done.len(), self.max_event_bytes) {
+            return GoLive::Full(done);
+        }
+        outbox.event_bytes += done.len();
+        outbox.events.push_back(EventFrame {
+            sub,
+            id: None,
+            frame: done,
+        });
+        if let Some(state) = outbox.subs.get_mut(&sub) {
+            state.live = true;
+        }
+        drop(outbox);
+        self.wake.notify_one();
+        GoLive::Live
+    }
+
     /// Queues a live event for `sub`.
     pub(crate) fn push_live(&self, sub: SubId, id: EventId, frame: &Frame) -> Pushed {
         let mut outbox = self.lock();
@@ -493,35 +526,70 @@ enum Take {
 /// stalls. The connection is closed when this returns.
 pub(crate) async fn write_loop(conn: &Conn, mut writer: OwnedWriteHalf) {
     let mut closed = conn.closed.subscribe();
+    let mut since_yield = 0usize;
     loop {
+        if *closed.borrow_and_update() {
+            break;
+        }
         let (frame, origin) = match conn.take() {
             Take::Frame(frame, origin) => (frame, origin),
             Take::Closed => break,
             Take::Empty => {
+                since_yield = 0;
                 // `notify_one` keeps a wake-up sent before this point.
                 conn.wake.notified().await;
                 continue;
             }
         };
-        let writing = async {
-            let mut written = 0;
-            while written < frame.len() {
-                writer.writable().await?;
-                match conn.write_some(&writer, &frame[written..], written == 0, origin)? {
-                    Some(more) => written += more,
+        let mut written = 0;
+        let mut io_err = false;
+        // Fast path: write immediately ready frames without allocating a
+        // `WRITE_STALL` timeout or awaiting `writable()` on every small event.
+        while written < frame.len() {
+            match conn.write_some(&writer, &frame[written..], written == 0, origin) {
+                Ok(Some(0)) => break,
+                Ok(Some(more)) => written += more,
+                Ok(None) => {
                     // Its subscription ended first: not sent.
-                    None => break,
+                    written = frame.len();
+                    break;
+                }
+                Err(_) => {
+                    io_err = true;
+                    break;
                 }
             }
-            std::io::Result::Ok(())
-        };
-        tokio::select! {
-            biased;
-            _ = closed.wait_for(|is_closed| *is_closed) => break,
-            res = tokio::time::timeout(WRITE_STALL, writing) => match res {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => break,
-            },
+        }
+        if io_err {
+            break;
+        }
+        if written < frame.len() {
+            let writing = async {
+                while written < frame.len() {
+                    writer.writable().await?;
+                    match conn.write_some(&writer, &frame[written..], written == 0, origin)? {
+                        Some(more) => written += more,
+                        // Its subscription ended first: not sent.
+                        None => break,
+                    }
+                }
+                std::io::Result::Ok(())
+            };
+            tokio::select! {
+                biased;
+                _ = closed.wait_for(|is_closed| *is_closed) => break,
+                res = tokio::time::timeout(WRITE_STALL, writing) => match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => break,
+                },
+            }
+            since_yield = 0;
+        } else {
+            since_yield += 1;
+            if since_yield >= 64 {
+                since_yield = 0;
+                tokio::task::yield_now().await;
+            }
         }
     }
     conn.close();
@@ -932,10 +1000,7 @@ mod tests {
         theirs.read_exact(&mut drain).await.expect("drains filler");
 
         let mut messages = Vec::new();
-        loop {
-            let Ok(len) = theirs.read_u32().await else {
-                break;
-            };
+        while let Ok(len) = theirs.read_u32().await {
             let kind = theirs.read_u8().await.expect("kind");
             assert_eq!(kind, 0);
             let mut payload = vec![0u8; len as usize - 1];
@@ -1002,5 +1067,39 @@ mod tests {
         theirs.read_exact(&mut drain).await.expect("drains filler");
         let mut tail = [0u8; 16];
         assert_eq!(theirs.read(&mut tail).await.expect("eof"), 0);
+    }
+
+    #[tokio::test]
+    async fn go_live_with_done_queues_done_and_marks_live_atomically() {
+        let conn = Conn::with_limit(1, ClientRole::Dev, 100);
+        let sub = conn.subscribe(&t("a")).expect("a subscription");
+        assert!(conn.feed(sub, Some(EventId(1)), frame(80)).await);
+
+        let done = codec::encode(&ServerMessage::ReplayDone {
+            thread_id: t("a"),
+            last: Some(EventId(1)),
+        })
+        .expect("encodes");
+        assert!(matches!(
+            conn.go_live_with_done(sub, done.clone()),
+            GoLive::Full(_)
+        ));
+        assert_eq!(conn.push_live(sub, EventId(2), &frame(10)), Pushed::Gone);
+
+        assert_eq!(conn.take_for_test().expect("replayed event").len(), 80);
+        assert!(matches!(
+            conn.go_live_with_done(sub, done.clone()),
+            GoLive::Live
+        ));
+        assert!(matches!(conn.go_live_with_done(sub, done), GoLive::Gone));
+        assert_eq!(conn.push_live(sub, EventId(2), &frame(10)), Pushed::Queued);
+        assert!(matches!(
+            message(&conn.take_for_test().expect("ReplayDone")),
+            ServerMessage::ReplayDone {
+                last: Some(EventId(1)),
+                ..
+            }
+        ));
+        assert_eq!(conn.take_for_test().expect("live event").len(), 10);
     }
 }
