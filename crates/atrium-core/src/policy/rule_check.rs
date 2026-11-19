@@ -195,11 +195,50 @@ fn is_stdin_script_path(raw: &str) -> bool {
     if raw == "-" {
         return true;
     }
-    if !raw.starts_with('/') {
+    if raw.starts_with('/') {
+        let norm = normalize_posix_path(raw);
+        return STDIN.contains(&norm.as_str()) || is_proc_pid_fd0(&norm);
+    }
+    // Relative: the command's cwd is unknown here, so any spelling that
+    // resolves to standard input from some folder counts (`./stdin` in
+    // `/dev`, `0` in `/dev/fd`, `../dev/stdin`). Folding `a/..` and dropping
+    // leading `..` leaves the tail every resolution ends with.
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in raw.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    if parts.is_empty() {
         return false;
     }
-    let norm = normalize_posix_path(raw);
-    STDIN.contains(&norm.as_str())
+    let tail = format!("/{}", parts.join("/").to_lowercase().replace('ſ', "s"));
+    STDIN
+        .iter()
+        .filter(|s| s.starts_with('/'))
+        .any(|s| s.ends_with(tail.as_str()))
+        || {
+            // a tail of `/proc/<pid>/fd/0`
+            let want = ["proc", "", "fd", "0"];
+            let lower: Vec<String> = parts.iter().map(|p| p.to_lowercase()).collect();
+            lower.len() <= 4
+                && lower
+                    .iter()
+                    .rev()
+                    .zip(want.iter().rev())
+                    .all(|(p, w)| w.is_empty() || p == w)
+        }
+}
+
+/// `/proc/<pid>/fd/0`: the process's own stdin when the pid is its own.
+fn is_proc_pid_fd0(norm: &str) -> bool {
+    norm.strip_prefix("/proc/")
+        .and_then(|r| r.strip_suffix("/fd/0"))
+        .is_some_and(|pid| !pid.is_empty() && !pid.contains('/'))
 }
 
 fn is_ps1_script(w: &str) -> bool {
@@ -537,7 +576,12 @@ fn check_interpreter_risk(
 
     // Fail closed, as the editor does: a stdin name anywhere (`python3 x.py -`)
     // may be read as code.
-    if let Some(w) = args.iter().find(|w| is_stdin_script_path(w)) {
+    // (Relative spellings count only as the script itself: `x.py 0` is an
+    // ordinary argument.)
+    if let Some(w) = args
+        .iter()
+        .find(|w| *w == "-" || (w.starts_with('/') && is_stdin_script_path(w)))
+    {
         return Err(format!(
             "an allow rule can't allow `{name} {w}`: it reads code from standard input"
         ));

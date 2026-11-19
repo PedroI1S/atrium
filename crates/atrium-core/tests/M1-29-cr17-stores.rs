@@ -1855,8 +1855,8 @@ fn review3_finding4_relative_stdin_paths() {
         assert!(command_allow_risk(&a, true).is_err(), "{script}");
         assert!(command_allow_risk(&a, false).is_err(), "{script}");
     }
-    for ok in ["build.py", "./scripts/build.py", "tools/stdin.py"] {
-        let a = vec!["python3".to_string(), ok.to_string()];
+    for ok in ["build.py", "./scripts/build.py", "tools/stdin.py", "x.py 0", "x.py stdin"] {
+        let a: Vec<String> = std::iter::once("python3").chain(ok.split(' ')).map(String::from).collect();
         assert!(command_allow_risk(&a, true).is_ok(), "{ok}");
     }
 }
