@@ -220,9 +220,7 @@ fn sed_script_files(script: &str) -> Option<Vec<String>> {
             i += 1;
             ws(&mut i);
         }
-        let Some(&cmd) = c.get(i) else {
-            return None;
-        };
+        let &cmd = c.get(i)?;
         i += 1;
         match cmd {
             '{' | '}' | '=' | 'd' | 'D' | 'g' | 'G' | 'h' | 'H' | 'n' | 'N' | 'p' | 'P' | 'x'
