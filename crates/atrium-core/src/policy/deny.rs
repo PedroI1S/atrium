@@ -473,7 +473,9 @@ pub struct Sensitive {
     protected: Vec<String>,
     raw_forms: Vec<(String, &'static str)>,
     /// The glob matcher's sensitive shapes, built on first use (D-131).
-    specs: std::sync::OnceLock<Specs>,
+    specs: std::sync::OnceLock<std::sync::Arc<Specs>>,
+    /// One shared work budget for all glob checks on this `Sensitive` (D-134).
+    budget: std::sync::atomic::AtomicU64,
 }
 
 impl Sensitive {
@@ -501,6 +503,7 @@ impl Sensitive {
             protected,
             raw_forms,
             specs: std::sync::OnceLock::new(),
+            budget: std::sync::atomic::AtomicU64::new(MATCH_BUDGET),
         }
     }
 
@@ -625,9 +628,30 @@ impl Sensitive {
         v
     }
 
-    /// The sensitive shapes, built once per `Sensitive` on first use.
+    /// The sensitive shapes, built once per `(home, data, protected)` and
+    /// cached per thread.
     fn specs(&self) -> &Specs {
-        self.specs.get_or_init(|| Specs::build(self))
+        self.specs.get_or_init(|| {
+            SPECS_CACHE.with(|c| {
+                let mut cache = c.borrow_mut();
+                if let Some(entry) = cache.iter().find(|e| {
+                    e.home == self.home && e.data == self.data && e.protected == self.protected
+                }) {
+                    return std::sync::Arc::clone(&entry.specs);
+                }
+                let built = std::sync::Arc::new(Specs::build(self));
+                if cache.len() >= 8 {
+                    cache.remove(0);
+                }
+                cache.push(SpecsCacheEntry {
+                    home: self.home.clone(),
+                    data: self.data.clone(),
+                    protected: self.protected.clone(),
+                    specs: std::sync::Arc::clone(&built),
+                });
+                built
+            })
+        })
     }
 
     /// A word with glob characters: does the pattern reach a sensitive path?
@@ -648,23 +672,25 @@ impl Sensitive {
         {
             return Some(h);
         }
-        match self.glob_str_hit(&pl, role) {
+        match self.glob_str_hit_with(&pl, role, false) {
             GlobHit::Hit(h) => Some(h),
             GlobHit::Undecided | GlobHit::Miss => None,
         }
     }
 
     /// The shared glob check (D-131) for a lower-case absolute pattern:
-    /// `dev`'s probes, then the keyed sensitive shapes.
-    fn glob_str_hit(&self, pl: &str, role: Role) -> GlobHit {
+    /// `dev`'s probes, then the keyed sensitive shapes. `search`: `globset`
+    /// search-filter semantics, where `*` and `?` match a leading dot.
+    fn glob_str_hit_with(&self, pl: &str, role: Role, search: bool) -> GlobHit {
         if !pl.starts_with('/') {
             return GlobHit::Miss;
         }
         let specs = self.specs();
-        let mut q = Query::new();
-        let Some(parsed) = PathPat::parse_all(pl, &mut q.budget) else {
+        let mut guard = BudgetGuard::new(&self.budget);
+        let Some(parsed) = PathPat::parse_all(pl, search, &mut guard.budget) else {
             return GlobHit::Undecided;
         };
+        let mut q = Query::new(&mut guard.budget);
         let mut undecided = false;
         for pp in &parsed.pats {
             let floor = specs.floor.iter().map(|(c, id)| (c, *id, false));
@@ -693,7 +719,7 @@ impl Sensitive {
     fn search_filter_hit(&self, variants: &[String]) -> Option<&'static str> {
         variants
             .iter()
-            .find_map(|v| match self.glob_str_hit(v, Role::Read) {
+            .find_map(|v| match self.glob_str_hit_with(v, Role::Read, true) {
                 GlobHit::Hit(h) => Some(h),
                 _ => None,
             })
@@ -708,10 +734,11 @@ impl Sensitive {
             return false;
         }
         let specs = self.specs();
-        let mut q = Query::new();
-        let Some(parsed) = PathPat::parse_all(&pl, &mut q.budget) else {
+        let mut guard = BudgetGuard::new(&self.budget);
+        let Some(parsed) = PathPat::parse_all(&pl, false, &mut guard.budget) else {
             return false;
         };
+        let mut q = Query::new(&mut guard.budget);
         parsed.pats.iter().any(|pp| {
             path_meets(pp, &specs.ssh_dir, Role::Read, parsed.keyed, &mut q) == Reach::Yes
         })
@@ -733,20 +760,21 @@ impl Sensitive {
         if !pl.contains(['*', '?', '[', '{']) {
             return false;
         }
-        self.ask_glob_str_hit(&pl)
+        self.ask_glob_str_hit_with(&pl, false)
     }
 
     /// A glob that can name a store that asks, or that the matcher can't
     /// decide (out of budget: Ask, never a hard deny).
-    fn ask_glob_str_hit(&self, pl: &str) -> bool {
+    fn ask_glob_str_hit_with(&self, pl: &str, search: bool) -> bool {
         if !pl.starts_with('/') {
             return false;
         }
         let specs = self.specs();
-        let mut q = Query::new();
-        let Some(parsed) = PathPat::parse_all(pl, &mut q.budget) else {
+        let mut guard = BudgetGuard::new(&self.budget);
+        let Some(parsed) = PathPat::parse_all(pl, search, &mut guard.budget) else {
             return true;
         };
+        let mut q = Query::new(&mut guard.budget);
         for pp in &parsed.pats {
             for s in &specs.ask {
                 if path_meets(pp, &s.comps, Role::Read, parsed.keyed, &mut q) != Reach::No {
@@ -754,7 +782,26 @@ impl Sensitive {
                 }
             }
         }
-        self.glob_str_hit(pl, Role::Write) == GlobHit::Undecided
+        // If the hard-deny matcher couldn't decide this pattern within budget,
+        // Ask rather than Allow (never Allow on doubt).
+        for pp in &parsed.pats {
+            if path_meets(pp, &specs.ssh_dir, Role::Read, parsed.keyed, &mut q) == Reach::Undecided
+            {
+                return true;
+            }
+            let floor = specs.floor.iter().map(|(c, _)| (c, false));
+            let hard = specs
+                .hard
+                .iter()
+                .filter(|s| !s.write_only)
+                .map(|s| (&s.comps, parsed.keyed));
+            for (comps, keyed) in floor.chain(hard) {
+                if path_meets(pp, comps, Role::Read, keyed, &mut q) == Reach::Undecided {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Representative paths of the credential stores that ask.
@@ -822,7 +869,7 @@ impl Sensitive {
             }
         }
         // The anchored forms of the filter, through the shared matcher (K8).
-        variants.iter().any(|v| self.ask_glob_str_hit(v))
+        variants.iter().any(|v| self.ask_glob_str_hit_with(v, true))
     }
 
     /// Raw-text check: home-anchored credential paths and Atrium's data.
@@ -893,8 +940,20 @@ impl Sensitive {
 const MATCH_BUDGET: u64 = 4_000_000;
 /// Brace expansions read exactly; more and the pattern is widened.
 const MAX_PATH_VARIANTS: usize = 64;
-/// DP tables up to this many cells are dense; larger ones are hashed.
+/// DP tables up to this many cells use a flat bitmap/vec; larger ones are hashed.
 const DENSE_CELLS: usize = 4096;
+
+struct SpecsCacheEntry {
+    home: String,
+    data: Vec<String>,
+    protected: Vec<String>,
+    specs: std::sync::Arc<Specs>,
+}
+
+thread_local! {
+    static SPECS_CACHE: std::cell::RefCell<Vec<SpecsCacheEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 struct Budget(u64);
 
@@ -913,18 +972,45 @@ impl Budget {
     }
 }
 
-/// One query's budget, and the answers for pattern components against
-/// literal names (the same names recur across hundreds of shapes).
-struct Query {
+/// Checks out a `Sensitive`'s shared budget into a local `u64` for tight DP
+/// loops and writes the remaining budget back on drop.
+struct BudgetGuard<'a> {
+    cell: &'a std::sync::atomic::AtomicU64,
     budget: Budget,
-    cache: HashMap<(usize, String), Reach>,
 }
 
-impl Query {
-    fn new() -> Self {
+impl<'a> BudgetGuard<'a> {
+    fn new(cell: &'a std::sync::atomic::AtomicU64) -> Self {
         Self {
-            budget: Budget::new(),
+            cell,
+            budget: Budget(cell.load(std::sync::atomic::Ordering::Relaxed)),
+        }
+    }
+}
+
+impl Drop for BudgetGuard<'_> {
+    fn drop(&mut self) {
+        self.cell
+            .store(self.budget.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One parsed pattern's scratch state and component-match cache, sharing the
+/// check's single budget.
+struct Query<'a, 'b> {
+    budget: &'a mut Budget,
+    cache: HashMap<(usize, &'b str), Reach>,
+    path_stack: Vec<(usize, usize)>,
+    comp_stack: Vec<(usize, usize, bool, bool)>,
+}
+
+impl<'a, 'b> Query<'a, 'b> {
+    fn new(budget: &'a mut Budget) -> Self {
+        Self {
+            budget,
             cache: HashMap::new(),
+            path_stack: Vec::new(),
+            comp_stack: Vec::new(),
         }
     }
 }
@@ -938,15 +1024,19 @@ enum Reach {
     Yes,
 }
 
-/// Visited states of a DP: dense for small tables, hashed for large ones.
+/// Visited states of a DP: stack bitset for small tables, dense vec for
+/// medium ones, hashed for large ones.
 enum Seen {
+    Small([u64; 8]),
     Dense(Vec<bool>),
     Sparse(std::collections::HashSet<usize>),
 }
 
 impl Seen {
     fn new(cells: usize) -> Self {
-        if cells <= DENSE_CELLS {
+        if cells <= 512 {
+            Seen::Small([0; 8])
+        } else if cells <= DENSE_CELLS {
             Seen::Dense(vec![false; cells])
         } else {
             Seen::Sparse(std::collections::HashSet::new())
@@ -955,6 +1045,15 @@ impl Seen {
     /// Marks `id`; `false` when it was already marked.
     fn insert(&mut self, id: usize) -> bool {
         match self {
+            Seen::Small(bits) => {
+                let slot = &mut bits[id >> 6];
+                let mask = 1u64 << (id & 63);
+                if (*slot & mask) != 0 {
+                    return false;
+                }
+                *slot |= mask;
+                true
+            }
             Seen::Dense(v) => !std::mem::replace(&mut v[id], true),
             Seen::Sparse(s) => s.insert(id),
         }
@@ -979,6 +1078,9 @@ impl BSet {
     }
     fn add(&mut self, b: u8) {
         self.0[usize::from(b >> 7)] |= 1u128 << (b & 0x7f);
+    }
+    fn contains(&self, b: u8) -> bool {
+        (self.0[usize::from(b >> 7)] & (1u128 << (b & 0x7f))) != 0
     }
     fn and(self, o: BSet) -> BSet {
         BSet([self.0[0] & o.0[0], self.0[1] & o.0[1]])
@@ -1016,52 +1118,111 @@ enum Atom {
     Tail,
 }
 
-fn posix_class(name: &str, c: u8) -> Option<bool> {
-    Some(match name {
-        "alpha" => c.is_ascii_alphabetic(),
-        "alnum" => c.is_ascii_alphanumeric(),
-        "lower" => c.is_ascii_lowercase(),
-        "upper" => c.is_ascii_uppercase(),
-        "digit" => c.is_ascii_digit(),
-        "xdigit" => c.is_ascii_hexdigit(),
-        "punct" => c.is_ascii_punctuation(),
-        "graph" => c.is_ascii_graphic(),
-        "print" => c.is_ascii_graphic() || c == b' ',
-        "space" => c.is_ascii_whitespace() || c == 0x0b,
-        "blank" => c == b' ' || c == b'\t',
-        "cntrl" => c.is_ascii_control(),
-        "word" => c.is_ascii_alphanumeric() || c == b'_',
+const fn ascii_range(lo: u8, hi: u8) -> u128 {
+    ((1u128 << (hi - lo + 1)) - 1) << lo
+}
+
+fn posix_class_bset(name: &str) -> Option<BSet> {
+    const LOWER: u128 = ascii_range(b'a', b'z');
+    const UPPER: u128 = ascii_range(b'A', b'Z');
+    const ALPHA: u128 = LOWER | UPPER;
+    const DIGIT: u128 = ascii_range(b'0', b'9');
+    const ALNUM: u128 = ALPHA | DIGIT;
+    const XDIGIT: u128 = DIGIT | ascii_range(b'a', b'f') | ascii_range(b'A', b'F');
+    const PUNCT: u128 = ascii_range(0x21, 0x2F)
+        | ascii_range(0x3A, 0x40)
+        | ascii_range(0x5B, 0x60)
+        | ascii_range(0x7B, 0x7E);
+    const GRAPH: u128 = ascii_range(0x21, 0x7E);
+    const PRINT: u128 = ascii_range(0x20, 0x7E);
+    const SPACE: u128 = (1u128 << b' ') | ascii_range(0x09, 0x0D);
+    const BLANK: u128 = (1u128 << b' ') | (1u128 << b'\t');
+    const CNTRL: u128 = ascii_range(0x01, 0x1F) | (1u128 << 0x7F);
+    const WORD: u128 = ALNUM | (1u128 << b'_');
+    let lo = match name {
+        "alpha" => ALPHA,
+        "alnum" => ALNUM,
+        "lower" => LOWER,
+        "upper" => UPPER,
+        "digit" => DIGIT,
+        "xdigit" => XDIGIT,
+        "punct" => PUNCT,
+        "graph" => GRAPH,
+        "print" => PRINT,
+        "space" => SPACE,
+        "blank" => BLANK,
+        "cntrl" => CNTRL,
+        "word" => WORD,
         _ => return None,
-    })
+    };
+    Some(BSet([lo, 0]))
 }
 
 /// A class body (without brackets and negation): its ASCII bytes, and
-/// whether it names a non-ASCII character. `None`: an unknown `[:class:]`.
+/// whether it names a non-ASCII character. `None`: an unknown `[:class:]`
+/// or unsupported POSIX bracket expression (`[=a=]`, `[.ch.]`).
 fn class_body(body: &str) -> Option<(BSet, bool)> {
     let cs: Vec<char> = body.chars().collect();
     let mut set = BSet::EMPTY;
     let mut hi = false;
-    let add = |lo: char, h: char, set: &mut BSet| {
-        for b in 1u8..0x80 {
-            if lo <= char::from(b) && char::from(b) <= h {
-                set.add(b);
+    let add = |lo: char, h: char, set: &mut BSet| -> bool {
+        if lo > h {
+            return false;
+        }
+        if lo == h {
+            if lo.is_ascii() {
+                let b = lo as u8;
+                if b != 0 {
+                    set.add(b);
+                }
+                return false;
             }
+            return true;
+        }
+        let lo_u = lo as u32;
+        let h_u = h as u32;
+        if lo_u < 0x80 {
+            let start = (lo_u as u8).max(1);
+            let end = h_u.min(0x7f) as u8;
+            set.0[0] |= ascii_range(start, end);
         }
         !h.is_ascii()
     };
     let mut k = 0;
     while k < cs.len() {
-        if cs[k] == '[' && cs.get(k + 1) == Some(&':') {
-            let rest: String = cs[k + 2..].iter().collect();
-            if let Some(end) = rest.find(":]") {
-                let name = &rest[..end];
-                for b in 1u8..0x80 {
-                    if posix_class(name, b)? {
-                        set.add(b);
+        if cs[k] == '[' && matches!(cs.get(k + 1), Some(':' | '=' | '.')) {
+            let tag = cs[k + 1];
+            if tag == ':' {
+                let mut m = k + 2;
+                let mut name_buf = [0u8; 16];
+                let mut nlen = 0usize;
+                while m < cs.len()
+                    && (cs[m].is_ascii_alphanumeric() || cs[m] == '_' || cs[m] == '-')
+                {
+                    if nlen < name_buf.len() {
+                        name_buf[nlen] = cs[m] as u8;
                     }
+                    nlen += 1;
+                    m += 1;
                 }
-                k += 2 + name.chars().count() + 2;
-                continue;
+                if m > k + 2 && cs.get(m) == Some(&':') && cs.get(m + 1) == Some(&']') {
+                    if nlen > name_buf.len() {
+                        return None;
+                    }
+                    let name = std::str::from_utf8(&name_buf[..nlen]).ok()?;
+                    set = set.or(posix_class_bset(name)?);
+                    k = m + 2;
+                    continue;
+                }
+            } else {
+                let mut m = k + 2;
+                let limit = (k + 18).min(cs.len());
+                while m < limit && cs[m] != '[' && cs[m] != ']' && cs[m] != tag {
+                    m += 1;
+                }
+                if m > k + 2 && cs.get(m) == Some(&tag) && cs.get(m + 1) == Some(&']') {
+                    return None;
+                }
             }
         }
         let (lo, nk) = if cs[k] == '\\' && k + 1 < cs.len() {
@@ -1085,9 +1246,43 @@ fn class_body(body: &str) -> Option<(BSet, bool)> {
     Some((set.and(BSet::NAME), hi))
 }
 
+/// Advance past a POSIX bracket item (`[:name:]`, `[=x=]`, `[.x.]`) starting
+/// at `b[j] == b'['`, returning the next index and bytes scanned.
+fn posix_item_end(b: &[u8], j: usize) -> Option<(usize, u64)> {
+    let tag = *b.get(j + 1)?;
+    if !matches!(tag, b':' | b'=' | b'.') {
+        return None;
+    }
+    let mut k = j + 2;
+    let mut steps = 0u64;
+    if tag == b':' {
+        while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_' || b[k] == b'-') {
+            k += 1;
+            steps += 1;
+        }
+    } else {
+        let limit = (j + 18).min(b.len());
+        while k < limit && b[k] != b'[' && b[k] != b']' && b[k] != tag {
+            k += 1;
+            steps += 1;
+        }
+    }
+    if k > j + 2 && b.get(k) == Some(&tag) && b.get(k + 1) == Some(&b']') {
+        Some((k + 2, steps))
+    } else {
+        None
+    }
+}
+
 /// The byte index of the `]` closing the class opened at `start`, charging
-/// each scanned byte. `Err` when the budget ran out.
-fn class_end(b: &[u8], start: usize, budget: &mut Budget) -> Result<Option<usize>, ()> {
+/// each scanned byte and memoizing positions that never reach a closing `]`
+/// so unclosed openers stay strictly linear. `Err` when the budget ran out.
+fn class_end(
+    b: &[u8],
+    start: usize,
+    dead: &mut Option<Vec<bool>>,
+    budget: &mut Budget,
+) -> Result<Option<usize>, ()> {
     let mut j = start + 1;
     if matches!(b.get(j), Some(b'!' | b'^')) {
         j += 1;
@@ -1095,16 +1290,27 @@ fn class_end(b: &[u8], start: usize, budget: &mut Budget) -> Result<Option<usize
     if b.get(j) == Some(&b']') {
         j += 1;
     }
-    let from = j;
+    let first_j = j;
+    let mut visited: Vec<usize> = Vec::new();
+    let mut steps = 1u64;
     let found = loop {
         if j >= b.len() {
             break None;
         }
+        if dead.as_ref().is_some_and(|d| d[j]) {
+            break None;
+        }
+        steps += 1;
+        if dead.is_some() {
+            visited.push(j);
+        }
         match b[j] {
-            b'[' if b.get(j + 1) == Some(&b':') => {
-                match b[j + 2..].windows(2).position(|w| w == b":]") {
-                    Some(e) => j += 2 + e + 2,
-                    None => j += 1,
+            b'[' if matches!(b.get(j + 1), Some(b':' | b'=' | b'.')) => {
+                if let Some((next, extra)) = posix_item_end(b, j) {
+                    steps += extra;
+                    j = next;
+                } else {
+                    j += 1;
                 }
             }
             b'\\' => j += 2,
@@ -1112,8 +1318,34 @@ fn class_end(b: &[u8], start: usize, budget: &mut Budget) -> Result<Option<usize
             _ => j += 1,
         }
     };
-    if !budget.take((j.min(b.len()) - from + 1) as u64) {
+    if !budget.take(steps) {
         return Err(());
+    }
+    if found.is_none() {
+        if let Some(d) = dead {
+            for idx in visited {
+                d[idx] = true;
+            }
+        } else {
+            let mut d = vec![false; b.len()];
+            let mut k = first_j;
+            while k < b.len() {
+                d[k] = true;
+                match b[k] {
+                    b'[' if matches!(b.get(k + 1), Some(b':' | b'=' | b'.')) => {
+                        if let Some((next, _)) = posix_item_end(b, k) {
+                            k = next;
+                        } else {
+                            k += 1;
+                        }
+                    }
+                    b'\\' => k += 2,
+                    b']' => break,
+                    _ => k += 1,
+                }
+            }
+            *dead = Some(d);
+        }
     }
     Ok(found)
 }
@@ -1127,12 +1359,15 @@ fn push_char(out: &mut Vec<Atom>, c: char) {
 
 /// A name pattern's atoms. `None` when the budget ran out.
 fn parse_atoms(pat: &str, budget: &mut Budget) -> Option<Vec<Atom>> {
-    if !budget.take(pat.len() as u64 + 1) {
+    // Charge 4 steps per byte so many brace variants of a huge component hit
+    // the budget before allocating excessive memory.
+    if !budget.take(pat.len().saturating_mul(4) as u64 + 1) {
         return None;
     }
     let bytes = pat.as_bytes();
     // With no `]` after it, an opener is a literal: no scan needed.
     let last_close = bytes.iter().rposition(|&b| b == b']');
+    let mut dead: Option<Vec<bool>> = None;
     let mut out = Vec::with_capacity(pat.len());
     let mut it = pat.char_indices().peekable();
     while let Some((i, c)) = it.next() {
@@ -1152,7 +1387,7 @@ fn parse_atoms(pat: &str, budget: &mut Budget) -> Option<Vec<Atom>> {
             },
             '[' => {
                 let end = match last_close {
-                    Some(lc) if lc > i => class_end(bytes, i, budget).ok()?,
+                    Some(lc) if lc > i => class_end(bytes, i, &mut dead, budget).ok()?,
                     _ => None,
                 };
                 let Some(end) = end else {
@@ -1185,29 +1420,56 @@ fn parse_atoms(pat: &str, budget: &mut Budget) -> Option<Vec<Atom>> {
     Some(out)
 }
 
-fn lit_atoms(name: &str) -> Vec<Atom> {
-    name.bytes()
-        .map(|b| Atom::One(BSet::one(b), true))
+fn lit_atoms_bytes(name: &[u8]) -> Vec<Atom> {
+    name.iter()
+        .map(|&b| Atom::One(BSet::one(b), true))
         .collect()
 }
 
 /// Whether two name patterns share a non-empty name. `loose`: `*` and `?`
 /// in `a` may match a leading dot (`dev`'s globset reading of patterns
-/// holding `**`). `stem`: the first `stem` atoms of `b` are a store's own
-/// name, and a match counts only when a non-wildcard atom of `a` takes one
-/// of their bytes (the pattern pins part of the name).
+/// holding `**`, and `Search` filters). `stem`: the first `stem` atoms of `b`
+/// are a store's own name, and a match counts only when a non-wildcard atom of
+/// `a` takes one of their bytes (the pattern pins part of the name).
 fn comp_intersect(
     a: &[Atom],
     b: &[Atom],
     loose: bool,
     stem: Option<usize>,
+    stack: &mut Vec<(usize, usize, bool, bool)>,
     budget: &mut Budget,
 ) -> Reach {
+    if a.is_empty() || b.is_empty() {
+        return Reach::No;
+    }
+    if let (Atom::One(sa, da), Atom::One(sb, db)) = (a[0], b[0]) {
+        let mut meet = sa.and(sb).and(BSet::NAME);
+        if !((da || loose) && db) {
+            meet = meet.minus(BSet::one(b'.'));
+        }
+        if meet.is_empty() {
+            return if budget.take(1) {
+                Reach::No
+            } else {
+                Reach::Undecided
+            };
+        }
+    }
+    if let (Some(Atom::One(sa, _)), Some(Atom::One(sb, _))) = (a.last(), b.last())
+        && sa.and(*sb).and(BSet::NAME).is_empty()
+    {
+        return if budget.take(1) {
+            Reach::No
+        } else {
+            Reach::Undecided
+        };
+    }
     let (la, lb) = (a.len(), b.len());
     let w = lb + 1;
-    let cells = (la + 1) * w * 4;
+    let cells = (la + 1).saturating_mul(w).saturating_mul(4);
     let mut seen = Seen::new(cells);
-    let mut stack = vec![(0usize, 0usize, false, false)];
+    stack.clear();
+    stack.push((0usize, 0usize, false, false));
     while let Some((i, j, started, named)) = stack.pop() {
         let id = ((i * w + j) * 2 + usize::from(started)) * 2 + usize::from(named);
         if !seen.insert(id) {
@@ -1238,7 +1500,7 @@ fn comp_intersect(
             Atom::Tail => (BSet::HI, false, j, true),
             Atom::One(s, d) => (s, d, j + 1, false),
         };
-        if astay && bstay {
+        if astay && bstay && started {
             continue;
         }
         let mut meet = xa.and(yb).and(BSet::NAME);
@@ -1251,6 +1513,49 @@ fn comp_intersect(
         }
     }
     Reach::No
+}
+
+/// Fast path for matching pattern atoms against a literal name without heap
+/// allocation for common lengths.
+fn comp_meets_lit(
+    atoms: &[Atom],
+    name: &[u8],
+    loose: bool,
+    stack: &mut Vec<(usize, usize, bool, bool)>,
+    budget: &mut Budget,
+) -> Reach {
+    if atoms.is_empty() || name.is_empty() {
+        return Reach::No;
+    }
+    if let Atom::One(sa, da) = atoms[0] {
+        let b0 = name[0];
+        if !sa.contains(b0) || (b0 == b'.' && !(da || loose)) {
+            return if budget.take(1) {
+                Reach::No
+            } else {
+                Reach::Undecided
+            };
+        }
+    }
+    if let Some(Atom::One(sa, _)) = atoms.last()
+        && !sa.contains(*name.last().unwrap())
+    {
+        return if budget.take(1) {
+            Reach::No
+        } else {
+            Reach::Undecided
+        };
+    }
+    if name.len() <= 64 {
+        let mut buf = [Atom::Star; 64];
+        for (dst, &b) in buf.iter_mut().zip(name) {
+            *dst = Atom::One(BSet::one(b), true);
+        }
+        comp_intersect(atoms, &buf[..name.len()], loose, None, stack, budget)
+    } else {
+        let b_atoms = lit_atoms_bytes(name);
+        comp_intersect(atoms, &b_atoms, loose, None, stack, budget)
+    }
 }
 
 /// A component that matches every name a directory listing gives (`*`,
@@ -1359,8 +1664,9 @@ struct Parsed {
 }
 
 impl PathPat {
-    /// `None` when the budget ran out while reading.
-    fn parse_all(s: &str, budget: &mut Budget) -> Option<Parsed> {
+    /// `None` when the budget ran out while reading. `loose_dots`: `true` for
+    /// `globset` search filters (where `*` and `?` always match leading dots).
+    fn parse_all(s: &str, loose_dots: bool, budget: &mut Budget) -> Option<Parsed> {
         if !budget.take(s.len() as u64) {
             return None;
         }
@@ -1368,9 +1674,11 @@ impl PathPat {
             Some(v) if v.len() <= MAX_PATH_VARIANTS => (v, true),
             _ => (vec![widen_braces(s)], false),
         };
+        let base_dstar = loose_dots || !keyed || s.contains("**");
         let mut pats = Vec::with_capacity(variants.len());
         for v in &variants {
-            pats.push(PathPat::parse(v, s.contains("**"), budget)?);
+            let dstar = base_dstar || v.contains("**");
+            pats.push(PathPat::parse(v, dstar, budget)?);
         }
         Some(Parsed { pats, keyed })
     }
@@ -1602,30 +1910,36 @@ const ASK_TREE_SUFFIXES: &[(&str, &[&str])] = &[
 ];
 
 /// Whether pattern component `p` can match shape component `s`.
-fn comp_meets(p: &PComp, s: &SComp, role: Role, loose: bool, q: &mut Query) -> Reach {
+fn comp_meets<'b>(
+    p: &PComp,
+    s: &'b SComp,
+    role: Role,
+    loose: bool,
+    q: &mut Query<'_, 'b>,
+) -> Reach {
     let PComp::Pat { atoms, lit, .. } = p else {
         return Reach::Yes;
     };
     let key = p as *const PComp as usize;
-    let against = |name: &str, q: &mut Query| -> Reach {
+    let against = |name: &'b str, q: &mut Query<'_, 'b>| -> Reach {
         if let Some(l) = lit {
             return if l == name { Reach::Yes } else { Reach::No };
         }
-        if let Some(r) = q.cache.get(&(key, name.to_string())) {
+        if let Some(r) = q.cache.get(&(key, name)) {
             return *r;
         }
-        let r = comp_intersect(atoms, &lit_atoms(name), loose, None, &mut q.budget);
+        let r = comp_meets_lit(atoms, name.as_bytes(), loose, &mut q.comp_stack, q.budget);
         if r != Reach::Undecided {
-            q.cache.insert((key, name.to_string()), r);
+            q.cache.insert((key, name), r);
         }
         r
     };
     match s {
         SComp::One | SComp::Any => Reach::Yes,
-        SComp::Lit(name) => against(name, q),
+        SComp::Lit(name) => against(name.as_str(), q),
         SComp::Names(names) => {
             let mut r = Reach::No;
-            for n in *names {
+            for &n in *names {
                 match against(n, q) {
                     Reach::Yes => return Reach::Yes,
                     Reach::Undecided => r = Reach::Undecided,
@@ -1634,8 +1948,10 @@ fn comp_meets(p: &PComp, s: &SComp, role: Role, loose: bool, q: &mut Query) -> R
             }
             r
         }
-        SComp::Glob(g) => comp_intersect(atoms, g, loose, None, &mut q.budget),
-        SComp::Pinned(g, stem) => comp_intersect(atoms, g, loose, Some(*stem), &mut q.budget),
+        SComp::Glob(g) => comp_intersect(atoms, g, loose, None, &mut q.comp_stack, q.budget),
+        SComp::Pinned(g, stem) => {
+            comp_intersect(atoms, g, loose, Some(*stem), &mut q.comp_stack, q.budget)
+        }
         SComp::Secret(top) => {
             if atoms_may_be_secret(atoms, *top, role) {
                 Reach::Yes
@@ -1648,19 +1964,53 @@ fn comp_meets(p: &PComp, s: &SComp, role: Role, loose: bool, q: &mut Query) -> R
 
 /// Whether pattern `p` can name a path of shape `s`. `keyed`: a component
 /// matching every name only counts against a key when all later ones do too.
-fn path_meets(p: &PathPat, s: &[(SComp, bool)], role: Role, keyed: bool, q: &mut Query) -> Reach {
+fn path_meets<'b>(
+    p: &PathPat,
+    s: &'b [(SComp, bool)],
+    role: Role,
+    keyed: bool,
+    q: &mut Query<'_, 'b>,
+) -> Reach {
     let (n, m) = (p.comps.len(), s.len());
     let s_any = s.iter().any(|c| matches!(c.0, SComp::Any));
     if !p.globstar && !s_any && n != m {
         return Reach::No;
     }
+    let mut start = 0usize;
+    while start < n && start < m {
+        match (&p.comps[start], &s[start].0) {
+            (PComp::Pat { lit: Some(pl), .. }, SComp::Lit(sl)) => {
+                if pl != sl {
+                    return if q.budget.take(start as u64 + 1) {
+                        Reach::No
+                    } else {
+                        Reach::Undecided
+                    };
+                }
+                start += 1;
+            }
+            _ => break,
+        }
+    }
+    if start == n && start == m {
+        return if q.budget.take(start as u64 + 1) {
+            Reach::Yes
+        } else {
+            Reach::Undecided
+        };
+    }
+    if start > 0 && !q.budget.take(start as u64) {
+        return Reach::Undecided;
+    }
     let loose = p.dstar;
-    let w = m + 1;
-    let mut seen = Seen::new((n + 1) * w);
-    let mut stack = vec![(0usize, 0usize)];
+    let w = m - start + 1;
+    let cells = (n - start + 1).saturating_mul(w);
+    let mut seen = Seen::new(cells);
+    q.path_stack.clear();
+    q.path_stack.push((start, start));
     let mut undecided = false;
-    while let Some((i, j)) = stack.pop() {
-        if !seen.insert(i * w + j) {
+    while let Some((i, j)) = q.path_stack.pop() {
+        if !seen.insert((i - start) * w + (j - start)) {
             continue;
         }
         if !q.budget.take(1) {
@@ -1670,10 +2020,10 @@ fn path_meets(p: &PathPat, s: &[(SComp, bool)], role: Role, keyed: bool, q: &mut
             return Reach::Yes;
         }
         if i < n && matches!(p.comps[i], PComp::GlobStar) {
-            stack.push((i + 1, j));
+            q.path_stack.push((i + 1, j));
         }
         if j < m && matches!(s[j].0, SComp::Any) {
-            stack.push((i, j + 1));
+            q.path_stack.push((i, j + 1));
         }
         if i >= n || j >= m {
             continue;
@@ -1693,7 +2043,7 @@ fn path_meets(p: &PathPat, s: &[(SComp, bool)], role: Role, keyed: bool, q: &mut
             continue;
         }
         match comp_meets(&p.comps[i], &s[j].0, role, loose, q) {
-            Reach::Yes => stack.push((ni, nj)),
+            Reach::Yes => q.path_stack.push((ni, nj)),
             Reach::Undecided => undecided = true,
             Reach::No => {}
         }
