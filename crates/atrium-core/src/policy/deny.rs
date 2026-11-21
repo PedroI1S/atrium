@@ -648,33 +648,55 @@ impl Sensitive {
         {
             return Some(h);
         }
-        self.glob_str_hit(&pl, role)
+        match self.glob_str_hit(&pl, role) {
+            GlobHit::Hit(h) => Some(h),
+            GlobHit::Undecided | GlobHit::Miss => None,
+        }
     }
 
     /// The shared glob check (D-131) for a lower-case absolute pattern:
     /// `dev`'s probes, then the keyed sensitive shapes.
-    fn glob_str_hit(&self, pl: &str, role: Role) -> Option<&'static str> {
+    fn glob_str_hit(&self, pl: &str, role: Role) -> GlobHit {
         if !pl.starts_with('/') {
-            return None;
+            return GlobHit::Miss;
         }
         let specs = self.specs();
-        let mut budget = Budget::new();
-        let (pats, keyed) = PathPat::parse_all(pl);
-        for pp in &pats {
-            for (probe, id) in &specs.floor {
-                if path_meets(pp, probe, role, false, &mut budget) {
-                    return Some(id);
-                }
-            }
-            for s in &specs.hard {
-                if (role != Role::Read || !s.write_only)
-                    && path_meets(pp, &s.comps, role, keyed, &mut budget)
-                {
-                    return Some(s.id);
+        let mut q = Query::new();
+        let Some(parsed) = PathPat::parse_all(pl, &mut q.budget) else {
+            return GlobHit::Undecided;
+        };
+        let mut undecided = false;
+        for pp in &parsed.pats {
+            let floor = specs.floor.iter().map(|(c, id)| (c, *id, false));
+            let hard = specs
+                .hard
+                .iter()
+                .filter(|s| role != Role::Read || !s.write_only)
+                .map(|s| (&s.comps, s.id, parsed.keyed));
+            for (comps, id, keyed) in floor.chain(hard) {
+                match path_meets(pp, comps, role, keyed, &mut q) {
+                    Reach::Yes => return GlobHit::Hit(id),
+                    Reach::Undecided => undecided = true,
+                    Reach::No => {}
                 }
             }
         }
-        None
+        if undecided {
+            GlobHit::Undecided
+        } else {
+            GlobHit::Miss
+        }
+    }
+
+    /// The hard deny a search filter's anchored forms reach (D-131):
+    /// `~/.g*/private-keys-v1.d/k.key` names a file no probe has.
+    fn search_filter_hit(&self, variants: &[String]) -> Option<&'static str> {
+        variants
+            .iter()
+            .find_map(|v| match self.glob_str_hit(v, Role::Read) {
+                GlobHit::Hit(h) => Some(h),
+                _ => None,
+            })
     }
 
     pub fn is_ssh_dir(&self, p: &Path) -> bool {
@@ -686,14 +708,17 @@ impl Sensitive {
             return false;
         }
         let specs = self.specs();
-        let mut budget = Budget::new();
-        let (pats, keyed) = PathPat::parse_all(&pl);
-        pats.iter()
-            .any(|pp| path_meets(pp, &specs.ssh_dir, Role::Read, keyed, &mut budget))
+        let mut q = Query::new();
+        let Some(parsed) = PathPat::parse_all(&pl, &mut q.budget) else {
+            return false;
+        };
+        parsed.pats.iter().any(|pp| {
+            path_meets(pp, &specs.ssh_dir, Role::Read, parsed.keyed, &mut q) == Reach::Yes
+        })
     }
 
     /// A credential store that asks (CR-12): `p` is one, or is inside one
-    /// of its folders.
+    /// of its folders. A glob the matcher can't decide asks too.
     pub fn ask_hit(&self, p: &Path) -> bool {
         let pl = lower(p);
         if let Some(rest) = under(&pl, &self.home)
@@ -711,19 +736,25 @@ impl Sensitive {
         self.ask_glob_str_hit(&pl)
     }
 
+    /// A glob that can name a store that asks, or that the matcher can't
+    /// decide (out of budget: Ask, never a hard deny).
     fn ask_glob_str_hit(&self, pl: &str) -> bool {
         if !pl.starts_with('/') {
             return false;
         }
         let specs = self.specs();
-        let mut budget = Budget::new();
-        let (pats, keyed) = PathPat::parse_all(pl);
-        pats.iter().any(|pp| {
-            specs
-                .ask
-                .iter()
-                .any(|s| path_meets(pp, &s.comps, Role::Read, keyed, &mut budget))
-        })
+        let mut q = Query::new();
+        let Some(parsed) = PathPat::parse_all(pl, &mut q.budget) else {
+            return true;
+        };
+        for pp in &parsed.pats {
+            for s in &specs.ask {
+                if path_meets(pp, &s.comps, Role::Read, parsed.keyed, &mut q) != Reach::No {
+                    return true;
+                }
+            }
+        }
+        self.glob_str_hit(pl, Role::Write) == GlobHit::Undecided
     }
 
     /// Representative paths of the credential stores that ask.
@@ -839,26 +870,31 @@ impl Sensitive {
 //
 // One matcher decides whether a path pattern (`*`, `?`, `[...]` with POSIX
 // classes and ranges, `**`, braces expanded within a budget) can name a
-// sensitive path. Sensitive paths are written as *shapes*: a list of
-// components, each a literal name, a name glob (`*.session`,
-// `msal_token_cache.*`), a set of names, "any one name", "any number of
-// names", or "an SSH name that isn't public". Both levels are dynamic
-// programs over (pattern position, shape position) with a step budget, so
-// adjacent globstars and long patterns cost linear-bounded work and nothing
-// recurses. When the budget runs out the answer is "can match" (fail
-// closed: the shape's own verdict, never Allow).
+// sensitive path. Matching is over bytes: a literal is its UTF-8 bytes, and
+// `?`, a negated class, an unknown class or a class naming a non-ASCII
+// character matches any non-ASCII byte run (a superset of one character).
+//
+// Sensitive paths are *shapes*: lists of components, each a literal name, a
+// name glob (`*.session`), a set of names, any one name, any number of
+// names, an SSH name that isn't public, or a store name the pattern must pin
+// (`msal_token_cache.*`). Both levels are dynamic programs over (pattern
+// position, shape position) that charge every visited state, and every
+// parsed byte, to one budget. A query that runs out answers "undecided",
+// which the callers turn into Ask, never into a hard deny.
 //
 // *Keys* keep ordinary globs ordinary: a shape marks the components that
 // name it (a tree's folder, a store's file name). A component that matches
-// every name (`*`, `***`, `?*`, `**`) only counts against a key when every
-// later pattern component also matches everything (`~/.config/*/*`,
-// `~/**`), so `~/.config/*/settings.json` and `~/**/*.rs` stay ordinary
-// while `~/.g*/k.key` and `~/**/b.session` don't.
+// every name (`*`, `***`, `?*`, `*[!.]*`, `**`) only counts against a key
+// when every later pattern component does too, so `~/.config/*/settings.json`
+// and `~/**/*.rs` stay ordinary while `~/.g*/k.key` and `~/**/b.session`
+// don't.
 
-/// Work allowed per query, in DP states.
+/// Work allowed per query: visited DP states plus parsed bytes.
 const MATCH_BUDGET: u64 = 4_000_000;
 /// Brace expansions read exactly; more and the pattern is widened.
 const MAX_PATH_VARIANTS: usize = 64;
+/// DP tables up to this many cells are dense; larger ones are hashed.
+const DENSE_CELLS: usize = 4096;
 
 struct Budget(u64);
 
@@ -877,29 +913,110 @@ impl Budget {
     }
 }
 
-/// A one-character set.
+/// One query's budget, and the answers for pattern components against
+/// literal names (the same names recur across hundreds of shapes).
+struct Query {
+    budget: Budget,
+    cache: HashMap<(usize, String), Reach>,
+}
+
+impl Query {
+    fn new() -> Self {
+        Self {
+            budget: Budget::new(),
+            cache: HashMap::new(),
+        }
+    }
+}
+
+/// What a query found.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum CSet {
-    Lit(char),
-    /// `?`
-    Any,
-    /// `[...]`: ASCII membership as a bitmap, and whether non-ASCII
-    /// characters are in it (all of them, read conservatively).
-    Class {
-        bits: u128,
-        hi: bool,
-    },
-    /// A class this matcher can't read (an unknown `[:name:]`): any char.
-    Unknown,
+enum Reach {
+    No,
+    /// Out of budget: neither shown nor ruled out.
+    Undecided,
+    Yes,
+}
+
+/// Visited states of a DP: dense for small tables, hashed for large ones.
+enum Seen {
+    Dense(Vec<bool>),
+    Sparse(std::collections::HashSet<usize>),
+}
+
+impl Seen {
+    fn new(cells: usize) -> Self {
+        if cells <= DENSE_CELLS {
+            Seen::Dense(vec![false; cells])
+        } else {
+            Seen::Sparse(std::collections::HashSet::new())
+        }
+    }
+    /// Marks `id`; `false` when it was already marked.
+    fn insert(&mut self, id: usize) -> bool {
+        match self {
+            Seen::Dense(v) => !std::mem::replace(&mut v[id], true),
+            Seen::Sparse(s) => s.insert(id),
+        }
+    }
+}
+
+/// A set of bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BSet([u128; 2]);
+
+impl BSet {
+    const EMPTY: BSet = BSet([0, 0]);
+    /// Every byte a file name can hold (not NUL, not `/`).
+    const NAME: BSet = BSet([!1u128 & !(1u128 << b'/'), !0]);
+    /// The bytes of a non-ASCII character.
+    const HI: BSet = BSet([0, !0]);
+
+    fn one(b: u8) -> Self {
+        let mut s = Self::EMPTY;
+        s.add(b);
+        s
+    }
+    fn add(&mut self, b: u8) {
+        self.0[usize::from(b >> 7)] |= 1u128 << (b & 0x7f);
+    }
+    fn and(self, o: BSet) -> BSet {
+        BSet([self.0[0] & o.0[0], self.0[1] & o.0[1]])
+    }
+    fn or(self, o: BSet) -> BSet {
+        BSet([self.0[0] | o.0[0], self.0[1] | o.0[1]])
+    }
+    fn minus(self, o: BSet) -> BSet {
+        BSet([self.0[0] & !o.0[0], self.0[1] & !o.0[1]])
+    }
+    fn is_empty(&self) -> bool {
+        self.0 == [0, 0]
+    }
+    fn single(&self) -> Option<u8> {
+        let n = self.0[0].count_ones() + self.0[1].count_ones();
+        if n != 1 {
+            return None;
+        }
+        Some(if self.0[0] != 0 {
+            self.0[0].trailing_zeros() as u8
+        } else {
+            0x80 | self.0[1].trailing_zeros() as u8
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Atom {
+    /// `*`: any bytes of a name.
     Star,
-    One(CSet),
+    /// One byte from the set; `dot`: it may be a name's leading `.` (a
+    /// literal or a class may; `?` may not, as in the shell).
+    One(BSet, bool),
+    /// The rest of a non-ASCII character: zero or more non-ASCII bytes.
+    Tail,
 }
 
-fn posix_class(name: &str, c: char) -> Option<bool> {
+fn posix_class(name: &str, c: u8) -> Option<bool> {
     Some(match name {
         "alpha" => c.is_ascii_alphabetic(),
         "alnum" => c.is_ascii_alphanumeric(),
@@ -909,40 +1026,38 @@ fn posix_class(name: &str, c: char) -> Option<bool> {
         "xdigit" => c.is_ascii_hexdigit(),
         "punct" => c.is_ascii_punctuation(),
         "graph" => c.is_ascii_graphic(),
-        "print" => c.is_ascii_graphic() || c == ' ',
-        "space" => c.is_ascii_whitespace() || c == '\x0b',
-        "blank" => c == ' ' || c == '\t',
+        "print" => c.is_ascii_graphic() || c == b' ',
+        "space" => c.is_ascii_whitespace() || c == 0x0b,
+        "blank" => c == b' ' || c == b'\t',
         "cntrl" => c.is_ascii_control(),
-        "word" => c.is_ascii_alphanumeric() || c == '_',
+        "word" => c.is_ascii_alphanumeric() || c == b'_',
         _ => return None,
     })
 }
 
-fn add_range(lo: char, hi: char, bits: &mut u128) -> bool {
-    for c in 1u8..0x80 {
-        let ch = char::from(c);
-        if lo <= ch && ch <= hi {
-            *bits |= 1u128 << c;
-        }
-    }
-    u32::from(hi) >= 0x80
-}
-
-/// A class body (without brackets and negation) as a set; `None` when it
-/// names an unknown `[:class:]`.
-fn class_set(body: &str, neg: bool) -> Option<CSet> {
+/// A class body (without brackets and negation): its ASCII bytes, and
+/// whether it names a non-ASCII character. `None`: an unknown `[:class:]`.
+fn class_body(body: &str) -> Option<(BSet, bool)> {
     let cs: Vec<char> = body.chars().collect();
-    let mut bits: u128 = 0;
+    let mut set = BSet::EMPTY;
     let mut hi = false;
+    let add = |lo: char, h: char, set: &mut BSet| {
+        for b in 1u8..0x80 {
+            if lo <= char::from(b) && char::from(b) <= h {
+                set.add(b);
+            }
+        }
+        !h.is_ascii()
+    };
     let mut k = 0;
     while k < cs.len() {
         if cs[k] == '[' && cs.get(k + 1) == Some(&':') {
             let rest: String = cs[k + 2..].iter().collect();
             if let Some(end) = rest.find(":]") {
                 let name = &rest[..end];
-                for c in 1u8..0x80 {
-                    if posix_class(name, char::from(c))? {
-                        bits |= 1u128 << c;
+                for b in 1u8..0x80 {
+                    if posix_class(name, b)? {
+                        set.add(b);
                     }
                 }
                 k += 2 + name.chars().count() + 2;
@@ -960,30 +1075,19 @@ fn class_set(body: &str, neg: bool) -> Option<CSet> {
             } else {
                 (cs[nk + 1], nk + 2)
             };
-            hi |= add_range(lo, h, &mut bits);
+            hi |= add(lo, h, &mut set);
             k = nk2;
         } else {
-            hi |= add_range(lo, lo, &mut bits);
+            hi |= add(lo, lo, &mut set);
             k = nk;
         }
     }
-    let nul = !1u128; // NUL is never in a name
-    Some(if neg {
-        CSet::Class {
-            bits: !bits & nul,
-            hi: !hi,
-        }
-    } else {
-        CSet::Class {
-            bits: bits & nul,
-            hi,
-        }
-    })
+    Some((set.and(BSet::NAME), hi))
 }
 
-/// The byte index of the `]` closing the class opened at `start`.
-fn class_end(pat: &str, start: usize) -> Option<usize> {
-    let b = pat.as_bytes();
+/// The byte index of the `]` closing the class opened at `start`, charging
+/// each scanned byte. `Err` when the budget ran out.
+fn class_end(b: &[u8], start: usize, budget: &mut Budget) -> Result<Option<usize>, ()> {
     let mut j = start + 1;
     if matches!(b.get(j), Some(b'!' | b'^')) {
         j += 1;
@@ -991,21 +1095,44 @@ fn class_end(pat: &str, start: usize) -> Option<usize> {
     if b.get(j) == Some(&b']') {
         j += 1;
     }
-    while j < b.len() {
+    let from = j;
+    let found = loop {
+        if j >= b.len() {
+            break None;
+        }
         match b[j] {
-            b'[' if b.get(j + 1) == Some(&b':') => match pat[j + 2..].find(":]") {
-                Some(e) => j += 2 + e + 2,
-                None => j += 1,
-            },
+            b'[' if b.get(j + 1) == Some(&b':') => {
+                match b[j + 2..].windows(2).position(|w| w == b":]") {
+                    Some(e) => j += 2 + e + 2,
+                    None => j += 1,
+                }
+            }
             b'\\' => j += 2,
-            b']' => return Some(j),
+            b']' => break Some(j),
             _ => j += 1,
         }
+    };
+    if !budget.take((j.min(b.len()) - from + 1) as u64) {
+        return Err(());
     }
-    None
+    Ok(found)
 }
 
-fn parse_atoms(pat: &str) -> Vec<Atom> {
+fn push_char(out: &mut Vec<Atom>, c: char) {
+    let mut buf = [0u8; 4];
+    for &b in c.encode_utf8(&mut buf).as_bytes() {
+        out.push(Atom::One(BSet::one(b), true));
+    }
+}
+
+/// A name pattern's atoms. `None` when the budget ran out.
+fn parse_atoms(pat: &str, budget: &mut Budget) -> Option<Vec<Atom>> {
+    if !budget.take(pat.len() as u64 + 1) {
+        return None;
+    }
+    let bytes = pat.as_bytes();
+    // With no `]` after it, an opener is a literal: no scan needed.
+    let last_close = bytes.iter().rposition(|&b| b == b']');
     let mut out = Vec::with_capacity(pat.len());
     let mut it = pat.char_indices().peekable();
     while let Some((i, c)) = it.next() {
@@ -1015,123 +1142,115 @@ fn parse_atoms(pat: &str) -> Vec<Atom> {
                     out.push(Atom::Star);
                 }
             }
-            '?' => out.push(Atom::One(CSet::Any)),
+            '?' => {
+                out.push(Atom::One(BSet::NAME, false));
+                out.push(Atom::Tail);
+            }
             '\\' => match it.next() {
-                Some((_, e)) => out.push(Atom::One(CSet::Lit(e))),
-                None => out.push(Atom::One(CSet::Lit('\\'))),
+                Some((_, e)) => push_char(&mut out, e),
+                None => push_char(&mut out, '\\'),
             },
-            '[' => match class_end(pat, i) {
-                Some(end) => {
-                    let inner = &pat[i + 1..end];
-                    let (neg, body) = match inner.strip_prefix(['!', '^']) {
-                        Some(b) => (true, b),
-                        None => (false, inner),
-                    };
-                    out.push(Atom::One(class_set(body, neg).unwrap_or(CSet::Unknown)));
-                    while it.peek().is_some_and(|(k, _)| *k <= end) {
-                        it.next();
-                    }
+            '[' => {
+                let end = match last_close {
+                    Some(lc) if lc > i => class_end(bytes, i, budget).ok()?,
+                    _ => None,
+                };
+                let Some(end) = end else {
+                    push_char(&mut out, '[');
+                    continue;
+                };
+                let inner = &pat[i + 1..end];
+                let (neg, body) = match inner.strip_prefix(['!', '^']) {
+                    Some(b) => (true, b),
+                    None => (false, inner),
+                };
+                // A negated or unknown class, or one naming a non-ASCII
+                // character, matches every non-ASCII character.
+                let (set, hi) = match class_body(body) {
+                    Some((set, _)) if neg => (BSet::NAME.minus(set).or(BSet::HI), true),
+                    Some((set, hi)) => (if hi { set.or(BSet::HI) } else { set }, hi),
+                    None => (BSet::NAME, true),
+                };
+                out.push(Atom::One(set, true));
+                if hi {
+                    out.push(Atom::Tail);
                 }
-                None => out.push(Atom::One(CSet::Lit('['))),
-            },
-            _ => out.push(Atom::One(CSet::Lit(c))),
-        }
-    }
-    out
-}
-
-/// The characters tried for a set: ASCII, and `é` for every non-ASCII one.
-fn universe() -> impl Iterator<Item = char> {
-    (1u8..0x80).map(char::from).chain(std::iter::once('é'))
-}
-
-impl CSet {
-    fn has(&self, c: char) -> bool {
-        match self {
-            CSet::Lit(l) => *l == c,
-            CSet::Any | CSet::Unknown => true,
-            CSet::Class { bits, hi } => {
-                let u = u32::from(c);
-                if u < 0x80 {
-                    bits & (1u128 << u) != 0
-                } else {
-                    *hi
+                while it.peek().is_some_and(|(k, _)| *k <= end) {
+                    it.next();
                 }
             }
+            _ => push_char(&mut out, c),
         }
     }
-
-    /// The one character this set matches, if it matches exactly one.
-    fn singleton(&self) -> Option<char> {
-        match self {
-            CSet::Lit(l) => Some(*l),
-            CSet::Any | CSet::Unknown => None,
-            CSet::Class { bits, hi } => {
-                (!*hi && bits.count_ones() == 1).then(|| char::from(bits.trailing_zeros() as u8))
-            }
-        }
-    }
+    Some(out)
 }
 
-/// One character step of a component DP: a set, and whether it may be a
-/// name's leading `.` (`*` and `?` can't, as in the shell).
-fn sets_meet(x: CSet, x_dot: bool, y: CSet, y_dot: bool, first: bool) -> bool {
-    let ok = |c: char| c != '/' && (!first || c != '.' || (x_dot && y_dot));
-    if let CSet::Lit(l) = x {
-        return ok(l) && y.has(l);
-    }
-    if let CSet::Lit(l) = y {
-        return ok(l) && x.has(l);
-    }
-    universe().any(|c| ok(c) && x.has(c) && y.has(c))
+fn lit_atoms(name: &str) -> Vec<Atom> {
+    name.bytes()
+        .map(|b| Atom::One(BSet::one(b), true))
+        .collect()
 }
 
-/// Whether two name patterns share a (non-empty) name. `loose`: `*` and `?`
-/// in `a` may match a leading dot (globset's `**` patterns). `None`: out of
-/// budget.
-fn comp_intersect(a: &[Atom], b: &[Atom], loose: bool, budget: &mut Budget) -> Option<bool> {
+/// Whether two name patterns share a non-empty name. `loose`: `*` and `?`
+/// in `a` may match a leading dot (`dev`'s globset reading of patterns
+/// holding `**`). `stem`: the first `stem` atoms of `b` are a store's own
+/// name, and a match counts only when a non-wildcard atom of `a` takes one
+/// of their bytes (the pattern pins part of the name).
+fn comp_intersect(
+    a: &[Atom],
+    b: &[Atom],
+    loose: bool,
+    stem: Option<usize>,
+    budget: &mut Budget,
+) -> Reach {
     let (la, lb) = (a.len(), b.len());
     let w = lb + 1;
-    let n = (la + 1) * w * 2;
-    if !budget.take(n as u64) {
-        return None;
-    }
-    let mut seen = vec![false; n];
-    let mut stack = vec![(0usize, 0usize, false)];
-    while let Some((i, j, s)) = stack.pop() {
-        let id = (i * w + j) * 2 + usize::from(s);
-        if seen[id] {
+    let cells = (la + 1) * w * 4;
+    let mut seen = Seen::new(cells);
+    let mut stack = vec![(0usize, 0usize, false, false)];
+    while let Some((i, j, started, named)) = stack.pop() {
+        let id = ((i * w + j) * 2 + usize::from(started)) * 2 + usize::from(named);
+        if !seen.insert(id) {
             continue;
         }
-        seen[id] = true;
-        if i == la && j == lb && s {
-            return Some(true);
+        if !budget.take(1) {
+            return Reach::Undecided;
         }
-        if i < la && a[i] == Atom::Star {
-            stack.push((i + 1, j, s));
+        if i == la && j == lb && started && (named || stem.is_none()) {
+            return Reach::Yes;
         }
-        if j < lb && b[j] == Atom::Star {
-            stack.push((i, j + 1, s));
+        if i < la && matches!(a[i], Atom::Star | Atom::Tail) {
+            stack.push((i + 1, j, started, named));
+        }
+        if j < lb && matches!(b[j], Atom::Star | Atom::Tail) {
+            stack.push((i, j + 1, started, named));
         }
         if i >= la || j >= lb {
             continue;
         }
         let (xa, xdot, ni, astay) = match a[i] {
-            Atom::Star => (CSet::Any, loose, i, true),
-            Atom::One(x) => (x, !matches!(x, CSet::Any) || loose, i + 1, false),
+            Atom::Star => (BSet::NAME, loose, i, true),
+            Atom::Tail => (BSet::HI, false, i, true),
+            Atom::One(s, d) => (s, d || loose, i + 1, false),
         };
         let (yb, ydot, nj, bstay) = match b[j] {
-            Atom::Star => (CSet::Any, false, j, true),
-            Atom::One(y) => (y, !matches!(y, CSet::Any), j + 1, false),
+            Atom::Star => (BSet::NAME, false, j, true),
+            Atom::Tail => (BSet::HI, false, j, true),
+            Atom::One(s, d) => (s, d, j + 1, false),
         };
         if astay && bstay {
             continue;
         }
-        if sets_meet(xa, xdot, yb, ydot, !s) {
-            stack.push((ni, nj, true));
+        let mut meet = xa.and(yb).and(BSet::NAME);
+        if !started && !(xdot && ydot) {
+            meet = meet.minus(BSet::one(b'.'));
+        }
+        if !meet.is_empty() {
+            let pins = !astay && !bstay && stem.is_some_and(|k| j < k);
+            stack.push((ni, nj, true, named || pins));
         }
     }
-    Some(false)
+    Reach::No
 }
 
 /// A component that matches every name a directory listing gives (`*`,
@@ -1139,17 +1258,13 @@ fn comp_intersect(a: &[Atom], b: &[Atom], loose: bool, budget: &mut Budget) -> O
 fn atoms_catchall(atoms: &[Atom]) -> bool {
     let mut stars = 0;
     let mut ones = 0;
+    let all_but_dot = BSet::NAME.minus(BSet::one(b'.'));
     for a in atoms {
         match a {
             Atom::Star => stars += 1,
-            Atom::One(CSet::Any) => ones += 1,
-            Atom::One(c @ CSet::Class { .. }) => {
-                if universe().any(|ch| ch != '.' && ch != '/' && !c.has(ch)) {
-                    return false;
-                }
-                ones += 1;
-            }
-            Atom::One(_) => return false,
+            Atom::Tail => {}
+            Atom::One(s, _) if all_but_dot.minus(*s).is_empty() => ones += 1,
+            Atom::One(..) => return false,
         }
     }
     stars > 0 && ones <= 1
@@ -1160,20 +1275,20 @@ fn atoms_catchall(atoms: &[Atom]) -> bool {
 /// unless written).
 fn atoms_may_be_secret(atoms: &[Atom], top: bool, role: Role) -> bool {
     let single = |a: &Atom| match a {
-        Atom::One(s) => s.singleton(),
-        Atom::Star => None,
+        Atom::One(s, _) => s.single(),
+        _ => None,
     };
-    let prefix: String = atoms.iter().map_while(single).collect();
-    let suffix: String = {
-        let mut v: Vec<char> = atoms.iter().rev().map_while(single).collect();
-        v.reverse();
-        v.into_iter().collect()
-    };
-    if suffix.ends_with(".pub") || prefix.starts_with("known_hosts") {
+    let prefix: Vec<u8> = atoms.iter().map_while(single).collect();
+    let mut suffix: Vec<u8> = atoms.iter().rev().map_while(single).collect();
+    suffix.reverse();
+    if suffix.ends_with(b".pub") || prefix.starts_with(b"known_hosts") {
         return false;
     }
-    let literal = prefix.chars().count() == atoms.len();
-    !(top && role != Role::Write && literal && (prefix == "config" || prefix == "authorized_keys"))
+    let literal = prefix.len() == atoms.len();
+    !(top
+        && role != Role::Write
+        && literal
+        && (prefix == b"config" || prefix == b"authorized_keys"))
 }
 
 /// A pattern path component.
@@ -1192,6 +1307,9 @@ struct PathPat {
     /// `tail_catchall[i]`: every component from `i` on matches everything.
     tail_catchall: Vec<bool>,
     globstar: bool,
+    /// The spelling holds `**` anywhere (`dev` then matched it with
+    /// globset, where `*` takes a leading dot).
+    dstar: bool,
 }
 
 /// Widens a pattern whose braces expand too far: each outermost brace
@@ -1233,19 +1351,31 @@ fn widen_braces(s: &str) -> String {
     out
 }
 
+/// A pattern read for matching: its brace variants and whether keys apply
+/// (`false` once the braces were widened: then nothing is ordinary).
+struct Parsed {
+    pats: Vec<PathPat>,
+    keyed: bool,
+}
+
 impl PathPat {
-    /// The brace expansions of `s`, parsed; `keyed` is `false` when they
-    /// were too many and the pattern was widened (then nothing is ordinary).
-    fn parse_all(s: &str) -> (Vec<PathPat>, bool) {
-        match words::brace_expand(s) {
-            Some(v) if v.len() <= MAX_PATH_VARIANTS => {
-                (v.iter().map(|x| PathPat::parse(x)).collect(), true)
-            }
-            _ => (vec![PathPat::parse(&widen_braces(s))], false),
+    /// `None` when the budget ran out while reading.
+    fn parse_all(s: &str, budget: &mut Budget) -> Option<Parsed> {
+        if !budget.take(s.len() as u64) {
+            return None;
         }
+        let (variants, keyed) = match words::brace_expand(s) {
+            Some(v) if v.len() <= MAX_PATH_VARIANTS => (v, true),
+            _ => (vec![widen_braces(s)], false),
+        };
+        let mut pats = Vec::with_capacity(variants.len());
+        for v in &variants {
+            pats.push(PathPat::parse(v, s.contains("**"), budget)?);
+        }
+        Some(Parsed { pats, keyed })
     }
 
-    fn parse(s: &str) -> Self {
+    fn parse(s: &str, dstar: bool, budget: &mut Budget) -> Option<Self> {
         let mut comps: Vec<PComp> = vec![];
         for part in s.split('/') {
             match part {
@@ -1261,14 +1391,8 @@ impl PathPat {
                     }
                 }
                 _ => {
-                    let atoms = parse_atoms(part);
-                    let lit = atoms
-                        .iter()
-                        .map(|a| match a {
-                            Atom::One(CSet::Lit(c)) => Some(*c),
-                            _ => None,
-                        })
-                        .collect::<Option<String>>();
+                    let atoms = parse_atoms(part, budget)?;
+                    let lit = (!part.contains(['*', '?', '[', '\\'])).then(|| part.to_string());
                     let catchall = atoms_catchall(&atoms);
                     comps.push(PComp::Pat {
                         atoms,
@@ -1287,11 +1411,12 @@ impl PathPat {
             tail_catchall[i] = c && tail_catchall[i + 1];
         }
         let globstar = comps.iter().any(|c| matches!(c, PComp::GlobStar));
-        Self {
+        Some(Self {
             comps,
             tail_catchall,
             globstar,
-        }
+            dstar,
+        })
     }
 }
 
@@ -1300,7 +1425,7 @@ impl PathPat {
 enum SComp {
     Lit(String),
     /// A name glob (`*.session`).
-    Glob(String),
+    Glob(Vec<Atom>),
     /// One of these names.
     Names(&'static [&'static str]),
     /// Any one name.
@@ -1309,9 +1434,10 @@ enum SComp {
     Any,
     /// An SSH file name that isn't public (`true`: directly in `~/.ssh`).
     Secret(bool),
-    /// A name with this prefix, written with a literal run of at least
-    /// four of the prefix's own characters.
-    Named(&'static str),
+    /// `<stem>.*`, reached only by a name pattern that pins part of the
+    /// stem (`ms?l_*.custom`, `*token_cache.x`), not by one whose wildcard
+    /// covers the whole stem (`*.rs`).
+    Pinned(Vec<Atom>, usize),
 }
 
 struct Shape {
@@ -1354,6 +1480,11 @@ fn file_shape(path: &str) -> Vec<(SComp, bool)> {
         l.1 = true;
     }
     v
+}
+
+/// A shape's own name glob (internal text, read without a budget limit).
+fn shape_glob(g: &str) -> Vec<Atom> {
+    parse_atoms(g, &mut Budget::new()).unwrap_or_else(|| vec![Atom::Star])
 }
 
 impl Specs {
@@ -1429,19 +1560,25 @@ impl Specs {
         }
         for (t, sufs) in ASK_TREE_SUFFIXES {
             for suf in *sufs {
+                // The folder's files at any depth below it.
                 let mut v = lits(&abs(t));
-                v.push((SComp::Glob(format!("*{suf}")), true));
+                v.push((SComp::Any, false));
+                v.push((SComp::Glob(shape_glob(&format!("*{suf}"))), true));
                 ask.push(shape(v, "ask", false));
             }
         }
         for (dir, pre) in ASK_NAME_PREFIXES {
+            // Named folder: any `msal_token_cache.*`.
             let mut v = file_shape(&abs(dir));
-            v.push((SComp::Glob(format!("{pre}*")), true));
+            v.push((SComp::Glob(shape_glob(&format!("{pre}*"))), true));
             ask.push(shape(v, "ask", false));
-            // Past the folder by a `**`: only a file name that spells part of
-            // the store's name (`*token_cache.custom`), not `*.rs`.
+            // Past the folder by a `**`: a file name that pins the stem.
+            let stem = pre.trim_end_matches('.');
             let mut v = lits(&abs(dir));
-            v.push((SComp::Named(pre), true));
+            v.push((
+                SComp::Pinned(shape_glob(&format!("{pre}*")), stem.len()),
+                true,
+            ));
             ask.push(shape(v, "ask", false));
         }
         Self {
@@ -1465,59 +1602,72 @@ const ASK_TREE_SUFFIXES: &[(&str, &[&str])] = &[
 ];
 
 /// Whether pattern component `p` can match shape component `s`.
-fn comp_meets(p: &PComp, s: &SComp, role: Role, loose: bool, budget: &mut Budget) -> bool {
+fn comp_meets(p: &PComp, s: &SComp, role: Role, loose: bool, q: &mut Query) -> Reach {
     let PComp::Pat { atoms, lit, .. } = p else {
-        return true;
+        return Reach::Yes;
     };
-    let mut against = |name: &str| -> bool {
+    let key = p as *const PComp as usize;
+    let against = |name: &str, q: &mut Query| -> Reach {
         if let Some(l) = lit {
-            return l == name;
+            return if l == name { Reach::Yes } else { Reach::No };
         }
-        comp_intersect(atoms, &parse_atoms(name), loose, budget).unwrap_or(true)
+        if let Some(r) = q.cache.get(&(key, name.to_string())) {
+            return *r;
+        }
+        let r = comp_intersect(atoms, &lit_atoms(name), loose, None, &mut q.budget);
+        if r != Reach::Undecided {
+            q.cache.insert((key, name.to_string()), r);
+        }
+        r
     };
     match s {
-        SComp::Named(pre) => {
-            comp_intersect(atoms, &parse_atoms(&format!("{pre}*")), loose, budget).unwrap_or(true)
-                && spells_part_of(atoms, pre)
+        SComp::One | SComp::Any => Reach::Yes,
+        SComp::Lit(name) => against(name, q),
+        SComp::Names(names) => {
+            let mut r = Reach::No;
+            for n in *names {
+                match against(n, q) {
+                    Reach::Yes => return Reach::Yes,
+                    Reach::Undecided => r = Reach::Undecided,
+                    Reach::No => {}
+                }
+            }
+            r
         }
-        SComp::One | SComp::Any => true,
-        SComp::Lit(name) => against(name),
-        SComp::Names(names) => names.iter().any(|n| against(n)),
-        SComp::Glob(g) => comp_intersect(atoms, &parse_atoms(g), loose, budget).unwrap_or(true),
-        SComp::Secret(top) => atoms_may_be_secret(atoms, *top, role),
+        SComp::Glob(g) => comp_intersect(atoms, g, loose, None, &mut q.budget),
+        SComp::Pinned(g, stem) => comp_intersect(atoms, g, loose, Some(*stem), &mut q.budget),
+        SComp::Secret(top) => {
+            if atoms_may_be_secret(atoms, *top, role) {
+                Reach::Yes
+            } else {
+                Reach::No
+            }
+        }
     }
 }
 
 /// Whether pattern `p` can name a path of shape `s`. `keyed`: a component
 /// matching every name only counts against a key when all later ones do too.
-/// Out of budget: `true` (fail closed).
-fn path_meets(
-    p: &PathPat,
-    s: &[(SComp, bool)],
-    role: Role,
-    keyed: bool,
-    budget: &mut Budget,
-) -> bool {
+fn path_meets(p: &PathPat, s: &[(SComp, bool)], role: Role, keyed: bool, q: &mut Query) -> Reach {
     let (n, m) = (p.comps.len(), s.len());
     let s_any = s.iter().any(|c| matches!(c.0, SComp::Any));
     if !p.globstar && !s_any && n != m {
-        return false;
+        return Reach::No;
     }
-    // `**` patterns follow globset (search globs, `dev`): `*` may match a dot.
-    let loose = p.globstar;
+    let loose = p.dstar;
     let w = m + 1;
-    if !budget.take(((n + 1) * w) as u64) {
-        return true;
-    }
-    let mut seen = vec![false; (n + 1) * w];
+    let mut seen = Seen::new((n + 1) * w);
     let mut stack = vec![(0usize, 0usize)];
+    let mut undecided = false;
     while let Some((i, j)) = stack.pop() {
-        if seen[i * w + j] {
+        if !seen.insert(i * w + j) {
             continue;
         }
-        seen[i * w + j] = true;
+        if !q.budget.take(1) {
+            return Reach::Undecided;
+        }
         if i == n && j == m {
-            return true;
+            return Reach::Yes;
         }
         if i < n && matches!(p.comps[i], PComp::GlobStar) {
             stack.push((i + 1, j));
@@ -1542,11 +1692,26 @@ fn path_meets(
         if keyed && s[j].1 && pcatch && !p.tail_catchall[i + 1] {
             continue;
         }
-        if comp_meets(&p.comps[i], &s[j].0, role, loose, budget) {
-            stack.push((ni, nj));
+        match comp_meets(&p.comps[i], &s[j].0, role, loose, q) {
+            Reach::Yes => stack.push((ni, nj)),
+            Reach::Undecided => undecided = true,
+            Reach::No => {}
         }
     }
-    false
+    if undecided {
+        Reach::Undecided
+    } else {
+        Reach::No
+    }
+}
+
+/// What the glob check found for a pattern.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GlobHit {
+    Hit(&'static str),
+    /// Out of budget: the caller asks.
+    Undecided,
+    Miss,
 }
 
 // ---------------------------------------------------------------------------
@@ -2226,11 +2391,8 @@ impl Ctx<'_> {
                 }
             }
         }
-        // The anchored forms of the filter, through the shared matcher
-        // (D-131): `~/.g*/private-keys-v1.d/k.key` names a file no probe has.
-        variants
-            .iter()
-            .find_map(|v| self.s.glob_str_hit(v, Role::Read))
+        // D-131 (owner M1-31 to confirm): the filter through the shared matcher.
+        self.s.search_filter_hit(variants)
     }
 }
 
@@ -2919,27 +3081,4 @@ pub fn sensitive_roots(home: &Path, data: &[PathBuf], protected: &[PathBuf]) -> 
     v.extend(data.iter().cloned());
     v.extend(protected.iter().cloned());
     v
-}
-
-/// Whether the pattern holds a literal run of four or more characters that
-/// is part of `name` (`*token_cache.custom` spells part of
-/// `msal_token_cache.`; `*.rs` and `m*.rs` don't).
-fn spells_part_of(atoms: &[Atom], name: &str) -> bool {
-    let mut run = String::new();
-    for a in atoms.iter().chain(std::iter::once(&Atom::Star)) {
-        match a {
-            Atom::One(s) if s.singleton().is_some() => run.extend(s.singleton()),
-            _ => {
-                let cs: Vec<char> = run.chars().collect();
-                if cs
-                    .windows(4)
-                    .any(|w| name.contains(&w.iter().collect::<String>()))
-                {
-                    return true;
-                }
-                run.clear();
-            }
-        }
-    }
-    false
 }

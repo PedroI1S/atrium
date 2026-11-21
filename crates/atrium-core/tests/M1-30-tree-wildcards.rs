@@ -828,10 +828,16 @@ fn k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree() {
         "src/**/*.rs",
         "**/src/*.rs",
         "**/*.{rs,md}",
-        "**/m*.rs",
     ] {
         check_search(&["~"], false, glob, ["Allow", "Allow", "Allow"]);
     }
+    // Round 3 finding 4: the matcher decides the Azure family, so a name that
+    // pins part of `msal_token_cache` asks (`dev` asks for this search too).
+    check_search(&["~"], false, "**/m*.rs", ["Ask", "Allow", "Allow"]);
+    // `*.cache` covers the whole stem with its wildcard, like `*.rs`: ordinary.
+    // The cache's real names still ask through `dev`'s probes.
+    check_search(&["~"], false, "**/*.cache", ["Allow", "Allow", "Allow"]);
+    check_search(&["~"], false, "**/*.bin", ["Ask", "Allow", "Allow"]);
     // Round 2 finding 6: an explicit Azure folder keeps `msal_token_cache.*`
     // for every extension, so `*.rs` there can be `msal_token_cache.rs`.
     check_search(&["~"], false, ".azure/*.rs", ["Ask", "Allow", "Allow"]);
@@ -844,7 +850,6 @@ fn k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree() {
         "**/*.history",
         "**/token.json",
         "**/cache.json",
-        "**/*.cache",
         // `.cargo/credentials.toml` is in ASK_FILES (CR-12), so `**/*.toml` must Ask.
         "**/*.toml",
         "**/*.{rs,toml}",
@@ -1348,7 +1353,8 @@ fn review2_finding_6_azure_cache_keeps_every_extension() {
             ("~/.azure/m*.rs", ["Ask", "Allow", "Allow"]),
             ("~/.a?ure/*token_cache.custom", ["Ask", "Allow", "Allow"]),
             ("~/.a?ure/config", ["Allow", "Allow", "Allow"]),
-            ("~/**/m*.rs", ["Allow", "Allow", "Allow"]),
+            // Round 3 finding 4: `m*.rs` pins the `m` of `msal_token_cache`.
+            ("~/**/m*.rs", ["Ask", "Allow", "Allow"]),
         ],
     );
 }
@@ -1390,5 +1396,168 @@ fn review2_finding_6_globstar_names_the_azure_cache() {
             ("~/**/msal_*", ["Ask", "Allow", "Allow"]),
             ("~/**/*.custom", ["Allow", "Allow", "Allow"]),
         ],
+    );
+}
+
+/// Verdicts of a non-recursive `Search` of `roots` with `glob` in Home,
+/// Home with `Any → Allow`, and FullAccess.
+fn search_verdicts(env: &Env, roots: &[&str], glob: &str) -> [String; 3] {
+    let any_search = vec![rule(
+        RuleScope::Global,
+        ToolKind::Search,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "any-search",
+    )];
+    let c = paths_check(ToolKind::Search, "Search", roots, false, Some(glob));
+    [
+        classify(&env.eval_check(&c, &[], Preset::Home)),
+        classify(&env.eval_check(&c, &any_search, Preset::Home)),
+        classify(&env.eval_check(&c, &[], Preset::FullAccess)),
+    ]
+}
+
+fn check_searches(env: &Env, rows: &[(&str, [&str; 3])]) {
+    let mut failures = vec![];
+    for (glob, want) in rows {
+        let got = search_verdicts(env, &["~"], glob);
+        if got.iter().map(String::as_str).ne(want.iter().copied()) {
+            failures.push(format!("Search [~] {glob:?}: wanted {want:?}, got {got:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Round 3, finding 1: matching is over bytes; a negated (or non-ASCII)
+/// class matches any non-ASCII character, so `[!é]` can be `á`.
+#[test]
+fn review3_finding_1_negated_unicode_classes_reach_atrium_folders() {
+    let mut env = Env::home();
+    env.data.push(format!("{HOME}/átrium").into());
+    let hard = format!("Hard({AS})");
+    check_reads(
+        &env,
+        &[
+            ("/h/u/[!é]trium/secret", [&hard, &hard, &hard]),
+            ("/h/u/[!a]trium/secret", [&hard, &hard, &hard]),
+            ("/h/u/[á]trium/secret", [&hard, &hard, &hard]),
+            ("/h/u/[à-â]trium/secret", [&hard, &hard, &hard]),
+            ("/h/u/?trium/secret", [&hard, &hard, &hard]),
+            ("/h/u/*trium/secret", [&hard, &hard, &hard]),
+            ("/h/u/[!á]trium/secret", [&hard, &hard, &hard]),
+        ],
+    );
+    run_table(
+        &env,
+        &[
+            ("cat /h/u/[!é]trium/secret", Want::Hard(AS)),
+            ("cat ~/?trium/x", Want::Hard(AS)),
+        ],
+    );
+}
+
+/// Round 3, finding 2: `dev`'s matcher read any spelling holding `**`
+/// (even inside a component) with `*` matching a leading dot; the floor
+/// keeps that.
+#[test]
+fn review3_finding_2_embedded_globstar_keeps_devs_hard_deny() {
+    let env = Env::home();
+    run_table(
+        &env,
+        &[
+            ("cat ~/**ssh/id_rsa", Want::Hard(CR)),
+            ("cat ~/**gnupg/x", Want::Hard(CR)),
+            ("cat ~/a/../**ssh/id_rsa", Want::Hard(CR)),
+        ],
+    );
+}
+
+/// Round 3, finding 3: an ask tree's files at any depth, past a `**`.
+#[test]
+fn review3_finding_3_session_families_reach_ask_tree_descendants() {
+    let env = Env::home();
+    check_searches(
+        &env,
+        &[
+            ("**/foo/b.session", ["Ask", "Allow", "Allow"]),
+            ("**/foo/bar/b.history", ["Ask", "Allow", "Allow"]),
+            ("**/foo/*.rs", ["Allow", "Allow", "Allow"]),
+        ],
+    );
+    check_reads(
+        &env,
+        &[
+            ("~/**/foo/b.session", ["Ask", "Allow", "Allow"]),
+            ("~/**/foo/b.rs", ["Allow", "Allow", "Allow"]),
+        ],
+    );
+}
+
+/// Round 3, finding 4: a file name pins part of the Azure cache's own name
+/// (decided by the matcher, not by counting literals).
+#[test]
+fn review3_finding_4_azure_cache_searches_are_decided_by_the_matcher() {
+    let env = Env::home();
+    check_searches(
+        &env,
+        &[
+            ("**/ms?l_*.custom", ["Ask", "Allow", "Allow"]),
+            ("**/m?al*", ["Ask", "Allow", "Allow"]),
+            ("**/[m]*.custom", ["Ask", "Allow", "Allow"]),
+            ("**/*e.custom", ["Ask", "Allow", "Allow"]),
+            ("**/*token_cache.custom", ["Ask", "Allow", "Allow"]),
+            ("**/*.custom", ["Allow", "Allow", "Allow"]),
+            ("**/*.rs", ["Allow", "Allow", "Allow"]),
+        ],
+    );
+    check_reads(
+        &env,
+        &[
+            ("~/**/ms?l_*.custom", ["Ask", "Allow", "Allow"]),
+            ("~/**/*.custom", ["Allow", "Allow", "Allow"]),
+        ],
+    );
+}
+
+/// Round 3, finding 5: class openers that never close are read in linear,
+/// budgeted work.
+#[test]
+fn review3_finding_5_unclosed_classes_parse_in_bounded_work() {
+    let env = Env::home();
+    let t = std::time::Instant::now();
+    let line = format!("cat ~/src/{}.rs", "[".repeat(32768));
+    check_4_settings(&env, &[(line.as_str(), ["Ask", "Ask", "Allow", "Allow"])]);
+    let escaped = format!("~/src/{}x.rs", "[\\".repeat(16000));
+    let got = read_verdicts(&env, &escaped);
+    assert!(
+        got.iter().all(|v| !v.starts_with("Hard")),
+        "Read of escaped openers: {got:?}"
+    );
+    let posix = format!("~/src/{}x.rs", "[[:".repeat(10000));
+    let got = read_verdicts(&env, &posix);
+    assert!(
+        got.iter().all(|v| !v.starts_with("Hard")),
+        "Read of POSIX openers: {got:?}"
+    );
+    // A generous ceiling: the quadratic version did over 500 million steps.
+    assert!(t.elapsed() < std::time::Duration::from_secs(20));
+}
+
+/// Round 3, finding 6: running out of budget is Ask, never an invented
+/// hard deny.
+#[test]
+fn review3_finding_6_budget_exhaustion_asks_and_never_hard_denies() {
+    let env = Env::home();
+    let line = format!("cat ~/{}*/notes.txt", "a".repeat(50000));
+    check_4_settings(&env, &[(line.as_str(), ["Ask", "Ask", "Allow", "Allow"])]);
+    let wide = format!("cat ~/{}/notes.txt", "*a".repeat(20000));
+    check_4_settings(&env, &[(wide.as_str(), ["Ask", "Ask", "Allow", "Allow"])]);
+    // A plain path that is hard-denied stays hard-denied however long the rest.
+    run_table(
+        &env,
+        &[(
+            &format!("cat ~/.gnupg/{}*", "a".repeat(50000)),
+            Want::Hard(CR),
+        )],
     );
 }
