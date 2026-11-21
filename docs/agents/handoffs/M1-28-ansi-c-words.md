@@ -316,3 +316,40 @@ pnpm --dir app typecheck
 pnpm --dir app test -- markdown.test.ts
 pnpm --dir app build
 ```
+
+---
+
+## 12. Neon round (D-134)
+
+Continued from Opus's unchecked WIP commit (`6e0728f`) to close every finding of Codex review round 2 (`.orchestration/review-input/review-round2.md`).
+
+1. **Finding 1 (Unreadable ANSI-C words still allow) — Fixed:** Kept Opus's WIP propagation of `shell::UNDECODABLE` across top-level words, `${…}` defaults, substitutions, `-c` payloads, piped texts, `find -exec`, backtick backslash preservation, and `engine.rs` `unknown` so undecodable `$'…'` words (`$'\xff'`, `$'\ud800'`, `$'unterminated`, etc.) always `Ask` everywhere (while hard denies still run first), and added escaped ANSI-C redirection target cases; pinned by `round2_f1_undecodable_ansi_c_words_never_allow` and `s7_ordinary_and_fail_closed_ansi_c_keep_safe_verdicts` in [`crates/atrium-core/tests/M1-28-ansi-c-words.rs`](crates/atrium-core/tests/M1-28-ansi-c-words.rs).
+2. **Finding 2 (Custom Atrium roots remain absent from globbed `cd` candidates) — Fixed:** Added `cd_protected_roots` in [`crates/atrium-core/src/policy/deny.rs`](crates/atrium-core/src/policy/deny.rs) deriving all protected roots (direct hard-deny roots first, including supplied `atrium_data_paths` and `atrium_protected_paths`, then ask roots and ancestors) from the shared `deny.rs` protection catalogue, passed them into `words::walk`, and removed the duplicated `SENSITIVE_CD_DIRS`/`SENSITIVE_CD_TREES` tables from [`crates/atrium-core/src/policy/words.rs`](crates/atrium-core/src/policy/words.rs); pinned by `round2_f2_custom_atrium_roots_in_globbed_cd_are_hard_denied` in [`crates/atrium-core/tests/M1-28-ansi-c-words.rs`](crates/atrium-core/tests/M1-28-ansi-c-words.rs).
+3. **Finding 3 (Directory candidates still discard reachable depths) — Fixed:** Enabled descendant-tail matching for every protected root (including `.aws`, `.config/gh`, and custom Atrium paths), replaced the fixed `0..=3` globstar cap with demand-driven `needed_upward_depths` (preserving `**` continuations when `**` matches a root and accounting for chained `cd`s), deduplicated raw paths before `resolve` to preserve gate/engine alignment, and added a single per-check `CdGlobBudget` + `Walk::cd_glob_unbounded` → `Analysis::cd_glob_unbounded` → `engine.rs` `unknown` fail-closed path (`Ask` everywhere on budget/depth/loop/seen overflow, never `Allow`); pinned by `round2_f3_globbed_cd_preserves_descendant_and_globstar_depths` in [`crates/atrium-core/tests/M1-28-ansi-c-words.rs`](crates/atrium-core/tests/M1-28-ansi-c-words.rs).
+4. **Finding 4 (Fish discovery still corrupts the final PATH entry) — Fixed:** Updated `login_shell_path_command` for `fish` in [`crates/atrium-daemon/src/lib.rs`](crates/atrium-daemon/src/lib.rs) to `"printf '__ATRIUM_PATH_START__%s__ATRIUM_PATH_END__' (string join : -- $PATH)"` (fish command substitution strips `string join`'s trailing newline before `printf`, whereas `-n` only drops empty items) and fixed `fake_fish` to emit `\n` for bare `string join` both with and without `-n`; pinned by `fish_shell_detection_and_marker_extraction` in [`crates/atrium-daemon/src/lib.rs`](crates/atrium-daemon/src/lib.rs) and `atriumd_discovers_fish_login_shell_path_and_never_fails_on_bad_shell` in [`crates/atrium-daemon/tests/M1-28-followups.rs`](crates/atrium-daemon/tests/M1-28-followups.rs).
+5. **Finding 5 (Late orphan withdrawals can enter a channel that is never drained again) — Fixed:** Closed `self.internal_rx.close()` before the final `drain_internal_withdrawals()` in [`crates/atrium-agents/src/claude/adapter.rs`](crates/atrium-agents/src/claude/adapter.rs) (`finish` and `run`, also pinning/enabling `gate_settled.notified()` in `wait_for_in_flight_gates`) and [`crates/atrium-agents/src/codex/adapter.rs`](crates/atrium-agents/src/codex/adapter.rs) (`run`), so any `OrphanGuard` dropping after the 500 ms cap while terminal event delivery is blocked immediately takes the direct `gate.withdraw` fallback; pinned by `claude_late_orphan_withdrawal_after_cap_with_event_backpressure` and `codex_late_orphan_withdrawal_after_cap_with_event_backpressure` in [`crates/atrium-agents/tests/M1-28-followups.rs`](crates/atrium-agents/tests/M1-28-followups.rs).
+6. **Finding 6 (Malformed link destinations still cause quadratic markdown parsing) — Fixed:** Added `LinkScanState` (`lastParen`, `lastGt`, monotonic `angleFailBefore`, `lastDQuote`, `lastSQuote`, and an aggregate `budget = Math.max(4096, s.length * 4)`) to `linkTail` and `parseInline` in [`app/src/chat/markdown.ts`](app/src/chat/markdown.ts) so malformed `<...>` destinations and unclosed link titles scan strictly in $O(N)$ aggregate time; pinned by `"malformed link destinations and titles scale linearly"` in [`app/src/chat/markdown.test.ts`](app/src/chat/markdown.test.ts).
+
+**Hunks outside the original brief's owned ranges (minimal, zero overlap with M1-27/M1-29/M1-30/M1-31/M1-32):**
+- [`crates/atrium-core/src/policy/engine.rs`](crates/atrium-core/src/policy/engine.rs) (`DefaultPolicy::evaluate`, ~935–943): added `a.cd_glob_unbounded` and `shell::UNDECODABLE` (from Opus WIP `6e0728f`) to `unknown` (required for round-2 findings 1 and 3).
+- [`crates/atrium-core/src/policy/deny.rs`](crates/atrium-core/src/policy/deny.rs) (`Analysis::cd_glob_unbounded` ~43, `cd_protected_roots` ~197, `words::walk` call sites in `analyze_with` ~302 and ~391): passes the shared protection catalogue and supplied Atrium paths into `words::walk` (required for round-2 finding 2; untouched by sibling tasks).
+
+**Checks run after Neon round (D-123):**
+- `cargo fmt --all`: exited 0
+- `cargo check -p atrium-core --tests`: exited 0 (0 warnings)
+- `cargo check -p atrium-daemon --tests`: exited 0 (0 warnings)
+- `cargo check -p atrium-agents --tests`: exited 0 (0 warnings)
+
+**Verification commands for Neon round (fish):**
+```fish
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core --test M1-28-ansi-c-words
+cargo test -p atrium-core --test adversarial_policy finding_4_ansi_c_quoted_words_are_decoded
+cargo test -p atrium-daemon --lib fish_shell_detection_and_marker_extraction
+cargo test -p atrium-daemon --test M1-28-followups atriumd_discovers_fish_login_shell_path_and_never_fails_on_bad_shell
+cargo test -p atrium-agents --test M1-28-followups
+pnpm --dir app typecheck
+pnpm --dir app test -- markdown.test.ts client.test.ts
+pnpm --dir app build
+```
