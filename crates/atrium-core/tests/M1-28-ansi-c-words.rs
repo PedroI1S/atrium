@@ -184,7 +184,10 @@ fn s7_ordinary_and_fail_closed_ansi_c_keep_safe_verdicts() {
         // Invalid bytes/scalars must preserve word identity (no false HardDeny)
         // and can't be decoded exactly (Ask everywhere)
         (r"cat $'\xff.aws/credentials'", ["Ask", "Ask", "Ask", "Ask"]),
-        (r"cat $'\ud800.aws/credentials'", ["Ask", "Ask", "Ask", "Ask"]),
+        (
+            r"cat $'\ud800.aws/credentials'",
+            ["Ask", "Ask", "Ask", "Ask"],
+        ),
         (
             r"cat $'\U00110000.aws/credentials'",
             ["Ask", "Ask", "Ask", "Ask"],
@@ -230,13 +233,19 @@ fn round2_f1_undecodable_ansi_c_words_never_allow() {
         (r"echo hi > $'\ud800'", ask),
         (r"cat <<< $'\zfoo'", ask),
     ]);
-    // A hard deny elsewhere on the line still wins.
+    // A hard deny elsewhere on the line still wins, and escaped ANSI-C
+    // redirection targets decode and hard-deny like ordinary path words.
     hard_everywhere(&[
         r"cat $'\xff' ~/.ssh/id_rsa",
         r"cat $'\x2essh/id_rsa' $'\ud800'",
         r"sh -c $'cat ~/.ssh/id_rsa \xff'",
         // backticks keep a backslash that doesn't quote `$`, `` ` `` or `\`
         r"echo `cat $'\x2essh/id_rsa'`",
+        // escaped ANSI-C redirection targets
+        r"cat < $'.ssh/\x69d_rsa'",
+        r"cat < $'\056ssh/id_rsa'",
+        r"echo hi > $'\x2eaws/credentials'",
+        r"echo hi >> $'.local/sh\x61re/atrium/atrium.db'",
     ]);
 }
 
@@ -326,6 +335,83 @@ fn finding_11_cd_glob_reaching_sensitive_dirs_is_caught() {
             ["Ask", "Ask", "Allow", "Allow"],
         ),
         ("cd p*/sub; ls", ["Ask", "Ask", "Allow", "Allow"]),
+    ]);
+}
+
+/// Round 2, finding 2: custom supplied `atrium_data_paths` and
+/// `atrium_protected_paths` are passed into globbed `cd` tracking from the
+/// shared protection catalogue.
+#[test]
+fn round2_f2_custom_atrium_roots_in_globbed_cd_are_hard_denied() {
+    let mut env = Env::home();
+    env.data = vec![format!("{HOME}/atrium-state").into()];
+    env.prot = vec!["/opt/custom-atrium".into()];
+
+    for line in [
+        // the reviewer's exact case
+        "cd atrium-st?te/dbs; cat atrium.db",
+        "cd atrium-st?te; cat atrium.db",
+        concat!("cd atrium-st?te/a/b; cat ..", "/../atrium.db"),
+        "cd /opt/custom-atr?um/bin; rm x",
+    ] {
+        for (label, rules, preset) in settings() {
+            let v = env.eval_check(&cmd_check(line), &rules, preset);
+            assert!(
+                matches!(v, PolicyVerdict::HardDeny { id } if id == "atrium-self"),
+                "{line:?} [{label}]: expected HardDeny(atrium-self), got {}",
+                classify(&v)
+            );
+        }
+    }
+}
+
+/// Round 2, finding 3: descendant depths are preserved for all protected
+/// directories (including `.aws`) and for globstar (`**`) targets at any
+/// reachable traversal depth; unbounded globstar traversals fail closed to Ask.
+#[test]
+fn round2_f3_globbed_cd_preserves_descendant_and_globstar_depths() {
+    hard_everywhere(&[
+        // the reviewer's exact cases
+        concat!("cd .a?s/a/b; cat ..", "/../credentials"),
+        concat!(
+            "shopt -s globstar; cd .ss?/**/leaf; cat ..",
+            "/../../../../id_rsa"
+        ),
+        // deeper traversals and chained cd steps
+        concat!(
+            "shopt -s globstar; cd .ss?/**/leaf; cat ..",
+            "/../../../../../../../../../id_rsa"
+        ),
+        concat!(
+            "shopt -s globstar; cd .ss?/**/leaf; cd ..",
+            "/..; cd ../../..; cat id_rsa"
+        ),
+        concat!(
+            "shopt -s globstar; cd .ss?/**/leaf; cd sub; cat ..",
+            "/../../../../../id_rsa"
+        ),
+        concat!(
+            "shopt -s globstar; cd .a?s/**/leaf; cat ..",
+            "/../../../../credentials"
+        ),
+        concat!(
+            "shopt -s globstar; cd .config/**/sub; cat ..",
+            "/../../'Login Data'"
+        ),
+        concat!("cd .config/g?/sub; cat ..", "/hosts.yml"),
+    ]);
+
+    // Ordinary file inside `.aws/a/b` climbing up to non-sensitive sibling keeps safe verdicts.
+    check_table(&[
+        (
+            concat!("cd .a?s/a/b; cat ..", "/../notes.txt"),
+            ["Ask", "Ask", "Allow", "Allow"],
+        ),
+        // Unbounded loop climbing `..` after a globstar `cd`: fail closed to Ask everywhere.
+        (
+            "shopt -s globstar; cd .a?s/**/leaf; for i in 1 2 3; do cd ..; done; cat notes.txt",
+            ["Ask", "Ask", "Ask", "Ask"],
+        ),
     ]);
 }
 

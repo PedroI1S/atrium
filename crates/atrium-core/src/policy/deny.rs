@@ -40,6 +40,9 @@ pub struct Analysis {
     /// An unknown `env`/`command` invocation whose readings could not be
     /// bounded and whose words may be dangerous (M1-18, K1 fail-closed).
     pub unbounded_unknown_dangerous: bool,
+    /// A globbed `cd` target exceeded its matching/candidate budget or could
+    /// not be bounded (M1-28 fail-closed: Ask everywhere, never Allow).
+    pub cd_glob_unbounded: bool,
     /// Text the raw-string checks run on.
     pub raw: Vec<String>,
     /// The starting directory of a command.
@@ -191,6 +194,63 @@ fn path_like(s: &str) -> bool {
             || s.starts_with('.'))
 }
 
+/// Directories derived from the shared protection catalogue and the call's
+/// supplied Atrium paths, used by `words::walk` when a `cd` target is a glob.
+fn cd_protected_roots(input: &PolicyInput<'_>) -> Vec<PathBuf> {
+    let home = input.home;
+    let mut direct: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push_one = |p: PathBuf, dst: &mut Vec<PathBuf>| {
+        let norm = words::normalize(&p);
+        let key = lower(&norm);
+        if key != "/" && seen.insert(key) {
+            dst.push(norm);
+        }
+    };
+    // Direct hard-deny roots first so budget pressure never drops them behind
+    // ancestors or ask-only directories.
+    push_one(home.join(".ssh"), &mut direct);
+    for p in input
+        .atrium_data_paths
+        .iter()
+        .chain(input.atrium_protected_paths.iter())
+    {
+        push_one(p.clone(), &mut direct);
+    }
+    for rel in CRED_FILES {
+        if let Some(parent) = home.join(rel).parent() {
+            push_one(parent.to_path_buf(), &mut direct);
+        }
+    }
+    for rel in CRED_TREES.iter().chain(BROWSER_ROOTS.iter()) {
+        push_one(home.join(rel), &mut direct);
+    }
+    for rel in ASK_FILES {
+        if let Some(parent) = home.join(rel).parent() {
+            push_one(parent.to_path_buf(), &mut direct);
+        }
+    }
+    for rel in ASK_TREES {
+        push_one(home.join(rel), &mut direct);
+    }
+    for (dir, _) in ASK_NAME_PREFIXES {
+        push_one(home.join(dir), &mut direct);
+    }
+    let mut ancestors: Vec<PathBuf> = Vec::new();
+    for p in &direct {
+        let mut cur = p.as_path();
+        while let Some(parent) = cur.parent() {
+            if parent == cur {
+                break;
+            }
+            push_one(parent.to_path_buf(), &mut ancestors);
+            cur = parent;
+        }
+    }
+    direct.extend(ancestors);
+    direct
+}
+
 pub fn analyze(input: &PolicyInput<'_>) -> Analysis {
     analyze_with(input, &lexical_resolve)
 }
@@ -211,12 +271,14 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
         cwd_uncertain: false,
         overflow: false,
         unbounded_unknown_dangerous: false,
+        cd_glob_unbounded: false,
         raw: vec![],
         start: input.cwd.to_path_buf(),
         glob_escape: None,
         glob_search: None,
     };
     let s_for_unknown = Sensitive::new(input);
+    let cd_roots = cd_protected_roots(input);
     let lex_cmd = |a: &mut Analysis, line: &str, start: &Path| {
         if line.len() > MAX_BYTES {
             a.overflow = true;
@@ -237,8 +299,9 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
             a.overflow = true;
             return;
         }
-        let walk: Walk = words::walk(&a.units, start, home, resolve);
+        let walk: Walk = words::walk(&a.units, start, home, &cd_roots, resolve);
         a.overflow |= walk.overflow;
+        a.cd_glob_unbounded |= walk.cd_glob_unbounded;
         a.unit_cwd = walk.unit_cwd.clone();
         a.cwd_unknown = walk.unknown;
         a.uses = walk.uses;
@@ -327,8 +390,9 @@ pub fn analyze_with(input: &PolicyInput<'_>, resolve: words::Resolver<'_>) -> An
                 a.overflow = true;
                 return a;
             }
-            let walk = words::walk(&a.units, input.cwd, home, resolve);
+            let walk = words::walk(&a.units, input.cwd, home, &cd_roots, resolve);
             a.overflow |= walk.overflow;
+            a.cd_glob_unbounded |= walk.cd_glob_unbounded;
             a.unit_cwd = walk.unit_cwd.clone();
             a.cwd_unknown = walk.unknown;
             a.uses = walk.uses;

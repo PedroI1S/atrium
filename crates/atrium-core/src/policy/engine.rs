@@ -937,6 +937,7 @@ impl PolicyEngine for DefaultPolicy {
         let unknown = matches!(input.check.subject, ToolSubject::Unknown)
             || a.unbounded_unknown_dangerous
             || glob_unbounded
+            || a.cd_glob_unbounded
             || a.reasons.iter().any(|r| r == shell::UNDECODABLE);
         let command = matches!(input.check.subject, ToolSubject::Command { .. });
         if !unknown

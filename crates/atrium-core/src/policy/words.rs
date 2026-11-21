@@ -376,6 +376,9 @@ pub struct Walk {
     pub total: usize,
     /// The call is bigger than the checker will take on.
     pub overflow: bool,
+    /// A globbed `cd` target exceeded its matching/candidate budget or could
+    /// not be bounded (fail-closed: Ask everywhere, never Allow).
+    pub cd_glob_unbounded: bool,
 }
 
 pub const MAX_USES: usize = 4096;
@@ -892,68 +895,42 @@ enum Cd {
     Moved(Vec<PathBuf>),
     /// The engine can't say where the shell is (`popd`, `pushd`, `cd -`,
     /// `cd $X`, a `cd` in a subshell or pipeline, options it can't read);
-    /// these are the targets it can name.
-    Lost(Vec<PathBuf>),
+    /// these are the targets it can name, plus whether they came from a glob.
+    Lost(Vec<PathBuf>, bool),
 }
 
-/// The effect of `unit` if it changes directory, resolved against every
-/// directory the shell may be in (`cands`). `followed`: where it goes can be
-/// followed (not in a pipeline or the background).
-/// Directories under `home` that hold credentials or Atrium data/config, or
-/// lead to them; a `cd <glob>` that can match any of them includes them in
-/// `Cd::Lost` so subsequent commands are checked against those directories.
-const SENSITIVE_CD_DIRS: &[&str] = &[
-    ".aws",
-    ".aws/sso",
-    ".docker",
-    ".kube",
-    ".config",
-    ".config/gh",
-    ".config/git",
-    ".config/fish",
-    ".claude",
-    ".codex",
-    ".cargo",
-    ".azure",
-    ".local",
-    ".local/share",
-    ".local/share/fish",
-    "Library",
-    "Library/Application Support",
-    "Library/Application Support/Google",
-];
-
-/// Credential and Atrium trees where any subdirectory inside them is sensitive.
-const SENSITIVE_CD_TREES: &[&str] = &[
-    ".ssh",
-    ".gnupg",
-    ".config/gcloud",
-    ".gemini",
-    "Library/Keychains",
-    ".local/share/atrium",
-    ".config/atrium",
-    ".aws/sso/cache",
-    ".zsh_sessions",
-    ".bash_sessions",
-    "Library/Application Support/Google/Chrome",
-    "Library/Application Support/Chromium",
-    "Library/Application Support/Microsoft Edge",
-    "Library/Application Support/BraveSoftware",
-    "Library/Application Support/Firefox",
-    "Library/Application Support/Arc",
-    "Library/Application Support/Vivaldi",
-    "Library/Cookies",
-    ".config/google-chrome",
-    ".config/chromium",
-    ".config/bravesoftware",
-    ".config/microsoft-edge",
-    ".config/vivaldi",
-    ".mozilla",
-];
-
 const MAX_CD_GLOB_VARIANTS: usize = 16;
+const MAX_CD_GLOB_WORK: usize = 16_384;
+const MAX_GLOBSTAR_DEPTH: usize = 256;
+const MAX_NEEDED_DEPTHS: usize = 16;
 
-fn normalize_cd_glob(pat: &str) -> Vec<Vec<String>> {
+/// One budget per `walk` call for globbed `cd` candidate matching. Once spent
+/// (or when a representation limit is exceeded), `unbounded` flips true so the
+/// engine fails closed to `Ask` everywhere instead of silently truncating.
+struct CdGlobBudget {
+    steps: usize,
+    unbounded: bool,
+}
+
+impl CdGlobBudget {
+    fn new() -> Self {
+        Self {
+            steps: 0,
+            unbounded: false,
+        }
+    }
+
+    fn charge(&mut self, n: usize) -> bool {
+        self.steps = self.steps.saturating_add(n);
+        if self.steps > MAX_CD_GLOB_WORK {
+            self.unbounded = true;
+            return false;
+        }
+        true
+    }
+}
+
+fn normalize_cd_glob(pat: &str, budget: &mut CdGlobBudget) -> Vec<Vec<String>> {
     let abs = pat.starts_with('/');
     let folded = pat.replace('ſ', "s");
     let mut states: Vec<Vec<String>> = vec![vec![]];
@@ -970,6 +947,10 @@ fn normalize_cd_glob(pat: &str) -> Vec<Vec<String>> {
             ".." => {
                 let mut next = Vec::new();
                 for mut st in states {
+                    if !budget.charge(1) {
+                        next.push(st);
+                        break;
+                    }
                     match st.last().map(String::as_str) {
                         None => {
                             if !abs {
@@ -1002,13 +983,17 @@ fn normalize_cd_glob(pat: &str) -> Vec<Vec<String>> {
                             next.push(st);
                         }
                     }
-                    if next.len() >= MAX_CD_GLOB_VARIANTS {
+                    if next.len() > MAX_CD_GLOB_VARIANTS {
+                        budget.unbounded = true;
                         break;
                     }
                 }
                 next.sort();
                 next.dedup();
-                next.truncate(MAX_CD_GLOB_VARIANTS);
+                if next.len() > MAX_CD_GLOB_VARIANTS {
+                    budget.unbounded = true;
+                    next.truncate(MAX_CD_GLOB_VARIANTS);
+                }
                 states = next;
             }
             other => {
@@ -1136,12 +1121,29 @@ fn leading_class_matches_dot(p: &str) -> bool {
     bracket_matches_char(false, &items, '.')
 }
 
-fn cd_comp_matches(pat: &str, cand: &str) -> bool {
+fn cd_comp_matches(pat: &str, cand: &str, budget: &mut CdGlobBudget) -> bool {
     if cand.starts_with('.') && !(pat.starts_with('.') || leading_class_matches_dot(pat)) {
         return false;
     }
+    if !pat.contains(['*', '?', '[']) {
+        if !budget.charge(1) {
+            return false;
+        }
+        return if pat.is_ascii() && cand.is_ascii() {
+            pat.eq_ignore_ascii_case(cand)
+        } else {
+            pat.to_lowercase() == cand.to_lowercase()
+        };
+    }
     let p: Vec<char> = pat.chars().collect();
     let c: Vec<char> = cand.chars().collect();
+    let cost = p
+        .len()
+        .saturating_add(1)
+        .saturating_mul(c.len().saturating_add(1));
+    if !budget.charge(cost) {
+        return false;
+    }
     let mut dp = vec![false; c.len() + 1];
     dp[0] = true;
     let mut pi = 0;
@@ -1188,11 +1190,26 @@ fn cd_comp_matches(pat: &str, cand: &str) -> bool {
     dp[c.len()]
 }
 
-fn cd_comps_match(pat: &[String], cand: &[&str]) -> bool {
-    pat.len() == cand.len() && pat.iter().zip(cand).all(|(p, c)| cd_comp_matches(p, c))
+fn cd_comps_match(pat: &[String], cand: &[&str], budget: &mut CdGlobBudget) -> bool {
+    if pat.len() != cand.len() {
+        return false;
+    }
+    for (p, c) in pat.iter().zip(cand) {
+        if !cd_comp_matches(p, c, budget) {
+            return false;
+        }
+    }
+    true
 }
 
-fn cd_comps_match_globstar(pat: &[String], cand: &[&str]) -> bool {
+fn cd_comps_match_globstar(pat: &[String], cand: &[&str], budget: &mut CdGlobBudget) -> bool {
+    if !budget.charge(
+        pat.len()
+            .saturating_mul(cand.len().saturating_add(1))
+            .max(1),
+    ) {
+        return false;
+    }
     let mut dp = vec![false; cand.len() + 1];
     dp[0] = true;
     for p in pat {
@@ -1204,15 +1221,142 @@ fn cd_comps_match_globstar(pat: &[String], cand: &[&str]) -> bool {
             }
         } else {
             for j in (1..=cand.len()).rev() {
-                dp[j] = dp[j - 1] && cd_comp_matches(p, cand[j - 1]);
+                dp[j] = dp[j - 1] && cd_comp_matches(p, cand[j - 1], budget);
             }
             dp[0] = false;
+        }
+        if budget.unbounded {
+            return false;
         }
     }
     dp[cand.len()]
 }
 
-fn push_tree_tail(base: &str, tail: &[String], push_target: &mut impl FnMut(String)) {
+fn upward_depth(word: &str) -> usize {
+    let mut depth: isize = 0;
+    let mut min_depth: isize = 0;
+    for comp in word.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < min_depth {
+                    min_depth = depth;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    (-min_depth) as usize
+}
+
+fn downward_depth(word: &str) -> usize {
+    let mut depth: isize = 0;
+    for comp in word.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+    }
+    depth.max(0) as usize
+}
+
+fn needed_upward_depths(units: &[Unit], after_idx: usize, budget: &mut CdGlobBudget) -> Vec<usize> {
+    let mut depths: Vec<usize> = vec![0];
+    let mut record = |d: usize, budget: &mut CdGlobBudget| {
+        if d > MAX_GLOBSTAR_DEPTH {
+            budget.unbounded = true;
+            return;
+        }
+        if !depths.contains(&d) {
+            if depths.len() >= MAX_NEEDED_DEPTHS {
+                budget.unbounded = true;
+                return;
+            }
+            depths.push(d);
+        }
+    };
+    let mut cum_cd_up: usize = 0;
+    let mut cum_cd_down: usize = 0;
+    for u in &units[after_idx + 1..] {
+        if !budget.charge(1) {
+            break;
+        }
+        let is_cd = u
+            .eff
+            .first()
+            .is_some_and(|f| matches!(base(f), "cd" | "pushd" | "chdir"));
+        let in_repeat = u
+            .compound
+            .iter()
+            .any(|(kind, _)| matches!(kind, Compound::Loop | Compound::Func));
+        let mut cd_step_up = 0usize;
+        let mut cd_step_down = 0usize;
+        for (wi, w) in u.eff.iter().enumerate() {
+            let up = upward_depth(w);
+            if up > 0 {
+                record(up, budget);
+                record(cum_cd_up.saturating_add(up), budget);
+                if cum_cd_down > 0 {
+                    record(up.saturating_sub(cum_cd_down), budget);
+                }
+                if is_cd && wi > 0 {
+                    cd_step_up = cd_step_up.max(up);
+                    if in_repeat {
+                        budget.unbounded = true;
+                    }
+                }
+            }
+            if is_cd
+                && wi > 0
+                && !w.starts_with('-')
+                && !Path::new(w).is_absolute()
+                && !w.starts_with('~')
+            {
+                cd_step_down = cd_step_down.max(downward_depth(w));
+            }
+            if let Some((_, val)) = w.split_once('=') {
+                let vup = upward_depth(val);
+                if vup > 0 {
+                    record(vup, budget);
+                    record(cum_cd_up.saturating_add(vup), budget);
+                    if cum_cd_down > 0 {
+                        record(vup.saturating_sub(cum_cd_down), budget);
+                    }
+                }
+            }
+        }
+        for r in &u.seg.redirects {
+            let up = upward_depth(&r.target);
+            if up > 0 {
+                record(up, budget);
+                record(cum_cd_up.saturating_add(up), budget);
+                if cum_cd_down > 0 {
+                    record(up.saturating_sub(cum_cd_down), budget);
+                }
+            }
+        }
+        if is_cd {
+            if cd_step_up > 0 {
+                cum_cd_up = cum_cd_up.saturating_add(cd_step_up);
+                record(cum_cd_up, budget);
+            }
+            if cd_step_down > 0 {
+                cum_cd_down = cum_cd_down.saturating_add(cd_step_down);
+            }
+        }
+    }
+    depths
+}
+
+fn push_tree_tail(
+    base: &str,
+    tail: &[String],
+    needed_ups: &[usize],
+    budget: &mut CdGlobBudget,
+    push_target: &mut impl FnMut(String),
+) {
     if tail.is_empty() {
         push_target(base.to_string());
         return;
@@ -1234,7 +1378,37 @@ fn push_tree_tail(base: &str, tail: &[String], push_target: &mut impl FnMut(Stri
             .filter(|c| c.as_str() != "**")
             .map(|c| concretize_comp(c))
             .collect();
-        for depth in 0..=3 {
+        let net_comps = |comps: &[String]| -> isize {
+            let mut d: isize = 0;
+            for c in comps {
+                if c == ".." {
+                    d -= 1;
+                } else if !c.is_empty() && c != "." {
+                    d += 1;
+                }
+            }
+            d
+        };
+        let fixed_net = net_comps(&pre) + net_comps(&post);
+        let mut emit_depths: Vec<usize> = vec![0];
+        for &up in needed_ups {
+            let target_d = (up as isize) - fixed_net;
+            if target_d >= 0 {
+                let d = target_d as usize;
+                if d > MAX_GLOBSTAR_DEPTH {
+                    budget.unbounded = true;
+                } else if !emit_depths.contains(&d) {
+                    emit_depths.push(d);
+                }
+            }
+        }
+        if pre.is_empty() && post.is_empty() && !emit_depths.contains(&1) {
+            emit_depths.push(1);
+        }
+        for depth in emit_depths {
+            if !budget.charge(depth + 1) {
+                break;
+            }
             let mut comps = pre.clone();
             comps.extend(std::iter::repeat_n("x".to_string(), depth));
             comps.extend(post.iter().cloned());
@@ -1250,15 +1424,18 @@ fn push_tree_tail(base: &str, tail: &[String], push_target: &mut impl FnMut(Stri
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cd_glob_matches(
     expanded: &str,
     cands: &[PathBuf],
     start: &Path,
     home: &Path,
+    protected_roots: &[PathBuf],
+    units: &[Unit],
+    unit_idx: usize,
+    budget: &mut CdGlobBudget,
     resolve: Resolver<'_>,
 ) -> Vec<PathBuf> {
-    let home_str = home.to_string_lossy();
-    let home_trimmed = home_str.trim_end_matches('/');
     let mut raw_patterns: Vec<String> = Vec::new();
     if Path::new(expanded).is_absolute() {
         raw_patterns.push(expanded.to_string());
@@ -1275,87 +1452,105 @@ fn cd_glob_matches(
 
     let mut variants: Vec<Vec<String>> = Vec::new();
     for raw in &raw_patterns {
-        for v in normalize_cd_glob(raw) {
+        for v in normalize_cd_glob(raw, budget) {
             if !variants.contains(&v) {
+                if variants.len() >= MAX_CD_GLOB_VARIANTS {
+                    budget.unbounded = true;
+                    break;
+                }
                 variants.push(v);
             }
         }
+        if budget.unbounded {
+            break;
+        }
     }
 
+    let has_globstar = variants.iter().any(|v| v.iter().any(|c| c == "**"));
+    let needed_ups = if has_globstar {
+        needed_upward_depths(units, unit_idx, budget)
+    } else {
+        Vec::new()
+    };
+
+    // Deduplicate on raw path before resolving so the gate (`fs_resolve`) and
+    // engine (`lexical_resolve`) always build candidate lists of the exact same shape.
+    let mut seen_raw: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut matched: Vec<PathBuf> = Vec::new();
     let mut push_target = |raw_path: String| {
-        let p = resolve(&raw_path, start, home);
-        if !matched.contains(&p) {
-            matched.push(p);
+        if seen_raw.insert(raw_path.clone()) {
+            matched.push(resolve(&raw_path, start, home));
         }
     };
 
-    let home_comps: Vec<String> = home_trimmed
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.replace('ſ', "s"))
-        .collect();
-
-    let matches_variant = |var: &[String], target_comps: &[&str]| -> bool {
-        if var.iter().any(|c| c == "**") {
-            cd_comps_match_globstar(var, target_comps)
-        } else {
-            cd_comps_match(var, target_comps)
+    for root in protected_roots {
+        if budget.unbounded {
+            break;
         }
-    };
-
-    for rel in SENSITIVE_CD_DIRS.iter().chain(SENSITIVE_CD_TREES.iter()) {
-        let mut target: Vec<&str> = home_comps.iter().map(String::as_str).collect();
-        target.extend(rel.split('/'));
-        if variants.iter().any(|v| matches_variant(v, &target)) {
-            push_target(format!("{home_trimmed}/{rel}"));
+        let root_str = root.to_string_lossy();
+        let root_base = root_str.trim_end_matches('/');
+        let target_owned: Vec<String> = root_base
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.replace('ſ', "s"))
+            .collect();
+        if target_owned.is_empty() {
+            continue;
         }
-    }
-    for tree in SENSITIVE_CD_TREES {
-        let mut target: Vec<&str> = home_comps.iter().map(String::as_str).collect();
-        target.extend(tree.split('/'));
-        let tree_base = format!("{home_trimmed}/{tree}");
+        let target: Vec<&str> = target_owned.iter().map(String::as_str).collect();
         for v in &variants {
-            if v.iter().any(|c| c == "**") {
+            if !budget.charge(1) {
+                break;
+            }
+            let var_has_gs = v.iter().any(|c| c == "**");
+            let exact = if var_has_gs {
+                cd_comps_match_globstar(v, &target, budget)
+            } else {
+                cd_comps_match(v, &target, budget)
+            };
+            if exact {
+                push_target(root_base.to_string());
+            }
+            if var_has_gs {
                 for k in 1..=v.len() {
-                    if cd_comps_match_globstar(&v[..k], &target) {
-                        push_tree_tail(&tree_base, &v[k..], &mut push_target);
+                    if cd_comps_match_globstar(&v[..k], &target, budget) {
+                        // When `**` matched `target`, the same `**` can also
+                        // continue into descendants of `target`.
+                        let tail = if v[k - 1] == "**" {
+                            &v[k - 1..]
+                        } else {
+                            &v[k..]
+                        };
+                        push_tree_tail(root_base, tail, &needed_ups, budget, &mut push_target);
+                    }
+                    if budget.unbounded {
+                        break;
                     }
                 }
-            } else if v.len() > target.len() && cd_comps_match(&v[..target.len()], &target) {
-                push_tree_tail(&tree_base, &v[target.len()..], &mut push_target);
+            } else if v.len() > target.len() && cd_comps_match(&v[..target.len()], &target, budget)
+            {
+                push_tree_tail(root_base, &v[target.len()..], &[], budget, &mut push_target);
             }
-        }
-    }
-    let app_comps = ["Applications", "Atrium.app"];
-    for v in &variants {
-        if matches_variant(v, &app_comps) {
-            push_target("/Applications/Atrium.app".to_string());
-        }
-        if v.iter().any(|c| c == "**") {
-            for k in 1..=v.len() {
-                if cd_comps_match_globstar(&v[..k], &app_comps) {
-                    push_tree_tail("/Applications/Atrium.app", &v[k..], &mut push_target);
-                }
+            if budget.unbounded {
+                break;
             }
-        } else if v.len() > app_comps.len() && cd_comps_match(&v[..app_comps.len()], &app_comps) {
-            push_tree_tail(
-                "/Applications/Atrium.app",
-                &v[app_comps.len()..],
-                &mut push_target,
-            );
         }
     }
 
     matched
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cd_effect(
     unit: &Unit,
+    unit_idx: usize,
+    units: &[Unit],
     followed: bool,
     cands: &[PathBuf],
     start: &Path,
     home: &Path,
+    protected_roots: &[PathBuf],
+    budget: &mut CdGlobBudget,
     resolve: Resolver<'_>,
 ) -> Option<Cd> {
     let first = unit.eff.first()?;
@@ -1364,7 +1559,7 @@ fn cd_effect(
         return None;
     }
     if name == "popd" {
-        return Some(Cd::Lost(vec![]));
+        return Some(Cd::Lost(vec![], false));
     }
     // Options: `-L`, `-P`, `-e`, `-@` alone or in a cluster (`-LP`, `-Pe`),
     // then `--`. Any other option leaves the `cd` unread: its targets stay
@@ -1403,7 +1598,17 @@ fn cd_effect(
             None
         } else if expanded.contains(['*', '?', '[']) {
             glob_cd = true;
-            Some(cd_glob_matches(&expanded, cands, start, home, resolve))
+            Some(cd_glob_matches(
+                &expanded,
+                cands,
+                start,
+                home,
+                protected_roots,
+                units,
+                unit_idx,
+                budget,
+                resolve,
+            ))
         } else if Path::new(&expanded).is_absolute() {
             Some(vec![resolve(&expanded, start, home)])
         } else {
@@ -1431,21 +1636,24 @@ fn cd_effect(
     // `pushd` keeps a stack the line can pop later: never followed.
     Some(match targets {
         Some(t) if readable && !glob_cd && name != "pushd" && followed => Cd::Moved(t),
-        Some(t) => Cd::Lost(t),
-        None => Cd::Lost(vec![]),
+        Some(t) => Cd::Lost(t, glob_cd),
+        None => Cd::Lost(vec![], glob_cd),
     })
 }
 
 /// Appends up to `MAX_SEEN` directories. No two candidates are compared by
 /// value: the gate (filesystem) and the engine (lexical) must build lists of
 /// the same shape from the same words.
-fn push_seen(seen: &mut Vec<PathBuf>, more: &[PathBuf]) {
+fn push_seen(seen: &mut Vec<PathBuf>, more: &[PathBuf]) -> bool {
+    let mut truncated = false;
     for p in more {
         if seen.len() >= MAX_SEEN {
-            return;
+            truncated = true;
+            break;
         }
         seen.push(p.clone());
     }
+    truncated
 }
 
 /// An unknown directory: home, the start and every directory the line named.
@@ -1577,8 +1785,15 @@ fn too_many(lv: &mut Level, seen: &mut Vec<PathBuf>, home: &Path, start: &Path, 
 /// around it is; when it ends, the text around it carries on where it was,
 /// unless the text ran in the same shell (`eval`, `source`), which takes
 /// over where it ended (re-review majors 1 and 2).
-pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) -> Walk {
+pub fn walk(
+    units: &[Unit],
+    start: &Path,
+    home: &Path,
+    protected_roots: &[PathBuf],
+    resolve: Resolver<'_>,
+) -> Walk {
     let mut w = Walk::default();
+    let mut cd_budget = CdGlobBudget::new();
     let mut seen: Vec<PathBuf> = vec![];
     let mut stack: Vec<Level> = vec![Level {
         ctx: None,
@@ -1758,10 +1973,22 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
             && !unit.seg.piped
             && !unit.background;
         let followed = !unit.grouped || in_paren;
-        let effect = match cd_effect(unit, followed, &lv.cands, start, home, resolve) {
-            Some(Cd::Moved(t)) if repeats => Some(Cd::Lost(t)),
+        let effect = match cd_effect(
+            unit,
+            i,
+            units,
+            followed,
+            &lv.cands,
+            start,
+            home,
+            protected_roots,
+            &mut cd_budget,
+            resolve,
+        ) {
+            Some(Cd::Moved(t)) if repeats => Some(Cd::Lost(t, false)),
             e => e,
         };
+        w.cd_glob_unbounded |= cd_budget.unbounded;
         let moved = effect.is_some();
         match effect {
             None => {
@@ -1784,8 +2011,11 @@ pub fn walk(units: &[Unit], start: &Path, home: &Path, resolve: Resolver<'_>) ->
                     lv.cands = next;
                 }
             }
-            Some(Cd::Lost(targets)) => {
-                push_seen(&mut seen, &targets);
+            Some(Cd::Lost(targets, from_glob)) => {
+                let truncated = push_seen(&mut seen, &targets);
+                if from_glob && truncated {
+                    w.cd_glob_unbounded = true;
+                }
                 if !lv.unknown {
                     push_seen(&mut seen, &lv.cands);
                     push_seen(&mut seen, &lv.pool);
