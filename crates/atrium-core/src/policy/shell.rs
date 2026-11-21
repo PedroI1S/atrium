@@ -123,6 +123,44 @@ pub struct Lexed {
 
 pub const MAX_UNITS: usize = 512;
 
+/// The reason a line carries when one of its words, at any depth (a
+/// substitution, an `sh -c` payload, a piped text), is an ANSI-C `$'…'` word
+/// this reader can't decode exactly: unterminated, or with an escape it can't
+/// turn into the bytes bash would (an invalid byte sequence, a surrogate, an
+/// unknown escape). The engine never allows such a line, under any rule or
+/// preset (M1-28 round-2 finding 1); hard denies still apply first.
+pub const UNDECODABLE: &str = "undecodable word";
+
+/// Whether a `${…}` body holds a `$'…'` span this reader can't decode. It
+/// over-approximates (a `$'` inside other quotes counts too), which only
+/// asks more often.
+fn ansi_c_undecodable_in(body: &str) -> bool {
+    if !body.contains("$'") {
+        return false;
+    }
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if chars[i] == '$' && chars[i + 1] == '\'' {
+            let res = super::words::decode_ansi_c(&chars, i + 1);
+            if !res.closed || res.bad_escape {
+                return true;
+            }
+            i = res.next_index.max(i + 2);
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Carries an undecodable word of a nested text up to the line that runs it.
+fn inherit_undecodable(reasons: &mut Vec<String>, nested: &Lexed) {
+    if nested.reasons.iter().any(|r| r == UNDECODABLE) {
+        reasons.push(UNDECODABLE.into());
+    }
+}
+
 struct Builder {
     assignments: Vec<(String, String)>,
     argv: Vec<String>,
@@ -298,7 +336,12 @@ fn scan_backtick(chars: &[char], start: usize) -> (String, usize, bool) {
     let mut body = String::new();
     while i < chars.len() {
         match chars[i] {
+            // bash keeps the backslash unless it quotes `$`, `` ` `` or `\`,
+            // so `` `cat $'\x2essh/id_rsa'` `` keeps its `\x` escape (M1-28)
             '\\' if i + 1 < chars.len() => {
+                if !matches!(chars[i + 1], '$' | '`' | '\\') {
+                    body.push('\\');
+                }
                 body.push(chars[i + 1]);
                 i += 2;
                 continue;
@@ -928,6 +971,9 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
                         if res.bad_escape {
                             out.reasons.push("malformed escape".into());
                         }
+                        if !res.closed || res.bad_escape {
+                            out.reasons.push(UNDECODABLE.into());
+                        }
                     } else if chars.get(i + 1) == Some(&'"') {
                         // Locale-translated double quotes `$"…"`: parsed like `"…"`,
                         // keeping `expansion = true` so unknown translation fails closed.
@@ -945,6 +991,10 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
                         let (body, j, closed) = scan_dollar_brace(&chars, i + 2, false);
                         if !closed {
                             ambiguous_tail(&chars, i + 2, &mut tails);
+                        }
+                        // `${x:-$'\xff'}`: the default is a word too
+                        if ansi_c_undecodable_in(&body) {
+                            out.reasons.push(UNDECODABLE.into());
                         }
                         word.push_str("${");
                         word.push_str(&body);
@@ -1231,6 +1281,7 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
         for body in &subs {
             let l = lex_depth_fresh(body, depth + 1, cache);
             out.overflow |= l.overflow;
+            inherit_undecodable(&mut out.reasons, &l);
             out.unbounded_unknown_words
                 .extend(l.unbounded_unknown_words.iter().cloned());
             extra.push(l);
@@ -1263,6 +1314,7 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
         for p in &payloads {
             let l = lex_depth_fresh(p, depth + 1, cache);
             out.overflow |= l.overflow;
+            inherit_undecodable(&mut out.reasons, &l);
             out.unbounded_unknown_words
                 .extend(l.unbounded_unknown_words.iter().cloned());
             payload_units.extend(l.units.into_iter().map(|mut u| {
@@ -1441,6 +1493,7 @@ fn lex_depth_uncached(line: &str, depth: u8, derived: bool, cache: &mut LexCache
     for (t, owner, union) in &texts {
         let l = lex_depth_fresh(t, depth + 1, cache);
         out.overflow |= l.overflow;
+        inherit_undecodable(&mut out.reasons, &l);
         out.unbounded_unknown_words
             .extend(l.unbounded_unknown_words.iter().cloned());
         let mut units = vec![];
@@ -3947,6 +4000,7 @@ fn find_exec_units(eff: &[String], out: &mut Lexed, level: u8, cache: &mut LexCa
             for p in &payloads {
                 let l = lex_depth_fresh(p, level + 1, cache);
                 out.overflow |= l.overflow;
+                inherit_undecodable(&mut out.reasons, &l);
                 out.unbounded_unknown_words
                     .extend(l.unbounded_unknown_words.iter().cloned());
                 for mut u in l.units {

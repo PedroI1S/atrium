@@ -162,41 +162,36 @@ fn s7_ordinary_and_fail_closed_ansi_c_keep_safe_verdicts() {
         (r"printf $'\cC'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"printf $'\c?'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"printf $'\c\\'", ["Ask", "Ask", "Allow", "Allow"]),
-        // Unknown, malformed, unterminated, or NUL escapes fail closed (Ask in Home/prefix)
-        (r"cat $'\zfoo'", ["Ask", "Ask", "Allow", "Allow"]),
-        (r"cat $'\x'", ["Ask", "Ask", "Allow", "Allow"]),
-        (r"cat $'\u'", ["Ask", "Ask", "Allow", "Allow"]),
-        (r"cat $'\U'", ["Ask", "Ask", "Allow", "Allow"]),
-        (r"cat $'\ud800'", ["Ask", "Ask", "Allow", "Allow"]),
-        (r"cat $'\U00110000'", ["Ask", "Ask", "Allow", "Allow"]),
-        (r"cat $'\xff'", ["Ask", "Ask", "Allow", "Allow"]),
-        (r"cat $'\c'", ["Ask", "Ask", "Allow", "Allow"]),
-        (r"cat $'\c\'", ["Ask", "Ask", "Allow", "Allow"]),
+        // Unknown, malformed or unterminated escapes can't be decoded exactly:
+        // Ask everywhere (round-2 finding 1)
+        (r"cat $'\zfoo'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"cat $'\x'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"cat $'\u'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"cat $'\U'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"cat $'\ud800'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"cat $'\U00110000'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"cat $'\xff'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"cat $'\c'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"cat $'\c\'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"cat $'unterminated", ["Ask", "Ask", "Ask", "Ask"]),
+        // `\c\'` is `\c\` (0x1c) then a quote, as in bash: exact, a control char
         (r"cat $'\c\''", ["Ask", "Ask", "Allow", "Allow"]),
+        // NUL truncates the word exactly as bash does: decoded exactly
         (r"cat $'ok\x00'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"cat $'ok\u0000'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"cat $'ok\U00000000'", ["Ask", "Ask", "Allow", "Allow"]),
         (r"cat $'ok\c@'", ["Ask", "Ask", "Allow", "Allow"]),
-        (r"cat $'unterminated", ["Ask", "Ask", "Allow", "Allow"]),
         // Invalid bytes/scalars must preserve word identity (no false HardDeny)
-        (
-            r"cat $'\xff.aws/credentials'",
-            ["Ask", "Ask", "Allow", "Allow"],
-        ),
-        (
-            r"cat $'\ud800.aws/credentials'",
-            ["Ask", "Ask", "Allow", "Allow"],
-        ),
+        // and can't be decoded exactly (Ask everywhere)
+        (r"cat $'\xff.aws/credentials'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"cat $'\ud800.aws/credentials'", ["Ask", "Ask", "Ask", "Ask"]),
         (
             r"cat $'\U00110000.aws/credentials'",
-            ["Ask", "Ask", "Allow", "Allow"],
+            ["Ask", "Ask", "Ask", "Ask"],
         ),
-        (
-            r"cat $'\x2e\xffssh/id_rsa'",
-            ["Ask", "Ask", "Allow", "Allow"],
-        ),
-        (r"$'\xffsudo'", ["Ask", "Ask", "Allow", "Allow"]),
-        (r"$'\xff'sudo", ["Ask", "Ask", "Allow", "Allow"]),
+        (r"cat $'\x2e\xffssh/id_rsa'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"$'\xffsudo'", ["Ask", "Ask", "Ask", "Ask"]),
+        (r"$'\xff'sudo", ["Ask", "Ask", "Ask", "Ask"]),
         // Existing dev baseline for unreadable words (Ask in Home/prefix, Allow in Any/Full)
         ("cat 'unterminated", ["Ask", "Ask", "Allow", "Allow"]),
         ("ls \u{1}", ["Ask", "Ask", "Allow", "Allow"]),
@@ -209,6 +204,39 @@ fn s7_ordinary_and_fail_closed_ansi_c_keep_safe_verdicts() {
             ["Ask", "Ask", "Allow", "Allow"],
         ),
         (r"echo $(printf $'\')')", ["Ask", "Ask", "Allow", "Allow"]),
+    ]);
+}
+
+/// Round 2, finding 1: a word the reader can't decode exactly never gives
+/// Allow, under any rule or preset, also nested in a substitution, an
+/// `sh -c` payload, a piped text, a `${…}` default or a redirection target.
+#[test]
+fn round2_f1_undecodable_ansi_c_words_never_allow() {
+    let ask = ["Ask", "Ask", "Ask", "Ask"];
+    check_table(&[
+        // the reviewer's cases
+        (r"cat $'\xff'", ask),
+        (r"cat $'\ud800'", ask),
+        (r"cat $'unterminated", ask),
+        // nested
+        (r#"sh -c "cat $'\xff'""#, ask),
+        (r"echo $(cat $'\ud800')", ask),
+        (r"echo `cat $'\xff'`", ask),
+        (r"echo ${x:-$'\xff'}", ask),
+        (r#"echo "cat $'\xff'" | sh"#, ask),
+        (r"find . -exec cat $'\xff' \;", ask),
+        // redirection targets
+        (r"cat < $'\xff'", ask),
+        (r"echo hi > $'\ud800'", ask),
+        (r"cat <<< $'\zfoo'", ask),
+    ]);
+    // A hard deny elsewhere on the line still wins.
+    hard_everywhere(&[
+        r"cat $'\xff' ~/.ssh/id_rsa",
+        r"cat $'\x2essh/id_rsa' $'\ud800'",
+        r"sh -c $'cat ~/.ssh/id_rsa \xff'",
+        // backticks keep a backslash that doesn't quote `$`, `` ` `` or `\`
+        r"echo `cat $'\x2essh/id_rsa'`",
     ]);
 }
 

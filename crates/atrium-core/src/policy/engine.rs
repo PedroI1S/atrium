@@ -12,7 +12,7 @@ use globset::GlobBuilder;
 
 use super::DefaultPolicy;
 use super::deny::{self, Analysis, Sensitive};
-use super::shell::Unit;
+use super::shell::{self, Unit};
 use crate::{PolicyEngine, PolicyInput, PolicyVerdict};
 
 fn effective_kind(input: &PolicyInput<'_>) -> ToolKind {
@@ -932,9 +932,12 @@ impl PolicyEngine for DefaultPolicy {
         // the hard-deny list, otherwise allowed by FullAccess or an Any rule
         // and asked in Home/Normal/Trusted/Careful and under prefix/scoped rules.
         // When glob expansion overflows (brace or variant cap), Ask everywhere.
+        // A word the reader can't decode exactly (`$'\xff'`, `$'\ud800'`, an
+        // unterminated `$'…`), at any depth: Ask everywhere (M1-28).
         let unknown = matches!(input.check.subject, ToolSubject::Unknown)
             || a.unbounded_unknown_dangerous
-            || glob_unbounded;
+            || glob_unbounded
+            || a.reasons.iter().any(|r| r == shell::UNDECODABLE);
         let command = matches!(input.check.subject, ToolSubject::Command { .. });
         if !unknown
             && (!glob_leaves || out.any_allow)
