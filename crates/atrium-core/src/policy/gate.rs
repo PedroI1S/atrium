@@ -2,7 +2,7 @@
 //! filesystem access), asks the engine, opens and redeems ledger entries.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -257,6 +257,8 @@ fn evaluate_sync(
     }
     input.resolved_paths = &resolved;
     let mut verdict = policy.evaluate(&input, rules);
+    // every link pass below shares one budget and one "unfinished" state
+    let link_scope = LinkScope::enter();
     // A file below a folder linked into `~/.ssh`, at any depth, or a
     // recursive search or glob that reaches such a folder, reads keys.
     // Maybe (options or a glob it can't read): never auto-allow, ask.
@@ -311,6 +313,13 @@ fn evaluate_sync(
             TreeKind::Sensitive,
             in_home,
         );
+        trees.extend(trees_in_home(
+            &dangling_ssh_links(&c.home),
+            "credential-read",
+            true,
+            TreeKind::Sensitive,
+            in_home,
+        ));
         trees.extend(trees_in_home(
             &ssh.members,
             "credential-read",
@@ -387,6 +396,12 @@ fn evaluate_sync(
             }
         }
     }
+    // a link check that ran out of budget or couldn't read something it
+    // needed can't show the call safe (round 4 findings 4, 5)
+    if matches!(verdict, PolicyVerdict::Allow { .. }) && budget_spent() {
+        verdict = PolicyVerdict::Ask;
+    }
+    drop(link_scope);
     // A file with several links may be another name for a credential in a
     // tree the identity map doesn't walk: never auto-allow it, ask instead.
     if matches!(verdict, PolicyVerdict::Allow { .. })
@@ -396,6 +411,112 @@ fn evaluate_sync(
         verdict = PolicyVerdict::Ask;
     }
     Ok(Evaluated { verdict, resolved })
+}
+
+/// Whether a walker opens the files of the folders it's given (round 4
+/// finding 6): `tar -t`/`-x` read an archive, not their operands; `7z x`
+/// and `cpio -i` likewise. Unknown modes count as reading.
+fn walker_reads_operands(eff: &[String]) -> bool {
+    let Some(first) = eff.first() else {
+        return false;
+    };
+    let args = &eff[1..];
+    let opts = || args.iter().take_while(|a| a.as_str() != "--");
+    match shell::base(first) {
+        "tar" | "bsdtar" | "gtar" => {
+            let mut modes = String::new();
+            if let Some(a) = args.first()
+                && !a.starts_with('-')
+            {
+                modes.push_str(a); // old style: `tar cf x proj`
+            }
+            for a in opts() {
+                if let Some(l) = a.strip_prefix("--") {
+                    match l.split('=').next().unwrap_or("") {
+                        "create" | "append" | "update" | "catenate" | "concatenate" => {
+                            modes.push('c')
+                        }
+                        "list" => modes.push('t'),
+                        "extract" | "get" => modes.push('x'),
+                        "diff" | "compare" => modes.push('d'),
+                        "delete" => modes.push('D'),
+                        _ => {}
+                    }
+                } else if let Some(sh) = a.strip_prefix('-') {
+                    modes.push_str(sh);
+                }
+            }
+            let reads = modes.contains(['c', 'r', 'u', 'A']);
+            let other = modes.contains(['t', 'x', 'd']) || modes.contains('D');
+            // `-d` compares the archive with the live files: it reads them
+            reads || modes.contains('d') || !other
+        }
+        "7z" | "7za" => !matches!(
+            args.iter()
+                .find(|a| !a.starts_with('-'))
+                .map(String::as_str),
+            Some("x" | "e" | "l" | "t")
+        ),
+        "cpio" => !opts().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('i')),
+        "pax" => {
+            opts().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('w'))
+                || !opts().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('r'))
+        }
+        _ => true,
+    }
+}
+
+/// The dangling links in `~/.ssh` (and in folders below it, not through
+/// links): credential names whose target doesn't exist yet, so writing
+/// through them creates a key (review round 4 finding 2). Bounded like
+/// `ssh_members`; a folder it can't read marks the check unfinished.
+fn dangling_ssh_links(home: &Path) -> Vec<PathBuf> {
+    const MAX_ENTRIES: usize = 1024;
+    const MAX_DEPTH: u8 = 8;
+    let mut out = vec![];
+    let mut found = 0usize;
+    let mut stack = vec![(home.join(".ssh"), 0u8)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= MAX_DEPTH || found >= MAX_ENTRIES {
+            mark_incomplete();
+            continue;
+        }
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                if unresolved(&e) {
+                    mark_incomplete();
+                }
+                continue;
+            }
+        };
+        for e in rd {
+            let Ok(e) = e else {
+                mark_incomplete();
+                continue;
+            };
+            found += 1;
+            if found > MAX_ENTRIES || !spend(1) {
+                mark_incomplete();
+                break;
+            }
+            let Ok(ft) = e.file_type() else {
+                mark_incomplete();
+                continue;
+            };
+            let p = e.path();
+            if ft.is_symlink() {
+                match std::fs::metadata(&p) {
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => out.push(p),
+                    Err(_) => mark_incomplete(),
+                    Ok(_) => {}
+                }
+            } else if ft.is_dir() {
+                stack.push((p, depth + 1));
+            }
+        }
+    }
+    out
 }
 
 /// Commands that read every file below a folder they are given. `grep`'s
@@ -856,18 +977,49 @@ fn budget_spent() -> bool {
 
 /// Runs `f` with a fresh budget for one link check.
 fn with_link_budget<T>(f: impl FnOnce() -> T) -> T {
-    struct Reset(Option<usize>, bool);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            LINK_BUDGET.with(|b| b.set(self.0));
-            LINK_BUDGET_OUT.with(|o| o.set(self.1));
+    let _scope = LinkScope::enter();
+    f()
+}
+
+/// One link check's scope: the whole of `evaluate_sync`'s link passes share
+/// it (review round 4 finding 5). Entering inside an open scope reuses it.
+struct LinkScope(Option<(Option<usize>, bool)>);
+
+impl LinkScope {
+    fn enter() -> Self {
+        if LINK_BUDGET.with(std::cell::Cell::get).is_some() {
+            return LinkScope(None);
+        }
+        LinkScope(Some((
+            LINK_BUDGET.with(|b| b.replace(Some(LINK_CHECK_BUDGET))),
+            LINK_BUDGET_OUT.with(|o| o.replace(false)),
+        )))
+    }
+}
+
+impl Drop for LinkScope {
+    fn drop(&mut self) {
+        if let Some((b, o)) = self.0.take() {
+            LINK_BUDGET.with(|c| c.set(b));
+            LINK_BUDGET_OUT.with(|c| c.set(o));
         }
     }
-    let _reset = Reset(
-        LINK_BUDGET.with(|b| b.replace(Some(LINK_CHECK_BUDGET))),
-        LINK_BUDGET_OUT.with(|o| o.replace(false)),
-    );
-    f()
+}
+
+/// Marks the current check unfinished: something it needed couldn't be
+/// read or resolved (round 4 finding 4). No effect outside a check.
+fn mark_incomplete() {
+    if LINK_BUDGET.with(std::cell::Cell::get).is_some() {
+        LINK_BUDGET_OUT.with(|o| o.set(true));
+    }
+}
+
+/// An I/O error that leaves a path unresolved, not just absent.
+fn unresolved(e: &std::io::Error) -> bool {
+    !(matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) || e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()))
 }
 
 /// The credential identities (dev, inode) of the current check and the
@@ -926,24 +1078,62 @@ fn expand_glob(p: &Path) -> Option<GlobExpansion> {
     expand_glob_with(p, false)
 }
 
+/// A glob split where the user's text puts it: `prefix` is a resolved real
+/// path (bytes, never a pattern: review round 4 finding 1) and `rest` the
+/// components from the first pattern one on, as written.
+struct GlobPat {
+    prefix: PathBuf,
+    rest: Vec<OsString>,
+}
+
+fn comp_text(c: &OsStr) -> std::borrow::Cow<'_, str> {
+    c.to_string_lossy()
+}
+
+fn comp_is_pat(c: &OsStr) -> bool {
+    comp_text(c).contains(['*', '?', '[', '{'])
+}
+
 fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
-    const MAX_ENTRIES: usize = 4096;
-    const MAX_DEPTH: usize = 12;
-    // the components' own bytes (review round 3 finding 2): only a pattern
-    // component is read as text, and one that isn't text can't be matched
+    // the components' own bytes (review round 3 finding 2)
     let comps: Vec<OsString> = p.components().map(|c| c.as_os_str().to_owned()).collect();
-    let text = |c: &OsString| c.to_string_lossy().into_owned();
-    let is_pat = |c: &OsString| text(c).contains(['*', '?', '[', '{']);
     // A `$`, a backtick or a brace left in any component (round 7 item 1):
     // the shell expands it to something the pattern doesn't show
     // (`~/${DIR}/work/*`, `~/$(echo v*)/w`); comma lists and ranges were
     // expanded before (`words::brace_expand`), so a brace still here is one
     // this walk can't read.
-    if comps.iter().any(|c| text(c).contains(['$', '`', '{', '}'])) {
+    if comps
+        .iter()
+        .any(|c| comp_text(c).contains(['$', '`', '{', '}']))
+    {
         return None;
     }
-    let first = comps.iter().position(&is_pat)?;
-    let prefix: PathBuf = comps[..first].iter().collect();
+    let first = comps.iter().position(|c| comp_is_pat(c))?;
+    expand_pat(
+        &GlobPat {
+            prefix: comps[..first].iter().collect(),
+            rest: comps[first..].to_vec(),
+        },
+        include_dotfiles,
+    )
+}
+
+fn expand_pat(g: &GlobPat, include_dotfiles: bool) -> Option<GlobExpansion> {
+    const MAX_ENTRIES: usize = 4096;
+    const MAX_DEPTH: usize = 12;
+    let comps = &g.rest;
+    let is_pat = |c: &OsString| comp_is_pat(c);
+    if comps
+        .iter()
+        .any(|c| comp_text(c).contains(['$', '`', '{', '}']))
+    {
+        return None;
+    }
+    let first = 0usize;
+    if comps.first().is_none_or(|c| !is_pat(c)) {
+        return None;
+    }
+    let prefix = g.prefix.clone();
     let mut seen = 0usize;
     let mut visited: std::collections::HashSet<(PathBuf, usize)> = std::collections::HashSet::new();
     // (folder, index of the next component, folders `**` went down)
@@ -994,6 +1184,9 @@ fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
             .build()
             .ok()?
             .compile_matcher();
+        if !spend(1) {
+            return None;
+        }
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) => {
@@ -1138,9 +1331,21 @@ fn real_path(p: &Path) -> PathBuf {
             },
             Seg::Normal(name) => {
                 cur.push(&name);
+                spend(1);
+                let md = match std::fs::symlink_metadata(&cur) {
+                    Ok(md) => Some(md),
+                    Err(e) => {
+                        if unresolved(&e) {
+                            mark_incomplete();
+                        }
+                        None
+                    }
+                };
+                if md.as_ref().is_some_and(|m| m.is_symlink()) && hops >= MAX_HOPS {
+                    mark_incomplete();
+                }
                 if hops < MAX_HOPS
-                    && let Ok(md) = std::fs::symlink_metadata(&cur)
-                    && md.is_symlink()
+                    && md.is_some_and(|m| m.is_symlink())
                     && let Ok(target) = std::fs::read_link(&cur)
                 {
                     hops += 1;
@@ -1858,53 +2063,81 @@ fn links_below(
 /// Resolves only the literal prefix before the first glob/expansion component
 /// so parent segments after a wildcard are preserved for `expand_glob` instead
 /// of being collapsed lexically against the wildcard.
-fn raw_glob_pattern(word: &str, cwd: &Path, home: &Path) -> PathBuf {
-    let w = expand_home(word, home, cwd);
-    let p = Path::new(&w);
-    let abs = if p.is_absolute() {
-        p.to_path_buf()
+enum RawGlob {
+    /// No pattern in the user's text: the path as written (callers resolve it
+    /// with `real_path`, which follows links before `..`).
+    Literal(PathBuf),
+    Pat(GlobPat),
+}
+
+/// Splits a glob where the user's text has its first pattern component.
+/// The base (cwd, home) and the literal prefix are resolved bytes and are
+/// never read as pattern syntax (review round 4 finding 1).
+fn raw_glob(word: &str, cwd: &Path, home: &Path) -> RawGlob {
+    let (base, rel): (PathBuf, String) = if word == "~" {
+        (home.to_path_buf(), String::new())
+    } else if let Some(r) = word.strip_prefix("~/") {
+        (home.to_path_buf(), r.to_string())
+    } else if let Some(r) = word.strip_prefix('/') {
+        (PathBuf::from("/"), r.to_string())
+    } else if word.starts_with('~') {
+        // `~user/...`: that user's home, then the rest as written
+        let w = expand_home(word, home, cwd);
+        match w.strip_prefix('/') {
+            Some(r) => (PathBuf::from("/"), r.to_string()),
+            None => (cwd.to_path_buf(), w),
+        }
     } else {
-        cwd.join(p)
+        (cwd.to_path_buf(), word.to_string())
     };
-    let comps: Vec<_> = abs.components().collect();
-    let is_pat = |c: &std::path::Component<'_>| {
-        c.as_os_str()
-            .to_string_lossy()
+    let comps: Vec<OsString> = Path::new(&rel)
+        .components()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let is_pat = |c: &OsString| {
+        c.to_string_lossy()
             .contains(['*', '?', '[', '{', '}', '$', '`'])
     };
     let Some(first) = comps.iter().position(is_pat) else {
-        // no pattern: callers resolve it with `real_path`, which follows
-        // links before `..` (a lexical resolve here loses a dangling target
-        // such as `dir/../new_key`)
-        return abs;
+        let mut out = base;
+        for c in &comps {
+            out.push(c);
+        }
+        return RawGlob::Literal(out);
     };
-    let prefix: PathBuf = comps[..first].iter().collect();
-    let mut out = if prefix.as_os_str().is_empty() {
-        PathBuf::new()
-    } else {
-        resolve_fs(&prefix, 0)
-    };
-    for c in &comps[first..] {
-        out.push(c.as_os_str());
+    let mut prefix = base;
+    for c in &comps[..first] {
+        prefix.push(c);
     }
-    out
+    RawGlob::Pat(GlobPat {
+        prefix: resolve_fs(&prefix, 0),
+        rest: comps[first..].to_vec(),
+    })
 }
 
-/// Expands `p` on disk, marking `maybe` if the walk hits a cap or cannot read
-/// a component; returns the original `p` on `None` so callers can still walk it
-/// if it is a directory.
-fn expand_targets(p: &Path, include_dotfiles: bool, maybe: &mut bool) -> Vec<PathBuf> {
-    match expand_glob_with(p, include_dotfiles) {
-        Some(exp) => {
-            if exp.truncated {
-                *maybe = true;
+/// The paths a glob word names on disk, marking `maybe` when the walk can't
+/// be finished (a cap, an unreadable folder, syntax it can't read).
+fn raw_targets(
+    word: &str,
+    cwd: &Path,
+    home: &Path,
+    include_dotfiles: bool,
+    maybe: &mut bool,
+) -> Vec<PathBuf> {
+    match raw_glob(word, cwd, home) {
+        RawGlob::Literal(p) => vec![p],
+        RawGlob::Pat(g) => match expand_pat(&g, include_dotfiles) {
+            Some(exp) => {
+                if exp.truncated {
+                    *maybe = true;
+                }
+                exp.matches
             }
-            exp.matches
-        }
-        None => {
-            *maybe = true;
-            vec![p.to_path_buf()]
-        }
+            None => {
+                *maybe = true;
+                vec![]
+            }
+        },
     }
 }
 
@@ -2036,8 +2269,8 @@ fn reaches_tree_through_links_once(
                 maybe = true;
                 continue;
             }
-            let cands: Vec<PathBuf> = if h.starts_with('/') {
-                vec![raw_glob_pattern(&h, cwd, home)]
+            let cands: Vec<(String, &Path)> = if h.starts_with('/') || gv.starts_with('~') {
+                vec![(gv.clone(), cwd)]
             } else {
                 let mut v = Vec::with_capacity(roots.len() * 2);
                 let trimmed = h.trim_end_matches('/');
@@ -2046,25 +2279,18 @@ fn reaches_tree_through_links_once(
                     && !trimmed.contains('/')
                     && !matches!(trimmed, "." | ".." | "**");
                 for r in &roots {
-                    v.push(raw_glob_pattern(&h, r, home));
+                    v.push((gv.clone(), r.as_path()));
                     if basename_recursive {
-                        v.push(raw_glob_pattern(&format!("**/{trimmed}"), r, home));
+                        v.push((format!("**/{trimmed}"), r.as_path()));
                     }
                 }
                 v
             };
-            for p in cands {
-                if !seen_cand.insert(p.clone()) {
+            for (w, r) in cands {
+                if !seen_cand.insert((w.clone(), r.to_path_buf())) {
                     continue;
                 }
-                let globby = p
-                    .to_string_lossy()
-                    .contains(['*', '?', '[', '{', '}', '$', '`']);
-                let targets = if globby {
-                    expand_targets(&p, true, &mut maybe)
-                } else {
-                    vec![p]
-                };
+                let targets = raw_targets(&w, r, home, true, &mut maybe);
                 if let Some(t) = first_tree_hit(&targets, trees, *recursive, role, sensitive) {
                     return (Reach::Yes, Some(t));
                 }
@@ -2081,7 +2307,9 @@ fn reaches_tree_through_links_once(
         let prune = unit.map_or(PruneDirs::None, |x| prune_mode(&x.eff));
         let include_dotfiles = unit.is_none() && file_tool;
         let reads_contents = (u.role == words::Role::Read
-            || unit.is_some_and(|x| recursive_reader(&x.eff) || tree_walker(&x.eff)))
+            || unit.is_some_and(|x| {
+                recursive_reader(&x.eff) || (tree_walker(&x.eff) && walker_reads_operands(&x.eff))
+            }))
             && unit.is_none_or(|x| {
                 !x.eff
                     .first()
@@ -2090,7 +2318,15 @@ fn reaches_tree_through_links_once(
         // `ls proj/*` only names what it lists
         let lister = !recursive
             && unit.is_some_and(|x| x.eff.first().is_some_and(|f| shell::base(f) == "ls"));
-        for _ in &u.paths {
+        let use_cwds: Vec<&Path> = a
+            .unit_cwd
+            .get(u.unit)
+            .map(|s| s.candidates().into_iter().map(PathBuf::as_path).collect())
+            .unwrap_or_default();
+        // A pattern is the user's text, never resolved bytes (round 4
+        // finding 1); a file tool's path is literal (round 4 finding 3).
+        let globby = unit.is_some() && u.word.contains(['*', '?', '[', '{', '}', '$', '`']);
+        for (j, _) in u.paths.iter().enumerate() {
             let Some(p) = resolved.get(k) else {
                 return (Reach::Maybe, None);
             };
@@ -2098,11 +2334,21 @@ fn reaches_tree_through_links_once(
             if command_word {
                 continue;
             }
-            let ps = p.to_string_lossy();
-            let globby = ps.contains(['*', '?', '['])
-                || (unit.is_some() && ps.contains(['{', '}', '$', '`']));
             let targets = if globby {
-                expand_targets(p, include_dotfiles, &mut maybe)
+                let uc = use_cwds.get(j).copied().unwrap_or(cwd);
+                match words::brace_expand(&u.word) {
+                    Some(vs) => {
+                        let mut t = vec![];
+                        for v in vs {
+                            t.extend(raw_targets(&v, uc, home, include_dotfiles, &mut maybe));
+                        }
+                        t
+                    }
+                    None => {
+                        maybe = true;
+                        vec![]
+                    }
+                }
             } else {
                 vec![p.clone()]
             };
@@ -2182,15 +2428,7 @@ fn reaches_tree_through_links_once(
                 .unwrap_or_else(|| vec![cwd]);
             for ev in exps {
                 for uc in &unit_cwds {
-                    let raw_p = raw_glob_pattern(&ev, uc, home);
-                    let globby = raw_p
-                        .to_string_lossy()
-                        .contains(['*', '?', '[', '{', '}', '$', '`']);
-                    let targets = if globby {
-                        expand_targets(&raw_p, include_dotfiles, &mut maybe)
-                    } else {
-                        vec![raw_p]
-                    };
+                    let targets = raw_targets(&ev, uc, home, include_dotfiles, &mut maybe);
                     if let Some(t) = first_tree_hit(&targets, trees, recursive, u.role, sensitive) {
                         return (Reach::Yes, Some(t));
                     }

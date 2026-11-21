@@ -898,3 +898,129 @@ fn added_scope_non_reading_walks_do_not_hard_deny_on_hard_links() {
         assert_ne!(eval_cmd_3(&t, line), ["Deny", "Deny", "Deny"], "{line}");
     }
 }
+
+// ---- Escalation round 3 (D-127): review round 4 findings 1-6 ----
+
+#[test]
+fn rework4_finding1_metacharacters_from_a_resolved_link_stay_literal() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    std::fs::create_dir_all(t.home.join("store[1]")).unwrap();
+    let up = "..";
+    symlink(format!("{up}/.ssh/id_rsa"), t.home.join("store[1]/key")).unwrap();
+    symlink("store[1]", t.home.join("proj")).unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    assert_eq!(eval_cmd_3(&t, "cat proj/key*"), deny);
+    let check = paths_check(ToolKind::Search, "Glob", &["proj"], true, Some("key*"));
+    assert_eq!(eval_check_3(&t, &check), deny);
+}
+
+#[test]
+fn rework4_finding2_dangling_ssh_members_are_in_the_credential_set() {
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.home.join(".ssh")).unwrap();
+    std::fs::create_dir_all(t.home.join("vault")).unwrap();
+    std::fs::create_dir_all(t.home.join("proj")).unwrap();
+    let up = "..";
+    symlink(format!("{up}/vault/new_key"), t.home.join(".ssh/id_rsa")).unwrap();
+    symlink(format!("{up}/.ssh/id_rsa"), t.home.join("proj/key")).unwrap();
+
+    let deny = ["Deny", "Deny", "Deny"];
+    assert_eq!(eval_cmd_3(&t, "printf x > proj/key*"), deny);
+    let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("key*"));
+    assert_eq!(eval_check_3(&t, &check), deny);
+}
+
+#[test]
+fn rework4_finding3_literal_read_paths_are_not_globs() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    t.write("proj/file[1]", "ordinary");
+    let up = "..";
+    symlink(format!("{up}/.ssh/id_rsa"), t.home.join("proj/file1")).unwrap();
+    let read = paths_check(ToolKind::Read, "Read", &["proj/file[1]"], false, None);
+    assert_eq!(eval_check_3(&t, &read), ["Allow", "Allow", "Allow"]);
+}
+
+#[test]
+fn rework4_finding4_unreadable_literal_path_fails_closed() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    let closed = t.home.join("proj/closed");
+    std::fs::create_dir_all(&closed).unwrap();
+    let up = "..";
+    symlink(format!("{up}/{up}/.ssh/id_rsa"), closed.join("key")).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _guard = RestorePerm2(closed.clone());
+    if std::fs::read_dir(&closed).is_ok() {
+        return; // running as root
+    }
+    let read = paths_check(ToolKind::Read, "Read", &["proj/closed/key"], false, None);
+    assert_eq!(eval_check_3(&t, &read), ["Ask", "Ask", "Ask"]);
+}
+
+#[test]
+fn rework4_finding5_budget_covers_the_whole_check() {
+    // Case A: links in ~/.ssh to many folders, many glob operands
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.home.join(".ssh")).unwrap();
+    for i in 0..1024 {
+        let d = t.home.join(format!("ext/d{i:04}"));
+        std::fs::create_dir_all(&d).unwrap();
+        symlink(&d, t.home.join(format!(".ssh/l{i:04}"))).unwrap();
+    }
+    for i in 0..4096 {
+        t.write(&format!("proj/ka{i:04}"), "ordinary");
+    }
+    let line = format!("cat{}", " proj/k*".repeat(4095));
+    let start = std::time::Instant::now();
+    assert_eq!(eval_cmd_3(&t, &line), ["Ask", "Ask", "Ask"]);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "case A took {:?}",
+        start.elapsed()
+    );
+
+    // Case B: 4096 empty folders x 256 alternatives
+    let t = Tmp::new();
+    let mut dirs = vec![];
+    for i in 0..4096 {
+        let d = format!("e/d{i:04}");
+        std::fs::create_dir_all(t.home.join(&d)).unwrap();
+        dirs.push(d);
+    }
+    let roots: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    let alts: Vec<String> = (0..256).map(|i| format!("x{i}")).collect();
+    let g = format!("{{{}}}*", alts.join(","));
+    let start = std::time::Instant::now();
+    let check = paths_check(ToolKind::Search, "Glob", &roots, false, Some(&g));
+    assert_eq!(eval_check_3(&t, &check), ["Ask", "Ask", "Ask"]);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "case B took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn rework4_finding6_archive_listing_does_not_scan_operands() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    t.write("proj/a.txt", "ordinary");
+    t.write("plain.tar", "not really a tar");
+    std::fs::hard_link(t.home.join(".ssh/id_rsa"), t.home.join("proj/h")).unwrap();
+    assert_eq!(
+        eval_cmd_3(&t, "tar -tf plain.tar proj"),
+        ["Ask", "Allow", "Allow"]
+    );
+    assert_eq!(
+        eval_cmd_3(&t, "tar -xf plain.tar proj"),
+        eval_cmd_3(&t, "tar -xf plain.tar a")
+    );
+    // creating an archive still reads the folder
+    assert_eq!(
+        eval_cmd_3(&t, "tar -cf out.tar proj"),
+        ["Deny", "Deny", "Deny"]
+    );
+}
