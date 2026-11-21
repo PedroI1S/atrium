@@ -912,8 +912,16 @@ fn rework4_finding1_metacharacters_from_a_resolved_link_stay_literal() {
 
     let deny = ["Deny", "Deny", "Deny"];
     assert_eq!(eval_cmd_3(&t, "cat proj/key*"), deny);
+    assert_eq!(eval_cmd_3(&t, "cat ~/proj/key*"), deny);
+    assert_eq!(eval_cmd_3(&t, "cat $HOME/proj/key*"), deny);
     let check = paths_check(ToolKind::Search, "Glob", &["proj"], true, Some("key*"));
     assert_eq!(eval_check_3(&t, &check), deny);
+
+    // Same when `~/.ssh` also links to an external folder (exercises `reaches_linked_ssh_dir`)
+    t.write("vault/k", "secret");
+    symlink(t.home.join("vault"), t.home.join(".ssh/vdir")).unwrap();
+    symlink(format!("{up}/vault/k"), t.home.join("store[1]/vkey")).unwrap();
+    assert_eq!(eval_cmd_3(&t, "cat proj/vkey*"), deny);
 }
 
 #[test]
@@ -925,11 +933,24 @@ fn rework4_finding2_dangling_ssh_members_are_in_the_credential_set() {
     let up = "..";
     symlink(format!("{up}/vault/new_key"), t.home.join(".ssh/id_rsa")).unwrap();
     symlink(format!("{up}/.ssh/id_rsa"), t.home.join("proj/key")).unwrap();
+    symlink(
+        format!("{up}/vault/new_pub"),
+        t.home.join(".ssh/id_rsa.pub"),
+    )
+    .unwrap();
+    symlink(format!("{up}/.ssh/id_rsa.pub"), t.home.join("proj/pub")).unwrap();
 
     let deny = ["Deny", "Deny", "Deny"];
     assert_eq!(eval_cmd_3(&t, "printf x > proj/key*"), deny);
+    assert_eq!(eval_cmd_3(&t, "printf x > proj/key"), deny);
     let check = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("key*"));
     assert_eq!(eval_check_3(&t, &check), deny);
+    let read = paths_check(ToolKind::Read, "Read", &["proj/key"], false, None);
+    assert_eq!(eval_check_3(&t, &read), deny);
+
+    // Dangling public SSH member keeps the public-file exception
+    let pub_glob = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("pub*"));
+    assert_eq!(eval_check_3(&t, &pub_glob), ["Allow", "Allow", "Allow"]);
 }
 
 #[test]
@@ -937,10 +958,24 @@ fn rework4_finding3_literal_read_paths_are_not_globs() {
     let t = Tmp::new();
     t.write(".ssh/id_rsa", "secret");
     t.write("proj/file[1]", "ordinary");
+    std::fs::create_dir_all(t.home.join("proj/sub")).unwrap();
     let up = "..";
     symlink(format!("{up}/.ssh/id_rsa"), t.home.join("proj/file1")).unwrap();
+    let allow = ["Allow", "Allow", "Allow"];
     let read = paths_check(ToolKind::Read, "Read", &["proj/file[1]"], false, None);
-    assert_eq!(eval_check_3(&t, &read), ["Allow", "Allow", "Allow"]);
+    assert_eq!(eval_check_3(&t, &read), allow);
+    let rel_parent = format!("proj/sub/{up}/file[1]");
+    let read_dotdot = paths_check(ToolKind::Read, "Read", &[rel_parent.as_str()], false, None);
+    assert_eq!(eval_check_3(&t, &read_dotdot), allow);
+
+    // Explicit tool glob still expands `[1]` and blocks reaching `file1`
+    let glob = paths_check(ToolKind::Search, "Glob", &["proj"], false, Some("file[1]"));
+    assert_eq!(eval_check_3(&t, &glob), ["Deny", "Deny", "Deny"]);
+
+    // Literal Read also stays ordinary when `~/.ssh` has a linked folder
+    std::fs::create_dir_all(t.home.join("vault")).unwrap();
+    symlink(t.home.join("vault"), t.home.join(".ssh/vdir")).unwrap();
+    assert_eq!(eval_check_3(&t, &read), allow);
 }
 
 #[test]
@@ -951,6 +986,7 @@ fn rework4_finding4_unreadable_literal_path_fails_closed() {
     std::fs::create_dir_all(&closed).unwrap();
     let up = "..";
     symlink(format!("{up}/{up}/.ssh/id_rsa"), closed.join("key")).unwrap();
+    symlink(format!("{up}/.ssh/id_rsa"), t.home.join("proj/link-key")).unwrap();
     std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
     let _guard = RestorePerm2(closed.clone());
     if std::fs::read_dir(&closed).is_ok() {
@@ -958,11 +994,26 @@ fn rework4_finding4_unreadable_literal_path_fails_closed() {
     }
     let read = paths_check(ToolKind::Read, "Read", &["proj/closed/key"], false, None);
     assert_eq!(eval_check_3(&t, &read), ["Ask", "Ask", "Ask"]);
+    assert_eq!(eval_cmd_3(&t, "cat proj/closed/key"), ["Ask", "Ask", "Ask"]);
+    // Missing tail keeps ordinary behavior (not treated as an I/O error)
+    let missing = paths_check(
+        ToolKind::Read,
+        "Read",
+        &["proj/missing_dir/missing_file"],
+        false,
+        None,
+    );
+    assert_eq!(eval_check_3(&t, &missing), ["Allow", "Allow", "Allow"]);
+    // An unreadable operand never hides a definite credential hit on another operand
+    assert_eq!(
+        eval_cmd_3(&t, "cat proj/closed/key proj/link-*"),
+        ["Deny", "Deny", "Deny"]
+    );
 }
 
 #[test]
 fn rework4_finding5_budget_covers_the_whole_check() {
-    // Case A: links in ~/.ssh to many folders, many glob operands
+    // Case A: links in ~/.ssh to many folders, many repeated glob operands
     let t = Tmp::new();
     std::fs::create_dir_all(t.home.join(".ssh")).unwrap();
     for i in 0..1024 {
@@ -975,12 +1026,38 @@ fn rework4_finding5_budget_covers_the_whole_check() {
     }
     let line = format!("cat{}", " proj/k*".repeat(4095));
     let start = std::time::Instant::now();
-    assert_eq!(eval_cmd_3(&t, &line), ["Ask", "Ask", "Ask"]);
+    assert_eq!(eval_cmd_3(&t, &line), ["Ask", "Allow", "Allow"]);
     assert!(
         start.elapsed() < std::time::Duration::from_secs(60),
         "case A took {:?}",
         start.elapsed()
     );
+
+    // Distinct globs across both passes share the single budget (60 x 4096 fits
+    // one pass alone, but exceeds the shared budget across pass 1 + pass 2)
+    let distinct: String = (0..60).map(|i| format!(" proj/x{i:02}*")).collect();
+    let start = std::time::Instant::now();
+    assert_eq!(
+        eval_cmd_3(&t, &format!("cat{distinct}")),
+        ["Ask", "Ask", "Ask"]
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "case A distinct took {:?}",
+        start.elapsed()
+    );
+
+    // Empty directory opens spend budget (600 empty subdirs x 256 alts = 153,600
+    // entries + 153,600 empty-dir opens > 262,144; without charging opens this
+    // would fit the budget and return Allow)
+    let t_empty = Tmp::new();
+    for i in 0..600 {
+        std::fs::create_dir_all(t_empty.home.join(format!("empty_sub/d{i:03}"))).unwrap();
+    }
+    let alts: Vec<String> = (0..256).map(|i| format!("x{i}")).collect();
+    let pat = format!("*/{{{}}}*", alts.join(","));
+    let check_empty = paths_check(ToolKind::Search, "Glob", &["empty_sub"], false, Some(&pat));
+    assert_eq!(eval_check_3(&t_empty, &check_empty), ["Ask", "Ask", "Ask"]);
 
     // Case B: 4096 empty folders x 256 alternatives
     let t = Tmp::new();
@@ -991,7 +1068,6 @@ fn rework4_finding5_budget_covers_the_whole_check() {
         dirs.push(d);
     }
     let roots: Vec<&str> = dirs.iter().map(String::as_str).collect();
-    let alts: Vec<String> = (0..256).map(|i| format!("x{i}")).collect();
     let g = format!("{{{}}}*", alts.join(","));
     let start = std::time::Instant::now();
     let check = paths_check(ToolKind::Search, "Glob", &roots, false, Some(&g));
@@ -1010,17 +1086,27 @@ fn rework4_finding6_archive_listing_does_not_scan_operands() {
     t.write("proj/a.txt", "ordinary");
     t.write("plain.tar", "not really a tar");
     std::fs::hard_link(t.home.join(".ssh/id_rsa"), t.home.join("proj/h")).unwrap();
-    assert_eq!(
-        eval_cmd_3(&t, "tar -tf plain.tar proj"),
-        ["Ask", "Allow", "Allow"]
-    );
+    let ordinary = ["Ask", "Allow", "Allow"];
+    for line in [
+        "tar -tf plain.tar proj",
+        "tar tf plain.tar proj",
+        "tar -tfc.tar proj",
+        "tar --list -f plain.tar proj",
+    ] {
+        assert_eq!(eval_cmd_3(&t, line), ordinary, "{line}");
+    }
     assert_eq!(
         eval_cmd_3(&t, "tar -xf plain.tar proj"),
         eval_cmd_3(&t, "tar -xf plain.tar a")
     );
-    // creating an archive still reads the folder
-    assert_eq!(
-        eval_cmd_3(&t, "tar -cf out.tar proj"),
-        ["Deny", "Deny", "Deny"]
-    );
+    // Archive operations that read live operands still block hard-linked credentials
+    let deny = ["Deny", "Deny", "Deny"];
+    for line in [
+        "tar -cf out.tar proj",
+        "tar -df plain.tar proj",
+        "tar -f -t -c proj",
+        "cpio -o -Hbin proj",
+    ] {
+        assert_eq!(eval_cmd_3(&t, line), deny, "{line}");
+    }
 }
