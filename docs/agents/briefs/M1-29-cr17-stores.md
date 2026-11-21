@@ -54,7 +54,7 @@ The Opus escalation (D-129) changed `gate.rs`'s hard-link Ask exemption (review 
 
 ## Added scope (D-120, orchestrator, 2026-11-18): files the escalation touched
 The Opus escalation (D-129) closed review rounds 2 and 3 in files outside the owned list. The owned paths widen to:
-- `app/src/ui/rule-form.ts` and its test: the editor must refuse what the daemon refuses (brief item 5);
+- `app/src/chat/rule-form.ts` and its test `rule-form.test.ts`: the editor must refuse what the daemon refuses (brief item 5). (Corrected path; review round 4, the nit.)
 - `engine.rs` `git_path_is_credential`: just below the owned CR-12 list;
 - `policy/rule_check.rs`'s stdin check.
 
