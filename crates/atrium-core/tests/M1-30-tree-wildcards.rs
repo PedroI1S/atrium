@@ -1467,21 +1467,46 @@ fn review3_finding_2_embedded_globstar_keeps_devs_hard_deny() {
         &[
             ("cat ~/**ssh/id_rsa", Want::Hard(CR)),
             ("cat ~/**gnupg/x", Want::Hard(CR)),
+            ("cat ~/{*,a}*ssh/id_rsa", Want::Hard(CR)),
             ("cat ~/a/../**ssh/id_rsa", Want::Hard(CR)),
+        ],
+    );
+    // Brace overflow (> 64 variants in one group) widens to `*` with loose dot
+    // matching so `{.ssh,a1,...,a65}` still reaches `.ssh`.
+    let hard = format!("Hard({CR})");
+    let overflow_dir = format!(
+        "{{.ssh,{}}}",
+        (1..=65)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let overflow_path = format!("{HOME}/{overflow_dir}/id_rs?");
+    check_reads(
+        &env,
+        &[
+            ("~/{*,a}*ssh/id_rsa", [&hard, &hard, &hard]),
+            (&overflow_path, [&hard, &hard, &hard]),
         ],
     );
 }
 
-/// Round 3, finding 3: an ask tree's files at any depth, past a `**`.
+/// Round 3, finding 3: an ask tree's files at any depth, past a `**`, plus
+/// `globset` leading-dot matching for `Search` filters.
 #[test]
 fn review3_finding_3_session_families_reach_ask_tree_descendants() {
     let env = Env::home();
+    let hard = format!("Hard({CR})");
     check_searches(
         &env,
         &[
             ("**/foo/b.session", ["Ask", "Allow", "Allow"]),
             ("**/foo/bar/b.history", ["Ask", "Allow", "Allow"]),
             ("**/foo/*.rs", ["Allow", "Allow", "Allow"]),
+            ("*/*.session", ["Ask", "Allow", "Allow"]),
+            ("*/b.session", ["Ask", "Allow", "Allow"]),
+            ("*/*.rs", ["Allow", "Allow", "Allow"]),
+            ("*gnupg/private-keys-v1.d/k.key", [&hard, &hard, &hard]),
         ],
     );
     check_reads(
@@ -1526,7 +1551,29 @@ fn review3_finding_5_unclosed_classes_parse_in_bounded_work() {
     let env = Env::home();
     let t = std::time::Instant::now();
     let line = format!("cat ~/src/{}.rs", "[".repeat(32768));
-    check_4_settings(&env, &[(line.as_str(), ["Ask", "Ask", "Allow", "Allow"])]);
+    let trailing_escaped_close = format!("cat ~/src/{}\\].rs", "[".repeat(32768));
+    let posix_openers_closed = format!("cat ~/src/{}].rs", "[[:".repeat(10000));
+    let posix_body_openers = format!("cat ~/src/[{}].rs", "[:".repeat(10000));
+    let long_class_body = format!("cat ~/src/[{}].rs", "a".repeat(32768));
+    check_4_settings(
+        &env,
+        &[
+            (line.as_str(), ["Ask", "Ask", "Allow", "Allow"]),
+            (
+                trailing_escaped_close.as_str(),
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            (
+                posix_openers_closed.as_str(),
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            (
+                posix_body_openers.as_str(),
+                ["Ask", "Ask", "Allow", "Allow"],
+            ),
+            (long_class_body.as_str(), ["Ask", "Ask", "Allow", "Allow"]),
+        ],
+    );
     let escaped = format!("~/src/{}x.rs", "[\\".repeat(16000));
     let got = read_verdicts(&env, &escaped);
     assert!(
@@ -1539,12 +1586,14 @@ fn review3_finding_5_unclosed_classes_parse_in_bounded_work() {
         got.iter().all(|v| !v.starts_with("Hard")),
         "Read of POSIX openers: {got:?}"
     );
+    // Unsupported POSIX equivalence classes still fail closed.
+    run_table(&env, &[("cat ~/.s[[=s=]]h/id_rsa", Want::Hard(CR))]);
     // A generous ceiling: the quadratic version did over 500 million steps.
     assert!(t.elapsed() < std::time::Duration::from_secs(20));
 }
 
 /// Round 3, finding 6: running out of budget is Ask, never an invented
-/// hard deny.
+/// hard deny, and one budget is shared across the whole check.
 #[test]
 fn review3_finding_6_budget_exhaustion_asks_and_never_hard_denies() {
     let env = Env::home();
@@ -1559,5 +1608,53 @@ fn review3_finding_6_budget_exhaustion_asks_and_never_hard_denies() {
             &format!("cat ~/.gnupg/{}*", "a".repeat(50000)),
             Want::Hard(CR),
         )],
+    );
+    // Genuine budget exhaustion on a Read pattern asks in Home and never
+    // fabricates a hard deny or allows on doubt.
+    let heavy = format!(
+        "~/{{a,b}}{{a,b}}{{a,b}}{{a,b}}{{a,b}}{{a,b}}/{}*",
+        "a".repeat(20000)
+    );
+    // A protected (write-only) sibling branch must not mask budget exhaustion
+    // during a Read.
+    let heavy_with_protected = format!(
+        "~/{{.config/atrium/config.toml,{{a,b}}{{a,b}}{{a,b}}{{a,b}}{{a,b}}/{}*}}",
+        "a".repeat(35000)
+    );
+    check_reads(
+        &env,
+        &[
+            (&heavy, ["Ask", "Allow", "Allow"]),
+            (&heavy_with_protected, ["Ask", "Allow", "Allow"]),
+        ],
+    );
+    // One shared budget per check: one 16-variant path stays within budget
+    // (Allow), while three copies in a single Read exhaust the shared budget
+    // (Ask in Home, Allow in Any/FullAccess).
+    let medium = format!("~/{{a,b}}{{a,b}}{{a,b}}{{a,b}}/{}*", "a".repeat(30000));
+    check_reads(&env, &[(&medium, ["Allow", "Allow", "Allow"])]);
+    let any_read = vec![rule(
+        RuleScope::Global,
+        ToolKind::Read,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "any-read",
+    )];
+    let multi = paths_check(
+        ToolKind::Read,
+        "Read",
+        &[medium.as_str(), medium.as_str(), medium.as_str()],
+        false,
+        None,
+    );
+    let got = [
+        classify(&env.eval_check(&multi, &[], Preset::Home)),
+        classify(&env.eval_check(&multi, &any_read, Preset::Home)),
+        classify(&env.eval_check(&multi, &[], Preset::FullAccess)),
+    ];
+    assert_eq!(
+        got.each_ref().map(String::as_str),
+        ["Ask", "Allow", "Allow"],
+        "shared budget exhaustion across multiple Read paths: got {got:?}"
     );
 }
