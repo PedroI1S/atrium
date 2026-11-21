@@ -303,14 +303,16 @@ async fn atriumd_discovers_fish_login_shell_path_and_never_fails_on_bad_shell() 
     create_private_dir(&mise_bin);
     write_fake_claude(&mise_bin, "9.8.8");
 
-    // Fake `fish` shell: faithfully emulates fish's `string join : -- $PATH`
-    // (which appends a trailing newline unless `-n` is given), and places `mise_bin`
-    // as the final entry so any trailing newline corrupts it and breaks discovery.
+    // Fake `fish` shell: faithfully reproduces real fish behavior where
+    // `string join` (even with `-n` / `--no-empty`) always emits a trailing
+    // newline, while `printf '...%s...' (string join : -- $PATH)` strips the
+    // newline via command substitution. `mise_bin` is placed last so any
+    // trailing newline corrupts it and fails the directory-existence filter.
     let fake_fish = root.path().join("fish");
     write_executable(
         &fake_fish,
         &format!(
-            "#!/bin/sh\ncase \"$2\" in\n  *\"string join -n : -- \\$PATH\"*)\n    printf '__ATRIUM_PATH_START__/usr/bin:%s__ATRIUM_PATH_END__' '{}'\n    ;;\n  *\"string join : -- \\$PATH\"*)\n    printf '__ATRIUM_PATH_START__/usr/bin:%s\\n__ATRIUM_PATH_END__' '{}'\n    ;;\n  *)\n    exit 2\n    ;;\nesac\n",
+            "#!/bin/sh\ncase \"$2\" in\n  \"printf '__ATRIUM_PATH_START__%s__ATRIUM_PATH_END__' (string join\"*\")\")\n    printf '__ATRIUM_PATH_START__/usr/bin:%s__ATRIUM_PATH_END__' '{}'\n    ;;\n  *\"string join\"*)\n    printf '__ATRIUM_PATH_START__/usr/bin:%s\\n__ATRIUM_PATH_END__' '{}'\n    ;;\n  *)\n    exit 2\n    ;;\nesac\n",
             mise_bin.display(),
             mise_bin.display(),
         ),
