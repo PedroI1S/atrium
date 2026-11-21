@@ -796,3 +796,227 @@ for line in sys.stdin:
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+/// Round 2, finding 5 (Claude): if `gate.check` commits a ticket and returns
+/// *after* the 500 ms `wait_for_in_flight_gates` cap while terminal event
+/// delivery is blocked on a full `events_tx`, `OrphanGuard` must still withdraw
+/// the ticket directly instead of queuing it into an unread `internal_rx`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_late_orphan_withdrawal_after_cap_with_event_backpressure() {
+    let dir = scratch("claude-late-orphan-bp");
+    let script = dir.join("fake-claude-late-bp.py");
+
+    let on_inserted = Arc::new(Notify::new());
+    let allow_return = Arc::new(Notify::new());
+    let ledger = RealLedger::with_check_barrier(
+        Provider::Claude,
+        &dir,
+        Preset::Careful,
+        on_inserted.clone(),
+        allow_return.clone(),
+    )
+    .await;
+
+    // Emit enough deltas before `PreToolUse` to fill `session.events` plus
+    // leave buffered events in `self.pending` so shutdown blocks on `events_tx`.
+    // (Exact capacity is checked below; 1200 exceeds `EVENT_BUFFER` while
+    // staying well below `PENDING_LIMIT` = 4096.)
+    write_executable(
+        &script,
+        r#"#!/usr/bin/env python3
+import json, sys
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("2.1.308 (Claude Code)")
+    sys.exit(0)
+sid = "fake-late-bp"
+for line in sys.stdin:
+    v = json.loads(line)
+    t = v.get("type")
+    if t == "control_request" and v.get("request", {}).get("subtype") == "initialize":
+        print(json.dumps({"type":"control_response","response":{"subtype":"success","request_id":v["request_id"],"response":{"commands":[]}}}), flush=True)
+    elif t == "user":
+        print(json.dumps({"type":"system","subtype":"init","session_id":sid,"model":"claude-fake","tools":["Read"],"cwd":"."}), flush=True)
+        for _ in range(1200):
+            print(json.dumps({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}},"session_id":sid,"api_message_id":"msg_bp"}), flush=True)
+        print(json.dumps({"type":"control_request","request_id":"h1","request":{"subtype":"hook_callback","callback_id":"atrium-pre-tool-use","input":{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"x"},"tool_use_id":"toolu_1"}}}), flush=True)
+"#,
+    );
+
+    let mut session = ClaudeAdapter::new(claude_opts(Duration::from_secs(5)))
+        .start(
+            claude_cfg(&dir, script, ledger.gate.clone()),
+            Transport::Local,
+        )
+        .await
+        .unwrap();
+    assert!(
+        session.events.max_capacity() < 1200,
+        "test flood must exceed session.events capacity"
+    );
+
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage { text: "go".into() })
+        .await
+        .unwrap();
+
+    // Do NOT drain `session.events`: wait until the approval row is inserted
+    // (by which point all 1200 preceding deltas have already filled `events_tx`).
+    tokio::time::timeout(Duration::from_secs(5), on_inserted.notified())
+        .await
+        .expect("approval insert committed");
+    assert_eq!(ledger.open_count().await, 1);
+
+    // Trigger Shutdown and let the 500 ms `wait_for_in_flight_gates` cap expire
+    // so the actor is parked in the terminal `events_tx.send(ev).await` loop.
+    let _ = session.commands.send(SessionCommand::Shutdown).await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+
+    // Release the paused `gate.check` while terminal delivery is still blocked.
+    allow_return.notify_one();
+
+    // Drain events so the session can complete cleanly.
+    let end_deadline = Instant::now() + Duration::from_secs(10);
+    while let Some(remaining) = end_deadline.checked_duration_since(Instant::now()) {
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, session.events.recv()).await {
+            Ok(Some(env)) if matches!(env.event, AgentEvent::SessionEnded { .. }) => break,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    let settle = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < settle {
+        if ledger.gate.withdrawn() == ledger.gate.asked() && ledger.open_count().await == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(ledger.gate.asked().len(), 1);
+    assert_eq!(
+        ledger.gate.withdrawn(),
+        ledger.gate.asked(),
+        "late Claude orphan withdrawal entered closed/unread channel instead of withdrawing"
+    );
+    assert_eq!(ledger.open_count().await, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Round 2, finding 5 (Codex): same late-return + terminal-backpressure case
+/// for `CodexAdapter` (`flush_final` blocked after the 500 ms cap).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_late_orphan_withdrawal_after_cap_with_event_backpressure() {
+    let dir = scratch("codex-late-orphan-bp");
+    let user_dir = dir.join("empty-codex-home");
+    fs::create_dir_all(&user_dir).unwrap();
+    let script = dir.join("fake-codex-late-bp.py");
+    write_executable(
+        &script,
+        r#"#!/usr/bin/env python3
+import json, sys
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("codex-cli 0.163.0")
+    sys.exit(0)
+for line in sys.stdin:
+    v = json.loads(line)
+    m = v.get("method")
+    rid = v.get("id")
+    if m == "initialize":
+        print(json.dumps({"id": rid, "result": {"userAgent": "codex-fake/0.163.0", "codexHome": "/scratch/.codex"}}), flush=True)
+    elif m == "thread/start":
+        print(json.dumps({"id": rid, "result": {"thread": {"id": "th_fake", "cliVersion": "0.163.0"}, "approvalPolicy": "untrusted", "sandbox": {"type": "workspaceWrite", "networkAccess": False}}}), flush=True)
+    elif m == "turn/start":
+        print(json.dumps({"id": rid, "result": {"turn": {"id": "turn_1", "items": [], "status": "inProgress"}}}), flush=True)
+        print(json.dumps({"method": "turn/started", "params": {"threadId": "th_fake", "turn": {"id": "turn_1", "status": "inProgress"}}}), flush=True)
+        print(json.dumps({"method": "item/started", "params": {"threadId": "th_fake", "turnId": "turn_1", "item": {"type": "agentMessage", "id": "msg_bp", "text": ""}}}), flush=True)
+        for _ in range(1200):
+            print(json.dumps({"method": "item/agentMessage/delta", "params": {"threadId": "th_fake", "turnId": "turn_1", "itemId": "msg_bp", "delta": "x"}}), flush=True)
+        print(json.dumps({"id": "req_1", "method": "item/commandExecution/requestApproval", "params": {"threadId": "th_fake", "turnId": "turn_1", "itemId": "item_1", "command": "ls", "cwd": "."}}), flush=True)
+"#,
+    );
+
+    let on_inserted = Arc::new(Notify::new());
+    let allow_return = Arc::new(Notify::new());
+    let ledger = RealLedger::with_check_barrier(
+        Provider::Codex,
+        &dir,
+        Preset::Careful,
+        on_inserted.clone(),
+        allow_return.clone(),
+    )
+    .await;
+    let cfg = SessionConfig {
+        cwd: dir.clone(),
+        model: Some("gpt-5".into()),
+        effort: None,
+        permissions: PermissionPolicy::Ask,
+        resume: None,
+        mcp_servers: vec![],
+        gate: ledger.gate.clone(),
+        env: vec![("CODEX_HOME".into(), user_dir.display().to_string())],
+        program: Some(script),
+        on_spawn: None,
+    };
+    let opts = CodexOptions {
+        user_dir: Some(user_dir),
+        ..CodexOptions::default()
+    };
+    let mut session = CodexAdapter::with_options(opts)
+        .start(cfg, Transport::Local)
+        .await
+        .unwrap();
+    assert!(
+        session.events.max_capacity() < 1200,
+        "test flood must exceed session.events capacity"
+    );
+
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage { text: "go".into() })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), on_inserted.notified())
+        .await
+        .expect("approval insert committed");
+    assert_eq!(ledger.open_count().await, 1);
+
+    let _ = session.commands.send(SessionCommand::Shutdown).await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+
+    // Release the paused check while `flush_final()` is blocked on `events_tx`.
+    allow_return.notify_one();
+
+    let end_deadline = Instant::now() + Duration::from_secs(10);
+    while let Some(remaining) = end_deadline.checked_duration_since(Instant::now()) {
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, session.events.recv()).await {
+            Ok(Some(env)) if matches!(env.event, AgentEvent::SessionEnded { .. }) => break,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    let settle = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < settle {
+        if ledger.gate.withdrawn() == ledger.gate.asked() && ledger.open_count().await == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(ledger.gate.asked().len(), 1);
+    assert_eq!(
+        ledger.gate.withdrawn(),
+        ledger.gate.asked(),
+        "late Codex orphan withdrawal entered closed/unread channel instead of withdrawing"
+    );
+    assert_eq!(ledger.open_count().await, 0);
+    let _ = fs::remove_dir_all(&dir);
+}

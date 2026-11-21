@@ -1025,6 +1025,10 @@ impl Actor {
         }
         self.clear_requests();
         while self.gates.join_next().await.is_some() {}
+        // Close `internal_rx` before the final drain so late `OrphanGuard`
+        // drops after the shutdown wait take the direct withdrawal fallback
+        // instead of queuing into a channel that will never be read again.
+        self.internal_rx.close();
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.commands_rx = None;
@@ -1060,6 +1064,7 @@ impl Actor {
         self.clear_requests();
         while self.gates.join_next().await.is_some() {}
         self.wait_for_in_flight_gates().await;
+        self.internal_rx.close();
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.feed(AdapterInput::Exit { code });
@@ -1080,6 +1085,8 @@ impl Actor {
         let deadline = TokioInstant::now() + cap;
         while self.gate_in_flight.load(Ordering::Acquire) > 0 {
             let notified = self.gate_settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.gate_in_flight.load(Ordering::Acquire) == 0 {
                 break;
             }

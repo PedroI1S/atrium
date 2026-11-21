@@ -1224,6 +1224,10 @@ impl Driver {
         self.cmd_rx = None;
         self.clear_requests();
         self.wait_for_in_flight_gates().await;
+        // Close `internal_rx` before the final drain so late `OrphanGuard`
+        // drops during `flush_final` take the direct withdrawal fallback
+        // instead of queuing into a channel that will never be read again.
+        self.internal_rx.close();
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.flush_final().await;
