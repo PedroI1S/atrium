@@ -825,3 +825,11 @@ rodrigo asked the orchestrator to choose. It kept `dev`'s behaviour on both:
 - **Unchanged:** reviews stay with Codex (GPT-6.1 Sol, `high`, read-only; D-124), so Neon's work is reviewed cross-provider. Writers stay inside the `agy` allowlist (no `python3`, no GUI), and D-123's write-then-verify flow holds. Work that needs path-like literals the policy refuses (D-074) still goes to Claude.
 - **`agy` 1.5.14:** the hook check of `HANDOFF.md` passed with Neon in a scratch worktree, which was removed afterwards. `cargo --version` was allowed; the write to `.agents/probe.txt` and `git push` were denied by the hook. `scripts/doctor` names 1.5.14 as the tested version.
 - This applies to rodrigo's shifts. Pedro's shifts keep his own routing unless he decides otherwise (D-064).
+
+## D-135 — 2026-11-21 — rodrigo: the policy engine moves to "exact, or not established" (contract rev 4, draft)
+**Decided by rodrigo (driver); the security-default changes wait for Pedro (D-013).** The M1-27 batch's 18 Codex reviews were all rework, each finding a neighbouring variant of the last. The cause is in the goals: several must-fix items asked the engine to resolve dynamic shell exactly (K7, K9, `$'…'`, glob-pattern reasoning). rodrigo chose a redesign with variant B:
+- Checks are exact where Atrium can read a call completely; everything else is "not established".
+- "Not established" asks in Home and under prefix, exact and scoped rules (fail-closed), and allows under Any rules and FullAccess after a best-effort hard-deny check. The contract says so, and so does the UI.
+- Variant A (ask for every not-established line under FullAccess too) was rejected: 53% of 3,353 real agent commands on rodrigo's machine use a construct outside the readable grammar, and under FullAccess the hard deny can't stop a deliberate evader anyway (a script file run with `sh x.sh`).
+- The draft is `docs/contracts/m1-policy-rev4.md` (CR-20). rodrigo approves its text; Pedro confirms the items marked [D-013] (its §10) before any worker starts on P1–P3.
+- **Held:** M1-27, M1-29, M1-30, M1-31 and M1-32 are neither verified nor reviewed further. Their non-policy parts move to M1-33 (from M1-28) and M1-34 (from M1-31), which may go ahead now.

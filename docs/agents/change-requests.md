@@ -238,3 +238,13 @@ Non-blocking; a gap in the wire.
 **The policy engine matches shell, wrapper and privilege-tool names case-sensitively.** macOS filesystems ignore case, so `/bin/BASH -c "…"`, `/usr/bin/ENV rm -rf ~`, `SUDO id` and `/bin/baſh -c "…"` run the real programs. But `shell.rs` (`SHELLS`, `unwrap_reading`, `payloads_of`, `env_payloads`) and `deny.rs` (`PRIV`, `is_interpreter`) compare the basename as written. So the wrapper isn't unwrapped, the `-c` payload isn't read, and `SUDO` isn't flagged as privilege escalation, even with no rules at all. Argon (review of M1-23 round 3, `docs/agents/reviews/M1-23-ui-gaps-round3.md`) rated it high for the M1 gate. The rules editor already folds names (M1-23).
 
 **Change:** fold the command basename before every name comparison in `shell.rs` and `deny.rs`: lowercase (which also folds K U+212A), plus `ſ`→`s`, the same folds `deny.rs` already uses for paths. Tests: each spelling above gets the same verdict as its lowercase form, in every setting; no ordinary line changes. Done in the task that fixes S5, S7, S8, S11, K5 and CR-17 after M1-18 merges (same files).
+
+## CR-20 — M1-27 batch — 2026-11-21
+
+**Open: draft; rodrigo approves the text, Pedro confirms the [D-013] items (D-135).**
+
+**Change:** contract §9's policy engine moves to three outcomes per check (exact hit, exact clear, not established), a readable shell grammar, forward glob expansion by `SessionGate` instead of pattern-versus-pattern reasoning, and one table of known tools that rules and Home's read-only list share. The full text is `docs/contracts/m1-policy-rev4.md`.
+
+**Why:** the batch's reviews don't converge (D-135).
+
+**Affected:** `atrium-core::policy` (`shell.rs`, `words.rs`, `deny.rs`, `engine.rs`, `gate.rs`), `atrium-protocol` `ReadOnlyCommand`, the rules editor, the Settings text for the hard-deny list, and the M1-27 batch's branches (rev 4 §11).
