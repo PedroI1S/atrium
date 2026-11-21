@@ -228,6 +228,10 @@ fn evaluate_sync(
         resolved_paths: &[],
         preset,
     };
+    // Track unresolved I/O errors across path resolution and every link pass,
+    // separately from budget exhaustion so an unreadable entry never aborts
+    // finding a definite credential deny elsewhere in the same check.
+    let _resolve_scope = ResolveScope::enter();
     let analysis = deny::analyze_with(&input, &fs_resolve);
     let ssh = ssh_members(&c.home);
     let mut resolved = vec![];
@@ -257,13 +261,20 @@ fn evaluate_sync(
     }
     input.resolved_paths = &resolved;
     let mut verdict = policy.evaluate(&input, rules);
-    // every link pass below shares one budget and one "unfinished" state
+    // every link pass below shares one budget (round 4 finding 5)
     let link_scope = LinkScope::enter();
     // A file below a folder linked into `~/.ssh`, at any depth, or a
     // recursive search or glob that reaches such a folder, reads keys.
     // Maybe (options or a glob it can't read): never auto-allow, ask.
     if !matches!(verdict, PolicyVerdict::HardDeny { .. }) && !analysis.overflow {
-        match reaches_linked_ssh_dir(check, &analysis, &resolved, &ssh.linked_dirs, &c.cwd) {
+        match reaches_linked_ssh_dir(
+            check,
+            &analysis,
+            &resolved,
+            &ssh.linked_dirs,
+            &c.cwd,
+            &c.home,
+        ) {
             Reach::Yes => {
                 verdict = PolicyVerdict::HardDeny {
                     id: "credential-read",
@@ -278,7 +289,10 @@ fn evaluate_sync(
     // A link from elsewhere into a credential tree (`proj/keys -> ~/.ssh`)
     // or Atrium's own paths, reached through a glob or a search or walker
     // that follows links (round 8 blocker 2, M1-18 K2).
-    if !matches!(verdict, PolicyVerdict::HardDeny { .. }) && !analysis.overflow {
+    if !matches!(verdict, PolicyVerdict::HardDeny { .. })
+        && !analysis.overflow
+        && !budget_exhausted()
+    {
         let real_home = resolve_fs(&c.home, 0);
         let real_data: Vec<PathBuf> = c
             .atrium_data_paths
@@ -303,8 +317,9 @@ fn evaluate_sync(
         };
         let real_sensitive = deny::sensitive(&real_input);
         // The canonical credential set: every store and every member of
-        // `~/.ssh` (a key linked out of it: review round 3 finding 3), at its
-        // real path, classified by its home spelling.
+        // `~/.ssh` (including dangling links and keys linked out of it:
+        // review round 3 finding 3, round 4 finding 2), at its real path,
+        // classified by its home spelling.
         let in_home = Some((c.home.as_path(), real_home.as_path()));
         let mut trees = trees_in_home(
             &deny::sensitive_roots(&c.home, &[], &[]),
@@ -373,6 +388,7 @@ fn evaluate_sync(
     // remembered approval) and FullAccess keep their Allow.
     if matches!(verdict, PolicyVerdict::Allow { .. })
         && !analysis.overflow
+        && !budget_exhausted()
         && matches!(preset, Preset::Home | Preset::Normal | Preset::Trusted)
     {
         let asks = trees_of(
@@ -398,7 +414,7 @@ fn evaluate_sync(
     }
     // a link check that ran out of budget or couldn't read something it
     // needed can't show the call safe (round 4 findings 4, 5)
-    if matches!(verdict, PolicyVerdict::Allow { .. }) && budget_spent() {
+    if matches!(verdict, PolicyVerdict::Allow { .. }) && (budget_exhausted() || is_incomplete()) {
         verdict = PolicyVerdict::Ask;
     }
     drop(link_scope);
@@ -421,35 +437,114 @@ fn walker_reads_operands(eff: &[String]) -> bool {
         return false;
     };
     let args = &eff[1..];
-    let opts = || args.iter().take_while(|a| a.as_str() != "--");
     match shell::base(first) {
         "tar" | "bsdtar" | "gtar" => {
+            const TAR_READ_LONGS: &[&str] = &[
+                "create",
+                "append",
+                "update",
+                "catenate",
+                "concatenate",
+                "diff",
+                "compare",
+            ];
+            const TAR_LONG_NAMES: &[&str] = &[
+                "create",
+                "append",
+                "update",
+                "catenate",
+                "concatenate",
+                "diff",
+                "compare",
+                "directory",
+                "delete",
+                "dereference",
+                "compress",
+                "checkpoint",
+                "check-links",
+                "list",
+                "extract",
+                "get",
+                "file",
+                "files-from",
+                "exclude",
+                "exclude-from",
+            ];
             let mut modes = String::new();
+            let mut i = 0usize;
+            // Old-style bundled options (`tar tf plain.tar proj`, `tar cf out.tar proj`):
+            // every char in the first arg is a flag; value-taking flags consume
+            // subsequent args in order.
             if let Some(a) = args.first()
                 && !a.starts_with('-')
             {
-                modes.push_str(a); // old style: `tar cf x proj`
-            }
-            for a in opts() {
-                if let Some(l) = a.strip_prefix("--") {
-                    match l.split('=').next().unwrap_or("") {
-                        "create" | "append" | "update" | "catenate" | "concatenate" => {
-                            modes.push('c')
-                        }
-                        "list" => modes.push('t'),
-                        "extract" | "get" => modes.push('x'),
-                        "diff" | "compare" => modes.push('d'),
-                        "delete" => modes.push('D'),
-                        _ => {}
+                modes.push_str(a);
+                i = 1;
+                for c in a.chars() {
+                    if matches!(
+                        c,
+                        'f' | 'C' | 'b' | 'T' | 'X' | 'H' | 'I' | 'K' | 'L' | 'N' | 'V'
+                    ) {
+                        i += 1;
                     }
-                } else if let Some(sh) = a.strip_prefix('-') {
-                    modes.push_str(sh);
                 }
             }
-            let reads = modes.contains(['c', 'r', 'u', 'A']);
-            let other = modes.contains(['t', 'x', 'd']) || modes.contains('D');
-            // `-d` compares the archive with the live files: it reads them
-            reads || modes.contains('d') || !other
+            while i < args.len() {
+                let a = args[i].as_str();
+                i += 1;
+                if a == "--" {
+                    break;
+                }
+                if let Some(l) = a.strip_prefix("--") {
+                    let (name, has_val) = l.split_once('=').map_or((l, false), |(n, _)| (n, true));
+                    if TAR_READ_LONGS
+                        .iter()
+                        .any(|full| long_is(a, full, TAR_LONG_NAMES))
+                    {
+                        modes.push('c');
+                    } else {
+                        match name {
+                            "list" => modes.push('t'),
+                            "extract" | "get" => modes.push('x'),
+                            "delete" => modes.push('D'),
+                            "file"
+                            | "directory"
+                            | "files-from"
+                            | "exclude-from"
+                            | "exclude"
+                            | "use-compress-program"
+                            | "blocking-factor"
+                            | "format"
+                            | "newer"
+                            | "tape-length"
+                            | "label" => {
+                                if !has_val {
+                                    i += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if let Some(sh) = a.strip_prefix('-') {
+                    let cs: Vec<char> = sh.chars().collect();
+                    for (k, &c) in cs.iter().enumerate() {
+                        if matches!(
+                            c,
+                            'f' | 'C' | 'b' | 'T' | 'X' | 'H' | 'I' | 'K' | 'L' | 'N' | 'V'
+                        ) {
+                            if k + 1 == cs.len() {
+                                i += 1;
+                            }
+                            break;
+                        }
+                        modes.push(c);
+                    }
+                }
+            }
+            // `-d` compares the archive with live files (reads them); unknown mode fails closed.
+            let reads = modes.contains(['c', 'r', 'u', 'A', 'd']);
+            let non_reading = modes.contains(['t', 'x', 'D']);
+            reads || !non_reading
         }
         "7z" | "7za" => !matches!(
             args.iter()
@@ -457,29 +552,108 @@ fn walker_reads_operands(eff: &[String]) -> bool {
                 .map(String::as_str),
             Some("x" | "e" | "l" | "t")
         ),
-        "cpio" => !opts().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('i')),
+        "cpio" => {
+            let mut extract = false;
+            let mut writes = false;
+            let mut i = 0usize;
+            while i < args.len() {
+                let a = args[i].as_str();
+                i += 1;
+                if a == "--" {
+                    break;
+                }
+                if let Some(l) = a.strip_prefix("--") {
+                    let (name, has_val) = l.split_once('=').map_or((l, false), |(n, _)| (n, true));
+                    match name {
+                        "extract" => extract = true,
+                        "create" | "pass-through" => writes = true,
+                        "file" | "format" | "io-size" | "pattern-file" | "owner" => {
+                            if !has_val {
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if let Some(sh) = a.strip_prefix('-') {
+                    let cs: Vec<char> = sh.chars().collect();
+                    for (k, &c) in cs.iter().enumerate() {
+                        if matches!(c, 'F' | 'H' | 'C' | 'E' | 'I' | 'O' | 'R') {
+                            if k + 1 == cs.len() {
+                                i += 1;
+                            }
+                            break;
+                        }
+                        match c {
+                            'i' => extract = true,
+                            'o' | 'p' => writes = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            writes || !extract
+        }
         "pax" => {
-            opts().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('w'))
-                || !opts().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('r'))
+            let mut reads = false;
+            let mut writes = false;
+            let mut i = 0usize;
+            while i < args.len() {
+                let a = args[i].as_str();
+                i += 1;
+                if a == "--" {
+                    break;
+                }
+                if let Some(sh) = a.strip_prefix('-')
+                    && !a.starts_with("--")
+                {
+                    let cs: Vec<char> = sh.chars().collect();
+                    for (k, &c) in cs.iter().enumerate() {
+                        if matches!(c, 'b' | 'f' | 'o' | 's' | 'x') {
+                            if k + 1 == cs.len() {
+                                i += 1;
+                            }
+                            break;
+                        }
+                        match c {
+                            'r' => reads = true,
+                            'w' => writes = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            writes || !reads
         }
         _ => true,
     }
 }
 
-/// The dangling links in `~/.ssh` (and in folders below it, not through
-/// links): credential names whose target doesn't exist yet, so writing
-/// through them creates a key (review round 4 finding 2). Bounded like
-/// `ssh_members`; a folder it can't read marks the check unfinished.
+/// The dangling links in `~/.ssh` (and in folders below it, including
+/// symlinked folders): credential names whose target doesn't exist yet, so
+/// writing through them creates a key (review round 4 finding 2). Bounded on
+/// the check's shared budget; a folder it can't read marks the check
+/// unfinished.
 fn dangling_ssh_links(home: &Path) -> Vec<PathBuf> {
-    const MAX_ENTRIES: usize = 1024;
+    const MAX_ENTRIES: usize = 4096;
     const MAX_DEPTH: u8 = 8;
     let mut out = vec![];
     let mut found = 0usize;
-    let mut stack = vec![(home.join(".ssh"), 0u8)];
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let ssh_dir = home.join(".ssh");
+    if let Ok(canon) = std::fs::canonicalize(&ssh_dir) {
+        visited.insert(canon);
+    }
+    let mut stack = vec![(ssh_dir, 0u8)];
     while let Some((dir, depth)) = stack.pop() {
-        if depth >= MAX_DEPTH || found >= MAX_ENTRIES {
+        if budget_exhausted() {
+            break;
+        }
+        if depth >= MAX_DEPTH || found > MAX_ENTRIES {
             mark_incomplete();
             continue;
+        }
+        if !spend(1) {
+            break;
         }
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
@@ -496,8 +670,11 @@ fn dangling_ssh_links(home: &Path) -> Vec<PathBuf> {
                 continue;
             };
             found += 1;
-            if found > MAX_ENTRIES || !spend(1) {
+            if found > MAX_ENTRIES {
                 mark_incomplete();
+                break;
+            }
+            if !spend(1) {
                 break;
             }
             let Ok(ft) = e.file_type() else {
@@ -509,6 +686,16 @@ fn dangling_ssh_links(home: &Path) -> Vec<PathBuf> {
                 match std::fs::metadata(&p) {
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => out.push(p),
                     Err(_) => mark_incomplete(),
+                    Ok(m) if m.is_dir() => {
+                        if !spend(1) {
+                            break;
+                        }
+                        if let Ok(canon) = std::fs::canonicalize(&p)
+                            && visited.insert(canon)
+                        {
+                            stack.push((p, depth + 1));
+                        }
+                    }
                     Ok(_) => {}
                 }
             } else if ft.is_dir() {
@@ -945,17 +1132,21 @@ struct GlobExpansion {
 
 thread_local! {
     /// The filesystem work left for the current link check (review round 3
-    /// finding 5): one budget across every walk, expansion and resolution
-    /// of a check. `None` outside a check (no limit beyond each walk's own).
+    /// finding 5, round 4 finding 5): one budget across every walk, expansion
+    /// and resolution of a check. `None` outside a check.
     static LINK_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static LINK_BUDGET_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether an unresolved permission/I/O error was seen during the current
+    /// evaluation (review round 4 finding 4). Tracked separately from budget
+    /// exhaustion so an unreadable path never stops a later definite deny.
+    static LINK_INCOMPLETE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Filesystem operations one link check may do, all walks together.
 const LINK_CHECK_BUDGET: usize = 1 << 18;
 
 /// Spends `n` operations of the current check's budget; false (and marks
-/// the check unfinished) once it is gone.
+/// the budget exhausted) once it is gone.
 fn spend(n: usize) -> bool {
     LINK_BUDGET.with(|b| match b.get() {
         None => true,
@@ -971,7 +1162,7 @@ fn spend(n: usize) -> bool {
     })
 }
 
-fn budget_spent() -> bool {
+fn budget_exhausted() -> bool {
     LINK_BUDGET_OUT.with(std::cell::Cell::get)
 }
 
@@ -981,7 +1172,7 @@ fn with_link_budget<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// One link check's scope: the whole of `evaluate_sync`'s link passes share
+/// One link check's budget scope: every link pass in `evaluate_sync` shares
 /// it (review round 4 finding 5). Entering inside an open scope reuses it.
 struct LinkScope(Option<(Option<usize>, bool)>);
 
@@ -1006,12 +1197,39 @@ impl Drop for LinkScope {
     }
 }
 
+/// Scope for unresolved path-resolution errors across `evaluate_sync` (round
+/// 4 finding 4). Entering inside an open scope reuses it.
+struct ResolveScope(Option<Option<bool>>);
+
+impl ResolveScope {
+    fn enter() -> Self {
+        if LINK_INCOMPLETE.with(std::cell::Cell::get).is_some() {
+            return ResolveScope(None);
+        }
+        ResolveScope(Some(LINK_INCOMPLETE.with(|c| c.replace(Some(false)))))
+    }
+}
+
+impl Drop for ResolveScope {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0.take() {
+            LINK_INCOMPLETE.with(|c| c.set(prev));
+        }
+    }
+}
+
 /// Marks the current check unfinished: something it needed couldn't be
 /// read or resolved (round 4 finding 4). No effect outside a check.
 fn mark_incomplete() {
-    if LINK_BUDGET.with(std::cell::Cell::get).is_some() {
-        LINK_BUDGET_OUT.with(|o| o.set(true));
-    }
+    LINK_INCOMPLETE.with(|c| {
+        if c.get().is_some() {
+            c.set(Some(true));
+        }
+    });
+}
+
+fn is_incomplete() -> bool {
+    LINK_INCOMPLETE.with(|c| c.get() == Some(true))
 }
 
 /// An I/O error that leaves a path unresolved, not just absent.
@@ -1074,10 +1292,6 @@ fn identity_hit(real: &Path, role: words::Role) -> Option<&'static str> {
     })
 }
 
-fn expand_glob(p: &Path) -> Option<GlobExpansion> {
-    expand_glob_with(p, false)
-}
-
 /// A glob split where the user's text puts it: `prefix` is a resolved real
 /// path (bytes, never a pattern: review round 4 finding 1) and `rest` the
 /// components from the first pattern one on, as written.
@@ -1094,33 +1308,12 @@ fn comp_is_pat(c: &OsStr) -> bool {
     comp_text(c).contains(['*', '?', '[', '{'])
 }
 
-fn expand_glob_with(p: &Path, include_dotfiles: bool) -> Option<GlobExpansion> {
-    // the components' own bytes (review round 3 finding 2)
-    let comps: Vec<OsString> = p.components().map(|c| c.as_os_str().to_owned()).collect();
-    // A `$`, a backtick or a brace left in any component (round 7 item 1):
-    // the shell expands it to something the pattern doesn't show
-    // (`~/${DIR}/work/*`, `~/$(echo v*)/w`); comma lists and ranges were
-    // expanded before (`words::brace_expand`), so a brace still here is one
-    // this walk can't read.
-    if comps
-        .iter()
-        .any(|c| comp_text(c).contains(['$', '`', '{', '}']))
-    {
-        return None;
-    }
-    let first = comps.iter().position(|c| comp_is_pat(c))?;
-    expand_pat(
-        &GlobPat {
-            prefix: comps[..first].iter().collect(),
-            rest: comps[first..].to_vec(),
-        },
-        include_dotfiles,
-    )
-}
-
 fn expand_pat(g: &GlobPat, include_dotfiles: bool) -> Option<GlobExpansion> {
     const MAX_ENTRIES: usize = 4096;
     const MAX_DEPTH: usize = 12;
+    if budget_exhausted() {
+        return None;
+    }
     let comps = &g.rest;
     let is_pat = |c: &OsString| comp_is_pat(c);
     if comps
@@ -1141,6 +1334,9 @@ fn expand_pat(g: &GlobPat, include_dotfiles: bool) -> Option<GlobExpansion> {
     let mut out = vec![];
     let mut truncated = false;
     while let Some((dir, k, deep)) = stack.pop() {
+        if budget_exhausted() {
+            return None;
+        }
         if k == comps.len() {
             out.push(dir);
             continue;
@@ -1156,8 +1352,10 @@ fn expand_pat(g: &GlobPat, include_dotfiles: bool) -> Option<GlobExpansion> {
             match std::fs::symlink_metadata(&next) {
                 Ok(_) => stack.push((next, k + 1, deep)),
                 Err(e) => {
-                    let not_there = e.kind() == std::io::ErrorKind::NotFound
-                        || std::fs::metadata(&dir).is_ok_and(|m| !m.is_dir());
+                    let not_there = matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) || std::fs::metadata(&dir).is_ok_and(|m| !m.is_dir());
                     if !not_there {
                         truncated = true;
                     }
@@ -1169,6 +1367,9 @@ fn expand_pat(g: &GlobPat, include_dotfiles: bool) -> Option<GlobExpansion> {
         if c == "**" {
             // zero folders here, or one more and `**` again
             stack.push((dir.clone(), k + 1, deep));
+            if !spend(1) {
+                return None;
+            }
             if let Ok(real_dir) = std::fs::canonicalize(&dir)
                 && !visited.insert((real_dir, k))
             {
@@ -1179,19 +1380,21 @@ fn expand_pat(g: &GlobPat, include_dotfiles: bool) -> Option<GlobExpansion> {
                 continue;
             }
         }
+        if !spend(1) {
+            return None;
+        }
         let m = globset::GlobBuilder::new(c)
             .literal_separator(true)
             .build()
             .ok()?
             .compile_matcher();
-        if !spend(1) {
-            return None;
-        }
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) => {
-                let not_dir = e.kind() == std::io::ErrorKind::NotFound
-                    || std::fs::metadata(&dir).is_ok_and(|m| !m.is_dir());
+                let not_dir = matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) || std::fs::metadata(&dir).is_ok_and(|m| !m.is_dir());
                 if !not_dir {
                     truncated = true;
                 }
@@ -1239,35 +1442,17 @@ fn expand_pat(g: &GlobPat, include_dotfiles: bool) -> Option<GlobExpansion> {
     })
 }
 
-/// Whether a glob reaches a file inside the linked folder `d`, or with
-/// `names_dir` (a recursive reader or walker) names `d` or a folder holding
-/// it. `ls vault/*` only names the folder: it stays ordinary.
-fn glob_reaches(p: &Path, d: &Path, names_dir: bool) -> Reach {
-    let Some(exp) = expand_glob(p) else {
-        return Reach::Maybe;
-    };
-    for f in exp.matches {
-        let real = real_path(&f);
-        if real.starts_with(d) && real != *d {
-            return Reach::Yes;
-        }
-        if names_dir && d.starts_with(&real) {
-            return Reach::Yes;
-        }
-    }
-    if exp.truncated {
-        Reach::Maybe
-    } else {
-        Reach::No
-    }
-}
-
 /// The real path of `p`, following symlinks (including dangling ones) in
 /// filesystem order so `..` applies after preceding links, falling back to
 /// the deepest existing ancestor when a tail does not exist.
 fn real_path(p: &Path) -> PathBuf {
-    if let Ok(r) = std::fs::canonicalize(p) {
-        return r;
+    if !spend(1) {
+        return p.to_path_buf();
+    }
+    match std::fs::canonicalize(p) {
+        Ok(r) => return r,
+        Err(e) if !unresolved(&e) => {}
+        Err(_) => mark_incomplete(),
     }
     use std::collections::VecDeque;
     use std::path::Component;
@@ -1331,7 +1516,9 @@ fn real_path(p: &Path) -> PathBuf {
             },
             Seg::Normal(name) => {
                 cur.push(&name);
-                spend(1);
+                if !spend(1) {
+                    return cur;
+                }
                 let md = match std::fs::symlink_metadata(&cur) {
                     Ok(md) => Some(md),
                     Err(e) => {
@@ -1341,24 +1528,37 @@ fn real_path(p: &Path) -> PathBuf {
                         None
                     }
                 };
-                if md.as_ref().is_some_and(|m| m.is_symlink()) && hops >= MAX_HOPS {
-                    mark_incomplete();
-                }
-                if hops < MAX_HOPS
-                    && md.is_some_and(|m| m.is_symlink())
-                    && let Ok(target) = std::fs::read_link(&cur)
-                {
-                    hops += 1;
-                    if target.is_absolute() {
-                        cur.clear();
+                if md.as_ref().is_some_and(|m| m.is_symlink()) {
+                    if hops >= MAX_HOPS {
+                        mark_incomplete();
                     } else {
-                        cur.pop();
+                        if !spend(1) {
+                            return cur;
+                        }
+                        match std::fs::read_link(&cur) {
+                            Ok(target) => {
+                                hops += 1;
+                                if target.is_absolute() {
+                                    cur.clear();
+                                } else {
+                                    cur.pop();
+                                }
+                                push_comps(&mut queue, &target, true);
+                                continue;
+                            }
+                            Err(e) => {
+                                if unresolved(&e) {
+                                    mark_incomplete();
+                                }
+                            }
+                        }
                     }
-                    push_comps(&mut queue, &target, true);
-                    continue;
-                }
-                if let Ok(canon) = std::fs::canonicalize(&cur) {
-                    cur = canon;
+                } else if md.is_some() {
+                    match std::fs::canonicalize(&cur) {
+                        Ok(canon) => cur = canon,
+                        Err(e) if unresolved(&e) => mark_incomplete(),
+                        Err(_) => {}
+                    }
                 }
             }
         }
@@ -1376,9 +1576,13 @@ fn reaches_linked_ssh_dir(
     resolved: &[PathBuf],
     linked: &[PathBuf],
     cwd: &Path,
+    home: &Path,
 ) -> Reach {
     if linked.is_empty() {
         return Reach::No;
+    }
+    if budget_exhausted() {
+        return Reach::Maybe;
     }
     let recursive_paths = matches!(
         &check.subject,
@@ -1405,11 +1609,17 @@ fn reaches_linked_ssh_dir(
     {
         return Reach::Yes;
     }
+    if budget_exhausted() {
+        return Reach::Maybe;
+    }
     // A recursive reader with no folder operand searches where it runs: each
     // directory the walk is sure of (an uncertain one keeps D-078's verdict).
     // Options it can't read: it may, so it asks (round 6 item 2).
     let mut maybe = false;
     for (i, u) in a.units.iter().enumerate() {
+        if budget_exhausted() {
+            return Reach::Maybe;
+        }
         if !recursive_reader(&u.eff) {
             continue;
         }
@@ -1425,14 +1635,30 @@ fn reaches_linked_ssh_dir(
             None => maybe = true,
         }
     }
+    let mut seen_globs: std::collections::HashSet<(String, PathBuf, bool)> =
+        std::collections::HashSet::new();
+    let mut seen_literals: std::collections::HashSet<(PathBuf, bool, bool)> =
+        std::collections::HashSet::new();
     let mut k = 0usize;
     for u in &a.uses {
+        if budget_exhausted() {
+            return Reach::Maybe;
+        }
         let unit = a.units.get(u.unit);
         let command_word = unit.is_some_and(|x| x.seg.argv.first() == Some(&u.word));
         let recursive = recursive_paths
-            || unit.is_some_and(|x| recursive_reader(&x.eff) || tree_walker(&x.eff));
-        let globby = u.word.contains(['*', '?', '[', '{']);
-        for _ in &u.paths {
+            || unit.is_some_and(|x| {
+                recursive_reader(&x.eff) || (tree_walker(&x.eff) && walker_reads_operands(&x.eff))
+            });
+        // Literal file-tool paths are never expanded as shell patterns (round 4
+        // finding 3); patterns are split from the user's text (finding 1).
+        let globby = unit.is_some() && u.word.contains(['*', '?', '[', '{', '}', '$', '`']);
+        let use_cwds: Vec<&Path> = a
+            .unit_cwd
+            .get(u.unit)
+            .map(|s| s.candidates().into_iter().map(PathBuf::as_path).collect())
+            .unwrap_or_default();
+        for (j, _) in u.paths.iter().enumerate() {
             let Some(p) = resolved.get(k) else {
                 return Reach::Maybe;
             };
@@ -1440,38 +1666,73 @@ fn reaches_linked_ssh_dir(
             if command_word {
                 continue;
             }
-            // a word the shell expands at run time (`$X`, a backtick) may
-            // name anything (round 7 item 1)
-            if p.to_string_lossy().contains(['$', '`']) {
+            if budget_exhausted() {
+                return Reach::Maybe;
+            }
+            let uc = use_cwds.get(j).copied().unwrap_or(cwd);
+            // a shell word the shell expands at run time (`$X`, a backtick) may
+            // name anything (round 7 item 1); never misread resolved bytes
+            if unit.is_some()
+                && split_home_prefix(&u.word, uc, home).is_none_or(|(_, r)| r.contains(['$', '`']))
+            {
                 maybe = true;
                 continue;
             }
-            if globby {
-                for d in linked {
-                    match glob_reaches(p, d, recursive) {
-                        Reach::Yes => return Reach::Yes,
-                        Reach::Maybe => maybe = true,
-                        Reach::No => {}
+            if globby && seen_globs.insert((u.word.clone(), uc.to_path_buf(), recursive)) {
+                // Expand once per unique (pattern, cwd, recursive) and check
+                // against all linked dirs (round 4 finding 5 case A).
+                match words::brace_expand(&u.word) {
+                    Some(vs) => {
+                        for v in vs {
+                            if budget_exhausted() {
+                                return Reach::Maybe;
+                            }
+                            let targets = raw_targets(&v, uc, home, false, &mut maybe);
+                            for f in targets {
+                                if budget_exhausted() {
+                                    return Reach::Maybe;
+                                }
+                                let real = real_path(&f);
+                                for d in linked {
+                                    if real.starts_with(d) && real != *d {
+                                        return Reach::Yes;
+                                    }
+                                    if recursive && d.starts_with(&real) {
+                                        return Reach::Yes;
+                                    }
+                                }
+                            }
+                        }
                     }
+                    None => maybe = true,
                 }
             }
-            let real = real_path(p);
-            let is_dir = real.is_dir();
-            for d in linked {
-                let inside = real.starts_with(d) && real != *d;
-                if inside && !is_dir {
-                    return Reach::Yes;
-                }
-                if globby && real.parent().is_some_and(|parent| parent.starts_with(d)) {
-                    return Reach::Yes;
-                }
-                if recursive && (real.starts_with(d) || d.starts_with(&real)) {
-                    return Reach::Yes;
+            if budget_exhausted() {
+                return Reach::Maybe;
+            }
+            if seen_literals.insert((p.clone(), recursive, globby)) {
+                let real = real_path(p);
+                let is_dir = real.is_dir();
+                for d in linked {
+                    let inside = real.starts_with(d) && real != *d;
+                    if inside && !is_dir {
+                        return Reach::Yes;
+                    }
+                    if globby && real.parent().is_some_and(|parent| parent.starts_with(d)) {
+                        return Reach::Yes;
+                    }
+                    if recursive && (real.starts_with(d) || d.starts_with(&real)) {
+                        return Reach::Yes;
+                    }
                 }
             }
         }
     }
-    if maybe { Reach::Maybe } else { Reach::No }
+    if maybe || budget_exhausted() {
+        Reach::Maybe
+    } else {
+        Reach::No
+    }
 }
 
 /// Whether a command follows the links it meets below the folders it is
@@ -1961,19 +2222,14 @@ fn links_below(
 ) -> (Reach, Option<&'static str>) {
     const BUDGET: usize = 4096;
     const MAX_DEPTH: u8 = 16;
+    if budget_exhausted() || !spend(1) {
+        return (Reach::Maybe, None);
+    }
     let mut seen = 0usize;
     let mut visited: Vec<PathBuf> = vec![];
     if let Ok(r) = std::fs::canonicalize(root) {
         visited.push(r);
     }
-    // an error that leaves part of the walk unchecked (not a missing path,
-    // a non-folder or a link loop): Maybe, unless a sure hit turns up
-    let unchecked = |e: &std::io::Error| {
-        !(matches!(
-            e.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        ) || e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()))
-    };
     // The folders a walker reads but a project fills with many entries
     // (`.git`, `node_modules`, `target`): walked (round 2 finding 3), on a
     // budget of their own so an ordinary repo still fits.
@@ -1982,10 +2238,13 @@ fn links_below(
     let mut maybe = false;
     let mut stack = vec![(root.to_path_buf(), 0u8, false)];
     while let Some((dir, depth, bulk)) = stack.pop() {
+        if budget_exhausted() || !spend(1) {
+            return (Reach::Maybe, None);
+        }
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) => {
-                maybe |= unchecked(&e);
+                maybe |= unresolved(&e);
                 continue;
             }
         };
@@ -2016,10 +2275,13 @@ fn links_below(
                 continue;
             }
             if ft.is_symlink() {
+                if !spend(1) {
+                    return (Reach::Maybe, None);
+                }
                 let real = match std::fs::canonicalize(&p) {
                     Ok(r) => r,
                     Err(e) => {
-                        maybe |= unchecked(&e);
+                        maybe |= unresolved(&e);
                         continue;
                     }
                 };
@@ -2049,7 +2311,7 @@ fn links_below(
             }
         }
     }
-    if maybe {
+    if maybe || budget_exhausted() {
         (Reach::Maybe, None)
     } else {
         (Reach::No, None)
@@ -2063,34 +2325,59 @@ fn links_below(
 /// Resolves only the literal prefix before the first glob/expansion component
 /// so parent segments after a wildcard are preserved for `expand_glob` instead
 /// of being collapsed lexically against the wildcard.
+fn split_home_prefix<'a>(word: &'a str, cwd: &Path, home: &Path) -> Option<(PathBuf, &'a str)> {
+    if let Some(after) = word.strip_prefix('~') {
+        let (name, rest) = match after.find('/') {
+            Some(i) => (&after[..i], &after[i + 1..]),
+            None => (after, ""),
+        };
+        let user = home.file_name().map(|n| n.to_string_lossy().into_owned());
+        if name.is_empty() || user.as_deref() == Some(name) {
+            return Some((home.to_path_buf(), rest));
+        }
+        if name == "+" || name == "-" {
+            return Some((cwd.to_path_buf(), rest));
+        }
+        return None;
+    }
+    for (var, base) in [
+        ("$HOME", home),
+        ("${HOME}", home),
+        ("$PWD", cwd),
+        ("${PWD}", cwd),
+    ] {
+        if let Some(rest) = word.strip_prefix(var) {
+            if rest.is_empty() {
+                return Some((base.to_path_buf(), ""));
+            }
+            if let Some(r) = rest.strip_prefix('/') {
+                return Some((base.to_path_buf(), r));
+            }
+        }
+    }
+    if let Some(r) = word.strip_prefix('/') {
+        return Some((PathBuf::from("/"), r));
+    }
+    Some((cwd.to_path_buf(), word))
+}
+
 enum RawGlob {
     /// No pattern in the user's text: the path as written (callers resolve it
     /// with `real_path`, which follows links before `..`).
     Literal(PathBuf),
     Pat(GlobPat),
+    /// Unknown prefix such as `~otheruser`: fail closed to `Maybe`.
+    Unknown,
 }
 
 /// Splits a glob where the user's text has its first pattern component.
 /// The base (cwd, home) and the literal prefix are resolved bytes and are
 /// never read as pattern syntax (review round 4 finding 1).
 fn raw_glob(word: &str, cwd: &Path, home: &Path) -> RawGlob {
-    let (base, rel): (PathBuf, String) = if word == "~" {
-        (home.to_path_buf(), String::new())
-    } else if let Some(r) = word.strip_prefix("~/") {
-        (home.to_path_buf(), r.to_string())
-    } else if let Some(r) = word.strip_prefix('/') {
-        (PathBuf::from("/"), r.to_string())
-    } else if word.starts_with('~') {
-        // `~user/...`: that user's home, then the rest as written
-        let w = expand_home(word, home, cwd);
-        match w.strip_prefix('/') {
-            Some(r) => (PathBuf::from("/"), r.to_string()),
-            None => (cwd.to_path_buf(), w),
-        }
-    } else {
-        (cwd.to_path_buf(), word.to_string())
+    let Some((base, rel)) = split_home_prefix(word, cwd, home) else {
+        return RawGlob::Unknown;
     };
-    let comps: Vec<OsString> = Path::new(&rel)
+    let comps: Vec<OsString> = Path::new(rel)
         .components()
         .map(|c| c.as_os_str().to_owned())
         .collect();
@@ -2124,6 +2411,10 @@ fn raw_targets(
     include_dotfiles: bool,
     maybe: &mut bool,
 ) -> Vec<PathBuf> {
+    if budget_exhausted() {
+        *maybe = true;
+        return vec![];
+    }
     match raw_glob(word, cwd, home) {
         RawGlob::Literal(p) => vec![p],
         RawGlob::Pat(g) => match expand_pat(&g, include_dotfiles) {
@@ -2138,6 +2429,10 @@ fn raw_targets(
                 vec![]
             }
         },
+        RawGlob::Unknown => {
+            *maybe = true;
+            vec![]
+        }
     }
 }
 
@@ -2148,16 +2443,19 @@ fn first_tree_hit(
     role: words::Role,
     sensitive: Option<&deny::Sensitive>,
 ) -> Option<&'static str> {
-    targets.iter().find_map(|f| {
-        // out of budget: the caller's `Maybe` comes from `budget_spent`
-        if !spend(1) {
+    for f in targets {
+        if budget_exhausted() || !spend(1) {
             return None;
         }
         let real = real_path(f);
-        in_trees(&real, trees, names_dir, role, sensitive)
+        if let Some(id) = in_trees(&real, trees, names_dir, role, sensitive)
             .map(|t| t.id)
             .or_else(|| identity_hit(&real, role))
-    })
+        {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// One link check under one shared filesystem budget (review round 3
@@ -2174,7 +2472,7 @@ fn reaches_tree_through_links(
     with_link_budget(|| {
         match reaches_tree_through_links_once(check, a, resolved, trees, cwd, home, sensitive) {
             (Reach::Yes, t) => (Reach::Yes, t),
-            _ if budget_spent() => (Reach::Maybe, None),
+            _ if budget_exhausted() || is_incomplete() => (Reach::Maybe, None),
             r => r,
         }
     })
@@ -2192,6 +2490,9 @@ fn reaches_tree_through_links_once(
     if trees.is_empty() {
         return (Reach::No, None);
     }
+    if budget_exhausted() {
+        return (Reach::Maybe, None);
+    }
     let mut maybe = false;
     let recursive_paths = matches!(
         &check.subject,
@@ -2200,7 +2501,27 @@ fn reaches_tree_through_links_once(
             ..
         }
     );
+    let prune_id = |p: PruneDirs| match p {
+        PruneDirs::None => 0u8,
+        PruneDirs::GitOnly => 1u8,
+        PruneDirs::AckDefault => 2u8,
+    };
+    let follow_id = |f: Follow| match f {
+        Follow::No => 0u8,
+        Follow::Maybe => 1u8,
+        Follow::Yes => 2u8,
+    };
+    let role_id = |r: words::Role| match r {
+        words::Role::Read => 0u8,
+        words::Role::Write => 1u8,
+        words::Role::MaybeWrite => 2u8,
+    };
+    let mut seen_walk: std::collections::HashSet<(PathBuf, bool, u8)> =
+        std::collections::HashSet::new();
     for (i, u) in a.units.iter().enumerate() {
+        if budget_exhausted() {
+            return (Reach::Maybe, None);
+        }
         let follow = follows_links(&u.eff);
         if !recursive_reader(&u.eff) {
             continue;
@@ -2212,34 +2533,44 @@ fn reaches_tree_through_links_once(
             None => false,
         };
         let prune = prune_mode(&u.eff);
+        let pid = prune_id(prune);
         if let Some(words::CwdState::Known(cands)) = a.unit_cwd.get(i) {
             for c in cands {
-                // what it reads without following: hard links are sure hits
-                match links_below(c, trees, prune, sensitive, false) {
-                    (Reach::Yes, t) if reads_cwd => return (Reach::Yes, t),
-                    (Reach::No, _) => {}
-                    _ => maybe = true,
+                if budget_exhausted() {
+                    return (Reach::Maybe, None);
                 }
-                if follow == Follow::No {
+                // what it reads without following: hard links are sure hits
+                if seen_walk.insert((c.clone(), false, pid)) {
+                    match links_below(c, trees, prune, sensitive, false) {
+                        (Reach::Yes, t) if reads_cwd => return (Reach::Yes, t),
+                        (Reach::No, _) => {}
+                        _ => maybe = true,
+                    }
+                }
+                if follow == Follow::No || budget_exhausted() {
                     continue;
                 }
-                match links_below(c, trees, prune, sensitive, true) {
-                    (Reach::Yes, t) if reads_cwd && follow == Follow::Yes => {
-                        return (Reach::Yes, t);
+                if seen_walk.insert((c.clone(), true, pid)) {
+                    match links_below(c, trees, prune, sensitive, true) {
+                        (Reach::Yes, t) if reads_cwd && follow == Follow::Yes => {
+                            return (Reach::Yes, t);
+                        }
+                        (Reach::No, _) => {}
+                        _ => maybe = true,
                     }
-                    (Reach::No, _) => {}
-                    _ => maybe = true,
                 }
             }
         }
     }
-    let file_tool = matches!(check.subject, ToolSubject::Paths { .. });
     if let ToolSubject::Paths {
         paths,
         glob: Some(g),
         recursive,
     } = &check.subject
     {
+        if budget_exhausted() {
+            return (Reach::Maybe, None);
+        }
         let role = match check.kind {
             ToolKind::Read | ToolKind::Search => words::Role::Read,
             _ => words::Role::Write,
@@ -2258,6 +2589,9 @@ fn reaches_tree_through_links_once(
         let mut seen_gv = std::collections::HashSet::new();
         let mut seen_cand = std::collections::HashSet::new();
         for gv in exps {
+            if budget_exhausted() {
+                return (Reach::Maybe, None);
+            }
             if gv.is_empty() || !seen_gv.insert(gv.clone()) {
                 continue;
             }
@@ -2287,6 +2621,9 @@ fn reaches_tree_through_links_once(
                 v
             };
             for (w, r) in cands {
+                if budget_exhausted() {
+                    return (Reach::Maybe, None);
+                }
                 if !seen_cand.insert((w.clone(), r.to_path_buf())) {
                     continue;
                 }
@@ -2297,15 +2634,32 @@ fn reaches_tree_through_links_once(
             }
         }
     }
+    #[derive(Hash, PartialEq, Eq)]
+    struct ShellGlobKey {
+        word: String,
+        cwd: PathBuf,
+        role: u8,
+        recursive: bool,
+        lister: bool,
+        follow: u8,
+        reads_contents: bool,
+        prune: u8,
+    }
+    let mut seen_shell_glob: std::collections::HashSet<ShellGlobKey> =
+        std::collections::HashSet::new();
+    let mut seen_lit: std::collections::HashSet<(String, PathBuf, u8, bool)> =
+        std::collections::HashSet::new();
     let mut k = 0usize;
     for u in &a.uses {
+        if budget_exhausted() {
+            return (Reach::Maybe, None);
+        }
         let unit = a.units.get(u.unit);
         let command_word = unit.is_some_and(|x| x.seg.argv.first() == Some(&u.word));
         let recursive = recursive_paths
             || unit.is_some_and(|x| recursive_reader(&x.eff) || tree_walker(&x.eff));
         let follow = unit.map_or(Follow::No, |x| follows_links(&x.eff));
         let prune = unit.map_or(PruneDirs::None, |x| prune_mode(&x.eff));
-        let include_dotfiles = unit.is_none() && file_tool;
         let reads_contents = (u.role == words::Role::Read
             || unit.is_some_and(|x| {
                 recursive_reader(&x.eff) || (tree_walker(&x.eff) && walker_reads_operands(&x.eff))
@@ -2326,6 +2680,9 @@ fn reaches_tree_through_links_once(
         // A pattern is the user's text, never resolved bytes (round 4
         // finding 1); a file tool's path is literal (round 4 finding 3).
         let globby = unit.is_some() && u.word.contains(['*', '?', '[', '{', '}', '$', '`']);
+        let pid = prune_id(prune);
+        let fid = follow_id(follow);
+        let rid = role_id(u.role);
         for (j, _) in u.paths.iter().enumerate() {
             let Some(p) = resolved.get(k) else {
                 return (Reach::Maybe, None);
@@ -2334,13 +2691,31 @@ fn reaches_tree_through_links_once(
             if command_word {
                 continue;
             }
+            if budget_exhausted() {
+                return (Reach::Maybe, None);
+            }
             let targets = if globby {
                 let uc = use_cwds.get(j).copied().unwrap_or(cwd);
+                if !seen_shell_glob.insert(ShellGlobKey {
+                    word: u.word.clone(),
+                    cwd: uc.to_path_buf(),
+                    role: rid,
+                    recursive,
+                    lister,
+                    follow: fid,
+                    reads_contents,
+                    prune: pid,
+                }) {
+                    continue;
+                }
                 match words::brace_expand(&u.word) {
                     Some(vs) => {
                         let mut t = vec![];
                         for v in vs {
-                            t.extend(raw_targets(&v, uc, home, include_dotfiles, &mut maybe));
+                            if budget_exhausted() {
+                                return (Reach::Maybe, None);
+                            }
+                            t.extend(raw_targets(&v, uc, home, false, &mut maybe));
                         }
                         t
                     }
@@ -2358,29 +2733,35 @@ fn reaches_tree_through_links_once(
             {
                 return (Reach::Yes, Some(t));
             }
-            if recursive {
+            if recursive && reads_contents {
                 for f in &targets {
+                    if budget_exhausted() {
+                        return (Reach::Maybe, None);
+                    }
                     if !f.is_dir() {
                         continue;
                     }
                     // the tree it reads without following: hard links to a
                     // credential are read whatever the command follows
                     // (only a tree whose files are opened: not `rm -r`/`mv`,
-                    // which move or unlink names)
-                    if reads_contents {
+                    // which move or unlink names, nor `tar -t`/`-x` which
+                    // read an archive rather than live operands)
+                    if seen_walk.insert((f.clone(), false, pid)) {
                         match links_below(f, trees, prune, sensitive, false) {
                             (Reach::Yes, t) => return (Reach::Yes, t),
                             (Reach::No, _) => {}
                             _ => maybe = true,
                         }
                     }
-                    if follow == Follow::No {
+                    if follow == Follow::No || budget_exhausted() {
                         continue;
                     }
-                    match links_below(f, trees, prune, sensitive, true) {
-                        (Reach::Yes, t) if follow == Follow::Yes => return (Reach::Yes, t),
-                        (Reach::No, _) => {}
-                        _ => maybe = true,
+                    if seen_walk.insert((f.clone(), true, pid)) {
+                        match links_below(f, trees, prune, sensitive, true) {
+                            (Reach::Yes, t) if follow == Follow::Yes => return (Reach::Yes, t),
+                            (Reach::No, _) => {}
+                            _ => maybe = true,
+                        }
                     }
                 }
             }
@@ -2390,9 +2771,7 @@ fn reaches_tree_through_links_once(
         // link: round 2 finding 5): check where the filesystem takes it.
         // A file tool's path is literal whatever it holds (`key[1]`: review
         // round 3 finding 4); a shell word with metacharacters is a pattern.
-        if !command_word
-            && (unit.is_none() || !u.word.contains(['*', '?', '[', '{', '}', '$', '`']))
-        {
+        if !command_word && !globby {
             let unit_cwds: Vec<&Path> = a
                 .unit_cwd
                 .get(u.unit)
@@ -2400,43 +2779,33 @@ fn reaches_tree_through_links_once(
                 .filter(|v: &Vec<&Path>| !v.is_empty())
                 .unwrap_or_else(|| vec![cwd]);
             for uc in &unit_cwds {
+                if budget_exhausted() {
+                    return (Reach::Maybe, None);
+                }
+                if !seen_lit.insert((u.word.clone(), uc.to_path_buf(), rid, recursive)) {
+                    continue;
+                }
                 let w = expand_home(&u.word, home, uc);
                 let raw = uc.join(&w);
                 let real = real_path(&raw);
-                if u.paths.contains(&real) {
-                    continue;
-                }
-                if let Some(id) = in_trees(&real, trees, recursive, u.role, sensitive)
-                    .map(|t| t.id)
-                    .or_else(|| identity_hit(&real, u.role))
-                {
-                    return (Reach::Yes, Some(id));
-                }
-            }
-        }
-        if !command_word
-            && !lister
-            && u.word.contains("..")
-            && u.word.contains(['*', '?', '['])
-            && let Some(exps) = words::brace_expand(&u.word)
-        {
-            let unit_cwds: Vec<&Path> = a
-                .unit_cwd
-                .get(u.unit)
-                .map(|s| s.candidates().into_iter().map(PathBuf::as_path).collect())
-                .filter(|v: &Vec<&Path>| !v.is_empty())
-                .unwrap_or_else(|| vec![cwd]);
-            for ev in exps {
-                for uc in &unit_cwds {
-                    let targets = raw_targets(&ev, uc, home, include_dotfiles, &mut maybe);
-                    if let Some(t) = first_tree_hit(&targets, trees, recursive, u.role, sensitive) {
-                        return (Reach::Yes, Some(t));
+                let differs = !u.paths.contains(&real);
+                if differs || !real.is_dir() {
+                    // When `u.paths` already holds `real` (e.g. a dangling or
+                    // relocated credential file with no inode for `alias_fix`),
+                    // classify as a file (`names_dir = false`, preserving
+                    // `ls ~/.ssh` and `rg ~`).
+                    let names_dir = differs && recursive;
+                    if let Some(id) = in_trees(&real, trees, names_dir, u.role, sensitive)
+                        .map(|t| t.id)
+                        .or_else(|| identity_hit(&real, u.role))
+                    {
+                        return (Reach::Yes, Some(id));
                     }
                 }
             }
         }
     }
-    if maybe {
+    if maybe || budget_exhausted() {
         (Reach::Maybe, None)
     } else {
         (Reach::No, None)
