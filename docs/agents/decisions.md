@@ -811,3 +811,17 @@ M1-30-tree-wildcards went through five Hydrogen `high` rounds. Codex review roun
 
 ## D-132 — 2026-11-18 — M1-28 escalates to Opus 5.5 (orchestrator, under PLAN §8.3)
 M1-28-ansi-c-words went through five Hydrogen `high` rounds. Codex review round 2 (`reviews/M1-28-ansi-c-words-round2.md`) still found 4 majors and 2 minors: unreadable ANSI-C words that Allow, `cd` candidates in globbed folders, a withdrawal channel that is never drained, and quadratic markdown. **An Opus 5.5 worker** continues. The review stays with Codex. Same reasoning as D-127 to D-131.
+
+## D-133 — 2026-11-21 — rodrigo: keep `dev`'s behaviour on two findings (orchestrator's pick, at rodrigo's request)
+rodrigo asked the orchestrator to choose. It kept `dev`'s behaviour on both:
+- **M1-31, review 1, finding 3 (`~/.config`):** a recursive search of `~/.config` **keeps Ask**; it is not hard-denied. This is a recorded exception to S8's "a recursive search of a folder holding a hard-denied credential is hard-denied". Why: searching config files is ordinary work, a hard deny can't be approved, and contract §9 already uses Ask for credential stores outside the hard-deny list (CR-12). The two `policy.rs` tests that expect Ask stay as they are.
+- **M1-27, review 2, finding 8 (a long `env` line that can't be read):** **`dev`'s design stays.** Home and a prefix rule ask; Any and FullAccess allow unless a hard deny applies. `adversarial_m1_18`'s "K1 fix2 unbounded safe" row stands. Making unreadable lines ask under FullAccess would change a security default, and D-013 gives that to Pedro.
+- Both findings are closed by this decision. Pedro can overturn either one.
+
+## D-134 — 2026-11-21 — rodrigo: Gemini 4 Neon takes Hydrogen's place, and the heavy work
+**Decided by rodrigo (driver).** Gemini 4 Neon, through `agy`, takes every role Gemini 4 Hydrogen held on rodrigo's shifts (D-084, D-073, D-074, D-076), and also the heavy tasks: escalations, security fixes, and the work D-127 to D-132 gave to Opus 5.5.
+- **Model ids:** `gemini-4-neon-high` for writers, escalations and security; `gemini-4-neon-medium` for utility work. `xhigh` is there for the hardest escalations.
+- **The M1-27 batch's six tasks continue on Neon `high`** from their branch tips and handoffs, including the WIP commits left by the Opus workers when the Claude usage limit stopped them.
+- **Unchanged:** reviews stay with Codex (GPT-6.1 Sol, `high`, read-only; D-124), so Neon's work is reviewed cross-provider. Writers stay inside the `agy` allowlist (no `python3`, no GUI), and D-123's write-then-verify flow holds. Work that needs path-like literals the policy refuses (D-074) still goes to Claude.
+- **`agy` 1.5.14:** the hook check of `HANDOFF.md` passed with Neon in a scratch worktree, which was removed afterwards. `cargo --version` was allowed; the write to `.agents/probe.txt` and `git push` were denied by the hook. `scripts/doctor` names 1.5.14 as the tested version.
+- This applies to rodrigo's shifts. Pedro's shifts keep his own routing unless he decides otherwise (D-064).

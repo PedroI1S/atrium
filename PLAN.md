@@ -35,7 +35,7 @@ A fast, lightweight agent development environment written in Rust. It wraps the 
 | Audience | Personal first, kept clean enough to open-source later |
 | Editor AI | Optional and off until you pick a provider: Copilot-style ghost text, next-edit prediction, ⌘K inline edit. Backends: Copilot LSP, your own local server (never bundled or auto-started), remote APIs, free hosted models (`untrusted`: manual only, current file only). Context engine in `atriumd`; the one place it calls models directly (3.21) |
 | Databases | SQLite/libSQL + PostgreSQL: query editor, drawDB-style schema diagram with design → migration, Drizzle Studio-style table view with staged edits; agents get read-only `db_*` tools, writes go through approvals (3.19) |
-| Build team | Opus 5.5 orchestrates; Sol 6.1 (backend), Sonnet 5.5 (frontend), Argon (systems/security), Gemini 4 Hydrogen (utility; it replaced 3.8 Flash, D-068), Astra (gates/escalation). Cross-provider review, contract-first parallel fan-out. See section 8. |
+| Build team | Opus 5.5 orchestrates; Sol 6.1 (backend), Sonnet 5.5 (frontend), Argon (systems/security), Gemini 4 Hydrogen (utility; it replaced 3.8 Flash, D-068), Gemini 4 Neon (on rodrigo's shifts: Hydrogen's roles and the heavy work, D-134), Astra (gates/escalation). Cross-provider review, contract-first parallel fan-out. See section 8. |
 
 ## 2. Landscape (what we borrow / where we differ)
 
@@ -144,7 +144,7 @@ trait AgentAdapter {
 
 - **Claude Code**: spawn `claude -p --input-format stream-json --output-format stream-json --verbose` with `--mcp-config` pointing at Atrium's MCP. Handle permission prompts through the control protocol (`can_use_tool`) so approvals show up in our UI and the policy engine. Session resume via `--resume`.
 - **Codex**: `codex app-server` (JSON-RPC over stdio). It has native `sandbox` (`read-only` / `workspace-write`) and `approval_policy`, which fit the Home chat policy directly. Its rate-limit notifications feed the scheduler.
-- **Antigravity (`agy`)**: Google's agent CLI, which runs the Gemini models (Argon, Hydrogen, 3.8 Flash).
+- **Antigravity (`agy`)**: Google's agent CLI, which runs the Gemini models (Argon, Hydrogen, Neon, 3.8 Flash).
   - Spawn `agy -p --input-format stream-json --output-format stream-json --model <id> --effort <level>`.
   - Permission modes: `--mode accept-edits|auto|plan`. Resume: `--conversation <id>`.
   - **Approvals (found in the M0-00 smoke test)**: headless `agy` can't prompt and ignores hook `allow` grants, but enforces hook `deny`. So Atrium runs `agy` with `--dangerously-skip-permissions` plus a `PreToolUse` hook (matcher `"*"`) that calls back into `atriumd`'s policy engine over the socket: `allow`/`deny` per call, and `ask` becomes "deny + inbox approval + retry". Re-test with each `agy` release; a native host-approval channel would replace this.
@@ -832,6 +832,7 @@ This section covers building Atrium with a team of agents. The same rules later 
 | **GPT-6.1 Sol** | OpenAI / Codex | Close to Astra on agentic coding at ~1/5 the price; slower output (~$2/$10) | **Backend workhorse.** Most Rust crates. Long, well-specified background tasks. |
 | **Claude Sonnet 5.5** | Anthropic / Claude Code | Fast, strong coder, good at UI iteration | **Frontend + Claude-integration workhorse.** SolidJS UI, Tauri bridge, Claude adapter, mid-tier reviews. |
 | **Gemini 4 Hydrogen** | Google / Antigravity (`agy`) | Took Gemini 3.8 Flash's place on 2026-11-13 (D-068); its price and profile are not calibrated yet (8.6) | **High-volume utility.** Tests, fixtures, docs, boilerplate, codebase exploration, check-failure triage, handoff/commit summaries. |
+| **Gemini 4 Neon** | Google / Antigravity (`agy`) | Took Hydrogen's place on rodrigo's shifts on 2026-11-21 (D-134); not calibrated yet (8.6) | **Hydrogen's roles plus the heavy work** on rodrigo's shifts: writers, escalations and security fixes (`gemini-4-neon-high`), utility work (`gemini-4-neon-medium`). Reviewed cross-provider by Codex (D-124). |
 
 **Gemini 4 Hydrogen replaced Gemini 3.8 Flash in this roster on 2026-11-13 (D-068).** Records written before that (briefs, reviews, decisions, the M1 contract's task table) name Flash and are left as they were; where one of them gives Flash a role that is still open, read Hydrogen.
 
