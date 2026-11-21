@@ -278,20 +278,47 @@ function inlinesOf(nodes: Node[]): Inline[] {
   return out;
 }
 
-/** Link destination and optional title after `](`. Returns the end index (after `)`) or -1. */
-function linkTail(s: string, at: number): { dest: string; end: number } | null {
+interface LinkScanState {
+  lastParen: number | null;
+  lastGt: number | null;
+  angleFailBefore: number;
+  lastDQuote: number | null;
+  lastSQuote: number | null;
+  budget: number;
+}
+
+/** Link destination and optional title after `](`. Returns the end index (after `)`) or null. */
+function linkTail(s: string, at: number, state: LinkScanState): { dest: string; end: number } | null {
+  if (state.budget <= 0) return null;
   let i = at;
-  while (i < s.length && (s[i] === " " || s[i] === "\n")) i++;
+  while (i < s.length && (s[i] === " " || s[i] === "\n")) {
+    if (--state.budget <= 0) return null;
+    i++;
+  }
   let dest = "";
   if (s[i] === "<") {
-    const close = s.indexOf(">", i + 1);
-    if (close < 0 || s.slice(i + 1, close).includes("\n")) return null;
-    dest = s.slice(i + 1, close);
-    i = close + 1;
+    if (i < state.angleFailBefore) return null;
+    state.lastGt ??= s.lastIndexOf(">");
+    if (i + 1 > state.lastGt) {
+      state.angleFailBefore = s.length;
+      return null;
+    }
+    let j = i + 1;
+    while (j < s.length && s[j] !== ">" && s[j] !== "\n") {
+      if (--state.budget <= 0) return null;
+      j++;
+    }
+    if (j >= s.length || s[j] !== ">") {
+      state.angleFailBefore = Math.max(state.angleFailBefore, j);
+      return null;
+    }
+    dest = s.slice(i + 1, j);
+    i = j + 1;
   } else {
     let depth = 0;
     const startDest = i;
     while (i < s.length) {
+      if (--state.budget <= 0) return null;
       const ch = s[i]!;
       if (ch === "\\" && i + 1 < s.length && PUNCT.test(s[i + 1]!)) { i += 2; continue; }
       if (ch === "(") {
@@ -304,16 +331,32 @@ function linkTail(s: string, at: number): { dest: string; end: number } | null {
     }
     dest = s.slice(startDest, i).replace(/\\([!-/:-@[-`{-~])/g, "$1");
   }
-  while (i < s.length && (s[i] === " " || s[i] === "\n")) i++;
+  while (i < s.length && (s[i] === " " || s[i] === "\n")) {
+    if (--state.budget <= 0) return null;
+    i++;
+  }
   // An optional title, which is not shown (the URL itself is, on hover).
   const q = s[i];
   if (q === '"' || q === "'" || q === "(") {
     const closer = q === "(" ? ")" : q;
+    if (q === '"') {
+      state.lastDQuote ??= s.lastIndexOf('"');
+      if (i + 1 > state.lastDQuote) return null;
+    } else if (q === "'") {
+      state.lastSQuote ??= s.lastIndexOf("'");
+      if (i + 1 > state.lastSQuote) return null;
+    }
     let j = i + 1;
-    while (j < s.length && s[j] !== closer) j += s[j] === "\\" ? 2 : 1;
+    while (j < s.length && s[j] !== closer) {
+      if (--state.budget <= 0) return null;
+      j += s[j] === "\\" ? 2 : 1;
+    }
     if (j >= s.length) return null;
     i = j + 1;
-    while (i < s.length && (s[i] === " " || s[i] === "\n")) i++;
+    while (i < s.length && (s[i] === " " || s[i] === "\n")) {
+      if (--state.budget <= 0) return null;
+      i++;
+    }
   }
   if (s[i] !== ")") return null;
   return { dest, end: i + 1 };
@@ -440,7 +483,14 @@ export function parseInline(s: string): Inline[] {
   const list = new List();
   const brackets: Node[] = [];
   let failedBacktickLens: Set<number> | null = null;
-  let lastParen: number | null = null;
+  const linkScan: LinkScanState = {
+    lastParen: null,
+    lastGt: null,
+    angleFailBefore: -1,
+    lastDQuote: null,
+    lastSQuote: null,
+    budget: Math.max(4096, s.length * 4),
+  };
   let buf = "";
   const flush = () => {
     if (buf) list.push({ inline: text(buf), delim: null, bracket: null });
@@ -543,8 +593,8 @@ export function parseInline(s: string): Inline[] {
         i++;
         continue;
       }
-      lastParen ??= s.lastIndexOf(")");
-      const tail = i + 2 <= lastParen ? linkTail(s, i + 2) : null;
+      linkScan.lastParen ??= s.lastIndexOf(")");
+      const tail = i + 2 <= linkScan.lastParen ? linkTail(s, i + 2, linkScan) : null;
       if (!tail) {
         opener.inline = text(opener.bracket!.image ? "![" : "[");
         opener.bracket = null;

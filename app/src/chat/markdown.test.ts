@@ -238,6 +238,24 @@ describe("blocks", () => {
     parseInline("`".repeat(20_000));
     expect(performance.now() - start).toBeLessThan(2000);
   });
+
+  it("malformed link destinations and titles scale linearly", () => {
+    const start = performance.now();
+    // Round-2 finding 6: unclosed `<` destination with a trailing `)`
+    parseInline("[x](<".repeat(20_000) + ")");
+    // Newline before `>` defeats a simple lastIndexOf(">") check
+    parseInline("[x](<".repeat(20_000) + "\n>)");
+    // Unclosed title quotes with a trailing `)`
+    parseInline('[x](a "'.repeat(20_000) + ")");
+    parseInline("[x](a '".repeat(20_000) + ")");
+    expect(performance.now() - start).toBeLessThan(2000);
+
+    // Valid angle-bracket destinations still parse normally.
+    const valid = parseInline('[ok](<https://example.com/a> "title")');
+    expect(valid).toEqual([
+      { t: "link", target: { kind: "web", url: "https://example.com/a" }, c: [{ t: "text", v: "ok" }] },
+    ]);
+  });
 });
 
 describe("inlines", () => {
