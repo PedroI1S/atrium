@@ -1,6 +1,6 @@
 # Handoff: M1-30-tree-wildcards (S5 + K8)
 
-Status: **ready for DoD verification** after the D-131 escalation (Opus) and its round 2 (review 3). "Escalation round 2 (review 3)" is the latest and overrides "Escalation (Opus, D-131)" where they differ. Both override the matcher descriptions in sections 1 and 2 and in rework rounds 1–5.
+Status: **ready for DoD verification** after the D-131 escalation (Opus), its round 2 (review 3), and the Neon round (D-134). "Neon round (D-134)" and "Escalation round 2 (review 3)" are the latest and override earlier matcher descriptions where they differ.
 
 ## What changed and where
 
@@ -14,7 +14,7 @@ Status: **ready for DoD verification** after the D-131 escalation (Opus) and its
 - Verified the late `**` tree-leaf fix in `Tail::matches_tree_impl`: when `reach_indices` reaches `Comp::GlobStar` before a sensitive tree's leaf, it only matches if the remaining components are all `Comp::GlobStar` (`~/.local/**`, `~/.g*/**`), so ordinary `**` globs (`cat ~/**/*.rs`, `cat ~/**/notes.txt`) are not falsely hard-denied.
 
 ### 2. K8 (`deny.rs`, now the shared matcher; see "Escalation (Opus, D-131)")
-- A non-recursive home `**` search asks only when the glob's file name can be a file of an ask tree (`*.session`, `*.history`, `*.historynew`, `*.zsh`, `.aws/sso/cache/*.json`) or an ask store. Final verdicts in Home: `**/*.rs`, `**/*.md`, `**/*/*.rs`, `**/m*.rs` → Allow; `**/*.session`, `**/b.session`, `**/*.history`, `**/token.json`, `**/*.toml` and `**/*.{rs,toml}` (both via `.cargo/credentials.toml`), `**/*token*` → Ask; `**/*.json`, `**/*`, `**`, `**/` → Hard(credential-read) (they reach `.docker/config.json` and other credential files). `.azure/*.rs` now asks (round 2 finding 6).
+- A non-recursive home `**` search asks only when the glob's file name can be a file of an ask tree (`*.session`, `*.history`, `*.historynew`, `*.zsh`, `.aws/sso/cache/*.json`) or an ask store. Final verdicts in Home: `**/*.rs`, `**/*.md`, `**/*/*.rs`, `**/*.cache` → Allow; `**/*.session`, `**/b.session`, `**/*.history`, `**/token.json`, `**/*.toml`, `**/*.{rs,toml}` (via `.cargo/credentials.toml`), `**/*token*`, `**/m*.rs`, `**/*.bin`, `.azure/*.rs` → Ask; `**/*.json`, `**/*`, `**`, `**/` → Hard(credential-read) (they reach `.docker/config.json` and other credential files).
 - Note on `rg --glob '**/*.rs' x ~` and `Search ["~"] **/*.rs` (`recursive: true`): in `crates/atrium-core/src/policy/engine.rs` (outside M1-30 owned paths), recursive searches rooted directly at `~` still return `Ask` in Home because `Home::root_ok(~)` is `false` (walking all of `~` reaches `.ssh`/`.gnupg`/etc. regardless of `--glob`), whereas `rg --glob '**/*.rs' x ~/proj` returns `Allow`.
 
 ### 3. Tests (`crates/atrium-core/tests/M1-30-tree-wildcards.rs` and `adversarial_gate.rs`)
@@ -127,7 +127,7 @@ Running the current test suite against `dev`'s `crates/atrium-core/src/policy/de
 3. `cargo test --workspace --no-fail-fast`
 4. Run `cargo test -p atrium-core` 3 times in a loop and record timings for `adversarial_fuzz` and `policy` (no slowdown).
 5. Check out `dev:crates/atrium-core/src/policy/deny.rs` and run `cargo test -p atrium-core --test M1-30-tree-wildcards`. Confirm the S5/K8/review tests fail on `dev` and `ordinary_globs_keep_expected_verdicts` passes. Then restore `HEAD`'s `deny.rs` and re-verify that all 27 tests pass (none are ignored).
-6. Confirm `git diff 5e693ad6..HEAD --stat` touches only owned paths (`crates/atrium-core/src/policy/deny.rs`, `crates/atrium-core/tests/M1-30-tree-wildcards.rs`, `crates/atrium-core/tests/adversarial_gate.rs`, `docs/agents/handoffs/M1-30-tree-wildcards.md`).
+6. Confirm `git diff 5e693ad6..HEAD --stat` touches only owned paths (`crates/atrium-core/src/policy/deny.rs`, `crates/atrium-core/tests/M1-30-tree-wildcards.rs`, `crates/atrium-core/tests/adversarial_gate.rs`, `docs/agents/handoffs/M1-30-tree-wildcards.md`), with the single documented 1-line `self.s.search_filter_hit(variants)` call in `Ctx::search_glob_hit` pending M1-31 / driver confirmation (R3-7).
 
 ## Escalation (Opus, D-131)
 
@@ -188,3 +188,27 @@ One bounded glob-component matcher in `deny.rs` replaces `ShellGlob`/`Tail`/`Com
 - `cargo test -p atrium-core --test M1-30-tree-wildcards`: 27 passed, 0 ignored (about 33 s).
 - `cargo test -p atrium-core --no-fail-fast`: everything passes except `round_5_blocker_1_searches_and_walkers_reaching_a_folder_linked_into_ssh` (known `dev` N9). Timings: `adversarial_fuzz` 29 s, `policy` 8.7 s. The previous run had 24 s and 8.5 s on the same machine, so a slowdown can't be ruled out.
 - The round-3 tests were also run against the previous commit's `deny.rs` (`e4fa939`); see the report for which fail there.
+
+## Neon round (D-134)
+
+Audited the unchecked Opus WIP commit (`ccce204`), kept its byte-level matcher and round-3 fixes, and closed additional edge cases, budget/performance gaps, and stale handoff text:
+- **One budget per check:** `Sensitive` now owns a shared `AtomicU64` (`MATCH_BUDGET = 4_000_000`) checked out via `BudgetGuard` across all glob calls (`glob_hit`, `search_filter_hit`, `is_ssh_dir`, `ask_hit`, `ask_search_glob_hit`), and `parse_atoms` charges 4 steps/byte to bound peak memory across brace variants.
+- **No write-only masking of budget exhaustion:** `ask_glob_str_hit_with` checks `specs.ask`, `specs.ssh_dir`, `specs.floor`, and read-applicable `specs.hard` (`!s.write_only`) on the single parsed pattern and shared budget instead of re-parsing and calling `glob_str_hit(..., Role::Write)`.
+- **Search-filter `globset` dot semantics & brace-overflow widening:** `search_filter_hit` and `ask_search_glob_hit` pass `loose_dots = true` (matching `globset`, where `*` and `?` match leading dots), closing `Search ["~"] "*/*.session"`, `"*/b.session"`, and `"*gnupg/private-keys-v1.d/k.key"` while keeping `"*/*.rs"` `Allow`. Brace widening (`!keyed`) and post-expansion `v.contains("**")` also enable loose dot matching.
+- **Strictly linear class parsing & unsupported POSIX bracket items:** `class_end` memoizes unclosed loop positions (`dead`), scans `[:name:]`/`[=x=]`/`[.x.]` without rescanning (`posix_item_end`), and `class_body` uses O(1) `const` bitmasks (`posix_class_bset` + `ascii_range`) with zero-alloc POSIX scanning (closing quadratic traps on `"[".repeat(32768) + "\\].rs"`, `"[[:".repeat(10000) + "].rs"`, `"[" + "[:".repeat(10000) + "].rs"`, and `"[" + "a".repeat(32768) + "].rs"`, and failing closed on `[=s=]` / `[.ch.]`).
+- **Matcher fast paths & `Specs` caching:** thread-local `SpecsCacheEntry` cache (`Arc<Specs>`, 8-entry cap), `Seen::Small([u64; 8])` stack bitset, reused DP stacks in `Query`, zero-alloc `&str` cache keys, stack `[Atom; 64]` literal matching with first/last-byte rejection, literal-prefix fast path in `path_meets`, and exact `astay && bstay && started` handling in `comp_intersect`.
+
+### Review 3 findings (fixed and pinned)
+- **R3-1 (negated Unicode classes bypass Atrium folders):** fixed (byte-level `BSet` + `Atom::Tail`, negated/non-ASCII classes preserve `BSet::HI`), pinned by `review3_finding_1_negated_unicode_classes_reach_atrium_folders`.
+- **R3-2 (embedded `**` loses `dev` hard deny):** fixed (`dstar` set for `s.contains("**") || v.contains("**")` and widened `!keyed` brace overflows), pinned by `review3_finding_2_embedded_globstar_keeps_devs_hard_deny`.
+- **R3-3 (session-family shapes omit ask-tree descendants):** fixed (`SComp::Any` between ask tree and suffix glob, plus `loose_dots = true` for `Search` globs), pinned by `review3_finding_3_session_families_reach_ask_tree_descendants`.
+- **R3-4 (four-literal heuristic misses Azure cache searches):** fixed (`SComp::Pinned` in `comp_intersect`), pinned by `review3_finding_4_azure_cache_searches_are_decided_by_the_matcher`.
+- **R3-5 (quadratic class parsing before budget):** fixed (budgeted, strictly linear `class_end` with `dead` memoization and `posix_item_end`, plus O(n) zero-alloc `class_body` with O(1) `BSet` masks), pinned by `review3_finding_5_unclosed_classes_parse_in_bounded_work`.
+- **R3-6 (budget exhaustion fabricates hard deny):** fixed (`Reach::Undecided` / `GlobHit::Undecided` -> Ask never HardDeny, one shared budget per `Sensitive`, read-only undecided check without `write_only` masking, first/last-byte & literal-prefix fast rejects), pinned by `review3_finding_6_budget_exhaustion_asks_and_never_hard_denies`.
+- **R3-7 (excluded boundary in `Ctx::search_glob_hit`):** kept the 1-line `self.s.search_filter_hit(variants)` call per reviewer's instruction ("Keep the security fix"); documented here and in verification step 6 for M1-31 owner / driver sign-off and `decisions.md` entry before merge, pinned by `review2_finding_1_contained_search_globs_reach_sensitive_trees`.
+- **R3-8 (stale handoff):** fixed (updated opening K8 summary line 17 to match `**/m*.rs` → Ask and `**/*.cache` → Allow, updated test inventory/verification steps, and added this section).
+
+### Checks run (Neon, D-123)
+- `cargo fmt --all`: clean (exit 0).
+- `cargo check -p atrium-core --tests`: clean (0 warnings, exit 0).
+- DoD verification (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`, 3× timing loop, and `dev` failure check) left to the verification task per D-123.
