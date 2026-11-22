@@ -839,3 +839,6 @@ rodrigo asked the orchestrator to choose. It kept `dev`'s behaviour on both:
 - **The text of `docs/contracts/m1-policy-rev4.md` (draft 5) is approved.** Five Codex reviews (GPT-6.1 Sol, `high`, read-only) found 21, 15, 5, 1 and then 0 findings; the last one approves (`reviews/rev4-contract-round5.md`).
 - **Still open:** Pedro confirms the 14 security-default changes in its §11 (D-013). P0–P5 don't start until he does. CR-20 stays open until then.
 - **Go for M1-33-nonpolicy-fixes and M1-34-n9-fixture** (rev 4 §13). The orchestrator extracts the hunks itself (a mechanical copy of files that already passed the batch's reviews for those parts, so no writer); then D-123's verification and a Codex review, under D-120.
+
+## D-137 — 2026-11-22 — rodrigo: go for M1-35-test-flakes (N13, N14, N15)
+**Decided by rodrigo (driver).** After M1-33 and M1-34 merged, `dev` is green on Linux except three intermittent tests: N13 (`atrium-app` upgrade signal, under load), N14 (`claude_adapter::questions_use_the_gates_question_ticket`) and N15 (`discover_login_shell_path_handles_noise_failures_and_timeouts`). One task fixes all three: a Neon `high` writer (D-134), the orchestrator's verification with repeated runs (D-123), Codex review (D-124), the 100% gate (D-120).
