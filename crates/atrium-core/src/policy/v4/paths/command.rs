@@ -6,15 +6,15 @@ use std::collections::HashMap;
 use crate::policy::limits;
 use crate::policy::model::{
     AccessMode, ByteProvenance, Cap, CodeExecution, CommandUnit, ComputeBudget,
-    DerivedDestinations, Exhausted, FileType, FilterDialect, FsCaps, ModelRedirect, OperandRole,
-    PartId, PartOutcome, PartResult, PipelineId, ProtectedSet, ResolveError, ResolvedCallPaths,
-    SearchFilter, Target, TargetOrigin, TargetResolution, ToolEffects, UnitIndex, UnreadReason,
-    ValueRole, Word,
+    DerivedDestinations, Exhausted, FileType, FilterDialect, FsCaps, Hit, HitMatch, HitSource,
+    ModelRedirect, OperandRole, PartId, PartOutcome, PartResult, PipelineId, ProtectedSet,
+    ResolveError, ResolvedCallPaths, SearchFilter, Target, TargetOrigin, TargetResolution,
+    ToolEffects, UnitIndex, UnreadReason, ValueRole, Word,
 };
 use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::glob::expand_shell_glob_impl;
 use crate::policy::v4::paths::recursive::{check_filter_on_root, check_recursive_root_impl};
-use crate::policy::v4::paths::resolve::{resolve_literal_impl, resolve_word_literal};
+use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl, resolve_word_literal};
 use crate::policy::v4::paths::sensitive::{
     SharedSensitive, check_target_impl, fold_path_listed, under_bytes,
 };
@@ -237,14 +237,15 @@ pub(crate) fn resolve_command_targets_impl(
                         return Ok(out);
                     }
                     record_multiply_linked(&target, &mut out.multiply_linked_file);
-                    let checked = check_target_impl(&target, protected, budget)?;
-                    out.outcomes.push(checked);
                     if is_rec_root && let Some(e) = eff {
                         let rec = check_recursive_root_impl(
                             &target, e.links, &e.filters, protected, resolver, caps, budget,
                         )?;
                         out.multiply_linked_file |= rec.multiply_linked_file;
                         out.outcomes.extend(rec.outcomes);
+                    } else {
+                        let checked = check_target_impl(&target, protected, budget)?;
+                        out.outcomes.push(checked);
                     }
                     if eff.is_some_and(|e| {
                         e.derived_destinations == DerivedDestinations::WhenSourceIsDir
@@ -255,6 +256,7 @@ pub(crate) fn resolve_command_targets_impl(
                     }
                     out.targets.push(target);
                 }
+                let mut emitted_variant = false;
                 for target in exp.variant_only_matches {
                     if out.targets.len() >= limits::MAX_PATHS {
                         out.outcomes.push(PartResult {
@@ -264,12 +266,15 @@ pub(crate) fn resolve_command_targets_impl(
                         return Ok(out);
                     }
                     // Variant-only matches are Unread, never hits (§1, §5).
-                    out.outcomes.push(PartResult {
-                        part: part.clone(),
-                        outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
-                            pattern: word.literal_bytes().to_vec(),
-                        }),
-                    });
+                    if !emitted_variant {
+                        emitted_variant = true;
+                        out.outcomes.push(PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
+                                pattern: word.literal_bytes().to_vec(),
+                            }),
+                        });
+                    }
                     out.targets.push(target);
                 }
             } else {
@@ -284,14 +289,15 @@ pub(crate) fn resolve_command_targets_impl(
                     budget,
                 )?;
                 record_multiply_linked(&target, &mut out.multiply_linked_file);
-                let checked = check_target_impl(&target, protected, budget)?;
-                out.outcomes.push(checked);
                 if is_rec_root && let Some(e) = eff {
                     let rec = check_recursive_root_impl(
                         &target, e.links, &e.filters, protected, resolver, caps, budget,
                     )?;
                     out.multiply_linked_file |= rec.multiply_linked_file;
                     out.outcomes.extend(rec.outcomes);
+                } else {
+                    let checked = check_target_impl(&target, protected, budget)?;
+                    out.outcomes.push(checked);
                 }
                 if eff
                     .is_some_and(|e| e.derived_destinations == DerivedDestinations::WhenSourceIsDir)
@@ -474,7 +480,11 @@ pub(crate) fn resolve_command_targets_impl(
         if let Some(e) = eff
             && e.tool_name == Some("cd")
         {
-            cwd_state = next_cwd_after_cd(unit, e, &cwd_state, protected, resolver, caps, budget)?;
+            cwd_state = if earlier_writer.is_some() {
+                CwdState::Unknown
+            } else {
+                next_cwd_after_cd(unit, e, &cwd_state, protected, resolver, caps, budget)?
+            };
         }
 
         // Record possible-writer status for later units.
@@ -547,19 +557,138 @@ fn next_cwd_after_cd(
                 budget,
             )?;
             match resolved.resolution {
-                TargetResolution::Resolved { canonical, .. } => Ok(CwdState::Known(canonical)),
+                TargetResolution::Resolved { canonical, .. } => {
+                    // Only move cwd when the destination is an existing directory;
+                    // otherwise `cd` fails at runtime and later units run in the
+                    // prior directory, so treat cwd as Unknown (fail closed).
+                    match resolver.stat(&canonical, caps, budget) {
+                        Ok(md) if md.file_type == FileType::Dir => Ok(CwdState::Known(canonical)),
+                        Ok(_)
+                        | Err(
+                            ResolveError::NotFound
+                            | ResolveError::Io(_)
+                            | ResolveError::CapReached(_),
+                        ) => Ok(CwdState::Unknown),
+                        Err(ResolveError::Exhausted(e)) => Err(e),
+                    }
+                }
                 TargetResolution::Unread(_) => Ok(CwdState::Unknown),
             }
         }
         None => {
-            // Bare `cd` (no positional operand) moves to `home`.
-            if unit.argv.len() == 1 {
+            // Bare `cd` (or `cd -L` / `cd -P` / `cd --` with no positional operand) moves to `home`.
+            let only_flags = unit.argv.len() == 1
+                || (eff.roles.len() == unit.argv.len()
+                    && eff.roles[1..].iter().all(|r| *r == OperandRole::Flag));
+            if only_flags {
                 Ok(CwdState::Known(protected.home.clone()))
             } else {
                 Ok(CwdState::Unknown)
             }
         }
     }
+}
+
+/// Lexically normalizes an absolute byte path containing `.` / `..` for
+/// best-effort selector probe matching on absent targets.
+fn lexical_normalize_selector(base: &[u8], glob: &str, home: &[u8]) -> Vec<u8> {
+    let raw = glob.as_bytes();
+    let abs = if raw == b"~" {
+        home.to_vec()
+    } else if let Some(rest) = raw.strip_prefix(b"~/") {
+        join_bytes(home, rest)
+    } else if raw.starts_with(b"/") {
+        raw.to_vec()
+    } else {
+        join_bytes(base, raw)
+    };
+    let mut segs: Vec<&[u8]> = Vec::new();
+    for seg in abs.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
+        if seg == b"." {
+            continue;
+        }
+        if seg == b".." {
+            segs.pop();
+        } else {
+            segs.push(seg);
+        }
+    }
+    if segs.is_empty() {
+        return b"/".to_vec();
+    }
+    let mut out = Vec::with_capacity(abs.len());
+    for seg in segs {
+        out.push(b'/');
+        out.extend_from_slice(seg);
+    }
+    out
+}
+
+/// Best-effort probe check for selector globs (`../.aws/credentia?s`,
+/// `~/.azure/msal*`) so absent protected paths still produce their probe hits
+/// (§2, §5).
+fn check_selector_probes(
+    base: &[u8],
+    glob: &str,
+    protected: &ProtectedSet,
+    shared: &SharedSensitive,
+    budget: &mut ComputeBudget,
+    outcomes: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
+    let norm = lexical_normalize_selector(base, glob, &protected.home);
+    let folded = fold_path_listed(&norm, protected.folds);
+    let Ok(pat_str) = std::str::from_utf8(&folded) else {
+        return Ok(());
+    };
+    budget.charge((pat_str.len() as u64).saturating_mul(8).max(8))?;
+    budget.charge_alloc(pat_str.len().saturating_mul(16).max(64))?;
+    let Ok(g) = globset::GlobBuilder::new(pat_str)
+        .literal_separator(true)
+        .build()
+    else {
+        return Ok(());
+    };
+    let matcher = g.compile_matcher();
+    let filter_part = PartId::Filter { unit: None };
+    for (probe_bytes, hard_id) in shared.hard_deny_probes() {
+        budget.charge(probe_bytes.len().max(1) as u64)?;
+        if let Ok(ps) = std::str::from_utf8(&probe_bytes)
+            && matcher.is_match(ps)
+        {
+            outcomes.push(PartResult {
+                part: filter_part.clone(),
+                outcome: PartOutcome::HardDenyHit(Hit {
+                    hard_deny_id: Some(hard_id),
+                    source: HitSource::BestEffort,
+                    matched: HitMatch::ProbeName {
+                        probe: ps.to_string(),
+                    },
+                    part: filter_part.clone(),
+                }),
+            });
+            break;
+        }
+    }
+    for (probe_bytes, _family) in shared.store_probes() {
+        budget.charge(probe_bytes.len().max(1) as u64)?;
+        if let Ok(ps) = std::str::from_utf8(&probe_bytes)
+            && matcher.is_match(ps)
+        {
+            outcomes.push(PartResult {
+                part: filter_part.clone(),
+                outcome: PartOutcome::StoreHit(Hit {
+                    hard_deny_id: None,
+                    source: HitSource::Model,
+                    matched: HitMatch::ProbeName {
+                        probe: ps.to_string(),
+                    },
+                    part: filter_part.clone(),
+                }),
+            });
+            break;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +723,7 @@ pub(crate) fn resolve_subject_paths_impl(
     }
 
     let mut roots: Vec<Target> = Vec::with_capacity(paths.len().max(1));
+    let delegated_to_recursive = recursive && !glob.is_some_and(is_selector_glob);
 
     // File-tool paths are ALWAYS literal (M1-32 round 4 finding 3; §5; §10 row 11).
     for (path_index, raw) in paths.iter().enumerate() {
@@ -615,8 +745,10 @@ pub(crate) fn resolve_subject_paths_impl(
             budget,
         )?;
         record_multiply_linked(&target, &mut out.multiply_linked_file);
-        let checked = check_target_impl(&target, protected, budget)?;
-        out.outcomes.push(checked);
+        if !delegated_to_recursive {
+            let checked = check_target_impl(&target, protected, budget)?;
+            out.outcomes.push(checked);
+        }
         roots.push(target.clone());
         out.targets.push(target);
     }
@@ -633,8 +765,10 @@ pub(crate) fn resolve_subject_paths_impl(
             budget,
         )?;
         record_multiply_linked(&implicit, &mut out.multiply_linked_file);
-        let checked = check_target_impl(&implicit, protected, budget)?;
-        out.outcomes.push(checked);
+        if !delegated_to_recursive {
+            let checked = check_target_impl(&implicit, protected, budget)?;
+            out.outcomes.push(checked);
+        }
         roots.push(implicit.clone());
         out.targets.push(implicit);
     }
@@ -668,7 +802,7 @@ pub(crate) fn resolve_subject_paths_impl(
                 })
                 .collect();
 
-            let mut escaped = false;
+            let mut escaped = root_bases.is_empty() && !anchored;
             for base in &root_bases {
                 let exp = expand_shell_glob_impl(
                     &word,
@@ -705,16 +839,21 @@ pub(crate) fn resolve_subject_paths_impl(
                     out.outcomes.push(checked);
                     out.targets.push(target);
                 }
+                let mut emitted_variant = false;
                 for target in exp.variant_only_matches {
                     escaped = true;
-                    out.outcomes.push(PartResult {
-                        part: PartId::Filter { unit: None },
-                        outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
-                            pattern: g.as_bytes().to_vec(),
-                        }),
-                    });
+                    if !emitted_variant {
+                        emitted_variant = true;
+                        out.outcomes.push(PartResult {
+                            part: PartId::Filter { unit: None },
+                            outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
+                                pattern: g.as_bytes().to_vec(),
+                            }),
+                        });
+                    }
                     out.targets.push(target);
                 }
+                check_selector_probes(base, g, protected, &shared, budget, &mut out.outcomes)?;
             }
             if escaped || anchored {
                 // D-100: an escaping selector cannot be allowed by Home or
@@ -726,7 +865,6 @@ pub(crate) fn resolve_subject_paths_impl(
                 });
             }
             // If recursive is also set on the subject, run S8 / hard-link checks on roots.
-            let _ = &shared;
             if recursive {
                 for root in &roots {
                     let rec = check_recursive_root_impl(

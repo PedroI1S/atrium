@@ -133,6 +133,7 @@ pub(crate) fn check_recursive_root_impl(
             caps,
             budget,
             &mut result.outcomes,
+            &mut result.multiply_linked_file,
         )?;
     }
 
@@ -277,8 +278,8 @@ fn check_s8_protected_root(
     };
 
     for f in CRED_FILES {
-        if under_str(f, root_rel).is_some() {
-            let cand = join_bytes(&protected.home, f.as_bytes());
+        if let Some(suffix) = under_str(f, root_rel) {
+            let cand = join_bytes(root_canon, suffix.as_bytes());
             if check_exists(&cand, resolver, caps, budget, outcomes)? {
                 push_hit(outcomes, "credential-read", cand);
                 return Ok(true);
@@ -287,8 +288,8 @@ fn check_s8_protected_root(
     }
 
     for t in CRED_TREES {
-        if under_str(t, root_rel).is_some() {
-            let cand = join_bytes(&protected.home, t.as_bytes());
+        if let Some(suffix) = under_str(t, root_rel) {
+            let cand = join_bytes(root_canon, suffix.as_bytes());
             if check_exists(&cand, resolver, caps, budget, outcomes)? {
                 push_hit(outcomes, "credential-read", cand);
                 return Ok(true);
@@ -493,6 +494,9 @@ fn root_contains_store_or_exempt_sensitive(
         return Some("config-root");
     }
     let rest = under_bytes(folded_root, home_folded).and_then(|b| std::str::from_utf8(b).ok())?;
+    if rest == ".ssh" {
+        return Some("ssh-dir");
+    }
     for &(f, family) in ASK_FILES {
         if under_str(f, rest).is_some() {
             return Some(family);
@@ -736,11 +740,15 @@ pub(crate) fn check_filter_on_root(
     };
 
     let mut stack: Vec<(Vec<u8>, Vec<u8>, usize)> = vec![(root_canon.to_vec(), Vec::new(), 0)];
+    let mut visited_symlink_dirs: HashSet<Vec<u8>> = HashSet::new();
     let mut entries_seen = 0usize;
+    let mut emitted_depth_cap = false;
+    let follow_dir_symlinks = compiled.dialect == FilterDialect::SearchGlob;
 
     while let Some((dir, rel_dir, depth)) = stack.pop() {
         if depth >= max_depth {
-            if recursive || compiled.has_globstar {
+            if (recursive || compiled.has_globstar) && !emitted_depth_cap {
+                emitted_depth_cap = true;
                 outcomes.push(PartResult {
                     part: filter_part.clone(),
                     outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(FsCap::WalkDepth)),
@@ -782,6 +790,7 @@ pub(crate) fn check_filter_on_root(
                 capped = true;
                 break;
             }
+            budget.charge_alloc(dir.len() + rel_dir.len() + entry.name.len() * 2 + 2)?;
             let entry_full = join_bytes(&dir, &entry.name);
             let entry_rel = if rel_dir.is_empty() {
                 entry.name.clone()
@@ -825,9 +834,58 @@ pub(crate) fn check_filter_on_root(
                 }
             }
 
-            if entry.file_type == FileType::Dir && depth + 1 < max_depth {
+            let is_traversable_dir = match entry.file_type {
+                FileType::Dir => true,
+                FileType::Symlink if follow_dir_symlinks => {
+                    match resolver.stat(&entry_full, caps, budget) {
+                        Ok(md) if md.file_type == FileType::Dir => {
+                            match resolver.canonicalize(&entry_full, caps, budget) {
+                                Ok(canon) => visited_symlink_dirs.insert(canon),
+                                Err(ResolveError::Exhausted(e)) => return Err(e),
+                                Err(ResolveError::CapReached(c)) => {
+                                    outcomes.push(PartResult {
+                                        part: filter_part.clone(),
+                                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                                    });
+                                    capped = true;
+                                    false
+                                }
+                                Err(_) => false,
+                            }
+                        }
+                        Ok(_) | Err(ResolveError::NotFound) => false,
+                        Err(ResolveError::Io(_)) => {
+                            outcomes.push(PartResult {
+                                part: filter_part.clone(),
+                                outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                                    path: entry_full.clone(),
+                                }),
+                            });
+                            false
+                        }
+                        Err(ResolveError::CapReached(c)) => {
+                            outcomes.push(PartResult {
+                                part: filter_part.clone(),
+                                outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                            });
+                            capped = true;
+                            false
+                        }
+                        Err(ResolveError::Exhausted(e)) => return Err(e),
+                    }
+                }
+                FileType::Symlink | FileType::File | FileType::Other => false,
+            };
+            if capped {
+                break;
+            }
+            if is_traversable_dir && depth + 1 < max_depth {
                 stack.push((entry_full, entry_rel, depth + 1));
-            } else if entry.file_type == FileType::Dir && (recursive || compiled.has_globstar) {
+            } else if is_traversable_dir
+                && (recursive || compiled.has_globstar)
+                && !emitted_depth_cap
+            {
+                emitted_depth_cap = true;
                 outcomes.push(PartResult {
                     part: filter_part.clone(),
                     outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(FsCap::WalkDepth)),
@@ -896,6 +954,7 @@ pub(crate) fn check_filter_on_root(
     }
 
     // 2b. Store probes (CR-12 + CR-17; independent part per §5).
+    let mut store_probe_hit = false;
     for (probe_bytes, _family) in shared.store_probes() {
         let Some(rel_bytes) = under_bytes(&probe_bytes, folded_root) else {
             continue;
@@ -916,7 +975,58 @@ pub(crate) fn check_filter_on_root(
                     part: filter_part.clone(),
                 }),
             });
+            store_probe_hit = true;
             break;
+        }
+    }
+
+    // Also match `dev`'s ASK_TREES directory-prefix rule (`deny.rs:697-728`):
+    // e.g. `Search(paths=["~"], glob=".zsh_sessions/*.foo")` targets an
+    // ASK_TREE directory by prefix even when the filename suffix isn't one of
+    // the fixed probe extensions.
+    if !store_probe_hit
+        && let Ok(pat_folded_bytes) = std::str::from_utf8(&fold_listed_component(
+            filter.pattern.literal_bytes(),
+            protected.folds.fold_long_s,
+            protected.folds.fold_kelvin,
+        ))
+    {
+        let pat_trimmed = pat_folded_bytes
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        'ask_tree: for &(t, family) in ASK_TREES {
+            let t_abs = join_folded(shared.home_folded(), t.as_bytes());
+            let Some(tree_rel_bytes) = under_bytes(&t_abs, folded_root) else {
+                continue;
+            };
+            if tree_rel_bytes.is_empty() {
+                continue;
+            }
+            let Ok(tree_rel) = std::str::from_utf8(tree_rel_bytes) else {
+                continue;
+            };
+            for (idx, _) in pat_trimmed.match_indices('/') {
+                if idx == 0 {
+                    continue;
+                }
+                let dir_pat = &pat_trimmed[..idx];
+                if let Ok(m) = build_glob_matcher(dir_pat, true, budget)? {
+                    budget.charge(tree_rel.len().max(1) as u64)?;
+                    if m.is_match(tree_rel) {
+                        outcomes.push(PartResult {
+                            part: filter_part.clone(),
+                            outcome: PartOutcome::StoreHit(Hit {
+                                hard_deny_id: None,
+                                source: HitSource::Model,
+                                matched: HitMatch::StoreFamily { family },
+                                part: filter_part.clone(),
+                            }),
+                        });
+                        break 'ask_tree;
+                    }
+                }
+            }
         }
     }
 
@@ -938,18 +1048,40 @@ fn walk_followed_links(
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
     outcomes: &mut Vec<PartResult>,
+    multiply_linked_file: &mut bool,
 ) -> Result<(), Exhausted> {
     let mut visited_paths: HashSet<Vec<u8>> = HashSet::new();
     let mut visited_ids: HashSet<FileIdentity> = HashSet::new();
     visited_paths.insert(root_canon.to_vec());
-    if let Ok(md) = resolver.stat(root_canon, caps, budget)
-        && let Some(id) = md.identity
-    {
-        visited_ids.insert(id);
+    match resolver.stat(root_canon, caps, budget) {
+        Ok(md) => {
+            if let Some(id) = md.identity {
+                visited_ids.insert(id);
+            }
+        }
+        Err(ResolveError::NotFound) => {}
+        Err(ResolveError::Io(_)) => {
+            outcomes.push(PartResult {
+                part: part.clone(),
+                outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                    path: root_canon.to_vec(),
+                }),
+            });
+            return Ok(());
+        }
+        Err(ResolveError::CapReached(c)) => {
+            outcomes.push(PartResult {
+                part: part.clone(),
+                outcome: PartOutcome::Unread(UnreadReason::from(c)),
+            });
+            return Ok(());
+        }
+        Err(ResolveError::Exhausted(e)) => return Err(e),
     }
 
     let mut stack: Vec<(Vec<u8>, u8)> = vec![(root_canon.to_vec(), 0)];
     let mut seen = 0usize;
+    let mut emitted_depth_cap = false;
 
     while let Some((dir, depth)) = stack.pop() {
         let entries = match resolver.read_dir(&dir, caps, budget) {
@@ -984,6 +1116,7 @@ fn walk_followed_links(
                 });
                 return Ok(());
             }
+            budget.charge_alloc(dir.len() + entry.name.len() + 1)?;
             let child = join_bytes(&dir, &entry.name);
             match entry.file_type {
                 FileType::Symlink => {
@@ -1000,6 +1133,13 @@ fn walk_followed_links(
                         caps,
                         budget,
                     )?;
+                    if let TargetResolution::Resolved {
+                        multiply_linked: true,
+                        ..
+                    } = &target.resolution
+                    {
+                        *multiply_linked_file = true;
+                    }
 
                     let checked = check_target_impl(&target, protected, budget)?;
                     match checked.outcome {
@@ -1078,28 +1218,32 @@ fn walk_followed_links(
                             } else {
                                 outcomes.extend(link_s8_outcomes);
                             }
-                        } else if let Some(family) =
-                            root_contains_store_or_exempt_sensitive(&folded, shared)
-                        {
-                            if has_filter {
-                                outcomes.push(PartResult {
-                                    part: part.clone(),
-                                    outcome: PartOutcome::Unread(
-                                        UnreadReason::FollowedLinkUnderFilter {
-                                            path: canonical.clone(),
-                                        },
-                                    ),
-                                });
-                            } else {
-                                outcomes.push(PartResult {
-                                    part: part.clone(),
-                                    outcome: PartOutcome::StoreHit(Hit {
-                                        hard_deny_id: None,
-                                        source: HitSource::Model,
-                                        matched: HitMatch::StoreFamily { family },
+                        } else {
+                            // Preserve any I/O or walk-cap Unreads observed while checking the linked root.
+                            outcomes.extend(link_s8_outcomes);
+                            if let Some(family) =
+                                root_contains_store_or_exempt_sensitive(&folded, shared)
+                            {
+                                if has_filter {
+                                    outcomes.push(PartResult {
                                         part: part.clone(),
-                                    }),
-                                });
+                                        outcome: PartOutcome::Unread(
+                                            UnreadReason::FollowedLinkUnderFilter {
+                                                path: canonical.clone(),
+                                            },
+                                        ),
+                                    });
+                                } else {
+                                    outcomes.push(PartResult {
+                                        part: part.clone(),
+                                        outcome: PartOutcome::StoreHit(Hit {
+                                            hard_deny_id: None,
+                                            source: HitSource::Model,
+                                            matched: HitMatch::StoreFamily { family },
+                                            part: part.clone(),
+                                        }),
+                                    });
+                                }
                             }
                         }
 
@@ -1110,12 +1254,15 @@ fn walk_followed_links(
                                 let fresh_id = md.identity.is_none_or(|id| visited_ids.insert(id));
                                 if fresh_path && fresh_id {
                                     if depth + 1 >= limits::WALK_MAX_DEPTH {
-                                        outcomes.push(PartResult {
-                                            part: part.clone(),
-                                            outcome: PartOutcome::Unread(
-                                                UnreadReason::WalkCapReached(FsCap::WalkDepth),
-                                            ),
-                                        });
+                                        if !emitted_depth_cap {
+                                            emitted_depth_cap = true;
+                                            outcomes.push(PartResult {
+                                                part: part.clone(),
+                                                outcome: PartOutcome::Unread(
+                                                    UnreadReason::WalkCapReached(FsCap::WalkDepth),
+                                                ),
+                                            });
+                                        }
                                     } else {
                                         stack.push((canonical, depth + 1));
                                     }
@@ -1143,12 +1290,15 @@ fn walk_followed_links(
                 }
                 FileType::Dir => {
                     if depth + 1 >= limits::WALK_MAX_DEPTH {
-                        outcomes.push(PartResult {
-                            part: part.clone(),
-                            outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
-                                FsCap::WalkDepth,
-                            )),
-                        });
+                        if !emitted_depth_cap {
+                            emitted_depth_cap = true;
+                            outcomes.push(PartResult {
+                                part: part.clone(),
+                                outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                                    FsCap::WalkDepth,
+                                )),
+                            });
+                        }
                     } else if visited_paths.insert(child.clone()) {
                         stack.push((child, depth + 1));
                     }
@@ -1185,9 +1335,8 @@ fn walk_hard_links(
             Ok(e) => e,
             Err(ResolveError::Exhausted(e)) => return Err(e),
             // Hard-link walk cutoff counts as clear (§2, §5, §11 item 7).
-            Err(ResolveError::NotFound | ResolveError::Io(_) | ResolveError::CapReached(_)) => {
-                continue;
-            }
+            Err(ResolveError::CapReached(_)) => return Ok(()),
+            Err(ResolveError::NotFound | ResolveError::Io(_)) => continue,
         };
 
         for entry in entries {

@@ -76,6 +76,7 @@ fn parse_component(
         && prov[0] == ByteProvenance::Unquoted
         && prov[1] == ByteProvenance::Unquoted;
 
+    budget.charge_alloc(bytes.len() * std::mem::size_of::<CompAtom>())?;
     let mut atoms: Vec<CompAtom> = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {
@@ -97,21 +98,18 @@ fn parse_component(
                 atoms.push(CompAtom::AnyOne);
                 i += 1;
             }
-            b'[' => {
-                if let Some((class_res, next_i)) = parse_bracket_class(bytes, prov, i, budget)? {
-                    match class_res {
-                        Ok(table) => {
-                            atoms.push(CompAtom::Class(table));
-                            i = next_i;
-                        }
-                        Err(unread) => return Ok(Err(unread)),
-                    }
-                } else {
+            b'[' => match parse_bracket_class(bytes, prov, i, budget)? {
+                BracketParse::Class(table, next_i) => {
+                    atoms.push(CompAtom::Class(table));
+                    i = next_i;
+                }
+                BracketParse::Unread(unread) => return Ok(Err(unread)),
+                BracketParse::Unclosed => {
                     // Unclosed `[` is treated as a literal `[`.
                     atoms.push(CompAtom::Literal(b'['));
                     i += 1;
                 }
-            }
+            },
             other => {
                 atoms.push(CompAtom::Literal(other));
                 i += 1;
@@ -129,40 +127,99 @@ fn parse_component(
 
 /// Parses an unquoted `[...]` class starting at `start`. Returns `Ok(None)` if
 /// no matching unquoted `]` closes the class.
+fn add_posix_class(table: &mut [u64; 4], name: &[u8]) -> bool {
+    let pred: fn(u8) -> bool = match name {
+        b"alnum" => |b| b.is_ascii_alphanumeric(),
+        b"alpha" => |b| b.is_ascii_alphabetic(),
+        b"ascii" => |b| b.is_ascii(),
+        b"blank" => |b| matches!(b, b' ' | b'\t'),
+        b"cntrl" => |b| b.is_ascii_control(),
+        b"digit" => |b| b.is_ascii_digit(),
+        b"graph" => |b| b.is_ascii_graphic(),
+        b"lower" => |b| b.is_ascii_lowercase(),
+        b"print" => |b| b.is_ascii_graphic() || b == b' ',
+        b"punct" => |b| b.is_ascii_punctuation(),
+        b"space" => |b| b.is_ascii_whitespace(),
+        b"upper" => |b| b.is_ascii_uppercase(),
+        b"word" => |b| b.is_ascii_alphanumeric() || b == b'_',
+        b"xdigit" => |b| b.is_ascii_hexdigit(),
+        _ => return false,
+    };
+    for b in 0u8..=127u8 {
+        if pred(b) {
+            CompAtom::class_set(table, b);
+        }
+    }
+    true
+}
+
+fn scan_posix_bracket_item(
+    bytes: &[u8],
+    prov: &[ByteProvenance],
+    pos: usize,
+    budget: &mut ComputeBudget,
+) -> Result<Option<usize>, Exhausted> {
+    if pos + 3 >= bytes.len() || bytes[pos] != b'[' || prov[pos] != ByteProvenance::Unquoted {
+        return Ok(None);
+    }
+    let delim = bytes[pos + 1];
+    if prov[pos + 1] != ByteProvenance::Unquoted || !matches!(delim, b':' | b'=' | b'.') {
+        return Ok(None);
+    }
+    let mut scan = pos + 2;
+    while scan + 1 < bytes.len() {
+        budget.charge(1)?;
+        if bytes[scan] == delim
+            && prov[scan] == ByteProvenance::Unquoted
+            && bytes[scan + 1] == b']'
+            && prov[scan + 1] == ByteProvenance::Unquoted
+        {
+            return Ok(Some(scan + 2));
+        }
+        scan += 1;
+    }
+    Ok(None)
+}
+
+enum BracketParse {
+    Class([u64; 4], usize),
+    Unread(UnreadReason),
+    Unclosed,
+}
+
 fn parse_bracket_class(
     bytes: &[u8],
     prov: &[ByteProvenance],
     start: usize,
     budget: &mut ComputeBudget,
-) -> Result<Option<(Result<[u64; 4], UnreadReason>, usize)>, Exhausted> {
+) -> Result<BracketParse, Exhausted> {
     let mut j = start + 1;
     if j >= bytes.len() {
-        return Ok(None);
-    }
-    if prov[j] == ByteProvenance::Unquoted && matches!(bytes[j], b'!' | b'^') {
-        // Check if this class actually closes; if so it's a negated class (§3).
-        let mut scan = j + 1;
-        if scan < bytes.len() && bytes[scan] == b']' {
-            scan += 1;
-        }
-        while scan < bytes.len() {
-            budget.charge(1)?;
-            if bytes[scan] == b']' && prov[scan] == ByteProvenance::Unquoted {
-                return Ok(Some((Err(UnreadReason::NegatedGlobClass), scan + 1)));
-            }
-            scan += 1;
-        }
-        return Ok(None);
+        return Ok(BracketParse::Unclosed);
     }
 
-    // Find closing unquoted `]` (a leading `]` right after `[` is literal).
     let body_start = j;
+    let mut has_bang_or_caret = false;
+    if prov[j] == ByteProvenance::Unquoted && matches!(bytes[j], b'!' | b'^') {
+        has_bang_or_caret = true;
+        j += 1;
+    }
     if j < bytes.len() && bytes[j] == b']' {
         j += 1;
     }
     let mut close = None;
     while j < bytes.len() {
         budget.charge(1)?;
+        if bytes[j] == b'['
+            && prov[j] == ByteProvenance::Unquoted
+            && let Some(item_end) = scan_posix_bracket_item(bytes, prov, j, budget)?
+        {
+            j = item_end;
+            continue;
+        }
+        if prov[j] == ByteProvenance::Unquoted && matches!(bytes[j], b'!' | b'^') {
+            has_bang_or_caret = true;
+        }
         if bytes[j] == b']' && prov[j] == ByteProvenance::Unquoted {
             close = Some(j);
             break;
@@ -170,13 +227,31 @@ fn parse_bracket_class(
         j += 1;
     }
     let Some(end) = close else {
-        return Ok(None);
+        return Ok(BracketParse::Unclosed);
     };
+    if has_bang_or_caret {
+        return Ok(BracketParse::Unread(UnreadReason::NegatedGlobClass));
+    }
 
     let mut table = [0u64; 4];
     let mut k = body_start;
     while k < end {
         budget.charge(1)?;
+        if bytes[k] == b'['
+            && prov[k] == ByteProvenance::Unquoted
+            && let Some(item_end) = scan_posix_bracket_item(bytes, prov, k, budget)?
+            && item_end <= end
+        {
+            let delim = bytes[k + 1];
+            let inner = &bytes[k + 2..item_end - 2];
+            if delim == b':' && add_posix_class(&mut table, inner) {
+                k = item_end;
+                continue;
+            }
+            return Ok(BracketParse::Unread(UnreadReason::VariantOnlyGlobMatch {
+                pattern: bytes[start..=end].to_vec(),
+            }));
+        }
         let c = bytes[k];
         if k + 2 < end && bytes[k + 1] == b'-' && prov[k + 1] == ByteProvenance::Unquoted {
             let hi = bytes[k + 2];
@@ -191,7 +266,7 @@ fn parse_bracket_class(
             k += 1;
         }
     }
-    Ok(Some((Ok(table), end + 1)))
+    Ok(BracketParse::Class(table, end + 1))
 }
 
 /// Linear/budgeted glob matcher for one path component against one directory
@@ -305,8 +380,10 @@ pub(crate) fn expand_shell_glob_impl(
 
     // Build an absolute `(bytes, provenance)` stream where expanded `home` and
     // `cwd` bytes are marked `Derived` so their characters never act as globs.
-    let mut abs_bytes: Vec<u8> = Vec::with_capacity(cwd.len() + raw.len() + 2);
-    let mut abs_prov: Vec<ByteProvenance> = Vec::with_capacity(cwd.len() + raw.len() + 2);
+    let abs_cap = cwd.len().max(home.len()) + raw.len() + 2;
+    budget.charge_alloc(abs_cap * 2)?;
+    let mut abs_bytes: Vec<u8> = Vec::with_capacity(abs_cap);
+    let mut abs_prov: Vec<ByteProvenance> = Vec::with_capacity(abs_cap);
 
     if pattern.starts_with_unquoted_tilde() {
         if raw == b"~" {
@@ -391,12 +468,15 @@ pub(crate) fn expand_shell_glob_impl(
     // DFS stack: `(current_path, comp_idx, glob_depth, variant_only)`.
     let mut stack: Vec<(Vec<u8>, usize, usize, bool)> = vec![(prefix, first_glob, 0, false)];
     let mut visited: HashSet<(Vec<u8>, usize, bool)> = HashSet::new();
+    let mut globstar_symlink_dirs: HashSet<Vec<u8>> = HashSet::new();
     let mut entries_seen: usize = 0;
 
     while let Some((dir, idx, depth, variant_only)) = stack.pop() {
+        budget.charge(dir.len().max(1) as u64)?;
         if !visited.insert((dir.clone(), idx, variant_only)) {
             continue;
         }
+        budget.charge_alloc(dir.len())?;
         if idx == comps.len() {
             if trailing_slash {
                 match resolver.stat(&dir, caps, budget) {
@@ -421,9 +501,11 @@ pub(crate) fn expand_shell_glob_impl(
             }
             if variant_only {
                 if variant_seen.insert(dir.clone()) {
+                    budget.charge_alloc(dir.len())?;
                     variant_paths.push(dir);
                 }
             } else if exact_seen.insert(dir.clone()) {
+                budget.charge_alloc(dir.len())?;
                 exact_paths.push(dir);
             }
             continue;
@@ -431,15 +513,39 @@ pub(crate) fn expand_shell_glob_impl(
 
         match &comps[idx] {
             PatComp::Literal(seg) => {
-                if seg == b"." {
-                    stack.push((dir, idx + 1, depth, variant_only));
+                if seg == b"." || seg == b".." {
+                    // POSIX globbing requires `dir` to be an existing directory for `.` / `..`.
+                    match resolver.stat(&dir, caps, budget) {
+                        Ok(meta) if meta.file_type == FileType::Dir => {}
+                        Ok(_)
+                        | Err(
+                            ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory),
+                        ) => {
+                            continue;
+                        }
+                        Err(ResolveError::Io(_)) => {
+                            push_unique_unread(
+                                &mut expansion.unread,
+                                UnreadReason::UnresolvablePath { path: dir },
+                            );
+                            continue;
+                        }
+                        Err(ResolveError::CapReached(c)) => {
+                            push_unique_unread(&mut expansion.unread, UnreadReason::from(c));
+                            break;
+                        }
+                        Err(ResolveError::Exhausted(e)) => return Err(e),
+                    }
+                    if seg == b"." {
+                        stack.push((dir, idx + 1, depth, variant_only));
+                    } else {
+                        budget.charge_alloc(dir.len() + 3)?;
+                        let next = join_bytes(&dir, b"..");
+                        stack.push((next, idx + 1, depth, variant_only));
+                    }
                     continue;
                 }
-                if seg == b".." {
-                    let next = join_bytes(&dir, b"..");
-                    stack.push((next, idx + 1, depth, variant_only));
-                    continue;
-                }
+                budget.charge_alloc(dir.len() + seg.len() + 1)?;
                 let next = join_bytes(&dir, seg);
                 match resolver.lstat(&next, caps, budget) {
                     Ok(_) => {
@@ -512,11 +618,53 @@ pub(crate) fn expand_shell_glob_impl(
                     let is_dot = entry.name.starts_with(b".");
                     if *is_globstar {
                         // 1-level match agrees across sh, bash, zsh defaults when not a dotfile.
+                        budget.charge_alloc(dir.len() + entry.name.len() + 1)?;
                         let next = join_bytes(&dir, &entry.name);
                         let one_level_variant = variant_only || is_dot;
                         stack.push((next.clone(), idx + 1, depth + 1, one_level_variant));
-                        // 2+-level descent is variant-only.
-                        if entry.file_type == FileType::Dir {
+                        // 2+-level descent is variant-only (including symlinked dirs for bash 4 globstar).
+                        let descend_dir = match entry.file_type {
+                            FileType::Dir => true,
+                            FileType::Symlink => match resolver.stat(&next, caps, budget) {
+                                Ok(md) if md.file_type == FileType::Dir => {
+                                    match resolver.canonicalize(&next, caps, budget) {
+                                        Ok(canon) => globstar_symlink_dirs.insert(canon),
+                                        Err(ResolveError::Exhausted(e)) => return Err(e),
+                                        Err(ResolveError::CapReached(c)) => {
+                                            push_unique_unread(
+                                                &mut expansion.unread,
+                                                UnreadReason::from(c),
+                                            );
+                                            hit_cap = true;
+                                            false
+                                        }
+                                        Err(_) => false,
+                                    }
+                                }
+                                Ok(_) | Err(ResolveError::NotFound) => false,
+                                Err(ResolveError::Io(_)) => {
+                                    push_unique_unread(
+                                        &mut expansion.unread,
+                                        UnreadReason::UnresolvablePath { path: next.clone() },
+                                    );
+                                    false
+                                }
+                                Err(ResolveError::CapReached(c)) => {
+                                    push_unique_unread(
+                                        &mut expansion.unread,
+                                        UnreadReason::from(c),
+                                    );
+                                    hit_cap = true;
+                                    false
+                                }
+                                Err(ResolveError::Exhausted(e)) => return Err(e),
+                            },
+                            FileType::File | FileType::Other => false,
+                        };
+                        if hit_cap {
+                            break;
+                        }
+                        if descend_dir {
                             if depth + 1 >= limits::GLOB_MAX_DEPTH {
                                 push_unique_unread(
                                     &mut expansion.unread,
@@ -527,6 +675,7 @@ pub(crate) fn expand_shell_glob_impl(
                             }
                         }
                     } else if match_component(atoms, &entry.name, budget)? {
+                        budget.charge_alloc(dir.len() + entry.name.len() + 1)?;
                         let next = join_bytes(&dir, &entry.name);
                         let entry_variant = variant_only || (is_dot && !explicit_leading_dot);
                         stack.push((next, idx + 1, depth + 1, entry_variant));
@@ -544,15 +693,17 @@ pub(crate) fn expand_shell_glob_impl(
     exact_paths.sort();
     variant_paths.sort();
 
-    // No-match fallback (§5): a glob that matches nothing is checked as its
-    // literal word.
-    if exact_paths.is_empty() && variant_paths.is_empty() && expansion.unread.is_empty() {
+    // No-match fallback (§5): when the sh/bash/zsh intersection matched nothing
+    // (and no cap/I/O unread prevented expansion), check the literal word too —
+    // even if a dialect variant matched dotfiles or recursive `**`, because
+    // default sh/bash passes the unexpanded word literally.
+    if exact_paths.is_empty() && expansion.unread.is_empty() {
         let fallback = resolve_word_literal(
             pattern,
             cwd,
             home,
             TargetOrigin::ExpandedFrom {
-                source,
+                source: source.clone(),
                 variant_only: false,
             },
             access,
@@ -561,7 +712,6 @@ pub(crate) fn expand_shell_glob_impl(
             budget,
         )?;
         expansion.exact_matches.push(fallback);
-        return Ok(expansion);
     }
 
     for matched in exact_paths {

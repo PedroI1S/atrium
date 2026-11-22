@@ -100,7 +100,6 @@ fn map_io_error(err: &std::io::Error, for_readlink: bool) -> ResolveError {
         ErrorKind::NotFound => ResolveError::NotFound,
         ErrorKind::PermissionDenied => ResolveError::Io(FsIoError::PermissionDenied),
         ErrorKind::NotADirectory => ResolveError::Io(FsIoError::NotADirectory),
-        ErrorKind::FilesystemLoop => ResolveError::Io(FsIoError::SymlinkLoop),
         ErrorKind::InvalidInput if for_readlink => ResolveError::Io(FsIoError::NotASymlink),
         _ => {
             // Fallback for platform-specific raw errno values if ErrorKind didn't classify them.
@@ -115,7 +114,7 @@ fn map_io_error(err: &std::io::Error, for_readlink: bool) -> ResolveError {
                 if code == rustix::io::Errno::NOTDIR.raw_os_error() {
                     return ResolveError::Io(FsIoError::NotADirectory);
                 }
-                if code == rustix::io::Errno::ACCES.raw_os_error()
+                if code == rustix::io::Errno::ACCESS.raw_os_error()
                     || code == rustix::io::Errno::PERM.raw_os_error()
                 {
                     return ResolveError::Io(FsIoError::PermissionDenied);
@@ -559,11 +558,21 @@ pub(crate) mod fake {
             let mut hops: u8 = 0;
 
             while let Some(seg) = queue.pop_front() {
-                if seg == b"." {
-                    continue;
-                }
-                if seg == b".." {
-                    if stack.len() > 1 {
+                if seg == b"." || seg == b".." {
+                    let cur_ino = stack.last().expect("root always present").0;
+                    match self.inodes.get(&cur_ino) {
+                        Some(Inode {
+                            kind: InodeKind::Dir { exec_error, .. },
+                            ..
+                        }) => {
+                            if let Some(err) = exec_error {
+                                return Err(ResolveError::Io(*err));
+                            }
+                        }
+                        Some(_) => return Err(ResolveError::Io(FsIoError::NotADirectory)),
+                        None => return Err(ResolveError::NotFound),
+                    }
+                    if seg == b".." && stack.len() > 1 {
                         stack.pop();
                     }
                     continue;

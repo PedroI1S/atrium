@@ -954,6 +954,7 @@ pub(crate) fn check_target_impl(
 /// populating `(dev, ino)` identities for existing hard-deny paths, `~/.ssh`
 /// members (including dangling links inside `~/.ssh`, M1-32 rework4 finding 2),
 /// directories linked into `~/.ssh`, and CR-12 / CR-17 credential stores.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_protected_set(
     home: &[u8],
     cwd: &[u8],
@@ -978,12 +979,16 @@ pub(crate) fn build_protected_set(
     let mut seen_hd: HashSet<FileIdentity> = HashSet::new();
     let mut seen_store: HashSet<FileIdentity> = HashSet::new();
 
-    let mut add_hd = |path: &[u8],
-                      id_str: &'static str,
-                      caps: &mut FsCaps,
-                      budget: &mut ComputeBudget,
-                      set: &mut ProtectedSet|
-     -> Result<(), Exhausted> {
+    #[allow(clippy::too_many_arguments)]
+    fn add_hd_path(
+        path: &[u8],
+        id_str: &'static str,
+        resolver: &dyn PathResolver,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+        seen_hd: &mut HashSet<FileIdentity>,
+        set: &mut ProtectedSet,
+    ) -> Result<(), Exhausted> {
         match resolver.stat(path, caps, budget) {
             Ok(meta) => {
                 if let Some(id) = meta.identity
@@ -996,20 +1001,44 @@ pub(crate) fn build_protected_set(
             Err(ResolveError::NotFound | ResolveError::Io(_) | ResolveError::CapReached(_)) => {}
         }
         Ok(())
-    };
+    }
 
     // Hard-deny files, trees, and Atrium data paths.
     for f in CRED_FILES {
         let p = join_folded(home, f.as_bytes());
-        add_hd(&p, "credential-read", caps, budget, &mut set)?;
+        add_hd_path(
+            &p,
+            "credential-read",
+            resolver,
+            caps,
+            budget,
+            &mut seen_hd,
+            &mut set,
+        )?;
     }
     for t in CRED_TREES {
         let p = join_folded(home, t.as_bytes());
-        add_hd(&p, "credential-read", caps, budget, &mut set)?;
+        add_hd_path(
+            &p,
+            "credential-read",
+            resolver,
+            caps,
+            budget,
+            &mut seen_hd,
+            &mut set,
+        )?;
     }
     let data_paths = set.atrium_data_paths.clone();
     for d in &data_paths {
-        add_hd(d, "atrium-self", caps, budget, &mut set)?;
+        add_hd_path(
+            d,
+            "atrium-self",
+            resolver,
+            caps,
+            budget,
+            &mut seen_hd,
+            &mut set,
+        )?;
     }
 
     // Walk ~/.ssh (bounded, matching gate.rs ssh_members + M1-32 dangling members).
@@ -1039,12 +1068,10 @@ pub(crate) fn build_protected_set(
             let name_lower =
                 fold_listed_component(&entry.name, folds.fold_long_s, folds.fold_kelvin);
             let is_public_ssh = !linked
-                && depth == 0
                 && std::str::from_utf8(&name_lower).is_ok_and(|n| {
                     n.ends_with(".pub")
                         || n.starts_with("known_hosts")
-                        || n == "config"
-                        || n == "authorized_keys"
+                        || (depth == 0 && (n == "config" || n == "authorized_keys"))
                 });
             let child = join_folded(&dir, &entry.name);
             match entry.file_type {
@@ -1065,10 +1092,14 @@ pub(crate) fn build_protected_set(
                     }
                     match resolver.stat(&child, caps, budget) {
                         Ok(md) if md.file_type == FileType::Dir => {
-                            if let Ok(real) = resolver.canonicalize(&child, caps, budget)
-                                && !set.ssh_linked_dirs.contains(&real)
-                            {
-                                set.ssh_linked_dirs.push(real);
+                            match resolver.canonicalize(&child, caps, budget) {
+                                Ok(real) => {
+                                    if !set.ssh_linked_dirs.contains(&real) {
+                                        set.ssh_linked_dirs.push(real);
+                                    }
+                                }
+                                Err(ResolveError::Exhausted(e)) => return Err(e),
+                                Err(_) => {}
                             }
                             let visit = md.identity.is_none_or(|id| visited_dirs.insert(id));
                             if visit {
@@ -1089,12 +1120,11 @@ pub(crate) fn build_protected_set(
                 }
                 FileType::Dir => match resolver.lstat(&child, caps, budget) {
                     Ok(md) => {
-                        if !linked
-                            && let Some(id) = md.identity
-                            && seen_hd.insert(id)
-                        {
-                            set.hard_deny_identities.push((id, "credential-read"));
-                        }
+                        // Do not add subdir inodes to `hard_deny_identities`:
+                        // `~/.ssh/sub/key.pub` must keep its `.pub` exception
+                        // while private files inside `sub` get their own file
+                        // identities below and `~/.ssh/sub` itself stays
+                        // blocked by listed path name.
                         let visit = md.identity.is_none_or(|id| visited_dirs.insert(id));
                         if visit {
                             stack.push((child, depth + 1, linked));
@@ -1105,7 +1135,15 @@ pub(crate) fn build_protected_set(
                 },
                 FileType::File | FileType::Other => {
                     if !is_public_ssh {
-                        add_hd(&child, "credential-read", caps, budget, &mut set)?;
+                        add_hd_path(
+                            &child,
+                            "credential-read",
+                            resolver,
+                            caps,
+                            budget,
+                            &mut seen_hd,
+                            &mut set,
+                        )?;
                     }
                 }
             }

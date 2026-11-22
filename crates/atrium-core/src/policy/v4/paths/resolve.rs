@@ -21,11 +21,13 @@ use crate::policy::model::{
     ResolveError, Target, TargetOrigin, TargetResolution, UnreadReason, Word,
 };
 use crate::policy::v4::paths::PathResolver;
+use crate::policy::v4::paths::sensitive::strip_firmlink;
 
 /// Returns `true` iff `path` is a process-dependent path under §3 / §11 item 14:
 /// `/proc/self`, `/proc/thread-self`, `/proc/<pid>`, `/dev/fd/`, `/dev/stdin`,
 /// `/dev/stdout`, `/dev/stderr` (exact or prefix followed by `/`).
 pub(crate) fn is_process_dependent_path(path: &[u8]) -> bool {
+    let path = strip_firmlink(path);
     if !path.starts_with(b"/") {
         return false;
     }
@@ -212,6 +214,7 @@ pub(crate) fn resolve_literal_impl(
         ));
     }
 
+    budget.charge_alloc(expanded.len())?;
     let mut queue: VecDeque<Vec<u8>> = expanded
         .split(|&b| b == b'/')
         .filter(|s| !s.is_empty())
@@ -221,11 +224,20 @@ pub(crate) fn resolve_literal_impl(
     let mut existing_stack: Vec<(Vec<u8>, Option<FileIdentity>)> = Vec::new();
     let mut missing_tail: Vec<Vec<u8>> = Vec::new();
     let mut hops: u8 = 0;
-    let mut followed_symlink = false;
+    // Number of front segments in `queue` originating from symlink expansions:
+    // a symlink is dangling only when resolution enters `missing_tail` while
+    // resolving segments produced by a symlink target (not an absent child of
+    // an existing directory reached through a valid directory symlink).
+    let mut symlink_target_segs: usize = 0;
+    let mut dangling_symlink = false;
     let mut final_meta: Option<PathMetadata> = None;
-    let mut dangling_link_identity: Option<FileIdentity> = None;
+    let mut symlink_identities: Vec<FileIdentity> = Vec::new();
 
     while let Some(seg) = queue.pop_front() {
+        let from_symlink = symlink_target_segs > 0;
+        if from_symlink {
+            symlink_target_segs -= 1;
+        }
         budget.charge(seg.len().max(1) as u64)?;
         if seg == b"." {
             continue;
@@ -262,6 +274,7 @@ pub(crate) fn resolve_literal_impl(
         }
 
         let cand = build_path_from_stack(&existing_stack, Some(&seg));
+        budget.charge_alloc(cand.len())?;
         if is_process_dependent_path(&cand) {
             return Ok(unread_target(
                 origin,
@@ -297,9 +310,10 @@ pub(crate) fn resolve_literal_impl(
                                 ));
                             }
                             hops += 1;
-                            followed_symlink = true;
-                            if queue.is_empty() {
-                                dangling_link_identity = meta.identity;
+                            if let Some(id) = meta.identity
+                                && !symlink_identities.contains(&id)
+                            {
+                                symlink_identities.push(id);
                             }
                             if target.starts_with(b"/") {
                                 if is_process_dependent_path(&target) {
@@ -319,11 +333,14 @@ pub(crate) fn resolve_literal_impl(
                                 existing_stack.clear();
                                 final_meta = None;
                             }
+                            budget.charge_alloc(target.len())?;
                             let target_segs: Vec<Vec<u8>> = target
                                 .split(|&b| b == b'/')
                                 .filter(|s| !s.is_empty())
                                 .map(|s| s.to_vec())
                                 .collect();
+                            symlink_target_segs =
+                                symlink_target_segs.saturating_add(target_segs.len());
                             for s in target_segs.into_iter().rev() {
                                 queue.push_front(s);
                             }
@@ -346,6 +363,9 @@ pub(crate) fn resolve_literal_impl(
                 }
             }
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {
+                if from_symlink {
+                    dangling_symlink = true;
+                }
                 missing_tail.push(seg);
                 final_meta = None;
             }
@@ -416,11 +436,13 @@ pub(crate) fn resolve_literal_impl(
         ));
     }
 
-    let dangling_symlink = followed_symlink && !missing_tail.is_empty();
+    let dangling_symlink = dangling_symlink && !missing_tail.is_empty();
     let multiply_linked = missing_tail.is_empty()
         && final_meta.is_some_and(|m| m.file_type == FileType::File && m.nlink > 1);
 
-    let mut identities: Vec<FileIdentity> = Vec::with_capacity(existing_stack.len() + 1);
+    let max_ids = existing_stack.len() + symlink_identities.len();
+    budget.charge_alloc(max_ids * std::mem::size_of::<FileIdentity>())?;
+    let mut identities: Vec<FileIdentity> = Vec::with_capacity(max_ids);
     for (_, id_opt) in &existing_stack {
         if let Some(id) = id_opt
             && !identities.contains(id)
@@ -428,11 +450,12 @@ pub(crate) fn resolve_literal_impl(
             identities.push(*id);
         }
     }
-    if dangling_symlink
-        && let Some(id) = dangling_link_identity
-        && !identities.contains(&id)
-    {
-        identities.push(id);
+    if dangling_symlink {
+        for id in symlink_identities {
+            if !identities.contains(&id) {
+                identities.push(id);
+            }
+        }
     }
 
     Ok(Target {

@@ -11,6 +11,7 @@ pub(crate) mod sensitive;
 #[cfg(test)]
 mod p2_tests;
 
+#[allow(unused_imports)]
 pub(crate) use resolver::FsResolver;
 
 use crate::policy::model::{
