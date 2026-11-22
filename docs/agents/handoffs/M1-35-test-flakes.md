@@ -226,3 +226,63 @@ bash -c 'for i in $(seq 1 30); do cargo test -p atrium-agents --test claude_adap
 # N15
 bash -c 'for i in $(seq 1 30); do cargo test -p atrium-daemon --test M1-28-followups || exit 1; done'
 ```
+
+---
+
+## Round 2
+
+Addressed all 3 findings from `.orchestration/review-input/review-round1.md` (D-120).
+
+- **Checks run (D-123):** `cargo fmt --all`, `cargo check -p atrium-app --tests`, `cargo check -p atrium-agents --tests`, `cargo check -p atrium-daemon --tests` — all passed with zero errors and zero warnings. `cargo test`, `cargo clippy`, and `pnpm` were not run.
+
+### Finding 1: Completed malformed JSONL records silently discarded (`claude_adapter.rs`, `codex_adapter.rs`)
+
+- **Fix:**
+  - Updated `responses(dir)` in `crates/atrium-agents/tests/claude_adapter.rs` to slice `raw[..=last_nl]` (ignoring only an unfinished trailing line without `\n`, while including every `\n`-terminated line including blank completed lines) and panic on any completed line that fails `serde_json::from_str` with a diagnostic containing the 1-based line number, file path, parse error, and raw line (`{line:?}`).
+  - Added the same `responses(dir)` helper in `crates/atrium-agents/tests/codex_adapter.rs` and switched all 6 `responses.jsonl` readers (including the live polling loop in `saturation_declines_approvals_questions_and_reports_dropped_events`) from `.filter_map(|l| serde_json::from_str(l).ok())` / `.ok().is_some_and(...)` to `responses(&dir)`.
+- **Commit:** `2ab435d` (`M1-35 (R2 F1): fail on malformed completed JSONL lines in adapter tests`).
+- **Tests:**
+  - `claude_adapter::wait_response_fails_on_malformed_completed_jsonl_line` — verifies that `wait_response` panics with a diagnostic showing the bad line and line number on both `"not-json-at-all\n<valid>\n"` and `"\n<valid>\n"`, while still succeeding on `"<valid>\n{\"truncated"` (only the unfinished trailing line without `\n` is ignored).
+  - `codex_adapter::responses_fails_on_malformed_completed_jsonl_line` — verifies the same three cases plus an unfinished-only file (`"{\"truncated"` -> empty `Vec`) for `codex_adapter::responses`.
+- **How each test fails without the fix:** With the round-1 `.filter_map(|l| serde_json::from_str(l).ok())` implementation (and `raw[..last_nl]` for blank lines), both `"not-json-at-all\n<valid>\n"` and `"\n<valid>\n"` silently discard the malformed line and return the following valid record (`Ok(...)`), failing `.expect_err("malformed completed JSONL line must fail ...")` / `.expect_err("blank completed JSONL line must fail ...")`.
+
+### Finding 2: Retry can launch the login shell after the deadline (`crates/atrium-daemon/src/lib.rs`)
+
+- **Fix:**
+  - Extracted `#[doc(hidden)] pub fn spawn_login_shell_with_retry(deadline, now, sleep, spawn)` and routed `spawn_login_shell` / `discover_login_shell_path` through it.
+  - Added an explicit `if now() >= deadline { return None; }` check at the top of the retry loop immediately before each spawn attempt (including right after every backoff sleep), so no shell can launch once the deadline has passed—whether the final backoff consumed the remaining budget, the OS overslept past the deadline, or the budget was already zero.
+  - Added `#[doc(hidden)] pub fn discover_login_shell_path_with_spawn_hook` (called by `discover_login_shell_path` with a no-op hook) to observe real spawn attempts without changing `discover_login_shell_path`'s public signature.
+- **Commit:** `a0c6885` (`M1-35 (R2 F2): check deadline before each login-shell spawn retry`).
+- **Test:**
+  - `atrium_daemon::tests::spawn_login_shell_with_retry_returns_none_when_deadline_expires_before_retry` — injects a virtual clock and spawn closure to test: (1) final backoff consuming the remaining `3 ms` budget (`1 ms + 2 ms`) where attempt 3 would return `Ok("started-after-deadline")`, asserting `None` and `attempts == 2`; (2) simulated oversleep past a `10 ms` deadline where attempt 2 would succeed, asserting `None` and `attempts == 1`; (3) already-expired deadline (`0 ms`), asserting `None` and `attempts == 0`; and (4) non-`ETXTBSY` (`NotFound`) aborting immediately (`attempts == 1`, no sleep).
+- **How the test fails without the fix:** Without the pre-attempt `if now() >= deadline { return None; }` check, subcase 1 loops directly from `sleep(2ms)` (at `t == deadline`) into attempt 3, launching the shell and returning `Some("started-after-deadline")` (`attempts == 3`) instead of `None` (`attempts == 2`); subcase 2 similarly launches attempt 2 after oversleeping past `deadline` and returns `Some("started-after-oversleep")` (`attempts == 2`).
+
+### Finding 3: Deterministic ETXTBSY regression test (`crates/atrium-daemon/tests/M1-28-followups.rs`)
+
+- **Fix:**
+  - Replaced the scheduling-dependent `thread::sleep(50 ms)` releaser thread in `M1-28-followups::discover_login_shell_path_handles_etxtbsy_within_timeout` with two deterministic layers:
+    1. **Virtual-clock + injected-outcome seam tests** via `spawn_login_shell_with_retry` (all platforms, zero wall-clock sleep): transient `[ETXTBSY, ETXTBSY, Ok]` recovery (asserting `Some`, `3` attempts, sleeps `[1ms, 2ms]`, all attempt times `< deadline`); permanently busy (`20 ms` virtual budget, asserting `None`, `5` attempts = 1 initial + 4 retries, exact backoff schedule `[1ms, 2ms, 4ms, 8ms, 5ms]`, all attempt times `< deadline`); and expiry right before retry (`3 ms` budget, asserting `None` and `2` attempts).
+    2. **Real Linux kernel `ETXTBSY` end-to-end tests** (`#[cfg(target_os = "linux")]`) via `discover_login_shell_path_with_spawn_hook`: holds a writable fd on `busy-sh` on the test thread and drops it synchronously **only inside the spawn-attempt hook after observing `Err(ExecutableFileBusy)`**, asserting recovery to `Some("/fake/busy/bin")` with `prior` non-empty and all `Err(ExecutableFileBusy)` followed by `Ok(())`; and for the permanently held writable fd (`200 ms` timeout), asserts `None`, `busy_attempts.len() >= 2` (confirming real retries occurred), all attempts `Err(ExecutableFileBusy)`, and elapsed `< 2 s`.
+- **Commit:** `b34fdd8` (`M1-35 (R2 F3): make ETXTBSY regression tests deterministic`).
+- **Test:** `M1-28-followups::discover_login_shell_path_handles_etxtbsy_within_timeout`.
+- **How each test fails without the fix (old non-retrying `cmd.spawn().ok()?`):**
+  - **1a (injected transient busy -> success):** Old code does not retry `ETXTBSY`; attempt 1 receives `Err(ExecutableFileBusy)` and immediately returns `None` (`attempt_times.len() == 1`, `sleeps == []`), failing `assert_eq!(recovered, Some("recovered-shell"))`.
+  - **1b (injected permanently busy):** Old code stops after 1 attempt (`attempt_times.len() == 1`, `sleeps == []`), failing `assert_eq!(attempt_times.len(), 5, ...)`.
+  - **1c (expiry before retry):** Old non-retrying code stops after 1 attempt (`attempts == 1`, failing `assert_eq!(attempts, 2)`); round-1 retrying code without Finding 2's pre-retry deadline check invokes attempt 3 at `t == deadline` and returns `Some("started-after-deadline")`, failing `assert_eq!(expired, None)`.
+  - **2a (real Linux transient `ETXTBSY` with hook-synchronized release):** Because `writer` stays open on the calling thread until `on_spawn_attempt` observes `Err(ExecutableFileBusy)`, attempt 1 deterministically hits kernel `ETXTBSY` regardless of scheduling. Old non-retrying code immediately returns `None` without retrying after `writer` drops, failing `assert_eq!(found.as_deref(), Some(OsStr::new("/fake/busy/bin")))`.
+  - **2b (real Linux permanently held writable fd):** Old non-retrying code performs only 1 spawn attempt (`busy_attempts.len() == 1`) before returning `None`, failing `assert!(busy_attempts.len() >= 2, ...)`.
+
+### Additional Round 2 verification commands for the orchestrator
+
+(All commands are fish- and bash-compatible.)
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+cargo test --workspace --no-fail-fast
+cargo test -p atrium-daemon --lib spawn_login_shell_with_retry
+bash -c 'for i in $(seq 1 30); do cargo test -p atrium-agents --test claude_adapter || exit 1; done'
+bash -c 'for i in $(seq 1 30); do cargo test -p atrium-agents --test codex_adapter || exit 1; done'
+bash -c 'for i in $(seq 1 30); do cargo test -p atrium-daemon --test M1-28-followups || exit 1; done'
+bash -c 'for i in $(seq 1 30); do cargo test -p atrium-app --lib upgrade::tests || exit 1; done'
+```
