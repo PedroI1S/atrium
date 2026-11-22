@@ -213,3 +213,98 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 3 (rework against Codex review round 2 & full-table audit under Rules A–F)
+
+All 6 findings from `.orchestration/review-input/review-round2.md` are fixed, and the entire tool table (`TOOLS` + all subcommands) was audited under Rules A–F so no accepted flag or form can omit its real policy effect. `docs/contracts/m1-policy-rev4-tools.md` is intentionally left untouched for the orchestrator to regenerate via `env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools`. Commits `c89a8bd` (`dev` merge) and `f966066` (§11 item 15 approved) are preserved untouched.
+
+### Findings, fixes, and commits
+
+| # | Finding | Fix | Commit(s) |
+|---|---|---|---|
+| 1 | Unlisted options retained acceptance (`AnyExceptForbidden` outside Home) and lost write semantics (`cp -t vault README.md`, `sort --out=alias README.md`) | Added `AccessMode::ReadWrite` in `model.rs`; restricted `FlagMode::AnyExceptForbidden` strictly to the 22 non-`rg`/non-`grep` `HOME_READONLY_COMMANDS` rows (defaulting `base_tool`/`base_subcommand` to `FlagMode::ListedOnly`); documented conservative `ReadWrite` candidate-path treatment on unlisted flags and `UnknownFlag` fallbacks; added `is_forbidden_flag` (mirroring `engine::forbidden_flag`: short clusters + long abbreviations `>= 3` chars including `--`) and `flag_long_or_writing_abbrev` (so `sort --out=alias`, `tree --out=alias`, `git diff --out=alias` receive `--output`'s write effect); added `any_except_forbidden_restricted_to_home_readonly` integrity test and fixtures. | `ca6c07f`, `28da20f`, `3d9a9ae` |
+| 2 | Ripgrep's global glob case setting (`--glob-case-insensitive` / `--no-glob-case-insensitive`) had no effect | Added `FilterCase` (`AlwaysSensitive`, `AlwaysInsensitive`, `FollowGlobalToggle`), `FilterSpec`, and `FlagEffects::filter_case_insensitive: FlagToggle`; set `--glob-case-insensitive` → `Enable`, `--no-glob-case-insensitive` → `Disable`, `-g`/`--glob` → `FollowGlobalToggle`, and `--iglob` → `AlwaysInsensitive`; added ordering/override fixtures. | `28da20f`, `3d9a9ae` |
+| 3 | Unsupported search filters (`grep --exclude`, `--exclude-dir`, `--include-dir`, `ag` ignore/filter flags, etc.) lacked an `Unread` effect | Added `FlagUnread::FilterForm` → `UnreadReason::UnsupportedFilterForm`; marked `grep`'s `--exclude`, `--exclude-dir`, `--include-dir`, `ag`'s `-G`, `-g`, `-p` (preserving `Read` on its ignore file), `--ackmate-dir-filter`, `--depth`, `--ignore`, `--ignore-dir`, `--one-device`, `rg`'s `-t`, `-T`, `--type-add`, `--type-clear`, `-d`/`--max-depth`, `--maxdepth`, `--max-filesize`, `ack`'s `-g`, `-t`/`--type`, `--ignore-dir`, `--noignore-dir`, `-k`, and `find`'s `-x`, `-maxdepth`, `-mindepth` with `FlagUnread::FilterForm`; added fixtures. | `28da20f`, `3d9a9ae` |
+| 4 | `tar -C` lacked per-operand base-directory resolution semantics | Added `UnreadReason::UnsupportedBaseDirChange { tool, flag }` in `model.rs` and `FlagUnread::BaseDirChange` in `tools.rs`; marked `tar -C`/`--directory` (preserving `WriteWhenWriting` on its dir arg) and `git`'s `-C`, `--git-dir`, `--work-tree` (preserving `Read` on their path args) and `--super-prefix` with `FlagUnread::BaseDirChange`; added fixtures. | `ca6c07f`, `28da20f`, `3d9a9ae` |
+| 5 | Named `sed -f edit.sed` program could not receive program coverage | Added `ProgramPin::FlagValue` and `FlagEffects::runs_program: Option<ProgramPin>`; changed `sed -f`/`--file` to `runs_code: false, runs_program: Some(ProgramPin::FlagValue), value_access: Some(FlagValueAccess::Read)`, added `awk`/`gawk`/`mawk` `-f`/`--file` with the same pinning semantics (`CodeRunnerBehavior::ProgramOrInline { pin: ProgramPin::FlagValue }`), kept `sed -e` inline script inspection (`e`/`w`/`r`) unchanged, cited `§11 item 8` on `sed`/`awk`/`gawk`/`mawk`, and added `flag_program_files_have_pin_and_cite_item_8` integrity test + fixtures. | `28da20f`, `3d9a9ae` |
+| 6 | Flag-value operand relaxations (`codesign -s`, `git` text-valued globals, `find` text-valued options) lacked `§11 item 9` citations | Annotated `codesign`, `git`, `find`, `nice`, `timeout`, `git bisect`, `git rebase`, `git submodule`, `git difftool`, `cargo` subcommands, and `target_then_code_runner` rows with `§11 item 9`; removed `wrapper`/`code_runner` bypasses from `non_path_operand_relaxations_cite_item_9` and extended it to check all `FlagKind::Value`/`OptionalValue` flag roles and `positional_role` overrides. | `28da20f`, `3d9a9ae` |
+
+### Row-by-row audit changes (Rules A–F) and what became `Unread`
+
+1. **Schema & integrity guarantees (Rules A–F):**
+   - Replaced implicit `FlagEffects::NONE` with explicit `Effect::None { reason: &'static str }` vs. `Effect::Applied(FlagEffects)` on every `FlagSpec`; added `FlagValueAccess` (`Read`, `Write`, `WriteWhenWriting`), `FilterCase`, `FilterSpec`, `GitPushEffect`, and `FlagUnread` (`FilterForm`, `BaseDirChange`, `FlagEffect`).
+   - Added `UnreadReason::UnsupportedBaseDirChange` and `UnreadReason::UnsupportedFlagEffect` plus `AccessMode::ReadWrite` in `model.rs`.
+   - Added integrity tests `every_flag_declares_explicit_effect_or_none_reason` (Rule A), `any_except_forbidden_restricted_to_home_readonly` (Rules B & C), `flag_program_files_have_pin_and_cite_item_8` (Rule D), and extended `non_path_operand_relaxations_cite_item_9` to all rows/subcommands and flag values (Rule F).
+2. **Row-by-row changes:**
+   - **`ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `du`, `df`, `which`, `uname`, `date`, `whoami`, `tree`, `git status`, `git log`, `git diff`, `git show`, `git branch`, `git rev-parse`, `git ls-files` (22 Home read-only rows):** retained `FlagMode::AnyExceptForbidden` (explicitly set per row) with conservative `AccessMode::ReadWrite` treatment for unlisted flags and attached `--opt=value`; `tree -o`/`--output` and `git diff --output` gained explicit `value_access: Write` + long-abbreviation write matching (`--out=...`).
+   - **All non-Home rows (`cp`, `mv`, `rsync`, `tar`, `unzip`, `ln`, `find`, `rm`, `tee`, `touch`, `chmod`, `chown`, `chgrp`, `truncate`, `install`, `mkdir`, `rmdir`, `unlink`, `shred`, `patch`, `wipefs`, `blkdiscard`, `ed`, `ex`, `diff`, `cmp`, `md5`, `md5sum`, `shasum`, `sha1sum`, `sha256sum`, `readlink`, `realpath`, `basename`, `dirname`, `nl`, `od`, `hexdump`, `strings`, `bat`, `column`, `fold`, `expand`, `less`, `more`, `cut`, `sort`, `uniq`, `xxd`, `echo`, `printf`, `whereis`, `type`, `tr`, `true`, `false`, `id`, `test`, `[`, `jq`, `mdls`, `open`, `spctl`, `mdfind`, `codesign`, `awk`, `gawk`, `mawk`, `sed`, `perl`, `python`, `python3`, `node`, `ruby`, `eval`, `source`, `.`, `npx`, `xargs`, `COMMAND_RUNNERS`, `PRIV`, `DOWNLOADERS`, `git` top-level + non-Home git subcommands, `cargo` + subcommands, `pipx` + `pipx run`):** switched to `FlagMode::ListedOnly` (Rule C), so any unlisted flag (e.g. `cp -t`, `rm -f`, `mkdir -p`, `test -f`, `cargo test --lib`) becomes `Unread(UnknownFlag)` with conservative `ReadWrite` fallback on unclassified words.
+   - **`rg`:** `--glob-case-insensitive` / `--no-glob-case-insensitive` now toggle `filter_case_insensitive`; `-g`/`--glob` uses `FollowGlobalToggle`; `--iglob` uses `AlwaysInsensitive`; `-f`/`--file` sets `value_access: Read`; `-t`/`--type`, `-T`/`--type-not`, `--type-add`, `--type-clear`, `-d`/`--max-depth`, `--maxdepth`, `--max-filesize` now produce **`Unread(UnsupportedFilterForm)`**; all remaining flags carry explicit `Effect::None { reason }`. Added `§11 item 2`.
+   - **`grep`, `egrep`, `fgrep`, `zgrep`, `ggrep`, `rgrep`:** `-f`/`--file` sets `value_access: Read`; `--include` uses `AlwaysSensitive`; `--exclude`, `--exclude-dir`, and `--include-dir` (added for §5/Rule A) now produce **`Unread(UnsupportedFilterForm)`**; `-d`/`--directories` keeps `recursive: Enable` and produces **`Unread(UnsupportedFlagEffect)`** (action depends on `read`/`skip`/`recurse` value); all remaining flags carry explicit `Effect::None { reason }`. Added `§11 item 2`.
+   - **`ag`:** `-G`/`--file-search-regex`, `-g`/`--filename-pattern`, `-p`/`--path-to-ignore` (with `value_access: Read`), `--ackmate-dir-filter`, `--depth`, `--ignore`, `--ignore-dir`, and `--one-device` now produce **`Unread(UnsupportedFilterForm)`**; `-z`/`--search-zip` now produces **`Unread(UnsupportedFlagEffect)`**; all remaining flags carry explicit `Effect::None { reason }`. Added `§11 item 2`.
+   - **`ack`:** `-g`, `-t`/`--type`, `--ignore-dir`, `--noignore-dir`, and `-k` now produce **`Unread(UnsupportedFilterForm)`**; `-x` (reads file list from stdin) now produces **`Unread(UnsupportedFlagEffect)`**; all remaining flags carry explicit `Effect::None { reason }`. Added `§11 item 2`.
+   - **`tar`:** `-f`/`--file` sets `value_access: WriteWhenWriting`; `-C`/`--directory` sets `value_access: WriteWhenWriting` and now produces **`Unread(UnsupportedBaseDirChange)`**. Added `§11 item 2`.
+   - **`unzip`:** `-d` sets `value_access: Write`.
+   - **`find`:** `-f` sets `value_access: Read`; `-fprint`/`-fprint0`/`-fprintf`/`-fls` set `value_access: Write`; `-delete` also sets `derived_destinations: Enable` (`find.derived_destinations = WithFlag`); `-x`, `-maxdepth`, and `-mindepth` now produce **`Unread(UnsupportedFilterForm)`**; `-E`/`-X`/`-d`/`-s`/`-depth`/`-D` carry explicit `Effect::None { reason }`. Added `§11 item 2`, `§11 item 9`, `§11 item 10`.
+   - **`sort` / `tree`:** `-o`/`--output` sets `value_access: Write`; long abbreviations (`--out=...`, `--o=...`) match `--output` via `flag_long_or_writing_abbrev`.
+   - **`printf`:** `-v` (bash variable assignment, which can set `HOME`) now produces **`Unread(UnsupportedFlagEffect)`**. Added `§11 item 2`.
+   - **`codesign`:** `-d`/`-v` carry explicit `Effect::None { reason }`; row now cites `§11 item 9` (for `-s`/`--sign` `Value(Text)`).
+   - **`sed`:** `-f`/`--file` changed from `runs_code: true` to `runs_program: Some(ProgramPin::FlagValue), value_access: Some(FlagValueAccess::Read)` (pinnable `Unread(program)`). Added `§11 item 8`.
+   - **`awk`, `gawk`, `mawk`:** added `-f`/`--file` (`Value(ProgramFile)`, `runs_program: Some(ProgramPin::FlagValue)`, `value_access: Read`, `provides_script: true`, `writes: Enable`) and switched `code_runner` to `ProgramOrInline { pin: ProgramPin::FlagValue }`. Added `§11 item 8`.
+   - **`sh`, `bash`, `dash`, `perl`, `python`, `python3`, `node`, `ruby`, `source`, `.`, `npx`, `pipx run`:** changed trailing script-argument `rest` role from `ValueRole::Text` to `ValueRole::Path` so script arguments (e.g. `python build.py proj/key`) keep candidate-path hard-deny checks instead of being relaxed.
+   - **`git` (top-level):** `-C`, `--git-dir`, `--work-tree` set `value_access: Read` and produce **`Unread(UnsupportedBaseDirChange)`**; `--super-prefix` produces **`Unread(UnsupportedBaseDirChange)`**; `--namespace` carries `Effect::None { reason }`. Added `§11 item 2; §11 item 9`.
+   - **`git push`:** `-f`/`--force`/`--force-with-lease`/`--force-if-includes`/`--mirror` carry `git_push: Some(Force)`; `--all`/`--tags`/`--branches`/`--prune` carry `git_push: Some(ImplicitTargets)`; `-o`/`--push-option` carries `Effect::None { reason }`.
+   - **`git checkout`:** `-b`/`-B`/`--orphan` set `writes: Enable`.
+   - **`git bisect`, `git rebase`, `git submodule`, `git difftool`, `nice`, `timeout`, `cargo` subcommands, `target_then_code_runner` (19 tools):** added `§11 item 9` per Rule F.
+
+### Updated full list of rows marked `changes_default` (Round 3, for Pedro)
+
+| Entry | §11 item(s) | Reason |
+|---|---|---|
+| `command`, `exec`, `time`, `env` | §11 item 10 | Closed §4 wrapper forms (`ListedOnly`); other forms/options → `Unread`. |
+| `nice`, `timeout` | §11 item 9; §11 item 10 | Non-path priority/signal/duration flag/operand values (`Text`; item 9); closed §4 wrapper forms (item 10). |
+| `sh`, `bash`, `dash` | §11 item 2; §11 item 4; §11 item 8 | K7 positional resolution & non-§4 flags → `Unread` (item 2); bare prefix invalid at creation (item 4); script file (`sh x.sh`) pinnable `Unread (program)` (item 8). |
+| `which`, `echo`, `whereis`, `type`, `tr`, `true`, `false`, `id`, `jq`, `chmod`, `chown`, `chgrp`, `codesign` | §11 item 9 | Non-path operands or flag values (`Text`/`Pattern`; including `codesign -s`) stop counting as candidate paths. |
+| `printf` | §11 item 2; §11 item 9 | `-v` shell-variable assignment → `Unread` (item 2); format/value operands (`Text`) stop counting as candidate paths (item 9). |
+| `rg`, `grep` | §11 item 2; §11 item 9; §11 item 15 | Unsupported filters/depth/size/dir-action flags → `Unread` (item 2); pattern & text values not paths (item 9); followed-link search allowed in Home when link walk is within budget (item 15, D-139). |
+| `egrep`, `fgrep`, `zgrep`, `ggrep`, `rgrep` | §11 item 2; §11 item 9 | Unsupported filters/dir-action flags → `Unread` (item 2); pattern & text values not paths (item 9). |
+| `ag`, `ack` | §11 item 2; §11 item 4; §11 item 9 | Unsupported ignore/filter/zip/stdin flags → `Unread` (item 2); unpinned Allow prefix invalid (item 4); pattern & text values not paths (item 9). |
+| `git` (bare prefix) | §11 item 2; §11 item 4; §11 item 9 | `-C`/`--git-dir`/`--work-tree`/`--super-prefix` → `Unread(UnsupportedBaseDirChange)` (item 2); bare `["git"]` prefix invalid (item 4); `--namespace`/`--super-prefix` `Text` values not paths (item 9). |
+| `git status`, `git ls-files` | §11 item 10 | Active wildcard pathspecs → `Unread`. |
+| `git log`, `git show` | §11 item 9; §11 item 10 | Ref operands / `-L` text not filesystem paths (item 9); active wildcard pathspecs → `Unread` (item 10). |
+| `git diff` | §11 item 4; §11 item 9; §11 item 10 | Prefix ending at `["git", "diff"]` invalid (`--ext-diff`; item 4); ref operands not paths (item 9); active wildcard pathspecs → `Unread` (item 10). |
+| `git push` | §11 item 4; §11 item 9 | Prefix ending at `["git", "push"]` invalid (`--receive-pack`/`--exec`; item 4); ref operands & `-o` text not paths (item 9). |
+| `git branch`, `git rev-parse`, `git cat-file` | §11 item 9 | Ref operands / `-u` ref not filesystem paths. |
+| `git clone`, `git checkout` | §11 item 9; §11 item 10 | Ref operands / `-b`/`-B`/`--orphan` not filesystem paths (item 9); derived destinations → `Unread` (item 10). |
+| `git merge-index`, `git filter-branch`, `git mergetool` | §11 item 4 | Program-running git subcommands; unpinned Allow prefixes invalid at creation. |
+| `git bisect`, `git rebase`, `git submodule`, `git difftool` | §11 item 4; §11 item 9 | Program-running git subcommands (item 4); subarg/ref operands (`Text`/`Ref`) not filesystem paths (item 9). |
+| `cargo` (bare) | §11 item 4; §11 item 8 | Bare `["cargo"]` invalid at creation (item 4); `["cargo", "<subcmd>"]` pins `Unread (program)` (item 8). |
+| `cargo test`, `build`, `run`, `check`, `bench`, `doc`, `clippy` | §11 item 8; §11 item 9 | Pinnable `Unread (program)` (item 8); test/target filter operands (`Text`) not filesystem paths (item 9). |
+| `pipx`, `pipx run` | §11 item 4; §11 item 8 | Bare `["pipx"]` and `["pipx", "run"]` invalid at creation (item 4); `["pipx", "run", "<pkg>"]` pins `Unread (program)` (item 8). |
+| `find` | §11 item 2; §11 item 4; §11 item 9; §11 item 10 | `-maxdepth`/`-mindepth`/`-x` → `Unread(UnsupportedFilterForm)` (item 2); bare `["find"]` invalid (item 4); `-D`/`-maxdepth`/`-mindepth` `Text` values not paths (item 9); `-delete` derived destinations (item 10). |
+| `cp`, `mv`, `rsync` | §11 item 10 | Derived destinations (`cp -r`/`-R`/`-a`, `mv` of directory, `rsync`) → `Unread`. |
+| `tar` | §11 item 2; §11 item 9; §11 item 10 | `-C`/`--directory` → `Unread(UnsupportedBaseDirChange)` (item 2); extract/list `ArchiveMember` operands not host paths (item 9); `-x` derived destinations → `Unread` (item 10). |
+| `unzip` | §11 item 9; §11 item 10 | `ArchiveMember` operands not host paths (item 9); derived destinations → `Unread` (item 10). |
+| `awk`, `gawk`, `mawk`, `sed` | §11 item 4; §11 item 8 | Bare prefix invalid at creation (item 4); `-f`/`--file` flag-held program file is pinnable `Unread (program)` under `ProgramPin::FlagValue` (item 8). |
+| `perl`, `python`, `python3`, `node`, `ruby`, `source`, `.`, `npx` | §11 item 4; §11 item 8 | Bare prefix invalid at creation (item 4); `[tool, script]` pins `Unread (program)` (item 8). |
+| `eval`, `xargs`, direct `COMMAND_RUNNERS` (9: `nsenter`, `unshare`, `systemd-run`, `systemd-nspawn`, `firejail`, `bwrap`, `flatpak-spawn`, `setpriv`, `parallel`) | §11 item 4 | Code runners; unpinned Allow prefix invalid at creation. |
+| Target-then-code `COMMAND_RUNNERS` (19: `ssh`, `mosh`, `autossh`, `docker`, `podman`, `nerdctl`, `kubectl`, `oc`, `lxc`, `incus`, `machinectl`, `toolbox`, `distrobox`, `distrobox-enter`, `multipass`, `vagrant`, `limactl`, `colima`, `runuser`) | §11 item 4; §11 item 9 | Code runners (item 4); `[0]` host/target operand (`Text`) not a filesystem path (item 9). |
+| `OUTSIDE_MODEL` shells (12: `zsh`..`xonsh`) | §11 item 4 | Shells outside §4's modeled `sh`/`bash`/`dash` subset → `Unread`, unpinned Allow prefix invalid. |
+| `OUTSIDE_MODEL` wrappers (16: `nohup`..`arch`) | §11 item 10 | Wrappers outside §4's closed list → `Unread`. |
+
+### Round 3 verification
+
+Run by worker (allowed under D-123 + Round 3 instruction):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
+
+Commands for the orchestrator's verification task (fish-compatible):
+
+```sh
+env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+```
