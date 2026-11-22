@@ -21,7 +21,6 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
-use tokio::task::JoinSet;
 use tokio::time::Instant as TokioInstant;
 
 use super::normalizer::{CodexNormalizer, DEADLINE_INTERRUPT, DEADLINE_RECORD_TOO_LARGE, coverage};
@@ -390,7 +389,6 @@ enum Internal {
         questions: Value,
         failed: bool,
     },
-    Withdraw(ApprovalTicket, Option<OwnedSemaphorePermit>),
 }
 
 struct InFlightCheck {
@@ -430,20 +428,20 @@ impl Drop for InFlightCheck {
 
 struct OrphanGuard {
     ticket: Option<ApprovalTicket>,
-    tx: mpsc::Sender<Internal>,
+    withdraw_tx: mpsc::Sender<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
     gate: Arc<dyn ToolGate>,
     in_flight: Option<InFlightCheck>,
 }
 
 impl OrphanGuard {
     fn arm(
-        tx: mpsc::Sender<Internal>,
+        withdraw_tx: mpsc::Sender<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
         gate: Arc<dyn ToolGate>,
         in_flight: Option<InFlightCheck>,
     ) -> Self {
         Self {
             ticket: None,
-            tx,
+            withdraw_tx,
             gate,
             in_flight,
         }
@@ -463,11 +461,11 @@ impl Drop for OrphanGuard {
         let mut in_flight = self.in_flight.take();
         if let Some(ticket) = self.ticket.take() {
             let permit = in_flight.as_mut().and_then(InFlightCheck::take_permit);
-            match self.tx.try_send(Internal::Withdraw(ticket, permit)) {
+            match self.withdraw_tx.try_send((ticket, permit)) {
                 Ok(()) => {}
                 Err(
-                    mpsc::error::TrySendError::Full(Internal::Withdraw(ticket, permit))
-                    | mpsc::error::TrySendError::Closed(Internal::Withdraw(ticket, permit)),
+                    mpsc::error::TrySendError::Full((ticket, permit))
+                    | mpsc::error::TrySendError::Closed((ticket, permit)),
                 ) => {
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         let gate = self.gate.clone();
@@ -478,7 +476,6 @@ impl Drop for OrphanGuard {
                         });
                     }
                 }
-                Err(_) => unreachable!(),
             }
         }
     }
@@ -580,6 +577,7 @@ async fn start_session(
     let (out_tx, out_rx) = mpsc::channel(256);
     let (stdin_tx, stdin_rx) = mpsc::channel(WRITER_BUFFER);
     let (internal_tx, internal_rx) = mpsc::channel(128);
+    let (withdraw_tx, withdraw_rx) = mpsc::channel(MAX_IN_FLIGHT_GATE_CALLS);
 
     let writer = tokio::spawn(run_writer(stdin, stdin_rx, internal_tx.clone()));
     let r_out = tokio::spawn(read_lines(stdout, out_tx.clone(), true));
@@ -612,6 +610,8 @@ async fn start_session(
         out_rx: Some(out_rx),
         internal_tx,
         internal_rx,
+        withdraw_tx,
+        withdraw_rx,
         proc: Some(proc),
         items: HashMap::new(),
         queued_msgs: VecDeque::new(),
@@ -789,6 +789,8 @@ struct Driver {
     out_rx: Option<mpsc::Receiver<Out>>,
     internal_tx: mpsc::Sender<Internal>,
     internal_rx: mpsc::Receiver<Internal>,
+    withdraw_tx: mpsc::Sender<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
+    withdraw_rx: mpsc::Receiver<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
     proc: Option<Proc>,
     items: HashMap<String, Value>,
     queued_msgs: VecDeque<String>,
@@ -1222,6 +1224,12 @@ impl Driver {
                     }
                 }
 
+                withdraw = self.withdraw_rx.recv() => {
+                    if let Some((ticket, permit)) = withdraw {
+                        self.queue_withdraw_with_permit(ticket, permit);
+                    }
+                }
+
                 out = recv_out(&mut self.out_rx), if !paused_stdout => {
                     match out {
                         Some(msg) => self.on_out(msg),
@@ -1248,10 +1256,11 @@ impl Driver {
         self.cmd_rx = None;
         self.clear_requests();
         self.wait_for_in_flight_gates().await;
-        // Close `internal_rx` before the final drain so late `OrphanGuard`
-        // drops during `flush_final` take the direct withdrawal fallback
-        // instead of queuing into a channel that will never be read again.
+        // Close `internal_rx` and `withdraw_rx` before the final drain so late
+        // `OrphanGuard` drops during `flush_final` take the direct withdrawal
+        // fallback instead of queuing into a channel that will never be read again.
         self.internal_rx.close();
+        self.withdraw_rx.close();
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.flush_final().await;
@@ -1465,16 +1474,16 @@ impl Driver {
         };
         let gate = self.gate.clone();
         let tx = self.internal_tx.clone();
+        let withdraw_tx = self.withdraw_tx.clone();
         let key = native.clone();
         let check_gate = check.clone();
         let handle = tokio::spawn(async move {
-            let tx_orphan = tx.clone();
             let gate_orphan = gate.clone();
             let (res_tx, res_rx) = oneshot::channel();
             // Run `gate.check` to completion without aborting on cancellation
             // so an already-inserted ledger ticket cannot leak.
             tokio::spawn(async move {
-                let mut guard = OrphanGuard::arm(tx_orphan, gate_orphan, Some(in_flight));
+                let mut guard = OrphanGuard::arm(withdraw_tx, gate_orphan, Some(in_flight));
                 let d = gate.check(&check_gate).await;
                 if let GateDecision::Ask { ticket } = &d {
                     guard.set_ticket(Some(ticket.clone()));
@@ -1596,14 +1605,14 @@ impl Driver {
         };
         let gate = self.gate.clone();
         let tx = self.internal_tx.clone();
+        let withdraw_tx = self.withdraw_tx.clone();
         let key = native.clone();
         let q_clone = questions.clone();
         let handle = tokio::spawn(async move {
-            let tx_orphan = tx.clone();
             let gate_orphan = gate.clone();
             let (res_tx, res_rx) = oneshot::channel();
             tokio::spawn(async move {
-                let mut guard = OrphanGuard::arm(tx_orphan, gate_orphan, Some(in_flight));
+                let mut guard = OrphanGuard::arm(withdraw_tx, gate_orphan, Some(in_flight));
                 let t = gate.question_ticket(turn).await;
                 guard.set_ticket(t.clone());
                 let _ = res_tx.send((t, guard));
@@ -1815,9 +1824,6 @@ impl Driver {
                         }
                     }
                 }
-            }
-            Internal::Withdraw(ticket, permit) => {
-                self.queue_withdraw_with_permit(ticket, permit);
             }
         }
     }
@@ -2073,22 +2079,30 @@ impl Driver {
     }
 
     async fn drain_withdrawals(&mut self) {
+        while let Ok((ticket, permit)) = self.withdraw_rx.try_recv() {
+            self.pending_withdrawals.push((ticket, permit));
+        }
         let tickets = std::mem::take(&mut self.pending_withdrawals);
         if tickets.is_empty() {
             return;
         }
-        let mut set = JoinSet::new();
+        let mut handles = Vec::with_capacity(tickets.len());
         for (ticket, permit) in tickets {
             let gate = self.gate.clone();
-            set.spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let _permit = permit;
                 gate.withdraw(&ticket).await;
-            });
+            }));
         }
-        let _ = tokio::time::timeout(REDEEM_TIMEOUT, async {
-            while set.join_next().await.is_some() {}
-        })
-        .await;
+        let deadline = TokioInstant::now() + REDEEM_TIMEOUT;
+        for handle in handles {
+            if tokio::time::timeout_at(deadline, handle).await.is_err() {
+                // Keep unfinished withdrawals running in the background with
+                // their permits so compensation settles and capacity stays
+                // reserved until `gate.withdraw` completes.
+                break;
+            }
+        }
     }
 
     fn drain_internal_withdrawals(&mut self) {
@@ -2105,9 +2119,6 @@ impl Driver {
                 Internal::Redeem {
                     ticket, decision, ..
                 } if !matches!(decision, GateDecision::Allow) => self.queue_withdraw(ticket),
-                Internal::Withdraw(ticket, permit) => {
-                    self.queue_withdraw_with_permit(ticket, permit);
-                }
                 _ => {}
             }
         }

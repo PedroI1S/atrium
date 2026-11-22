@@ -328,6 +328,7 @@ enum Out {
 enum Ev {
     Command(Option<SessionCommand>),
     Internal(Box<Internal>),
+    Withdraw(ApprovalTicket, Option<OwnedSemaphorePermit>),
     InterruptDeadline,
     Flushed,
     ConsumerGone,
@@ -356,7 +357,6 @@ enum Internal {
         input: Value,
         failed: bool,
     },
-    Withdraw(ApprovalTicket, Option<OwnedSemaphorePermit>),
 }
 
 struct InFlightCheck {
@@ -396,7 +396,7 @@ impl Drop for InFlightCheck {
 
 struct OrphanGuard {
     ticket: Option<ApprovalTicket>,
-    tx: mpsc::UnboundedSender<Internal>,
+    withdraw_tx: mpsc::UnboundedSender<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
     gate: Arc<dyn ToolGate>,
     in_flight: Option<InFlightCheck>,
 }
@@ -404,13 +404,13 @@ struct OrphanGuard {
 impl OrphanGuard {
     fn arm(
         ticket: Option<ApprovalTicket>,
-        tx: mpsc::UnboundedSender<Internal>,
+        withdraw_tx: mpsc::UnboundedSender<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
         gate: Arc<dyn ToolGate>,
         in_flight: Option<InFlightCheck>,
     ) -> Self {
         Self {
             ticket,
-            tx,
+            withdraw_tx,
             gate,
             in_flight,
         }
@@ -430,8 +430,8 @@ impl Drop for OrphanGuard {
         let mut in_flight = self.in_flight.take();
         if let Some(ticket) = self.ticket.take() {
             let permit = in_flight.as_mut().and_then(InFlightCheck::take_permit);
-            if let Err(mpsc::error::SendError(Internal::Withdraw(ticket, permit))) =
-                self.tx.send(Internal::Withdraw(ticket, permit))
+            if let Err(mpsc::error::SendError((ticket, permit))) =
+                self.withdraw_tx.send((ticket, permit))
                 && let Ok(handle) = tokio::runtime::Handle::try_current()
             {
                 let gate = self.gate.clone();
@@ -552,6 +552,8 @@ struct Actor {
     commands_rx: Option<mpsc::Receiver<SessionCommand>>,
     internal_tx: mpsc::UnboundedSender<Internal>,
     internal_rx: mpsc::UnboundedReceiver<Internal>,
+    withdraw_tx: mpsc::UnboundedSender<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
+    withdraw_rx: mpsc::UnboundedReceiver<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
     pending: VecDeque<AgentEventEnvelope>,
     /// Closing events queued since the session began ending.
     closing: usize,
@@ -619,6 +621,7 @@ impl Actor {
         let mcp_path = dir.join("mcp.json");
         write_private(&mcp_path, mcp_config(&config).to_string().as_bytes())?;
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
+        let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel();
         Ok(Self {
             gate: config.gate.clone(),
             config,
@@ -632,6 +635,8 @@ impl Actor {
             commands_rx: Some(commands_rx),
             internal_tx,
             internal_rx,
+            withdraw_tx,
+            withdraw_rx,
             pending: VecDeque::new(),
             closing: 0,
             finishing: false,
@@ -989,6 +994,7 @@ impl Actor {
                     biased;
                     cmd = commands_rx.recv() => Ev::Command(cmd),
                     Some(msg) = self.internal_rx.recv() => Ev::Internal(Box::new(msg)),
+                    Some((ticket, permit)) = self.withdraw_rx.recv() => Ev::Withdraw(ticket, permit),
                     _ = sleep_until(deadline.unwrap_or_else(TokioInstant::now)), if deadline.is_some() => Ev::InterruptDeadline,
                     permit = self.events_tx.reserve(), if flush => match permit {
                         Ok(p) => {
@@ -1010,6 +1016,7 @@ impl Actor {
                     break;
                 }
                 Ev::Internal(msg) => self.on_internal(*msg),
+                Ev::Withdraw(ticket, permit) => self.queue_withdraw_with_permit(ticket, permit),
                 Ev::InterruptDeadline => {
                     // The child ignored the interrupt: the session ends and
                     // the daemon resumes it in a new incarnation.
@@ -1048,10 +1055,11 @@ impl Actor {
         }
         self.clear_requests();
         while self.gates.join_next().await.is_some() {}
-        // Close `internal_rx` before the final drain so late `OrphanGuard`
-        // drops after the shutdown wait take the direct withdrawal fallback
-        // instead of queuing into a channel that will never be read again.
+        // Close `internal_rx` and `withdraw_rx` before the final drain so late
+        // `OrphanGuard` drops after the shutdown wait take the direct withdrawal
+        // fallback instead of queuing into a channel that will never be read again.
         self.internal_rx.close();
+        self.withdraw_rx.close();
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.commands_rx = None;
@@ -1088,6 +1096,7 @@ impl Actor {
         while self.gates.join_next().await.is_some() {}
         self.wait_for_in_flight_gates().await;
         self.internal_rx.close();
+        self.withdraw_rx.close();
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.feed(AdapterInput::Exit { code });
@@ -1128,22 +1137,30 @@ impl Actor {
     }
 
     async fn drain_withdrawals(&mut self) {
+        while let Ok((ticket, permit)) = self.withdraw_rx.try_recv() {
+            self.pending_withdrawals.push((ticket, permit));
+        }
         let tickets = std::mem::take(&mut self.pending_withdrawals);
         if tickets.is_empty() {
             return;
         }
-        let mut set = JoinSet::new();
+        let mut handles = Vec::with_capacity(tickets.len());
         for (ticket, permit) in tickets {
             let gate = self.gate.clone();
-            set.spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let _permit = permit;
                 gate.withdraw(&ticket).await;
-            });
+            }));
         }
-        let _ = timeout(self.options.gate_deadline, async {
-            while set.join_next().await.is_some() {}
-        })
-        .await;
+        let deadline = TokioInstant::now() + self.options.gate_deadline;
+        for handle in handles {
+            if timeout_at(deadline, handle).await.is_err() {
+                // Keep unfinished withdrawals running in the background with
+                // their permits so compensation settles and capacity stays
+                // reserved until `gate.withdraw` completes.
+                break;
+            }
+        }
     }
 
     fn drain_internal_withdrawals(&mut self) {
@@ -1160,9 +1177,6 @@ impl Actor {
                 Internal::Redeem {
                     ticket, decision, ..
                 } if !matches!(decision, GateDecision::Allow) => self.queue_withdraw(ticket),
-                Internal::Withdraw(ticket, permit) => {
-                    self.queue_withdraw_with_permit(ticket, permit);
-                }
                 _ => {}
             }
         }
@@ -1438,17 +1452,17 @@ impl Actor {
         };
         let gate = self.gate.clone();
         let tx = self.internal_tx.clone();
+        let withdraw_tx = self.withdraw_tx.clone();
         let deadline = self.options.gate_deadline;
         let native = reply.key();
         let task = self.gates.spawn(async move {
             let for_gate = check.clone();
-            let tx_orphan = tx.clone();
             let gate_orphan = gate.clone();
             let (res_tx, res_rx) = oneshot::channel();
             // Run `gate.check` to completion without aborting on cancellation or
             // timeout so an already-queued DB insert cannot leak an approval row.
             tokio::spawn(async move {
-                let mut guard = OrphanGuard::arm(None, tx_orphan, gate_orphan, Some(in_flight));
+                let mut guard = OrphanGuard::arm(None, withdraw_tx, gate_orphan, Some(in_flight));
                 let d = gate.check(&for_gate).await;
                 if let GateDecision::Ask { ticket } = &d {
                     guard.set_ticket(Some(ticket.clone()));
@@ -1519,15 +1533,15 @@ impl Actor {
         };
         let gate = self.gate.clone();
         let tx = self.internal_tx.clone();
+        let withdraw_tx = self.withdraw_tx.clone();
         let deadline = self.options.gate_deadline;
         let turn = Some(self.norm.turn_number());
         let key = Req::CanUse(native.clone());
         let task = self.gates.spawn(async move {
-            let tx_orphan = tx.clone();
             let gate_orphan = gate.clone();
             let (res_tx, res_rx) = oneshot::channel();
             tokio::spawn(async move {
-                let mut guard = OrphanGuard::arm(None, tx_orphan, gate_orphan, Some(in_flight));
+                let mut guard = OrphanGuard::arm(None, withdraw_tx, gate_orphan, Some(in_flight));
                 let t = gate.question_ticket(turn).await;
                 guard.set_ticket(t.clone());
                 let _ = res_tx.send((t, guard));
@@ -1597,22 +1611,16 @@ impl Actor {
 
     fn on_internal(&mut self, msg: Internal) {
         while self.gates.try_join_next().is_some() {}
-        if let Internal::Withdraw(ticket, permit) = msg {
-            self.queue_withdraw_with_permit(ticket, permit);
-            return;
-        }
         match &msg {
             Internal::Gate { reply, .. } => self.inflight.remove(&reply.key()),
             Internal::Redeem { native, .. } | Internal::Question { native, .. } => {
                 self.inflight.remove(&Req::CanUse(native.clone()))
             }
-            Internal::Withdraw(_, _) => None,
         };
         let failed = match &msg {
             Internal::Gate { failed, .. }
             | Internal::Redeem { failed, .. }
             | Internal::Question { failed, .. } => *failed,
-            Internal::Withdraw(_, _) => false,
         };
         match msg {
             Internal::Gate {
@@ -1703,7 +1711,6 @@ impl Actor {
                     self.queue_withdraw(t);
                 }
             }
-            Internal::Withdraw(_, _) => {}
         }
         if failed {
             self.gate_failed();

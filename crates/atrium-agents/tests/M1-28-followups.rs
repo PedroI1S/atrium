@@ -1465,3 +1465,599 @@ for line in sys.stdin:
     let _ = fs::remove_dir_all(&ledger_dir);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Gate wrapper for delayed-withdrawal regressions:
+/// - The first `filler_count` checks pause before touching `inner` until
+///   `filler_release` turns `true`, holding their adapter permits without
+///   creating extra ledger rows.
+/// - The next check (`filler_count + 1`) commits a real `SessionGate` approval
+///   row, signals `delayed_inserted`, and pauses until `delayed_check_release`.
+/// - `withdraw()` pauses *before* calling `inner.withdraw()` until
+///   `withdraw_release` turns `true`, so tests can exceed `drain_withdrawals`'
+///   deadline while the withdrawal is still unfinished.
+struct DelayedControls {
+    filler: watch::Sender<bool>,
+    delayed_check: watch::Sender<bool>,
+    withdraw: watch::Sender<bool>,
+}
+
+struct DelayedWithdrawGate {
+    inner: Arc<SessionGate>,
+    filler_count: usize,
+    check_calls: AtomicUsize,
+    filler_entered: Arc<Notify>,
+    delayed_inserted: Arc<Notify>,
+    withdraw_entered: Arc<Notify>,
+    filler_release: watch::Receiver<bool>,
+    delayed_check_release: watch::Receiver<bool>,
+    withdraw_release: watch::Receiver<bool>,
+    asked: Mutex<Vec<ApprovalTicket>>,
+    withdraw_started: AtomicUsize,
+    withdraw_finished: AtomicUsize,
+}
+
+impl DelayedWithdrawGate {
+    fn new(inner: Arc<SessionGate>, filler_count: usize) -> (Arc<Self>, DelayedControls) {
+        let (filler_tx, filler_rx) = watch::channel(false);
+        let (delayed_tx, delayed_rx) = watch::channel(false);
+        let (withdraw_tx, withdraw_rx) = watch::channel(false);
+        let gate = Arc::new(Self {
+            inner,
+            filler_count,
+            check_calls: AtomicUsize::new(0),
+            filler_entered: Arc::new(Notify::new()),
+            delayed_inserted: Arc::new(Notify::new()),
+            withdraw_entered: Arc::new(Notify::new()),
+            filler_release: filler_rx,
+            delayed_check_release: delayed_rx,
+            withdraw_release: withdraw_rx,
+            asked: Mutex::default(),
+            withdraw_started: AtomicUsize::new(0),
+            withdraw_finished: AtomicUsize::new(0),
+        });
+        (
+            gate,
+            DelayedControls {
+                filler: filler_tx,
+                delayed_check: delayed_tx,
+                withdraw: withdraw_tx,
+            },
+        )
+    }
+
+    fn check_calls(&self) -> usize {
+        self.check_calls.load(Ordering::Acquire)
+    }
+
+    fn asked_len(&self) -> usize {
+        self.asked.lock().unwrap().len()
+    }
+
+    fn withdraw_started(&self) -> usize {
+        self.withdraw_started.load(Ordering::Acquire)
+    }
+
+    fn withdraw_finished(&self) -> usize {
+        self.withdraw_finished.load(Ordering::Acquire)
+    }
+}
+
+impl ToolGate for DelayedWithdrawGate {
+    fn check<'a>(&'a self, check: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+        Box::pin(async move {
+            let seq = self.check_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if seq <= self.filler_count {
+                self.filler_entered.notify_waiters();
+                let mut rx = self.filler_release.clone();
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+                return GateDecision::Deny {
+                    reason: "test filler".into(),
+                };
+            }
+            if seq == self.filler_count + 1 {
+                let d = self.inner.check(check).await;
+                if let GateDecision::Ask { ticket } = &d {
+                    self.asked.lock().unwrap().push(ticket.clone());
+                }
+                self.delayed_inserted.notify_waiters();
+                let mut rx = self.delayed_check_release.clone();
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+                return d;
+            }
+            self.inner.check(check).await
+        })
+    }
+
+    fn redeem<'a>(
+        &'a self,
+        ticket: &'a ApprovalTicket,
+        check: &'a ToolCheck,
+    ) -> BoxFuture<'a, GateDecision> {
+        self.inner.redeem(ticket, check)
+    }
+
+    fn question_ticket(&self, turn: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
+        self.inner.question_ticket(turn)
+    }
+
+    fn withdraw<'a>(&'a self, ticket: &'a ApprovalTicket) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.withdraw_started.fetch_add(1, Ordering::AcqRel);
+            self.withdraw_entered.notify_waiters();
+            let mut rx = self.withdraw_release.clone();
+            while !*rx.borrow() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            self.inner.withdraw(ticket).await;
+            self.withdraw_finished.fetch_add(1, Ordering::AcqRel);
+        })
+    }
+}
+
+/// M1-33 round 2, finding 1 (Claude): a withdrawal that outlives
+/// `drain_withdrawals`' deadline must not be aborted; its permit stays
+/// reserved until `SessionGate::withdraw` finishes, and once released the
+/// orphan ledger row is cancelled and capacity recovers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_delayed_withdrawal_past_deadline_keeps_permit_and_cancels_orphan() {
+    let dir = scratch("claude-delayed-withdraw");
+    let script = dir.join("fake-claude-delayed.py");
+    let probe_log = dir.join("probe.txt");
+    let denied_log = dir.join("denied.txt");
+    let filler_count: usize = MAX_PENDING_REQUESTS - 1;
+    let batch_size: usize = 16;
+    let excess_count: usize = 4;
+
+    write_executable(
+        &script,
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, os, sys, threading, time
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("2.1.308 (Claude Code)")
+    sys.exit(0)
+sid = "fake-delayed"
+filler_count = {filler_count}
+batch_size = {batch_size}
+excess = {excess}
+trigger_dir = {trigger_dir:?}
+probe_log = {probe_log:?}
+denied_log = {denied_log:?}
+
+def wait_for(path):
+    deadline = time.monotonic() + 30.0
+    while not os.path.exists(path) and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+def emit_flow():
+    print(json.dumps({{"type":"system","subtype":"init","session_id":sid,"model":"claude-fake","tools":["Read"],"cwd":"."}}), flush=True)
+    sent = 0
+    b = 0
+    while sent < filler_count:
+        n = min(batch_size, filler_count - sent)
+        for i in range(sent, sent + n):
+            print(json.dumps({{"type":"control_request","request_id":f"filler_{{i}}","request":{{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":f"tu_f_{{i}}","input":{{"file_path":"x"}}}}}}), flush=True)
+        wait_for(os.path.join(trigger_dir, f"cancel_{{b}}"))
+        for i in range(sent, sent + n):
+            print(json.dumps({{"type":"control_cancel_request","request_id":f"filler_{{i}}"}}), flush=True)
+        sent += n
+        b += 1
+    print(json.dumps({{"type":"control_request","request_id":"delayed_0","request":{{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"tu_delayed","input":{{"file_path":"x"}}}}}}), flush=True)
+    wait_for(os.path.join(trigger_dir, "cancel_delayed"))
+    print(json.dumps({{"type":"control_cancel_request","request_id":"delayed_0"}}), flush=True)
+    # Sent right after cancellation on the same pipe so observing its deny proves
+    # `delayed_0` cancellation was processed before releasing `delayed_0`.
+    print(json.dumps({{"type":"control_request","request_id":"probe_0","request":{{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"tu_probe","input":{{"file_path":"x"}}}}}}), flush=True)
+    wait_for(os.path.join(trigger_dir, "send_excess"))
+    for i in range(excess):
+        print(json.dumps({{"type":"control_request","request_id":f"excess_{{i}}","request":{{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":f"tu_e_{{i}}","input":{{"file_path":"x"}}}}}}), flush=True)
+    wait_for(os.path.join(trigger_dir, "send_recovery"))
+    print(json.dumps({{"type":"control_request","request_id":"recover_1","request":{{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"tu_rec","input":{{"file_path":"x"}}}}}}), flush=True)
+
+for line in sys.stdin:
+    v = json.loads(line)
+    t = v.get("type")
+    if t == "control_request" and v.get("request", {{}}).get("subtype") == "initialize":
+        print(json.dumps({{"type":"control_response","response":{{"subtype":"success","request_id":v["request_id"],"response":{{"commands":[]}}}}}}), flush=True)
+    elif t == "user":
+        threading.Thread(target=emit_flow, daemon=True).start()
+    elif t == "control_response":
+        resp = v.get("response", {{}})
+        rid = resp.get("request_id", "")
+        beh = resp.get("response", {{}}).get("behavior")
+        if rid == "probe_0" and beh == "deny":
+            with open(probe_log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+        elif rid.startswith("excess_") and beh == "deny":
+            with open(denied_log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+"#,
+            filler_count = filler_count,
+            batch_size = batch_size,
+            excess = excess_count,
+            trigger_dir = dir.display().to_string(),
+            probe_log = probe_log.display().to_string(),
+            denied_log = denied_log.display().to_string(),
+        ),
+    );
+
+    let (ledger_dir, store, thread, inc, session_gate) =
+        make_session_gate(Provider::Claude, &dir, Preset::Careful).await;
+    let (gate, controls) = DelayedWithdrawGate::new(session_gate, filler_count);
+
+    let wait_deadline = Duration::from_millis(150);
+    let mut session = ClaudeAdapter::new(claude_opts(wait_deadline))
+        .start(claude_cfg(&dir, script, gate.clone()), Transport::Local)
+        .await
+        .unwrap();
+
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage { text: "go".into() })
+        .await
+        .unwrap();
+
+    // Fill `MAX_PENDING_REQUESTS - 1` inner gate permits with cancelled checks.
+    let mut sent = 0;
+    let mut b = 0;
+    while sent < filler_count {
+        let n = batch_size.min(filler_count - sent);
+        let target = sent + n;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gate.check_calls() < target && Instant::now() < deadline {
+            let notified = gate.filler_entered.notified();
+            let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
+        }
+        assert_eq!(gate.check_calls(), target, "filler batch {b} did not enter");
+        fs::write(dir.join(format!("cancel_{b}")), "go").unwrap();
+        sent = target;
+        b += 1;
+    }
+
+    // Wait for the final check (`delayed_0`) to commit its real approval row.
+    let insert_deadline = Instant::now() + Duration::from_secs(10);
+    while gate.asked_len() < 1 && Instant::now() < insert_deadline {
+        let notified = gate.delayed_inserted.notified();
+        let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
+    }
+    assert_eq!(gate.asked_len(), 1);
+    assert_eq!(gate.check_calls(), MAX_PENDING_REQUESTS);
+    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 1);
+
+    // Cancel `delayed_0` before it returns and wait until `probe_0` is denied
+    // so the cancellation has definitely been processed by the actor.
+    fs::write(dir.join("cancel_delayed"), "go").unwrap();
+    let probe_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < probe_deadline {
+        if fs::read_to_string(&probe_log).is_ok_and(|s| s.lines().any(|l| l == "probe_0")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        fs::read_to_string(&probe_log).is_ok_and(|s| s.lines().any(|l| l == "probe_0")),
+        "probe_0 was not denied after cancelling delayed_0"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Let `delayed_0` return `Ask { ticket }` so `OrphanGuard` triggers
+    // `drain_withdrawals`, where `withdraw()` pauses past `wait_deadline`.
+    let release_at = Instant::now();
+    let _ = controls.delayed_check.send(true);
+    let withdraw_start_deadline = Instant::now() + Duration::from_secs(10);
+    while gate.withdraw_started() < 1 && Instant::now() < withdraw_start_deadline {
+        let notified = gate.withdraw_entered.notified();
+        let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
+    }
+    assert_eq!(gate.withdraw_started(), 1);
+
+    // Submit excess requests: the actor can only answer them *after*
+    // `drain_withdrawals` hits its deadline, and all must be explicitly denied
+    // because the unfinished withdrawal still holds its permit.
+    fs::write(dir.join("send_excess"), "go").unwrap();
+    let deny_deadline = Instant::now() + Duration::from_secs(10);
+    let mut denied: Vec<String> = Vec::new();
+    while Instant::now() < deny_deadline {
+        if let Ok(text) = fs::read_to_string(&denied_log) {
+            denied = text.lines().map(str::to_owned).collect();
+            if denied.len() == excess_count {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        release_at.elapsed() >= Duration::from_millis(120),
+        "expected drain_withdrawals to exceed its 150ms deadline, elapsed {:?}",
+        release_at.elapsed()
+    );
+    assert_eq!(
+        denied.len(),
+        excess_count,
+        "expected all {excess_count} excess Claude requests to be denied while delayed withdrawal holds permit, got {denied:?}"
+    );
+    assert_eq!(
+        gate.check_calls(),
+        MAX_PENDING_REQUESTS,
+        "delayed withdrawal past deadline must retain its permit and block excess checks"
+    );
+    assert_eq!(gate.withdraw_finished(), 0);
+    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 1);
+
+    // Release the delayed withdrawal and assert it was never aborted: it
+    // cancels the orphan ledger row and returns the permit.
+    let _ = controls.withdraw.send(true);
+    let settle_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < settle_deadline {
+        let open = store.requests().open_count(&thread, inc).await.unwrap();
+        if gate.withdraw_finished() == 1 && open == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        gate.withdraw_finished(),
+        1,
+        "delayed Claude withdrawal was aborted on drain_withdrawals timeout"
+    );
+    assert_eq!(
+        store.requests().open_count(&thread, inc).await.unwrap(),
+        0,
+        "orphan Claude ledger row remained pending after delayed withdrawal released"
+    );
+
+    // With the 64th permit finally returned (63 fillers still paused), a new
+    // request is admitted normally.
+    fs::write(dir.join("send_recovery"), "go").unwrap();
+    wait_for_approvals(&mut session, 1).await;
+    assert_eq!(gate.check_calls(), MAX_PENDING_REQUESTS + 1);
+
+    let _ = controls.filler.send(true);
+    shutdown(session).await;
+    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+    let _ = fs::remove_dir_all(&ledger_dir);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// M1-33 round 2, finding 1 (Codex): a withdrawal that outlives
+/// `drain_withdrawals`' deadline (`REDEEM_TIMEOUT`, 10s) must not be aborted;
+/// its permit stays reserved until `SessionGate::withdraw` finishes, and once
+/// released the orphan ledger row is cancelled and capacity recovers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_delayed_withdrawal_past_deadline_keeps_permit_and_cancels_orphan() {
+    let dir = scratch("codex-delayed-withdraw");
+    let user_dir = dir.join("empty-codex-home");
+    fs::create_dir_all(&user_dir).unwrap();
+    let script = dir.join("fake-codex-delayed.py");
+    let probe_log = dir.join("probe.txt");
+    let declined_log = dir.join("declined.txt");
+    let filler_count: usize = MAX_PENDING_REQUESTS - 1;
+    let batch_size: usize = 16;
+    let excess_count: usize = 4;
+
+    write_executable(
+        &script,
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, os, sys, threading, time
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("codex-cli 0.163.0")
+    sys.exit(0)
+filler_count = {filler_count}
+batch_size = {batch_size}
+excess = {excess}
+trigger_dir = {trigger_dir:?}
+probe_log = {probe_log:?}
+declined_log = {declined_log:?}
+
+def wait_for(path):
+    deadline = time.monotonic() + 30.0
+    while not os.path.exists(path) and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+def emit_flow():
+    sent = 0
+    b = 0
+    while sent < filler_count:
+        n = min(batch_size, filler_count - sent)
+        for i in range(sent, sent + n):
+            print(json.dumps({{"id": f"filler_{{i}}", "method": "item/commandExecution/requestApproval", "params": {{"threadId": "th_fake", "turnId": "turn_1", "itemId": f"item_f_{{i}}", "command": "ls", "cwd": "."}}}}), flush=True)
+        wait_for(os.path.join(trigger_dir, f"cancel_{{b}}"))
+        for i in range(sent, sent + n):
+            print(json.dumps({{"method": "serverRequest/resolved", "params": {{"threadId": "th_fake", "requestId": f"filler_{{i}}"}}}}), flush=True)
+        sent += n
+        b += 1
+    print(json.dumps({{"id": "delayed_0", "method": "item/commandExecution/requestApproval", "params": {{"threadId": "th_fake", "turnId": "turn_1", "itemId": "item_delayed", "command": "ls", "cwd": "."}}}}), flush=True)
+    wait_for(os.path.join(trigger_dir, "cancel_delayed"))
+    print(json.dumps({{"method": "serverRequest/resolved", "params": {{"threadId": "th_fake", "requestId": "delayed_0"}}}}), flush=True)
+    print(json.dumps({{"id": "probe_0", "method": "item/commandExecution/requestApproval", "params": {{"threadId": "th_fake", "turnId": "turn_1", "itemId": "item_probe", "command": "ls", "cwd": "."}}}}), flush=True)
+    wait_for(os.path.join(trigger_dir, "send_excess"))
+    for i in range(excess):
+        print(json.dumps({{"id": f"excess_{{i}}", "method": "item/commandExecution/requestApproval", "params": {{"threadId": "th_fake", "turnId": "turn_1", "itemId": f"item_e_{{i}}", "command": "ls", "cwd": "."}}}}), flush=True)
+    wait_for(os.path.join(trigger_dir, "send_recovery"))
+    print(json.dumps({{"id": "recover_1", "method": "item/commandExecution/requestApproval", "params": {{"threadId": "th_fake", "turnId": "turn_1", "itemId": "item_rec", "command": "ls", "cwd": "."}}}}), flush=True)
+
+for line in sys.stdin:
+    v = json.loads(line)
+    m = v.get("method")
+    rid = v.get("id")
+    if m == "initialize":
+        print(json.dumps({{"id": rid, "result": {{"userAgent": "codex-fake/0.163.0", "codexHome": "/scratch/.codex"}}}}), flush=True)
+    elif m == "thread/start":
+        print(json.dumps({{"id": rid, "result": {{"thread": {{"id": "th_fake", "cliVersion": "0.163.0"}}, "approvalPolicy": "untrusted", "sandbox": {{"type": "workspaceWrite", "networkAccess": False}}}}}}), flush=True)
+    elif m == "turn/start":
+        print(json.dumps({{"id": rid, "result": {{"turn": {{"id": "turn_1", "items": [], "status": "inProgress"}}}}}}), flush=True)
+        print(json.dumps({{"method": "turn/started", "params": {{"threadId": "th_fake", "turn": {{"id": "turn_1", "status": "inProgress"}}}}}}), flush=True)
+        threading.Thread(target=emit_flow, daemon=True).start()
+    elif m is None and isinstance(rid, str):
+        if rid == "probe_0" and v.get("result", {{}}).get("decision") == "decline":
+            with open(probe_log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+        elif rid.startswith("excess_") and v.get("result", {{}}).get("decision") == "decline":
+            with open(declined_log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+"#,
+            filler_count = filler_count,
+            batch_size = batch_size,
+            excess = excess_count,
+            trigger_dir = dir.display().to_string(),
+            probe_log = probe_log.display().to_string(),
+            declined_log = declined_log.display().to_string(),
+        ),
+    );
+
+    let (ledger_dir, store, thread, inc, session_gate) =
+        make_session_gate(Provider::Codex, &dir, Preset::Careful).await;
+    let (gate, controls) = DelayedWithdrawGate::new(session_gate, filler_count);
+
+    let cfg = SessionConfig {
+        cwd: dir.clone(),
+        model: Some("gpt-5".into()),
+        effort: None,
+        permissions: PermissionPolicy::Ask,
+        resume: None,
+        mcp_servers: vec![],
+        gate: gate.clone(),
+        env: vec![("CODEX_HOME".into(), user_dir.display().to_string())],
+        program: Some(script),
+        on_spawn: None,
+    };
+    let opts = CodexOptions {
+        user_dir: Some(user_dir),
+        ..CodexOptions::default()
+    };
+    let mut session = CodexAdapter::with_options(opts)
+        .start(cfg, Transport::Local)
+        .await
+        .unwrap();
+
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage { text: "go".into() })
+        .await
+        .unwrap();
+
+    let mut sent = 0;
+    let mut b = 0;
+    while sent < filler_count {
+        let n = batch_size.min(filler_count - sent);
+        let target = sent + n;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gate.check_calls() < target && Instant::now() < deadline {
+            let notified = gate.filler_entered.notified();
+            let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
+        }
+        assert_eq!(gate.check_calls(), target, "filler batch {b} did not enter");
+        fs::write(dir.join(format!("cancel_{b}")), "go").unwrap();
+        sent = target;
+        b += 1;
+    }
+
+    let insert_deadline = Instant::now() + Duration::from_secs(10);
+    while gate.asked_len() < 1 && Instant::now() < insert_deadline {
+        let notified = gate.delayed_inserted.notified();
+        let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
+    }
+    assert_eq!(gate.asked_len(), 1);
+    assert_eq!(gate.check_calls(), MAX_PENDING_REQUESTS);
+    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 1);
+
+    fs::write(dir.join("cancel_delayed"), "go").unwrap();
+    let probe_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < probe_deadline {
+        if fs::read_to_string(&probe_log).is_ok_and(|s| s.lines().any(|l| l == "probe_0")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        fs::read_to_string(&probe_log).is_ok_and(|s| s.lines().any(|l| l == "probe_0")),
+        "probe_0 was not declined after cancelling delayed_0"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let release_at = Instant::now();
+    let _ = controls.delayed_check.send(true);
+    let withdraw_start_deadline = Instant::now() + Duration::from_secs(10);
+    while gate.withdraw_started() < 1 && Instant::now() < withdraw_start_deadline {
+        let notified = gate.withdraw_entered.notified();
+        let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
+    }
+    assert_eq!(gate.withdraw_started(), 1);
+
+    // Submit excess requests: the driver can only answer them *after*
+    // `drain_withdrawals` hits its 10s `REDEEM_TIMEOUT` deadline, and all must
+    // be explicitly declined because the unfinished withdrawal still holds its
+    // permit.
+    fs::write(dir.join("send_excess"), "go").unwrap();
+    let decline_deadline = Instant::now() + Duration::from_secs(20);
+    let mut declined: Vec<String> = Vec::new();
+    while Instant::now() < decline_deadline {
+        if let Ok(text) = fs::read_to_string(&declined_log) {
+            declined = text.lines().map(str::to_owned).collect();
+            if declined.len() == excess_count {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        release_at.elapsed() >= Duration::from_secs(9),
+        "expected drain_withdrawals to exceed its 10s REDEEM_TIMEOUT, elapsed {:?}",
+        release_at.elapsed()
+    );
+    assert_eq!(
+        declined.len(),
+        excess_count,
+        "expected all {excess_count} excess Codex requests to be declined while delayed withdrawal holds permit, got {declined:?}"
+    );
+    assert_eq!(
+        gate.check_calls(),
+        MAX_PENDING_REQUESTS,
+        "delayed withdrawal past deadline must retain its permit and block excess checks"
+    );
+    assert_eq!(gate.withdraw_finished(), 0);
+    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 1);
+
+    // Release the delayed withdrawal and assert it was never aborted: it
+    // cancels the orphan ledger row and returns the permit.
+    let _ = controls.withdraw.send(true);
+    let settle_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < settle_deadline {
+        let open = store.requests().open_count(&thread, inc).await.unwrap();
+        if gate.withdraw_finished() == 1 && open == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        gate.withdraw_finished(),
+        1,
+        "delayed Codex withdrawal was aborted on drain_withdrawals timeout"
+    );
+    assert_eq!(
+        store.requests().open_count(&thread, inc).await.unwrap(),
+        0,
+        "orphan Codex ledger row remained pending after delayed withdrawal released"
+    );
+
+    fs::write(dir.join("send_recovery"), "go").unwrap();
+    wait_for_approvals(&mut session, 1).await;
+    assert_eq!(gate.check_calls(), MAX_PENDING_REQUESTS + 1);
+
+    let _ = controls.filler.send(true);
+    shutdown(session).await;
+    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+    let _ = fs::remove_dir_all(&ledger_dir);
+    let _ = fs::remove_dir_all(&dir);
+}
