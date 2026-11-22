@@ -2,8 +2,17 @@
 //!
 //! Static data (`ToolSpec` rows) accounting for every tool `dev` knows plus
 //! §4's closed wrapper/nested-shell forms and §6's code-running/git forms.
-//! Forms not in this table (and every tool listed in [`OUTSIDE_MODEL`]) are
-//! outside the model (`Unread`).
+//!
+//! **Unknown tools vs. excluded forms (§4, §6):**
+//! - An **unknown tool** (absent from both [`TOOLS`] and [`OUTSIDE_MODEL`])
+//!   stays in the model for hard-deny and store checks (§4): every word counts
+//!   as a candidate `Path`, the unit counts as a possible writer (§5), and it
+//!   is never eligible for Home's read-only list. Under a covering Allow rule
+//!   meeting §7's simple-command conditions, Clear targets remain Clear.
+//! - An **explicitly excluded form** makes its unit `Unread`: any entry in
+//!   [`OUTSIDE_MODEL`] (§3–§5), any flag absent from a [`FlagMode::ListedOnly`]
+//!   row, any forbidden flag on a [`FlagMode::AnyExceptForbidden`] row, or any
+//!   modeled form whose flags/operands trigger an `Unread` effect.
 //!
 //! Not wired into `SessionGate` until P5; parsing argv against this table is
 //! P3's job (`v4/tools.rs`).
@@ -38,6 +47,59 @@ impl Platforms {
     }
 }
 
+/// How flags absent from a row's `flags` slice are handled (contract §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FlagMode {
+    /// Only flags listed in `flags` are within the model; any other flag makes
+    /// the unit `Unread(UnknownFlag)` (§6). Used for §4's closed wrappers and
+    /// nested shells, `cd`, and search tools with complete `dev` flag tables
+    /// (`rg`, `grep`, `ag`, `ack`).
+    ListedOnly,
+    /// Any flag not forbidden by the row (`home_readonly.forbidden` or a
+    /// `runs_code` flag in `flags`) is accepted rather than `Unread`. Listed
+    /// flags still apply their exact `FlagKind` and `FlagEffects`. For unlisted
+    /// flags, every non-pattern/non-ref/non-text/non-member word (flag values
+    /// included) is a candidate `Path`, preserving `dev`'s all-arguments
+    /// extraction; operands the table marks as `Pattern`/`Text`/`Ref`/
+    /// `ArchiveMember` keep that role (§11 item 9).
+    AnyExceptForbidden,
+}
+
+impl FlagMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ListedOnly => "ListedOnly",
+            Self::AnyExceptForbidden => "AnyExceptForbidden",
+        }
+    }
+}
+
+/// Ordered effect toggle applied left-to-right across a unit's flags, where the
+/// last matching flag wins (e.g. `ack --follow --nofollow`, `find -L -P`,
+/// `cp -LP`, `ag -r -n`; contract §5, §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) enum FlagToggle {
+    /// Flag leaves this effect unchanged.
+    #[default]
+    Unchanged,
+    /// Flag enables this effect (overriding any earlier `Disable`).
+    Enable,
+    /// Flag disables this effect (overriding any earlier `Enable`).
+    Disable,
+}
+
+impl FlagToggle {
+    /// Applies this toggle to a running boolean state (last non-`Unchanged`
+    /// flag wins).
+    pub(crate) const fn apply(self, current: bool) -> bool {
+        match self {
+            Self::Unchanged => current,
+            Self::Enable => true,
+            Self::Disable => false,
+        }
+    }
+}
+
 /// Whether a flag is boolean, requires a value, or accepts an optional value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FlagKind {
@@ -47,32 +109,48 @@ pub(crate) enum FlagKind {
 }
 
 /// Semantic effects triggered when a flag is present on a unit (contract §5, §6).
+///
+/// Toggle fields are applied left-to-right as flags appear in argv so a later
+/// disabling flag overrides an earlier enabling flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct FlagEffects {
-    pub(crate) writes: bool,
-    pub(crate) derived_destinations: bool,
-    pub(crate) recursive: bool,
-    pub(crate) follows_links_at_root: bool,
-    pub(crate) follows_links_below_root: bool,
+    /// Ordered toggle for write behaviour (`Enable` / `Disable`; last wins).
+    pub(crate) writes: FlagToggle,
+    /// Ordered toggle for derived destinations (`cp -r`/`-R`/`-a`, `tar -x`).
+    pub(crate) derived_destinations: FlagToggle,
+    /// Ordered toggle for recursive traversal (`Enable` / `Disable`; last wins).
+    pub(crate) recursive: FlagToggle,
+    /// Ordered toggle for following symlinks at root operands (last wins).
+    pub(crate) follows_links_at_root: FlagToggle,
+    /// Ordered toggle for following symlinks below traversed roots (last wins).
+    pub(crate) follows_links_below_root: FlagToggle,
     /// Flag supplies the search pattern (or disables a positional pattern,
     /// e.g. `rg -e`/`--files`, `grep -e`/`-f`, `ag -g`, `ack -g`/`-f`/`--match`).
     pub(crate) provides_pattern: bool,
+    /// Flag supplies an inline/file script so positional `[0]` is no longer a
+    /// script operand (e.g. `sed -e`/`--expression`, `sed -f`/`--file`).
+    pub(crate) provides_script: bool,
+    /// Overrides the role of positional operands when present (last wins; e.g.
+    /// `tar -c`/`-r`/`-u` → `Path`, `tar -x`/`-t` → `ArchiveMember`).
+    pub(crate) positional_role: Option<ValueRole>,
     /// Search filter dialect and case-insensitivity (`rg -g`/`--glob`/`--iglob`,
     /// `grep --include`).
     pub(crate) filter: Option<(FilterDialect, bool)>,
     /// Flag causes the unit to execute inline code (e.g. `sh -c`, `python -c`,
-    /// `find -exec`, `git -c`, `git rebase -x`).
+    /// `find -exec`, `git -c`, `git rebase -x`, `sed -f`).
     pub(crate) runs_code: bool,
 }
 
 impl FlagEffects {
     const NONE: Self = Self {
-        writes: false,
-        derived_destinations: false,
-        recursive: false,
-        follows_links_at_root: false,
-        follows_links_below_root: false,
+        writes: FlagToggle::Unchanged,
+        derived_destinations: FlagToggle::Unchanged,
+        recursive: FlagToggle::Unchanged,
+        follows_links_at_root: FlagToggle::Unchanged,
+        follows_links_below_root: FlagToggle::Unchanged,
         provides_pattern: false,
+        provides_script: false,
+        positional_role: None,
         filter: None,
         runs_code: false,
     };
@@ -82,7 +160,8 @@ impl FlagEffects {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FlagSpec {
     pub(crate) short: Option<char>,
-    /// Long option name without leading `--`.
+    /// Long option name without leading `--` (or without leading `-` when
+    /// `ToolSpec::single_dash_long` is `true`, as for `find` primaries).
     pub(crate) long: Option<&'static str>,
     pub(crate) kind: FlagKind,
     pub(crate) effects: FlagEffects,
@@ -98,6 +177,9 @@ pub(crate) struct OperandLayout {
     /// Optional override for the final positional operand (e.g. destination
     /// root of `cp`/`mv`/`rsync`).
     pub(crate) last: Option<ValueRole>,
+    /// Optional role override for operands appearing after `--` (e.g.
+    /// `git checkout -- path/to/file` destination pathspecs).
+    pub(crate) after_double_dash: Option<ValueRole>,
 }
 
 impl OperandLayout {
@@ -105,6 +187,7 @@ impl OperandLayout {
         positional: &[],
         rest: None,
         last: None,
+        after_double_dash: None,
     };
 
     const fn all(role: ValueRole) -> Self {
@@ -112,6 +195,7 @@ impl OperandLayout {
             positional: &[],
             rest: Some(role),
             last: None,
+            after_double_dash: None,
         }
     }
 
@@ -120,6 +204,7 @@ impl OperandLayout {
             positional,
             rest: None,
             last: None,
+            after_double_dash: None,
         }
     }
 
@@ -128,6 +213,7 @@ impl OperandLayout {
             positional,
             rest: Some(rest),
             last: None,
+            after_double_dash: None,
         }
     }
 }
@@ -139,14 +225,31 @@ pub(crate) enum OperandAccessMode {
     AllRead,
     /// All path/destination operands are written.
     AllWrite,
-    /// Source operands are read and the final path/destination operand is
-    /// written (e.g. `ln`, `cp`, `rsync`, `uniq` with 2 operands, `xxd` with 2
-    /// operands; §6).
+    /// Path operands are read when the unit does not write, and written when a
+    /// writing flag or write condition is active (e.g. `codesign -s`/`-f`/
+    /// `--remove-signature`, `sed -i`, `perl -i`).
+    AllWriteWhenWriting,
+    /// Source operands are read and the final path/destination operand (and any
+    /// `DestinationRoot` operand) is written (e.g. `ln`, `cp`, `rsync`,
+    /// `git clone`, `uniq` >= 2 operands, `xxd` >= 2 operands; §6).
     SourcesReadLastWrite,
-    /// Positional path operands are read; only value-taking flags with
-    /// `FlagEffects::writes` write (e.g. `sort -o`, `tree -o`, `find -fprint`,
-    /// `git diff --output`).
+    /// Positional path operands are read (unless a boolean `writes: Enable`
+    /// flag such as `find -delete` is present); value-taking path flags with
+    /// `writes: Enable` (e.g. `sort -o`, `tree -o`, `find -fprint`, `git diff
+    /// --output`, `tar -f` in create/append/update, `tar -C` in extract) write.
     FlagOnlyWrite,
+}
+
+impl OperandAccessMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AllRead => "AllRead",
+            Self::AllWrite => "AllWrite",
+            Self::AllWriteWhenWriting => "AllWriteWhenWriting",
+            Self::SourcesReadLastWrite => "SourcesReadLastWrite",
+            Self::FlagOnlyWrite => "FlagOnlyWrite",
+        }
+    }
 }
 
 /// Whether and when a tool/subcommand writes to the filesystem (contract §5, §6).
@@ -154,12 +257,16 @@ pub(crate) enum OperandAccessMode {
 pub(crate) enum WriteBehavior {
     Never,
     Always,
-    /// Writes only when a flag with `FlagEffects::writes` is present (e.g.
-    /// `sort -o`, `tree -o`, `find -delete`, `sed -i`, `codesign -s`).
+    /// Writes only when a flag with `FlagEffects::writes == Enable` is active
+    /// (e.g. `sort -o`, `tree -o`, `find -delete`, `sed -i`, `codesign -s`).
     WithFlag,
     /// Writes when at least `n` positional operands are given (e.g. `uniq` and
     /// `xxd` with `>= 2` operands; `words.rs`).
     WithOperandCount(usize),
+    /// Writes when a `writes: Enable` flag is active, OR when at least `n`
+    /// positional operands are given and no `writes: Disable` flag (such as
+    /// `git branch -l`/`--list`) forces read-only listing (contract §5, §6).
+    WithFlagOrOperandCount(usize),
 }
 
 /// Whether and when a writer writes to derived destinations (contract §5).
@@ -167,8 +274,8 @@ pub(crate) enum WriteBehavior {
 pub(crate) enum DerivedDestinationsBehavior {
     Never,
     Always,
-    /// Only when a flag with `FlagEffects::derived_destinations` is present
-    /// (e.g. `cp -R`/`-a`, `tar -x`).
+    /// Only when a flag with `FlagEffects::derived_destinations == Enable` is
+    /// active (e.g. `cp -R`/`-a`, `tar -x`).
     WithFlag,
     /// Only when a source operand resolves to a directory (`mv` of a
     /// directory; §5).
@@ -180,7 +287,8 @@ pub(crate) enum DerivedDestinationsBehavior {
 pub(crate) enum RecursiveBehavior {
     Never,
     Always,
-    /// Only when a flag with `FlagEffects::recursive` is present (`grep -r`).
+    /// Only when a flag with `FlagEffects::recursive == Enable` is active
+    /// (`grep -r`).
     WithFlag,
 }
 
@@ -203,9 +311,14 @@ pub(crate) enum CodeRunnerBehavior {
     Never,
     /// Always runs inline/arbitrary code (plain `Unread`; never pinnable).
     InlineOnly,
-    /// Runs inline code when a flag with `FlagEffects::runs_code` is given (or
-    /// for `sed`, when the script contains `e`, `w`, or `r`).
+    /// Runs inline code when a flag with `FlagEffects::runs_code` is given.
     InlineWithFlag,
+    /// Inspects script operands (`ValueRole::Code`, positional `[0]` or
+    /// supplied via a `provides_script` flag such as `sed -e`/`--expression`)
+    /// for the listed single-letter commands (e.g. `sed`'s `e`, `w`, `r`; §4).
+    /// Only scripts containing one of those commands (or a `runs_code` flag
+    /// such as `sed -f`) trigger code execution.
+    ScriptCommands(&'static [char]),
     /// Runs inline code when the first operand matches one of these subargs
     /// (e.g. `git bisect run`, `git submodule foreach`; §6).
     InlineWithSubarg(&'static [&'static str]),
@@ -221,6 +334,14 @@ pub(crate) enum CodeRunnerBehavior {
     },
 }
 
+/// Single-line switch controlling whether Home auto-allow permits followed-link
+/// searches (`rg -L`, `grep -R`) when the bounded link walk stays within budget
+/// and reaches no protected path (§10 row 15; proposed §11 item 15).
+///
+/// Flipping this constant to `false` restores `dev`'s Home `Ask` in one line if
+/// the driver rejects proposed §11 item 15.
+pub(crate) const ALLOW_HOME_FOLLOWED_SEARCH: bool = true;
+
 /// Home read-only eligibility mirrored verbatim from
 /// `atrium_protocol::policy::HOME_READONLY_COMMANDS` (contract §6).
 ///
@@ -232,6 +353,10 @@ pub(crate) struct HomeReadOnlySpec {
     pub(crate) forbidden: &'static [&'static str],
     pub(crate) only: Option<&'static [&'static str]>,
     pub(crate) recursion: Recursion,
+    /// Whether followed-symlink searches (`rg -L`, `grep -R`) are eligible for
+    /// Home Allow when the link walk is within budget (§10 row 15; proposed
+    /// §11 item 15).
+    pub(crate) allow_followed_search: bool,
 }
 
 /// Normative row for a subcommand of a multi-subcommand tool (e.g. `git`,
@@ -239,6 +364,7 @@ pub(crate) struct HomeReadOnlySpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SubcommandSpec {
     pub(crate) name: &'static str,
+    pub(crate) flag_mode: FlagMode,
     pub(crate) flags: &'static [FlagSpec],
     pub(crate) operands: OperandLayout,
     pub(crate) operand_access: OperandAccessMode,
@@ -259,10 +385,18 @@ pub(crate) struct SubcommandSpec {
 /// Normative row for one known tool in §6's table (contract §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ToolSpec {
-    /// Folded (lowercase, CR-19) tool name.
+    /// Folded (Unicode lowercase + CR-19) tool name.
     pub(crate) name: &'static str,
     pub(crate) platforms: Platforms,
+    /// Subcommand table for multi-subcommand tools (`git`, `cargo`, `pipx`).
+    /// For `git`, an unlisted subcommand falls back to unknown-tool checking
+    /// (every word a candidate path, possible writer, not Home read-only; §4)
+    /// while still checking `GIT_GLOBAL_FLAGS`.
     pub(crate) subcommands: &'static [SubcommandSpec],
+    pub(crate) flag_mode: FlagMode,
+    /// `true` when long option names are spelled with a single leading dash
+    /// (e.g. `find` primaries `-follow`, `-delete`, `-exec`).
+    pub(crate) single_dash_long: bool,
     pub(crate) flags: &'static [FlagSpec],
     pub(crate) operands: OperandLayout,
     pub(crate) operand_access: OperandAccessMode,
@@ -460,6 +594,8 @@ const fn base_tool(name: &'static str) -> ToolSpec {
         name,
         platforms: Platforms::Both,
         subcommands: &[],
+        flag_mode: FlagMode::AnyExceptForbidden,
+        single_dash_long: false,
         flags: &[],
         operands: OperandLayout::all(ValueRole::Path),
         operand_access: OperandAccessMode::AllRead,
@@ -482,6 +618,7 @@ const fn base_tool(name: &'static str) -> ToolSpec {
 const fn base_subcommand(name: &'static str) -> SubcommandSpec {
     SubcommandSpec {
         name,
+        flag_mode: FlagMode::AnyExceptForbidden,
         flags: &[],
         operands: OperandLayout::all(ValueRole::Path),
         operand_access: OperandAccessMode::AllRead,
@@ -503,6 +640,7 @@ const fn home_ro(prefix: &'static [&'static str]) -> Option<HomeReadOnlySpec> {
         forbidden: &[],
         only: None,
         recursion: Recursion::Never,
+        allow_followed_search: false,
     })
 }
 
@@ -520,6 +658,7 @@ const fn home_git_ro(prefix: &'static [&'static str]) -> Option<HomeReadOnlySpec
         forbidden: GIT_FORBIDDEN,
         only: None,
         recursion: Recursion::Never,
+        allow_followed_search: false,
     })
 }
 
@@ -569,8 +708,8 @@ const RG_FLAGS: &[FlagSpec] = &[
         Some('L'),
         Some("follow"),
         FlagEffects {
-            follows_links_at_root: true,
-            follows_links_below_root: true,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -718,7 +857,8 @@ const GREP_FLAGS: &[FlagSpec] = &[
         Some('r'),
         Some("recursive"),
         FlagEffects {
-            recursive: true,
+            recursive: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Disable,
             ..FlagEffects::NONE
         },
     ),
@@ -726,9 +866,9 @@ const GREP_FLAGS: &[FlagSpec] = &[
         Some('R'),
         Some("dereference-recursive"),
         FlagEffects {
-            recursive: true,
-            follows_links_at_root: true,
-            follows_links_below_root: true,
+            recursive: FlagToggle::Enable,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -775,7 +915,7 @@ const GREP_FLAGS: &[FlagSpec] = &[
         Some("directories"),
         ValueRole::Text,
         FlagEffects {
-            recursive: true,
+            recursive: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -809,8 +949,8 @@ const AG_FLAGS: &[FlagSpec] = &[
         Some('f'),
         Some("follow"),
         FlagEffects {
-            follows_links_at_root: true,
-            follows_links_below_root: true,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -819,11 +959,32 @@ const AG_FLAGS: &[FlagSpec] = &[
     bool_sl('i', "ignore-case"),
     bool_sl('L', "files-without-matches"),
     bool_sl('l', "files-with-matches"),
-    bool_sl('n', "norecurse"),
+    bool_e(
+        Some('n'),
+        Some("norecurse"),
+        FlagEffects {
+            recursive: FlagToggle::Disable,
+            ..FlagEffects::NONE
+        },
+    ),
     bool_sl('o', "only-matching"),
     bool_sl('Q', "literal"),
-    bool_sl('R', "recurse"),
-    bool_s('r'),
+    bool_e(
+        Some('R'),
+        Some("recurse"),
+        FlagEffects {
+            recursive: FlagToggle::Enable,
+            ..FlagEffects::NONE
+        },
+    ),
+    bool_e(
+        Some('r'),
+        None,
+        FlagEffects {
+            recursive: FlagToggle::Enable,
+            ..FlagEffects::NONE
+        },
+    ),
     bool_sl('S', "smart-case"),
     bool_sl('s', "case-sensitive"),
     bool_sl('v', "invert-match"),
@@ -846,7 +1007,15 @@ const AG_FLAGS: &[FlagSpec] = &[
     bool_l("noheading"),
     bool_l("nobreak"),
     bool_l("break"),
-    bool_l("nofollow"),
+    bool_e(
+        None,
+        Some("nofollow"),
+        FlagEffects {
+            follows_links_at_root: FlagToggle::Disable,
+            follows_links_below_root: FlagToggle::Disable,
+            ..FlagEffects::NONE
+        },
+    ),
     bool_l("search-binary"),
     bool_l("silent"),
     bool_l("stats"),
@@ -925,9 +1094,30 @@ const ACK_FLAGS: &[FlagSpec] = &[
     bool_sl('H', "with-filename"),
     bool_s('o'),
     bool_s('1'),
-    bool_sl('n', "no-recurse"),
-    bool_sl('r', "recurse"),
-    bool_s('R'),
+    bool_e(
+        Some('n'),
+        Some("no-recurse"),
+        FlagEffects {
+            recursive: FlagToggle::Disable,
+            ..FlagEffects::NONE
+        },
+    ),
+    bool_e(
+        Some('r'),
+        Some("recurse"),
+        FlagEffects {
+            recursive: FlagToggle::Enable,
+            ..FlagEffects::NONE
+        },
+    ),
+    bool_e(
+        Some('R'),
+        None,
+        FlagEffects {
+            recursive: FlagToggle::Enable,
+            ..FlagEffects::NONE
+        },
+    ),
     bool_s('s'),
     bool_s('x'),
     bool_e(
@@ -951,12 +1141,20 @@ const ACK_FLAGS: &[FlagSpec] = &[
         None,
         Some("follow"),
         FlagEffects {
-            follows_links_at_root: true,
-            follows_links_below_root: true,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
-    bool_l("nofollow"),
+    bool_e(
+        None,
+        Some("nofollow"),
+        FlagEffects {
+            follows_links_at_root: FlagToggle::Disable,
+            follows_links_below_root: FlagToggle::Disable,
+            ..FlagEffects::NONE
+        },
+    ),
     bool_l("sort-files"),
     bool_l("nopager"),
     // Value flags
@@ -1029,8 +1227,8 @@ const CP_FLAGS: &[FlagSpec] = &[
         Some('r'),
         None,
         FlagEffects {
-            recursive: true,
-            derived_destinations: true,
+            recursive: FlagToggle::Enable,
+            derived_destinations: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1038,8 +1236,8 @@ const CP_FLAGS: &[FlagSpec] = &[
         Some('R'),
         Some("recursive"),
         FlagEffects {
-            recursive: true,
-            derived_destinations: true,
+            recursive: FlagToggle::Enable,
+            derived_destinations: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1047,8 +1245,10 @@ const CP_FLAGS: &[FlagSpec] = &[
         Some('a'),
         Some("archive"),
         FlagEffects {
-            recursive: true,
-            derived_destinations: true,
+            recursive: FlagToggle::Enable,
+            derived_destinations: FlagToggle::Enable,
+            follows_links_at_root: FlagToggle::Disable,
+            follows_links_below_root: FlagToggle::Disable,
             ..FlagEffects::NONE
         },
     ),
@@ -1056,13 +1256,29 @@ const CP_FLAGS: &[FlagSpec] = &[
         Some('L'),
         Some("dereference"),
         FlagEffects {
-            follows_links_at_root: true,
-            follows_links_below_root: true,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
-    bool_s('P'),
-    bool_s('d'),
+    bool_e(
+        Some('P'),
+        None,
+        FlagEffects {
+            follows_links_at_root: FlagToggle::Disable,
+            follows_links_below_root: FlagToggle::Disable,
+            ..FlagEffects::NONE
+        },
+    ),
+    bool_e(
+        Some('d'),
+        None,
+        FlagEffects {
+            follows_links_at_root: FlagToggle::Disable,
+            follows_links_below_root: FlagToggle::Disable,
+            ..FlagEffects::NONE
+        },
+    ),
 ];
 
 /// `rsync` flags known to `dev` (`gate.rs`: `-L`, `-k`, `--copy-links`,
@@ -1072,8 +1288,8 @@ const RSYNC_FLAGS: &[FlagSpec] = &[
         Some('L'),
         Some("copy-links"),
         FlagEffects {
-            follows_links_at_root: true,
-            follows_links_below_root: true,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1081,8 +1297,8 @@ const RSYNC_FLAGS: &[FlagSpec] = &[
         Some('k'),
         Some("copy-dirlinks"),
         FlagEffects {
-            follows_links_at_root: true,
-            follows_links_below_root: true,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1090,8 +1306,8 @@ const RSYNC_FLAGS: &[FlagSpec] = &[
         None,
         Some("copy-unsafe-links"),
         FlagEffects {
-            follows_links_at_root: true,
-            follows_links_below_root: true,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1104,8 +1320,8 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some('x'),
         None,
         FlagEffects {
-            writes: true,
-            derived_destinations: true,
+            writes: FlagToggle::Enable,
+            derived_destinations: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1113,7 +1329,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some('c'),
         None,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1121,7 +1337,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some('r'),
         None,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1129,7 +1345,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some('u'),
         None,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1137,8 +1353,8 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some('h'),
         Some("dereference"),
         FlagEffects {
-            follows_links_at_root: true,
-            follows_links_below_root: true,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1151,14 +1367,15 @@ const CD_FLAGS: &[FlagSpec] = &[bool_s('L'), bool_s('P'), bool_s('e'), bool_s('@
 /// and contract §4/§5.
 ///
 /// Note: `find` uses single-dash multi-character primary names (`-follow`,
-/// `-delete`, `-exec`, …); they are stored in `FlagSpec::long` so P3 matches
-/// single-dash primaries for `find`.
+/// `-delete`, `-exec`, …); they are stored in `FlagSpec::long` with
+/// `ToolSpec::single_dash_long = true`.
 const FIND_FLAGS: &[FlagSpec] = &[
     bool_e(
         Some('H'),
         None,
         FlagEffects {
-            follows_links_at_root: true,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Disable,
             ..FlagEffects::NONE
         },
     ),
@@ -1166,12 +1383,20 @@ const FIND_FLAGS: &[FlagSpec] = &[
         Some('L'),
         Some("follow"),
         FlagEffects {
-            follows_links_at_root: true,
-            follows_links_below_root: true,
+            follows_links_at_root: FlagToggle::Enable,
+            follows_links_below_root: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
-    bool_s('P'),
+    bool_e(
+        Some('P'),
+        None,
+        FlagEffects {
+            follows_links_at_root: FlagToggle::Disable,
+            follows_links_below_root: FlagToggle::Disable,
+            ..FlagEffects::NONE
+        },
+    ),
     bool_s('E'),
     bool_s('X'),
     bool_s('d'),
@@ -1183,7 +1408,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         None,
         Some("delete"),
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1195,7 +1420,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         Some("exec"),
         ValueRole::Code,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             runs_code: true,
             ..FlagEffects::NONE
         },
@@ -1205,7 +1430,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         Some("execdir"),
         ValueRole::Code,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             runs_code: true,
             ..FlagEffects::NONE
         },
@@ -1215,7 +1440,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         Some("ok"),
         ValueRole::Code,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             runs_code: true,
             ..FlagEffects::NONE
         },
@@ -1225,7 +1450,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         Some("okdir"),
         ValueRole::Code,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             runs_code: true,
             ..FlagEffects::NONE
         },
@@ -1235,7 +1460,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         Some("fprint"),
         ValueRole::Path,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1244,7 +1469,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         Some("fprint0"),
         ValueRole::Path,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1253,7 +1478,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         Some("fprintf"),
         ValueRole::Path,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1262,7 +1487,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         Some("fls"),
         ValueRole::Path,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1274,7 +1499,7 @@ const RM_FLAGS: &[FlagSpec] = &[
         Some('r'),
         Some("recursive"),
         FlagEffects {
-            recursive: true,
+            recursive: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1282,7 +1507,7 @@ const RM_FLAGS: &[FlagSpec] = &[
         Some('R'),
         None,
         FlagEffects {
-            recursive: true,
+            recursive: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1294,7 +1519,7 @@ const OUTPUT_FILE_FLAGS: &[FlagSpec] = &[val_e(
     Some("output"),
     ValueRole::Path,
     FlagEffects {
-        writes: true,
+        writes: FlagToggle::Enable,
         ..FlagEffects::NONE
     },
 )];
@@ -1312,7 +1537,7 @@ const CODESIGN_FLAGS: &[FlagSpec] = &[
         Some("sign"),
         ValueRole::Text,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1320,7 +1545,7 @@ const CODESIGN_FLAGS: &[FlagSpec] = &[
         Some('f'),
         Some("force"),
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1328,7 +1553,7 @@ const CODESIGN_FLAGS: &[FlagSpec] = &[
         None,
         Some("remove-signature"),
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1342,7 +1567,7 @@ const SED_FLAGS: &[FlagSpec] = &[
         Some('i'),
         Some("in-place"),
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1363,7 +1588,7 @@ const AWK_FLAGS: &[FlagSpec] = &[val_e(
     Some("include"),
     ValueRole::Code,
     FlagEffects {
-        writes: true,
+        writes: FlagToggle::Enable,
         runs_code: true,
         ..FlagEffects::NONE
     },
@@ -1375,7 +1600,7 @@ const PERL_FLAGS: &[FlagSpec] = &[
         Some('i'),
         None,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1503,7 +1728,7 @@ const GIT_DIFF_FLAGS: &[FlagSpec] = &[
         Some("output"),
         ValueRole::Path,
         FlagEffects {
-            writes: true,
+            writes: FlagToggle::Enable,
             ..FlagEffects::NONE
         },
     ),
@@ -1626,6 +1851,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
                 "--show-current",
             ]),
             recursion: Recursion::Never,
+            allow_followed_search: false,
         }),
         changes_default: Some("§11 item 9"),
         ..base_subcommand("branch")
@@ -1770,18 +1996,21 @@ const PIPX_SUBCOMMANDS: &[SubcommandSpec] = &[SubcommandSpec {
 pub(crate) const TOOLS: &[ToolSpec] = &[
     // --- Modeled §4 wrappers (exact closed forms) ---
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Command),
         changes_default: Some("§11 item 10"),
         ..base_tool("command")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Exec),
         changes_default: Some("§11 item 10"),
         ..base_tool("exec")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: NICE_FLAGS,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Nice),
@@ -1789,6 +2018,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("nice")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: TIMEOUT_FLAGS,
         operands: OperandLayout::fixed(&[ValueRole::Text]),
         wrapper: Some(WrapperKind::Timeout),
@@ -1796,12 +2026,14 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("timeout")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Time),
         changes_default: Some("§11 item 10"),
         ..base_tool("time")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Env),
         changes_default: Some("§11 item 10"),
@@ -1809,6 +2041,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     },
     // --- Modeled §4 nested shells (and script-file Unread (program)) ---
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: MODELED_SHELL_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
         writes: WriteBehavior::Always,
@@ -1821,6 +2054,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("sh")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: MODELED_SHELL_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
         writes: WriteBehavior::Always,
@@ -1833,6 +2067,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("bash")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: MODELED_SHELL_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
         writes: WriteBehavior::Always,
@@ -1850,7 +2085,6 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("ls")
     },
     ToolSpec {
-        operands: OperandLayout::NONE,
         home_readonly: home_ro(&["pwd"]),
         ..base_tool("pwd")
     },
@@ -1883,6 +2117,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             ],
             only: None,
             recursion: Recursion::Never,
+            allow_followed_search: false,
         }),
         ..base_tool("file")
     },
@@ -1906,23 +2141,20 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("which")
     },
     ToolSpec {
-        operands: OperandLayout::NONE,
         home_readonly: home_ro(&["uname"]),
         ..base_tool("uname")
     },
     ToolSpec {
-        operands: OperandLayout::all(ValueRole::Text),
         home_readonly: Some(HomeReadOnlySpec {
             prefix: &["date"],
             forbidden: &["-s", "--set", "-f", "--file"],
             only: None,
             recursion: Recursion::Never,
+            allow_followed_search: false,
         }),
-        changes_default: Some("§11 item 9"),
         ..base_tool("date")
     },
     ToolSpec {
-        operands: OperandLayout::NONE,
         home_readonly: home_ro(&["whoami"]),
         ..base_tool("whoami")
     },
@@ -1935,11 +2167,13 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             forbidden: &["-o", "--output", "-R"],
             only: None,
             recursion: Recursion::Never,
+            allow_followed_search: false,
         }),
         ..base_tool("tree")
     },
     // --- Search tools with faithful `dev` flag tables ---
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: RG_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::Always,
@@ -1956,12 +2190,14 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             ],
             only: None,
             recursion: Recursion::Always,
+            allow_followed_search: ALLOW_HOME_FOLLOWED_SEARCH,
         }),
         filter_dialect: Some(FilterDialect::RgGlob),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 9; §11 item 15 (proposed; §10 row 15)"),
         ..base_tool("rg")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: GREP_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::WithFlag,
@@ -1977,12 +2213,14 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
                 "-d",
                 "--directories",
             ]),
+            allow_followed_search: ALLOW_HOME_FOLLOWED_SEARCH,
         }),
         filter_dialect: Some(FilterDialect::GrepInclude),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 9; §11 item 15 (proposed; §10 row 15)"),
         ..base_tool("grep")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: GREP_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::WithFlag,
@@ -1991,6 +2229,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("egrep")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: GREP_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::WithFlag,
@@ -1999,6 +2238,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("fgrep")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: GREP_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::WithFlag,
@@ -2007,6 +2247,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("zgrep")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: GREP_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::WithFlag,
@@ -2015,6 +2256,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("ggrep")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: GREP_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::Always,
@@ -2023,6 +2265,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("rgrep")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: AG_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::Always,
@@ -2031,6 +2274,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("ag")
     },
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: ACK_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::Always,
@@ -2070,11 +2314,13 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     },
     // --- Explicit §5/§6 file, directory, archive, and link tools ---
     ToolSpec {
+        flag_mode: FlagMode::ListedOnly,
         flags: CD_FLAGS,
         operands: OperandLayout::fixed(&[ValueRole::Path]),
         ..base_tool("cd")
     },
     ToolSpec {
+        single_dash_long: true,
         flags: FIND_FLAGS,
         operands: OperandLayout::all(ValueRole::Path),
         operand_access: OperandAccessMode::FlagOnlyWrite,
@@ -2100,6 +2346,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             positional: &[],
             rest: Some(ValueRole::Path),
             last: Some(ValueRole::DestinationRoot),
+            after_double_dash: None,
         },
         operand_access: OperandAccessMode::SourcesReadLastWrite,
         writes: WriteBehavior::Always,
@@ -2113,6 +2360,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             positional: &[],
             rest: Some(ValueRole::Path),
             last: Some(ValueRole::DestinationRoot),
+            after_double_dash: None,
         },
         operand_access: OperandAccessMode::AllWrite,
         writes: WriteBehavior::Always,
@@ -2127,6 +2375,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             positional: &[],
             rest: Some(ValueRole::Path),
             last: Some(ValueRole::DestinationRoot),
+            after_double_dash: None,
         },
         operand_access: OperandAccessMode::SourcesReadLastWrite,
         writes: WriteBehavior::Always,
@@ -2241,6 +2490,16 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::Always,
         ..base_tool("blkdiscard")
     },
+    ToolSpec {
+        operand_access: OperandAccessMode::AllWrite,
+        writes: WriteBehavior::Always,
+        ..base_tool("ed")
+    },
+    ToolSpec {
+        operand_access: OperandAccessMode::AllWrite,
+        writes: WriteBehavior::Always,
+        ..base_tool("ex")
+    },
     // --- Remaining `words::READERS` (modeled readers) ---
     base_tool("diff"),
     base_tool("cmp"),
@@ -2329,16 +2588,21 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         operands: OperandLayout::all(ValueRole::Text),
+        changes_default: Some("§11 item 9"),
         ..base_tool("true")
     },
     ToolSpec {
         operands: OperandLayout::all(ValueRole::Text),
+        changes_default: Some("§11 item 9"),
         ..base_tool("false")
     },
     ToolSpec {
         operands: OperandLayout::all(ValueRole::Text),
+        changes_default: Some("§11 item 9"),
         ..base_tool("id")
     },
+    base_tool("test"),
+    base_tool("["),
     ToolSpec {
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         changes_default: Some("§11 item 9"),
@@ -2347,6 +2611,18 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         platforms: Platforms::MacOs,
         ..base_tool("mdls")
+    },
+    ToolSpec {
+        platforms: Platforms::MacOs,
+        ..base_tool("open")
+    },
+    ToolSpec {
+        platforms: Platforms::MacOs,
+        ..base_tool("spctl")
+    },
+    ToolSpec {
+        platforms: Platforms::MacOs,
+        ..base_tool("mdfind")
     },
     ToolSpec {
         platforms: Platforms::MacOs,
@@ -2712,23 +2988,7 @@ pub(crate) const OUTSIDE_MODEL: &[OutsideModelEntry] = &[
     outside_reserved("!"),
     outside_reserved("[["),
     outside_reserved("coproc"),
-    // --- Other tools in `words::WRITERS` / `words::READERS` deliberately left Unread ---
-    OutsideModelEntry {
-        name: "ed",
-        platforms: Platforms::Both,
-        code_runner_no_pin: true,
-        reason: "Interactive line editor capable of shell escapes (`!cmd`); outside the model",
-        contract_section: "§4",
-        changes_default: Some("§11 item 4"),
-    },
-    OutsideModelEntry {
-        name: "ex",
-        platforms: Platforms::Both,
-        code_runner_no_pin: true,
-        reason: "Interactive line editor capable of shell escapes (`!cmd`); outside the model",
-        contract_section: "§4",
-        changes_default: Some("§11 item 4"),
-    },
+    // --- Directory-stack builtins outside §5's `cd` model (`words::READERS`) ---
     OutsideModelEntry {
         name: "pushd",
         platforms: Platforms::Both,
@@ -2743,46 +3003,6 @@ pub(crate) const OUTSIDE_MODEL: &[OutsideModelEntry] = &[
         code_runner_no_pin: false,
         reason: "Mutates shell directory stack; makes cwd unknown (§5)",
         contract_section: "§5",
-        changes_default: None,
-    },
-    OutsideModelEntry {
-        name: "test",
-        platforms: Platforms::Both,
-        code_runner_no_pin: false,
-        reason: "Conditional primaries (`-f`, `-r`, …) have no flag table in `dev`",
-        contract_section: "§6",
-        changes_default: None,
-    },
-    OutsideModelEntry {
-        name: "[",
-        platforms: Platforms::Both,
-        code_runner_no_pin: false,
-        reason: "Conditional primaries (`-f`, `-r`, …) have no flag table in `dev`",
-        contract_section: "§6",
-        changes_default: None,
-    },
-    OutsideModelEntry {
-        name: "open",
-        platforms: Platforms::MacOs,
-        code_runner_no_pin: true,
-        reason: "macOS launcher that opens files/URLs with external applications",
-        contract_section: "§6",
-        changes_default: Some("§11 item 4"),
-    },
-    OutsideModelEntry {
-        name: "spctl",
-        platforms: Platforms::MacOs,
-        code_runner_no_pin: false,
-        reason: "macOS Gatekeeper policy tool with modifying flags; no flag table in `dev`",
-        contract_section: "§6",
-        changes_default: None,
-    },
-    OutsideModelEntry {
-        name: "mdfind",
-        platforms: Platforms::MacOs,
-        code_runner_no_pin: false,
-        reason: "macOS Spotlight search across volumes; no flag table in `dev`",
-        contract_section: "§6",
         changes_default: None,
     },
 ];
@@ -2931,6 +3151,9 @@ fn fmt_effects(e: EffectFields) -> String {
         WriteBehavior::Always => items.push("writes".into()),
         WriteBehavior::WithFlag => items.push("writes (flag)".into()),
         WriteBehavior::WithOperandCount(n) => items.push(format!("writes (>= {n} args)")),
+        WriteBehavior::WithFlagOrOperandCount(n) => {
+            items.push(format!("writes (flag or >= {n} args unless disabled)"))
+        }
     }
     match e.derived {
         DerivedDestinationsBehavior::Never => {}
@@ -2952,6 +3175,14 @@ fn fmt_effects(e: EffectFields) -> String {
         CodeRunnerBehavior::Never => {}
         CodeRunnerBehavior::InlineOnly => items.push("code: inline".into()),
         CodeRunnerBehavior::InlineWithFlag => items.push("code: flag".into()),
+        CodeRunnerBehavior::ScriptCommands(cmds) => {
+            let list = cmds
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join("/");
+            items.push(format!("code: script commands ({list})"));
+        }
         CodeRunnerBehavior::InlineWithSubarg(s) => {
             items.push(format!("code: subarg {}", s.join("/")))
         }
@@ -3003,8 +3234,14 @@ pub(crate) fn render_markdown() -> String {
          regenerate with `env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools`.\n\n",
     );
     out.push_str(
-        "Any tool or flag absent from this table (and every entry in **Outside the model** below) \
-         makes the unit **Unread** (§6).\n\n",
+        "**Unknown tools vs. excluded forms (§4, §6):**\n\
+         - An **unknown tool** (absent from both **Modeled tools** and **Outside the model** below) \
+           stays in the model for hard-deny and store checks (§4): every word counts as a candidate `Path`, \
+           the unit counts as a possible writer (§5), and it is never eligible for Home's read-only list. \
+           Under a covering prefix/exact Allow rule meeting §7's simple-command conditions, Clear targets remain Clear.\n\
+         - An **explicitly excluded form** makes its unit **Unread**: every entry in **Outside the model**, \
+           any unlisted flag on a `ListedOnly` row, any forbidden flag on an `AnyExceptForbidden` row, \
+           or any form triggering an `Unread` effect (§3–§6).\n\n",
     );
 
     // 1. Main tools table
@@ -3103,32 +3340,43 @@ pub(crate) fn render_markdown() -> String {
                 FlagKind::OptionalValue(r) => format!("OptionalValue({})", fmt_role(r)),
             };
             let mut eff = Vec::new();
-            if f.effects.writes {
-                eff.push("writes".to_string());
+            match f.effects.writes {
+                FlagToggle::Unchanged => {}
+                FlagToggle::Enable => eff.push("writes:+".to_string()),
+                FlagToggle::Disable => eff.push("writes:-".to_string()),
             }
-            if f.effects.derived_destinations {
-                eff.push("derived-dest".to_string());
+            match f.effects.derived_destinations {
+                FlagToggle::Unchanged => {}
+                FlagToggle::Enable => eff.push("derived-dest:+".to_string()),
+                FlagToggle::Disable => eff.push("derived-dest:-".to_string()),
             }
-            if f.effects.recursive {
-                eff.push("recursive".to_string());
+            match f.effects.recursive {
+                FlagToggle::Unchanged => {}
+                FlagToggle::Enable => eff.push("recursive:+".to_string()),
+                FlagToggle::Disable => eff.push("recursive:-".to_string()),
             }
-            if f.effects.follows_links_at_root || f.effects.follows_links_below_root {
+            if f.effects.follows_links_at_root != FlagToggle::Unchanged
+                || f.effects.follows_links_below_root != FlagToggle::Unchanged
+            {
+                let sym = |t: FlagToggle| match t {
+                    FlagToggle::Unchanged => "=",
+                    FlagToggle::Enable => "+",
+                    FlagToggle::Disable => "-",
+                };
                 eff.push(format!(
                     "links(root={}, below={})",
-                    if f.effects.follows_links_at_root {
-                        "Y"
-                    } else {
-                        "N"
-                    },
-                    if f.effects.follows_links_below_root {
-                        "Y"
-                    } else {
-                        "N"
-                    }
+                    sym(f.effects.follows_links_at_root),
+                    sym(f.effects.follows_links_below_root)
                 ));
             }
             if f.effects.provides_pattern {
                 eff.push("provides-pattern".to_string());
+            }
+            if f.effects.provides_script {
+                eff.push("provides-script".to_string());
+            }
+            if let Some(role) = f.effects.positional_role {
+                eff.push(format!("positional-role({})", fmt_role(role)));
             }
             if let Some((d, ci)) = f.effects.filter {
                 eff.push(format!("filter({d:?}, ci={ci})"));
@@ -3320,6 +3568,16 @@ mod tests {
                     assert!(
                         flags.iter().any(|f| f.effects.runs_code),
                         "{label}: InlineWithFlag row must have a runs_code flag"
+                    );
+                }
+                CodeRunnerBehavior::ScriptCommands(cmds) => {
+                    assert!(
+                        !cmds.is_empty(),
+                        "{label}: ScriptCommands must list trigger commands"
+                    );
+                    assert!(
+                        has_code_operand(layout, flags),
+                        "{label}: ScriptCommands must name a Code operand or flag"
                     );
                 }
                 CodeRunnerBehavior::InlineWithSubarg(subargs) => {
@@ -3610,11 +3868,14 @@ mod tests {
     }
 
     #[test]
-    fn changes_default_citations_reference_items_1_to_14() {
+    fn changes_default_citations_reference_valid_items() {
         let check = |label: &str, s: &str| {
             let parts: Vec<&str> = s.split(';').map(str::trim).collect();
             assert!(!parts.is_empty(), "{label}: empty changes_default");
             for p in parts {
+                if p == "§11 item 15 (proposed; §10 row 15)" {
+                    continue;
+                }
                 let num_str = p
                     .strip_prefix("§11 item ")
                     .unwrap_or_else(|| panic!("{label}: invalid citation `{p}`"));
