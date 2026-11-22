@@ -314,6 +314,11 @@ The columns are **Home / prefix or exact rule / Any rule / FullAccess**, with `h
 12. **S8's hard deny of roots holding a credential,** with its exceptions (home, ancestors of home, `~/.config`) and its extension to ancestors of Atrium data paths outside home (§5).
 13. **Names that match a protected name only under an unlisted equivalence** (Unicode normalization, other case folds) become Unread, so Home asks where `dev` allows (§5).
 14. **Process-dependent paths** (`/proc/self/…`, `/dev/fd/…`, `/dev/std*`) become Unread, so Home asks where `dev` may allow (§3).
+15. **Followed-link searches can be Allow in Home** (`rg -L`, `grep -R`, `find -L`, `ack --follow`). If `SessionGate`'s walk of the root's links finds no link to a protected path within budget, the search is Clear, so Home allows it (§5, §10 row 15). On `dev`, Home asks for every followed-link search. Unchanged:
+    - a link that reaches a protected path is a hit when the search has no filter, and Unread when it has one;
+    - reaching the walk cap is Unread.
+
+    Added on 2026-11-22 (D-139): P0's review found that row 15 had no item here.
 
 **Unchanged on purpose:**
 - `ToolSubject::Unknown` asks everywhere.
