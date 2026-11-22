@@ -49,7 +49,7 @@ pub struct SessionGateConfig {
     pub provider: Provider,
 }
 
-const MAX_HOPS: u8 = 40;
+pub(super) const MAX_HOPS: u8 = 40;
 
 /// Absolute path with the deepest existing ancestor canonicalized and the
 /// rest appended (dangling symlinks are followed by hand).
@@ -388,21 +388,21 @@ fn recursive_reader(eff: &[String]) -> bool {
 /// table, for each way it can be read: a short option whose value is
 /// optional (`ack -C [N]`) followed by a separate word gives two readings.
 /// `None`: an option the table doesn't know.
-struct ReaderOpts {
-    flags: &'static str,
-    vals: &'static str,
-    opt_vals: &'static str,
-    long_vals: &'static [&'static str],
+pub(super) struct ReaderOpts {
+    pub(super) flags: &'static str,
+    pub(super) vals: &'static str,
+    pub(super) opt_vals: &'static str,
+    pub(super) long_vals: &'static [&'static str],
     /// Long options whose value is optional (`ag --context [N]`, `ack
     /// --context[=N]`): `--name=v` takes it, `--name v` is read both ways.
-    long_opt_vals: &'static [&'static str],
-    long_flags: &'static [&'static str],
+    pub(super) long_opt_vals: &'static [&'static str],
+    pub(super) long_flags: &'static [&'static str],
     /// Short options whose value is the pattern (`ag -g PAT`, `ack -g RE`)
     /// or that take no pattern (`ack -f`): the positional words are paths.
-    no_pattern: &'static str,
+    pub(super) no_pattern: &'static str,
     /// The same for long options (`ag --filename-pattern PAT`, `ack --match
     /// RE`): round 8, review major 6.
-    long_no_pattern: &'static [&'static str],
+    pub(super) long_no_pattern: &'static [&'static str],
 }
 
 fn readings(args: &[String], o: &ReaderOpts, prefixes: bool) -> Option<Vec<(Vec<String>, bool)>> {
@@ -514,7 +514,7 @@ fn readings(args: &[String], o: &ReaderOpts, prefixes: bool) -> Option<Vec<(Vec<
 
 // The Silver Searcher's `getopt_long` table (`src/options.c`): `-A`, `-B`,
 // `-C` and their long names take an optional number (read both ways).
-const AG_OPTS: ReaderOpts = ReaderOpts {
+pub(super) const AG_OPTS: ReaderOpts = ReaderOpts {
     flags: "aDcFfHhiLlnoQRrSsvVtuUwz0",
     vals: "GgmpW",
     opt_vals: "ABC",
@@ -602,7 +602,7 @@ const AG_OPTS: ReaderOpts = ReaderOpts {
 
 // ack 3's `Getopt::Long` table: `-C`/`--context` take an optional number
 // (read both ways); `-A`/`-B` and their long names need one.
-const ACK_OPTS: ReaderOpts = ReaderOpts {
+pub(super) const ACK_OPTS: ReaderOpts = ReaderOpts {
     flags: "iISvwQlLchHo1nrRsxfk",
     vals: "ABmgt",
     opt_vals: "C",

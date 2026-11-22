@@ -533,7 +533,7 @@ fn roots_of(is_rg: bool, follow: bool, args: &[String]) -> Option<Searched> {
 /// hard-deny list's files and the stores that ask, by their path below home
 /// or, for names that are distinctive, by file name alone; private keys
 /// (`id_*` but `.pub`); anything below a credential folder.
-const GIT_CRED_SUFFIXES: &[&str] = &[
+pub(super) const GIT_CRED_SUFFIXES: &[&str] = &[
     ".aws/credentials",
     ".docker/config.json",
     ".kube/config",
@@ -545,7 +545,7 @@ const GIT_CRED_SUFFIXES: &[&str] = &[
     ".config/git/credentials",
     ".azure/accesstokens.json",
 ];
-const GIT_CRED_NAMES: &[&str] = &[
+pub(super) const GIT_CRED_NAMES: &[&str] = &[
     ".netrc",
     ".git-credentials",
     ".npmrc",
@@ -563,7 +563,7 @@ const GIT_CRED_NAMES: &[&str] = &[
     "fish_history",
     "accesstokens.json",
 ];
-const GIT_CRED_DIRS: &[&str] = &[
+pub(super) const GIT_CRED_DIRS: &[&str] = &[
     ".ssh",
     ".gnupg",
     ".config/gcloud",

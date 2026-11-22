@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::{Redirect, RedirectOp, Segment};
 
-const MAX_DEPTH: u8 = 6;
+pub(super) const MAX_DEPTH: u8 = 6;
 
 /// How a command is joined to the one after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1463,7 +1463,7 @@ fn opens_body(argv: &[String]) -> bool {
 
 /// Words that start compound commands; a segment starting with one can't be
 /// matched by a rule.
-const RESERVED: &[&str] = &[
+pub(super) const RESERVED: &[&str] = &[
     "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
     "function", "select", "{", "}", "!", "[[", "coproc",
 ];
@@ -2586,7 +2586,7 @@ fn is_assignment_word(w: &str) -> bool {
     w.split_once('=').is_some_and(|(n, _)| is_name(n))
 }
 
-const SHELLS: &[&str] = &[
+pub(super) const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh", "mksh", "yash", "rbash",
     "posh", "elvish", "xonsh",
 ];
@@ -2614,7 +2614,7 @@ fn has_substitution_or_var(w: &str) -> bool {
 
 /// Commands that run a command named in their arguments somewhere else (a
 /// host, a container, a namespace) and hand it their stdin.
-const COMMAND_RUNNERS: &[&str] = &[
+pub(super) const COMMAND_RUNNERS: &[&str] = &[
     "ssh",
     "mosh",
     "autossh",
