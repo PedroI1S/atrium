@@ -224,33 +224,54 @@ fn append_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-fn spawn_login_shell(shell_path: &Path, deadline: Instant) -> Option<(UnixStream, Child)> {
+#[doc(hidden)]
+pub fn spawn_login_shell_with_retry<T>(
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+    mut spawn: impl FnMut() -> io::Result<T>,
+) -> Option<T> {
     let mut backoff = Duration::from_millis(1);
     loop {
-        let (stdout_rx, stdout_tx) = UnixStream::pair().ok()?;
+        if now() >= deadline {
+            return None;
+        }
+        match spawn() {
+            Ok(value) => return Some(value),
+            Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy => {
+                // On Linux, `execve` returns `ETXTBSY` while another thread's
+                // freshly forked child still holds a writable fd to the same
+                // inode before its own `execve` closes `O_CLOEXEC` fds. Wait
+                // briefly within the caller's deadline for the writer to close.
+                let remaining = deadline.saturating_duration_since(now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                sleep(backoff.min(remaining));
+                backoff = (backoff * 2).min(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn spawn_login_shell(
+    shell_path: &Path,
+    deadline: Instant,
+    mut on_attempt: impl FnMut(Result<(), io::ErrorKind>),
+) -> Option<(UnixStream, Child)> {
+    spawn_login_shell_with_retry(deadline, Instant::now, std::thread::sleep, || {
+        let (stdout_rx, stdout_tx) = UnixStream::pair()?;
         let mut cmd = Command::new(shell_path);
         cmd.args(["-ilc", login_shell_path_command(shell_path)])
             .stdin(Stdio::null())
             .stdout(Stdio::from(OwnedFd::from(stdout_tx)))
             .stderr(Stdio::null())
             .process_group(0);
-        match cmd.spawn() {
-            Ok(child) => return Some((stdout_rx, child)),
-            Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy => {
-                // On Linux, `execve` returns `ETXTBSY` while another thread's
-                // freshly forked child still holds a writable fd to the same
-                // inode before its own `execve` closes `O_CLOEXEC` fds. Wait
-                // briefly within the caller's deadline for the writer to close.
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return None;
-                }
-                std::thread::sleep(backoff.min(remaining));
-                backoff = (backoff * 2).min(Duration::from_millis(10));
-            }
-            Err(_) => return None,
-        }
-    }
+        let result = cmd.spawn();
+        on_attempt(result.as_ref().map(|_| ()).map_err(io::Error::kind));
+        result.map(|child| (stdout_rx, child))
+    })
 }
 
 /// Runs `$SHELL -ilc` with a short timeout to discover the user's login-shell
@@ -263,10 +284,19 @@ fn spawn_login_shell(shell_path: &Path, deadline: Instant) -> Option<(UnixStream
 /// thread), killing the whole process group and reaping the leader on every
 /// return path.
 pub fn discover_login_shell_path(shell: Option<&OsStr>, timeout: Duration) -> Option<OsString> {
+    discover_login_shell_path_with_spawn_hook(shell, timeout, |_| {})
+}
+
+#[doc(hidden)]
+pub fn discover_login_shell_path_with_spawn_hook(
+    shell: Option<&OsStr>,
+    timeout: Duration,
+    on_spawn_attempt: impl FnMut(Result<(), io::ErrorKind>),
+) -> Option<OsString> {
     let shell = shell.filter(|s| !s.is_empty())?;
     let shell_path = Path::new(shell);
     let deadline = Instant::now() + timeout;
-    let (mut stdout_rx, child) = spawn_login_shell(shell_path, deadline)?;
+    let (mut stdout_rx, child) = spawn_login_shell(shell_path, deadline, on_spawn_attempt)?;
     let mut shell_child = LoginShellChild::new(child);
 
     let mut buf = Vec::new();
@@ -774,14 +804,17 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashSet;
     use std::ffi::OsStr;
+    use std::io;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     use super::{
         DEFAULT_PATH_EXTRAS, extract_marked_path, is_fish_shell, login_shell_path_command,
-        provider_path, provider_path_with_shell,
+        provider_path, provider_path_with_shell, spawn_login_shell_with_retry,
     };
 
     #[test]
@@ -977,5 +1010,96 @@ mod tests {
             None
         );
         assert_eq!(extract_marked_path(b"no markers here"), None);
+    }
+
+    #[test]
+    fn spawn_login_shell_with_retry_returns_none_when_deadline_expires_before_retry() {
+        // 1. Final backoff consumes the remaining budget (`1ms + 2ms == 3ms`):
+        // even though the next spawn would succeed (simulating the writer
+        // closing during that sleep), no shell may start once the deadline
+        // has been reached.
+        let base = Instant::now();
+        let deadline = base + Duration::from_millis(3);
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut sleeps = Vec::new();
+        let mut attempts = 0usize;
+        let result = spawn_login_shell_with_retry(
+            deadline,
+            || base + elapsed.get(),
+            |d| {
+                sleeps.push(d);
+                elapsed.set(elapsed.get() + d);
+            },
+            || {
+                attempts += 1;
+                if attempts <= 2 {
+                    Err(io::Error::from(io::ErrorKind::ExecutableFileBusy))
+                } else {
+                    Ok("started-after-deadline")
+                }
+            },
+        );
+        assert_eq!(result, None);
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_millis(1), Duration::from_millis(2)]
+        );
+        assert_eq!(elapsed.get(), Duration::from_millis(3));
+
+        // 2. Clock oversleeps past the deadline before a retry: next spawn is
+        // skipped even if it would succeed.
+        let base = Instant::now();
+        let deadline = base + Duration::from_millis(10);
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut attempts = 0usize;
+        let result = spawn_login_shell_with_retry(
+            deadline,
+            || base + elapsed.get(),
+            |_d| elapsed.set(Duration::from_millis(10)),
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(io::Error::from(io::ErrorKind::ExecutableFileBusy))
+                } else {
+                    Ok("started-after-oversleep")
+                }
+            },
+        );
+        assert_eq!(result, None);
+        assert_eq!(attempts, 1);
+
+        // 3. Deadline already reached before the first attempt: never spawns.
+        let base = Instant::now();
+        let mut attempts = 0usize;
+        let result = spawn_login_shell_with_retry(
+            base,
+            || base,
+            |_| panic!("unexpected sleep when already expired"),
+            || {
+                attempts += 1;
+                Ok("should-not-start")
+            },
+        );
+        assert_eq!(result, None);
+        assert_eq!(attempts, 0);
+
+        // 4. Non-ETXTBSY error returns immediately without retrying or sleeping.
+        let base = Instant::now();
+        let deadline = base + Duration::from_secs(1);
+        let mut attempts = 0usize;
+        let mut sleeps = Vec::new();
+        let result = spawn_login_shell_with_retry(
+            deadline,
+            || base,
+            |d| sleeps.push(d),
+            || {
+                attempts += 1;
+                Err::<&str, _>(io::Error::from(io::ErrorKind::NotFound))
+            },
+        );
+        assert_eq!(result, None);
+        assert_eq!(attempts, 1);
+        assert!(sleeps.is_empty());
     }
 }
