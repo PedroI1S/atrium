@@ -554,6 +554,9 @@ fn terminate_now(mut child: SupervisedChild) {
     let _ = supervise::terminate_blocking(&mut child, Duration::ZERO);
 }
 
+/// A hook `ask`: `(tool_use_id, ticket, permit)`.
+type HookAsked = (Option<String>, ApprovalTicket, Option<OwnedSemaphorePermit>);
+
 struct Actor {
     config: SessionConfig,
     options: ClaudeOptions,
@@ -592,8 +595,7 @@ struct Actor {
     gate_settled: Arc<Notify>,
 
     /// Gate keys the hook answered `ask` for, with `(tool_use_id, ticket, permit)`.
-    hook_asked:
-        HashMap<String, VecDeque<(Option<String>, ApprovalTicket, Option<OwnedSemaphorePermit>)>>,
+    hook_asked: HashMap<String, VecDeque<HookAsked>>,
     /// Requests of the provider (hook calls and `can_use_tool`, by its own
     /// ids) not answered yet. An answer for one that is not here is never
     /// sent: it was withdrawn, or its turn ended.
