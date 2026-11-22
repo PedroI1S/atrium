@@ -9,7 +9,10 @@ use crate::policy::model::{
 };
 use crate::policy::tools::{self, FlagKind, ToolSpec};
 
-use super::lex::{fold_command_word, leading_assignment_name, lex_best_effort_into, lex_exact};
+use super::lex::{
+    charge_vec_growth, fold_command_word, leading_assignment_name, lex_best_effort_into, lex_exact,
+    vec_push_budgeted,
+};
 
 #[cfg(test)]
 mod tests;
@@ -105,10 +108,11 @@ fn process_text_recursive(
 ) -> Result<(), PartOutcome> {
     let lex_out = lex_exact(text, depth, parent_unit, budget)?;
 
-    // Track per-local-unit mapping to global `UnitIndex` values so lex outcomes
-    // are attached to the exact final unit indices.
+    // Track per-local-unit mapping to global `UnitIndex` values via arithmetic
+    // offset `base_idx + local` (avoiding any auxiliary mapping allocation).
     let base_idx = parsed.units.len();
-    if base_idx + lex_out.units.len() > limits::MAX_UNITS {
+    let local_len = lex_out.units.len();
+    if base_idx + local_len > limits::MAX_UNITS {
         return Err(PartOutcome::TooLarge(Cap::Units));
     }
 
@@ -121,19 +125,22 @@ fn process_text_recursive(
     }
     *next_pipe_offset = next_pipe_offset.saturating_add(max_local_pipe);
 
-    // Pre-assign global indices for this level's raw units (nested `-c` units
-    // are appended after this level's units, keeping their `parent_unit`).
-    let mut local_to_global: Vec<UnitIndex> = Vec::with_capacity(lex_out.units.len());
-    for i in 0..lex_out.units.len() {
-        local_to_global.push(UnitIndex(base_idx + i));
-    }
+    // Charge `parsed.outcomes` and `parsed.units` capacity growth before moving
+    // this level's outcomes/units when budget remains (§8). If exhausted, we
+    // still preserve every unit and outcome found before exhaustion.
+    let pre_exhausted = if !budget.is_exhausted() {
+        charge_vec_growth(&mut parsed.outcomes, lex_out.outcomes.len(), budget)
+            .and_then(|()| charge_vec_growth(&mut parsed.units, local_len, budget))
+            .err()
+    } else {
+        None
+    };
 
     // Remap outcomes emitted by `lex_exact`.
     for pr in lex_out.outcomes {
         let mapped_part = match pr.part {
-            PartId::Unit(UnitIndex(local)) => local_to_global
-                .get(local)
-                .copied()
+            PartId::Unit(UnitIndex(local)) => (local < local_len)
+                .then_some(UnitIndex(base_idx + local))
                 .map_or(PartId::WholeCall, PartId::Unit),
             PartId::WholeCall => parent_unit.map_or(PartId::WholeCall, PartId::Unit),
             other => other,
@@ -143,13 +150,19 @@ fn process_text_recursive(
             outcome: pr.outcome,
         });
     }
+    if let Some(e) = pre_exhausted {
+        parsed.outcomes.push(PartResult {
+            part: parent_unit.map_or(PartId::WholeCall, PartId::Unit),
+            outcome: PartOutcome::Exhausted(e.reason),
+        });
+    }
 
-    // If `lex_exact` already exhausted the budget, move all raw units produced
-    // before exhaustion into `parsed.units` without allocating so earlier hits
-    // are never lost (§8).
+    // If `lex_exact` (or pre-allocation charging) exhausted the budget, move
+    // all raw units produced before exhaustion into `parsed.units` so earlier
+    // hits are never lost (§8).
     if budget.is_exhausted() {
         for (i, raw) in lex_out.units.into_iter().enumerate() {
-            let global_idx = local_to_global[i];
+            let global_idx = UnitIndex(base_idx + i);
             let pipeline_id = raw
                 .pipeline_id
                 .map(|PipelineId(id)| PipelineId(local_pipe_offset + id));
@@ -175,7 +188,7 @@ fn process_text_recursive(
         |raw_iter: &mut std::iter::Enumerate<std::vec::IntoIter<RawCommandUnit>>,
          parsed: &mut ParsedCommandUnits| {
             for (j, rem) in raw_iter.by_ref() {
-                let g_idx = local_to_global[j];
+                let g_idx = UnitIndex(base_idx + j);
                 let pipeline_id = rem
                     .pipeline_id
                     .map(|PipelineId(id)| PipelineId(local_pipe_offset + id));
@@ -193,7 +206,7 @@ fn process_text_recursive(
         };
 
     while let Some((i, mut raw)) = raw_iter.next() {
-        let global_idx = local_to_global[i];
+        let global_idx = UnitIndex(base_idx + i);
         raw.index = global_idx;
         raw.pipeline_id = raw
             .pipeline_id
@@ -217,6 +230,19 @@ fn process_text_recursive(
 
         let unit = unwrapped.unit;
         if let Some(reason) = unwrapped.unread {
+            if let Err(e) = charge_vec_growth(&mut parsed.outcomes, 1, budget) {
+                parsed.outcomes.push(PartResult {
+                    part: PartId::Unit(global_idx),
+                    outcome: PartOutcome::Unread(reason),
+                });
+                parsed.units.push(unit);
+                flush_remaining_raw(&mut raw_iter, parsed);
+                parsed.outcomes.push(PartResult {
+                    part: PartId::Unit(global_idx),
+                    outcome: PartOutcome::Exhausted(e.reason),
+                });
+                return Ok(());
+            }
             parsed.outcomes.push(PartResult {
                 part: PartId::Unit(global_idx),
                 outcome: PartOutcome::Unread(reason),
@@ -226,6 +252,19 @@ fn process_text_recursive(
         // Check if this unit uses an unquoted `~` after an earlier unit
         // modified `HOME` (§3).
         if home_modified && unit_uses_unquoted_tilde(&unit) {
+            if let Err(e) = charge_vec_growth(&mut parsed.outcomes, 1, budget) {
+                parsed.outcomes.push(PartResult {
+                    part: PartId::Unit(global_idx),
+                    outcome: PartOutcome::Unread(UnreadReason::HomeSetEarlier),
+                });
+                parsed.units.push(unit);
+                flush_remaining_raw(&mut raw_iter, parsed);
+                parsed.outcomes.push(PartResult {
+                    part: PartId::Unit(global_idx),
+                    outcome: PartOutcome::Exhausted(e.reason),
+                });
+                return Ok(());
+            }
             parsed.outcomes.push(PartResult {
                 part: PartId::Unit(global_idx),
                 outcome: PartOutcome::Unread(UnreadReason::HomeSetEarlier),
@@ -261,6 +300,19 @@ fn process_text_recursive(
         // (§4), HOME-modifying commands (§3), and optional P3 code-runner hook.
         if let Some(first) = unit.argv.first() {
             if first.has_unquoted_glob() {
+                if let Err(e) = charge_vec_growth(&mut parsed.outcomes, 1, budget) {
+                    parsed.outcomes.push(PartResult {
+                        part: PartId::Unit(global_idx),
+                        outcome: PartOutcome::Unread(UnreadReason::CommandWordGlob),
+                    });
+                    parsed.units.push(unit);
+                    flush_remaining_raw(&mut raw_iter, parsed);
+                    parsed.outcomes.push(PartResult {
+                        part: PartId::Unit(global_idx),
+                        outcome: PartOutcome::Exhausted(e.reason),
+                    });
+                    return Ok(());
+                }
                 parsed.outcomes.push(PartResult {
                     part: PartId::Unit(global_idx),
                     outcome: PartOutcome::Unread(UnreadReason::CommandWordGlob),
@@ -289,17 +341,57 @@ fn process_text_recursive(
                         match classify_nested_shell(&unit, &folded, spec, budget) {
                             Ok(NestedShellOutcome::ModeledScript(script)) => {
                                 if unit.depth >= limits::MAX_DEPTH {
+                                    if let Err(e) =
+                                        charge_vec_growth(&mut parsed.outcomes, 1, budget)
+                                    {
+                                        parsed.outcomes.push(PartResult {
+                                            part: PartId::Unit(global_idx),
+                                            outcome: PartOutcome::Unread(
+                                                UnreadReason::MaxNestingDepthReached,
+                                            ),
+                                        });
+                                        parsed.units.push(unit);
+                                        flush_remaining_raw(&mut raw_iter, parsed);
+                                        parsed.outcomes.push(PartResult {
+                                            part: PartId::Unit(global_idx),
+                                            outcome: PartOutcome::Exhausted(e.reason),
+                                        });
+                                        return Ok(());
+                                    }
                                     parsed.outcomes.push(PartResult {
                                         part: PartId::Unit(global_idx),
                                         outcome: PartOutcome::Unread(
                                             UnreadReason::MaxNestingDepthReached,
                                         ),
                                     });
-                                } else {
-                                    nested_scripts.push((global_idx, script, home_modified));
+                                } else if let Err(e) = vec_push_budgeted(
+                                    &mut nested_scripts,
+                                    (global_idx, script, home_modified),
+                                    budget,
+                                ) {
+                                    parsed.units.push(unit);
+                                    flush_remaining_raw(&mut raw_iter, parsed);
+                                    parsed.outcomes.push(PartResult {
+                                        part: PartId::Unit(global_idx),
+                                        outcome: PartOutcome::Exhausted(e.reason),
+                                    });
+                                    return Ok(());
                                 }
                             }
                             Ok(NestedShellOutcome::Unread(reason)) => {
+                                if let Err(e) = charge_vec_growth(&mut parsed.outcomes, 1, budget) {
+                                    parsed.outcomes.push(PartResult {
+                                        part: PartId::Unit(global_idx),
+                                        outcome: PartOutcome::Unread(reason),
+                                    });
+                                    parsed.units.push(unit);
+                                    flush_remaining_raw(&mut raw_iter, parsed);
+                                    parsed.outcomes.push(PartResult {
+                                        part: PartId::Unit(global_idx),
+                                        outcome: PartOutcome::Exhausted(e.reason),
+                                    });
+                                    return Ok(());
+                                }
                                 parsed.outcomes.push(PartResult {
                                     part: PartId::Unit(global_idx),
                                     outcome: PartOutcome::Unread(reason),
@@ -321,6 +413,19 @@ fn process_text_recursive(
                     && !out_entry.reason.starts_with("Wrapper")
                 {
                     // Shell outside §4's sh/bash/dash subset (`zsh`, `ksh`, `fish`, …).
+                    if let Err(e) = budget
+                        .charge(folded.len().max(1) as u64)
+                        .and_then(|()| budget.charge_alloc(folded.len()))
+                        .and_then(|()| charge_vec_growth(&mut parsed.outcomes, 1, budget))
+                    {
+                        parsed.units.push(unit);
+                        flush_remaining_raw(&mut raw_iter, parsed);
+                        parsed.outcomes.push(PartResult {
+                            part: PartId::Unit(global_idx),
+                            outcome: PartOutcome::Exhausted(e.reason),
+                        });
+                        return Ok(());
+                    }
                     parsed.outcomes.push(PartResult {
                         part: PartId::Unit(global_idx),
                         outcome: PartOutcome::Unread(UnreadReason::UnsupportedNestedShellForm {
@@ -333,6 +438,24 @@ fn process_text_recursive(
                 if let Some(hook) = code_runner_hook.as_deref_mut() {
                     match hook(&unit, &folded, budget) {
                         Ok(reasons) => {
+                            if !reasons.is_empty()
+                                && let Err(e) =
+                                    charge_vec_growth(&mut parsed.outcomes, reasons.len(), budget)
+                            {
+                                for r in reasons {
+                                    parsed.outcomes.push(PartResult {
+                                        part: PartId::Unit(global_idx),
+                                        outcome: PartOutcome::Unread(r),
+                                    });
+                                }
+                                parsed.units.push(unit);
+                                flush_remaining_raw(&mut raw_iter, parsed);
+                                parsed.outcomes.push(PartResult {
+                                    part: PartId::Unit(global_idx),
+                                    outcome: PartOutcome::Exhausted(e.reason),
+                                });
+                                return Ok(());
+                            }
                             for r in reasons {
                                 parsed.outcomes.push(PartResult {
                                     part: PartId::Unit(global_idx),
@@ -443,11 +566,7 @@ fn unwrap_unit_preserving(
                 && out.contract_section == "§4"
                 && out.reason.starts_with("Wrapper")
             {
-                unread = Some(if removed_wrappers.len() >= limits::MAX_WRAP {
-                    UnreadReason::MaxWrapReached
-                } else {
-                    UnreadReason::UnsupportedWrapperForm { wrapper: folded }
-                });
+                unread = Some(UnreadReason::UnsupportedWrapperForm { wrapper: folded });
             }
             break;
         };
@@ -456,23 +575,22 @@ fn unwrap_unit_preserving(
             break;
         };
 
-        if removed_wrappers.len() >= limits::MAX_WRAP {
-            unread = Some(UnreadReason::MaxWrapReached);
-            break;
-        }
-
         match parse_wrapper_prefix(kind, spec, &argv, budget) {
             Ok(Some(strip_count)) => {
-                if let Err(e) = budget.charge(strip_count as u64).and_then(|()| {
-                    budget.charge_alloc(
-                        std::mem::size_of::<RemovedWrapper>()
-                            + strip_count * std::mem::size_of::<Word>(),
-                    )
-                }) {
+                if let Err(e) = budget
+                    .charge(strip_count as u64)
+                    .and_then(|()| charge_vec_growth(&mut removed_wrappers, 1, budget))
+                    .and_then(|()| budget.charge_alloc(strip_count * std::mem::size_of::<Word>()))
+                {
                     return Err(finish_err(argv, removed_wrappers, raw.redirects, e));
                 }
                 let words: Vec<Word> = argv.drain(..strip_count).collect();
                 removed_wrappers.push(RemovedWrapper { kind, words });
+                // Reaching `MAX_WRAP` (8 removals) makes the unit Unread (§4).
+                if removed_wrappers.len() >= limits::MAX_WRAP {
+                    unread = Some(UnreadReason::MaxWrapReached);
+                    break;
+                }
             }
             Ok(None) => {
                 unread = Some(UnreadReason::UnsupportedWrapperForm { wrapper: folded });
@@ -690,6 +808,19 @@ enum NestedShellOutcome {
     Unread(UnreadReason),
 }
 
+fn unsupported_nested_shell(
+    folded_shell: &str,
+    budget: &mut ComputeBudget,
+) -> Result<NestedShellOutcome, Exhausted> {
+    budget.charge(folded_shell.len().max(1) as u64)?;
+    budget.charge_alloc(folded_shell.len())?;
+    Ok(NestedShellOutcome::Unread(
+        UnreadReason::UnsupportedNestedShellForm {
+            shell: folded_shell.to_string(),
+        },
+    ))
+}
+
 fn classify_nested_shell(
     unit: &CommandUnit,
     folded_shell: &str,
@@ -699,11 +830,7 @@ fn classify_nested_shell(
     let argv = &unit.argv;
     let Some(first_arg) = argv.get(1) else {
         // Stdin shell (`sh`, `bash`, `dash`).
-        return Ok(NestedShellOutcome::Unread(
-            UnreadReason::UnsupportedNestedShellForm {
-                shell: folded_shell.to_string(),
-            },
-        ));
+        return unsupported_nested_shell(folded_shell, budget);
     };
 
     let fb = first_arg.literal_bytes();
@@ -720,11 +847,7 @@ fn classify_nested_shell(
                 program_words: vec![cmd_s.to_string(), script_s.to_string()],
             }));
         }
-        return Ok(NestedShellOutcome::Unread(
-            UnreadReason::UnsupportedNestedShellForm {
-                shell: folded_shell.to_string(),
-            },
-        ));
+        return unsupported_nested_shell(folded_shell, budget);
     }
 
     // Modeled `-c` form: `NAME [-e|-u|-x]... -c SCRIPT` (nothing after SCRIPT).
@@ -734,54 +857,30 @@ fn classify_nested_shell(
         budget.charge(1)?;
         let wb = w.literal_bytes();
         if !wb.starts_with(b"-") || wb == b"-" || wb.starts_with(b"--") {
-            return Ok(NestedShellOutcome::Unread(
-                UnreadReason::UnsupportedNestedShellForm {
-                    shell: folded_shell.to_string(),
-                },
-            ));
+            return unsupported_nested_shell(folded_shell, budget);
         }
         let letters = &wb[1..];
         if letters.is_empty() {
-            return Ok(NestedShellOutcome::Unread(
-                UnreadReason::UnsupportedNestedShellForm {
-                    shell: folded_shell.to_string(),
-                },
-            ));
+            return unsupported_nested_shell(folded_shell, budget);
         }
         for (k, &lb) in letters.iter().enumerate() {
             if !lb.is_ascii() {
-                return Ok(NestedShellOutcome::Unread(
-                    UnreadReason::UnsupportedNestedShellForm {
-                        shell: folded_shell.to_string(),
-                    },
-                ));
+                return unsupported_nested_shell(folded_shell, budget);
             }
             let Some(fspec) = tools::flag_short(spec.flags(), lb as char) else {
-                return Ok(NestedShellOutcome::Unread(
-                    UnreadReason::UnsupportedNestedShellForm {
-                        shell: folded_shell.to_string(),
-                    },
-                ));
+                return unsupported_nested_shell(folded_shell, budget);
             };
             match fspec.kind {
                 FlagKind::Bool => {}
                 FlagKind::Value(ValueRole::Code) => {
                     // `-c` must be the final flag letter (`-ec` ok; `-ce` rejected).
                     if k + 1 != letters.len() {
-                        return Ok(NestedShellOutcome::Unread(
-                            UnreadReason::UnsupportedNestedShellForm {
-                                shell: folded_shell.to_string(),
-                            },
-                        ));
+                        return unsupported_nested_shell(folded_shell, budget);
                     }
                     saw_c = true;
                 }
                 _ => {
-                    return Ok(NestedShellOutcome::Unread(
-                        UnreadReason::UnsupportedNestedShellForm {
-                            shell: folded_shell.to_string(),
-                        },
-                    ));
+                    return unsupported_nested_shell(folded_shell, budget);
                 }
             }
         }
@@ -793,27 +892,15 @@ fn classify_nested_shell(
 
     // Must have `-c`, followed by EXACTLY ONE `SCRIPT` word and nothing after it.
     if !saw_c || j + 1 != argv.len() {
-        return Ok(NestedShellOutcome::Unread(
-            UnreadReason::UnsupportedNestedShellForm {
-                shell: folded_shell.to_string(),
-            },
-        ));
+        return unsupported_nested_shell(folded_shell, budget);
     }
 
     let script_word = &argv[j];
     if script_word.has_unquoted_glob() || script_word.starts_with_unquoted_tilde() {
-        return Ok(NestedShellOutcome::Unread(
-            UnreadReason::UnsupportedNestedShellForm {
-                shell: folded_shell.to_string(),
-            },
-        ));
+        return unsupported_nested_shell(folded_shell, budget);
     }
     let Some(script) = script_word.as_str() else {
-        return Ok(NestedShellOutcome::Unread(
-            UnreadReason::UnsupportedNestedShellForm {
-                shell: folded_shell.to_string(),
-            },
-        ));
+        return unsupported_nested_shell(folded_shell, budget);
     };
 
     budget.charge(script.len().max(1) as u64)?;
