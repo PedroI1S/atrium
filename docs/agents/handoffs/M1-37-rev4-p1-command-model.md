@@ -20,7 +20,7 @@
 - **Per-byte provenance (`v4/lex.rs`):** every decoded byte in `Word` records `ByteProvenance::{Unquoted, SingleQuoted, DoubleQuoted, Escaped}`. Bytes produced from quotes or escapes are never re-parsed as shell syntax.
 - **Unquoted bytes:**
   - Allowed: `A-Z a-z 0-9 _ . / , : @ % + -`, plus `=` only when not the word's first byte (leading `=` → `UnreadReason::UnquotedByteOutsideModel { byte: b'=' }` for zsh `=cmd`).
-  - Globs: `*`, `?`, and non-empty closed `[...]` without `!`, `^`, nested `[`, `/`, quotes, or non-ASCII (`[!…]` / `[^…]` → `NegatedGlobClass`; empty/unclosed/stray `]`/nested `[`/slash → `UnquotedByteOutsideModel`).
+  - Globs: `*`, `?`, and non-empty closed `[...]` without `!`, `^`, nested `[`, `/`, or non-ASCII (`[!…]` / `[^…]` → `NegatedGlobClass`; empty/unclosed/stray `]`/nested `[`/slash → `UnquotedByteOutsideModel`). Permitted §3 quotes and escapes inside `[...]` are processed while retaining class state and per-byte provenance.
   - `~`: allowed unquoted only as a word's first byte followed by `/` or end of word (`~user`, `~+`, `~-`, `~''` → `UnsupportedTildeForm`; non-leading unquoted `~` → `UnquotedByteOutsideModel { byte: b'~' }`).
   - Any other unquoted byte (`$`, `` ` ``, `{`, `}`, `#`, `!`, `^`, `(`, `)`, `&`, non-ASCII, control bytes, etc.) emits the precise `UnreadReason`.
 - **Quotes and escapes:**
@@ -38,7 +38,7 @@
   - Earlier units setting/clearing `HOME` (leading `HOME=` assignment, `export`/`declare`/`typeset`/`local`/`readonly`/`read` targeting `HOME`, `unset HOME`, `env` with `-i`/`-`/`-u HOME`/`-S`/`HOME=` including after `--`, `printf -v HOME`, including after leading assignments like `FOO=1 export HOME=/tmp`) mark later units (and child `-c` scripts) using an unquoted `~` in argv or redirects with `UnreadReason::HomeSetEarlier`.
 
 ### Contract §4: Command words, wrappers, nested shells, code-runner hook
-- **Command-word folding (`fold_command_word`):** takes the basename after the last `/`, applies Unicode `char::to_lowercase()` plus `FoldRules::{fold_long_s, fold_kelvin}` (`ſ` U+017F → `s`, `K` U+212A → `k`), with **no** Unicode normalization (NFC/NFD preserved verbatim).
+- **Command-word folding (`fold_command_word`):** takes the basename after the last `/`, applies string-level Unicode `str::to_lowercase()` (preserving contextual rules such as Greek final sigma `'ΟΣ'` → `"ος"`) plus `FoldRules::{fold_long_s, fold_kelvin}` (`ſ` U+017F → `s`, `K` U+212A → `k`), with budgeted pre-allocation and **no** Unicode normalization (NFC/NFD preserved verbatim).
 - **Command-word globs:** an unquoted glob in effective `argv[0]` emits `UnreadReason::CommandWordGlob` (not expanded as a wrapper or tool).
 - **Closed wrapper list (`unwrap_unit`):** reads wrapper specs and flags from P0's `policy::tools::{lookup, lookup_outside_model, flag}` without editing `tools.rs`. Strips only:
   - `command [--]`
@@ -47,7 +47,7 @@
   - `timeout [-s SIG] [-k D] D`
   - `time` (no options)
   - bare `env` (no options, no `=` assignments — even quoted)
-  - Bounded by `limits::MAX_WRAP` (8); a 9th wrapper (modeled or outside-model) emits `UnreadReason::MaxWrapReached` and stops immediately. Any other wrapper option/near miss or any of the 16 outside-model wrappers in `tools::OUTSIDE_MODEL` emits `UnreadReason::UnsupportedWrapperForm`.
+  - Bounded by `limits::MAX_WRAP` (8); reaching 8 wrapper removals (7 remain Clear, 8th triggers the limit) immediately emits `UnreadReason::MaxWrapReached` and stops (§4). Any other wrapper option/near miss or any of the 16 outside-model wrappers in `tools::OUTSIDE_MODEL` emits `UnreadReason::UnsupportedWrapperForm`.
 - **Nested shells (`v4/units.rs`):**
   - Modeled: only `sh`, `bash`, `dash` (`spec.nested_shell == true` in `tools.rs`) as `NAME [-e|-u|-x]... -c SCRIPT` (using `tools::flag_short(spec.flags, ...)`), with nothing after `SCRIPT` and no unquoted glob/tilde on `SCRIPT`. `SCRIPT` is lexed and built recursively up to `limits::MAX_DEPTH` (6), preserving `parent_unit`, `depth`, distinct `PipelineId`s, and inherited `HOME` state. Exceeding `MAX_DEPTH` emits `UnreadReason::MaxNestingDepthReached`.
   - Script files (`sh x.sh`, `bash ./build.sh arg1`, `dash run.sh`) emit `UnreadReason::Program { program_words: [argv[0], argv[1]] }` (Unread (program)).
@@ -96,15 +96,15 @@
 | `folded_shells_match_lowercase_verdicts` | **Kept (ported to P1 unit tests; P5 integrates full verdicts)** | `v4/lex/tests.rs` & `v4/units/tests.rs`: `/bin/BASH -c …`, `/bin/baſ​h -c …`, `/bin/Ksh -c …` fold to `bash`/`ksh`; `sh`/`bash`/`dash -c` recursively modeled, `ksh` → `UnsupportedNestedShellForm`, all derived in best-effort (§4, §10 row 3). |
 | `folded_wrappers_match_lowercase_verdicts` | **Kept with new expectation** | Modeled forms (`COMMAND`, `NICE`, `TIMEOUT 5`, `/usr/bin/ENV`) unwrap in exact model (§4); outside-model forms (`ENV -i`, `ENV -S`, `SCRIPT -c`, `ARCH`, `CHROOT`) → `UnsupportedWrapperForm` in exact model (§11 item 10), derived in best-effort (`v4/lex/tests.rs`, `v4/units/tests.rs`). |
 | `folded_interpreters_and_substitutions_match_lowercase` | **Kept (ported to best-effort tests; P3/P5 integrate)** | `$(/usr/bin/WHICH sudo) id`, `FIND -exec`, `EVAL`, `CRONTAB`, `echo 'sudo id' \| BASH` produce derived units in `lex_best_effort` (`v4/lex/tests.rs`); exact model marks substitutions/runners `Unread` (§3, §4, §11 item 1). |
-| `rule_matching_keeps_original_case` | **Deferred to P3/P5** | Exact `Word` retains original bytes/case (`CommandUnit::argv` is never mutated by folding); rule matching is P3/P5 (§6, §7). |
-| `ordinary_lines_with_capitals_keep_dev_verdicts` | **Kept (ported to P1; P5 integrates)** | Uppercase ordinary words lex cleanly with original bytes preserved (`v4/lex/tests.rs`). |
+| `rule_matching_keeps_original_case` | **Deferred to P3/P5** | Exact `Word` retains original bytes/case (`CommandUnit::argv` is never mutated by folding); rule matching is P3/P5 (§6, §7, §10 row 1, §11 "Unchanged on purpose: Home eligibility by the command word as written"). |
+| `ordinary_lines_with_capitals_keep_dev_verdicts` | **Kept (ported to P1; P5 integrates)** | Uppercase ordinary words lex cleanly with original bytes preserved (`v4/lex/tests.rs`; §10 row 1, §11 "Unchanged on purpose: Home eligibility by the command word as written"). |
 | `escalated_sudo_case_folding_needs_deny_flags_outside_owned_range` | **Kept (now un-ignored under rev 4)** | `SUDO id` and `/usr/bin/sudo id` fold to `"sudo"` in `fold_command_word` (`v4/lex/tests.rs`, `v4/units/tests.rs`, §10 row 3). |
 | `folded_deny_hard_denies_and_mixed_paths_match_lowercase` | **Kept (command folding in P1; path/deny integration in P2/P5)** | CR-19 command folding covered in `v4/lex/tests.rs`; path folding & hard-deny matching belong to P2/P5 (§5, §10 row 3). |
 | `k7_exact_shape_resolves_to_payload_verdicts` | **Kept with new expectation** | All `sh -c SCRIPT _ args…` forms become `Unread(UnsupportedNestedShellForm)` in exact mode (§4, §11 item 2), while best-effort still extracts `SCRIPT` (§10 row 4; `v4/units/tests.rs`). |
 | `k7_unquoted_expansion_asks_or_hard_denies_on_default_reading` | **Dropped (replaced by §10 row 4)** | K7 positional resolution removed (§4, §11 item 2, §12); `sh -c 'X="$1" sudo id' _ foo` covered in `v4/units/tests.rs` & `v4/lex/tests.rs`. |
 | `k7_unresolvable_positional_sh_c_fails_closed` | **Kept with new expectation** | Trailing operands after `-c SCRIPT` are `Unread(UnsupportedNestedShellForm)` (Ask in Home/rules, Allow\* under unscoped Any/FullAccess after best-effort; §2, §4, §11 items 1–2). |
-| `k7_here_document_body_is_still_checked` | **Kept (best-effort Scan 7)** | Here-doc bodies fed to shells are still extracted by `lex_best_effort` (`v4/lex/tests.rs`) and marked `ReservedWordOrConstruct { construct: "<<" }` in `lex_exact` (§2, §3). |
-| `k7_reading_size_is_bounded_before_allocation` | **Dropped (replaced by §8 budget tests)** | K7 builder removed (§12); pre-allocation budget charging verified in `v4/lex/tests.rs` & `v4/units/tests.rs` (§8). |
+| `k7_here_document_body_is_still_checked` | **Kept (best-effort Scan 7)** | Here-doc bodies fed to shells are still extracted by `lex_best_effort` (`v4/lex/tests.rs`) and marked `ReservedWordOrConstruct { construct: "<<" }` in `lex_exact` (§2, §3, §11 items 1–2). |
+| `k7_reading_size_is_bounded_before_allocation` | **Dropped (replaced by §8 budget tests)** | K7 builder removed (§12); pre-allocation budget charging verified in `v4/lex/tests.rs` & `v4/units/tests.rs` (§8, §11 "Unchanged on purpose: Unbounded work asks everywhere"). |
 | `k9_long_readable_env_matches_short_form` | **Dropped** | K9 parity explicitly removed (§4, §11 items 2 & 10, §12); any `env` with options/assignments is `Unread(UnsupportedWrapperForm)` (`v4/units/tests.rs`). |
 | `k9_genuinely_unbounded_env_still_fails_closed` | **Dropped (replaced by §4 & §8 tests)** | `env` with options is `Unread(UnsupportedWrapperForm)` (§4, §11 item 10), and padded lines hitting budget are `Exhausted` (`v4/units/tests.rs`, §8). |
 
@@ -121,8 +121,8 @@
 | Test | Disposition | Rev 4 expectation & contract citation |
 |---|---|---|
 | `review1_f6_full_i64_brace_range_does_not_panic` | **Kept (ported to `v4/lex/tests.rs`)** | `brace_expand_budgeted("{9223372036854775807..-9223372036854775808}")` returns `Ok(Some([literal]))` without overflow/panic; exact lexer marks `{` Unread (§3, §11 item 1). |
-| `review1_f7_nested_braces_are_linear` | **Kept (ported to `v4/lex/tests.rs`)** | `brace_expand_budgeted` on `{`×10,000 `x` `}`×10,000 charges linearly (`< 8 * len` units; §8). |
-| `review1_f10_brace_shortcut_does_not_refuse_dollar_words` | **Kept (ported to `v4/lex/tests.rs`)** | `$`-bearing words bypass the lower-bound shortcut: `{,$}`×9 hits `MAX_BRACE_RESULTS` → `Ok(None)`, `{,$}{a,b}` succeeds (`Ok(Some(...))`). |
+| `review1_f7_nested_braces_are_linear` | **Kept (ported to `v4/lex/tests.rs`)** | `brace_expand_budgeted` on `{`×10,000 `x` `}`×10,000 charges linearly (`< 8 * len` compute units, auxiliary stack/pair vectors budgeted before growth; §8, §11 item 1 & "Unchanged on purpose: Unbounded work asks everywhere"). |
+| `review1_f10_brace_shortcut_does_not_refuse_dollar_words` | **Kept (ported to `v4/lex/tests.rs`)** | `$`-bearing words bypass the naive lower-bound shortcut: `"{,$}".repeat(9)` succeeds with 89 bounded expansions (`Ok(Some(_))`, because `$` suppresses the immediately following `{`), preserving M1-31's FullAccess Allow (§2, §11 item 1); genuinely overflowing cases (`"{a,b}".repeat(9)` and `"{,$}".repeat(12)`) return `Ok(None)` (§11 "Unchanged on purpose: Unbounded work asks everywhere"). In exact lexing, unquoted `{` is `Unread` (§3, §11 items 1–2). |
 | Remaining tests in `M1-31-credential-folder-search.rs` (S8, K10, `Sensitive` cache, `grep -d`, `git -C`, `GlobBudget`) | **Not P1 (owned by P2 / dropped per §12)** | Handled by P2 (`M1-38-rev4-p2-paths`). |
 
 ---
@@ -193,6 +193,66 @@ Adapted P1 to P0's final D-141 interface (`a1f0174`), where `ToolSpec` carries `
 - **None.** `ToolSpec::{flags, wrapper, is_nested_shell}`, `ToolRowKind::CodeRunner`, `lookup`, `lookup_outside_model`, `lookup_unknown_by_design`, `flag`, and `flag_short` cover every P1 call site cleanly with no edits to `tools.rs`, `model.rs`, or `limits.rs`.
 
 ### Round 2 verification
+Run by worker (allowed under D-123):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
+
+Commands for the orchestrator's verification task (fish-compatible):
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4:: -- --nocapture
+cargo test --workspace --no-fail-fast
+```
+
+---
+
+## Round 3 (Review round 1 rework — all 9 findings)
+
+Addressed all 9 findings from `.orchestration/review-input/review-round1.md` plus the `sed -f -` heredoc documentation test gap and handoff disposition corrections. P0's frozen interface (`model.rs`, `limits.rs`, `tools.rs`) remains untouched.
+
+### Finding-by-finding fixes and regression tests
+1. **Finding 1 (Major — Exhaustion drops a fully scanned unit):**
+   - **Fix:** Charged unit metadata, output vector growth, and redirect-only reason allocation **before** `std::mem::replace(cur, ...)` in both `crates/atrium-core/src/policy/v4/lex.rs` (`flush_unit`) and `crates/atrium-core/src/policy/v4/lex/best_effort.rs` (`flush_builder`), so exhaustion leaves the pending unit intact for the recovery handler to preserve both its words and its `UnreadReason`s (§8).
+   - **Test:** `exhaustion_at_flush_preserves_pending_unit_words_and_reasons` in `crates/atrium-core/src/policy/v4/lex/tests.rs` (covers `lex_exact("sudo id", 0, None, &mut ComputeBudget::new(16, 10_000))`, `lex_exact("sudo $id", ...)` preserving `UnquotedByteOutsideModel`, allocation exhaustion at `flush_unit`, and `lex_best_effort_into(&["sudo id"], ...)` at `flush_builder`).
+2. **Finding 2 (Major — Significant allocations bypass the shared budget):**
+   - **Fix:** Added shared budgeted collection helpers (`charge_vec_growth`, `vec_push_budgeted`, `vec_extend_budgeted`, `vec_with_capacity_budgeted`, `charge_string_growth`) in `crates/atrium-core/src/policy/v4/lex.rs` and audited all three owned runtime files:
+     - `crates/atrium-core/src/policy/v4/lex/best_effort.rs`: charged all auxiliary vectors/stacks in `brace_expand_budgeted`, `brace_sequence`, and `brace_results_lower_bound` (rewritten in O(n) open-order without sorting), charged cold `BE_LEX_MEMO` insertion copies (skipping optional cache insertion when unaffordable), accounted for `Vec<String>` / redirect headers in `estimate_unit_bytes`, and budgeted `raw_to_record_idx`, `raw_units`, `heredocs`, `heredoc_owners`, `bodies`, `cur.*`, `deferred_payloads`, `pipeline_units`, `checked_pipes`, `all_alt`, `find_execs`, and `record.units`/`raw_texts` growth.
+     - `crates/atrium-core/src/policy/v4/lex.rs`: charged `cur.argv`, `cur.redirects`, `cur.unreads`, `heredocs`, `delim`, `out.units`, `out.outcomes`, and unread reason strings before allocating them.
+     - `crates/atrium-core/src/policy/v4/units.rs`: eliminated the uncharged `local_to_global` vector via arithmetic offset (`UnitIndex(base_idx + i)`), charged `parsed.units` / `parsed.outcomes` / `nested_scripts` / `removed_wrappers` growth, and charged `UnsupportedNestedShellForm` string copies before allocating.
+   - **Test:** `auxiliary_allocations_and_cold_memo_copies_are_budgeted` in `crates/atrium-core/src/policy/v4/lex/tests.rs` (verifies `"{" × 10000 + "x" + "}" × 10000` with `ComputeBudget::new(1_000_000, 200_100)` returns `Err(Exhausted { reason: AllocationBudget })`, verifies full auxiliary charge under default limits, and verifies cold memo copy budgeting and unaffordable-skip without exhaustion).
+3. **Finding 3 (Major — `MAX_WRAP` enforced one wrapper too late):**
+   - **Fix:** In `crates/atrium-core/src/policy/v4/units.rs` (`unwrap_unit_preserving`), check `removed_wrappers.len() >= limits::MAX_WRAP` immediately after pushing each stripped wrapper so reaching 8 removals emits `UnreadReason::MaxWrapReached` and stops (§4).
+   - **Test:** Updated `unwrap_unit_max_wrap_boundary` in `crates/atrium-core/src/policy/v4/units/tests.rs` to assert 7 wrappers (`MAX_WRAP - 1`) stay Clear while reaching 8 wrappers (`"command " × 8 + "cat a"`) and 9 wrappers emit `MaxWrapReached` (tested via both `unwrap_unit` and `build_units`).
+4. **Finding 4 (Major — Cached units reuse pipeline IDs from separate pipelines):**
+   - **Fix:** In `crates/atrium-core/src/policy/v4/lex/best_effort.rs`, both `BE_LEX_MEMO` and the per-call recursion cache (`state.cache`) normalize stored `PipelineId`s to 0-based relative offsets alongside `pipe_count`, and both cache-hit paths assign fresh `PipelineId`s offset from `state.next_pipe_id` and advance `state.next_pipe_id` by `pipe_count` (§2).
+   - **Test:** `cached_best_effort_hits_assign_fresh_pipeline_ids` in `crates/atrium-core/src/policy/v4/lex/tests.rs` (covers warming `BE_LEX_MEMO` with `curl x | cat` then lexing `["curl x | cat", "echo ok | sh"]`, duplicate cached texts, repeated cached nested scripts containing pipelines via `state.cache`, and cold/warm multi-text equivalence).
+5. **Finding 5 (Minor — Command folding differs from P0's Unicode lowercase rule):**
+   - **Fix:** Updated `fold_command_bytes` in `crates/atrium-core/src/policy/v4/lex.rs` to use string-level `str::to_lowercase()` (preserving contextual Greek final sigma `'ΟΣ'` → `"ος"`) with budgeted pre-allocation, `FoldRules::{fold_long_s, fold_kelvin}` support, and zero Unicode normalization (§4).
+   - **Test:** Extended `fold_command_word_cr19_rules_and_no_unicode_normalization` in `crates/atrium-core/src/policy/v4/lex/tests.rs` with `'ΟΣ'` → `"ος"`, medial vs final sigma, `FoldRules` interactions, and Unicode allocation-budget exhaustion.
+6. **Finding 6 (Minor — Valid quoting inside a glob class is rejected):**
+   - **Fix:** Factored single-quote, double-quote, and unquoted-escape scanning helpers in `crates/atrium-core/src/policy/v4/lex.rs` and used them inside the `[...]` class loop so permitted §3 quotes and escapes inside a glob class preserve class state (`class_len`, closing unquoted `]`, `!`/`^` negation check) and per-byte provenance (§3).
+   - **Test:** `lex_exact_allows_permitted_quotes_and_escapes_inside_glob_class` in `crates/atrium-core/src/policy/v4/lex/tests.rs` (covers `cat /usr/bi[n'n']`, double quotes, permitted escapes, escaped `\]`, and disallowed/negated/empty/unclosed class cases).
+7. **Finding 7 (Minor — Empty quotes lose their effect on keyword recognition):**
+   - **Fix:** Retained token-level `contained_quoting` and `is_unquoted_assignment` flags on `ReadWordOutcome` in `crates/atrium-core/src/policy/v4/lex.rs`, using them for reserved-word recognition, leading assignment recognition (suppressing `''FOO=1` / `FOO''=1` while keeping `FOO=''`), and plain-unquoted `n>&-` close targets (§3).
+   - **Test:** `lex_exact_empty_quotes_suppress_keywords_and_assignments` in `crates/atrium-core/src/policy/v4/lex/tests.rs` (covers `''if foo`, `""if foo`, `if'' foo`, empty-quoted assignment names vs value-quoted assignments, and `2>&''-`).
+8. **Finding 8 (Minor — Brace failure is a test defect):**
+   - **Fix:** Updated `brace_expand_budgeted_carries_m1_31_n11_guarantees` in `crates/atrium-core/src/policy/v4/lex/tests.rs` to expect `Ok(Some(expanded))` with 89 bounded results for `"{,$}".repeat(9)` (preserving M1-31 review-1 finding 10), while adding separate genuinely overflowing cases (`"{a,b}".repeat(9)` and `"{,$}".repeat(12)` → `Ok(None)`). Corrected the N11 disposition in §2 above and added §10/§11 citations across all retained entries.
+9. **Finding 9 (Minor — Linearity failure is a test defect):**
+   - **Fix:** Updated `linear_charge_growth_from_10kb_to_max_bytes` in `crates/atrium-core/src/policy/v4/lex/tests.rs` (and `build_units_and_unwrap_unit_budget_exhaustion_and_linearity` in `crates/atrium-core/src/policy/v4/units/tests.rs`) to measure both compute **and allocation** scaling under explicit generous budgets, and separately assert that `adv_large` returns `Exhausted(AllocationBudget)` under P0's frozen default limits while preserving earlier units found before exhaustion.
+10. **Test gap (`sed -f -` / `sed --file=-` heredoc documentation):**
+    - **Test:** Added `lex_best_effort_sed_stdin_script_heredoc_limit_matches_dev` in `crates/atrium-core/src/policy/v4/lex/tests.rs` documenting that Scan 7 intentionally omits `sed` (`ConditionalRunner`) heredoc bodies (matching `dev`, while `lex_exact` still marks `<<` as `Unread`).
+
+### Corrected dispositions
+- `review1_f10_brace_shortcut_does_not_refuse_dollar_words` (§2 table above): corrected to reflect `"{,$}".repeat(9)` returning `Ok(Some(_))` (89 results, FullAccess Allow; §2, §11 item 1) and genuinely overflowing inputs returning `Ok(None)` (§11 "Unchanged on purpose: Unbounded work asks everywhere").
+- Added missing §10/§11 citations to `rule_matching_keeps_original_case`, `ordinary_lines_with_capitals_keep_dev_verdicts`, `k7_here_document_body_is_still_checked`, `k7_reading_size_is_bounded_before_allocation`, and `review1_f7_nested_braces_are_linear`.
+- Corrected §1 `MAX_WRAP`, glob-class quoting, and Unicode `str::to_lowercase()` descriptions above.
+
+### Change requests against P0's interface
+- **None.**
+
+### Round 3 verification
 Run by worker (allowed under D-123):
 - `cargo fmt --all` — clean
 - `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
