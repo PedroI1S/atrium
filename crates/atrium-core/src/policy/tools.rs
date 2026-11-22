@@ -5925,4 +5925,1004 @@ mod tests {
             "docs/contracts/m1-policy-rev4-tools.md is out of date; regenerate with: env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Round 3 integrity tests (Rules A, B/C, D, F) and finding fixtures
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_flag_declares_explicit_effect_or_none_reason() {
+        let check_flags = |context: &str, flags: &[FlagSpec]| {
+            for f in flags {
+                let flag_name = match (f.short, f.long) {
+                    (Some(s), Some(l)) => format!("-{s}/--{l}"),
+                    (Some(s), None) => format!("-{s}"),
+                    (None, Some(l)) => format!("--{l}"),
+                    (None, None) => "<unnamed>".to_string(),
+                };
+                match f.effect {
+                    Effect::None { reason } => {
+                        assert!(
+                            !reason.trim().is_empty(),
+                            "{context} {flag_name}: Effect::None must provide a non-empty reason"
+                        );
+                    }
+                    Effect::Applied(e) => {
+                        assert!(
+                            e.has_any_effect(),
+                            "{context} {flag_name}: Effect::Applied must declare at least one effect (or use Effect::None with a reason)"
+                        );
+                    }
+                }
+                let eff = f.effects();
+                if matches!(
+                    f.kind,
+                    FlagKind::Value(
+                        ValueRole::Path | ValueRole::DestinationRoot | ValueRole::ProgramFile
+                    ) | FlagKind::OptionalValue(
+                        ValueRole::Path | ValueRole::DestinationRoot | ValueRole::ProgramFile
+                    )
+                ) {
+                    assert!(
+                        eff.value_access.is_some(),
+                        "{context} {flag_name}: path/destination/program-file value flag must declare FlagValueAccess"
+                    );
+                }
+                if eff.filter.is_some() {
+                    assert_eq!(
+                        f.kind,
+                        FlagKind::Value(ValueRole::Pattern),
+                        "{context} {flag_name}: modeled filter flag must take Value(Pattern)"
+                    );
+                    assert!(
+                        eff.unread.is_none(),
+                        "{context} {flag_name}: modeled filter flag must not also set unread"
+                    );
+                }
+                if eff.writes == FlagToggle::Enable
+                    && matches!(
+                        f.kind,
+                        FlagKind::Value(ValueRole::Path | ValueRole::DestinationRoot)
+                    )
+                {
+                    assert!(
+                        matches!(
+                            eff.value_access,
+                            Some(FlagValueAccess::Write | FlagValueAccess::WriteWhenWriting)
+                        ),
+                        "{context} {flag_name}: writing path flag must set Write or WriteWhenWriting value_access"
+                    );
+                }
+            }
+        };
+
+        for t in TOOLS {
+            check_flags(t.name, t.flags);
+            for s in t.subcommands {
+                check_flags(&format!("{} {}", t.name, s.name), s.flags);
+            }
+        }
+    }
+
+    #[test]
+    fn any_except_forbidden_restricted_to_home_readonly() {
+        for t in TOOLS {
+            if t.flag_mode == FlagMode::AnyExceptForbidden {
+                assert!(
+                    t.home_readonly.is_some(),
+                    "`{}` uses AnyExceptForbidden outside HOME_READONLY_COMMANDS (Rule B/C)",
+                    t.name
+                );
+                assert!(
+                    !matches!(t.name, "rg" | "grep"),
+                    "`{}` has a complete dev flag table and must use ListedOnly",
+                    t.name
+                );
+            } else if t.home_readonly.is_some() {
+                assert!(
+                    matches!(t.name, "rg" | "grep"),
+                    "Home read-only tool `{}` without complete dev flag table must use AnyExceptForbidden",
+                    t.name
+                );
+            }
+            for s in t.subcommands {
+                if s.flag_mode == FlagMode::AnyExceptForbidden {
+                    assert!(
+                        s.home_readonly.is_some(),
+                        "`{} {}` uses AnyExceptForbidden outside HOME_READONLY_COMMANDS (Rule B/C)",
+                        t.name,
+                        s.name
+                    );
+                } else {
+                    assert!(
+                        s.home_readonly.is_none(),
+                        "Home read-only subcommand `{} {}` must use AnyExceptForbidden",
+                        t.name,
+                        s.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flag_program_files_have_pin_and_cite_item_8() {
+        let check_row = |label: &str, flags: &[FlagSpec], changes_default: Option<&'static str>| {
+            for f in flags {
+                let eff = f.effects();
+                let is_prog_kind = matches!(
+                    f.kind,
+                    FlagKind::Value(ValueRole::ProgramFile)
+                        | FlagKind::OptionalValue(ValueRole::ProgramFile)
+                );
+                if is_prog_kind || eff.runs_program.is_some() {
+                    assert_eq!(
+                        f.kind,
+                        FlagKind::Value(ValueRole::ProgramFile),
+                        "{label}: runs_program flag must take Value(ProgramFile)"
+                    );
+                    assert!(
+                        eff.runs_program.is_some_and(|p| p != ProgramPin::None),
+                        "{label}: ProgramFile flag must declare a non-None ProgramPin (Rule D)"
+                    );
+                    assert!(
+                        !eff.runs_code,
+                        "{label}: ProgramFile flag must not set runs_code (must remain pinnable Unread(program), not inline code)"
+                    );
+                    assert_eq!(
+                        eff.value_access,
+                        Some(FlagValueAccess::Read),
+                        "{label}: ProgramFile flag must read its script file for hard-deny checks"
+                    );
+                    assert!(
+                        changes_default.is_some_and(|cd| cd.contains("§11 item 8")),
+                        "{label}: row with ProgramFile flag must cite §11 item 8 (Rule D)"
+                    );
+                }
+            }
+        };
+        for t in TOOLS {
+            check_row(t.name, t.flags, t.changes_default);
+            for s in t.subcommands {
+                check_row(
+                    &format!("{} {}", t.name, s.name),
+                    s.flags,
+                    s.changes_default,
+                );
+            }
+        }
+    }
+
+    /// Test-only simulation of P3's table consumption for fixture tests covering
+    /// operand access, global filter toggles, unsupported filter/base-dir flags,
+    /// long-option writing abbreviations, and flag-held program pinning.
+    #[derive(Debug, Default)]
+    struct SimulatedUnit {
+        unread: Vec<UnreadReason>,
+        writes: bool,
+        candidate_paths: Vec<(String, super::super::model::AccessMode)>,
+        filters: Vec<(FilterDialect, String, bool)>,
+        program_pin: Option<Vec<String>>,
+        inline_code: bool,
+    }
+
+    fn simulate_table(argv: &[&str]) -> SimulatedUnit {
+        use super::super::model::AccessMode;
+
+        let mut out = SimulatedUnit::default();
+        let Some(&cmd) = argv.first() else {
+            return out;
+        };
+        if lookup_outside_model(cmd).is_some() {
+            out.unread.push(UnreadReason::OutsideToolModel {
+                tool: cmd.to_string(),
+            });
+            return out;
+        }
+        let Some(tool) = lookup(cmd) else {
+            // Unknown tool: every arg is conservative ReadWrite, possible writer (§4).
+            out.writes = true;
+            for &w in &argv[1..] {
+                out.candidate_paths
+                    .push((w.to_string(), AccessMode::ReadWrite));
+            }
+            return out;
+        };
+
+        // For multi-subcommand tools (e.g. `git`), scan top-level global flags
+        // before the subcommand first.
+        let mut idx = 1usize;
+        let mut sub_spec: Option<&'static SubcommandSpec> = None;
+        if !tool.subcommands.is_empty() {
+            while idx < argv.len() {
+                let tok = argv[idx];
+                if !tok.starts_with('-') || tok == "-" {
+                    sub_spec = subcommand(tool, tok);
+                    idx += 1;
+                    break;
+                }
+                idx += 1;
+                if let Some(rest) = tok.strip_prefix("--") {
+                    let (name, eq_val) = match rest.split_once('=') {
+                        Some((n, v)) => (n, Some(v)),
+                        None => (rest, None),
+                    };
+                    if let Some(spec) = flag_long_or_writing_abbrev(tool.flags, name) {
+                        let eff = spec.effects();
+                        let val = match (spec.kind, eq_val) {
+                            (FlagKind::Value(_), Some(v)) => Some(v),
+                            (FlagKind::Value(_), None) => {
+                                let v = argv.get(idx).copied();
+                                if v.is_some() {
+                                    idx += 1;
+                                }
+                                v
+                            }
+                            _ => None,
+                        };
+                        if let (Some(v), Some(acc)) = (val, eff.value_access) {
+                            let mode = match acc {
+                                FlagValueAccess::Read => AccessMode::Read,
+                                FlagValueAccess::Write | FlagValueAccess::WriteWhenWriting => {
+                                    AccessMode::Write
+                                }
+                            };
+                            out.candidate_paths.push((v.to_string(), mode));
+                        }
+                        if eff.runs_code {
+                            out.inline_code = true;
+                            out.unread.push(UnreadReason::CodeRunnerInlineCode {
+                                tool: cmd.to_string(),
+                            });
+                        }
+                        if let Some(u) = eff.unread {
+                            out.unread
+                                .push(u.into_unread_reason(cmd, &format!("--{name}")));
+                        }
+                    } else {
+                        out.unread.push(UnreadReason::UnknownFlag {
+                            tool: cmd.to_string(),
+                            flag: tok.to_string(),
+                        });
+                    }
+                } else {
+                    let ch = tok.chars().nth(1).unwrap_or('?');
+                    if let Some(spec) = flag_short(tool.flags, ch) {
+                        let eff = spec.effects();
+                        let val = if matches!(spec.kind, FlagKind::Value(_)) {
+                            if tok.len() > 2 {
+                                Some(&tok[2..])
+                            } else {
+                                let v = argv.get(idx).copied();
+                                if v.is_some() {
+                                    idx += 1;
+                                }
+                                v
+                            }
+                        } else {
+                            None
+                        };
+                        if let (Some(v), Some(acc)) = (val, eff.value_access) {
+                            let mode = match acc {
+                                FlagValueAccess::Read => AccessMode::Read,
+                                FlagValueAccess::Write | FlagValueAccess::WriteWhenWriting => {
+                                    AccessMode::Write
+                                }
+                            };
+                            out.candidate_paths.push((v.to_string(), mode));
+                        }
+                        if eff.runs_code {
+                            out.inline_code = true;
+                            out.unread.push(UnreadReason::CodeRunnerInlineCode {
+                                tool: cmd.to_string(),
+                            });
+                        }
+                        if let Some(u) = eff.unread {
+                            out.unread
+                                .push(u.into_unread_reason(cmd, &format!("-{ch}")));
+                        }
+                    } else {
+                        out.unread.push(UnreadReason::UnknownFlag {
+                            tool: cmd.to_string(),
+                            flag: tok.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let (flag_mode, single_dash, flags, layout, access_mode, write_behavior, code_runner) =
+            match sub_spec {
+                Some(s) => (
+                    s.flag_mode,
+                    false,
+                    s.flags,
+                    s.operands,
+                    s.operand_access,
+                    s.writes,
+                    s.code_runner,
+                ),
+                None => (
+                    tool.flag_mode,
+                    tool.single_dash_long,
+                    tool.flags,
+                    tool.operands,
+                    tool.operand_access,
+                    tool.writes,
+                    tool.code_runner,
+                ),
+            };
+
+        let mut writes_toggle = FlagToggle::Unchanged;
+        let mut provides_pattern = false;
+        let mut provides_script = false;
+        let mut positional_role_override: Option<ValueRole> = None;
+        let mut global_filter_ci = false;
+        let mut raw_filters: Vec<(FilterSpec, String)> = Vec::new();
+        let mut scripts: Vec<String> = Vec::new();
+        let mut deferred_val_paths: Vec<(String, FlagValueAccess)> = Vec::new();
+        let mut positional: Vec<(String, bool)> = Vec::new();
+        let mut conservative_unlisted = false;
+
+        let mut dd = false;
+        let args = &argv[idx..];
+        let mut i = 0usize;
+        while i < args.len() {
+            let tok = args[i];
+            i += 1;
+            if dd || !tok.starts_with('-') || tok == "-" {
+                positional.push((tok.to_string(), dd));
+                continue;
+            }
+            if tok == "--" {
+                dd = true;
+                continue;
+            }
+            let apply_spec =
+                |spec: &'static FlagSpec,
+                 flag_label: String,
+                 val: Option<&str>,
+                 out: &mut SimulatedUnit,
+                 writes_toggle: &mut FlagToggle,
+                 provides_pattern: &mut bool,
+                 provides_script: &mut bool,
+                 positional_role_override: &mut Option<ValueRole>,
+                 global_filter_ci: &mut bool,
+                 raw_filters: &mut Vec<(FilterSpec, String)>,
+                 scripts: &mut Vec<String>,
+                 deferred_val_paths: &mut Vec<(String, FlagValueAccess)>| {
+                    let eff = spec.effects();
+                    if eff.writes != FlagToggle::Unchanged {
+                        *writes_toggle = eff.writes;
+                    }
+                    *provides_pattern |= eff.provides_pattern;
+                    *provides_script |= eff.provides_script;
+                    if let Some(r) = eff.positional_role {
+                        *positional_role_override = Some(r);
+                    }
+                    *global_filter_ci = eff.filter_case_insensitive.apply(*global_filter_ci);
+                    if let (Some(v), Some(acc)) = (val, eff.value_access) {
+                        deferred_val_paths.push((v.to_string(), acc));
+                    }
+                    if let (Some(v), Some(fs)) = (val, eff.filter) {
+                        raw_filters.push((fs, v.to_string()));
+                    }
+                    if eff.provides_script
+                        && matches!(spec.kind, FlagKind::Value(ValueRole::Code))
+                        && let Some(v) = val
+                    {
+                        scripts.push(v.to_string());
+                    }
+                    if eff.runs_code {
+                        out.inline_code = true;
+                        out.unread.push(UnreadReason::CodeRunnerInlineCode {
+                            tool: cmd.to_string(),
+                        });
+                    }
+                    if let (Some(ProgramPin::FlagValue), Some(v)) = (eff.runs_program, val) {
+                        let words = vec![cmd.to_string(), flag_label.clone(), v.to_string()];
+                        out.program_pin = Some(words.clone());
+                        out.unread.push(UnreadReason::Program {
+                            program_words: words,
+                        });
+                    }
+                    if let Some(u) = eff.unread {
+                        out.unread.push(u.into_unread_reason(cmd, &flag_label));
+                    }
+                };
+
+            if single_dash {
+                let rest = &tok[1..];
+                let spec = if rest.chars().count() == 1 {
+                    flag_short(flags, rest.chars().next().unwrap())
+                } else {
+                    flag_long(flags, rest)
+                };
+                if let Some(spec) = spec {
+                    let val = if matches!(spec.kind, FlagKind::Value(_)) {
+                        let v = args.get(i).copied();
+                        if v.is_some() {
+                            i += 1;
+                        }
+                        v
+                    } else {
+                        None
+                    };
+                    apply_spec(
+                        spec,
+                        tok.to_string(),
+                        val,
+                        &mut out,
+                        &mut writes_toggle,
+                        &mut provides_pattern,
+                        &mut provides_script,
+                        &mut positional_role_override,
+                        &mut global_filter_ci,
+                        &mut raw_filters,
+                        &mut scripts,
+                        &mut deferred_val_paths,
+                    );
+                } else {
+                    conservative_unlisted = true;
+                    if flag_mode == FlagMode::ListedOnly {
+                        out.unread.push(UnreadReason::UnknownFlag {
+                            tool: cmd.to_string(),
+                            flag: tok.to_string(),
+                        });
+                    }
+                }
+            } else if let Some(rest) = tok.strip_prefix("--") {
+                let (name, eq_val) = match rest.split_once('=') {
+                    Some((n, v)) => (n, Some(v)),
+                    None => (rest, None),
+                };
+                if let Some(spec) = flag_long_or_writing_abbrev(flags, name) {
+                    let val = match (spec.kind, eq_val) {
+                        (FlagKind::Value(_), Some(v)) => Some(v),
+                        (FlagKind::Value(_), None) => {
+                            let v = args.get(i).copied();
+                            if v.is_some() {
+                                i += 1;
+                            }
+                            v
+                        }
+                        (FlagKind::OptionalValue(_), Some(v)) => Some(v),
+                        _ => None,
+                    };
+                    apply_spec(
+                        spec,
+                        format!("--{name}"),
+                        val,
+                        &mut out,
+                        &mut writes_toggle,
+                        &mut provides_pattern,
+                        &mut provides_script,
+                        &mut positional_role_override,
+                        &mut global_filter_ci,
+                        &mut raw_filters,
+                        &mut scripts,
+                        &mut deferred_val_paths,
+                    );
+                } else {
+                    conservative_unlisted = true;
+                    if let Some(v) = eq_val {
+                        out.candidate_paths
+                            .push((v.to_string(), AccessMode::ReadWrite));
+                    }
+                    if flag_mode == FlagMode::ListedOnly {
+                        out.unread.push(UnreadReason::UnknownFlag {
+                            tool: cmd.to_string(),
+                            flag: tok.to_string(),
+                        });
+                    }
+                }
+            } else {
+                let chars: Vec<char> = tok[1..].chars().collect();
+                for (k, &c) in chars.iter().enumerate() {
+                    if let Some(spec) = flag_short(flags, c) {
+                        let val = if matches!(spec.kind, FlagKind::Value(_)) {
+                            if k + 1 < chars.len() {
+                                let attached: String = chars[k + 1..].iter().collect();
+                                // Attached short-flag value (handled directly via owned string below).
+                                apply_spec(
+                                    spec,
+                                    format!("-{c}"),
+                                    Some(&attached),
+                                    &mut out,
+                                    &mut writes_toggle,
+                                    &mut provides_pattern,
+                                    &mut provides_script,
+                                    &mut positional_role_override,
+                                    &mut global_filter_ci,
+                                    &mut raw_filters,
+                                    &mut scripts,
+                                    &mut deferred_val_paths,
+                                );
+                                break;
+                            } else {
+                                let v = args.get(i).copied();
+                                if v.is_some() {
+                                    i += 1;
+                                }
+                                v
+                            }
+                        } else {
+                            None
+                        };
+                        apply_spec(
+                            spec,
+                            format!("-{c}"),
+                            val,
+                            &mut out,
+                            &mut writes_toggle,
+                            &mut provides_pattern,
+                            &mut provides_script,
+                            &mut positional_role_override,
+                            &mut global_filter_ci,
+                            &mut raw_filters,
+                            &mut scripts,
+                            &mut deferred_val_paths,
+                        );
+                        if matches!(spec.kind, FlagKind::Value(_)) {
+                            break;
+                        }
+                    } else {
+                        conservative_unlisted = true;
+                        if flag_mode == FlagMode::ListedOnly {
+                            out.unread.push(UnreadReason::UnknownFlag {
+                                tool: cmd.to_string(),
+                                flag: format!("-{c}"),
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Compute final write state.
+        out.writes = match write_behavior {
+            WriteBehavior::Never => false,
+            WriteBehavior::Always => true,
+            WriteBehavior::WithFlag => writes_toggle == FlagToggle::Enable,
+            WriteBehavior::WithOperandCount(n) => positional.len() >= n,
+            WriteBehavior::WithFlagOrOperandCount(n) => match writes_toggle {
+                FlagToggle::Enable => true,
+                FlagToggle::Disable => false,
+                FlagToggle::Unchanged => positional.len() >= n,
+            },
+        };
+
+        // Resolve deferred flag value paths with final `out.writes`.
+        for (p, acc) in deferred_val_paths {
+            let mode = match acc {
+                FlagValueAccess::Read => AccessMode::Read,
+                FlagValueAccess::Write => AccessMode::Write,
+                FlagValueAccess::WriteWhenWriting => {
+                    if out.writes {
+                        AccessMode::Write
+                    } else {
+                        AccessMode::Read
+                    }
+                }
+            };
+            out.candidate_paths.push((p, mode));
+        }
+
+        // Apply final global filter case-insensitivity toggle to every filter (Rule E).
+        if raw_filters.len() > 1 {
+            out.unread.push(UnreadReason::UnsupportedFilterForm);
+        }
+        for (fs, pat) in raw_filters {
+            if fs.dialect == FilterDialect::RgGlob && pat.starts_with('!') {
+                out.unread.push(UnreadReason::UnsupportedFilterForm);
+            }
+            let ci = match fs.case {
+                FilterCase::AlwaysSensitive => false,
+                FilterCase::AlwaysInsensitive => true,
+                FilterCase::FollowGlobalToggle => global_filter_ci,
+            };
+            out.filters.push((fs.dialect, pat, ci));
+        }
+
+        // Assign positional operand roles and access modes.
+        let skip_first_positional = (provides_pattern
+            && layout.positional.first() == Some(&ValueRole::Pattern))
+            || (provides_script && layout.positional.first() == Some(&ValueRole::Code));
+        let eff_positional_start = usize::from(skip_first_positional);
+        let n_pos = positional.len();
+        for (pos_idx, (word, after_dd)) in positional.iter().enumerate() {
+            let role = if *after_dd && let Some(r) = layout.after_double_dash {
+                r
+            } else if let Some(r) = positional_role_override {
+                r
+            } else if pos_idx + 1 == n_pos
+                && n_pos >= 2
+                && let Some(r) = layout.last
+            {
+                r
+            } else if let Some(&r) = layout.positional.get(pos_idx + eff_positional_start) {
+                r
+            } else {
+                layout.rest.unwrap_or(ValueRole::Path)
+            };
+
+            if role == ValueRole::Code {
+                scripts.push(word.clone());
+            }
+
+            if conservative_unlisted {
+                if !matches!(
+                    role,
+                    ValueRole::Pattern
+                        | ValueRole::Text
+                        | ValueRole::Ref
+                        | ValueRole::ArchiveMember
+                ) {
+                    out.candidate_paths
+                        .push((word.clone(), AccessMode::ReadWrite));
+                }
+            } else if matches!(
+                role,
+                ValueRole::Path | ValueRole::DestinationRoot | ValueRole::ProgramFile
+            ) {
+                let mode = match access_mode {
+                    OperandAccessMode::AllRead => AccessMode::Read,
+                    OperandAccessMode::AllWrite => AccessMode::Write,
+                    OperandAccessMode::AllWriteWhenWriting => {
+                        if out.writes {
+                            AccessMode::Write
+                        } else {
+                            AccessMode::Read
+                        }
+                    }
+                    OperandAccessMode::SourcesReadLastWrite => {
+                        if role == ValueRole::DestinationRoot
+                            || (pos_idx + 1 == n_pos && n_pos >= 2)
+                        {
+                            AccessMode::Write
+                        } else {
+                            AccessMode::Read
+                        }
+                    }
+                    OperandAccessMode::FlagOnlyWrite => AccessMode::Read,
+                };
+                out.candidate_paths.push((word.clone(), mode));
+            }
+        }
+
+        // Check inline code execution for `ScriptCommands` (sed) and `ProgramOrInline { pin: FlagValue }` (awk).
+        match code_runner {
+            CodeRunnerBehavior::ScriptCommands(triggers) => {
+                if scripts
+                    .iter()
+                    .any(|s| s.chars().any(|c| triggers.contains(&c)))
+                {
+                    out.inline_code = true;
+                    out.unread.push(UnreadReason::CodeRunnerInlineCode {
+                        tool: cmd.to_string(),
+                    });
+                }
+            }
+            CodeRunnerBehavior::ProgramOrInline {
+                pin: ProgramPin::FlagValue,
+            } if !provides_script && !scripts.is_empty() => {
+                out.inline_code = true;
+                out.unread.push(UnreadReason::CodeRunnerInlineCode {
+                    tool: cmd.to_string(),
+                });
+            }
+            _ => {}
+        }
+
+        out
+    }
+
+    #[test]
+    fn round3_review_findings_and_audit_fixtures() {
+        use super::super::model::AccessMode;
+
+        // --- Finding 1 + Rules B & C: unlisted options & writing flag abbreviations ---
+        let cp_t = simulate_table(&["cp", "-t", "vault", "README.md"]);
+        assert!(
+            cp_t.unread.contains(&UnreadReason::UnknownFlag {
+                tool: "cp".into(),
+                flag: "-t".into(),
+            }),
+            "cp -t must be Unread(UnknownFlag), never accepted with last operand as destination"
+        );
+        assert!(
+            cp_t.candidate_paths
+                .contains(&("vault".into(), AccessMode::ReadWrite)),
+            "cp -t fallback must keep conservative ReadWrite access on vault for atrium-self"
+        );
+
+        let sort_out = simulate_table(&["sort", "--out=alias", "README.md"]);
+        assert!(sort_out.writes, "sort --out=alias must enable writes");
+        assert!(
+            sort_out
+                .candidate_paths
+                .contains(&("alias".into(), AccessMode::Write)),
+            "sort --out=alias must mark alias as Write"
+        );
+        assert!(sort_out.unread.is_empty());
+
+        let tree_spec = lookup("tree").unwrap();
+        assert!(is_forbidden_flag(
+            tree_spec.home_readonly.unwrap().forbidden,
+            "--out=alias"
+        ));
+        assert!(is_forbidden_flag(
+            tree_spec.home_readonly.unwrap().forbidden,
+            "-xo"
+        ));
+        assert!(!is_forbidden_flag(
+            tree_spec.home_readonly.unwrap().forbidden,
+            "--"
+        ));
+        let tree_out = simulate_table(&["tree", "--out=alias"]);
+        assert!(tree_out.writes);
+        assert!(
+            tree_out
+                .candidate_paths
+                .contains(&("alias".into(), AccessMode::Write))
+        );
+
+        let ls_unlisted = simulate_table(&["ls", "--color=alias", "README.md"]);
+        assert!(ls_unlisted.unread.is_empty());
+        assert!(
+            ls_unlisted
+                .candidate_paths
+                .contains(&("alias".into(), AccessMode::ReadWrite)),
+            "AnyExceptForbidden unlisted flag attached value must be conservative ReadWrite"
+        );
+        assert!(
+            ls_unlisted
+                .candidate_paths
+                .contains(&("README.md".into(), AccessMode::ReadWrite))
+        );
+
+        // --- Finding 2 + Rule E: rg global glob case toggle (last wins) & --iglob ---
+        let rg_ci = simulate_table(&[
+            "rg",
+            "-L",
+            "--glob-case-insensitive",
+            "-g",
+            "KEY",
+            "x",
+            "proj",
+        ]);
+        assert!(rg_ci.unread.is_empty());
+        assert_eq!(
+            rg_ci.filters,
+            vec![(FilterDialect::RgGlob, "KEY".into(), true)]
+        );
+
+        let rg_ci_after = simulate_table(&[
+            "rg",
+            "-L",
+            "-g",
+            "KEY",
+            "--glob-case-insensitive",
+            "x",
+            "proj",
+        ]);
+        assert_eq!(
+            rg_ci_after.filters,
+            vec![(FilterDialect::RgGlob, "KEY".into(), true)],
+            "global --glob-case-insensitive applies to every -g on the unit"
+        );
+
+        let rg_ci_override = simulate_table(&[
+            "rg",
+            "-L",
+            "--glob-case-insensitive",
+            "--no-glob-case-insensitive",
+            "-g",
+            "KEY",
+            "x",
+            "proj",
+        ]);
+        assert_eq!(
+            rg_ci_override.filters,
+            vec![(FilterDialect::RgGlob, "KEY".into(), false)],
+            "last global toggle wins"
+        );
+
+        let rg_iglob = simulate_table(&[
+            "rg",
+            "-L",
+            "--no-glob-case-insensitive",
+            "--iglob",
+            "KEY",
+            "x",
+            "proj",
+        ]);
+        assert_eq!(
+            rg_iglob.filters,
+            vec![(FilterDialect::RgGlob, "KEY".into(), true)],
+            "--iglob stays case-insensitive even after --no-glob-case-insensitive"
+        );
+
+        // --- Finding 3 + Rule A: unsupported search filters propagate UnsupportedFilterForm ---
+        for cmd in [
+            &["grep", "-R", "--exclude=key", "x", "proj"][..],
+            &["grep", "-R", "--exclude-dir=sub", "x", "proj"][..],
+            &["grep", "-R", "--include-dir=sub", "x", "proj"][..],
+            &["ag", "-f", "--ignore=key", "x", "proj"][..],
+            &["ag", "--ignore-dir=sub", "x", "proj"][..],
+            &["ag", "-G", "key", "x", "proj"][..],
+            &["ag", "-g", "key", "proj"][..],
+            &["rg", "-L", "-t", "rust", "x", "proj"][..],
+            &["rg", "-L", "-T", "txt", "x", "proj"][..],
+            &["rg", "-L", "--max-depth", "1", "x", "proj"][..],
+            &["rg", "-g", "*.rs", "-g", "*.md", "x", "proj"][..],
+            &["rg", "-g", "!key", "x", "proj"][..],
+            &["ack", "--follow", "--ignore-dir=sub", "x", "proj"][..],
+            &["ack", "-t", "rust", "x", "proj"][..],
+            &["ack", "-g", "key", "proj"][..],
+            &["find", "-L", "proj", "-maxdepth", "1"][..],
+            &["find", "-x", "proj"][..],
+        ] {
+            let sim = simulate_table(cmd);
+            assert!(
+                sim.unread.contains(&UnreadReason::UnsupportedFilterForm),
+                "{cmd:?} must propagate UnreadReason::UnsupportedFilterForm, got {:?}",
+                sim.unread
+            );
+        }
+        let ag_ignore_file = simulate_table(&["ag", "-p", "ignorefile", "x", "proj"]);
+        assert!(
+            ag_ignore_file
+                .unread
+                .contains(&UnreadReason::UnsupportedFilterForm)
+        );
+        assert!(
+            ag_ignore_file
+                .candidate_paths
+                .contains(&("ignorefile".into(), AccessMode::Read)),
+            "ag -p must still check its ignore file as a Read candidate path"
+        );
+
+        // --- Finding 4 + Rule A: tar -C and git base-dir changing flags ---
+        let tar_c = simulate_table(&["tar", "-chf", "out.tar", "-C", "sub", "../key"]);
+        assert!(
+            tar_c
+                .unread
+                .contains(&UnreadReason::UnsupportedBaseDirChange {
+                    tool: "tar".into(),
+                    flag: "-C".into(),
+                }),
+            "tar -C must emit UnsupportedBaseDirChange"
+        );
+        assert!(
+            tar_c
+                .candidate_paths
+                .contains(&("out.tar".into(), AccessMode::Write))
+        );
+
+        let tar_dir = simulate_table(&["tar", "-chf", "out.tar", "--directory=sub", "../key"]);
+        assert!(
+            tar_dir
+                .unread
+                .contains(&UnreadReason::UnsupportedBaseDirChange {
+                    tool: "tar".into(),
+                    flag: "--directory".into(),
+                })
+        );
+
+        for (cmd, flag_name) in [
+            (&["git", "-C", "sub", "status"][..], "-C"),
+            (&["git", "--work-tree=sub", "status"][..], "--work-tree"),
+            (&["git", "--git-dir=sub/.git", "status"][..], "--git-dir"),
+            (
+                &["git", "--super-prefix=sub/", "status"][..],
+                "--super-prefix",
+            ),
+        ] {
+            let sim = simulate_table(cmd);
+            assert!(
+                sim.unread
+                    .contains(&UnreadReason::UnsupportedBaseDirChange {
+                        tool: "git".into(),
+                        flag: flag_name.into(),
+                    }),
+                "{cmd:?} must emit UnsupportedBaseDirChange for {flag_name}"
+            );
+        }
+
+        // --- Finding 5 + Rule D: flag-held program files vs inline expressions ---
+        let sed_f = simulate_table(&["sed", "-f", "edit.sed", "README.md"]);
+        assert!(!sed_f.inline_code);
+        assert_eq!(
+            sed_f.program_pin,
+            Some(vec!["sed".into(), "-f".into(), "edit.sed".into()])
+        );
+        assert_eq!(
+            sed_f.unread,
+            vec![UnreadReason::Program {
+                program_words: vec!["sed".into(), "-f".into(), "edit.sed".into()],
+            }]
+        );
+        assert!(
+            sed_f
+                .candidate_paths
+                .contains(&("edit.sed".into(), AccessMode::Read))
+        );
+        assert!(
+            sed_f
+                .candidate_paths
+                .contains(&("README.md".into(), AccessMode::Write))
+        );
+
+        let sed_e_safe = simulate_table(&["sed", "-e", "s/a/b/", "README.md"]);
+        assert!(!sed_e_safe.inline_code);
+        assert!(sed_e_safe.unread.is_empty());
+
+        for dangerous in ["1e id", "w out", "r in"] {
+            let sed_e_bad = simulate_table(&["sed", "-e", dangerous, "README.md"]);
+            assert!(sed_e_bad.inline_code);
+            assert!(
+                sed_e_bad
+                    .unread
+                    .contains(&UnreadReason::CodeRunnerInlineCode { tool: "sed".into() })
+            );
+        }
+
+        let awk_f = simulate_table(&["awk", "-f", "prog.awk", "README.md"]);
+        assert!(!awk_f.inline_code);
+        assert_eq!(
+            awk_f.program_pin,
+            Some(vec!["awk".into(), "-f".into(), "prog.awk".into()])
+        );
+        assert_eq!(
+            awk_f.unread,
+            vec![UnreadReason::Program {
+                program_words: vec!["awk".into(), "-f".into(), "prog.awk".into()],
+            }]
+        );
+        assert!(
+            awk_f
+                .candidate_paths
+                .contains(&("prog.awk".into(), AccessMode::Read))
+        );
+
+        let awk_inline = simulate_table(&["awk", "{print}", "README.md"]);
+        assert!(awk_inline.inline_code);
+        assert!(
+            awk_inline
+                .unread
+                .contains(&UnreadReason::CodeRunnerInlineCode { tool: "awk".into() })
+        );
+
+        // --- Finding 6 + Rule F: flag-value relaxations cited with §11 item 9 ---
+        let codesign = simulate_table(&["codesign", "-s", "identity", "app"]);
+        assert!(codesign.writes);
+        assert!(codesign.unread.is_empty());
+        assert!(
+            !codesign
+                .candidate_paths
+                .iter()
+                .any(|(p, _)| p == "identity"),
+            "codesign -s value is Text, not a candidate path"
+        );
+        assert!(
+            codesign
+                .candidate_paths
+                .contains(&("app".into(), AccessMode::Write))
+        );
+
+        let git_ns = simulate_table(&["git", "--namespace", "ns", "status"]);
+        assert!(git_ns.unread.is_empty());
+        assert!(!git_ns.candidate_paths.iter().any(|(p, _)| p == "ns"));
+
+        let find_dbg = simulate_table(&["find", "-D", "stat", "proj"]);
+        assert!(find_dbg.unread.is_empty());
+        assert!(!find_dbg.candidate_paths.iter().any(|(p, _)| p == "stat"));
+        assert!(
+            find_dbg
+                .candidate_paths
+                .contains(&("proj".into(), AccessMode::Read))
+        );
+    }
 }
