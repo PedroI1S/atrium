@@ -1177,6 +1177,13 @@ impl Driver {
 
     async fn run(mut self) {
         loop {
+            if self.norm.has_ended() {
+                // Break before flushing so `SessionEnded` is only delivered in
+                // `flush_final` after `clear_requests` and `drain_withdrawals`
+                // have settled all pending tickets.
+                break;
+            }
+
             self.drain_withdrawals().await;
             self.flush_pending();
 

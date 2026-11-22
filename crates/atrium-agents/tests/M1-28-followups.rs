@@ -1824,7 +1824,11 @@ for line in sys.stdin:
 
     let _ = controls.filler.send(true);
     shutdown(session).await;
-    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+    assert_eq!(
+        store.requests().open_count(&thread, inc).await.unwrap(),
+        0,
+        "open Claude ledger row remained pending after shutdown"
+    );
     let _ = fs::remove_dir_all(&ledger_dir);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -2057,7 +2061,11 @@ for line in sys.stdin:
 
     let _ = controls.filler.send(true);
     shutdown(session).await;
-    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+    assert_eq!(
+        store.requests().open_count(&thread, inc).await.unwrap(),
+        0,
+        "open Codex ledger row remained pending after shutdown"
+    );
     let _ = fs::remove_dir_all(&ledger_dir);
     let _ = fs::remove_dir_all(&dir);
 }
