@@ -169,8 +169,30 @@ fn process_text_recursive(
 
     let mut home_modified = inherited_home_modified;
     let mut nested_scripts: Vec<(UnitIndex, String, bool)> = Vec::new();
+    let mut raw_iter = lex_out.units.into_iter().enumerate();
 
-    for (i, mut raw) in lex_out.units.into_iter().enumerate() {
+    let flush_remaining_raw =
+        |raw_iter: &mut std::iter::Enumerate<std::vec::IntoIter<RawCommandUnit>>,
+         parsed: &mut ParsedCommandUnits| {
+            for (j, rem) in raw_iter.by_ref() {
+                let g_idx = local_to_global[j];
+                let pipeline_id = rem
+                    .pipeline_id
+                    .map(|PipelineId(id)| PipelineId(local_pipe_offset + id));
+                parsed.units.push(CommandUnit {
+                    index: g_idx,
+                    argv: rem.argv,
+                    removed_wrappers: Vec::new(),
+                    redirects: rem.redirects,
+                    separator_before: rem.separator_before,
+                    pipeline_id,
+                    depth: rem.depth,
+                    parent_unit: rem.parent_unit,
+                });
+            }
+        };
+
+    while let Some((i, mut raw)) = raw_iter.next() {
         let global_idx = local_to_global[i];
         raw.index = global_idx;
         raw.pipeline_id = raw
@@ -180,9 +202,11 @@ fn process_text_recursive(
         // Detect leading `HOME=...` assignment before unwrapping.
         let mut unit_sets_home = has_leading_home_assignment(&raw.argv);
 
-        let unwrapped = match unwrap_unit(raw, folds, budget) {
+        let unwrapped = match unwrap_unit_preserving(raw, folds, budget) {
             Ok(u) => u,
-            Err(e) => {
+            Err((partial_unit, e)) => {
+                parsed.units.push(partial_unit);
+                flush_remaining_raw(&mut raw_iter, parsed);
                 parsed.outcomes.push(PartResult {
                     part: PartId::Unit(global_idx),
                     outcome: PartOutcome::Exhausted(e.reason),
@@ -208,6 +232,31 @@ fn process_text_recursive(
             });
         }
 
+        // Check if a command after leading assignments (`FOO=1 export HOME=...`,
+        // `FOO=1 unset HOME`, `FOO=1 env -u HOME ...`) modifies `HOME` (§3).
+        let assign_prefix = leading_assignment_count(&unit.argv);
+        if assign_prefix > 0
+            && let Some(cmd_after_assign) = unit.argv.get(assign_prefix)
+            && !cmd_after_assign.has_unquoted_glob()
+        {
+            match fold_command_word(cmd_after_assign, folds, budget) {
+                Ok(folded_after) => {
+                    if command_modifies_home(&folded_after, &unit.argv[assign_prefix..]) {
+                        unit_sets_home = true;
+                    }
+                }
+                Err(e) => {
+                    parsed.units.push(unit);
+                    flush_remaining_raw(&mut raw_iter, parsed);
+                    parsed.outcomes.push(PartResult {
+                        part: PartId::Unit(global_idx),
+                        outcome: PartOutcome::Exhausted(e.reason),
+                    });
+                    return Ok(());
+                }
+            }
+        }
+
         // Inspect effective command word: command-word glob (§4), nested shell
         // (§4), HOME-modifying commands (§3), and optional P3 code-runner hook.
         if let Some(first) = unit.argv.first() {
@@ -221,6 +270,7 @@ fn process_text_recursive(
                     Ok(f) => f,
                     Err(e) => {
                         parsed.units.push(unit);
+                        flush_remaining_raw(&mut raw_iter, parsed);
                         parsed.outcomes.push(PartResult {
                             part: PartId::Unit(global_idx),
                             outcome: PartOutcome::Exhausted(e.reason),
@@ -257,6 +307,7 @@ fn process_text_recursive(
                             }
                             Err(e) => {
                                 parsed.units.push(unit);
+                                flush_remaining_raw(&mut raw_iter, parsed);
                                 parsed.outcomes.push(PartResult {
                                     part: PartId::Unit(global_idx),
                                     outcome: PartOutcome::Exhausted(e.reason),
@@ -291,6 +342,7 @@ fn process_text_recursive(
                         }
                         Err(e) => {
                             parsed.units.push(unit);
+                            flush_remaining_raw(&mut raw_iter, parsed);
                             parsed.outcomes.push(PartResult {
                                 part: PartId::Unit(global_idx),
                                 outcome: PartOutcome::Exhausted(e.reason),
@@ -339,11 +391,41 @@ pub(crate) fn unwrap_unit(
     folds: &FoldRules,
     budget: &mut ComputeBudget,
 ) -> Result<UnwrapResult, Exhausted> {
-    budget.charge(1)?;
+    unwrap_unit_preserving(raw, folds, budget).map_err(|(_, e)| e)
+}
 
+/// Internal helper that preserves the partially-unwrapped [`CommandUnit`] on
+/// budget exhaustion so `build_units` never drops a unit found before running
+/// out of budget (§8).
+fn unwrap_unit_preserving(
+    raw: RawCommandUnit,
+    folds: &FoldRules,
+    budget: &mut ComputeBudget,
+) -> Result<UnwrapResult, (CommandUnit, Exhausted)> {
     let mut argv = raw.argv;
     let mut removed_wrappers: Vec<RemovedWrapper> = Vec::new();
     let mut unread: Option<UnreadReason> = None;
+
+    let finish_err =
+        |argv: Vec<Word>, removed_wrappers: Vec<RemovedWrapper>, redirects, e: Exhausted| {
+            (
+                CommandUnit {
+                    index: raw.index,
+                    argv,
+                    removed_wrappers,
+                    redirects,
+                    separator_before: raw.separator_before,
+                    pipeline_id: raw.pipeline_id,
+                    depth: raw.depth,
+                    parent_unit: raw.parent_unit,
+                },
+                e,
+            )
+        };
+
+    if let Err(e) = budget.charge(1) {
+        return Err(finish_err(argv, removed_wrappers, raw.redirects, e));
+    }
 
     while let Some(first) = argv.first() {
         // Never treat a globbed command word as a wrapper (§4).
@@ -351,7 +433,10 @@ pub(crate) fn unwrap_unit(
             break;
         }
 
-        let folded = fold_command_word(first, folds, budget)?;
+        let folded = match fold_command_word(first, folds, budget) {
+            Ok(f) => f,
+            Err(e) => return Err(finish_err(argv, removed_wrappers, raw.redirects, e)),
+        };
         let Some(spec) = tools::lookup(&folded) else {
             // Check if `folded` is an explicit outside-model wrapper in P0's table.
             if let Some(out) = tools::lookup_outside_model(&folded)
@@ -376,20 +461,24 @@ pub(crate) fn unwrap_unit(
             break;
         }
 
-        match parse_wrapper_prefix(kind, spec, &argv, budget)? {
-            Some(strip_count) => {
-                budget.charge(strip_count as u64)?;
-                budget.charge_alloc(
-                    std::mem::size_of::<RemovedWrapper>()
-                        + strip_count * std::mem::size_of::<Word>(),
-                )?;
+        match parse_wrapper_prefix(kind, spec, &argv, budget) {
+            Ok(Some(strip_count)) => {
+                if let Err(e) = budget.charge(strip_count as u64).and_then(|()| {
+                    budget.charge_alloc(
+                        std::mem::size_of::<RemovedWrapper>()
+                            + strip_count * std::mem::size_of::<Word>(),
+                    )
+                }) {
+                    return Err(finish_err(argv, removed_wrappers, raw.redirects, e));
+                }
                 let words: Vec<Word> = argv.drain(..strip_count).collect();
                 removed_wrappers.push(RemovedWrapper { kind, words });
             }
-            None => {
+            Ok(None) => {
                 unread = Some(UnreadReason::UnsupportedWrapperForm { wrapper: folded });
                 break;
             }
+            Err(e) => return Err(finish_err(argv, removed_wrappers, raw.redirects, e)),
         }
     }
 
@@ -736,6 +825,12 @@ fn classify_nested_shell(
 // HOME modification tracking (§3)
 // ---------------------------------------------------------------------------
 
+fn leading_assignment_count(argv: &[Word]) -> usize {
+    argv.iter()
+        .take_while(|w| leading_assignment_name(w).is_some())
+        .count()
+}
+
 fn has_leading_home_assignment(argv: &[Word]) -> bool {
     for w in argv {
         match leading_assignment_name(w) {
@@ -759,15 +854,50 @@ fn command_modifies_home(folded: &str, argv: &[Word]) -> bool {
             args.iter().any(word_targets_home_var)
         }
         "unset" => args.iter().any(|w| w.literal_bytes() == b"HOME"),
-        "env" => {
-            // Bare `env` was already stripped by `unwrap_unit`; any remaining
-            // `env` unit may clear (`-i`), unset (`-u HOME`), split-string
-            // (`-S`), or assign `HOME=...`.
+        "printf" => {
+            // `printf -v HOME ...` or `printf -vHOME ...` sets `HOME` in bash.
             let mut i = 0usize;
             while i < args.len() {
                 let b = args[i].literal_bytes();
                 if b == b"--" {
                     break;
+                }
+                if b == b"-v"
+                    && args
+                        .get(i + 1)
+                        .is_some_and(|w| w.literal_bytes() == b"HOME")
+                {
+                    return true;
+                }
+                if b == b"-vHOME" {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
+        "env" => {
+            // Bare `env` was already stripped by `unwrap_unit`; any remaining
+            // `env` unit may clear (`-i`), unset (`-u HOME`), split-string
+            // (`-S`), or assign `HOME=...` (including after `--`).
+            let mut i = 0usize;
+            let mut after_double_dash = false;
+            while i < args.len() {
+                let b = args[i].literal_bytes();
+                if !after_double_dash && b == b"--" {
+                    after_double_dash = true;
+                    i += 1;
+                    continue;
+                }
+                if b.starts_with(b"HOME=") {
+                    return true;
+                }
+                if after_double_dash {
+                    if !b.contains(&b'=') {
+                        break;
+                    }
+                    i += 1;
+                    continue;
                 }
                 if b == b"-i"
                     || b == b"-"
@@ -778,7 +908,6 @@ fn command_modifies_home(folded: &str, argv: &[Word]) -> bool {
                     || b.starts_with(b"--split-string=")
                     || b == b"--unset=HOME"
                     || b == b"-uHOME"
-                    || b.starts_with(b"HOME=")
                 {
                     return true;
                 }
@@ -789,8 +918,22 @@ fn command_modifies_home(folded: &str, argv: &[Word]) -> bool {
                 {
                     return true;
                 }
-                if b.starts_with(b"-") && !b.starts_with(b"--") && b[1..].contains(&b'i') {
-                    return true;
+                if b.starts_with(b"-") && !b.starts_with(b"--") {
+                    let rest = &b[1..];
+                    if rest.contains(&b'i') || rest.contains(&b'S') {
+                        return true;
+                    }
+                    if let Some(pos) = rest.iter().position(|&c| c == b'u') {
+                        let tail = &rest[pos + 1..];
+                        if tail == b"HOME"
+                            || (tail.is_empty()
+                                && args
+                                    .get(i + 1)
+                                    .is_some_and(|w| w.literal_bytes() == b"HOME"))
+                        {
+                            return true;
+                        }
+                    }
                 }
                 i += 1;
             }
