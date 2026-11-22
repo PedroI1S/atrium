@@ -221,12 +221,13 @@ async fn connection(inner: Arc<Inner>, mut stream: UnixStream, _slot: OwnedSemap
 
     loop {
         let payload = tokio::select! {
+            biased;
+            () = conn.closed() => break,
             read = codec::read_client(&mut reader) => match read {
                 Ok(payload) => payload,
                 // The client left, or sent a frame that isn't one.
                 Err(_) => break,
             },
-            () = conn.closed() => break,
         };
         let Ok(message) = serde_json::from_slice::<ClientMessage>(&payload) else {
             break;

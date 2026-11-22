@@ -459,8 +459,8 @@ impl Conn {
     }
 
     /// Writes as much of a taken frame as the socket takes now. `Ok(None)`:
-    /// the frame is an event frame of a subscription that ended before any
-    /// of it was written, and must not be sent (D-058: nothing of a
+    /// the connection closed or the frame's subscription ended before any of
+    /// it was written, so it must not be sent (D-058: nothing of a
     /// subscription follows its end, a frame the writer already holds
     /// included).
     ///
@@ -477,8 +477,7 @@ impl Conn {
     ) -> std::io::Result<Option<usize>> {
         let mut outbox = self.lock();
         if first
-            && let Some((sub, _)) = origin
-            && !outbox.subs.contains_key(&sub)
+            && (outbox.closed || origin.is_some_and(|(sub, _)| !outbox.subs.contains_key(&sub)))
         {
             return Ok(None);
         }
@@ -1101,5 +1100,61 @@ mod tests {
             }
         ));
         assert_eq!(conn.take_for_test().expect("live event").len(), 10);
+    }
+
+    #[tokio::test]
+    async fn write_loop_never_writes_a_later_frame_after_closing_mid_frame() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a pair");
+        let (_reading, writer) = ours.into_split();
+
+        let conn = Arc::new(Conn::with_limit(1, ClientRole::Dev, 100));
+        let first_frame: Frame = vec![0x41u8; 4 * 1024 * 1024].into();
+        conn.control_frame(first_frame.clone(), Coalesce::Keep);
+
+        let writer_task = tokio::spawn({
+            let conn = conn.clone();
+            async move { write_loop(&conn, writer).await }
+        });
+
+        // Wait until `write_loop` has dequeued `first_frame`, written what
+        // fits in the socket buffer, and parked on `writer.writable()`.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !conn.lock().control.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            tokio::task::yield_now().await;
+        })
+        .await
+        .expect("write_loop dequeued first_frame");
+
+        // Overflow `MAX_CONTROL_BYTES` with frames carrying a distinct byte;
+        // `write_loop` must close immediately without writing any byte of the
+        // later frames after the partial `first_frame`.
+        let later: Frame = vec![0x42u8; 1024 * 1024].into();
+        for _ in 0..9 {
+            conn.control_frame(later.clone(), Coalesce::Keep);
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("write_loop exited promptly")
+            .expect("writer task");
+        assert!(conn.is_closed());
+
+        let mut received = Vec::new();
+        theirs.read_to_end(&mut received).await.expect("reads");
+        assert!(
+            !received.is_empty() && received.len() < first_frame.len(),
+            "expected a partial first frame before close, got {} bytes",
+            received.len()
+        );
+        assert_eq!(
+            received.as_slice(),
+            &first_frame[..received.len()],
+            "wire bytes must only be a prefix of the in-flight frame, never followed by another frame"
+        );
     }
 }
