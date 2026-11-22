@@ -36,6 +36,8 @@ export type Block =
 const MAX_DEPTH = 12;
 /** Inline container nesting deeper than this is flattened so traversal and rendering stay bounded. */
 const MAX_INLINE_DEPTH = 16;
+/** Tables wider than this degrade extra columns to plain text in the last column so copy and render stay bounded. */
+export const MAX_TABLE_COLUMNS = 256;
 
 // ---- blocks --------------------------------------------------------------------------------
 
@@ -302,19 +304,36 @@ function parseLines(lines: string[], depth: number): Block[] {
       const head = splitRow(line);
       const delims = splitRow(lines[i + 1]!);
       if (delims.length === head.length) {
-        const align = delims.map(alignOf);
+        const origCols = head.length;
+        const colCount = Math.min(origCols, MAX_TABLE_COLUMNS);
+        const align = delims.slice(0, colCount).map(alignOf);
+        const appendOverflow = (cell: Inline[], extras: string[]): void => {
+          const extra = ` | ${extras.join(" | ")}`;
+          const last = cell[cell.length - 1];
+          if (last && last.t === "text") last.v += extra;
+          else cell.push(text(extra));
+        };
+        const parsedHead: Inline[][] = [];
+        for (let k = 0; k < colCount; k++) parsedHead.push(parseInline(head[k]!));
+        if (origCols > colCount) {
+          appendOverflow(parsedHead[colCount - 1]!, head.slice(colCount));
+        }
         i += 2;
         const rows: Inline[][][] = [];
         while (i < lines.length && !isBlank(lines[i]!) && lines[i]!.includes("|") && !startsBlock(lines[i]!)) {
           const cells = splitRow(lines[i]!);
-          // Parse only present cells up to `head.length` so wide headers + many short rows stay O(n).
+          // Keep short rows compact so wide tables stay O(n); render.ts spans missing
+          // trailing columns and blocksText pads with tabs up to the capped column count.
           const rowCells: Inline[][] = [];
-          const count = Math.min(cells.length, head.length);
+          const count = Math.min(cells.length, colCount);
           for (let k = 0; k < count; k++) rowCells.push(parseInline(cells[k]!));
+          if (origCols > colCount && cells.length > colCount) {
+            appendOverflow(rowCells[colCount - 1]!, cells.slice(colCount, origCols));
+          }
           rows.push(rowCells);
           i++;
         }
-        out.push({ t: "table", align, head: head.map((h) => parseInline(h)), rows });
+        out.push({ t: "table", align, head: parsedHead, rows });
         continue;
       }
     }

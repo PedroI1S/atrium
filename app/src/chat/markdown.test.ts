@@ -6,8 +6,8 @@ import { describe, expect, it, vi } from "vitest";
 import { BlockSplitter } from "./blocks";
 import { classifyImage, classifyLink } from "./links";
 import { MAX_INLINE_IMAGE_BYTES } from "./limits";
-import { type Block, type Inline, parseInline, parseMarkdown, plainText } from "./markdown";
-import { type LinkActions, renderBlocks } from "./render";
+import { type Block, type Inline, MAX_TABLE_COLUMNS, parseInline, parseMarkdown, plainText } from "./markdown";
+import { type LinkActions, blocksText, renderBlocks } from "./render";
 
 const actions = (): LinkActions & { opened: string[]; revealed: string[] } => {
   const opened: string[] = [];
@@ -22,7 +22,7 @@ function render(md: string, a: LinkActions = actions()): HTMLDivElement {
 }
 
 const ALLOWED_TAGS = new Set(["DIV", "P", "H1", "H2", "H3", "H4", "H5", "H6", "PRE", "CODE", "BLOCKQUOTE", "UL", "OL", "LI", "HR", "TABLE", "THEAD", "TBODY", "TR", "TH", "TD", "EM", "STRONG", "DEL", "BR", "A", "SPAN", "IMG", "BUTTON"]);
-const ALLOWED_ATTRS = new Set(["class", "href", "title", "rel", "alt", "src", "decoding", "start", "tabindex", "role", "type", "data-lang", "referrerpolicy", "crossorigin"]);
+const ALLOWED_ATTRS = new Set(["class", "href", "title", "rel", "alt", "src", "decoding", "start", "tabindex", "role", "type", "data-lang", "referrerpolicy", "crossorigin", "colspan"]);
 
 /** Every element is one the renderer makes, with attributes it sets, and nothing active. */
 function assertInert(root: Element): void {
@@ -450,6 +450,46 @@ describe("blocks", () => {
     expect(parseInline("a  ")).toEqual([{ t: "text", v: "a  " }]);
   });
 
+  it("short table rows keep trailing empty cells in rendered DOM and copied text (M1-33 round 4 finding 1)", () => {
+    const src = "a|b|c\n-|-|-\n1|2\n3|4|5";
+    const blocks = parseMarkdown(src);
+    expect(blocks).toHaveLength(1);
+    const table = blocks[0] as Extract<Block, { t: "table" }>;
+    expect(table.t).toBe("table");
+    expect(table.head).toHaveLength(3);
+    // Parsed rows stay compact (no trailing empty-cell padding in the AST).
+    expect(table.rows[0]).toEqual([[{ t: "text", v: "1" }], [{ t: "text", v: "2" }]]);
+    expect(table.rows[1]).toEqual([
+      [{ t: "text", v: "3" }],
+      [{ t: "text", v: "4" }],
+      [{ t: "text", v: "5" }],
+    ]);
+
+    const div = render(src);
+    const bodyRows = [...div.querySelectorAll("tbody tr")];
+    expect(bodyRows).toHaveLength(2);
+    const firstCells = [...bodyRows[0]!.querySelectorAll("td")];
+    expect(firstCells.map((td) => td.textContent)).toEqual(["1", "2", ""]);
+    expect(firstCells[2]!.hasAttribute("colspan")).toBe(false);
+    const secondCells = [...bodyRows[1]!.querySelectorAll("td")];
+    expect(secondCells.map((td) => td.textContent)).toEqual(["3", "4", "5"]);
+    expect(blocksText(blocks)).toBe("a\tb\tc\n1\t2\t\n3\t4\t5");
+    assertInert(div);
+
+    // Multiple missing trailing cells span the remaining columns with one `<td colspan=k>`
+    // and preserve every trailing tab in copied text.
+    const multiSrc = "a|b|c|d\n-|-|-|--:\n1|2\n3|4|5|6";
+    const multiBlocks = parseMarkdown(multiSrc);
+    const multiDiv = render(multiSrc);
+    const multiFirst = [...multiDiv.querySelectorAll("tbody tr")[0]!.querySelectorAll("td")];
+    expect(multiFirst.map((td) => td.textContent)).toEqual(["1", "2", ""]);
+    expect(multiFirst[2]!.colSpan).toBe(2);
+    expect(multiFirst[2]!.getAttribute("colspan")).toBe("2");
+    expect(multiFirst.reduce((sum, td) => sum + td.colSpan, 0)).toBe(4);
+    expect(blocksText(multiBlocks)).toBe("a\tb\tc\td\n1\t2\t\t\n3\t4\t5\t6");
+    assertInert(multiDiv);
+  });
+
   it("wide tables with many short rows and autolink opener floods scale linearly (M1-33 round 3 audit)", () => {
     const cols = 4_000;
     const rowCount = 4_000;
@@ -460,16 +500,52 @@ describe("blocks", () => {
 
     const start = performance.now();
     const blocks = parseMarkdown(tableSrc);
+    const copied = blocksText(blocks);
     const angleOut = parseInline("<".repeat(100_000));
     expect(performance.now() - start).toBeLessThan(2000);
 
     expect(blocks).toHaveLength(1);
     const table = blocks[0] as Extract<Block, { t: "table" }>;
     expect(table.t).toBe("table");
-    expect(table.head).toHaveLength(cols);
+    expect(table.head).toHaveLength(MAX_TABLE_COLUMNS);
+    expect(table.align).toHaveLength(MAX_TABLE_COLUMNS);
+    expect(plainText(table.head[MAX_TABLE_COLUMNS - 1]!)).toBe(
+      Array.from({ length: cols - MAX_TABLE_COLUMNS + 1 }, () => "h").join(" | "),
+    );
     expect(table.rows).toHaveLength(rowCount);
     expect(table.rows[0]).toEqual([[{ t: "text", v: "a" }], [{ t: "text", v: "b" }]]);
+    const copiedLines = copied.split("\n");
+    expect(copiedLines).toHaveLength(rowCount + 1);
+    expect(copiedLines[1]).toBe(`a\tb${"\t".repeat(MAX_TABLE_COLUMNS - 2)}`);
     expect(angleOut).toEqual([{ t: "text", v: "<".repeat(100_000) }]);
+
+    // Rendering a wide table with short rows emits one trailing `<td colspan=k>` per row (O(n) DOM nodes).
+    const renderRows = 400;
+    const renderStart = performance.now();
+    const wideDiv = render(`${header}\n${delim}\n${"a|b\n".repeat(renderRows)}`);
+    expect(performance.now() - renderStart).toBeLessThan(2000);
+    expect(wideDiv.querySelectorAll("thead th")).toHaveLength(MAX_TABLE_COLUMNS);
+    expect(wideDiv.querySelectorAll("tbody tr")).toHaveLength(renderRows);
+    expect(wideDiv.querySelectorAll("tbody td")).toHaveLength(renderRows * 3);
+    const wideFirstTds = [...wideDiv.querySelectorAll("tbody tr")[0]!.querySelectorAll("td")];
+    expect(wideFirstTds[2]!.colSpan).toBe(MAX_TABLE_COLUMNS - 2);
+    assertInert(wideDiv);
+
+    // Extra header and body cells past MAX_TABLE_COLUMNS degrade to plain text in the last column,
+    // while body cells past the original header column count are still dropped per GFM.
+    const overCols = MAX_TABLE_COLUMNS + 2;
+    const overHeader = Array.from({ length: overCols }, (_, idx) => (idx === MAX_TABLE_COLUMNS ? "*extra*" : `h${idx}`)).join("|");
+    const overDelim = Array.from({ length: overCols }, () => "-").join("|");
+    const overRow = Array.from({ length: overCols + 2 }, (_, idx) => `c${idx}`).join("|");
+    const overBlocks = parseMarkdown(`${overHeader}\n${overDelim}\n${overRow}`);
+    const overTable = overBlocks[0] as Extract<Block, { t: "table" }>;
+    expect(overTable.head).toHaveLength(MAX_TABLE_COLUMNS);
+    expect(overTable.head[MAX_TABLE_COLUMNS - 1]).toEqual([
+      { t: "text", v: `h${MAX_TABLE_COLUMNS - 1} | *extra* | h${MAX_TABLE_COLUMNS + 1}` },
+    ]);
+    expect(overTable.rows[0]![MAX_TABLE_COLUMNS - 1]).toEqual([
+      { t: "text", v: `c${MAX_TABLE_COLUMNS - 1} | c${MAX_TABLE_COLUMNS} | c${MAX_TABLE_COLUMNS + 1}` },
+    ]);
   });
 });
 
