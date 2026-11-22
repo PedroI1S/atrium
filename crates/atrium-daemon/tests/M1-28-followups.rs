@@ -5,15 +5,21 @@
 
 mod common;
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use atrium_daemon::{NO_PATH_EXTRAS_ENV, discover_login_shell_path};
+#[cfg(target_os = "linux")]
+use atrium_daemon::discover_login_shell_path_with_spawn_hook;
+use atrium_daemon::{NO_PATH_EXTRAS_ENV, discover_login_shell_path, spawn_login_shell_with_retry};
 use atrium_protocol::agent::Provider;
 use atrium_protocol::policy::Preset;
 use atrium_protocol::wire::{DaemonCommand, ProviderProbe};
@@ -30,6 +36,18 @@ fn discover_path(shell: Option<&OsStr>, timeout: Duration) -> Option<OsString> {
         .read()
         .unwrap_or_else(PoisonError::into_inner);
     discover_login_shell_path(shell, timeout)
+}
+
+#[cfg(target_os = "linux")]
+fn discover_path_with_hook(
+    shell: Option<&OsStr>,
+    timeout: Duration,
+    on_spawn_attempt: impl FnMut(Result<(), io::ErrorKind>),
+) -> Option<OsString> {
+    let _guard = EXEC_WRITE_LOCK
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    discover_login_shell_path_with_spawn_hook(shell, timeout, on_spawn_attempt)
 }
 
 struct DaemonProcess {
@@ -201,41 +219,174 @@ fn discover_login_shell_path_handles_noise_failures_and_timeouts() {
 
 #[test]
 fn discover_login_shell_path_handles_etxtbsy_within_timeout() {
-    let root = folder();
-    let busy_sh = root.path().join("busy-sh");
-    write_executable(
-        &busy_sh,
-        "#!/bin/sh\nPATH='/fake/busy/bin'\n/bin/sh -c \"$2\"\n",
+    // 1. Deterministic seam tests (injected spawn outcomes and virtual clock):
+    // completely independent of thread scheduling and OS load.
+
+    // 1a. Transient ETXTBSY followed by success retries and recovers.
+    let base = Instant::now();
+    let deadline = base + Duration::from_millis(20);
+    let elapsed = Cell::new(Duration::ZERO);
+    let mut sleeps = Vec::new();
+    let mut attempt_times = Vec::new();
+    let recovered = spawn_login_shell_with_retry(
+        deadline,
+        || base + elapsed.get(),
+        |d| {
+            sleeps.push(d);
+            elapsed.set(elapsed.get() + d);
+        },
+        || {
+            attempt_times.push(base + elapsed.get());
+            if attempt_times.len() <= 2 {
+                Err(io::Error::from(io::ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok("recovered-shell")
+            }
+        },
     );
+    assert_eq!(recovered, Some("recovered-shell"));
+    assert_eq!(attempt_times.len(), 3);
+    assert_eq!(
+        sleeps,
+        vec![Duration::from_millis(1), Duration::from_millis(2)]
+    );
+    assert!(attempt_times.iter().all(|&t| t < deadline));
 
-    // Holding a writable fd on the script forces `ETXTBSY` on Linux `execve`
-    // (the same condition a sibling thread's un-exec'd fork child creates).
-    let writer = OpenOptions::new()
-        .write(true)
-        .open(&busy_sh)
-        .expect("open script for write");
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(50));
-        drop(writer);
-    });
-    let found = discover_path(Some(busy_sh.as_os_str()), Duration::from_secs(2));
-    releaser.join().expect("releaser joined");
-    assert_eq!(found.as_deref(), Some(OsStr::new("/fake/busy/bin")));
+    // 1b. Permanently busy script retries until the deadline, returns None,
+    // and never starts a spawn at or after the deadline.
+    let base = Instant::now();
+    let deadline = base + Duration::from_millis(20);
+    let elapsed = Cell::new(Duration::ZERO);
+    let mut sleeps = Vec::new();
+    let mut attempt_times = Vec::new();
+    let exhausted: Option<()> = spawn_login_shell_with_retry(
+        deadline,
+        || base + elapsed.get(),
+        |d| {
+            sleeps.push(d);
+            elapsed.set(elapsed.get() + d);
+        },
+        || {
+            attempt_times.push(base + elapsed.get());
+            Err(io::Error::from(io::ErrorKind::ExecutableFileBusy))
+        },
+    );
+    assert_eq!(exhausted, None);
+    assert_eq!(
+        attempt_times.len(),
+        5,
+        "expected retries before deadline exhaustion (1 initial + 4 retries)"
+    );
+    assert_eq!(
+        sleeps,
+        vec![
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(4),
+            Duration::from_millis(8),
+            Duration::from_millis(5),
+        ]
+    );
+    assert!(attempt_times.iter().all(|&t| t < deadline));
+    assert_eq!(elapsed.get(), Duration::from_millis(20));
 
+    // 1c. Expiry right before a retry stops before launching the shell even if
+    // the next attempt would succeed.
+    let base = Instant::now();
+    let deadline = base + Duration::from_millis(3);
+    let elapsed = Cell::new(Duration::ZERO);
+    let mut attempts = 0usize;
+    let expired = spawn_login_shell_with_retry(
+        deadline,
+        || base + elapsed.get(),
+        |d| elapsed.set(elapsed.get() + d),
+        || {
+            attempts += 1;
+            if attempts <= 2 {
+                Err(io::Error::from(io::ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok("started-after-deadline")
+            }
+        },
+    );
+    assert_eq!(expired, None);
+    assert_eq!(attempts, 2);
+
+    // 2. End-to-end Linux ETXTBSY tests through `discover_login_shell_path`:
+    // the writer fd is dropped synchronously ONLY inside the spawn-attempt hook
+    // after a real `execve` actually observes `ETXTBSY`, eliminating any
+    // scheduling race with a background releaser thread.
     #[cfg(target_os = "linux")]
     {
-        // A permanently held writable fd must still respect the timeout bound.
+        let root = folder();
+        let busy_sh = root.path().join("busy-sh");
+        write_executable(
+            &busy_sh,
+            "#!/bin/sh\nPATH='/fake/busy/bin'\n/bin/sh -c \"$2\"\n",
+        );
+
+        let mut writer = Some(
+            OpenOptions::new()
+                .write(true)
+                .open(&busy_sh)
+                .expect("open script for write"),
+        );
+        let mut attempts = Vec::new();
+        let found = discover_path_with_hook(
+            Some(busy_sh.as_os_str()),
+            Duration::from_secs(2),
+            |outcome| {
+                attempts.push(outcome);
+                if outcome == Err(io::ErrorKind::ExecutableFileBusy) {
+                    writer.take();
+                }
+            },
+        );
+        assert_eq!(found.as_deref(), Some(OsStr::new("/fake/busy/bin")));
+        let (last, prior) = attempts
+            .split_last()
+            .expect("at least one spawn attempt recorded");
+        assert_eq!(
+            *last,
+            Ok(()),
+            "final spawn attempt must succeed: {attempts:?}"
+        );
+        assert!(
+            !prior.is_empty()
+                && prior
+                    .iter()
+                    .all(|&o| o == Err(io::ErrorKind::ExecutableFileBusy)),
+            "expected at least one ETXTBSY before succeeding, got {attempts:?}"
+        );
+
+        // Permanently held writable fd must retry repeatedly and still return
+        // `None` promptly within the timeout bound.
         let _held = OpenOptions::new()
             .write(true)
             .open(&busy_sh)
             .expect("open script for write");
+        let mut busy_attempts = Vec::new();
         let started = Instant::now();
         assert_eq!(
-            discover_path(Some(busy_sh.as_os_str()), Duration::from_millis(80)),
+            discover_path_with_hook(
+                Some(busy_sh.as_os_str()),
+                Duration::from_millis(200),
+                |outcome| busy_attempts.push(outcome),
+            ),
             None
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            busy_attempts.len() >= 2,
+            "expected ETXTBSY retries before timeout, got {busy_attempts:?}"
+        );
+        assert!(
+            busy_attempts
+                .iter()
+                .all(|&o| o == Err(io::ErrorKind::ExecutableFileBusy)),
+            "expected only ETXTBSY failures while writer is held, got {busy_attempts:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
             "ETXTBSY retry exceeded timeout: {:?}",
             started.elapsed()
         );
