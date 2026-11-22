@@ -367,3 +367,86 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast
 ```
+
+
+---
+
+## Round 5 (D-141: shrink tool table to the six contract row kinds)
+
+Restructured `crates/atrium-core/src/policy/tools.rs` per driver decision `.orchestration/review-input/D-141.md`, removing per-tool flag/operand modeling for tools outside the six contract row kinds and resolving all 6 findings from `.orchestration/review-input/review-round4.md`. Reverted the now-unused `pub(super)` visibility widening on `ReaderOpts`, `AG_OPTS`, and `ACK_OPTS` in `crates/atrium-core/src/policy/gate.rs` (keeping `MAX_HOPS` `pub(super)`). `model.rs`, `v4/*`, and existing P1/P2 accessor signatures (`lookup`, `lookup_outside_model`, `subcommand`, `flag`, `flag_for_tool`, `flag_short`, `flag_long`, `is_forbidden_flag`) remain unchanged. `docs/contracts/m1-policy-rev4-tools.md` is intentionally left untouched for the orchestrator to regenerate via `env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools`.
+
+### The six D-141 row kinds and their rows
+
+| Kind | Count | Rows | Fields kept |
+|---|---|---|---|
+| `HomeReadOnly` | 15 tools + 7 `git` subcommands | `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `du`, `df`, `which`, `uname`, `date`, `whoami`, `tree`; `git status`, `git log`, `git diff`, `git show`, `git branch`, `git rev-parse`, `git ls-files` | `home_readonly` (`AnyExceptForbidden` mirroring `dev`'s `forbidden_flag` short clusters + `>= 3`-char long prefixes; forbidden only removes Home eligibility; every word is a `ReadWrite` candidate path, no operand relaxations), plus `git_selects_by_name` and `git_wildcard_pathspec` on `git` subcommands. |
+| `Search` | 7 tools (2 Home-eligible) | Home-eligible: `rg`, `grep`; non-Home siblings: `egrep`, `fgrep`, `zgrep`, `ggrep`, `rgrep` | `dev`'s `RG_*` / `GREP_*` flag tables (`FlagSpec` + explicit `Effect::None`/`Applied`), positional `[0]` pattern operand (§11 item 9), `FilterDialect` (`RgGlob` / `GrepInclude`) & `FilterCase` (`FollowGlobalToggle` / `AlwaysInsensitive` / `AlwaysSensitive`), unsupported filters as `FlagUnread::FilterForm` (`rg -t`/`-T`/`-d`/`--maxdepth`/`--max-filesize`/`--type-add`/`--type-clear`, `grep --exclude`/`--exclude-dir`) and `grep -d` as `FlagUnread::FlagEffect`, recursion/link-following flags with `ALLOW_HOME_FOLLOWED_SEARCH` (§11 item 15), and `home_readonly`. |
+| `Wrapper` & `NestedShell` | 6 wrappers + 3 nested shells | Wrappers: `command`, `exec`, `nice`, `timeout`, `time`, `env`; Nested shells: `sh`, `bash`, `dash` | Exact §4 closed forms (`WrapperRow`: `wrapper`, `flags`, `allows_double_dash`, `positional_operands`; `NestedShellRow`: `flags` (`-e`/`-u`/`-x`/`-c`), `script_pin: FirstOperand`, `code_runner_no_pin: true`). |
+| `CodeRunner` | 44 tools + 8 subcommands | `awk`, `gawk`, `mawk` (`-f`/`--file` pin); `perl`, `python`, `python3`, `node`, `ruby` (inline flags + `FirstOperand` pin); `eval`, `xargs`; `source`, `.`, `npx` (`FirstOperand` pin); `cargo` + `test`/`build`/`run`/`check`/`bench`/`doc`/`clippy` (`CommandAndSubcommand` pin); `pipx` + `pipx run` (`FirstOperand` pin); all 29 `shell::COMMAND_RUNNERS` (`ssh`..`parallel`, including `su`) | Always `Unread`; `inline_code` (`None` / `Flags` / `Operand` / `OperandsFrom`), `program_pin` (`ProgramPinSpec`, §11 item 8), `code_runner_no_pin` (§7, §11 item 4), and `subcommands`. No flag tables or operand relaxations. |
+| `ConditionalRunner` | 3 tools | `find` (`-exec`, `-execdir`, `-ok`, `-okdir`), `git` (`-c`, `--config-env`, `--exec-path`, `merge-index`, `filter-branch`, `bisect run`, `rebase -x`/`--exec`, `submodule foreach`, `difftool -x`/`--tool-cmd`, `mergetool -x`/`--tool-cmd`, `diff --ext-diff`, `push --receive-pack`/`--exec`), `sed` (script commands `e`/`w`/`r`, `-f`/`--file` pinned via `ProgramPin::FlagValue`) | Data-only `triggers: &[RunnerTrigger]`, `code_runner_no_pin: true`, and `subcommands` (`git`'s 7 `HomeReadOnly` + 2 `DerivedDestinationWriter` subcommands). Unknown-tool treatment when no trigger fires. No flag arities or operand roles. |
+| `DerivedDestinationWriter` | 5 tools + 2 `git` subcommands | `cp` (`-R`, `-r`, `-a`, `--recursive`, `--archive`), `mv` (`WhenSourceIsDir`), `rsync` (`Always`), `tar` (`-x`, `--extract`, `--get`), `unzip` (`Always`), `git clone` (`Always`), `git checkout` (`Always`) | Data-only `trigger: DerivedDestinationTrigger`. Triggered → `Unread(DerivedDestinations)` (§11 item 10) while every word stays a `ReadWrite` candidate path; untriggered (plain `cp a b`, `tar -c`) → unknown-tool treatment. |
+
+- **`OUTSIDE_MODEL` (49 entries, always `Unread`):** 12 non-§4 shells (`zsh`..`xonsh`), 16 non-§4 wrappers (`nohup`..`arch`), 19 `shell::RESERVED` (`if`..`coproc`), and `pushd`/`popd` (§5).
+- **Schema machinery deleted from `tools.rs`:** `FlagMode`, `FlagArgSpec`, `FlagArity`, `FlagKind::OptionalValue`/`MultiValue`/`TerminatedValues`, `ArchiveOperation`, `FlagValueAccess`, `GitPushEffect`, `FlagUnread::BaseDirChange`, `OperandLayout`, `OperandAccessMode`, `WriteBehavior`, `DerivedDestinationsBehavior`, `RecursiveBehavior`, `CodeRunnerBehavior`, `flag_long_or_writing_abbrev`, unused `FlagEffects` write/operation/script/positional/program/git_push fields, and all fixtures for removed tools.
+
+### Tools removed from `TOOLS` (now §4 unknown tools in `UNKNOWN_BY_DESIGN`)
+
+70 top-level tools across `dev`'s lists left `TOOLS` and are recorded in `UNKNOWN_BY_DESIGN` with one-line reasons (every word a `ReadWrite` candidate path, possible writer, never Home-eligible):
+- **`words::WRITERS` (18):** `rm`, `tee`, `touch`, `chmod`, `chown`, `chgrp`, `ln`, `truncate`, `install`, `mkdir`, `rmdir`, `unlink`, `shred`, `patch`, `ed`, `ex`, `wipefs`, `blkdiscard`.
+- **`words::READERS` (44):** `less`, `more`, `ag`, `ack`, `diff`, `cmp`, `md5`, `md5sum`, `shasum`, `sha1sum`, `sha256sum`, `echo`, `printf`, `whereis`, `type`, `readlink`, `realpath`, `basename`, `dirname`, `test`, `[`, `sort`, `uniq`, `cut`, `tr`, `nl`, `od`, `xxd`, `hexdump`, `strings`, `bat`, `jq`, `column`, `fold`, `expand`, `true`, `false`, `id`, `cd` (handled directly by P2's §5 cwd tracker), `open`, `spctl`, `mdls`, `mdfind`, `codesign`.
+- **`deny::DOWNLOADERS` (3):** `curl`, `wget`, `fetch` (pipe-to-shell hard-deny pass still runs).
+- **`deny::PRIV` (5, excluding `su` which stays a `CodeRunner`):** `sudo`, `sudoedit`, `doas`, `pkexec`, `run0` (always `HardDeny` `privilege-escalation`).
+- **`git` subcommand rows removed (9):** `git cat-file` and `git push` (now unknown git subcommands; CR-12 name selection and force-push hard-deny checks remain in P3/hard-deny, and `git push --receive-pack`/`--exec` stays a trigger in `GIT_TRIGGERS`), plus `git merge-index`, `git filter-branch`, `git bisect`, `git rebase`, `git submodule`, `git difftool`, `git mergetool` (converted to data triggers in `GIT_TRIGGERS`).
+
+### Resolution of all 6 round-4 Codex findings
+
+| # | Round-4 finding | Resolution under D-141 |
+|---|---|---|
+| 1 | `git diff --no-index bridge/plain README.md` lost path checks via `Ref` operands | `git diff` is a `HomeReadOnly` row with no operand relaxations (no `Ref` operands). Every word is checked as a `ReadWrite` candidate path, so both `bridge/plain` and `README.md` go through canonical path checks. |
+| 2 | `sed -i` arity wrong across macOS/GNU (`sed -i .bak`, `sed -ie`) | `sed` is now a `ConditionalRunner` with triggers only (`e`/`w`/`r`, `-f`/`--file`) and no flag table or arities. Untriggered `sed` (including `-i`) receives §4 unknown-tool treatment (every word a `ReadWrite` candidate path, possible writer, never Home-eligible). Removed the old arity test and `sed` flag table. |
+| 3 | `patch` input patch file marked `Write` (`AllWrite`) | `patch` row removed (`UNKNOWN_BY_DESIGN`); per-operand writer access modes deleted. `patch` receives §4 unknown-tool treatment. |
+| 4 | `patch` content-derived destinations declared explicit (`Never`) | `patch` row removed (`UNKNOWN_BY_DESIGN`); no longer declares `DerivedDestinationsBehavior::Never`. |
+| 5 | `codesign --verify --force` independently enabled `Write` | `codesign` row removed (`UNKNOWN_BY_DESIGN`); no longer models per-flag write semantics. |
+| 6 | `rsync` unconditionally classified as a recursive reader (false S8 hit) | `rsync` is now a `DerivedDestinationWriter` (`trigger: Always`) with no `recursive` read property or flag table: the writer itself is `Unread(DerivedDestinations)` while every word remains a `ReadWrite` candidate path. |
+
+### Updated full list of rows marked `changes_default` (Round 5 / D-141, for Pedro)
+
+| Entry | Kind | §11 item(s) | Reason |
+|---|---|---|---|
+| `git status`, `git log`, `git diff`, `git show`, `git ls-files` | `HomeReadOnly` | §11 item 10 | Active wildcard pathspecs → `Unread`. (No `Ref` relaxations; no item 9.) |
+| `rg`, `grep` | `Search` | §11 item 2; §11 item 9; §11 item 15 | Unsupported filters/unlisted flags → `Unread` (item 2); pattern & non-path flag values not candidate paths (item 9); followed-link search allowed in Home when link walk is within budget (item 15, D-139). |
+| `egrep`, `fgrep`, `zgrep`, `ggrep`, `rgrep` | `Search` | §11 item 2; §11 item 9 | Unsupported filters/unlisted flags → `Unread` (item 2); pattern & non-path flag values not candidate paths (item 9). |
+| `command`, `exec`, `time` | `Wrapper` | §11 item 10 | Closed §4 wrapper forms; other forms/options → `Unread`. |
+| `nice`, `timeout` | `Wrapper` | §11 item 9; §11 item 10 | Non-path priority/signal/duration values (`Text`; item 9); closed §4 wrapper forms (item 10). |
+| `env` | `Wrapper` | §11 item 2; §11 item 10 | K9 long `env` lines → `Unread` (item 2); wrapper forms outside §4's list → `Unread` (item 10). |
+| `sh`, `bash`, `dash` | `NestedShell` | §11 item 2; §11 item 4; §11 item 8 | K7 positional resolution & non-§4 flags → `Unread` (item 2); bare prefix invalid (item 4); script file (`sh x.sh`) pinnable `Unread (program)` (item 8). |
+| `awk`, `gawk`, `mawk` | `CodeRunner` | §11 item 4; §11 item 8 | Bare prefix invalid (item 4); `-f`/`--file` pinnable `Unread (program)` (item 8). |
+| `perl`, `python`, `python3`, `node`, `ruby`, `source`, `.`, `npx` | `CodeRunner` | §11 item 4; §11 item 8 | Bare prefix invalid (item 4); `[tool, script]` pins `Unread (program)` (item 8). |
+| `cargo` | `CodeRunner` | §11 item 4; §11 item 8 | Bare `["cargo"]` invalid (item 4); `["cargo", "<subcmd>"]` pins `Unread (program)` (item 8). |
+| `cargo test`, `build`, `run`, `check`, `bench`, `doc`, `clippy` | `CodeRunner` | §11 item 8 | Project build/test commands pinnable `Unread (program)` (item 8). |
+| `pipx` | `CodeRunner` | §11 item 4 | Bare `["pipx"]` invalid at creation. |
+| `pipx run` | `CodeRunner` | §11 item 4; §11 item 8 | `["pipx", "run"]` invalid (item 4); `["pipx", "run", "<pkg>"]` pins `Unread (program)` (item 8). |
+| `eval`, `xargs`, 28 `COMMAND_RUNNERS` (`ssh`..`parallel`, excluding `su`) | `CodeRunner` | §11 item 4 | Unpinned Allow prefix invalid at creation. (`su` is `None`: always `HardDeny` `privilege-escalation`.) |
+| `find`, `git` | `ConditionalRunner` | §11 item 4 | Bare `["find"]` / `["git"]` Allow prefix invalid at creation. |
+| `sed` | `ConditionalRunner` | §11 item 4; §11 item 8 | Bare `["sed"]` invalid (item 4); `-f`/`--file` pinnable `Unread (program)` (item 8). |
+| `cp`, `mv`, `rsync`, `tar`, `unzip`, `git clone`, `git checkout` | `DerivedDestinationWriter` | §11 item 10 | Derived destinations make the writer itself `Unread`. |
+| `OUTSIDE_MODEL` shells (12: `zsh`..`xonsh`) | `OutsideModel` | §11 item 4 | Shells outside §4's modeled subset → `Unread`, unpinned Allow prefix invalid. |
+| `OUTSIDE_MODEL` wrappers (16: `nohup`..`arch`) | `OutsideModel` | §11 item 4; §11 item 10 | Unpinned Allow prefix invalid (item 4); wrappers outside §4's closed list → `Unread` (item 10). |
+
+*(All 15 non-search `HomeReadOnly` tools, `git branch`, `git rev-parse`, `su`, `shell::RESERVED`, and `pushd`/`popd` have `changes_default: None`.)*
+
+### Round 5 verification
+
+Run by worker (allowed under D-123):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
+
+Commands for the orchestrator's verification task (fish-compatible):
+
+```sh
+env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+```
