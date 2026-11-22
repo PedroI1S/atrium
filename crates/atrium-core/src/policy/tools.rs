@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 
 use atrium_protocol::policy::Recursion;
 
-use super::model::{FilterDialect, LinkPolicy, ValueRole, WrapperKind};
+use super::model::{FilterDialect, LinkPolicy, UnreadReason, ValueRole, WrapperKind};
 
 // ---------------------------------------------------------------------------
 // Schema types for the normative tool table (§6)
@@ -51,17 +51,28 @@ impl Platforms {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FlagMode {
     /// Only flags listed in `flags` are within the model; any other flag makes
-    /// the unit `Unread(UnknownFlag)` (§6). Used for §4's closed wrappers and
-    /// nested shells, `cd`, and search tools with complete `dev` flag tables
-    /// (`rg`, `grep`, `ag`, `ack`).
+    /// the unit `Unread(UnknownFlag)` (§6) and triggers conservative
+    /// `AccessMode::ReadWrite` fallback on unclassified words so hard-deny /
+    /// `atrium-self` write checks are never lost. Used for every row outside
+    /// `HOME_READONLY_COMMANDS` as well as search tools with complete `dev`
+    /// flag tables (`rg`, `grep`, `ag`, `ack`).
     ListedOnly,
-    /// Any flag not forbidden by the row (`home_readonly.forbidden` or a
-    /// `runs_code` flag in `flags`) is accepted rather than `Unread`. Listed
-    /// flags still apply their exact `FlagKind` and `FlagEffects`. For unlisted
-    /// flags, every non-pattern/non-ref/non-text/non-member word (flag values
-    /// included) is a candidate `Path`, preserving `dev`'s all-arguments
-    /// extraction; operands the table marks as `Pattern`/`Text`/`Ref`/
-    /// `ArchiveMember` keep that role (§11 item 9).
+    /// Home-parity mode: allowed **only** on tools and git subcommands in
+    /// `HOME_READONLY_COMMANDS` that lack a complete `dev` flag table.
+    ///
+    /// - Any flag matching `home_readonly.forbidden` (via [`is_forbidden_flag`],
+    ///   mirroring `dev`'s `engine::forbidden_flag`: short flags inside
+    ///   clusters and long-option abbreviations of `>= 3` chars including `--`)
+    ///   is forbidden in Home and rejected.
+    /// - Any listed flag (or long abbreviation of `>= 3` chars matching a
+    ///   listed writing flag via [`flag_long_or_writing_abbrev`]) applies its
+    ///   exact `FlagKind` and `Effect`.
+    /// - Any other unlisted flag is accepted rather than `Unread`, keeping
+    ///   `dev`'s conservative treatment: every word (flag values and attached
+    ///   `--opt=value` included) is a candidate `Path` checked with
+    ///   `AccessMode::ReadWrite` (both read and write checks, including
+    ///   Atrium's self-protection), except operands the table marks as
+    ///   `Pattern`/`Text`/`Ref`/`ArchiveMember` (§11 item 9).
     AnyExceptForbidden,
 }
 
@@ -76,7 +87,8 @@ impl FlagMode {
 
 /// Ordered effect toggle applied left-to-right across a unit's flags, where the
 /// last matching flag wins (e.g. `ack --follow --nofollow`, `find -L -P`,
-/// `cp -LP`, `ag -r -n`; contract §5, §6).
+/// `cp -LP`, `ag -r -n`, `rg --glob-case-insensitive --no-glob-case-insensitive`;
+/// contract §5, §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum FlagToggle {
     /// Flag leaves this effect unchanged.
@@ -108,6 +120,87 @@ pub(crate) enum FlagKind {
     OptionalValue(ValueRole),
 }
 
+/// How a path/destination/program-file value taken by a flag is accessed
+/// (contract §5, §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FlagValueAccess {
+    /// Value path is read (e.g. `rg -f`, `grep -f`, `ag -p`, `find -f`,
+    /// `sed -f`, `awk -f`, `git -C`, `git --git-dir`, `git --work-tree`).
+    Read,
+    /// Value path is written (e.g. `sort -o`, `tree -o`, `git diff --output`,
+    /// `find -fprint`/`-fprint0`/`-fprintf`/`-fls`, `unzip -d`).
+    Write,
+    /// Value path is written when the unit writes and read otherwise (e.g.
+    /// `tar -f` written in `-c`/`-r`/`-u`, read in `-t`/`-x`; `tar -C`).
+    WriteWhenWriting,
+}
+
+/// Case-sensitivity rule for a modeled search filter flag (contract §5, §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FilterCase {
+    /// Always case-sensitive (e.g. `grep --include`).
+    AlwaysSensitive,
+    /// Always case-insensitive regardless of global toggles (e.g. `rg --iglob`).
+    AlwaysInsensitive,
+    /// Follows the final value of the unit's global filter case-insensitivity
+    /// toggle (`FlagEffects::filter_case_insensitive`, last toggle wins; e.g.
+    /// `rg -g`/`--glob` governed by `--glob-case-insensitive` /
+    /// `--no-glob-case-insensitive`).
+    FollowGlobalToggle,
+}
+
+/// Modeled search filter specification attached to a flag (contract §5, §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FilterSpec {
+    pub(crate) dialect: FilterDialect,
+    pub(crate) case: FilterCase,
+}
+
+/// Force-push / implicit-target semantics for `git push` flags (§6,
+/// `force-push-protected`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum GitPushEffect {
+    /// Forces non-fast-forward ref update (`-f`/`--force`,
+    /// `--force-with-lease`, `--force-if-includes`, `--mirror`).
+    Force,
+    /// Selects implicit push targets (`--all`, `--tags`, `--branches`,
+    /// `--prune`), blocking force-push unless targets are explicit.
+    ImplicitTargets,
+}
+
+/// Precise `UnreadReason` triggered by a flag whose effect is intentionally
+/// outside the rev 4 model (contract §3, §5, §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FlagUnread {
+    /// Unsupported filter, exclusion, ignore file, depth/size/mount limit, or
+    /// filter dialect → `UnreadReason::UnsupportedFilterForm` (§5).
+    FilterForm,
+    /// Changes the base directory or path prefix for resolving later operands
+    /// (`tar -C`/`--directory`, `git -C`/`--git-dir`/`--work-tree`/
+    /// `--super-prefix`) → `UnreadReason::UnsupportedBaseDirChange` (§5, §6).
+    BaseDirChange,
+    /// Other real flag effect outside the model (`ag -z`/`--search-zip`,
+    /// `ack -x`, `printf -v`, `grep -d`/`--directories`) →
+    /// `UnreadReason::UnsupportedFlagEffect` (§3, §5, §6).
+    FlagEffect,
+}
+
+impl FlagUnread {
+    pub(crate) fn into_unread_reason(self, tool: &str, flag: &str) -> UnreadReason {
+        match self {
+            Self::FilterForm => UnreadReason::UnsupportedFilterForm,
+            Self::BaseDirChange => UnreadReason::UnsupportedBaseDirChange {
+                tool: tool.to_string(),
+                flag: flag.to_string(),
+            },
+            Self::FlagEffect => UnreadReason::UnsupportedFlagEffect {
+                tool: tool.to_string(),
+                flag: flag.to_string(),
+            },
+        }
+    }
+}
+
 /// Semantic effects triggered when a flag is present on a unit (contract §5, §6).
 ///
 /// Toggle fields are applied left-to-right as flags appear in argv so a later
@@ -116,7 +209,11 @@ pub(crate) enum FlagKind {
 pub(crate) struct FlagEffects {
     /// Ordered toggle for write behaviour (`Enable` / `Disable`; last wins).
     pub(crate) writes: FlagToggle,
-    /// Ordered toggle for derived destinations (`cp -r`/`-R`/`-a`, `tar -x`).
+    /// Access mode for a path/destination/program-file value taken by this
+    /// flag (`None` for bool or non-path value flags).
+    pub(crate) value_access: Option<FlagValueAccess>,
+    /// Ordered toggle for derived destinations (`cp -r`/`-R`/`-a`, `tar -x`,
+    /// `find -delete`).
     pub(crate) derived_destinations: FlagToggle,
     /// Ordered toggle for recursive traversal (`Enable` / `Disable`; last wins).
     pub(crate) recursive: FlagToggle,
@@ -128,22 +225,37 @@ pub(crate) struct FlagEffects {
     /// e.g. `rg -e`/`--files`, `grep -e`/`-f`, `ag -g`, `ack -g`/`-f`/`--match`).
     pub(crate) provides_pattern: bool,
     /// Flag supplies an inline/file script so positional `[0]` is no longer a
-    /// script operand (e.g. `sed -e`/`--expression`, `sed -f`/`--file`).
+    /// script operand (e.g. `sed -e`/`--expression`, `sed -f`/`--file`,
+    /// `awk -f`/`--file`).
     pub(crate) provides_script: bool,
     /// Overrides the role of positional operands when present (last wins; e.g.
     /// `tar -c`/`-r`/`-u` → `Path`, `tar -x`/`-t` → `ArchiveMember`).
     pub(crate) positional_role: Option<ValueRole>,
-    /// Search filter dialect and case-insensitivity (`rg -g`/`--glob`/`--iglob`,
+    /// Modeled search filter dialect and case rule (`rg -g`/`--glob`/`--iglob`,
     /// `grep --include`).
-    pub(crate) filter: Option<(FilterDialect, bool)>,
-    /// Flag causes the unit to execute inline code (e.g. `sh -c`, `python -c`,
-    /// `find -exec`, `git -c`, `git rebase -x`, `sed -f`).
+    pub(crate) filter: Option<FilterSpec>,
+    /// Global toggle for filter case-insensitivity (`rg --glob-case-insensitive`
+    /// / `--no-glob-case-insensitive`; last toggle wins and applies to every
+    /// `FilterCase::FollowGlobalToggle` filter on the unit).
+    pub(crate) filter_case_insensitive: FlagToggle,
+    /// Flag causes the unit to execute inline code (plain `Unread`; e.g.
+    /// `sh -c`, `python -c`, `find -exec`, `git -c`, `git rebase -x`).
     pub(crate) runs_code: bool,
+    /// Flag names a program file to execute (`Unread (program)` coverable
+    /// under `pin`; e.g. `sed -f FILE`, `awk -f FILE`; §4, §7, §11 item 8).
+    pub(crate) runs_program: Option<ProgramPin>,
+    /// Force-push / implicit-target effect for `git push` flags.
+    pub(crate) git_push: Option<GitPushEffect>,
+    /// Flag has an effect outside the model, making the unit `Unread` with
+    /// this precise reason category (while preserving any `value_access` or
+    /// `provides_pattern` semantics for hard-deny checks).
+    pub(crate) unread: Option<FlagUnread>,
 }
 
 impl FlagEffects {
-    const NONE: Self = Self {
+    const EMPTY: Self = Self {
         writes: FlagToggle::Unchanged,
+        value_access: None,
         derived_destinations: FlagToggle::Unchanged,
         recursive: FlagToggle::Unchanged,
         follows_links_at_root: FlagToggle::Unchanged,
@@ -152,8 +264,47 @@ impl FlagEffects {
         provides_script: false,
         positional_role: None,
         filter: None,
+        filter_case_insensitive: FlagToggle::Unchanged,
         runs_code: false,
+        runs_program: None,
+        git_push: None,
+        unread: None,
     };
+
+    /// Returns `true` iff at least one modeled effect or `unread` trigger is
+    /// stated on this `FlagEffects`.
+    pub(crate) const fn has_any_effect(self) -> bool {
+        !matches!(self.writes, FlagToggle::Unchanged)
+            || self.value_access.is_some()
+            || !matches!(self.derived_destinations, FlagToggle::Unchanged)
+            || !matches!(self.recursive, FlagToggle::Unchanged)
+            || !matches!(self.follows_links_at_root, FlagToggle::Unchanged)
+            || !matches!(self.follows_links_below_root, FlagToggle::Unchanged)
+            || self.provides_pattern
+            || self.provides_script
+            || self.positional_role.is_some()
+            || self.filter.is_some()
+            || !matches!(self.filter_case_insensitive, FlagToggle::Unchanged)
+            || self.runs_code
+            || self.runs_program.is_some()
+            || self.git_push.is_some()
+            || self.unread.is_some()
+    }
+}
+
+/// Explicit policy-effect declaration on every [`FlagSpec`] (contract §6).
+///
+/// Every flag in the table must either state at least one effect in
+/// `Applied(FlagEffects)` or explicitly declare `None { reason }`; an integrity
+/// test fails if any flag has neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Effect {
+    /// Flag has no policy-relevant effect (path resolution, writing,
+    /// recursion, symlink following, filtering, code/program execution, or
+    /// base-directory changes), with a short reviewable explanation.
+    None { reason: &'static str },
+    /// Flag triggers one or more explicit effects in [`FlagEffects`].
+    Applied(FlagEffects),
 }
 
 /// One flag accepted by a tool or subcommand (contract §6).
@@ -164,7 +315,18 @@ pub(crate) struct FlagSpec {
     /// `ToolSpec::single_dash_long` is `true`, as for `find` primaries).
     pub(crate) long: Option<&'static str>,
     pub(crate) kind: FlagKind,
-    pub(crate) effects: FlagEffects,
+    pub(crate) effect: Effect,
+}
+
+impl FlagSpec {
+    /// Returns the flag's [`FlagEffects`] (`FlagEffects::EMPTY` when
+    /// `Effect::None`).
+    pub(crate) const fn effects(&self) -> FlagEffects {
+        match self.effect {
+            Effect::None { .. } => FlagEffects::EMPTY,
+            Effect::Applied(e) => e,
+        }
+    }
 }
 
 /// Operand role layout for a tool or subcommand (contract §6).
@@ -303,6 +465,10 @@ pub(crate) enum ProgramPin {
     /// Rule must name `[tool, operand0]` or `[tool, subcommand, operand0]`
     /// (e.g. `["python", "build.py"]`, `["sh", "x.sh"]`, `["pipx", "run", "pkg"]`).
     FirstOperand,
+    /// Rule must name the program-file flag and its value (e.g.
+    /// `["sed", "-f", "edit.sed"]`, `["awk", "-f", "prog.awk"]`; contract §4,
+    /// §7, §11 item 8).
+    FlagValue,
 }
 
 /// How a tool/subcommand executes code (contract §4, §6, §7).
@@ -313,17 +479,19 @@ pub(crate) enum CodeRunnerBehavior {
     InlineOnly,
     /// Runs inline code when a flag with `FlagEffects::runs_code` is given.
     InlineWithFlag,
-    /// Inspects script operands (`ValueRole::Code`, positional `[0]` or
+    /// Inspects inline script operands (`ValueRole::Code`, positional `[0]` or
     /// supplied via a `provides_script` flag such as `sed -e`/`--expression`)
     /// for the listed single-letter commands (e.g. `sed`'s `e`, `w`, `r`; §4).
-    /// Only scripts containing one of those commands (or a `runs_code` flag
-    /// such as `sed -f`) trigger code execution.
+    /// Only scripts containing one of those commands trigger inline code
+    /// (`UnreadReason::CodeRunnerInlineCode`). Flag-held program files
+    /// (`sed -f FILE` with `FlagEffects::runs_program`) instead produce
+    /// pinnable `UnreadReason::Program` (§7, §11 item 8).
     ScriptCommands(&'static [char]),
     /// Runs inline code when the first operand matches one of these subargs
     /// (e.g. `git bisect run`, `git submodule foreach`; §6).
     InlineWithSubarg(&'static [&'static str]),
-    /// Runs inline code with a code flag (`-c`/`-e`) OR runs a named program
-    /// file (`Unread (program)` coverable under `pin`; §4, §7).
+    /// Runs inline code with a code flag (`-c`/`-e`) or inline operand OR runs
+    /// a named program file (`Unread (program)` coverable under `pin`; §4, §7).
     ProgramOrInline {
         pin: ProgramPin,
     },
@@ -488,30 +656,30 @@ pub(crate) const GIT_CRED_DIRS: &[&str] = &[
 // Helper constructors for static table definitions
 // ---------------------------------------------------------------------------
 
-const fn bool_s(short: char) -> FlagSpec {
+const fn bool_none_s(short: char, reason: &'static str) -> FlagSpec {
     FlagSpec {
         short: Some(short),
         long: None,
         kind: FlagKind::Bool,
-        effects: FlagEffects::NONE,
+        effect: Effect::None { reason },
     }
 }
 
-const fn bool_l(long: &'static str) -> FlagSpec {
+const fn bool_none_l(long: &'static str, reason: &'static str) -> FlagSpec {
     FlagSpec {
         short: None,
         long: Some(long),
         kind: FlagKind::Bool,
-        effects: FlagEffects::NONE,
+        effect: Effect::None { reason },
     }
 }
 
-const fn bool_sl(short: char, long: &'static str) -> FlagSpec {
+const fn bool_none_sl(short: char, long: &'static str, reason: &'static str) -> FlagSpec {
     FlagSpec {
         short: Some(short),
         long: Some(long),
         kind: FlagKind::Bool,
-        effects: FlagEffects::NONE,
+        effect: Effect::None { reason },
     }
 }
 
@@ -520,34 +688,55 @@ const fn bool_e(short: Option<char>, long: Option<&'static str>, effects: FlagEf
         short,
         long,
         kind: FlagKind::Bool,
-        effects,
+        effect: Effect::Applied(effects),
     }
 }
 
-const fn val_s(short: char, role: ValueRole) -> FlagSpec {
+const fn bool_unread(
+    short: Option<char>,
+    long: Option<&'static str>,
+    unread: FlagUnread,
+) -> FlagSpec {
+    FlagSpec {
+        short,
+        long,
+        kind: FlagKind::Bool,
+        effect: Effect::Applied(FlagEffects {
+            unread: Some(unread),
+            ..FlagEffects::EMPTY
+        }),
+    }
+}
+
+const fn val_none_s(short: char, role: ValueRole, reason: &'static str) -> FlagSpec {
     FlagSpec {
         short: Some(short),
         long: None,
         kind: FlagKind::Value(role),
-        effects: FlagEffects::NONE,
+        effect: Effect::None { reason },
     }
 }
 
-const fn val_l(long: &'static str, role: ValueRole) -> FlagSpec {
+const fn val_none_l(long: &'static str, role: ValueRole, reason: &'static str) -> FlagSpec {
     FlagSpec {
         short: None,
         long: Some(long),
         kind: FlagKind::Value(role),
-        effects: FlagEffects::NONE,
+        effect: Effect::None { reason },
     }
 }
 
-const fn val_sl(short: char, long: &'static str, role: ValueRole) -> FlagSpec {
+const fn val_none_sl(
+    short: char,
+    long: &'static str,
+    role: ValueRole,
+    reason: &'static str,
+) -> FlagSpec {
     FlagSpec {
         short: Some(short),
         long: Some(long),
         kind: FlagKind::Value(role),
-        effects: FlagEffects::NONE,
+        effect: Effect::None { reason },
     }
 }
 
@@ -561,16 +750,38 @@ const fn val_e(
         short,
         long,
         kind: FlagKind::Value(role),
-        effects,
+        effect: Effect::Applied(effects),
     }
 }
 
-const fn opt_val_sl(short: char, long: &'static str, role: ValueRole) -> FlagSpec {
+const fn val_unread(
+    short: Option<char>,
+    long: Option<&'static str>,
+    role: ValueRole,
+    unread: FlagUnread,
+) -> FlagSpec {
+    FlagSpec {
+        short,
+        long,
+        kind: FlagKind::Value(role),
+        effect: Effect::Applied(FlagEffects {
+            unread: Some(unread),
+            ..FlagEffects::EMPTY
+        }),
+    }
+}
+
+const fn opt_val_none_sl(
+    short: char,
+    long: &'static str,
+    role: ValueRole,
+    reason: &'static str,
+) -> FlagSpec {
     FlagSpec {
         short: Some(short),
         long: Some(long),
         kind: FlagKind::OptionalValue(role),
-        effects: FlagEffects::NONE,
+        effect: Effect::None { reason },
     }
 }
 
@@ -594,7 +805,7 @@ const fn base_tool(name: &'static str) -> ToolSpec {
         name,
         platforms: Platforms::Both,
         subcommands: &[],
-        flag_mode: FlagMode::AnyExceptForbidden,
+        flag_mode: FlagMode::ListedOnly,
         single_dash_long: false,
         flags: &[],
         operands: OperandLayout::all(ValueRole::Path),
@@ -618,7 +829,7 @@ const fn base_tool(name: &'static str) -> ToolSpec {
 const fn base_subcommand(name: &'static str) -> SubcommandSpec {
     SubcommandSpec {
         name,
-        flag_mode: FlagMode::AnyExceptForbidden,
+        flag_mode: FlagMode::ListedOnly,
         flags: &[],
         operands: OperandLayout::all(ValueRole::Path),
         operand_access: OperandAccessMode::AllRead,
@@ -668,7 +879,7 @@ const fn target_then_code_runner(name: &'static str) -> ToolSpec {
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 4; §11 item 9"),
         ..base_tool(name)
     }
 }
@@ -693,58 +904,101 @@ const fn direct_code_runner(name: &'static str) -> ToolSpec {
 /// `RG_VAL_L`, plus `-L`/`--follow` and `-f`/`--file` from `gate.rs`.
 const RG_FLAGS: &[FlagSpec] = &[
     // Paired short + long booleans
-    bool_sl('i', "ignore-case"),
-    bool_sl('S', "smart-case"),
-    bool_sl('s', "case-sensitive"),
-    bool_sl('n', "line-number"),
-    bool_sl('N', "no-line-number"),
-    bool_sl('H', "with-filename"),
-    bool_sl('I', "no-filename"),
-    bool_sl('l', "files-with-matches"),
-    bool_sl('c', "count"),
-    bool_sl('o', "only-matching"),
-    bool_sl('v', "invert-match"),
-    bool_sl('w', "word-regexp"),
-    bool_sl('x', "line-regexp"),
-    bool_sl('u', "unrestricted"),
-    bool_sl('a', "text"),
-    bool_sl('U', "multiline"),
-    bool_sl('F', "fixed-strings"),
-    bool_sl('P', "pcre2"),
-    bool_sl('q', "quiet"),
-    bool_sl('0', "null"),
-    bool_sl('p', "pretty"),
-    bool_sl('b', "byte-offset"),
+    bool_none_sl('i', "ignore-case", "content match case-insensitivity only"),
+    bool_none_sl('S', "smart-case", "content match smart-case only"),
+    bool_none_sl('s', "case-sensitive", "content match case-sensitivity only"),
+    bool_none_sl('n', "line-number", "output formatting: print line numbers"),
+    bool_none_sl(
+        'N',
+        "no-line-number",
+        "output formatting: omit line numbers",
+    ),
+    bool_none_sl('H', "with-filename", "output formatting: print filename"),
+    bool_none_sl('I', "no-filename", "output formatting: omit filename"),
+    bool_none_sl(
+        'l',
+        "files-with-matches",
+        "output formatting: print matching filenames only",
+    ),
+    bool_none_sl('c', "count", "output formatting: print match count"),
+    bool_none_sl(
+        'o',
+        "only-matching",
+        "output formatting: print matched text only",
+    ),
+    bool_none_sl('v', "invert-match", "content match inversion only"),
+    bool_none_sl('w', "word-regexp", "content match word boundaries only"),
+    bool_none_sl('x', "line-regexp", "content match whole lines only"),
+    bool_none_sl(
+        'u',
+        "unrestricted",
+        "disables default ignore/hidden skipping; model checks all entries",
+    ),
+    bool_none_sl('a', "text", "treat binary files as text during match"),
+    bool_none_sl('U', "multiline", "multiline content match only"),
+    bool_none_sl('F', "fixed-strings", "literal content match only"),
+    bool_none_sl('P', "pcre2", "PCRE2 content regex engine only"),
+    bool_none_sl('q', "quiet", "suppress output"),
+    bool_none_sl('0', "null", "output formatting: NUL filename separator"),
+    bool_none_sl('p', "pretty", "output formatting: pretty display"),
+    bool_none_sl('b', "byte-offset", "output formatting: print byte offset"),
     bool_e(
         Some('L'),
         Some("follow"),
         FlagEffects {
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     // Long-only booleans
-    bool_l("hidden"),
-    bool_l("no-ignore"),
-    bool_l("no-ignore-vcs"),
-    bool_l("no-ignore-dot"),
-    bool_l("no-ignore-parent"),
-    bool_l("no-ignore-global"),
-    bool_l("no-ignore-files"),
-    bool_l("no-messages"),
-    bool_l("no-heading"),
-    bool_l("heading"),
-    bool_l("count-matches"),
-    bool_l("files-without-match"),
-    bool_l("multiline-dotall"),
-    bool_l("binary"),
+    bool_none_l(
+        "hidden",
+        "searches dotfiles; model already checks all entries",
+    ),
+    bool_none_l(
+        "no-ignore",
+        "disables ignore files; model already checks all entries",
+    ),
+    bool_none_l(
+        "no-ignore-vcs",
+        "disables VCS ignore files; model already checks all entries",
+    ),
+    bool_none_l(
+        "no-ignore-dot",
+        "disables .ignore files; model already checks all entries",
+    ),
+    bool_none_l(
+        "no-ignore-parent",
+        "disables parent ignore files; model already checks all entries",
+    ),
+    bool_none_l(
+        "no-ignore-global",
+        "disables global ignore files; model already checks all entries",
+    ),
+    bool_none_l(
+        "no-ignore-files",
+        "disables --ignore-file entries; model already checks all entries",
+    ),
+    bool_none_l("no-messages", "suppress error messages"),
+    bool_none_l("no-heading", "output formatting: omit file headings"),
+    bool_none_l("heading", "output formatting: print file headings"),
+    bool_none_l(
+        "count-matches",
+        "output formatting: print total match count",
+    ),
+    bool_none_l(
+        "files-without-match",
+        "output formatting: print non-matching filenames",
+    ),
+    bool_none_l("multiline-dotall", "multiline regex dotall mode only"),
+    bool_none_l("binary", "search binary files for content matches"),
     bool_e(
         None,
         Some("files"),
         FlagEffects {
             provides_pattern: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -752,23 +1006,37 @@ const RG_FLAGS: &[FlagSpec] = &[
         Some("type-list"),
         FlagEffects {
             provides_pattern: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_l("json"),
-    bool_l("column"),
-    bool_l("no-column"),
-    bool_l("vimgrep"),
-    bool_l("trim"),
-    bool_l("stats"),
-    bool_l("no-config"),
-    bool_l("version"),
-    bool_l("help"),
-    bool_l("no-pcre2"),
-    bool_l("crlf"),
-    bool_l("include-zero"),
-    bool_l("glob-case-insensitive"),
-    bool_l("no-glob-case-insensitive"),
+    bool_none_l("json", "output formatting: JSON lines"),
+    bool_none_l("column", "output formatting: print column number"),
+    bool_none_l("no-column", "output formatting: omit column number"),
+    bool_none_l("vimgrep", "output formatting: vimgrep format"),
+    bool_none_l("trim", "output formatting: trim leading whitespace"),
+    bool_none_l("stats", "output formatting: print search statistics"),
+    bool_none_l("no-config", "ignore ripgrep config file"),
+    bool_none_l("version", "print version and exit"),
+    bool_none_l("help", "print help and exit"),
+    bool_none_l("no-pcre2", "disable PCRE2 content regex engine"),
+    bool_none_l("crlf", "CRLF line terminator handling only"),
+    bool_none_l("include-zero", "output formatting: include zero counts"),
+    bool_e(
+        None,
+        Some("glob-case-insensitive"),
+        FlagEffects {
+            filter_case_insensitive: FlagToggle::Enable,
+            ..FlagEffects::EMPTY
+        },
+    ),
+    bool_e(
+        None,
+        Some("no-glob-case-insensitive"),
+        FlagEffects {
+            filter_case_insensitive: FlagToggle::Disable,
+            ..FlagEffects::EMPTY
+        },
+    ),
     // Paired short + long value flags
     val_e(
         Some('e'),
@@ -776,7 +1044,7 @@ const RG_FLAGS: &[FlagSpec] = &[
         ValueRole::Pattern,
         FlagEffects {
             provides_pattern: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -784,8 +1052,11 @@ const RG_FLAGS: &[FlagSpec] = &[
         Some("glob"),
         ValueRole::Pattern,
         FlagEffects {
-            filter: Some((FilterDialect::RgGlob, false)),
-            ..FlagEffects::NONE
+            filter: Some(FilterSpec {
+                dialect: FilterDialect::RgGlob,
+                case: FilterCase::FollowGlobalToggle,
+            }),
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -793,8 +1064,11 @@ const RG_FLAGS: &[FlagSpec] = &[
         Some("iglob"),
         ValueRole::Pattern,
         FlagEffects {
-            filter: Some((FilterDialect::RgGlob, true)),
-            ..FlagEffects::NONE
+            filter: Some(FilterSpec {
+                dialect: FilterDialect::RgGlob,
+                case: FilterCase::AlwaysInsensitive,
+            }),
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -802,37 +1076,129 @@ const RG_FLAGS: &[FlagSpec] = &[
         Some("file"),
         ValueRole::Path,
         FlagEffects {
+            value_access: Some(FlagValueAccess::Read),
             provides_pattern: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    val_sl('t', "type", ValueRole::Text),
-    val_sl('T', "type-not", ValueRole::Text),
-    val_sl('m', "max-count", ValueRole::Text),
-    val_sl('A', "after-context", ValueRole::Text),
-    val_sl('B', "before-context", ValueRole::Text),
-    val_sl('C', "context", ValueRole::Text),
-    val_sl('d', "max-depth", ValueRole::Text),
-    val_l("maxdepth", ValueRole::Text),
-    val_sl('j', "threads", ValueRole::Text),
-    val_sl('M', "max-columns", ValueRole::Text),
-    val_sl('E', "encoding", ValueRole::Text),
-    val_sl('r', "replace", ValueRole::Text),
+    // Unsupported file-type / depth / size filters (§5: other dialects / narrowing)
+    val_unread(
+        Some('t'),
+        Some("type"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_unread(
+        Some('T'),
+        Some("type-not"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_none_sl(
+        'm',
+        "max-count",
+        ValueRole::Text,
+        "limits matches printed per file",
+    ),
+    val_none_sl(
+        'A',
+        "after-context",
+        ValueRole::Text,
+        "prints trailing context lines",
+    ),
+    val_none_sl(
+        'B',
+        "before-context",
+        ValueRole::Text,
+        "prints leading context lines",
+    ),
+    val_none_sl(
+        'C',
+        "context",
+        ValueRole::Text,
+        "prints surrounding context lines",
+    ),
+    val_unread(
+        Some('d'),
+        Some("max-depth"),
+        ValueRole::Text,
+        FlagUnread::FilterForm,
+    ),
+    val_unread(
+        None,
+        Some("maxdepth"),
+        ValueRole::Text,
+        FlagUnread::FilterForm,
+    ),
+    val_none_sl('j', "threads", ValueRole::Text, "sets worker thread count"),
+    val_none_sl(
+        'M',
+        "max-columns",
+        ValueRole::Text,
+        "truncates long output lines",
+    ),
+    val_none_sl(
+        'E',
+        "encoding",
+        ValueRole::Text,
+        "selects text decoding for content match",
+    ),
+    val_none_sl(
+        'r',
+        "replace",
+        ValueRole::Text,
+        "formats matched output text",
+    ),
     // Long-only value flags
-    val_l("colors", ValueRole::Text),
-    val_l("color", ValueRole::Text),
-    val_l("sort", ValueRole::Text),
-    val_l("sortr", ValueRole::Text),
-    val_l("max-filesize", ValueRole::Text),
-    val_l("path-separator", ValueRole::Text),
-    val_l("engine", ValueRole::Text),
-    val_l("context-separator", ValueRole::Text),
-    val_l("type-add", ValueRole::Text),
-    val_l("type-clear", ValueRole::Text),
-    val_l("field-context-separator", ValueRole::Text),
-    val_l("field-match-separator", ValueRole::Text),
-    val_l("dfa-size-limit", ValueRole::Text),
-    val_l("regex-size-limit", ValueRole::Text),
+    val_none_l("colors", ValueRole::Text, "output color specification"),
+    val_none_l("color", ValueRole::Text, "output color mode"),
+    val_none_l("sort", ValueRole::Text, "sorts output order"),
+    val_none_l("sortr", ValueRole::Text, "reverse-sorts output order"),
+    val_unread(
+        None,
+        Some("max-filesize"),
+        ValueRole::Text,
+        FlagUnread::FilterForm,
+    ),
+    val_none_l(
+        "path-separator",
+        ValueRole::Text,
+        "output path display separator only",
+    ),
+    val_none_l("engine", ValueRole::Text, "selects regex engine"),
+    val_none_l(
+        "context-separator",
+        ValueRole::Text,
+        "output context separator string",
+    ),
+    val_unread(
+        None,
+        Some("type-add"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_unread(
+        None,
+        Some("type-clear"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_none_l(
+        "field-context-separator",
+        ValueRole::Text,
+        "output field separator string",
+    ),
+    val_none_l(
+        "field-match-separator",
+        ValueRole::Text,
+        "output field separator string",
+    ),
+    val_none_l("dfa-size-limit", ValueRole::Text, "regex DFA memory limit"),
+    val_none_l(
+        "regex-size-limit",
+        ValueRole::Text,
+        "regex compilation memory limit",
+    ),
 ];
 
 /// `grep` / `egrep` / `fgrep` / `zgrep` / `ggrep` / `rgrep` flags copied from
@@ -840,37 +1206,49 @@ const RG_FLAGS: &[FlagSpec] = &[
 /// `-f`/`--file` from `gate.rs`.
 const GREP_FLAGS: &[FlagSpec] = &[
     // Paired short + long booleans
-    bool_sl('i', "ignore-case"),
-    bool_l("no-ignore-case"),
-    bool_sl('v', "invert-match"),
-    bool_sl('n', "line-number"),
-    bool_sl('c', "count"),
-    bool_sl('l', "files-with-matches"),
-    bool_sl('L', "files-without-match"),
-    bool_sl('o', "only-matching"),
-    bool_sl('q', "quiet"),
-    bool_l("silent"),
-    bool_sl('s', "no-messages"),
-    bool_sl('w', "word-regexp"),
-    bool_sl('x', "line-regexp"),
-    bool_sl('h', "no-filename"),
-    bool_sl('H', "with-filename"),
-    bool_sl('E', "extended-regexp"),
-    bool_sl('F', "fixed-strings"),
-    bool_sl('G', "basic-regexp"),
-    bool_sl('P', "perl-regexp"),
-    bool_sl('a', "text"),
-    bool_sl('z', "null-data"),
-    bool_sl('Z', "null"),
-    bool_sl('b', "byte-offset"),
-    bool_sl('T', "initial-tab"),
+    bool_none_sl('i', "ignore-case", "content match case-insensitivity only"),
+    bool_none_l("no-ignore-case", "content match case-sensitivity only"),
+    bool_none_sl('v', "invert-match", "content match inversion only"),
+    bool_none_sl('n', "line-number", "output formatting: print line numbers"),
+    bool_none_sl('c', "count", "output formatting: print match count"),
+    bool_none_sl(
+        'l',
+        "files-with-matches",
+        "output formatting: print matching filenames only",
+    ),
+    bool_none_sl(
+        'L',
+        "files-without-match",
+        "output formatting: print non-matching filenames",
+    ),
+    bool_none_sl(
+        'o',
+        "only-matching",
+        "output formatting: print matched text only",
+    ),
+    bool_none_sl('q', "quiet", "suppress output"),
+    bool_none_l("silent", "suppress output"),
+    bool_none_sl('s', "no-messages", "suppress error messages"),
+    bool_none_sl('w', "word-regexp", "content match word boundaries only"),
+    bool_none_sl('x', "line-regexp", "content match whole lines only"),
+    bool_none_sl('h', "no-filename", "output formatting: omit filename"),
+    bool_none_sl('H', "with-filename", "output formatting: print filename"),
+    bool_none_sl('E', "extended-regexp", "ERE content regex dialect only"),
+    bool_none_sl('F', "fixed-strings", "literal content match only"),
+    bool_none_sl('G', "basic-regexp", "BRE content regex dialect only"),
+    bool_none_sl('P', "perl-regexp", "PCRE content regex dialect only"),
+    bool_none_sl('a', "text", "treat binary files as text during match"),
+    bool_none_sl('z', "null-data", "NUL-delimited input lines only"),
+    bool_none_sl('Z', "null", "output formatting: NUL filename separator"),
+    bool_none_sl('b', "byte-offset", "output formatting: print byte offset"),
+    bool_none_sl('T', "initial-tab", "output formatting: align tab"),
     bool_e(
         Some('r'),
         Some("recursive"),
         FlagEffects {
             recursive: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -880,24 +1258,27 @@ const GREP_FLAGS: &[FlagSpec] = &[
             recursive: FlagToggle::Enable,
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_l("no-group-separator"),
+    bool_none_l(
+        "no-group-separator",
+        "output formatting: omit context group separator",
+    ),
     // Short-only booleans from GREP_BOOL_S
-    bool_s('I'),
-    bool_s('U'),
-    bool_s('y'),
-    bool_s('0'),
-    bool_s('1'),
-    bool_s('2'),
-    bool_s('3'),
-    bool_s('4'),
-    bool_s('5'),
-    bool_s('6'),
-    bool_s('7'),
-    bool_s('8'),
-    bool_s('9'),
+    bool_none_s('I', "skip binary files in content match only"),
+    bool_none_s('U', "binary CR handling on MS-DOS/Windows only"),
+    bool_none_s('y', "obsolete alias for -i ignore-case"),
+    bool_none_s('0', "digit context-line count shorthand"),
+    bool_none_s('1', "digit context-line count shorthand"),
+    bool_none_s('2', "digit context-line count shorthand"),
+    bool_none_s('3', "digit context-line count shorthand"),
+    bool_none_s('4', "digit context-line count shorthand"),
+    bool_none_s('5', "digit context-line count shorthand"),
+    bool_none_s('6', "digit context-line count shorthand"),
+    bool_none_s('7', "digit context-line count shorthand"),
+    bool_none_s('8', "digit context-line count shorthand"),
+    bool_none_s('9', "digit context-line count shorthand"),
     // Value flags
     val_e(
         Some('e'),
@@ -905,7 +1286,7 @@ const GREP_FLAGS: &[FlagSpec] = &[
         ValueRole::Pattern,
         FlagEffects {
             provides_pattern: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -913,79 +1294,150 @@ const GREP_FLAGS: &[FlagSpec] = &[
         Some("file"),
         ValueRole::Path,
         FlagEffects {
+            value_access: Some(FlagValueAccess::Read),
             provides_pattern: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    val_sl('m', "max-count", ValueRole::Text),
-    val_sl('A', "after-context", ValueRole::Text),
-    val_sl('B', "before-context", ValueRole::Text),
-    val_sl('C', "context", ValueRole::Text),
+    val_none_sl(
+        'm',
+        "max-count",
+        ValueRole::Text,
+        "limits matches printed per file",
+    ),
+    val_none_sl(
+        'A',
+        "after-context",
+        ValueRole::Text,
+        "prints trailing context lines",
+    ),
+    val_none_sl(
+        'B',
+        "before-context",
+        ValueRole::Text,
+        "prints leading context lines",
+    ),
+    val_none_sl(
+        'C',
+        "context",
+        ValueRole::Text,
+        "prints surrounding context lines",
+    ),
     val_e(
         Some('d'),
         Some("directories"),
         ValueRole::Text,
         FlagEffects {
             recursive: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            unread: Some(FlagUnread::FlagEffect),
+            ..FlagEffects::EMPTY
         },
     ),
-    val_sl('D', "devices", ValueRole::Text),
+    val_none_sl(
+        'D',
+        "devices",
+        ValueRole::Text,
+        "device/FIFO handling only; does not change file or directory selection",
+    ),
     val_e(
         None,
         Some("include"),
         ValueRole::Pattern,
         FlagEffects {
-            filter: Some((FilterDialect::GrepInclude, false)),
-            ..FlagEffects::NONE
+            filter: Some(FilterSpec {
+                dialect: FilterDialect::GrepInclude,
+                case: FilterCase::AlwaysSensitive,
+            }),
+            ..FlagEffects::EMPTY
         },
     ),
-    val_l("exclude", ValueRole::Pattern),
-    val_l("exclude-dir", ValueRole::Pattern),
-    val_l("label", ValueRole::Text),
-    val_l("color", ValueRole::Text),
-    val_l("colour", ValueRole::Text),
-    val_l("binary-files", ValueRole::Text),
-    val_l("group-separator", ValueRole::Text),
+    // Unsupported grep filters (§5: negated / directory filters → Unread)
+    val_unread(
+        None,
+        Some("exclude"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_unread(
+        None,
+        Some("exclude-dir"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_unread(
+        None,
+        Some("include-dir"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_none_l("label", ValueRole::Text, "stdin display label in output"),
+    val_none_l("color", ValueRole::Text, "output color mode"),
+    val_none_l("colour", ValueRole::Text, "output color mode"),
+    val_none_l(
+        "binary-files",
+        ValueRole::Text,
+        "binary file content match mode only",
+    ),
+    val_none_l(
+        "group-separator",
+        ValueRole::Text,
+        "output context group separator string",
+    ),
 ];
 
 /// `ag` flags copied faithfully from `gate::AG_OPTS`.
 const AG_FLAGS: &[FlagSpec] = &[
     // Paired short + long booleans
-    bool_sl('a', "all-types"),
-    bool_sl('D', "debug"),
-    bool_sl('c', "count"),
-    bool_sl('F', "fixed-strings"),
+    bool_none_sl(
+        'a',
+        "all-types",
+        "disables default type skipping; model already checks all entries",
+    ),
+    bool_none_sl('D', "debug", "prints debug diagnostics only"),
+    bool_none_sl('c', "count", "output formatting: print match count"),
+    bool_none_sl('F', "fixed-strings", "literal content match only"),
     bool_e(
         Some('f'),
         Some("follow"),
         FlagEffects {
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_sl('H', "heading"),
-    bool_s('h'),
-    bool_sl('i', "ignore-case"),
-    bool_sl('L', "files-without-matches"),
-    bool_sl('l', "files-with-matches"),
+    bool_none_sl('H', "heading", "output formatting: print file headings"),
+    bool_none_s('h', "print help and exit"),
+    bool_none_sl('i', "ignore-case", "content match case-insensitivity only"),
+    bool_none_sl(
+        'L',
+        "files-without-matches",
+        "output formatting: print non-matching filenames",
+    ),
+    bool_none_sl(
+        'l',
+        "files-with-matches",
+        "output formatting: print matching filenames only",
+    ),
     bool_e(
         Some('n'),
         Some("norecurse"),
         FlagEffects {
             recursive: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_sl('o', "only-matching"),
-    bool_sl('Q', "literal"),
+    bool_none_sl(
+        'o',
+        "only-matching",
+        "output formatting: print matched text only",
+    ),
+    bool_none_sl('Q', "literal", "literal content match only"),
     bool_e(
         Some('R'),
         Some("recurse"),
         FlagEffects {
             recursive: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -993,124 +1445,227 @@ const AG_FLAGS: &[FlagSpec] = &[
         None,
         FlagEffects {
             recursive: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_sl('S', "smart-case"),
-    bool_sl('s', "case-sensitive"),
-    bool_sl('v', "invert-match"),
-    bool_s('V'),
-    bool_sl('t', "all-text"),
-    bool_sl('u', "unrestricted"),
-    bool_sl('U', "skip-vcs-ignores"),
-    bool_sl('w', "word-regexp"),
-    bool_sl('z', "search-zip"),
-    bool_sl('0', "null"),
+    bool_none_sl('S', "smart-case", "content match smart-case only"),
+    bool_none_sl('s', "case-sensitive", "content match case-sensitivity only"),
+    bool_none_sl('v', "invert-match", "content match inversion only"),
+    bool_none_s('V', "print version and exit"),
+    bool_none_sl(
+        't',
+        "all-text",
+        "disables ignore skipping for text files; model checks all entries",
+    ),
+    bool_none_sl(
+        'u',
+        "unrestricted",
+        "disables ignore/hidden skipping; model checks all entries",
+    ),
+    bool_none_sl(
+        'U',
+        "skip-vcs-ignores",
+        "disables VCS ignore files; model checks all entries",
+    ),
+    bool_none_sl('w', "word-regexp", "content match word boundaries only"),
+    bool_unread(Some('z'), Some("search-zip"), FlagUnread::FlagEffect),
+    bool_none_sl('0', "null", "output formatting: NUL filename separator"),
     // Long-only booleans
-    bool_l("ackmate"),
-    bool_l("affinity"),
-    bool_l("noaffinity"),
-    bool_l("hidden"),
-    bool_l("column"),
-    bool_l("nocolor"),
-    bool_l("color"),
-    bool_l("color-win-ansi"),
-    bool_l("noheading"),
-    bool_l("nobreak"),
-    bool_l("break"),
+    bool_none_l("ackmate", "output formatting: AckMate format"),
+    bool_none_l("affinity", "CPU thread affinity setting only"),
+    bool_none_l("noaffinity", "disables CPU thread affinity only"),
+    bool_none_l(
+        "hidden",
+        "searches dotfiles; model already checks all entries",
+    ),
+    bool_none_l("column", "output formatting: print column number"),
+    bool_none_l("nocolor", "output formatting: disable color"),
+    bool_none_l("color", "output formatting: enable color"),
+    bool_none_l(
+        "color-win-ansi",
+        "output formatting: ANSI colors on Windows",
+    ),
+    bool_none_l("noheading", "output formatting: omit file headings"),
+    bool_none_l(
+        "nobreak",
+        "output formatting: omit blank lines between files",
+    ),
+    bool_none_l(
+        "break",
+        "output formatting: print blank lines between files",
+    ),
     bool_e(
         None,
         Some("nofollow"),
         FlagEffects {
             follows_links_at_root: FlagToggle::Disable,
             follows_links_below_root: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_l("search-binary"),
-    bool_l("silent"),
-    bool_l("stats"),
-    bool_l("stats-only"),
-    bool_l("vimgrep"),
-    bool_l("print0"),
-    bool_l("one-device"),
-    bool_l("filename"),
-    bool_l("nofilename"),
-    bool_l("numbers"),
-    bool_l("nonumbers"),
-    bool_l("line-numbers"),
-    bool_l("group"),
-    bool_l("nogroup"),
-    bool_l("match"),
-    bool_l("mmap"),
-    bool_l("nommap"),
-    bool_l("multiline"),
-    bool_l("nomultiline"),
-    bool_l("nopager"),
-    bool_l("parallel"),
-    bool_l("passthrough"),
-    bool_l("passthru"),
-    bool_l("print-all-files"),
-    bool_l("print-long-lines"),
-    // Value flags
-    val_sl('G', "file-search-regex", ValueRole::Pattern),
+    bool_none_l(
+        "search-binary",
+        "search binary files; model already checks all entries",
+    ),
+    bool_none_l("silent", "suppress error messages"),
+    bool_none_l("stats", "output formatting: print search statistics"),
+    bool_none_l(
+        "stats-only",
+        "output formatting: print search statistics only",
+    ),
+    bool_none_l("vimgrep", "output formatting: vimgrep format"),
+    bool_none_l("print0", "output formatting: NUL filename separator"),
+    bool_unread(None, Some("one-device"), FlagUnread::FilterForm),
+    bool_none_l("filename", "output formatting: print filename"),
+    bool_none_l("nofilename", "output formatting: omit filename"),
+    bool_none_l("numbers", "output formatting: print line numbers"),
+    bool_none_l("nonumbers", "output formatting: omit line numbers"),
+    bool_none_l("line-numbers", "output formatting: print line numbers"),
+    bool_none_l("group", "output formatting: group matches by file"),
+    bool_none_l("nogroup", "output formatting: do not group matches by file"),
+    bool_none_l("match", "disables filename-only search mode"),
+    bool_none_l("mmap", "use mmap for file reading only"),
+    bool_none_l("nommap", "disable mmap for file reading only"),
+    bool_none_l("multiline", "multiline content match only"),
+    bool_none_l("nomultiline", "disable multiline content match"),
+    bool_none_l("nopager", "do not pipe output to pager"),
+    bool_none_l("parallel", "enable parallel search threads only"),
+    bool_none_l("passthrough", "output formatting: print all lines of file"),
+    bool_none_l("passthru", "output formatting: print all lines of file"),
+    bool_none_l(
+        "print-all-files",
+        "output formatting: print all file headers",
+    ),
+    bool_none_l(
+        "print-long-lines",
+        "output formatting: do not truncate lines",
+    ),
+    // Value flags (unsupported filter / ignore options → Unread)
+    val_unread(
+        Some('G'),
+        Some("file-search-regex"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
     val_e(
         Some('g'),
         Some("filename-pattern"),
         ValueRole::Pattern,
         FlagEffects {
             provides_pattern: true,
-            ..FlagEffects::NONE
+            unread: Some(FlagUnread::FilterForm),
+            ..FlagEffects::EMPTY
         },
     ),
-    val_sl('m', "max-count", ValueRole::Text),
-    val_sl('p', "path-to-ignore", ValueRole::Path),
-    val_sl('W', "width", ValueRole::Text),
-    val_l("ackmate-dir-filter", ValueRole::Pattern),
-    val_l("depth", ValueRole::Text),
-    val_l("ignore", ValueRole::Pattern),
-    val_l("ignore-dir", ValueRole::Pattern),
+    val_none_sl(
+        'm',
+        "max-count",
+        ValueRole::Text,
+        "limits matches printed per file",
+    ),
+    val_e(
+        Some('p'),
+        Some("path-to-ignore"),
+        ValueRole::Path,
+        FlagEffects {
+            value_access: Some(FlagValueAccess::Read),
+            unread: Some(FlagUnread::FilterForm),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    val_none_sl(
+        'W',
+        "width",
+        ValueRole::Text,
+        "output formatting: truncate lines to width",
+    ),
+    val_unread(
+        None,
+        Some("ackmate-dir-filter"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_unread(None, Some("depth"), ValueRole::Text, FlagUnread::FilterForm),
+    val_unread(
+        None,
+        Some("ignore"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_unread(
+        None,
+        Some("ignore-dir"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
     val_e(
         None,
         Some("pager"),
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    val_l("workers", ValueRole::Text),
-    val_l("color-line-number", ValueRole::Text),
-    val_l("color-match", ValueRole::Text),
-    val_l("color-path", ValueRole::Text),
+    val_none_l("workers", ValueRole::Text, "sets worker thread count"),
+    val_none_l(
+        "color-line-number",
+        ValueRole::Text,
+        "output color for line numbers",
+    ),
+    val_none_l("color-match", ValueRole::Text, "output color for matches"),
+    val_none_l("color-path", ValueRole::Text, "output color for paths"),
     // Optional-value flags
-    opt_val_sl('A', "after", ValueRole::Text),
-    opt_val_sl('B', "before", ValueRole::Text),
-    opt_val_sl('C', "context", ValueRole::Text),
+    opt_val_none_sl(
+        'A',
+        "after",
+        ValueRole::Text,
+        "prints trailing context lines",
+    ),
+    opt_val_none_sl(
+        'B',
+        "before",
+        ValueRole::Text,
+        "prints leading context lines",
+    ),
+    opt_val_none_sl(
+        'C',
+        "context",
+        ValueRole::Text,
+        "prints surrounding context lines",
+    ),
 ];
 
 /// `ack` flags copied faithfully from `gate::ACK_OPTS`.
 const ACK_FLAGS: &[FlagSpec] = &[
     // Paired short + long booleans
-    bool_sl('i', "ignore-case"),
-    bool_s('I'),
-    bool_sl('S', "smart-case"),
-    bool_sl('v', "invert-match"),
-    bool_sl('w', "word-regexp"),
-    bool_sl('Q', "literal"),
-    bool_sl('l', "files-with-matches"),
-    bool_sl('L', "files-without-matches"),
-    bool_sl('c', "count"),
-    bool_sl('h', "no-filename"),
-    bool_sl('H', "with-filename"),
-    bool_s('o'),
-    bool_s('1'),
+    bool_none_sl('i', "ignore-case", "content match case-insensitivity only"),
+    bool_none_s('I', "content match case-sensitivity only"),
+    bool_none_sl('S', "smart-case", "content match smart-case only"),
+    bool_none_sl('v', "invert-match", "content match inversion only"),
+    bool_none_sl('w', "word-regexp", "content match word boundaries only"),
+    bool_none_sl('Q', "literal", "literal content match only"),
+    bool_none_sl(
+        'l',
+        "files-with-matches",
+        "output formatting: print matching filenames only",
+    ),
+    bool_none_sl(
+        'L',
+        "files-without-matches",
+        "output formatting: print non-matching filenames",
+    ),
+    bool_none_sl('c', "count", "output formatting: print match count"),
+    bool_none_sl('h', "no-filename", "output formatting: omit filename"),
+    bool_none_sl('H', "with-filename", "output formatting: print filename"),
+    bool_none_s('o', "output formatting: print matched text only"),
+    bool_none_s('1', "stop after first match"),
     bool_e(
         Some('n'),
         Some("no-recurse"),
         FlagEffects {
             recursive: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1118,7 +1673,7 @@ const ACK_FLAGS: &[FlagSpec] = &[
         Some("recurse"),
         FlagEffects {
             recursive: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1126,35 +1681,41 @@ const ACK_FLAGS: &[FlagSpec] = &[
         None,
         FlagEffects {
             recursive: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_s('s'),
-    bool_s('x'),
+    bool_none_s('s', "suppress error messages"),
+    bool_unread(Some('x'), None, FlagUnread::FlagEffect),
     bool_e(
         Some('f'),
         None,
         FlagEffects {
             provides_pattern: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_s('k'),
+    bool_unread(Some('k'), None, FlagUnread::FilterForm),
     // Long-only booleans
-    bool_l("column"),
-    bool_l("nocolor"),
-    bool_l("color"),
-    bool_l("noheading"),
-    bool_l("heading"),
-    bool_l("nobreak"),
-    bool_l("break"),
+    bool_none_l("column", "output formatting: print column number"),
+    bool_none_l("nocolor", "output formatting: disable color"),
+    bool_none_l("color", "output formatting: enable color"),
+    bool_none_l("noheading", "output formatting: omit file headings"),
+    bool_none_l("heading", "output formatting: print file headings"),
+    bool_none_l(
+        "nobreak",
+        "output formatting: omit blank lines between files",
+    ),
+    bool_none_l(
+        "break",
+        "output formatting: print blank lines between files",
+    ),
     bool_e(
         None,
         Some("follow"),
         FlagEffects {
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1163,34 +1724,65 @@ const ACK_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Disable,
             follows_links_below_root: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_l("sort-files"),
-    bool_l("nopager"),
+    bool_none_l("sort-files", "sorts output file order only"),
+    bool_none_l("nopager", "do not pipe output to pager"),
     // Value flags
-    val_sl('A', "after-context", ValueRole::Text),
-    val_sl('B', "before-context", ValueRole::Text),
-    val_sl('m', "max-count", ValueRole::Text),
+    val_none_sl(
+        'A',
+        "after-context",
+        ValueRole::Text,
+        "prints trailing context lines",
+    ),
+    val_none_sl(
+        'B',
+        "before-context",
+        ValueRole::Text,
+        "prints leading context lines",
+    ),
+    val_none_sl(
+        'm',
+        "max-count",
+        ValueRole::Text,
+        "limits matches printed per file",
+    ),
     val_e(
         Some('g'),
         None,
         ValueRole::Pattern,
         FlagEffects {
             provides_pattern: true,
-            ..FlagEffects::NONE
+            unread: Some(FlagUnread::FilterForm),
+            ..FlagEffects::EMPTY
         },
     ),
-    val_sl('t', "type", ValueRole::Text),
-    val_l("ignore-dir", ValueRole::Pattern),
-    val_l("noignore-dir", ValueRole::Pattern),
+    val_unread(
+        Some('t'),
+        Some("type"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_unread(
+        None,
+        Some("ignore-dir"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
+    val_unread(
+        None,
+        Some("noignore-dir"),
+        ValueRole::Pattern,
+        FlagUnread::FilterForm,
+    ),
     val_e(
         None,
         Some("match"),
         ValueRole::Pattern,
         FlagEffects {
             provides_pattern: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1199,37 +1791,60 @@ const ACK_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     // Optional-value flags
-    opt_val_sl('C', "context", ValueRole::Text),
+    opt_val_none_sl(
+        'C',
+        "context",
+        ValueRole::Text,
+        "prints surrounding context lines",
+    ),
 ];
 
 /// Modeled nested-shell flags (§4: `-e`, `-u`, `-x`, `-c SCRIPT`).
 const MODELED_SHELL_FLAGS: &[FlagSpec] = &[
-    bool_s('e'),
-    bool_s('u'),
-    bool_s('x'),
+    bool_none_s('e', "shell errexit option; allowed before -c (§4)"),
+    bool_none_s('u', "shell nounset option; allowed before -c (§4)"),
+    bool_none_s('x', "shell xtrace option; allowed before -c (§4)"),
     val_e(
         Some('c'),
         None,
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
 ];
 
 /// `nice` flags (§4: `nice`, `nice -n N`).
-const NICE_FLAGS: &[FlagSpec] = &[val_s('n', ValueRole::Text)];
+const NICE_FLAGS: &[FlagSpec] = &[val_none_s(
+    'n',
+    ValueRole::Text,
+    "scheduling priority increment; allowed wrapper option (§4)",
+)];
 
 /// `timeout` flags (§4: `timeout [-s SIG] [-k D] D`).
-const TIMEOUT_FLAGS: &[FlagSpec] = &[val_s('s', ValueRole::Text), val_s('k', ValueRole::Text)];
+const TIMEOUT_FLAGS: &[FlagSpec] = &[
+    val_none_s(
+        's',
+        ValueRole::Text,
+        "termination signal name/number; allowed wrapper option (§4)",
+    ),
+    val_none_s(
+        'k',
+        ValueRole::Text,
+        "kill-after duration; allowed wrapper option (§4)",
+    ),
+];
 
 /// `ln` flags (§6: `ln` and `ln -s`).
-const LN_FLAGS: &[FlagSpec] = &[bool_s('s')];
+const LN_FLAGS: &[FlagSpec] = &[bool_none_s(
+    's',
+    "creates symbolic link instead of hard link; target stays Read and link stays Write (§6)",
+)];
 
 /// `cp` flags known to `dev` (`gate.rs`: `-r`, `-R`, `-a`, `--recursive`,
 /// `--archive`, `-L`, `--dereference`, `-P`, `-d`).
@@ -1240,7 +1855,7 @@ const CP_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             recursive: FlagToggle::Enable,
             derived_destinations: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1249,7 +1864,7 @@ const CP_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             recursive: FlagToggle::Enable,
             derived_destinations: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1260,7 +1875,7 @@ const CP_FLAGS: &[FlagSpec] = &[
             derived_destinations: FlagToggle::Enable,
             follows_links_at_root: FlagToggle::Disable,
             follows_links_below_root: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1269,7 +1884,7 @@ const CP_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1278,7 +1893,7 @@ const CP_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Disable,
             follows_links_below_root: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1287,7 +1902,7 @@ const CP_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Disable,
             follows_links_below_root: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
 ];
@@ -1301,7 +1916,7 @@ const RSYNC_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1310,7 +1925,7 @@ const RSYNC_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1319,7 +1934,7 @@ const RSYNC_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
 ];
@@ -1327,7 +1942,7 @@ const RSYNC_FLAGS: &[FlagSpec] = &[
 /// `tar` flags distinguishing creation/update source paths (`-c`/`-r`/`-u`)
 /// from extraction/listing archive member selectors (`-x`/`-t`), plus `-h`/
 /// `--dereference` (`gate.rs`), `-f`/`--file` (archive path), and `-C`/
-/// `--directory` (destination root).
+/// `--directory` (base-directory change for later operands → `Unread`).
 ///
 /// For old-style bundled key arguments (`tar chf out.tar proj/key`), P3 reads
 /// the same operation letters (`c`/`r`/`u` → `Path`, `x`/`t` → `ArchiveMember`,
@@ -1339,7 +1954,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             writes: FlagToggle::Enable,
             positional_role: Some(ValueRole::Path),
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1348,7 +1963,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             writes: FlagToggle::Enable,
             positional_role: Some(ValueRole::Path),
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1357,7 +1972,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             writes: FlagToggle::Enable,
             positional_role: Some(ValueRole::Path),
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1367,7 +1982,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
             writes: FlagToggle::Enable,
             derived_destinations: FlagToggle::Enable,
             positional_role: Some(ValueRole::ArchiveMember),
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1375,7 +1990,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some("list"),
         FlagEffects {
             positional_role: Some(ValueRole::ArchiveMember),
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1384,11 +1999,28 @@ const TAR_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    val_sl('f', "file", ValueRole::Path),
-    val_sl('C', "directory", ValueRole::DestinationRoot),
+    val_e(
+        Some('f'),
+        Some("file"),
+        ValueRole::Path,
+        FlagEffects {
+            value_access: Some(FlagValueAccess::WriteWhenWriting),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    val_e(
+        Some('C'),
+        Some("directory"),
+        ValueRole::DestinationRoot,
+        FlagEffects {
+            value_access: Some(FlagValueAccess::WriteWhenWriting),
+            unread: Some(FlagUnread::BaseDirChange),
+            ..FlagEffects::EMPTY
+        },
+    ),
 ];
 
 /// `unzip` destination-directory flag (`-d DIR` writes to destination root).
@@ -1398,12 +2030,27 @@ const UNZIP_FLAGS: &[FlagSpec] = &[val_e(
     ValueRole::DestinationRoot,
     FlagEffects {
         writes: FlagToggle::Enable,
-        ..FlagEffects::NONE
+        value_access: Some(FlagValueAccess::Write),
+        ..FlagEffects::EMPTY
     },
 )];
 
 /// `cd` flags from `words.rs` (`-L`, `-P`, `-e`, `-@`).
-const CD_FLAGS: &[FlagSpec] = &[bool_s('L'), bool_s('P'), bool_s('e'), bool_s('@')];
+const CD_FLAGS: &[FlagSpec] = &[
+    bool_none_s(
+        'L',
+        "logical symlink handling for cd; target resolved by P2 (§5)",
+    ),
+    bool_none_s(
+        'P',
+        "physical symlink handling for cd; target resolved by P2 (§5)",
+    ),
+    bool_none_s('e', "exit non-zero if physical cwd cannot be determined"),
+    bool_none_s(
+        '@',
+        "extended-attribute directory flag accepted by dev's cd parser",
+    ),
+];
 
 /// `find` flags known to `dev` (`shell.rs`, `gate.rs`, `deny.rs`, `words.rs`)
 /// and contract §4/§5.
@@ -1418,7 +2065,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1427,7 +2074,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Enable,
             follows_links_below_root: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1436,27 +2083,55 @@ const FIND_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             follows_links_at_root: FlagToggle::Disable,
             follows_links_below_root: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_s('E'),
-    bool_s('X'),
-    bool_s('d'),
-    bool_s('s'),
-    bool_s('x'),
-    val_s('D', ValueRole::Text),
-    val_s('f', ValueRole::Path),
+    bool_none_s('E', "extended regex syntax for -regex predicate only"),
+    bool_none_s('X', "xargs-safe path warning mode only"),
+    bool_none_s(
+        'd',
+        "BSD depth-first traversal order only (same files visited)",
+    ),
+    bool_none_s(
+        's',
+        "BSD lexicographical traversal order only (same files visited)",
+    ),
+    bool_unread(Some('x'), None, FlagUnread::FilterForm),
+    val_none_s('D', ValueRole::Text, "GNU find debug output category only"),
+    val_e(
+        Some('f'),
+        None,
+        ValueRole::Path,
+        FlagEffects {
+            value_access: Some(FlagValueAccess::Read),
+            ..FlagEffects::EMPTY
+        },
+    ),
     bool_e(
         None,
         Some("delete"),
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            derived_destinations: FlagToggle::Enable,
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_l("depth"),
-    val_l("maxdepth", ValueRole::Text),
-    val_l("mindepth", ValueRole::Text),
+    bool_none_l(
+        "depth",
+        "depth-first traversal order only (same files visited)",
+    ),
+    val_unread(
+        None,
+        Some("maxdepth"),
+        ValueRole::Text,
+        FlagUnread::FilterForm,
+    ),
+    val_unread(
+        None,
+        Some("mindepth"),
+        ValueRole::Text,
+        FlagUnread::FilterForm,
+    ),
     val_e(
         None,
         Some("exec"),
@@ -1464,7 +2139,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             writes: FlagToggle::Enable,
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1474,7 +2149,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             writes: FlagToggle::Enable,
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1484,7 +2159,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             writes: FlagToggle::Enable,
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1494,7 +2169,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         FlagEffects {
             writes: FlagToggle::Enable,
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1503,7 +2178,8 @@ const FIND_FLAGS: &[FlagSpec] = &[
         ValueRole::Path,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            value_access: Some(FlagValueAccess::Write),
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1512,7 +2188,8 @@ const FIND_FLAGS: &[FlagSpec] = &[
         ValueRole::Path,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            value_access: Some(FlagValueAccess::Write),
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1521,7 +2198,8 @@ const FIND_FLAGS: &[FlagSpec] = &[
         ValueRole::Path,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            value_access: Some(FlagValueAccess::Write),
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1530,7 +2208,8 @@ const FIND_FLAGS: &[FlagSpec] = &[
         ValueRole::Path,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            value_access: Some(FlagValueAccess::Write),
+            ..FlagEffects::EMPTY
         },
     ),
 ];
@@ -1542,7 +2221,7 @@ const RM_FLAGS: &[FlagSpec] = &[
         Some("recursive"),
         FlagEffects {
             recursive: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1550,7 +2229,7 @@ const RM_FLAGS: &[FlagSpec] = &[
         None,
         FlagEffects {
             recursive: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
 ];
@@ -1562,15 +2241,31 @@ const OUTPUT_FILE_FLAGS: &[FlagSpec] = &[val_e(
     ValueRole::Path,
     FlagEffects {
         writes: FlagToggle::Enable,
-        ..FlagEffects::NONE
+        value_access: Some(FlagValueAccess::Write),
+        ..FlagEffects::EMPTY
     },
 )];
 
 /// `echo` flags known to `dev` (`shell.rs`).
-const ECHO_FLAGS: &[FlagSpec] = &[bool_s('n'), bool_s('e'), bool_s('E')];
+const ECHO_FLAGS: &[FlagSpec] = &[
+    bool_none_s('n', "omits trailing newline in stdout output only"),
+    bool_none_s('e', "interprets backslash escapes in stdout output only"),
+    bool_none_s(
+        'E',
+        "disables backslash escape interpretation in stdout output only",
+    ),
+];
 
 /// `printf` flags known to `dev` (`shell.rs`).
-const PRINTF_FLAGS: &[FlagSpec] = &[val_s('v', ValueRole::Text)];
+///
+/// `-v VAR` assigns a shell variable in bash (including `HOME`), outside §3's
+/// assignment model → `Unread(UnsupportedFlagEffect)`.
+const PRINTF_FLAGS: &[FlagSpec] = &[val_unread(
+    Some('v'),
+    None,
+    ValueRole::Text,
+    FlagUnread::FlagEffect,
+)];
 
 /// `codesign` flags known to `dev` (`words.rs`).
 const CODESIGN_FLAGS: &[FlagSpec] = &[
@@ -1580,7 +2275,7 @@ const CODESIGN_FLAGS: &[FlagSpec] = &[
         ValueRole::Text,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1588,7 +2283,7 @@ const CODESIGN_FLAGS: &[FlagSpec] = &[
         Some("force"),
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1596,23 +2291,29 @@ const CODESIGN_FLAGS: &[FlagSpec] = &[
         Some("remove-signature"),
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_sl('d', "display"),
-    bool_sl('v', "verify"),
+    bool_none_sl(
+        'd',
+        "display",
+        "displays code signature metadata (read-only)",
+    ),
+    bool_none_sl('v', "verify", "verifies code signature (read-only)"),
 ];
 
-/// `sed` flags (`words.rs`, contract §4): `-i`/`--in-place` writes input files,
-/// `-e`/`--expression` supplies a script inspected for `e`/`w`/`r` (omitting
-/// positional `[0]` script), and `-f`/`--file` runs an external script file.
+/// `sed` flags (`words.rs`, contract §4, §7): `-i`/`--in-place` writes input
+/// files, `-e`/`--expression` supplies an inline script inspected for
+/// `e`/`w`/`r` (omitting positional `[0]` script), and `-f`/`--file` names a
+/// pinnable program file (`Unread (program)` coverable under
+/// `ProgramPin::FlagValue`; §11 item 8).
 const SED_FLAGS: &[FlagSpec] = &[
     bool_e(
         Some('i'),
         Some("in-place"),
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1621,7 +2322,7 @@ const SED_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             provides_script: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1630,24 +2331,42 @@ const SED_FLAGS: &[FlagSpec] = &[
         ValueRole::ProgramFile,
         FlagEffects {
             writes: FlagToggle::Enable,
+            value_access: Some(FlagValueAccess::Read),
             provides_script: true,
-            runs_code: true,
-            ..FlagEffects::NONE
+            runs_program: Some(ProgramPin::FlagValue),
+            ..FlagEffects::EMPTY
         },
     ),
 ];
 
-/// `awk` / `gawk` / `mawk` flags known to `dev` (`words.rs`).
-const AWK_FLAGS: &[FlagSpec] = &[val_e(
-    Some('i'),
-    Some("include"),
-    ValueRole::Code,
-    FlagEffects {
-        writes: FlagToggle::Enable,
-        runs_code: true,
-        ..FlagEffects::NONE
-    },
-)];
+/// `awk` / `gawk` / `mawk` flags (`words.rs`, contract §4, §7): `-f`/`--file`
+/// names a pinnable program file (`Unread (program)` coverable under
+/// `ProgramPin::FlagValue`; §11 item 8), while `-i`/`--include` loads an
+/// extension/library (`inline` code runner).
+const AWK_FLAGS: &[FlagSpec] = &[
+    val_e(
+        Some('f'),
+        Some("file"),
+        ValueRole::ProgramFile,
+        FlagEffects {
+            writes: FlagToggle::Enable,
+            value_access: Some(FlagValueAccess::Read),
+            provides_script: true,
+            runs_program: Some(ProgramPin::FlagValue),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    val_e(
+        Some('i'),
+        Some("include"),
+        ValueRole::Code,
+        FlagEffects {
+            writes: FlagToggle::Enable,
+            runs_code: true,
+            ..FlagEffects::EMPTY
+        },
+    ),
+];
 
 /// `perl` flags known to `dev` (`words.rs`, `deny.rs`).
 const PERL_FLAGS: &[FlagSpec] = &[
@@ -1656,7 +2375,7 @@ const PERL_FLAGS: &[FlagSpec] = &[
         None,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1665,7 +2384,7 @@ const PERL_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1674,7 +2393,7 @@ const PERL_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
 ];
@@ -1687,7 +2406,7 @@ const PYTHON_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1696,7 +2415,7 @@ const PYTHON_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
 ];
@@ -1709,7 +2428,7 @@ const NODE_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1718,7 +2437,7 @@ const NODE_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
 ];
@@ -1730,7 +2449,7 @@ const RUBY_FLAGS: &[FlagSpec] = &[val_e(
     ValueRole::Code,
     FlagEffects {
         runs_code: true,
-        ..FlagEffects::NONE
+        ..FlagEffects::EMPTY
     },
 )];
 
@@ -1740,15 +2459,29 @@ const RUBY_FLAGS: &[FlagSpec] = &[val_e(
 
 /// `git` top-level options known to `dev` (`deny.rs`, `HOME_READONLY_COMMANDS`)
 /// and contract §6.
+///
+/// Base-directory / repository-root changing flags (`-C`, `--git-dir`,
+/// `--work-tree`, `--super-prefix`) make the unit `Unread` with
+/// `UnsupportedBaseDirChange` while still reading their path values for
+/// hard-deny checks.
 const GIT_GLOBAL_FLAGS: &[FlagSpec] = &[
-    val_s('C', ValueRole::Path),
+    val_e(
+        Some('C'),
+        None,
+        ValueRole::Path,
+        FlagEffects {
+            value_access: Some(FlagValueAccess::Read),
+            unread: Some(FlagUnread::BaseDirChange),
+            ..FlagEffects::EMPTY
+        },
+    ),
     val_e(
         Some('c'),
         None,
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1757,7 +2490,7 @@ const GIT_GLOBAL_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1766,16 +2499,54 @@ const GIT_GLOBAL_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    val_l("git-dir", ValueRole::Path),
-    val_l("work-tree", ValueRole::Path),
-    val_l("namespace", ValueRole::Text),
-    val_l("super-prefix", ValueRole::Text),
+    val_e(
+        None,
+        Some("git-dir"),
+        ValueRole::Path,
+        FlagEffects {
+            value_access: Some(FlagValueAccess::Read),
+            unread: Some(FlagUnread::BaseDirChange),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    val_e(
+        None,
+        Some("work-tree"),
+        ValueRole::Path,
+        FlagEffects {
+            value_access: Some(FlagValueAccess::Read),
+            unread: Some(FlagUnread::BaseDirChange),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    val_none_l(
+        "namespace",
+        ValueRole::Text,
+        "selects git ref namespace only; does not change host filesystem paths",
+    ),
+    val_unread(
+        None,
+        Some("super-prefix"),
+        ValueRole::Text,
+        FlagUnread::BaseDirChange,
+    ),
 ];
 
-const GIT_LOG_FLAGS: &[FlagSpec] = &[bool_s('p'), val_sl('L', "line-range", ValueRole::Text)];
+const GIT_LOG_FLAGS: &[FlagSpec] = &[
+    bool_none_s(
+        'p',
+        "shows patch diffs in git log output; CR-12 git selection still checks operands",
+    ),
+    val_none_sl(
+        'L',
+        "line-range",
+        ValueRole::Text,
+        "selects line range in git log; file part checked by CR-12 git selection (§6)",
+    ),
+];
 
 const GIT_DIFF_FLAGS: &[FlagSpec] = &[
     val_e(
@@ -1784,7 +2555,8 @@ const GIT_DIFF_FLAGS: &[FlagSpec] = &[
         ValueRole::Path,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            value_access: Some(FlagValueAccess::Write),
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1792,30 +2564,41 @@ const GIT_DIFF_FLAGS: &[FlagSpec] = &[
         Some("ext-diff"),
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
 ];
 
 const GIT_BRANCH_FLAGS: &[FlagSpec] = &[
-    bool_sl('a', "all"),
-    bool_sl('r', "remotes"),
-    bool_sl('v', "verbose"),
+    bool_none_sl(
+        'a',
+        "all",
+        "lists both local and remote-tracking branches (read-only)",
+    ),
+    bool_none_sl('r', "remotes", "lists remote-tracking branches (read-only)"),
+    bool_none_sl(
+        'v',
+        "verbose",
+        "prints commit hash and subject in branch listing (read-only)",
+    ),
     bool_e(
         Some('l'),
         Some("list"),
         FlagEffects {
             writes: FlagToggle::Disable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
-    bool_l("show-current"),
+    bool_none_l(
+        "show-current",
+        "prints current branch name only (read-only)",
+    ),
     bool_e(
         Some('d'),
         Some("delete"),
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1823,7 +2606,7 @@ const GIT_BRANCH_FLAGS: &[FlagSpec] = &[
         None,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1831,7 +2614,7 @@ const GIT_BRANCH_FLAGS: &[FlagSpec] = &[
         Some("move"),
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1839,7 +2622,7 @@ const GIT_BRANCH_FLAGS: &[FlagSpec] = &[
         None,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1847,7 +2630,7 @@ const GIT_BRANCH_FLAGS: &[FlagSpec] = &[
         Some("copy"),
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1855,7 +2638,7 @@ const GIT_BRANCH_FLAGS: &[FlagSpec] = &[
         None,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1864,7 +2647,7 @@ const GIT_BRANCH_FLAGS: &[FlagSpec] = &[
         ValueRole::Ref,
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1872,7 +2655,7 @@ const GIT_BRANCH_FLAGS: &[FlagSpec] = &[
         Some("unset-upstream"),
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     bool_e(
@@ -1880,34 +2663,119 @@ const GIT_BRANCH_FLAGS: &[FlagSpec] = &[
         Some("edit-description"),
         FlagEffects {
             writes: FlagToggle::Enable,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
 ];
 
 const GIT_CHECKOUT_FLAGS: &[FlagSpec] = &[
-    val_s('b', ValueRole::Ref),
-    val_s('B', ValueRole::Ref),
-    val_l("orphan", ValueRole::Ref),
+    val_e(
+        Some('b'),
+        None,
+        ValueRole::Ref,
+        FlagEffects {
+            writes: FlagToggle::Enable,
+            ..FlagEffects::EMPTY
+        },
+    ),
+    val_e(
+        Some('B'),
+        None,
+        ValueRole::Ref,
+        FlagEffects {
+            writes: FlagToggle::Enable,
+            ..FlagEffects::EMPTY
+        },
+    ),
+    val_e(
+        None,
+        Some("orphan"),
+        ValueRole::Ref,
+        FlagEffects {
+            writes: FlagToggle::Enable,
+            ..FlagEffects::EMPTY
+        },
+    ),
 ];
 
 const GIT_PUSH_FLAGS: &[FlagSpec] = &[
-    bool_sl('f', "force"),
-    bool_l("force-with-lease"),
-    bool_l("force-if-includes"),
-    bool_l("mirror"),
-    bool_l("all"),
-    bool_l("tags"),
-    bool_l("branches"),
-    bool_l("prune"),
-    val_sl('o', "push-option", ValueRole::Text),
+    bool_e(
+        Some('f'),
+        Some("force"),
+        FlagEffects {
+            git_push: Some(GitPushEffect::Force),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    bool_e(
+        None,
+        Some("force-with-lease"),
+        FlagEffects {
+            git_push: Some(GitPushEffect::Force),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    bool_e(
+        None,
+        Some("force-if-includes"),
+        FlagEffects {
+            git_push: Some(GitPushEffect::Force),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    bool_e(
+        None,
+        Some("mirror"),
+        FlagEffects {
+            git_push: Some(GitPushEffect::Force),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    bool_e(
+        None,
+        Some("all"),
+        FlagEffects {
+            git_push: Some(GitPushEffect::ImplicitTargets),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    bool_e(
+        None,
+        Some("tags"),
+        FlagEffects {
+            git_push: Some(GitPushEffect::ImplicitTargets),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    bool_e(
+        None,
+        Some("branches"),
+        FlagEffects {
+            git_push: Some(GitPushEffect::ImplicitTargets),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    bool_e(
+        None,
+        Some("prune"),
+        FlagEffects {
+            git_push: Some(GitPushEffect::ImplicitTargets),
+            ..FlagEffects::EMPTY
+        },
+    ),
+    val_none_sl(
+        'o',
+        "push-option",
+        ValueRole::Text,
+        "transmits string option to remote server only; does not touch host paths",
+    ),
     val_e(
         None,
         Some("receive-pack"),
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
     val_e(
@@ -1916,7 +2784,7 @@ const GIT_PUSH_FLAGS: &[FlagSpec] = &[
         ValueRole::Code,
         FlagEffects {
             runs_code: true,
-            ..FlagEffects::NONE
+            ..FlagEffects::EMPTY
         },
     ),
 ];
@@ -1927,7 +2795,7 @@ const GIT_REBASE_FLAGS: &[FlagSpec] = &[val_e(
     ValueRole::Code,
     FlagEffects {
         runs_code: true,
-        ..FlagEffects::NONE
+        ..FlagEffects::EMPTY
     },
 )];
 
@@ -1937,17 +2805,19 @@ const GIT_TOOL_CMD_FLAGS: &[FlagSpec] = &[val_e(
     ValueRole::Code,
     FlagEffects {
         runs_code: true,
-        ..FlagEffects::NONE
+        ..FlagEffects::EMPTY
     },
 )];
 
 const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
     SubcommandSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_git_ro(&["git", "status"]),
         changes_default: Some("§11 item 10"),
         ..base_subcommand("status")
     },
     SubcommandSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         flags: GIT_LOG_FLAGS,
         operands: OperandLayout::all(ValueRole::Ref),
         home_readonly: home_git_ro(&["git", "log"]),
@@ -1956,6 +2826,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         ..base_subcommand("log")
     },
     SubcommandSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         flags: GIT_DIFF_FLAGS,
         operands: OperandLayout::all(ValueRole::Ref),
         operand_access: OperandAccessMode::FlagOnlyWrite,
@@ -1968,6 +2839,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         ..base_subcommand("diff")
     },
     SubcommandSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         operands: OperandLayout::all(ValueRole::Ref),
         home_readonly: home_git_ro(&["git", "show"]),
         git_selects_by_name: true,
@@ -1975,6 +2847,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         ..base_subcommand("show")
     },
     SubcommandSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         flags: GIT_BRANCH_FLAGS,
         operands: OperandLayout::all(ValueRole::Ref),
         writes: WriteBehavior::WithFlagOrOperandCount(1),
@@ -2000,12 +2873,14 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         ..base_subcommand("branch")
     },
     SubcommandSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         operands: OperandLayout::all(ValueRole::Ref),
         home_readonly: home_git_ro(&["git", "rev-parse"]),
         changes_default: Some("§11 item 9"),
         ..base_subcommand("rev-parse")
     },
     SubcommandSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_git_ro(&["git", "ls-files"]),
         changes_default: Some("§11 item 10"),
         ..base_subcommand("ls-files")
@@ -2069,7 +2944,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithSubarg(&["run"]),
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 4; §11 item 9"),
         ..base_subcommand("bisect")
     },
     SubcommandSpec {
@@ -2078,7 +2953,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 4; §11 item 9"),
         ..base_subcommand("rebase")
     },
     SubcommandSpec {
@@ -2086,7 +2961,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithSubarg(&["foreach"]),
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 4; §11 item 9"),
         ..base_subcommand("submodule")
     },
     SubcommandSpec {
@@ -2094,7 +2969,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         operands: OperandLayout::all(ValueRole::Ref),
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 4; §11 item 9"),
         ..base_subcommand("difftool")
     },
     SubcommandSpec {
@@ -2116,7 +2991,7 @@ const fn cargo_build_subcommand(name: &'static str) -> SubcommandSpec {
         code_runner: CodeRunnerBehavior::ProjectBuild {
             pin: ProgramPin::CommandAndSubcommand,
         },
-        changes_default: Some("§11 item 8"),
+        changes_default: Some("§11 item 8; §11 item 9"),
         ..base_subcommand(name)
     }
 }
@@ -2132,7 +3007,7 @@ const CARGO_SUBCOMMANDS: &[SubcommandSpec] = &[
 ];
 
 const PIPX_SUBCOMMANDS: &[SubcommandSpec] = &[SubcommandSpec {
-    operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+    operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
     writes: WriteBehavior::Always,
     code_runner: CodeRunnerBehavior::ProgramOrInline {
         pin: ProgramPin::FirstOperand,
@@ -2167,7 +3042,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         flags: NICE_FLAGS,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Nice),
-        changes_default: Some("§11 item 10"),
+        changes_default: Some("§11 item 9; §11 item 10"),
         ..base_tool("nice")
     },
     ToolSpec {
@@ -2175,7 +3050,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         flags: TIMEOUT_FLAGS,
         operands: OperandLayout::fixed(&[ValueRole::Text]),
         wrapper: Some(WrapperKind::Timeout),
-        changes_default: Some("§11 item 10"),
+        changes_default: Some("§11 item 9; §11 item 10"),
         ..base_tool("timeout")
     },
     ToolSpec {
@@ -2196,7 +3071,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flag_mode: FlagMode::ListedOnly,
         flags: MODELED_SHELL_FLAGS,
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -2209,7 +3084,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flag_mode: FlagMode::ListedOnly,
         flags: MODELED_SHELL_FLAGS,
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -2222,7 +3097,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flag_mode: FlagMode::ListedOnly,
         flags: MODELED_SHELL_FLAGS,
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -2234,30 +3109,37 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     },
     // --- Home read-only commands (`HOME_READONLY_COMMANDS`) ---
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["ls"]),
         ..base_tool("ls")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["pwd"]),
         ..base_tool("pwd")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["cat"]),
         ..base_tool("cat")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["head"]),
         ..base_tool("head")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["tail"]),
         ..base_tool("tail")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["wc"]),
         ..base_tool("wc")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: Some(HomeReadOnlySpec {
             prefix: &["file"],
             forbidden: &[
@@ -2275,29 +3157,35 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("file")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         links: LINKS_NONE,
         home_readonly: home_ro(&["stat"]),
         ..base_tool("stat")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["du"]),
         ..base_tool("du")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["df"]),
         ..base_tool("df")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         operands: OperandLayout::all(ValueRole::Text),
         home_readonly: home_ro(&["which"]),
         changes_default: Some("§11 item 9"),
         ..base_tool("which")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["uname"]),
         ..base_tool("uname")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: Some(HomeReadOnlySpec {
             prefix: &["date"],
             forbidden: &["-s", "--set", "-f", "--file"],
@@ -2308,10 +3196,12 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("date")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["whoami"]),
         ..base_tool("whoami")
     },
     ToolSpec {
+        flag_mode: FlagMode::AnyExceptForbidden,
         flags: OUTPUT_FILE_FLAGS,
         operand_access: OperandAccessMode::FlagOnlyWrite,
         writes: WriteBehavior::WithFlag,
@@ -2346,7 +3236,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             allow_followed_search: ALLOW_HOME_FOLLOWED_SEARCH,
         }),
         filter_dialect: Some(FilterDialect::RgGlob),
-        changes_default: Some("§11 item 9; §11 item 15"),
+        changes_default: Some("§11 item 2; §11 item 9; §11 item 15"),
         ..base_tool("rg")
     },
     ToolSpec {
@@ -2369,7 +3259,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             allow_followed_search: ALLOW_HOME_FOLLOWED_SEARCH,
         }),
         filter_dialect: Some(FilterDialect::GrepInclude),
-        changes_default: Some("§11 item 9; §11 item 15"),
+        changes_default: Some("§11 item 2; §11 item 9; §11 item 15"),
         ..base_tool("grep")
     },
     ToolSpec {
@@ -2378,7 +3268,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::WithFlag,
         filter_dialect: Some(FilterDialect::GrepInclude),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("egrep")
     },
     ToolSpec {
@@ -2387,7 +3277,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::WithFlag,
         filter_dialect: Some(FilterDialect::GrepInclude),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("fgrep")
     },
     ToolSpec {
@@ -2396,7 +3286,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::WithFlag,
         filter_dialect: Some(FilterDialect::GrepInclude),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("zgrep")
     },
     ToolSpec {
@@ -2405,7 +3295,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::WithFlag,
         filter_dialect: Some(FilterDialect::GrepInclude),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("ggrep")
     },
     ToolSpec {
@@ -2414,7 +3304,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
         recursive: RecursiveBehavior::Always,
         filter_dialect: Some(FilterDialect::GrepInclude),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("rgrep")
     },
     ToolSpec {
@@ -2424,7 +3314,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         recursive: RecursiveBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 9"),
         ..base_tool("ag")
     },
     ToolSpec {
@@ -2434,7 +3324,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         recursive: RecursiveBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 9"),
         ..base_tool("ack")
     },
     // --- Multi-subcommand tools (`git`, `cargo`, `pipx`) ---
@@ -2444,7 +3334,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::NONE,
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 9"),
         ..base_tool("git")
     },
     ToolSpec {
@@ -2480,11 +3370,12 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::all(ValueRole::Path),
         operand_access: OperandAccessMode::FlagOnlyWrite,
         writes: WriteBehavior::WithFlag,
+        derived_destinations: DerivedDestinationsBehavior::WithFlag,
         recursive: RecursiveBehavior::Always,
         links: LINKS_NONE,
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 9; §11 item 10"),
         ..base_tool("find")
     },
     ToolSpec {
@@ -2547,7 +3438,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         derived_destinations: DerivedDestinationsBehavior::WithFlag,
         recursive: RecursiveBehavior::Always,
         links: LINKS_NONE,
-        changes_default: Some("§11 item 9; §11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 9; §11 item 10"),
         ..base_tool("tar")
     },
     ToolSpec {
@@ -2726,7 +3617,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flags: PRINTF_FLAGS,
         operands: OperandLayout::all(ValueRole::Text),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("printf")
     },
     ToolSpec {
@@ -2787,6 +3678,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         flags: CODESIGN_FLAGS,
         operand_access: OperandAccessMode::AllWriteWhenWriting,
         writes: WriteBehavior::WithFlag,
+        changes_default: Some("§11 item 9"),
         ..base_tool("codesign")
     },
     // --- Code runners & interpreters (§4, §6, §7) ---
@@ -2795,9 +3687,11 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::prefix_then(&[ValueRole::Code], ValueRole::Path),
         operand_access: OperandAccessMode::AllWriteWhenWriting,
         writes: WriteBehavior::Always,
-        code_runner: CodeRunnerBehavior::InlineOnly,
+        code_runner: CodeRunnerBehavior::ProgramOrInline {
+            pin: ProgramPin::FlagValue,
+        },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 4; §11 item 8"),
         ..base_tool("awk")
     },
     ToolSpec {
@@ -2805,9 +3699,11 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::prefix_then(&[ValueRole::Code], ValueRole::Path),
         operand_access: OperandAccessMode::AllWriteWhenWriting,
         writes: WriteBehavior::Always,
-        code_runner: CodeRunnerBehavior::InlineOnly,
+        code_runner: CodeRunnerBehavior::ProgramOrInline {
+            pin: ProgramPin::FlagValue,
+        },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 4; §11 item 8"),
         ..base_tool("gawk")
     },
     ToolSpec {
@@ -2815,9 +3711,11 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::prefix_then(&[ValueRole::Code], ValueRole::Path),
         operand_access: OperandAccessMode::AllWriteWhenWriting,
         writes: WriteBehavior::Always,
-        code_runner: CodeRunnerBehavior::InlineOnly,
+        code_runner: CodeRunnerBehavior::ProgramOrInline {
+            pin: ProgramPin::FlagValue,
+        },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 4; §11 item 8"),
         ..base_tool("mawk")
     },
     ToolSpec {
@@ -2827,12 +3725,12 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::WithFlag,
         code_runner: CodeRunnerBehavior::ScriptCommands(&['e', 'w', 'r']),
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 4; §11 item 8"),
         ..base_tool("sed")
     },
     ToolSpec {
         flags: PERL_FLAGS,
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         operand_access: OperandAccessMode::AllWriteWhenWriting,
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
@@ -2844,7 +3742,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         flags: PYTHON_FLAGS,
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -2855,7 +3753,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         flags: PYTHON_FLAGS,
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -2866,7 +3764,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         flags: NODE_FLAGS,
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -2877,7 +3775,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         flags: RUBY_FLAGS,
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -2895,7 +3793,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("eval")
     },
     ToolSpec {
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -2905,7 +3803,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool("source")
     },
     ToolSpec {
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -2915,7 +3813,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..base_tool(".")
     },
     ToolSpec {
-        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Text),
+        operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -3204,6 +4102,59 @@ pub(crate) fn flag_long(flags: &'static [FlagSpec], long: &str) -> Option<&'stat
     flags.iter().find(|f| f.long == Some(long))
 }
 
+/// Looks up a long flag (without leading `--`) in `flags`:
+/// 1. Exact match always wins.
+/// 2. Otherwise, if `long` is non-empty (so `--<long>` has length >= 3,
+///    mirroring `dev`'s `engine::forbidden_flag` and `words::is_writer`),
+///    matches a listed writing flag (`effects().writes == FlagToggle::Enable`)
+///    whose long name starts with `long` (e.g. `sort --out=x` → `--output`,
+///    `tree --out=x` → `--output`, `git diff --out=x` → `--output`).
+pub(crate) fn flag_long_or_writing_abbrev(
+    flags: &'static [FlagSpec],
+    long: &str,
+) -> Option<&'static FlagSpec> {
+    if let Some(exact) = flag_long(flags, long) {
+        return Some(exact);
+    }
+    if long.is_empty() {
+        return None;
+    }
+    flags.iter().find(|f| {
+        f.effects().writes == FlagToggle::Enable && f.long.is_some_and(|l| l.starts_with(long))
+    })
+}
+
+/// Checks whether a single flag token matches any entry in `forbidden`,
+/// mirroring `dev`'s `engine::forbidden_flag` (`engine.rs:249`) exactly:
+/// - short flags match anywhere inside a short-flag cluster (`-xo` matches `-o`);
+/// - long options match exact names or prefixes of length `>= 3` including `--`
+///   (so `--o`, `--ou`, `--out`, and `--out=x` all match `--output`).
+pub(crate) fn is_forbidden_flag(forbidden: &[&str], token: &str) -> bool {
+    if token == "--" {
+        return false;
+    }
+    if let Some(rest) = token.strip_prefix("--") {
+        let name_part = rest.split('=').next().unwrap_or(rest);
+        if name_part.is_empty() {
+            return false;
+        }
+        forbidden.iter().any(|&f| {
+            f.strip_prefix("--")
+                .is_some_and(|l| l == name_part || l.starts_with(name_part))
+        })
+    } else if let Some(cluster) = token.strip_prefix('-')
+        && !cluster.is_empty()
+    {
+        cluster.chars().any(|c| {
+            forbidden
+                .iter()
+                .any(|&f| f.len() == 2 && !f.starts_with("--") && f.chars().nth(1) == Some(c))
+        })
+    } else {
+        false
+    }
+}
+
 /// Looks up a single flag token (`"-x"` or `"--name"`) in `flags`.
 pub(crate) fn flag(flags: &'static [FlagSpec], token: &str) -> Option<&'static FlagSpec> {
     if let Some(long) = token.strip_prefix("--") {
@@ -3289,12 +4240,25 @@ fn fmt_operands(layout: OperandLayout) -> String {
     }
 }
 
-fn fmt_flag_effects(effects: FlagEffects) -> String {
+fn fmt_flag_effects(effect: Effect, include_none_reason: bool) -> String {
+    let effects = match effect {
+        Effect::None { reason } => {
+            return if include_none_reason {
+                format!("none ({reason})")
+            } else {
+                String::new()
+            };
+        }
+        Effect::Applied(e) => e,
+    };
     let mut eff = Vec::new();
     match effects.writes {
         FlagToggle::Unchanged => {}
         FlagToggle::Enable => eff.push("writes:+".to_string()),
         FlagToggle::Disable => eff.push("writes:-".to_string()),
+    }
+    if let Some(access) = effects.value_access {
+        eff.push(format!("val-access:{access:?}"));
     }
     match effects.derived_destinations {
         FlagToggle::Unchanged => {}
@@ -3329,11 +4293,30 @@ fn fmt_flag_effects(effects: FlagEffects) -> String {
     if let Some(role) = effects.positional_role {
         eff.push(format!("positional-role({})", fmt_role(role)));
     }
-    if let Some((d, ci)) = effects.filter {
-        eff.push(format!("filter({d:?}, ci={ci})"));
+    if let Some(spec) = effects.filter {
+        let case = match spec.case {
+            FilterCase::AlwaysSensitive => "sensitive",
+            FilterCase::AlwaysInsensitive => "insensitive",
+            FilterCase::FollowGlobalToggle => "global-toggle",
+        };
+        eff.push(format!("filter({:?}, {case})", spec.dialect));
+    }
+    match effects.filter_case_insensitive {
+        FlagToggle::Unchanged => {}
+        FlagToggle::Enable => eff.push("filter-ci:+".to_string()),
+        FlagToggle::Disable => eff.push("filter-ci:-".to_string()),
     }
     if effects.runs_code {
         eff.push("runs-code".to_string());
+    }
+    if let Some(pin) = effects.runs_program {
+        eff.push(format!("runs-program({pin:?})"));
+    }
+    if let Some(push) = effects.git_push {
+        eff.push(format!("git-push({push:?})"));
+    }
+    if let Some(unread) = effects.unread {
+        eff.push(format!("unread({unread:?})"));
     }
     eff.join("; ")
 }
@@ -3381,7 +4364,7 @@ fn fmt_flags_summary(mode: FlagMode, single_dash_long: bool, flags: &[FlagSpec])
                 FlagKind::Value(r) => format!("`{name}` ({})", fmt_role(r)),
                 FlagKind::OptionalValue(r) => format!("`{name}` ([{}])", fmt_role(r)),
             };
-            let eff = fmt_flag_effects(f.effects);
+            let eff = fmt_flag_effects(f.effect, false);
             if eff.is_empty() {
                 base
             } else {
@@ -3514,7 +4497,7 @@ fn write_flag_table(
             FlagKind::Value(r) => format!("Value({})", fmt_role(r)),
             FlagKind::OptionalValue(r) => format!("OptionalValue({})", fmt_role(r)),
         };
-        let eff = fmt_flag_effects(f.effects);
+        let eff = fmt_flag_effects(f.effect, true);
         let eff_str = if eff.is_empty() {
             "—".to_string()
         } else {
@@ -3536,12 +4519,19 @@ pub(crate) fn render_markdown() -> String {
     out.push_str(
         "**Unknown tools vs. excluded forms (§4, §6):**\n\
          - An **unknown tool** (absent from both **Modeled tools** and **Outside the model** below) \
-           stays in the model for hard-deny and store checks (§4): every word counts as a candidate `Path`, \
-           the unit counts as a possible writer (§5), and it is never eligible for Home's read-only list. \
+           stays in the model for hard-deny and store checks (§4): every word counts as a candidate `Path` \
+           with conservative `ReadWrite` access, the unit counts as a possible writer (§5), and it \
+           is never eligible for Home's read-only list. \
            Under a covering prefix/exact Allow rule meeting §7's simple-command conditions, Clear targets remain Clear.\n\
+         - **`AnyExceptForbidden`** applies **only** to `HOME_READONLY_COMMANDS` rows without complete `dev` flag tables. \
+           Forbidden flags mirror `dev`'s `engine::forbidden_flag` (short clusters and long abbreviations of `>= 3` chars including `--`). \
+           Listed flags (and long abbreviations matching a listed writing flag) keep their stated effects; \
+           any unlisted non-forbidden flag keeps `dev`'s conservative treatment (`ReadWrite` candidate-path check on every unclassified word and attached `--opt=value`).\n\
+         - **Rows outside `HOME_READONLY_COMMANDS`** (and search tools with complete `dev` flag tables) use **`ListedOnly`**: \
+           an unlisted flag makes the unit `Unread(UnknownFlag)` and falls back to conservative `ReadWrite` candidate-path checks on unclassified words.\n\
          - An **explicitly excluded form** makes its unit **Unread**: every entry in **Outside the model**, \
            any unlisted flag on a `ListedOnly` row, any forbidden flag on an `AnyExceptForbidden` row, \
-           or any form triggering an `Unread` effect (§3–§6).\n\n",
+           or any modeled flag/form triggering an explicit `Unread` effect (§3–§6).\n\n",
     );
 
     // 1. Main tools table
@@ -3751,7 +4741,7 @@ mod tests {
     fn value_taking_flags_have_valid_roles() {
         let verify = |context: &str, flags: &[FlagSpec]| {
             for f in flags {
-                if f.effects.filter.is_some() {
+                if f.effects().filter.is_some() {
                     assert_eq!(
                         f.kind,
                         FlagKind::Value(ValueRole::Pattern),
@@ -3779,7 +4769,7 @@ mod tests {
                 || layout.rest == Some(ValueRole::Code)
                 || layout.last == Some(ValueRole::Code)
                 || flags.iter().any(|f| {
-                    f.effects.runs_code
+                    f.effects().runs_code
                         || matches!(
                             f.kind,
                             FlagKind::Value(ValueRole::Code)
@@ -3787,9 +4777,17 @@ mod tests {
                         )
                 })
         };
-        let has_program_file = |layout: OperandLayout| {
+        let has_program_file = |layout: OperandLayout, flags: &[FlagSpec]| {
             layout.positional.contains(&ValueRole::ProgramFile)
                 || layout.rest == Some(ValueRole::ProgramFile)
+                || flags.iter().any(|f| {
+                    f.effects().runs_program.is_some()
+                        || matches!(
+                            f.kind,
+                            FlagKind::Value(ValueRole::ProgramFile)
+                                | FlagKind::OptionalValue(ValueRole::ProgramFile)
+                        )
+                })
         };
 
         let check_row = |label: &str,
@@ -3820,7 +4818,7 @@ mod tests {
                 }
                 CodeRunnerBehavior::InlineWithFlag => {
                     assert!(
-                        flags.iter().any(|f| f.effects.runs_code),
+                        flags.iter().any(|f| f.effects().runs_code),
                         "{label}: InlineWithFlag row must have a runs_code flag"
                     );
                     assert!(
@@ -3849,7 +4847,7 @@ mod tests {
                     );
                     let subcmd_has_code = subcommands.iter().any(|s| {
                         subargs.contains(&s.name)
-                            && (has_program_file(s.operands)
+                            && (has_program_file(s.operands, s.flags)
                                 || has_code_operand(s.operands, s.flags))
                     });
                     assert!(
@@ -3868,7 +4866,7 @@ mod tests {
                         "{label}: ProgramOrInline must specify a ProgramPin"
                     );
                     assert!(
-                        has_program_file(layout) || has_code_operand(layout, flags),
+                        has_program_file(layout, flags) || has_code_operand(layout, flags),
                         "{label}: ProgramOrInline must name ProgramFile or Code operand"
                     );
                     assert!(
@@ -3960,24 +4958,6 @@ mod tests {
         {
             return false;
         }
-        // Check forbidden flags (`dev` `engine::forbidden_flag` semantics).
-        let is_forbidden = |tok: &str| {
-            if let Some(rest) = tok.strip_prefix("--") {
-                let name = format!("--{}", rest.split('=').next().unwrap_or(rest));
-                home.forbidden
-                    .iter()
-                    .filter(|f| f.starts_with("--"))
-                    .any(|f| *f == name || (name.len() >= 3 && f.starts_with(&name)))
-            } else if tok.starts_with('-') && tok.len() > 1 {
-                tok[1..].chars().any(|c| {
-                    home.forbidden
-                        .iter()
-                        .any(|f| f.len() == 2 && !f.starts_with("--") && f.ends_with(c))
-                })
-            } else {
-                false
-            }
-        };
         let mut i = 0;
         let mut dd = false;
         let mut follows_below = false;
@@ -3991,7 +4971,7 @@ mod tests {
                 dd = true;
                 continue;
             }
-            if is_forbidden(tok) {
+            if is_forbidden_flag(home.forbidden, tok) {
                 return false;
             }
             if let Some(rest) = tok.strip_prefix("--") {
@@ -3999,11 +4979,12 @@ mod tests {
                     Some((n, _)) => (n, true),
                     None => (rest, false),
                 };
-                if let Some(spec) = flag_long(flags, name) {
-                    if spec.effects.runs_code {
+                if let Some(spec) = flag_long_or_writing_abbrev(flags, name) {
+                    let eff = spec.effects();
+                    if eff.runs_code || eff.unread.is_some() || eff.writes == FlagToggle::Enable {
                         return false;
                     }
-                    follows_below = spec.effects.follows_links_below_root.apply(follows_below);
+                    follows_below = eff.follows_links_below_root.apply(follows_below);
                     if matches!(spec.kind, FlagKind::Value(_)) && !has_eq {
                         i += 1;
                     }
@@ -4014,10 +4995,12 @@ mod tests {
                 let chars: Vec<char> = tok[1..].chars().collect();
                 for (k, &c) in chars.iter().enumerate() {
                     if let Some(spec) = flag_short(flags, c) {
-                        if spec.effects.runs_code {
+                        let eff = spec.effects();
+                        if eff.runs_code || eff.unread.is_some() || eff.writes == FlagToggle::Enable
+                        {
                             return false;
                         }
-                        follows_below = spec.effects.follows_links_below_root.apply(follows_below);
+                        follows_below = eff.follows_links_below_root.apply(follows_below);
                         if matches!(spec.kind, FlagKind::Value(_)) {
                             if k + 1 == chars.len() {
                                 i += 1;
@@ -4037,7 +5020,7 @@ mod tests {
     }
 
     /// Test-only helper checking whether a command's flags are accepted under a
-    /// covering rule (not `UnknownFlag` and not `OUTSIDE_MODEL`).
+    /// covering rule (not `UnknownFlag`, no `FlagUnread`, and not `OUTSIDE_MODEL`).
     fn table_accepts_flags_under_rule(argv: &[&str]) -> bool {
         let Some(&cmd) = argv.first() else {
             return false;
@@ -4077,7 +5060,10 @@ mod tests {
                     Some((n, _)) => (n, true),
                     None => (rest, false),
                 };
-                if let Some(spec) = flag_long(flags, name) {
+                if let Some(spec) = flag_long_or_writing_abbrev(flags, name) {
+                    if spec.effects().unread.is_some() {
+                        return false;
+                    }
                     if matches!(spec.kind, FlagKind::Value(_)) && !has_eq {
                         i += 1;
                     }
@@ -4088,6 +5074,9 @@ mod tests {
                 let chars: Vec<char> = tok[1..].chars().collect();
                 for (k, &c) in chars.iter().enumerate() {
                     if let Some(spec) = flag_short(flags, c) {
+                        if spec.effects().unread.is_some() {
+                            return false;
+                        }
                         if matches!(spec.kind, FlagKind::Value(_)) {
                             if k + 1 == chars.len() {
                                 i += 1;
@@ -4204,14 +5193,20 @@ mod tests {
             &["date", "-s", "2026-01-01"],
             &["date", "--file", "dates.txt"],
             &["tree", "-o", "out.txt"],
+            &["tree", "--out=out.txt"],
             &["tree", "-R", "src"],
             &["rg", "--pre", "cat", "x", "proj"],
             &["rg", "--unknown-flag", "x", "proj"],
             &["rg", "-f", "pats", "proj"],
+            &["rg", "-t", "rust", "x", "proj"],
             &["grep", "-f", "pats", "proj"],
+            &["grep", "--exclude=key", "x", "proj"],
+            &["grep", "--exclude-dir=sub", "x", "proj"],
+            &["grep", "--include-dir=sub", "x", "proj"],
             &["grep", "--unknown-flag", "x", "proj"],
             &["git", "status", "-c", "core.fsmonitor=x"],
             &["git", "diff", "--output", "out.patch"],
+            &["git", "diff", "--out=out.patch"],
             &["git", "diff", "--ext-diff"],
             &["git", "branch", "topic"],
             &["git", "branch", "-d", "topic"],
@@ -4223,20 +5218,31 @@ mod tests {
             );
         }
 
-        // 4. Forms accepted under covering rules (finding 1: no unapproved Unread)
+        // 4. Forms accepted vs. rejected under covering rules (Rules B & C)
         let rule_accepted: &[&[&str]] = &[
-            &["test", "-f", "README.md"],
-            &["[", "-f", "README.md", "]"],
-            &["rm", "-rf", "build"],
-            &["mkdir", "-p", "a/b"],
+            &["rm", "-r", "build"],
+            &["cp", "-L", "a", "b"],
             &["sed", "-e", "p", "README.md"],
-            &["cargo", "test", "--lib"],
+            &["cargo", "test"],
             &["my-custom-tool", "--flag", "arg"],
         ];
         for cmd in rule_accepted {
             assert!(
                 table_accepts_flags_under_rule(cmd),
-                "covering rule must not treat {cmd:?} as Unread"
+                "covering rule must accept modeled form {cmd:?}"
+            );
+        }
+        // Unlisted flags on rows outside HOME_READONLY_COMMANDS are Unread (Rule C).
+        let rule_rejected: &[&[&str]] = &[
+            &["cp", "-t", "vault", "README.md"],
+            &["tar", "-chf", "out.tar", "-C", "sub", "../key"],
+            &["grep", "-R", "--exclude=key", "x", "proj"],
+            &["ag", "-f", "--ignore=key", "x", "proj"],
+        ];
+        for cmd in rule_rejected {
+            assert!(
+                !table_accepts_flags_under_rule(cmd),
+                "covering rule must mark unlisted/unsupported form {cmd:?} Unread"
             );
         }
     }
@@ -4415,7 +5421,7 @@ mod tests {
         let grep_dev_val_l: HashSet<&str> = engine::GREP_VAL_L
             .iter()
             .copied()
-            .chain(std::iter::once("file"))
+            .chain(["file", "include-dir"])
             .collect();
         for &c in &grep_dev_bool_s {
             let f = flag_short(grep.flags, c).unwrap_or_else(|| panic!("grep missing -{c}"));
@@ -4555,14 +5561,14 @@ mod tests {
             for c in opts.no_pattern.chars() {
                 let f = flag_short(tool.flags, c).unwrap();
                 assert!(
-                    f.effects.provides_pattern,
+                    f.effects().provides_pattern,
                     "{name} -{c} must set provides_pattern"
                 );
             }
             for &l in opts.long_no_pattern {
                 let f = flag_long(tool.flags, l).unwrap();
                 assert!(
-                    f.effects.provides_pattern,
+                    f.effects().provides_pattern,
                     "{name} --{l} must set provides_pattern"
                 );
             }
@@ -4577,73 +5583,83 @@ mod tests {
                 ValueRole::Pattern | ValueRole::Text | ValueRole::Ref | ValueRole::ArchiveMember
             )
         };
-        let has_relaxed = |layout: OperandLayout| {
+        let has_relaxed = |layout: OperandLayout, flags: &[FlagSpec]| {
             layout.positional.iter().copied().any(is_relaxed)
                 || layout.rest.is_some_and(is_relaxed)
                 || layout.last.is_some_and(is_relaxed)
+                || layout.after_double_dash.is_some_and(is_relaxed)
+                || flags.iter().any(|f| {
+                    matches!(f.kind, FlagKind::Value(r) | FlagKind::OptionalValue(r) if is_relaxed(r))
+                        || f.effects().positional_role.is_some_and(is_relaxed)
+                })
         };
         for t in TOOLS {
-            if t.wrapper.is_none()
-                && t.code_runner == CodeRunnerBehavior::Never
-                && has_relaxed(t.operands)
-            {
+            if has_relaxed(t.operands, t.flags) {
                 assert!(
                     t.changes_default
                         .is_some_and(|cd| cd.contains("§11 item 9")),
-                    "`{}` relaxes operands to non-Path without citing §11 item 9",
+                    "`{}` relaxes operands or flag values to non-Path without citing §11 item 9",
                     t.name
                 );
             }
             for s in t.subcommands {
-                if s.code_runner == CodeRunnerBehavior::Never && has_relaxed(s.operands) {
+                if has_relaxed(s.operands, s.flags) {
                     assert!(
                         s.changes_default
                             .is_some_and(|cd| cd.contains("§11 item 9")),
-                        "`{} {}` relaxes operands to non-Path without citing §11 item 9",
+                        "`{} {}` relaxes operands or flag values to non-Path without citing §11 item 9",
                         t.name,
                         s.name
                     );
                 }
             }
         }
-        for name in ["true", "false", "id"] {
+        for name in [
+            "true", "false", "id", "codesign", "git", "find", "nice", "timeout",
+        ] {
             let t = lookup(name).unwrap();
-            assert_eq!(t.changes_default, Some("§11 item 9"));
+            assert!(
+                t.changes_default
+                    .is_some_and(|cd| cd.contains("§11 item 9")),
+                "`{name}` must cite §11 item 9"
+            );
         }
     }
 
     #[test]
     fn operand_access_tar_modes_conditional_writers_and_code_runners() {
-        // Finding 5: tar creation/update sources are Paths; extract/list operands are ArchiveMembers.
+        // Finding 5 (round 1) + Finding 4 (round 2): tar creation/update sources are Paths;
+        // extract/list operands are ArchiveMembers; -C triggers UnsupportedBaseDirChange.
         let tar = lookup("tar").unwrap();
         assert_eq!(tar.operands, OperandLayout::all(ValueRole::Path));
         for c in ['c', 'r', 'u'] {
             let f = flag_short(tar.flags, c).unwrap();
-            assert_eq!(f.effects.positional_role, Some(ValueRole::Path));
-            assert_eq!(f.effects.writes, FlagToggle::Enable);
+            assert_eq!(f.effects().positional_role, Some(ValueRole::Path));
+            assert_eq!(f.effects().writes, FlagToggle::Enable);
         }
         let tar_x = flag_short(tar.flags, 'x').unwrap();
         assert_eq!(
-            tar_x.effects.positional_role,
+            tar_x.effects().positional_role,
             Some(ValueRole::ArchiveMember)
         );
-        assert_eq!(tar_x.effects.derived_destinations, FlagToggle::Enable);
+        assert_eq!(tar_x.effects().derived_destinations, FlagToggle::Enable);
         let tar_t = flag_short(tar.flags, 't').unwrap();
         assert_eq!(
-            tar_t.effects.positional_role,
+            tar_t.effects().positional_role,
             Some(ValueRole::ArchiveMember)
         );
-        assert_eq!(tar_t.effects.writes, FlagToggle::Unchanged);
+        assert_eq!(tar_t.effects().writes, FlagToggle::Unchanged);
+        let tar_f = flag_short(tar.flags, 'f').unwrap();
+        assert_eq!(tar_f.kind, FlagKind::Value(ValueRole::Path));
         assert_eq!(
-            flag_short(tar.flags, 'f').unwrap().kind,
-            FlagKind::Value(ValueRole::Path)
+            tar_f.effects().value_access,
+            Some(FlagValueAccess::WriteWhenWriting)
         );
-        assert_eq!(
-            flag_short(tar.flags, 'C').unwrap().kind,
-            FlagKind::Value(ValueRole::DestinationRoot)
-        );
+        let tar_c = flag_short(tar.flags, 'C').unwrap();
+        assert_eq!(tar_c.kind, FlagKind::Value(ValueRole::DestinationRoot));
+        assert_eq!(tar_c.effects().unread, Some(FlagUnread::BaseDirChange));
 
-        // Finding 6: destination write access for git clone, git checkout, codesign, sed, unzip, etc.
+        // Finding 6 (round 1): destination write access for git clone, git checkout, codesign, sed, unzip, etc.
         let git = lookup("git").unwrap();
         let clone = subcommand(git, "clone").unwrap();
         assert_eq!(
@@ -4668,45 +5684,50 @@ mod tests {
             OperandAccessMode::AllWriteWhenWriting
         );
         assert_eq!(
-            flag_short(codesign.flags, 's').unwrap().effects.writes,
+            flag_short(codesign.flags, 's').unwrap().effects().writes,
             FlagToggle::Enable
         );
         assert_eq!(
             flag_long(codesign.flags, "remove-signature")
                 .unwrap()
-                .effects
+                .effects()
                 .writes,
             FlagToggle::Enable
         );
 
-        // Finding 7: git branch writes on creation/mutation, not on listing.
+        // Finding 7 (round 1): git branch writes on creation/mutation, not on listing.
         let branch = subcommand(git, "branch").unwrap();
         assert_eq!(branch.writes, WriteBehavior::WithFlagOrOperandCount(1));
         assert_eq!(
-            flag_short(branch.flags, 'l').unwrap().effects.writes,
+            flag_short(branch.flags, 'l').unwrap().effects().writes,
             FlagToggle::Disable
         );
         assert_eq!(
-            flag_short(branch.flags, 'd').unwrap().effects.writes,
+            flag_short(branch.flags, 'd').unwrap().effects().writes,
             FlagToggle::Enable
         );
 
-        // Finding 9: sed -e supplies script without unconditional runs_code; inspects e/w/r.
+        // Finding 9 (round 1) + Finding 5 (round 2): sed -e inspects e/w/r; sed -f & awk -f pin ProgramFile.
         let sed = lookup("sed").unwrap();
         assert_eq!(
             sed.code_runner,
             CodeRunnerBehavior::ScriptCommands(&['e', 'w', 'r'])
         );
         assert_eq!(sed.operand_access, OperandAccessMode::AllWriteWhenWriting);
+        assert!(sed.changes_default.unwrap().contains("§11 item 8"));
         let sed_e = flag_short(sed.flags, 'e').unwrap();
         assert_eq!(sed_e.kind, FlagKind::Value(ValueRole::Code));
-        assert!(sed_e.effects.provides_script);
-        assert!(!sed_e.effects.runs_code);
+        assert!(sed_e.effects().provides_script);
+        assert!(!sed_e.effects().runs_code);
+        assert_eq!(sed_e.effects().runs_program, None);
         let sed_f = flag_short(sed.flags, 'f').unwrap();
-        assert!(sed_f.effects.provides_script);
-        assert!(sed_f.effects.runs_code);
+        assert_eq!(sed_f.kind, FlagKind::Value(ValueRole::ProgramFile));
+        assert!(sed_f.effects().provides_script);
+        assert!(!sed_f.effects().runs_code);
+        assert_eq!(sed_f.effects().runs_program, Some(ProgramPin::FlagValue));
+        assert_eq!(sed_f.effects().value_access, Some(FlagValueAccess::Read));
 
-        // Finding 10: ag, ack, git diff, git push all reject unpinned Allow prefixes.
+        // Finding 10 (round 1): ag, ack, git diff, git push all reject unpinned Allow prefixes.
         for name in ["ag", "ack"] {
             let t = lookup(name).unwrap();
             assert!(t.code_runner_no_pin);
@@ -4718,7 +5739,7 @@ mod tests {
             assert!(s.changes_default.unwrap().contains("§11 item 4"));
         }
 
-        // Finding 2: rg and grep carry §11 item 15 and single toggle flag.
+        // Finding 2 (round 1): rg and grep carry §11 item 15 and single toggle flag.
         for name in ["rg", "grep"] {
             let t = lookup(name).unwrap();
             assert!(t.changes_default.unwrap().contains("§11 item 15"));
@@ -4746,8 +5767,8 @@ mod tests {
                     } else {
                         flag(flags, tok).unwrap()
                     };
-                    at_root = spec.effects.follows_links_at_root.apply(at_root);
-                    below = spec.effects.follows_links_below_root.apply(below);
+                    at_root = spec.effects().follows_links_at_root.apply(at_root);
+                    below = spec.effects().follows_links_below_root.apply(below);
                 }
                 (at_root, below)
             };
@@ -4781,10 +5802,10 @@ mod tests {
         let ag = lookup("ag").unwrap();
         let mut rec = true;
         for tok in ["-r", "-n"] {
-            rec = flag(ag.flags, tok).unwrap().effects.recursive.apply(rec);
+            rec = flag(ag.flags, tok).unwrap().effects().recursive.apply(rec);
         }
         assert!(!rec);
-        rec = flag(ag.flags, "-R").unwrap().effects.recursive.apply(rec);
+        rec = flag(ag.flags, "-R").unwrap().effects().recursive.apply(rec);
         assert!(rec);
 
         let git = lookup("git").unwrap();
@@ -4793,14 +5814,14 @@ mod tests {
         for tok in ["--list", "-d"] {
             writes = flag(branch.flags, tok)
                 .unwrap()
-                .effects
+                .effects()
                 .writes
                 .apply(writes);
         }
         assert!(writes);
         writes = flag(branch.flags, "--list")
             .unwrap()
-            .effects
+            .effects()
             .writes
             .apply(writes);
         assert!(!writes);
