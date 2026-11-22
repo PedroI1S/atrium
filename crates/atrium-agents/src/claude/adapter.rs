@@ -54,8 +54,8 @@ use atrium_protocol::agent::{
     AgentEvent, AgentEventEnvelope, ApprovalDecision, Provider, QuestionAnswer, SessionCommand,
 };
 use atrium_protocol::limits::{
-    MAX_DIAGNOSTIC_LINE_BYTES, MAX_PARTIAL_ARGS_BYTES, MAX_PROVIDER_RECORD_BYTES,
-    TERMINAL_TAIL_EVENTS,
+    MAX_DIAGNOSTIC_LINE_BYTES, MAX_PARTIAL_ARGS_BYTES, MAX_PENDING_REQUESTS,
+    MAX_PROVIDER_RECORD_BYTES, TERMINAL_TAIL_EVENTS,
 };
 use atrium_protocol::policy::{
     ClassCoverage, Coverage, EnforcementDescriptor, EnforcementReason, ReasonCode, ToolClass,
@@ -63,7 +63,7 @@ use atrium_protocol::policy::{
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::{Instant as TokioInstant, sleep_until, timeout, timeout_at};
 
@@ -83,6 +83,9 @@ const ASK_USER_QUESTION: &str = "AskUserQuestion";
 /// Events held back when the client is not reading, before the adapter stops
 /// reading the provider (the pipe then applies backpressure to Claude Code).
 const PENDING_LIMIT: usize = 4096;
+/// Maximum number of inner `gate.check` / `gate.question_ticket` calls (and
+/// their compensation withdrawals) that may be outstanding at once.
+const MAX_IN_FLIGHT_GATE_CALLS: usize = MAX_PENDING_REQUESTS;
 /// How often a provider that closed nothing is checked for being gone (a
 /// grandchild can keep its pipes open after it exited).
 const ALIVE_POLL: Duration = Duration::from_millis(500);
@@ -353,26 +356,38 @@ enum Internal {
         input: Value,
         failed: bool,
     },
-    Withdraw(ApprovalTicket),
+    Withdraw(ApprovalTicket, Option<OwnedSemaphorePermit>),
 }
 
 struct InFlightCheck {
     count: Arc<AtomicUsize>,
     settled: Arc<Notify>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl InFlightCheck {
-    fn enter(count: &Arc<AtomicUsize>, settled: &Arc<Notify>) -> Self {
+    fn try_enter(
+        permits: &Arc<Semaphore>,
+        count: &Arc<AtomicUsize>,
+        settled: &Arc<Notify>,
+    ) -> Option<Self> {
+        let permit = permits.clone().try_acquire_owned().ok()?;
         count.fetch_add(1, Ordering::AcqRel);
-        Self {
+        Some(Self {
             count: count.clone(),
             settled: settled.clone(),
-        }
+            permit: Some(permit),
+        })
+    }
+
+    fn take_permit(&mut self) -> Option<OwnedSemaphorePermit> {
+        self.permit.take()
     }
 }
 
 impl Drop for InFlightCheck {
     fn drop(&mut self) {
+        drop(self.permit.take());
         if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.settled.notify_waiters();
         }
@@ -412,17 +427,20 @@ impl OrphanGuard {
 
 impl Drop for OrphanGuard {
     fn drop(&mut self) {
-        let in_flight = self.in_flight.take();
-        if let Some(ticket) = self.ticket.take()
-            && let Err(mpsc::error::SendError(Internal::Withdraw(ticket))) =
-                self.tx.send(Internal::Withdraw(ticket))
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            let gate = self.gate.clone();
-            handle.spawn(async move {
-                let _keep_inflight = in_flight;
-                gate.withdraw(&ticket).await;
-            });
+        let mut in_flight = self.in_flight.take();
+        if let Some(ticket) = self.ticket.take() {
+            let permit = in_flight.as_mut().and_then(InFlightCheck::take_permit);
+            if let Err(mpsc::error::SendError(Internal::Withdraw(ticket, permit))) =
+                self.tx.send(Internal::Withdraw(ticket, permit))
+                && let Ok(handle) = tokio::runtime::Handle::try_current()
+            {
+                let gate = self.gate.clone();
+                handle.spawn(async move {
+                    let _keep_inflight = in_flight;
+                    let _keep_permit = permit;
+                    gate.withdraw(&ticket).await;
+                });
+            }
         }
     }
 }
@@ -546,6 +564,9 @@ struct Actor {
     shutting_down: bool,
     /// In-flight gate calls; aborted when the session ends.
     gates: JoinSet<()>,
+    /// Admission bound on inner `gate.check` / `gate.question_ticket` calls
+    /// (including cancelled/timed-out calls still running or awaiting withdrawal).
+    gate_permits: Arc<Semaphore>,
     /// Number of inner `gate.check` / `gate.question_ticket` tasks still running
     /// or holding an unclaimed `OrphanGuard`, so shutdown drains their withdrawals.
     gate_in_flight: Arc<AtomicUsize>,
@@ -565,8 +586,9 @@ struct Actor {
     /// Questions waiting for an answer, by ticket id: (native id, input).
     questions: HashMap<String, (String, Value)>,
     /// Tickets withdrawn by the provider, turn end, or unmatched hook `Ask`,
-    /// drained asynchronously via `ToolGate::withdraw`.
-    pending_withdrawals: Vec<ApprovalTicket>,
+    /// drained asynchronously via `ToolGate::withdraw` (retaining any inner
+    /// gate permit until compensation settles).
+    pending_withdrawals: Vec<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
 
     mcp_dir: Option<TempDir>,
     mcp_path: PathBuf,
@@ -619,6 +641,7 @@ impl Actor {
             queue: VecDeque::new(),
             shutting_down: false,
             gates: JoinSet::new(),
+            gate_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_GATE_CALLS)),
             gate_in_flight: Arc::new(AtomicUsize::new(0)),
             gate_settled: Arc::new(Notify::new()),
             hook_asked: HashMap::new(),
@@ -1074,7 +1097,15 @@ impl Actor {
     }
 
     fn queue_withdraw(&mut self, ticket: ApprovalTicket) {
-        self.pending_withdrawals.push(ticket);
+        self.pending_withdrawals.push((ticket, None));
+    }
+
+    fn queue_withdraw_with_permit(
+        &mut self,
+        ticket: ApprovalTicket,
+        permit: Option<OwnedSemaphorePermit>,
+    ) {
+        self.pending_withdrawals.push((ticket, permit));
     }
 
     async fn wait_for_in_flight_gates(&self) {
@@ -1102,9 +1133,12 @@ impl Actor {
             return;
         }
         let mut set = JoinSet::new();
-        for ticket in tickets {
+        for (ticket, permit) in tickets {
             let gate = self.gate.clone();
-            set.spawn(async move { gate.withdraw(&ticket).await });
+            set.spawn(async move {
+                let _permit = permit;
+                gate.withdraw(&ticket).await;
+            });
         }
         let _ = timeout(self.options.gate_deadline, async {
             while set.join_next().await.is_some() {}
@@ -1126,7 +1160,9 @@ impl Actor {
                 Internal::Redeem {
                     ticket, decision, ..
                 } if !matches!(decision, GateDecision::Allow) => self.queue_withdraw(ticket),
-                Internal::Withdraw(ticket) => self.queue_withdraw(ticket),
+                Internal::Withdraw(ticket, permit) => {
+                    self.queue_withdraw_with_permit(ticket, permit);
+                }
                 _ => {}
             }
         }
@@ -1158,21 +1194,24 @@ impl Actor {
         self.inflight.clear();
         for (_, queue) in self.hook_asked.drain() {
             for (_, ticket) in queue {
-                self.pending_withdrawals.push(ticket);
+                self.pending_withdrawals.push((ticket, None));
             }
         }
         self.live.clear();
         for (_, a) in self.approvals.drain() {
-            self.pending_withdrawals.push(a.ticket);
+            self.pending_withdrawals.push((a.ticket, None));
         }
         for (_, ticket) in self.redeeming.drain() {
-            self.pending_withdrawals.push(ticket);
+            self.pending_withdrawals.push((ticket, None));
         }
         for (request_id, _) in self.questions.drain() {
-            self.pending_withdrawals.push(ApprovalTicket {
-                request_id,
-                rememberable: false,
-            });
+            self.pending_withdrawals.push((
+                ApprovalTicket {
+                    request_id,
+                    rememberable: false,
+                },
+                None,
+            ));
         }
     }
 
@@ -1384,11 +1423,23 @@ impl Actor {
     }
 
     fn spawn_gate(&mut self, reply: Reply, check: ToolCheck) {
+        let Some(in_flight) =
+            InFlightCheck::try_enter(&self.gate_permits, &self.gate_in_flight, &self.gate_settled)
+        else {
+            let decision = GateDecision::Deny {
+                reason: "too many pending gate checks".into(),
+            };
+            self.feed(AdapterInput::Gate {
+                check: check.clone(),
+                decision: decision.clone(),
+            });
+            self.on_gate_decision(reply, check, decision);
+            return;
+        };
         let gate = self.gate.clone();
         let tx = self.internal_tx.clone();
         let deadline = self.options.gate_deadline;
         let native = reply.key();
-        let in_flight = InFlightCheck::enter(&self.gate_in_flight, &self.gate_settled);
         let task = self.gates.spawn(async move {
             let for_gate = check.clone();
             let tx_orphan = tx.clone();
@@ -1453,12 +1504,24 @@ impl Actor {
     }
 
     fn spawn_question(&mut self, native: String, input: Value) {
+        let Some(in_flight) =
+            InFlightCheck::try_enter(&self.gate_permits, &self.gate_in_flight, &self.gate_settled)
+        else {
+            self.feed(AdapterInput::QuestionTicket {
+                id: native.clone(),
+                ticket: None,
+            });
+            self.deny_can_use(
+                &native,
+                "Atrium declined the question: too many pending gate checks",
+            );
+            return;
+        };
         let gate = self.gate.clone();
         let tx = self.internal_tx.clone();
         let deadline = self.options.gate_deadline;
         let turn = Some(self.norm.turn_number());
         let key = Req::CanUse(native.clone());
-        let in_flight = InFlightCheck::enter(&self.gate_in_flight, &self.gate_settled);
         let task = self.gates.spawn(async move {
             let tx_orphan = tx.clone();
             let gate_orphan = gate.clone();
@@ -1534,8 +1597,8 @@ impl Actor {
 
     fn on_internal(&mut self, msg: Internal) {
         while self.gates.try_join_next().is_some() {}
-        if let Internal::Withdraw(ticket) = msg {
-            self.queue_withdraw(ticket);
+        if let Internal::Withdraw(ticket, permit) = msg {
+            self.queue_withdraw_with_permit(ticket, permit);
             return;
         }
         match &msg {
@@ -1543,13 +1606,13 @@ impl Actor {
             Internal::Redeem { native, .. } | Internal::Question { native, .. } => {
                 self.inflight.remove(&Req::CanUse(native.clone()))
             }
-            Internal::Withdraw(_) => None,
+            Internal::Withdraw(_, _) => None,
         };
         let failed = match &msg {
             Internal::Gate { failed, .. }
             | Internal::Redeem { failed, .. }
             | Internal::Question { failed, .. } => *failed,
-            Internal::Withdraw(_) => false,
+            Internal::Withdraw(_, _) => false,
         };
         match msg {
             Internal::Gate {
@@ -1640,7 +1703,7 @@ impl Actor {
                     self.queue_withdraw(t);
                 }
             }
-            Internal::Withdraw(_) => {}
+            Internal::Withdraw(_, _) => {}
         }
         if failed {
             self.gate_failed();
@@ -2288,7 +2351,7 @@ mod tests {
         assert_eq!(
             a.pending_withdrawals
                 .iter()
-                .map(|t| t.request_id.as_str())
+                .map(|(t, _)| t.request_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["H1"]
         );
@@ -2308,7 +2371,7 @@ mod tests {
         assert_eq!(
             a.pending_withdrawals
                 .iter()
-                .map(|t| t.request_id.as_str())
+                .map(|(t, _)| t.request_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["R1"]
         );
@@ -2332,7 +2395,7 @@ mod tests {
         assert_eq!(
             a.pending_withdrawals
                 .iter()
-                .map(|t| t.request_id.as_str())
+                .map(|(t, _)| t.request_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["L1"]
         );

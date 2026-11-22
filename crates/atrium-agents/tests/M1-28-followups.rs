@@ -20,9 +20,10 @@ use atrium_core::policy::{DefaultPolicy, Ledger, SessionGate, SessionGateConfig,
 use atrium_core::store::{SqliteStore, StoreOptions};
 use atrium_core::{NewThread, Signal, Store};
 use atrium_protocol::agent::{AgentEvent, Provider, SessionCommand};
+use atrium_protocol::limits::MAX_PENDING_REQUESTS;
 use atrium_protocol::policy::Preset;
 use atrium_protocol::thread::{Location, ThreadId};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 fn scratch(name: &str) -> PathBuf {
     static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -1018,5 +1019,449 @@ for line in sys.stdin:
         "late Codex orphan withdrawal entered closed/unread channel instead of withdrawing"
     );
     assert_eq!(ledger.open_count().await, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Gate wrapper that pauses `check()` after the real `SessionGate` inserts its
+/// approval row until `release` turns `true`, while counting total `check()`
+/// invocations and withdrawals.
+struct BoundedBarrierGate {
+    inner: Arc<SessionGate>,
+    check_calls: AtomicUsize,
+    check_entered: Arc<Notify>,
+    release: watch::Receiver<bool>,
+    asked: Mutex<Vec<ApprovalTicket>>,
+    withdrawn: Mutex<Vec<ApprovalTicket>>,
+}
+
+impl BoundedBarrierGate {
+    fn new(inner: Arc<SessionGate>) -> (Arc<Self>, watch::Sender<bool>) {
+        let (tx, rx) = watch::channel(false);
+        let gate = Arc::new(Self {
+            inner,
+            check_calls: AtomicUsize::new(0),
+            check_entered: Arc::new(Notify::new()),
+            release: rx,
+            asked: Mutex::default(),
+            withdrawn: Mutex::default(),
+        });
+        (gate, tx)
+    }
+
+    fn check_calls(&self) -> usize {
+        self.check_calls.load(Ordering::Acquire)
+    }
+
+    fn asked_len(&self) -> usize {
+        self.asked.lock().unwrap().len()
+    }
+
+    fn withdrawn_len(&self) -> usize {
+        self.withdrawn.lock().unwrap().len()
+    }
+}
+
+impl ToolGate for BoundedBarrierGate {
+    fn check<'a>(&'a self, check: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+        Box::pin(async move {
+            self.check_calls.fetch_add(1, Ordering::AcqRel);
+            let d = self.inner.check(check).await;
+            if let GateDecision::Ask { ticket } = &d {
+                self.asked.lock().unwrap().push(ticket.clone());
+            }
+            self.check_entered.notify_waiters();
+            let mut rx = self.release.clone();
+            while !*rx.borrow() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            d
+        })
+    }
+
+    fn redeem<'a>(
+        &'a self,
+        ticket: &'a ApprovalTicket,
+        check: &'a ToolCheck,
+    ) -> BoxFuture<'a, GateDecision> {
+        self.inner.redeem(ticket, check)
+    }
+
+    fn question_ticket(&self, turn: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
+        self.inner.question_ticket(turn)
+    }
+
+    fn withdraw<'a>(&'a self, ticket: &'a ApprovalTicket) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.withdrawn.lock().unwrap().push(ticket.clone());
+            self.inner.withdraw(ticket).await;
+        })
+    }
+}
+
+async fn make_session_gate(
+    provider: Provider,
+    home: &Path,
+    preset: Preset,
+) -> (PathBuf, Arc<SqliteStore>, ThreadId, u32, Arc<SessionGate>) {
+    let dir = scratch("ledger-bounded");
+    let store = Arc::new(
+        SqliteStore::open(&dir.join("atrium.db"), StoreOptions::default())
+            .await
+            .unwrap(),
+    );
+    let ledger = Arc::new(Ledger::new(store.requests()));
+    let s = store
+        .create_thread(NewThread {
+            provider,
+            model: None,
+            effort: None,
+            preset,
+            location: Location::Home,
+            title: "m1-33-bounded-gate".into(),
+        })
+        .await
+        .unwrap();
+    let inc = store.begin_incarnation(&s.thread_id).await.unwrap();
+    store.signal(&s.thread_id, Signal::Starting).await.unwrap();
+    let canon_home = fs::canonicalize(home).unwrap();
+    let gate = Arc::new(SessionGate::new(
+        SessionGateConfig {
+            thread: s.thread_id.clone(),
+            incarnation: inc,
+            cwd: canon_home.clone(),
+            home: canon_home,
+            atrium_data_paths: vec![],
+            atrium_protected_paths: vec![],
+            preset,
+            provider,
+        },
+        Arc::new(DefaultPolicy::new()),
+        ledger,
+        Arc::new(StoreRules(store.clone())),
+    ));
+    (dir, store, s.thread_id, inc, gate)
+}
+
+/// M1-33 finding 1 (Claude): repeatedly submitting and cancelling native
+/// requests while `gate.check` is blocked must not accumulate unbounded inner
+/// tasks; excess requests are declined explicitly and capacity recovers once
+/// cancelled calls settle and withdraw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_bounded_inner_gate_calls_decline_excess_and_recover() {
+    let dir = scratch("claude-bounded-gate");
+    let script = dir.join("fake-claude-bounded.py");
+    let recovery_trigger = dir.join("send_recovery");
+    let denied_log = dir.join("denied.txt");
+    let batch_size: usize = 16;
+    let batches: usize = MAX_PENDING_REQUESTS / batch_size;
+    assert_eq!(batches * batch_size, MAX_PENDING_REQUESTS);
+    let excess_count: usize = 8;
+
+    write_executable(
+        &script,
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, os, sys, threading, time
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("2.1.308 (Claude Code)")
+    sys.exit(0)
+sid = "fake-bounded"
+batch_size = {batch_size}
+batches = {batches}
+excess = {excess}
+trigger_dir = {trigger_dir:?}
+recovery_trigger = {recovery_trigger:?}
+denied_log = {denied_log:?}
+
+def wait_for(path):
+    deadline = time.monotonic() + 10.0
+    while not os.path.exists(path) and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+def emit_flow():
+    print(json.dumps({{"type":"system","subtype":"init","session_id":sid,"model":"claude-fake","tools":["Read"],"cwd":"."}}), flush=True)
+    # Submit in batches, wait until each batch has entered the blocked gate,
+    # then cancel every request in the batch so outer bookkeeping is cleared
+    # while all `MAX_PENDING_REQUESTS` inner tasks remain blocked.
+    for b in range(batches):
+        base = b * batch_size
+        for i in range(base, base + batch_size):
+            rid = f"cancel_{{i}}"
+            print(json.dumps({{"type":"control_request","request_id":rid,"request":{{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":f"tu_c_{{i}}","input":{{"file_path":"x"}}}}}}), flush=True)
+        wait_for(os.path.join(trigger_dir, f"cancel_{{b}}"))
+        for i in range(base, base + batch_size):
+            print(json.dumps({{"type":"control_cancel_request","request_id":f"cancel_{{i}}"}}), flush=True)
+    # Pipe FIFO guarantees all cancellations are processed before these excess requests.
+    for i in range(excess):
+        rid = f"excess_{{i}}"
+        print(json.dumps({{"type":"control_request","request_id":rid,"request":{{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":f"tu_e_{{i}}","input":{{"file_path":"x"}}}}}}), flush=True)
+    wait_for(recovery_trigger)
+    print(json.dumps({{"type":"control_request","request_id":"recover_1","request":{{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"tu_rec","input":{{"file_path":"x"}}}}}}), flush=True)
+
+for line in sys.stdin:
+    v = json.loads(line)
+    t = v.get("type")
+    if t == "control_request" and v.get("request", {{}}).get("subtype") == "initialize":
+        print(json.dumps({{"type":"control_response","response":{{"subtype":"success","request_id":v["request_id"],"response":{{"commands":[]}}}}}}), flush=True)
+    elif t == "user":
+        threading.Thread(target=emit_flow, daemon=True).start()
+    elif t == "control_response":
+        resp = v.get("response", {{}})
+        rid = resp.get("request_id", "")
+        beh = resp.get("response", {{}}).get("behavior")
+        if rid.startswith("excess_") and beh == "deny":
+            with open(denied_log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+"#,
+            batch_size = batch_size,
+            batches = batches,
+            excess = excess_count,
+            trigger_dir = dir.display().to_string(),
+            recovery_trigger = recovery_trigger.display().to_string(),
+            denied_log = denied_log.display().to_string(),
+        ),
+    );
+
+    let (ledger_dir, store, thread, inc, session_gate) =
+        make_session_gate(Provider::Claude, &dir, Preset::Careful).await;
+    let (gate, release) = BoundedBarrierGate::new(session_gate);
+
+    let mut session = ClaudeAdapter::new(claude_opts(Duration::from_secs(30)))
+        .start(claude_cfg(&dir, script, gate.clone()), Transport::Local)
+        .await
+        .unwrap();
+
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage { text: "go".into() })
+        .await
+        .unwrap();
+
+    // Let each batch commit into SQLite and park on the gate barrier before cancelling it.
+    for b in 0..batches {
+        let target = (b + 1) * batch_size;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gate.asked_len() < target && Instant::now() < deadline {
+            let notified = gate.check_entered.notified();
+            let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
+        }
+        assert_eq!(gate.asked_len(), target, "batch {b} did not reach gate");
+        fs::write(dir.join(format!("cancel_{b}")), "go").unwrap();
+    }
+
+    // All `excess_count` requests sent right after the final batch's cancellations
+    // must be declined explicitly without entering `gate.check`.
+    let deny_deadline = Instant::now() + Duration::from_secs(10);
+    let mut denied: Vec<String> = Vec::new();
+    while Instant::now() < deny_deadline {
+        if let Ok(text) = fs::read_to_string(&denied_log) {
+            denied = text.lines().map(str::to_owned).collect();
+            if denied.len() == excess_count {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        denied.len(),
+        excess_count,
+        "expected all {excess_count} excess Claude requests to be explicitly denied, got {denied:?}"
+    );
+    assert_eq!(
+        gate.check_calls(),
+        MAX_PENDING_REQUESTS,
+        "excess requests must not enter inner gate.check while cancelled calls hold capacity"
+    );
+
+    // Release the blocked inner checks so they settle and withdraw their tickets.
+    let _ = release.send(true);
+    let settle_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < settle_deadline {
+        let open = store.requests().open_count(&thread, inc).await.unwrap();
+        if gate.withdrawn_len() == MAX_PENDING_REQUESTS && open == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(gate.asked_len(), MAX_PENDING_REQUESTS);
+    assert_eq!(gate.withdrawn_len(), MAX_PENDING_REQUESTS);
+    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+
+    // After capacity is returned, a new request is admitted normally.
+    fs::write(&recovery_trigger, "go").unwrap();
+    wait_for_approvals(&mut session, 1).await;
+    assert_eq!(gate.check_calls(), MAX_PENDING_REQUESTS + 1);
+
+    shutdown(session).await;
+    let _ = fs::remove_dir_all(&ledger_dir);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// M1-33 finding 1 (Codex): repeatedly submitting and cancelling native
+/// requests (`serverRequest/resolved`) while `gate.check` is blocked must not
+/// accumulate unbounded inner tasks; excess requests are declined explicitly
+/// and capacity recovers once cancelled calls settle and withdraw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_bounded_inner_gate_calls_decline_excess_and_recover() {
+    let dir = scratch("codex-bounded-gate");
+    let user_dir = dir.join("empty-codex-home");
+    fs::create_dir_all(&user_dir).unwrap();
+    let script = dir.join("fake-codex-bounded.py");
+    let recovery_trigger = dir.join("send_recovery");
+    let declined_log = dir.join("declined.txt");
+    let batch_size: usize = 16;
+    let batches: usize = MAX_PENDING_REQUESTS / batch_size;
+    assert_eq!(batches * batch_size, MAX_PENDING_REQUESTS);
+    let excess_count: usize = 8;
+
+    write_executable(
+        &script,
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, os, sys, threading, time
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("codex-cli 0.163.0")
+    sys.exit(0)
+batch_size = {batch_size}
+batches = {batches}
+excess = {excess}
+trigger_dir = {trigger_dir:?}
+recovery_trigger = {recovery_trigger:?}
+declined_log = {declined_log:?}
+
+def wait_for(path):
+    deadline = time.monotonic() + 10.0
+    while not os.path.exists(path) and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+def emit_flow():
+    # Submit in batches of 16 (well below the outer live+approvals bound),
+    # wait until each batch has entered the blocked gate, then cancel via
+    # `serverRequest/resolved` so outer bookkeeping clears while inner tasks stay blocked.
+    for b in range(batches):
+        base = b * batch_size
+        for i in range(base, base + batch_size):
+            rid = f"cancel_{{i}}"
+            print(json.dumps({{"id": rid, "method": "item/commandExecution/requestApproval", "params": {{"threadId": "th_fake", "turnId": "turn_1", "itemId": f"item_c_{{i}}", "command": "ls", "cwd": "."}}}}), flush=True)
+        wait_for(os.path.join(trigger_dir, f"cancel_{{b}}"))
+        for i in range(base, base + batch_size):
+            print(json.dumps({{"method": "serverRequest/resolved", "params": {{"threadId": "th_fake", "requestId": f"cancel_{{i}}"}}}}), flush=True)
+    for i in range(excess):
+        rid = f"excess_{{i}}"
+        print(json.dumps({{"id": rid, "method": "item/commandExecution/requestApproval", "params": {{"threadId": "th_fake", "turnId": "turn_1", "itemId": f"item_e_{{i}}", "command": "ls", "cwd": "."}}}}), flush=True)
+    wait_for(recovery_trigger)
+    print(json.dumps({{"id": "recover_1", "method": "item/commandExecution/requestApproval", "params": {{"threadId": "th_fake", "turnId": "turn_1", "itemId": "item_rec", "command": "ls", "cwd": "."}}}}), flush=True)
+
+for line in sys.stdin:
+    v = json.loads(line)
+    m = v.get("method")
+    rid = v.get("id")
+    if m == "initialize":
+        print(json.dumps({{"id": rid, "result": {{"userAgent": "codex-fake/0.163.0", "codexHome": "/scratch/.codex"}}}}), flush=True)
+    elif m == "thread/start":
+        print(json.dumps({{"id": rid, "result": {{"thread": {{"id": "th_fake", "cliVersion": "0.163.0"}}, "approvalPolicy": "untrusted", "sandbox": {{"type": "workspaceWrite", "networkAccess": False}}}}}}), flush=True)
+    elif m == "turn/start":
+        print(json.dumps({{"id": rid, "result": {{"turn": {{"id": "turn_1", "items": [], "status": "inProgress"}}}}}}), flush=True)
+        print(json.dumps({{"method": "turn/started", "params": {{"threadId": "th_fake", "turn": {{"id": "turn_1", "status": "inProgress"}}}}}}), flush=True)
+        threading.Thread(target=emit_flow, daemon=True).start()
+    elif m is None and isinstance(rid, str) and rid.startswith("excess_"):
+        if v.get("result", {{}}).get("decision") == "decline":
+            with open(declined_log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+"#,
+            batch_size = batch_size,
+            batches = batches,
+            excess = excess_count,
+            trigger_dir = dir.display().to_string(),
+            recovery_trigger = recovery_trigger.display().to_string(),
+            declined_log = declined_log.display().to_string(),
+        ),
+    );
+
+    let (ledger_dir, store, thread, inc, session_gate) =
+        make_session_gate(Provider::Codex, &dir, Preset::Careful).await;
+    let (gate, release) = BoundedBarrierGate::new(session_gate);
+
+    let cfg = SessionConfig {
+        cwd: dir.clone(),
+        model: Some("gpt-5".into()),
+        effort: None,
+        permissions: PermissionPolicy::Ask,
+        resume: None,
+        mcp_servers: vec![],
+        gate: gate.clone(),
+        env: vec![("CODEX_HOME".into(), user_dir.display().to_string())],
+        program: Some(script),
+        on_spawn: None,
+    };
+    let opts = CodexOptions {
+        user_dir: Some(user_dir),
+        ..CodexOptions::default()
+    };
+    let mut session = CodexAdapter::with_options(opts)
+        .start(cfg, Transport::Local)
+        .await
+        .unwrap();
+
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage { text: "go".into() })
+        .await
+        .unwrap();
+
+    for b in 0..batches {
+        let target = (b + 1) * batch_size;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gate.asked_len() < target && Instant::now() < deadline {
+            let notified = gate.check_entered.notified();
+            let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
+        }
+        assert_eq!(gate.asked_len(), target, "batch {b} did not reach gate");
+        fs::write(dir.join(format!("cancel_{b}")), "go").unwrap();
+    }
+
+    let decline_deadline = Instant::now() + Duration::from_secs(10);
+    let mut declined: Vec<String> = Vec::new();
+    while Instant::now() < decline_deadline {
+        if let Ok(text) = fs::read_to_string(&declined_log) {
+            declined = text.lines().map(str::to_owned).collect();
+            if declined.len() == excess_count {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        declined.len(),
+        excess_count,
+        "expected all {excess_count} excess Codex requests to be explicitly declined, got {declined:?}"
+    );
+    assert_eq!(
+        gate.check_calls(),
+        MAX_PENDING_REQUESTS,
+        "excess requests must not enter inner gate.check while cancelled calls hold capacity"
+    );
+
+    let _ = release.send(true);
+    let settle_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < settle_deadline {
+        let open = store.requests().open_count(&thread, inc).await.unwrap();
+        if gate.withdrawn_len() == MAX_PENDING_REQUESTS && open == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(gate.asked_len(), MAX_PENDING_REQUESTS);
+    assert_eq!(gate.withdrawn_len(), MAX_PENDING_REQUESTS);
+    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+
+    fs::write(&recovery_trigger, "go").unwrap();
+    wait_for_approvals(&mut session, 1).await;
+    assert_eq!(gate.check_calls(), MAX_PENDING_REQUESTS + 1);
+
+    shutdown(session).await;
+    let _ = fs::remove_dir_all(&ledger_dir);
     let _ = fs::remove_dir_all(&dir);
 }
