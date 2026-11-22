@@ -160,3 +160,48 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core policy::v4:: -- --nocapture
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 2 (P0 final, D-141)
+
+Adapted P1 to P0's final D-141 interface (`a1f0174`), where `ToolSpec` carries `{ name, platforms, kind: ToolRowKind, changes_default }` across the six row kinds and 70 tools moved out of `TOOLS` into `UNKNOWN_BY_DESIGN`.
+
+### Changes by call site
+- **`crates/atrium-core/src/policy/v4/units.rs`:**
+  - `process_text_recursive` (nested-shell check): `spec.nested_shell` → `spec.is_nested_shell()` (matches `ToolRowKind::NestedShell(_)`, i.e., `sh`, `bash`, `dash`).
+  - `unwrap_unit_preserving`: `spec.wrapper` → `spec.wrapper()` (matches `ToolRowKind::Wrapper(_)`, i.e., §4's 6 closed wrappers).
+  - `parse_wrapper_prefix` (`WrapperKind::Nice`, `WrapperKind::Timeout`) and `classify_nested_shell`: `spec.flags` → `spec.flags()` (3 call sites + doc comment).
+  - `lookup_outside_model` checks for the 12 outside-model shells and 16 outside-model wrappers remain exact against D-141's `OUTSIDE_MODEL` entries.
+- **`crates/atrium-core/src/policy/v4/lex/best_effort.rs`:**
+  - Replaced `use crate::policy::tools::{self, CodeRunnerBehavior}` with `use crate::policy::tools::{self, ToolRowKind, ToolSpec}`.
+  - `is_be_shell`: `tools::lookup(&folded).is_some_and(|t| t.nested_shell)` → `tools::lookup(&folded).is_some_and(ToolSpec::is_nested_shell)`.
+  - `is_be_code_runner`: `tools::lookup(folded).is_some_and(|t| !matches!(t.code_runner, CodeRunnerBehavior::Never))` → `tools::lookup(folded).is_some_and(|t| matches!(t.kind, ToolRowKind::CodeRunner(_)))`.
+
+### Decision: "is a code runner" in the best-effort pass (`is_be_code_runner`)
+- `is_be_code_runner` is called only in **Scan 7** (`lex_one_text`, deciding whether a here-doc or here-string body fed to `owner_unit` on stdin should be recursively lexed as shell commands).
+- Under D-141, **`is_be_code_runner` matches `ToolRowKind::CodeRunner(_)` only, excluding `ToolRowKind::ConditionalRunner(_)` (`find`, `git`, `sed`)**:
+  - Unconditional `CodeRunner` tools (`awk`/`gawk`/`mawk`, `perl`/`python`/`python3`/`node`/`ruby`, `eval`/`xargs`, `source`/`.`/`npx`, `cargo`/`pipx`, and all 29 `shell::COMMAND_RUNNERS` such as `ssh`, `docker`, `kubectl`, `parallel`, `su`) can execute code or commands supplied on stdin, so Scan 7 keeps extracting their heredoc/herestring bodies.
+  - `ConditionalRunner` (`find`, `git`, `sed`) is excluded from Scan 7: `git` reads data on stdin (e.g. `git commit -F - <<EOF`, `git apply <<EOF`), never shell code (even its code-running triggers come from argv/config); `find` does not execute stdin (`-exec`/`-execdir`/`-ok`/`-okdir` are already extracted from argv by Scan 5); and plain `sed 's/a/b/' <<EOF` processes text data (its `e`/`w`/`r`/`-f` triggers are classified as `Unread` by P3 in the exact model). Excluding `ConditionalRunner` avoids false hard-deny hits on commit messages or plain text data in heredocs while matching `dev`'s `reads_stdin_as_script` behaviour.
+
+### Test audit against D-141's table
+- Audited all existing tests in `v4/lex/tests.rs` and `v4/units/tests.rs`: none depended on per-tool rows removed under D-141 (`cat` remains `HomeReadOnly`; `sh`/`bash`/`dash`, all 6 wrappers, all 12 outside shells, all 16 outside wrappers, and all 19 reserved words remain in `TOOLS` / `OUTSIDE_MODEL`; `SUDO id` / `echo` / `printf` / `true` receive §4 unknown-tool treatment in P1 without emitting spurious `Unread`, while `printf -v HOME` still triggers `HomeSetEarlier` by folded name).
+- Added `lex_best_effort_heredocs_follow_d141_code_runner_vs_conditional_runner` in `crates/atrium-core/src/policy/v4/lex/tests.rs` verifying `CodeRunner` vs `ConditionalRunner` heredoc handling in Scan 7.
+- Added `build_units_treats_d141_unknown_by_design_tools_as_unknown` in `crates/atrium-core/src/policy/v4/units/tests.rs` verifying `rm`, `curl`, `patch`, `diff`, `sudo` are in `UNKNOWN_BY_DESIGN` (not `TOOLS` or `OUTSIDE_MODEL`), unwrap cleanly under §4 wrappers, and emit no P1 `Unread`.
+
+### Change requests against P0's interface
+- **None.** `ToolSpec::{flags, wrapper, is_nested_shell}`, `ToolRowKind::CodeRunner`, `lookup`, `lookup_outside_model`, `lookup_unknown_by_design`, `flag`, and `flag_short` cover every P1 call site cleanly with no edits to `tools.rs`, `model.rs`, or `limits.rs`.
+
+### Round 2 verification
+Run by worker (allowed under D-123):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
+
+Commands for the orchestrator's verification task (fish-compatible):
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4:: -- --nocapture
+cargo test --workspace --no-fail-fast
+```
