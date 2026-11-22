@@ -3,6 +3,7 @@
 // ends up holding. The DOM checks walk every node the renderer made.
 
 import { describe, expect, it, vi } from "vitest";
+import { BlockSplitter } from "./blocks";
 import { classifyImage, classifyLink } from "./links";
 import { MAX_INLINE_IMAGE_BYTES } from "./limits";
 import { type Block, type Inline, parseInline, parseMarkdown, plainText } from "./markdown";
@@ -420,6 +421,55 @@ describe("blocks", () => {
     expect(parseMarkdown("a | b\n|---||---|").map((b) => b.t)).toEqual(["p"]);
     expect(parseMarkdown("a | b\n|---| |").map((b) => b.t)).toEqual(["p"]);
     expect(parseMarkdown("a | b\n   |   ").map((b) => b.t)).toEqual(["p"]);
+  });
+
+  it("multiline soft line breaks scale linearly, including through BlockSplitter (M1-33 round 3 finding 1)", () => {
+    const lines = 160_000;
+    const src = "a\n".repeat(lines);
+    const start = performance.now();
+    const direct = parseMarkdown(src);
+    expect(performance.now() - start).toBeLessThan(1500);
+    expect(direct).toEqual([{ t: "p", c: [{ t: "text", v: src.slice(0, -1) }] }]);
+
+    // Input delivered through BlockSplitter as one folded multiline delta.
+    const splitter = new BlockSplitter();
+    const splitStart = performance.now();
+    splitter.feed(src);
+    splitter.seal();
+    const parsedBlocks = splitter.blocks.flatMap((b) => parseMarkdown(b.text));
+    expect(performance.now() - splitStart).toBeLessThan(1500);
+    expect(splitter.blocks.length).toBeGreaterThanOrEqual(1);
+    expect(parsedBlocks).toEqual([{ t: "p", c: [{ t: "text", v: src.slice(0, -1) }] }]);
+
+    // Soft-break trailing single space trimming, hard breaks (2+ spaces or `\`), and leading space trimming.
+    expect(parseInline("a \n  b")).toEqual([{ t: "text", v: "a\nb" }]);
+    expect(parseInline("a  \n  b")).toEqual([{ t: "text", v: "a" }, { t: "br" }, { t: "text", v: "b" }]);
+    expect(parseInline("a    \nb")).toEqual([{ t: "text", v: "a" }, { t: "br" }, { t: "text", v: "b" }]);
+    expect(parseInline("  \nb")).toEqual([{ t: "br" }, { t: "text", v: "b" }]);
+    expect(parseInline("a  \\\nb")).toEqual([{ t: "text", v: "a  " }, { t: "br" }, { t: "text", v: "b" }]);
+    expect(parseInline("a  ")).toEqual([{ t: "text", v: "a  " }]);
+  });
+
+  it("wide tables with many short rows and autolink opener floods scale linearly (M1-33 round 3 audit)", () => {
+    const cols = 4_000;
+    const rowCount = 4_000;
+    const header = Array.from({ length: cols }, () => "h").join("|");
+    const delim = Array.from({ length: cols }, () => "-").join("|");
+    const body = "a|b\n".repeat(rowCount);
+    const tableSrc = `${header}\n${delim}\n${body}`;
+
+    const start = performance.now();
+    const blocks = parseMarkdown(tableSrc);
+    const angleOut = parseInline("<".repeat(100_000));
+    expect(performance.now() - start).toBeLessThan(2000);
+
+    expect(blocks).toHaveLength(1);
+    const table = blocks[0] as Extract<Block, { t: "table" }>;
+    expect(table.t).toBe("table");
+    expect(table.head).toHaveLength(cols);
+    expect(table.rows).toHaveLength(rowCount);
+    expect(table.rows[0]).toEqual([[{ t: "text", v: "a" }], [{ t: "text", v: "b" }]]);
+    expect(angleOut).toEqual([{ t: "text", v: "<".repeat(100_000) }]);
   });
 });
 
