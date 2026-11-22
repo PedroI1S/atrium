@@ -336,10 +336,10 @@ pub(crate) enum CodeRunnerBehavior {
 
 /// Single-line switch controlling whether Home auto-allow permits followed-link
 /// searches (`rg -L`, `grep -R`) when the bounded link walk stays within budget
-/// and reaches no protected path (§10 row 15; proposed §11 item 15).
+/// and reaches no protected path (§10 row 15; §11 item 15, D-139).
 ///
 /// Flipping this constant to `false` restores `dev`'s Home `Ask` in one line if
-/// the driver rejects proposed §11 item 15.
+/// the driver had rejected §11 item 15 (approved, D-139).
 pub(crate) const ALLOW_HOME_FOLLOWED_SEARCH: bool = true;
 
 /// Home read-only eligibility mirrored verbatim from
@@ -2346,7 +2346,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             allow_followed_search: ALLOW_HOME_FOLLOWED_SEARCH,
         }),
         filter_dialect: Some(FilterDialect::RgGlob),
-        changes_default: Some("§11 item 9; §11 item 15 (proposed; §10 row 15)"),
+        changes_default: Some("§11 item 9; §11 item 15"),
         ..base_tool("rg")
     },
     ToolSpec {
@@ -2369,7 +2369,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             allow_followed_search: ALLOW_HOME_FOLLOWED_SEARCH,
         }),
         filter_dialect: Some(FilterDialect::GrepInclude),
-        changes_default: Some("§11 item 9; §11 item 15 (proposed; §10 row 15)"),
+        changes_default: Some("§11 item 9; §11 item 15"),
         ..base_tool("grep")
     },
     ToolSpec {
@@ -3483,7 +3483,7 @@ fn fmt_home(h: Option<HomeReadOnlySpec>) -> String {
         Recursion::WithFlags(_) => s.push_str(" [recursive w/ flags]"),
     }
     if h.allow_followed_search {
-        s.push_str(" [allows followed search (§11 item 15 proposed)]");
+        s.push_str(" [allows followed search (§11 item 15)]");
     }
     s
 }
@@ -4186,7 +4186,7 @@ mod tests {
             );
         }
 
-        // Proposed §11 item 15 (§10 row 15): controlled by ALLOW_HOME_FOLLOWED_SEARCH
+        // §11 item 15 (§10 row 15, D-139): controlled by ALLOW_HOME_FOLLOWED_SEARCH
         assert_eq!(
             table_accepts_in_home(&["rg", "-L", "x", "proj"]),
             ALLOW_HOME_FOLLOWED_SEARCH
@@ -4718,14 +4718,10 @@ mod tests {
             assert!(s.changes_default.unwrap().contains("§11 item 4"));
         }
 
-        // Finding 2: rg and grep carry proposed §11 item 15 and single toggle flag.
+        // Finding 2: rg and grep carry §11 item 15 and single toggle flag.
         for name in ["rg", "grep"] {
             let t = lookup(name).unwrap();
-            assert!(
-                t.changes_default
-                    .unwrap()
-                    .contains("§11 item 15 (proposed; §10 row 15)")
-            );
+            assert!(t.changes_default.unwrap().contains("§11 item 15"));
             assert_eq!(
                 t.home_readonly.unwrap().allow_followed_search,
                 ALLOW_HOME_FOLLOWED_SEARCH
@@ -4842,9 +4838,6 @@ mod tests {
             let parts: Vec<&str> = s.split(';').map(str::trim).collect();
             assert!(!parts.is_empty(), "{label}: empty changes_default");
             for p in parts {
-                if p == "§11 item 15 (proposed; §10 row 15)" {
-                    continue;
-                }
                 let num_str = p
                     .strip_prefix("§11 item ")
                     .unwrap_or_else(|| panic!("{label}: invalid citation `{p}`"));
@@ -4852,8 +4845,8 @@ mod tests {
                     .parse()
                     .unwrap_or_else(|_| panic!("{label}: non-numeric item in `{p}`"));
                 assert!(
-                    (1..=14).contains(&n),
-                    "{label}: item {n} outside 1..=14 in `{p}`"
+                    (1..=15).contains(&n),
+                    "{label}: item {n} outside 1..=15 in `{p}`"
                 );
             }
         };

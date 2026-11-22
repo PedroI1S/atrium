@@ -34,8 +34,8 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | `date` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes (forbids -s, --set, -f, --file) | — |
 | `whoami` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
 | `tree` | Linux, macOS | AnyExceptForbidden: `-o/--output` (Path) [writes:+] | rest: Path | access: FlagOnlyWrite; writes (flag); links(root=Y, below=N) | Yes (forbids -o, --output, -R) | — |
-| `rg` | Linux, macOS | ListedOnly: 83 listed flags (53 bool, 30 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive; links(root=Y, below=N); filter: RgGlob | Yes (forbids --pre, --pre-glob, -z, --search-zip, --hostname-bin, -f, --file) [recursive] [allows followed search (§11 item 15 proposed)] | §11 item 9; §11 item 15 (proposed; §10 row 15) |
-| `grep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | Yes (forbids -f, --file) [recursive w/ flags] [allows followed search (§11 item 15 proposed)] | §11 item 9; §11 item 15 (proposed; §10 row 15) |
+| `rg` | Linux, macOS | ListedOnly: 83 listed flags (53 bool, 30 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive; links(root=Y, below=N); filter: RgGlob | Yes (forbids --pre, --pre-glob, -z, --search-zip, --hostname-bin, -f, --file) [recursive] [allows followed search (§11 item 15)] | §11 item 9; §11 item 15 |
+| `grep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | Yes (forbids -f, --file) [recursive w/ flags] [allows followed search (§11 item 15)] | §11 item 9; §11 item 15 |
 | `egrep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 9 |
 | `fgrep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 9 |
 | `zgrep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 9 |
@@ -1173,8 +1173,8 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | `bash` | §11 item 2; §11 item 4; §11 item 8 |
 | `dash` | §11 item 2; §11 item 4; §11 item 8 |
 | `which` | §11 item 9 |
-| `rg` | §11 item 9; §11 item 15 (proposed; §10 row 15) |
-| `grep` | §11 item 9; §11 item 15 (proposed; §10 row 15) |
+| `rg` | §11 item 9; §11 item 15 |
+| `grep` | §11 item 9; §11 item 15 |
 | `egrep` | §11 item 9 |
 | `fgrep` | §11 item 9 |
 | `zgrep` | §11 item 9 |
