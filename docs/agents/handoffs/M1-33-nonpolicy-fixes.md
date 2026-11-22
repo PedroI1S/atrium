@@ -68,3 +68,18 @@ Worker: Gemini 4 Neon (D-134) · Branch: `agent/orchestrator/M1-33-nonpolicy-fix
   - `cargo test --workspace --no-fail-fast`
   - `pnpm -C app typecheck`
   - `pnpm -C app test`
+
+## Rework round 4
+
+- **Finding 1 (Minor — short table rows lose trailing empty cells):** Fixed in `app/src/chat/markdown.ts` and `app/src/chat/render.ts` (`8b19e98`), pinned in `app/src/chat/markdown.test.ts`:
+  - **Design & rationale (closest to pre-round-3 for ordinary tables while staying linear):**
+    - `parseMarkdown` keeps parsed body rows compact (no trailing empty-cell padding in `table.rows`) and caps table width at `MAX_TABLE_COLUMNS = 256`; when a table exceeds 256 columns, extra header cells (and extra body cells up to the original header count) degrade to plain text joined by `" | "` in the 256th column, while body cells beyond the original header count are still dropped per GFM.
+    - `renderBlocks` renders missing trailing cells without AST or DOM amplification: when 1 cell is missing (`missing === 1`, e.g. `a|b|c\n-|-|-\n1|2\n3|4|5`), it emits an ordinary `<td>` with the column's alignment class and no `colspan` attribute (DOM-identical to pre-round-3); when `missing > 1`, it emits a single `<td colspan=missing>` spanning the remaining columns, which preserves the continuous row `border-bottom` in `app/src/styles/chat.css` while adding at most one `<td>` node per row (O(n) DOM nodes even on 256-column tables with thousands of short rows, avoiding 256× DOM amplification).
+    - `blocksText` pads short rows with trailing `"\t"` up to `Math.min(b.head.length, MAX_TABLE_COLUMNS)`, matching pre-round-3 copied text byte-for-byte for every table up to 256 columns while keeping wide-table output linear and bounded.
+  - **Tests (`app/src/chat/markdown.test.ts`):** Added `"colspan"` to `ALLOWED_ATTRS` in `assertInert`; added `short table rows keep trailing empty cells in rendered DOM and copied text (M1-33 round 4 finding 1)` covering the review's exact case (`a|b|c\n-|-|-\n1|2\n3|4|5`) and a 2-missing-cell row (`a|b|c|d\n-|-|-|--:\n1|2\n3|4|5|6`) for compact AST, rendered `<td>`/`colspan`, and `blocksText`; expanded `wide tables with many short rows and autolink opener floods scale linearly (M1-33 round 3 audit)` to check linear scaling across `parseMarkdown`, `blocksText`, and `renderBlocks` (confirming O(1) trailing `<td colspan=254>` per row) plus plain-text overflow degradation past `MAX_TABLE_COLUMNS`.
+- **Verification & not done (per D-123):** No Rust files were modified in round 4; ran `cargo fmt --all --check` (via `cargo fmt --all`) clean. Did not run `pnpm`, `cargo test`, or `cargo clippy` (prohibited for workers by D-123). Orchestrator should run:
+  - `pnpm -C app typecheck`
+  - `pnpm -C app test`
+  - `cargo fmt --all --check`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - `cargo test --workspace --no-fail-fast`
