@@ -2,26 +2,46 @@
 //! link walks, and bounded hard-link walks (contract §1 step 4, §2, §5, §8,
 //! §11 items 7, 11, 12, 15).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use globset::{GlobBuilder, GlobMatcher};
 
 use crate::policy::limits;
 use crate::policy::model::{
-    AccessMode, ComputeBudget, Exhausted, FileIdentity, FileType, FilterDialect, FsCap, FsCaps,
-    FsIoError, Hit, HitMatch, HitSource, LinkPolicy, PartId, PartOutcome, PartResult, ProtectedSet,
-    RecursiveRootResult, ResolveError, SearchFilter, Target, TargetOrigin, TargetResolution,
-    UnreadReason,
+    AccessMode, ComputeBudget, DirEntry, Exhausted, FileIdentity, FileType, FilterDialect, FsCap,
+    FsCaps, FsIoError, Hit, HitMatch, HitSource, LinkPolicy, PartId, PartOutcome, PartResult,
+    ProtectedSet, RecursiveRootResult, ResolveError, SearchFilter, Target, TargetOrigin,
+    TargetResolution, UnreadReason,
 };
 use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl};
 use crate::policy::v4::paths::sensitive::{
     ASK_FILES, ASK_NAME_PREFIXES, ASK_TREES, BROWSER_FILES, BROWSER_ROOTS, CRED_FILES, CRED_TREES,
-    SharedSensitive, check_target_impl, fold_listed_component, fold_path_listed, join_folded,
-    origin_to_part, under_bytes, under_str,
+    SharedSensitive, check_target_impl, collect_write_only_identities, fold_listed_component,
+    fold_path_listed, join_folded, origin_to_part, under_bytes, under_str,
 };
 
-/// Implementation of `v4::paths::check_recursive_root` (contract §2, §5, §8).
+fn finish_recursive_exhausted(
+    mut result: RecursiveRootResult,
+    part: PartId,
+    e: Exhausted,
+) -> Result<RecursiveRootResult, Exhausted> {
+    if result.outcomes.is_empty() && !result.multiply_linked_file {
+        return Err(e);
+    }
+    if !result
+        .outcomes
+        .iter()
+        .any(|r| matches!(r.outcome, PartOutcome::Exhausted(_)))
+    {
+        result.outcomes.push(PartResult {
+            part,
+            outcome: PartOutcome::Exhausted(e.reason),
+        });
+    }
+    Ok(result)
+}
+
 pub(crate) fn check_recursive_root_impl(
     root: &Target,
     links: LinkPolicy,
@@ -34,7 +54,7 @@ pub(crate) fn check_recursive_root_impl(
     let root_part = origin_to_part(&root.origin);
     let mut result = RecursiveRootResult::default();
 
-    let (root_canon, root_multiply_linked) = match &root.resolution {
+    let (root_canon, root_identities, root_multiply_linked) = match &root.resolution {
         TargetResolution::Unread(reason) => {
             budget.charge(1)?;
             result.outcomes.push(PartResult {
@@ -45,9 +65,10 @@ pub(crate) fn check_recursive_root_impl(
         }
         TargetResolution::Resolved {
             canonical,
+            identities,
             multiply_linked,
             ..
-        } => (canonical, *multiply_linked),
+        } => (canonical, identities, *multiply_linked),
     };
 
     if root_multiply_linked {
@@ -55,19 +76,68 @@ pub(crate) fn check_recursive_root_impl(
     }
 
     // 1. Check the root target itself (identities, listed folds, unlisted equivalences).
-    let root_check = check_target_impl(root, protected, budget)?;
+    let root_check = match check_target_impl(root, protected, budget) {
+        Ok(r) => r,
+        Err(e) => return finish_recursive_exhausted(result, root_part, e),
+    };
+    let root_is_hard_deny = matches!(root_check.outcome, PartOutcome::HardDenyHit(_));
     if !matches!(root_check.outcome, PartOutcome::Clear) {
         result.outcomes.push(root_check);
     }
 
-    let shared = SharedSensitive::for_protected(protected);
+    // Access-aware write-only identity protection when `root` is written (§5).
+    if root.access != AccessMode::Read && !root_is_hard_deny {
+        match collect_write_only_identities(protected, resolver, caps, budget) {
+            Ok(wo) => {
+                let mut matched_wo = false;
+                for id in root_identities {
+                    if let Some((_, hard_id)) = wo.identities.iter().find(|(pid, _)| pid == id) {
+                        result.outcomes.push(PartResult {
+                            part: root_part.clone(),
+                            outcome: PartOutcome::HardDenyHit(Hit {
+                                hard_deny_id: Some(hard_id),
+                                source: HitSource::Model,
+                                matched: HitMatch::ProtectedPath {
+                                    path: root_canon.clone(),
+                                },
+                                part: root_part.clone(),
+                            }),
+                        });
+                        matched_wo = true;
+                        break;
+                    }
+                }
+                if !matched_wo {
+                    for u in wo.unreads {
+                        result.outcomes.push(PartResult {
+                            part: root_part.clone(),
+                            outcome: PartOutcome::Unread(u),
+                        });
+                    }
+                }
+            }
+            Err(e) => return finish_recursive_exhausted(result, root_part, e),
+        }
+    }
+
+    let shared = match SharedSensitive::for_protected_budgeted(protected, budget) {
+        Ok(s) => s,
+        Err(e) => return finish_recursive_exhausted(result, root_part, e),
+    };
+    if let Err(e) = budget
+        .charge(root_canon.len().max(1) as u64)
+        .and_then(|()| budget.charge_alloc(root_canon.len().max(1)))
+    {
+        return finish_recursive_exhausted(result, root_part, e);
+    }
     let folded_root = fold_path_listed(root_canon, protected.folds);
+    let exempt_root = is_s8_exempt(&folded_root, shared.home_folded());
 
     // 2. S8 protected-root policy (§5, §11 item 12): a recursive root that
     //    contains an existing hard-deny path is HardDeny whatever its filters.
     //    Exemptions: home itself, ancestors of home, and `~/.config` (D-133).
     //    Extends to ancestors of Atrium data paths outside home.
-    let s8_hit = check_s8_protected_root(
+    let s8_hit = match check_s8_protected_root(
         root_canon,
         &folded_root,
         &root_part,
@@ -77,7 +147,10 @@ pub(crate) fn check_recursive_root_impl(
         caps,
         budget,
         &mut result.outcomes,
-    )?;
+    ) {
+        Ok(hit) => hit,
+        Err(e) => return finish_recursive_exhausted(result, root_part, e),
+    };
 
     // 2b. S8-exempted roots (home, ancestors of home, `~/.config`) and roots
     //     containing credential stores (CR-12 + CR-17) keep `dev`'s
@@ -104,8 +177,8 @@ pub(crate) fn check_recursive_root_impl(
             part: filter_part,
             outcome: PartOutcome::Unread(UnreadReason::UnsupportedFilterForm),
         });
-    } else if let Some(filter) = filters.first() {
-        check_filter_on_root(
+    } else if let Some(filter) = filters.first()
+        && let Err(e) = check_filter_on_root(
             root_canon,
             &folded_root,
             filter,
@@ -118,12 +191,14 @@ pub(crate) fn check_recursive_root_impl(
             budget,
             &mut result.outcomes,
             &mut result.multiply_linked_file,
-        )?;
+        )
+    {
+        return finish_recursive_exhausted(result, filter_part, e);
     }
 
     // 4. Followed-link walk (§5, §10 row 15, §11 item 15, M1-32 `rg -L` verdict).
-    if links.below_root {
-        walk_followed_links(
+    if links.below_root
+        && let Err(e) = walk_followed_links(
             root_canon,
             &root_part,
             !filters.is_empty(),
@@ -134,22 +209,29 @@ pub(crate) fn check_recursive_root_impl(
             budget,
             &mut result.outcomes,
             &mut result.multiply_linked_file,
-        )?;
+        )
+    {
+        return finish_recursive_exhausted(result, root_part, e);
     }
 
     // 5. Bounded hard-link walk (§2, §5, §8, §11 item 7): 4,096 entries,
-    //    depth 8, skipping `node_modules` and `.git`, clear when it runs out.
-    walk_hard_links(
+    //    depth 8, skipping `node_modules` and `.git`, clear when its local
+    //    cutoff runs out, while recording global `FsCaps` failures as Unread
+    //    and preserving S8 exemptions on exempt roots.
+    if let Err(e) = walk_hard_links(
         root_canon,
         &root_part,
         !filters.is_empty(),
+        exempt_root,
         protected,
         resolver,
         caps,
         budget,
         &mut result.outcomes,
         &mut result.multiply_linked_file,
-    )?;
+    ) {
+        return finish_recursive_exhausted(result, root_part, e);
+    }
 
     if result.outcomes.is_empty() {
         result.outcomes.push(PartResult {
@@ -182,6 +264,165 @@ fn is_s8_exempt(folded_root: &[u8], home_folded: &[u8]) -> bool {
 
 /// S8 protected-root check: returns `Ok(true)` if an existing hard-deny path
 /// was found under `root_canon` (and pushes the `HardDenyHit` into `outcomes`).
+type S8DirCache = HashMap<Vec<u8>, Option<Vec<DirEntry>>>;
+
+#[allow(clippy::too_many_arguments)]
+fn s8_read_dir_cached<'a>(
+    dir: &[u8],
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    part: &PartId,
+    outcomes: &mut Vec<PartResult>,
+    cache: &'a mut S8DirCache,
+) -> Result<Option<&'a [DirEntry]>, Exhausted> {
+    if !cache.contains_key(dir) {
+        budget.charge_alloc(dir.len())?;
+        let val = match resolver.read_dir(dir, caps, budget) {
+            Ok(entries) => Some(entries),
+            Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => None,
+            Err(ResolveError::Io(_)) => {
+                outcomes.push(PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                        path: dir.to_vec(),
+                    }),
+                });
+                None
+            }
+            Err(ResolveError::CapReached(c)) => {
+                outcomes.push(PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                });
+                None
+            }
+            Err(ResolveError::Exhausted(e)) => return Err(e),
+        };
+        cache.insert(dir.to_vec(), val);
+    }
+    Ok(cache.get(dir).and_then(|opt| opt.as_deref()))
+}
+
+/// Discovers existing listed-fold spellings of `suffix_folded` under `base`
+/// within the filesystem caps and compute budget (fast-pathing exact `lstat`
+/// first, then matching directory entries via `fold_listed_component`).
+#[allow(clippy::too_many_arguments)]
+fn find_s8_folded_matches(
+    base: &[u8],
+    suffix_folded: &str,
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    part: &PartId,
+    outcomes: &mut Vec<PartResult>,
+    cache: &mut S8DirCache,
+) -> Result<Vec<Vec<u8>>, Exhausted> {
+    let comps: Vec<&str> = suffix_folded.split('/').filter(|s| !s.is_empty()).collect();
+    if comps.is_empty() {
+        return match resolver.lstat(base, caps, budget) {
+            Ok(_) => {
+                budget.charge_alloc(base.len())?;
+                Ok(vec![base.to_vec()])
+            }
+            Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {
+                Ok(Vec::new())
+            }
+            Err(ResolveError::Io(_)) => {
+                outcomes.push(PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                        path: base.to_vec(),
+                    }),
+                });
+                Ok(Vec::new())
+            }
+            Err(ResolveError::CapReached(c)) => {
+                outcomes.push(PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                });
+                Ok(Vec::new())
+            }
+            Err(ResolveError::Exhausted(e)) => Err(e),
+        };
+    }
+
+    // Fast path: check exact lowercase spelling via `lstat` first (also handles
+    // non-listable `chmod 0111` directories).
+    let exact_len = base.len() + 1 + suffix_folded.len();
+    budget.charge_alloc(exact_len)?;
+    let exact = join_bytes(base, suffix_folded.as_bytes());
+    match resolver.lstat(&exact, caps, budget) {
+        Ok(_) => return Ok(vec![exact]),
+        Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {}
+        Err(ResolveError::Io(_)) => {
+            outcomes.push(PartResult {
+                part: part.clone(),
+                outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: exact }),
+            });
+        }
+        Err(ResolveError::CapReached(c)) => {
+            outcomes.push(PartResult {
+                part: part.clone(),
+                outcome: PartOutcome::Unread(UnreadReason::from(c)),
+            });
+            return Ok(Vec::new());
+        }
+        Err(ResolveError::Exhausted(e)) => return Err(e),
+    }
+
+    // Walk component-by-component via cached `read_dir` to establish existence
+    // across all listed-fold spellings (e.g. `.aws/CREDENTIALS`, `.AWS/CREDENTIALS`,
+    // `Library/Application Support/Google/Chrome`).
+    budget.charge_alloc(base.len())?;
+    let mut frontier: Vec<Vec<u8>> = vec![base.to_vec()];
+    let mut entries_seen = 0usize;
+    let folds = protected.folds;
+    for comp in comps {
+        let mut next: Vec<Vec<u8>> = Vec::new();
+        for dir in &frontier {
+            let Some(entries) =
+                s8_read_dir_cached(dir, resolver, caps, budget, part, outcomes, cache)?
+            else {
+                continue;
+            };
+            for entry in entries {
+                if entry.name == b"." || entry.name == b".." {
+                    continue;
+                }
+                entries_seen += 1;
+                if entries_seen > limits::WALK_MAX_ENTRIES {
+                    outcomes.push(PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                            FsCap::EntriesRead,
+                        )),
+                    });
+                    return Ok(Vec::new());
+                }
+                budget.charge(entry.name.len().max(1) as u64)?;
+                budget.charge_alloc(entry.name.len().max(1))?;
+                let folded =
+                    fold_listed_component(&entry.name, folds.fold_long_s, folds.fold_kelvin);
+                if folded == comp.as_bytes() {
+                    budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
+                    let cand = join_bytes(dir, &entry.name);
+                    if !next.contains(&cand) {
+                        next.push(cand);
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            return Ok(Vec::new());
+        }
+        frontier = next;
+    }
+    Ok(frontier)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_s8_protected_root(
     root_canon: &[u8],
@@ -241,17 +482,36 @@ fn check_s8_protected_root(
         }
     };
 
+    let mut dir_cache: S8DirCache = HashMap::new();
+
     // 1. Atrium data paths (inside OR outside home; M1-31 round 2 finding 4).
     for (raw_d, folded_d) in protected
         .atrium_data_paths
         .iter()
         .zip(shared.data_folded().iter())
     {
-        if under_bytes(folded_d, folded_root).is_some()
-            && check_exists(raw_d, resolver, caps, budget, outcomes)?
-        {
-            push_hit(outcomes, "atrium-self", raw_d.clone());
-            return Ok(true);
+        if let Some(suffix_bytes) = under_bytes(folded_d, folded_root) {
+            if check_exists(raw_d, resolver, caps, budget, outcomes)? {
+                push_hit(outcomes, "atrium-self", raw_d.clone());
+                return Ok(true);
+            }
+            if let Ok(suffix_str) = std::str::from_utf8(suffix_bytes) {
+                let matches = find_s8_folded_matches(
+                    root_canon,
+                    suffix_str,
+                    protected,
+                    resolver,
+                    caps,
+                    budget,
+                    part,
+                    outcomes,
+                    &mut dir_cache,
+                )?;
+                if let Some(found) = matches.into_iter().next() {
+                    push_hit(outcomes, "atrium-self", found);
+                    return Ok(true);
+                }
+            }
         }
     }
 
@@ -261,11 +521,28 @@ fn check_s8_protected_root(
         .iter()
         .zip(shared.ssh_linked_folded().iter())
     {
-        if under_bytes(folded_d, folded_root).is_some()
-            && check_exists(raw_d, resolver, caps, budget, outcomes)?
-        {
-            push_hit(outcomes, "credential-read", raw_d.clone());
-            return Ok(true);
+        if let Some(suffix_bytes) = under_bytes(folded_d, folded_root) {
+            if check_exists(raw_d, resolver, caps, budget, outcomes)? {
+                push_hit(outcomes, "credential-read", raw_d.clone());
+                return Ok(true);
+            }
+            if let Ok(suffix_str) = std::str::from_utf8(suffix_bytes) {
+                let matches = find_s8_folded_matches(
+                    root_canon,
+                    suffix_str,
+                    protected,
+                    resolver,
+                    caps,
+                    budget,
+                    part,
+                    outcomes,
+                    &mut dir_cache,
+                )?;
+                if let Some(found) = matches.into_iter().next() {
+                    push_hit(outcomes, "credential-read", found);
+                    return Ok(true);
+                }
+            }
         }
     }
 
@@ -279,9 +556,19 @@ fn check_s8_protected_root(
 
     for f in CRED_FILES {
         if let Some(suffix) = under_str(f, root_rel) {
-            let cand = join_bytes(root_canon, suffix.as_bytes());
-            if check_exists(&cand, resolver, caps, budget, outcomes)? {
-                push_hit(outcomes, "credential-read", cand);
+            let matches = find_s8_folded_matches(
+                root_canon,
+                suffix,
+                protected,
+                resolver,
+                caps,
+                budget,
+                part,
+                outcomes,
+                &mut dir_cache,
+            )?;
+            if let Some(found) = matches.into_iter().next() {
+                push_hit(outcomes, "credential-read", found);
                 return Ok(true);
             }
         }
@@ -289,39 +576,77 @@ fn check_s8_protected_root(
 
     for t in CRED_TREES {
         if let Some(suffix) = under_str(t, root_rel) {
-            let cand = join_bytes(root_canon, suffix.as_bytes());
-            if check_exists(&cand, resolver, caps, budget, outcomes)? {
-                push_hit(outcomes, "credential-read", cand);
+            let matches = find_s8_folded_matches(
+                root_canon,
+                suffix,
+                protected,
+                resolver,
+                caps,
+                budget,
+                part,
+                outcomes,
+                &mut dir_cache,
+            )?;
+            if let Some(found) = matches.into_iter().next() {
+                push_hit(outcomes, "credential-read", found);
                 return Ok(true);
             }
         }
     }
 
-    // `.ssh`: check if any existing hard-deny entry lives inside `~/.ssh`.
-    if under_str(".ssh", root_rel).is_some() || under_str(root_rel, ".ssh").is_some() {
-        let ssh_root = if under_str(root_rel, ".ssh").is_some() {
-            root_canon.to_vec()
-        } else {
-            join_bytes(&protected.home, b".ssh")
-        };
+    // `.ssh`: check if any existing hard-deny entry lives inside `~/.ssh`
+    // (including listed-fold spellings like `.SSH` / `.ſsh`).
+    if under_str(root_rel, ".ssh").is_some() {
         if let Some(found) = dir_has_existing_hard_deny_ssh_entry(
-            &ssh_root, protected, shared, resolver, caps, budget, part, outcomes,
+            root_canon, protected, shared, resolver, caps, budget, part, outcomes,
         )? {
             push_hit(outcomes, "credential-read", found);
             return Ok(true);
+        }
+    } else if let Some(suffix) = under_str(".ssh", root_rel) {
+        let ssh_roots = find_s8_folded_matches(
+            root_canon,
+            suffix,
+            protected,
+            resolver,
+            caps,
+            budget,
+            part,
+            outcomes,
+            &mut dir_cache,
+        )?;
+        for ssh_root in ssh_roots {
+            if let Some(found) = dir_has_existing_hard_deny_ssh_entry(
+                &ssh_root, protected, shared, resolver, caps, budget, part, outcomes,
+            )? {
+                push_hit(outcomes, "credential-read", found);
+                return Ok(true);
+            }
         }
     }
 
     // Browser roots & profile folders (M1-31 review 1 finding 4: ordinary
     // files like `Default/Preferences` are NOT folders holding credentials).
     for b in BROWSER_ROOTS {
-        if under_str(b, root_rel).is_some() {
-            let b_path = join_bytes(&protected.home, b.as_bytes());
-            if let Some(found) = browser_dir_has_existing_cred(
-                &b_path, protected, resolver, caps, budget, part, outcomes,
-            )? {
-                push_hit(outcomes, "credential-read", found);
-                return Ok(true);
+        if let Some(suffix) = under_str(b, root_rel) {
+            let b_paths = find_s8_folded_matches(
+                root_canon,
+                suffix,
+                protected,
+                resolver,
+                caps,
+                budget,
+                part,
+                outcomes,
+                &mut dir_cache,
+            )?;
+            for b_path in b_paths {
+                if let Some(found) = browser_dir_has_existing_cred(
+                    &b_path, protected, resolver, caps, budget, part, outcomes,
+                )? {
+                    push_hit(outcomes, "credential-read", found);
+                    return Ok(true);
+                }
             }
         } else if under_str(root_rel, b).is_some() {
             // Only a directory inside a browser root can contain browser credential files.
@@ -358,7 +683,6 @@ fn check_s8_protected_root(
     Ok(false)
 }
 
-/// Checks if an `~/.ssh` directory (or subdir) contains an existing hard-deny entry.
 #[allow(clippy::too_many_arguments)]
 fn dir_has_existing_hard_deny_ssh_entry(
     ssh_root: &[u8],
@@ -370,8 +694,10 @@ fn dir_has_existing_hard_deny_ssh_entry(
     part: &PartId,
     outcomes: &mut Vec<PartResult>,
 ) -> Result<Option<Vec<u8>>, Exhausted> {
+    budget.charge_alloc(ssh_root.len())?;
     let mut stack = vec![(ssh_root.to_vec(), 0u8)];
     let mut seen = 0usize;
+    let mut emitted_depth_cap = false;
     while let Some((dir, depth)) = stack.pop() {
         let entries = match resolver.read_dir(&dir, caps, budget) {
             Ok(e) => e,
@@ -393,6 +719,9 @@ fn dir_has_existing_hard_deny_ssh_entry(
             Err(ResolveError::Exhausted(e)) => return Err(e),
         };
         for entry in entries {
+            if entry.name == b"." || entry.name == b".." {
+                continue;
+            }
             seen += 1;
             if seen > limits::WALK_MAX_ENTRIES {
                 outcomes.push(PartResult {
@@ -401,6 +730,9 @@ fn dir_has_existing_hard_deny_ssh_entry(
                 });
                 return Ok(None);
             }
+            let child_len = dir.len() + 1 + entry.name.len();
+            budget.charge(child_len as u64)?;
+            budget.charge_alloc(child_len.saturating_mul(2))?;
             let child = join_bytes(&dir, &entry.name);
             let folded = fold_path_listed(&child, protected.folds);
             if entry.file_type != FileType::Dir
@@ -410,16 +742,28 @@ fn dir_has_existing_hard_deny_ssh_entry(
             {
                 return Ok(Some(child));
             }
-            if entry.file_type == FileType::Dir && depth + 1 < limits::WALK_MAX_DEPTH {
-                stack.push((child, depth + 1));
+            if entry.file_type == FileType::Dir {
+                if depth + 1 < limits::WALK_MAX_DEPTH {
+                    stack.push((child, depth + 1));
+                } else if !emitted_depth_cap {
+                    emitted_depth_cap = true;
+                    outcomes.push(PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                            FsCap::WalkDepth,
+                        )),
+                    });
+                }
             }
         }
     }
     Ok(None)
 }
 
-/// Bounded check (depth <= 3) for any existing `BROWSER_FILES` inside a
-/// browser root or profile directory.
+/// Bounded check within the frozen walk limits (`WALK_MAX_DEPTH`,
+/// `WALK_MAX_ENTRIES`) for any existing `BROWSER_FILES` inside a browser root
+/// or profile directory, emitting `Unread(WalkCapReached)` when a limit
+/// prevents completion (§5, §8).
 fn browser_dir_has_existing_cred(
     root: &[u8],
     protected: &ProtectedSet,
@@ -429,8 +773,10 @@ fn browser_dir_has_existing_cred(
     part: &PartId,
     outcomes: &mut Vec<PartResult>,
 ) -> Result<Option<Vec<u8>>, Exhausted> {
+    budget.charge_alloc(root.len())?;
     let mut stack = vec![(root.to_vec(), 0u8)];
     let mut seen = 0usize;
+    let mut emitted_depth_cap = false;
     while let Some((dir, depth)) = stack.pop() {
         let entries = match resolver.read_dir(&dir, caps, budget) {
             Ok(e) => e,
@@ -452,6 +798,9 @@ fn browser_dir_has_existing_cred(
             Err(ResolveError::Exhausted(e)) => return Err(e),
         };
         for entry in entries {
+            if entry.name == b"." || entry.name == b".." {
+                continue;
+            }
             seen += 1;
             if seen > limits::WALK_MAX_ENTRIES {
                 outcomes.push(PartResult {
@@ -460,6 +809,8 @@ fn browser_dir_has_existing_cred(
                 });
                 return Ok(None);
             }
+            budget.charge(entry.name.len().max(1) as u64)?;
+            budget.charge_alloc(entry.name.len().max(1))?;
             let name_folded = fold_listed_component(
                 &entry.name,
                 protected.folds.fold_long_s,
@@ -468,10 +819,22 @@ fn browser_dir_has_existing_cred(
             if entry.file_type != FileType::Dir
                 && std::str::from_utf8(&name_folded).is_ok_and(|n| BROWSER_FILES.contains(&n))
             {
+                budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
                 return Ok(Some(join_bytes(&dir, &entry.name)));
             }
-            if entry.file_type == FileType::Dir && depth < 2 {
-                stack.push((join_bytes(&dir, &entry.name), depth + 1));
+            if entry.file_type == FileType::Dir {
+                if depth + 1 < limits::WALK_MAX_DEPTH {
+                    budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
+                    stack.push((join_bytes(&dir, &entry.name), depth + 1));
+                } else if !emitted_depth_cap {
+                    emitted_depth_cap = true;
+                    outcomes.push(PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                            FsCap::WalkDepth,
+                        )),
+                    });
+                }
             }
         }
     }
@@ -649,27 +1012,22 @@ impl CompiledFilter {
         &self,
         name: &[u8],
         rel: &[u8],
+        entry_full: &[u8],
         recursive: bool,
         budget: &mut ComputeBudget,
-    ) -> Result<bool, Exhausted> {
+    ) -> Result<Result<bool, UnreadReason>, Exhausted> {
         budget.charge((rel.len() + name.len() + 1) as u64)?;
-        let Ok(rel_str) = std::str::from_utf8(rel) else {
-            return Ok(false);
-        };
-        let Ok(name_str) = std::str::from_utf8(name) else {
-            return Ok(false);
-        };
         let _ = self.dialect;
         if self.match_basename {
-            if !recursive && rel_str.contains('/') {
-                return Ok(false);
+            if !recursive && rel.contains(&b'/') {
+                return Ok(Ok(false));
             }
-            return Ok(self.matcher.is_match(name_str));
+            return Ok(match_raw_bytes_path(&self.matcher, name, entry_full));
         }
         if self.root_anchored {
-            return Ok(self.matcher.is_match(rel_str));
+            return Ok(match_raw_bytes_path(&self.matcher, rel, entry_full));
         }
-        Ok(self.matcher.is_match(rel_str))
+        Ok(match_raw_bytes_path(&self.matcher, rel, entry_full))
     }
 
     fn matches_probe(
@@ -704,6 +1062,32 @@ impl CompiledFilter {
 ///    resolve + check each one;
 /// 2. Match the filter against `dev`'s probe names (Store hit for store probes,
 ///    HardDeny for hard-deny probes).
+#[cfg(unix)]
+fn match_raw_bytes_path(
+    matcher: &GlobMatcher,
+    candidate: &[u8],
+    _full_path: &[u8],
+) -> Result<bool, UnreadReason> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    Ok(matcher.is_match(Path::new(OsStr::from_bytes(candidate))))
+}
+
+#[cfg(not(unix))]
+fn match_raw_bytes_path(
+    matcher: &GlobMatcher,
+    candidate: &[u8],
+    full_path: &[u8],
+) -> Result<bool, UnreadReason> {
+    match std::str::from_utf8(candidate) {
+        Ok(s) => Ok(matcher.is_match(std::path::Path::new(s))),
+        Err(_) => Err(UnreadReason::UnresolvablePath {
+            path: full_path.to_vec(),
+        }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_filter_on_root(
     root_canon: &[u8],
@@ -739,6 +1123,7 @@ pub(crate) fn check_filter_on_root(
             .min(limits::WALK_MAX_DEPTH as usize)
     };
 
+    budget.charge_alloc(root_canon.len())?;
     let mut stack: Vec<(Vec<u8>, Vec<u8>, usize)> = vec![(root_canon.to_vec(), Vec::new(), 0)];
     let mut visited_symlink_dirs: HashSet<Vec<u8>> = HashSet::new();
     let mut entries_seen = 0usize;
@@ -802,35 +1187,45 @@ pub(crate) fn check_filter_on_root(
                 v
             };
 
-            if compiled.matches_entry(
+            match compiled.matches_entry(
                 &entry.name,
                 &entry_rel,
+                &entry_full,
                 recursive || compiled.has_globstar,
                 budget,
             )? {
-                let resolved = resolve_literal_impl(
-                    &entry_full,
-                    &protected.cwd,
-                    &protected.home,
-                    TargetOrigin::ExpandedFrom {
-                        source: filter_part.clone(),
-                        variant_only: false,
-                    },
-                    AccessMode::Read,
-                    resolver,
-                    caps,
-                    budget,
-                )?;
-                if let TargetResolution::Resolved {
-                    multiply_linked: true,
-                    ..
-                } = &resolved.resolution
-                {
-                    *multiply_linked_file = true;
+                Ok(true) => {
+                    let resolved = resolve_literal_impl(
+                        &entry_full,
+                        &protected.cwd,
+                        &protected.home,
+                        TargetOrigin::ExpandedFrom {
+                            source: filter_part.clone(),
+                            variant_only: false,
+                        },
+                        AccessMode::Read,
+                        resolver,
+                        caps,
+                        budget,
+                    )?;
+                    if let TargetResolution::Resolved {
+                        multiply_linked: true,
+                        ..
+                    } = &resolved.resolution
+                    {
+                        *multiply_linked_file = true;
+                    }
+                    let res = check_target_impl(&resolved, protected, budget)?;
+                    if !matches!(res.outcome, PartOutcome::Clear) {
+                        outcomes.push(res);
+                    }
                 }
-                let res = check_target_impl(&resolved, protected, budget)?;
-                if !matches!(res.outcome, PartOutcome::Clear) {
-                    outcomes.push(res);
+                Ok(false) => {}
+                Err(unread) => {
+                    outcomes.push(PartResult {
+                        part: filter_part.clone(),
+                        outcome: PartOutcome::Unread(unread),
+                    });
                 }
             }
 
@@ -1050,6 +1445,7 @@ fn walk_followed_links(
     outcomes: &mut Vec<PartResult>,
     multiply_linked_file: &mut bool,
 ) -> Result<(), Exhausted> {
+    budget.charge_alloc(root_canon.len().saturating_mul(2))?;
     let mut visited_paths: HashSet<Vec<u8>> = HashSet::new();
     let mut visited_ids: HashSet<FileIdentity> = HashSet::new();
     visited_paths.insert(root_canon.to_vec());
@@ -1320,6 +1716,7 @@ fn walk_hard_links(
     root_canon: &[u8],
     part: &PartId,
     has_filter: bool,
+    exempt_root: bool,
     protected: &ProtectedSet,
     resolver: &dyn PathResolver,
     caps: &mut FsCaps,
@@ -1327,6 +1724,7 @@ fn walk_hard_links(
     outcomes: &mut Vec<PartResult>,
     multiply_linked_file: &mut bool,
 ) -> Result<(), Exhausted> {
+    budget.charge_alloc(root_canon.len())?;
     let mut stack: Vec<(Vec<u8>, u8)> = vec![(root_canon.to_vec(), 0)];
     let mut seen = 0usize;
 
@@ -1334,8 +1732,15 @@ fn walk_hard_links(
         let entries = match resolver.read_dir(&dir, caps, budget) {
             Ok(e) => e,
             Err(ResolveError::Exhausted(e)) => return Err(e),
-            // Hard-link walk cutoff counts as clear (§2, §5, §11 item 7).
-            Err(ResolveError::CapReached(_)) => return Ok(()),
+            // Global `FsCaps` failures are Unread (§8); only the local hard-link
+            // cutoff (`HARD_LINK_WALK_ENTRIES` / `HARD_LINK_WALK_DEPTH`) counts as clear.
+            Err(ResolveError::CapReached(c)) => {
+                outcomes.push(PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                });
+                return Ok(());
+            }
             Err(ResolveError::NotFound | ResolveError::Io(_)) => continue,
         };
 
@@ -1352,23 +1757,31 @@ fn walk_hard_links(
                     let skip = std::str::from_utf8(&entry.name)
                         .is_ok_and(|n| limits::HARD_LINK_WALK_SKIP_DIRS.contains(&n));
                     if !skip && depth + 1 < limits::HARD_LINK_WALK_DEPTH {
+                        budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
                         stack.push((join_bytes(&dir, &entry.name), depth + 1));
                     }
                 }
                 FileType::File => {
+                    budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
                     let child = join_bytes(&dir, &entry.name);
                     match resolver.lstat(&child, caps, budget) {
                         Ok(md) if md.file_type == FileType::File => {
                             if md.nlink > 1 {
                                 *multiply_linked_file = true;
-                            }
-                            if let Some(id) = md.identity {
-                                if let Some((_, hard_id)) = protected
-                                    .hard_deny_identities
-                                    .iter()
-                                    .find(|(pid, _)| *pid == id)
+                                // Only multiply-linked aliases under non-exempt,
+                                // unfiltered roots produce identity hits here;
+                                // singly-linked descendants and S8-exempt roots
+                                // (`~`, ancestors of `~`, `~/.config`) keep
+                                // their S8 exemptions (§5, §10 row 16, §11 item 12).
+                                if !has_filter
+                                    && !exempt_root
+                                    && let Some(id) = md.identity
                                 {
-                                    if !has_filter {
+                                    if let Some((_, hard_id)) = protected
+                                        .hard_deny_identities
+                                        .iter()
+                                        .find(|(pid, _)| *pid == id)
+                                    {
                                         outcomes.push(PartResult {
                                             part: part.clone(),
                                             outcome: PartOutcome::HardDenyHit(Hit {
@@ -1378,28 +1791,33 @@ fn walk_hard_links(
                                                 part: part.clone(),
                                             }),
                                         });
-                                    }
-                                } else if !has_filter
-                                    && let Some((_, family)) = protected
+                                    } else if let Some((_, family)) = protected
                                         .store_identities
                                         .iter()
                                         .find(|(pid, _)| *pid == id)
-                                {
-                                    outcomes.push(PartResult {
-                                        part: part.clone(),
-                                        outcome: PartOutcome::StoreHit(Hit {
-                                            hard_deny_id: None,
-                                            source: HitSource::Model,
-                                            matched: HitMatch::StoreFamily { family },
+                                    {
+                                        outcomes.push(PartResult {
                                             part: part.clone(),
-                                        }),
-                                    });
+                                            outcome: PartOutcome::StoreHit(Hit {
+                                                hard_deny_id: None,
+                                                source: HitSource::Model,
+                                                matched: HitMatch::StoreFamily { family },
+                                                part: part.clone(),
+                                            }),
+                                        });
+                                    }
                                 }
                             }
                         }
                         Ok(_) => {}
                         Err(ResolveError::Exhausted(e)) => return Err(e),
-                        Err(ResolveError::CapReached(_)) => return Ok(()),
+                        Err(ResolveError::CapReached(c)) => {
+                            outcomes.push(PartResult {
+                                part: part.clone(),
+                                outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                            });
+                            return Ok(());
+                        }
                         Err(ResolveError::NotFound | ResolveError::Io(_)) => {}
                     }
                 }

@@ -16,13 +16,122 @@ use crate::policy::v4::paths::glob::expand_shell_glob_impl;
 use crate::policy::v4::paths::recursive::{check_filter_on_root, check_recursive_root_impl};
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl, resolve_word_literal};
 use crate::policy::v4::paths::sensitive::{
-    SharedSensitive, check_target_impl, fold_path_listed, under_bytes,
+    SharedSensitive, WriteOnlyIdentities, check_target_impl, collect_write_only_identities,
+    fold_path_listed, origin_to_part, under_bytes,
 };
 
 #[derive(Debug, Clone)]
 enum CwdState {
     Known(Vec<u8>),
     Unknown,
+}
+
+/// Lazily caches write-only protected identities (`~/.ssh/config`,
+/// `~/.ssh/authorized_keys`, `atrium_protected_paths` + descendants) once per
+/// resolver-backed call when any non-read target is checked (§5).
+#[derive(Default)]
+struct WriteOnlyIdCache {
+    loaded: Option<WriteOnlyIdentities>,
+}
+
+impl WriteOnlyIdCache {
+    #[allow(clippy::too_many_arguments)]
+    fn check_target(
+        &mut self,
+        target: &Target,
+        protected: &ProtectedSet,
+        resolver: &dyn PathResolver,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+        outcomes: &mut Vec<PartResult>,
+    ) -> Result<(), Exhausted> {
+        let checked = check_target_impl(target, protected, budget)?;
+        if target.access != AccessMode::Read
+            && !matches!(checked.outcome, PartOutcome::HardDenyHit(_))
+            && let TargetResolution::Resolved {
+                canonical,
+                identities,
+                ..
+            } = &target.resolution
+        {
+            if self.loaded.is_none() {
+                match collect_write_only_identities(protected, resolver, caps, budget) {
+                    Ok(loaded) => self.loaded = Some(loaded),
+                    Err(e) => {
+                        // Preserve any hit/unread already established on `target`
+                        // before propagating Exhausted (§8).
+                        outcomes.push(checked);
+                        return Err(e);
+                    }
+                }
+            }
+            if let Some(wo) = &self.loaded {
+                let part = origin_to_part(&target.origin);
+                for id in identities {
+                    if let Some((_, hard_id)) = wo.identities.iter().find(|(pid, _)| pid == id) {
+                        budget.charge_alloc(canonical.len())?;
+                        outcomes.push(PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::HardDenyHit(Hit {
+                                hard_deny_id: Some(hard_id),
+                                source: HitSource::Model,
+                                matched: HitMatch::ProtectedPath {
+                                    path: canonical.clone(),
+                                },
+                                part,
+                            }),
+                        });
+                        return Ok(());
+                    }
+                }
+                outcomes.push(checked);
+                for u in &wo.unreads {
+                    outcomes.push(PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(u.clone()),
+                    });
+                }
+                return Ok(());
+            }
+        }
+        outcomes.push(checked);
+        Ok(())
+    }
+}
+
+fn finish_call_exhausted(
+    mut out: ResolvedCallPaths,
+    part: PartId,
+    e: Exhausted,
+) -> Result<ResolvedCallPaths, Exhausted> {
+    if out.outcomes.is_empty() && !out.multiply_linked_file {
+        return Err(e);
+    }
+    if !out
+        .outcomes
+        .iter()
+        .any(|r| matches!(r.outcome, PartOutcome::Exhausted(_)))
+    {
+        out.outcomes.push(PartResult {
+            part,
+            outcome: PartOutcome::Exhausted(e.reason),
+        });
+    }
+    Ok(out)
+}
+
+fn ensure_exhausted_recorded(out: &mut ResolvedCallPaths, part: PartId, budget: &ComputeBudget) {
+    if let Some(reason) = budget.exhausted_reason()
+        && !out
+            .outcomes
+            .iter()
+            .any(|r| matches!(r.outcome, PartOutcome::Exhausted(_)))
+    {
+        out.outcomes.push(PartResult {
+            part,
+            outcome: PartOutcome::Exhausted(reason),
+        });
+    }
 }
 
 fn unit_is_possible_writer(unit: &CommandUnit, eff: Option<&ToolEffects>) -> bool {
@@ -72,38 +181,93 @@ fn record_multiply_linked(target: &Target, flag: &mut bool) {
     }
 }
 
-/// Implementation of `v4::paths::resolve_command_targets` (contract §5, §8).
-pub(crate) fn resolve_command_targets_impl(
+fn compute_subtree_writer(
+    pos: usize,
     units: &[CommandUnit],
     effects: &[ToolEffects],
-    start_cwd: &[u8],
-    protected: &ProtectedSet,
-    resolver: &dyn PathResolver,
-    caps: &mut FsCaps,
-    budget: &mut ComputeBudget,
-) -> Result<ResolvedCallPaths, Exhausted> {
-    budget.charge((units.len() + start_cwd.len() + 1) as u64)?;
-
-    let mut out = ResolvedCallPaths::default();
-
-    // Pre-scan pipelines so every stage of a pipeline containing a possible
-    // writer — including stages BEFORE the writer — is tainted (§5, §10 row 21).
-    let mut pipeline_writers: HashMap<PipelineId, UnitIndex> = HashMap::new();
-    for (idx, unit) in units.iter().enumerate() {
-        if let Some(pid) = unit.pipeline_id
-            && unit_is_possible_writer(unit, effects.get(idx))
-        {
-            pipeline_writers.entry(pid).or_insert(unit.index);
+    children_by_parent: &HashMap<Option<UnitIndex>, Vec<usize>>,
+    memo: &mut [Option<Option<UnitIndex>>],
+    visiting: &mut [bool],
+) -> Option<UnitIndex> {
+    if let Some(cached) = memo[pos] {
+        return cached;
+    }
+    if visiting[pos] {
+        return None;
+    }
+    visiting[pos] = true;
+    let unit = &units[pos];
+    let mut writer = if unit_is_possible_writer(unit, effects.get(pos)) {
+        Some(unit.index)
+    } else {
+        None
+    };
+    if writer.is_none()
+        && let Some(children) = children_by_parent.get(&Some(unit.index))
+    {
+        for &child_pos in children {
+            if let Some(w) = compute_subtree_writer(
+                child_pos,
+                units,
+                effects,
+                children_by_parent,
+                memo,
+                visiting,
+            ) {
+                writer = Some(w);
+                break;
+            }
         }
     }
+    visiting[pos] = false;
+    memo[pos] = Some(writer);
+    writer
+}
 
-    let mut cwd_state = CwdState::Known(start_cwd.to_vec());
-    let mut earlier_writer: Option<UnitIndex> = None;
+struct ExecCtx<'a> {
+    units: &'a [CommandUnit],
+    effects: &'a [ToolEffects],
+    start_cwd: &'a [u8],
+    protected: &'a ProtectedSet,
+    resolver: &'a dyn PathResolver,
+    caps: &'a mut FsCaps,
+    budget: &'a mut ComputeBudget,
+    children_by_parent: &'a HashMap<Option<UnitIndex>, Vec<usize>>,
+    pipeline_writers: &'a HashMap<PipelineId, UnitIndex>,
+    subtree_writers: &'a [Option<UnitIndex>],
+    visited: &'a mut [bool],
+    wo_cache: &'a mut WriteOnlyIdCache,
+    out: &'a mut ResolvedCallPaths,
+    stopped_too_large: bool,
+    exhausted_err: Option<(PartId, Exhausted)>,
+}
+
+/// Executes a sibling sequence of command units with its own lexically-scoped
+/// `cwd_state` (so nested-shell `cd` never leaks back into the parent scope,
+/// while child units inherit the exact cwd their parent unit had when it ran,
+/// and child writers still propagate into `earlier_writer`; §5).
+fn exec_unit_sequence(
+    indices: &[usize],
+    initial_cwd: CwdState,
+    inherited_pipeline_taint: Option<UnitIndex>,
+    earlier_writer: &mut Option<UnitIndex>,
+    ctx: &mut ExecCtx<'_>,
+) {
+    let mut cwd_state = initial_cwd;
     let mut active_pipeline: Option<PipelineId> = None;
     let mut active_pipeline_writer: Option<UnitIndex> = None;
 
-    for (idx, unit) in units.iter().enumerate() {
-        let eff = effects.get(idx);
+    for &idx in indices {
+        if ctx.stopped_too_large || ctx.exhausted_err.is_some() {
+            return;
+        }
+        if ctx.visited[idx] {
+            continue;
+        }
+        ctx.visited[idx] = true;
+
+        let unit = &ctx.units[idx];
+        let eff = ctx.effects.get(idx);
 
         // If we just left a pipeline that had a writer, promote it to `earlier_writer`.
         if unit.pipeline_id != active_pipeline {
@@ -113,13 +277,14 @@ pub(crate) fn resolve_command_targets_impl(
             active_pipeline = unit.pipeline_id;
         }
 
-        let pipeline_taint = unit
+        let own_pipeline_taint = unit
             .pipeline_id
-            .and_then(|pid| pipeline_writers.get(&pid).copied());
+            .and_then(|pid| ctx.pipeline_writers.get(&pid).copied());
+        let pipeline_taint = own_pipeline_taint.or(inherited_pipeline_taint);
         let after_writer_taint = if pipeline_taint.is_some() {
             None
         } else {
-            earlier_writer
+            *earlier_writer
         };
 
         let mut unit_target_parts: Vec<PartId> = Vec::new();
@@ -127,7 +292,7 @@ pub(crate) fn resolve_command_targets_impl(
         let mut mv_source_is_dir = false;
 
         if matches!(cwd_state, CwdState::Unknown) {
-            out.outcomes.push(PartResult {
+            ctx.out.outcomes.push(PartResult {
                 part: PartId::Unit(unit.index),
                 outcome: PartOutcome::Unread(UnreadReason::UnknownCwd),
             });
@@ -167,12 +332,13 @@ pub(crate) fn resolve_command_targets_impl(
                 continue;
             }
 
-            if out.targets.len() >= limits::MAX_PATHS {
-                out.outcomes.push(PartResult {
+            if ctx.out.targets.len() >= limits::MAX_PATHS {
+                ctx.out.outcomes.push(PartResult {
                     part: PartId::WholeCall,
                     outcome: PartOutcome::TooLarge(Cap::Paths),
                 });
-                return Ok(out);
+                ctx.stopped_too_large = true;
+                return;
             }
 
             let part = PartId::Operand {
@@ -194,14 +360,14 @@ pub(crate) fn resolve_command_targets_impl(
                             access,
                             resolution: TargetResolution::Unread(UnreadReason::UnknownCwd),
                         };
-                        out.outcomes.push(PartResult {
+                        ctx.out.outcomes.push(PartResult {
                             part,
                             outcome: PartOutcome::Unread(UnreadReason::UnknownCwd),
                         });
-                        out.targets.push(unread_t);
+                        ctx.out.targets.push(unread_t);
                         continue;
                     }
-                    start_cwd
+                    ctx.start_cwd
                 }
             };
 
@@ -212,101 +378,183 @@ pub(crate) fn resolve_command_targets_impl(
             }
 
             if word.has_unquoted_glob() {
-                let exp = expand_shell_glob_impl(
+                let exp = match expand_shell_glob_impl(
                     word,
                     cur_cwd,
-                    &protected.home,
+                    &ctx.protected.home,
                     part.clone(),
                     access,
-                    resolver,
-                    caps,
-                    budget,
-                )?;
+                    ctx.resolver,
+                    ctx.caps,
+                    ctx.budget,
+                ) {
+                    Ok(exp) => exp,
+                    Err(e) => {
+                        ctx.exhausted_err = Some((part, e));
+                        return;
+                    }
+                };
                 for unread in exp.unread {
-                    out.outcomes.push(PartResult {
+                    ctx.out.outcomes.push(PartResult {
                         part: part.clone(),
                         outcome: PartOutcome::Unread(unread),
                     });
                 }
                 for target in exp.exact_matches {
-                    if out.targets.len() >= limits::MAX_PATHS {
-                        out.outcomes.push(PartResult {
+                    if ctx.out.targets.len() >= limits::MAX_PATHS {
+                        ctx.out.outcomes.push(PartResult {
                             part: PartId::WholeCall,
                             outcome: PartOutcome::TooLarge(Cap::Paths),
                         });
-                        return Ok(out);
+                        ctx.stopped_too_large = true;
+                        return;
                     }
-                    record_multiply_linked(&target, &mut out.multiply_linked_file);
+                    record_multiply_linked(&target, &mut ctx.out.multiply_linked_file);
                     if is_rec_root && let Some(e) = eff {
-                        let rec = check_recursive_root_impl(
-                            &target, e.links, &e.filters, protected, resolver, caps, budget,
-                        )?;
-                        out.multiply_linked_file |= rec.multiply_linked_file;
-                        out.outcomes.extend(rec.outcomes);
-                    } else {
-                        let checked = check_target_impl(&target, protected, budget)?;
-                        out.outcomes.push(checked);
+                        match check_recursive_root_impl(
+                            &target,
+                            e.links,
+                            &e.filters,
+                            ctx.protected,
+                            ctx.resolver,
+                            ctx.caps,
+                            ctx.budget,
+                        ) {
+                            Ok(rec) => {
+                                ctx.out.multiply_linked_file |= rec.multiply_linked_file;
+                                ctx.out.outcomes.extend(rec.outcomes);
+                                if ctx.budget.is_exhausted() {
+                                    ensure_exhausted_recorded(ctx.out, part.clone(), ctx.budget);
+                                    ctx.out.targets.push(target);
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                ctx.exhausted_err = Some((part, err));
+                                return;
+                            }
+                        }
+                    } else if let Err(err) = ctx.wo_cache.check_target(
+                        &target,
+                        ctx.protected,
+                        ctx.resolver,
+                        ctx.caps,
+                        ctx.budget,
+                        &mut ctx.out.outcomes,
+                    ) {
+                        ctx.exhausted_err = Some((part, err));
+                        return;
                     }
                     if eff.is_some_and(|e| {
                         e.derived_destinations == DerivedDestinations::WhenSourceIsDir
                     }) && role == OperandRole::Path
-                        && source_is_dir_or_unknown(&target, resolver, caps, budget)?
                     {
-                        mv_source_is_dir = true;
+                        match source_is_dir_or_unknown(&target, ctx.resolver, ctx.caps, ctx.budget)
+                        {
+                            Ok(is_dir) => {
+                                if is_dir {
+                                    mv_source_is_dir = true;
+                                }
+                            }
+                            Err(err) => {
+                                ctx.exhausted_err = Some((part, err));
+                                return;
+                            }
+                        }
                     }
-                    out.targets.push(target);
+                    ctx.out.targets.push(target);
                 }
                 let mut emitted_variant = false;
                 for target in exp.variant_only_matches {
-                    if out.targets.len() >= limits::MAX_PATHS {
-                        out.outcomes.push(PartResult {
+                    if ctx.out.targets.len() >= limits::MAX_PATHS {
+                        ctx.out.outcomes.push(PartResult {
                             part: PartId::WholeCall,
                             outcome: PartOutcome::TooLarge(Cap::Paths),
                         });
-                        return Ok(out);
+                        ctx.stopped_too_large = true;
+                        return;
                     }
-                    // Variant-only matches are Unread, never hits (§1, §5).
                     if !emitted_variant {
                         emitted_variant = true;
-                        out.outcomes.push(PartResult {
+                        ctx.out.outcomes.push(PartResult {
                             part: part.clone(),
                             outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
                                 pattern: word.literal_bytes().to_vec(),
                             }),
                         });
                     }
-                    out.targets.push(target);
+                    ctx.out.targets.push(target);
                 }
             } else {
-                let target = resolve_word_literal(
+                let target = match resolve_word_literal(
                     word,
                     cur_cwd,
-                    &protected.home,
+                    &ctx.protected.home,
                     origin,
                     access,
-                    resolver,
-                    caps,
-                    budget,
-                )?;
-                record_multiply_linked(&target, &mut out.multiply_linked_file);
+                    ctx.resolver,
+                    ctx.caps,
+                    ctx.budget,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        ctx.exhausted_err = Some((part, e));
+                        return;
+                    }
+                };
+                record_multiply_linked(&target, &mut ctx.out.multiply_linked_file);
                 if is_rec_root && let Some(e) = eff {
-                    let rec = check_recursive_root_impl(
-                        &target, e.links, &e.filters, protected, resolver, caps, budget,
-                    )?;
-                    out.multiply_linked_file |= rec.multiply_linked_file;
-                    out.outcomes.extend(rec.outcomes);
-                } else {
-                    let checked = check_target_impl(&target, protected, budget)?;
-                    out.outcomes.push(checked);
+                    match check_recursive_root_impl(
+                        &target,
+                        e.links,
+                        &e.filters,
+                        ctx.protected,
+                        ctx.resolver,
+                        ctx.caps,
+                        ctx.budget,
+                    ) {
+                        Ok(rec) => {
+                            ctx.out.multiply_linked_file |= rec.multiply_linked_file;
+                            ctx.out.outcomes.extend(rec.outcomes);
+                            if ctx.budget.is_exhausted() {
+                                ensure_exhausted_recorded(ctx.out, part.clone(), ctx.budget);
+                                ctx.out.targets.push(target);
+                                return;
+                            }
+                        }
+                        Err(err) => {
+                            ctx.exhausted_err = Some((part, err));
+                            return;
+                        }
+                    }
+                } else if let Err(err) = ctx.wo_cache.check_target(
+                    &target,
+                    ctx.protected,
+                    ctx.resolver,
+                    ctx.caps,
+                    ctx.budget,
+                    &mut ctx.out.outcomes,
+                ) {
+                    ctx.exhausted_err = Some((part, err));
+                    return;
                 }
                 if eff
                     .is_some_and(|e| e.derived_destinations == DerivedDestinations::WhenSourceIsDir)
                     && role == OperandRole::Path
-                    && source_is_dir_or_unknown(&target, resolver, caps, budget)?
                 {
-                    mv_source_is_dir = true;
+                    match source_is_dir_or_unknown(&target, ctx.resolver, ctx.caps, ctx.budget) {
+                        Ok(is_dir) => {
+                            if is_dir {
+                                mv_source_is_dir = true;
+                            }
+                        }
+                        Err(err) => {
+                            ctx.exhausted_err = Some((part, err));
+                            return;
+                        }
+                    }
                 }
-                out.targets.push(target);
+                ctx.out.targets.push(target);
             }
         }
 
@@ -320,28 +568,51 @@ pub(crate) fn resolve_command_targets_impl(
             unit_target_parts.push(implicit_part.clone());
             match &cwd_state {
                 CwdState::Known(cur) => {
-                    let target = resolve_literal_impl(
+                    let target = match resolve_literal_impl(
                         cur,
                         cur,
-                        &protected.home,
+                        &ctx.protected.home,
                         TargetOrigin::ImplicitCwd {
                             unit: Some(unit.index),
                         },
                         AccessMode::Read,
-                        resolver,
-                        caps,
-                        budget,
-                    )?;
-                    record_multiply_linked(&target, &mut out.multiply_linked_file);
-                    let rec = check_recursive_root_impl(
-                        &target, e.links, &e.filters, protected, resolver, caps, budget,
-                    )?;
-                    out.multiply_linked_file |= rec.multiply_linked_file;
-                    out.outcomes.extend(rec.outcomes);
-                    out.targets.push(target);
+                        ctx.resolver,
+                        ctx.caps,
+                        ctx.budget,
+                    ) {
+                        Ok(t) => t,
+                        Err(err) => {
+                            ctx.exhausted_err = Some((implicit_part, err));
+                            return;
+                        }
+                    };
+                    record_multiply_linked(&target, &mut ctx.out.multiply_linked_file);
+                    match check_recursive_root_impl(
+                        &target,
+                        e.links,
+                        &e.filters,
+                        ctx.protected,
+                        ctx.resolver,
+                        ctx.caps,
+                        ctx.budget,
+                    ) {
+                        Ok(rec) => {
+                            ctx.out.multiply_linked_file |= rec.multiply_linked_file;
+                            ctx.out.outcomes.extend(rec.outcomes);
+                            ctx.out.targets.push(target);
+                            if ctx.budget.is_exhausted() {
+                                ensure_exhausted_recorded(ctx.out, implicit_part, ctx.budget);
+                                return;
+                            }
+                        }
+                        Err(err) => {
+                            ctx.exhausted_err = Some((implicit_part, err));
+                            return;
+                        }
+                    }
                 }
                 CwdState::Unknown => {
-                    out.targets.push(Target {
+                    ctx.out.targets.push(Target {
                         origin: TargetOrigin::ImplicitCwd {
                             unit: Some(unit.index),
                         },
@@ -357,12 +628,13 @@ pub(crate) fn resolve_command_targets_impl(
             let Some(target_word) = redir.target() else {
                 continue;
             };
-            if out.targets.len() >= limits::MAX_PATHS {
-                out.outcomes.push(PartResult {
+            if ctx.out.targets.len() >= limits::MAX_PATHS {
+                ctx.out.outcomes.push(PartResult {
                     part: PartId::WholeCall,
                     outcome: PartOutcome::TooLarge(Cap::Paths),
                 });
-                return Ok(out);
+                ctx.stopped_too_large = true;
+                return;
             }
             let access = match redir {
                 ModelRedirect::Read { .. } => AccessMode::Read,
@@ -386,35 +658,50 @@ pub(crate) fn resolve_command_targets_impl(
                 CwdState::Known(c) => c.as_slice(),
                 CwdState::Unknown => {
                     if !is_absolute_or_tilde(target_word) {
-                        out.outcomes.push(PartResult {
+                        ctx.out.outcomes.push(PartResult {
                             part,
                             outcome: PartOutcome::Unread(UnreadReason::UnknownCwd),
                         });
-                        out.targets.push(Target {
+                        ctx.out.targets.push(Target {
                             origin,
                             access,
                             resolution: TargetResolution::Unread(UnreadReason::UnknownCwd),
                         });
                         continue;
                     }
-                    start_cwd
+                    ctx.start_cwd
                 }
             };
 
-            let target = resolve_word_literal(
+            let target = match resolve_word_literal(
                 target_word,
                 cur_cwd,
-                &protected.home,
+                &ctx.protected.home,
                 origin,
                 access,
-                resolver,
-                caps,
-                budget,
-            )?;
-            record_multiply_linked(&target, &mut out.multiply_linked_file);
-            let checked = check_target_impl(&target, protected, budget)?;
-            out.outcomes.push(checked);
-            out.targets.push(target);
+                ctx.resolver,
+                ctx.caps,
+                ctx.budget,
+            ) {
+                Ok(t) => t,
+                Err(err) => {
+                    ctx.exhausted_err = Some((part, err));
+                    return;
+                }
+            };
+            record_multiply_linked(&target, &mut ctx.out.multiply_linked_file);
+            if let Err(err) = ctx.wo_cache.check_target(
+                &target,
+                ctx.protected,
+                ctx.resolver,
+                ctx.caps,
+                ctx.budget,
+                &mut ctx.out.outcomes,
+            ) {
+                ctx.exhausted_err = Some((part, err));
+                return;
+            }
+            ctx.out.targets.push(target);
         }
 
         // Derived destinations (§5, §10 row 18): makes the writer itself Unread,
@@ -426,7 +713,7 @@ pub(crate) fn resolve_command_targets_impl(
                 DerivedDestinations::WhenSourceIsDir => mv_source_is_dir,
             };
             if derived {
-                out.outcomes.push(PartResult {
+                ctx.out.outcomes.push(PartResult {
                     part: PartId::Unit(unit.index),
                     outcome: PartOutcome::Unread(UnreadReason::DerivedDestinations {
                         tool: e.tool_name.unwrap_or("unknown").to_string(),
@@ -441,7 +728,7 @@ pub(crate) fn resolve_command_targets_impl(
         if let Some(writer_unit) = pipeline_taint {
             if unit_target_parts.is_empty() {
                 if unit.index != writer_unit {
-                    out.outcomes.push(PartResult {
+                    ctx.out.outcomes.push(PartResult {
                         part: PartId::Unit(unit.index),
                         outcome: PartOutcome::Unread(UnreadReason::PipelineWithPossibleWriter {
                             writer_unit,
@@ -450,7 +737,7 @@ pub(crate) fn resolve_command_targets_impl(
                 }
             } else {
                 for p in &unit_target_parts {
-                    out.outcomes.push(PartResult {
+                    ctx.out.outcomes.push(PartResult {
                         part: p.clone(),
                         outcome: PartOutcome::Unread(UnreadReason::PipelineWithPossibleWriter {
                             writer_unit,
@@ -460,13 +747,13 @@ pub(crate) fn resolve_command_targets_impl(
             }
         } else if let Some(writer_unit) = after_writer_taint {
             if unit_target_parts.is_empty() {
-                out.outcomes.push(PartResult {
+                ctx.out.outcomes.push(PartResult {
                     part: PartId::Unit(unit.index),
                     outcome: PartOutcome::Unread(UnreadReason::AfterPossibleWriter { writer_unit }),
                 });
             } else {
                 for p in &unit_target_parts {
-                    out.outcomes.push(PartResult {
+                    ctx.out.outcomes.push(PartResult {
                         part: p.clone(),
                         outcome: PartOutcome::Unread(UnreadReason::AfterPossibleWriter {
                             writer_unit,
@@ -476,25 +763,202 @@ pub(crate) fn resolve_command_targets_impl(
             }
         }
 
-        // Update `cd` state for subsequent units (§5).
+        // Execute nested-shell children at the EXACT cwd `unit` had when it ran,
+        // isolating any `cd` inside the child from `unit`'s parent scope (§5).
+        if let Some(children) = ctx.children_by_parent.get(&Some(unit.index)) {
+            let child_entry_cwd = cwd_state.clone();
+            let mut child_earlier_writer = *earlier_writer;
+            exec_unit_sequence(
+                children,
+                child_entry_cwd,
+                pipeline_taint,
+                &mut child_earlier_writer,
+                ctx,
+            );
+            if ctx.stopped_too_large || ctx.exhausted_err.is_some() || ctx.budget.is_exhausted() {
+                return;
+            }
+            // If a child inside a non-pipelined `-c` script wrote to disk, later
+            // outer units run after that writer.
+            if let Some(cw) = child_earlier_writer
+                && earlier_writer.is_none()
+            {
+                if unit.pipeline_id.is_some() {
+                    active_pipeline_writer.get_or_insert(cw);
+                } else {
+                    *earlier_writer = Some(cw);
+                }
+            }
+        }
+
+        // Update `cd` state for subsequent sibling units in THIS scope only (§5).
         if let Some(e) = eff
             && e.tool_name == Some("cd")
         {
             cwd_state = if earlier_writer.is_some() {
                 CwdState::Unknown
             } else {
-                next_cwd_after_cd(unit, e, &cwd_state, protected, resolver, caps, budget)?
+                match next_cwd_after_cd(
+                    unit,
+                    e,
+                    &cwd_state,
+                    ctx.protected,
+                    ctx.resolver,
+                    ctx.caps,
+                    ctx.budget,
+                ) {
+                    Ok(next) => next,
+                    Err(err) => {
+                        ctx.exhausted_err = Some((PartId::Unit(unit.index), err));
+                        return;
+                    }
+                }
             };
         }
 
         // Record possible-writer status for later units.
-        if unit_is_possible_writer(unit, eff) {
+        if let Some(w) = ctx.subtree_writers[idx] {
             if unit.pipeline_id.is_some() {
-                active_pipeline_writer.get_or_insert(unit.index);
+                active_pipeline_writer.get_or_insert(w);
             } else {
-                earlier_writer.get_or_insert(unit.index);
+                earlier_writer.get_or_insert(w);
             }
         }
+    }
+
+    if let Some(pw) = active_pipeline_writer.take() {
+        earlier_writer.get_or_insert(pw);
+    }
+}
+
+/// Implementation of `v4::paths::resolve_command_targets` (contract §5, §8).
+pub(crate) fn resolve_command_targets_impl(
+    units: &[CommandUnit],
+    effects: &[ToolEffects],
+    start_cwd: &[u8],
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+) -> Result<ResolvedCallPaths, Exhausted> {
+    budget.charge((units.len() + start_cwd.len() + 1) as u64)?;
+    budget.charge_alloc(
+        start_cwd
+            .len()
+            .saturating_add(units.len() * std::mem::size_of::<usize>()),
+    )?;
+
+    let mut out = ResolvedCallPaths::default();
+
+    // Build the execution tree from `parent_unit` and `depth` so nested-shell
+    // children resolve at their parent's entry cwd regardless of flattening
+    // order, and child `cd` changes stay isolated from the parent scope (§5).
+    let mut index_to_pos: HashMap<UnitIndex, usize> = HashMap::with_capacity(units.len());
+    for (pos, u) in units.iter().enumerate() {
+        index_to_pos.insert(u.index, pos);
+    }
+
+    let mut children_by_parent: HashMap<Option<UnitIndex>, Vec<usize>> = HashMap::new();
+    let mut orphans: Vec<usize> = Vec::new();
+    for (pos, u) in units.iter().enumerate() {
+        match u.parent_unit {
+            None if u.depth == 0 => {
+                children_by_parent.entry(None).or_default().push(pos);
+            }
+            Some(parent_idx) if index_to_pos.contains_key(&parent_idx) => {
+                children_by_parent
+                    .entry(Some(parent_idx))
+                    .or_default()
+                    .push(pos);
+            }
+            _ => {
+                // Detached or depth>0 unit with missing parent: resolve fail-closed
+                // under `Unknown` cwd so it is never silently dropped.
+                orphans.push(pos);
+            }
+        }
+    }
+
+    // Compute per-unit subtree writer status bottom-up so pipelines whose stage
+    // invokes a writing nested shell taint every stage of the pipeline (§5).
+    let mut memo: Vec<Option<Option<UnitIndex>>> = vec![None; units.len()];
+    let mut visiting: Vec<bool> = vec![false; units.len()];
+    let mut subtree_writers: Vec<Option<UnitIndex>> = Vec::with_capacity(units.len());
+    for pos in 0..units.len() {
+        let w = compute_subtree_writer(
+            pos,
+            units,
+            effects,
+            &children_by_parent,
+            &mut memo,
+            &mut visiting,
+        );
+        subtree_writers.push(w);
+    }
+
+    // Pre-scan pipelines so every stage of a pipeline containing a possible
+    // writer — including stages BEFORE the writer — is tainted (§5, §10 row 21).
+    let mut pipeline_writers: HashMap<PipelineId, UnitIndex> = HashMap::new();
+    for (pos, unit) in units.iter().enumerate() {
+        if let Some(pid) = unit.pipeline_id
+            && let Some(w) = subtree_writers[pos]
+        {
+            pipeline_writers.entry(pid).or_insert(w);
+        }
+    }
+
+    let mut visited = vec![false; units.len()];
+    let mut wo_cache = WriteOnlyIdCache::default();
+    let mut earlier_writer: Option<UnitIndex> = None;
+
+    let top_level: Vec<usize> = children_by_parent.get(&None).cloned().unwrap_or_default();
+
+    let mut ctx = ExecCtx {
+        units,
+        effects,
+        start_cwd,
+        protected,
+        resolver,
+        caps,
+        budget,
+        children_by_parent: &children_by_parent,
+        pipeline_writers: &pipeline_writers,
+        subtree_writers: &subtree_writers,
+        visited: &mut visited,
+        wo_cache: &mut wo_cache,
+        out: &mut out,
+        stopped_too_large: false,
+        exhausted_err: None,
+    };
+
+    exec_unit_sequence(
+        &top_level,
+        CwdState::Known(start_cwd.to_vec()),
+        None,
+        &mut earlier_writer,
+        &mut ctx,
+    );
+
+    if !ctx.stopped_too_large && ctx.exhausted_err.is_none() && !ctx.budget.is_exhausted() {
+        // Resolve any detached orphans or cycle members under Unknown cwd.
+        let remaining: Vec<usize> = orphans
+            .into_iter()
+            .chain((0..units.len()).filter(|&i| !ctx.visited[i]))
+            .collect();
+        if !remaining.is_empty() {
+            exec_unit_sequence(
+                &remaining,
+                CwdState::Unknown,
+                None,
+                &mut earlier_writer,
+                &mut ctx,
+            );
+        }
+    }
+
+    let exhausted_err = ctx.exhausted_err.take();
+    if let Some((part, err)) = exhausted_err {
+        return finish_call_exhausted(out, part, err);
     }
 
     Ok(out)
@@ -581,6 +1045,7 @@ fn next_cwd_after_cd(
                 || (eff.roles.len() == unit.argv.len()
                     && eff.roles[1..].iter().all(|r| *r == OperandRole::Flag));
             if only_flags {
+                budget.charge_alloc(protected.home.len())?;
                 Ok(CwdState::Known(protected.home.clone()))
             } else {
                 Ok(CwdState::Unknown)
@@ -635,6 +1100,9 @@ fn check_selector_probes(
     budget: &mut ComputeBudget,
     outcomes: &mut Vec<PartResult>,
 ) -> Result<(), Exhausted> {
+    let est_len = base.len().max(protected.home.len()) + glob.len() + 2;
+    budget.charge(est_len as u64)?;
+    budget.charge_alloc(est_len.saturating_mul(2))?;
     let norm = lexical_normalize_selector(base, glob, &protected.home);
     let folded = fold_path_listed(&norm, protected.folds);
     let Ok(pat_str) = std::str::from_utf8(&folded) else {
@@ -722,8 +1190,19 @@ pub(crate) fn resolve_subject_paths_impl(
         return Ok(out);
     }
 
+    let mut wo_cache = WriteOnlyIdCache::default();
+    let selector_glob = glob.filter(|g| is_selector_glob(g));
+    let non_selector_filter = glob.filter(|g| !is_selector_glob(g)).map(|g| SearchFilter {
+        dialect: FilterDialect::SearchGlob,
+        pattern: Word::derived(g.as_bytes().to_vec()),
+        case_insensitive: false,
+        argv_index: None,
+    });
+    let filter_part = PartId::Filter { unit: None };
+
+    // Helper: check a single resolved root immediately (so any earlier hit is
+    // already stored in `out.outcomes` if a later root exhausts the budget; §8).
     let mut roots: Vec<Target> = Vec::with_capacity(paths.len().max(1));
-    let delegated_to_recursive = recursive && !glob.is_some_and(is_selector_glob);
 
     // File-tool paths are ALWAYS literal (M1-32 round 4 finding 3; §5; §10 row 11).
     for (path_index, raw) in paths.iter().enumerate() {
@@ -734,7 +1213,8 @@ pub(crate) fn resolve_subject_paths_impl(
             });
             return Ok(out);
         }
-        let target = resolve_literal_impl(
+        let part = PartId::SubjectPath { path_index };
+        let target = match resolve_literal_impl(
             raw.as_bytes(),
             &protected.cwd,
             &protected.home,
@@ -743,18 +1223,97 @@ pub(crate) fn resolve_subject_paths_impl(
             resolver,
             caps,
             budget,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(e) => return finish_call_exhausted(out, part, e),
+        };
         record_multiply_linked(&target, &mut out.multiply_linked_file);
-        if !delegated_to_recursive {
-            let checked = check_target_impl(&target, protected, budget)?;
-            out.outcomes.push(checked);
+
+        if selector_glob.is_some() {
+            if let Err(e) = wo_cache.check_target(
+                &target,
+                protected,
+                resolver,
+                caps,
+                budget,
+                &mut out.outcomes,
+            ) {
+                return finish_call_exhausted(out, part, e);
+            }
+            roots.push(target.clone());
+        } else if recursive {
+            let filters_slice = non_selector_filter.as_slice();
+            match check_recursive_root_impl(
+                &target,
+                Default::default(),
+                filters_slice,
+                protected,
+                resolver,
+                caps,
+                budget,
+            ) {
+                Ok(rec) => {
+                    out.multiply_linked_file |= rec.multiply_linked_file;
+                    out.outcomes.extend(rec.outcomes);
+                    out.targets.push(target);
+                    if budget.is_exhausted() {
+                        ensure_exhausted_recorded(&mut out, part, budget);
+                        return Ok(out);
+                    }
+                    continue;
+                }
+                Err(e) => return finish_call_exhausted(out, part, e),
+            }
+        } else {
+            if let Err(e) = wo_cache.check_target(
+                &target,
+                protected,
+                resolver,
+                caps,
+                budget,
+                &mut out.outcomes,
+            ) {
+                return finish_call_exhausted(out, part, e);
+            }
+            if let Some(filter) = &non_selector_filter
+                && let TargetResolution::Resolved { canonical, .. } = &target.resolution
+            {
+                let shared = match SharedSensitive::for_protected_budgeted(protected, budget) {
+                    Ok(s) => s,
+                    Err(e) => return finish_call_exhausted(out, filter_part, e),
+                };
+                if let Err(e) = budget
+                    .charge(canonical.len().max(1) as u64)
+                    .and_then(|()| budget.charge_alloc(canonical.len().max(1)))
+                {
+                    return finish_call_exhausted(out, filter_part, e);
+                }
+                let folded_root = fold_path_listed(canonical, protected.folds);
+                if let Err(e) = check_filter_on_root(
+                    canonical,
+                    &folded_root,
+                    filter,
+                    false,
+                    &filter_part,
+                    protected,
+                    &shared,
+                    resolver,
+                    caps,
+                    budget,
+                    &mut out.outcomes,
+                    &mut out.multiply_linked_file,
+                ) {
+                    return finish_call_exhausted(out, filter_part, e);
+                }
+            }
         }
-        roots.push(target.clone());
         out.targets.push(target);
     }
 
-    if roots.is_empty() && (recursive || glob.is_some()) {
-        let implicit = resolve_literal_impl(
+    // Implicit cwd root when `paths` is empty and a recursive or glob search runs.
+    if paths.is_empty() && (recursive || glob.is_some()) {
+        let part = PartId::WholeCall;
+        let implicit = match resolve_literal_impl(
             &protected.cwd,
             &protected.cwd,
             &protected.home,
@@ -763,184 +1322,227 @@ pub(crate) fn resolve_subject_paths_impl(
             resolver,
             caps,
             budget,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(e) => return finish_call_exhausted(out, part, e),
+        };
         record_multiply_linked(&implicit, &mut out.multiply_linked_file);
-        if !delegated_to_recursive {
-            let checked = check_target_impl(&implicit, protected, budget)?;
-            out.outcomes.push(checked);
-        }
-        roots.push(implicit.clone());
-        out.targets.push(implicit);
-    }
 
-    match glob {
-        Some(g) if is_selector_glob(g) => {
-            // Selector (§5): expands like a shell glob, and D-100 escaping-glob
-            // verdicts stay (Unread when escaping roots, HardDeny if a hit).
-            let mut word = Word::new();
-            word.extend_with_provenance(g.as_bytes(), ByteProvenance::Unquoted);
-            let shared = SharedSensitive::for_protected(protected);
-            let anchored = g.starts_with('/') || g.starts_with('~');
-            let root_bases: Vec<Vec<u8>> = if anchored {
-                vec![protected.cwd.clone()]
-            } else {
-                roots
-                    .iter()
-                    .filter_map(|r| match &r.resolution {
-                        TargetResolution::Resolved { canonical, .. } => Some(canonical.clone()),
-                        TargetResolution::Unread(_) => None,
-                    })
-                    .collect()
-            };
-            let root_folded: Vec<Vec<u8>> = roots
-                .iter()
-                .filter_map(|r| match &r.resolution {
-                    TargetResolution::Resolved { canonical, .. } => {
-                        Some(fold_path_listed(canonical, protected.folds))
+        if selector_glob.is_some() {
+            if let Err(e) = wo_cache.check_target(
+                &implicit,
+                protected,
+                resolver,
+                caps,
+                budget,
+                &mut out.outcomes,
+            ) {
+                return finish_call_exhausted(out, part, e);
+            }
+            roots.push(implicit.clone());
+        } else if recursive {
+            let filters_slice = non_selector_filter.as_slice();
+            match check_recursive_root_impl(
+                &implicit,
+                Default::default(),
+                filters_slice,
+                protected,
+                resolver,
+                caps,
+                budget,
+            ) {
+                Ok(rec) => {
+                    out.multiply_linked_file |= rec.multiply_linked_file;
+                    out.outcomes.extend(rec.outcomes);
+                    out.targets.push(implicit);
+                    if budget.is_exhausted() {
+                        ensure_exhausted_recorded(&mut out, part, budget);
                     }
-                    TargetResolution::Unread(_) => None,
-                })
-                .collect();
-
-            let mut escaped = root_bases.is_empty() && !anchored;
-            for base in &root_bases {
-                let exp = expand_shell_glob_impl(
-                    &word,
-                    base,
-                    &protected.home,
-                    PartId::Filter { unit: None },
-                    access,
+                    return Ok(out);
+                }
+                Err(e) => return finish_call_exhausted(out, part, e),
+            }
+        } else {
+            if let Err(e) = wo_cache.check_target(
+                &implicit,
+                protected,
+                resolver,
+                caps,
+                budget,
+                &mut out.outcomes,
+            ) {
+                return finish_call_exhausted(out, part, e);
+            }
+            if let Some(filter) = &non_selector_filter
+                && let TargetResolution::Resolved { canonical, .. } = &implicit.resolution
+            {
+                let shared = match SharedSensitive::for_protected_budgeted(protected, budget) {
+                    Ok(s) => s,
+                    Err(e) => return finish_call_exhausted(out, filter_part, e),
+                };
+                if let Err(e) = budget
+                    .charge(canonical.len().max(1) as u64)
+                    .and_then(|()| budget.charge_alloc(canonical.len().max(1)))
+                {
+                    return finish_call_exhausted(out, filter_part, e);
+                }
+                let folded_root = fold_path_listed(canonical, protected.folds);
+                if let Err(e) = check_filter_on_root(
+                    canonical,
+                    &folded_root,
+                    filter,
+                    false,
+                    &filter_part,
+                    protected,
+                    &shared,
                     resolver,
                     caps,
                     budget,
-                )?;
-                for unread in exp.unread {
-                    out.outcomes.push(PartResult {
-                        part: PartId::Filter { unit: None },
-                        outcome: PartOutcome::Unread(unread),
-                    });
+                    &mut out.outcomes,
+                    &mut out.multiply_linked_file,
+                ) {
+                    return finish_call_exhausted(out, filter_part, e);
                 }
-                for target in exp.exact_matches {
-                    if out.targets.len() >= limits::MAX_PATHS {
-                        out.outcomes.push(PartResult {
-                            part: PartId::WholeCall,
-                            outcome: PartOutcome::TooLarge(Cap::Paths),
-                        });
-                        return Ok(out);
-                    }
-                    if let TargetResolution::Resolved { canonical, .. } = &target.resolution {
-                        let tf = fold_path_listed(canonical, protected.folds);
-                        if !root_folded.iter().any(|rf| under_bytes(&tf, rf).is_some()) {
-                            escaped = true;
-                        }
-                    }
-                    record_multiply_linked(&target, &mut out.multiply_linked_file);
-                    let checked = check_target_impl(&target, protected, budget)?;
-                    out.outcomes.push(checked);
-                    out.targets.push(target);
-                }
-                let mut emitted_variant = false;
-                for target in exp.variant_only_matches {
-                    escaped = true;
-                    if !emitted_variant {
-                        emitted_variant = true;
-                        out.outcomes.push(PartResult {
-                            part: PartId::Filter { unit: None },
-                            outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
-                                pattern: g.as_bytes().to_vec(),
-                            }),
-                        });
-                    }
-                    out.targets.push(target);
-                }
-                check_selector_probes(base, g, protected, &shared, budget, &mut out.outcomes)?;
             }
-            if escaped || anchored {
-                // D-100: an escaping selector cannot be allowed by Home or
-                // scoped/prefix rules; only unscoped Any or FullAccess allows
-                // it (unless a HardDeny hit was already recorded above).
+        }
+        out.targets.push(implicit);
+    }
+
+    // Selector glob (`../...`, `/...`, `~...`): expand like shell glob + D-100 escaping Unread.
+    if let Some(g) = selector_glob {
+        if let Err(e) = budget.charge_alloc(g.len().saturating_mul(2)) {
+            return finish_call_exhausted(out, filter_part, e);
+        }
+        let mut word = Word::new();
+        word.extend_with_provenance(g.as_bytes(), ByteProvenance::Unquoted);
+        let shared = match SharedSensitive::for_protected_budgeted(protected, budget) {
+            Ok(s) => s,
+            Err(e) => return finish_call_exhausted(out, filter_part, e),
+        };
+        let anchored = g.starts_with('/') || g.starts_with('~');
+        let root_bases: Vec<Vec<u8>> = if anchored {
+            vec![protected.cwd.clone()]
+        } else {
+            roots
+                .iter()
+                .filter_map(|r| match &r.resolution {
+                    TargetResolution::Resolved { canonical, .. } => Some(canonical.clone()),
+                    TargetResolution::Unread(_) => None,
+                })
+                .collect()
+        };
+        let root_folded: Vec<Vec<u8>> = roots
+            .iter()
+            .filter_map(|r| match &r.resolution {
+                TargetResolution::Resolved { canonical, .. } => {
+                    Some(fold_path_listed(canonical, protected.folds))
+                }
+                TargetResolution::Unread(_) => None,
+            })
+            .collect();
+
+        let mut escaped = root_bases.is_empty() && !anchored;
+        for base in &root_bases {
+            let exp = match expand_shell_glob_impl(
+                &word,
+                base,
+                &protected.home,
+                filter_part.clone(),
+                access,
+                resolver,
+                caps,
+                budget,
+            ) {
+                Ok(exp) => exp,
+                Err(e) => return finish_call_exhausted(out, filter_part, e),
+            };
+            for unread in exp.unread {
                 out.outcomes.push(PartResult {
-                    part: PartId::Filter { unit: None },
-                    outcome: PartOutcome::Unread(UnreadReason::UnsupportedFilterForm),
+                    part: filter_part.clone(),
+                    outcome: PartOutcome::Unread(unread),
                 });
             }
-            // If recursive is also set on the subject, run S8 / hard-link checks on roots.
-            if recursive {
-                for root in &roots {
-                    let rec = check_recursive_root_impl(
-                        root,
-                        Default::default(),
-                        &[],
-                        protected,
-                        resolver,
-                        caps,
-                        budget,
-                    )?;
-                    out.multiply_linked_file |= rec.multiply_linked_file;
-                    out.outcomes.extend(rec.outcomes);
+            for target in exp.exact_matches {
+                if out.targets.len() >= limits::MAX_PATHS {
+                    out.outcomes.push(PartResult {
+                        part: PartId::WholeCall,
+                        outcome: PartOutcome::TooLarge(Cap::Paths),
+                    });
+                    return Ok(out);
                 }
+                if let TargetResolution::Resolved { canonical, .. } = &target.resolution {
+                    let tf = fold_path_listed(canonical, protected.folds);
+                    if !root_folded.iter().any(|rf| under_bytes(&tf, rf).is_some()) {
+                        escaped = true;
+                    }
+                }
+                record_multiply_linked(&target, &mut out.multiply_linked_file);
+                if let Err(e) = wo_cache.check_target(
+                    &target,
+                    protected,
+                    resolver,
+                    caps,
+                    budget,
+                    &mut out.outcomes,
+                ) {
+                    return finish_call_exhausted(out, filter_part, e);
+                }
+                out.targets.push(target);
+            }
+            let mut emitted_variant = false;
+            for target in exp.variant_only_matches {
+                escaped = true;
+                if !emitted_variant {
+                    emitted_variant = true;
+                    out.outcomes.push(PartResult {
+                        part: filter_part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
+                            pattern: g.as_bytes().to_vec(),
+                        }),
+                    });
+                }
+                out.targets.push(target);
+            }
+            if let Err(e) =
+                check_selector_probes(base, g, protected, &shared, budget, &mut out.outcomes)
+            {
+                return finish_call_exhausted(out, filter_part, e);
             }
         }
-        Some(g) => {
-            let filter = SearchFilter {
-                dialect: FilterDialect::SearchGlob,
-                pattern: Word::derived(g.as_bytes().to_vec()),
-                case_insensitive: false,
-                argv_index: None,
-            };
-            if recursive {
-                for root in &roots {
-                    let rec = check_recursive_root_impl(
-                        root,
-                        Default::default(),
-                        std::slice::from_ref(&filter),
-                        protected,
-                        resolver,
-                        caps,
-                        budget,
-                    )?;
-                    out.multiply_linked_file |= rec.multiply_linked_file;
-                    out.outcomes.extend(rec.outcomes);
-                }
-            } else {
-                let shared = SharedSensitive::for_protected(protected);
-                let filter_part = PartId::Filter { unit: None };
-                for root in &roots {
-                    let TargetResolution::Resolved { canonical, .. } = &root.resolution else {
-                        continue;
-                    };
-                    let folded_root = fold_path_listed(canonical, protected.folds);
-                    check_filter_on_root(
-                        canonical,
-                        &folded_root,
-                        &filter,
-                        false,
-                        &filter_part,
-                        protected,
-                        &shared,
-                        resolver,
-                        caps,
-                        budget,
-                        &mut out.outcomes,
-                        &mut out.multiply_linked_file,
-                    )?;
-                }
-            }
+        if escaped || anchored {
+            // D-100: an escaping selector cannot be allowed by Home or
+            // scoped/prefix rules; only unscoped Any or FullAccess allows
+            // it (unless a HardDeny hit was already recorded above).
+            out.outcomes.push(PartResult {
+                part: filter_part.clone(),
+                outcome: PartOutcome::Unread(UnreadReason::UnsupportedFilterForm),
+            });
         }
-        None => {
-            if recursive {
-                for root in &roots {
-                    let rec = check_recursive_root_impl(
-                        root,
-                        Default::default(),
-                        &[],
-                        protected,
-                        resolver,
-                        caps,
-                        budget,
-                    )?;
-                    out.multiply_linked_file |= rec.multiply_linked_file;
-                    out.outcomes.extend(rec.outcomes);
+        // If recursive is also set on the subject, run S8 / hard-link checks on roots.
+        if recursive {
+            for root in &roots {
+                match check_recursive_root_impl(
+                    root,
+                    Default::default(),
+                    &[],
+                    protected,
+                    resolver,
+                    caps,
+                    budget,
+                ) {
+                    Ok(rec) => {
+                        out.multiply_linked_file |= rec.multiply_linked_file;
+                        out.outcomes.extend(rec.outcomes);
+                        if budget.is_exhausted() {
+                            ensure_exhausted_recorded(
+                                &mut out,
+                                origin_to_part(&root.origin),
+                                budget,
+                            );
+                            return Ok(out);
+                        }
+                    }
+                    Err(e) => return finish_call_exhausted(out, origin_to_part(&root.origin), e),
                 }
             }
         }
