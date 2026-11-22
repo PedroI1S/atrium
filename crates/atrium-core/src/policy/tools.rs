@@ -385,6 +385,9 @@ pub(crate) struct ProgramPinSpec {
 
 /// Payload for [`ToolRowKind::CodeRunner`] and [`SubcommandKind::CodeRunner`]
 /// (D-141 kind 4): always `Unread`.
+///
+/// `inline_code` and `program_pin` locate inline code or a pinned program file
+/// without relaxing candidate-path hard-deny/store checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CodeRunnerRow {
     pub(crate) inline_code: InlineCodeSpec,
@@ -398,7 +401,9 @@ pub(crate) struct CodeRunnerRow {
 
 /// One data-only trigger on a [`ConditionalRunnerRow`] (D-141 kind 5).
 ///
-/// Triggers carry no flag arities and no operand roles; P3 applies them.
+/// Triggers carry no flag arities and no operand roles; P3 applies them
+/// (matching flag triggers against exact, `--flag=value`, and short-flag
+/// cluster / attached-value forms as appropriate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunnerTrigger {
     /// Presence of this flag makes the unit `Unread(CodeRunnerInlineCode)`
@@ -428,10 +433,7 @@ pub(crate) enum RunnerTrigger {
     ScriptCommands(&'static [char]),
     /// A flag naming a program file makes the unit pinnable
     /// `Unread (program)` (§11 item 8; e.g. `sed -f`/`--file`).
-    ProgramFileFlag {
-        flag: &'static str,
-        pin: ProgramPin,
-    },
+    ProgramFileFlag { flag: &'static str, pin: ProgramPin },
 }
 
 /// Payload for [`ToolRowKind::ConditionalRunner`] (D-141 kind 5): `find`,
@@ -1490,14 +1492,21 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         true,
         Some("§11 item 10"),
     ),
-    home_git_sub("log", &["git", "log"], None, true, true, Some("§11 item 10")),
+    home_git_sub(
+        "log",
+        &["git", "log"],
+        None,
+        true,
+        true,
+        Some("§11 item 10"),
+    ),
     home_git_sub(
         "diff",
         &["git", "diff"],
         None,
         true,
         true,
-        Some("§11 item 4; §11 item 10"),
+        Some("§11 item 10"),
     ),
     home_git_sub(
         "show",
@@ -1891,7 +1900,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             code_runner_no_pin: true,
             subcommands: PIPX_SUBCOMMANDS,
         }),
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 4"),
     },
     // `shell::COMMAND_RUNNERS` (all 29 entries)
     target_then_code_runner("ssh", Platforms::Both),
@@ -2000,7 +2009,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         name: "tar",
         platforms: Platforms::Both,
         kind: ToolRowKind::DerivedDestinationWriter(DerivedDestinationWriterRow {
-            trigger: DerivedDestinationTrigger::Flags(&["-x", "--extract"]),
+            trigger: DerivedDestinationTrigger::Flags(&["-x", "--extract", "--get"]),
         }),
         changes_default: Some("§11 item 10"),
     },
@@ -2025,7 +2034,7 @@ const fn outside_wrapper(name: &'static str, platforms: Platforms) -> OutsideMod
         code_runner_no_pin: true,
         reason: "Wrapper outside §4's closed list; makes the unit Unread",
         contract_section: "§4",
-        changes_default: Some("§11 item 10"),
+        changes_default: Some("§11 item 4; §11 item 10"),
     }
 }
 
@@ -3386,9 +3395,9 @@ mod tests {
                 ToolRowKind::NestedShell(r) => {
                     assert!(r.code_runner_no_pin);
                     assert!(
-                        t.changes_default
-                            .is_some_and(|cd| cd.contains("§11 item 4")
-                                && cd.contains("§11 item 8")),
+                        t.changes_default.is_some_and(
+                            |cd| cd.contains("§11 item 4") && cd.contains("§11 item 8")
+                        ),
                         "NestedShell `{}` must cite §11 item 4 and item 8",
                         t.name
                     );
@@ -3401,8 +3410,29 @@ mod tests {
                         "ConditionalRunner `{}` must cite §11 item 4",
                         t.name
                     );
+                    if r.triggers
+                        .iter()
+                        .any(|trig| matches!(trig, RunnerTrigger::ProgramFileFlag { .. }))
+                    {
+                        assert!(
+                            t.changes_default
+                                .is_some_and(|cd| cd.contains("§11 item 8")),
+                            "ConditionalRunner `{}` with ProgramFileFlag must cite §11 item 8",
+                            t.name
+                        );
+                    }
                 }
                 _ => {}
+            }
+        }
+        for e in OUTSIDE_MODEL {
+            if e.code_runner_no_pin {
+                assert!(
+                    e.changes_default
+                        .is_some_and(|cd| cd.contains("§11 item 4")),
+                    "OUTSIDE_MODEL `{}` with code_runner_no_pin must cite §11 item 4",
+                    e.name
+                );
             }
         }
     }
@@ -3612,7 +3642,10 @@ mod tests {
         for t in TOOLS {
             if let Some(h) = t.home_readonly() {
                 assert!(
-                    matches!(t.kind, ToolRowKind::HomeReadOnly(_) | ToolRowKind::Search(_)),
+                    matches!(
+                        t.kind,
+                        ToolRowKind::HomeReadOnly(_) | ToolRowKind::Search(_)
+                    ),
                     "only HomeReadOnly or Search rows may carry home_readonly: `{}`",
                     t.name
                 );
@@ -3697,6 +3730,9 @@ mod tests {
             table_accepts_in_home(&["grep", "-R", "x", "proj"]),
             ALLOW_HOME_FOLLOWED_SEARCH
         );
+        // `-R` overridden by later `-r` disables following links below root, so
+        // Home accepts regardless of ALLOW_HOME_FOLLOWED_SEARCH.
+        assert!(table_accepts_in_home(&["grep", "-R", "-r", "x", "proj"]));
 
         // 3. Effective rejected forms in Home
         let home_rejected: &[&[&str]] = &[
@@ -3742,12 +3778,6 @@ mod tests {
 
     #[test]
     fn dev_lists_and_flag_tables_fully_accounted_for() {
-        let accounted = |name: &str| {
-            lookup(name).is_some()
-                || lookup_outside_model(name).is_some()
-                || lookup_unknown_by_design(name).is_some()
-        };
-
         // 1. HOME_READONLY_COMMANDS
         for entry in HOME_READONLY_COMMANDS {
             let cmd = entry.prefix[0];
@@ -3755,7 +3785,10 @@ mod tests {
                 lookup(cmd).unwrap_or_else(|| panic!("HOME_READONLY_COMMANDS `{cmd}` missing"));
             if entry.prefix.len() > 1 {
                 let sub = subcommand(tool, entry.prefix[1]).unwrap_or_else(|| {
-                    panic!("HOME_READONLY_COMMANDS subcommand {:?} missing", entry.prefix)
+                    panic!(
+                        "HOME_READONLY_COMMANDS subcommand {:?} missing",
+                        entry.prefix
+                    )
                 });
                 assert!(
                     matches!(sub.kind, SubcommandKind::HomeReadOnly(_)),
@@ -3841,10 +3874,45 @@ mod tests {
 
         // 6. words::WRITERS, words::READERS, deny::DOWNLOADERS, deny::PRIV
         for &w in words::WRITERS {
-            assert!(accounted(w), "words::WRITERS `{w}` not accounted for");
+            if matches!(w, "cp" | "mv" | "rsync") {
+                assert!(
+                    matches!(
+                        lookup(w).map(|t| t.kind),
+                        Some(ToolRowKind::DerivedDestinationWriter(_))
+                    ),
+                    "words::WRITERS `{w}` must be DerivedDestinationWriter"
+                );
+            } else {
+                assert!(
+                    lookup_unknown_by_design(w).is_some(),
+                    "words::WRITERS `{w}` must be in UNKNOWN_BY_DESIGN"
+                );
+            }
         }
         for &r in words::READERS {
-            assert!(accounted(r), "words::READERS `{r}` not accounted for");
+            if matches!(r, "pushd" | "popd") {
+                assert!(
+                    lookup_outside_model(r).is_some(),
+                    "words::READERS `{r}` must be in OUTSIDE_MODEL"
+                );
+            } else if let Some(t) = lookup(r) {
+                assert!(
+                    matches!(
+                        t.kind,
+                        ToolRowKind::HomeReadOnly(_)
+                            | ToolRowKind::Search(_)
+                            | ToolRowKind::CodeRunner(_)
+                            | ToolRowKind::ConditionalRunner(_)
+                    ),
+                    "words::READERS `{r}` has unexpected kind {:?}",
+                    t.kind.label()
+                );
+            } else {
+                assert!(
+                    lookup_unknown_by_design(r).is_some(),
+                    "words::READERS `{r}` must be in TOOLS or UNKNOWN_BY_DESIGN"
+                );
+            }
         }
         for &d in deny::DOWNLOADERS {
             assert!(
@@ -3853,7 +3921,38 @@ mod tests {
             );
         }
         for &p in deny::PRIV {
-            assert!(accounted(p), "deny::PRIV `{p}` not accounted for");
+            if p == "su" {
+                assert!(
+                    matches!(lookup(p).map(|t| t.kind), Some(ToolRowKind::CodeRunner(_))),
+                    "deny::PRIV `su` must be CodeRunner"
+                );
+            } else {
+                assert!(
+                    lookup_unknown_by_design(p).is_some(),
+                    "deny::PRIV `{p}` must be in UNKNOWN_BY_DESIGN"
+                );
+            }
+        }
+        // Two-way check: no stale UNKNOWN_BY_DESIGN entries outside dev's lists.
+        for e in UNKNOWN_BY_DESIGN {
+            let in_dev = words::WRITERS.contains(&e.name)
+                || words::READERS.contains(&e.name)
+                || deny::DOWNLOADERS.contains(&e.name)
+                || deny::PRIV.contains(&e.name);
+            assert!(
+                in_dev,
+                "UNKNOWN_BY_DESIGN `{}` is not in any dev list",
+                e.name
+            );
+        }
+        // Verify grep siblings share GREP_FLAGS.
+        for name in ["egrep", "fgrep", "zgrep", "ggrep", "rgrep"] {
+            let t = lookup(name).unwrap();
+            assert!(
+                matches!(t.kind, ToolRowKind::Search(_)),
+                "`{name}` must be Search"
+            );
+            assert_eq!(t.flags(), GREP_FLAGS);
         }
 
         // 7. engine.rs GIT_CRED_* parity
@@ -4047,18 +4146,42 @@ mod tests {
         assert!(is_forbidden_flag(GIT_FORBIDDEN, "--out=patch.diff"));
         assert!(is_forbidden_flag(GIT_FORBIDDEN, "--o=x"));
         assert!(is_forbidden_flag(GIT_FORBIDDEN, "-xc"));
+        assert!(is_forbidden_flag(&["-o"], "-o"));
+        assert!(!is_forbidden_flag(GIT_FORBIDDEN, "--=x"));
+        assert!(!is_forbidden_flag(GIT_FORBIDDEN, "-"));
         assert!(!is_forbidden_flag(GIT_FORBIDDEN, "--no-index"));
         assert!(!is_forbidden_flag(GIT_FORBIDDEN, "--"));
 
+        // HomeReadOnly / ConditionalRunner / DerivedDestinationWriter carry no FlagSpec tables.
+        for t in TOOLS {
+            if matches!(
+                t.kind,
+                ToolRowKind::HomeReadOnly(_)
+                    | ToolRowKind::CodeRunner(_)
+                    | ToolRowKind::ConditionalRunner(_)
+                    | ToolRowKind::DerivedDestinationWriter(_)
+            ) {
+                assert!(
+                    t.flags().is_empty(),
+                    "`{}` ({}) must have no FlagSpec table",
+                    t.name,
+                    t.kind.label()
+                );
+            }
+        }
+
         // `git diff` is HomeReadOnly with no operand relaxations (resolves round 4 finding 1).
         let git = lookup("git").unwrap();
+        let git_diff = subcommand(git, "diff").unwrap();
         assert!(matches!(
-            subcommand(git, "diff").unwrap().kind,
+            git_diff.kind,
             SubcommandKind::HomeReadOnly(HomeReadOnlyRow {
                 git_selects_by_name: true,
                 ..
             })
         ));
+        assert!(!git_diff.code_runner_no_pin());
+        assert_eq!(git_diff.changes_default, Some("§11 item 10"));
 
         // 2. Search: rg filter case toggle ordering (Rule E) & grep -r/-R link toggle ordering
         let rg = lookup("rg").unwrap();
@@ -4091,7 +4214,15 @@ mod tests {
                 case: FilterCase::AlwaysInsensitive,
             })
         );
-        for tok in ["-t", "-T", "-d", "--maxdepth", "--max-filesize", "--type-add", "--type-clear"] {
+        for tok in [
+            "-t",
+            "-T",
+            "-d",
+            "--maxdepth",
+            "--max-filesize",
+            "--type-add",
+            "--type-clear",
+        ] {
             assert_eq!(
                 flag_for_tool(rg, tok).unwrap().effects().unread,
                 Some(FlagUnread::FilterForm),
@@ -4162,7 +4293,10 @@ mod tests {
             assert!(matches!(t.kind, ToolRowKind::ConditionalRunner(_)));
         }
         if let ToolRowKind::ConditionalRunner(sed) = lookup("sed").unwrap().kind {
-            assert!(sed.triggers.contains(&RunnerTrigger::ScriptCommands(&['e', 'w', 'r'])));
+            assert!(
+                sed.triggers
+                    .contains(&RunnerTrigger::ScriptCommands(&['e', 'w', 'r']))
+            );
             assert!(sed.triggers.contains(&RunnerTrigger::ProgramFileFlag {
                 flag: "-f",
                 pin: ProgramPin::FlagValue,
@@ -4177,8 +4311,16 @@ mod tests {
             for f in ["-c", "--config-env", "--exec-path"] {
                 assert!(git_r.triggers.contains(&RunnerTrigger::Flag(f)));
             }
-            assert!(git_r.triggers.contains(&RunnerTrigger::Subcommand("merge-index")));
-            assert!(git_r.triggers.contains(&RunnerTrigger::Subcommand("filter-branch")));
+            assert!(
+                git_r
+                    .triggers
+                    .contains(&RunnerTrigger::Subcommand("merge-index"))
+            );
+            assert!(
+                git_r
+                    .triggers
+                    .contains(&RunnerTrigger::Subcommand("filter-branch"))
+            );
             assert!(git_r.triggers.contains(&RunnerTrigger::SubcommandWithFlag {
                 subcommand: "diff",
                 flag: "--ext-diff",
@@ -4208,7 +4350,7 @@ mod tests {
             lookup("tar").unwrap().kind,
             ToolRowKind::DerivedDestinationWriter(DerivedDestinationWriterRow {
                 trigger: DerivedDestinationTrigger::Flags(fs),
-            }) if fs.contains(&"-x") && fs.contains(&"--extract")
+            }) if fs.contains(&"-x") && fs.contains(&"--extract") && fs.contains(&"--get")
         ));
         assert!(matches!(
             lookup("unzip").unwrap().kind,
@@ -4226,8 +4368,13 @@ mod tests {
         }
 
         // 6. Removed tools are unknown by design
-        for removed in ["patch", "codesign", "ag", "ack", "rm", "ln", "sort", "curl", "sudo"] {
-            assert!(lookup(removed).is_none(), "`{removed}` must not be in TOOLS");
+        for removed in [
+            "patch", "codesign", "ag", "ack", "rm", "ln", "sort", "curl", "sudo",
+        ] {
+            assert!(
+                lookup(removed).is_none(),
+                "`{removed}` must not be in TOOLS"
+            );
             assert!(
                 lookup_outside_model(removed).is_none(),
                 "`{removed}` must not be in OUTSIDE_MODEL"
