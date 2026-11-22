@@ -542,6 +542,15 @@ pub(crate) enum UnreadReason {
     Program { program_words: Vec<String> },
     /// A known tool invoked with a flag absent from §6's table (contract §6).
     UnknownFlag { tool: String, flag: String },
+    /// A tool flag changes the base directory or path prefix for resolving
+    /// later operands (`tar -C`/`--directory`, `git -C`/`--git-dir`/
+    /// `--work-tree`/`--super-prefix`), which the table does not resolve
+    /// per-operand (contract §5, §6).
+    UnsupportedBaseDirChange { tool: String, flag: String },
+    /// A known tool flag has a real effect intentionally left outside the
+    /// model (`ag -z`/`--search-zip`, `ack -x`, `printf -v`,
+    /// `grep -d`/`--directories`) (contract §3, §5, §6).
+    UnsupportedFlagEffect { tool: String, flag: String },
     /// A tool or subcommand explicitly left outside the model in §6's table
     /// (`OUTSIDE_MODEL` or unsupported subcommand) (contract §6).
     OutsideToolModel { tool: String },
@@ -927,11 +936,17 @@ pub(crate) enum TargetOrigin {
     },
 }
 
-/// Whether a [`Target`] is read or written (contract §5).
+/// Whether a [`Target`] is read, written, or conservatively checked for both
+/// (contract §5, §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AccessMode {
     Read,
     Write,
+    /// Conservative candidate path checked for **both** read and write
+    /// protections (including `atrium-self` write-protected paths): used for
+    /// unlisted flags under `FlagMode::AnyExceptForbidden`, unknown tools
+    /// (§4), and unclassified words after an `UnknownFlag` fallback.
+    ReadWrite,
 }
 
 /// Resolution result for one [`Target`] (contract §5).
