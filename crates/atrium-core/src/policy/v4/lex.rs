@@ -98,6 +98,112 @@ fn is_reserved_word(s: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Shared budgeted collection growth helpers (§8)
+// ---------------------------------------------------------------------------
+
+/// Charges capacity growth (both allocation bytes for the new capacity delta
+/// and compute units for copying existing elements on reallocation) before
+/// reserving space in `v` using geometric growth.
+#[inline]
+pub(super) fn charge_vec_growth<T>(
+    v: &mut Vec<T>,
+    additional: usize,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    if budget.is_exhausted() {
+        return budget.charge(0);
+    }
+    let needed = v.len().saturating_add(additional);
+    if needed > v.capacity() {
+        let old_cap = v.capacity();
+        let elem_size = std::mem::size_of::<T>();
+        if elem_size == 0 {
+            return Ok(());
+        }
+        let min_cap = if elem_size == 1 { 8 } else { 4 };
+        let target_cap = old_cap.saturating_mul(2).max(needed).max(min_cap);
+        let delta_elems = target_cap.saturating_sub(old_cap);
+        let delta_bytes = delta_elems.saturating_mul(elem_size);
+        if old_cap > 0 {
+            budget.charge(old_cap as u64)?;
+        }
+        budget.charge_alloc(delta_bytes)?;
+        v.reserve_exact(target_cap - v.len());
+    }
+    Ok(())
+}
+
+/// Pushes `val` into `v`, charging any capacity growth before allocating.
+#[inline]
+pub(super) fn vec_push_budgeted<T>(
+    v: &mut Vec<T>,
+    val: T,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    charge_vec_growth(v, 1, budget)?;
+    v.push(val);
+    Ok(())
+}
+
+/// Extends `v` with items from `items`, charging capacity growth before
+/// allocating.
+#[inline]
+pub(super) fn vec_extend_budgeted<T>(
+    v: &mut Vec<T>,
+    items: Vec<T>,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    if !items.is_empty() {
+        charge_vec_growth(v, items.len(), budget)?;
+        v.extend(items);
+    }
+    Ok(())
+}
+
+/// Allocates a `Vec<T>` with exact capacity `cap`, charging its backing buffer
+/// before allocating.
+#[inline]
+pub(super) fn vec_with_capacity_budgeted<T>(
+    cap: usize,
+    budget: &mut ComputeBudget,
+) -> Result<Vec<T>, Exhausted> {
+    if budget.is_exhausted() {
+        budget.charge(0)?;
+    }
+    if cap == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes = cap.saturating_mul(std::mem::size_of::<T>());
+    budget.charge_alloc(bytes)?;
+    Ok(Vec::with_capacity(cap))
+}
+
+/// Charges `String` capacity growth (allocation delta + copy work on realloc)
+/// before reserving space using geometric growth.
+#[inline]
+pub(super) fn charge_string_growth(
+    s: &mut String,
+    additional: usize,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    if budget.is_exhausted() {
+        return budget.charge(0);
+    }
+    let needed = s.len().saturating_add(additional);
+    if needed > s.capacity() {
+        let old_cap = s.capacity();
+        let target_cap = old_cap.saturating_mul(2).max(needed).max(8);
+        let delta_bytes = target_cap.saturating_sub(old_cap);
+        if old_cap > 0 {
+            budget.charge(old_cap as u64)?;
+        }
+        budget.charge_alloc(delta_bytes)?;
+        s.reserve_exact(target_cap - s.len());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Budgeted exact scanner (§3, §8)
 // ---------------------------------------------------------------------------
 
@@ -172,29 +278,26 @@ impl<'a, 'b> ExactScanner<'a, 'b> {
 
     #[inline]
     fn charge_word_meta(&mut self) -> Result<(), Exhausted> {
-        self.budget.charge(1)?;
-        self.budget.charge_alloc(std::mem::size_of::<Word>())
+        self.budget.charge(1)
     }
 
     #[inline]
     fn charge_unit_meta(&mut self) -> Result<(), Exhausted> {
-        self.budget.charge(1)?;
-        self.budget
-            .charge_alloc(std::mem::size_of::<RawCommandUnit>())
+        self.budget.charge(1)
     }
 
     #[inline]
     fn charge_redirect_meta(&mut self) -> Result<(), Exhausted> {
-        self.budget.charge(1)?;
-        self.budget
-            .charge_alloc(std::mem::size_of::<ModelRedirect>())
+        self.budget.charge(1)
     }
 
     #[inline]
     fn charge_unread_meta(&mut self, extra_bytes: usize) -> Result<(), Exhausted> {
         self.budget.charge(1)?;
-        self.budget
-            .charge_alloc(std::mem::size_of::<PartResult>() + extra_bytes)
+        if extra_bytes > 0 {
+            self.budget.charge_alloc(extra_bytes)?;
+        }
+        Ok(())
     }
 
     /// Consumes a single UTF-8 scalar value starting at `self.pos` (already
@@ -268,6 +371,14 @@ struct ReadWordOutcome {
     /// True iff the token consisted purely of unquoted ASCII digits (no
     /// quotes, no escapes, non-empty).
     all_unquoted_digits: bool,
+    /// True iff any quote (`'`, `"`) or escape (`\`) occurred anywhere in this
+    /// token, even if the quoted span emitted zero bytes (e.g. `''if`, `if""`).
+    contained_quoting: bool,
+    /// True iff the token is a leading shell assignment (`NAME=value` or
+    /// `NAME+=value`) where the entire prefix through the first unquoted `=`
+    /// contained zero quoting or escaping (so `''FOO=1` and `FOO''=1` are not
+    /// assignments, while `FOO=''` and `FOO="bar"` are).
+    is_unquoted_assignment: bool,
     /// True iff the token was a single standalone unquoted `{`, `}`, `!`, or
     /// `[[` (reserved words that contain bytes outside the allowed set).
     standalone_reserved: Option<&'static str>,
@@ -284,7 +395,175 @@ fn push_unread(
         _ => 0,
     };
     scanner.charge_unread_meta(extra)?;
-    unreads.push(reason);
+    vec_push_budgeted(unreads, reason, scanner.budget)
+}
+
+fn push_unread_construct(
+    scanner: &mut ExactScanner<'_, '_>,
+    unreads: &mut Vec<UnreadReason>,
+    construct: &str,
+) -> Result<(), Exhausted> {
+    scanner.charge_unread_meta(construct.len())?;
+    charge_vec_growth(unreads, 1, scanner.budget)?;
+    unreads.push(UnreadReason::ReservedWordOrConstruct {
+        construct: construct.to_string(),
+    });
+    Ok(())
+}
+
+fn push_unread_redirect_op(
+    scanner: &mut ExactScanner<'_, '_>,
+    unreads: &mut Vec<UnreadReason>,
+    op: &str,
+) -> Result<(), Exhausted> {
+    scanner.charge_unread_meta(op.len())?;
+    charge_vec_growth(unreads, 1, scanner.budget)?;
+    unreads.push(UnreadReason::UnsupportedRedirect { op: op.to_string() });
+    Ok(())
+}
+
+/// Scans `'...'` (with opening `'` at `scanner.peek()`), preserving
+/// `ByteProvenance::SingleQuoted`. When `class_len` is `Some`, also enforces
+/// §3's no-`!`/no-`^` rule inside glob classes and tracks class byte count.
+fn scan_single_quoted(
+    scanner: &mut ExactScanner<'_, '_>,
+    word: &mut Word,
+    unreads: &mut Vec<UnreadReason>,
+    mut class_len: Option<&mut usize>,
+) -> Result<(), Exhausted> {
+    scanner.next_byte()?;
+    let mut closed = false;
+    while let Some(c) = scanner.next_byte()? {
+        if c == b'\'' {
+            closed = true;
+            break;
+        }
+        if let Some(ref mut clen) = class_len {
+            if matches!(c, b'!' | b'^') {
+                push_unread(scanner, unreads, UnreadReason::NegatedGlobClass)?;
+            }
+            **clen += 1;
+        }
+        scanner.push_word_byte(word, c, ByteProvenance::SingleQuoted)?;
+    }
+    if !closed {
+        push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
+    }
+    Ok(())
+}
+
+/// Scans `"..."` (with opening `"` at `scanner.peek()`), preserving
+/// `ByteProvenance::DoubleQuoted` / `ByteProvenance::Escaped`. When `class_len`
+/// is `Some`, also enforces §3's no-`!`/no-`^` rule inside glob classes and
+/// tracks class byte count.
+fn scan_double_quoted(
+    scanner: &mut ExactScanner<'_, '_>,
+    word: &mut Word,
+    unreads: &mut Vec<UnreadReason>,
+    mut class_len: Option<&mut usize>,
+) -> Result<(), Exhausted> {
+    scanner.next_byte()?;
+    let mut closed = false;
+    while let Some(c) = scanner.next_byte()? {
+        match c {
+            b'"' => {
+                closed = true;
+                break;
+            }
+            b'$' | b'`' | b'!' => {
+                push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
+                if let Some(ref mut clen) = class_len {
+                    if c == b'!' {
+                        push_unread(scanner, unreads, UnreadReason::NegatedGlobClass)?;
+                    }
+                    **clen += 1;
+                }
+                scanner.push_word_byte(word, c, ByteProvenance::DoubleQuoted)?;
+            }
+            b'\\' => match scanner.next_byte()? {
+                Some(esc @ (b'"' | b'\\')) => {
+                    if let Some(ref mut clen) = class_len {
+                        **clen += 1;
+                    }
+                    scanner.push_word_byte(word, esc, ByteProvenance::Escaped)?;
+                }
+                Some(other) => {
+                    push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
+                    if let Some(ref mut clen) = class_len {
+                        if matches!(other, b'!' | b'^') {
+                            push_unread(scanner, unreads, UnreadReason::NegatedGlobClass)?;
+                        }
+                        **clen += 2;
+                    }
+                    scanner.push_word_byte(word, b'\\', ByteProvenance::DoubleQuoted)?;
+                    scanner.push_word_byte(word, other, ByteProvenance::DoubleQuoted)?;
+                }
+                None => {
+                    push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
+                    break;
+                }
+            },
+            other => {
+                if let Some(ref mut clen) = class_len {
+                    if other == b'^' {
+                        push_unread(scanner, unreads, UnreadReason::NegatedGlobClass)?;
+                    }
+                    **clen += 1;
+                }
+                scanner.push_word_byte(word, other, ByteProvenance::DoubleQuoted)?;
+            }
+        }
+    }
+    if !closed {
+        push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
+    }
+    Ok(())
+}
+
+/// Scans an outside-quotes backslash escape (`\` at `scanner.peek()`),
+/// preserving `ByteProvenance::Escaped`. When `class_len` is `Some`, also
+/// tracks class byte count and `!`/`^` inside glob classes.
+fn scan_unquoted_escape(
+    scanner: &mut ExactScanner<'_, '_>,
+    word: &mut Word,
+    unreads: &mut Vec<UnreadReason>,
+    class_len: Option<&mut usize>,
+) -> Result<(), Exhausted> {
+    scanner.next_byte()?;
+    match scanner.peek() {
+        Some(next) if is_escapable_outside_quotes(next) => {
+            scanner.next_byte()?;
+            if let Some(clen) = class_len {
+                *clen += 1;
+            }
+            scanner.push_word_byte(word, next, ByteProvenance::Escaped)?;
+        }
+        Some(b'\n') => {
+            scanner.next_byte()?;
+            push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
+        }
+        Some(next) if next >= 0x80 => {
+            push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
+            if let Some(clen) = class_len {
+                *clen += 1;
+            }
+            scanner.consume_utf8_char_into(word, ByteProvenance::Escaped)?;
+        }
+        Some(next) => {
+            scanner.next_byte()?;
+            push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
+            if let Some(clen) = class_len {
+                if matches!(next, b'!' | b'^') {
+                    push_unread(scanner, unreads, UnreadReason::NegatedGlobClass)?;
+                }
+                *clen += 1;
+            }
+            scanner.push_word_byte(word, next, ByteProvenance::Escaped)?;
+        }
+        None => {
+            push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
+        }
+    }
     Ok(())
 }
 
@@ -312,6 +591,8 @@ fn read_word(
             return Ok(ReadWordOutcome {
                 word,
                 all_unquoted_digits: false,
+                contained_quoting: false,
+                is_unquoted_assignment: false,
                 standalone_reserved: Some(kw),
             });
         }
@@ -322,6 +603,8 @@ fn read_word(
             return Ok(ReadWordOutcome {
                 word,
                 all_unquoted_digits: false,
+                contained_quoting: false,
+                is_unquoted_assignment: false,
                 standalone_reserved: Some("!"),
             });
         }
@@ -337,6 +620,8 @@ fn read_word(
             return Ok(ReadWordOutcome {
                 word,
                 all_unquoted_digits: false,
+                contained_quoting: false,
+                is_unquoted_assignment: false,
                 standalone_reserved: Some("[["),
             });
         }
@@ -345,6 +630,9 @@ fn read_word(
     let mut word = Word::new();
     let mut started = false;
     let mut all_unquoted_digits = true;
+    let mut contained_quoting = false;
+    let mut seen_first_unquoted_eq = false;
+    let mut is_unquoted_assignment = false;
 
     while let Some(b) = scanner.peek() {
         if is_word_boundary(b) {
@@ -355,78 +643,16 @@ fn read_word(
                 // Single quotes: any bytes until matching `'`.
                 started = true;
                 all_unquoted_digits = false;
-                scanner.next_byte()?;
-                let mut closed = false;
-                while let Some(c) = scanner.next_byte()? {
-                    if c == b'\'' {
-                        closed = true;
-                        break;
-                    }
-                    scanner.push_word_byte(&mut word, c, ByteProvenance::SingleQuoted)?;
-                }
-                if !closed {
-                    push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
-                }
+                contained_quoting = true;
+                scan_single_quoted(scanner, &mut word, unreads, None)?;
             }
             b'"' => {
                 // Double quotes: any bytes except `$`, backtick, `!`;
                 // `\` allowed ONLY in `\"` and `\\`.
                 started = true;
                 all_unquoted_digits = false;
-                scanner.next_byte()?;
-                let mut closed = false;
-                while let Some(c) = scanner.next_byte()? {
-                    match c {
-                        b'"' => {
-                            closed = true;
-                            break;
-                        }
-                        b'$' | b'`' | b'!' => {
-                            push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
-                            scanner.push_word_byte(&mut word, c, ByteProvenance::DoubleQuoted)?;
-                        }
-                        b'\\' => match scanner.next_byte()? {
-                            Some(esc @ (b'"' | b'\\')) => {
-                                scanner.push_word_byte(&mut word, esc, ByteProvenance::Escaped)?;
-                            }
-                            Some(other) => {
-                                push_unread(
-                                    scanner,
-                                    unreads,
-                                    UnreadReason::UnsupportedQuoteOrEscape,
-                                )?;
-                                scanner.push_word_byte(
-                                    &mut word,
-                                    b'\\',
-                                    ByteProvenance::DoubleQuoted,
-                                )?;
-                                scanner.push_word_byte(
-                                    &mut word,
-                                    other,
-                                    ByteProvenance::DoubleQuoted,
-                                )?;
-                            }
-                            None => {
-                                push_unread(
-                                    scanner,
-                                    unreads,
-                                    UnreadReason::UnsupportedQuoteOrEscape,
-                                )?;
-                                break;
-                            }
-                        },
-                        other => {
-                            scanner.push_word_byte(
-                                &mut word,
-                                other,
-                                ByteProvenance::DoubleQuoted,
-                            )?;
-                        }
-                    }
-                }
-                if !closed {
-                    push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
-                }
+                contained_quoting = true;
+                scan_double_quoted(scanner, &mut word, unreads, None)?;
             }
             b'\\' => {
                 // Outside quotes: backslash allowed ONLY before allowed
@@ -434,29 +660,8 @@ fn read_word(
                 // Backslash-newline is outside the model.
                 started = true;
                 all_unquoted_digits = false;
-                scanner.next_byte()?;
-                match scanner.peek() {
-                    Some(next) if is_escapable_outside_quotes(next) => {
-                        scanner.next_byte()?;
-                        scanner.push_word_byte(&mut word, next, ByteProvenance::Escaped)?;
-                    }
-                    Some(b'\n') => {
-                        scanner.next_byte()?;
-                        push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
-                    }
-                    Some(next) if next >= 0x80 => {
-                        push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
-                        scanner.consume_utf8_char_into(&mut word, ByteProvenance::Escaped)?;
-                    }
-                    Some(next) => {
-                        scanner.next_byte()?;
-                        push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
-                        scanner.push_word_byte(&mut word, next, ByteProvenance::Escaped)?;
-                    }
-                    None => {
-                        push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
-                    }
-                }
+                contained_quoting = true;
+                scan_unquoted_escape(scanner, &mut word, unreads, None)?;
             }
             b'~' => {
                 let at_word_start = !started;
@@ -492,6 +697,15 @@ fn read_word(
                         unreads,
                         UnreadReason::UnquotedByteOutsideModel { byte: b'=' },
                     )?;
+                } else if !seen_first_unquoted_eq {
+                    seen_first_unquoted_eq = true;
+                    if !contained_quoting {
+                        let prefix = word.literal_bytes();
+                        let name = prefix.strip_suffix(b"+").unwrap_or(prefix);
+                        if !prefix.is_empty() && is_posix_name(name) {
+                            is_unquoted_assignment = true;
+                        }
+                    }
                 }
                 scanner.push_word_byte(&mut word, b'=', ByteProvenance::Unquoted)?;
             }
@@ -503,7 +717,8 @@ fn read_word(
             }
             b'[' => {
                 // Glob character class `[...]`: no `!` or `^` inside, must be
-                // non-empty and closed, only allowed ASCII/glob chars inside.
+                // non-empty and closed, permits §3 quotes and escapes while
+                // retaining class state and byte provenance.
                 started = true;
                 all_unquoted_digits = false;
                 scanner.next_byte()?;
@@ -534,11 +749,22 @@ fn read_word(
                             scanner.push_word_byte(&mut word, cb, ByteProvenance::Unquoted)?;
                             class_len += 1;
                         }
-                        b'\'' | b'"' | b'\\' => {
-                            push_unread(scanner, unreads, UnreadReason::UnsupportedQuoteOrEscape)?;
-                            // Hand back to outer word loop so quotes stay in sync.
-                            found_close = true;
-                            break;
+                        b'\'' => {
+                            contained_quoting = true;
+                            scan_single_quoted(scanner, &mut word, unreads, Some(&mut class_len))?;
+                        }
+                        b'"' => {
+                            contained_quoting = true;
+                            scan_double_quoted(scanner, &mut word, unreads, Some(&mut class_len))?;
+                        }
+                        b'\\' => {
+                            contained_quoting = true;
+                            scan_unquoted_escape(
+                                scanner,
+                                &mut word,
+                                unreads,
+                                Some(&mut class_len),
+                            )?;
                         }
                         c if (is_allowed_unquoted_base(c) && c != b'/')
                             || matches!(c, b'=' | b'*' | b'?') =>
@@ -619,6 +845,8 @@ fn read_word(
     Ok(ReadWordOutcome {
         word,
         all_unquoted_digits: is_digits,
+        contained_quoting,
+        is_unquoted_assignment,
         standalone_reserved: None,
     })
 }
@@ -645,11 +873,7 @@ fn lex_exact_redirect(
             let _ = read_word(scanner, &mut cur.unreads, false)?;
         } else {
             let op = if len == 3 { "&>>" } else { "&>" };
-            push_unread(
-                scanner,
-                &mut cur.unreads,
-                UnreadReason::UnsupportedRedirect { op: op.to_string() },
-            )?;
+            push_unread_redirect_op(scanner, &mut cur.unreads, op)?;
         }
         return Ok(());
     }
@@ -657,13 +881,7 @@ fn lex_exact_redirect(
     // Here-string `<<<`.
     if c0 == b'<' && c1 == Some(b'<') && c2 == Some(b'<') {
         scanner.advance_n(3)?;
-        push_unread(
-            scanner,
-            &mut cur.unreads,
-            UnreadReason::ReservedWordOrConstruct {
-                construct: "<<<".to_string(),
-            },
-        )?;
+        push_unread_construct(scanner, &mut cur.unreads, "<<<")?;
         if let Some((fd, _)) = explicit_fd
             && fd > 2
         {
@@ -684,16 +902,10 @@ fn lex_exact_redirect(
     if c0 == b'<' && c1 == Some(b'<') {
         let strip_tabs = c2 == Some(b'-');
         scanner.advance_n(if strip_tabs { 3 } else { 2 })?;
-        push_unread(
+        push_unread_construct(
             scanner,
             &mut cur.unreads,
-            UnreadReason::ReservedWordOrConstruct {
-                construct: if strip_tabs {
-                    "<<-".to_string()
-                } else {
-                    "<<".to_string()
-                },
-            },
+            if strip_tabs { "<<-" } else { "<<" },
         )?;
         if let Some((fd, _)) = explicit_fd
             && fd > 2
@@ -718,8 +930,7 @@ fn lex_exact_redirect(
                             break;
                         }
                         scanner.budget.charge(1)?;
-                        scanner.budget.charge_alloc(1)?;
-                        delim.push(c);
+                        vec_push_budgeted(&mut delim, c, scanner.budget)?;
                     }
                 }
                 b'"' => {
@@ -732,12 +943,10 @@ fn lex_exact_redirect(
                             && let Some(esc) = scanner.next_byte()?
                         {
                             scanner.budget.charge(1)?;
-                            scanner.budget.charge_alloc(1)?;
-                            delim.push(esc);
+                            vec_push_budgeted(&mut delim, esc, scanner.budget)?;
                         } else {
                             scanner.budget.charge(1)?;
-                            scanner.budget.charge_alloc(1)?;
-                            delim.push(c);
+                            vec_push_budgeted(&mut delim, c, scanner.budget)?;
                         }
                     }
                 }
@@ -745,23 +954,18 @@ fn lex_exact_redirect(
                     scanner.next_byte()?;
                     if let Some(esc) = scanner.next_byte()? {
                         scanner.budget.charge(1)?;
-                        scanner.budget.charge_alloc(1)?;
-                        delim.push(esc);
+                        vec_push_budgeted(&mut delim, esc, scanner.budget)?;
                     }
                 }
                 _ => {
                     scanner.next_byte()?;
                     scanner.budget.charge(1)?;
-                    scanner.budget.charge_alloc(1)?;
-                    delim.push(b);
+                    vec_push_budgeted(&mut delim, b, scanner.budget)?;
                 }
             }
         }
         if !delim.is_empty() {
-            scanner
-                .budget
-                .charge_alloc(std::mem::size_of::<(Vec<u8>, bool)>())?;
-            heredocs.push((delim, strip_tabs));
+            vec_push_budgeted(heredocs, (delim, strip_tabs), scanner.budget)?;
         }
         return Ok(());
     }
@@ -769,16 +973,10 @@ fn lex_exact_redirect(
     // Process substitution `<(` / `>(`.
     if matches!(c0, b'<' | b'>') && c1 == Some(b'(') {
         scanner.advance_n(2)?;
-        push_unread(
+        push_unread_construct(
             scanner,
             &mut cur.unreads,
-            UnreadReason::ReservedWordOrConstruct {
-                construct: if c0 == b'<' {
-                    "<(".to_string()
-                } else {
-                    ">(".to_string()
-                },
-            },
+            if c0 == b'<' { "<(" } else { ">(" },
         )?;
         return Ok(());
     }
@@ -837,13 +1035,7 @@ fn lex_exact_redirect(
 
     match op {
         Op::DupIn => {
-            push_unread(
-                scanner,
-                &mut cur.unreads,
-                UnreadReason::UnsupportedRedirect {
-                    op: "<&".to_string(),
-                },
-            )?;
+            push_unread_redirect_op(scanner, &mut cur.unreads, "<&")?;
             if let Some(ref t) = target_opt
                 && t.all_unquoted_digits
                 && let Some(m) = parse_u32_digits(t.word.literal_bytes())
@@ -857,34 +1049,16 @@ fn lex_exact_redirect(
             }
         }
         Op::ReadWrite | Op::Clobber => {
-            push_unread(
-                scanner,
-                &mut cur.unreads,
-                UnreadReason::UnsupportedRedirect {
-                    op: op_str.to_string(),
-                },
-            )?;
+            push_unread_redirect_op(scanner, &mut cur.unreads, op_str)?;
         }
         Op::DupOut => {
             let Some(target) = target_opt else {
-                push_unread(
-                    scanner,
-                    &mut cur.unreads,
-                    UnreadReason::UnsupportedRedirect {
-                        op: ">&".to_string(),
-                    },
-                )?;
+                push_unread_redirect_op(scanner, &mut cur.unreads, ">&")?;
                 return Ok(());
             };
             let Some((fd, digit_len)) = explicit_fd else {
                 // `>&2` / `>&-` / `>&file`: explicit `n` in 0..=2 required by §3's closed list.
-                push_unread(
-                    scanner,
-                    &mut cur.unreads,
-                    UnreadReason::UnsupportedRedirect {
-                        op: ">&".to_string(),
-                    },
-                )?;
+                push_unread_redirect_op(scanner, &mut cur.unreads, ">&")?;
                 if target.all_unquoted_digits
                     && let Some(m) = parse_u32_digits(target.word.literal_bytes())
                     && m > 2
@@ -898,13 +1072,7 @@ fn lex_exact_redirect(
                 return Ok(());
             };
             if digit_len != 1 {
-                push_unread(
-                    scanner,
-                    &mut cur.unreads,
-                    UnreadReason::UnsupportedRedirect {
-                        op: ">&".to_string(),
-                    },
-                )?;
+                push_unread_redirect_op(scanner, &mut cur.unreads, ">&")?;
                 return Ok(());
             }
             let Some(from) = StdFd::from_u8(fd as u8) else {
@@ -916,13 +1084,21 @@ fn lex_exact_redirect(
                 return Ok(());
             };
             let tb = target.word.literal_bytes();
-            if target.word.is_all_unquoted() && tb == b"-" {
+            if !target.contained_quoting && target.word.is_all_unquoted() && tb == b"-" {
                 scanner.charge_redirect_meta()?;
-                cur.redirects.push(ModelRedirect::Close { fd: from });
+                vec_push_budgeted(
+                    &mut cur.redirects,
+                    ModelRedirect::Close { fd: from },
+                    scanner.budget,
+                )?;
             } else if target.all_unquoted_digits && tb.len() == 1 && matches!(tb[0], b'0'..=b'2') {
                 let to = StdFd::from_u8(tb[0] - b'0').expect("0..=2");
                 scanner.charge_redirect_meta()?;
-                cur.redirects.push(ModelRedirect::Dup { from, to });
+                vec_push_budgeted(
+                    &mut cur.redirects,
+                    ModelRedirect::Dup { from, to },
+                    scanner.budget,
+                )?;
             } else if target.all_unquoted_digits {
                 if let Some(m) = parse_u32_digits(tb)
                     && m > 2
@@ -933,33 +1109,15 @@ fn lex_exact_redirect(
                         UnreadReason::DescriptorOutsideStd { fd: m },
                     )?;
                 } else {
-                    push_unread(
-                        scanner,
-                        &mut cur.unreads,
-                        UnreadReason::UnsupportedRedirect {
-                            op: ">&".to_string(),
-                        },
-                    )?;
+                    push_unread_redirect_op(scanner, &mut cur.unreads, ">&")?;
                 }
             } else {
-                push_unread(
-                    scanner,
-                    &mut cur.unreads,
-                    UnreadReason::UnsupportedRedirect {
-                        op: ">&".to_string(),
-                    },
-                )?;
+                push_unread_redirect_op(scanner, &mut cur.unreads, ">&")?;
             }
         }
         Op::Read | Op::Write | Op::Append => {
             let Some(target) = target_opt else {
-                push_unread(
-                    scanner,
-                    &mut cur.unreads,
-                    UnreadReason::UnsupportedRedirect {
-                        op: op_str.to_string(),
-                    },
-                )?;
+                push_unread_redirect_op(scanner, &mut cur.unreads, op_str)?;
                 return Ok(());
             };
             let model_redir = match (explicit_fd, op) {
@@ -984,28 +1142,27 @@ fn lex_exact_redirect(
                 Some(r) => {
                     if r.target().is_some_and(Word::has_unquoted_glob) {
                         // zsh expands globs in redirect targets (MULTIOS); not a literal target.
-                        push_unread(
-                            scanner,
-                            &mut cur.unreads,
-                            UnreadReason::UnsupportedRedirect {
-                                op: format!("{op_str} (glob target)"),
-                            },
-                        )?;
+                        let suffix = " (glob target)";
+                        scanner.charge_unread_meta(op_str.len() + suffix.len())?;
+                        charge_vec_growth(&mut cur.unreads, 1, scanner.budget)?;
+                        cur.unreads.push(UnreadReason::UnsupportedRedirect {
+                            op: format!("{op_str}{suffix}"),
+                        });
                     }
                     scanner.charge_redirect_meta()?;
-                    cur.redirects.push(r);
+                    vec_push_budgeted(&mut cur.redirects, r, scanner.budget)?;
                 }
-                None => {
-                    let op_label = match explicit_fd {
-                        Some((fd, _)) => format!("{fd}{op_str}"),
-                        None => op_str.to_string(),
-                    };
-                    push_unread(
-                        scanner,
-                        &mut cur.unreads,
-                        UnreadReason::UnsupportedRedirect { op: op_label },
-                    )?;
-                }
+                None => match explicit_fd {
+                    Some((fd, _)) => {
+                        let extra = 10 + op_str.len();
+                        scanner.charge_unread_meta(extra)?;
+                        charge_vec_growth(&mut cur.unreads, 1, scanner.budget)?;
+                        cur.unreads.push(UnreadReason::UnsupportedRedirect {
+                            op: format!("{fd}{op_str}"),
+                        });
+                    }
+                    None => push_unread_redirect_op(scanner, &mut cur.unreads, op_str)?,
+                },
             }
         }
     }
@@ -1100,8 +1257,12 @@ pub(crate) fn lex_exact(
                       out: &mut LexExactOutput,
                       scanner: &mut ExactScanner<'_, '_>|
      -> Result<(), Result<PartOutcome, Exhausted>> {
-        let finished = std::mem::replace(cur, PendingUnit::new(next_sep, next_pipe));
-        if finished.is_empty() {
+        if cur.is_empty() {
+            if !cur.unreads.is_empty() {
+                charge_vec_growth(&mut out.outcomes, cur.unreads.len(), scanner.budget)
+                    .map_err(Err)?;
+            }
+            let finished = std::mem::replace(cur, PendingUnit::new(next_sep, next_pipe));
             for r in finished.unreads {
                 out.outcomes.push(PartResult {
                     part: whole_part.clone(),
@@ -1113,9 +1274,23 @@ pub(crate) fn lex_exact(
         if out.units.len() >= limits::MAX_UNITS {
             return Err(Ok(PartOutcome::TooLarge(Cap::Units)));
         }
+        // Charge unit metadata, output vector growth, and redirect-only reason
+        // BEFORE moving `cur` so exhaustion preserves the pending unit's words
+        // and reasons (§8).
+        let redirect_only = cur.argv.is_empty() && !cur.redirects.is_empty();
         scanner.charge_unit_meta().map_err(Err)?;
+        charge_vec_growth(&mut out.units, 1, scanner.budget).map_err(Err)?;
+        let extra_outcomes = cur.unreads.len() + usize::from(redirect_only);
+        if extra_outcomes > 0 {
+            charge_vec_growth(&mut out.outcomes, extra_outcomes, scanner.budget).map_err(Err)?;
+        }
+        if redirect_only {
+            scanner
+                .charge_unread_meta("redirect-only command".len())
+                .map_err(Err)?;
+        }
+        let finished = std::mem::replace(cur, PendingUnit::new(next_sep, next_pipe));
         let idx = UnitIndex(out.units.len());
-        let redirect_only = finished.argv.is_empty() && !finished.redirects.is_empty();
         for r in finished.unreads {
             out.outcomes.push(PartResult {
                 part: PartId::Unit(idx),
@@ -1126,9 +1301,6 @@ pub(crate) fn lex_exact(
             // Redirect-only command (`> foo`, `< foo`) diverges in zsh
             // (NULLCMD / READNULLCMD). Keep the unit so its redirects are still
             // checked as literal paths, while marking it Unread.
-            scanner
-                .charge_unread_meta("redirect-only command".len())
-                .map_err(Err)?;
             out.outcomes.push(PartResult {
                 part: PartId::Unit(idx),
                 outcome: PartOutcome::Unread(UnreadReason::ReservedWordOrConstruct {
@@ -1156,14 +1328,7 @@ pub(crate) fn lex_exact(
                 }
                 b'#' => {
                     // Comment at token boundary: outside the model (§3).
-                    push_unread(
-                        &mut scanner,
-                        &mut cur.unreads,
-                        UnreadReason::ReservedWordOrConstruct {
-                            construct: "#".to_string(),
-                        },
-                    )
-                    .map_err(Err)?;
+                    push_unread_construct(&mut scanner, &mut cur.unreads, "#").map_err(Err)?;
                     while let Some(ch) = scanner.peek() {
                         if ch == b'\n' {
                             break;
@@ -1188,38 +1353,18 @@ pub(crate) fn lex_exact(
                 b';' => {
                     if scanner.peek_at(1) == Some(b';') {
                         scanner.advance_n(2).map_err(Err)?;
-                        push_unread(
-                            &mut scanner,
-                            &mut cur.unreads,
-                            UnreadReason::ReservedWordOrConstruct {
-                                construct: ";;".to_string(),
-                            },
-                        )
-                        .map_err(Err)?;
+                        push_unread_construct(&mut scanner, &mut cur.unreads, ";;").map_err(Err)?;
                     } else {
                         scanner.next_byte().map_err(Err)?;
                         if cur.is_empty() {
-                            push_unread(
-                                &mut scanner,
-                                &mut cur.unreads,
-                                UnreadReason::ReservedWordOrConstruct {
-                                    construct: ";".to_string(),
-                                },
-                            )
-                            .map_err(Err)?;
+                            push_unread_construct(&mut scanner, &mut cur.unreads, ";")
+                                .map_err(Err)?;
                         }
                     }
                     if let Some(op) = expecting_after_op.take()
                         && cur.is_empty()
                     {
-                        push_unread(
-                            &mut scanner,
-                            &mut cur.unreads,
-                            UnreadReason::ReservedWordOrConstruct {
-                                construct: op.to_string(),
-                            },
-                        )
-                        .map_err(Err)?;
+                        push_unread_construct(&mut scanner, &mut cur.unreads, op).map_err(Err)?;
                     }
                     active_pipe = None;
                     flush_unit(&mut cur, Separator::Semi, None, &mut out, &mut scanner)?;
@@ -1228,14 +1373,8 @@ pub(crate) fn lex_exact(
                     Some(b'&') => {
                         scanner.advance_n(2).map_err(Err)?;
                         if cur.is_empty() {
-                            push_unread(
-                                &mut scanner,
-                                &mut cur.unreads,
-                                UnreadReason::ReservedWordOrConstruct {
-                                    construct: "&&".to_string(),
-                                },
-                            )
-                            .map_err(Err)?;
+                            push_unread_construct(&mut scanner, &mut cur.unreads, "&&")
+                                .map_err(Err)?;
                         }
                         active_pipe = None;
                         expecting_after_op = Some("&&");
@@ -1248,14 +1387,7 @@ pub(crate) fn lex_exact(
                     }
                     _ => {
                         scanner.next_byte().map_err(Err)?;
-                        push_unread(
-                            &mut scanner,
-                            &mut cur.unreads,
-                            UnreadReason::ReservedWordOrConstruct {
-                                construct: "&".to_string(),
-                            },
-                        )
-                        .map_err(Err)?;
+                        push_unread_construct(&mut scanner, &mut cur.unreads, "&").map_err(Err)?;
                         active_pipe = None;
                         expecting_after_op = None;
                         flush_unit(&mut cur, Separator::Semi, None, &mut out, &mut scanner)?;
@@ -1265,14 +1397,8 @@ pub(crate) fn lex_exact(
                     Some(b'|') => {
                         scanner.advance_n(2).map_err(Err)?;
                         if cur.is_empty() {
-                            push_unread(
-                                &mut scanner,
-                                &mut cur.unreads,
-                                UnreadReason::ReservedWordOrConstruct {
-                                    construct: "||".to_string(),
-                                },
-                            )
-                            .map_err(Err)?;
+                            push_unread_construct(&mut scanner, &mut cur.unreads, "||")
+                                .map_err(Err)?;
                         }
                         active_pipe = None;
                         expecting_after_op = Some("||");
@@ -1280,14 +1406,7 @@ pub(crate) fn lex_exact(
                     }
                     Some(b'&') => {
                         scanner.advance_n(2).map_err(Err)?;
-                        push_unread(
-                            &mut scanner,
-                            &mut cur.unreads,
-                            UnreadReason::ReservedWordOrConstruct {
-                                construct: "|&".to_string(),
-                            },
-                        )
-                        .map_err(Err)?;
+                        push_unread_construct(&mut scanner, &mut cur.unreads, "|&").map_err(Err)?;
                         let pipe = if cur.is_empty() {
                             None
                         } else {
@@ -1305,14 +1424,8 @@ pub(crate) fn lex_exact(
                     _ => {
                         scanner.next_byte().map_err(Err)?;
                         let pipe = if cur.is_empty() {
-                            push_unread(
-                                &mut scanner,
-                                &mut cur.unreads,
-                                UnreadReason::ReservedWordOrConstruct {
-                                    construct: "|".to_string(),
-                                },
-                            )
-                            .map_err(Err)?;
+                            push_unread_construct(&mut scanner, &mut cur.unreads, "|")
+                                .map_err(Err)?;
                             None
                         } else {
                             let id = cur.pipeline_id.unwrap_or_else(|| {
@@ -1341,14 +1454,8 @@ pub(crate) fn lex_exact(
                         scanner.next_byte().map_err(Err)?;
                         if b == b'(' { "(" } else { ")" }
                     };
-                    push_unread(
-                        &mut scanner,
-                        &mut cur.unreads,
-                        UnreadReason::ReservedWordOrConstruct {
-                            construct: construct.to_string(),
-                        },
-                    )
-                    .map_err(Err)?;
+                    push_unread_construct(&mut scanner, &mut cur.unreads, construct)
+                        .map_err(Err)?;
                 }
                 b'<' | b'>' => {
                     expecting_after_op = None;
@@ -1378,42 +1485,31 @@ pub(crate) fn lex_exact(
                     }
 
                     if let Some(kw) = rw.standalone_reserved {
-                        push_unread(
-                            &mut scanner,
-                            &mut cur.unreads,
-                            UnreadReason::ReservedWordOrConstruct {
-                                construct: kw.to_string(),
-                            },
-                        )
-                        .map_err(Err)?;
+                        push_unread_construct(&mut scanner, &mut cur.unreads, kw).map_err(Err)?;
                         cur.seen_command_word = true;
-                        cur.argv.push(rw.word);
+                        vec_push_budgeted(&mut cur.argv, rw.word, scanner.budget).map_err(Err)?;
                         continue;
                     }
 
                     if !cur.seen_command_word {
-                        if leading_assignment_name(&rw.word).is_some() {
+                        if rw.is_unquoted_assignment {
                             push_unread(&mut scanner, &mut cur.unreads, UnreadReason::Assignment)
                                 .map_err(Err)?;
-                            cur.argv.push(rw.word);
+                            vec_push_budgeted(&mut cur.argv, rw.word, scanner.budget)
+                                .map_err(Err)?;
                             continue;
                         }
-                        if rw.word.is_all_unquoted()
+                        if !rw.contained_quoting
+                            && rw.word.is_all_unquoted()
                             && let Some(s) = rw.word.as_str()
                             && is_reserved_word(s)
                         {
-                            push_unread(
-                                &mut scanner,
-                                &mut cur.unreads,
-                                UnreadReason::ReservedWordOrConstruct {
-                                    construct: s.to_string(),
-                                },
-                            )
-                            .map_err(Err)?;
+                            push_unread_construct(&mut scanner, &mut cur.unreads, s)
+                                .map_err(Err)?;
                         }
                         cur.seen_command_word = true;
                     }
-                    cur.argv.push(rw.word);
+                    vec_push_budgeted(&mut cur.argv, rw.word, scanner.budget).map_err(Err)?;
                 }
             }
         }
@@ -1421,14 +1517,7 @@ pub(crate) fn lex_exact(
         if let Some(op) = expecting_after_op.take()
             && cur.is_empty()
         {
-            push_unread(
-                &mut scanner,
-                &mut cur.unreads,
-                UnreadReason::ReservedWordOrConstruct {
-                    construct: op.to_string(),
-                },
-            )
-            .map_err(Err)?;
+            push_unread_construct(&mut scanner, &mut cur.unreads, op).map_err(Err)?;
         }
         let _ = active_pipe;
         flush_unit(&mut cur, Separator::Start, None, &mut out, &mut scanner)?;
@@ -1443,10 +1532,19 @@ pub(crate) fn lex_exact(
             // (§8: nothing found before exhaustion is lost).
             if !cur.is_empty() && out.units.len() < limits::MAX_UNITS {
                 let idx = UnitIndex(out.units.len());
+                let redirect_only = cur.argv.is_empty() && !cur.redirects.is_empty();
                 for r in cur.unreads {
                     out.outcomes.push(PartResult {
                         part: PartId::Unit(idx),
                         outcome: PartOutcome::Unread(r),
+                    });
+                }
+                if redirect_only {
+                    out.outcomes.push(PartResult {
+                        part: PartId::Unit(idx),
+                        outcome: PartOutcome::Unread(UnreadReason::ReservedWordOrConstruct {
+                            construct: "redirect-only command".to_string(),
+                        }),
                     });
                 }
                 out.units.push(RawCommandUnit {
@@ -1526,60 +1624,93 @@ pub(super) fn fold_command_bytes(
         return Ok(out);
     }
 
-    // Unicode path: `char::to_lowercase()` + optional `ſ` (U+017F) -> `s` and
-    // `K` (U+212A) -> `k`, with NO Unicode normalization (NFC/NFD).
-    let mut out_len = 0usize;
+    // Unicode path: string-level `str::to_lowercase()` (preserving contextual
+    // rules such as Greek final sigma `ΟΣ` -> `ος`) plus optional `FoldRules`
+    // (`ſ` U+017F -> `s` and `K` U+212A -> `k`), with NO Unicode normalization
+    // (NFC/NFD).
+    let mut lower_total = 0usize;
+    let mut out_total = 0usize;
+    let mut needs_rewrite = false;
+    let mut has_invalid = false;
+
     for chunk in base.utf8_chunks() {
         for c in chunk.valid().chars() {
-            out_len += folded_char_len(c, folds);
+            let lc_len: usize = c.to_lowercase().map(char::len_utf8).sum();
+            lower_total = lower_total.saturating_add(lc_len);
+            if c == '\u{017f}' {
+                if folds.fold_long_s {
+                    needs_rewrite = true;
+                    out_total = out_total.saturating_add(1);
+                } else {
+                    out_total = out_total.saturating_add(c.len_utf8());
+                }
+            } else if c == '\u{212a}' {
+                if folds.fold_kelvin {
+                    // `str::to_lowercase()` already maps U+212A -> `k` (1 byte).
+                    out_total = out_total.saturating_add(1);
+                } else {
+                    needs_rewrite = true;
+                    out_total = out_total.saturating_add(c.len_utf8());
+                }
+            } else {
+                out_total = out_total.saturating_add(lc_len);
+            }
         }
         if !chunk.invalid().is_empty() {
-            out_len += chunk.invalid().len() * char::REPLACEMENT_CHARACTER.len_utf8();
+            has_invalid = true;
+            out_total = out_total.saturating_add(
+                chunk
+                    .invalid()
+                    .len()
+                    .saturating_mul(char::REPLACEMENT_CHARACTER.len_utf8()),
+            );
         }
     }
-    budget.charge(out_len as u64)?;
-    budget.charge_alloc(out_len)?;
 
-    let mut out = String::with_capacity(out_len);
+    // `str::to_lowercase()` starts at `valid.len()` and may double capacity up
+    // to `2 * lower_len` if characters expand (e.g. U+0130). Charge worst-case
+    // temporary allocation before calling it (§8).
+    let lower_alloc_est = lower_total.max(base.len()).saturating_mul(2);
+    if !has_invalid && !needs_rewrite {
+        budget.charge(lower_total.max(1) as u64)?;
+        budget.charge_alloc(lower_alloc_est)?;
+        let valid = std::str::from_utf8(base).expect("no invalid UTF-8 chunks");
+        return Ok(valid.to_lowercase());
+    }
+
+    budget.charge(lower_total.saturating_add(out_total).max(1) as u64)?;
+    budget.charge_alloc(lower_alloc_est.saturating_add(out_total))?;
+
+    let mut out = String::with_capacity(out_total);
     for chunk in base.utf8_chunks() {
-        for c in chunk.valid().chars() {
-            push_folded_char(&mut out, c, folds);
+        let valid = chunk.valid();
+        if !valid.is_empty() {
+            let lowered = valid.to_lowercase();
+            let mut lower_it = lowered.chars();
+            for orig in valid.chars() {
+                let count = orig.to_lowercase().count();
+                if orig == '\u{017f}' && folds.fold_long_s {
+                    for _ in 0..count {
+                        let _ = lower_it.next();
+                    }
+                    out.push('s');
+                } else if orig == '\u{212a}' && !folds.fold_kelvin {
+                    for _ in 0..count {
+                        let _ = lower_it.next();
+                    }
+                    out.push('\u{212a}');
+                } else {
+                    for _ in 0..count {
+                        if let Some(lc) = lower_it.next() {
+                            out.push(lc);
+                        }
+                    }
+                }
+            }
         }
         for _ in chunk.invalid() {
             out.push(char::REPLACEMENT_CHARACTER);
         }
     }
     Ok(out)
-}
-
-#[inline]
-fn folded_char_len(c: char, folds: &FoldRules) -> usize {
-    if c == '\u{017f}' {
-        if folds.fold_long_s { 1 } else { c.len_utf8() }
-    } else if c == '\u{212a}' {
-        if folds.fold_kelvin { 1 } else { c.len_utf8() }
-    } else {
-        c.to_lowercase().map(char::len_utf8).sum()
-    }
-}
-
-#[inline]
-fn push_folded_char(out: &mut String, c: char, folds: &FoldRules) {
-    if c == '\u{017f}' {
-        if folds.fold_long_s {
-            out.push('s');
-        } else {
-            out.push(c);
-        }
-    } else if c == '\u{212a}' {
-        if folds.fold_kelvin {
-            out.push('k');
-        } else {
-            out.push(c);
-        }
-    } else {
-        for lc in c.to_lowercase() {
-            out.push(lc);
-        }
-    }
 }
