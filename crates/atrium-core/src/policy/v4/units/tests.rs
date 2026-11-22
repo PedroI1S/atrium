@@ -572,6 +572,51 @@ fn build_units_code_runner_hook_attaches_p3_reasons() {
     )));
 }
 
+#[test]
+fn build_units_treats_d141_unknown_by_design_tools_as_unknown() {
+    // Tools D-141 moved out of `TOOLS` into `UNKNOWN_BY_DESIGN` receive §4's
+    // unknown-tool treatment (kept in the exact model for hard-deny / store
+    // checks; P1 strips wrappers cleanly and emits no spurious Unread).
+    for name in ["rm", "curl", "patch", "diff", "sudo"] {
+        assert!(tools::lookup(name).is_none(), "{name} moved out of TOOLS");
+        assert!(
+            tools::lookup_outside_model(name).is_none(),
+            "{name} is unknown, not OUTSIDE_MODEL"
+        );
+        assert!(
+            tools::lookup_unknown_by_design(name).is_some(),
+            "{name} must be recorded in UNKNOWN_BY_DESIGN"
+        );
+    }
+    assert!(
+        tools::lookup("cat").is_some(),
+        "cat remains HomeReadOnly in TOOLS"
+    );
+
+    for (line, want_cmd, want_wrapped) in [
+        ("rm -rf proj", b"rm".as_slice(), false),
+        ("command rm a", b"rm".as_slice(), true),
+        ("curl https://example.com", b"curl".as_slice(), false),
+        ("nice patch -p1", b"patch".as_slice(), true),
+        ("env diff a b", b"diff".as_slice(), true),
+    ] {
+        let mut b = ComputeBudget::with_default_limits();
+        let parsed = build_units(line, &FoldRules::REV4, &mut b).unwrap();
+        assert!(
+            unreads_of(&parsed).is_empty(),
+            "unknown tool `{line}` must not emit P1 Unread: {:?}",
+            parsed.outcomes
+        );
+        assert_eq!(parsed.units.len(), 1, "{line}");
+        assert_eq!(parsed.units[0].argv[0].literal_bytes(), want_cmd, "{line}");
+        assert_eq!(
+            !parsed.units[0].removed_wrappers.is_empty(),
+            want_wrapped,
+            "{line}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // §8 Budgets in `unwrap_unit` and `build_units`
 // ---------------------------------------------------------------------------

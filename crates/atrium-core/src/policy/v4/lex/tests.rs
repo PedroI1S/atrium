@@ -717,6 +717,45 @@ fn lex_best_effort_extracts_section_10_and_m1_27_derived_units() {
 }
 
 #[test]
+fn lex_best_effort_heredocs_follow_d141_code_runner_vs_conditional_runner() {
+    // Unconditional `ToolRowKind::CodeRunner` tools extract heredoc bodies in Scan 7.
+    for line in [
+        "ssh host <<EOF\nsudo id\nEOF",
+        "parallel <<EOF\nsudo id\nEOF",
+        "awk -f /dev/stdin <<EOF\nsudo id\nEOF",
+    ] {
+        let mut b = ComputeBudget::with_default_limits();
+        let rec = lex_best_effort(&[line], &mut b).unwrap();
+        assert!(
+            rec.units
+                .iter()
+                .any(|u| u.derived && u.effective_argv == ["sudo", "id"]),
+            "expected derived unit from CodeRunner heredoc `{line}`: {:?}",
+            rec.units
+        );
+    }
+
+    // `ToolRowKind::ConditionalRunner` (`find`, `git`, `sed`) do not feed
+    // arbitrary heredoc data as shell commands in Scan 7 (`find -exec` is
+    // still handled by Scan 5).
+    for line in [
+        "git commit -F - <<EOF\nsudo id\nEOF",
+        "sed 's/a/b/' <<EOF\nsudo id\nEOF",
+        "find . <<EOF\nsudo id\nEOF",
+    ] {
+        let mut b = ComputeBudget::with_default_limits();
+        let rec = lex_best_effort(&[line], &mut b).unwrap();
+        assert!(
+            !rec.units
+                .iter()
+                .any(|u| u.derived && u.effective_argv == ["sudo", "id"]),
+            "ConditionalRunner heredoc must not derive fake command `{line}`: {:?}",
+            rec.units
+        );
+    }
+}
+
+#[test]
 fn brace_expand_budgeted_carries_m1_31_n11_guarantees() {
     let mut b = ComputeBudget::with_default_limits();
     assert_eq!(
