@@ -842,3 +842,12 @@ rodrigo asked the orchestrator to choose. It kept `dev`'s behaviour on both:
 
 ## D-137 — 2026-11-22 — rodrigo: go for M1-35-test-flakes (N13, N14, N15)
 **Decided by rodrigo (driver).** After M1-33 and M1-34 merged, `dev` is green on Linux except three intermittent tests: N13 (`atrium-app` upgrade signal, under load), N14 (`claude_adapter::questions_use_the_gates_question_ticket`) and N15 (`discover_login_shell_path_handles_noise_failures_and_timeouts`). One task fixes all three: a Neon `high` writer (D-134), the orchestrator's verification with repeated runs (D-123), Codex review (D-124), the 100% gate (D-120).
+
+## D-138 — 2026-11-22 — rodrigo: approves rev 4 §11's 14 items, and the go for rev 4 development
+**Decided by rodrigo (driver).** rodrigo approves all 14 items in `docs/contracts/m1-policy-rev4.md` §11 (summary in `rev4-for-pedro.md`) and gives the go for rev 4's tasks P0 to P5.
+- **D-013 still holds.** Security defaults are Pedro's call as the owner, so rodrigo's approval counts as the partner's proposal. The work is arranged so that it doesn't need Pedro's word until behaviour changes:
+  - **P0, P1 and P2 change no behaviour.** P0 is types, the tool table as data and `limits`; P1 and P2 are built in `policy/v4/` and aren't wired into `SessionGate`. They can merge into `dev` with rodrigo's go.
+  - **P3's live parts, P4 and P5 change behaviour.** P3's live parts are daemon rule validation, `Security.tsx` and `rule-form.ts`. They are built and reviewed now, but merge into `dev` only after Pedro confirms §11 (or overturns items, which then go back to the contract).
+- **The tool table** (contract §6, P0) is approved like contract text: Codex review, then rodrigo. The rows that change defaults are marked for Pedro.
+- **This amends D-135 and D-136,** which held P0 to P5 until Pedro confirmed. CR-20 stays open until Pedro confirms.
+- Each task keeps PLAN §8: a brief, Neon `high` writers (D-134), the orchestrator's verification (D-123), Codex review (D-124) and the 100% gate (D-120). Each merge still needs rodrigo's explicit go.
