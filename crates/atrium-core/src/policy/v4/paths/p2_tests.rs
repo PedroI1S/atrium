@@ -541,8 +541,16 @@ fn section10_row_18_cp_r_derived_destinations_is_unread_and_protected_dst_hits()
         git_selects_by_name: false,
         unread: vec![],
     };
-    let res = resolve_command_targets(&[u], &[e.clone()], CWD, &prot, &fs, &mut caps, &mut budget)
-        .unwrap();
+    let res = resolve_command_targets(
+        &[u],
+        std::slice::from_ref(&e),
+        CWD,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
     assert!(!has_any_hard_deny(&res.outcomes));
     assert!(has_unread(&res.outcomes, |r| matches!(
         r,
@@ -726,7 +734,9 @@ fn section10_row_24_search_azure_msal_absent_matches_store_probe() {
     .unwrap();
     assert!(res.outcomes.iter().any(|r| matches!(
         &r.outcome,
-        PartOutcome::StoreHit(h) if matches!(&h.matched, HitMatch::ProbeName { probe } if probe.contains("msal_token_cache."))
+        PartOutcome::StoreHit(h)
+            if h.source == HitSource::Model
+                && matches!(&h.matched, HitMatch::ProbeName { probe } if probe.contains("msal_token_cache."))
     )));
     assert!(!has_any_hard_deny(&res.outcomes));
 }
@@ -935,7 +945,7 @@ fn boundary_case_and_fold_variants_sensitive_and_insensitive_and_nfc_nfd() {
     // Unlisted case folds on case-sensitive fake:
     cs_fs.add_file("/h/u/.ßh/id_rsa".as_bytes());
     cs_fs.add_file("/h/u/.con\u{FB01}g/gh/hosts.yml".as_bytes());
-    cs_fs.add_file("/h/u/.ssh/\u{0130}d_rsa".as_bytes());
+    cs_fs.add_file("/h/u/.aws/credent\u{0130}als".as_bytes());
     // NFC vs NFD on Atrium data path (`/h/u/Café/atrium` NFC vs `Cafe\u{0301}` NFD):
     cs_fs.mkdir_all("/h/u/Caf\u{00E9}/atrium".as_bytes());
     cs_fs.add_file("/h/u/Cafe\u{0301}/atrium/db".as_bytes());
@@ -980,10 +990,11 @@ fn boundary_case_and_fold_variants_sensitive_and_insensitive_and_nfc_nfd() {
         );
     }
 
-    // Unlisted equivalences (ß->ss, ﬁ->fi, NFC/NFD Café) -> Unread(UnlistedNameEquivalence)
+    // Unlisted equivalences (ß->ss, ﬁ->fi, İ->i, NFC/NFD Café) -> Unread(UnlistedNameEquivalence)
     for p in [
         "/h/u/.ßh/id_rsa",
         "/h/u/.con\u{FB01}g/gh/hosts.yml",
+        "/h/u/.aws/credent\u{0130}als",
         "/h/u/Cafe\u{0301}/atrium/db",
     ] {
         let t = resolve_literal(
@@ -1491,7 +1502,7 @@ fn boundary_writer_effects_and_mv_derived_destinations_and_cd() {
     );
     let res_mv_file = resolve_command_targets(
         &[mv_file],
-        &[mv_effects.clone()],
+        std::slice::from_ref(&mv_effects),
         CWD,
         &prot,
         &fs,
@@ -2105,7 +2116,7 @@ fn search_selectors_and_filters_negated_multiple_and_grep_include() {
     let res_grep = check_recursive_root(
         &proj_root,
         LinkPolicy::default(),
-        &[grep_inc.clone()],
+        std::slice::from_ref(&grep_inc),
         &prot,
         &fs,
         &mut caps,
@@ -2301,4 +2312,289 @@ fn fs_resolver_real_tempdir_symlinks_dangling_hardlinks_unreadable_and_budgets()
             UnreadReason::UnresolvablePath { .. }
         )));
     }
+}
+
+#[test]
+fn regression_posix_classes_dotfile_fallback_dangling_chains_ssh_pub_and_cd_nonexistent() {
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    fs.add_file(b"/h/u/.ssh/sub/key.pub");
+    fs.add_file(b"/h/u/.ssh/sub/secret_key");
+    fs.add_hard_link(b"/h/u/.ssh/sub/secret_key", b"/h/u/proj/hl_sub_secret");
+    fs.add_symlink(b"/h/u/.ssh/k1", b"/tmp/k2");
+    fs.add_symlink(b"/tmp/k2", b"/tmp/nowhere");
+    fs.mkdir_all(b"/h/u/real_dir");
+    fs.add_symlink(b"/h/u/proj/link_dir", b"/h/u/real_dir");
+    fs.add_symlink(b"/h/u/proj/sub_ssh", b"/h/u/.ssh");
+    fs.mkdir_all(b"/h/u/.aws");
+    fs.add_file(b"/h/u/other/hl_target");
+    fs.add_hard_link(b"/h/u/other/hl_target", b"/h/u/other/hl_second");
+    fs.add_symlink(b"/h/u/follow_proj/to_hl", b"/h/u/other/hl_target");
+
+    let prot = default_protected(&fs);
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+
+    // 1. POSIX bracket class `[[:alpha:]]` expands properly (does not truncate at inner `]`).
+    let u_posix = unit(
+        0,
+        vec![unquoted(b"cat"), unquoted(b"~/.[[:alpha:]]sh/id_rsa")],
+        vec![],
+        Separator::Start,
+        None,
+    );
+    let res_posix = resolve_command_targets(
+        &[u_posix],
+        &[reader_effects("cat", 2)],
+        CWD,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(has_hard_deny(&res_posix.outcomes, "credential-read"));
+
+    // Negated class `[!a]` inside shell glob -> Unread(NegatedGlobClass).
+    let exp_neg = expand_shell_glob(
+        &unquoted(b"proj/[!a]*"),
+        CWD,
+        HOME,
+        PartId::Operand {
+            unit: UnitIndex(0),
+            argv_index: 1,
+        },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(exp_neg.unread.contains(&UnreadReason::NegatedGlobClass));
+
+    // 2. No-match literal fallback even when only dotfiles exist under `~/.ssh`.
+    let mut dot_only_fs = FakeFs::new();
+    dot_only_fs.add_file(b"/h/u/.ssh/.hidden");
+    let prot_dot = default_protected(&dot_only_fs);
+    let u_dot_ssh = unit(
+        0,
+        vec![unquoted(b"cat"), unquoted(b"~/.ssh/*")],
+        vec![],
+        Separator::Start,
+        None,
+    );
+    let res_dot_ssh = resolve_command_targets(
+        &[u_dot_ssh],
+        &[reader_effects("cat", 2)],
+        CWD,
+        &prot_dot,
+        &dot_only_fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(has_hard_deny(&res_dot_ssh.outcomes, "credential-read"));
+    assert!(has_unread(&res_dot_ssh.outcomes, |r| matches!(
+        r,
+        UnreadReason::VariantOnlyGlobMatch { .. }
+    )));
+
+    // 3. Valid symlink to existing dir + absent child has `dangling_symlink == false`.
+    let not_dangling = resolve_literal(
+        b"proj/link_dir/absent_child",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(matches!(
+        not_dangling.resolution,
+        TargetResolution::Resolved {
+            dangling_symlink: false,
+            ..
+        }
+    ));
+
+    // 2-hop dangling chain originating in `~/.ssh/k1` retains `~/.ssh/k1`'s identity -> HardDenyHit.
+    let chain_dangling = resolve_literal(
+        b"~/.ssh/k1",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(matches!(
+        chain_dangling.resolution,
+        TargetResolution::Resolved {
+            dangling_symlink: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        check_target(&chain_dangling, &prot, &mut budget)
+            .unwrap()
+            .outcome,
+        PartOutcome::HardDenyHit(_)
+    ));
+
+    // 4. `~/.ssh/sub/key.pub` keeps `.pub` exception (Clear), while `~/.ssh/sub/secret_key`
+    //    and its hard link `proj/hl_sub_secret` are HardDenyHit.
+    let pub_sub = resolve_subject_paths(
+        &["~/.ssh/sub/key.pub".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        all_clear(&pub_sub.outcomes),
+        "~/.ssh/sub/key.pub must stay Clear, got {:?}",
+        pub_sub.outcomes
+    );
+    let hl_sub = resolve_subject_paths(
+        &["proj/hl_sub_secret".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(has_hard_deny(&hl_sub.outcomes, "credential-read"));
+
+    // 5. `Glob(paths=["proj"], glob="sub_ssh/*")` follows symlinked dir `proj/sub_ssh -> ~/.ssh` -> HardDenyHit.
+    let glob_sym_dir = resolve_subject_paths(
+        &["proj".to_string()],
+        Some("sub_ssh/*"),
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(has_hard_deny(&glob_sym_dir.outcomes, "credential-read"));
+
+    // 6. `Search(paths=["~"], glob=".zsh_sessions/*.foo")` matches ASK_TREES prefix -> StoreHit.
+    let zsh_tree = resolve_subject_paths(
+        &["~".to_string()],
+        Some(".zsh_sessions/*.foo"),
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(has_store_hit(&zsh_tree.outcomes));
+
+    // 7. Escaping selector probe on absent credential: `Search(paths=["proj"], glob="../.aws/credentia?s")` -> HardDenyHit (BestEffort).
+    let esc_probe = resolve_subject_paths(
+        &["proj".to_string()],
+        Some("../.aws/credentia?s"),
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(esc_probe.outcomes.iter().any(|r| matches!(
+        &r.outcome,
+        PartOutcome::HardDenyHit(h)
+            if h.hard_deny_id == Some("credential-read") && h.source == HitSource::BestEffort
+    )));
+
+    // 8. `cd nonexistent; cat id_rsa` starting in `~/.ssh` must NOT move cwd to `/h/u/.ssh/nonexistent`!
+    let cd_missing = unit(
+        0,
+        vec![unquoted(b"cd"), unquoted(b"nonexistent")],
+        vec![],
+        Separator::Start,
+        None,
+    );
+    let mut cd_eff = reader_effects("cd", 2);
+    cd_eff.cd_target_operand = Some(1);
+    let cat_id = unit(
+        1,
+        vec![unquoted(b"cat"), unquoted(b"id_rsa")],
+        vec![],
+        Separator::Semi,
+        None,
+    );
+    let res_cd_fail = resolve_command_targets(
+        &[cd_missing, cat_id],
+        &[cd_eff, reader_effects("cat", 2)],
+        b"/h/u/.ssh",
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(has_unread(&res_cd_fail.outcomes, |r| matches!(
+        r,
+        UnreadReason::UnknownCwd
+    )));
+
+    // 9. Firmlink-prefixed process-dependent path `/System/Volumes/Data/dev/fd/3` -> ProcessDependentPath.
+    let firmlink_fd = resolve_literal(
+        b"/System/Volumes/Data/dev/fd/3",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(matches!(
+        firmlink_fd.resolution,
+        TargetResolution::Unread(UnreadReason::ProcessDependentPath { .. })
+    ));
+
+    // 10. Followed-link walk propagates `multiply_linked_file` for symlinked hard-linked regular files.
+    let follow_root = resolve_literal(
+        b"follow_proj",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    let follow_res = check_recursive_root(
+        &follow_root,
+        LinkPolicy {
+            at_root: true,
+            below_root: true,
+        },
+        &[],
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(follow_res.multiply_linked_file);
 }
