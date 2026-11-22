@@ -200,7 +200,616 @@ Any tool or flag absent from this table (and every entry in **Outside the model*
 
 ## Detailed flag tables
 
-(Regenerated in full for `rg`, `grep`, `egrep`, `fgrep`, `zgrep`, `ggrep`, `rgrep`, `ag`, `ack`, and `find` by `env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools`.)
+### `rg` (83 flags)
+
+| Short | Long | Kind | Effects |
+|---|---|---|---|
+| `-i` | `--ignore-case` | Bool | — |
+| `-S` | `--smart-case` | Bool | — |
+| `-s` | `--case-sensitive` | Bool | — |
+| `-n` | `--line-number` | Bool | — |
+| `-N` | `--no-line-number` | Bool | — |
+| `-H` | `--with-filename` | Bool | — |
+| `-I` | `--no-filename` | Bool | — |
+| `-l` | `--files-with-matches` | Bool | — |
+| `-c` | `--count` | Bool | — |
+| `-o` | `--only-matching` | Bool | — |
+| `-v` | `--invert-match` | Bool | — |
+| `-w` | `--word-regexp` | Bool | — |
+| `-x` | `--line-regexp` | Bool | — |
+| `-u` | `--unrestricted` | Bool | — |
+| `-a` | `--text` | Bool | — |
+| `-U` | `--multiline` | Bool | — |
+| `-F` | `--fixed-strings` | Bool | — |
+| `-P` | `--pcre2` | Bool | — |
+| `-q` | `--quiet` | Bool | — |
+| `-0` | `--null` | Bool | — |
+| `-p` | `--pretty` | Bool | — |
+| `-b` | `--byte-offset` | Bool | — |
+| `-L` | `--follow` | Bool | links(root=Y, below=Y) |
+| — | `--hidden` | Bool | — |
+| — | `--no-ignore` | Bool | — |
+| — | `--no-ignore-vcs` | Bool | — |
+| — | `--no-ignore-dot` | Bool | — |
+| — | `--no-ignore-parent` | Bool | — |
+| — | `--no-ignore-global` | Bool | — |
+| — | `--no-ignore-files` | Bool | — |
+| — | `--no-messages` | Bool | — |
+| — | `--no-heading` | Bool | — |
+| — | `--heading` | Bool | — |
+| — | `--count-matches` | Bool | — |
+| — | `--files-without-match` | Bool | — |
+| — | `--multiline-dotall` | Bool | — |
+| — | `--binary` | Bool | — |
+| — | `--files` | Bool | provides-pattern |
+| — | `--type-list` | Bool | provides-pattern |
+| — | `--json` | Bool | — |
+| — | `--column` | Bool | — |
+| — | `--no-column` | Bool | — |
+| — | `--vimgrep` | Bool | — |
+| — | `--trim` | Bool | — |
+| — | `--stats` | Bool | — |
+| — | `--no-config` | Bool | — |
+| — | `--version` | Bool | — |
+| — | `--help` | Bool | — |
+| — | `--no-pcre2` | Bool | — |
+| — | `--crlf` | Bool | — |
+| — | `--include-zero` | Bool | — |
+| — | `--glob-case-insensitive` | Bool | — |
+| — | `--no-glob-case-insensitive` | Bool | — |
+| `-e` | `--regexp` | Value(Pattern) | provides-pattern |
+| `-g` | `--glob` | Value(Pattern) | filter(RgGlob, ci=false) |
+| — | `--iglob` | Value(Pattern) | filter(RgGlob, ci=true) |
+| `-f` | `--file` | Value(Path) | provides-pattern |
+| `-t` | `--type` | Value(Text) | — |
+| `-T` | `--type-not` | Value(Text) | — |
+| `-m` | `--max-count` | Value(Text) | — |
+| `-A` | `--after-context` | Value(Text) | — |
+| `-B` | `--before-context` | Value(Text) | — |
+| `-C` | `--context` | Value(Text) | — |
+| `-d` | `--max-depth` | Value(Text) | — |
+| — | `--maxdepth` | Value(Text) | — |
+| `-j` | `--threads` | Value(Text) | — |
+| `-M` | `--max-columns` | Value(Text) | — |
+| `-E` | `--encoding` | Value(Text) | — |
+| `-r` | `--replace` | Value(Text) | — |
+| — | `--colors` | Value(Text) | — |
+| — | `--color` | Value(Text) | — |
+| — | `--sort` | Value(Text) | — |
+| — | `--sortr` | Value(Text) | — |
+| — | `--max-filesize` | Value(Text) | — |
+| — | `--path-separator` | Value(Text) | — |
+| — | `--engine` | Value(Text) | — |
+| — | `--context-separator` | Value(Text) | — |
+| — | `--type-add` | Value(Text) | — |
+| — | `--type-clear` | Value(Text) | — |
+| — | `--field-context-separator` | Value(Text) | — |
+| — | `--field-match-separator` | Value(Text) | — |
+| — | `--dfa-size-limit` | Value(Text) | — |
+| — | `--regex-size-limit` | Value(Text) | — |
+
+### `grep` (56 flags)
+
+| Short | Long | Kind | Effects |
+|---|---|---|---|
+| `-i` | `--ignore-case` | Bool | — |
+| — | `--no-ignore-case` | Bool | — |
+| `-v` | `--invert-match` | Bool | — |
+| `-n` | `--line-number` | Bool | — |
+| `-c` | `--count` | Bool | — |
+| `-l` | `--files-with-matches` | Bool | — |
+| `-L` | `--files-without-match` | Bool | — |
+| `-o` | `--only-matching` | Bool | — |
+| `-q` | `--quiet` | Bool | — |
+| — | `--silent` | Bool | — |
+| `-s` | `--no-messages` | Bool | — |
+| `-w` | `--word-regexp` | Bool | — |
+| `-x` | `--line-regexp` | Bool | — |
+| `-h` | `--no-filename` | Bool | — |
+| `-H` | `--with-filename` | Bool | — |
+| `-E` | `--extended-regexp` | Bool | — |
+| `-F` | `--fixed-strings` | Bool | — |
+| `-G` | `--basic-regexp` | Bool | — |
+| `-P` | `--perl-regexp` | Bool | — |
+| `-a` | `--text` | Bool | — |
+| `-z` | `--null-data` | Bool | — |
+| `-Z` | `--null` | Bool | — |
+| `-b` | `--byte-offset` | Bool | — |
+| `-T` | `--initial-tab` | Bool | — |
+| `-r` | `--recursive` | Bool | recursive |
+| `-R` | `--dereference-recursive` | Bool | recursive; links(root=Y, below=Y) |
+| — | `--no-group-separator` | Bool | — |
+| `-I` | — | Bool | — |
+| `-U` | — | Bool | — |
+| `-y` | — | Bool | — |
+| `-0` | — | Bool | — |
+| `-1` | — | Bool | — |
+| `-2` | — | Bool | — |
+| `-3` | — | Bool | — |
+| `-4` | — | Bool | — |
+| `-5` | — | Bool | — |
+| `-6` | — | Bool | — |
+| `-7` | — | Bool | — |
+| `-8` | — | Bool | — |
+| `-9` | — | Bool | — |
+| `-e` | `--regexp` | Value(Pattern) | provides-pattern |
+| `-f` | `--file` | Value(Path) | provides-pattern |
+| `-m` | `--max-count` | Value(Text) | — |
+| `-A` | `--after-context` | Value(Text) | — |
+| `-B` | `--before-context` | Value(Text) | — |
+| `-C` | `--context` | Value(Text) | — |
+| `-d` | `--directories` | Value(Text) | recursive |
+| `-D` | `--devices` | Value(Text) | — |
+| — | `--include` | Value(Pattern) | filter(GrepInclude, ci=false) |
+| — | `--exclude` | Value(Pattern) | — |
+| — | `--exclude-dir` | Value(Pattern) | — |
+| — | `--label` | Value(Text) | — |
+| — | `--color` | Value(Text) | — |
+| — | `--colour` | Value(Text) | — |
+| — | `--binary-files` | Value(Text) | — |
+| — | `--group-separator` | Value(Text) | — |
+
+### `egrep` (56 flags)
+
+| Short | Long | Kind | Effects |
+|---|---|---|---|
+| `-i` | `--ignore-case` | Bool | — |
+| — | `--no-ignore-case` | Bool | — |
+| `-v` | `--invert-match` | Bool | — |
+| `-n` | `--line-number` | Bool | — |
+| `-c` | `--count` | Bool | — |
+| `-l` | `--files-with-matches` | Bool | — |
+| `-L` | `--files-without-match` | Bool | — |
+| `-o` | `--only-matching` | Bool | — |
+| `-q` | `--quiet` | Bool | — |
+| — | `--silent` | Bool | — |
+| `-s` | `--no-messages` | Bool | — |
+| `-w` | `--word-regexp` | Bool | — |
+| `-x` | `--line-regexp` | Bool | — |
+| `-h` | `--no-filename` | Bool | — |
+| `-H` | `--with-filename` | Bool | — |
+| `-E` | `--extended-regexp` | Bool | — |
+| `-F` | `--fixed-strings` | Bool | — |
+| `-G` | `--basic-regexp` | Bool | — |
+| `-P` | `--perl-regexp` | Bool | — |
+| `-a` | `--text` | Bool | — |
+| `-z` | `--null-data` | Bool | — |
+| `-Z` | `--null` | Bool | — |
+| `-b` | `--byte-offset` | Bool | — |
+| `-T` | `--initial-tab` | Bool | — |
+| `-r` | `--recursive` | Bool | recursive |
+| `-R` | `--dereference-recursive` | Bool | recursive; links(root=Y, below=Y) |
+| — | `--no-group-separator` | Bool | — |
+| `-I` | — | Bool | — |
+| `-U` | — | Bool | — |
+| `-y` | — | Bool | — |
+| `-0` | — | Bool | — |
+| `-1` | — | Bool | — |
+| `-2` | — | Bool | — |
+| `-3` | — | Bool | — |
+| `-4` | — | Bool | — |
+| `-5` | — | Bool | — |
+| `-6` | — | Bool | — |
+| `-7` | — | Bool | — |
+| `-8` | — | Bool | — |
+| `-9` | — | Bool | — |
+| `-e` | `--regexp` | Value(Pattern) | provides-pattern |
+| `-f` | `--file` | Value(Path) | provides-pattern |
+| `-m` | `--max-count` | Value(Text) | — |
+| `-A` | `--after-context` | Value(Text) | — |
+| `-B` | `--before-context` | Value(Text) | — |
+| `-C` | `--context` | Value(Text) | — |
+| `-d` | `--directories` | Value(Text) | recursive |
+| `-D` | `--devices` | Value(Text) | — |
+| — | `--include` | Value(Pattern) | filter(GrepInclude, ci=false) |
+| — | `--exclude` | Value(Pattern) | — |
+| — | `--exclude-dir` | Value(Pattern) | — |
+| — | `--label` | Value(Text) | — |
+| — | `--color` | Value(Text) | — |
+| — | `--colour` | Value(Text) | — |
+| — | `--binary-files` | Value(Text) | — |
+| — | `--group-separator` | Value(Text) | — |
+
+### `fgrep` (56 flags)
+
+| Short | Long | Kind | Effects |
+|---|---|---|---|
+| `-i` | `--ignore-case` | Bool | — |
+| — | `--no-ignore-case` | Bool | — |
+| `-v` | `--invert-match` | Bool | — |
+| `-n` | `--line-number` | Bool | — |
+| `-c` | `--count` | Bool | — |
+| `-l` | `--files-with-matches` | Bool | — |
+| `-L` | `--files-without-match` | Bool | — |
+| `-o` | `--only-matching` | Bool | — |
+| `-q` | `--quiet` | Bool | — |
+| — | `--silent` | Bool | — |
+| `-s` | `--no-messages` | Bool | — |
+| `-w` | `--word-regexp` | Bool | — |
+| `-x` | `--line-regexp` | Bool | — |
+| `-h` | `--no-filename` | Bool | — |
+| `-H` | `--with-filename` | Bool | — |
+| `-E` | `--extended-regexp` | Bool | — |
+| `-F` | `--fixed-strings` | Bool | — |
+| `-G` | `--basic-regexp` | Bool | — |
+| `-P` | `--perl-regexp` | Bool | — |
+| `-a` | `--text` | Bool | — |
+| `-z` | `--null-data` | Bool | — |
+| `-Z` | `--null` | Bool | — |
+| `-b` | `--byte-offset` | Bool | — |
+| `-T` | `--initial-tab` | Bool | — |
+| `-r` | `--recursive` | Bool | recursive |
+| `-R` | `--dereference-recursive` | Bool | recursive; links(root=Y, below=Y) |
+| — | `--no-group-separator` | Bool | — |
+| `-I` | — | Bool | — |
+| `-U` | — | Bool | — |
+| `-y` | — | Bool | — |
+| `-0` | — | Bool | — |
+| `-1` | — | Bool | — |
+| `-2` | — | Bool | — |
+| `-3` | — | Bool | — |
+| `-4` | — | Bool | — |
+| `-5` | — | Bool | — |
+| `-6` | — | Bool | — |
+| `-7` | — | Bool | — |
+| `-8` | — | Bool | — |
+| `-9` | — | Bool | — |
+| `-e` | `--regexp` | Value(Pattern) | provides-pattern |
+| `-f` | `--file` | Value(Path) | provides-pattern |
+| `-m` | `--max-count` | Value(Text) | — |
+| `-A` | `--after-context` | Value(Text) | — |
+| `-B` | `--before-context` | Value(Text) | — |
+| `-C` | `--context` | Value(Text) | — |
+| `-d` | `--directories` | Value(Text) | recursive |
+| `-D` | `--devices` | Value(Text) | — |
+| — | `--include` | Value(Pattern) | filter(GrepInclude, ci=false) |
+| — | `--exclude` | Value(Pattern) | — |
+| — | `--exclude-dir` | Value(Pattern) | — |
+| — | `--label` | Value(Text) | — |
+| — | `--color` | Value(Text) | — |
+| — | `--colour` | Value(Text) | — |
+| — | `--binary-files` | Value(Text) | — |
+| — | `--group-separator` | Value(Text) | — |
+
+### `zgrep` (56 flags)
+
+| Short | Long | Kind | Effects |
+|---|---|---|---|
+| `-i` | `--ignore-case` | Bool | — |
+| — | `--no-ignore-case` | Bool | — |
+| `-v` | `--invert-match` | Bool | — |
+| `-n` | `--line-number` | Bool | — |
+| `-c` | `--count` | Bool | — |
+| `-l` | `--files-with-matches` | Bool | — |
+| `-L` | `--files-without-match` | Bool | — |
+| `-o` | `--only-matching` | Bool | — |
+| `-q` | `--quiet` | Bool | — |
+| — | `--silent` | Bool | — |
+| `-s` | `--no-messages` | Bool | — |
+| `-w` | `--word-regexp` | Bool | — |
+| `-x` | `--line-regexp` | Bool | — |
+| `-h` | `--no-filename` | Bool | — |
+| `-H` | `--with-filename` | Bool | — |
+| `-E` | `--extended-regexp` | Bool | — |
+| `-F` | `--fixed-strings` | Bool | — |
+| `-G` | `--basic-regexp` | Bool | — |
+| `-P` | `--perl-regexp` | Bool | — |
+| `-a` | `--text` | Bool | — |
+| `-z` | `--null-data` | Bool | — |
+| `-Z` | `--null` | Bool | — |
+| `-b` | `--byte-offset` | Bool | — |
+| `-T` | `--initial-tab` | Bool | — |
+| `-r` | `--recursive` | Bool | recursive |
+| `-R` | `--dereference-recursive` | Bool | recursive; links(root=Y, below=Y) |
+| — | `--no-group-separator` | Bool | — |
+| `-I` | — | Bool | — |
+| `-U` | — | Bool | — |
+| `-y` | — | Bool | — |
+| `-0` | — | Bool | — |
+| `-1` | — | Bool | — |
+| `-2` | — | Bool | — |
+| `-3` | — | Bool | — |
+| `-4` | — | Bool | — |
+| `-5` | — | Bool | — |
+| `-6` | — | Bool | — |
+| `-7` | — | Bool | — |
+| `-8` | — | Bool | — |
+| `-9` | — | Bool | — |
+| `-e` | `--regexp` | Value(Pattern) | provides-pattern |
+| `-f` | `--file` | Value(Path) | provides-pattern |
+| `-m` | `--max-count` | Value(Text) | — |
+| `-A` | `--after-context` | Value(Text) | — |
+| `-B` | `--before-context` | Value(Text) | — |
+| `-C` | `--context` | Value(Text) | — |
+| `-d` | `--directories` | Value(Text) | recursive |
+| `-D` | `--devices` | Value(Text) | — |
+| — | `--include` | Value(Pattern) | filter(GrepInclude, ci=false) |
+| — | `--exclude` | Value(Pattern) | — |
+| — | `--exclude-dir` | Value(Pattern) | — |
+| — | `--label` | Value(Text) | — |
+| — | `--color` | Value(Text) | — |
+| — | `--colour` | Value(Text) | — |
+| — | `--binary-files` | Value(Text) | — |
+| — | `--group-separator` | Value(Text) | — |
+
+### `ggrep` (56 flags)
+
+| Short | Long | Kind | Effects |
+|---|---|---|---|
+| `-i` | `--ignore-case` | Bool | — |
+| — | `--no-ignore-case` | Bool | — |
+| `-v` | `--invert-match` | Bool | — |
+| `-n` | `--line-number` | Bool | — |
+| `-c` | `--count` | Bool | — |
+| `-l` | `--files-with-matches` | Bool | — |
+| `-L` | `--files-without-match` | Bool | — |
+| `-o` | `--only-matching` | Bool | — |
+| `-q` | `--quiet` | Bool | — |
+| — | `--silent` | Bool | — |
+| `-s` | `--no-messages` | Bool | — |
+| `-w` | `--word-regexp` | Bool | — |
+| `-x` | `--line-regexp` | Bool | — |
+| `-h` | `--no-filename` | Bool | — |
+| `-H` | `--with-filename` | Bool | — |
+| `-E` | `--extended-regexp` | Bool | — |
+| `-F` | `--fixed-strings` | Bool | — |
+| `-G` | `--basic-regexp` | Bool | — |
+| `-P` | `--perl-regexp` | Bool | — |
+| `-a` | `--text` | Bool | — |
+| `-z` | `--null-data` | Bool | — |
+| `-Z` | `--null` | Bool | — |
+| `-b` | `--byte-offset` | Bool | — |
+| `-T` | `--initial-tab` | Bool | — |
+| `-r` | `--recursive` | Bool | recursive |
+| `-R` | `--dereference-recursive` | Bool | recursive; links(root=Y, below=Y) |
+| — | `--no-group-separator` | Bool | — |
+| `-I` | — | Bool | — |
+| `-U` | — | Bool | — |
+| `-y` | — | Bool | — |
+| `-0` | — | Bool | — |
+| `-1` | — | Bool | — |
+| `-2` | — | Bool | — |
+| `-3` | — | Bool | — |
+| `-4` | — | Bool | — |
+| `-5` | — | Bool | — |
+| `-6` | — | Bool | — |
+| `-7` | — | Bool | — |
+| `-8` | — | Bool | — |
+| `-9` | — | Bool | — |
+| `-e` | `--regexp` | Value(Pattern) | provides-pattern |
+| `-f` | `--file` | Value(Path) | provides-pattern |
+| `-m` | `--max-count` | Value(Text) | — |
+| `-A` | `--after-context` | Value(Text) | — |
+| `-B` | `--before-context` | Value(Text) | — |
+| `-C` | `--context` | Value(Text) | — |
+| `-d` | `--directories` | Value(Text) | recursive |
+| `-D` | `--devices` | Value(Text) | — |
+| — | `--include` | Value(Pattern) | filter(GrepInclude, ci=false) |
+| — | `--exclude` | Value(Pattern) | — |
+| — | `--exclude-dir` | Value(Pattern) | — |
+| — | `--label` | Value(Text) | — |
+| — | `--color` | Value(Text) | — |
+| — | `--colour` | Value(Text) | — |
+| — | `--binary-files` | Value(Text) | — |
+| — | `--group-separator` | Value(Text) | — |
+
+### `rgrep` (56 flags)
+
+| Short | Long | Kind | Effects |
+|---|---|---|---|
+| `-i` | `--ignore-case` | Bool | — |
+| — | `--no-ignore-case` | Bool | — |
+| `-v` | `--invert-match` | Bool | — |
+| `-n` | `--line-number` | Bool | — |
+| `-c` | `--count` | Bool | — |
+| `-l` | `--files-with-matches` | Bool | — |
+| `-L` | `--files-without-match` | Bool | — |
+| `-o` | `--only-matching` | Bool | — |
+| `-q` | `--quiet` | Bool | — |
+| — | `--silent` | Bool | — |
+| `-s` | `--no-messages` | Bool | — |
+| `-w` | `--word-regexp` | Bool | — |
+| `-x` | `--line-regexp` | Bool | — |
+| `-h` | `--no-filename` | Bool | — |
+| `-H` | `--with-filename` | Bool | — |
+| `-E` | `--extended-regexp` | Bool | — |
+| `-F` | `--fixed-strings` | Bool | — |
+| `-G` | `--basic-regexp` | Bool | — |
+| `-P` | `--perl-regexp` | Bool | — |
+| `-a` | `--text` | Bool | — |
+| `-z` | `--null-data` | Bool | — |
+| `-Z` | `--null` | Bool | — |
+| `-b` | `--byte-offset` | Bool | — |
+| `-T` | `--initial-tab` | Bool | — |
+| `-r` | `--recursive` | Bool | recursive |
+| `-R` | `--dereference-recursive` | Bool | recursive; links(root=Y, below=Y) |
+| — | `--no-group-separator` | Bool | — |
+| `-I` | — | Bool | — |
+| `-U` | — | Bool | — |
+| `-y` | — | Bool | — |
+| `-0` | — | Bool | — |
+| `-1` | — | Bool | — |
+| `-2` | — | Bool | — |
+| `-3` | — | Bool | — |
+| `-4` | — | Bool | — |
+| `-5` | — | Bool | — |
+| `-6` | — | Bool | — |
+| `-7` | — | Bool | — |
+| `-8` | — | Bool | — |
+| `-9` | — | Bool | — |
+| `-e` | `--regexp` | Value(Pattern) | provides-pattern |
+| `-f` | `--file` | Value(Path) | provides-pattern |
+| `-m` | `--max-count` | Value(Text) | — |
+| `-A` | `--after-context` | Value(Text) | — |
+| `-B` | `--before-context` | Value(Text) | — |
+| `-C` | `--context` | Value(Text) | — |
+| `-d` | `--directories` | Value(Text) | recursive |
+| `-D` | `--devices` | Value(Text) | — |
+| — | `--include` | Value(Pattern) | filter(GrepInclude, ci=false) |
+| — | `--exclude` | Value(Pattern) | — |
+| — | `--exclude-dir` | Value(Pattern) | — |
+| — | `--label` | Value(Text) | — |
+| — | `--color` | Value(Text) | — |
+| — | `--colour` | Value(Text) | — |
+| — | `--binary-files` | Value(Text) | — |
+| — | `--group-separator` | Value(Text) | — |
+
+### `ag` (79 flags)
+
+| Short | Long | Kind | Effects |
+|---|---|---|---|
+| `-a` | `--all-types` | Bool | — |
+| `-D` | `--debug` | Bool | — |
+| `-c` | `--count` | Bool | — |
+| `-F` | `--fixed-strings` | Bool | — |
+| `-f` | `--follow` | Bool | links(root=Y, below=Y) |
+| `-H` | `--heading` | Bool | — |
+| `-h` | — | Bool | — |
+| `-i` | `--ignore-case` | Bool | — |
+| `-L` | `--files-without-matches` | Bool | — |
+| `-l` | `--files-with-matches` | Bool | — |
+| `-n` | `--norecurse` | Bool | — |
+| `-o` | `--only-matching` | Bool | — |
+| `-Q` | `--literal` | Bool | — |
+| `-R` | `--recurse` | Bool | — |
+| `-r` | — | Bool | — |
+| `-S` | `--smart-case` | Bool | — |
+| `-s` | `--case-sensitive` | Bool | — |
+| `-v` | `--invert-match` | Bool | — |
+| `-V` | — | Bool | — |
+| `-t` | `--all-text` | Bool | — |
+| `-u` | `--unrestricted` | Bool | — |
+| `-U` | `--skip-vcs-ignores` | Bool | — |
+| `-w` | `--word-regexp` | Bool | — |
+| `-z` | `--search-zip` | Bool | — |
+| `-0` | `--null` | Bool | — |
+| — | `--ackmate` | Bool | — |
+| — | `--affinity` | Bool | — |
+| — | `--noaffinity` | Bool | — |
+| — | `--hidden` | Bool | — |
+| — | `--column` | Bool | — |
+| — | `--nocolor` | Bool | — |
+| — | `--color` | Bool | — |
+| — | `--color-win-ansi` | Bool | — |
+| — | `--noheading` | Bool | — |
+| — | `--nobreak` | Bool | — |
+| — | `--break` | Bool | — |
+| — | `--nofollow` | Bool | — |
+| — | `--search-binary` | Bool | — |
+| — | `--silent` | Bool | — |
+| — | `--stats` | Bool | — |
+| — | `--stats-only` | Bool | — |
+| — | `--vimgrep` | Bool | — |
+| — | `--print0` | Bool | — |
+| — | `--one-device` | Bool | — |
+| — | `--filename` | Bool | — |
+| — | `--nofilename` | Bool | — |
+| — | `--numbers` | Bool | — |
+| — | `--nonumbers` | Bool | — |
+| — | `--line-numbers` | Bool | — |
+| — | `--group` | Bool | — |
+| — | `--nogroup` | Bool | — |
+| — | `--match` | Bool | — |
+| — | `--mmap` | Bool | — |
+| — | `--nommap` | Bool | — |
+| — | `--multiline` | Bool | — |
+| — | `--nomultiline` | Bool | — |
+| — | `--nopager` | Bool | — |
+| — | `--parallel` | Bool | — |
+| — | `--passthrough` | Bool | — |
+| — | `--passthru` | Bool | — |
+| — | `--print-all-files` | Bool | — |
+| — | `--print-long-lines` | Bool | — |
+| `-G` | `--file-search-regex` | Value(Pattern) | — |
+| `-g` | `--filename-pattern` | Value(Pattern) | provides-pattern |
+| `-m` | `--max-count` | Value(Text) | — |
+| `-p` | `--path-to-ignore` | Value(Path) | — |
+| `-W` | `--width` | Value(Text) | — |
+| — | `--ackmate-dir-filter` | Value(Pattern) | — |
+| — | `--depth` | Value(Text) | — |
+| — | `--ignore` | Value(Pattern) | — |
+| — | `--ignore-dir` | Value(Pattern) | — |
+| — | `--pager` | Value(Code) | runs-code |
+| — | `--workers` | Value(Text) | — |
+| — | `--color-line-number` | Value(Text) | — |
+| — | `--color-match` | Value(Text) | — |
+| — | `--color-path` | Value(Text) | — |
+| `-A` | `--after` | OptionalValue(Text) | — |
+| `-B` | `--before` | OptionalValue(Text) | — |
+| `-C` | `--context` | OptionalValue(Text) | — |
+
+### `ack` (41 flags)
+
+| Short | Long | Kind | Effects |
+|---|---|---|---|
+| `-i` | `--ignore-case` | Bool | — |
+| `-I` | — | Bool | — |
+| `-S` | `--smart-case` | Bool | — |
+| `-v` | `--invert-match` | Bool | — |
+| `-w` | `--word-regexp` | Bool | — |
+| `-Q` | `--literal` | Bool | — |
+| `-l` | `--files-with-matches` | Bool | — |
+| `-L` | `--files-without-matches` | Bool | — |
+| `-c` | `--count` | Bool | — |
+| `-h` | `--no-filename` | Bool | — |
+| `-H` | `--with-filename` | Bool | — |
+| `-o` | — | Bool | — |
+| `-1` | — | Bool | — |
+| `-n` | `--no-recurse` | Bool | — |
+| `-r` | `--recurse` | Bool | — |
+| `-R` | — | Bool | — |
+| `-s` | — | Bool | — |
+| `-x` | — | Bool | — |
+| `-f` | — | Bool | provides-pattern |
+| `-k` | — | Bool | — |
+| — | `--column` | Bool | — |
+| — | `--nocolor` | Bool | — |
+| — | `--color` | Bool | — |
+| — | `--noheading` | Bool | — |
+| — | `--heading` | Bool | — |
+| — | `--nobreak` | Bool | — |
+| — | `--break` | Bool | — |
+| — | `--follow` | Bool | links(root=Y, below=Y) |
+| — | `--nofollow` | Bool | — |
+| — | `--sort-files` | Bool | — |
+| — | `--nopager` | Bool | — |
+| `-A` | `--after-context` | Value(Text) | — |
+| `-B` | `--before-context` | Value(Text) | — |
+| `-m` | `--max-count` | Value(Text) | — |
+| `-g` | — | Value(Pattern) | provides-pattern |
+| `-t` | `--type` | Value(Text) | — |
+| — | `--ignore-dir` | Value(Pattern) | — |
+| — | `--noignore-dir` | Value(Pattern) | — |
+| — | `--match` | Value(Pattern) | provides-pattern |
+| — | `--output` | Value(Code) | runs-code |
+| `-C` | `--context` | OptionalValue(Text) | — |
+
+### `find` (22 flags)
+
+| Short | Long | Kind | Effects |
+|---|---|---|---|
+| `-H` | — | Bool | links(root=Y, below=N) |
+| `-L` | `--follow` | Bool | links(root=Y, below=Y) |
+| `-P` | — | Bool | — |
+| `-E` | — | Bool | — |
+| `-X` | — | Bool | — |
+| `-d` | — | Bool | — |
+| `-s` | — | Bool | — |
+| `-x` | — | Bool | — |
+| `-D` | — | Value(Text) | — |
+| `-f` | — | Value(Path) | — |
+| — | `--delete` | Bool | writes |
+| — | `--depth` | Bool | — |
+| — | `--maxdepth` | Value(Text) | — |
+| — | `--mindepth` | Value(Text) | — |
+| — | `--exec` | Value(Code) | writes; runs-code |
+| — | `--execdir` | Value(Code) | writes; runs-code |
+| — | `--ok` | Value(Code) | writes; runs-code |
+| — | `--okdir` | Value(Code) | writes; runs-code |
+| — | `--fprint` | Value(Path) | writes |
+| — | `--fprint0` | Value(Path) | writes |
+| — | `--fprintf` | Value(Path) | writes |
+| — | `--fls` | Value(Path) | writes |
 
 ## Outside the model (`OUTSIDE_MODEL`)
 
@@ -262,3 +871,145 @@ Any tool or flag absent from this table (and every entry in **Outside the model*
 | `open` | macOS | Yes | §6 | §11 item 4 | macOS launcher that opens files/URLs with external applications |
 | `spctl` | macOS | No | §6 | — | macOS Gatekeeper policy tool with modifying flags; no flag table in `dev` |
 | `mdfind` | macOS | No | §6 | — | macOS Spotlight search across volumes; no flag table in `dev` |
+
+## Summary of rows changing `dev` defaults (§11)
+
+| Entry | §11 item(s) |
+|---|---|
+| `command` | §11 item 10 |
+| `exec` | §11 item 10 |
+| `nice` | §11 item 10 |
+| `timeout` | §11 item 10 |
+| `time` | §11 item 10 |
+| `env` | §11 item 10 |
+| `sh` | §11 item 2; §11 item 4; §11 item 8 |
+| `bash` | §11 item 2; §11 item 4; §11 item 8 |
+| `dash` | §11 item 2; §11 item 4; §11 item 8 |
+| `which` | §11 item 9 |
+| `date` | §11 item 9 |
+| `rg` | §11 item 9 |
+| `grep` | §11 item 9 |
+| `egrep` | §11 item 9 |
+| `fgrep` | §11 item 9 |
+| `zgrep` | §11 item 9 |
+| `ggrep` | §11 item 9 |
+| `rgrep` | §11 item 9 |
+| `ag` | §11 item 9 |
+| `ack` | §11 item 9 |
+| `git` | §11 item 4 |
+| `git status` | §11 item 10 |
+| `git log` | §11 item 9; §11 item 10 |
+| `git diff` | §11 item 9; §11 item 10 |
+| `git show` | §11 item 9; §11 item 10 |
+| `git branch` | §11 item 9 |
+| `git rev-parse` | §11 item 9 |
+| `git ls-files` | §11 item 10 |
+| `git cat-file` | §11 item 9 |
+| `git push` | §11 item 9 |
+| `git clone` | §11 item 10 |
+| `git checkout` | §11 item 10 |
+| `git merge-index` | §11 item 4 |
+| `git filter-branch` | §11 item 4 |
+| `git bisect` | §11 item 4 |
+| `git rebase` | §11 item 4 |
+| `git submodule` | §11 item 4 |
+| `git difftool` | §11 item 4 |
+| `git mergetool` | §11 item 4 |
+| `cargo` | §11 item 4; §11 item 8 |
+| `cargo test` | §11 item 8 |
+| `cargo build` | §11 item 8 |
+| `cargo run` | §11 item 8 |
+| `cargo check` | §11 item 8 |
+| `cargo bench` | §11 item 8 |
+| `cargo doc` | §11 item 8 |
+| `cargo clippy` | §11 item 8 |
+| `pipx` | §11 item 4; §11 item 8 |
+| `pipx run` | §11 item 4; §11 item 8 |
+| `find` | §11 item 4 |
+| `cp` | §11 item 10 |
+| `mv` | §11 item 10 |
+| `rsync` | §11 item 10 |
+| `tar` | §11 item 9; §11 item 10 |
+| `unzip` | §11 item 9; §11 item 10 |
+| `chmod` | §11 item 9 |
+| `chown` | §11 item 9 |
+| `chgrp` | §11 item 9 |
+| `echo` | §11 item 9 |
+| `printf` | §11 item 9 |
+| `whereis` | §11 item 9 |
+| `type` | §11 item 9 |
+| `tr` | §11 item 9 |
+| `jq` | §11 item 9 |
+| `awk` | §11 item 4 |
+| `gawk` | §11 item 4 |
+| `mawk` | §11 item 4 |
+| `sed` | §11 item 4 |
+| `perl` | §11 item 4; §11 item 8 |
+| `python` | §11 item 4; §11 item 8 |
+| `python3` | §11 item 4; §11 item 8 |
+| `node` | §11 item 4; §11 item 8 |
+| `ruby` | §11 item 4; §11 item 8 |
+| `eval` | §11 item 4 |
+| `source` | §11 item 4; §11 item 8 |
+| `.` | §11 item 4; §11 item 8 |
+| `npx` | §11 item 4; §11 item 8 |
+| `xargs` | §11 item 4 |
+| `ssh` | §11 item 4 |
+| `mosh` | §11 item 4 |
+| `autossh` | §11 item 4 |
+| `nsenter` | §11 item 4 |
+| `unshare` | §11 item 4 |
+| `docker` | §11 item 4 |
+| `podman` | §11 item 4 |
+| `nerdctl` | §11 item 4 |
+| `kubectl` | §11 item 4 |
+| `oc` | §11 item 4 |
+| `lxc` | §11 item 4 |
+| `incus` | §11 item 4 |
+| `machinectl` | §11 item 4 |
+| `systemd-run` | §11 item 4 |
+| `systemd-nspawn` | §11 item 4 |
+| `firejail` | §11 item 4 |
+| `bwrap` | §11 item 4 |
+| `flatpak-spawn` | §11 item 4 |
+| `toolbox` | §11 item 4 |
+| `distrobox` | §11 item 4 |
+| `distrobox-enter` | §11 item 4 |
+| `multipass` | §11 item 4 |
+| `vagrant` | §11 item 4 |
+| `limactl` | §11 item 4 |
+| `colima` | §11 item 4 |
+| `runuser` | §11 item 4 |
+| `setpriv` | §11 item 4 |
+| `parallel` | §11 item 4 |
+| `zsh` (outside model) | §11 item 4 |
+| `ksh` (outside model) | §11 item 4 |
+| `fish` (outside model) | §11 item 4 |
+| `ash` (outside model) | §11 item 4 |
+| `csh` (outside model) | §11 item 4 |
+| `tcsh` (outside model) | §11 item 4 |
+| `mksh` (outside model) | §11 item 4 |
+| `yash` (outside model) | §11 item 4 |
+| `rbash` (outside model) | §11 item 4 |
+| `posh` (outside model) | §11 item 4 |
+| `elvish` (outside model) | §11 item 4 |
+| `xonsh` (outside model) | §11 item 4 |
+| `nohup` (outside model) | §11 item 10 |
+| `builtin` (outside model) | §11 item 10 |
+| `busybox` (outside model) | §11 item 10 |
+| `toybox` (outside model) | §11 item 10 |
+| `setsid` (outside model) | §11 item 10 |
+| `unbuffer` (outside model) | §11 item 10 |
+| `caffeinate` (outside model) | §11 item 10 |
+| `sandbox-exec` (outside model) | §11 item 10 |
+| `chroot` (outside model) | §11 item 10 |
+| `ionice` (outside model) | §11 item 10 |
+| `stdbuf` (outside model) | §11 item 10 |
+| `chrt` (outside model) | §11 item 10 |
+| `taskset` (outside model) | §11 item 10 |
+| `flock` (outside model) | §11 item 10 |
+| `script` (outside model) | §11 item 10 |
+| `arch` (outside model) | §11 item 10 |
+| `ed` (outside model) | §11 item 4 |
+| `ex` (outside model) | §11 item 4 |
+| `open` (outside model) | §11 item 4 |
