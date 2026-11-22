@@ -943,8 +943,17 @@ fn round_5_blocker_1_searches_and_walkers_reaching_a_folder_linked_into_ssh() {
     // names the linked folder itself
     let empty_outside = Tmp::new();
     std::fs::remove_dir_all(&empty_outside.home).unwrap();
-    let cd_empty_outside = format!("cd {} && rg x", empty_outside.root.display());
-    let find_empty_outside = format!("find {} -name x", empty_outside.root.display());
+    // One literal shell word, whatever TMPDIR holds (spaces, apostrophes).
+    let quoted = format!(
+        "'{}'",
+        empty_outside
+            .root
+            .display()
+            .to_string()
+            .replace('\'', "'\\''")
+    );
+    let cd_empty_outside = format!("cd {quoted} && rg x");
+    let find_empty_outside = format!("find {quoted} -name x");
     let g = t.gate(Preset::Home, vec![]);
     for line in [
         "ls vault/work",
