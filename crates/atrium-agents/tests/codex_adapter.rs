@@ -166,17 +166,56 @@ fn allow() -> Arc<dyn ToolGate> {
     TestGate::new(|_| GateDecision::Allow)
 }
 
-async fn wait_file(path: &Path, secs: u64) -> String {
-    let end = Instant::now() + Duration::from_secs(secs);
+async fn wait_file_until<T>(
+    path: &Path,
+    timeout: Duration,
+    mut parse: impl FnMut(&str) -> Option<T>,
+) -> T {
+    let end = Instant::now() + timeout;
+    let mut last_seen: Option<String> = None;
     loop {
-        if let Ok(text) = fs::read_to_string(path)
-            && !text.trim().is_empty()
-        {
-            return text;
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Some(value) = parse(&text) {
+                return value;
+            }
+            last_seen = Some(text);
         }
-        assert!(Instant::now() < end, "{} never appeared", path.display());
+        assert!(
+            Instant::now() < end,
+            "{} never became complete (last_seen={last_seen:?})",
+            path.display()
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+async fn wait_file(path: &Path, secs: u64) -> String {
+    wait_file_until(path, Duration::from_secs(secs), |text| {
+        (text.ends_with('\n') && !text.trim().is_empty()).then(|| text.to_owned())
+    })
+    .await
+}
+
+async fn wait_json(path: &Path, secs: u64) -> Value {
+    wait_file_until(path, Duration::from_secs(secs), |text| {
+        serde_json::from_str::<Value>(text).ok()
+    })
+    .await
+}
+
+async fn wait_pid(path: &Path, secs: u64) -> String {
+    wait_file_until(path, Duration::from_secs(secs), |text| {
+        if !text.ends_with('\n') {
+            return None;
+        }
+        let trimmed = text.trim();
+        trimmed
+            .parse::<u32>()
+            .ok()
+            .filter(|&pid| pid > 0)
+            .map(|_| trimmed.to_owned())
+    })
+    .await
 }
 
 fn alive(pid: &str) -> bool {
@@ -258,8 +297,8 @@ async fn saturation_unread_events_still_obey_interrupt_and_shutdown() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(events.len(), events.max_capacity(), "event channel is full");
-    let pid = wait_file(&dir.join("pids.txt"), 5).await;
-    let grandchild = wait_file(&dir.join("grandchild.pid"), 5).await;
+    let pid = wait_pid(&dir.join("pids.txt"), 5).await;
+    let grandchild = wait_pid(&dir.join("grandchild.pid"), 5).await;
     assert!(alive(&grandchild) && group_alive(process.pgid));
 
     let t = Instant::now();
@@ -314,7 +353,7 @@ async fn an_interrupt_the_child_ignores_ends_the_session() {
         matches!(e, AgentEvent::TurnStarted { .. })
     })
     .await;
-    let pid = wait_file(&dir.join("pids.txt"), 5).await;
+    let pid = wait_pid(&dir.join("pids.txt"), 5).await;
     let pgid = session.process.as_ref().unwrap().pgid;
 
     session
@@ -355,7 +394,7 @@ async fn start_dropped_and_leader_exits_kill_process_group() {
         .unwrap_err();
     assert!(matches!(err, AdapterError::Handshake(_)));
     let identity = spawned.lock().unwrap().clone().expect("on_spawn called");
-    let grandchild = wait_file(&dir.join("grandchild.pid"), 5).await;
+    let grandchild = wait_pid(&dir.join("grandchild.pid"), 5).await;
     // Wait briefly for terminate_blocking / terminate to reap.
     let end = Instant::now() + Duration::from_secs(3);
     while alive(&grandchild) && Instant::now() < end {
@@ -1288,6 +1327,73 @@ async fn saturation_declines_approvals_questions_and_reports_dropped_events() {
         "expected dropped non-terminal event report, got {non_fatal_errors:?}"
     );
     assert!(matches!(evs.last(), Some(AgentEvent::SessionEnded { .. })));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn wait_helpers_ignore_empty_and_half_written_files() {
+    let dir = scratch("wait-partial");
+
+    // 1. JSON reader waits past empty and truncated files until valid JSON lands.
+    let json_path = dir.join("response.json");
+    fs::write(&json_path, "").unwrap();
+    let mut json_fut = Box::pin(wait_json(&json_path, 5));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut json_fut)
+            .await
+            .is_err(),
+        "wait_json returned on an empty file"
+    );
+    fs::write(&json_path, r#"{"result":{"decision":"#).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut json_fut)
+            .await
+            .is_err(),
+        "wait_json returned on truncated JSON"
+    );
+    fs::write(&json_path, r#"{"result":{"decision":"accept"}}"#).unwrap();
+    let value = json_fut.await;
+    assert_eq!(value["result"]["decision"], "accept");
+
+    // 2. PID and marker readers wait past empty and unterminated partial writes.
+    let pid_path = dir.join("grandchild.pid");
+    fs::write(&pid_path, "").unwrap();
+    let mut pid_fut = Box::pin(wait_pid(&pid_path, 5));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut pid_fut)
+            .await
+            .is_err(),
+        "wait_pid returned on an empty file"
+    );
+    fs::write(&pid_path, "4242").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut pid_fut)
+            .await
+            .is_err(),
+        "wait_pid returned before the trailing newline"
+    );
+    fs::write(&pid_path, "4242\n").unwrap();
+    assert_eq!(pid_fut.await, "4242");
+
+    let marker_path = dir.join("interrupted");
+    fs::write(&marker_path, "").unwrap();
+    let mut marker_fut = Box::pin(wait_file(&marker_path, 5));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut marker_fut)
+            .await
+            .is_err(),
+        "wait_file returned on an empty file"
+    );
+    fs::write(&marker_path, "1").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut marker_fut)
+            .await
+            .is_err(),
+        "wait_file returned before the trailing newline"
+    );
+    fs::write(&marker_path, "1\n").unwrap();
+    assert_eq!(marker_fut.await, "1\n");
 
     let _ = fs::remove_dir_all(&dir);
 }
