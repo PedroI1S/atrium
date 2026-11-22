@@ -12,14 +12,14 @@
 //!   without ever downgrading a listed-fold or identity hit.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::policy::limits;
 use crate::policy::model::{
-    AccessMode, ComputeBudget, Exhausted, FileIdentity, FileType, FoldRules, FsCaps, Hit, HitMatch,
-    HitSource, PartId, PartOutcome, PartResult, ProtectedSet, ResolveError, Target, TargetOrigin,
-    TargetResolution, UnreadReason,
+    AccessMode, ComputeBudget, DirEntry, Exhausted, FileIdentity, FileType, FoldRules, FsCaps, Hit,
+    HitMatch, HitSource, PartId, PartOutcome, PartResult, ProtectedSet, ResolveError, Target,
+    TargetOrigin, TargetResolution, UnreadReason,
 };
 use crate::policy::v4::paths::PathResolver;
 
@@ -213,29 +213,36 @@ pub(crate) fn fold_path_listed(path: &[u8], folds: FoldRules) -> Vec<u8> {
 }
 
 /// Extended equivalence fold for §5 / §11 item 13:
-/// - NFD canonical decomposition (Latin-1/Extended-A/B/Additional + Hangul
-///   algorithmic decomposition) with canonical combining-class ordering;
+/// - NFD canonical decomposition (complete Latin-1, Latin Extended-A, key
+///   Latin Extended-B / Additional / Greek / Cyrillic, and algorithmic Hangul)
+///   with complete Combining Diacritical Marks (`U+0300..=U+036F`) CCC ordering;
 /// - Full Unicode case folding beyond `str::to_lowercase()` (`ß`/`ẞ`→`ss`,
 ///   `İ`→`i`, `ı`→`i`, `ſ`→`s`, `K`→`k`, ligatures `ﬀ`..`ﬆ`, `ς`→`σ`, `µ`→`μ`);
-/// - Stripping APFS/HFS+ default-ignorable code points (soft hyphen, ZWSP,
-///   ZWNJ, ZWJ, LRM/RLM, bidi controls, BOM/FEFF).
+/// - Stripping APFS/HFS+ default-ignorable code points;
+/// - Returns `(folded_bytes, has_uncovered_non_ascii)` so any non-ASCII code
+///   point outside the exact table can be treated conservatively as a possible
+///   unlisted equivalence against non-ASCII protected components (§11 item 13).
 ///
 /// Invalid UTF-8 bytes are preserved verbatim.
-pub(crate) fn fold_extended_component(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn fold_extended_component_tracked(bytes: &[u8]) -> (Vec<u8>, bool) {
     let mut out = Vec::with_capacity(bytes.len());
+    let mut uncovered = false;
     let mut rest = bytes;
     while !rest.is_empty() {
         match std::str::from_utf8(rest) {
             Ok(valid) => {
-                push_extended_str(&mut out, valid);
+                if push_extended_str(&mut out, valid) {
+                    uncovered = true;
+                }
                 break;
             }
             Err(e) => {
                 let valid_len = e.valid_up_to();
                 if valid_len > 0
                     && let Ok(s) = std::str::from_utf8(&rest[..valid_len])
+                    && push_extended_str(&mut out, s)
                 {
-                    push_extended_str(&mut out, s);
+                    uncovered = true;
                 }
                 let err_len = e.error_len().unwrap_or(rest.len() - valid_len);
                 out.extend_from_slice(&rest[valid_len..valid_len + err_len]);
@@ -243,9 +250,14 @@ pub(crate) fn fold_extended_component(bytes: &[u8]) -> Vec<u8> {
             }
         }
     }
-    out
+    (out, uncovered)
 }
 
+pub(crate) fn fold_extended_component(bytes: &[u8]) -> Vec<u8> {
+    fold_extended_component_tracked(bytes).0
+}
+
+#[allow(dead_code)]
 pub(crate) fn fold_path_extended(path: &[u8]) -> Vec<u8> {
     let p = strip_firmlink(path);
     let mut folded = fold_extended_component(p);
@@ -258,8 +270,12 @@ pub(crate) fn fold_path_extended(path: &[u8]) -> Vec<u8> {
     folded
 }
 
-fn push_extended_str(out: &mut Vec<u8>, s: &str) {
+/// Returns `true` iff `s` contains any non-ASCII scalar whose canonical
+/// decomposition, combining class, or unlisted case fold is NOT guaranteed
+/// completely covered by the built-in exact table.
+fn push_extended_str(out: &mut Vec<u8>, s: &str) -> bool {
     let mut chars: Vec<char> = Vec::with_capacity(s.len());
+    let mut uncovered = false;
     for ch in s.chars() {
         if is_apfs_ignorable(ch) {
             continue;
@@ -273,6 +289,10 @@ fn push_extended_str(out: &mut Vec<u8>, s: &str) {
             '\u{0130}' | '\u{0131}' => chars.push('i'),
             '\u{017F}' => chars.push('s'),
             '\u{212A}' => chars.push('k'),
+            '\u{212B}' => {
+                chars.push('a');
+                chars.push('\u{030A}');
+            }
             '\u{03C2}' => chars.push('\u{03C3}'),
             '\u{00B5}' => chars.push('\u{03BC}'),
             '\u{FB00}' => chars.extend(['f', 'f']),
@@ -283,7 +303,9 @@ fn push_extended_str(out: &mut Vec<u8>, s: &str) {
             '\u{FB05}' | '\u{FB06}' => chars.extend(['s', 't']),
             other => {
                 for lc in other.to_lowercase() {
-                    decompose_nfd(lc, &mut chars);
+                    if !decompose_nfd(lc, &mut chars) {
+                        uncovered = true;
+                    }
                 }
             }
         }
@@ -305,19 +327,32 @@ fn push_extended_str(out: &mut Vec<u8>, s: &str) {
     for ch in chars {
         out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
     }
+    uncovered
 }
 
 fn is_apfs_ignorable(ch: char) -> bool {
     matches!(
         ch,
         '\u{00AD}'
+            | '\u{034F}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
             | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
     )
 }
 
+/// Complete Unicode Canonical_Combining_Class (CCC) values for Combining
+/// Diacritical Marks (`U+0300..=U+036F`).
 fn combining_class(ch: char) -> u8 {
     match ch {
         '\u{0300}'..='\u{0314}'
@@ -326,7 +361,9 @@ fn combining_class(ch: char) -> u8 {
         | '\u{034A}'..='\u{034C}'
         | '\u{0350}'..='\u{0352}'
         | '\u{0357}'
-        | '\u{035B}' => 230, // Above
+        | '\u{035B}'
+        | '\u{0363}'..='\u{036F}' => 230, // Above
+        '\u{0315}' | '\u{031A}' | '\u{0358}' => 232, // Above Right
         '\u{0316}'..='\u{0319}'
         | '\u{031C}'..='\u{0320}'
         | '\u{0323}'..='\u{0326}'
@@ -336,18 +373,29 @@ fn combining_class(ch: char) -> u8 {
         | '\u{034D}'..='\u{034E}'
         | '\u{0353}'..='\u{0356}'
         | '\u{0359}'..='\u{035A}' => 220, // Below
-        '\u{0327}' | '\u{0328}' => 202, // Attached below (cedilla, ogonek)
-        '\u{031B}' => 216,              // Attached above right (horn)
-        '\u{0334}'..='\u{0338}' => 1,   // Overlay
-        '\u{0345}' => 240,              // Iota subscript
+        '\u{0321}'..='\u{0322}' | '\u{0327}' | '\u{0328}' => 202, // Attached below
+        '\u{031B}' => 216,                           // Attached above right (horn)
+        '\u{0334}'..='\u{0338}' => 1,                // Overlay
+        '\u{0345}' => 240,                           // Iota subscript
+        '\u{035C}' | '\u{035F}' | '\u{0362}' => 233, // Double below
+        '\u{035D}'..='\u{035E}' | '\u{0360}'..='\u{0361}' => 234, // Double above
         _ => 0,
     }
 }
 
 /// Canonical NFD decomposition for precomposed lowercase Latin, common Greek/
 /// Cyrillic accented letters, and algorithmic Hangul syllables.
-fn decompose_nfd(ch: char, out: &mut Vec<char>) {
+///
+/// Returns `true` iff `ch` lies in a range whose canonical decomposition and
+/// combining class are completely covered by this table; returns `false` when
+/// `ch` is outside the exact table (so callers can apply §11 item 13's
+/// conservative `Unread` rule without false negatives).
+fn decompose_nfd(ch: char, out: &mut Vec<char>) -> bool {
     let cp = ch as u32;
+    if cp <= 0x7F {
+        out.push(ch);
+        return true;
+    }
     // Hangul algorithmic decomposition (Unicode Standard §3.12).
     if (0xAC00..=0xD7A3).contains(&cp) {
         let s_index = cp - 0xAC00;
@@ -365,10 +413,11 @@ fn decompose_nfd(ch: char, out: &mut Vec<char>) {
         {
             out.push(tc);
         }
-        return;
+        return true;
     }
 
-    // Lowercase Latin-1 Supplement & Latin Extended-A/B/Additional canonical decompositions.
+    // Complete lowercase Latin-1 Supplement, Latin Extended-A, plus key Latin
+    // Extended-B (including U+01FB `ǻ`), Latin Extended Additional, and Cyrillic.
     let decomp: Option<&[char]> = match ch {
         '\u{00E0}' => Some(&['a', '\u{0300}']), // à
         '\u{00E1}' => Some(&['a', '\u{0301}']), // á
@@ -397,7 +446,7 @@ fn decompose_nfd(ch: char, out: &mut Vec<char>) {
         '\u{00FC}' => Some(&['u', '\u{0308}']), // ü
         '\u{00FD}' => Some(&['y', '\u{0301}']), // ý
         '\u{00FF}' => Some(&['y', '\u{0308}']), // ÿ
-        // Latin Extended-A
+        // Latin Extended-A (complete)
         '\u{0101}' => Some(&['a', '\u{0304}']), // ā
         '\u{0103}' => Some(&['a', '\u{0306}']), // ă
         '\u{0105}' => Some(&['a', '\u{0328}']), // ą
@@ -451,7 +500,31 @@ fn decompose_nfd(ch: char, out: &mut Vec<char>) {
         '\u{017A}' => Some(&['z', '\u{0301}']), // ź
         '\u{017C}' => Some(&['z', '\u{0307}']), // ż
         '\u{017E}' => Some(&['z', '\u{030C}']), // ž
+        // Latin Extended-B canonical decompositions (including U+01FB `ǻ`)
+        '\u{01CE}' => Some(&['a', '\u{030C}']), // ǎ
+        '\u{01D0}' => Some(&['i', '\u{030C}']), // ǐ
+        '\u{01D2}' => Some(&['o', '\u{030C}']), // ǒ
+        '\u{01D4}' => Some(&['u', '\u{030C}']), // ǔ
+        '\u{01D6}' => Some(&['u', '\u{0308}', '\u{0304}']), // ǖ
+        '\u{01D8}' => Some(&['u', '\u{0308}', '\u{0301}']), // ǘ
+        '\u{01DA}' => Some(&['u', '\u{0308}', '\u{030C}']), // ǚ
+        '\u{01DC}' => Some(&['u', '\u{0308}', '\u{0300}']), // ǜ
+        '\u{01DF}' => Some(&['a', '\u{0308}', '\u{0304}']), // ǟ
+        '\u{01E1}' => Some(&['a', '\u{0307}', '\u{0304}']), // ǡ
+        '\u{01E3}' => Some(&['\u{00E6}', '\u{0304}']), // ǣ
+        '\u{01E7}' => Some(&['g', '\u{030C}']), // ǧ
+        '\u{01E9}' => Some(&['k', '\u{030C}']), // ǩ
+        '\u{01EB}' => Some(&['o', '\u{0328}']), // ǫ
+        '\u{01ED}' => Some(&['o', '\u{0328}', '\u{0304}']), // ǭ
+        '\u{01EF}' => Some(&['\u{0292}', '\u{030C}']), // ǯ
+        '\u{01F0}' => Some(&['j', '\u{030C}']), // ǰ
+        '\u{01F5}' => Some(&['g', '\u{0301}']), // ǵ
+        '\u{01F9}' => Some(&['n', '\u{0300}']), // ǹ
+        '\u{01FB}' => Some(&['a', '\u{030A}', '\u{0301}']), // ǻ
+        '\u{01FD}' => Some(&['\u{00E6}', '\u{0301}']), // ǽ
+        '\u{01FF}' => Some(&['\u{00F8}', '\u{0301}']), // ǿ
         // Common Latin Extended Additional (Vietnamese / European)
+        '\u{1E09}' => Some(&['c', '\u{0327}', '\u{0301}']), // ḉ
         '\u{1EBF}' => Some(&['e', '\u{0302}', '\u{0301}']), // ế
         '\u{1EC1}' => Some(&['e', '\u{0302}', '\u{0300}']), // ề
         '\u{1EDB}' => Some(&['o', '\u{031B}', '\u{0301}']), // ớ
@@ -463,9 +536,81 @@ fn decompose_nfd(ch: char, out: &mut Vec<char>) {
     };
     if let Some(seq) = decomp {
         out.extend_from_slice(seq);
-    } else {
-        out.push(ch);
+        return true;
     }
+    out.push(ch);
+    // Ranges whose canonical decompositions and combining classes are 100% covered:
+    // Latin-1 Supplement, Latin Extended-A, Combining Diacritical Marks, Hangul Jamo.
+    (0x0080..=0x017F).contains(&cp)
+        || (0x0300..=0x036F).contains(&cp)
+        || (0x1100..=0x11FF).contains(&cp)
+}
+
+/// Returns `true` iff path component `cand` could match `prot` under an
+/// unlisted equivalence (NFD/NFC normalization, unlisted Unicode case fold,
+/// APFS default-ignorable code points, or conservatively any uncovered
+/// non-ASCII decomposition when both components contain non-ASCII bytes; §11 item 13).
+fn component_may_match_unlisted(
+    cand: &[u8],
+    prot: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<bool, Exhausted> {
+    budget.charge((cand.len() + prot.len() + 1) as u64)?;
+    if cand.is_ascii() && prot.is_ascii() {
+        return Ok(cand.eq_ignore_ascii_case(prot));
+    }
+    budget.charge_alloc(
+        cand.len()
+            .saturating_add(prot.len())
+            .saturating_mul(2)
+            .max(2),
+    )?;
+    let (cand_ext, cand_uncovered) = fold_extended_component_tracked(cand);
+    let (prot_ext, prot_uncovered) = fold_extended_component_tracked(prot);
+    if cand_ext == prot_ext {
+        return Ok(true);
+    }
+    // Conservative §11 item 13 rule: when BOTH components contain non-ASCII
+    // bytes and either contains a scalar outside our exact NFD/CCC table,
+    // treat the pair as a potential unlisted equivalence (-> Unread, never a hit).
+    if (cand_uncovered || prot_uncovered) && !cand.is_ascii() && !prot.is_ascii() {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn split_path_components(path: &[u8]) -> Vec<&[u8]> {
+    strip_firmlink(path)
+        .split(|&b| b == b'/')
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn comps_match_prefix_unlisted(
+    cand: &[&[u8]],
+    prot: &[&[u8]],
+    budget: &mut ComputeBudget,
+) -> Result<bool, Exhausted> {
+    if cand.len() < prot.len() {
+        return Ok(false);
+    }
+    for (c, p) in cand.iter().zip(prot.iter()) {
+        if !component_may_match_unlisted(c, p, budget)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn comps_match_exact_unlisted(
+    cand: &[&[u8]],
+    prot: &[&[u8]],
+    budget: &mut ComputeBudget,
+) -> Result<bool, Exhausted> {
+    if cand.len() != prot.len() {
+        return Ok(false);
+    }
+    comps_match_prefix_unlisted(cand, prot, budget)
 }
 
 // ---------------------------------------------------------------------------
@@ -503,27 +648,71 @@ pub(crate) fn under_str<'a>(path: &'a str, base: &str) -> Option<&'a str> {
 /// checks on the same thread while the folded key stays equal (M1-31 N11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SharedSensitive {
+    raw_home: Vec<u8>,
+    raw_data: Vec<Vec<u8>>,
+    raw_protected: Vec<Vec<u8>>,
+    raw_ssh_linked: Vec<Vec<u8>>,
     key_home: Vec<u8>,
     key_data: Vec<Vec<u8>>,
     key_protected: Vec<Vec<u8>>,
     key_ssh_linked: Vec<Vec<u8>>,
     key_folds: FoldRules,
-    // Extended-folded equivalents for §11 item 13 checks.
-    ext_home: Vec<u8>,
-    ext_data: Vec<Vec<u8>>,
-    ext_protected: Vec<Vec<u8>>,
-    ext_ssh_linked: Vec<Vec<u8>>,
 }
 
 impl SharedSensitive {
     /// Returns an `Rc<SharedSensitive>` for `protected`, reusing the
     /// thread-local cache when the folded home, data, protected, ssh-linked
     /// lists and `FoldRules` match by value (M1-31 review 1, finding 1).
-    pub(crate) fn for_protected(protected: &ProtectedSet) -> Rc<Self> {
+    ///
+    /// Precharges compute and heap allocations against `budget` before folding
+    /// or building a cache entry (§8).
+    pub(crate) fn for_protected_budgeted(
+        protected: &ProtectedSet,
+        budget: &mut ComputeBudget,
+    ) -> Result<Rc<Self>, Exhausted> {
         thread_local! {
             static LAST: RefCell<Option<Rc<SharedSensitive>>> = const { RefCell::new(None) };
         }
         let folds = protected.folds;
+        let input_bytes = protected.home.len()
+            + protected
+                .atrium_data_paths
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+            + protected
+                .atrium_protected_paths
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+            + protected
+                .ssh_linked_dirs
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
+        budget.charge(input_bytes.max(1) as u64)?;
+
+        // Zero-allocation fast path when raw inputs are identical to the cached entry.
+        if let Some(hit) = LAST.with(|slot| {
+            let slot = slot.borrow();
+            if let Some(cached) = slot.as_ref()
+                && cached.key_folds == folds
+                && cached.raw_home == protected.home
+                && cached.raw_data == protected.atrium_data_paths
+                && cached.raw_protected == protected.atrium_protected_paths
+                && cached.raw_ssh_linked == protected.ssh_linked_dirs
+            {
+                return Some(Rc::clone(cached));
+            }
+            None
+        }) {
+            return Ok(hit);
+        }
+
+        // Precharge folding work and allocations before folding keys.
+        budget.charge(input_bytes.max(1) as u64)?;
+        budget.charge_alloc(input_bytes.max(1))?;
+
         let key_home = fold_path_listed(&protected.home, folds);
         let key_data: Vec<Vec<u8>> = protected
             .atrium_data_paths
@@ -541,8 +730,8 @@ impl SharedSensitive {
             .map(|p| fold_path_listed(p, folds))
             .collect();
 
-        LAST.with(|slot| {
-            let mut slot = slot.borrow_mut();
+        if let Some(hit) = LAST.with(|slot| {
+            let slot = slot.borrow();
             if let Some(cached) = slot.as_ref()
                 && cached.key_folds == folds
                 && cached.key_home == key_home
@@ -550,38 +739,39 @@ impl SharedSensitive {
                 && cached.key_protected == key_protected
                 && cached.key_ssh_linked == key_ssh_linked
             {
-                return Rc::clone(cached);
+                return Some(Rc::clone(cached));
             }
-            let ext_home = fold_path_extended(&protected.home);
-            let ext_data = protected
-                .atrium_data_paths
-                .iter()
-                .map(|p| fold_path_extended(p))
-                .collect();
-            let ext_protected = protected
-                .atrium_protected_paths
-                .iter()
-                .map(|p| fold_path_extended(p))
-                .collect();
-            let ext_ssh_linked = protected
-                .ssh_linked_dirs
-                .iter()
-                .map(|p| fold_path_extended(p))
-                .collect();
-            let built = Rc::new(Self {
-                key_home,
-                key_data,
-                key_protected,
-                key_ssh_linked,
-                key_folds: folds,
-                ext_home,
-                ext_data,
-                ext_protected,
-                ext_ssh_linked,
-            });
-            *slot = Some(Rc::clone(&built));
-            built
-        })
+            None
+        }) {
+            return Ok(hit);
+        }
+
+        // Cache miss: precharge allocation for storing raw copies + `SharedSensitive`.
+        budget.charge_alloc(std::mem::size_of::<Self>() + input_bytes)?;
+        let built = Rc::new(Self {
+            raw_home: protected.home.clone(),
+            raw_data: protected.atrium_data_paths.clone(),
+            raw_protected: protected.atrium_protected_paths.clone(),
+            raw_ssh_linked: protected.ssh_linked_dirs.clone(),
+            key_home,
+            key_data,
+            key_protected,
+            key_ssh_linked,
+            key_folds: folds,
+        });
+        LAST.with(|slot| {
+            *slot.borrow_mut() = Some(Rc::clone(&built));
+        });
+        Ok(built)
+    }
+
+    /// Convenience wrapper for tests that inspects the thread-local cache
+    /// using default limits.
+    #[cfg(test)]
+    pub(crate) fn for_protected(protected: &ProtectedSet) -> Rc<Self> {
+        let mut budget = ComputeBudget::with_default_limits();
+        Self::for_protected_budgeted(protected, &mut budget)
+            .expect("SharedSensitive fits default budget")
     }
 
     pub(crate) fn home_folded(&self) -> &[u8] {
@@ -619,23 +809,119 @@ impl SharedSensitive {
 
     /// Checks whether `canonical` matches a protected path (hard-deny or store)
     /// under extended equivalences (NFC/NFD, unlisted case folds, APFS
-    /// ignorables) when it did NOT match under the listed folds (§11 item 13).
+    /// ignorables, or conservatively any uncovered non-ASCII decomposition)
+    /// when it did NOT match under the listed folds (§11 item 13).
     pub(crate) fn matches_unlisted_equivalence(
         &self,
         canonical: &[u8],
         access: AccessMode,
-    ) -> bool {
-        let ext = fold_path_extended(canonical);
-        hard_deny_match_parts(
-            &ext,
-            &self.ext_home,
-            &self.ext_data,
-            &self.ext_protected,
-            &self.ext_ssh_linked,
-            access,
-        )
-        .is_some()
-            || store_match_parts(&ext, &self.ext_home).is_some()
+        budget: &mut ComputeBudget,
+    ) -> Result<bool, Exhausted> {
+        let writes = access != AccessMode::Read;
+        let cand_comps = split_path_components(canonical);
+        budget.charge((canonical.len() + cand_comps.len() + 1) as u64)?;
+        budget.charge_alloc(cand_comps.len() * std::mem::size_of::<&[u8]>())?;
+
+        for d in &self.raw_data {
+            let d_comps = split_path_components(d);
+            if comps_match_prefix_unlisted(&cand_comps, &d_comps, budget)? {
+                return Ok(true);
+            }
+        }
+        if writes {
+            for d in &self.raw_protected {
+                let d_comps = split_path_components(d);
+                if comps_match_prefix_unlisted(&cand_comps, &d_comps, budget)? {
+                    return Ok(true);
+                }
+            }
+        }
+        for d in &self.raw_ssh_linked {
+            let d_comps = split_path_components(d);
+            if comps_match_prefix_unlisted(&cand_comps, &d_comps, budget)?
+                && (cand_comps.len() > d_comps.len() || writes)
+            {
+                return Ok(true);
+            }
+        }
+
+        let home_comps = split_path_components(&self.raw_home);
+        if !comps_match_prefix_unlisted(&cand_comps, &home_comps, budget)? {
+            return Ok(false);
+        }
+        let rest = &cand_comps[home_comps.len()..];
+        if rest.is_empty() {
+            return Ok(false);
+        }
+
+        for f in CRED_FILES {
+            let prot_comps: Vec<&[u8]> = f.split('/').map(str::as_bytes).collect();
+            if comps_match_exact_unlisted(rest, &prot_comps, budget)? {
+                return Ok(true);
+            }
+        }
+        for t in CRED_TREES {
+            let prot_comps: Vec<&[u8]> = t.split('/').map(str::as_bytes).collect();
+            if comps_match_prefix_unlisted(rest, &prot_comps, budget)? {
+                return Ok(true);
+            }
+        }
+        if component_may_match_unlisted(rest[0], b".ssh", budget)? {
+            if rest.len() == 1 {
+                if writes {
+                    return Ok(true);
+                }
+            } else {
+                let last = rest[rest.len() - 1];
+                budget.charge_alloc(last.len().max(1))?;
+                let last_ext = fold_extended_component(last);
+                let is_public = last_ext.ends_with(b".pub") || last_ext.starts_with(b"known_hosts");
+                let is_readable_cfg = rest.len() == 2
+                    && (component_may_match_unlisted(rest[1], b"config", budget)?
+                        || component_may_match_unlisted(rest[1], b"authorized_keys", budget)?);
+                if !(is_public || (is_readable_cfg && !writes)) {
+                    return Ok(true);
+                }
+            }
+        }
+        for b in BROWSER_ROOTS {
+            let b_comps: Vec<&[u8]> = b.split('/').map(str::as_bytes).collect();
+            if rest.len() > b_comps.len() && comps_match_prefix_unlisted(rest, &b_comps, budget)? {
+                let last = rest[rest.len() - 1];
+                for bf in BROWSER_FILES {
+                    if component_may_match_unlisted(last, bf.as_bytes(), budget)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        for &(f, _) in ASK_FILES {
+            let prot_comps: Vec<&[u8]> = f.split('/').map(str::as_bytes).collect();
+            if comps_match_exact_unlisted(rest, &prot_comps, budget)? {
+                return Ok(true);
+            }
+        }
+        for &(t, _) in ASK_TREES {
+            let prot_comps: Vec<&[u8]> = t.split('/').map(str::as_bytes).collect();
+            if comps_match_prefix_unlisted(rest, &prot_comps, budget)? {
+                return Ok(true);
+            }
+        }
+        for &(dir, pre, _) in ASK_NAME_PREFIXES {
+            let dir_comps: Vec<&[u8]> = dir.split('/').map(str::as_bytes).collect();
+            if rest.len() == dir_comps.len() + 1
+                && comps_match_prefix_unlisted(rest, &dir_comps, budget)?
+            {
+                let last = rest[dir_comps.len()];
+                budget.charge_alloc(last.len().max(1))?;
+                let last_ext = fold_extended_component(last);
+                if last_ext.starts_with(pre.as_bytes()) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     /// Representative hard-deny probe paths (folded lowercase, absolute) for
@@ -821,6 +1107,31 @@ pub(crate) fn origin_to_part(origin: &TargetOrigin) -> PartId {
 
 /// Checks one resolved (or unread) [`Target`] against `protected`: identities,
 /// listed name folds, and unlisted volume equivalences (§5, §11 item 13).
+fn unread_reason_alloc_bytes(reason: &UnreadReason) -> usize {
+    match reason {
+        UnreadReason::ProcessDependentPath { path }
+        | UnreadReason::UnresolvablePath { path }
+        | UnreadReason::UnlistedNameEquivalence { path }
+        | UnreadReason::FollowedLinkUnderFilter { path } => path.len(),
+        UnreadReason::VariantOnlyGlobMatch { pattern } => pattern.len(),
+        UnreadReason::ReservedWordOrConstruct { construct } => construct.len(),
+        UnreadReason::UnsupportedWrapperForm { wrapper } => wrapper.len(),
+        UnreadReason::UnsupportedNestedShellForm { shell } => shell.len(),
+        UnreadReason::CodeRunnerInlineCode { tool }
+        | UnreadReason::OutsideToolModel { tool }
+        | UnreadReason::DerivedDestinations { tool } => tool.len(),
+        UnreadReason::Program { program_words } => {
+            program_words.iter().map(String::len).sum::<usize>()
+        }
+        UnreadReason::UnknownFlag { tool, flag }
+        | UnreadReason::UnsupportedBaseDirChange { tool, flag }
+        | UnreadReason::UnsupportedFlagEffect { tool, flag } => tool.len() + flag.len(),
+        UnreadReason::GitWildcardPathspec { pathspec } => pathspec.len(),
+        UnreadReason::UnsupportedRedirect { op } => op.len(),
+        _ => 0,
+    }
+}
+
 pub(crate) fn check_target_impl(
     target: &Target,
     protected: &ProtectedSet,
@@ -831,6 +1142,10 @@ pub(crate) fn check_target_impl(
     let (canonical, identities) = match &target.resolution {
         TargetResolution::Unread(reason) => {
             budget.charge(1)?;
+            let alloc = unread_reason_alloc_bytes(reason);
+            if alloc > 0 {
+                budget.charge_alloc(alloc)?;
+            }
             return Ok(PartResult {
                 part,
                 outcome: PartOutcome::Unread(reason.clone()),
@@ -853,6 +1168,7 @@ pub(crate) fn check_target_impl(
         }
     ) {
         budget.charge(canonical.len().max(1) as u64)?;
+        budget.charge_alloc(canonical.len())?;
         return Ok(PartResult {
             part,
             outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
@@ -861,7 +1177,10 @@ pub(crate) fn check_target_impl(
         });
     }
 
+    // Precharge identity scan, path folding, and output path allocation BEFORE
+    // any work or heap allocation (§8).
     budget.charge((canonical.len() + identities.len() + 1) as u64)?;
+    budget.charge_alloc(canonical.len().max(1))?;
 
     // 1. Hard-deny identity check (path and every existing ancestor).
     for id in identities {
@@ -885,8 +1204,11 @@ pub(crate) fn check_target_impl(
     }
 
     // 2. Listed-fold hard-deny check (in addition to identity).
-    let shared = SharedSensitive::for_protected(protected);
+    let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
     let folded = fold_path_listed(canonical, protected.folds);
+    if folded.len() > canonical.len() {
+        budget.charge_alloc(folded.len() - canonical.len())?;
+    }
     if let Some(hard_id) = shared.hard_deny_hit_folded(&folded, target.access) {
         return Ok(PartResult {
             part: part.clone(),
@@ -930,8 +1252,7 @@ pub(crate) fn check_target_impl(
     }
 
     // 5. Unlisted equivalence check (§5, §11 item 13): never downgrades a hit.
-    budget.charge(canonical.len().max(1) as u64)?;
-    if shared.matches_unlisted_equivalence(canonical, target.access) {
+    if shared.matches_unlisted_equivalence(canonical, target.access, budget)? {
         return Ok(PartResult {
             part,
             outcome: PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence {
@@ -947,13 +1268,329 @@ pub(crate) fn check_target_impl(
 }
 
 // ---------------------------------------------------------------------------
-// ProtectedSet builder helper (populates identities and ~/.ssh linked dirs)
+// ProtectedSet builder & write-only identity collector
 // ---------------------------------------------------------------------------
 
+type DirCache = HashMap<Vec<u8>, Option<Vec<DirEntry>>>;
+
+fn read_dir_cached<'a>(
+    dir: &[u8],
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    cache: &'a mut DirCache,
+    unreads: Option<&mut Vec<UnreadReason>>,
+) -> Result<Option<&'a [DirEntry]>, Exhausted> {
+    if !cache.contains_key(dir) {
+        budget.charge_alloc(dir.len())?;
+        let val = match resolver.read_dir(dir, caps, budget) {
+            Ok(entries) => Some(entries),
+            Err(ResolveError::Exhausted(e)) => return Err(e),
+            Err(
+                ResolveError::NotFound
+                | ResolveError::Io(crate::policy::model::FsIoError::NotADirectory),
+            ) => None,
+            Err(ResolveError::CapReached(c)) => {
+                if let Some(u) = unreads {
+                    let r = UnreadReason::from(c);
+                    if !u.contains(&r) {
+                        u.push(r);
+                    }
+                }
+                None
+            }
+            Err(ResolveError::Io(_)) => {
+                if let Some(u) = unreads {
+                    let r = UnreadReason::UnresolvablePath { path: dir.to_vec() };
+                    if !u.contains(&r) {
+                        u.push(r);
+                    }
+                }
+                None
+            }
+        };
+        cache.insert(dir.to_vec(), val);
+    }
+    Ok(cache.get(dir).and_then(|opt| opt.as_deref()))
+}
+
+/// Discovers all existing listed-fold spellings of `rel_folded` under `base`
+/// using cached `read_dir` calls (falling back to the exact lowercase path when
+/// a parent directory cannot be listed).
+#[allow(clippy::too_many_arguments)]
+fn resolve_folded_under_base(
+    base: &[u8],
+    rel_folded: &str,
+    folds: FoldRules,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    cache: &mut DirCache,
+    mut unreads: Option<&mut Vec<UnreadReason>>,
+) -> Result<Vec<Vec<u8>>, Exhausted> {
+    let comps: Vec<&str> = rel_folded.split('/').filter(|s| !s.is_empty()).collect();
+    if comps.is_empty() {
+        budget.charge_alloc(base.len())?;
+        return Ok(vec![base.to_vec()]);
+    }
+    budget.charge_alloc(base.len())?;
+    let mut frontier: Vec<Vec<u8>> = vec![base.to_vec()];
+    for comp in comps {
+        let mut next: Vec<Vec<u8>> = Vec::new();
+        for dir in &frontier {
+            let entries_opt =
+                read_dir_cached(dir, resolver, caps, budget, cache, unreads.as_deref_mut())?;
+            if let Some(entries) = entries_opt {
+                for entry in entries {
+                    budget.charge(entry.name.len().max(1) as u64)?;
+                    let folded =
+                        fold_listed_component(&entry.name, folds.fold_long_s, folds.fold_kelvin);
+                    if folded == comp.as_bytes() {
+                        let cand_len = dir.len() + 1 + entry.name.len();
+                        budget.charge_alloc(cand_len)?;
+                        let cand = join_folded(dir, &entry.name);
+                        if !next.contains(&cand) {
+                            next.push(cand);
+                        }
+                    }
+                }
+            } else {
+                // Fallback when `dir` is non-listable (e.g. chmod 0111) or cap-reached.
+                let cand_len = dir.len() + 1 + comp.len();
+                budget.charge_alloc(cand_len)?;
+                let cand = join_folded(dir, comp.as_bytes());
+                if !next.contains(&cand) {
+                    next.push(cand);
+                }
+            }
+        }
+        if next.is_empty() {
+            return Ok(Vec::new());
+        }
+        frontier = next;
+    }
+    Ok(frontier)
+}
+
+/// Discovers exact `path` plus any listed-fold sibling spellings in `path`'s
+/// parent directory (used for Atrium data / protected paths).
+#[allow(clippy::too_many_arguments)]
+fn resolve_folded_abs_path(
+    path: &[u8],
+    folds: FoldRules,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    cache: &mut DirCache,
+    unreads: Option<&mut Vec<UnreadReason>>,
+) -> Result<Vec<Vec<u8>>, Exhausted> {
+    let mut out = Vec::new();
+    budget.charge_alloc(path.len())?;
+    out.push(path.to_vec());
+    let mut end = path.len();
+    while end > 1 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    let trimmed = &path[..end];
+    if let Some(pos) = trimmed.iter().rposition(|&b| b == b'/') {
+        let parent = if pos == 0 {
+            b"/".as_slice()
+        } else {
+            &trimmed[..pos]
+        };
+        let name = &trimmed[pos + 1..];
+        if !name.is_empty() {
+            let target_folded = fold_listed_component(name, folds.fold_long_s, folds.fold_kelvin);
+            if let Some(entries) = read_dir_cached(parent, resolver, caps, budget, cache, unreads)?
+            {
+                for entry in entries {
+                    budget.charge(entry.name.len().max(1) as u64)?;
+                    let ef =
+                        fold_listed_component(&entry.name, folds.fold_long_s, folds.fold_kelvin);
+                    if ef == target_folded {
+                        let cand_len = parent.len() + 1 + entry.name.len();
+                        budget.charge_alloc(cand_len)?;
+                        let cand = join_folded(parent, &entry.name);
+                        if !out.contains(&cand) {
+                            out.push(cand);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Records BOTH `lstat` (retaining dangling symlinks and symlink spellings under
+/// their own name, §5) and `stat` (when `path` is a symlink pointing to an
+/// existing target).
+#[allow(clippy::too_many_arguments)]
+fn record_lstat_and_stat(
+    path: &[u8],
+    tag: &'static str,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    seen: &mut HashSet<FileIdentity>,
+    out: &mut Vec<(FileIdentity, &'static str)>,
+    mut unreads: Option<&mut Vec<UnreadReason>>,
+) -> Result<Option<FileType>, Exhausted> {
+    let meta = match resolver.lstat(path, caps, budget) {
+        Ok(m) => m,
+        Err(ResolveError::Exhausted(e)) => return Err(e),
+        Err(
+            ResolveError::NotFound
+            | ResolveError::Io(crate::policy::model::FsIoError::NotADirectory),
+        ) => {
+            return Ok(None);
+        }
+        Err(ResolveError::CapReached(c)) => {
+            if let Some(u) = unreads.as_deref_mut() {
+                let r = UnreadReason::from(c);
+                if !u.contains(&r) {
+                    u.push(r);
+                }
+            }
+            return Ok(None);
+        }
+        Err(ResolveError::Io(_)) => {
+            if let Some(u) = unreads.as_deref_mut() {
+                let r = UnreadReason::UnresolvablePath {
+                    path: path.to_vec(),
+                };
+                if !u.contains(&r) {
+                    u.push(r);
+                }
+            }
+            return Ok(None);
+        }
+    };
+    if let Some(id) = meta.identity
+        && seen.insert(id)
+    {
+        budget.charge_alloc(std::mem::size_of::<(FileIdentity, &str)>())?;
+        out.push((id, tag));
+    }
+    if meta.file_type == FileType::Symlink {
+        match resolver.stat(path, caps, budget) {
+            Ok(target_meta) => {
+                if let Some(tid) = target_meta.identity
+                    && seen.insert(tid)
+                {
+                    budget.charge_alloc(std::mem::size_of::<(FileIdentity, &str)>())?;
+                    out.push((tid, tag));
+                }
+                return Ok(Some(target_meta.file_type));
+            }
+            Err(ResolveError::Exhausted(e)) => return Err(e),
+            Err(ResolveError::CapReached(c)) => {
+                if let Some(u) = unreads {
+                    let r = UnreadReason::from(c);
+                    if !u.contains(&r) {
+                        u.push(r);
+                    }
+                }
+            }
+            Err(ResolveError::NotFound | ResolveError::Io(_)) => {}
+        }
+    }
+    Ok(Some(meta.file_type))
+}
+
+/// Bounded walk inside a protected tree (`atrium_data_paths` or
+/// `atrium_protected_paths`) to record member file/symlink identities so hard
+/// links to files inside the tree are caught by identity (§5).
+#[allow(clippy::too_many_arguments)]
+fn walk_protected_tree_members(
+    root: &[u8],
+    tag: &'static str,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    seen: &mut HashSet<FileIdentity>,
+    out: &mut Vec<(FileIdentity, &'static str)>,
+    mut unreads: Option<&mut Vec<UnreadReason>>,
+) -> Result<(), Exhausted> {
+    const TREE_MAX_ENTRIES: usize = 1024;
+    const TREE_MAX_DEPTH: u8 = 8;
+
+    let mut stack: Vec<(Vec<u8>, u8)> = vec![(root.to_vec(), 0)];
+    let mut visited_dirs: HashSet<FileIdentity> = HashSet::new();
+    let mut entries_seen = 0usize;
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= TREE_MAX_DEPTH || entries_seen >= TREE_MAX_ENTRIES {
+            continue;
+        }
+        let entries = match resolver.read_dir(&dir, caps, budget) {
+            Ok(e) => e,
+            Err(ResolveError::Exhausted(e)) => return Err(e),
+            Err(
+                ResolveError::NotFound
+                | ResolveError::Io(crate::policy::model::FsIoError::NotADirectory),
+            ) => {
+                continue;
+            }
+            Err(ResolveError::CapReached(c)) => {
+                if let Some(u) = unreads.as_deref_mut() {
+                    let r = UnreadReason::from(c);
+                    if !u.contains(&r) {
+                        u.push(r);
+                    }
+                }
+                return Ok(());
+            }
+            Err(ResolveError::Io(_)) => {
+                if let Some(u) = unreads.as_deref_mut() {
+                    let r = UnreadReason::UnresolvablePath { path: dir };
+                    if !u.contains(&r) {
+                        u.push(r);
+                    }
+                }
+                continue;
+            }
+        };
+        for entry in entries {
+            if entry.name == b"." || entry.name == b".." {
+                continue;
+            }
+            entries_seen += 1;
+            if entries_seen > TREE_MAX_ENTRIES {
+                break;
+            }
+            budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
+            let child = join_folded(&dir, &entry.name);
+            let ft = record_lstat_and_stat(
+                &child,
+                tag,
+                resolver,
+                caps,
+                budget,
+                seen,
+                out,
+                unreads.as_deref_mut(),
+            )?;
+            if ft == Some(FileType::Dir) && depth + 1 < TREE_MAX_DEPTH {
+                match resolver.stat(&child, caps, budget) {
+                    Ok(md) if md.identity.is_none_or(|id| visited_dirs.insert(id)) => {
+                        stack.push((child, depth + 1));
+                    }
+                    Err(ResolveError::Exhausted(e)) => return Err(e),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Builds a [`ProtectedSet`] using `resolver` (charging `caps` and `budget`),
-/// populating `(dev, ino)` identities for existing hard-deny paths, `~/.ssh`
-/// members (including dangling links inside `~/.ssh`, M1-32 rework4 finding 2),
-/// directories linked into `~/.ssh`, and CR-12 / CR-17 credential stores.
+/// populating `(dev, ino)` identities for existing hard-deny paths (across
+/// listed-fold spellings and including dangling symlinks via `lstat`),
+/// `~/.ssh` members (including dangling links and folded `.SSH` / `.ſsh`
+/// spellings), directories linked into `~/.ssh`, browser credential files,
+/// Atrium data paths, and CR-12 / CR-17 credential stores.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_protected_set(
     home: &[u8],
@@ -965,6 +1602,8 @@ pub(crate) fn build_protected_set(
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
 ) -> Result<ProtectedSet, Exhausted> {
+    budget.charge((home.len() + cwd.len() + 1) as u64)?;
+    budget.charge_alloc(home.len() + cwd.len())?;
     let mut set = ProtectedSet {
         home: home.to_vec(),
         cwd: cwd.to_vec(),
@@ -978,72 +1617,84 @@ pub(crate) fn build_protected_set(
 
     let mut seen_hd: HashSet<FileIdentity> = HashSet::new();
     let mut seen_store: HashSet<FileIdentity> = HashSet::new();
+    let mut dir_cache: DirCache = HashMap::new();
 
-    #[allow(clippy::too_many_arguments)]
-    fn add_hd_path(
-        path: &[u8],
-        id_str: &'static str,
-        resolver: &dyn PathResolver,
-        caps: &mut FsCaps,
-        budget: &mut ComputeBudget,
-        seen_hd: &mut HashSet<FileIdentity>,
-        set: &mut ProtectedSet,
-    ) -> Result<(), Exhausted> {
-        match resolver.stat(path, caps, budget) {
-            Ok(meta) => {
-                if let Some(id) = meta.identity
-                    && seen_hd.insert(id)
-                {
-                    set.hard_deny_identities.push((id, id_str));
-                }
-            }
-            Err(ResolveError::Exhausted(e)) => return Err(e),
-            Err(ResolveError::NotFound | ResolveError::Io(_) | ResolveError::CapReached(_)) => {}
-        }
-        Ok(())
-    }
-
-    // Hard-deny files, trees, and Atrium data paths.
+    // 1. Hard-deny files & trees (across listed-fold spellings, retaining dangling links via lstat).
     for f in CRED_FILES {
-        let p = join_folded(home, f.as_bytes());
-        add_hd_path(
-            &p,
-            "credential-read",
-            resolver,
-            caps,
-            budget,
-            &mut seen_hd,
-            &mut set,
-        )?;
+        for p in
+            resolve_folded_under_base(home, f, folds, resolver, caps, budget, &mut dir_cache, None)?
+        {
+            record_lstat_and_stat(
+                &p,
+                "credential-read",
+                resolver,
+                caps,
+                budget,
+                &mut seen_hd,
+                &mut set.hard_deny_identities,
+                None,
+            )?;
+        }
     }
     for t in CRED_TREES {
-        let p = join_folded(home, t.as_bytes());
-        add_hd_path(
-            &p,
-            "credential-read",
-            resolver,
-            caps,
-            budget,
-            &mut seen_hd,
-            &mut set,
-        )?;
-    }
-    let data_paths = set.atrium_data_paths.clone();
-    for d in &data_paths {
-        add_hd_path(
-            d,
-            "atrium-self",
-            resolver,
-            caps,
-            budget,
-            &mut seen_hd,
-            &mut set,
-        )?;
+        for p in
+            resolve_folded_under_base(home, t, folds, resolver, caps, budget, &mut dir_cache, None)?
+        {
+            record_lstat_and_stat(
+                &p,
+                "credential-read",
+                resolver,
+                caps,
+                budget,
+                &mut seen_hd,
+                &mut set.hard_deny_identities,
+                None,
+            )?;
+        }
     }
 
-    // Walk ~/.ssh (bounded, matching gate.rs ssh_members + M1-32 dangling members).
-    let ssh_dir = join_folded(home, b".ssh");
-    let mut stack: Vec<(Vec<u8>, u8, bool)> = vec![(ssh_dir, 0, false)];
+    // 2. Atrium data paths (exact + folded sibling spellings, lstat+stat, plus member files).
+    let data_paths = set.atrium_data_paths.clone();
+    for d in &data_paths {
+        for cand in resolve_folded_abs_path(d, folds, resolver, caps, budget, &mut dir_cache, None)?
+        {
+            let ft = record_lstat_and_stat(
+                &cand,
+                "atrium-self",
+                resolver,
+                caps,
+                budget,
+                &mut seen_hd,
+                &mut set.hard_deny_identities,
+                None,
+            )?;
+            if ft == Some(FileType::Dir) {
+                walk_protected_tree_members(
+                    &cand,
+                    "atrium-self",
+                    resolver,
+                    caps,
+                    budget,
+                    &mut seen_hd,
+                    &mut set.hard_deny_identities,
+                    None,
+                )?;
+            }
+        }
+    }
+
+    // 3. Walk all listed-fold spellings of `~/.ssh` (e.g. `.ssh`, `.SSH`, `.ſsh`).
+    let ssh_dirs = resolve_folded_under_base(
+        home,
+        ".ssh",
+        folds,
+        resolver,
+        caps,
+        budget,
+        &mut dir_cache,
+        None,
+    )?;
+    let mut stack: Vec<(Vec<u8>, u8, bool)> = ssh_dirs.into_iter().map(|d| (d, 0, false)).collect();
     let mut visited_dirs: HashSet<FileIdentity> = HashSet::new();
     let mut entries_seen = 0usize;
     const SSH_MAX_ENTRIES: usize = 1024;
@@ -1061,10 +1712,14 @@ pub(crate) fn build_protected_set(
             }
         };
         for entry in entries {
+            if entry.name == b"." || entry.name == b".." {
+                continue;
+            }
             entries_seen += 1;
             if entries_seen > SSH_MAX_ENTRIES {
                 break;
             }
+            budget.charge(entry.name.len().max(1) as u64)?;
             let name_lower =
                 fold_listed_component(&entry.name, folds.fold_long_s, folds.fold_kelvin);
             let is_public_ssh = !linked
@@ -1073,16 +1728,19 @@ pub(crate) fn build_protected_set(
                         || n.starts_with("known_hosts")
                         || (depth == 0 && (n == "config" || n == "authorized_keys"))
                 });
+            budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
             let child = join_folded(&dir, &entry.name);
             match entry.file_type {
                 FileType::Symlink => {
-                    // Record dangling symlink's own identity too (M1-32 rework4 finding 2).
+                    // Record dangling symlink's own identity AND resolved target identity.
                     if !is_public_ssh {
                         match resolver.lstat(&child, caps, budget) {
                             Ok(md) => {
                                 if let Some(id) = md.identity
                                     && seen_hd.insert(id)
                                 {
+                                    budget
+                                        .charge_alloc(std::mem::size_of::<(FileIdentity, &str)>())?;
                                     set.hard_deny_identities.push((id, "credential-read"));
                                 }
                             }
@@ -1111,6 +1769,7 @@ pub(crate) fn build_protected_set(
                                 && let Some(id) = md.identity
                                 && seen_hd.insert(id)
                             {
+                                budget.charge_alloc(std::mem::size_of::<(FileIdentity, &str)>())?;
                                 set.hard_deny_identities.push((id, "credential-read"));
                             }
                         }
@@ -1120,11 +1779,6 @@ pub(crate) fn build_protected_set(
                 }
                 FileType::Dir => match resolver.lstat(&child, caps, budget) {
                     Ok(md) => {
-                        // Do not add subdir inodes to `hard_deny_identities`:
-                        // `~/.ssh/sub/key.pub` must keep its `.pub` exception
-                        // while private files inside `sub` get their own file
-                        // identities below and `~/.ssh/sub` itself stays
-                        // blocked by listed path name.
                         let visit = md.identity.is_none_or(|id| visited_dirs.insert(id));
                         if visit {
                             stack.push((child, depth + 1, linked));
@@ -1135,14 +1789,15 @@ pub(crate) fn build_protected_set(
                 },
                 FileType::File | FileType::Other => {
                     if !is_public_ssh {
-                        add_hd_path(
+                        record_lstat_and_stat(
                             &child,
                             "credential-read",
                             resolver,
                             caps,
                             budget,
                             &mut seen_hd,
-                            &mut set,
+                            &mut set.hard_deny_identities,
+                            None,
                         )?;
                     }
                 }
@@ -1150,52 +1805,240 @@ pub(crate) fn build_protected_set(
         }
     }
 
-    // Store identities (CR-12 + CR-17).
-    let mut add_store = |path: &[u8],
-                         family: &'static str,
-                         caps: &mut FsCaps,
-                         budget: &mut ComputeBudget,
-                         set: &mut ProtectedSet|
-     -> Result<(), Exhausted> {
-        match resolver.stat(path, caps, budget) {
-            Ok(meta) => {
-                if let Some(id) = meta.identity
-                    && seen_store.insert(id)
-                {
-                    set.store_identities.push((id, family));
+    // 4. Bounded walk of existing browser roots for `BROWSER_FILES` identities
+    //    (catches hard links and dangling/symlinked browser credential files
+    //    without adding ordinary profile folders or `Preferences`).
+    const BROWSER_ID_MAX_ENTRIES: usize = 1024;
+    const BROWSER_ID_MAX_DEPTH: u8 = 8;
+    let mut b_entries = 0usize;
+    let mut b_visited: HashSet<FileIdentity> = HashSet::new();
+    for b in BROWSER_ROOTS {
+        if b_entries >= BROWSER_ID_MAX_ENTRIES {
+            break;
+        }
+        let b_dirs = resolve_folded_under_base(
+            home,
+            b,
+            folds,
+            resolver,
+            caps,
+            budget,
+            &mut dir_cache,
+            None,
+        )?;
+        let mut b_stack: Vec<(Vec<u8>, u8)> = b_dirs.into_iter().map(|d| (d, 0)).collect();
+        while let Some((dir, depth)) = b_stack.pop() {
+            if depth >= BROWSER_ID_MAX_DEPTH || b_entries >= BROWSER_ID_MAX_ENTRIES {
+                continue;
+            }
+            let entries = match resolver.read_dir(&dir, caps, budget) {
+                Ok(e) => e,
+                Err(ResolveError::Exhausted(e)) => return Err(e),
+                Err(_) => continue,
+            };
+            for entry in entries {
+                if entry.name == b"." || entry.name == b".." {
+                    continue;
+                }
+                b_entries += 1;
+                if b_entries > BROWSER_ID_MAX_ENTRIES {
+                    break;
+                }
+                budget.charge(entry.name.len().max(1) as u64)?;
+                let nl = fold_listed_component(&entry.name, folds.fold_long_s, folds.fold_kelvin);
+                if entry.file_type == FileType::Dir {
+                    if depth + 1 < BROWSER_ID_MAX_DEPTH {
+                        budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
+                        let child = join_folded(&dir, &entry.name);
+                        match resolver.lstat(&child, caps, budget) {
+                            Ok(md) if md.identity.is_none_or(|id| b_visited.insert(id)) => {
+                                b_stack.push((child, depth + 1));
+                            }
+                            Err(ResolveError::Exhausted(e)) => return Err(e),
+                            _ => {}
+                        }
+                    }
+                } else if std::str::from_utf8(&nl).is_ok_and(|n| BROWSER_FILES.contains(&n)) {
+                    budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
+                    let child = join_folded(&dir, &entry.name);
+                    record_lstat_and_stat(
+                        &child,
+                        "credential-read",
+                        resolver,
+                        caps,
+                        budget,
+                        &mut seen_hd,
+                        &mut set.hard_deny_identities,
+                        None,
+                    )?;
                 }
             }
-            Err(ResolveError::Exhausted(e)) => return Err(e),
-            Err(ResolveError::NotFound | ResolveError::Io(_) | ResolveError::CapReached(_)) => {}
         }
-        Ok(())
-    };
+    }
 
+    // 5. Store identities (CR-12 + CR-17, across listed-fold spellings, retaining dangling links).
     for &(f, family) in ASK_FILES {
-        let p = join_folded(home, f.as_bytes());
-        add_store(&p, family, caps, budget, &mut set)?;
+        for p in
+            resolve_folded_under_base(home, f, folds, resolver, caps, budget, &mut dir_cache, None)?
+        {
+            record_lstat_and_stat(
+                &p,
+                family,
+                resolver,
+                caps,
+                budget,
+                &mut seen_store,
+                &mut set.store_identities,
+                None,
+            )?;
+        }
     }
     for &(t, family) in ASK_TREES {
-        let p = join_folded(home, t.as_bytes());
-        add_store(&p, family, caps, budget, &mut set)?;
+        for p in
+            resolve_folded_under_base(home, t, folds, resolver, caps, budget, &mut dir_cache, None)?
+        {
+            record_lstat_and_stat(
+                &p,
+                family,
+                resolver,
+                caps,
+                budget,
+                &mut seen_store,
+                &mut set.store_identities,
+                None,
+            )?;
+        }
     }
     for &(dir, pre, family) in ASK_NAME_PREFIXES {
-        let dir_path = join_folded(home, dir.as_bytes());
-        match resolver.read_dir(&dir_path, caps, budget) {
-            Ok(entries) => {
-                for entry in entries.into_iter().take(limits::WALK_MAX_ENTRIES.min(256)) {
-                    let nl =
-                        fold_listed_component(&entry.name, folds.fold_long_s, folds.fold_kelvin);
-                    if nl.starts_with(pre.as_bytes()) {
-                        let p = join_folded(&dir_path, &entry.name);
-                        add_store(&p, family, caps, budget, &mut set)?;
-                    }
+        for dir_path in resolve_folded_under_base(
+            home,
+            dir,
+            folds,
+            resolver,
+            caps,
+            budget,
+            &mut dir_cache,
+            None,
+        )? {
+            let entries = match resolver.read_dir(&dir_path, caps, budget) {
+                Ok(e) => e,
+                Err(ResolveError::Exhausted(e)) => return Err(e),
+                Err(_) => continue,
+            };
+            for entry in entries.into_iter().take(limits::WALK_MAX_ENTRIES.min(256)) {
+                budget.charge(entry.name.len().max(1) as u64)?;
+                let nl = fold_listed_component(&entry.name, folds.fold_long_s, folds.fold_kelvin);
+                if nl.starts_with(pre.as_bytes()) {
+                    budget.charge_alloc(dir_path.len() + 1 + entry.name.len())?;
+                    let p = join_folded(&dir_path, &entry.name);
+                    record_lstat_and_stat(
+                        &p,
+                        family,
+                        resolver,
+                        caps,
+                        budget,
+                        &mut seen_store,
+                        &mut set.store_identities,
+                        None,
+                    )?;
                 }
             }
-            Err(ResolveError::Exhausted(e)) => return Err(e),
-            Err(_) => {}
         }
     }
 
     Ok(set)
+}
+
+/// Collects `(dev, ino)` identities of write-only protected files/trees
+/// (`~/.ssh/config`, `~/.ssh/authorized_keys`, and `protected.atrium_protected_paths`
+/// plus their member files, across listed-fold spellings and including dangling
+/// symlinks via `lstat`).
+///
+/// Used by resolver-backed flows (`resolve_command_targets`,
+/// `resolve_subject_paths`, `check_recursive_root`) for targets with
+/// `AccessMode::Write` or `AccessMode::ReadWrite` so hard-linked aliases to
+/// write-only protected files produce `HardDenyHit` on write while staying
+/// readable on `AccessMode::Read` (§5).
+pub(crate) struct WriteOnlyIdentities {
+    pub(crate) identities: Vec<(FileIdentity, &'static str)>,
+    pub(crate) unreads: Vec<UnreadReason>,
+}
+
+pub(crate) fn collect_write_only_identities(
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+) -> Result<WriteOnlyIdentities, Exhausted> {
+    let mut out: Vec<(FileIdentity, &'static str)> = Vec::new();
+    let mut seen: HashSet<FileIdentity> = HashSet::new();
+    let mut unreads: Vec<UnreadReason> = Vec::new();
+    let mut dir_cache: DirCache = HashMap::new();
+    let folds = protected.folds;
+
+    // 1. `~/.ssh/config` and `~/.ssh/authorized_keys` (across listed-fold spellings).
+    for rel in [".ssh/config", ".ssh/authorized_keys"] {
+        for p in resolve_folded_under_base(
+            &protected.home,
+            rel,
+            folds,
+            resolver,
+            caps,
+            budget,
+            &mut dir_cache,
+            Some(&mut unreads),
+        )? {
+            record_lstat_and_stat(
+                &p,
+                "credential-read",
+                resolver,
+                caps,
+                budget,
+                &mut seen,
+                &mut out,
+                Some(&mut unreads),
+            )?;
+        }
+    }
+
+    // 2. `atrium_protected_paths` (exact + folded spellings + bounded member walk).
+    for d in &protected.atrium_protected_paths {
+        for cand in resolve_folded_abs_path(
+            d,
+            folds,
+            resolver,
+            caps,
+            budget,
+            &mut dir_cache,
+            Some(&mut unreads),
+        )? {
+            let ft = record_lstat_and_stat(
+                &cand,
+                "atrium-self",
+                resolver,
+                caps,
+                budget,
+                &mut seen,
+                &mut out,
+                Some(&mut unreads),
+            )?;
+            if ft == Some(FileType::Dir) {
+                walk_protected_tree_members(
+                    &cand,
+                    "atrium-self",
+                    resolver,
+                    caps,
+                    budget,
+                    &mut seen,
+                    &mut out,
+                    Some(&mut unreads),
+                )?;
+            }
+        }
+    }
+
+    Ok(WriteOnlyIdentities {
+        identities: out,
+        unreads,
+    })
 }
