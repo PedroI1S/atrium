@@ -308,3 +308,62 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast
 ```
+
+
+---
+
+## Round 4 (rework against Codex review round 3 & Rule G per-operand/per-operation access audit)
+
+All 6 findings from `.orchestration/review-input/review-round3.md` are fixed, per-operand and per-operation access modes were audited under Rule G, and every flag added in round 3 was checked against `dev`'s tables. `docs/contracts/m1-policy-rev4-tools.md` is intentionally left untouched for the orchestrator to regenerate via `env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools`.
+
+### Findings, fixes, and commits
+
+| # | Finding | Fix | Commit(s) |
+|---|---|---|---|
+| 1 | Newly restricted `ListedOnly` rows lacked `§11 item 2` default-change citations (`sort -r`, `rm -f`, etc.) | Defaulted `base_tool`/`base_subcommand` to `changes_default: Some("§11 item 2")`, explicitly set `changes_default: None` on the 14 `AnyExceptForbidden` tools with no other default changes and on the 6 always-`HardDeny` `PRIV` rows (never coverable by `dev`'s rules), added `§11 item 2` to every other `ListedOnly` row/subcommand, added the `listed_only_rows_cite_item_2` integrity test (also checking `AnyExceptForbidden` rows do not spuriously cite item 2), and added fixtures for `sort -r` / `rm -f`. | `ada80e4`, `8ebed58` |
+| 2 | Home-forbidden flags on `AnyExceptForbidden` rows were declared `Unread` under every setting | Fixed the module doc, `FlagMode::AnyExceptForbidden`, `HomeReadOnlySpec::forbidden`, `fmt_flags_summary`, and `render_markdown()` intro so `home_readonly.forbidden` **only removes Home read-only eligibility** (`home_readonly_eligible = false`, so Home asks as on `dev`) and never by itself makes the unit `Unread`. Modeled flags (`tree -o`/`--out`, `git diff --output`/`--out`, `rg -f`, `grep -f`) keep their declared effects under covering rules; unlisted flags on `AnyExceptForbidden` (`tree -R`, `file -C`/`-f`, `date -s`) keep conservative `ReadWrite` candidate-path checks; `git diff --ext-diff` stays `Unread` from its declared `runs_code` effect. Added `home_readonly_eligible` to `SimulatedUnit` and tested both Home and covering-rule settings. | `a5707d4`, `8ebed58` |
+| 3 | `tar` extraction marked its input archive as `Write` (and `-C` access was tied to row-wide `writes`) | Added `ArchiveOperation` (`Write`, `Extract`, `List`) and `FlagEffects::operation`; replaced `FlagValueAccess::WriteWhenWriting` with per-operation `FlagValueAccess::TarArchive` (`Write` on `-c`/`-r`/`-u`, `Read` on `-x`/`-t`) and `FlagValueAccess::TarDirectory` (`Write` on `-x` extraction destination dir, `Read` on `-c`/`-r`/`-u`/`-t` source/list chdir dir; changed `-C` role to `ValueRole::Path` and `tar` positional `operand_access` to `AllRead`). Added independent fixtures for `-c`, `-r`, `-u`, `-x`, `-t`, flag ordering (`tar -f archive.tar -x`), and `-C` under every operation. | `a5707d4`, `8ebed58` |
+| 4 | `sed -f FILE` turned input files into `Write` targets | Separated unit-level possible-writer status (`FlagEffects::writes`, making later units/pipeline siblings `Unread` under §5) from in-place positional input writes (`FlagEffects::writes_positional_inputs` + `OperandAccessMode::InPlaceWithFlag`, removing `AllWriteWhenWriting` and `FlagOnlyWrite`; clarified `ToolEffects::writes` in `model.rs`). On `sed -f FILE`, `FILE` is `ProgramFile` (`Read`, pinned under `ProgramPin::FlagValue`, §11 item 8), positional inputs stay `Read`, and the unit is a possible writer (`writes = true`). Only `-i`/`--in-place` (`sed`, `perl`), `-s`/`-f`/`--remove-signature` (`codesign`), and `-delete` (`find`) enable `writes_positional_inputs` (never marking `ProgramFile` operands `Write`). Removed round 3's erroneous `sed -f` Write assertion and added independent fixtures for `sed -f`, `sed -i -f`, `sed -i`, `sed -e`, `perl`, `perl -i`, `awk`, `codesign`, `ln`, `cp`, `uniq`, `unzip`, and `find`. | `a5707d4`, `8ebed58` |
+| 5 | `find -fprintf FILE FORMAT` lacked its second argument role (and `-exec`/`-execdir`/`-ok`/`-okdir` consumed only 1 arg) | Added `FlagArgSpec`, `FlagArity`, `FlagKind::MultiValue(&'static [FlagArgSpec])`, `FlagKind::TerminatedValues { role, terminators }`, and `FlagKind::arity()`. Modeled `find -fprintf` as `MultiValue([Path:Write, Text])`, `-exec`/`-execdir` as `TerminatedValues(Code, &[";", "+"])`, and `-ok`/`-okdir` as `TerminatedValues(Code, &[";"])`; verified `-fprint`/`-fprint0`/`-fls` (1 `Write Path` arg) and left unlisted primaries (`-printf`, `-newerXY`, `-newermt`, `-name`, `-regex`) outside `FIND_FLAGS` (`Unread(UnknownFlag)`). Updated Markdown rendering and added `no_flag_consumes_fewer_arguments_than_documented` integrity test plus fixtures. | `a5707d4`, `8ebed58` |
+| 6 | Invented `grep --include-dir` and its parity-test exception | Removed `--include-dir` from `GREP_FLAGS` and removed `"include-dir"` from `grep_dev_val_l` in `dev_lists_and_flag_tables_fully_accounted_for`; updated fixtures to assert `grep --include-dir=sub x proj` produces `UnreadReason::UnknownFlag`. | `a5707d4`, `8ebed58` |
+
+### Flags removed (round-3 audit against `dev`'s tables)
+
+| Tool(s) | Flag removed | Reason |
+|---|---|---|
+| `grep`, `egrep`, `fgrep`, `zgrep`, `ggrep`, `rgrep` | `--include-dir` | Absent from `dev`'s `GREP_VAL_L` (Finding 6); unknown-flag rule on `ListedOnly` already marks it `Unread(UnknownFlag)`. Parity-test exception removed. |
+| `awk`, `gawk`, `mawk` | `-f` / `--file` | Added in round 3 but absent from `dev`'s tables (`words.rs` only handles `-i`/`--include` for `awk`) and not needed to make a form `Unread` (`awk` is `ListedOnly`, so `awk -f` is `Unread(UnknownFlag)` and `awk` returns to `CodeRunnerBehavior::InlineOnly` per contract §4). Removed `§11 item 8` from `awk`/`gawk`/`mawk`. |
+
+### Rows cited for `§11 item 2` (all 151 non-`hard_deny` `ListedOnly` rows)
+
+Every `FlagMode::ListedOnly` row that `dev`'s rules could cover now cites `§11 item 2` in `changes_default` (enforced by `listed_only_rows_cite_item_2`):
+
+- **Already citing `§11 item 2` in round 3 (16):** `sh`, `bash`, `dash`, `rg`, `grep`, `egrep`, `fgrep`, `zgrep`, `ggrep`, `rgrep`, `ag`, `ack`, `git`, `find`, `tar`, `printf`.
+- **Newly citing `§11 item 2` in round 4 (135):**
+  - **Wrappers (6):** `command`, `exec`, `nice`, `timeout`, `time`, `env`.
+  - **Multi-subcommand parents (2):** `cargo`, `pipx`.
+  - **Subcommands (19):** `git cat-file`, `git push`, `git clone`, `git checkout`, `git merge-index`, `git filter-branch`, `git bisect`, `git rebase`, `git submodule`, `git difftool`, `git mergetool`; `cargo test`, `cargo build`, `cargo run`, `cargo check`, `cargo bench`, `cargo doc`, `cargo clippy`; `pipx run`.
+  - **File, directory, archive, and link tools (6):** `cd`, `ln`, `cp`, `mv`, `rsync`, `unzip`.
+  - **`words::WRITERS` (17):** `rm`, `tee`, `touch`, `chmod`, `chown`, `chgrp`, `truncate`, `install`, `mkdir`, `rmdir`, `unlink`, `shred`, `patch`, `wipefs`, `blkdiscard`, `ed`, `ex`.
+  - **`words::READERS` (40):** `diff`, `cmp`, `md5`, `md5sum`, `shasum`, `sha1sum`, `sha256sum`, `readlink`, `realpath`, `basename`, `dirname`, `nl`, `od`, `hexdump`, `strings`, `bat`, `column`, `fold`, `expand`, `less`, `more`, `cut`, `sort`, `uniq`, `xxd`, `echo`, `whereis`, `type`, `tr`, `true`, `false`, `id`, `test`, `[`, `jq`, `mdls`, `open`, `spctl`, `mdfind`, `codesign`.
+  - **Code runners & interpreters (14):** `awk`, `gawk`, `mawk`, `sed`, `perl`, `python`, `python3`, `node`, `ruby`, `eval`, `source`, `.`, `npx`, `xargs`.
+  - **`shell::COMMAND_RUNNERS` (28):** `ssh`, `mosh`, `autossh`, `nsenter`, `unshare`, `docker`, `podman`, `nerdctl`, `kubectl`, `oc`, `lxc`, `incus`, `machinectl`, `systemd-run`, `systemd-nspawn`, `firejail`, `bwrap`, `flatpak-spawn`, `toolbox`, `distrobox`, `distrobox-enter`, `multipass`, `vagrant`, `limactl`, `colima`, `runuser`, `setpriv`, `parallel`.
+  - **`deny::DOWNLOADERS` (3):** `curl`, `wget`, `fetch`.
+- **Excluded (not coverable by `dev`'s rules):** `deny::PRIV` (`sudo`, `sudoedit`, `su`, `doas`, `pkexec`, `run0`) are always `HardDeny` (`privilege-escalation`) on both `dev` and rev 4 (`changes_default: None`).
+- **`AnyExceptForbidden` rows (22, unchanged — do not cite item 2):** `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `du`, `df`, `which`, `uname`, `date`, `whoami`, `tree`, `git status`, `git log`, `git diff`, `git show`, `git branch`, `git rev-parse`, `git ls-files`.
+
+### Round 4 verification
+
+Run by worker (allowed under D-123):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
+
+Commands for the orchestrator's verification task (fish-compatible):
+
+```sh
+env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+```
