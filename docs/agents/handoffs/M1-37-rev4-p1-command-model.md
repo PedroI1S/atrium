@@ -265,3 +265,44 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core policy::v4:: -- --nocapture
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 4 (Review round 2 rework — all 6 findings)
+
+Addressed all 6 findings from `.orchestration/review-input/review-round2.md` (3 major, 3 minor, including the 2 round-3 test defects). P0's frozen interface (`model.rs`, `limits.rs`, `tools.rs`) and `SessionGate` remain untouched.
+
+### Finding-by-finding fixes and regression tests
+1. **Finding 1 (Major — Best-effort assignment detection performs uncharged quadratic work):**
+   - **Fix:** Added an O(1)-per-byte incremental `AssignPrefix` state machine (`Empty` / `ValidName` / `ValidNamePlus` / `Invalid`) shared by `crates/atrium-core/src/policy/v4/lex.rs` and `crates/atrium-core/src/policy/v4/lex/best_effort.rs`, and tracked `seen_unquoted_eq` and `all_unquoted_digits` incrementally in `best_effort.rs` so only the first unquoted `=` is considered once with zero prefix rescanning. Charged remaining per-word scans before performing them (`Dup` redirect digit check, `has_cmd_sub`, and `env` wrapper `split_once('=')` / `is_posix_name`).
+   - **Test:** `best_effort_repeated_equals_after_invalid_assignment_prefix_is_linear` in `crates/atrium-core/src/policy/v4/lex/tests.rs` (covers the exact 60,000-byte failing case `"echo " + "a".repeat(60_000) + "-" + "=".repeat(60_000)` across both `lex_best_effort` and `lex_exact`, asserts an affine linear compute bound and linear scaling against a 6,000-byte fixture, and checks incremental assignment edge cases).
+2. **Finding 2 (Major — Exact-word buffer allocations still bypass size accounting):**
+   - **Fix:** Added `WordBuilder` in `crates/atrium-core/src/policy/v4/lex.rs` whose `reserve_growth` builds both the `Vec<u8>` byte buffer and `Vec<ByteProvenance>` provenance buffer using budgeted geometric capacity growth (minimum capacity 8 each), charging reallocation copy work (`old_cap`) and allocated capacity deltas (`target_cap - old_cap`) across both vectors before calling `reserve_exact`, and then constructs each `Word` via P0's frozen `Word::from_parts` without calling `Word::push`.
+   - **Test:** `lex_exact_word_buffer_capacity_and_realloc_copy_are_budgeted` in `crates/atrium-core/src/policy/v4/lex/tests.rs` (covers the review's exact-budget failing case `lex_exact("x", ...)` with `2 + 4 * size_of::<Word>() + 4 * size_of::<RawCommandUnit>()`, verifies the exact 15-byte-exhausts / 16-byte-succeeds boundary, verifies 8 → 16 reallocation capacity and 8 + 8 = 16 copy compute units on `"abcdefghi"`, and updates `exhaustion_at_flush_preserves_pending_unit_words_and_reasons`'s pre-flush allocation calculation for `"sudo id"` to reflect the 16 + 16 = 32-byte word capacities).
+3. **Finding 3 (Major — The carried `find -exec` scan omits nested `-c` scripts):**
+   - **Fix:** Factored `resolve_cmd_sub_readings`, `collect_shell_proc_sub_payloads`, and `process_find_exec_cmds` in `crates/atrium-core/src/policy/v4/lex/best_effort.rs` and tagged `deferred_payloads` with their target recursion depth so commands extracted from `find -exec` / `-execdir` / `-ok` / `-okdir` run through the same bounded wrapper unwrapping, command-word substitution resolution, `extract_code_payloads` (across both effective and alternative readings), shell `<(...)` process-substitution extraction, nested `find -exec` extraction, and recursive lexing as ordinary units, strictly respecting `limits::MAX_DEPTH` and `limits::MAX_UNITS`.
+   - **Test:** `lex_best_effort_find_exec_recurses_into_nested_scripts_within_caps` in `crates/atrium-core/src/policy/v4/lex/tests.rs` (covers `find . -exec sh -c 'sudo id' \;` asserting derived `["sh", "-c", "sudo id"]` and `["sudo", "id"]` units, plus `-execdir bash -c 'eval ...' +`, alternative wrapper reading `command -Z arg sh -c ...`, `$(which sh) -c ...`, nested `find -exec find ... -exec ...`, `MAX_DEPTH` cutoff, and `MAX_UNITS` `TooLarge(Cap::Units)` enforcement).
+4. **Finding 4 (Minor — Empty quotes still disappear during HOME assignment detection):**
+   - **Fix:** Added private (`pub(super)`) `RawUnitLexMeta` / `LexExactWithMeta` and `lex_exact_with_meta` in `crates/atrium-core/src/policy/v4/lex.rs` (budgeted via `charge_vec_growth` before moving `cur` in `flush_unit`, while leaving P0's `lex_exact` signature and zero-overhead path unchanged) so `crates/atrium-core/src/policy/v4/units.rs` consumes the lexer's token-level leading-assignment count and `HOME`-assignment flag directly instead of reconstructing assignment syntax from decoded bytes. Removed `leading_assignment_name`, `has_leading_home_assignment`, and `leading_assignment_count`.
+   - **Test:** `build_units_empty_quoted_home_does_not_trigger_home_set_earlier` in `crates/atrium-core/src/policy/v4/units/tests.rs` (covers `''HOME=/tmp; cat ~/x` plus `""HOME=/tmp`, `HOME''=/tmp`, `H""OME=/tmp`, `HOME+''=/tmp`, `''FOO=1 export HOME=/tmp`, `FOO=1 ''HOME=/tmp`, and positive value-quoted contrasts `HOME=''/tmp`, `HOME="/tmp"`, `HOME+=/tmp`, `FOO=1 HOME=/tmp`).
+5. **Finding 5 (Minor — Reported glob-class failure is a test defect):**
+   - **Fix (test only, no implementation change):** Updated `lex_exact_allows_permitted_quotes_and_escapes_inside_glob_class` in `crates/atrium-core/src/policy/v4/lex/tests.rs` to expect `r"cat /usr/bi[n\]]"` to be accepted (no `UnreadReason`, literal bytes `b"/usr/bi[n]]"`, `provenance()[9] == ByteProvenance::Escaped`, `provenance()[10] == ByteProvenance::Unquoted`), and added `r"cat /usr/bi[n\]"` as the genuinely unclosed case emitting `UnreadReason::UnquotedByteOutsideModel { byte: b'[' }` with `provenance()[9] == ByteProvenance::Escaped`.
+6. **Finding 6 (Minor — Reported allocation-linearity failure is a test defect):**
+   - **Fix (test only, no implementation change):** Updated `linear_charge_growth_from_10kb_to_max_bytes` in `crates/atrium-core/src/policy/v4/lex/tests.rs` and `build_units_and_unwrap_unit_budget_exhaustion_and_linearity` in `crates/atrium-core/src/policy/v4/units/tests.rs` to assert §8 affine upper bounds `C(n) <= a*n + b` and `A(n) <= a*n + b` (with explicit fixed metadata overhead `b`) plus upper growth-rate bounds and monotonic positive growth, removing the spurious proportional lower bounds while keeping default-budget exhaustion checks separate.
+
+### Change requests against P0's interface
+- **None.**
+
+### Round 4 verification
+Run by worker (allowed under D-123):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
+
+Commands for the orchestrator's verification task (fish-compatible):
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4:: -- --nocapture
+cargo test --workspace --no-fail-fast
+```

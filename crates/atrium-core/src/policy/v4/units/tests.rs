@@ -569,6 +569,78 @@ fn build_units_tracks_home_modifications_for_later_tildes() {
     }
 }
 
+#[test]
+fn build_units_empty_quoted_home_does_not_trigger_home_set_earlier() {
+    // Review round 2 finding 4: empty quotes before `=` suppress shell
+    // assignment recognition, so `''HOME=/tmp` is a command name rather than
+    // a `HOME` assignment and must emit neither `Assignment` nor `HomeSetEarlier`.
+    for line in [
+        "''HOME=/tmp; cat ~/x",
+        r#"""HOME=/tmp; cat ~/x"#,
+        "HOME''=/tmp; cat ~/x",
+        r#"H""OME=/tmp; cat ~/x"#,
+        "HOME+''=/tmp; cat ~/x",
+        "''FOO=1 export HOME=/tmp; cat ~/x",
+    ] {
+        let mut b = ComputeBudget::with_default_limits();
+        let parsed = build_units(line, &FoldRules::REV4, &mut b).unwrap();
+        assert!(
+            !unreads_of(&parsed)
+                .iter()
+                .any(|r| matches!(r, UnreadReason::Assignment | UnreadReason::HomeSetEarlier)),
+            "empty-quoted command word `{line}` must not emit Assignment or HomeSetEarlier: {:?}",
+            parsed.outcomes
+        );
+        assert_eq!(parsed.units.len(), 2, "`{line}`");
+    }
+
+    // `FOO=1` is a leading assignment, while `''HOME=/tmp` is the command word
+    // following it: `Assignment` applies to `FOO=1`, but `HOME` is not set.
+    let mut b_mixed = ComputeBudget::with_default_limits();
+    let parsed_mixed =
+        build_units("FOO=1 ''HOME=/tmp; cat ~/x", &FoldRules::REV4, &mut b_mixed).unwrap();
+    assert!(
+        unreads_of(&parsed_mixed)
+            .iter()
+            .any(|r| matches!(r, UnreadReason::Assignment)),
+        "{:?}",
+        parsed_mixed.outcomes
+    );
+    assert!(
+        !unreads_of(&parsed_mixed)
+            .iter()
+            .any(|r| matches!(r, UnreadReason::HomeSetEarlier)),
+        "empty-quoted `''HOME=/tmp` after `FOO=1` must not trigger HomeSetEarlier: {:?}",
+        parsed_mixed.outcomes
+    );
+
+    // Contrast: quoting only the value side (after `=`) remains a real `HOME`
+    // assignment and still triggers both `Assignment` and `HomeSetEarlier`.
+    for line in [
+        "HOME=''/tmp; cat ~/x",
+        r#"HOME="/tmp"; cat ~/x"#,
+        "HOME+=/tmp; cat ~/x",
+        "FOO=1 HOME=/tmp; cat ~/x",
+    ] {
+        let mut b = ComputeBudget::with_default_limits();
+        let parsed = build_units(line, &FoldRules::REV4, &mut b).unwrap();
+        assert!(
+            unreads_of(&parsed)
+                .iter()
+                .any(|r| matches!(r, UnreadReason::Assignment)),
+            "expected Assignment for `{line}`: {:?}",
+            parsed.outcomes
+        );
+        assert!(
+            unreads_of(&parsed)
+                .iter()
+                .any(|r| matches!(r, UnreadReason::HomeSetEarlier)),
+            "expected HomeSetEarlier for `{line}`: {:?}",
+            parsed.outcomes
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // P3 code-runner hook
 // ---------------------------------------------------------------------------
@@ -759,12 +831,14 @@ fn build_units_and_unwrap_unit_budget_exhaustion_and_linearity() {
 
     let ratio = (cl as f64) / (cs as f64);
     let alloc_ratio = (al as f64) / (as_ as f64);
+    assert!(cs > 0 && cl > cs);
+    assert!(as_ > 0 && al > as_);
     assert!(
-        ratio <= len_ratio * 1.5 && ratio >= len_ratio * 0.5,
-        "build_units compute charge not linear: small={cs}, large={cl}, ratio={ratio:.2}, len_ratio={len_ratio:.2}"
+        cl <= 64 * (large.len() as u64) + 16_384 && ratio <= len_ratio * 1.5,
+        "build_units compute charge exceeds linear bound: small={cs}, large={cl}, ratio={ratio:.2}, len_ratio={len_ratio:.2}"
     );
     assert!(
-        alloc_ratio <= len_ratio * 2.0 && alloc_ratio >= len_ratio * 0.5,
-        "build_units alloc charge not linear: small={as_}, large={al}, ratio={alloc_ratio:.2}, len_ratio={len_ratio:.2}"
+        al <= 32 * large.len() + 65_536 && alloc_ratio <= len_ratio * 2.0,
+        "build_units alloc charge exceeds affine bound: small={as_}, large={al}, ratio={alloc_ratio:.2}, len_ratio={len_ratio:.2}"
     );
 }
