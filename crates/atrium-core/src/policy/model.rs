@@ -741,6 +741,28 @@ pub(crate) struct SearchFilter {
     pub(crate) argv_index: Option<usize>,
 }
 
+/// Whether a classified unit writes to derived destinations, including
+/// filesystem-dependent cases that P2 resolves (contract §5).
+///
+/// Carried from P3 (`v4/tools.rs`, which has no [`PathResolver`]) into P2
+/// (`v4/paths.rs`) so P2 can resolve `mv` of a directory against the
+/// filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) enum DerivedDestinations {
+    /// Destinations are explicit operands only.
+    #[default]
+    None,
+    /// Unconditionally writes to derived destinations (`cp -R`/`-a`, `rsync`,
+    /// `tar -x`, `unzip`, `git clone`, `git checkout`), making the writer
+    /// itself `Unread(DerivedDestinations)`.
+    Always,
+    /// Writes to derived destinations when any source operand resolves to a
+    /// directory (`mv` of a directory; contract §5). P2 resolves source
+    /// operands and emits `Unread(DerivedDestinations)` when a source is a
+    /// directory (or cannot be established as non-directory).
+    WhenSourceIsDir,
+}
+
 /// Tool-table classification of one modeled [`CommandUnit`] (contract §6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolEffects {
@@ -755,9 +777,9 @@ pub(crate) struct ToolEffects {
     pub(crate) operand_access: Vec<AccessMode>,
     /// Whether the unit may write to the filesystem.
     pub(crate) writes: bool,
-    /// Whether the unit writes to derived destinations (§5: makes the writer
-    /// itself `Unread`).
-    pub(crate) writes_derived_destinations: bool,
+    /// Whether the unit writes to derived destinations, including conditional
+    /// cases (`mv` of a directory) that P2 resolves against the filesystem (§5).
+    pub(crate) derived_destinations: DerivedDestinations,
     /// Whether the unit reads directory trees recursively.
     pub(crate) reads_recursively: bool,
     /// Symlink-following behaviour at root and below root.
@@ -818,6 +840,66 @@ pub(crate) struct DirEntry {
     /// Entry name as raw bytes (not a full path).
     pub(crate) name: Vec<u8>,
     pub(crate) file_type: FileType,
+}
+
+/// Non-absence filesystem I/O failure category surfaced by
+/// `v4::paths::PathResolver` so P2 can distinguish unreadable directories and
+/// OS errors requiring [`UnreadReason::UnresolvablePath`] from legitimate
+/// absence (`ResolveError::NotFound`) (contract §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FsIoError {
+    /// Permission denied (`EACCES` / `EPERM`).
+    PermissionDenied,
+    /// Expected a directory (`ENOTDIR`).
+    NotADirectory,
+    /// Expected a symbolic link (`EINVAL` on `readlink`).
+    NotASymlink,
+    /// Too many symbolic links (`ELOOP`).
+    SymlinkLoop,
+    /// Any other OS I/O error.
+    Other,
+}
+
+/// Error returned by `v4::paths::PathResolver` methods (contract §2, §5, §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ResolveError {
+    /// The path (or an ancestor) does not exist (`ENOENT`), distinct from I/O
+    /// failures so P2 can safely resolve a nonexistent suffix against its
+    /// deepest existing ancestor.
+    NotFound,
+    /// A non-absence filesystem I/O failure (e.g. unreadable directory,
+    /// permission denied, symlink loop).
+    Io(FsIoError),
+    /// A per-check filesystem cap in [`FsCaps`] was reached (callers convert
+    /// this into `Unread(WalkCapReached)`, never `Exhausted`).
+    CapReached(CapReached),
+    /// The shared [`ComputeBudget`] (compute units or allocation bytes) ran
+    /// out (callers propagate `Exhausted` → `Ask` everywhere).
+    Exhausted(Exhausted),
+}
+
+impl From<CapReached> for ResolveError {
+    fn from(value: CapReached) -> Self {
+        Self::CapReached(value)
+    }
+}
+
+impl From<Exhausted> for ResolveError {
+    fn from(value: Exhausted) -> Self {
+        Self::Exhausted(value)
+    }
+}
+
+/// Result of checking one recursive read root (S8 protected-root policy,
+/// filter enumeration + store probes, followed-link walk, and bounded
+/// hard-link walk) (contract §1 step 4, §2, §5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RecursiveRootResult {
+    pub(crate) outcomes: Vec<PartResult>,
+    /// `true` iff the bounded hard-link walk found a regular file with
+    /// `nlink > 1` under the root (forces `Ask` in every setting, including
+    /// `FullAccess`, per §1 step 4).
+    pub(crate) multiply_linked_file: bool,
 }
 
 /// Where a [`Target`] originated (contract §5).
@@ -904,13 +986,16 @@ pub(crate) struct ResolvedCallPaths {
 
 /// Listed name-folding rules shared by P1, P2, and P3 (CR-19, contract §4, §5).
 ///
-/// Exact folds: ASCII lowercase, `ſ` (U+017F) → `s`, Kelvin sign `K` (U+212A)
-/// → `k`, with no Unicode normalization added.
+/// Exact folds: Unicode lowercase (`str::to_lowercase()`, matching `dev`'s
+/// `deny.rs`/`engine.rs` path folds — which already maps Kelvin sign `K`
+/// (U+212A) → `k` and folds e.g. `CAFÉ` → `café`) plus `ſ` (U+017F) → `s`,
+/// with no Unicode normalization (NFC/NFD) added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct FoldRules {
     /// Fold `ſ` (U+017F) to `s`.
     pub(crate) fold_long_s: bool,
-    /// Fold `K` (U+212A) to `k`.
+    /// Fold `K` (U+212A) to `k` (implied by Unicode `to_lowercase()`, kept
+    /// explicit for non-UTF-8 / byte-oriented paths).
     pub(crate) fold_kelvin: bool,
 }
 

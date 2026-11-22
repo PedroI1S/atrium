@@ -157,11 +157,13 @@ mod tests {
         assert_eq!(HARD_LINK_WALK_ENTRIES, 4096);
         assert_eq!(HARD_LINK_WALK_DEPTH, 8);
         assert_eq!(HARD_LINK_WALK_SKIP_DIRS, &["node_modules", ".git"]);
-        assert!(FS_MAX_ENTRIES_READ >= WALK_MAX_ENTRIES);
-        assert!(FS_MAX_DIR_OPENS > 0);
-        assert!(FS_MAX_STATS >= WALK_MAX_ENTRIES);
-        assert!(FS_MAX_READLINKS >= usize::from(MAX_HOPS));
-        assert!(FS_MAX_CANONICALIZATIONS >= MAX_USES);
+        const {
+            assert!(FS_MAX_ENTRIES_READ >= WALK_MAX_ENTRIES);
+            assert!(FS_MAX_DIR_OPENS > 0);
+            assert!(FS_MAX_STATS >= WALK_MAX_ENTRIES);
+            assert!(FS_MAX_READLINKS >= MAX_HOPS as usize);
+            assert!(FS_MAX_CANONICALIZATIONS >= MAX_USES);
+        }
         assert_eq!(COMPUTE_BUDGET_UNITS, (MAX_BYTES as u64) * 128);
         assert_eq!(COMPUTE_BUDGET_ALLOC_BYTES, MAX_BYTES * 64);
     }
