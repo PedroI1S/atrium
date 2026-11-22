@@ -18,7 +18,7 @@ use atrium_agents::{
 };
 use atrium_core::policy::{DefaultPolicy, Ledger, SessionGate, SessionGateConfig, StoreRules};
 use atrium_core::store::{SqliteStore, StoreOptions};
-use atrium_core::{NewThread, Signal, Store};
+use atrium_core::{ApprovalLedger, NewThread, RequestKey, Signal, Store};
 use atrium_protocol::agent::{AgentEvent, Provider, SessionCommand};
 use atrium_protocol::limits::MAX_PENDING_REQUESTS;
 use atrium_protocol::policy::Preset;
@@ -2060,6 +2060,507 @@ for line in sys.stdin:
     assert_eq!(gate.check_calls(), MAX_PENDING_REQUESTS + 1);
 
     let _ = controls.filler.send(true);
+    shutdown(session).await;
+    assert_eq!(
+        store.requests().open_count(&thread, inc).await.unwrap(),
+        0,
+        "open Codex ledger row remained pending after shutdown"
+    );
+    let _ = fs::remove_dir_all(&ledger_dir);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Gate wrapper that allows normal ticket delivery through a real `SessionGate`
+/// while blocking `withdraw()` until `withdraw_release` turns `true`.
+struct BlockedDeliveredWithdrawGate {
+    inner: Arc<SessionGate>,
+    question_calls: AtomicUsize,
+    withdraw_started: AtomicUsize,
+    withdraw_finished: AtomicUsize,
+    withdraw_entered: Arc<Notify>,
+    withdraw_release: watch::Receiver<bool>,
+}
+
+impl BlockedDeliveredWithdrawGate {
+    fn new(inner: Arc<SessionGate>) -> (Arc<Self>, watch::Sender<bool>) {
+        let (tx, rx) = watch::channel(false);
+        let gate = Arc::new(Self {
+            inner,
+            question_calls: AtomicUsize::new(0),
+            withdraw_started: AtomicUsize::new(0),
+            withdraw_finished: AtomicUsize::new(0),
+            withdraw_entered: Arc::new(Notify::new()),
+            withdraw_release: rx,
+        });
+        (gate, tx)
+    }
+
+    fn question_calls(&self) -> usize {
+        self.question_calls.load(Ordering::Acquire)
+    }
+
+    fn withdraw_started(&self) -> usize {
+        self.withdraw_started.load(Ordering::Acquire)
+    }
+
+    fn withdraw_finished(&self) -> usize {
+        self.withdraw_finished.load(Ordering::Acquire)
+    }
+}
+
+impl ToolGate for BlockedDeliveredWithdrawGate {
+    fn check<'a>(&'a self, check: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+        self.inner.check(check)
+    }
+
+    fn redeem<'a>(
+        &'a self,
+        ticket: &'a ApprovalTicket,
+        check: &'a ToolCheck,
+    ) -> BoxFuture<'a, GateDecision> {
+        self.inner.redeem(ticket, check)
+    }
+
+    fn question_ticket(&self, turn: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
+        Box::pin(async move {
+            self.question_calls.fetch_add(1, Ordering::AcqRel);
+            self.inner.question_ticket(turn).await
+        })
+    }
+
+    fn withdraw<'a>(&'a self, ticket: &'a ApprovalTicket) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.withdraw_started.fetch_add(1, Ordering::AcqRel);
+            self.withdraw_entered.notify_waiters();
+            let mut rx = self.withdraw_release.clone();
+            while !*rx.borrow() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            self.inner.withdraw(ticket).await;
+            self.withdraw_finished.fetch_add(1, Ordering::AcqRel);
+        })
+    }
+}
+
+async fn make_session_gate_with_ledger(
+    provider: Provider,
+    home: &Path,
+    preset: Preset,
+) -> (
+    PathBuf,
+    Arc<SqliteStore>,
+    Arc<Ledger>,
+    ThreadId,
+    u32,
+    Arc<SessionGate>,
+) {
+    let dir = scratch("ledger-delivered-withdraw");
+    let store = Arc::new(
+        SqliteStore::open(&dir.join("atrium.db"), StoreOptions::default())
+            .await
+            .unwrap(),
+    );
+    let ledger = Arc::new(Ledger::new(store.requests()));
+    let s = store
+        .create_thread(NewThread {
+            provider,
+            model: None,
+            effort: None,
+            preset,
+            location: Location::Home,
+            title: "m1-33-delivered-withdraw".into(),
+        })
+        .await
+        .unwrap();
+    let inc = store.begin_incarnation(&s.thread_id).await.unwrap();
+    store.signal(&s.thread_id, Signal::Starting).await.unwrap();
+    let canon_home = fs::canonicalize(home).unwrap();
+    let gate = Arc::new(SessionGate::new(
+        SessionGateConfig {
+            thread: s.thread_id.clone(),
+            incarnation: inc,
+            cwd: canon_home.clone(),
+            home: canon_home,
+            atrium_data_paths: vec![],
+            atrium_protected_paths: vec![],
+            preset,
+            provider,
+        },
+        Arc::new(DefaultPolicy::new()),
+        ledger.clone(),
+        Arc::new(StoreRules(store.clone())),
+    ));
+    (dir, store, ledger, s.thread_id, inc, gate)
+}
+
+async fn wait_for_question(session: &mut Session) -> String {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("timed out waiting for QuestionAsked");
+        match tokio::time::timeout(remaining, session.events.recv()).await {
+            Ok(Some(env)) => {
+                if let AgentEvent::QuestionAsked { request_id, .. } = env.event {
+                    return request_id;
+                }
+            }
+            Ok(None) => panic!("session ended while waiting for QuestionAsked"),
+            Err(_) => panic!("timed out waiting for QuestionAsked"),
+        }
+    }
+}
+
+/// M1-33 round 3, finding 2 (Claude): after normal question delivery, freeing
+/// each ledger slot independently (as the daemon does before `DeclineQuestion`)
+/// while adapter `gate.withdraw()` is blocked must keep detached withdrawals
+/// bounded by `MAX_PENDING_REQUESTS`, explicitly decline excess questions, and
+/// complete all blocked withdrawals without aborting them once unblocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_delivered_question_blocked_withdrawals_stay_bounded_and_complete() {
+    let dir = scratch("claude-delivered-withdraw-bound");
+    let script = dir.join("fake-claude-delivered-withdraw.py");
+    let recovery_trigger = dir.join("send_recovery");
+    let denied_log = dir.join("denied.txt");
+    let total: usize = MAX_PENDING_REQUESTS;
+    let excess_count: usize = 6;
+
+    write_executable(
+        &script,
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, os, sys, threading, time
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("2.1.308 (Claude Code)")
+    sys.exit(0)
+sid = "fake-delivered-withdraw"
+total = {total}
+excess = {excess}
+recovery_trigger = {recovery_trigger:?}
+denied_log = {denied_log:?}
+out_lock = threading.Lock()
+
+def emit(obj):
+    with out_lock:
+        print(json.dumps(obj), flush=True)
+
+def emit_question(rid):
+    emit({{
+        "type": "control_request",
+        "request_id": rid,
+        "request": {{
+            "subtype": "can_use_tool",
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": f"tu_{{rid}}",
+            "input": {{"questions": [{{"question": "Proceed?", "options": [{{"label": "Yes"}}, {{"label": "No"}}]}}]}}
+        }}
+    }})
+
+def wait_recovery():
+    deadline = time.monotonic() + 60.0
+    while not os.path.exists(recovery_trigger) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    if os.path.exists(recovery_trigger):
+        emit_question("recover_1")
+
+for line in sys.stdin:
+    v = json.loads(line)
+    t = v.get("type")
+    if t == "control_request" and v.get("request", {{}}).get("subtype") == "initialize":
+        emit({{"type": "control_response", "response": {{"subtype": "success", "request_id": v["request_id"], "response": {{"commands": []}}}}}})
+    elif t == "user":
+        emit({{"type": "system", "subtype": "init", "session_id": sid, "model": "claude-fake", "tools": ["AskUserQuestion"], "cwd": "."}})
+        threading.Thread(target=wait_recovery, daemon=True).start()
+        emit_question("q_0")
+    elif t == "control_response":
+        resp = v.get("response", {{}})
+        rid = resp.get("request_id", "")
+        beh = resp.get("response", {{}}).get("behavior")
+        if rid.startswith("q_") and beh == "deny":
+            idx = int(rid[2:])
+            if idx + 1 < total:
+                emit_question(f"q_{{idx + 1}}")
+            else:
+                for i in range(excess):
+                    emit_question(f"excess_{{i}}")
+        elif rid.startswith("excess_") and beh == "deny":
+            with open(denied_log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+"#,
+            total = total,
+            excess = excess_count,
+            recovery_trigger = recovery_trigger.display().to_string(),
+            denied_log = denied_log.display().to_string(),
+        ),
+    );
+
+    let (ledger_dir, store, ledger, thread, inc, session_gate) =
+        make_session_gate_with_ledger(Provider::Claude, &dir, Preset::Careful).await;
+    let (gate, release_withdraw) = BlockedDeliveredWithdrawGate::new(session_gate);
+
+    let mut session = ClaudeAdapter::new(claude_opts(Duration::from_millis(150)))
+        .start(claude_cfg(&dir, script, gate.clone()), Transport::Local)
+        .await
+        .unwrap();
+
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage { text: "go".into() })
+        .await
+        .unwrap();
+
+    // Deliver `MAX_PENDING_REQUESTS` questions normally, free each ledger slot
+    // independently (modeling daemon `DeclineQuestion`), and decline each one
+    // while adapter `gate.withdraw()` remains blocked.
+    for _ in 0..total {
+        let request_id = wait_for_question(&mut session).await;
+        ledger
+            .withdraw(&RequestKey {
+                thread: thread.clone(),
+                incarnation: inc,
+                request_id: request_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+        session
+            .commands
+            .send(SessionCommand::DeclineQuestion { request_id })
+            .await
+            .unwrap();
+    }
+
+    // All excess questions sent once all `MAX_PENDING_REQUESTS` permits are held
+    // by blocked withdrawals must be declined explicitly without opening new tickets.
+    let deny_deadline = Instant::now() + Duration::from_secs(15);
+    let mut denied: Vec<String> = Vec::new();
+    while Instant::now() < deny_deadline {
+        if let Ok(text) = fs::read_to_string(&denied_log) {
+            denied = text.lines().map(str::to_owned).collect();
+            if denied.len() == excess_count && gate.withdraw_started() == total {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        denied.len(),
+        excess_count,
+        "expected all {excess_count} excess Claude questions to be explicitly declined while delivered-ticket withdrawals are blocked, got {denied:?}"
+    );
+    assert_eq!(
+        gate.question_calls(),
+        total,
+        "excess Claude questions must not enter question_ticket while blocked delivered-ticket withdrawals hold all permits"
+    );
+    assert_eq!(gate.withdraw_started(), total);
+    assert_eq!(gate.withdraw_finished(), 0);
+    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+
+    // Unblock withdrawals: every single blocked withdrawal must complete (none aborted).
+    let _ = release_withdraw.send(true);
+    let settle_deadline = Instant::now() + Duration::from_secs(15);
+    while gate.withdraw_finished() < total && Instant::now() < settle_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        gate.withdraw_finished(),
+        total,
+        "blocked Claude delivered-ticket withdrawals must all eventually complete"
+    );
+
+    // Capacity recovers: a subsequent question is admitted and delivered normally.
+    fs::write(&recovery_trigger, "go").unwrap();
+    let _recovered_id = wait_for_question(&mut session).await;
+    assert_eq!(gate.question_calls(), total + 1);
+
+    shutdown(session).await;
+    assert_eq!(
+        store.requests().open_count(&thread, inc).await.unwrap(),
+        0,
+        "open Claude ledger row remained pending after shutdown"
+    );
+    let _ = fs::remove_dir_all(&ledger_dir);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// M1-33 round 3, finding 2 (Codex): after normal question delivery, freeing
+/// each ledger slot independently (as the daemon does before `DeclineQuestion`)
+/// while adapter `gate.withdraw()` is blocked must keep detached withdrawals
+/// bounded by `MAX_PENDING_REQUESTS`, explicitly decline excess questions, and
+/// complete all blocked withdrawals without aborting them once unblocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_delivered_question_blocked_withdrawals_stay_bounded_and_complete() {
+    let dir = scratch("codex-delivered-withdraw-bound");
+    let user_dir = dir.join("empty-codex-home");
+    fs::create_dir_all(&user_dir).unwrap();
+    let script = dir.join("fake-codex-delivered-withdraw.py");
+    let recovery_trigger = dir.join("send_recovery");
+    let declined_log = dir.join("declined.txt");
+    let total: usize = MAX_PENDING_REQUESTS;
+    let excess_count: usize = 6;
+
+    write_executable(
+        &script,
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, os, sys, threading, time
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("codex-cli 0.163.0")
+    sys.exit(0)
+total = {total}
+excess = {excess}
+recovery_trigger = {recovery_trigger:?}
+declined_log = {declined_log:?}
+out_lock = threading.Lock()
+
+def emit(obj):
+    with out_lock:
+        print(json.dumps(obj), flush=True)
+
+def emit_question(rid):
+    emit({{
+        "id": rid,
+        "method": "item/tool/requestUserInput",
+        "params": {{
+            "threadId": "th_fake",
+            "turnId": "turn_1",
+            "itemId": f"item_{{rid}}",
+            "questions": [{{"id": "q1", "header": "Confirm", "question": "Proceed?", "options": [{{"label": "Yes", "description": "Continue"}}]}}]
+        }}
+    }})
+
+def wait_recovery():
+    deadline = time.monotonic() + 30.0
+    while not os.path.exists(recovery_trigger) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    if os.path.exists(recovery_trigger):
+        emit_question("recover_1")
+
+for line in sys.stdin:
+    v = json.loads(line)
+    m = v.get("method")
+    rid = v.get("id")
+    if m == "initialize":
+        emit({{"id": rid, "result": {{"userAgent": "codex-fake/0.163.0", "codexHome": "/scratch/.codex"}}}})
+    elif m == "thread/start":
+        emit({{"id": rid, "result": {{"thread": {{"id": "th_fake", "cliVersion": "0.163.0"}}, "approvalPolicy": "untrusted", "sandbox": {{"type": "workspaceWrite", "networkAccess": False}}}}}})
+    elif m == "turn/start":
+        emit({{"id": rid, "result": {{"turn": {{"id": "turn_1", "items": [], "status": "inProgress"}}}}}})
+        emit({{"method": "turn/started", "params": {{"threadId": "th_fake", "turn": {{"id": "turn_1", "status": "inProgress"}}}}}})
+        threading.Thread(target=wait_recovery, daemon=True).start()
+        emit_question("q_0")
+    elif m is None and isinstance(rid, str):
+        if rid.startswith("q_") and v.get("result") == {{"answers": {{}}}}:
+            idx = int(rid[2:])
+            if idx + 1 < total:
+                emit_question(f"q_{{idx + 1}}")
+            else:
+                for i in range(excess):
+                    emit_question(f"excess_{{i}}")
+        elif rid.startswith("excess_") and v.get("result") == {{"answers": {{}}}}:
+            with open(declined_log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+"#,
+            total = total,
+            excess = excess_count,
+            recovery_trigger = recovery_trigger.display().to_string(),
+            declined_log = declined_log.display().to_string(),
+        ),
+    );
+
+    let (ledger_dir, store, ledger, thread, inc, session_gate) =
+        make_session_gate_with_ledger(Provider::Codex, &dir, Preset::Careful).await;
+    let (gate, release_withdraw) = BlockedDeliveredWithdrawGate::new(session_gate);
+
+    let cfg = SessionConfig {
+        cwd: dir.clone(),
+        model: Some("gpt-5".into()),
+        effort: None,
+        permissions: PermissionPolicy::Ask,
+        resume: None,
+        mcp_servers: vec![],
+        gate: gate.clone(),
+        env: vec![("CODEX_HOME".into(), user_dir.display().to_string())],
+        program: Some(script),
+        on_spawn: None,
+    };
+    let opts = CodexOptions {
+        user_dir: Some(user_dir),
+        withdraw_timeout: Some(Duration::from_millis(20)),
+        ..CodexOptions::default()
+    };
+    let mut session = CodexAdapter::with_options(opts)
+        .start(cfg, Transport::Local)
+        .await
+        .unwrap();
+
+    session
+        .commands
+        .send(SessionCommand::SendUserMessage { text: "go".into() })
+        .await
+        .unwrap();
+
+    for _ in 0..total {
+        let request_id = wait_for_question(&mut session).await;
+        ledger
+            .withdraw(&RequestKey {
+                thread: thread.clone(),
+                incarnation: inc,
+                request_id: request_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+        session
+            .commands
+            .send(SessionCommand::DeclineQuestion { request_id })
+            .await
+            .unwrap();
+    }
+
+    let decline_deadline = Instant::now() + Duration::from_secs(15);
+    let mut declined: Vec<String> = Vec::new();
+    while Instant::now() < decline_deadline {
+        if let Ok(text) = fs::read_to_string(&declined_log) {
+            declined = text.lines().map(str::to_owned).collect();
+            if declined.len() == excess_count && gate.withdraw_started() == total {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        declined.len(),
+        excess_count,
+        "expected all {excess_count} excess Codex questions to be explicitly declined while delivered-ticket withdrawals are blocked, got {declined:?}"
+    );
+    assert_eq!(
+        gate.question_calls(),
+        total,
+        "excess Codex questions must not enter question_ticket while blocked delivered-ticket withdrawals hold all permits"
+    );
+    assert_eq!(gate.withdraw_started(), total);
+    assert_eq!(gate.withdraw_finished(), 0);
+    assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+
+    let _ = release_withdraw.send(true);
+    let settle_deadline = Instant::now() + Duration::from_secs(15);
+    while gate.withdraw_finished() < total && Instant::now() < settle_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        gate.withdraw_finished(),
+        total,
+        "blocked Codex delivered-ticket withdrawals must all eventually complete"
+    );
+
+    fs::write(&recovery_trigger, "go").unwrap();
+    let _recovered_id = wait_for_question(&mut session).await;
+    assert_eq!(gate.question_calls(), total + 1);
+
     shutdown(session).await;
     assert_eq!(
         store.requests().open_count(&thread, inc).await.unwrap(),
