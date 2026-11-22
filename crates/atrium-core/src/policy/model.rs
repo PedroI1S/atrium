@@ -784,7 +784,10 @@ pub(crate) struct ToolEffects {
     /// Per-argv-position filesystem access mode (same length as `unit.argv`),
     /// distinguishing e.g. `ln`/`cp` source reads from destination writes (§6).
     pub(crate) operand_access: Vec<AccessMode>,
-    /// Whether the unit may write to the filesystem.
+    /// Whether the unit is a possible writer under §5 (making later units and
+    /// pipeline siblings `Unread`), separate from per-operand `operand_access`
+    /// (e.g. `sed -f print.sed input` has `writes = true` because the program
+    /// is uninspected, while `print.sed` and `input` remain `AccessMode::Read`).
     pub(crate) writes: bool,
     /// Whether the unit writes to derived destinations, including conditional
     /// cases (`mv` of a directory) that P2 resolves against the filesystem (§5).

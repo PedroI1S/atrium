@@ -3,16 +3,23 @@
 //! Static data (`ToolSpec` rows) accounting for every tool `dev` knows plus
 //! §4's closed wrapper/nested-shell forms and §6's code-running/git forms.
 //!
-//! **Unknown tools vs. excluded forms (§4, §6):**
+//! **Unknown tools, Home-eligibility restrictions, and excluded forms (§4, §6):**
 //! - An **unknown tool** (absent from both [`TOOLS`] and [`OUTSIDE_MODEL`])
 //!   stays in the model for hard-deny and store checks (§4): every word counts
 //!   as a candidate `Path`, the unit counts as a possible writer (§5), and it
 //!   is never eligible for Home's read-only list. Under a covering Allow rule
 //!   meeting §7's simple-command conditions, Clear targets remain Clear.
+//! - A **Home-forbidden flag** (`home_readonly.forbidden` on an
+//!   [`FlagMode::AnyExceptForbidden`] row) **only removes Home read-only
+//!   eligibility** (`home_readonly_eligible = false`), so Home asks as on
+//!   `dev`. The unit stays in the model with that flag's declared effect (if
+//!   listed in `flags`, e.g. `tree -o out.txt` writes `out.txt`) or with
+//!   conservative `ReadWrite` candidate-path checks (if unlisted), so a
+//!   covering prefix/exact Allow rule can still cover it unless its declared
+//!   effect is `Unread`.
 //! - An **explicitly excluded form** makes its unit `Unread`: any entry in
 //!   [`OUTSIDE_MODEL`] (§3–§5), any flag absent from a [`FlagMode::ListedOnly`]
-//!   row, any forbidden flag on a [`FlagMode::AnyExceptForbidden`] row, or any
-//!   modeled form whose flags/operands trigger an `Unread` effect.
+//!   row, or any modeled form whose flags/operands trigger an `Unread` effect.
 //!
 //! Not wired into `SessionGate` until P5; parsing argv against this table is
 //! P3's job (`v4/tools.rs`).
@@ -63,7 +70,14 @@ pub(crate) enum FlagMode {
     /// - Any flag matching `home_readonly.forbidden` (via [`is_forbidden_flag`],
     ///   mirroring `dev`'s `engine::forbidden_flag`: short flags inside
     ///   clusters and long-option abbreviations of `>= 3` chars including `--`)
-    ///   is forbidden in Home and rejected.
+    ///   removes **Home read-only eligibility only** (`home_readonly_eligible =
+    ///   false`, so Home asks as on `dev`). It does **not** by itself make the
+    ///   unit `Unread`: the unit stays in the model with that flag's declared
+    ///   `FlagSpec` effect (if listed, e.g. `tree -o out.txt` writes `out.txt`,
+    ///   `git diff --output out.patch` writes `out.patch`, `git diff --ext-diff`
+    ///   runs inline code) or conservative `ReadWrite` candidate-path checks
+    ///   (if unlisted), so a covering prefix/exact Allow rule can still cover
+    ///   it unless its declared effect triggers `Unread`.
     /// - Any listed flag (or long abbreviation of `>= 3` chars matching a
     ///   listed writing flag via [`flag_long_or_writing_abbrev`]) applies its
     ///   exact `FlagKind` and `Effect`.
@@ -112,27 +126,105 @@ impl FlagToggle {
     }
 }
 
-/// Whether a flag is boolean, requires a value, or accepts an optional value.
+/// One argument consumed by a multi-argument flag (contract §6; Rule G:
+/// per-argument role and access mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum FlagKind {
-    Bool,
-    Value(ValueRole),
-    OptionalValue(ValueRole),
+pub(crate) struct FlagArgSpec {
+    pub(crate) role: ValueRole,
+    /// Access mode when `role` is `Path`, `DestinationRoot`, or `ProgramFile`
+    /// (`None` for non-path roles `Pattern`, `ArchiveMember`, `Ref`, `Text`,
+    /// `Code`).
+    pub(crate) access: Option<FlagValueAccess>,
 }
 
-/// How a path/destination/program-file value taken by a flag is accessed
-/// (contract §5, §6).
+/// Documented argument arity of a [`FlagKind`] (contract §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FlagArity {
+    /// Exact fixed number of required arguments (`0` for `Bool`, `1` for
+    /// `Value`, `N` for `MultiValue`).
+    Exact(usize),
+    /// Optional single argument (`0` or `1` for `OptionalValue`).
+    OptionalOne,
+    /// Variable number of arguments consumed up to one of the listed
+    /// terminator tokens (e.g. `find -exec CMD ... ;` or `+`).
+    Terminated(&'static [&'static str]),
+}
+
+/// How many arguments a flag consumes and the semantic role of each argument
+/// (contract §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FlagKind {
+    /// Takes 0 arguments.
+    Bool,
+    /// Takes 1 required argument with the given [`ValueRole`].
+    Value(ValueRole),
+    /// Takes 0 or 1 optional argument with the given [`ValueRole`].
+    OptionalValue(ValueRole),
+    /// Takes a fixed sequence of `N >= 2` required arguments, each with its
+    /// own [`ValueRole`] and optional [`FlagValueAccess`] (e.g.
+    /// `find -fprintf FILE FORMAT` → `[Write Path, Text]`).
+    MultiValue(&'static [FlagArgSpec]),
+    /// Consumes a variable number of arguments of `role` up to and including
+    /// one of `terminators` (e.g. `find -exec CMD ... ;` / `+`,
+    /// `find -ok CMD ... ;`).
+    TerminatedValues {
+        role: ValueRole,
+        terminators: &'static [&'static str],
+    },
+}
+
+impl FlagKind {
+    /// Returns the documented argument arity consumed by this flag.
+    pub(crate) const fn arity(self) -> FlagArity {
+        match self {
+            Self::Bool => FlagArity::Exact(0),
+            Self::Value(_) => FlagArity::Exact(1),
+            Self::OptionalValue(_) => FlagArity::OptionalOne,
+            Self::MultiValue(args) => FlagArity::Exact(args.len()),
+            Self::TerminatedValues { terminators, .. } => FlagArity::Terminated(terminators),
+        }
+    }
+}
+
+/// High-level operation mode selected by a tool's mode flags so per-flag path
+/// access depends on the operation rather than a row-wide write bit
+/// (contract §5, §6; Rule G).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ArchiveOperation {
+    /// Creating, appending to, or updating a tar archive (`tar -c`/`-r`/`-u`):
+    /// writes the archive (`-f`) and reads source operands and `-C` base dirs.
+    Write,
+    /// Extracting a tar archive (`tar -x`): reads the archive (`-f`) and
+    /// writes extracted entries into `-C` (or cwd).
+    Extract,
+    /// Listing a tar archive (`tar -t`): reads the archive (`-f`) and `-C`
+    /// base dirs; writes nothing.
+    List,
+}
+
+/// How a path/destination/program-file argument taken by a flag is accessed
+/// (contract §5, §6; Rule G: per operand and per operation, never per row).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FlagValueAccess {
-    /// Value path is read (e.g. `rg -f`, `grep -f`, `ag -p`, `find -f`,
-    /// `sed -f`, `awk -f`, `git -C`, `git --git-dir`, `git --work-tree`).
+    /// Value path is always read (e.g. `rg -f`, `grep -f`, `ag -p`, `find -f`,
+    /// `sed -f`, `git -C`, `git --git-dir`, `git --work-tree`).
     Read,
-    /// Value path is written (e.g. `sort -o`, `tree -o`, `git diff --output`,
-    /// `find -fprint`/`-fprint0`/`-fprintf`/`-fls`, `unzip -d`).
+    /// Value path is always written (e.g. `sort -o`, `tree -o`, `git diff
+    /// --output`, `find -fprint`/`-fprint0`/`-fprintf FILE`/`-fls`,
+    /// `unzip -d`).
     Write,
-    /// Value path is written when the unit writes and read otherwise (e.g.
-    /// `tar -f` written in `-c`/`-r`/`-u`, read in `-t`/`-x`; `tar -C`).
-    WriteWhenWriting,
+    /// Archive file path (`tar -f`/`--file`): `Write` for
+    /// [`ArchiveOperation::Write`] (`-c`/`-r`/`-u`), `Read` for
+    /// [`ArchiveOperation::Extract`] (`-x`) and [`ArchiveOperation::List`]
+    /// (`-t`), and conservative `ReadWrite` if no operation flag is present.
+    TarArchive,
+    /// Base directory (`tar -C`/`--directory`): `Write` for
+    /// [`ArchiveOperation::Extract`] (`-x`, destination directory where
+    /// extracted files are written), `Read` for [`ArchiveOperation::Write`]
+    /// (`-c`/`-r`/`-u`, source chdir directory) and [`ArchiveOperation::List`]
+    /// (`-t`, read-only chdir), and conservative `ReadWrite` if no operation
+    /// flag is present.
+    TarDirectory,
 }
 
 /// Case-sensitivity rule for a modeled search filter flag (contract §5, §6).
@@ -207,10 +299,22 @@ impl FlagUnread {
 /// disabling flag overrides an earlier enabling flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct FlagEffects {
-    /// Ordered toggle for write behaviour (`Enable` / `Disable`; last wins).
+    /// Ordered toggle for unit-level possible-writer status under §5 (`Enable`
+    /// / `Disable`; last wins). This marks later units and pipeline siblings
+    /// `Unread` and NEVER by itself turns positional inputs or flag values into
+    /// `AccessMode::Write` (Rule G).
     pub(crate) writes: FlagToggle,
-    /// Access mode for a path/destination/program-file value taken by this
-    /// flag (`None` for bool or non-path value flags).
+    /// Ordered toggle for writing positional `Path` input operands in place
+    /// (`sed -i`, `perl -i`, `codesign -s`/`-f`/`--remove-signature`,
+    /// `find -delete`; last wins). Never marks `ProgramFile` operands `Write`.
+    pub(crate) writes_positional_inputs: FlagToggle,
+    /// Archive operation mode selected by this flag (last wins; e.g.
+    /// `tar -c`/`-r`/`-u` → `ArchiveOperation::Write`, `-x` → `Extract`,
+    /// `-t` → `List`) so per-flag path access depends on the operation.
+    pub(crate) operation: Option<ArchiveOperation>,
+    /// Access mode for a single path/destination/program-file value taken by
+    /// a `FlagKind::Value` / `OptionalValue` flag (`None` for bool, non-path,
+    /// or `MultiValue` flags whose per-argument access lives in `FlagArgSpec`).
     pub(crate) value_access: Option<FlagValueAccess>,
     /// Ordered toggle for derived destinations (`cp -r`/`-R`/`-a`, `tar -x`,
     /// `find -delete`).
@@ -225,8 +329,8 @@ pub(crate) struct FlagEffects {
     /// e.g. `rg -e`/`--files`, `grep -e`/`-f`, `ag -g`, `ack -g`/`-f`/`--match`).
     pub(crate) provides_pattern: bool,
     /// Flag supplies an inline/file script so positional `[0]` is no longer a
-    /// script operand (e.g. `sed -e`/`--expression`, `sed -f`/`--file`,
-    /// `awk -f`/`--file`).
+    /// script or `ProgramFile` operand (e.g. `sed -e`/`--expression`,
+    /// `sed -f`/`--file`, `perl -e`/`-E`).
     pub(crate) provides_script: bool,
     /// Overrides the role of positional operands when present (last wins; e.g.
     /// `tar -c`/`-r`/`-u` → `Path`, `tar -x`/`-t` → `ArchiveMember`).
@@ -242,7 +346,7 @@ pub(crate) struct FlagEffects {
     /// `sh -c`, `python -c`, `find -exec`, `git -c`, `git rebase -x`).
     pub(crate) runs_code: bool,
     /// Flag names a program file to execute (`Unread (program)` coverable
-    /// under `pin`; e.g. `sed -f FILE`, `awk -f FILE`; §4, §7, §11 item 8).
+    /// under `pin`; e.g. `sed -f FILE`; §4, §7, §11 item 8).
     pub(crate) runs_program: Option<ProgramPin>,
     /// Force-push / implicit-target effect for `git push` flags.
     pub(crate) git_push: Option<GitPushEffect>,
@@ -255,6 +359,8 @@ pub(crate) struct FlagEffects {
 impl FlagEffects {
     const EMPTY: Self = Self {
         writes: FlagToggle::Unchanged,
+        writes_positional_inputs: FlagToggle::Unchanged,
+        operation: None,
         value_access: None,
         derived_destinations: FlagToggle::Unchanged,
         recursive: FlagToggle::Unchanged,
@@ -275,6 +381,8 @@ impl FlagEffects {
     /// stated on this `FlagEffects`.
     pub(crate) const fn has_any_effect(self) -> bool {
         !matches!(self.writes, FlagToggle::Unchanged)
+            || !matches!(self.writes_positional_inputs, FlagToggle::Unchanged)
+            || self.operation.is_some()
             || self.value_access.is_some()
             || !matches!(self.derived_destinations, FlagToggle::Unchanged)
             || !matches!(self.recursive, FlagToggle::Unchanged)
@@ -383,23 +491,23 @@ impl OperandLayout {
 /// How a tool's path operands split between reads and writes (contract §5, §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperandAccessMode {
-    /// All path operands are read.
+    /// All positional path operands are read (flag-held output paths still
+    /// take their own `FlagValueAccess::Write` / `TarArchive` / `TarDirectory`,
+    /// e.g. `sort -o`, `tree -o`, `git diff --output`, `tar -f`, `unzip -d`).
     AllRead,
-    /// All path/destination operands are written.
+    /// All positional path/destination operands are written.
     AllWrite,
-    /// Path operands are read when the unit does not write, and written when a
-    /// writing flag or write condition is active (e.g. `codesign -s`/`-f`/
-    /// `--remove-signature`, `sed -i`, `perl -i`).
-    AllWriteWhenWriting,
+    /// Positional `Path` operands are read unless a flag with
+    /// `FlagEffects::writes_positional_inputs == FlagToggle::Enable` is active
+    /// (e.g. `sed -i`, `perl -i`, `codesign -s`/`-f`/`--remove-signature`,
+    /// `find -delete`). Unit-level possible-writer status (`writes: Enable`,
+    /// e.g. `sed -f`, `perl script.pl`, `find -fprint`) never marks inputs
+    /// `Write`, and `ProgramFile` operands always remain `Read` (Rule G).
+    InPlaceWithFlag,
     /// Source operands are read and the final path/destination operand (and any
     /// `DestinationRoot` operand) is written (e.g. `ln`, `cp`, `rsync`,
     /// `git clone`, `uniq` >= 2 operands, `xxd` >= 2 operands; §6).
     SourcesReadLastWrite,
-    /// Positional path operands are read (unless a boolean `writes: Enable`
-    /// flag such as `find -delete` is present); value-taking path flags with
-    /// `writes: Enable` (e.g. `sort -o`, `tree -o`, `find -fprint`, `git diff
-    /// --output`, `tar -f` in create/append/update, `tar -C` in extract) write.
-    FlagOnlyWrite,
 }
 
 impl OperandAccessMode {
@@ -407,9 +515,8 @@ impl OperandAccessMode {
         match self {
             Self::AllRead => "AllRead",
             Self::AllWrite => "AllWrite",
-            Self::AllWriteWhenWriting => "AllWriteWhenWriting",
+            Self::InPlaceWithFlag => "InPlaceWithFlag",
             Self::SourcesReadLastWrite => "SourcesReadLastWrite",
-            Self::FlagOnlyWrite => "FlagOnlyWrite",
         }
     }
 }
@@ -515,15 +622,26 @@ pub(crate) const ALLOW_HOME_FOLLOWED_SEARCH: bool = true;
 ///
 /// Home eligibility matches on the command word **as written** (`cat`
 /// qualifies; `/bin/cat` and `CAT` do not).
+///
+/// `forbidden` and `only` restrict **Home read-only eligibility only**
+/// (`ToolEffects::home_readonly_eligible = false`, so Home asks as on `dev`).
+/// They never by themselves make the unit `Unread` under covering rules: the
+/// unit stays in the model with the flag's declared `FlagSpec` effect (if
+/// listed) or `AnyExceptForbidden`'s conservative `ReadWrite` candidate-path
+/// check (if unlisted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HomeReadOnlySpec {
     pub(crate) prefix: &'static [&'static str],
+    /// Flags that disqualify the unit from Home read-only auto-allow only
+    /// (never makes the unit `Unread` on its own).
     pub(crate) forbidden: &'static [&'static str],
+    /// When `Some`, Home read-only auto-allow permits only these exact args
+    /// (e.g. `git branch` listing flags).
     pub(crate) only: Option<&'static [&'static str]>,
     pub(crate) recursion: Recursion,
     /// Whether followed-symlink searches (`rg -L`, `grep -R`) are eligible for
-    /// Home Allow when the link walk is within budget (§10 row 15; proposed
-    /// §11 item 15).
+    /// Home Allow when the link walk is within budget (§10 row 15; §11 item
+    /// 15, D-139).
     pub(crate) allow_followed_search: bool,
 }
 
@@ -1364,12 +1482,6 @@ const GREP_FLAGS: &[FlagSpec] = &[
         ValueRole::Pattern,
         FlagUnread::FilterForm,
     ),
-    val_unread(
-        None,
-        Some("include-dir"),
-        ValueRole::Pattern,
-        FlagUnread::FilterForm,
-    ),
     val_none_l("label", ValueRole::Text, "stdin display label in output"),
     val_none_l("color", ValueRole::Text, "output color mode"),
     val_none_l("colour", ValueRole::Text, "output color mode"),
@@ -1953,6 +2065,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some("create"),
         FlagEffects {
             writes: FlagToggle::Enable,
+            operation: Some(ArchiveOperation::Write),
             positional_role: Some(ValueRole::Path),
             ..FlagEffects::EMPTY
         },
@@ -1962,6 +2075,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some("append"),
         FlagEffects {
             writes: FlagToggle::Enable,
+            operation: Some(ArchiveOperation::Write),
             positional_role: Some(ValueRole::Path),
             ..FlagEffects::EMPTY
         },
@@ -1971,6 +2085,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some("update"),
         FlagEffects {
             writes: FlagToggle::Enable,
+            operation: Some(ArchiveOperation::Write),
             positional_role: Some(ValueRole::Path),
             ..FlagEffects::EMPTY
         },
@@ -1980,6 +2095,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some("extract"),
         FlagEffects {
             writes: FlagToggle::Enable,
+            operation: Some(ArchiveOperation::Extract),
             derived_destinations: FlagToggle::Enable,
             positional_role: Some(ValueRole::ArchiveMember),
             ..FlagEffects::EMPTY
@@ -1989,6 +2105,7 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some('t'),
         Some("list"),
         FlagEffects {
+            operation: Some(ArchiveOperation::List),
             positional_role: Some(ValueRole::ArchiveMember),
             ..FlagEffects::EMPTY
         },
@@ -2007,16 +2124,16 @@ const TAR_FLAGS: &[FlagSpec] = &[
         Some("file"),
         ValueRole::Path,
         FlagEffects {
-            value_access: Some(FlagValueAccess::WriteWhenWriting),
+            value_access: Some(FlagValueAccess::TarArchive),
             ..FlagEffects::EMPTY
         },
     ),
     val_e(
         Some('C'),
         Some("directory"),
-        ValueRole::DestinationRoot,
+        ValueRole::Path,
         FlagEffects {
-            value_access: Some(FlagValueAccess::WriteWhenWriting),
+            value_access: Some(FlagValueAccess::TarDirectory),
             unread: Some(FlagUnread::BaseDirChange),
             ..FlagEffects::EMPTY
         },
@@ -2112,6 +2229,7 @@ const FIND_FLAGS: &[FlagSpec] = &[
         Some("delete"),
         FlagEffects {
             writes: FlagToggle::Enable,
+            writes_positional_inputs: FlagToggle::Enable,
             derived_destinations: FlagToggle::Enable,
             ..FlagEffects::EMPTY
         },
@@ -2132,46 +2250,58 @@ const FIND_FLAGS: &[FlagSpec] = &[
         ValueRole::Text,
         FlagUnread::FilterForm,
     ),
-    val_e(
-        None,
-        Some("exec"),
-        ValueRole::Code,
-        FlagEffects {
+    FlagSpec {
+        short: None,
+        long: Some("exec"),
+        kind: FlagKind::TerminatedValues {
+            role: ValueRole::Code,
+            terminators: &[";", "+"],
+        },
+        effect: Effect::Applied(FlagEffects {
             writes: FlagToggle::Enable,
             runs_code: true,
             ..FlagEffects::EMPTY
+        }),
+    },
+    FlagSpec {
+        short: None,
+        long: Some("execdir"),
+        kind: FlagKind::TerminatedValues {
+            role: ValueRole::Code,
+            terminators: &[";", "+"],
         },
-    ),
-    val_e(
-        None,
-        Some("execdir"),
-        ValueRole::Code,
-        FlagEffects {
+        effect: Effect::Applied(FlagEffects {
             writes: FlagToggle::Enable,
             runs_code: true,
             ..FlagEffects::EMPTY
+        }),
+    },
+    FlagSpec {
+        short: None,
+        long: Some("ok"),
+        kind: FlagKind::TerminatedValues {
+            role: ValueRole::Code,
+            terminators: &[";"],
         },
-    ),
-    val_e(
-        None,
-        Some("ok"),
-        ValueRole::Code,
-        FlagEffects {
+        effect: Effect::Applied(FlagEffects {
             writes: FlagToggle::Enable,
             runs_code: true,
             ..FlagEffects::EMPTY
+        }),
+    },
+    FlagSpec {
+        short: None,
+        long: Some("okdir"),
+        kind: FlagKind::TerminatedValues {
+            role: ValueRole::Code,
+            terminators: &[";"],
         },
-    ),
-    val_e(
-        None,
-        Some("okdir"),
-        ValueRole::Code,
-        FlagEffects {
+        effect: Effect::Applied(FlagEffects {
             writes: FlagToggle::Enable,
             runs_code: true,
             ..FlagEffects::EMPTY
-        },
-    ),
+        }),
+    },
     val_e(
         None,
         Some("fprint"),
@@ -2192,16 +2322,24 @@ const FIND_FLAGS: &[FlagSpec] = &[
             ..FlagEffects::EMPTY
         },
     ),
-    val_e(
-        None,
-        Some("fprintf"),
-        ValueRole::Path,
-        FlagEffects {
+    FlagSpec {
+        short: None,
+        long: Some("fprintf"),
+        kind: FlagKind::MultiValue(&[
+            FlagArgSpec {
+                role: ValueRole::Path,
+                access: Some(FlagValueAccess::Write),
+            },
+            FlagArgSpec {
+                role: ValueRole::Text,
+                access: None,
+            },
+        ]),
+        effect: Effect::Applied(FlagEffects {
             writes: FlagToggle::Enable,
-            value_access: Some(FlagValueAccess::Write),
             ..FlagEffects::EMPTY
-        },
-    ),
+        }),
+    },
     val_e(
         None,
         Some("fls"),
@@ -2275,6 +2413,7 @@ const CODESIGN_FLAGS: &[FlagSpec] = &[
         ValueRole::Text,
         FlagEffects {
             writes: FlagToggle::Enable,
+            writes_positional_inputs: FlagToggle::Enable,
             ..FlagEffects::EMPTY
         },
     ),
@@ -2283,6 +2422,7 @@ const CODESIGN_FLAGS: &[FlagSpec] = &[
         Some("force"),
         FlagEffects {
             writes: FlagToggle::Enable,
+            writes_positional_inputs: FlagToggle::Enable,
             ..FlagEffects::EMPTY
         },
     ),
@@ -2291,6 +2431,7 @@ const CODESIGN_FLAGS: &[FlagSpec] = &[
         Some("remove-signature"),
         FlagEffects {
             writes: FlagToggle::Enable,
+            writes_positional_inputs: FlagToggle::Enable,
             ..FlagEffects::EMPTY
         },
     ),
@@ -2303,16 +2444,19 @@ const CODESIGN_FLAGS: &[FlagSpec] = &[
 ];
 
 /// `sed` flags (`words.rs`, contract §4, §7): `-i`/`--in-place` writes input
-/// files, `-e`/`--expression` supplies an inline script inspected for
-/// `e`/`w`/`r` (omitting positional `[0]` script), and `-f`/`--file` names a
-/// pinnable program file (`Unread (program)` coverable under
-/// `ProgramPin::FlagValue`; §11 item 8).
+/// files in place (`writes_positional_inputs`), `-e`/`--expression` supplies
+/// an inline script inspected for `e`/`w`/`r` (omitting positional `[0]`
+/// script), and `-f`/`--file` names a pinnable program file (`ProgramFile`,
+/// `Read`, pinned under `ProgramPin::FlagValue`; §11 item 8) making the unit a
+/// possible writer (§5) without turning its input files into write targets
+/// (Rule G).
 const SED_FLAGS: &[FlagSpec] = &[
     bool_e(
         Some('i'),
         Some("in-place"),
         FlagEffects {
             writes: FlagToggle::Enable,
+            writes_positional_inputs: FlagToggle::Enable,
             ..FlagEffects::EMPTY
         },
     ),
@@ -2339,34 +2483,19 @@ const SED_FLAGS: &[FlagSpec] = &[
     ),
 ];
 
-/// `awk` / `gawk` / `mawk` flags (`words.rs`, contract §4, §7): `-f`/`--file`
-/// names a pinnable program file (`Unread (program)` coverable under
-/// `ProgramPin::FlagValue`; §11 item 8), while `-i`/`--include` loads an
-/// extension/library (`inline` code runner).
-const AWK_FLAGS: &[FlagSpec] = &[
-    val_e(
-        Some('f'),
-        Some("file"),
-        ValueRole::ProgramFile,
-        FlagEffects {
-            writes: FlagToggle::Enable,
-            value_access: Some(FlagValueAccess::Read),
-            provides_script: true,
-            runs_program: Some(ProgramPin::FlagValue),
-            ..FlagEffects::EMPTY
-        },
-    ),
-    val_e(
-        Some('i'),
-        Some("include"),
-        ValueRole::Code,
-        FlagEffects {
-            writes: FlagToggle::Enable,
-            runs_code: true,
-            ..FlagEffects::EMPTY
-        },
-    ),
-];
+/// `awk` / `gawk` / `mawk` flags known to `dev` (`words.rs`): `-i`/`--include`
+/// loads an extension/library (inline code runner). Any unlisted flag (e.g.
+/// `-f`) is `Unread(UnknownFlag)` under `FlagMode::ListedOnly`.
+const AWK_FLAGS: &[FlagSpec] = &[val_e(
+    Some('i'),
+    Some("include"),
+    ValueRole::Code,
+    FlagEffects {
+        writes: FlagToggle::Enable,
+        runs_code: true,
+        ..FlagEffects::EMPTY
+    },
+)];
 
 /// `perl` flags known to `dev` (`words.rs`, `deny.rs`).
 const PERL_FLAGS: &[FlagSpec] = &[
@@ -2374,7 +2503,7 @@ const PERL_FLAGS: &[FlagSpec] = &[
         Some('i'),
         None,
         FlagEffects {
-            writes: FlagToggle::Enable,
+            writes_positional_inputs: FlagToggle::Enable,
             ..FlagEffects::EMPTY
         },
     ),
@@ -2383,6 +2512,7 @@ const PERL_FLAGS: &[FlagSpec] = &[
         None,
         ValueRole::Code,
         FlagEffects {
+            provides_script: true,
             runs_code: true,
             ..FlagEffects::EMPTY
         },
@@ -2392,6 +2522,7 @@ const PERL_FLAGS: &[FlagSpec] = &[
         None,
         ValueRole::Code,
         FlagEffects {
+            provides_script: true,
             runs_code: true,
             ..FlagEffects::EMPTY
         },
@@ -2829,7 +2960,6 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         flag_mode: FlagMode::AnyExceptForbidden,
         flags: GIT_DIFF_FLAGS,
         operands: OperandLayout::all(ValueRole::Ref),
-        operand_access: OperandAccessMode::FlagOnlyWrite,
         writes: WriteBehavior::WithFlag,
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
@@ -3203,7 +3333,6 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         flags: OUTPUT_FILE_FLAGS,
-        operand_access: OperandAccessMode::FlagOnlyWrite,
         writes: WriteBehavior::WithFlag,
         home_readonly: Some(HomeReadOnlySpec {
             prefix: &["tree"],
@@ -3368,7 +3497,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         single_dash_long: true,
         flags: FIND_FLAGS,
         operands: OperandLayout::all(ValueRole::Path),
-        operand_access: OperandAccessMode::FlagOnlyWrite,
+        operand_access: OperandAccessMode::InPlaceWithFlag,
         writes: WriteBehavior::WithFlag,
         derived_destinations: DerivedDestinationsBehavior::WithFlag,
         recursive: RecursiveBehavior::Always,
@@ -3433,7 +3562,6 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flags: TAR_FLAGS,
         operands: OperandLayout::all(ValueRole::Path),
-        operand_access: OperandAccessMode::FlagOnlyWrite,
         writes: WriteBehavior::WithFlag,
         derived_destinations: DerivedDestinationsBehavior::WithFlag,
         recursive: RecursiveBehavior::Always,
@@ -3444,7 +3572,6 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flags: UNZIP_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Path], ValueRole::ArchiveMember),
-        operand_access: OperandAccessMode::FlagOnlyWrite,
         writes: WriteBehavior::Always,
         derived_destinations: DerivedDestinationsBehavior::Always,
         changes_default: Some("§11 item 9; §11 item 10"),
@@ -3592,7 +3719,6 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     base_tool("cut"),
     ToolSpec {
         flags: OUTPUT_FILE_FLAGS,
-        operand_access: OperandAccessMode::FlagOnlyWrite,
         writes: WriteBehavior::WithFlag,
         ..base_tool("sort")
     },
@@ -3676,7 +3802,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         platforms: Platforms::MacOs,
         flags: CODESIGN_FLAGS,
-        operand_access: OperandAccessMode::AllWriteWhenWriting,
+        operand_access: OperandAccessMode::InPlaceWithFlag,
         writes: WriteBehavior::WithFlag,
         changes_default: Some("§11 item 9"),
         ..base_tool("codesign")
@@ -3685,43 +3811,34 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flags: AWK_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Code], ValueRole::Path),
-        operand_access: OperandAccessMode::AllWriteWhenWriting,
         writes: WriteBehavior::Always,
-        code_runner: CodeRunnerBehavior::ProgramOrInline {
-            pin: ProgramPin::FlagValue,
-        },
+        code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 4"),
         ..base_tool("awk")
     },
     ToolSpec {
         flags: AWK_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Code], ValueRole::Path),
-        operand_access: OperandAccessMode::AllWriteWhenWriting,
         writes: WriteBehavior::Always,
-        code_runner: CodeRunnerBehavior::ProgramOrInline {
-            pin: ProgramPin::FlagValue,
-        },
+        code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 4"),
         ..base_tool("gawk")
     },
     ToolSpec {
         flags: AWK_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Code], ValueRole::Path),
-        operand_access: OperandAccessMode::AllWriteWhenWriting,
         writes: WriteBehavior::Always,
-        code_runner: CodeRunnerBehavior::ProgramOrInline {
-            pin: ProgramPin::FlagValue,
-        },
+        code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 4"),
         ..base_tool("mawk")
     },
     ToolSpec {
         flags: SED_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::Code], ValueRole::Path),
-        operand_access: OperandAccessMode::AllWriteWhenWriting,
+        operand_access: OperandAccessMode::InPlaceWithFlag,
         writes: WriteBehavior::WithFlag,
         code_runner: CodeRunnerBehavior::ScriptCommands(&['e', 'w', 'r']),
         code_runner_no_pin: true,
@@ -3731,7 +3848,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flags: PERL_FLAGS,
         operands: OperandLayout::prefix_then(&[ValueRole::ProgramFile], ValueRole::Path),
-        operand_access: OperandAccessMode::AllWriteWhenWriting,
+        operand_access: OperandAccessMode::InPlaceWithFlag,
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::ProgramOrInline {
             pin: ProgramPin::FirstOperand,
@@ -4257,6 +4374,14 @@ fn fmt_flag_effects(effect: Effect, include_none_reason: bool) -> String {
         FlagToggle::Enable => eff.push("writes:+".to_string()),
         FlagToggle::Disable => eff.push("writes:-".to_string()),
     }
+    match effects.writes_positional_inputs {
+        FlagToggle::Unchanged => {}
+        FlagToggle::Enable => eff.push("writes-inputs:+".to_string()),
+        FlagToggle::Disable => eff.push("writes-inputs:-".to_string()),
+    }
+    if let Some(op) = effects.operation {
+        eff.push(format!("op:{op:?}"));
+    }
     if let Some(access) = effects.value_access {
         eff.push(format!("val-access:{access:?}"));
     }
@@ -4334,7 +4459,9 @@ fn fmt_flags_summary(mode: FlagMode, single_dash_long: bool, flags: &[FlagSpec])
     if flags.is_empty() {
         return match mode {
             FlagMode::ListedOnly => format!("{mode_label}: none (any flag → Unread)"),
-            FlagMode::AnyExceptForbidden => format!("{mode_label}: any non-forbidden flag"),
+            FlagMode::AnyExceptForbidden => {
+                format!("{mode_label}: any flag (Home forbids listed flags)")
+            }
         };
     }
     if flags.len() > 12 {
@@ -4363,6 +4490,20 @@ fn fmt_flags_summary(mode: FlagMode, single_dash_long: bool, flags: &[FlagSpec])
                 FlagKind::Bool => format!("`{name}`"),
                 FlagKind::Value(r) => format!("`{name}` ({})", fmt_role(r)),
                 FlagKind::OptionalValue(r) => format!("`{name}` ([{}])", fmt_role(r)),
+                FlagKind::MultiValue(args) => {
+                    let roles = args
+                        .iter()
+                        .map(|a| match a.access {
+                            Some(acc) => format!("{}:{acc:?}", fmt_role(a.role)),
+                            None => fmt_role(a.role).to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("`{name}` ({roles})")
+                }
+                FlagKind::TerminatedValues { role, terminators } => {
+                    format!("`{name}` ({}... {})", fmt_role(role), terminators.join("|"))
+                }
             };
             let eff = fmt_flag_effects(f.effect, false);
             if eff.is_empty() {
@@ -4496,6 +4637,24 @@ fn write_flag_table(
             FlagKind::Bool => "Bool".into(),
             FlagKind::Value(r) => format!("Value({})", fmt_role(r)),
             FlagKind::OptionalValue(r) => format!("OptionalValue({})", fmt_role(r)),
+            FlagKind::MultiValue(args) => {
+                let roles = args
+                    .iter()
+                    .map(|a| match a.access {
+                        Some(acc) => format!("{}:{acc:?}", fmt_role(a.role)),
+                        None => fmt_role(a.role).to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("MultiValue({roles})")
+            }
+            FlagKind::TerminatedValues { role, terminators } => {
+                format!(
+                    "TerminatedValues({}, end: {})",
+                    fmt_role(role),
+                    terminators.join(" / ")
+                )
+            }
         };
         let eff = fmt_flag_effects(f.effect, true);
         let eff_str = if eff.is_empty() {
@@ -4517,20 +4676,26 @@ pub(crate) fn render_markdown() -> String {
          regenerate with `env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools`.\n\n",
     );
     out.push_str(
-        "**Unknown tools vs. excluded forms (§4, §6):**\n\
+        "**Unknown tools, Home-eligibility restrictions, and excluded forms (§4, §6):**\n\
          - An **unknown tool** (absent from both **Modeled tools** and **Outside the model** below) \
            stays in the model for hard-deny and store checks (§4): every word counts as a candidate `Path` \
            with conservative `ReadWrite` access, the unit counts as a possible writer (§5), and it \
            is never eligible for Home's read-only list. \
            Under a covering prefix/exact Allow rule meeting §7's simple-command conditions, Clear targets remain Clear.\n\
          - **`AnyExceptForbidden`** applies **only** to `HOME_READONLY_COMMANDS` rows without complete `dev` flag tables. \
-           Forbidden flags mirror `dev`'s `engine::forbidden_flag` (short clusters and long abbreviations of `>= 3` chars including `--`). \
            Listed flags (and long abbreviations matching a listed writing flag) keep their stated effects; \
-           any unlisted non-forbidden flag keeps `dev`'s conservative treatment (`ReadWrite` candidate-path check on every unclassified word and attached `--opt=value`).\n\
+           any unlisted flag keeps `dev`'s conservative treatment (`ReadWrite` candidate-path check on every unclassified word and attached `--opt=value`).\n\
+         - **Home-eligibility restrictions (`home_readonly.forbidden` / `home_readonly.only`):** \
+           forbidden flags mirror `dev`'s `engine::forbidden_flag` (short clusters and long abbreviations of `>= 3` chars including `--`). \
+           On an `AnyExceptForbidden` row, a Home-forbidden flag **only removes Home read-only eligibility** \
+           (`home_readonly_eligible = false`, so Home asks as on `dev`); it does **not** make the unit `Unread`. \
+           The unit stays in the model with that flag's declared effect (e.g. `tree -o out.txt` writes `out.txt`, \
+           `git diff --output out.patch` writes `out.patch`, `git diff --ext-diff` runs inline code → `Unread`), \
+           so a covering prefix/exact Allow rule can still cover it unless its declared effect triggers `Unread`.\n\
          - **Rows outside `HOME_READONLY_COMMANDS`** (and search tools with complete `dev` flag tables) use **`ListedOnly`**: \
            an unlisted flag makes the unit `Unread(UnknownFlag)` and falls back to conservative `ReadWrite` candidate-path checks on unclassified words.\n\
-         - An **explicitly excluded form** makes its unit **Unread**: every entry in **Outside the model**, \
-           any unlisted flag on a `ListedOnly` row, any forbidden flag on an `AnyExceptForbidden` row, \
+         - An **explicitly excluded form** makes its unit **Unread** under every setting (including prefix/exact rules): \
+           every entry in **Outside the model**, any unlisted flag on a `ListedOnly` row, \
            or any modeled flag/form triggering an explicit `Unread` effect (§3–§6).\n\n",
     );
 
@@ -4748,9 +4913,27 @@ mod tests {
                         "{context}: filter flag must take Value(Pattern)"
                     );
                 }
-                if let FlagKind::Value(role) | FlagKind::OptionalValue(role) = f.kind {
-                    // Exhaustive match confirms every value flag assigns a concrete ValueRole.
-                    let _ = fmt_role(role);
+                match f.kind {
+                    FlagKind::Bool => {}
+                    FlagKind::Value(role) | FlagKind::OptionalValue(role) => {
+                        let _ = fmt_role(role);
+                    }
+                    FlagKind::MultiValue(args) => {
+                        assert!(
+                            args.len() >= 2,
+                            "{context}: MultiValue flag must take at least 2 arguments"
+                        );
+                        for a in args {
+                            let _ = fmt_role(a.role);
+                        }
+                    }
+                    FlagKind::TerminatedValues { role, terminators } => {
+                        let _ = fmt_role(role);
+                        assert!(
+                            !terminators.is_empty(),
+                            "{context}: TerminatedValues flag must list at least one terminator"
+                        );
+                    }
                 }
             }
         };
@@ -4770,11 +4953,18 @@ mod tests {
                 || layout.last == Some(ValueRole::Code)
                 || flags.iter().any(|f| {
                     f.effects().runs_code
-                        || matches!(
-                            f.kind,
+                        || match f.kind {
                             FlagKind::Value(ValueRole::Code)
-                                | FlagKind::OptionalValue(ValueRole::Code)
-                        )
+                            | FlagKind::OptionalValue(ValueRole::Code)
+                            | FlagKind::TerminatedValues {
+                                role: ValueRole::Code,
+                                ..
+                            } => true,
+                            FlagKind::MultiValue(args) => {
+                                args.iter().any(|a| a.role == ValueRole::Code)
+                            }
+                            _ => false,
+                        }
                 })
         };
         let has_program_file = |layout: OperandLayout, flags: &[FlagSpec]| {
@@ -4782,11 +4972,18 @@ mod tests {
                 || layout.rest == Some(ValueRole::ProgramFile)
                 || flags.iter().any(|f| {
                     f.effects().runs_program.is_some()
-                        || matches!(
-                            f.kind,
+                        || match f.kind {
                             FlagKind::Value(ValueRole::ProgramFile)
-                                | FlagKind::OptionalValue(ValueRole::ProgramFile)
-                        )
+                            | FlagKind::OptionalValue(ValueRole::ProgramFile)
+                            | FlagKind::TerminatedValues {
+                                role: ValueRole::ProgramFile,
+                                ..
+                            } => true,
+                            FlagKind::MultiValue(args) => {
+                                args.iter().any(|a| a.role == ValueRole::ProgramFile)
+                            }
+                            _ => false,
+                        }
                 })
         };
 
@@ -5020,7 +5217,9 @@ mod tests {
     }
 
     /// Test-only helper checking whether a command's flags are accepted under a
-    /// covering rule (not `UnknownFlag`, no `FlagUnread`, and not `OUTSIDE_MODEL`).
+    /// covering rule (not `UnknownFlag`, no `FlagUnread`, no `runs_code`, and
+    /// not `OUTSIDE_MODEL`). Note: `home_readonly.forbidden` only removes Home
+    /// eligibility and does NOT reject the unit under a covering rule.
     fn table_accepts_flags_under_rule(argv: &[&str]) -> bool {
         let Some(&cmd) = argv.first() else {
             return false;
@@ -5032,16 +5231,21 @@ mod tests {
             // Unknown tool stays in model under covering rules (§4).
             return true;
         };
-        let (flag_mode, flags, args) = if !tool.subcommands.is_empty() {
+        let (flag_mode, single_dash, flags, args) = if !tool.subcommands.is_empty() {
             let Some(&sub_name) = argv.get(1) else {
                 return true;
             };
             match subcommand(tool, sub_name) {
-                Some(sub) => (sub.flag_mode, sub.flags, &argv[2..]),
+                Some(sub) => (sub.flag_mode, false, sub.flags, &argv[2..]),
                 None => return true,
             }
         } else {
-            (tool.flag_mode, tool.flags, &argv[1..])
+            (
+                tool.flag_mode,
+                tool.single_dash_long,
+                tool.flags,
+                &argv[1..],
+            )
         };
         let mut i = 0;
         let mut dd = false;
@@ -5055,17 +5259,65 @@ mod tests {
                 dd = true;
                 continue;
             }
-            if let Some(rest) = tok.strip_prefix("--") {
+            if single_dash {
+                let rest = &tok[1..];
+                let spec = if rest.chars().count() == 1 {
+                    flag_short(flags, rest.chars().next().unwrap())
+                } else {
+                    flag_long(flags, rest)
+                };
+                if let Some(spec) = spec {
+                    let eff = spec.effects();
+                    if eff.unread.is_some() || eff.runs_code {
+                        return false;
+                    }
+                    match spec.kind {
+                        FlagKind::Bool | FlagKind::OptionalValue(_) => {}
+                        FlagKind::Value(_) => i = (i + 1).min(args.len()),
+                        FlagKind::MultiValue(a) => i = (i + a.len()).min(args.len()),
+                        FlagKind::TerminatedValues { terminators, .. } => {
+                            while i < args.len() {
+                                let w = args[i];
+                                i += 1;
+                                if terminators.contains(&w) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else if flag_mode == FlagMode::ListedOnly {
+                    return false;
+                }
+            } else if let Some(rest) = tok.strip_prefix("--") {
                 let (name, has_eq) = match rest.split_once('=') {
                     Some((n, _)) => (n, true),
                     None => (rest, false),
                 };
                 if let Some(spec) = flag_long_or_writing_abbrev(flags, name) {
-                    if spec.effects().unread.is_some() {
+                    let eff = spec.effects();
+                    if eff.unread.is_some() || eff.runs_code {
                         return false;
                     }
-                    if matches!(spec.kind, FlagKind::Value(_)) && !has_eq {
-                        i += 1;
+                    match spec.kind {
+                        FlagKind::Value(_) if !has_eq => i = (i + 1).min(args.len()),
+                        FlagKind::MultiValue(a) => {
+                            let rem = if has_eq {
+                                a.len().saturating_sub(1)
+                            } else {
+                                a.len()
+                            };
+                            i = (i + rem).min(args.len());
+                        }
+                        FlagKind::TerminatedValues { terminators, .. } => {
+                            while i < args.len() {
+                                let w = args[i];
+                                i += 1;
+                                if terminators.contains(&w) {
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 } else if flag_mode == FlagMode::ListedOnly {
                     return false;
@@ -5074,14 +5326,37 @@ mod tests {
                 let chars: Vec<char> = tok[1..].chars().collect();
                 for (k, &c) in chars.iter().enumerate() {
                     if let Some(spec) = flag_short(flags, c) {
-                        if spec.effects().unread.is_some() {
+                        let eff = spec.effects();
+                        if eff.unread.is_some() || eff.runs_code {
                             return false;
                         }
-                        if matches!(spec.kind, FlagKind::Value(_)) {
-                            if k + 1 == chars.len() {
-                                i += 1;
+                        match spec.kind {
+                            FlagKind::Value(_) => {
+                                if k + 1 == chars.len() {
+                                    i = (i + 1).min(args.len());
+                                }
+                                break;
                             }
-                            break;
+                            FlagKind::MultiValue(a) => {
+                                let rem = if k + 1 < chars.len() {
+                                    a.len().saturating_sub(1)
+                                } else {
+                                    a.len()
+                                };
+                                i = (i + rem).min(args.len());
+                                break;
+                            }
+                            FlagKind::TerminatedValues { terminators, .. } => {
+                                while i < args.len() {
+                                    let w = args[i];
+                                    i += 1;
+                                    if terminators.contains(&w) {
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                            _ => {}
                         }
                     } else if flag_mode == FlagMode::ListedOnly {
                         return false;
@@ -5389,8 +5664,10 @@ mod tests {
                         rg_dev_val_s.contains(&c),
                         "rg invented short value flag -{c} beyond dev's table"
                     ),
-                    FlagKind::OptionalValue(_) => {
-                        panic!("rg invented short optional-value flag -{c}")
+                    FlagKind::OptionalValue(_)
+                    | FlagKind::MultiValue(_)
+                    | FlagKind::TerminatedValues { .. } => {
+                        panic!("rg invented non-dev short flag kind for -{c}")
                     }
                 }
             }
@@ -5404,8 +5681,10 @@ mod tests {
                         rg_dev_val_l.contains(l),
                         "rg invented long value flag --{l} beyond dev's table"
                     ),
-                    FlagKind::OptionalValue(_) => {
-                        panic!("rg invented long optional-value flag --{l}")
+                    FlagKind::OptionalValue(_)
+                    | FlagKind::MultiValue(_)
+                    | FlagKind::TerminatedValues { .. } => {
+                        panic!("rg invented non-dev long flag kind for --{l}")
                     }
                 }
             }
@@ -5421,7 +5700,7 @@ mod tests {
         let grep_dev_val_l: HashSet<&str> = engine::GREP_VAL_L
             .iter()
             .copied()
-            .chain(["file", "include-dir"])
+            .chain(std::iter::once("file"))
             .collect();
         for &c in &grep_dev_bool_s {
             let f = flag_short(grep.flags, c).unwrap_or_else(|| panic!("grep missing -{c}"));
@@ -5456,8 +5735,10 @@ mod tests {
                         grep_dev_val_s.contains(&c),
                         "grep invented short value flag -{c} beyond dev's table"
                     ),
-                    FlagKind::OptionalValue(_) => {
-                        panic!("grep invented short optional-value flag -{c}")
+                    FlagKind::OptionalValue(_)
+                    | FlagKind::MultiValue(_)
+                    | FlagKind::TerminatedValues { .. } => {
+                        panic!("grep invented non-dev short flag kind for -{c}")
                     }
                 }
             }
@@ -5471,8 +5752,10 @@ mod tests {
                         grep_dev_val_l.contains(l),
                         "grep invented long value flag --{l} beyond dev's table"
                     ),
-                    FlagKind::OptionalValue(_) => {
-                        panic!("grep invented long optional-value flag --{l}")
+                    FlagKind::OptionalValue(_)
+                    | FlagKind::MultiValue(_)
+                    | FlagKind::TerminatedValues { .. } => {
+                        panic!("grep invented non-dev long flag kind for --{l}")
                     }
                 }
             }
@@ -5539,6 +5822,9 @@ mod tests {
                             dev_opt_s.contains(&c),
                             "{name} invented short optional-value flag -{c} beyond dev's table"
                         ),
+                        FlagKind::MultiValue(_) | FlagKind::TerminatedValues { .. } => {
+                            panic!("{name} invented non-dev short flag kind for -{c}")
+                        }
                     }
                 }
                 if let Some(l) = f.long {
@@ -5555,6 +5841,9 @@ mod tests {
                             dev_opt_l.contains(l),
                             "{name} invented long optional-value flag --{l} beyond dev's table"
                         ),
+                        FlagKind::MultiValue(_) | FlagKind::TerminatedValues { .. } => {
+                            panic!("{name} invented non-dev long flag kind for --{l}")
+                        }
                     }
                 }
             }
@@ -5589,8 +5878,13 @@ mod tests {
                 || layout.last.is_some_and(is_relaxed)
                 || layout.after_double_dash.is_some_and(is_relaxed)
                 || flags.iter().any(|f| {
-                    matches!(f.kind, FlagKind::Value(r) | FlagKind::OptionalValue(r) if is_relaxed(r))
-                        || f.effects().positional_role.is_some_and(is_relaxed)
+                    let kind_relaxes = match f.kind {
+                        FlagKind::Value(r) | FlagKind::OptionalValue(r) => is_relaxed(r),
+                        FlagKind::MultiValue(args) => args.iter().any(|a| is_relaxed(a.role)),
+                        FlagKind::TerminatedValues { role, .. } => is_relaxed(role),
+                        FlagKind::Bool => false,
+                    };
+                    kind_relaxes || f.effects().positional_role.is_some_and(is_relaxed)
                 })
         };
         for t in TOOLS {
@@ -5632,31 +5926,39 @@ mod tests {
         // extract/list operands are ArchiveMembers; -C triggers UnsupportedBaseDirChange.
         let tar = lookup("tar").unwrap();
         assert_eq!(tar.operands, OperandLayout::all(ValueRole::Path));
+        assert_eq!(tar.operand_access, OperandAccessMode::AllRead);
         for c in ['c', 'r', 'u'] {
             let f = flag_short(tar.flags, c).unwrap();
             assert_eq!(f.effects().positional_role, Some(ValueRole::Path));
             assert_eq!(f.effects().writes, FlagToggle::Enable);
+            assert_eq!(f.effects().operation, Some(ArchiveOperation::Write));
         }
         let tar_x = flag_short(tar.flags, 'x').unwrap();
         assert_eq!(
             tar_x.effects().positional_role,
             Some(ValueRole::ArchiveMember)
         );
+        assert_eq!(tar_x.effects().operation, Some(ArchiveOperation::Extract));
         assert_eq!(tar_x.effects().derived_destinations, FlagToggle::Enable);
         let tar_t = flag_short(tar.flags, 't').unwrap();
         assert_eq!(
             tar_t.effects().positional_role,
             Some(ValueRole::ArchiveMember)
         );
+        assert_eq!(tar_t.effects().operation, Some(ArchiveOperation::List));
         assert_eq!(tar_t.effects().writes, FlagToggle::Unchanged);
         let tar_f = flag_short(tar.flags, 'f').unwrap();
         assert_eq!(tar_f.kind, FlagKind::Value(ValueRole::Path));
         assert_eq!(
             tar_f.effects().value_access,
-            Some(FlagValueAccess::WriteWhenWriting)
+            Some(FlagValueAccess::TarArchive)
         );
         let tar_c = flag_short(tar.flags, 'C').unwrap();
-        assert_eq!(tar_c.kind, FlagKind::Value(ValueRole::DestinationRoot));
+        assert_eq!(tar_c.kind, FlagKind::Value(ValueRole::Path));
+        assert_eq!(
+            tar_c.effects().value_access,
+            Some(FlagValueAccess::TarDirectory)
+        );
         assert_eq!(tar_c.effects().unread, Some(FlagUnread::BaseDirChange));
 
         // Finding 6 (round 1): destination write access for git clone, git checkout, codesign, sed, unzip, etc.
@@ -5679,12 +5981,16 @@ mod tests {
             Some(ValueRole::DestinationRoot)
         );
         let codesign = lookup("codesign").unwrap();
-        assert_eq!(
-            codesign.operand_access,
-            OperandAccessMode::AllWriteWhenWriting
-        );
+        assert_eq!(codesign.operand_access, OperandAccessMode::InPlaceWithFlag);
         assert_eq!(
             flag_short(codesign.flags, 's').unwrap().effects().writes,
+            FlagToggle::Enable
+        );
+        assert_eq!(
+            flag_short(codesign.flags, 's')
+                .unwrap()
+                .effects()
+                .writes_positional_inputs,
             FlagToggle::Enable
         );
         assert_eq!(
@@ -5707,13 +6013,14 @@ mod tests {
             FlagToggle::Enable
         );
 
-        // Finding 9 (round 1) + Finding 5 (round 2): sed -e inspects e/w/r; sed -f & awk -f pin ProgramFile.
+        // Finding 9 (round 1) + Finding 5 (round 2) + Finding 4 (round 3): sed -e inspects e/w/r;
+        // sed -f pins ProgramFile (Read) and marks unit possible writer without turning inputs Write.
         let sed = lookup("sed").unwrap();
         assert_eq!(
             sed.code_runner,
             CodeRunnerBehavior::ScriptCommands(&['e', 'w', 'r'])
         );
-        assert_eq!(sed.operand_access, OperandAccessMode::AllWriteWhenWriting);
+        assert_eq!(sed.operand_access, OperandAccessMode::InPlaceWithFlag);
         assert!(sed.changes_default.unwrap().contains("§11 item 8"));
         let sed_e = flag_short(sed.flags, 'e').unwrap();
         assert_eq!(sed_e.kind, FlagKind::Value(ValueRole::Code));
@@ -5726,6 +6033,11 @@ mod tests {
         assert!(!sed_f.effects().runs_code);
         assert_eq!(sed_f.effects().runs_program, Some(ProgramPin::FlagValue));
         assert_eq!(sed_f.effects().value_access, Some(FlagValueAccess::Read));
+        assert_eq!(sed_f.effects().writes, FlagToggle::Enable);
+        assert_eq!(
+            sed_f.effects().writes_positional_inputs,
+            FlagToggle::Unchanged
+        );
 
         // Finding 10 (round 1): ag, ack, git diff, git push all reject unpinned Allow prefixes.
         for name in ["ag", "ack"] {
@@ -5830,15 +6142,16 @@ mod tests {
     #[test]
     fn markdown_renders_access_modes_flag_effects_and_find_primaries() {
         let md = render_markdown();
-        assert!(md.contains("Unknown tools vs. excluded forms"));
+        assert!(md.contains("Unknown tools, Home-eligibility restrictions, and excluded forms"));
         assert!(md.contains("AnyExceptForbidden"));
         assert!(md.contains("ListedOnly"));
-        assert!(md.contains("access: AllWriteWhenWriting"));
+        assert!(md.contains("access: InPlaceWithFlag"));
         assert!(md.contains("access: SourcesReadLastWrite"));
         assert!(md.contains("### `codesign`"));
         assert!(md.contains("### `git branch`"));
         assert!(md.contains("### `git diff`"));
-        // find primaries must render with single-dash spelling, not double-dash.
+        // find primaries must render with single-dash spelling, not double-dash,
+        // and multi-arg / terminated forms must render their exact arities.
         let find_start = md
             .find("### `find`")
             .expect("detailed flag table for `find` missing");
@@ -5848,6 +6161,9 @@ mod tests {
         assert!(find_section.contains("`-follow`"));
         assert!(find_section.contains("`-delete`"));
         assert!(find_section.contains("`-exec`"));
+        assert!(find_section.contains("MultiValue(Path:Write, Text)"));
+        assert!(find_section.contains("TerminatedValues(Code, end: ; / +)"));
+        assert!(find_section.contains("TerminatedValues(Code, end: ;)"));
         assert!(!find_section.contains("`--follow`"));
         assert!(!find_section.contains("`--delete`"));
         assert!(!find_section.contains("`--exec`"));
@@ -5955,18 +6271,53 @@ mod tests {
                     }
                 }
                 let eff = f.effects();
-                if matches!(
-                    f.kind,
-                    FlagKind::Value(
-                        ValueRole::Path | ValueRole::DestinationRoot | ValueRole::ProgramFile
-                    ) | FlagKind::OptionalValue(
+                let is_path_role = |r: ValueRole| {
+                    matches!(
+                        r,
                         ValueRole::Path | ValueRole::DestinationRoot | ValueRole::ProgramFile
                     )
-                ) {
-                    assert!(
-                        eff.value_access.is_some(),
-                        "{context} {flag_name}: path/destination/program-file value flag must declare FlagValueAccess"
-                    );
+                };
+                match f.kind {
+                    FlagKind::Value(r) | FlagKind::OptionalValue(r) if is_path_role(r) => {
+                        assert!(
+                            eff.value_access.is_some(),
+                            "{context} {flag_name}: path/destination/program-file value flag must declare FlagValueAccess"
+                        );
+                    }
+                    FlagKind::MultiValue(args) => {
+                        assert!(
+                            args.len() >= 2,
+                            "{context} {flag_name}: MultiValue flag must take at least 2 arguments"
+                        );
+                        assert!(
+                            eff.value_access.is_none(),
+                            "{context} {flag_name}: MultiValue flag must declare access per FlagArgSpec, not in value_access"
+                        );
+                        for (idx, a) in args.iter().enumerate() {
+                            if is_path_role(a.role) {
+                                assert!(
+                                    a.access.is_some(),
+                                    "{context} {flag_name} arg[{idx}]: path-like arg must declare FlagValueAccess"
+                                );
+                            } else {
+                                assert!(
+                                    a.access.is_none(),
+                                    "{context} {flag_name} arg[{idx}]: non-path arg must not declare FlagValueAccess"
+                                );
+                            }
+                        }
+                    }
+                    FlagKind::TerminatedValues { terminators, .. } => {
+                        assert!(
+                            !terminators.is_empty(),
+                            "{context} {flag_name}: TerminatedValues must list at least one terminator"
+                        );
+                        assert!(
+                            eff.value_access.is_none(),
+                            "{context} {flag_name}: TerminatedValues must not set scalar value_access"
+                        );
+                    }
+                    _ => {}
                 }
                 if eff.filter.is_some() {
                     assert_eq!(
@@ -5988,9 +6339,13 @@ mod tests {
                     assert!(
                         matches!(
                             eff.value_access,
-                            Some(FlagValueAccess::Write | FlagValueAccess::WriteWhenWriting)
+                            Some(
+                                FlagValueAccess::Write
+                                    | FlagValueAccess::TarArchive
+                                    | FlagValueAccess::TarDirectory
+                            )
                         ),
-                        "{context} {flag_name}: writing path flag must set Write or WriteWhenWriting value_access"
+                        "{context} {flag_name}: writing path flag must set Write/TarArchive/TarDirectory value_access"
                     );
                 }
             }
@@ -6100,6 +6455,8 @@ mod tests {
     struct SimulatedUnit {
         unread: Vec<UnreadReason>,
         writes: bool,
+        derived_destinations: bool,
+        home_readonly_eligible: bool,
         candidate_paths: Vec<(String, super::super::model::AccessMode)>,
         filters: Vec<(FilterDialect, String, bool)>,
         program_pin: Option<Vec<String>>,
@@ -6128,6 +6485,8 @@ mod tests {
             }
             return out;
         };
+
+        out.home_readonly_eligible = table_accepts_in_home(argv);
 
         // For multi-subcommand tools (e.g. `git`), scan top-level global flags
         // before the subcommand first.
@@ -6163,8 +6522,9 @@ mod tests {
                         if let (Some(v), Some(acc)) = (val, eff.value_access) {
                             let mode = match acc {
                                 FlagValueAccess::Read => AccessMode::Read,
-                                FlagValueAccess::Write | FlagValueAccess::WriteWhenWriting => {
-                                    AccessMode::Write
+                                FlagValueAccess::Write => AccessMode::Write,
+                                FlagValueAccess::TarArchive | FlagValueAccess::TarDirectory => {
+                                    AccessMode::ReadWrite
                                 }
                             };
                             out.candidate_paths.push((v.to_string(), mode));
@@ -6205,8 +6565,9 @@ mod tests {
                         if let (Some(v), Some(acc)) = (val, eff.value_access) {
                             let mode = match acc {
                                 FlagValueAccess::Read => AccessMode::Read,
-                                FlagValueAccess::Write | FlagValueAccess::WriteWhenWriting => {
-                                    AccessMode::Write
+                                FlagValueAccess::Write => AccessMode::Write,
+                                FlagValueAccess::TarArchive | FlagValueAccess::TarDirectory => {
+                                    AccessMode::ReadWrite
                                 }
                             };
                             out.candidate_paths.push((v.to_string(), mode));
@@ -6231,29 +6592,42 @@ mod tests {
             }
         }
 
-        let (flag_mode, single_dash, flags, layout, access_mode, write_behavior, code_runner) =
-            match sub_spec {
-                Some(s) => (
-                    s.flag_mode,
-                    false,
-                    s.flags,
-                    s.operands,
-                    s.operand_access,
-                    s.writes,
-                    s.code_runner,
-                ),
-                None => (
-                    tool.flag_mode,
-                    tool.single_dash_long,
-                    tool.flags,
-                    tool.operands,
-                    tool.operand_access,
-                    tool.writes,
-                    tool.code_runner,
-                ),
-            };
+        let (
+            flag_mode,
+            single_dash,
+            flags,
+            layout,
+            access_mode,
+            write_behavior,
+            derived_behavior,
+            code_runner,
+        ) = match sub_spec {
+            Some(s) => (
+                s.flag_mode,
+                false,
+                s.flags,
+                s.operands,
+                s.operand_access,
+                s.writes,
+                s.derived_destinations,
+                s.code_runner,
+            ),
+            None => (
+                tool.flag_mode,
+                tool.single_dash_long,
+                tool.flags,
+                tool.operands,
+                tool.operand_access,
+                tool.writes,
+                tool.derived_destinations,
+                tool.code_runner,
+            ),
+        };
 
         let mut writes_toggle = FlagToggle::Unchanged;
+        let mut writes_inputs_toggle = FlagToggle::Unchanged;
+        let mut derived_toggle = FlagToggle::Unchanged;
+        let mut operation: Option<ArchiveOperation> = None;
         let mut provides_pattern = false;
         let mut provides_script = false;
         let mut positional_role_override: Option<ValueRole> = None;
@@ -6278,12 +6652,16 @@ mod tests {
                 dd = true;
                 continue;
             }
+            #[allow(clippy::too_many_arguments)]
             let apply_spec =
                 |spec: &'static FlagSpec,
                  flag_label: String,
-                 val: Option<&str>,
+                 vals: &[String],
                  out: &mut SimulatedUnit,
                  writes_toggle: &mut FlagToggle,
+                 writes_inputs_toggle: &mut FlagToggle,
+                 derived_toggle: &mut FlagToggle,
+                 operation: &mut Option<ArchiveOperation>,
                  provides_pattern: &mut bool,
                  provides_script: &mut bool,
                  positional_role_override: &mut Option<ValueRole>,
@@ -6295,23 +6673,54 @@ mod tests {
                     if eff.writes != FlagToggle::Unchanged {
                         *writes_toggle = eff.writes;
                     }
+                    if eff.writes_positional_inputs != FlagToggle::Unchanged {
+                        *writes_inputs_toggle = eff.writes_positional_inputs;
+                    }
+                    if eff.derived_destinations != FlagToggle::Unchanged {
+                        *derived_toggle = eff.derived_destinations;
+                    }
+                    if let Some(op) = eff.operation {
+                        *operation = Some(op);
+                    }
                     *provides_pattern |= eff.provides_pattern;
                     *provides_script |= eff.provides_script;
                     if let Some(r) = eff.positional_role {
                         *positional_role_override = Some(r);
                     }
                     *global_filter_ci = eff.filter_case_insensitive.apply(*global_filter_ci);
-                    if let (Some(v), Some(acc)) = (val, eff.value_access) {
-                        deferred_val_paths.push((v.to_string(), acc));
-                    }
-                    if let (Some(v), Some(fs)) = (val, eff.filter) {
-                        raw_filters.push((fs, v.to_string()));
-                    }
-                    if eff.provides_script
-                        && matches!(spec.kind, FlagKind::Value(ValueRole::Code))
-                        && let Some(v) = val
-                    {
-                        scripts.push(v.to_string());
+                    match spec.kind {
+                        FlagKind::MultiValue(arg_specs) => {
+                            for (arg_spec, val) in arg_specs.iter().zip(vals.iter()) {
+                                if let Some(acc) = arg_spec.access {
+                                    deferred_val_paths.push((val.clone(), acc));
+                                }
+                            }
+                        }
+                        FlagKind::TerminatedValues { .. } => {}
+                        _ => {
+                            let val = vals.first().map(String::as_str);
+                            if let (Some(v), Some(acc)) = (val, eff.value_access) {
+                                deferred_val_paths.push((v.to_string(), acc));
+                            }
+                            if let (Some(v), Some(fs)) = (val, eff.filter) {
+                                raw_filters.push((fs, v.to_string()));
+                            }
+                            if eff.provides_script
+                                && matches!(spec.kind, FlagKind::Value(ValueRole::Code))
+                                && let Some(v) = val
+                            {
+                                scripts.push(v.to_string());
+                            }
+                            if let (Some(ProgramPin::FlagValue), Some(v)) = (eff.runs_program, val)
+                            {
+                                let words =
+                                    vec![cmd.to_string(), flag_label.clone(), v.to_string()];
+                                out.program_pin = Some(words.clone());
+                                out.unread.push(UnreadReason::Program {
+                                    program_words: words,
+                                });
+                            }
+                        }
                     }
                     if eff.runs_code {
                         out.inline_code = true;
@@ -6319,17 +6728,56 @@ mod tests {
                             tool: cmd.to_string(),
                         });
                     }
-                    if let (Some(ProgramPin::FlagValue), Some(v)) = (eff.runs_program, val) {
-                        let words = vec![cmd.to_string(), flag_label.clone(), v.to_string()];
-                        out.program_pin = Some(words.clone());
-                        out.unread.push(UnreadReason::Program {
-                            program_words: words,
-                        });
-                    }
                     if let Some(u) = eff.unread {
                         out.unread.push(u.into_unread_reason(cmd, &flag_label));
                     }
                 };
+
+            let consume_args = |kind: FlagKind,
+                                attached: Option<&str>,
+                                args: &[&str],
+                                i: &mut usize|
+             -> Vec<String> {
+                match kind {
+                    FlagKind::Bool => vec![],
+                    FlagKind::Value(_) => {
+                        if let Some(v) = attached {
+                            vec![v.to_string()]
+                        } else if let Some(&v) = args.get(*i) {
+                            *i += 1;
+                            vec![v.to_string()]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    FlagKind::OptionalValue(_) => {
+                        attached.map(|v| vec![v.to_string()]).unwrap_or_default()
+                    }
+                    FlagKind::MultiValue(specs) => {
+                        let mut vals = Vec::with_capacity(specs.len());
+                        if let Some(v) = attached {
+                            vals.push(v.to_string());
+                        }
+                        while vals.len() < specs.len() && *i < args.len() {
+                            vals.push(args[*i].to_string());
+                            *i += 1;
+                        }
+                        vals
+                    }
+                    FlagKind::TerminatedValues { terminators, .. } => {
+                        let mut vals = Vec::new();
+                        while *i < args.len() {
+                            let w = args[*i];
+                            *i += 1;
+                            if terminators.contains(&w) {
+                                break;
+                            }
+                            vals.push(w.to_string());
+                        }
+                        vals
+                    }
+                }
+            };
 
             if single_dash {
                 let rest = &tok[1..];
@@ -6339,21 +6787,16 @@ mod tests {
                     flag_long(flags, rest)
                 };
                 if let Some(spec) = spec {
-                    let val = if matches!(spec.kind, FlagKind::Value(_)) {
-                        let v = args.get(i).copied();
-                        if v.is_some() {
-                            i += 1;
-                        }
-                        v
-                    } else {
-                        None
-                    };
+                    let vals = consume_args(spec.kind, None, args, &mut i);
                     apply_spec(
                         spec,
                         tok.to_string(),
-                        val,
+                        &vals,
                         &mut out,
                         &mut writes_toggle,
+                        &mut writes_inputs_toggle,
+                        &mut derived_toggle,
+                        &mut operation,
                         &mut provides_pattern,
                         &mut provides_script,
                         &mut positional_role_override,
@@ -6377,24 +6820,16 @@ mod tests {
                     None => (rest, None),
                 };
                 if let Some(spec) = flag_long_or_writing_abbrev(flags, name) {
-                    let val = match (spec.kind, eq_val) {
-                        (FlagKind::Value(_), Some(v)) => Some(v),
-                        (FlagKind::Value(_), None) => {
-                            let v = args.get(i).copied();
-                            if v.is_some() {
-                                i += 1;
-                            }
-                            v
-                        }
-                        (FlagKind::OptionalValue(_), Some(v)) => Some(v),
-                        _ => None,
-                    };
+                    let vals = consume_args(spec.kind, eq_val, args, &mut i);
                     apply_spec(
                         spec,
                         format!("--{name}"),
-                        val,
+                        &vals,
                         &mut out,
                         &mut writes_toggle,
+                        &mut writes_inputs_toggle,
+                        &mut derived_toggle,
+                        &mut operation,
                         &mut provides_pattern,
                         &mut provides_script,
                         &mut positional_role_override,
@@ -6420,41 +6855,22 @@ mod tests {
                 let chars: Vec<char> = tok[1..].chars().collect();
                 for (k, &c) in chars.iter().enumerate() {
                     if let Some(spec) = flag_short(flags, c) {
-                        let val = if matches!(spec.kind, FlagKind::Value(_)) {
-                            if k + 1 < chars.len() {
-                                let attached: String = chars[k + 1..].iter().collect();
-                                // Attached short-flag value (handled directly via owned string below).
-                                apply_spec(
-                                    spec,
-                                    format!("-{c}"),
-                                    Some(&attached),
-                                    &mut out,
-                                    &mut writes_toggle,
-                                    &mut provides_pattern,
-                                    &mut provides_script,
-                                    &mut positional_role_override,
-                                    &mut global_filter_ci,
-                                    &mut raw_filters,
-                                    &mut scripts,
-                                    &mut deferred_val_paths,
-                                );
-                                break;
-                            } else {
-                                let v = args.get(i).copied();
-                                if v.is_some() {
-                                    i += 1;
-                                }
-                                v
-                            }
+                        let takes_arg = !matches!(spec.kind, FlagKind::Bool);
+                        let attached = if takes_arg && k + 1 < chars.len() {
+                            Some(chars[k + 1..].iter().collect::<String>())
                         } else {
                             None
                         };
+                        let vals = consume_args(spec.kind, attached.as_deref(), args, &mut i);
                         apply_spec(
                             spec,
                             format!("-{c}"),
-                            val,
+                            &vals,
                             &mut out,
                             &mut writes_toggle,
+                            &mut writes_inputs_toggle,
+                            &mut derived_toggle,
+                            &mut operation,
                             &mut provides_pattern,
                             &mut provides_script,
                             &mut positional_role_override,
@@ -6463,7 +6879,7 @@ mod tests {
                             &mut scripts,
                             &mut deferred_val_paths,
                         );
-                        if matches!(spec.kind, FlagKind::Value(_)) {
+                        if takes_arg {
                             break;
                         }
                     } else {
@@ -6480,7 +6896,7 @@ mod tests {
             }
         }
 
-        // Compute final write state.
+        // Compute final unit-level possible-writer and derived-destination state.
         out.writes = match write_behavior {
             WriteBehavior::Never => false,
             WriteBehavior::Always => true,
@@ -6492,19 +6908,33 @@ mod tests {
                 FlagToggle::Unchanged => positional.len() >= n,
             },
         };
+        out.derived_destinations = match derived_behavior {
+            DerivedDestinationsBehavior::Never => false,
+            DerivedDestinationsBehavior::Always => true,
+            DerivedDestinationsBehavior::WithFlag => derived_toggle == FlagToggle::Enable,
+            DerivedDestinationsBehavior::WhenSourceIsDir => false,
+        };
+        if out.derived_destinations {
+            out.unread.push(UnreadReason::DerivedDestinations {
+                tool: cmd.to_string(),
+            });
+        }
 
-        // Resolve deferred flag value paths with final `out.writes`.
+        // Resolve deferred flag value paths with the operation mode (Rule G: never row-wide `out.writes`).
         for (p, acc) in deferred_val_paths {
             let mode = match acc {
                 FlagValueAccess::Read => AccessMode::Read,
                 FlagValueAccess::Write => AccessMode::Write,
-                FlagValueAccess::WriteWhenWriting => {
-                    if out.writes {
-                        AccessMode::Write
-                    } else {
-                        AccessMode::Read
-                    }
-                }
+                FlagValueAccess::TarArchive => match operation {
+                    Some(ArchiveOperation::Write) => AccessMode::Write,
+                    Some(ArchiveOperation::Extract | ArchiveOperation::List) => AccessMode::Read,
+                    None => AccessMode::ReadWrite,
+                },
+                FlagValueAccess::TarDirectory => match operation {
+                    Some(ArchiveOperation::Extract) => AccessMode::Write,
+                    Some(ArchiveOperation::Write | ArchiveOperation::List) => AccessMode::Read,
+                    None => AccessMode::ReadWrite,
+                },
             };
             out.candidate_paths.push((p, mode));
         }
@@ -6525,12 +6955,17 @@ mod tests {
             out.filters.push((fs.dialect, pat, ci));
         }
 
-        // Assign positional operand roles and access modes.
+        // Assign positional operand roles and per-operand access modes (Rule G).
         let skip_first_positional = (provides_pattern
             && layout.positional.first() == Some(&ValueRole::Pattern))
-            || (provides_script && layout.positional.first() == Some(&ValueRole::Code));
+            || (provides_script
+                && matches!(
+                    layout.positional.first(),
+                    Some(ValueRole::Code | ValueRole::ProgramFile)
+                ));
         let eff_positional_start = usize::from(skip_first_positional);
         let n_pos = positional.len();
+        let writes_in_place = writes_inputs_toggle == FlagToggle::Enable;
         for (pos_idx, (word, after_dd)) in positional.iter().enumerate() {
             let role = if *after_dd && let Some(r) = layout.after_double_dash {
                 r
@@ -6566,32 +7001,36 @@ mod tests {
                 role,
                 ValueRole::Path | ValueRole::DestinationRoot | ValueRole::ProgramFile
             ) {
-                let mode = match access_mode {
-                    OperandAccessMode::AllRead => AccessMode::Read,
-                    OperandAccessMode::AllWrite => AccessMode::Write,
-                    OperandAccessMode::AllWriteWhenWriting => {
-                        if out.writes {
-                            AccessMode::Write
-                        } else {
-                            AccessMode::Read
+                let mode = if role == ValueRole::ProgramFile {
+                    // Program files are executed/read, never written by in-place flags.
+                    AccessMode::Read
+                } else {
+                    match access_mode {
+                        OperandAccessMode::AllRead => AccessMode::Read,
+                        OperandAccessMode::AllWrite => AccessMode::Write,
+                        OperandAccessMode::InPlaceWithFlag => {
+                            if writes_in_place {
+                                AccessMode::Write
+                            } else {
+                                AccessMode::Read
+                            }
+                        }
+                        OperandAccessMode::SourcesReadLastWrite => {
+                            if role == ValueRole::DestinationRoot
+                                || (pos_idx + 1 == n_pos && n_pos >= 2)
+                            {
+                                AccessMode::Write
+                            } else {
+                                AccessMode::Read
+                            }
                         }
                     }
-                    OperandAccessMode::SourcesReadLastWrite => {
-                        if role == ValueRole::DestinationRoot
-                            || (pos_idx + 1 == n_pos && n_pos >= 2)
-                        {
-                            AccessMode::Write
-                        } else {
-                            AccessMode::Read
-                        }
-                    }
-                    OperandAccessMode::FlagOnlyWrite => AccessMode::Read,
                 };
                 out.candidate_paths.push((word.clone(), mode));
             }
         }
 
-        // Check inline code execution for `ScriptCommands` (sed) and `ProgramOrInline { pin: FlagValue }` (awk).
+        // Check inline code execution for `ScriptCommands` (sed) and `InlineOnly` (awk).
         match code_runner {
             CodeRunnerBehavior::ScriptCommands(triggers) => {
                 if scripts
@@ -6599,14 +7038,13 @@ mod tests {
                     .any(|s| s.chars().any(|c| triggers.contains(&c)))
                 {
                     out.inline_code = true;
+                    out.writes = true;
                     out.unread.push(UnreadReason::CodeRunnerInlineCode {
                         tool: cmd.to_string(),
                     });
                 }
             }
-            CodeRunnerBehavior::ProgramOrInline {
-                pin: ProgramPin::FlagValue,
-            } if !provides_script && !scripts.is_empty() => {
+            CodeRunnerBehavior::InlineOnly => {
                 out.inline_code = true;
                 out.unread.push(UnreadReason::CodeRunnerInlineCode {
                     tool: cmd.to_string(),
@@ -6748,7 +7186,6 @@ mod tests {
         for cmd in [
             &["grep", "-R", "--exclude=key", "x", "proj"][..],
             &["grep", "-R", "--exclude-dir=sub", "x", "proj"][..],
-            &["grep", "-R", "--include-dir=sub", "x", "proj"][..],
             &["ag", "-f", "--ignore=key", "x", "proj"][..],
             &["ag", "--ignore-dir=sub", "x", "proj"][..],
             &["ag", "-G", "key", "x", "proj"][..],
@@ -6771,6 +7208,18 @@ mod tests {
                 sim.unread
             );
         }
+        // Invented `grep --include-dir` removed: unknown-flag rule handles it (round 3 finding 6).
+        let grep_include_dir = simulate_table(&["grep", "-R", "--include-dir=sub", "x", "proj"]);
+        assert!(
+            grep_include_dir
+                .unread
+                .contains(&UnreadReason::UnknownFlag {
+                    tool: "grep".into(),
+                    flag: "--include-dir=sub".into(),
+                }),
+            "grep --include-dir must be handled as UnknownFlag, got {:?}",
+            grep_include_dir.unread
+        );
         let ag_ignore_file = simulate_table(&["ag", "-p", "ignorefile", "x", "proj"]);
         assert!(
             ag_ignore_file
@@ -6831,37 +7280,55 @@ mod tests {
             );
         }
 
-        // --- Finding 5 + Rule D: flag-held program files vs inline expressions ---
-        let sed_f = simulate_table(&["sed", "-f", "edit.sed", "README.md"]);
+        // --- Finding 5 (round 2) + Finding 4 (round 3) + Rule G: sed -f vs sed -e ---
+        let sed_f = simulate_table(&["sed", "-f", "print.sed", "protected"]);
         assert!(!sed_f.inline_code);
+        assert!(
+            sed_f.writes,
+            "sed -f runs an uninspected program so the unit is a possible writer (§5)"
+        );
         assert_eq!(
             sed_f.program_pin,
-            Some(vec!["sed".into(), "-f".into(), "edit.sed".into()])
+            Some(vec!["sed".into(), "-f".into(), "print.sed".into()])
         );
         assert_eq!(
             sed_f.unread,
             vec![UnreadReason::Program {
-                program_words: vec!["sed".into(), "-f".into(), "edit.sed".into()],
+                program_words: vec!["sed".into(), "-f".into(), "print.sed".into()],
             }]
         );
         assert!(
             sed_f
                 .candidate_paths
-                .contains(&("edit.sed".into(), AccessMode::Read))
+                .contains(&("print.sed".into(), AccessMode::Read)),
+            "sed -f program file is Read"
         );
         assert!(
             sed_f
                 .candidate_paths
-                .contains(&("README.md".into(), AccessMode::Write))
+                .contains(&("protected".into(), AccessMode::Read)),
+            "sed -f input files stay Read (Rule G: possible-writer unit never marks inputs Write)"
         );
 
         let sed_e_safe = simulate_table(&["sed", "-e", "s/a/b/", "README.md"]);
         assert!(!sed_e_safe.inline_code);
+        assert!(!sed_e_safe.writes);
         assert!(sed_e_safe.unread.is_empty());
+        assert!(
+            sed_e_safe
+                .candidate_paths
+                .contains(&("README.md".into(), AccessMode::Read))
+        );
 
         for dangerous in ["1e id", "w out", "r in"] {
             let sed_e_bad = simulate_table(&["sed", "-e", dangerous, "README.md"]);
             assert!(sed_e_bad.inline_code);
+            assert!(sed_e_bad.writes);
+            assert!(
+                sed_e_bad
+                    .candidate_paths
+                    .contains(&("README.md".into(), AccessMode::Read))
+            );
             assert!(
                 sed_e_bad
                     .unread
@@ -6869,26 +7336,15 @@ mod tests {
             );
         }
 
-        let awk_f = simulate_table(&["awk", "-f", "prog.awk", "README.md"]);
-        assert!(!awk_f.inline_code);
-        assert_eq!(
-            awk_f.program_pin,
-            Some(vec!["awk".into(), "-f".into(), "prog.awk".into()])
-        );
-        assert_eq!(
-            awk_f.unread,
-            vec![UnreadReason::Program {
-                program_words: vec!["awk".into(), "-f".into(), "prog.awk".into()],
-            }]
-        );
-        assert!(
-            awk_f
-                .candidate_paths
-                .contains(&("prog.awk".into(), AccessMode::Read))
-        );
-
         let awk_inline = simulate_table(&["awk", "{print}", "README.md"]);
         assert!(awk_inline.inline_code);
+        assert!(awk_inline.writes);
+        assert!(
+            awk_inline
+                .candidate_paths
+                .contains(&("README.md".into(), AccessMode::Read)),
+            "awk input files are Read even though the unit is a possible writer (Rule G)"
+        );
         assert!(
             awk_inline
                 .unread
