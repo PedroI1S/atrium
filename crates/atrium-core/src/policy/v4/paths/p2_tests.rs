@@ -1778,7 +1778,10 @@ fn carried_m1_30_absent_targets_and_search_filter_probes() {
     .unwrap();
     assert!(has_hard_deny(&aws_probe.outcomes, "credential-read"));
 
-    // M1-30 K8 probes on non-recursive `~`: `**/*.rs` Clear, `**/*.session` StoreHit, `**/*.json` HardDenyHit
+    // M1-30 K8 probes on non-recursive `~`: `**/*.rs` -> StoreHit (`dev`'s
+    // retained ASK_TREES directory-prefix probe matches `**` against
+    // `.aws/sso/cache`, never HardDeny; §5, §11), `**/*.session` -> StoreHit,
+    // `**/*.json` -> HardDenyHit.
     let k8_rs = resolve_subject_paths(
         &["~".to_string()],
         Some("**/*.rs"),
@@ -1791,8 +1794,13 @@ fn carried_m1_30_absent_targets_and_search_filter_probes() {
     )
     .unwrap();
     assert!(
-        all_clear(&k8_rs.outcomes),
-        "**/*.rs should be Clear, got {:?}",
+        has_store_hit(&k8_rs.outcomes),
+        "**/*.rs on ~ should produce StoreHit under retained ASK_TREES prefix probe, got {:?}",
+        k8_rs.outcomes
+    );
+    assert!(
+        !has_any_hard_deny(&k8_rs.outcomes),
+        "**/*.rs on ~ must not HardDeny, got {:?}",
         k8_rs.outcomes
     );
 
@@ -2597,4 +2605,1304 @@ fn regression_posix_classes_dotfile_fallback_dangling_chains_ssh_pub_and_cd_none
     )
     .unwrap();
     assert!(follow_res.multiply_linked_file);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Rework Round 2 regressions (all 14 review-round1 findings & test gaps)
+// ---------------------------------------------------------------------------
+
+fn has_exhausted(outcomes: &[PartResult], expected: ExhaustReason) -> bool {
+    outcomes
+        .iter()
+        .any(|r| matches!(r.outcome, PartOutcome::Exhausted(reason) if reason == expected))
+}
+
+#[test]
+fn round2_finding01_hit_preserved_after_later_exhaustion() {
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    fs.add_file(b"/h/u/ordinary");
+    fs.add_file(b"/h/u/.aws/credentials");
+    for i in 0..8 {
+        fs.add_file(format!("/h/u/.aws/extra_{i}.txt").as_bytes());
+    }
+    let prot = default_protected(&fs);
+
+    // 1. Subject collector: `["~/.ssh/id_rsa", "ordinary"]` with budget enough
+    //    to establish the first HardDenyHit but insufficient for the second path.
+    let mut dry_caps = FsCaps::with_default_limits();
+    let mut dry_budget = ComputeBudget::with_default_limits();
+    let dry = resolve_subject_paths(
+        &["~/.ssh/id_rsa".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut dry_caps,
+        &mut dry_budget,
+    )
+    .unwrap();
+    assert!(has_hard_deny(&dry.outcomes, "credential-read"));
+    let first_cost = limits::COMPUTE_BUDGET_UNITS - dry_budget.remaining_units();
+
+    let mut caps = FsCaps::with_default_limits();
+    let mut tight = ComputeBudget::new(first_cost + 2, limits::COMPUTE_BUDGET_ALLOC_BYTES);
+    let subj = resolve_subject_paths(
+        &["~/.ssh/id_rsa".to_string(), "ordinary".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut tight,
+    )
+    .expect("earlier HardDenyHit must not be discarded as Err(Exhausted)");
+    assert!(
+        has_hard_deny(&subj.outcomes, "credential-read"),
+        "expected HardDenyHit preserved, got {:?}",
+        subj.outcomes
+    );
+    assert!(
+        has_exhausted(&subj.outcomes, ExhaustReason::ComputeBudget),
+        "expected Exhausted appended, got {:?}",
+        subj.outcomes
+    );
+
+    // 2. Command collector: `cat ~/.ssh/id_rsa; cat ordinary` with tight budget.
+    let u0 = unit(
+        0,
+        vec![unquoted(b"cat"), unquoted(b"~/.ssh/id_rsa")],
+        vec![],
+        Separator::Start,
+        None,
+    );
+    let u1 = unit(
+        1,
+        vec![unquoted(b"cat"), unquoted(b"ordinary")],
+        vec![],
+        Separator::Semi,
+        None,
+    );
+    let mut dry_c_caps = FsCaps::with_default_limits();
+    let mut dry_c_budget = ComputeBudget::with_default_limits();
+    let dry_cmd = resolve_command_targets(
+        std::slice::from_ref(&u0),
+        &[reader_effects("cat", 2)],
+        CWD,
+        &prot,
+        &fs,
+        &mut dry_c_caps,
+        &mut dry_c_budget,
+    )
+    .unwrap();
+    assert!(has_hard_deny(&dry_cmd.outcomes, "credential-read"));
+    let cmd_first_cost = limits::COMPUTE_BUDGET_UNITS - dry_c_budget.remaining_units();
+
+    let mut caps2 = FsCaps::with_default_limits();
+    let mut tight_cmd = ComputeBudget::new(cmd_first_cost + 2, limits::COMPUTE_BUDGET_ALLOC_BYTES);
+    let cmd = resolve_command_targets(
+        &[u0, u1],
+        &[reader_effects("cat", 2), reader_effects("cat", 2)],
+        CWD,
+        &prot,
+        &fs,
+        &mut caps2,
+        &mut tight_cmd,
+    )
+    .expect("earlier command HardDenyHit must not be discarded on later Exhausted");
+    assert!(has_hard_deny(&cmd.outcomes, "credential-read"));
+    assert!(has_exhausted(&cmd.outcomes, ExhaustReason::ComputeBudget));
+
+    // 3. Recursive collector: `~/.aws` establishes S8 HardDenyHit, then exhausts
+    //    during the subsequent hard-link walk.
+    let mut caps3 = FsCaps::with_default_limits();
+    let mut plenty = ComputeBudget::with_default_limits();
+    let aws_root = resolve_literal(
+        b"~/.aws",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut caps3,
+        &mut plenty,
+    )
+    .unwrap();
+    let mut full_b = ComputeBudget::with_default_limits();
+    let mut full_c = FsCaps::with_default_limits();
+    let full_rec = check_recursive_root(
+        &aws_root,
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut full_c,
+        &mut full_b,
+    )
+    .unwrap();
+    assert!(has_hard_deny(&full_rec.outcomes, "credential-read"));
+    let total_rec_cost = limits::COMPUTE_BUDGET_UNITS - full_b.remaining_units();
+
+    // Give almost enough compute to finish S8 but fail during the later hard-link walk.
+    let mut tight_rec_b = ComputeBudget::new(
+        total_rec_cost.saturating_sub(25),
+        limits::COMPUTE_BUDGET_ALLOC_BYTES,
+    );
+    let mut rec_c = FsCaps::with_default_limits();
+    let rec = check_recursive_root(
+        &aws_root,
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut rec_c,
+        &mut tight_rec_b,
+    )
+    .expect("S8 HardDenyHit must be preserved when later hard-link walk exhausts");
+    assert!(has_hard_deny(&rec.outcomes, "credential-read"));
+    assert!(has_exhausted(&rec.outcomes, ExhaustReason::ComputeBudget));
+}
+
+#[test]
+fn round2_finding02_exempt_root_identity_walk_preserves_s8_exemptions() {
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.aws/credentials");
+    fs.add_file(b"/h/u/.config/gh/hosts.yml");
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    fs.add_file(b"/h/u/.config/ordinary_a");
+    fs.add_hard_link(b"/h/u/.config/ordinary_a", b"/h/u/.config/ordinary_b");
+
+    let prot = default_protected(&fs);
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+
+    for exempt in [b"~/.config".as_slice(), b"~".as_slice(), b"/h".as_slice()] {
+        let root = resolve_literal(
+            exempt,
+            CWD,
+            HOME,
+            TargetOrigin::SubjectPath { path_index: 0 },
+            AccessMode::Read,
+            &fs,
+            &mut caps,
+            &mut budget,
+        )
+        .unwrap();
+        let res = check_recursive_root(
+            &root,
+            LinkPolicy::default(),
+            &[],
+            &prot,
+            &fs,
+            &mut caps,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(
+            !has_any_hard_deny(&res.outcomes),
+            "exempt root {:?} must NOT HardDeny, got {:?}",
+            String::from_utf8_lossy(exempt),
+            res.outcomes
+        );
+        assert!(
+            has_store_hit(&res.outcomes),
+            "exempt root {:?} should yield StoreHit, got {:?}",
+            String::from_utf8_lossy(exempt),
+            res.outcomes
+        );
+        assert!(
+            res.multiply_linked_file,
+            "hard-linked ordinary file under exempt root {:?} still sets multiply_linked_file",
+            String::from_utf8_lossy(exempt)
+        );
+    }
+}
+
+#[test]
+fn round2_finding03_non_utf8_filter_matches_symlink_to_credential() {
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    fs.add_symlink(b"/h/u/proj/key\xff", b"/h/u/.ssh/id_rsa");
+    let prot = default_protected(&fs);
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+
+    // `Glob(paths=["proj"], glob="key*")` selects `proj/key\xff` -> HardDenyHit.
+    let res = resolve_subject_paths(
+        &["proj".to_string()],
+        Some("key*"),
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&res.outcomes, "credential-read"),
+        "non-UTF-8 selected alias must HardDeny, got {:?}",
+        res.outcomes
+    );
+
+    // Same for `rg -g 'key*'` and `grep --include 'key*'` via `check_recursive_root`.
+    let proj_root = resolve_literal(
+        b"proj",
+        CWD,
+        HOME,
+        TargetOrigin::Operand {
+            unit: UnitIndex(0),
+            argv_index: 2,
+        },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    for dialect in [FilterDialect::RgGlob, FilterDialect::GrepInclude] {
+        let f = SearchFilter {
+            dialect,
+            pattern: unquoted(b"key*"),
+            case_insensitive: false,
+            argv_index: Some(1),
+        };
+        let rec = check_recursive_root(
+            &proj_root,
+            LinkPolicy::default(),
+            &[f],
+            &prot,
+            &fs,
+            &mut caps,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(
+            has_hard_deny(&rec.outcomes, "credential-read"),
+            "{dialect:?} filter must select non-UTF-8 alias, got {:?}",
+            rec.outcomes
+        );
+    }
+}
+
+#[test]
+fn round2_finding04_s8_matches_listed_fold_credential_spellings() {
+    // Case-sensitive fake with ONLY uppercase `/h/u/.aws/CREDENTIALS`.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.aws/CREDENTIALS");
+    let prot = default_protected(&fs);
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+
+    let aws_root = resolve_literal(
+        b"~/.aws",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+
+    // Unfiltered recursive read of `~/.aws` -> S8 HardDenyHit.
+    let unfilt = check_recursive_root(
+        &aws_root,
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&unfilt.outcomes, "credential-read"),
+        "expected S8 HardDenyHit for .aws/CREDENTIALS, got {:?}",
+        unfilt.outcomes
+    );
+
+    // Filtered to `*.rs` -> S8 still HardDenyHit!
+    let filter_rs = SearchFilter {
+        dialect: FilterDialect::RgGlob,
+        pattern: unquoted(b"*.rs"),
+        case_insensitive: false,
+        argv_index: Some(1),
+    };
+    let filt = check_recursive_root(
+        &aws_root,
+        LinkPolicy::default(),
+        &[filter_rs],
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&filt.outcomes, "credential-read"),
+        "filtered recursive read of ~/.aws with CREDENTIALS must HardDeny, got {:?}",
+        filt.outcomes
+    );
+
+    // Hard link to `.aws/CREDENTIALS` is also recorded by `build_protected_set`.
+    fs.add_hard_link(b"/h/u/.aws/CREDENTIALS", b"/h/u/proj/hl_creds");
+    let prot2 = default_protected(&fs);
+    let hl_res = resolve_subject_paths(
+        &["proj/hl_creds".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot2,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(has_hard_deny(&hl_res.outcomes, "credential-read"));
+}
+
+#[test]
+fn round2_finding05_browser_s8_deeper_levels_and_depth_cap_unread() {
+    let mut fs = FakeFs::new();
+    // 4 levels below `~/.config/google-chrome`: a/b/c/Cookies.
+    fs.add_file(b"/h/u/.config/google-chrome/a/b/c/Cookies");
+    // 17 levels below `~/.config/chromium` (> WALK_MAX_DEPTH = 16).
+    let mut deep_path = b"/h/u/.config/chromium".to_vec();
+    for i in 0..=(limits::WALK_MAX_DEPTH as usize) {
+        deep_path.extend_from_slice(format!("/d{i}").as_bytes());
+    }
+    deep_path.extend_from_slice(b"/Cookies");
+    fs.add_file(&deep_path);
+
+    let prot = default_protected(&fs);
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+
+    let chrome_root = resolve_literal(
+        b"~/.config/google-chrome",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    let chrome_res = check_recursive_root(
+        &chrome_root,
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&chrome_res.outcomes, "credential-read"),
+        "a/b/c/Cookies under google-chrome must S8 HardDeny, got {:?}",
+        chrome_res.outcomes
+    );
+
+    let chromium_root = resolve_literal(
+        b"~/.config/chromium",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    let chromium_res = check_recursive_root(
+        &chromium_root,
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        has_unread(&chromium_res.outcomes, |r| *r
+            == UnreadReason::WalkCapReached(FsCap::WalkDepth)),
+        "exceeding WALK_MAX_DEPTH in browser S8 scan must emit Unread(WalkCapReached(WalkDepth)), got {:?}",
+        chromium_res.outcomes
+    );
+}
+
+#[test]
+fn round2_finding06_dangling_protected_entries_outside_ssh() {
+    let mut fs = FakeFs::new();
+    fs.add_symlink(b"/h/u/.aws/credentials", b"/tmp/missing_aws");
+    fs.add_symlink(b"/h/u/.gem/credentials", b"/tmp/missing_gem");
+    fs.add_symlink(b"/h/u/.local/share/atrium", b"/tmp/missing_atrium");
+    let prot = default_protected(&fs);
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+
+    let aws = resolve_subject_paths(
+        &["~/.aws/credentials".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&aws.outcomes, "credential-read"),
+        "dangling ~/.aws/credentials must HardDeny, got {:?}",
+        aws.outcomes
+    );
+
+    let gem = resolve_subject_paths(
+        &["~/.gem/credentials".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        has_store_hit(&gem.outcomes),
+        "dangling ~/.gem/credentials must StoreHit, got {:?}",
+        gem.outcomes
+    );
+    assert!(!has_any_hard_deny(&gem.outcomes));
+
+    let atrium = resolve_subject_paths(
+        &["~/.local/share/atrium".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&atrium.outcomes, "atrium-self"),
+        "dangling Atrium data path must HardDeny(atrium-self), got {:?}",
+        atrium.outcomes
+    );
+}
+
+#[test]
+fn round2_finding07_write_only_hard_link_aliases_in_resolver_flows() {
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/config");
+    fs.add_file(b"/h/u/.ssh/authorized_keys");
+    fs.add_file(b"/h/u/.ssh/id_rsa.pub");
+    fs.add_file(b"/h/u/.config/atrium/config.toml");
+    fs.add_file(b"/h/u/proj/input.txt");
+    fs.add_hard_link(b"/h/u/.ssh/config", b"/h/u/proj/alias_ssh_cfg");
+    fs.add_hard_link(b"/h/u/.ssh/authorized_keys", b"/h/u/proj/alias_auth");
+    fs.add_hard_link(
+        b"/h/u/.config/atrium/config.toml",
+        b"/h/u/proj/alias_atrium",
+    );
+
+    let prot = default_protected(&fs);
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+
+    // 1. Writing through hard-linked aliases -> HardDenyHit!
+    for (alias, expected_id) in [
+        ("proj/alias_ssh_cfg", "credential-read"),
+        ("proj/alias_auth", "credential-read"),
+        ("proj/alias_atrium", "atrium-self"),
+    ] {
+        let w = resolve_subject_paths(
+            &[alias.to_string()],
+            None,
+            false,
+            AccessMode::Write,
+            &prot,
+            &fs,
+            &mut caps,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(
+            has_hard_deny(&w.outcomes, expected_id),
+            "Write via hard-linked alias {alias} must HardDeny({expected_id}), got {:?}",
+            w.outcomes
+        );
+    }
+
+    // 2. Reading through those same aliases -> Clear + multiply_linked_file (NOT HardDeny!).
+    for alias in ["proj/alias_ssh_cfg", "proj/alias_atrium"] {
+        let r = resolve_subject_paths(
+            &[alias.to_string()],
+            None,
+            false,
+            AccessMode::Read,
+            &prot,
+            &fs,
+            &mut caps,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(
+            all_clear(&r.outcomes),
+            "Read via hard-linked write-only alias {alias} must stay Clear, got {:?}",
+            r.outcomes
+        );
+        assert!(r.multiply_linked_file);
+    }
+
+    // 3. Command output redirect to hard-linked write-only alias -> HardDenyHit!
+    let u_redir = unit(
+        0,
+        vec![unquoted(b"cat"), unquoted(b"proj/input.txt")],
+        vec![ModelRedirect::Write {
+            target: unquoted(b"proj/alias_ssh_cfg"),
+        }],
+        Separator::Start,
+        None,
+    );
+    let cmd_res = resolve_command_targets(
+        &[u_redir],
+        &[reader_effects("cat", 2)],
+        CWD,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(has_hard_deny(&cmd_res.outcomes, "credential-read"));
+
+    // 4. Writing to `~/.ssh/id_rsa.pub` keeps its `.pub` exception.
+    let pub_w = resolve_subject_paths(
+        &["~/.ssh/id_rsa.pub".to_string()],
+        None,
+        false,
+        AccessMode::Write,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(all_clear(&pub_w.outcomes));
+}
+
+#[test]
+fn round2_finding08_canonicalization_preserves_listed_protected_spelling() {
+    // Case-sensitive fake with NO lowercase `.ssh` tree; `.SSH/ID_RSA` is a
+    // symlink to an ordinary file.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/ordinary.txt");
+    fs.add_symlink(b"/h/u/.SSH/ID_RSA", b"/h/u/ordinary.txt");
+    let prot = default_protected(&fs);
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+
+    let t = resolve_literal(
+        b"~/.SSH/ID_RSA",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    let checked = check_target(&t, &prot, &mut budget).unwrap();
+    assert!(
+        matches!(
+            checked.outcome,
+            PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("credential-read")
+        ),
+        "~/.SSH/ID_RSA -> ordinary.txt must HardDeny, got {:?}",
+        checked.outcome
+    );
+}
+
+#[test]
+fn round2_finding09_unicode_normalization_u01fb_and_independent_conformance() {
+    // 1. Case-sensitive fake: Atrium data root containing U+01FB (`ǻ`),
+    //    checked via its NFD spelling `a\u{030A}\u{0301}` -> Unread(UnlistedNameEquivalence).
+    let mut cs_fs = FakeFs::new();
+    cs_fs.mkdir_all("/h/u/\u{01FB}/atrium".as_bytes());
+    cs_fs.add_file("/h/u/a\u{030A}\u{0301}/atrium/db".as_bytes());
+    cs_fs.add_file("/h/u/\u{01FB}/atrium/db".as_bytes());
+    cs_fs.add_file("/h/u/proj/a\u{030A}\u{0301}.txt".as_bytes());
+    // Uncovered non-Latin precomposed character (Tibetan U+0F43 vs NFD U+0F42 U+0FB7).
+    cs_fs.mkdir_all("/h/u/\u{0F43}/atrium".as_bytes());
+    cs_fs.add_file("/h/u/\u{0F42}\u{0FB7}/atrium/db".as_bytes());
+    // Hangul NFC (`가` U+AC00) vs NFD (`\u{1100}\u{1161}`) and CCC reordering.
+    cs_fs.mkdir_all("/h/u/\u{AC00}/atrium".as_bytes());
+    cs_fs.add_file("/h/u/\u{1100}\u{1161}/atrium/db".as_bytes());
+    cs_fs.mkdir_all("/h/u/e\u{0327}\u{0301}/atrium".as_bytes());
+    cs_fs.add_file("/h/u/e\u{0301}\u{0327}/atrium/db".as_bytes());
+    // Distinct Latin-1 vowels (à vs á) stay Clear.
+    cs_fs.mkdir_all("/h/u/\u{00E0}/atrium".as_bytes());
+    cs_fs.add_file("/h/u/\u{00E1}/atrium/db".as_bytes());
+
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+    let prot = build_protected_set(
+        HOME,
+        CWD,
+        vec![
+            "/h/u/\u{01FB}/atrium".as_bytes().to_vec(),
+            "/h/u/\u{0F43}/atrium".as_bytes().to_vec(),
+            "/h/u/\u{AC00}/atrium".as_bytes().to_vec(),
+            "/h/u/e\u{0327}\u{0301}/atrium".as_bytes().to_vec(),
+            "/h/u/\u{00E0}/atrium".as_bytes().to_vec(),
+        ],
+        vec![],
+        FoldRules::REV4,
+        &cs_fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+
+    for nfd_path in [
+        "/h/u/a\u{030A}\u{0301}/atrium/db",
+        "/h/u/\u{0F42}\u{0FB7}/atrium/db",
+        "/h/u/\u{1100}\u{1161}/atrium/db",
+        "/h/u/e\u{0301}\u{0327}/atrium/db",
+    ] {
+        let t = resolve_literal(
+            nfd_path.as_bytes(),
+            CWD,
+            HOME,
+            TargetOrigin::SubjectPath { path_index: 0 },
+            AccessMode::Read,
+            &cs_fs,
+            &mut caps,
+            &mut budget,
+        )
+        .unwrap();
+        let res = check_target(&t, &prot, &mut budget).unwrap();
+        assert!(
+            matches!(
+                res.outcome,
+                PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence { .. })
+            ),
+            "expected UnlistedNameEquivalence for {nfd_path:?}, got {:?}",
+            res.outcome
+        );
+    }
+
+    // Exact NFC U+01FB stays HardDenyHit (never downgraded).
+    let exact_u01fb = resolve_literal(
+        "/h/u/\u{01FB}/atrium/db".as_bytes(),
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &cs_fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(matches!(
+        check_target(&exact_u01fb, &prot, &mut budget)
+            .unwrap()
+            .outcome,
+        PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("atrium-self")
+    ));
+
+    // Ordinary NFD file and distinct Latin-1 vowel stay Clear.
+    for clear_path in ["/h/u/proj/a\u{030A}\u{0301}.txt", "/h/u/\u{00E1}/atrium/db"] {
+        let t = resolve_literal(
+            clear_path.as_bytes(),
+            CWD,
+            HOME,
+            TargetOrigin::SubjectPath { path_index: 0 },
+            AccessMode::Read,
+            &cs_fs,
+            &mut caps,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            check_target(&t, &prot, &mut budget).unwrap().outcome,
+            PartOutcome::Clear,
+            "{clear_path:?} should stay Clear"
+        );
+    }
+
+    // 2. Independent normalizing fake (not reusing production folding):
+    //    checking NFD `a\u{030A}\u{0301}` resolves to stored NFC `ǻ` inode -> HardDenyHit.
+    let mut nfd_fs = FakeFs::nfc_nfd_insensitive();
+    nfd_fs.add_equivalent_component("\u{0F43}".as_bytes(), "\u{0F42}\u{0FB7}".as_bytes());
+    nfd_fs.add_file("/h/u/\u{01FB}/atrium/db".as_bytes());
+    let prot_nfd = build_protected_set(
+        HOME,
+        CWD,
+        vec!["/h/u/\u{01FB}/atrium".as_bytes().to_vec()],
+        vec![],
+        FoldRules::REV4,
+        &nfd_fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    let t_norm = resolve_literal(
+        "/h/u/a\u{030A}\u{0301}/atrium/db".as_bytes(),
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &nfd_fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(matches!(
+        check_target(&t_norm, &prot_nfd, &mut budget)
+            .unwrap()
+            .outcome,
+        PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("atrium-self")
+    ));
+}
+
+#[test]
+fn round2_finding10_global_fs_caps_in_hard_link_walk_are_unread() {
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/proj/a.txt");
+    let prot = default_protected(&fs);
+
+    let mut init_caps = FsCaps::with_default_limits();
+    let mut init_budget = ComputeBudget::with_default_limits();
+    let proj_root = resolve_literal(
+        b"proj",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut init_caps,
+        &mut init_budget,
+    )
+    .unwrap();
+
+    // Zero dir opens -> Unread(WalkCapReached(DirOpens)), NEVER Clear!
+    let mut zero_dir_opens = FsCaps::new(100, 0, 100, 100, 100);
+    let mut budget = ComputeBudget::with_default_limits();
+    let res_dir = check_recursive_root(
+        &proj_root,
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut zero_dir_opens,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        has_unread(&res_dir.outcomes, |r| *r
+            == UnreadReason::WalkCapReached(FsCap::DirOpens)),
+        "zero dir_opens in hard-link walk must yield WalkCapReached(DirOpens), got {:?}",
+        res_dir.outcomes
+    );
+
+    // Zero stats -> Unread(WalkCapReached(Stats)), NEVER Clear!
+    let mut zero_stats = FsCaps::new(100, 10, 0, 100, 100);
+    let res_stats = check_recursive_root(
+        &proj_root,
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut zero_stats,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(has_unread(&res_stats.outcomes, |r| *r
+        == UnreadReason::WalkCapReached(FsCap::Stats)));
+
+    // Local hard-link walk cutoff (> HARD_LINK_WALK_ENTRIES) still counts as Clear (§8).
+    let mut big_fs = FakeFs::new();
+    for i in 0..(limits::HARD_LINK_WALK_ENTRIES + 5) {
+        big_fs.add_file(format!("/h/u/big/f{i:05}.txt").as_bytes());
+    }
+    let big_prot = default_protected(&big_fs);
+    let mut big_caps = FsCaps::with_default_limits();
+    let mut big_budget = ComputeBudget::with_default_limits();
+    let big_root = resolve_literal(
+        b"big",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &big_fs,
+        &mut big_caps,
+        &mut big_budget,
+    )
+    .unwrap();
+    let big_res = check_recursive_root(
+        &big_root,
+        LinkPolicy::default(),
+        &[],
+        &big_prot,
+        &big_fs,
+        &mut big_caps,
+        &mut big_budget,
+    )
+    .unwrap();
+    assert!(
+        all_clear(&big_res.outcomes),
+        "local HARD_LINK_WALK_ENTRIES cutoff should stay Clear, got {:?}",
+        big_res.outcomes
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn round2_finding11_budgets_all_fs_caps_and_small_nonzero_alloc() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fake_home = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let home_bytes = fake_home.as_os_str().as_bytes().to_vec();
+    std::fs::create_dir_all(fake_home.join("proj")).unwrap();
+    std::fs::write(fake_home.join("proj/ordinary.txt"), b"hello").unwrap();
+    symlink(
+        fake_home.join("proj/ordinary.txt"),
+        fake_home.join("proj/link_ordinary"),
+    )
+    .unwrap();
+
+    let resolver = FsResolver::new();
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+    let prot = build_protected_set(
+        &home_bytes,
+        &home_bytes,
+        vec![],
+        vec![],
+        FoldRules::REV4,
+        &resolver,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+
+    // 1. `check_target` on a Clear target fails with 0 AND with small nonzero alloc budgets!
+    let clear_target = resolve_literal(
+        b"proj/ordinary.txt",
+        &home_bytes,
+        &home_bytes,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &resolver,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    for alloc in [0usize, 4usize] {
+        let mut small = ComputeBudget::new(10_000, alloc);
+        let err = check_target(&clear_target, &prot, &mut small).unwrap_err();
+        assert_eq!(
+            err.reason,
+            ExhaustReason::AllocationBudget,
+            "check_target must exhaust on alloc={alloc}"
+        );
+    }
+
+    // 2. Small nonzero alloc budgets fail BEFORE allocating in real `FsResolver`.
+    let file_path = fake_home.join("proj/ordinary.txt");
+    let link_path = fake_home.join("proj/link_ordinary");
+    let dir_path = fake_home.join("proj");
+
+    let mut small_rl = ComputeBudget::new(10_000, 4);
+    assert_eq!(
+        resolver.read_link(link_path.as_os_str().as_bytes(), &mut caps, &mut small_rl),
+        Err(ResolveError::Exhausted(Exhausted {
+            reason: ExhaustReason::AllocationBudget
+        }))
+    );
+
+    let mut small_canon = ComputeBudget::new(10_000, 4);
+    assert_eq!(
+        resolver.canonicalize(
+            file_path.as_os_str().as_bytes(),
+            &mut caps,
+            &mut small_canon
+        ),
+        Err(ResolveError::Exhausted(Exhausted {
+            reason: ExhaustReason::AllocationBudget
+        }))
+    );
+
+    let mut small_rd = ComputeBudget::new(10_000, 4);
+    assert_eq!(
+        resolver.read_dir(dir_path.as_os_str().as_bytes(), &mut caps, &mut small_rd),
+        Err(ResolveError::Exhausted(Exhausted {
+            reason: ExhaustReason::AllocationBudget
+        }))
+    );
+
+    // 3. Exercise every global `FsCap` individually on real `FsResolver`.
+    let mut plenty = ComputeBudget::with_default_limits();
+    assert_eq!(
+        resolver.read_dir(
+            dir_path.as_os_str().as_bytes(),
+            &mut FsCaps::new(0, 10, 10, 10, 10),
+            &mut plenty
+        ),
+        Err(ResolveError::CapReached(CapReached {
+            cap: FsCap::EntriesRead
+        }))
+    );
+    assert_eq!(
+        resolver.read_dir(
+            dir_path.as_os_str().as_bytes(),
+            &mut FsCaps::new(10, 0, 10, 10, 10),
+            &mut plenty
+        ),
+        Err(ResolveError::CapReached(CapReached {
+            cap: FsCap::DirOpens
+        }))
+    );
+    assert_eq!(
+        resolver.stat(
+            file_path.as_os_str().as_bytes(),
+            &mut FsCaps::new(10, 10, 0, 10, 10),
+            &mut plenty
+        ),
+        Err(ResolveError::CapReached(CapReached { cap: FsCap::Stats }))
+    );
+    assert_eq!(
+        resolver.read_link(
+            link_path.as_os_str().as_bytes(),
+            &mut FsCaps::new(10, 10, 10, 0, 10),
+            &mut plenty
+        ),
+        Err(ResolveError::CapReached(CapReached {
+            cap: FsCap::LinkReads
+        }))
+    );
+    assert_eq!(
+        resolver.canonicalize(
+            file_path.as_os_str().as_bytes(),
+            &mut FsCaps::new(10, 10, 10, 10, 0),
+            &mut plenty
+        ),
+        Err(ResolveError::CapReached(CapReached {
+            cap: FsCap::Canonicalizations
+        }))
+    );
+}
+
+#[test]
+fn round2_finding12_unclosed_brackets_parse_linearly() {
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/h/u/proj");
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+
+    // 8,192 unquoted `[` bytes — well below MAX_BYTES; must parse linearly
+    // without exhausting the default compute budget (§8).
+    let mut raw = b"proj/".to_vec();
+    raw.extend(std::iter::repeat_n(b'[', 8_192));
+    let word = unquoted(&raw);
+
+    let start_units = budget.remaining_units();
+    let exp = expand_shell_glob(
+        &word,
+        CWD,
+        HOME,
+        PartId::Operand {
+            unit: UnitIndex(0),
+            argv_index: 1,
+        },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .expect("8,192 unclosed `[` bytes must not exhaust default compute budget");
+    let spent = start_units - budget.remaining_units();
+    assert!(
+        spent < 500_000,
+        "expected linear compute for 8,192 `[` bytes, spent {spent}"
+    );
+    assert!(!exp.exact_matches.is_empty());
+
+    // 4,096 unclosed `[` bytes followed by a POSIX class `[:alpha:]` also stays linear.
+    let mut raw_posix = b"proj/".to_vec();
+    raw_posix.extend(std::iter::repeat_n(b'[', 4_096));
+    raw_posix.extend_from_slice(b"[:alpha:]");
+    let mut budget2 = ComputeBudget::with_default_limits();
+    let start2 = budget2.remaining_units();
+    let _ = expand_shell_glob(
+        &unquoted(&raw_posix),
+        CWD,
+        HOME,
+        PartId::Operand {
+            unit: UnitIndex(0),
+            argv_index: 1,
+        },
+        AccessMode::Read,
+        &fs,
+        &mut caps,
+        &mut budget2,
+    )
+    .expect("unclosed `[` prefix before POSIX class must parse linearly");
+    let spent2 = start2 - budget2.remaining_units();
+    assert!(spent2 < 500_000, "expected linear compute, spent {spent2}");
+}
+
+#[test]
+fn round2_finding13_nested_shell_cwd_scope_and_isolation() {
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    fs.add_file(b"/h/u/id_rsa");
+    fs.add_file(b"/h/u/b");
+    fs.mkdir_all(b"/h/u/sub");
+    fs.mkdir_all(b"/h/u/other");
+    fs.add_symlink(b"/h/u/sub/key", b"/h/u/.ssh/id_rsa");
+    fs.add_file(b"/h/u/other/key");
+    let prot = default_protected(&fs);
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
+
+    let mut cd_eff = reader_effects("cd", 2);
+    cd_eff.cd_target_operand = Some(1);
+    let sh_eff = ToolEffects {
+        tool_name: Some("sh"),
+        subcommand: None,
+        roles: vec![OperandRole::Command, OperandRole::Flag, OperandRole::Code],
+        operand_access: vec![AccessMode::Read, AccessMode::Read, AccessMode::Read],
+        writes: false,
+        derived_destinations: DerivedDestinations::None,
+        reads_recursively: false,
+        links: LinkPolicy::default(),
+        code: CodeExecution::None,
+        filter_dialect: None,
+        filters: vec![],
+        home_readonly_eligible: false,
+        cd_target_operand: None,
+        git_selects_by_name: false,
+        unread: vec![],
+    };
+
+    // 1. `cd sub; sh -c 'cat key'; cd other` with child unit APPENDED after outer `cd other`:
+    //    child `cat key` must resolve at `/h/u/sub` -> HardDenyHit!
+    let u0_cd_sub = unit(
+        0,
+        vec![unquoted(b"cd"), unquoted(b"sub")],
+        vec![],
+        Separator::Start,
+        None,
+    );
+    let u1_sh = unit(
+        1,
+        vec![unquoted(b"sh"), unquoted(b"-c"), single_quoted(b"cat key")],
+        vec![],
+        Separator::Semi,
+        None,
+    );
+    let u2_cd_other = unit(
+        2,
+        vec![unquoted(b"cd"), unquoted(b"other")],
+        vec![],
+        Separator::Semi,
+        None,
+    );
+    let u3_child_cat = CommandUnit {
+        index: UnitIndex(3),
+        argv: vec![unquoted(b"cat"), unquoted(b"key")],
+        removed_wrappers: vec![],
+        redirects: vec![],
+        separator_before: Separator::Start,
+        pipeline_id: None,
+        depth: 1,
+        parent_unit: Some(UnitIndex(1)),
+    };
+    let res_appended = resolve_command_targets(
+        &[u0_cd_sub, u1_sh, u2_cd_other, u3_child_cat],
+        &[
+            cd_eff.clone(),
+            sh_eff.clone(),
+            cd_eff.clone(),
+            reader_effects("cat", 2),
+        ],
+        CWD,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&res_appended.outcomes, "credential-read"),
+        "appended child `cat key` must inherit parent's `sub` cwd -> HardDenyHit, got {:?}",
+        res_appended.outcomes
+    );
+
+    // 2. `sh -c 'cd ~/.ssh; cat id_rsa'; cat id_rsa`:
+    //    child `cd ~/.ssh` must NOT leak into outer `cat id_rsa` (which reads ordinary `/h/u/id_rsa`)!
+    let p0_sh = unit(
+        0,
+        vec![
+            unquoted(b"sh"),
+            unquoted(b"-c"),
+            single_quoted(b"cd ~/.ssh; cat id_rsa"),
+        ],
+        vec![],
+        Separator::Start,
+        None,
+    );
+    let p1_child_cd = CommandUnit {
+        index: UnitIndex(1),
+        argv: vec![unquoted(b"cd"), unquoted(b"~/.ssh")],
+        removed_wrappers: vec![],
+        redirects: vec![],
+        separator_before: Separator::Start,
+        pipeline_id: None,
+        depth: 1,
+        parent_unit: Some(UnitIndex(0)),
+    };
+    let p2_child_cat = CommandUnit {
+        index: UnitIndex(2),
+        argv: vec![unquoted(b"cat"), unquoted(b"id_rsa")],
+        removed_wrappers: vec![],
+        redirects: vec![],
+        separator_before: Separator::Semi,
+        pipeline_id: None,
+        depth: 1,
+        parent_unit: Some(UnitIndex(0)),
+    };
+    let p3_outer_cat = unit(
+        3,
+        vec![unquoted(b"cat"), unquoted(b"id_rsa")],
+        vec![],
+        Separator::Semi,
+        None,
+    );
+    let res_isolated = resolve_command_targets(
+        &[p0_sh, p1_child_cd, p2_child_cat, p3_outer_cat],
+        &[
+            sh_eff.clone(),
+            cd_eff.clone(),
+            reader_effects("cat", 2),
+            reader_effects("cat", 2),
+        ],
+        CWD,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(res_isolated.outcomes.iter().any(|r| {
+        r.part
+            == PartId::Operand {
+                unit: UnitIndex(2),
+                argv_index: 1,
+            }
+            && matches!(r.outcome, PartOutcome::HardDenyHit(_))
+    }));
+    assert!(
+        res_isolated.outcomes.iter().any(|r| {
+            r.part
+                == PartId::Operand {
+                    unit: UnitIndex(3),
+                    argv_index: 1,
+                }
+                && r.outcome == PartOutcome::Clear
+        }),
+        "outer `cat id_rsa` must resolve at `/h/u` (Clear), not child's `~/.ssh`: {:?}",
+        res_isolated.outcomes
+    );
+
+    // 3. `sh -c 'cd -; cat b'; cat b`: child `cd -` UnknownCwd stays isolated from outer `cat b`.
+    let q0_sh = unit(
+        0,
+        vec![
+            unquoted(b"sh"),
+            unquoted(b"-c"),
+            single_quoted(b"cd -; cat b"),
+        ],
+        vec![],
+        Separator::Start,
+        None,
+    );
+    let q1_child_cd_dash = CommandUnit {
+        index: UnitIndex(1),
+        argv: vec![unquoted(b"cd"), unquoted(b"-")],
+        removed_wrappers: vec![],
+        redirects: vec![],
+        separator_before: Separator::Start,
+        pipeline_id: None,
+        depth: 1,
+        parent_unit: Some(UnitIndex(0)),
+    };
+    let q2_child_cat = CommandUnit {
+        index: UnitIndex(2),
+        argv: vec![unquoted(b"cat"), unquoted(b"b")],
+        removed_wrappers: vec![],
+        redirects: vec![],
+        separator_before: Separator::Semi,
+        pipeline_id: None,
+        depth: 1,
+        parent_unit: Some(UnitIndex(0)),
+    };
+    let q3_outer_cat = unit(
+        3,
+        vec![unquoted(b"cat"), unquoted(b"b")],
+        vec![],
+        Separator::Semi,
+        None,
+    );
+    let res_dash = resolve_command_targets(
+        &[q0_sh, q1_child_cd_dash, q2_child_cat, q3_outer_cat],
+        &[
+            sh_eff,
+            cd_eff,
+            reader_effects("cat", 2),
+            reader_effects("cat", 2),
+        ],
+        CWD,
+        &prot,
+        &fs,
+        &mut caps,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(res_dash.outcomes.iter().any(|r| {
+        r.part
+            == PartId::Operand {
+                unit: UnitIndex(2),
+                argv_index: 1,
+            }
+            && r.outcome == PartOutcome::Unread(UnreadReason::UnknownCwd)
+    }));
+    assert!(
+        res_dash.outcomes.iter().any(|r| {
+            r.part
+                == PartId::Operand {
+                    unit: UnitIndex(3),
+                    argv_index: 1,
+                }
+                && r.outcome == PartOutcome::Clear
+        }),
+        "outer `cat b` must not inherit child's UnknownCwd: {:?}",
+        res_dash.outcomes
+    );
 }
