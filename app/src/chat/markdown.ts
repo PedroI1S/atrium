@@ -34,6 +34,8 @@ export type Block =
 
 /** Nesting deeper than this (quotes in lists in quotes…) is shown as text. */
 const MAX_DEPTH = 12;
+/** Inline container nesting deeper than this is flattened so traversal and rendering stay bounded. */
+const MAX_INLINE_DEPTH = 16;
 
 // ---- blocks --------------------------------------------------------------------------------
 
@@ -219,12 +221,37 @@ const PUNCT = /[!-/:-@[-`{-~]/;
 const WS = /\s/;
 const PUNCTUATION = /[\p{P}\p{S}]/u;
 
+/** Singly-linked inline sequence supporting O(1) concatenation when flattening deep nesting. */
+interface InlineCell {
+  item: Inline;
+  next: InlineCell | null;
+}
+
+interface InlineSeq {
+  head: InlineCell;
+  tail: InlineCell;
+  depth: number;
+}
+
+function singleSeq(item: Inline, depth: number): InlineSeq {
+  const cell: InlineCell = { item, next: null };
+  return { head: cell, tail: cell, depth };
+}
+
+function appendSeq(a: InlineSeq | null, b: InlineSeq): InlineSeq {
+  if (!a) return b;
+  a.tail.next = b.head;
+  a.tail = b.tail;
+  if (b.depth > a.depth) a.depth = b.depth;
+  return a;
+}
+
 /** A node of the inline list while parsing: text, finished inlines and delimiter runs. */
 interface Node {
   prev: Node | null;
   next: Node | null;
   seq: number;
-  inline: Inline | null;
+  items: InlineSeq | null;
   /** Delimiter run (`*`, `_`, `~`) or bracket (`[`, `![`); null for finished content. */
   delim: { char: string; count: number; orig: number; canOpen: boolean; canClose: boolean } | null;
   bracket: { image: boolean; active: boolean; pos: number } | null;
@@ -247,7 +274,7 @@ class List {
     if (n.next) n.next.prev = n.prev;
     else this.tail = n.prev;
   }
-  /** Removes the nodes strictly between `a` and `b` and returns their inlines, in order. */
+  /** Removes the nodes strictly between `a` and `b` and returns them, in order. */
   cut(a: Node, b: Node): Node[] {
     const taken: Node[] = [];
     let n = a.next;
@@ -265,60 +292,73 @@ function text(v: string): Inline {
   return { t: "text", v };
 }
 
-/** Collapses a node run into inlines (unmatched delimiters and brackets become text). */
-function inlinesOf(nodes: Node[]): Inline[] {
-  const out: Inline[] = [];
+/** Concatenates a node run into an O(1)-appendable inline sequence (unmatched delimiters and brackets become text). */
+function concatNodes(nodes: Node[]): InlineSeq | null {
+  let out: InlineSeq | null = null;
   for (const n of nodes) {
-    const item: Inline | null = n.inline ?? (n.delim ? text(n.delim.char.repeat(n.delim.count)) : n.bracket ? text(n.bracket.image ? "![" : "[") : null);
-    if (!item) continue;
+    const seg: InlineSeq | null =
+      n.items ??
+      (n.delim
+        ? singleSeq(text(n.delim.char.repeat(n.delim.count)), 0)
+        : n.bracket
+          ? singleSeq(text(n.bracket.image ? "![" : "["), 0)
+          : null);
+    if (seg) out = appendSeq(out, seg);
+  }
+  return out;
+}
+
+/** Materialises an inline sequence into an array, coalescing adjacent text nodes. */
+function seqToArray(seq: InlineSeq | null): Inline[] {
+  const out: Inline[] = [];
+  let cell = seq ? seq.head : null;
+  while (cell) {
+    const item = cell.item;
     const last = out[out.length - 1];
     if (item.t === "text" && last?.t === "text") last.v += item.v;
     else out.push(item.t === "text" ? { ...item } : item);
+    cell = cell.next;
   }
   return out;
 }
 
 interface LinkScanState {
   lastParen: number | null;
-  lastGt: number | null;
-  angleFailBefore: number;
-  lastDQuote: number | null;
-  lastSQuote: number | null;
-  budget: number;
+  angleEnd: number;
+  angleHasGt: boolean;
+  parenTitleEnd: number;
+  dquoteTitleEnd: number;
+  squoteTitleEnd: number;
+  failedAfterDest: Set<number>;
+  failedAfterTitle: Set<number>;
 }
 
 /** Link destination and optional title after `](`. Returns the end index (after `)`) or null. */
 function linkTail(s: string, at: number, state: LinkScanState): { dest: string; end: number } | null {
-  if (state.budget <= 0) return null;
   let i = at;
-  while (i < s.length && (s[i] === " " || s[i] === "\n")) {
-    if (--state.budget <= 0) return null;
-    i++;
-  }
-  let dest = "";
+  while (i < s.length && (s[i] === " " || s[i] === "\n")) i++;
+  let destStart = i;
+  let destEnd = i;
+  let unescapeBare = false;
   if (s[i] === "<") {
-    if (i < state.angleFailBefore) return null;
-    state.lastGt ??= s.lastIndexOf(">");
-    if (i + 1 > state.lastGt) {
-      state.angleFailBefore = s.length;
-      return null;
+    let j: number;
+    if (i < state.angleEnd) {
+      if (!state.angleHasGt) return null;
+      j = state.angleEnd;
+    } else {
+      j = i + 1;
+      while (j < s.length && s[j] !== ">" && s[j] !== "\n") j++;
+      state.angleEnd = j;
+      state.angleHasGt = j < s.length && s[j] === ">";
+      if (!state.angleHasGt) return null;
     }
-    let j = i + 1;
-    while (j < s.length && s[j] !== ">" && s[j] !== "\n") {
-      if (--state.budget <= 0) return null;
-      j++;
-    }
-    if (j >= s.length || s[j] !== ">") {
-      state.angleFailBefore = Math.max(state.angleFailBefore, j);
-      return null;
-    }
-    dest = s.slice(i + 1, j);
+    destStart = i + 1;
+    destEnd = j;
     i = j + 1;
   } else {
     let depth = 0;
-    const startDest = i;
+    destStart = i;
     while (i < s.length) {
-      if (--state.budget <= 0) return null;
       const ch = s[i]!;
       if (ch === "\\" && i + 1 < s.length && PUNCT.test(s[i + 1]!)) { i += 2; continue; }
       if (ch === "(") {
@@ -329,36 +369,50 @@ function linkTail(s: string, at: number, state: LinkScanState): { dest: string; 
       } else if (WS.test(ch) || ch < " ") break;
       i++;
     }
-    dest = s.slice(startDest, i).replace(/\\([!-/:-@[-`{-~])/g, "$1");
+    destEnd = i;
+    unescapeBare = true;
   }
-  while (i < s.length && (s[i] === " " || s[i] === "\n")) {
-    if (--state.budget <= 0) return null;
-    i++;
-  }
+  const afterDest = i;
+  if (state.failedAfterDest.has(afterDest)) return null;
+  while (i < s.length && (s[i] === " " || s[i] === "\n")) i++;
   // An optional title, which is not shown (the URL itself is, on hover).
   const q = s[i];
   if (q === '"' || q === "'" || q === "(") {
     const closer = q === "(" ? ")" : q;
-    if (q === '"') {
-      state.lastDQuote ??= s.lastIndexOf('"');
-      if (i + 1 > state.lastDQuote) return null;
-    } else if (q === "'") {
-      state.lastSQuote ??= s.lastIndexOf("'");
-      if (i + 1 > state.lastSQuote) return null;
+    const cachedEnd =
+      q === "(" ? state.parenTitleEnd : q === '"' ? state.dquoteTitleEnd : state.squoteTitleEnd;
+    let j: number;
+    if (i + 1 < cachedEnd) {
+      j = cachedEnd;
+    } else {
+      j = i + 1;
+      while (j < s.length && s[j] !== closer) j += s[j] === "\\" ? 2 : 1;
+      if (q === "(") state.parenTitleEnd = j;
+      else if (q === '"') state.dquoteTitleEnd = j;
+      else state.squoteTitleEnd = j;
     }
-    let j = i + 1;
-    while (j < s.length && s[j] !== closer) {
-      if (--state.budget <= 0) return null;
-      j += s[j] === "\\" ? 2 : 1;
+    if (j >= s.length) {
+      state.failedAfterDest.add(afterDest);
+      return null;
     }
-    if (j >= s.length) return null;
-    i = j + 1;
-    while (i < s.length && (s[i] === " " || s[i] === "\n")) {
-      if (--state.budget <= 0) return null;
-      i++;
+    const afterTitle = j + 1;
+    if (state.failedAfterTitle.has(afterTitle)) {
+      state.failedAfterDest.add(afterDest);
+      return null;
     }
+    i = afterTitle;
+    while (i < s.length && (s[i] === " " || s[i] === "\n")) i++;
+    if (s[i] !== ")") {
+      state.failedAfterTitle.add(afterTitle);
+      state.failedAfterDest.add(afterDest);
+      return null;
+    }
+  } else if (s[i] !== ")") {
+    state.failedAfterDest.add(afterDest);
+    return null;
   }
-  if (s[i] !== ")") return null;
+  const rawDest = s.slice(destStart, destEnd);
+  const dest = unescapeBare ? rawDest.replace(/\\([!-/:-@[-`{-~])/g, "$1") : rawDest;
   return { dest, end: i + 1 };
 }
 
@@ -446,20 +500,27 @@ function processEmphasis(list: List, bottom: Node | null): void {
     }
     if (!found) {
       openersBottom.set(key, Math.max(floorSeq, closer.seq - 1));
-      if (!cd.canOpen) closer.delim = null, (closer.inline = text(cd.char.repeat(cd.count)));
+      if (!cd.canOpen) closer.delim = null, (closer.items = singleSeq(text(cd.char.repeat(cd.count)), 0));
       closer = closer.next;
       continue;
     }
     const od = found.delim!;
     const use = cd.char === "~" ? 2 : od.count >= 2 && cd.count >= 2 ? 2 : 1;
-    const inner = inlinesOf(list.cut(found, closer));
+    const innerSeq = concatNodes(list.cut(found, closer));
+    const innerDepth = innerSeq ? innerSeq.depth : 0;
     const kind = cd.char === "~" ? "del" : use === 2 ? "strong" : "em";
     od.count -= use;
     cd.count -= use;
-    // The emphasis node goes right after the opener.
-    const node: Node = { prev: found, next: closer, seq: found.seq, inline: { t: kind, c: inner }, delim: null, bracket: null };
-    found.next = node;
-    closer.prev = node;
+    // Flatten excess inline nesting so traversal and rendering stay bounded.
+    const nextItems: InlineSeq | null =
+      innerDepth < MAX_INLINE_DEPTH
+        ? singleSeq({ t: kind, c: seqToArray(innerSeq) }, innerDepth + 1)
+        : innerSeq;
+    if (nextItems) {
+      const node: Node = { prev: found, next: closer, seq: found.seq, items: nextItems, delim: null, bracket: null };
+      found.next = node;
+      closer.prev = node;
+    }
     if (od.count === 0) list.remove(found);
     if (cd.count === 0) {
       const next = closer.next;
@@ -471,7 +532,7 @@ function processEmphasis(list: List, bottom: Node | null): void {
   let n = bottom ? bottom.next : list.head;
   while (n) {
     if (n.delim) {
-      n.inline = text(n.delim.char.repeat(n.delim.count));
+      n.items = singleSeq(text(n.delim.char.repeat(n.delim.count)), 0);
       n.delim = null;
     }
     n = n.next;
@@ -482,18 +543,21 @@ function processEmphasis(list: List, bottom: Node | null): void {
 export function parseInline(s: string): Inline[] {
   const list = new List();
   const brackets: Node[] = [];
-  let failedBacktickLens: Set<number> | null = null;
+  const activeLinks: Node[] = [];
+  let backtickRuns: Map<number, { positions: number[]; cursor: number }> | null = null;
   const linkScan: LinkScanState = {
     lastParen: null,
-    lastGt: null,
-    angleFailBefore: -1,
-    lastDQuote: null,
-    lastSQuote: null,
-    budget: Math.max(4096, s.length * 4),
+    angleEnd: -1,
+    angleHasGt: false,
+    parenTitleEnd: -1,
+    dquoteTitleEnd: -1,
+    squoteTitleEnd: -1,
+    failedAfterDest: new Set(),
+    failedAfterTitle: new Set(),
   };
   let buf = "";
   const flush = () => {
-    if (buf) list.push({ inline: text(buf), delim: null, bracket: null });
+    if (buf) list.push({ items: singleSeq(text(buf), 0), delim: null, bracket: null });
     buf = "";
   };
   let i = 0;
@@ -501,7 +565,7 @@ export function parseInline(s: string): Inline[] {
     const ch = s[i]!;
     if (ch === "\\") {
       const next = s[i + 1];
-      if (next === "\n") { flush(); list.push({ inline: { t: "br" }, delim: null, bracket: null }); i += 2; continue; }
+      if (next === "\n") { flush(); list.push({ items: singleSeq({ t: "br" }, 0), delim: null, bracket: null }); i += 2; continue; }
       if (next !== undefined && PUNCT.test(next)) { buf += next; i += 2; continue; }
       buf += ch;
       i++;
@@ -510,28 +574,40 @@ export function parseInline(s: string): Inline[] {
     if (ch === "`") {
       let n = 1;
       while (s[i + n] === "`") n++;
-      const run = "`".repeat(n);
-      let close = -1;
-      if (!failedBacktickLens?.has(n)) {
-        let j = i + n;
-        while (j < s.length) {
-          const k = s.indexOf(run, j);
+      if (backtickRuns === null) {
+        backtickRuns = new Map();
+        let p = i;
+        while (p < s.length) {
+          const k = s.indexOf("`", p);
           if (k < 0) break;
-          let m = n;
-          while (s[k + m] === "`") m++;
-          if (m === n) { close = k; break; }
-          j = k + m;
-        }
-        if (close < 0) {
-          failedBacktickLens ??= new Set();
-          failedBacktickLens.add(n);
+          let end = k + 1;
+          while (end < s.length && s[end] === "`") end++;
+          const len = end - k;
+          let entry = backtickRuns.get(len);
+          if (!entry) {
+            entry = { positions: [], cursor: 0 };
+            backtickRuns.set(len, entry);
+          }
+          entry.positions.push(k);
+          p = end;
         }
       }
-      if (close < 0) { buf += run; i += n; continue; }
+      let close = -1;
+      const entry = backtickRuns.get(n);
+      if (entry) {
+        const minPos = i + n;
+        while (entry.cursor < entry.positions.length && entry.positions[entry.cursor]! < minPos) {
+          entry.cursor++;
+        }
+        if (entry.cursor < entry.positions.length) {
+          close = entry.positions[entry.cursor]!;
+        }
+      }
+      if (close < 0) { buf += "`".repeat(n); i += n; continue; }
       let code = s.slice(i + n, close).replace(/\n/g, " ");
       if (code.length > 2 && code.startsWith(" ") && code.endsWith(" ") && code.trim()) code = code.slice(1, -1);
       flush();
-      list.push({ inline: { t: "code", v: code }, delim: null, bracket: null });
+      list.push({ items: singleSeq({ t: "code", v: code }, 0), delim: null, bracket: null });
       i = close + n;
       continue;
     }
@@ -539,14 +615,14 @@ export function parseInline(s: string): Inline[] {
       const auto = AUTOLINK.exec(s.slice(i, i + 4096));
       if (auto) {
         flush();
-        list.push({ inline: { t: "link", target: classifyLink(auto[1]!), c: [text(auto[1]!)] }, delim: null, bracket: null });
+        list.push({ items: singleSeq({ t: "link", target: classifyLink(auto[1]!), c: [text(auto[1]!)] }, 1), delim: null, bracket: null });
         i += auto[0].length;
         continue;
       }
       const mail = EMAIL.exec(s.slice(i, i + 512));
       if (mail) {
         flush();
-        list.push({ inline: { t: "link", target: classifyLink(`mailto:${mail[1]!}`), c: [text(mail[1]!)] }, delim: null, bracket: null });
+        list.push({ items: singleSeq({ t: "link", target: classifyLink(`mailto:${mail[1]!}`), c: [text(mail[1]!)] }, 1), delim: null, bracket: null });
         i += mail[0].length;
         continue;
       }
@@ -568,27 +644,32 @@ export function parseInline(s: string): Inline[] {
       }
       if (ch === "~" && n !== 2) { buf += ch.repeat(n); i += n; continue; }
       flush();
-      list.push({ inline: null, delim: { char: ch, count: n, orig: n, canOpen, canClose }, bracket: null });
+      list.push({ items: null, delim: { char: ch, count: n, orig: n, canOpen, canClose }, bracket: null });
       i += n;
       continue;
     }
     if (ch === "!" && s[i + 1] === "[") {
       flush();
-      brackets.push(list.push({ inline: null, delim: null, bracket: { image: true, active: true, pos: i + 2 } }));
+      brackets.push(list.push({ items: null, delim: null, bracket: { image: true, active: true, pos: i + 2 } }));
       i += 2;
       continue;
     }
     if (ch === "[") {
       flush();
-      brackets.push(list.push({ inline: null, delim: null, bracket: { image: false, active: true, pos: i + 1 } }));
+      const node = list.push({ items: null, delim: null, bracket: { image: false, active: true, pos: i + 1 } });
+      brackets.push(node);
+      activeLinks.push(node);
       i++;
       continue;
     }
     if (ch === "]") {
       flush();
       const opener = brackets.pop();
+      if (opener && !opener.bracket!.image && activeLinks[activeLinks.length - 1] === opener) {
+        activeLinks.pop();
+      }
       if (!opener || !opener.bracket!.active || s[i + 1] !== "(") {
-        if (opener) opener.inline = text(opener.bracket!.image ? "![" : "["), (opener.bracket = null);
+        if (opener) opener.items = singleSeq(text(opener.bracket!.image ? "![" : "["), 0), (opener.bracket = null);
         buf += "]";
         i++;
         continue;
@@ -596,29 +677,28 @@ export function parseInline(s: string): Inline[] {
       linkScan.lastParen ??= s.lastIndexOf(")");
       const tail = i + 2 <= linkScan.lastParen ? linkTail(s, i + 2, linkScan) : null;
       if (!tail) {
-        opener.inline = text(opener.bracket!.image ? "![" : "[");
+        opener.items = singleSeq(text(opener.bracket!.image ? "![" : "["), 0);
         opener.bracket = null;
         buf += "]";
         i++;
         continue;
       }
       const image = opener.bracket!.image;
-      const marker = list.push({ inline: null, delim: null, bracket: null });
+      const marker = list.push({ items: null, delim: null, bracket: null });
       processEmphasis(list, opener);
-      const inner = inlinesOf(list.cut(opener, marker));
+      const innerSeq = concatNodes(list.cut(opener, marker));
+      const inner = seqToArray(innerSeq);
       list.remove(marker);
       if (image) {
         const alt = plainText(inner);
-        opener.inline = { t: "image", target: classifyImage(tail.dest), alt };
+        opener.items = singleSeq({ t: "image", target: classifyImage(tail.dest), alt }, 0);
       } else {
-        opener.inline = { t: "link", target: classifyLink(tail.dest), c: inner };
+        const innerDepth = innerSeq ? innerSeq.depth : 0;
+        opener.items = singleSeq({ t: "link", target: classifyLink(tail.dest), c: inner }, innerDepth + 1);
         // No links inside links: earlier `[` openers can't make one any more.
-        for (let b = brackets.length - 1; b >= 0; b--) {
-          const br = brackets[b]!.bracket!;
-          if (!br.image) {
-            if (!br.active) break;
-            br.active = false;
-          }
+        while (activeLinks.length > 0) {
+          const prev = activeLinks.pop()!;
+          if (prev.bracket) prev.bracket.active = false;
         }
       }
       opener.bracket = null;
@@ -630,7 +710,7 @@ export function parseInline(s: string): Inline[] {
       if (buf.endsWith("  ")) {
         buf = buf.replace(/ +$/, "");
         flush();
-        list.push({ inline: { t: "br" }, delim: null, bracket: null });
+        list.push({ items: singleSeq({ t: "br" }, 0), delim: null, bracket: null });
       } else {
         buf = buf.replace(/ +$/, "") + "\n";
       }
@@ -646,17 +726,24 @@ export function parseInline(s: string): Inline[] {
   const nodes: Node[] = [];
   for (let n = list.head; n; n = n.next) nodes.push(n);
   // Bare URLs only in text that isn't already inside a link.
-  return mapText(inlinesOf(nodes), linkify);
+  return mapText(seqToArray(concatNodes(nodes)), linkify);
 }
 
 /** The text of inlines, without markup (image alt text, titles). */
 export function plainText(items: Inline[]): string {
   let out = "";
-  for (const item of items) {
+  const stack: { list: Inline[]; idx: number }[] = [{ list: items, idx: 0 }];
+  while (stack.length > 0) {
+    const top = stack[stack.length - 1]!;
+    if (top.idx >= top.list.length) {
+      stack.pop();
+      continue;
+    }
+    const item = top.list[top.idx++]!;
     if (item.t === "text" || item.t === "code") out += item.v;
     else if (item.t === "br") out += "\n";
     else if (item.t === "image") out += item.alt;
-    else out += plainText(item.c);
+    else stack.push({ list: item.c, idx: 0 });
   }
   return out;
 }

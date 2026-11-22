@@ -5,7 +5,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { classifyImage, classifyLink } from "./links";
 import { MAX_INLINE_IMAGE_BYTES } from "./limits";
-import { type Block, type Inline, parseInline, parseMarkdown } from "./markdown";
+import { type Block, type Inline, parseInline, parseMarkdown, plainText } from "./markdown";
 import { type LinkActions, renderBlocks } from "./render";
 
 const actions = (): LinkActions & { opened: string[]; revealed: string[] } => {
@@ -255,6 +255,99 @@ describe("blocks", () => {
     expect(valid).toEqual([
       { t: "link", target: { kind: "web", url: "https://example.com/a" }, c: [{ t: "text", v: "ok" }] },
     ]);
+  });
+
+  it("image openers before many links scale linearly (M1-33 finding 2)", () => {
+    const n = 32_000;
+    const src = "![".repeat(n) + "[x](https://e.co)".repeat(n);
+    const start = performance.now();
+    const out = parseInline(src);
+    expect(performance.now() - start).toBeLessThan(2000);
+    const links = out.filter((item) => item.t === "link");
+    expect(links).toHaveLength(n);
+    // Links inside image alt text remain active for the enclosing image, while
+    // links inside links still deactivate outer `[` openers.
+    const nestedImg = parseInline("![alt [b](https://b.co)](https://e.co/a.png)");
+    expect(nestedImg).toEqual([
+      { t: "image", target: { kind: "remote", url: "https://e.co/a.png" }, alt: "alt b" },
+    ]);
+  });
+
+  it("distinct unmatched backtick run lengths scale linearly (M1-33 finding 3)", () => {
+    const parts: string[] = [];
+    for (let len = 1; len <= 2400; len++) {
+      parts.push("`".repeat(len), "x");
+    }
+    const src = parts.join("");
+    const start = performance.now();
+    const out = parseInline(src);
+    expect(performance.now() - start).toBeLessThan(2000);
+    expect(out).toEqual([{ t: "text", v: src }]);
+
+    // Matched backtick runs of varying lengths still parse as code spans.
+    expect(parseInline("``a ` b`` and `c`")).toEqual([
+      { t: "code", v: "a ` b" },
+      { t: "text", v: " and " },
+      { t: "code", v: "c" },
+    ]);
+  });
+
+  it("deep inline emphasis nesting flattens without overflowing the stack (M1-33 finding 4)", () => {
+    const maxDepth = (items: Inline[]): number => {
+      let best = 0;
+      const stack: { list: Inline[]; d: number }[] = [{ list: items, d: 0 }];
+      while (stack.length > 0) {
+        const cur = stack.pop()!;
+        for (const item of cur.list) {
+          if ("c" in item) {
+            if (cur.d + 1 > best) best = cur.d + 1;
+            stack.push({ list: item.c, d: cur.d + 1 });
+          }
+        }
+      }
+      return best;
+    };
+
+    const stars = "*".repeat(12_000) + "x" + "*".repeat(12_000);
+    const parsedStars = parseInline(stars);
+    expect(plainText(parsedStars)).toBe("x");
+    expect(maxDepth(parsedStars)).toBeLessThanOrEqual(20);
+    expect(() => render(stars)).not.toThrow();
+
+    const spaced = "*a ".repeat(12_000) + "x" + " a*".repeat(12_000);
+    const start = performance.now();
+    const parsedSpaced = parseInline(spaced);
+    expect(performance.now() - start).toBeLessThan(2000);
+    expect(maxDepth(parsedSpaced)).toBeLessThanOrEqual(20);
+    expect(plainText(parsedSpaced)).toContain("x");
+  });
+
+  it("malformed link prefixes never disable later valid links (M1-33 finding 5)", () => {
+    const anglePrefix = "[x](<".repeat(1000) + ">X [ok](file:///tmp/a)";
+    const angleOut = parseInline(anglePrefix);
+    expect(angleOut.find((item) => item.t === "link")).toEqual({
+      t: "link",
+      target: { kind: "file", path: "/tmp/a" },
+      c: [{ t: "text", v: "ok" }],
+    });
+
+    const start = performance.now();
+    const bigAngle = "[x](<".repeat(20_000) + ">X [ok](file:///tmp/a)";
+    const bigAngleOut = parseInline(bigAngle);
+    const bigParenTitle = "[x](a (".repeat(20_000) + ")X [ok](file:///tmp/b)";
+    const bigParenOut = parseInline(bigParenTitle);
+    expect(performance.now() - start).toBeLessThan(2000);
+
+    expect(bigAngleOut.find((item) => item.t === "link")).toEqual({
+      t: "link",
+      target: { kind: "file", path: "/tmp/a" },
+      c: [{ t: "text", v: "ok" }],
+    });
+    expect(bigParenOut.find((item) => item.t === "link")).toEqual({
+      t: "link",
+      target: { kind: "file", path: "/tmp/b" },
+      c: [{ t: "text", v: "ok" }],
+    });
   });
 });
 
