@@ -940,7 +940,7 @@ const fn base_tool(name: &'static str) -> ToolSpec {
         hard_deny: None,
         home_readonly: None,
         filter_dialect: None,
-        changes_default: None,
+        changes_default: Some("§11 item 2"),
     }
 }
 
@@ -959,7 +959,7 @@ const fn base_subcommand(name: &'static str) -> SubcommandSpec {
         code_runner_no_pin: false,
         home_readonly: None,
         git_selects_by_name: false,
-        changes_default: None,
+        changes_default: Some("§11 item 2"),
     }
 }
 
@@ -997,7 +997,7 @@ const fn target_then_code_runner(name: &'static str) -> ToolSpec {
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 9"),
         ..base_tool(name)
     }
 }
@@ -1008,7 +1008,7 @@ const fn direct_code_runner(name: &'static str) -> ToolSpec {
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4"),
         ..base_tool(name)
     }
 }
@@ -3018,7 +3018,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
     SubcommandSpec {
         operands: OperandLayout::all(ValueRole::Ref),
         git_selects_by_name: true,
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_subcommand("cat-file")
     },
     SubcommandSpec {
@@ -3027,7 +3027,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 9"),
         ..base_subcommand("push")
     },
     SubcommandSpec {
@@ -3035,7 +3035,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         operand_access: OperandAccessMode::SourcesReadLastWrite,
         writes: WriteBehavior::Always,
         derived_destinations: DerivedDestinationsBehavior::Always,
-        changes_default: Some("§11 item 9; §11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 9; §11 item 10"),
         ..base_subcommand("clone")
     },
     SubcommandSpec {
@@ -3049,7 +3049,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         operand_access: OperandAccessMode::AllWrite,
         writes: WriteBehavior::Always,
         derived_destinations: DerivedDestinationsBehavior::Always,
-        changes_default: Some("§11 item 9; §11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 9; §11 item 10"),
         ..base_subcommand("checkout")
     },
     // Program-running git subcommands (§6)
@@ -3058,7 +3058,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4"),
         ..base_subcommand("merge-index")
     },
     SubcommandSpec {
@@ -3066,7 +3066,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4"),
         ..base_subcommand("filter-branch")
     },
     SubcommandSpec {
@@ -3074,7 +3074,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithSubarg(&["run"]),
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 9"),
         ..base_subcommand("bisect")
     },
     SubcommandSpec {
@@ -3083,7 +3083,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 9"),
         ..base_subcommand("rebase")
     },
     SubcommandSpec {
@@ -3091,7 +3091,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithSubarg(&["foreach"]),
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 9"),
         ..base_subcommand("submodule")
     },
     SubcommandSpec {
@@ -3099,7 +3099,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         operands: OperandLayout::all(ValueRole::Ref),
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 9"),
         ..base_subcommand("difftool")
     },
     SubcommandSpec {
@@ -3109,7 +3109,7 @@ const GIT_SUBCOMMANDS: &[SubcommandSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithFlag,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4"),
         ..base_subcommand("mergetool")
     },
 ];
@@ -3121,7 +3121,7 @@ const fn cargo_build_subcommand(name: &'static str) -> SubcommandSpec {
         code_runner: CodeRunnerBehavior::ProjectBuild {
             pin: ProgramPin::CommandAndSubcommand,
         },
-        changes_default: Some("§11 item 8; §11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 8; §11 item 9"),
         ..base_subcommand(name)
     }
 }
@@ -3143,7 +3143,7 @@ const PIPX_SUBCOMMANDS: &[SubcommandSpec] = &[SubcommandSpec {
         pin: ProgramPin::FirstOperand,
     },
     code_runner_no_pin: true,
-    changes_default: Some("§11 item 4; §11 item 8"),
+    changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
     ..base_subcommand("run")
 }];
 
@@ -3157,14 +3157,14 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         flag_mode: FlagMode::ListedOnly,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Command),
-        changes_default: Some("§11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 10"),
         ..base_tool("command")
     },
     ToolSpec {
         flag_mode: FlagMode::ListedOnly,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Exec),
-        changes_default: Some("§11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 10"),
         ..base_tool("exec")
     },
     ToolSpec {
@@ -3172,7 +3172,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         flags: NICE_FLAGS,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Nice),
-        changes_default: Some("§11 item 9; §11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 9; §11 item 10"),
         ..base_tool("nice")
     },
     ToolSpec {
@@ -3180,21 +3180,21 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         flags: TIMEOUT_FLAGS,
         operands: OperandLayout::fixed(&[ValueRole::Text]),
         wrapper: Some(WrapperKind::Timeout),
-        changes_default: Some("§11 item 9; §11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 9; §11 item 10"),
         ..base_tool("timeout")
     },
     ToolSpec {
         flag_mode: FlagMode::ListedOnly,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Time),
-        changes_default: Some("§11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 10"),
         ..base_tool("time")
     },
     ToolSpec {
         flag_mode: FlagMode::ListedOnly,
         operands: OperandLayout::NONE,
         wrapper: Some(WrapperKind::Env),
-        changes_default: Some("§11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 10"),
         ..base_tool("env")
     },
     // --- Modeled §4 nested shells (and script-file Unread (program)) ---
@@ -3241,31 +3241,37 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["ls"]),
+        changes_default: None,
         ..base_tool("ls")
     },
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["pwd"]),
+        changes_default: None,
         ..base_tool("pwd")
     },
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["cat"]),
+        changes_default: None,
         ..base_tool("cat")
     },
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["head"]),
+        changes_default: None,
         ..base_tool("head")
     },
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["tail"]),
+        changes_default: None,
         ..base_tool("tail")
     },
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["wc"]),
+        changes_default: None,
         ..base_tool("wc")
     },
     ToolSpec {
@@ -3284,22 +3290,26 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             recursion: Recursion::Never,
             allow_followed_search: false,
         }),
+        changes_default: None,
         ..base_tool("file")
     },
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         links: LINKS_NONE,
         home_readonly: home_ro(&["stat"]),
+        changes_default: None,
         ..base_tool("stat")
     },
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["du"]),
+        changes_default: None,
         ..base_tool("du")
     },
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["df"]),
+        changes_default: None,
         ..base_tool("df")
     },
     ToolSpec {
@@ -3312,6 +3322,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["uname"]),
+        changes_default: None,
         ..base_tool("uname")
     },
     ToolSpec {
@@ -3323,11 +3334,13 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             recursion: Recursion::Never,
             allow_followed_search: false,
         }),
+        changes_default: None,
         ..base_tool("date")
     },
     ToolSpec {
         flag_mode: FlagMode::AnyExceptForbidden,
         home_readonly: home_ro(&["whoami"]),
+        changes_default: None,
         ..base_tool("whoami")
     },
     ToolSpec {
@@ -3341,6 +3354,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             recursion: Recursion::Never,
             allow_followed_search: false,
         }),
+        changes_default: None,
         ..base_tool("tree")
     },
     // --- Search tools with faithful `dev` flag tables ---
@@ -3474,7 +3488,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             pin: ProgramPin::CommandAndSubcommand,
         },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool("cargo")
     },
     ToolSpec {
@@ -3483,7 +3497,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineWithSubarg(&["run"]),
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool("pipx")
     },
     // --- Explicit §5/§6 file, directory, archive, and link tools ---
@@ -3527,7 +3541,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::Always,
         derived_destinations: DerivedDestinationsBehavior::WithFlag,
         recursive: RecursiveBehavior::WithFlag,
-        changes_default: Some("§11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 10"),
         ..base_tool("cp")
     },
     ToolSpec {
@@ -3541,7 +3555,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::Always,
         derived_destinations: DerivedDestinationsBehavior::WhenSourceIsDir,
         links: LINKS_NONE,
-        changes_default: Some("§11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 10"),
         ..base_tool("mv")
     },
     ToolSpec {
@@ -3556,7 +3570,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::Always,
         derived_destinations: DerivedDestinationsBehavior::Always,
         recursive: RecursiveBehavior::Always,
-        changes_default: Some("§11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 10"),
         ..base_tool("rsync")
     },
     ToolSpec {
@@ -3574,7 +3588,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::prefix_then(&[ValueRole::Path], ValueRole::ArchiveMember),
         writes: WriteBehavior::Always,
         derived_destinations: DerivedDestinationsBehavior::Always,
-        changes_default: Some("§11 item 9; §11 item 10"),
+        changes_default: Some("§11 item 2; §11 item 9; §11 item 10"),
         ..base_tool("unzip")
     },
     // --- Remaining `words::WRITERS` ---
@@ -3600,21 +3614,21 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         operands: OperandLayout::prefix_then(&[ValueRole::Text], ValueRole::Path),
         operand_access: OperandAccessMode::AllWrite,
         writes: WriteBehavior::Always,
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("chmod")
     },
     ToolSpec {
         operands: OperandLayout::prefix_then(&[ValueRole::Text], ValueRole::Path),
         operand_access: OperandAccessMode::AllWrite,
         writes: WriteBehavior::Always,
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("chown")
     },
     ToolSpec {
         operands: OperandLayout::prefix_then(&[ValueRole::Text], ValueRole::Path),
         operand_access: OperandAccessMode::AllWrite,
         writes: WriteBehavior::Always,
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("chgrp")
     },
     ToolSpec {
@@ -3737,7 +3751,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         flags: ECHO_FLAGS,
         operands: OperandLayout::all(ValueRole::Text),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("echo")
     },
     ToolSpec {
@@ -3748,39 +3762,39 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         operands: OperandLayout::all(ValueRole::Text),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("whereis")
     },
     ToolSpec {
         operands: OperandLayout::all(ValueRole::Text),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("type")
     },
     ToolSpec {
         operands: OperandLayout::all(ValueRole::Text),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("tr")
     },
     ToolSpec {
         operands: OperandLayout::all(ValueRole::Text),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("true")
     },
     ToolSpec {
         operands: OperandLayout::all(ValueRole::Text),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("false")
     },
     ToolSpec {
         operands: OperandLayout::all(ValueRole::Text),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("id")
     },
     base_tool("test"),
     base_tool("["),
     ToolSpec {
         operands: OperandLayout::prefix_then(&[ValueRole::Pattern], ValueRole::Path),
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("jq")
     },
     ToolSpec {
@@ -3804,7 +3818,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         flags: CODESIGN_FLAGS,
         operand_access: OperandAccessMode::InPlaceWithFlag,
         writes: WriteBehavior::WithFlag,
-        changes_default: Some("§11 item 9"),
+        changes_default: Some("§11 item 2; §11 item 9"),
         ..base_tool("codesign")
     },
     // --- Code runners & interpreters (§4, §6, §7) ---
@@ -3814,7 +3828,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4"),
         ..base_tool("awk")
     },
     ToolSpec {
@@ -3823,7 +3837,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4"),
         ..base_tool("gawk")
     },
     ToolSpec {
@@ -3832,7 +3846,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4"),
         ..base_tool("mawk")
     },
     ToolSpec {
@@ -3842,7 +3856,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::WithFlag,
         code_runner: CodeRunnerBehavior::ScriptCommands(&['e', 'w', 'r']),
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool("sed")
     },
     ToolSpec {
@@ -3854,7 +3868,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             pin: ProgramPin::FirstOperand,
         },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool("perl")
     },
     ToolSpec {
@@ -3865,7 +3879,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             pin: ProgramPin::FirstOperand,
         },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool("python")
     },
     ToolSpec {
@@ -3876,7 +3890,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             pin: ProgramPin::FirstOperand,
         },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool("python3")
     },
     ToolSpec {
@@ -3887,7 +3901,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             pin: ProgramPin::FirstOperand,
         },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool("node")
     },
     ToolSpec {
@@ -3898,7 +3912,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             pin: ProgramPin::FirstOperand,
         },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool("ruby")
     },
     ToolSpec {
@@ -3906,7 +3920,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4"),
         ..base_tool("eval")
     },
     ToolSpec {
@@ -3916,7 +3930,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             pin: ProgramPin::FirstOperand,
         },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool("source")
     },
     ToolSpec {
@@ -3926,7 +3940,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             pin: ProgramPin::FirstOperand,
         },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool(".")
     },
     ToolSpec {
@@ -3936,7 +3950,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
             pin: ProgramPin::FirstOperand,
         },
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4; §11 item 8"),
+        changes_default: Some("§11 item 2; §11 item 4; §11 item 8"),
         ..base_tool("npx")
     },
     ToolSpec {
@@ -3944,7 +3958,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
-        changes_default: Some("§11 item 4"),
+        changes_default: Some("§11 item 2; §11 item 4"),
         ..base_tool("xargs")
     },
     // --- `shell::COMMAND_RUNNERS` (marked as code runners in §4, §6) ---
@@ -4006,19 +4020,22 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         ..direct_code_runner("setpriv")
     },
     direct_code_runner("parallel"),
-    // --- `deny::PRIV` (always hard-denied `privilege-escalation`, also code runners) ---
+    // --- `deny::PRIV` (always hard-denied `privilege-escalation`, also code runners;
+    //     never coverable by `dev`'s rules, so `changes_default: None`) ---
     ToolSpec {
         operands: OperandLayout::all(ValueRole::Code),
         writes: WriteBehavior::Always,
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
         hard_deny: Some("privilege-escalation"),
+        changes_default: None,
         ..base_tool("sudo")
     },
     ToolSpec {
         operand_access: OperandAccessMode::AllWrite,
         writes: WriteBehavior::Always,
         hard_deny: Some("privilege-escalation"),
+        changes_default: None,
         ..base_tool("sudoedit")
     },
     ToolSpec {
@@ -4027,6 +4044,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
         hard_deny: Some("privilege-escalation"),
+        changes_default: None,
         ..base_tool("su")
     },
     ToolSpec {
@@ -4035,6 +4053,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
         hard_deny: Some("privilege-escalation"),
+        changes_default: None,
         ..base_tool("doas")
     },
     ToolSpec {
@@ -4044,6 +4063,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
         hard_deny: Some("privilege-escalation"),
+        changes_default: None,
         ..base_tool("pkexec")
     },
     ToolSpec {
@@ -4053,6 +4073,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         code_runner: CodeRunnerBehavior::InlineOnly,
         code_runner_no_pin: true,
         hard_deny: Some("privilege-escalation"),
+        changes_default: None,
         ..base_tool("run0")
     },
     // --- `deny::DOWNLOADERS` (pipe-to-shell sources) ---
@@ -6397,6 +6418,66 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn listed_only_rows_cite_item_2() {
+        // Finding 1 (round 3): every row in FlagMode::ListedOnly that dev's
+        // rules could cover (i.e. not always-HardDeny `PRIV`) restricts
+        // unlisted flags to Unread(UnknownFlag) under prefix/exact rules and
+        // must cite §11 item 2. AnyExceptForbidden rows keep unlisted flags
+        // in the model and do not cite item 2 for unlisted flags.
+        for t in TOOLS {
+            if t.flag_mode == FlagMode::ListedOnly {
+                if t.hard_deny.is_none() {
+                    assert!(
+                        t.changes_default
+                            .is_some_and(|cd| cd.contains("§11 item 2")),
+                        "`{}` uses FlagMode::ListedOnly without citing §11 item 2",
+                        t.name
+                    );
+                }
+            } else {
+                assert!(
+                    !t.changes_default
+                        .is_some_and(|cd| cd.contains("§11 item 2")),
+                    "AnyExceptForbidden tool `{}` should not cite §11 item 2",
+                    t.name
+                );
+            }
+            for s in t.subcommands {
+                if s.flag_mode == FlagMode::ListedOnly {
+                    if t.hard_deny.is_none() {
+                        assert!(
+                            s.changes_default
+                                .is_some_and(|cd| cd.contains("§11 item 2")),
+                            "`{} {}` uses FlagMode::ListedOnly without citing §11 item 2",
+                            t.name,
+                            s.name
+                        );
+                    }
+                } else {
+                    assert!(
+                        !s.changes_default
+                            .is_some_and(|cd| cd.contains("§11 item 2")),
+                        "AnyExceptForbidden subcommand `{} {}` should not cite §11 item 2",
+                        t.name,
+                        s.name
+                    );
+                }
+            }
+        }
+        for name in [
+            "sort", "rm", "cp", "mkdir", "ln", "cd", "curl", "sed", "awk", "perl", "python",
+            "cargo", "pipx",
+        ] {
+            let t = lookup(name).unwrap();
+            assert!(
+                t.changes_default
+                    .is_some_and(|cd| cd.contains("§11 item 2")),
+                "`{name}` must cite §11 item 2"
+            );
         }
     }
 
