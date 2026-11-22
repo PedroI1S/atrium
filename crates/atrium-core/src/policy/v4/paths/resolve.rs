@@ -97,17 +97,31 @@ fn strip_trailing_slashes(path: &[u8]) -> &[u8] {
     &path[..end]
 }
 
-fn build_path_from_stack(
-    stack: &[(Vec<u8>, Option<FileIdentity>)],
-    extra: Option<&[u8]>,
-) -> Vec<u8> {
-    let mut len = 1usize;
+fn stack_path_len(stack: &[(Vec<u8>, Option<FileIdentity>)], extra: Option<&[u8]>) -> usize {
+    if stack.is_empty() && extra.is_none() {
+        return 1;
+    }
+    let mut len = 0usize;
     for (seg, _) in stack {
         len += seg.len() + 1;
     }
     if let Some(e) = extra {
         len += e.len() + 1;
     }
+    len.max(1)
+}
+
+fn with_tail_len(stack: &[(Vec<u8>, Option<FileIdentity>)], missing_tail: &[Vec<u8>]) -> usize {
+    let base = stack_path_len(stack, None);
+    let tail: usize = missing_tail.iter().map(|s| s.len() + 1).sum();
+    base + tail
+}
+
+fn build_path_from_stack(
+    stack: &[(Vec<u8>, Option<FileIdentity>)],
+    extra: Option<&[u8]>,
+) -> Vec<u8> {
+    let len = stack_path_len(stack, extra);
     let mut out = Vec::with_capacity(len);
     if stack.is_empty() && extra.is_none() {
         out.push(b'/');
@@ -249,6 +263,8 @@ pub(crate) fn resolve_literal_impl(
                 existing_stack.pop();
                 final_meta = None;
             }
+            let cur_len = with_tail_len(&existing_stack, &missing_tail);
+            budget.charge_alloc(cur_len)?;
             let cur = build_with_tail(&existing_stack, &missing_tail);
             if is_process_dependent_path(&cur) {
                 return Ok(unread_target(
@@ -262,6 +278,8 @@ pub(crate) fn resolve_literal_impl(
 
         if !missing_tail.is_empty() {
             missing_tail.push(seg);
+            let cur_len = with_tail_len(&existing_stack, &missing_tail);
+            budget.charge_alloc(cur_len)?;
             let cur = build_with_tail(&existing_stack, &missing_tail);
             if is_process_dependent_path(&cur) {
                 return Ok(unread_target(
@@ -273,8 +291,9 @@ pub(crate) fn resolve_literal_impl(
             continue;
         }
 
+        let cand_len = stack_path_len(&existing_stack, Some(&seg));
+        budget.charge_alloc(cand_len)?;
         let cand = build_path_from_stack(&existing_stack, Some(&seg));
-        budget.charge_alloc(cand.len())?;
         if is_process_dependent_path(&cand) {
             return Ok(unread_target(
                 origin,
@@ -386,8 +405,11 @@ pub(crate) fn resolve_literal_impl(
     // Canonicalize the deepest existing ancestor for volume canonical spelling
     // (handles case-insensitive volumes and platform firmlinks).
     let canon_base = if existing_stack.is_empty() {
+        budget.charge_alloc(1)?;
         b"/".to_vec()
     } else {
+        let existing_len = stack_path_len(&existing_stack, None);
+        budget.charge_alloc(existing_len)?;
         let existing_path = build_path_from_stack(&existing_stack, None);
         match resolver.canonicalize(&existing_path, caps, budget) {
             Ok(c) => c,
@@ -450,11 +472,12 @@ pub(crate) fn resolve_literal_impl(
             identities.push(*id);
         }
     }
-    if dangling_symlink {
-        for id in symlink_identities {
-            if !identities.contains(&id) {
-                identities.push(id);
-            }
+    // Always preserve traversed symlink identities (both dangling links and
+    // symlinks placed at protected spellings that canonicalize to ordinary
+    // targets; §5).
+    for id in symlink_identities {
+        if !identities.contains(&id) {
+            identities.push(id);
         }
     }
 

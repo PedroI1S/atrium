@@ -79,6 +79,7 @@ fn parse_component(
     budget.charge_alloc(bytes.len() * std::mem::size_of::<CompAtom>())?;
     let mut atoms: Vec<CompAtom> = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
+    let mut skip_brackets_until = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
         let p = prov[i];
@@ -98,18 +99,30 @@ fn parse_component(
                 atoms.push(CompAtom::AnyOne);
                 i += 1;
             }
-            b'[' => match parse_bracket_class(bytes, prov, i, budget)? {
-                BracketParse::Class(table, next_i) => {
-                    atoms.push(CompAtom::Class(table));
-                    i = next_i;
-                }
-                BracketParse::Unread(unread) => return Ok(Err(unread)),
-                BracketParse::Unclosed => {
-                    // Unclosed `[` is treated as a literal `[`.
+            b'[' => {
+                if i < skip_brackets_until {
                     atoms.push(CompAtom::Literal(b'['));
                     i += 1;
+                } else {
+                    match parse_bracket_class(bytes, prov, i, budget)? {
+                        BracketParse::Class(table, next_i) => {
+                            atoms.push(CompAtom::Class(table));
+                            i = next_i;
+                        }
+                        BracketParse::Unread(unread) => return Ok(Err(unread)),
+                        BracketParse::Unclosed {
+                            next_possible_bracket,
+                        } => {
+                            // Unclosed `[` is treated as a literal `[`; advance
+                            // `skip_brackets_until` so subsequent unclosed `[` bytes
+                            // never rescan the same suffix (§8).
+                            atoms.push(CompAtom::Literal(b'['));
+                            skip_brackets_until = skip_brackets_until.max(next_possible_bracket);
+                            i += 1;
+                        }
+                    }
                 }
-            },
+            }
             other => {
                 atoms.push(CompAtom::Literal(other));
                 i += 1;
@@ -169,6 +182,9 @@ fn scan_posix_bracket_item(
     let mut scan = pos + 2;
     while scan + 1 < bytes.len() {
         budget.charge(1)?;
+        if bytes[scan] == b'[' && prov[scan] == ByteProvenance::Unquoted {
+            return Ok(None);
+        }
         if bytes[scan] == delim
             && prov[scan] == ByteProvenance::Unquoted
             && bytes[scan + 1] == b']'
@@ -184,7 +200,7 @@ fn scan_posix_bracket_item(
 enum BracketParse {
     Class([u64; 4], usize),
     Unread(UnreadReason),
-    Unclosed,
+    Unclosed { next_possible_bracket: usize },
 }
 
 fn parse_bracket_class(
@@ -195,7 +211,9 @@ fn parse_bracket_class(
 ) -> Result<BracketParse, Exhausted> {
     let mut j = start + 1;
     if j >= bytes.len() {
-        return Ok(BracketParse::Unclosed);
+        return Ok(BracketParse::Unclosed {
+            next_possible_bracket: bytes.len(),
+        });
     }
 
     let body_start = j;
@@ -208,12 +226,14 @@ fn parse_bracket_class(
         j += 1;
     }
     let mut close = None;
+    let mut first_skipped_posix: Option<usize> = None;
     while j < bytes.len() {
         budget.charge(1)?;
         if bytes[j] == b'['
             && prov[j] == ByteProvenance::Unquoted
             && let Some(item_end) = scan_posix_bracket_item(bytes, prov, j, budget)?
         {
+            first_skipped_posix.get_or_insert(j);
             j = item_end;
             continue;
         }
@@ -227,7 +247,9 @@ fn parse_bracket_class(
         j += 1;
     }
     let Some(end) = close else {
-        return Ok(BracketParse::Unclosed);
+        return Ok(BracketParse::Unclosed {
+            next_possible_bracket: first_skipped_posix.unwrap_or(bytes.len()),
+        });
     };
     if has_bang_or_caret {
         return Ok(BracketParse::Unread(UnreadReason::NegatedGlobClass));
@@ -448,6 +470,7 @@ pub(crate) fn expand_shell_glob_impl(
         .position(|c| matches!(c, PatComp::Glob { .. }))
         .unwrap_or(comps.len());
 
+    budget.charge_alloc(abs_bytes.len().max(1))?;
     let mut prefix = Vec::new();
     if first_glob == 0 {
         prefix.push(b'/');
@@ -473,10 +496,10 @@ pub(crate) fn expand_shell_glob_impl(
 
     while let Some((dir, idx, depth, variant_only)) = stack.pop() {
         budget.charge(dir.len().max(1) as u64)?;
+        budget.charge_alloc(dir.len())?;
         if !visited.insert((dir.clone(), idx, variant_only)) {
             continue;
         }
-        budget.charge_alloc(dir.len())?;
         if idx == comps.len() {
             if trailing_slash {
                 match resolver.stat(&dir, caps, budget) {
@@ -500,12 +523,14 @@ pub(crate) fn expand_shell_glob_impl(
                 }
             }
             if variant_only {
-                if variant_seen.insert(dir.clone()) {
-                    budget.charge_alloc(dir.len())?;
+                if !variant_seen.contains(&dir) {
+                    budget.charge_alloc(dir.len().saturating_mul(2))?;
+                    variant_seen.insert(dir.clone());
                     variant_paths.push(dir);
                 }
-            } else if exact_seen.insert(dir.clone()) {
-                budget.charge_alloc(dir.len())?;
+            } else if !exact_seen.contains(&dir) {
+                budget.charge_alloc(dir.len().saturating_mul(2))?;
+                exact_seen.insert(dir.clone());
                 exact_paths.push(dir);
             }
             continue;
@@ -579,6 +604,7 @@ pub(crate) fn expand_shell_glob_impl(
                 }
                 if *is_globstar {
                     // 0-level match (`a/**/b` -> `a/b`) is variant-only (zsh/bash globstar).
+                    budget.charge_alloc(dir.len())?;
                     stack.push((dir.clone(), idx + 1, depth, true));
                 }
 
@@ -618,7 +644,8 @@ pub(crate) fn expand_shell_glob_impl(
                     let is_dot = entry.name.starts_with(b".");
                     if *is_globstar {
                         // 1-level match agrees across sh, bash, zsh defaults when not a dotfile.
-                        budget.charge_alloc(dir.len() + entry.name.len() + 1)?;
+                        let next_len = dir.len() + entry.name.len() + 1;
+                        budget.charge_alloc(next_len.saturating_mul(2))?;
                         let next = join_bytes(&dir, &entry.name);
                         let one_level_variant = variant_only || is_dot;
                         stack.push((next.clone(), idx + 1, depth + 1, one_level_variant));
