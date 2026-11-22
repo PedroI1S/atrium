@@ -284,10 +284,12 @@ fn unwrap_unit_rejects_wrapper_near_misses_and_outside_wrappers() {
 
 #[test]
 fn unwrap_unit_max_wrap_boundary() {
-    // Exactly `MAX_WRAP` (8) wrappers before `cat a`: allowed.
-    let ok8 = format!("{}cat a", "command ".repeat(limits::MAX_WRAP));
+    // Review round 1 finding 3: `MAX_WRAP - 1` (7) wrappers before `cat a` stay
+    // Clear, while reaching `MAX_WRAP` (8 removals) makes the unit Unread with
+    // `MaxWrapReached` (§4).
+    let ok7 = format!("{}cat a", "command ".repeat(limits::MAX_WRAP - 1));
     let mut b = ComputeBudget::with_default_limits();
-    let lexed = lex_exact(&ok8, 0, None, &mut b).unwrap();
+    let lexed = lex_exact(&ok7, 0, None, &mut b).unwrap();
     let res = unwrap_unit(
         lexed.units.into_iter().next().unwrap(),
         &FoldRules::REV4,
@@ -295,10 +297,37 @@ fn unwrap_unit_max_wrap_boundary() {
     )
     .unwrap();
     assert_eq!(res.unread, None);
-    assert_eq!(res.unit.removed_wrappers.len(), limits::MAX_WRAP);
+    assert_eq!(res.unit.removed_wrappers.len(), limits::MAX_WRAP - 1);
     assert_eq!(res.unit.argv[0].literal_bytes(), b"cat");
 
-    // `MAX_WRAP + 1` (9) wrappers: `MaxWrapReached`.
+    let mut b7 = ComputeBudget::with_default_limits();
+    let parsed7 = build_units(&ok7, &FoldRules::REV4, &mut b7).unwrap();
+    assert!(unreads_of(&parsed7).is_empty(), "{:?}", parsed7.outcomes);
+
+    // Reaching `MAX_WRAP` (8) wrappers: `MaxWrapReached`.
+    let fail8 = format!("{}cat a", "command ".repeat(limits::MAX_WRAP));
+    let mut b = ComputeBudget::with_default_limits();
+    let lexed = lex_exact(&fail8, 0, None, &mut b).unwrap();
+    let res = unwrap_unit(
+        lexed.units.into_iter().next().unwrap(),
+        &FoldRules::REV4,
+        &mut b,
+    )
+    .unwrap();
+    assert_eq!(res.unread, Some(UnreadReason::MaxWrapReached));
+    assert_eq!(res.unit.removed_wrappers.len(), limits::MAX_WRAP);
+
+    let mut b8 = ComputeBudget::with_default_limits();
+    let parsed8 = build_units(&fail8, &FoldRules::REV4, &mut b8).unwrap();
+    assert!(
+        unreads_of(&parsed8)
+            .iter()
+            .any(|r| matches!(r, UnreadReason::MaxWrapReached)),
+        "{:?}",
+        parsed8.outcomes
+    );
+
+    // `MAX_WRAP + 1` (9) wrappers also stops at 8 removals with `MaxWrapReached`.
     let fail9 = format!("{}cat a", "command ".repeat(limits::MAX_WRAP + 1));
     let mut b = ComputeBudget::with_default_limits();
     let lexed = lex_exact(&fail9, 0, None, &mut b).unwrap();
@@ -703,7 +732,8 @@ fn build_units_and_unwrap_unit_budget_exhaustion_and_linearity() {
         Err(PartOutcome::TooLarge(Cap::Units))
     );
 
-    // Linear charge scaling for full `build_units` from 10 KB to `MAX_BYTES`.
+    // Linear compute and allocation scaling for full `build_units` from 10 KB
+    // to `MAX_BYTES`.
     let make_padded = |len: usize| -> String {
         let mut s = String::from("cat ");
         while s.len() < len {
@@ -719,15 +749,22 @@ fn build_units_and_unwrap_unit_budget_exhaustion_and_linearity() {
     let ps = build_units(&small, &FoldRules::REV4, &mut bs).unwrap();
     assert!(unreads_of(&ps).is_empty() && !has_exhausted(&ps));
     let cs = limits::COMPUTE_BUDGET_UNITS - bs.remaining_units();
+    let as_ = limits::COMPUTE_BUDGET_ALLOC_BYTES - bs.remaining_alloc_bytes();
 
     let mut bl = ComputeBudget::with_default_limits();
     let pl = build_units(&large, &FoldRules::REV4, &mut bl).unwrap();
     assert!(unreads_of(&pl).is_empty() && !has_exhausted(&pl));
     let cl = limits::COMPUTE_BUDGET_UNITS - bl.remaining_units();
+    let al = limits::COMPUTE_BUDGET_ALLOC_BYTES - bl.remaining_alloc_bytes();
 
     let ratio = (cl as f64) / (cs as f64);
+    let alloc_ratio = (al as f64) / (as_ as f64);
     assert!(
-        ratio <= len_ratio * 1.15 && ratio >= len_ratio * 0.85,
-        "build_units charge not linear: small={cs}, large={cl}, ratio={ratio:.2}, len_ratio={len_ratio:.2}"
+        ratio <= len_ratio * 1.5 && ratio >= len_ratio * 0.5,
+        "build_units compute charge not linear: small={cs}, large={cl}, ratio={ratio:.2}, len_ratio={len_ratio:.2}"
+    );
+    assert!(
+        alloc_ratio <= len_ratio * 2.0 && alloc_ratio >= len_ratio * 0.5,
+        "build_units alloc charge not linear: small={as_}, large={al}, ratio={alloc_ratio:.2}, len_ratio={len_ratio:.2}"
     );
 }

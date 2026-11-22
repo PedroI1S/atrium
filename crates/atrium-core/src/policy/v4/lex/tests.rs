@@ -622,6 +622,212 @@ fn fold_command_word_cr19_rules_and_no_unicode_normalization() {
         fold_command_word(&w2, &no_fold, &mut b).unwrap(),
         "\u{212a}sh"
     );
+
+    // Review round 1 finding 5: string-level `str::to_lowercase()` preserves
+    // contextual Greek final-sigma folding (`'ΟΣ'` -> `"ος"`, not `"οσ"`).
+    let mut b_lex = ComputeBudget::with_default_limits();
+    let lexed_sigma = lex_exact("'ΟΣ' arg", 0, None, &mut b_lex).unwrap();
+    assert!(unread_reasons(&lexed_sigma).is_empty());
+    assert_eq!(
+        fold_command_word(&lexed_sigma.units[0].argv[0], &FoldRules::REV4, &mut b_lex).unwrap(),
+        "ος"
+    );
+    for (input, rules, want) in [
+        ("/usr/bin/ΟΣ", FoldRules::REV4, "ος"),
+        ("ΟΣΑ", FoldRules::REV4, "οσα"),
+        ("Σ", FoldRules::REV4, "σ"),
+        ("ΟΣ\u{017f}", FoldRules::REV4, "οσs"),
+        ("\u{017f}ΟΣ", FoldRules::REV4, "sος"),
+        ("ΟΣ\u{212a}", no_fold, "οσ\u{212a}"),
+    ] {
+        let mut b = ComputeBudget::with_default_limits();
+        let w = Word::derived(input.as_bytes().to_vec());
+        assert_eq!(
+            fold_command_word(&w, &rules, &mut b).unwrap(),
+            want,
+            "input `{input}`"
+        );
+    }
+
+    // Unicode folding charges allocation before calling `to_lowercase()`.
+    let mut b_tight = ComputeBudget::new(1_000, 2);
+    let w_sigma = Word::derived("ΟΣ".as_bytes().to_vec());
+    assert_eq!(
+        fold_command_word(&w_sigma, &FoldRules::REV4, &mut b_tight),
+        Err(Exhausted {
+            reason: ExhaustReason::AllocationBudget
+        })
+    );
+}
+
+#[test]
+fn lex_exact_allows_permitted_quotes_and_escapes_inside_glob_class() {
+    // Review round 1 finding 6: `cat /usr/bi[n'n']` uses an allowed non-negated
+    // class and valid single quoting; accepted by sh, bash, and zsh.
+    let mut b = ComputeBudget::with_default_limits();
+    let out = lex_exact("cat /usr/bi[n'n']", 0, None, &mut b).unwrap();
+    assert!(unread_reasons(&out).is_empty(), "{:?}", out.outcomes);
+    let w = &out.units[0].argv[1];
+    assert_eq!(w.literal_bytes(), b"/usr/bi[nn]");
+    assert!(w.has_unquoted_glob());
+    assert_eq!(w.provenance()[7], ByteProvenance::Unquoted); // `[`
+    assert_eq!(w.provenance()[8], ByteProvenance::Unquoted); // `n`
+    assert_eq!(w.provenance()[9], ByteProvenance::SingleQuoted); // `'n'`
+    assert_eq!(w.provenance()[10], ByteProvenance::Unquoted); // `]`
+
+    // Double quotes and permitted escapes inside a class also retain provenance.
+    let mut b2 = ComputeBudget::with_default_limits();
+    let out_dq = lex_exact(r#"cat /usr/bi[n"n"]"#, 0, None, &mut b2).unwrap();
+    assert!(unread_reasons(&out_dq).is_empty(), "{:?}", out_dq.outcomes);
+    assert_eq!(out_dq.units[0].argv[1].literal_bytes(), b"/usr/bi[nn]");
+    assert!(out_dq.units[0].argv[1].has_unquoted_glob());
+    assert_eq!(
+        out_dq.units[0].argv[1].provenance()[9],
+        ByteProvenance::DoubleQuoted
+    );
+
+    let mut b3 = ComputeBudget::with_default_limits();
+    let out_esc = lex_exact(r"cat /usr/bi[n\n]", 0, None, &mut b3).unwrap();
+    assert!(
+        unread_reasons(&out_esc).is_empty(),
+        "{:?}",
+        out_esc.outcomes
+    );
+    assert_eq!(out_esc.units[0].argv[1].literal_bytes(), b"/usr/bi[nn]");
+    assert!(out_esc.units[0].argv[1].has_unquoted_glob());
+    assert_eq!(
+        out_esc.units[0].argv[1].provenance()[9],
+        ByteProvenance::Escaped
+    );
+
+    // Escaped `]` inside class does not close the class.
+    let mut b4 = ComputeBudget::with_default_limits();
+    let out_esc_close = lex_exact(r"cat /usr/bi[n\]a]", 0, None, &mut b4).unwrap();
+    assert!(
+        unread_reasons(&out_esc_close).is_empty(),
+        "{:?}",
+        out_esc_close.outcomes
+    );
+    assert_eq!(
+        out_esc_close.units[0].argv[1].literal_bytes(),
+        b"/usr/bi[n]a]"
+    );
+    assert_eq!(
+        out_esc_close.units[0].argv[1].provenance()[9],
+        ByteProvenance::Escaped
+    );
+
+    let mut b5 = ComputeBudget::with_default_limits();
+    let out_unclosed = lex_exact(r"cat /usr/bi[n\]]", 0, None, &mut b5).unwrap();
+    assert!(
+        unread_reasons(&out_unclosed)
+            .iter()
+            .any(|r| matches!(r, UnreadReason::UnquotedByteOutsideModel { byte: b'[' })),
+        "{:?}",
+        out_unclosed.outcomes
+    );
+
+    // Negation, empty quoted class, unclosed class, and disallowed quotes/escapes stay Unread.
+    for line in ["cat /usr/bi['!'a]", r#"cat /usr/bi["^"a]"#] {
+        let mut b = ComputeBudget::with_default_limits();
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert!(
+            unread_reasons(&out)
+                .iter()
+                .any(|r| matches!(r, UnreadReason::NegatedGlobClass)),
+            "`{line}`: {:?}",
+            out.outcomes
+        );
+    }
+    for line in [
+        r#"cat /usr/bi["$X"]"#,
+        r"cat /usr/bi[n\ ]",
+        "cat /usr/bi['x",
+    ] {
+        let mut b = ComputeBudget::with_default_limits();
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert!(
+            unread_reasons(&out)
+                .iter()
+                .any(|r| matches!(r, UnreadReason::UnsupportedQuoteOrEscape)),
+            "`{line}`: {:?}",
+            out.outcomes
+        );
+    }
+    for line in ["cat /usr/bi['']", "cat /usr/bi[n'n'"] {
+        let mut b = ComputeBudget::with_default_limits();
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert!(
+            unread_reasons(&out)
+                .iter()
+                .any(|r| matches!(r, UnreadReason::UnquotedByteOutsideModel { byte: b'[' })),
+            "`{line}`: {:?}",
+            out.outcomes
+        );
+    }
+}
+
+#[test]
+fn lex_exact_empty_quotes_suppress_keywords_and_assignments() {
+    // Review round 1 finding 7: `''if foo` is parsed as command word `"if"`,
+    // not reserved word `if`, by sh, bash, and zsh.
+    for (line, want_cmd) in [
+        ("''if foo", b"if".as_slice()),
+        (r#"""if foo"#, b"if".as_slice()),
+        ("if'' foo", b"if".as_slice()),
+        (r#"for"" x"#, b"for".as_slice()),
+        ("''while x", b"while".as_slice()),
+    ] {
+        let mut b = ComputeBudget::with_default_limits();
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert!(
+            unread_reasons(&out).is_empty(),
+            "empty-quoted keyword `{line}` must not be Unread: {:?}",
+            out.outcomes
+        );
+        assert_eq!(out.units.len(), 1, "`{line}`");
+        assert_eq!(out.units[0].argv[0].literal_bytes(), want_cmd, "`{line}`");
+    }
+
+    // Empty quotes before `=` suppress leading assignment recognition.
+    for line in [
+        "''FOO=1 cat a",
+        "FOO''=1 cat a",
+        r#"F""OO=1 cat a"#,
+        "FOO+''=1 cat a",
+    ] {
+        let mut b = ComputeBudget::with_default_limits();
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert!(
+            unread_reasons(&out).is_empty(),
+            "quoted-name `{line}` must not be Assignment: {:?}",
+            out.outcomes
+        );
+    }
+
+    // Quotes AFTER `=` (in the value) remain a leading assignment.
+    for line in ["FOO='' cat a", r#"FOO="" cat a"#, r#"FOO="bar" cat a"#] {
+        let mut b = ComputeBudget::with_default_limits();
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert!(
+            unread_reasons(&out)
+                .iter()
+                .any(|r| matches!(r, UnreadReason::Assignment)),
+            "value-quoted `{line}` must still emit Assignment: {:?}",
+            out.outcomes
+        );
+    }
+
+    // Empty quote in `2>&''-` prevents plain-unquoted close recognition.
+    let mut b = ComputeBudget::with_default_limits();
+    let out = lex_exact("cat 2>&''-", 0, None, &mut b).unwrap();
+    assert!(
+        unread_reasons(&out)
+            .iter()
+            .any(|r| matches!(r, UnreadReason::UnsupportedRedirect { .. })),
+        "{:?}",
+        out.outcomes
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +962,39 @@ fn lex_best_effort_heredocs_follow_d141_code_runner_vs_conditional_runner() {
 }
 
 #[test]
+fn lex_best_effort_sed_stdin_script_heredoc_limit_matches_dev() {
+    // Documents the round-2 D-141 Scan 7 decision limit: `sed -f -` /
+    // `sed --file=-` with a heredoc can supply an `e` command on stdin, but
+    // excluding all `ToolRowKind::ConditionalRunner` rows from Scan 7 omits
+    // that body — matching `dev`'s `reads_stdin_as_script` (and per §2, misses
+    // on Unread parts are outside the promise). Exact lexing still marks `<<`
+    // as Unread.
+    for line in [
+        "sed -f - <<EOF\n1e sudo id\nEOF",
+        "sed --file=- <<EOF\n1e sudo id\nEOF",
+    ] {
+        let mut b_be = ComputeBudget::with_default_limits();
+        let rec = lex_best_effort(&[line], &mut b_be).unwrap();
+        assert!(
+            !rec.units.iter().any(|u| u.derived),
+            "sed ConditionalRunner heredoc is intentionally not scanned as code: `{line}` -> {:?}",
+            rec.units
+        );
+
+        let mut b_ex = ComputeBudget::with_default_limits();
+        let exact = lex_exact(line, 0, None, &mut b_ex).unwrap();
+        assert!(
+            unread_reasons(&exact).iter().any(|r| matches!(
+                r,
+                UnreadReason::ReservedWordOrConstruct { construct } if construct == "<<"
+            )),
+            "exact lexer still marks heredoc Unread for `{line}`: {:?}",
+            exact.outcomes
+        );
+    }
+}
+
+#[test]
 fn brace_expand_budgeted_carries_m1_31_n11_guarantees() {
     let mut b = ComputeBudget::with_default_limits();
     assert_eq!(
@@ -792,14 +1031,17 @@ fn brace_expand_budgeted_carries_m1_31_n11_guarantees() {
         nested.len()
     );
 
-    // M1-31 review 1 finding 10: `$`-bearing words skip lower-bound shortcut.
+    // M1-31 review 1 finding 10 (review round 1 finding 8): `$`-bearing words
+    // skip the naive lower-bound shortcut because introducing `$` immediately
+    // before the next `{` suppresses its expansion; `"{,$}".repeat(9)` expands
+    // to 89 bounded results (`<= MAX_BRACE_RESULTS = 256`), not 512.
     let dollar_word = "{,$}".repeat(9);
     let mut b = ComputeBudget::with_default_limits();
-    assert!(
-        brace_expand_budgeted(&dollar_word, &mut b)
-            .unwrap()
-            .is_none()
-    );
+    let expanded = brace_expand_budgeted(&dollar_word, &mut b)
+        .unwrap()
+        .expect("9x `{,$}` produces 89 bounded results (M1-31 review 1 finding 10)");
+    assert_eq!(expanded.len(), 89);
+
     let small_dollar = "{,$}{a,b}";
     let mut b2 = ComputeBudget::with_default_limits();
     assert!(
@@ -807,6 +1049,236 @@ fn brace_expand_budgeted_carries_m1_31_n11_guarantees() {
             .unwrap()
             .is_some()
     );
+
+    // Separate genuinely overflowing cases (both non-`$` shortcut and `$`-bearing
+    // expansion exceeding `MAX_BRACE_RESULTS`).
+    let overflow_plain = "{a,b}".repeat(9);
+    let mut b3 = ComputeBudget::with_default_limits();
+    assert!(
+        brace_expand_budgeted(&overflow_plain, &mut b3)
+            .unwrap()
+            .is_none()
+    );
+    let overflow_dollar = "{,$}".repeat(12);
+    let mut b4 = ComputeBudget::with_default_limits();
+    assert!(
+        brace_expand_budgeted(&overflow_dollar, &mut b4)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn exhaustion_at_flush_preserves_pending_unit_words_and_reasons() {
+    // Review round 1 finding 1: exact failing case in `lex_exact` — scans both
+    // words, exhausts at `flush_unit`, and retains the pending unit.
+    let mut b = ComputeBudget::new(16, 10_000);
+    let out = lex_exact("sudo id", 0, None, &mut b).unwrap();
+    assert!(
+        out.outcomes.iter().any(|pr| matches!(
+            pr.outcome,
+            PartOutcome::Exhausted(ExhaustReason::ComputeBudget)
+        )),
+        "{:?}",
+        out.outcomes
+    );
+    assert_eq!(out.units.len(), 1, "pending unit must not be dropped");
+    assert_eq!(out.units[0].argv[0].literal_bytes(), b"sudo");
+    assert_eq!(out.units[0].argv[1].literal_bytes(), b"id");
+
+    // Pending unit's Unread reasons are preserved alongside its words.
+    let mut b_reasons = ComputeBudget::new(19, 10_000);
+    let out_r = lex_exact("sudo $id", 0, None, &mut b_reasons).unwrap();
+    assert!(
+        out_r.outcomes.iter().any(|pr| matches!(
+            pr.outcome,
+            PartOutcome::Exhausted(ExhaustReason::ComputeBudget)
+        )),
+        "{:?}",
+        out_r.outcomes
+    );
+    assert_eq!(out_r.units.len(), 1);
+    assert_eq!(out_r.units[0].argv[0].literal_bytes(), b"sudo");
+    assert_eq!(out_r.units[0].argv[1].literal_bytes(), b"$id");
+    assert!(
+        out_r.outcomes.iter().any(|pr| matches!(
+            pr,
+            PartResult {
+                part: PartId::Unit(UnitIndex(0)),
+                outcome: PartOutcome::Unread(UnreadReason::UnquotedByteOutsideModel { byte: b'$' })
+            }
+        )),
+        "pending unit reasons must be preserved: {:?}",
+        out_r.outcomes
+    );
+
+    // Allocation exhaustion at `flush_unit` also retains the pending unit.
+    let pre_flush_alloc = 4 * std::mem::size_of::<Word>() + 20;
+    let mut b_alloc = ComputeBudget::new(10_000, pre_flush_alloc);
+    let out_a = lex_exact("sudo id", 0, None, &mut b_alloc).unwrap();
+    assert!(out_a.outcomes.iter().any(|pr| matches!(
+        pr.outcome,
+        PartOutcome::Exhausted(ExhaustReason::AllocationBudget)
+    )));
+    assert_eq!(out_a.units.len(), 1);
+    assert_eq!(out_a.units[0].argv[0].literal_bytes(), b"sudo");
+    assert_eq!(out_a.units[0].argv[1].literal_bytes(), b"id");
+
+    // Review round 1 finding 1: best-effort `flush_builder` retains the pending
+    // unit when flushing exhausts the budget.
+    let mut b_be = ComputeBudget::new(22, 10_000);
+    let mut rec = BestEffortRecord::default();
+    let err = lex_best_effort_into(&["sudo id"], &mut rec, &mut b_be);
+    assert_eq!(
+        err,
+        Err(PartOutcome::Exhausted(ExhaustReason::ComputeBudget))
+    );
+    assert_eq!(
+        rec.units.len(),
+        1,
+        "best-effort pending unit must not be dropped at flush"
+    );
+    assert_eq!(rec.units[0].raw_argv, ["sudo", "id"]);
+    assert_eq!(rec.units[0].effective_argv, ["sudo", "id"]);
+}
+
+#[test]
+fn auxiliary_allocations_and_cold_memo_copies_are_budgeted() {
+    // Review round 1 finding 2: exact failing case — deeply nested braces grow
+    // auxiliary stack/pair vectors in both lower-bound and expansion passes, so
+    // `ComputeBudget::new(1_000_000, 200_100)` must exhaust AllocationBudget.
+    let nested = format!("{}x{}", "{".repeat(10_000), "}".repeat(10_000));
+    let mut b_tight = ComputeBudget::new(1_000_000, 200_100);
+    assert_eq!(
+        brace_expand_budgeted(&nested, &mut b_tight),
+        Err(Exhausted {
+            reason: ExhaustReason::AllocationBudget
+        })
+    );
+
+    // With default limits, the full auxiliary allocation is accounted for.
+    let mut b_def = ComputeBudget::with_default_limits();
+    assert!(
+        brace_expand_budgeted(&nested, &mut b_def)
+            .unwrap()
+            .is_some()
+    );
+    let charged_alloc = limits::COMPUTE_BUDGET_ALLOC_BYTES - b_def.remaining_alloc_bytes();
+    assert!(
+        charged_alloc > 700_000,
+        "expected auxiliary stack/pair allocations to be charged, got {charged_alloc}"
+    );
+
+    // Cold memo insertion charges its clone before copying, and is skipped
+    // (without exhausting) when the remaining budget cannot afford the cache copy.
+    let line_full = "cat memo_budget_case_alpha; echo memo_budget_case_beta";
+    let mut b_full = ComputeBudget::with_default_limits();
+    let rec_full = lex_best_effort(&[line_full], &mut b_full).unwrap();
+    let alloc_with_memo = limits::COMPUTE_BUDGET_ALLOC_BYTES - b_full.remaining_alloc_bytes();
+    let units_with_memo = limits::COMPUTE_BUDGET_UNITS - b_full.remaining_units();
+
+    // Warm hit charges identically.
+    let mut b_warm = ComputeBudget::with_default_limits();
+    let rec_warm = lex_best_effort(&[line_full], &mut b_warm).unwrap();
+    assert_eq!(rec_full, rec_warm);
+    assert_eq!(
+        limits::COMPUTE_BUDGET_UNITS - b_warm.remaining_units(),
+        units_with_memo
+    );
+    assert_eq!(
+        limits::COMPUTE_BUDGET_ALLOC_BYTES - b_warm.remaining_alloc_bytes(),
+        alloc_with_memo
+    );
+
+    // A fresh identical-length line given `alloc_with_memo - 100` bytes can
+    // finish lexing cleanly by skipping the optional memo insertion copy.
+    let line_skip = "cat memo_budget_skip_alpha; echo memo_budget_skip_beta";
+    assert_eq!(line_skip.len(), line_full.len());
+    let mut b_skip = ComputeBudget::new(units_with_memo * 2, alloc_with_memo - 100);
+    let rec_skip = lex_best_effort(&[line_skip], &mut b_skip).unwrap();
+    assert_eq!(rec_skip.units.len(), 2);
+    assert!(!b_skip.is_exhausted());
+}
+
+#[test]
+fn cached_best_effort_hits_assign_fresh_pipeline_ids() {
+    // Review round 1 finding 4: warm thread-local memo with `curl x | cat`,
+    // then lex `["curl x | cat", "echo ok | sh"]`. Both pipelines must receive
+    // distinct `PipelineId`s.
+    let mut b_warm = ComputeBudget::with_default_limits();
+    let _ = lex_best_effort(&["curl x | cat"], &mut b_warm).unwrap();
+
+    let mut b_two = ComputeBudget::with_default_limits();
+    let rec = lex_best_effort(&["curl x | cat", "echo ok | sh"], &mut b_two).unwrap();
+    let p_curl = rec
+        .units
+        .iter()
+        .find(|u| u.raw_argv == ["curl", "x"])
+        .and_then(|u| u.pipeline_id)
+        .expect("curl pipeline_id");
+    let p_cat = rec
+        .units
+        .iter()
+        .find(|u| u.raw_argv == ["cat"])
+        .and_then(|u| u.pipeline_id)
+        .expect("cat pipeline_id");
+    let p_echo = rec
+        .units
+        .iter()
+        .find(|u| u.raw_argv == ["echo", "ok"])
+        .and_then(|u| u.pipeline_id)
+        .expect("echo pipeline_id");
+    let p_sh = rec
+        .units
+        .iter()
+        .find(|u| u.raw_argv == ["sh"])
+        .and_then(|u| u.pipeline_id)
+        .expect("sh pipeline_id");
+    assert_eq!(p_curl, p_cat);
+    assert_eq!(p_echo, p_sh);
+    assert_ne!(
+        p_curl, p_echo,
+        "cached pipeline and newly parsed pipeline must not alias PipelineId"
+    );
+
+    // Two memo hits for the same text in one call must also get distinct PipelineIds.
+    let mut b_dup = ComputeBudget::with_default_limits();
+    let rec_dup = lex_best_effort(&["curl x | cat", "curl x | cat"], &mut b_dup).unwrap();
+    assert_eq!(rec_dup.units.len(), 4);
+    assert_eq!(rec_dup.units[0].pipeline_id, rec_dup.units[1].pipeline_id);
+    assert_eq!(rec_dup.units[2].pipeline_id, rec_dup.units[3].pipeline_id);
+    assert_ne!(
+        rec_dup.units[0].pipeline_id, rec_dup.units[2].pipeline_id,
+        "repeated cached texts must get distinct PipelineIds"
+    );
+
+    // Repeating a cached nested script containing a pipeline (per-call
+    // recursion cache hit) must assign distinct PipelineIds.
+    let mut b_rec = ComputeBudget::with_default_limits();
+    let rec_nested =
+        lex_best_effort(&["sh -c 'curl a | wc'; sh -c 'curl a | wc'"], &mut b_rec).unwrap();
+    let derived_pipes: Vec<(Vec<String>, Option<PipelineId>)> = rec_nested
+        .units
+        .iter()
+        .filter(|u| u.derived)
+        .map(|u| (u.effective_argv.clone(), u.pipeline_id))
+        .collect();
+    assert_eq!(derived_pipes.len(), 4, "{derived_pipes:?}");
+    assert_eq!(derived_pipes[0].1, derived_pipes[1].1);
+    assert_eq!(derived_pipes[2].1, derived_pipes[3].1);
+    assert!(derived_pipes[0].1.is_some());
+    assert_ne!(
+        derived_pipes[0].1, derived_pipes[2].1,
+        "cached nested script executions must not alias PipelineId"
+    );
+
+    // Cold vs warm equivalence across multiple texts.
+    let texts = ["curl cold_warm_p1 | cat", "echo cold_warm_p2 | sh"];
+    let mut b_c = ComputeBudget::with_default_limits();
+    let cold = lex_best_effort(&texts, &mut b_c).unwrap();
+    let mut b_w = ComputeBudget::with_default_limits();
+    let warm = lex_best_effort(&texts, &mut b_w).unwrap();
+    assert_eq!(cold, warm, "cold and warm multi-text lexing must match");
 }
 
 // ---------------------------------------------------------------------------
@@ -912,7 +1384,7 @@ fn budgets_exhaustion_preserves_early_units_and_never_allows_padded_lines() {
     assert_eq!(u1, u2, "memo hit must charge identical compute units");
     assert_eq!(a1, a2, "memo hit must charge identical alloc bytes");
 
-    let mut bm_tight = ComputeBudget::new(u1 / 2, 100_000);
+    let mut bm_tight = ComputeBudget::new(110, 100_000);
     let mut partial_rec = BestEffortRecord::default();
     let err = lex_best_effort_into(&[memo_line], &mut partial_rec, &mut bm_tight);
     assert_eq!(
@@ -950,59 +1422,110 @@ fn linear_charge_growth_from_10kb_to_max_bytes() {
         s
     };
 
+    let big_units = 200_000_000u64;
+    let big_alloc = 200 * 1024 * 1024usize;
     let small_len = 10 * 1024;
     let large_len = limits::MAX_BYTES;
     let small = make_single_unit(small_len);
     let large = make_single_unit(large_len);
     let len_ratio = (large.len() as f64) / (small.len() as f64);
 
-    // `lex_exact` charge ratio must be linear in length (single-unit & multi-unit).
-    let mut bs = ComputeBudget::with_default_limits();
+    // `lex_exact` compute and allocation scaling must be linear in length
+    // (single-unit & multi-unit).
+    let mut bs = ComputeBudget::new(big_units, big_alloc);
     let _ = lex_exact(&small, 0, None, &mut bs).unwrap();
-    let cs = limits::COMPUTE_BUDGET_UNITS - bs.remaining_units();
+    let cs = big_units - bs.remaining_units();
+    let as_ = big_alloc - bs.remaining_alloc_bytes();
 
-    let mut bl = ComputeBudget::with_default_limits();
+    let mut bl = ComputeBudget::new(big_units, big_alloc);
     let _ = lex_exact(&large, 0, None, &mut bl).unwrap();
-    let cl = limits::COMPUTE_BUDGET_UNITS - bl.remaining_units();
+    let cl = big_units - bl.remaining_units();
+    let al = big_alloc - bl.remaining_alloc_bytes();
 
     let exact_ratio = (cl as f64) / (cs as f64);
+    let exact_alloc_ratio = (al as f64) / (as_ as f64);
     assert!(
         exact_ratio <= len_ratio * 1.15 && exact_ratio >= len_ratio * 0.85,
-        "lex_exact charge not linear: small={cs}, large={cl}, ratio={exact_ratio:.2}, len_ratio={len_ratio:.2}"
+        "lex_exact compute charge not linear: small={cs}, large={cl}, ratio={exact_ratio:.2}, len_ratio={len_ratio:.2}"
+    );
+    assert!(
+        exact_alloc_ratio <= len_ratio * 1.15 && exact_alloc_ratio >= len_ratio * 0.85,
+        "lex_exact alloc charge not linear: small={as_}, large={al}, ratio={exact_alloc_ratio:.2}, len_ratio={len_ratio:.2}"
     );
 
     let m_small = make_multi_unit(small_len);
     let m_large = make_multi_unit(large_len);
     let m_len_ratio = (m_large.len() as f64) / (m_small.len() as f64);
-    let mut bms = ComputeBudget::with_default_limits();
+    let mut bms = ComputeBudget::new(big_units, big_alloc);
     let _ = lex_exact(&m_small, 0, None, &mut bms).unwrap();
-    let cms = limits::COMPUTE_BUDGET_UNITS - bms.remaining_units();
-    let mut bml = ComputeBudget::with_default_limits();
+    let cms = big_units - bms.remaining_units();
+    let ams = big_alloc - bms.remaining_alloc_bytes();
+    let mut bml = ComputeBudget::new(big_units, big_alloc);
     let _ = lex_exact(&m_large, 0, None, &mut bml).unwrap();
-    let cml = limits::COMPUTE_BUDGET_UNITS - bml.remaining_units();
+    let cml = big_units - bml.remaining_units();
+    let aml = big_alloc - bml.remaining_alloc_bytes();
     let m_ratio = (cml as f64) / (cms as f64);
+    let m_alloc_ratio = (aml as f64) / (ams as f64);
     assert!(
         m_ratio <= m_len_ratio * 1.15 && m_ratio >= m_len_ratio * 0.85,
-        "lex_exact multi-unit charge not linear: small={cms}, large={cml}, ratio={m_ratio:.2}, len_ratio={m_len_ratio:.2}"
+        "lex_exact multi-unit compute charge not linear: small={cms}, large={cml}, ratio={m_ratio:.2}, len_ratio={m_len_ratio:.2}"
+    );
+    assert!(
+        m_alloc_ratio <= m_len_ratio * 1.25 && m_alloc_ratio >= m_len_ratio * 0.75,
+        "lex_exact multi-unit alloc charge not linear: small={ams}, large={aml}, ratio={m_alloc_ratio:.2}, len_ratio={m_len_ratio:.2}"
     );
 
-    // `lex_best_effort` charge ratio must also be linear in length (including
-    // adversarial unclosed `$(` padding that would go quadratic if rescanned).
+    // Review round 1 finding 9: `lex_best_effort` compute AND allocation
+    // scaling are linear on adversarial unclosed `$(` padding (bounded by
+    // `MAX_DEPTH` with a fixed constant factor per level), measured under
+    // explicit generous budgets.
     let adv_small = format!("echo {}", "$(".repeat(small_len / 2 - 4));
     let adv_large = format!("echo {}", "$(".repeat(large_len / 2 - 4));
     let adv_len_ratio = (adv_large.len() as f64) / (adv_small.len() as f64);
 
-    let mut b_as = ComputeBudget::with_default_limits();
+    let mut b_as = ComputeBudget::new(big_units, big_alloc);
     let _ = lex_best_effort(&[&adv_small], &mut b_as).unwrap();
-    let c_as = limits::COMPUTE_BUDGET_UNITS - b_as.remaining_units();
+    let c_as = big_units - b_as.remaining_units();
+    let a_as = big_alloc - b_as.remaining_alloc_bytes();
 
-    let mut b_al = ComputeBudget::with_default_limits();
+    let mut b_al = ComputeBudget::new(big_units, big_alloc);
     let _ = lex_best_effort(&[&adv_large], &mut b_al).unwrap();
-    let c_al = limits::COMPUTE_BUDGET_UNITS - b_al.remaining_units();
+    let c_al = big_units - b_al.remaining_units();
+    let a_al = big_alloc - b_al.remaining_alloc_bytes();
 
     let be_ratio = (c_al as f64) / (c_as as f64);
+    let be_alloc_ratio = (a_al as f64) / (a_as as f64);
     assert!(
-        be_ratio <= adv_len_ratio * 1.25,
-        "lex_best_effort charge not linear on unclosed `$((`: small={c_as}, large={c_al}, ratio={be_ratio:.2}, len_ratio={adv_len_ratio:.2}"
+        be_ratio <= adv_len_ratio * 1.5 && be_ratio >= adv_len_ratio * 0.5,
+        "lex_best_effort compute charge not linear on unclosed `$(`: small={c_as}, large={c_al}, ratio={be_ratio:.2}, len_ratio={adv_len_ratio:.2}"
     );
+    assert!(
+        be_alloc_ratio <= adv_len_ratio * 2.0 && be_alloc_ratio >= adv_len_ratio * 0.5,
+        "lex_best_effort alloc charge not linear on unclosed `$(`: small={a_as}, large={a_al}, ratio={be_alloc_ratio:.2}, len_ratio={adv_len_ratio:.2}"
+    );
+
+    // Separately assert that under P0's frozen default limits this adversarial
+    // input exhausts `AllocationBudget` AND preserves units discovered before
+    // exhaustion (§8).
+    let mut b_def_plain = ComputeBudget::with_default_limits();
+    assert_eq!(
+        lex_best_effort(&[&adv_large], &mut b_def_plain),
+        Err(PartOutcome::Exhausted(ExhaustReason::AllocationBudget))
+    );
+
+    let adv_with_early = format!(
+        "cat ~/.ssh/id_rsa; echo {}",
+        "$(".repeat(large_len / 2 - 20)
+    );
+    let mut b_def = ComputeBudget::with_default_limits();
+    let mut partial = BestEffortRecord::default();
+    assert_eq!(
+        lex_best_effort_into(&[&adv_with_early], &mut partial, &mut b_def),
+        Err(PartOutcome::Exhausted(ExhaustReason::AllocationBudget))
+    );
+    assert!(
+        !partial.units.is_empty(),
+        "units found before default-budget exhaustion must be kept"
+    );
+    assert_eq!(partial.units[0].raw_argv, ["cat", "~/.ssh/id_rsa"]);
 }
