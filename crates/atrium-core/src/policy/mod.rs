@@ -17,7 +17,11 @@ mod deny;
 mod engine;
 mod gate;
 mod ledger;
+mod limits;
+mod model;
 mod shell;
+mod tools;
+mod v4;
 mod words;
 
 pub use gate::{RulesSource, SessionGateConfig, StoreRules, fs_resolve};
