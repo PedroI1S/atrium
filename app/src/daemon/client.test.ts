@@ -155,4 +155,40 @@ describe("bridge client batch receive path", () => {
 
     stop();
   });
+
+  it("logs every later error in a batch via console.error and rethrows the first", () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const stop = viewThread("t-old", (d) => {
+        if (d.type === "event") {
+          if (d.event.id === 60) throw new Error("boom-1");
+          if (d.event.id === 61) throw new Error("boom-2");
+          if (d.event.id === 62) throw new Error("boom-3");
+        }
+      });
+
+      expect(() =>
+        activeChannel!.onmessage!({
+          batch: [
+            { seq: 20, delivery: eventDelivery(60, "one") },
+            { seq: 21, delivery: eventDelivery(61, "two") },
+            { seq: 22, delivery: eventDelivery(62, "three") },
+            { seq: 23, delivery: { type: "thread_updated", summary: { ...baseSummary, title: "AfterMultipleErrors" } } },
+          ],
+        }),
+      ).toThrow("boom-1");
+
+      expect(daemon().threads["t-old"]?.title).toBe("AfterMultipleErrors");
+      expect(errSpy).toHaveBeenCalledTimes(2);
+      expect((errSpy.mock.calls[0]?.[1] as Error)?.message).toBe("boom-2");
+      expect((errSpy.mock.calls[1]?.[1] as Error)?.message).toBe("boom-3");
+
+      vi.advanceTimersByTime(16);
+      expect(ackCalls()).toEqual([23]);
+
+      stop();
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
 });

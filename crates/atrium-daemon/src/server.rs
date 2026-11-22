@@ -221,12 +221,13 @@ async fn connection(inner: Arc<Inner>, mut stream: UnixStream, _slot: OwnedSemap
 
     loop {
         let payload = tokio::select! {
+            biased;
+            () = conn.closed() => break,
             read = codec::read_client(&mut reader) => match read {
                 Ok(payload) => payload,
                 // The client left, or sent a frame that isn't one.
                 Err(_) => break,
             },
-            () = conn.closed() => break,
         };
         let Ok(message) = serde_json::from_slice::<ClientMessage>(&payload) else {
             break;
@@ -393,16 +394,6 @@ async fn feed(
             Err(error) => return broken(&conn, &thread, &error),
         };
         if page.is_empty() {
-            // Everything stored when the subscription began has been fed.
-            if !replayed {
-                let Some(frame) = done() else {
-                    return;
-                };
-                if !conn.feed(sub, None, frame).await {
-                    return;
-                }
-                replayed = true;
-            }
             let _publishing = inner.publish.lock().await;
             page = match inner
                 .store
@@ -413,8 +404,27 @@ async fn feed(
                 Err(error) => return broken(&conn, &thread, &error),
             };
             if page.is_empty() {
-                inner.hub().go_live(&conn, sub, &thread);
-                return;
+                if replayed {
+                    inner.hub().go_live(&conn, sub, &thread);
+                    return;
+                }
+                let Some(frame) = done() else {
+                    return;
+                };
+                let go = inner.hub().go_live_with_done(&conn, sub, &thread, frame);
+                match go {
+                    Ok(_) => return,
+                    Err(frame) => {
+                        // Event lane is full: wait for room without holding `publish`,
+                        // then re-check under `publish` before going live.
+                        drop(_publishing);
+                        if !conn.feed(sub, None, frame).await {
+                            return;
+                        }
+                        replayed = true;
+                        continue;
+                    }
+                }
             }
         }
         for event in page {

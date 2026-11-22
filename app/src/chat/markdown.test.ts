@@ -3,10 +3,11 @@
 // ends up holding. The DOM checks walk every node the renderer made.
 
 import { describe, expect, it, vi } from "vitest";
+import { BlockSplitter } from "./blocks";
 import { classifyImage, classifyLink } from "./links";
 import { MAX_INLINE_IMAGE_BYTES } from "./limits";
-import { type Block, type Inline, parseInline, parseMarkdown } from "./markdown";
-import { type LinkActions, renderBlocks } from "./render";
+import { type Block, type Inline, MAX_TABLE_COLUMNS, parseInline, parseMarkdown, plainText } from "./markdown";
+import { type LinkActions, blocksText, renderBlocks } from "./render";
 
 const actions = (): LinkActions & { opened: string[]; revealed: string[] } => {
   const opened: string[] = [];
@@ -21,7 +22,7 @@ function render(md: string, a: LinkActions = actions()): HTMLDivElement {
 }
 
 const ALLOWED_TAGS = new Set(["DIV", "P", "H1", "H2", "H3", "H4", "H5", "H6", "PRE", "CODE", "BLOCKQUOTE", "UL", "OL", "LI", "HR", "TABLE", "THEAD", "TBODY", "TR", "TH", "TD", "EM", "STRONG", "DEL", "BR", "A", "SPAN", "IMG", "BUTTON"]);
-const ALLOWED_ATTRS = new Set(["class", "href", "title", "rel", "alt", "src", "decoding", "start", "tabindex", "role", "type", "data-lang", "referrerpolicy", "crossorigin"]);
+const ALLOWED_ATTRS = new Set(["class", "href", "title", "rel", "alt", "src", "decoding", "start", "tabindex", "role", "type", "data-lang", "referrerpolicy", "crossorigin", "colspan"]);
 
 /** Every element is one the renderer makes, with attributes it sets, and nothing active. */
 function assertInert(root: Element): void {
@@ -237,6 +238,314 @@ describe("blocks", () => {
     parseInline("**_".repeat(10_000));
     parseInline("`".repeat(20_000));
     expect(performance.now() - start).toBeLessThan(2000);
+  });
+
+  it("malformed link destinations and titles scale linearly", () => {
+    const start = performance.now();
+    // Round-2 finding 6: unclosed `<` destination with a trailing `)`
+    parseInline("[x](<".repeat(20_000) + ")");
+    // Newline before `>` defeats a simple lastIndexOf(">") check
+    parseInline("[x](<".repeat(20_000) + "\n>)");
+    // Unclosed title quotes with a trailing `)`
+    parseInline('[x](a "'.repeat(20_000) + ")");
+    parseInline("[x](a '".repeat(20_000) + ")");
+    expect(performance.now() - start).toBeLessThan(2000);
+
+    // Valid angle-bracket destinations still parse normally.
+    const valid = parseInline('[ok](<https://example.com/a> "title")');
+    expect(valid).toEqual([
+      { t: "link", target: { kind: "web", url: "https://example.com/a" }, c: [{ t: "text", v: "ok" }] },
+    ]);
+  });
+
+  it("image openers before many links scale linearly (M1-33 finding 2)", () => {
+    const n = 32_000;
+    const src = "![".repeat(n) + "[x](https://e.co)".repeat(n);
+    const start = performance.now();
+    const out = parseInline(src);
+    expect(performance.now() - start).toBeLessThan(2000);
+    const links = out.filter((item) => item.t === "link");
+    expect(links).toHaveLength(n);
+    // Links inside image alt text remain active for the enclosing image, while
+    // links inside links still deactivate outer `[` openers.
+    const nestedImg = parseInline("![alt [b](https://b.co)](https://e.co/a.png)");
+    expect(nestedImg).toEqual([
+      { t: "image", target: { kind: "remote", url: "https://e.co/a.png" }, alt: "alt b" },
+    ]);
+  });
+
+  it("distinct unmatched backtick run lengths scale linearly (M1-33 finding 3)", () => {
+    const parts: string[] = [];
+    for (let len = 1; len <= 2400; len++) {
+      parts.push("`".repeat(len), "x");
+    }
+    const src = parts.join("");
+    const start = performance.now();
+    const out = parseInline(src);
+    expect(performance.now() - start).toBeLessThan(2000);
+    expect(out).toEqual([{ t: "text", v: src }]);
+
+    // Matched backtick runs of varying lengths still parse as code spans.
+    expect(parseInline("``a ` b`` and `c`")).toEqual([
+      { t: "code", v: "a ` b" },
+      { t: "text", v: " and " },
+      { t: "code", v: "c" },
+    ]);
+  });
+
+  it("deep inline emphasis nesting flattens without overflowing the stack (M1-33 finding 4)", () => {
+    const maxDepth = (items: Inline[]): number => {
+      let best = 0;
+      const stack: { list: Inline[]; d: number }[] = [{ list: items, d: 0 }];
+      while (stack.length > 0) {
+        const cur = stack.pop()!;
+        for (const item of cur.list) {
+          if ("c" in item) {
+            if (cur.d + 1 > best) best = cur.d + 1;
+            stack.push({ list: item.c, d: cur.d + 1 });
+          }
+        }
+      }
+      return best;
+    };
+
+    const stars = "*".repeat(12_000) + "x" + "*".repeat(12_000);
+    const parsedStars = parseInline(stars);
+    expect(plainText(parsedStars)).toBe("x");
+    expect(maxDepth(parsedStars)).toBeLessThanOrEqual(20);
+    expect(() => render(stars)).not.toThrow();
+
+    const spaced = "*a ".repeat(12_000) + "x" + " a*".repeat(12_000);
+    const start = performance.now();
+    const parsedSpaced = parseInline(spaced);
+    expect(performance.now() - start).toBeLessThan(2000);
+    expect(maxDepth(parsedSpaced)).toBeLessThanOrEqual(20);
+    expect(plainText(parsedSpaced)).toContain("x");
+  });
+
+  it("malformed link prefixes never disable later valid links (M1-33 finding 5)", () => {
+    const anglePrefix = "[x](<".repeat(1000) + ">X [ok](file:///tmp/a)";
+    const angleOut = parseInline(anglePrefix);
+    expect(angleOut.find((item) => item.t === "link")).toEqual({
+      t: "link",
+      target: { kind: "file", path: "/tmp/a" },
+      c: [{ t: "text", v: "ok" }],
+    });
+
+    const start = performance.now();
+    const bigAngle = "[x](<".repeat(20_000) + ">X [ok](file:///tmp/a)";
+    const bigAngleOut = parseInline(bigAngle);
+    const bigParenTitle = "[x](a (".repeat(20_000) + ")X [ok](file:///tmp/b)";
+    const bigParenOut = parseInline(bigParenTitle);
+    expect(performance.now() - start).toBeLessThan(2000);
+
+    expect(bigAngleOut.find((item) => item.t === "link")).toEqual({
+      t: "link",
+      target: { kind: "file", path: "/tmp/a" },
+      c: [{ t: "text", v: "ok" }],
+    });
+    expect(bigParenOut.find((item) => item.t === "link")).toEqual({
+      t: "link",
+      target: { kind: "file", path: "/tmp/b" },
+      c: [{ t: "text", v: "ok" }],
+    });
+  });
+
+  it("bare URLs with many unmatched closing parentheses scale linearly (M1-33 round 2 finding 2)", () => {
+    const n = 100_000;
+    const src = "https://e.co/" + ")".repeat(n);
+    const start = performance.now();
+    const out = parseInline(src);
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(out).toEqual([
+      { t: "link", target: { kind: "web", url: "https://e.co/" }, c: [{ t: "text", v: "https://e.co/" }] },
+      { t: "text", v: ")".repeat(n) },
+    ]);
+
+    // Balanced parentheses stay in the URL; unbalanced trailing ones and sentence punctuation are trimmed.
+    expect(parseInline("see (https://example.com/a_(b)), ok.")).toEqual([
+      { t: "text", v: "see (" },
+      {
+        t: "link",
+        target: { kind: "web", url: "https://example.com/a_(b)" },
+        c: [{ t: "text", v: "https://example.com/a_(b)" }],
+      },
+      { t: "text", v: "), ok." },
+    ]);
+    expect(parseInline("https://example.com/a_((b)).")).toEqual([
+      {
+        t: "link",
+        target: { kind: "web", url: "https://example.com/a_((b))" },
+        c: [{ t: "text", v: "https://example.com/a_((b))" }],
+      },
+      { t: "text", v: "." },
+    ]);
+    expect(parseInline("https://example.com/a_(b).),")).toEqual([
+      {
+        t: "link",
+        target: { kind: "web", url: "https://example.com/a_(b)" },
+        c: [{ t: "text", v: "https://example.com/a_(b)" }],
+      },
+      { t: "text", v: ".)," },
+    ]);
+  });
+
+  it("headings and table delimiters with long whitespace runs scale linearly (M1-33 round 2 finding 3)", () => {
+    const n = 60_000;
+    const headingSrc = "# x" + " ".repeat(n) + "x";
+    const tableSrc = "a|b\n---" + " ".repeat(n) + "x";
+    const start = performance.now();
+    const headingBlocks = parseMarkdown(headingSrc);
+    const tableBlocks = parseMarkdown(tableSrc);
+    expect(performance.now() - start).toBeLessThan(1000);
+
+    expect(headingBlocks).toEqual([{ t: "h", level: 1, c: [{ t: "text", v: "x" + " ".repeat(n) + "x" }] }]);
+    expect(tableBlocks).toEqual([{ t: "p", c: [{ t: "text", v: tableSrc }] }]);
+
+    // ATX heading edge cases (closing `#` sequences, levels, indentation).
+    expect(parseMarkdown("# Title ###")).toEqual([{ t: "h", level: 1, c: [{ t: "text", v: "Title" }] }]);
+    expect(parseMarkdown("## Title   ###  ")).toEqual([{ t: "h", level: 2, c: [{ t: "text", v: "Title" }] }]);
+    expect(parseMarkdown("### foo###")).toEqual([{ t: "h", level: 3, c: [{ t: "text", v: "foo###" }] }]);
+    expect(parseMarkdown("# ###")).toEqual([{ t: "h", level: 1, c: [] }]);
+    expect(parseMarkdown("#")).toEqual([{ t: "h", level: 1, c: [] }]);
+    expect(parseMarkdown("####### not heading")).toEqual([
+      { t: "p", c: [{ t: "text", v: "####### not heading" }] },
+    ]);
+    expect(parseMarkdown("    # indented")).toEqual([{ t: "p", c: [{ t: "text", v: " # indented" }] }]);
+
+    // Table delimiter edge cases (valid alignments and rejected malformed delimiters).
+    const plainTable = parseMarkdown("a | b\n--- | ---\n1 | 2");
+    expect(plainTable).toMatchObject([{ t: "table", align: [null, null] }]);
+    const alignedTable = parseMarkdown("| a | b |\n| :---: | --: |\n| 1 | 2 |");
+    expect(alignedTable).toMatchObject([{ t: "table", align: ["center", "right"] }]);
+    expect(parseMarkdown("a | b\n|---||---|").map((b) => b.t)).toEqual(["p"]);
+    expect(parseMarkdown("a | b\n|---| |").map((b) => b.t)).toEqual(["p"]);
+    expect(parseMarkdown("a | b\n   |   ").map((b) => b.t)).toEqual(["p"]);
+  });
+
+  it("multiline soft line breaks scale linearly, including through BlockSplitter (M1-33 round 3 finding 1)", () => {
+    const lines = 160_000;
+    const src = "a\n".repeat(lines);
+    const start = performance.now();
+    const direct = parseMarkdown(src);
+    expect(performance.now() - start).toBeLessThan(1500);
+    expect(direct).toEqual([{ t: "p", c: [{ t: "text", v: src.slice(0, -1) }] }]);
+
+    // Input delivered through BlockSplitter as one folded multiline delta.
+    const splitter = new BlockSplitter();
+    const splitStart = performance.now();
+    splitter.feed(src);
+    splitter.seal();
+    const parsedBlocks = splitter.blocks.flatMap((b) => parseMarkdown(b.text));
+    expect(performance.now() - splitStart).toBeLessThan(1500);
+    expect(splitter.blocks.length).toBeGreaterThanOrEqual(1);
+    expect(parsedBlocks).toEqual([{ t: "p", c: [{ t: "text", v: src.slice(0, -1) }] }]);
+
+    // Soft-break trailing single space trimming, hard breaks (2+ spaces or `\`), and leading space trimming.
+    expect(parseInline("a \n  b")).toEqual([{ t: "text", v: "a\nb" }]);
+    expect(parseInline("a  \n  b")).toEqual([{ t: "text", v: "a" }, { t: "br" }, { t: "text", v: "b" }]);
+    expect(parseInline("a    \nb")).toEqual([{ t: "text", v: "a" }, { t: "br" }, { t: "text", v: "b" }]);
+    expect(parseInline("  \nb")).toEqual([{ t: "br" }, { t: "text", v: "b" }]);
+    expect(parseInline("a  \\\nb")).toEqual([{ t: "text", v: "a  " }, { t: "br" }, { t: "text", v: "b" }]);
+    expect(parseInline("a  ")).toEqual([{ t: "text", v: "a  " }]);
+  });
+
+  it("short table rows keep trailing empty cells in rendered DOM and copied text (M1-33 round 4 finding 1)", () => {
+    const src = "a|b|c\n-|-|-\n1|2\n3|4|5";
+    const blocks = parseMarkdown(src);
+    expect(blocks).toHaveLength(1);
+    const table = blocks[0] as Extract<Block, { t: "table" }>;
+    expect(table.t).toBe("table");
+    expect(table.head).toHaveLength(3);
+    // Parsed rows stay compact (no trailing empty-cell padding in the AST).
+    expect(table.rows[0]).toEqual([[{ t: "text", v: "1" }], [{ t: "text", v: "2" }]]);
+    expect(table.rows[1]).toEqual([
+      [{ t: "text", v: "3" }],
+      [{ t: "text", v: "4" }],
+      [{ t: "text", v: "5" }],
+    ]);
+
+    const div = render(src);
+    const bodyRows = [...div.querySelectorAll("tbody tr")];
+    expect(bodyRows).toHaveLength(2);
+    const firstCells = [...bodyRows[0]!.querySelectorAll("td")];
+    expect(firstCells.map((td) => td.textContent)).toEqual(["1", "2", ""]);
+    expect(firstCells[2]!.hasAttribute("colspan")).toBe(false);
+    const secondCells = [...bodyRows[1]!.querySelectorAll("td")];
+    expect(secondCells.map((td) => td.textContent)).toEqual(["3", "4", "5"]);
+    expect(blocksText(blocks)).toBe("a\tb\tc\n1\t2\t\n3\t4\t5");
+    assertInert(div);
+
+    // Multiple missing trailing cells span the remaining columns with one `<td colspan=k>`
+    // and preserve every trailing tab in copied text.
+    const multiSrc = "a|b|c|d\n-|-|-|--:\n1|2\n3|4|5|6";
+    const multiBlocks = parseMarkdown(multiSrc);
+    const multiDiv = render(multiSrc);
+    const multiFirst = [...multiDiv.querySelectorAll("tbody tr")[0]!.querySelectorAll("td")];
+    expect(multiFirst.map((td) => td.textContent)).toEqual(["1", "2", ""]);
+    expect(multiFirst[2]!.colSpan).toBe(2);
+    expect(multiFirst[2]!.getAttribute("colspan")).toBe("2");
+    expect(multiFirst.reduce((sum, td) => sum + td.colSpan, 0)).toBe(4);
+    expect(blocksText(multiBlocks)).toBe("a\tb\tc\td\n1\t2\t\t\n3\t4\t5\t6");
+    assertInert(multiDiv);
+  });
+
+  it("wide tables with many short rows and autolink opener floods scale linearly (M1-33 round 3 audit)", () => {
+    const cols = 4_000;
+    const rowCount = 4_000;
+    const header = Array.from({ length: cols }, () => "h").join("|");
+    const delim = Array.from({ length: cols }, () => "-").join("|");
+    const body = "a|b\n".repeat(rowCount);
+    const tableSrc = `${header}\n${delim}\n${body}`;
+
+    const start = performance.now();
+    const blocks = parseMarkdown(tableSrc);
+    const copied = blocksText(blocks);
+    const angleOut = parseInline("<".repeat(100_000));
+    expect(performance.now() - start).toBeLessThan(2000);
+
+    expect(blocks).toHaveLength(1);
+    const table = blocks[0] as Extract<Block, { t: "table" }>;
+    expect(table.t).toBe("table");
+    expect(table.head).toHaveLength(MAX_TABLE_COLUMNS);
+    expect(table.align).toHaveLength(MAX_TABLE_COLUMNS);
+    expect(plainText(table.head[MAX_TABLE_COLUMNS - 1]!)).toBe(
+      Array.from({ length: cols - MAX_TABLE_COLUMNS + 1 }, () => "h").join(" | "),
+    );
+    expect(table.rows).toHaveLength(rowCount);
+    expect(table.rows[0]).toEqual([[{ t: "text", v: "a" }], [{ t: "text", v: "b" }]]);
+    const copiedLines = copied.split("\n");
+    expect(copiedLines).toHaveLength(rowCount + 1);
+    expect(copiedLines[1]).toBe(`a\tb${"\t".repeat(MAX_TABLE_COLUMNS - 2)}`);
+    expect(angleOut).toEqual([{ t: "text", v: "<".repeat(100_000) }]);
+
+    // Rendering a wide table with short rows emits one trailing `<td colspan=k>` per row (O(n) DOM nodes).
+    const renderRows = 400;
+    const renderStart = performance.now();
+    const wideDiv = render(`${header}\n${delim}\n${"a|b\n".repeat(renderRows)}`);
+    expect(performance.now() - renderStart).toBeLessThan(2000);
+    expect(wideDiv.querySelectorAll("thead th")).toHaveLength(MAX_TABLE_COLUMNS);
+    expect(wideDiv.querySelectorAll("tbody tr")).toHaveLength(renderRows);
+    expect(wideDiv.querySelectorAll("tbody td")).toHaveLength(renderRows * 3);
+    const wideFirstTds = [...wideDiv.querySelectorAll("tbody tr")[0]!.querySelectorAll("td")];
+    expect(wideFirstTds[2]!.colSpan).toBe(MAX_TABLE_COLUMNS - 2);
+    assertInert(wideDiv);
+
+    // Extra header and body cells past MAX_TABLE_COLUMNS degrade to plain text in the last column,
+    // while body cells past the original header column count are still dropped per GFM.
+    const overCols = MAX_TABLE_COLUMNS + 2;
+    const overHeader = Array.from({ length: overCols }, (_, idx) => (idx === MAX_TABLE_COLUMNS ? "*extra*" : `h${idx}`)).join("|");
+    const overDelim = Array.from({ length: overCols }, () => "-").join("|");
+    const overRow = Array.from({ length: overCols + 2 }, (_, idx) => `c${idx}`).join("|");
+    const overBlocks = parseMarkdown(`${overHeader}\n${overDelim}\n${overRow}`);
+    const overTable = overBlocks[0] as Extract<Block, { t: "table" }>;
+    expect(overTable.head).toHaveLength(MAX_TABLE_COLUMNS);
+    expect(overTable.head[MAX_TABLE_COLUMNS - 1]).toEqual([
+      { t: "text", v: `h${MAX_TABLE_COLUMNS - 1} | *extra* | h${MAX_TABLE_COLUMNS + 1}` },
+    ]);
+    expect(overTable.rows[0]![MAX_TABLE_COLUMNS - 1]).toEqual([
+      { t: "text", v: `c${MAX_TABLE_COLUMNS - 1} | c${MAX_TABLE_COLUMNS} | c${MAX_TABLE_COLUMNS + 1}` },
+    ]);
   });
 });
 

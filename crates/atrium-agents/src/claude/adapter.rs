@@ -46,7 +46,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atrium_host::supervise::{self, ProcessIdentity, SupervisedChild};
@@ -54,8 +54,8 @@ use atrium_protocol::agent::{
     AgentEvent, AgentEventEnvelope, ApprovalDecision, Provider, QuestionAnswer, SessionCommand,
 };
 use atrium_protocol::limits::{
-    MAX_DIAGNOSTIC_LINE_BYTES, MAX_PARTIAL_ARGS_BYTES, MAX_PROVIDER_RECORD_BYTES,
-    TERMINAL_TAIL_EVENTS,
+    MAX_DIAGNOSTIC_LINE_BYTES, MAX_PARTIAL_ARGS_BYTES, MAX_PENDING_REQUESTS,
+    MAX_PROVIDER_RECORD_BYTES, TERMINAL_TAIL_EVENTS,
 };
 use atrium_protocol::policy::{
     ClassCoverage, Coverage, EnforcementDescriptor, EnforcementReason, ReasonCode, ToolClass,
@@ -63,9 +63,9 @@ use atrium_protocol::policy::{
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
-use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
+use tokio::time::{Instant as TokioInstant, sleep_until, timeout, timeout_at};
 
 use super::normalizer::{ClaudeNormalizer, DEADLINE_INTERRUPT, DEADLINE_RECORD_TOO_LARGE};
 use super::settings::{InspectInput, Inspection, inspect};
@@ -83,6 +83,9 @@ const ASK_USER_QUESTION: &str = "AskUserQuestion";
 /// Events held back when the client is not reading, before the adapter stops
 /// reading the provider (the pipe then applies backpressure to Claude Code).
 const PENDING_LIMIT: usize = 4096;
+/// Maximum number of inner `gate.check` / `gate.question_ticket` calls (and
+/// their compensation withdrawals) that may be outstanding at once.
+const MAX_IN_FLIGHT_GATE_CALLS: usize = MAX_PENDING_REQUESTS;
 /// How often a provider that closed nothing is checked for being gone (a
 /// grandchild can keep its pipes open after it exited).
 const ALIVE_POLL: Duration = Duration::from_millis(500);
@@ -325,6 +328,7 @@ enum Out {
 enum Ev {
     Command(Option<SessionCommand>),
     Internal(Box<Internal>),
+    Withdraw(ApprovalTicket, Option<OwnedSemaphorePermit>),
     InterruptDeadline,
     Flushed,
     ConsumerGone,
@@ -338,6 +342,7 @@ enum Internal {
         check: ToolCheck,
         decision: GateDecision,
         failed: bool,
+        permit: Option<OwnedSemaphorePermit>,
     },
     Redeem {
         native: String,
@@ -352,7 +357,108 @@ enum Internal {
         ticket: Option<ApprovalTicket>,
         input: Value,
         failed: bool,
+        permit: Option<OwnedSemaphorePermit>,
     },
+}
+
+struct InFlightCheck {
+    count: Arc<AtomicUsize>,
+    settled: Arc<Notify>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl InFlightCheck {
+    fn try_enter(
+        permits: &Arc<Semaphore>,
+        count: &Arc<AtomicUsize>,
+        settled: &Arc<Notify>,
+    ) -> Option<Self> {
+        let permit = permits.clone().try_acquire_owned().ok()?;
+        count.fetch_add(1, Ordering::AcqRel);
+        Some(Self {
+            count: count.clone(),
+            settled: settled.clone(),
+            permit: Some(permit),
+        })
+    }
+
+    fn take_permit(&mut self) -> Option<OwnedSemaphorePermit> {
+        self.permit.take()
+    }
+
+    fn restore_permit(&mut self, permit: Option<OwnedSemaphorePermit>) {
+        self.permit = permit;
+    }
+}
+
+impl Drop for InFlightCheck {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.settled.notify_waiters();
+        }
+    }
+}
+
+struct OrphanGuard {
+    ticket: Option<ApprovalTicket>,
+    withdraw_tx: mpsc::UnboundedSender<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
+    gate: Arc<dyn ToolGate>,
+    in_flight: Option<InFlightCheck>,
+}
+
+impl OrphanGuard {
+    fn arm(
+        ticket: Option<ApprovalTicket>,
+        withdraw_tx: mpsc::UnboundedSender<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
+        gate: Arc<dyn ToolGate>,
+        in_flight: Option<InFlightCheck>,
+    ) -> Self {
+        Self {
+            ticket,
+            withdraw_tx,
+            gate,
+            in_flight,
+        }
+    }
+
+    fn set_ticket(&mut self, ticket: Option<ApprovalTicket>) {
+        self.ticket = ticket;
+    }
+
+    fn take_permit(&mut self) -> Option<OwnedSemaphorePermit> {
+        self.in_flight.as_mut().and_then(InFlightCheck::take_permit)
+    }
+
+    fn restore_permit(&mut self, permit: Option<OwnedSemaphorePermit>) {
+        if let Some(in_flight) = self.in_flight.as_mut() {
+            in_flight.restore_permit(permit);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.ticket = None;
+    }
+}
+
+impl Drop for OrphanGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self.in_flight.take();
+        if let Some(ticket) = self.ticket.take() {
+            let permit = in_flight.as_mut().and_then(InFlightCheck::take_permit);
+            if let Err(mpsc::error::SendError((ticket, permit))) =
+                self.withdraw_tx.send((ticket, permit))
+                && let Ok(handle) = tokio::runtime::Handle::try_current()
+            {
+                let gate = self.gate.clone();
+                handle.spawn(async move {
+                    let _keep_inflight = in_flight;
+                    let _keep_permit = permit;
+                    gate.withdraw(&ticket).await;
+                });
+            }
+        }
+    }
 }
 
 /// What to do with a gate decision.
@@ -386,6 +492,7 @@ enum Req {
 struct PendingApproval {
     native: String,
     ticket: ApprovalTicket,
+    permit: Option<OwnedSemaphorePermit>,
     tool_use_id: Option<String>,
     name: String,
     input: Value,
@@ -447,6 +554,9 @@ fn terminate_now(mut child: SupervisedChild) {
     let _ = supervise::terminate_blocking(&mut child, Duration::ZERO);
 }
 
+/// A hook `ask`: `(tool_use_id, ticket, permit)`.
+type HookAsked = (Option<String>, ApprovalTicket, Option<OwnedSemaphorePermit>);
+
 struct Actor {
     config: SessionConfig,
     options: ClaudeOptions,
@@ -462,6 +572,8 @@ struct Actor {
     commands_rx: Option<mpsc::Receiver<SessionCommand>>,
     internal_tx: mpsc::UnboundedSender<Internal>,
     internal_rx: mpsc::UnboundedReceiver<Internal>,
+    withdraw_tx: mpsc::UnboundedSender<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
+    withdraw_rx: mpsc::UnboundedReceiver<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
     pending: VecDeque<AgentEventEnvelope>,
     /// Closing events queued since the session began ending.
     closing: usize,
@@ -474,9 +586,16 @@ struct Actor {
     shutting_down: bool,
     /// In-flight gate calls; aborted when the session ends.
     gates: JoinSet<()>,
+    /// Admission bound on inner `gate.check` / `gate.question_ticket` calls
+    /// (including cancelled/timed-out calls still running or awaiting withdrawal).
+    gate_permits: Arc<Semaphore>,
+    /// Number of inner `gate.check` / `gate.question_ticket` tasks still running
+    /// or holding an unclaimed `OrphanGuard`, so shutdown drains their withdrawals.
+    gate_in_flight: Arc<AtomicUsize>,
+    gate_settled: Arc<Notify>,
 
-    /// Gate keys the hook answered `ask` for, with `(tool_use_id, ticket)`.
-    hook_asked: HashMap<String, VecDeque<(Option<String>, ApprovalTicket)>>,
+    /// Gate keys the hook answered `ask` for, with `(tool_use_id, ticket, permit)`.
+    hook_asked: HashMap<String, VecDeque<HookAsked>>,
     /// Requests of the provider (hook calls and `can_use_tool`, by its own
     /// ids) not answered yet. An answer for one that is not here is never
     /// sent: it was withdrawn, or its turn ended.
@@ -485,12 +604,13 @@ struct Actor {
     inflight: HashMap<Req, AbortHandle>,
     approvals: HashMap<String, PendingApproval>,
     /// Approvals currently in flight for `gate.redeem`, by native `can_use_tool` id.
-    redeeming: HashMap<String, ApprovalTicket>,
-    /// Questions waiting for an answer, by ticket id: (native id, input).
-    questions: HashMap<String, (String, Value)>,
+    redeeming: HashMap<String, (ApprovalTicket, Option<OwnedSemaphorePermit>)>,
+    /// Questions waiting for an answer, by ticket id: (native id, input, permit).
+    questions: HashMap<String, (String, Value, Option<OwnedSemaphorePermit>)>,
     /// Tickets withdrawn by the provider, turn end, or unmatched hook `Ask`,
-    /// drained asynchronously via `ToolGate::withdraw`.
-    pending_withdrawals: Vec<ApprovalTicket>,
+    /// drained asynchronously via `ToolGate::withdraw` (retaining any inner
+    /// gate permit until compensation settles).
+    pending_withdrawals: Vec<(ApprovalTicket, Option<OwnedSemaphorePermit>)>,
 
     mcp_dir: Option<TempDir>,
     mcp_path: PathBuf,
@@ -521,6 +641,7 @@ impl Actor {
         let mcp_path = dir.join("mcp.json");
         write_private(&mcp_path, mcp_config(&config).to_string().as_bytes())?;
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
+        let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel();
         Ok(Self {
             gate: config.gate.clone(),
             config,
@@ -534,6 +655,8 @@ impl Actor {
             commands_rx: Some(commands_rx),
             internal_tx,
             internal_rx,
+            withdraw_tx,
+            withdraw_rx,
             pending: VecDeque::new(),
             closing: 0,
             finishing: false,
@@ -543,6 +666,9 @@ impl Actor {
             queue: VecDeque::new(),
             shutting_down: false,
             gates: JoinSet::new(),
+            gate_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_GATE_CALLS)),
+            gate_in_flight: Arc::new(AtomicUsize::new(0)),
+            gate_settled: Arc::new(Notify::new()),
             hook_asked: HashMap::new(),
             live: HashSet::new(),
             inflight: HashMap::new(),
@@ -888,6 +1014,7 @@ impl Actor {
                     biased;
                     cmd = commands_rx.recv() => Ev::Command(cmd),
                     Some(msg) = self.internal_rx.recv() => Ev::Internal(Box::new(msg)),
+                    Some((ticket, permit)) = self.withdraw_rx.recv() => Ev::Withdraw(ticket, permit),
                     _ = sleep_until(deadline.unwrap_or_else(TokioInstant::now)), if deadline.is_some() => Ev::InterruptDeadline,
                     permit = self.events_tx.reserve(), if flush => match permit {
                         Ok(p) => {
@@ -909,6 +1036,7 @@ impl Actor {
                     break;
                 }
                 Ev::Internal(msg) => self.on_internal(*msg),
+                Ev::Withdraw(ticket, permit) => self.queue_withdraw(ticket, permit),
                 Ev::InterruptDeadline => {
                     // The child ignored the interrupt: the session ends and
                     // the daemon resumes it in a new incarnation.
@@ -946,6 +1074,12 @@ impl Actor {
             }
         }
         self.clear_requests();
+        while self.gates.join_next().await.is_some() {}
+        // Close `internal_rx` and `withdraw_rx` before the final drain so late
+        // `OrphanGuard` drops after the shutdown wait take the direct withdrawal
+        // fallback instead of queuing into a channel that will never be read again.
+        self.internal_rx.close();
+        self.withdraw_rx.close();
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.commands_rx = None;
@@ -979,6 +1113,10 @@ impl Actor {
         // wrote while winding down must not use it up.
         self.finishing = true;
         self.clear_requests();
+        while self.gates.join_next().await.is_some() {}
+        self.wait_for_in_flight_gates().await;
+        self.internal_rx.close();
+        self.withdraw_rx.close();
         self.drain_internal_withdrawals();
         self.drain_withdrawals().await;
         self.feed(AdapterInput::Exit { code });
@@ -987,17 +1125,53 @@ impl Actor {
         self.mcp_dir = None;
     }
 
-    fn queue_withdraw(&mut self, ticket: ApprovalTicket) {
-        self.pending_withdrawals.push(ticket);
+    fn queue_withdraw(&mut self, ticket: ApprovalTicket, permit: Option<OwnedSemaphorePermit>) {
+        self.pending_withdrawals.push((ticket, permit));
+    }
+
+    async fn wait_for_in_flight_gates(&self) {
+        // Bound the shutdown wait so a hung/unanswered gate (e.g. an abandoned
+        // check on a finished turn) never blocks SessionEnded past shutdown
+        // deadlines; slower gates still withdraw via OrphanGuard::drop.
+        let cap = self.options.gate_deadline.min(Duration::from_millis(500));
+        let deadline = TokioInstant::now() + cap;
+        while self.gate_in_flight.load(Ordering::Acquire) > 0 {
+            let notified = self.gate_settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.gate_in_flight.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            if timeout_at(deadline, notified).await.is_err() {
+                break;
+            }
+        }
     }
 
     async fn drain_withdrawals(&mut self) {
+        while let Ok((ticket, permit)) = self.withdraw_rx.try_recv() {
+            self.pending_withdrawals.push((ticket, permit));
+        }
         let tickets = std::mem::take(&mut self.pending_withdrawals);
-        let deadline = self.options.gate_deadline;
-        for ticket in tickets {
+        if tickets.is_empty() {
+            return;
+        }
+        let mut handles = Vec::with_capacity(tickets.len());
+        for (ticket, permit) in tickets {
             let gate = self.gate.clone();
-            let inner = tokio::spawn(async move { gate.withdraw(&ticket).await });
-            let _ = guarded(deadline, inner).await;
+            handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                gate.withdraw(&ticket).await;
+            }));
+        }
+        let deadline = TokioInstant::now() + self.options.gate_deadline;
+        for handle in handles {
+            if timeout_at(deadline, handle).await.is_err() {
+                // Keep unfinished withdrawals running in the background with
+                // their permits so compensation settles and capacity stays
+                // reserved until `gate.withdraw` completes.
+                break;
+            }
         }
     }
 
@@ -1006,15 +1180,17 @@ impl Actor {
             match msg {
                 Internal::Gate {
                     decision: GateDecision::Ask { ticket },
+                    permit,
                     ..
-                } => self.queue_withdraw(ticket),
+                } => self.queue_withdraw(ticket, permit),
                 Internal::Question {
                     ticket: Some(ticket),
+                    permit,
                     ..
-                } => self.queue_withdraw(ticket),
-                Internal::Redeem {
-                    ticket, decision, ..
-                } if !matches!(decision, GateDecision::Allow) => self.queue_withdraw(ticket),
+                } => self.queue_withdraw(ticket, permit),
+                Internal::Redeem { .. } => {
+                    // `clear_requests()` already drained `self.redeeming` with its permit.
+                }
                 _ => {}
             }
         }
@@ -1026,8 +1202,8 @@ impl Actor {
             let mut i = 0;
             while i < queue.len() {
                 if queue[i].0.as_deref() == Some(call_id) {
-                    if let Some((_, ticket)) = queue.remove(i) {
-                        withdrawn.push(ticket);
+                    if let Some((_, ticket, permit)) = queue.remove(i) {
+                        withdrawn.push((ticket, permit));
                     }
                 } else {
                     i += 1;
@@ -1035,8 +1211,8 @@ impl Actor {
             }
             !queue.is_empty()
         });
-        for ticket in withdrawn {
-            self.queue_withdraw(ticket);
+        for (ticket, permit) in withdrawn {
+            self.queue_withdraw(ticket, permit);
         }
     }
 
@@ -1045,22 +1221,25 @@ impl Actor {
         self.gates.abort_all();
         self.inflight.clear();
         for (_, queue) in self.hook_asked.drain() {
-            for (_, ticket) in queue {
-                self.pending_withdrawals.push(ticket);
+            for (_, ticket, permit) in queue {
+                self.pending_withdrawals.push((ticket, permit));
             }
         }
         self.live.clear();
         for (_, a) in self.approvals.drain() {
-            self.pending_withdrawals.push(a.ticket);
+            self.pending_withdrawals.push((a.ticket, a.permit));
         }
-        for (_, ticket) in self.redeeming.drain() {
-            self.pending_withdrawals.push(ticket);
+        for (_, (ticket, permit)) in self.redeeming.drain() {
+            self.pending_withdrawals.push((ticket, permit));
         }
-        for (request_id, _) in self.questions.drain() {
-            self.pending_withdrawals.push(ApprovalTicket {
-                request_id,
-                rememberable: false,
-            });
+        for (request_id, (_, _, permit)) in self.questions.drain() {
+            self.pending_withdrawals.push((
+                ApprovalTicket {
+                    request_id,
+                    rememberable: false,
+                },
+                permit,
+            ));
         }
     }
 
@@ -1134,28 +1313,31 @@ impl Actor {
         let mut withdrawn = Vec::new();
         self.approvals.retain(|_, a| {
             if a.native == native {
-                withdrawn.push(a.ticket.clone());
+                withdrawn.push((a.ticket.clone(), a.permit.take()));
                 false
             } else {
                 true
             }
         });
-        if let Some(ticket) = self.redeeming.remove(native) {
-            withdrawn.push(ticket);
+        if let Some((ticket, permit)) = self.redeeming.remove(native) {
+            withdrawn.push((ticket, permit));
         }
-        self.questions.retain(|request_id, (n, _)| {
+        self.questions.retain(|request_id, (n, _, permit)| {
             if n == native {
-                withdrawn.push(ApprovalTicket {
-                    request_id: request_id.clone(),
-                    rememberable: false,
-                });
+                withdrawn.push((
+                    ApprovalTicket {
+                        request_id: request_id.clone(),
+                        rememberable: false,
+                    },
+                    permit.take(),
+                ));
                 false
             } else {
                 true
             }
         });
-        for ticket in withdrawn {
-            self.queue_withdraw(ticket);
+        for (ticket, permit) in withdrawn {
+            self.queue_withdraw(ticket, permit);
         }
     }
 
@@ -1243,12 +1425,13 @@ impl Actor {
             return;
         }
         let key = gate_key(tool_use_id.as_deref(), name, &input);
-        if let Some(ticket) = self.take_hook_ticket(&key) {
+        if let Some((ticket, permit)) = self.take_hook_ticket(&key) {
             self.approvals.insert(
                 ticket.request_id.clone(),
                 PendingApproval {
                     native: request_id,
                     ticket,
+                    permit,
                     tool_use_id,
                     name: name.to_owned(),
                     input,
@@ -1272,20 +1455,69 @@ impl Actor {
     }
 
     fn spawn_gate(&mut self, reply: Reply, check: ToolCheck) {
+        let Some(in_flight) =
+            InFlightCheck::try_enter(&self.gate_permits, &self.gate_in_flight, &self.gate_settled)
+        else {
+            let decision = GateDecision::Deny {
+                reason: "too many pending gate checks".into(),
+            };
+            self.feed(AdapterInput::Gate {
+                check: check.clone(),
+                decision: decision.clone(),
+            });
+            self.on_gate_decision(reply, check, decision, None);
+            return;
+        };
         let gate = self.gate.clone();
         let tx = self.internal_tx.clone();
+        let withdraw_tx = self.withdraw_tx.clone();
         let deadline = self.options.gate_deadline;
         let native = reply.key();
         let task = self.gates.spawn(async move {
             let for_gate = check.clone();
-            // The call runs in its own task so a panic is contained, and is
-            // aborted if this task is (session end) or the deadline passes.
-            let inner = tokio::spawn(async move { gate.check(&for_gate).await });
-            let (decision, failed) = match guarded(deadline, inner).await {
-                Ok(d) => (d, false),
-                Err(why) => (
+            let gate_orphan = gate.clone();
+            let (res_tx, res_rx) = oneshot::channel();
+            // Run `gate.check` to completion without aborting on cancellation or
+            // timeout so an already-queued DB insert cannot leak an approval row.
+            tokio::spawn(async move {
+                let mut guard = OrphanGuard::arm(None, withdraw_tx, gate_orphan, Some(in_flight));
+                let d = gate.check(&for_gate).await;
+                if let GateDecision::Ask { ticket } = &d {
+                    guard.set_ticket(Some(ticket.clone()));
+                }
+                let _ = res_tx.send((d, guard));
+            });
+            let (decision, failed) = match timeout(deadline, res_rx).await {
+                Ok(Ok((d, mut guard))) => {
+                    let permit = if matches!(d, GateDecision::Ask { .. }) {
+                        guard.take_permit()
+                    } else {
+                        None
+                    };
+                    match tx.send(Internal::Gate {
+                        reply,
+                        check,
+                        decision: d,
+                        failed: false,
+                        permit,
+                    }) {
+                        Ok(()) => guard.disarm(),
+                        Err(mpsc::error::SendError(Internal::Gate { permit, .. })) => {
+                            guard.restore_permit(permit);
+                        }
+                        Err(_) => {}
+                    }
+                    return;
+                }
+                Ok(Err(_)) => (
                     GateDecision::Deny {
-                        reason: why.reason().into(),
+                        reason: GuardFail::Panicked.reason().into(),
+                    },
+                    true,
+                ),
+                Err(_) => (
+                    GateDecision::Deny {
+                        reason: GuardFail::TimedOut.reason().into(),
                     },
                     true,
                 ),
@@ -1295,38 +1527,84 @@ impl Actor {
                 check,
                 decision,
                 failed,
+                permit: None,
             });
         });
         self.inflight.insert(native, task);
     }
 
     /// The oldest ticket the hook got for this call and input.
-    fn take_hook_ticket(&mut self, key: &str) -> Option<ApprovalTicket> {
+    fn take_hook_ticket(
+        &mut self,
+        key: &str,
+    ) -> Option<(ApprovalTicket, Option<OwnedSemaphorePermit>)> {
         let queue = self.hook_asked.get_mut(key)?;
-        let (_, ticket) = queue.pop_front()?;
+        let (_, ticket, permit) = queue.pop_front()?;
         if queue.is_empty() {
             self.hook_asked.remove(key);
         }
-        Some(ticket)
+        Some((ticket, permit))
     }
 
     fn spawn_question(&mut self, native: String, input: Value) {
+        let Some(in_flight) =
+            InFlightCheck::try_enter(&self.gate_permits, &self.gate_in_flight, &self.gate_settled)
+        else {
+            self.feed(AdapterInput::QuestionTicket {
+                id: native.clone(),
+                ticket: None,
+            });
+            self.deny_can_use(
+                &native,
+                "Atrium declined the question: too many pending gate checks",
+            );
+            return;
+        };
         let gate = self.gate.clone();
         let tx = self.internal_tx.clone();
+        let withdraw_tx = self.withdraw_tx.clone();
         let deadline = self.options.gate_deadline;
         let turn = Some(self.norm.turn_number());
         let key = Req::CanUse(native.clone());
         let task = self.gates.spawn(async move {
-            let inner = tokio::spawn(async move { gate.question_ticket(turn).await });
-            let (ticket, failed) = match guarded(deadline, inner).await {
-                Ok(t) => (t, false),
-                Err(_) => (None, true),
+            let gate_orphan = gate.clone();
+            let (res_tx, res_rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let mut guard = OrphanGuard::arm(None, withdraw_tx, gate_orphan, Some(in_flight));
+                let t = gate.question_ticket(turn).await;
+                guard.set_ticket(t.clone());
+                let _ = res_tx.send((t, guard));
+            });
+            let (ticket, failed) = match timeout(deadline, res_rx).await {
+                Ok(Ok((t, mut guard))) => {
+                    let permit = if t.is_some() {
+                        guard.take_permit()
+                    } else {
+                        None
+                    };
+                    match tx.send(Internal::Question {
+                        native,
+                        ticket: t,
+                        input,
+                        failed: false,
+                        permit,
+                    }) {
+                        Ok(()) => guard.disarm(),
+                        Err(mpsc::error::SendError(Internal::Question { permit, .. })) => {
+                            guard.restore_permit(permit);
+                        }
+                        Err(_) => {}
+                    }
+                    return;
+                }
+                Err(_) | Ok(Err(_)) => (None, true),
             };
             let _ = tx.send(Internal::Question {
                 native,
                 ticket,
                 input,
                 failed,
+                permit: None,
             });
         });
         self.inflight.insert(key, task);
@@ -1386,6 +1664,7 @@ impl Actor {
                 reply,
                 check,
                 decision,
+                permit,
                 ..
             } => {
                 // The request may have been withdrawn, or its turn ended,
@@ -1396,9 +1675,9 @@ impl Actor {
                         check: check.clone(),
                         decision: decision.clone(),
                     });
-                    self.on_gate_decision(reply, check, decision);
+                    self.on_gate_decision(reply, check, decision, permit);
                 } else if let GateDecision::Ask { ticket } = decision {
-                    self.queue_withdraw(ticket);
+                    self.queue_withdraw(ticket, permit);
                 }
             }
             Internal::Redeem {
@@ -1409,7 +1688,7 @@ impl Actor {
                 decision,
                 ..
             } => {
-                self.redeeming.remove(&native);
+                let redeeming = self.redeeming.remove(&native);
                 // The request may have been withdrawn, or its turn ended, while
                 // the gate decided: then nothing is recorded or shown for it
                 // (a refused redeem would otherwise deny a call nobody asks
@@ -1421,6 +1700,7 @@ impl Actor {
                         check,
                         decision: decision.clone(),
                     });
+                    let permit = redeeming.and_then(|(_, p)| p);
                     if self.live.remove(&req) && self.proc.is_some() {
                         let response = match &decision {
                             GateDecision::Allow => {
@@ -1435,19 +1715,20 @@ impl Actor {
                         };
                         self.respond(&native, response);
                         if !matches!(decision, GateDecision::Allow) {
-                            self.queue_withdraw(ticket);
+                            self.queue_withdraw(ticket, permit);
                         }
                     } else {
-                        self.queue_withdraw(ticket);
+                        self.queue_withdraw(ticket, permit);
                     }
-                } else {
-                    self.queue_withdraw(ticket);
+                } else if let Some((redeem_ticket, permit)) = redeeming {
+                    self.queue_withdraw(redeem_ticket, permit);
                 }
             }
             Internal::Question {
                 native,
                 ticket,
                 input,
+                permit,
                 ..
             } => {
                 // As for a redeem: a question that is no longer asked is not shown.
@@ -1459,15 +1740,15 @@ impl Actor {
                     if self.proc.is_some() {
                         match ticket {
                             Some(t) => {
-                                self.questions.insert(t.request_id, (native, input));
+                                self.questions.insert(t.request_id, (native, input, permit));
                             }
                             None => self.deny_can_use(&native, "Atrium declined the question"),
                         }
                     } else if let Some(t) = ticket {
-                        self.queue_withdraw(t);
+                        self.queue_withdraw(t, permit);
                     }
                 } else if let Some(t) = ticket {
-                    self.queue_withdraw(t);
+                    self.queue_withdraw(t, permit);
                 }
             }
         }
@@ -1476,11 +1757,17 @@ impl Actor {
         }
     }
 
-    fn on_gate_decision(&mut self, reply: Reply, check: ToolCheck, decision: GateDecision) {
+    fn on_gate_decision(
+        &mut self,
+        reply: Reply,
+        check: ToolCheck,
+        decision: GateDecision,
+        permit: Option<OwnedSemaphorePermit>,
+    ) {
         // A gate answer for a process that is gone has nobody to hear it.
         if self.proc.is_none() {
             if let GateDecision::Ask { ticket } = decision {
-                self.queue_withdraw(ticket);
+                self.queue_withdraw(ticket, permit);
             }
             return;
         }
@@ -1495,10 +1782,11 @@ impl Actor {
                     }
                     GateDecision::Ask { ticket } => {
                         let key = gate_key(check.call_id.as_deref(), &check.name, &check.input);
-                        self.hook_asked
-                            .entry(key)
-                            .or_default()
-                            .push_back((check.call_id, ticket));
+                        self.hook_asked.entry(key).or_default().push_back((
+                            check.call_id,
+                            ticket,
+                            permit,
+                        ));
                         self.respond_hook(&request_id, "ask", None);
                     }
                 }
@@ -1520,6 +1808,7 @@ impl Actor {
                         PendingApproval {
                             native: request_id,
                             ticket,
+                            permit,
                             tool_use_id: check.call_id,
                             name: check.name,
                             input,
@@ -1598,12 +1887,13 @@ impl Actor {
                     },
                 });
                 // Unknown, expired or withdrawn: nothing happens.
-                let Some(a) = approval else {
+                let Some(mut a) = approval else {
                     return;
                 };
                 match decision {
                     ApprovalDecision::Allow => {
-                        self.redeeming.insert(a.native.clone(), a.ticket.clone());
+                        self.redeeming
+                            .insert(a.native.clone(), (a.ticket.clone(), a.permit.take()));
                         self.spawn_redeem(a);
                     }
                     ApprovalDecision::Deny { message } => {
@@ -1623,7 +1913,7 @@ impl Actor {
                         answers: answers.clone(),
                     },
                 });
-                if let Some((native, input)) = question {
+                if let Some((native, input, _permit)) = question {
                     self.live.remove(&Req::CanUse(native.clone()));
                     let updated = answered_input(&input, &answers);
                     self.respond(
@@ -1639,11 +1929,14 @@ impl Actor {
                         request_id: request_id.clone(),
                     },
                 });
-                if let Some((native, _input)) = question {
-                    self.queue_withdraw(ApprovalTicket {
-                        request_id,
-                        rememberable: false,
-                    });
+                if let Some((native, _input, permit)) = question {
+                    self.queue_withdraw(
+                        ApprovalTicket {
+                            request_id,
+                            rememberable: false,
+                        },
+                        permit,
+                    );
                     self.deny_can_use(&native, "The user declined to answer.");
                 }
             }
@@ -2041,6 +2334,7 @@ mod tests {
                 reason: "no".into(),
             },
             failed: false,
+            permit: None,
         };
         let mut a = actor("namespaces", &[init_line(), bash_call()]);
         a.live.insert(Req::Hook("r1".into()));
@@ -2066,6 +2360,7 @@ mod tests {
                 }),
                 input: json!({}),
                 failed: false,
+                permit: None,
             });
         };
         let mut a = actor("question-not-live", &[init_line(), question.clone()]);
@@ -2103,6 +2398,7 @@ mod tests {
                 request_id: "H1".into(),
                 rememberable: false,
             },
+            None,
         ));
         let tool_result = json!({
             "type": "user",
@@ -2117,7 +2413,7 @@ mod tests {
         assert_eq!(
             a.pending_withdrawals
                 .iter()
-                .map(|t| t.request_id.as_str())
+                .map(|(t, _)| t.request_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["H1"]
         );
@@ -2128,16 +2424,19 @@ mod tests {
         a.live.insert(Req::CanUse("c1".into()));
         a.redeeming.insert(
             "c1".into(),
-            ApprovalTicket {
-                request_id: "R1".into(),
-                rememberable: false,
-            },
+            (
+                ApprovalTicket {
+                    request_id: "R1".into(),
+                    rememberable: false,
+                },
+                None,
+            ),
         );
         a.forget_native("c1");
         assert_eq!(
             a.pending_withdrawals
                 .iter()
-                .map(|t| t.request_id.as_str())
+                .map(|(t, _)| t.request_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["R1"]
         );
@@ -2157,11 +2456,12 @@ mod tests {
                 },
             },
             failed: false,
+            permit: None,
         });
         assert_eq!(
             a.pending_withdrawals
                 .iter()
-                .map(|t| t.request_id.as_str())
+                .map(|(t, _)| t.request_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["L1"]
         );

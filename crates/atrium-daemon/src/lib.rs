@@ -31,10 +31,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::io::{self, Read};
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atrium_agents::AgentAdapter;
 use atrium_core::policy::{DefaultPolicy, Ledger};
@@ -88,6 +94,230 @@ pub const DEFAULT_PATH_EXTRAS: &[&str] = &[
     "/usr/local/bin",
 ];
 
+/// Maximum time `atriumd` waits for the user's login shell to print `PATH`.
+pub const LOGIN_SHELL_PATH_TIMEOUT: Duration = Duration::from_millis(2000);
+
+const PATH_START_MARKER: &[u8] = b"__ATRIUM_PATH_START__";
+const PATH_END_MARKER: &[u8] = b"__ATRIUM_PATH_END__";
+const MAX_LOGIN_SHELL_OUTPUT: u64 = 64 * 1024;
+
+/// Returns `true` when `shell` refers to `fish`.
+pub fn is_fish_shell(shell: &Path) -> bool {
+    shell
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("fish"))
+}
+
+/// Command passed to `$SHELL -ilc` to print `PATH` between sentinel markers.
+pub fn login_shell_path_command(shell: &Path) -> &'static str {
+    if is_fish_shell(shell) {
+        // `string join` always emits a trailing newline (`-n` only drops empty
+        // items); fish command substitution strips that newline before `printf`.
+        "printf '__ATRIUM_PATH_START__%s__ATRIUM_PATH_END__' (string join : -- $PATH)"
+    } else {
+        "printf '__ATRIUM_PATH_START__%s__ATRIUM_PATH_END__' \"$PATH\""
+    }
+}
+
+/// Extracts the raw `PATH` bytes wrapped between the sentinel markers, ignoring
+/// any shell startup noise (MOTD, prompts) printed before or after.
+pub fn extract_marked_path(output: &[u8]) -> Option<OsString> {
+    let start = output
+        .windows(PATH_START_MARKER.len())
+        .position(|w| w == PATH_START_MARKER)?
+        + PATH_START_MARKER.len();
+    let rest = &output[start..];
+    let end = rest
+        .windows(PATH_END_MARKER.len())
+        .position(|w| w == PATH_END_MARKER)?;
+    let slice = &rest[..end];
+    if slice.is_empty() {
+        return None;
+    }
+    Some(OsStr::from_bytes(slice).to_os_string())
+}
+
+struct LoginShellChild {
+    child: Child,
+    pgid: Option<rustix::process::Pid>,
+    reaped: bool,
+}
+
+impl LoginShellChild {
+    fn new(child: Child) -> Self {
+        let pgid = i32::try_from(child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw);
+        Self {
+            child,
+            pgid,
+            reaped: false,
+        }
+    }
+
+    /// Checks whether the shell leader has exited without reaping it so its
+    /// process group ID stays pinned until `kill_group_and_reap` signals it.
+    fn peek_exited(&self) -> io::Result<bool> {
+        let Some(pid) = self.pgid else {
+            return Ok(false);
+        };
+        let opts = rustix::process::WaitIdOptions::NOHANG
+            | rustix::process::WaitIdOptions::EXITED
+            | rustix::process::WaitIdOptions::NOWAIT;
+        match rustix::process::waitid(rustix::process::WaitId::Pid(pid), opts) {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(rustix::io::Errno::INTR) => Ok(false),
+            Err(err) => Err(io::Error::from(err)),
+        }
+    }
+
+    /// Kills the entire process group (and the leader itself) while the leader
+    /// is still unreaped, reaps the leader, and waits briefly for the group to
+    /// drain so descendants cannot outlive discovery.
+    fn kill_group_and_reap(&mut self) -> Option<ExitStatus> {
+        if self.reaped {
+            return None;
+        }
+        let own_pgid = rustix::process::getpgrp();
+        if let Some(pgid) = self.pgid
+            && pgid != own_pgid
+        {
+            let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+        }
+        let _ = self.child.kill();
+        let status = self.child.wait().ok();
+        self.reaped = true;
+        if let Some(pgid) = self.pgid
+            && pgid != own_pgid
+        {
+            let drain_deadline = Instant::now() + Duration::from_millis(500);
+            while !matches!(
+                rustix::process::test_kill_process_group(pgid),
+                Err(rustix::io::Errno::SRCH)
+            ) {
+                let now = Instant::now();
+                if now >= drain_deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5).min(drain_deadline - now));
+            }
+        }
+        status
+    }
+}
+
+impl Drop for LoginShellChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.kill_group_and_reap();
+        }
+    }
+}
+
+fn append_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let cap = MAX_LOGIN_SHELL_OUTPUT as usize;
+    let room = cap.saturating_sub(buf.len());
+    if room > 0 {
+        buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+}
+
+/// Runs `$SHELL -ilc` with a short timeout to discover the user's login-shell
+/// `PATH` (for `nvm`, `asdf`, `mise`, or custom init scripts). Never fails
+/// startup: returns `None` if `shell` is unset, fails to spawn, exits non-zero,
+/// times out, or emits no marked `PATH`.
+///
+/// The shell runs as leader of its own process group and stdout is collected
+/// directly on the calling thread with bounded timeouts (no detached reader
+/// thread), killing the whole process group and reaping the leader on every
+/// return path.
+pub fn discover_login_shell_path(shell: Option<&OsStr>, timeout: Duration) -> Option<OsString> {
+    let shell = shell.filter(|s| !s.is_empty())?;
+    let shell_path = Path::new(shell);
+    let (mut stdout_rx, stdout_tx) = UnixStream::pair().ok()?;
+    let child = {
+        let mut cmd = Command::new(shell_path);
+        cmd.args(["-ilc", login_shell_path_command(shell_path)])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(OwnedFd::from(stdout_tx)))
+            .stderr(Stdio::null())
+            .process_group(0);
+        cmd.spawn().ok()?
+    };
+    let mut shell_child = LoginShellChild::new(child);
+
+    let deadline = Instant::now() + timeout;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut stdout_eof = false;
+    let mut leader_exited = false;
+
+    loop {
+        if !leader_exited {
+            match shell_child.peek_exited() {
+                Ok(true) => leader_exited = true,
+                Ok(false) => {}
+                Err(_) => return None,
+            }
+        }
+
+        if !stdout_eof {
+            if leader_exited {
+                // Leader already exited: drain any bytes already buffered
+                // without blocking on a background descendant retaining stdout.
+                let _ = stdout_rx.set_nonblocking(true);
+                while buf.len() < MAX_LOGIN_SHELL_OUTPUT as usize {
+                    match stdout_rx.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => append_capped(&mut buf, &chunk[..n]),
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            // Clamp to >= 1 ms so SO_RCVTIMEO is never truncated to 0 (infinite).
+            let slice = remaining.clamp(Duration::from_millis(1), Duration::from_millis(20));
+            let _ = stdout_rx.set_read_timeout(Some(slice));
+            match stdout_rx.read(&mut chunk) {
+                Ok(0) => stdout_eof = true,
+                Ok(n) => append_capped(&mut buf, &chunk[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => stdout_eof = true,
+            }
+        } else {
+            if leader_exited {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+
+    drop(stdout_rx);
+    let status = shell_child.kill_group_and_reap()?;
+    if !status.success() {
+        return None;
+    }
+    extract_marked_path(&buf)
+}
+
 /// Merges `existing` `PATH` entries with `candidates` that satisfy `exists`.
 ///
 /// Keeps every non-empty entry from `existing` first, in order, then appends
@@ -101,39 +331,62 @@ pub fn provider_path<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
     exists: impl Fn(&Path) -> bool,
 ) -> OsString {
+    provider_path_with_shell(existing, None, home, candidates, exists)
+}
+
+/// Like [`provider_path`], also merging absolute directories from `shell_path`
+/// (the login shell's `PATH`). Order: `existing` entries first, then
+/// `$HOME`-relative `candidates`, then `shell_path` entries, then absolute
+/// `candidates`.
+pub fn provider_path_with_shell<'a>(
+    existing: Option<&OsStr>,
+    shell_path: Option<&OsStr>,
+    home: &Path,
+    candidates: impl IntoIterator<Item = &'a str>,
+    exists: impl Fn(&Path) -> bool,
+) -> OsString {
     let mut entries: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
+    let mut push_if_new = |resolved: PathBuf, check_exists: bool| {
+        if resolved.as_os_str().is_empty() || seen.contains(&resolved) {
+            return;
+        }
+        if std::env::join_paths(std::iter::once(&resolved)).is_err() {
+            return;
+        }
+        if (!check_exists || exists(&resolved)) && seen.insert(resolved.clone()) {
+            entries.push(resolved);
+        }
+    };
+
     if let Some(raw) = existing {
         for entry in std::env::split_paths(raw) {
-            if entry.as_os_str().is_empty() {
-                continue;
-            }
-            if seen.insert(entry.clone()) {
-                entries.push(entry);
-            }
+            push_if_new(entry, false);
         }
     }
 
     let has_home = !home.as_os_str().is_empty();
+    let mut absolute_candidates: Vec<PathBuf> = Vec::new();
     for candidate in candidates {
         let candidate_path = Path::new(candidate);
-        let resolved = if candidate_path.is_absolute() {
-            candidate_path.to_path_buf()
+        if candidate_path.is_absolute() {
+            absolute_candidates.push(candidate_path.to_path_buf());
         } else if has_home {
-            home.join(candidate_path)
-        } else {
-            continue;
-        };
-        if seen.contains(&resolved) {
-            continue;
+            push_if_new(home.join(candidate_path), true);
         }
-        if std::env::join_paths(std::iter::once(&resolved)).is_err() {
-            continue;
+    }
+
+    if let Some(raw) = shell_path {
+        for entry in std::env::split_paths(raw) {
+            if entry.is_absolute() {
+                push_if_new(entry, true);
+            }
         }
-        if exists(&resolved) && seen.insert(resolved.clone()) {
-            entries.push(resolved);
-        }
+    }
+
+    for resolved in absolute_candidates {
+        push_if_new(resolved, true);
     }
 
     std::env::join_paths(&entries)
@@ -506,7 +759,10 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
-    use super::{DEFAULT_PATH_EXTRAS, provider_path};
+    use super::{
+        DEFAULT_PATH_EXTRAS, extract_marked_path, is_fish_shell, login_shell_path_command,
+        provider_path, provider_path_with_shell,
+    };
 
     #[test]
     fn provider_path_keeps_existing_first_and_appends_in_order() {
@@ -637,5 +893,69 @@ mod tests {
             merged,
             OsStr::new("/usr/bin:/opt/homebrew/bin:/usr/local/bin")
         );
+    }
+
+    #[test]
+    fn provider_path_with_shell_merges_and_deduplicates_in_order() {
+        let home = Path::new("/home/alice");
+        let existing = OsStr::new("/custom/bin:/usr/bin");
+        let shell = OsStr::new(
+            "/home/alice/.nvm/versions/node/v22/bin:relative/dir:/usr/bin:/opt/homebrew/bin:/home/alice/.local/bin",
+        );
+        let merged = provider_path_with_shell(
+            Some(existing),
+            Some(shell),
+            home,
+            DEFAULT_PATH_EXTRAS.iter().copied(),
+            |p| {
+                matches!(
+                    p.to_str(),
+                    Some(
+                        "/home/alice/.local/bin"
+                            | "/home/alice/.nvm/versions/node/v22/bin"
+                            | "/opt/homebrew/bin"
+                            | "/usr/local/bin"
+                    )
+                )
+            },
+        );
+        let parts: Vec<PathBuf> = std::env::split_paths(&merged).collect();
+        assert_eq!(
+            parts,
+            vec![
+                PathBuf::from("/custom/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/home/alice/.local/bin"),
+                PathBuf::from("/home/alice/.nvm/versions/node/v22/bin"),
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/local/bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn fish_shell_detection_and_marker_extraction() {
+        assert!(is_fish_shell(Path::new("/opt/homebrew/bin/fish")));
+        assert!(is_fish_shell(Path::new("fish")));
+        assert!(!is_fish_shell(Path::new("/bin/zsh")));
+        assert!(!is_fish_shell(Path::new("/bin/bash")));
+
+        let fish_cmd = login_shell_path_command(Path::new("/opt/homebrew/bin/fish"));
+        assert_eq!(
+            fish_cmd,
+            "printf '__ATRIUM_PATH_START__%s__ATRIUM_PATH_END__' (string join : -- $PATH)"
+        );
+        assert!(login_shell_path_command(Path::new("/bin/zsh")).contains("$PATH"));
+
+        let noisy = b"Welcome to fish!\n__ATRIUM_PATH_START__/nvm/bin:/opt/\xff/bin__ATRIUM_PATH_END__\nbye\n";
+        assert_eq!(
+            extract_marked_path(noisy).as_deref(),
+            Some(OsStr::from_bytes(b"/nvm/bin:/opt/\xff/bin"))
+        );
+        assert_eq!(
+            extract_marked_path(b"__ATRIUM_PATH_START____ATRIUM_PATH_END__"),
+            None
+        );
+        assert_eq!(extract_marked_path(b"no markers here"), None);
     }
 }

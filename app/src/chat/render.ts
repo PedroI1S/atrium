@@ -4,7 +4,7 @@
 // Rust checking again on click), the `src` of a checked data image or of a clicked https
 // image, and `alt`/`title` strings.
 
-import type { Block, Inline } from "./markdown";
+import { type Block, type Inline, MAX_TABLE_COLUMNS } from "./markdown";
 import type { ImageTarget, LinkTarget } from "./links";
 
 /** What a click on agent content may ask the app to do. */
@@ -193,13 +193,23 @@ function block(doc: Doc, b: Block, actions: LinkActions): Node {
       });
       head.append(tr);
       const body = el(doc, "tbody");
+      const cols = b.head.length;
       for (const row of b.rows) {
         const r = el(doc, "tr");
-        row.forEach((cell, k) => {
+        const count = Math.min(row.length, cols);
+        for (let k = 0; k < count; k++) {
           const td = el(doc, "td", b.align[k] ? ALIGN_CLASS[b.align[k]!] : undefined);
-          td.append(...inlines(doc, cell, actions));
+          td.append(...inlines(doc, row[k]!, actions));
           r.append(td);
-        });
+        }
+        const missing = cols - count;
+        if (missing === 1) {
+          r.append(el(doc, "td", b.align[count] ? ALIGN_CLASS[b.align[count]!] : undefined));
+        } else if (missing > 1) {
+          const td = el(doc, "td");
+          td.colSpan = missing;
+          r.append(td);
+        }
         body.append(r);
       }
       table.append(head, body);
@@ -232,8 +242,16 @@ export function blocksText(blocks: Block[]): string {
           return b.items.map((i) => blocksText(i)).join("\n");
         case "hr":
           return "";
-        case "table":
-          return [b.head, ...b.rows].map((r) => r.map(textOf).join("\t")).join("\n");
+        case "table": {
+          const cols = Math.min(b.head.length, MAX_TABLE_COLUMNS);
+          const formatRow = (r: Inline[][]): string => {
+            const base = r.map(textOf).join("\t");
+            const missing = cols - r.length;
+            if (missing <= 0) return base;
+            return base + "\t".repeat(r.length === 0 ? Math.max(0, cols - 1) : missing);
+          };
+          return [b.head.map(textOf).join("\t"), ...b.rows.map(formatRow)].join("\n");
+        }
       }
     })
     .join("\n\n");

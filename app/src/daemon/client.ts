@@ -68,7 +68,13 @@ export function receiveFrame(incoming: ChannelFrame): void {
     solidBatch(() => {
       for (const item of incoming.batch) {
         const err = applyOne(item);
-        if (err !== NO_ERROR && firstError === NO_ERROR) firstError = err;
+        if (err !== NO_ERROR) {
+          if (firstError === NO_ERROR) {
+            firstError = err;
+          } else {
+            console.error("batch delivery error", err);
+          }
+        }
       }
     });
   } else {

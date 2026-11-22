@@ -30,7 +30,7 @@ use atrium_protocol::wire::{ClientRole, CommandResult, ErrorCode, EventId, Serve
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::codec::{self, Frame};
 
@@ -144,6 +144,15 @@ impl Outbox {
     }
 }
 
+/// Result of trying to queue `ReplayDone` and go live atomically.
+pub(crate) enum GoLive {
+    Live,
+    /// The subscription is already over (closed, replaced, unsubscribed).
+    Gone,
+    /// The event lane is full; wait for room without holding `Inner::publish`.
+    Full(Frame),
+}
+
 /// What happened to an event pushed for a subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pushed {
@@ -162,6 +171,9 @@ pub(crate) struct Conn {
     wake: Notify,
     /// Wakes feeders waiting for room, and tells them of ended subscriptions.
     room: Notify,
+    /// Becomes `true` once [`Conn::close`] closes the connection, without
+    /// spurious wakeups from `room`.
+    closed: watch::Sender<bool>,
     max_event_bytes: usize,
 }
 
@@ -175,6 +187,7 @@ impl Conn {
             outbox: Mutex::new(Outbox::default()),
             wake: Notify::new(),
             room: Notify::new(),
+            closed: watch::channel(false).0,
             max_event_bytes,
         }
     }
@@ -183,6 +196,7 @@ impl Conn {
         self.outbox.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.lock().closed
     }
@@ -198,6 +212,11 @@ impl Conn {
         outbox.subs.clear();
         outbox.by_thread.clear();
         drop(outbox);
+        self.closed.send_if_modified(|is_closed| {
+            let changed = !*is_closed;
+            *is_closed = true;
+            changed
+        });
         self.wake.notify_one();
         self.room.notify_waiters();
     }
@@ -222,15 +241,8 @@ impl Conn {
 
     /// Returns once the connection is closed.
     pub(crate) async fn closed(&self) {
-        loop {
-            let notified = self.room.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.is_closed() {
-                return;
-            }
-            notified.await;
-        }
+        let mut closed = self.closed.subscribe();
+        let _ = closed.wait_for(|is_closed| *is_closed).await;
     }
 
     /// Queues a control-lane message.
@@ -363,6 +375,30 @@ impl Conn {
         }
     }
 
+    /// Queues `ReplayDone` and marks `sub` live under the outbox lock, so a
+    /// client that sees `ReplayDone` is already live.
+    pub(crate) fn go_live_with_done(&self, sub: SubId, done: Frame) -> GoLive {
+        let mut outbox = self.lock();
+        if outbox.closed || !outbox.subs.get(&sub).is_some_and(|state| !state.live) {
+            return GoLive::Gone;
+        }
+        if !outbox.has_room(done.len(), self.max_event_bytes) {
+            return GoLive::Full(done);
+        }
+        outbox.event_bytes += done.len();
+        outbox.events.push_back(EventFrame {
+            sub,
+            id: None,
+            frame: done,
+        });
+        if let Some(state) = outbox.subs.get_mut(&sub) {
+            state.live = true;
+        }
+        drop(outbox);
+        self.wake.notify_one();
+        GoLive::Live
+    }
+
     /// Queues a live event for `sub`.
     pub(crate) fn push_live(&self, sub: SubId, id: EventId, frame: &Frame) -> Pushed {
         let mut outbox = self.lock();
@@ -423,8 +459,8 @@ impl Conn {
     }
 
     /// Writes as much of a taken frame as the socket takes now. `Ok(None)`:
-    /// the frame is an event frame of a subscription that ended before any
-    /// of it was written, and must not be sent (D-058: nothing of a
+    /// the connection closed or the frame's subscription ended before any of
+    /// it was written, so it must not be sent (D-058: nothing of a
     /// subscription follows its end, a frame the writer already holds
     /// included).
     ///
@@ -441,8 +477,7 @@ impl Conn {
     ) -> std::io::Result<Option<usize>> {
         let mut outbox = self.lock();
         if first
-            && let Some((sub, _)) = origin
-            && !outbox.subs.contains_key(&sub)
+            && (outbox.closed || origin.is_some_and(|(sub, _)| !outbox.subs.contains_key(&sub)))
         {
             return Ok(None);
         }
@@ -489,31 +524,71 @@ enum Take {
 /// Writes the connection's frames until it closes or a write fails or
 /// stalls. The connection is closed when this returns.
 pub(crate) async fn write_loop(conn: &Conn, mut writer: OwnedWriteHalf) {
+    let mut closed = conn.closed.subscribe();
+    let mut since_yield = 0usize;
     loop {
+        if *closed.borrow_and_update() {
+            break;
+        }
         let (frame, origin) = match conn.take() {
             Take::Frame(frame, origin) => (frame, origin),
             Take::Closed => break,
             Take::Empty => {
+                since_yield = 0;
                 // `notify_one` keeps a wake-up sent before this point.
                 conn.wake.notified().await;
                 continue;
             }
         };
-        let writing = async {
-            let mut written = 0;
-            while written < frame.len() {
-                writer.writable().await?;
-                match conn.write_some(&writer, &frame[written..], written == 0, origin)? {
-                    Some(more) => written += more,
+        let mut written = 0;
+        let mut io_err = false;
+        // Fast path: write immediately ready frames without allocating a
+        // `WRITE_STALL` timeout or awaiting `writable()` on every small event.
+        while written < frame.len() {
+            match conn.write_some(&writer, &frame[written..], written == 0, origin) {
+                Ok(Some(0)) => break,
+                Ok(Some(more)) => written += more,
+                Ok(None) => {
                     // Its subscription ended first: not sent.
-                    None => break,
+                    written = frame.len();
+                    break;
+                }
+                Err(_) => {
+                    io_err = true;
+                    break;
                 }
             }
-            std::io::Result::Ok(())
-        };
-        match tokio::time::timeout(WRITE_STALL, writing).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(_) => break,
+        }
+        if io_err {
+            break;
+        }
+        if written < frame.len() {
+            let writing = async {
+                while written < frame.len() {
+                    writer.writable().await?;
+                    match conn.write_some(&writer, &frame[written..], written == 0, origin)? {
+                        Some(more) => written += more,
+                        // Its subscription ended first: not sent.
+                        None => break,
+                    }
+                }
+                std::io::Result::Ok(())
+            };
+            tokio::select! {
+                biased;
+                _ = closed.wait_for(|is_closed| *is_closed) => break,
+                res = tokio::time::timeout(WRITE_STALL, writing) => match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => break,
+                },
+            }
+            since_yield = 0;
+        } else {
+            since_yield += 1;
+            if since_yield >= 64 {
+                since_yield = 0;
+                tokio::task::yield_now().await;
+            }
         }
     }
     conn.close();
@@ -872,5 +947,214 @@ mod tests {
         let mut received = Vec::new();
         theirs.read_to_end(&mut received).await.expect("reads");
         assert_eq!(received.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn write_loop_does_not_close_when_stalled_reader_lags() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a pair");
+        let (_reading, writer) = ours.into_split();
+
+        // Fill the socket buffer so `write_loop` parks on `writer.writable()`.
+        let mut filler_bytes = 0usize;
+        let filler = [0xEEu8; 4096];
+        loop {
+            match writer.try_write(&filler) {
+                Ok(n) => filler_bytes += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected write error: {err}"),
+            }
+        }
+
+        let conn = Arc::new(Conn::with_limit(1, ClientRole::Dev, 100));
+        let sub = conn.subscribe(&t("a")).expect("a subscription");
+        assert!(conn.go_live(sub));
+        let ev1 = codec::encode(&ServerMessage::ReplayDone {
+            thread_id: t("a"),
+            last: None,
+        })
+        .expect("encodes");
+        assert_eq!(conn.push_live(sub, EventId(1), &ev1), Pushed::Queued);
+
+        let writer_task = tokio::spawn({
+            let conn = conn.clone();
+            async move { write_loop(&conn, writer).await }
+        });
+        tokio::task::yield_now().await;
+
+        // Exceed the event lane while `write_loop` is stalled: `room` wakes
+        // feeders, but must not wake or close `write_loop`.
+        assert_eq!(conn.push_live(sub, EventId(2), &frame(80)), Pushed::Queued);
+        assert_eq!(conn.push_live(sub, EventId(3), &frame(80)), Pushed::Lagged);
+        tokio::task::yield_now().await;
+        assert!(!conn.is_closed());
+        assert!(!writer_task.is_finished());
+
+        conn.ok(42, Value::Null);
+        conn.finish();
+
+        let mut drain = vec![0u8; filler_bytes];
+        theirs.read_exact(&mut drain).await.expect("drains filler");
+
+        let mut messages = Vec::new();
+        while let Ok(len) = theirs.read_u32().await {
+            let kind = theirs.read_u8().await.expect("kind");
+            assert_eq!(kind, 0);
+            let mut payload = vec![0u8; len as usize - 1];
+            theirs.read_exact(&mut payload).await.expect("payload");
+            messages
+                .push(serde_json::from_slice::<ServerMessage>(&payload).expect("server message"));
+        }
+        writer_task.await.expect("writer task");
+
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                ServerMessage::SubscriptionLagged { thread_id, .. } if *thread_id == t("a")
+            )),
+            "expected SubscriptionLagged, got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, ServerMessage::Response { request_id: 42, .. })),
+            "expected Response 42, got {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_loop_exits_promptly_when_closed_while_stalled() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a pair");
+        let (_reading, writer) = ours.into_split();
+
+        let mut filler_bytes = 0usize;
+        let filler = [0xEEu8; 4096];
+        loop {
+            match writer.try_write(&filler) {
+                Ok(n) => filler_bytes += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected write error: {err}"),
+            }
+        }
+
+        let conn = Arc::new(Conn::with_limit(1, ClientRole::Dev, 100));
+        conn.ok(1, Value::Null);
+
+        let writer_task = tokio::spawn({
+            let conn = conn.clone();
+            async move { write_loop(&conn, writer).await }
+        });
+        tokio::task::yield_now().await;
+
+        // Overflow `MAX_CONTROL_BYTES` while the socket buffer is full.
+        for _ in 0..9 {
+            conn.control_frame(frame(1024 * 1024), Coalesce::Keep);
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("write_loop exited promptly")
+            .expect("writer task");
+        assert!(conn.is_closed());
+
+        let mut drain = vec![0u8; filler_bytes];
+        theirs.read_exact(&mut drain).await.expect("drains filler");
+        let mut tail = [0u8; 16];
+        assert_eq!(theirs.read(&mut tail).await.expect("eof"), 0);
+    }
+
+    #[tokio::test]
+    async fn go_live_with_done_queues_done_and_marks_live_atomically() {
+        let conn = Conn::with_limit(1, ClientRole::Dev, 100);
+        let sub = conn.subscribe(&t("a")).expect("a subscription");
+        assert!(conn.feed(sub, Some(EventId(1)), frame(80)).await);
+
+        let done = codec::encode(&ServerMessage::ReplayDone {
+            thread_id: t("a"),
+            last: Some(EventId(1)),
+        })
+        .expect("encodes");
+        assert!(matches!(
+            conn.go_live_with_done(sub, done.clone()),
+            GoLive::Full(_)
+        ));
+        assert_eq!(conn.push_live(sub, EventId(2), &frame(10)), Pushed::Gone);
+
+        assert_eq!(conn.take_for_test().expect("replayed event").len(), 80);
+        assert!(matches!(
+            conn.go_live_with_done(sub, done.clone()),
+            GoLive::Live
+        ));
+        assert!(matches!(conn.go_live_with_done(sub, done), GoLive::Gone));
+        assert_eq!(conn.push_live(sub, EventId(2), &frame(10)), Pushed::Queued);
+        assert!(matches!(
+            message(&conn.take_for_test().expect("ReplayDone")),
+            ServerMessage::ReplayDone {
+                last: Some(EventId(1)),
+                ..
+            }
+        ));
+        assert_eq!(conn.take_for_test().expect("live event").len(), 10);
+    }
+
+    #[tokio::test]
+    async fn write_loop_never_writes_a_later_frame_after_closing_mid_frame() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a pair");
+        let (_reading, writer) = ours.into_split();
+
+        let conn = Arc::new(Conn::with_limit(1, ClientRole::Dev, 100));
+        let first_frame: Frame = vec![0x41u8; 4 * 1024 * 1024].into();
+        conn.control_frame(first_frame.clone(), Coalesce::Keep);
+
+        let writer_task = tokio::spawn({
+            let conn = conn.clone();
+            async move { write_loop(&conn, writer).await }
+        });
+
+        // Wait until `write_loop` has dequeued `first_frame`, written what
+        // fits in the socket buffer, and parked on `writer.writable()`.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !conn.lock().control.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            tokio::task::yield_now().await;
+        })
+        .await
+        .expect("write_loop dequeued first_frame");
+
+        // Overflow `MAX_CONTROL_BYTES` with frames carrying a distinct byte;
+        // `write_loop` must close immediately without writing any byte of the
+        // later frames after the partial `first_frame`.
+        let later: Frame = vec![0x42u8; 1024 * 1024].into();
+        for _ in 0..9 {
+            conn.control_frame(later.clone(), Coalesce::Keep);
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("write_loop exited promptly")
+            .expect("writer task");
+        assert!(conn.is_closed());
+
+        let mut received = Vec::new();
+        theirs.read_to_end(&mut received).await.expect("reads");
+        assert!(
+            !received.is_empty() && received.len() < first_frame.len(),
+            "expected a partial first frame before close, got {} bytes",
+            received.len()
+        );
+        assert_eq!(
+            received.as_slice(),
+            &first_frame[..received.len()],
+            "wire bytes must only be a prefix of the in-flight frame, never followed by another frame"
+        );
     }
 }

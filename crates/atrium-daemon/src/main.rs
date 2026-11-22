@@ -18,7 +18,8 @@ use atrium_agents::claude::{ClaudeAdapter, ClaudeOptions};
 use atrium_agents::codex::CodexAdapter;
 use atrium_daemon::{
     AppIdentitySource, CommandNotifier, DAEMON_VERSION, DEFAULT_PATH_EXTRAS, Daemon,
-    NO_PATH_EXTRAS_ENV, Options, provider_path,
+    LOGIN_SHELL_PATH_TIMEOUT, NO_PATH_EXTRAS_ENV, Options, discover_login_shell_path,
+    provider_path_with_shell,
 };
 use atrium_host::lifecycle::default_paths;
 use tokio::signal::unix::{SignalKind, signal};
@@ -81,8 +82,11 @@ fn extend_provider_path() {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
-    let merged = provider_path(
+    let shell = std::env::var_os("SHELL");
+    let shell_path = discover_login_shell_path(shell.as_deref(), LOGIN_SHELL_PATH_TIMEOUT);
+    let merged = provider_path_with_shell(
         existing.as_deref(),
+        shell_path.as_deref(),
         &home,
         DEFAULT_PATH_EXTRAS.iter().copied(),
         |path| path.is_dir(),
