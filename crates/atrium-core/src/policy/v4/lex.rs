@@ -12,6 +12,7 @@ mod best_effort;
 #[cfg(test)]
 mod tests;
 
+#[allow(unused_imports)]
 pub(crate) use best_effort::{brace_expand_budgeted, lex_best_effort_into};
 
 // ---------------------------------------------------------------------------
@@ -93,7 +94,7 @@ pub(super) fn leading_assignment_name(word: &Word) -> Option<&[u8]> {
 /// model (reusing `policy::shell::RESERVED`).
 #[inline]
 fn is_reserved_word(s: &str) -> bool {
-    crate::policy::shell::RESERVED.contains(&s)
+    crate::policy::tools::lookup_outside_model(s).is_some_and(|e| e.contract_section == "§3")
 }
 
 // ---------------------------------------------------------------------------
@@ -303,7 +304,7 @@ fn read_word(
     if let Some(b) = scanner.peek() {
         let next = scanner.peek_at(1);
         let at_single_boundary = next.is_none_or(is_word_boundary);
-        if matches!(b, b'{' | b'}') && at_single_boundary {
+        if matches!(b, b'{' | b'}') && at_single_boundary && in_command_position {
             scanner.next_byte()?;
             let mut word = Word::new();
             scanner.push_word_byte(&mut word, b, ByteProvenance::Unquoted)?;
@@ -539,7 +540,9 @@ fn read_word(
                             found_close = true;
                             break;
                         }
-                        c if is_allowed_unquoted_base(c) || matches!(c, b'=' | b'*' | b'?') => {
+                        c if (is_allowed_unquoted_base(c) && c != b'/')
+                            || matches!(c, b'=' | b'*' | b'?') =>
+                        {
                             scanner.next_byte()?;
                             scanner.push_word_byte(&mut word, c, ByteProvenance::Unquoted)?;
                             class_len += 1;
@@ -612,9 +615,10 @@ fn read_word(
         all_unquoted_digits = false;
     }
 
+    let is_digits = started && all_unquoted_digits && !word.is_empty();
     Ok(ReadWordOutcome {
         word,
-        all_unquoted_digits: started && all_unquoted_digits && !word.is_empty(),
+        all_unquoted_digits: is_digits,
         standalone_reserved: None,
     })
 }
@@ -706,17 +710,59 @@ fn lex_exact_redirect(
             if is_word_boundary(b) {
                 break;
             }
-            scanner.next_byte()?;
-            if !matches!(b, b'\'' | b'"' | b'\\') {
-                scanner.budget.charge(1)?;
-                scanner.budget.charge_alloc(1)?;
-                delim.push(b);
+            match b {
+                b'\'' => {
+                    scanner.next_byte()?;
+                    while let Some(c) = scanner.next_byte()? {
+                        if c == b'\'' {
+                            break;
+                        }
+                        scanner.budget.charge(1)?;
+                        scanner.budget.charge_alloc(1)?;
+                        delim.push(c);
+                    }
+                }
+                b'"' => {
+                    scanner.next_byte()?;
+                    while let Some(c) = scanner.next_byte()? {
+                        if c == b'"' {
+                            break;
+                        }
+                        if c == b'\\'
+                            && let Some(esc) = scanner.next_byte()?
+                        {
+                            scanner.budget.charge(1)?;
+                            scanner.budget.charge_alloc(1)?;
+                            delim.push(esc);
+                        } else {
+                            scanner.budget.charge(1)?;
+                            scanner.budget.charge_alloc(1)?;
+                            delim.push(c);
+                        }
+                    }
+                }
+                b'\\' => {
+                    scanner.next_byte()?;
+                    if let Some(esc) = scanner.next_byte()? {
+                        scanner.budget.charge(1)?;
+                        scanner.budget.charge_alloc(1)?;
+                        delim.push(esc);
+                    }
+                }
+                _ => {
+                    scanner.next_byte()?;
+                    scanner.budget.charge(1)?;
+                    scanner.budget.charge_alloc(1)?;
+                    delim.push(b);
+                }
             }
         }
-        scanner
-            .budget
-            .charge_alloc(std::mem::size_of::<(Vec<u8>, bool)>())?;
-        heredocs.push((delim, strip_tabs));
+        if !delim.is_empty() {
+            scanner
+                .budget
+                .charge_alloc(std::mem::size_of::<(Vec<u8>, bool)>())?;
+            heredocs.push((delim, strip_tabs));
+        }
         return Ok(());
     }
 

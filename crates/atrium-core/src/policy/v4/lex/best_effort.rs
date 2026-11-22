@@ -7,15 +7,33 @@
 //! [`ComputeBudget`], strictly linear in the line length, with CR-19 command
 //! name folding. Kept strictly separate from the exact model.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::policy::limits;
 use crate::policy::model::{
     BestEffortRecord, BestEffortRedirectKind, BestEffortUnit, Cap, ComputeBudget, Exhausted,
     FoldRules, PartOutcome, PipelineId,
 };
+use crate::policy::tools::{self, CodeRunnerBehavior};
 
 use super::{fold_command_bytes, is_posix_name};
+
+/// Maximum entries in the thread-local best-effort lexer memo (carried from
+/// M1-31 N11, adapted to preserve exact deterministic `ComputeBudget` charges).
+const LEX_MEMO: usize = 4;
+
+struct LexMemoEntry {
+    line: String,
+    units: Rc<Vec<BestEffortUnit>>,
+    compute_units: u64,
+    alloc_bytes: usize,
+}
+
+thread_local! {
+    static BE_LEX_MEMO: RefCell<Vec<LexMemoEntry>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Maximum nesting depth for scanning nested quoting/substitution delimiters
 /// (`$(` inside `"` inside `${` …) before giving up linearly.
@@ -70,9 +88,66 @@ pub(crate) fn lex_best_effort_into(
             return Err(PartOutcome::Exhausted(e.reason));
         }
         record.raw_texts.push(text.to_string());
-        if let Err(outcome) = lex_one_text(text, 0, false, record, &mut state, budget) {
-            return Err(outcome);
+
+        // Check the N11 thread-local memo (M1-31): hit only when the remaining
+        // budget can afford the exact recorded compute + allocation cost, so
+        // budget accounting is 100% deterministic and tight budgets still run
+        // incrementally and preserve partial units found before exhaustion (§8).
+        let memo_hit = BE_LEX_MEMO.with(|m| {
+            m.borrow()
+                .iter()
+                .find(|e| e.line == text)
+                .map(|e| (Rc::clone(&e.units), e.compute_units, e.alloc_bytes))
+        });
+        if let Some((cached_units, cost_units, cost_alloc)) = memo_hit
+            && !budget.is_exhausted()
+            && budget.remaining_units() >= cost_units
+            && budget.remaining_alloc_bytes() >= cost_alloc
+        {
+            if record.units.len() + cached_units.len() > limits::MAX_UNITS {
+                return Err(PartOutcome::TooLarge(Cap::Units));
+            }
+            if let Err(e) = budget
+                .charge(cost_units)
+                .and_then(|()| budget.charge_alloc(cost_alloc))
+            {
+                return Err(PartOutcome::Exhausted(e.reason));
+            }
+            for u in cached_units.iter() {
+                let mut cloned = u.clone();
+                cloned.index = record.units.len();
+                record.units.push(cloned);
+            }
+            continue;
         }
+
+        let start_units_rem = budget.remaining_units();
+        let start_alloc_rem = budget.remaining_alloc_bytes();
+        let start_rec_len = record.units.len();
+        lex_one_text(text, 0, false, record, &mut state, budget)?;
+        let spent_units = start_units_rem.saturating_sub(budget.remaining_units());
+        let spent_alloc = start_alloc_rem.saturating_sub(budget.remaining_alloc_bytes());
+        let produced: Vec<BestEffortUnit> = record.units[start_rec_len..]
+            .iter()
+            .enumerate()
+            .map(|(k, u)| {
+                let mut c = u.clone();
+                c.index = k;
+                c
+            })
+            .collect();
+        BE_LEX_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() >= LEX_MEMO {
+                m.remove(0);
+            }
+            m.push(LexMemoEntry {
+                line: text.to_string(),
+                units: Rc::new(produced),
+                compute_units: spent_units,
+                alloc_bytes: spent_alloc,
+            });
+        });
     }
 
     Ok(())
@@ -80,7 +155,7 @@ pub(crate) fn lex_best_effort_into(
 
 struct BeState {
     next_pipe_id: u32,
-    cache: HashMap<(String, u8), Vec<BestEffortUnit>>,
+    cache: HashMap<String, Vec<(u8, Vec<BestEffortUnit>)>>,
 }
 
 struct BeBuilder {
@@ -405,26 +480,26 @@ fn lex_one_text(
     if depth > limits::MAX_DEPTH {
         return Ok(());
     }
-    if derived {
-        let key_len = text.len() + 1;
-        if let Some(cached) = state.cache.get(&(text.to_string(), depth)).cloned() {
-            for mut u in cached {
-                if record.units.len() >= limits::MAX_UNITS {
-                    return Err(PartOutcome::TooLarge(Cap::Units));
-                }
-                let est = estimate_unit_bytes(&u);
-                if let Err(e) = budget
-                    .charge(est.max(1) as u64)
-                    .and_then(|()| budget.charge_alloc(est))
-                {
-                    return Err(PartOutcome::Exhausted(e.reason));
-                }
-                u.index = record.units.len();
-                record.units.push(u);
-            }
-            return Ok(());
+    if derived
+        && let Some(entries) = state.cache.get(text)
+        && let Some((_, cached)) = entries.iter().find(|(d, _)| *d == depth)
+    {
+        if record.units.len() + cached.len() > limits::MAX_UNITS {
+            return Err(PartOutcome::TooLarge(Cap::Units));
         }
-        let _ = key_len;
+        let total_est: usize = cached.iter().map(estimate_unit_bytes).sum();
+        if let Err(e) = budget
+            .charge(total_est.max(1) as u64)
+            .and_then(|()| budget.charge_alloc(total_est))
+        {
+            return Err(PartOutcome::Exhausted(e.reason));
+        }
+        for u in cached {
+            let mut cloned = u.clone();
+            cloned.index = record.units.len();
+            record.units.push(cloned);
+        }
+        return Ok(());
     }
 
     let start_unit_len = record.units.len();
@@ -441,10 +516,14 @@ fn lex_one_text(
                          next_pipe: Option<PipelineId>,
                          next_piped: bool,
                          raw_units: &mut Vec<BeBuilder>,
+                         rec_len: usize,
                          budget: &mut ComputeBudget|
      -> Result<(), PartOutcome> {
         let b = std::mem::replace(cur, BeBuilder::new(next_pipe, next_piped));
         if !b.is_empty() {
+            if rec_len + raw_units.len() >= limits::MAX_UNITS {
+                return Err(PartOutcome::TooLarge(Cap::Units));
+            }
             if let Err(e) = budget
                 .charge(1)
                 .and_then(|()| budget.charge_alloc(std::mem::size_of::<BeBuilder>()))
@@ -452,472 +531,170 @@ fn lex_one_text(
                 return Err(PartOutcome::Exhausted(e.reason));
             }
             raw_units.push(b);
-            if raw_units.len() > limits::MAX_UNITS {
-                return Err(PartOutcome::TooLarge(Cap::Units));
-            }
         }
         Ok(())
     };
 
-    while i < bytes.len() {
-        if let Err(e) = budget.charge(1) {
-            return Err(PartOutcome::Exhausted(e.reason));
-        }
-        match bytes[i] {
-            b' ' | b'\t' => {
-                i += 1;
+    let scan_res: Result<(), PartOutcome> = (|| {
+        let rec_len = record.units.len();
+
+        while i < bytes.len() {
+            if let Err(e) = budget.charge(1) {
+                return Err(PartOutcome::Exhausted(e.reason));
             }
-            b'\\' if bytes.get(i + 1) == Some(&b'\n') => {
-                if let Err(e) = budget.charge(1) {
-                    return Err(PartOutcome::Exhausted(e.reason));
+            match bytes[i] {
+                b' ' | b'\t' => {
+                    i += 1;
                 }
-                i += 2;
-            }
-            b'\n' => {
-                i += 1;
-                flush_builder(&mut cur, None, false, &mut raw_units, budget)?;
-                let owners = std::mem::take(&mut heredoc_owners);
-                for (hd_idx, (delim, strip_tabs, quoted)) in
-                    std::mem::take(&mut heredocs).into_iter().enumerate()
-                {
-                    let owner = owners.get(hd_idx).copied().unwrap_or(usize::MAX);
-                    let mut body = String::new();
-                    while i < bytes.len() {
-                        let line_start = i;
-                        while i < bytes.len() {
-                            if let Err(e) = budget.charge(1) {
-                                return Err(PartOutcome::Exhausted(e.reason));
-                            }
-                            if bytes[i] == b'\n' {
-                                break;
-                            }
-                            i += 1;
-                        }
-                        let line_str = &text[line_start..i];
-                        if i < bytes.len() && bytes[i] == b'\n' {
-                            i += 1;
-                        }
-                        let trimmed = if strip_tabs {
-                            line_str.trim_start_matches('\t')
-                        } else {
-                            line_str
-                        };
-                        if trimmed == delim {
-                            break;
-                        }
-                        if let Err(e) = push_str_budgeted(&mut body, line_str, budget)
-                            .and_then(|()| push_char_budgeted(&mut body, '\n', budget))
-                        {
-                            return Err(PartOutcome::Exhausted(e.reason));
-                        }
-                    }
-                    if !quoted {
-                        match find_substitutions_budgeted(&body, budget) {
-                            Ok(subs) => {
-                                if let Some(last) = raw_units.last_mut() {
-                                    last.subs.extend(subs);
-                                }
-                            }
-                            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                        }
-                    }
-                    bodies.push((owner, body));
-                }
-            }
-            b';' => {
-                if bytes.get(i + 1) == Some(&b';') {
+                b'\\' if bytes.get(i + 1) == Some(&b'\n') => {
                     if let Err(e) = budget.charge(1) {
                         return Err(PartOutcome::Exhausted(e.reason));
                     }
                     i += 2;
-                } else {
+                }
+                b'\n' => {
                     i += 1;
+                    flush_builder(&mut cur, None, false, &mut raw_units, rec_len, budget)?;
+                    let owners = std::mem::take(&mut heredoc_owners);
+                    for (hd_idx, (delim, strip_tabs, quoted)) in
+                        std::mem::take(&mut heredocs).into_iter().enumerate()
+                    {
+                        let owner = owners.get(hd_idx).copied().unwrap_or(usize::MAX);
+                        let mut body = String::new();
+                        while i < bytes.len() {
+                            let line_start = i;
+                            while i < bytes.len() {
+                                if let Err(e) = budget.charge(1) {
+                                    return Err(PartOutcome::Exhausted(e.reason));
+                                }
+                                if bytes[i] == b'\n' {
+                                    break;
+                                }
+                                i += 1;
+                            }
+                            let line_str = &text[line_start..i];
+                            if i < bytes.len() && bytes[i] == b'\n' {
+                                i += 1;
+                            }
+                            let trimmed = if strip_tabs {
+                                line_str.trim_start_matches('\t')
+                            } else {
+                                line_str
+                            };
+                            if trimmed == delim {
+                                break;
+                            }
+                            if let Err(e) = push_str_budgeted(&mut body, line_str, budget)
+                                .and_then(|()| push_char_budgeted(&mut body, '\n', budget))
+                            {
+                                return Err(PartOutcome::Exhausted(e.reason));
+                            }
+                        }
+                        if !quoted {
+                            match find_substitutions_budgeted(&body, budget) {
+                                Ok(subs) => {
+                                    if let Some(last) = raw_units.last_mut() {
+                                        last.subs.extend(subs);
+                                    }
+                                }
+                                Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                            }
+                        }
+                        bodies.push((owner, body));
+                    }
                 }
-                flush_builder(&mut cur, None, false, &mut raw_units, budget)?;
-            }
-            b'(' | b')' => {
-                let c = bytes[i];
-                i += 1;
-                if c == b'(' {
-                    // `f()` function definition: skip empty parens cleanly.
-                    let mut k = i;
-                    while matches!(bytes.get(k), Some(b' ' | b'\t')) {
+                b';' => {
+                    if bytes.get(i + 1) == Some(&b';') {
                         if let Err(e) = budget.charge(1) {
                             return Err(PartOutcome::Exhausted(e.reason));
                         }
-                        k += 1;
+                        i += 2;
+                    } else {
+                        i += 1;
                     }
-                    if bytes.get(k) == Some(&b')') && !cur.raw_argv.is_empty() {
-                        if let Err(e) = budget.charge(1) {
-                            return Err(PartOutcome::Exhausted(e.reason));
+                    flush_builder(&mut cur, None, false, &mut raw_units, rec_len, budget)?;
+                }
+                b'(' | b')' => {
+                    let c = bytes[i];
+                    i += 1;
+                    if c == b'(' {
+                        // `f()` function definition: skip empty parens cleanly.
+                        let mut k = i;
+                        while matches!(bytes.get(k), Some(b' ' | b'\t')) {
+                            if let Err(e) = budget.charge(1) {
+                                return Err(PartOutcome::Exhausted(e.reason));
+                            }
+                            k += 1;
                         }
-                        i = k + 1;
+                        if bytes.get(k) == Some(&b')') && !cur.raw_argv.is_empty() {
+                            if let Err(e) = budget.charge(1) {
+                                return Err(PartOutcome::Exhausted(e.reason));
+                            }
+                            i = k + 1;
+                        }
                     }
+                    flush_builder(&mut cur, None, false, &mut raw_units, rec_len, budget)?;
                 }
-                flush_builder(&mut cur, None, false, &mut raw_units, budget)?;
-            }
-            b'&' if bytes.get(i + 1) == Some(&b'&') => {
-                if let Err(e) = budget.charge(1) {
-                    return Err(PartOutcome::Exhausted(e.reason));
-                }
-                i += 2;
-                flush_builder(&mut cur, None, false, &mut raw_units, budget)?;
-            }
-            b'&' if bytes.get(i + 1) == Some(&b'>') => {
-                let step = if bytes.get(i + 2) == Some(&b'>') {
-                    3
-                } else {
-                    2
-                };
-                if let Err(e) = budget.charge((step - 1) as u64) {
-                    return Err(PartOutcome::Exhausted(e.reason));
-                }
-                i += step;
-                pending = Some(BePending::Redirect(BestEffortRedirectKind::Write));
-            }
-            b'&' => {
-                i += 1;
-                flush_builder(&mut cur, None, false, &mut raw_units, budget)?;
-            }
-            b'|' => {
-                let is_pipe = bytes.get(i + 1) != Some(&b'|');
-                let step = if is_pipe && bytes.get(i + 1) == Some(&b'&') {
-                    2
-                } else if is_pipe {
-                    1
-                } else {
-                    2
-                };
-                if step > 1
-                    && let Err(e) = budget.charge((step - 1) as u64)
-                {
-                    return Err(PartOutcome::Exhausted(e.reason));
-                }
-                i += step;
-                if is_pipe {
-                    let pid = cur.pipeline_id.unwrap_or_else(|| {
-                        let id = PipelineId(state.next_pipe_id);
-                        state.next_pipe_id += 1;
-                        id
-                    });
-                    cur.pipeline_id = Some(pid);
-                    flush_builder(&mut cur, Some(pid), true, &mut raw_units, budget)?;
-                } else {
-                    flush_builder(&mut cur, None, false, &mut raw_units, budget)?;
-                }
-            }
-            b'#' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'\n' {
+                b'&' if bytes.get(i + 1) == Some(&b'&') => {
                     if let Err(e) = budget.charge(1) {
                         return Err(PartOutcome::Exhausted(e.reason));
                     }
+                    i += 2;
+                    flush_builder(&mut cur, None, false, &mut raw_units, rec_len, budget)?;
+                }
+                b'&' if bytes.get(i + 1) == Some(&b'>') => {
+                    let step = if bytes.get(i + 2) == Some(&b'>') {
+                        3
+                    } else {
+                        2
+                    };
+                    if let Err(e) = budget.charge((step - 1) as u64) {
+                        return Err(PartOutcome::Exhausted(e.reason));
+                    }
+                    i += step;
+                    pending = Some(BePending::Redirect(BestEffortRedirectKind::Write));
+                }
+                b'&' => {
                     i += 1;
+                    flush_builder(&mut cur, None, false, &mut raw_units, rec_len, budget)?;
                 }
-            }
-            b'<' | b'>' if bytes.get(i + 1) != Some(&b'(') => {
-                let before_hd = heredocs.len();
-                match lex_be_redirect(text, i, &mut pending, &mut heredocs, budget) {
-                    Ok(new_i) => i = new_i,
-                    Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                }
-                if heredocs.len() > before_hd {
-                    heredoc_owners.push(raw_units.len());
-                }
-            }
-            _ => {
-                // Read one word linearly.
-                let mut word = String::new();
-                let mut quoted_prefix_empty = true;
-                let mut assign_eq: Option<usize> = None;
-                let start_i = i;
-
-                while i < bytes.len() {
-                    if i > start_i
-                        && let Err(e) = budget.charge(1)
+                b'|' => {
+                    let is_pipe = bytes.get(i + 1) != Some(&b'|');
+                    let step = if is_pipe && bytes.get(i + 1) == Some(&b'&') {
+                        2
+                    } else if is_pipe {
+                        1
+                    } else {
+                        2
+                    };
+                    if step > 1
+                        && let Err(e) = budget.charge((step - 1) as u64)
                     {
                         return Err(PartOutcome::Exhausted(e.reason));
                     }
-                    let b = bytes[i];
-                    match b {
-                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' => break,
-                        b'<' | b'>' if bytes.get(i + 1) != Some(&b'(') => break,
-                        b'\\' => {
-                            quoted_prefix_empty = false;
-                            if i + 1 < bytes.len() {
-                                if let Err(e) = budget.charge(1) {
-                                    return Err(PartOutcome::Exhausted(e.reason));
-                                }
-                                let next_ch = text[i + 1..].chars().next().unwrap_or(' ');
-                                if next_ch != '\n'
-                                    && let Err(e) = push_char_budgeted(&mut word, next_ch, budget)
-                                {
-                                    return Err(PartOutcome::Exhausted(e.reason));
-                                }
-                                i += 1 + next_ch.len_utf8();
-                            } else {
-                                i += 1;
-                            }
-                        }
-                        b'\'' => {
-                            quoted_prefix_empty = false;
-                            i += 1;
-                            while i < bytes.len() {
-                                if let Err(e) = budget.charge(1) {
-                                    return Err(PartOutcome::Exhausted(e.reason));
-                                }
-                                if bytes[i] == b'\'' {
-                                    i += 1;
-                                    break;
-                                }
-                                let ch = text[i..].chars().next().unwrap_or(' ');
-                                if let Err(e) = push_char_budgeted(&mut word, ch, budget) {
-                                    return Err(PartOutcome::Exhausted(e.reason));
-                                }
-                                i += ch.len_utf8();
-                            }
-                        }
-                        b'"' => {
-                            quoted_prefix_empty = false;
-                            i += 1;
-                            while i < bytes.len() {
-                                if let Err(e) = budget.charge(1) {
-                                    return Err(PartOutcome::Exhausted(e.reason));
-                                }
-                                match bytes[i] {
-                                    b'"' => {
-                                        i += 1;
-                                        break;
-                                    }
-                                    b'\\'
-                                        if matches!(
-                                            bytes.get(i + 1),
-                                            Some(b'$' | b'`' | b'"' | b'\\' | b'\n')
-                                        ) =>
-                                    {
-                                        if let Err(e) = budget.charge(1) {
-                                            return Err(PartOutcome::Exhausted(e.reason));
-                                        }
-                                        let nb = bytes[i + 1];
-                                        if nb != b'\n'
-                                            && let Err(e) =
-                                                push_char_budgeted(&mut word, nb as char, budget)
-                                        {
-                                            return Err(PartOutcome::Exhausted(e.reason));
-                                        }
-                                        i += 2;
-                                    }
-                                    b'$' if bytes.get(i + 1) == Some(&b'(') => {
-                                        if let Err(e) = budget.charge(1) {
-                                            return Err(PartOutcome::Exhausted(e.reason));
-                                        }
-                                        match scan_paren_bytes(text, i + 2, 0, budget) {
-                                            Ok((body, end)) => {
-                                                if let Err(e) =
-                                                    push_str_budgeted(&mut word, "$(", budget)
-                                                        .and_then(|()| {
-                                                            push_str_budgeted(
-                                                                &mut word, body, budget,
-                                                            )
-                                                        })
-                                                        .and_then(|()| {
-                                                            push_char_budgeted(
-                                                                &mut word, ')', budget,
-                                                            )
-                                                        })
-                                                        .and_then(|()| {
-                                                            clone_string_budgeted(body, budget)
-                                                                .map(|s| cur.subs.push(s))
-                                                        })
-                                                {
-                                                    return Err(PartOutcome::Exhausted(e.reason));
-                                                }
-                                                i = end;
-                                            }
-                                            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                                        }
-                                    }
-                                    b'`' => match scan_backtick_bytes(text, i + 1, budget) {
-                                        Ok((body, end)) => {
-                                            if let Err(e) =
-                                                push_char_budgeted(&mut word, '`', budget)
-                                                    .and_then(|()| {
-                                                        push_str_budgeted(&mut word, &body, budget)
-                                                    })
-                                                    .and_then(|()| {
-                                                        push_char_budgeted(&mut word, '`', budget)
-                                                    })
-                                            {
-                                                return Err(PartOutcome::Exhausted(e.reason));
-                                            }
-                                            cur.subs.push(body);
-                                            i = end;
-                                        }
-                                        Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                                    },
-                                    b'$' if bytes.get(i + 1) == Some(&b'{') => {
-                                        if let Err(e) = budget.charge(1) {
-                                            return Err(PartOutcome::Exhausted(e.reason));
-                                        }
-                                        match scan_dollar_brace_bytes(text, i + 2, true, 0, budget)
-                                        {
-                                            Ok((body, end)) => {
-                                                if let Err(e) =
-                                                    push_str_budgeted(&mut word, "${", budget)
-                                                        .and_then(|()| {
-                                                            push_str_budgeted(
-                                                                &mut word, body, budget,
-                                                            )
-                                                        })
-                                                        .and_then(|()| {
-                                                            push_char_budgeted(
-                                                                &mut word, '}', budget,
-                                                            )
-                                                        })
-                                                {
-                                                    return Err(PartOutcome::Exhausted(e.reason));
-                                                }
-                                                match find_substitutions_budgeted(body, budget) {
-                                                    Ok(subs) => cur.subs.extend(subs),
-                                                    Err(e) => {
-                                                        return Err(PartOutcome::Exhausted(
-                                                            e.reason,
-                                                        ));
-                                                    }
-                                                }
-                                                i = end;
-                                            }
-                                            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                                        }
-                                    }
-                                    _ => {
-                                        let ch = text[i..].chars().next().unwrap_or(' ');
-                                        if let Err(e) = push_char_budgeted(&mut word, ch, budget) {
-                                            return Err(PartOutcome::Exhausted(e.reason));
-                                        }
-                                        i += ch.len_utf8();
-                                    }
-                                }
-                            }
-                        }
-                        b'$' if bytes.get(i + 1) == Some(&b'(') => {
-                            let dbl = bytes.get(i + 2) == Some(&b'(');
-                            if let Err(e) = budget.charge(1) {
-                                return Err(PartOutcome::Exhausted(e.reason));
-                            }
-                            match scan_paren_bytes(text, i + 2, 0, budget) {
-                                Ok((body, end)) => {
-                                    if let Err(e) = push_str_budgeted(&mut word, "$(", budget)
-                                        .and_then(|()| push_str_budgeted(&mut word, body, budget))
-                                        .and_then(|()| push_char_budgeted(&mut word, ')', budget))
-                                    {
-                                        return Err(PartOutcome::Exhausted(e.reason));
-                                    }
-                                    if dbl {
-                                        match find_substitutions_budgeted(body, budget) {
-                                            Ok(subs) => cur.subs.extend(subs),
-                                            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                                        }
-                                    }
-                                    match clone_string_budgeted(body, budget) {
-                                        Ok(s) => cur.subs.push(s),
-                                        Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                                    }
-                                    i = end;
-                                }
-                                Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                            }
-                        }
-                        b'$' if bytes.get(i + 1) == Some(&b'{') => {
-                            if let Err(e) = budget.charge(1) {
-                                return Err(PartOutcome::Exhausted(e.reason));
-                            }
-                            match scan_dollar_brace_bytes(text, i + 2, false, 0, budget) {
-                                Ok((body, end)) => {
-                                    if let Err(e) = push_str_budgeted(&mut word, "${", budget)
-                                        .and_then(|()| push_str_budgeted(&mut word, body, budget))
-                                        .and_then(|()| push_char_budgeted(&mut word, '}', budget))
-                                    {
-                                        return Err(PartOutcome::Exhausted(e.reason));
-                                    }
-                                    match find_substitutions_budgeted(body, budget) {
-                                        Ok(subs) => cur.subs.extend(subs),
-                                        Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                                    }
-                                    i = end;
-                                }
-                                Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                            }
-                        }
-                        b'`' => match scan_backtick_bytes(text, i + 1, budget) {
-                            Ok((body, end)) => {
-                                if let Err(e) = push_char_budgeted(&mut word, '`', budget)
-                                    .and_then(|()| push_str_budgeted(&mut word, &body, budget))
-                                    .and_then(|()| push_char_budgeted(&mut word, '`', budget))
-                                {
-                                    return Err(PartOutcome::Exhausted(e.reason));
-                                }
-                                cur.subs.push(body);
-                                i = end;
-                            }
-                            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                        },
-                        b'<' | b'>' => {
-                            // Process substitution `<(...)` / `>(...)`.
-                            let dir = b as char;
-                            if let Err(e) = budget.charge(1) {
-                                return Err(PartOutcome::Exhausted(e.reason));
-                            }
-                            match scan_paren_bytes(text, i + 2, 0, budget) {
-                                Ok((body, end)) => {
-                                    if let Err(e) = push_char_budgeted(&mut word, dir, budget)
-                                        .and_then(|()| push_char_budgeted(&mut word, '(', budget))
-                                        .and_then(|()| push_str_budgeted(&mut word, body, budget))
-                                        .and_then(|()| push_char_budgeted(&mut word, ')', budget))
-                                        .and_then(|()| {
-                                            clone_string_budgeted(body, budget)
-                                                .map(|s| cur.subs.push(s))
-                                        })
-                                    {
-                                        return Err(PartOutcome::Exhausted(e.reason));
-                                    }
-                                    i = end;
-                                }
-                                Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                            }
-                        }
-                        b'=' if assign_eq.is_none()
-                            && quoted_prefix_empty
-                            && is_posix_name(word.as_bytes()) =>
-                        {
-                            assign_eq = Some(word.len());
-                            if let Err(e) = push_char_budgeted(&mut word, '=', budget) {
-                                return Err(PartOutcome::Exhausted(e.reason));
-                            }
-                            i += 1;
-                        }
-                        _ => {
-                            let ch = text[i..].chars().next().unwrap_or(' ');
-                            if let Err(e) = push_char_budgeted(&mut word, ch, budget) {
-                                return Err(PartOutcome::Exhausted(e.reason));
-                            }
-                            i += ch.len_utf8();
-                        }
+                    i += step;
+                    if is_pipe {
+                        let pid = cur.pipeline_id.unwrap_or_else(|| {
+                            let id = PipelineId(state.next_pipe_id);
+                            state.next_pipe_id += 1;
+                            id
+                        });
+                        cur.pipeline_id = Some(pid);
+                        flush_builder(&mut cur, Some(pid), true, &mut raw_units, rec_len, budget)?;
+                    } else {
+                        flush_builder(&mut cur, None, false, &mut raw_units, rec_len, budget)?;
                     }
                 }
-
-                if i == start_i {
+                b'#' => {
                     i += 1;
-                    continue;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        if let Err(e) = budget.charge(1) {
+                            return Err(PartOutcome::Exhausted(e.reason));
+                        }
+                        i += 1;
+                    }
                 }
-
-                // Digits directly before `<` or `>` are the redirect fd.
-                if pending.is_none()
-                    && !word.is_empty()
-                    && word.bytes().all(|c| c.is_ascii_digit())
-                    && matches!(bytes.get(i), Some(b'<' | b'>'))
-                    && bytes.get(i + 1) != Some(&b'(')
-                {
+                b'<' | b'>' if bytes.get(i + 1) != Some(&b'(') => {
                     let before_hd = heredocs.len();
                     match lex_be_redirect(text, i, &mut pending, &mut heredocs, budget) {
                         Ok(new_i) => i = new_i,
@@ -926,99 +703,547 @@ fn lex_one_text(
                     if heredocs.len() > before_hd {
                         heredoc_owners.push(raw_units.len());
                     }
-                    continue;
                 }
+                _ => {
+                    // Read one word linearly.
+                    let mut word = String::new();
+                    let mut quoted_prefix_empty = true;
+                    let mut assign_eq: Option<usize> = None;
+                    let start_i = i;
 
-                match pending.take() {
-                    Some(BePending::Redirect(kind)) => {
-                        let fixed = if kind == BestEffortRedirectKind::Dup
-                            && !(word == "-" || word.bytes().all(|c| c.is_ascii_digit()))
+                    while i < bytes.len() {
+                        if i > start_i
+                            && let Err(e) = budget.charge(1)
                         {
-                            BestEffortRedirectKind::Write
-                        } else {
-                            kind
-                        };
-                        cur.redirects.push((fixed, word));
-                    }
-                    Some(BePending::HereString) => {
-                        bodies.push((raw_units.len(), word));
-                    }
-                    None => {
-                        if cur.raw_argv.is_empty()
-                            && let Some(eq) = assign_eq
-                        {
-                            let k = match clone_string_budgeted(&word[..eq], budget) {
-                                Ok(s) => s,
+                            return Err(PartOutcome::Exhausted(e.reason));
+                        }
+                        let b = bytes[i];
+                        match b {
+                            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' => break,
+                            b'<' | b'>' if bytes.get(i + 1) != Some(&b'(') => break,
+                            b'\\' => {
+                                quoted_prefix_empty = false;
+                                if i + 1 < bytes.len() {
+                                    if let Err(e) = budget.charge(1) {
+                                        return Err(PartOutcome::Exhausted(e.reason));
+                                    }
+                                    let next_ch = text[i + 1..].chars().next().unwrap_or(' ');
+                                    if next_ch != '\n'
+                                        && let Err(e) =
+                                            push_char_budgeted(&mut word, next_ch, budget)
+                                    {
+                                        return Err(PartOutcome::Exhausted(e.reason));
+                                    }
+                                    i += 1 + next_ch.len_utf8();
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                            b'\'' => {
+                                quoted_prefix_empty = false;
+                                i += 1;
+                                while i < bytes.len() {
+                                    if let Err(e) = budget.charge(1) {
+                                        return Err(PartOutcome::Exhausted(e.reason));
+                                    }
+                                    if bytes[i] == b'\'' {
+                                        i += 1;
+                                        break;
+                                    }
+                                    let ch = text[i..].chars().next().unwrap_or(' ');
+                                    if let Err(e) = push_char_budgeted(&mut word, ch, budget) {
+                                        return Err(PartOutcome::Exhausted(e.reason));
+                                    }
+                                    i += ch.len_utf8();
+                                }
+                            }
+                            b'"' => {
+                                quoted_prefix_empty = false;
+                                i += 1;
+                                while i < bytes.len() {
+                                    if let Err(e) = budget.charge(1) {
+                                        return Err(PartOutcome::Exhausted(e.reason));
+                                    }
+                                    match bytes[i] {
+                                        b'"' => {
+                                            i += 1;
+                                            break;
+                                        }
+                                        b'\\'
+                                            if matches!(
+                                                bytes.get(i + 1),
+                                                Some(b'$' | b'`' | b'"' | b'\\' | b'\n')
+                                            ) =>
+                                        {
+                                            if let Err(e) = budget.charge(1) {
+                                                return Err(PartOutcome::Exhausted(e.reason));
+                                            }
+                                            let nb = bytes[i + 1];
+                                            if nb != b'\n'
+                                                && let Err(e) = push_char_budgeted(
+                                                    &mut word, nb as char, budget,
+                                                )
+                                            {
+                                                return Err(PartOutcome::Exhausted(e.reason));
+                                            }
+                                            i += 2;
+                                        }
+                                        b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                                            if let Err(e) = budget.charge(1) {
+                                                return Err(PartOutcome::Exhausted(e.reason));
+                                            }
+                                            match scan_paren_bytes(text, i + 2, 0, budget) {
+                                                Ok((body, end)) => {
+                                                    if let Err(e) =
+                                                        push_str_budgeted(&mut word, "$(", budget)
+                                                            .and_then(|()| {
+                                                                push_str_budgeted(
+                                                                    &mut word, body, budget,
+                                                                )
+                                                            })
+                                                            .and_then(|()| {
+                                                                push_char_budgeted(
+                                                                    &mut word, ')', budget,
+                                                                )
+                                                            })
+                                                            .and_then(|()| {
+                                                                clone_string_budgeted(body, budget)
+                                                                    .map(|s| cur.subs.push(s))
+                                                            })
+                                                    {
+                                                        return Err(PartOutcome::Exhausted(
+                                                            e.reason,
+                                                        ));
+                                                    }
+                                                    i = end;
+                                                }
+                                                Err(e) => {
+                                                    return Err(PartOutcome::Exhausted(e.reason));
+                                                }
+                                            }
+                                        }
+                                        b'`' => match scan_backtick_bytes(text, i + 1, budget) {
+                                            Ok((body, end)) => {
+                                                if let Err(e) =
+                                                    push_char_budgeted(&mut word, '`', budget)
+                                                        .and_then(|()| {
+                                                            push_str_budgeted(
+                                                                &mut word, &body, budget,
+                                                            )
+                                                        })
+                                                        .and_then(|()| {
+                                                            push_char_budgeted(
+                                                                &mut word, '`', budget,
+                                                            )
+                                                        })
+                                                {
+                                                    return Err(PartOutcome::Exhausted(e.reason));
+                                                }
+                                                cur.subs.push(body);
+                                                i = end;
+                                            }
+                                            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                                        },
+                                        b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                                            if let Err(e) = budget.charge(1) {
+                                                return Err(PartOutcome::Exhausted(e.reason));
+                                            }
+                                            match scan_dollar_brace_bytes(
+                                                text,
+                                                i + 2,
+                                                true,
+                                                0,
+                                                budget,
+                                            ) {
+                                                Ok((body, end)) => {
+                                                    if let Err(e) =
+                                                        push_str_budgeted(&mut word, "${", budget)
+                                                            .and_then(|()| {
+                                                                push_str_budgeted(
+                                                                    &mut word, body, budget,
+                                                                )
+                                                            })
+                                                            .and_then(|()| {
+                                                                push_char_budgeted(
+                                                                    &mut word, '}', budget,
+                                                                )
+                                                            })
+                                                    {
+                                                        return Err(PartOutcome::Exhausted(
+                                                            e.reason,
+                                                        ));
+                                                    }
+                                                    match find_substitutions_budgeted(body, budget)
+                                                    {
+                                                        Ok(subs) => cur.subs.extend(subs),
+                                                        Err(e) => {
+                                                            return Err(PartOutcome::Exhausted(
+                                                                e.reason,
+                                                            ));
+                                                        }
+                                                    }
+                                                    i = end;
+                                                }
+                                                Err(e) => {
+                                                    return Err(PartOutcome::Exhausted(e.reason));
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            let ch = text[i..].chars().next().unwrap_or(' ');
+                                            if let Err(e) =
+                                                push_char_budgeted(&mut word, ch, budget)
+                                            {
+                                                return Err(PartOutcome::Exhausted(e.reason));
+                                            }
+                                            i += ch.len_utf8();
+                                        }
+                                    }
+                                }
+                            }
+                            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                                // Keep quote balance across `$'...'` (escaping `\'` and `\\`)
+                                // without decoding ANSI-C escapes (dropped per §12).
+                                quoted_prefix_empty = false;
+                                if let Err(e) = budget.charge(1) {
+                                    return Err(PartOutcome::Exhausted(e.reason));
+                                }
+                                if let Err(e) = push_str_budgeted(&mut word, "$'", budget) {
+                                    return Err(PartOutcome::Exhausted(e.reason));
+                                }
+                                i += 2;
+                                while i < bytes.len() {
+                                    if let Err(e) = budget.charge(1) {
+                                        return Err(PartOutcome::Exhausted(e.reason));
+                                    }
+                                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                                        if let Err(e) = budget.charge(1) {
+                                            return Err(PartOutcome::Exhausted(e.reason));
+                                        }
+                                        let next_ch = text[i + 1..].chars().next().unwrap_or(' ');
+                                        if let Err(e) = push_char_budgeted(&mut word, '\\', budget)
+                                            .and_then(|()| {
+                                                push_char_budgeted(&mut word, next_ch, budget)
+                                            })
+                                        {
+                                            return Err(PartOutcome::Exhausted(e.reason));
+                                        }
+                                        i += 1 + next_ch.len_utf8();
+                                    } else if bytes[i] == b'\'' {
+                                        if let Err(e) = push_char_budgeted(&mut word, '\'', budget)
+                                        {
+                                            return Err(PartOutcome::Exhausted(e.reason));
+                                        }
+                                        i += 1;
+                                        break;
+                                    } else {
+                                        let ch = text[i..].chars().next().unwrap_or(' ');
+                                        if let Err(e) = push_char_budgeted(&mut word, ch, budget) {
+                                            return Err(PartOutcome::Exhausted(e.reason));
+                                        }
+                                        i += ch.len_utf8();
+                                    }
+                                }
+                            }
+                            b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                                let dbl = bytes.get(i + 2) == Some(&b'(');
+                                if let Err(e) = budget.charge(1) {
+                                    return Err(PartOutcome::Exhausted(e.reason));
+                                }
+                                match scan_paren_bytes(text, i + 2, 0, budget) {
+                                    Ok((body, end)) => {
+                                        if let Err(e) = push_str_budgeted(&mut word, "$(", budget)
+                                            .and_then(|()| {
+                                                push_str_budgeted(&mut word, body, budget)
+                                            })
+                                            .and_then(|()| {
+                                                push_char_budgeted(&mut word, ')', budget)
+                                            })
+                                        {
+                                            return Err(PartOutcome::Exhausted(e.reason));
+                                        }
+                                        if dbl {
+                                            match find_substitutions_budgeted(body, budget) {
+                                                Ok(subs) => cur.subs.extend(subs),
+                                                Err(e) => {
+                                                    return Err(PartOutcome::Exhausted(e.reason));
+                                                }
+                                            }
+                                        }
+                                        match clone_string_budgeted(body, budget) {
+                                            Ok(s) => cur.subs.push(s),
+                                            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                                        }
+                                        i = end;
+                                    }
+                                    Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                                }
+                            }
+                            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                                if let Err(e) = budget.charge(1) {
+                                    return Err(PartOutcome::Exhausted(e.reason));
+                                }
+                                match scan_dollar_brace_bytes(text, i + 2, false, 0, budget) {
+                                    Ok((body, end)) => {
+                                        if let Err(e) = push_str_budgeted(&mut word, "${", budget)
+                                            .and_then(|()| {
+                                                push_str_budgeted(&mut word, body, budget)
+                                            })
+                                            .and_then(|()| {
+                                                push_char_budgeted(&mut word, '}', budget)
+                                            })
+                                        {
+                                            return Err(PartOutcome::Exhausted(e.reason));
+                                        }
+                                        match find_substitutions_budgeted(body, budget) {
+                                            Ok(subs) => cur.subs.extend(subs),
+                                            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                                        }
+                                        i = end;
+                                    }
+                                    Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                                }
+                            }
+                            b'`' => match scan_backtick_bytes(text, i + 1, budget) {
+                                Ok((body, end)) => {
+                                    if let Err(e) = push_char_budgeted(&mut word, '`', budget)
+                                        .and_then(|()| push_str_budgeted(&mut word, &body, budget))
+                                        .and_then(|()| push_char_budgeted(&mut word, '`', budget))
+                                    {
+                                        return Err(PartOutcome::Exhausted(e.reason));
+                                    }
+                                    cur.subs.push(body);
+                                    i = end;
+                                }
                                 Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                            },
+                            b'<' | b'>' => {
+                                // Process substitution `<(...)` / `>(...)`.
+                                let dir = b as char;
+                                if let Err(e) = budget.charge(1) {
+                                    return Err(PartOutcome::Exhausted(e.reason));
+                                }
+                                match scan_paren_bytes(text, i + 2, 0, budget) {
+                                    Ok((body, end)) => {
+                                        if let Err(e) = push_char_budgeted(&mut word, dir, budget)
+                                            .and_then(|()| {
+                                                push_char_budgeted(&mut word, '(', budget)
+                                            })
+                                            .and_then(|()| {
+                                                push_str_budgeted(&mut word, body, budget)
+                                            })
+                                            .and_then(|()| {
+                                                push_char_budgeted(&mut word, ')', budget)
+                                            })
+                                            .and_then(|()| {
+                                                clone_string_budgeted(body, budget)
+                                                    .map(|s| cur.subs.push(s))
+                                            })
+                                        {
+                                            return Err(PartOutcome::Exhausted(e.reason));
+                                        }
+                                        i = end;
+                                    }
+                                    Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                                }
+                            }
+                            b'=' if assign_eq.is_none()
+                                && quoted_prefix_empty
+                                && is_posix_name(
+                                    word.as_bytes()
+                                        .strip_suffix(b"+")
+                                        .unwrap_or(word.as_bytes()),
+                                ) =>
+                            {
+                                assign_eq = Some(word.len());
+                                if let Err(e) = push_char_budgeted(&mut word, '=', budget) {
+                                    return Err(PartOutcome::Exhausted(e.reason));
+                                }
+                                i += 1;
+                            }
+                            _ => {
+                                let ch = text[i..].chars().next().unwrap_or(' ');
+                                if let Err(e) = push_char_budgeted(&mut word, ch, budget) {
+                                    return Err(PartOutcome::Exhausted(e.reason));
+                                }
+                                i += ch.len_utf8();
+                            }
+                        }
+                    }
+
+                    if i == start_i {
+                        i += 1;
+                        continue;
+                    }
+
+                    // Unquoted digits directly before `<` or `>` are the redirect fd.
+                    if pending.is_none()
+                        && quoted_prefix_empty
+                        && !word.is_empty()
+                        && word.bytes().all(|c| c.is_ascii_digit())
+                        && matches!(bytes.get(i), Some(b'<' | b'>'))
+                        && bytes.get(i + 1) != Some(&b'(')
+                    {
+                        let before_hd = heredocs.len();
+                        match lex_be_redirect(text, i, &mut pending, &mut heredocs, budget) {
+                            Ok(new_i) => i = new_i,
+                            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                        }
+                        if heredocs.len() > before_hd {
+                            heredoc_owners.push(raw_units.len());
+                        }
+                        continue;
+                    }
+
+                    match pending.take() {
+                        Some(BePending::Redirect(kind)) => {
+                            let fixed = if kind == BestEffortRedirectKind::Dup
+                                && !(word == "-" || word.bytes().all(|c| c.is_ascii_digit()))
+                            {
+                                BestEffortRedirectKind::Write
+                            } else {
+                                kind
                             };
-                            let v = match clone_string_budgeted(&word[eq + 1..], budget) {
-                                Ok(s) => s,
-                                Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-                            };
-                            cur.assignments.push((k, v));
-                        } else {
-                            cur.raw_argv.push(word);
+                            cur.redirects.push((fixed, word));
+                        }
+                        Some(BePending::HereString) => {
+                            bodies.push((raw_units.len(), word));
+                        }
+                        None => {
+                            if cur.raw_argv.is_empty()
+                                && let Some(eq) = assign_eq
+                            {
+                                let name_slice =
+                                    word[..eq].strip_suffix('+').unwrap_or(&word[..eq]);
+                                let k = match clone_string_budgeted(name_slice, budget) {
+                                    Ok(s) => s,
+                                    Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                                };
+                                let v = match clone_string_budgeted(&word[eq + 1..], budget) {
+                                    Ok(s) => s,
+                                    Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                                };
+                                cur.assignments.push((k, v));
+                            } else {
+                                cur.raw_argv.push(word);
+                            }
                         }
                     }
                 }
             }
         }
+        flush_builder(&mut cur, None, false, &mut raw_units, rec_len, budget)?;
+        Ok(())
+    })();
+
+    if let Err(err) = scan_res {
+        // Preserve every unit scanned before exhaustion (§8).
+        if matches!(err, PartOutcome::Exhausted(_)) {
+            if !cur.is_empty() && record.units.len() + raw_units.len() < limits::MAX_UNITS {
+                raw_units.push(cur);
+            }
+            flush_builders_raw(raw_units.into_iter(), depth, derived, record);
+        }
+        return Err(err);
     }
-    flush_builder(&mut cur, None, false, &mut raw_units, budget)?;
 
     // Convert raw builders into `BestEffortUnit`s + run bounded code scans.
     let mut raw_to_record_idx: Vec<usize> = Vec::with_capacity(raw_units.len());
     let mut deferred_payloads: Vec<String> = Vec::new();
     let mut pipeline_units: Vec<(PipelineId, usize)> = Vec::new();
+    let mut raw_iter = raw_units.into_iter();
 
-    for b in raw_units {
+    while let Some(b) = raw_iter.next() {
         if record.units.len() >= limits::MAX_UNITS {
             return Err(PartOutcome::TooLarge(Cap::Units));
         }
-        let (eff, alt) = match unwrap_best_effort(&b.raw_argv, budget) {
+        let BestEffortUnwrap {
+            effective: eff,
+            alt,
+            wrapper_payloads,
+        } = match unwrap_best_effort(&b.raw_argv, budget) {
             Ok(v) => v,
-            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+            Err(e) => {
+                flush_builders_raw(std::iter::once(b).chain(raw_iter), depth, derived, record);
+                return Err(PartOutcome::Exhausted(e.reason));
+            }
         };
 
         // Check `$(which CMD)` / `$(command -v CMD)` / `$(type -p CMD)` / `$(echo CMD)`
         // command-word substitutions (CR-19 folded).
         let mut all_alt = alt;
+        let mut extra_wrapper_payloads = wrapper_payloads;
         if let Some(first) = eff.first()
             && has_cmd_sub(first)
-            && let Ok(Some(sub_name)) = substituted_program_budgeted(first, budget)
         {
-            let mut replaced = match clone_vec_string_budgeted(&eff, budget) {
-                Ok(v) => v,
-                Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-            };
-            replaced[0] = sub_name;
-            if let Ok((sub_eff, sub_alt)) = unwrap_best_effort(&replaced, budget) {
-                if !sub_eff.is_empty()
-                    && sub_eff != eff
-                    && !all_alt.contains(&sub_eff)
-                    && all_alt.len() < MAX_ALT_READINGS
-                {
-                    all_alt.push(sub_eff);
-                }
-                for a in sub_alt {
-                    if !a.is_empty()
-                        && a != eff
-                        && !all_alt.contains(&a)
-                        && all_alt.len() < MAX_ALT_READINGS
-                    {
-                        all_alt.push(a);
+            match substituted_program_budgeted(first, budget) {
+                Ok(Some(sub_name)) => {
+                    let mut replaced = match clone_vec_string_budgeted(&eff, budget) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            flush_builders_raw(
+                                std::iter::once(b).chain(raw_iter),
+                                depth,
+                                derived,
+                                record,
+                            );
+                            return Err(PartOutcome::Exhausted(e.reason));
+                        }
+                    };
+                    replaced[0] = sub_name;
+                    match unwrap_best_effort(&replaced, budget) {
+                        Ok(BestEffortUnwrap {
+                            effective: sub_eff,
+                            alt: sub_alt,
+                            wrapper_payloads: sub_wp,
+                        }) => {
+                            extra_wrapper_payloads.extend(sub_wp);
+                            if !sub_eff.is_empty()
+                                && sub_eff != eff
+                                && !all_alt.contains(&sub_eff)
+                                && all_alt.len() < MAX_ALT_READINGS
+                            {
+                                all_alt.push(sub_eff);
+                            }
+                            for a in sub_alt {
+                                if !a.is_empty()
+                                    && a != eff
+                                    && !all_alt.contains(&a)
+                                    && all_alt.len() < MAX_ALT_READINGS
+                                {
+                                    all_alt.push(a);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            flush_builders_raw(
+                                std::iter::once(b).chain(raw_iter),
+                                depth,
+                                derived,
+                                record,
+                            );
+                            return Err(PartOutcome::Exhausted(e.reason));
+                        }
                     }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    flush_builders_raw(std::iter::once(b).chain(raw_iter), depth, derived, record);
+                    return Err(PartOutcome::Exhausted(e.reason));
                 }
             }
         }
 
-        // Collect bounded code payloads from `eff` + `all_alt` + `b.raw_argv` + `b.subs`.
+        // Collect bounded code payloads from `eff` + `all_alt` + wrapper steps + `b.subs`.
         let mut payloads = Vec::new();
         let mut push_unique = |s: String| {
             if !s.is_empty() && !payloads.contains(&s) {
                 payloads.push(s);
             }
         };
+        for p in extra_wrapper_payloads {
+            push_unique(p);
+        }
         for reading in std::iter::once(&eff).chain(all_alt.iter()) {
             match extract_code_payloads(reading, budget) {
                 Ok(ps) => {
@@ -1026,62 +1251,104 @@ fn lex_one_text(
                         push_unique(p);
                     }
                 }
-                Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-            }
-        }
-        // `env -S` / `env -C` inside raw_argv before unwrapping.
-        match extract_env_payloads(&b.raw_argv, budget) {
-            Ok(ps) => {
-                for p in ps {
-                    push_unique(p);
+                Err(e) => {
+                    flush_builders_raw(std::iter::once(b).chain(raw_iter), depth, derived, record);
+                    return Err(PartOutcome::Exhausted(e.reason));
                 }
             }
-            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
-        }
-        // `script -c` / `flock -c` inside raw_argv.
-        match extract_script_flock_payloads(&b.raw_argv, budget) {
-            Ok(ps) => {
-                for p in ps {
-                    push_unique(p);
-                }
-            }
-            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
         }
 
         // Extract `find -exec` / `-execdir` / `-ok` / `-okdir` sub-commands.
         let mut find_execs = Vec::new();
         for reading in std::iter::once(&eff).chain(all_alt.iter()) {
-            if reading
-                .first()
-                .is_some_and(|f| fold_str_cr19(f, budget).ok().as_deref() == Some("find"))
-            {
-                match extract_find_exec_cmds(reading, budget) {
-                    Ok(cmds) => find_execs.extend(cmds),
-                    Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+            if let Some(f) = reading.first() {
+                let folded = match fold_str_cr19(f, budget) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        flush_builders_raw(
+                            std::iter::once(b).chain(raw_iter),
+                            depth,
+                            derived,
+                            record,
+                        );
+                        return Err(PartOutcome::Exhausted(e.reason));
+                    }
+                };
+                if folded == "find" {
+                    match extract_find_exec_cmds(reading, budget) {
+                        Ok(cmds) => find_execs.extend(cmds),
+                        Err(e) => {
+                            flush_builders_raw(
+                                std::iter::once(b).chain(raw_iter),
+                                depth,
+                                derived,
+                                record,
+                            );
+                            return Err(PartOutcome::Exhausted(e.reason));
+                        }
+                    }
                 }
             }
         }
 
         // Process substitutions `<(...)` passed to shells/source/`.` via args or redirects.
-        if std::iter::once(&eff).chain(all_alt.iter()).any(|r| {
-            r.first().is_some_and(|f| {
-                is_be_shell(f, budget).unwrap_or(false)
-                    || matches!(
-                        fold_str_cr19(f, budget).ok().as_deref(),
-                        Some("source" | ".")
-                    )
-            })
-        }) {
+        let mut runs_proc_sub = false;
+        for r in std::iter::once(&eff).chain(all_alt.iter()) {
+            if let Some(f) = r.first() {
+                let is_sh = match is_be_shell(f, budget) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        flush_builders_raw(
+                            std::iter::once(b).chain(raw_iter),
+                            depth,
+                            derived,
+                            record,
+                        );
+                        return Err(PartOutcome::Exhausted(e.reason));
+                    }
+                };
+                if is_sh {
+                    runs_proc_sub = true;
+                    break;
+                }
+                let folded = match fold_str_cr19(f, budget) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        flush_builders_raw(
+                            std::iter::once(b).chain(raw_iter),
+                            depth,
+                            derived,
+                            record,
+                        );
+                        return Err(PartOutcome::Exhausted(e.reason));
+                    }
+                };
+                if matches!(folded.as_str(), "source" | ".") {
+                    runs_proc_sub = true;
+                    break;
+                }
+            }
+        }
+        if runs_proc_sub {
             for w in b
                 .raw_argv
                 .iter()
                 .skip(1)
                 .chain(b.redirects.iter().map(|(_, t)| t))
             {
-                if let Some(inner) = w.strip_prefix("<(").and_then(|r| r.strip_suffix(')'))
-                    && let Ok(s) = clone_string_budgeted(inner, budget)
-                {
-                    push_unique(s);
+                if let Some(inner) = w.strip_prefix("<(").and_then(|r| r.strip_suffix(')')) {
+                    match clone_string_budgeted(inner, budget) {
+                        Ok(s) => push_unique(s),
+                        Err(e) => {
+                            flush_builders_raw(
+                                std::iter::once(b).chain(raw_iter),
+                                depth,
+                                derived,
+                                record,
+                            );
+                            return Err(PartOutcome::Exhausted(e.reason));
+                        }
+                    }
                 }
             }
         }
@@ -1096,6 +1363,7 @@ fn lex_one_text(
             .charge(1)
             .and_then(|()| budget.charge_alloc(std::mem::size_of::<BestEffortUnit>()))
         {
+            flush_builders_raw(std::iter::once(b).chain(raw_iter), depth, derived, record);
             return Err(PartOutcome::Exhausted(e.reason));
         }
         record.units.push(BestEffortUnit {
@@ -1116,14 +1384,25 @@ fn lex_one_text(
             if record.units.len() >= limits::MAX_UNITS {
                 return Err(PartOutcome::TooLarge(Cap::Units));
             }
-            let (f_eff, f_alt) = match unwrap_best_effort(&cmd_argv, budget) {
+            let BestEffortUnwrap {
+                effective: f_eff,
+                alt: f_alt,
+                wrapper_payloads: f_wp,
+            } = match unwrap_best_effort(&cmd_argv, budget) {
                 Ok(v) => v,
-                Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                Err(e) => {
+                    flush_builders_raw(raw_iter, depth, derived, record);
+                    return Err(PartOutcome::Exhausted(e.reason));
+                }
             };
+            for p in f_wp {
+                deferred_payloads.push(p);
+            }
             if let Err(e) = budget
                 .charge(1)
                 .and_then(|()| budget.charge_alloc(std::mem::size_of::<BestEffortUnit>()))
             {
+                flush_builders_raw(raw_iter, depth, derived, record);
                 return Err(PartOutcome::Exhausted(e.reason));
             }
             let idx = record.units.len();
@@ -1143,7 +1422,6 @@ fn lex_one_text(
 
         // Recurse on substitutions and extracted code payloads.
         for sub in b.subs {
-            // Also check `$(echo ...)` / `$(printf ...)` outputs when used as code.
             deferred_payloads.push(sub);
         }
         for p in payloads {
@@ -1157,11 +1435,14 @@ fn lex_one_text(
         let owner_unit = raw_to_record_idx
             .get(owner)
             .and_then(|&idx| record.units.get(idx));
-        let is_crontab = owner_unit.is_some_and(|u| {
-            u.effective_argv
-                .first()
-                .is_some_and(|f| fold_str_cr19(f, budget).ok().as_deref() == Some("crontab"))
-        });
+        let owner_folded = match owner_unit.and_then(|u| u.effective_argv.first()) {
+            Some(f) => match fold_str_cr19(f, budget) {
+                Ok(s) => Some((f.as_str(), s)),
+                Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+            },
+            None => None,
+        };
+        let is_crontab = owner_folded.as_ref().is_some_and(|(_, s)| s == "crontab");
         if is_crontab {
             match crontab_commands_budgeted(&body, budget) {
                 Ok(cmds) if !cmds.is_empty() => deferred_payloads.push(cmds),
@@ -1172,16 +1453,21 @@ fn lex_one_text(
         let feeds_code = match owner_unit {
             None => true,
             Some(u) => {
-                u.pipeline_id.is_some()
-                    || u.effective_argv.first().is_some_and(|f| {
-                        let folded = fold_str_cr19(f, budget).ok();
-                        let s = folded.as_deref().unwrap_or("");
-                        is_be_shell(f, budget).unwrap_or(false)
-                            || is_be_interpreter(s)
-                            || matches!(s, "eval" | "source" | "." | "crontab")
-                            || crate::policy::shell::COMMAND_RUNNERS.contains(&s)
-                            || crate::policy::shell::RESERVED.contains(&f.as_str())
-                    })
+                if u.pipeline_id.is_some() {
+                    true
+                } else if let Some((raw_first, folded)) = owner_folded.as_ref() {
+                    let is_sh = match is_be_shell(raw_first, budget) {
+                        Ok(v) => v,
+                        Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                    };
+                    is_sh
+                        || is_be_interpreter(folded)
+                        || matches!(folded.as_str(), "eval" | "source" | "." | "crontab")
+                        || is_be_code_runner(folded)
+                        || is_be_reserved(raw_first)
+                } else {
+                    false
+                }
             }
         };
         if feeds_code {
@@ -1199,20 +1485,23 @@ fn lex_one_text(
         if !u.piped {
             continue;
         }
-        let receives_code = u.effective_argv.first().is_some_and(|f| {
-            let folded = fold_str_cr19(f, budget).ok();
-            let s = folded.as_deref().unwrap_or("");
-            is_be_shell(f, budget).unwrap_or(false)
-                || matches!(s, "eval" | "source" | "." | "crontab")
-        });
+        let Some(first) = u.effective_argv.first() else {
+            continue;
+        };
+        let is_sh = match is_be_shell(first, budget) {
+            Ok(v) => v,
+            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+        };
+        let folded = match fold_str_cr19(first, budget) {
+            Ok(s) => s,
+            Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+        };
+        let receives_code = is_sh || matches!(folded.as_str(), "eval" | "source" | "." | "crontab");
         if !receives_code {
             continue;
         }
         checked_pipes.push(pid);
-        let is_crontab = u
-            .effective_argv
-            .first()
-            .is_some_and(|f| fold_str_cr19(f, budget).ok().as_deref() == Some("crontab"));
+        let is_crontab = folded == "crontab";
         for &(other_pid, other_idx) in &pipeline_units {
             if other_pid != pid || other_idx == idx {
                 continue;
@@ -1221,11 +1510,12 @@ fn lex_one_text(
             match extract_echo_printf_texts(prev_eff, budget) {
                 Ok(texts) => {
                     for t in texts {
-                        if is_crontab
-                            && let Ok(cmds) = crontab_commands_budgeted(&t, budget)
-                            && !cmds.is_empty()
-                        {
-                            deferred_payloads.push(cmds);
+                        if is_crontab {
+                            match crontab_commands_budgeted(&t, budget) {
+                                Ok(cmds) if !cmds.is_empty() => deferred_payloads.push(cmds),
+                                Ok(_) => {}
+                                Err(e) => return Err(PartOutcome::Exhausted(e.reason)),
+                            }
                         }
                         deferred_payloads.push(t);
                     }
@@ -1243,13 +1533,55 @@ fn lex_one_text(
     }
 
     if derived && state.cache.len() < MAX_CALL_CACHE {
-        let produced = record.units[start_unit_len..].to_vec();
-        if let Ok(key_text) = clone_string_budgeted(text, budget) {
-            state.cache.insert((key_text, depth), produced);
+        let produced_slice = &record.units[start_unit_len..];
+        let cache_bytes: usize = produced_slice
+            .iter()
+            .map(estimate_unit_bytes)
+            .sum::<usize>()
+            .saturating_add(text.len() + std::mem::size_of::<String>());
+        if cache_bytes <= 16_384
+            && budget.remaining_units() >= (cache_bytes.max(1) as u64)
+            && budget.remaining_alloc_bytes() >= cache_bytes
+        {
+            let _ = budget.charge(cache_bytes.max(1) as u64);
+            let _ = budget.charge_alloc(cache_bytes);
+            let produced = produced_slice.to_vec();
+            state
+                .cache
+                .entry(text.to_string())
+                .or_default()
+                .push((depth, produced));
         }
     }
 
     Ok(())
+}
+
+fn flush_builders_raw(
+    builders: impl Iterator<Item = BeBuilder>,
+    depth: u8,
+    derived: bool,
+    record: &mut BestEffortRecord,
+) {
+    for b in builders {
+        if record.units.len() >= limits::MAX_UNITS {
+            break;
+        }
+        let unit_idx = record.units.len();
+        let eff = b.raw_argv.clone();
+        record.units.push(BestEffortUnit {
+            index: unit_idx,
+            raw_argv: b.raw_argv,
+            effective_argv: eff,
+            alt_argv: Vec::new(),
+            assignments: b.assignments,
+            redirects: b.redirects,
+            pipeline_id: b.pipeline_id,
+            piped: b.piped,
+            depth,
+            derived,
+        });
+    }
 }
 
 fn lex_be_redirect(
@@ -1362,7 +1694,17 @@ fn is_be_shell(cmd: &str, budget: &mut ComputeBudget) -> Result<bool, Exhausted>
         return Ok(true);
     }
     let folded = fold_str_cr19(cmd, budget)?;
-    Ok(crate::policy::shell::SHELLS.contains(&folded.as_str()))
+    Ok(tools::lookup(&folded).is_some_and(|t| t.nested_shell)
+        || tools::lookup_outside_model(&folded)
+            .is_some_and(|e| e.contract_section == "§4" && !e.reason.starts_with("Wrapper")))
+}
+
+fn is_be_reserved(raw: &str) -> bool {
+    tools::lookup_outside_model(raw).is_some_and(|e| e.contract_section == "§3")
+}
+
+fn is_be_code_runner(folded: &str) -> bool {
+    tools::lookup(folded).is_some_and(|t| !matches!(t.code_runner, CodeRunnerBehavior::Never))
 }
 
 fn is_be_interpreter(folded: &str) -> bool {
@@ -1389,23 +1731,28 @@ fn substituted_program_budgeted(
         return Ok(None);
     }
     let body = subs[0].trim();
-    let parts: Vec<&str> = body.split_whitespace().collect();
-    let candidate = match parts.as_slice() {
-        [w0, name] => {
+    budget.charge(body.len().max(1) as u64)?;
+    let mut it = body.split_whitespace();
+    let w0 = it.next();
+    let w1 = it.next();
+    let w2 = it.next();
+    let w3 = it.next();
+    let candidate = match (w0, w1, w2, w3) {
+        (Some(w0), Some(name), None, None) => {
             let f = fold_str_cr19(w0, budget)?;
             if matches!(f.as_str(), "which" | "whence" | "echo") {
-                Some(*name)
+                Some(name)
             } else {
                 None
             }
         }
-        [w0, "-v" | "-V", name] => {
+        (Some(w0), Some("-v" | "-V"), Some(name), None) => {
             let f = fold_str_cr19(w0, budget)?;
-            (f == "command").then_some(*name)
+            (f == "command").then_some(name)
         }
-        [w0, "-p" | "-P", name] => {
+        (Some(w0), Some("-p" | "-P"), Some(name), None) => {
             let f = fold_str_cr19(w0, budget)?;
-            (f == "type").then_some(*name)
+            (f == "type").then_some(name)
         }
         _ => None,
     };
@@ -1419,12 +1766,19 @@ fn substituted_program_budgeted(
 
 /// Tolerantly strips reserved words and wrappers (CR-19 folded) up to
 /// `MAX_BEST_EFFORT_WRAP` steps, returning `(effective_argv, alt_argv)`.
+struct BestEffortUnwrap {
+    effective: Vec<String>,
+    alt: Vec<Vec<String>>,
+    wrapper_payloads: Vec<String>,
+}
+
 fn unwrap_best_effort(
     argv: &[String],
     budget: &mut ComputeBudget,
-) -> Result<(Vec<String>, Vec<Vec<String>>), Exhausted> {
+) -> Result<BestEffortUnwrap, Exhausted> {
     let mut cur = clone_vec_string_budgeted(argv, budget)?;
     let mut alts: Vec<Vec<String>> = Vec::new();
+    let mut wrapper_payloads: Vec<String> = Vec::new();
 
     for _ in 0..MAX_BEST_EFFORT_WRAP {
         let Some(first) = cur.first() else {
@@ -1441,6 +1795,11 @@ fn unwrap_best_effort(
             continue;
         }
         let folded = fold_str_cr19(first, budget)?;
+        if folded == "env" {
+            wrapper_payloads.extend(extract_env_payloads(&cur, budget)?);
+        } else if matches!(folded.as_str(), "script" | "flock") {
+            wrapper_payloads.extend(extract_script_flock_payloads(&cur, budget)?);
+        }
         let Some((skip, maybe_alt_skip)) = wrapper_skip_be(&folded, &cur, budget)? else {
             break;
         };
@@ -1460,7 +1819,11 @@ fn unwrap_best_effort(
         cur.drain(..skip);
     }
 
-    Ok((cur, alts))
+    Ok(BestEffortUnwrap {
+        effective: cur,
+        alt: alts,
+        wrapper_payloads,
+    })
 }
 
 /// Returns `Ok(Some((primary_skip, optional_alt_skip)))` for a recognized
@@ -2024,10 +2387,10 @@ fn extract_echo_printf_texts(
                 }
             }
             if j < eff.len() {
-                let joined = eff[j..].join(" ");
-                budget.charge(joined.len() as u64)?;
-                budget.charge_alloc(joined.len())?;
-                out.push(joined);
+                let total_len: usize = eff[j..].iter().map(|s| s.len() + 1).sum();
+                budget.charge(total_len as u64)?;
+                budget.charge_alloc(total_len)?;
+                out.push(eff[j..].join(" "));
             }
         }
         "printf" => {
@@ -2084,8 +2447,8 @@ pub(crate) fn brace_expand_budgeted(
             return Ok(None);
         }
         budget.charge(x.len().max(1) as u64)?;
+        budget.charge_alloc(x.len() * std::mem::size_of::<char>())?;
         let cs: Vec<char> = x.chars().collect();
-        budget.charge_alloc(cs.len() * std::mem::size_of::<char>())?;
 
         // (open, commas, holds_nested_pair)
         let mut stack: Vec<(usize, Vec<usize>, bool)> = Vec::new();
@@ -2115,6 +2478,9 @@ pub(crate) fn brace_expand_budgeted(
                         if nested {
                             continue;
                         }
+                        let inner_bytes = (i - open - 1).saturating_mul(4);
+                        budget.charge((i - open - 1).max(1) as u64)?;
+                        budget.charge_alloc(inner_bytes)?;
                         let inner: String = cs[open + 1..i].iter().collect();
                         match brace_sequence(&inner, budget)? {
                             Some(v) => Ok(v),
@@ -2152,6 +2518,10 @@ pub(crate) fn brace_expand_budgeted(
                 if work.len() + out.len() + alts.len() > MAX_BRACE_RESULTS {
                     return Ok(None);
                 }
+                let pre_est = open.saturating_mul(4);
+                let post_est = (cs.len().saturating_sub(close + 1)).saturating_mul(4);
+                budget.charge((open + cs.len().saturating_sub(close + 1)).max(1) as u64)?;
+                budget.charge_alloc(pre_est + post_est)?;
                 let pre: String = cs[..open].iter().collect();
                 let post: String = cs[close + 1..].iter().collect();
                 for alt in alts {
@@ -2180,11 +2550,18 @@ fn brace_sequence(
     budget: &mut ComputeBudget,
 ) -> Result<Option<Vec<String>>, Exhausted> {
     budget.charge(inner.len().max(1) as u64)?;
-    let parts: Vec<&str> = inner.split("..").collect();
-    if !(2..=3).contains(&parts.len()) {
+    let mut split = inner.split("..");
+    let Some(a) = split.next() else {
+        return Ok(None);
+    };
+    let Some(b) = split.next() else {
+        return Ok(None);
+    };
+    let step_part = split.next();
+    if split.next().is_some() {
         return Ok(None);
     }
-    let step: i128 = match parts.get(2) {
+    let step: i128 = match step_part {
         Some(s) => {
             let Ok(v) = s.parse::<i64>() else {
                 return Ok(None);
@@ -2193,7 +2570,6 @@ fn brace_sequence(
         }
         None => 1,
     };
-    let (a, b) = (parts[0], parts[1]);
     let letter = |s: &str| {
         let mut it = s.chars();
         match (it.next(), it.next()) {
@@ -2249,13 +2625,14 @@ fn brace_sequence(
         if out.len() >= MAX_SEQUENCE {
             return Ok(None);
         }
+        let est_len = width.max(21);
+        budget.charge(est_len as u64)?;
+        budget.charge_alloc(est_len + std::mem::size_of::<String>())?;
         let s = if v < 0 {
             format!("-{:0>w$}", -v, w = width.saturating_sub(1))
         } else {
             format!("{v:0>width$}")
         };
-        budget.charge(s.len().max(1) as u64)?;
-        budget.charge_alloc(s.len() + std::mem::size_of::<String>())?;
         out.push(s);
         v += dir * step;
     }
@@ -2264,8 +2641,8 @@ fn brace_sequence(
 
 fn brace_results_lower_bound(w: &str, budget: &mut ComputeBudget) -> Result<usize, Exhausted> {
     budget.charge(w.len().max(1) as u64)?;
+    budget.charge_alloc(w.len() * std::mem::size_of::<char>())?;
     let cs: Vec<char> = w.chars().collect();
-    budget.charge_alloc(cs.len() * std::mem::size_of::<char>())?;
     let mut stack: Vec<(usize, usize, bool)> = Vec::new();
     let mut pairs: Vec<(usize, usize, usize, bool)> = Vec::new();
     for (i, &c) in cs.iter().enumerate() {
