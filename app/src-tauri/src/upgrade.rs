@@ -107,11 +107,60 @@ mod tests {
 
     use super::*;
 
+    const SIG_DFL: usize = 0;
+    const SIG_IGN: usize = 1;
+    const SIGINT: std::ffi::c_int = 2;
+    const SIGTERM: std::ffi::c_int = 15;
+
+    #[allow(unsafe_code)]
+    fn set_signal_disposition(sig: std::ffi::c_int, handler: usize) -> std::io::Result<()> {
+        unsafe extern "C" {
+            fn signal(sig: std::ffi::c_int, handler: usize) -> usize;
+        }
+        // SAFETY: `signal(2)` is async-signal-safe (POSIX.1-2008) and touches
+        // no Rust allocator or lock state; `SIGINT` (2), `SIGTERM` (15),
+        // `SIG_DFL` (0), and `SIG_IGN` (1) have identical values on Linux and
+        // macOS.
+        let prev = unsafe { signal(sig, handler) };
+        if prev == usize::MAX {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn reset_stop_signals() -> std::io::Result<()> {
+        set_signal_disposition(SIGINT, SIG_DFL)?;
+        set_signal_disposition(SIGTERM, SIG_DFL)
+    }
+
+    #[allow(unsafe_code)]
+    fn spawn_sleeper(seconds: &str, ignore_before_reset: bool) -> Child {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("sleep");
+        command.arg(seconds);
+        // SAFETY: the `pre_exec` closure runs between `fork` and `execve` and
+        // only calls `set_signal_disposition`, which invokes async-signal-safe
+        // `signal(2)`. Resetting `SIGINT` and `SIGTERM` to `SIG_DFL` clears
+        // any `SIG_IGN` inherited from a backgrounded non-interactive shell
+        // (`cmd &`), matching `atriumd` (which installs explicit handlers on
+        // startup). Using `pre_exec` also forces `std`'s fork+exec
+        // CLOEXEC-pipe path so `spawn()` returns only after `execve` has
+        // installed `sleep`'s image.
+        unsafe {
+            command.pre_exec(move || {
+                if ignore_before_reset {
+                    set_signal_disposition(SIGINT, SIG_IGN)?;
+                    set_signal_disposition(SIGTERM, SIG_IGN)?;
+                }
+                reset_stop_signals()
+            });
+        }
+        command.spawn().expect("sleep starts")
+    }
+
     fn sleeper() -> Child {
-        Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .expect("sleep starts")
+        spawn_sleeper("60", false)
     }
 
     fn lock_for(identity: &ProcessIdentity) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -125,6 +174,20 @@ mod tests {
     fn the_daemon_in_the_lock_file_gets_the_signal() {
         for (how, signal) in [(Stop::WhenIdle, 15), (Stop::Now, 2)] {
             let mut child = sleeper();
+            let identity = supervise::identify(child.id())
+                .unwrap()
+                .expect("the child runs");
+            let (_folder, lock) = lock_for(&identity);
+            stop_old_daemon(&lock, child.id(), how).unwrap();
+            let status = child.wait().unwrap();
+            assert_eq!(status.signal(), Some(signal), "{how:?}");
+        }
+    }
+
+    #[test]
+    fn sleeper_receives_signals_even_when_parent_ignores_them() {
+        for (how, signal) in [(Stop::WhenIdle, 15), (Stop::Now, 2)] {
+            let mut child = spawn_sleeper("60", true);
             let identity = supervise::identify(child.id())
                 .unwrap()
                 .expect("the child runs");

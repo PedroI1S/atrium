@@ -851,3 +851,10 @@ rodrigo asked the orchestrator to choose. It kept `dev`'s behaviour on both:
 - **The tool table** (contract §6, P0) is approved like contract text: Codex review, then rodrigo. The rows that change defaults are marked for Pedro.
 - **This amends D-135 and D-136,** which held P0 to P5 until Pedro confirmed. CR-20 stays open until Pedro confirms.
 - Each task keeps PLAN §8: a brief, Neon `high` writers (D-134), the orchestrator's verification (D-123), Codex review (D-124) and the 100% gate (D-120). Each merge still needs rodrigo's explicit go.
+
+## D-139 — 2026-11-22 — rodrigo: approves rev 4 §11 item 15 (followed-link searches can be Allow in Home)
+**Decided by rodrigo (driver).** P0's Codex review (`reviews/M1-36-rev4-p0-interface.md`, finding 2) found that contract §10 row 15 relaxes `dev`'s default but §11 didn't list it.
+- **What item 15 says:** `rg -L`, `grep -R`, `find -L` and `ack --follow` are Clear, so Home allows them, when `SessionGate`'s link walk finds no link to a protected path within budget.
+- **Unchanged:** a link that reaches a protected path is still a hit (no filter) or Unread (with a filter), and reaching the walk cap is Unread.
+- **The documents:** item 15 is added to contract §11 and to `rev4-for-pedro.md`.
+- **Under D-013 and D-138,** item 15 goes to Pedro with the other 14. It takes effect only at P5.

@@ -166,17 +166,83 @@ fn allow() -> Arc<dyn ToolGate> {
     TestGate::new(|_| GateDecision::Allow)
 }
 
-async fn wait_file(path: &Path, secs: u64) -> String {
-    let end = Instant::now() + Duration::from_secs(secs);
+async fn wait_file_until<T>(
+    path: &Path,
+    timeout: Duration,
+    mut parse: impl FnMut(&str) -> Option<T>,
+) -> T {
+    let end = Instant::now() + timeout;
+    let mut last_seen: Option<String> = None;
     loop {
-        if let Ok(text) = fs::read_to_string(path)
-            && !text.trim().is_empty()
-        {
-            return text;
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Some(value) = parse(&text) {
+                return value;
+            }
+            last_seen = Some(text);
         }
-        assert!(Instant::now() < end, "{} never appeared", path.display());
+        assert!(
+            Instant::now() < end,
+            "{} never became complete (last_seen={last_seen:?})",
+            path.display()
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+async fn wait_file(path: &Path, secs: u64) -> String {
+    wait_file_until(path, Duration::from_secs(secs), |text| {
+        (text.ends_with('\n') && !text.trim().is_empty()).then(|| text.to_owned())
+    })
+    .await
+}
+
+async fn wait_json(path: &Path, secs: u64) -> Value {
+    wait_file_until(path, Duration::from_secs(secs), |text| {
+        serde_json::from_str::<Value>(text).ok()
+    })
+    .await
+}
+
+async fn wait_pid(path: &Path, secs: u64) -> String {
+    wait_file_until(path, Duration::from_secs(secs), |text| {
+        if !text.ends_with('\n') {
+            return None;
+        }
+        let trimmed = text.trim();
+        trimmed
+            .parse::<u32>()
+            .ok()
+            .filter(|&pid| pid > 0)
+            .map(|_| trimmed.to_owned())
+    })
+    .await
+}
+
+/// The completed (`\n`-terminated) lines of `responses.jsonl` so far, as JSON.
+///
+/// An unfinished trailing line (without `\n` yet) is ignored while the writer
+/// is still appending. Every completed line must parse as valid JSON.
+fn responses(dir: &Path) -> Vec<Value> {
+    let path = dir.join("responses.jsonl");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Some(last_nl) = raw.rfind('\n') else {
+        return Vec::new();
+    };
+    raw[..=last_nl]
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| {
+            serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!(
+                    "malformed completed JSONL line {} in {}: {err}: {line:?}",
+                    idx + 1,
+                    path.display()
+                )
+            })
+        })
+        .collect()
 }
 
 fn alive(pid: &str) -> bool {
@@ -258,8 +324,8 @@ async fn saturation_unread_events_still_obey_interrupt_and_shutdown() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(events.len(), events.max_capacity(), "event channel is full");
-    let pid = wait_file(&dir.join("pids.txt"), 5).await;
-    let grandchild = wait_file(&dir.join("grandchild.pid"), 5).await;
+    let pid = wait_pid(&dir.join("pids.txt"), 5).await;
+    let grandchild = wait_pid(&dir.join("grandchild.pid"), 5).await;
     assert!(alive(&grandchild) && group_alive(process.pgid));
 
     let t = Instant::now();
@@ -314,7 +380,7 @@ async fn an_interrupt_the_child_ignores_ends_the_session() {
         matches!(e, AgentEvent::TurnStarted { .. })
     })
     .await;
-    let pid = wait_file(&dir.join("pids.txt"), 5).await;
+    let pid = wait_pid(&dir.join("pids.txt"), 5).await;
     let pgid = session.process.as_ref().unwrap().pgid;
 
     session
@@ -355,7 +421,7 @@ async fn start_dropped_and_leader_exits_kill_process_group() {
         .unwrap_err();
     assert!(matches!(err, AdapterError::Handshake(_)));
     let identity = spawned.lock().unwrap().clone().expect("on_spawn called");
-    let grandchild = wait_file(&dir.join("grandchild.pid"), 5).await;
+    let grandchild = wait_pid(&dir.join("grandchild.pid"), 5).await;
     // Wait briefly for terminate_blocking / terminate to reap.
     let end = Instant::now() + Duration::from_secs(3);
     while alive(&grandchild) && Instant::now() < end {
@@ -469,21 +535,21 @@ async fn config_becomes_cli_arguments_and_thread_params() {
                 .any(|w| w == ["app-server", "--listen", "stdio://"])
         );
 
-        let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
-        let thread_req: Value = wire
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        let records = responses(&dir);
+        let thread_req: Value = records
+            .iter()
             .find(|v| v.get("method").and_then(Value::as_str) == Some("thread/resume"))
+            .cloned()
             .expect("thread/resume sent");
         assert_eq!(thread_req["params"]["sandbox"], expected_sandbox);
         assert_eq!(thread_req["params"]["approvalPolicy"], expected_approval);
         assert_eq!(thread_req["params"]["approvalsReviewer"], "user");
         assert_eq!(thread_req["params"]["threadId"], "thread-prev");
 
-        let turn_req: Value = wire
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        let turn_req: Value = records
+            .iter()
             .find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .cloned()
             .expect("turn/start sent");
         assert_eq!(turn_req["params"]["effort"], "high");
 
@@ -556,10 +622,8 @@ async fn gate_allow_deny_and_redeem_flow() {
         assert_ne!(redeems[0].1.input, serde_json::json!({}));
     }
     let _ = shutdown(session).await;
-    let wire1 = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
-    let reply1: Value = wire1
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    let reply1: Value = responses(&dir)
+        .into_iter()
         .find(|v| v.get("id").and_then(Value::as_str) == Some("srv-cmd-1"))
         .expect("srv-cmd-1 reply written");
     assert_eq!(reply1["result"]["decision"], "accept");
@@ -627,10 +691,8 @@ async fn gate_allow_deny_and_redeem_flow() {
         assert_eq!(redeems2[0].1, checks2[0]);
     }
     let _ = shutdown(session2).await;
-    let wire2 = fs::read_to_string(dir2.join("responses.jsonl")).unwrap();
-    let reply2: Value = wire2
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    let reply2: Value = responses(&dir2)
+        .into_iter()
         .find(|v| v.get("id").and_then(Value::as_str) == Some("srv-cmd-1"))
         .expect("srv-cmd-1 reply written");
     assert_eq!(
@@ -881,10 +943,8 @@ async fn decline_question_sends_empty_answers_and_continues_turn() {
 
     let _ = shutdown(session).await;
 
-    let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
-    let reply: Value = wire
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    let reply: Value = responses(&dir)
+        .into_iter()
         .find(|v| v.get("id").and_then(Value::as_str) == Some("srv-q-1"))
         .expect("question reply sent to fake server");
     assert_eq!(reply["result"], serde_json::json!({ "answers": {} }));
@@ -1012,10 +1072,8 @@ async fn unverified_legacy_permissions_and_grant_root_requests_are_declined() {
 
     let _ = shutdown(session).await;
 
-    let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
-    let replies: std::collections::HashMap<String, Value> = wire
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    let replies: std::collections::HashMap<String, Value> = responses(&dir)
+        .into_iter()
         .filter_map(|v| {
             let id = v.get("id")?.as_str()?.to_owned();
             let res = v.get("result")?.clone();
@@ -1227,25 +1285,21 @@ async fn saturation_declines_approvals_questions_and_reports_dropped_events() {
     // Wait for Codex fake server to record both declines in responses.jsonl.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap_or_default();
-        let has_cmd_decline = wire.lines().any(|l| {
-            serde_json::from_str::<Value>(l).ok().is_some_and(|v| {
-                v.get("id").and_then(Value::as_str) == Some("srv-sat-cmd")
-                    && v.pointer("/result/decision").and_then(Value::as_str) == Some("decline")
-            })
+        let records = responses(&dir);
+        let has_cmd_decline = records.iter().any(|v| {
+            v.get("id").and_then(Value::as_str) == Some("srv-sat-cmd")
+                && v.pointer("/result/decision").and_then(Value::as_str) == Some("decline")
         });
-        let has_q_decline = wire.lines().any(|l| {
-            serde_json::from_str::<Value>(l).ok().is_some_and(|v| {
-                v.get("id").and_then(Value::as_str) == Some("srv-sat-q")
-                    && v.get("result") == Some(&serde_json::json!({ "answers": {} }))
-            })
+        let has_q_decline = records.iter().any(|v| {
+            v.get("id").and_then(Value::as_str) == Some("srv-sat-q")
+                && v.get("result") == Some(&serde_json::json!({ "answers": {} }))
         });
         if has_cmd_decline && has_q_decline {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for saturation declines in responses.jsonl: {wire}"
+            "timed out waiting for saturation declines in responses.jsonl: {records:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -1288,6 +1342,127 @@ async fn saturation_declines_approvals_questions_and_reports_dropped_events() {
         "expected dropped non-terminal event report, got {non_fatal_errors:?}"
     );
     assert!(matches!(evs.last(), Some(AgentEvent::SessionEnded { .. })));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn wait_helpers_ignore_empty_and_half_written_files() {
+    let dir = scratch("wait-partial");
+
+    // 1. JSON reader waits past empty and truncated files until valid JSON lands.
+    let json_path = dir.join("response.json");
+    fs::write(&json_path, "").unwrap();
+    let mut json_fut = Box::pin(wait_json(&json_path, 5));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut json_fut)
+            .await
+            .is_err(),
+        "wait_json returned on an empty file"
+    );
+    fs::write(&json_path, r#"{"result":{"decision":"#).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut json_fut)
+            .await
+            .is_err(),
+        "wait_json returned on truncated JSON"
+    );
+    fs::write(&json_path, r#"{"result":{"decision":"accept"}}"#).unwrap();
+    let value = json_fut.await;
+    assert_eq!(value["result"]["decision"], "accept");
+
+    // 2. PID and marker readers wait past empty and unterminated partial writes.
+    let pid_path = dir.join("grandchild.pid");
+    fs::write(&pid_path, "").unwrap();
+    let mut pid_fut = Box::pin(wait_pid(&pid_path, 5));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut pid_fut)
+            .await
+            .is_err(),
+        "wait_pid returned on an empty file"
+    );
+    fs::write(&pid_path, "4242").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut pid_fut)
+            .await
+            .is_err(),
+        "wait_pid returned before the trailing newline"
+    );
+    fs::write(&pid_path, "4242\n").unwrap();
+    assert_eq!(pid_fut.await, "4242");
+
+    let marker_path = dir.join("interrupted");
+    fs::write(&marker_path, "").unwrap();
+    let mut marker_fut = Box::pin(wait_file(&marker_path, 5));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut marker_fut)
+            .await
+            .is_err(),
+        "wait_file returned on an empty file"
+    );
+    fs::write(&marker_path, "1").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut marker_fut)
+            .await
+            .is_err(),
+        "wait_file returned before the trailing newline"
+    );
+    fs::write(&marker_path, "1\n").unwrap();
+    assert_eq!(marker_fut.await, "1\n");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn responses_fails_on_malformed_completed_jsonl_line() {
+    let dir = scratch("responses-malformed");
+    let jsonl_path = dir.join("responses.jsonl");
+
+    // 1. A completed malformed line before a valid record must panic with the
+    // malformed line in the diagnostic.
+    fs::write(
+        &jsonl_path,
+        "not-json-at-all\n{\"id\":\"srv-1\",\"result\":{}}\n",
+    )
+    .unwrap();
+    let payload = std::panic::catch_unwind(|| responses(&dir))
+        .expect_err("malformed completed JSONL line must fail responses()");
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        msg.contains("not-json-at-all") && msg.contains("line 1"),
+        "diagnostic must show the malformed line and line number, got: {msg}"
+    );
+
+    // 2. A completed blank line before a valid record must also fail.
+    fs::write(&jsonl_path, "\n{\"id\":\"srv-1\",\"result\":{}}\n").unwrap();
+    let blank_payload = std::panic::catch_unwind(|| responses(&dir))
+        .expect_err("blank completed JSONL line must fail responses()");
+    let blank_msg = blank_payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| blank_payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        blank_msg.contains("\"\"") && blank_msg.contains("line 1"),
+        "diagnostic must show the blank line and line number, got: {blank_msg}"
+    );
+
+    // 3. An unfinished trailing line (no newline yet) is ignored.
+    fs::write(&jsonl_path, "{\"truncated").unwrap();
+    assert!(responses(&dir).is_empty());
+
+    fs::write(
+        &jsonl_path,
+        "{\"id\":\"srv-1\",\"result\":{}}\n{\"truncated",
+    )
+    .unwrap();
+    let parsed = responses(&dir);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0]["id"], "srv-1");
 
     let _ = fs::remove_dir_all(&dir);
 }

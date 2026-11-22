@@ -18,7 +18,7 @@ Pedir aprovação também no FullAccess foi descartado por dois motivos:
 - **Uso real:** 53% de 3.353 comandos reais de agentes têm alguma construção dinâmica (`$VAR`, loops, `$(…)`, heredoc).
 - **Contorno trivial:** no FullAccess o hard deny não segura quem quer contorná-lo. Basta gravar `sudo id` num arquivo e rodar `sh x.sh`.
 
-## Os 14 itens para confirmar (§11)
+## Os 15 itens para confirmar (§11)
 
 1. **"Não lido" é liberado sob Any e FullAccess,** depois do melhor esforço. Isso generaliza o segundo ponto do D-133.
 2. **"Não lido" sempre pede aprovação no Home e com regras de prefixo ou exatas,** inclusive em linhas que o `dev` libera resolvendo-as: K7, linhas longas de `env` (K9) e palavras ANSI-C.
@@ -42,6 +42,10 @@ Pedir aprovação também no FullAccess foi descartado por dois motivos:
 12. **O S8** (hard deny de pastas que contêm uma credencial), com as exceções da home, dos ancestrais da home e de `~/.config`, e estendido aos ancestrais das pastas de dados do Atrium fora da home.
 13. **Nomes que só batem com um nome protegido por outra equivalência** (normalização Unicode, outras dobras de maiúsculas) viram "não lido": o Home pede aprovação onde o `dev` libera.
 14. **Caminhos que dependem do processo** (`/proc/self/…`, `/dev/fd/…`, `/dev/std*`) viram "não lido".
+15. **Buscas que seguem links podem ser permitidas no Home** (`rg -L`, `grep -R`, `find -L`).
+    - **O que muda:** se o Gate percorre os links da pasta e, dentro do orçamento, nenhum leva a algo protegido, a busca é permitida. No `dev`, o Home sempre pede aprovação para essas buscas.
+    - **O que continua igual:** um link que chega a algo protegido continua bloqueado, e um percurso que estoura o limite pede aprovação.
+    - **Por que entrou agora:** a linha 15 dos exemplos do contrato já dizia isso, mas faltava o item no §11. rodrigo aprovou em 2026-11-22 (D-139).
 
 **Mantido de propósito:**
 - `Unknown` pede aprovação em todo lugar.
@@ -53,7 +57,7 @@ Pedir aprovação também no FullAccess foi descartado por dois motivos:
 
 ## O que você decide
 
-- Confirmar os 14 itens.
+- Confirmar os 15 itens.
 - Ou recusar itens específicos, cada um com o que fazer no lugar.
 
 O item 1 é o central. Se você o recusar, a alternativa é pedir aprovação também no FullAccess para linhas dinâmicas, o que, pela medição, pediria em cerca de metade dos comandos.
