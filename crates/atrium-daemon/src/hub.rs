@@ -15,7 +15,7 @@ use atrium_protocol::wire::{ServerMessage, StoredEvent};
 use serde_json::{Value, json};
 
 use crate::codec;
-use crate::conn::{Coalesce, Conn, ConnId, Pushed, SubId};
+use crate::conn::{Coalesce, Conn, ConnId, GoLive, Pushed, SubId};
 
 /// A transition the user should hear about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,16 +281,40 @@ impl Hub {
     /// A subscription has everything stored and is pushed to from now on.
     /// Called with the publish lock held, so no event falls between what it
     /// read from the store and what is pushed.
-    pub(crate) fn go_live(&mut self, conn: &Arc<Conn>, sub: SubId, thread: &ThreadId) -> bool {
-        if !conn.go_live(sub) {
-            return false;
-        }
+    fn register_live(&mut self, conn: &Arc<Conn>, sub: SubId, thread: &ThreadId) {
         let subs = self.live.entry(thread.clone()).or_default();
         // A connection has one subscription per thread: what it had before
         // is over, and would otherwise stay listed until the next event.
         subs.retain(|(other, _)| other.id != conn.id);
         subs.push((conn.clone(), sub));
+    }
+
+    pub(crate) fn go_live(&mut self, conn: &Arc<Conn>, sub: SubId, thread: &ThreadId) -> bool {
+        if !conn.go_live(sub) {
+            return false;
+        }
+        self.register_live(conn, sub, thread);
         true
+    }
+
+    /// Queues `ReplayDone` and registers `sub` as live atomically under the
+    /// publish lock, returning `Err(done)` when the connection's event lane has
+    /// no room for `done` right now.
+    pub(crate) fn go_live_with_done(
+        &mut self,
+        conn: &Arc<Conn>,
+        sub: SubId,
+        thread: &ThreadId,
+        done: codec::Frame,
+    ) -> Result<bool, codec::Frame> {
+        match conn.go_live_with_done(sub, done) {
+            GoLive::Live => {
+                self.register_live(conn, sub, thread);
+                Ok(true)
+            }
+            GoLive::Gone => Ok(false),
+            GoLive::Full(done) => Err(done),
+        }
     }
 
     /// Sends newly stored events to the thread's live subscribers.

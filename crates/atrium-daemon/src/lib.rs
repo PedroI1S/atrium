@@ -31,10 +31,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atrium_agents::AgentAdapter;
 use atrium_core::policy::{DefaultPolicy, Ledger};
@@ -88,6 +91,101 @@ pub const DEFAULT_PATH_EXTRAS: &[&str] = &[
     "/usr/local/bin",
 ];
 
+/// Maximum time `atriumd` waits for the user's login shell to print `PATH`.
+pub const LOGIN_SHELL_PATH_TIMEOUT: Duration = Duration::from_millis(2000);
+
+const PATH_START_MARKER: &[u8] = b"__ATRIUM_PATH_START__";
+const PATH_END_MARKER: &[u8] = b"__ATRIUM_PATH_END__";
+const MAX_LOGIN_SHELL_OUTPUT: u64 = 64 * 1024;
+
+/// Returns `true` when `shell` refers to `fish`.
+pub fn is_fish_shell(shell: &Path) -> bool {
+    shell
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("fish"))
+}
+
+/// Command passed to `$SHELL -ilc` to print `PATH` between sentinel markers.
+pub fn login_shell_path_command(shell: &Path) -> &'static str {
+    if is_fish_shell(shell) {
+        // `string join` always emits a trailing newline (`-n` only drops empty
+        // items); fish command substitution strips that newline before `printf`.
+        "printf '__ATRIUM_PATH_START__%s__ATRIUM_PATH_END__' (string join : -- $PATH)"
+    } else {
+        "printf '__ATRIUM_PATH_START__%s__ATRIUM_PATH_END__' \"$PATH\""
+    }
+}
+
+/// Extracts the raw `PATH` bytes wrapped between the sentinel markers, ignoring
+/// any shell startup noise (MOTD, prompts) printed before or after.
+pub fn extract_marked_path(output: &[u8]) -> Option<OsString> {
+    let start = output
+        .windows(PATH_START_MARKER.len())
+        .position(|w| w == PATH_START_MARKER)?
+        + PATH_START_MARKER.len();
+    let rest = &output[start..];
+    let end = rest
+        .windows(PATH_END_MARKER.len())
+        .position(|w| w == PATH_END_MARKER)?;
+    let slice = &rest[..end];
+    if slice.is_empty() {
+        return None;
+    }
+    Some(OsStr::from_bytes(slice).to_os_string())
+}
+
+/// Runs `$SHELL -ilc` with a short timeout to discover the user's login-shell
+/// `PATH` (for `nvm`, `asdf`, `mise`, or custom init scripts). Never fails
+/// startup: returns `None` if `shell` is unset, fails to spawn, exits non-zero,
+/// times out, or emits no marked `PATH`.
+pub fn discover_login_shell_path(shell: Option<&OsStr>, timeout: Duration) -> Option<OsString> {
+    let shell = shell.filter(|s| !s.is_empty())?;
+    let shell_path = Path::new(shell);
+    let mut cmd = Command::new(shell_path);
+    cmd.args(["-ilc", login_shell_path_command(shell_path)])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.take(MAX_LOGIN_SHELL_OUTPUT).read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let bytes = rx
+        .recv_timeout(remaining.max(Duration::from_millis(50)))
+        .ok()?;
+    extract_marked_path(&bytes)
+}
+
 /// Merges `existing` `PATH` entries with `candidates` that satisfy `exists`.
 ///
 /// Keeps every non-empty entry from `existing` first, in order, then appends
@@ -101,39 +199,62 @@ pub fn provider_path<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
     exists: impl Fn(&Path) -> bool,
 ) -> OsString {
+    provider_path_with_shell(existing, None, home, candidates, exists)
+}
+
+/// Like [`provider_path`], also merging absolute directories from `shell_path`
+/// (the login shell's `PATH`). Order: `existing` entries first, then
+/// `$HOME`-relative `candidates`, then `shell_path` entries, then absolute
+/// `candidates`.
+pub fn provider_path_with_shell<'a>(
+    existing: Option<&OsStr>,
+    shell_path: Option<&OsStr>,
+    home: &Path,
+    candidates: impl IntoIterator<Item = &'a str>,
+    exists: impl Fn(&Path) -> bool,
+) -> OsString {
     let mut entries: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
+    let mut push_if_new = |resolved: PathBuf, check_exists: bool| {
+        if resolved.as_os_str().is_empty() || seen.contains(&resolved) {
+            return;
+        }
+        if std::env::join_paths(std::iter::once(&resolved)).is_err() {
+            return;
+        }
+        if (!check_exists || exists(&resolved)) && seen.insert(resolved.clone()) {
+            entries.push(resolved);
+        }
+    };
+
     if let Some(raw) = existing {
         for entry in std::env::split_paths(raw) {
-            if entry.as_os_str().is_empty() {
-                continue;
-            }
-            if seen.insert(entry.clone()) {
-                entries.push(entry);
-            }
+            push_if_new(entry, false);
         }
     }
 
     let has_home = !home.as_os_str().is_empty();
+    let mut absolute_candidates: Vec<PathBuf> = Vec::new();
     for candidate in candidates {
         let candidate_path = Path::new(candidate);
-        let resolved = if candidate_path.is_absolute() {
-            candidate_path.to_path_buf()
+        if candidate_path.is_absolute() {
+            absolute_candidates.push(candidate_path.to_path_buf());
         } else if has_home {
-            home.join(candidate_path)
-        } else {
-            continue;
-        };
-        if seen.contains(&resolved) {
-            continue;
+            push_if_new(home.join(candidate_path), true);
         }
-        if std::env::join_paths(std::iter::once(&resolved)).is_err() {
-            continue;
+    }
+
+    if let Some(raw) = shell_path {
+        for entry in std::env::split_paths(raw) {
+            if entry.is_absolute() {
+                push_if_new(entry, true);
+            }
         }
-        if exists(&resolved) && seen.insert(resolved.clone()) {
-            entries.push(resolved);
-        }
+    }
+
+    for resolved in absolute_candidates {
+        push_if_new(resolved, true);
     }
 
     std::env::join_paths(&entries)
@@ -506,7 +627,10 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
-    use super::{DEFAULT_PATH_EXTRAS, provider_path};
+    use super::{
+        DEFAULT_PATH_EXTRAS, extract_marked_path, is_fish_shell, login_shell_path_command,
+        provider_path, provider_path_with_shell,
+    };
 
     #[test]
     fn provider_path_keeps_existing_first_and_appends_in_order() {
@@ -637,5 +761,69 @@ mod tests {
             merged,
             OsStr::new("/usr/bin:/opt/homebrew/bin:/usr/local/bin")
         );
+    }
+
+    #[test]
+    fn provider_path_with_shell_merges_and_deduplicates_in_order() {
+        let home = Path::new("/home/alice");
+        let existing = OsStr::new("/custom/bin:/usr/bin");
+        let shell = OsStr::new(
+            "/home/alice/.nvm/versions/node/v22/bin:relative/dir:/usr/bin:/opt/homebrew/bin:/home/alice/.local/bin",
+        );
+        let merged = provider_path_with_shell(
+            Some(existing),
+            Some(shell),
+            home,
+            DEFAULT_PATH_EXTRAS.iter().copied(),
+            |p| {
+                matches!(
+                    p.to_str(),
+                    Some(
+                        "/home/alice/.local/bin"
+                            | "/home/alice/.nvm/versions/node/v22/bin"
+                            | "/opt/homebrew/bin"
+                            | "/usr/local/bin"
+                    )
+                )
+            },
+        );
+        let parts: Vec<PathBuf> = std::env::split_paths(&merged).collect();
+        assert_eq!(
+            parts,
+            vec![
+                PathBuf::from("/custom/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/home/alice/.local/bin"),
+                PathBuf::from("/home/alice/.nvm/versions/node/v22/bin"),
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/local/bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn fish_shell_detection_and_marker_extraction() {
+        assert!(is_fish_shell(Path::new("/opt/homebrew/bin/fish")));
+        assert!(is_fish_shell(Path::new("fish")));
+        assert!(!is_fish_shell(Path::new("/bin/zsh")));
+        assert!(!is_fish_shell(Path::new("/bin/bash")));
+
+        let fish_cmd = login_shell_path_command(Path::new("/opt/homebrew/bin/fish"));
+        assert_eq!(
+            fish_cmd,
+            "printf '__ATRIUM_PATH_START__%s__ATRIUM_PATH_END__' (string join : -- $PATH)"
+        );
+        assert!(login_shell_path_command(Path::new("/bin/zsh")).contains("$PATH"));
+
+        let noisy = b"Welcome to fish!\n__ATRIUM_PATH_START__/nvm/bin:/opt/\xff/bin__ATRIUM_PATH_END__\nbye\n";
+        assert_eq!(
+            extract_marked_path(noisy).as_deref(),
+            Some(OsStr::from_bytes(b"/nvm/bin:/opt/\xff/bin"))
+        );
+        assert_eq!(
+            extract_marked_path(b"__ATRIUM_PATH_START____ATRIUM_PATH_END__"),
+            None
+        );
+        assert_eq!(extract_marked_path(b"no markers here"), None);
     }
 }

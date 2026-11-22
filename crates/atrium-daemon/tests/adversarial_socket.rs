@@ -355,57 +355,172 @@ async fn flooding_unread_list_threads_past_8_mib_control_lane_closes_connection(
     const LIMIT: usize = 8 * 1024 * 1024;
     // phase 1: well below the limit
     let phase1 = (6 * 1024 * 1024) / size;
-    // phase 2: past it, counting nothing as drained
-    let phase2 = LIMIT / size + 2;
+    // phase 2: sized from the lane limit with margin for socket buffering,
+    // counting nothing as drained
+    let phase2 = (LIMIT + 4 * 1024 * 1024) / size + 2;
 
-    let mut flooded = rig.dev().await;
+    async fn write_msg(stream: &mut UnixStream, message: &ClientMessage) -> std::io::Result<()> {
+        let payload = serde_json::to_vec(message).expect("serializes");
+        let mut frame = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+        frame.push(0);
+        frame.extend_from_slice(&payload);
+        stream.write_all(&frame).await
+    }
+
+    async fn read_msg(stream: &mut UnixStream) -> Option<ServerMessage> {
+        soon(async {
+            let len = stream.read_u32().await.ok()?;
+            let kind = stream.read_u8().await.ok()?;
+            assert_eq!(kind, 0, "M1 has no stream frames");
+            let mut payload = vec![0; len as usize - 1];
+            stream.read_exact(&mut payload).await.ok()?;
+            Some(serde_json::from_slice(&payload).expect("a server message"))
+        })
+        .await
+    }
+
+    let mut flooded = UnixStream::connect(rig.socket()).await.expect("connects");
+    write_msg(
+        &mut flooded,
+        &ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "test".into(),
+            role: ClientRole::Dev,
+        },
+    )
+    .await
+    .expect("hello");
+    assert!(
+        matches!(
+            read_msg(&mut flooded).await,
+            Some(ServerMessage::Welcome { .. })
+        ),
+        "expected Welcome"
+    );
+
     let mut req_id = 0u64;
     let mut sent = 0usize;
     for _ in 0..phase1 {
         req_id += 1;
-        flooded
-            .send(&ClientMessage::Command {
+        write_msg(
+            &mut flooded,
+            &ClientMessage::Command {
                 request_id: req_id,
                 command: DaemonCommand::ListThreads,
-            })
-            .await;
+            },
+        )
+        .await
+        .expect("phase1 write");
         sent += 1;
     }
     req_id += 1;
-    flooded
-        .send(&ClientMessage::Command {
+    write_msg(
+        &mut flooded,
+        &ClientMessage::Command {
             request_id: req_id,
             command: DaemonCommand::RenameThread {
                 thread_id: marker_thread.clone(),
                 title: "phase-1-done".into(),
             },
-        })
-        .await;
+        },
+    )
+    .await
+    .expect("phase1 marker write");
     sent += 1;
     // every phase-1 answer is now queued, unread
     setup
         .thread_when(&marker_thread, |s| s.title == "phase-1-done")
         .await;
+
+    let mut closed_during_send = false;
     for _ in 0..phase2 {
         req_id += 1;
-        flooded
-            .send(&ClientMessage::Command {
+        if write_msg(
+            &mut flooded,
+            &ClientMessage::Command {
                 request_id: req_id,
                 command: DaemonCommand::ListThreads,
-            })
-            .await;
+            },
+        )
+        .await
+        .is_err()
+        {
+            closed_during_send = true;
+            break;
+        }
         sent += 1;
     }
+    if !closed_during_send {
+        req_id += 1;
+        if write_msg(
+            &mut flooded,
+            &ClientMessage::Command {
+                request_id: req_id,
+                command: DaemonCommand::RenameThread {
+                    thread_id: marker_thread.clone(),
+                    title: "phase-2-done".into(),
+                },
+            },
+        )
+        .await
+        .is_err()
+        {
+            closed_during_send = true;
+        } else {
+            sent += 1;
+        }
+    }
+
+    // Without reading from `flooded` (so the test does not drain the socket
+    // while the daemon is answering `phase2`), wait until either the daemon
+    // closes `flooded` (detected by a no-op write failing) or `phase-2-done`
+    // becomes visible (a broken daemon answered everything).
+    let peer_closed = if closed_during_send {
+        true
+    } else {
+        let probe = ClientMessage::Unsubscribe {
+            thread_id: ThreadId("__flood_probe__".into()),
+        };
+        soon(async {
+            tokio::select! {
+                _ = setup.thread_when(&marker_thread, |s| s.title == "phase-2-done") => false,
+                _ = async {
+                    loop {
+                        if write_msg(&mut flooded, &probe).await.is_err() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => true,
+            }
+        })
+        .await
+    };
+    assert!(
+        peer_closed,
+        "the 8 MiB control lane was not enforced: phase-2-done completed on flooded socket"
+    );
 
     let mut received = 0usize;
-    while flooded.read().await.is_some() {
+    while read_msg(&mut flooded).await.is_some() {
         received += 1;
         assert!(
             received < sent,
             "the 8 MiB control lane was not enforced: all {sent} answers arrived"
         );
     }
-    assert!(flooded.closed().await);
+    assert!(
+        soon(async {
+            let mut sink = [0u8; 4096];
+            loop {
+                match flooded.read(&mut sink).await {
+                    Ok(0) | Err(_) => return true,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+    );
 
     let threads = setup.ok(DaemonCommand::ListThreads).await;
     assert_eq!(threads.as_array().expect("array").len(), 4);
