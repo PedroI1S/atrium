@@ -833,3 +833,9 @@ rodrigo asked the orchestrator to choose. It kept `dev`'s behaviour on both:
 - Variant A (ask for every not-established line under FullAccess too) was rejected: 53% of 3,353 real agent commands on rodrigo's machine use a construct outside the readable grammar, and under FullAccess the hard deny can't stop a deliberate evader anyway (a script file run with `sh x.sh`).
 - The draft is `docs/contracts/m1-policy-rev4.md` (CR-20). rodrigo approves its text; Pedro confirms the items marked [D-013] (its §10) before any worker starts on P1–P3.
 - **Held:** M1-27, M1-29, M1-30, M1-31 and M1-32 are neither verified nor reviewed further. Their non-policy parts move to M1-33 (from M1-28) and M1-34 (from M1-31), which may go ahead now.
+
+## D-136 — 2026-11-21 — rodrigo: approves the rev 4 contract text, and the go for M1-33 and M1-34
+**Decided by rodrigo (driver).**
+- **The text of `docs/contracts/m1-policy-rev4.md` (draft 5) is approved.** Five Codex reviews (GPT-6.1 Sol, `high`, read-only) found 21, 15, 5, 1 and then 0 findings; the last one approves (`reviews/rev4-contract-round5.md`).
+- **Still open:** Pedro confirms the 14 security-default changes in its §11 (D-013). P0–P5 don't start until he does. CR-20 stays open until then.
+- **Go for M1-33-nonpolicy-fixes and M1-34-n9-fixture** (rev 4 §13). The orchestrator extracts the hunks itself (a mechanical copy of files that already passed the batch's reviews for those parts, so no writer); then D-123's verification and a Codex review, under D-120.
