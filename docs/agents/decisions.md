@@ -866,3 +866,37 @@ rodrigo asked the orchestrator to choose. It kept `dev`'s behaviour on both:
   - P1 and P2 merge only after P0, and each changes no behaviour, so they need only rodrigo's go (D-138).
   - **P3 waits for P0's approval,** because it builds on the table.
 - **M1-23's Linux save dialog** (`app/src-tauri/src/save.rs`, `gtk::FileChooserNative`) **already compiles:** every Linux `cargo test --workspace` since M1-23 builds it. What's still owed is a live check in the running app: Export opens the GTK chooser, Cancel returns, and Save writes a new file. It needs a GUI, so no worker does it; the orchestrator prepares the steps and rodrigo runs them.
+
+## D-141 — 2026-11-22 — rodrigo: P0's tool table shrinks to what the contract needs
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P0's reviews found 18, 6, 6 and 6 findings. From round 2 on, each round fixed one tool's semantics and the next found a neighbouring tool's (sed, tar, patch, codesign, rsync, `git diff --no-index`), the same pattern as the M1-27 batch. The cause is scope: about 120 tools modelled flag by flag.
+
+The table keeps only these row kinds:
+1. **Home read-only:** the tools and git subcommands in `HOME_READONLY_COMMANDS`.
+   - `AnyExceptForbidden`, mirroring `dev`'s `forbidden_flag` exactly;
+   - every word is a candidate path for read and write checks, as on `dev`;
+   - a forbidden flag only removes Home eligibility.
+2. **Search tools with filters:** `rg` and the `grep` family. These keep:
+   - the pattern operand (§11 item 9);
+   - the filter dialect and its case rules;
+   - recursion and link-following flags (§5, §11 item 15);
+   - `dev`'s flag tables.
+3. **Wrappers (§4) and nested shells (§4),** in exactly their listed forms.
+4. **Code runners (§4):**
+   - always Unread, with the inline code or the pinned program file (Unread (program), §11 item 8);
+   - an Allow prefix that ends at one is Invalid (§11 item 4).
+5. **Conditional runners:** otherwise unknown-tool treatment, but a listed trigger makes the unit Unread:
+   - `find -exec`/`-execdir`/`-ok`/`-okdir`;
+   - git's program-running forms and `-c`/`--config-env`/`--exec-path`;
+   - `sed` scripts with `e`, `w` or `r`;
+   - and the like.
+6. **Derived-destination writers (§5):**
+   - `cp -R`/`-a`, `mv`, `rsync`, `tar -x`, `unzip`, `git clone`, `git checkout`;
+   - the writer itself is Unread (§11 item 10);
+   - every word is still a candidate path, so a destination hit stands.
+
+**Every other tool leaves the table** and is an unknown tool (§4):
+- every word is a candidate path for hard-deny, store and self-protection checks, as on `dev`;
+- the unit is a possible writer (§5);
+- it is never Home-eligible.
+
+That never allows more than `dev` does, and it removes per-tool semantics as a source of findings. This narrows what the annex lists. The contract text is unchanged: §6 already says a form not in the table is outside the model, and §4 says how an unknown tool is checked.
