@@ -16,7 +16,7 @@ use crate::policy::model::{
     BestEffortRecord, BestEffortRedirectKind, BestEffortUnit, Cap, ComputeBudget, Exhausted,
     FoldRules, PartOutcome, PipelineId,
 };
-use crate::policy::tools::{self, CodeRunnerBehavior};
+use crate::policy::tools::{self, ToolRowKind, ToolSpec};
 
 use super::{fold_command_bytes, is_posix_name};
 
@@ -1694,17 +1694,25 @@ fn is_be_shell(cmd: &str, budget: &mut ComputeBudget) -> Result<bool, Exhausted>
         return Ok(true);
     }
     let folded = fold_str_cr19(cmd, budget)?;
-    Ok(tools::lookup(&folded).is_some_and(|t| t.nested_shell)
-        || tools::lookup_outside_model(&folded)
-            .is_some_and(|e| e.contract_section == "§4" && !e.reason.starts_with("Wrapper")))
+    Ok(
+        tools::lookup(&folded).is_some_and(ToolSpec::is_nested_shell)
+            || tools::lookup_outside_model(&folded)
+                .is_some_and(|e| e.contract_section == "§4" && !e.reason.starts_with("Wrapper")),
+    )
 }
 
 fn is_be_reserved(raw: &str) -> bool {
     tools::lookup_outside_model(raw).is_some_and(|e| e.contract_section == "§3")
 }
 
+/// Whether `folded` is an unconditional code runner in P0's table
+/// (`ToolRowKind::CodeRunner`) for Scan 7 (here-doc / here-string body
+/// extraction). `ToolRowKind::ConditionalRunner` (`find`, `git`, `sed`) is
+/// deliberately excluded: `git` and plain `sed` read data on stdin (e.g.
+/// `git commit -F - <<EOF`, `sed 's/a/b/' <<EOF`), and `find`'s `-exec*` /
+/// `-ok*` triggers are already extracted by Scan 5.
 fn is_be_code_runner(folded: &str) -> bool {
-    tools::lookup(folded).is_some_and(|t| !matches!(t.code_runner, CodeRunnerBehavior::Never))
+    tools::lookup(folded).is_some_and(|t| matches!(t.kind, ToolRowKind::CodeRunner(_)))
 }
 
 fn is_be_interpreter(folded: &str) -> bool {

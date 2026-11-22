@@ -285,7 +285,7 @@ fn process_text_recursive(
 
                 // Check modeled and outside-model nested shells (§4).
                 if let Some(spec) = tools::lookup(&folded) {
-                    if spec.nested_shell {
+                    if spec.is_nested_shell() {
                         match classify_nested_shell(&unit, &folded, spec, budget) {
                             Ok(NestedShellOutcome::ModeledScript(script)) => {
                                 if unit.depth >= limits::MAX_DEPTH {
@@ -452,7 +452,7 @@ fn unwrap_unit_preserving(
             break;
         };
 
-        let Some(kind) = spec.wrapper else {
+        let Some(kind) = spec.wrapper() else {
             break;
         };
 
@@ -497,7 +497,7 @@ fn unwrap_unit_preserving(
     })
 }
 
-/// Validates a single §4 wrapper at the front of `argv` using `spec.flags`
+/// Validates a single §4 wrapper at the front of `argv` using `spec.flags()`
 /// from P0's `tools.rs`. Returns `Ok(Some(word_count_to_strip))` when the
 /// invocation matches §4's closed form, or `Ok(None)` for any near miss.
 fn parse_wrapper_prefix(
@@ -558,7 +558,7 @@ fn parse_wrapper_prefix(
             let Some(tok) = next.as_str() else {
                 return Ok(None);
             };
-            let Some(fspec) = tools::flag(spec.flags, tok) else {
+            let Some(fspec) = tools::flag(spec.flags(), tok) else {
                 return Ok(None);
             };
             if fspec.short != Some('n') {
@@ -586,7 +586,7 @@ fn parse_wrapper_prefix(
                 let Some(tok) = w.as_str() else {
                     return Ok(None);
                 };
-                let Some(fspec) = tools::flag(spec.flags, tok) else {
+                let Some(fspec) = tools::flag(spec.flags(), tok) else {
                     return Ok(None);
                 };
                 match fspec.short {
@@ -756,7 +756,7 @@ fn classify_nested_shell(
                     },
                 ));
             }
-            let Some(fspec) = tools::flag_short(spec.flags, lb as char) else {
+            let Some(fspec) = tools::flag_short(spec.flags(), lb as char) else {
                 return Ok(NestedShellOutcome::Unread(
                     UnreadReason::UnsupportedNestedShellForm {
                         shell: folded_shell.to_string(),
