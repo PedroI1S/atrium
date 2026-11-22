@@ -224,6 +224,35 @@ fn append_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
+fn spawn_login_shell(shell_path: &Path, deadline: Instant) -> Option<(UnixStream, Child)> {
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        let (stdout_rx, stdout_tx) = UnixStream::pair().ok()?;
+        let mut cmd = Command::new(shell_path);
+        cmd.args(["-ilc", login_shell_path_command(shell_path)])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(OwnedFd::from(stdout_tx)))
+            .stderr(Stdio::null())
+            .process_group(0);
+        match cmd.spawn() {
+            Ok(child) => return Some((stdout_rx, child)),
+            Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy => {
+                // On Linux, `execve` returns `ETXTBSY` while another thread's
+                // freshly forked child still holds a writable fd to the same
+                // inode before its own `execve` closes `O_CLOEXEC` fds. Wait
+                // briefly within the caller's deadline for the writer to close.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                std::thread::sleep(backoff.min(remaining));
+                backoff = (backoff * 2).min(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Runs `$SHELL -ilc` with a short timeout to discover the user's login-shell
 /// `PATH` (for `nvm`, `asdf`, `mise`, or custom init scripts). Never fails
 /// startup: returns `None` if `shell` is unset, fails to spawn, exits non-zero,
@@ -236,19 +265,10 @@ fn append_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
 pub fn discover_login_shell_path(shell: Option<&OsStr>, timeout: Duration) -> Option<OsString> {
     let shell = shell.filter(|s| !s.is_empty())?;
     let shell_path = Path::new(shell);
-    let (mut stdout_rx, stdout_tx) = UnixStream::pair().ok()?;
-    let child = {
-        let mut cmd = Command::new(shell_path);
-        cmd.args(["-ilc", login_shell_path_command(shell_path)])
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(OwnedFd::from(stdout_tx)))
-            .stderr(Stdio::null())
-            .process_group(0);
-        cmd.spawn().ok()?
-    };
+    let deadline = Instant::now() + timeout;
+    let (mut stdout_rx, child) = spawn_login_shell(shell_path, deadline)?;
     let mut shell_child = LoginShellChild::new(child);
 
-    let deadline = Instant::now() + timeout;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut stdout_eof = false;

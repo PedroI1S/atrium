@@ -5,11 +5,12 @@
 
 mod common;
 
-use std::ffi::OsStr;
-use std::fs::File;
+use std::ffi::{OsStr, OsString};
+use std::fs::{File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use atrium_daemon::{NO_PATH_EXTRAS_ENV, discover_login_shell_path};
@@ -18,6 +19,18 @@ use atrium_protocol::policy::Preset;
 use atrium_protocol::wire::{DaemonCommand, ProviderProbe};
 use common::{SOON, Wire, folder};
 use tokio::net::UnixStream;
+
+/// Prevents Linux `ETXTBSY` across parallel test threads: no thread forks a
+/// subprocess (which duplicates open file descriptors until the child calls
+/// `execve`) while another thread has an executable script open for writing.
+static EXEC_WRITE_LOCK: RwLock<()> = RwLock::new(());
+
+fn discover_path(shell: Option<&OsStr>, timeout: Duration) -> Option<OsString> {
+    let _guard = EXEC_WRITE_LOCK
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    discover_login_shell_path(shell, timeout)
+}
 
 struct DaemonProcess {
     child: Option<Child>,
@@ -58,7 +71,12 @@ impl DaemonProcess {
         } else {
             command.env_remove(NO_PATH_EXTRAS_ENV);
         }
-        let child = command.spawn().expect("spawn atriumd");
+        let child = {
+            let _guard = EXEC_WRITE_LOCK
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            command.spawn().expect("spawn atriumd")
+        };
         Self {
             child: Some(child),
             stderr_path: stderr_path.to_path_buf(),
@@ -125,6 +143,9 @@ fn create_private_dir(path: &Path) {
 }
 
 fn write_executable(path: &Path, body: &str) {
+    let _guard = EXEC_WRITE_LOCK
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
     std::fs::write(path, body).expect("write script");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
 }
@@ -144,7 +165,7 @@ fn discover_login_shell_path_handles_noise_failures_and_timeouts() {
         &noisy_sh,
         "#!/bin/sh\nprintf 'MOTD banner\\n'\nPATH='/fake/nvm/bin:/fake/asdf/bin'\n/bin/sh -c \"$2\"\nprintf '\\ntrailing\\n'\n",
     );
-    let found = discover_login_shell_path(Some(noisy_sh.as_os_str()), Duration::from_secs(2));
+    let found = discover_path(Some(noisy_sh.as_os_str()), Duration::from_secs(2));
     assert_eq!(
         found.as_deref(),
         Some(OsStr::new("/fake/nvm/bin:/fake/asdf/bin"))
@@ -153,7 +174,7 @@ fn discover_login_shell_path_handles_noise_failures_and_timeouts() {
     let failing_sh = root.path().join("failing-sh");
     write_executable(&failing_sh, "#!/bin/sh\nexit 1\n");
     assert_eq!(
-        discover_login_shell_path(Some(failing_sh.as_os_str()), Duration::from_secs(2)),
+        discover_path(Some(failing_sh.as_os_str()), Duration::from_secs(2)),
         None
     );
 
@@ -161,7 +182,7 @@ fn discover_login_shell_path_handles_noise_failures_and_timeouts() {
     write_executable(&hanging_sh, "#!/bin/sh\nsleep 10\n");
     let started = Instant::now();
     assert_eq!(
-        discover_login_shell_path(Some(hanging_sh.as_os_str()), Duration::from_millis(120)),
+        discover_path(Some(hanging_sh.as_os_str()), Duration::from_millis(120)),
         None
     );
     assert!(
@@ -172,13 +193,53 @@ fn discover_login_shell_path_handles_noise_failures_and_timeouts() {
 
     let missing_sh = root.path().join("does-not-exist");
     assert_eq!(
-        discover_login_shell_path(Some(missing_sh.as_os_str()), Duration::from_secs(1)),
+        discover_path(Some(missing_sh.as_os_str()), Duration::from_secs(1)),
         None
     );
-    assert_eq!(
-        discover_login_shell_path(None, Duration::from_secs(1)),
-        None
+    assert_eq!(discover_path(None, Duration::from_secs(1)), None);
+}
+
+#[test]
+fn discover_login_shell_path_handles_etxtbsy_within_timeout() {
+    let root = folder();
+    let busy_sh = root.path().join("busy-sh");
+    write_executable(
+        &busy_sh,
+        "#!/bin/sh\nPATH='/fake/busy/bin'\n/bin/sh -c \"$2\"\n",
     );
+
+    // Holding a writable fd on the script forces `ETXTBSY` on Linux `execve`
+    // (the same condition a sibling thread's un-exec'd fork child creates).
+    let writer = OpenOptions::new()
+        .write(true)
+        .open(&busy_sh)
+        .expect("open script for write");
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(writer);
+    });
+    let found = discover_path(Some(busy_sh.as_os_str()), Duration::from_secs(2));
+    releaser.join().expect("releaser joined");
+    assert_eq!(found.as_deref(), Some(OsStr::new("/fake/busy/bin")));
+
+    #[cfg(target_os = "linux")]
+    {
+        // A permanently held writable fd must still respect the timeout bound.
+        let _held = OpenOptions::new()
+            .write(true)
+            .open(&busy_sh)
+            .expect("open script for write");
+        let started = Instant::now();
+        assert_eq!(
+            discover_path(Some(busy_sh.as_os_str()), Duration::from_millis(80)),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "ETXTBSY retry exceeded timeout: {:?}",
+            started.elapsed()
+        );
+    }
 }
 
 fn process_alive(pid: i32) -> bool {
@@ -212,7 +273,7 @@ fn discover_login_shell_path_kills_process_group_descendants_on_timeout() {
 
     let started = Instant::now();
     assert_eq!(
-        discover_login_shell_path(Some(script.as_os_str()), Duration::from_millis(300)),
+        discover_path(Some(script.as_os_str()), Duration::from_millis(300)),
         None
     );
     assert!(
@@ -250,7 +311,7 @@ fn discover_login_shell_path_cleans_up_background_descendant_retaining_stdout() 
     );
 
     let started = Instant::now();
-    let found = discover_login_shell_path(Some(bg_ok_sh.as_os_str()), Duration::from_secs(5));
+    let found = discover_path(Some(bg_ok_sh.as_os_str()), Duration::from_secs(5));
     let elapsed = started.elapsed();
     let bg_ok_pid: i32 = std::fs::read_to_string(&pid_file_ok)
         .expect("bg child wrote pid")
@@ -284,7 +345,7 @@ fn discover_login_shell_path_cleans_up_background_descendant_retaining_stdout() 
     );
 
     let started = Instant::now();
-    let res = discover_login_shell_path(Some(bg_err_sh.as_os_str()), Duration::from_secs(5));
+    let res = discover_path(Some(bg_err_sh.as_os_str()), Duration::from_secs(5));
     let elapsed = started.elapsed();
     let bg_err_pid: i32 = std::fs::read_to_string(&pid_file_err)
         .expect("bg err child wrote pid")
