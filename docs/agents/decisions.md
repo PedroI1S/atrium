@@ -858,3 +858,11 @@ rodrigo asked the orchestrator to choose. It kept `dev`'s behaviour on both:
 - **Unchanged:** a link that reaches a protected path is still a hit (no filter) or Unread (with a filter), and reaching the walk cap is Unread.
 - **The documents:** item 15 is added to contract §11 and to `rev4-for-pedro.md`.
 - **Under D-013 and D-138,** item 15 goes to Pedro with the other 14. It takes effect only at P5.
+
+## D-140 — 2026-11-22 — rodrigo: P1 and P2 start before P0 merges; the Linux save dialog
+**Decided by rodrigo (driver).**
+- **P1 (`M1-37-rev4-p1-command-model`) and P2 (`M1-38-rev4-p2-paths`) start now.** Both branch from P0's tip (`1a09705`, review round 4 pending), not from `dev`. They are built in `policy/v4/` behind P0's interface. The types they use (`Word`, `Unit`, the resolver trait) haven't changed since P0's round 2; the churn is in the tool table.
+  - If P0's later rounds change those types, P1 and P2 rebase onto P0's final tip.
+  - P1 and P2 merge only after P0, and each changes no behaviour, so they need only rodrigo's go (D-138).
+  - **P3 waits for P0's approval,** because it builds on the table.
+- **M1-23's Linux save dialog** (`app/src-tauri/src/save.rs`, `gtk::FileChooserNative`) **already compiles:** every Linux `cargo test --workspace` since M1-23 builds it. What's still owed is a live check in the running app: Export opens the GTK chooser, Cancel returns, and Save writes a new file. It needs a GUI, so no worker does it; the orchestrator prepares the steps and rodrigo runs them.
