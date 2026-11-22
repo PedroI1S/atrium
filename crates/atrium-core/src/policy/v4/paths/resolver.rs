@@ -50,12 +50,6 @@ fn bytes_to_path(bytes: &[u8]) -> Result<&Path, ResolveError> {
     Ok(Path::new(s))
 }
 
-#[cfg(unix)]
-fn path_to_bytes(path: &Path) -> &[u8] {
-    use std::os::unix::ffi::OsStrExt;
-    path.as_os_str().as_bytes()
-}
-
 #[cfg(not(unix))]
 fn path_to_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_encoded_bytes()
@@ -125,6 +119,37 @@ fn map_io_error(err: &std::io::Error, for_readlink: bool) -> ResolveError {
     }
 }
 
+#[cfg(unix)]
+fn map_errno(errno: rustix::io::Errno, for_readlink: bool) -> ResolveError {
+    if errno == rustix::io::Errno::NOENT {
+        return ResolveError::NotFound;
+    }
+    if for_readlink && errno == rustix::io::Errno::INVAL {
+        return ResolveError::Io(FsIoError::NotASymlink);
+    }
+    if errno == rustix::io::Errno::LOOP {
+        return ResolveError::Io(FsIoError::SymlinkLoop);
+    }
+    if errno == rustix::io::Errno::NOTDIR {
+        return ResolveError::Io(FsIoError::NotADirectory);
+    }
+    if errno == rustix::io::Errno::ACCESS || errno == rustix::io::Errno::PERM {
+        return ResolveError::Io(FsIoError::PermissionDenied);
+    }
+    ResolveError::Io(FsIoError::Other)
+}
+
+#[cfg(unix)]
+fn map_rustix_file_type(ft: rustix::fs::FileType) -> Option<FileType> {
+    match ft {
+        rustix::fs::FileType::RegularFile => Some(FileType::File),
+        rustix::fs::FileType::Directory => Some(FileType::Dir),
+        rustix::fs::FileType::Symlink => Some(FileType::Symlink),
+        rustix::fs::FileType::Unknown => None,
+        _ => Some(FileType::Other),
+    }
+}
+
 impl PathResolver for FsResolver {
     fn stat(
         &self,
@@ -160,14 +185,41 @@ impl PathResolver for FsResolver {
     ) -> Result<Vec<u8>, ResolveError> {
         caps.charge_link_read()?;
         budget.charge(path.len().max(1) as u64)?;
-        if budget.remaining_alloc_bytes() == 0 {
-            budget.charge_alloc(1)?;
-        }
         let p = bytes_to_path(path)?;
-        let target = std::fs::read_link(p).map_err(|e| map_io_error(&e, true))?;
-        let bytes = path_to_bytes(&target);
-        budget.charge_alloc(bytes.len())?;
-        Ok(bytes.to_vec())
+        #[cfg(unix)]
+        {
+            // Stack-only lstat discovers existence, symlink kind, and exact
+            // target byte length (`st_size`) before any heap allocation occurs.
+            let md = std::fs::symlink_metadata(p).map_err(|e| map_io_error(&e, false))?;
+            if !md.file_type().is_symlink() {
+                return Err(ResolveError::Io(FsIoError::NotASymlink));
+            }
+            let st_size = usize::try_from(md.len()).unwrap_or(usize::MAX);
+            let reserve = if st_size > 0 {
+                st_size.saturating_add(1)
+            } else {
+                256
+            };
+            budget.charge_alloc(reserve)?;
+            let buf = Vec::with_capacity(reserve);
+            let target = rustix::fs::readlink(p, buf).map_err(|e| map_errno(e, true))?;
+            let bytes = target.into_bytes();
+            if bytes.len() > reserve {
+                budget.charge_alloc(bytes.len() - reserve)?;
+            }
+            Ok(bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            let reserve = path.len().max(64);
+            budget.charge_alloc(reserve)?;
+            let target = std::fs::read_link(p).map_err(|e| map_io_error(&e, true))?;
+            let bytes = path_to_bytes(&target);
+            if bytes.len() > reserve {
+                budget.charge_alloc(bytes.len() - reserve)?;
+            }
+            Ok(bytes.to_vec())
+        }
     }
 
     fn canonicalize(
@@ -178,14 +230,30 @@ impl PathResolver for FsResolver {
     ) -> Result<Vec<u8>, ResolveError> {
         caps.charge_canonicalize()?;
         budget.charge(path.len().max(1) as u64)?;
-        if budget.remaining_alloc_bytes() == 0 {
-            budget.charge_alloc(1)?;
-        }
         let p = bytes_to_path(path)?;
+        // Stack-only metadata checks avoid heap allocation for missing/inaccessible
+        // paths and provide a lower bound on symlink target length before
+        // canonicalizing.
+        let link_hint = match std::fs::symlink_metadata(p) {
+            Ok(md) if md.file_type().is_symlink() => usize::try_from(md.len()).unwrap_or(0),
+            Ok(_) => 0,
+            Err(e) => return Err(map_io_error(&e, false)),
+        };
+        let _ = std::fs::metadata(p).map_err(|e| map_io_error(&e, false))?;
+        let reserve = path.len().max(link_hint).max(1);
+        budget.charge_alloc(reserve)?;
         let canon = std::fs::canonicalize(p).map_err(|e| map_io_error(&e, false))?;
-        let bytes = path_to_bytes(&canon);
-        budget.charge_alloc(bytes.len())?;
-        Ok(bytes.to_vec())
+        #[cfg(unix)]
+        let bytes = {
+            use std::os::unix::ffi::OsStringExt;
+            canon.into_os_string().into_vec()
+        };
+        #[cfg(not(unix))]
+        let bytes = path_to_bytes(&canon).to_vec();
+        if bytes.len() > reserve {
+            budget.charge_alloc(bytes.len() - reserve)?;
+        }
+        Ok(bytes)
     }
 
     fn read_dir(
@@ -197,22 +265,72 @@ impl PathResolver for FsResolver {
         caps.charge_dir_open()?;
         budget.charge(path.len().max(1) as u64)?;
         let p = bytes_to_path(path)?;
-        let rd = std::fs::read_dir(p).map_err(|e| map_io_error(&e, false))?;
-        let mut out = Vec::new();
-        for entry_res in rd {
-            caps.charge_entries_read(1)?;
-            let entry = entry_res.map_err(|e| map_io_error(&e, false))?;
-            let os_name = entry.file_name();
-            let name_bytes = path_to_bytes(Path::new(&os_name));
-            budget.charge(name_bytes.len().max(1) as u64)?;
-            budget.charge_alloc(std::mem::size_of::<DirEntry>() + name_bytes.len())?;
-            let ft = entry.file_type().map_err(|e| map_io_error(&e, false))?;
-            out.push(DirEntry {
-                name: name_bytes.to_vec(),
-                file_type: map_file_type(ft),
-            });
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, Mode, OFlags, RawDir, open, statat};
+
+            let dir_fd = open(
+                p,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| map_errno(e, false))?;
+            let mut stack_buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+            let mut raw_dir = RawDir::new(&dir_fd, &mut stack_buf);
+            let mut out = Vec::new();
+            loop {
+                // Charge entry read and work BEFORE advancing the directory iterator.
+                caps.charge_entries_read(1)?;
+                budget.charge(1)?;
+                let Some(entry_res) = raw_dir.next() else {
+                    break;
+                };
+                let entry = entry_res.map_err(|e| map_errno(e, false))?;
+                let name_cstr = entry.file_name();
+                let name_bytes = name_cstr.to_bytes();
+                if name_bytes == b"." || name_bytes == b".." {
+                    continue;
+                }
+                budget.charge(name_bytes.len().saturating_sub(1) as u64)?;
+                budget.charge_alloc(std::mem::size_of::<DirEntry>() + name_bytes.len())?;
+                let file_type = match map_rustix_file_type(entry.file_type()) {
+                    Some(ft) => ft,
+                    None => {
+                        let st = statat(&dir_fd, name_cstr, AtFlags::SYMLINK_NOFOLLOW)
+                            .map_err(|e| map_errno(e, false))?;
+                        map_rustix_file_type(rustix::fs::FileType::from_raw_mode(st.st_mode))
+                            .unwrap_or(FileType::Other)
+                    }
+                };
+                let mut name = Vec::with_capacity(name_bytes.len());
+                name.extend_from_slice(name_bytes);
+                out.push(DirEntry { name, file_type });
+            }
+            Ok(out)
         }
-        Ok(out)
+        #[cfg(not(unix))]
+        {
+            let mut rd = std::fs::read_dir(p).map_err(|e| map_io_error(&e, false))?;
+            let mut out = Vec::new();
+            loop {
+                caps.charge_entries_read(1)?;
+                budget.charge(1)?;
+                let Some(entry_res) = rd.next() else {
+                    break;
+                };
+                let entry = entry_res.map_err(|e| map_io_error(&e, false))?;
+                let os_name = entry.file_name();
+                let name_bytes = path_to_bytes(Path::new(&os_name));
+                budget.charge(name_bytes.len().saturating_sub(1) as u64)?;
+                budget.charge_alloc(std::mem::size_of::<DirEntry>() + name_bytes.len())?;
+                let ft = entry.file_type().map_err(|e| map_io_error(&e, false))?;
+                out.push(DirEntry {
+                    name: name_bytes.to_vec(),
+                    file_type: map_file_type(ft),
+                });
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -230,7 +348,56 @@ pub(crate) mod fake {
         ResolveError,
     };
     use crate::policy::v4::paths::PathResolver;
-    use crate::policy::v4::paths::sensitive::{fold_extended_component, fold_listed_component};
+
+    /// Independent test-only ASCII/basic case folding for `FakeFs::case_insensitive`
+    /// (does NOT reuse production `sensitive.rs` folding functions).
+    fn fake_fold_case(bytes: &[u8]) -> Vec<u8> {
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s
+                .chars()
+                .flat_map(|ch| match ch {
+                    '\u{017F}' => vec!['s'],
+                    '\u{212A}' => vec!['k'],
+                    other => other.to_lowercase().collect(),
+                })
+                .collect::<String>()
+                .into_bytes(),
+            Err(_) => bytes.to_ascii_lowercase(),
+        }
+    }
+
+    /// Independent test-only volume equivalence table for `FakeFs::nfc_nfd_insensitive`
+    /// (does NOT reuse production `sensitive.rs` folding/normalization functions).
+    fn fake_volume_key(bytes: &[u8], extra_aliases: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        for (a, b) in extra_aliases {
+            if bytes == a.as_slice() || bytes == b.as_slice() {
+                return a.clone();
+            }
+        }
+        let Ok(s) = std::str::from_utf8(bytes) else {
+            return fake_fold_case(bytes);
+        };
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            match ch {
+                '\u{00C9}' | '\u{00E9}' => out.push_str("e\u{0301}"),
+                '\u{01FA}' | '\u{01FB}' => out.push_str("a\u{030A}\u{0301}"),
+                '\u{212B}' | '\u{00C5}' | '\u{00E5}' => out.push_str("a\u{030A}"),
+                '\u{1E08}' | '\u{1E09}' => out.push_str("c\u{0327}\u{0301}"),
+                '\u{AC00}' => out.push_str("\u{1100}\u{1161}"),
+                '\u{00DF}' | '\u{1E9E}' => out.push_str("ss"),
+                '\u{0130}' | '\u{0131}' => out.push('i'),
+                '\u{FB01}' => out.push_str("fi"),
+                '\u{00AD}' | '\u{200B}' | '\u{FEFF}' => {}
+                other => {
+                    for lc in other.to_lowercase() {
+                        out.push(lc);
+                    }
+                }
+            }
+        }
+        out.into_bytes()
+    }
 
     #[derive(Debug, Clone)]
     enum InodeKind {
@@ -268,8 +435,12 @@ pub(crate) mod fake {
         /// stored on-disk spelling as the canonical name.
         pub(crate) case_insensitive: bool,
         /// When `true`, component lookup also equates NFC/NFD and unlisted
-        /// Unicode case folds (simulating APFS/HFS+ normalization).
+        /// Unicode case folds (simulating APFS/HFS+ normalization) using an
+        /// independent test-only equivalence mapping.
         pub(crate) nfc_nfd_equivalent: bool,
+        /// Optional explicit component-name equivalence pairs `(canon, alias)`
+        /// for independent conformance tests.
+        extra_equivalences: Vec<(Vec<u8>, Vec<u8>)>,
     }
 
     impl Default for FakeFs {
@@ -305,6 +476,7 @@ pub(crate) mod fake {
                 root_ino,
                 case_insensitive: false,
                 nfc_nfd_equivalent: false,
+                extra_equivalences: Vec::new(),
             }
         }
 
@@ -321,6 +493,10 @@ pub(crate) mod fake {
             fs
         }
 
+        pub(crate) fn add_equivalent_component(&mut self, a: &[u8], b: &[u8]) {
+            self.extra_equivalences.push((a.to_vec(), b.to_vec()));
+        }
+
         fn alloc_ino(&mut self) -> u64 {
             let ino = self.next_ino;
             self.next_ino += 1;
@@ -332,11 +508,11 @@ pub(crate) mod fake {
                 return true;
             }
             if self.nfc_nfd_equivalent {
-                return fold_extended_component(stored) == fold_extended_component(query);
+                return fake_volume_key(stored, &self.extra_equivalences)
+                    == fake_volume_key(query, &self.extra_equivalences);
             }
             if self.case_insensitive {
-                return fold_listed_component(stored, true, true)
-                    == fold_listed_component(query, true, true);
+                return fake_fold_case(stored) == fake_fold_case(query);
             }
             false
         }
@@ -745,9 +921,14 @@ pub(crate) mod fake {
                         return Err(ResolveError::Io(*err));
                     }
                     let mut out = Vec::new();
-                    for (name, &child_ino) in entries {
+                    let mut iter = entries.iter();
+                    loop {
                         caps.charge_entries_read(1)?;
-                        budget.charge(name.len().max(1) as u64)?;
+                        budget.charge(1)?;
+                        let Some((name, &child_ino)) = iter.next() else {
+                            break;
+                        };
+                        budget.charge(name.len().saturating_sub(1) as u64)?;
                         budget.charge_alloc(std::mem::size_of::<DirEntry>() + name.len())?;
                         let child_ft = match self.inodes.get(&child_ino).map(|i| &i.kind) {
                             Some(InodeKind::File) => FileType::File,
