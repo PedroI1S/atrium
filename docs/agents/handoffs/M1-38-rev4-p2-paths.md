@@ -88,8 +88,8 @@ All P2 code lives under `crates/atrium-core/src/policy/v4/paths.rs` and `crates/
 | `wildcards_in_atrium_data_and_protected_folders` | **Migrated** | Absent `~/.local/share/atrium/*` → `HardDenyHit("atrium-self")`; `~/.config/atrium/*` Write → `HardDenyHit("atrium-self")`, Read → `Clear` (`carried_m1_30_absent_targets_and_search_filter_probes`). |
 | `wildcards_in_ask_stores_and_trees` | **Migrated** | Search filter `msal*` on `~/.azure` (present and absent) → `StoreHit` (§10 rows 12 & 24); ordinary siblings → `Clear`. |
 | `relative_paths_from_subdir_and_file_tools_reads_and_searches` | **Migrated** | Escaping selectors `../.ssh/id_*` → `HardDenyHit`, `../.aws/credentia?s` (absent) → `HardDenyHit(BestEffort)`, `../other.txt` → `Unread` (D-100; §5). |
-| `ordinary_globs_keep_expected_verdicts` | **Migrated** | `**/*.rs` on `~` → `Clear`; ordinary literal/glob targets → `Clear`. |
-| `k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree` | **Kept (migrated in P2)** | `Search ~ **/*.rs` → `Clear`; `**/*.session` → `StoreHit`; `**/*.json` → `HardDenyHit` (`carried_m1_30_absent_targets_and_search_filter_probes`, §5). |
+| `ordinary_globs_keep_expected_verdicts` | **Migrated (new verdict for `~` `**/*.rs`)** | `Search ~ **/*.rs` → `StoreHit` (no HardDeny; `dev`'s retained `ASK_TREES` prefix probe matches `**` against `.aws/sso/cache`, §5 & §11); ordinary literal/glob targets → `Clear`. |
+| `k8_home_globstar_search_asks_only_when_suffix_can_match_ask_tree` | **Migrated with rev 4 verdict** | `Search ~ **/*.rs` → `StoreHit` (no HardDeny; M1-30's suffix-reasoning matcher is dropped per §5 & §12, so `dev`'s retained `ASK_TREES` directory-prefix probe stands); `**/*.session` → `StoreHit`; `**/*.json` → `HardDenyHit` (`carried_m1_30_absent_targets_and_search_filter_probes`, §5, §11). |
 | `session_gate_blocks_wildcarded_credential_and_atrium_trees_when_absent_on_disk` | **Migrated (new verdict for absent globs)** | Absent literal paths → `HardDenyHit`; absent `Search ~/.aws credentia?s` → `HardDenyHit(BestEffort)` (§2, §5); absent shell-glob probes belong to P5 best-effort (§2). |
 | `review2_finding_1_contained_search_globs_reach_sensitive_trees` | **Kept (migrated in P2)** | `Search ~/.aws credentia?s`, `Search ~ **/*.json` → `HardDenyHit` (§2, §5). |
 | `posix_named_classes_match_real_character_sets` | **Kept (migrated in P2)** | `[[:alpha:]]` in `expand_shell_glob` (`regression_posix_classes_...`, §3, §5). |
@@ -161,9 +161,20 @@ Per contract §13, `dev`'s evaluator (`deny.rs`, `gate.rs`, `engine.rs`) remains
 
 ## 4. Change requests against P0's interface
 
-**None (no blocking changes required).** All six `v4::paths` entry points (`resolve_literal`, `expand_shell_glob`, `check_target`, `check_recursive_root`, `resolve_command_targets`, `resolve_subject_paths`) and `PathResolver` implement P0's frozen signatures and `model.rs` types verbatim.
-
-*Non-blocking observation for P5:* `ProtectedSet` has `hard_deny_identities` (which applies to both reads and writes) and does not carry a separate `write_only_identities` field for hard links to write-only paths (`atrium_protected_paths`, `~/.ssh/config`, `~/.ssh/authorized_keys`). P2 intentionally omits write-only paths from `hard_deny_identities` so reads are never falsely hard-denied; writes to symlinks or case-variants still hard-deny via `hard_deny_hit_folded`, and writes to hard links still set `multiply_linked_file = true` (forcing `Ask` in every setting per §1 step 4).
+### CR-P2-1: Add `write_only_hard_deny_identities` to `ProtectedSet` (`crates/atrium-core/src/policy/model.rs`)
+- **Exact field:**
+  ```rust
+  /// Identities `(dev, ino)` of existing write-only protected files/trees
+  /// (`~/.ssh/config`, `~/.ssh/authorized_keys`, and `atrium_protected_paths`
+  /// plus their member files), mapped to their `HARD_DENY_DEFAULTS` id
+  /// (`"credential-read"` / `"atrium-self"`). Checked only when
+  /// `target.access != AccessMode::Read` (contract §5).
+  pub(crate) write_only_hard_deny_identities: Vec<(FileIdentity, &'static str)>,
+  ```
+- **Why:** `v4::paths::check_target(target: &Target, protected: &ProtectedSet, budget: &mut ComputeBudget)` is pure (it does not accept a `PathResolver`), and `ProtectedSet::hard_deny_identities` applies unconditionally to both reads and writes. Write-only protected paths (`~/.ssh/config`, `~/.ssh/authorized_keys`, `atrium_protected_paths`) cannot be placed in `hard_deny_identities` without causing false hard-denies on `AccessMode::Read`.
+- **Current status & what still fails until this lands:**
+  - All resolver-backed P2 entry points (`resolve_command_targets`, `resolve_subject_paths`, and `check_recursive_root`) **pass today** by lazily collecting write-only identities via `sensitive::collect_write_only_identities` on non-read targets (`round2_finding07_write_only_hard_link_aliases_in_resolver_flows`).
+  - **Still fails until CR-P2-1 lands:** a standalone call to `check_target(&target, &protected, &mut budget)` (without going through `resolve_command_targets` / `resolve_subject_paths` / `check_recursive_root`) on a `Target` with `AccessMode::Write` or `AccessMode::ReadWrite` pointing to a hard-linked alias of `~/.ssh/config`, `~/.ssh/authorized_keys`, or a file under `atrium_protected_paths` (e.g., `proj/alias_cfg` hard-linked to `~/.ssh/config`) returns `Clear` instead of `HardDenyHit`, because `ProtectedSet` cannot carry write-only identities to the pure `check_target` function.
 
 ---
 
@@ -181,3 +192,26 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## 6. Round 2 (rework against `.orchestration/review-input/review-round1.md`)
+
+All 14 findings from Codex review round 1 have been addressed on top of P0 tip `a1f0174`:
+
+| # | Finding | Fix (file) | Regression test (`p2_tests.rs`) |
+|---|---|---|---|
+| 1 | Later exhaustion discards earlier hits | Added `finish_call_exhausted` / `finish_recursive_exhausted` and per-root immediate checking so `resolve_command_targets`, `resolve_subject_paths`, and `check_recursive_root` retain all partial outcomes and append `PartOutcome::Exhausted` when subsequent work exhausts `ComputeBudget` (`command.rs`, `recursive.rs`). | `round2_finding01_hit_preserved_after_later_exhaustion` |
+| 2 | Hard-link walk bypasses S8 exemptions (`section10_row_16` failure) | Restricted identity hits in `walk_hard_links` to `md.nlink > 1 && !has_filter && !exempt_root` while still setting `multiply_linked_file` for any `nlink > 1` regular file (`recursive.rs`). | `section10_row_16_s8_aws_hard_deny_config_and_home_exempt`, `round2_finding02_exempt_root_identity_walk_preserves_s8_exemptions` |
+| 3 | Filters silently exclude non-UTF-8 names | Updated `CompiledFilter::matches_entry` to match raw filesystem bytes via `globset::GlobMatcher::is_match(&Path)` (`OsStrExt::from_bytes` on Unix), returning `Unread(UnresolvablePath)` on non-Unix encoding failures instead of `false` (`recursive.rs`). | `round2_finding03_non_utf8_filter_matches_symlink_to_credential` |
+| 4 | S8 misses listed-fold credential spellings | Added cached listed-fold directory discovery (`find_s8_folded_matches` in `recursive.rs`, `resolve_folded_under_base` / `resolve_folded_abs_path` in `sensitive.rs`) across `CRED_FILES`, `CRED_TREES`, `.ssh`, `BROWSER_ROOTS`, Atrium paths, and stores within filesystem budgets. | `round2_finding04_s8_matches_listed_fold_credential_spellings` |
+| 5 | Browser S8 traversal silently stops after 3 levels | Replaced `depth < 2` with `limits::WALK_MAX_DEPTH` (16) and `limits::WALK_MAX_ENTRIES` (4,096) in `browser_dir_has_existing_cred` (and added depth-cap `Unread` in `dir_has_existing_hard_deny_ssh_entry`), emitting `Unread(WalkCapReached(FsCap::WalkDepth \| EntriesRead))` on cap (`recursive.rs`). | `round2_finding05_browser_s8_deeper_levels_and_depth_cap_unread` |
+| 6 | Dangling protected entries outside `.ssh` lose protection | Changed `build_protected_set` (`record_lstat_and_stat`) to always record `lstat` identity first (plus `stat` target identity when symlink resolves) for `CRED_FILES`, `CRED_TREES`, `atrium_data_paths`, `BROWSER_FILES`, and `ASK_*` stores (`sensitive.rs`), and always retain `symlink_identities` in `resolve.rs`. | `round2_finding06_dangling_protected_entries_outside_ssh` |
+| 7 | Write-only protected identities omitted | Implemented `collect_write_only_identities` (`sensitive.rs`) and lazy `WriteOnlyIdCache` in `resolve_command_targets`, `resolve_subject_paths`, and `check_recursive_root` (`command.rs`, `recursive.rs`) for `~/.ssh/config`, `~/.ssh/authorized_keys`, and `atrium_protected_paths` (+ descendants); filed concrete change request **CR-P2-1** above for pure standalone `check_target`. | `round2_finding07_write_only_hard_link_aliases_in_resolver_flows` |
+| 8 | Canonicalization erases listed protected spelling (`.SSH/ID_RSA -> ordinary`) | `build_protected_set` now discovers all listed-fold spellings of `.ssh` (including `.SSH`, `.ſsh`) and records both `lstat` and `stat` identities; `resolve_literal_impl` always retains traversed `symlink_identities` (`sensitive.rs`, `resolve.rs`). | `round2_finding08_canonicalization_preserves_listed_protected_spelling` |
+| 9 | Unicode normalization handling incomplete (`U+01FB` `ǻ`) | Expanded NFD/CCC/ignorable tables (complete Latin-1, Latin Extended-A, key Latin Extended-B including `U+01FB`, full `U+0300..=U+036F` CCCs, Hangul) and added a sound conservative §11 item 13 fallback in `component_may_match_unlisted` that marks non-ASCII component pairs `Unread(UnlistedNameEquivalence)` whenever either contains a scalar outside the exact table (`sensitive.rs`); decoupled `FakeFs` normalization from production folding (`resolver.rs`). | `round2_finding09_unicode_normalization_u01fb_and_independent_conformance` |
+| 10 | Global `FsCaps` failures become Clear in hard-link walk | `walk_hard_links` now records `Unread(WalkCapReached(c))` on `ResolveError::CapReached(c)` from `read_dir`/`lstat`, preserving the Clear exception strictly for the local `HARD_LINK_WALK_ENTRIES` / `HARD_LINK_WALK_DEPTH` cutoffs (`recursive.rs`). | `round2_finding10_global_fs_caps_in_hard_link_walk_are_unread` |
+| 11 | Budget accounting omits work and charges allocations after they occur | Precharged allocations and compute before folding/cache work in `check_target_impl` and `SharedSensitive::for_protected_budgeted` (`sensitive.rs`); reserved output buffers before OS calls in `FsResolver::read_link` (`rustix::fs::readlink` + `lstat` size) and `canonicalize`, and rewrote `FsResolver::read_dir` with `rustix::fs::RawDir` on a stack buffer charging `charge_entries_read(1)` and compute BEFORE advancing `next()` and `charge_alloc` BEFORE allocating entry names (`resolver.rs`); fixed post-allocation charges in `resolve.rs`, `glob.rs`, `recursive.rs`, and `command.rs`. | `round2_finding11_budgets_all_fs_caps_and_small_nonzero_alloc` |
+| 12 | Unclosed brackets trigger repeated suffix scans | Eliminated quadratic rescanning in `parse_component` / `parse_bracket_class` / `scan_posix_bracket_item` via `skip_brackets_until` and stopping POSIX bracket-item scans on unquoted `[` (`glob.rs`). | `round2_finding12_unclosed_brackets_parse_linearly` |
+| 13 | Cwd state ignores nested-shell scope | Replaced single flat mutable `cwd_state` with tree-structured execution keyed by `parent_unit` and `depth` (`exec_unit_sequence` in `command.rs`), passing each parent's entry cwd to its children regardless of flattened vector order while isolating child `cd` changes from outer scopes and propagating child writers into `earlier_writer` / `pipeline_writers`. | `round2_finding13_nested_shell_cwd_scope_and_isolation` |
+| 14 | Carried `**/*.rs` test retains wrong verdict (`Clear` vs `StoreHit`) | Updated `carried_m1_30_absent_targets_and_search_filter_probes` to assert `StoreHit` and no `HardDenyHit` (keeping `dev`'s retained `ASK_TREES` directory-prefix probe without restoring M1-30's dropped suffix matcher) and corrected the M1-30 disposition entries above (`p2_tests.rs`, handoff §2B). | `carried_m1_30_absent_targets_and_search_filter_probes` |
