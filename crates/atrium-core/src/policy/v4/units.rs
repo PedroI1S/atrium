@@ -10,8 +10,8 @@ use crate::policy::model::{
 use crate::policy::tools::{self, FlagKind, ToolSpec};
 
 use super::lex::{
-    charge_vec_growth, fold_command_word, leading_assignment_name, lex_best_effort_into, lex_exact,
-    vec_push_budgeted,
+    LexExactWithMeta, charge_vec_growth, fold_command_word, lex_best_effort_into,
+    lex_exact_with_meta, vec_push_budgeted,
 };
 
 #[cfg(test)]
@@ -106,7 +106,10 @@ fn process_text_recursive(
     parsed: &mut ParsedCommandUnits,
     budget: &mut ComputeBudget,
 ) -> Result<(), PartOutcome> {
-    let lex_out = lex_exact(text, depth, parent_unit, budget)?;
+    let LexExactWithMeta {
+        output: lex_out,
+        unit_meta,
+    } = lex_exact_with_meta(text, depth, parent_unit, budget)?;
 
     // Track per-local-unit mapping to global `UnitIndex` values via arithmetic
     // offset `base_idx + local` (avoiding any auxiliary mapping allocation).
@@ -212,8 +215,12 @@ fn process_text_recursive(
             .pipeline_id
             .map(|PipelineId(id)| PipelineId(local_pipe_offset + id));
 
-        // Detect leading `HOME=...` assignment before unwrapping.
-        let mut unit_sets_home = has_leading_home_assignment(&raw.argv);
+        // Carry the exact lexer's token-level leading assignment classification
+        // into HOME tracking instead of reconstructing syntax from decoded
+        // bytes (so `''HOME=/tmp` is never misread as an assignment; §3).
+        let meta = unit_meta.get(i).copied().unwrap_or_default();
+        let mut unit_sets_home = meta.sets_home;
+        let assign_prefix = meta.leading_assignment_count;
 
         let unwrapped = match unwrap_unit_preserving(raw, folds, budget) {
             Ok(u) => u,
@@ -273,8 +280,8 @@ fn process_text_recursive(
 
         // Check if a command after leading assignments (`FOO=1 export HOME=...`,
         // `FOO=1 unset HOME`, `FOO=1 env -u HOME ...`) modifies `HOME` (§3).
-        let assign_prefix = leading_assignment_count(&unit.argv);
-        if assign_prefix > 0
+        if unit.removed_wrappers.is_empty()
+            && assign_prefix > 0
             && let Some(cmd_after_assign) = unit.argv.get(assign_prefix)
             && !cmd_after_assign.has_unquoted_glob()
         {
@@ -911,23 +918,6 @@ fn classify_nested_shell(
 // ---------------------------------------------------------------------------
 // HOME modification tracking (§3)
 // ---------------------------------------------------------------------------
-
-fn leading_assignment_count(argv: &[Word]) -> usize {
-    argv.iter()
-        .take_while(|w| leading_assignment_name(w).is_some())
-        .count()
-}
-
-fn has_leading_home_assignment(argv: &[Word]) -> bool {
-    for w in argv {
-        match leading_assignment_name(w) {
-            Some(b"HOME") => return true,
-            Some(_) => continue,
-            None => break,
-        }
-    }
-    false
-}
 
 fn word_targets_home_var(w: &Word) -> bool {
     let b = w.literal_bytes();
