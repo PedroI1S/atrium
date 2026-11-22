@@ -349,6 +349,78 @@ describe("blocks", () => {
       c: [{ t: "text", v: "ok" }],
     });
   });
+
+  it("bare URLs with many unmatched closing parentheses scale linearly (M1-33 round 2 finding 2)", () => {
+    const n = 100_000;
+    const src = "https://e.co/" + ")".repeat(n);
+    const start = performance.now();
+    const out = parseInline(src);
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(out).toEqual([
+      { t: "link", target: { kind: "web", url: "https://e.co/" }, c: [{ t: "text", v: "https://e.co/" }] },
+      { t: "text", v: ")".repeat(n) },
+    ]);
+
+    // Balanced parentheses stay in the URL; unbalanced trailing ones and sentence punctuation are trimmed.
+    expect(parseInline("see (https://example.com/a_(b)), ok.")).toEqual([
+      { t: "text", v: "see (" },
+      {
+        t: "link",
+        target: { kind: "web", url: "https://example.com/a_(b)" },
+        c: [{ t: "text", v: "https://example.com/a_(b)" }],
+      },
+      { t: "text", v: "), ok." },
+    ]);
+    expect(parseInline("https://example.com/a_((b)).")).toEqual([
+      {
+        t: "link",
+        target: { kind: "web", url: "https://example.com/a_((b))" },
+        c: [{ t: "text", v: "https://example.com/a_((b))" }],
+      },
+      { t: "text", v: "." },
+    ]);
+    expect(parseInline("https://example.com/a_(b).),")).toEqual([
+      {
+        t: "link",
+        target: { kind: "web", url: "https://example.com/a_(b)" },
+        c: [{ t: "text", v: "https://example.com/a_(b)" }],
+      },
+      { t: "text", v: ".)," },
+    ]);
+  });
+
+  it("headings and table delimiters with long whitespace runs scale linearly (M1-33 round 2 finding 3)", () => {
+    const n = 60_000;
+    const headingSrc = "# x" + " ".repeat(n) + "x";
+    const tableSrc = "a|b\n---" + " ".repeat(n) + "x";
+    const start = performance.now();
+    const headingBlocks = parseMarkdown(headingSrc);
+    const tableBlocks = parseMarkdown(tableSrc);
+    expect(performance.now() - start).toBeLessThan(1000);
+
+    expect(headingBlocks).toEqual([{ t: "h", level: 1, c: [{ t: "text", v: "x" + " ".repeat(n) + "x" }] }]);
+    expect(tableBlocks).toEqual([{ t: "p", c: [{ t: "text", v: tableSrc }] }]);
+
+    // ATX heading edge cases (closing `#` sequences, levels, indentation).
+    expect(parseMarkdown("# Title ###")).toEqual([{ t: "h", level: 1, c: [{ t: "text", v: "Title" }] }]);
+    expect(parseMarkdown("## Title   ###  ")).toEqual([{ t: "h", level: 2, c: [{ t: "text", v: "Title" }] }]);
+    expect(parseMarkdown("### foo###")).toEqual([{ t: "h", level: 3, c: [{ t: "text", v: "foo###" }] }]);
+    expect(parseMarkdown("# ###")).toEqual([{ t: "h", level: 1, c: [] }]);
+    expect(parseMarkdown("#")).toEqual([{ t: "h", level: 1, c: [] }]);
+    expect(parseMarkdown("####### not heading")).toEqual([
+      { t: "p", c: [{ t: "text", v: "####### not heading" }] },
+    ]);
+    expect(parseMarkdown("    # indented")).toEqual([{ t: "p", c: [{ t: "text", v: " # indented" }] }]);
+
+    // Table delimiter edge cases (valid alignments and rejected malformed delimiters).
+    const plainTable = parseMarkdown("a | b\n--- | ---\n1 | 2");
+    expect(plainTable).toMatchObject([{ t: "table", align: [null, null] }]);
+    const alignedTable = parseMarkdown("| a | b |\n| :---: | --: |\n| 1 | 2 |");
+    expect(alignedTable).toMatchObject([{ t: "table", align: ["center", "right"] }]);
+    expect(parseMarkdown("a | b\n|---||---|").map((b) => b.t)).toEqual(["p"]);
+    expect(parseMarkdown("a | b\n|---| |").map((b) => b.t)).toEqual(["p"]);
+    expect(parseMarkdown("a | b\n   |   ").map((b) => b.t)).toEqual(["p"]);
+  });
 });
 
 describe("inlines", () => {

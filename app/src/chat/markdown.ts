@@ -40,14 +40,82 @@ const MAX_INLINE_DEPTH = 16;
 // ---- blocks --------------------------------------------------------------------------------
 
 const FENCE_OPEN = /^( {0,3})(`{3,}|~{3,})(.*)$/;
-const ATX = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/;
-const HR = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 const QUOTE = /^ {0,3}> ?/;
 const BULLET = /^( {0,3})([-*+])( {1,4}|\t|$)/;
 const ORDERED = /^( {0,3})(\d{1,9})([.)])( {1,4}|\t|$)/;
 const SETEXT = /^ {0,3}(=+|-+)[ \t]*$/;
-const TABLE_DELIM = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/;
 const BLANK = /^[ \t]*$/;
+
+/** Deterministic O(n) ATX heading scan (avoids lazy/whitespace regex backtracking). */
+function parseAtxHeading(line: string): { level: number; text: string } | null {
+  const len = line.length;
+  let i = 0;
+  while (i < len && i < 3 && line[i] === " ") i++;
+  let level = 0;
+  while (i < len && line[i] === "#") {
+    level++;
+    i++;
+    if (level > 6) return null;
+  }
+  if (level === 0) return null;
+  if (i === len) return { level, text: "" };
+  if (line[i] !== " " && line[i] !== "\t") return null;
+  let start = i;
+  while (start < len && (line[start] === " " || line[start] === "\t")) start++;
+  let end = len;
+  while (end > start && (line[end - 1] === " " || line[end - 1] === "\t")) end--;
+  if (start === end) return { level, text: "" };
+  // Strip an optional closing `#` sequence preceded by at least one space/tab.
+  let hashStart = end;
+  while (hashStart > start && line[hashStart - 1] === "#") hashStart--;
+  if (hashStart < end && (hashStart === start || line[hashStart - 1] === " " || line[hashStart - 1] === "\t")) {
+    end = hashStart;
+    while (end > start && (line[end - 1] === " " || line[end - 1] === "\t")) end--;
+  }
+  return { level, text: start === end ? "" : line.slice(start, end) };
+}
+
+/** Deterministic O(n) thematic-break scan (`---`, `***`, `___` with optional spaces/tabs). */
+function isThematicBreak(line: string): boolean {
+  const len = line.length;
+  let i = 0;
+  while (i < len && i < 3 && line[i] === " ") i++;
+  const ch = line[i];
+  if (ch !== "-" && ch !== "*" && ch !== "_") return false;
+  let count = 0;
+  while (i < len) {
+    const c = line[i];
+    if (c === ch) count++;
+    else if (c !== " " && c !== "\t") return false;
+    i++;
+  }
+  return count >= 3;
+}
+
+/** Deterministic O(n) GFM table-delimiter row scan (avoids adjacent whitespace quantifiers). */
+function isTableDelimiter(line: string): boolean {
+  const len = line.length;
+  let i = 0;
+  while (i < len && i < 3 && line[i] === " ") i++;
+  if (i < len && line[i] === "|") i++;
+  let cells = 0;
+  while (true) {
+    while (i < len && (line[i] === " " || line[i] === "\t")) i++;
+    if (i >= len) return cells > 0;
+    if (line[i] === ":") i++;
+    const dashStart = i;
+    while (i < len && line[i] === "-") i++;
+    if (i === dashStart) return false;
+    if (i < len && line[i] === ":") i++;
+    cells++;
+    while (i < len && (line[i] === " " || line[i] === "\t")) i++;
+    if (i >= len) return true;
+    if (line[i] !== "|") return false;
+    i++;
+    while (i < len && (line[i] === " " || line[i] === "\t")) i++;
+    if (i >= len) return true;
+  }
+}
 
 interface Marker { ordered: boolean; char: string; start: number; indent: number; content: number }
 
@@ -70,7 +138,7 @@ function listMarker(line: string): Marker | null {
 const expandTabs = (line: string) => (line.includes("\t") ? line.replace(/\t/g, "    ") : line);
 
 function startsBlock(line: string): boolean {
-  return FENCE_OPEN.test(line) || ATX.test(line) || HR.test(line) || QUOTE.test(line) || listMarker(line) !== null;
+  return FENCE_OPEN.test(line) || parseAtxHeading(line) !== null || isThematicBreak(line) || QUOTE.test(line) || listMarker(line) !== null;
 }
 
 function splitRow(line: string): string[] {
@@ -121,13 +189,13 @@ function parseLines(lines: string[], depth: number): Block[] {
       continue;
     }
 
-    const atx = ATX.exec(line);
+    const atx = parseAtxHeading(line);
     if (atx) {
-      out.push({ t: "h", level: atx[1]!.length, c: parseInline(atx[2] ?? "") });
+      out.push({ t: "h", level: atx.level, c: parseInline(atx.text) });
       i++;
       continue;
     }
-    if (HR.test(line)) { out.push({ t: "hr" }); i++; continue; }
+    if (isThematicBreak(line)) { out.push({ t: "hr" }); i++; continue; }
 
     if (QUOTE.test(line)) {
       const inner: string[] = [];
@@ -172,7 +240,7 @@ function parseLines(lines: string[], depth: number): Block[] {
       continue;
     }
 
-    if (line.includes("|") && i + 1 < lines.length && TABLE_DELIM.test(lines[i + 1]!) && lines[i + 1]!.includes("-")) {
+    if (line.includes("|") && i + 1 < lines.length && isTableDelimiter(lines[i + 1]!)) {
       const head = splitRow(line);
       const delims = splitRow(lines[i + 1]!);
       if (delims.length === head.length) {
@@ -420,6 +488,21 @@ const AUTOLINK = /^<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^\s<>]*)>/;
 const EMAIL = /^<([a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*)>/;
 const BARE_URL = /https?:\/\/[^\s<>"]+/g;
 
+function isBareUrlTrailingPunct(ch: string | undefined): boolean {
+  return (
+    ch === "." ||
+    ch === "," ||
+    ch === ":" ||
+    ch === ";" ||
+    ch === "!" ||
+    ch === "?" ||
+    ch === "'" ||
+    ch === "*" ||
+    ch === "_" ||
+    ch === "~"
+  );
+}
+
 /** Splits bare http(s) URLs out of a text inline (GFM's extended autolinks, http only). */
 function linkify(items: Inline[]): Inline[] {
   const out: Inline[] = [];
@@ -427,9 +510,30 @@ function linkify(items: Inline[]): Inline[] {
     if (item.t !== "text" || !item.v.includes("http")) { out.push(item); continue; }
     let last = 0;
     for (const m of item.v.matchAll(BARE_URL)) {
-      let url = m[0];
+      const raw = m[0];
+      let end = raw.length;
+      let openParens = 0;
+      let closeParens = 0;
+      if (raw.includes(")")) {
+        for (let k = 0; k < raw.length; k++) {
+          const c = raw[k];
+          if (c === "(") openParens++;
+          else if (c === ")") closeParens++;
+        }
+      }
       // Trailing punctuation belongs to the sentence; an unbalanced `)` too.
-      while (/[.,:;!?'*_~]$/.test(url) || (url.endsWith(")") && (url.match(/\(/g)?.length ?? 0) < (url.match(/\)/g)?.length ?? 0))) url = url.slice(0, -1);
+      while (end > 0) {
+        const ch = raw[end - 1];
+        if (isBareUrlTrailingPunct(ch)) {
+          end--;
+        } else if (ch === ")" && openParens < closeParens) {
+          closeParens--;
+          end--;
+        } else {
+          break;
+        }
+      }
+      const url = end === raw.length ? raw : raw.slice(0, end);
       const start = m.index;
       if (start > last) out.push(text(item.v.slice(last, start)));
       out.push({ t: "link", target: classifyLink(url), c: [text(url)] });
@@ -537,6 +641,12 @@ function processEmphasis(list: List, bottom: Node | null): void {
     }
     n = n.next;
   }
+}
+
+function trimTrailingSpaces(s: string): string {
+  let end = s.length;
+  while (end > 0 && s[end - 1] === " ") end--;
+  return end === s.length ? s : s.slice(0, end);
 }
 
 /** Parses inline markdown in linear time. */
@@ -708,11 +818,11 @@ export function parseInline(s: string): Inline[] {
     if (ch === "\n") {
       // Two trailing spaces make a hard break; otherwise a soft break stays a newline.
       if (buf.endsWith("  ")) {
-        buf = buf.replace(/ +$/, "");
+        buf = trimTrailingSpaces(buf);
         flush();
         list.push({ items: singleSeq({ t: "br" }, 0), delim: null, bracket: null });
       } else {
-        buf = buf.replace(/ +$/, "") + "\n";
+        buf = trimTrailingSpaces(buf) + "\n";
       }
       i++;
       while (s[i] === " ") i++;
