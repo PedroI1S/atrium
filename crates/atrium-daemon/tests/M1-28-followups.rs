@@ -5,19 +5,50 @@
 
 mod common;
 
-use std::ffi::OsStr;
+use std::cell::Cell;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use atrium_daemon::{NO_PATH_EXTRAS_ENV, discover_login_shell_path};
+#[cfg(target_os = "linux")]
+use atrium_daemon::discover_login_shell_path_with_spawn_hook;
+use atrium_daemon::{NO_PATH_EXTRAS_ENV, discover_login_shell_path, spawn_login_shell_with_retry};
 use atrium_protocol::agent::Provider;
 use atrium_protocol::policy::Preset;
 use atrium_protocol::wire::{DaemonCommand, ProviderProbe};
 use common::{SOON, Wire, folder};
 use tokio::net::UnixStream;
+
+/// Prevents Linux `ETXTBSY` across parallel test threads: no thread forks a
+/// subprocess (which duplicates open file descriptors until the child calls
+/// `execve`) while another thread has an executable script open for writing.
+static EXEC_WRITE_LOCK: RwLock<()> = RwLock::new(());
+
+fn discover_path(shell: Option<&OsStr>, timeout: Duration) -> Option<OsString> {
+    let _guard = EXEC_WRITE_LOCK
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    discover_login_shell_path(shell, timeout)
+}
+
+#[cfg(target_os = "linux")]
+fn discover_path_with_hook(
+    shell: Option<&OsStr>,
+    timeout: Duration,
+    on_spawn_attempt: impl FnMut(Result<(), io::ErrorKind>),
+) -> Option<OsString> {
+    let _guard = EXEC_WRITE_LOCK
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    discover_login_shell_path_with_spawn_hook(shell, timeout, on_spawn_attempt)
+}
 
 struct DaemonProcess {
     child: Option<Child>,
@@ -58,7 +89,12 @@ impl DaemonProcess {
         } else {
             command.env_remove(NO_PATH_EXTRAS_ENV);
         }
-        let child = command.spawn().expect("spawn atriumd");
+        let child = {
+            let _guard = EXEC_WRITE_LOCK
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            command.spawn().expect("spawn atriumd")
+        };
         Self {
             child: Some(child),
             stderr_path: stderr_path.to_path_buf(),
@@ -125,6 +161,9 @@ fn create_private_dir(path: &Path) {
 }
 
 fn write_executable(path: &Path, body: &str) {
+    let _guard = EXEC_WRITE_LOCK
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
     std::fs::write(path, body).expect("write script");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
 }
@@ -144,7 +183,7 @@ fn discover_login_shell_path_handles_noise_failures_and_timeouts() {
         &noisy_sh,
         "#!/bin/sh\nprintf 'MOTD banner\\n'\nPATH='/fake/nvm/bin:/fake/asdf/bin'\n/bin/sh -c \"$2\"\nprintf '\\ntrailing\\n'\n",
     );
-    let found = discover_login_shell_path(Some(noisy_sh.as_os_str()), Duration::from_secs(2));
+    let found = discover_path(Some(noisy_sh.as_os_str()), Duration::from_secs(2));
     assert_eq!(
         found.as_deref(),
         Some(OsStr::new("/fake/nvm/bin:/fake/asdf/bin"))
@@ -153,7 +192,7 @@ fn discover_login_shell_path_handles_noise_failures_and_timeouts() {
     let failing_sh = root.path().join("failing-sh");
     write_executable(&failing_sh, "#!/bin/sh\nexit 1\n");
     assert_eq!(
-        discover_login_shell_path(Some(failing_sh.as_os_str()), Duration::from_secs(2)),
+        discover_path(Some(failing_sh.as_os_str()), Duration::from_secs(2)),
         None
     );
 
@@ -161,7 +200,7 @@ fn discover_login_shell_path_handles_noise_failures_and_timeouts() {
     write_executable(&hanging_sh, "#!/bin/sh\nsleep 10\n");
     let started = Instant::now();
     assert_eq!(
-        discover_login_shell_path(Some(hanging_sh.as_os_str()), Duration::from_millis(120)),
+        discover_path(Some(hanging_sh.as_os_str()), Duration::from_millis(120)),
         None
     );
     assert!(
@@ -172,13 +211,186 @@ fn discover_login_shell_path_handles_noise_failures_and_timeouts() {
 
     let missing_sh = root.path().join("does-not-exist");
     assert_eq!(
-        discover_login_shell_path(Some(missing_sh.as_os_str()), Duration::from_secs(1)),
+        discover_path(Some(missing_sh.as_os_str()), Duration::from_secs(1)),
         None
+    );
+    assert_eq!(discover_path(None, Duration::from_secs(1)), None);
+}
+
+#[test]
+fn discover_login_shell_path_handles_etxtbsy_within_timeout() {
+    // 1. Deterministic seam tests (injected spawn outcomes and virtual clock):
+    // completely independent of thread scheduling and OS load.
+
+    // 1a. Transient ETXTBSY followed by success retries and recovers.
+    let base = Instant::now();
+    let deadline = base + Duration::from_millis(20);
+    let elapsed = Cell::new(Duration::ZERO);
+    let mut sleeps = Vec::new();
+    let mut attempt_times = Vec::new();
+    let recovered = spawn_login_shell_with_retry(
+        deadline,
+        || base + elapsed.get(),
+        |d| {
+            sleeps.push(d);
+            elapsed.set(elapsed.get() + d);
+        },
+        || {
+            attempt_times.push(base + elapsed.get());
+            if attempt_times.len() <= 2 {
+                Err(io::Error::from(io::ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok("recovered-shell")
+            }
+        },
+    );
+    assert_eq!(recovered, Some("recovered-shell"));
+    assert_eq!(attempt_times.len(), 3);
+    assert_eq!(
+        sleeps,
+        vec![Duration::from_millis(1), Duration::from_millis(2)]
+    );
+    assert!(attempt_times.iter().all(|&t| t < deadline));
+
+    // 1b. Permanently busy script retries until the deadline, returns None,
+    // and never starts a spawn at or after the deadline.
+    let base = Instant::now();
+    let deadline = base + Duration::from_millis(20);
+    let elapsed = Cell::new(Duration::ZERO);
+    let mut sleeps = Vec::new();
+    let mut attempt_times = Vec::new();
+    let exhausted: Option<()> = spawn_login_shell_with_retry(
+        deadline,
+        || base + elapsed.get(),
+        |d| {
+            sleeps.push(d);
+            elapsed.set(elapsed.get() + d);
+        },
+        || {
+            attempt_times.push(base + elapsed.get());
+            Err(io::Error::from(io::ErrorKind::ExecutableFileBusy))
+        },
+    );
+    assert_eq!(exhausted, None);
+    assert_eq!(
+        attempt_times.len(),
+        5,
+        "expected retries before deadline exhaustion (1 initial + 4 retries)"
     );
     assert_eq!(
-        discover_login_shell_path(None, Duration::from_secs(1)),
-        None
+        sleeps,
+        vec![
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(4),
+            Duration::from_millis(8),
+            Duration::from_millis(5),
+        ]
     );
+    assert!(attempt_times.iter().all(|&t| t < deadline));
+    assert_eq!(elapsed.get(), Duration::from_millis(20));
+
+    // 1c. Expiry right before a retry stops before launching the shell even if
+    // the next attempt would succeed.
+    let base = Instant::now();
+    let deadline = base + Duration::from_millis(3);
+    let elapsed = Cell::new(Duration::ZERO);
+    let mut attempts = 0usize;
+    let expired = spawn_login_shell_with_retry(
+        deadline,
+        || base + elapsed.get(),
+        |d| elapsed.set(elapsed.get() + d),
+        || {
+            attempts += 1;
+            if attempts <= 2 {
+                Err(io::Error::from(io::ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok("started-after-deadline")
+            }
+        },
+    );
+    assert_eq!(expired, None);
+    assert_eq!(attempts, 2);
+
+    // 2. End-to-end Linux ETXTBSY tests through `discover_login_shell_path`:
+    // the writer fd is dropped synchronously ONLY inside the spawn-attempt hook
+    // after a real `execve` actually observes `ETXTBSY`, eliminating any
+    // scheduling race with a background releaser thread.
+    #[cfg(target_os = "linux")]
+    {
+        let root = folder();
+        let busy_sh = root.path().join("busy-sh");
+        write_executable(
+            &busy_sh,
+            "#!/bin/sh\nPATH='/fake/busy/bin'\n/bin/sh -c \"$2\"\n",
+        );
+
+        let mut writer = Some(
+            OpenOptions::new()
+                .write(true)
+                .open(&busy_sh)
+                .expect("open script for write"),
+        );
+        let mut attempts = Vec::new();
+        let found = discover_path_with_hook(
+            Some(busy_sh.as_os_str()),
+            Duration::from_secs(2),
+            |outcome| {
+                attempts.push(outcome);
+                if outcome == Err(io::ErrorKind::ExecutableFileBusy) {
+                    writer.take();
+                }
+            },
+        );
+        assert_eq!(found.as_deref(), Some(OsStr::new("/fake/busy/bin")));
+        let (last, prior) = attempts
+            .split_last()
+            .expect("at least one spawn attempt recorded");
+        assert_eq!(
+            *last,
+            Ok(()),
+            "final spawn attempt must succeed: {attempts:?}"
+        );
+        assert!(
+            !prior.is_empty()
+                && prior
+                    .iter()
+                    .all(|&o| o == Err(io::ErrorKind::ExecutableFileBusy)),
+            "expected at least one ETXTBSY before succeeding, got {attempts:?}"
+        );
+
+        // Permanently held writable fd must retry repeatedly and still return
+        // `None` promptly within the timeout bound.
+        let _held = OpenOptions::new()
+            .write(true)
+            .open(&busy_sh)
+            .expect("open script for write");
+        let mut busy_attempts = Vec::new();
+        let started = Instant::now();
+        assert_eq!(
+            discover_path_with_hook(
+                Some(busy_sh.as_os_str()),
+                Duration::from_millis(200),
+                |outcome| busy_attempts.push(outcome),
+            ),
+            None
+        );
+        assert!(
+            busy_attempts.len() >= 2,
+            "expected ETXTBSY retries before timeout, got {busy_attempts:?}"
+        );
+        assert!(
+            busy_attempts
+                .iter()
+                .all(|&o| o == Err(io::ErrorKind::ExecutableFileBusy)),
+            "expected only ETXTBSY failures while writer is held, got {busy_attempts:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "ETXTBSY retry exceeded timeout: {:?}",
+            started.elapsed()
+        );
+    }
 }
 
 fn process_alive(pid: i32) -> bool {
@@ -212,7 +424,7 @@ fn discover_login_shell_path_kills_process_group_descendants_on_timeout() {
 
     let started = Instant::now();
     assert_eq!(
-        discover_login_shell_path(Some(script.as_os_str()), Duration::from_millis(300)),
+        discover_path(Some(script.as_os_str()), Duration::from_millis(300)),
         None
     );
     assert!(
@@ -250,7 +462,7 @@ fn discover_login_shell_path_cleans_up_background_descendant_retaining_stdout() 
     );
 
     let started = Instant::now();
-    let found = discover_login_shell_path(Some(bg_ok_sh.as_os_str()), Duration::from_secs(5));
+    let found = discover_path(Some(bg_ok_sh.as_os_str()), Duration::from_secs(5));
     let elapsed = started.elapsed();
     let bg_ok_pid: i32 = std::fs::read_to_string(&pid_file_ok)
         .expect("bg child wrote pid")
@@ -284,7 +496,7 @@ fn discover_login_shell_path_cleans_up_background_descendant_retaining_stdout() 
     );
 
     let started = Instant::now();
-    let res = discover_login_shell_path(Some(bg_err_sh.as_os_str()), Duration::from_secs(5));
+    let res = discover_path(Some(bg_err_sh.as_os_str()), Duration::from_secs(5));
     let elapsed = started.elapsed();
     let bg_err_pid: i32 = std::fs::read_to_string(&pid_file_err)
         .expect("bg err child wrote pid")

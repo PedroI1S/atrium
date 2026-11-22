@@ -198,15 +198,53 @@ async fn start(cfg: SessionConfig, opts: ClaudeOptions) -> Result<Session, Adapt
     ClaudeAdapter::new(opts).start(cfg, Transport::Local).await
 }
 
-async fn wait_file(path: &Path, secs: u64) -> String {
-    let end = Instant::now() + Duration::from_secs(secs);
+async fn wait_file_until<T>(
+    path: &Path,
+    timeout: Duration,
+    mut parse: impl FnMut(&str) -> Option<T>,
+) -> T {
+    let end = Instant::now() + timeout;
+    let mut last_seen: Option<String> = None;
     loop {
         if let Ok(text) = fs::read_to_string(path) {
-            return text;
+            if let Some(value) = parse(&text) {
+                return value;
+            }
+            last_seen = Some(text);
         }
-        assert!(Instant::now() < end, "{} never appeared", path.display());
+        assert!(
+            Instant::now() < end,
+            "{} never became complete (last_seen={last_seen:?})",
+            path.display()
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+async fn wait_file(path: &Path, secs: u64) -> String {
+    wait_file_until(path, Duration::from_secs(secs), |text| {
+        (!text.trim().is_empty()).then(|| text.to_owned())
+    })
+    .await
+}
+
+async fn wait_json(path: &Path, secs: u64) -> Value {
+    wait_file_until(path, Duration::from_secs(secs), |text| {
+        serde_json::from_str::<Value>(text).ok()
+    })
+    .await
+}
+
+async fn wait_pid(path: &Path, secs: u64) -> String {
+    wait_file_until(path, Duration::from_secs(secs), |text| {
+        let trimmed = text.trim();
+        trimmed
+            .parse::<u32>()
+            .ok()
+            .filter(|&pid| pid > 0)
+            .map(|_| trimmed.to_owned())
+    })
+    .await
 }
 
 fn alive(pid: &str) -> bool {
@@ -285,8 +323,8 @@ async fn saturation_unread_events_still_obey_interrupt_and_shutdown() {
     // Let the flood fill the event channel and the adapter's backlog.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(events.len(), events.max_capacity(), "the channel is full");
-    let pid = wait_file(&dir.join("pids.txt"), 5).await;
-    let grandchild = wait_file(&dir.join("grandchild.pid"), 5).await;
+    let pid = wait_pid(&dir.join("pids.txt"), 5).await;
+    let grandchild = wait_pid(&dir.join("grandchild.pid"), 5).await;
     assert!(alive(&grandchild) && group_alive(process.pgid));
 
     let t = Instant::now();
@@ -349,7 +387,7 @@ async fn an_interrupt_the_child_ignores_ends_the_session() {
         matches!(e, AgentEvent::TurnStarted { .. })
     })
     .await;
-    let pid = wait_file(&dir.join("pids.txt"), 5).await;
+    let pid = wait_pid(&dir.join("pids.txt"), 5).await;
     let pgid = session.process.as_ref().unwrap().pgid;
 
     session
@@ -393,8 +431,7 @@ async fn hook_answer(
     .await
     .unwrap();
     session.commands.send(say("read x")).await.unwrap();
-    let text = wait_file(&dir.join("hook_response.json"), 10).await;
-    let v: Value = serde_json::from_str(&text).unwrap();
+    let v = wait_json(&dir.join("hook_response.json"), 10).await;
     let mut evs = next_matching(&mut session, 10, turn_done).await;
     evs.extend(shutdown(session).await);
     (v, evs)
@@ -450,7 +487,7 @@ async fn checks_carry_subject_kind_and_turn() {
     let g = gate.clone();
     let mut session = start(config(&dir, "hook", gate), opts()).await.unwrap();
     session.commands.send(say("read x")).await.unwrap();
-    wait_file(&dir.join("hook_response.json"), 10).await;
+    wait_json(&dir.join("hook_response.json"), 10).await;
     next_matching(&mut session, 10, turn_done).await;
     shutdown(session).await;
     let checks = g.checks.lock().unwrap().clone();
@@ -647,10 +684,10 @@ async fn run_mode(
     .await
     .unwrap();
     session.commands.send(say("go")).await.unwrap();
-    let text = wait_file(&dir.join(file), 10).await;
+    let v = wait_json(&dir.join(file), 10).await;
     let mut evs = next_matching(&mut session, 10, turn_done).await;
     evs.extend(shutdown(session).await);
-    (serde_json::from_str(&text).unwrap(), evs)
+    (v, evs)
 }
 
 fn behavior(v: &Value) -> (&str, &Value) {
@@ -788,8 +825,7 @@ async fn an_ask_on_can_use_tool_reaches_the_client_with_or_without_an_id() {
             })
             .await
             .unwrap();
-        let v: Value =
-            serde_json::from_str(&wait_file(&dir.join("canuse_response.json"), 10).await).unwrap();
+        let v = wait_json(&dir.join("canuse_response.json"), 10).await;
         assert_eq!(behavior(&v).0, "allow");
         assert_eq!(g.redeems().len(), 1, "{mode}: redeemed once");
         next_matching(&mut session, 10, turn_done).await;
@@ -835,8 +871,7 @@ async fn an_allowed_approval_is_redeemed_before_the_effect() {
         })
         .await
         .unwrap();
-    let v: Value =
-        serde_json::from_str(&wait_file(&dir.join("canuse_response.json"), 10).await).unwrap();
+    let v = wait_json(&dir.join("canuse_response.json"), 10).await;
     assert_eq!(behavior(&v).0, "allow");
     let redeems = g.redeems();
     assert_eq!(redeems.len(), 1);
@@ -886,8 +921,7 @@ async fn a_refused_redeem_denies_the_tool() {
         })
         .await
         .unwrap();
-    let v: Value =
-        serde_json::from_str(&wait_file(&dir.join("canuse_response.json"), 10).await).unwrap();
+    let v = wait_json(&dir.join("canuse_response.json"), 10).await;
     let (b, r) = behavior(&v);
     assert_eq!(b, "deny");
     assert!(r["message"].as_str().unwrap().contains("deny rule"));
@@ -924,8 +958,7 @@ async fn a_denied_approval_is_never_redeemed() {
         })
         .await
         .unwrap();
-    let v: Value =
-        serde_json::from_str(&wait_file(&dir.join("canuse_response.json"), 10).await).unwrap();
+    let v = wait_json(&dir.join("canuse_response.json"), 10).await;
     let (b, r) = behavior(&v);
     assert_eq!(b, "deny");
     assert_eq!(r["message"], "not now");
@@ -997,8 +1030,7 @@ async fn questions_use_the_gates_question_ticket() {
         .await
         .unwrap();
     session.commands.send(say("go")).await.unwrap();
-    let v: Value =
-        serde_json::from_str(&wait_file(&dir.join("canuse_response.json"), 10).await).unwrap();
+    let v = wait_json(&dir.join("canuse_response.json"), 10).await;
     assert_eq!(behavior(&v).0, "deny");
     let mut evs = next_matching(&mut session, 10, turn_done).await;
     evs.extend(shutdown(session).await);
@@ -1038,8 +1070,7 @@ async fn questions_use_the_gates_question_ticket() {
         })
         .await
         .unwrap();
-    let v: Value =
-        serde_json::from_str(&wait_file(&dir.join("canuse_response.json"), 10).await).unwrap();
+    let v = wait_json(&dir.join("canuse_response.json"), 10).await;
     assert_eq!(
         v["response"]["response"]["updatedInput"]["answers"]["Q?"],
         "B"
@@ -1084,8 +1115,7 @@ async fn questions_use_the_gates_question_ticket() {
             outcome: RequestOutcome::Cancelled,
         } if request_id == "Q1"
     )));
-    let v: Value =
-        serde_json::from_str(&wait_file(&dir.join("canuse_response.json"), 10).await).unwrap();
+    let v = wait_json(&dir.join("canuse_response.json"), 10).await;
     assert_eq!(v["response"]["response"]["behavior"], "deny");
     assert_eq!(
         v["response"]["response"]["message"],
@@ -1142,8 +1172,8 @@ async fn shutdown_kills_the_whole_process_group() {
         .unwrap();
     let pgid = session.process.as_ref().unwrap().pgid;
     session.commands.send(say("go")).await.unwrap();
-    let grandchild = wait_file(&dir.join("grandchild.pid"), 10).await;
-    let child = wait_file(&dir.join("pids.txt"), 5).await;
+    let grandchild = wait_pid(&dir.join("grandchild.pid"), 10).await;
+    let child = wait_pid(&dir.join("pids.txt"), 5).await;
     assert!(alive(&grandchild) && alive(&child));
 
     let t = Instant::now();
@@ -1559,7 +1589,7 @@ async fn a_start_dropped_during_the_handshake_kills_the_process_group() {
     let mut fut = Box::pin(start(cfg, opts()));
     tokio::select! {
         _ = &mut fut => panic!("the fake never answers initialize"),
-        _ = wait_file(&marker, 10) => {}
+        _ = wait_pid(&marker, 10) => {}
     }
     drop(fut);
     let pgid = pgid.load(Ordering::SeqCst);
@@ -1585,7 +1615,7 @@ async fn a_start_dropped_outside_a_runtime_kills_the_process_group() {
     let mut fut = Box::pin(start(cfg, opts()));
     tokio::select! {
         _ = &mut fut => panic!("the fake never answers initialize"),
-        _ = wait_file(&marker, 10) => {}
+        _ = wait_pid(&marker, 10) => {}
     }
     // No runtime on this thread: `Handle::try_current()` is an error there.
     std::thread::spawn(move || drop(fut)).join().unwrap();
@@ -1621,7 +1651,7 @@ async fn r3_a_start_dropped_outside_a_runtime_after_the_leader_exited_kills_the_
     let mut fut = Box::pin(start(cfg, opts()));
     let grandchild = tokio::select! {
         _ = &mut fut => panic!("the grandchild holds stdout: the handshake never ends"),
-        pid = wait_file(&marker, 10) => pid.trim().to_owned(),
+        pid = wait_pid(&marker, 10) => pid,
     };
     let leader = pgid.load(Ordering::SeqCst).to_string();
     // Wait (polling `fut` too) until the leader is a zombie.
@@ -1852,10 +1882,25 @@ async fn a_recorded_session_replays_to_the_same_events() {
 
 /// The lines of `responses.jsonl` so far, as JSON.
 fn responses(dir: &Path) -> Vec<Value> {
-    fs::read_to_string(dir.join("responses.jsonl"))
-        .unwrap_or_default()
+    let path = dir.join("responses.jsonl");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Some(last_nl) = raw.rfind('\n') else {
+        return Vec::new();
+    };
+    raw[..=last_nl]
         .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
+        .enumerate()
+        .map(|(idx, line)| {
+            serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!(
+                    "malformed completed JSONL line {} in {}: {err}: {line:?}",
+                    idx + 1,
+                    path.display()
+                )
+            })
+        })
         .collect()
 }
 
@@ -1910,4 +1955,156 @@ async fn r2_a_hook_call_and_a_can_use_request_with_one_id_are_separate() {
     .await;
     assert_eq!(behavior(&v).0, "allow");
     shutdown(session).await;
+}
+
+#[tokio::test]
+async fn wait_helpers_ignore_empty_and_half_written_files() {
+    let dir = scratch("wait-partial");
+
+    // 1. `wait_json` waits past 0-byte and truncated JSON until valid JSON lands.
+    let json_path = dir.join("canuse_response.json");
+    fs::write(&json_path, "").unwrap();
+    let mut json_fut = Box::pin(wait_json(&json_path, 5));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut json_fut)
+            .await
+            .is_err(),
+        "wait_json returned on an empty file"
+    );
+    fs::write(&json_path, r#"{"response":{"response":{"behavior":"#).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut json_fut)
+            .await
+            .is_err(),
+        "wait_json returned on truncated JSON"
+    );
+    fs::write(
+        &json_path,
+        r#"{"response":{"response":{"behavior":"deny","message":"The user declined to answer."}}}"#,
+    )
+    .unwrap();
+    let v = json_fut.await;
+    assert_eq!(v["response"]["response"]["behavior"], "deny");
+
+    // 2. `wait_pid` and `wait_file` wait past 0-byte writes.
+    let pid_path = dir.join("grandchild.pid");
+    fs::write(&pid_path, "").unwrap();
+    let mut pid_fut = Box::pin(wait_pid(&pid_path, 5));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut pid_fut)
+            .await
+            .is_err(),
+        "wait_pid returned on an empty file"
+    );
+    fs::write(&pid_path, "4242").unwrap();
+    assert_eq!(pid_fut.await, "4242");
+
+    let marker_path = dir.join("interrupted");
+    fs::write(&marker_path, "").unwrap();
+    let mut marker_fut = Box::pin(wait_file(&marker_path, 5));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut marker_fut)
+            .await
+            .is_err(),
+        "wait_file returned on an empty file"
+    );
+    fs::write(&marker_path, "yes").unwrap();
+    assert_eq!(marker_fut.await, "yes");
+
+    // 3. `wait_response` ignores a half-written trailing line in `responses.jsonl`.
+    let jsonl_path = dir.join("responses.jsonl");
+    fs::write(&jsonl_path, r#"{"response":{"response":{"behavior":"#).unwrap();
+    let mut resp_fut = Box::pin(wait_response(&dir, "can_use_tool request", |v| {
+        v.pointer("/response/response/behavior").is_some()
+    }));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut resp_fut)
+            .await
+            .is_err(),
+        "wait_response returned on a half-written line"
+    );
+    fs::write(
+        &jsonl_path,
+        "{\"response\":{\"response\":{\"behavior\":\"allow\"}}}\n",
+    )
+    .unwrap();
+    let resp = resp_fut.await;
+    assert_eq!(behavior(&resp).0, "allow");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn wait_response_fails_on_malformed_completed_jsonl_line() {
+    let dir = scratch("wait-response-malformed");
+    let jsonl_path = dir.join("responses.jsonl");
+
+    // 1. A completed malformed line followed by a valid matching record must
+    // fail `wait_response` with a diagnostic showing the bad line.
+    fs::write(
+        &jsonl_path,
+        "not-json-at-all\n{\"response\":{\"response\":{\"behavior\":\"allow\"}}}\n",
+    )
+    .unwrap();
+    let dir_for_task = dir.clone();
+    let err = tokio::spawn(async move {
+        wait_response(&dir_for_task, "can_use_tool request", |v| {
+            v.pointer("/response/response/behavior").is_some()
+        })
+        .await
+    })
+    .await
+    .expect_err("malformed completed JSONL line must fail wait_response");
+    assert!(err.is_panic(), "expected panic, got: {err:?}");
+    let payload = err.into_panic();
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        msg.contains("not-json-at-all") && msg.contains("line 1"),
+        "diagnostic must show the malformed line and line number, got: {msg}"
+    );
+
+    // 2. A completed blank line before a valid record must also fail.
+    fs::write(
+        &jsonl_path,
+        "\n{\"response\":{\"response\":{\"behavior\":\"allow\"}}}\n",
+    )
+    .unwrap();
+    let dir_for_blank = dir.clone();
+    let blank_err = tokio::spawn(async move {
+        wait_response(&dir_for_blank, "can_use_tool request", |v| {
+            v.pointer("/response/response/behavior").is_some()
+        })
+        .await
+    })
+    .await
+    .expect_err("blank completed JSONL line must fail wait_response");
+    assert!(blank_err.is_panic(), "expected panic, got: {blank_err:?}");
+    let blank_payload = blank_err.into_panic();
+    let blank_msg = blank_payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| blank_payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        blank_msg.contains("\"\"") && blank_msg.contains("line 1"),
+        "diagnostic must show the blank line and line number, got: {blank_msg}"
+    );
+
+    // 3. Only an unfinished trailing line (no newline yet) is ignored.
+    fs::write(
+        &jsonl_path,
+        "{\"response\":{\"response\":{\"behavior\":\"allow\"}}}\n{\"truncated",
+    )
+    .unwrap();
+    let resp = wait_response(&dir, "can_use_tool request", |v| {
+        v.pointer("/response/response/behavior").is_some()
+    })
+    .await;
+    assert_eq!(behavior(&resp).0, "allow");
+
+    let _ = fs::remove_dir_all(&dir);
 }
