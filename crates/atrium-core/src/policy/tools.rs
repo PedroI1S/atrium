@@ -6486,11 +6486,14 @@ mod tests {
         let check_row = |label: &str, flags: &[FlagSpec], changes_default: Option<&'static str>| {
             for f in flags {
                 let eff = f.effects();
-                let is_prog_kind = matches!(
-                    f.kind,
+                let is_prog_kind = match f.kind {
                     FlagKind::Value(ValueRole::ProgramFile)
-                        | FlagKind::OptionalValue(ValueRole::ProgramFile)
-                );
+                    | FlagKind::OptionalValue(ValueRole::ProgramFile) => true,
+                    FlagKind::MultiValue(args) => {
+                        args.iter().any(|a| a.role == ValueRole::ProgramFile)
+                    }
+                    _ => false,
+                };
                 if is_prog_kind || eff.runs_program.is_some() {
                     assert_eq!(
                         f.kind,
@@ -6509,6 +6512,11 @@ mod tests {
                         eff.value_access,
                         Some(FlagValueAccess::Read),
                         "{label}: ProgramFile flag must read its script file for hard-deny checks"
+                    );
+                    assert_eq!(
+                        eff.writes_positional_inputs,
+                        FlagToggle::Unchanged,
+                        "{label}: ProgramFile flag must not turn positional inputs into write targets (Rule G)"
                     );
                     assert!(
                         changes_default.is_some_and(|cd| cd.contains("§11 item 8")),
@@ -7460,6 +7468,642 @@ mod tests {
             find_dbg
                 .candidate_paths
                 .contains(&("proj".into(), AccessMode::Read))
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Round 4 integrity test (documented flag arities) & independent fixtures
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_flag_consumes_fewer_arguments_than_documented() {
+        fn arity_covers(actual: FlagArity, documented: FlagArity) -> bool {
+            match (actual, documented) {
+                (FlagArity::Exact(got), FlagArity::Exact(req)) => got >= req,
+                (FlagArity::OptionalOne, FlagArity::Exact(0) | FlagArity::OptionalOne) => true,
+                (FlagArity::Terminated(got), FlagArity::Terminated(req)) => {
+                    req.iter().all(|t| got.contains(t))
+                }
+                _ => false,
+            }
+        }
+
+        // Documented arities for every flag in non-search-table tools and git
+        // subcommands (rg/grep/ag/ack arities are checked bidirectionally
+        // against dev's tables in `dev_lists_and_flag_tables_fully_accounted_for`).
+        // Format: (tool, optional subcommand, token, documented FlagArity).
+        let documented: &[(&str, Option<&str>, &str, FlagArity)] = &[
+            // `find` (GNU / BSD / POSIX documented arities)
+            ("find", None, "-H", FlagArity::Exact(0)),
+            ("find", None, "-L", FlagArity::Exact(0)),
+            ("find", None, "-follow", FlagArity::Exact(0)),
+            ("find", None, "-P", FlagArity::Exact(0)),
+            ("find", None, "-E", FlagArity::Exact(0)),
+            ("find", None, "-X", FlagArity::Exact(0)),
+            ("find", None, "-d", FlagArity::Exact(0)),
+            ("find", None, "-s", FlagArity::Exact(0)),
+            ("find", None, "-x", FlagArity::Exact(0)),
+            ("find", None, "-D", FlagArity::Exact(1)),
+            ("find", None, "-f", FlagArity::Exact(1)),
+            ("find", None, "-delete", FlagArity::Exact(0)),
+            ("find", None, "-depth", FlagArity::Exact(0)),
+            ("find", None, "-maxdepth", FlagArity::Exact(1)),
+            ("find", None, "-mindepth", FlagArity::Exact(1)),
+            ("find", None, "-exec", FlagArity::Terminated(&[";", "+"])),
+            ("find", None, "-execdir", FlagArity::Terminated(&[";", "+"])),
+            ("find", None, "-ok", FlagArity::Terminated(&[";"])),
+            ("find", None, "-okdir", FlagArity::Terminated(&[";"])),
+            ("find", None, "-fprint", FlagArity::Exact(1)),
+            ("find", None, "-fprint0", FlagArity::Exact(1)),
+            ("find", None, "-fprintf", FlagArity::Exact(2)),
+            ("find", None, "-fls", FlagArity::Exact(1)),
+            // `tar`
+            ("tar", None, "-c", FlagArity::Exact(0)),
+            ("tar", None, "-r", FlagArity::Exact(0)),
+            ("tar", None, "-u", FlagArity::Exact(0)),
+            ("tar", None, "-x", FlagArity::Exact(0)),
+            ("tar", None, "-t", FlagArity::Exact(0)),
+            ("tar", None, "-h", FlagArity::Exact(0)),
+            ("tar", None, "-f", FlagArity::Exact(1)),
+            ("tar", None, "-C", FlagArity::Exact(1)),
+            // `unzip`
+            ("unzip", None, "-d", FlagArity::Exact(1)),
+            // `nice` & `timeout`
+            ("nice", None, "-n", FlagArity::Exact(1)),
+            ("timeout", None, "-s", FlagArity::Exact(1)),
+            ("timeout", None, "-k", FlagArity::Exact(1)),
+            // `sh` / `bash` / `dash`
+            ("sh", None, "-c", FlagArity::Exact(1)),
+            ("bash", None, "-c", FlagArity::Exact(1)),
+            ("dash", None, "-c", FlagArity::Exact(1)),
+            // `sort` & `tree`
+            ("sort", None, "-o", FlagArity::Exact(1)),
+            ("tree", None, "-o", FlagArity::Exact(1)),
+            // `printf`
+            ("printf", None, "-v", FlagArity::Exact(1)),
+            // `codesign`
+            ("codesign", None, "-s", FlagArity::Exact(1)),
+            ("codesign", None, "-f", FlagArity::Exact(0)),
+            ("codesign", None, "--remove-signature", FlagArity::Exact(0)),
+            ("codesign", None, "-d", FlagArity::Exact(0)),
+            ("codesign", None, "-v", FlagArity::Exact(0)),
+            // `sed`, `awk`, `perl`, `python`, `python3`, `node`, `ruby`
+            ("sed", None, "-i", FlagArity::Exact(0)),
+            ("sed", None, "-e", FlagArity::Exact(1)),
+            ("sed", None, "-f", FlagArity::Exact(1)),
+            ("awk", None, "-i", FlagArity::Exact(1)),
+            ("perl", None, "-i", FlagArity::Exact(0)),
+            ("perl", None, "-e", FlagArity::Exact(1)),
+            ("perl", None, "-E", FlagArity::Exact(1)),
+            ("python", None, "-c", FlagArity::Exact(1)),
+            ("python", None, "-m", FlagArity::Exact(1)),
+            ("python3", None, "-c", FlagArity::Exact(1)),
+            ("python3", None, "-m", FlagArity::Exact(1)),
+            ("node", None, "-e", FlagArity::Exact(1)),
+            ("node", None, "-p", FlagArity::Exact(1)),
+            ("ruby", None, "-e", FlagArity::Exact(1)),
+            // `git` globals & subcommand value flags
+            ("git", None, "-C", FlagArity::Exact(1)),
+            ("git", None, "-c", FlagArity::Exact(1)),
+            ("git", None, "--config-env", FlagArity::Exact(1)),
+            ("git", None, "--exec-path", FlagArity::Exact(1)),
+            ("git", None, "--git-dir", FlagArity::Exact(1)),
+            ("git", None, "--work-tree", FlagArity::Exact(1)),
+            ("git", None, "--namespace", FlagArity::Exact(1)),
+            ("git", None, "--super-prefix", FlagArity::Exact(1)),
+            ("git", Some("log"), "-L", FlagArity::Exact(1)),
+            ("git", Some("diff"), "--output", FlagArity::Exact(1)),
+            ("git", Some("branch"), "-u", FlagArity::Exact(1)),
+            ("git", Some("checkout"), "-b", FlagArity::Exact(1)),
+            ("git", Some("checkout"), "-B", FlagArity::Exact(1)),
+            ("git", Some("checkout"), "--orphan", FlagArity::Exact(1)),
+            ("git", Some("push"), "-o", FlagArity::Exact(1)),
+            ("git", Some("push"), "--receive-pack", FlagArity::Exact(1)),
+            ("git", Some("push"), "--exec", FlagArity::Exact(1)),
+            ("git", Some("rebase"), "-x", FlagArity::Exact(1)),
+            ("git", Some("difftool"), "-x", FlagArity::Exact(1)),
+            ("git", Some("mergetool"), "-x", FlagArity::Exact(1)),
+        ];
+
+        // Verify every flag in FIND_FLAGS is explicitly audited above.
+        let find = lookup("find").unwrap();
+        for f in find.flags {
+            let tok = match (f.short, f.long) {
+                (Some(s), _) => format!("-{s}"),
+                (None, Some(l)) => format!("-{l}"),
+                (None, None) => unreachable!(),
+            };
+            assert!(
+                documented
+                    .iter()
+                    .any(|(t, sub, name, _)| *t == "find" && sub.is_none() && *name == tok),
+                "FIND_FLAGS entry `{tok}` must have its documented arity audited in this test"
+            );
+        }
+
+        for &(tool_name, sub_name, tok, req_arity) in documented {
+            let tool = lookup(tool_name).unwrap_or_else(|| panic!("missing tool `{tool_name}`"));
+            let spec = match sub_name {
+                Some(sn) => {
+                    let sub = subcommand(tool, sn)
+                        .unwrap_or_else(|| panic!("missing subcommand `{tool_name} {sn}`"));
+                    flag(sub.flags, tok)
+                }
+                None => flag_for_tool(tool, tok),
+            }
+            .unwrap_or_else(|| panic!("missing flag `{tok}` on `{tool_name}` ({sub_name:?})"));
+            let actual = spec.kind.arity();
+            assert!(
+                arity_covers(actual, req_arity),
+                "`{tool_name}` ({sub_name:?}) `{tok}` has arity {actual:?}, which consumes fewer arguments than documented {req_arity:?}"
+            );
+        }
+
+        // Unlisted multi-arg / value-taking find primaries must remain unlisted
+        // (handled as Unread(UnknownFlag) under FlagMode::ListedOnly).
+        for unlisted in ["-printf", "-newerXY", "-newermt", "-name", "-regex"] {
+            assert!(
+                flag_for_tool(find, unlisted).is_none(),
+                "unlisted find primary `{unlisted}` should stay outside FIND_FLAGS (Unread)"
+            );
+        }
+    }
+
+    #[test]
+    fn round4_findings_and_rule_g_access_fixtures() {
+        use super::super::model::AccessMode;
+
+        // --- Finding 1: newly restricted ListedOnly forms become Unread(UnknownFlag) ---
+        for (argv, tool, flag_tok) in [
+            (&["sort", "-r", "README.md"][..], "sort", "-r"),
+            (&["rm", "-f", "build.tmp"][..], "rm", "-f"),
+        ] {
+            let sim = simulate_table(argv);
+            assert!(
+                sim.unread.contains(&UnreadReason::UnknownFlag {
+                    tool: tool.into(),
+                    flag: flag_tok.into(),
+                }),
+                "{argv:?} must produce UnknownFlag under ListedOnly, got {:?}",
+                sim.unread
+            );
+            assert!(!table_accepts_flags_under_rule(argv));
+        }
+
+        // --- Finding 2: Home-forbidden flags only remove Home eligibility ---
+        // Modeled Home-forbidden flags stay in the model under a covering rule.
+        for (argv, written_target) in [
+            (&["tree", "-o", "out.txt"][..], "out.txt"),
+            (&["tree", "--out=out.txt"][..], "out.txt"),
+            (&["git", "diff", "--output", "out.patch"][..], "out.patch"),
+            (&["git", "diff", "--out=out.patch"][..], "out.patch"),
+        ] {
+            let sim = simulate_table(argv);
+            assert!(
+                !sim.home_readonly_eligible && !table_accepts_in_home(argv),
+                "{argv:?} must not be Home-eligible (Home asks as on dev)"
+            );
+            assert!(
+                table_accepts_flags_under_rule(argv) && sim.unread.is_empty(),
+                "{argv:?} must stay in the model under a covering rule, got {:?}",
+                sim.unread
+            );
+            assert!(sim.writes, "{argv:?} must mark unit as writing");
+            assert!(
+                sim.candidate_paths
+                    .contains(&(written_target.into(), AccessMode::Write)),
+                "{argv:?} must mark {written_target} as Write"
+            );
+        }
+        // Unlisted Home-forbidden flags on AnyExceptForbidden rows also only
+        // remove Home eligibility; under a covering rule they keep conservative ReadWrite.
+        for (argv, path_arg) in [
+            (&["tree", "-R", "src"][..], "src"),
+            (&["file", "-C", "magic"][..], "magic"),
+            (&["file", "-f", "list.txt"][..], "list.txt"),
+            (&["date", "-s", "2026-01-01"][..], "2026-01-01"),
+        ] {
+            let sim = simulate_table(argv);
+            assert!(!sim.home_readonly_eligible && !table_accepts_in_home(argv));
+            assert!(
+                table_accepts_flags_under_rule(argv) && sim.unread.is_empty(),
+                "{argv:?} must stay in the model under a covering rule"
+            );
+            assert!(
+                sim.candidate_paths
+                    .contains(&(path_arg.into(), AccessMode::ReadWrite)),
+                "{argv:?} must check {path_arg} conservatively as ReadWrite"
+            );
+        }
+        // Modeled ListedOnly Home-forbidden flags without Unread (`rg -f`, `grep -f`)
+        // ask in Home and stay in the model under a covering rule with Read access.
+        for argv in [
+            &["rg", "-f", "pats", "proj"][..],
+            &["grep", "-f", "pats", "proj"][..],
+        ] {
+            let sim = simulate_table(argv);
+            assert!(!sim.home_readonly_eligible && !table_accepts_in_home(argv));
+            assert!(table_accepts_flags_under_rule(argv) && sim.unread.is_empty());
+            assert!(
+                sim.candidate_paths
+                    .contains(&("pats".into(), AccessMode::Read))
+            );
+            assert!(
+                sim.candidate_paths
+                    .contains(&("proj".into(), AccessMode::Read))
+            );
+        }
+        // A Home-forbidden flag whose declared effect is code execution (`git diff --ext-diff`)
+        // is Unread under covering rules because of `runs_code`, not `home_readonly.forbidden`.
+        let git_ext = simulate_table(&["git", "diff", "--ext-diff"]);
+        assert!(!git_ext.home_readonly_eligible);
+        assert!(!table_accepts_flags_under_rule(&[
+            "git",
+            "diff",
+            "--ext-diff"
+        ]));
+        assert!(
+            git_ext
+                .unread
+                .contains(&UnreadReason::CodeRunnerInlineCode { tool: "git".into() })
+        );
+
+        // --- Finding 3 + Rule G: tar archive & -C access depend on operation ---
+        // Create / append / update: archive is Write, sources are Read, -C is Read.
+        for op_flag in ["-cf", "-rf", "-uf"] {
+            let sim = simulate_table(&["tar", op_flag, "out.tar", "src"]);
+            assert!(sim.writes, "tar {op_flag} writes archive");
+            assert!(!sim.derived_destinations);
+            assert!(sim.unread.is_empty());
+            assert!(
+                sim.candidate_paths
+                    .contains(&("out.tar".into(), AccessMode::Write)),
+                "tar {op_flag} must mark archive Write"
+            );
+            assert!(
+                sim.candidate_paths
+                    .contains(&("src".into(), AccessMode::Read)),
+                "tar {op_flag} must mark source operand Read"
+            );
+
+            let sim_c = simulate_table(&["tar", op_flag, "out.tar", "-C", "src_dir", "file.txt"]);
+            assert!(
+                sim_c
+                    .candidate_paths
+                    .contains(&("out.tar".into(), AccessMode::Write)),
+                "tar {op_flag} -C must mark archive Write"
+            );
+            assert!(
+                sim_c
+                    .candidate_paths
+                    .contains(&("src_dir".into(), AccessMode::Read)),
+                "tar {op_flag} -C reads from src_dir, never writes it"
+            );
+            assert!(
+                sim_c
+                    .candidate_paths
+                    .contains(&("file.txt".into(), AccessMode::Read))
+            );
+            assert!(
+                sim_c
+                    .unread
+                    .contains(&UnreadReason::UnsupportedBaseDirChange {
+                        tool: "tar".into(),
+                        flag: "-C".into(),
+                    })
+            );
+        }
+        // Extract (`-x`): archive is Read (even though unit writes derived destinations),
+        // members are not host paths, and `-C` destination dir is Write.
+        let tar_x = simulate_table(&["tar", "-xf", "archive.tar", "member.txt"]);
+        assert!(tar_x.writes);
+        assert!(tar_x.derived_destinations);
+        assert!(
+            tar_x
+                .unread
+                .contains(&UnreadReason::DerivedDestinations { tool: "tar".into() })
+        );
+        assert!(
+            tar_x
+                .candidate_paths
+                .contains(&("archive.tar".into(), AccessMode::Read)),
+            "tar -xf reads archive.tar; must never mark it Write"
+        );
+        assert!(
+            !tar_x.candidate_paths.iter().any(|(p, _)| p == "member.txt"),
+            "tar -xf member operands are ArchiveMembers, not host paths"
+        );
+        // Order-independent: `-f` before `-x` still resolves archive as Read.
+        let tar_f_then_x = simulate_table(&["tar", "-f", "archive.tar", "-x"]);
+        assert!(
+            tar_f_then_x
+                .candidate_paths
+                .contains(&("archive.tar".into(), AccessMode::Read))
+        );
+        let tar_x_c = simulate_table(&["tar", "-xf", "archive.tar", "-C", "dest_dir"]);
+        assert!(
+            tar_x_c
+                .candidate_paths
+                .contains(&("archive.tar".into(), AccessMode::Read)),
+            "tar -xf -C reads archive.tar"
+        );
+        assert!(
+            tar_x_c
+                .candidate_paths
+                .contains(&("dest_dir".into(), AccessMode::Write)),
+            "tar -xf -C extracts into dest_dir (Write)"
+        );
+        assert!(
+            tar_x_c
+                .unread
+                .contains(&UnreadReason::UnsupportedBaseDirChange {
+                    tool: "tar".into(),
+                    flag: "-C".into(),
+                })
+        );
+        // List (`-t`): archive is Read, -C is Read, unit does not write.
+        let tar_t = simulate_table(&["tar", "-tf", "archive.tar", "member.txt"]);
+        assert!(!tar_t.writes);
+        assert!(!tar_t.derived_destinations);
+        assert!(tar_t.unread.is_empty());
+        assert!(
+            tar_t
+                .candidate_paths
+                .contains(&("archive.tar".into(), AccessMode::Read))
+        );
+        assert!(!tar_t.candidate_paths.iter().any(|(p, _)| p == "member.txt"));
+        let tar_t_c = simulate_table(&["tar", "-tf", "archive.tar", "-C", "list_dir"]);
+        assert!(!tar_t_c.writes);
+        assert!(
+            tar_t_c
+                .candidate_paths
+                .contains(&("archive.tar".into(), AccessMode::Read))
+        );
+        assert!(
+            tar_t_c
+                .candidate_paths
+                .contains(&("list_dir".into(), AccessMode::Read))
+        );
+        assert!(
+            tar_t_c
+                .unread
+                .contains(&UnreadReason::UnsupportedBaseDirChange {
+                    tool: "tar".into(),
+                    flag: "-C".into(),
+                })
+        );
+
+        // --- Finding 4 + Rule G: sed -f, sed -i, perl, awk, codesign, ln/cp/uniq/unzip ---
+        let sed_f = simulate_table(&["sed", "-f", "print.sed", "protected"]);
+        assert!(sed_f.writes, "sed -f is a possible writer (§5)");
+        assert!(!sed_f.inline_code);
+        assert_eq!(
+            sed_f.unread,
+            vec![UnreadReason::Program {
+                program_words: vec!["sed".into(), "-f".into(), "print.sed".into()],
+            }]
+        );
+        assert!(
+            sed_f
+                .candidate_paths
+                .contains(&("print.sed".into(), AccessMode::Read))
+        );
+        assert!(
+            sed_f
+                .candidate_paths
+                .contains(&("protected".into(), AccessMode::Read))
+        );
+
+        // `sed -i -f`: program file stays Read, input target becomes Write.
+        let sed_if = simulate_table(&["sed", "-i", "-f", "edit.sed", "target.txt"]);
+        assert!(sed_if.writes);
+        assert!(
+            sed_if
+                .candidate_paths
+                .contains(&("edit.sed".into(), AccessMode::Read))
+        );
+        assert!(
+            sed_if
+                .candidate_paths
+                .contains(&("target.txt".into(), AccessMode::Write))
+        );
+
+        // `sed -i`: in-place edit marks input target Write.
+        let sed_i = simulate_table(&["sed", "-i", "s/a/b/", "target.txt"]);
+        assert!(sed_i.writes);
+        assert!(sed_i.unread.is_empty());
+        assert!(
+            sed_i
+                .candidate_paths
+                .contains(&("target.txt".into(), AccessMode::Write))
+        );
+
+        // `perl` without `-i`: script and inputs stay Read while unit is possible writer.
+        let perl_ro = simulate_table(&["perl", "script.pl", "protected"]);
+        assert!(perl_ro.writes);
+        assert!(
+            perl_ro
+                .candidate_paths
+                .contains(&("script.pl".into(), AccessMode::Read))
+        );
+        assert!(
+            perl_ro
+                .candidate_paths
+                .contains(&("protected".into(), AccessMode::Read))
+        );
+        // `perl -i`: script stays Read, input target becomes Write.
+        let perl_i = simulate_table(&["perl", "-i", "script.pl", "target.txt"]);
+        assert!(perl_i.writes);
+        assert!(
+            perl_i
+                .candidate_paths
+                .contains(&("script.pl".into(), AccessMode::Read)),
+            "perl -i must not mark ProgramFile script.pl as Write"
+        );
+        assert!(
+            perl_i
+                .candidate_paths
+                .contains(&("target.txt".into(), AccessMode::Write))
+        );
+        let perl_ie = simulate_table(&["perl", "-i", "-e", "s/a/b/", "target.txt"]);
+        assert!(perl_ie.writes);
+        assert!(perl_ie.inline_code);
+        assert!(
+            perl_ie
+                .candidate_paths
+                .contains(&("target.txt".into(), AccessMode::Write))
+        );
+
+        // `codesign -v` reads; `codesign -s` writes in place.
+        let codesign_v = simulate_table(&["codesign", "-v", "app"]);
+        assert!(!codesign_v.writes);
+        assert!(
+            codesign_v
+                .candidate_paths
+                .contains(&("app".into(), AccessMode::Read))
+        );
+
+        // `ln`, `cp`, `uniq`, `unzip` per-operand access.
+        let ln_s = simulate_table(&["ln", "-s", "target", "link"]);
+        assert!(
+            ln_s.candidate_paths
+                .contains(&("target".into(), AccessMode::Read))
+        );
+        assert!(
+            ln_s.candidate_paths
+                .contains(&("link".into(), AccessMode::Write))
+        );
+
+        let cp_f = simulate_table(&["cp", "src", "dst"]);
+        assert!(
+            cp_f.candidate_paths
+                .contains(&("src".into(), AccessMode::Read))
+        );
+        assert!(
+            cp_f.candidate_paths
+                .contains(&("dst".into(), AccessMode::Write))
+        );
+
+        let uniq_1 = simulate_table(&["uniq", "in.txt"]);
+        assert!(!uniq_1.writes);
+        assert!(
+            uniq_1
+                .candidate_paths
+                .contains(&("in.txt".into(), AccessMode::Read))
+        );
+        let uniq_2 = simulate_table(&["uniq", "in.txt", "out.txt"]);
+        assert!(uniq_2.writes);
+        assert!(
+            uniq_2
+                .candidate_paths
+                .contains(&("in.txt".into(), AccessMode::Read))
+        );
+        assert!(
+            uniq_2
+                .candidate_paths
+                .contains(&("out.txt".into(), AccessMode::Write))
+        );
+
+        let unzip = simulate_table(&["unzip", "archive.zip", "-d", "dest_dir", "member.txt"]);
+        assert!(unzip.writes);
+        assert!(unzip.derived_destinations);
+        assert!(
+            unzip
+                .candidate_paths
+                .contains(&("archive.zip".into(), AccessMode::Read))
+        );
+        assert!(
+            unzip
+                .candidate_paths
+                .contains(&("dest_dir".into(), AccessMode::Write))
+        );
+        assert!(!unzip.candidate_paths.iter().any(|(p, _)| p == "member.txt"));
+
+        // --- Finding 5: multi-argument and terminated `find` primaries ---
+        let find_fprintf = simulate_table(&["find", "proj", "-fprintf", "out.txt", "alias"]);
+        assert!(find_fprintf.writes);
+        assert!(find_fprintf.unread.is_empty());
+        assert!(
+            find_fprintf
+                .candidate_paths
+                .contains(&("proj".into(), AccessMode::Read)),
+            "find start point is Read"
+        );
+        assert!(
+            find_fprintf
+                .candidate_paths
+                .contains(&("out.txt".into(), AccessMode::Write)),
+            "find -fprintf FILE is Write"
+        );
+        assert!(
+            !find_fprintf
+                .candidate_paths
+                .iter()
+                .any(|(p, _)| p == "alias"),
+            "find -fprintf FORMAT is Text, never a filesystem path"
+        );
+
+        for primary in ["-fprint", "-fprint0", "-fls"] {
+            let sim = simulate_table(&["find", "proj", primary, "out.txt"]);
+            assert!(sim.writes);
+            assert!(sim.unread.is_empty());
+            assert!(
+                sim.candidate_paths
+                    .contains(&("proj".into(), AccessMode::Read))
+            );
+            assert!(
+                sim.candidate_paths
+                    .contains(&("out.txt".into(), AccessMode::Write))
+            );
+        }
+
+        for (primary, term) in [
+            ("-exec", ";"),
+            ("-exec", "+"),
+            ("-execdir", ";"),
+            ("-execdir", "+"),
+            ("-ok", ";"),
+            ("-okdir", ";"),
+        ] {
+            let sim = simulate_table(&["find", "proj", primary, "echo", "alias", term]);
+            assert!(sim.writes);
+            assert!(sim.inline_code);
+            assert!(sim.unread.contains(&UnreadReason::CodeRunnerInlineCode {
+                tool: "find".into()
+            }));
+            assert!(
+                sim.candidate_paths
+                    .contains(&("proj".into(), AccessMode::Read)),
+                "find {primary} start point is Read"
+            );
+            assert!(
+                !sim.candidate_paths
+                    .iter()
+                    .any(|(p, _)| p == "alias" || p == "echo" || p == term),
+                "find {primary} ... {term} must consume all arguments up to terminator"
+            );
+        }
+
+        let find_del = simulate_table(&["find", "proj", "-delete"]);
+        assert!(find_del.writes);
+        assert!(find_del.derived_destinations);
+        assert!(
+            find_del
+                .candidate_paths
+                .contains(&("proj".into(), AccessMode::Write))
+        );
+        assert!(
+            find_del
+                .unread
+                .contains(&UnreadReason::DerivedDestinations {
+                    tool: "find".into()
+                })
+        );
+
+        for (argv, flag_tok) in [
+            (&["find", "proj", "-printf", "%p"][..], "-printf"),
+            (&["find", "proj", "-newermt", "2026-01-01"][..], "-newermt"),
+        ] {
+            let sim = simulate_table(argv);
+            assert!(
+                sim.unread.contains(&UnreadReason::UnknownFlag {
+                    tool: "find".into(),
+                    flag: flag_tok.into(),
+                }),
+                "{argv:?} must be Unread(UnknownFlag)"
+            );
+        }
+
+        // --- Finding 6 & round-3 flag audit: removed synthetic flags ---
+        assert!(flag_long(lookup("grep").unwrap().flags, "include-dir").is_none());
+        assert!(flag_short(lookup("awk").unwrap().flags, 'f').is_none());
+        let awk_f = simulate_table(&["awk", "-f", "prog.awk", "README.md"]);
+        assert!(
+            awk_f.unread.contains(&UnreadReason::UnknownFlag {
+                tool: "awk".into(),
+                flag: "-f".into(),
+            }),
+            "awk -f (removed as not in dev) must be handled as UnknownFlag"
         );
     }
 }
