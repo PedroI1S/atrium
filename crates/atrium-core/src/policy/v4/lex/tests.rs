@@ -5,7 +5,7 @@ use super::*;
 use crate::policy::limits;
 use crate::policy::model::{
     BestEffortRedirectKind, ByteProvenance, Cap, ComputeBudget, ExhaustReason, FoldRules,
-    ModelRedirect, PartOutcome, PipelineId, Separator, StdFd, UnitIndex, UnreadReason, Word,
+    ModelRedirect, PartOutcome, PipelineId, Separator, StdFd, UnreadReason, Word,
 };
 
 fn unread_reasons(out: &LexExactOutput) -> Vec<&UnreadReason> {
@@ -100,8 +100,14 @@ fn lex_exact_globs_and_negated_classes() {
         );
     }
 
-    // Empty `[]`, unclosed `[abc`, nested `[[:alpha:]]`, stray `]`.
-    for line in ["cat []", "cat [abc", "cat [[:alpha:]]", "cat a]b"] {
+    // Empty `[]`, unclosed `[abc`, nested `[[:alpha:]]`, slash `[a/b]`, stray `]`.
+    for line in [
+        "cat []",
+        "cat [abc",
+        "cat [[:alpha:]]",
+        "cat [a/b]",
+        "cat a]b",
+    ] {
         let mut budget = ComputeBudget::with_default_limits();
         let out = lex_exact(line, 0, None, &mut budget).unwrap();
         assert!(
@@ -227,7 +233,24 @@ fn lex_exact_quotes_escapes_and_provenance() {
         );
     }
 
-    // Outside quotes: `\` allowed before allowed chars & glob chars (`\*`, `\?`, `\[`, `\]`, `\=`).
+    // Outside quotes: `\` allowed before EVERY allowed char and glob char.
+    for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./,:@%+-=*?[]".chars()
+    {
+        let line = format!("echo \\{ch}");
+        let mut b = ComputeBudget::with_default_limits();
+        let out = lex_exact(&line, 0, None, &mut b).unwrap();
+        assert!(
+            unread_reasons(&out).is_empty(),
+            "escaped `\\{ch}` must be allowed: {:?}",
+            out.outcomes
+        );
+        assert_eq!(out.units[0].argv[1].literal_bytes(), &[ch as u8]);
+        assert_eq!(
+            out.units[0].argv[1].provenance(),
+            &[ByteProvenance::Escaped]
+        );
+        assert!(!out.units[0].argv[1].has_unquoted_glob());
+    }
     let mut b5 = ComputeBudget::with_default_limits();
     let esc = lex_exact(r"cat proj/key\*\[0\]\?", 0, None, &mut b5).unwrap();
     assert!(unread_reasons(&esc).is_empty(), "{:?}", esc.outcomes);
@@ -315,8 +338,12 @@ fn lex_exact_separators_pipelines_and_outside_constructs() {
         );
     }
 
-    // Every reserved word in `shell::RESERVED`.
-    for &kw in crate::policy::shell::RESERVED {
+    // Every reserved word in P0's `OUTSIDE_MODEL` (§3, matching `shell::RESERVED`).
+    for entry in crate::policy::tools::outside_model()
+        .iter()
+        .filter(|e| e.contract_section == "§3")
+    {
+        let kw = entry.name;
         let line = format!("{kw} foo");
         let mut b = ComputeBudget::with_default_limits();
         let out = lex_exact(&line, 0, None, &mut b).unwrap();
@@ -326,6 +353,19 @@ fn lex_exact_separators_pipelines_and_outside_constructs() {
                 UnreadReason::ReservedWordOrConstruct { construct } if construct == kw
             )),
             "reserved word `{kw}`: {:?}",
+            out.outcomes
+        );
+    }
+
+    // Standalone `{` / `}` in argument position reports `UnquotedByteOutsideModel`.
+    for (line, want_b) in [("echo {", b'{'), ("echo }", b'}')] {
+        let mut b = ComputeBudget::with_default_limits();
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert!(
+            unread_reasons(&out).iter().any(
+                |r| matches!(r, UnreadReason::UnquotedByteOutsideModel { byte } if *byte == want_b)
+            ),
+            "line `{line}`: {:?}",
             out.outcomes
         );
     }
@@ -378,6 +418,33 @@ fn lex_exact_closed_redirect_list_and_outside_redirects() {
         }
     );
     assert_eq!(r[7], ModelRedirect::Close { fd: StdFd::Stdout });
+
+    // All 9 `n>&m` pairs and all 3 `n>&-` forms in `0..=2`.
+    for n in 0u8..=2 {
+        let close_line = format!("cat {n}>&-");
+        let mut bc = ComputeBudget::with_default_limits();
+        let out_c = lex_exact(&close_line, 0, None, &mut bc).unwrap();
+        assert!(unread_reasons(&out_c).is_empty(), "{close_line}");
+        assert_eq!(
+            out_c.units[0].redirects,
+            vec![ModelRedirect::Close {
+                fd: StdFd::from_u8(n).unwrap()
+            }]
+        );
+        for m in 0u8..=2 {
+            let dup_line = format!("cat {n}>&{m}");
+            let mut bd = ComputeBudget::with_default_limits();
+            let out_d = lex_exact(&dup_line, 0, None, &mut bd).unwrap();
+            assert!(unread_reasons(&out_d).is_empty(), "{dup_line}");
+            assert_eq!(
+                out_d.units[0].redirects,
+                vec![ModelRedirect::Dup {
+                    from: StdFd::from_u8(n).unwrap(),
+                    to: StdFd::from_u8(m).unwrap()
+                }]
+            );
+        }
+    }
 
     // Quoted `'2'>out` is NOT an fd number: `'2'` stays in argv, `>out` is stdout Write.
     let mut b2 = ComputeBudget::with_default_limits();
@@ -610,6 +677,10 @@ fn lex_best_effort_extracts_section_10_and_m1_27_derived_units() {
         ),
         ("NICE TIMEOUT 5 ENV -i SUDO id", &["SUDO", "id"]),
         ("echo 'sudo id' | BASH", &["sudo", "id"]),
+        ("command env -S 'sh -c' 'sudo id'", &["sudo", "id"]),
+        ("nice script -c 'sudo id' /dev/null", &["sudo", "id"]),
+        ("X+=foo sudo id", &["sudo", "id"]),
+        (r"echo $'a\'b' && sudo id", &["sudo", "id"]),
     ];
     for &(line, want_eff) in m1_27_cases {
         let mut b = ComputeBudget::with_default_limits();
@@ -754,6 +825,24 @@ fn budgets_exhaustion_preserves_early_units_and_never_allows_padded_lines() {
         Err(PartOutcome::Exhausted(ExhaustReason::AllocationBudget))
     );
 
+    // Exact `MAX_UNITS` (512) succeeds; `MAX_UNITS + 1` (513) -> `TooLarge(Cap::Units)`.
+    let exact_512 = "echo a; ".repeat(limits::MAX_UNITS);
+    let mut b_ok = ComputeBudget::with_default_limits();
+    let out_512 = lex_exact(&exact_512, 0, None, &mut b_ok).unwrap();
+    assert_eq!(out_512.units.len(), limits::MAX_UNITS);
+    let over_513 = "echo a; ".repeat(limits::MAX_UNITS + 1);
+    let mut b_over = ComputeBudget::with_default_limits();
+    assert_eq!(
+        lex_exact(&over_513, 0, None, &mut b_over),
+        Err(PartOutcome::TooLarge(Cap::Units))
+    );
+
+    // Exact `MAX_BYTES` succeeds; `MAX_BYTES + 1` -> `TooLarge(Cap::Bytes)`.
+    let exact_bytes = format!("cat {}", "a".repeat(limits::MAX_BYTES - 4));
+    assert_eq!(exact_bytes.len(), limits::MAX_BYTES);
+    let mut b_max = ComputeBudget::with_default_limits();
+    assert!(lex_exact(&exact_bytes, 0, None, &mut b_max).is_ok());
+
     // `MAX_BYTES` exceeded -> `TooLarge(Cap::Bytes)`.
     let over = "a".repeat(limits::MAX_BYTES + 1);
     let mut b = ComputeBudget::with_default_limits();
@@ -766,32 +855,69 @@ fn budgets_exhaustion_preserves_early_units_and_never_allows_padded_lines() {
         lex_best_effort(&[&over], &mut b2),
         Err(PartOutcome::TooLarge(Cap::Bytes))
     );
+
+    // N11 best-effort memo determinism: repeated call charges identical
+    // compute + alloc units, while a tight budget bypasses the memo and still
+    // exhausts while preserving early units.
+    let memo_line = "cat ~/.ssh/id_rsa; echo ok; echo done";
+    let mut bm1 = ComputeBudget::with_default_limits();
+    let rec1 = lex_best_effort(&[memo_line], &mut bm1).unwrap();
+    let u1 = limits::COMPUTE_BUDGET_UNITS - bm1.remaining_units();
+    let a1 = limits::COMPUTE_BUDGET_ALLOC_BYTES - bm1.remaining_alloc_bytes();
+
+    let mut bm2 = ComputeBudget::with_default_limits();
+    let rec2 = lex_best_effort(&[memo_line], &mut bm2).unwrap();
+    let u2 = limits::COMPUTE_BUDGET_UNITS - bm2.remaining_units();
+    let a2 = limits::COMPUTE_BUDGET_ALLOC_BYTES - bm2.remaining_alloc_bytes();
+    assert_eq!(rec1, rec2);
+    assert_eq!(u1, u2, "memo hit must charge identical compute units");
+    assert_eq!(a1, a2, "memo hit must charge identical alloc bytes");
+
+    let mut bm_tight = ComputeBudget::new(u1 / 2, 100_000);
+    let mut partial_rec = BestEffortRecord::default();
+    let err = lex_best_effort_into(&[memo_line], &mut partial_rec, &mut bm_tight);
+    assert_eq!(
+        err,
+        Err(PartOutcome::Exhausted(ExhaustReason::ComputeBudget))
+    );
+    assert!(
+        !partial_rec.units.is_empty(),
+        "partial best-effort units scanned before exhaustion must be preserved"
+    );
+    assert_eq!(partial_rec.units[0].raw_argv[0], "cat");
 }
 
 #[test]
 fn linear_charge_growth_from_10kb_to_max_bytes() {
-    let make_line = |target_len: usize| -> String {
-        let chunk = "cat README.md && ";
+    let make_single_unit = |target_len: usize| -> String {
         let mut s = String::with_capacity(target_len);
-        while s.len() + chunk.len() < target_len {
-            s.push_str(chunk);
+        s.push_str("cat ");
+        while s.len() < target_len {
+            s.push('a');
         }
-        // Keep unit count <= MAX_UNITS by padding the final argument.
-        let mut s2 = String::from("cat ");
-        while s2.len() < target_len {
-            s2.push('a');
+        s
+    };
+    let make_multi_unit = |target_len: usize| -> String {
+        let n_units = 64usize;
+        let per = (target_len / n_units).saturating_sub(6);
+        let mut s = String::with_capacity(target_len);
+        for _ in 0..n_units {
+            s.push_str("cat ");
+            for _ in 0..per {
+                s.push('x');
+            }
+            s.push_str("; ");
         }
-        let _ = s;
-        s2
+        s
     };
 
     let small_len = 10 * 1024;
     let large_len = limits::MAX_BYTES;
-    let small = make_line(small_len);
-    let large = make_line(large_len);
+    let small = make_single_unit(small_len);
+    let large = make_single_unit(large_len);
     let len_ratio = (large.len() as f64) / (small.len() as f64);
 
-    // `lex_exact` charge ratio must be linear in length.
+    // `lex_exact` charge ratio must be linear in length (single-unit & multi-unit).
     let mut bs = ComputeBudget::with_default_limits();
     let _ = lex_exact(&small, 0, None, &mut bs).unwrap();
     let cs = limits::COMPUTE_BUDGET_UNITS - bs.remaining_units();
@@ -804,6 +930,21 @@ fn linear_charge_growth_from_10kb_to_max_bytes() {
     assert!(
         exact_ratio <= len_ratio * 1.15 && exact_ratio >= len_ratio * 0.85,
         "lex_exact charge not linear: small={cs}, large={cl}, ratio={exact_ratio:.2}, len_ratio={len_ratio:.2}"
+    );
+
+    let m_small = make_multi_unit(small_len);
+    let m_large = make_multi_unit(large_len);
+    let m_len_ratio = (m_large.len() as f64) / (m_small.len() as f64);
+    let mut bms = ComputeBudget::with_default_limits();
+    let _ = lex_exact(&m_small, 0, None, &mut bms).unwrap();
+    let cms = limits::COMPUTE_BUDGET_UNITS - bms.remaining_units();
+    let mut bml = ComputeBudget::with_default_limits();
+    let _ = lex_exact(&m_large, 0, None, &mut bml).unwrap();
+    let cml = limits::COMPUTE_BUDGET_UNITS - bml.remaining_units();
+    let m_ratio = (cml as f64) / (cms as f64);
+    assert!(
+        m_ratio <= m_len_ratio * 1.15 && m_ratio >= m_len_ratio * 0.85,
+        "lex_exact multi-unit charge not linear: small={cms}, large={cml}, ratio={m_ratio:.2}, len_ratio={m_len_ratio:.2}"
     );
 
     // `lex_best_effort` charge ratio must also be linear in length (including

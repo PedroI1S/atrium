@@ -4,8 +4,8 @@
 use super::*;
 use crate::policy::limits;
 use crate::policy::model::{
-    Cap, ComputeBudget, ExhaustReason, FoldRules, PartId, PartOutcome, PipelineId, Separator,
-    UnitIndex, UnreadReason, WrapperKind,
+    Cap, ComputeBudget, ExhaustReason, FoldRules, PartId, PartOutcome, PipelineId, UnitIndex,
+    UnreadReason, WrapperKind,
 };
 use crate::policy::v4::lex::lex_exact;
 
@@ -138,7 +138,8 @@ fn contract_section_10_p1_rows() {
 
 #[test]
 fn unwrap_unit_accepts_every_closed_wrapper_form() {
-    let cases: &[(&str, &[WrapperKind], &[&[u8]])] = &[
+    type WrapperCase<'a> = (&'a str, &'a [WrapperKind], &'a [&'a [u8]]);
+    let cases: &[WrapperCase<'_>] = &[
         ("command cat a", &[WrapperKind::Command], &[b"cat", b"a"]),
         ("command -- cat a", &[WrapperKind::Command], &[b"cat", b"a"]),
         ("exec cat a", &[WrapperKind::Exec], &[b"cat", b"a"]),
@@ -491,11 +492,17 @@ fn build_units_tracks_home_modifications_for_later_tildes() {
     let triggers = [
         "HOME=/tmp; cat ~/x",
         "HOME=/tmp true; cat ~/x",
+        "FOO=1 export HOME=/tmp; cat ~/x",
+        "FOO=1 unset HOME; cat ~/x",
+        "FOO=1 env HOME=/tmp true; cat ~/x",
         "export HOME=/tmp; cat ~/x",
         "unset HOME; cat ~/x",
         "env -u HOME true; cat ~/x",
         "env -i true; cat ~/x",
         "env HOME=/tmp true; cat ~/x",
+        "env -- HOME=/tmp true; cat ~/x",
+        "env -vu HOME true; cat ~/x",
+        "printf -v HOME /tmp; cat ~/x",
         "HOME=/tmp; cat < ~/x",
         "HOME=/tmp; sh -c 'cat ~/x'",
         "sh -c 'HOME=/tmp; cat ~/x'",
@@ -602,6 +609,32 @@ fn build_units_and_unwrap_unit_budget_exhaustion_and_linearity() {
     assert!(!parsed.units.is_empty(), "early unit must be preserved");
     assert_eq!(parsed.units[0].argv[0].literal_bytes(), b"cat");
     assert_eq!(parsed.units[0].argv[1].literal_bytes(), b"~/.ssh/id_rsa");
+
+    // Exhaustion during unwrap / fold stage in `build_units`: every lexed unit
+    // is still preserved and every `PartId::Unit(idx)` in `outcomes` is valid.
+    let two_units = "command cat ~/.ssh/id_rsa; $BAD echo hi";
+    let mut b_m2 = ComputeBudget::with_default_limits();
+    let lexed_two = lex_exact(two_units, 0, None, &mut b_m2).unwrap();
+    let lex_two_used = limits::COMPUTE_BUDGET_UNITS - b_m2.remaining_units();
+    assert_eq!(lexed_two.units.len(), 2);
+    // Allow `lex_exact` to finish, then exhaust immediately inside `unwrap_unit`.
+    let mut b_unwrap_exhaust = ComputeBudget::new(lex_two_used + 2, 100_000);
+    let parsed_ue = build_units(two_units, &FoldRules::REV4, &mut b_unwrap_exhaust).unwrap();
+    assert!(has_exhausted(&parsed_ue));
+    assert_eq!(
+        parsed_ue.units.len(),
+        2,
+        "all lexed units must be preserved when unwrap_unit exhausts"
+    );
+    for pr in &parsed_ue.outcomes {
+        if let PartId::Unit(UnitIndex(idx)) = pr.part {
+            assert!(
+                idx < parsed_ue.units.len(),
+                "UnitIndex({idx}) out of bounds for {} units",
+                parsed_ue.units.len()
+            );
+        }
+    }
 
     // Exhaustion during best-effort pass after exact lexing succeeded.
     let mut b_measure = ComputeBudget::with_default_limits();
