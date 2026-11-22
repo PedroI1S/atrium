@@ -181,6 +181,131 @@ fn discover_login_shell_path_handles_noise_failures_and_timeouts() {
     );
 }
 
+fn process_alive(pid: i32) -> bool {
+    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+        return false;
+    };
+    !matches!(
+        rustix::process::test_kill_process(pid),
+        Err(rustix::io::Errno::SRCH)
+    )
+}
+
+fn kill_if_alive(pid: i32) {
+    if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+}
+
+#[test]
+fn discover_login_shell_path_kills_process_group_descendants_on_timeout() {
+    let root = folder();
+    let pid_file = root.path().join("sleep.pid");
+    let script = root.path().join("timeout-descendant-sh");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\n/bin/sh -c 'echo $$ > \"{}\"; exec sleep 600'\ntrue\n",
+            pid_file.display()
+        ),
+    );
+
+    let started = Instant::now();
+    assert_eq!(
+        discover_login_shell_path(Some(script.as_os_str()), Duration::from_millis(300)),
+        None
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "timed-out login shell stalled for {:?}",
+        started.elapsed()
+    );
+
+    let pid_text = std::fs::read_to_string(&pid_file).expect("descendant wrote its pid");
+    let descendant_pid: i32 = pid_text.trim().parse().expect("parse descendant pid");
+    let still_alive = process_alive(descendant_pid);
+    if still_alive {
+        kill_if_alive(descendant_pid);
+    }
+    assert!(
+        !still_alive,
+        "timeout left descendant sleep process {descendant_pid} alive"
+    );
+}
+
+#[test]
+fn discover_login_shell_path_cleans_up_background_descendant_retaining_stdout() {
+    let root = folder();
+
+    // 1. Shell emits marked PATH and exits 0 while a background child still holds stdout open.
+    let pid_file_ok = root.path().join("bg-ok.pid");
+    let bg_ok_sh = root.path().join("bg-ok-sh");
+    write_executable(
+        &bg_ok_sh,
+        &format!(
+            "#!/bin/sh\n/bin/sh -c 'echo $$ > \"{}\"; exec sleep 600' &\ni=0\nwhile [ ! -s \"{}\" ] && [ \"$i\" -lt 100 ]; do i=$((i + 1)); sleep 0.01; done\nPATH='/fake/bg/bin'\n/bin/sh -c \"$2\"\nexit 0\n",
+            pid_file_ok.display(),
+            pid_file_ok.display(),
+        ),
+    );
+
+    let started = Instant::now();
+    let found = discover_login_shell_path(Some(bg_ok_sh.as_os_str()), Duration::from_secs(5));
+    let elapsed = started.elapsed();
+    let bg_ok_pid: i32 = std::fs::read_to_string(&pid_file_ok)
+        .expect("bg child wrote pid")
+        .trim()
+        .parse()
+        .expect("parse bg pid");
+    let ok_alive = process_alive(bg_ok_pid);
+    if ok_alive {
+        kill_if_alive(bg_ok_pid);
+    }
+    assert_eq!(found.as_deref(), Some(OsStr::new("/fake/bg/bin")));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "shell with background stdout holder stalled for {elapsed:?}"
+    );
+    assert!(
+        !ok_alive,
+        "background descendant {bg_ok_pid} survived after shell exited 0"
+    );
+
+    // 2. Shell exits non-zero while a background child still holds stdout open.
+    let pid_file_err = root.path().join("bg-err.pid");
+    let bg_err_sh = root.path().join("bg-err-sh");
+    write_executable(
+        &bg_err_sh,
+        &format!(
+            "#!/bin/sh\n/bin/sh -c 'echo $$ > \"{}\"; exec sleep 600' &\ni=0\nwhile [ ! -s \"{}\" ] && [ \"$i\" -lt 100 ]; do i=$((i + 1)); sleep 0.01; done\nexit 1\n",
+            pid_file_err.display(),
+            pid_file_err.display(),
+        ),
+    );
+
+    let started = Instant::now();
+    let res = discover_login_shell_path(Some(bg_err_sh.as_os_str()), Duration::from_secs(5));
+    let elapsed = started.elapsed();
+    let bg_err_pid: i32 = std::fs::read_to_string(&pid_file_err)
+        .expect("bg err child wrote pid")
+        .trim()
+        .parse()
+        .expect("parse bg err pid");
+    let err_alive = process_alive(bg_err_pid);
+    if err_alive {
+        kill_if_alive(bg_err_pid);
+    }
+    assert_eq!(res, None);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "failing shell with background stdout holder stalled for {elapsed:?}"
+    );
+    assert!(
+        !err_alive,
+        "background descendant {bg_err_pid} survived after shell exited 1"
+    );
+}
+
 #[tokio::test]
 async fn atriumd_merges_login_shell_path_and_skips_under_no_path_extras() {
     let root = folder();

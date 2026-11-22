@@ -31,12 +31,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
+use std::io::{self, Read};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atrium_agents::AgentAdapter;
@@ -135,55 +138,184 @@ pub fn extract_marked_path(output: &[u8]) -> Option<OsString> {
     Some(OsStr::from_bytes(slice).to_os_string())
 }
 
+struct LoginShellChild {
+    child: Child,
+    pgid: Option<rustix::process::Pid>,
+    reaped: bool,
+}
+
+impl LoginShellChild {
+    fn new(child: Child) -> Self {
+        let pgid = i32::try_from(child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw);
+        Self {
+            child,
+            pgid,
+            reaped: false,
+        }
+    }
+
+    /// Checks whether the shell leader has exited without reaping it so its
+    /// process group ID stays pinned until `kill_group_and_reap` signals it.
+    fn peek_exited(&self) -> io::Result<bool> {
+        let Some(pid) = self.pgid else {
+            return Ok(false);
+        };
+        let opts = rustix::process::WaitIdOptions::NOHANG
+            | rustix::process::WaitIdOptions::EXITED
+            | rustix::process::WaitIdOptions::NOWAIT;
+        match rustix::process::waitid(rustix::process::WaitId::Pid(pid), opts) {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(rustix::io::Errno::INTR) => Ok(false),
+            Err(err) => Err(io::Error::from(err)),
+        }
+    }
+
+    /// Kills the entire process group (and the leader itself) while the leader
+    /// is still unreaped, reaps the leader, and waits briefly for the group to
+    /// drain so descendants cannot outlive discovery.
+    fn kill_group_and_reap(&mut self) -> Option<ExitStatus> {
+        if self.reaped {
+            return None;
+        }
+        let own_pgid = rustix::process::getpgrp();
+        if let Some(pgid) = self.pgid
+            && pgid != own_pgid
+        {
+            let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+        }
+        let _ = self.child.kill();
+        let status = self.child.wait().ok();
+        self.reaped = true;
+        if let Some(pgid) = self.pgid
+            && pgid != own_pgid
+        {
+            let drain_deadline = Instant::now() + Duration::from_millis(500);
+            while !matches!(
+                rustix::process::test_kill_process_group(pgid),
+                Err(rustix::io::Errno::SRCH)
+            ) {
+                let now = Instant::now();
+                if now >= drain_deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5).min(drain_deadline - now));
+            }
+        }
+        status
+    }
+}
+
+impl Drop for LoginShellChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.kill_group_and_reap();
+        }
+    }
+}
+
+fn append_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let cap = MAX_LOGIN_SHELL_OUTPUT as usize;
+    let room = cap.saturating_sub(buf.len());
+    if room > 0 {
+        buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+}
+
 /// Runs `$SHELL -ilc` with a short timeout to discover the user's login-shell
 /// `PATH` (for `nvm`, `asdf`, `mise`, or custom init scripts). Never fails
 /// startup: returns `None` if `shell` is unset, fails to spawn, exits non-zero,
 /// times out, or emits no marked `PATH`.
+///
+/// The shell runs as leader of its own process group and stdout is collected
+/// directly on the calling thread with bounded timeouts (no detached reader
+/// thread), killing the whole process group and reaping the leader on every
+/// return path.
 pub fn discover_login_shell_path(shell: Option<&OsStr>, timeout: Duration) -> Option<OsString> {
     let shell = shell.filter(|s| !s.is_empty())?;
     let shell_path = Path::new(shell);
-    let mut cmd = Command::new(shell_path);
-    cmd.args(["-ilc", login_shell_path_command(shell_path)])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-
-    let mut child = cmd.spawn().ok()?;
-    let stdout = child.stdout.take()?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.take(MAX_LOGIN_SHELL_OUTPUT).read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
+    let (mut stdout_rx, stdout_tx) = UnixStream::pair().ok()?;
+    let child = {
+        let mut cmd = Command::new(shell_path);
+        cmd.args(["-ilc", login_shell_path_command(shell_path)])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(OwnedFd::from(stdout_tx)))
+            .stderr(Stdio::null())
+            .process_group(0);
+        cmd.spawn().ok()?
+    };
+    let mut shell_child = LoginShellChild::new(child);
 
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut stdout_eof = false;
+    let mut leader_exited = false;
+
+    loop {
+        if !leader_exited {
+            match shell_child.peek_exited() {
+                Ok(true) => leader_exited = true,
+                Ok(false) => {}
+                Err(_) => return None,
             }
         }
-    };
+
+        if !stdout_eof {
+            if leader_exited {
+                // Leader already exited: drain any bytes already buffered
+                // without blocking on a background descendant retaining stdout.
+                let _ = stdout_rx.set_nonblocking(true);
+                while buf.len() < MAX_LOGIN_SHELL_OUTPUT as usize {
+                    match stdout_rx.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => append_capped(&mut buf, &chunk[..n]),
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            // Clamp to >= 1 ms so SO_RCVTIMEO is never truncated to 0 (infinite).
+            let slice = remaining.clamp(Duration::from_millis(1), Duration::from_millis(20));
+            let _ = stdout_rx.set_read_timeout(Some(slice));
+            match stdout_rx.read(&mut chunk) {
+                Ok(0) => stdout_eof = true,
+                Ok(n) => append_capped(&mut buf, &chunk[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => stdout_eof = true,
+            }
+        } else {
+            if leader_exited {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+
+    drop(stdout_rx);
+    let status = shell_child.kill_group_and_reap()?;
     if !status.success() {
         return None;
     }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let bytes = rx
-        .recv_timeout(remaining.max(Duration::from_millis(50)))
-        .ok()?;
-    extract_marked_path(&bytes)
+    extract_marked_path(&buf)
 }
 
 /// Merges `existing` `PATH` entries with `candidates` that satisfy `exists`.
