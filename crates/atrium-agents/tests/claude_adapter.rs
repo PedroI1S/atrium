@@ -1882,15 +1882,25 @@ async fn a_recorded_session_replays_to_the_same_events() {
 
 /// The lines of `responses.jsonl` so far, as JSON.
 fn responses(dir: &Path) -> Vec<Value> {
-    let Ok(raw) = fs::read_to_string(dir.join("responses.jsonl")) else {
+    let path = dir.join("responses.jsonl");
+    let Ok(raw) = fs::read_to_string(&path) else {
         return Vec::new();
     };
     let Some(last_nl) = raw.rfind('\n') else {
         return Vec::new();
     };
-    raw[..last_nl]
+    raw[..=last_nl]
         .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .enumerate()
+        .map(|(idx, line)| {
+            serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!(
+                    "malformed completed JSONL line {} in {}: {err}: {line:?}",
+                    idx + 1,
+                    path.display()
+                )
+            })
+        })
         .collect()
 }
 
@@ -2019,6 +2029,81 @@ async fn wait_helpers_ignore_empty_and_half_written_files() {
     )
     .unwrap();
     let resp = resp_fut.await;
+    assert_eq!(behavior(&resp).0, "allow");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn wait_response_fails_on_malformed_completed_jsonl_line() {
+    let dir = scratch("wait-response-malformed");
+    let jsonl_path = dir.join("responses.jsonl");
+
+    // 1. A completed malformed line followed by a valid matching record must
+    // fail `wait_response` with a diagnostic showing the bad line.
+    fs::write(
+        &jsonl_path,
+        "not-json-at-all\n{\"response\":{\"response\":{\"behavior\":\"allow\"}}}\n",
+    )
+    .unwrap();
+    let dir_for_task = dir.clone();
+    let err = tokio::spawn(async move {
+        wait_response(&dir_for_task, "can_use_tool request", |v| {
+            v.pointer("/response/response/behavior").is_some()
+        })
+        .await
+    })
+    .await
+    .expect_err("malformed completed JSONL line must fail wait_response");
+    assert!(err.is_panic(), "expected panic, got: {err:?}");
+    let payload = err.into_panic();
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        msg.contains("not-json-at-all") && msg.contains("line 1"),
+        "diagnostic must show the malformed line and line number, got: {msg}"
+    );
+
+    // 2. A completed blank line before a valid record must also fail.
+    fs::write(
+        &jsonl_path,
+        "\n{\"response\":{\"response\":{\"behavior\":\"allow\"}}}\n",
+    )
+    .unwrap();
+    let dir_for_blank = dir.clone();
+    let blank_err = tokio::spawn(async move {
+        wait_response(&dir_for_blank, "can_use_tool request", |v| {
+            v.pointer("/response/response/behavior").is_some()
+        })
+        .await
+    })
+    .await
+    .expect_err("blank completed JSONL line must fail wait_response");
+    assert!(blank_err.is_panic(), "expected panic, got: {blank_err:?}");
+    let blank_payload = blank_err.into_panic();
+    let blank_msg = blank_payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| blank_payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        blank_msg.contains("\"\"") && blank_msg.contains("line 1"),
+        "diagnostic must show the blank line and line number, got: {blank_msg}"
+    );
+
+    // 3. Only an unfinished trailing line (no newline yet) is ignored.
+    fs::write(
+        &jsonl_path,
+        "{\"response\":{\"response\":{\"behavior\":\"allow\"}}}\n{\"truncated",
+    )
+    .unwrap();
+    let resp = wait_response(&dir, "can_use_tool request", |v| {
+        v.pointer("/response/response/behavior").is_some()
+    })
+    .await;
     assert_eq!(behavior(&resp).0, "allow");
 
     let _ = fs::remove_dir_all(&dir);

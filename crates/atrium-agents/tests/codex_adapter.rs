@@ -218,6 +218,33 @@ async fn wait_pid(path: &Path, secs: u64) -> String {
     .await
 }
 
+/// The completed (`\n`-terminated) lines of `responses.jsonl` so far, as JSON.
+///
+/// An unfinished trailing line (without `\n` yet) is ignored while the writer
+/// is still appending. Every completed line must parse as valid JSON.
+fn responses(dir: &Path) -> Vec<Value> {
+    let path = dir.join("responses.jsonl");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Some(last_nl) = raw.rfind('\n') else {
+        return Vec::new();
+    };
+    raw[..=last_nl]
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| {
+            serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!(
+                    "malformed completed JSONL line {} in {}: {err}: {line:?}",
+                    idx + 1,
+                    path.display()
+                )
+            })
+        })
+        .collect()
+}
+
 fn alive(pid: &str) -> bool {
     std::process::Command::new("kill")
         .args(["-0", "--", pid.trim()])
@@ -508,21 +535,21 @@ async fn config_becomes_cli_arguments_and_thread_params() {
                 .any(|w| w == ["app-server", "--listen", "stdio://"])
         );
 
-        let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
-        let thread_req: Value = wire
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        let records = responses(&dir);
+        let thread_req: Value = records
+            .iter()
             .find(|v| v.get("method").and_then(Value::as_str) == Some("thread/resume"))
+            .cloned()
             .expect("thread/resume sent");
         assert_eq!(thread_req["params"]["sandbox"], expected_sandbox);
         assert_eq!(thread_req["params"]["approvalPolicy"], expected_approval);
         assert_eq!(thread_req["params"]["approvalsReviewer"], "user");
         assert_eq!(thread_req["params"]["threadId"], "thread-prev");
 
-        let turn_req: Value = wire
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        let turn_req: Value = records
+            .iter()
             .find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .cloned()
             .expect("turn/start sent");
         assert_eq!(turn_req["params"]["effort"], "high");
 
@@ -595,10 +622,8 @@ async fn gate_allow_deny_and_redeem_flow() {
         assert_ne!(redeems[0].1.input, serde_json::json!({}));
     }
     let _ = shutdown(session).await;
-    let wire1 = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
-    let reply1: Value = wire1
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    let reply1: Value = responses(&dir)
+        .into_iter()
         .find(|v| v.get("id").and_then(Value::as_str) == Some("srv-cmd-1"))
         .expect("srv-cmd-1 reply written");
     assert_eq!(reply1["result"]["decision"], "accept");
@@ -666,10 +691,8 @@ async fn gate_allow_deny_and_redeem_flow() {
         assert_eq!(redeems2[0].1, checks2[0]);
     }
     let _ = shutdown(session2).await;
-    let wire2 = fs::read_to_string(dir2.join("responses.jsonl")).unwrap();
-    let reply2: Value = wire2
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    let reply2: Value = responses(&dir2)
+        .into_iter()
         .find(|v| v.get("id").and_then(Value::as_str) == Some("srv-cmd-1"))
         .expect("srv-cmd-1 reply written");
     assert_eq!(
@@ -920,10 +943,8 @@ async fn decline_question_sends_empty_answers_and_continues_turn() {
 
     let _ = shutdown(session).await;
 
-    let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
-    let reply: Value = wire
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    let reply: Value = responses(&dir)
+        .into_iter()
         .find(|v| v.get("id").and_then(Value::as_str) == Some("srv-q-1"))
         .expect("question reply sent to fake server");
     assert_eq!(reply["result"], serde_json::json!({ "answers": {} }));
@@ -1051,10 +1072,8 @@ async fn unverified_legacy_permissions_and_grant_root_requests_are_declined() {
 
     let _ = shutdown(session).await;
 
-    let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap();
-    let replies: std::collections::HashMap<String, Value> = wire
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    let replies: std::collections::HashMap<String, Value> = responses(&dir)
+        .into_iter()
         .filter_map(|v| {
             let id = v.get("id")?.as_str()?.to_owned();
             let res = v.get("result")?.clone();
@@ -1266,25 +1285,21 @@ async fn saturation_declines_approvals_questions_and_reports_dropped_events() {
     // Wait for Codex fake server to record both declines in responses.jsonl.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let wire = fs::read_to_string(dir.join("responses.jsonl")).unwrap_or_default();
-        let has_cmd_decline = wire.lines().any(|l| {
-            serde_json::from_str::<Value>(l).ok().is_some_and(|v| {
-                v.get("id").and_then(Value::as_str) == Some("srv-sat-cmd")
-                    && v.pointer("/result/decision").and_then(Value::as_str) == Some("decline")
-            })
+        let records = responses(&dir);
+        let has_cmd_decline = records.iter().any(|v| {
+            v.get("id").and_then(Value::as_str) == Some("srv-sat-cmd")
+                && v.pointer("/result/decision").and_then(Value::as_str) == Some("decline")
         });
-        let has_q_decline = wire.lines().any(|l| {
-            serde_json::from_str::<Value>(l).ok().is_some_and(|v| {
-                v.get("id").and_then(Value::as_str) == Some("srv-sat-q")
-                    && v.get("result") == Some(&serde_json::json!({ "answers": {} }))
-            })
+        let has_q_decline = records.iter().any(|v| {
+            v.get("id").and_then(Value::as_str) == Some("srv-sat-q")
+                && v.get("result") == Some(&serde_json::json!({ "answers": {} }))
         });
         if has_cmd_decline && has_q_decline {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for saturation declines in responses.jsonl: {wire}"
+            "timed out waiting for saturation declines in responses.jsonl: {records:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -1394,6 +1409,60 @@ async fn wait_helpers_ignore_empty_and_half_written_files() {
     );
     fs::write(&marker_path, "1\n").unwrap();
     assert_eq!(marker_fut.await, "1\n");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn responses_fails_on_malformed_completed_jsonl_line() {
+    let dir = scratch("responses-malformed");
+    let jsonl_path = dir.join("responses.jsonl");
+
+    // 1. A completed malformed line before a valid record must panic with the
+    // malformed line in the diagnostic.
+    fs::write(
+        &jsonl_path,
+        "not-json-at-all\n{\"id\":\"srv-1\",\"result\":{}}\n",
+    )
+    .unwrap();
+    let payload = std::panic::catch_unwind(|| responses(&dir))
+        .expect_err("malformed completed JSONL line must fail responses()");
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        msg.contains("not-json-at-all") && msg.contains("line 1"),
+        "diagnostic must show the malformed line and line number, got: {msg}"
+    );
+
+    // 2. A completed blank line before a valid record must also fail.
+    fs::write(&jsonl_path, "\n{\"id\":\"srv-1\",\"result\":{}}\n").unwrap();
+    let blank_payload = std::panic::catch_unwind(|| responses(&dir))
+        .expect_err("blank completed JSONL line must fail responses()");
+    let blank_msg = blank_payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| blank_payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        blank_msg.contains("\"\"") && blank_msg.contains("line 1"),
+        "diagnostic must show the blank line and line number, got: {blank_msg}"
+    );
+
+    // 3. An unfinished trailing line (no newline yet) is ignored.
+    fs::write(&jsonl_path, "{\"truncated").unwrap();
+    assert!(responses(&dir).is_empty());
+
+    fs::write(
+        &jsonl_path,
+        "{\"id\":\"srv-1\",\"result\":{}}\n{\"truncated",
+    )
+    .unwrap();
+    let parsed = responses(&dir);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0]["id"], "srv-1");
 
     let _ = fs::remove_dir_all(&dir);
 }
