@@ -445,6 +445,11 @@ pub fn native() -> AgentLaunch {
 pub struct Wire {
     stream: UnixStream,
     next_request: u64,
+    /// Unconsumed bytes read from `stream`, keeping `read` cancel-safe across
+    /// `tokio::select!` and `tokio::time::timeout`.
+    read_buf: Vec<u8>,
+    /// Unsent bytes of an outgoing frame, keeping `send_raw` cancel-safe.
+    write_buf: Vec<u8>,
     /// Messages read while waiting for a response.
     pub aside: VecDeque<ServerMessage>,
 }
@@ -452,12 +457,22 @@ pub struct Wire {
 pub type Answer = Result<Value, (ErrorCode, String)>;
 
 impl Wire {
-    pub async fn connect(socket: &Path) -> Self {
+    pub fn from_stream(stream: UnixStream) -> Self {
         Self {
-            stream: UnixStream::connect(socket).await.expect("connects"),
+            stream,
             next_request: 1,
+            read_buf: Vec::new(),
+            write_buf: Vec::new(),
             aside: VecDeque::new(),
         }
+    }
+
+    pub fn buffered_read_len(&self) -> usize {
+        self.read_buf.len()
+    }
+
+    pub async fn connect(socket: &Path) -> Self {
+        Self::from_stream(UnixStream::connect(socket).await.expect("connects"))
     }
 
     /// Connects and says `Hello`; returns the daemon's first message.
@@ -482,12 +497,28 @@ impl Wire {
         wire
     }
 
+    async fn flush_write(&mut self) {
+        while !self.write_buf.is_empty() {
+            match self.stream.write(&self.write_buf).await {
+                Ok(0) | Err(_) => {
+                    self.write_buf.clear();
+                    return;
+                }
+                Ok(n) => {
+                    self.write_buf.drain(..n);
+                }
+            }
+        }
+    }
+
     pub async fn send_raw(&mut self, kind: u8, payload: &[u8]) {
-        let mut frame = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
-        frame.push(kind);
-        frame.extend_from_slice(payload);
+        self.flush_write().await;
+        let len = (payload.len() + 1) as u32;
+        self.write_buf.extend_from_slice(&len.to_be_bytes());
+        self.write_buf.push(kind);
+        self.write_buf.extend_from_slice(payload);
         // A daemon that already closed is fine: the read says so.
-        let _ = self.stream.write_all(&frame).await;
+        self.flush_write().await;
     }
 
     pub async fn send(&mut self, message: &ClientMessage) {
@@ -495,17 +526,43 @@ impl Wire {
         self.send_raw(0, &payload).await;
     }
 
+    /// Reads one complete server frame, buffering partial reads on `self` so
+    /// cancelling the future mid-frame never loses alignment.
+    pub async fn read_frame(&mut self) -> Option<ServerMessage> {
+        loop {
+            if self.read_buf.len() >= 5 {
+                let len = u32::from_be_bytes([
+                    self.read_buf[0],
+                    self.read_buf[1],
+                    self.read_buf[2],
+                    self.read_buf[3],
+                ]) as usize;
+                assert!(len >= 1, "server frame length must be at least 1");
+                let kind = self.read_buf[4];
+                assert_eq!(kind, 0, "M1 has no stream frames");
+                let frame_len = 4usize.checked_add(len).expect("frame length");
+                if self.read_buf.len() >= frame_len {
+                    let message = serde_json::from_slice(&self.read_buf[5..frame_len])
+                        .expect("a server message");
+                    self.read_buf.drain(..frame_len);
+                    return Some(message);
+                }
+            }
+            // `Vec`'s `BufMut::chunk_mut` only exposes existing spare capacity,
+            // so reserve before `read_buf` to avoid a zero-length read.
+            if self.read_buf.capacity() - self.read_buf.len() < 4096 {
+                self.read_buf.reserve(16 * 1024);
+            }
+            match self.stream.read_buf(&mut self.read_buf).await {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => {}
+            }
+        }
+    }
+
     /// The next message off the socket; `None` when the daemon closed it.
     pub async fn read(&mut self) -> Option<ServerMessage> {
-        soon(async {
-            let len = self.stream.read_u32().await.ok()?;
-            let kind = self.stream.read_u8().await.ok()?;
-            assert_eq!(kind, 0, "M1 has no stream frames");
-            let mut payload = vec![0; len as usize - 1];
-            self.stream.read_exact(&mut payload).await.ok()?;
-            Some(serde_json::from_slice(&payload).expect("a server message"))
-        })
-        .await
+        soon(self.read_frame()).await
     }
 
     /// The next message, those set aside first.
@@ -519,6 +576,7 @@ impl Wire {
     /// Whether the daemon closed the connection (anything it sent first is
     /// dropped).
     pub async fn closed(&mut self) -> bool {
+        self.read_buf.clear();
         soon(async {
             let mut sink = [0u8; 4096];
             loop {

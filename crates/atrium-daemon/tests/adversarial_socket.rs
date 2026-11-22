@@ -527,6 +527,98 @@ async fn flooding_unread_list_threads_past_8_mib_control_lane_closes_connection(
     rig.stop(true).await;
 }
 
+/// Regression test for the N10 flake: cancelling `Wire::read` mid-frame inside
+/// `tokio::select!` (as `flooding_unread_list_threads_past_8_mib_control_lane_closes_connection`
+/// does while `setup.thread_when` is receiving a ~260 KiB `ThreadSummary`
+/// filled with `'n'` = byte 110) must preserve buffered bytes and frame
+/// alignment for subsequent reads.
+#[tokio::test]
+async fn wire_reader_cancelled_mid_frame_preserves_alignment() {
+    use atrium_protocol::wire::CommandResult;
+
+    fn encode_server(message: &ServerMessage) -> Vec<u8> {
+        let payload = serde_json::to_vec(message).expect("serializes");
+        let mut frame = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+        frame.push(0);
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    let big = "n".repeat(260_000);
+    let first_msg = ServerMessage::Response {
+        request_id: 1,
+        result: CommandResult::Ok { value: json!(big) },
+    };
+    let second_msg = ServerMessage::Response {
+        request_id: 2,
+        result: CommandResult::Ok {
+            value: json!("after-cancel"),
+        },
+    };
+    let frame1 = encode_server(&first_msg);
+    let frame2 = encode_server(&second_msg);
+
+    // Split mid-length-header, between length and kind, and mid-`'n'` payload
+    // (all under 8 KiB so the first write never stalls on macOS or Linux).
+    for split in [2usize, 4, 5 + 64, 5 + 4096] {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("pair");
+        let mut wire = Wire::from_stream(client_stream);
+        let part1_sent = Arc::new(Notify::new());
+        let send_rest = Arc::new(Notify::new());
+
+        let writer = tokio::spawn({
+            let frame1 = frame1.clone();
+            let frame2 = frame2.clone();
+            let part1_sent = part1_sent.clone();
+            let send_rest = send_rest.clone();
+            async move {
+                server_stream
+                    .write_all(&frame1[..split])
+                    .await
+                    .expect("writes first part");
+                part1_sent.notify_one();
+                send_rest.notified().await;
+                server_stream
+                    .write_all(&frame1[split..])
+                    .await
+                    .expect("writes remainder");
+                server_stream
+                    .write_all(&frame2)
+                    .await
+                    .expect("writes second frame");
+            }
+        });
+
+        part1_sent.notified().await;
+
+        // Poll `wire.read()` until it consumes the partial frame and parks,
+        // then cancel it via `tokio::select!`.
+        tokio::select! {
+            biased;
+            msg = wire.read() => panic!("split {split}: incomplete frame returned {msg:?}"),
+            _ = async {
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        assert_eq!(
+            wire.buffered_read_len(),
+            split,
+            "split {split}: reader must have consumed and retained the partial frame"
+        );
+
+        send_rest.notify_one();
+
+        let got1 = wire.read().await.expect("first frame completes");
+        assert_eq!(got1, first_msg, "split {split}: first frame mismatch");
+        let got2 = wire.read().await.expect("second frame stays aligned");
+        assert_eq!(got2, second_msg, "split {split}: second frame mismatch");
+
+        writer.await.expect("writer finishes");
+    }
+}
+
 #[tokio::test]
 async fn many_replaced_subscriptions_in_a_row_and_replacement_while_live_obey_d058() {
     let mut rig = Rig::start().await;
