@@ -2,169 +2,170 @@
 
 Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; regenerate with `env UPDATE_TOOL_TABLE=1 cargo test -p atrium-core tools`.
 
-**Unknown tools vs. excluded forms (§4, §6):**
+**Unknown tools, Home-eligibility restrictions, and excluded forms (§4, §6):**
 - An **unknown tool** (absent from both **Modeled tools** and **Outside the model** below) stays in the model for hard-deny and store checks (§4): every word counts as a candidate `Path` with conservative `ReadWrite` access, the unit counts as a possible writer (§5), and it is never eligible for Home's read-only list. Under a covering prefix/exact Allow rule meeting §7's simple-command conditions, Clear targets remain Clear.
-- **`AnyExceptForbidden`** applies **only** to `HOME_READONLY_COMMANDS` rows without complete `dev` flag tables. Forbidden flags mirror `dev`'s `engine::forbidden_flag` (short clusters and long abbreviations of `>= 3` chars including `--`). Listed flags (and long abbreviations matching a listed writing flag) keep their stated effects; any unlisted non-forbidden flag keeps `dev`'s conservative treatment (`ReadWrite` candidate-path check on every unclassified word and attached `--opt=value`).
+- **`AnyExceptForbidden`** applies **only** to `HOME_READONLY_COMMANDS` rows without complete `dev` flag tables. Listed flags (and long abbreviations matching a listed writing flag) keep their stated effects; any unlisted flag keeps `dev`'s conservative treatment (`ReadWrite` candidate-path check on every unclassified word and attached `--opt=value`).
+- **Home-eligibility restrictions (`home_readonly.forbidden` / `home_readonly.only`):** forbidden flags mirror `dev`'s `engine::forbidden_flag` (short clusters and long abbreviations of `>= 3` chars including `--`). On an `AnyExceptForbidden` row, a Home-forbidden flag **only removes Home read-only eligibility** (`home_readonly_eligible = false`, so Home asks as on `dev`); it does **not** make the unit `Unread`. The unit stays in the model with that flag's declared effect (e.g. `tree -o out.txt` writes `out.txt`, `git diff --output out.patch` writes `out.patch`, `git diff --ext-diff` runs inline code → `Unread`), so a covering prefix/exact Allow rule can still cover it unless its declared effect triggers `Unread`.
 - **Rows outside `HOME_READONLY_COMMANDS`** (and search tools with complete `dev` flag tables) use **`ListedOnly`**: an unlisted flag makes the unit `Unread(UnknownFlag)` and falls back to conservative `ReadWrite` candidate-path checks on unclassified words.
-- An **explicitly excluded form** makes its unit **Unread**: every entry in **Outside the model**, any unlisted flag on a `ListedOnly` row, any forbidden flag on an `AnyExceptForbidden` row, or any modeled flag/form triggering an explicit `Unread` effect (§3–§6).
+- An **explicitly excluded form** makes its unit **Unread** under every setting (including prefix/exact rules): every entry in **Outside the model**, any unlisted flag on a `ListedOnly` row, or any modeled flag/form triggering an explicit `Unread` effect (§3–§6).
 
 ## Modeled tools
 
 | Tool | Platforms | Flags | Operands | Effects & pinning | Home read-only | Changes default (§11) |
 |---|---|---|---|---|---|---|
-| `command` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; links(root=Y, below=N); wrapper: Command | No | §11 item 10 |
-| `exec` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; links(root=Y, below=N); wrapper: Exec | No | §11 item 10 |
-| `nice` | Linux, macOS | ListedOnly: `-n` (Text) | — | access: AllRead; links(root=Y, below=N); wrapper: Nice | No | §11 item 9; §11 item 10 |
-| `timeout` | Linux, macOS | ListedOnly: `-s` (Text), `-k` (Text) | [0] Text | access: AllRead; links(root=Y, below=N); wrapper: Timeout | No | §11 item 9; §11 item 10 |
-| `time` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; links(root=Y, below=N); wrapper: Time | No | §11 item 10 |
-| `env` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; links(root=Y, below=N); wrapper: Env | No | §11 item 10 |
+| `command` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; links(root=Y, below=N); wrapper: Command | No | §11 item 2; §11 item 10 |
+| `exec` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; links(root=Y, below=N); wrapper: Exec | No | §11 item 2; §11 item 10 |
+| `nice` | Linux, macOS | ListedOnly: `-n` (Text) | — | access: AllRead; links(root=Y, below=N); wrapper: Nice | No | §11 item 2; §11 item 9; §11 item 10 |
+| `timeout` | Linux, macOS | ListedOnly: `-s` (Text), `-k` (Text) | [0] Text | access: AllRead; links(root=Y, below=N); wrapper: Timeout | No | §11 item 2; §11 item 9; §11 item 10 |
+| `time` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; links(root=Y, below=N); wrapper: Time | No | §11 item 2; §11 item 10 |
+| `env` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; links(root=Y, below=N); wrapper: Env | No | §11 item 2; §11 item 10 |
 | `sh` | Linux, macOS | ListedOnly: `-e`, `-u`, `-x`, `-c` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid; nested-shell | No | §11 item 2; §11 item 4; §11 item 8 |
 | `bash` | Linux, macOS | ListedOnly: `-e`, `-u`, `-x`, `-c` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid; nested-shell | No | §11 item 2; §11 item 4; §11 item 8 |
 | `dash` | Linux, macOS | ListedOnly: `-e`, `-u`, `-x`, `-c` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid; nested-shell | No | §11 item 2; §11 item 4; §11 item 8 |
-| `ls` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
-| `pwd` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
-| `cat` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
-| `head` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
-| `tail` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
-| `wc` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
-| `file` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes (forbids -C, --compile, -m, --magic-file, -f, --files-from) | — |
-| `stat` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=N, below=N) | Yes | — |
-| `du` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
-| `df` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
-| `which` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Text | access: AllRead; links(root=Y, below=N) | Yes | §11 item 9 |
-| `uname` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
-| `date` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes (forbids -s, --set, -f, --file) | — |
-| `whoami` | Linux, macOS | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
-| `tree` | Linux, macOS | AnyExceptForbidden: `-o/--output` (Path) [writes:+; val-access:Write] | rest: Path | access: FlagOnlyWrite; writes (flag); links(root=Y, below=N) | Yes (forbids -o, --output, -R) | — |
+| `ls` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
+| `pwd` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
+| `cat` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
+| `head` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
+| `tail` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
+| `wc` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
+| `file` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes (forbids -C, --compile, -m, --magic-file, -f, --files-from) | — |
+| `stat` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=N, below=N) | Yes | — |
+| `du` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
+| `df` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
+| `which` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Text | access: AllRead; links(root=Y, below=N) | Yes | §11 item 9 |
+| `uname` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
+| `date` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes (forbids -s, --set, -f, --file) | — |
+| `whoami` | Linux, macOS | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes | — |
+| `tree` | Linux, macOS | AnyExceptForbidden: `-o/--output` (Path) [writes:+; val-access:Write] | rest: Path | access: AllRead; writes (flag); links(root=Y, below=N) | Yes (forbids -o, --output, -R) | — |
 | `rg` | Linux, macOS | ListedOnly: 83 listed flags (53 bool, 30 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive; links(root=Y, below=N); filter: RgGlob | Yes (forbids --pre, --pre-glob, -z, --search-zip, --hostname-bin, -f, --file) [recursive] [allows followed search (§11 item 15)] | §11 item 2; §11 item 9; §11 item 15 |
-| `grep` | Linux, macOS | ListedOnly: 57 listed flags (40 bool, 17 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | Yes (forbids -f, --file) [recursive w/ flags] [allows followed search (§11 item 15)] | §11 item 2; §11 item 9; §11 item 15 |
-| `egrep` | Linux, macOS | ListedOnly: 57 listed flags (40 bool, 17 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 2; §11 item 9 |
-| `fgrep` | Linux, macOS | ListedOnly: 57 listed flags (40 bool, 17 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 2; §11 item 9 |
-| `zgrep` | Linux, macOS | ListedOnly: 57 listed flags (40 bool, 17 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 2; §11 item 9 |
-| `ggrep` | Linux, macOS | ListedOnly: 57 listed flags (40 bool, 17 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 2; §11 item 9 |
-| `rgrep` | Linux, macOS | ListedOnly: 57 listed flags (40 bool, 17 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive; links(root=Y, below=N); filter: GrepInclude | No | §11 item 2; §11 item 9 |
+| `grep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | Yes (forbids -f, --file) [recursive w/ flags] [allows followed search (§11 item 15)] | §11 item 2; §11 item 9; §11 item 15 |
+| `egrep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 2; §11 item 9 |
+| `fgrep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 2; §11 item 9 |
+| `zgrep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 2; §11 item 9 |
+| `ggrep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive (flag); links(root=Y, below=N); filter: GrepInclude | No | §11 item 2; §11 item 9 |
+| `rgrep` | Linux, macOS | ListedOnly: 56 listed flags (40 bool, 16 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive; links(root=Y, below=N); filter: GrepInclude | No | §11 item 2; §11 item 9 |
 | `ag` | Linux, macOS | ListedOnly: 79 listed flags (62 bool, 17 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
 | `ack` | Linux, macOS | ListedOnly: 41 listed flags (31 bool, 10 value; see flag table below) | [0] Pattern, rest: Path | access: AllRead; recursive; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
 | `git` | Linux, macOS | ListedOnly: `-C` (Path) [val-access:Read; unread(BaseDirChange)], `-c` (Code) [runs-code], `--config-env` (Code) [runs-code], `--exec-path` (Code) [runs-code], `--git-dir` (Path) [val-access:Read; unread(BaseDirChange)], `--work-tree` (Path) [val-access:Read; unread(BaseDirChange)], `--namespace` (Text), `--super-prefix` (Text) [unread(BaseDirChange)] | — | access: AllRead; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
-| `cargo` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `pipx` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; writes; links(root=Y, below=N); code: subarg run; unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `cd` | Linux, macOS | ListedOnly: `-L`, `-P`, `-e`, `-@` | [0] Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `find` | Linux, macOS | ListedOnly: 22 listed flags (10 bool, 12 value; see flag table below) | rest: Path | access: FlagOnlyWrite; writes (flag); derived-dest (flag); recursive; links(root=N, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9; §11 item 10 |
-| `ln` | Linux, macOS | ListedOnly: `-s` | [0] Path, [1] Path | access: SourcesReadLastWrite; writes; links(root=N, below=N) | No | — |
-| `cp` | Linux, macOS | ListedOnly: `-r` [derived-dest:+; recursive:+], `-R/--recursive` [derived-dest:+; recursive:+], `-a/--archive` [derived-dest:+; recursive:+; links(root=-, below=-)], `-L/--dereference` [links(root=+, below=+)], `-P` [links(root=-, below=-)], `-d` [links(root=-, below=-)] | rest: Path, last: DestinationRoot | access: SourcesReadLastWrite; writes; derived-dest (flag); recursive (flag); links(root=Y, below=N) | No | §11 item 10 |
-| `mv` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path, last: DestinationRoot | access: AllWrite; writes; derived-dest (dir src); links(root=N, below=N) | No | §11 item 10 |
-| `rsync` | Linux, macOS | ListedOnly: `-L/--copy-links` [links(root=+, below=+)], `-k/--copy-dirlinks` [links(root=+, below=+)], `--copy-unsafe-links` [links(root=+, below=+)] | rest: Path, last: DestinationRoot | access: SourcesReadLastWrite; writes; derived-dest; recursive; links(root=Y, below=N) | No | §11 item 10 |
-| `tar` | Linux, macOS | ListedOnly: `-c/--create` [writes:+; positional-role(Path)], `-r/--append` [writes:+; positional-role(Path)], `-u/--update` [writes:+; positional-role(Path)], `-x/--extract` [writes:+; derived-dest:+; positional-role(ArchiveMember)], `-t/--list` [positional-role(ArchiveMember)], `-h/--dereference` [links(root=+, below=+)], `-f/--file` (Path) [val-access:WriteWhenWriting], `-C/--directory` (DestinationRoot) [val-access:WriteWhenWriting; unread(BaseDirChange)] | rest: Path | access: FlagOnlyWrite; writes (flag); derived-dest (flag); recursive; links(root=N, below=N) | No | §11 item 2; §11 item 9; §11 item 10 |
-| `unzip` | Linux, macOS | ListedOnly: `-d` (DestinationRoot) [writes:+; val-access:Write] | [0] Path, rest: ArchiveMember | access: FlagOnlyWrite; writes; derived-dest; links(root=Y, below=N) | No | §11 item 9; §11 item 10 |
-| `rm` | Linux, macOS | ListedOnly: `-r/--recursive` [recursive:+], `-R` [recursive:+] | rest: Path | access: AllWrite; writes; recursive (flag); links(root=N, below=N) | No | — |
-| `tee` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | — |
-| `touch` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | — |
-| `chmod` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 9 |
-| `chown` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 9 |
-| `chgrp` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 9 |
-| `truncate` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | — |
-| `install` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: SourcesReadLastWrite; writes; links(root=Y, below=N) | No | — |
-| `mkdir` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | — |
-| `rmdir` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=N, below=N) | No | — |
-| `unlink` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=N, below=N) | No | — |
-| `shred` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | — |
-| `patch` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | — |
-| `wipefs` | Linux | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | — |
-| `blkdiscard` | Linux | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | — |
-| `ed` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | — |
-| `ex` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | — |
-| `diff` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `cmp` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `md5` | macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `md5sum` | Linux | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `shasum` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `sha1sum` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `sha256sum` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `readlink` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=N, below=N) | No | — |
-| `realpath` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=Y) | No | — |
-| `basename` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=N, below=N) | No | — |
-| `dirname` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=N, below=N) | No | — |
-| `nl` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `od` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `hexdump` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `strings` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `bat` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `column` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `fold` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `expand` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `less` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `more` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `cut` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `sort` | Linux, macOS | ListedOnly: `-o/--output` (Path) [writes:+; val-access:Write] | rest: Path | access: FlagOnlyWrite; writes (flag); links(root=Y, below=N) | No | — |
-| `uniq` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Path, [1] Path | access: SourcesReadLastWrite; writes (>= 2 args); links(root=Y, below=N) | No | — |
-| `xxd` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Path, [1] Path | access: SourcesReadLastWrite; writes (>= 2 args); links(root=Y, below=N) | No | — |
-| `echo` | Linux, macOS | ListedOnly: `-n`, `-e`, `-E` | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 9 |
+| `cargo` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `pipx` | Linux, macOS | ListedOnly: none (any flag → Unread) | — | access: AllRead; writes; links(root=Y, below=N); code: subarg run; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `cd` | Linux, macOS | ListedOnly: `-L`, `-P`, `-e`, `-@` | [0] Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `find` | Linux, macOS | ListedOnly: 22 listed flags (10 bool, 12 value; see flag table below) | rest: Path | access: InPlaceWithFlag; writes (flag); derived-dest (flag); recursive; links(root=N, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9; §11 item 10 |
+| `ln` | Linux, macOS | ListedOnly: `-s` | [0] Path, [1] Path | access: SourcesReadLastWrite; writes; links(root=N, below=N) | No | §11 item 2 |
+| `cp` | Linux, macOS | ListedOnly: `-r` [derived-dest:+; recursive:+], `-R/--recursive` [derived-dest:+; recursive:+], `-a/--archive` [derived-dest:+; recursive:+; links(root=-, below=-)], `-L/--dereference` [links(root=+, below=+)], `-P` [links(root=-, below=-)], `-d` [links(root=-, below=-)] | rest: Path, last: DestinationRoot | access: SourcesReadLastWrite; writes; derived-dest (flag); recursive (flag); links(root=Y, below=N) | No | §11 item 2; §11 item 10 |
+| `mv` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path, last: DestinationRoot | access: AllWrite; writes; derived-dest (dir src); links(root=N, below=N) | No | §11 item 2; §11 item 10 |
+| `rsync` | Linux, macOS | ListedOnly: `-L/--copy-links` [links(root=+, below=+)], `-k/--copy-dirlinks` [links(root=+, below=+)], `--copy-unsafe-links` [links(root=+, below=+)] | rest: Path, last: DestinationRoot | access: SourcesReadLastWrite; writes; derived-dest; recursive; links(root=Y, below=N) | No | §11 item 2; §11 item 10 |
+| `tar` | Linux, macOS | ListedOnly: `-c/--create` [writes:+; op:Write; positional-role(Path)], `-r/--append` [writes:+; op:Write; positional-role(Path)], `-u/--update` [writes:+; op:Write; positional-role(Path)], `-x/--extract` [writes:+; op:Extract; derived-dest:+; positional-role(ArchiveMember)], `-t/--list` [op:List; positional-role(ArchiveMember)], `-h/--dereference` [links(root=+, below=+)], `-f/--file` (Path) [val-access:TarArchive], `-C/--directory` (Path) [val-access:TarDirectory; unread(BaseDirChange)] | rest: Path | access: AllRead; writes (flag); derived-dest (flag); recursive; links(root=N, below=N) | No | §11 item 2; §11 item 9; §11 item 10 |
+| `unzip` | Linux, macOS | ListedOnly: `-d` (DestinationRoot) [writes:+; val-access:Write] | [0] Path, rest: ArchiveMember | access: AllRead; writes; derived-dest; links(root=Y, below=N) | No | §11 item 2; §11 item 9; §11 item 10 |
+| `rm` | Linux, macOS | ListedOnly: `-r/--recursive` [recursive:+], `-R` [recursive:+] | rest: Path | access: AllWrite; writes; recursive (flag); links(root=N, below=N) | No | §11 item 2 |
+| `tee` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `touch` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `chmod` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `chown` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `chgrp` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `truncate` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `install` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: SourcesReadLastWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `mkdir` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `rmdir` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=N, below=N) | No | §11 item 2 |
+| `unlink` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=N, below=N) | No | §11 item 2 |
+| `shred` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `patch` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `wipefs` | Linux | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `blkdiscard` | Linux | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `ed` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `ex` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N) | No | §11 item 2 |
+| `diff` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `cmp` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `md5` | macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `md5sum` | Linux | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `shasum` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `sha1sum` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `sha256sum` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `readlink` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=N, below=N) | No | §11 item 2 |
+| `realpath` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=Y) | No | §11 item 2 |
+| `basename` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=N, below=N) | No | §11 item 2 |
+| `dirname` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=N, below=N) | No | §11 item 2 |
+| `nl` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `od` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `hexdump` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `strings` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `bat` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `column` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `fold` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `expand` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `less` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `more` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `cut` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `sort` | Linux, macOS | ListedOnly: `-o/--output` (Path) [writes:+; val-access:Write] | rest: Path | access: AllRead; writes (flag); links(root=Y, below=N) | No | §11 item 2 |
+| `uniq` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Path, [1] Path | access: SourcesReadLastWrite; writes (>= 2 args); links(root=Y, below=N) | No | §11 item 2 |
+| `xxd` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Path, [1] Path | access: SourcesReadLastWrite; writes (>= 2 args); links(root=Y, below=N) | No | §11 item 2 |
+| `echo` | Linux, macOS | ListedOnly: `-n`, `-e`, `-E` | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
 | `printf` | Linux, macOS | ListedOnly: `-v` (Text) [unread(FlagEffect)] | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
-| `whereis` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 9 |
-| `type` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 9 |
-| `tr` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 9 |
-| `true` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 9 |
-| `false` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 9 |
-| `id` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 9 |
-| `test` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `[` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `jq` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Pattern, rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 9 |
-| `mdls` | macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `open` | macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `spctl` | macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `mdfind` | macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | — |
-| `codesign` | macOS | ListedOnly: `-s/--sign` (Text) [writes:+], `-f/--force` [writes:+], `--remove-signature` [writes:+], `-d/--display`, `-v/--verify` | rest: Path | access: AllWriteWhenWriting; writes (flag); links(root=Y, below=N) | No | §11 item 9 |
-| `awk` | Linux, macOS | ListedOnly: `-f/--file` (ProgramFile) [writes:+; val-access:Read; provides-script; runs-program(FlagValue)], `-i/--include` (Code) [writes:+; runs-code] | [0] Code, rest: Path | access: AllWriteWhenWriting; writes; links(root=Y, below=N); code: program/inline (pin: FlagValue); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `gawk` | Linux, macOS | ListedOnly: `-f/--file` (ProgramFile) [writes:+; val-access:Read; provides-script; runs-program(FlagValue)], `-i/--include` (Code) [writes:+; runs-code] | [0] Code, rest: Path | access: AllWriteWhenWriting; writes; links(root=Y, below=N); code: program/inline (pin: FlagValue); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `mawk` | Linux, macOS | ListedOnly: `-f/--file` (ProgramFile) [writes:+; val-access:Read; provides-script; runs-program(FlagValue)], `-i/--include` (Code) [writes:+; runs-code] | [0] Code, rest: Path | access: AllWriteWhenWriting; writes; links(root=Y, below=N); code: program/inline (pin: FlagValue); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `sed` | Linux, macOS | ListedOnly: `-i/--in-place` [writes:+], `-e/--expression` (Code) [provides-script], `-f/--file` (ProgramFile) [writes:+; val-access:Read; provides-script; runs-program(FlagValue)] | [0] Code, rest: Path | access: AllWriteWhenWriting; writes (flag); links(root=Y, below=N); code: script commands (e/w/r); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `perl` | Linux, macOS | ListedOnly: `-i` [writes:+], `-e` (Code) [runs-code], `-E` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllWriteWhenWriting; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `python` | Linux, macOS | ListedOnly: `-c` (Code) [runs-code], `-m` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `python3` | Linux, macOS | ListedOnly: `-c` (Code) [runs-code], `-m` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `node` | Linux, macOS | ListedOnly: `-e/--eval` (Code) [runs-code], `-p/--print` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `ruby` | Linux, macOS | ListedOnly: `-e` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `eval` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `source` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `.` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `npx` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
-| `xargs` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `ssh` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `mosh` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `autossh` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `nsenter` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `unshare` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `docker` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `podman` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `nerdctl` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `kubectl` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `oc` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `lxc` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `incus` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `machinectl` | Linux | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `systemd-run` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `systemd-nspawn` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `firejail` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `bwrap` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `flatpak-spawn` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `toolbox` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `distrobox` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `distrobox-enter` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `multipass` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `vagrant` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `limactl` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `colima` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `runuser` | Linux | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `setpriv` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `parallel` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
+| `whereis` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `type` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `tr` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `true` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `false` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `id` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `test` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `[` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `jq` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Pattern, rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `mdls` | macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `open` | macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `spctl` | macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `mdfind` | macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllRead; links(root=Y, below=N) | No | §11 item 2 |
+| `codesign` | macOS | ListedOnly: `-s/--sign` (Text) [writes:+; writes-inputs:+], `-f/--force` [writes:+; writes-inputs:+], `--remove-signature` [writes:+; writes-inputs:+], `-d/--display`, `-v/--verify` | rest: Path | access: InPlaceWithFlag; writes (flag); links(root=Y, below=N) | No | §11 item 2; §11 item 9 |
+| `awk` | Linux, macOS | ListedOnly: `-i/--include` (Code) [writes:+; runs-code] | [0] Code, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `gawk` | Linux, macOS | ListedOnly: `-i/--include` (Code) [writes:+; runs-code] | [0] Code, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `mawk` | Linux, macOS | ListedOnly: `-i/--include` (Code) [writes:+; runs-code] | [0] Code, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `sed` | Linux, macOS | ListedOnly: `-i/--in-place` [writes:+; writes-inputs:+], `-e/--expression` (Code) [provides-script], `-f/--file` (ProgramFile) [writes:+; val-access:Read; provides-script; runs-program(FlagValue)] | [0] Code, rest: Path | access: InPlaceWithFlag; writes (flag); links(root=Y, below=N); code: script commands (e/w/r); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `perl` | Linux, macOS | ListedOnly: `-i` [writes-inputs:+], `-e` (Code) [provides-script; runs-code], `-E` (Code) [provides-script; runs-code] | [0] ProgramFile, rest: Path | access: InPlaceWithFlag; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `python` | Linux, macOS | ListedOnly: `-c` (Code) [runs-code], `-m` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `python3` | Linux, macOS | ListedOnly: `-c` (Code) [runs-code], `-m` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `node` | Linux, macOS | ListedOnly: `-e/--eval` (Code) [runs-code], `-p/--print` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `ruby` | Linux, macOS | ListedOnly: `-e` (Code) [runs-code] | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `eval` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `source` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `.` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `npx` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
+| `xargs` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `ssh` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `mosh` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `autossh` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `nsenter` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `unshare` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `docker` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `podman` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `nerdctl` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `kubectl` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `oc` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `lxc` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `incus` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `machinectl` | Linux | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `systemd-run` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `systemd-nspawn` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `firejail` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `bwrap` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `flatpak-spawn` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `toolbox` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `distrobox` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `distrobox-enter` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `multipass` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `vagrant` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `limactl` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `colima` | Linux, macOS | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `runuser` | Linux | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `setpriv` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `parallel` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
 | `sudo` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid; hard-deny: `privilege-escalation` | No | — |
 | `sudoedit` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N); hard-deny: `privilege-escalation` | No | — |
 | `su` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid; hard-deny: `privilege-escalation` | No | — |
 | `doas` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid; hard-deny: `privilege-escalation` | No | — |
 | `pkexec` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid; hard-deny: `privilege-escalation` | No | — |
 | `run0` | Linux | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid; hard-deny: `privilege-escalation` | No | — |
-| `curl` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N); downloader | No | — |
-| `wget` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N); downloader | No | — |
-| `fetch` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N); downloader | No | — |
+| `curl` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N); downloader | No | §11 item 2 |
+| `wget` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N); downloader | No | §11 item 2 |
+| `fetch` | Linux, macOS | ListedOnly: none (any flag → Unread) | rest: Path | access: AllWrite; writes; links(root=Y, below=N); downloader | No | §11 item 2 |
 
 ## Subcommands
 
@@ -172,42 +173,42 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 
 | Subcommand | Flags | Operands | Effects & pinning | Home read-only | Changes default (§11) |
 |---|---|---|---|---|---|
-| `git status` | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 10 |
+| `git status` | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 10 |
 | `git log` | AnyExceptForbidden: `-p`, `-L/--line-range` (Text) | rest: Ref | access: AllRead; links(root=Y, below=N); git-cred-select | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 9; §11 item 10 |
-| `git diff` | AnyExceptForbidden: `--output` (Path) [writes:+; val-access:Write], `--ext-diff` [runs-code] | rest: Ref | access: FlagOnlyWrite; writes (flag); links(root=Y, below=N); code: flag; unpinned-prefix-invalid; git-cred-select | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 4; §11 item 9; §11 item 10 |
-| `git show` | AnyExceptForbidden: any non-forbidden flag | rest: Ref | access: AllRead; links(root=Y, below=N); git-cred-select | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 9; §11 item 10 |
+| `git diff` | AnyExceptForbidden: `--output` (Path) [writes:+; val-access:Write], `--ext-diff` [runs-code] | rest: Ref | access: AllRead; writes (flag); links(root=Y, below=N); code: flag; unpinned-prefix-invalid; git-cred-select | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 4; §11 item 9; §11 item 10 |
+| `git show` | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Ref | access: AllRead; links(root=Y, below=N); git-cred-select | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 9; §11 item 10 |
 | `git branch` | AnyExceptForbidden: 14 listed flags (13 bool, 1 value; see flag table below) | rest: Ref | access: AllRead; writes (flag or >= 1 args unless disabled); links(root=Y, below=N) | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) (only -a, --all, -r, --remotes, -v, -vv, --verbose, --list, -l, --show-current) | §11 item 9 |
-| `git rev-parse` | AnyExceptForbidden: any non-forbidden flag | rest: Ref | access: AllRead; links(root=Y, below=N) | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 9 |
-| `git ls-files` | AnyExceptForbidden: any non-forbidden flag | rest: Path | access: AllRead; links(root=Y, below=N) | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 10 |
-| `git cat-file` | ListedOnly: none (any flag → Unread) | rest: Ref | access: AllRead; links(root=Y, below=N); git-cred-select | No | §11 item 9 |
-| `git push` | ListedOnly: `-f/--force` [git-push(Force)], `--force-with-lease` [git-push(Force)], `--force-if-includes` [git-push(Force)], `--mirror` [git-push(Force)], `--all` [git-push(ImplicitTargets)], `--tags` [git-push(ImplicitTargets)], `--branches` [git-push(ImplicitTargets)], `--prune` [git-push(ImplicitTargets)], `-o/--push-option` (Text), `--receive-pack` (Code) [runs-code], `--exec` (Code) [runs-code] | rest: Ref | access: AllRead; writes; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `git clone` | ListedOnly: none (any flag → Unread) | [0] Ref, [1] DestinationRoot | access: SourcesReadLastWrite; writes; derived-dest; links(root=Y, below=N) | No | §11 item 9; §11 item 10 |
-| `git checkout` | ListedOnly: `-b` (Ref) [writes:+], `-B` (Ref) [writes:+], `--orphan` (Ref) [writes:+] | [0] Ref, rest: DestinationRoot, after `--`: DestinationRoot | access: AllWrite; writes; derived-dest; links(root=Y, below=N) | No | §11 item 9; §11 item 10 |
-| `git merge-index` | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `git filter-branch` | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 4 |
-| `git bisect` | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: subarg run; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `git rebase` | ListedOnly: `-x/--exec` (Code) [runs-code] | rest: Ref | access: AllRead; writes; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `git submodule` | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: subarg foreach; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `git difftool` | ListedOnly: `-x/--tool-cmd` (Code) [runs-code] | rest: Ref | access: AllRead; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 4; §11 item 9 |
-| `git mergetool` | ListedOnly: `-x/--tool-cmd` (Code) [runs-code] | rest: Path | access: AllWrite; writes; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 4 |
+| `git rev-parse` | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Ref | access: AllRead; links(root=Y, below=N) | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 9 |
+| `git ls-files` | AnyExceptForbidden: any flag (Home forbids listed flags) | rest: Path | access: AllRead; links(root=Y, below=N) | Yes (forbids --output, --ext-diff, --exec-path, --config-env, -c) | §11 item 10 |
+| `git cat-file` | ListedOnly: none (any flag → Unread) | rest: Ref | access: AllRead; links(root=Y, below=N); git-cred-select | No | §11 item 2; §11 item 9 |
+| `git push` | ListedOnly: `-f/--force` [git-push(Force)], `--force-with-lease` [git-push(Force)], `--force-if-includes` [git-push(Force)], `--mirror` [git-push(Force)], `--all` [git-push(ImplicitTargets)], `--tags` [git-push(ImplicitTargets)], `--branches` [git-push(ImplicitTargets)], `--prune` [git-push(ImplicitTargets)], `-o/--push-option` (Text), `--receive-pack` (Code) [runs-code], `--exec` (Code) [runs-code] | rest: Ref | access: AllRead; writes; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `git clone` | ListedOnly: none (any flag → Unread) | [0] Ref, [1] DestinationRoot | access: SourcesReadLastWrite; writes; derived-dest; links(root=Y, below=N) | No | §11 item 2; §11 item 9; §11 item 10 |
+| `git checkout` | ListedOnly: `-b` (Ref) [writes:+], `-B` (Ref) [writes:+], `--orphan` (Ref) [writes:+] | [0] Ref, rest: DestinationRoot, after `--`: DestinationRoot | access: AllWrite; writes; derived-dest; links(root=Y, below=N) | No | §11 item 2; §11 item 9; §11 item 10 |
+| `git merge-index` | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `git filter-branch` | ListedOnly: none (any flag → Unread) | rest: Code | access: AllRead; writes; links(root=Y, below=N); code: inline; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
+| `git bisect` | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: subarg run; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `git rebase` | ListedOnly: `-x/--exec` (Code) [runs-code] | rest: Ref | access: AllRead; writes; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `git submodule` | ListedOnly: none (any flag → Unread) | [0] Text, rest: Code | access: AllRead; writes; links(root=Y, below=N); code: subarg foreach; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `git difftool` | ListedOnly: `-x/--tool-cmd` (Code) [runs-code] | rest: Ref | access: AllRead; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 9 |
+| `git mergetool` | ListedOnly: `-x/--tool-cmd` (Code) [runs-code] | rest: Path | access: AllWrite; writes; links(root=Y, below=N); code: flag; unpinned-prefix-invalid | No | §11 item 2; §11 item 4 |
 
 ### `cargo`
 
 | Subcommand | Flags | Operands | Effects & pinning | Home read-only | Changes default (§11) |
 |---|---|---|---|---|---|
-| `cargo test` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 8; §11 item 9 |
-| `cargo build` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 8; §11 item 9 |
-| `cargo run` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 8; §11 item 9 |
-| `cargo check` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 8; §11 item 9 |
-| `cargo bench` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 8; §11 item 9 |
-| `cargo doc` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 8; §11 item 9 |
-| `cargo clippy` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 8; §11 item 9 |
+| `cargo test` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo build` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo run` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo check` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo bench` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo doc` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo clippy` | ListedOnly: none (any flag → Unread) | rest: Text | access: AllRead; writes; links(root=Y, below=N); code: build (pin: CommandAndSubcommand) | No | §11 item 2; §11 item 8; §11 item 9 |
 
 ### `pipx`
 
 | Subcommand | Flags | Operands | Effects & pinning | Home read-only | Changes default (§11) |
 |---|---|---|---|---|---|
-| `pipx run` | ListedOnly: none (any flag → Unread) | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 4; §11 item 8 |
+| `pipx run` | ListedOnly: none (any flag → Unread) | [0] ProgramFile, rest: Path | access: AllRead; writes; links(root=Y, below=N); code: program/inline (pin: FirstOperand); unpinned-prefix-invalid | No | §11 item 2; §11 item 4; §11 item 8 |
 
 ## Detailed flag tables
 
@@ -345,7 +346,7 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | — | `--dfa-size-limit` | Value(Text) | none (regex DFA memory limit) |
 | — | `--regex-size-limit` | Value(Text) | none (regex compilation memory limit) |
 
-### `grep` (57 flags, ListedOnly)
+### `grep` (56 flags, ListedOnly)
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
@@ -400,14 +401,13 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | — | `--include` | Value(Pattern) | filter(GrepInclude, sensitive) |
 | — | `--exclude` | Value(Pattern) | unread(FilterForm) |
 | — | `--exclude-dir` | Value(Pattern) | unread(FilterForm) |
-| — | `--include-dir` | Value(Pattern) | unread(FilterForm) |
 | — | `--label` | Value(Text) | none (stdin display label in output) |
 | — | `--color` | Value(Text) | none (output color mode) |
 | — | `--colour` | Value(Text) | none (output color mode) |
 | — | `--binary-files` | Value(Text) | none (binary file content match mode only) |
 | — | `--group-separator` | Value(Text) | none (output context group separator string) |
 
-### `egrep` (57 flags, ListedOnly)
+### `egrep` (56 flags, ListedOnly)
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
@@ -462,14 +462,13 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | — | `--include` | Value(Pattern) | filter(GrepInclude, sensitive) |
 | — | `--exclude` | Value(Pattern) | unread(FilterForm) |
 | — | `--exclude-dir` | Value(Pattern) | unread(FilterForm) |
-| — | `--include-dir` | Value(Pattern) | unread(FilterForm) |
 | — | `--label` | Value(Text) | none (stdin display label in output) |
 | — | `--color` | Value(Text) | none (output color mode) |
 | — | `--colour` | Value(Text) | none (output color mode) |
 | — | `--binary-files` | Value(Text) | none (binary file content match mode only) |
 | — | `--group-separator` | Value(Text) | none (output context group separator string) |
 
-### `fgrep` (57 flags, ListedOnly)
+### `fgrep` (56 flags, ListedOnly)
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
@@ -524,14 +523,13 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | — | `--include` | Value(Pattern) | filter(GrepInclude, sensitive) |
 | — | `--exclude` | Value(Pattern) | unread(FilterForm) |
 | — | `--exclude-dir` | Value(Pattern) | unread(FilterForm) |
-| — | `--include-dir` | Value(Pattern) | unread(FilterForm) |
 | — | `--label` | Value(Text) | none (stdin display label in output) |
 | — | `--color` | Value(Text) | none (output color mode) |
 | — | `--colour` | Value(Text) | none (output color mode) |
 | — | `--binary-files` | Value(Text) | none (binary file content match mode only) |
 | — | `--group-separator` | Value(Text) | none (output context group separator string) |
 
-### `zgrep` (57 flags, ListedOnly)
+### `zgrep` (56 flags, ListedOnly)
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
@@ -586,14 +584,13 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | — | `--include` | Value(Pattern) | filter(GrepInclude, sensitive) |
 | — | `--exclude` | Value(Pattern) | unread(FilterForm) |
 | — | `--exclude-dir` | Value(Pattern) | unread(FilterForm) |
-| — | `--include-dir` | Value(Pattern) | unread(FilterForm) |
 | — | `--label` | Value(Text) | none (stdin display label in output) |
 | — | `--color` | Value(Text) | none (output color mode) |
 | — | `--colour` | Value(Text) | none (output color mode) |
 | — | `--binary-files` | Value(Text) | none (binary file content match mode only) |
 | — | `--group-separator` | Value(Text) | none (output context group separator string) |
 
-### `ggrep` (57 flags, ListedOnly)
+### `ggrep` (56 flags, ListedOnly)
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
@@ -648,14 +645,13 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | — | `--include` | Value(Pattern) | filter(GrepInclude, sensitive) |
 | — | `--exclude` | Value(Pattern) | unread(FilterForm) |
 | — | `--exclude-dir` | Value(Pattern) | unread(FilterForm) |
-| — | `--include-dir` | Value(Pattern) | unread(FilterForm) |
 | — | `--label` | Value(Text) | none (stdin display label in output) |
 | — | `--color` | Value(Text) | none (output color mode) |
 | — | `--colour` | Value(Text) | none (output color mode) |
 | — | `--binary-files` | Value(Text) | none (binary file content match mode only) |
 | — | `--group-separator` | Value(Text) | none (output context group separator string) |
 
-### `rgrep` (57 flags, ListedOnly)
+### `rgrep` (56 flags, ListedOnly)
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
@@ -710,7 +706,6 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | — | `--include` | Value(Pattern) | filter(GrepInclude, sensitive) |
 | — | `--exclude` | Value(Pattern) | unread(FilterForm) |
 | — | `--exclude-dir` | Value(Pattern) | unread(FilterForm) |
-| — | `--include-dir` | Value(Pattern) | unread(FilterForm) |
 | — | `--label` | Value(Text) | none (stdin display label in output) |
 | — | `--color` | Value(Text) | none (output color mode) |
 | — | `--colour` | Value(Text) | none (output color mode) |
@@ -958,17 +953,17 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | `-x` | — | Bool | unread(FilterForm) |
 | `-D` | — | Value(Text) | none (GNU find debug output category only) |
 | `-f` | — | Value(Path) | val-access:Read |
-| — | `-delete` | Bool | writes:+; derived-dest:+ |
+| — | `-delete` | Bool | writes:+; writes-inputs:+; derived-dest:+ |
 | — | `-depth` | Bool | none (depth-first traversal order only (same files visited)) |
 | — | `-maxdepth` | Value(Text) | unread(FilterForm) |
 | — | `-mindepth` | Value(Text) | unread(FilterForm) |
-| — | `-exec` | Value(Code) | writes:+; runs-code |
-| — | `-execdir` | Value(Code) | writes:+; runs-code |
-| — | `-ok` | Value(Code) | writes:+; runs-code |
-| — | `-okdir` | Value(Code) | writes:+; runs-code |
+| — | `-exec` | TerminatedValues(Code, end: ; / +) | writes:+; runs-code |
+| — | `-execdir` | TerminatedValues(Code, end: ; / +) | writes:+; runs-code |
+| — | `-ok` | TerminatedValues(Code, end: ;) | writes:+; runs-code |
+| — | `-okdir` | TerminatedValues(Code, end: ;) | writes:+; runs-code |
 | — | `-fprint` | Value(Path) | writes:+; val-access:Write |
 | — | `-fprint0` | Value(Path) | writes:+; val-access:Write |
-| — | `-fprintf` | Value(Path) | writes:+; val-access:Write |
+| — | `-fprintf` | MultiValue(Path:Write, Text) | writes:+ |
 | — | `-fls` | Value(Path) | writes:+; val-access:Write |
 
 ### `ln` (1 flags, ListedOnly)
@@ -1000,14 +995,14 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
-| `-c` | `--create` | Bool | writes:+; positional-role(Path) |
-| `-r` | `--append` | Bool | writes:+; positional-role(Path) |
-| `-u` | `--update` | Bool | writes:+; positional-role(Path) |
-| `-x` | `--extract` | Bool | writes:+; derived-dest:+; positional-role(ArchiveMember) |
-| `-t` | `--list` | Bool | positional-role(ArchiveMember) |
+| `-c` | `--create` | Bool | writes:+; op:Write; positional-role(Path) |
+| `-r` | `--append` | Bool | writes:+; op:Write; positional-role(Path) |
+| `-u` | `--update` | Bool | writes:+; op:Write; positional-role(Path) |
+| `-x` | `--extract` | Bool | writes:+; op:Extract; derived-dest:+; positional-role(ArchiveMember) |
+| `-t` | `--list` | Bool | op:List; positional-role(ArchiveMember) |
 | `-h` | `--dereference` | Bool | links(root=+, below=+) |
-| `-f` | `--file` | Value(Path) | val-access:WriteWhenWriting |
-| `-C` | `--directory` | Value(DestinationRoot) | val-access:WriteWhenWriting; unread(BaseDirChange) |
+| `-f` | `--file` | Value(Path) | val-access:TarArchive |
+| `-C` | `--directory` | Value(Path) | val-access:TarDirectory; unread(BaseDirChange) |
 
 ### `unzip` (1 flags, ListedOnly)
 
@@ -1046,38 +1041,35 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
-| `-s` | `--sign` | Value(Text) | writes:+ |
-| `-f` | `--force` | Bool | writes:+ |
-| — | `--remove-signature` | Bool | writes:+ |
+| `-s` | `--sign` | Value(Text) | writes:+; writes-inputs:+ |
+| `-f` | `--force` | Bool | writes:+; writes-inputs:+ |
+| — | `--remove-signature` | Bool | writes:+; writes-inputs:+ |
 | `-d` | `--display` | Bool | none (displays code signature metadata (read-only)) |
 | `-v` | `--verify` | Bool | none (verifies code signature (read-only)) |
 
-### `awk` (2 flags, ListedOnly)
+### `awk` (1 flags, ListedOnly)
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
-| `-f` | `--file` | Value(ProgramFile) | writes:+; val-access:Read; provides-script; runs-program(FlagValue) |
 | `-i` | `--include` | Value(Code) | writes:+; runs-code |
 
-### `gawk` (2 flags, ListedOnly)
+### `gawk` (1 flags, ListedOnly)
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
-| `-f` | `--file` | Value(ProgramFile) | writes:+; val-access:Read; provides-script; runs-program(FlagValue) |
 | `-i` | `--include` | Value(Code) | writes:+; runs-code |
 
-### `mawk` (2 flags, ListedOnly)
+### `mawk` (1 flags, ListedOnly)
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
-| `-f` | `--file` | Value(ProgramFile) | writes:+; val-access:Read; provides-script; runs-program(FlagValue) |
 | `-i` | `--include` | Value(Code) | writes:+; runs-code |
 
 ### `sed` (3 flags, ListedOnly)
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
-| `-i` | `--in-place` | Bool | writes:+ |
+| `-i` | `--in-place` | Bool | writes:+; writes-inputs:+ |
 | `-e` | `--expression` | Value(Code) | provides-script |
 | `-f` | `--file` | Value(ProgramFile) | writes:+; val-access:Read; provides-script; runs-program(FlagValue) |
 
@@ -1085,9 +1077,9 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 
 | Short | Long | Kind | Effects |
 |---|---|---|---|
-| `-i` | — | Bool | writes:+ |
-| `-e` | — | Value(Code) | runs-code |
-| `-E` | — | Value(Code) | runs-code |
+| `-i` | — | Bool | writes-inputs:+ |
+| `-e` | — | Value(Code) | provides-script; runs-code |
+| `-E` | — | Value(Code) | provides-script; runs-code |
 
 ### `python` (2 flags, ListedOnly)
 
@@ -1174,12 +1166,12 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 
 | Entry | §11 item(s) |
 |---|---|
-| `command` | §11 item 10 |
-| `exec` | §11 item 10 |
-| `nice` | §11 item 9; §11 item 10 |
-| `timeout` | §11 item 9; §11 item 10 |
-| `time` | §11 item 10 |
-| `env` | §11 item 10 |
+| `command` | §11 item 2; §11 item 10 |
+| `exec` | §11 item 2; §11 item 10 |
+| `nice` | §11 item 2; §11 item 9; §11 item 10 |
+| `timeout` | §11 item 2; §11 item 9; §11 item 10 |
+| `time` | §11 item 2; §11 item 10 |
+| `env` | §11 item 2; §11 item 10 |
 | `sh` | §11 item 2; §11 item 4; §11 item 8 |
 | `bash` | §11 item 2; §11 item 4; §11 item 8 |
 | `dash` | §11 item 2; §11 item 4; §11 item 8 |
@@ -1201,88 +1193,138 @@ Generated from `crates/atrium-core/src/policy/tools.rs`. Do not edit by hand; re
 | `git branch` | §11 item 9 |
 | `git rev-parse` | §11 item 9 |
 | `git ls-files` | §11 item 10 |
-| `git cat-file` | §11 item 9 |
-| `git push` | §11 item 4; §11 item 9 |
-| `git clone` | §11 item 9; §11 item 10 |
-| `git checkout` | §11 item 9; §11 item 10 |
-| `git merge-index` | §11 item 4 |
-| `git filter-branch` | §11 item 4 |
-| `git bisect` | §11 item 4; §11 item 9 |
-| `git rebase` | §11 item 4; §11 item 9 |
-| `git submodule` | §11 item 4; §11 item 9 |
-| `git difftool` | §11 item 4; §11 item 9 |
-| `git mergetool` | §11 item 4 |
-| `cargo` | §11 item 4; §11 item 8 |
-| `cargo test` | §11 item 8; §11 item 9 |
-| `cargo build` | §11 item 8; §11 item 9 |
-| `cargo run` | §11 item 8; §11 item 9 |
-| `cargo check` | §11 item 8; §11 item 9 |
-| `cargo bench` | §11 item 8; §11 item 9 |
-| `cargo doc` | §11 item 8; §11 item 9 |
-| `cargo clippy` | §11 item 8; §11 item 9 |
-| `pipx` | §11 item 4; §11 item 8 |
-| `pipx run` | §11 item 4; §11 item 8 |
+| `git cat-file` | §11 item 2; §11 item 9 |
+| `git push` | §11 item 2; §11 item 4; §11 item 9 |
+| `git clone` | §11 item 2; §11 item 9; §11 item 10 |
+| `git checkout` | §11 item 2; §11 item 9; §11 item 10 |
+| `git merge-index` | §11 item 2; §11 item 4 |
+| `git filter-branch` | §11 item 2; §11 item 4 |
+| `git bisect` | §11 item 2; §11 item 4; §11 item 9 |
+| `git rebase` | §11 item 2; §11 item 4; §11 item 9 |
+| `git submodule` | §11 item 2; §11 item 4; §11 item 9 |
+| `git difftool` | §11 item 2; §11 item 4; §11 item 9 |
+| `git mergetool` | §11 item 2; §11 item 4 |
+| `cargo` | §11 item 2; §11 item 4; §11 item 8 |
+| `cargo test` | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo build` | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo run` | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo check` | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo bench` | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo doc` | §11 item 2; §11 item 8; §11 item 9 |
+| `cargo clippy` | §11 item 2; §11 item 8; §11 item 9 |
+| `pipx` | §11 item 2; §11 item 4; §11 item 8 |
+| `pipx run` | §11 item 2; §11 item 4; §11 item 8 |
+| `cd` | §11 item 2 |
 | `find` | §11 item 2; §11 item 4; §11 item 9; §11 item 10 |
-| `cp` | §11 item 10 |
-| `mv` | §11 item 10 |
-| `rsync` | §11 item 10 |
+| `ln` | §11 item 2 |
+| `cp` | §11 item 2; §11 item 10 |
+| `mv` | §11 item 2; §11 item 10 |
+| `rsync` | §11 item 2; §11 item 10 |
 | `tar` | §11 item 2; §11 item 9; §11 item 10 |
-| `unzip` | §11 item 9; §11 item 10 |
-| `chmod` | §11 item 9 |
-| `chown` | §11 item 9 |
-| `chgrp` | §11 item 9 |
-| `echo` | §11 item 9 |
+| `unzip` | §11 item 2; §11 item 9; §11 item 10 |
+| `rm` | §11 item 2 |
+| `tee` | §11 item 2 |
+| `touch` | §11 item 2 |
+| `chmod` | §11 item 2; §11 item 9 |
+| `chown` | §11 item 2; §11 item 9 |
+| `chgrp` | §11 item 2; §11 item 9 |
+| `truncate` | §11 item 2 |
+| `install` | §11 item 2 |
+| `mkdir` | §11 item 2 |
+| `rmdir` | §11 item 2 |
+| `unlink` | §11 item 2 |
+| `shred` | §11 item 2 |
+| `patch` | §11 item 2 |
+| `wipefs` | §11 item 2 |
+| `blkdiscard` | §11 item 2 |
+| `ed` | §11 item 2 |
+| `ex` | §11 item 2 |
+| `diff` | §11 item 2 |
+| `cmp` | §11 item 2 |
+| `md5` | §11 item 2 |
+| `md5sum` | §11 item 2 |
+| `shasum` | §11 item 2 |
+| `sha1sum` | §11 item 2 |
+| `sha256sum` | §11 item 2 |
+| `readlink` | §11 item 2 |
+| `realpath` | §11 item 2 |
+| `basename` | §11 item 2 |
+| `dirname` | §11 item 2 |
+| `nl` | §11 item 2 |
+| `od` | §11 item 2 |
+| `hexdump` | §11 item 2 |
+| `strings` | §11 item 2 |
+| `bat` | §11 item 2 |
+| `column` | §11 item 2 |
+| `fold` | §11 item 2 |
+| `expand` | §11 item 2 |
+| `less` | §11 item 2 |
+| `more` | §11 item 2 |
+| `cut` | §11 item 2 |
+| `sort` | §11 item 2 |
+| `uniq` | §11 item 2 |
+| `xxd` | §11 item 2 |
+| `echo` | §11 item 2; §11 item 9 |
 | `printf` | §11 item 2; §11 item 9 |
-| `whereis` | §11 item 9 |
-| `type` | §11 item 9 |
-| `tr` | §11 item 9 |
-| `true` | §11 item 9 |
-| `false` | §11 item 9 |
-| `id` | §11 item 9 |
-| `jq` | §11 item 9 |
-| `codesign` | §11 item 9 |
-| `awk` | §11 item 4; §11 item 8 |
-| `gawk` | §11 item 4; §11 item 8 |
-| `mawk` | §11 item 4; §11 item 8 |
-| `sed` | §11 item 4; §11 item 8 |
-| `perl` | §11 item 4; §11 item 8 |
-| `python` | §11 item 4; §11 item 8 |
-| `python3` | §11 item 4; §11 item 8 |
-| `node` | §11 item 4; §11 item 8 |
-| `ruby` | §11 item 4; §11 item 8 |
-| `eval` | §11 item 4 |
-| `source` | §11 item 4; §11 item 8 |
-| `.` | §11 item 4; §11 item 8 |
-| `npx` | §11 item 4; §11 item 8 |
-| `xargs` | §11 item 4 |
-| `ssh` | §11 item 4; §11 item 9 |
-| `mosh` | §11 item 4; §11 item 9 |
-| `autossh` | §11 item 4; §11 item 9 |
-| `nsenter` | §11 item 4 |
-| `unshare` | §11 item 4 |
-| `docker` | §11 item 4; §11 item 9 |
-| `podman` | §11 item 4; §11 item 9 |
-| `nerdctl` | §11 item 4; §11 item 9 |
-| `kubectl` | §11 item 4; §11 item 9 |
-| `oc` | §11 item 4; §11 item 9 |
-| `lxc` | §11 item 4; §11 item 9 |
-| `incus` | §11 item 4; §11 item 9 |
-| `machinectl` | §11 item 4; §11 item 9 |
-| `systemd-run` | §11 item 4 |
-| `systemd-nspawn` | §11 item 4 |
-| `firejail` | §11 item 4 |
-| `bwrap` | §11 item 4 |
-| `flatpak-spawn` | §11 item 4 |
-| `toolbox` | §11 item 4; §11 item 9 |
-| `distrobox` | §11 item 4; §11 item 9 |
-| `distrobox-enter` | §11 item 4; §11 item 9 |
-| `multipass` | §11 item 4; §11 item 9 |
-| `vagrant` | §11 item 4; §11 item 9 |
-| `limactl` | §11 item 4; §11 item 9 |
-| `colima` | §11 item 4; §11 item 9 |
-| `runuser` | §11 item 4; §11 item 9 |
-| `setpriv` | §11 item 4 |
-| `parallel` | §11 item 4 |
+| `whereis` | §11 item 2; §11 item 9 |
+| `type` | §11 item 2; §11 item 9 |
+| `tr` | §11 item 2; §11 item 9 |
+| `true` | §11 item 2; §11 item 9 |
+| `false` | §11 item 2; §11 item 9 |
+| `id` | §11 item 2; §11 item 9 |
+| `test` | §11 item 2 |
+| `[` | §11 item 2 |
+| `jq` | §11 item 2; §11 item 9 |
+| `mdls` | §11 item 2 |
+| `open` | §11 item 2 |
+| `spctl` | §11 item 2 |
+| `mdfind` | §11 item 2 |
+| `codesign` | §11 item 2; §11 item 9 |
+| `awk` | §11 item 2; §11 item 4 |
+| `gawk` | §11 item 2; §11 item 4 |
+| `mawk` | §11 item 2; §11 item 4 |
+| `sed` | §11 item 2; §11 item 4; §11 item 8 |
+| `perl` | §11 item 2; §11 item 4; §11 item 8 |
+| `python` | §11 item 2; §11 item 4; §11 item 8 |
+| `python3` | §11 item 2; §11 item 4; §11 item 8 |
+| `node` | §11 item 2; §11 item 4; §11 item 8 |
+| `ruby` | §11 item 2; §11 item 4; §11 item 8 |
+| `eval` | §11 item 2; §11 item 4 |
+| `source` | §11 item 2; §11 item 4; §11 item 8 |
+| `.` | §11 item 2; §11 item 4; §11 item 8 |
+| `npx` | §11 item 2; §11 item 4; §11 item 8 |
+| `xargs` | §11 item 2; §11 item 4 |
+| `ssh` | §11 item 2; §11 item 4; §11 item 9 |
+| `mosh` | §11 item 2; §11 item 4; §11 item 9 |
+| `autossh` | §11 item 2; §11 item 4; §11 item 9 |
+| `nsenter` | §11 item 2; §11 item 4 |
+| `unshare` | §11 item 2; §11 item 4 |
+| `docker` | §11 item 2; §11 item 4; §11 item 9 |
+| `podman` | §11 item 2; §11 item 4; §11 item 9 |
+| `nerdctl` | §11 item 2; §11 item 4; §11 item 9 |
+| `kubectl` | §11 item 2; §11 item 4; §11 item 9 |
+| `oc` | §11 item 2; §11 item 4; §11 item 9 |
+| `lxc` | §11 item 2; §11 item 4; §11 item 9 |
+| `incus` | §11 item 2; §11 item 4; §11 item 9 |
+| `machinectl` | §11 item 2; §11 item 4; §11 item 9 |
+| `systemd-run` | §11 item 2; §11 item 4 |
+| `systemd-nspawn` | §11 item 2; §11 item 4 |
+| `firejail` | §11 item 2; §11 item 4 |
+| `bwrap` | §11 item 2; §11 item 4 |
+| `flatpak-spawn` | §11 item 2; §11 item 4 |
+| `toolbox` | §11 item 2; §11 item 4; §11 item 9 |
+| `distrobox` | §11 item 2; §11 item 4; §11 item 9 |
+| `distrobox-enter` | §11 item 2; §11 item 4; §11 item 9 |
+| `multipass` | §11 item 2; §11 item 4; §11 item 9 |
+| `vagrant` | §11 item 2; §11 item 4; §11 item 9 |
+| `limactl` | §11 item 2; §11 item 4; §11 item 9 |
+| `colima` | §11 item 2; §11 item 4; §11 item 9 |
+| `runuser` | §11 item 2; §11 item 4; §11 item 9 |
+| `setpriv` | §11 item 2; §11 item 4 |
+| `parallel` | §11 item 2; §11 item 4 |
+| `curl` | §11 item 2 |
+| `wget` | §11 item 2 |
+| `fetch` | §11 item 2 |
 | `zsh` (outside model) | §11 item 4 |
 | `ksh` (outside model) | §11 item 4 |
 | `fish` (outside model) | §11 item 4 |
