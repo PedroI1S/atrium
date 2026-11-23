@@ -724,7 +724,16 @@ pub(crate) fn expand_shell_glob_impl(
                                             hit_cap = true;
                                             false
                                         }
-                                        Err(_) => false,
+                                        Err(ResolveError::NotFound) => false,
+                                        Err(_) => {
+                                            push_unique_unread(
+                                                &mut expansion.unread,
+                                                UnreadReason::UnresolvablePath {
+                                                    path: next.clone(),
+                                                },
+                                            );
+                                            false
+                                        }
                                     }
                                 }
                                 Ok(_) | Err(ResolveError::NotFound) => false,

@@ -1205,7 +1205,18 @@ pub(crate) fn check_filter_on_root(
                                     capped = true;
                                     false
                                 }
-                                Err(_) => false,
+                                Err(ResolveError::NotFound) => false,
+                                Err(_) => {
+                                    outcomes.push(PartResult {
+                                        part: filter_part.clone(),
+                                        outcome: PartOutcome::Unread(
+                                            UnreadReason::UnresolvablePath {
+                                                path: entry_full.clone(),
+                                            },
+                                        ),
+                                    });
+                                    false
+                                }
                             }
                         }
                         Ok(_) | Err(ResolveError::NotFound) => false,
@@ -1752,7 +1763,16 @@ fn walk_hard_links(
                 });
                 return Ok(());
             }
-            Err(ResolveError::NotFound | ResolveError::Io(_)) => continue,
+            Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => continue,
+            // An unreadable folder is not the local cutoff: the walk did not
+            // cover it, so it is Unread (§2, §8).
+            Err(ResolveError::Io(_)) => {
+                outcomes.push(PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
+                });
+                continue;
+            }
         };
 
         for entry in entries {
@@ -1842,7 +1862,17 @@ fn walk_hard_links(
                             });
                             return Ok(());
                         }
-                        Err(ResolveError::NotFound | ResolveError::Io(_)) => {}
+                        Err(
+                            ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory),
+                        ) => {}
+                        Err(ResolveError::Io(_)) => {
+                            outcomes.push(PartResult {
+                                part: part.clone(),
+                                outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                                    path: child,
+                                }),
+                            });
+                        }
                     }
                 }
                 FileType::Symlink | FileType::Other => {}
