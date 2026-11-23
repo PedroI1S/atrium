@@ -150,6 +150,105 @@ fn map_rustix_file_type(ft: rustix::fs::FileType) -> Option<FileType> {
     }
 }
 
+/// Longest path the kernel returns from `readlink` or `realpath`
+/// (`PATH_MAX`): 1,024 bytes on Apple platforms, 4,096 elsewhere.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const PATH_MAX: usize = 1024;
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const PATH_MAX: usize = 4096;
+
+/// `rustix` and `std` copy a path into a heap `CString` when it does not fit
+/// their stack buffers (256 bytes in `rustix`, 384 in `std`). Charges that
+/// copy before the call that makes it (§8).
+fn charge_path_conversion(path: &[u8], budget: &mut ComputeBudget) -> Result<(), ResolveError> {
+    if path.len() >= 256 {
+        budget.charge_alloc(path.len() + 1)?;
+    }
+    Ok(())
+}
+
+/// Charges one auxiliary metadata call made inside another operation: the
+/// `stat` cap and its compute, before the call (§8, round-2 finding 4).
+fn charge_aux_stat(
+    name_len: usize,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+) -> Result<(), ResolveError> {
+    caps.charge_stat()?;
+    budget.charge(name_len.max(1) as u64)?;
+    Ok(())
+}
+
+/// Pushes `entry` onto `out`, charging the vector's growth before it
+/// reallocates (the name's own bytes are charged by the caller, before the
+/// name is copied).
+fn push_entry_charged(
+    out: &mut Vec<DirEntry>,
+    entry: DirEntry,
+    budget: &mut ComputeBudget,
+) -> Result<(), ResolveError> {
+    if out.len() == out.capacity() {
+        let new_cap = out.capacity().saturating_mul(2).max(8);
+        budget.charge_alloc(new_cap.saturating_mul(std::mem::size_of::<DirEntry>()))?;
+        out.reserve_exact(new_cap - out.len());
+    }
+    out.push(entry);
+    Ok(())
+}
+
+/// Canonicalizes through `/proc/self/fd`: `open(O_PATH)` follows every link
+/// without reading metadata, and the kernel writes the real path into a
+/// stack buffer, so the result is charged at its exact size before the
+/// `Vec` that holds it is allocated. Returns `Ok(None)` when `/proc` cannot
+/// answer (not mounted, or a path outside the process root), and the caller
+/// falls back.
+#[cfg(target_os = "linux")]
+fn canonicalize_via_proc(
+    p: &Path,
+    budget: &mut ComputeBudget,
+) -> Result<Option<Vec<u8>>, ResolveError> {
+    use rustix::fs::{CWD, Mode, OFlags, open, readlinkat_raw};
+
+    let fd =
+        open(p, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).map_err(|e| map_errno(e, false))?;
+    // "/proc/self/fd/" + decimal fd + NUL, built on the stack.
+    let mut link = [0u8; 40];
+    let prefix = b"/proc/self/fd/";
+    link[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0u8; 20];
+    let mut n = {
+        use std::os::fd::AsRawFd;
+        u64::try_from(fd.as_raw_fd()).map_err(|_| ResolveError::Io(FsIoError::Other))?
+    };
+    let mut d = 0usize;
+    loop {
+        digits[d] = b'0' + (n % 10) as u8;
+        d += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let mut end = prefix.len();
+    for i in (0..d).rev() {
+        link[end] = digits[i];
+        end += 1;
+    }
+    let Ok(link_cstr) = std::ffi::CStr::from_bytes_with_nul(&link[..=end]) else {
+        return Ok(None);
+    };
+    let mut buf = [0u8; PATH_MAX];
+    let Ok(len) = readlinkat_raw(CWD, link_cstr, &mut buf) else {
+        return Ok(None);
+    };
+    if len == 0 || len >= PATH_MAX || buf[0] != b'/' {
+        return Ok(None);
+    }
+    budget.charge(len as u64)?;
+    budget.charge_alloc(len)?;
+    Ok(Some(buf[..len].to_vec()))
+}
+
 impl PathResolver for FsResolver {
     fn stat(
         &self,
@@ -159,6 +258,7 @@ impl PathResolver for FsResolver {
     ) -> Result<PathMetadata, ResolveError> {
         caps.charge_stat()?;
         budget.charge(path.len().max(1) as u64)?;
+        charge_path_conversion(path, budget)?;
         let p = bytes_to_path(path)?;
         let md = std::fs::metadata(p).map_err(|e| map_io_error(&e, false))?;
         Ok(map_metadata(&md))
@@ -172,6 +272,7 @@ impl PathResolver for FsResolver {
     ) -> Result<PathMetadata, ResolveError> {
         caps.charge_stat()?;
         budget.charge(path.len().max(1) as u64)?;
+        charge_path_conversion(path, budget)?;
         let p = bytes_to_path(path)?;
         let md = std::fs::symlink_metadata(p).map_err(|e| map_io_error(&e, false))?;
         Ok(map_metadata(&md))
@@ -185,40 +286,32 @@ impl PathResolver for FsResolver {
     ) -> Result<Vec<u8>, ResolveError> {
         caps.charge_link_read()?;
         budget.charge(path.len().max(1) as u64)?;
+        charge_path_conversion(path, budget)?;
         let p = bytes_to_path(path)?;
         #[cfg(unix)]
         {
-            // Stack-only lstat discovers existence, symlink kind, and exact
-            // target byte length (`st_size`) before any heap allocation occurs.
-            let md = std::fs::symlink_metadata(p).map_err(|e| map_io_error(&e, false))?;
-            if !md.file_type().is_symlink() {
-                return Err(ResolveError::Io(FsIoError::NotASymlink));
+            // `readlink` writes into a stack buffer of `PATH_MAX` bytes (no
+            // metadata call, no heap growth); `EINVAL` means "not a link".
+            // The target is then charged at its exact size before the `Vec`
+            // holding it is allocated (§8, round-2 findings 4 and 5).
+            let mut buf = [0u8; PATH_MAX];
+            let len = rustix::fs::readlinkat_raw(rustix::fs::CWD, p, &mut buf)
+                .map_err(|e| map_errno(e, true))?;
+            if len >= PATH_MAX {
+                // Truncated: a target this long cannot be resolved anyway.
+                return Err(ResolveError::Io(FsIoError::Other));
             }
-            let st_size = usize::try_from(md.len()).unwrap_or(usize::MAX);
-            let reserve = if st_size > 0 {
-                st_size.saturating_add(1)
-            } else {
-                256
-            };
-            budget.charge_alloc(reserve)?;
-            let buf = Vec::with_capacity(reserve);
-            let target = rustix::fs::readlink(p, buf).map_err(|e| map_errno(e, true))?;
-            let bytes = target.into_bytes();
-            if bytes.len() > reserve {
-                budget.charge_alloc(bytes.len() - reserve)?;
-            }
-            Ok(bytes)
+            budget.charge(len as u64)?;
+            budget.charge_alloc(len)?;
+            Ok(buf[..len].to_vec())
         }
         #[cfg(not(unix))]
         {
-            let reserve = path.len().max(64);
-            budget.charge_alloc(reserve)?;
+            // `std::fs::read_link` allocates its result before returning it,
+            // so the largest result is charged first.
+            budget.charge_alloc(PATH_MAX.saturating_mul(2))?;
             let target = std::fs::read_link(p).map_err(|e| map_io_error(&e, true))?;
-            let bytes = path_to_bytes(&target);
-            if bytes.len() > reserve {
-                budget.charge_alloc(bytes.len() - reserve)?;
-            }
-            Ok(bytes.to_vec())
+            Ok(path_to_bytes(&target).to_vec())
         }
     }
 
@@ -230,18 +323,22 @@ impl PathResolver for FsResolver {
     ) -> Result<Vec<u8>, ResolveError> {
         caps.charge_canonicalize()?;
         budget.charge(path.len().max(1) as u64)?;
+        charge_path_conversion(path, budget)?;
         let p = bytes_to_path(path)?;
-        // Stack-only metadata checks avoid heap allocation for missing/inaccessible
-        // paths and provide a lower bound on symlink target length before
-        // canonicalizing.
-        let link_hint = match std::fs::symlink_metadata(p) {
-            Ok(md) if md.file_type().is_symlink() => usize::try_from(md.len()).unwrap_or(0),
-            Ok(_) => 0,
-            Err(e) => return Err(map_io_error(&e, false)),
-        };
-        let _ = std::fs::metadata(p).map_err(|e| map_io_error(&e, false))?;
-        let reserve = path.len().max(link_hint).max(1);
-        budget.charge_alloc(reserve)?;
+        #[cfg(target_os = "linux")]
+        if let Some(real) = canonicalize_via_proc(p, budget)? {
+            return Ok(real);
+        }
+        // Fallback (no `/proc`, or another platform): `realpath` allocates a
+        // buffer of at most `PATH_MAX` bytes and `std` copies the result into
+        // a `Vec` of the same bound, so both are charged before the call; its
+        // internal metadata calls are not visible here, so one `stat` per
+        // component of `path` is charged first (round-2 finding 4).
+        let components = path.split(|&b| b == b'/').filter(|c| !c.is_empty()).count();
+        for _ in 0..components.max(1) {
+            charge_aux_stat(path.len(), caps, budget)?;
+        }
+        budget.charge_alloc(PATH_MAX.saturating_mul(2))?;
         let canon = std::fs::canonicalize(p).map_err(|e| map_io_error(&e, false))?;
         #[cfg(unix)]
         let bytes = {
@@ -250,9 +347,6 @@ impl PathResolver for FsResolver {
         };
         #[cfg(not(unix))]
         let bytes = path_to_bytes(&canon).to_vec();
-        if bytes.len() > reserve {
-            budget.charge_alloc(bytes.len() - reserve)?;
-        }
         Ok(bytes)
     }
 
@@ -264,6 +358,7 @@ impl PathResolver for FsResolver {
     ) -> Result<Vec<DirEntry>, ResolveError> {
         caps.charge_dir_open()?;
         budget.charge(path.len().max(1) as u64)?;
+        charge_path_conversion(path, budget)?;
         let p = bytes_to_path(path)?;
         #[cfg(unix)]
         {
@@ -277,7 +372,7 @@ impl PathResolver for FsResolver {
             .map_err(|e| map_errno(e, false))?;
             let mut stack_buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
             let mut raw_dir = RawDir::new(&dir_fd, &mut stack_buf);
-            let mut out = Vec::new();
+            let mut out: Vec<DirEntry> = Vec::new();
             loop {
                 // Charge entry read and work BEFORE advancing the directory iterator.
                 caps.charge_entries_read(1)?;
@@ -292,29 +387,34 @@ impl PathResolver for FsResolver {
                     continue;
                 }
                 budget.charge(name_bytes.len().saturating_sub(1) as u64)?;
-                budget.charge_alloc(std::mem::size_of::<DirEntry>() + name_bytes.len())?;
                 let file_type = match map_rustix_file_type(entry.file_type()) {
                     Some(ft) => ft,
                     None => {
+                        // `DT_UNKNOWN`: one `fstatat`, charged first (round-2 finding 4).
+                        charge_aux_stat(name_bytes.len(), caps, budget)?;
                         let st = statat(&dir_fd, name_cstr, AtFlags::SYMLINK_NOFOLLOW)
                             .map_err(|e| map_errno(e, false))?;
                         map_rustix_file_type(rustix::fs::FileType::from_raw_mode(st.st_mode))
                             .unwrap_or(FileType::Other)
                     }
                 };
+                budget.charge_alloc(name_bytes.len())?;
                 let mut name = Vec::with_capacity(name_bytes.len());
                 name.extend_from_slice(name_bytes);
-                out.push(DirEntry { name, file_type });
+                push_entry_charged(&mut out, DirEntry { name, file_type }, budget)?;
             }
             Ok(out)
         }
         #[cfg(not(unix))]
         {
             let mut rd = std::fs::read_dir(p).map_err(|e| map_io_error(&e, false))?;
-            let mut out = Vec::new();
+            let mut out: Vec<DirEntry> = Vec::new();
             loop {
                 caps.charge_entries_read(1)?;
                 budget.charge(1)?;
+                // `std` allocates the entry (and its name) while advancing,
+                // so the largest name is charged first.
+                budget.charge_alloc(PATH_MAX)?;
                 let Some(entry_res) = rd.next() else {
                     break;
                 };
@@ -322,12 +422,17 @@ impl PathResolver for FsResolver {
                 let os_name = entry.file_name();
                 let name_bytes = path_to_bytes(Path::new(&os_name));
                 budget.charge(name_bytes.len().saturating_sub(1) as u64)?;
-                budget.charge_alloc(std::mem::size_of::<DirEntry>() + name_bytes.len())?;
+                charge_aux_stat(name_bytes.len(), caps, budget)?;
                 let ft = entry.file_type().map_err(|e| map_io_error(&e, false))?;
-                out.push(DirEntry {
-                    name: name_bytes.to_vec(),
-                    file_type: map_file_type(ft),
-                });
+                budget.charge_alloc(name_bytes.len())?;
+                push_entry_charged(
+                    &mut out,
+                    DirEntry {
+                        name: name_bytes.to_vec(),
+                        file_type: map_file_type(ft),
+                    },
+                    budget,
+                )?;
             }
             Ok(out)
         }
