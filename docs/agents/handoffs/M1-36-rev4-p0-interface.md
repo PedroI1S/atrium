@@ -450,3 +450,28 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast
 ```
+
+
+---
+
+## Round 6 (D-142, CR-P2-1)
+
+Added the write-only hard-deny identity field to `ProtectedSet` per driver decision D-142 (accepting P2's change request CR-P2-1), so standalone `v4::paths::check_target(target, protected, budget)` can return `HardDeny` for writes through hard-linked aliases of write-only protected files without hard-denying reads. No other types or tool-table rows were changed.
+
+### Field and `HARD_DENY_DEFAULTS` ids
+- **Field:** `ProtectedSet::write_only_hard_deny_identities: Vec<(FileIdentity, &'static str)>` (placed immediately after `ProtectedSet::hard_deny_identities`, whose doc comment now specifies read+write protection and points to `write_only_hard_deny_identities`).
+- **Checked when:** `target.access != AccessMode::Read` (contract §5, D-142).
+- **Exact `HARD_DENY_DEFAULTS` ids (verified against `crates/atrium-protocol/src/policy.rs`, `crates/atrium-core/src/policy/deny.rs`, and `crates/atrium-core/src/policy/gate.rs`):**
+  - `"credential-read"` for `~/.ssh/config` and `~/.ssh/authorized_keys`
+  - `"atrium-self"` for `atrium_protected_paths` and their member files
+
+### Files touched
+- `crates/atrium-core/src/policy/model.rs`: added `ProtectedSet::write_only_hard_deny_identities`, updated `ProtectedSet::hard_deny_identities` doc comment, and added the `protected_set_separates_read_write_and_write_only_hard_deny_identities` interface unit test.
+- `docs/agents/handoffs/M1-36-rev4-p0-interface.md`: added this Round 6 section.
+
+### Round 6 verification
+
+Run by worker (allowed under D-123):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
