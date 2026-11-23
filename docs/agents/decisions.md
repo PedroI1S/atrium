@@ -900,3 +900,12 @@ The table keeps only these row kinds:
 - it is never Home-eligible.
 
 That never allows more than `dev` does, and it removes per-tool semantics as a source of findings. This narrows what the annex lists. The contract text is unchanged: §6 already says a form not in the table is outside the model, and §4 says how an unknown tool is checked.
+
+## D-142 — 2026-11-23 — rodrigo: P2 escalates to Opus 5.5; CR-P2-1 amends P0 before it merges
+**Decided by rodrigo (driver), on the orchestrator's recommendation.**
+
+1. **P2 (M1-38) escalates (PLAN §8.3, §8.4).** Its two Neon rework rounds left majors: 14 findings, then 9 (`reviews/M1-38-rev4-p2-paths.md`, `-round2.md`). Round 3 is written by **Opus 5.5**, as a Claude subagent in P2's worktree, with the same brief, the handoff and both reviews. Codex GPT-6.1 Sol stays the reviewer, from another provider.
+2. **CR-P2-1 is accepted.** P0's `ProtectedSet` (`policy/model.rs`) gains `write_only_hard_deny_identities`: the identities of existing write-only protected files (`~/.ssh/config`, `~/.ssh/authorized_keys`, Atrium's protected paths and their members), each with its hard-deny id, checked only when the target's access is not Read (contract §5). Without it a standalone `check_target` with Write access through a hard link returns Clear, and Codex confirmed the gap is real under the frozen interface.
+   - P0 (M1-36) gets a short amendment round (the field, its docs, the stubs and tests that build a `ProtectedSet`), then a Codex review, before P0 merges.
+   - P1 and P2 are rebased onto P0's amended tip.
+   - P0's merge still needs rodrigo's go (D-138).
