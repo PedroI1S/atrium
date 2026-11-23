@@ -1357,10 +1357,7 @@ pub(crate) fn check_filter_on_root(
             let Ok(tree_rel) = std::str::from_utf8(tree_rel_bytes) else {
                 continue;
             };
-            for (idx, _) in pat_trimmed.match_indices('/') {
-                if idx == 0 {
-                    continue;
-                }
+            for idx in ask_tree_prefix_ends(pat_trimmed, tree_rel, budget)? {
                 let dir_pat = &pat_trimmed[..idx];
                 if let Ok(m) = build_glob_matcher(dir_pat, true, budget)? {
                     budget.charge(tree_rel.len().max(1) as u64)?;
@@ -1382,6 +1379,63 @@ pub(crate) fn check_filter_on_root(
     }
 
     Ok(())
+}
+
+/// The end offsets of the directory prefixes of `pat` (split at `/` outside
+/// braces) that `dev`'s `ASK_TREES` prefix rule tries against `tree_rel`,
+/// found in one linear pass so the matchers built stay bounded (§8).
+///
+/// With a literal separator and components that are never empty, every
+/// non-empty segment that holds no `**` matches at least one component, so a
+/// prefix with more such segments than `tree_rel` has components cannot match,
+/// and neither can any longer prefix: the scan stops there. A prefix ending in
+/// an empty segment, or in a `**` segment right after another one, is
+/// equivalent to or stricter than the prefix before it and is skipped. At most
+/// `2 * components + 2` prefixes are returned.
+fn ask_tree_prefix_ends(
+    pat: &str,
+    tree_rel: &str,
+    budget: &mut ComputeBudget,
+) -> Result<Vec<usize>, Exhausted> {
+    let tree_comps = tree_rel.split('/').filter(|c| !c.is_empty()).count();
+    budget.charge((pat.len() + tree_rel.len()).max(1) as u64)?;
+    budget.charge_alloc((2 * tree_comps + 2) * std::mem::size_of::<usize>())?;
+    let bytes = pat.as_bytes();
+    let mut out = Vec::with_capacity(2 * tree_comps + 2);
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let mut seg_start = 0usize;
+    let mut counted = 0usize;
+    let mut prev_globstar = false;
+    for (idx, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match b {
+            b'\\' => escaped = true,
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b'/' if depth == 0 => {
+                let seg = &bytes[seg_start..idx];
+                seg_start = idx + 1;
+                let globstar = seg.windows(2).any(|w| w == b"**");
+                let skip = seg.is_empty() || (globstar && prev_globstar);
+                prev_globstar = globstar;
+                if !globstar && !seg.is_empty() {
+                    counted += 1;
+                    if counted > tree_comps {
+                        break;
+                    }
+                }
+                if idx > 0 && !skip && out.len() < out.capacity() {
+                    out.push(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

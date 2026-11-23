@@ -56,6 +56,12 @@ enum PatComp {
 
 /// Parses one path component's `(bytes, provenance)` into a [`PatComp`],
 /// rejecting unquoted negated character classes (`[!...]` / `[^...]`).
+///
+/// Linear in the component's length (§8, round-1 finding 12, round-2 finding
+/// 7): the bracket structure is computed once by [`BracketIndex::build`], so
+/// an unclosed `[` is decided in constant time and never rescans the
+/// remainder, nested or not (`[[:digit:]` repeated, `[` repeated), and each
+/// closed class body is scanned once.
 fn parse_component(
     bytes: &[u8],
     prov: &[ByteProvenance],
@@ -76,11 +82,21 @@ fn parse_component(
         && prov[0] == ByteProvenance::Unquoted
         && prov[1] == ByteProvenance::Unquoted;
 
+    let has_unquoted_bracket = bytes
+        .iter()
+        .zip(prov)
+        .any(|(&b, &p)| p == ByteProvenance::Unquoted && b == b'[');
+    let index = if has_unquoted_bracket {
+        Some(BracketIndex::build(bytes, prov, budget)?)
+    } else {
+        None
+    };
+
     budget.charge_alloc(bytes.len() * std::mem::size_of::<CompAtom>())?;
     let mut atoms: Vec<CompAtom> = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
-    let mut skip_brackets_until = 0usize;
     while i < bytes.len() {
+        budget.charge(1)?;
         let b = bytes[i];
         let p = prov[i];
         if p != ByteProvenance::Unquoted {
@@ -100,26 +116,22 @@ fn parse_component(
                 i += 1;
             }
             b'[' => {
-                if i < skip_brackets_until {
+                let Some(index) = index.as_ref() else {
                     atoms.push(CompAtom::Literal(b'['));
                     i += 1;
-                } else {
-                    match parse_bracket_class(bytes, prov, i, budget)? {
-                        BracketParse::Class(table, next_i) => {
-                            atoms.push(CompAtom::Class(table));
-                            i = next_i;
-                        }
-                        BracketParse::Unread(unread) => return Ok(Err(unread)),
-                        BracketParse::Unclosed {
-                            next_possible_bracket,
-                        } => {
-                            // Unclosed `[` is treated as a literal `[`; advance
-                            // `skip_brackets_until` so subsequent unclosed `[` bytes
-                            // never rescan the same suffix (§8).
-                            atoms.push(CompAtom::Literal(b'['));
-                            skip_brackets_until = skip_brackets_until.max(next_possible_bracket);
-                            i += 1;
-                        }
+                    continue;
+                };
+                match parse_bracket_class(bytes, prov, i, index, budget)? {
+                    BracketParse::Class(table, next_i) => {
+                        atoms.push(CompAtom::Class(table));
+                        i = next_i;
+                    }
+                    BracketParse::Unread(unread) => return Ok(Err(unread)),
+                    BracketParse::Unclosed => {
+                        // An unclosed `[` is a literal `[`; the next `[` is
+                        // decided from the index, without rescanning (§8).
+                        atoms.push(CompAtom::Literal(b'['));
+                        i += 1;
                     }
                 }
             }
@@ -138,8 +150,8 @@ fn parse_component(
     }))
 }
 
-/// Parses an unquoted `[...]` class starting at `start`. Returns `Ok(None)` if
-/// no matching unquoted `]` closes the class.
+/// Adds the bytes of the POSIX class `[:name:]` to `table`. Returns `false`
+/// for an unknown name.
 fn add_posix_class(table: &mut [u64; 4], name: &[u8]) -> bool {
     let pred: fn(u8) -> bool = match name {
         b"alnum" => |b| b.is_ascii_alphanumeric(),
@@ -166,56 +178,104 @@ fn add_posix_class(table: &mut [u64; 4], name: &[u8]) -> bool {
     true
 }
 
-fn scan_posix_bracket_item(
-    bytes: &[u8],
-    prov: &[ByteProvenance],
-    pos: usize,
-    budget: &mut ComputeBudget,
-) -> Result<Option<usize>, Exhausted> {
-    if pos + 3 >= bytes.len() || bytes[pos] != b'[' || prov[pos] != ByteProvenance::Unquoted {
-        return Ok(None);
-    }
-    let delim = bytes[pos + 1];
-    if prov[pos + 1] != ByteProvenance::Unquoted || !matches!(delim, b':' | b'=' | b'.') {
-        return Ok(None);
-    }
-    let mut scan = pos + 2;
-    while scan + 1 < bytes.len() {
-        budget.charge(1)?;
-        if bytes[scan] == b'[' && prov[scan] == ByteProvenance::Unquoted {
-            return Ok(None);
+/// Sentinel for "no position" in [`BracketIndex`].
+const NO_POS: u32 = u32::MAX;
+
+/// The bracket structure of one component, computed in two right-to-left
+/// passes (§8).
+struct BracketIndex {
+    /// For an unquoted `[` at `p` followed by an unquoted `:`, `=` or `.`
+    /// (a bracket item such as `[:alpha:]`): the position just past its
+    /// matching `<delim>]`, or `NO_POS`. An item never spans an unquoted `[`,
+    /// so each item's search covers the bytes up to the next `[` only, and
+    /// those spans are disjoint.
+    item_end: Vec<u32>,
+    /// For each position `j` (and `len`): where a class-body scan starting at
+    /// `j` meets its closing unquoted `]`, skipping whole bracket items, or
+    /// `NO_POS`. A scan's result depends only on its position, so every scan
+    /// shares this table.
+    close_from: Vec<u32>,
+}
+
+impl BracketIndex {
+    fn build(
+        bytes: &[u8],
+        prov: &[ByteProvenance],
+        budget: &mut ComputeBudget,
+    ) -> Result<Self, Exhausted> {
+        let n = bytes.len();
+        // Two passes over the component, plus each item's disjoint span.
+        budget.charge((n as u64).saturating_mul(3).saturating_add(1))?;
+        budget.charge_alloc((2 * n + 1).saturating_mul(std::mem::size_of::<u32>()))?;
+        let unquoted = |k: usize, b: u8| bytes[k] == b && prov[k] == ByteProvenance::Unquoted;
+        let to_pos = |k: usize| u32::try_from(k).unwrap_or(NO_POS);
+
+        let mut item_end = vec![NO_POS; n];
+        let mut next_bracket = n; // the nearest unquoted `[` after the current position
+        for p in (0..n).rev() {
+            if unquoted(p, b'[')
+                && p + 3 < n
+                && prov[p + 1] == ByteProvenance::Unquoted
+                && matches!(bytes[p + 1], b':' | b'=' | b'.')
+            {
+                let delim = bytes[p + 1];
+                let mut s = p + 2;
+                while s + 1 < n && s < next_bracket {
+                    if unquoted(s, delim) && unquoted(s + 1, b']') {
+                        item_end[p] = to_pos(s + 2);
+                        break;
+                    }
+                    s += 1;
+                }
+            }
+            if unquoted(p, b'[') {
+                next_bracket = p;
+            }
         }
-        if bytes[scan] == delim
-            && prov[scan] == ByteProvenance::Unquoted
-            && bytes[scan + 1] == b']'
-            && prov[scan + 1] == ByteProvenance::Unquoted
-        {
-            return Ok(Some(scan + 2));
+
+        let mut close_from = vec![NO_POS; n + 1];
+        for j in (0..n).rev() {
+            close_from[j] = if unquoted(j, b']') {
+                to_pos(j)
+            } else if unquoted(j, b'[') && item_end[j] != NO_POS {
+                close_from[item_end[j] as usize]
+            } else {
+                close_from[j + 1]
+            };
         }
-        scan += 1;
+        Ok(Self {
+            item_end,
+            close_from,
+        })
     }
-    Ok(None)
+
+    fn item_end(&self, k: usize) -> Option<usize> {
+        self.item_end
+            .get(k)
+            .filter(|&&e| e != NO_POS)
+            .map(|&e| e as usize)
+    }
 }
 
 enum BracketParse {
     Class([u64; 4], usize),
     Unread(UnreadReason),
-    Unclosed { next_possible_bracket: usize },
+    Unclosed,
 }
 
+/// Parses the unquoted `[...]` class starting at `start` using `index`, in
+/// time linear in the class body (which the caller then skips).
 fn parse_bracket_class(
     bytes: &[u8],
     prov: &[ByteProvenance],
     start: usize,
+    index: &BracketIndex,
     budget: &mut ComputeBudget,
 ) -> Result<BracketParse, Exhausted> {
     let mut j = start + 1;
     if j >= bytes.len() {
-        return Ok(BracketParse::Unclosed {
-            next_possible_bracket: bytes.len(),
-        });
+        return Ok(BracketParse::Unclosed);
     }
-
     let body_start = j;
     let mut has_bang_or_caret = false;
     if prov[j] == ByteProvenance::Unquoted && matches!(bytes[j], b'!' | b'^') {
@@ -225,32 +285,29 @@ fn parse_bracket_class(
     if j < bytes.len() && bytes[j] == b']' {
         j += 1;
     }
-    let mut close = None;
-    let mut first_skipped_posix: Option<usize> = None;
-    while j < bytes.len() {
+    let close = index.close_from[j];
+    if close == NO_POS {
+        return Ok(BracketParse::Unclosed);
+    }
+    let end = close as usize;
+
+    // One pass over the body (bodies of closed classes are disjoint).
+    let mut k = j;
+    while k < end {
         budget.charge(1)?;
-        if bytes[j] == b'['
-            && prov[j] == ByteProvenance::Unquoted
-            && let Some(item_end) = scan_posix_bracket_item(bytes, prov, j, budget)?
+        if bytes[k] == b'['
+            && prov[k] == ByteProvenance::Unquoted
+            && let Some(item_end) = index.item_end(k)
+            && item_end <= end
         {
-            first_skipped_posix.get_or_insert(j);
-            j = item_end;
+            k = item_end;
             continue;
         }
-        if prov[j] == ByteProvenance::Unquoted && matches!(bytes[j], b'!' | b'^') {
+        if prov[k] == ByteProvenance::Unquoted && matches!(bytes[k], b'!' | b'^') {
             has_bang_or_caret = true;
         }
-        if bytes[j] == b']' && prov[j] == ByteProvenance::Unquoted {
-            close = Some(j);
-            break;
-        }
-        j += 1;
+        k += 1;
     }
-    let Some(end) = close else {
-        return Ok(BracketParse::Unclosed {
-            next_possible_bracket: first_skipped_posix.unwrap_or(bytes.len()),
-        });
-    };
     if has_bang_or_caret {
         return Ok(BracketParse::Unread(UnreadReason::NegatedGlobClass));
     }
@@ -261,7 +318,7 @@ fn parse_bracket_class(
         budget.charge(1)?;
         if bytes[k] == b'['
             && prov[k] == ByteProvenance::Unquoted
-            && let Some(item_end) = scan_posix_bracket_item(bytes, prov, k, budget)?
+            && let Some(item_end) = index.item_end(k)
             && item_end <= end
         {
             let delim = bytes[k + 1];
@@ -270,6 +327,7 @@ fn parse_bracket_class(
                 k = item_end;
                 continue;
             }
+            budget.charge_alloc(end + 1 - start)?;
             return Ok(BracketParse::Unread(UnreadReason::VariantOnlyGlobMatch {
                 pattern: bytes[start..=end].to_vec(),
             }));
@@ -278,6 +336,7 @@ fn parse_bracket_class(
         if k + 2 < end && bytes[k + 1] == b'-' && prov[k + 1] == ByteProvenance::Unquoted {
             let hi = bytes[k + 2];
             if c <= hi {
+                budget.charge(u64::from(hi - c) + 1)?;
                 for ch in c..=hi {
                     CompAtom::class_set(&mut table, ch);
                 }
