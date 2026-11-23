@@ -18,7 +18,7 @@ use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl};
 use crate::policy::v4::paths::sensitive::{
     ASK_FILES, ASK_NAME_PREFIXES, ASK_TREES, BROWSER_FILES, BROWSER_ROOTS, CRED_FILES, CRED_TREES,
     SharedSensitive, check_target_impl, fold_listed_component, fold_path_listed, join_folded,
-    origin_to_part, under_bytes, under_str,
+    origin_to_part, push_charged, under_bytes, under_str,
 };
 
 fn finish_recursive_exhausted(
@@ -53,6 +53,11 @@ pub(crate) fn check_recursive_root_impl(
 ) -> Result<RecursiveRootResult, Exhausted> {
     let root_part = origin_to_part(&root.origin);
     let mut result = RecursiveRootResult::default();
+    // Room for the root-level records (root Unread, root check, final Clear),
+    // charged before it is allocated; records pushed after a walk use
+    // `push_charged` (§8).
+    budget.charge_alloc(4 * std::mem::size_of::<PartResult>())?;
+    result.outcomes.reserve_exact(4);
 
     let (root_canon, root_multiply_linked) = match &root.resolution {
         TargetResolution::Unread(reason) => {
@@ -124,7 +129,7 @@ pub(crate) fn check_recursive_root_impl(
     //     `StoreHit` (§5, §10 row 16).
     if !s8_hit && let Some(family) = root_contains_store_or_exempt_sensitive(&folded_root, &shared)
     {
-        result.outcomes.push(PartResult {
+        let store_hit = PartResult {
             part: root_part.clone(),
             outcome: PartOutcome::StoreHit(Hit {
                 hard_deny_id: None,
@@ -132,17 +137,23 @@ pub(crate) fn check_recursive_root_impl(
                 matched: HitMatch::StoreFamily { family },
                 part: root_part.clone(),
             }),
-        });
+        };
+        if let Err(e) = push_charged(&mut result.outcomes, store_hit, budget) {
+            return finish_recursive_exhausted(result, root_part, e);
+        }
     }
 
     // 3. Search filters (§5): single supported filter -> enumerate selected
     //    entries + match probe names; multiple/negated/unsupported -> Unread.
     let filter_part = filter_part_id(&root.origin);
     if filters.len() > 1 {
-        result.outcomes.push(PartResult {
+        let unsupported = PartResult {
             part: filter_part,
             outcome: PartOutcome::Unread(UnreadReason::UnsupportedFilterForm),
-        });
+        };
+        if let Err(e) = push_charged(&mut result.outcomes, unsupported, budget) {
+            return finish_recursive_exhausted(result, root_part, e);
+        }
     } else if let Some(filter) = filters.first()
         && let Err(e) = check_filter_on_root(
             root_canon,
@@ -249,19 +260,27 @@ fn s8_read_dir_cached<'a>(
             Ok(entries) => Some(entries),
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => None,
             Err(ResolveError::Io(_)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
-                        path: dir.to_vec(),
-                    }),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                            path: dir.to_vec(),
+                        }),
+                    },
+                    budget,
+                )?;
                 None
             }
             Err(ResolveError::CapReached(c)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                    },
+                    budget,
+                )?;
                 None
             }
             Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -300,19 +319,27 @@ fn find_s8_folded_matches(
                 Ok(Vec::new())
             }
             Err(ResolveError::Io(_)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
-                        path: base.to_vec(),
-                    }),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                            path: base.to_vec(),
+                        }),
+                    },
+                    budget,
+                )?;
                 Ok(Vec::new())
             }
             Err(ResolveError::CapReached(c)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                    },
+                    budget,
+                )?;
                 Ok(Vec::new())
             }
             Err(ResolveError::Exhausted(e)) => Err(e),
@@ -337,18 +364,26 @@ fn find_s8_folded_matches(
                     }
                     Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {}
                     Err(ResolveError::Io(_)) => {
-                        outcomes.push(PartResult {
-                            part: part.clone(),
-                            outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
-                                path: cand,
-                            }),
-                        });
+                        push_charged(
+                            outcomes,
+                            PartResult {
+                                part: part.clone(),
+                                outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                                    path: cand,
+                                }),
+                            },
+                            budget,
+                        )?;
                     }
                     Err(ResolveError::CapReached(c)) => {
-                        outcomes.push(PartResult {
-                            part: part.clone(),
-                            outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                        });
+                        push_charged(
+                            outcomes,
+                            PartResult {
+                                part: part.clone(),
+                                outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                            },
+                            budget,
+                        )?;
                     }
                     Err(ResolveError::Exhausted(e)) => return Err(e),
                 }
@@ -360,12 +395,16 @@ fn find_s8_folded_matches(
                 }
                 entries_seen += 1;
                 if entries_seen > limits::WALK_MAX_ENTRIES {
-                    outcomes.push(PartResult {
-                        part: part.clone(),
-                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
-                            FsCap::EntriesRead,
-                        )),
-                    });
+                    push_charged(
+                        outcomes,
+                        PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                                FsCap::EntriesRead,
+                            )),
+                        },
+                        budget,
+                    )?;
                     return Ok(Vec::new());
                 }
                 let folded = fold_listed_component(&entry.name, folds, budget)?;
@@ -404,16 +443,24 @@ fn check_s8_protected_root(
         return Ok(false);
     }
 
-    let push_hit = |outcomes: &mut Vec<PartResult>, id: &'static str, path: Vec<u8>| {
-        outcomes.push(PartResult {
-            part: part.clone(),
-            outcome: PartOutcome::HardDenyHit(Hit {
-                hard_deny_id: Some(id),
-                source: HitSource::Model,
-                matched: HitMatch::ProtectedPath { path },
+    let push_hit = |outcomes: &mut Vec<PartResult>,
+                    id: &'static str,
+                    path: Vec<u8>,
+                    budget: &mut ComputeBudget|
+     -> Result<(), Exhausted> {
+        push_charged(
+            outcomes,
+            PartResult {
                 part: part.clone(),
-            }),
-        });
+                outcome: PartOutcome::HardDenyHit(Hit {
+                    hard_deny_id: Some(id),
+                    source: HitSource::Model,
+                    matched: HitMatch::ProtectedPath { path },
+                    part: part.clone(),
+                }),
+            },
+            budget,
+        )
     };
 
     // Helper: check if `candidate` exists via `lstat`, recording I/O or cap Unreads.
@@ -427,19 +474,27 @@ fn check_s8_protected_root(
             Ok(_) => Ok(true),
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => Ok(false),
             Err(ResolveError::Io(_)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
-                        path: cand.to_vec(),
-                    }),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                            path: cand.to_vec(),
+                        }),
+                    },
+                    budget,
+                )?;
                 Ok(false)
             }
             Err(ResolveError::CapReached(c)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                    },
+                    budget,
+                )?;
                 Ok(false)
             }
             Err(ResolveError::Exhausted(e)) => Err(e),
@@ -456,7 +511,7 @@ fn check_s8_protected_root(
     {
         if let Some(suffix_bytes) = under_bytes(folded_d, folded_root) {
             if check_exists(raw_d, resolver, caps, budget, outcomes)? {
-                push_hit(outcomes, "atrium-self", raw_d.clone());
+                push_hit(outcomes, "atrium-self", raw_d.clone(), budget)?;
                 return Ok(true);
             }
             if let Ok(suffix_str) = std::str::from_utf8(suffix_bytes) {
@@ -472,7 +527,7 @@ fn check_s8_protected_root(
                     &mut dir_cache,
                 )?;
                 if let Some(found) = matches.into_iter().next() {
-                    push_hit(outcomes, "atrium-self", found);
+                    push_hit(outcomes, "atrium-self", found, budget)?;
                     return Ok(true);
                 }
             }
@@ -487,7 +542,7 @@ fn check_s8_protected_root(
     {
         if let Some(suffix_bytes) = under_bytes(folded_d, folded_root) {
             if check_exists(raw_d, resolver, caps, budget, outcomes)? {
-                push_hit(outcomes, "credential-read", raw_d.clone());
+                push_hit(outcomes, "credential-read", raw_d.clone(), budget)?;
                 return Ok(true);
             }
             if let Ok(suffix_str) = std::str::from_utf8(suffix_bytes) {
@@ -503,7 +558,7 @@ fn check_s8_protected_root(
                     &mut dir_cache,
                 )?;
                 if let Some(found) = matches.into_iter().next() {
-                    push_hit(outcomes, "credential-read", found);
+                    push_hit(outcomes, "credential-read", found, budget)?;
                     return Ok(true);
                 }
             }
@@ -532,7 +587,7 @@ fn check_s8_protected_root(
                 &mut dir_cache,
             )?;
             if let Some(found) = matches.into_iter().next() {
-                push_hit(outcomes, "credential-read", found);
+                push_hit(outcomes, "credential-read", found, budget)?;
                 return Ok(true);
             }
         }
@@ -552,7 +607,7 @@ fn check_s8_protected_root(
                 &mut dir_cache,
             )?;
             if let Some(found) = matches.into_iter().next() {
-                push_hit(outcomes, "credential-read", found);
+                push_hit(outcomes, "credential-read", found, budget)?;
                 return Ok(true);
             }
         }
@@ -564,7 +619,7 @@ fn check_s8_protected_root(
         if let Some(found) = dir_has_existing_hard_deny_ssh_entry(
             root_canon, protected, shared, resolver, caps, budget, part, outcomes,
         )? {
-            push_hit(outcomes, "credential-read", found);
+            push_hit(outcomes, "credential-read", found, budget)?;
             return Ok(true);
         }
     } else if let Some(suffix) = under_str(".ssh", root_rel) {
@@ -583,7 +638,7 @@ fn check_s8_protected_root(
             if let Some(found) = dir_has_existing_hard_deny_ssh_entry(
                 &ssh_root, protected, shared, resolver, caps, budget, part, outcomes,
             )? {
-                push_hit(outcomes, "credential-read", found);
+                push_hit(outcomes, "credential-read", found, budget)?;
                 return Ok(true);
             }
         }
@@ -608,7 +663,7 @@ fn check_s8_protected_root(
                 if let Some(found) = browser_dir_has_existing_cred(
                     &b_path, protected, resolver, caps, budget, part, outcomes,
                 )? {
-                    push_hit(outcomes, "credential-read", found);
+                    push_hit(outcomes, "credential-read", found, budget)?;
                     return Ok(true);
                 }
             }
@@ -619,25 +674,33 @@ fn check_s8_protected_root(
                     if let Some(found) = browser_dir_has_existing_cred(
                         root_canon, protected, resolver, caps, budget, part, outcomes,
                     )? {
-                        push_hit(outcomes, "credential-read", found);
+                        push_hit(outcomes, "credential-read", found, budget)?;
                         return Ok(true);
                     }
                 }
                 Ok(_)
                 | Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {}
                 Err(ResolveError::Io(_)) => {
-                    outcomes.push(PartResult {
-                        part: part.clone(),
-                        outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
-                            path: root_canon.to_vec(),
-                        }),
-                    });
+                    push_charged(
+                        outcomes,
+                        PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                                path: root_canon.to_vec(),
+                            }),
+                        },
+                        budget,
+                    )?;
                 }
                 Err(ResolveError::CapReached(c)) => {
-                    outcomes.push(PartResult {
-                        part: part.clone(),
-                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                    });
+                    push_charged(
+                        outcomes,
+                        PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                        },
+                        budget,
+                    )?;
                 }
                 Err(ResolveError::Exhausted(e)) => return Err(e),
             }
@@ -667,17 +730,25 @@ fn dir_has_existing_hard_deny_ssh_entry(
             Ok(e) => e,
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => continue,
             Err(ResolveError::Io(_)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
+                    },
+                    budget,
+                )?;
                 continue;
             }
             Err(ResolveError::CapReached(c)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                    },
+                    budget,
+                )?;
                 return Ok(None);
             }
             Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -688,10 +759,16 @@ fn dir_has_existing_hard_deny_ssh_entry(
             }
             seen += 1;
             if seen > limits::WALK_MAX_ENTRIES {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(FsCap::EntriesRead)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                            FsCap::EntriesRead,
+                        )),
+                    },
+                    budget,
+                )?;
                 return Ok(None);
             }
             let child_len = dir.len() + 1 + entry.name.len();
@@ -711,12 +788,16 @@ fn dir_has_existing_hard_deny_ssh_entry(
                     stack.push((child, depth + 1));
                 } else if !emitted_depth_cap {
                     emitted_depth_cap = true;
-                    outcomes.push(PartResult {
-                        part: part.clone(),
-                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
-                            FsCap::WalkDepth,
-                        )),
-                    });
+                    push_charged(
+                        outcomes,
+                        PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                                FsCap::WalkDepth,
+                            )),
+                        },
+                        budget,
+                    )?;
                 }
             }
         }
@@ -746,17 +827,25 @@ fn browser_dir_has_existing_cred(
             Ok(e) => e,
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => continue,
             Err(ResolveError::Io(_)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
+                    },
+                    budget,
+                )?;
                 continue;
             }
             Err(ResolveError::CapReached(c)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                    },
+                    budget,
+                )?;
                 return Ok(None);
             }
             Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -767,10 +856,16 @@ fn browser_dir_has_existing_cred(
             }
             seen += 1;
             if seen > limits::WALK_MAX_ENTRIES {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(FsCap::EntriesRead)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                            FsCap::EntriesRead,
+                        )),
+                    },
+                    budget,
+                )?;
                 return Ok(None);
             }
             budget.charge(entry.name.len().max(1) as u64)?;
@@ -788,12 +883,16 @@ fn browser_dir_has_existing_cred(
                     stack.push((join_bytes(&dir, &entry.name), depth + 1));
                 } else if !emitted_depth_cap {
                     emitted_depth_cap = true;
-                    outcomes.push(PartResult {
-                        part: part.clone(),
-                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
-                            FsCap::WalkDepth,
-                        )),
-                    });
+                    push_charged(
+                        outcomes,
+                        PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                                FsCap::WalkDepth,
+                            )),
+                        },
+                        budget,
+                    )?;
                 }
             }
         }
@@ -1066,10 +1165,14 @@ pub(crate) fn check_filter_on_root(
     let compiled = match compile_filter(filter, budget)? {
         Ok(c) => c,
         Err(reason) => {
-            outcomes.push(PartResult {
-                part: filter_part.clone(),
-                outcome: PartOutcome::Unread(reason),
-            });
+            push_charged(
+                outcomes,
+                PartResult {
+                    part: filter_part.clone(),
+                    outcome: PartOutcome::Unread(reason),
+                },
+                budget,
+            )?;
             return Ok(());
         }
     };
@@ -1094,10 +1197,16 @@ pub(crate) fn check_filter_on_root(
         if depth >= max_depth {
             if (recursive || compiled.has_globstar) && !emitted_depth_cap {
                 emitted_depth_cap = true;
-                outcomes.push(PartResult {
-                    part: filter_part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(FsCap::WalkDepth)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: filter_part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                            FsCap::WalkDepth,
+                        )),
+                    },
+                    budget,
+                )?;
             }
             continue;
         }
@@ -1105,17 +1214,25 @@ pub(crate) fn check_filter_on_root(
             Ok(e) => e,
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => continue,
             Err(ResolveError::Io(_)) => {
-                outcomes.push(PartResult {
-                    part: filter_part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: filter_part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
+                    },
+                    budget,
+                )?;
                 continue;
             }
             Err(ResolveError::CapReached(c)) => {
-                outcomes.push(PartResult {
-                    part: filter_part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: filter_part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                    },
+                    budget,
+                )?;
                 break;
             }
             Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -1128,10 +1245,16 @@ pub(crate) fn check_filter_on_root(
             }
             entries_seen += 1;
             if entries_seen > limits::WALK_MAX_ENTRIES {
-                outcomes.push(PartResult {
-                    part: filter_part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(FsCap::EntriesRead)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: filter_part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                            FsCap::EntriesRead,
+                        )),
+                    },
+                    budget,
+                )?;
                 capped = true;
                 break;
             }
@@ -1177,15 +1300,19 @@ pub(crate) fn check_filter_on_root(
                     }
                     let res = check_target_impl(&resolved, protected, budget)?;
                     if !matches!(res.outcome, PartOutcome::Clear) {
-                        outcomes.push(res);
+                        push_charged(outcomes, res, budget)?;
                     }
                 }
                 Ok(false) => {}
                 Err(unread) => {
-                    outcomes.push(PartResult {
-                        part: filter_part.clone(),
-                        outcome: PartOutcome::Unread(unread),
-                    });
+                    push_charged(
+                        outcomes,
+                        PartResult {
+                            part: filter_part.clone(),
+                            outcome: PartOutcome::Unread(unread),
+                        },
+                        budget,
+                    )?;
                 }
             }
 
@@ -1198,42 +1325,58 @@ pub(crate) fn check_filter_on_root(
                                 Ok(canon) => visited_symlink_dirs.insert(canon),
                                 Err(ResolveError::Exhausted(e)) => return Err(e),
                                 Err(ResolveError::CapReached(c)) => {
-                                    outcomes.push(PartResult {
-                                        part: filter_part.clone(),
-                                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                                    });
+                                    push_charged(
+                                        outcomes,
+                                        PartResult {
+                                            part: filter_part.clone(),
+                                            outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                                        },
+                                        budget,
+                                    )?;
                                     capped = true;
                                     false
                                 }
                                 Err(ResolveError::NotFound) => false,
                                 Err(_) => {
-                                    outcomes.push(PartResult {
-                                        part: filter_part.clone(),
-                                        outcome: PartOutcome::Unread(
-                                            UnreadReason::UnresolvablePath {
-                                                path: entry_full.clone(),
-                                            },
-                                        ),
-                                    });
+                                    push_charged(
+                                        outcomes,
+                                        PartResult {
+                                            part: filter_part.clone(),
+                                            outcome: PartOutcome::Unread(
+                                                UnreadReason::UnresolvablePath {
+                                                    path: entry_full.clone(),
+                                                },
+                                            ),
+                                        },
+                                        budget,
+                                    )?;
                                     false
                                 }
                             }
                         }
                         Ok(_) | Err(ResolveError::NotFound) => false,
                         Err(ResolveError::Io(_)) => {
-                            outcomes.push(PartResult {
-                                part: filter_part.clone(),
-                                outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
-                                    path: entry_full.clone(),
-                                }),
-                            });
+                            push_charged(
+                                outcomes,
+                                PartResult {
+                                    part: filter_part.clone(),
+                                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                                        path: entry_full.clone(),
+                                    }),
+                                },
+                                budget,
+                            )?;
                             false
                         }
                         Err(ResolveError::CapReached(c)) => {
-                            outcomes.push(PartResult {
-                                part: filter_part.clone(),
-                                outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                            });
+                            push_charged(
+                                outcomes,
+                                PartResult {
+                                    part: filter_part.clone(),
+                                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                                },
+                                budget,
+                            )?;
                             capped = true;
                             false
                         }
@@ -1252,10 +1395,16 @@ pub(crate) fn check_filter_on_root(
                 && !emitted_depth_cap
             {
                 emitted_depth_cap = true;
-                outcomes.push(PartResult {
-                    part: filter_part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(FsCap::WalkDepth)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: filter_part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                            FsCap::WalkDepth,
+                        )),
+                    },
+                    budget,
+                )?;
             }
         }
         if capped {
@@ -1301,17 +1450,21 @@ pub(crate) fn check_filter_on_root(
         };
         let name = rel_str.rsplit('/').next().unwrap_or(rel_str);
         if probe_matcher.matches_probe(rel_str, name, recursive, budget)? {
-            outcomes.push(PartResult {
-                part: filter_part.clone(),
-                outcome: PartOutcome::HardDenyHit(Hit {
-                    hard_deny_id: Some(hard_id),
-                    source: HitSource::BestEffort,
-                    matched: HitMatch::ProbeName {
-                        probe: String::from_utf8_lossy(&probe_bytes).into_owned(),
-                    },
+            push_charged(
+                outcomes,
+                PartResult {
                     part: filter_part.clone(),
-                }),
-            });
+                    outcome: PartOutcome::HardDenyHit(Hit {
+                        hard_deny_id: Some(hard_id),
+                        source: HitSource::BestEffort,
+                        matched: HitMatch::ProbeName {
+                            probe: String::from_utf8_lossy(&probe_bytes).into_owned(),
+                        },
+                        part: filter_part.clone(),
+                    }),
+                },
+                budget,
+            )?;
             break;
         }
     }
@@ -1327,17 +1480,21 @@ pub(crate) fn check_filter_on_root(
         };
         let name = rel_str.rsplit('/').next().unwrap_or(rel_str);
         if probe_matcher.matches_probe(rel_str, name, recursive, budget)? {
-            outcomes.push(PartResult {
-                part: filter_part.clone(),
-                outcome: PartOutcome::StoreHit(Hit {
-                    hard_deny_id: None,
-                    source: HitSource::Model,
-                    matched: HitMatch::ProbeName {
-                        probe: String::from_utf8_lossy(&probe_bytes).into_owned(),
-                    },
+            push_charged(
+                outcomes,
+                PartResult {
                     part: filter_part.clone(),
-                }),
-            });
+                    outcome: PartOutcome::StoreHit(Hit {
+                        hard_deny_id: None,
+                        source: HitSource::Model,
+                        matched: HitMatch::ProbeName {
+                            probe: String::from_utf8_lossy(&probe_bytes).into_owned(),
+                        },
+                        part: filter_part.clone(),
+                    }),
+                },
+                budget,
+            )?;
             store_probe_hit = true;
             break;
         }
@@ -1373,15 +1530,19 @@ pub(crate) fn check_filter_on_root(
                 if let Ok(m) = build_glob_matcher(dir_pat, true, budget)? {
                     budget.charge(tree_rel.len().max(1) as u64)?;
                     if m.is_match(tree_rel) {
-                        outcomes.push(PartResult {
-                            part: filter_part.clone(),
-                            outcome: PartOutcome::StoreHit(Hit {
-                                hard_deny_id: None,
-                                source: HitSource::Model,
-                                matched: HitMatch::StoreFamily { family },
+                        push_charged(
+                            outcomes,
+                            PartResult {
                                 part: filter_part.clone(),
-                            }),
-                        });
+                                outcome: PartOutcome::StoreHit(Hit {
+                                    hard_deny_id: None,
+                                    source: HitSource::Model,
+                                    matched: HitMatch::StoreFamily { family },
+                                    part: filter_part.clone(),
+                                }),
+                            },
+                            budget,
+                        )?;
                         break 'ask_tree;
                     }
                 }
@@ -1478,19 +1639,27 @@ fn walk_followed_links(
         }
         Err(ResolveError::NotFound) => {}
         Err(ResolveError::Io(_)) => {
-            outcomes.push(PartResult {
-                part: part.clone(),
-                outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
-                    path: root_canon.to_vec(),
-                }),
-            });
+            push_charged(
+                outcomes,
+                PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                        path: root_canon.to_vec(),
+                    }),
+                },
+                budget,
+            )?;
             return Ok(());
         }
         Err(ResolveError::CapReached(c)) => {
-            outcomes.push(PartResult {
-                part: part.clone(),
-                outcome: PartOutcome::Unread(UnreadReason::from(c)),
-            });
+            push_charged(
+                outcomes,
+                PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                },
+                budget,
+            )?;
             return Ok(());
         }
         Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -1505,17 +1674,25 @@ fn walk_followed_links(
             Ok(e) => e,
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => continue,
             Err(ResolveError::Io(_)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
+                    },
+                    budget,
+                )?;
                 continue;
             }
             Err(ResolveError::CapReached(c)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                    },
+                    budget,
+                )?;
                 return Ok(());
             }
             Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -1527,10 +1704,16 @@ fn walk_followed_links(
             }
             seen += 1;
             if seen > limits::WALK_MAX_ENTRIES {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(FsCap::EntriesRead)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                            FsCap::EntriesRead,
+                        )),
+                    },
+                    budget,
+                )?;
                 return Ok(());
             }
             budget.charge_alloc(dir.len() + entry.name.len() + 1)?;
@@ -1562,39 +1745,59 @@ fn walk_followed_links(
                     match checked.outcome {
                         PartOutcome::HardDenyHit(hit) => {
                             if has_filter {
-                                outcomes.push(PartResult {
-                                    part: part.clone(),
-                                    outcome: PartOutcome::Unread(
-                                        UnreadReason::FollowedLinkUnderFilter { path: child },
-                                    ),
-                                });
+                                push_charged(
+                                    outcomes,
+                                    PartResult {
+                                        part: part.clone(),
+                                        outcome: PartOutcome::Unread(
+                                            UnreadReason::FollowedLinkUnderFilter { path: child },
+                                        ),
+                                    },
+                                    budget,
+                                )?;
                             } else {
-                                outcomes.push(PartResult {
-                                    part: part.clone(),
-                                    outcome: PartOutcome::HardDenyHit(hit),
-                                });
+                                push_charged(
+                                    outcomes,
+                                    PartResult {
+                                        part: part.clone(),
+                                        outcome: PartOutcome::HardDenyHit(hit),
+                                    },
+                                    budget,
+                                )?;
                             }
                         }
                         PartOutcome::StoreHit(hit) => {
                             if has_filter {
-                                outcomes.push(PartResult {
-                                    part: part.clone(),
-                                    outcome: PartOutcome::Unread(
-                                        UnreadReason::FollowedLinkUnderFilter { path: child },
-                                    ),
-                                });
+                                push_charged(
+                                    outcomes,
+                                    PartResult {
+                                        part: part.clone(),
+                                        outcome: PartOutcome::Unread(
+                                            UnreadReason::FollowedLinkUnderFilter { path: child },
+                                        ),
+                                    },
+                                    budget,
+                                )?;
                             } else {
-                                outcomes.push(PartResult {
-                                    part: part.clone(),
-                                    outcome: PartOutcome::StoreHit(hit),
-                                });
+                                push_charged(
+                                    outcomes,
+                                    PartResult {
+                                        part: part.clone(),
+                                        outcome: PartOutcome::StoreHit(hit),
+                                    },
+                                    budget,
+                                )?;
                             }
                         }
                         PartOutcome::Unread(reason) => {
-                            outcomes.push(PartResult {
-                                part: part.clone(),
-                                outcome: PartOutcome::Unread(reason),
-                            });
+                            push_charged(
+                                outcomes,
+                                PartResult {
+                                    part: part.clone(),
+                                    outcome: PartOutcome::Unread(reason),
+                                },
+                                budget,
+                            )?;
                         }
                         PartOutcome::Clear
                         | PartOutcome::Exhausted(_)
@@ -1624,14 +1827,18 @@ fn walk_followed_links(
                         )?;
                         if s8 {
                             if has_filter {
-                                outcomes.push(PartResult {
-                                    part: part.clone(),
-                                    outcome: PartOutcome::Unread(
-                                        UnreadReason::FollowedLinkUnderFilter {
-                                            path: canonical.clone(),
-                                        },
-                                    ),
-                                });
+                                push_charged(
+                                    outcomes,
+                                    PartResult {
+                                        part: part.clone(),
+                                        outcome: PartOutcome::Unread(
+                                            UnreadReason::FollowedLinkUnderFilter {
+                                                path: canonical.clone(),
+                                            },
+                                        ),
+                                    },
+                                    budget,
+                                )?;
                             } else {
                                 outcomes.extend(link_s8_outcomes);
                             }
@@ -1642,24 +1849,32 @@ fn walk_followed_links(
                                 root_contains_store_or_exempt_sensitive(&folded, shared)
                             {
                                 if has_filter {
-                                    outcomes.push(PartResult {
-                                        part: part.clone(),
-                                        outcome: PartOutcome::Unread(
-                                            UnreadReason::FollowedLinkUnderFilter {
-                                                path: canonical.clone(),
-                                            },
-                                        ),
-                                    });
-                                } else {
-                                    outcomes.push(PartResult {
-                                        part: part.clone(),
-                                        outcome: PartOutcome::StoreHit(Hit {
-                                            hard_deny_id: None,
-                                            source: HitSource::Model,
-                                            matched: HitMatch::StoreFamily { family },
+                                    push_charged(
+                                        outcomes,
+                                        PartResult {
                                             part: part.clone(),
-                                        }),
-                                    });
+                                            outcome: PartOutcome::Unread(
+                                                UnreadReason::FollowedLinkUnderFilter {
+                                                    path: canonical.clone(),
+                                                },
+                                            ),
+                                        },
+                                        budget,
+                                    )?;
+                                } else {
+                                    push_charged(
+                                        outcomes,
+                                        PartResult {
+                                            part: part.clone(),
+                                            outcome: PartOutcome::StoreHit(Hit {
+                                                hard_deny_id: None,
+                                                source: HitSource::Model,
+                                                matched: HitMatch::StoreFamily { family },
+                                                part: part.clone(),
+                                            }),
+                                        },
+                                        budget,
+                                    )?;
                                 }
                             }
                         }
@@ -1673,12 +1888,18 @@ fn walk_followed_links(
                                     if depth + 1 >= limits::WALK_MAX_DEPTH {
                                         if !emitted_depth_cap {
                                             emitted_depth_cap = true;
-                                            outcomes.push(PartResult {
-                                                part: part.clone(),
-                                                outcome: PartOutcome::Unread(
-                                                    UnreadReason::WalkCapReached(FsCap::WalkDepth),
-                                                ),
-                                            });
+                                            push_charged(
+                                                outcomes,
+                                                PartResult {
+                                                    part: part.clone(),
+                                                    outcome: PartOutcome::Unread(
+                                                        UnreadReason::WalkCapReached(
+                                                            FsCap::WalkDepth,
+                                                        ),
+                                                    ),
+                                                },
+                                                budget,
+                                            )?;
                                         }
                                     } else {
                                         stack.push((canonical, depth + 1));
@@ -1687,18 +1908,26 @@ fn walk_followed_links(
                             }
                             Ok(_) | Err(ResolveError::NotFound) => {}
                             Err(ResolveError::Io(_)) => {
-                                outcomes.push(PartResult {
-                                    part: part.clone(),
-                                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
-                                        path: canonical,
-                                    }),
-                                });
+                                push_charged(
+                                    outcomes,
+                                    PartResult {
+                                        part: part.clone(),
+                                        outcome: PartOutcome::Unread(
+                                            UnreadReason::UnresolvablePath { path: canonical },
+                                        ),
+                                    },
+                                    budget,
+                                )?;
                             }
                             Err(ResolveError::CapReached(c)) => {
-                                outcomes.push(PartResult {
-                                    part: part.clone(),
-                                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                                });
+                                push_charged(
+                                    outcomes,
+                                    PartResult {
+                                        part: part.clone(),
+                                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                                    },
+                                    budget,
+                                )?;
                                 return Ok(());
                             }
                             Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -1709,12 +1938,16 @@ fn walk_followed_links(
                     if depth + 1 >= limits::WALK_MAX_DEPTH {
                         if !emitted_depth_cap {
                             emitted_depth_cap = true;
-                            outcomes.push(PartResult {
-                                part: part.clone(),
-                                outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
-                                    FsCap::WalkDepth,
-                                )),
-                            });
+                            push_charged(
+                                outcomes,
+                                PartResult {
+                                    part: part.clone(),
+                                    outcome: PartOutcome::Unread(UnreadReason::WalkCapReached(
+                                        FsCap::WalkDepth,
+                                    )),
+                                },
+                                budget,
+                            )?;
                         }
                     } else if visited_paths.insert(child.clone()) {
                         stack.push((child, depth + 1));
@@ -1757,20 +1990,28 @@ fn walk_hard_links(
             // Global `FsCaps` failures are Unread (§8); only the local hard-link
             // cutoff (`HARD_LINK_WALK_ENTRIES` / `HARD_LINK_WALK_DEPTH`) counts as clear.
             Err(ResolveError::CapReached(c)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                    },
+                    budget,
+                )?;
                 return Ok(());
             }
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => continue,
             // An unreadable folder is not the local cutoff: the walk did not
             // cover it, so it is Unread (§2, §8).
             Err(ResolveError::Io(_)) => {
-                outcomes.push(PartResult {
-                    part: part.clone(),
-                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
-                });
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: dir }),
+                    },
+                    budget,
+                )?;
                 continue;
             }
         };
@@ -1826,29 +2067,39 @@ fn walk_hard_links(
                                         )
                                         .find(|(pid, _)| *pid == id)
                                     {
-                                        outcomes.push(PartResult {
-                                            part: part.clone(),
-                                            outcome: PartOutcome::HardDenyHit(Hit {
-                                                hard_deny_id: Some(hard_id),
-                                                source: HitSource::Model,
-                                                matched: HitMatch::ProtectedPath { path: child },
+                                        push_charged(
+                                            outcomes,
+                                            PartResult {
                                                 part: part.clone(),
-                                            }),
-                                        });
+                                                outcome: PartOutcome::HardDenyHit(Hit {
+                                                    hard_deny_id: Some(hard_id),
+                                                    source: HitSource::Model,
+                                                    matched: HitMatch::ProtectedPath {
+                                                        path: child,
+                                                    },
+                                                    part: part.clone(),
+                                                }),
+                                            },
+                                            budget,
+                                        )?;
                                     } else if let Some((_, family)) = protected
                                         .store_identities
                                         .iter()
                                         .find(|(pid, _)| *pid == id)
                                     {
-                                        outcomes.push(PartResult {
-                                            part: part.clone(),
-                                            outcome: PartOutcome::StoreHit(Hit {
-                                                hard_deny_id: None,
-                                                source: HitSource::Model,
-                                                matched: HitMatch::StoreFamily { family },
+                                        push_charged(
+                                            outcomes,
+                                            PartResult {
                                                 part: part.clone(),
-                                            }),
-                                        });
+                                                outcome: PartOutcome::StoreHit(Hit {
+                                                    hard_deny_id: None,
+                                                    source: HitSource::Model,
+                                                    matched: HitMatch::StoreFamily { family },
+                                                    part: part.clone(),
+                                                }),
+                                            },
+                                            budget,
+                                        )?;
                                     }
                                 }
                             }
@@ -1856,22 +2107,30 @@ fn walk_hard_links(
                         Ok(_) => {}
                         Err(ResolveError::Exhausted(e)) => return Err(e),
                         Err(ResolveError::CapReached(c)) => {
-                            outcomes.push(PartResult {
-                                part: part.clone(),
-                                outcome: PartOutcome::Unread(UnreadReason::from(c)),
-                            });
+                            push_charged(
+                                outcomes,
+                                PartResult {
+                                    part: part.clone(),
+                                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                                },
+                                budget,
+                            )?;
                             return Ok(());
                         }
                         Err(
                             ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory),
                         ) => {}
                         Err(ResolveError::Io(_)) => {
-                            outcomes.push(PartResult {
-                                part: part.clone(),
-                                outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
-                                    path: child,
-                                }),
-                            });
+                            push_charged(
+                                outcomes,
+                                PartResult {
+                                    part: part.clone(),
+                                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                                        path: child,
+                                    }),
+                                },
+                                budget,
+                            )?;
                         }
                     }
                 }

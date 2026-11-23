@@ -16,7 +16,7 @@ use crate::policy::v4::paths::glob::expand_shell_glob_impl;
 use crate::policy::v4::paths::recursive::{check_filter_on_root, check_recursive_root_impl};
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl, resolve_word_literal};
 use crate::policy::v4::paths::sensitive::{
-    SharedSensitive, check_target_impl, fold_path_listed, origin_to_part, under_bytes,
+    SharedSensitive, check_target_impl, fold_path_listed, origin_to_part, push_charged, under_bytes,
 };
 
 #[derive(Debug, Clone)]
@@ -37,8 +37,7 @@ fn push_checked(
     outcomes: &mut Vec<PartResult>,
 ) -> Result<(), Exhausted> {
     let checked = check_target_impl(target, protected, budget)?;
-    budget.charge_alloc(std::mem::size_of::<PartResult>())?;
-    outcomes.push(checked);
+    push_charged(outcomes, checked, budget)?;
     Ok(())
 }
 
@@ -55,6 +54,8 @@ fn finish_call_exhausted(
         .iter()
         .any(|r| matches!(r.outcome, PartOutcome::Exhausted(_)))
     {
+        // Recording the exhaustion itself cannot be charged (the budget is
+        // spent): it is one bounded record.
         out.outcomes.push(PartResult {
             part,
             outcome: PartOutcome::Exhausted(e.reason),
@@ -70,6 +71,8 @@ fn ensure_exhausted_recorded(out: &mut ResolvedCallPaths, part: PartId, budget: 
             .iter()
             .any(|r| matches!(r.outcome, PartOutcome::Exhausted(_)))
     {
+        // Recording the exhaustion itself cannot be charged (the budget is
+        // spent): it is one bounded record.
         out.outcomes.push(PartResult {
             part,
             outcome: PartOutcome::Exhausted(reason),
@@ -233,11 +236,18 @@ fn exec_unit_sequence(
         let mut saw_explicit_recursive_root = false;
         let mut mv_source_is_dir = false;
 
-        if matches!(cwd_state, CwdState::Unknown) {
-            ctx.out.outcomes.push(PartResult {
-                part: PartId::Unit(unit.index),
-                outcome: PartOutcome::Unread(UnreadReason::UnknownCwd),
-            });
+        if matches!(cwd_state, CwdState::Unknown)
+            && let Err(err) = push_charged(
+                &mut ctx.out.outcomes,
+                PartResult {
+                    part: PartId::Unit(unit.index),
+                    outcome: PartOutcome::Unread(UnreadReason::UnknownCwd),
+                },
+                ctx.budget,
+            )
+        {
+            ctx.exhausted_err = Some((PartId::WholeCall, err));
+            return;
         }
 
         // Resolve operands according to ToolEffects roles & access modes.
@@ -275,10 +285,17 @@ fn exec_unit_sequence(
             }
 
             if ctx.out.targets.len() >= limits::MAX_PATHS {
-                ctx.out.outcomes.push(PartResult {
-                    part: PartId::WholeCall,
-                    outcome: PartOutcome::TooLarge(Cap::Paths),
-                });
+                if let Err(err) = push_charged(
+                    &mut ctx.out.outcomes,
+                    PartResult {
+                        part: PartId::WholeCall,
+                        outcome: PartOutcome::TooLarge(Cap::Paths),
+                    },
+                    ctx.budget,
+                ) {
+                    ctx.exhausted_err = Some((PartId::WholeCall, err));
+                    return;
+                }
                 ctx.stopped_too_large = true;
                 return;
             }
@@ -302,10 +319,17 @@ fn exec_unit_sequence(
                             access,
                             resolution: TargetResolution::Unread(UnreadReason::UnknownCwd),
                         };
-                        ctx.out.outcomes.push(PartResult {
-                            part,
-                            outcome: PartOutcome::Unread(UnreadReason::UnknownCwd),
-                        });
+                        if let Err(err) = push_charged(
+                            &mut ctx.out.outcomes,
+                            PartResult {
+                                part,
+                                outcome: PartOutcome::Unread(UnreadReason::UnknownCwd),
+                            },
+                            ctx.budget,
+                        ) {
+                            ctx.exhausted_err = Some((PartId::WholeCall, err));
+                            return;
+                        }
                         ctx.out.targets.push(unread_t);
                         continue;
                     }
@@ -337,17 +361,31 @@ fn exec_unit_sequence(
                     }
                 };
                 for unread in exp.unread {
-                    ctx.out.outcomes.push(PartResult {
-                        part: part.clone(),
-                        outcome: PartOutcome::Unread(unread),
-                    });
+                    if let Err(err) = push_charged(
+                        &mut ctx.out.outcomes,
+                        PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::Unread(unread),
+                        },
+                        ctx.budget,
+                    ) {
+                        ctx.exhausted_err = Some((PartId::WholeCall, err));
+                        return;
+                    }
                 }
                 for target in exp.exact_matches {
                     if ctx.out.targets.len() >= limits::MAX_PATHS {
-                        ctx.out.outcomes.push(PartResult {
-                            part: PartId::WholeCall,
-                            outcome: PartOutcome::TooLarge(Cap::Paths),
-                        });
+                        if let Err(err) = push_charged(
+                            &mut ctx.out.outcomes,
+                            PartResult {
+                                part: PartId::WholeCall,
+                                outcome: PartOutcome::TooLarge(Cap::Paths),
+                            },
+                            ctx.budget,
+                        ) {
+                            ctx.exhausted_err = Some((PartId::WholeCall, err));
+                            return;
+                        }
                         ctx.stopped_too_large = true;
                         return;
                     }
@@ -404,21 +442,35 @@ fn exec_unit_sequence(
                 let mut emitted_variant = false;
                 for target in exp.variant_only_matches {
                     if ctx.out.targets.len() >= limits::MAX_PATHS {
-                        ctx.out.outcomes.push(PartResult {
-                            part: PartId::WholeCall,
-                            outcome: PartOutcome::TooLarge(Cap::Paths),
-                        });
+                        if let Err(err) = push_charged(
+                            &mut ctx.out.outcomes,
+                            PartResult {
+                                part: PartId::WholeCall,
+                                outcome: PartOutcome::TooLarge(Cap::Paths),
+                            },
+                            ctx.budget,
+                        ) {
+                            ctx.exhausted_err = Some((PartId::WholeCall, err));
+                            return;
+                        }
                         ctx.stopped_too_large = true;
                         return;
                     }
                     if !emitted_variant {
                         emitted_variant = true;
-                        ctx.out.outcomes.push(PartResult {
-                            part: part.clone(),
-                            outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
-                                pattern: word.literal_bytes().to_vec(),
-                            }),
-                        });
+                        if let Err(err) = push_charged(
+                            &mut ctx.out.outcomes,
+                            PartResult {
+                                part: part.clone(),
+                                outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
+                                    pattern: word.literal_bytes().to_vec(),
+                                }),
+                            },
+                            ctx.budget,
+                        ) {
+                            ctx.exhausted_err = Some((PartId::WholeCall, err));
+                            return;
+                        }
                     }
                     ctx.out.targets.push(target);
                 }
@@ -561,10 +613,17 @@ fn exec_unit_sequence(
                 continue;
             };
             if ctx.out.targets.len() >= limits::MAX_PATHS {
-                ctx.out.outcomes.push(PartResult {
-                    part: PartId::WholeCall,
-                    outcome: PartOutcome::TooLarge(Cap::Paths),
-                });
+                if let Err(err) = push_charged(
+                    &mut ctx.out.outcomes,
+                    PartResult {
+                        part: PartId::WholeCall,
+                        outcome: PartOutcome::TooLarge(Cap::Paths),
+                    },
+                    ctx.budget,
+                ) {
+                    ctx.exhausted_err = Some((PartId::WholeCall, err));
+                    return;
+                }
                 ctx.stopped_too_large = true;
                 return;
             }
@@ -590,10 +649,17 @@ fn exec_unit_sequence(
                 CwdState::Known(c) => c.as_slice(),
                 CwdState::Unknown => {
                     if !is_absolute_or_tilde(target_word) {
-                        ctx.out.outcomes.push(PartResult {
-                            part,
-                            outcome: PartOutcome::Unread(UnreadReason::UnknownCwd),
-                        });
+                        if let Err(err) = push_charged(
+                            &mut ctx.out.outcomes,
+                            PartResult {
+                                part,
+                                outcome: PartOutcome::Unread(UnreadReason::UnknownCwd),
+                            },
+                            ctx.budget,
+                        ) {
+                            ctx.exhausted_err = Some((PartId::WholeCall, err));
+                            return;
+                        }
                         ctx.out.targets.push(Target {
                             origin,
                             access,
@@ -639,13 +705,20 @@ fn exec_unit_sequence(
                 DerivedDestinations::Always => true,
                 DerivedDestinations::WhenSourceIsDir => mv_source_is_dir,
             };
-            if derived {
-                ctx.out.outcomes.push(PartResult {
-                    part: PartId::Unit(unit.index),
-                    outcome: PartOutcome::Unread(UnreadReason::DerivedDestinations {
-                        tool: e.tool_name.unwrap_or("unknown").to_string(),
-                    }),
-                });
+            if derived
+                && let Err(err) = push_charged(
+                    &mut ctx.out.outcomes,
+                    PartResult {
+                        part: PartId::Unit(unit.index),
+                        outcome: PartOutcome::Unread(UnreadReason::DerivedDestinations {
+                            tool: e.tool_name.unwrap_or("unknown").to_string(),
+                        }),
+                    },
+                    ctx.budget,
+                )
+            {
+                ctx.exhausted_err = Some((PartId::WholeCall, err));
+                return;
             }
         }
 
@@ -654,38 +727,68 @@ fn exec_unit_sequence(
         // possible writer, are Unread (hard-deny hits already pushed still stand).
         if let Some(writer_unit) = pipeline_taint {
             if unit_target_parts.is_empty() {
-                if unit.index != writer_unit {
-                    ctx.out.outcomes.push(PartResult {
-                        part: PartId::Unit(unit.index),
-                        outcome: PartOutcome::Unread(UnreadReason::PipelineWithPossibleWriter {
-                            writer_unit,
-                        }),
-                    });
+                if unit.index != writer_unit
+                    && let Err(err) = push_charged(
+                        &mut ctx.out.outcomes,
+                        PartResult {
+                            part: PartId::Unit(unit.index),
+                            outcome: PartOutcome::Unread(
+                                UnreadReason::PipelineWithPossibleWriter { writer_unit },
+                            ),
+                        },
+                        ctx.budget,
+                    )
+                {
+                    ctx.exhausted_err = Some((PartId::WholeCall, err));
+                    return;
                 }
             } else {
                 for p in &unit_target_parts {
-                    ctx.out.outcomes.push(PartResult {
-                        part: p.clone(),
-                        outcome: PartOutcome::Unread(UnreadReason::PipelineWithPossibleWriter {
-                            writer_unit,
-                        }),
-                    });
+                    if let Err(err) = push_charged(
+                        &mut ctx.out.outcomes,
+                        PartResult {
+                            part: p.clone(),
+                            outcome: PartOutcome::Unread(
+                                UnreadReason::PipelineWithPossibleWriter { writer_unit },
+                            ),
+                        },
+                        ctx.budget,
+                    ) {
+                        ctx.exhausted_err = Some((PartId::WholeCall, err));
+                        return;
+                    }
                 }
             }
         } else if let Some(writer_unit) = after_writer_taint {
             if unit_target_parts.is_empty() {
-                ctx.out.outcomes.push(PartResult {
-                    part: PartId::Unit(unit.index),
-                    outcome: PartOutcome::Unread(UnreadReason::AfterPossibleWriter { writer_unit }),
-                });
-            } else {
-                for p in &unit_target_parts {
-                    ctx.out.outcomes.push(PartResult {
-                        part: p.clone(),
+                if let Err(err) = push_charged(
+                    &mut ctx.out.outcomes,
+                    PartResult {
+                        part: PartId::Unit(unit.index),
                         outcome: PartOutcome::Unread(UnreadReason::AfterPossibleWriter {
                             writer_unit,
                         }),
-                    });
+                    },
+                    ctx.budget,
+                ) {
+                    ctx.exhausted_err = Some((PartId::WholeCall, err));
+                    return;
+                }
+            } else {
+                for p in &unit_target_parts {
+                    if let Err(err) = push_charged(
+                        &mut ctx.out.outcomes,
+                        PartResult {
+                            part: p.clone(),
+                            outcome: PartOutcome::Unread(UnreadReason::AfterPossibleWriter {
+                                writer_unit,
+                            }),
+                        },
+                        ctx.budget,
+                    ) {
+                        ctx.exhausted_err = Some((PartId::WholeCall, err));
+                        return;
+                    }
                 }
             }
         }
@@ -1048,17 +1151,21 @@ fn check_selector_probes(
         if let Ok(ps) = std::str::from_utf8(&probe_bytes)
             && matcher.is_match(ps)
         {
-            outcomes.push(PartResult {
-                part: filter_part.clone(),
-                outcome: PartOutcome::HardDenyHit(Hit {
-                    hard_deny_id: Some(hard_id),
-                    source: HitSource::BestEffort,
-                    matched: HitMatch::ProbeName {
-                        probe: ps.to_string(),
-                    },
+            push_charged(
+                outcomes,
+                PartResult {
                     part: filter_part.clone(),
-                }),
-            });
+                    outcome: PartOutcome::HardDenyHit(Hit {
+                        hard_deny_id: Some(hard_id),
+                        source: HitSource::BestEffort,
+                        matched: HitMatch::ProbeName {
+                            probe: ps.to_string(),
+                        },
+                        part: filter_part.clone(),
+                    }),
+                },
+                budget,
+            )?;
             break;
         }
     }
@@ -1067,17 +1174,21 @@ fn check_selector_probes(
         if let Ok(ps) = std::str::from_utf8(&probe_bytes)
             && matcher.is_match(ps)
         {
-            outcomes.push(PartResult {
-                part: filter_part.clone(),
-                outcome: PartOutcome::StoreHit(Hit {
-                    hard_deny_id: None,
-                    source: HitSource::Model,
-                    matched: HitMatch::ProbeName {
-                        probe: ps.to_string(),
-                    },
+            push_charged(
+                outcomes,
+                PartResult {
                     part: filter_part.clone(),
-                }),
-            });
+                    outcome: PartOutcome::StoreHit(Hit {
+                        hard_deny_id: None,
+                        source: HitSource::Model,
+                        matched: HitMatch::ProbeName {
+                            probe: ps.to_string(),
+                        },
+                        part: filter_part.clone(),
+                    }),
+                },
+                budget,
+            )?;
             break;
         }
     }
@@ -1108,10 +1219,16 @@ pub(crate) fn resolve_subject_paths_impl(
     let mut out = ResolvedCallPaths::default();
 
     if paths.len() > limits::MAX_USES {
-        out.outcomes.push(PartResult {
-            part: PartId::WholeCall,
-            outcome: PartOutcome::TooLarge(Cap::Uses),
-        });
+        if let Err(e) = push_charged(
+            &mut out.outcomes,
+            PartResult {
+                part: PartId::WholeCall,
+                outcome: PartOutcome::TooLarge(Cap::Uses),
+            },
+            budget,
+        ) {
+            return finish_call_exhausted(out, PartId::WholeCall, e);
+        }
         return Ok(out);
     }
 
@@ -1131,10 +1248,16 @@ pub(crate) fn resolve_subject_paths_impl(
     // File-tool paths are ALWAYS literal (M1-32 round 4 finding 3; §5; §10 row 11).
     for (path_index, raw) in paths.iter().enumerate() {
         if out.targets.len() >= limits::MAX_PATHS {
-            out.outcomes.push(PartResult {
-                part: PartId::WholeCall,
-                outcome: PartOutcome::TooLarge(Cap::Paths),
-            });
+            if let Err(e) = push_charged(
+                &mut out.outcomes,
+                PartResult {
+                    part: PartId::WholeCall,
+                    outcome: PartOutcome::TooLarge(Cap::Paths),
+                },
+                budget,
+            ) {
+                return finish_call_exhausted(out, PartId::WholeCall, e);
+            }
             return Ok(out);
         }
         let part = PartId::SubjectPath { path_index };
@@ -1359,17 +1482,29 @@ pub(crate) fn resolve_subject_paths_impl(
                 Err(e) => return finish_call_exhausted(out, filter_part, e),
             };
             for unread in exp.unread {
-                out.outcomes.push(PartResult {
-                    part: filter_part.clone(),
-                    outcome: PartOutcome::Unread(unread),
-                });
+                if let Err(e) = push_charged(
+                    &mut out.outcomes,
+                    PartResult {
+                        part: filter_part.clone(),
+                        outcome: PartOutcome::Unread(unread),
+                    },
+                    budget,
+                ) {
+                    return finish_call_exhausted(out, PartId::WholeCall, e);
+                }
             }
             for target in exp.exact_matches {
                 if out.targets.len() >= limits::MAX_PATHS {
-                    out.outcomes.push(PartResult {
-                        part: PartId::WholeCall,
-                        outcome: PartOutcome::TooLarge(Cap::Paths),
-                    });
+                    if let Err(e) = push_charged(
+                        &mut out.outcomes,
+                        PartResult {
+                            part: PartId::WholeCall,
+                            outcome: PartOutcome::TooLarge(Cap::Paths),
+                        },
+                        budget,
+                    ) {
+                        return finish_call_exhausted(out, PartId::WholeCall, e);
+                    }
                     return Ok(out);
                 }
                 if let TargetResolution::Resolved { canonical, .. } = &target.resolution {
@@ -1392,12 +1527,18 @@ pub(crate) fn resolve_subject_paths_impl(
                 escaped = true;
                 if !emitted_variant {
                     emitted_variant = true;
-                    out.outcomes.push(PartResult {
-                        part: filter_part.clone(),
-                        outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
-                            pattern: g.as_bytes().to_vec(),
-                        }),
-                    });
+                    if let Err(e) = push_charged(
+                        &mut out.outcomes,
+                        PartResult {
+                            part: filter_part.clone(),
+                            outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
+                                pattern: g.as_bytes().to_vec(),
+                            }),
+                        },
+                        budget,
+                    ) {
+                        return finish_call_exhausted(out, PartId::WholeCall, e);
+                    }
                 }
                 out.targets.push(target);
             }
@@ -1411,10 +1552,16 @@ pub(crate) fn resolve_subject_paths_impl(
             // D-100: an escaping selector cannot be allowed by Home or
             // scoped/prefix rules; only unscoped Any or FullAccess allows
             // it (unless a HardDeny hit was already recorded above).
-            out.outcomes.push(PartResult {
-                part: filter_part.clone(),
-                outcome: PartOutcome::Unread(UnreadReason::UnsupportedFilterForm),
-            });
+            if let Err(e) = push_charged(
+                &mut out.outcomes,
+                PartResult {
+                    part: filter_part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::UnsupportedFilterForm),
+                },
+                budget,
+            ) {
+                return finish_call_exhausted(out, PartId::WholeCall, e);
+            }
         }
         // If recursive is also set on the subject, run S8 / hard-link checks on roots.
         if recursive {

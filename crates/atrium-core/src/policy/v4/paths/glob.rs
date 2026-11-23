@@ -18,6 +18,7 @@ use crate::policy::model::{
 };
 use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl, resolve_word_literal};
+use crate::policy::v4::paths::sensitive::push_charged;
 
 /// One byte atom inside a single glob path component.
 #[derive(Debug, Clone)]
@@ -481,7 +482,11 @@ pub(crate) fn expand_shell_glob_impl(
             abs_bytes.extend_from_slice(rest);
             abs_prov.extend_from_slice(rest_prov);
         } else {
-            expansion.unread.push(UnreadReason::UnsupportedTildeForm);
+            push_charged(
+                &mut expansion.unread,
+                UnreadReason::UnsupportedTildeForm,
+                budget,
+            )?;
             return Ok(expansion);
         }
     } else if raw.starts_with(b"/") {
@@ -512,7 +517,7 @@ pub(crate) fn expand_shell_glob_impl(
             match parse_component(&abs_bytes[start..end], &abs_prov[start..end], budget)? {
                 Ok(comp) => comps.push(comp),
                 Err(unread) => {
-                    expansion.unread.push(unread);
+                    push_charged(&mut expansion.unread, unread, budget)?;
                     return Ok(expansion);
                 }
             }
@@ -571,11 +576,12 @@ pub(crate) fn expand_shell_glob_impl(
                         push_unique_unread(
                             &mut expansion.unread,
                             UnreadReason::UnresolvablePath { path: dir },
-                        );
+                            budget,
+                        )?;
                         continue;
                     }
                     Err(ResolveError::CapReached(c)) => {
-                        push_unique_unread(&mut expansion.unread, UnreadReason::from(c));
+                        push_unique_unread(&mut expansion.unread, UnreadReason::from(c), budget)?;
                         break;
                     }
                     Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -611,11 +617,16 @@ pub(crate) fn expand_shell_glob_impl(
                             push_unique_unread(
                                 &mut expansion.unread,
                                 UnreadReason::UnresolvablePath { path: dir },
-                            );
+                                budget,
+                            )?;
                             continue;
                         }
                         Err(ResolveError::CapReached(c)) => {
-                            push_unique_unread(&mut expansion.unread, UnreadReason::from(c));
+                            push_unique_unread(
+                                &mut expansion.unread,
+                                UnreadReason::from(c),
+                                budget,
+                            )?;
                             break;
                         }
                         Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -640,10 +651,11 @@ pub(crate) fn expand_shell_glob_impl(
                         push_unique_unread(
                             &mut expansion.unread,
                             UnreadReason::UnresolvablePath { path: next },
-                        );
+                            budget,
+                        )?;
                     }
                     Err(ResolveError::CapReached(c)) => {
-                        push_unique_unread(&mut expansion.unread, UnreadReason::from(c));
+                        push_unique_unread(&mut expansion.unread, UnreadReason::from(c), budget)?;
                         break;
                     }
                     Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -658,7 +670,8 @@ pub(crate) fn expand_shell_glob_impl(
                     push_unique_unread(
                         &mut expansion.unread,
                         UnreadReason::WalkCapReached(FsCap::WalkDepth),
-                    );
+                        budget,
+                    )?;
                     continue;
                 }
                 if *is_globstar {
@@ -676,11 +689,12 @@ pub(crate) fn expand_shell_glob_impl(
                         push_unique_unread(
                             &mut expansion.unread,
                             UnreadReason::UnresolvablePath { path: dir },
-                        );
+                            budget,
+                        )?;
                         continue;
                     }
                     Err(ResolveError::CapReached(c)) => {
-                        push_unique_unread(&mut expansion.unread, UnreadReason::from(c));
+                        push_unique_unread(&mut expansion.unread, UnreadReason::from(c), budget)?;
                         break;
                     }
                     Err(ResolveError::Exhausted(e)) => return Err(e),
@@ -696,7 +710,8 @@ pub(crate) fn expand_shell_glob_impl(
                         push_unique_unread(
                             &mut expansion.unread,
                             UnreadReason::WalkCapReached(FsCap::EntriesRead),
-                        );
+                            budget,
+                        )?;
                         hit_cap = true;
                         break;
                     }
@@ -720,7 +735,8 @@ pub(crate) fn expand_shell_glob_impl(
                                             push_unique_unread(
                                                 &mut expansion.unread,
                                                 UnreadReason::from(c),
-                                            );
+                                                budget,
+                                            )?;
                                             hit_cap = true;
                                             false
                                         }
@@ -731,7 +747,8 @@ pub(crate) fn expand_shell_glob_impl(
                                                 UnreadReason::UnresolvablePath {
                                                     path: next.clone(),
                                                 },
-                                            );
+                                                budget,
+                                            )?;
                                             false
                                         }
                                     }
@@ -741,14 +758,16 @@ pub(crate) fn expand_shell_glob_impl(
                                     push_unique_unread(
                                         &mut expansion.unread,
                                         UnreadReason::UnresolvablePath { path: next.clone() },
-                                    );
+                                        budget,
+                                    )?;
                                     false
                                 }
                                 Err(ResolveError::CapReached(c)) => {
                                     push_unique_unread(
                                         &mut expansion.unread,
                                         UnreadReason::from(c),
-                                    );
+                                        budget,
+                                    )?;
                                     hit_cap = true;
                                     false
                                 }
@@ -764,7 +783,8 @@ pub(crate) fn expand_shell_glob_impl(
                                 push_unique_unread(
                                     &mut expansion.unread,
                                     UnreadReason::WalkCapReached(FsCap::WalkDepth),
-                                );
+                                    budget,
+                                )?;
                             } else {
                                 stack.push((next, idx, depth + 1, true));
                             }
@@ -846,8 +866,14 @@ pub(crate) fn expand_shell_glob_impl(
     Ok(expansion)
 }
 
-fn push_unique_unread(out: &mut Vec<UnreadReason>, reason: UnreadReason) {
+fn push_unique_unread(
+    out: &mut Vec<UnreadReason>,
+    reason: UnreadReason,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    budget.charge(out.len() as u64 + 1)?;
     if !out.contains(&reason) {
-        out.push(reason);
+        push_charged(out, reason, budget)?;
     }
+    Ok(())
 }

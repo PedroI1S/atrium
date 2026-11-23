@@ -701,6 +701,51 @@ pub(crate) fn under_str<'a>(path: &'a str, base: &str) -> Option<&'a str> {
 // Shared Sensitive (ported from M1-31 N11, keyed strictly by value)
 // ---------------------------------------------------------------------------
 
+/// Pushes `item` onto `v` after charging the vector's growth (§8): when `v`
+/// is full, the buffer it is about to allocate (double its capacity, at least
+/// four slots) is charged first, so outcome and reason lists never grow
+/// uncharged.
+///
+/// A hit (or an Exhausted record) found before the budget ran out still
+/// stands (§8): when charging its slot is what exhausts the budget, it is
+/// recorded anyway, like the final Exhausted record, and the error returned.
+pub(crate) fn push_charged<T: ChargedRecord>(
+    v: &mut Vec<T>,
+    item: T,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    if v.len() == v.capacity() {
+        let new_cap = v.capacity().saturating_mul(2).max(4);
+        if let Err(e) = budget.charge_alloc(new_cap.saturating_mul(std::mem::size_of::<T>())) {
+            if item.keep_on_exhaustion() {
+                v.push(item);
+            }
+            return Err(e);
+        }
+        v.reserve_exact(new_cap - v.len());
+    }
+    v.push(item);
+    Ok(())
+}
+
+/// A record kept by [`push_charged`] even when its slot exhausts the budget.
+pub(crate) trait ChargedRecord {
+    fn keep_on_exhaustion(&self) -> bool {
+        false
+    }
+}
+
+impl ChargedRecord for PartResult {
+    fn keep_on_exhaustion(&self) -> bool {
+        matches!(
+            self.outcome,
+            PartOutcome::HardDenyHit(_) | PartOutcome::StoreHit(_) | PartOutcome::Exhausted(_)
+        )
+    }
+}
+
+impl ChargedRecord for UnreadReason {}
+
 /// Folds every path of `paths`, charging the list's allocation before building
 /// it (each fold charges its own work and allocation).
 fn fold_path_list(
