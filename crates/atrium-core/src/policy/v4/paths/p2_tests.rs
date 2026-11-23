@@ -56,6 +56,7 @@ fn default_protected(fs: &dyn PathResolver) -> ProtectedSet {
         &mut budget,
     )
     .expect("build_protected_set fits default budget")
+    .set
 }
 
 fn unit(
@@ -963,7 +964,8 @@ fn boundary_case_and_fold_variants_sensitive_and_insensitive_and_nfc_nfd() {
         &mut caps,
         &mut budget,
     )
-    .unwrap();
+    .unwrap()
+    .set;
 
     // Listed folds -> HardDenyHit (never downgraded!)
     for p in [
@@ -1078,7 +1080,8 @@ fn boundary_case_and_fold_variants_sensitive_and_insensitive_and_nfc_nfd() {
         &mut caps,
         &mut budget,
     )
-    .unwrap();
+    .unwrap()
+    .set;
     let t_nfd = resolve_literal(
         "/h/u/Caf\u{00E9}/atrium/db".as_bytes(),
         CWD,
@@ -1852,7 +1855,8 @@ fn carried_m1_31_s8_filters_atrium_outside_home_browser_and_shared_sensitive() {
         &mut caps,
         &mut budget,
     )
-    .unwrap();
+    .unwrap()
+    .set;
 
     // 1. S8 blocks `~/.aws` EVEN WITH a non-matching filter (`rg -g '*.txt' x ~/.aws`)
     let aws_root = resolve_literal(
@@ -2230,7 +2234,8 @@ fn fs_resolver_real_tempdir_symlinks_dangling_hardlinks_unreadable_and_budgets()
         &mut caps,
         &mut budget,
     )
-    .unwrap();
+    .unwrap()
+    .set;
 
     // 1. Symlink & dangling link resolve to fake `~/.ssh/...` -> HardDenyHit
     for rel in ["proj/link_key", "proj/dangling_key"] {
@@ -3274,7 +3279,8 @@ fn round2_finding09_unicode_normalization_u01fb_and_independent_conformance() {
         &mut caps,
         &mut budget,
     )
-    .unwrap();
+    .unwrap()
+    .set;
 
     for nfd_path in [
         "/h/u/a\u{030A}\u{0301}/atrium/db",
@@ -3358,7 +3364,8 @@ fn round2_finding09_unicode_normalization_u01fb_and_independent_conformance() {
         &mut caps,
         &mut budget,
     )
-    .unwrap();
+    .unwrap()
+    .set;
     let t_norm = resolve_literal(
         "/h/u/a\u{030A}\u{0301}/atrium/db".as_bytes(),
         CWD,
@@ -3499,7 +3506,8 @@ fn round2_finding11_budgets_all_fs_caps_and_small_nonzero_alloc() {
         &mut caps,
         &mut budget,
     )
-    .unwrap();
+    .unwrap()
+    .set;
 
     // 1. `check_target` on a Clear target fails with 0 AND with small nonzero alloc budgets!
     let clear_target = resolve_literal(

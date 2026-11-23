@@ -16,8 +16,7 @@ use crate::policy::v4::paths::glob::expand_shell_glob_impl;
 use crate::policy::v4::paths::recursive::{check_filter_on_root, check_recursive_root_impl};
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl, resolve_word_literal};
 use crate::policy::v4::paths::sensitive::{
-    SharedSensitive, WriteOnlyIdentities, check_target_impl, collect_write_only_identities,
-    fold_path_listed, origin_to_part, under_bytes,
+    SharedSensitive, check_target_impl, fold_path_listed, origin_to_part, under_bytes,
 };
 
 #[derive(Debug, Clone)]
@@ -26,77 +25,21 @@ enum CwdState {
     Unknown,
 }
 
-/// Lazily caches write-only protected identities (`~/.ssh/config`,
-/// `~/.ssh/authorized_keys`, `atrium_protected_paths` + descendants) once per
-/// resolver-backed call when any non-read target is checked (§5).
-#[derive(Default)]
-struct WriteOnlyIdCache {
-    loaded: Option<WriteOnlyIdentities>,
-}
-
-impl WriteOnlyIdCache {
-    #[allow(clippy::too_many_arguments)]
-    fn check_target(
-        &mut self,
-        target: &Target,
-        protected: &ProtectedSet,
-        resolver: &dyn PathResolver,
-        caps: &mut FsCaps,
-        budget: &mut ComputeBudget,
-        outcomes: &mut Vec<PartResult>,
-    ) -> Result<(), Exhausted> {
-        let checked = check_target_impl(target, protected, budget)?;
-        if target.access != AccessMode::Read
-            && !matches!(checked.outcome, PartOutcome::HardDenyHit(_))
-            && let TargetResolution::Resolved {
-                canonical,
-                identities,
-                ..
-            } = &target.resolution
-        {
-            if self.loaded.is_none() {
-                match collect_write_only_identities(protected, resolver, caps, budget) {
-                    Ok(loaded) => self.loaded = Some(loaded),
-                    Err(e) => {
-                        // Preserve any hit/unread already established on `target`
-                        // before propagating Exhausted (§8).
-                        outcomes.push(checked);
-                        return Err(e);
-                    }
-                }
-            }
-            if let Some(wo) = &self.loaded {
-                let part = origin_to_part(&target.origin);
-                for id in identities {
-                    if let Some((_, hard_id)) = wo.identities.iter().find(|(pid, _)| pid == id) {
-                        budget.charge_alloc(canonical.len())?;
-                        outcomes.push(PartResult {
-                            part: part.clone(),
-                            outcome: PartOutcome::HardDenyHit(Hit {
-                                hard_deny_id: Some(hard_id),
-                                source: HitSource::Model,
-                                matched: HitMatch::ProtectedPath {
-                                    path: canonical.clone(),
-                                },
-                                part,
-                            }),
-                        });
-                        return Ok(());
-                    }
-                }
-                outcomes.push(checked);
-                for u in &wo.unreads {
-                    outcomes.push(PartResult {
-                        part: part.clone(),
-                        outcome: PartOutcome::Unread(u.clone()),
-                    });
-                }
-                return Ok(());
-            }
-        }
-        outcomes.push(checked);
-        Ok(())
-    }
+/// Checks `target` against `protected` and records the outcome. Write-only
+/// identities come from `protected.write_only_hard_deny_identities`, which
+/// `build_protected_set` fills: there is one identity collection, so the
+/// resolver-backed flows and a standalone `check_target` always agree (§5,
+/// D-142).
+fn push_checked(
+    target: &Target,
+    protected: &ProtectedSet,
+    budget: &mut ComputeBudget,
+    outcomes: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
+    let checked = check_target_impl(target, protected, budget)?;
+    budget.charge_alloc(std::mem::size_of::<PartResult>())?;
+    outcomes.push(checked);
+    Ok(())
 }
 
 fn finish_call_exhausted(
@@ -236,7 +179,6 @@ struct ExecCtx<'a> {
     pipeline_writers: &'a HashMap<PipelineId, UnitIndex>,
     subtree_writers: &'a [Option<UnitIndex>],
     visited: &'a mut [bool],
-    wo_cache: &'a mut WriteOnlyIdCache,
     out: &'a mut ResolvedCallPaths,
     stopped_too_large: bool,
     exhausted_err: Option<(PartId, Exhausted)>,
@@ -434,14 +376,9 @@ fn exec_unit_sequence(
                                 return;
                             }
                         }
-                    } else if let Err(err) = ctx.wo_cache.check_target(
-                        &target,
-                        ctx.protected,
-                        ctx.resolver,
-                        ctx.caps,
-                        ctx.budget,
-                        &mut ctx.out.outcomes,
-                    ) {
+                    } else if let Err(err) =
+                        push_checked(&target, ctx.protected, ctx.budget, &mut ctx.out.outcomes)
+                    {
                         ctx.exhausted_err = Some((part, err));
                         return;
                     }
@@ -527,14 +464,9 @@ fn exec_unit_sequence(
                             return;
                         }
                     }
-                } else if let Err(err) = ctx.wo_cache.check_target(
-                    &target,
-                    ctx.protected,
-                    ctx.resolver,
-                    ctx.caps,
-                    ctx.budget,
-                    &mut ctx.out.outcomes,
-                ) {
+                } else if let Err(err) =
+                    push_checked(&target, ctx.protected, ctx.budget, &mut ctx.out.outcomes)
+                {
                     ctx.exhausted_err = Some((part, err));
                     return;
                 }
@@ -690,14 +622,9 @@ fn exec_unit_sequence(
                 }
             };
             record_multiply_linked(&target, &mut ctx.out.multiply_linked_file);
-            if let Err(err) = ctx.wo_cache.check_target(
-                &target,
-                ctx.protected,
-                ctx.resolver,
-                ctx.caps,
-                ctx.budget,
-                &mut ctx.out.outcomes,
-            ) {
+            if let Err(err) =
+                push_checked(&target, ctx.protected, ctx.budget, &mut ctx.out.outcomes)
+            {
                 ctx.exhausted_err = Some((part, err));
                 return;
             }
@@ -908,7 +835,6 @@ pub(crate) fn resolve_command_targets_impl(
     }
 
     let mut visited = vec![false; units.len()];
-    let mut wo_cache = WriteOnlyIdCache::default();
     let mut earlier_writer: Option<UnitIndex> = None;
 
     let top_level: Vec<usize> = children_by_parent.get(&None).cloned().unwrap_or_default();
@@ -925,7 +851,6 @@ pub(crate) fn resolve_command_targets_impl(
         pipeline_writers: &pipeline_writers,
         subtree_writers: &subtree_writers,
         visited: &mut visited,
-        wo_cache: &mut wo_cache,
         out: &mut out,
         stopped_too_large: false,
         exhausted_err: None,
@@ -1104,7 +1029,7 @@ fn check_selector_probes(
     budget.charge(est_len as u64)?;
     budget.charge_alloc(est_len.saturating_mul(2))?;
     let norm = lexical_normalize_selector(base, glob, &protected.home);
-    let folded = fold_path_listed(&norm, protected.folds);
+    let folded = fold_path_listed(&norm, protected.folds, budget)?;
     let Ok(pat_str) = std::str::from_utf8(&folded) else {
         return Ok(());
     };
@@ -1118,7 +1043,7 @@ fn check_selector_probes(
     };
     let matcher = g.compile_matcher();
     let filter_part = PartId::Filter { unit: None };
-    for (probe_bytes, hard_id) in shared.hard_deny_probes() {
+    for (probe_bytes, hard_id) in shared.hard_deny_probes(budget)? {
         budget.charge(probe_bytes.len().max(1) as u64)?;
         if let Ok(ps) = std::str::from_utf8(&probe_bytes)
             && matcher.is_match(ps)
@@ -1137,7 +1062,7 @@ fn check_selector_probes(
             break;
         }
     }
-    for (probe_bytes, _family) in shared.store_probes() {
+    for (probe_bytes, _family) in shared.store_probes(budget)? {
         budget.charge(probe_bytes.len().max(1) as u64)?;
         if let Ok(ps) = std::str::from_utf8(&probe_bytes)
             && matcher.is_match(ps)
@@ -1190,7 +1115,6 @@ pub(crate) fn resolve_subject_paths_impl(
         return Ok(out);
     }
 
-    let mut wo_cache = WriteOnlyIdCache::default();
     let selector_glob = glob.filter(|g| is_selector_glob(g));
     let non_selector_filter = glob.filter(|g| !is_selector_glob(g)).map(|g| SearchFilter {
         dialect: FilterDialect::SearchGlob,
@@ -1230,14 +1154,7 @@ pub(crate) fn resolve_subject_paths_impl(
         record_multiply_linked(&target, &mut out.multiply_linked_file);
 
         if selector_glob.is_some() {
-            if let Err(e) = wo_cache.check_target(
-                &target,
-                protected,
-                resolver,
-                caps,
-                budget,
-                &mut out.outcomes,
-            ) {
+            if let Err(e) = push_checked(&target, protected, budget, &mut out.outcomes) {
                 return finish_call_exhausted(out, part, e);
             }
             roots.push(target.clone());
@@ -1265,14 +1182,7 @@ pub(crate) fn resolve_subject_paths_impl(
                 Err(e) => return finish_call_exhausted(out, part, e),
             }
         } else {
-            if let Err(e) = wo_cache.check_target(
-                &target,
-                protected,
-                resolver,
-                caps,
-                budget,
-                &mut out.outcomes,
-            ) {
+            if let Err(e) = push_checked(&target, protected, budget, &mut out.outcomes) {
                 return finish_call_exhausted(out, part, e);
             }
             if let Some(filter) = &non_selector_filter
@@ -1288,7 +1198,10 @@ pub(crate) fn resolve_subject_paths_impl(
                 {
                     return finish_call_exhausted(out, filter_part, e);
                 }
-                let folded_root = fold_path_listed(canonical, protected.folds);
+                let folded_root = match fold_path_listed(canonical, protected.folds, budget) {
+                    Ok(f) => f,
+                    Err(e) => return finish_call_exhausted(out, filter_part, e),
+                };
                 if let Err(e) = check_filter_on_root(
                     canonical,
                     &folded_root,
@@ -1329,14 +1242,7 @@ pub(crate) fn resolve_subject_paths_impl(
         record_multiply_linked(&implicit, &mut out.multiply_linked_file);
 
         if selector_glob.is_some() {
-            if let Err(e) = wo_cache.check_target(
-                &implicit,
-                protected,
-                resolver,
-                caps,
-                budget,
-                &mut out.outcomes,
-            ) {
+            if let Err(e) = push_checked(&implicit, protected, budget, &mut out.outcomes) {
                 return finish_call_exhausted(out, part, e);
             }
             roots.push(implicit.clone());
@@ -1363,14 +1269,7 @@ pub(crate) fn resolve_subject_paths_impl(
                 Err(e) => return finish_call_exhausted(out, part, e),
             }
         } else {
-            if let Err(e) = wo_cache.check_target(
-                &implicit,
-                protected,
-                resolver,
-                caps,
-                budget,
-                &mut out.outcomes,
-            ) {
+            if let Err(e) = push_checked(&implicit, protected, budget, &mut out.outcomes) {
                 return finish_call_exhausted(out, part, e);
             }
             if let Some(filter) = &non_selector_filter
@@ -1386,7 +1285,10 @@ pub(crate) fn resolve_subject_paths_impl(
                 {
                     return finish_call_exhausted(out, filter_part, e);
                 }
-                let folded_root = fold_path_listed(canonical, protected.folds);
+                let folded_root = match fold_path_listed(canonical, protected.folds, budget) {
+                    Ok(f) => f,
+                    Err(e) => return finish_call_exhausted(out, filter_part, e),
+                };
                 if let Err(e) = check_filter_on_root(
                     canonical,
                     &folded_root,
@@ -1431,15 +1333,15 @@ pub(crate) fn resolve_subject_paths_impl(
                 })
                 .collect()
         };
-        let root_folded: Vec<Vec<u8>> = roots
-            .iter()
-            .filter_map(|r| match &r.resolution {
-                TargetResolution::Resolved { canonical, .. } => {
-                    Some(fold_path_listed(canonical, protected.folds))
+        let mut root_folded: Vec<Vec<u8>> = Vec::with_capacity(roots.len());
+        for r in &roots {
+            if let TargetResolution::Resolved { canonical, .. } = &r.resolution {
+                match fold_path_listed(canonical, protected.folds, budget) {
+                    Ok(f) => root_folded.push(f),
+                    Err(e) => return finish_call_exhausted(out, filter_part, e),
                 }
-                TargetResolution::Unread(_) => None,
-            })
-            .collect();
+            }
+        }
 
         let mut escaped = root_bases.is_empty() && !anchored;
         for base in &root_bases {
@@ -1471,20 +1373,16 @@ pub(crate) fn resolve_subject_paths_impl(
                     return Ok(out);
                 }
                 if let TargetResolution::Resolved { canonical, .. } = &target.resolution {
-                    let tf = fold_path_listed(canonical, protected.folds);
+                    let tf = match fold_path_listed(canonical, protected.folds, budget) {
+                        Ok(f) => f,
+                        Err(e) => return finish_call_exhausted(out, filter_part, e),
+                    };
                     if !root_folded.iter().any(|rf| under_bytes(&tf, rf).is_some()) {
                         escaped = true;
                     }
                 }
                 record_multiply_linked(&target, &mut out.multiply_linked_file);
-                if let Err(e) = wo_cache.check_target(
-                    &target,
-                    protected,
-                    resolver,
-                    caps,
-                    budget,
-                    &mut out.outcomes,
-                ) {
+                if let Err(e) = push_checked(&target, protected, budget, &mut out.outcomes) {
                     return finish_call_exhausted(out, filter_part, e);
                 }
                 out.targets.push(target);

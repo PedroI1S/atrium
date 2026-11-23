@@ -329,10 +329,28 @@ pub(crate) fn resolve_literal_impl(
                                 ));
                             }
                             hops += 1;
+                            budget
+                                .charge((existing_stack.len() + symlink_identities.len()) as u64)?;
+                            budget.charge_alloc(
+                                (existing_stack.len() + 1) * std::mem::size_of::<FileIdentity>(),
+                            )?;
                             if let Some(id) = meta.identity
                                 && !symlink_identities.contains(&id)
                             {
                                 symlink_identities.push(id);
+                            }
+                            // Keep the identity of every directory holding the
+                            // followed link: the path as spelled names an entry
+                            // inside them, so a protected folder stays a hit by
+                            // identity after the link leads out of it (§5: the
+                            // protected spellings count in addition to identity;
+                            // `~/.gnupg/sub/link -> /tmp/x` names `~/.gnupg`).
+                            for (_, dir_id) in &existing_stack {
+                                if let Some(dir_id) = dir_id
+                                    && !symlink_identities.contains(dir_id)
+                                {
+                                    symlink_identities.push(*dir_id);
+                                }
                             }
                             if target.starts_with(b"/") {
                                 if is_process_dependent_path(&target) {
@@ -474,7 +492,7 @@ pub(crate) fn resolve_literal_impl(
     }
     // Always preserve traversed symlink identities (both dangling links and
     // symlinks placed at protected spellings that canonicalize to ordinary
-    // targets; §5).
+    // targets) and the identities of the directories that held them (§5).
     for id in symlink_identities {
         if !identities.contains(&id) {
             identities.push(id);

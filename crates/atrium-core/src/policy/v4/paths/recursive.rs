@@ -17,8 +17,8 @@ use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl};
 use crate::policy::v4::paths::sensitive::{
     ASK_FILES, ASK_NAME_PREFIXES, ASK_TREES, BROWSER_FILES, BROWSER_ROOTS, CRED_FILES, CRED_TREES,
-    SharedSensitive, check_target_impl, collect_write_only_identities, fold_listed_component,
-    fold_path_listed, join_folded, origin_to_part, under_bytes, under_str,
+    SharedSensitive, check_target_impl, fold_listed_component, fold_path_listed, join_folded,
+    origin_to_part, under_bytes, under_str,
 };
 
 fn finish_recursive_exhausted(
@@ -54,7 +54,7 @@ pub(crate) fn check_recursive_root_impl(
     let root_part = origin_to_part(&root.origin);
     let mut result = RecursiveRootResult::default();
 
-    let (root_canon, root_identities, root_multiply_linked) = match &root.resolution {
+    let (root_canon, root_multiply_linked) = match &root.resolution {
         TargetResolution::Unread(reason) => {
             budget.charge(1)?;
             result.outcomes.push(PartResult {
@@ -65,10 +65,9 @@ pub(crate) fn check_recursive_root_impl(
         }
         TargetResolution::Resolved {
             canonical,
-            identities,
             multiply_linked,
             ..
-        } => (canonical, identities, *multiply_linked),
+        } => (canonical, *multiply_linked),
     };
 
     if root_multiply_linked {
@@ -80,44 +79,8 @@ pub(crate) fn check_recursive_root_impl(
         Ok(r) => r,
         Err(e) => return finish_recursive_exhausted(result, root_part, e),
     };
-    let root_is_hard_deny = matches!(root_check.outcome, PartOutcome::HardDenyHit(_));
     if !matches!(root_check.outcome, PartOutcome::Clear) {
         result.outcomes.push(root_check);
-    }
-
-    // Access-aware write-only identity protection when `root` is written (§5).
-    if root.access != AccessMode::Read && !root_is_hard_deny {
-        match collect_write_only_identities(protected, resolver, caps, budget) {
-            Ok(wo) => {
-                let mut matched_wo = false;
-                for id in root_identities {
-                    if let Some((_, hard_id)) = wo.identities.iter().find(|(pid, _)| pid == id) {
-                        result.outcomes.push(PartResult {
-                            part: root_part.clone(),
-                            outcome: PartOutcome::HardDenyHit(Hit {
-                                hard_deny_id: Some(hard_id),
-                                source: HitSource::Model,
-                                matched: HitMatch::ProtectedPath {
-                                    path: root_canon.clone(),
-                                },
-                                part: root_part.clone(),
-                            }),
-                        });
-                        matched_wo = true;
-                        break;
-                    }
-                }
-                if !matched_wo {
-                    for u in wo.unreads {
-                        result.outcomes.push(PartResult {
-                            part: root_part.clone(),
-                            outcome: PartOutcome::Unread(u),
-                        });
-                    }
-                }
-            }
-            Err(e) => return finish_recursive_exhausted(result, root_part, e),
-        }
     }
 
     let shared = match SharedSensitive::for_protected_budgeted(protected, budget) {
@@ -130,7 +93,10 @@ pub(crate) fn check_recursive_root_impl(
     {
         return finish_recursive_exhausted(result, root_part, e);
     }
-    let folded_root = fold_path_listed(root_canon, protected.folds);
+    let folded_root = match fold_path_listed(root_canon, protected.folds, budget) {
+        Ok(f) => f,
+        Err(e) => return finish_recursive_exhausted(result, root_part, e),
+    };
     let exempt_root = is_s8_exempt(&folded_root, shared.home_folded());
 
     // 2. S8 protected-root policy (§5, §11 item 12): a recursive root that
@@ -223,6 +189,7 @@ pub(crate) fn check_recursive_root_impl(
         &root_part,
         !filters.is_empty(),
         exempt_root,
+        root.access,
         protected,
         resolver,
         caps,
@@ -303,10 +270,14 @@ fn s8_read_dir_cached<'a>(
     }
     Ok(cache.get(dir).and_then(|opt| opt.as_deref()))
 }
-
-/// Discovers existing listed-fold spellings of `suffix_folded` under `base`
-/// within the filesystem caps and compute budget (fast-pathing exact `lstat`
-/// first, then matching directory entries via `fold_listed_component`).
+/// Discovers EVERY existing listed-fold spelling of `suffix_folded` under
+/// `base` within the filesystem caps and compute budget (§5, round-2 finding
+/// 9): each component is matched against the folded names of the cached
+/// directory listing, so an existing lowercase spelling never hides a sibling
+/// spelling (`application support` next to `APPLICATION SUPPORT`). When a
+/// folder on the way cannot be listed (an unreadable folder, or `chmod 0111`),
+/// its lowercase spelling is still probed with `lstat`, and the failure is
+/// recorded as Unread.
 #[allow(clippy::too_many_arguments)]
 fn find_s8_folded_matches(
     base: &[u8],
@@ -320,12 +291,11 @@ fn find_s8_folded_matches(
     cache: &mut S8DirCache,
 ) -> Result<Vec<Vec<u8>>, Exhausted> {
     let comps: Vec<&str> = suffix_folded.split('/').filter(|s| !s.is_empty()).collect();
+    budget.charge_alloc(base.len())?;
+    let mut frontier: Vec<Vec<u8>> = vec![base.to_vec()];
     if comps.is_empty() {
         return match resolver.lstat(base, caps, budget) {
-            Ok(_) => {
-                budget.charge_alloc(base.len())?;
-                Ok(vec![base.to_vec()])
-            }
+            Ok(_) => Ok(frontier),
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {
                 Ok(Vec::new())
             }
@@ -349,43 +319,39 @@ fn find_s8_folded_matches(
         };
     }
 
-    // Fast path: check exact lowercase spelling via `lstat` first (also handles
-    // non-listable `chmod 0111` directories).
-    let exact_len = base.len() + 1 + suffix_folded.len();
-    budget.charge_alloc(exact_len)?;
-    let exact = join_bytes(base, suffix_folded.as_bytes());
-    match resolver.lstat(&exact, caps, budget) {
-        Ok(_) => return Ok(vec![exact]),
-        Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {}
-        Err(ResolveError::Io(_)) => {
-            outcomes.push(PartResult {
-                part: part.clone(),
-                outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: exact }),
-            });
-        }
-        Err(ResolveError::CapReached(c)) => {
-            outcomes.push(PartResult {
-                part: part.clone(),
-                outcome: PartOutcome::Unread(UnreadReason::from(c)),
-            });
-            return Ok(Vec::new());
-        }
-        Err(ResolveError::Exhausted(e)) => return Err(e),
-    }
-
-    // Walk component-by-component via cached `read_dir` to establish existence
-    // across all listed-fold spellings (e.g. `.aws/CREDENTIALS`, `.AWS/CREDENTIALS`,
-    // `Library/Application Support/Google/Chrome`).
-    budget.charge_alloc(base.len())?;
-    let mut frontier: Vec<Vec<u8>> = vec![base.to_vec()];
     let mut entries_seen = 0usize;
     let folds = protected.folds;
     for comp in comps {
         let mut next: Vec<Vec<u8>> = Vec::new();
         for dir in &frontier {
-            let Some(entries) =
-                s8_read_dir_cached(dir, resolver, caps, budget, part, outcomes, cache)?
-            else {
+            let listed = s8_read_dir_cached(dir, resolver, caps, budget, part, outcomes, cache)?;
+            let Some(entries) = listed else {
+                // Not listable: probe the lowercase spelling directly.
+                budget.charge_alloc(dir.len() + 1 + comp.len())?;
+                let cand = join_bytes(dir, comp.as_bytes());
+                match resolver.lstat(&cand, caps, budget) {
+                    Ok(_) => {
+                        if !next.contains(&cand) {
+                            next.push(cand);
+                        }
+                    }
+                    Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {}
+                    Err(ResolveError::Io(_)) => {
+                        outcomes.push(PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                                path: cand,
+                            }),
+                        });
+                    }
+                    Err(ResolveError::CapReached(c)) => {
+                        outcomes.push(PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                        });
+                    }
+                    Err(ResolveError::Exhausted(e)) => return Err(e),
+                }
                 continue;
             };
             for entry in entries {
@@ -402,13 +368,11 @@ fn find_s8_folded_matches(
                     });
                     return Ok(Vec::new());
                 }
-                budget.charge(entry.name.len().max(1) as u64)?;
-                budget.charge_alloc(entry.name.len().max(1))?;
-                let folded =
-                    fold_listed_component(&entry.name, folds.fold_long_s, folds.fold_kelvin);
+                let folded = fold_listed_component(&entry.name, folds, budget)?;
                 if folded == comp.as_bytes() {
                     budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
                     let cand = join_bytes(dir, &entry.name);
+                    budget.charge(next.len() as u64 + 1)?;
                     if !next.contains(&cand) {
                         next.push(cand);
                     }
@@ -734,7 +698,7 @@ fn dir_has_existing_hard_deny_ssh_entry(
             budget.charge(child_len as u64)?;
             budget.charge_alloc(child_len.saturating_mul(2))?;
             let child = join_bytes(&dir, &entry.name);
-            let folded = fold_path_listed(&child, protected.folds);
+            let folded = fold_path_listed(&child, protected.folds, budget)?;
             if entry.file_type != FileType::Dir
                 && shared
                     .hard_deny_hit_folded(&folded, AccessMode::Read)
@@ -811,11 +775,7 @@ fn browser_dir_has_existing_cred(
             }
             budget.charge(entry.name.len().max(1) as u64)?;
             budget.charge_alloc(entry.name.len().max(1))?;
-            let name_folded = fold_listed_component(
-                &entry.name,
-                protected.folds.fold_long_s,
-                protected.folds.fold_kelvin,
-            );
+            let name_folded = fold_listed_component(&entry.name, protected.folds, budget)?;
             if entry.file_type != FileType::Dir
                 && std::str::from_utf8(&name_folded).is_ok_and(|n| BROWSER_FILES.contains(&n))
             {
@@ -1300,11 +1260,8 @@ pub(crate) fn check_filter_on_root(
         // Probes are lowercase; match case-insensitively only if filter is
         // case-insensitive, otherwise match as compiled against lowercase probes
         // (and folded pattern if pattern has uppercase).
-        let raw_folded = fold_listed_component(
-            filter.pattern.literal_bytes(),
-            protected.folds.fold_long_s,
-            protected.folds.fold_kelvin,
-        );
+        let raw_folded =
+            fold_listed_component(filter.pattern.literal_bytes(), protected.folds, budget)?;
         if raw_folded != filter.pattern.literal_bytes()
             && let Ok(folded_str) = std::str::from_utf8(&raw_folded)
         {
@@ -1324,7 +1281,7 @@ pub(crate) fn check_filter_on_root(
     };
 
     // 2a. Hard-deny probes (best-effort probe matching per §2 & brief).
-    for (probe_bytes, hard_id) in shared.hard_deny_probes() {
+    for (probe_bytes, hard_id) in shared.hard_deny_probes(budget)? {
         let Some(rel_bytes) = under_bytes(&probe_bytes, folded_root) else {
             continue;
         };
@@ -1350,7 +1307,7 @@ pub(crate) fn check_filter_on_root(
 
     // 2b. Store probes (CR-12 + CR-17; independent part per §5).
     let mut store_probe_hit = false;
-    for (probe_bytes, _family) in shared.store_probes() {
+    for (probe_bytes, _family) in shared.store_probes(budget)? {
         let Some(rel_bytes) = under_bytes(&probe_bytes, folded_root) else {
             continue;
         };
@@ -1379,13 +1336,12 @@ pub(crate) fn check_filter_on_root(
     // e.g. `Search(paths=["~"], glob=".zsh_sessions/*.foo")` targets an
     // ASK_TREE directory by prefix even when the filename suffix isn't one of
     // the fixed probe extensions.
-    if !store_probe_hit
-        && let Ok(pat_folded_bytes) = std::str::from_utf8(&fold_listed_component(
-            filter.pattern.literal_bytes(),
-            protected.folds.fold_long_s,
-            protected.folds.fold_kelvin,
-        ))
-    {
+    let pat_folded = if store_probe_hit {
+        Vec::new()
+    } else {
+        fold_listed_component(filter.pattern.literal_bytes(), protected.folds, budget)?
+    };
+    if !store_probe_hit && let Ok(pat_folded_bytes) = std::str::from_utf8(&pat_folded) {
         let pat_trimmed = pat_folded_bytes
             .trim_start_matches("./")
             .trim_start_matches('/')
@@ -1588,7 +1544,7 @@ fn walk_followed_links(
                     {
                         // Also check S8 on a followed link into a folder holding credentials
                         // (e.g. `proj/link_aws -> ~/.aws` with `~/.aws/credentials` present).
-                        let folded = fold_path_listed(&canonical, protected.folds);
+                        let folded = fold_path_listed(&canonical, protected.folds, budget)?;
                         let mut link_s8_outcomes = Vec::new();
                         let s8 = check_s8_protected_root(
                             &canonical,
@@ -1717,6 +1673,7 @@ fn walk_hard_links(
     part: &PartId,
     has_filter: bool,
     exempt_root: bool,
+    access: AccessMode,
     protected: &ProtectedSet,
     resolver: &dyn PathResolver,
     caps: &mut FsCaps,
@@ -1777,9 +1734,22 @@ fn walk_hard_links(
                                     && !exempt_root
                                     && let Some(id) = md.identity
                                 {
+                                    let writes = access != AccessMode::Read;
+                                    budget.charge(
+                                        (protected.hard_deny_identities.len()
+                                            + protected.write_only_hard_deny_identities.len()
+                                            + protected.store_identities.len()
+                                            + 1) as u64,
+                                    )?;
                                     if let Some((_, hard_id)) = protected
                                         .hard_deny_identities
                                         .iter()
+                                        .chain(
+                                            protected
+                                                .write_only_hard_deny_identities
+                                                .iter()
+                                                .filter(|_| writes),
+                                        )
                                         .find(|(pid, _)| *pid == id)
                                     {
                                         outcomes.push(PartResult {
