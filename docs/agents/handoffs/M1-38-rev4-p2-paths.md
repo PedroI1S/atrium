@@ -1,7 +1,7 @@
 # Handoff: M1-38-rev4-p2-paths (P2)
 
 - **Branch:** `agent/neon/M1-38-rev4-p2-paths` (branched from P0's tip `1a09705`)
-- **Model:** Gemini 4 Neon (High)
+- **Model:** Gemini 4 Neon (High), rounds 1–2; Claude Opus 5.5, round 3 (D-142, §7)
 - **Contract:** `docs/contracts/m1-policy-rev4.md` (draft 5) — §2 (filesystem caps & walk-cap rule), §3 (process-dependent paths, `~`, redirect targets), §5 (paths, globs, links, recursive reads, `cd`, intra-call writer effects), §8 (budgets), §10–§12
 - **Behaviour change:** None. `SessionGate` is not wired yet (that is P5), and no P0 interface file (`model.rs`, `limits.rs`, `tools.rs`, other `v4/` stubs) or `dev` file was modified.
 
@@ -215,3 +215,97 @@ All 14 findings from Codex review round 1 have been addressed on top of P0 tip `
 | 12 | Unclosed brackets trigger repeated suffix scans | Eliminated quadratic rescanning in `parse_component` / `parse_bracket_class` / `scan_posix_bracket_item` via `skip_brackets_until` and stopping POSIX bracket-item scans on unquoted `[` (`glob.rs`). | `round2_finding12_unclosed_brackets_parse_linearly` |
 | 13 | Cwd state ignores nested-shell scope | Replaced single flat mutable `cwd_state` with tree-structured execution keyed by `parent_unit` and `depth` (`exec_unit_sequence` in `command.rs`), passing each parent's entry cwd to its children regardless of flattened vector order while isolating child `cd` changes from outer scopes and propagating child writers into `earlier_writer` / `pipeline_writers`. | `round2_finding13_nested_shell_cwd_scope_and_isolation` |
 | 14 | Carried `**/*.rs` test retains wrong verdict (`Clear` vs `StoreHit`) | Updated `carried_m1_30_absent_targets_and_search_filter_probes` to assert `StoreHit` and no `HardDenyHit` (keeping `dev`'s retained `ASK_TREES` directory-prefix probe without restoring M1-30's dropped suffix matcher) and corrected the M1-30 disposition entries above (`p2_tests.rs`, handoff §2B). | `carried_m1_30_absent_targets_and_search_filter_probes` |
+
+---
+
+## 7. Round 3 (Opus 5.5, D-142)
+
+Written by Claude Opus 5.5 (escalation, D-142) on the branch rebased onto P0's amended tip `b50f726` (`ProtectedSet::write_only_hard_deny_identities`, CR-P2-1). It addresses review round 2 (`.orchestration/review-input/review-round2.md`, 9 findings) and the round-1 findings that stayed open (7, 9, 11, 12). No file outside P2's owned paths changed (`git diff b50f726..HEAD -- crates/atrium-core/src/policy/{model,limits,tools}.rs` is empty).
+
+Commits: `ca219ac` (identity collector, write-only identities, fold, Unicode, S8 spellings), `0e4d11b` (FsResolver budgets), `93fffc7` (linear brackets, ASK_TREES prefixes), `ba4c450` (walks report unreadable folders), `36733e0` (outcome and reason lists charged before they grow; also carries the round-3 tests and the two round-2 test fixes), and the handoff commit.
+
+### 7.1 Design change: one identity collector, with gaps
+
+- `build_protected_set` (`sensitive.rs`) is now the **only** collector of protected identities. It fills `hard_deny_identities`, `write_only_hard_deny_identities` (new, D-142) and `store_identities`. `check_target` checks the write-only list for every access other than Read. The lazy per-flow collector (`WriteOnlyIdCache`, `collect_write_only_identities`, and the block in `check_recursive_root_impl`) is gone, so the resolver-backed flows and a standalone `check_target` can no longer disagree.
+- Every protected tree is walked within the contract's walk caps (`WALK_MAX_ENTRIES` entries and `WALK_MAX_DEPTH` levels per tree): credential trees, Atrium data and protected paths, `~/.ssh` (dev's `ssh_members`), browser roots (browser files only) and store trees. The old local cutoffs (1,024 entries, depth 8, `take(256)`) are gone.
+- **Gaps.** A walk that stops at a cap, an unreadable folder and a filesystem cap are returned as `IdentityGap { reason, scope, write_only }` in `ProtectedSetBuild { set, gaps }`, never dropped. `GapScope` says which targets a gap can affect:
+  - `Through(dir)`: a multiply-linked file, or a target whose identities include the tree root's (a path spelled through it);
+  - `HardLinks`: a multiply-linked file;
+  - `AnyTarget`: a protected entry that could not be established at all, and the `~/.ssh` walk (its linked folders protect files anywhere by name).
+  A write-only gap affects only targets whose access is not Read. `ProtectedSetBuild::apply_identity_gaps(&mut ResolvedCallPaths, budget)` adds the Unread parts (never on a target that is already a hard-deny hit). **Until CR-P2-2 lands, P5 must call it after each resolver-backed entry point** (see 7.4).
+- **Spelled-path identities.** `resolve_literal` keeps the identity of every directory that held a followed link. A path spelled through a protected folder (`~/.gnupg/zz_link -> /tmp/x`, or a chain to it) stays a hit by the folder's identity after the link leads out, as `dev` hits it by its written name. This also makes `GapScope::Through` meaningful.
+- P5 should give `build_protected_set` its own `FsCaps`, so the builder's walks don't use up the check's caps.
+
+### 7.2 Findings, fixes and tests
+
+All tests are in `crates/atrium-core/src/policy/v4/paths/p2_tests.rs`. Each expectation was checked against the contract text, not against the code's output (D-123: no tests run by the worker).
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| R2-1 (test) exhaustion test measured a cold cache | The test measures each collector warm (two identical runs must cost the same) and then runs at exactly that cost minus one unit. The failing charge is then the run's last, after the first hit, so the hit must stand and Exhausted must be appended. Same intended assertions for all three collectors. | `round2_finding01_hit_preserved_after_later_exhaustion` (rewritten) |
+| R2-2 (test) combined Unicode fixture required Clear | In the combined fixture `á` is Unread (Tibetan U+0F43 is uncovered: §11 item 13's conservative fallback). The `à` vs `á` Clear check moved to an isolated fixture with only covered components. | `round2_finding09_unicode_normalization_u01fb_and_independent_conformance` (edited) |
+| R2-3 + R1-7 write-only collection stopped silently; pure `check_target` could not see write-only identities | 7.1: the builder fills `write_only_hard_deny_identities` within the walk caps; a cap is a write-only gap. | `round3_r2f3_write_only_members_are_collected_and_early_stops_are_unread` (depth 9, 1,100 siblings, Write and ReadWrite HardDeny, Read clear, pure `check_target`), `round3_r2f3_write_only_walk_past_its_caps_is_unread_never_clear` (4,100 siblings and depth 17: Unread after `apply_identity_gaps`; reads and singly linked files unaffected), `round3_identity_gaps_are_scoped_to_targets_they_can_affect` |
+| R2-4 uncharged metadata calls in `read_link`, `canonicalize`, `DT_UNKNOWN` | `read_link` reads into a `PATH_MAX` stack buffer with `readlinkat`, with no metadata call (`EINVAL` means "not a link"). On Linux `canonicalize` opens with `O_PATH` and reads `/proc/self/fd/N`, with no metadata call; the `realpath` fallback charges one stat per component first. The `DT_UNKNOWN` `fstatat` charges the stat cap and compute first. | `round3_r2f4_fs_resolver_makes_no_uncharged_metadata_call` (Linux: zero stats left, both calls succeed and only their own cap moves) |
+| R2-5 `canonicalize` charged expanded output after allocating | The `/proc` path's result is written into a stack buffer and charged at its exact size before the `Vec` exists. The fallback charges two `PATH_MAX` buffers first. `read_link` is charged the same way. | `round3_r2f5_canonicalize_charges_its_expanded_output_before_allocating` (a short link to a 200-byte folder: a budget covering the input fails; one exactly the output's size succeeds with 0 left) |
+| R2-6 + R1-9 covered range held undecomposed scalars | The table adds U+0340, U+0341, U+0343, U+0344 (the only Combining Diacritical Marks with decompositions) and the singletons that decompose into ASCII or Latin-1 (U+037E, U+0387, U+1FEF, U+1FFD); every other scalar outside the exactly-covered blocks is uncovered. The conservative rule now applies unless the other side folds to pure ASCII (every mapping into ASCII is in the table). The default-ignorable list is complete (adds U+061C, U+1BCA0..=U+1BCA3). | `round3_r2f6_combining_marks_with_decompositions_are_unlisted_equivalences` (U+0341 vs `é`, U+0344 vs U+0308 U+0301: Unread; a CJK folder: Clear) |
+| R2-7 + R1-12 nested unclosed brackets rescanned | `BracketIndex`: two right-to-left passes record where each `[:…:]` item ends and where a class-body scan starting at each position closes. Every `[` is decided in O(1), and each class body is scanned once. | `round3_r2f7_nested_unclosed_brackets_parse_linearly` (`[[:digit:]` ×2,048, `[[[:alpha:]` ×2,048, `[[:` ×6,000, `[a[:x` ×4,000: under 40 units per byte); `round2_finding12_unclosed_brackets_parse_linearly` kept |
+| R2-8 per-character lowercase | `fold_listed_component` uses string-level `str::to_lowercase()` per valid UTF-8 segment, then `ſ`→`s` (and K→k), exactly `dev`'s `to_lowercase().replace('ſ', "s")`, keeping invalid bytes verbatim. It charges its work and allocation bound first. | `round3_r2f8_listed_fold_is_string_lowercase_with_final_sigma` (`ΟΣ` → `ος`; Atrium data at `ος`, distinct `ΟΣ` folder: HardDeny `atrium-self`) |
+| R2-9 existing lowercase browser root hid fold siblings | `find_s8_folded_matches` always matches every listing entry by its folded name, so it returns every spelling. The exact `lstat` is only a fallback for unlistable folders. | `round3_r2f9_existing_lowercase_browser_root_does_not_hide_fold_siblings` |
+| R1-11 budgets | All of the above, plus 7.3's budget items. | R2-4 and R2-5 tests; `round2_finding11_budgets_all_fs_caps_and_small_nonzero_alloc` kept |
+
+### 7.3 Neighbouring cases found and fixed
+
+- **Identity (finding 7's class):**
+  - Credential-tree and store-tree members are now walked: a hard link to `~/.gnupg/private-keys-v1.d/k.key` is HardDeny, and one to `~/.aws/sso/cache/tok.json` is a Store hit.
+  - A written recursive root checks write-only identities in the hard-link walk (a hard link of `~/.ssh/config` under a written root is HardDeny).
+  - Tests: `round3_neighbour_hard_links_to_tree_members_and_folded_abs_paths`, `round3_neighbour_written_recursive_root_checks_write_only_identities`.
+- **Folds (finding 8's and 9's class):**
+  - Atrium data and protected paths are discovered under every listed-fold spelling of **every** component (from home, or from `/` outside home), not only siblings of the last component: `/opt/atrium` present only as `/OPT/atrium` is collected.
+  - The builder's fallback for an unlistable folder probes the configured spelling, not the lowercase one.
+  - A link inside a protected folder that leads out keeps the hit (7.1).
+  - Tests: `round3_neighbour_hard_links_to_tree_members_and_folded_abs_paths`, `round3_neighbour_paths_spelled_through_protected_folders_keep_their_hit`.
+- **Walks (finding 3's class):**
+  - The hard-link walk records an unreadable folder or a failed `lstat` as Unread; only its local cutoff counts as clear.
+  - The filter and glob walks record a symlinked folder they cannot canonicalize, instead of silently not descending.
+  - The builder's `~/.ssh`, browser and `ASK_NAME_PREFIXES` walks report gaps.
+  - Test: `round3_neighbour_hard_link_walk_reports_unreadable_folders`.
+- **Linear work (finding 12's class):** `dev`'s `ASK_TREES` directory-prefix rule built one matcher per `/` of a filter (quadratic). It now tries only prefixes that can still match (at most `2 * components + 2`), found in one pass that respects braces. Test: `round3_neighbour_ask_tree_prefix_rule_stays_linear` (`a/` ×5,000).
+- **Budgets (finding 11's class):**
+  - Folding: the listed and extended folds charge their work and allocation bound before running. `SharedSensitive` folds each key path through the budgeted fold. The unlisted-equivalence check compares protected names without allocating and charges the candidate's component list first.
+  - Probe lists are charged before they are built.
+  - Vector growth: outcome and Unread-reason lists grow through `push_charged`, which charges the new buffer before reallocating, and so does `read_dir`'s entry vector. A hit or Exhausted record whose slot is what exhausts the budget is still recorded (§8: a hit found before the budget ran out stands). The final Exhausted record is the only uncharged push, because the budget is already spent.
+  - Paths of 256 bytes or more charge their heap `CString` conversion before each filesystem call.
+
+### 7.4 Change request
+
+**CR-P2-2: carry the identity gaps in `ProtectedSet` (`crates/atrium-core/src/policy/model.rs`).**
+- **Field:** `pub(crate) identity_gaps: Vec<IdentityGap>`, with `IdentityGap { reason: UnreadReason, scope: GapScope, write_only: bool }` and `GapScope { HardLinks, Through(FileIdentity), AnyTarget }` moved from `v4/paths/sensitive.rs` to `model.rs`. Doc: "reasons the builder could not establish every protected identity; a target a gap can affect that is not a hit is Unread (contract §2, §5)."
+- **Why:** collection that stops early must be Unread, never Clear (review round 2, finding 3). The frozen `ProtectedSet` has no field for that, so `check_target(target, protected, budget)` and the entry points that take `&ProtectedSet` cannot see the gaps. Today they reach callers only through `ProtectedSetBuild::apply_identity_gaps`, which P5 must call. That covers each call's top-level targets and the multiply-linked flag, but not entries checked inside a recursive walk.
+- **Failing cases until it lands:**
+  1. `~/.config/atrium/big` holds 4,100 files and `zz_key` hard-linked to `proj/alias`. A standalone `check_target` of `proj/alias` with Write returns Clear (plus the multiply-linked flag; Ask by §1 step 4) instead of Unread.
+  2. `rg -g '*.toml' x proj` with `proj/l -> ~/.config/google-chrome/Default/x.toml`, where the browser walk passed its cap. The selected entry is checked inside `check_recursive_root` and is Clear instead of Unread.
+- **With the field:** `check_target_impl` applies `ProtectedSetBuild::gap_outcomes`' rule itself, and `apply_identity_gaps` and `ProtectedSetBuild` go away.
+
+### 7.5 Corrected dispositions
+
+- §4's CR-P2-1 status is superseded: CR-P2-1 landed in P0 (`b50f726`). The resolver-backed lazy collection it described has been removed (7.1).
+- §1's description of `build_protected_set` and the ~/.ssh walk bounds (`SSH_MAX_ENTRIES = 1,024`, depth 8) is superseded by 7.1: all builder walks use `WALK_MAX_ENTRIES` / `WALK_MAX_DEPTH` and report gaps.
+- §1's description of the listed fold ("per-character") is superseded by R2-8's string-level fold.
+- §2's dispositions are unchanged.
+
+### 7.6 Verification
+
+Run by the worker (D-123): `cargo fmt --all` (clean, `--check` passes), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
+
+For the orchestrator's verification task (fish-compatible):
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core --lib policy::v4::paths
+cargo test --workspace --no-fail-fast
+```
+
+Notes for the run:
+- The FsResolver tests use a temporary folder and a fake home. Two of them (`round3_r2f4_*`, `round3_r2f5_*`) are Linux-only, since they rely on `/proc/self/fd`.
+- The `DT_UNKNOWN` path of `FsResolver::read_dir` cannot be produced on ordinary local filesystems, so it has no runtime test; its charge is visible in the code.
