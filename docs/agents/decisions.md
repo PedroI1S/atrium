@@ -909,3 +909,6 @@ That never allows more than `dev` does, and it removes per-tool semantics as a s
    - P0 (M1-36) gets a short amendment round (the field, its docs, the stubs and tests that build a `ProtectedSet`), then a Codex review, before P0 merges.
    - P1 and P2 are rebased onto P0's amended tip.
    - P0's merge still needs rodrigo's go (D-138).
+
+## D-143 — 2026-11-23 — rodrigo: P1 escalates to Opus 5.5
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P1 (M1-37) had two Neon rework rounds, and its reviews found 9, then 6, then 3 findings (`reviews/M1-37-rev4-p1-command-model.md`, `-round2.md`, `-round3.md`). The 3 left are majors and all one class, §8 budgets: work or allocation done before it is charged. Under PLAN §8.3 and §8.4, round 5 is written by **Opus 5.5**, as a Claude subagent in P1's worktree, with the same brief, the handoff and the three reviews. It must audit the whole class, so every scan, copy and allocation is charged before it happens. Codex GPT-6.1 Sol stays the reviewer.
