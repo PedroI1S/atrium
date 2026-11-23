@@ -1038,8 +1038,17 @@ pub(crate) struct ProtectedSet {
     /// Atrium protected paths (never written; `atrium-self`).
     pub(crate) atrium_protected_paths: Vec<Vec<u8>>,
     /// Identities `(dev, ino)` of existing hard-deny files/trees and `~/.ssh`
-    /// members, mapped to their `HARD_DENY_DEFAULTS` id.
+    /// members that are protected for both reads and writes, mapped to their
+    /// `HARD_DENY_DEFAULTS` id. Write-only protected identities live in
+    /// [`Self::write_only_hard_deny_identities`].
     pub(crate) hard_deny_identities: Vec<(FileIdentity, &'static str)>,
+    /// Identities `(dev, ino)` of existing write-only protected files and
+    /// trees (`~/.ssh/config`, `~/.ssh/authorized_keys`, and
+    /// `atrium_protected_paths` with their member files), mapped to their
+    /// `HARD_DENY_DEFAULTS` id (`"credential-read"` or `"atrium-self"`).
+    /// Checked only when the target's access is not `AccessMode::Read`
+    /// (contract §5, D-142).
+    pub(crate) write_only_hard_deny_identities: Vec<(FileIdentity, &'static str)>,
     /// Identities `(dev, ino)` of existing credential stores that ask (CR-12,
     /// CR-17), mapped to their store family name.
     pub(crate) store_identities: Vec<(FileIdentity, &'static str)>,
@@ -1465,5 +1474,56 @@ mod tests {
             .is_harmless_for_rules()
         );
         assert!(!ModelRedirect::Read { target: out_file }.is_harmless_for_rules());
+    }
+
+    #[test]
+    fn protected_set_separates_read_write_and_write_only_hard_deny_identities() {
+        use atrium_protocol::policy::HARD_DENY_DEFAULTS;
+
+        let rw_id = FileIdentity { dev: 1, ino: 100 };
+        let ssh_config_id = FileIdentity { dev: 1, ino: 200 };
+        let atrium_cfg_id = FileIdentity { dev: 1, ino: 201 };
+
+        let protected = ProtectedSet {
+            home: b"/Users/alice".to_vec(),
+            cwd: b"/Users/alice/proj".to_vec(),
+            atrium_data_paths: vec![b"/Users/alice/.atrium/data".to_vec()],
+            atrium_protected_paths: vec![b"/Users/alice/.atrium/config.toml".to_vec()],
+            hard_deny_identities: vec![(rw_id, "credential-read")],
+            write_only_hard_deny_identities: vec![
+                (ssh_config_id, "credential-read"),
+                (atrium_cfg_id, "atrium-self"),
+            ],
+            store_identities: Vec::new(),
+            ssh_linked_dirs: Vec::new(),
+            folds: FoldRules::REV4,
+        };
+
+        assert_eq!(
+            protected.hard_deny_identities,
+            vec![(rw_id, "credential-read")]
+        );
+        assert_eq!(
+            protected.write_only_hard_deny_identities,
+            vec![
+                (ssh_config_id, "credential-read"),
+                (atrium_cfg_id, "atrium-self"),
+            ]
+        );
+        assert_ne!(
+            protected.hard_deny_identities,
+            protected.write_only_hard_deny_identities
+        );
+
+        for &(_, id) in protected
+            .hard_deny_identities
+            .iter()
+            .chain(&protected.write_only_hard_deny_identities)
+        {
+            assert!(
+                HARD_DENY_DEFAULTS.iter().any(|d| d.id == id),
+                "hard-deny id {id:?} must exist in HARD_DENY_DEFAULTS"
+            );
+        }
     }
 }
