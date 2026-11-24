@@ -1566,7 +1566,7 @@ fn resolve_cmd_sub_readings(
 /// Inserting `n` payloads of total length `L` is O(n + L) charged work in
 /// expectation; inputs whose hashes collide only cost more charged probes.
 #[derive(Default)]
-struct PayloadSet {
+pub(super) struct PayloadSet {
     items: Vec<String>,
     hashes: Vec<u64>,
     /// `0` is empty; otherwise the index into `items`, plus one.
@@ -1603,7 +1603,11 @@ impl PayloadSet {
     }
 
     /// Adds `s` unless it is empty or already present.
-    fn insert(&mut self, s: String, budget: &mut ComputeBudget) -> Result<(), Exhausted> {
+    pub(super) fn insert(
+        &mut self,
+        s: String,
+        budget: &mut ComputeBudget,
+    ) -> Result<(), Exhausted> {
         if s.is_empty() {
             return Ok(());
         }
@@ -1635,7 +1639,7 @@ impl PayloadSet {
         Ok(())
     }
 
-    fn into_vec(self) -> Vec<String> {
+    pub(super) fn into_vec(self) -> Vec<String> {
         self.items
     }
 }
@@ -2720,14 +2724,17 @@ pub(crate) fn brace_expand_budgeted(
     w: &str,
     budget: &mut ComputeBudget,
 ) -> Result<Option<Vec<String>>, Exhausted> {
-    // One pass for this charge's caller, then the `{` and `$` checks.
-    budget.charge((w.len() as u64).saturating_mul(3).max(1))?;
-    if !w.contains('{') {
+    // One charged pass finds both `{` and `$`.
+    budget.charge(w.len().max(1) as u64)?;
+    let (has_brace, has_dollar) = w
+        .bytes()
+        .fold((false, false), |(b, d), c| (b || c == b'{', d || c == b'$'));
+    if !has_brace {
         let mut out = vec_with_capacity_budgeted(1, budget)?;
         out.push(clone_string_budgeted(w, budget)?);
         return Ok(Some(out));
     }
-    if !w.contains('$') && brace_results_lower_bound(w, budget)? > MAX_BRACE_RESULTS {
+    if !has_dollar && brace_results_lower_bound(w, budget)? > MAX_BRACE_RESULTS {
         return Ok(None);
     }
 

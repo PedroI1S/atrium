@@ -756,8 +756,13 @@ fn build_units_and_unwrap_unit_budget_exhaustion_and_linearity() {
     );
 
     // Exhaustion mid-`build_units`: preserves earlier unit and records Exhausted.
+    // Budget: entry + the first unit's lexing (measured alone) + a little,
+    // far short of the 200 padding units.
     let padded = format!("cat ~/.ssh/id_rsa; {}", "echo x; ".repeat(200));
-    let mut b = ComputeBudget::new(150, 20_000);
+    let mut b_first = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let _ = lex_exact("cat ~/.ssh/id_rsa;", 0, None, &mut b_first).unwrap();
+    let first_unit = BIG_UNITS - b_first.remaining_units();
+    let mut b = ComputeBudget::new(first_unit + 20, BIG_ALLOC);
     let parsed = build_units(&padded, &FoldRules::REV4, &mut b).unwrap();
     assert!(has_exhausted(&parsed), "padded line must be Exhausted");
     assert!(!parsed.units.is_empty(), "early unit must be preserved");
@@ -849,4 +854,210 @@ fn build_units_and_unwrap_unit_budget_exhaustion_and_linearity() {
         al <= 32 * large.len() + 65_536 && alloc_ratio <= len_ratio * 2.0,
         "build_units alloc charge exceeds affine bound: small={as_}, large={al}, ratio={alloc_ratio:.2}, len_ratio={len_ratio:.2}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round 5 (review round 3): every scan charged before it runs
+// ---------------------------------------------------------------------------
+
+const BIG_UNITS: u64 = 100_000_000;
+const BIG_ALLOC: usize = 128 * 1024 * 1024;
+
+fn raw_unit(line: &str) -> RawCommandUnit {
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    lex_exact(line, 0, None, &mut b)
+        .unwrap()
+        .units
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+fn charged(b: &ComputeBudget) -> u64 {
+    BIG_UNITS - b.remaining_units()
+}
+
+#[test]
+fn r5_f2_wrapper_operand_scans_are_charged() {
+    // Review round 3, finding 2, failing case: unwrapping charged only 19
+    // units while scanning the 60,000-byte `-n` operand several times.
+    let line = format!("nice -n {} cat", "0".repeat(60_000));
+    let raw = raw_unit(&line);
+    assert_eq!(
+        unwrap_unit(
+            raw.clone(),
+            &FoldRules::REV4,
+            &mut ComputeBudget::new(100, 10_000)
+        ),
+        Err(Exhausted {
+            reason: ExhaustReason::ComputeBudget
+        })
+    );
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let res = unwrap_unit(raw, &FoldRules::REV4, &mut b).unwrap();
+    assert_eq!(res.unit.argv[0].literal_bytes(), b"cat");
+    assert!(charged(&b) >= 60_000, "charged {}", charged(&b));
+
+    // The same for every variable-length scan of exact unwrapping: each
+    // charges at least the operand's length, so half of it exhausts.
+    let n = 20_000;
+    for (line, cmd) in [
+        (format!("nice -n {} cat", "7".repeat(n)), "cat"),
+        (format!("timeout -s {} 5 cat", "S".repeat(n)), "cat"),
+        (format!("timeout -k {} 5 cat", "1".repeat(n)), "cat"),
+        (format!("timeout {}s cat", "1".repeat(n)), "cat"),
+        (format!("nice -{} cat", "n".repeat(n)), "nice"),
+        (format!("{}* x", "a".repeat(n)), ""),
+        (format!("env {}=1 cat", "A".repeat(n)), "env"),
+    ] {
+        let raw = raw_unit(&line);
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let res = unwrap_unit(raw.clone(), &FoldRules::REV4, &mut b).unwrap();
+        if !cmd.is_empty() {
+            assert_eq!(
+                res.unit.argv[0].literal_bytes(),
+                cmd.as_bytes(),
+                "{}",
+                &line[..20]
+            );
+        }
+        assert!(
+            charged(&b) >= n as u64,
+            "`{}…`: charged {} for a {n}-byte operand",
+            &line[..20],
+            charged(&b)
+        );
+        assert!(
+            unwrap_unit(
+                raw,
+                &FoldRules::REV4,
+                &mut ComputeBudget::new(n as u64 / 2, BIG_ALLOC)
+            )
+            .is_err(),
+            "`{}…` must exhaust below its operand's length",
+            &line[..20]
+        );
+    }
+
+    // Wrapper words are moved out with one charged shift of the argv, not
+    // one per wrapper: the charge covers the argv, and stays linear in it.
+    let wrapped = |k: usize| format!("command command command cat {}", "a ".repeat(k));
+    let mut b1 = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let r1 = unwrap_unit(raw_unit(&wrapped(10_000)), &FoldRules::REV4, &mut b1).unwrap();
+    assert_eq!(r1.unit.removed_wrappers.len(), 3);
+    assert_eq!(r1.unit.argv.len(), 10_001);
+    assert!(charged(&b1) >= 10_004);
+    let mut b2 = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let _ = unwrap_unit(raw_unit(&wrapped(20_000)), &FoldRules::REV4, &mut b2).unwrap();
+    assert!((charged(&b2) as f64) / (charged(&b1) as f64) <= 2.5);
+}
+
+#[test]
+fn r5_f2_nested_shell_and_home_scans_are_charged() {
+    let n = 20_000;
+    let sh = tools::lookup("sh").unwrap();
+    let unit_of = |line: &str| {
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        unwrap_unit(raw_unit(line), &FoldRules::REV4, &mut b)
+            .unwrap()
+            .unit
+    };
+
+    // Nested-shell classification scans the script word (glob check, UTF-8
+    // check, copy) and a script file's name; both are charged.
+    let script = unit_of(&format!("sh -c '{}'", "a".repeat(n)));
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    assert!(matches!(
+        classify_nested_shell(&script, "sh", sh, &mut b).unwrap(),
+        NestedShellOutcome::ModeledScript(s) if s.len() == n
+    ));
+    assert!(charged(&b) >= 3 * n as u64);
+    let file = unit_of(&format!("sh {}.sh", "a".repeat(n)));
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    assert!(matches!(
+        classify_nested_shell(&file, "sh", sh, &mut b).unwrap(),
+        NestedShellOutcome::Unread(UnreadReason::Program { .. })
+    ));
+    assert!(charged(&b) >= n as u64);
+    // Each flag letter's lookup is charged.
+    let flags = unit_of(&format!("sh -{}c 'x'", "e".repeat(n)));
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let _ = classify_nested_shell(&flags, "sh", sh, &mut b).unwrap();
+    assert!(charged(&b) >= n as u64);
+
+    // `env`'s HOME check scans each argument once, charged.
+    let env = unit_of(&format!("env -{} x", "a".repeat(n)));
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    assert!(!command_modifies_home("env", &env.argv, &mut b).unwrap());
+    assert!(charged(&b) >= n as u64);
+
+    // The `~` check after a HOME change visits every word, charged.
+    let many = unit_of(&format!("cat {}", "a ".repeat(n)));
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    assert!(!unit_uses_unquoted_tilde(&many, &mut b).unwrap());
+    assert!(charged(&b) >= n as u64);
+}
+
+#[test]
+fn r5_class_build_units_below_cost_keeps_only_finished_values() {
+    // Every compute budget below the smallest clean one gives `Exhausted`,
+    // keeps only units (with their words as written) the full run found, in
+    // order, and never points an outcome at a missing unit. Reservations are
+    // debug-asserted by `push_reserved`.
+    for line in [
+        "sudo id",
+        "command nice -n 5 timeout -s TERM 3 cat a; ls",
+        "HOME=/x cat ~/y; cat ~/z",
+        "sh -c 'sudo id; bash -c \"ls\"'",
+        "command command command command command command command command cat a",
+        "zsh -c x | sh run.sh",
+    ] {
+        let clean = |b: &mut ComputeBudget| {
+            build_units(line, &FoldRules::REV4, b).is_ok_and(|p| !has_exhausted(&p))
+        };
+        let mut bf = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let full = build_units(line, &FoldRules::REV4, &mut bf).unwrap();
+        let mut lo = 0u64;
+        let mut hi = BIG_UNITS;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if clean(&mut ComputeBudget::new(mid, BIG_ALLOC)) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        for units in 0..lo {
+            let res = build_units(
+                line,
+                &FoldRules::REV4,
+                &mut ComputeBudget::new(units, BIG_ALLOC),
+            );
+            let parsed = match res {
+                Err(PartOutcome::Exhausted(_)) => continue,
+                Ok(p) => p,
+                Err(other) => panic!("`{line}` units={units}: {other:?}"),
+            };
+            assert!(has_exhausted(&parsed), "`{line}` units={units}");
+            assert!(parsed.units.len() <= full.units.len());
+            for (i, u) in parsed.units.iter().enumerate() {
+                let kept: Vec<&Word> = u.original_argv().collect();
+                let want: Vec<&Word> = full.units[i].original_argv().collect();
+                assert_eq!(u.index, full.units[i].index);
+                if i + 1 < parsed.units.len() {
+                    assert_eq!(kept, want, "`{line}` units={units} unit {i}");
+                } else {
+                    assert!(
+                        kept.len() <= want.len() && kept[..] == want[..kept.len()],
+                        "`{line}` units={units}: last unit is not a word prefix"
+                    );
+                }
+            }
+            for pr in &parsed.outcomes {
+                if let PartId::Unit(UnitIndex(idx)) = pr.part {
+                    assert!(idx < parsed.units.len(), "`{line}` units={units}");
+                }
+            }
+        }
+    }
 }

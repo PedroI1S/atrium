@@ -24,6 +24,91 @@ fn has_exhausted(out: &LexExactOutput) -> bool {
         .any(|pr| matches!(pr.outcome, PartOutcome::Exhausted(_)))
 }
 
+/// Budgets large enough for every input in this file.
+const BIG_UNITS: u64 = 100_000_000;
+const BIG_ALLOC: usize = 128 * 1024 * 1024;
+
+/// Compute and allocation a clean `lex_exact` run of `line` charges.
+fn exact_cost(line: &str) -> (u64, usize) {
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let out = lex_exact(line, 0, None, &mut b).unwrap();
+    assert!(!has_exhausted(&out), "`{line}` must lex cleanly");
+    (
+        BIG_UNITS - b.remaining_units(),
+        BIG_ALLOC - b.remaining_alloc_bytes(),
+    )
+}
+
+/// `true` iff `res` reports exhaustion, either on entry (`Err`) or among
+/// its outcomes.
+fn exact_exhausted(res: &Result<LexExactOutput, PartOutcome>) -> bool {
+    match res {
+        Err(PartOutcome::Exhausted(_)) => true,
+        Ok(out) => has_exhausted(out),
+        Err(_) => false,
+    }
+}
+
+/// Asserts that `kept` (a run cut short by exhaustion) holds only what the
+/// full run found, in order and whole: every unit but the last equals the
+/// full run's unit, and the last one's argv and redirects are prefixes of the
+/// full run's, made of complete words. Every unit outcome points at a kept
+/// unit.
+fn assert_exact_prefix(kept: &LexExactOutput, full: &LexExactOutput, ctx: &str) {
+    assert!(kept.units.len() <= full.units.len(), "{ctx}: extra units");
+    for (i, u) in kept.units.iter().enumerate() {
+        let f = &full.units[i];
+        assert_eq!(u.index, f.index, "{ctx}: unit {i} index");
+        if i + 1 < kept.units.len() {
+            assert_eq!(u.argv, f.argv, "{ctx}: unit {i} argv");
+            assert_eq!(u.redirects, f.redirects, "{ctx}: unit {i} redirects");
+        } else {
+            assert!(
+                u.argv.len() <= f.argv.len() && u.argv[..] == f.argv[..u.argv.len()],
+                "{ctx}: last unit argv {:?} is not a word prefix of {:?}",
+                u.argv,
+                f.argv
+            );
+            assert!(
+                u.redirects.len() <= f.redirects.len()
+                    && u.redirects[..] == f.redirects[..u.redirects.len()],
+                "{ctx}: last unit redirects are not a prefix"
+            );
+        }
+    }
+    for pr in &kept.outcomes {
+        if let PartId::Unit(UnitIndex(idx)) = pr.part {
+            assert!(
+                idx < kept.units.len(),
+                "{ctx}: outcome for missing unit {idx}"
+            );
+        }
+    }
+}
+
+/// Smallest budget along one dimension (the other one ample) for which
+/// `clean` reports a run without exhaustion.
+fn min_clean_budget(compute: bool, mut clean: impl FnMut(&mut ComputeBudget) -> bool) -> u64 {
+    let make = |n: u64| {
+        if compute {
+            ComputeBudget::new(n, BIG_ALLOC)
+        } else {
+            ComputeBudget::new(BIG_UNITS, usize::try_from(n).unwrap())
+        }
+    };
+    let (mut lo, mut hi) = (0u64, if compute { BIG_UNITS } else { BIG_ALLOC as u64 });
+    assert!(clean(&mut make(hi)), "must finish with ample budget");
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if clean(&mut make(mid)) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
 // ---------------------------------------------------------------------------
 // §3 Allowed unquoted bytes & boundaries
 // ---------------------------------------------------------------------------
@@ -1051,8 +1136,13 @@ fn brace_expand_budgeted_carries_m1_31_n11_guarantees() {
     let res = brace_expand_budgeted(&nested, &mut b).unwrap();
     assert!(res.is_some());
     let charged = start_units - b.remaining_units();
+    // Round 5 charges every pass: the `{`/`$` scan (1), the lower bound's
+    // char copy, pairing walk and pair/stack growth (about 4), the initial
+    // copy (1), and the expansion's char copy, matching walk and stack growth
+    // (about 3): about 9 units per byte, linear. The bound was 8 before those
+    // second walks were charged.
     assert!(
-        charged < (nested.len() as u64) * 8,
+        charged < (nested.len() as u64) * 12,
         "nested braces must be linear, charged {charged} for len {}",
         nested.len()
     );
@@ -1096,9 +1186,10 @@ fn brace_expand_budgeted_carries_m1_31_n11_guarantees() {
 
 #[test]
 fn exhaustion_at_flush_preserves_pending_unit_words_and_reasons() {
-    // Review round 1 finding 1: exact failing case in `lex_exact` — scans both
-    // words, exhausts at `flush_unit`, and retains the pending unit.
-    let mut b = ComputeBudget::new(16, 10_000);
+    // Review round 1 finding 1: exhausting at `flush_unit` (the run's last
+    // compute charge) keeps the pending unit with both words.
+    let (c, _) = exact_cost("sudo id");
+    let mut b = ComputeBudget::new(c - 1, BIG_ALLOC);
     let out = lex_exact("sudo id", 0, None, &mut b).unwrap();
     assert!(
         out.outcomes.iter().any(|pr| matches!(
@@ -1112,17 +1203,11 @@ fn exhaustion_at_flush_preserves_pending_unit_words_and_reasons() {
     assert_eq!(out.units[0].argv[0].literal_bytes(), b"sudo");
     assert_eq!(out.units[0].argv[1].literal_bytes(), b"id");
 
-    // Pending unit's Unread reasons are preserved alongside its words.
-    let mut b_reasons = ComputeBudget::new(19, 10_000);
+    // The pending unit's Unread reasons are kept alongside its words.
+    let (c_r, _) = exact_cost("sudo $id");
+    let mut b_reasons = ComputeBudget::new(c_r - 1, BIG_ALLOC);
     let out_r = lex_exact("sudo $id", 0, None, &mut b_reasons).unwrap();
-    assert!(
-        out_r.outcomes.iter().any(|pr| matches!(
-            pr.outcome,
-            PartOutcome::Exhausted(ExhaustReason::ComputeBudget)
-        )),
-        "{:?}",
-        out_r.outcomes
-    );
+    assert!(has_exhausted(&out_r), "{:?}", out_r.outcomes);
     assert_eq!(out_r.units.len(), 1);
     assert_eq!(out_r.units[0].argv[0].literal_bytes(), b"sudo");
     assert_eq!(out_r.units[0].argv[1].literal_bytes(), b"$id");
@@ -1138,23 +1223,25 @@ fn exhaustion_at_flush_preserves_pending_unit_words_and_reasons() {
         out_r.outcomes
     );
 
-    // Allocation exhaustion at `flush_unit` also retains the pending unit.
-    // Each short word allocates 8 + 8 = 16 bytes across its byte and provenance
-    // buffers (`sudo` = 16, `id` = 16), plus `cur.argv` (cap 4).
-    let pre_flush_alloc = 4 * std::mem::size_of::<Word>() + 32;
-    let mut b_alloc = ComputeBudget::new(10_000, pre_flush_alloc);
+    // Allocation: the unit's slots are reserved before its first word, so
+    // the last allocation of `sudo id` is the buffers of `id`. Running out
+    // there keeps the finished `sudo` (and drops the unfinished `id` whole).
+    let (_, a) = exact_cost("sudo id");
+    let mut b_alloc = ComputeBudget::new(BIG_UNITS, a - 1);
     let out_a = lex_exact("sudo id", 0, None, &mut b_alloc).unwrap();
     assert!(out_a.outcomes.iter().any(|pr| matches!(
         pr.outcome,
         PartOutcome::Exhausted(ExhaustReason::AllocationBudget)
     )));
     assert_eq!(out_a.units.len(), 1);
+    assert_eq!(out_a.units[0].argv.len(), 1);
     assert_eq!(out_a.units[0].argv[0].literal_bytes(), b"sudo");
-    assert_eq!(out_a.units[0].argv[1].literal_bytes(), b"id");
 
-    // Review round 1 finding 1: best-effort `flush_builder` retains the pending
-    // unit when flushing exhausts the budget.
-    let mut b_be = ComputeBudget::new(22, 10_000);
+    // Review round 1 finding 1: best-effort `flush_builder` / conversion keep
+    // the pending unit when the budget runs out one unit short of a clean run.
+    let clean = |b: &mut ComputeBudget| lex_best_effort(&["sudo id"], b).is_ok();
+    let need = min_clean_budget(true, clean);
+    let mut b_be = ComputeBudget::new(need - 1, BIG_ALLOC);
     let mut rec = BestEffortRecord::default();
     let err = lex_best_effort_into(&["sudo id"], &mut rec, &mut b_be);
     assert_eq!(
@@ -1164,7 +1251,7 @@ fn exhaustion_at_flush_preserves_pending_unit_words_and_reasons() {
     assert_eq!(
         rec.units.len(),
         1,
-        "best-effort pending unit must not be dropped at flush"
+        "best-effort pending unit must not be dropped"
     );
     assert_eq!(rec.units[0].raw_argv, ["sudo", "id"]);
     assert_eq!(rec.units[0].effective_argv, ["sudo", "id"]);
@@ -1316,8 +1403,11 @@ fn cached_best_effort_hits_assign_fresh_pipeline_ids() {
 #[test]
 fn budgets_exhaustion_preserves_early_units_and_never_allows_padded_lines() {
     // Exhaustion in `lex_exact`: early unit preserved + Exhausted recorded.
+    // The budget covers the first unit (measured alone) and a little more,
+    // far less than the 200 padding units.
     let padded = format!("cat ~/.ssh/id_rsa; {}", "echo a; ".repeat(200));
-    let mut b = ComputeBudget::new(120, 10_000);
+    let (first_unit, _) = exact_cost("cat ~/.ssh/id_rsa;");
+    let mut b = ComputeBudget::new(first_unit + 20, BIG_ALLOC);
     let out = lex_exact(&padded, 0, None, &mut b).unwrap();
     assert!(has_exhausted(&out), "must record Exhausted");
     assert!(
@@ -1328,8 +1418,16 @@ fn budgets_exhaustion_preserves_early_units_and_never_allows_padded_lines() {
     assert_eq!(out.units[0].argv[1].literal_bytes(), b"~/.ssh/id_rsa");
 
     // Exhaustion on allocation budget in `lex_exact`.
+    // 16 bytes cannot even reserve the slot that records exhaustion, so
+    // `lex_exact` reports it on entry, before lexing anything.
     let mut b_alloc = ComputeBudget::new(100_000, 16);
-    let out_alloc = lex_exact("cat README.md", 0, None, &mut b_alloc).unwrap();
+    assert_eq!(
+        lex_exact("cat README.md", 0, None, &mut b_alloc),
+        Err(PartOutcome::Exhausted(ExhaustReason::AllocationBudget))
+    );
+    let (_, a_cat) = exact_cost("cat README.md");
+    let mut b_alloc_late = ComputeBudget::new(100_000, a_cat - 1);
+    let out_alloc = lex_exact("cat README.md", 0, None, &mut b_alloc_late).unwrap();
     assert!(out_alloc.outcomes.iter().any(|pr| matches!(
         pr.outcome,
         PartOutcome::Exhausted(ExhaustReason::AllocationBudget)
@@ -1412,7 +1510,10 @@ fn budgets_exhaustion_preserves_early_units_and_never_allows_padded_lines() {
     assert_eq!(u1, u2, "memo hit must charge identical compute units");
     assert_eq!(a1, a2, "memo hit must charge identical alloc bytes");
 
-    let mut bm_tight = ComputeBudget::new(110, 100_000);
+    // Enough to finish `cat` (and start the next word), far short of the
+    // line: entry (2) + raw-text copy + worst-case memo lookup, plus 64.
+    let pre_scan = 2 + memo_line.len() as u64 + 4 * (1 + memo_line.len() as u64);
+    let mut bm_tight = ComputeBudget::new(pre_scan + 64, 100_000);
     let mut partial_rec = BestEffortRecord::default();
     let err = lex_best_effort_into(&[memo_line], &mut partial_rec, &mut bm_tight);
     assert_eq!(
@@ -1502,69 +1603,48 @@ fn best_effort_repeated_equals_after_invalid_assignment_prefix_is_linear() {
 
 #[test]
 fn lex_exact_word_buffer_capacity_and_realloc_copy_are_budgeted() {
-    // Review round 2 finding 2: exact failing case — a 1-byte word allocates
-    // 8 + 8 = 16 bytes across its byte and provenance vectors, so a budget
-    // allowing only 2 bytes for the word must exhaust AllocationBudget.
-    let fixed_unit_meta =
-        4 * std::mem::size_of::<Word>() + 4 * std::mem::size_of::<RawCommandUnit>();
+    // Review round 2 finding 2: a word's byte and provenance buffers are
+    // charged by capacity before allocating. Measured as the difference a
+    // second (non-command) word makes, so fixed per-line reservations cancel.
+    let (c_base, a_base) = exact_cost("a");
+    let (c_one, a_one) = exact_cost("a b");
+    let (c_eight, a_eight) = exact_cost("a bcdefghi");
+    let (c_nine, a_nine) = exact_cost("a bcdefghij");
 
-    let mut b_review_case = ComputeBudget::new(10_000, 2 + fixed_unit_meta);
-    let out_review = lex_exact("x", 0, None, &mut b_review_case).unwrap();
-    assert!(
-        out_review.outcomes.iter().any(|pr| matches!(
-            pr.outcome,
-            PartOutcome::Exhausted(ExhaustReason::AllocationBudget)
-        )),
-        "1-byte word's 8+8 capacity must exceed 2-byte allowance: {:?}",
-        out_review.outcomes
-    );
+    // A 1-byte word allocates 8 + 8 = 16 bytes; 8 bytes still fit.
+    assert_eq!(a_one - a_base, 16);
+    assert_eq!(a_eight - a_base, 16);
+    // A 9-byte word grows each buffer from 8 to 16: 32 bytes in all.
+    assert_eq!(a_nine - a_base, 32);
+    // Each byte costs a scan and a push; the 9th also pays the 8 + 8 copy
+    // of the old buffers, charged before the reallocation.
+    assert_eq!(c_nine - c_eight, 2 + 16);
+    assert_eq!(c_eight - c_one, 7 * 2);
+    assert!(c_one > c_base);
 
-    // One byte short of actual allocated capacity (15 + meta) still exhausts.
-    let mut b_short = ComputeBudget::new(10_000, 15 + fixed_unit_meta);
-    let out_short = lex_exact("x", 0, None, &mut b_short).unwrap();
-    assert!(
-        out_short.outcomes.iter().any(|pr| matches!(
-            pr.outcome,
-            PartOutcome::Exhausted(ExhaustReason::AllocationBudget)
-        )),
-        "15-byte word allowance must still exhaust: {:?}",
-        out_short.outcomes
-    );
-
-    // Exact allocated capacity (16 + meta) succeeds with 0 remaining alloc bytes.
-    let mut b_exact = ComputeBudget::new(10_000, 16 + fixed_unit_meta);
-    let out_exact = lex_exact("x", 0, None, &mut b_exact).unwrap();
-    assert!(!has_exhausted(&out_exact), "{:?}", out_exact.outcomes);
-    assert!(unread_reasons(&out_exact).is_empty());
-    assert_eq!(out_exact.units.len(), 1);
-    assert_eq!(out_exact.units[0].argv[0].literal_bytes(), b"x");
-    assert_eq!(b_exact.remaining_alloc_bytes(), 0);
-
-    // Reallocation boundary: a 9-byte word grows each buffer from cap 8 -> 16
-    // (32 bytes allocated total, plus 8 + 8 = 16 copy compute units charged
-    // before reallocation).
-    let mut b_realloc_short = ComputeBudget::new(10_000, 31 + fixed_unit_meta);
-    let out_rs = lex_exact("abcdefghi", 0, None, &mut b_realloc_short).unwrap();
-    assert!(out_rs.outcomes.iter().any(|pr| matches!(
+    // One byte short of the measured allocation exhausts on the second
+    // word's buffers and keeps the finished first word; the exact amount
+    // succeeds with nothing left over.
+    let mut b_short = ComputeBudget::new(BIG_UNITS, a_one - 1);
+    let out_short = lex_exact("a b", 0, None, &mut b_short).unwrap();
+    assert!(out_short.outcomes.iter().any(|pr| matches!(
         pr.outcome,
         PartOutcome::Exhausted(ExhaustReason::AllocationBudget)
     )));
+    assert_eq!(out_short.units.len(), 1);
+    assert_eq!(out_short.units[0].argv.len(), 1);
+    assert_eq!(out_short.units[0].argv[0].literal_bytes(), b"a");
 
-    let mut b_realloc_ok = ComputeBudget::new(10_000, 32 + fixed_unit_meta);
-    let out_ro = lex_exact("abcdefghi", 0, None, &mut b_realloc_ok).unwrap();
-    assert!(!has_exhausted(&out_ro), "{:?}", out_ro.outcomes);
-    assert_eq!(out_ro.units[0].argv[0].literal_bytes(), b"abcdefghi");
-    assert_eq!(b_realloc_ok.remaining_alloc_bytes(), 0);
-    // Exact compute: entry(1) + word_meta(1) + 9*(scan 1 + push 1) + realloc copy(8+8) + unit_meta(1) = 37.
-    let used_compute = 10_000 - b_realloc_ok.remaining_units();
-    assert_eq!(
-        used_compute, 37,
-        "reallocation copy work (8 + 8) must be charged before growing Word buffers"
-    );
+    let mut b_exact = ComputeBudget::new(BIG_UNITS, a_one);
+    let out_exact = lex_exact("a b", 0, None, &mut b_exact).unwrap();
+    assert!(!has_exhausted(&out_exact), "{:?}", out_exact.outcomes);
+    assert!(unread_reasons(&out_exact).is_empty());
+    assert_eq!(out_exact.units[0].argv[1].literal_bytes(), b"b");
+    assert_eq!(b_exact.remaining_alloc_bytes(), 0);
 
-    // Compute budget below the reallocation copy charge exhausts ComputeBudget.
-    let mut b_copy_short = ComputeBudget::new(25, 10_000);
-    let out_cs = lex_exact("abcdefghi", 0, None, &mut b_copy_short).unwrap();
+    // Compute one unit short of the 9-byte word's run exhausts ComputeBudget.
+    let mut b_copy_short = ComputeBudget::new(c_nine - 1, BIG_ALLOC);
+    let out_cs = lex_exact("a bcdefghij", 0, None, &mut b_copy_short).unwrap();
     assert!(out_cs.outcomes.iter().any(|pr| matches!(
         pr.outcome,
         PartOutcome::Exhausted(ExhaustReason::ComputeBudget)
@@ -1769,13 +1849,14 @@ fn linear_charge_growth_from_10kb_to_max_bytes() {
     );
 
     // Separately assert that under P0's frozen default limits this adversarial
-    // input exhausts `AllocationBudget` AND preserves units discovered before
-    // exhaustion (§8).
+    // input is Exhausted AND preserves units discovered before exhaustion
+    // (§8). Which of the two budgets runs out first is not part of the
+    // contract, so either reason is accepted.
     let mut b_def_plain = ComputeBudget::with_default_limits();
-    assert_eq!(
+    assert!(matches!(
         lex_best_effort(&[&adv_large], &mut b_def_plain),
-        Err(PartOutcome::Exhausted(ExhaustReason::AllocationBudget))
-    );
+        Err(PartOutcome::Exhausted(_))
+    ));
 
     let adv_with_early = format!(
         "cat ~/.ssh/id_rsa; echo {}",
@@ -1783,13 +1864,362 @@ fn linear_charge_growth_from_10kb_to_max_bytes() {
     );
     let mut b_def = ComputeBudget::with_default_limits();
     let mut partial = BestEffortRecord::default();
-    assert_eq!(
+    assert!(matches!(
         lex_best_effort_into(&[&adv_with_early], &mut partial, &mut b_def),
-        Err(PartOutcome::Exhausted(ExhaustReason::AllocationBudget))
-    );
+        Err(PartOutcome::Exhausted(_))
+    ));
     assert!(
         !partial.units.is_empty(),
         "units found before default-budget exhaustion must be kept"
     );
     assert_eq!(partial.units[0].raw_argv, ["cat", "~/.ssh/id_rsa"]);
+}
+
+// ---------------------------------------------------------------------------
+// Round 5 (review round 3): nothing done or found without, or before, a charge
+// ---------------------------------------------------------------------------
+
+/// Words of the full run that each kept best-effort unit's `raw_argv` and
+/// redirects are word prefixes of, in some full-run unit.
+fn assert_best_effort_subset(kept: &BestEffortRecord, full: &BestEffortRecord, ctx: &str) {
+    for (pos, u) in kept.units.iter().enumerate() {
+        assert_eq!(u.index, pos, "{ctx}: unit index");
+        assert!(
+            full.units.iter().any(|f| {
+                u.raw_argv.len() <= f.raw_argv.len()
+                    && u.raw_argv[..] == f.raw_argv[..u.raw_argv.len()]
+                    && u.redirects.len() <= f.redirects.len()
+                    && u.redirects[..] == f.redirects[..u.redirects.len()]
+            }),
+            "{ctx}: kept unit {:?} / {:?} is not made of finished words of the full run",
+            u.raw_argv,
+            u.redirects
+        );
+    }
+}
+
+#[test]
+fn r5_f1_completed_word_or_redirect_is_never_dropped() {
+    // Review round 3, finding 1, failing case: 16 allocation bytes. The run
+    // must report exhaustion, and it may not have scanned a word it then
+    // dropped: 16 bytes no longer reach the word's buffers, because the
+    // unit's slots (and the slot recording `Exhausted`) are reserved first.
+    let res = lex_exact("sudo", 0, None, &mut ComputeBudget::new(1000, 16));
+    assert!(exact_exhausted(&res), "{res:?}");
+    if let Ok(out) = &res {
+        for u in &out.units {
+            assert_eq!(u.argv.len(), 1);
+            assert_eq!(u.argv[0].literal_bytes(), b"sudo");
+        }
+    }
+
+    // The same shape one step later: `sudo` is scanned whole and a later
+    // allocation (the reserved-word check's reason string, 4 bytes) fails.
+    // The finished word is kept.
+    let (_, a) = exact_cost("sudo");
+    for short in 1..=4 {
+        let mut b = ComputeBudget::new(BIG_UNITS, a - short);
+        let out = lex_exact("sudo", 0, None, &mut b).unwrap();
+        assert!(out.outcomes.iter().any(|pr| matches!(
+            pr.outcome,
+            PartOutcome::Exhausted(ExhaustReason::AllocationBudget)
+        )));
+        assert_eq!(out.units.len(), 1, "short by {short}");
+        assert_eq!(out.units[0].argv[0].literal_bytes(), b"sudo");
+    }
+
+    // Neighbour: a finished redirect target. The last charge of
+    // `cat > out.txt` comes after the target is read; the redirect is kept.
+    let (c, _) = exact_cost("cat > out.txt");
+    let mut b = ComputeBudget::new(c - 1, BIG_ALLOC);
+    let out = lex_exact("cat > out.txt", 0, None, &mut b).unwrap();
+    assert!(has_exhausted(&out));
+    assert_eq!(out.units.len(), 1);
+    assert!(matches!(
+        &out.units[0].redirects[..],
+        [ModelRedirect::Write { target }] if target.literal_bytes() == b"out.txt"
+    ));
+
+    // Neighbour: an assignment word keeps its `Assignment` reason, whose slot
+    // and work are reserved before the word is scanned.
+    let (c, _) = exact_cost("FOO=1");
+    let mut b = ComputeBudget::new(c - 1, BIG_ALLOC);
+    let out = lex_exact("FOO=1", 0, None, &mut b).unwrap();
+    assert_eq!(out.units.len(), 1);
+    assert!(unread_reasons(&out).contains(&&UnreadReason::Assignment));
+
+    // Neighbour in the best-effort pass: a finished redirect target and a
+    // here-string are kept when the budget runs out one unit early.
+    for line in ["cat > out.txt", "FOO=1 sudo id"] {
+        let need = min_clean_budget(true, |b| lex_best_effort(&[line], b).is_ok());
+        let mut rec = BestEffortRecord::default();
+        let r = lex_best_effort_into(
+            &[line],
+            &mut rec,
+            &mut ComputeBudget::new(need - 1, BIG_ALLOC),
+        );
+        assert!(matches!(r, Err(PartOutcome::Exhausted(_))), "`{line}`");
+        assert_eq!(rec.units.len(), 1, "`{line}`");
+    }
+    let mut rec = BestEffortRecord::default();
+    let need = min_clean_budget(true, |b| lex_best_effort(&["cat > out.txt"], b).is_ok());
+    let _ = lex_best_effort_into(
+        &["cat > out.txt"],
+        &mut rec,
+        &mut ComputeBudget::new(need - 1, BIG_ALLOC),
+    );
+    assert_eq!(
+        rec.units[0].redirects,
+        [(BestEffortRedirectKind::Write, "out.txt".to_string())]
+    );
+    let mut rec = BestEffortRecord::default();
+    let need = min_clean_budget(true, |b| lex_best_effort(&["FOO=1 sudo id"], b).is_ok());
+    let _ = lex_best_effort_into(
+        &["FOO=1 sudo id"],
+        &mut rec,
+        &mut ComputeBudget::new(need - 1, BIG_ALLOC),
+    );
+    assert_eq!(
+        rec.units[0].assignments,
+        [("FOO".to_string(), "1".to_string())]
+    );
+    assert_eq!(rec.units[0].raw_argv, ["sudo", "id"]);
+}
+
+#[test]
+fn r5_class_exact_lexer_below_cost_keeps_only_finished_values() {
+    // Every budget below the measured cost, in each dimension, must give
+    // `Exhausted`, keep only whole words and redirects the full run found,
+    // and never store into a slot that was not reserved (debug-asserted by
+    // `push_reserved`). One unit below the compute cost (the final flush)
+    // keeps everything.
+    for line in [
+        "sudo",
+        "sudo id",
+        "sudo $id",
+        "FOO=1 HOME=/x cat ~/y",
+        "FOO=$x BAR=é cat",
+        "cat > $out 2>&$fd 3< x",
+        "cat README.md > out.txt 2>> err.log",
+        "cat 2>&1 <in.txt; ls",
+        "cat <&3",
+        "if true",
+        "{ cat a",
+        "a | b && c || d",
+        "> out.txt",
+        "cat <<EOF\nsudo id\nEOF\nls",
+    ] {
+        let mut bf = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let full = lex_exact(line, 0, None, &mut bf).unwrap();
+        assert!(!has_exhausted(&full), "`{line}`");
+        let c = BIG_UNITS - bf.remaining_units();
+        let a = BIG_ALLOC - bf.remaining_alloc_bytes();
+
+        for units in 0..c {
+            let res = lex_exact(line, 0, None, &mut ComputeBudget::new(units, BIG_ALLOC));
+            assert!(exact_exhausted(&res), "`{line}`: {units} of {c} units");
+            if let Ok(out) = &res {
+                assert_exact_prefix(out, &full, &format!("`{line}` units={units}"));
+            }
+        }
+        let out = lex_exact(line, 0, None, &mut ComputeBudget::new(c - 1, BIG_ALLOC)).unwrap();
+        assert_eq!(out.units.len(), full.units.len(), "`{line}`");
+        for (k, f) in out.units.iter().zip(&full.units) {
+            assert_eq!(k.argv, f.argv, "`{line}`");
+            assert_eq!(k.redirects, f.redirects, "`{line}`");
+        }
+
+        for alloc in 0..a {
+            let res = lex_exact(line, 0, None, &mut ComputeBudget::new(BIG_UNITS, alloc));
+            assert!(exact_exhausted(&res), "`{line}`: {alloc} of {a} bytes");
+            if let Ok(out) = &res {
+                assert_exact_prefix(out, &full, &format!("`{line}` alloc={alloc}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn r5_class_best_effort_below_cost_keeps_only_finished_values() {
+    // Same class check for the best-effort pass, including recovery during
+    // scanning, conversion, `find -exec` derivation and recursion. The
+    // optional memo makes "measured cost" the smallest clean budget.
+    for line in [
+        "sudo id",
+        "FOO=1 sudo id > out",
+        "cat <<< 'sudo id'",
+        "echo 'sudo id' | sh",
+        "sh -c 'sudo id' && command -p env -i ls",
+        r"find . -exec sh -c 'sudo id' \; ; ls",
+        "cat <<EOF | sh\nsudo id\nEOF",
+    ] {
+        let mut bf = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let full = lex_best_effort(&[line], &mut bf).unwrap();
+        let need_c = min_clean_budget(true, |b| lex_best_effort(&[line], b).is_ok());
+        let need_a = min_clean_budget(false, |b| lex_best_effort(&[line], b).is_ok());
+        for units in 0..need_c {
+            let mut rec = BestEffortRecord::default();
+            let r =
+                lex_best_effort_into(&[line], &mut rec, &mut ComputeBudget::new(units, BIG_ALLOC));
+            assert!(
+                matches!(r, Err(PartOutcome::Exhausted(_))),
+                "`{line}` units={units}"
+            );
+            assert_best_effort_subset(&rec, &full, &format!("`{line}` units={units}"));
+        }
+        for alloc in 0..need_a {
+            let mut rec = BestEffortRecord::default();
+            let r = lex_best_effort_into(
+                &[line],
+                &mut rec,
+                &mut ComputeBudget::new(BIG_UNITS, usize::try_from(alloc).unwrap()),
+            );
+            assert!(
+                matches!(r, Err(PartOutcome::Exhausted(_))),
+                "`{line}` alloc={alloc}"
+            );
+            assert_best_effort_subset(&rec, &full, &format!("`{line}` alloc={alloc}"));
+        }
+    }
+}
+
+#[test]
+fn r5_f3_payload_dedup_is_linear_and_charged() {
+    use super::best_effort::PayloadSet;
+
+    let prefix = "a".repeat(500);
+    let distinct =
+        |n: usize| -> Vec<String> { (0..n).map(|i| format!("echo {prefix}{i:04}")).collect() };
+    let total = |v: &[String]| v.iter().map(String::len).sum::<usize>() as u64;
+    let insert_all = |items: Vec<String>| -> (u64, usize) {
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let mut set = PayloadSet::default();
+        for s in items {
+            set.insert(s, &mut b).unwrap();
+        }
+        (BIG_UNITS - b.remaining_units(), set.into_vec().len())
+    };
+
+    // Review round 3, finding 3: 255 distinct payloads sharing a 500-byte
+    // prefix. Each payload is hashed once and probed O(1) times, never
+    // compared against every earlier payload (32,385 comparisons of the
+    // common prefix before), so the charge is linear in the bytes inserted.
+    let d255 = distinct(255);
+    let t255 = total(&d255);
+    let (c255, n255) = insert_all(d255);
+    assert_eq!(n255, 255);
+    let d510 = distinct(510);
+    let t510 = total(&d510);
+    let (c510, n510) = insert_all(d510);
+    assert_eq!(n510, 510);
+    assert!(
+        c255 <= 2 * t255 + 64 * 255,
+        "charge {c255} for {t255} bytes"
+    );
+    assert!(
+        c510 <= 2 * t510 + 64 * 510,
+        "charge {c510} for {t510} bytes"
+    );
+    assert!(
+        (c510 as f64) / (c255 as f64) <= 2.5,
+        "doubling the payloads must about double the charge: {c255} -> {c510}"
+    );
+
+    // A comparison that does run is charged by the bytes it compares: 255
+    // copies of one payload cost a hash each and a full comparison for each
+    // duplicate, and only one copy is kept.
+    let one = format!("echo {prefix}");
+    let (c_dup, n_dup) = insert_all(vec![one.clone(); 255]);
+    assert_eq!(n_dup, 1);
+    assert!(
+        c_dup >= (255 + 254) * one.len() as u64,
+        "duplicate compares uncharged: {c_dup}"
+    );
+
+    // A budget below the hashing cost exhausts instead of finishing.
+    let mut b = ComputeBudget::new(t255 / 2, BIG_ALLOC);
+    let mut set = PayloadSet::default();
+    let res: Result<(), Exhausted> = distinct(255)
+        .into_iter()
+        .try_for_each(|s| set.insert(s, &mut b));
+    assert!(res.is_err());
+
+    // The review's whole failing line through the best-effort pass: one
+    // `sh` unit and the derived `echo` units of all 255 payloads.
+    let line = format!(
+        "sh {}",
+        (0..255)
+            .map(|i| format!("<(echo {}{i:04})", "a".repeat(500)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    assert_eq!(line.len(), 130_817);
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let rec = lex_best_effort(&[&line], &mut b).unwrap();
+    let mut echoes: Vec<&Vec<String>> = rec
+        .units
+        .iter()
+        .filter(|u| u.derived && u.raw_argv.first().is_some_and(|w| w == "echo"))
+        .map(|u| &u.raw_argv)
+        .collect();
+    echoes.sort();
+    echoes.dedup();
+    assert_eq!(echoes.len(), 255);
+}
+
+#[test]
+fn r5_neighbours_lookups_comparisons_folds_and_memo_are_charged() {
+    let charged = |b: &ComputeBudget| BIG_UNITS - b.remaining_units();
+
+    // P0 table lookups charge their row scan before it runs.
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    assert!(lookup_tool("cat", &mut b).unwrap().is_some());
+    assert!(charged(&b) >= tools::all_tools().len() as u64);
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    assert!(lookup_outside("zsh", &mut b).unwrap().is_some());
+    assert!(charged(&b) >= tools::outside_model().len() as u64);
+    let mut b = ComputeBudget::new(1, BIG_ALLOC);
+    assert!(
+        lookup_tool("cat", &mut b).is_err(),
+        "a lookup must not run uncharged"
+    );
+
+    // CR-19 folding charges each of its passes over an ASCII word: the
+    // basename search, the ASCII check and the lowercase copy.
+    let long = Word::derived("A".repeat(10_000).into_bytes());
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let _ = fold_command_word(&long, &FoldRules::REV4, &mut b).unwrap();
+    assert!(charged(&b) >= 3 * 10_000);
+
+    // Here-document delimiter comparisons are charged by the bytes compared:
+    // body lines as long as the delimiter each cost a full comparison.
+    let delim = "D".repeat(1_000);
+    let here = |body_line: &str| {
+        format!(
+            "cat <<{delim}\n{}{delim}\nls",
+            format!("{body_line}\n").repeat(50)
+        )
+    };
+    let (c_same, _) = exact_cost(&here(&"x".repeat(1_000)));
+    let (c_diff, _) = exact_cost(&here(&"x".repeat(999)));
+    assert!(
+        c_same >= c_diff + 50 * 1_000,
+        "same-length delimiter comparisons uncharged: {c_same} vs {c_diff}"
+    );
+
+    // The memo lookup compares the line with up to `LEX_MEMO` (4) entries;
+    // that is charged before it runs, on a cold and a warm memo alike.
+    let line = format!("echo {}", "m".repeat(20_000));
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let _ = lex_best_effort(&[&line], &mut b).unwrap();
+    assert!(charged(&b) >= 5 * line.len() as u64);
+
+    // Scan 8 walks each pipeline once: doubling the pipelines about doubles
+    // the charge.
+    let pipes = |k: usize| "echo a | sh; ".repeat(k);
+    let mut b60 = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let _ = lex_best_effort(&[&pipes(60)], &mut b60).unwrap();
+    let mut b120 = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let _ = lex_best_effort(&[&pipes(120)], &mut b120).unwrap();
+    assert!((charged(&b120) as f64) / (charged(&b60) as f64) <= 2.5);
 }
