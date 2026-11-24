@@ -19,7 +19,7 @@ use crate::policy::v4::paths::resolve::{
 };
 use crate::policy::v4::paths::sensitive::{
     RootAliases, SharedSensitive, extend_charged, fold_path_listed, lexical_spelling,
-    origin_to_part, push_charged, push_target_records, under_bytes,
+    origin_to_part, other_spellings, push_charged, push_target_records, under_bytes,
 };
 
 #[derive(Debug, Clone)]
@@ -1632,18 +1632,26 @@ pub(crate) fn resolve_subject_paths_impl(
                     Ok(f) => f,
                     Err(e) => return finish_call_exhausted(out, filter_part, e),
                 };
-                let written_root = match target.written.as_deref() {
-                    Some(w) => match fold_path_listed(w, protected.folds, budget) {
-                        Ok(fw) if fw != folded_root => Some((w, fw)),
-                        Ok(_) => None,
-                        Err(e) => return finish_call_exhausted(out, filter_part, e),
-                    },
-                    None => None,
+                // Probes see every spelling: written and protected-root
+                // alias (D-154; review 7, finding 2).
+                let spellings = match other_spellings(
+                    target.written.as_deref(),
+                    canonical,
+                    &folded_root,
+                    protected,
+                    resolver,
+                    caps,
+                    budget,
+                    &mut aliases,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return finish_call_exhausted(out, filter_part, e),
                 };
                 if let Err(e) = check_filter_on_root(
                     canonical,
                     &folded_root,
-                    written_root.as_ref().map(|(w, fw)| (*w, fw.as_slice())),
+                    target.written.as_deref(),
+                    &spellings,
                     filter,
                     false,
                     &filter_part,
@@ -1763,18 +1771,26 @@ pub(crate) fn resolve_subject_paths_impl(
                     Ok(f) => f,
                     Err(e) => return finish_call_exhausted(out, filter_part, e),
                 };
-                let written_root = match implicit.written.as_deref() {
-                    Some(w) => match fold_path_listed(w, protected.folds, budget) {
-                        Ok(fw) if fw != folded_root => Some((w, fw)),
-                        Ok(_) => None,
-                        Err(e) => return finish_call_exhausted(out, filter_part, e),
-                    },
-                    None => None,
+                // Probes see every spelling: written and protected-root
+                // alias (D-154; review 7, finding 2).
+                let spellings = match other_spellings(
+                    implicit.written.as_deref(),
+                    canonical,
+                    &folded_root,
+                    protected,
+                    resolver,
+                    caps,
+                    budget,
+                    &mut aliases,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return finish_call_exhausted(out, filter_part, e),
                 };
                 if let Err(e) = check_filter_on_root(
                     canonical,
                     &folded_root,
-                    written_root.as_ref().map(|(w, fw)| (*w, fw.as_slice())),
+                    implicit.written.as_deref(),
+                    &spellings,
                     filter,
                     false,
                     &filter_part,
@@ -1959,6 +1975,20 @@ pub(crate) fn resolve_subject_paths_impl(
                     budget,
                     &mut out.outcomes,
                 )
+            {
+                return finish_call_exhausted(out, filter_part, e);
+            }
+            // And on the base's protected-root alias (D-154; review 7,
+            // finding 2), when it differs from both.
+            let alias = match aliases.scan(base, protected, resolver, caps, budget) {
+                Ok(s) => s.alias,
+                Err(e) => return finish_call_exhausted(out, filter_part, e),
+            };
+            if let Some(alias) = alias
+                && alias != *base
+                && alias != *base_written
+                && let Err(e) =
+                    check_selector_probes(&alias, g, protected, &shared, budget, &mut out.outcomes)
             {
                 return finish_call_exhausted(out, filter_part, e);
             }

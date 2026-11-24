@@ -782,6 +782,29 @@ pub(crate) mod fake {
             self.inodes[&existing_ino].id
         }
 
+        /// Gives the existing directory at `existing_dir` a second name at
+        /// `path` with the same identity (a bind mount): both names list the
+        /// same entries, and each canonicalizes to its own spelling.
+        pub(crate) fn bind_dir(&mut self, existing_dir: &[u8], path: &[u8]) -> FileIdentity {
+            let (ino, _) = self
+                .walk_internal(existing_dir, true)
+                .expect("bind source must exist");
+            assert!(
+                matches!(self.inodes[&ino].kind, InodeKind::Dir { .. }),
+                "bind source must be a directory"
+            );
+            let (parent, name) = split_parent_name(path);
+            let parent_id = self.mkdir_all(parent);
+            if let Some(Inode {
+                kind: InodeKind::Dir { entries, .. },
+                ..
+            }) = self.inodes.get_mut(&parent_id.ino)
+            {
+                entries.insert(name.to_vec(), ino);
+            }
+            self.inodes[&ino].id
+        }
+
         /// Marks a directory unreadable (`read_dir` and child traversal return
         /// `err`, matching `chmod 000`).
         pub(crate) fn set_dir_unreadable(&mut self, path: &[u8], err: FsIoError) {

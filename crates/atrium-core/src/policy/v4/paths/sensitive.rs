@@ -1543,8 +1543,8 @@ pub(crate) fn check_target_into(
     Ok(())
 }
 
-/// A protected root before canonicalization: spelling, hard-deny id, store
-/// family, (read, held, wholesale).
+/// A protected root before its identity is read: spelling, hard-deny id,
+/// store family, (read, held, reach) (see [`ProtectedRoot`]).
 type SpelledRoot = (
     Vec<u8>,
     Option<&'static str>,
@@ -1552,46 +1552,103 @@ type SpelledRoot = (
     (bool, bool, bool),
 );
 
-/// A protected root as `dev`'s `sensitive_roots` (and its store roots) lists
-/// it, with its canonical path (`dev` canonicalizes its roots).
+/// `dev`'s `ask_roots` reads at most this many entries of each folder that
+/// holds name-prefixed store entries (`take(256)`).
+const ASK_PREFIX_ENTRIES: usize = 256;
+
+/// macOS Data volume firmlink, stripped before the alias scan as `dev`'s
+/// `alias_fix` does (case-sensitive `strip_prefix`).
+const FIRMLINK: &[u8] = b"/System/Volumes/Data";
+
+/// A protected root as `dev`'s `evaluate_sync` lists it for `alias_fix`
+/// (`sensitive_roots` and `ask_roots`, each with its `(dev, ino)` identity
+/// read through links) and for `links_below` (`trees_of`: the canonical
+/// path).
 pub(crate) struct ProtectedRoot {
-    canonical: Vec<u8>,
+    /// `dev`'s `identity(&r)`: `stat`, following links.
+    identity: FileIdentity,
+    /// `dev`'s `trees_of`: the canonical path, when it could be read.
+    canonical: Option<Vec<u8>>,
     spelled: Vec<u8>,
     /// The hard-deny id, or `None` for a store root that asks.
     id: Option<&'static str>,
     /// The store family of a store root.
     family: &'static str,
-    /// Reading counts, not only writing.
+    /// Reading counts, not only writing (`Tree::read`).
     read: bool,
     /// A recursive reader given a folder that holds the root reaches it
-    /// (credential roots, as `dev`'s `Tree::held`).
+    /// (`Tree::held`: `trees_of` sets it for every tree built with the
+    /// `credential-read` id, which includes the store roots that ask).
     held: bool,
-    /// The root itself is protected (`dev`'s `sensitive_roots` and
-    /// `ask_roots`). False for the folder that holds name-prefixed store
-    /// entries (`~/.azure` for MSAL): `dev`'s `ask_roots` lists those
-    /// entries, not the folder, so it serves only to spell the entries
-    /// below it (`alias_fix`) and is never reached wholesale (review 6,
-    /// finding 4).
-    wholesale: bool,
+    /// The root is one of `dev`'s trees (`links_below`). False only for a
+    /// folder that holds name-prefixed store entries (`~/.azure` for MSAL):
+    /// `dev`'s `ask_roots` lists the entries, not the folder, so the folder
+    /// only spells the paths below it (`alias_fix`; the names below it then
+    /// decide) and is never reached wholesale (review 6, finding 4; review
+    /// 7, finding 2).
+    reach: bool,
 }
 
-/// The canonical paths of the protected roots, built once per call through
-/// the resolver (charged), for `dev`'s two alias rules:
-/// - `alias_fix`: a path below a root's canonical path is named as the root's
-///   spelling plus the rest, so the protected names inside an aliased root
-///   (a browser root or `~/.ssh` that is a link) hold even for entries that
-///   do not exist yet;
+/// The result of `dev`'s `alias_fix` scan of one path.
+#[derive(Default)]
+pub(crate) struct AliasScan {
+    /// The root's own spelling plus the rest of the path, when an ancestor
+    /// of the path (or the path) has the identity of a protected root.
+    pub(crate) alias: Option<Vec<u8>>,
+    /// Why the scan could not be completed: the table is incomplete, or an
+    /// ancestor's identity could not be read (a cap or an I/O failure, §8).
+    pub(crate) unread: Option<UnreadReason>,
+}
+
+/// The protected roots with their identities and canonical paths, built once
+/// per call through the resolver (charged), for `dev`'s two alias rules (a
+/// literal port of `gate.rs`, D-154):
+/// - `alias_fix`: a path with an ancestor (or itself) that is the same file
+///   or folder as a protected root, by `(dev, ino)`, is named as the root's
+///   spelling plus the rest. This covers links, bind mounts and any other
+///   second name of a root, even when the root's spelling is canonical;
 /// - `links_below` / `in_trees`: a followed link whose real path is in, is,
-///   or holds a protected root reaches it.
+///   or holds a protected root's canonical path reaches it.
 ///
-/// A root whose canonical path cannot be established for a reason other than
-/// absence (a cap reached, an I/O failure) makes the table incomplete: its
-/// first reason is kept, and every check that finds no alias reports it as
-/// Unread instead of Clear (review 6, finding 2; §8).
+/// Where `dev` skips a root whose identity it cannot read, P2 skips only an
+/// absent one: a cap or an I/O failure makes the table incomplete, its first
+/// reason is kept, and every scan reports it (§8; review 6, finding 2).
 #[derive(Default)]
 pub(crate) struct RootAliases {
     roots: Option<Vec<ProtectedRoot>>,
     incomplete: Option<UnreadReason>,
+}
+
+/// Records the first reason a filesystem step could not be established.
+fn note_unread(
+    slot: &mut Option<UnreadReason>,
+    err: ResolveError,
+    path: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    let reason = match err {
+        ResolveError::Exhausted(e) => return Err(e),
+        ResolveError::CapReached(c) => UnreadReason::from(c),
+        ResolveError::NotFound | ResolveError::Io(_) => {
+            if slot.is_some() {
+                return Ok(());
+            }
+            budget.charge_alloc(path.len())?;
+            UnreadReason::UnresolvablePath {
+                path: path.to_vec(),
+            }
+        }
+    };
+    slot.get_or_insert(reason);
+    Ok(())
+}
+
+/// Absence, as `dev` treats a root or ancestor it cannot find.
+fn is_absent(err: &ResolveError) -> bool {
+    matches!(
+        err,
+        ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)
+    )
 }
 
 impl RootAliases {
@@ -1603,115 +1660,49 @@ impl RootAliases {
         budget: &mut ComputeBudget,
     ) -> Result<&[ProtectedRoot], Exhausted> {
         if self.roots.is_none() {
-            let home = protected.home.as_slice();
-            // Every spelled root is charged before it is built (§8).
-            let total: usize = [".ssh"]
-                .iter()
-                .chain(CRED_FILES)
-                .chain(CRED_TREES)
-                .chain(BROWSER_ROOTS)
-                .copied()
-                .chain(ASK_FILES.iter().map(|(f, _)| *f))
-                .chain(ASK_TREES.iter().map(|(t, _)| *t))
-                .chain(ASK_NAME_PREFIXES.iter().map(|(d, _, _)| *d))
-                .map(|rel| home.len() + 1 + rel.len())
-                .chain(protected.atrium_data_paths.iter().map(Vec::len))
-                .chain(protected.atrium_protected_paths.iter().map(Vec::len))
-                .sum();
-            budget.charge(total as u64 + 1)?;
-            budget.charge_alloc(total)?;
-            let mut spelled: Vec<SpelledRoot> = Vec::new();
-            let mut add = |p: Vec<u8>,
-                           id: Option<&'static str>,
-                           family: &'static str,
-                           flags: (bool, bool, bool),
-                           budget: &mut ComputeBudget|
-             -> Result<(), Exhausted> {
-                push_charged(&mut spelled, (p, id, family, flags), budget)
-            };
-            let cred = Some("credential-read");
-            for rel in std::iter::once(".ssh")
-                .chain(CRED_FILES.iter().copied())
-                .chain(CRED_TREES.iter().copied())
-                .chain(BROWSER_ROOTS.iter().copied())
-            {
-                add(
-                    join_folded(home, rel.as_bytes()),
-                    cred,
-                    "",
-                    (true, true, true),
-                    budget,
-                )?;
-            }
-            for d in &protected.atrium_data_paths {
-                add(
-                    d.clone(),
-                    Some("atrium-self"),
-                    "",
-                    (true, false, true),
-                    budget,
-                )?;
-            }
-            for d in &protected.atrium_protected_paths {
-                add(
-                    d.clone(),
-                    Some("atrium-self"),
-                    "",
-                    (false, false, true),
-                    budget,
-                )?;
-            }
-            for (rel, family) in ASK_FILES.iter().copied().chain(ASK_TREES.iter().copied()) {
-                add(
-                    join_folded(home, rel.as_bytes()),
-                    None,
-                    family,
-                    (true, false, true),
-                    budget,
-                )?;
-            }
-            for (dir, _, family) in ASK_NAME_PREFIXES.iter().copied() {
-                add(
-                    join_folded(home, dir.as_bytes()),
-                    None,
-                    family,
-                    (true, false, false),
-                    budget,
-                )?;
-            }
+            let spelled = self.spelled_roots(protected, resolver, caps, budget)?;
             let mut roots = Vec::new();
-            for (p, id, family, (read, held, wholesale)) in spelled {
+            for (p, id, family, (read, held, reach)) in spelled {
+                // `dev`'s `identity(&r)` (`fs::metadata`, following links).
+                let identity = match resolver.stat(&p, caps, budget) {
+                    Ok(PathMetadata {
+                        identity: Some(i), ..
+                    }) => i,
+                    Ok(_) => {
+                        note_unread(
+                            &mut self.incomplete,
+                            ResolveError::Io(FsIoError::Other),
+                            &p,
+                            budget,
+                        )?;
+                        continue;
+                    }
+                    Err(e) if is_absent(&e) => continue,
+                    Err(e) => {
+                        note_unread(&mut self.incomplete, e, &p, budget)?;
+                        continue;
+                    }
+                };
+                // `dev`'s `trees_of` (`fs::canonicalize`).
                 let canonical = match resolver.canonicalize(&p, caps, budget) {
-                    Ok(c) => c,
-                    Err(ResolveError::Exhausted(e)) => return Err(e),
-                    // Absent: nothing to alias.
-                    Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {
-                        continue;
-                    }
-                    // Not established: the table is incomplete, never
-                    // treated as complete (review 6, finding 2).
-                    Err(ResolveError::CapReached(c)) => {
-                        self.incomplete.get_or_insert(UnreadReason::from(c));
-                        continue;
-                    }
-                    Err(ResolveError::Io(_)) => {
-                        if self.incomplete.is_none() {
-                            budget.charge_alloc(p.len())?;
-                            self.incomplete = Some(UnreadReason::UnresolvablePath { path: p });
-                        }
-                        continue;
+                    Ok(c) => Some(c),
+                    Err(e) if is_absent(&e) => None,
+                    Err(e) => {
+                        note_unread(&mut self.incomplete, e, &p, budget)?;
+                        None
                     }
                 };
                 push_charged(
                     &mut roots,
                     ProtectedRoot {
+                        identity,
                         canonical,
                         spelled: p,
                         id,
                         family,
                         read,
                         held,
-                        wholesale,
+                        reach,
                     },
                     budget,
                 )?;
@@ -1721,51 +1712,155 @@ impl RootAliases {
         Ok(self.roots.as_deref().unwrap_or(&[]))
     }
 
-    /// The reason the table is incomplete, if a root could not be
-    /// established, as an Unread record for `part` (charged).
-    pub(crate) fn incomplete_record(
-        &self,
-        part: &PartId,
+    /// `dev`'s `sensitive_roots` then `ask_roots` (ASK_FILES, ASK_TREES and
+    /// the name-prefixed entries of each prefix folder, at most
+    /// [`ASK_PREFIX_ENTRIES`] read), every spelling charged before it is
+    /// built (§8).
+    fn spelled_roots(
+        &mut self,
+        protected: &ProtectedSet,
+        resolver: &dyn PathResolver,
+        caps: &mut FsCaps,
         budget: &mut ComputeBudget,
-    ) -> Result<Option<PartResult>, Exhausted> {
-        let Some(reason) = &self.incomplete else {
-            return Ok(None);
-        };
-        budget.charge_alloc(unread_reason_alloc_bytes(reason))?;
-        Ok(Some(PartResult {
-            part: part.clone(),
-            outcome: PartOutcome::Unread(reason.clone()),
-        }))
-    }
-
-    /// `dev`'s `alias_fix`: when `canonical` is at or below the canonical path
-    /// of a root whose spelling differs, the root's spelling plus the rest.
-    /// The copied spelling is charged (compute and allocation) before it is
-    /// built (review 6, finding 5).
-    pub(crate) fn rewrite(
-        roots: &[ProtectedRoot],
-        canonical: &[u8],
-        budget: &mut ComputeBudget,
-    ) -> Result<Option<Vec<u8>>, Exhausted> {
-        budget.charge((roots.len() as u64).saturating_mul(canonical.len() as u64 + 1))?;
-        for r in roots {
-            if r.canonical == r.spelled {
-                continue;
-            }
-            if let Some(rest) = under_bytes(canonical, &r.canonical) {
-                let len = r.spelled.len() + 1 + rest.len();
-                budget.charge(len as u64)?;
-                budget.charge_alloc(len)?;
-                return Ok(Some(join_folded(&r.spelled, rest)));
+    ) -> Result<Vec<SpelledRoot>, Exhausted> {
+        let home = protected.home.as_slice();
+        let total: usize = [".ssh"]
+            .iter()
+            .chain(CRED_FILES)
+            .chain(CRED_TREES)
+            .chain(BROWSER_ROOTS)
+            .copied()
+            .chain(ASK_FILES.iter().map(|(f, _)| *f))
+            .chain(ASK_TREES.iter().map(|(t, _)| *t))
+            .chain(ASK_NAME_PREFIXES.iter().map(|(d, _, _)| *d))
+            .map(|rel| home.len() + 1 + rel.len())
+            .chain(protected.atrium_data_paths.iter().map(Vec::len))
+            .chain(protected.atrium_protected_paths.iter().map(Vec::len))
+            .sum();
+        budget.charge(total as u64 + 1)?;
+        budget.charge_alloc(total)?;
+        let mut spelled: Vec<SpelledRoot> = Vec::new();
+        let cred = Some("credential-read");
+        for rel in std::iter::once(".ssh")
+            .chain(CRED_FILES.iter().copied())
+            .chain(CRED_TREES.iter().copied())
+            .chain(BROWSER_ROOTS.iter().copied())
+        {
+            let p = join_folded(home, rel.as_bytes());
+            push_charged(&mut spelled, (p, cred, "", (true, true, true)), budget)?;
+        }
+        for d in &protected.atrium_data_paths {
+            let r = (d.clone(), Some("atrium-self"), "", (true, false, true));
+            push_charged(&mut spelled, r, budget)?;
+        }
+        for d in &protected.atrium_protected_paths {
+            let r = (d.clone(), Some("atrium-self"), "", (false, false, true));
+            push_charged(&mut spelled, r, budget)?;
+        }
+        for (rel, family) in ASK_FILES.iter().copied().chain(ASK_TREES.iter().copied()) {
+            let p = join_folded(home, rel.as_bytes());
+            push_charged(&mut spelled, (p, None, family, (true, true, true)), budget)?;
+        }
+        for (dir, prefix, family) in ASK_NAME_PREFIXES.iter().copied() {
+            let folder = join_folded(home, dir.as_bytes());
+            budget.charge_alloc(folder.len())?;
+            let spelling = (folder.clone(), None, family, (true, false, false));
+            push_charged(&mut spelled, spelling, budget)?;
+            let entries = match resolver.read_dir(&folder, caps, budget) {
+                Ok(e) => e,
+                Err(e) if is_absent(&e) => continue,
+                Err(e) => {
+                    note_unread(&mut self.incomplete, e, &folder, budget)?;
+                    continue;
+                }
+            };
+            for e in entries.iter().take(ASK_PREFIX_ENTRIES) {
+                // `dev`: `to_string_lossy().to_lowercase().starts_with(pre)`.
+                budget.charge(e.name.len() as u64 * 2 + 1)?;
+                budget.charge_alloc(e.name.len().saturating_mul(4))?;
+                let lower = String::from_utf8_lossy(&e.name).to_lowercase();
+                if lower.starts_with(prefix) {
+                    budget.charge(folder.len() as u64 + e.name.len() as u64 + 1)?;
+                    budget.charge_alloc(folder.len() + 1 + e.name.len())?;
+                    let p = join_folded(&folder, &e.name);
+                    push_charged(&mut spelled, (p, None, family, (true, true, true)), budget)?;
+                }
             }
         }
-        Ok(None)
+        Ok(spelled)
+    }
+
+    /// `dev`'s `alias_fix` on a path `canonical`: each ancestor of the path
+    /// (after the firmlink is stripped), shortest first, and the path itself,
+    /// is read through links (charged, as `dev`'s `identity`); the first one
+    /// with the identity of a protected root names the path as that root's
+    /// spelling plus the rest. An absent ancestor ends the scan, as nothing
+    /// below it exists. A cap or an I/O failure ends it too and is reported,
+    /// as is an incomplete table. Every copy is charged before it is built.
+    pub(crate) fn scan(
+        &mut self,
+        canonical: &[u8],
+        protected: &ProtectedSet,
+        resolver: &dyn PathResolver,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<AliasScan, Exhausted> {
+        self.roots(protected, resolver, caps, budget)?;
+        let mut unread = self.incomplete.clone();
+        if let Some(r) = &unread {
+            budget.charge_alloc(unread_reason_alloc_bytes(r))?;
+        }
+        let roots = self.roots.as_deref().unwrap_or(&[]);
+        let path = match canonical.strip_prefix(FIRMLINK) {
+            Some(rest) if rest.is_empty() || rest.starts_with(b"/") => rest,
+            _ => canonical,
+        };
+        let comps = collect_components(path, budget)?;
+        budget.charge(path.len() as u64 + 1)?;
+        budget.charge_alloc(path.len() + 1)?;
+        let mut prefix: Vec<u8> = Vec::with_capacity(path.len() + 1);
+        for (i, comp) in comps.iter().enumerate() {
+            prefix.push(b'/');
+            prefix.extend_from_slice(comp);
+            let id = match resolver.stat(&prefix, caps, budget) {
+                Ok(md) => md.identity,
+                Err(e) if is_absent(&e) => break,
+                Err(e) => {
+                    note_unread(&mut unread, e, &prefix, budget)?;
+                    break;
+                }
+            };
+            let Some(id) = id else { continue };
+            budget.charge(roots.len() as u64 + 1)?;
+            if let Some(r) = roots.iter().find(|r| r.identity == id) {
+                let rest = &comps[i + 1..];
+                let len = r.spelled.len() + rest.iter().map(|c| c.len() + 1).sum::<usize>();
+                budget.charge(len as u64 + 1)?;
+                budget.charge_alloc(len + 1)?;
+                let mut out = Vec::with_capacity(len + 1);
+                out.extend_from_slice(&r.spelled);
+                for c in rest {
+                    if out.last() != Some(&b'/') {
+                        out.push(b'/');
+                    }
+                    out.extend_from_slice(c);
+                }
+                return Ok(AliasScan {
+                    alias: Some(out),
+                    unread,
+                });
+            }
+        }
+        Ok(AliasScan {
+            alias: None,
+            unread,
+        })
     }
 
     /// `dev`'s `in_trees` for a walker that follows links (`names_dir`): the
     /// root a followed link's real path `real` is in (a root's own folder
-    /// only when the walker reads into it), is, or holds. Only roots that
-    /// are protected wholesale count.
+    /// only when the walker reads into it), is, or holds, by canonical path
+    /// (`trees_of`).
     pub(crate) fn reached<'r>(
         roots: &'r [ProtectedRoot],
         real: &[u8],
@@ -1774,35 +1869,41 @@ impl RootAliases {
     ) -> Result<Option<&'r ProtectedRoot>, Exhausted> {
         budget.charge((roots.len() as u64).saturating_mul(real.len() as u64 + 1))?;
         Ok(roots.iter().find(|t| {
+            let Some(path) = t.canonical.as_deref() else {
+                return false;
+            };
             t.read
-                && t.wholesale
-                && ((under_bytes(real, &t.canonical).is_some()
-                    && (real != t.canonical.as_slice() || !real_is_dir))
-                    || t.canonical.as_slice() == real
-                    || (t.held && under_bytes(&t.canonical, real).is_some()))
+                && t.reach
+                && ((under_bytes(real, path).is_some() && (real != path || !real_is_dir))
+                    || path == real
+                    || (t.held && under_bytes(path, real).is_some()))
         }))
+    }
+
+    /// The reason the table is incomplete, if any.
+    pub(crate) fn incomplete(&self) -> Option<&UnreadReason> {
+        self.incomplete.as_ref()
     }
 }
 
-/// `dev`'s `alias_fix` for a resolved target: when its canonical path lies
-/// at or below the canonical path of a protected root whose spelling differs
-/// (a browser root or `~/.ssh` that is a link, say), the protected names are
-/// checked on the root's spelling plus the rest, so they hold even for an
-/// entry that does not exist yet: the listed folds first, then the unlisted
-/// equivalences, as for every spelling (review 6, finding 3; §11 item 13).
-/// When no alias is found and the alias table is incomplete, the reason is
-/// returned as Unread (review 6, finding 2). Variant-only matches are never
-/// hits.
-pub(crate) fn alias_name_hit(
+/// `dev`'s `alias_fix` for a resolved target ([`RootAliases::scan`] of its
+/// canonical path), appended to `out` as each record is established: when
+/// the alias differs from the canonical path, its protected names (listed
+/// folds), else its unlisted equivalences as Unread (§11 item 13); and,
+/// unless a hard-deny hit was found, the scan's reason for doubt (an
+/// incomplete table, an unreadable ancestor) as Unread beside any Store hit
+/// (§1, §8; review 7, finding 3). Variant-only matches are never hits.
+pub(crate) fn push_alias_records(
     target: &Target,
     protected: &ProtectedSet,
     resolver: &dyn PathResolver,
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
     aliases: &mut RootAliases,
-) -> Result<Option<PartResult>, Exhausted> {
+    out: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
     let TargetResolution::Resolved { canonical, .. } = &target.resolution else {
-        return Ok(None);
+        return Ok(());
     };
     if matches!(
         target.origin,
@@ -1811,30 +1912,79 @@ pub(crate) fn alias_name_hit(
             ..
         }
     ) {
-        return Ok(None);
+        return Ok(());
     }
     let part = origin_to_part(&target.origin);
-    let roots = aliases.roots(protected, resolver, caps, budget)?;
-    let Some(alias) = RootAliases::rewrite(roots, canonical, budget)? else {
-        return aliases.incomplete_record(&part, budget);
-    };
-    if let Some(hit) = written_name_hit(&alias, target.access, &part, protected, budget)? {
-        return Ok(Some(hit));
+    let scan = aliases.scan(canonical, protected, resolver, caps, budget)?;
+    let mut hard = false;
+    if let Some(alias) = scan.alias
+        && alias != *canonical
+    {
+        if let Some(hit) = written_name_hit(&alias, target.access, &part, protected, budget)? {
+            hard = matches!(hit.outcome, PartOutcome::HardDenyHit(_));
+            push_charged(out, hit, budget)?;
+        } else {
+            let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
+            if shared.matches_unlisted_equivalence(&alias, target.access, budget)? {
+                let record = PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence {
+                        path: alias,
+                    }),
+                };
+                push_charged(out, record, budget)?;
+            }
+        }
     }
-    let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
-    if shared.matches_unlisted_equivalence(&alias, target.access, budget)? {
-        return Ok(Some(PartResult {
+    if !hard && let Some(reason) = scan.unread {
+        let record = PartResult {
             part,
-            outcome: PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence { path: alias }),
-        }));
+            outcome: PartOutcome::Unread(reason),
+        };
+        push_charged(out, record, budget)?;
     }
-    Ok(None)
+    Ok(())
 }
 
-/// Every record of `target` ([`check_target_into`]) plus its alias name hit
-/// ([`alias_name_hit`]), appended to `outcomes` as each is established, so
-/// a later exhaustion never loses one (§1, §8; review 6, finding 1). Clear
-/// is recorded only when `keep_clear`.
+/// Spellings of a root, each with its listed fold.
+pub(crate) type Spellings = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// The other spellings of a root whose canonical path folds to
+/// `folded_root`, each with its listed fold, deduplicated by fold: its
+/// written spelling (D-147, D-149) and its alias (`dev`'s `alias_fix`,
+/// [`RootAliases::scan`]). They give names only (probes, S8, the store
+/// rule); every filesystem step uses the real root. The scan's reason for
+/// doubt is recorded by [`push_alias_records`] on the root itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn other_spellings(
+    written: Option<&[u8]>,
+    canonical: &[u8],
+    folded_root: &[u8],
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    aliases: &mut RootAliases,
+) -> Result<Spellings, Exhausted> {
+    let alias = aliases
+        .scan(canonical, protected, resolver, caps, budget)?
+        .alias;
+    let mut spellings: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for s in written.into_iter().chain(alias.as_deref()) {
+        let folded = fold_path_listed(s, protected.folds, budget)?;
+        if folded != folded_root && !spellings.iter().any(|(_, f)| *f == folded) {
+            budget.charge(s.len() as u64 + 1)?;
+            budget.charge_alloc(s.len())?;
+            push_charged(&mut spellings, (s.to_vec(), folded), budget)?;
+        }
+    }
+    Ok(spellings)
+}
+
+/// Every record of `target` ([`check_target_into`]) plus its alias records
+/// ([`push_alias_records`]), appended to `outcomes` as each is established,
+/// so a later exhaustion never loses one (§1, §8). Clear is recorded only
+/// when `keep_clear`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push_target_records(
     target: &Target,
@@ -1847,10 +1997,7 @@ pub(crate) fn push_target_records(
     keep_clear: bool,
 ) -> Result<(), Exhausted> {
     check_target_into(target, protected, budget, outcomes, keep_clear)?;
-    if let Some(hit) = alias_name_hit(target, protected, resolver, caps, budget, aliases)? {
-        push_charged(outcomes, hit, budget)?;
-    }
-    Ok(())
+    push_alias_records(target, protected, resolver, caps, budget, aliases, outcomes)
 }
 
 impl ProtectedRoot {

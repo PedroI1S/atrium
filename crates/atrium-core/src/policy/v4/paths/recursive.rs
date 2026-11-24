@@ -17,9 +17,9 @@ use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl};
 use crate::policy::v4::paths::sensitive::{
     ASK_FILES, ASK_NAME_PREFIXES, ASK_TREES, BROWSER_FILES, BROWSER_ROOTS, CRED_FILES, CRED_TREES,
-    RootAliases, SharedSensitive, alias_name_hit, check_target_into, extend_charged,
-    fold_listed_component, fold_path_listed, join_folded, origin_to_part, push_charged,
-    push_target_records, under_bytes, under_str,
+    RootAliases, SharedSensitive, check_target_into, extend_charged, fold_listed_component,
+    fold_path_listed, join_folded, origin_to_part, other_spellings, push_alias_records,
+    push_charged, push_target_records, under_bytes, under_str,
 };
 
 fn finish_recursive_exhausted(
@@ -108,36 +108,26 @@ pub(crate) fn check_recursive_root_impl(
     let mut exempt_root = is_s8_exempt(&folded_root, shared.home_folded());
 
     // D-147, D-149: the root's other spellings are named like the canonical
-    // one, as on `dev`: its written spelling, and `dev`'s alias spelling when
-    // it lies below a protected root that is a link (`alias_fix`). They give
+    // one, as on `dev`: its written spelling, and `dev`'s alias spelling
+    // (`alias_fix`, by ancestor identity, D-154). They give
     // names only; every filesystem check below uses the real root
     // (`root_canon`), never a spelling (review 5's class rule).
-    let alias = match aliases.roots(protected, resolver, caps, budget) {
-        Ok(roots) => match RootAliases::rewrite(roots, root_canon, budget) {
-            Ok(a) => a,
-            Err(e) => return finish_recursive_exhausted(result, root_part, e),
-        },
+    let spellings = match other_spellings(
+        root.written.as_deref(),
+        root_canon,
+        &folded_root,
+        protected,
+        resolver,
+        caps,
+        budget,
+        aliases,
+    ) {
+        Ok(s) => s,
         Err(e) => return finish_recursive_exhausted(result, root_part, e),
     };
-    let mut spellings: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for s in root.written.iter().chain(alias.iter()) {
-        let folded = match fold_path_listed(s, protected.folds, budget) {
-            Ok(f) => f,
-            Err(e) => return finish_recursive_exhausted(result, root_part, e),
-        };
-        if folded != folded_root && !spellings.iter().any(|(_, f)| *f == folded) {
-            if let Err(e) = budget.charge_alloc(s.len()) {
-                return finish_recursive_exhausted(result, root_part, e);
-            }
-            if let Err(e) = push_charged(&mut spellings, (s.clone(), folded), budget) {
-                return finish_recursive_exhausted(result, root_part, e);
-            }
-        }
-    }
     for (_, folded_s) in &spellings {
         exempt_root |= is_s8_exempt(folded_s, shared.home_folded());
     }
-    let written = spellings.first().map(|(s, f)| (s.as_slice(), f.as_slice()));
 
     // 2. S8 protected-root policy (§5, §11 item 12): a recursive root that
     //    contains an existing hard-deny path is HardDeny whatever its filters.
@@ -206,7 +196,8 @@ pub(crate) fn check_recursive_root_impl(
         && let Err(e) = check_filter_on_root(
             root_canon,
             &folded_root,
-            written,
+            root.written.as_deref(),
+            &spellings,
             filter,
             true,
             &filter_part,
@@ -412,7 +403,7 @@ fn find_s8_folded_matches(
                 match resolver.lstat(&cand, caps, budget) {
                     Ok(_) => {
                         if !next.contains(&cand) {
-                            next.push(cand);
+                            push_charged(&mut next, cand, budget)?;
                         }
                     }
                     Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {}
@@ -466,7 +457,7 @@ fn find_s8_folded_matches(
                     let cand = join_bytes(dir, &entry.name);
                     budget.charge(next.len() as u64 + 1)?;
                     if !next.contains(&cand) {
-                        next.push(cand);
+                        push_charged(&mut next, cand, budget)?;
                     }
                 }
             }
@@ -1278,7 +1269,8 @@ fn match_raw_bytes_path(
 pub(crate) fn check_filter_on_root(
     root_canon: &[u8],
     folded_root: &[u8],
-    written_root: Option<(&[u8], &[u8])>,
+    written_root: Option<&[u8]>,
+    probe_spellings: &[(Vec<u8>, Vec<u8>)],
     filter: &SearchFilter,
     recursive: bool,
     filter_part: &PartId,
@@ -1431,7 +1423,7 @@ pub(crate) fn check_filter_on_root(
                     // record kept, a Store hit beside a gap's Unread (review 5,
                     // finding 6).
                     let mut resolved = resolved;
-                    if let Some((w, _)) = written_root {
+                    if let Some(w) = written_root {
                         let copied = w.len() + 1 + entry_rel.len();
                         budget.charge(copied as u64)?;
                         budget.charge_alloc(copied)?;
@@ -1580,11 +1572,11 @@ pub(crate) fn check_filter_on_root(
         }
     };
 
-    // Probes are matched relative to the canonical root and, when it differs,
-    // to the written root (D-147).
-    budget.charge_alloc(2 * std::mem::size_of::<&[u8]>())?;
+    // Probes are matched relative to every spelling of the root: canonical,
+    // written (D-147) and protected-root alias (D-154; review 7, finding 2).
+    budget.charge_alloc((1 + probe_spellings.len()) * std::mem::size_of::<&[u8]>())?;
     let probe_roots: Vec<&[u8]> = std::iter::once(folded_root)
-        .chain(written_root.map(|(_, f)| f))
+        .chain(probe_spellings.iter().map(|(_, f)| f.as_slice()))
         .collect();
     for probe_root in probe_roots {
         // 2a. Hard-deny probes (best-effort probe matching per §2 & brief).
@@ -1920,34 +1912,46 @@ fn walk_followed_links(
                     {
                         // Also check S8 on a followed link into a folder holding credentials
                         // (e.g. `proj/link_aws -> ~/.aws` with `~/.aws/credentials` present).
+                        // Named on the canonical path and on its protected-root
+                        // alias (`alias_fix`, D-154), on the real folder.
                         let folded = fold_path_listed(&canonical, protected.folds, budget)?;
+                        let alias_folds = other_spellings(
+                            None, &canonical, &folded, protected, resolver, caps, budget, aliases,
+                        )?;
                         let mut link_s8_outcomes = Vec::new();
-                        let s8 = match check_s8_protected_root(
-                            &canonical,
-                            &folded,
-                            part,
-                            protected,
-                            shared,
-                            resolver,
-                            caps,
-                            budget,
-                            &mut link_s8_outcomes,
-                        ) {
-                            Ok(s8) => s8,
-                            // The records established before the exhaustion are
-                            // kept (§1, §8; review 6, finding 1's class).
-                            Err(e) => {
-                                emit_followed_link_records(
-                                    link_s8_outcomes,
-                                    &canonical,
-                                    part,
-                                    has_filter,
-                                    budget,
-                                    outcomes,
-                                )?;
-                                return Err(e);
+                        let mut s8 = false;
+                        for f in std::iter::once(&folded).chain(alias_folds.iter().map(|(_, f)| f))
+                        {
+                            match check_s8_protected_root(
+                                &canonical,
+                                f,
+                                part,
+                                protected,
+                                shared,
+                                resolver,
+                                caps,
+                                budget,
+                                &mut link_s8_outcomes,
+                            ) {
+                                Ok(hit) => s8 |= hit,
+                                // The records established before the exhaustion are
+                                // kept (§1, §8; review 6, finding 1's class).
+                                Err(e) => {
+                                    emit_followed_link_records(
+                                        link_s8_outcomes,
+                                        &canonical,
+                                        part,
+                                        has_filter,
+                                        budget,
+                                        outcomes,
+                                    )?;
+                                    return Err(e);
+                                }
                             }
-                        };
+                            if s8 {
+                                break;
+                            }
+                        }
                         if s8 {
                             if has_filter {
                                 budget.charge_alloc(canonical.len())?;
@@ -1969,9 +1973,14 @@ fn walk_followed_links(
                         } else {
                             // Preserve any I/O or walk-cap Unreads observed while checking the linked root.
                             extend_charged(outcomes, link_s8_outcomes, budget)?;
-                            if let Some(family) =
-                                root_contains_store_or_exempt_sensitive(&folded, shared)
-                            {
+                            if let Some(family) = root_contains_store_or_exempt_sensitive(
+                                &folded, shared,
+                            )
+                            .or_else(|| {
+                                alias_folds.iter().find_map(|(_, f)| {
+                                    root_contains_store_or_exempt_sensitive(f, shared)
+                                })
+                            }) {
                                 if has_filter {
                                     budget.charge_alloc(canonical.len())?;
                                     push_charged(
@@ -2093,7 +2102,7 @@ fn walk_followed_links(
 }
 
 /// The records of a followed link's target: [`check_target_into`] (written and
-/// canonical names, identities, gaps), `dev`'s alias rule ([`alias_name_hit`])
+/// canonical names, identities, gaps), `dev`'s alias rule ([`push_alias_records`])
 /// and `dev`'s `links_below` rule: a link whose real path is in, is, or holds
 /// a canonical protected root reaches it. Each record is appended to `out` as
 /// soon as it is established.
@@ -2109,9 +2118,7 @@ fn followed_link_records(
     out: &mut Vec<PartResult>,
 ) -> Result<(), Exhausted> {
     check_target_into(target, protected, budget, out, false)?;
-    if let Some(hit) = alias_name_hit(target, protected, resolver, caps, budget, aliases)? {
-        push_charged(out, hit, budget)?;
-    }
+    push_alias_records(target, protected, resolver, caps, budget, aliases, out)?;
     if let TargetResolution::Resolved { canonical, .. } = &target.resolution {
         // When the type cannot be read, "not a folder" is the stricter
         // answer: the root's own path then counts as reached.

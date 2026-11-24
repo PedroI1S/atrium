@@ -495,7 +495,7 @@ pub(crate) fn expand_shell_glob_written(
         )?;
         let mut t = t;
         t.written = word_spelling(pattern, written_cwd, home, budget)?;
-        expansion.exact_matches.push(t);
+        push_charged(&mut expansion.exact_matches, t, budget)?;
         let e = word_entry_path(pattern, cwd, home, budget)?;
         push_charged(&mut entries, e, budget)?;
         return Ok((expansion, entries));
@@ -880,7 +880,7 @@ pub(crate) fn expand_shell_glob_written(
         )?;
         let mut fallback = fallback;
         fallback.written = word_spelling(pattern, written_cwd, home, budget)?;
-        expansion.exact_matches.push(fallback);
+        push_charged(&mut expansion.exact_matches, fallback, budget)?;
         let e = word_entry_path(pattern, cwd, home, budget)?;
         push_charged(&mut entries, e, budget)?;
     }
@@ -901,19 +901,26 @@ pub(crate) fn expand_shell_glob_written(
         )?;
         let mut target = target;
         target.written = if relative {
-            let rest: Vec<&[u8]> = matched
+            // The relative spelling is copied without an intermediate list,
+            // charged before it is built (§8; review 7, finding 4).
+            budget.charge(matched.len() as u64 + 1)?;
+            budget.charge_alloc(matched.len())?;
+            let mut rel = Vec::with_capacity(matched.len());
+            for c in matched
                 .split(|&b| b == b'/')
                 .filter(|c| !c.is_empty())
                 .skip(cwd_comps)
-                .collect();
-            budget.charge(matched.len() as u64 + 1)?;
-            budget.charge_alloc(matched.len() + rest.len() * std::mem::size_of::<&[u8]>())?;
-            let rel = rest.join(&b'/');
+            {
+                if !rel.is_empty() {
+                    rel.push(b'/');
+                }
+                rel.extend_from_slice(c);
+            }
             lexical_spelling(&rel, written_cwd, home, budget)?
         } else {
             lexical_spelling(&matched, b"/", home, budget)?
         };
-        expansion.exact_matches.push(target);
+        push_charged(&mut expansion.exact_matches, target, budget)?;
         budget.charge_alloc(matched.len())?;
         push_charged(&mut entries, Some(matched), budget)?;
     }
@@ -934,7 +941,7 @@ pub(crate) fn expand_shell_glob_written(
         )?;
         let mut target = target;
         target.written = None;
-        expansion.variant_only_matches.push(target);
+        push_charged(&mut expansion.variant_only_matches, target, budget)?;
     }
 
     Ok((expansion, entries))
