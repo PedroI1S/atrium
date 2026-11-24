@@ -1016,3 +1016,19 @@ Each change is additive and keeps every existing field. P2 doesn't use `RuleEval
 - no change request against the interface appears.
 
 If the count stalls or rises, a blocker appears, or an interface change is requested, the orchestrator brings it to the driver. Failing tests found by the verification go into the same round.
+
+## D-156 — 2026-11-24 — rodrigo: trigger detection never consumes option values; P3 escalates to Opus 5.5
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P3's (M1-39) reviews found 14, 2 and then 3 findings, so the count rose (`reviews/M1-39-rev4-p3-tools-rules-round3.md`). All three new findings come from round 3's sweep, which started modelling how many values each option consumes:
+- GNU `tar -s` is boolean, so treating it as taking a value swallowed `-x`;
+- `git diff --unified` takes an optional value, so treating it as taking one swallowed `--ext-diff`;
+- `gawk -Wsource=` supplies code.
+
+D-141 removed flag arities from these rows precisely to avoid this.
+
+**The ruling (§6, D-141):**
+- When P3 looks for triggers, code and pinned programs, **no word is consumed as an option's value**.
+- Any word that could be a trigger under some reading makes the unit Unread. So does any letter of a short-option cluster that could be one, or any form that could supply code (`-e`, `-f`, `-W…`, `--source`, …).
+- Over-approximating is accepted. It only adds Unread, so more asks and never a missed hit. Round 2's `git -Csrc` finding is therefore closed by this ruling: a `c` in a cluster may fire.
+- Arities stay only where the frozen table lists them: the Search rows' flag tables, `dev`'s forbidden flags, and the §4 wrappers.
+
+**Escalation (PLAN §8.3, §8.4):** P3 had two Neon rework rounds and still has majors. Round 4 is written by **Opus 5.5**, as a Claude subagent in P3's worktree. It removes the arity modelling outside the table, applies this ruling in core and in the app's validator together, and fixes review 3's three findings. Codex GPT-6.1 Sol stays the reviewer.
