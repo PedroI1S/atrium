@@ -545,3 +545,46 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core policy::v4:: -- --nocapture
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 9 (D-150)
+
+Short round under D-150 for review round 7's one major (`.orchestration/review-input/review-round7.md`).
+
+### Finding: best-effort entry charge came before the `MAX_BYTES` check
+- **Cause:** `lex_best_effort_into` charged its entry work before testing the total input length. An oversized input with a spent budget was `Exhausted` (Ask) instead of `TooLarge(Bytes)` (Deny), against §1 and §8.
+- **Fix:** the saturating sum of the texts' lengths (length metadata only, one step per text, no input byte) and the `MAX_BYTES` check now come first. The entry charge, which covers that walk, follows. `lex_best_effort` does nothing before delegating, so both entry points are fixed.
+
+### Audit: every structural cap before any fallible charge
+- **`lex_exact` / `lex_exact_core`:** `MAX_BYTES` is tested before the entry charge. This covers modeled `-c` scripts too, since `build_units` recurses through the same core and a script is never longer than its line.
+- **`build_units` / `build_units_with_hook`:** `MAX_BYTES` before the entry charge. The best-effort pass it calls checks first as well.
+- **`lex_best_effort` / `lex_best_effort_into`:** fixed above.
+- **`fold_command_word`, `unwrap_unit`:** no structural cap. `MAX_WRAP` and `MAX_DEPTH` are Unread reasons, not caps.
+- **`MAX_UNITS`:** can only be known while lexing. Every place that stores a unit checks it before charging, and round 8 made every exhaustion-recovery path return `TooLarge(Units)` for a finished unit past the cap. The memo hit checks it before charging its copy.
+
+### Tests
+- `r9_max_bytes_beats_exhaustion_at_every_entry_point`:
+  - **inputs:** the review's case (one text of `MAX_BYTES + 1`), and three multi-text inputs whose sum exceeds the cap (two halves, three thirds, halves mixed with short texts);
+  - **budgets:** zero and tiny (`(0, usize::MAX)`, `(0, 0)`, `(1, 1)`, `(3, 0)`);
+  - **checked:** both best-effort entry points (`TooLarge(Bytes)`, nothing recorded), `lex_exact` and `build_units` with the oversized text;
+  - **contrast:** exactly `MAX_BYTES` with a zero budget is `Exhausted`.
+
+### Change requests
+None.
+
+### Round 9 verification
+Run by the worker (D-123):
+- `cargo fmt --all`: clean
+- `cargo check -p atrium-core --tests`: clean
+- `cargo clippy -p atrium-core --tests -- -D warnings`: clean
+
+Not run (D-123): any test.
+
+Commands for the orchestrator's verification task (fish-compatible):
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4:: -- --nocapture
+cargo test --workspace --no-fail-fast
+```
