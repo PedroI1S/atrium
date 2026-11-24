@@ -142,3 +142,74 @@ pnpm --dir app run typecheck
 pnpm --dir app test -- src/chat/rule-form.test.ts
 ./scripts/check-protocol-ts
 ```
+
+
+---
+
+## Round 2
+
+Rework addressing all 14 findings from `.orchestration/review-input/review-round1.md` and implementing CR-P3-1, CR-P3-2, and CR-P3-3 under D-153 (leaving CR-P3-4 as-is).
+
+### 1. Findings fixed and regression tests
+
+| # | Finding | Fix | Regression test(s) |
+|---|---|---|---|
+| 1 | `RuleCoverage` ignored P1/P2 `Unread` & `Exhausted` outcomes (CR-P3-3) | Added `outcomes: &'a [PartResult]` to `RuleEvalContext` (`policy/model.rs`). `evaluate_rules` (`v4/rules.rs`) now scans `call.effects`, `call.outcomes`, and `call.targets` (including `variant_only`), never granting Allow coverage or suppressing Deny for plain `Unread` (outside a single pinned `Unread(Program)` with no competing plain `Unread`/`Exhausted`) or `Exhausted` (which blocks even unscoped `Any`). | `v4/rules/tests.rs::finding_1_p1_p2_unread_and_exhausted_block_allow_and_do_not_suppress_deny` (Unread target, P1 `Assignment`, P2 `AfterPossibleWriter`, `WholeCall` `UnknownCwd`, `Exhausted` blocking unscoped `Any`, and pinned `python build.py` combined with an Unread target). |
+| 2 | Partial coverage suppressed lower-ranked Deny rules | Retained `dev`'s call-level suppression in `evaluate_rules`: `all_units_and_be_covered` breaks out of the rank loop only when the whole call is covered; while uncovered, `deny_command_matches` checks every exact and best-effort unit without skipping covered units. | `v4/rules/tests.rs::precedence_and_best_effort_deny_semantics` (fixed `cat a && ls b` assertion to expect Global Deny `r_g_deny_cat`; added full-coverage suppression case `cat a && ls b` with both Thread Allows). |
+| 3 | Matched Deny could be lost to post-match exhaustion | `evaluate_rules` pre-charges compute and allocation for the Deny reason and `RuleId` **before** calling `deny_rule_matches`, so committing an established Deny is infallible (`String::with_capacity` + `push_str`). | `v4/rules/tests.rs::finding_3_matched_deny_never_lost_to_post_match_exhaustion` (sweeps compute units `0..=80` — covering `(12, 1_048_576)` — and allocation `0..=256`, asserting monotonic Deny preservation). |
+| 4 | `check_git_selection` discarded earlier `StoreHit`s on later exhaustion | Amended `check_git_selection` to return `GitSelectionOutcome { results, exhausted }` and added `check_git_selection_into` (`v4/tools.rs`, `v4/tools/git.rs`), pre-reserving result slots before each operand so established `StoreHit`s survive later exhaustion. | `v4/tools/tests.rs::classify_unit_and_git_selection_respect_compute_and_alloc_budgets` (`git show -- ':!x' y` sweep across compute budgets `0..=40`, verifying retained `StoreHit` alongside `ExhaustReason::ComputeBudget`). |
+| 5 | BSD/macOS bare `sed -i` could hide a trigger (`sed -i p 'w out' input`) | `classify_sed` (`v4/tools.rs`) now consumes only an empty suffix (`sed -i '' ...`) cleanly; any other bare `-i` form sets `uncertain = true` and emits `UnreadReason::CodeRunnerInlineCode`. | `v4/tools/tests.rs::conditional_runners_find_git_sed` (`sed -i p 'w out' input`, `sed -ni p 'w out' input`, `sed -i 's/a/b/' input` → `CodeRunnerInlineCode`; `sed -i '' 's/a/b/' input` and `-i.bak` remain clear). |
+| 6 | Deny `path_scope` used existential matching and ignored `Unread` targets | `deny_path_scope_ok` (`v4/rules.rs`) now calls `all_targets_match_glob`, requiring every canonical target to be resolved and inside `path_scope` (rejecting `Unread` and `variant_only` targets); existential `deny_targets_match_glob` is kept solely for the Deny `PathGlob` matcher itself. | `v4/rules/tests.rs::finding_6_deny_path_scope_requires_every_target_and_rejects_unread` (mixed `/proj/a` + `/elsewhere/b`, `/proj/a` + Unread target, all in-scope, and Deny `PathGlob` existential check). |
+| 7 | Daemon validator mirror diverged from core (CR-P3-1; `["sed", "z"]`) | Exposed `pub fn validate_rule_matcher` in `crates/atrium-core/src/policy/mod.rs` calling `v4::rules::validate_rule_draft_reason`. `crates/atrium-daemon/src/commands.rs` calls it for both `CreateRule` and `ListRules` and removes the entire 731-line `validate_rule_v4` mirror. | `v4/rules/tests.rs::finding_7_public_core_validator_matches_v4_rules`; `crates/atrium-daemon/tests/create_rule.rs` (`["sed", "z"]` and D-141 unknown tools accepted by `CreateRule` and listed valid). |
+| 8 | App retained pre-D-141 per-tool guards (`deno`, `bun`, `php`, `lua`, `pwsh`, etc.) | Rewrote `commandRisk` and `checkStoredRule` in `app/src/chat/rule-form.ts` to match core's frozen D-141 six row kinds 1-to-1 (accepting unknown tools like `deno`/`bun`/`php`/`lua`/`pwsh`, `sed z`, and `command_exact` rules). Rewrote/dropped conflicting carried tests in `app/src/chat/rule-form.test.ts` (dispositions below). | `app/src/chat/rule-form.test.ts` (`rev 4 §7 & D-141 parity with core`, `stored invalid rules (§11 item 5)`). |
+| 9 | Stored invalid rules were not marked in the rendered Settings rules list (CR-P3-2) | Added `pub struct ListedRule` (`invalid_reason: Option<String>` with `#[serde(default)]`) in `atrium-protocol`, registered in `examples/export-ts.rs`, mirrored in `bindings/protocol.ts` and `app/src/daemon/types.ts`, returned by daemon `ListRules`, consumed by `Settings.tsx` and `app/src/chat/rules.ts`, and rendered via `app/src/ui/RulesList.tsx` (`data-invalid="true"`, `"needs-you"` dot, reason + `"covers nothing"`, active Delete button). | `crates/atrium-protocol/src/policy.rs::listed_rule_wire_compatibility_and_invalid_reason_default`; `crates/atrium-daemon/tests/create_rule.rs`; `app/src/chat/rules.test.ts`; `app/src/ui/rules-list.test.ts` (rendered `happy-dom` test). |
+| 10 | Root pathspecs (`git show HEAD -- .`, lone `:`) escaped CR-12 checks | `v4/tools/git.rs` now recognizes root ancestor selections (`.`, `./`, `..`, `src/..`, `/`, `""`) in pathspec context (`allow_root_ancestor = true`) and lone `:` pathspec as `StoreHit`, while keeping revision-object parsing (`HEAD:.`, `:0:path`, `-L`) separate (`allow_root_ancestor = false`). | `v4/tools/tests.rs::git_selection_cr12_and_cr17_stores` (`git show HEAD -- .`, `./`, `..`, `src/..`, `:`, `git show -- .`, while `git show HEAD:.` stays clear). |
+| 11 | `--noglob-pathspecs` left wildcards active | `v4/tools/git.rs` tracks `pathspec_magic_enabled` separately from `default_glob_wildcards` and parses `:(literal)` / `:(glob)` magic flags: `--noglob-pathspecs` makes `*`/`?`/`[` literal by default while keeping pathspec magic (`:!`, `:(glob)`) active. | `v4/tools/tests.rs::git_selection_cr12_and_cr17_stores` (`--noglob-pathspecs status -- '*.rs'` clear, `--noglob-pathspecs status -- ':(glob)*.rs'` → `GitWildcardPathspec`, `--noglob-pathspecs show HEAD -- ':!*.rs'` → `StoreHit` only). |
+| 12 | Program pinning rescanned a word before charging | `ProgramPin::FirstOperand` in `v4/tools.rs` retains the validated `&str` views from `word_as_str_budgeted`, removing the uncharged `w.as_str()` UTF-8 rescan. Also swept `v4/tools.rs`, `v4/tools/git.rs`, and `v4/rules.rs` so every loop/scan charges before running. | `v4/tools/tests.rs::classify_unit_and_git_selection_respect_compute_and_alloc_budgets` (`python <2048-byte script>` boundary sweep proving exhaustion before cloning `program_words`). |
+| 13 | Search test invented unsupported `rg --no-follow` flag | Replaced the unsupported toggle expectation in `v4/tools/tests.rs` with `UnknownFlag` + `!home_readonly_eligible` (matching the frozen table), and added a table-supported `grep -R -r` toggle check. | `v4/tools/tests.rs::search_tools_rg_and_grep`. |
+| 14 | Daemon fixture created `data_dir` with 0755 permissions | `crates/atrium-daemon/tests/create_rule.rs` now creates `&rig.paths.data_dir` with `atrium_host::lifecycle::secure_dir` (0700) before opening the store. | `crates/atrium-daemon/tests/create_rule.rs::list_rules_keeps_stored_invalid_rules_visible_with_invalid_reason`. |
+
+### 2. Interface changes made under D-153
+
+1. **`crates/atrium-core/src/policy/mod.rs` (CR-P3-1):**
+   - Added `pub fn validate_rule_matcher(matcher: &RuleMatcher, decision: RuleDecision, path_scope: Option<&str>) -> Result<(), String>` delegating to `v4::rules::validate_rule_draft_reason(..., &model::FoldRules::REV4)`.
+2. **`crates/atrium-core/src/policy/model.rs` (CR-P3-3):**
+   - Additively added `pub(crate) outcomes: &'a [PartResult]` to `RuleEvalContext<'a>` with a doc comment citing §7 and D-153.
+3. **`crates/atrium-protocol/src/policy.rs`, `examples/export-ts.rs`, `bindings/protocol.ts` (CR-P3-2):**
+   - Added `pub struct ListedRule` (all `Rule` fields plus `#[serde(default)] pub invalid_reason: Option<String>` and `ListedRule::from_rule`), registered it in `export-ts.rs`, and added the matching `export type ListedRule` in `bindings/protocol.ts` and `app/src/daemon/types.ts`. Wire-compatible with both `Vec<ListedRule>` and `Vec<Rule>`.
+4. **`crates/atrium-core/src/policy/v4/tools.rs` (Finding 4 / D-153 widening):**
+   - Added `pub(crate) struct GitSelectionOutcome { pub results: Vec<PartResult>, pub exhausted: Option<Exhausted> }`, updated `check_git_selection` to return `GitSelectionOutcome` (instead of `Result<Vec<PartResult>, Exhausted>` which dropped prior `StoreHit`s on later exhaustion), and added `check_git_selection_into` writing into a caller-provided `Vec<PartResult>`.
+
+### 3. Corrected §12 dispositions for `app/src/chat/rule-form.test.ts`
+
+To align `app/src/chat/rule-form.ts` 1-to-1 with core's frozen D-141 six-row table (Finding 8), the following carried pre-D-141 tests from `dev` / `M1-29` were rewritten or dropped:
+
+| Carried test in `app/src/chat/rule-form.test.ts` | Disposition | Reason (D-141 / §7 / §12) |
+|---|---|---|
+| `refuses unpinned shells, eval, bare source/., and every wrapper` (asserted refusal on `command_exact` and on §4 wrappers `env`/`exec`/`command`/`time`/`nice`/`timeout` and `sudo`/`doas`) | **Rewritten** | Core `validate_rule_matcher` only restricts Allow `CommandPrefix` on `OUTSIDE_MODEL`, `NestedShell`, `CodeRunner`, and `ConditionalRunner`; §4 `Wrapper` rows and `CommandExact` are accepted. Replaced by `refuses unpinned Allow prefixes for OUTSIDE_MODEL shells/wrappers, NestedShell, CodeRunner, and ConditionalRunner` and `accepts CommandExact rules and Deny rules matching core validate_rule_matcher`. |
+| `refuses inline-code flags on interpreters` (`python3 -c`, `node -e`, `php -r`, `lua -e`, `osascript -e`, `deno eval`, `bun -e` on `command_exact` and prefix) | **Rewritten** | `python`/`python3`/`node`/`perl`/`ruby` Allow prefixes without a script pin remain refused; `deno`, `bun`, `php`, `lua`, `osascript` were removed from the frozen table by D-141 and are now asserted accepted as unknown tools. |
+| `refuses PowerShell given code, by any prefix PowerShell accepts` (`pwsh`, `powershell`) | **Dropped** | `pwsh`/`powershell` are absent from the frozen D-141 table (unknown tools); replaced by unknown-tool parity assertion. |
+| `refuses privilege wrappers` (`run0`, `sudoedit`, `pkexec`, `doas`, `su -c`) | **Rewritten** | `su` remains refused as a `COMMAND_RUNNERS` Allow prefix; `run0`/`sudoedit`/`pkexec`/`doas` are outside the frozen table (privilege escalation is enforced by hard-deny, not prefix validation). |
+| `refuses a prefix rule on an interpreter, runner or find unless the script, package or file comes right after it` (`deno`, `bun`, `uvx`, `pnpx`, `command_exact` `-c` checks) | **Rewritten** | Retained for frozen-table `FirstOperand` runners (`python`, `python3`, `node`, `perl`, `ruby`, `source`, `.`, `npx`) and `find`; dropped `deno`/`bun`/`uvx`/`pnpx` and `command_exact` refusals to match core. |
+| `bun exec, package runner -c, stdin scripts, and bare exact rules` (`bun exec`, `pnpx`/`bunx`/`uvx -c`, `/dev/stdin`, bare `command_exact` interpreters) | **Dropped** | Pre-D-141 per-tool guards removed by D-141; core `validate_rule_matcher` accepts `CommandExact` and treats `bun`/`pnpx`/`bunx`/`uvx` as unknown tools. |
+
+### 4. Updated verification commands
+
+#### Run by worker (D-123)
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core -p atrium-daemon -p atrium-protocol --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core -p atrium-daemon -p atrium-protocol --tests -- -D warnings` — clean (0 errors, 0 warnings)
+
+#### Commands for the orchestrator's verification task (fish-compatible)
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4::tools:: -- --nocapture
+cargo test -p atrium-core policy::v4::rules:: -- --nocapture
+cargo test -p atrium-protocol policy::tests:: -- --nocapture
+cargo test -p atrium-daemon --test create_rule -- --nocapture
+cargo test --workspace --no-fail-fast
+./scripts/check-protocol-ts
+pnpm --dir app run typecheck
+pnpm --dir app test -- src/chat/rule-form.test.ts src/chat/rules.test.ts src/ui/rules-list.test.ts
+```
