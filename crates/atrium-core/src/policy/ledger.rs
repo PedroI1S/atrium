@@ -90,18 +90,22 @@ impl Ledger {
             incarnation,
             request_id: self.new_request_id(),
         };
-        let rememberable = binding
-            .as_ref()
-            .is_some_and(|b| b.remember_matcher.is_some());
+        let unread = binding.as_ref().and_then(|b| b.unread);
+        // Contract rev 4 §7 & §9: Unread / Exhausted asks are never rememberable.
+        let rememberable = unread.is_none()
+            && binding
+                .as_ref()
+                .is_some_and(|b| b.remember_matcher.is_some());
         match &binding {
             Some(b) => self.store.open_approval(&key, b).await,
             None => self.store.open_question(&key, turn).await,
         }
         .map_err(|_| LedgerError::Store)?;
-        Ok(ApprovalTicket {
-            request_id: key.request_id,
+        Ok(ApprovalTicket::with_notice(
+            key.request_id,
             rememberable,
-        })
+            unread,
+        ))
     }
 
     fn rule_id(key: &RequestKey) -> RuleId {
@@ -185,25 +189,29 @@ impl ApprovalLedger for Ledger {
                             if status != "pending" {
                                 return Err(refused(Some(&status)));
                             }
-                            binding.remember_matcher.map(|matcher| Rule {
-                                id: Self::rule_id(&key),
-                                scope: match scope {
-                                    RememberScope::Thread => RuleScope::Thread {
-                                        thread_id: key.thread.clone(),
+                            if binding.unread.is_some() {
+                                None
+                            } else {
+                                binding.remember_matcher.map(|matcher| Rule {
+                                    id: Self::rule_id(&key),
+                                    scope: match scope {
+                                        RememberScope::Thread => RuleScope::Thread {
+                                            thread_id: key.thread.clone(),
+                                        },
+                                        RememberScope::Home => RuleScope::Home,
+                                        RememberScope::Global => RuleScope::Global,
                                     },
-                                    RememberScope::Home => RuleScope::Home,
-                                    RememberScope::Global => RuleScope::Global,
-                                },
-                                tool_kind: binding.tool_kind,
-                                tool_name: Some(binding.tool_name.clone()),
-                                matcher,
-                                path_scope: None,
-                                decision: RuleDecision::Allow,
-                                origin: RuleOrigin::Approval {
-                                    request_id: key.request_id.clone(),
-                                },
-                                created_at_ms: now_ms(),
-                            })
+                                    tool_kind: binding.tool_kind,
+                                    tool_name: Some(binding.tool_name.clone()),
+                                    matcher,
+                                    path_scope: None,
+                                    decision: RuleDecision::Allow,
+                                    origin: RuleOrigin::Approval {
+                                        request_id: key.request_id.clone(),
+                                    },
+                                    created_at_ms: now_ms(),
+                                })
+                            }
                         }
                     };
                     let id = rule.as_ref().map(|r| r.id.clone());

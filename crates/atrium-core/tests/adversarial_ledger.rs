@@ -659,10 +659,7 @@ async fn an_unknown_or_foreign_ticket_is_never_redeemed() {
     let g = sql.gate(&t, inc);
     let c = cmd_check("touch a");
     // a ticket that was never opened
-    let forged = ApprovalTicket {
-        request_id: "req_0_0".into(),
-        rememberable: false,
-    };
+    let forged = ApprovalTicket::new("req_0_0".into(), false);
     assert!(is_deny(&g.redeem(&forged, &c).await));
     // a ticket opened by another gate over the same store (same thread): this
     // gate never opened it

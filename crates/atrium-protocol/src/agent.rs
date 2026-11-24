@@ -174,6 +174,9 @@ pub enum AgentEvent {
         /// offers only allow/deny once.
         #[serde(default)]
         rememberable: bool,
+        /// Present when Atrium couldn't read the call in full (contract rev 4 §9).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unread: Option<UnreadNotice>,
     },
     /// The agent asked the user something. Answer with
     /// [`SessionCommand::AnswerQuestion`] or dismiss with
@@ -314,6 +317,17 @@ pub enum TurnOutcome {
     Failed,
     /// The provider stopped on a turn or token limit.
     LimitReached,
+}
+
+/// Why Atrium couldn't check a tool call in full (contract rev 4 §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadNotice {
+    /// Part of the call is outside the command or path model.
+    Unread,
+    /// The check ran out of its budget, or the tool subject is unknown.
+    Exhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

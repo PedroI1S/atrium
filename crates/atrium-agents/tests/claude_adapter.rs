@@ -76,10 +76,7 @@ impl TestGate {
 }
 
 fn ticket(id: &str, rememberable: bool) -> ApprovalTicket {
-    ApprovalTicket {
-        request_id: id.into(),
-        rememberable,
-    }
+    ApprovalTicket::new(id.into(), rememberable)
 }
 
 fn ask() -> GateDecision {

@@ -1233,13 +1233,8 @@ impl Actor {
             self.pending_withdrawals.push((ticket, permit));
         }
         for (request_id, (_, _, permit)) in self.questions.drain() {
-            self.pending_withdrawals.push((
-                ApprovalTicket {
-                    request_id,
-                    rememberable: false,
-                },
-                permit,
-            ));
+            self.pending_withdrawals
+                .push((ApprovalTicket::new(request_id, false), permit));
         }
     }
 
@@ -1325,10 +1320,7 @@ impl Actor {
         self.questions.retain(|request_id, (n, _, permit)| {
             if n == native {
                 withdrawn.push((
-                    ApprovalTicket {
-                        request_id: request_id.clone(),
-                        rememberable: false,
-                    },
+                    ApprovalTicket::new(request_id.clone(), false),
                     permit.take(),
                 ));
                 false
@@ -1930,13 +1922,7 @@ impl Actor {
                     },
                 });
                 if let Some((native, _input, permit)) = question {
-                    self.queue_withdraw(
-                        ApprovalTicket {
-                            request_id,
-                            rememberable: false,
-                        },
-                        permit,
-                    );
+                    self.queue_withdraw(ApprovalTicket::new(request_id, false), permit);
                     self.deny_can_use(&native, "The user declined to answer.");
                 }
             }
@@ -2278,10 +2264,7 @@ mod tests {
         let input = json!({"command":"ls"});
         Internal::Redeem {
             native: native.into(),
-            ticket: ApprovalTicket {
-                request_id: "T1".into(),
-                rememberable: false,
-            },
+            ticket: ApprovalTicket::new("T1".into(), false),
             check: tool_check(Some("toolu_1"), "Bash", &input, 1),
             input,
             decision: GateDecision::Deny {
@@ -2354,10 +2337,7 @@ mod tests {
         let ask = |a: &mut Actor| {
             a.on_internal(Internal::Question {
                 native: "c1".into(),
-                ticket: Some(ApprovalTicket {
-                    request_id: "Q1".into(),
-                    rememberable: false,
-                }),
+                ticket: Some(ApprovalTicket::new("Q1".into(), false)),
                 input: json!({}),
                 failed: false,
                 permit: None,
@@ -2394,10 +2374,7 @@ mod tests {
         let key = gate_key(Some("toolu_1"), "Bash", &input);
         a.hook_asked.entry(key).or_default().push_back((
             Some("toolu_1".into()),
-            ApprovalTicket {
-                request_id: "H1".into(),
-                rememberable: false,
-            },
+            ApprovalTicket::new("H1".into(), false),
             None,
         ));
         let tool_result = json!({
@@ -2422,16 +2399,8 @@ mod tests {
         //    is queued for withdrawal.
         let mut a = actor("redeeming-cancel", &[init_line(), bash_call()]);
         a.live.insert(Req::CanUse("c1".into()));
-        a.redeeming.insert(
-            "c1".into(),
-            (
-                ApprovalTicket {
-                    request_id: "R1".into(),
-                    rememberable: false,
-                },
-                None,
-            ),
-        );
+        a.redeeming
+            .insert("c1".into(), (ApprovalTicket::new("R1".into(), false), None));
         a.forget_native("c1");
         assert_eq!(
             a.pending_withdrawals
@@ -2450,10 +2419,7 @@ mod tests {
             },
             check,
             decision: GateDecision::Ask {
-                ticket: ApprovalTicket {
-                    request_id: "L1".into(),
-                    rememberable: false,
-                },
+                ticket: ApprovalTicket::new("L1".into(), false),
             },
             failed: false,
             permit: None,

@@ -983,3 +983,91 @@ P2's next round, round 5 (Opus 5.5, D-142), applies this ruling, keeps the rest 
    - Neither changes behaviour: nothing is wired into `SessionGate` (D-138). The merge stays local, and the push happens at handoff (D-005).
    - P2, P3 and P4 rebase onto `dev` from now on. A later P0 change request becomes a small task on `dev`.
 2. **P2 (M1-38).** Review 6 (`reviews/M1-38-rev4-p2-paths-round6.md`) closed round 5's findings and both CR-P2-3 cases, and accepted the pure `check_target` alias limit. It found five new findings, two of them high, mostly in the alias code round 7 ported from `dev`. **Exception to PLAN §8.4:** Opus 5.5 writes one more round and sweeps two classes: a hit is kept before any fallible check, and every filesystem error in the checking phase is Unread. If the next review still has findings, they come back to the driver.
+
+## D-153 — 2026-11-24 — orchestrator (PLAN §8.4): P3's owned paths widen for CR-P3-1 to CR-P3-3
+**Decided by the orchestrator under PLAN §8.4** ("if a fix needs paths outside the task's owned paths, the orchestrator widens that task's owned paths, unless another running task owns them"). P3's (M1-39) first review (`reviews/M1-39-rev4-p3-tools-rules.md`, 14 findings) found that the workarounds for three of P3's change requests leave defects:
+- **CR-P3-1:** the daemon mirrors the §7 validator, and the mirror already diverges from core.
+- **CR-P3-2:** Settings never shows stored invalid rules.
+- **CR-P3-3:** rule coverage can't see P1's and P2's unit-level Unread, so a prefix Allow can suppress a Deny.
+
+P0 is merged (D-152), and no running task owns those files. So P3's round 2 may also edit:
+- `crates/atrium-core/src/policy/mod.rs`: a public validation entry point;
+- `crates/atrium-core/src/policy/model.rs`, only to add per-unit outcomes to `RuleEvalContext`;
+- the `Rule` listing in `atrium-protocol`, its TypeScript mirror, and the Settings rules list that renders invalid rules.
+
+Each change is additive and keeps every existing field. P2 doesn't use `RuleEvalContext`. CR-P3-4 is not a defect. P4's first review has one low finding (jargon in the Settings text), which goes back to P4.
+
+## D-154 — 2026-11-24 — rodrigo: P2's alias rules are a literal port of `dev`'s
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P2's (M1-38) review 7 (`reviews/M1-38-rev4-p2-paths-round7.md`) closed round 6's findings and found four more, all in the protected-root alias code that round 7 rebuilt from `dev`'s idea. The review counts went 7, 6, 5, 4. The two high findings are differences from `dev`:
+- `dev`'s `alias_fix` compares ancestor **identities**, so it catches a protected root reached under another name, such as a bind mount. P2 compares canonical spellings.
+- Filter probes ignore alias spellings.
+
+**Exception to PLAN §8.4:** Opus 5.5 writes one more P2 round. It **ports `dev`'s `alias_fix` and `links_below` (`deny.rs`/`engine.rs`) as literally as P2's types allow**, by ancestor identity, with budgets charged. It doesn't reinvent them.
+- Probes run on every applicable spelling: canonical, written and alias.
+- It also fixes review 7's other two findings.
+- If the next review still has findings, they come back to the driver.
+
+## D-155 — 2026-11-24 — rodrigo: P2 keeps its Opus rounds while findings fall
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P2's (M1-38) review counts fell one per round after D-145: 7, 6, 5, 4, 3 (`reviews/M1-38-rev4-p2-paths-round8.md`). Each round's findings are narrower than the last.
+
+**Standing exception to PLAN §8.4 for P2 only:** Opus 5.5 keeps writing P2's rounds, without coming back to the driver each time, while three conditions hold:
+- each review finds fewer findings than the one before;
+- no review finds a blocker;
+- no change request against the interface appears.
+
+If the count stalls or rises, a blocker appears, or an interface change is requested, the orchestrator brings it to the driver. Failing tests found by the verification go into the same round.
+
+## D-156 — 2026-11-24 — rodrigo: trigger detection never consumes option values; P3 escalates to Opus 5.5
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P3's (M1-39) reviews found 14, 2 and then 3 findings, so the count rose (`reviews/M1-39-rev4-p3-tools-rules-round3.md`). All three new findings come from round 3's sweep, which started modelling how many values each option consumes:
+- GNU `tar -s` is boolean, so treating it as taking a value swallowed `-x`;
+- `git diff --unified` takes an optional value, so treating it as taking one swallowed `--ext-diff`;
+- `gawk -Wsource=` supplies code.
+
+D-141 removed flag arities from these rows precisely to avoid this.
+
+**The ruling (§6, D-141):**
+- When P3 looks for triggers, code and pinned programs, **no word is consumed as an option's value**.
+- Any word that could be a trigger under some reading makes the unit Unread. So does any letter of a short-option cluster that could be one, or any form that could supply code (`-e`, `-f`, `-W…`, `--source`, …).
+- Over-approximating is accepted. It only adds Unread, so more asks and never a missed hit. Round 2's `git -Csrc` finding is therefore closed by this ruling: a `c` in a cluster may fire.
+- Arities stay only where the frozen table lists them: the Search rows' flag tables, `dev`'s forbidden flags, and the §4 wrappers.
+
+**Escalation (PLAN §8.3, §8.4):** P3 had two Neon rework rounds and still has majors. Round 4 is written by **Opus 5.5**, as a Claude subagent in P3's worktree. It removes the arity modelling outside the table, applies this ruling in core and in the app's validator together, and fixes review 3's three findings. Codex GPT-6.1 Sol stays the reviewer.
+
+## D-157 — 2026-11-24 — Pedro: confirms all 15 items of rev 4 §11
+**Decided by Pedro (driver, owner; D-013).** Pedro confirms every item in `docs/contracts/m1-policy-rev4.md` §11, items 1 to 15 (summary in `rev4-for-pedro.md`). Rodrigo's approval in D-138 and D-139 was the partner's proposal; this confirmation makes them the security defaults.
+- **This includes** item 1 (Unread allows under Any rules and FullAccess after the best-effort pass), item 15 (followed-link searches can be Allow in Home when the link walk finds nothing protected), and the later rulings that narrow or extend the contract within those items: D-141, D-145, D-146, D-147, D-148 and D-156. Each of them only adds Unread or matches `dev`.
+- **CR-20 is closed** (approved).
+- **What it unblocks:** P4 (M1-40), P3's live parts (M1-39: daemon rule validation, `rule-form.ts`, rule validity in Settings) and P5 (M1-41) may merge into `dev` once each one passes its own gate (D-120). **Each merge still needs the driver's explicit go.** This decision doesn't approve any merge by itself.
+
+## D-158 — 2026-11-24 — Pedro: Gemini 4 Neon takes the heavy work on Pedro's shifts too
+**Decided by Pedro (driver).** D-134's routing now applies to Pedro's shifts as well, replacing his Hydrogen routing (D-064). Gemini 4 Neon through `agy` takes the heavy tasks: writers, escalations and security fixes.
+- **Model ids:** `gemini-4-neon-high` for writers, escalations and security; `gemini-4-neon-xhigh` for the hardest escalations; `gemini-4-neon-medium` for utility work.
+- **Unchanged:**
+  - Reviews stay cross-provider: Codex (GPT-6.1 Sol, `high`, read-only; D-124) for Neon's work.
+  - D-123 (workers only write) and D-120 (the 100% gate).
+  - Work that needs path-like literals the `agy` policy refuses (D-074) still goes to Claude.
+  - Rounds already running with Opus (P2 under D-155, P3 under D-156) stay with Opus.
+- **Before the first Neon run on Pedro's Mac:** `agy` here is 1.5.15, and `scripts/doctor` has only tested 1.5.14. Repeat D-134's hook check (an allowed `cargo --version`, a denied write to `.agents/` and a denied `git push`) in a scratch worktree first.
+
+## D-159 — 2026-11-24 — Pedro: merge P4 (M1-40) into `dev`
+**Decided by Pedro (driver).** P4 (`agent/neon/M1-40-rev4-p4-ui-ledger` @ `33b60ff`) is merged into `dev` as `c8a73590`. It was approved in Codex review round 2 with no open findings (D-120), and §11 is confirmed (D-157).
+- **No rebase was needed.** `dev` had moved only in `docs/` since the branch's base `0819536e`, and `git merge-tree` was clean.
+- **The orchestrator's single verification on the merged tree, on macOS (D-123):** fmt and workspace clippy clean; `check-protocol-ts` up to date; **886 passed, 0 failed, 7 ignored**; app typecheck clean, **377 vitest** passed, build OK.
+
+## D-160 — 2026-11-24 — Pedro: agent environment awareness and a welcome flow (CR-21, PLAN §3.22)
+**Decided by Pedro (driver, owner),** agreed with the orchestrator on 2026-11-16 and written into the plan now. This adds PLAN §3.22 and an M2 item:
+- **An environment brief for agents.** It is built from live state, names blocked things by category, informs and never grants, and comes in kinds by role (Home or orchestrator, workspace, delegated, reviewer).
+- **Three levels:**
+  1. off;
+  2. MCP only (`atrium://environment` resource, `atrium_environment` tool), which is the recommended default;
+  3. MCP plus **opt-in prompt injection**, the only exception to §3.2's "we never rewrite prompts". It shows a preview with a token count, can be overridden per workspace, marks the threads it was injected into, and refreshes when the policy changes mid-session.
+- **A compaction spike first:** how each provider compacts, whether the injection channel survives, and what signal the adapter sees. Its results drive the brief's re-injection and a new `ContextCompacted` event with a marker in the thread.
+- **A first-launch welcome flow:** providers found (with §3.18's import offer folded in), security preset, brief level, and opt-in heavy features (all off). It is skippable and never blocks first use.
+- **Milestone: M2**, after the M1 gate. Nothing starts until the driver gives a go for that phase.
+
+## D-161 — 2026-11-24 — Pedro: P2's and P3's next writer rounds go to Neon
+**Decided by Pedro (driver).** This replaces the Opus 5.5 writer in D-155 (P2) and D-156 (P3). The Opus sessions for those rounds live on rodrigo's machine. The orchestrator picked the effort: **`gemini-4-neon-xhigh`**, because both tasks are escalations past two Neon `high` rounds (D-158).
+- **P2 (M1-38):** round 10 (`cae98db`, written by Opus) is verified first (D-123), then gets Codex review 9. Any further round is written by Neon `xhigh` on the same branch. D-155's rules still hold: rounds go on while each review finds fewer findings, and the task goes back to the driver if the count stalls or rises, a blocker appears, or an interface change is requested.
+- **P3 (M1-39):** round 4 is written by Neon `xhigh` from `b021ad4`. It follows D-156's ruling (trigger and code detection never consumes option values), removes the arity modelling outside the frozen table in core and in `app/src/chat/rule-form.ts` together, and fixes review 3's three findings.
+- **Unchanged:** reviews by Codex (GPT-6.1 Sol, `high`, read-only); D-123's write-then-verify flow; D-120's 100% gate. Work that needs path-like literals the `agy` policy refuses (D-074) goes back to Claude.
+- **First:** the `agy` 1.5.15 hook check (D-158).

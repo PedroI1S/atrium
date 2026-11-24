@@ -1,5 +1,7 @@
 # Pedro: confirmar as mudanças de padrão do rev 4 (D-013)
 
+> **Confirmado:** Pedro confirmou os 15 itens em 2026-11-24 (D-157).
+
 Este é um resumo para você decidir. O texto completo está em `docs/contracts/m1-policy-rev4.md`.
 
 O rodrigo aprovou o texto (D-136), e o Codex aprovou na quinta rodada. Falta a sua confirmação dos itens da §11, porque mudam padrões de segurança. As tarefas P0 a P5 só começam depois dela.

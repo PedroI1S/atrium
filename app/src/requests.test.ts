@@ -6,7 +6,7 @@ import { render } from "solid-js/web";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonCommand } from "./daemon/types";
 import { cardState } from "./chat/requests";
-import type { QuestionItem } from "./chat/transcript";
+import type { ApprovalItem, QuestionItem } from "./chat/transcript";
 
 const commandMock = vi.fn<(cmd: DaemonCommand) => Promise<null>>();
 
@@ -16,7 +16,7 @@ vi.mock("./daemon/client", () => ({
   viewThread: vi.fn(),
 }));
 
-import { QuestionCard } from "./ui/RequestCard";
+import { ApprovalCard, QuestionCard } from "./ui/RequestCard";
 import { Transcript } from "./chat/transcript";
 
 const makeQuestion = (over: Partial<QuestionItem> = {}): QuestionItem => ({
@@ -172,5 +172,118 @@ describe("question card states and Decline button (CR-15)", () => {
     expect(host.querySelector(".ask")?.getAttribute("data-state")).toBe("failed");
     expect(host.querySelector(".ask-state")?.textContent).toBe("the store is unavailable");
     expect(host.querySelectorAll(".ask-act button")).toHaveLength(3);
+  });
+});
+
+const makeApproval = (over: Partial<ApprovalItem> = {}): ApprovalItem => ({
+  kind: "approval",
+  key: "k-a",
+  first: 1,
+  last: 1,
+  incarnation: 1,
+  v: 0,
+  bytes: 0,
+  requestId: "req_a1",
+  turn: 1,
+  outcome: null,
+  stale: false,
+  at: Date.now(),
+  callId: "c1",
+  name: "Bash",
+  toolKind: "execute",
+  title: 'for f in *.rs; do wc -l "$f"; done',
+  input: { command: 'for f in *.rs; do wc -l "$f"; done' },
+  reason: null,
+  rememberable: false,
+  unread: null,
+  ...over,
+});
+
+describe("approval card Unread and Exhausted notice (contract rev 4 §9)", () => {
+  let host: HTMLElement;
+  let dispose: (() => void) | undefined;
+
+  beforeEach(() => {
+    commandMock.mockReset();
+    host = document.createElement("div");
+    document.body.appendChild(host);
+  });
+
+  afterEach(() => {
+    dispose?.();
+    dispose = undefined;
+    host.remove();
+  });
+
+  it("shows no unread notice and offers Always… for an ordinary rememberable approval", () => {
+    const a = makeApproval({ requestId: "req-plain", rememberable: true, unread: null });
+    const [tick] = createSignal(0);
+
+    dispose = render(() => createComponent(ApprovalCard, { threadId: "t-plain", item: a, tick }), host);
+
+    expect(host.querySelector('[data-atrium-part="approval-unread"]')).toBeNull();
+    expect(host.querySelector('button[aria-haspopup="menu"]')).not.toBeNull();
+    const labels = Array.from(host.querySelectorAll(".ask-act button")).map((b) => b.textContent?.trim());
+    expect(labels).toEqual(["Allow once↵", "Always…", "Denyesc"]);
+  });
+
+  it("shows the Unread notice, hides Always… even if rememberable is true, and keeps Allow once working", async () => {
+    commandMock.mockResolvedValueOnce(null);
+    const a = makeApproval({ requestId: "req-unread", rememberable: true, unread: "unread" });
+    const [tick, setTick] = createSignal(0);
+
+    dispose = render(() => createComponent(ApprovalCard, { threadId: "t-unread", item: a, tick }), host);
+
+    const notice = host.querySelector('[data-atrium-part="approval-unread"]');
+    expect(notice?.textContent).toBe("Atrium can't read this command in full.");
+    expect(notice?.getAttribute("data-unread")).toBe("unread");
+    expect(host.querySelector('button[aria-haspopup="menu"]')).toBeNull();
+
+    const buttons = Array.from(host.querySelectorAll(".ask-act button")) as HTMLButtonElement[];
+    expect(buttons.map((b) => b.textContent?.trim())).toEqual(["Allow once↵", "Denyesc"]);
+
+    buttons[0]!.click();
+    await flush();
+    setTick((n) => n + 1);
+
+    expect(commandMock).toHaveBeenCalledTimes(1);
+    expect(commandMock).toHaveBeenCalledWith({
+      type: "resolve_approval",
+      thread_id: "t-unread",
+      incarnation: 1,
+      request_id: "req-unread",
+      decision: { type: "allow" },
+      remember: null,
+    });
+  });
+
+  it("shows the Exhausted notice with second sentence, hides Always…, and keeps Deny working", async () => {
+    commandMock.mockResolvedValueOnce(null);
+    const a = makeApproval({ requestId: "req-exhausted", rememberable: true, unread: "exhausted" });
+    const [tick, setTick] = createSignal(0);
+
+    dispose = render(() => createComponent(ApprovalCard, { threadId: "t-exhausted", item: a, tick }), host);
+
+    const notice = host.querySelector('[data-atrium-part="approval-unread"]');
+    expect(notice?.textContent).toBe("Atrium can't read this command in full. It was too long or too complex to check.");
+    expect(notice?.getAttribute("data-unread")).toBe("exhausted");
+    expect(host.querySelector('button[aria-haspopup="menu"]')).toBeNull();
+
+    const buttons = Array.from(host.querySelectorAll(".ask-act button")) as HTMLButtonElement[];
+    expect(buttons.map((b) => b.textContent?.trim())).toEqual(["Allow once↵", "Denyesc"]);
+
+    buttons[1]!.click();
+    await flush();
+    setTick((n) => n + 1);
+
+    expect(commandMock).toHaveBeenCalledTimes(1);
+    expect(commandMock).toHaveBeenCalledWith({
+      type: "resolve_approval",
+      thread_id: "t-exhausted",
+      incarnation: 1,
+      request_id: "req-exhausted",
+      decision: { type: "deny", message: null },
+      remember: null,
+    });
   });
 });

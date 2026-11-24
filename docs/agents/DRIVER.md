@@ -4,6 +4,6 @@ Only one person drives at a time: runs the orchestrator, dispatches workers, mer
 Managed by `scripts/handoff`. Don't edit by hand.
 
 state: active
-driver: rodrigo
-since: 2026-11-16T18:54Z
-machine: rodrigo
+driver: Pedro Mariano
+since: 2026-11-24T23:44Z
+machine: Pedros-MacBook-Air

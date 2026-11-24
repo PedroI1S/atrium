@@ -715,6 +715,7 @@ impl CodexNormalizer {
             input: req.input,
             reason: req.reason,
             rememberable: ticket.rememberable,
+            unread: ticket.unread,
         });
         self.pending.push((
             ticket.request_id,

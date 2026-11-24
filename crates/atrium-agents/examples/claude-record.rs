@@ -78,10 +78,7 @@ impl ToolGate for ScriptedGate {
                     .unwrap()
                     .insert(id.clone(), check.input.to_string());
                 GateDecision::Ask {
-                    ticket: ApprovalTicket {
-                        request_id: id,
-                        rememberable: check.kind == ToolKind::Execute,
-                    },
+                    ticket: ApprovalTicket::new(id, check.kind == ToolKind::Execute),
                 }
             }
         };
@@ -107,12 +104,7 @@ impl ToolGate for ScriptedGate {
 
     fn question_ticket(&self, _turn: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
         let id = format!("question-{}", self.next.fetch_add(1, Ordering::SeqCst));
-        Box::pin(async move {
-            Some(ApprovalTicket {
-                request_id: id,
-                rememberable: false,
-            })
-        })
+        Box::pin(async move { Some(ApprovalTicket::new(id, false)) })
     }
 }
 

@@ -152,7 +152,7 @@ trait AgentAdapter {
   - **Spike (M0)**: per-session MCP injection (`agy mcp` manages servers globally, so per-session scoping may need a generated config), and the `--input-format stream-json` multi-turn mode.
 - **OpenCode** (D-063; Pedro's main provider): its own adapter over `opencode serve` (HTTP API + event stream), not ACP. Each Atrium session gets its own OpenCode session with **per-session permission rules** that route every tool call through Atrium's gate, and a model and reasoning level (`variant`) per prompt. Prior art: MonoCode's OpenCode connector (`src/integrations/harness/providers/opencode/`, ideas only). The M0-04 spike (OpenCode through ACP) is the starting point for fixtures and the must-fix items O1–O10, which apply to this adapter where they still make sense (Code Mode `execute` policy for every agent, cancelled approvals never executed, usage vs context, closing events under load). Free hosted OpenCode models stay `untrusted` by default (§3.21 trust levels).
 - **ACP**: the `agent-client-protocol` crate (Zed). One generic adapter covers Goose and other ACP agents. MCP servers are passed in `session/new`. Lower priority than OpenCode (D-063).
-- **Skills / native config**: we never rewrite prompts. Agents load their own `CLAUDE.md` / `AGENTS.md` / skills from the cwd and home dir as usual. Atrium only *adds* MCP tools and sends ordinary user messages (review comments, check failures, handoff requests).
+- **Skills / native config**: we never rewrite prompts. Agents load their own `CLAUDE.md` / `AGENTS.md` / skills from the cwd and home dir as usual. Atrium only *adds* MCP tools and sends ordinary user messages (review comments, check failures, handoff requests). The one exception is the opt-in environment brief injection (3.22), which the user turns on and which is marked on the thread.
 - **Fallback if Claude's stream-json control protocol proves brittle**: use `claude-code-acp` through the ACP adapter (costs a Node dependency).
 
 ### 3.3 Domain model and storage (`atrium-core`)
@@ -441,7 +441,7 @@ Atrium doesn't replace these. It keeps a **normalized copy** in its own store, p
 - **Import** (read-only, never modifies the source):
   - Importers for Claude Code, Codex, `agy` and MonoCode histories. They map native records into the same event enum as the live adapters (3.2) and reuse their parsers and recorded fixtures.
   - Imported threads appear under Home or under the workspace that matches their cwd, marked "imported". Re-imports are idempotent (keyed by native session ID and record offset).
-  - First-run offer: "Import your existing conversations?", per provider, with a preview of the count and size.
+  - First-run offer: "Import your existing conversations?", per provider, with a preview of the count and size. It is part of the welcome flow (3.22).
   - The Atrium **build archive** (8.7) uses the same format, so Atrium's own construction history imports at graduation.
 - **Export**: a thread or workspace to Markdown (readable, with tool calls collapsed) or JSONL (lossless events + manifest). Redaction runs first (below).
 - **Search**: FTS5 over messages, tool calls, notes and handoffs, across live and imported threads (the full UI comes in M7).
@@ -700,6 +700,51 @@ trust = "untrusted"         # default for free tiers; changing it requires confi
 
 **Measurement (local only, never sent anywhere)**: accept rate, partial-accept rate, latency p50/p95 per provider and per feature. Shown in the usage dashboard (3.11) along with tokens and cost for paid providers, with optional daily caps.
 
+### 3.22 Agent environment awareness and first run (CR-21, D-160)
+
+An agent that knows it runs inside Atrium can use what Atrium gives it: the approval queue, notifications, threads, notes and the rules. It also stops wasting turns against the policy gate. Without that, the agent finds these by trial and error, or never. This section covers an **environment brief**, a short description of where the agent is and what it may use, and a **welcome flow** that lets the user choose these things on first launch. Both are opt-in.
+
+**The environment brief**
+- **Generated from live state, never fixed text.** It's built from the thread's actual preset, rules, adapter, tool groups (3.15) and the features turned on. A brief that says "you can read X" while the gate denies X is worse than none.
+- **It names blocked things by category, never by path.** For example, "credential stores need approval", never where they live.
+- **It informs and never grants.** Nothing in it changes what the gate allows. The agent can't use it to change its own permissions, and every action still goes through the policy (3.12).
+- **Kinds by role:** each role gets its own brief from the same generator.
+  - Home (the orchestrator role: `workspace_*`/`task_*`, read freely, any change asks);
+  - workspace threads (worktree, checks, ports, preview);
+  - delegated threads (who delegated, depth and budget, how to hand off);
+  - reviewers (read-only, where the findings go).
+- **It's short:** a few hundred tokens, kept stable so the provider's prompt cache absorbs it after the first turn.
+
+**Delivery, three levels** (*Settings → Agents → Environment*, with a per-workspace override)
+1. **Off.**
+2. **MCP only** (recommended, the default once the welcome flow has run):
+   - an `atrium://environment` resource and an `atrium_environment` tool in every thread's MCP server (3.15);
+   - the agent reads them when it needs to, so this costs nothing until then and is always current.
+3. **MCP plus prompt injection** (opt-in, clearly explained): the brief also goes into the provider's system-prompt or instructions channel at session start.
+   - **This is the one exception to "we never rewrite prompts" (3.2),** and it applies only when the user turns it on.
+   - **The injected brief is a snapshot.** It ends with "call `atrium_environment` for the current state". When the policy changes during a session (preset, rules), Atrium sends a short "your environment changed" message, or re-injects where the channel allows it.
+- **Clarity:**
+  - Settings and the welcome flow show a preview of the exact text that would be injected, generated from the user's current setup, with its approximate token cost.
+  - Threads that had a brief injected are marked in the thread header and in exports (3.18), so a conversation is never silently different from what the user typed.
+
+**Compaction (a discovery task first)**
+- **Each provider compacts its context differently**, and those mechanisms change between CLI versions. A spike finds out, for Claude Code, Codex, `agy` and OpenCode:
+  - how and when each one compacts;
+  - whether the system or instructions channel survives compaction;
+  - what signal, if any, the adapter can see (a stream event, a hook, a token-count drop).
+- **What the results drive:**
+  - **The brief.** Where the injection channel survives compaction, nothing more is needed. Where it doesn't, Atrium re-injects the brief on the compaction signal. Where there is no signal, the level falls back to MCP only for that provider, and Settings says so.
+  - **The UI.** A new `ContextCompacted` event in the event enum (3.2) shows a marker in the thread ("Context compacted, by the provider"), with the before and after token counts where the provider reports them.
+- **Each adapter's descriptor** states its injection channel, whether that channel survives compaction, and its compaction signal.
+
+**The welcome flow (first launch)**
+- It has 3–4 skippable screens, and every choice can be changed later in Settings:
+  1. **Providers found:** which CLIs Atrium detected, their versions and enforcement levels, plus the existing "Import your existing conversations?" offer (3.18), so first run doesn't ask twice.
+  2. **Security preset:** Home's defaults and what the hard-deny list covers, in plain words (the same text as Settings → Security).
+  3. **Environment brief:** the three levels above, with the live preview and token cost.
+  4. **Optional heavy features:** local models, the sandbox VM (3.14), free hosted AI and editor AI (3.21), all off by default, each with its trust label and cost.
+- **It never blocks first use.** Skipping it leaves every choice at its default, which is MCP only for the brief.
+
 ## 4. Performance budgets (targets)
 
 - Cold start to interactive: < 400 ms (macOS, M-series). On Linux it's a gate too, with a load condition (D-041, D-111). Reconnecting to a running daemon with full state: < 100 ms.
@@ -738,6 +783,7 @@ trust = "untrusted"         # default for free tiers; changing it requires confi
 - Diff view with inline comments, terminal, editor.
 - Commit/push/PR through `gh`. **OpenCode adapter** over `opencode serve` (first, D-063), then the generic ACP adapter.
 - History import: Claude Code, Codex, `agy` and MonoCode importers, and the build archive (8.7) at graduation.
+- Agent environment awareness and first run (3.22, CR-21): a compaction spike across the providers first, then the `atrium://environment` resource and `atrium_environment` tool, role-based briefs, the opt-in prompt injection with its compaction handling, the `ContextCompacted` event and its marker, *Settings → Agents → Environment*, and the welcome flow.
 
 **M3: Browser**
 - Discovery and settings, per-thread contexts, the screencast pane with take-over, the browser MCP tools.

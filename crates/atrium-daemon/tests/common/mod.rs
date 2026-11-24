@@ -315,6 +315,7 @@ impl Script {
             input: check.input.clone(),
             reason: None,
             rememberable: ticket.rememberable,
+            unread: ticket.unread,
         })
         .await;
         (ticket, check)
