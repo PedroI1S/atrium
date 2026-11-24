@@ -2242,7 +2242,14 @@ pub(super) fn lex_exact_core(
             // so recovery allocates nothing. Whether a redirect-only pending
             // unit would have stayed redirect-only is unknown here, so that
             // reason is not guessed.
-            if !cur.is_empty() && !sink.out.at_unit_cap() {
+            //
+            // A non-empty pending unit past `MAX_UNITS` holds finished words
+            // or redirects: the line has more units than the cap, and
+            // `TooLarge` wins over `Exhausted` (§1, §8; D-148).
+            if !cur.is_empty() && sink.out.at_unit_cap() {
+                return Err(CoreStop::TooLarge(Cap::Units));
+            }
+            if !cur.is_empty() {
                 let idx = sink.out.local_units();
                 for r in sink.pending.drain(..) {
                     sink.out.push_unit_outcome(idx, PartOutcome::Unread(r));

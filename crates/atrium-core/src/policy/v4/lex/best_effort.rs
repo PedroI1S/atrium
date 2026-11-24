@@ -655,9 +655,11 @@ fn push_converted(
     alt_argv: Vec<Vec<String>>,
     depth: u8,
     derived: bool,
-) {
+) -> Result<(), PartOutcome> {
+    // A finished unit past the cap is `TooLarge`, which wins over
+    // `Exhausted` (§1, §8; D-148).
     if record.units.len() >= limits::MAX_UNITS {
-        return;
+        return Err(PartOutcome::TooLarge(Cap::Units));
     }
     let index = record.units.len();
     push_reserved(
@@ -675,6 +677,7 @@ fn push_converted(
             derived,
         },
     );
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1211,10 +1214,15 @@ fn lex_one_text(
         // Preserve every unit scanned before exhaustion (§8), into slots
         // reserved earlier; the argv copies were pre-paid.
         if matches!(err, PartOutcome::Exhausted(_)) {
-            if !cur.is_empty() && record.units.len() + raw_units.len() < limits::MAX_UNITS {
+            if !cur.is_empty() {
+                // A finished builder past the cap is `TooLarge`, which
+                // wins over `Exhausted` (§1, §8; D-148).
+                if record.units.len() + raw_units.len() >= limits::MAX_UNITS {
+                    return Err(PartOutcome::TooLarge(Cap::Units));
+                }
                 push_reserved(&mut raw_units, cur);
             }
-            flush_builders_raw(raw_units.into_iter(), depth, derived, record);
+            flush_builders_raw(raw_units.into_iter(), depth, derived, record)?;
         }
         return Err(err);
     }
@@ -1224,7 +1232,7 @@ fn lex_one_text(
         match vec_with_capacity_budgeted(raw_units.len(), budget) {
             Ok(v) => v,
             Err(e) => {
-                flush_builders_raw(raw_units.into_iter(), depth, derived, record);
+                flush_builders_raw(raw_units.into_iter(), depth, derived, record)?;
                 return Err(PartOutcome::Exhausted(e.reason));
             }
         };
@@ -1247,8 +1255,8 @@ fn lex_one_text(
             Err((partial, e)) => {
                 // Keep the readings found before exhaustion (review round 4,
                 // finding 1).
-                push_converted(record, b, partial.effective, partial.alt, depth, derived);
-                flush_builders_raw(raw_iter, depth, derived, record);
+                push_converted(record, b, partial.effective, partial.alt, depth, derived)?;
+                flush_builders_raw(raw_iter, depth, derived, record)?;
                 return Err(PartOutcome::Exhausted(e.reason));
             }
         };
@@ -1309,9 +1317,9 @@ fn lex_one_text(
         let payloads = match derived_work {
             Ok(v) => v,
             Err(e) => {
-                push_converted(record, b, eff, all_alt, depth, derived);
-                flush_find_execs_raw(find_execs, depth + 1, record);
-                flush_builders_raw(raw_iter, depth, derived, record);
+                push_converted(record, b, eff, all_alt, depth, derived)?;
+                flush_find_execs_raw(find_execs, depth + 1, record)?;
+                flush_builders_raw(raw_iter, depth, derived, record)?;
                 return Err(PartOutcome::Exhausted(e.reason));
             }
         };
@@ -1344,8 +1352,8 @@ fn lex_one_text(
         if let Some(pid) = pipeline_id
             && let Err(e) = vec_push_budgeted(&mut pipeline_units, (pid, unit_idx), budget)
         {
-            flush_find_execs_raw(find_execs, depth + 1, record);
-            flush_builders_raw(raw_iter, depth, derived, record);
+            flush_find_execs_raw(find_execs, depth + 1, record)?;
+            flush_builders_raw(raw_iter, depth, derived, record)?;
             return Err(PartOutcome::Exhausted(e.reason));
         }
 
@@ -1364,7 +1372,7 @@ fn lex_one_text(
             )
         {
             if matches!(err, PartOutcome::Exhausted(_)) {
-                flush_builders_raw(raw_iter, depth, derived, record);
+                flush_builders_raw(raw_iter, depth, derived, record)?;
             }
             return Err(err);
         }
@@ -1373,7 +1381,7 @@ fn lex_one_text(
         if depth < limits::MAX_DEPTH {
             for p in subs.into_iter().chain(payloads.into_vec()) {
                 if let Err(e) = vec_push_budgeted(&mut deferred_payloads, (depth + 1, p), budget) {
-                    flush_builders_raw(raw_iter, depth, derived, record);
+                    flush_builders_raw(raw_iter, depth, derived, record)?;
                     return Err(PartOutcome::Exhausted(e.reason));
                 }
             }
@@ -1820,16 +1828,16 @@ fn process_find_exec_cmds(
             },
         );
         if let Err(e) = derivation {
-            flush_find_execs_raw(nested_find_execs, exec_depth + 1, record);
-            flush_find_execs_raw(cmds, exec_depth, record);
+            flush_find_execs_raw(nested_find_execs, exec_depth + 1, record)?;
+            flush_find_execs_raw(cmds, exec_depth, record)?;
             return Err(ex(e));
         }
 
         if exec_depth < limits::MAX_DEPTH {
             for p in exec_payloads.into_vec() {
                 if let Err(e) = vec_push_budgeted(deferred_payloads, (exec_depth + 1, p), budget) {
-                    flush_find_execs_raw(nested_find_execs, exec_depth + 1, record);
-                    flush_find_execs_raw(cmds, exec_depth, record);
+                    flush_find_execs_raw(nested_find_execs, exec_depth + 1, record)?;
+                    flush_find_execs_raw(cmds, exec_depth, record)?;
                     return Err(ex(e));
                 }
             }
@@ -1844,7 +1852,7 @@ fn process_find_exec_cmds(
                 )
             {
                 if matches!(err, PartOutcome::Exhausted(_)) {
-                    flush_find_execs_raw(cmds, exec_depth, record);
+                    flush_find_execs_raw(cmds, exec_depth, record)?;
                 }
                 return Err(err);
             }
@@ -1860,10 +1868,10 @@ fn flush_find_execs_raw(
     cmds: impl IntoIterator<Item = Vec<String>>,
     depth: u8,
     record: &mut BestEffortRecord,
-) {
+) -> Result<(), PartOutcome> {
     for cmd_argv in cmds {
         if record.units.len() >= limits::MAX_UNITS {
-            break;
+            return Err(PartOutcome::TooLarge(Cap::Units));
         }
         let index = record.units.len();
         let effective_argv = cmd_argv.clone();
@@ -1883,6 +1891,7 @@ fn flush_find_execs_raw(
             },
         );
     }
+    Ok(())
 }
 
 /// Stores builders not yet converted, after exhaustion, into record slots
@@ -1893,14 +1902,12 @@ fn flush_builders_raw(
     depth: u8,
     derived: bool,
     record: &mut BestEffortRecord,
-) {
+) -> Result<(), PartOutcome> {
     for b in builders {
-        if record.units.len() >= limits::MAX_UNITS {
-            break;
-        }
         let eff = b.raw_argv.clone();
-        push_converted(record, b, eff, Vec::new(), depth, derived);
+        push_converted(record, b, eff, Vec::new(), depth, derived)?;
     }
+    Ok(())
 }
 
 fn lex_be_redirect(
