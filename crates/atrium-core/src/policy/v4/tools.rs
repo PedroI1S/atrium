@@ -1494,7 +1494,9 @@ fn classify_git(
     effects: &mut ToolEffects,
     budget: &mut ComputeBudget,
 ) -> Result<(), Exhausted> {
-    // 1. Walk global options before the subcommand.
+    // 1. Walk global options before the subcommand, respecting short/long
+    //    option values so attached values (`git -Csrc status`) and separate
+    //    values (`git -C -c status`) are never scanned as option letters.
     let mut i = 1usize;
     let mut triggered_tool: Option<String> = None;
     let mut subcmd_idx: Option<(usize, &str)> = None;
@@ -1509,18 +1511,18 @@ fn classify_git(
             }
             break;
         }
+        let opt = parse_git_global_opt(tok, budget)?;
         budget.charge(row.triggers.len().max(1) as u64)?;
-        // Check top-level `RunnerTrigger::Flag` (`-c`, `--config-env`, `--exec-path`).
-        for &trigger in row.triggers {
-            if let RunnerTrigger::Flag(f) = trigger
-                && matches_git_flag(tok, f, budget)?
-                && triggered_tool.is_none()
-            {
-                triggered_tool = Some(charge_str_clone(spec.name, budget)?);
-            }
+        if let Some(matched_flag) = opt.trigger
+            && triggered_tool.is_none()
+            && row
+                .triggers
+                .iter()
+                .any(|t| matches!(t, RunnerTrigger::Flag(f) if *f == matched_flag))
+        {
+            triggered_tool = Some(charge_str_clone(spec.name, budget)?);
         }
-        // Skip separate value of known value-taking git global options.
-        if git_global_opt_takes_separate_value(tok) && i + 1 < unit.argv.len() {
+        if opt.consumes_next && i + 1 < unit.argv.len() {
             i += 2;
         } else {
             i += 1;
@@ -1563,20 +1565,14 @@ fn classify_git(
                 }
                 RunnerTrigger::SubcommandWithFlag { subcommand, flag } => {
                     budget.charge(sname.len().max(1) as u64)?;
-                    if sname == subcommand && triggered_tool.is_none() {
-                        for arg in sub_args {
-                            let Some(a) = word_as_str_budgeted(arg, budget)? else {
-                                continue;
-                            };
-                            if a == "--" {
-                                break;
-                            }
-                            if matches_git_flag(a, flag, budget)? {
-                                triggered_tool =
-                                    Some(charge_str_join2(spec.name, " ", subcommand, budget)?);
-                                break;
-                            }
-                        }
+                    if sname == subcommand
+                        && triggered_tool.is_none()
+                        && git_subcommand_has_flag_trigger_budgeted(
+                            subcommand, sub_args, flag, budget,
+                        )?
+                    {
+                        triggered_tool =
+                            Some(charge_str_join2(spec.name, " ", subcommand, budget)?);
                     }
                 }
                 RunnerTrigger::Flag(_)
@@ -1657,45 +1653,279 @@ fn classify_git(
     Ok(())
 }
 
-fn git_global_opt_takes_separate_value(tok: &str) -> bool {
-    matches!(
-        tok,
-        "-C" | "-c"
-            | "--git-dir"
-            | "--work-tree"
-            | "--namespace"
-            | "--super-prefix"
-            | "--config-env"
-    )
+/// Arity of a single short option letter inside a `-...` cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortOptArity {
+    /// Boolean flag: takes no value; following letters in the token are more flags.
+    Bool,
+    /// Required value: remaining bytes in the token are the attached value (never
+    /// read as option letters); if at end of token, consumes the next argv word.
+    Value,
+    /// Optional attached value (e.g. `git rebase -S[<keyid>]`): remaining bytes in
+    /// the token are the attached value (never read as option letters); if at end
+    /// of token, does NOT consume the next argv word.
+    OptionalAttachedValue,
+    /// Unknown short option: stop scanning remaining bytes of the token so a
+    /// potential attached value is never misread as option letters.
+    Unknown,
 }
 
-/// Matches a git trigger flag (`-c`, `-x`, `--config-env`, `--exec-path`,
-/// `--exec`, `--tool-cmd`, `--ext-diff`, `--receive-pack`) against `tok`.
-pub(super) fn matches_git_flag(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GitPathspecFlag {
+    Literal,
+    Noglob,
+    Glob,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GitGlobalOpt {
+    /// Matched top-level trigger flag (`"-c"`, `"--config-env"`, `"--exec-path"`).
+    pub(super) trigger: Option<&'static str>,
+    /// Whether this token consumes the immediately following argv word as its value.
+    pub(super) consumes_next: bool,
+    /// Pathspec global flag, if any.
+    pub(super) pathspec_flag: Option<GitPathspecFlag>,
+}
+
+fn git_global_short_arity(ch: char) -> ShortOptArity {
+    match ch {
+        'v' | 'h' | 'p' | 'P' => ShortOptArity::Bool,
+        'C' | 'c' => ShortOptArity::Value,
+        _ => ShortOptArity::Unknown,
+    }
+}
+
+/// Parses one top-level Git option token before the subcommand, distinguishing
+/// short options from their attached or separate values so value bytes (e.g.
+/// `src` in `git -Csrc status`) are never read as option letters.
+pub(super) fn parse_git_global_opt(
     tok: &str,
+    budget: &mut ComputeBudget,
+) -> Result<GitGlobalOpt, Exhausted> {
+    budget.charge(tok.len().max(1) as u64)?;
+    if let Some(rest) = tok.strip_prefix("--") {
+        let (name, has_eq) = match rest.split_once('=') {
+            Some((n, _)) => (n, true),
+            None => (rest, false),
+        };
+        let trigger = match name {
+            "config-env" => Some("--config-env"),
+            "exec-path" => Some("--exec-path"),
+            _ => None,
+        };
+        let consumes_next = !has_eq
+            && matches!(
+                name,
+                "git-dir"
+                    | "work-tree"
+                    | "namespace"
+                    | "super-prefix"
+                    | "config-env"
+                    | "attr-source"
+            );
+        let pathspec_flag = if !has_eq {
+            match name {
+                "literal-pathspecs" => Some(GitPathspecFlag::Literal),
+                "noglob-pathspecs" => Some(GitPathspecFlag::Noglob),
+                "glob-pathspecs" => Some(GitPathspecFlag::Glob),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        return Ok(GitGlobalOpt {
+            trigger,
+            consumes_next,
+            pathspec_flag,
+        });
+    }
+
+    if let Some(cluster) = tok.strip_prefix('-')
+        && !cluster.is_empty()
+    {
+        for (byte_off, ch) in cluster.char_indices() {
+            let at_end = byte_off + ch.len_utf8() >= cluster.len();
+            if ch == 'c' {
+                return Ok(GitGlobalOpt {
+                    trigger: Some("-c"),
+                    consumes_next: at_end,
+                    pathspec_flag: None,
+                });
+            }
+            match git_global_short_arity(ch) {
+                ShortOptArity::Bool => {}
+                ShortOptArity::Value => {
+                    return Ok(GitGlobalOpt {
+                        trigger: None,
+                        consumes_next: at_end,
+                        pathspec_flag: None,
+                    });
+                }
+                ShortOptArity::OptionalAttachedValue | ShortOptArity::Unknown => {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(GitGlobalOpt {
+        trigger: None,
+        consumes_next: false,
+        pathspec_flag: None,
+    })
+}
+
+fn git_subcommand_short_arity(subcommand: &str, ch: char) -> ShortOptArity {
+    match subcommand {
+        "rebase" => match ch {
+            'm' | 'f' | 'i' | 'q' | 'v' | 'n' | 'k' | 'p' | 'h' => ShortOptArity::Bool,
+            's' | 'X' | 'x' | 'C' => ShortOptArity::Value,
+            'S' | 'r' => ShortOptArity::OptionalAttachedValue,
+            _ => ShortOptArity::Unknown,
+        },
+        "difftool" => match ch {
+            'd' | 'y' | 'g' | 'h' | 'p' | 'u' | 's' | 'w' | 'b' | 'R' | 'z' => ShortOptArity::Bool,
+            't' | 'x' | 'S' | 'G' | 'O' | 'I' | 'l' => ShortOptArity::Value,
+            'U' | 'C' | 'M' | 'B' | 'W' => ShortOptArity::OptionalAttachedValue,
+            _ => ShortOptArity::Unknown,
+        },
+        "mergetool" => match ch {
+            'y' | 'g' | 'h' => ShortOptArity::Bool,
+            't' | 'x' => ShortOptArity::Value,
+            _ => ShortOptArity::Unknown,
+        },
+        "diff" => match ch {
+            'p' | 'u' | 's' | 'w' | 'b' | 'R' | 'z' | 'h' => ShortOptArity::Bool,
+            'S' | 'G' | 'O' | 'I' | 'l' => ShortOptArity::Value,
+            'U' | 'C' | 'M' | 'B' | 'W' => ShortOptArity::OptionalAttachedValue,
+            _ => ShortOptArity::Unknown,
+        },
+        "push" => match ch {
+            'v' | 'q' | 'f' | 'u' | 'n' | 'd' | 'h' => ShortOptArity::Bool,
+            'o' => ShortOptArity::Value,
+            _ => ShortOptArity::Unknown,
+        },
+        _ => ShortOptArity::Unknown,
+    }
+}
+
+fn git_subcommand_long_takes_separate_value(subcommand: &str, name: &str) -> bool {
+    match subcommand {
+        "rebase" => matches!(
+            name,
+            "onto" | "strategy" | "strategy-option" | "exec" | "empty" | "whitespace"
+        ),
+        "difftool" => matches!(name, "tool" | "extcmd" | "tool-cmd" | "output"),
+        "mergetool" => matches!(name, "tool" | "tool-cmd"),
+        "diff" => matches!(
+            name,
+            "output"
+                | "diff-filter"
+                | "src-prefix"
+                | "dst-prefix"
+                | "line-prefix"
+                | "inter-hunk-context"
+                | "unified"
+                | "word-diff-regex"
+        ),
+        "push" => matches!(name, "repo" | "push-option" | "receive-pack" | "exec"),
+        _ => false,
+    }
+}
+
+/// Evaluates one option token on a Git subcommand against `trigger`, returning
+/// `(matched_trigger, consumes_next_word)` without scanning option-value bytes
+/// as option letters.
+pub(super) fn git_subcommand_opt_step(subcommand: &str, tok: &str, trigger: &str) -> (bool, bool) {
+    if let Some(rest) = tok.strip_prefix("--") {
+        let (name, has_eq) = match rest.split_once('=') {
+            Some((n, _)) => (n, true),
+            None => (rest, false),
+        };
+        let matched = trigger.strip_prefix("--").is_some_and(|l| name == l);
+        let consumes_next = !has_eq && git_subcommand_long_takes_separate_value(subcommand, name);
+        return (matched, consumes_next);
+    }
+
+    if let Some(cluster) = tok.strip_prefix('-')
+        && !cluster.is_empty()
+    {
+        let trigger_short = (trigger.len() == 2 && !trigger.starts_with("--"))
+            .then(|| trigger.chars().nth(1))
+            .flatten();
+        for (byte_off, ch) in cluster.char_indices() {
+            let at_end = byte_off + ch.len_utf8() >= cluster.len();
+            if trigger_short == Some(ch) {
+                let consumes_next =
+                    at_end && git_subcommand_short_arity(subcommand, ch) == ShortOptArity::Value;
+                return (true, consumes_next);
+            }
+            match git_subcommand_short_arity(subcommand, ch) {
+                ShortOptArity::Bool => {}
+                ShortOptArity::Value => return (false, at_end),
+                ShortOptArity::OptionalAttachedValue | ShortOptArity::Unknown => {
+                    return (false, false);
+                }
+            }
+        }
+    }
+
+    (tok == trigger, false)
+}
+
+/// Pure subcommand flag-trigger scan used by `validate_rule_matcher` (§7).
+pub(super) fn git_subcommand_has_flag_trigger_pure(
+    subcommand: &str,
+    args: &[String],
+    trigger: &str,
+) -> bool {
+    let mut i = 0usize;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if tok == "--" {
+            break;
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            i += 1;
+            continue;
+        }
+        let (matched, consumes_next) = git_subcommand_opt_step(subcommand, tok, trigger);
+        if matched {
+            return true;
+        }
+        i += if consumes_next { 2 } else { 1 };
+    }
+    false
+}
+
+/// Budgeted subcommand flag-trigger scan used by `classify_git` (§6, §8).
+fn git_subcommand_has_flag_trigger_budgeted(
+    subcommand: &str,
+    args: &[Word],
     trigger: &str,
     budget: &mut ComputeBudget,
 ) -> Result<bool, Exhausted> {
-    budget.charge(tok.len().max(1) as u64)?;
-    if let Some(long) = trigger.strip_prefix("--") {
-        let Some(rest) = tok.strip_prefix("--") else {
-            return Ok(false);
+    let mut i = 0usize;
+    while i < args.len() {
+        let Some(tok) = word_as_str_budgeted(&args[i], budget)? else {
+            i += 1;
+            continue;
         };
-        let name = rest.split('=').next().unwrap_or(rest);
-        return Ok(name == long);
-    }
-    if trigger.len() == 2 && trigger.starts_with('-') {
-        let Some(ch) = trigger.chars().nth(1) else {
-            return Ok(false);
-        };
-        if let Some(cluster) = tok.strip_prefix('-')
-            && !cluster.is_empty()
-            && !tok.starts_with("--")
-        {
-            return Ok(cluster.contains(ch));
+        if tok == "--" {
+            break;
         }
+        if !tok.starts_with('-') || tok == "-" {
+            i += 1;
+            continue;
+        }
+        budget.charge(tok.len().max(1) as u64)?;
+        let (matched, consumes_next) = git_subcommand_opt_step(subcommand, tok, trigger);
+        if matched {
+            return Ok(true);
+        }
+        i += if consumes_next { 2 } else { 1 };
     }
-    Ok(tok == trigger)
+    Ok(false)
 }
 
 /// Classifies `sed` against `SED_TRIGGERS` (`ScriptCommands(&['e', 'w', 'r'])`

@@ -20,8 +20,9 @@ use crate::policy::tools::{
 };
 
 use super::tools::{
-    SedParseOutcome, charge_str_clone, fold_command_str_pure, inspect_sed_script,
-    vec_push_budgeted, vec_with_exact_budgeted, word_has_unquoted_glob_budgeted,
+    SedParseOutcome, charge_str_clone, fold_command_str_pure, git_subcommand_has_flag_trigger_pure,
+    inspect_sed_script, vec_push_budgeted, vec_with_exact_budgeted,
+    word_has_unquoted_glob_budgeted,
 };
 
 #[cfg(test)]
@@ -312,16 +313,11 @@ fn validate_conditional_runner_prefix(
                     }
                 }
                 RunnerTrigger::SubcommandWithFlag { subcommand, flag } if sub == subcommand => {
-                    for arg in rest {
-                        if arg == "--" {
-                            break;
-                        }
-                        if matches_git_flag_pure(arg, flag) {
-                            return Err(RuleValidationError::UnpinnedCodeRunner {
-                                tool: format!("{} {subcommand}", spec.name),
-                                required_pin: "a form without code-running flags",
-                            });
-                        }
+                    if git_subcommand_has_flag_trigger_pure(subcommand, rest, flag) {
+                        return Err(RuleValidationError::UnpinnedCodeRunner {
+                            tool: format!("{} {subcommand}", spec.name),
+                            required_pin: "a form without code-running flags",
+                        });
                     }
                 }
                 _ => {}
@@ -375,26 +371,6 @@ fn validate_conditional_runner_prefix(
         tool: spec.name.to_owned(),
         required_pin: "using an exact command rule (a prefix rule on `find` would allow appending `-exec`)",
     })
-}
-
-fn matches_git_flag_pure(tok: &str, trigger: &str) -> bool {
-    if let Some(long) = trigger.strip_prefix("--") {
-        let Some(rest) = tok.strip_prefix("--") else {
-            return false;
-        };
-        let name = rest.split('=').next().unwrap_or(rest);
-        return name == long;
-    }
-    if trigger.len() == 2
-        && trigger.starts_with('-')
-        && let Some(ch) = trigger.chars().nth(1)
-        && let Some(cluster) = tok.strip_prefix('-')
-        && !cluster.is_empty()
-        && !tok.starts_with("--")
-    {
-        return cluster.contains(ch);
-    }
-    tok == trigger
 }
 
 fn validate_sed_inline_prefix_budgeted(

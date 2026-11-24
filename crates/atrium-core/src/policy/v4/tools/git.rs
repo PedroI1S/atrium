@@ -8,8 +8,8 @@ use crate::policy::model::{
 use crate::policy::tools::{self, GIT_CRED_DIRS, GIT_CRED_NAMES, GIT_CRED_SUFFIXES};
 
 use super::{
-    fold_command_bytes_budgeted, reserve_vec_slots_budgeted, vec_push_budgeted,
-    word_as_str_budgeted,
+    GitPathspecFlag, fold_command_bytes_budgeted, parse_git_global_opt, reserve_vec_slots_budgeted,
+    vec_push_budgeted, word_as_str_budgeted,
 };
 
 /// CR-17 credential store suffixes added beyond `dev`'s `GIT_CRED_SUFFIXES`
@@ -66,30 +66,41 @@ pub(super) fn check_git_selection_into_impl(
     }
 
     // Track pathspec magic (`:(...)`, `:!`, `:`) separately from default
-    // wildcard interpretation (`*`, `?`, `[`):
+    // wildcard interpretation (`*`, `?`, `[`), skipping separate option values
+    // so e.g. `git -C --literal-pathspecs show ...` never mistakes a directory
+    // value for a global flag:
     // - `--literal-pathspecs` disables both pathspec magic and wildcards;
     // - `--noglob-pathspecs` makes wildcards literal by default while keeping
     //   explicit pathspec magic (including `:(glob)`) active;
     // - `--glob-pathspecs` leaves wildcards active (fail-closed if combined).
     let mut pathspec_magic_enabled = true;
     let mut default_glob_wildcards = true;
-    for w in &unit.argv[1..subcmd_idx] {
-        if let Some(tok) = word_as_str_budgeted(w, budget)? {
-            match tok {
-                "--literal-pathspecs" => {
-                    pathspec_magic_enabled = false;
-                    default_glob_wildcards = false;
-                }
-                "--noglob-pathspecs" => {
-                    default_glob_wildcards = false;
-                }
-                "--glob-pathspecs" => {
-                    pathspec_magic_enabled = true;
-                    default_glob_wildcards = true;
-                }
-                _ => {}
-            }
+    let mut gidx = 1usize;
+    while gidx < subcmd_idx {
+        let Some(tok) = word_as_str_budgeted(&unit.argv[gidx], budget)? else {
+            gidx += 1;
+            continue;
+        };
+        if !tok.starts_with('-') || tok == "-" {
+            gidx += 1;
+            continue;
         }
+        let opt = parse_git_global_opt(tok, budget)?;
+        match opt.pathspec_flag {
+            Some(GitPathspecFlag::Literal) => {
+                pathspec_magic_enabled = false;
+                default_glob_wildcards = false;
+            }
+            Some(GitPathspecFlag::Noglob) => {
+                default_glob_wildcards = false;
+            }
+            Some(GitPathspecFlag::Glob) => {
+                pathspec_magic_enabled = true;
+                default_glob_wildcards = true;
+            }
+            None => {}
+        }
+        gidx += if opt.consumes_next { 2 } else { 1 };
     }
 
     let mut after_dd = false;

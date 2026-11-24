@@ -1873,3 +1873,103 @@ fn round3_finding_1_wrapped_pinned_programs_receive_coverage_and_suppress_lower_
     );
     assert!(cov_awk_ok.per_unit[0].covers_pinned_program);
 }
+
+#[test]
+fn round3_finding_2_git_option_values_preserve_exact_rule_coverage_and_validation() {
+    let tid = ThreadId("t1".into());
+    let mut budget = ComputeBudget::with_default_limits();
+
+    // `git -Csrc status` and `git -C src status` both receive exact Allow rule
+    // coverage (no false `-c` trigger), whereas `git -cx=y status` and
+    // `git -c x=y status` remain plain Unread and are NOT covered.
+    for (cmd_line, words, expect_covered) in [
+        ("git -Csrc status", &["git", "-Csrc", "status"][..], true),
+        (
+            "git -C src status",
+            &["git", "-C", "src", "status"][..],
+            true,
+        ),
+        ("git -cx=y status", &["git", "-cx=y", "status"][..], false),
+        (
+            "git -c x=y status",
+            &["git", "-c", "x=y", "status"][..],
+            false,
+        ),
+    ] {
+        let check = cmd_check(cmd_line);
+        let units = vec![make_unit(0, words)];
+        let effects = classify_all(&units);
+        let be = BestEffortRecord {
+            raw_texts: vec![cmd_line.into()],
+            units: vec![be_unit(0, words)],
+        };
+        let rule = make_rule(
+            "r_exact",
+            RuleScope::Global,
+            ToolKind::Execute,
+            RuleMatcher::CommandExact { argv: argv(words) },
+            RuleDecision::Allow,
+        );
+        let cov = evaluate_rules(
+            &RuleEvalContext {
+                check: &check,
+                thread_id: &tid,
+                preset: Preset::Home,
+                units: &units,
+                effects: &effects,
+                targets: &[],
+                outcomes: &[],
+                best_effort: &be,
+                folds: &FoldRules::REV4,
+            },
+            &[rule],
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            cov.per_unit[0].allow_rule.is_some(),
+            expect_covered,
+            "{cmd_line}"
+        );
+    }
+
+    // `validate_rule_matcher`: Git subcommand option values do not falsely fail
+    // validation, while real `-x` triggers (attached/clustered) still fail.
+    for valid in [
+        &["git", "rebase", "-Xcontext"][..],
+        &["git", "rebase", "-S0x1234"][..],
+        &["git", "difftool", "-txxdiff"][..],
+        &["git", "mergetool", "-txxdiff"][..],
+        &["git", "diff", "-S", "--ext-diff"][..],
+        &["git", "push", "-o", "--exec"][..],
+    ] {
+        assert!(
+            validate_rule_matcher(
+                &RuleMatcher::CommandPrefix { argv: argv(valid) },
+                RuleDecision::Allow,
+                &FoldRules::REV4,
+            )
+            .is_ok(),
+            "expected valid prefix {valid:?}"
+        );
+    }
+    for invalid in [
+        &["git", "rebase", "-xid"][..],
+        &["git", "rebase", "-ix", "id"][..],
+        &["git", "difftool", "-xid"][..],
+        &["git", "difftool", "-yx", "id"][..],
+        &["git", "mergetool", "-xid"][..],
+    ] {
+        assert!(
+            validate_rule_matcher(
+                &RuleMatcher::CommandPrefix {
+                    argv: argv(invalid)
+                },
+                RuleDecision::Allow,
+                &FoldRules::REV4,
+            )
+            .is_err(),
+            "expected invalid prefix {invalid:?}"
+        );
+    }
+}

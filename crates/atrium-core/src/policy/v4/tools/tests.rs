@@ -1349,3 +1349,123 @@ fn classify_unit_and_git_selection_respect_compute_and_alloc_budgets() {
         assert_eq!(err.reason, ExhaustReason::ComputeBudget);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 10. Round 3 regression tests (Finding 2: Git short-option values & class)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round3_finding_2_git_short_option_values_and_subcommand_values() {
+    // Equivalent attached and separate global option values must NOT fire `-c`.
+    for no_trig in [
+        &["git", "-Csrc", "status"][..],
+        &["git", "-C", "src", "status"][..],
+        &["git", "-C", "-c", "status"][..],
+        &["git", "-pCsrc", "status"][..],
+        &["git", "-PCsrc", "status"][..],
+        &["git", "--git-dir=/tmp/c", "status"][..],
+        &["git", "--git-dir", "-c", "status"][..],
+        &["git", "--attr-source", "HEAD", "status"][..],
+    ] {
+        let e = classify(no_trig);
+        assert_eq!(e.subcommand, Some("status"), "{no_trig:?}");
+        assert!(
+            e.unread.is_empty(),
+            "unexpected trigger on {no_trig:?}: {:?}",
+            e.unread
+        );
+        assert!(!e.home_readonly_eligible, "{no_trig:?}");
+    }
+
+    // Real global `-c` / `--config-env` / `--exec-path` triggers (attached and separate).
+    for trig in [
+        &["git", "-c", "x=y", "status"][..],
+        &["git", "-cx=y", "status"][..],
+        &["git", "-pc", "x=y", "status"][..],
+        &["git", "-pcx=y", "status"][..],
+        &["git", "--config-env", "k=v", "status"][..],
+        &["git", "--config-env=k=v", "status"][..],
+        &["git", "--exec-path=/tmp", "status"][..],
+        &["git", "--exec-path", "status"][..],
+    ] {
+        let e = classify(trig);
+        assert_eq!(
+            e.unread,
+            vec![UnreadReason::CodeRunnerInlineCode { tool: "git".into() }],
+            "expected trigger on {trig:?}"
+        );
+    }
+
+    // Git subcommand option values (attached and separate) must NOT fire `-x` / `--ext-diff` / `--exec`.
+    for sub_safe in [
+        &["git", "rebase", "-Xcontext", "main"][..],
+        &["git", "rebase", "-X", "context", "main"][..],
+        &["git", "rebase", "-S0x1234", "main"][..],
+        &["git", "rebase", "-sxyz", "main"][..],
+        &["git", "rebase", "-s", "-x", "main"][..],
+        &["git", "rebase", "--onto", "-x", "main"][..],
+        &["git", "difftool", "-txxdiff"][..],
+        &["git", "difftool", "-t", "xxdiff"][..],
+        &["git", "difftool", "-t", "-x"][..],
+        &["git", "difftool", "-ytxxdiff"][..],
+        &["git", "mergetool", "-txxdiff"][..],
+        &["git", "mergetool", "-t", "xxdiff"][..],
+        &["git", "diff", "-S", "--ext-diff"][..],
+        &["git", "push", "-o", "--exec"][..],
+    ] {
+        let e = classify(sub_safe);
+        assert!(
+            e.unread.is_empty(),
+            "unexpected trigger on {sub_safe:?}: {:?}",
+            e.unread
+        );
+    }
+
+    // Real subcommand triggers (separate, attached, and clustered after bools).
+    for (sub_trig, expected_tool) in [
+        (&["git", "rebase", "-x", "id", "main"][..], "git rebase"),
+        (&["git", "rebase", "-xid", "main"][..], "git rebase"),
+        (&["git", "rebase", "-ix", "id", "main"][..], "git rebase"),
+        (&["git", "rebase", "-ixid", "main"][..], "git rebase"),
+        (
+            &["git", "rebase", "-S", "-x", "id", "main"][..],
+            "git rebase",
+        ),
+        (
+            &["git", "rebase", "-r", "-x", "id", "main"][..],
+            "git rebase",
+        ),
+        (&["git", "difftool", "-x", "id"][..], "git difftool"),
+        (&["git", "difftool", "-xid"][..], "git difftool"),
+        (&["git", "difftool", "-yx", "id"][..], "git difftool"),
+        (&["git", "mergetool", "-x", "id"][..], "git mergetool"),
+        (&["git", "mergetool", "-xid"][..], "git mergetool"),
+        (&["git", "mergetool", "-yx", "id"][..], "git mergetool"),
+    ] {
+        let e = classify(sub_trig);
+        assert_eq!(
+            e.unread,
+            vec![UnreadReason::CodeRunnerInlineCode {
+                tool: expected_tool.into()
+            }],
+            "expected trigger on {sub_trig:?}"
+        );
+    }
+
+    // `git -C --literal-pathspecs show HEAD -- ':!.env'` must NOT mistake `-C`'s
+    // directory value for `--literal-pathspecs` in `check_git_selection`.
+    let (_, sel) = git_sel(vec![
+        w("git"),
+        w("-C"),
+        w("--literal-pathspecs"),
+        w("show"),
+        w("HEAD"),
+        w("--"),
+        wq(":!.env"),
+    ]);
+    assert!(
+        sel.iter()
+            .any(|r| matches!(r.outcome, PartOutcome::StoreHit(_))),
+        "expected StoreHit when `--literal-pathspecs` is `-C`'s value, got {sel:?}"
+    );
+}
