@@ -50,6 +50,7 @@ fn main() {
         .register::<RuleDraft>()
         .register::<RuleOrigin>()
         .register::<Rule>()
+        .register::<ListedRule>()
         .register::<PolicyContext>()
         // thread
         .register::<ThreadId>()

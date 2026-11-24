@@ -7,7 +7,7 @@ use atrium_core::Store;
 use atrium_core::store::{SqliteStore, StoreOptions};
 use atrium_protocol::agent::ToolKind;
 use atrium_protocol::policy::{
-    Rule, RuleDecision, RuleDraft, RuleId, RuleMatcher, RuleOrigin, RuleScope,
+    ListedRule, Rule, RuleDecision, RuleDraft, RuleId, RuleMatcher, RuleOrigin, RuleScope,
 };
 use atrium_protocol::thread::ThreadId;
 use atrium_protocol::wire::{DaemonCommand, ErrorCode};
@@ -182,6 +182,7 @@ async fn create_rule_accepts_pinned_allow_prefixes_deny_rules_and_exact_commands
         &["awk", "-f", "prog.awk"],
         &["sed", "-f", "edit.sed"],
         &["sed", "s/error/warn/g"],
+        &["sed", "z"],
         &["sh", "x.sh"],
         &["source", "env.sh"],
         &[".", "./env.sh"],
@@ -191,6 +192,12 @@ async fn create_rule_accepts_pinned_allow_prefixes_deny_rules_and_exact_commands
         &["git", "bisect", "start"],
         &["git", "submodule", "status"],
         &["cat"],
+        // Tools removed by D-141 are unknown tools -> accepted by core and daemon.
+        &["deno"],
+        &["bun"],
+        &["php"],
+        &["lua"],
+        &["pwsh"],
     ];
 
     for &prefix in valid_allow_prefixes {
@@ -243,12 +250,13 @@ async fn create_rule_accepts_pinned_allow_prefixes_deny_rules_and_exact_commands
     .await;
 
     let listed = wire.ok(DaemonCommand::ListRules).await;
-    let items = listed.as_array().expect("JSON array");
-    assert_eq!(items.len(), valid_allow_prefixes.len() + 6);
-    for item in items {
+    let listed_rules: Vec<ListedRule> =
+        serde_json::from_value(listed).expect("deserializes as Vec<ListedRule>");
+    assert_eq!(listed_rules.len(), valid_allow_prefixes.len() + 6);
+    for item in &listed_rules {
         assert!(
-            item.get("invalid_reason").is_none(),
-            "valid rule must not carry invalid_reason: {item}"
+            item.invalid_reason.is_none(),
+            "valid rule must not carry invalid_reason: {item:?}"
         );
     }
 
@@ -260,7 +268,8 @@ async fn list_rules_keeps_stored_invalid_rules_visible_and_marked_invalid() {
     // §11 item 5: pre-existing stored rules that fail rev 4 §7 validation stay
     // listed, are marked invalid with a reason, and remain deletable.
     let mut rig = Rig::in_folder(common::folder());
-    std::fs::create_dir_all(&rig.paths.data_dir).expect("data_dir");
+    // Finding 14: create data_dir with `secure_dir` (0700) so daemon startup accepts it.
+    atrium_host::lifecycle::secure_dir(&rig.paths.data_dir).expect("secures data_dir");
     {
         let store = SqliteStore::open(&rig.paths.store, StoreOptions::default())
             .await
@@ -283,12 +292,12 @@ async fn list_rules_keeps_stored_invalid_rules_visible_and_marked_invalid() {
             .expect("seed invalid rule");
         store
             .create_rule(Rule {
-                id: RuleId("rule_valid_cat".into()),
+                id: RuleId("rule_valid_sed_z".into()),
                 scope: RuleScope::Global,
                 tool_kind: ToolKind::Execute,
                 tool_name: None,
                 matcher: RuleMatcher::CommandPrefix {
-                    argv: argv(&["cat"]),
+                    argv: argv(&["sed", "z"]),
                 },
                 path_scope: None,
                 decision: RuleDecision::Allow,
@@ -303,23 +312,26 @@ async fn list_rules_keeps_stored_invalid_rules_visible_and_marked_invalid() {
     let mut wire = rig.dev().await;
 
     let listed = wire.ok(DaemonCommand::ListRules).await;
-    let items = listed.as_array().expect("JSON array");
+    let items: Vec<ListedRule> =
+        serde_json::from_value(listed.clone()).expect("deserializes as Vec<ListedRule>");
     assert_eq!(items.len(), 2);
 
     let legacy = items
         .iter()
-        .find(|v| v["id"] == "rule_legacy_awk")
+        .find(|r| r.id == RuleId("rule_legacy_awk".into()))
         .expect("stored invalid rule stays listed");
-    let reason = legacy["invalid_reason"]
-        .as_str()
+    let reason = legacy
+        .invalid_reason
+        .as_deref()
         .expect("stored invalid rule must be marked with invalid_reason");
     assert!(!reason.is_empty());
 
+    // Finding 7 parity: `["sed", "z"]` is accepted by core, so daemon marks it valid.
     let valid = items
         .iter()
-        .find(|v| v["id"] == "rule_valid_cat")
+        .find(|r| r.id == RuleId("rule_valid_sed_z".into()))
         .expect("valid rule stays listed");
-    assert!(valid.get("invalid_reason").is_none());
+    assert!(valid.invalid_reason.is_none());
 
     // Wire-compatibility: callers deserializing `Vec<Rule>` still succeed.
     let as_rules: Vec<Rule> = serde_json::from_value(listed).expect("deserializes as Vec<Rule>");
@@ -330,10 +342,10 @@ async fn list_rules_keeps_stored_invalid_rules_visible_and_marked_invalid() {
         rule_id: RuleId("rule_legacy_awk".into()),
     })
     .await;
-    let remaining: Vec<Rule> =
+    let remaining: Vec<ListedRule> =
         serde_json::from_value(wire.ok(DaemonCommand::ListRules).await).expect("remaining rules");
     assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].id, RuleId("rule_valid_cat".into()));
+    assert_eq!(remaining[0].id, RuleId("rule_valid_sed_z".into()));
 
     rig.stop(true).await;
 }
