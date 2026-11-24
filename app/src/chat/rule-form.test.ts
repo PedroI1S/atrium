@@ -1,9 +1,38 @@
 import { describe, expect, it } from "vitest";
-import { PATH_KINDS, broadGlob, expandsBraces, foldName, checkGlob, commandRisk, emptyRuleForm, globSyntaxError, pathScopeOffered, type RuleForm, splitCommand, validateRule } from "./rule-form";
+import type { Rule } from "../daemon/types";
+import {
+  PATH_KINDS,
+  broadGlob,
+  checkGlob,
+  checkStoredRule,
+  commandRisk,
+  emptyRuleForm,
+  expandsBraces,
+  foldName,
+  globSyntaxError,
+  markStoredRules,
+  pathScopeOffered,
+  type RuleForm,
+  splitCommand,
+  validateRule,
+} from "./rule-form";
 
 const HOME = "/Users/me";
 const ctx = { home: HOME, threadExists: (id: string) => id === "t1" };
 const form = (over: Partial<RuleForm>): RuleForm => ({ ...emptyRuleForm(), ...over });
+
+const storedRule = (over: Partial<Rule>): Rule => ({
+  id: "r1",
+  scope: { type: "global" },
+  tool_kind: "execute",
+  tool_name: null,
+  matcher: { type: "command_prefix", argv: ["cat"] },
+  path_scope: null,
+  decision: "allow",
+  origin: { type: "settings" },
+  created_at_ms: 1,
+  ...over,
+});
 
 describe("rules editor: the command, as argv", () => {
   it("splits on spaces and removes quotes and backslashes", () => {
@@ -50,8 +79,6 @@ describe("rules editor: the draft", () => {
     expect(v).toEqual({ ok: true, warnings: [], draft: { scope: { type: "global" }, tool_kind: "execute", tool_name: null, matcher: { type: "command_prefix", argv: ["cargo", "test"] }, path_scope: null, decision: "allow" } });
   });
   it("builds an exact command deny rule in Home, never with a path scope", () => {
-    // Round 2 blocker 2: the engine adds the cwd (~ in Home) to a command's paths, so a scoped
-    // command rule never matches; a leftover scope from another matcher is dropped.
     const v = validateRule(form({ decision: "deny", matcher: "command_exact", command: "git push", scope: "home", pathScope: "~/work/**" }), ctx);
     expect(v.ok && v.draft).toEqual({ scope: { type: "home" }, tool_kind: "execute", tool_name: null, matcher: { type: "command_exact", argv: ["git", "push"] }, path_scope: null, decision: "deny" });
   });
@@ -83,14 +110,14 @@ describe("rules editor: the draft", () => {
     const deny = validateRule(form({ decision: "deny", command: "bash" }), ctx);
     expect(deny.ok && deny.warnings).toEqual([]);
   });
-  it("warns on globs that cover the whole disk or home folder (round 2, minor 4)", () => {
+  it("warns on globs that cover the whole disk or home folder", () => {
     for (const g of ["/", "/**", "/**/*", "/*", "/**/"]) expect(broadGlob(g, HOME), g).toBe("computer");
     for (const g of ["~", "~/**", "~/*", "~/**/*"]) expect(broadGlob(checkGlob(g, HOME).ok ? (checkGlob(g, HOME) as { glob: string }).glob : "", HOME), g).toBe("home");
     expect(broadGlob("/Users/me/src/**", HOME)).toBeNull();
     expect(validateRule(form({ matcher: "path_glob", glob: "/**/*" }), ctx)).toMatchObject({ ok: true, warnings: ["This matches every path on this computer."] });
     expect(validateRule(form({ matcher: "path_glob", glob: "~/**" }), ctx)).toMatchObject({ ok: true, warnings: ["This matches every path in your home folder."] });
   });
-  it("keeps the every-call warning when a path limit is set (round 2, minor 4)", () => {
+  it("keeps the every-call warning when a path limit is set", () => {
     expect(validateRule(form({ matcher: "any", toolKind: "read", pathScope: "/**" }), ctx)).toMatchObject({ ok: true, warnings: ["This allows every call of this kind without asking."] });
     expect(validateRule(form({ matcher: "any", toolKind: "read", pathScope: "~/**" }), ctx)).toMatchObject({ ok: true, warnings: ["This allows every call of this kind in your home folder without asking."] });
   });
@@ -102,43 +129,121 @@ describe("rules editor: the draft", () => {
   });
 });
 
-describe("rules editor: allow rules on shells, wrappers and inline code (round 2, blocker 1)", () => {
+describe("rules editor: rev 4 §7 allow rules on shells, wrappers, and code runners", () => {
   const refused = (command: string, matcher: "command_prefix" | "command_exact" = "command_prefix") => {
     const v = validateRule(form({ matcher, command }), ctx);
     return !v.ok && v.errors.command !== undefined;
   };
-  it("refuses shells, eval/source/., and every wrapper the engine strips, with or without a path or more words", () => {
-    for (const c of ["bash", "sh -c", "bash -c 'ls'", "/bin/zsh", "dash -ec", "fish", "eval", "source", ". ./env.sh", "env", "env -i", "/usr/bin/env FOO=1 make", "exec ls", "command ls", "nohup make", "time cargo test", "nice -n 10 make", "xargs rm", "sudo ls", "doas ls", "timeout 60 cargo test", "stdbuf -oL make", "flock /tmp/l make", "script -q log", "chroot /x ls", "builtin cd", "busybox ls", "su -", "setsid ls", "caffeinate make", "arch -arm64 make"]) {
+  it("refuses unpinned shells, eval, bare source/., and every wrapper", () => {
+    for (const c of ["bash", "sh -c", "bash -c 'ls'", "/bin/zsh", "dash -ec", "fish", "eval", "source", ".", "env", "env -i", "/usr/bin/env FOO=1 make", "exec ls", "command ls", "nohup make", "time cargo test", "nice -n 10 make", "xargs rm", "sudo ls", "doas ls", "timeout 60 cargo test", "stdbuf -oL make", "flock /tmp/l make", "script -q log", "chroot /x ls", "builtin cd", "busybox ls", "su -", "setsid ls", "caffeinate make", "arch -arm64 make"]) {
       expect(refused(c), c).toBe(true);
       expect(refused(c, "command_exact"), c).toBe(true);
     }
+  });
+  it("accepts rev 4 §7 pinned script files on sh/bash/dash and source/. with a warning", () => {
+    for (const c of ["sh x.sh", "bash scripts/build.sh", "dash run.sh", "source env.sh", ". ./env.sh"]) {
+      const v = validateRule(form({ command: c }), ctx);
+      expect(v.ok && v.warnings.length, c).toBe(1);
+    }
+  });
+  it("refuses rev 4 §7 unpinned code-runner prefixes (awk, sed, git, cargo, pipx, ssh, docker)", () => {
+    for (const c of [
+      "awk",
+      "gawk",
+      "mawk",
+      "awk -f",
+      "awk -f -",
+      "awk -f a.awk -e '{print}'",
+      "sed",
+      "sed -f",
+      "sed -f -",
+      "sed '1e id'",
+      "sed 's/a/b/w out'",
+      "git",
+      "git -c x=y status",
+      "git merge-index",
+      "git filter-branch",
+      "git bisect",
+      "git bisect run",
+      "git submodule",
+      "git submodule foreach",
+      "git rebase -x id",
+      "git diff --ext-diff",
+      "git push --exec=x",
+      "git push --receive-pack=x",
+      "cargo",
+      "pipx",
+      "pipx run",
+      "pipx install ruff",
+      "ssh host",
+      "docker",
+      "docker run img",
+      "kubectl exec pod",
+      "parallel echo",
+    ]) {
+      expect(refused(c), c).toBe(true);
+    }
+    // Valid pinned Allow prefixes under rev 4 §7:
+    for (const ok of ["awk -f prog.awk", "sed -f edit.sed", "pipx run ruff"]) {
+      const v = validateRule(form({ command: ok }), ctx);
+      expect(v.ok && v.warnings.length, ok).toBe(1);
+    }
+    for (const clean of ["cargo test", "git status", "git diff", "git bisect start", "git submodule status", "sed 's/error/warn/g'"]) {
+      expect(commandRisk(splitCommand(clean).ok ? (splitCommand(clean) as { ok: true; argv: string[] }).argv : []), clean).toBeNull();
+    }
+    // Exact command rules on remote runners remain allowed with a warning.
+    expect(commandRisk(["ssh", "host", "ls"], "command_exact")).toMatchObject({ warn: expect.any(String) });
+    expect(commandRisk(["docker", "run", "img"], "command_exact")).toMatchObject({ warn: expect.any(String) });
   });
   it("refuses interpreters given code inline, also in an option cluster", () => {
     for (const c of ["python3 -c", "python -c 'print(1)'", "python3.12 -Ic x", "node -e", "node --eval", "node --eval=1", "node -p", "ruby -e", "ruby -ne x", "perl -e", "perl -lne", "perl -E", "osascript -e", "deno eval", "bun -e", "php -r", "lua -e", "find . -exec rm {} +", "find . -execdir x", "find . -ok rm"]) {
       expect(refused(c), c).toBe(true);
     }
   });
-  it("warns on interpreters and runners that name their script or package, and on remote runners", () => {
-    for (const c of ["python3 scripts/build.py", "node build.js", "npx prettier", "ssh host", "docker", "docker run img", "deno run x.ts", "bun x.ts"]) {
+  it("warns on interpreters and runners that name their script or package", () => {
+    for (const c of ["python3 scripts/build.py", "node build.js", "npx prettier", "deno run x.ts", "bun x.ts"]) {
       const v = validateRule(form({ command: c }), ctx);
       expect(v.ok && v.warnings.length, c).toBe(1);
     }
     expect(commandRisk(["cargo", "test"])).toBeNull();
-    expect(commandRisk(["git", "-c", "x=y", "status"])).toBeNull();
-    // Exact rules can name the interpreter's options: nothing can be added after them.
     expect(commandRisk(["python3", "-m", "pytest"], "command_exact")).toMatchObject({ warn: expect.any(String) });
     expect(commandRisk(["find", ".", "-name", "x"], "command_exact")).toBeNull();
     expect(commandRisk(["find", ".", "-delete"], "command_exact")).toMatchObject({ warn: expect.any(String) });
   });
   it("allows deny rules on all of them", () => {
-    for (const c of ["bash", "sh -c", "sudo", "env", "python3 -c", "find . -exec"]) {
+    for (const c of ["bash", "sh -c", "sudo", "env", "python3 -c", "find . -exec", "awk", "git", "pipx run", "sed", "docker"]) {
       const v = validateRule(form({ decision: "deny", command: c }), ctx);
       expect(v.ok && v.warnings, c).toEqual([]);
     }
   });
 });
 
-describe("rules editor: what the engine never matches (round 2, minor 4)", () => {
+describe("rules editor: stored invalid rules (§11 item 5)", () => {
+  it("marks stored rules rejected by rev 4 §7 invalid with a reason, while keeping valid rules valid", () => {
+    const valid = storedRule({ id: "r_ok", matcher: { type: "command_prefix", argv: ["cargo", "test"] } });
+    const invAwk = storedRule({ id: "r_awk", matcher: { type: "command_prefix", argv: ["awk"] } });
+    const invGit = storedRule({ id: "r_git", matcher: { type: "command_prefix", argv: ["git"] } });
+    const invPipx = storedRule({ id: "r_pipx", matcher: { type: "command_prefix", argv: ["pipx", "run"] } });
+    const invDaemon = { ...valid, id: "r_daemon", invalid_reason: "daemon marked invalid" };
+    const invGlob = storedRule({ id: "r_glob", tool_kind: "edit", matcher: { type: "path_glob", glob: "/a/[" } });
+    const denyAwk = storedRule({ id: "r_deny", decision: "deny", matcher: { type: "command_prefix", argv: ["awk"] } });
+
+    expect(checkStoredRule(valid)).toEqual({ valid: true, reason: null });
+    expect(checkStoredRule(denyAwk)).toEqual({ valid: true, reason: null });
+    for (const r of [invAwk, invGit, invPipx, invDaemon, invGlob]) {
+      const res = checkStoredRule(r);
+      expect(res.valid, r.id).toBe(false);
+      expect(typeof res.reason === "string" && res.reason.length > 0, r.id).toBe(true);
+    }
+
+    const marked = markStoredRules([valid, invAwk, denyAwk]);
+    expect(marked[0]!.invalid_reason).toBeNull();
+    expect(marked[1]!.invalid_reason).toMatch(/awk/);
+    expect(marked[2]!.invalid_reason).toBeNull();
+  });
+});
+
+describe("rules editor: what the engine never matches", () => {
   it("refuses a word-initial #, which starts a comment, but not a # inside a word or quoted", () => {
     expect(splitCommand("cargo test # note").ok).toBe(false);
     expect(splitCommand("#x").ok).toBe(false);
@@ -149,7 +254,6 @@ describe("rules editor: what the engine never matches (round 2, minor 4)", () =>
     for (const bad of ["ls\u0000", "ls\u001b[0m", "ls\u007f", "ls\u0085", "ls\u2028x", "ls\u2029"]) {
       expect(splitCommand(bad), JSON.stringify(bad)).toMatchObject({ ok: false, error: expect.stringMatching(/control character/) });
     }
-    // A tab splits words, as in the shell.
     expect(splitCommand("ls\t-l")).toEqual({ ok: true, argv: ["ls", "-l"] });
   });
   it("refuses an empty command name and reserved first words", () => {
@@ -169,7 +273,7 @@ describe("rules editor: what the engine never matches (round 2, minor 4)", () =>
   });
 });
 
-describe("rules editor: where a path limit is offered (round 2, blocker 2)", () => {
+describe("rules editor: where a path limit is offered", () => {
   it("only on allow rules about file calls; never on commands or deny rules", () => {
     expect(pathScopeOffered({ decision: "allow", matcher: "path_glob", toolKind: "edit" })).toBe(true);
     expect(pathScopeOffered({ decision: "allow", matcher: "any", toolKind: "read" })).toBe(true);
@@ -188,20 +292,22 @@ describe("rules editor: where a path limit is offered (round 2, blocker 2)", () 
       const v = validateRule(form({ ...over, pathScope: "~/projects/**" }), ctx);
       expect(v.ok && v.draft.path_scope, JSON.stringify(over)).toBeNull();
     }
-    // An invalid leftover limit doesn't block a rule that can't have one.
     expect(validateRule(form({ command: "cargo test", pathScope: "relative" }), ctx).ok).toBe(true);
   });
 });
 
-describe("rules editor: the allow check fails closed (round 3, blocker 1)", () => {
+describe("rules editor: the allow check fails closed", () => {
   const refused = (command: string, matcher: "command_prefix" | "command_exact" = "command_prefix") => {
     const v = validateRule(form({ matcher, command }), ctx);
     return !v.ok && v.errors.command !== undefined;
   };
-  it("folds names as the disk does: case, ſ and K (U+212A), any folder", () => {
-    for (const c of ["/bin/BASH -c 'ls'", "Bash -c x", "/usr/bin/ENV ls", "SUDO ls", "Python3 -c 'x'", "/bin/baſh", "/bin/\u212Ash", "FIND . -exec rm {} +", "Find . -EXEC rm {} +", "EVAL x", "Source x", "NoHup make", "RUN0 ls", "/usr/bin/SUDOEDIT f", "PERL -E x"]) {
+  it("folds names as the disk does: case, ſ and K (U+212A), any folder", () => {
+    for (const c of ["/bin/BASH -c 'ls'", "Bash -c x", "/usr/bin/ENV ls", "SUDO ls", "Python3 -c 'x'", "/bin/baſh", "/bin/\u212Ash", "FIND . -exec rm {} +", "Find . -EXEC rm {} +", "EVAL x", "NoHup make", "RUN0 ls", "/usr/bin/SUDOEDIT f", "PERL -E x"]) {
       expect(refused(c), c).toBe(true);
       expect(refused(c, "command_exact"), c).toBe(true);
+    }
+    for (const c of ["AWK", "/usr/bin/GAWK", "GIT", "CARGO", "PIPX run", "SOURCE"]) {
+      expect(refused(c), c).toBe(true);
     }
   });
   it("never trips on Object.prototype names", () => {
@@ -227,13 +333,12 @@ describe("rules editor: the allow check fails closed (round 3, blocker 1)", () =
       expect(refused(c), c).toBe(true);
       expect(refused(c, "command_exact"), c).toBe(true);
     }
-    // Only a named script is clear: Windows PowerShell reads bare words as a command.
     expect(refused("pwsh")).toBe(true);
     expect(refused("powershell build")).toBe(true);
     expect(refused("pwsh -File build.ps1")).toBe(false);
     expect(refused("pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1")).toBe(false);
   });
-  it("refuses deny.rs's PRIV wrappers", () => {
+  it("refuses privilege wrappers", () => {
     for (const c of ["run0 ls", "sudoedit /etc/hosts", "pkexec ls", "doas ls", "su -c x"]) expect(refused(c), c).toBe(true);
   });
   it("refuses a prefix rule on an interpreter, runner or find unless the script, package or file comes right after it", () => {
@@ -243,9 +348,7 @@ describe("rules editor: the allow check fails closed (round 3, blocker 1)", () =
     for (const c of ["python3 scripts/build.py", "python3 x.py --flag", "node build.js", "deno run x.ts", "bun run build", "npx prettier --write", "uvx ruff"]) {
       expect(refused(c), c).toBe(false);
     }
-    // Fail closed: a code flag anywhere counts, even after the script (where it is the script's).
     expect(refused("perl tool.pl -e", "command_exact")).toBe(true);
-    // Exact rules can't grow, so options are fine there.
     for (const c of ["python3 -m pytest", "python3 -u build.py", "npx -y prettier", "find . -name x"]) expect(refused(c, "command_exact"), c).toBe(false);
     for (const c of ["npx -c 'sh'", "npx --call=x", "pnpx -c x"]) expect(refused(c, "command_exact"), c).toBe(true);
   });
@@ -259,25 +362,23 @@ describe("rules editor: the allow check fails closed (round 3, blocker 1)", () =
   });
 });
 
-describe("rules editor: round 3 minors", () => {
+describe("rules editor: line breaks, braces, and globset classes", () => {
   it("refuses a line break anywhere, quoted too", () => {
     for (const c of ["echo 'a\nb'", 'echo "a\rb"', "a\nb"]) expect(splitCommand(c), JSON.stringify(c)).toEqual({ ok: false, error: "A rule matches one line: remove the line break" });
   });
-  it("reads brace expansion with nested braces, as shell.rs does", () => {
+  it("reads brace expansion with nested braces", () => {
     for (const bad of ["echo {{a},b}", "echo {a,{b}}", "echo {1..3}", "echo x{a,b}y"]) expect(splitCommand(bad).ok, bad).toBe(false);
     for (const good of ["echo {}", "echo {a}", "echo {{a}}", "find . -exec x {} +", "echo {a b,c}"]) expect(splitCommand(good).ok, good).toBe(true);
     expect(expandsBraces("{{a},b}", 0)).toBe(true);
     expect(expandsBraces("{{a},b}", 1)).toBe(false);
   });
-  it("matches globset 0.4.21 on classes (checked by building each glob with it)", () => {
-    // globset refuses these ("invalid range"): a `-` after a range extends it from its start.
+  it("matches globset 0.4.21 on classes", () => {
     for (const bad of ["/a/[a-z-_]", "/a/[a-z-0]", "/a/[\\"]) expect(globSyntaxError(bad), bad).not.toBeNull();
-    // and builds these: no escapes inside a class.
     for (const good of ["/a/[\\]", "/a/[\\]]", "/a/[a-c-e]", "/a/[a-c-b]", "/a/[a\\-z]"]) expect(globSyntaxError(good), good).toBeNull();
   });
 });
 
-describe("rules editor: round 3 follow-up (review 3, finding 1)", () => {
+describe("rules editor: bun exec, package runner -c, stdin scripts, and bare exact rules", () => {
   const refused = (command: string, matcher: "command_prefix" | "command_exact" = "command_prefix") => {
     const v = validateRule(form({ matcher, command }), ctx);
     return !v.ok && v.errors.command !== undefined;
