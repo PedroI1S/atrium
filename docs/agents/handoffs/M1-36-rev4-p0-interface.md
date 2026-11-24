@@ -504,3 +504,24 @@ Run by worker (allowed under D-123):
 - `cargo fmt --all` — clean
 - `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
 - `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
+
+
+---
+
+## Round 8 (D-149, CR-P2-3)
+
+Added `Target::written` to `crates/atrium-core/src/policy/model.rs` per driver decision D-149 (accepting P2's change request CR-P2-3 under D-147), so standalone `v4::paths::check_target` and `v4::paths::check_recursive_root` can check protected names on a target's lexically normalised written spelling as well as on its canonical path (matching `dev`). No other types, stubs, or tool-table rows were changed.
+
+### Field added
+- **`Target::written`** (`pub(crate) written: Option<Vec<u8>>`, placed immediately after `Target::resolution`): holds the lexically normalised written spelling (`~` expanded, joined onto the written working directory, `.` and `..` removed) when known, or `None` when the target has no written form (for example a filesystem entry found by a walk).
+
+### Files touched
+- `crates/atrium-core/src/policy/model.rs`: added `Target::written` with its contract/decision doc comment and added the `target_carries_optional_written_spelling` interface unit test building `Target` values both with `written: Some(...)` and with `written: None`.
+- `docs/agents/handoffs/M1-36-rev4-p0-interface.md`: added this Round 8 section.
+
+### Round 8 verification
+
+Run by worker (allowed under D-123):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
