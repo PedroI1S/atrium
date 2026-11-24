@@ -447,3 +447,54 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core policy::v4:: -- --nocapture
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 7 (D-146)
+
+Exception round granted by the driver (D-146) for review round 5's two findings (`.orchestration/review-input/review-round5.md`).
+
+### Finding 1 (major): here-document bodies became exact units
+- **Cause:** `lex_exact_redirect` queued a here-doc only when its decoded delimiter was non-empty, so `cat <<''` queued nothing and the body line `sudo id` was lexed as an exact unit.
+- **Fix (`v4/lex.rs`):** `read_heredoc_delimiter` decodes the delimiter only where `sh`, `bash` and `zsh` agree:
+  - single quotes keep every byte;
+  - in double quotes a backslash escapes only `"`, `\`, `$` and backtick, and is otherwise kept. Before, every backslash was dropped, so `<<"E\F"` ended at a line `EF` and the body lines after it became exact units. Same class, fixed;
+  - outside quotes a backslash escapes the next byte.
+- **The three outcomes:**
+  - **Known delimiter, including empty (`<<''`, `<<""`, `<<-''`, `E''""`):** queued. The body ends at the first matching line (an empty line for an empty delimiter; with `<<-`, a line of tabs). Units after the terminator are lexed as before.
+  - **Unknown delimiter:** a quoted or escaped newline, an unquoted or double-quoted `$` or backtick, or an unclosed quote. Where the body ends is uncertain, so `skip_heredocs` treats the rest of the text as body.
+  - **Missing delimiter word (`cat <<`, `cat << ; …`):** a syntax error in every shell. The rest of the text is skipped at once, so nothing after `<<` becomes an exact unit.
+  - In the last two cases, units after the body are hidden only from the exact lexer: the line is Unread (`<<`) anyway, and the best-effort pass still lexes them. No other exact path consumes a newline without skipping pending bodies (checked: comments, quotes, escapes, `&&`/`||`/`|` continuations, nested `-c` scripts). Here-strings (`<<<`) have no body. The best-effort lexer already queued every here-doc, including empty delimiters, and is unchanged.
+- **Test:** `r7_f1_here_document_bodies_never_become_exact_units`:
+  - the review's case and 9 more known-delimiter forms (empty quoted, `<<-`, with a following redirect, `2<<''`, two here-docs, `"E\F"`, mixed quoting, `\E`): no exact `sudo` unit, the `ls` after the terminator is an exact unit, the `<<` reason is recorded, and the best-effort pass still has `ls`;
+  - 9 missing or unknown forms: only the `cat` unit;
+  - a modeled `sh -c` script through `build_units`.
+
+### Finding 2 (minor): bracket expressions, closed by D-146
+- **The lexer implements D-146's closed form:** members are allowed unquoted characters, ranges between two such characters, or quoted/escaped bytes, with no `!`/`^`. Outside it (Unread): `]` as the first member, `[` as a member (which covers `[:…:]`, `[=…=]` and `[.….]`), unquoted `*`/`?` members (accepted before), and a range with a quoted or escaped endpoint (`['a'-z]`, `[a-'z']`, `[a-\z]`; not checked before). Range checks use `ClassMembers`: an unquoted `-` between members is a range, and a first or last `-` is a literal member.
+- **Two deliberate choices, stricter than D-146's wording; both only add Unread, never a missed hit.** I'd like the driver to confirm them:
+  - **`/` is not accepted as a member** (`[a/b]` stays Unread, as the existing test at `lex/tests.rs` requires). A slash never matches inside a bracket expression in pathname expansion, and the shells handle it differently.
+  - **A quoted `!` or `^` inside a class stays `NegatedGlobClass`**, as since round 1. D-146 says only "no `!` or `^`".
+- **Tests:**
+  - `r7_bracket_class_is_d146_closed_form`: 11 accepted forms (`[a-z]`, `[A'x']`, `[\]]` as review 2 ruled, `[']'a]`, `[a-]`, `[-a]`, `[a\-z]`, …) and 10 Unread ones (review 5's `[]A]GENTS.md`, `[A[]GENTS.md`, `[[:upper:]]GENTS.md`, plus `[[=a=]]`, `[[.a.]]`, `[*]`, `[?]` and the three quoted-endpoint ranges);
+  - the test rejecting `[[:alpha:]]` is unchanged.
+- **Expectation changed:** `lex_exact_globs_and_negated_classes` no longer lists `cat proj/[*]` as accepted, because under D-146 `*` is not an allowed unquoted character. It is now in the Unread list of the new test.
+
+### Change requests
+None.
+
+### Round 7 verification
+Run by the worker (D-123):
+- `cargo fmt --all`: clean
+- `cargo check -p atrium-core --tests`: clean
+- `cargo clippy -p atrium-core --tests -- -D warnings`: clean
+
+Not run (D-123): any test. Run in debug (reservation `debug_assert`s).
+
+Commands for the orchestrator's verification task (fish-compatible):
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4:: -- --nocapture
+cargo test --workspace --no-fail-fast
+```
