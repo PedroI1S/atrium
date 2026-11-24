@@ -470,13 +470,19 @@ pub(crate) fn unwrap_unit(
     Ok(UnwrapResult { unit, unread })
 }
 
+/// Most words one §4 wrapper form strips (`timeout -s SIG -k D D`).
+const MAX_WRAPPER_WORDS: usize = 6;
+
 /// Removes §4 wrappers from the front of `unit.argv` into
 /// `unit.removed_wrappers`, in place.
 ///
-/// The wrapper words are moved once, at the end, with one shift of the argv
-/// (charged by its length), instead of one shift per wrapper. On exhaustion
-/// the unit keeps its full argv and no removed wrappers, and any wrapper
-/// reason already found is still returned.
+/// The wrapper words are moved once, at the end, with one shift of the
+/// argv, instead of one shift per wrapper. The shift is paid for before the
+/// first wrapper is parsed, and each wrapper's storage (its
+/// `removed_wrappers` slot and up to `MAX_WRAPPER_WORDS` words) before it is
+/// parsed. So on exhaustion every wrapper already recognised is still moved
+/// out and kept, along with any wrapper reason already found (review round
+/// 4: no finished result is dropped on an error path).
 fn unwrap_in_place(
     unit: &mut CommandUnit,
     folds: &FoldRules,
@@ -508,8 +514,16 @@ fn unwrap_in_place(
             let Some(kind) = spec.wrapper() else {
                 break;
             };
+            // Pay, before parsing, for storing this wrapper once recognised.
+            if planned == 0 {
+                budget.charge(unit.argv.len() as u64)?;
+            }
+            budget.charge(MAX_WRAPPER_WORDS as u64)?;
+            budget.charge_alloc(MAX_WRAPPER_WORDS * std::mem::size_of::<Word>())?;
+            charge_vec_growth(&mut unit.removed_wrappers, planned + 1, budget)?;
             match parse_wrapper_prefix(kind, spec, &unit.argv[pos..], budget)? {
                 Some(strip_count) => {
+                    debug_assert!(strip_count <= MAX_WRAPPER_WORDS);
                     plan[planned] = (kind, strip_count);
                     planned += 1;
                     pos += strip_count;
@@ -527,31 +541,17 @@ fn unwrap_in_place(
         }
         Ok(())
     })();
-    if let Err(e) = scan {
-        return (unread, Err(e));
-    }
-    if planned == 0 {
-        return (unread, Ok(()));
-    }
 
-    // Charge moving the wrapper words out (one shift of the argv plus each
-    // removed word) and their storage before doing it.
-    let plan = &plan[..planned];
-    let charged = budget
-        .charge((unit.argv.len() + pos) as u64)
-        .and_then(|()| charge_vec_growth(&mut unit.removed_wrappers, planned, budget))
-        .and_then(|()| budget.charge_alloc(pos.saturating_mul(std::mem::size_of::<Word>())));
-    if let Err(e) = charged {
-        return (unread, Err(e));
+    // Move the recognised wrappers out; all of it was paid for above.
+    if planned > 0 {
+        let mut drained = unit.argv.drain(..pos);
+        for &(kind, count) in &plan[..planned] {
+            let mut words = Vec::with_capacity(count);
+            words.extend(drained.by_ref().take(count));
+            push_reserved(&mut unit.removed_wrappers, RemovedWrapper { kind, words });
+        }
     }
-    let mut drained = unit.argv.drain(..pos);
-    for &(kind, count) in plan {
-        let mut words = Vec::with_capacity(count);
-        words.extend(drained.by_ref().take(count));
-        push_reserved(&mut unit.removed_wrappers, RemovedWrapper { kind, words });
-    }
-    drop(drained);
-    (unread, Ok(()))
+    (unread, scan)
 }
 
 /// Validates a single §4 wrapper at the front of `argv` using `spec.flags()`
