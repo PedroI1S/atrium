@@ -1064,3 +1064,10 @@ D-141 removed flag arities from these rows precisely to avoid this.
 - **A compaction spike first:** how each provider compacts, whether the injection channel survives, and what signal the adapter sees. Its results drive the brief's re-injection and a new `ContextCompacted` event with a marker in the thread.
 - **A first-launch welcome flow:** providers found (with §3.18's import offer folded in), security preset, brief level, and opt-in heavy features (all off). It is skippable and never blocks first use.
 - **Milestone: M2**, after the M1 gate. Nothing starts until the driver gives a go for that phase.
+
+## D-161 — 2026-11-24 — Pedro: P2's and P3's next writer rounds go to Neon
+**Decided by Pedro (driver).** This replaces the Opus 5.5 writer in D-155 (P2) and D-156 (P3). The Opus sessions for those rounds live on rodrigo's machine. The orchestrator picked the effort: **`gemini-4-neon-xhigh`**, because both tasks are escalations past two Neon `high` rounds (D-158).
+- **P2 (M1-38):** round 10 (`cae98db`, written by Opus) is verified first (D-123), then gets Codex review 9. Any further round is written by Neon `xhigh` on the same branch. D-155's rules still hold: rounds go on while each review finds fewer findings, and the task goes back to the driver if the count stalls or rises, a blocker appears, or an interface change is requested.
+- **P3 (M1-39):** round 4 is written by Neon `xhigh` from `b021ad4`. It follows D-156's ruling (trigger and code detection never consumes option values), removes the arity modelling outside the frozen table in core and in `app/src/chat/rule-form.ts` together, and fixes review 3's three findings.
+- **Unchanged:** reviews by Codex (GPT-6.1 Sol, `high`, read-only); D-123's write-then-verify flow; D-120's 100% gate. Work that needs path-like literals the `agy` policy refuses (D-074) goes back to Claude.
+- **First:** the `agy` 1.5.15 hook check (D-158).
