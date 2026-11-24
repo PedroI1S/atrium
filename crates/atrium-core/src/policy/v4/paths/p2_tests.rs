@@ -4095,8 +4095,11 @@ fn round3_r2f3_write_only_members_are_collected_and_early_stops_are_unread() {
 }
 
 #[test]
-fn round3_r2f3_write_only_walk_past_its_caps_is_unread_never_clear() {
-    // Entries: 4,100 siblings before the member (past WALK_MAX_ENTRIES).
+fn round5_d145_member_walk_cutoff_is_clear_and_still_asks_by_its_link_count() {
+    // D-145 rule 2 (replaces round 4's `AnyTarget` expectation): members are
+    // collected for hard links within the walk caps, and a cutoff there is
+    // Clear, as in §5's bounded hard-link walk. The uncollected hard-linked
+    // alias is still Ask in every setting (§1 step 4, multiply-linked flag).
     let mut fs = FakeFs::new();
     for i in 0..(limits::WALK_MAX_ENTRIES + 4) {
         fs.add_file(format!("/h/u/.config/atrium/big/f{i:05}").as_bytes());
@@ -4104,117 +4107,111 @@ fn round3_r2f3_write_only_walk_past_its_caps_is_unread_never_clear() {
     fs.add_file(b"/h/u/.config/atrium/big/zz_key");
     fs.add_hard_link(b"/h/u/.config/atrium/big/zz_key", b"/h/u/proj/alias");
     fs.add_file(b"/h/u/proj/plain");
-    fs.add_file(b"/h/u/.ssh/id_rsa");
-    let prot = default_build(&fs);
-    assert!(
-        prot.identity_gaps.iter().any(|g| g.write_only
-            && g.scope == GapScope::AnyTarget
-            && g.reason == UnreadReason::WalkCapReached(FsCap::EntriesRead)),
-        "gap expected, got {:?}",
-        prot.identity_gaps
-    );
-
-    // Round 4: the gap is applied inside `check_target` (D-144), so the
-    // resolver-backed flow and a standalone check agree.
-    let w = subject("proj/alias", AccessMode::Write, &prot, &fs);
-    assert!(
-        has_unread(&w.outcomes, |r| *r
-            == UnreadReason::WalkCapReached(FsCap::EntriesRead)),
-        "a write the incomplete walk might protect is Unread, got {:?}",
-        w.outcomes
-    );
-    let t = literal(b"proj/alias", AccessMode::Write, &fs);
-    assert_eq!(
-        check_target(&t, &prot, &mut ComputeBudget::with_default_limits())
-            .unwrap()
-            .outcome,
-        PartOutcome::Unread(UnreadReason::WalkCapReached(FsCap::EntriesRead))
-    );
-
-    // Conservative rule (round 4): the gap could hide a member link whose
-    // target is anywhere, so every write that is not already a hit is Unread,
-    // singly linked or not. Reads are untouched by a write-only gap, and hits
-    // stay hits.
-    let plain = subject("proj/plain", AccessMode::Write, &prot, &fs);
-    assert!(has_unread(&plain.outcomes, |r| *r
-        == UnreadReason::WalkCapReached(FsCap::EntriesRead)));
-    for p in ["proj/alias", "proj/plain"] {
-        let r = subject(p, AccessMode::Read, &prot, &fs);
-        assert!(all_clear(&r.outcomes), "{p}: {:?}", r.outcomes);
-    }
-    let key = subject("~/.ssh/id_rsa", AccessMode::Write, &prot, &fs);
-    assert!(has_hard_deny(&key.outcomes, "credential-read"));
-    assert!(!has_unread(&key.outcomes, |_| true), "{:?}", key.outcomes);
-
-    // Depth: a member below WALK_MAX_DEPTH levels.
-    let mut deep_fs = FakeFs::new();
     let mut deep = b"/h/u/.config/atrium".to_vec();
     for i in 0..=(limits::WALK_MAX_DEPTH as usize) {
         deep.extend_from_slice(format!("/d{i}").as_bytes());
     }
     deep.extend_from_slice(b"/key");
-    deep_fs.add_file(&deep);
-    deep_fs.add_hard_link(&deep, b"/h/u/proj/deep_alias");
-    let deep_prot = default_build(&deep_fs);
-    assert!(
-        deep_prot
-            .identity_gaps
-            .iter()
-            .any(|g| g.write_only && g.reason == UnreadReason::WalkCapReached(FsCap::WalkDepth)),
-        "got {:?}",
-        deep_prot.identity_gaps
-    );
-    let dw = subject("proj/deep_alias", AccessMode::Write, &deep_prot, &deep_fs);
-    assert!(has_unread(&dw.outcomes, |r| *r
-        == UnreadReason::WalkCapReached(FsCap::WalkDepth)));
+    fs.add_file(&deep);
+    fs.add_hard_link(&deep, b"/h/u/proj/deep_alias");
+    let prot = default_build(&fs);
+    assert!(prot.identity_gaps.is_empty(), "{:?}", prot.identity_gaps);
+
+    for alias in ["proj/alias", "proj/deep_alias"] {
+        let w = subject(alias, AccessMode::Write, &prot, &fs);
+        assert!(all_clear(&w.outcomes), "{alias}: {:?}", w.outcomes);
+        assert!(
+            w.multiply_linked_file,
+            "{alias} still asks by its link count"
+        );
+    }
+    assert!(all_clear(
+        &subject("proj/plain", AccessMode::Write, &prot, &fs).outcomes
+    ));
+    // Spelled through the protected folder, every member is a hit by name.
+    let named = subject("~/.config/atrium/big/zz_key", AccessMode::Write, &prot, &fs);
+    assert!(has_hard_deny(&named.outcomes, "atrium-self"));
 }
 
 #[test]
-fn round4_identity_gaps_widen_unread_and_never_touch_hits() {
-    // A browser root larger than the walk cap: a read-applicable AnyTarget
-    // gap. Every target that is not a hit is Unread; hits are unchanged; a
-    // Store hit is kept beside the gap's Unread in the flows, and a
-    // single-result check reports the stricter Unread.
-    let mut fs = FakeFs::new();
+fn round5_d145_gaps_only_where_a_root_cannot_be_established() {
+    // D-145 rule 4 (replaces round 4's walk-cap gaps).
+    // (a) A large tree is not a gap: Clear stays Clear.
+    let mut big = FakeFs::new();
     for i in 0..(limits::WALK_MAX_ENTRIES + 4) {
-        fs.add_file(format!("/h/u/.config/google-chrome/Cache/c{i:05}").as_bytes());
+        big.add_file(format!("/h/u/.config/google-chrome/Cache/c{i:05}").as_bytes());
     }
-    fs.add_file(b"/h/u/.config/google-chrome/Default/Preferences");
+    big.add_file(b"/h/u/proj/readme");
+    let big_prot = default_build(&big);
+    assert!(
+        big_prot.identity_gaps.is_empty(),
+        "{:?}",
+        big_prot.identity_gaps
+    );
+    assert!(all_clear(
+        &subject("proj/readme", AccessMode::Read, &big_prot, &big).outcomes
+    ));
+
+    // (b) A credential tree root that cannot be listed: a gap through it,
+    //     which reaches multiply-linked targets but not ordinary ones; paths
+    //     spelled through the root stay exact hits.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.gnupg/x");
+    fs.set_dir_read_error(b"/h/u/.gnupg", FsIoError::PermissionDenied);
     fs.add_file(b"/h/u/proj/readme");
-    fs.add_file(b"/h/u/.ssh/id_rsa");
-    fs.add_file(b"/h/u/.pypirc");
+    fs.add_file(b"/h/u/proj/a");
+    fs.add_hard_link(b"/h/u/proj/a", b"/h/u/proj/b");
     let prot = default_build(&fs);
-    assert!(prot.identity_gaps.iter().any(|g| !g.write_only
-        && g.scope == GapScope::AnyTarget
-        && g.reason == UnreadReason::WalkCapReached(FsCap::EntriesRead)));
+    assert!(
+        prot.identity_gaps
+            .iter()
+            .any(|g| matches!(g.scope, GapScope::Through(_)) && !g.write_only),
+        "{:?}",
+        prot.identity_gaps
+    );
+    assert!(all_clear(
+        &subject("proj/readme", AccessMode::Read, &prot, &fs).outcomes
+    ));
+    assert!(has_unread(
+        &subject("proj/b", AccessMode::Read, &prot, &fs).outcomes,
+        |r| { matches!(r, UnreadReason::UnresolvablePath { .. }) }
+    ));
+    let x = subject("~/.gnupg/x", AccessMode::Read, &prot, &fs);
+    assert!(has_hard_deny(&x.outcomes, "credential-read"));
+    assert!(!has_unread(&x.outcomes, |_| true));
 
-    let gap_unread = |path: &str| {
-        let res = subject(path, AccessMode::Read, &prot, &fs);
-        has_unread(&res.outcomes, |r| {
-            matches!(r, UnreadReason::WalkCapReached(_))
-        })
-    };
-    assert!(gap_unread("~/.config/google-chrome/Default/Preferences"));
-    assert!(gap_unread("proj/readme"));
-    assert!(gap_unread("~/.config/other.toml"));
-
-    let key = subject("~/.ssh/id_rsa", AccessMode::Read, &prot, &fs);
-    assert!(has_hard_deny(&key.outcomes, "credential-read"));
-    assert!(!has_unread(&key.outcomes, |_| true));
-
-    let store = subject("~/.pypirc", AccessMode::Read, &prot, &fs);
-    assert!(has_store_hit(&store.outcomes), "{:?}", store.outcomes);
-    assert!(has_unread(&store.outcomes, |r| matches!(
-        r,
-        UnreadReason::WalkCapReached(_)
-    )));
-    let t = literal(b"~/.pypirc", AccessMode::Read, &fs);
+    // (c) `~/.ssh` that cannot be listed: `AnyTarget`. Every target that is
+    //     not a hit is Unread; a Store hit keeps its record beside the doubt,
+    //     and a single-result check reports the stricter Unread.
+    let mut ssh_fs = FakeFs::new();
+    ssh_fs.mkdir_all(b"/h/u/.ssh");
+    ssh_fs.set_dir_read_error(b"/h/u/.ssh", FsIoError::PermissionDenied);
+    ssh_fs.add_file(b"/h/u/proj/readme");
+    ssh_fs.add_file(b"/h/u/.pypirc");
+    ssh_fs.add_file(b"/h/u/.aws/credentials");
+    let ssh_prot = default_build(&ssh_fs);
+    assert!(
+        ssh_prot
+            .identity_gaps
+            .iter()
+            .any(|g| g.scope == GapScope::AnyTarget && !g.write_only)
+    );
+    assert!(has_unread(
+        &subject("proj/readme", AccessMode::Read, &ssh_prot, &ssh_fs).outcomes,
+        |r| matches!(r, UnreadReason::UnresolvablePath { .. })
+    ));
+    let store = subject("~/.pypirc", AccessMode::Read, &ssh_prot, &ssh_fs);
+    assert!(has_store_hit(&store.outcomes) && has_unread(&store.outcomes, |_| true));
+    let t = literal(b"~/.pypirc", AccessMode::Read, &ssh_fs);
     assert!(matches!(
-        check_target(&t, &prot, &mut ComputeBudget::with_default_limits())
+        check_target(&t, &ssh_prot, &mut ComputeBudget::with_default_limits())
             .unwrap()
             .outcome,
-        PartOutcome::Unread(UnreadReason::WalkCapReached(_))
+        PartOutcome::Unread(_)
     ));
+    let key = subject("~/.aws/credentials", AccessMode::Read, &ssh_prot, &ssh_fs);
+    assert!(has_hard_deny(&key.outcomes, "credential-read"));
+    assert!(!has_unread(&key.outcomes, |_| true));
 }
 
 #[cfg(target_os = "linux")]
@@ -4518,17 +4515,17 @@ fn round3_neighbour_paths_spelled_through_protected_folders_keep_their_hit() {
     );
     let r = subject("~/.config/atrium/zz_link", AccessMode::Read, prot, &fs);
     assert!(!has_any_hard_deny(&r.outcomes), "{:?}", r.outcomes);
-    // The links' targets, named directly: the walks stopped before the links,
-    // so a complete walk might have recorded these targets. Round 4's
-    // conservative rule makes them Unread (never Clear, never a hit).
+    // The links' targets, named directly: D-145 rules 2-3. Link targets are
+    // recorded only for `~/.ssh` members, and the member walk's cutoff is
+    // not a gap, so a direct read of the external target is Clear, as on
+    // `dev` (not a hit, not Unread).
+    assert!(prot.identity_gaps.is_empty(), "{:?}", prot.identity_gaps);
     for (p, access) in [
         ("/tmp/ordinary", AccessMode::Read),
         ("/tmp/ordinary2", AccessMode::Write),
     ] {
         let r = subject(p, access, prot, &fs);
-        assert!(!has_any_hard_deny(&r.outcomes), "{p}: {:?}", r.outcomes);
-        assert!(has_unread(&r.outcomes, |r| *r
-            == UnreadReason::WalkCapReached(FsCap::EntriesRead)));
+        assert!(all_clear(&r.outcomes), "{p}: {:?}", r.outcomes);
     }
 }
 
@@ -4692,27 +4689,38 @@ fn round4_f1_browser_profile_reached_through_a_link_is_collected() {
 }
 
 #[test]
-fn round4_f2_external_target_of_an_uncollected_link_is_unread() {
-    // Review round 3, finding 2: `.gnupg` is searchable but not listable, so
-    // the walk cannot see `key -> /tmp/token`.
+fn round5_d145_unlistable_tree_root_is_a_gap_through_it() {
+    // Review round 3, finding 2, under D-145: `.gnupg` is searchable but not
+    // listable, so the root cannot be listed: a gap through the root (rule
+    // 4). The external target of a link inside the tree is not recorded even
+    // by a complete walk (rule 3), so its direct read is Clear, as on `dev`.
     let mut fs = FakeFs::new();
     fs.add_file(b"/tmp/token");
     fs.add_symlink(b"/h/u/.gnupg/key", b"/tmp/token");
     fs.set_dir_read_error(b"/h/u/.gnupg", FsIoError::PermissionDenied);
+    fs.add_file(b"/h/u/proj/a");
+    fs.add_hard_link(b"/h/u/proj/a", b"/h/u/proj/b");
     let prot = default_build(&fs);
     assert!(prot.identity_gaps.iter().any(|g| !g.write_only
-        && g.scope == GapScope::AnyTarget
+        && matches!(g.scope, GapScope::Through(_))
         && matches!(g.reason, UnreadReason::UnresolvablePath { .. })));
+    assert!(
+        !prot
+            .identity_gaps
+            .iter()
+            .any(|g| g.scope == GapScope::AnyTarget)
+    );
 
-    // A complete walk would have recorded /tmp/token: Unread, never Clear.
-    assert!(matches!(
-        read_outcome(b"/tmp/token", &prot, &fs),
-        PartOutcome::Unread(UnreadReason::UnresolvablePath { .. })
-    ));
-    // The protected spelling itself stays an exact hit.
+    assert_eq!(read_outcome(b"/tmp/token", &prot, &fs), PartOutcome::Clear);
+    // The protected spelling stays an exact hit (the root's identity).
     assert!(matches!(
         read_outcome(b"~/.gnupg/key", &prot, &fs),
         PartOutcome::HardDenyHit(_)
+    ));
+    // A multiply-linked file could be an uncollected member: Unread.
+    assert!(matches!(
+        read_outcome(b"proj/b", &prot, &fs),
+        PartOutcome::Unread(UnreadReason::UnresolvablePath { .. })
     ));
 }
 
@@ -4720,7 +4728,9 @@ fn round4_f2_external_target_of_an_uncollected_link_is_unread() {
 fn round4_f3_cached_listing_failure_is_recorded_for_every_access_scope() {
     // Review round 3, finding 3: the write-protected Atrium path is the first
     // to list `.azure` (and fail); the store discovery that reuses the cached
-    // failure is read-sensitive.
+    // failure is read-sensitive. Under D-145 rule 4 an unreadable folder on
+    // the path to a root may hide fold spellings whose identity is unknown,
+    // so each consumer records an `AnyTarget` gap in its own access scope.
     let mut fs = FakeFs::new();
     fs.add_file(b"/tmp/token");
     fs.mkdir_all(b"/h/u/.azure/atrium");
@@ -4728,7 +4738,11 @@ fn round4_f3_cached_listing_failure_is_recorded_for_every_access_scope() {
     fs.set_dir_read_error(b"/h/u/.azure", FsIoError::PermissionDenied);
     let prot = build_with(&fs, &[], &[b"/h/u/.azure/atrium"]);
     assert!(prot.identity_gaps.iter().any(|g| g.write_only));
-    assert!(prot.identity_gaps.iter().any(|g| !g.write_only));
+    assert!(
+        prot.identity_gaps
+            .iter()
+            .any(|g| !g.write_only && g.scope == GapScope::AnyTarget)
+    );
     assert!(matches!(
         read_outcome(b"/tmp/token", &prot, &fs),
         PartOutcome::Unread(UnreadReason::UnresolvablePath { .. })
@@ -4911,16 +4925,15 @@ fn round4_f8_mv_trigger_is_a_directory_source_not_the_destination() {
 #[test]
 fn round4_cr_p2_2_gaps_reach_standalone_checks_and_recursive_walks() {
     // CR-P2-2 failing case 2: a filter-selected link, checked inside the
-    // recursive walk, into a browser root whose walk passed its cap.
+    // recursive walk, into a browser root with a gap. Under D-145 a walk cap
+    // is no longer a gap, so the root here cannot be listed (rule 4).
     let mut fs = FakeFs::new();
-    for i in 0..(limits::WALK_MAX_ENTRIES + 4) {
-        fs.add_file(format!("/h/u/.config/google-chrome/Cache/c{i:05}").as_bytes());
-    }
     fs.add_file(b"/h/u/.config/google-chrome/Default/x.toml");
     fs.add_symlink(
         b"/h/u/proj/l.toml",
         b"/h/u/.config/google-chrome/Default/x.toml",
     );
+    fs.set_dir_read_error(b"/h/u/.config/google-chrome", FsIoError::PermissionDenied);
     let prot = default_build(&fs);
     let root = literal(b"proj", AccessMode::Read, &fs);
     let filter = SearchFilter {
@@ -4941,13 +4954,16 @@ fn round4_cr_p2_2_gaps_reach_standalone_checks_and_recursive_walks() {
     .unwrap();
     assert!(!has_any_hard_deny(&res.outcomes));
     assert!(
-        has_unread(&res.outcomes, |r| *r
-            == UnreadReason::WalkCapReached(FsCap::EntriesRead)),
+        has_unread(&res.outcomes, |r| matches!(
+            r,
+            UnreadReason::UnresolvablePath { .. }
+        )),
         "{:?}",
         res.outcomes
     );
-    // (Failing case 1, the standalone write through a hard link past the
-    // cap, is asserted in `round3_r2f3_write_only_walk_past_its_caps_is_unread_never_clear`.)
+    // (Failing case 1, a write through a hard link past the member walk's cap,
+    // is Clear with the multiply-linked Ask under D-145 rule 2:
+    // `round5_d145_member_walk_cutoff_is_clear_and_still_asks_by_its_link_count`.)
 }
 
 #[test]
