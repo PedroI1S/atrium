@@ -496,6 +496,16 @@ struct UnitEvalInfo<'a> {
     has_plain_unread: bool,
     has_exhausted: bool,
     pinned_program_words: Option<&'a [String]>,
+    wrapper_words: usize,
+}
+
+fn wrapper_word_count(unit: &CommandUnit, budget: &mut ComputeBudget) -> Result<usize, Exhausted> {
+    budget.charge(unit.removed_wrappers.len().max(1) as u64)?;
+    let mut count = 0usize;
+    for w in &unit.removed_wrappers {
+        count = count.saturating_add(w.words.len());
+    }
+    Ok(count)
 }
 
 struct CallOutcomeFlags {
@@ -567,6 +577,7 @@ pub(crate) fn evaluate_rules(
     let mut unit_info = vec_with_exact_budgeted::<UnitEvalInfo<'_>>(call.units.len(), budget)?;
     for (idx, u) in call.units.iter().enumerate() {
         let simple_ok = is_unit_simple_for_allow(u, budget)?;
+        let wrapper_words = wrapper_word_count(u, budget)?;
         let eff = call.effects.get(idx);
         let mut has_plain_unread = false;
         let mut pinned_program_words: Option<&[String]> = None;
@@ -587,6 +598,7 @@ pub(crate) fn evaluate_rules(
             has_plain_unread,
             has_exhausted: false,
             pinned_program_words,
+            wrapper_words,
         });
     }
 
@@ -1228,6 +1240,26 @@ fn strings_match_argv(
     Ok(true)
 }
 
+/// Checks whether `rule_argv` (which already matched `unit.original_argv()`)
+/// names the full pinned program `prog_words` starting immediately after the
+/// unit's `wrapper_offset` removed wrapper words (§7, §11 item 8).
+fn rule_argv_names_pinned_program(
+    rule_argv: &[String],
+    wrapper_offset: usize,
+    prog_words: &[String],
+    budget: &mut ComputeBudget,
+) -> Result<bool, Exhausted> {
+    let Some(after_wrappers) = rule_argv.get(wrapper_offset..) else {
+        budget.charge(1)?;
+        return Ok(false);
+    };
+    if after_wrappers.len() < prog_words.len() {
+        budget.charge(1)?;
+        return Ok(false);
+    }
+    strings_match_argv(after_wrappers, prog_words, true, budget)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_allow_rule(
     rule: &Rule,
@@ -1329,10 +1361,14 @@ fn apply_allow_rule(
                     continue;
                 }
                 if let Some(prog_words) = unit_info[idx].pinned_program_words {
-                    // Rule must name the full pinned program (§7, §11 item 8).
-                    if rule_argv.len() < prog_words.len()
-                        || !strings_match_argv(rule_argv, prog_words, true, budget)?
-                    {
+                    // Rule must name the full pinned program past any removed
+                    // wrapper words (§7, §11 item 8).
+                    if !rule_argv_names_pinned_program(
+                        rule_argv,
+                        unit_info[idx].wrapper_words,
+                        prog_words,
+                        budget,
+                    )? {
                         continue;
                     }
                     per_unit[idx].covers_pinned_program = true;
@@ -1367,9 +1403,14 @@ fn apply_allow_rule(
                     continue;
                 }
                 if let Some(prog_words) = unit_info[idx].pinned_program_words {
-                    if rule_argv.len() < prog_words.len()
-                        || !strings_match_argv(rule_argv, prog_words, true, budget)?
-                    {
+                    // Rule must name the full pinned program past any removed
+                    // wrapper words (§7, §11 item 8).
+                    if !rule_argv_names_pinned_program(
+                        rule_argv,
+                        unit_info[idx].wrapper_words,
+                        prog_words,
+                        budget,
+                    )? {
                         continue;
                     }
                     per_unit[idx].covers_pinned_program = true;

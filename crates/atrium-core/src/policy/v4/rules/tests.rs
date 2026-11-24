@@ -9,8 +9,9 @@ use serde_json::json;
 use crate::policy::model::{
     AccessMode, BestEffortRecord, BestEffortUnit, ByteProvenance, CallOutcome, CommandUnit,
     ComputeBudget, ExhaustReason, FoldRules, Hit, HitMatch, HitSource, ModelRedirect, PartId,
-    PartOutcome, PartResult, RuleEvalContext, RuleValidationError, Separator, Target, TargetOrigin,
-    TargetResolution, ToolEffects, UnitIndex, UnreadReason, Word,
+    PartOutcome, PartResult, RemovedWrapper, RuleEvalContext, RuleValidationError, Separator,
+    Target, TargetOrigin, TargetResolution, ToolEffects, UnitIndex, UnreadReason, Word,
+    WrapperKind,
 };
 use crate::policy::v4::tools::classify_unit;
 
@@ -1462,4 +1463,413 @@ fn finding_7_public_core_validator_matches_v4_rules() {
         crate::policy::validate_rule_matcher(&RuleMatcher::Any, RuleDecision::Allow, Some("/a/["))
             .unwrap_err();
     assert!(!err_scope.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 6. Round 3 regression tests (Wrapped pinned programs, option-value parsing)
+// ---------------------------------------------------------------------------
+
+fn make_wrapped_unit(
+    idx: usize,
+    wrappers: &[(WrapperKind, &[&str])],
+    effective_args: &[&str],
+) -> CommandUnit {
+    CommandUnit {
+        index: UnitIndex(idx),
+        argv: effective_args.iter().map(|s| w(s)).collect(),
+        removed_wrappers: wrappers
+            .iter()
+            .map(|(kind, words)| RemovedWrapper {
+                kind: *kind,
+                words: words.iter().map(|s| w(s)).collect(),
+            })
+            .collect(),
+        redirects: Vec::new(),
+        separator_before: Separator::Start,
+        pipeline_id: None,
+        depth: 0,
+        parent_unit: None,
+    }
+}
+
+fn wrapped_be_unit(idx: usize, raw: &[&str], effective: &[&str]) -> BestEffortUnit {
+    BestEffortUnit {
+        index: idx,
+        raw_argv: argv(raw),
+        effective_argv: argv(effective),
+        alt_argv: Vec::new(),
+        assignments: Vec::new(),
+        redirects: Vec::new(),
+        pipeline_id: None,
+        piped: false,
+        depth: 0,
+        derived: false,
+    }
+}
+
+#[test]
+fn round3_finding_1_wrapped_pinned_programs_receive_coverage_and_suppress_lower_deny() {
+    let tid = ThreadId("t1".into());
+    let mut budget = ComputeBudget::with_default_limits();
+
+    // 1. Failing case from review: `command python build.py` with established targets
+    //    and Thread Allow `CommandExact ["command", "python", "build.py"]` vs
+    //    lower-ranked Global Deny `CommandPrefix ["python"]`.
+    let check = cmd_check("command python build.py");
+    let units = vec![make_wrapped_unit(
+        0,
+        &[(WrapperKind::Command, &["command"])],
+        &["python", "build.py"],
+    )];
+    let effects = classify_all(&units);
+    let targets = vec![resolved_target(
+        TargetOrigin::Operand {
+            unit: UnitIndex(0),
+            argv_index: 1,
+        },
+        "/proj/build.py",
+    )];
+    let be = BestEffortRecord {
+        raw_texts: vec!["command python build.py".into()],
+        units: vec![wrapped_be_unit(
+            0,
+            &["command", "python", "build.py"],
+            &["python", "build.py"],
+        )],
+    };
+    let global_deny_py = make_rule(
+        "r_g_deny_py",
+        RuleScope::Global,
+        ToolKind::Execute,
+        RuleMatcher::CommandPrefix {
+            argv: argv(&["python"]),
+        },
+        RuleDecision::Deny,
+    );
+    let global_deny_cmd = make_rule(
+        "r_g_deny_cmd",
+        RuleScope::Global,
+        ToolKind::Execute,
+        RuleMatcher::CommandPrefix {
+            argv: argv(&["command"]),
+        },
+        RuleDecision::Deny,
+    );
+    let thread_exact = make_rule(
+        "r_t_exact",
+        RuleScope::Thread {
+            thread_id: tid.clone(),
+        },
+        ToolKind::Execute,
+        RuleMatcher::CommandExact {
+            argv: argv(&["command", "python", "build.py"]),
+        },
+        RuleDecision::Allow,
+    );
+    let ctx = RuleEvalContext {
+        check: &check,
+        thread_id: &tid,
+        preset: Preset::Home,
+        units: &units,
+        effects: &effects,
+        targets: &targets,
+        outcomes: &[],
+        best_effort: &be,
+        folds: &FoldRules::REV4,
+    };
+
+    let cov_exact = evaluate_rules(
+        &ctx,
+        &[
+            thread_exact,
+            global_deny_py.clone(),
+            global_deny_cmd.clone(),
+        ],
+        &mut budget,
+    )
+    .unwrap();
+    assert!(cov_exact.deny.is_none());
+    assert_eq!(
+        cov_exact.per_unit[0].allow_rule,
+        Some(RuleId("r_t_exact".into()))
+    );
+    assert!(cov_exact.per_unit[0].covers_pinned_program);
+
+    // 2. Prefix branch: `command python build.py --prod` with Thread Allow
+    //    `CommandPrefix ["command", "python", "build.py"]` vs Global Deny `["python"]`.
+    let check_pfx = cmd_check("command python build.py --prod");
+    let units_pfx = vec![make_wrapped_unit(
+        0,
+        &[(WrapperKind::Command, &["command"])],
+        &["python", "build.py", "--prod"],
+    )];
+    let effects_pfx = classify_all(&units_pfx);
+    let be_pfx = BestEffortRecord {
+        raw_texts: vec!["command python build.py --prod".into()],
+        units: vec![wrapped_be_unit(
+            0,
+            &["command", "python", "build.py", "--prod"],
+            &["python", "build.py", "--prod"],
+        )],
+    };
+    let thread_pfx = make_rule(
+        "r_t_pfx",
+        RuleScope::Thread {
+            thread_id: tid.clone(),
+        },
+        ToolKind::Execute,
+        RuleMatcher::CommandPrefix {
+            argv: argv(&["command", "python", "build.py"]),
+        },
+        RuleDecision::Allow,
+    );
+    let ctx_pfx = RuleEvalContext {
+        check: &check_pfx,
+        thread_id: &tid,
+        preset: Preset::Home,
+        units: &units_pfx,
+        effects: &effects_pfx,
+        targets: &targets,
+        outcomes: &[],
+        best_effort: &be_pfx,
+        folds: &FoldRules::REV4,
+    };
+    let cov_pfx =
+        evaluate_rules(&ctx_pfx, &[thread_pfx, global_deny_py.clone()], &mut budget).unwrap();
+    assert!(cov_pfx.deny.is_none());
+    assert_eq!(
+        cov_pfx.per_unit[0].allow_rule,
+        Some(RuleId("r_t_pfx".into()))
+    );
+    assert!(cov_pfx.per_unit[0].covers_pinned_program);
+
+    // 3. Unpinned wrapped prefix (`["command"]` or `["command", "python"]`) does NOT
+    //    name the pinned program -> no coverage, and Global Deny still wins.
+    for unpinned in [&["command"][..], &["command", "python"][..]] {
+        let bad_allow = make_rule(
+            "r_t_unpinned",
+            RuleScope::Thread {
+                thread_id: tid.clone(),
+            },
+            ToolKind::Execute,
+            RuleMatcher::CommandPrefix {
+                argv: argv(unpinned),
+            },
+            RuleDecision::Allow,
+        );
+        let cov_bad =
+            evaluate_rules(&ctx, &[bad_allow, global_deny_py.clone()], &mut budget).unwrap();
+        assert!(cov_bad.per_unit[0].allow_rule.is_none(), "{unpinned:?}");
+        assert!(!cov_bad.per_unit[0].covers_pinned_program, "{unpinned:?}");
+        assert_eq!(
+            cov_bad.deny.as_ref().map(|(_, id)| id),
+            Some(&RuleId("r_g_deny_py".into())),
+            "{unpinned:?}"
+        );
+    }
+
+    // 4. Original-argv matching is preserved: an unwrapped rule `["python", "build.py"]`
+    //    (exact or prefix) must NOT match wrapped `command python build.py`.
+    for unwrapped_matcher in [
+        RuleMatcher::CommandExact {
+            argv: argv(&["python", "build.py"]),
+        },
+        RuleMatcher::CommandPrefix {
+            argv: argv(&["python", "build.py"]),
+        },
+    ] {
+        let unwrapped_allow = make_rule(
+            "r_t_unwrapped",
+            RuleScope::Thread {
+                thread_id: tid.clone(),
+            },
+            ToolKind::Execute,
+            unwrapped_matcher,
+            RuleDecision::Allow,
+        );
+        let cov_unwrapped = evaluate_rules(
+            &ctx,
+            &[unwrapped_allow, global_deny_py.clone()],
+            &mut budget,
+        )
+        .unwrap();
+        assert!(cov_unwrapped.per_unit[0].allow_rule.is_none());
+        assert!(!cov_unwrapped.per_unit[0].covers_pinned_program);
+        assert_eq!(
+            cov_unwrapped.deny.as_ref().map(|(_, id)| id),
+            Some(&RuleId("r_g_deny_py".into()))
+        );
+    }
+
+    // 5. Stacked multi-word wrappers: `nice -n 5 command -- python build.py --flag`
+    //    (wrapper offset = 5).
+    let stacked_check = cmd_check("nice -n 5 command -- python build.py --flag");
+    let stacked_units = vec![make_wrapped_unit(
+        0,
+        &[
+            (WrapperKind::Nice, &["nice", "-n", "5"]),
+            (WrapperKind::Command, &["command", "--"]),
+        ],
+        &["python", "build.py", "--flag"],
+    )];
+    let stacked_effects = classify_all(&stacked_units);
+    let stacked_be = BestEffortRecord {
+        raw_texts: vec!["nice -n 5 command -- python build.py --flag".into()],
+        units: vec![wrapped_be_unit(
+            0,
+            &[
+                "nice", "-n", "5", "command", "--", "python", "build.py", "--flag",
+            ],
+            &["python", "build.py", "--flag"],
+        )],
+    };
+    let stacked_ctx = RuleEvalContext {
+        check: &stacked_check,
+        thread_id: &tid,
+        preset: Preset::Home,
+        units: &stacked_units,
+        effects: &stacked_effects,
+        targets: &targets,
+        outcomes: &[],
+        best_effort: &stacked_be,
+        folds: &FoldRules::REV4,
+    };
+    let stacked_allow = make_rule(
+        "r_t_stacked",
+        RuleScope::Thread {
+            thread_id: tid.clone(),
+        },
+        ToolKind::Execute,
+        RuleMatcher::CommandPrefix {
+            argv: argv(&["nice", "-n", "5", "command", "--", "python", "build.py"]),
+        },
+        RuleDecision::Allow,
+    );
+    let cov_stacked = evaluate_rules(
+        &stacked_ctx,
+        &[stacked_allow, global_deny_py.clone()],
+        &mut budget,
+    )
+    .unwrap();
+    assert!(cov_stacked.deny.is_none());
+    assert_eq!(
+        cov_stacked.per_unit[0].allow_rule,
+        Some(RuleId("r_t_stacked".into()))
+    );
+    assert!(cov_stacked.per_unit[0].covers_pinned_program);
+
+    let stacked_short = make_rule(
+        "r_t_stacked_short",
+        RuleScope::Thread {
+            thread_id: tid.clone(),
+        },
+        ToolKind::Execute,
+        RuleMatcher::CommandPrefix {
+            argv: argv(&["nice", "-n", "5", "command", "--", "python"]),
+        },
+        RuleDecision::Allow,
+    );
+    let cov_stacked_short =
+        evaluate_rules(&stacked_ctx, &[stacked_short, global_deny_py], &mut budget).unwrap();
+    assert!(cov_stacked_short.per_unit[0].allow_rule.is_none());
+    assert!(!cov_stacked_short.per_unit[0].covers_pinned_program);
+    assert_eq!(
+        cov_stacked_short.deny.as_ref().map(|(_, id)| id),
+        Some(&RuleId("r_g_deny_py".into()))
+    );
+
+    // 6. Other pinned program kinds behind wrappers (`timeout 30 cargo test`,
+    //    `env awk -f prog.awk data.txt`, `time pipx run ruff check`).
+    let cargo_units = vec![make_wrapped_unit(
+        0,
+        &[(WrapperKind::Timeout, &["timeout", "30"])],
+        &["cargo", "test", "--lib"],
+    )];
+    let cargo_effects = classify_all(&cargo_units);
+    let cargo_check = cmd_check("timeout 30 cargo test --lib");
+    let cargo_ctx = RuleEvalContext {
+        check: &cargo_check,
+        thread_id: &tid,
+        preset: Preset::Home,
+        units: &cargo_units,
+        effects: &cargo_effects,
+        targets: &[],
+        outcomes: &[],
+        best_effort: &BestEffortRecord::default(),
+        folds: &FoldRules::REV4,
+    };
+    let cov_cargo_ok = evaluate_rules(
+        &cargo_ctx,
+        &[make_rule(
+            "r_cargo_ok",
+            RuleScope::Global,
+            ToolKind::Execute,
+            RuleMatcher::CommandPrefix {
+                argv: argv(&["timeout", "30", "cargo", "test"]),
+            },
+            RuleDecision::Allow,
+        )],
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        cov_cargo_ok.per_unit[0].allow_rule,
+        Some(RuleId("r_cargo_ok".into()))
+    );
+    assert!(cov_cargo_ok.per_unit[0].covers_pinned_program);
+
+    let cov_cargo_short = evaluate_rules(
+        &cargo_ctx,
+        &[make_rule(
+            "r_cargo_short",
+            RuleScope::Global,
+            ToolKind::Execute,
+            RuleMatcher::CommandPrefix {
+                argv: argv(&["timeout", "30", "cargo"]),
+            },
+            RuleDecision::Allow,
+        )],
+        &mut budget,
+    )
+    .unwrap();
+    assert!(cov_cargo_short.per_unit[0].allow_rule.is_none());
+    assert!(!cov_cargo_short.per_unit[0].covers_pinned_program);
+
+    let awk_units = vec![make_wrapped_unit(
+        0,
+        &[(WrapperKind::Env, &["env"])],
+        &["awk", "-f", "prog.awk", "data.txt"],
+    )];
+    let awk_effects = classify_all(&awk_units);
+    let awk_check = cmd_check("env awk -f prog.awk data.txt");
+    let awk_ctx = RuleEvalContext {
+        check: &awk_check,
+        thread_id: &tid,
+        preset: Preset::Home,
+        units: &awk_units,
+        effects: &awk_effects,
+        targets: &[],
+        outcomes: &[],
+        best_effort: &BestEffortRecord::default(),
+        folds: &FoldRules::REV4,
+    };
+    let cov_awk_ok = evaluate_rules(
+        &awk_ctx,
+        &[make_rule(
+            "r_awk_ok",
+            RuleScope::Global,
+            ToolKind::Execute,
+            RuleMatcher::CommandPrefix {
+                argv: argv(&["env", "awk", "-f", "prog.awk"]),
+            },
+            RuleDecision::Allow,
+        )],
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        cov_awk_ok.per_unit[0].allow_rule,
+        Some(RuleId("r_awk_ok".into()))
+    );
+    assert!(cov_awk_ok.per_unit[0].covers_pinned_program);
 }
