@@ -684,3 +684,66 @@ Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-cor
 Expectations that rest on the review's text rather than code tracing:
 - `~/.ssh/config` is not a hard-deny name (13.2, row 3).
 - The filter `msal*` on a non-recursive root uses the probe path.
+
+## 14. Round 10 (D-155)
+
+There were two inputs: the orchestrator's verification of round 9 (two failing tests) and review 8 (3 findings). Commits:
+- `81c6ab7`: verification failures;
+- `8471af0`: review 8 and the sweeps;
+- `e2ab0e0`: regression tests.
+
+No change requests.
+
+### 14.1 Verification failures (both were code bugs; the tests stand)
+
+| Test | Cause | Fix |
+|---|---|---|
+| `round7_f1_unread_recursive_root_keeps_its_written_name_hit` | Round 8's `check_target_into` returned right after a written hard-deny hit, so an Unread resolution's reason was never recorded. §1 keeps both. | A written hard-deny hit ends the list only for a resolved target. An Unread resolution still records its reason beside the hit. |
+| `round8_f1_written_name_hit_survives_a_later_exhaustion` (folder root `lnk/../.ssh`) | S8's `~/.ssh` walk (`dir_has_existing_hard_deny_ssh_entry`) named entries by their real path (`/tmp/pub/.ssh/id_rsa`). A root written `~/.ssh` therefore missed its keys, which breaks D-147. Only the written Store record (`ssh-dir`) remained. | The walk reads the real folder and names each entry on the spelling it is checked under: the folded root spelling plus the entry's path below the folder. The same applies to a `.ssh` found below a root. |
+
+### 14.2 Review 8
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| 1 `~/.ssh` member folders were missing from the alias roots | `RootAliases::push_ssh_members` ports `dev`'s `ssh_members`, with its bounds and order. See the details below the table. | `round10_f1_ssh_member_folder_under_another_name_is_an_alias` (`~/.ssh/keys` bound at `/mnt/keys`; `/mnt/keys/future` is a hard deny) |
+| 2 The incomplete-table reason was cloned before it was charged | `scan` charges the reason's compute and storage first, then clones it. Gap reasons in `check_target_into` are charged the same way. | `round10_f2_incomplete_reason_is_charged_before_it_is_copied` |
+| 3 MSAL discovery undercharged its lossy lowercase | `lossy_lowercase_starts_with` gives the result of `dev`'s `to_string_lossy().to_lowercase().starts_with(pre)` without allocating. It decodes chunk by chunk, maps each invalid sequence to one U+FFFD, and lowercases each scalar. For an ASCII prefix this matches `dev`: per-scalar and string-level lowercasing differ only for a final sigma, which is not ASCII. | `round10_f3_msal_prefix_test_matches_devs_lossy_lowercase` (agreement with `dev`'s expression on valid, mixed-case and invalid names, including 64 `0xFF` bytes; and discovery of such an entry) |
+
+How finding 1's port maps `dev`'s `ssh_members`:
+- **Bounds and order:** depth 8 and 1,024 entries, placed between `sensitive_roots` and `ask_roots` as in `dev`.
+- **Members:** these are alias roots, spelled through `~/.ssh`. They are files, links to files, and folders not reached through a link.
+- **Folders linked into `~/.ssh`:** these are trees for `links_below` (held), not alias roots, as `dev`'s `linked_dirs` are.
+- **Name exceptions:** they come from checking each member's alias spelling by name, so `~/.ssh/config` and `*.pub` stay ordinary.
+- **Cutoffs:** a cutoff is silent, as in `dev` (D-145). A cap or I/O failure makes the table incomplete.
+
+**Correction to §13.1:** round 9 claimed that `ProtectedSet` identities replace `dev`'s member aliases. That was wrong. `ProtectedSet` holds member identities only for hard links (D-145), so an ordinary member folder under another name was missed. The member aliases are now ported.
+
+### 14.3 Sweep: P2's alias roots against `gate.rs`, line by line
+
+| `dev` (`evaluate_sync`, `gate.rs`) | P2 (`RootAliases`) | Result |
+|---|---|---|
+| `sensitive_roots`: `~/.ssh` | same, first | same |
+| `CRED_FILES`, `CRED_TREES`, `BROWSER_ROOTS` | same constants | entries identical (diffed) |
+| Atrium data, then protected paths | same | same |
+| `ssh.members` | `push_ssh_members` | ported this round (14.2) |
+| `ask_roots`: `ASK_FILES` | `ASK_FILES` | P2 adds the four CR-17 stores (`.gem/credentials`, `.terraform.d/credentials.tfrc.json`, `.config/op/config`, `.yarnrc.yml`), as the contract requires. **Departure fixed:** P2's list folds `.azure/accessTokens.json` to lowercase for names, so a case-sensitive volume never found the root. The table now reads it on `dev`'s spelling (`DEV_ROOT_SPELLINGS`). Test: `round10_sweep_store_root_is_read_on_devs_spelling`. |
+| `ASK_TREES` | same | same |
+| MSAL entries of `~/.azure` (`take(256)`) | same | same |
+| — | the `~/.azure` folder, alias only, never reached | kept: names only (review 7, finding 2; review 6, finding 4) |
+| `identity` = `fs::metadata` (through links); a missing identity is skipped | `stat` through links; absence is skipped | a cap or I/O failure makes the table incomplete (§8) |
+| `trees_of` adds `linked_dirs` | linked folders as reach-only roots | same |
+
+**Clones and lossy conversions** (charged before they run):
+- the incomplete-table reason and gap reasons;
+- the S8 hit paths (`raw_d`);
+- followed-link paths and visited sets;
+- probe names (`from_utf8_lossy`, compute added beside the existing allocation charge);
+- the `.azure` folder spelling.
+
+The other lossy conversions are covered by `fold_alloc_bound`, or are in the test-only fake.
+
+### 14.4 Verification
+
+Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
+
+An allocation-counting allocator is not possible in a library test, so charge-before-clone ordering holds by construction. The tests check that each charge exists and that results are correct.
