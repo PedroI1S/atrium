@@ -1,7 +1,7 @@
 # Handoff: M1-38-rev4-p2-paths (P2)
 
 - **Branch:** `agent/neon/M1-38-rev4-p2-paths` (branched from P0's tip `1a09705`)
-- **Model:** Gemini 4 Neon (High), rounds 1–2; Claude Opus 5.5, rounds 3–5 (D-142, D-145, §7–§9)
+- **Model:** Gemini 4 Neon (High), rounds 1–2; Claude Opus 5.5, rounds 3–6 (D-142, D-145, D-147, §7–§10)
 - **Contract:** `docs/contracts/m1-policy-rev4.md` (draft 5) — §2 (filesystem caps & walk-cap rule), §3 (process-dependent paths, `~`, redirect targets), §5 (paths, globs, links, recursive reads, `cd`, intra-call writer effects), §8 (budgets), §10–§12
 - **Behaviour change:** None. `SessionGate` is not wired yet (that is P5), and no P0 interface file (`model.rs`, `limits.rs`, `tools.rs`, other `v4/` stubs) or `dev` file was modified.
 
@@ -461,3 +461,70 @@ All other round 1–4 regressions keep their expectations, each re-checked again
 Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
 
 For the orchestrator: the same commands as in §7.6 and §8.6.
+
+---
+
+## 10. Round 6 (D-147)
+
+Fixes review 4's 7 findings (`.orchestration/review-input/review-round4.md`) under D-147. Commits:
+- `8439ac3`: written spellings, findings 1–6;
+- `64b9883`: the frozen `check_recursive_root` wrapper;
+- `e73a64c`: tests;
+- the handoff commit.
+
+No file outside P2's owned paths changed.
+
+### 10.1 Protected names on the written spelling (findings 1 and 4, D-147)
+
+`dev` checks protected names on the written, lexically normalised spelling as well as on the resolved path (`Sensitive::hit` over `Analysis::all_paths`). P2 checked only the canonical path.
+
+**Now:** every resolver-backed flow also checks each target's written spelling, with the listed folds and `dev`'s exceptions (public `.ssh` names, readable `config` / `authorized_keys`).
+- **The written spelling** (`sensitive::lexical_spelling`, `resolve::word_spelling`): `dev`'s `words::lexical_resolve`. That is `~` expanded, a relative path joined onto the written working directory, `.` removed, and `..` popping (never above `/`). A quoted leading `~` is a literal name.
+- **The check:** `sensitive::written_name_hit` gives a HardDeny or Store hit for the part, recorded beside the exact check's outcome (`command::push_checked_written`). It runs even when resolution is Unread, so an unreadable protected folder still hits by name, as on `dev`.
+- **Where:**
+  - command operands and redirect targets;
+  - glob exact matches (`glob::expand_shell_glob_written` returns each match's written spelling; variant-only matches get none, since they are never hits);
+  - subject paths;
+  - selector-glob bases (selector probes too);
+  - implicit cwd roots;
+  - recursive roots (`check_recursive_root_impl(…, written_root, …)`): the root's own name, S8 and the store or exempt-root rule on the written root as well, and the filter's selected entries and probes (`check_filter_on_root(…, written_root, …)`).
+- **`cd`:** the working-directory state keeps the written spelling beside the real one. Later relative paths are resolved on the real directory and named on the written one.
+
+### 10.2 Other findings
+
+| Finding | Fix | Regression test (`p2_tests.rs`) |
+|---|---|---|
+| 1 names below aliased roots | 10.1 | `round6_f1_protected_names_on_the_written_spelling_below_aliased_roots`: `~/.config/google-chrome` and `~/.ssh` are links to empty folders. The absent `Cookies` and `id_rsa` are hits through file-tool paths, `cat`, `cd` then `cat Cookies`, and a redirect. `id_rsa.pub` and a readable `config` are not; a written `config` is. Also `round6_f1_glob_matches_are_checked_on_their_written_spelling`. |
+| 2 S8 skipped linked profile folders | `browser_dir_has_existing_cred` follows linked folders (`linked_folder`), each once by identity; a link that can't be followed is Unread. A written root inside a browser root is followed (`stat`, not `lstat`). | `round6_f2_s8_walks_linked_browser_profile_folders` (`rg -g '*.rs'` over the root; also with a link cycle) |
+| 3 a root link's identity narrowed an unknown-referent gap | A root whose followed `stat` fails is an `AnyTarget` gap (D-145 rule 4). | `round6_f3_root_link_with_unknown_referent_is_any_target` |
+| 4 named MSAL roots cut at the member cap | Named-root discovery searches the whole listing (already within the filesystem caps); the written spelling is a hit by name anyway (10.1). | `round6_f4_named_store_root_after_many_siblings_is_found` (a Store hit by name and by identity) |
+| 5 subject resolution allocated before charging | See the list below. | `round6_f5_subject_resolution_charges_before_allocating` |
+| 6 `mv` of a link to a directory | `source_is_dir_or_unknown` `lstat`s the source's final entry before following it (`command::final_entry_path` for literals, the written spelling for glob matches); protection checks stay on the canonical target. | `round6_f6_mv_of_a_link_to_a_directory_moves_the_link` |
+| 7 real-filesystem tests depended on host folder sizes | The two tests give `build_protected_set` its own phase caps and budget (unbounded, as P5 should give the builder its own caps); their assertions use fresh default ones. | the two tests themselves (`fs_resolver_real_tempdir_…`, `round2_finding11_…`) |
+
+Finding 5's charges, all made before the allocation:
+- the filter `Word`;
+- the root list (no eager buffer), its clones and their written spellings;
+- the selector bases and folded roots;
+- the target lists and per-unit parts;
+- the child scope's cwd clone;
+- the variant-only pattern copies;
+- the selector normalisation buffer.
+
+Recursive roots' outcomes are appended through `extend_charged`, which, like `push_charged`, keeps hit, Exhausted and TooLarge records if the charge exhausts the budget.
+
+The execution-tree maps keep their per-unit charge of 160 bytes, which covers their entries (about 100 bytes per unit).
+
+### 10.3 Change request
+
+**CR-P2-3: carry the written spelling in `Target` (`model.rs`).**
+- **Why:** the frozen `check_target(target, protected, budget)` and `check_recursive_root(root, …)` receive only a `Target`, whose resolution holds the canonical path, never the written spelling. So a standalone `resolve_literal` + `check_target` of `~/.config/google-chrome/Cookies` is Clear when `google-chrome` is a link to an empty folder. It is also Clear when it is a link to a profile past the builder's walk cap (D-145: no gap). A standalone `check_recursive_root` misses S8 on a written root that is a link, because the canonical root lies outside home.
+  - The resolver-backed flows (`resolve_command_targets`, `resolve_subject_paths`), which P5 calls, do apply D-147 (10.1).
+- **Field:** `pub(crate) written: Option<Vec<u8>>` on `Target` (or on `TargetResolution::Resolved`), the lexical spelling. `resolve_literal` and glob expansion would fill it, and `check_target` / `check_recursive_root` would check it. P2's side channel (`push_checked_written`, `written_root`) would then go.
+- **Failing cases until it lands:** the two above, through the standalone entry points only.
+
+### 10.4 Verification
+
+Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
+
+For the orchestrator: the same commands as in §7.6.
