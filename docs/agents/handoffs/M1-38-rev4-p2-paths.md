@@ -1,7 +1,7 @@
 # Handoff: M1-38-rev4-p2-paths (P2)
 
 - **Branch:** `agent/neon/M1-38-rev4-p2-paths` (branched from P0's tip `1a09705`)
-- **Model:** Gemini 4 Neon (High), rounds 1–2; Claude Opus 5.5, rounds 3–6 (D-142, D-145, D-147, §7–§10)
+- **Model:** Gemini 4 Neon (High), rounds 1–2; Claude Opus 5.5, rounds 3–7 (D-142, D-145, D-147, D-149, D-151, §7–§11)
 - **Contract:** `docs/contracts/m1-policy-rev4.md` (draft 5) — §2 (filesystem caps & walk-cap rule), §3 (process-dependent paths, `~`, redirect targets), §5 (paths, globs, links, recursive reads, `cd`, intra-call writer effects), §8 (budgets), §10–§12
 - **Behaviour change:** None. `SessionGate` is not wired yet (that is P5), and no P0 interface file (`model.rs`, `limits.rs`, `tools.rs`, other `v4/` stubs) or `dev` file was modified.
 
@@ -524,6 +524,71 @@ The execution-tree maps keep their per-unit charge of 160 bytes, which covers th
 - **Failing cases until it lands:** the two above, through the standalone entry points only.
 
 ### 10.4 Verification
+
+Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
+
+For the orchestrator: the same commands as in §7.6.
+
+---
+
+## 11. Round 7 (D-149, D-151)
+
+On the branch rebased onto P0's round-8 tip `a5b9b3b` (`Target::written`, CR-P2-3, D-149). Fixes review 5's 6 findings (`.orchestration/review-input/review-round5.md`) and sweeps the class rules from the orchestrator's brief. Commits:
+- `30c162d`: code;
+- `5a099d9`: tests;
+- the handoff commit.
+
+No file outside P2's owned paths changed.
+
+### 11.1 CR-P2-3 adopted (D-149)
+
+- **Who fills `Target::written`:**
+  - `resolve_literal` fills it (the lexical spelling on its `cwd`).
+  - Glob expansion fills it for exact matches: the matched path as spelled, on the written cwd for a relative pattern. Variant-only matches get `None`, since they are never hits.
+  - The command flow replaces it with the spelling on its written working directory, for operands, redirects and implicit roots.
+  - Filter-selected entries below a differently spelled root get the written root plus the relative path.
+- **`check_target`** now names the written spelling itself, through `check_target_all`, which keeps every record (§1):
+  - the written name hit, which is checked first, so an Unread resolution keeps it beside its reason;
+  - the canonical exact check;
+  - the written spelling's unlisted equivalences (review 5, finding 3);
+  - the gap that applies, beside a Clear or Store-hit outcome.
+
+  The single-result `check_target` reports the strictest: hard deny, then Unread, then Store hit or Clear. The flows and the recursive walks keep every record (`push_target_records`).
+- **`check_recursive_root`** reads `root.written`. The side channel (`push_checked_written`, `written_root`) is gone.
+- **Both CR-P2-3 standalone cases pass:** `round7_cr_p2_3_standalone_checks_name_the_written_spelling`.
+
+### 11.2 `dev`'s alias rules for protected roots (finding 2 and its class)
+
+`dev` canonicalizes its roots (`sensitive_roots`: `~/.ssh`, credential files and trees, browser roots, Atrium data and protected paths; plus the store roots) and applies two rules. `RootAliases` reproduces them through a table of canonical roots that is built lazily once per call and charged.
+- **`alias_fix`** (`alias_name_hit`): a path at or below a root's canonical folder, when that folder differs from the root's spelling, is named on the root's spelling plus the rest. Its protected names then hold even for entries that don't exist yet, and the public `.ssh` names stay public. It applies to every flow target, filter entry, followed link and recursive root, where S8 runs under the alias spelling too.
+- **`links_below` / `in_trees`** (`RootAliases::reached`): a followed link whose real path is in a root, is a root, or holds a credential root reaches it. That is a hit without a filter, and Unread (`FollowedLinkUnderFilter`) with one. This closes `rg -L token proj` through `proj/p -> ~/.config/google-chrome -> /tmp/profile` (finding 2).
+- **The pure `check_target` has no resolver**, so it can't build this table. It relies on the root identities D-145 records, which cover wholesale-protected roots and existing browser and `~/.ssh` members within the walk caps. Every resolver-backed entry point, including the frozen `check_recursive_root`, applies both rules.
+
+### 11.3 Findings, fixes, tests
+
+| Finding | Fix | Regression test (`p2_tests.rs`) |
+|---|---|---|
+| 1 Unread recursive root skipped its written name | The root's records (`push_target_records`) come first, and an Unread root keeps its name hit beside its reason. | `round7_f1_unread_recursive_root_keeps_its_written_name_hit` |
+| 2 `rg -L` through an aliased browser root | 11.2 | `round7_f2_followed_link_through_an_aliased_browser_root_reaches_it` (Unread under a filter), `round7_alias_rule_names_paths_below_an_aliased_root` |
+| 3 written spelling skipped unlisted equivalences | `check_target_all` checks them on the written spelling when nothing else matched. | `round7_f3_written_spelling_gets_the_unlisted_equivalence_check` |
+| 4 globbed `mv` source typed by the lexical spelling | Glob expansion returns each match's actual entry path (not followed), and the type check uses it. | `round7_f4_globbed_mv_source_is_typed_by_the_expanded_entry` |
+| 5 initial cwd undercharged | Both cwd copies are charged. | `round7_f5_initial_cwd_copies_are_charged` |
+| 6 recursive filter entries lost Store hits under a gap | Filter entries keep every record. | `round7_f6_recursive_filter_entry_keeps_store_hit_beside_gap` |
+
+### 11.4 Class sweep (the orchestrator's three rules)
+
+- **Every early return still names the written spelling first and keeps every hit.** Covered by:
+  - `check_target_all` (Unread resolutions);
+  - the recursive root (11.3, row 1);
+  - gaps (kept beside hits, never replacing a hard deny).
+- **Written spelling for names only; the real entry for types and identities.**
+  - S8 and the store or exempt rule on a written or alias spelling now list the real root and take only the names from the spelling. Round 6 listed the written path, which differs physically after `..` through a link.
+  - `mv` uses the expanded entry (finding 4) or the unnormalised physical path of a literal operand.
+  - `cd` resolves on the real directory and names on the written one.
+  - Filter entries are enumerated on the real root.
+- **Protected-root aliases:** `dev`'s two rules (11.2), applied wherever P2 has a resolver.
+
+### 11.5 Verification
 
 Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
 
