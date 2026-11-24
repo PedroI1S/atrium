@@ -983,3 +983,16 @@ P2's next round, round 5 (Opus 5.5, D-142), applies this ruling, keeps the rest 
    - Neither changes behaviour: nothing is wired into `SessionGate` (D-138). The merge stays local, and the push happens at handoff (D-005).
    - P2, P3 and P4 rebase onto `dev` from now on. A later P0 change request becomes a small task on `dev`.
 2. **P2 (M1-38).** Review 6 (`reviews/M1-38-rev4-p2-paths-round6.md`) closed round 5's findings and both CR-P2-3 cases, and accepted the pure `check_target` alias limit. It found five new findings, two of them high, mostly in the alias code round 7 ported from `dev`. **Exception to PLAN §8.4:** Opus 5.5 writes one more round and sweeps two classes: a hit is kept before any fallible check, and every filesystem error in the checking phase is Unread. If the next review still has findings, they come back to the driver.
+
+## D-153 — 2026-11-24 — orchestrator (PLAN §8.4): P3's owned paths widen for CR-P3-1 to CR-P3-3
+**Decided by the orchestrator under PLAN §8.4** ("if a fix needs paths outside the task's owned paths, the orchestrator widens that task's owned paths, unless another running task owns them"). P3's (M1-39) first review (`reviews/M1-39-rev4-p3-tools-rules.md`, 14 findings) found that the workarounds for three of P3's change requests leave defects:
+- **CR-P3-1:** the daemon mirrors the §7 validator, and the mirror already diverges from core.
+- **CR-P3-2:** Settings never shows stored invalid rules.
+- **CR-P3-3:** rule coverage can't see P1's and P2's unit-level Unread, so a prefix Allow can suppress a Deny.
+
+P0 is merged (D-152), and no running task owns those files. So P3's round 2 may also edit:
+- `crates/atrium-core/src/policy/mod.rs`: a public validation entry point;
+- `crates/atrium-core/src/policy/model.rs`, only to add per-unit outcomes to `RuleEvalContext`;
+- the `Rule` listing in `atrium-protocol`, its TypeScript mirror, and the Settings rules list that renders invalid rules.
+
+Each change is additive and keeps every existing field. P2 doesn't use `RuleEvalContext`. CR-P3-4 is not a defect. P4's first review has one low finding (jargon in the Settings text), which goes back to P4.
