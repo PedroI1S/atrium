@@ -593,3 +593,46 @@ No file outside P2's owned paths changed.
 Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
 
 For the orchestrator: the same commands as in §7.6.
+
+## 12. Round 8 (D-152)
+
+Review 6 (Codex) had 5 findings. It accepted the pure `check_target` alias limit as not a finding. Commits: `c81e19a` (fixes and class sweeps) and `28c6e2a` (regression tests). No change requests.
+
+### 12.1 Findings, fixes, tests
+
+| Finding | Fix | Regression test (`p2_tests.rs`) |
+|---|---|---|
+| 1 A later exhaustion discarded an established written-name hit | `check_target_all` is replaced by `check_target_into`, which appends each record to the caller's vector as soon as it is established. `push_target_records` passes the outcomes vector through. `check_target` returns an established hard-deny hit instead of `Exhausted`. | `round8_f1_written_name_hit_survives_a_later_exhaustion` (every budget from the first hit up to completion, for `check_target` and `check_recursive_root` on a file and on a folder) |
+| 2 The alias table treated a cap or I/O failure as absence | `RootAliases` counts only `NotFound` and `ENOTDIR` as absence. A canonicalization cap or another I/O failure marks the table incomplete and keeps the first reason. `alias_name_hit` returns that reason as Unread when it finds no alias. | `round8_f2_alias_table_cut_short_by_a_cap_is_unread` |
+| 3 Alias spellings skipped the unlisted equivalences | `alias_name_hit` checks the listed folds, then `matches_unlisted_equivalence`, which gives `Unread(UnlistedNameEquivalence)`. | `round8_f3_alias_spelling_gets_the_unlisted_equivalence_check` |
+| 4 `~/.azure` was reached as a whole store root | `ProtectedRoot::wholesale` is false for the MSAL folder. It still spells entries below it (`alias_fix`), but `reached` skips it, as `dev`'s `ask_roots` lists the MSAL entries and not the folder. MSAL entries are still caught by name. | `round8_f4_msal_folder_is_not_a_wholesale_store_root` (README is Clear; a link to `msal_token_cache.json` is a Store hit) |
+| 5 Alias rewriting was charged by the short canonical path | `rewrite` charges compute and allocation for the copied spelling before it joins. | `round8_f5_alias_rewrite_charges_the_copied_spelling` |
+
+### 12.2 Class sweeps
+
+- **(a) Established records survive exhaustion.**
+  - `ChargedRecord for PartResult` now keeps Unread as well as hits when the slot charge fails.
+  - The followed-link walk collects a link's records with `followed_link_records`. It then emits them with `emit_followed_link_records` before it propagates an error from the collection.
+  - The S8 check of a followed link keeps its partial records on exhaustion (the filter rule still applies). Its uncharged `outcomes.extend` became `extend_charged`.
+  - The other sites already pushed into the caller's vector before the next fallible step: the recursive root's S8 and store rule, filter entries, and the command flows (`push_checked`). Covered by `round8_class_a_followed_link_hit_survives_a_later_exhaustion`.
+- **(b) Filesystem errors and caps in the checking phase are Unread.** The alias table was the remaining site (finding 2). It is never cached as complete when it is not.
+  - The other `Err(_)` arms in the checking phase were rechecked. Each already reports Unread, except two that give the stricter result:
+    - the walk's `is_dir` stat treats an unreadable type as "not a folder", which counts the root's own path as reached;
+    - a filter that fails to fold keeps the unfolded compiled filter.
+  - The builder's member-walk arms are unchanged, as D-145 requires.
+- **Copied spellings are charged first:**
+  - `word_entry_path` charges compute for the whole copied path, not only the word;
+  - the glob's relative written spelling (`rest.join`) charges its compute;
+  - the filter's written entry join charges its compute;
+  - the selector normalizer charges both of its copies.
+
+### 12.3 Behaviour notes for review
+
+- An incomplete alias table makes every later check that finds no alias Unread for that call. This is strict, but a cap or I/O failure means the alias rule cannot be shown not to apply (§8).
+- When `check_target` runs out of budget after a hard-deny hit, it returns the hit, not `Exhausted`. An established Unread or Store hit still gives `Exhausted`, which is no weaker.
+
+### 12.4 Verification
+
+Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
+
+The budget-sweep tests run `check_recursive_root` many times, densely for 4,096 budgets after the first hit and then every 61. They may take a few seconds.
