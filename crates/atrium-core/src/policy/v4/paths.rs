@@ -156,7 +156,9 @@ pub(crate) fn check_recursive_root(
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
 ) -> Result<RecursiveRootResult, Exhausted> {
-    recursive::check_recursive_root_impl(root, links, filters, protected, resolver, caps, budget)
+    recursive::check_recursive_root_impl(
+        root, links, filters, None, protected, resolver, caps, budget,
+    )
 }
 
 /// Resolves and checks all targets of a sequence of modeled command units,
