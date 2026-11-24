@@ -1,7 +1,7 @@
 # Handoff: M1-38-rev4-p2-paths (P2)
 
 - **Branch:** `agent/neon/M1-38-rev4-p2-paths` (branched from P0's tip `1a09705`)
-- **Model:** Gemini 4 Neon (High), rounds 1–2; Claude Opus 5.5, rounds 3–4 (D-142, §7–§8)
+- **Model:** Gemini 4 Neon (High), rounds 1–2; Claude Opus 5.5, rounds 3–5 (D-142, D-145, §7–§9)
 - **Contract:** `docs/contracts/m1-policy-rev4.md` (draft 5) — §2 (filesystem caps & walk-cap rule), §3 (process-dependent paths, `~`, redirect targets), §5 (paths, globs, links, recursive reads, `cd`, intra-call writer effects), §8 (budgets), §10–§12
 - **Behaviour change:** None. `SessionGate` is not wired yet (that is P5), and no P0 interface file (`model.rs`, `limits.rs`, `tools.rs`, other `v4/` stubs) or `dev` file was modified.
 
@@ -397,3 +397,67 @@ cargo test --workspace --no-fail-fast
 ```
 
 The real-filesystem tests now also list `/` and the temporary folder's parent: discovery runs from the root. They read no file contents and no credential paths.
+
+---
+
+## 9. Round 5 (D-145)
+
+Applies the driver's ruling D-145 and fixes the two failures in the orchestrator's verification of `39c290a`. Commits: `5550324` (builder), `eebec79` (tests), and the handoff commit. No file outside P2's owned paths changed.
+
+### 9.1 What the ruling changed in the builder (`sensitive.rs`)
+
+| D-145 rule | Round 4 | Round 5 |
+|---|---|---|
+| 1 Protected by name and root identities | Roots were recorded, but so was every member | Roots are recorded by their own identity (`lstat`, so a dangling link counts) and by what they name (as `dev`'s `metadata`). The roots are: credential files and trees, Atrium data and protected paths, store files and trees, browser credential files, and `msal_token_cache.*` files. A target's path and existing ancestors are compared with them. |
+| 2 Members for hard links, cutoff Clear | Every member (files, links, folders) recorded; a cutoff was an `AnyTarget` gap | Only regular files with more than one link are recorded, within `WALK_MAX_ENTRIES` / `WALK_MAX_DEPTH`. A cutoff, an unreadable subfolder or a member that can't be stat'ed is Clear (no gap). An uncollected hard-linked alias still asks (multiply-linked, §1 step 4). |
+| 3 Link targets only for `~/.ssh` | Link targets recorded in every tree | Recorded only for `~/.ssh` members (never a linked folder's own identity). A direct read of a link's external target in another tree is Clear, as on `dev`. Through the protected spelling it stays a hit, by name and by the root's retained identity. |
+| 4 Gaps only for roots | Every early stop: `AnyTarget` | Only where a root or its name can't be established. See the list below. |
+
+Rule 4's gaps, by case:
+- A root that can't be listed: `Through(root)`.
+- A root that can't be stat'ed: `AnyTarget`, since its identity is unknown.
+- A root link whose target can't be stat'ed: `Through(link)`.
+- An unreadable folder on the path to a root: `AnyTarget`. The fold spellings it hides have no known identity, and the configured spelling is still tried.
+- Any `~/.ssh` incompleteness: `AnyTarget`.
+- A browser root or `ASK_NAME_PREFIXES` folder that can't be listed: `Through(root)`.
+
+Unchanged from round 4, as D-145 item 5 requires:
+- linked folders walked like folders (round-3 finding 1);
+- fold discovery from `/`;
+- listing failures cached with their reason and re-recorded per access scope;
+- budgets;
+- TooLarge above Exhausted;
+- write-only identities;
+- gaps applied inside `check_target`.
+
+Round 4's §8.2 rule 1 (every gap `AnyTarget`) is withdrawn, and with it that cost note. The cost now is that of `dev`, plus Unread for roots the builder can't establish.
+
+### 9.2 The two verification failures
+
+Both failing tests (`fs_resolver_real_tempdir_symlinks_dangling_hardlinks_unreadable_and_budgets` and `round2_finding11_budgets_all_fs_caps_and_small_nonzero_alloc`) build a protected set on the real filesystem with the default per-check budget (8 MiB of allocation). **The implementation was wrong; the tests' budgets are right** under §8:
+- **Cause:** discovery from `/` lists `/` and the temp folder's parent (`/tmp`, 7,316 entries on this machine) once, then cached the listing. But every protected name (about 60) re-folded every cached entry, charging the fold's allocation bound each time. That is tens of MiB for one build.
+- **Fix:** a cached listing stores each name's fold, computed once per build. Each discovery then compares folded names and charges only the matches it collects. A build on that `/tmp` now uses about 1.5 MiB.
+
+The tests are unchanged. Real-filesystem tests still depend on the size of the temporary folder's parent (if it held more than about 16,000 entries, the builder's listing would reach its filesystem cap). That is an environment property, not a budget error.
+
+### 9.3 Tests changed by the ruling (each cites D-145)
+
+| Test | Before | Now |
+|---|---|---|
+| `round3_r2f3_write_only_walk_past_its_caps_is_unread_never_clear` → **`round5_d145_member_walk_cutoff_is_clear_and_still_asks_by_its_link_count`** | Write through a hard link past the entry and depth caps: Unread; an ordinary write was Unread too | No gaps. The write is Clear with `multiply_linked_file` (Ask by §1 step 4); an ordinary write is Clear; the member spelled through the folder is a hit. |
+| `round4_identity_gaps_widen_unread_and_never_touch_hits` → **`round5_d145_gaps_only_where_a_root_cannot_be_established`** | A capped browser root made every target Unread | (a) A capped tree is no gap. (b) An unlistable `.gnupg` is `Through(.gnupg)`: ordinary targets Clear, a multiply-linked file Unread, a spelled member an exact hit. (c) An unlistable `~/.ssh` is `AnyTarget`: ordinary targets Unread, a Store hit kept with the Unread (single result: Unread), hard-deny hits untouched. |
+| `round4_f2_external_target_of_an_uncollected_link_is_unread` → **`round5_d145_unlistable_tree_root_is_a_gap_through_it`** | `/tmp/token` (target of `~/.gnupg/key`) Unread | `/tmp/token` Clear (rule 3); the gap is `Through(.gnupg)`; `~/.gnupg/key` a hit; a multiply-linked file Unread. |
+| `round3_neighbour_paths_spelled_through_protected_folders_keep_their_hit` | The links' targets Unread (walk-cap gaps) | No gaps; the targets are Clear (rules 2–3); the spelled paths stay hits. |
+| `round4_f3_cached_listing_failure_is_recorded_for_every_access_scope` | Unread | Still Unread. The gap is now justified by rule 4 (an unreadable folder on the path to a root): the read-scope gap is `AnyTarget`. Comment updated. |
+| `round4_cr_p2_2_gaps_reach_standalone_checks_and_recursive_walks` | A capped browser root | The browser root can't be listed (rule 4): the filter-selected link into it is Unread inside the recursive walk. |
+
+All other round 1–4 regressions keep their expectations, each re-checked against the D-145 builder:
+- hard-linked members (link count 2), browser files and roots are still collected;
+- linked folders are still walked;
+- `~/.ssh` link targets are still recorded.
+
+### 9.4 Verification
+
+Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
+
+For the orchestrator: the same commands as in §7.6 and §8.6.
