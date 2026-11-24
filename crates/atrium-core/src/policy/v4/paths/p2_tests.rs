@@ -14,7 +14,7 @@
 
 use crate::policy::limits;
 use crate::policy::model::{
-    AccessMode, ByteProvenance, CapReached, CodeExecution, CommandUnit, ComputeBudget,
+    AccessMode, ByteProvenance, Cap, CapReached, CodeExecution, CommandUnit, ComputeBudget,
     DerivedDestinations, ExhaustReason, Exhausted, FilterDialect, FoldRules, FsCap, FsCaps,
     FsIoError, GapScope, HitMatch, HitSource, LinkPolicy, ModelRedirect, OperandRole, PartId,
     PartOutcome, PartResult, PipelineId, ProtectedSet, ResolveError, SearchFilter, Separator,
@@ -4647,4 +4647,325 @@ fn round3_neighbour_ask_tree_prefix_rule_stays_linear() {
     );
     let spent = start - budget.remaining_units();
     assert!(spent < 4_000_000, "spent {spent}");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Rework Round 4 regressions (review round 3, CR-P2-2 / D-144)
+// ---------------------------------------------------------------------------
+
+fn read_outcome(path: &[u8], prot: &ProtectedSet, fs: &dyn PathResolver) -> PartOutcome {
+    let t = literal(path, AccessMode::Read, fs);
+    check_target(&t, prot, &mut ComputeBudget::with_default_limits())
+        .unwrap()
+        .outcome
+}
+
+#[test]
+fn round4_f1_browser_profile_reached_through_a_link_is_collected() {
+    // Review round 3, finding 1.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/profile/Cookies");
+    fs.add_file(b"/tmp/profile/Preferences");
+    fs.mkdir_all(b"/h/u/.config/google-chrome");
+    fs.add_symlink(b"/h/u/.config/google-chrome/Default", b"/tmp/profile");
+    let prot = default_build(&fs);
+    assert!(prot.identity_gaps.is_empty(), "{:?}", prot.identity_gaps);
+
+    // The protected spelling, through the linked profile: a hit by the
+    // identity collected below the link (§5).
+    assert!(matches!(
+        read_outcome(b"~/.config/google-chrome/Default/Cookies", &prot, &fs),
+        PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("credential-read")
+    ));
+    let r = subject(
+        "~/.config/google-chrome/Default/Cookies",
+        AccessMode::Read,
+        &prot,
+        &fs,
+    );
+    assert!(has_hard_deny(&r.outcomes, "credential-read"));
+    // An ordinary profile file stays ordinary.
+    assert_eq!(
+        read_outcome(b"~/.config/google-chrome/Default/Preferences", &prot, &fs),
+        PartOutcome::Clear
+    );
+}
+
+#[test]
+fn round4_f2_external_target_of_an_uncollected_link_is_unread() {
+    // Review round 3, finding 2: `.gnupg` is searchable but not listable, so
+    // the walk cannot see `key -> /tmp/token`.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/token");
+    fs.add_symlink(b"/h/u/.gnupg/key", b"/tmp/token");
+    fs.set_dir_read_error(b"/h/u/.gnupg", FsIoError::PermissionDenied);
+    let prot = default_build(&fs);
+    assert!(prot.identity_gaps.iter().any(|g| !g.write_only
+        && g.scope == GapScope::AnyTarget
+        && matches!(g.reason, UnreadReason::UnresolvablePath { .. })));
+
+    // A complete walk would have recorded /tmp/token: Unread, never Clear.
+    assert!(matches!(
+        read_outcome(b"/tmp/token", &prot, &fs),
+        PartOutcome::Unread(UnreadReason::UnresolvablePath { .. })
+    ));
+    // The protected spelling itself stays an exact hit.
+    assert!(matches!(
+        read_outcome(b"~/.gnupg/key", &prot, &fs),
+        PartOutcome::HardDenyHit(_)
+    ));
+}
+
+#[test]
+fn round4_f3_cached_listing_failure_is_recorded_for_every_access_scope() {
+    // Review round 3, finding 3: the write-protected Atrium path is the first
+    // to list `.azure` (and fail); the store discovery that reuses the cached
+    // failure is read-sensitive.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/token");
+    fs.mkdir_all(b"/h/u/.azure/atrium");
+    fs.add_symlink(b"/h/u/.azure/msal_token_cache.json", b"/tmp/token");
+    fs.set_dir_read_error(b"/h/u/.azure", FsIoError::PermissionDenied);
+    let prot = build_with(&fs, &[], &[b"/h/u/.azure/atrium"]);
+    assert!(prot.identity_gaps.iter().any(|g| g.write_only));
+    assert!(prot.identity_gaps.iter().any(|g| !g.write_only));
+    assert!(matches!(
+        read_outcome(b"/tmp/token", &prot, &fs),
+        PartOutcome::Unread(UnreadReason::UnresolvablePath { .. })
+    ));
+}
+
+#[test]
+fn round4_f4_fold_variants_of_home_components_are_discovered() {
+    // Review round 3, finding 4: home is `/h/u`; a distinct `/H/U` exists.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/h/u");
+    fs.add_file(b"/tmp/token");
+    fs.add_file(b"/tmp/db2");
+    fs.add_symlink(b"/H/U/.aws/credentials", b"/tmp/token");
+    fs.mkdir_all(b"/h/u/.local/share/atrium");
+    fs.add_symlink(b"/H/U/.local/share/atrium/db", b"/tmp/db2");
+    let prot = default_build(&fs);
+    assert!(prot.identity_gaps.is_empty(), "{:?}", prot.identity_gaps);
+
+    assert!(matches!(
+        read_outcome(b"/H/U/.aws/credentials", &prot, &fs),
+        PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("credential-read")
+    ));
+    assert!(matches!(
+        read_outcome(b"/H/U/.local/share/atrium/db", &prot, &fs),
+        PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("atrium-self")
+    ));
+}
+
+#[test]
+fn round4_f6_error_path_copies_are_charged_before_allocating() {
+    // Review round 3, finding 6: enough compute, no allocation budget.
+    let fs = FakeFs::new();
+    let mut budget = ComputeBudget::new(1_000_000, 0);
+    let err = resolve_literal(
+        b"x\0",
+        CWD,
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut budget,
+    )
+    .unwrap_err();
+    assert_eq!(err.reason, ExhaustReason::AllocationBudget);
+
+    let mut word = unquoted(b"x");
+    word.push(0, ByteProvenance::Unquoted);
+    word.push(b'*', ByteProvenance::Unquoted);
+    let mut budget = ComputeBudget::new(1_000_000, 0);
+    let err = expand_shell_glob(
+        &word,
+        CWD,
+        HOME,
+        PartId::Operand {
+            unit: UnitIndex(0),
+            argv_index: 1,
+        },
+        AccessMode::Read,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut budget,
+    )
+    .unwrap_err();
+    assert_eq!(err.reason, ExhaustReason::AllocationBudget);
+}
+
+#[test]
+fn round4_f7_too_large_survives_an_exhausted_budget() {
+    // Review round 3, finding 7: §1 puts TooLarge above Exhausted.
+    let fs = FakeFs::new();
+    let prot = default_build(&fs);
+    let paths: Vec<String> = (0..=limits::MAX_USES).map(|i| format!("f{i}")).collect();
+    for (units, alloc) in [(1_000_000u64, 0usize), (0, 0)] {
+        let res = resolve_subject_paths(
+            &paths,
+            None,
+            false,
+            AccessMode::Read,
+            &prot,
+            &fs,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::new(units, alloc),
+        )
+        .expect("a structural limit is decided, not lost");
+        assert!(
+            res.outcomes
+                .iter()
+                .any(|r| r.outcome == PartOutcome::TooLarge(Cap::Uses)),
+            "{:?}",
+            res.outcomes
+        );
+    }
+
+    // Neighbour: a command line whose path operands alone exceed MAX_PATHS.
+    let mut argv = vec![unquoted(b"cat")];
+    for _ in 0..=limits::MAX_PATHS {
+        argv.push(unquoted(b"f"));
+    }
+    let n = argv.len();
+    let u = unit(0, argv, vec![], Separator::Start, None);
+    let res = resolve_command_targets(
+        &[u],
+        &[reader_effects("cat", n)],
+        CWD,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::new(0, 0),
+    )
+    .expect("a structural limit is decided, not lost");
+    assert!(
+        res.outcomes
+            .iter()
+            .any(|r| r.outcome == PartOutcome::TooLarge(Cap::Paths))
+    );
+}
+
+#[test]
+fn round4_f8_mv_trigger_is_a_directory_source_not_the_destination() {
+    // Review round 3, finding 8: the annex gives derived-destination writers
+    // all-`Path`, ReadWrite operands.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/ordinary_file");
+    fs.mkdir_all(b"/h/u/ordinary_directory");
+    fs.mkdir_all(b"/h/u/source_dir");
+    let prot = default_build(&fs);
+    let mv_effects = |n: usize| ToolEffects {
+        tool_name: Some("mv"),
+        subcommand: None,
+        roles: std::iter::once(OperandRole::Command)
+            .chain(std::iter::repeat_n(OperandRole::Path, n - 1))
+            .collect(),
+        operand_access: std::iter::once(AccessMode::Read)
+            .chain(std::iter::repeat_n(AccessMode::ReadWrite, n - 1))
+            .collect(),
+        writes: true,
+        derived_destinations: DerivedDestinations::WhenSourceIsDir,
+        reads_recursively: false,
+        links: LinkPolicy::default(),
+        code: CodeExecution::None,
+        filter_dialect: None,
+        filters: vec![],
+        home_readonly_eligible: false,
+        cd_target_operand: None,
+        git_selects_by_name: false,
+        unread: vec![],
+    };
+    let derived = |argv: &[&[u8]]| {
+        let words: Vec<Word> = argv.iter().map(|w| unquoted(w)).collect();
+        let n = words.len();
+        let res = resolve_command_targets(
+            &[unit(0, words, vec![], Separator::Start, None)],
+            &[mv_effects(n)],
+            CWD,
+            &prot,
+            &fs,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+        has_unread(&res.outcomes, |r| {
+            matches!(r, UnreadReason::DerivedDestinations { .. })
+        })
+    };
+    // A file moved into a directory: no directory source, no derived destinations.
+    assert!(!derived(&[b"mv", b"ordinary_file", b"ordinary_directory"]));
+    // A directory moved: derived destinations, the writer is Unread (§5).
+    assert!(derived(&[b"mv", b"source_dir", b"ordinary_directory"]));
+    // `-t DIR` names the destination first: every operand may be a source.
+    assert!(derived(&[
+        b"mv",
+        b"-t",
+        b"ordinary_directory",
+        b"ordinary_file"
+    ]));
+}
+
+#[test]
+fn round4_cr_p2_2_gaps_reach_standalone_checks_and_recursive_walks() {
+    // CR-P2-2 failing case 2: a filter-selected link, checked inside the
+    // recursive walk, into a browser root whose walk passed its cap.
+    let mut fs = FakeFs::new();
+    for i in 0..(limits::WALK_MAX_ENTRIES + 4) {
+        fs.add_file(format!("/h/u/.config/google-chrome/Cache/c{i:05}").as_bytes());
+    }
+    fs.add_file(b"/h/u/.config/google-chrome/Default/x.toml");
+    fs.add_symlink(
+        b"/h/u/proj/l.toml",
+        b"/h/u/.config/google-chrome/Default/x.toml",
+    );
+    let prot = default_build(&fs);
+    let root = literal(b"proj", AccessMode::Read, &fs);
+    let filter = SearchFilter {
+        dialect: FilterDialect::RgGlob,
+        pattern: unquoted(b"*.toml"),
+        case_insensitive: false,
+        argv_index: Some(1),
+    };
+    let res = check_recursive_root(
+        &root,
+        LinkPolicy::default(),
+        &[filter],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(!has_any_hard_deny(&res.outcomes));
+    assert!(
+        has_unread(&res.outcomes, |r| *r
+            == UnreadReason::WalkCapReached(FsCap::EntriesRead)),
+        "{:?}",
+        res.outcomes
+    );
+    // (Failing case 1, the standalone write through a hard link past the
+    // cap, is asserted in `round3_r2f3_write_only_walk_past_its_caps_is_unread_never_clear`.)
+}
+
+#[test]
+fn round4_neighbour_protected_folder_reached_through_a_link_is_walked() {
+    // A credential-tree folder that is a link: walked like the folder, so its
+    // members (and the linked folder) are protected under any name.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/gsub/k");
+    fs.mkdir_all(b"/h/u/.gnupg");
+    fs.add_symlink(b"/h/u/.gnupg/sub", b"/tmp/gsub");
+    fs.add_hard_link(b"/tmp/gsub/k", b"/h/u/proj/k_alias");
+    let prot = default_build(&fs);
+    assert!(prot.identity_gaps.is_empty(), "{:?}", prot.identity_gaps);
+    for p in [&b"~/.gnupg/sub/k"[..], b"/tmp/gsub/k", b"proj/k_alias"] {
+        assert!(
+            matches!(read_outcome(p, &prot, &fs), PartOutcome::HardDenyHit(_)),
+            "{}",
+            String::from_utf8_lossy(p)
+        );
+    }
 }
