@@ -1,5 +1,5 @@
 //! CR-12 Git name-selection and wildcard-pathspec checks (contract §6, §8,
-//! M1-29 round 4 finding 1).
+//! M1-29 round 4 finding 1, D-153).
 
 use crate::policy::model::{
     CommandUnit, ComputeBudget, Exhausted, FoldRules, Hit, HitMatch, HitSource, OperandRole,
@@ -8,7 +8,8 @@ use crate::policy::model::{
 use crate::policy::tools::{self, GIT_CRED_DIRS, GIT_CRED_NAMES, GIT_CRED_SUFFIXES};
 
 use super::{
-    charge_str_clone, fold_command_bytes_budgeted, vec_push_budgeted, word_as_str_budgeted,
+    fold_command_bytes_budgeted, reserve_vec_slots_budgeted, vec_push_budgeted,
+    word_as_str_budgeted,
 };
 
 /// CR-17 credential store suffixes added beyond `dev`'s `GIT_CRED_SUFFIXES`
@@ -26,25 +27,33 @@ const CR17_GIT_CRED_NAMES: &[&str] = &[".yarnrc.yml", "credentials.tfrc.json"];
 /// Store family label emitted on CR-12/CR-17 Git selection `StoreHit`s.
 const GIT_SELECTION_FAMILY: &str = "git-credential-selection";
 
-pub(super) fn check_git_selection_impl(
+#[derive(Debug, Clone, Copy, Default)]
+struct PathspecMagicFlags {
+    has_literal: bool,
+    has_glob: bool,
+}
+
+pub(super) fn check_git_selection_into_impl(
     unit: &CommandUnit,
     effects: &ToolEffects,
     folds: &FoldRules,
+    out: &mut Vec<PartResult>,
     budget: &mut ComputeBudget,
-) -> Result<Vec<PartResult>, Exhausted> {
+) -> Result<(), Exhausted> {
     if effects.tool_name != Some("git") || unit.argv.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let sub = effects.subcommand;
     let check_cred_names = effects.git_selects_by_name;
     let check_wildcards = check_cred_names || matches!(sub, Some("status" | "ls-files"));
     if !check_cred_names && !check_wildcards {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     // Find subcommand position (marked `OperandRole::Command` at index >= 1,
-    // or fallback to index 1).
+    // or fallback to index 1). Charge before scanning `effects.roles`.
+    budget.charge(effects.roles.len().max(1) as u64)?;
     let subcmd_idx = effects
         .roles
         .iter()
@@ -53,26 +62,45 @@ pub(super) fn check_git_selection_impl(
         .find_map(|(idx, role)| (*role == OperandRole::Command).then_some(idx))
         .unwrap_or(1);
     if subcmd_idx >= unit.argv.len() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
-    // Check leading global options for `--literal-pathspecs`.
-    let mut literal_pathspecs = false;
+    // Track pathspec magic (`:(...)`, `:!`, `:`) separately from default
+    // wildcard interpretation (`*`, `?`, `[`):
+    // - `--literal-pathspecs` disables both pathspec magic and wildcards;
+    // - `--noglob-pathspecs` makes wildcards literal by default while keeping
+    //   explicit pathspec magic (including `:(glob)`) active;
+    // - `--glob-pathspecs` leaves wildcards active (fail-closed if combined).
+    let mut pathspec_magic_enabled = true;
+    let mut default_glob_wildcards = true;
     for w in &unit.argv[1..subcmd_idx] {
         if let Some(tok) = word_as_str_budgeted(w, budget)? {
-            if tok == "--literal-pathspecs" {
-                literal_pathspecs = true;
-            } else if matches!(tok, "--glob-pathspecs" | "--noglob-pathspecs") {
-                literal_pathspecs = false;
+            match tok {
+                "--literal-pathspecs" => {
+                    pathspec_magic_enabled = false;
+                    default_glob_wildcards = false;
+                }
+                "--noglob-pathspecs" => {
+                    default_glob_wildcards = false;
+                }
+                "--glob-pathspecs" => {
+                    pathspec_magic_enabled = true;
+                    default_glob_wildcards = true;
+                }
+                _ => {}
             }
         }
     }
 
-    let mut out: Vec<PartResult> = Vec::new();
     let mut after_dd = false;
     let mut i = subcmd_idx + 1;
 
     while i < unit.argv.len() {
+        // Reserve 2 result slots BEFORE inspecting operand `i` so committing
+        // any established `StoreHit` / `GitWildcardPathspec` on this operand
+        // cannot fail with allocation exhaustion (§8).
+        reserve_vec_slots_budgeted(out, 2, budget)?;
+
         let argv_index = i;
         let part = PartId::Operand {
             unit: unit.index,
@@ -82,20 +110,19 @@ pub(super) fn check_git_selection_impl(
             // Non-UTF-8 pathspec: check raw bytes for active wildcards or `:` magic.
             let raw = unit.argv[i].literal_bytes();
             budget.charge(raw.len().max(1) as u64)?;
-            if check_cred_names && raw.starts_with(b":") {
-                push_store_hit(&mut out, part, budget)?;
-            } else if check_wildcards && !literal_pathspecs && raw_has_active_wildcard(raw) {
-                let pathspec = charge_str_clone("<non-utf8>", budget)?;
-                vec_push_budgeted(
-                    &mut out,
-                    PartResult {
-                        part,
-                        outcome: PartOutcome::Unread(UnreadReason::GitWildcardPathspec {
-                            pathspec,
-                        }),
-                    },
-                    budget,
+            if check_cred_names && pathspec_magic_enabled && raw.starts_with(b":") {
+                push_store_hit_reserved(out, part);
+            } else if check_wildcards && default_glob_wildcards {
+                const NON_UTF8_LABEL: &str = "<non-utf8>";
+                budget.charge(
+                    (raw.len().max(1) as u64).saturating_add(NON_UTF8_LABEL.len() as u64),
                 )?;
+                budget.charge_alloc(NON_UTF8_LABEL.len())?;
+                if raw_has_active_wildcard(raw) {
+                    let mut pathspec = String::with_capacity(NON_UTF8_LABEL.len());
+                    pathspec.push_str(NON_UTF8_LABEL);
+                    push_wildcard_reserved(out, part, pathspec);
+                }
             }
             i += 1;
             continue;
@@ -131,15 +158,18 @@ pub(super) fn check_git_selection_impl(
                 } else {
                     (arg.strip_prefix("--line-range="), part)
                 };
+                if let Some(spec) = spec_opt {
+                    budget.charge(spec.len().max(1) as u64)?;
+                }
                 match spec_opt.and_then(parse_git_line_range) {
                     Some(file) => {
-                        if git_path_is_credential_or_ancestor(file, folds, budget)? {
-                            push_store_hit(&mut out, spec_part, budget)?;
+                        if git_path_is_credential_or_ancestor(file, false, folds, budget)? {
+                            push_store_hit_reserved(out, spec_part);
                         }
                     }
                     None => {
                         // Malformed or missing `-L` spec: fail closed as StoreHit.
-                        push_store_hit(&mut out, spec_part, budget)?;
+                        push_store_hit_reserved(out, spec_part);
                     }
                 }
                 i += 1;
@@ -149,7 +179,7 @@ pub(super) fn check_git_selection_impl(
             // `--pathspec-from-file` reads pathspecs from a file we can't inspect.
             if arg == "--pathspec-from-file" || arg.starts_with("--pathspec-from-file=") {
                 if check_cred_names {
-                    push_store_hit(&mut out, part, budget)?;
+                    push_store_hit_reserved(out, part);
                 }
                 i += 1;
                 continue;
@@ -168,16 +198,17 @@ pub(super) fn check_git_selection_impl(
             after_dd,
             check_cred_names,
             check_wildcards,
-            literal_pathspecs,
+            pathspec_magic_enabled,
+            default_glob_wildcards,
             part,
             folds,
-            &mut out,
+            out,
             budget,
         )?;
         i += 1;
     }
 
-    Ok(out)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -186,7 +217,8 @@ fn inspect_git_operand(
     after_dd: bool,
     check_cred_names: bool,
     check_wildcards: bool,
-    literal_pathspecs: bool,
+    pathspec_magic_enabled: bool,
+    default_glob_wildcards: bool,
     part: PartId,
     folds: &FoldRules,
     out: &mut Vec<PartResult>,
@@ -194,115 +226,155 @@ fn inspect_git_operand(
 ) -> Result<(), Exhausted> {
     budget.charge(arg.len().max(1) as u64)?;
 
-    // 1. Leading `:` forms: `:N:PATH` (index stage), `:(magic)PATH`, `:!PATH`,
-    //    `:^PATH`, `:/PATH`, `:PATH`.
+    // 1. Leading `:` forms: `:N:PATH` (index stage), lone `:` pathspec,
+    //    `:(magic)PATH`, `:!PATH`, `:^PATH`, `:/PATH`, `:PATH`.
     if let Some(after) = arg.strip_prefix(':') {
-        // Index stage spec `:N:PATH` (only before `--`, when cred checks apply).
+        // Index stage object spec `:N:PATH` (only before `--`, revision-object context).
         if !after_dd
             && let Some((n, path)) = after.split_once(':')
             && !n.is_empty()
             && n.bytes().all(|b| b.is_ascii_digit())
         {
-            if check_cred_names && git_path_is_credential_or_ancestor(path, folds, budget)? {
-                push_store_hit(out, part, budget)?;
+            if check_cred_names && git_path_is_credential_or_ancestor(path, false, folds, budget)? {
+                push_store_hit_reserved(out, part);
             }
             return Ok(());
         }
 
-        // Pathspec magic or exclusion: `:(...)`, `:!`, `:^`, `:/`
-        if after.starts_with(['(', '!', '^', '/']) {
-            let (body, is_literal_magic) = strip_pathspec_magic(after);
-            if check_cred_names {
-                push_store_hit(out, part.clone(), budget)?;
-            }
-            if check_wildcards && !is_literal_magic && !literal_pathspecs {
-                let wildcard_or_unclosed = match body {
-                    Some(body_str) => str_has_active_wildcard(body_str),
-                    None => true,
-                };
-                if wildcard_or_unclosed {
-                    let pathspec = charge_str_clone(arg, budget)?;
-                    vec_push_budgeted(
-                        out,
-                        PartResult {
-                            part,
-                            outcome: PartOutcome::Unread(UnreadReason::GitWildcardPathspec {
-                                pathspec,
-                            }),
-                        },
-                        budget,
-                    )?;
+        if pathspec_magic_enabled {
+            // Lone `:` is a special pathspec selecting the root/top of the tree
+            // (ancestor of every credential-shaped name; §6).
+            if after.is_empty() {
+                if check_cred_names {
+                    push_store_hit_reserved(out, part);
                 }
+                return Ok(());
+            }
+
+            // Pathspec magic or exclusion: `:(...)`, `:!`, `:^`, `:/`
+            if after.starts_with(['(', '!', '^', '/']) {
+                budget.charge(after.len().max(1) as u64)?;
+                let (body, magic) = strip_pathspec_magic(after);
+                // Commit the StoreHit FIRST (already reserved, infallible) so
+                // it cannot be lost if wildcard string allocation exhausts later.
+                if check_cred_names {
+                    push_store_hit_reserved(out, part.clone());
+                }
+                if check_wildcards {
+                    let wildcards_active = match body {
+                        None => true,
+                        Some(_) => !magic.has_literal && (magic.has_glob || default_glob_wildcards),
+                    };
+                    if wildcards_active {
+                        let scan_len = body.map_or(1, |b| b.len().max(1));
+                        budget.charge((arg.len().max(1) as u64).saturating_add(scan_len as u64))?;
+                        if !arg.is_empty() {
+                            budget.charge_alloc(arg.len())?;
+                        }
+                        let has_wc = match body {
+                            Some(body_str) => str_has_active_wildcard(body_str),
+                            None => true,
+                        };
+                        if has_wc {
+                            let mut pathspec = String::with_capacity(arg.len());
+                            pathspec.push_str(arg);
+                            push_wildcard_reserved(out, part, pathspec);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
+            // Unrecognized `:` magic or extra `:` (fail closed on CR-12 subcommands).
+            if after.starts_with(['~', '@', '#', '+', '=', '%', '&', '$', '\\', ':'])
+                || after.contains(':')
+            {
+                if check_cred_names {
+                    push_store_hit_reserved(out, part);
+                }
+                return Ok(());
+            }
+
+            // Plain `:PATH`: after `--` this is pathspec context (empty magic + PATH,
+            // where `:.` / `:./` is a root ancestor); before `--` it is a stage-0
+            // object spec (revision-object context).
+            if after_dd {
+                if check_wildcards && default_glob_wildcards {
+                    budget.charge(
+                        (arg.len().max(1) as u64).saturating_add(after.len().max(1) as u64),
+                    )?;
+                    if !arg.is_empty() {
+                        budget.charge_alloc(arg.len())?;
+                    }
+                    if str_has_active_wildcard(after) {
+                        let mut pathspec = String::with_capacity(arg.len());
+                        pathspec.push_str(arg);
+                        push_wildcard_reserved(out, part, pathspec);
+                        return Ok(());
+                    }
+                }
+                if check_cred_names
+                    && git_path_is_credential_or_ancestor(after, true, folds, budget)?
+                {
+                    push_store_hit_reserved(out, part);
+                }
+            } else if check_cred_names
+                && git_path_is_credential_or_ancestor(after, false, folds, budget)?
+            {
+                push_store_hit_reserved(out, part);
+            }
+            return Ok(());
+        } else if !after_dd {
+            // Under `--literal-pathspecs`, leading `:` before `--` is still a
+            // stage-0 object spec (not a pathspec).
+            if check_cred_names && git_path_is_credential_or_ancestor(after, false, folds, budget)?
+            {
+                push_store_hit_reserved(out, part);
             }
             return Ok(());
         }
-
-        // Unrecognized `:` magic or extra `:` (fail closed on CR-12 subcommands).
-        if after.starts_with(['~', '@', '#', '+', '=', '%', '&', '$', '\\', ':'])
-            || after.contains(':')
-        {
-            if check_cred_names {
-                push_store_hit(out, part, budget)?;
-            }
-            return Ok(());
-        }
-
-        // Plain `:PATH` (stage 0 object spec or pathspec)
-        if check_wildcards && !literal_pathspecs && after_dd && str_has_active_wildcard(after) {
-            let pathspec = charge_str_clone(arg, budget)?;
-            vec_push_budgeted(
-                out,
-                PartResult {
-                    part,
-                    outcome: PartOutcome::Unread(UnreadReason::GitWildcardPathspec { pathspec }),
-                },
-                budget,
-            )?;
-            return Ok(());
-        }
-        if check_cred_names && git_path_is_credential_or_ancestor(after, folds, budget)? {
-            push_store_hit(out, part, budget)?;
-        }
-        return Ok(());
+        // Under `--literal-pathspecs` after `--`, `:` is literal: fall through to
+        // plain pathspec handling below.
     }
 
-    // 2. `REV:PATH` object spec (before `--`, e.g. `HEAD:.env`, `HEAD:.gem/credentials`).
+    // 2. `REV:PATH` revision-object spec (before `--`, e.g. `HEAD:.env`,
+    //    `HEAD:.gem/credentials`, `HEAD:README.md`). Kept separate from
+    //    pathspec root-ancestor matching.
     if !after_dd && let Some((rev, path)) = arg.split_once(':') {
-        // Note: `rev` is a revision (not a pathspec); `path` is a tree path.
         let _ = rev;
-        if check_cred_names && git_path_is_credential_or_ancestor(path, folds, budget)? {
-            push_store_hit(out, part, budget)?;
+        if check_cred_names && git_path_is_credential_or_ancestor(path, false, folds, budget)? {
+            push_store_hit_reserved(out, part);
         }
         return Ok(());
     }
 
     // 3. Plain pathspec (either after `--` or a positional pathspec before `--`).
-    if check_wildcards && !literal_pathspecs && str_has_active_wildcard(arg) {
-        let pathspec = charge_str_clone(arg, budget)?;
-        vec_push_budgeted(
-            out,
-            PartResult {
-                part,
-                outcome: PartOutcome::Unread(UnreadReason::GitWildcardPathspec { pathspec }),
-            },
-            budget,
-        )?;
-        return Ok(());
+    if check_wildcards && default_glob_wildcards {
+        budget.charge((arg.len().max(1) as u64).saturating_mul(2))?;
+        if !arg.is_empty() {
+            budget.charge_alloc(arg.len())?;
+        }
+        if str_has_active_wildcard(arg) {
+            let mut pathspec = String::with_capacity(arg.len());
+            pathspec.push_str(arg);
+            push_wildcard_reserved(out, part, pathspec);
+            return Ok(());
+        }
     }
 
-    if check_cred_names && git_path_is_credential_or_ancestor(arg, folds, budget)? {
-        push_store_hit(out, part, budget)?;
+    if check_cred_names && git_path_is_credential_or_ancestor(arg, true, folds, budget)? {
+        push_store_hit_reserved(out, part);
     }
 
     Ok(())
 }
 
 /// Strips leading `:(magic)` / `:!` / `:^` / `:/` prefixes from the substring
-/// after the leading `:`. Returns `(Some(remaining_body), has_literal_magic)`,
-/// or `(None, false)` if `:(...` is unclosed.
-fn strip_pathspec_magic(after_colon: &str) -> (Option<&str>, bool) {
+/// after the leading `:`. Returns `(Some(remaining_body), flags)`, or
+/// `(None, flags)` if `:(...` is unclosed.
+fn strip_pathspec_magic(after_colon: &str) -> (Option<&str>, PathspecMagicFlags) {
     let mut s = after_colon;
-    let mut has_literal = false;
+    let mut flags = PathspecMagicFlags::default();
     loop {
         if let Some(rest) = s.strip_prefix('(') {
             let mut depth = 1usize;
@@ -321,11 +393,15 @@ fn strip_pathspec_magic(after_colon: &str) -> (Option<&str>, bool) {
                 }
             }
             let Some(end_idx) = end else {
-                return (None, false);
+                return (None, flags);
             };
             let inside = &rest[..end_idx];
-            if inside.split(',').any(|k| k == "literal") {
-                has_literal = true;
+            for kw in inside.split(',') {
+                if kw == "literal" {
+                    flags.has_literal = true;
+                } else if kw == "glob" {
+                    flags.has_glob = true;
+                }
             }
             s = &rest[end_idx + 1..];
         } else if let Some(rest) = s.strip_prefix(['/', '!', '^']) {
@@ -334,7 +410,7 @@ fn strip_pathspec_magic(after_colon: &str) -> (Option<&str>, bool) {
             break;
         }
     }
-    (Some(s), has_literal)
+    (Some(s), flags)
 }
 
 /// Returns `true` if `s` contains an unescaped Git pathspec wildcard (`*`, `?`,
@@ -366,30 +442,37 @@ fn parse_git_line_range(spec: &str) -> Option<&str> {
     }
 }
 
-fn push_store_hit(
-    out: &mut Vec<PartResult>,
-    part: PartId,
-    budget: &mut ComputeBudget,
-) -> Result<(), Exhausted> {
-    vec_push_budgeted(
-        out,
-        PartResult {
-            part: part.clone(),
-            outcome: PartOutcome::StoreHit(Hit {
-                hard_deny_id: None,
-                source: HitSource::Model,
-                matched: HitMatch::StoreFamily {
-                    family: GIT_SELECTION_FAMILY,
-                },
-                part,
-            }),
-        },
-        budget,
-    )
+/// Pushes a Git credential selection `StoreHit` into an already-reserved slot
+/// of `out` (infallible; caller reserved via `reserve_vec_slots_budgeted`).
+fn push_store_hit_reserved(out: &mut Vec<PartResult>, part: PartId) {
+    debug_assert!(out.len() < out.capacity());
+    out.push(PartResult {
+        part: part.clone(),
+        outcome: PartOutcome::StoreHit(Hit {
+            hard_deny_id: None,
+            source: HitSource::Model,
+            matched: HitMatch::StoreFamily {
+                family: GIT_SELECTION_FAMILY,
+            },
+            part,
+        }),
+    });
+}
+
+/// Pushes a `GitWildcardPathspec` `Unread` into an already-reserved slot of
+/// `out` (infallible; caller reserved via `reserve_vec_slots_budgeted`).
+fn push_wildcard_reserved(out: &mut Vec<PartResult>, part: PartId, pathspec: String) {
+    debug_assert!(out.len() < out.capacity());
+    out.push(PartResult {
+        part,
+        outcome: PartOutcome::Unread(UnreadReason::GitWildcardPathspec { pathspec }),
+    });
 }
 
 /// Checks whether a Git path or pathspec (after CR-19 folding and lexical `.`/
 /// `..` normalization) matches:
+/// 0. a root/ancestor pathspec (`.`, `./`, `..`, `a/..`, `/`, `""`) when
+///    `allow_root_ancestor == true` (pathspec context, never revision-object);
 /// 1. a credential filename (`GIT_CRED_NAMES` + CR-17, `msal_token_cache.*`,
 ///    or SSH private key name `id_*` excluding code/public extensions);
 /// 2. a credential suffix (`GIT_CRED_SUFFIXES` + CR-17) or a proper ancestor
@@ -399,6 +482,7 @@ fn push_store_hit(
 ///    `.pub` / `known_hosts*` / `config` / `authorized_keys` read exceptions).
 fn git_path_is_credential_or_ancestor(
     path: &str,
+    allow_root_ancestor: bool,
     folds: &FoldRules,
     budget: &mut ComputeBudget,
 ) -> Result<bool, Exhausted> {
@@ -423,7 +507,10 @@ fn git_path_is_credential_or_ancestor(
     }
 
     let Some(name) = parts.last().map(String::as_str) else {
-        return Ok(false);
+        // Empty normalized path (e.g. `.`, `./`, `..`, `a/..`, `/`, `""`):
+        // in pathspec context this selects the tree root / ancestor of all
+        // credential-shaped names (§6); in revision-object context keep separate.
+        return Ok(allow_root_ancestor);
     };
 
     // 1. Filename checks (`GIT_CRED_NAMES`, CR-17 names, `msal_token_cache.*`, SSH key names).
@@ -439,11 +526,7 @@ fn git_path_is_credential_or_ancestor(
 
     // 2. Credential suffixes (exact match OR proper directory ancestor, M1-29 round 4 finding 1).
     let total_suffixes = (GIT_CRED_SUFFIXES.len() + CR17_GIT_CRED_SUFFIXES.len()) as u64;
-    budget.charge(
-        total_suffixes
-            .saturating_mul(parts.len().max(1) as u64)
-            .saturating_mul(4),
-    )?;
+    budget.charge(total_suffixes.saturating_mul(path.len().max(1) as u64))?;
     for &suffix in GIT_CRED_SUFFIXES.iter().chain(CR17_GIT_CRED_SUFFIXES) {
         if path_matches_or_is_ancestor_of_pattern(&parts, suffix) {
             return Ok(true);
@@ -453,11 +536,7 @@ fn git_path_is_credential_or_ancestor(
     // 3. Credential directories:
     //    - exact match or proper ancestor of dir (e.g. `.ssh`, `.aws`, `.aws/sso`, `.config`);
     //    - descendant below dir (keeping `.ssh` public/readable exceptions).
-    budget.charge(
-        (GIT_CRED_DIRS.len() as u64)
-            .saturating_mul(parts.len().max(1) as u64)
-            .saturating_mul(4),
-    )?;
+    budget.charge((GIT_CRED_DIRS.len() as u64).saturating_mul(path.len().max(1) as u64))?;
     for &dir in GIT_CRED_DIRS {
         if path_matches_or_is_ancestor_of_pattern(&parts, dir) {
             return Ok(true);

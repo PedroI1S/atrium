@@ -39,6 +39,45 @@ pub(super) fn vec_with_exact_budgeted<T>(
     Ok(Vec::with_capacity(len))
 }
 
+/// Result of CR-12 Git name-selection and wildcard-pathspec checks
+/// (contract §6, §8, D-153).
+///
+/// Retains every `StoreHit` and `Unread(GitWildcardPathspec)` established
+/// before completion or exhaustion so no earlier hit is lost if a later
+/// operand exhausts [`ComputeBudget`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GitSelectionOutcome {
+    pub(crate) results: Vec<PartResult>,
+    pub(crate) exhausted: Option<Exhausted>,
+}
+
+/// Ensures `vec` has spare capacity for at least `additional` items without
+/// reallocating later, charging element-copy compute units and growth
+/// allocation bytes **before** reserving (§8).
+pub(super) fn reserve_vec_slots_budgeted<T>(
+    vec: &mut Vec<T>,
+    additional: usize,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    let spare = vec.capacity().saturating_sub(vec.len());
+    if spare >= additional {
+        return Ok(());
+    }
+    let old_cap = vec.capacity();
+    let needed_cap = vec.len().saturating_add(additional);
+    let doubled = if old_cap == 0 {
+        4
+    } else {
+        old_cap.saturating_mul(2)
+    };
+    let new_cap = doubled.max(needed_cap);
+    let add_elems = new_cap - old_cap;
+    budget.charge(vec.len().max(1) as u64)?;
+    budget.charge_alloc(add_elems.saturating_mul(size_of::<T>()))?;
+    vec.reserve_exact(new_cap - vec.len());
+    Ok(())
+}
+
 /// Pushes `item` into `vec`, charging any capacity growth (allocation bytes +
 /// element-copy compute units) **before** reallocating.
 pub(super) fn vec_push_budgeted<T>(
@@ -528,6 +567,7 @@ fn classify_cd(
             && tok.starts_with('-')
             && !tok[1..].starts_with(|c: char| c.is_ascii_digit())
         {
+            budget.charge(tok.len() as u64)?;
             if tok[1..].chars().all(|c| matches!(c, 'L' | 'P' | 'e' | '@')) {
                 effects.roles[idx] = OperandRole::Flag;
                 effects.operand_access[idx] = AccessMode::Read;
@@ -602,8 +642,7 @@ fn classify_home_readonly(
     // Check forbidden flags before `--` (mirrors dev's `engine::forbidden_flag`).
     let mut has_forbidden = false;
     for arg in &unit.argv[args_start..] {
-        if arg.literal_bytes() == b"--" {
-            budget.charge(2)?;
+        if bytes_eq_budgeted(arg.literal_bytes(), b"--", budget)? {
             break;
         }
         match word_as_str_budgeted(arg, budget)? {
@@ -725,6 +764,7 @@ fn classify_search(
         }
 
         if let Some(rest) = tok.strip_prefix("--") {
+            budget.charge(rest.len().max(1) as u64)?;
             let (name, eq_pos) = match rest.find('=') {
                 Some(pos) => (&rest[..pos], Some(2 + pos)),
                 None => (rest, None),
@@ -836,6 +876,7 @@ fn classify_search(
             }
         } else {
             // Short option cluster `-...`
+            budget.charge(tok.len().max(1) as u64)?;
             let mut cluster_ok = true;
             let mut consumed_next = false;
             let mut attached_path = false;
@@ -1150,11 +1191,20 @@ fn classify_code_runner_leaf(
                     && !first_op.is_empty()
                     && !first_op.starts_with('-')
                 {
-                    // Build exact program_words = argv[0..=args_start].
+                    // Build exact program_words = argv[0..=args_start], retaining
+                    // validated `&str` views so no word is rescanned without charge (§8).
                     let count = args_start + 1;
+                    let mut views = vec_with_exact_budgeted::<&str>(count, budget)?;
                     let mut valid_utf8 = true;
-                    for w in &unit.argv[..count] {
-                        if word_as_str_budgeted(w, budget)?.is_none() {
+                    for (k, w) in unit.argv[..count].iter().enumerate() {
+                        let s = if k == args_start {
+                            Some(first_op)
+                        } else {
+                            word_as_str_budgeted(w, budget)?
+                        };
+                        if let Some(s) = s {
+                            views.push(s);
+                        } else {
                             valid_utf8 = false;
                             break;
                         }
@@ -1164,8 +1214,7 @@ fn classify_code_runner_leaf(
                         effects.operand_access[args_start] = AccessMode::Read;
                         let mut p1 = vec_with_exact_budgeted::<String>(count, budget)?;
                         let mut p2 = vec_with_exact_budgeted::<String>(count, budget)?;
-                        for w in &unit.argv[..count] {
-                            let s = w.as_str().unwrap_or("");
+                        for &s in &views {
                             p1.push(charge_str_clone(s, budget)?);
                             p2.push(charge_str_clone(s, budget)?);
                         }
@@ -1448,14 +1497,19 @@ fn classify_git(
     // 1. Walk global options before the subcommand.
     let mut i = 1usize;
     let mut triggered_tool: Option<String> = None;
+    let mut subcmd_idx: Option<(usize, &str)> = None;
 
     while i < unit.argv.len() {
         let Some(tok) = word_as_str_budgeted(&unit.argv[i], budget)? else {
             break;
         };
         if tok == "--" || !tok.starts_with('-') || tok == "-" {
+            if tok != "--" && !tok.starts_with('-') {
+                subcmd_idx = Some((i, tok));
+            }
             break;
         }
+        budget.charge(row.triggers.len().max(1) as u64)?;
         // Check top-level `RunnerTrigger::Flag` (`-c`, `--config-env`, `--exec-path`).
         for &trigger in row.triggers {
             if let RunnerTrigger::Flag(f) = trigger
@@ -1472,16 +1526,6 @@ fn classify_git(
             i += 1;
         }
     }
-
-    let subcmd_idx = if i < unit.argv.len()
-        && let Some(tok) = word_as_str_budgeted(&unit.argv[i], budget)?
-        && tok != "--"
-        && !tok.starts_with('-')
-    {
-        Some((i, tok))
-    } else {
-        None
-    };
 
     // 2. Check subcommand triggers (`Subcommand`, `SubcommandWithSubarg`,
     //    `SubcommandWithFlag`).
@@ -1698,6 +1742,7 @@ fn classify_sed(
             continue;
         }
         if let Some(rest) = tok.strip_prefix("--") {
+            budget.charge(rest.len().max(1) as u64)?;
             let (name, val) = match rest.split_once('=') {
                 Some((n, v)) => (n, Some(v)),
                 None => (rest, None),
@@ -1754,6 +1799,7 @@ fn classify_sed(
             }
         } else {
             // Short option cluster `-...`
+            budget.charge(tok.len().max(1) as u64)?;
             let mut consumed_next = false;
             for (byte_off, ch) in tok[1..].char_indices() {
                 let rest_start = 1 + byte_off + ch.len_utf8();
@@ -1787,6 +1833,20 @@ fn classify_sed(
                     'i' => {
                         if rest_start >= tok.len() {
                             saw_bare_in_place = true;
+                            // Bare `-i` is ambiguous across GNU (no arg) and
+                            // BSD/macOS (consumes next word as backup suffix).
+                            // Only `sed -i '' ...` (the macOS empty-suffix
+                            // idiom) cannot hide a script behind a suffix;
+                            // every other bare `-i` form (e.g.
+                            // `sed -i p 'w out' input`) is classified Unread.
+                            budget.charge(1)?;
+                            if i + 1 < unit.argv.len()
+                                && unit.argv[i + 1].literal_bytes().is_empty()
+                            {
+                                consumed_next = true;
+                            } else {
+                                uncertain = true;
+                            }
                         }
                         break;
                     }
@@ -1877,24 +1937,7 @@ fn classify_sed(
     }
 
     if expr_scripts.is_empty() {
-        let script_pos = if saw_bare_in_place {
-            // Bare `-i` is ambiguous across GNU (no arg) and BSD/macOS (required
-            // backup suffix). If `positional[0]` is `""` (standard macOS idiom
-            // `sed -i '' 's/a/b/' file`) and `positional.len() >= 2`, inspect
-            // `positional[1]`; otherwise if `positional.len() >= 1`, fail closed
-            // unless `positional[0]` parses cleanly AND (if another arg might be
-            // the script on BSD) wait: on BSD `sed -i .bak 's/a/b/' file`,
-            // `positional[0]` is `.bak` which fails our sed parser -> Uncertain!
-            if positional.len() >= 2 && unit.argv[positional[0]].literal_bytes().is_empty() {
-                Some(positional[1])
-            } else {
-                positional.first().copied()
-            }
-        } else {
-            positional.first().copied()
-        };
-
-        let Some(sidx) = script_pos else {
+        let Some(sidx) = positional.first().copied() else {
             // No script operand at all -> cannot tell reliably -> Unread.
             let tool = charge_str_clone(tool_name, budget)?;
             effects.code = CodeExecution::Inline {
@@ -2086,6 +2129,25 @@ pub(crate) fn check_git_selection(
     effects: &ToolEffects,
     folds: &FoldRules,
     budget: &mut ComputeBudget,
-) -> Result<Vec<PartResult>, Exhausted> {
-    git::check_git_selection_impl(unit, effects, folds, budget)
+) -> GitSelectionOutcome {
+    let mut results = Vec::new();
+    let res = git::check_git_selection_into_impl(unit, effects, folds, &mut results, budget);
+    GitSelectionOutcome {
+        results,
+        exhausted: res.err(),
+    }
+}
+
+/// Sink variant of [`check_git_selection`] that appends established results
+/// directly into `out` (reserving slots before checking each operand) so every
+/// earlier `StoreHit` / `Unread(GitWildcardPathspec)` remains in `out` if a
+/// later operand returns `Err(Exhausted)` (§6, §8, D-153).
+pub(crate) fn check_git_selection_into(
+    unit: &CommandUnit,
+    effects: &ToolEffects,
+    folds: &FoldRules,
+    out: &mut Vec<PartResult>,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    git::check_git_selection_into_impl(unit, effects, folds, out, budget)
 }

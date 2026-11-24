@@ -59,8 +59,13 @@ fn git_sel(words: Vec<Word>) -> (ToolEffects, Vec<crate::policy::model::PartResu
     let u = make_unit(words);
     let mut budget = ComputeBudget::with_default_limits();
     let eff = classify_unit(&u, &FoldRules::REV4, &mut budget).expect("classify");
-    let res = check_git_selection(&u, &eff, &FoldRules::REV4, &mut budget).expect("git sel");
-    (eff, res)
+    let out = check_git_selection(&u, &eff, &FoldRules::REV4, &mut budget);
+    assert!(
+        out.exhausted.is_none(),
+        "unexpected exhaustion: {:?}",
+        out.exhausted
+    );
+    (eff, out.results)
 }
 
 // ---------------------------------------------------------------------------
@@ -435,10 +440,21 @@ fn search_followed_links_unknown_flags_and_near_misses() {
     assert_eq!(rg_l.home_readonly_eligible, ALLOW_HOME_FOLLOWED_SEARCH);
     assert!(rg_l.unread.is_empty());
 
-    // Ordered toggle: `-L --no-follow` disables below-root link following.
+    // `--no-follow` is NOT in RG_FLAGS, so §6 requires UnknownFlag/Unread
+    // and disables Home eligibility (finding 13).
     let rg_nf = classify(&["rg", "-L", "--no-follow", "needle", "src"]);
-    assert!(!rg_nf.links.below_root);
-    assert!(rg_nf.home_readonly_eligible);
+    assert!(rg_nf.unread.iter().any(|r| matches!(
+        r,
+        UnreadReason::UnknownFlag { tool, flag } if tool == "rg" && flag == "--no-follow"
+    )));
+    assert!(!rg_nf.home_readonly_eligible);
+
+    // Table-supported ordered toggle: `grep -R -r` disables below-root link following.
+    let grep_r_override = classify(&["grep", "-R", "-r", "needle", "src"]);
+    assert!(grep_r_override.reads_recursively);
+    assert!(!grep_r_override.links.below_root);
+    assert!(grep_r_override.home_readonly_eligible);
+    assert!(grep_r_override.unread.is_empty());
 
     let grep_cap_r = classify(&["grep", "-R", "needle", "src"]);
     assert!(grep_cap_r.reads_recursively);
@@ -803,11 +819,32 @@ fn conditional_runner_sed_script_parser_and_program_pin() {
         vec![w("sed"), w("-n"), wq("1,5p"), w("a.txt")],
         vec![w("sed"), w("-E"), w("-e"), wq("s|error|ok|g"), w("a.txt")],
         vec![w("sed"), w("-i"), wq(""), wq("s/a/b/"), w("a.txt")],
+        vec![w("sed"), w("-i.bak"), wq("s/a/b/"), w("a.txt")],
+        vec![w("sed"), wq("z"), w("a.txt")],
     ] {
         let e = classify_words(safe.clone());
         assert!(e.unread.is_empty(), "expected safe sed for {safe:?}");
         assert!(e.writes);
         assert!(!e.home_readonly_eligible);
+    }
+
+    // Finding 5: BSD/macOS bare `-i` can consume the next word (`p`) as the
+    // backup suffix and execute the following word (`w out`) as the script, so
+    // ambiguous bare `-i` forms (anything other than `sed -i '' ...`) are Unread.
+    for bsd_ambig in [
+        vec![w("sed"), w("-i"), w("p"), wq("w out"), w("input")],
+        vec![w("sed"), w("-ni"), w("p"), wq("w out"), w("input")],
+        vec![w("sed"), w("-i"), wq("s/a/b/"), w("input")],
+        vec![w("sed"), w("-i"), w("-e"), w("p"), wq("w out"), w("input")],
+        vec![w("sed"), w("-i"), wq(""), wq("w out"), w("input")],
+        vec![w("sed"), w("-i.bak"), wq("w out"), w("input")],
+    ] {
+        let e = classify_words(bsd_ambig.clone());
+        assert_eq!(
+            e.unread,
+            vec![UnreadReason::CodeRunnerInlineCode { tool: "sed".into() }],
+            "expected Unread on sed -i form {bsd_ambig:?}"
+        );
     }
 
     // Trigger scripts (`e`, `w`, `r`, `W`, `R`, substitute flags `e`/`w`).
@@ -1070,6 +1107,15 @@ fn git_selection_credentials_cr17_ancestors_magic_and_wildcards() {
             wq(":(top)README.md"),
         ],
         vec![w("git"), w("show"), w("HEAD"), w("--"), wq(":!README.md")],
+        // Finding 10: root pathspec selections and lone `:` pathspec are ancestor selections.
+        vec![w("git"), w("show"), w("HEAD"), w("--"), w(".")],
+        vec![w("git"), w("show"), w("HEAD"), w("--"), w("./")],
+        vec![w("git"), w("show"), w("HEAD"), w("--"), w("src/..")],
+        vec![w("git"), w("show"), w("HEAD"), w("--"), w(":")],
+        vec![w("git"), w("show"), w("HEAD"), w(":")],
+        vec![w("git"), w("show"), w("HEAD"), w("--"), w(":.")],
+        vec![w("git"), w("diff"), w(".")],
+        vec![w("git"), w("log"), w("-p"), w("--"), w(".")],
     ] {
         let (_, res) = git_sel(hit_cmd.clone());
         assert!(
@@ -1104,6 +1150,25 @@ fn git_selection_credentials_cr17_ancestors_magic_and_wildcards() {
             w("--"),
             wq("*.key"),
         ],
+        // Finding 11: `--noglob-pathspecs` makes wildcards literal unless explicit glob magic enables them.
+        vec![
+            w("git"),
+            w("--noglob-pathspecs"),
+            w("status"),
+            w("--"),
+            wq("*.rs"),
+        ],
+        vec![
+            w("git"),
+            w("--noglob-pathspecs"),
+            w("show"),
+            w("HEAD"),
+            w("--"),
+            wq("*.rs"),
+        ],
+        // Revision-object context kept separate from pathspec root-ancestor matching.
+        vec![w("git"), w("show"), w("HEAD:.")],
+        vec![w("git"), w("diff"), w("HEAD..main")],
         vec![w("git"), w("show"), w("HEAD"), w("--"), wq(r"\*.txt")],
     ] {
         let (_, res) = git_sel(clear_cmd.clone());
@@ -1118,6 +1183,14 @@ fn git_selection_credentials_cr17_ancestors_magic_and_wildcards() {
         vec![w("git"), w("show"), w("HEAD"), w("--"), wq(".gem/*")],
         vec![w("git"), w("status"), w("--"), wq("*.key")],
         vec![w("git"), w("ls-files"), wq("*.env")],
+        // Explicit `:(glob)` overrides `--noglob-pathspecs`.
+        vec![
+            w("git"),
+            w("--noglob-pathspecs"),
+            w("status"),
+            w("--"),
+            wq(":(glob)*.rs"),
+        ],
     ] {
         let (_, res) = git_sel(wild_cmd.clone());
         assert!(
@@ -1128,6 +1201,26 @@ fn git_selection_credentials_cr17_ancestors_magic_and_wildcards() {
             "expected GitWildcardPathspec for {wild_cmd:?}, got {res:?}"
         );
     }
+
+    // `--noglob-pathspecs` keeps pathspec exclusion magic (`:!`) as StoreHit
+    // while treating `*` as literal (no GitWildcardPathspec).
+    let (_, noglob_excl) = git_sel(vec![
+        w("git"),
+        w("--noglob-pathspecs"),
+        w("show"),
+        w("HEAD"),
+        w("--"),
+        wq(":!*.rs"),
+    ]);
+    assert!(
+        noglob_excl
+            .iter()
+            .any(|r| matches!(r.outcome, PartOutcome::StoreHit(_)))
+    );
+    assert!(!noglob_excl.iter().any(|r| matches!(
+        r.outcome,
+        PartOutcome::Unread(UnreadReason::GitWildcardPathspec { .. })
+    )));
 
     // `:(glob).gem/*` produces both StoreHit (pathspec magic) and GitWildcardPathspec.
     let (_, glob_magic) = git_sel(vec![
@@ -1191,16 +1284,68 @@ fn classify_unit_and_git_selection_respect_compute_and_alloc_budgets() {
         assert_eq!(err.reason, ExhaustReason::AllocationBudget);
     }
 
-    // `check_git_selection` exhaustion.
+    // `check_git_selection` exhaustion on entry.
     let git_u = unit_strs(&["git", "show", "HEAD", "--", ".gem/credentials"]);
     let mut ok_budget = ComputeBudget::with_default_limits();
     let eff = classify_unit(&git_u, &FoldRules::REV4, &mut ok_budget).unwrap();
 
     let mut tight_compute = ComputeBudget::new(1, 1024 * 1024);
-    let err = check_git_selection(&git_u, &eff, &FoldRules::REV4, &mut tight_compute).unwrap_err();
-    assert_eq!(err.reason, ExhaustReason::ComputeBudget);
+    let out_c = check_git_selection(&git_u, &eff, &FoldRules::REV4, &mut tight_compute);
+    assert_eq!(
+        out_c.exhausted.expect("compute exhausted").reason,
+        ExhaustReason::ComputeBudget
+    );
 
     let mut tight_alloc = ComputeBudget::new(100_000, 1);
-    let err = check_git_selection(&git_u, &eff, &FoldRules::REV4, &mut tight_alloc).unwrap_err();
-    assert_eq!(err.reason, ExhaustReason::AllocationBudget);
+    let out_a = check_git_selection(&git_u, &eff, &FoldRules::REV4, &mut tight_alloc);
+    assert_eq!(
+        out_a.exhausted.expect("alloc exhausted").reason,
+        ExhaustReason::AllocationBudget
+    );
+
+    // Finding 4: `check_git_selection` retains earlier StoreHits when a later
+    // operand exhausts the compute budget (`git show -- ':!x' y`).
+    let git_two = make_unit(vec![w("git"), w("show"), w("--"), wq(":!x"), w("y")]);
+    let mut ok_b2 = ComputeBudget::with_default_limits();
+    let eff2 = classify_unit(&git_two, &FoldRules::REV4, &mut ok_b2).unwrap();
+    let mut saw_partial_hit_with_exhausted = false;
+    for units in 0..=40u64 {
+        let mut b = ComputeBudget::new(units, 1024 * 1024);
+        let out = check_git_selection(&git_two, &eff2, &FoldRules::REV4, &mut b);
+        let has_hit = out
+            .results
+            .iter()
+            .any(|r| matches!(r.outcome, PartOutcome::StoreHit(_)));
+        if has_hit && let Some(ex) = out.exhausted {
+            saw_partial_hit_with_exhausted = true;
+            assert_eq!(ex.reason, ExhaustReason::ComputeBudget);
+        }
+    }
+    assert!(
+        saw_partial_hit_with_exhausted,
+        "expected a budget boundary where StoreHit on ':!x' is retained alongside exhaustion on 'y'"
+    );
+
+    // Finding 12: program pinning charges before every scan and never rescans
+    // a long named script without budget (`python <long_script>`).
+    let long_script = "a".repeat(2048);
+    let py_long = unit_strs(&["python", &long_script]);
+    let mut full_b = ComputeBudget::with_default_limits();
+    let full_eff = classify_unit(&py_long, &FoldRules::REV4, &mut full_b).unwrap();
+    assert!(matches!(
+        full_eff.unread.as_slice(),
+        [UnreadReason::Program { .. }]
+    ));
+    let full_units = crate::policy::limits::COMPUTE_BUDGET_UNITS - full_b.remaining_units();
+    // Every budget strictly below `full_units` must fail with ComputeBudget
+    // (including right after initial validation, before cloning program_words).
+    for probe in [
+        full_units.saturating_sub(1),
+        full_units.saturating_sub(long_script.len() as u64),
+        full_units.saturating_sub(long_script.len() as u64 * 2),
+    ] {
+        let mut b = ComputeBudget::new(probe, 1024 * 1024);
+        let err = classify_unit(&py_long, &FoldRules::REV4, &mut b).unwrap_err();
+        assert_eq!(err.reason, ExhaustReason::ComputeBudget);
+    }
 }
