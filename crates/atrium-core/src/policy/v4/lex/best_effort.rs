@@ -396,10 +396,9 @@ fn clone_vec_string_budgeted(
     v: &[String],
     budget: &mut ComputeBudget,
 ) -> Result<Vec<String>, Exhausted> {
-    let bytes: usize = v
-        .iter()
-        .map(|s| s.len() + std::mem::size_of::<String>())
-        .sum();
+    // Sizing walks the strings once; charge that walk before it runs.
+    budget.charge(v.len() as u64)?;
+    let bytes = argv_copy_cost(v);
     budget.charge(bytes.max(1) as u64)?;
     budget.charge_alloc(bytes)?;
     Ok(v.to_vec())
@@ -1246,14 +1245,22 @@ fn lex_one_text(
         } = match unwrap_best_effort(init, budget) {
             Ok(v) => v,
             Err((partial, e)) => {
-                push_converted(record, b, partial, Vec::new(), depth, derived);
+                // Keep the readings found before exhaustion (review round 4,
+                // finding 1).
+                push_converted(record, b, partial.effective, partial.alt, depth, derived);
                 flush_builders_raw(raw_iter, depth, derived, record);
                 return Err(PartOutcome::Exhausted(e.reason));
             }
         };
 
+        // `find -exec` commands found in this unit's readings. Each one's
+        // record slot (after this unit's and those of the builders still to
+        // convert) is reserved, and its argv copies paid, as it is extracted.
+        let mut find_execs: Vec<Vec<String>> = Vec::new();
+        let find_keep = raw_iter.len() + 1;
+
         // Collect everything derived from this unit's readings.
-        let derived_work = (|| -> Result<(PayloadSet, Vec<Vec<String>>), Exhausted> {
+        let derived_work = (|| -> Result<PayloadSet, Exhausted> {
             // `$(which CMD)` / `$(command -v CMD)` / `$(type -p CMD)` /
             // `$(echo CMD)` command-word substitutions (CR-19 folded).
             resolve_cmd_sub_readings(&eff, &mut all_alt, &mut extra_wrapper_payloads, budget)?;
@@ -1271,14 +1278,18 @@ fn lex_one_text(
             }
 
             // `find -exec` / `-execdir` / `-ok` / `-okdir` sub-commands.
-            let mut find_execs = Vec::new();
             if depth < limits::MAX_DEPTH {
                 for reading in std::iter::once(&eff).chain(all_alt.iter()) {
                     if let Some(f) = reading.first()
                         && fold_str_cr19(f, budget)? == "find"
                     {
-                        let cmds = extract_find_exec_cmds(reading, budget)?;
-                        vec_extend_budgeted(&mut find_execs, cmds, budget)?;
+                        extract_find_exec_cmds(
+                            reading,
+                            find_keep,
+                            &mut find_execs,
+                            record,
+                            budget,
+                        )?;
                     }
                 }
             }
@@ -1293,12 +1304,13 @@ fn lex_one_text(
                 budget,
             )?;
             budget.charge(1)?;
-            Ok((payloads, find_execs))
+            Ok(payloads)
         })();
-        let (payloads, find_execs) = match derived_work {
+        let payloads = match derived_work {
             Ok(v) => v,
             Err(e) => {
                 push_converted(record, b, eff, all_alt, depth, derived);
+                flush_find_execs_raw(find_execs, depth + 1, record);
                 flush_builders_raw(raw_iter, depth, derived, record);
                 return Err(PartOutcome::Exhausted(e.reason));
             }
@@ -1332,6 +1344,7 @@ fn lex_one_text(
         if let Some(pid) = pipeline_id
             && let Err(e) = vec_push_budgeted(&mut pipeline_units, (pid, unit_idx), budget)
         {
+            flush_find_execs_raw(find_execs, depth + 1, record);
             flush_builders_raw(raw_iter, depth, derived, record);
             return Err(PartOutcome::Exhausted(e.reason));
         }
@@ -1531,30 +1544,54 @@ fn resolve_cmd_sub_readings(
         )?;
         let mut replaced = clone_vec_string_budgeted(eff, budget)?;
         replaced[0] = sub_name;
+        let (unwrapped, mut failed) = match unwrap_best_effort(replaced, budget) {
+            Ok(u) => (u, None),
+            Err((partial, e)) => (partial, Some(e)),
+        };
         let BestEffortUnwrap {
             effective: sub_eff,
             alt: sub_alt,
             wrapper_payloads: sub_wp,
-        } = unwrap_best_effort(replaced, budget).map_err(|(_, e)| e)?;
-        vec_extend_budgeted(extra_wrapper_payloads, sub_wp, budget)?;
-        if !sub_eff.is_empty()
-            && all_alt.len() < MAX_ALT_READINGS
-            && !readings_eq(&sub_eff, eff, budget)?
-            && !has_reading(all_alt, &sub_eff, budget)?
-        {
-            push_reserved(all_alt, sub_eff);
-        }
-        for a in sub_alt {
-            if !a.is_empty()
-                && all_alt.len() < MAX_ALT_READINGS
-                && !readings_eq(&a, eff, budget)?
-                && !has_reading(all_alt, &a, budget)?
-            {
-                push_reserved(all_alt, a);
+        } = unwrapped;
+        // Every reading found is kept before anything else can fail. Once the
+        // budget is out, the duplicate checks cannot run, so remaining
+        // readings are kept unchecked (a duplicate reading is harmless; a
+        // dropped one would lose a finished result, review round 4 finding 1).
+        for reading in std::iter::once(sub_eff).chain(sub_alt) {
+            if reading.is_empty() || all_alt.len() >= MAX_ALT_READINGS {
+                continue;
             }
+            if failed.is_none() {
+                let dup = readings_eq(&reading, eff, budget).and_then(|same| {
+                    if same {
+                        Ok(true)
+                    } else {
+                        has_reading(all_alt, &reading, budget)
+                    }
+                });
+                match dup {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => failed = Some(e),
+                }
+            }
+            push_reserved(all_alt, reading);
         }
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        vec_extend_budgeted(extra_wrapper_payloads, sub_wp, budget)?;
     }
     Ok(())
+}
+
+/// Bytes (and compute units) a copy of the argv `v` costs: each string's
+/// bytes plus its `String` header in the copied `Vec`. Walks `v` once;
+/// callers charge `v.len()` before calling.
+fn argv_copy_cost(v: &[String]) -> usize {
+    v.iter()
+        .map(|s| s.len() + std::mem::size_of::<String>())
+        .sum()
 }
 
 /// Distinct non-empty payloads in insertion order, deduplicated through an
@@ -1682,9 +1719,13 @@ fn collect_shell_proc_sub_payloads(
     Ok(())
 }
 
-/// Derives a unit for each `find -exec` command. `keep` record slots stay
-/// free for the builders of the current text not yet converted, so their
-/// recovery never allocates.
+/// Derives a unit for each `find -exec` command. Each command's record slot
+/// and argv copies were reserved and paid when it was extracted
+/// ([`extract_find_exec_cmds`]), and `keep` record slots stay free for the
+/// builders of the current text not yet converted. On exhaustion the
+/// command being derived is recorded with the readings found so far, and
+/// every command not yet derived (nested ones included) is recorded with
+/// its argv as its reading; nothing allocates.
 fn process_find_exec_cmds(
     find_execs: Vec<Vec<String>>,
     exec_depth: u8,
@@ -1697,47 +1738,70 @@ fn process_find_exec_cmds(
     if exec_depth > limits::MAX_DEPTH {
         return Ok(());
     }
-    for cmd_argv in find_execs {
+    let mut cmds = find_execs.into_iter();
+    while let Some(cmd_argv) = cmds.next() {
         if record.units.len() >= limits::MAX_UNITS {
             return Err(PartOutcome::TooLarge(Cap::Units));
         }
-        // Reserve the derived unit's record slot before deriving it.
-        budget
-            .charge(1)
-            .and_then(|()| charge_vec_growth(&mut record.units, 1 + keep, budget))
-            .map_err(ex)?;
-        let init = clone_vec_string_budgeted(&cmd_argv, budget).map_err(ex)?;
-        let BestEffortUnwrap {
-            effective: f_eff,
-            alt: mut f_alt,
-            wrapper_payloads: mut f_wp,
-        } = unwrap_best_effort(init, budget).map_err(|(_, e)| ex(e))?;
-
-        resolve_cmd_sub_readings(&f_eff, &mut f_alt, &mut f_wp, budget).map_err(ex)?;
-
+        // Record slots of the commands after this one, then of the builders.
+        let keep_here = keep + cmds.len();
+        // Paid for when the command was extracted.
+        let init = cmd_argv.clone();
+        let mut f_eff: Vec<String> = Vec::new();
+        let mut f_alt: Vec<Vec<String>> = Vec::new();
         let mut exec_payloads = PayloadSet::default();
-        for p in f_wp {
-            exec_payloads.insert(p, budget).map_err(ex)?;
-        }
-        for reading in std::iter::once(&f_eff).chain(f_alt.iter()) {
-            for p in extract_code_payloads(reading, budget).map_err(ex)? {
-                exec_payloads.insert(p, budget).map_err(ex)?;
-            }
-        }
-        collect_shell_proc_sub_payloads(&f_eff, &f_alt, &cmd_argv, &[], &mut exec_payloads, budget)
-            .map_err(ex)?;
-
         let mut nested_find_execs: Vec<Vec<String>> = Vec::new();
-        if exec_depth < limits::MAX_DEPTH {
+
+        let derivation = (|| -> Result<(), Exhausted> {
+            let BestEffortUnwrap {
+                effective,
+                alt,
+                wrapper_payloads: mut f_wp,
+            } = match unwrap_best_effort(init, budget) {
+                Ok(u) => u,
+                Err((partial, e)) => {
+                    f_eff = partial.effective;
+                    f_alt = partial.alt;
+                    return Err(e);
+                }
+            };
+            f_eff = effective;
+            f_alt = alt;
+            resolve_cmd_sub_readings(&f_eff, &mut f_alt, &mut f_wp, budget)?;
+            for p in f_wp {
+                exec_payloads.insert(p, budget)?;
+            }
             for reading in std::iter::once(&f_eff).chain(f_alt.iter()) {
-                if let Some(f) = reading.first()
-                    && fold_str_cr19(f, budget).map_err(ex)? == "find"
-                {
-                    let cmds = extract_find_exec_cmds(reading, budget).map_err(ex)?;
-                    vec_extend_budgeted(&mut nested_find_execs, cmds, budget).map_err(ex)?;
+                for p in extract_code_payloads(reading, budget)? {
+                    exec_payloads.insert(p, budget)?;
                 }
             }
-        }
+            collect_shell_proc_sub_payloads(
+                &f_eff,
+                &f_alt,
+                &cmd_argv,
+                &[],
+                &mut exec_payloads,
+                budget,
+            )?;
+            if exec_depth < limits::MAX_DEPTH {
+                for reading in std::iter::once(&f_eff).chain(f_alt.iter()) {
+                    if let Some(f) = reading.first()
+                        && fold_str_cr19(f, budget)? == "find"
+                    {
+                        // This unit's slot is still free: count it.
+                        extract_find_exec_cmds(
+                            reading,
+                            keep_here + 1,
+                            &mut nested_find_execs,
+                            record,
+                            budget,
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        })();
 
         let idx = record.units.len();
         push_reserved(
@@ -1755,24 +1819,70 @@ fn process_find_exec_cmds(
                 derived: true,
             },
         );
+        if let Err(e) = derivation {
+            flush_find_execs_raw(nested_find_execs, exec_depth + 1, record);
+            flush_find_execs_raw(cmds, exec_depth, record);
+            return Err(ex(e));
+        }
 
         if exec_depth < limits::MAX_DEPTH {
             for p in exec_payloads.into_vec() {
-                vec_push_budgeted(deferred_payloads, (exec_depth + 1, p), budget).map_err(ex)?;
+                if let Err(e) = vec_push_budgeted(deferred_payloads, (exec_depth + 1, p), budget) {
+                    flush_find_execs_raw(nested_find_execs, exec_depth + 1, record);
+                    flush_find_execs_raw(cmds, exec_depth, record);
+                    return Err(ex(e));
+                }
             }
-            if !nested_find_execs.is_empty() {
-                process_find_exec_cmds(
+            if !nested_find_execs.is_empty()
+                && let Err(err) = process_find_exec_cmds(
                     nested_find_execs,
                     exec_depth + 1,
-                    keep,
+                    keep_here,
                     record,
                     deferred_payloads,
                     budget,
-                )?;
+                )
+            {
+                if matches!(err, PartOutcome::Exhausted(_)) {
+                    flush_find_execs_raw(cmds, exec_depth, record);
+                }
+                return Err(err);
             }
         }
     }
     Ok(())
+}
+
+/// Records `find -exec` commands not yet derived, after exhaustion, into the
+/// record slots reserved when they were extracted. Their effective reading
+/// is a copy of their argv, paid for at extraction.
+fn flush_find_execs_raw(
+    cmds: impl IntoIterator<Item = Vec<String>>,
+    depth: u8,
+    record: &mut BestEffortRecord,
+) {
+    for cmd_argv in cmds {
+        if record.units.len() >= limits::MAX_UNITS {
+            break;
+        }
+        let index = record.units.len();
+        let effective_argv = cmd_argv.clone();
+        push_reserved(
+            &mut record.units,
+            BestEffortUnit {
+                index,
+                raw_argv: cmd_argv,
+                effective_argv,
+                alt_argv: Vec::new(),
+                assignments: Vec::new(),
+                redirects: Vec::new(),
+                pipeline_id: None,
+                piped: false,
+                depth,
+                derived: true,
+            },
+        );
+    }
 }
 
 /// Stores builders not yet converted, after exhaustion, into record slots
@@ -2023,25 +2133,33 @@ fn substituted_program_budgeted(
 
 /// Tolerantly strips reserved words and wrappers (CR-19 folded) up to
 /// `MAX_BEST_EFFORT_WRAP` steps, returning `(effective_argv, alt_argv)`.
-struct BestEffortUnwrap {
-    effective: Vec<String>,
-    alt: Vec<Vec<String>>,
-    wrapper_payloads: Vec<String>,
+pub(super) struct BestEffortUnwrap {
+    pub(super) effective: Vec<String>,
+    pub(super) alt: Vec<Vec<String>>,
+    pub(super) wrapper_payloads: Vec<String>,
 }
 
 /// Unwraps `cur` (an owned copy of the argv, already charged by the caller).
 ///
-/// The words stripped are dropped once, at the end, with one shift of the
-/// argv charged by its length, instead of one shift per wrapper. On
-/// exhaustion the argv is handed back unshifted, so the caller can still
-/// record it as the unit's effective reading.
-fn unwrap_best_effort(
+/// The one shift that drops the stripped words is paid for on entry, so the
+/// effective reading and every alternative reading found before exhaustion
+/// are handed back whole on `Err` (review round 4, finding 1).
+pub(super) fn unwrap_best_effort(
     mut cur: Vec<String>,
     budget: &mut ComputeBudget,
-) -> Result<BestEffortUnwrap, (Vec<String>, Exhausted)> {
+) -> Result<BestEffortUnwrap, (BestEffortUnwrap, Exhausted)> {
     let mut alts: Vec<Vec<String>> = Vec::new();
     let mut wrapper_payloads: Vec<String> = Vec::new();
     let mut start = 0usize;
+
+    if let Err(e) = budget.charge(cur.len() as u64) {
+        let unchanged = BestEffortUnwrap {
+            effective: cur,
+            alt: alts,
+            wrapper_payloads,
+        };
+        return Err((unchanged, e));
+    }
 
     let scan = (|| -> Result<(), Exhausted> {
         for _ in 0..MAX_BEST_EFFORT_WRAP {
@@ -2087,8 +2205,17 @@ fn unwrap_best_effort(
                 // Reserve the reading's slot before deriving it.
                 charge_vec_growth(&mut alts, 1, budget)?;
                 let alt_slice = clone_vec_string_budgeted(&rest[alt_skip..], budget)?;
-                if !alt_slice.is_empty() && !has_reading(&alts, &alt_slice, budget)? {
-                    push_reserved(&mut alts, alt_slice);
+                if !alt_slice.is_empty() {
+                    match has_reading(&alts, &alt_slice, budget) {
+                        Ok(true) => {}
+                        Ok(false) => push_reserved(&mut alts, alt_slice),
+                        Err(e) => {
+                            // The reading is finished; keep it even though
+                            // the duplicate check could not run.
+                            push_reserved(&mut alts, alt_slice);
+                            return Err(e);
+                        }
+                    }
                 }
             }
             if skip == 0 || skip > rest.len() {
@@ -2096,21 +2223,19 @@ fn unwrap_best_effort(
             }
             start += skip;
         }
-        if start > 0 {
-            budget.charge(cur.len() as u64)?;
-        }
         Ok(())
     })();
-    if let Err(e) = scan {
-        return Err((cur, e));
-    }
+    // Paid for on entry.
     cur.drain(..start);
-
-    Ok(BestEffortUnwrap {
+    let out = BestEffortUnwrap {
         effective: cur,
         alt: alts,
         wrapper_payloads,
-    })
+    };
+    match scan {
+        Ok(()) => Ok(out),
+        Err(e) => Err((out, e)),
+    }
 }
 
 /// Returns `Ok(Some((primary_skip, optional_alt_skip)))` for a recognized
@@ -2475,6 +2600,8 @@ fn extract_code_payloads(
             _ => &eff[1..],
         };
         if !args.is_empty() {
+            // Sizing walks the arguments; charge the walk before it runs.
+            budget.charge(args.len() as u64)?;
             let total_len: usize = args.iter().map(|s| s.len() + 1).sum();
             budget.charge(total_len as u64)?;
             budget.charge_alloc(total_len)?;
@@ -2597,37 +2724,77 @@ fn extract_script_flock_payloads(
     Ok(out)
 }
 
-/// Scan 5: `find -exec` / `-execdir` / `-ok` / `-okdir` sub-commands.
+/// Scan 5: `find -exec` / `-execdir` / `-ok` / `-okdir` sub-commands, appended
+/// to `out`.
+///
+/// Each command is a derived unit, so its storage is reserved before the
+/// command is found: its slot in `out`, and its record slot after `keep`
+/// slots for units recorded before it. While the scan passes each word of
+/// the command it pays for the word's two copies: the command's argv, and
+/// the effective reading made later by derivation or recovery. Storing a
+/// found command is then infallible.
 fn extract_find_exec_cmds(
     eff: &[String],
+    keep: usize,
+    out: &mut Vec<Vec<String>>,
+    record: &mut BestEffortRecord,
     budget: &mut ComputeBudget,
-) -> Result<Vec<Vec<String>>, Exhausted> {
-    let mut out = Vec::new();
+) -> Result<(), Exhausted> {
     let mut j = 1usize;
     while j < eff.len() {
         budget.charge(1)?;
         if matches!(eff[j].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
             j += 1;
+            charge_vec_growth(out, 1, budget)?;
+            charge_vec_growth(&mut record.units, keep + out.len() + 1, budget)?;
             let start = j;
             while j < eff.len() && !matches!(eff[j].as_str(), ";" | "+") {
-                budget.charge(1)?;
+                let copy = eff[j].len() + std::mem::size_of::<String>();
+                budget.charge(1 + 2 * copy as u64)?;
+                budget.charge_alloc(2 * copy)?;
                 j += 1;
             }
             if j > start {
-                let cmd = clone_vec_string_budgeted(&eff[start..j], budget)?;
-                vec_push_budgeted(&mut out, cmd, budget)?;
+                push_reserved(out, eff[start..j].to_vec());
             }
         }
         j += 1;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Scan 7 helper: extract command column from crontab lines.
-fn crontab_commands_budgeted(text: &str, budget: &mut ComputeBudget) -> Result<String, Exhausted> {
+///
+/// Lines are found with a byte scan charged one unit before each byte is
+/// examined (review round 4, finding 2), split like `str::lines` (`\n`, an
+/// optional `\r` before it). Each line's field parsing (`trim_start` and
+/// `split_once`, which together examine each byte at most twice) is charged
+/// before it runs, and the copy of the command is charged by its pushes.
+pub(super) fn crontab_commands_budgeted(
+    text: &str,
+    budget: &mut ComputeBudget,
+) -> Result<String, Exhausted> {
+    let bytes = text.as_bytes();
     let mut out = String::new();
-    for line in text.lines() {
-        budget.charge(3 * line.len() as u64 + 1)?;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() {
+            budget.charge(1)?;
+            if bytes[i] == b'\n' {
+                break;
+            }
+            i += 1;
+        }
+        let mut line = &text[start..i];
+        if i < bytes.len() {
+            i += 1;
+        }
+        if let Some(stripped) = line.strip_suffix('\r') {
+            line = stripped;
+        }
+
+        budget.charge(2 * line.len() as u64 + 1)?;
         let t = line.trim_start();
         if t.is_empty() || t.starts_with('#') {
             continue;
@@ -2682,6 +2849,7 @@ fn extract_echo_printf_texts(
                 }
             }
             if j < eff.len() {
+                budget.charge((eff.len() - j) as u64)?;
                 let total_len: usize = eff[j..].iter().map(|s| s.len() + 1).sum();
                 budget.charge(total_len as u64)?;
                 budget.charge_alloc(total_len)?;
@@ -2785,6 +2953,8 @@ pub(crate) fn brace_expand_budgeted(
                             continue;
                         }
                         let inner_slice = &cs[open + 1..i];
+                        // Sizing walks the slice; charge the walk before it runs.
+                        budget.charge(inner_slice.len().max(1) as u64)?;
                         let inner_bytes: usize = inner_slice.iter().map(|ch| ch.len_utf8()).sum();
                         budget.charge(inner_bytes.max(1) as u64)?;
                         budget.charge_alloc(inner_bytes)?;
@@ -2820,6 +2990,7 @@ pub(crate) fn brace_expand_budgeted(
                         let mut v = vec_with_capacity_budgeted(bounds.len() - 1, budget)?;
                         for k in 0..bounds.len() - 1 {
                             let slice = &cs[bounds[k] + 1..bounds[k + 1]];
+                            budget.charge(slice.len().max(1) as u64)?;
                             let byte_len: usize = slice.iter().map(|ch| ch.len_utf8()).sum();
                             budget.charge(byte_len.max(1) as u64)?;
                             budget.charge_alloc(byte_len)?;
@@ -2837,6 +3008,8 @@ pub(crate) fn brace_expand_budgeted(
                 }
                 let pre_slice = &cs[..open];
                 let post_slice = &cs[close + 1..];
+                // Sizing walks both slices; charge the walk before it runs.
+                budget.charge((pre_slice.len() + post_slice.len()).max(1) as u64)?;
                 let pre_bytes: usize = pre_slice.iter().map(|ch| ch.len_utf8()).sum();
                 let post_bytes: usize = post_slice.iter().map(|ch| ch.len_utf8()).sum();
                 budget.charge((pre_bytes + post_bytes).max(1) as u64)?;
