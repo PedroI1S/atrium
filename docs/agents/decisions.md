@@ -912,3 +912,9 @@ That never allows more than `dev` does, and it removes per-tool semantics as a s
 
 ## D-143 — 2026-11-23 — rodrigo: P1 escalates to Opus 5.5
 **Decided by rodrigo (driver), on the orchestrator's recommendation.** P1 (M1-37) had two Neon rework rounds, and its reviews found 9, then 6, then 3 findings (`reviews/M1-37-rev4-p1-command-model.md`, `-round2.md`, `-round3.md`). The 3 left are majors and all one class, §8 budgets: work or allocation done before it is charged. Under PLAN §8.3 and §8.4, round 5 is written by **Opus 5.5**, as a Claude subagent in P1's worktree, with the same brief, the handoff and the three reviews. It must audit the whole class, so every scan, copy and allocation is charged before it happens. Codex GPT-6.1 Sol stays the reviewer.
+
+## D-144 — 2026-11-23 — rodrigo: CR-P2-2 amends P0 again (identity gaps)
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P2's round 3 (Opus 5.5, D-142) filed change request CR-P2-2, and the driver accepted it. When the protected-set builder's identity collection stops early (a walk cap of 4,096 entries or 16 levels, an unreadable folder, a filesystem cap), a target the gap can affect must be Unread, never Clear (§2, §5). The frozen `ProtectedSet` can't carry that, so the pure `check_target` and the checks inside a recursive walk can't see it. Two cases fail until the field exists.
+- **P0 (M1-36) round 7** adds `ProtectedSet::identity_gaps: Vec<IdentityGap>` to `policy/model.rs`. It also moves in `IdentityGap { reason, scope, write_only }` and `GapScope { HardLinks, Through(FileIdentity), AnyTarget }` as P2 defined them. A Codex review and the verification follow.
+- **P2** then drops its `ProtectedSetBuild` workaround and applies the gaps inside `check_target`. P1 is rebased onto the new tip.
+- P0's merge still needs rodrigo's go (D-138).
