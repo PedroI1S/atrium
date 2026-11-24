@@ -45,7 +45,7 @@ fn push_checked(
     outcomes: &mut Vec<PartResult>,
 ) -> Result<(), Exhausted> {
     push_target_records(
-        target, protected, resolver, caps, budget, aliases, outcomes, false,
+        target, protected, resolver, caps, budget, aliases, outcomes, true,
     )
 }
 
@@ -1387,7 +1387,8 @@ fn check_selector_probes(
     outcomes: &mut Vec<PartResult>,
 ) -> Result<(), Exhausted> {
     let est_len = base.len().max(protected.home.len()) + glob.len() + 2;
-    budget.charge(est_len as u64)?;
+    // Both copies (the joined and the normalized path) are charged.
+    budget.charge((est_len as u64).saturating_mul(2))?;
     budget.charge_alloc(
         est_len.saturating_mul(2) + (est_len / 2 + 1) * std::mem::size_of::<&[u8]>(),
     )?;

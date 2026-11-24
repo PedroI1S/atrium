@@ -17,9 +17,9 @@ use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl};
 use crate::policy::v4::paths::sensitive::{
     ASK_FILES, ASK_NAME_PREFIXES, ASK_TREES, BROWSER_FILES, BROWSER_ROOTS, CRED_FILES, CRED_TREES,
-    RootAliases, SharedSensitive, alias_name_hit, check_target_all, fold_listed_component,
-    fold_path_listed, join_folded, origin_to_part, push_charged, push_target_records, under_bytes,
-    under_str,
+    RootAliases, SharedSensitive, alias_name_hit, check_target_into, extend_charged,
+    fold_listed_component, fold_path_listed, join_folded, origin_to_part, push_charged,
+    push_target_records, under_bytes, under_str,
 };
 
 fn finish_recursive_exhausted(
@@ -74,7 +74,7 @@ pub(crate) fn check_recursive_root_impl(
         budget,
         aliases,
         &mut result.outcomes,
-        true,
+        false,
     ) {
         return finish_recursive_exhausted(result, root_part, e);
     }
@@ -1432,11 +1432,13 @@ pub(crate) fn check_filter_on_root(
                     // finding 6).
                     let mut resolved = resolved;
                     if let Some((w, _)) = written_root {
-                        budget.charge_alloc(w.len() + 1 + entry_rel.len())?;
+                        let copied = w.len() + 1 + entry_rel.len();
+                        budget.charge(copied as u64)?;
+                        budget.charge_alloc(copied)?;
                         resolved.written = Some(join_bytes(w, &entry_rel));
                     }
                     push_target_records(
-                        &resolved, protected, resolver, caps, budget, aliases, outcomes, true,
+                        &resolved, protected, resolver, caps, budget, aliases, outcomes, false,
                     )?;
                 }
                 Ok(false) => {}
@@ -1889,71 +1891,26 @@ fn walk_followed_links(
                     {
                         *multiply_linked_file = true;
                     }
-
                     // The link's records: its target's check (written and canonical
                     // names, identities, gaps), `dev`'s alias rule, and `dev`'s
-                    // `links_below` rule: a link whose real path is in, is, or holds
-                    // a canonical protected root reaches it (review 5, finding 2).
-                    // Under a filter a hit is an over-approximation: Unread.
-                    let mut records = check_target_all(&target, protected, budget)?;
-                    if let Some(hit) =
-                        alias_name_hit(&target, protected, resolver, caps, budget, aliases)?
-                    {
-                        push_charged(&mut records, hit, budget)?;
-                    }
-                    if let TargetResolution::Resolved { canonical, .. } = &target.resolution {
-                        let is_dir = match resolver.stat(canonical, caps, budget) {
-                            Ok(md) => md.file_type == FileType::Dir,
-                            Err(ResolveError::Exhausted(e)) => return Err(e),
-                            Err(_) => false,
-                        };
-                        let roots = aliases.roots(protected, resolver, caps, budget)?;
-                        if let Some(root) = RootAliases::reached(roots, canonical, is_dir, budget)?
-                        {
-                            let hit = root.hit(part, budget)?;
-                            push_charged(&mut records, hit, budget)?;
-                        }
-                    }
-                    let mut under_filter_recorded = false;
-                    for r in records {
-                        match r.outcome {
-                            PartOutcome::HardDenyHit(_) | PartOutcome::StoreHit(_)
-                                if has_filter =>
-                            {
-                                if !under_filter_recorded {
-                                    under_filter_recorded = true;
-                                    budget.charge_alloc(child.len())?;
-                                    push_charged(
-                                        outcomes,
-                                        PartResult {
-                                            part: part.clone(),
-                                            outcome: PartOutcome::Unread(
-                                                UnreadReason::FollowedLinkUnderFilter {
-                                                    path: child.clone(),
-                                                },
-                                            ),
-                                        },
-                                        budget,
-                                    )?;
-                                }
-                            }
-                            PartOutcome::HardDenyHit(_)
-                            | PartOutcome::StoreHit(_)
-                            | PartOutcome::Unread(_) => {
-                                push_charged(
-                                    outcomes,
-                                    PartResult {
-                                        part: part.clone(),
-                                        outcome: r.outcome,
-                                    },
-                                    budget,
-                                )?;
-                            }
-                            PartOutcome::Clear
-                            | PartOutcome::Exhausted(_)
-                            | PartOutcome::TooLarge(_) => {}
-                        }
-                    }
+                    // `links_below` rule (review 5, finding 2). Every record is
+                    // emitted even when a later step exhausts the budget (§1, §8;
+                    // review 6, finding 1).
+                    let mut records: Vec<PartResult> = Vec::new();
+                    let collected = followed_link_records(
+                        &target,
+                        part,
+                        protected,
+                        resolver,
+                        caps,
+                        budget,
+                        aliases,
+                        &mut records,
+                    );
+                    emit_followed_link_records(
+                        records, &child, part, has_filter, budget, outcomes,
+                    )?;
+                    collected?;
 
                     if let TargetResolution::Resolved {
                         canonical,
@@ -1965,7 +1922,7 @@ fn walk_followed_links(
                         // (e.g. `proj/link_aws -> ~/.aws` with `~/.aws/credentials` present).
                         let folded = fold_path_listed(&canonical, protected.folds, budget)?;
                         let mut link_s8_outcomes = Vec::new();
-                        let s8 = check_s8_protected_root(
+                        let s8 = match check_s8_protected_root(
                             &canonical,
                             &folded,
                             part,
@@ -1975,7 +1932,22 @@ fn walk_followed_links(
                             caps,
                             budget,
                             &mut link_s8_outcomes,
-                        )?;
+                        ) {
+                            Ok(s8) => s8,
+                            // The records established before the exhaustion are
+                            // kept (§1, §8; review 6, finding 1's class).
+                            Err(e) => {
+                                emit_followed_link_records(
+                                    link_s8_outcomes,
+                                    &canonical,
+                                    part,
+                                    has_filter,
+                                    budget,
+                                    outcomes,
+                                )?;
+                                return Err(e);
+                            }
+                        };
                         if s8 {
                             if has_filter {
                                 budget.charge_alloc(canonical.len())?;
@@ -1992,11 +1964,11 @@ fn walk_followed_links(
                                     budget,
                                 )?;
                             } else {
-                                outcomes.extend(link_s8_outcomes);
+                                extend_charged(outcomes, link_s8_outcomes, budget)?;
                             }
                         } else {
                             // Preserve any I/O or walk-cap Unreads observed while checking the linked root.
-                            outcomes.extend(link_s8_outcomes);
+                            extend_charged(outcomes, link_s8_outcomes, budget)?;
                             if let Some(family) =
                                 root_contains_store_or_exempt_sensitive(&folded, shared)
                             {
@@ -2118,6 +2090,93 @@ fn walk_followed_links(
     }
 
     Ok(())
+}
+
+/// The records of a followed link's target: [`check_target_into`] (written and
+/// canonical names, identities, gaps), `dev`'s alias rule ([`alias_name_hit`])
+/// and `dev`'s `links_below` rule: a link whose real path is in, is, or holds
+/// a canonical protected root reaches it. Each record is appended to `out` as
+/// soon as it is established.
+#[allow(clippy::too_many_arguments)]
+fn followed_link_records(
+    target: &Target,
+    part: &PartId,
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    aliases: &mut RootAliases,
+    out: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
+    check_target_into(target, protected, budget, out, false)?;
+    if let Some(hit) = alias_name_hit(target, protected, resolver, caps, budget, aliases)? {
+        push_charged(out, hit, budget)?;
+    }
+    if let TargetResolution::Resolved { canonical, .. } = &target.resolution {
+        // When the type cannot be read, "not a folder" is the stricter
+        // answer: the root's own path then counts as reached.
+        let is_dir = match resolver.stat(canonical, caps, budget) {
+            Ok(md) => md.file_type == FileType::Dir,
+            Err(ResolveError::Exhausted(e)) => return Err(e),
+            Err(_) => false,
+        };
+        let roots = aliases.roots(protected, resolver, caps, budget)?;
+        if let Some(root) = RootAliases::reached(roots, canonical, is_dir, budget)? {
+            let hit = root.hit(part, budget)?;
+            push_charged(out, hit, budget)?;
+        }
+    }
+    Ok(())
+}
+
+/// Emits a followed link's records into `outcomes`: under a filter a hit is
+/// an over-approximation and becomes one `FollowedLinkUnderFilter` Unread;
+/// every Unread is kept. Records are pushed before their storage charge is
+/// propagated, so none is lost to exhaustion.
+fn emit_followed_link_records(
+    records: Vec<PartResult>,
+    child: &[u8],
+    part: &PartId,
+    has_filter: bool,
+    budget: &mut ComputeBudget,
+    outcomes: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
+    let mut under_filter_recorded = false;
+    let mut first_err = None;
+    for r in records {
+        let outcome = match r.outcome {
+            PartOutcome::HardDenyHit(_) | PartOutcome::StoreHit(_) if has_filter => {
+                if under_filter_recorded {
+                    continue;
+                }
+                under_filter_recorded = true;
+                if let Err(e) = budget.charge_alloc(child.len()) {
+                    first_err.get_or_insert(e);
+                }
+                PartOutcome::Unread(UnreadReason::FollowedLinkUnderFilter {
+                    path: child.to_vec(),
+                })
+            }
+            o @ (PartOutcome::HardDenyHit(_)
+            | PartOutcome::StoreHit(_)
+            | PartOutcome::Unread(_)) => o,
+            PartOutcome::Clear | PartOutcome::Exhausted(_) | PartOutcome::TooLarge(_) => continue,
+        };
+        if let Err(e) = push_charged(
+            outcomes,
+            PartResult {
+                part: part.clone(),
+                outcome,
+            },
+            budget,
+        ) {
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------

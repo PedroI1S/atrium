@@ -205,8 +205,11 @@ pub(crate) fn word_entry_path(
     if raw.is_empty() || raw.contains(&0) {
         return Ok(None);
     }
-    budget.charge(raw.len() as u64 + 1)?;
-    budget.charge_alloc(raw.len() + cwd.len().max(home.len()) + 2)?;
+    // The copied spelling (the base plus the word) is charged before it is
+    // built (review 6, finding 5's class).
+    let copied = raw.len() + cwd.len().max(home.len()) + 2;
+    budget.charge(copied as u64)?;
+    budget.charge_alloc(copied)?;
     let path = if word.starts_with_unquoted_tilde() {
         if raw == b"~" {
             home.to_vec()

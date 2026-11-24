@@ -906,6 +906,7 @@ pub(crate) fn expand_shell_glob_written(
                 .filter(|c| !c.is_empty())
                 .skip(cwd_comps)
                 .collect();
+            budget.charge(matched.len() as u64 + 1)?;
             budget.charge_alloc(matched.len() + rest.len() * std::mem::size_of::<&[u8]>())?;
             let rel = rest.join(&b'/');
             lexical_spelling(&rel, written_cwd, home, budget)?

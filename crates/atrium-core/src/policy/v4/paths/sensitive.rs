@@ -761,6 +761,7 @@ impl ChargedRecord for PartResult {
             self.outcome,
             PartOutcome::HardDenyHit(_)
                 | PartOutcome::StoreHit(_)
+                | PartOutcome::Unread(_)
                 | PartOutcome::Exhausted(_)
                 | PartOutcome::TooLarge(_)
         )
@@ -1399,14 +1400,24 @@ fn unread_reason_alloc_bytes(reason: &UnreadReason) -> usize {
 }
 
 /// `check_target` (§5, D-144, D-147, D-149): every record of the target (see
-/// [`check_target_all`]) reduced to one, the strictest: a hard-deny hit, else
-/// a reason for doubt (Unread), else the Store hit or Clear.
+/// [`check_target_into`]) reduced to one, the strictest: a hard-deny hit, else
+/// a reason for doubt (Unread), else the Store hit or Clear. A hard-deny hit
+/// established before the budget ran out stands (§1, §8).
 pub(crate) fn check_target_impl(
     target: &Target,
     protected: &ProtectedSet,
     budget: &mut ComputeBudget,
 ) -> Result<PartResult, Exhausted> {
-    let records = check_target_all(target, protected, budget)?;
+    let mut records: Vec<PartResult> = Vec::new();
+    if let Err(e) = check_target_into(target, protected, budget, &mut records, true) {
+        return match records
+            .into_iter()
+            .find(|r| matches!(r.outcome, PartOutcome::HardDenyHit(_)))
+        {
+            Some(hit) => Ok(hit),
+            None => Err(e),
+        };
+    }
     let pick = records
         .iter()
         .position(|r| matches!(r.outcome, PartOutcome::HardDenyHit(_)))
@@ -1419,26 +1430,31 @@ pub(crate) fn check_target_impl(
     Ok(records
         .into_iter()
         .nth(pick)
-        .expect("check_target_all returns at least one record"))
+        .expect("check_target_into records at least one outcome"))
 }
 
-/// Every record of `target` (§1 keeps every hit and every reason for doubt):
+/// Appends every record of `target` to `out` (§1 keeps every hit and every
+/// reason for doubt), each as soon as it is established, so a later
+/// exhaustion never loses it (§8; review 6, finding 1):
 /// - the protected names on its written spelling (`Target::written`, D-147,
-///   D-149), checked first, so an early return (an Unread resolution) keeps
-///   the hit beside its reason;
+///   D-149), checked first, so an Unread resolution keeps the hit beside its
+///   reason;
 /// - the exact check of the canonical path (identities, listed folds,
 ///   unlisted equivalences);
 /// - the unlisted equivalences (NFC/NFD, unlisted case folds) of the written
 ///   spelling, when nothing else matched (§11 item 13);
 /// - the identity gap that applies, beside a Clear or Store-hit outcome.
 ///
-/// A hard-deny hit ends the list. Variant-only matches are never hits, so
-/// their written spelling is not checked.
-pub(crate) fn check_target_all(
+/// A hard-deny hit ends the list. A Clear outcome is recorded only when
+/// `keep_clear`. Variant-only matches are never hits, so their written
+/// spelling is not checked.
+pub(crate) fn check_target_into(
     target: &Target,
     protected: &ProtectedSet,
     budget: &mut ComputeBudget,
-) -> Result<Vec<PartResult>, Exhausted> {
+    out: &mut Vec<PartResult>,
+    keep_clear: bool,
+) -> Result<(), Exhausted> {
     let part = origin_to_part(&target.origin);
     let variant_only = matches!(
         target.origin,
@@ -1452,86 +1468,89 @@ pub(crate) fn check_target_all(
     } else {
         target.written.as_deref()
     };
-    budget.charge_alloc(3 * std::mem::size_of::<PartResult>())?;
-    let mut out: Vec<PartResult> = Vec::with_capacity(3);
+    let start = out.len();
 
-    let written_hit = match written {
-        Some(w) => written_name_hit(w, target.access, &part, protected, budget)?,
-        None => None,
-    };
+    let mut written_store = false;
+    if let Some(w) = written
+        && let Some(hit) = written_name_hit(w, target.access, &part, protected, budget)?
+    {
+        let hard = matches!(hit.outcome, PartOutcome::HardDenyHit(_));
+        written_store = !hard;
+        push_charged(out, hit, budget)?;
+        if hard {
+            return Ok(());
+        }
+    }
     let canonical = match &target.resolution {
         TargetResolution::Unread(_) => {
-            out.extend(written_hit);
-            out.push(check_target_exact(target, protected, budget)?);
-            return Ok(out);
+            let exact = check_target_exact(target, protected, budget)?;
+            return push_charged(out, exact, budget);
         }
         TargetResolution::Resolved { canonical, .. } => canonical,
     };
 
     let exact = check_target_exact(target, protected, budget)?;
-    if matches!(exact.outcome, PartOutcome::HardDenyHit(_)) {
-        out.push(exact);
-        return Ok(out);
-    }
-    if let Some(hit) = written_hit {
-        match hit.outcome {
-            PartOutcome::HardDenyHit(_) => {
-                out.push(hit);
-                return Ok(out);
+    match exact.outcome {
+        PartOutcome::HardDenyHit(_) | PartOutcome::Unread(_) => {
+            let hard = matches!(exact.outcome, PartOutcome::HardDenyHit(_));
+            push_charged(out, exact, budget)?;
+            if hard {
+                return Ok(());
             }
-            _ => {
-                // A Store hit by the written name: it replaces a Clear exact
-                // outcome, and is kept beside a reason for doubt.
-                if matches!(exact.outcome, PartOutcome::Clear) {
-                    out.push(hit);
-                } else {
-                    if matches!(exact.outcome, PartOutcome::Unread(_)) {
-                        out.push(hit);
-                    }
-                    out.push(exact);
+        }
+        PartOutcome::StoreHit(_) if !written_store => push_charged(out, exact, budget)?,
+        PartOutcome::Clear if !written_store => {
+            // The written spelling's unlisted equivalences, when nothing
+            // matched (§11 item 13).
+            let mut record = exact;
+            if let Some(w) = written
+                && w != canonical.as_slice()
+            {
+                let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
+                if shared.matches_unlisted_equivalence(w, target.access, budget)? {
+                    budget.charge_alloc(w.len())?;
+                    record = PartResult {
+                        part: part.clone(),
+                        outcome: PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence {
+                            path: w.to_vec(),
+                        }),
+                    };
                 }
             }
+            if keep_clear || !matches!(record.outcome, PartOutcome::Clear) {
+                push_charged(out, record, budget)?;
+            }
         }
-    } else {
-        out.push(exact);
-    }
-
-    // The written spelling's unlisted equivalences, when nothing matched.
-    if let Some(w) = written
-        && w != canonical.as_slice()
-        && out.len() == 1
-        && matches!(out[0].outcome, PartOutcome::Clear)
-    {
-        let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
-        if shared.matches_unlisted_equivalence(w, target.access, budget)? {
-            budget.charge_alloc(w.len())?;
-            out[0] = PartResult {
-                part: part.clone(),
-                outcome: PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence {
-                    path: w.to_vec(),
-                }),
-            };
-        }
+        _ => {}
     }
 
     // The identity gap that applies, beside a Clear or Store-hit outcome.
-    if out
+    if out[start..]
         .iter()
         .all(|r| matches!(r.outcome, PartOutcome::Clear | PartOutcome::StoreHit(_)))
         && let Some(gap) = applicable_gap(target, protected, budget)?
     {
         budget.charge_alloc(unread_reason_alloc_bytes(&gap.reason))?;
-        out.push(PartResult {
-            part,
-            outcome: PartOutcome::Unread(gap.reason.clone()),
-        });
+        push_charged(
+            out,
+            PartResult {
+                part,
+                outcome: PartOutcome::Unread(gap.reason.clone()),
+            },
+            budget,
+        )?;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// A protected root before canonicalization: spelling, hard-deny id, store
-/// family, read, held.
-type SpelledRoot = (Vec<u8>, Option<&'static str>, &'static str, bool, bool);
+/// family, (read, held, wholesale).
+type SpelledRoot = (
+    Vec<u8>,
+    Option<&'static str>,
+    &'static str,
+    (bool, bool, bool),
+);
 
 /// A protected root as `dev`'s `sensitive_roots` (and its store roots) lists
 /// it, with its canonical path (`dev` canonicalizes its roots).
@@ -1547,6 +1566,13 @@ pub(crate) struct ProtectedRoot {
     /// A recursive reader given a folder that holds the root reaches it
     /// (credential roots, as `dev`'s `Tree::held`).
     held: bool,
+    /// The root itself is protected (`dev`'s `sensitive_roots` and
+    /// `ask_roots`). False for the folder that holds name-prefixed store
+    /// entries (`~/.azure` for MSAL): `dev`'s `ask_roots` lists those
+    /// entries, not the folder, so it serves only to spell the entries
+    /// below it (`alias_fix`) and is never reached wholesale (review 6,
+    /// finding 4).
+    wholesale: bool,
 }
 
 /// The canonical paths of the protected roots, built once per call through
@@ -1557,9 +1583,15 @@ pub(crate) struct ProtectedRoot {
 ///   do not exist yet;
 /// - `links_below` / `in_trees`: a followed link whose real path is in, is,
 ///   or holds a protected root reaches it.
+///
+/// A root whose canonical path cannot be established for a reason other than
+/// absence (a cap reached, an I/O failure) makes the table incomplete: its
+/// first reason is kept, and every check that finds no alias reports it as
+/// Unread instead of Clear (review 6, finding 2; §8).
 #[derive(Default)]
 pub(crate) struct RootAliases {
     roots: Option<Vec<ProtectedRoot>>,
+    incomplete: Option<UnreadReason>,
 }
 
 impl RootAliases {
@@ -1592,11 +1624,10 @@ impl RootAliases {
             let mut add = |p: Vec<u8>,
                            id: Option<&'static str>,
                            family: &'static str,
-                           read: bool,
-                           held: bool,
+                           flags: (bool, bool, bool),
                            budget: &mut ComputeBudget|
              -> Result<(), Exhausted> {
-                push_charged(&mut spelled, (p, id, family, read, held), budget)
+                push_charged(&mut spelled, (p, id, family, flags), budget)
             };
             let cred = Some("credential-read");
             for rel in std::iter::once(".ssh")
@@ -1608,40 +1639,68 @@ impl RootAliases {
                     join_folded(home, rel.as_bytes()),
                     cred,
                     "",
-                    true,
-                    true,
+                    (true, true, true),
                     budget,
                 )?;
             }
             for d in &protected.atrium_data_paths {
-                add(d.clone(), Some("atrium-self"), "", true, false, budget)?;
+                add(
+                    d.clone(),
+                    Some("atrium-self"),
+                    "",
+                    (true, false, true),
+                    budget,
+                )?;
             }
             for d in &protected.atrium_protected_paths {
-                add(d.clone(), Some("atrium-self"), "", false, false, budget)?;
+                add(
+                    d.clone(),
+                    Some("atrium-self"),
+                    "",
+                    (false, false, true),
+                    budget,
+                )?;
             }
-            for (rel, family) in ASK_FILES
-                .iter()
-                .copied()
-                .chain(ASK_TREES.iter().copied())
-                .chain(ASK_NAME_PREFIXES.iter().map(|(d, _, f)| (*d, *f)))
-            {
+            for (rel, family) in ASK_FILES.iter().copied().chain(ASK_TREES.iter().copied()) {
                 add(
                     join_folded(home, rel.as_bytes()),
                     None,
                     family,
-                    true,
-                    false,
+                    (true, false, true),
+                    budget,
+                )?;
+            }
+            for (dir, _, family) in ASK_NAME_PREFIXES.iter().copied() {
+                add(
+                    join_folded(home, dir.as_bytes()),
+                    None,
+                    family,
+                    (true, false, false),
                     budget,
                 )?;
             }
             let mut roots = Vec::new();
-            for (p, id, family, read, held) in spelled {
+            for (p, id, family, (read, held, wholesale)) in spelled {
                 let canonical = match resolver.canonicalize(&p, caps, budget) {
                     Ok(c) => c,
                     Err(ResolveError::Exhausted(e)) => return Err(e),
-                    // Absent, or not established: the builder records the
-                    // gap for a root it cannot establish (D-145 rule 4).
-                    Err(_) => continue,
+                    // Absent: nothing to alias.
+                    Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {
+                        continue;
+                    }
+                    // Not established: the table is incomplete, never
+                    // treated as complete (review 6, finding 2).
+                    Err(ResolveError::CapReached(c)) => {
+                        self.incomplete.get_or_insert(UnreadReason::from(c));
+                        continue;
+                    }
+                    Err(ResolveError::Io(_)) => {
+                        if self.incomplete.is_none() {
+                            budget.charge_alloc(p.len())?;
+                            self.incomplete = Some(UnreadReason::UnresolvablePath { path: p });
+                        }
+                        continue;
+                    }
                 };
                 push_charged(
                     &mut roots,
@@ -1652,6 +1711,7 @@ impl RootAliases {
                         family,
                         read,
                         held,
+                        wholesale,
                     },
                     budget,
                 )?;
@@ -1661,8 +1721,27 @@ impl RootAliases {
         Ok(self.roots.as_deref().unwrap_or(&[]))
     }
 
+    /// The reason the table is incomplete, if a root could not be
+    /// established, as an Unread record for `part` (charged).
+    pub(crate) fn incomplete_record(
+        &self,
+        part: &PartId,
+        budget: &mut ComputeBudget,
+    ) -> Result<Option<PartResult>, Exhausted> {
+        let Some(reason) = &self.incomplete else {
+            return Ok(None);
+        };
+        budget.charge_alloc(unread_reason_alloc_bytes(reason))?;
+        Ok(Some(PartResult {
+            part: part.clone(),
+            outcome: PartOutcome::Unread(reason.clone()),
+        }))
+    }
+
     /// `dev`'s `alias_fix`: when `canonical` is at or below the canonical path
     /// of a root whose spelling differs, the root's spelling plus the rest.
+    /// The copied spelling is charged (compute and allocation) before it is
+    /// built (review 6, finding 5).
     pub(crate) fn rewrite(
         roots: &[ProtectedRoot],
         canonical: &[u8],
@@ -1674,7 +1753,9 @@ impl RootAliases {
                 continue;
             }
             if let Some(rest) = under_bytes(canonical, &r.canonical) {
-                budget.charge_alloc(r.spelled.len() + 1 + rest.len())?;
+                let len = r.spelled.len() + 1 + rest.len();
+                budget.charge(len as u64)?;
+                budget.charge_alloc(len)?;
                 return Ok(Some(join_folded(&r.spelled, rest)));
             }
         }
@@ -1683,7 +1764,8 @@ impl RootAliases {
 
     /// `dev`'s `in_trees` for a walker that follows links (`names_dir`): the
     /// root a followed link's real path `real` is in (a root's own folder
-    /// only when the walker reads into it), is, or holds.
+    /// only when the walker reads into it), is, or holds. Only roots that
+    /// are protected wholesale count.
     pub(crate) fn reached<'r>(
         roots: &'r [ProtectedRoot],
         real: &[u8],
@@ -1693,6 +1775,7 @@ impl RootAliases {
         budget.charge((roots.len() as u64).saturating_mul(real.len() as u64 + 1))?;
         Ok(roots.iter().find(|t| {
             t.read
+                && t.wholesale
                 && ((under_bytes(real, &t.canonical).is_some()
                     && (real != t.canonical.as_slice() || !real_is_dir))
                     || t.canonical.as_slice() == real
@@ -1705,7 +1788,11 @@ impl RootAliases {
 /// at or below the canonical path of a protected root whose spelling differs
 /// (a browser root or `~/.ssh` that is a link, say), the protected names are
 /// checked on the root's spelling plus the rest, so they hold even for an
-/// entry that does not exist yet. Variant-only matches are never hits.
+/// entry that does not exist yet: the listed folds first, then the unlisted
+/// equivalences, as for every spelling (review 6, finding 3; §11 item 13).
+/// When no alias is found and the alias table is incomplete, the reason is
+/// returned as Unread (review 6, finding 2). Variant-only matches are never
+/// hits.
 pub(crate) fn alias_name_hit(
     target: &Target,
     protected: &ProtectedSet,
@@ -1726,22 +1813,28 @@ pub(crate) fn alias_name_hit(
     ) {
         return Ok(None);
     }
+    let part = origin_to_part(&target.origin);
     let roots = aliases.roots(protected, resolver, caps, budget)?;
     let Some(alias) = RootAliases::rewrite(roots, canonical, budget)? else {
-        return Ok(None);
+        return aliases.incomplete_record(&part, budget);
     };
-    written_name_hit(
-        &alias,
-        target.access,
-        &origin_to_part(&target.origin),
-        protected,
-        budget,
-    )
+    if let Some(hit) = written_name_hit(&alias, target.access, &part, protected, budget)? {
+        return Ok(Some(hit));
+    }
+    let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
+    if shared.matches_unlisted_equivalence(&alias, target.access, budget)? {
+        return Ok(Some(PartResult {
+            part,
+            outcome: PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence { path: alias }),
+        }));
+    }
+    Ok(None)
 }
 
-/// Every record of `target` ([`check_target_all`]) plus its alias name hit
-/// ([`alias_name_hit`]), appended to `outcomes` with their storage charged
-/// (hits kept on exhaustion).
+/// Every record of `target` ([`check_target_into`]) plus its alias name hit
+/// ([`alias_name_hit`]), appended to `outcomes` as each is established, so
+/// a later exhaustion never loses one (§1, §8; review 6, finding 1). Clear
+/// is recorded only when `keep_clear`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push_target_records(
     target: &Target,
@@ -1751,13 +1844,9 @@ pub(crate) fn push_target_records(
     budget: &mut ComputeBudget,
     aliases: &mut RootAliases,
     outcomes: &mut Vec<PartResult>,
-    skip_clear: bool,
+    keep_clear: bool,
 ) -> Result<(), Exhausted> {
-    let mut records = check_target_all(target, protected, budget)?;
-    if skip_clear {
-        records.retain(|r| !matches!(r.outcome, PartOutcome::Clear));
-    }
-    extend_charged(outcomes, records, budget)?;
+    check_target_into(target, protected, budget, outcomes, keep_clear)?;
     if let Some(hit) = alias_name_hit(target, protected, resolver, caps, budget, aliases)? {
         push_charged(outcomes, hit, budget)?;
     }
