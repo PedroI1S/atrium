@@ -1006,3 +1006,13 @@ Each change is additive and keeps every existing field. P2 doesn't use `RuleEval
 - Probes run on every applicable spelling: canonical, written and alias.
 - It also fixes review 7's other two findings.
 - If the next review still has findings, they come back to the driver.
+
+## D-155 — 2026-11-24 — rodrigo: P2 keeps its Opus rounds while findings fall
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P2's (M1-38) review counts fell one per round after D-145: 7, 6, 5, 4, 3 (`reviews/M1-38-rev4-p2-paths-round8.md`). Each round's findings are narrower than the last.
+
+**Standing exception to PLAN §8.4 for P2 only:** Opus 5.5 keeps writing P2's rounds, without coming back to the driver each time, while three conditions hold:
+- each review finds fewer findings than the one before;
+- no review finds a blocker;
+- no change request against the interface appears.
+
+If the count stalls or rises, a blocker appears, or an interface change is requested, the orchestrator brings it to the driver. Failing tests found by the verification go into the same round.
