@@ -98,15 +98,19 @@ pub(crate) fn lex_best_effort_into(
     record: &mut BestEffortRecord,
     budget: &mut ComputeBudget,
 ) -> Result<(), PartOutcome> {
-    budget
-        .charge(raw_texts.len() as u64 + 1)
-        .map_err(|e| PartOutcome::Exhausted(e.reason))?;
+    // The structural cap comes before any fallible charge, so `TooLarge`
+    // always beats `Exhausted` (§1, §8; D-150). The check reads only each
+    // text's length (one step per text, no input byte), and that walk is
+    // charged right after it.
     let total_bytes: usize = raw_texts
         .iter()
         .fold(0usize, |acc, s| acc.saturating_add(s.len()));
     if total_bytes > limits::MAX_BYTES {
         return Err(PartOutcome::TooLarge(Cap::Bytes));
     }
+    budget
+        .charge(raw_texts.len() as u64 + 1)
+        .map_err(|e| PartOutcome::Exhausted(e.reason))?;
 
     let mut state = BeState { next_pipe_id: 1 };
 
