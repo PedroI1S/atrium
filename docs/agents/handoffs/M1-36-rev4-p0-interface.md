@@ -475,3 +475,32 @@ Run by worker (allowed under D-123):
 - `cargo fmt --all` — clean
 - `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
 - `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
+
+
+---
+
+## Round 7 (D-144, CR-P2-2)
+
+Added `GapScope`, `IdentityGap`, and `ProtectedSet::identity_gaps` to `crates/atrium-core/src/policy/model.rs` per driver decision D-144 (accepting P2's change request CR-P2-2), so when the protected-set builder's identity collection stops early (a walk cap, an unreadable folder, or a filesystem cap), pure `v4::paths::check_target` can report affected targets as `Unread` instead of `Clear`. No other types, stubs, or tool-table rows were changed.
+
+### Types and field added
+- **`GapScope`** (`pub(crate) enum GapScope`, `#[derive(Debug, Clone, PartialEq, Eq)]`):
+  - `HardLinks` — affects multiply-linked regular files (hard links).
+  - `Through(FileIdentity)` — affects multiply-linked regular files and targets whose identities include this directory's (paths spelled through it).
+  - `AnyTarget` — affects any target (e.g. filesystem cap, unreadable folder on a protected entry's path, or `~/.ssh` walk).
+- **`IdentityGap`** (`pub(crate) struct IdentityGap`, `#[derive(Debug, Clone, PartialEq, Eq)]`):
+  - `reason: UnreadReason`
+  - `scope: GapScope`
+  - `write_only: bool` (`true` for gaps in write-only collections; affects only targets whose access is not `AccessMode::Read`)
+- **Field on `ProtectedSet`:** `pub(crate) identity_gaps: Vec<IdentityGap>` (placed immediately after `ProtectedSet::write_only_hard_deny_identities`).
+
+### Files touched
+- `crates/atrium-core/src/policy/model.rs`: added `GapScope`, `IdentityGap`, and `ProtectedSet::identity_gaps`; updated `protected_set_separates_read_write_and_write_only_hard_deny_identities` to populate `identity_gaps` and assert that a gap of each `GapScope` variant can be built and stored.
+- `docs/agents/handoffs/M1-36-rev4-p0-interface.md`: added this Round 7 section.
+
+### Round 7 verification
+
+Run by worker (allowed under D-123):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core --tests -- -D warnings` — clean (0 errors, 0 warnings)
