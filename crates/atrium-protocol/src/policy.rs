@@ -596,3 +596,75 @@ pub const HOME_READONLY_COMMANDS: &[ReadOnlyCommand] = &[
     git(&["git", "rev-parse"]),
     git(&["git", "ls-files"]),
 ];
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{GIT_FORBIDDEN, HOME_READONLY_COMMANDS, Recursion};
+
+    #[test]
+    fn home_readonly_commands_invariants_and_rev4_parity() {
+        assert_eq!(
+            HOME_READONLY_COMMANDS.len(),
+            24,
+            "15 HomeReadOnly tools + 2 Search tools (rg, grep) + 7 git subcommands"
+        );
+
+        let mut seen: HashSet<&[&str]> = HashSet::new();
+        for entry in HOME_READONLY_COMMANDS {
+            assert!(!entry.prefix.is_empty(), "prefix must be non-empty");
+            assert!(
+                seen.insert(entry.prefix),
+                "duplicate HOME_READONLY_COMMANDS prefix: {:?}",
+                entry.prefix
+            );
+            for &word in entry.prefix {
+                assert!(!word.is_empty());
+                assert_eq!(word, word.to_ascii_lowercase());
+            }
+            for &flag in entry.forbidden {
+                assert!(
+                    flag.starts_with('-'),
+                    "forbidden flag {flag:?} on {:?} must start with '-'",
+                    entry.prefix
+                );
+            }
+            if entry.prefix.first() == Some(&"git") {
+                assert_eq!(entry.prefix.len(), 2);
+                assert_eq!(entry.forbidden, GIT_FORBIDDEN);
+                assert_eq!(entry.recursion, Recursion::Never);
+            }
+        }
+
+        // Verify the exact rev 4 §6 set of prefixes.
+        let expected: &[&[&str]] = &[
+            &["ls"],
+            &["pwd"],
+            &["cat"],
+            &["head"],
+            &["tail"],
+            &["wc"],
+            &["file"],
+            &["stat"],
+            &["du"],
+            &["df"],
+            &["which"],
+            &["uname"],
+            &["date"],
+            &["whoami"],
+            &["tree"],
+            &["rg"],
+            &["grep"],
+            &["git", "status"],
+            &["git", "log"],
+            &["git", "diff"],
+            &["git", "show"],
+            &["git", "branch"],
+            &["git", "rev-parse"],
+            &["git", "ls-files"],
+        ];
+        let actual: Vec<&[&str]> = HOME_READONLY_COMMANDS.iter().map(|e| e.prefix).collect();
+        assert_eq!(actual, expected);
+    }
+}
