@@ -213,3 +213,24 @@ cargo test --workspace --no-fail-fast
 pnpm --dir app run typecheck
 pnpm --dir app test -- src/chat/rule-form.test.ts src/chat/rules.test.ts src/ui/rules-list.test.ts
 ```
+
+---
+
+## Round 3
+
+Rework addressing both medium findings from `.orchestration/review-input/review-round2.md` plus a full sweep of the option-value scanning class across all P3 rows and `app/src/chat/rule-form.ts`.
+
+### 1. Findings fixed and regression tests
+
+| # | Finding / Class | Fix | Regression test(s) |
+|---|---|---|---|
+| 1 | Wrapped pinned programs received no rule coverage (`v4/rules.rs`) | Pre-computed `wrapper_words` from `CommandUnit::removed_wrappers` in `UnitEvalInfo` (budgeted via `wrapper_word_count`) and added `rule_argv_names_pinned_program`, checking `rule_argv[wrapper_offset..]` against `prog_words` in both `CommandPrefix` and `CommandExact` while keeping `words_match_argv(u.original_argv(), ...)` intact for rule matching itself. | `v4/rules/tests.rs::round3_finding_1_wrapped_pinned_programs_receive_coverage_and_suppress_lower_deny` (`command python build.py` with `CommandExact` and `CommandPrefix`, higher-ranked Thread Allow suppressing lower-ranked Global Deny, unpinned `["command"]`/`["command","python"]` rejected and Deny preserved, unwrapped rule rejected on wrapped call, stacked `nice -n 5 command -- python build.py --flag`, plus `timeout 30 cargo test` and `env awk -f prog.awk`). |
+| 2 | Git short-option values read as option letters (`v4/tools.rs`, `v4/tools/git.rs`, `v4/rules.rs`, `app/src/chat/rule-form.ts`) | Replaced substring short-option matching with `ShortOptArity`-based parsers (`parse_git_global_opt`, `git_subcommand_opt_step`, `git_subcommand_has_flag_trigger_budgeted` / `_pure`, mirrored in `rule-form.ts::findGitSubcommandTriggerFlag`). Value-taking options (`-C`, `-c`, `--git-dir`, `--attr-source`, `rebase -s`/`-X`/`-S`, `difftool`/`mergetool -t`, `diff -S`, `push -o`, etc.) consume the rest of the token or the next word so value bytes are never scanned as option letters. `check_git_selection` (`v4/tools/git.rs`) now uses `parse_git_global_opt` so `git -C --literal-pathspecs show ...` never mistakes `-C`'s directory value for `--literal-pathspecs`. | `v4/tools/tests.rs::round3_finding_2_git_short_option_values_and_subcommand_values` (`git -Csrc status`, `git -C src status`, `git -C -c status`, `git -pCsrc status` → no trigger; `git -c x=y status`, `git -cx=y status`, `git -pcx=y status` → trigger; subcommand attached/separate values on `rebase`, `difftool`, `mergetool`, `diff`, `push`; `git -C --literal-pathspecs show HEAD -- ':!.env'` → `StoreHit`); `v4/rules/tests.rs::round3_finding_2_git_option_values_preserve_exact_rule_coverage_and_validation`; `app/src/chat/rule-form.test.ts`. |
+| Class | Same option-value scanning class across `rg`/`grep`, `cp`, `tar`, `awk`, `sed`, `find`, and interpreters | **Search (`rg`/`grep`):** removed blanket `is_forbidden_flag` over whole short clusters in `classify_search`; now checks `home.forbidden` per long option name and per actual short option letter before breaking on `FlagKind::Value` (`rg -efoo src`, `rg '-g*.pdf' needle src`, `grep -efoo README.md` keep `home_readonly_eligible = true`). **DerivedDestinationWriter (`cp`/`tar`):** replaced `matches_exact_or_short_cluster` with `derived_writer_opt_step` plus old-style `tar` key-arg skipping (`cp -tarchive`, `cp -S.bak`, `tar -cfextra.tar`, `tar -Cextra`, `tar cf -x` no longer falsely trigger `-a`/`-r`/`-x`). **CodeRunner (`awk`/`gawk`/`mawk` & interpreters):** `awk_opt_step` respects `-F`/`-v`/`-W`/`--field-separator`/`--assign` in both `v4/tools.rs`, `v4/rules.rs`, and `rule-form.ts`; `parse_interpreter_opt` respects value-taking short options on `python`/`node`/`perl`/`ruby`. **ConditionalRunner (`sed` & `find`):** `has_competing_sed_flags_pure` / `hasCompetingSedFlags` respect attached `-i.ref`/`-l80` while rejecting bare `-i`/`-l`; bare `-l` in `classify_sed` now fails closed (`uncertain = true`, avoiding macOS/BSD `-l` zero-arg ambiguity); `find` skips values of unambiguous value-taking primaries (`find . -name -exec`). | `v4/tools/tests.rs::round3_option_value_scanning_class_rg_grep_cp_tar_awk_sed_find_interpreters`; `v4/rules/tests.rs::round3_finding_2_git_option_values_preserve_exact_rule_coverage_and_validation`; `app/src/chat/rule-form.test.ts`. |
+
+### 2. Verification run by worker (D-123)
+
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core -p atrium-daemon -p atrium-protocol --tests` — clean (0 errors, 0 warnings)
+- `cargo clippy -p atrium-core -p atrium-daemon -p atrium-protocol --tests -- -D warnings` — clean (0 errors, 0 warnings)
+- No `cargo test` or `pnpm` run by worker; orchestrator verification runs the fish commands listed in Round 2 §4 above.
