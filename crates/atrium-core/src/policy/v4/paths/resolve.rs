@@ -21,7 +21,7 @@ use crate::policy::model::{
     ResolveError, Target, TargetOrigin, TargetResolution, UnreadReason, Word,
 };
 use crate::policy::v4::paths::PathResolver;
-use crate::policy::v4::paths::sensitive::{push_charged, strip_firmlink};
+use crate::policy::v4::paths::sensitive::{lexical_spelling, push_charged, strip_firmlink};
 
 /// Returns `true` iff `path` is a process-dependent path under §3 / §11 item 14:
 /// `/proc/self`, `/proc/thread-self`, `/proc/<pid>`, `/dev/fd/`, `/dev/stdin`,
@@ -168,6 +168,27 @@ pub(crate) fn resolve_word_literal(
         return resolve_literal_impl(&joined, cwd, home, origin, access, resolver, caps, budget);
     }
     resolve_literal_impl(raw, cwd, home, origin, access, resolver, caps, budget)
+}
+
+/// The written spelling of `word` (see [`lexical_spelling`]) on the written
+/// working directory `written_cwd`. A quoted or escaped leading `~` is a
+/// literal name in the working directory, as [`resolve_word_literal`] treats
+/// it (§3).
+pub(crate) fn word_spelling(
+    word: &Word,
+    written_cwd: &[u8],
+    home: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<Option<Vec<u8>>, Exhausted> {
+    let raw = word.literal_bytes();
+    if raw.starts_with(b"~") && !word.starts_with_unquoted_tilde() {
+        budget.charge_alloc(raw.len() + 2)?;
+        let mut rel = Vec::with_capacity(raw.len() + 2);
+        rel.extend_from_slice(b"./");
+        rel.extend_from_slice(raw);
+        return lexical_spelling(&rel, written_cwd, home, budget);
+    }
+    lexical_spelling(raw, written_cwd, home, budget)
 }
 
 /// Implementation of `v4::paths::resolve_literal` (contract §3, §5, §8).

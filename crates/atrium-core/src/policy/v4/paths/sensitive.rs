@@ -727,6 +727,27 @@ pub(crate) fn push_charged<T: ChargedRecord>(
     Ok(())
 }
 
+/// Appends `items` to `v` after charging the growth (§8). When the charge
+/// exhausts the budget, the records [`ChargedRecord::keep_on_exhaustion`]
+/// keeps (hits, Exhausted, TooLarge) are still appended, so a hit found
+/// before the budget ran out stands, and the error is returned.
+pub(crate) fn extend_charged<T: ChargedRecord>(
+    v: &mut Vec<T>,
+    items: Vec<T>,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    if v.capacity() - v.len() < items.len() {
+        let new_cap = (v.len() + items.len()).max(v.capacity().saturating_mul(2));
+        if let Err(e) = budget.charge_alloc(new_cap.saturating_mul(std::mem::size_of::<T>())) {
+            v.extend(items.into_iter().filter(ChargedRecord::keep_on_exhaustion));
+            return Err(e);
+        }
+        v.reserve_exact(new_cap - v.len());
+    }
+    v.extend(items);
+    Ok(())
+}
+
 /// A record kept by [`push_charged`] even when its slot exhausts the budget.
 pub(crate) trait ChargedRecord {
     fn keep_on_exhaustion(&self) -> bool {
@@ -754,6 +775,9 @@ impl ChargedRecord for (Vec<u8>, u8) {}
 impl ChargedRecord for (Vec<u8>, u8, bool) {}
 impl ChargedRecord for (Vec<u8>, Option<FileIdentity>) {}
 impl ChargedRecord for (Vec<u8>, Vec<u8>, usize) {}
+impl ChargedRecord for Option<Vec<u8>> {}
+impl ChargedRecord for Target {}
+impl ChargedRecord for PartId {}
 
 /// Folds every path of `paths`, charging the list's allocation before building
 /// it (each fold charges its own work and allocation).
@@ -1217,6 +1241,106 @@ fn store_match_parts(pl: &[u8], home: &[u8]) -> Option<&'static str> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Written spellings (D-147: protected names on the written spelling too)
+// ---------------------------------------------------------------------------
+
+/// The written spelling of a path operand, as `dev`'s `words::lexical_resolve`
+/// gives it: `~` and `~/…` expanded to `home`, a relative path joined onto
+/// `cwd` (the written working directory), `.` removed, `..` popping a
+/// component (never above `/`). `None` for spellings literal resolution does
+/// not model (empty, NUL, `~user`). Work and allocation are charged first
+/// (§8).
+pub(crate) fn lexical_spelling(
+    raw: &[u8],
+    cwd: &[u8],
+    home: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<Option<Vec<u8>>, Exhausted> {
+    if raw.is_empty() || raw.contains(&0) {
+        return Ok(None);
+    }
+    let (base, rest): (&[u8], &[u8]) = if raw == b"~" {
+        (home, b"")
+    } else if let Some(r) = raw.strip_prefix(b"~/") {
+        (home, r)
+    } else if raw.starts_with(b"~") {
+        return Ok(None);
+    } else if raw.starts_with(b"/") {
+        (b"/", raw)
+    } else {
+        (cwd, raw)
+    };
+    let len = base.len() + 1 + rest.len();
+    budget.charge(len as u64 * 2 + 1)?;
+    budget.charge_alloc(len + 1)?;
+    let mut out: Vec<u8> = Vec::with_capacity(len + 1);
+    for comp in base
+        .split(|&b| b == b'/')
+        .chain(rest.split(|&b| b == b'/'))
+        .filter(|c| !c.is_empty())
+    {
+        match comp {
+            b"." => {}
+            b".." => {
+                let cut = out.iter().rposition(|&b| b == b'/').unwrap_or(0);
+                out.truncate(cut);
+            }
+            _ => {
+                out.push(b'/');
+                out.extend_from_slice(comp);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(b'/');
+    }
+    Ok(Some(out))
+}
+
+/// The hit (hard-deny, else store) that a written spelling names under the
+/// listed folds, with `dev`'s exceptions (public `.ssh` names, readable
+/// `config` / `authorized_keys`), for `part` (D-147). `dev` compares
+/// protected names on the written spelling as well as on the resolved path
+/// (`Sensitive::hit` over `Analysis::all_paths`), so a protected spelling
+/// stays a hit when a root or the entry itself is a link, or does not exist
+/// yet below an aliased root.
+pub(crate) fn written_name_hit(
+    written: &[u8],
+    access: AccessMode,
+    part: &PartId,
+    protected: &ProtectedSet,
+    budget: &mut ComputeBudget,
+) -> Result<Option<PartResult>, Exhausted> {
+    let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
+    let folded = fold_path_listed(written, protected.folds, budget)?;
+    budget.charge(folded.len() as u64 + 1)?;
+    let outcome = if let Some(id) = shared.hard_deny_hit_folded(&folded, access) {
+        budget.charge_alloc(written.len())?;
+        PartOutcome::HardDenyHit(Hit {
+            hard_deny_id: Some(id),
+            source: HitSource::Model,
+            matched: HitMatch::ProtectedPath {
+                path: written.to_vec(),
+            },
+            part: part.clone(),
+        })
+    } else if let Some(family) = shared.store_hit_folded(&folded) {
+        PartOutcome::StoreHit(Hit {
+            hard_deny_id: None,
+            source: HitSource::Model,
+            matched: HitMatch::StoreFamily { family },
+            part: part.clone(),
+        })
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(PartResult {
+        part: part.clone(),
+        outcome,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1848,14 +1972,10 @@ impl Collector<'_> {
                 Ok(Some(meta))
             }
             Err(err) => {
-                // The link's own identity is known, so its scope is through it.
-                self.failure(
-                    err,
-                    path,
-                    root_scope(meta.identity),
-                    kind.write_only(),
-                    budget,
-                )?;
+                // The link's own identity does not establish its referent's: the
+                // root's identity is unknown, so the gap is AnyTarget (D-145 rule 4;
+                // review 4, finding 3).
+                self.failure(err, path, GapScope::AnyTarget, kind.write_only(), budget)?;
                 Ok(Some(meta))
             }
         }
@@ -2245,7 +2365,10 @@ pub(crate) fn build_protected_set(
                     continue;
                 }
             };
-            for entry in entries.iter().take(limits::WALK_MAX_ENTRIES) {
+            // Named roots: the whole listing (already within the filesystem
+            // caps) is searched, not cut at the member walk's cap (review 4,
+            // finding 4).
+            for entry in entries.iter() {
                 budget.charge(entry.folded.len().max(1) as u64)?;
                 if entry.folded.starts_with(pre.as_bytes()) {
                     budget.charge_alloc(dir_path.len() + 1 + entry.name.len())?;

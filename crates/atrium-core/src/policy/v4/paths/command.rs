@@ -12,17 +12,21 @@ use crate::policy::model::{
     ToolEffects, UnitIndex, UnreadReason, ValueRole, Word,
 };
 use crate::policy::v4::paths::PathResolver;
-use crate::policy::v4::paths::glob::expand_shell_glob_impl;
+use crate::policy::v4::paths::glob::expand_shell_glob_written;
 use crate::policy::v4::paths::recursive::{check_filter_on_root, check_recursive_root_impl};
-use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl, resolve_word_literal};
+use crate::policy::v4::paths::resolve::{
+    join_bytes, resolve_literal_impl, resolve_word_literal, word_spelling,
+};
 use crate::policy::v4::paths::sensitive::{
-    SharedSensitive, check_target_parts, fold_path_listed, origin_to_part, push_charged,
-    under_bytes,
+    SharedSensitive, check_target_parts, extend_charged, fold_path_listed, lexical_spelling,
+    origin_to_part, push_charged, under_bytes, written_name_hit,
 };
 
 #[derive(Debug, Clone)]
 enum CwdState {
-    Known(Vec<u8>),
+    /// The real (canonical) working directory, which resolution uses, and its
+    /// written spelling, which protected-name checks use (D-147).
+    Known(Vec<u8>, Vec<u8>),
     Unknown,
 }
 
@@ -43,6 +47,55 @@ fn push_checked(
         push_charged(outcomes, gap, budget)?;
     }
     Ok(())
+}
+
+/// [`push_checked`], then the written spelling's own protected name (D-147):
+/// a hit `dev` finds on the written spelling (`Sensitive::hit` over
+/// `all_paths`) stays a hit when resolution leads elsewhere, through a link
+/// or to a name that does not exist yet below an aliased root.
+fn push_checked_written(
+    target: &Target,
+    written: Option<&[u8]>,
+    protected: &ProtectedSet,
+    budget: &mut ComputeBudget,
+    outcomes: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
+    push_checked(target, protected, budget, outcomes)?;
+    if let Some(w) = written
+        && !matches!(
+            target.origin,
+            TargetOrigin::ExpandedFrom {
+                variant_only: true,
+                ..
+            }
+        )
+        && let Some(hit) = written_name_hit(
+            w,
+            target.access,
+            &origin_to_part(&target.origin),
+            protected,
+            budget,
+        )?
+    {
+        push_charged(outcomes, hit, budget)?;
+    }
+    Ok(())
+}
+
+/// Charges a clone of `target` (its path and identities) before it is made (§8).
+fn charge_target_clone(target: &Target, budget: &mut ComputeBudget) -> Result<(), Exhausted> {
+    let bytes = match &target.resolution {
+        TargetResolution::Resolved {
+            canonical,
+            identities,
+            ..
+        } => {
+            canonical.len()
+                + identities.len() * std::mem::size_of::<crate::policy::model::FileIdentity>()
+        }
+        TargetResolution::Unread(_) => 64,
+    };
+    budget.charge_alloc(bytes)
 }
 
 fn finish_call_exhausted(
@@ -318,10 +371,13 @@ fn exec_unit_sequence(
                 unit: unit.index,
                 argv_index,
             };
-            unit_target_parts.push(part.clone());
+            if let Err(err) = push_charged(&mut unit_target_parts, part.clone(), ctx.budget) {
+                ctx.exhausted_err = Some((PartId::WholeCall, err));
+                return;
+            }
 
-            let cur_cwd: &[u8] = match &cwd_state {
-                CwdState::Known(c) => c.as_slice(),
+            let (cur_cwd, cur_written): (&[u8], &[u8]) = match &cwd_state {
+                CwdState::Known(c, w) => (c.as_slice(), w.as_slice()),
                 CwdState::Unknown => {
                     if !is_absolute_or_tilde(word) {
                         let unread_t = Target {
@@ -340,10 +396,13 @@ fn exec_unit_sequence(
                             ctx.exhausted_err = Some((PartId::WholeCall, err));
                             return;
                         }
-                        ctx.out.targets.push(unread_t);
+                        if let Err(err) = push_charged(&mut ctx.out.targets, unread_t, ctx.budget) {
+                            ctx.exhausted_err = Some((PartId::WholeCall, err));
+                            return;
+                        }
                         continue;
                     }
-                    ctx.start_cwd
+                    (ctx.start_cwd, ctx.start_cwd)
                 }
             };
 
@@ -354,9 +413,10 @@ fn exec_unit_sequence(
             }
 
             if word.has_unquoted_glob() {
-                let exp = match expand_shell_glob_impl(
+                let (exp, exact_written) = match expand_shell_glob_written(
                     word,
                     cur_cwd,
+                    cur_written,
                     &ctx.protected.home,
                     part.clone(),
                     access,
@@ -383,7 +443,7 @@ fn exec_unit_sequence(
                         return;
                     }
                 }
-                for target in exp.exact_matches {
+                for (target, written_spelling) in exp.exact_matches.into_iter().zip(exact_written) {
                     if ctx.out.targets.len() >= limits::MAX_PATHS {
                         if let Err(err) = push_charged(
                             &mut ctx.out.outcomes,
@@ -405,6 +465,7 @@ fn exec_unit_sequence(
                             &target,
                             e.links,
                             &e.filters,
+                            written_spelling.as_deref(),
                             ctx.protected,
                             ctx.resolver,
                             ctx.caps,
@@ -412,10 +473,17 @@ fn exec_unit_sequence(
                         ) {
                             Ok(rec) => {
                                 ctx.out.multiply_linked_file |= rec.multiply_linked_file;
-                                ctx.out.outcomes.extend(rec.outcomes);
+                                // On exhaustion the hits are kept and the branch below records it.
+                                let _ =
+                                    extend_charged(&mut ctx.out.outcomes, rec.outcomes, ctx.budget);
                                 if ctx.budget.is_exhausted() {
                                     ensure_exhausted_recorded(ctx.out, part.clone(), ctx.budget);
-                                    ctx.out.targets.push(target);
+                                    if let Err(err) =
+                                        push_charged(&mut ctx.out.targets, target, ctx.budget)
+                                    {
+                                        ctx.exhausted_err = Some((PartId::WholeCall, err));
+                                        return;
+                                    }
                                     return;
                                 }
                             }
@@ -424,9 +492,13 @@ fn exec_unit_sequence(
                                 return;
                             }
                         }
-                    } else if let Err(err) =
-                        push_checked(&target, ctx.protected, ctx.budget, &mut ctx.out.outcomes)
-                    {
+                    } else if let Err(err) = push_checked_written(
+                        &target,
+                        written_spelling.as_deref(),
+                        ctx.protected,
+                        ctx.budget,
+                        &mut ctx.out.outcomes,
+                    ) {
                         ctx.exhausted_err = Some((part, err));
                         return;
                     }
@@ -435,8 +507,13 @@ fn exec_unit_sequence(
                     }) && role == OperandRole::Path
                         && Some(argv_index) != mv_destination
                     {
-                        match source_is_dir_or_unknown(&target, ctx.resolver, ctx.caps, ctx.budget)
-                        {
+                        match source_is_dir_or_unknown(
+                            &target,
+                            written_spelling.as_deref(),
+                            ctx.resolver,
+                            ctx.caps,
+                            ctx.budget,
+                        ) {
                             Ok(is_dir) => {
                                 if is_dir {
                                     mv_source_is_dir = true;
@@ -448,7 +525,10 @@ fn exec_unit_sequence(
                             }
                         }
                     }
-                    ctx.out.targets.push(target);
+                    if let Err(err) = push_charged(&mut ctx.out.targets, target, ctx.budget) {
+                        ctx.exhausted_err = Some((PartId::WholeCall, err));
+                        return;
+                    }
                 }
                 let mut emitted_variant = false;
                 for target in exp.variant_only_matches {
@@ -469,6 +549,10 @@ fn exec_unit_sequence(
                     }
                     if !emitted_variant {
                         emitted_variant = true;
+                        if let Err(err) = ctx.budget.charge_alloc(word.literal_bytes().len()) {
+                            ctx.exhausted_err = Some((PartId::WholeCall, err));
+                            return;
+                        }
                         if let Err(err) = push_charged(
                             &mut ctx.out.outcomes,
                             PartResult {
@@ -483,9 +567,28 @@ fn exec_unit_sequence(
                             return;
                         }
                     }
-                    ctx.out.targets.push(target);
+                    if let Err(err) = push_charged(&mut ctx.out.targets, target, ctx.budget) {
+                        ctx.exhausted_err = Some((PartId::WholeCall, err));
+                        return;
+                    }
                 }
             } else {
+                let written_spelling =
+                    match word_spelling(word, cur_written, &ctx.protected.home, ctx.budget) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            ctx.exhausted_err = Some((part, e));
+                            return;
+                        }
+                    };
+                let entry_path =
+                    match final_entry_path(word, cur_cwd, &ctx.protected.home, ctx.budget) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            ctx.exhausted_err = Some((part, e));
+                            return;
+                        }
+                    };
                 let target = match resolve_word_literal(
                     word,
                     cur_cwd,
@@ -508,6 +611,7 @@ fn exec_unit_sequence(
                         &target,
                         e.links,
                         &e.filters,
+                        written_spelling.as_deref(),
                         ctx.protected,
                         ctx.resolver,
                         ctx.caps,
@@ -515,10 +619,16 @@ fn exec_unit_sequence(
                     ) {
                         Ok(rec) => {
                             ctx.out.multiply_linked_file |= rec.multiply_linked_file;
-                            ctx.out.outcomes.extend(rec.outcomes);
+                            // On exhaustion the hits are kept and the branch below records it.
+                            let _ = extend_charged(&mut ctx.out.outcomes, rec.outcomes, ctx.budget);
                             if ctx.budget.is_exhausted() {
                                 ensure_exhausted_recorded(ctx.out, part.clone(), ctx.budget);
-                                ctx.out.targets.push(target);
+                                if let Err(err) =
+                                    push_charged(&mut ctx.out.targets, target, ctx.budget)
+                                {
+                                    ctx.exhausted_err = Some((PartId::WholeCall, err));
+                                    return;
+                                }
                                 return;
                             }
                         }
@@ -527,9 +637,13 @@ fn exec_unit_sequence(
                             return;
                         }
                     }
-                } else if let Err(err) =
-                    push_checked(&target, ctx.protected, ctx.budget, &mut ctx.out.outcomes)
-                {
+                } else if let Err(err) = push_checked_written(
+                    &target,
+                    written_spelling.as_deref(),
+                    ctx.protected,
+                    ctx.budget,
+                    &mut ctx.out.outcomes,
+                ) {
                     ctx.exhausted_err = Some((part, err));
                     return;
                 }
@@ -538,7 +652,13 @@ fn exec_unit_sequence(
                     && role == OperandRole::Path
                     && Some(argv_index) != mv_destination
                 {
-                    match source_is_dir_or_unknown(&target, ctx.resolver, ctx.caps, ctx.budget) {
+                    match source_is_dir_or_unknown(
+                        &target,
+                        entry_path.as_deref(),
+                        ctx.resolver,
+                        ctx.caps,
+                        ctx.budget,
+                    ) {
                         Ok(is_dir) => {
                             if is_dir {
                                 mv_source_is_dir = true;
@@ -550,7 +670,10 @@ fn exec_unit_sequence(
                         }
                     }
                 }
-                ctx.out.targets.push(target);
+                if let Err(err) = push_charged(&mut ctx.out.targets, target, ctx.budget) {
+                    ctx.exhausted_err = Some((PartId::WholeCall, err));
+                    return;
+                }
             }
         }
 
@@ -561,9 +684,19 @@ fn exec_unit_sequence(
             && !saw_explicit_recursive_root
         {
             let implicit_part = PartId::Unit(unit.index);
-            unit_target_parts.push(implicit_part.clone());
+            if let Err(err) =
+                push_charged(&mut unit_target_parts, implicit_part.clone(), ctx.budget)
+            {
+                ctx.exhausted_err = Some((PartId::WholeCall, err));
+                return;
+            }
             match &cwd_state {
-                CwdState::Known(cur) => {
+                CwdState::Known(cur, cur_written) => {
+                    if let Err(err) = ctx.budget.charge_alloc(cur_written.len()) {
+                        ctx.exhausted_err = Some((implicit_part, err));
+                        return;
+                    }
+                    let written_spelling = Some(cur_written.clone());
                     let target = match resolve_literal_impl(
                         cur,
                         cur,
@@ -587,6 +720,7 @@ fn exec_unit_sequence(
                         &target,
                         e.links,
                         &e.filters,
+                        written_spelling.as_deref(),
                         ctx.protected,
                         ctx.resolver,
                         ctx.caps,
@@ -594,8 +728,13 @@ fn exec_unit_sequence(
                     ) {
                         Ok(rec) => {
                             ctx.out.multiply_linked_file |= rec.multiply_linked_file;
-                            ctx.out.outcomes.extend(rec.outcomes);
-                            ctx.out.targets.push(target);
+                            // On exhaustion the hits are kept and the branch below records it.
+                            let _ = extend_charged(&mut ctx.out.outcomes, rec.outcomes, ctx.budget);
+                            if let Err(err) = push_charged(&mut ctx.out.targets, target, ctx.budget)
+                            {
+                                ctx.exhausted_err = Some((PartId::WholeCall, err));
+                                return;
+                            }
                             if ctx.budget.is_exhausted() {
                                 ensure_exhausted_recorded(ctx.out, implicit_part, ctx.budget);
                                 return;
@@ -608,13 +747,20 @@ fn exec_unit_sequence(
                     }
                 }
                 CwdState::Unknown => {
-                    ctx.out.targets.push(Target {
-                        origin: TargetOrigin::ImplicitCwd {
-                            unit: Some(unit.index),
+                    if let Err(err) = push_charged(
+                        &mut ctx.out.targets,
+                        Target {
+                            origin: TargetOrigin::ImplicitCwd {
+                                unit: Some(unit.index),
+                            },
+                            access: AccessMode::Read,
+                            resolution: TargetResolution::Unread(UnreadReason::UnknownCwd),
                         },
-                        access: AccessMode::Read,
-                        resolution: TargetResolution::Unread(UnreadReason::UnknownCwd),
-                    });
+                        ctx.budget,
+                    ) {
+                        ctx.exhausted_err = Some((PartId::WholeCall, err));
+                        return;
+                    }
                 }
             }
         }
@@ -655,10 +801,13 @@ fn exec_unit_sequence(
                 unit: unit.index,
                 redirect_index,
             };
-            unit_target_parts.push(part.clone());
+            if let Err(err) = push_charged(&mut unit_target_parts, part.clone(), ctx.budget) {
+                ctx.exhausted_err = Some((PartId::WholeCall, err));
+                return;
+            }
 
-            let cur_cwd: &[u8] = match &cwd_state {
-                CwdState::Known(c) => c.as_slice(),
+            let (cur_cwd, cur_written): (&[u8], &[u8]) = match &cwd_state {
+                CwdState::Known(c, w) => (c.as_slice(), w.as_slice()),
                 CwdState::Unknown => {
                     if !is_absolute_or_tilde(target_word) {
                         if let Err(err) = push_charged(
@@ -672,16 +821,34 @@ fn exec_unit_sequence(
                             ctx.exhausted_err = Some((PartId::WholeCall, err));
                             return;
                         }
-                        ctx.out.targets.push(Target {
-                            origin,
-                            access,
-                            resolution: TargetResolution::Unread(UnreadReason::UnknownCwd),
-                        });
+                        if let Err(err) = push_charged(
+                            &mut ctx.out.targets,
+                            Target {
+                                origin,
+                                access,
+                                resolution: TargetResolution::Unread(UnreadReason::UnknownCwd),
+                            },
+                            ctx.budget,
+                        ) {
+                            ctx.exhausted_err = Some((PartId::WholeCall, err));
+                            return;
+                        }
                         continue;
                     }
-                    ctx.start_cwd
+                    (ctx.start_cwd, ctx.start_cwd)
                 }
             };
+
+            let written_spelling =
+                match word_spelling(target_word, cur_written, &ctx.protected.home, ctx.budget) {
+                    Ok(w) => w,
+
+                    Err(e) => {
+                        ctx.exhausted_err = Some((part, e));
+
+                        return;
+                    }
+                };
 
             let target = match resolve_word_literal(
                 target_word,
@@ -700,13 +867,20 @@ fn exec_unit_sequence(
                 }
             };
             record_multiply_linked(&target, &mut ctx.out.multiply_linked_file);
-            if let Err(err) =
-                push_checked(&target, ctx.protected, ctx.budget, &mut ctx.out.outcomes)
-            {
+            if let Err(err) = push_checked_written(
+                &target,
+                written_spelling.as_deref(),
+                ctx.protected,
+                ctx.budget,
+                &mut ctx.out.outcomes,
+            ) {
                 ctx.exhausted_err = Some((part, err));
                 return;
             }
-            ctx.out.targets.push(target);
+            if let Err(err) = push_charged(&mut ctx.out.targets, target, ctx.budget) {
+                ctx.exhausted_err = Some((PartId::WholeCall, err));
+                return;
+            }
         }
 
         // Derived destinations (§5, §10 row 18): makes the writer itself Unread,
@@ -814,6 +988,12 @@ fn exec_unit_sequence(
         // Execute nested-shell children at the EXACT cwd `unit` had when it ran,
         // isolating any `cd` inside the child from `unit`'s parent scope (§5).
         if let Some(children) = ctx.children_by_parent.get(&Some(unit.index)) {
+            if let CwdState::Known(c, w) = &cwd_state
+                && let Err(err) = ctx.budget.charge_alloc(c.len() + w.len())
+            {
+                ctx.exhausted_err = Some((PartId::WholeCall, err));
+                return;
+            }
             let child_entry_cwd = cwd_state.clone();
             let mut child_earlier_writer = *earlier_writer;
             exec_unit_sequence(
@@ -1011,7 +1191,7 @@ pub(crate) fn resolve_command_targets_impl(
 
     exec_unit_sequence(
         &top_level,
-        CwdState::Known(start_cwd.to_vec()),
+        CwdState::Known(start_cwd.to_vec(), start_cwd.to_vec()),
         None,
         &mut earlier_writer,
         &mut ctx,
@@ -1068,18 +1248,55 @@ fn mv_destination_operand(unit: &CommandUnit, eff: Option<&ToolEffects>) -> Opti
         .find(|&i| is_path_role(e.roles.get(i).copied().unwrap_or(OperandRole::Path)))
 }
 
+/// The path of `word`'s final entry as the shell passes it (`~` expanded,
+/// joined onto the real working directory, not normalised and not followed),
+/// so `lstat` sees the entry itself, a link included (review 4, finding 6).
+fn final_entry_path(
+    word: &Word,
+    cwd: &[u8],
+    home: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<Option<Vec<u8>>, Exhausted> {
+    let raw = word.literal_bytes();
+    if raw.is_empty() || raw.contains(&0) {
+        return Ok(None);
+    }
+    budget.charge(raw.len() as u64 + 1)?;
+    budget.charge_alloc(raw.len() + cwd.len().max(home.len()) + 2)?;
+    let path = if word.starts_with_unquoted_tilde() {
+        if raw == b"~" {
+            home.to_vec()
+        } else if let Some(rest) = raw.strip_prefix(b"~/") {
+            join_bytes(home, rest)
+        } else {
+            return Ok(None);
+        }
+    } else if raw.starts_with(b"/") {
+        raw.to_vec()
+    } else {
+        join_bytes(cwd, raw)
+    };
+    Ok(Some(path))
+}
+
+/// Whether an `mv` source is a directory (or can't be established as not
+/// one): the source's final entry is checked with `lstat` BEFORE following
+/// it, since `mv` moves a link itself, not the directory it points to
+/// (review 4, finding 6). `entry` is that final entry's path; without one the
+/// target's canonical path is the fallback.
 fn source_is_dir_or_unknown(
     target: &Target,
+    entry: Option<&[u8]>,
     resolver: &dyn PathResolver,
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
 ) -> Result<bool, Exhausted> {
-    let TargetResolution::Resolved { canonical, .. } = &target.resolution else {
-        return Ok(true);
+    let path = match (entry, &target.resolution) {
+        (Some(p), _) => p,
+        (None, TargetResolution::Resolved { canonical, .. }) => canonical.as_slice(),
+        (None, TargetResolution::Unread(_)) => return Ok(true),
     };
-    // `mv` moves symlinks themselves rather than their target directories, so
-    // `lstat` is the exact check for whether a source is a directory.
-    match resolver.lstat(canonical, caps, budget) {
+    match resolver.lstat(path, caps, budget) {
         Ok(md) => Ok(md.file_type == FileType::Dir),
         Err(ResolveError::NotFound) => Ok(false),
         Err(ResolveError::Io(_) | ResolveError::CapReached(_)) => Ok(true),
@@ -1100,7 +1317,7 @@ fn next_cwd_after_cd(
     if unit.pipeline_id.is_some() || !eff.unread.is_empty() {
         return Ok(CwdState::Unknown);
     }
-    let CwdState::Known(cur) = current else {
+    let CwdState::Known(cur, cur_written) = current else {
         return Ok(CwdState::Unknown);
     };
     match eff.cd_target_operand {
@@ -1111,6 +1328,9 @@ fn next_cwd_after_cd(
             if word.has_unquoted_glob() || word.literal_bytes() == b"-" {
                 return Ok(CwdState::Unknown);
             }
+            let Some(written) = word_spelling(word, cur_written, &protected.home, budget)? else {
+                return Ok(CwdState::Unknown);
+            };
             let resolved = resolve_word_literal(
                 word,
                 cur,
@@ -1130,7 +1350,9 @@ fn next_cwd_after_cd(
                     // otherwise `cd` fails at runtime and later units run in the
                     // prior directory, so treat cwd as Unknown (fail closed).
                     match resolver.stat(&canonical, caps, budget) {
-                        Ok(md) if md.file_type == FileType::Dir => Ok(CwdState::Known(canonical)),
+                        Ok(md) if md.file_type == FileType::Dir => {
+                            Ok(CwdState::Known(canonical, written))
+                        }
                         Ok(_)
                         | Err(
                             ResolveError::NotFound
@@ -1149,8 +1371,11 @@ fn next_cwd_after_cd(
                 || (eff.roles.len() == unit.argv.len()
                     && eff.roles[1..].iter().all(|r| *r == OperandRole::Flag));
             if only_flags {
-                budget.charge_alloc(protected.home.len())?;
-                Ok(CwdState::Known(protected.home.clone()))
+                budget.charge_alloc(2 * protected.home.len())?;
+                Ok(CwdState::Known(
+                    protected.home.clone(),
+                    protected.home.clone(),
+                ))
             } else {
                 Ok(CwdState::Unknown)
             }
@@ -1206,7 +1431,9 @@ fn check_selector_probes(
 ) -> Result<(), Exhausted> {
     let est_len = base.len().max(protected.home.len()) + glob.len() + 2;
     budget.charge(est_len as u64)?;
-    budget.charge_alloc(est_len.saturating_mul(2))?;
+    budget.charge_alloc(
+        est_len.saturating_mul(2) + (est_len / 2 + 1) * std::mem::size_of::<&[u8]>(),
+    )?;
     let norm = lexical_normalize_selector(base, glob, &protected.home);
     let folded = fold_path_listed(&norm, protected.folds, budget)?;
     let Ok(pat_str) = std::str::from_utf8(&folded) else {
@@ -1313,17 +1540,25 @@ pub(crate) fn resolve_subject_paths_impl(
     budget.charge((paths.len() + 1) as u64)?;
 
     let selector_glob = glob.filter(|g| is_selector_glob(g));
-    let non_selector_filter = glob.filter(|g| !is_selector_glob(g)).map(|g| SearchFilter {
-        dialect: FilterDialect::SearchGlob,
-        pattern: Word::derived(g.as_bytes().to_vec()),
-        case_insensitive: false,
-        argv_index: None,
-    });
+    // The filter's `Word` (bytes and provenance) is charged before it is built (§8).
+    let non_selector_filter = match glob.filter(|g| !is_selector_glob(g)) {
+        Some(g) => {
+            budget.charge_alloc(g.len().saturating_mul(2))?;
+            Some(SearchFilter {
+                dialect: FilterDialect::SearchGlob,
+                pattern: Word::derived(g.as_bytes().to_vec()),
+                case_insensitive: false,
+                argv_index: None,
+            })
+        }
+        None => None,
+    };
     let filter_part = PartId::Filter { unit: None };
 
     // Helper: check a single resolved root immediately (so any earlier hit is
     // already stored in `out.outcomes` if a later root exhausts the budget; §8).
-    let mut roots: Vec<Target> = Vec::with_capacity(paths.len().max(1));
+    let mut roots: Vec<Target> = Vec::new();
+    let mut roots_written: Vec<Option<Vec<u8>>> = Vec::new();
 
     // File-tool paths are ALWAYS literal (M1-32 round 4 finding 3; §5; §10 row 11).
     for (path_index, raw) in paths.iter().enumerate() {
@@ -1341,6 +1576,11 @@ pub(crate) fn resolve_subject_paths_impl(
             return Ok(out);
         }
         let part = PartId::SubjectPath { path_index };
+        let written =
+            match lexical_spelling(raw.as_bytes(), &protected.cwd, &protected.home, budget) {
+                Ok(w) => w,
+                Err(e) => return finish_call_exhausted(out, part, e),
+            };
         let target = match resolve_literal_impl(
             raw.as_bytes(),
             &protected.cwd,
@@ -1357,16 +1597,31 @@ pub(crate) fn resolve_subject_paths_impl(
         record_multiply_linked(&target, &mut out.multiply_linked_file);
 
         if selector_glob.is_some() {
-            if let Err(e) = push_checked(&target, protected, budget, &mut out.outcomes) {
+            if let Err(e) = push_checked_written(
+                &target,
+                written.as_deref(),
+                protected,
+                budget,
+                &mut out.outcomes,
+            ) {
                 return finish_call_exhausted(out, part, e);
             }
-            roots.push(target.clone());
+            if let Err(e) = charge_target_clone(&target, budget)
+                .and_then(|()| push_charged(&mut roots, target.clone(), budget))
+                .and_then(|()| {
+                    budget.charge_alloc(written.as_ref().map_or(0, Vec::len))?;
+                    push_charged(&mut roots_written, written.clone(), budget)
+                })
+            {
+                return finish_call_exhausted(out, part, e);
+            }
         } else if recursive {
             let filters_slice = non_selector_filter.as_slice();
             match check_recursive_root_impl(
                 &target,
                 Default::default(),
                 filters_slice,
+                written.as_deref(),
                 protected,
                 resolver,
                 caps,
@@ -1374,8 +1629,11 @@ pub(crate) fn resolve_subject_paths_impl(
             ) {
                 Ok(rec) => {
                     out.multiply_linked_file |= rec.multiply_linked_file;
-                    out.outcomes.extend(rec.outcomes);
-                    out.targets.push(target);
+                    // On exhaustion the hits are kept and the check below records it.
+                    let _ = extend_charged(&mut out.outcomes, rec.outcomes, budget);
+                    if let Err(e) = push_charged(&mut out.targets, target, budget) {
+                        return finish_call_exhausted(out, PartId::WholeCall, e);
+                    }
                     if budget.is_exhausted() {
                         ensure_exhausted_recorded(&mut out, part, budget);
                         return Ok(out);
@@ -1385,7 +1643,13 @@ pub(crate) fn resolve_subject_paths_impl(
                 Err(e) => return finish_call_exhausted(out, part, e),
             }
         } else {
-            if let Err(e) = push_checked(&target, protected, budget, &mut out.outcomes) {
+            if let Err(e) = push_checked_written(
+                &target,
+                written.as_deref(),
+                protected,
+                budget,
+                &mut out.outcomes,
+            ) {
                 return finish_call_exhausted(out, part, e);
             }
             if let Some(filter) = &non_selector_filter
@@ -1405,9 +1669,18 @@ pub(crate) fn resolve_subject_paths_impl(
                     Ok(f) => f,
                     Err(e) => return finish_call_exhausted(out, filter_part, e),
                 };
+                let written_root = match written.as_deref() {
+                    Some(w) => match fold_path_listed(w, protected.folds, budget) {
+                        Ok(fw) if fw != folded_root => Some((w, fw)),
+                        Ok(_) => None,
+                        Err(e) => return finish_call_exhausted(out, filter_part, e),
+                    },
+                    None => None,
+                };
                 if let Err(e) = check_filter_on_root(
                     canonical,
                     &folded_root,
+                    written_root.as_ref().map(|(w, fw)| (*w, fw.as_slice())),
                     filter,
                     false,
                     &filter_part,
@@ -1423,12 +1696,18 @@ pub(crate) fn resolve_subject_paths_impl(
                 }
             }
         }
-        out.targets.push(target);
+        if let Err(e) = push_charged(&mut out.targets, target, budget) {
+            return finish_call_exhausted(out, PartId::WholeCall, e);
+        }
     }
 
     // Implicit cwd root when `paths` is empty and a recursive or glob search runs.
     if paths.is_empty() && (recursive || glob.is_some()) {
         let part = PartId::WholeCall;
+        if let Err(e) = budget.charge_alloc(protected.cwd.len()) {
+            return finish_call_exhausted(out, part, e);
+        }
+        let written = Some(protected.cwd.clone());
         let implicit = match resolve_literal_impl(
             &protected.cwd,
             &protected.cwd,
@@ -1445,16 +1724,31 @@ pub(crate) fn resolve_subject_paths_impl(
         record_multiply_linked(&implicit, &mut out.multiply_linked_file);
 
         if selector_glob.is_some() {
-            if let Err(e) = push_checked(&implicit, protected, budget, &mut out.outcomes) {
+            if let Err(e) = push_checked_written(
+                &implicit,
+                written.as_deref(),
+                protected,
+                budget,
+                &mut out.outcomes,
+            ) {
                 return finish_call_exhausted(out, part, e);
             }
-            roots.push(implicit.clone());
+            if let Err(e) = charge_target_clone(&implicit, budget)
+                .and_then(|()| push_charged(&mut roots, implicit.clone(), budget))
+                .and_then(|()| {
+                    budget.charge_alloc(written.as_ref().map_or(0, Vec::len))?;
+                    push_charged(&mut roots_written, written.clone(), budget)
+                })
+            {
+                return finish_call_exhausted(out, part, e);
+            }
         } else if recursive {
             let filters_slice = non_selector_filter.as_slice();
             match check_recursive_root_impl(
                 &implicit,
                 Default::default(),
                 filters_slice,
+                written.as_deref(),
                 protected,
                 resolver,
                 caps,
@@ -1462,8 +1756,11 @@ pub(crate) fn resolve_subject_paths_impl(
             ) {
                 Ok(rec) => {
                     out.multiply_linked_file |= rec.multiply_linked_file;
-                    out.outcomes.extend(rec.outcomes);
-                    out.targets.push(implicit);
+                    // On exhaustion the hits are kept and the check below records it.
+                    let _ = extend_charged(&mut out.outcomes, rec.outcomes, budget);
+                    if let Err(e) = push_charged(&mut out.targets, implicit, budget) {
+                        return finish_call_exhausted(out, PartId::WholeCall, e);
+                    }
                     if budget.is_exhausted() {
                         ensure_exhausted_recorded(&mut out, part, budget);
                     }
@@ -1472,7 +1769,13 @@ pub(crate) fn resolve_subject_paths_impl(
                 Err(e) => return finish_call_exhausted(out, part, e),
             }
         } else {
-            if let Err(e) = push_checked(&implicit, protected, budget, &mut out.outcomes) {
+            if let Err(e) = push_checked_written(
+                &implicit,
+                written.as_deref(),
+                protected,
+                budget,
+                &mut out.outcomes,
+            ) {
                 return finish_call_exhausted(out, part, e);
             }
             if let Some(filter) = &non_selector_filter
@@ -1492,9 +1795,18 @@ pub(crate) fn resolve_subject_paths_impl(
                     Ok(f) => f,
                     Err(e) => return finish_call_exhausted(out, filter_part, e),
                 };
+                let written_root = match written.as_deref() {
+                    Some(w) => match fold_path_listed(w, protected.folds, budget) {
+                        Ok(fw) if fw != folded_root => Some((w, fw)),
+                        Ok(_) => None,
+                        Err(e) => return finish_call_exhausted(out, filter_part, e),
+                    },
+                    None => None,
+                };
                 if let Err(e) = check_filter_on_root(
                     canonical,
                     &folded_root,
+                    written_root.as_ref().map(|(w, fw)| (*w, fw.as_slice())),
                     filter,
                     false,
                     &filter_part,
@@ -1510,7 +1822,9 @@ pub(crate) fn resolve_subject_paths_impl(
                 }
             }
         }
-        out.targets.push(implicit);
+        if let Err(e) = push_charged(&mut out.targets, implicit, budget) {
+            return finish_call_exhausted(out, PartId::WholeCall, e);
+        }
     }
 
     // Selector glob (`../...`, `/...`, `~...`): expand like shell glob + D-100 escaping Unread.
@@ -1525,17 +1839,41 @@ pub(crate) fn resolve_subject_paths_impl(
             Err(e) => return finish_call_exhausted(out, filter_part, e),
         };
         let anchored = g.starts_with('/') || g.starts_with('~');
-        let root_bases: Vec<Vec<u8>> = if anchored {
-            vec![protected.cwd.clone()]
+        // Each base is the root's canonical path with its written spelling
+        // (D-147); the list and its copies are charged first (§8).
+        let bases_bytes: usize = roots
+            .iter()
+            .zip(&roots_written)
+            .map(|(r, w)| match &r.resolution {
+                TargetResolution::Resolved { canonical, .. } => {
+                    canonical.len() + w.as_ref().map_or(canonical.len(), Vec::len)
+                }
+                TargetResolution::Unread(_) => 0,
+            })
+            .sum::<usize>()
+            + 2 * protected.cwd.len()
+            + (roots.len() + 1) * std::mem::size_of::<(Vec<u8>, Vec<u8>)>();
+        if let Err(e) = budget.charge_alloc(bases_bytes) {
+            return finish_call_exhausted(out, filter_part, e);
+        }
+        let root_bases: Vec<(Vec<u8>, Vec<u8>)> = if anchored {
+            vec![(protected.cwd.clone(), protected.cwd.clone())]
         } else {
             roots
                 .iter()
-                .filter_map(|r| match &r.resolution {
-                    TargetResolution::Resolved { canonical, .. } => Some(canonical.clone()),
+                .zip(&roots_written)
+                .filter_map(|(r, w)| match &r.resolution {
+                    TargetResolution::Resolved { canonical, .. } => Some((
+                        canonical.clone(),
+                        w.clone().unwrap_or_else(|| canonical.clone()),
+                    )),
                     TargetResolution::Unread(_) => None,
                 })
                 .collect()
         };
+        if let Err(e) = budget.charge_alloc(roots.len() * std::mem::size_of::<Vec<u8>>()) {
+            return finish_call_exhausted(out, filter_part, e);
+        }
         let mut root_folded: Vec<Vec<u8>> = Vec::with_capacity(roots.len());
         for r in &roots {
             if let TargetResolution::Resolved { canonical, .. } = &r.resolution {
@@ -1547,10 +1885,11 @@ pub(crate) fn resolve_subject_paths_impl(
         }
 
         let mut escaped = root_bases.is_empty() && !anchored;
-        for base in &root_bases {
-            let exp = match expand_shell_glob_impl(
+        for (base, base_written) in &root_bases {
+            let (exp, exact_written) = match expand_shell_glob_written(
                 &word,
                 base,
+                base_written,
                 &protected.home,
                 filter_part.clone(),
                 access,
@@ -1573,7 +1912,7 @@ pub(crate) fn resolve_subject_paths_impl(
                     return finish_call_exhausted(out, PartId::WholeCall, e);
                 }
             }
-            for target in exp.exact_matches {
+            for (target, written_spelling) in exp.exact_matches.into_iter().zip(exact_written) {
                 if out.targets.len() >= limits::MAX_PATHS {
                     if let Err(e) = push_charged(
                         &mut out.outcomes,
@@ -1597,16 +1936,27 @@ pub(crate) fn resolve_subject_paths_impl(
                     }
                 }
                 record_multiply_linked(&target, &mut out.multiply_linked_file);
-                if let Err(e) = push_checked(&target, protected, budget, &mut out.outcomes) {
+                if let Err(e) = push_checked_written(
+                    &target,
+                    written_spelling.as_deref(),
+                    protected,
+                    budget,
+                    &mut out.outcomes,
+                ) {
                     return finish_call_exhausted(out, filter_part, e);
                 }
-                out.targets.push(target);
+                if let Err(e) = push_charged(&mut out.targets, target, budget) {
+                    return finish_call_exhausted(out, PartId::WholeCall, e);
+                }
             }
             let mut emitted_variant = false;
             for target in exp.variant_only_matches {
                 escaped = true;
                 if !emitted_variant {
                     emitted_variant = true;
+                    if let Err(e) = budget.charge_alloc(g.len()) {
+                        return finish_call_exhausted(out, PartId::WholeCall, e);
+                    }
                     if let Err(e) = push_charged(
                         &mut out.outcomes,
                         PartResult {
@@ -1620,10 +1970,24 @@ pub(crate) fn resolve_subject_paths_impl(
                         return finish_call_exhausted(out, PartId::WholeCall, e);
                     }
                 }
-                out.targets.push(target);
+                if let Err(e) = push_charged(&mut out.targets, target, budget) {
+                    return finish_call_exhausted(out, PartId::WholeCall, e);
+                }
             }
             if let Err(e) =
                 check_selector_probes(base, g, protected, &shared, budget, &mut out.outcomes)
+            {
+                return finish_call_exhausted(out, filter_part, e);
+            }
+            if base_written != base
+                && let Err(e) = check_selector_probes(
+                    base_written,
+                    g,
+                    protected,
+                    &shared,
+                    budget,
+                    &mut out.outcomes,
+                )
             {
                 return finish_call_exhausted(out, filter_part, e);
             }
@@ -1645,11 +2009,12 @@ pub(crate) fn resolve_subject_paths_impl(
         }
         // If recursive is also set on the subject, run S8 / hard-link checks on roots.
         if recursive {
-            for root in &roots {
+            for (root, root_written) in roots.iter().zip(&roots_written) {
                 match check_recursive_root_impl(
                     root,
                     Default::default(),
                     &[],
+                    root_written.as_deref(),
                     protected,
                     resolver,
                     caps,
@@ -1657,7 +2022,8 @@ pub(crate) fn resolve_subject_paths_impl(
                 ) {
                     Ok(rec) => {
                         out.multiply_linked_file |= rec.multiply_linked_file;
-                        out.outcomes.extend(rec.outcomes);
+                        // On exhaustion the hits are kept and the check below records it.
+                        let _ = extend_charged(&mut out.outcomes, rec.outcomes, budget);
                         if budget.is_exhausted() {
                             ensure_exhausted_recorded(
                                 &mut out,

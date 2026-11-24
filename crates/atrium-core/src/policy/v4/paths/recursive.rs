@@ -18,7 +18,7 @@ use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl};
 use crate::policy::v4::paths::sensitive::{
     ASK_FILES, ASK_NAME_PREFIXES, ASK_TREES, BROWSER_FILES, BROWSER_ROOTS, CRED_FILES, CRED_TREES,
     SharedSensitive, check_target_impl, fold_listed_component, fold_path_listed, join_folded,
-    origin_to_part, push_charged, under_bytes, under_str,
+    origin_to_part, push_charged, under_bytes, under_str, written_name_hit,
 };
 
 fn finish_recursive_exhausted(
@@ -42,10 +42,12 @@ fn finish_recursive_exhausted(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_recursive_root_impl(
     root: &Target,
     links: LinkPolicy,
     filters: &[SearchFilter],
+    written_root: Option<&[u8]>,
     protected: &ProtectedSet,
     resolver: &dyn PathResolver,
     caps: &mut FsCaps,
@@ -102,7 +104,32 @@ pub(crate) fn check_recursive_root_impl(
         Ok(f) => f,
         Err(e) => return finish_recursive_exhausted(result, root_part, e),
     };
-    let exempt_root = is_s8_exempt(&folded_root, shared.home_folded());
+    let mut exempt_root = is_s8_exempt(&folded_root, shared.home_folded());
+
+    // D-147: the written spelling of the root (when the flow knows it) is
+    // checked like the canonical one, as on `dev`: its own protected name,
+    // S8, the store and exempt-root rule, and the filter's selected entries
+    // and probes.
+    let written = match written_root {
+        Some(w) => match fold_path_listed(w, protected.folds, budget) {
+            Ok(f) if f != folded_root => Some((w, f)),
+            Ok(_) => None,
+            Err(e) => return finish_recursive_exhausted(result, root_part, e),
+        },
+        None => None,
+    };
+    if let Some((w, folded_w)) = &written {
+        match written_name_hit(w, root.access, &root_part, protected, budget) {
+            Ok(Some(hit)) => {
+                if let Err(e) = push_charged(&mut result.outcomes, hit, budget) {
+                    return finish_recursive_exhausted(result, root_part, e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return finish_recursive_exhausted(result, root_part, e),
+        }
+        exempt_root |= is_s8_exempt(folded_w, shared.home_folded());
+    }
 
     // 2. S8 protected-root policy (§5, §11 item 12): a recursive root that
     //    contains an existing hard-deny path is HardDeny whatever its filters.
@@ -122,12 +149,36 @@ pub(crate) fn check_recursive_root_impl(
         Ok(hit) => hit,
         Err(e) => return finish_recursive_exhausted(result, root_part, e),
     };
+    let s8_hit = s8_hit
+        || match &written {
+            Some((w, folded_w)) => match check_s8_protected_root(
+                w,
+                folded_w,
+                &root_part,
+                protected,
+                &shared,
+                resolver,
+                caps,
+                budget,
+                &mut result.outcomes,
+            ) {
+                Ok(hit) => hit,
+                Err(e) => return finish_recursive_exhausted(result, root_part, e),
+            },
+            None => false,
+        };
 
     // 2b. S8-exempted roots (home, ancestors of home, `~/.config`) and roots
     //     containing credential stores (CR-12 + CR-17) keep `dev`'s
     //     `Ask / Allow (rule) / Allow (Any) / Allow (FullAccess)` verdict via
     //     `StoreHit` (§5, §10 row 16).
-    if !s8_hit && let Some(family) = root_contains_store_or_exempt_sensitive(&folded_root, &shared)
+    if !s8_hit
+        && let Some(family) = root_contains_store_or_exempt_sensitive(&folded_root, &shared)
+            .or_else(|| {
+                written
+                    .as_ref()
+                    .and_then(|(_, f)| root_contains_store_or_exempt_sensitive(f, &shared))
+            })
     {
         let store_hit = PartResult {
             part: root_part.clone(),
@@ -158,6 +209,7 @@ pub(crate) fn check_recursive_root_impl(
         && let Err(e) = check_filter_on_root(
             root_canon,
             &folded_root,
+            written.as_ref().map(|(w, f)| (*w, f.as_slice())),
             filter,
             true,
             &filter_part,
@@ -671,8 +723,9 @@ fn check_s8_protected_root(
                 }
             }
         } else if under_str(root_rel, b).is_some() {
-            // Only a directory inside a browser root can contain browser credential files.
-            match resolver.lstat(root_canon, caps, budget) {
+            // Only a directory inside a browser root can contain browser credential
+            // files; a written root that is a link is followed (D-147).
+            match resolver.stat(root_canon, caps, budget) {
                 Ok(md) if md.file_type == FileType::Dir => {
                     if let Some(found) = browser_dir_has_existing_cred(
                         root_canon, protected, resolver, caps, budget, part, outcomes,
@@ -824,6 +877,9 @@ fn browser_dir_has_existing_cred(
 ) -> Result<Option<Vec<u8>>, Exhausted> {
     budget.charge_alloc(root.len())?;
     let mut stack = vec![(root.to_vec(), 0u8)];
+    // Linked profile folders are walked like folders (D-145; review 4,
+    // finding 2), each linked folder once by identity.
+    let mut visited: HashSet<FileIdentity> = HashSet::new();
     let mut seen = 0usize;
     let mut emitted_depth_cap = false;
     while let Some((dir, depth)) = stack.pop() {
@@ -881,7 +937,21 @@ fn browser_dir_has_existing_cred(
                 budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
                 return Ok(Some(join_bytes(&dir, &entry.name)));
             }
-            if entry.file_type == FileType::Dir {
+            let is_folder = match entry.file_type {
+                FileType::Dir => true,
+                FileType::Symlink => linked_folder(
+                    &dir,
+                    &entry.name,
+                    &mut visited,
+                    resolver,
+                    caps,
+                    budget,
+                    part,
+                    outcomes,
+                )?,
+                _ => false,
+            };
+            if is_folder {
                 if depth + 1 < limits::WALK_MAX_DEPTH {
                     budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
                     push_charged(
@@ -906,6 +976,56 @@ fn browser_dir_has_existing_cred(
         }
     }
     Ok(None)
+}
+
+/// Whether the link `dir/name` leads to a folder to walk (D-145), not yet
+/// visited (by the folder's identity, so link cycles end). A link that
+/// cannot be followed for a reason other than absence is Unread.
+#[allow(clippy::too_many_arguments)]
+fn linked_folder(
+    dir: &[u8],
+    name: &[u8],
+    visited: &mut HashSet<FileIdentity>,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    part: &PartId,
+    outcomes: &mut Vec<PartResult>,
+) -> Result<bool, Exhausted> {
+    budget.charge_alloc(dir.len() + 1 + name.len())?;
+    let child = join_bytes(dir, name);
+    match resolver.stat(&child, caps, budget) {
+        Ok(md) if md.file_type == FileType::Dir => {
+            budget.charge_alloc(4 * std::mem::size_of::<FileIdentity>())?;
+            Ok(md.identity.is_none_or(|id| visited.insert(id)))
+        }
+        Ok(_) | Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {
+            Ok(false)
+        }
+        Err(ResolveError::Exhausted(e)) => Err(e),
+        Err(ResolveError::CapReached(c)) => {
+            push_charged(
+                outcomes,
+                PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::from(c)),
+                },
+                budget,
+            )?;
+            Ok(false)
+        }
+        Err(ResolveError::Io(_)) => {
+            push_charged(
+                outcomes,
+                PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: child }),
+                },
+                budget,
+            )?;
+            Ok(false)
+        }
+    }
 }
 
 /// Checks if a recursive root is an S8-exempted sensitive container (`home`,
@@ -1159,6 +1279,7 @@ fn match_raw_bytes_path(
 pub(crate) fn check_filter_on_root(
     root_canon: &[u8],
     folded_root: &[u8],
+    written_root: Option<(&[u8], &[u8])>,
     filter: &SearchFilter,
     recursive: bool,
     filter_part: &PartId,
@@ -1310,6 +1431,19 @@ pub(crate) fn check_filter_on_root(
                     if !matches!(res.outcome, PartOutcome::Clear) {
                         push_charged(outcomes, res, budget)?;
                     }
+                    if let Some((w, _)) = written_root {
+                        budget.charge_alloc(w.len() + 1 + entry_rel.len())?;
+                        let written_entry = join_bytes(w, &entry_rel);
+                        if let Some(hit) = written_name_hit(
+                            &written_entry,
+                            AccessMode::Read,
+                            filter_part,
+                            protected,
+                            budget,
+                        )? {
+                            push_charged(outcomes, hit, budget)?;
+                        }
+                    }
                 }
                 Ok(false) => {}
                 Err(unread) => {
@@ -1450,118 +1584,125 @@ pub(crate) fn check_filter_on_root(
         }
     };
 
-    // 2a. Hard-deny probes (best-effort probe matching per §2 & brief).
-    for (probe_bytes, hard_id) in shared.hard_deny_probes(budget)? {
-        let Some(rel_bytes) = under_bytes(&probe_bytes, folded_root) else {
-            continue;
-        };
-        let Ok(rel_str) = std::str::from_utf8(rel_bytes) else {
-            continue;
-        };
-        let name = rel_str.rsplit('/').next().unwrap_or(rel_str);
-        if probe_matcher.matches_probe(rel_str, name, recursive, budget)? {
-            budget.charge_alloc(probe_bytes.len().saturating_mul(3))?;
-            push_charged(
-                outcomes,
-                PartResult {
-                    part: filter_part.clone(),
-                    outcome: PartOutcome::HardDenyHit(Hit {
-                        hard_deny_id: Some(hard_id),
-                        source: HitSource::BestEffort,
-                        matched: HitMatch::ProbeName {
-                            probe: String::from_utf8_lossy(&probe_bytes).into_owned(),
-                        },
-                        part: filter_part.clone(),
-                    }),
-                },
-                budget,
-            )?;
-            break;
-        }
-    }
-
-    // 2b. Store probes (CR-12 + CR-17; independent part per §5).
-    let mut store_probe_hit = false;
-    for (probe_bytes, _family) in shared.store_probes(budget)? {
-        let Some(rel_bytes) = under_bytes(&probe_bytes, folded_root) else {
-            continue;
-        };
-        let Ok(rel_str) = std::str::from_utf8(rel_bytes) else {
-            continue;
-        };
-        let name = rel_str.rsplit('/').next().unwrap_or(rel_str);
-        if probe_matcher.matches_probe(rel_str, name, recursive, budget)? {
-            budget.charge_alloc(probe_bytes.len().saturating_mul(3))?;
-            push_charged(
-                outcomes,
-                PartResult {
-                    part: filter_part.clone(),
-                    outcome: PartOutcome::StoreHit(Hit {
-                        hard_deny_id: None,
-                        source: HitSource::Model,
-                        matched: HitMatch::ProbeName {
-                            probe: String::from_utf8_lossy(&probe_bytes).into_owned(),
-                        },
-                        part: filter_part.clone(),
-                    }),
-                },
-                budget,
-            )?;
-            store_probe_hit = true;
-            break;
-        }
-    }
-
-    // Also match `dev`'s ASK_TREES directory-prefix rule (`deny.rs:697-728`):
-    // e.g. `Search(paths=["~"], glob=".zsh_sessions/*.foo")` targets an
-    // ASK_TREE directory by prefix even when the filename suffix isn't one of
-    // the fixed probe extensions.
-    let pat_folded = if store_probe_hit {
-        Vec::new()
-    } else {
-        fold_listed_component(filter.pattern.literal_bytes(), protected.folds, budget)?
-    };
-    if !store_probe_hit && let Ok(pat_folded_bytes) = std::str::from_utf8(&pat_folded) {
-        let pat_trimmed = pat_folded_bytes
-            .trim_start_matches("./")
-            .trim_start_matches('/')
-            .trim_end_matches('/');
-        'ask_tree: for &(t, family) in ASK_TREES {
-            let t_abs = join_folded(shared.home_folded(), t.as_bytes());
-            let Some(tree_rel_bytes) = under_bytes(&t_abs, folded_root) else {
+    // Probes are matched relative to the canonical root and, when it differs,
+    // to the written root (D-147).
+    budget.charge_alloc(2 * std::mem::size_of::<&[u8]>())?;
+    let probe_roots: Vec<&[u8]> = std::iter::once(folded_root)
+        .chain(written_root.map(|(_, f)| f))
+        .collect();
+    for probe_root in probe_roots {
+        // 2a. Hard-deny probes (best-effort probe matching per §2 & brief).
+        for (probe_bytes, hard_id) in shared.hard_deny_probes(budget)? {
+            let Some(rel_bytes) = under_bytes(&probe_bytes, probe_root) else {
                 continue;
             };
-            if tree_rel_bytes.is_empty() {
-                continue;
-            }
-            let Ok(tree_rel) = std::str::from_utf8(tree_rel_bytes) else {
+            let Ok(rel_str) = std::str::from_utf8(rel_bytes) else {
                 continue;
             };
-            for idx in ask_tree_prefix_ends(pat_trimmed, tree_rel, budget)? {
-                let dir_pat = &pat_trimmed[..idx];
-                if let Ok(m) = build_glob_matcher(dir_pat, true, budget)? {
-                    budget.charge(tree_rel.len().max(1) as u64)?;
-                    if m.is_match(tree_rel) {
-                        push_charged(
-                            outcomes,
-                            PartResult {
-                                part: filter_part.clone(),
-                                outcome: PartOutcome::StoreHit(Hit {
-                                    hard_deny_id: None,
-                                    source: HitSource::Model,
-                                    matched: HitMatch::StoreFamily { family },
-                                    part: filter_part.clone(),
-                                }),
+            let name = rel_str.rsplit('/').next().unwrap_or(rel_str);
+            if probe_matcher.matches_probe(rel_str, name, recursive, budget)? {
+                budget.charge_alloc(probe_bytes.len().saturating_mul(3))?;
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: filter_part.clone(),
+                        outcome: PartOutcome::HardDenyHit(Hit {
+                            hard_deny_id: Some(hard_id),
+                            source: HitSource::BestEffort,
+                            matched: HitMatch::ProbeName {
+                                probe: String::from_utf8_lossy(&probe_bytes).into_owned(),
                             },
-                            budget,
-                        )?;
-                        break 'ask_tree;
+                            part: filter_part.clone(),
+                        }),
+                    },
+                    budget,
+                )?;
+                break;
+            }
+        }
+
+        // 2b. Store probes (CR-12 + CR-17; independent part per §5).
+        let mut store_probe_hit = false;
+        for (probe_bytes, _family) in shared.store_probes(budget)? {
+            let Some(rel_bytes) = under_bytes(&probe_bytes, probe_root) else {
+                continue;
+            };
+            let Ok(rel_str) = std::str::from_utf8(rel_bytes) else {
+                continue;
+            };
+            let name = rel_str.rsplit('/').next().unwrap_or(rel_str);
+            if probe_matcher.matches_probe(rel_str, name, recursive, budget)? {
+                budget.charge_alloc(probe_bytes.len().saturating_mul(3))?;
+                push_charged(
+                    outcomes,
+                    PartResult {
+                        part: filter_part.clone(),
+                        outcome: PartOutcome::StoreHit(Hit {
+                            hard_deny_id: None,
+                            source: HitSource::Model,
+                            matched: HitMatch::ProbeName {
+                                probe: String::from_utf8_lossy(&probe_bytes).into_owned(),
+                            },
+                            part: filter_part.clone(),
+                        }),
+                    },
+                    budget,
+                )?;
+                store_probe_hit = true;
+                break;
+            }
+        }
+
+        // Also match `dev`'s ASK_TREES directory-prefix rule (`deny.rs:697-728`):
+        // e.g. `Search(paths=["~"], glob=".zsh_sessions/*.foo")` targets an
+        // ASK_TREE directory by prefix even when the filename suffix isn't one of
+        // the fixed probe extensions.
+        let pat_folded = if store_probe_hit {
+            Vec::new()
+        } else {
+            fold_listed_component(filter.pattern.literal_bytes(), protected.folds, budget)?
+        };
+        if !store_probe_hit && let Ok(pat_folded_bytes) = std::str::from_utf8(&pat_folded) {
+            let pat_trimmed = pat_folded_bytes
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .trim_end_matches('/');
+            'ask_tree: for &(t, family) in ASK_TREES {
+                let t_abs = join_folded(shared.home_folded(), t.as_bytes());
+                let Some(tree_rel_bytes) = under_bytes(&t_abs, probe_root) else {
+                    continue;
+                };
+                if tree_rel_bytes.is_empty() {
+                    continue;
+                }
+                let Ok(tree_rel) = std::str::from_utf8(tree_rel_bytes) else {
+                    continue;
+                };
+                for idx in ask_tree_prefix_ends(pat_trimmed, tree_rel, budget)? {
+                    let dir_pat = &pat_trimmed[..idx];
+                    if let Ok(m) = build_glob_matcher(dir_pat, true, budget)? {
+                        budget.charge(tree_rel.len().max(1) as u64)?;
+                        if m.is_match(tree_rel) {
+                            push_charged(
+                                outcomes,
+                                PartResult {
+                                    part: filter_part.clone(),
+                                    outcome: PartOutcome::StoreHit(Hit {
+                                        hard_deny_id: None,
+                                        source: HitSource::Model,
+                                        matched: HitMatch::StoreFamily { family },
+                                        part: filter_part.clone(),
+                                    }),
+                                },
+                                budget,
+                            )?;
+                            break 'ask_tree;
+                        }
                     }
                 }
             }
         }
     }
-
     Ok(())
 }
 
