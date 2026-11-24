@@ -241,7 +241,7 @@ Non-blocking; a gap in the wire.
 
 ## CR-20 — M1-27 batch — 2026-11-21
 
-**Open: draft; rodrigo approves the text, Pedro confirms the [D-013] items (D-135).**
+**Closed: approved.** rodrigo approved the text (D-136) and Pedro confirmed all 15 [D-013] items of §11 (D-157, 2026-11-24).
 
 **Change:** contract §9's policy engine moves to three outcomes per check (exact hit, exact clear, not established), a readable shell grammar, forward glob expansion by `SessionGate` instead of pattern-versus-pattern reasoning, and one table of known tools that rules and Home's read-only list share. The full text is `docs/contracts/m1-policy-rev4.md`.
 

@@ -1032,3 +1032,9 @@ D-141 removed flag arities from these rows precisely to avoid this.
 - Arities stay only where the frozen table lists them: the Search rows' flag tables, `dev`'s forbidden flags, and the §4 wrappers.
 
 **Escalation (PLAN §8.3, §8.4):** P3 had two Neon rework rounds and still has majors. Round 4 is written by **Opus 5.5**, as a Claude subagent in P3's worktree. It removes the arity modelling outside the table, applies this ruling in core and in the app's validator together, and fixes review 3's three findings. Codex GPT-6.1 Sol stays the reviewer.
+
+## D-157 — 2026-11-24 — Pedro: confirms all 15 items of rev 4 §11
+**Decided by Pedro (driver, owner; D-013).** Pedro confirms every item in `docs/contracts/m1-policy-rev4.md` §11, items 1 to 15 (summary in `rev4-for-pedro.md`). Rodrigo's approval in D-138 and D-139 was the partner's proposal; this confirmation makes them the security defaults.
+- **This includes** item 1 (Unread allows under Any rules and FullAccess after the best-effort pass), item 15 (followed-link searches can be Allow in Home when the link walk finds nothing protected), and the later rulings that narrow or extend the contract within those items: D-141, D-145, D-146, D-147, D-148 and D-156. Each of them only adds Unread or matches `dev`.
+- **CR-20 is closed** (approved).
+- **What it unblocks:** P4 (M1-40), P3's live parts (M1-39: daemon rule validation, `rule-form.ts`, rule validity in Settings) and P5 (M1-41) may merge into `dev` once each one passes its own gate (D-120). **Each merge still needs the driver's explicit go.** This decision doesn't approve any merge by itself.
