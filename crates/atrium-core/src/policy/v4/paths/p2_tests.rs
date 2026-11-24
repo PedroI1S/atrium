@@ -5333,3 +5333,324 @@ fn round6_f6_mv_of_a_link_to_a_directory_moves_the_link() {
     assert!(!run(b"link"));
     assert!(run(b"directory"));
 }
+
+// ---------------------------------------------------------------------------
+// 9. Rework Round 7 regressions (review round 5, D-149, D-151)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round7_cr_p2_3_standalone_checks_name_the_written_spelling() {
+    // CR-P2-3 / D-149 case 1: `resolve_literal` + `check_target` of a
+    // protected name below a browser root that is a link (to an empty folder).
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/tmp/profile");
+    fs.mkdir_all(b"/h/u/.config");
+    fs.add_symlink(b"/h/u/.config/google-chrome", b"/tmp/profile");
+    let prot = default_build(&fs);
+    let t = literal(b"~/.config/google-chrome/Cookies", AccessMode::Read, &fs);
+    assert_eq!(
+        t.written.as_deref(),
+        Some(&b"/h/u/.config/google-chrome/Cookies"[..])
+    );
+    assert!(matches!(
+        check_target(&t, &prot, &mut ComputeBudget::with_default_limits())
+            .unwrap()
+            .outcome,
+        PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("credential-read")
+    ));
+
+    // Case 2: the standalone `check_recursive_root` on a written root that
+    // is a link: S8 names the root by its written spelling (on the real root).
+    fs.add_file(b"/tmp/profile/Cookies");
+    let prot = default_build(&fs);
+    let root = literal(b"~/.config/google-chrome", AccessMode::Read, &fs);
+    let res = check_recursive_root(
+        &root,
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&res.outcomes, "credential-read"),
+        "{:?}",
+        res.outcomes
+    );
+}
+
+#[test]
+fn round7_f1_unread_recursive_root_keeps_its_written_name_hit() {
+    // Review 5, finding 1: `~/.gnupg` cannot be traversed, so the root is
+    // Unread; its written name is still a hit, kept beside the reason (§1).
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.gnupg/key");
+    fs.set_dir_unreadable(b"/h/u/.gnupg", FsIoError::PermissionDenied);
+    let prot = default_build(&fs);
+    let res = resolve_subject_paths(
+        &["~/.gnupg/key".to_string()],
+        None,
+        true,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&res.outcomes, "credential-read"),
+        "{:?}",
+        res.outcomes
+    );
+    assert!(has_unread(&res.outcomes, |r| matches!(
+        r,
+        UnreadReason::UnresolvablePath { .. }
+    )));
+}
+
+#[test]
+fn round7_f2_followed_link_through_an_aliased_browser_root_reaches_it() {
+    // Review 5, finding 2: `rg -L token proj` with
+    // `proj/p -> ~/.config/google-chrome -> /tmp/profile` (dev's
+    // `links_below` on canonical roots: the link reaches the browser root).
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/profile/Cookies");
+    fs.mkdir_all(b"/h/u/.config");
+    fs.add_symlink(b"/h/u/.config/google-chrome", b"/tmp/profile");
+    fs.add_symlink(b"/h/u/proj/p", b"/h/u/.config/google-chrome");
+    let prot = default_build(&fs);
+    let root = literal(b"proj", AccessMode::Read, &fs);
+    let follow = LinkPolicy {
+        at_root: true,
+        below_root: true,
+    };
+    let res = check_recursive_root(
+        &root,
+        follow,
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&res.outcomes, "credential-read"),
+        "{:?}",
+        res.outcomes
+    );
+
+    // With a filter, the reached link is an over-approximation: Unread.
+    let filter = SearchFilter {
+        dialect: FilterDialect::RgGlob,
+        pattern: unquoted(b"*.rs"),
+        case_insensitive: false,
+        argv_index: Some(1),
+    };
+    let filtered = check_recursive_root(
+        &root,
+        follow,
+        &[filter],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        !has_any_hard_deny(&filtered.outcomes),
+        "{:?}",
+        filtered.outcomes
+    );
+    assert!(has_unread(&filtered.outcomes, |r| matches!(
+        r,
+        UnreadReason::FollowedLinkUnderFilter { .. }
+    )));
+}
+
+#[test]
+fn round7_alias_rule_names_paths_below_an_aliased_root() {
+    // dev's `alias_fix`: a path below the canonical folder of a protected
+    // root that is a link is named on the root's spelling, so an absent
+    // browser file read through the real folder is a hit, a public `.ssh`
+    // name is not, and a search rooted at the real folder is S8.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/profile/Cookies");
+    fs.mkdir_all(b"/h/u/.config");
+    fs.add_symlink(b"/h/u/.config/google-chrome", b"/tmp/profile");
+    fs.mkdir_all(b"/tmp/keys");
+    fs.add_symlink(b"/h/u/.ssh", b"/tmp/keys");
+    let prot = default_build(&fs);
+    for p in ["/tmp/profile/Login Data", "/tmp/keys/id_rsa"] {
+        let r = subject(p, AccessMode::Read, &prot, &fs);
+        assert!(
+            has_hard_deny(&r.outcomes, "credential-read"),
+            "{p}: {:?}",
+            r.outcomes
+        );
+    }
+    let pubkey = subject("/tmp/keys/id_rsa.pub", AccessMode::Read, &prot, &fs);
+    assert!(
+        !has_any_hard_deny(&pubkey.outcomes),
+        "{:?}",
+        pubkey.outcomes
+    );
+    let res = resolve_subject_paths(
+        &["/tmp/profile".to_string()],
+        Some("*.rs"),
+        true,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&res.outcomes, "credential-read"),
+        "{:?}",
+        res.outcomes
+    );
+}
+
+#[test]
+fn round7_f3_written_spelling_gets_the_unlisted_equivalence_check() {
+    // Review 5, finding 3: Atrium data at `/h/u/Café/atrium` (absent); the
+    // NFD spelling `Cafe\u{0301}` is a link to an ordinary folder.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/tmp/public");
+    fs.add_symlink("/h/u/Cafe\u{0301}".as_bytes(), b"/tmp/public");
+    let prot = build_with(&fs, &["/h/u/Caf\u{00E9}/atrium".as_bytes()], &[]);
+    assert!(matches!(
+        read_outcome("/h/u/Cafe\u{0301}/atrium/db".as_bytes(), &prot, &fs),
+        PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence { .. })
+    ));
+}
+
+#[test]
+fn round7_f4_globbed_mv_source_is_typed_by_the_expanded_entry() {
+    // Review 5, finding 4: `mv link/../src* dest`, with `link -> /x/sub`:
+    // expansion selects the directory `/x/srcdir`; the lexical spelling
+    // `/h/u/srcdir` is an ordinary file and must not decide the type.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/x/sub");
+    fs.mkdir_all(b"/x/srcdir");
+    fs.add_symlink(b"/h/u/link", b"/x/sub");
+    fs.add_file(b"/h/u/srcdir");
+    fs.mkdir_all(b"/h/u/dest");
+    let prot = default_build(&fs);
+    let eff = ToolEffects {
+        tool_name: Some("mv"),
+        subcommand: None,
+        roles: vec![OperandRole::Command, OperandRole::Path, OperandRole::Path],
+        operand_access: vec![
+            AccessMode::Read,
+            AccessMode::ReadWrite,
+            AccessMode::ReadWrite,
+        ],
+        writes: true,
+        derived_destinations: DerivedDestinations::WhenSourceIsDir,
+        reads_recursively: false,
+        links: LinkPolicy::default(),
+        code: CodeExecution::None,
+        filter_dialect: None,
+        filters: vec![],
+        home_readonly_eligible: false,
+        cd_target_operand: None,
+        git_selects_by_name: false,
+        unread: vec![],
+    };
+    let res = resolve_command_targets(
+        &[unit(
+            0,
+            vec![
+                unquoted(b"mv"),
+                unquoted(b"link/../src*"),
+                unquoted(b"dest"),
+            ],
+            vec![],
+            Separator::Start,
+            None,
+        )],
+        &[eff],
+        CWD,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_unread(&res.outcomes, |r| matches!(
+            r,
+            UnreadReason::DerivedDestinations { .. }
+        )),
+        "{:?}",
+        res.outcomes
+    );
+}
+
+#[test]
+fn round7_f5_initial_cwd_copies_are_charged() {
+    // Review 5, finding 5: the working-directory state holds two copies of
+    // a five-byte cwd; an allocation budget of five cannot cover them.
+    let fs = FakeFs::new();
+    let prot = default_build(&fs);
+    let err = resolve_command_targets(
+        &[],
+        &[],
+        b"/proj",
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::new(100, 5),
+    )
+    .unwrap_err();
+    assert_eq!(err.reason, ExhaustReason::AllocationBudget);
+}
+
+#[test]
+fn round7_f6_recursive_filter_entry_keeps_store_hit_beside_gap() {
+    // Review 5, finding 6: an unlistable `~/.ssh` gives an AnyTarget gap; the
+    // selected entry `proj/x.token -> ~/.pypirc` keeps its Store hit beside
+    // the gap's Unread (§1).
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.pypirc");
+    fs.add_symlink(b"/h/u/proj/x.token", b"/h/u/.pypirc");
+    fs.mkdir_all(b"/h/u/.ssh");
+    fs.set_dir_read_error(b"/h/u/.ssh", FsIoError::PermissionDenied);
+    let prot = default_build(&fs);
+    assert!(
+        prot.identity_gaps
+            .iter()
+            .any(|g| g.scope == GapScope::AnyTarget)
+    );
+    let res = resolve_subject_paths(
+        &["proj".to_string()],
+        Some("*.token"),
+        true,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        res.outcomes
+            .iter()
+            .any(|r| r.part == PartId::Filter { unit: None }
+                && matches!(r.outcome, PartOutcome::StoreHit(_))),
+        "{:?}",
+        res.outcomes
+    );
+    assert!(
+        res.outcomes
+            .iter()
+            .any(|r| r.part == PartId::Filter { unit: None }
+                && matches!(r.outcome, PartOutcome::Unread(_)))
+    );
+}
