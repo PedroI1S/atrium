@@ -947,3 +947,10 @@ P2's next round, round 5 (Opus 5.5, D-142), applies this ruling, keeps the rest 
 **Decided by rodrigo (driver), on the orchestrator's recommendation.** P2 (M1-38) has had three Opus rounds (D-142, D-145). Its reviews found 14, 9, 8 and 7 findings (`reviews/M1-38-rev4-p2-paths-round4.md`). The two most serious of review 4's findings share one cause, a regression against `dev`. P2 compares protected names only on the canonical path. `dev` also compares them on the written spelling: `Sensitive::hit` runs over `all_paths`, which includes the lexical resolution. So `~/.config/google-chrome/Cookies` or `~/.azure/msal_token_cache.json` stops being a hit when the root or file is a symlink. The other findings are local.
 
 **An exception to PLAN §8.4:** Opus 5.5 writes one more P2 round and fixes all seven findings. Protected names, in every listed-fold spelling, are checked on both the written (lexically normalised) spelling and the canonical path, as on `dev`. D-145 still bounds what the builder promises. If the next review still has findings, the orchestrator brings them back to the driver before any further round.
+
+## D-148 — 2026-11-24 — rodrigo: a short Opus round for P1; D-146's two stricter bracket rules confirmed
+**Decided by rodrigo (driver), on the orchestrator's recommendation.**
+1. **P1's last finding.** Review 6 of P1 (M1-37, `reviews/M1-37-rev4-p1-command-model-round6.md`) found one major. If the budget runs out right after the 513th unit has been read completely, both lexers return Exhausted (Ask) instead of TooLarge (Deny), against §1's precedence and §8's structural cap. **Exception to PLAN §8.4:** Opus 5.5 fixes only that, in both lexers, with combined cap-and-exhaustion tests. If the next review still has findings, they come back to the driver.
+2. **D-146 is amended with two rules.** Both only add Unread.
+   - Unquoted `/` is not an accepted member of `[…]`. A slash never matches inside a class in pathname matching, and the shells treat it differently.
+   - A quoted or escaped `!` or `^` inside a class is also outside the model, following D-146's unqualified "no `!` or `^`".
