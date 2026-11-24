@@ -205,6 +205,7 @@ fn push_entry_charged(
 #[cfg(target_os = "linux")]
 fn canonicalize_via_proc(
     p: &Path,
+    caps: &mut FsCaps,
     budget: &mut ComputeBudget,
 ) -> Result<Option<Vec<u8>>, ResolveError> {
     use rustix::fs::{CWD, Mode, OFlags, open, readlinkat_raw};
@@ -237,6 +238,9 @@ fn canonicalize_via_proc(
     let Ok(link_cstr) = std::ffi::CStr::from_bytes_with_nul(&link[..=end]) else {
         return Ok(None);
     };
+    // Reading the `/proc` link is a link read: charged first (round-3 finding 5).
+    caps.charge_link_read()?;
+    budget.charge(end as u64)?;
     let mut buf = [0u8; PATH_MAX];
     let Ok(len) = readlinkat_raw(CWD, link_cstr, &mut buf) else {
         return Ok(None);
@@ -326,7 +330,7 @@ impl PathResolver for FsResolver {
         charge_path_conversion(path, budget)?;
         let p = bytes_to_path(path)?;
         #[cfg(target_os = "linux")]
-        if let Some(real) = canonicalize_via_proc(p, budget)? {
+        if let Some(real) = canonicalize_via_proc(p, caps, budget)? {
             return Ok(real);
         }
         // Fallback (no `/proc`, or another platform): `realpath` allocates a

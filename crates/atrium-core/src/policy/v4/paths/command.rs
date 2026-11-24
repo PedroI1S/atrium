@@ -16,7 +16,8 @@ use crate::policy::v4::paths::glob::expand_shell_glob_impl;
 use crate::policy::v4::paths::recursive::{check_filter_on_root, check_recursive_root_impl};
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl, resolve_word_literal};
 use crate::policy::v4::paths::sensitive::{
-    SharedSensitive, check_target_impl, fold_path_listed, origin_to_part, push_charged, under_bytes,
+    SharedSensitive, check_target_parts, fold_path_listed, origin_to_part, push_charged,
+    under_bytes,
 };
 
 #[derive(Debug, Clone)]
@@ -36,8 +37,11 @@ fn push_checked(
     budget: &mut ComputeBudget,
     outcomes: &mut Vec<PartResult>,
 ) -> Result<(), Exhausted> {
-    let checked = check_target_impl(target, protected, budget)?;
-    push_charged(outcomes, checked, budget)?;
+    let (exact, gap) = check_target_parts(target, protected, budget)?;
+    push_charged(outcomes, exact, budget)?;
+    if let Some(gap) = gap {
+        push_charged(outcomes, gap, budget)?;
+    }
     Ok(())
 }
 
@@ -250,6 +254,12 @@ fn exec_unit_sequence(
             return;
         }
 
+        // `mv`'s trigger is a directory SOURCE (annex: `WhenSourceIsDir`). With
+        // the table's all-`Path` operands, the last path operand is the
+        // destination, unless a `-t` / `--target-directory` form names it,
+        // in which case every path operand may be a source (round-3 finding 8).
+        let mv_destination = mv_destination_operand(unit, eff);
+
         // Resolve operands according to ToolEffects roles & access modes.
         for (argv_index, word) in unit.argv.iter().enumerate() {
             let (role, access) = match eff {
@@ -423,6 +433,7 @@ fn exec_unit_sequence(
                     if eff.is_some_and(|e| {
                         e.derived_destinations == DerivedDestinations::WhenSourceIsDir
                     }) && role == OperandRole::Path
+                        && Some(argv_index) != mv_destination
                     {
                         match source_is_dir_or_unknown(&target, ctx.resolver, ctx.caps, ctx.budget)
                         {
@@ -525,6 +536,7 @@ fn exec_unit_sequence(
                 if eff
                     .is_some_and(|e| e.derived_destinations == DerivedDestinations::WhenSourceIsDir)
                     && role == OperandRole::Path
+                    && Some(argv_index) != mv_destination
                 {
                     match source_is_dir_or_unknown(&target, ctx.resolver, ctx.caps, ctx.budget) {
                         Ok(is_dir) => {
@@ -705,20 +717,26 @@ fn exec_unit_sequence(
                 DerivedDestinations::Always => true,
                 DerivedDestinations::WhenSourceIsDir => mv_source_is_dir,
             };
-            if derived
-                && let Err(err) = push_charged(
-                    &mut ctx.out.outcomes,
-                    PartResult {
-                        part: PartId::Unit(unit.index),
-                        outcome: PartOutcome::Unread(UnreadReason::DerivedDestinations {
-                            tool: e.tool_name.unwrap_or("unknown").to_string(),
-                        }),
-                    },
-                    ctx.budget,
-                )
-            {
-                ctx.exhausted_err = Some((PartId::WholeCall, err));
-                return;
+            if derived {
+                let pushed = ctx
+                    .budget
+                    .charge_alloc(e.tool_name.map_or(7, str::len))
+                    .and_then(|()| {
+                        push_charged(
+                            &mut ctx.out.outcomes,
+                            PartResult {
+                                part: PartId::Unit(unit.index),
+                                outcome: PartOutcome::Unread(UnreadReason::DerivedDestinations {
+                                    tool: e.tool_name.unwrap_or("unknown").to_string(),
+                                }),
+                            },
+                            ctx.budget,
+                        )
+                    });
+                if let Err(err) = pushed {
+                    ctx.exhausted_err = Some((PartId::WholeCall, err));
+                    return;
+                }
             }
         }
 
@@ -871,14 +889,46 @@ pub(crate) fn resolve_command_targets_impl(
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
 ) -> Result<ResolvedCallPaths, Exhausted> {
+    let mut out = ResolvedCallPaths::default();
+
+    // A line whose path operands and redirect targets alone exceed MAX_PATHS
+    // is Too large before any budget is spent (§1: TooLarge is above
+    // Exhausted); its record survives an exhausted budget.
+    let candidate_paths: usize = units
+        .iter()
+        .enumerate()
+        .map(|(pos, u)| {
+            let operands = (1..u.argv.len())
+                .filter(|&i| {
+                    let role = effects
+                        .get(pos)
+                        .and_then(|e| e.roles.get(i).copied())
+                        .unwrap_or(OperandRole::Path);
+                    is_path_role(role)
+                })
+                .count();
+            operands + u.redirects.len()
+        })
+        .sum();
+    if candidate_paths > limits::MAX_PATHS {
+        let too_large = PartResult {
+            part: PartId::WholeCall,
+            outcome: PartOutcome::TooLarge(Cap::Paths),
+        };
+        if let Err(e) = push_charged(&mut out.outcomes, too_large, budget) {
+            return finish_call_exhausted(out, PartId::WholeCall, e);
+        }
+        return Ok(out);
+    }
+
+    // The execution-tree maps below hold one small entry per unit; their
+    // storage (with hash-table overhead) is charged first (§8).
     budget.charge((units.len() + start_cwd.len() + 1) as u64)?;
     budget.charge_alloc(
         start_cwd
             .len()
-            .saturating_add(units.len() * std::mem::size_of::<usize>()),
+            .saturating_add(units.len().saturating_mul(160)),
     )?;
-
-    let mut out = ResolvedCallPaths::default();
 
     // Build the execution tree from `parent_unit` and `depth` so nested-shell
     // children resolve at their parent's entry cwd regardless of flattening
@@ -990,6 +1040,32 @@ pub(crate) fn resolve_command_targets_impl(
     }
 
     Ok(out)
+}
+
+/// The argv index of `mv`'s destination operand, which is not a source for
+/// the `WhenSourceIsDir` trigger: the last path-role operand. `None` (every
+/// path operand may be a source) when the unit is not such a writer or when a
+/// `-t` / `--target-directory` form may name the destination elsewhere; a
+/// short-option cluster containing `t` counts, conservatively.
+fn mv_destination_operand(unit: &CommandUnit, eff: Option<&ToolEffects>) -> Option<usize> {
+    let e = eff.filter(|e| e.derived_destinations == DerivedDestinations::WhenSourceIsDir)?;
+    let mut options_ended = false;
+    for w in unit.argv.iter().skip(1) {
+        let b = w.literal_bytes();
+        if options_ended {
+            continue;
+        }
+        if b == b"--" {
+            options_ended = true;
+        } else if b.starts_with(b"--target-directory")
+            || (b.len() > 1 && b[0] == b'-' && b[1] != b'-' && b.contains(&b't'))
+        {
+            return None;
+        }
+    }
+    (1..unit.argv.len())
+        .rev()
+        .find(|&i| is_path_role(e.roles.get(i).copied().unwrap_or(OperandRole::Path)))
 }
 
 fn source_is_dir_or_unknown(
@@ -1151,6 +1227,7 @@ fn check_selector_probes(
         if let Ok(ps) = std::str::from_utf8(&probe_bytes)
             && matcher.is_match(ps)
         {
+            budget.charge_alloc(ps.len())?;
             push_charged(
                 outcomes,
                 PartResult {
@@ -1174,6 +1251,7 @@ fn check_selector_probes(
         if let Ok(ps) = std::str::from_utf8(&probe_bytes)
             && matcher.is_match(ps)
         {
+            budget.charge_alloc(ps.len())?;
             push_charged(
                 outcomes,
                 PartResult {
@@ -1215,9 +1293,10 @@ pub(crate) fn resolve_subject_paths_impl(
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
 ) -> Result<ResolvedCallPaths, Exhausted> {
-    budget.charge((paths.len() + 1) as u64)?;
     let mut out = ResolvedCallPaths::default();
 
+    // A structural limit decides before any budget is spent (§1: TooLarge is
+    // above Exhausted), and its record survives an exhausted budget.
     if paths.len() > limits::MAX_USES {
         if let Err(e) = push_charged(
             &mut out.outcomes,
@@ -1231,6 +1310,7 @@ pub(crate) fn resolve_subject_paths_impl(
         }
         return Ok(out);
     }
+    budget.charge((paths.len() + 1) as u64)?;
 
     let selector_glob = glob.filter(|g| is_selector_glob(g));
     let non_selector_filter = glob.filter(|g| !is_selector_glob(g)).map(|g| SearchFilter {

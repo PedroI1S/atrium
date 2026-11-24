@@ -260,6 +260,7 @@ fn s8_read_dir_cached<'a>(
             Ok(entries) => Some(entries),
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => None,
             Err(ResolveError::Io(_)) => {
+                budget.charge_alloc(dir.len())?;
                 push_charged(
                     outcomes,
                     PartResult {
@@ -319,6 +320,7 @@ fn find_s8_folded_matches(
                 Ok(Vec::new())
             }
             Err(ResolveError::Io(_)) => {
+                budget.charge_alloc(base.len())?;
                 push_charged(
                     outcomes,
                     PartResult {
@@ -474,6 +476,7 @@ fn check_s8_protected_root(
             Ok(_) => Ok(true),
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => Ok(false),
             Err(ResolveError::Io(_)) => {
+                budget.charge_alloc(cand.len())?;
                 push_charged(
                     outcomes,
                     PartResult {
@@ -681,6 +684,7 @@ fn check_s8_protected_root(
                 Ok(_)
                 | Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {}
                 Err(ResolveError::Io(_)) => {
+                    budget.charge_alloc(root_canon.len())?;
                     push_charged(
                         outcomes,
                         PartResult {
@@ -785,7 +789,7 @@ fn dir_has_existing_hard_deny_ssh_entry(
             }
             if entry.file_type == FileType::Dir {
                 if depth + 1 < limits::WALK_MAX_DEPTH {
-                    stack.push((child, depth + 1));
+                    push_charged(&mut stack, (child, depth + 1), budget)?;
                 } else if !emitted_depth_cap {
                     emitted_depth_cap = true;
                     push_charged(
@@ -880,7 +884,11 @@ fn browser_dir_has_existing_cred(
             if entry.file_type == FileType::Dir {
                 if depth + 1 < limits::WALK_MAX_DEPTH {
                     budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
-                    stack.push((join_bytes(&dir, &entry.name), depth + 1));
+                    push_charged(
+                        &mut stack,
+                        (join_bytes(&dir, &entry.name), depth + 1),
+                        budget,
+                    )?;
                 } else if !emitted_depth_cap {
                     emitted_depth_cap = true;
                     push_charged(
@@ -1338,6 +1346,7 @@ pub(crate) fn check_filter_on_root(
                                 }
                                 Err(ResolveError::NotFound) => false,
                                 Err(_) => {
+                                    budget.charge_alloc(entry_full.len())?;
                                     push_charged(
                                         outcomes,
                                         PartResult {
@@ -1356,6 +1365,7 @@ pub(crate) fn check_filter_on_root(
                         }
                         Ok(_) | Err(ResolveError::NotFound) => false,
                         Err(ResolveError::Io(_)) => {
+                            budget.charge_alloc(entry_full.len())?;
                             push_charged(
                                 outcomes,
                                 PartResult {
@@ -1389,7 +1399,7 @@ pub(crate) fn check_filter_on_root(
                 break;
             }
             if is_traversable_dir && depth + 1 < max_depth {
-                stack.push((entry_full, entry_rel, depth + 1));
+                push_charged(&mut stack, (entry_full, entry_rel, depth + 1), budget)?;
             } else if is_traversable_dir
                 && (recursive || compiled.has_globstar)
                 && !emitted_depth_cap
@@ -1450,6 +1460,7 @@ pub(crate) fn check_filter_on_root(
         };
         let name = rel_str.rsplit('/').next().unwrap_or(rel_str);
         if probe_matcher.matches_probe(rel_str, name, recursive, budget)? {
+            budget.charge_alloc(probe_bytes.len().saturating_mul(3))?;
             push_charged(
                 outcomes,
                 PartResult {
@@ -1480,6 +1491,7 @@ pub(crate) fn check_filter_on_root(
         };
         let name = rel_str.rsplit('/').next().unwrap_or(rel_str);
         if probe_matcher.matches_probe(rel_str, name, recursive, budget)? {
+            budget.charge_alloc(probe_bytes.len().saturating_mul(3))?;
             push_charged(
                 outcomes,
                 PartResult {
@@ -1639,6 +1651,7 @@ fn walk_followed_links(
         }
         Err(ResolveError::NotFound) => {}
         Err(ResolveError::Io(_)) => {
+            budget.charge_alloc(root_canon.len())?;
             push_charged(
                 outcomes,
                 PartResult {
@@ -1827,6 +1840,7 @@ fn walk_followed_links(
                         )?;
                         if s8 {
                             if has_filter {
+                                budget.charge_alloc(canonical.len())?;
                                 push_charged(
                                     outcomes,
                                     PartResult {
@@ -1849,6 +1863,7 @@ fn walk_followed_links(
                                 root_contains_store_or_exempt_sensitive(&folded, shared)
                             {
                                 if has_filter {
+                                    budget.charge_alloc(canonical.len())?;
                                     push_charged(
                                         outcomes,
                                         PartResult {
@@ -1882,6 +1897,9 @@ fn walk_followed_links(
                         // If the symlink points to a directory, walk inside it (cycle-guarded).
                         match resolver.stat(&canonical, caps, budget) {
                             Ok(md) if md.file_type == FileType::Dir => {
+                                budget.charge_alloc(
+                                    canonical.len() + 2 * std::mem::size_of::<Vec<u8>>(),
+                                )?;
                                 let fresh_path = visited_paths.insert(canonical.clone());
                                 let fresh_id = md.identity.is_none_or(|id| visited_ids.insert(id));
                                 if fresh_path && fresh_id {
@@ -1902,7 +1920,7 @@ fn walk_followed_links(
                                             )?;
                                         }
                                     } else {
-                                        stack.push((canonical, depth + 1));
+                                        push_charged(&mut stack, (canonical, depth + 1), budget)?;
                                     }
                                 }
                             }
@@ -1949,8 +1967,11 @@ fn walk_followed_links(
                                 budget,
                             )?;
                         }
-                    } else if visited_paths.insert(child.clone()) {
-                        stack.push((child, depth + 1));
+                    } else {
+                        budget.charge_alloc(child.len() + 2 * std::mem::size_of::<Vec<u8>>())?;
+                        if visited_paths.insert(child.clone()) {
+                            push_charged(&mut stack, (child, depth + 1), budget)?;
+                        }
                     }
                 }
                 FileType::File | FileType::Other => {}
@@ -2030,7 +2051,11 @@ fn walk_hard_links(
                         .is_ok_and(|n| limits::HARD_LINK_WALK_SKIP_DIRS.contains(&n));
                     if !skip && depth + 1 < limits::HARD_LINK_WALK_DEPTH {
                         budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
-                        stack.push((join_bytes(&dir, &entry.name), depth + 1));
+                        push_charged(
+                            &mut stack,
+                            (join_bytes(&dir, &entry.name), depth + 1),
+                            budget,
+                        )?;
                     }
                 }
                 FileType::File => {

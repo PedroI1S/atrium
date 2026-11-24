@@ -16,14 +16,13 @@ use crate::policy::limits;
 use crate::policy::model::{
     AccessMode, ByteProvenance, CapReached, CodeExecution, CommandUnit, ComputeBudget,
     DerivedDestinations, ExhaustReason, Exhausted, FilterDialect, FoldRules, FsCap, FsCaps,
-    FsIoError, HitMatch, HitSource, LinkPolicy, ModelRedirect, OperandRole, PartId, PartOutcome,
-    PartResult, PipelineId, ProtectedSet, ResolveError, SearchFilter, Separator, TargetOrigin,
-    TargetResolution, ToolEffects, UnitIndex, UnreadReason, Word,
+    FsIoError, GapScope, HitMatch, HitSource, LinkPolicy, ModelRedirect, OperandRole, PartId,
+    PartOutcome, PartResult, PipelineId, ProtectedSet, ResolveError, SearchFilter, Separator,
+    TargetOrigin, TargetResolution, ToolEffects, UnitIndex, UnreadReason, Word,
 };
 use crate::policy::v4::paths::resolver::fake::FakeFs;
 use crate::policy::v4::paths::sensitive::{
-    GapScope, ProtectedSetBuild, SharedSensitive, build_protected_set, fold_listed_component,
-    fold_path_listed,
+    SharedSensitive, build_protected_set, fold_listed_component, fold_path_listed,
 };
 use crate::policy::v4::paths::{
     FsResolver, PathResolver, check_recursive_root, check_target, expand_shell_glob,
@@ -59,7 +58,6 @@ fn default_protected(fs: &dyn PathResolver) -> ProtectedSet {
         &mut budget,
     )
     .expect("build_protected_set fits default budget")
-    .set
 }
 
 fn unit(
@@ -967,8 +965,7 @@ fn boundary_case_and_fold_variants_sensitive_and_insensitive_and_nfc_nfd() {
         &mut caps,
         &mut budget,
     )
-    .unwrap()
-    .set;
+    .unwrap();
 
     // Listed folds -> HardDenyHit (never downgraded!)
     for p in [
@@ -1083,8 +1080,7 @@ fn boundary_case_and_fold_variants_sensitive_and_insensitive_and_nfc_nfd() {
         &mut caps,
         &mut budget,
     )
-    .unwrap()
-    .set;
+    .unwrap();
     let t_nfd = resolve_literal(
         "/h/u/Caf\u{00E9}/atrium/db".as_bytes(),
         CWD,
@@ -1858,8 +1854,7 @@ fn carried_m1_31_s8_filters_atrium_outside_home_browser_and_shared_sensitive() {
         &mut caps,
         &mut budget,
     )
-    .unwrap()
-    .set;
+    .unwrap();
 
     // 1. S8 blocks `~/.aws` EVEN WITH a non-matching filter (`rg -g '*.txt' x ~/.aws`)
     let aws_root = resolve_literal(
@@ -2237,8 +2232,7 @@ fn fs_resolver_real_tempdir_symlinks_dangling_hardlinks_unreadable_and_budgets()
         &mut caps,
         &mut budget,
     )
-    .unwrap()
-    .set;
+    .unwrap();
 
     // 1. Symlink & dangling link resolve to fake `~/.ssh/...` -> HardDenyHit
     for rel in ["proj/link_key", "proj/dangling_key"] {
@@ -3290,8 +3284,7 @@ fn round2_finding09_unicode_normalization_u01fb_and_independent_conformance() {
         &mut caps,
         &mut budget,
     )
-    .unwrap()
-    .set;
+    .unwrap();
 
     for nfd_path in [
         "/h/u/a\u{030A}\u{0301}/atrium/db",
@@ -3393,8 +3386,7 @@ fn round2_finding09_unicode_normalization_u01fb_and_independent_conformance() {
         &mut FsCaps::with_default_limits(),
         &mut ComputeBudget::with_default_limits(),
     )
-    .unwrap()
-    .set;
+    .unwrap();
     let acute_alone = resolve_literal(
         "/h/u/\u{00E1}/atrium/db".as_bytes(),
         CWD,
@@ -3428,8 +3420,7 @@ fn round2_finding09_unicode_normalization_u01fb_and_independent_conformance() {
         &mut caps,
         &mut budget,
     )
-    .unwrap()
-    .set;
+    .unwrap();
     let t_norm = resolve_literal(
         "/h/u/a\u{030A}\u{0301}/atrium/db".as_bytes(),
         CWD,
@@ -3570,8 +3561,7 @@ fn round2_finding11_budgets_all_fs_caps_and_small_nonzero_alloc() {
         &mut caps,
         &mut budget,
     )
-    .unwrap()
-    .set;
+    .unwrap();
 
     // 1. `check_target` on a Clear target fails with 0 AND with small nonzero alloc budgets!
     let clear_target = resolve_literal(
@@ -3983,7 +3973,7 @@ fn round2_finding13_nested_shell_cwd_scope_and_isolation() {
 // 6. Rework Round 3 regressions (review round 2 and the open round-1 findings)
 // ---------------------------------------------------------------------------
 
-fn build_with(fs: &dyn PathResolver, data: &[&[u8]], protected: &[&[u8]]) -> ProtectedSetBuild {
+fn build_with(fs: &dyn PathResolver, data: &[&[u8]], protected: &[&[u8]]) -> ProtectedSet {
     build_protected_set(
         HOME,
         CWD,
@@ -3997,7 +3987,7 @@ fn build_with(fs: &dyn PathResolver, data: &[&[u8]], protected: &[&[u8]]) -> Pro
     .expect("build_protected_set fits default budget")
 }
 
-fn default_build(fs: &dyn PathResolver) -> ProtectedSetBuild {
+fn default_build(fs: &dyn PathResolver) -> ProtectedSet {
     build_with(
         fs,
         &[b"/h/u/.local/share/atrium"],
@@ -4055,8 +4045,12 @@ fn round3_r2f3_write_only_members_are_collected_and_early_stops_are_unread() {
     fs.add_file(b"/h/u/.config/atrium/many/zz_key");
     fs.add_hard_link(b"/h/u/.config/atrium/many/zz_key", b"/h/u/proj/alias2");
     let build = default_build(&fs);
-    assert!(build.gaps.is_empty(), "complete walk, got {:?}", build.gaps);
-    let prot = &build.set;
+    assert!(
+        build.identity_gaps.is_empty(),
+        "complete walk, got {:?}",
+        build.identity_gaps
+    );
+    let prot = &build;
 
     for alias in ["proj/alias", "proj/alias2"] {
         // §5, D-142: a write through a hard-linked alias of a write-only
@@ -4110,42 +4104,47 @@ fn round3_r2f3_write_only_walk_past_its_caps_is_unread_never_clear() {
     fs.add_file(b"/h/u/.config/atrium/big/zz_key");
     fs.add_hard_link(b"/h/u/.config/atrium/big/zz_key", b"/h/u/proj/alias");
     fs.add_file(b"/h/u/proj/plain");
-    let build = default_build(&fs);
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    let prot = default_build(&fs);
     assert!(
-        build
-            .gaps
-            .iter()
-            .any(|g| g.write_only && g.reason == UnreadReason::WalkCapReached(FsCap::EntriesRead)),
+        prot.identity_gaps.iter().any(|g| g.write_only
+            && g.scope == GapScope::AnyTarget
+            && g.reason == UnreadReason::WalkCapReached(FsCap::EntriesRead)),
         "gap expected, got {:?}",
-        build.gaps
+        prot.identity_gaps
     );
 
-    let mut w = subject("proj/alias", AccessMode::Write, &build.set, &fs);
-    build
-        .apply_identity_gaps(&mut w, &mut ComputeBudget::with_default_limits())
-        .unwrap();
+    // Round 4: the gap is applied inside `check_target` (D-144), so the
+    // resolver-backed flow and a standalone check agree.
+    let w = subject("proj/alias", AccessMode::Write, &prot, &fs);
     assert!(
         has_unread(&w.outcomes, |r| *r
             == UnreadReason::WalkCapReached(FsCap::EntriesRead)),
         "a write the incomplete walk might protect is Unread, got {:?}",
         w.outcomes
     );
-    assert!(!all_clear(&w.outcomes));
+    let t = literal(b"proj/alias", AccessMode::Write, &fs);
+    assert_eq!(
+        check_target(&t, &prot, &mut ComputeBudget::with_default_limits())
+            .unwrap()
+            .outcome,
+        PartOutcome::Unread(UnreadReason::WalkCapReached(FsCap::EntriesRead))
+    );
 
-    // The write-only gap does not touch reads, nor singly linked files.
-    let mut r = subject("proj/alias", AccessMode::Read, &build.set, &fs);
-    build
-        .apply_identity_gaps(&mut r, &mut ComputeBudget::with_default_limits())
-        .unwrap();
-    assert!(!has_unread(&r.outcomes, |r| matches!(
-        r,
-        UnreadReason::WalkCapReached(_)
-    )));
-    let mut plain = subject("proj/plain", AccessMode::Write, &build.set, &fs);
-    build
-        .apply_identity_gaps(&mut plain, &mut ComputeBudget::with_default_limits())
-        .unwrap();
-    assert!(all_clear(&plain.outcomes), "got {:?}", plain.outcomes);
+    // Conservative rule (round 4): the gap could hide a member link whose
+    // target is anywhere, so every write that is not already a hit is Unread,
+    // singly linked or not. Reads are untouched by a write-only gap, and hits
+    // stay hits.
+    let plain = subject("proj/plain", AccessMode::Write, &prot, &fs);
+    assert!(has_unread(&plain.outcomes, |r| *r
+        == UnreadReason::WalkCapReached(FsCap::EntriesRead)));
+    for p in ["proj/alias", "proj/plain"] {
+        let r = subject(p, AccessMode::Read, &prot, &fs);
+        assert!(all_clear(&r.outcomes), "{p}: {:?}", r.outcomes);
+    }
+    let key = subject("~/.ssh/id_rsa", AccessMode::Write, &prot, &fs);
+    assert!(has_hard_deny(&key.outcomes, "credential-read"));
+    assert!(!has_unread(&key.outcomes, |_| true), "{:?}", key.outcomes);
 
     // Depth: a member below WALK_MAX_DEPTH levels.
     let mut deep_fs = FakeFs::new();
@@ -4156,61 +4155,66 @@ fn round3_r2f3_write_only_walk_past_its_caps_is_unread_never_clear() {
     deep.extend_from_slice(b"/key");
     deep_fs.add_file(&deep);
     deep_fs.add_hard_link(&deep, b"/h/u/proj/deep_alias");
-    let deep_build = default_build(&deep_fs);
+    let deep_prot = default_build(&deep_fs);
     assert!(
-        deep_build
-            .gaps
+        deep_prot
+            .identity_gaps
             .iter()
             .any(|g| g.write_only && g.reason == UnreadReason::WalkCapReached(FsCap::WalkDepth)),
         "got {:?}",
-        deep_build.gaps
+        deep_prot.identity_gaps
     );
-    let mut dw = subject(
-        "proj/deep_alias",
-        AccessMode::Write,
-        &deep_build.set,
-        &deep_fs,
-    );
-    deep_build
-        .apply_identity_gaps(&mut dw, &mut ComputeBudget::with_default_limits())
-        .unwrap();
+    let dw = subject("proj/deep_alias", AccessMode::Write, &deep_prot, &deep_fs);
     assert!(has_unread(&dw.outcomes, |r| *r
         == UnreadReason::WalkCapReached(FsCap::WalkDepth)));
 }
 
 #[test]
-fn round3_identity_gaps_are_scoped_to_targets_they_can_affect() {
-    // A browser root larger than the walk cap: the gap affects paths spelled
-    // through it and multiply-linked files, not ordinary paths elsewhere.
+fn round4_identity_gaps_widen_unread_and_never_touch_hits() {
+    // A browser root larger than the walk cap: a read-applicable AnyTarget
+    // gap. Every target that is not a hit is Unread; hits are unchanged; a
+    // Store hit is kept beside the gap's Unread in the flows, and a
+    // single-result check reports the stricter Unread.
     let mut fs = FakeFs::new();
     for i in 0..(limits::WALK_MAX_ENTRIES + 4) {
         fs.add_file(format!("/h/u/.config/google-chrome/Cache/c{i:05}").as_bytes());
     }
     fs.add_file(b"/h/u/.config/google-chrome/Default/Preferences");
     fs.add_file(b"/h/u/proj/readme");
-    fs.add_file(b"/h/u/proj/a");
-    fs.add_hard_link(b"/h/u/proj/a", b"/h/u/proj/b");
-    let build = default_build(&fs);
-    assert!(build.gaps.iter().any(|g| !g.write_only
-        && matches!(g.scope, GapScope::Through(_))
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    fs.add_file(b"/h/u/.pypirc");
+    let prot = default_build(&fs);
+    assert!(prot.identity_gaps.iter().any(|g| !g.write_only
+        && g.scope == GapScope::AnyTarget
         && g.reason == UnreadReason::WalkCapReached(FsCap::EntriesRead)));
 
     let gap_unread = |path: &str| {
-        let mut res = subject(path, AccessMode::Read, &build.set, &fs);
-        build
-            .apply_identity_gaps(&mut res, &mut ComputeBudget::with_default_limits())
-            .unwrap();
+        let res = subject(path, AccessMode::Read, &prot, &fs);
         has_unread(&res.outcomes, |r| {
             matches!(r, UnreadReason::WalkCapReached(_))
         })
     };
     assert!(gap_unread("~/.config/google-chrome/Default/Preferences"));
-    assert!(
-        gap_unread("proj/b"),
-        "a hard link may alias an uncollected member"
-    );
-    assert!(!gap_unread("proj/readme"));
-    assert!(!gap_unread("~/.config/other.toml"));
+    assert!(gap_unread("proj/readme"));
+    assert!(gap_unread("~/.config/other.toml"));
+
+    let key = subject("~/.ssh/id_rsa", AccessMode::Read, &prot, &fs);
+    assert!(has_hard_deny(&key.outcomes, "credential-read"));
+    assert!(!has_unread(&key.outcomes, |_| true));
+
+    let store = subject("~/.pypirc", AccessMode::Read, &prot, &fs);
+    assert!(has_store_hit(&store.outcomes), "{:?}", store.outcomes);
+    assert!(has_unread(&store.outcomes, |r| matches!(
+        r,
+        UnreadReason::WalkCapReached(_)
+    )));
+    let t = literal(b"~/.pypirc", AccessMode::Read, &fs);
+    assert!(matches!(
+        check_target(&t, &prot, &mut ComputeBudget::with_default_limits())
+            .unwrap()
+            .outcome,
+        PartOutcome::Unread(UnreadReason::WalkCapReached(_))
+    ));
 }
 
 #[cfg(target_os = "linux")]
@@ -4248,7 +4252,20 @@ fn round3_r2f4_fs_resolver_makes_no_uncharged_metadata_call() {
         )
         .expect("canonicalize needs no stat on Linux");
     assert_eq!(canon, root.join("file").as_os_str().as_bytes());
-    assert_eq!(caps, FsCaps::new(10, 10, 0, 10, 9));
+    // Round 3 review, finding 5: reading `/proc/self/fd/N` is a link read,
+    // charged before it runs; a canonicalization with no link read left
+    // stops before it.
+    assert_eq!(caps, FsCaps::new(10, 10, 0, 9, 9));
+    assert_eq!(
+        resolver.canonicalize(
+            root.join("file").as_os_str().as_bytes(),
+            &mut FsCaps::new(10, 10, 10, 0, 10),
+            &mut ComputeBudget::with_default_limits(),
+        ),
+        Err(ResolveError::CapReached(CapReached {
+            cap: FsCap::LinkReads
+        }))
+    );
 
     // A non-link is still told apart from a link, without a metadata call.
     assert_eq!(
@@ -4325,7 +4342,7 @@ fn round3_r2f6_combining_marks_with_decompositions_are_unlisted_equivalences() {
         let t = literal(path.as_bytes(), AccessMode::Read, &fs);
         assert!(
             matches!(
-                check_target(&t, &build.set, &mut ComputeBudget::with_default_limits())
+                check_target(&t, &build, &mut ComputeBudget::with_default_limits())
                     .unwrap()
                     .outcome,
                 PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence { .. })
@@ -4341,7 +4358,7 @@ fn round3_r2f6_combining_marks_with_decompositions_are_unlisted_equivalences() {
         &fs,
     );
     assert_eq!(
-        check_target(&cjk, &build.set, &mut ComputeBudget::with_default_limits())
+        check_target(&cjk, &build, &mut ComputeBudget::with_default_limits())
             .unwrap()
             .outcome,
         PartOutcome::Clear
@@ -4430,7 +4447,7 @@ fn round3_r2f8_listed_fold_is_string_lowercase_with_final_sigma() {
         &fs,
     );
     assert!(matches!(
-        check_target(&t, &build.set, &mut budget).unwrap().outcome,
+        check_target(&t, &build, &mut budget).unwrap().outcome,
         PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("atrium-self")
     ));
 }
@@ -4453,7 +4470,7 @@ fn round3_r2f9_existing_lowercase_browser_root_does_not_hide_fold_siblings() {
         &root,
         LinkPolicy::default(),
         &[filter],
-        &build.set,
+        &build,
         &fs,
         &mut FsCaps::with_default_limits(),
         &mut ComputeBudget::with_default_limits(),
@@ -4483,7 +4500,7 @@ fn round3_neighbour_paths_spelled_through_protected_folders_keep_their_hit() {
     fs.add_symlink(b"/h/u/.config/atrium/zz_link", b"/tmp/ordinary2");
     fs.add_symlink(b"/h/u/proj/chain", b"/h/u/.gnupg/zz_link");
     let build = default_build(&fs);
-    let prot = &build.set;
+    let prot = &build;
 
     for p in ["~/.gnupg/zz_link", "proj/chain"] {
         let r = subject(p, AccessMode::Read, prot, &fs);
@@ -4501,14 +4518,18 @@ fn round3_neighbour_paths_spelled_through_protected_folders_keep_their_hit() {
     );
     let r = subject("~/.config/atrium/zz_link", AccessMode::Read, prot, &fs);
     assert!(!has_any_hard_deny(&r.outcomes), "{:?}", r.outcomes);
-    // The links' targets, named directly, are ordinary (the walk never
-    // reached the links, so their targets were not recorded either).
-    assert!(all_clear(
-        &subject("/tmp/ordinary", AccessMode::Read, prot, &fs).outcomes
-    ));
-    assert!(all_clear(
-        &subject("/tmp/ordinary2", AccessMode::Write, prot, &fs).outcomes
-    ));
+    // The links' targets, named directly: the walks stopped before the links,
+    // so a complete walk might have recorded these targets. Round 4's
+    // conservative rule makes them Unread (never Clear, never a hit).
+    for (p, access) in [
+        ("/tmp/ordinary", AccessMode::Read),
+        ("/tmp/ordinary2", AccessMode::Write),
+    ] {
+        let r = subject(p, access, prot, &fs);
+        assert!(!has_any_hard_deny(&r.outcomes), "{p}: {:?}", r.outcomes);
+        assert!(has_unread(&r.outcomes, |r| *r
+            == UnreadReason::WalkCapReached(FsCap::EntriesRead)));
+    }
 }
 
 #[test]
@@ -4524,8 +4545,8 @@ fn round3_neighbour_hard_links_to_tree_members_and_folded_abs_paths() {
     fs.add_file(b"/OPT/atrium/db");
     fs.add_hard_link(b"/OPT/atrium/db", b"/h/u/proj/db_alias");
     let build = build_with(&fs, &[b"/opt/atrium"], &[]);
-    assert!(build.gaps.is_empty(), "{:?}", build.gaps);
-    let prot = &build.set;
+    assert!(build.identity_gaps.is_empty(), "{:?}", build.identity_gaps);
+    let prot = &build;
 
     assert!(has_hard_deny(
         &subject("proj/gk", AccessMode::Read, prot, &fs).outcomes,
@@ -4551,7 +4572,7 @@ fn round3_neighbour_written_recursive_root_checks_write_only_identities() {
             &root,
             LinkPolicy::default(),
             &[],
-            &build.set,
+            &build,
             &fs,
             &mut FsCaps::with_default_limits(),
             &mut ComputeBudget::with_default_limits(),
@@ -4580,7 +4601,7 @@ fn round3_neighbour_hard_link_walk_reports_unreadable_folders() {
         &root,
         LinkPolicy::default(),
         &[],
-        &build.set,
+        &build,
         &fs,
         &mut FsCaps::with_default_limits(),
         &mut ComputeBudget::with_default_limits(),
@@ -4612,7 +4633,7 @@ fn round3_neighbour_ask_tree_prefix_rule_stays_linear() {
         Some(&pattern),
         true,
         AccessMode::Read,
-        &build.set,
+        &build,
         &fs,
         &mut FsCaps::with_default_limits(),
         &mut budget,

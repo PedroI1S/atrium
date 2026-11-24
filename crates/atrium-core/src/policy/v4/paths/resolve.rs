@@ -21,7 +21,7 @@ use crate::policy::model::{
     ResolveError, Target, TargetOrigin, TargetResolution, UnreadReason, Word,
 };
 use crate::policy::v4::paths::PathResolver;
-use crate::policy::v4::paths::sensitive::strip_firmlink;
+use crate::policy::v4::paths::sensitive::{push_charged, strip_firmlink};
 
 /// Returns `true` iff `path` is a process-dependent path under §3 / §11 item 14:
 /// `/proc/self`, `/proc/thread-self`, `/proc/<pid>`, `/dev/fd/`, `/dev/stdin`,
@@ -185,6 +185,7 @@ pub(crate) fn resolve_literal_impl(
     budget.charge((raw.len() + cwd.len() + home.len() + 1) as u64)?;
 
     if raw.is_empty() || raw.contains(&0) {
+        budget.charge_alloc(raw.len())?;
         return Ok(unread_target(
             origin,
             access,
@@ -228,7 +229,12 @@ pub(crate) fn resolve_literal_impl(
         ));
     }
 
-    budget.charge_alloc(expanded.len())?;
+    // The segment copies and the queue holding them (§8).
+    budget.charge_alloc(
+        expanded.len().saturating_add(
+            (expanded.len() / 2 + 1).saturating_mul(std::mem::size_of::<Vec<u8>>()),
+        ),
+    )?;
     let mut queue: VecDeque<Vec<u8>> = expanded
         .split(|&b| b == b'/')
         .filter(|s| !s.is_empty())
@@ -277,7 +283,7 @@ pub(crate) fn resolve_literal_impl(
         }
 
         if !missing_tail.is_empty() {
-            missing_tail.push(seg);
+            push_charged(&mut missing_tail, seg, budget)?;
             let cur_len = with_tail_len(&existing_stack, &missing_tail);
             budget.charge_alloc(cur_len)?;
             let cur = build_with_tail(&existing_stack, &missing_tail);
@@ -370,7 +376,14 @@ pub(crate) fn resolve_literal_impl(
                                 existing_stack.clear();
                                 final_meta = None;
                             }
-                            budget.charge_alloc(target.len())?;
+                            // The segment copies, their vector, and the queue's
+                            // worst-case reallocation to hold them (§8).
+                            budget.charge_alloc(
+                                target.len().saturating_add(
+                                    (target.len() / 2 + 1 + queue.len())
+                                        .saturating_mul(2 * std::mem::size_of::<Vec<u8>>()),
+                                ),
+                            )?;
                             let target_segs: Vec<Vec<u8>> = target
                                 .split(|&b| b == b'/')
                                 .filter(|s| !s.is_empty())
@@ -395,7 +408,7 @@ pub(crate) fn resolve_literal_impl(
                         }
                     }
                 } else {
-                    existing_stack.push((seg, meta.identity));
+                    push_charged(&mut existing_stack, (seg, meta.identity), budget)?;
                     final_meta = Some(meta);
                 }
             }
@@ -403,7 +416,7 @@ pub(crate) fn resolve_literal_impl(
                 if from_symlink {
                     dangling_symlink = true;
                 }
-                missing_tail.push(seg);
+                push_charged(&mut missing_tail, seg, budget)?;
                 final_meta = None;
             }
             Err(ResolveError::Io(_)) => {

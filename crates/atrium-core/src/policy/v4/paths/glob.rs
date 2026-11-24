@@ -18,7 +18,10 @@ use crate::policy::model::{
 };
 use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl, resolve_word_literal};
-use crate::policy::v4::paths::sensitive::push_charged;
+use crate::policy::v4::paths::sensitive::{ChargedRecord, push_charged};
+
+impl ChargedRecord for PatComp {}
+impl ChargedRecord for (Vec<u8>, usize, usize, bool) {}
 
 /// One byte atom inside a single glob path component.
 #[derive(Debug, Clone)]
@@ -435,6 +438,7 @@ pub(crate) fn expand_shell_glob_impl(
     let mut expansion = GlobExpansion::default();
 
     if raw.is_empty() || raw.contains(&0) {
+        budget.charge_alloc(raw.len() + std::mem::size_of::<UnreadReason>())?;
         expansion
             .unread
             .push(UnreadReason::UnresolvablePath { path: raw.to_vec() });
@@ -515,7 +519,7 @@ pub(crate) fn expand_shell_glob_impl(
             .map_or(abs_bytes.len(), |off| start + off);
         if end > start {
             match parse_component(&abs_bytes[start..end], &abs_prov[start..end], budget)? {
-                Ok(comp) => comps.push(comp),
+                Ok(comp) => push_charged(&mut comps, comp, budget)?,
                 Err(unread) => {
                     push_charged(&mut expansion.unread, unread, budget)?;
                     return Ok(expansion);
@@ -561,6 +565,7 @@ pub(crate) fn expand_shell_glob_impl(
     while let Some((dir, idx, depth, variant_only)) = stack.pop() {
         budget.charge(dir.len().max(1) as u64)?;
         budget.charge_alloc(dir.len())?;
+        budget.charge_alloc(4 * std::mem::size_of::<(Vec<u8>, usize, bool)>())?;
         if !visited.insert((dir.clone(), idx, variant_only)) {
             continue;
         }
@@ -591,12 +596,12 @@ pub(crate) fn expand_shell_glob_impl(
                 if !variant_seen.contains(&dir) {
                     budget.charge_alloc(dir.len().saturating_mul(2))?;
                     variant_seen.insert(dir.clone());
-                    variant_paths.push(dir);
+                    push_charged(&mut variant_paths, dir, budget)?;
                 }
             } else if !exact_seen.contains(&dir) {
                 budget.charge_alloc(dir.len().saturating_mul(2))?;
                 exact_seen.insert(dir.clone());
-                exact_paths.push(dir);
+                push_charged(&mut exact_paths, dir, budget)?;
             }
             continue;
         }
@@ -632,11 +637,11 @@ pub(crate) fn expand_shell_glob_impl(
                         Err(ResolveError::Exhausted(e)) => return Err(e),
                     }
                     if seg == b"." {
-                        stack.push((dir, idx + 1, depth, variant_only));
+                        push_charged(&mut stack, (dir, idx + 1, depth, variant_only), budget)?;
                     } else {
                         budget.charge_alloc(dir.len() + 3)?;
                         let next = join_bytes(&dir, b"..");
-                        stack.push((next, idx + 1, depth, variant_only));
+                        push_charged(&mut stack, (next, idx + 1, depth, variant_only), budget)?;
                     }
                     continue;
                 }
@@ -644,7 +649,7 @@ pub(crate) fn expand_shell_glob_impl(
                 let next = join_bytes(&dir, seg);
                 match resolver.lstat(&next, caps, budget) {
                     Ok(_) => {
-                        stack.push((next, idx + 1, depth, variant_only));
+                        push_charged(&mut stack, (next, idx + 1, depth, variant_only), budget)?;
                     }
                     Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {}
                     Err(ResolveError::Io(_)) => {
@@ -677,7 +682,7 @@ pub(crate) fn expand_shell_glob_impl(
                 if *is_globstar {
                     // 0-level match (`a/**/b` -> `a/b`) is variant-only (zsh/bash globstar).
                     budget.charge_alloc(dir.len())?;
-                    stack.push((dir.clone(), idx + 1, depth, true));
+                    push_charged(&mut stack, (dir.clone(), idx + 1, depth, true), budget)?;
                 }
 
                 let entries = match resolver.read_dir(&dir, caps, budget) {
@@ -722,7 +727,11 @@ pub(crate) fn expand_shell_glob_impl(
                         budget.charge_alloc(next_len.saturating_mul(2))?;
                         let next = join_bytes(&dir, &entry.name);
                         let one_level_variant = variant_only || is_dot;
-                        stack.push((next.clone(), idx + 1, depth + 1, one_level_variant));
+                        push_charged(
+                            &mut stack,
+                            (next.clone(), idx + 1, depth + 1, one_level_variant),
+                            budget,
+                        )?;
                         // 2+-level descent is variant-only (including symlinked dirs for bash 4 globstar).
                         let descend_dir = match entry.file_type {
                             FileType::Dir => true,
@@ -742,6 +751,7 @@ pub(crate) fn expand_shell_glob_impl(
                                         }
                                         Err(ResolveError::NotFound) => false,
                                         Err(_) => {
+                                            budget.charge_alloc(next.len())?;
                                             push_unique_unread(
                                                 &mut expansion.unread,
                                                 UnreadReason::UnresolvablePath {
@@ -755,6 +765,7 @@ pub(crate) fn expand_shell_glob_impl(
                                 }
                                 Ok(_) | Err(ResolveError::NotFound) => false,
                                 Err(ResolveError::Io(_)) => {
+                                    budget.charge_alloc(next.len())?;
                                     push_unique_unread(
                                         &mut expansion.unread,
                                         UnreadReason::UnresolvablePath { path: next.clone() },
@@ -786,14 +797,18 @@ pub(crate) fn expand_shell_glob_impl(
                                     budget,
                                 )?;
                             } else {
-                                stack.push((next, idx, depth + 1, true));
+                                push_charged(&mut stack, (next, idx, depth + 1, true), budget)?;
                             }
                         }
                     } else if match_component(atoms, &entry.name, budget)? {
                         budget.charge_alloc(dir.len() + entry.name.len() + 1)?;
                         let next = join_bytes(&dir, &entry.name);
                         let entry_variant = variant_only || (is_dot && !explicit_leading_dot);
-                        stack.push((next, idx + 1, depth + 1, entry_variant));
+                        push_charged(
+                            &mut stack,
+                            (next, idx + 1, depth + 1, entry_variant),
+                            budget,
+                        )?;
                     }
                 }
                 if hit_cap {
