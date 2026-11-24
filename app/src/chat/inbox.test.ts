@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { InboxItem, InboxReason } from "../daemon/types";
 import { filterInbox, groupInbox, itemKey, moveSelection, needsYouCount, nextJump, prevJump, rankInbox } from "./inbox";
-import { askOf, rememberChoices, subjectOf } from "./requests";
+import { askOf, rememberChoices, subjectOf, unreadNoticeOf } from "./requests";
 import type { ApprovalItem } from "./transcript";
 
 const item = (thread_id: string | null, reason: InboxReason, since_ms: number): InboxItem => ({ thread_id, reason, since_ms, title: thread_id ?? "", detail: null });
@@ -109,7 +109,7 @@ describe("⌘J order", () => {
 describe("what an approval card says (D-054, D-062)", () => {
   const approval = (over: Partial<ApprovalItem>): ApprovalItem => ({
     kind: "approval", key: "k", first: 1, last: 1, incarnation: 1, v: 0, bytes: 0, requestId: "r", turn: 1, outcome: null, stale: false, at: 0,
-    callId: null, name: "Bash", toolKind: "execute", title: "rm", input: { command: "rm -rf build" }, reason: null, rememberable: true, ...over,
+    callId: null, name: "Bash", toolKind: "execute", title: "rm", input: { command: "rm -rf build" }, reason: null, rememberable: true, unread: null, ...over,
   });
 
   it("shows the exact command or paths", () => {
@@ -125,5 +125,23 @@ describe("what an approval card says (D-054, D-062)", () => {
     expect(choices.map((c) => c.scope)).toEqual(["thread", "home", "global"]);
     for (const c of choices) expect(c.hint).toContain("in any folder");
     expect(choices[0]!.hint).toContain("this exact command");
+  });
+
+  it("never offers always… when unread or exhausted, even if rememberable is true (contract rev 4 §9)", () => {
+    expect(rememberChoices(approval({ rememberable: true, unread: "unread" }))).toEqual([]);
+    expect(rememberChoices(approval({ rememberable: true, unread: "exhausted" }))).toEqual([]);
+    expect(rememberChoices(approval({ rememberable: false, unread: "unread" }))).toEqual([]);
+    expect(rememberChoices(approval({ rememberable: false, unread: "exhausted" }))).toEqual([]);
+  });
+
+  it("formats the plain-language notice for unread and exhausted approvals only (contract rev 4 §9)", () => {
+    expect(unreadNoticeOf(approval({ unread: null }))).toBeNull();
+    const unreadText = unreadNoticeOf(approval({ unread: "unread" }));
+    expect(unreadText).toBe("Atrium can't read this command in full.");
+    expect(unreadText).not.toContain("Unread");
+    const exhaustedText = unreadNoticeOf(approval({ unread: "exhausted" }));
+    expect(exhaustedText).toContain("Atrium can't read this command in full.");
+    expect(exhaustedText).toContain("too long or too complex");
+    expect(exhaustedText).not.toContain("Exhausted");
   });
 });

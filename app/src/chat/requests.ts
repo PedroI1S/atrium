@@ -68,8 +68,20 @@ export const canAct = (state: CardState): boolean => state.kind === "fresh" || s
 /** "Always…" choices (contract §5, PLAN §3.12), worded per D-062: remembered rules are global. */
 export interface RememberChoice { scope: RememberScope; label: string; hint: string }
 
+/**
+ * Plain-language notice when Atrium couldn't read a call in full (contract rev 4 §9).
+ * Null for ordinary approvals.
+ */
+export function unreadNoticeOf(request: ApprovalItem): string | null {
+  if (request.unread === "unread") return "Atrium can't read this command in full.";
+  if (request.unread === "exhausted") return "Atrium can't read this command in full. It was too long or too complex to check.";
+  return null;
+}
+
 export function rememberChoices(request: ApprovalItem): RememberChoice[] {
-  if (!request.rememberable) return [];
+  // Defence in depth (contract rev 4 §7 & §9): never offer "Always…" when Atrium couldn't read
+  // the call in full, even if `rememberable` is true.
+  if (!request.rememberable || request.unread !== null) return [];
   const what = request.toolKind === "execute" ? "this exact command" : "this exact path";
   return [
     { scope: "thread", label: "Always in this chat", hint: `Allows ${what} again in this chat, in any folder` },
