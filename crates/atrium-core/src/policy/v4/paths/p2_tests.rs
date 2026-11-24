@@ -22,7 +22,7 @@ use crate::policy::model::{
 };
 use crate::policy::v4::paths::resolver::fake::FakeFs;
 use crate::policy::v4::paths::sensitive::{
-    SharedSensitive, build_protected_set, fold_listed_component, fold_path_listed,
+    RootAliases, SharedSensitive, build_protected_set, fold_listed_component, fold_path_listed,
 };
 use crate::policy::v4::paths::{
     FsResolver, PathResolver, check_recursive_root, check_target, expand_shell_glob,
@@ -5653,4 +5653,258 @@ fn round7_f6_recursive_filter_entry_keeps_store_hit_beside_gap() {
             .any(|r| r.part == PartId::Filter { unit: None }
                 && matches!(r.outcome, PartOutcome::Unread(_)))
     );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Rework Round 8 regressions (review round 6, D-152)
+// ---------------------------------------------------------------------------
+
+/// Runs a check under every compute budget from the first one that yields a
+/// hard-deny hit up to the one that completes (densely near the first, then
+/// sampled), and asserts the hit is never lost: a hit established before the
+/// budget runs out stands (§1, §8). `run` returns the records and whether the
+/// budget ran out.
+fn assert_hit_kept_under_every_budget(mut run: impl FnMut(u64) -> (Vec<PartResult>, bool)) {
+    let mut full = 1024u64;
+    while run(full).1 {
+        assert!(full < 1 << 34, "the check never completes");
+        full *= 2;
+    }
+    assert!(has_any_hard_deny(&run(full).0), "{:?}", run(full).0);
+    let (mut lo, mut hi) = (0u64, full);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if has_any_hard_deny(&run(mid).0) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let first = lo;
+    let mut n = first;
+    while n <= full {
+        let (out, _) = run(n);
+        assert!(
+            has_any_hard_deny(&out),
+            "hit lost at budget {n} (first hit at {first}): {out:?}"
+        );
+        n += if n < first + 4096 { 1 } else { 61 };
+    }
+}
+
+fn recursive_run(
+    root: &crate::policy::model::Target,
+    links: LinkPolicy,
+    prot: &ProtectedSet,
+    fs: &dyn PathResolver,
+    n: u64,
+) -> (Vec<PartResult>, bool) {
+    let mut budget = ComputeBudget::new(n, usize::MAX);
+    let res = check_recursive_root(
+        root,
+        links,
+        &[],
+        prot,
+        fs,
+        &mut FsCaps::with_default_limits(),
+        &mut budget,
+    );
+    let ran_out = budget.charge(0).is_err();
+    match res {
+        Ok(r) => (r.outcomes, ran_out),
+        Err(_) => (Vec::new(), true),
+    }
+}
+
+#[test]
+fn round8_f1_written_name_hit_survives_a_later_exhaustion() {
+    // Review 6, finding 1: `lnk/../.ssh` with `lnk -> /tmp/pub/sub` is
+    // written `~/.ssh` (a hard-deny name, D-147) but is really `/tmp/pub/.ssh`
+    // (Clear). Exhaustion after the written check must not discard its hit,
+    // in `check_target` and in `check_recursive_root`.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/tmp/pub/sub");
+    fs.mkdir_all(b"/tmp/pub/.ssh");
+    fs.add_file(b"/tmp/pub/.ssh/id_rsa");
+    fs.add_symlink(b"/h/u/lnk", b"/tmp/pub/sub");
+    let prot = default_build(&fs);
+
+    let file = literal(b"lnk/../.ssh/id_rsa", AccessMode::Read, &fs);
+    assert_eq!(file.written.as_deref(), Some(&b"/h/u/.ssh/id_rsa"[..]));
+    assert_hit_kept_under_every_budget(|n| {
+        let mut budget = ComputeBudget::new(n, usize::MAX);
+        let res = check_target(&file, &prot, &mut budget);
+        let ran_out = budget.charge(0).is_err();
+        match res {
+            Ok(r) => (vec![r], ran_out),
+            Err(_) => (Vec::new(), true),
+        }
+    });
+
+    let root = literal(b"lnk/../.ssh", AccessMode::Read, &fs);
+    assert_eq!(root.written.as_deref(), Some(&b"/h/u/.ssh"[..]));
+    // A file given as the recursive root keeps its written-name hit too.
+    assert_hit_kept_under_every_budget(|n| {
+        recursive_run(&file, LinkPolicy::default(), &prot, &fs, n)
+    });
+    assert_hit_kept_under_every_budget(|n| {
+        recursive_run(&root, LinkPolicy::default(), &prot, &fs, n)
+    });
+}
+
+#[test]
+fn round8_class_a_followed_link_hit_survives_a_later_exhaustion() {
+    // Class (a) in the followed-link walk: `rg -L x proj` with
+    // `proj/p -> ~/.ssh/id_rsa`; the link's hit is kept when a later step
+    // (the alias table, the S8 check of the link) runs out of budget.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    fs.add_symlink(b"/h/u/proj/p", b"/h/u/.ssh/id_rsa");
+    let prot = default_build(&fs);
+    let root = literal(b"proj", AccessMode::Read, &fs);
+    let follow = LinkPolicy {
+        at_root: true,
+        below_root: true,
+    };
+    assert_hit_kept_under_every_budget(|n| recursive_run(&root, follow, &prot, &fs, n));
+}
+
+#[test]
+fn round8_f2_alias_table_cut_short_by_a_cap_is_unread() {
+    // Review 6, finding 2: `~/.ssh -> /tmp/keys`; reading `/tmp/keys/id_rsa`
+    // when the canonicalization cap runs out before `~/.ssh` is established
+    // is Unread (a cap in the checking phase, §8), never Clear.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/keys/id_rsa");
+    fs.add_symlink(b"/h/u/.ssh", b"/tmp/keys");
+    let prot = default_build(&fs);
+    for canonicalizations in [0, 1] {
+        let res = resolve_subject_paths(
+            &["/tmp/keys/id_rsa".to_string()],
+            None,
+            false,
+            AccessMode::Read,
+            &prot,
+            &fs,
+            &mut FsCaps::new(1000, 1000, 1000, 1000, canonicalizations),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+        assert!(!all_clear(&res.outcomes), "{:?}", res.outcomes);
+        assert!(
+            has_hard_deny(&res.outcomes, "credential-read")
+                || has_unread(&res.outcomes, |r| matches!(
+                    r,
+                    UnreadReason::WalkCapReached(FsCap::Canonicalizations)
+                )),
+            "{canonicalizations}: {:?}",
+            res.outcomes
+        );
+    }
+}
+
+#[test]
+fn round8_f3_alias_spelling_gets_the_unlisted_equivalence_check() {
+    // Review 6, finding 3: `~/.config/google-chrome -> /tmp/profile`; the
+    // alias spelling of `/tmp/profile/log\u{0131}ns.json` matches the
+    // protected `logins.json` only under an unlisted case fold (dotless i):
+    // Unread (§5, §11 item 13), not Clear.
+    let mut fs = FakeFs::new();
+    fs.add_file("/tmp/profile/log\u{0131}ns.json".as_bytes());
+    fs.mkdir_all(b"/h/u/.config");
+    fs.add_symlink(b"/h/u/.config/google-chrome", b"/tmp/profile");
+    let prot = default_build(&fs);
+    let res = subject(
+        "/tmp/profile/log\u{0131}ns.json",
+        AccessMode::Read,
+        &prot,
+        &fs,
+    );
+    assert!(
+        has_any_hard_deny(&res.outcomes)
+            || has_unread(&res.outcomes, |r| matches!(
+                r,
+                UnreadReason::UnlistedNameEquivalence { .. }
+            )),
+        "{:?}",
+        res.outcomes
+    );
+    assert!(!all_clear(&res.outcomes), "{:?}", res.outcomes);
+}
+
+#[test]
+fn round8_f4_msal_folder_is_not_a_wholesale_store_root() {
+    // Review 6, finding 4: dev's `ask_roots` lists the MSAL entries inside
+    // `~/.azure`, not the folder. `rg -L x proj` reaching an ordinary
+    // `~/.azure/README` through `proj/readme` is Clear; a link to an MSAL
+    // entry is still its Store hit.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.azure/README");
+    fs.add_symlink(b"/h/u/proj/readme", b"/h/u/.azure/README");
+    let prot = default_build(&fs);
+    let root = literal(b"proj", AccessMode::Read, &fs);
+    let follow = LinkPolicy {
+        at_root: true,
+        below_root: true,
+    };
+    let res = check_recursive_root(
+        &root,
+        follow,
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(!has_store_hit(&res.outcomes), "{:?}", res.outcomes);
+    assert!(!has_any_hard_deny(&res.outcomes), "{:?}", res.outcomes);
+
+    fs.add_file(b"/h/u/.azure/msal_token_cache.json");
+    fs.add_symlink(b"/h/u/proj/cache", b"/h/u/.azure/msal_token_cache.json");
+    let prot = default_build(&fs);
+    let res = check_recursive_root(
+        &root,
+        follow,
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_store_hit(&res.outcomes), "{:?}", res.outcomes);
+}
+
+#[test]
+fn round8_f5_alias_rewrite_charges_the_copied_spelling() {
+    // Review 6, finding 5: an Atrium data path spelled with 3,000 bytes is a
+    // link to `/s`. Rewriting `/s/x` copies the long spelling, so a budget
+    // that covers only the scan by the short canonical path runs out.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/s");
+    fs.mkdir_all(b"/h/u");
+    let mut long = b"/h/u/".to_vec();
+    long.extend(std::iter::repeat_n(b'd', 3000));
+    fs.add_symlink(&long, b"/s");
+    let prot = build_with(&fs, &[&long], &[]);
+    let mut aliases = RootAliases::default();
+    let roots = aliases
+        .roots(
+            &prot,
+            &fs,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    let canonical = b"/s/x";
+    let scan = roots.len() as u64 * (canonical.len() as u64 + 1);
+    let mut short = ComputeBudget::new(scan + 100, usize::MAX);
+    let err = RootAliases::rewrite(roots, canonical, &mut short).unwrap_err();
+    assert_eq!(err.reason, ExhaustReason::ComputeBudget);
+    let mut enough = ComputeBudget::new(scan + 4000, usize::MAX);
+    let alias = RootAliases::rewrite(roots, canonical, &mut enough)
+        .unwrap()
+        .expect("`/s/x` lies below the linked data path");
+    assert_eq!(alias.len(), long.len() + 2);
 }
