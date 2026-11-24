@@ -918,3 +918,19 @@ That never allows more than `dev` does, and it removes per-tool semantics as a s
 - **P0 (M1-36) round 7** adds `ProtectedSet::identity_gaps: Vec<IdentityGap>` to `policy/model.rs`. It also moves in `IdentityGap { reason, scope, write_only }` and `GapScope { HardLinks, Through(FileIdentity), AnyTarget }` as P2 defined them. A Codex review and the verification follow.
 - **P2** then drops its `ProtectedSetBuild` workaround and applies the gaps inside `check_target`. P1 is rebased onto the new tip.
 - P0's merge still needs rodrigo's go (D-138).
+
+## D-145 — 2026-11-23 — rodrigo: P2's protected-set builder promises what `dev` does, no more
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P2's round 4 (Opus 5.5) closed review 3's "incomplete collection" findings by making every builder gap `AnyTarget`. Any protected tree past the builder's walk caps (4,096 entries or 16 levels) or with an unreadable folder would then make every target that is not a hit Unread. A large Chrome profile, gcloud logs, `~/.zsh_sessions` or a growing Atrium data folder would trigger it, so Home and prefix rules would ask nearly always. Like D-141, the fix is to narrow what the builder promises.
+
+**The ruling (contract §5, read with §1 step 4):**
+1. **Protected trees are protected by name and by the identities of their roots.** The name means every listed-fold spelling (§5). The roots are the tree root and its existing ancestors, compared with a target's path and existing ancestors. That is where hits come from, as on `dev`.
+2. **Members' identities are collected for hard links, within the builder's walk caps.** A cutoff in that collection is Clear, as in §5's bounded hard-link walk. A multiply-linked target is already Ask in every setting (§1 step 4), so a hard-linked alias of an uncollected member still asks. A hard-linked alias of a collected member is a hit.
+3. **Symlink targets are recorded only for `~/.ssh` members, as on `dev`.** A direct read of the external target of a symlink inside another protected tree is not a hit and not Unread, the same as `dev`. Reading it through the protected spelling stays a hit by name and by the identity of the folder that holds the link.
+4. **A gap is Unread only where the builder cannot establish a root or its name:**
+   - a protected root or `~/.ssh` that can't be listed or stat'ed within the filesystem caps;
+   - an unreadable folder on the path to a root.
+
+   Its scope is the targets that root could cover (`Through(root)`, or `AnyTarget` for `~/.ssh` and for a root whose identity is unknown).
+5. **This never allows more than `dev`.** It removes the open-ended "every possible member" promise that kept producing neighbouring findings. Every other §5 rule stands: walking linked directories, fold discovery from `/`, budgets, TooLarge above Exhausted, and CR-P2-1's write-only identities.
+
+P2's next round, round 5 (Opus 5.5, D-142), applies this ruling, keeps the rest of round 4, and fixes the tests to match. The reviewer reviews against this ruling.
