@@ -934,3 +934,11 @@ That never allows more than `dev` does, and it removes per-tool semantics as a s
 5. **This never allows more than `dev`.** It removes the open-ended "every possible member" promise that kept producing neighbouring findings. Every other §5 rule stands: walking linked directories, fold discovery from `/`, budgets, TooLarge above Exhausted, and CR-P2-1's write-only identities.
 
 P2's next round, round 5 (Opus 5.5, D-142), applies this ruling, keeps the rest of round 4, and fixes the tests to match. The reviewer reviews against this ruling.
+
+## D-146 — 2026-11-24 — rodrigo: §3's bracket class is a closed form; P1 gets one more Opus round
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P1's (M1-37) reviews found 9, 6, 3, 2 and 2 findings. The last two came after Opus's two rounds (D-143), which under PLAN §8.4 would escalate again. They are lexer edge cases, not a class (`reviews/M1-37-rev4-p1-command-model-round5.md`).
+1. **§3's `[…]`, clarified as a closed form.** An unquoted bracket class within the model has non-empty members. Each member is an allowed unquoted character (§3), a range `a-z` between two such characters, or a quoted or escaped byte. There is no `!` or `^`, as §3 already says.
+   - These forms are outside the model, so the unit is Unread: `]` as the first member, `[` as a member, and POSIX named classes `[:…:]`, `[=…=]` and `[.….]`.
+   - This only adds Unread (more asks, never a missed hit). Review 5's finding 2 (`[]A]`, `[A[]`, `[[:upper:]]`) is closed by this ruling. The test at `lex/tests.rs:192` stays as it is.
+   - P2's glob expansion (§5) applies to classes within this form only.
+2. **An exception to PLAN §8.4: Opus 5.5 writes one more P1 round.** Review 5's finding 1 is a real bug: an empty heredoc delimiter (`cat <<''`) turned heredoc data into exact units. §3 already puts here-documents outside the model. Opus fixes it, applies point 1 with tests, and the round is reviewed as usual. If that review still has findings, the orchestrator brings them back to the driver before any further round.
