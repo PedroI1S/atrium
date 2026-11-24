@@ -974,3 +974,12 @@ P2's next round, round 5 (Opus 5.5, D-142), applies this ruling, keeps the rest 
    - The orchestrator writes their briefs from the contract and dispatches Neon writers.
    - They rebase if P0 changes again.
    - Behaviour-changing merges (P3's live parts, P4, P5) still wait for Pedro's confirmation of the §11 items (D-138, D-013).
+
+## D-152 — 2026-11-24 — rodrigo: P0 and P1 merge into `dev`; one more Opus round for P2
+**Decided by rodrigo (driver).**
+1. **P0 (M1-36) and P1 (M1-37) merge into `dev`, P0 first.**
+   - Codex approved both with no findings: P0 in rounds 5–8 (`reviews/M1-36-rev4-p0-interface-round8.md`), P1 in round 8 (`reviews/M1-37-rev4-p1-command-model-round8.md`).
+   - Both are green in the orchestrator's verification: fmt, clippy, workspace rc=0 and three core runs. P0 is at `a5b9b3b`, P1 at `d2c1636`.
+   - Neither changes behaviour: nothing is wired into `SessionGate` (D-138). The merge stays local, and the push happens at handoff (D-005).
+   - P2, P3 and P4 rebase onto `dev` from now on. A later P0 change request becomes a small task on `dev`.
+2. **P2 (M1-38).** Review 6 (`reviews/M1-38-rev4-p2-paths-round6.md`) closed round 5's findings and both CR-P2-3 cases, and accepted the pure `check_target` alias limit. It found five new findings, two of them high, mostly in the alias code round 7 ported from `dev`. **Exception to PLAN §8.4:** Opus 5.5 writes one more round and sweeps two classes: a hit is kept before any fallible check, and every filesystem error in the checking phase is Unread. If the next review still has findings, they come back to the driver.
