@@ -1,7 +1,7 @@
 # Handoff: M1-38-rev4-p2-paths (P2)
 
 - **Branch:** `agent/neon/M1-38-rev4-p2-paths` (branched from P0's tip `1a09705`)
-- **Model:** Gemini 4 Neon (High), rounds 1–2; Claude Opus 5.5, round 3 (D-142, §7)
+- **Model:** Gemini 4 Neon (High), rounds 1–2; Claude Opus 5.5, rounds 3–4 (D-142, §7–§8)
 - **Contract:** `docs/contracts/m1-policy-rev4.md` (draft 5) — §2 (filesystem caps & walk-cap rule), §3 (process-dependent paths, `~`, redirect targets), §5 (paths, globs, links, recursive reads, `cd`, intra-call writer effects), §8 (budgets), §10–§12
 - **Behaviour change:** None. `SessionGate` is not wired yet (that is P5), and no P0 interface file (`model.rs`, `limits.rs`, `tools.rs`, other `v4/` stubs) or `dev` file was modified.
 
@@ -309,3 +309,91 @@ cargo test --workspace --no-fail-fast
 Notes for the run:
 - The FsResolver tests use a temporary folder and a fake home. Two of them (`round3_r2f4_*`, `round3_r2f5_*`) are Linux-only, since they rely on `/proc/self/fd`.
 - The `DT_UNKNOWN` path of `FsResolver::read_dir` cannot be produced on ordinary local filesystems, so it has no runtime test; its charge is visible in the code.
+
+---
+
+## 8. Round 4 (Opus 5.5, review round 3, D-144)
+
+On the branch rebased onto P0's round-7 tip `4f18a59` (`GapScope`, `IdentityGap`, `ProtectedSet::identity_gaps`, D-144). It addresses all 8 findings of `.orchestration/review-input/review-round3.md` and adopts CR-P2-2. No file outside P2's owned paths changed.
+
+Commits: `ed83b2f` (code: CR-P2-2 adoption, conservative gaps, findings 1–8), `f29c839` (tests), and the handoff commit.
+
+### 8.1 CR-P2-2 adopted
+
+- `build_protected_set` returns P0's `ProtectedSet`, with `identity_gaps` filled. The local `GapScope`, `IdentityGap`, `ProtectedSetBuild` and `apply_identity_gaps` are gone, and so is §7.1's obligation on P5 to apply gaps.
+- `check_target` applies the gaps itself (`check_target_impl` = exact check, then gaps). A Clear target, or a Store hit, that a gap applies to becomes Unread with the gap's reason; a hard-deny hit is never touched.
+  - Every flow and every recursive walk goes through `check_target`, so gaps reach entries checked inside walks.
+  - The resolver-backed flows (`push_checked`) record the Store hit **and** the gap's Unread. The single-result `check_target` reports the stricter Unread.
+- Both of §7.4's failing cases now pass:
+  - `round3_r2f3_write_only_walk_past_its_caps_is_unread_never_clear`: the standalone `check_target` with Write through a hard link past the cap is Unread;
+  - `round4_cr_p2_2_gaps_reach_standalone_checks_and_recursive_walks`: a filter-selected link into a browser root whose walk passed its cap is Unread.
+
+### 8.2 Conservative rules (where I chose one, and what it costs)
+
+1. **Every builder gap is `GapScope::AnyTarget` for its access scope** (round-3 finding 2).
+   - *Why:* a walk that stops early, an unreadable folder or a filesystem cap may hide a member link whose target, which can be anywhere, the complete walk would have recorded. So any target that is not already a hit could be that target. Narrow scopes (`Through`, `HardLinks`) kept missing those external targets.
+   - *Cost:* more Unread, never a missed hit. While any protected tree exceeds its walk caps (`WALK_MAX_ENTRIES` = 4,096 entries, `WALK_MAX_DEPTH` = 16 levels per tree) or holds an unreadable folder, every target that is not a hit is Unread for that access scope. So it asks in Home and under prefix and exact rules, and is allowed under unscoped Any and FullAccess. A write-only gap affects only non-Read targets.
+   - **For the driver:** on real machines the likely triggers are large browser profiles (Chrome or Chromium caches often exceed 4,096 entries), gcloud logs, `~/.zsh_sessions` and a growing Atrium data folder. If that makes Home ask too often, the options need a decision:
+     - raise the builder's per-tree caps;
+     - have P5 cache the build;
+     - or narrow what the builder promises, for example recording link targets only for `~/.ssh` members, as `dev` does. Then gaps in other trees could be `Through(tree)`, but a direct read of a credential tree's link target would no longer be a hit.
+2. **A directory reached through a link is walked like the directory** (round-3 finding 1), in browser roots and in every protected tree. Its members are recorded under their real identities, so they are protected under any name.
+   - For browser roots and `~/.ssh`, a linked directory's own identity is **not** recorded. Recording it would protect everything below it, which neither the name rule nor `dev` (listing a linked folder stays ordinary) does.
+3. **Discovery runs from `/` over every listed-fold spelling of every component** (round-3 finding 4): home's components, and Atrium paths inside or outside home. It then tries the configured spelling with `lstat`, for volumes whose equivalences the listings don't show (NFC/NFD, case).
+   - A folder on the way that cannot be listed is an `AnyTarget` gap, and its configured spelling is still tried.
+   - *Cost:* the builder lists `/` and every ancestor of home once per build (cached).
+4. **TooLarge is decided before any budget is spent**, and its record is kept even when charging its slot exhausts the budget (round-3 finding 7, §1). A command line whose path operands and redirects alone exceed `MAX_PATHS` is TooLarge up front. That count is a structural check and is not charged (like `MAX_BYTES`), so an exhausted budget cannot hide it.
+5. **`mv` with `-t` / `--target-directory`** (round-3 finding 8): every path operand may be a source. This covers a short-option cluster containing `t`.
+   - *Cost:* `mv -t dir file` with a directory destination is Unread(DerivedDestinations).
+
+### 8.3 Findings, fixes and tests
+
+| Finding | Fix | Regression test (`p2_tests.rs`) |
+|---|---|---|
+| 1 browser profile links lost protection | The browser walk follows linked directories (8.2 rule 2). | `round4_f1_browser_profile_reached_through_a_link_is_collected` |
+| 2 `Through` gaps missed external link targets | All gaps are `AnyTarget` (8.2 rule 1). | `round4_f2_external_target_of_an_uncollected_link_is_unread` |
+| 3 cached listing failure kept the first access scope | Listings are cached as `Entries` / `Absent` / `Failed(reason)`; every consumer re-records a `Failed` gap in its own access scope. | `round4_f3_cached_listing_failure_is_recorded_for_every_access_scope` |
+| 4 discovery anchored at the exact home spelling | 8.2 rule 3. | `round4_f4_fold_variants_of_home_components_are_discovered` |
+| 5 Linux `canonicalize` skipped LinkReads | The `/proc/self/fd/N` read charges LinkReads first. | `round3_r2f4_fs_resolver_makes_no_uncharged_metadata_call` (updated: both caps move; zero LinkReads is `CapReached(LinkReads)`) |
+| 6 uncharged error-path copies and cache clones | See the list below. | `round4_f6_error_path_copies_are_charged_before_allocating` (`resolve_literal(b"x\0")` and a NUL glob with zero allocation: Exhausted) |
+| 7 allocation exhaustion dropped TooLarge | 8.2 rule 4. | `round4_f7_too_large_survives_an_exhausted_budget` (`MAX_USES + 1` subject paths and `MAX_PATHS + 1` operands, with zero allocation and with zero budget) |
+| 8 `mv` destination treated as a source | `WhenSourceIsDir` tests source positions only: the last path-role operand is the destination (8.2 rule 5 for `-t`). | `round4_f8_mv_trigger_is_a_directory_source_not_the_destination` (the annex's all-`Path`, ReadWrite roles) |
+
+Finding 6's fixes, all charged before the allocation happens:
+- error-path copies into Unread reasons (`resolve_literal`, glob, every `path: X.clone()` / `X.to_vec()` push, inserted by a scripted pass);
+- probe-name and tool-name copies;
+- literal resolution's segment queue and stacks;
+- the glob walk's stack, component list and visited set;
+- the recursive walks' stacks and visited sets;
+- the execution-tree maps.
+
+Directory listings are shared through `Rc` instead of deep-cloned, and their one copy is charged.
+
+### 8.4 Neighbouring cases
+
+- A protected folder reached through a link is walked, and its members are hits under any name: `round4_neighbour_protected_folder_reached_through_a_link_is_walked`.
+- `MAX_PATHS` on command lines is decided before the budget (8.2 rule 4).
+- Every TooLarge record, wherever it is pushed, survives an exhausted budget.
+
+### 8.5 Superseded statements
+
+- §7.1's `ProtectedSetBuild` / `apply_identity_gaps` and the P5 obligation to call it are gone (8.1).
+- §7.1's gap scopes are replaced by 8.2 rule 1.
+- §7.4 (CR-P2-2) is accepted and implemented (D-144).
+- The round-3 test `round3_identity_gaps_are_scoped_to_targets_they_can_affect` is replaced by `round4_identity_gaps_widen_unread_and_never_touch_hits`.
+- `round3_r2f3_write_only_walk_past_its_caps_is_unread_never_clear` and `round3_neighbour_paths_spelled_through_protected_folders_keep_their_hit` now expect Unread (not Clear) for non-hit targets of a gapped build.
+
+### 8.6 Verification
+
+Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
+
+For the orchestrator (fish-compatible), the same commands as in §7.6:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core --lib policy::v4::paths
+cargo test --workspace --no-fail-fast
+```
+
+The real-filesystem tests now also list `/` and the temporary folder's parent: discovery runs from the root. They read no file contents and no credential paths.
