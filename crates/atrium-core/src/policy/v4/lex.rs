@@ -1086,6 +1086,36 @@ fn scan_unquoted_escape(
     Ok(())
 }
 
+/// Tracks the members of a bracket class to check D-146's range rule: an
+/// unquoted `-` between two members forms a range, whose endpoints must
+/// both be unquoted allowed characters. A `-` that is the first or the last
+/// member is a literal member.
+#[derive(Default)]
+struct ClassMembers {
+    /// The previous member is an unquoted allowed character.
+    prev_unquoted: bool,
+    /// The previous member is an unquoted `-` after another member:
+    /// `Some(start is an unquoted allowed character)`.
+    dash: Option<bool>,
+}
+
+impl ClassMembers {
+    /// Adds one member (a quoted segment counts as one member: its first byte
+    /// is the one a range would reach). Returns `true` when it completes a
+    /// range with a quoted, escaped or disallowed endpoint.
+    fn add(&mut self, unquoted_allowed: bool, is_dash: bool, first: bool) -> bool {
+        if let Some(start_ok) = self.dash.take() {
+            self.prev_unquoted = unquoted_allowed;
+            return !(start_ok && unquoted_allowed);
+        }
+        if unquoted_allowed && is_dash && !first {
+            self.dash = Some(self.prev_unquoted);
+        }
+        self.prev_unquoted = unquoted_allowed;
+        false
+    }
+}
+
 /// Reads one standalone reserved token (`{`, `}`, `!`, `[[`), charging the
 /// reason's string before consuming the token so the caller can record it
 /// into its reserved slot without a further charge.
@@ -1231,9 +1261,15 @@ fn read_word(
                 scanner.push_word_byte(&mut word, b, ByteProvenance::Unquoted)?;
             }
             b'[' => {
-                // Glob character class `[...]`: no `!` or `^` inside, must be
-                // non-empty and closed, permits §3 quotes and escapes while
-                // retaining class state and byte provenance.
+                // Glob character class `[...]` in D-146's closed form: one or
+                // more members, each an allowed unquoted character (§3; `/`
+                // excluded, as it never matches inside a class), a range
+                // between two such characters, or a quoted or escaped byte.
+                // No `!`/`^`. Outside the model (Unread): `]` as the first
+                // member, `[` as a member (which also covers `[:…:]`,
+                // `[=…=]` and `[.….]`), unquoted `*`/`?`, and a range with a
+                // quoted or escaped endpoint. Quotes and escapes keep their
+                // provenance.
                 started = true;
                 all_unquoted_digits = false;
                 assign_prefix = AssignPrefix::Invalid;
@@ -1241,6 +1277,7 @@ fn read_word(
                 scanner.push_word_byte(&mut word, b'[', ByteProvenance::Unquoted)?;
                 let mut found_close = false;
                 let mut class_len = 0usize;
+                let mut members = ClassMembers::default();
                 while let Some(cb) = scanner.peek() {
                     if is_word_boundary(cb) {
                         break;
@@ -1250,6 +1287,7 @@ fn read_word(
                             scanner.next_byte()?;
                             scanner.push_word_byte(&mut word, b']', ByteProvenance::Unquoted)?;
                             if class_len == 0 {
+                                // `]` as the first member (`[]A]`), or `[]`.
                                 push_unread(
                                     scanner,
                                     sink,
@@ -1263,25 +1301,56 @@ fn read_word(
                             scanner.next_byte()?;
                             push_unread(scanner, sink, UnreadReason::NegatedGlobClass)?;
                             scanner.push_word_byte(&mut word, cb, ByteProvenance::Unquoted)?;
+                            members.add(false, false, class_len == 0);
                             class_len += 1;
                         }
-                        b'\'' => {
+                        b'\'' | b'"' | b'\\' => {
                             contained_quoting = true;
-                            scan_single_quoted(scanner, &mut word, sink, Some(&mut class_len))?;
+                            let before = class_len;
+                            match cb {
+                                b'\'' => {
+                                    scan_single_quoted(
+                                        scanner,
+                                        &mut word,
+                                        sink,
+                                        Some(&mut class_len),
+                                    )?;
+                                }
+                                b'"' => {
+                                    scan_double_quoted(
+                                        scanner,
+                                        &mut word,
+                                        sink,
+                                        Some(&mut class_len),
+                                    )?;
+                                }
+                                _ => {
+                                    scan_unquoted_escape(
+                                        scanner,
+                                        &mut word,
+                                        sink,
+                                        Some(&mut class_len),
+                                    )?;
+                                }
+                            }
+                            if class_len > before && members.add(false, false, before == 0) {
+                                push_unread(
+                                    scanner,
+                                    sink,
+                                    UnreadReason::UnquotedByteOutsideModel { byte: b'-' },
+                                )?;
+                            }
                         }
-                        b'"' => {
-                            contained_quoting = true;
-                            scan_double_quoted(scanner, &mut word, sink, Some(&mut class_len))?;
-                        }
-                        b'\\' => {
-                            contained_quoting = true;
-                            scan_unquoted_escape(scanner, &mut word, sink, Some(&mut class_len))?;
-                        }
-                        c if (is_allowed_unquoted_base(c) && c != b'/')
-                            || matches!(c, b'=' | b'*' | b'?') =>
-                        {
+                        c if (is_allowed_unquoted_base(c) && c != b'/') || c == b'=' => {
                             scanner.next_byte()?;
                             scanner.push_word_byte(&mut word, c, ByteProvenance::Unquoted)?;
+                            if members.add(true, c == b'-', class_len == 0) {
+                                push_unread(
+                                    scanner,
+                                    sink,
+                                    UnreadReason::UnquotedByteOutsideModel { byte: b'-' },
+                                )?;
+                            }
                             class_len += 1;
                         }
                         c if c >= 0x80 => {
@@ -1292,9 +1361,12 @@ fn read_word(
                                 sink,
                                 UnreadReason::UnquotedByteOutsideModel { byte: lead },
                             )?;
+                            members.add(false, false, class_len == 0);
                             class_len += 1;
                         }
                         c => {
+                            // `[` (named classes too), `*`, `?`, `/` and every
+                            // other byte outside the allowed set.
                             scanner.next_byte()?;
                             push_unread(
                                 scanner,
@@ -1302,6 +1374,7 @@ fn read_word(
                                 UnreadReason::UnquotedByteOutsideModel { byte: c },
                             )?;
                             scanner.push_word_byte(&mut word, c, ByteProvenance::Unquoted)?;
+                            members.add(false, false, class_len == 0);
                             class_len += 1;
                         }
                     }
@@ -1378,6 +1451,99 @@ const REDIRECT_RECORD_UNITS: u64 = 3;
 /// charged before the target is read.
 const REDIRECT_REASON_ALLOC_MAX: usize = 16;
 
+/// A here-document delimiter as written after `<<` / `<<-`.
+enum HeredocDelimiter {
+    /// No delimiter word at all.
+    Missing,
+    /// The delimiter after quote removal, where `sh`, `bash` and `zsh`
+    /// agree on it. It may be empty (`<<''`, `<<""`): then the first empty
+    /// line ends the body.
+    Known(Vec<u8>),
+    /// A delimiter whose decoding the shells may not share (a quoted or
+    /// escaped newline, `$` or a backtick, an unclosed quote): where the
+    /// body ends is unknown, so the rest of the text is body.
+    Unknown,
+}
+
+/// Reads a here-document delimiter word, decoding quotes as the shells do:
+/// single quotes keep every byte; in double quotes a backslash escapes only
+/// `"`, `\`, `$` and backtick and is otherwise kept; outside quotes a
+/// backslash escapes the next byte. Every byte is charged before it is
+/// examined, and every byte kept before it is stored.
+fn read_heredoc_delimiter(
+    scanner: &mut ExactScanner<'_, '_>,
+) -> Result<HeredocDelimiter, Exhausted> {
+    let mut delim = Vec::new();
+    let mut token = false;
+    let mut known = true;
+    let keep = |scanner: &mut ExactScanner<'_, '_>, delim: &mut Vec<u8>, b: u8| {
+        scanner.budget.charge(1)?;
+        vec_push_budgeted(delim, b, scanner.budget)
+    };
+    while let Some(b) = scanner.peek() {
+        if is_word_boundary(b) {
+            break;
+        }
+        token = true;
+        scanner.next_byte()?;
+        match b {
+            b'\'' => {
+                let mut closed = false;
+                while let Some(c) = scanner.next_byte()? {
+                    if c == b'\'' {
+                        closed = true;
+                        break;
+                    }
+                    known &= c != b'\n';
+                    keep(scanner, &mut delim, c)?;
+                }
+                known &= closed;
+            }
+            b'"' => {
+                let mut closed = false;
+                while let Some(c) = scanner.next_byte()? {
+                    match c {
+                        b'"' => {
+                            closed = true;
+                            break;
+                        }
+                        b'\\' => match scanner.next_byte()? {
+                            Some(e @ (b'"' | b'\\' | b'$' | b'`')) => keep(scanner, &mut delim, e)?,
+                            Some(b'\n') | None => known = false,
+                            Some(other) => {
+                                keep(scanner, &mut delim, b'\\')?;
+                                keep(scanner, &mut delim, other)?;
+                            }
+                        },
+                        b'$' | b'`' | b'\n' => {
+                            known = false;
+                            keep(scanner, &mut delim, c)?;
+                        }
+                        other => keep(scanner, &mut delim, other)?,
+                    }
+                }
+                known &= closed;
+            }
+            b'\\' => match scanner.next_byte()? {
+                Some(b'\n') | None => known = false,
+                Some(e) => keep(scanner, &mut delim, e)?,
+            },
+            b'$' | b'`' => {
+                known = false;
+                keep(scanner, &mut delim, b)?;
+            }
+            other => keep(scanner, &mut delim, other)?,
+        }
+    }
+    Ok(if !token {
+        HeredocDelimiter::Missing
+    } else if known {
+        HeredocDelimiter::Known(delim)
+    } else {
+        HeredocDelimiter::Unknown
+    })
+}
+
 /// Parses a redirect starting at `<` or `>` (with optional preceding explicit
 /// fd digits, or `&>` / `&>>`).
 fn lex_exact_redirect(
@@ -1385,7 +1551,7 @@ fn lex_exact_redirect(
     explicit_fd: Option<(u32, usize)>,
     cur: &mut PendingUnit,
     sink: &mut ReasonSink<'_>,
-    heredocs: &mut Vec<(Vec<u8>, bool)>,
+    heredocs: &mut Vec<(Option<Vec<u8>>, bool)>,
 ) -> Result<(), Exhausted> {
     let c0 = scanner.peek().unwrap_or(0);
     let c1 = scanner.peek_at(1);
@@ -1435,55 +1601,17 @@ fn lex_exact_redirect(
         scanner.skip_horiz_ws()?;
         // Reserve the delimiter's slot before scanning it (§8).
         charge_vec_growth(heredocs, 1, scanner.budget)?;
-        let mut delim = Vec::new();
-        while let Some(b) = scanner.peek() {
-            if is_word_boundary(b) {
-                break;
+        match read_heredoc_delimiter(scanner)? {
+            HeredocDelimiter::Missing => {
+                // `cat <<` with no delimiter word is a syntax error in every
+                // shell: nothing after it is a command. The rest of the
+                // text is skipped, so none of it becomes an exact unit
+                // (D-146; review round 5, finding 1).
+                let rest = scanner.bytes.len() - scanner.pos;
+                scanner.advance_n(rest)?;
             }
-            match b {
-                b'\'' => {
-                    scanner.next_byte()?;
-                    while let Some(c) = scanner.next_byte()? {
-                        if c == b'\'' {
-                            break;
-                        }
-                        scanner.budget.charge(1)?;
-                        vec_push_budgeted(&mut delim, c, scanner.budget)?;
-                    }
-                }
-                b'"' => {
-                    scanner.next_byte()?;
-                    while let Some(c) = scanner.next_byte()? {
-                        if c == b'"' {
-                            break;
-                        }
-                        if c == b'\\'
-                            && let Some(esc) = scanner.next_byte()?
-                        {
-                            scanner.budget.charge(1)?;
-                            vec_push_budgeted(&mut delim, esc, scanner.budget)?;
-                        } else {
-                            scanner.budget.charge(1)?;
-                            vec_push_budgeted(&mut delim, c, scanner.budget)?;
-                        }
-                    }
-                }
-                b'\\' => {
-                    scanner.next_byte()?;
-                    if let Some(esc) = scanner.next_byte()? {
-                        scanner.budget.charge(1)?;
-                        vec_push_budgeted(&mut delim, esc, scanner.budget)?;
-                    }
-                }
-                _ => {
-                    scanner.next_byte()?;
-                    scanner.budget.charge(1)?;
-                    vec_push_budgeted(&mut delim, b, scanner.budget)?;
-                }
-            }
-        }
-        if !delim.is_empty() {
-            push_reserved(heredocs, (delim, strip_tabs));
+            HeredocDelimiter::Known(delim) => push_reserved(heredocs, (Some(delim), strip_tabs)),
+            HeredocDelimiter::Unknown => push_reserved(heredocs, (None, strip_tabs)),
         }
         return Ok(());
     }
@@ -1644,12 +1772,18 @@ fn lex_exact_redirect(
 
 /// Skips pending here-doc bodies after a newline, charging 1 compute unit per
 /// byte scanned (and the delimiter comparison) so body text is never
-/// mis-parsed as modeled commands.
+/// mis-parsed as modeled commands. A body whose delimiter the shells may not
+/// share runs to the end of the text (D-146).
 fn skip_heredocs(
     scanner: &mut ExactScanner<'_, '_>,
-    heredocs: &mut Vec<(Vec<u8>, bool)>,
+    heredocs: &mut Vec<(Option<Vec<u8>>, bool)>,
 ) -> Result<(), Exhausted> {
     for (delim, strip_tabs) in std::mem::take(heredocs) {
+        let Some(delim) = delim else {
+            // The later bodies are inside this one.
+            let rest = scanner.bytes.len() - scanner.pos;
+            return scanner.advance_n(rest);
+        };
         loop {
             if scanner.is_eof() {
                 break;
@@ -1822,7 +1956,7 @@ pub(super) fn lex_exact_core(
     let mut cur = PendingUnit::new(Separator::Start, None);
     let mut next_pipe_id = 0u32;
     let mut expecting_after_op: Option<&'static str> = None;
-    let mut heredocs: Vec<(Vec<u8>, bool)> = Vec::new();
+    let mut heredocs: Vec<(Option<Vec<u8>>, bool)> = Vec::new();
 
     let run = (|| -> Result<(), Stop> {
         while let Some(b) = scanner.peek() {
