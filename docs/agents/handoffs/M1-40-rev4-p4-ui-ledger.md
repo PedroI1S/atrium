@@ -103,3 +103,32 @@ pnpm --dir app test
 ```
 
 Note: `crates/atrium-protocol/bindings/protocol.ts` was updated by hand to match Specta's output because `cargo run` is outside the worker's D-123 command allowlist; running `export-ts` and `bash scripts/check-protocol-ts` first verifies or regenerates the exact byte-for-byte binding file before `pnpm --dir app typecheck` and `pnpm --dir app test`.
+
+---
+
+## 5. Round 2 (rework)
+
+Addressed the sole finding from `.orchestration/review-input/review-round1.md` (Low: Settings assumptions retained technical shorthand at `app/src/ui/Security.tsx:62,82`) and audited every user-facing string added in P4 (Ask-dialog notice in `app/src/chat/requests.ts`, hard-deny scope text, assumptions, and credential stores section in `app/src/ui/Security.tsx`) so none uses internal words (`Unread`, `Exhausted`, `walk`, `canonical`, `PATH`, `fd`, `identity`).
+
+### Strings changed (`app/src/ui/Security.tsx`, `UNCHECKED_ASSUMPTIONS`)
+
+| Item (`id`) | Old text | New text |
+|---|---|---|
+| `command-names` | `A command like cat or git is assumed to be that system tool; PATH shadowing isn't followed.` | `A command called cat or git is assumed to be the usual system tool, even if another program with that name comes first on the system.` |
+| `repo-contents` | `What commits and diffs contain beyond the paths a git read names.` | `What commits and diffs contain beyond the file paths a git command names.` |
+| `hard-links` | `Hard links inside a large folder beyond Atrium's bounded walk.` | `In large folders, Atrium checks only a limited number of files and folder levels for hard links to protected files.` |
+| `inherited-fds` | `Open file descriptors inherited beyond standard input, output, and error.` | `Open files passed down from a parent program beyond standard input, output, and error.` |
+
+### Other user-facing strings audited (unchanged, already plain words)
+- Ask-dialog notice (`app/src/chat/requests.ts`): `"Atrium can't read this command in full."` and `"Atrium can't read this command in full. It was too long or too complex to check."`
+- Settings hard-deny scope (`app/src/ui/Security.tsx`): contract §9 wording + existing `dev` sentences.
+- Settings assumptions heading & unchanged items (`user-config`, `other-processes`) and "Credential stores that ask" section (`app/src/ui/Security.tsx`).
+
+### Tests and verification
+- Updated `app/src/ui/security.test.ts` to assert the rewritten plain-word assumptions and check rendered `SecurityPage` text against `/\bunread\b/i`, `/\bexhausted\b/i`, `/\bwalk\b/i`, `/\bcanonical\b/i`, `/\bPATH\b/`, `/\bfd\b/i`, and `/\bidentity\b/i`.
+- No Rust files were modified in Round 2 (only `app/src/ui/Security.tsx`, `app/src/ui/security.test.ts`, and this handoff).
+- Orchestrator verification commands (fish-compatible):
+  ```sh
+  pnpm --dir app typecheck
+  pnpm --dir app test
+  ```
