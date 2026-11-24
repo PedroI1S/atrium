@@ -297,6 +297,7 @@ pub fn binding(c: &ToolCheck, matcher: Option<RuleMatcher>) -> Binding {
         },
         title: None,
         remember_matcher: matcher,
+        unread: None,
     }
 }
 

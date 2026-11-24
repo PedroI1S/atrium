@@ -37,12 +37,7 @@ impl ApprovalLedger for MemLedger {
         _: Binding,
     ) -> BoxFuture<'_, Result<ApprovalTicket, LedgerError>> {
         let id = format!("ASK-{}", self.seq.fetch_add(1, Ordering::Relaxed));
-        Box::pin(async move {
-            Ok(ApprovalTicket {
-                request_id: id,
-                rememberable: true,
-            })
-        })
+        Box::pin(async move { Ok(ApprovalTicket::new(id, true)) })
     }
 
     fn open_question(
@@ -52,12 +47,7 @@ impl ApprovalLedger for MemLedger {
         _: Option<u32>,
     ) -> BoxFuture<'_, Result<ApprovalTicket, LedgerError>> {
         let id = format!("Q-{}", self.seq.fetch_add(1, Ordering::Relaxed));
-        Box::pin(async move {
-            Ok(ApprovalTicket {
-                request_id: id,
-                rememberable: false,
-            })
-        })
+        Box::pin(async move { Ok(ApprovalTicket::new(id, false)) })
     }
 
     fn resolve(

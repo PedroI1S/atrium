@@ -59,10 +59,7 @@ fn started() -> ClaudeNormalizer {
 }
 
 fn ticket(id: &str) -> ApprovalTicket {
-    ApprovalTicket {
-        request_id: id.into(),
-        rememberable: true,
-    }
+    ApprovalTicket::new(id.into(), true)
 }
 
 fn ask(id: &str) -> GateDecision {

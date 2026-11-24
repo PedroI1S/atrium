@@ -20,6 +20,7 @@ fn main() {
         .register::<ToolKind>()
         .register::<ToolStatus>()
         .register::<TurnOutcome>()
+        .register::<UnreadNotice>()
         .register::<RequestOutcome>()
         .register::<Question>()
         .register::<QuestionOption>()

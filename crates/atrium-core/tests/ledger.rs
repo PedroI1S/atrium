@@ -11,7 +11,7 @@ use atrium_core::policy::{
 use atrium_core::{
     ApprovalLedger, Binding, LedgerError, RequestKey, RequestStore, StoreError, StoreResult,
 };
-use atrium_protocol::agent::{ApprovalDecision, Provider, ToolKind};
+use atrium_protocol::agent::{ApprovalDecision, Provider, ToolKind, UnreadNotice};
 use atrium_protocol::limits::MAX_PENDING_REQUESTS;
 use atrium_protocol::policy::{
     PolicyContext, Preset, RememberScope, Rule, RuleDecision, RuleId, RuleMatcher, RuleOrigin,
@@ -223,6 +223,7 @@ fn binding(c: &ToolCheck, matcher: Option<RuleMatcher>) -> Binding {
         },
         title: None,
         remember_matcher: matcher,
+        unread: None,
     }
 }
 
@@ -964,4 +965,39 @@ async fn remembered_command_is_exact_not_a_prefix() {
         created_at_ms: 0,
     });
     assert_eq!(g.check(&check(1, "mkdir x y z")).await, GateDecision::Allow);
+}
+
+#[tokio::test]
+async fn unread_and_exhausted_approvals_carry_notice_and_never_remember() {
+    let (store, l) = setup();
+    let c = check(1, "for f in *.rs; do wc -l \"$f\"; done");
+
+    for notice in [UnreadNotice::Unread, UnreadNotice::Exhausted] {
+        // Even if a remember_matcher were supplied, unread/exhausted is never rememberable
+        // and never creates a rule on resolve (contract rev 4 §7 & §9).
+        let mut b = binding(&c, Some(exact(&["for", "f"])));
+        b.unread = Some(notice);
+
+        let t = l.open_approval(&thread(), 1, b).await.unwrap();
+        assert_eq!(t.unread, Some(notice));
+        assert!(!t.rememberable);
+
+        let k = key(&t);
+        let (_, stored_binding) = store.binding(&k).await.unwrap().unwrap();
+        assert_eq!(stored_binding.unread, Some(notice));
+
+        let created_rule = l
+            .resolve(&k, &ApprovalDecision::Allow, Some(RememberScope::Home))
+            .await
+            .unwrap();
+        assert_eq!(created_rule, None);
+        assert!(store.0.lock().unwrap().rules.is_empty());
+        assert_eq!(store.status(&k).as_deref(), Some("approved"));
+        assert_eq!(l.redeem(&k, &c).await, Ok(()));
+    }
+
+    // Question tickets never carry an unread notice.
+    let q = l.open_question(&thread(), 1, Some(1)).await.unwrap();
+    assert_eq!(q.unread, None);
+    assert!(!q.rememberable);
 }

@@ -745,6 +745,7 @@ mod tests {
                 input: serde_json::json!({}),
                 reason: None,
                 rememberable: false,
+                unread: None,
             },
             AgentEvent::ApprovalRequested {
                 request_id: "dup_req".into(),
@@ -755,6 +756,7 @@ mod tests {
                 input: serde_json::json!({}),
                 reason: None,
                 rememberable: false,
+                unread: None,
             },
             AgentEvent::RequestResolved {
                 request_id: "dup_req".into(),
@@ -845,6 +847,7 @@ mod tests {
                 input: serde_json::json!({}),
                 reason: None,
                 rememberable: false,
+                unread: None,
             },
             AgentEvent::RequestResolved {
                 request_id: "req1".into(),
@@ -902,6 +905,7 @@ mod tests {
                 input: serde_json::json!({}),
                 reason: None,
                 rememberable: false,
+                unread: None,
             },
             // BAD ORDER: RequestResolved(cancelled) before ToolCallFinished(cancelled)
             AgentEvent::RequestResolved {
@@ -1075,6 +1079,7 @@ mod tests {
                 input: serde_json::json!({}),
                 reason: None,
                 rememberable: false,
+                unread: None,
             },
             AgentEvent::ApprovalRequested {
                 request_id: "req2".into(),
@@ -1085,6 +1090,7 @@ mod tests {
                 input: serde_json::json!({}),
                 reason: None,
                 rememberable: false,
+                unread: None,
             },
             // TurnCompleted occurs at event index 4
             AgentEvent::TurnCompleted {
@@ -1151,6 +1157,7 @@ mod tests {
                 input: serde_json::json!({}),
                 reason: None,
                 rememberable: false,
+                unread: None,
             },
             AgentEvent::RequestResolved {
                 request_id: "req1".into(),

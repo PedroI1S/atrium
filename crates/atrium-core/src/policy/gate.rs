@@ -1661,6 +1661,7 @@ impl SessionGate {
                     context,
                     title: check.title.clone(),
                     remember_matcher: self.remember_matcher(check, &e),
+                    unread: None,
                 };
                 let ticket = self
                     .ledger
