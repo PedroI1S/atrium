@@ -2253,7 +2253,8 @@ fn wrapper_skip_be(
                     }
                     continue;
                 }
-                budget.charge(w.len().max(1) as u64)?;
+                // `split_once` and the name check each scan at most the word.
+                budget.charge((w.len() as u64).saturating_mul(2).max(1))?;
                 if let Some((name, _)) = w.split_once('=')
                     && is_posix_name(name.as_bytes())
                 {
