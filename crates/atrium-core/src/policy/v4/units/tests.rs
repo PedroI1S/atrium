@@ -7,6 +7,7 @@ use crate::policy::model::{
     Cap, ComputeBudget, ExhaustReason, FoldRules, PartId, PartOutcome, PipelineId, UnitIndex,
     UnreadReason, WrapperKind,
 };
+use crate::policy::tools;
 use crate::policy::v4::lex::lex_exact;
 
 fn unreads_of(parsed: &ParsedCommandUnits) -> Vec<&UnreadReason> {
@@ -648,14 +649,21 @@ fn build_units_empty_quoted_home_does_not_trigger_home_set_earlier() {
 #[test]
 fn build_units_code_runner_hook_attaches_p3_reasons() {
     let mut b = ComputeBudget::with_default_limits();
-    let mut hook = |_unit: &CommandUnit, folded: &str, _budget: &mut ComputeBudget| {
+    let mut hook = |_unit: &CommandUnit,
+                    folded: &str,
+                    sink: &mut UnitReasonSink<'_>,
+                    budget: &mut ComputeBudget| {
         if folded == "awk" {
-            Ok(vec![UnreadReason::CodeRunnerInlineCode {
-                tool: "awk".to_string(),
-            }])
-        } else {
-            Ok(vec![])
+            // Reserve before building the reason, so it cannot be lost.
+            sink.reserve(1, budget)?;
+            sink.push(
+                UnreadReason::CodeRunnerInlineCode {
+                    tool: "awk".to_string(),
+                },
+                budget,
+            )?;
         }
+        Ok(())
     };
     let parsed = build_units_with_hook(
         "awk 'BEGIN{print 1}' README.md",
