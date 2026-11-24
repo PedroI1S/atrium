@@ -395,3 +395,55 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core policy::v4:: -- --nocapture
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 6 (Opus 5.5, review round 4)
+
+Round 5 was green in the orchestrator's verification at `8b5a298` (rebased onto P0's final tip `4f18a59`). The Codex review (`.orchestration/review-input/review-round4.md`) asked for rework with two findings. Both are fixed, along with the neighbouring cases of the same class: a finished result dropped on an error path, or a std helper scanning before its charge.
+
+### The two findings
+1. **Major: best-effort unwrapping dropped completed alternative readings on `Exhausted`.**
+   - **Fix:** `unwrap_best_effort` pays for its one final argv shift on entry. On exhaustion it returns `Err((BestEffortUnwrap, Exhausted))` holding the effective reading (shifted past every finished wrapper step) and every alternative found so far. An alternative whose duplicate check runs out is kept anyway. Every caller now keeps these readings:
+     - the conversion loop (`push_converted` gets the partial readings);
+     - `resolve_cmd_sub_readings`, which stores each reading into its reserved slot before anything else can fail. Once the budget is out, the duplicate checks can't run, so remaining readings are kept unchecked: a repeated reading is harmless, a dropped one would lose a result;
+     - `process_find_exec_cmds`.
+   - **Tests:**
+     - `r6_f1_best_effort_unwrap_keeps_alternative_readings_on_exhaustion` runs the review's case (`"command -Z arg sudo id"`, `ComputeBudget::new(402, 100_000)`). It then sweeps the helper at every budget below its cost: whole-word effective reading, only the full run's alternatives, a stripped reading always with its alternative, and some exhausted run that keeps it. The round-5 code fails that last check. It also covers the `find -exec` and `$(which …)` callers one unit short.
+     - The best-effort class sweep's `assert_best_effort_subset` now also checks that every kept alternative reading is one the full run has. The sweep gained `command -Z arg sudo id`, `$(which sh) -c 'id'`, a nested `find -exec … -ok` line and a `crontab` here-doc.
+2. **Minor: crontab line scanning ran before its charge.**
+   - **Fix:** `crontab_commands_budgeted` finds each line end with a byte scan charged one unit before each byte is examined. It splits like `str::lines` (`\n`, optional `\r`, no empty trailing line). Each line's field parse is charged (2 units/byte) before it runs.
+   - **Test:** `r6_f2_crontab_lines_are_charged_before_they_are_scanned`: the review's case (`"x"×60,000` with `ComputeBudget::new(0, 0)`), a small budget, the lower bound, and the line and field results of the old parser on CRLF, comments, blank lines, `@` lines and short lines.
+
+### Same class, fixed in the audit
+- **`find -exec` derived units were dropped on error paths.** Before, a command extracted from a unit's argv was lost when derivation, the parent's remaining work or the pipeline bookkeeping ran out. Now `extract_find_exec_cmds` reserves each command's `out` slot and its record slot (after the parent and the builders still to convert) when it sees `-exec`. It pays both argv copies (the command's argv, and the effective reading made later by derivation or recovery) word by word as its scan passes them. On any error path, a command being derived is recorded with its readings so far. Commands not yet derived (nested ones too) are recorded with their argv as their reading (`flush_find_execs_raw`), and nothing allocates.
+- **Exact unwrapping discarded recognised wrappers on exhaustion** (round 5 left the unit raw). `unwrap_in_place` now pays the argv shift before the first wrapper is parsed, and each wrapper's storage (`removed_wrappers` slot, up to `MAX_WRAPPER_WORDS` = 6 words) before that wrapper is parsed. So every wrapper recognised before exhaustion is moved out and kept. Test: `r6_exact_unwrap_keeps_recognised_wrappers_on_exhaustion` (every budget below the cost: words unchanged, removed wrappers a prefix of the full run's, all 4 kept by some exhausted run; also through `build_units`).
+- **Helpers that walked before charging:**
+  - `clone_vec_string_budgeted` summed its strings before charging; it now charges the walk first (`argv_copy_cost`).
+  - The `eval` and `echo` join sizing walked the arguments before charging.
+  - Brace expansion summed `char` slices (inner, alternatives, prefix/suffix) before charging.
+  - All of these now charge the walk first.
+- **Re-checked and already charged before they run:**
+  - every remaining `split`, `split_once`, `split_whitespace`, `trim`, `rsplit`, `contains`, `find`, `chars` and `bytes().all` in P1's files;
+  - the memo lookup, Scan 7 and 8, `PayloadSet`, and the here-doc and delimiter scans;
+  - `fold_command_bytes`, the exact lexer and `units.rs`.
+  - `text[i..].chars().next()` decodes one char under the step's charge.
+
+### Change requests
+- **Withdrawn: `unwrap_unit` by-value signature.** The review judged it not a defect, and I agree. No contract-defined caller loses information: `build_units` unwraps in place and keeps every unit, and nothing else in P1 or the contract needs the unit back after `Exhausted`. No open change requests.
+
+### Round 6 verification
+Run by the worker (D-123):
+- `cargo fmt --all`: clean
+- `cargo check -p atrium-core --tests`: clean
+- `cargo clippy -p atrium-core --tests -- -D warnings`: clean
+
+Not run (D-123): any test. Run in debug: the reservation checks are `debug_assert`s.
+
+Commands for the orchestrator's verification task (fish-compatible):
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4:: -- --nocapture
+cargo test --workspace --no-fail-fast
+```
