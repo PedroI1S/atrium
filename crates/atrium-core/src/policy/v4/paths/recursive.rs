@@ -556,6 +556,8 @@ fn check_s8_protected_root(
     {
         if let Some(suffix_bytes) = under_bytes(folded_d, folded_root) {
             if check_exists(raw_d, resolver, caps, budget, outcomes)? {
+                budget.charge(raw_d.len() as u64 + 1)?;
+                budget.charge_alloc(raw_d.len())?;
                 push_hit(outcomes, "atrium-self", raw_d.clone(), budget)?;
                 return Ok(true);
             }
@@ -587,6 +589,8 @@ fn check_s8_protected_root(
     {
         if let Some(suffix_bytes) = under_bytes(folded_d, folded_root) {
             if check_exists(raw_d, resolver, caps, budget, outcomes)? {
+                budget.charge(raw_d.len() as u64 + 1)?;
+                budget.charge_alloc(raw_d.len())?;
                 push_hit(outcomes, "credential-read", raw_d.clone(), budget)?;
                 return Ok(true);
             }
@@ -775,7 +779,6 @@ fn check_s8_protected_root(
 /// D-147, D-154) plus its path below the folder, so a hard-deny entry counts
 /// under the spelling being checked (review 5's class rule: names from the
 /// spelling, the filesystem from the real folder).
-#[allow(clippy::too_many_arguments)]
 fn dir_has_existing_hard_deny_ssh_entry(
     ssh_root: &[u8],
     name_root: &[u8],
@@ -1613,6 +1616,7 @@ pub(crate) fn check_filter_on_root(
             };
             let name = rel_str.rsplit('/').next().unwrap_or(rel_str);
             if probe_matcher.matches_probe(rel_str, name, recursive, budget)? {
+                budget.charge(probe_bytes.len() as u64 + 1)?;
                 budget.charge_alloc(probe_bytes.len().saturating_mul(3))?;
                 push_charged(
                     outcomes,
@@ -1644,6 +1648,7 @@ pub(crate) fn check_filter_on_root(
             };
             let name = rel_str.rsplit('/').next().unwrap_or(rel_str);
             if probe_matcher.matches_probe(rel_str, name, recursive, budget)? {
+                budget.charge(probe_bytes.len() as u64 + 1)?;
                 budget.charge_alloc(probe_bytes.len().saturating_mul(3))?;
                 push_charged(
                     outcomes,
@@ -1978,6 +1983,7 @@ fn walk_followed_links(
                         }
                         if s8 {
                             if has_filter {
+                                budget.charge(canonical.len() as u64 + 1)?;
                                 budget.charge_alloc(canonical.len())?;
                                 push_charged(
                                     outcomes,
@@ -2006,6 +2012,7 @@ fn walk_followed_links(
                                 })
                             }) {
                                 if has_filter {
+                                    budget.charge(canonical.len() as u64 + 1)?;
                                     budget.charge_alloc(canonical.len())?;
                                     push_charged(
                                         outcomes,
@@ -2040,6 +2047,7 @@ fn walk_followed_links(
                         // If the symlink points to a directory, walk inside it (cycle-guarded).
                         match resolver.stat(&canonical, caps, budget) {
                             Ok(md) if md.file_type == FileType::Dir => {
+                                budget.charge(canonical.len() as u64 + 1)?;
                                 budget.charge_alloc(
                                     canonical.len() + 2 * std::mem::size_of::<Vec<u8>>(),
                                 )?;
@@ -2111,6 +2119,7 @@ fn walk_followed_links(
                             )?;
                         }
                     } else {
+                        budget.charge(child.len() as u64 + 1)?;
                         budget.charge_alloc(child.len() + 2 * std::mem::size_of::<Vec<u8>>())?;
                         if visited_paths.insert(child.clone()) {
                             push_charged(&mut stack, (child, depth + 1), budget)?;

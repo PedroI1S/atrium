@@ -1534,7 +1534,9 @@ pub(crate) fn check_target_into(
         .all(|r| matches!(r.outcome, PartOutcome::Clear | PartOutcome::StoreHit(_)))
         && let Some(gap) = applicable_gap(target, protected, budget)?
     {
-        budget.charge_alloc(unread_reason_alloc_bytes(&gap.reason))?;
+        let bytes = unread_reason_alloc_bytes(&gap.reason);
+        budget.charge(bytes as u64 + 1)?;
+        budget.charge_alloc(bytes)?;
         push_charged(
             out,
             PartResult {
@@ -1548,13 +1550,19 @@ pub(crate) fn check_target_into(
 }
 
 /// A protected root before its identity is read: spelling, hard-deny id,
-/// store family, (read, held, reach) (see [`ProtectedRoot`]).
+/// store family, (read, held, reach, alias) (see [`ProtectedRoot`]).
 type SpelledRoot = (
     Vec<u8>,
     Option<&'static str>,
     &'static str,
-    (bool, bool, bool),
+    (bool, bool, bool, bool),
 );
+
+/// `dev`'s spelling of a store root whose entry in [`ASK_FILES`] is folded
+/// (`deny.rs`: `.azure/accessTokens.json`). The alias table reads the root
+/// on this spelling (review 8 sweep).
+const DEV_ROOT_SPELLINGS: &[(&str, &str)] =
+    &[(".azure/accesstokens.json", ".azure/accessTokens.json")];
 
 /// `dev`'s `ask_roots` reads at most this many entries of each folder that
 /// holds name-prefixed store entries (`take(256)`).
@@ -1591,6 +1599,11 @@ pub(crate) struct ProtectedRoot {
     /// decide) and is never reached wholesale (review 6, finding 4; review
     /// 7, finding 2).
     reach: bool,
+    /// The root is one of `dev`'s `alias_fix` roots. False only for a folder
+    /// linked into `~/.ssh`: `dev`'s `ssh_members` returns it among
+    /// `linked_dirs` (a tree for `links_below`), while only the files in it
+    /// are members.
+    alias: bool,
 }
 
 /// The result of `dev`'s `alias_fix` scan of one path.
@@ -1666,7 +1679,7 @@ impl RootAliases {
         if self.roots.is_none() {
             let spelled = self.spelled_roots(protected, resolver, caps, budget)?;
             let mut roots = Vec::new();
-            for (p, id, family, (read, held, reach)) in spelled {
+            for (p, id, family, (read, held, reach, alias)) in spelled {
                 // `dev`'s `identity(&r)` (`fs::metadata`, following links).
                 let identity = match resolver.stat(&p, caps, budget) {
                     Ok(PathMetadata {
@@ -1687,11 +1700,12 @@ impl RootAliases {
                         continue;
                     }
                 };
-                // `dev`'s `trees_of` (`fs::canonicalize`).
-                let canonical = match resolver.canonicalize(&p, caps, budget) {
-                    Ok(c) => Some(c),
-                    Err(e) if is_absent(&e) => None,
-                    Err(e) => {
+                // `dev`'s `trees_of` (`fs::canonicalize`), for the trees only.
+                let canonical = match reach.then(|| resolver.canonicalize(&p, caps, budget)) {
+                    None => None,
+                    Some(Ok(c)) => Some(c),
+                    Some(Err(e)) if is_absent(&e) => None,
+                    Some(Err(e)) => {
                         note_unread(&mut self.incomplete, e, &p, budget)?;
                         None
                     }
@@ -1707,6 +1721,7 @@ impl RootAliases {
                         read,
                         held,
                         reach,
+                        alias,
                     },
                     budget,
                 )?;
@@ -1751,24 +1766,51 @@ impl RootAliases {
             .chain(BROWSER_ROOTS.iter().copied())
         {
             let p = join_folded(home, rel.as_bytes());
-            push_charged(&mut spelled, (p, cred, "", (true, true, true)), budget)?;
+            push_charged(
+                &mut spelled,
+                (p, cred, "", (true, true, true, true)),
+                budget,
+            )?;
         }
         for d in &protected.atrium_data_paths {
-            let r = (d.clone(), Some("atrium-self"), "", (true, false, true));
+            let r = (
+                d.clone(),
+                Some("atrium-self"),
+                "",
+                (true, false, true, true),
+            );
             push_charged(&mut spelled, r, budget)?;
         }
         for d in &protected.atrium_protected_paths {
-            let r = (d.clone(), Some("atrium-self"), "", (false, false, true));
+            let r = (
+                d.clone(),
+                Some("atrium-self"),
+                "",
+                (false, false, true, true),
+            );
             push_charged(&mut spelled, r, budget)?;
         }
+        // `dev`'s `ssh_members`, between `sensitive_roots` and `ask_roots`.
+        self.push_ssh_members(home, resolver, caps, budget, &mut spelled)?;
         for (rel, family) in ASK_FILES.iter().copied().chain(ASK_TREES.iter().copied()) {
+            // The root is read on `dev`'s spelling (a case-sensitive volume
+            // only has that name), not on the folded one the names use.
+            let rel = DEV_ROOT_SPELLINGS
+                .iter()
+                .find(|(folded, _)| *folded == rel)
+                .map_or(rel, |(_, spelled)| *spelled);
             let p = join_folded(home, rel.as_bytes());
-            push_charged(&mut spelled, (p, None, family, (true, true, true)), budget)?;
+            push_charged(
+                &mut spelled,
+                (p, None, family, (true, true, true, true)),
+                budget,
+            )?;
         }
         for (dir, prefix, family) in ASK_NAME_PREFIXES.iter().copied() {
             let folder = join_folded(home, dir.as_bytes());
+            budget.charge(folder.len() as u64 + 1)?;
             budget.charge_alloc(folder.len())?;
-            let spelling = (folder.clone(), None, family, (true, false, false));
+            let spelling = (folder.clone(), None, family, (true, false, false, true));
             push_charged(&mut spelled, spelling, budget)?;
             let entries = match resolver.read_dir(&folder, caps, budget) {
                 Ok(e) => e,
@@ -1779,19 +1821,103 @@ impl RootAliases {
                 }
             };
             for e in entries.iter().take(ASK_PREFIX_ENTRIES) {
-                // `dev`: `to_string_lossy().to_lowercase().starts_with(pre)`.
+                // `dev`: `to_string_lossy().to_lowercase().starts_with(pre)`,
+                // decided without allocating (review 8, finding 3).
                 budget.charge(e.name.len() as u64 * 2 + 1)?;
-                budget.charge_alloc(e.name.len().saturating_mul(4))?;
-                let lower = String::from_utf8_lossy(&e.name).to_lowercase();
-                if lower.starts_with(prefix) {
+                if lossy_lowercase_starts_with(&e.name, prefix) {
                     budget.charge(folder.len() as u64 + e.name.len() as u64 + 1)?;
                     budget.charge_alloc(folder.len() + 1 + e.name.len())?;
                     let p = join_folded(&folder, &e.name);
-                    push_charged(&mut spelled, (p, None, family, (true, true, true)), budget)?;
+                    push_charged(
+                        &mut spelled,
+                        (p, None, family, (true, true, true, true)),
+                        budget,
+                    )?;
                 }
             }
         }
         Ok(spelled)
+    }
+
+    /// `dev`'s `ssh_members` (`gate.rs`), as alias roots: every entry of
+    /// `~/.ssh` down to depth 8 and 1,024 entries is a member (a folder too,
+    /// unless it was reached through a link), spelled through `~/.ssh`. A
+    /// link to a folder is walked and is returned as a linked folder: a tree
+    /// for `links_below` (held), but not an alias root; the files in it are
+    /// members. A link to anything else is a member. Members keep `dev`'s
+    /// names: their alias spelling is checked by name, so the public names
+    /// of `~/.ssh` stay ordinary (review 8, finding 1). The walk's bounds are
+    /// `dev`'s, a cutoff is silent as there (D-145); a cap or I/O failure
+    /// makes the table incomplete (§8).
+    fn push_ssh_members(
+        &mut self,
+        home: &[u8],
+        resolver: &dyn PathResolver,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+        spelled: &mut Vec<SpelledRoot>,
+    ) -> Result<(), Exhausted> {
+        const MAX_ENTRIES: usize = 1024;
+        const MAX_DEPTH: u8 = 8;
+        let cred = Some("credential-read");
+        let mut found = 0usize;
+        budget.charge(home.len() as u64 + 6)?;
+        budget.charge_alloc(home.len() + 5)?;
+        let mut stack: Vec<(Vec<u8>, u8, bool)> = Vec::new();
+        push_charged(&mut stack, (join_folded(home, b".ssh"), 0, false), budget)?;
+        while let Some((dir, depth, linked)) = stack.pop() {
+            if depth >= MAX_DEPTH || found >= MAX_ENTRIES {
+                continue;
+            }
+            let entries = match resolver.read_dir(&dir, caps, budget) {
+                Ok(e) => e,
+                Err(e) if is_absent(&e) => continue,
+                Err(e) => {
+                    note_unread(&mut self.incomplete, e, &dir, budget)?;
+                    continue;
+                }
+            };
+            for e in entries.iter().take(MAX_ENTRIES) {
+                found += 1;
+                let len = dir.len() + 1 + e.name.len();
+                budget.charge(len as u64 + 1)?;
+                budget.charge_alloc(len)?;
+                let p = join_folded(&dir, &e.name);
+                match e.file_type {
+                    FileType::Symlink => match resolver.stat(&p, caps, budget) {
+                        Ok(md) if md.file_type == FileType::Dir => {
+                            budget.charge(len as u64 + 1)?;
+                            budget.charge_alloc(len)?;
+                            let tree = (p.clone(), cred, "", (true, true, true, false));
+                            push_charged(spelled, tree, budget)?;
+                            push_charged(&mut stack, (p, depth + 1, true), budget)?;
+                        }
+                        Ok(_) => {
+                            let member = (p, cred, "", (true, false, false, true));
+                            push_charged(spelled, member, budget)?;
+                        }
+                        Err(e) if is_absent(&e) => {}
+                        Err(e) => note_unread(&mut self.incomplete, e, &p, budget)?,
+                    },
+                    FileType::Dir => {
+                        if linked {
+                            push_charged(&mut stack, (p, depth + 1, linked), budget)?;
+                        } else {
+                            budget.charge(len as u64 + 1)?;
+                            budget.charge_alloc(len)?;
+                            push_charged(&mut stack, (p.clone(), depth + 1, linked), budget)?;
+                            let member = (p, cred, "", (true, false, false, true));
+                            push_charged(spelled, member, budget)?;
+                        }
+                    }
+                    _ => {
+                        let member = (p, cred, "", (true, false, false, true));
+                        push_charged(spelled, member, budget)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `dev`'s `alias_fix` on a path `canonical`: each ancestor of the path
@@ -1810,10 +1936,14 @@ impl RootAliases {
         budget: &mut ComputeBudget,
     ) -> Result<AliasScan, Exhausted> {
         self.roots(protected, resolver, caps, budget)?;
-        let mut unread = self.incomplete.clone();
-        if let Some(r) = &unread {
-            budget.charge_alloc(unread_reason_alloc_bytes(r))?;
+        // The table's reason is charged (copy and storage) before it is
+        // cloned (§8; review 8, finding 2).
+        if let Some(r) = &self.incomplete {
+            let bytes = unread_reason_alloc_bytes(r);
+            budget.charge(bytes as u64 + 1)?;
+            budget.charge_alloc(bytes)?;
         }
+        let mut unread = self.incomplete.clone();
         let roots = self.roots.as_deref().unwrap_or(&[]);
         let path = match canonical.strip_prefix(FIRMLINK) {
             Some(rest) if rest.is_empty() || rest.starts_with(b"/") => rest,
@@ -1836,7 +1966,7 @@ impl RootAliases {
             };
             let Some(id) = id else { continue };
             budget.charge(roots.len() as u64 + 1)?;
-            if let Some(r) = roots.iter().find(|r| r.identity == id) {
+            if let Some(r) = roots.iter().find(|r| r.alias && r.identity == id) {
                 let rest = &comps[i + 1..];
                 let len = r.spelled.len() + rest.iter().map(|c| c.len() + 1).sum::<usize>();
                 budget.charge(len as u64 + 1)?;
@@ -2998,4 +3128,29 @@ pub(crate) fn build_protected_set(
         ssh_linked_dirs,
         folds,
     })
+}
+
+/// `String::from_utf8_lossy(name).to_lowercase().starts_with(prefix)` for an
+/// ASCII `prefix`, decided without allocating (review 8, finding 3): the
+/// name is decoded chunk by chunk (each invalid sequence is one U+FFFD, as
+/// `from_utf8_lossy` gives) and each scalar is lowercased in turn. Per-scalar
+/// lowercasing differs from the string-level one only for a final capital
+/// sigma, which is not ASCII either way, so the answer is the same.
+fn lossy_lowercase_starts_with(name: &[u8], prefix: &str) -> bool {
+    let mut want = prefix.chars();
+    for chunk in name.utf8_chunks() {
+        let lowered = chunk
+            .valid()
+            .chars()
+            .flat_map(char::to_lowercase)
+            .chain((!chunk.invalid().is_empty()).then_some('\u{FFFD}'));
+        for ch in lowered {
+            match want.next() {
+                None => return true,
+                Some(w) if w == ch => {}
+                Some(_) => return false,
+            }
+        }
+    }
+    want.next().is_none()
 }
