@@ -206,6 +206,7 @@ fn table() -> Vec<Row> {
                 input: json!({}),
                 reason: None,
                 rememberable: false,
+                unread: None,
             },
             pend(1, 0),
             "AAAAAAFXUE",

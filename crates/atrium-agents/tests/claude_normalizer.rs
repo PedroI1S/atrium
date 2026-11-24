@@ -85,10 +85,7 @@ fn deadline(what: &str) -> AdapterInput {
 }
 
 fn ticket(id: &str, rememberable: bool) -> ApprovalTicket {
-    ApprovalTicket {
-        request_id: id.into(),
-        rememberable,
-    }
+    ApprovalTicket::new(id.into(), rememberable)
 }
 
 /// Session started, turn 1 open, the user's message emitted.
@@ -2090,4 +2087,44 @@ fn the_message_queue_limit_is_decided_by_the_normalizer() {
     run(&mut n, vec![result(json!({})), user_line("m1")]);
     assert!(run(&mut n, vec![say("m10")]).is_empty());
     assert!(!n.take_rejected());
+}
+
+#[test]
+fn unread_and_exhausted_tickets_propagate_to_approval_requested() {
+    use atrium_protocol::agent::UnreadNotice;
+
+    // Defence in depth: with_notice forces rememberable to false whenever unread is Some.
+    let coerced = ApprovalTicket::with_notice("T-coerced".into(), true, Some(UnreadNotice::Unread));
+    assert!(!coerced.rememberable);
+    assert_eq!(coerced.unread, Some(UnreadNotice::Unread));
+
+    // Serde backwards compatibility: old JSON without `unread` parses as None and omits it.
+    let legacy: ApprovalTicket =
+        serde_json::from_value(json!({"request_id": "legacy", "rememberable": true})).unwrap();
+    assert_eq!(legacy, ApprovalTicket::new("legacy".into(), true));
+    let encoded_legacy = serde_json::to_value(&legacy).unwrap();
+    assert!(encoded_legacy.get("unread").is_none());
+
+    for notice in [UnreadNotice::Unread, UnreadNotice::Exhausted] {
+        let t = ApprovalTicket::with_unread("T-un".into(), notice);
+        let roundtrip: ApprovalTicket =
+            serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
+        assert_eq!(roundtrip, t);
+
+        let (mut n, _) = started();
+        run(&mut n, vec![bash_call("t1"), can_use("r1", "t1")]);
+        let evs = run(&mut n, vec![gate("t1", GateDecision::Ask { ticket: t })]);
+        assert!(
+            matches!(
+                &evs[0],
+                AgentEvent::ApprovalRequested {
+                    request_id,
+                    rememberable: false,
+                    unread,
+                    ..
+                } if request_id == "T-un" && *unread == Some(notice)
+            ),
+            "expected unread notice {notice:?} on ApprovalRequested, got {evs:?}"
+        );
+    }
 }

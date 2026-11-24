@@ -31,12 +31,7 @@ impl ApprovalLedger for AskLedger {
         _: u32,
         _: Binding,
     ) -> BoxFuture<'_, Result<ApprovalTicket, LedgerError>> {
-        Box::pin(async {
-            Ok(ApprovalTicket {
-                request_id: "ASK".into(),
-                rememberable: false,
-            })
-        })
+        Box::pin(async { Ok(ApprovalTicket::new("ASK".into(), false)) })
     }
     fn open_question(
         &self,

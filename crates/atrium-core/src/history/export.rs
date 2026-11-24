@@ -636,6 +636,7 @@ impl<'a> Markdown<'a> {
                 input,
                 reason,
                 rememberable: _,
+                unread: _,
             } => {
                 self.questions
                     .insert((incarnation, request_id.clone()), false);

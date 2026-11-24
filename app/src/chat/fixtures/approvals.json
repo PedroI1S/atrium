@@ -458,5 +458,57 @@
     }
    }
   }
+ },
+ {
+  "type": "event",
+  "event": {
+   "id": 21,
+   "thread_id": "t-approve",
+   "envelope": {
+    "incarnation": 2,
+    "seq": 3,
+    "at_ms": 1763000000020,
+    "event": {
+     "type": "approval_requested",
+     "request_id": "r3",
+     "call_id": null,
+     "name": "Bash",
+     "kind": "execute",
+     "title": "for f in *.rs; do wc -l \"$f\"; done",
+     "input": {
+      "command": "for f in *.rs; do wc -l \"$f\"; done"
+     },
+     "reason": null,
+     "rememberable": false,
+     "unread": "unread"
+    }
+   }
+  }
+ },
+ {
+  "type": "event",
+  "event": {
+   "id": 22,
+   "thread_id": "t-approve",
+   "envelope": {
+    "incarnation": 2,
+    "seq": 4,
+    "at_ms": 1763000000021,
+    "event": {
+     "type": "approval_requested",
+     "request_id": "r4",
+     "call_id": null,
+     "name": "Bash",
+     "kind": "execute",
+     "title": "long command",
+     "input": {
+      "command": "long command"
+     },
+     "reason": null,
+     "rememberable": false,
+     "unread": "exhausted"
+    }
+   }
+  }
  }
 ]

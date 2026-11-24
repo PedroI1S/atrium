@@ -350,10 +350,7 @@ fn redeem_denial_overrides_resolve_approval_allow() {
         "/scratch",
         1,
     );
-    let ticket = ApprovalTicket {
-        request_id: "tk-1".into(),
-        rememberable: true,
-    };
+    let ticket = ApprovalTicket::new("tk-1".into(), true);
     let gate_evs = norm.on_input(&AdapterInput::Gate {
         check: check.clone(),
         decision: GateDecision::Ask {
@@ -452,10 +449,7 @@ fn question_ticket_none_does_not_ask_client_and_some_asks() {
     });
     let asked = norm.on_input(&AdapterInput::QuestionTicket {
         id: "nq-2".into(),
-        ticket: Some(ApprovalTicket {
-            request_id: "qt-2".into(),
-            rememberable: false,
-        }),
+        ticket: Some(ApprovalTicket::new("qt-2".into(), false)),
     });
     assert!(asked.iter().any(|e| matches!(
         e,
@@ -507,10 +501,7 @@ fn decline_question_resolves_cancelled_and_unknown_emits_non_fatal_error() {
     });
     let asked = norm.on_input(&AdapterInput::QuestionTicket {
         id: "nq-decl".into(),
-        ticket: Some(ApprovalTicket {
-            request_id: "qt-decl".into(),
-            rememberable: false,
-        }),
+        ticket: Some(ApprovalTicket::new("qt-decl".into(), false)),
     });
     assert!(asked.iter().any(|e| matches!(
         e,
@@ -630,4 +621,62 @@ fn plan_rate_limit_and_tool_subjects_map_cleanly() {
         Vec::new(),
     );
     assert_eq!(desc.level, EnforcementLevel::Partial);
+}
+
+#[test]
+fn unread_and_exhausted_tickets_propagate_to_approval_requested() {
+    use atrium_protocol::agent::UnreadNotice;
+
+    for notice in [UnreadNotice::Unread, UnreadNotice::Exhausted] {
+        let mut norm = CodexNormalizer::new();
+        init_seq(&mut norm);
+        let _ = norm.on_input(&AdapterInput::Command {
+            command: SessionCommand::SendUserMessage { text: "run".into() },
+        });
+        let _ = norm.on_input(&AdapterInput::Stdout {
+            line: json!({ "method": "turn/started", "params": { "turn": { "id": "t1" } } })
+                .to_string(),
+        });
+        let payload = json!({
+            "itemId": "c-unread",
+            "command": "for f in *.rs; do wc -l \"$f\"; done",
+            "cwd": "/scratch",
+            "reason": null
+        });
+        let check = tools::tool_check(
+            Some("c-unread".into()),
+            "commandExecution".into(),
+            &payload,
+            "/scratch",
+            1,
+        );
+        let ticket = ApprovalTicket::with_unread("tk-unread".into(), notice);
+        assert!(
+            norm.on_input(&AdapterInput::Gate {
+                check,
+                decision: GateDecision::Ask { ticket },
+            })
+            .is_empty()
+        );
+        let req_evs = norm.on_input(&AdapterInput::Stdout {
+            line: json!({
+                "id": "native-unread",
+                "method": "item/commandExecution/requestApproval",
+                "params": payload
+            })
+            .to_string(),
+        });
+        assert!(
+            req_evs.iter().any(|e| matches!(
+                e,
+                AgentEvent::ApprovalRequested {
+                    request_id,
+                    rememberable: false,
+                    unread,
+                    ..
+                } if request_id == "tk-unread" && *unread == Some(notice)
+            )),
+            "expected unread notice {notice:?} on Codex ApprovalRequested, got {req_evs:?}"
+        );
+    }
 }

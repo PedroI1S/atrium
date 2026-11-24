@@ -6,7 +6,7 @@
 import { ChevronDown } from "lucide-solid";
 import { For, Show, createSignal } from "solid-js";
 import type { QuestionAnswer, RememberScope } from "../daemon/types";
-import { type CardState, answersComplete, askOf, canAct, cardState, rememberChoices, subjectOf } from "../chat/requests";
+import { type CardState, answersComplete, askOf, canAct, cardState, rememberChoices, subjectOf, unreadNoticeOf } from "../chat/requests";
 import { answerQuestion, declineQuestion, localOf, resolveApproval, stopTurnForQuestion } from "../chat/threads";
 import type { ApprovalItem, QuestionItem, RequestItem } from "../chat/transcript";
 import { Dot, Kbd } from "./controls";
@@ -43,6 +43,7 @@ export interface Pick { key: string; checked: boolean; toggle: () => void }
 export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick: () => number; small?: boolean; autofocus?: boolean; keys?: boolean; pick?: Pick }) {
   const state = () => (props.tick(), cardState(props.item, localOf(props.threadId, props.item)));
   const subject = () => subjectOf(props.item);
+  const unreadNotice = () => unreadNoticeOf(props.item);
   const choices = () => rememberChoices(props.item);
   const [menu, setMenu] = createSignal(false);
   const act = () => canAct(state());
@@ -81,6 +82,9 @@ export function ApprovalCard(props: { threadId: string; item: ApprovalItem; tick
         <span class="ask-mode">{props.item.name} · {askedAgo(props.item.at)}</span>
       </div>
       <div class="ask-cmd" aria-label={subject().label}>{subject().text}</div>
+      <Show when={unreadNotice()}>
+        {(text) => <p class="ask-note" data-atrium-part="approval-unread" data-unread={props.item.unread ?? undefined}>{text()}</p>}
+      </Show>
       <Show when={props.item.reason}><p class="ask-note">{props.item.reason}</p></Show>
       <StateLine state={state()} />
       <Show when={act()}>

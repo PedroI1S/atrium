@@ -12,7 +12,7 @@ import { MINUTE_MS, Seed, UNKNOWN_THREAD_WAIT_MS, both, click, seeds } from "./c
 import { setRenaming } from "./chat/thread-actions";
 import { holdThread } from "./chat/threads";
 import { apply, daemon } from "./daemon/client";
-import type { EnforcementDescriptor, InboxItem } from "./daemon/types";
+import type { EnforcementDescriptor, InboxItem, UnreadNotice } from "./daemon/types";
 import { writeReport } from "./platform";
 import { sleep, until } from "./roundtrip";
 import { setInboxPick, setPaletteOpen, setPanel, setScreen, setSettingsSection } from "./state";
@@ -50,9 +50,20 @@ const PARTIAL_EXAMPLE: EnforcementDescriptor = {
   ],
 };
 
-function approvalSeed(id: string, title: string, command: string, at: number): Seed {
+function approvalSeed(id: string, title: string, command: string, at: number, unread?: UnreadNotice): Seed {
   const s = new Seed(id, title, at).start().user(1, title).tool("c1", "Bash", "execute", command, null);
-  s.add({ type: "approval_requested", request_id: "q1", call_id: "c1", name: "Bash", kind: "execute", title: command, input: { command }, reason: "Home asks before anything is changed.", rememberable: true });
+  s.add({
+    type: "approval_requested",
+    request_id: "q1",
+    call_id: "c1",
+    name: "Bash",
+    kind: "execute",
+    title: command,
+    input: { command },
+    reason: unread ? null : "Home asks before anything is changed.",
+    rememberable: unread === undefined,
+    ...(unread !== undefined ? { unread } : {}),
+  });
   return s;
 }
 
@@ -70,7 +81,7 @@ export async function runGapShots(): Promise<void> {
   const seeded = seeds(now);
   const more = [
     approvalSeed("seed-approval-2", "Update the lockfile", "pnpm install --lockfile-only", now - 2 * MINUTE_MS),
-    approvalSeed("seed-approval-3", "Format the workspace", "cargo fmt --all", now - MINUTE_MS),
+    approvalSeed("seed-approval-3", "Count lines in Rust files", 'for f in *.rs; do wc -l "$f"; done', now - MINUTE_MS, "unread"),
   ];
   const all = [...seeded.all, ...more];
   for (const summary of seeded.summaries) apply({ type: "thread_updated", summary });

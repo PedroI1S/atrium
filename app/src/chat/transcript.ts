@@ -12,7 +12,7 @@
 //   beyond the bound drops the newest items instead and the view is `detached` from the live
 //   tail until it asks for a fresh snapshot.
 
-import type { AgentEvent, EnforcementDescriptor, EventId, MessageKind, PlanEntry, Question, RequestOutcome, StoredEvent, ToolKind, ToolStatus, TurnOutcome, Usage, Value } from "../daemon/types";
+import type { AgentEvent, EnforcementDescriptor, EventId, MessageKind, PlanEntry, Question, RequestOutcome, StoredEvent, ToolKind, ToolStatus, TurnOutcome, UnreadNotice, Usage, Value } from "../daemon/types";
 import { BlockSplitter, type BlockText } from "./blocks";
 import { MAX_LOADED_TRANSCRIPT_BYTES } from "./limits";
 
@@ -71,6 +71,7 @@ export interface ApprovalItem extends RequestBase {
   input: Value;
   reason: string | null;
   rememberable: boolean;
+  unread: UnreadNotice | null;
 }
 
 export interface QuestionItem extends RequestBase {
@@ -324,7 +325,7 @@ export class Transcript {
     const common = { ...this.base(e, key, NOTE_BYTES), requestId: ev.request_id, turn: this.turn, outcome: null, stale: false, at: e.envelope.at_ms };
     const item: RequestItem =
       ev.type === "approval_requested"
-        ? { ...common, kind: "approval", callId: ev.call_id, name: ev.name, toolKind: ev.kind, title: ev.title, input: ev.input, reason: ev.reason, rememberable: ev.rememberable ?? false, bytes: NOTE_BYTES + valueBytes(ev.input) }
+        ? { ...common, kind: "approval", callId: ev.call_id, name: ev.name, toolKind: ev.kind, title: ev.title, input: ev.input, reason: ev.reason, rememberable: ev.rememberable ?? false, unread: ev.unread ?? null, bytes: NOTE_BYTES + valueBytes(ev.input) }
         : { ...common, kind: "question", questions: ev.questions, bytes: NOTE_BYTES + valueBytes(ev.questions as unknown as Value) };
     this.requests.set(this.scoped(ev.request_id, e.envelope.incarnation), item);
     if (listed) this.add(item);

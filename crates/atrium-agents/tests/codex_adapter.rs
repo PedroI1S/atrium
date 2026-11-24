@@ -63,10 +63,7 @@ impl TestGate {
         Arc::new(Self {
             check: Box::new(check),
             redeem: Box::new(|_, _| GateDecision::Allow),
-            question: Some(ApprovalTicket {
-                request_id: "Q1".into(),
-                rememberable: false,
-            }),
+            question: Some(ApprovalTicket::new("Q1".into(), false)),
             checks: Mutex::default(),
             redeems: Mutex::default(),
         })
@@ -75,16 +72,10 @@ impl TestGate {
     fn asking(redeem: GateDecision) -> Arc<Self> {
         Arc::new(Self {
             check: Box::new(|_| GateDecision::Ask {
-                ticket: ApprovalTicket {
-                    request_id: "T1".into(),
-                    rememberable: true,
-                },
+                ticket: ApprovalTicket::new("T1".into(), true),
             }),
             redeem: Box::new(move |_, _| redeem.clone()),
-            question: Some(ApprovalTicket {
-                request_id: "Q1".into(),
-                rememberable: false,
-            }),
+            question: Some(ApprovalTicket::new("Q1".into(), false)),
             checks: Mutex::default(),
             redeems: Mutex::default(),
         })
@@ -1192,10 +1183,7 @@ async fn saturation_declines_approvals_questions_and_reports_dropped_events() {
                 }
                 let n = seen_asks.fetch_add(1, Ordering::AcqRel);
                 GateDecision::Ask {
-                    ticket: ApprovalTicket {
-                        request_id: format!("sat-req-{n}"),
-                        rememberable: false,
-                    },
+                    ticket: ApprovalTicket::new(format!("sat-req-{n}"), false),
                 }
             })
         }
@@ -1224,10 +1212,7 @@ async fn saturation_declines_approvals_questions_and_reports_dropped_events() {
                     notify.notified().await;
                 }
                 let n = seen_asks.fetch_add(1, Ordering::AcqRel);
-                Some(ApprovalTicket {
-                    request_id: format!("sat-q-{n}"),
-                    rememberable: false,
-                })
+                Some(ApprovalTicket::new(format!("sat-q-{n}"), false))
             })
         }
     }

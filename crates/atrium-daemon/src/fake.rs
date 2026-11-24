@@ -441,6 +441,7 @@ impl Agent {
                     input,
                     reason: Some("synthetic approval".into()),
                     rememberable: ticket.rememberable,
+                    unread: ticket.unread,
                 })
                 .await?;
                 self.resolve_approval(call_id, ticket, &check).await

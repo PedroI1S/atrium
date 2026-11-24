@@ -196,6 +196,7 @@ fn binding(title: &str) -> Binding {
         },
         title: Some(title.into()),
         remember_matcher: None,
+        unread: None,
     }
 }
 
@@ -209,6 +210,7 @@ fn approval(id: &str, title: &str) -> AgentEvent {
         input: json!({}),
         reason: None,
         rememberable: false,
+        unread: None,
     }
 }
 
@@ -2135,4 +2137,136 @@ async fn unfinished_incarnations_lists_open_current_incarnations_archived_or_not
         )
         .unwrap();
     assert_eq!(b_process, None);
+}
+
+#[tokio::test]
+async fn pending_approval_with_unread_notice_survives_restart() {
+    let fx = Fixture::new();
+    let (t, inc) = {
+        let store = fx.open().await;
+        let (t, inc) = started_thread(&store).await;
+        let reqs = store.requests();
+
+        let ordinary_b = binding("Ordinary ask");
+        let mut unread_b = binding("Dynamic loop");
+        unread_b.unread = Some(UnreadNotice::Unread);
+        let mut exhausted_b = binding("Complex command");
+        exhausted_b.unread = Some(UnreadNotice::Exhausted);
+
+        reqs.open_approval(&key(&t, inc, "a_plain"), &ordinary_b)
+            .await
+            .unwrap();
+        reqs.open_approval(&key(&t, inc, "a_unread"), &unread_b)
+            .await
+            .unwrap();
+        reqs.open_approval(&key(&t, inc, "a_exhausted"), &exhausted_b)
+            .await
+            .unwrap();
+
+        let unread_ev = AgentEvent::ApprovalRequested {
+            request_id: "a_unread".into(),
+            call_id: None,
+            name: "Bash".into(),
+            kind: ToolKind::Execute,
+            title: Some("Dynamic loop".into()),
+            input: json!({ "command": "for f in *.rs; do wc -l \"$f\"; done" }),
+            reason: None,
+            rememberable: false,
+            unread: Some(UnreadNotice::Unread),
+        };
+        let exhausted_ev = AgentEvent::ApprovalRequested {
+            request_id: "a_exhausted".into(),
+            call_id: None,
+            name: "Bash".into(),
+            kind: ToolKind::Execute,
+            title: Some("Complex command".into()),
+            input: json!({ "command": "long command" }),
+            reason: None,
+            rememberable: false,
+            unread: Some(UnreadNotice::Exhausted),
+        };
+
+        store
+            .append(
+                &t,
+                inc,
+                vec![
+                    env(0, started()),
+                    env(1, AgentEvent::TurnStarted { turn: 1 }),
+                    env(2, approval("a_plain", "Ordinary ask")),
+                    env(3, unread_ev),
+                    env(4, exhausted_ev),
+                ],
+            )
+            .await
+            .unwrap();
+        (t, inc)
+    };
+
+    // Reopen the SQLite store from disk to verify persistence across a daemon restart.
+    let store = fx.open().await;
+    let reqs = store.requests();
+
+    let (status_plain, b_plain) = reqs
+        .binding(&key(&t, inc, "a_plain"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status_plain, "pending");
+    assert_eq!(b_plain.unread, None);
+
+    let (status_unread, b_unread) = reqs
+        .binding(&key(&t, inc, "a_unread"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status_unread, "pending");
+    assert_eq!(b_unread.unread, Some(UnreadNotice::Unread));
+
+    let (status_exhausted, b_exhausted) = reqs
+        .binding(&key(&t, inc, "a_exhausted"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status_exhausted, "pending");
+    assert_eq!(b_exhausted.unread, Some(UnreadNotice::Exhausted));
+
+    let replayed = store.events_after(&t, None, 100).await.unwrap();
+    let notices: Vec<(String, Option<UnreadNotice>)> = replayed
+        .into_iter()
+        .filter_map(|e| match e.envelope.event {
+            AgentEvent::ApprovalRequested {
+                request_id, unread, ..
+            } => Some((request_id, unread)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        vec![
+            ("a_plain".into(), None),
+            ("a_unread".into(), Some(UnreadNotice::Unread)),
+            ("a_exhausted".into(), Some(UnreadNotice::Exhausted)),
+        ]
+    );
+
+    // Ordinary approvals keep the legacy `PolicyContext` JSON shape with no `"unread"` key.
+    drop(store);
+    let conn = rusqlite::Connection::open_with_flags(
+        fx.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let plain_ctx: String = conn
+        .query_row(
+            "SELECT context FROM requests WHERE thread_id = ?1 AND incarnation = ?2 AND request_id = 'a_plain'",
+            rusqlite::params![t.0, inc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let plain_val: serde_json::Value = serde_json::from_str(&plain_ctx).unwrap();
+    assert!(
+        plain_val.get("unread").is_none(),
+        "ordinary binding context must omit unread: {plain_ctx}"
+    );
 }

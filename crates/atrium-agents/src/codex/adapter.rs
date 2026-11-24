@@ -1553,10 +1553,7 @@ impl Driver {
                 call_id: None,
                 name: String::new(),
                 payload,
-                ticket: ApprovalTicket {
-                    request_id: String::new(),
-                    rememberable: false,
-                },
+                ticket: ApprovalTicket::new(String::new(), false),
                 permit: None,
             },
         );
