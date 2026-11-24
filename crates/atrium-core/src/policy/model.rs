@@ -975,6 +975,13 @@ pub(crate) struct Target {
     pub(crate) origin: TargetOrigin,
     pub(crate) access: AccessMode,
     pub(crate) resolution: TargetResolution,
+    /// The written spelling of this target, lexically normalised as `dev`'s
+    /// `lexical_resolve` does (`~` expanded, joined onto the written working
+    /// directory, `.` and `..` removed), when it is known. Protected names are
+    /// checked on it as well as on the canonical path (contract §5, D-147,
+    /// D-149). `None` when the target has no written form (for example a
+    /// filesystem entry found by a walk).
+    pub(crate) written: Option<Vec<u8>>,
 }
 
 /// Result of expanding one shell glob against the filesystem (contract §5).
@@ -1585,5 +1592,44 @@ mod tests {
                 "hard-deny id {id:?} must exist in HARD_DENY_DEFAULTS"
             );
         }
+    }
+
+    #[test]
+    fn target_carries_optional_written_spelling() {
+        let with_written = Target {
+            origin: TargetOrigin::Operand {
+                unit: UnitIndex(0),
+                argv_index: 1,
+            },
+            access: AccessMode::Read,
+            resolution: TargetResolution::Resolved {
+                canonical: b"/tmp/real-profile/Cookies".to_vec(),
+                identities: vec![FileIdentity { dev: 1, ino: 42 }],
+                dangling_symlink: false,
+                multiply_linked: false,
+            },
+            written: Some(b"/Users/alice/.config/google-chrome/Cookies".to_vec()),
+        };
+
+        let without_written = Target {
+            origin: TargetOrigin::ImplicitCwd {
+                unit: Some(UnitIndex(0)),
+            },
+            access: AccessMode::Read,
+            resolution: TargetResolution::Resolved {
+                canonical: b"/Users/alice/proj/file.txt".to_vec(),
+                identities: vec![FileIdentity { dev: 1, ino: 43 }],
+                dangling_symlink: false,
+                multiply_linked: false,
+            },
+            written: None,
+        };
+
+        assert_eq!(
+            with_written.written.as_deref(),
+            Some(b"/Users/alice/.config/google-chrome/Cookies".as_slice())
+        );
+        assert_eq!(without_written.written, None);
+        assert_ne!(with_written, without_written);
     }
 }
