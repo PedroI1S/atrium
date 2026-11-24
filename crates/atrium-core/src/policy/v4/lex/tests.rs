@@ -154,13 +154,14 @@ fn lex_exact_rejects_leading_equals_zsh_expansion() {
 
 #[test]
 fn lex_exact_globs_and_negated_classes() {
-    // Valid globs: `*`, `?`, `[a-z]`, `[0-9]`, `[*]`.
+    // Valid globs: `*`, `?`, `[a-z]`, `[0-9_]`. (`[*]` was listed here; under
+    // D-146's closed form `*` is not an allowed unquoted character, so a
+    // class holding it is Unread: see `r7_bracket_class_is_d146_closed_form`.)
     for line in [
         "cat proj/key*",
         "cat proj/key?",
         "cat proj/key[a-z]",
         "cat proj/key[0-9_]",
-        "cat proj/[*]",
     ] {
         let mut budget = ComputeBudget::with_default_limits();
         let out = lex_exact(line, 0, None, &mut budget).unwrap();
@@ -2353,6 +2354,168 @@ fn r6_f2_crontab_lines_are_charged_before_they_are_scanned() {
             crontab_commands_budgeted(text, &mut b).unwrap(),
             want,
             "{text:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 7 (D-146; review round 5)
+// ---------------------------------------------------------------------------
+
+/// Exact units whose command word is `sudo`.
+fn exact_sudo_units(out: &LexExactOutput) -> usize {
+    out.units
+        .iter()
+        .filter(|u| u.argv.first().is_some_and(|w| w.literal_bytes() == b"sudo"))
+        .count()
+}
+
+fn has_exact_unit(out: &LexExactOutput, argv0: &[u8]) -> bool {
+    out.units
+        .iter()
+        .any(|u| u.argv.first().is_some_and(|w| w.literal_bytes() == argv0))
+}
+
+#[test]
+fn r7_f1_here_document_bodies_never_become_exact_units() {
+    // Review round 5, finding 1, failing case: `cat <<''` queued no body, so
+    // the body line became an exact `sudo id` unit. §3 puts here-documents
+    // outside the model; with any delimiter form the body yields no exact
+    // unit. Where the shells agree on the terminator, the units after it are
+    // still lexed (`ls`), and the best-effort pass still sees them.
+    let known_end = [
+        "cat <<''\nsudo id\n\nls",
+        "cat <<\"\"\nsudo id\n\nls",
+        "cat <<-''\nsudo id\n\t\t\nls",
+        "cat <<-\"\"\nsudo id\n\nls",
+        "cat <<'' >out\nsudo id\n\nls",
+        "cat 2<<''\nsudo id\n\nls",
+        "cat <<A <<''\nsudo id\nA\nsudo id\n\nls",
+        // A backslash in double quotes stays unless it escapes `"`, `\`,
+        // `$` or backtick: the delimiter is `E\F`, not `EF`.
+        "cat <<\"E\\F\"\nEF\nsudo id\nE\\F\nls",
+        "cat <<E''\"\"\nsudo id\nE\nls",
+        "cat <<\\E\nsudo id\nE\nls",
+    ];
+    for line in known_end {
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert_eq!(exact_sudo_units(&out), 0, "{line:?}: {:?}", out.units);
+        assert!(has_exact_unit(&out, b"cat"), "{line:?}");
+        assert!(
+            has_exact_unit(&out, b"ls"),
+            "{line:?}: unit after the terminator"
+        );
+        assert!(
+            unread_reasons(&out).iter().any(|r| matches!(
+                r,
+                UnreadReason::ReservedWordOrConstruct { construct } if construct.starts_with("<<")
+            )),
+            "{line:?}"
+        );
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let rec = lex_best_effort(&[line], &mut b).unwrap();
+        assert!(
+            rec.units.iter().any(|u| u.raw_argv == ["ls"]),
+            "{line:?}: best-effort keeps the unit after the terminator"
+        );
+    }
+
+    // No delimiter word, or one the shells may decode differently (a quoted
+    // or escaped newline, `$`, a backtick, an unclosed quote): the body's
+    // end is unknown, so the rest of the text is body and yields no exact
+    // unit at all.
+    let unknown_end = [
+        "cat <<\nsudo id\n",
+        "cat << ; sudo id\nsudo id\n",
+        "cat <<-\nsudo id\n",
+        "cat <<'E\nF'\nsudo id\nE\nF\nsudo id",
+        "cat <<$X\nsudo id\n$X\nsudo id",
+        "cat <<\"$X\"\nsudo id\n$X\nsudo id",
+        "cat <<`X`\nsudo id\n`X`\nsudo id",
+        "cat <<'EOF\nsudo id\nEOF\nsudo id",
+        "cat <<E\\\nF\nsudo id\nEF\nsudo id",
+    ];
+    for line in unknown_end {
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert_eq!(exact_sudo_units(&out), 0, "{line:?}: {:?}", out.units);
+        assert_eq!(out.units.len(), 1, "{line:?}: only `cat`: {:?}", out.units);
+        assert!(!has_exhausted(&out));
+    }
+
+    // Same in a modeled `-c` script lexed through `build_units`.
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let parsed = crate::policy::v4::units::build_units(
+        "sh -c \"cat <<''\nsudo id\n\nls\"",
+        &FoldRules::REV4,
+        &mut b,
+    )
+    .unwrap();
+    assert!(
+        !parsed
+            .units
+            .iter()
+            .any(|u| u.argv.first().is_some_and(|w| w.literal_bytes() == b"sudo")),
+        "{:?}",
+        parsed.units
+    );
+    assert!(
+        parsed
+            .units
+            .iter()
+            .any(|u| u.argv.first().is_some_and(|w| w.literal_bytes() == b"ls"))
+    );
+}
+
+#[test]
+fn r7_bracket_class_is_d146_closed_form() {
+    // D-146: members are allowed unquoted characters, ranges between two
+    // such characters, or quoted or escaped bytes; no `!`/`^`.
+    for line in [
+        "cat key[a-z]",
+        "cat key[a-z0-9_]",
+        "cat key[A'x']",
+        "cat key[\\]]",
+        "cat key[']'a]",
+        "cat key[\"x\"y]",
+        "cat key[a-]",
+        "cat key[-a]",
+        "cat key[a\\-z]",
+        "cat key[a=b]",
+        "cat key[.,:@%+]",
+    ] {
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert!(
+            unread_reasons(&out).is_empty(),
+            "`{line}`: {:?}",
+            out.outcomes
+        );
+        assert!(out.units[0].argv[1].has_unquoted_glob(), "`{line}`");
+    }
+
+    // Outside the closed form, so Unread (D-146): `]` as the first member,
+    // `[` as a member (POSIX `[:…:]`, `[=…=]`, `[.….]` included), unquoted
+    // `*`/`?` members, and ranges with a quoted or escaped endpoint. These
+    // are review round 5's finding 2 cases, closed by D-146.
+    for line in [
+        "cat []A]GENTS.md",
+        "cat [A[]GENTS.md",
+        "cat [[:upper:]]GENTS.md",
+        "cat [[=a=]]",
+        "cat [[.a.]]",
+        "cat [*]",
+        "cat [?]",
+        "cat ['a'-z]",
+        "cat [a-'z']",
+        "cat [a-\\z]",
+    ] {
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let out = lex_exact(line, 0, None, &mut b).unwrap();
+        assert!(
+            !unread_reasons(&out).is_empty(),
+            "`{line}` must be Unread (D-146)"
         );
     }
 }
