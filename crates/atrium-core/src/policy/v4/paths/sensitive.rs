@@ -17,10 +17,9 @@ use std::rc::Rc;
 
 use crate::policy::limits;
 use crate::policy::model::{
-    AccessMode, ComputeBudget, DirEntry, Exhausted, FileIdentity, FileType, FoldRules, FsCap,
-    FsCaps, FsIoError, GapScope, Hit, HitMatch, HitSource, IdentityGap, PartId, PartOutcome,
-    PartResult, PathMetadata, ProtectedSet, ResolveError, Target, TargetOrigin, TargetResolution,
-    UnreadReason,
+    AccessMode, ComputeBudget, Exhausted, FileIdentity, FileType, FoldRules, FsCap, FsCaps,
+    FsIoError, GapScope, Hit, HitMatch, HitSource, IdentityGap, PartId, PartOutcome, PartResult,
+    PathMetadata, ProtectedSet, ResolveError, Target, TargetOrigin, TargetResolution, UnreadReason,
 };
 use crate::policy::v4::paths::PathResolver;
 
@@ -1463,15 +1462,28 @@ fn check_target_exact(
 }
 
 // ---------------------------------------------------------------------------
-// ProtectedSet builder: the only collector of protected identities
+// ProtectedSet builder: the only collector of protected identities (D-145)
 // ---------------------------------------------------------------------------
 //
-// Conservative rule (round 4): every gap the builder records is
-// `GapScope::AnyTarget` for its access scope. A walk that stops early, an
-// unreadable folder or a filesystem cap may hide a member link whose target
-// (which can be anywhere) the complete walk would have recorded, so any target
-// that is not already a hit could be that target: it is Unread. Hits stay
-// exact; only Unread widens (§2, §5, §11 item 13).
+// What the builder promises (D-145, contract §5 read with §1 step 4), which
+// is what `dev` promises:
+// 1. Protected trees and files are protected by name (every listed-fold
+//    spelling) and by the identities of their roots: each root's own
+//    identity (`lstat`, so a dangling link counts) and what it names after
+//    following links (as `dev`'s `metadata`). A target's path and existing
+//    ancestors are compared with them.
+// 2. Members' identities are collected for hard links only: regular files
+//    with more than one link, within the walk caps. A cutoff there is Clear,
+//    as in §5's bounded hard-link walk; an uncollected multiply-linked target
+//    is already Ask in every setting (§1 step 4). Browser roots are not
+//    protected wholesale, so their credential files (and the folders they sit
+//    in, through linked profile folders too) are their roots.
+// 3. Link targets are recorded only for `~/.ssh` members.
+// 4. A gap is Unread only where a root or its name cannot be established: a
+//    root or `~/.ssh` that cannot be stat'ed or listed within the caps, or an
+//    unreadable folder on the path to a root. Its scope is `Through(root)`,
+//    or `AnyTarget` for `~/.ssh` and for a root whose identity is unknown.
+// Linked directories are walked like directories.
 
 /// The identities a target can be compared with: a gap applies to it when its
 /// scope covers the target and the access matches (contract §2, §5, D-144).
@@ -1516,11 +1528,19 @@ pub(crate) fn applicable_gap<'p>(
         .find(|g| gap_applies(g, target)))
 }
 
-/// A cached directory listing: the entries, absence, or the reason it could
-/// not be listed (kept so every later consumer records its own gap).
+/// One cached directory entry with its listed-fold name, folded once per
+/// build (round-4 verification: re-folding every entry of `/` and `/tmp` for
+/// every protected name exhausted the allocation budget).
+struct Listed {
+    name: Vec<u8>,
+    folded: Vec<u8>,
+}
+
+/// A cached directory listing: its entries, absence, or the reason it could
+/// not be listed (kept so every consumer records its own gap).
 #[derive(Clone)]
 enum Listing {
-    Entries(Rc<[DirEntry]>),
+    Entries(Rc<[Listed]>),
     Absent,
     Failed(UnreadReason),
 }
@@ -1577,17 +1597,16 @@ impl IdentityLists {
     }
 }
 
-/// Which members of a protected tree are recorded.
+/// Which members of a protected tree are recorded (D-145 rule 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Members {
-    /// Every member (credential trees, Atrium paths, store trees).
-    All,
-    /// Members named in `BROWSER_FILES` (browser roots).
+    /// Regular files with more than one link (hard links).
+    HardLinks,
+    /// Entries named in `BROWSER_FILES` (a browser root's protected names).
     BrowserFiles,
 }
 
-/// The builder's working state: the resolver, the identity lists, the gaps
-/// and a directory cache shared by every listed-fold discovery.
+/// The builder's working state.
 struct Collector<'r> {
     resolver: &'r dyn PathResolver,
     folds: FoldRules,
@@ -1597,7 +1616,7 @@ struct Collector<'r> {
 }
 
 /// Maps a resolver failure that is not absence to the Unread reason it
-/// stands for (`None` for absence; `Exhausted` is returned by the caller).
+/// stands for (`None` for absence; `Exhausted` is returned).
 fn failure_reason(
     err: &ResolveError,
     path: &[u8],
@@ -1616,17 +1635,22 @@ fn failure_reason(
     }
 }
 
+/// The gap scope for a root: through its identity when known, else any target.
+fn root_scope(id: Option<FileIdentity>) -> GapScope {
+    id.map_or(GapScope::AnyTarget, GapScope::Through)
+}
+
 impl Collector<'_> {
-    /// Records a gap (always `AnyTarget`; see the module rule above).
     fn gap(
         &mut self,
         reason: UnreadReason,
+        scope: GapScope,
         write_only: bool,
         budget: &mut ComputeBudget,
     ) -> Result<(), Exhausted> {
         let gap = IdentityGap {
             reason,
-            scope: GapScope::AnyTarget,
+            scope,
             write_only,
         };
         budget.charge((self.gaps.len() as u64).saturating_add(1))?;
@@ -1634,89 +1658,91 @@ impl Collector<'_> {
             return Ok(());
         }
         // A read-applicable gap subsumes the same write-only one.
-        if self
-            .gaps
-            .iter()
-            .any(|g| !g.write_only && g.reason == gap.reason)
+        if gap.write_only
+            && self
+                .gaps
+                .iter()
+                .any(|g| !g.write_only && g.reason == gap.reason && g.scope == gap.scope)
         {
             return Ok(());
         }
+        budget.charge_alloc(unread_reason_alloc_bytes(&gap.reason))?;
         push_charged(&mut self.gaps, gap, budget)
     }
 
-    /// Records a resolver failure on `path` as a gap (absence is not one).
+    /// Records a resolver failure on `path` as a gap of `scope` (absence is
+    /// not one).
     fn failure(
         &mut self,
         err: ResolveError,
         path: &[u8],
+        scope: GapScope,
         write_only: bool,
         budget: &mut ComputeBudget,
     ) -> Result<(), Exhausted> {
         if let Some(reason) = failure_reason(&err, path, budget)? {
-            self.gap(reason, write_only, budget)?;
+            self.gap(reason, scope, write_only, budget)?;
         }
         Ok(())
     }
 
-    /// Lists `dir` once per build. A listing failure is cached with its
-    /// reason, and every consumer (in its own access scope) records the gap
-    /// again (round-3 finding 3). The listing is shared, not copied.
+    /// Lists `dir` once per build, folding each name once. A failure is
+    /// cached with its reason and returned to every consumer, which records
+    /// the gap in its own scope (round-3 finding 3).
     fn list_dir(
         &mut self,
         dir: &[u8],
-        write_only: bool,
         caps: &mut FsCaps,
         budget: &mut ComputeBudget,
-    ) -> Result<Option<Rc<[DirEntry]>>, Exhausted> {
+    ) -> Result<Listing, Exhausted> {
         budget.charge(dir.len().max(1) as u64)?;
-        let listing = match self.dir_cache.get(dir) {
-            Some(cached) => cached.clone(),
-            None => {
-                let listing = match self.resolver.read_dir(dir, caps, budget) {
-                    Ok(entries) => {
-                        // `Rc<[_]>` copies the entry headers (not the names)
-                        // into one new buffer.
-                        budget.charge_alloc(
-                            entries
-                                .len()
-                                .saturating_mul(std::mem::size_of::<DirEntry>())
-                                .saturating_add(32),
-                        )?;
-                        Listing::Entries(Rc::from(entries))
-                    }
-                    Err(err) => match failure_reason(&err, dir, budget)? {
-                        Some(reason) => Listing::Failed(reason),
-                        None => Listing::Absent,
-                    },
-                };
-                budget.charge_alloc(
-                    dir.len()
-                        + std::mem::size_of::<Listing>()
-                        + 4 * std::mem::size_of::<Vec<u8>>()
-                        + match &listing {
-                            Listing::Failed(r) => unread_reason_alloc_bytes(r),
-                            _ => 0,
-                        },
-                )?;
-                self.dir_cache.insert(dir.to_vec(), listing.clone());
-                listing
-            }
-        };
-        match listing {
-            Listing::Entries(entries) => Ok(Some(entries)),
-            Listing::Absent => Ok(None),
-            Listing::Failed(reason) => {
-                self.gap(reason, write_only, budget)?;
-                Ok(None)
-            }
+        if let Some(cached) = self.dir_cache.get(dir) {
+            return Ok(cached.clone());
         }
+        let listing = match self.resolver.read_dir(dir, caps, budget) {
+            Ok(entries) => {
+                // The `Vec` of entries and the `Rc` buffer it is moved into.
+                budget.charge_alloc(
+                    entries
+                        .len()
+                        .saturating_mul(2 * std::mem::size_of::<Listed>())
+                        .saturating_add(32),
+                )?;
+                let mut listed = Vec::with_capacity(entries.len());
+                for e in entries {
+                    let folded = fold_listed_component(&e.name, self.folds, budget)?;
+                    listed.push(Listed {
+                        name: e.name,
+                        folded,
+                    });
+                }
+                Listing::Entries(Rc::from(listed))
+            }
+            Err(err) => match failure_reason(&err, dir, budget)? {
+                Some(reason) => Listing::Failed(reason),
+                None => Listing::Absent,
+            },
+        };
+        budget.charge_alloc(
+            dir.len()
+                + std::mem::size_of::<Listing>()
+                + 4 * std::mem::size_of::<Vec<u8>>()
+                + match &listing {
+                    Listing::Failed(r) => unread_reason_alloc_bytes(r),
+                    _ => 0,
+                },
+        )?;
+        self.dir_cache.insert(dir.to_vec(), listing.clone());
+        Ok(listing)
     }
 
     /// Every existing listed-fold spelling of the absolute configured path
-    /// `abs`, discovered component by component FROM THE FILESYSTEM ROOT, so
-    /// fold variants of home's own components count too (round-3 finding 4).
-    /// Where a folder on the way cannot be listed (a gap), the configured
-    /// spelling is still tried there.
+    /// `abs`, discovered component by component from `/`, so fold variants of
+    /// home's own components count too (round-3 finding 4); then the
+    /// configured spelling itself, for equivalences the listings don't show.
+    /// A folder on the way that cannot be listed may hide spellings whose
+    /// identity is unknown: an `AnyTarget` gap (D-145 rule 4), and the
+    /// configured spelling is still tried there.
     fn folded_spellings(
         &mut self,
         abs: &[u8],
@@ -1730,38 +1756,31 @@ impl Collector<'_> {
             let comp_folded = fold_listed_component(comp, self.folds, budget)?;
             let mut next: Vec<Vec<u8>> = Vec::new();
             for dir in &frontier {
-                let listed = self.list_dir(dir, write_only, caps, budget)?;
-                let push_cand = |name: &[u8],
-                                 next: &mut Vec<Vec<u8>>,
-                                 budget: &mut ComputeBudget|
-                 -> Result<(), Exhausted> {
+                let listing = self.list_dir(dir, caps, budget)?;
+                let names: Vec<&[u8]> = match &listing {
+                    Listing::Entries(entries) => {
+                        budget.charge(2 * entries.len() as u64 + 1)?;
+                        let matches = entries.iter().filter(|l| l.folded == comp_folded).count();
+                        budget
+                            .charge_alloc(matches.saturating_mul(std::mem::size_of::<&[u8]>()))?;
+                        entries
+                            .iter()
+                            .filter(|l| l.folded == comp_folded)
+                            .map(|l| l.name.as_slice())
+                            .collect()
+                    }
+                    Listing::Absent => continue,
+                    Listing::Failed(reason) => {
+                        self.gap(reason.clone(), GapScope::AnyTarget, write_only, budget)?;
+                        vec![comp]
+                    }
+                };
+                for name in names {
                     budget.charge_alloc(dir.len() + 1 + name.len())?;
                     let cand = join_folded(dir, name);
                     budget.charge(next.len() as u64 + 1)?;
                     if !next.contains(&cand) {
-                        push_charged(next, cand, budget)?;
-                    }
-                    Ok(())
-                };
-                match listed {
-                    Some(entries) => {
-                        for entry in entries.iter() {
-                            let folded = fold_listed_component(&entry.name, self.folds, budget)?;
-                            if folded == comp_folded {
-                                push_cand(&entry.name, &mut next, budget)?;
-                            }
-                        }
-                    }
-                    None => {
-                        // Absent folder: nothing below it. Unlistable folder:
-                        // the gap is recorded; try the configured spelling.
-                        if self
-                            .dir_cache
-                            .get(dir.as_slice())
-                            .is_some_and(|l| matches!(l, Listing::Failed(_)))
-                        {
-                            push_cand(comp, &mut next, budget)?;
-                        }
+                        push_charged(&mut next, cand, budget)?;
                     }
                 }
             }
@@ -1770,8 +1789,6 @@ impl Collector<'_> {
                 break;
             }
         }
-        // The volume may resolve the configured spelling under an
-        // equivalence the listings don't show (normalization, case): try it.
         budget.charge(frontier.len() as u64 + 1)?;
         if !frontier.iter().any(|p| p.as_slice() == abs) {
             match self.resolver.lstat(abs, caps, budget) {
@@ -1779,7 +1796,7 @@ impl Collector<'_> {
                     budget.charge_alloc(abs.len())?;
                     push_charged(&mut frontier, abs.to_vec(), budget)?;
                 }
-                Err(err) => self.failure(err, abs, write_only, budget)?,
+                Err(err) => self.failure(err, abs, GapScope::AnyTarget, write_only, budget)?,
             }
         }
         Ok(frontier)
@@ -1795,26 +1812,22 @@ impl Collector<'_> {
         Ok(join_folded(home, rel.as_bytes()))
     }
 
-    /// Records the identity of `path` (`lstat`, so a dangling link counts
-    /// under its own name) and, when it is a link to an existing entry, of its
-    /// target (a target directory only when `dir_targets`: a folder linked into
-    /// `~/.ssh` or a browser root is walked, not protected wholesale). Returns
-    /// the metadata of what `path` names after following links (the link's
-    /// own metadata when dangling), if `path` exists.
-    #[allow(clippy::too_many_arguments)]
-    fn record(
+    /// Records a root (D-145 rule 1): its own identity (`lstat`) and, when it
+    /// is a link to an existing entry, what it names (as `dev`'s `metadata`).
+    /// A root that cannot be stat'ed is an `AnyTarget` gap (its identity is
+    /// unknown). Returns what the root names after following links.
+    fn record_root(
         &mut self,
         path: &[u8],
         kind: ListKind,
         tag: &'static str,
-        dir_targets: bool,
         caps: &mut FsCaps,
         budget: &mut ComputeBudget,
     ) -> Result<Option<PathMetadata>, Exhausted> {
         let meta = match self.resolver.lstat(path, caps, budget) {
             Ok(m) => m,
             Err(err) => {
-                self.failure(err, path, kind.write_only(), budget)?;
+                self.failure(err, path, GapScope::AnyTarget, kind.write_only(), budget)?;
                 return Ok(None);
             }
         };
@@ -1826,9 +1839,7 @@ impl Collector<'_> {
         }
         match self.resolver.stat(path, caps, budget) {
             Ok(target) => {
-                if let Some(id) = target.identity
-                    && (dir_targets || target.file_type != FileType::Dir)
-                {
+                if let Some(id) = target.identity {
                     self.lists.push(kind, id, tag, budget)?;
                 }
                 Ok(Some(target))
@@ -1837,18 +1848,45 @@ impl Collector<'_> {
                 Ok(Some(meta))
             }
             Err(err) => {
-                self.failure(err, path, kind.write_only(), budget)?;
+                // The link's own identity is known, so its scope is through it.
+                self.failure(
+                    err,
+                    path,
+                    root_scope(meta.identity),
+                    kind.write_only(),
+                    budget,
+                )?;
                 Ok(Some(meta))
             }
         }
     }
 
-    /// Walks the protected tree at `root` (whose followed metadata is
-    /// `root_meta`) within the contract's walk caps (`WALK_MAX_ENTRIES`
-    /// entries and `WALK_MAX_DEPTH` levels per tree), recording `members`.
-    /// A directory reached through a link is walked like the directory itself
-    /// (round-3 finding 1); directories are visited once by identity. Any
-    /// early stop is a gap.
+    /// Records a root and, when it names a folder (directly or through a
+    /// link), its members for hard links (D-145 rules 1-2).
+    fn record_tree(
+        &mut self,
+        path: &[u8],
+        kind: ListKind,
+        tag: &'static str,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<(), Exhausted> {
+        if let Some(m) = self.record_root(path, kind, tag, caps, budget)?
+            && m.file_type == FileType::Dir
+        {
+            self.walk_members(path, m, kind, tag, Members::HardLinks, caps, budget)?;
+        }
+        Ok(())
+    }
+
+    /// Walks the folder `root` (whose followed metadata is `root_meta`)
+    /// within `WALK_MAX_ENTRIES` entries and `WALK_MAX_DEPTH` levels,
+    /// recording `members` (D-145 rule 2). A folder reached through a link is
+    /// walked like the folder; folders are visited once by identity.
+    ///
+    /// Only the root's own listing failing is a gap (`Through(root)`, D-145
+    /// rule 4). A cutoff, an unreadable subfolder or a member that cannot be
+    /// stat'ed is Clear, as in §5's bounded hard-link walk.
     #[allow(clippy::too_many_arguments)]
     fn walk_members(
         &mut self,
@@ -1860,7 +1898,6 @@ impl Collector<'_> {
         caps: &mut FsCaps,
         budget: &mut ComputeBudget,
     ) -> Result<(), Exhausted> {
-        let write_only = kind.write_only();
         budget.charge_alloc(root.len() + 2 * std::mem::size_of::<(Vec<u8>, u8)>())?;
         let mut stack: Vec<(Vec<u8>, u8)> = vec![(root.to_vec(), 0)];
         let mut visited: HashSet<FileIdentity> = HashSet::new();
@@ -1872,8 +1909,12 @@ impl Collector<'_> {
         while let Some((dir, depth)) = stack.pop() {
             let entries = match self.resolver.read_dir(&dir, caps, budget) {
                 Ok(e) => e,
+                Err(ResolveError::Exhausted(e)) => return Err(e),
                 Err(err) => {
-                    self.failure(err, &dir, write_only, budget)?;
+                    if depth == 0 {
+                        let scope = root_scope(root_meta.identity);
+                        self.failure(err, &dir, scope, kind.write_only(), budget)?;
+                    }
                     continue;
                 }
             };
@@ -1883,61 +1924,53 @@ impl Collector<'_> {
                 }
                 entries_seen += 1;
                 if entries_seen > limits::WALK_MAX_ENTRIES {
-                    return self.gap(
-                        UnreadReason::WalkCapReached(FsCap::EntriesRead),
-                        write_only,
-                        budget,
-                    );
+                    return Ok(());
                 }
                 budget.charge(entry.name.len().max(1) as u64)?;
-                let named = match members {
-                    Members::All => true,
-                    // A folder named like a browser file is not one.
-                    Members::BrowserFiles => {
-                        entry.file_type != FileType::Dir && {
-                            let folded = fold_listed_component(&entry.name, self.folds, budget)?;
-                            std::str::from_utf8(&folded).is_ok_and(|n| BROWSER_FILES.contains(&n))
-                        }
-                    }
-                };
-                if !named && entry.file_type == FileType::File {
+                let named =
+                    members == Members::BrowserFiles && entry.file_type != FileType::Dir && {
+                        let folded = fold_listed_component(&entry.name, self.folds, budget)?;
+                        std::str::from_utf8(&folded).is_ok_and(|n| BROWSER_FILES.contains(&n))
+                    };
+                // In a browser root only the browser files are protected.
+                if members == Members::BrowserFiles
+                    && !named
+                    && !matches!(entry.file_type, FileType::Dir | FileType::Symlink)
+                {
                     continue;
                 }
                 budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
                 let child = join_folded(&dir, &entry.name);
-                // What `child` names after following links (a link to a
-                // directory is walked like the directory).
-                let followed = if named {
-                    self.record(&child, kind, tag, members == Members::All, caps, budget)?
-                } else if entry.file_type == FileType::Dir {
-                    match self.resolver.lstat(&child, caps, budget) {
-                        Ok(m) => Some(m),
-                        Err(err) => {
-                            self.failure(err, &child, write_only, budget)?;
-                            None
-                        }
-                    }
-                } else if entry.file_type == FileType::Symlink {
-                    match self.resolver.stat(&child, caps, budget) {
-                        Ok(m) => Some(m),
-                        Err(err) => {
-                            self.failure(err, &child, write_only, budget)?;
-                            None
-                        }
-                    }
-                } else {
-                    None
+                let meta = match self.resolver.lstat(&child, caps, budget) {
+                    Ok(m) => m,
+                    Err(ResolveError::Exhausted(e)) => return Err(e),
+                    Err(_) => continue,
                 };
-                let Some(m) = followed else { continue };
-                if m.file_type != FileType::Dir {
-                    continue;
+                if named {
+                    // A browser credential file is a root of its own name.
+                    if let Some(id) = meta.identity {
+                        self.lists.push(kind, id, tag, budget)?;
+                    }
+                } else if members == Members::HardLinks
+                    && meta.file_type == FileType::File
+                    && meta.nlink > 1
+                    && let Some(id) = meta.identity
+                {
+                    self.lists.push(kind, id, tag, budget)?;
                 }
+                // Folders, and links to folders, are walked.
+                let folder = match meta.file_type {
+                    FileType::Dir => Some(meta),
+                    FileType::Symlink => match self.resolver.stat(&child, caps, budget) {
+                        Ok(m) if m.file_type == FileType::Dir => Some(m),
+                        Ok(_) => None,
+                        Err(ResolveError::Exhausted(e)) => return Err(e),
+                        Err(_) => None,
+                    },
+                    _ => None,
+                };
+                let Some(m) = folder else { continue };
                 if depth + 1 >= limits::WALK_MAX_DEPTH {
-                    self.gap(
-                        UnreadReason::WalkCapReached(FsCap::WalkDepth),
-                        write_only,
-                        budget,
-                    )?;
                     continue;
                 }
                 if m.identity.is_none_or(|id| !visited.contains(&id)) {
@@ -1952,47 +1985,20 @@ impl Collector<'_> {
         Ok(())
     }
 
-    /// Records a protected entry and, when it names a folder (directly or
-    /// through a link), walks its members.
-    fn record_tree(
-        &mut self,
-        path: &[u8],
-        kind: ListKind,
-        tag: &'static str,
-        members: Members,
-        caps: &mut FsCaps,
-        budget: &mut ComputeBudget,
-    ) -> Result<(), Exhausted> {
-        let meta = if members == Members::All {
-            self.record(path, kind, tag, true, caps, budget)?
-        } else {
-            match self.resolver.stat(path, caps, budget) {
-                Ok(m) => Some(m),
-                Err(err) => {
-                    self.failure(err, path, kind.write_only(), budget)?;
-                    None
-                }
-            }
-        };
-        if let Some(m) = meta
-            && m.file_type == FileType::Dir
-        {
-            self.walk_members(path, m, kind, tag, members, caps, budget)?;
-        }
-        Ok(())
-    }
-
     /// Walks every listed-fold spelling of `~/.ssh` (dev's `ssh_members`,
-    /// within the contract's walk caps): private members go to the hard-deny
-    /// list, the top-level `config` and `authorized_keys` to the write-only
-    /// list, public names (`*.pub`, `known_hosts*`) to neither; folders linked
-    /// into `~/.ssh` are walked and their real paths returned.
+    /// within the walk caps): private members, with their link targets, go to
+    /// the hard-deny list (D-145 rule 3); the top-level `config` and
+    /// `authorized_keys` to the write-only list; public names (`*.pub`,
+    /// `known_hosts*`) to neither; folders linked into `~/.ssh` are walked and
+    /// their real paths returned. Any incompleteness is an `AnyTarget` gap,
+    /// since a missed linked folder protects files anywhere by name.
     fn walk_ssh(
         &mut self,
         home: &[u8],
         caps: &mut FsCaps,
         budget: &mut ComputeBudget,
     ) -> Result<Vec<Vec<u8>>, Exhausted> {
+        let any = GapScope::AnyTarget;
         let mut linked_dirs: Vec<Vec<u8>> = Vec::new();
         let ssh = Self::under_home(home, ".ssh", budget)?;
         let roots = self.folded_spellings(&ssh, false, caps, budget)?;
@@ -2006,7 +2012,7 @@ impl Collector<'_> {
             let entries = match self.resolver.read_dir(&dir, caps, budget) {
                 Ok(e) => e,
                 Err(err) => {
-                    self.failure(err, &dir, false, budget)?;
+                    self.failure(err, &dir, any.clone(), false, budget)?;
                     continue;
                 }
             };
@@ -2018,6 +2024,7 @@ impl Collector<'_> {
                 if entries_seen > limits::WALK_MAX_ENTRIES {
                     self.gap(
                         UnreadReason::WalkCapReached(FsCap::EntriesRead),
+                        any,
                         false,
                         budget,
                     )?;
@@ -2035,36 +2042,47 @@ impl Collector<'_> {
                 } else {
                     ListKind::HardDeny
                 };
-                let tag = "credential-read";
                 budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
                 let child = join_folded(&dir, &entry.name);
-                let followed = match entry.file_type {
-                    FileType::Dir => match self.resolver.lstat(&child, caps, budget) {
+                let lmeta = match self.resolver.lstat(&child, caps, budget) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        self.failure(err, &child, any.clone(), false, budget)?;
+                        continue;
+                    }
+                };
+                let followed = if lmeta.file_type == FileType::Symlink {
+                    match self.resolver.stat(&child, caps, budget) {
                         Ok(m) => Some(m),
+                        Err(
+                            ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory),
+                        ) => None,
                         Err(err) => {
-                            self.failure(err, &child, false, budget)?;
+                            self.failure(err, &child, any.clone(), false, budget)?;
                             None
                         }
-                    },
-                    _ if public => None,
-                    _ => self.record(&child, kind, tag, false, caps, budget)?,
+                    }
+                } else {
+                    Some(lmeta)
                 };
-                // A public link may still lead to a linked folder.
-                let followed = match (followed, entry.file_type) {
-                    (None, FileType::Symlink) => match self.resolver.stat(&child, caps, budget) {
-                        Ok(m) => Some(m),
-                        Err(err) => {
-                            self.failure(err, &child, false, budget)?;
-                            None
-                        }
-                    },
-                    (f, _) => f,
-                };
-                let Some(m) = followed else { continue };
-                if m.file_type != FileType::Dir {
+                let is_dir = followed.is_some_and(|m| m.file_type == FileType::Dir);
+                if !public && lmeta.file_type != FileType::Dir {
+                    // The member itself, and a link's target unless it is a
+                    // folder (a linked folder is walked, not protected whole).
+                    if let Some(id) = lmeta.identity {
+                        self.lists.push(kind, id, "credential-read", budget)?;
+                    }
+                    if !is_dir
+                        && lmeta.file_type == FileType::Symlink
+                        && let Some(id) = followed.and_then(|m| m.identity)
+                    {
+                        self.lists.push(kind, id, "credential-read", budget)?;
+                    }
+                }
+                if !is_dir {
                     continue;
                 }
-                let via_link = entry.file_type == FileType::Symlink;
+                let via_link = lmeta.file_type == FileType::Symlink;
                 if via_link {
                     match self.resolver.canonicalize(&child, caps, budget) {
                         Ok(real) => {
@@ -2073,17 +2091,19 @@ impl Collector<'_> {
                                 push_charged(&mut linked_dirs, real, budget)?;
                             }
                         }
-                        Err(err) => self.failure(err, &child, false, budget)?,
+                        Err(err) => self.failure(err, &child, any.clone(), false, budget)?,
                     }
                 }
                 if depth + 1 >= limits::WALK_MAX_DEPTH {
                     self.gap(
                         UnreadReason::WalkCapReached(FsCap::WalkDepth),
+                        any.clone(),
                         false,
                         budget,
                     )?;
                     continue;
                 }
+                let m = followed.unwrap_or(lmeta);
                 if m.identity.is_none_or(|id| !visited.contains(&id)) {
                     if let Some(id) = m.identity {
                         budget.charge_alloc(4 * std::mem::size_of::<FileIdentity>())?;
@@ -2098,27 +2118,21 @@ impl Collector<'_> {
 }
 
 /// Builds a [`ProtectedSet`] using `resolver` (charging `caps` and `budget`
-/// before every operation), with every gap in its identity lists in
-/// `identity_gaps` (§2, §5, §8, D-142, D-144).
-///
-/// It is the only collector of protected identities:
-/// - `hard_deny_identities`: credential files and trees (with their members),
-///   private `~/.ssh` members, browser credential files, and Atrium's data
-///   paths (with their members);
+/// before every operation), applying D-145 (see the rules above):
+/// - `hard_deny_identities`: credential files and trees, Atrium's data paths
+///   and browser credential files (their roots), the multiply-linked members
+///   of those trees, and `~/.ssh`'s private members with their link targets;
 /// - `write_only_hard_deny_identities`: `~/.ssh/config`,
-///   `~/.ssh/authorized_keys`, and Atrium's protected paths (with their
-///   members), checked only when the target's access is not Read;
-/// - `store_identities`: the CR-12 / CR-17 stores (with tree members);
+///   `~/.ssh/authorized_keys`, and Atrium's protected paths (roots and
+///   multiply-linked members), checked only when access is not Read;
+/// - `store_identities`: the CR-12 / CR-17 stores (roots and multiply-linked
+///   tree members);
+/// - `identity_gaps`: only where a root or its name could not be established;
 /// - `ssh_linked_dirs`: the real paths of folders linked into `~/.ssh`.
 ///
 /// Every protected name is found under every listed-fold spelling of every
-/// component, from the filesystem root; dangling links count under their own
-/// names (`lstat`); a link's target is recorded too, and a directory reached
-/// through a link is walked like the directory. Each tree is walked within
-/// `WALK_MAX_ENTRIES` entries and `WALK_MAX_DEPTH` levels; any early stop, an
-/// unreadable folder and a filesystem cap become an `AnyTarget` gap for that
-/// collection's access scope (see the rule above). The caller should give
-/// the builder its own [`FsCaps`], so the walks don't use up the check's.
+/// component, from `/`. The caller should give the builder its own
+/// [`FsCaps`], so its listings don't use up the check's caps.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_protected_set(
     home: &[u8],
@@ -2141,94 +2155,102 @@ pub(crate) fn build_protected_set(
     };
     let hd = ListKind::HardDeny;
 
-    // 1. Credential files and trees (every listed-fold spelling, members too).
+    // 1. Credential files and trees.
     for f in CRED_FILES {
         let abs = Collector::under_home(home, f, budget)?;
         for p in c.folded_spellings(&abs, false, caps, budget)? {
-            c.record(&p, hd, "credential-read", true, caps, budget)?;
+            c.record_root(&p, hd, "credential-read", caps, budget)?;
         }
     }
     for t in CRED_TREES {
         let abs = Collector::under_home(home, t, budget)?;
         for p in c.folded_spellings(&abs, false, caps, budget)? {
-            c.record_tree(&p, hd, "credential-read", Members::All, caps, budget)?;
+            c.record_tree(&p, hd, "credential-read", caps, budget)?;
         }
     }
 
-    // 2. Atrium data paths (every listed-fold spelling, members too).
+    // 2. Atrium data paths.
     for d in &atrium_data_paths {
         for p in c.folded_spellings(d, false, caps, budget)? {
-            c.record_tree(&p, hd, "atrium-self", Members::All, caps, budget)?;
+            c.record_tree(&p, hd, "atrium-self", caps, budget)?;
         }
     }
 
     // 3. `~/.ssh` members, write-only `config` / `authorized_keys`, linked folders.
     let ssh_linked_dirs = c.walk_ssh(home, caps, budget)?;
 
-    // 4. Browser credential files below every spelling of every browser root.
+    // 4. Browser credential files below every spelling of every browser root
+    //    (through linked profile folders too). A root that cannot be stat'ed
+    //    or listed is a gap through it.
     for b in BROWSER_ROOTS {
         let abs = Collector::under_home(home, b, budget)?;
         for root in c.folded_spellings(&abs, false, caps, budget)? {
-            c.record_tree(
-                &root,
-                hd,
-                "credential-read",
-                Members::BrowserFiles,
-                caps,
-                budget,
-            )?;
+            let meta = match resolver.stat(&root, caps, budget) {
+                Ok(m) => m,
+                Err(err) => {
+                    c.failure(err, &root, GapScope::AnyTarget, false, budget)?;
+                    continue;
+                }
+            };
+            if meta.file_type == FileType::Dir {
+                c.walk_members(
+                    &root,
+                    meta,
+                    hd,
+                    "credential-read",
+                    Members::BrowserFiles,
+                    caps,
+                    budget,
+                )?;
+            }
         }
     }
 
-    // 5. Atrium protected paths: write-only (every spelling, members too).
+    // 5. Atrium protected paths: write-only.
     for d in &atrium_protected_paths {
         for p in c.folded_spellings(d, true, caps, budget)? {
-            c.record_tree(
-                &p,
-                ListKind::WriteOnly,
-                "atrium-self",
-                Members::All,
-                caps,
-                budget,
-            )?;
+            c.record_tree(&p, ListKind::WriteOnly, "atrium-self", caps, budget)?;
         }
     }
 
-    // 6. Credential stores that ask (CR-12 + CR-17): files, trees (members
-    //    too) and the name-prefixed families.
+    // 6. Credential stores that ask (CR-12 + CR-17).
     let st = ListKind::Store;
     for &(f, family) in ASK_FILES {
         let abs = Collector::under_home(home, f, budget)?;
         for p in c.folded_spellings(&abs, false, caps, budget)? {
-            c.record(&p, st, family, true, caps, budget)?;
+            c.record_root(&p, st, family, caps, budget)?;
         }
     }
     for &(t, family) in ASK_TREES {
         let abs = Collector::under_home(home, t, budget)?;
         for p in c.folded_spellings(&abs, false, caps, budget)? {
-            c.record_tree(&p, st, family, Members::All, caps, budget)?;
+            c.record_tree(&p, st, family, caps, budget)?;
         }
     }
+    // The name-prefixed families: the folder is their root; each entry with
+    // the prefix is a root of its own name.
     for &(dir, pre, family) in ASK_NAME_PREFIXES {
         let abs = Collector::under_home(home, dir, budget)?;
         for dir_path in c.folded_spellings(&abs, false, caps, budget)? {
-            let Some(entries) = c.list_dir(&dir_path, false, caps, budget)? else {
-                continue;
-            };
-            for (i, entry) in entries.iter().enumerate() {
-                if i >= limits::WALK_MAX_ENTRIES {
-                    c.gap(
-                        UnreadReason::WalkCapReached(FsCap::EntriesRead),
-                        false,
-                        budget,
-                    )?;
-                    break;
+            let entries = match c.list_dir(&dir_path, caps, budget)? {
+                Listing::Entries(entries) => entries,
+                Listing::Absent => continue,
+                Listing::Failed(reason) => {
+                    let scope = match resolver.stat(&dir_path, caps, budget) {
+                        Ok(m) => root_scope(m.identity),
+                        Err(ResolveError::Exhausted(e)) => return Err(e),
+                        Err(_) => GapScope::AnyTarget,
+                    };
+                    c.gap(reason, scope, false, budget)?;
+                    continue;
                 }
-                let name = fold_listed_component(&entry.name, folds, budget)?;
-                if name.starts_with(pre.as_bytes()) {
+            };
+            for entry in entries.iter().take(limits::WALK_MAX_ENTRIES) {
+                budget.charge(entry.folded.len().max(1) as u64)?;
+                if entry.folded.starts_with(pre.as_bytes()) {
                     budget.charge_alloc(dir_path.len() + 1 + entry.name.len())?;
                     let p = join_folded(&dir_path, &entry.name);
-                    c.record(&p, st, family, true, caps, budget)?;
+                    c.record_root(&p, st, family, caps, budget)?;
                 }
             }
         }
