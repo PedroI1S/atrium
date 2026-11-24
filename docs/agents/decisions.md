@@ -1048,3 +1048,19 @@ D-141 removed flag arities from these rows precisely to avoid this.
   - Work that needs path-like literals the `agy` policy refuses (D-074) still goes to Claude.
   - Rounds already running with Opus (P2 under D-155, P3 under D-156) stay with Opus.
 - **Before the first Neon run on Pedro's Mac:** `agy` here is 1.5.15, and `scripts/doctor` has only tested 1.5.14. Repeat D-134's hook check (an allowed `cargo --version`, a denied write to `.agents/` and a denied `git push`) in a scratch worktree first.
+
+## D-159 — 2026-11-24 — Pedro: merge P4 (M1-40) into `dev`
+**Decided by Pedro (driver).** P4 (`agent/neon/M1-40-rev4-p4-ui-ledger` @ `33b60ff`) is merged into `dev` as `c8a73590`. It was approved in Codex review round 2 with no open findings (D-120), and §11 is confirmed (D-157).
+- **No rebase was needed.** `dev` had moved only in `docs/` since the branch's base `0819536e`, and `git merge-tree` was clean.
+- **The orchestrator's single verification on the merged tree, on macOS (D-123):** fmt and workspace clippy clean; `check-protocol-ts` up to date; **886 passed, 0 failed, 7 ignored**; app typecheck clean, **377 vitest** passed, build OK.
+
+## D-160 — 2026-11-24 — Pedro: agent environment awareness and a welcome flow (CR-21, PLAN §3.22)
+**Decided by Pedro (driver, owner),** agreed with the orchestrator on 2026-11-16 and written into the plan now. This adds PLAN §3.22 and an M2 item:
+- **An environment brief for agents.** It is built from live state, names blocked things by category, informs and never grants, and comes in kinds by role (Home or orchestrator, workspace, delegated, reviewer).
+- **Three levels:**
+  1. off;
+  2. MCP only (`atrium://environment` resource, `atrium_environment` tool), which is the recommended default;
+  3. MCP plus **opt-in prompt injection**, the only exception to §3.2's "we never rewrite prompts". It shows a preview with a token count, can be overridden per workspace, marks the threads it was injected into, and refreshes when the policy changes mid-session.
+- **A compaction spike first:** how each provider compacts, whether the injection channel survives, and what signal the adapter sees. Its results drive the brief's re-injection and a new `ContextCompacted` event with a marker in the thread.
+- **A first-launch welcome flow:** providers found (with §3.18's import offer folded in), security preset, brief level, and opt-in heavy features (all off). It is skippable and never blocks first use.
+- **Milestone: M2**, after the M1 gate. Nothing starts until the driver gives a go for that phase.

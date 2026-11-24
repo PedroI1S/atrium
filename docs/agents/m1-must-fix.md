@@ -2,12 +2,30 @@
 
 M0 spikes are merged as spikes: they answered their questions, but they aren't production code. When M1 folds an adapter or component into its real crate, **every item below is part of that task's Definition of Done**. Each M1 brief links this file, and nothing here gets closed without a test that would fail without the fix. Source: the cross-provider reviews in `docs/agents/reviews/` and the orchestrator's live runs. Decided by Pedro in D-018.
 
-## Where M1 stands (orchestrator, 2026-11-16)
+## Where M1 stands (orchestrator, 2026-11-24)
 
-Each row below starts with its state: ✅ done (with evidence), 🟡 in progress, ⬜ open, ➡️ belongs to a later milestone. Open before the M1 gate:
-- **Done:** M1-18 merged (`fb77f20b`, 2026-11-16): S1/CR-12, P1, K1–K4 closed, with known limits K7–K10 below. **In progress:** M1-08L, rodrigo's live Codex checks (X1–X3).
-- **Open blockers:** none. **D-120/D-121:** every known limit is reopened and assigned to the M1-27 batch (K5, K7–K10, R1–R3). **CR-19** (engine shell/wrapper/`sudo` names matched case-sensitively; Argon: high for the gate) is approved for the post-M1-18 batch (D-118).
-- **Open, minor:** S5, S7, S8, S11 (their tests are still ignored); K5; N5 and L10 are "later".
+Each row below starts with its state: ✅ done (with evidence), 🟡 in progress, ⬜ open, ➡️ belongs to a later milestone.
+
+**Rev 4 replaced the M1-27 batch** (D-135, contract `docs/contracts/m1-policy-rev4.md`; §11 confirmed by Pedro, D-157). The batch's items are now routed like this:
+- **Into rev 4's tasks** (contract §12):
+  - P2 (M1-38): S5, S8, S11, K6, K8.
+  - P3 (M1-39): R1–R3.
+  - P5 (M1-41) re-checks every ignored test with its rev 4 verdict, and K10.
+- **Decided by §11:** S7, K7 and K9 are Unread.
+- **Done in M1-33:** F1–F4, with the batch's non-policy hunks.
+
+**Open before the M1 gate:**
+- **Rev 4:**
+  - P0 (M1-36), P1 (M1-37) and P4 (M1-40) are merged.
+  - P2 (M1-38) and P3 (M1-39) are in rework.
+  - P5 (M1-41) and the integrated rev 4 review are still to come.
+- **N16:** the bridge test flake (major).
+- **F5:** confirm M1-21's review findings against `fdabc1b8` (orchestrator).
+- **Live and manual checks:**
+  - M1-08L: the live Codex checks X1–X3;
+  - Pedro's macOS benches;
+  - rodrigo's Linux save-dialog check (D-140).
+- **Later:** N5 and L10.
 - **Decided (D-111):** Linux idle memory < 165 MB; Linux TTI is a gate; the Linux frame statistic counts frames over 1.5 × the interval; `bridge.rs` batching now; damaged messages export marked (CR-16, ✅ M1-25 merged); S5/S7/S8/S11/K5 + four more stores (CR-17) after M1-18; P2 now (CR-18, ✅ M1-26 merged).
 - **The gate itself (PLAN §8):**
   - the demo end to end, with all checks green;
@@ -113,13 +131,13 @@ Each finding is a test marked `#[ignore = "M1-13 finding N"]` on that branch; fi
 | S2 | **blocker** | ✅ **Done:** M1-13 rounds 3–8, merged `02c13bc`. Finding 2: a failing `cd` is assumed to succeed. With two ordinary prefix rules (`cd`, `cat`), `cd nope; cat .ssh/id_rsa` reaches Allow. Treat the cwd as unknown after any `cd` whose target isn't a known folder. |
 | S3 | major | ✅ **Done:** M1-13 rounds 3–8, merged `02c13bc`. Finding 1: a `cd` inside `( … )` or a pipeline isn't followed (cwd tracking). Under a broad allow rule this reaches Allow on a hard-denied path. |
 | S4 | major | ✅ **Done:** M1-13 rounds 3–8, merged `02c13bc`. Finding 8: `echo rm -rf ~ \| sh` (the `-rf` is dropped) and `printf '%s' '…' \| sh`: text piped into a shell must be read as code. |
-| S5 | major | ⬜ **Open:** test still ignored ("finding 11"). Finding 11: a wildcard in the name of a credential tree or Atrium folder (`.g*`, `atr*`) must count as touching it. |
+| S5 | major | 🟡 **In rev 4** (D-135, contract §12): M1-30's test cases migrate one by one into P2 (M1-38); `SessionGate`'s forward glob expansion decides the verdict at P5 (M1-41). M1-30's matcher is dropped. Was: test still ignored ("finding 11"). Finding 11: a wildcard in the name of a credential tree or Atrium folder (`.g*`, `atr*`) must count as touching it. |
 | S6 | minor | ✅ **Done:** M1-13, merged `02c13bc`. Finding 3: `pushd`/`popd`/`CDPATH` leave the cwd unknown (must not auto-allow afterwards). |
-| S7 | minor | ⬜ **Open:** test still ignored ("finding 4"). Finding 4: ANSI-C words (`$'…'`) aren't decoded. |
-| S8 | minor | ⬜ **Open:** test still ignored ("finding 5"). Finding 5: `rg x ~/.aws` (recursive search of a folder holding a credential) only asks; consider hard deny. |
+| S7 | minor | 🟡 **Rev 4 decides it as Unread** (§11 item 2, D-157): ANSI-C words ask in Home and under prefix and exact rules; the `$'…'` reader is dropped. The ignored test gets its new verdict at P5 (M1-41). Was: test still ignored ("finding 4"). Finding 4: ANSI-C words (`$'…'`) aren't decoded. |
+| S8 | minor | 🟡 **Rev 4 makes it a hard deny** (§11 item 12, D-157): S8's verdicts go into P2 (M1-38), live at P5 (M1-41). Was: test still ignored ("finding 5"). Finding 5: `rg x ~/.aws` (recursive search of a folder holding a credential) only asks; consider hard deny. |
 | S9 | minor | ✅ **Done:** M1-13, merged `02c13bc`. Finding 7: `sh -c -- 'payload'` isn't read. |
 | S10 | minor | ✅ **Done:** M1-13, merged `02c13bc` (test not ignored). Finding 9: a shell fed by process substitution (`bash < <(echo …)`); documented limit from M1-03 round 6 finding 2. |
-| S11 | minor | ⬜ **Open:** test still ignored ("finding 10"). Finding 10: a glob that reaches a credential only through a symlink. |
+| S11 | minor | 🟡 **In rev 4:** M1-32's obligations (ordered resolution, dangling targets, I/O uncertainty, identity) are in P2 (M1-38), live at P5 (M1-41); the link-glob expansion code is dropped. Was: test still ignored ("finding 10"). Finding 10: a glob that reaches a credential only through a symlink. |
 | S13 | **blocker** | ✅ **Done:** the rework rounds; merged `02c13bc` with no Allow regression against `dev` (D-098). From the security review (`reviews/M1-13-adversarial.md`, 2026-11-14): S2 is **not closed** on the branch, and the branch has regressions against `dev` (a key symlinked into `~/.ssh` readable without asking; a `cd` through a symlink loses the write check; false hard denies after a working `cd`). `dev` doesn't have the regressions: the branch must not be merged before the rework (the brief's "Third part"). |
 | S12 | — | ✅ **Done:** `adversarial_socket.rs`, `adversarial_recovery.rs` and `adversarial_supervise.rs`, merged with M1-13. Still to write (M1-13's remaining scope): the daemon and host adversarial tests (socket roles, `Hello` across the deadline, full control lane, many replaced subscriptions, a store read failing during replay, `kill_recorded` `Unverified`, a recovery closure that fails, the slow-command limit). |
 
@@ -133,26 +151,26 @@ Rounds 3–8 worked through S2–S13 (the handoff says how each was handled); S1
 | K2 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 2: `reaches_tree_through_links` misses two-hop symlinks, drops `expand_glob`'s `None`, leaves out `atrium_*_paths`, and skips abbreviated long flags. |
 | K3 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 3: `shell_c_code` stops at `-o`/`+o`/`-O`/`+O` values; `long_name` ignores 1–2 letter GNU prefixes (`script --c`, `flock --c`). |
 | K4 | blocker | ✅ **Done in M1-18** (`fb77f20b`). Round 8, finding 4: `find_exec_units` doesn't extract `payloads_of`, `env_payloads` or `code_subs` from `-exec` commands. |
-| K6 | — | 🟡 M1-18 covered CR-12's list; finding 6 stays ignored for the four stores CR-17 adds (post-M1-18 batch). On merged `dev`, 7 tests are still ignored. 6 are marked `#[ignore = "M1-13 finding N"]`: findings 4 (S7), 5 (S8), 6 (S1, CR-12), 10 (S11), and 11 (S5) twice. Fixing a finding means un-ignoring its test. |
+| K6 | — | 🟡 **CR-17's four stores are in P2 (M1-38)** (contract §12); the remaining ignored tests get their rev 4 verdicts at P5 (M1-41). M1-18 covered CR-12's list; finding 6 stays ignored for the four stores CR-17 adds (post-M1-18 batch). On merged `dev`, 7 tests are still ignored. 6 are marked `#[ignore = "M1-13 finding N"]`: findings 4 (S7), 5 (S8), 6 (S1, CR-12), 10 (S11), and 11 (S5) twice. Fixing a finding means un-ignoring its test. |
 | K5 | minor | ✅ **Closed, correct behaviour (D-125, rodrigo):** the hard deny stays. `rg -L pat` with no folder named, from a folder that holds a link into `~/.ssh`, follows the link and reads the keys; `dev`'s old Ask/Allow/Allow would have allowed that under Any and FullAccess. |
 
-### Open minors from merged reviews (D-122, in M1-28)
+### Open minors from merged reviews (D-122; M1-28's non-policy hunks went to M1-33)
 
 | # | Sev. | Item |
 |---|---|---|
-| F1 | minor | 🟡 **In M1-28.** M1-22: merge the login shell's `PATH` (nvm, asdf, mise); the daemon's piped stderr can fill; two nits. |
-| F2 | minor | 🟡 **In M1-28.** M1-24: `client.ts` logs only the first error in a batch. |
-| F3 | minor | 🟡 **In M1-28.** M1-25: no test with a damaged message plus one still open. |
-| F4 | minor | 🟡 **In M1-28.** M1-26: withdrawals awaited one at a time; `clear_requests` can leak a ticket; no fake-provider `tool_result` test. |
-| F5 | — | 🟡 **In M1-28.** M1-21: confirm every review finding was addressed in `fdabc1b8`. |
+| F1 | minor | ✅ **Done in M1-33** (`c6845fb`): fish and login-shell `PATH` merge; the daemon's stderr goes to its log, and is piped only when the log can't be opened (`atrium-host` `lifecycle.rs`, test `spawn_detached_wait_returns_stderr_on_early_exit_and_pipes_when_log_unopenable`). Was in M1-28. M1-22: merge the login shell's `PATH` (nvm, asdf, mise); the daemon's piped stderr can fill; two nits. |
+| F2 | minor | ✅ **Done in M1-33** (`c6845fb`): client batch-error logging. Was in M1-28. M1-24: `client.ts` logs only the first error in a batch. |
+| F3 | minor | ✅ **Done in M1-33** (`c6845fb`): the M1-25 export test, in its own file. Was in M1-28. M1-25: no test with a damaged message plus one still open. |
+| F4 | minor | ✅ **Done in M1-33** (`c6845fb`): withdrawals spawned together under one deadline (`drain_withdrawals`), `clear_requests` queues hook tickets for withdrawal, and the fake-provider test `claude_tool_result_without_can_use_tool_withdraws_hook_ticket_before_turn_end` (`tests/M1-28-followups.rs`). Was in M1-28. M1-26: withdrawals awaited one at a time; `clear_requests` can leak a ticket; no fake-provider `tool_result` test. |
+| F5 | — | ⬜ **Owed, orchestrator:** M1-33 took no hunk for it (contract §12), so nobody has checked it yet. Check `reviews/M1-21-demo.md` against `fdabc1b8` before the M1 gate review. Was in M1-28. M1-21: confirm every review finding was addressed in `fdabc1b8`. |
 
-### M1-23's escalations (reopened by D-121, in M1-29)
+### M1-23's escalations (reopened by D-121; now in P3, M1-39)
 
 | # | Sev. | Limit |
 |---|---|---|
-| R1 | major | 🟡 **In M1-29.** Rule path scope: `all_paths` adds the cwd and every path-like word, and `path_scope_ok` uses `all` for deny rules too, so a scoped command rule never matches in Home and a scoped deny rule fails open on multi-path calls. |
-| R2 | major | 🟡 **In M1-29.** Allow rules cover only top-level units: a prefix rule on `find` covers `find -exec <cmd>`, one on `python3` covers `python3 -c '<code>'`. |
-| R3 | minor | 🟡 **In M1-29.** No daemon-side `CreateRule` guard: any socket client can create an allow rule on a shell, wrapper or privilege tool. |
+| R1 | major | 🟡 **In P3 (M1-39):** canonical-scope semantics (contract §12; was M1-29). Rule path scope: `all_paths` adds the cwd and every path-like word, and `path_scope_ok` uses `all` for deny rules too, so a scoped command rule never matches in Home and a scoped deny rule fails open on multi-path calls. |
+| R2 | major | 🟡 **In P3 (M1-39):** code runners in rules (§7, §11 item 4, D-156). Was M1-29. Allow rules cover only top-level units: a prefix rule on `find` covers `find -exec <cmd>`, one on `python3` covers `python3 -c '<code>'`. |
+| R3 | minor | 🟡 **In P3 (M1-39):** daemon-side rule validation, which merges now that §11 is confirmed (D-157). Was M1-29. No daemon-side `CreateRule` guard: any socket client can create an allow rule on a shell, wrapper or privilege tool. |
 
 ### M1-18 merged (`fb77f20b`, 2026-11-16): known limits
 
@@ -160,10 +178,10 @@ Five fix rounds (D-099–D-115). The last reviews found no Allow on a sensitive 
 
 | # | Sev. | Known limit |
 |---|---|---|
-| K7 | minor | 🟡 **In M1-27** (D-121). `sh -c` scripts that are only a positional-parameter expansion (`sh -c '$0' 'cat .ssh/id_rsa'`) aren't resolved to what they run: Ask in Home and under prefix rules, Allow under Any and FullAccess. Same as `dev`. |
-| K8 | nit | 🟡 **In M1-30** (D-121). A `**` search rooted at the home folder asks in Home, because it could reach `.zsh_sessions` (CR-12 trees). |
-| K9 | nit | 🟡 **In M1-27** (D-121). `env` with more than about 24 words before the command fails closed to Ask in every setting, including Any and FullAccess. |
-| K10 | nit | 🟡 **In M1-31** (D-121). Search globs with 400 or more `*/` segments followed by as many `..` segments take a few seconds to evaluate, then ask. |
+| K7 | minor | ✅ **Decided by rev 4** (§11 items 1–2, D-157): K7's resolution is dropped. The line is Unread, so it asks in Home and under prefix rules and allows under Any and FullAccess, as before. Was in M1-27 (D-121). `sh -c` scripts that are only a positional-parameter expansion (`sh -c '$0' 'cat .ssh/id_rsa'`) aren't resolved to what they run: Ask in Home and under prefix rules, Allow under Any and FullAccess. Same as `dev`. |
+| K8 | nit | 🟡 **In rev 4:** M1-30's test cases migrate into P2 (M1-38); the verdict follows contract §10 at P5 (M1-41). Was in M1-30 (D-121). A `**` search rooted at the home folder asks in Home, because it could reach `.zsh_sessions` (CR-12 trees). |
+| K9 | nit | ✅ **Decided by rev 4** (§11 items 1–2, D-157): K9 parity is dropped. Long `env` lines are Unread, so Any and FullAccess allow them after the best-effort pass and no longer ask everywhere. Was in M1-27 (D-121). `env` with more than about 24 words before the command fails closed to Ask in every setting, including Any and FullAccess. |
+| K10 | nit | 🟡 **Replaced in rev 4:** the glob normalizer is dropped, and rev 4's limits (P0) and structural caps before charges (P1, D-150) turn oversized globs into TooLarge or Exhausted. Checked again at P5 (M1-41). Was in M1-31 (D-121). Search globs with 400 or more `*/` segments followed by as many `..` segments take a few seconds to evaluate, then ask. |
 
 ## From the M1 Linux checks (`handoffs/M1-14a-linux-host.md` on `agent/sonnet/M1-14a-linux-host`; 2026-11-13)
 

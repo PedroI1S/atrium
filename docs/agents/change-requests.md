@@ -248,3 +248,13 @@ Non-blocking; a gap in the wire.
 **Why:** the batch's reviews don't converge (D-135).
 
 **Affected:** `atrium-core::policy` (`shell.rs`, `words.rs`, `deny.rs`, `engine.rs`, `gate.rs`), `atrium-protocol` `ReadOnlyCommand`, the rules editor, the Settings text for the hard-deny list, and the M1-27 batch's branches (rev 4 §11).
+
+## CR-21 — PLAN (Pedro, with the orchestrator) — 2026-11-24
+
+**Approved (D-160).**
+
+**Change:** adds PLAN §3.22, agent environment awareness and first run: an environment brief over MCP with an opt-in prompt injection, role-based briefs, compaction discovery and a `ContextCompacted` event, *Settings → Agents → Environment*, and a first-launch welcome flow. Notes added to §3.2 (the injection exception) and §3.18 (the import offer is part of the welcome flow); an M2 item.
+
+**Why:** agents that know what Atrium gives them use the approval queue and the other features instead of retrying against the gate, and the move from the user's own tools to Atrium is smoother.
+
+**Affected:** M2 (`atrium-mcp`, the adapters' descriptors, the event enum, Settings, the first-run UI). Nothing in M1.
