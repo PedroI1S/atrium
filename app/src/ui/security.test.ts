@@ -146,16 +146,20 @@ describe("Settings → Security (contract rev 4 §2, §9, §11 item 3; CR-12, CR
       "inherited-fds",
     ]);
     const cantCheckText = cantCheckSection?.textContent ?? "";
-    expect(cantCheckText).toContain("PATH shadowing");
+    expect(cantCheckText).toContain("usual system tool");
+    expect(cantCheckText).toContain("another program with that name");
     expect(cantCheckText).toContain("shell configuration");
     expect(cantCheckText).toContain("repository configuration");
     expect(cantCheckText).toContain("commits and diffs");
     expect(cantCheckText).toContain("another process");
-    expect(cantCheckText).toContain("bounded walk");
-    expect(cantCheckText).toContain("file descriptors");
+    expect(cantCheckText).toContain("limited number of files and folder levels");
+    expect(cantCheckText).toContain("parent program");
 
-    // Plain words only: internal jargon like "Unread" must not appear in user-facing copy.
-    expect(host.textContent).not.toContain("Unread");
+    // Plain words only: internal jargon must not appear in user-facing copy.
+    const pageText = host.textContent ?? "";
+    for (const jargon of [/\bunread\b/i, /\bexhausted\b/i, /\bwalk\b/i, /\bcanonical\b/i, /\bPATH\b/, /\bfd\b/i, /\bidentity\b/i]) {
+      expect(pageText, `jargon ${jargon}`).not.toMatch(jargon);
+    }
 
     // CR-12 and CR-17 "Credential stores that ask" section.
     const askList = host.querySelector('[data-atrium-part="ask-stores"]');

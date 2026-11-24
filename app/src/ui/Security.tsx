@@ -59,7 +59,7 @@ export const UNCHECKED_ASSUMPTIONS: readonly UncheckedAssumption[] = [
   {
     id: "command-names",
     title: "Command names",
-    text: "A command like cat or git is assumed to be that system tool; PATH shadowing isn't followed.",
+    text: "A command called cat or git is assumed to be the usual system tool, even if another program with that name comes first on the system.",
   },
   {
     id: "user-config",
@@ -69,7 +69,7 @@ export const UNCHECKED_ASSUMPTIONS: readonly UncheckedAssumption[] = [
   {
     id: "repo-contents",
     title: "Commit and diff contents",
-    text: "What commits and diffs contain beyond the paths a git read names.",
+    text: "What commits and diffs contain beyond the file paths a git command names.",
   },
   {
     id: "other-processes",
@@ -79,12 +79,12 @@ export const UNCHECKED_ASSUMPTIONS: readonly UncheckedAssumption[] = [
   {
     id: "hard-links",
     title: "Hard links in large folders",
-    text: "Hard links inside a large folder beyond Atrium's bounded walk.",
+    text: "In large folders, Atrium checks only a limited number of files and folder levels for hard links to protected files.",
   },
   {
     id: "inherited-fds",
     title: "Inherited file descriptors",
-    text: "Open file descriptors inherited beyond standard input, output, and error.",
+    text: "Open files passed down from a parent program beyond standard input, output, and error.",
   },
 ];
 
