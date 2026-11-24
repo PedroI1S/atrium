@@ -966,3 +966,11 @@ P2's next round, round 5 (Opus 5.5, D-142), applies this ruling, keeps the rest 
 **Decided by rodrigo (driver).** P1's review 7 (`reviews/M1-37-rev4-p1-command-model-round7.md`) closed round 6's finding and found one more in the same family. In the best-effort pass, a line over `MAX_BYTES` with a zero budget is Exhausted (Ask) instead of TooLarge (Deny), because the entry charge comes before the size check.
 
 **Exception to PLAN §8.4:** Opus 5.5 reorders both best-effort entry points. It also audits the whole "TooLarge beats Exhausted" rule: every structural cap is checked before any fallible charge, in every P1 entry point. If the next review still has findings, they come back to the driver.
+
+## D-151 — 2026-11-24 — rodrigo: one more Opus round for P2; P3 and P4 start now
+**Decided by rodrigo (driver), on the orchestrator's recommendation.**
+1. **P2 (M1-38).** Review 5 closed review 4's seven findings and found six narrower ones (`reviews/M1-38-rev4-p2-paths-round5.md`). The two high ones are a recursive Unread root that skips its written name, and `rg -L` through a link to a linked browser root, which `dev` denies. **Exception to PLAN §8.4:** Opus 5.5 writes one more round. It adopts `Target::written` (CR-P2-3, D-149) after a rebase onto P0's round-8 tip `a5b9b3b`, and fixes the six findings. If the next review still has findings, they come back to the driver.
+2. **P3 and P4 start now** from P0's approved tip `a5b9b3b`, the same way P1 and P2 did (D-140), under D-138's go for P0–P5.
+   - The orchestrator writes their briefs from the contract and dispatches Neon writers.
+   - They rebase if P0 changes again.
+   - Behaviour-changing merges (P3's live parts, P4, P5) still wait for Pedro's confirmation of the §11 items (D-138, D-013).
