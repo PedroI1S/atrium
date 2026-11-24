@@ -2220,8 +2220,10 @@ fn fs_resolver_real_tempdir_symlinks_dangling_hardlinks_unreadable_and_budgets()
     .unwrap();
 
     let resolver = FsResolver::new();
-    let mut caps = FsCaps::with_default_limits();
-    let mut budget = ComputeBudget::with_default_limits();
+    // Review 4, finding 7: discovery runs from `/`, so the build lists the
+    // temporary folder's parent, whose size is the host's. The build is its
+    // own phase with its own unbounded caps and budget (P5 gives the builder
+    // its own caps too); the assertions below get fresh default ones.
     let prot = build_protected_set(
         &home_bytes,
         &home_bytes,
@@ -2229,10 +2231,12 @@ fn fs_resolver_real_tempdir_symlinks_dangling_hardlinks_unreadable_and_budgets()
         vec![],
         FoldRules::REV4,
         &resolver,
-        &mut caps,
-        &mut budget,
+        &mut FsCaps::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        &mut ComputeBudget::new(u64::MAX, usize::MAX),
     )
     .unwrap();
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
 
     // 1. Symlink & dangling link resolve to fake `~/.ssh/...` -> HardDenyHit
     for rel in ["proj/link_key", "proj/dangling_key"] {
@@ -3549,8 +3553,10 @@ fn round2_finding11_budgets_all_fs_caps_and_small_nonzero_alloc() {
     .unwrap();
 
     let resolver = FsResolver::new();
-    let mut caps = FsCaps::with_default_limits();
-    let mut budget = ComputeBudget::with_default_limits();
+    // Review 4, finding 7: discovery runs from `/`, so the build lists the
+    // temporary folder's parent, whose size is the host's. The build is its
+    // own phase with its own unbounded caps and budget (P5 gives the builder
+    // its own caps too); the assertions below get fresh default ones.
     let prot = build_protected_set(
         &home_bytes,
         &home_bytes,
@@ -3558,10 +3564,12 @@ fn round2_finding11_budgets_all_fs_caps_and_small_nonzero_alloc() {
         vec![],
         FoldRules::REV4,
         &resolver,
-        &mut caps,
-        &mut budget,
+        &mut FsCaps::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        &mut ComputeBudget::new(u64::MAX, usize::MAX),
     )
     .unwrap();
+    let mut caps = FsCaps::with_default_limits();
+    let mut budget = ComputeBudget::with_default_limits();
 
     // 1. `check_target` on a Clear target fails with 0 AND with small nonzero alloc budgets!
     let clear_target = resolve_literal(
@@ -4984,4 +4992,344 @@ fn round4_neighbour_protected_folder_reached_through_a_link_is_walked() {
             String::from_utf8_lossy(p)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Rework Round 6 regressions (review round 4, D-147)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round6_f1_protected_names_on_the_written_spelling_below_aliased_roots() {
+    // Review 4, finding 1 / D-147: as on `dev` (`Sensitive::hit` over the
+    // lexical spelling), a protected name stays a hit when its root is a link,
+    // even when the name does not exist yet.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/tmp/profile");
+    fs.mkdir_all(b"/h/u/.config");
+    fs.add_symlink(b"/h/u/.config/google-chrome", b"/tmp/profile");
+    fs.mkdir_all(b"/tmp/keys");
+    fs.add_symlink(b"/h/u/.ssh", b"/tmp/keys");
+    let prot = default_build(&fs);
+
+    // File-tool paths.
+    for p in ["~/.config/google-chrome/Cookies", "~/.ssh/id_rsa"] {
+        let r = subject(p, AccessMode::Read, &prot, &fs);
+        assert!(
+            has_hard_deny(&r.outcomes, "credential-read"),
+            "{p}: {:?}",
+            r.outcomes
+        );
+    }
+    // dev's exceptions stay: a public `.ssh` name, a readable `config`.
+    for p in ["~/.ssh/id_rsa.pub", "~/.ssh/config"] {
+        let r = subject(p, AccessMode::Read, &prot, &fs);
+        assert!(!has_any_hard_deny(&r.outcomes), "{p}: {:?}", r.outcomes);
+    }
+    assert!(has_hard_deny(
+        &subject("~/.ssh/config", AccessMode::Write, &prot, &fs).outcomes,
+        "credential-read"
+    ));
+
+    // Command operands, a path relative to a `cd` into the aliased root (the
+    // written working directory), and a redirect. The redirect's writer comes
+    // last: a `cd` after a possible writer makes the cwd unknown (§5).
+    let mut cd_eff = reader_effects("cd", 2);
+    cd_eff.cd_target_operand = Some(1);
+    let units = [
+        unit(
+            0,
+            vec![
+                unquoted(b"cat"),
+                unquoted(b"~/.config/google-chrome/Cookies"),
+            ],
+            vec![],
+            Separator::Start,
+            None,
+        ),
+        unit(
+            1,
+            vec![unquoted(b"cd"), unquoted(b"~/.config/google-chrome")],
+            vec![],
+            Separator::Semi,
+            None,
+        ),
+        unit(
+            2,
+            vec![unquoted(b"cat"), unquoted(b"Cookies")],
+            vec![],
+            Separator::Semi,
+            None,
+        ),
+        unit(
+            3,
+            vec![unquoted(b"echo"), unquoted(b"x")],
+            vec![ModelRedirect::Write {
+                target: unquoted(b"~/.ssh/id_ed25519"),
+            }],
+            Separator::Semi,
+            None,
+        ),
+    ];
+    let res = resolve_command_targets(
+        &units,
+        &[
+            reader_effects("cat", 2),
+            cd_eff,
+            reader_effects("cat", 2),
+            reader_effects("echo", 2),
+        ],
+        CWD,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    for part in [
+        PartId::Operand {
+            unit: UnitIndex(0),
+            argv_index: 1,
+        },
+        PartId::Operand {
+            unit: UnitIndex(2),
+            argv_index: 1,
+        },
+        PartId::Redirect {
+            unit: UnitIndex(3),
+            redirect_index: 0,
+        },
+    ] {
+        assert!(
+            res.outcomes
+                .iter()
+                .any(|r| r.part == part && matches!(r.outcome, PartOutcome::HardDenyHit(_))),
+            "{part:?}: {:?}",
+            res.outcomes
+        );
+    }
+}
+
+#[test]
+fn round6_f1_glob_matches_are_checked_on_their_written_spelling() {
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/profile/Cookies");
+    fs.mkdir_all(b"/h/u/.config");
+    fs.add_symlink(b"/h/u/.config/google-chrome", b"/tmp/profile");
+    let prot = default_build(&fs);
+    let res = resolve_command_targets(
+        &[unit(
+            0,
+            vec![unquoted(b"cat"), unquoted(b"~/.config/google-chrome/Cook*")],
+            vec![],
+            Separator::Start,
+            None,
+        )],
+        &[reader_effects("cat", 2)],
+        CWD,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&res.outcomes, "credential-read"),
+        "{:?}",
+        res.outcomes
+    );
+}
+
+#[test]
+fn round6_f2_s8_walks_linked_browser_profile_folders() {
+    // Review 4, finding 2: `rg -g '*.rs' x ~/.config/google-chrome` with a
+    // linked `Default` profile holding `Cookies`: S8 is HardDeny whatever the
+    // filter (§5, D-145 keeps walking linked folders).
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/profile/Cookies");
+    fs.mkdir_all(b"/h/u/.config/google-chrome");
+    fs.add_symlink(b"/h/u/.config/google-chrome/Default", b"/tmp/profile");
+    let prot = default_build(&fs);
+    let root = literal(b"~/.config/google-chrome", AccessMode::Read, &fs);
+    let filter = SearchFilter {
+        dialect: FilterDialect::RgGlob,
+        pattern: unquoted(b"*.rs"),
+        case_insensitive: false,
+        argv_index: Some(1),
+    };
+    let res = check_recursive_root(
+        &root,
+        LinkPolicy::default(),
+        &[filter],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&res.outcomes, "credential-read"),
+        "{:?}",
+        res.outcomes
+    );
+
+    // A link cycle inside the profile ends.
+    fs.add_symlink(b"/tmp/profile/loop", b"/h/u/.config/google-chrome");
+    let prot = default_build(&fs);
+    let res = check_recursive_root(
+        &literal(b"~/.config/google-chrome", AccessMode::Read, &fs),
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_hard_deny(&res.outcomes, "credential-read"));
+}
+
+#[test]
+fn round6_f3_root_link_with_unknown_referent_is_any_target() {
+    // Review 4, finding 3: the link's own identity does not establish its
+    // referent's, so the gap is AnyTarget (D-145 rule 4). Here the referent
+    // cannot be stat'ed.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/token");
+    fs.add_symlink(b"/h/u/.azure/msal_token_cache.json", b"/tmp/token");
+    fs.set_stat_error(b"/tmp/token", FsIoError::PermissionDenied);
+    fs.add_file(b"/h/u/proj/readme");
+    let prot = default_build(&fs);
+    assert!(
+        prot.identity_gaps
+            .iter()
+            .any(|g| g.scope == GapScope::AnyTarget && !g.write_only),
+        "{:?}",
+        prot.identity_gaps
+    );
+    assert!(
+        !prot
+            .identity_gaps
+            .iter()
+            .any(|g| matches!(g.scope, GapScope::Through(_)))
+    );
+    assert!(matches!(
+        read_outcome(b"proj/readme", &prot, &fs),
+        PartOutcome::Unread(UnreadReason::UnresolvablePath { .. })
+    ));
+}
+
+#[test]
+fn round6_f4_named_store_root_after_many_siblings_is_found() {
+    // Review 4, finding 4: 4,096 earlier ordinary files, then the named root.
+    let mut fs = FakeFs::new();
+    for i in 0..limits::WALK_MAX_ENTRIES {
+        fs.add_file(format!("/h/u/.azure/a{i:05}").as_bytes());
+    }
+    fs.add_file(b"/tmp/token");
+    fs.add_symlink(b"/h/u/.azure/msal_token_cache.json", b"/tmp/token");
+    let prot = default_build(&fs);
+    // The protected spelling: a Store hit (by name, and by the root's identity).
+    let r = subject(
+        "~/.azure/msal_token_cache.json",
+        AccessMode::Read,
+        &prot,
+        &fs,
+    );
+    assert!(has_store_hit(&r.outcomes), "{:?}", r.outcomes);
+    assert!(matches!(
+        read_outcome(b"~/.azure/msal_token_cache.json", &prot, &fs),
+        PartOutcome::StoreHit(_)
+    ));
+}
+
+#[test]
+fn round6_f5_subject_resolution_charges_before_allocating() {
+    // Review 4, finding 5.
+    let fs = FakeFs::new();
+    let prot = default_build(&fs);
+    let mut budget = ComputeBudget::new(1, 0);
+    let res = resolve_subject_paths(
+        &[],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut budget,
+    )
+    .expect("nothing to resolve, nothing to allocate");
+    assert!(res.outcomes.is_empty());
+    assert_eq!(budget.remaining_alloc_bytes(), 0);
+    assert!(!budget.is_exhausted());
+
+    // A relative filter's buffers are charged before they are built.
+    let mut budget = ComputeBudget::new(1_000_000, 7);
+    let err = resolve_subject_paths(
+        &[],
+        Some("*.rs"),
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut budget,
+    )
+    .unwrap_err();
+    assert_eq!(err.reason, ExhaustReason::AllocationBudget);
+}
+
+#[test]
+fn round6_f6_mv_of_a_link_to_a_directory_moves_the_link() {
+    // Review 4, finding 6: `mv` moves the link itself, which is not a
+    // directory, so there are no derived destinations.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/h/u/directory");
+    fs.add_symlink(b"/h/u/link", b"/h/u/directory");
+    fs.mkdir_all(b"/h/u/destination");
+    let prot = default_build(&fs);
+    let eff = ToolEffects {
+        tool_name: Some("mv"),
+        subcommand: None,
+        roles: vec![OperandRole::Command, OperandRole::Path, OperandRole::Path],
+        operand_access: vec![
+            AccessMode::Read,
+            AccessMode::ReadWrite,
+            AccessMode::ReadWrite,
+        ],
+        writes: true,
+        derived_destinations: DerivedDestinations::WhenSourceIsDir,
+        reads_recursively: false,
+        links: LinkPolicy::default(),
+        code: CodeExecution::None,
+        filter_dialect: None,
+        filters: vec![],
+        home_readonly_eligible: false,
+        cd_target_operand: None,
+        git_selects_by_name: false,
+        unread: vec![],
+    };
+    let run = |src: &[u8]| {
+        let res = resolve_command_targets(
+            &[unit(
+                0,
+                vec![unquoted(b"mv"), unquoted(src), unquoted(b"destination")],
+                vec![],
+                Separator::Start,
+                None,
+            )],
+            std::slice::from_ref(&eff),
+            CWD,
+            &prot,
+            &fs,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+        has_unread(&res.outcomes, |r| {
+            matches!(r, UnreadReason::DerivedDestinations { .. })
+        })
+    };
+    assert!(!run(b"link"));
+    assert!(run(b"directory"));
 }
