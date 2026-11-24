@@ -331,6 +331,7 @@ fn evaluate_rules_precedence_and_row_26_thread_allow_beats_global_deny() {
         units: &units,
         effects: &effects,
         targets: &[],
+        outcomes: &[],
         best_effort: &be,
         folds: &FoldRules::REV4,
     };
@@ -416,6 +417,7 @@ fn evaluate_rules_multi_unit_and_row_19_best_effort_deny() {
         units: &[],
         effects: &[],
         targets: &[],
+        outcomes: &[],
         best_effort: &be_only,
         folds: &FoldRules::REV4,
     };
@@ -434,9 +436,10 @@ fn evaluate_rules_multi_unit_and_row_19_best_effort_deny() {
         Some(&RuleId("r_deny_cat".into()))
     );
 
-    // Multi-unit: `cat a && ls b` with Thread Allow `cat` + Global Deny `cat`:
-    // unit 0 (`cat a`) is covered by Thread Allow so its best-effort twin is suppressed,
-    // and unit 1 (`ls b`) does not match `cat` → NO deny!
+    // Finding 2: partial coverage at a higher rank MUST NOT suppress a lower-ranked Deny.
+    // `cat a && ls b` with Thread Allow `cat` + Global Deny `cat`:
+    // Thread rank covers only unit 0 (`cat a`), not unit 1 (`ls b`), so the call
+    // remains uncovered and Global Deny `cat` still matches unit 0 -> Deny!
     let check_multi = cmd_check("cat a && ls b");
     let units = vec![make_unit(0, &["cat", "a"]), make_unit(1, &["ls", "b"])];
     let effects = classify_all(&units);
@@ -451,6 +454,7 @@ fn evaluate_rules_multi_unit_and_row_19_best_effort_deny() {
         units: &units,
         effects: &effects,
         targets: &[],
+        outcomes: &[],
         best_effort: &be_multi,
         folds: &FoldRules::REV4,
     };
@@ -477,12 +481,34 @@ fn evaluate_rules_multi_unit_and_row_19_best_effort_deny() {
         ),
     ];
     let cov_multi = evaluate_rules(&ctx_multi, &rules_multi, &mut budget).unwrap();
-    assert!(cov_multi.deny.is_none());
     assert_eq!(
-        cov_multi.per_unit[0].allow_rule,
+        cov_multi.deny.as_ref().map(|(_, id)| id),
+        Some(&RuleId("r_g_deny_cat".into()))
+    );
+
+    // When Thread rank covers ALL units (`cat` + `ls`), Global Deny IS suppressed.
+    let mut rules_full_cover = rules_multi.clone();
+    rules_full_cover.push(make_rule(
+        "r_t_allow_ls",
+        RuleScope::Thread {
+            thread_id: tid.clone(),
+        },
+        ToolKind::Execute,
+        RuleMatcher::CommandPrefix {
+            argv: argv(&["ls"]),
+        },
+        RuleDecision::Allow,
+    ));
+    let cov_full = evaluate_rules(&ctx_multi, &rules_full_cover, &mut budget).unwrap();
+    assert!(cov_full.deny.is_none());
+    assert_eq!(
+        cov_full.per_unit[0].allow_rule,
         Some(RuleId("r_t_allow_cat".into()))
     );
-    assert!(cov_multi.per_unit[1].allow_rule.is_none());
+    assert_eq!(
+        cov_full.per_unit[1].allow_rule,
+        Some(RuleId("r_t_allow_ls".into()))
+    );
 
     // Partial parse: unit 0 (`cat a`) covered by Thread Allow, best-effort also has `rm "$X"`,
     // Global Deny `rm` MUST still fire!
@@ -497,6 +523,7 @@ fn evaluate_rules_multi_unit_and_row_19_best_effort_deny() {
         units: &units[..1],
         effects: &effects[..1],
         targets: &[],
+        outcomes: &[],
         best_effort: &be_partial,
         folds: &FoldRules::REV4,
     };
@@ -536,6 +563,7 @@ fn evaluate_rules_row_14_pinned_program_and_stored_invalid_rules() {
         units: &units,
         effects: &effects,
         targets: &[],
+        outcomes: &[],
         best_effort: &be,
         folds: &FoldRules::REV4,
     };
@@ -599,6 +627,7 @@ fn evaluate_rules_row_14_pinned_program_and_stored_invalid_rules() {
         units: &units_inline,
         effects: &effects_inline,
         targets: &[],
+        outcomes: &[],
         best_effort: &be,
         folds: &FoldRules::REV4,
     };
@@ -653,6 +682,7 @@ fn evaluate_rules_simple_command_guards_unknown_subject_and_canonical_path_scope
             units: &units_glob,
             effects: &eff_glob,
             targets: &[],
+            outcomes: &[],
             best_effort: &be,
             folds: &FoldRules::REV4,
         },
@@ -677,6 +707,7 @@ fn evaluate_rules_simple_command_guards_unknown_subject_and_canonical_path_scope
             units: &[u_ok],
             effects: &eff_ok,
             targets: &[],
+            outcomes: &[],
             best_effort: &be,
             folds: &FoldRules::REV4,
         },
@@ -697,6 +728,7 @@ fn evaluate_rules_simple_command_guards_unknown_subject_and_canonical_path_scope
             units: &[u_redir],
             effects: &eff_redir,
             targets: &[],
+            outcomes: &[],
             best_effort: &be,
             folds: &FoldRules::REV4,
         },
@@ -731,6 +763,7 @@ fn evaluate_rules_simple_command_guards_unknown_subject_and_canonical_path_scope
             units: &[],
             effects: &[],
             targets: &[],
+            outcomes: &[],
             best_effort: &be,
             folds: &FoldRules::REV4,
         },
@@ -765,6 +798,7 @@ fn evaluate_rules_simple_command_guards_unknown_subject_and_canonical_path_scope
             units: &[],
             effects: &[],
             targets: &good_targets,
+            outcomes: &[],
             best_effort: &be,
             folds: &FoldRules::REV4,
         },
@@ -797,6 +831,7 @@ fn evaluate_rules_simple_command_guards_unknown_subject_and_canonical_path_scope
             units: &[],
             effects: &[],
             targets: &unread_targets,
+            outcomes: &[],
             best_effort: &be,
             folds: &FoldRules::REV4,
         },
@@ -822,6 +857,7 @@ fn evaluate_rules_simple_command_guards_unknown_subject_and_canonical_path_scope
             units: &[],
             effects: &[],
             targets: &variant_targets,
+            outcomes: &[],
             best_effort: &be,
             folds: &FoldRules::REV4,
         },
@@ -852,6 +888,7 @@ fn remember_matcher_builds_exact_or_path_glob_and_returns_none_on_unread_or_exha
         units: &units,
         effects: &effects,
         targets: &[],
+        outcomes: &[],
         best_effort: &be,
         folds: &FoldRules::REV4,
     };
@@ -921,6 +958,7 @@ fn remember_matcher_builds_exact_or_path_glob_and_returns_none_on_unread_or_exha
         units: &[],
         effects: &[],
         targets: &targets,
+        outcomes: &[],
         best_effort: &be,
         folds: &FoldRules::REV4,
     };
@@ -950,6 +988,7 @@ fn evaluate_rules_respects_compute_and_alloc_budgets() {
         units: &units,
         effects: &effects,
         targets: &[],
+        outcomes: &[],
         best_effort: &be,
         folds: &FoldRules::REV4,
     };
@@ -978,4 +1017,449 @@ fn evaluate_rules_respects_compute_and_alloc_budgets() {
             .reason,
         ExhaustReason::AllocationBudget
     );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Round 2 regression tests (Findings 1, 2, 3, 6, 7; D-153)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn finding_1_p1_p2_unread_and_exhausted_outcomes_block_allow_and_preserve_deny() {
+    let tid = ThreadId("t1".into());
+    let mut budget = ComputeBudget::with_default_limits();
+
+    let check = cmd_check("cat a");
+    let units = vec![make_unit(0, &["cat", "a"])];
+    let effects = classify_all(&units);
+    let be = BestEffortRecord {
+        raw_texts: vec!["cat a".into()],
+        units: vec![be_unit(0, &["cat", "a"])],
+    };
+    let rules = vec![
+        make_rule(
+            "r_t_allow_cat",
+            RuleScope::Thread {
+                thread_id: tid.clone(),
+            },
+            ToolKind::Execute,
+            RuleMatcher::CommandPrefix {
+                argv: argv(&["cat"]),
+            },
+            RuleDecision::Allow,
+        ),
+        make_rule(
+            "r_g_deny_cat",
+            RuleScope::Global,
+            ToolKind::Execute,
+            RuleMatcher::CommandPrefix {
+                argv: argv(&["cat"]),
+            },
+            RuleDecision::Deny,
+        ),
+    ];
+
+    // 1a. Unread canonical target on `cat a` blocks Thread Allow `["cat"]` and
+    //     does NOT suppress Global Deny `["cat"]`.
+    let unread_targets = vec![Target {
+        origin: TargetOrigin::Operand {
+            unit: UnitIndex(0),
+            argv_index: 1,
+        },
+        access: AccessMode::ReadWrite,
+        resolution: TargetResolution::Unread(UnreadReason::UnresolvablePath {
+            path: b"/proj/a".to_vec(),
+        }),
+        written: Some(b"/proj/a".to_vec()),
+    }];
+    let ctx_unread_target = RuleEvalContext {
+        check: &check,
+        thread_id: &tid,
+        preset: Preset::Home,
+        units: &units,
+        effects: &effects,
+        targets: &unread_targets,
+        outcomes: &[],
+        best_effort: &be,
+        folds: &FoldRules::REV4,
+    };
+    let cov = evaluate_rules(&ctx_unread_target, &rules, &mut budget).unwrap();
+    assert!(cov.per_unit[0].allow_rule.is_none());
+    assert_eq!(
+        cov.deny.as_ref().map(|(_, id)| id),
+        Some(&RuleId("r_g_deny_cat".into()))
+    );
+
+    // 1b. P1/P2 unit-level Unread in `outcomes` (e.g. `Assignment` or
+    //     `AfterPossibleWriter`) blocks Thread Allow and lets Global Deny fire.
+    for prior in [
+        PartResult {
+            part: PartId::Unit(UnitIndex(0)),
+            outcome: PartOutcome::Unread(UnreadReason::Assignment),
+        },
+        PartResult {
+            part: PartId::Operand {
+                unit: UnitIndex(0),
+                argv_index: 1,
+            },
+            outcome: PartOutcome::Unread(UnreadReason::AfterPossibleWriter {
+                writer_unit: UnitIndex(0),
+            }),
+        },
+        PartResult {
+            part: PartId::WholeCall,
+            outcome: PartOutcome::Unread(UnreadReason::UnknownCwd),
+        },
+    ] {
+        let outcomes = [prior];
+        let ctx_p = RuleEvalContext {
+            check: &check,
+            thread_id: &tid,
+            preset: Preset::Home,
+            units: &units,
+            effects: &effects,
+            targets: &[],
+            outcomes: &outcomes,
+            best_effort: &be,
+            folds: &FoldRules::REV4,
+        };
+        let cov_p = evaluate_rules(&ctx_p, &rules, &mut budget).unwrap();
+        assert!(cov_p.per_unit[0].allow_rule.is_none());
+        assert_eq!(
+            cov_p.deny.as_ref().map(|(_, id)| id),
+            Some(&RuleId("r_g_deny_cat".into()))
+        );
+    }
+
+    // 1c. Exhausted outcome blocks EVEN unscoped Thread Any Allow and does NOT
+    //     suppress Global Deny.
+    let exhausted_outcomes = [PartResult {
+        part: PartId::Unit(UnitIndex(0)),
+        outcome: PartOutcome::Exhausted(ExhaustReason::ComputeBudget),
+    }];
+    let any_vs_deny = vec![
+        make_rule(
+            "r_t_any",
+            RuleScope::Thread {
+                thread_id: tid.clone(),
+            },
+            ToolKind::Execute,
+            RuleMatcher::Any,
+            RuleDecision::Allow,
+        ),
+        rules[1].clone(),
+    ];
+    let ctx_ex = RuleEvalContext {
+        check: &check,
+        thread_id: &tid,
+        preset: Preset::Home,
+        units: &units,
+        effects: &effects,
+        targets: &[],
+        outcomes: &exhausted_outcomes,
+        best_effort: &be,
+        folds: &FoldRules::REV4,
+    };
+    let cov_ex = evaluate_rules(&ctx_ex, &any_vs_deny, &mut budget).unwrap();
+    assert!(cov_ex.unscoped_any_rule.is_none());
+    assert!(cov_ex.per_unit[0].allow_rule.is_none());
+    assert!(!cov_ex.per_unit[0].unscoped_any_allow);
+    assert_eq!(
+        cov_ex.deny.as_ref().map(|(_, id)| id),
+        Some(&RuleId("r_g_deny_cat".into()))
+    );
+
+    // 1d. Pinned `python build.py` that ALSO has a P2 Unread target cannot be
+    //     covered by a pinned Allow rule (§1 step 6) and cannot suppress Deny.
+    let py_check = cmd_check("python build.py");
+    let py_units = vec![make_unit(0, &["python", "build.py"])];
+    let py_effects = classify_all(&py_units);
+    let py_be = BestEffortRecord {
+        raw_texts: vec!["python build.py".into()],
+        units: vec![be_unit(0, &["python", "build.py"])],
+    };
+    let py_rules = vec![
+        make_rule(
+            "r_t_py",
+            RuleScope::Thread {
+                thread_id: tid.clone(),
+            },
+            ToolKind::Execute,
+            RuleMatcher::CommandExact {
+                argv: argv(&["python", "build.py"]),
+            },
+            RuleDecision::Allow,
+        ),
+        make_rule(
+            "r_g_deny_py",
+            RuleScope::Global,
+            ToolKind::Execute,
+            RuleMatcher::CommandPrefix {
+                argv: argv(&["python"]),
+            },
+            RuleDecision::Deny,
+        ),
+    ];
+    let ctx_py_bad = RuleEvalContext {
+        check: &py_check,
+        thread_id: &tid,
+        preset: Preset::Home,
+        units: &py_units,
+        effects: &py_effects,
+        targets: &unread_targets,
+        outcomes: &[],
+        best_effort: &py_be,
+        folds: &FoldRules::REV4,
+    };
+    let cov_py = evaluate_rules(&ctx_py_bad, &py_rules, &mut budget).unwrap();
+    assert!(cov_py.per_unit[0].allow_rule.is_none());
+    assert!(!cov_py.per_unit[0].covers_pinned_program);
+    assert_eq!(
+        cov_py.deny.as_ref().map(|(_, id)| id),
+        Some(&RuleId("r_g_deny_py".into()))
+    );
+}
+
+#[test]
+fn finding_3_matched_deny_never_lost_to_post_match_exhaustion() {
+    let tid = ThreadId("t1".into());
+    let fcheck = file_check(ToolKind::Read, "Read", &["/proj/a.rs"]);
+    let be = BestEffortRecord::default();
+    let ctx = RuleEvalContext {
+        check: &fcheck,
+        thread_id: &tid,
+        preset: Preset::Home,
+        units: &[],
+        effects: &[],
+        targets: &[],
+        outcomes: &[],
+        best_effort: &be,
+        folds: &FoldRules::REV4,
+    };
+    let rules = vec![make_rule(
+        "r_deny_any",
+        RuleScope::Global,
+        ToolKind::Read,
+        RuleMatcher::Any,
+        RuleDecision::Deny,
+    )];
+
+    // Sweep compute units and allocation bytes across every boundary, including
+    // the review's exact `ComputeBudget::new(12, 1_048_576)` case: the result
+    // is monotonic — once enough budget exists to match, Deny is NEVER lost.
+    let mut first_ok_units = None;
+    for units in 0..=80u64 {
+        let mut b = ComputeBudget::new(units, 1_048_576);
+        match evaluate_rules(&ctx, &rules, &mut b) {
+            Err(e) => {
+                assert_eq!(e.reason, ExhaustReason::ComputeBudget);
+                assert!(
+                    first_ok_units.is_none(),
+                    "Deny disappeared at units={units} after succeeding at {first_ok_units:?}"
+                );
+            }
+            Ok(cov) => {
+                assert_eq!(
+                    cov.deny.as_ref().map(|(_, id)| id),
+                    Some(&RuleId("r_deny_any".into())),
+                    "units={units}"
+                );
+                first_ok_units.get_or_insert(units);
+            }
+        }
+    }
+    assert!(first_ok_units.is_some());
+
+    let mut first_ok_alloc = None;
+    for alloc in 0..=256usize {
+        let mut b = ComputeBudget::new(100_000, alloc);
+        match evaluate_rules(&ctx, &rules, &mut b) {
+            Err(e) => {
+                assert_eq!(e.reason, ExhaustReason::AllocationBudget);
+                assert!(
+                    first_ok_alloc.is_none(),
+                    "Deny disappeared at alloc={alloc} after succeeding at {first_ok_alloc:?}"
+                );
+            }
+            Ok(cov) => {
+                assert_eq!(
+                    cov.deny.as_ref().map(|(_, id)| id),
+                    Some(&RuleId("r_deny_any".into())),
+                    "alloc={alloc}"
+                );
+                first_ok_alloc.get_or_insert(alloc);
+            }
+        }
+    }
+    assert!(first_ok_alloc.is_some());
+}
+
+#[test]
+fn finding_6_deny_path_scope_requires_every_target_and_rejects_unread() {
+    let tid = ThreadId("t1".into());
+    let mut budget = ComputeBudget::with_default_limits();
+    let fcheck = file_check(ToolKind::Read, "Read", &["/proj/a", "/elsewhere/b"]);
+    let be = BestEffortRecord::default();
+
+    let mut scoped_deny_any = make_rule(
+        "r_deny_scoped",
+        RuleScope::Global,
+        ToolKind::Read,
+        RuleMatcher::Any,
+        RuleDecision::Deny,
+    );
+    scoped_deny_any.path_scope = Some("/proj/**".into());
+    let rules_scoped = [scoped_deny_any];
+
+    // Mixed targets (`/proj/a` + `/elsewhere/b`): NOT every target is in `/proj/**` -> no Deny.
+    let mixed = vec![
+        resolved_target(TargetOrigin::SubjectPath { path_index: 0 }, "/proj/a"),
+        resolved_target(TargetOrigin::SubjectPath { path_index: 1 }, "/elsewhere/b"),
+    ];
+    let cov_mixed = evaluate_rules(
+        &RuleEvalContext {
+            check: &fcheck,
+            thread_id: &tid,
+            preset: Preset::Home,
+            units: &[],
+            effects: &[],
+            targets: &mixed,
+            outcomes: &[],
+            best_effort: &be,
+            folds: &FoldRules::REV4,
+        },
+        &rules_scoped,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(cov_mixed.deny.is_none());
+
+    // One in-scope target + one Unread target -> Unread rejects path_scope -> no Deny.
+    let with_unread = vec![
+        resolved_target(TargetOrigin::SubjectPath { path_index: 0 }, "/proj/a"),
+        Target {
+            origin: TargetOrigin::SubjectPath { path_index: 1 },
+            access: AccessMode::Read,
+            resolution: TargetResolution::Unread(UnreadReason::UnresolvablePath {
+                path: b"/proj/unreadable".to_vec(),
+            }),
+            written: Some(b"/proj/unreadable".to_vec()),
+        },
+    ];
+    let cov_unread = evaluate_rules(
+        &RuleEvalContext {
+            check: &fcheck,
+            thread_id: &tid,
+            preset: Preset::Home,
+            units: &[],
+            effects: &[],
+            targets: &with_unread,
+            outcomes: &[],
+            best_effort: &be,
+            folds: &FoldRules::REV4,
+        },
+        &rules_scoped,
+        &mut budget,
+    )
+    .unwrap();
+    assert!(cov_unread.deny.is_none());
+
+    // All canonical targets inside `/proj/**` -> Deny fires!
+    let all_in_scope = vec![
+        resolved_target(TargetOrigin::SubjectPath { path_index: 0 }, "/proj/a"),
+        resolved_target(TargetOrigin::SubjectPath { path_index: 1 }, "/proj/b"),
+    ];
+    let cov_all = evaluate_rules(
+        &RuleEvalContext {
+            check: &fcheck,
+            thread_id: &tid,
+            preset: Preset::Home,
+            units: &[],
+            effects: &[],
+            targets: &all_in_scope,
+            outcomes: &[],
+            best_effort: &be,
+            folds: &FoldRules::REV4,
+        },
+        &rules_scoped,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        cov_all.deny.as_ref().map(|(_, id)| id),
+        Some(&RuleId("r_deny_scoped".into()))
+    );
+
+    // Existential matching stays ONLY for Deny `PathGlob` matcher itself (no path_scope).
+    let deny_path_glob = [make_rule(
+        "r_deny_pg",
+        RuleScope::Global,
+        ToolKind::Read,
+        RuleMatcher::PathGlob {
+            glob: "/proj/**".into(),
+        },
+        RuleDecision::Deny,
+    )];
+    let cov_pg = evaluate_rules(
+        &RuleEvalContext {
+            check: &fcheck,
+            thread_id: &tid,
+            preset: Preset::Home,
+            units: &[],
+            effects: &[],
+            targets: &mixed,
+            outcomes: &[],
+            best_effort: &be,
+            folds: &FoldRules::REV4,
+        },
+        &deny_path_glob,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        cov_pg.deny.as_ref().map(|(_, id)| id),
+        Some(&RuleId("r_deny_pg".into()))
+    );
+}
+
+#[test]
+fn finding_7_public_core_validator_matches_v4_rules() {
+    // `sed z` is a safe GNU zap script accepted by core (finding 7).
+    assert!(
+        crate::policy::validate_rule_matcher(
+            &RuleMatcher::CommandPrefix {
+                argv: argv(&["sed", "z"]),
+            },
+            RuleDecision::Allow,
+            None,
+        )
+        .is_ok()
+    );
+    // Tools removed by D-141 (`deno`, `bun`, `php`, `lua`, `pwsh`) are unknown tools -> accepted.
+    for unknown_tool in ["deno", "bun", "php", "lua", "pwsh"] {
+        assert!(
+            crate::policy::validate_rule_matcher(
+                &RuleMatcher::CommandPrefix {
+                    argv: argv(&[unknown_tool]),
+                },
+                RuleDecision::Allow,
+                None,
+            )
+            .is_ok(),
+            "{unknown_tool} must be accepted as unknown tool"
+        );
+    }
+    // Unpinned code runner and bad path_scope return displayable reasons.
+    let err_awk = crate::policy::validate_rule_matcher(
+        &RuleMatcher::CommandPrefix {
+            argv: argv(&["awk"]),
+        },
+        RuleDecision::Allow,
+        None,
+    )
+    .unwrap_err();
+    assert!(err_awk.contains("awk"));
+    let err_scope =
+        crate::policy::validate_rule_matcher(&RuleMatcher::Any, RuleDecision::Allow, Some("/a/["))
+            .unwrap_err();
+    assert!(!err_scope.is_empty());
 }

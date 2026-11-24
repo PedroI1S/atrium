@@ -79,6 +79,22 @@ pub(crate) fn format_validation_error(err: &RuleValidationError) -> String {
     }
 }
 
+/// Validates a rule matcher and optional `path_scope` under §7, returning a
+/// plain displayable explanation on failure (used by `policy::validate_rule_matcher`,
+/// D-153).
+pub(crate) fn validate_rule_draft_reason(
+    matcher: &RuleMatcher,
+    decision: RuleDecision,
+    path_scope: Option<&str>,
+    folds: &FoldRules,
+) -> Result<(), String> {
+    validate_rule_matcher(matcher, decision, folds).map_err(|e| format_validation_error(&e))?;
+    if let Some(scope) = path_scope {
+        validate_glob_syntax(scope).map_err(|e| format_validation_error(&e))?;
+    }
+    Ok(())
+}
+
 fn validate_glob_syntax(glob: &str) -> Result<(), RuleValidationError> {
     if glob.is_empty() {
         return Err(RuleValidationError::InvalidGlob {
@@ -477,8 +493,42 @@ fn validate_sed_inline_prefix_budgeted(
 
 struct UnitEvalInfo<'a> {
     simple_ok: bool,
-    has_plain_tool_unread: bool,
+    has_plain_unread: bool,
+    has_exhausted: bool,
     pinned_program_words: Option<&'a [String]>,
+}
+
+struct CallOutcomeFlags {
+    whole_call_plain_unread: bool,
+    whole_call_exhausted: bool,
+    non_cmd_plain_unread: bool,
+    non_cmd_exhausted: bool,
+    any_exhausted: bool,
+}
+
+fn part_unit_index(part: &PartId) -> Option<UnitIndex> {
+    match part {
+        PartId::Unit(u) | PartId::Operand { unit: u, .. } | PartId::Redirect { unit: u, .. } => {
+            Some(*u)
+        }
+        PartId::Filter { unit } => *unit,
+        PartId::WholeCall | PartId::SubjectPath { .. } | PartId::BestEffortUnit(_) => None,
+    }
+}
+
+fn find_unit_slot(
+    units: &[CommandUnit],
+    uid: UnitIndex,
+    budget: &mut ComputeBudget,
+) -> Result<Option<usize>, Exhausted> {
+    budget.charge(1)?;
+    if let Some(u) = units.get(uid.0)
+        && u.index == uid
+    {
+        return Ok(Some(uid.0));
+    }
+    budget.charge(units.len().max(1) as u64)?;
+    Ok(units.iter().position(|u| u.index == uid))
 }
 
 /// Evaluates `rules` against a call under `dev`'s precedence (thread > Home >
@@ -487,7 +537,7 @@ struct UnitEvalInfo<'a> {
 /// `Unread (program)` units meeting simple-command and canonical path-scope
 /// conditions.
 ///
-/// **Owned by:** P3 · **Contract:** §1 step 3, §7, §8.
+/// **Owned by:** P3 · **Contract:** §1 step 3, §7, §8, D-153.
 pub(crate) fn evaluate_rules(
     call: &RuleEvalContext<'_>,
     rules: &[Rule],
@@ -512,32 +562,140 @@ pub(crate) fn evaluate_rules(
         per_unit.push(UnitRuleCoverage::default());
     }
 
-    // Pre-compute per-unit simple-command and program-pin facts once (charged).
+    // Pre-compute per-unit simple-command, P1/P2/P3 outcome, target, and
+    // program-pin facts once (all scans charged before running; §7, §8, D-153).
     let mut unit_info = vec_with_exact_budgeted::<UnitEvalInfo<'_>>(call.units.len(), budget)?;
     for (idx, u) in call.units.iter().enumerate() {
         let simple_ok = is_unit_simple_for_allow(u, budget)?;
         let eff = call.effects.get(idx);
-        let mut has_plain_tool_unread = false;
+        let mut has_plain_unread = false;
         let mut pinned_program_words: Option<&[String]> = None;
         if let Some(e) = eff {
             budget.charge(e.unread.len().max(1) as u64)?;
             for reason in &e.unread {
                 if !matches!(reason, UnreadReason::Program { .. }) {
-                    has_plain_tool_unread = true;
+                    has_plain_unread = true;
                     break;
                 }
             }
-            if !has_plain_tool_unread && let CodeExecution::Program { program_words, .. } = &e.code
-            {
+            if let CodeExecution::Program { program_words, .. } = &e.code {
                 pinned_program_words = Some(program_words.as_slice());
             }
         }
         unit_info.push(UnitEvalInfo {
             simple_ok,
-            has_plain_tool_unread,
+            has_plain_unread,
+            has_exhausted: false,
             pinned_program_words,
         });
     }
+
+    let mut whole_call_plain_unread = false;
+    let mut whole_call_exhausted = false;
+    let mut non_cmd_plain_unread = false;
+    let mut non_cmd_exhausted = false;
+
+    // Incorporate prior P1/P2/P3 outcomes (`call.outcomes`, D-153).
+    budget.charge(call.outcomes.len().max(1) as u64)?;
+    for pr in call.outcomes {
+        match &pr.outcome {
+            PartOutcome::Exhausted(_) => {
+                if is_command && let Some(uid) = part_unit_index(&pr.part) {
+                    if let Some(slot) = find_unit_slot(call.units, uid, budget)? {
+                        unit_info[slot].has_exhausted = true;
+                    } else {
+                        whole_call_exhausted = true;
+                    }
+                } else if !is_command
+                    && matches!(
+                        pr.part,
+                        PartId::SubjectPath { .. } | PartId::Filter { unit: None }
+                    )
+                {
+                    non_cmd_exhausted = true;
+                } else {
+                    whole_call_exhausted = true;
+                }
+            }
+            PartOutcome::Unread(UnreadReason::Program { program_words }) => {
+                if is_command
+                    && let Some(uid) = part_unit_index(&pr.part)
+                    && let Some(slot) = find_unit_slot(call.units, uid, budget)?
+                    && unit_info[slot].pinned_program_words.is_none()
+                {
+                    unit_info[slot].pinned_program_words = Some(program_words.as_slice());
+                } else if !is_command {
+                    non_cmd_plain_unread = true;
+                } else if part_unit_index(&pr.part).is_none() {
+                    whole_call_plain_unread = true;
+                }
+            }
+            PartOutcome::Unread(_) => {
+                if is_command && let Some(uid) = part_unit_index(&pr.part) {
+                    if let Some(slot) = find_unit_slot(call.units, uid, budget)? {
+                        unit_info[slot].has_plain_unread = true;
+                    } else {
+                        whole_call_plain_unread = true;
+                    }
+                } else if !is_command
+                    && matches!(
+                        pr.part,
+                        PartId::SubjectPath { .. } | PartId::Filter { unit: None }
+                    )
+                {
+                    non_cmd_plain_unread = true;
+                } else {
+                    whole_call_plain_unread = true;
+                }
+            }
+            PartOutcome::HardDenyHit(_)
+            | PartOutcome::StoreHit(_)
+            | PartOutcome::Clear
+            | PartOutcome::TooLarge(_) => {}
+        }
+    }
+
+    // Incorporate target-level `Unread` and `variant_only` outcomes from P2
+    // (`call.targets`, §7, D-153).
+    budget.charge(call.targets.len().max(1) as u64)?;
+    for t in call.targets {
+        if matches!(t.resolution, TargetResolution::Unread(_)) || target_is_variant_only(&t.origin)
+        {
+            if is_command && let Some(uid) = target_unit_index(&t.origin) {
+                if let Some(slot) = find_unit_slot(call.units, uid, budget)? {
+                    unit_info[slot].has_plain_unread = true;
+                } else {
+                    whole_call_plain_unread = true;
+                }
+            } else if !is_command {
+                non_cmd_plain_unread = true;
+            } else {
+                whole_call_plain_unread = true;
+            }
+        }
+    }
+
+    // Clear pinned_program_words whenever the same unit also has a plain Unread
+    // or Exhausted outcome (§1 step 6: a pinned rule authorizes ONLY the
+    // Unread (program) reason, never another reason on the same unit).
+    budget.charge(unit_info.len().max(1) as u64)?;
+    let mut any_unit_exhausted = false;
+    for info in &mut unit_info {
+        if info.has_exhausted {
+            any_unit_exhausted = true;
+        }
+        if info.has_plain_unread || info.has_exhausted {
+            info.pinned_program_words = None;
+        }
+    }
+
+    let flags = CallOutcomeFlags {
+        whole_call_plain_unread,
+        whole_call_exhausted,
+        non_cmd_plain_unread,
+        non_cmd_exhausted,
+        any_exhausted: whole_call_exhausted || non_cmd_exhausted || any_unit_exhausted,
+    };
 
     let mut unscoped_any_rule: Option<RuleId> = None;
 
@@ -545,14 +703,22 @@ pub(crate) fn evaluate_rules(
     for rank in 0..3u8 {
         budget.charge(rules.len().max(1) as u64)?;
 
-        let all_covered =
-            all_units_and_be_covered(call, is_command, &per_unit, &unscoped_any_rule, budget)?;
+        let all_covered = all_units_and_be_covered(
+            call,
+            is_command,
+            &flags,
+            &per_unit,
+            &unscoped_any_rule,
+            budget,
+        )?;
         if all_covered {
             break;
         }
 
-        // 1. Deny rules at this rank (checked BEFORE Allow at the same rank,
-        //    unless higher ranks already covered every unit and best-effort unit).
+        // 1. Deny rules at this rank (checked BEFORE Allow at the same rank;
+        //    because the whole call is still uncovered, match against EVERY
+        //    exact and best-effort unit, preserving `dev`'s call-level
+        //    suppression semantics).
         for rule in rules {
             if rule.decision != RuleDecision::Deny {
                 continue;
@@ -566,18 +732,23 @@ pub(crate) fn evaluate_rules(
             if !rule_is_valid_budgeted(rule, call.folds, budget)? {
                 continue;
             }
-            if deny_rule_matches(
-                rule,
-                call,
-                is_command,
-                &per_unit,
-                &unscoped_any_rule,
-                budget,
-            )? {
-                let reason = format_deny_reason(&rule.matcher, budget)?;
-                let id = clone_rule_id(&rule.id, budget)?;
+            // Reserve & charge storage for the Deny result BEFORE matching so
+            // committing an established Deny cannot fail with Exhausted (§1, §8).
+            let deny_label = deny_reason_label(&rule.matcher);
+            let reason_len = deny_label.len();
+            let id_len = rule.id.0.len();
+            budget.charge((reason_len.max(1) as u64).saturating_add(id_len.max(1) as u64))?;
+            let alloc_bytes = reason_len.saturating_add(id_len);
+            if alloc_bytes > 0 {
+                budget.charge_alloc(alloc_bytes)?;
+            }
+            if deny_rule_matches(rule, call, is_command, budget)? {
+                let mut reason = String::with_capacity(reason_len);
+                reason.push_str(deny_label);
+                let mut id = String::with_capacity(id_len);
+                id.push_str(&rule.id.0);
                 return Ok(RuleCoverage {
-                    deny: Some((reason, id)),
+                    deny: Some((reason, RuleId(id))),
                     per_unit,
                     unscoped_any_rule,
                 });
@@ -606,6 +777,7 @@ pub(crate) fn evaluate_rules(
                 rule,
                 call,
                 is_command,
+                &flags,
                 &unit_info,
                 &mut per_unit,
                 &mut unscoped_any_rule,
@@ -699,7 +871,7 @@ fn rule_is_valid_budgeted(
             let mut cost = argv.len().max(1) as u64;
             let mut alloc = 0usize;
             for w in argv {
-                cost = cost.saturating_add((w.len() as u64).saturating_mul(3));
+                cost = cost.saturating_add((w.len() as u64).saturating_mul(4));
                 alloc = alloc.saturating_add(w.len().saturating_mul(4));
             }
             // Charge for table scan on command word + any sed script vector.
@@ -791,7 +963,7 @@ fn target_is_variant_only(origin: &TargetOrigin) -> bool {
 /// Checks canonical path targets for an **Allow** `path_scope` or `PathGlob`:
 /// requires at least one target, ZERO `Unread` or `variant_only` targets, and
 /// EVERY canonical target matching `matcher` (§7, M1-29 round 4 findings 2–3).
-fn allow_targets_match_glob(
+fn all_targets_match_glob(
     targets: &[Target],
     unit_filter: Option<UnitIndex>,
     matcher: &GlobMatcher,
@@ -821,7 +993,7 @@ fn allow_targets_match_glob(
     Ok(count > 0)
 }
 
-/// Checks canonical path targets for a **Deny** `path_scope` or `PathGlob`:
+/// Checks canonical path targets for a **Deny** `PathGlob` matcher:
 /// fail-closed if ANY resolved canonical target matches `matcher`.
 fn deny_targets_match_glob(
     targets: &[Target],
@@ -842,6 +1014,9 @@ fn deny_targets_match_glob(
     Ok(false)
 }
 
+/// Checks `path_scope` on a Deny rule: requires EVERY canonical target to be
+/// resolved (zero `Unread` or `variant_only` targets) and inside `path_scope`
+/// (`dev`'s `path_scope_ok` semantics and §7's Unread-target condition).
 fn deny_path_scope_ok(
     path_scope: Option<&str>,
     targets: &[Target],
@@ -853,15 +1028,13 @@ fn deny_path_scope_ok(
     let Some(matcher) = compile_glob_budgeted(scope, budget)? else {
         return Ok(false);
     };
-    deny_targets_match_glob(targets, &matcher, budget)
+    all_targets_match_glob(targets, None, &matcher, budget)
 }
 
 fn deny_rule_matches(
     rule: &Rule,
     call: &RuleEvalContext<'_>,
     is_command: bool,
-    per_unit: &[UnitRuleCoverage],
-    unscoped_any_rule: &Option<RuleId>,
     budget: &mut ComputeBudget,
 ) -> Result<bool, Exhausted> {
     match &rule.matcher {
@@ -870,7 +1043,7 @@ fn deny_rule_matches(
             if !is_command {
                 return Ok(false);
             }
-            if !deny_command_matches(argv, true, call, per_unit, unscoped_any_rule, budget)? {
+            if !deny_command_matches(argv, true, call, budget)? {
                 return Ok(false);
             }
             deny_path_scope_ok(rule.path_scope.as_deref(), call.targets, budget)
@@ -879,7 +1052,7 @@ fn deny_rule_matches(
             if !is_command {
                 return Ok(false);
             }
-            if !deny_command_matches(argv, false, call, per_unit, unscoped_any_rule, budget)? {
+            if !deny_command_matches(argv, false, call, budget)? {
                 return Ok(false);
             }
             deny_path_scope_ok(rule.path_scope.as_deref(), call.targets, budget)
@@ -897,26 +1070,23 @@ fn deny_rule_matches(
 }
 
 /// Checks whether a Deny `CommandPrefix` (`is_prefix == true`) or
-/// `CommandExact` (`is_prefix == false`) matches any uncovered exact unit OR
-/// any best-effort unit (§7: "a Deny rule matches exact **and** best-effort
-/// units").
+/// `CommandExact` (`is_prefix == false`) matches ANY exact unit OR ANY
+/// best-effort unit while the call remains uncovered (§7: "a Deny rule matches
+/// exact **and** best-effort units").
 fn deny_command_matches(
     rule_argv: &[String],
     is_prefix: bool,
     call: &RuleEvalContext<'_>,
-    per_unit: &[UnitRuleCoverage],
-    unscoped_any_rule: &Option<RuleId>,
     budget: &mut ComputeBudget,
 ) -> Result<bool, Exhausted> {
     if rule_argv.is_empty() {
         return Ok(false);
     }
 
-    // 1. Exact modeled units not already covered by a higher-ranked Allow.
-    for (idx, u) in call.units.iter().enumerate() {
-        if per_unit.get(idx).is_some_and(|c| c.allow_rule.is_some()) {
-            continue;
-        }
+    // 1. Every exact modeled unit (call-level suppression handles the
+    //    whole-call covered case before Deny rules run).
+    budget.charge(call.units.len().max(1) as u64)?;
+    for u in call.units {
         if words_match_argv(u.argv.iter(), rule_argv, is_prefix, budget)?
             || words_match_argv(u.original_argv(), rule_argv, is_prefix, budget)?
         {
@@ -924,22 +1094,18 @@ fn deny_command_matches(
         }
     }
 
-    // 2. Best-effort units not already represented by a higher-ranked covered
-    //    exact unit (unless a higher-ranked unscoped Any covered the call).
-    if unscoped_any_rule.is_none() {
-        for be in &call.best_effort.units {
-            if be_unit_covered_by_exact(be, call.units, per_unit, budget)? {
-                continue;
-            }
-            if strings_match_argv(&be.effective_argv, rule_argv, is_prefix, budget)?
-                || strings_match_argv(&be.raw_argv, rule_argv, is_prefix, budget)?
-            {
+    // 2. Every best-effort unit.
+    budget.charge(call.best_effort.units.len().max(1) as u64)?;
+    for be in &call.best_effort.units {
+        if strings_match_argv(&be.effective_argv, rule_argv, is_prefix, budget)?
+            || strings_match_argv(&be.raw_argv, rule_argv, is_prefix, budget)?
+        {
+            return Ok(true);
+        }
+        budget.charge(be.alt_argv.len().max(1) as u64)?;
+        for alt in &be.alt_argv {
+            if strings_match_argv(alt, rule_argv, is_prefix, budget)? {
                 return Ok(true);
-            }
-            for alt in &be.alt_argv {
-                if strings_match_argv(alt, rule_argv, is_prefix, budget)? {
-                    return Ok(true);
-                }
             }
         }
     }
@@ -973,18 +1139,27 @@ fn be_unit_covered_by_exact(
     Ok(false)
 }
 
-/// Returns `true` when higher-ranked Allow rules have already covered every
-/// exact unit AND every best-effort unit of the call, so no lower-ranked rule
-/// (Deny or Allow) can affect the result.
+/// Returns `true` when higher-ranked Allow rules have already covered the
+/// ENTIRE call (every exact unit and every best-effort unit, with no
+/// uncovered `Unread` or `Exhausted` part), so no lower-ranked rule (Deny or
+/// Allow) can affect the result.
 fn all_units_and_be_covered(
     call: &RuleEvalContext<'_>,
     is_command: bool,
+    flags: &CallOutcomeFlags,
     per_unit: &[UnitRuleCoverage],
     unscoped_any_rule: &Option<RuleId>,
     budget: &mut ComputeBudget,
 ) -> Result<bool, Exhausted> {
+    // An Exhausted part can never be covered or suppress a lower-ranked Deny.
+    if flags.any_exhausted {
+        return Ok(false);
+    }
     if unscoped_any_rule.is_some() {
         return Ok(true);
+    }
+    if flags.whole_call_plain_unread {
+        return Ok(false);
     }
     if is_command && call.units.is_empty() {
         return Ok(false);
@@ -994,6 +1169,7 @@ fn all_units_and_be_covered(
         return Ok(false);
     }
     if is_command {
+        budget.charge(call.best_effort.units.len().max(1) as u64)?;
         for be in &call.best_effort.units {
             if !be_unit_covered_by_exact(be, call.units, per_unit, budget)? {
                 return Ok(false);
@@ -1057,6 +1233,7 @@ fn apply_allow_rule(
     rule: &Rule,
     call: &RuleEvalContext<'_>,
     is_command: bool,
+    flags: &CallOutcomeFlags,
     unit_info: &[UnitEvalInfo<'_>],
     per_unit: &mut [UnitRuleCoverage],
     unscoped_any_rule: &mut Option<RuleId>,
@@ -1076,32 +1253,48 @@ fn apply_allow_rule(
         RuleMatcher::Any => {
             if let Some(ref scope_m) = scope_matcher {
                 // Scoped Any rule requires established canonical targets (§2, §7).
+                if flags.whole_call_plain_unread || flags.whole_call_exhausted {
+                    return Ok(());
+                }
                 if is_command {
                     for (idx, u) in call.units.iter().enumerate() {
                         if per_unit[idx].allow_rule.is_some() {
                             continue;
                         }
                         if !unit_info[idx].simple_ok
-                            || unit_info[idx].has_plain_tool_unread
+                            || unit_info[idx].has_plain_unread
+                            || unit_info[idx].has_exhausted
                             || unit_info[idx].pinned_program_words.is_some()
                         {
                             continue;
                         }
-                        if allow_targets_match_glob(call.targets, Some(u.index), scope_m, budget)? {
+                        if all_targets_match_glob(call.targets, Some(u.index), scope_m, budget)? {
                             per_unit[idx].allow_rule = Some(clone_rule_id(&rule.id, budget)?);
                         }
                     }
-                } else if per_unit[0].allow_rule.is_none()
-                    && allow_targets_match_glob(call.targets, None, scope_m, budget)?
+                } else if !flags.non_cmd_plain_unread
+                    && !flags.non_cmd_exhausted
+                    && per_unit[0].allow_rule.is_none()
+                    && all_targets_match_glob(call.targets, None, scope_m, budget)?
                 {
                     per_unit[0].allow_rule = Some(clone_rule_id(&rule.id, budget)?);
                 }
             } else {
-                // Unscoped Any rule covers every unit (including Unread parts; §2).
-                if unscoped_any_rule.is_none() {
+                // Unscoped Any rule covers Clear, StoreHit, and plain Unread,
+                // but NEVER Exhausted (§2, D-153).
+                if !flags.any_exhausted && unscoped_any_rule.is_none() {
                     *unscoped_any_rule = Some(clone_rule_id(&rule.id, budget)?);
                 }
-                for slot in per_unit.iter_mut() {
+                for (idx, slot) in per_unit.iter_mut().enumerate() {
+                    let slot_exhausted = flags.whole_call_exhausted
+                        || if is_command {
+                            unit_info.get(idx).is_some_and(|u| u.has_exhausted)
+                        } else {
+                            flags.non_cmd_exhausted
+                        };
+                    if slot_exhausted {
+                        continue;
+                    }
                     slot.unscoped_any_allow = true;
                     if slot.allow_rule.is_none() {
                         slot.allow_rule = Some(clone_rule_id(&rule.id, budget)?);
@@ -1110,18 +1303,25 @@ fn apply_allow_rule(
             }
         }
         RuleMatcher::CommandPrefix { argv: rule_argv } => {
-            if !is_command || call.units.is_empty() {
+            if !is_command
+                || call.units.is_empty()
+                || flags.whole_call_plain_unread
+                || flags.whole_call_exhausted
+            {
                 return Ok(());
             }
             for (idx, u) in call.units.iter().enumerate() {
                 if per_unit[idx].allow_rule.is_some() {
                     continue;
                 }
-                if !unit_info[idx].simple_ok || unit_info[idx].has_plain_tool_unread {
+                if !unit_info[idx].simple_ok
+                    || unit_info[idx].has_plain_unread
+                    || unit_info[idx].has_exhausted
+                {
                     continue;
                 }
                 if let Some(ref scope_m) = scope_matcher
-                    && !allow_targets_match_glob(call.targets, Some(u.index), scope_m, budget)?
+                    && !all_targets_match_glob(call.targets, Some(u.index), scope_m, budget)?
                 {
                     continue;
                 }
@@ -1141,18 +1341,25 @@ fn apply_allow_rule(
             }
         }
         RuleMatcher::CommandExact { argv: rule_argv } => {
-            if !is_command || call.units.is_empty() {
+            if !is_command
+                || call.units.is_empty()
+                || flags.whole_call_plain_unread
+                || flags.whole_call_exhausted
+            {
                 return Ok(());
             }
             for (idx, u) in call.units.iter().enumerate() {
                 if per_unit[idx].allow_rule.is_some() {
                     continue;
                 }
-                if !unit_info[idx].simple_ok || unit_info[idx].has_plain_tool_unread {
+                if !unit_info[idx].simple_ok
+                    || unit_info[idx].has_plain_unread
+                    || unit_info[idx].has_exhausted
+                {
                     continue;
                 }
                 if let Some(ref scope_m) = scope_matcher
-                    && !allow_targets_match_glob(call.targets, Some(u.index), scope_m, budget)?
+                    && !all_targets_match_glob(call.targets, Some(u.index), scope_m, budget)?
                 {
                     continue;
                 }
@@ -1171,6 +1378,9 @@ fn apply_allow_rule(
             }
         }
         RuleMatcher::PathGlob { glob } => {
+            if flags.whole_call_plain_unread || flags.whole_call_exhausted {
+                return Ok(());
+            }
             let Some(glob_m) = compile_glob_budgeted(glob, budget)? else {
                 return Ok(());
             };
@@ -1180,25 +1390,28 @@ fn apply_allow_rule(
                         continue;
                     }
                     if !unit_info[idx].simple_ok
-                        || unit_info[idx].has_plain_tool_unread
+                        || unit_info[idx].has_plain_unread
+                        || unit_info[idx].has_exhausted
                         || unit_info[idx].pinned_program_words.is_some()
                     {
                         continue;
                     }
-                    if !allow_targets_match_glob(call.targets, Some(u.index), &glob_m, budget)? {
+                    if !all_targets_match_glob(call.targets, Some(u.index), &glob_m, budget)? {
                         continue;
                     }
                     if let Some(ref scope_m) = scope_matcher
-                        && !allow_targets_match_glob(call.targets, Some(u.index), scope_m, budget)?
+                        && !all_targets_match_glob(call.targets, Some(u.index), scope_m, budget)?
                     {
                         continue;
                     }
                     per_unit[idx].allow_rule = Some(clone_rule_id(&rule.id, budget)?);
                 }
-            } else if per_unit[0].allow_rule.is_none()
-                && allow_targets_match_glob(call.targets, None, &glob_m, budget)?
+            } else if !flags.non_cmd_plain_unread
+                && !flags.non_cmd_exhausted
+                && per_unit[0].allow_rule.is_none()
+                && all_targets_match_glob(call.targets, None, &glob_m, budget)?
                 && match &scope_matcher {
-                    Some(scope_m) => allow_targets_match_glob(call.targets, None, scope_m, budget)?,
+                    Some(scope_m) => all_targets_match_glob(call.targets, None, scope_m, budget)?,
                     None => true,
                 }
             {
@@ -1214,17 +1427,13 @@ fn clone_rule_id(id: &RuleId, budget: &mut ComputeBudget) -> Result<RuleId, Exha
     Ok(RuleId(charge_str_clone(&id.0, budget)?))
 }
 
-fn format_deny_reason(
-    matcher: &RuleMatcher,
-    budget: &mut ComputeBudget,
-) -> Result<String, Exhausted> {
-    let label = match matcher {
+fn deny_reason_label(matcher: &RuleMatcher) -> &'static str {
+    match matcher {
         RuleMatcher::Any => "denied by a rule (Any)",
         RuleMatcher::CommandPrefix { .. } => "denied by a rule (CommandPrefix)",
         RuleMatcher::CommandExact { .. } => "denied by a rule (CommandExact)",
         RuleMatcher::PathGlob { .. } => "denied by a rule (PathGlob)",
-    };
-    charge_str_clone(label, budget)
+    }
 }
 
 // ---------------------------------------------------------------------------
