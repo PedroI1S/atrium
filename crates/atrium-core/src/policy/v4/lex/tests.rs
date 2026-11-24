@@ -1884,16 +1884,24 @@ fn linear_charge_growth_from_10kb_to_max_bytes() {
 fn assert_best_effort_subset(kept: &BestEffortRecord, full: &BestEffortRecord, ctx: &str) {
     for (pos, u) in kept.units.iter().enumerate() {
         assert_eq!(u.index, pos, "{ctx}: unit index");
+        // Some full-run unit has these finished words, and every alternative
+        // reading kept is one that unit has (round 6: kept alternatives are
+        // finished readings; when exhaustion stopped their duplicate check
+        // they may repeat one, never invent one).
         assert!(
             full.units.iter().any(|f| {
                 u.raw_argv.len() <= f.raw_argv.len()
                     && u.raw_argv[..] == f.raw_argv[..u.raw_argv.len()]
                     && u.redirects.len() <= f.redirects.len()
                     && u.redirects[..] == f.redirects[..u.redirects.len()]
+                    && u.alt_argv
+                        .iter()
+                        .all(|a| f.alt_argv.contains(a) || *a == f.effective_argv)
             }),
-            "{ctx}: kept unit {:?} / {:?} is not made of finished words of the full run",
+            "{ctx}: kept unit {:?} / {:?} / alternatives {:?} is not made of finished results of the full run",
             u.raw_argv,
-            u.redirects
+            u.redirects,
+            u.alt_argv
         );
     }
 }
@@ -2052,6 +2060,10 @@ fn r5_class_best_effort_below_cost_keeps_only_finished_values() {
         "sh -c 'sudo id' && command -p env -i ls",
         r"find . -exec sh -c 'sudo id' \; ; ls",
         "cat <<EOF | sh\nsudo id\nEOF",
+        "command -Z arg sudo id",
+        "$(which sh) -c 'id'",
+        r"find . -exec command -Z a sudo id \; -exec find b -ok ls \; \;",
+        "cat x | crontab <<EOF\n* * * * * sudo id\nEOF",
     ] {
         let mut bf = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
         let full = lex_best_effort(&[line], &mut bf).unwrap();
@@ -2222,4 +2234,125 @@ fn r5_neighbours_lookups_comparisons_folds_and_memo_are_charged() {
     let mut b120 = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
     let _ = lex_best_effort(&[&pipes(120)], &mut b120).unwrap();
     assert!((charged(&b120) as f64) / (charged(&b60) as f64) <= 2.5);
+}
+
+// ---------------------------------------------------------------------------
+// Round 6 (review round 4): finished readings survive, scans charge first
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r6_f1_best_effort_unwrap_keeps_alternative_readings_on_exhaustion() {
+    use super::best_effort::unwrap_best_effort;
+
+    // Review round 4, finding 1, failing case: unwrapping `command -Z arg`
+    // stores the alternative reading `sudo id`, then ran out on its final
+    // argv shift and dropped it. Whatever the budget, an alternative kept is
+    // the full run's, and once the first wrapper step is done (the
+    // effective reading is stripped) the alternative is there.
+    let line = "command -Z arg sudo id";
+    let mut rec = BestEffortRecord::default();
+    let res = lex_best_effort_into(&[line], &mut rec, &mut ComputeBudget::new(402, 100_000));
+    assert!(matches!(res, Err(PartOutcome::Exhausted(_))), "{res:?}");
+    let want_alt = vec!["sudo".to_string(), "id".to_string()];
+    for u in &rec.units {
+        assert!(
+            u.alt_argv.iter().all(|a| *a == want_alt),
+            "{:?}",
+            u.alt_argv
+        );
+        if u.effective_argv != u.raw_argv {
+            assert_eq!(
+                u.alt_argv,
+                std::slice::from_ref(&want_alt),
+                "stripped reading without its alternative"
+            );
+        }
+    }
+
+    // The helper itself, at every budget below its cost: on exhaustion it
+    // hands back whole words and every alternative found so far.
+    let argv: Vec<String> = ["command", "-Z", "arg", "sudo", "id"]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut bf = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let full = unwrap_best_effort(argv.clone(), &mut bf).unwrap_or_else(|_| unreachable!());
+    assert_eq!(full.effective, ["arg", "sudo", "id"]);
+    assert_eq!(full.alt, std::slice::from_ref(&want_alt));
+    let cost = BIG_UNITS - bf.remaining_units();
+    let mut kept_alt_on_exhaustion = false;
+    for units in 0..cost {
+        let Err((partial, _)) =
+            unwrap_best_effort(argv.clone(), &mut ComputeBudget::new(units, BIG_ALLOC))
+        else {
+            panic!("{units} of {cost} units must exhaust");
+        };
+        let n = partial.effective.len();
+        assert!(n <= argv.len() && partial.effective[..] == argv[argv.len() - n..]);
+        assert!(partial.alt.iter().all(|a| *a == want_alt));
+        if partial.effective != argv {
+            assert_eq!(partial.alt, full.alt, "units={units}");
+        }
+        kept_alt_on_exhaustion |= !partial.alt.is_empty();
+    }
+    assert!(
+        kept_alt_on_exhaustion,
+        "some budget must run out after the alternative is found and keep it"
+    );
+
+    // Callers: a `find -exec` command and a `$(which …)` reading keep their
+    // alternatives the same way (checked over every budget by the class
+    // sweep); here, one unit short of a clean run keeps them all.
+    for line in [
+        r"find . -exec command -Z a sudo id \;",
+        "$(which command) -Z a sudo id",
+    ] {
+        let mut bf = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        let full = lex_best_effort(&[line], &mut bf).unwrap();
+        let need = min_clean_budget(true, |b| lex_best_effort(&[line], b).is_ok());
+        let mut rec = BestEffortRecord::default();
+        let r = lex_best_effort_into(
+            &[line],
+            &mut rec,
+            &mut ComputeBudget::new(need - 1, BIG_ALLOC),
+        );
+        assert!(matches!(r, Err(PartOutcome::Exhausted(_))), "`{line}`");
+        assert_best_effort_subset(&rec, &full, line);
+        let alts = |r: &BestEffortRecord| r.units.iter().map(|u| u.alt_argv.len()).sum::<usize>();
+        assert_eq!(alts(&rec), alts(&full), "`{line}`: alternatives lost");
+    }
+}
+
+#[test]
+fn r6_f2_crontab_lines_are_charged_before_they_are_scanned() {
+    use super::best_effort::crontab_commands_budgeted;
+
+    // Review round 4, finding 2, failing case: `text.lines()` scanned all
+    // 60,000 bytes for a line end before the first charge. The scanner now
+    // charges each byte before examining it.
+    let long = "x".repeat(60_000);
+    assert!(crontab_commands_budgeted(&long, &mut ComputeBudget::new(0, 0)).is_err());
+    assert!(crontab_commands_budgeted(&long, &mut ComputeBudget::new(1_000, BIG_ALLOC)).is_err());
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    assert_eq!(crontab_commands_budgeted(&long, &mut b).unwrap(), "");
+    assert!(BIG_UNITS - b.remaining_units() >= 60_000);
+
+    // Same lines as `str::lines` (CRLF, no trailing empty line), same fields.
+    for (text, want) in [
+        ("* * * * * sudo id\n", "sudo id\n"),
+        (
+            "@reboot  run x\r\n# c\n\n  1 2 3 4 5   cmd a\nshort line",
+            "run x\ncmd a\n",
+        ),
+        ("1 2 3 4 5 last", "last\n"),
+        ("@daily", ""),
+        ("", ""),
+    ] {
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        assert_eq!(
+            crontab_commands_budgeted(text, &mut b).unwrap(),
+            want,
+            "{text:?}"
+        );
+    }
 }

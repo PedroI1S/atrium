@@ -1061,3 +1061,79 @@ fn r5_class_build_units_below_cost_keeps_only_finished_values() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 6 (review round 4): finished results survive every error path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r6_exact_unwrap_keeps_recognised_wrappers_on_exhaustion() {
+    // Same class as review round 4, finding 1, in exact unwrapping: a
+    // wrapper recognised before the budget runs out is still moved into
+    // `removed_wrappers` (its storage and the argv shift are paid before it
+    // is parsed), and the words as written never change.
+    let line = "command nice -n 5 timeout -s TERM 3 exec cat a";
+    let raw = raw_unit(line);
+    let mut bf = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let full = unwrap_unit(raw.clone(), &FoldRules::REV4, &mut bf)
+        .unwrap()
+        .unit;
+    let cost = charged(&bf);
+    assert_eq!(full.removed_wrappers.len(), 4);
+    let full_words: Vec<Word> = full.original_argv().cloned().collect();
+
+    let mut kept_on_exhaustion = 0usize;
+    for units in 0..cost {
+        let mut unit = CommandUnit {
+            index: raw.index,
+            argv: raw.argv.clone(),
+            removed_wrappers: Vec::new(),
+            redirects: raw.redirects.clone(),
+            separator_before: raw.separator_before,
+            pipeline_id: raw.pipeline_id,
+            depth: raw.depth,
+            parent_unit: raw.parent_unit,
+        };
+        let (_, res) = unwrap_in_place(
+            &mut unit,
+            &FoldRules::REV4,
+            &mut ComputeBudget::new(units, BIG_ALLOC),
+        );
+        assert!(res.is_err(), "{units} of {cost} units must exhaust");
+        let words: Vec<Word> = unit.original_argv().cloned().collect();
+        assert_eq!(words, full_words, "units={units}: words changed");
+        let n = unit.removed_wrappers.len();
+        assert_eq!(
+            unit.removed_wrappers[..],
+            full.removed_wrappers[..n],
+            "units={units}"
+        );
+        kept_on_exhaustion = kept_on_exhaustion.max(n);
+    }
+    assert_eq!(
+        kept_on_exhaustion, 4,
+        "wrappers recognised before exhaustion must be kept"
+    );
+
+    // Through `build_units`: the review's shape one unit short of a clean
+    // run keeps every removed wrapper of the full run.
+    let mut bf = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    let full_parsed = build_units(line, &FoldRules::REV4, &mut bf).unwrap();
+    for units in 0..charged(&bf) {
+        let Ok(p) = build_units(
+            line,
+            &FoldRules::REV4,
+            &mut ComputeBudget::new(units, BIG_ALLOC),
+        ) else {
+            continue;
+        };
+        for (u, f) in p.units.iter().zip(&full_parsed.units) {
+            let n = u.removed_wrappers.len();
+            assert_eq!(
+                u.removed_wrappers[..],
+                f.removed_wrappers[..n],
+                "units={units}"
+            );
+        }
+    }
+}
