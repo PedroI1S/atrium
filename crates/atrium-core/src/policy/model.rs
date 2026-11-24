@@ -1025,6 +1025,37 @@ impl FoldRules {
     };
 }
 
+/// Which targets a gap in the identity collection can affect (§2, §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GapScope {
+    /// Only a multiply-linked regular file (a hard link) can be another name
+    /// for a member whose identity was not collected.
+    HardLinks,
+    /// A multiply-linked file, or any target whose identities include this
+    /// directory's: a path spelled through it. Resolution keeps the identity
+    /// of every directory that held a link it followed, so a path spelled
+    /// through the directory carries its identity even after the link leaves
+    /// it.
+    Through(FileIdentity),
+    /// Any target. Used when the builder could not establish a protected
+    /// entry at all (a filesystem cap, an unreadable folder on its path), and
+    /// for the `~/.ssh` walk, whose linked folders protect files anywhere by
+    /// name.
+    AnyTarget,
+}
+
+/// One reason the builder could not establish every protected identity
+/// (a walk that stopped at a cap, an unreadable folder, a filesystem cap).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdentityGap {
+    pub(crate) reason: UnreadReason,
+    pub(crate) scope: GapScope,
+    /// `true` when the gap is in a write-only collection (`~/.ssh/config`,
+    /// `~/.ssh/authorized_keys`, Atrium's protected paths): it affects only
+    /// targets whose access is not Read.
+    pub(crate) write_only: bool,
+}
+
 /// Immutable sensitive/protected path configuration for one check, passed as a
 /// parameter to P2/P3/P5 rather than imported ad hoc (contract §5, §13).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1049,6 +1080,12 @@ pub(crate) struct ProtectedSet {
     /// Checked only when the target's access is not `AccessMode::Read`
     /// (contract §5, D-142).
     pub(crate) write_only_hard_deny_identities: Vec<(FileIdentity, &'static str)>,
+    /// Reasons the builder could not establish every protected identity (a
+    /// walk that stopped at its cap, an unreadable folder, a filesystem cap).
+    /// A target a gap can affect (see [`GapScope`]) that is not already a hit
+    /// is Unread with the gap's reason; a `write_only` gap affects only
+    /// targets whose access is not `AccessMode::Read` (contract §2, §5, D-144).
+    pub(crate) identity_gaps: Vec<IdentityGap>,
     /// Identities `(dev, ino)` of existing credential stores that ask (CR-12,
     /// CR-17), mapped to their store family name.
     pub(crate) store_identities: Vec<(FileIdentity, &'static str)>,
@@ -1483,6 +1520,27 @@ mod tests {
         let rw_id = FileIdentity { dev: 1, ino: 100 };
         let ssh_config_id = FileIdentity { dev: 1, ino: 200 };
         let atrium_cfg_id = FileIdentity { dev: 1, ino: 201 };
+        let dir_id = FileIdentity { dev: 1, ino: 300 };
+
+        let gaps = vec![
+            IdentityGap {
+                reason: UnreadReason::WalkCapReached(FsCap::EntriesRead),
+                scope: GapScope::HardLinks,
+                write_only: false,
+            },
+            IdentityGap {
+                reason: UnreadReason::UnresolvablePath {
+                    path: b"/Users/alice/.gnupg".to_vec(),
+                },
+                scope: GapScope::Through(dir_id),
+                write_only: true,
+            },
+            IdentityGap {
+                reason: UnreadReason::WalkCapReached(FsCap::DirOpens),
+                scope: GapScope::AnyTarget,
+                write_only: false,
+            },
+        ];
 
         let protected = ProtectedSet {
             home: b"/Users/alice".to_vec(),
@@ -1494,6 +1552,7 @@ mod tests {
                 (ssh_config_id, "credential-read"),
                 (atrium_cfg_id, "atrium-self"),
             ],
+            identity_gaps: gaps.clone(),
             store_identities: Vec::new(),
             ssh_linked_dirs: Vec::new(),
             folds: FoldRules::REV4,
@@ -1514,6 +1573,7 @@ mod tests {
             protected.hard_deny_identities,
             protected.write_only_hard_deny_identities
         );
+        assert_eq!(protected.identity_gaps, gaps);
 
         for &(_, id) in protected
             .hard_deny_identities
