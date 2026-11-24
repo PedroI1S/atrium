@@ -1038,3 +1038,13 @@ D-141 removed flag arities from these rows precisely to avoid this.
 - **This includes** item 1 (Unread allows under Any rules and FullAccess after the best-effort pass), item 15 (followed-link searches can be Allow in Home when the link walk finds nothing protected), and the later rulings that narrow or extend the contract within those items: D-141, D-145, D-146, D-147, D-148 and D-156. Each of them only adds Unread or matches `dev`.
 - **CR-20 is closed** (approved).
 - **What it unblocks:** P4 (M1-40), P3's live parts (M1-39: daemon rule validation, `rule-form.ts`, rule validity in Settings) and P5 (M1-41) may merge into `dev` once each one passes its own gate (D-120). **Each merge still needs the driver's explicit go.** This decision doesn't approve any merge by itself.
+
+## D-158 — 2026-11-24 — Pedro: Gemini 4 Neon takes the heavy work on Pedro's shifts too
+**Decided by Pedro (driver).** D-134's routing now applies to Pedro's shifts as well, replacing his Hydrogen routing (D-064). Gemini 4 Neon through `agy` takes the heavy tasks: writers, escalations and security fixes.
+- **Model ids:** `gemini-4-neon-high` for writers, escalations and security; `gemini-4-neon-xhigh` for the hardest escalations; `gemini-4-neon-medium` for utility work.
+- **Unchanged:**
+  - Reviews stay cross-provider: Codex (GPT-6.1 Sol, `high`, read-only; D-124) for Neon's work.
+  - D-123 (workers only write) and D-120 (the 100% gate).
+  - Work that needs path-like literals the `agy` policy refuses (D-074) still goes to Claude.
+  - Rounds already running with Opus (P2 under D-155, P3 under D-156) stay with Opus.
+- **Before the first Neon run on Pedro's Mac:** `agy` here is 1.5.15, and `scripts/doctor` has only tested 1.5.14. Repeat D-134's hook check (an allowed `cargo --version`, a denied write to `.agents/` and a denied `git push`) in a scratch worktree first.
