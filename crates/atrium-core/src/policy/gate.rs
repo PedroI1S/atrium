@@ -49,7 +49,7 @@ pub struct SessionGateConfig {
     pub provider: Provider,
 }
 
-const MAX_HOPS: u8 = 40;
+pub(super) const MAX_HOPS: u8 = 40;
 
 /// Absolute path with the deepest existing ancestor canonicalized and the
 /// rest appended (dangling symlinks are followed by hand).

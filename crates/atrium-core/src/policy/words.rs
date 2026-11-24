@@ -68,7 +68,7 @@ const MAX_SEQUENCE: usize = 64;
 
 pub type Resolver<'a> = &'a dyn Fn(&str, &Path, &Path) -> PathBuf;
 
-const WRITERS: &[&str] = &[
+pub(super) const WRITERS: &[&str] = &[
     "rm",
     "mv",
     "cp",
@@ -94,7 +94,7 @@ const WRITERS: &[&str] = &[
 
 /// Commands that only read what they are given. For Atrium's protected
 /// paths, anything else counts as a writer.
-const READERS: &[&str] = &[
+pub(super) const READERS: &[&str] = &[
     "cat",
     "head",
     "tail",

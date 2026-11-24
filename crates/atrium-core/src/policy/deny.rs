@@ -16,7 +16,7 @@ use super::shell::{self, Unit, base, is_shell};
 use super::words::{self, CwdState, Role, Use, Walk, lexical_resolve};
 use crate::PolicyInput;
 
-const MAX_BYTES: usize = 128 * 1024;
+pub(super) const MAX_BYTES: usize = 128 * 1024;
 use super::shell::MAX_UNITS;
 
 /// What the engine knows about a call, computed once.
@@ -817,8 +817,8 @@ impl ShellGlob {
 // The checks
 // ---------------------------------------------------------------------------
 
-const DOWNLOADERS: &[&str] = &["curl", "wget", "fetch"];
-const PRIV: &[&str] = &["sudo", "sudoedit", "su", "doas", "pkexec", "run0"];
+pub(super) const DOWNLOADERS: &[&str] = &["curl", "wget", "fetch"];
+pub(super) const PRIV: &[&str] = &["sudo", "sudoedit", "su", "doas", "pkexec", "run0"];
 
 fn is_interpreter(cmd: &str) -> bool {
     let b = base(cmd);
