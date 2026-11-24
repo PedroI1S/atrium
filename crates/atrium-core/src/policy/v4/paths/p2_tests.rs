@@ -5805,10 +5805,13 @@ fn round8_f2_alias_table_cut_short_by_a_cap_is_unread() {
 
 #[test]
 fn round8_f3_alias_spelling_gets_the_unlisted_equivalence_check() {
-    // Review 6, finding 3: `~/.config/google-chrome -> /tmp/profile`; the
-    // alias spelling of `/tmp/profile/log\u{0131}ns.json` matches the
-    // protected `logins.json` only under an unlisted case fold (dotless i):
-    // Unread (§5, §11 item 13), not Clear.
+    // Review 6, finding 3 (as corrected by review 7):
+    // `~/.config/google-chrome -> /tmp/profile`. Unicode default case folding
+    // keeps dotless `\u{0131}` distinct from `i`, so the alias spelling of
+    // `/tmp/profile/log\u{0131}ns.json` is not `logins.json`. The extended
+    // check treats `\u{0131}` as an unlisted fold that may reach ASCII and
+    // asks: Unread is the conservative answer under §11 item 13 (not a
+    // claim of Unicode conformance), never Clear.
     let mut fs = FakeFs::new();
     fs.add_file("/tmp/profile/log\u{0131}ns.json".as_bytes());
     fs.mkdir_all(b"/h/u/.config");
@@ -5879,8 +5882,8 @@ fn round8_f4_msal_folder_is_not_a_wholesale_store_root() {
 #[test]
 fn round8_f5_alias_rewrite_charges_the_copied_spelling() {
     // Review 6, finding 5: an Atrium data path spelled with 3,000 bytes is a
-    // link to `/s`. Rewriting `/s/x` copies the long spelling, so a budget
-    // that covers only the scan by the short canonical path runs out.
+    // link to `/s`. Rewriting `/s/x` copies the long spelling, so a compute
+    // budget of 3,000 (ample for scanning the two short ancestors) runs out.
     let mut fs = FakeFs::new();
     fs.mkdir_all(b"/s");
     fs.mkdir_all(b"/h/u");
@@ -5889,22 +5892,251 @@ fn round8_f5_alias_rewrite_charges_the_copied_spelling() {
     fs.add_symlink(&long, b"/s");
     let prot = build_with(&fs, &[&long], &[]);
     let mut aliases = RootAliases::default();
-    let roots = aliases
+    let mut caps = FsCaps::with_default_limits();
+    aliases
         .roots(
             &prot,
             &fs,
-            &mut FsCaps::with_default_limits(),
+            &mut caps,
             &mut ComputeBudget::with_default_limits(),
         )
         .unwrap();
     let canonical = b"/s/x";
-    let scan = roots.len() as u64 * (canonical.len() as u64 + 1);
-    let mut short = ComputeBudget::new(scan + 100, usize::MAX);
-    let err = RootAliases::rewrite(roots, canonical, &mut short).unwrap_err();
+    let mut short = ComputeBudget::new(3000, usize::MAX);
+    let err = match aliases.scan(canonical, &prot, &fs, &mut caps, &mut short) {
+        Err(e) => e,
+        Ok(_) => panic!("the copied spelling must be charged"),
+    };
     assert_eq!(err.reason, ExhaustReason::ComputeBudget);
-    let mut enough = ComputeBudget::new(scan + 4000, usize::MAX);
-    let alias = RootAliases::rewrite(roots, canonical, &mut enough)
-        .unwrap()
-        .expect("`/s/x` lies below the linked data path");
+    let scan = aliases
+        .scan(
+            canonical,
+            &prot,
+            &fs,
+            &mut caps,
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    let alias = scan.alias.expect("`/s/x` lies below the linked data path");
     assert_eq!(alias.len(), long.len() + 2);
+    assert!(scan.unread.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 11. Rework Round 9 regressions (review round 7, D-154)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round9_f1_protected_root_under_another_name_is_found_by_identity() {
+    // Review 7, finding 1: an empty `~/.config/google-chrome` also named
+    // `/tmp/profile` (a bind mount: same device and inode, its own canonical
+    // spelling). `dev`'s `alias_fix` compares ancestor identities, so
+    // `/tmp/profile/Cookies` is `~/.config/google-chrome/Cookies`: a hit.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/h/u/.config/google-chrome");
+    fs.bind_dir(b"/h/u/.config/google-chrome", b"/tmp/profile");
+    let prot = default_build(&fs);
+    let r = subject("/tmp/profile/Cookies", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_hard_deny(&r.outcomes, "credential-read"),
+        "{:?}",
+        r.outcomes
+    );
+    // An ordinary file below the other name stays Clear.
+    let notes = subject("/tmp/profile/notes.txt", AccessMode::Read, &prot, &fs);
+    assert!(all_clear(&notes.outcomes), "{:?}", notes.outcomes);
+
+    // The same for `~/.ssh` with a second name: a key read through it.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    fs.bind_dir(b"/h/u/.ssh", b"/mnt/keys");
+    let prot = default_build(&fs);
+    let r = subject("/mnt/keys/id_rsa", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_hard_deny(&r.outcomes, "credential-read"),
+        "{:?}",
+        r.outcomes
+    );
+}
+
+#[test]
+fn round9_f2_filter_probes_see_the_protected_root_alias() {
+    // Review 7, finding 2, first case: `~/.azure -> /tmp/cache` (empty).
+    // The probes of `msal*` under `/tmp/cache` run on its alias `~/.azure`
+    // too: the MSAL store probe is a Store hit (§5).
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/tmp/cache");
+    fs.add_symlink(b"/h/u/.azure", b"/tmp/cache");
+    let prot = default_build(&fs);
+    let res = resolve_subject_paths(
+        &["/tmp/cache".to_string()],
+        Some("msal*"),
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_store_hit(&res.outcomes), "{:?}", res.outcomes);
+
+    // Second case: a recursive search rooted at `~/other`, where both
+    // `~/other` and `~/.config/google-chrome` lead to the empty
+    // `/tmp/profile`, filtered to `Cookies`: the written spelling comes
+    // first, and the browser probe still runs on the alias.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/tmp/profile");
+    fs.mkdir_all(b"/h/u/.config");
+    fs.add_symlink(b"/h/u/other", b"/tmp/profile");
+    fs.add_symlink(b"/h/u/.config/google-chrome", b"/tmp/profile");
+    let prot = default_build(&fs);
+    let res = resolve_subject_paths(
+        &["~/other".to_string()],
+        Some("Cookies"),
+        true,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&res.outcomes, "credential-read"),
+        "{:?}",
+        res.outcomes
+    );
+}
+
+#[test]
+fn round9_f3_alias_found_with_an_incomplete_table_keeps_its_reason() {
+    // Review 7, finding 3: `~/.ssh -> /tmp/keys`; reading the public
+    // `/tmp/keys/config` when the canonicalization cap runs out on later
+    // protected roots (`~/.aws/credentials`, `~/.gnupg` exist). The alias
+    // `~/.ssh/config` is found by identity but is no hit, so the table's
+    // cap stays Unread (§8), never Clear.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/keys/config");
+    fs.add_symlink(b"/h/u/.ssh", b"/tmp/keys");
+    fs.add_file(b"/h/u/.aws/credentials");
+    fs.mkdir_all(b"/h/u/.gnupg");
+    let prot = default_build(&fs);
+    let res = resolve_subject_paths(
+        &["/tmp/keys/config".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::new(1000, 1000, 1000, 1000, 1),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(!all_clear(&res.outcomes), "{:?}", res.outcomes);
+    assert!(
+        has_unread(&res.outcomes, |r| matches!(
+            r,
+            UnreadReason::WalkCapReached(FsCap::Canonicalizations)
+        )),
+        "{:?}",
+        res.outcomes
+    );
+
+    // Beside a Store hit: `~/.cargo -> /tmp/cargo`, reading
+    // `/tmp/cargo/credentials` (alias `~/.cargo/credentials`, a store).
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/cargo/credentials");
+    fs.add_symlink(b"/h/u/.cargo", b"/tmp/cargo");
+    fs.add_file(b"/h/u/.aws/credentials");
+    fs.mkdir_all(b"/h/u/.gnupg");
+    let prot = default_build(&fs);
+    let res = resolve_subject_paths(
+        &["/tmp/cargo/credentials".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::new(1000, 1000, 1000, 1000, 1),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_store_hit(&res.outcomes), "{:?}", res.outcomes);
+    assert!(
+        has_unread(&res.outcomes, |r| matches!(
+            r,
+            UnreadReason::WalkCapReached(FsCap::Canonicalizations)
+        )),
+        "{:?}",
+        res.outcomes
+    );
+}
+
+#[test]
+fn round9_alias_spelling_gets_an_independent_unlisted_equivalence() {
+    // Review 7's correction to round 6, finding 3: an alias case decided by
+    // a documented unlisted equivalence. `Cook\u{200B}ies` holds a zero-width
+    // space (a default-ignorable code point, removed by the extended check),
+    // so below `~/.config/google-chrome -> /tmp/profile` it may name
+    // `Cookies`: Unread (§11 item 13), never Clear.
+    let mut fs = FakeFs::new();
+    fs.add_file("/tmp/profile/Cook\u{200B}ies".as_bytes());
+    fs.mkdir_all(b"/h/u/.config");
+    fs.add_symlink(b"/h/u/.config/google-chrome", b"/tmp/profile");
+    let prot = default_build(&fs);
+    let res = subject("/tmp/profile/Cook\u{200B}ies", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_unread(&res.outcomes, |r| matches!(
+            r,
+            UnreadReason::UnlistedNameEquivalence { .. }
+        )),
+        "{:?}",
+        res.outcomes
+    );
+}
+
+#[test]
+fn round9_f4_glob_spelling_and_matches_are_charged() {
+    // Review 7, finding 4: relative `*` in `/h/u/proj` with one ordinary
+    // match `a`. The relative spelling is built without an intermediate list
+    // and every match's slot is charged, so under every allocation budget
+    // the expansion either completes with its one match or reports the
+    // allocation budget, and once it completes it completes for every larger
+    // budget.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/proj/a");
+    let mut completed_at = None;
+    for n in 0..20_000usize {
+        let mut budget = ComputeBudget::new(u64::MAX, n);
+        let res = expand_shell_glob(
+            &unquoted(b"*"),
+            b"/h/u/proj",
+            HOME,
+            PartId::Operand {
+                unit: UnitIndex(0),
+                argv_index: 1,
+            },
+            AccessMode::Read,
+            &fs,
+            &mut FsCaps::with_default_limits(),
+            &mut budget,
+        );
+        match res {
+            Ok(exp) if budget.charge(0).is_ok() => {
+                assert_eq!(exp.exact_matches.len(), 1, "{n}");
+                assert_eq!(
+                    exp.exact_matches[0].written.as_deref(),
+                    Some(&b"/h/u/proj/a"[..])
+                );
+                completed_at.get_or_insert(n);
+            }
+            Ok(_) => assert!(completed_at.is_none(), "{n}"),
+            Err(e) => {
+                assert_eq!(e.reason, ExhaustReason::AllocationBudget, "{n}");
+                assert!(completed_at.is_none(), "lost completion at {n}");
+            }
+        }
+    }
+    assert!(completed_at.is_some());
 }
