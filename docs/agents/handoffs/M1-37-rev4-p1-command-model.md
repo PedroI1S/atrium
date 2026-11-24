@@ -306,3 +306,92 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core policy::v4:: -- --nocapture
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 5 (Opus 5.5, D-143)
+
+Escalated rework for the three open majors of `.orchestration/review-input/review-round3.md`. All three are one class: work or allocation done before, or without, a charge. The fix is a budget discipline applied to every function in P1's files, written down in `v4/lex.rs`'s module docs:
+
+1. **Charge, then work.** Every scan or copy of input-derived bytes charges one unit per byte before it runs. Every lookup in P0's tables charges its row scan before it runs (`lookup_tool`, `lookup_outside`, `flag_charged`, `flag_short_charged`; costs come from per-length row counts computed at compile time from P0's tables). Every comparison of two input-derived strings charges the bytes it may compare (`bytes_eq`, `readings_eq`). Comparisons against compile-time constants are bounded by the constant and ride on the step's charge.
+2. **Charge, then allocate.** Every `Vec`/`String` growth charges its new capacity and the copy of the old elements before reserving.
+3. **Reserve, then discover.** A value's storage (argv slot, redirect slot, reason slot, the pending unit's output slot, the slot that records the final `Exhausted`) is reserved and charged before the work that produces the value. Storing a finished value is then infallible (`push_reserved`, debug-asserted), so exhaustion never drops anything found earlier, and recovery after exhaustion allocates nothing. A word cut off by exhaustion is dropped whole, never kept truncated: a truncated `~/.ssh/id_rsa.pub` would read `~/.ssh/id_rsa`, and exhaustion must never create a hit (§8).
+
+### The three findings
+
+1. **Finding 1 (completed word lost on allocation exhaustion).**
+   - **Fix:** the exact lexer writes through an `ExactSink`. Before a word is scanned, `reserve_word_storage` reserves the pending unit's output slot, the word's argv slot and, in command position, a *held* reason slot plus its unit of work for the `Assignment` / reserved-word reason. Before a redirect target is read, `lex_exact_redirect` reserves the redirect slot, two held reason slots, their work and the longest reason string (16 bytes). Reasons recorded while the word is scanned reserve beyond the held slots (`ReasonSink::hold` / `push_held`), so `FOO=$x` cannot use up the slot its `Assignment` needs. The keyword check after a command word charges its reason string first. `lex_exact` reserves the `Exhausted` slot on entry. If even that fails it returns `Err(PartOutcome::Exhausted)` before lexing anything. The best-effort builder reserves its word's slot (argv, redirect or here-string) before scanning it, reserves the assignment slot at the `=` while still scanning, and pays in advance (byte by byte) for the copy that the effective reading or recovery makes later. The assignment name/value split uses that advance payment.
+   - **Tests:** `r5_f1_completed_word_or_redirect_is_never_dropped` (the review's case `lex_exact("sudo", …, ComputeBudget::new(1000, 16))`; the same shape one step later, where `sudo` is scanned and a later 4-byte allocation fails and the word is kept; redirect targets, assignments and best-effort redirects/assignments one unit short). The class sweeps below.
+2. **Finding 2 (uncharged scans in exact wrapper validation).**
+   - **Fix:** `is_signed_integer`, `is_timeout_signal`, `is_timeout_duration` are single passes charged by length (`bytes_with_glob` fuses the glob check). `parse_wrapper_prefix` charges the `env` operand's `=` scan, the UTF-8 checks (`word_as_str`) and flag lookups. The unwrap loop charges the command-word glob scan and the table lookups. `classify_nested_shell` charges glob and UTF-8 scans, each flag letter's lookup and the script copy. `command_modifies_home` charges each argument (one fused pass for `env`), and `unit_uses_unquoted_tilde` charges its walk. Wrapper words are moved out with one charged argv shift, not one per wrapper.
+   - **Tests:** `r5_f2_wrapper_operand_scans_are_charged` (the review's case: `nice -n` + 60,000 zeros, `unwrap_unit` with `ComputeBudget::new(100, 10_000)` is `Exhausted`, and a large budget is charged ≥ 60,000. Then a table of every variable-length operand form, each charged at least its operand's length and exhausting at half of it. The argv shift is charged and linear.) `r5_f2_nested_shell_and_home_scans_are_charged`.
+3. **Finding 3 (uncharged quadratic payload deduplication).**
+   - **Fix:** `PayloadSet`, an open-addressing index of FNV-1a hashes kept at most half full. Hashing charges one unit per byte, each probe one unit, a comparison on equal hashes the bytes it compares, and the table its capacity, all before the work. Expected cost is O(n + L); colliding inputs only cost more charged probes. It replaces every payload `.contains` (unit payloads, `find -exec` payloads, process-substitution payloads). Alternative readings (at most 8) use charged comparisons (`readings_eq`, `has_reading`).
+   - **Tests:** `r5_f3_payload_dedup_is_linear_and_charged` (255 and 510 distinct payloads with a 500-byte common prefix: linear bound and doubling ratio; 255 duplicates charge a hash and a full comparison each; a half budget exhausts; the review's exact 130,817-byte line runs through `lex_best_effort` and derives all 255 `echo` units).
+
+### Class tests (catch work done without a charge, not only charge growth)
+- `r5_class_exact_lexer_below_cost_keeps_only_finished_values`: 14 lines (assignments, quoted/non-ASCII values, every redirect form, reserved words, groups, pipelines, redirect-only, here-docs). For **every** compute and allocation budget below the measured cost: `Exhausted`, only whole words and redirects of the full run kept, in order, and every unit outcome points at a kept unit. One unit below the compute cost keeps everything.
+- `r5_class_best_effort_below_cost_keeps_only_finished_values`: the same over every budget below the smallest clean one, for here-strings, here-docs into `sh`, `echo | sh`, `-c`, wrappers and `find -exec`.
+- `r5_class_build_units_below_cost_keeps_only_finished_values`: the same for `build_units` (wrappers, `MAX_WRAP`, HOME, nested `-c`, outside shells).
+- Every store into reserved capacity is `debug_assert`ed (`push_reserved`, `push_held`), so these sweeps fail if any path stores without a reservation.
+- `r5_neighbours_lookups_comparisons_folds_and_memo_are_charged`: lower bounds for table lookups, the three fold passes, here-doc delimiter comparisons, the memo lookup and linear Scan 8.
+
+### The audit, by function
+
+**`v4/lex.rs`**
+- New charged primitives: `lookup_tool`, `lookup_outside`, `flag_charged`, `flag_short_charged`, `bytes_eq`, `word_has_unquoted_glob`, `word_as_str`, `push_reserved`. `is_reserved_word` is charged.
+- `ExactSink` (`OutputSink` for `lex_exact`, `UnitsSink` in `units.rs`), `ReasonSink` (pending reasons, held slots, outcome-slot invariant `pending + held + 1`), `CoreStop`.
+- `WordBuilder` tracks unquoted-glob and all-unquoted flags while building, and `read_word` tracks the digit value. So `lex_exact_redirect` no longer rescans a target (`has_unquoted_glob`, `is_all_unquoted`, `parse_u32_digits` were uncharged second passes; `parse_u32_digits` is removed).
+- `read_standalone` charges the reason string before consuming `{ } ! [[`. The heredoc delimiter's slot is reserved before its scan.
+- `skip_heredocs`: tab stripping and delimiter comparisons are charged.
+- `flush_unit` (now a function) charges everything before moving the pending unit. Recovery in `lex_exact_core` allocates nothing. It no longer guesses the redirect-only reason for a unit cut off mid-way.
+- `fold_command_bytes`: each pass is charged: basename search, ASCII check, copy; on the Unicode path, sizing at 4 units/byte, `to_lowercase` and the rewrite. Before, the ASCII check and the Unicode sizing pass were uncharged.
+- `vec_extend_budgeted` charges the moves.
+
+**`v4/units.rs`**
+- `process_text_recursive` lexes straight into `ParsedCommandUnits` through `UnitsSink`. The old copy of every raw unit into `parsed.units` (and its uncharged recovery pushes `flush_remaining_raw`) is gone. Units are classified in place by `process_unit`, which reserves its fixed reason slots plus the `Exhausted` spare before any work.
+- `build_units_with_hook` reserves the `Exhausted` slot on entry, and returns `Err(PartOutcome::Exhausted)` only if that fails.
+- `unwrap_in_place` / `unwrap_unit`: charged glob scan, fold, lookups, and one charged shift. On exhaustion the unit keeps its full argv, and any wrapper reason already found is still recorded.
+- Validators, `classify_nested_shell`, `command_modifies_home`, `unit_uses_unquoted_tilde`: charged as listed under finding 2.
+- Neighbouring bug fixed: a nested script's whole-text outcomes now go to the parent `-c` unit. Before, the lexer emitted `Unit(parent)` and the remapping read it as a local index, which could point at the wrong unit.
+
+**`v4/lex/best_effort.rs`**
+- `lex_best_effort_into`: the texts walk is charged. The memo lookup charges a fixed worst case (`LEX_MEMO × (1 + len)`) so cold and warm runs charge the same. Memo entries store their copy size, so hits no longer walk units uncharged. Memo insertion sizes its copy only when affordable (`estimate_units_bytes_if_affordable`), and charges the memo's own growth.
+- The per-call `HashMap` recursion cache is **removed**: its hashing, probing and table growth were uncharged. Re-lexing a repeated payload is charged and gives the same units with fresh `PipelineId`s.
+- `lex_one_text`: recovery slots are kept (`reserve_recovery_slots`: one `raw_units` slot for the pending builder, one `record.units` slot per unconverted builder). Words are reserved and paid in advance (`WordBuf`). The `>&N` digit check is incremental. Here-doc delimiter comparisons and tab stripping are charged. Conversion recovery stores the readings already computed (`push_converted`). `find -exec` derivation keeps the record slots of builders not yet converted (`keep`). Scan 8 groups each pipeline's run once; it was a nested loop over all pipeline units, an uncharged quadratic walk.
+- `unwrap_best_effort` takes an owned argv: one charged final shift (it used uncharged `remove(0)` / `drain` per step). The basename scan is charged, alternative readings are reserved and compared with charges, and on exhaustion it hands the argv back.
+- `resolve_cmd_sub_readings`, `substituted_program_budgeted`, `wrapper_skip_be`, `extract_code_payloads`, `extract_env_payloads`, `extract_echo_printf_texts`, `crontab_commands_budgeted`: every `contains`, `bytes().all`, `filter().count`, `trim`, `split_once` and `split_whitespace` is charged by the bytes it scans.
+- `is_be_shell`, `is_be_reserved`, `is_be_code_runner`: charged lookups.
+- Brace expansion: one fused `{`/`$` scan, charged second walks over the char vectors, and `padded_number` (exactly sized and charged) instead of `format!`, whose capacity is not exact.
+- Moves of elements that are already stored (draining pending reasons or payload lists) are one step per element, each element charged at least one unit when it was created.
+
+### Test expectations changed (each against the contract, not the code)
+- `exhaustion_at_flush_preserves_pending_unit_words_and_reasons`, `lex_exact_word_buffer_capacity_and_realloc_copy_are_budgeted`, the tight budgets in `budgets_exhaustion_preserves_early_units_and_never_allows_padded_lines` and in `build_units_and_unwrap_unit_budget_exhaustion_and_linearity`: budgets are now derived from measured runs, not hard-coded totals. Same assertions about what is kept (§8).
+- `lex_exact("cat README.md", …, new(100_000, 16))` is now `Err(Exhausted(AllocationBudget))` on entry. A later allocation failure is checked separately.
+- `linear_charge_growth_from_10kb_to_max_bytes`: under default limits the adversarial line must be `Exhausted`; which budget runs out first is not in the contract (§8), so either reason is accepted.
+- `brace_expand_budgeted_carries_m1_31_n11_guarantees`: the linear bound for nested braces is 12 units/byte, not 8, because the second walks are now charged (about 9 units/byte, listed in the test).
+- `build_units_code_runner_hook_attaches_p3_reasons`: uses the new hook signature.
+
+### Notes for P3 and P5
+- **`CodeRunnerHook` (P1's own API) changed:** the hook now receives `&mut UnitReasonSink` and records reasons through it (`reserve`, then `push`) instead of returning a `Vec`. That way a reason the hook builds is never lost when the move into the outcomes would fail.
+- `lex_exact` and `build_units` return `Err(PartOutcome::Exhausted)` only when the budget is spent on entry (nothing found). Otherwise exhaustion is an outcome, as before.
+
+### Change requests
+- **CR (low, P0 interface): `unwrap_unit` cannot hand back the unit on exhaustion.** Its frozen signature `unwrap_unit(raw: RawCommandUnit, …) -> Result<UnwrapResult, Exhausted>` takes the unit by value, so on `Exhausted` the caller loses it. Failing case: `unwrap_unit(raw, …, ComputeBudget::new(2, 10_000))` returns `Err` and `raw` is gone. P1 works around it: `build_units` unwraps in place and loses nothing. Proposed change: return `Result<UnwrapResult, (CommandUnit, Exhausted)>`, or take `&mut CommandUnit`. Not made (frozen).
+- None other. `ComputeBudget`, `model.rs`, `limits.rs` and `tools.rs` are untouched. D-144's new `ProtectedSet` field does not affect P1.
+
+### Round 5 verification
+Run by the worker (D-123):
+- `cargo fmt --all`: clean
+- `cargo check -p atrium-core --tests`: clean
+- `cargo clippy -p atrium-core --tests -- -D warnings`: clean
+
+Not run (D-123): any test. The new sweeps run lexing a few thousand times per line on short inputs. Run them in debug, because the reservation checks are `debug_assert`s.
+
+Commands for the orchestrator's verification task (fish-compatible):
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4:: -- --nocapture
+cargo test --workspace --no-fail-fast
+```
