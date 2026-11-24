@@ -21,8 +21,8 @@ use crate::policy::tools::{
 
 use super::tools::{
     SedParseOutcome, charge_str_clone, fold_command_str_pure, git_subcommand_has_flag_trigger_pure,
-    inspect_sed_script, vec_push_budgeted, vec_with_exact_budgeted,
-    word_has_unquoted_glob_budgeted,
+    has_competing_awk_code_flags_pure, has_competing_sed_flags_pure, inspect_sed_script,
+    vec_push_budgeted, vec_with_exact_budgeted, word_has_unquoted_glob_budgeted,
 };
 
 #[cfg(test)]
@@ -232,7 +232,7 @@ fn validate_code_runner_prefix(
                 && pin.flags.contains(&argv[1].as_str())
                 && !argv[2].is_empty()
                 && argv[2] != "-"
-                && !has_competing_program_flags_pure(&argv[3..], pin.flags)
+                && !has_competing_awk_code_flags_pure(&argv[3..], pin.flags)
             {
                 Ok(())
             } else {
@@ -253,23 +253,6 @@ fn validate_code_runner_prefix(
             }
         }
     }
-}
-
-fn has_competing_program_flags_pure(rest: &[String], pin_flags: &[&str]) -> bool {
-    for tok in rest {
-        if tok == "--" {
-            break;
-        }
-        if !tok.starts_with('-') || tok == "-" {
-            continue;
-        }
-        if tools::is_forbidden_flag(pin_flags, tok)
-            || tools::is_forbidden_flag(&["-e", "--source", "--eval", "--expression"], tok)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn validate_conditional_runner_prefix(
@@ -312,13 +295,14 @@ fn validate_conditional_runner_prefix(
                         });
                     }
                 }
-                RunnerTrigger::SubcommandWithFlag { subcommand, flag } if sub == subcommand => {
-                    if git_subcommand_has_flag_trigger_pure(subcommand, rest, flag) {
-                        return Err(RuleValidationError::UnpinnedCodeRunner {
-                            tool: format!("{} {subcommand}", spec.name),
-                            required_pin: "a form without code-running flags",
-                        });
-                    }
+                RunnerTrigger::SubcommandWithFlag { subcommand, flag }
+                    if sub == subcommand
+                        && git_subcommand_has_flag_trigger_pure(subcommand, rest, flag) =>
+                {
+                    return Err(RuleValidationError::UnpinnedCodeRunner {
+                        tool: format!("{} {subcommand}", spec.name),
+                        required_pin: "a form without code-running flags",
+                    });
                 }
                 _ => {}
             }
@@ -343,7 +327,7 @@ fn validate_conditional_runner_prefix(
             if argv.len() >= 3
                 && !argv[2].is_empty()
                 && argv[2] != "-"
-                && !has_competing_program_flags_pure(&argv[3..], pin_flags)
+                && !has_competing_sed_flags_pure(&argv[3..])
             {
                 return Ok(());
             }

@@ -174,18 +174,29 @@ describe("rules editor: rev 4 §7 & D-141 parity with core", () => {
       "sh x.sh", "bash scripts/build.sh", "dash run.sh",
       "source env.sh", ". ./env.sh",
       "python3 scripts/build.py", "python build.py", "node build.js", "perl run.pl", "ruby app.rb", "npx prettier",
-      "awk -f prog.awk", "sed -f edit.sed", "pipx run ruff",
+      "awk -f prog.awk", "awk -f prog.awk -vfoo=1", "awk -f prog.awk -Fsep", "awk -f prog.awk -F -e",
+      "sed -f edit.sed", "sed -f edit.sed -i.ref", "sed -f edit.sed -l80",
+      "pipx run ruff",
     ]) {
       const v = validateRule(form({ command: ok }), ctx);
       expect(v.ok && v.warnings.length, ok).toBe(1);
     }
     for (const clean of [
       "cargo test", "git status", "git diff", "git bisect start", "git submodule status",
+      "git rebase -Xcontext", "git rebase -S0x1234", "git difftool -txxdiff", "git mergetool -txxdiff",
+      "git diff -S --ext-diff", "git push -o --exec",
       "sed 's/error/warn/g'", "sed z", "sed F", "sed '1q 0'", "sed 'l 80'",
     ]) {
       const split = splitCommand(clean);
       expect(split.ok, clean).toBe(true);
       expect(commandRisk(split.ok ? split.argv : []), clean).toBeNull();
+    }
+    for (const bad of [
+      "git rebase -xid", "git rebase -ix id", "git difftool -xid", "git difftool -yx id", "git mergetool -xid",
+      "awk -f prog.awk -nf other.awk", "awk -f prog.awk -ne '{print}'",
+      "sed -f edit.sed -nf other.sed", "sed -f edit.sed -ne p", "sed -f edit.sed -i", "sed -f edit.sed -l",
+    ]) {
+      expect(refused(bad), bad).toBe(true);
     }
   });
 

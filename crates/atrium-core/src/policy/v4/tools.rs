@@ -358,6 +358,20 @@ fn is_forbidden_flag_budgeted(
     Ok(tools::is_forbidden_flag(forbidden, token))
 }
 
+fn short_flag_is_forbidden_budgeted(
+    forbidden: &[&str],
+    short: char,
+    budget: &mut ComputeBudget,
+) -> Result<bool, Exhausted> {
+    if forbidden.is_empty() {
+        return Ok(false);
+    }
+    budget.charge(forbidden.len() as u64)?;
+    Ok(forbidden
+        .iter()
+        .any(|&f| f.len() == 2 && !f.starts_with("--") && f.chars().nth(1) == Some(short)))
+}
+
 // ---------------------------------------------------------------------------
 // Public P3 entry point 1: `classify_unit` (§6, §8)
 // ---------------------------------------------------------------------------
@@ -757,13 +771,12 @@ fn classify_search(
             continue;
         };
 
-        if let Some(home) = row.home_readonly
-            && is_forbidden_flag_budgeted(home.forbidden, tok, budget)?
-        {
-            has_forbidden_home_flag = true;
-        }
-
         if let Some(rest) = tok.strip_prefix("--") {
+            if let Some(home) = row.home_readonly
+                && is_forbidden_flag_budgeted(home.forbidden, tok, budget)?
+            {
+                has_forbidden_home_flag = true;
+            }
             budget.charge(rest.len().max(1) as u64)?;
             let (name, eq_pos) = match rest.find('=') {
                 Some(pos) => (&rest[..pos], Some(2 + pos)),
@@ -881,6 +894,15 @@ fn classify_search(
             let mut consumed_next = false;
             let mut attached_path = false;
             for (byte_off, ch) in tok[1..].char_indices() {
+                // Check Home forbidden short flags per actual option letter BEFORE
+                // breaking on a value-taking flag so attached option values
+                // (e.g. `rg -efoo src`, `rg -g*.pdf src`, `grep -efoo README.md`)
+                // are never scanned as short option letters.
+                if let Some(home) = row.home_readonly
+                    && short_flag_is_forbidden_budgeted(home.forbidden, ch, budget)?
+                {
+                    has_forbidden_home_flag = true;
+                }
                 let Some(fspec) = flag_short_budgeted(row.flags, ch, budget)? else {
                     saw_unknown_flag = true;
                     cluster_ok = false;
@@ -1295,15 +1317,27 @@ fn classify_code_runner_leaf(
                 if !tok.starts_with('-') || tok == "-" {
                     break;
                 }
-                if let Some(attached) = match_inline_flag(tok, inline_flags, budget)? {
-                    if attached {
+                match parse_interpreter_opt(tool_name, tok, inline_flags, budget)? {
+                    InterpOpt::InlineCode { attached: true } => {
                         vec_push_budgeted(&mut code_operands, i, budget)?;
-                    } else if i + 1 < unit.argv.len() {
-                        vec_push_budgeted(&mut code_operands, i + 1, budget)?;
                         i += 1;
                     }
+                    InterpOpt::InlineCode { attached: false } => {
+                        if i + 1 < unit.argv.len() {
+                            vec_push_budgeted(&mut code_operands, i + 1, budget)?;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    InterpOpt::Other { consumes_next } => {
+                        i += if consumes_next && i + 1 < unit.argv.len() {
+                            2
+                        } else {
+                            1
+                        };
+                    }
                 }
-                i += 1;
             }
         }
         InlineCodeSpec::Operand(pos_idx) => {
@@ -1355,11 +1389,63 @@ fn classify_code_runner_leaf(
 /// Returns `Ok(Some(attached))` if `tok` matches one of `inline_flags`
 /// (`-c`, `--eval`, `--eval=X`, `-Ic`, `-cX`), where `attached == true` means
 /// the code is inside `tok` itself rather than in the following argv word.
-fn match_inline_flag(
+enum InterpOpt {
+    InlineCode { attached: bool },
+    Other { consumes_next: bool },
+}
+
+fn interpreter_short_arity(tool_name: &str, ch: char) -> ShortOptArity {
+    match tool_name {
+        "python" | "python3" => match ch {
+            'b' | 'B' | 'd' | 'E' | 'h' | 'i' | 'I' | 'O' | 'P' | 'q' | 's' | 'S' | 'u' | 'v'
+            | 'V' => ShortOptArity::Bool,
+            'W' | 'X' | 'c' | 'm' => ShortOptArity::Value,
+            _ => ShortOptArity::Unknown,
+        },
+        "node" => match ch {
+            'c' | 'h' | 'i' | 'v' => ShortOptArity::Bool,
+            'r' | 'C' | 'e' | 'p' => ShortOptArity::Value,
+            _ => ShortOptArity::Unknown,
+        },
+        "perl" => match ch {
+            'a' | 'c' | 'f' | 'g' | 'h' | 'l' | 'n' | 'p' | 's' | 'S' | 't' | 'T' | 'u' | 'U'
+            | 'v' | 'V' | 'w' | 'W' | 'X' => ShortOptArity::Bool,
+            'I' | 'M' | 'm' | 'F' | 'e' | 'E' => ShortOptArity::Value,
+            'i' | '0' | 'C' | 'd' | 'D' | 'x' => ShortOptArity::OptionalAttachedValue,
+            _ => ShortOptArity::Unknown,
+        },
+        "ruby" => match ch {
+            'a' | 'c' | 'd' | 'h' | 'l' | 'n' | 'p' | 's' | 'S' | 'v' | 'w' | 'y' => {
+                ShortOptArity::Bool
+            }
+            'I' | 'r' | 'E' | 'C' | 'F' | 'K' | 'e' => ShortOptArity::Value,
+            'i' | '0' | 'W' | 'x' => ShortOptArity::OptionalAttachedValue,
+            _ => ShortOptArity::Unknown,
+        },
+        _ => ShortOptArity::Unknown,
+    }
+}
+
+fn interpreter_long_takes_separate_value(tool_name: &str, name: &str) -> bool {
+    match tool_name {
+        "python" | "python3" => matches!(name, "check-hash-based-pycs"),
+        "node" => matches!(
+            name,
+            "require" | "import" | "conditions" | "eval" | "print" | "loader"
+        ),
+        _ => false,
+    }
+}
+
+/// Parses one option token on an interpreter (`python`/`python3`/`node`/`perl`/`ruby`)
+/// without scanning option-value bytes (e.g. `python -Xtracemalloc`, `node -rexpress`,
+/// `perl -Isrc/core`, `ruby -Ilib/ext`) as inline-code flags.
+fn parse_interpreter_opt(
+    tool_name: &str,
     tok: &str,
     inline_flags: &[&str],
     budget: &mut ComputeBudget,
-) -> Result<Option<bool>, Exhausted> {
+) -> Result<InterpOpt, Exhausted> {
     budget.charge((inline_flags.len().max(1) as u64).saturating_mul(tok.len().max(1) as u64))?;
     if let Some(rest) = tok.strip_prefix("--") {
         let (name, has_eq) = match rest.split_once('=') {
@@ -1370,51 +1456,218 @@ fn match_inline_flag(
             if let Some(fl) = f.strip_prefix("--")
                 && name == fl
             {
-                return Ok(Some(has_eq));
+                return Ok(InterpOpt::InlineCode { attached: has_eq });
             }
         }
-        return Ok(None);
+        return Ok(InterpOpt::Other {
+            consumes_next: !has_eq && interpreter_long_takes_separate_value(tool_name, name),
+        });
     }
     if let Some(cluster) = tok.strip_prefix('-')
         && !cluster.is_empty()
     {
         for (byte_off, ch) in cluster.char_indices() {
+            let at_end = byte_off + ch.len_utf8() >= cluster.len();
             for &f in inline_flags {
                 if f.len() == 2 && !f.starts_with("--") && f.chars().nth(1) == Some(ch) {
-                    let attached = byte_off + ch.len_utf8() < cluster.len();
-                    return Ok(Some(attached));
+                    return Ok(InterpOpt::InlineCode { attached: !at_end });
+                }
+            }
+            match interpreter_short_arity(tool_name, ch) {
+                ShortOptArity::Bool => {}
+                ShortOptArity::Value => {
+                    return Ok(InterpOpt::Other {
+                        consumes_next: at_end,
+                    });
+                }
+                ShortOptArity::OptionalAttachedValue | ShortOptArity::Unknown => {
+                    return Ok(InterpOpt::Other {
+                        consumes_next: false,
+                    });
                 }
             }
         }
     }
-    Ok(None)
+    Ok(InterpOpt::Other {
+        consumes_next: false,
+    })
+}
+
+fn awk_opt_step(tok: &str, pin_flags: &[&str]) -> (bool, bool) {
+    if let Some(rest) = tok.strip_prefix("--") {
+        let (name, has_eq) = match rest.split_once('=') {
+            Some((n, _)) => (n, true),
+            None => (rest, false),
+        };
+        if !name.is_empty()
+            && (tools::is_forbidden_flag(pin_flags, tok)
+                || tools::is_forbidden_flag(&["--source", "--eval"], tok))
+        {
+            return (true, false);
+        }
+        let consumes_next = !has_eq && matches!(name, "field-separator" | "assign");
+        return (false, consumes_next);
+    }
+
+    if let Some(cluster) = tok.strip_prefix('-')
+        && !cluster.is_empty()
+    {
+        for (byte_off, ch) in cluster.char_indices() {
+            let at_end = byte_off + ch.len_utf8() >= cluster.len();
+            let is_competing = ch == 'e'
+                || pin_flags
+                    .iter()
+                    .any(|&f| f.len() == 2 && !f.starts_with("--") && f.chars().nth(1) == Some(ch));
+            if is_competing {
+                return (true, false);
+            }
+            match ch {
+                'b' | 'c' | 'C' | 'g' | 'k' | 'M' | 'N' | 'n' | 'O' | 'P' | 'r' | 'S' | 's'
+                | 't' | 'V' => {}
+                'F' | 'v' | 'W' => return (false, at_end),
+                _ => return (false, false),
+            }
+        }
+    }
+    (false, false)
 }
 
 /// Checks whether trailing args after `awk -f PROG` contain another `-f`/`--file`
-/// or inline-code flag (`-e`, `--source`, `--eval`) before `--`.
+/// or inline-code flag (`-e`, `--source`, `--eval`) before `--`, respecting
+/// attached and separate values of `-F`, `-v`, `-W`, `--field-separator`, `--assign`.
 fn has_competing_awk_code_flags(
     rest: &[Word],
     pin_flags: &[&str],
     budget: &mut ComputeBudget,
 ) -> Result<bool, Exhausted> {
-    for w in rest {
-        let Some(tok) = word_as_str_budgeted(w, budget)? else {
+    let mut i = 0usize;
+    while i < rest.len() {
+        let Some(tok) = word_as_str_budgeted(&rest[i], budget)? else {
+            i += 1;
             continue;
         };
         if tok == "--" {
             break;
         }
         if !tok.starts_with('-') || tok == "-" {
+            i += 1;
             continue;
         }
-        if is_forbidden_flag_budgeted(pin_flags, tok, budget)? {
+        budget.charge((pin_flags.len().max(1) as u64).saturating_mul(tok.len().max(1) as u64))?;
+        let (competing, consumes_next) = awk_opt_step(tok, pin_flags);
+        if competing {
             return Ok(true);
         }
-        if is_forbidden_flag_budgeted(&["-e", "--source", "--eval"], tok, budget)? {
-            return Ok(true);
-        }
+        i += if consumes_next { 2 } else { 1 };
     }
     Ok(false)
+}
+
+/// Pure `awk -f` competing-flag check shared with `validate_rule_matcher` (§7).
+pub(super) fn has_competing_awk_code_flags_pure(rest: &[String], pin_flags: &[&str]) -> bool {
+    let mut i = 0usize;
+    while i < rest.len() {
+        let tok = rest[i].as_str();
+        if tok == "--" {
+            break;
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            i += 1;
+            continue;
+        }
+        let (competing, consumes_next) = awk_opt_step(tok, pin_flags);
+        if competing {
+            return true;
+        }
+        i += if consumes_next { 2 } else { 1 };
+    }
+    false
+}
+
+/// Pure `sed -f` competing/unsafe-flag check shared with `validate_rule_matcher` (§7).
+///
+/// Mirrors `classify_sed`: attached `-i.ref` and `-l80` do NOT scan their suffix
+/// as option letters, whereas bare `-i`, bare `-l`, `-f`, `-e`, `--file`,
+/// `--expression`, and unknown flags disable pinning.
+pub(super) fn has_competing_sed_flags_pure(rest: &[String]) -> bool {
+    let mut i = 0usize;
+    while i < rest.len() {
+        let tok = rest[i].as_str();
+        if tok == "--" {
+            break;
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            i += 1;
+            continue;
+        }
+        if let Some(long_rest) = tok.strip_prefix("--") {
+            let (name, has_eq) = match long_rest.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (long_rest, false),
+            };
+            if name.is_empty() {
+                i += 1;
+                continue;
+            }
+            if "file".starts_with(name) || "expression".starts_with(name) {
+                return true;
+            }
+            if name == "in-place" {
+                if !has_eq {
+                    return true;
+                }
+                i += 1;
+                continue;
+            }
+            if name == "line-length" {
+                if !has_eq && i + 1 >= rest.len() {
+                    return true;
+                }
+                i += if has_eq { 1 } else { 2 };
+                continue;
+            }
+            if matches!(
+                name,
+                "quiet"
+                    | "silent"
+                    | "regexp-extended"
+                    | "separate"
+                    | "unbuffered"
+                    | "null-data"
+                    | "posix"
+                    | "sandbox"
+                    | "debug"
+                    | "follow-symlinks"
+            ) {
+                if has_eq {
+                    return true;
+                }
+                i += 1;
+                continue;
+            }
+            return true;
+        }
+        if let Some(cluster) = tok.strip_prefix('-')
+            && !cluster.is_empty()
+        {
+            for (byte_off, ch) in cluster.char_indices() {
+                let at_end = byte_off + ch.len_utf8() >= cluster.len();
+                match ch {
+                    'f' | 'e' => return true,
+                    'i' | 'l' => {
+                        if at_end {
+                            return true;
+                        }
+                        break;
+                    }
+                    'n' | 'E' | 'r' | 's' | 'u' | 'z' => {}
+                    _ => return true,
+                }
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,8 +1707,12 @@ fn classify_conditional_runner(
     }
 
     // Flag-trigger conditional runner (`find`).
-    for idx in 1..unit.argv.len() {
+    // Skip values of unambiguous value-taking primaries (e.g. `find . -name -exec`)
+    // so operand values are not misread as action triggers.
+    let mut idx = 1usize;
+    while idx < unit.argv.len() {
         let Some(tok) = word_as_str_budgeted(&unit.argv[idx], budget)? else {
+            idx += 1;
             continue;
         };
         for &trigger in row.triggers {
@@ -1475,11 +1732,28 @@ fn classify_conditional_runner(
                 }
             }
         }
+        let skip = find_primary_value_arity(tok);
+        idx = idx.saturating_add(1 + skip);
     }
 
     // No trigger fired: unknown-tool treatment (possible writer, every word
     // Path/ReadWrite, never Home-eligible).
     Ok(())
+}
+
+/// Number of required arguments consumed by unambiguous POSIX/GNU/BSD `find`
+/// primaries (never zero-arg on Linux or macOS).
+fn find_primary_value_arity(tok: &str) -> usize {
+    match tok {
+        "-fprintf" => 2,
+        "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" | "-lname"
+        | "-ilname" | "-regex" | "-iregex" | "-type" | "-xtype" | "-user" | "-group" | "-uid"
+        | "-gid" | "-perm" | "-size" | "-maxdepth" | "-mindepth" | "-newer" | "-anewer"
+        | "-cnewer" | "-samefile" | "-inum" | "-links" | "-mtime" | "-atime" | "-ctime"
+        | "-mmin" | "-amin" | "-cmin" | "-fstype" | "-fprint" | "-fprint0" | "-fls" | "-printf"
+        | "-D" => 1,
+        _ => 0,
+    }
 }
 
 /// Locates `git`'s subcommand past leading global options and applies
@@ -2081,8 +2355,12 @@ fn classify_sed(
                         break;
                     }
                     'l' => {
+                        // Bare `-l` is ambiguous across GNU (takes numeric
+                        // line-length arg) and BSD/macOS (boolean line-buffered,
+                        // takes NO arg), so bare `-l` could hide an inline
+                        // script on macOS (`sed -l 'w out' p input`).
                         if rest_start >= tok.len() {
-                            consumed_next = true;
+                            uncertain = true;
                         }
                         break;
                     }
@@ -2261,8 +2539,12 @@ fn classify_derived_destination_writer_label(
         }
         DerivedDestinationTrigger::Flags(trigger_flags) => {
             let mut triggered = false;
+            let mut scan_start = args_start;
+
             // For `tar`, old-style bundled key letters without leading `-`
-            // (e.g. `tar xf a.tar`, `tar xzf a.tar.gz`) sit at `argv[args_start]`.
+            // (e.g. `tar xf a.tar`, `tar xzf a.tar.gz`, `tar cf out.tar src`)
+            // sit at `argv[args_start]`, and each value-taking key letter
+            // consumes one following operand (e.g. `tar cf -x src` consumes `-x`).
             if tool_name == "tar"
                 && args_start < unit.argv.len()
                 && let Some(first_arg) = word_as_str_budgeted(&unit.argv[args_start], budget)?
@@ -2273,33 +2555,45 @@ fn classify_derived_destination_writer_label(
                     (trigger_flags.len().max(1) as u64)
                         .saturating_mul(first_arg.len().max(1) as u64),
                 )?;
-                for &f in trigger_flags {
-                    if f.len() == 2
-                        && !f.starts_with("--")
-                        && let Some(ch) = f.chars().nth(1)
-                        && first_arg.contains(ch)
-                    {
+                let mut skip_args = 0usize;
+                for ch in first_arg.chars() {
+                    if trigger_flags.iter().any(|&f| {
+                        f.len() == 2 && !f.starts_with("--") && f.chars().nth(1) == Some(ch)
+                    }) {
                         triggered = true;
                         break;
                     }
+                    if tar_short_arity(ch) == ShortOptArity::Value {
+                        skip_args = skip_args.saturating_add(1);
+                    }
                 }
+                scan_start = args_start
+                    .saturating_add(1)
+                    .saturating_add(skip_args)
+                    .min(unit.argv.len());
             }
 
             if !triggered {
-                for arg in &unit.argv[args_start..] {
-                    let Some(tok) = word_as_str_budgeted(arg, budget)? else {
+                let mut idx = scan_start;
+                while idx < unit.argv.len() {
+                    let Some(tok) = word_as_str_budgeted(&unit.argv[idx], budget)? else {
+                        idx += 1;
                         continue;
                     };
                     if tok == "--" {
                         break;
                     }
                     if !tok.starts_with('-') || tok == "-" {
+                        idx += 1;
                         continue;
                     }
-                    if matches_exact_or_short_cluster(tok, trigger_flags, budget)? {
+                    let (matched, consumes_next) =
+                        derived_writer_opt_step(tool_name, tok, trigger_flags, budget)?;
+                    if matched {
                         triggered = true;
                         break;
                     }
+                    idx += if consumes_next { 2 } else { 1 };
                 }
             }
 
@@ -2317,30 +2611,137 @@ fn classify_derived_destination_writer_label(
     Ok(())
 }
 
-/// Matches exact long options (`--recursive`, `--recursive=..`) and short-flag
-/// letters inside clusters (`-R`, `-av`, `-xzf`).
-fn matches_exact_or_short_cluster(
+fn cp_short_arity(ch: char) -> ShortOptArity {
+    match ch {
+        'a' | 'b' | 'c' | 'd' | 'f' | 'H' | 'i' | 'l' | 'L' | 'n' | 'p' | 'P' | 'r' | 'R' | 's'
+        | 'u' | 'v' | 'x' | 'X' | 'Z' => ShortOptArity::Bool,
+        't' | 'S' => ShortOptArity::Value,
+        _ => ShortOptArity::Unknown,
+    }
+}
+
+fn tar_short_arity(ch: char) -> ShortOptArity {
+    match ch {
+        'c'
+        | 't'
+        | 'r'
+        | 'u'
+        | 'A'
+        | 'd'
+        | 'x'
+        | 'v'
+        | 'z'
+        | 'j'
+        | 'J'
+        | 'Z'
+        | 'a'
+        | 'p'
+        | 'P'
+        | 'k'
+        | 'm'
+        | 'h'
+        | 'O'
+        | 'S'
+        | 'w'
+        | 'W'
+        | 'i'
+        | 'B'
+        | 'G'
+        | 'l'
+        | 'o'
+        | 'q'
+        | 'U'
+        | 'y'
+        | 'n'
+        | 'R'
+        | 'e'
+        | '0'..='9' => ShortOptArity::Bool,
+        'f' | 'C' | 'T' | 'X' | 'b' | 'I' | 'V' | 'L' | 'F' | 'g' | 'H' | 'K' | 'N' | 's' => {
+            ShortOptArity::Value
+        }
+        _ => ShortOptArity::Unknown,
+    }
+}
+
+fn derived_writer_long_takes_separate_value(tool_name: &str, name: &str) -> bool {
+    match tool_name {
+        "cp" => matches!(
+            name,
+            "target-directory" | "suffix" | "no-preserve" | "sparse"
+        ),
+        "tar" => matches!(
+            name,
+            "file"
+                | "directory"
+                | "files-from"
+                | "exclude-from"
+                | "exclude"
+                | "blocking-factor"
+                | "use-compress-program"
+                | "label"
+                | "tape-length"
+                | "info-script"
+                | "listed-incremental"
+                | "format"
+                | "starting-file"
+                | "newer"
+                | "strip-components"
+                | "transform"
+                | "xform"
+                | "checkpoint-action"
+        ),
+        _ => false,
+    }
+}
+
+/// Evaluates one dashed option token on `cp` or `tar` against `flags`, returning
+/// `(matched_trigger, consumes_next_word)` while never reading attached option
+/// values (e.g. `cp -tarchive`, `cp -S.bak`, `tar -cfextra.tar`, `tar -Cextra`)
+/// as short option letters.
+fn derived_writer_opt_step(
+    tool_name: &str,
     tok: &str,
     flags: &[&str],
     budget: &mut ComputeBudget,
-) -> Result<bool, Exhausted> {
+) -> Result<(bool, bool), Exhausted> {
     budget.charge((flags.len().max(1) as u64).saturating_mul(tok.len().max(1) as u64))?;
     if let Some(rest) = tok.strip_prefix("--") {
-        let name = rest.split('=').next().unwrap_or(rest);
-        return Ok(flags
+        let (name, has_eq) = match rest.split_once('=') {
+            Some((n, _)) => (n, true),
+            None => (rest, false),
+        };
+        let matched = flags
             .iter()
-            .any(|&f| f.strip_prefix("--").is_some_and(|l| l == name)));
+            .any(|&f| f.strip_prefix("--").is_some_and(|l| l == name));
+        let consumes_next = !has_eq && derived_writer_long_takes_separate_value(tool_name, name);
+        return Ok((matched, consumes_next));
     }
     if let Some(cluster) = tok.strip_prefix('-')
         && !cluster.is_empty()
     {
-        return Ok(cluster.chars().any(|c| {
-            flags
+        for (byte_off, ch) in cluster.char_indices() {
+            let at_end = byte_off + ch.len_utf8() >= cluster.len();
+            if flags
                 .iter()
-                .any(|&f| f.len() == 2 && !f.starts_with("--") && f.chars().nth(1) == Some(c))
-        }));
+                .any(|&f| f.len() == 2 && !f.starts_with("--") && f.chars().nth(1) == Some(ch))
+            {
+                return Ok((true, false));
+            }
+            let arity = match tool_name {
+                "cp" => cp_short_arity(ch),
+                "tar" => tar_short_arity(ch),
+                _ => ShortOptArity::Unknown,
+            };
+            match arity {
+                ShortOptArity::Bool => {}
+                ShortOptArity::Value => return Ok((false, at_end)),
+                ShortOptArity::OptionalAttachedValue | ShortOptArity::Unknown => {
+                    return Ok((false, false));
+                }
+            }
+        }
     }
-    Ok(false)
+    Ok((false, false))
 }
 
 // ---------------------------------------------------------------------------

@@ -1972,4 +1972,44 @@ fn round3_finding_2_git_option_values_preserve_exact_rule_coverage_and_validatio
             "expected invalid prefix {invalid:?}"
         );
     }
+
+    // `awk -f` and `sed -f` trailing options with attached/separate values must
+    // not be misread as competing `-f`/`-e` flags, while real competing flags fail.
+    for valid in [
+        &["awk", "-f", "prog.awk", "-vfoo=1"][..],
+        &["awk", "-f", "prog.awk", "-Fsep"][..],
+        &["awk", "-f", "prog.awk", "-F", "-e"][..],
+        &["sed", "-f", "edit.sed", "-i.ref"][..],
+        &["sed", "-f", "edit.sed", "-l80"][..],
+    ] {
+        assert!(
+            validate_rule_matcher(
+                &RuleMatcher::CommandPrefix { argv: argv(valid) },
+                RuleDecision::Allow,
+                &FoldRules::REV4,
+            )
+            .is_ok(),
+            "expected valid prefix {valid:?}"
+        );
+    }
+    for invalid in [
+        &["awk", "-f", "prog.awk", "-nf", "other.awk"][..],
+        &["awk", "-f", "prog.awk", "-ne", "{print}"][..],
+        &["sed", "-f", "edit.sed", "-nf", "other.sed"][..],
+        &["sed", "-f", "edit.sed", "-ne", "p"][..],
+        &["sed", "-f", "edit.sed", "-i"][..],
+        &["sed", "-f", "edit.sed", "-l"][..],
+    ] {
+        assert!(
+            validate_rule_matcher(
+                &RuleMatcher::CommandPrefix {
+                    argv: argv(invalid)
+                },
+                RuleDecision::Allow,
+                &FoldRules::REV4,
+            )
+            .is_err(),
+            "expected invalid prefix {invalid:?}"
+        );
+    }
 }

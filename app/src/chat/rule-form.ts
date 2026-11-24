@@ -104,32 +104,206 @@ export function foldName(word: string): string {
   return b.toLowerCase().replaceAll("ſ", "s");
 }
 
-function matchesGitFlag(tok: string, trigger: string): boolean {
-  if (trigger.startsWith("--")) {
-    if (!tok.startsWith("--")) return false;
-    const eq = tok.indexOf("=");
-    const name = eq >= 0 ? tok.slice(0, eq) : tok;
-    return name === trigger;
+type ShortOptArity = "bool" | "value" | "opt_attached" | "unknown";
+
+function gitSubcommandShortArity(subcommand: string, ch: string): ShortOptArity {
+  switch (subcommand) {
+    case "rebase":
+      if ("mfiqvnkph".includes(ch)) return "bool";
+      if ("sXxC".includes(ch)) return "value";
+      if ("Sr".includes(ch)) return "opt_attached";
+      return "unknown";
+    case "difftool":
+      if ("dyghpuswbRz".includes(ch)) return "bool";
+      if ("txSGOIl".includes(ch)) return "value";
+      if ("UCMBW".includes(ch)) return "opt_attached";
+      return "unknown";
+    case "mergetool":
+      if ("ygh".includes(ch)) return "bool";
+      if ("tx".includes(ch)) return "value";
+      return "unknown";
+    case "diff":
+      if ("puswbRzh".includes(ch)) return "bool";
+      if ("SGOIl".includes(ch)) return "value";
+      if ("UCMBW".includes(ch)) return "opt_attached";
+      return "unknown";
+    case "push":
+      if ("vqfudh".includes(ch) || ch === "n") return "bool";
+      if (ch === "o") return "value";
+      return "unknown";
+    default:
+      return "unknown";
   }
-  if (trigger.length === 2 && trigger.startsWith("-") && tok.startsWith("-") && !tok.startsWith("--") && tok.length > 1) {
-    return tok.slice(1).includes(trigger[1]!);
-  }
-  return tok === trigger;
 }
 
-function hasCompetingProgramFlags(rest: readonly string[], pinFlags: readonly string[]): boolean {
-  const all = [...pinFlags, "-e", "--source", "--eval", "--expression"];
-  for (const tok of rest) {
+function gitSubcommandLongTakesSeparateValue(subcommand: string, name: string): boolean {
+  switch (subcommand) {
+    case "rebase":
+      return ["onto", "strategy", "strategy-option", "exec", "empty", "whitespace"].includes(name);
+    case "difftool":
+      return ["tool", "extcmd", "tool-cmd", "output"].includes(name);
+    case "mergetool":
+      return ["tool", "tool-cmd"].includes(name);
+    case "diff":
+      return [
+        "output", "diff-filter", "src-prefix", "dst-prefix",
+        "line-prefix", "inter-hunk-context", "unified", "word-diff-regex",
+      ].includes(name);
+    case "push":
+      return ["repo", "push-option", "receive-pack", "exec"].includes(name);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Finds the first triggering flag on a Git subcommand (`rebase`, `difftool`,
+ * `mergetool`, `diff`, `push`), respecting attached and separate short/long
+ * option values so value bytes (e.g. `-Xcontext`, `-S0x1234`, `-txxdiff`) are
+ * never read as option letters. Mirrors `v4/tools.rs::git_subcommand_has_flag_trigger_pure`.
+ */
+function findGitSubcommandTriggerFlag(
+  subcommand: string,
+  rest: readonly string[],
+  triggers: readonly string[],
+): string | null {
+  let i = 0;
+  while (i < rest.length) {
+    const tok = rest[i]!;
     if (tok === "--") break;
-    if (!tok.startsWith("-") || tok === "-") continue;
-    for (const f of all) {
-      if (f.startsWith("--")) {
-        const name = tok.split("=")[0]!;
-        if (name.startsWith("--") && name.length >= 3 && f.startsWith(name)) return true;
-      } else if (f.length === 2 && tok.startsWith("-") && !tok.startsWith("--") && tok.slice(1).includes(f[1]!)) {
+    if (!tok.startsWith("-") || tok === "-") {
+      i++;
+      continue;
+    }
+    if (tok.startsWith("--")) {
+      const eq = tok.indexOf("=");
+      const name = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
+      const hasEq = eq >= 0;
+      if (triggers.some((f) => f.startsWith("--") && f.slice(2) === name)) {
+        return tok;
+      }
+      i += !hasEq && gitSubcommandLongTakesSeparateValue(subcommand, name) ? 2 : 1;
+      continue;
+    }
+    const cluster = tok.slice(1);
+    let consumesNext = false;
+    for (let k = 0; k < cluster.length; k++) {
+      const ch = cluster[k]!;
+      const atEnd = k + 1 >= cluster.length;
+      if (triggers.some((f) => f.length === 2 && f.startsWith("-") && !f.startsWith("--") && f[1] === ch)) {
+        return tok;
+      }
+      const arity = gitSubcommandShortArity(subcommand, ch);
+      if (arity === "bool") continue;
+      if (arity === "value") consumesNext = atEnd;
+      break;
+    }
+    i += consumesNext ? 2 : 1;
+  }
+  return null;
+}
+
+/**
+ * Mirrors `v4/tools.rs::has_competing_awk_code_flags_pure`: checks for `-f`,
+ * `-e`, `--file`, `--source`, `--eval` while respecting attached and separate
+ * values of `-F`, `-v`, `-W`, `--field-separator`, and `--assign`.
+ */
+function hasCompetingAwkFlags(rest: readonly string[], pinFlags: readonly string[]): boolean {
+  const longBad = [...pinFlags.filter((f) => f.startsWith("--")), "--source", "--eval"];
+  let i = 0;
+  while (i < rest.length) {
+    const tok = rest[i]!;
+    if (tok === "--") break;
+    if (!tok.startsWith("-") || tok === "-") {
+      i++;
+      continue;
+    }
+    if (tok.startsWith("--")) {
+      const eq = tok.indexOf("=");
+      const name = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
+      const hasEq = eq >= 0;
+      if (name.length > 0 && longBad.some((f) => f.slice(2).startsWith(name))) {
         return true;
       }
+      i += !hasEq && (name === "field-separator" || name === "assign") ? 2 : 1;
+      continue;
     }
+    const cluster = tok.slice(1);
+    let consumesNext = false;
+    for (let k = 0; k < cluster.length; k++) {
+      const ch = cluster[k]!;
+      const atEnd = k + 1 >= cluster.length;
+      const isCompeting =
+        ch === "e" ||
+        pinFlags.some((f) => f.length === 2 && !f.startsWith("--") && f[1] === ch);
+      if (isCompeting) return true;
+      if ("bcCgkMNnOPrSstV".includes(ch)) continue;
+      if (ch === "F" || ch === "v" || ch === "W") {
+        consumesNext = atEnd;
+      }
+      break;
+    }
+    i += consumesNext ? 2 : 1;
+  }
+  return false;
+}
+
+/**
+ * Mirrors `v4/tools.rs::has_competing_sed_flags_pure`: attached `-i.ref` and
+ * `-l80` do not scan their suffix as option letters, while bare `-i`, bare `-l`,
+ * `-f`, `-e`, `--file`, `--expression`, and unknown flags disable pinning.
+ */
+function hasCompetingSedFlags(rest: readonly string[]): boolean {
+  let i = 0;
+  while (i < rest.length) {
+    const tok = rest[i]!;
+    if (tok === "--") break;
+    if (!tok.startsWith("-") || tok === "-") {
+      i++;
+      continue;
+    }
+    if (tok.startsWith("--")) {
+      const eq = tok.indexOf("=");
+      const name = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
+      const hasEq = eq >= 0;
+      if (name.length === 0) {
+        i++;
+        continue;
+      }
+      if ("file".startsWith(name) || "expression".startsWith(name)) return true;
+      if (name === "in-place") {
+        if (!hasEq) return true;
+        i++;
+        continue;
+      }
+      if (name === "line-length") {
+        if (!hasEq && i + 1 >= rest.length) return true;
+        i += hasEq ? 1 : 2;
+        continue;
+      }
+      if ([
+        "quiet", "silent", "regexp-extended", "separate", "unbuffered",
+        "null-data", "posix", "sandbox", "debug", "follow-symlinks",
+      ].includes(name)) {
+        if (hasEq) return true;
+        i++;
+        continue;
+      }
+      return true;
+    }
+    const cluster = tok.slice(1);
+    for (let k = 0; k < cluster.length; k++) {
+      const ch = cluster[k]!;
+      const atEnd = k + 1 >= cluster.length;
+      if (ch === "f" || ch === "e") return true;
+      if (ch === "i" || ch === "l") {
+        if (atEnd) return true;
+        break;
+      }
+      if ("nErsuz".includes(ch)) continue;
+      return true;
+    }
+    i++;
   }
   return false;
 }
@@ -453,7 +627,7 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
         (args[0] === "-f" || args[0] === "--file") &&
         args[1] !== "" &&
         args[1] !== "-" &&
-        !hasCompetingProgramFlags(args.slice(2), ["-f", "--file"])
+        !hasCompetingAwkFlags(args.slice(2), ["-f", "--file"])
       ) {
         return { warn: `This allows the ${name} program ${args[1]}, whatever it does.` };
       }
@@ -529,11 +703,9 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
       };
       const flags = subFlagTriggers[sub];
       if (flags) {
-        for (const arg of rest) {
-          if (arg === "--") break;
-          if (flags.some((f) => matchesGitFlag(arg, f))) {
-            return { refuse: `An Allow prefix rule can't allow git ${sub} with ${arg}: it runs an external command.` };
-          }
+        const hit = findGitSubcommandTriggerFlag(sub, rest, flags);
+        if (hit !== null) {
+          return { refuse: `An Allow prefix rule can't allow git ${sub} with ${hit}: it runs an external command.` };
         }
       }
     }
@@ -551,7 +723,7 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
           args.length >= 2 &&
           args[1] !== "" &&
           args[1] !== "-" &&
-          !hasCompetingProgramFlags(args.slice(2), ["-f", "--file"])
+          !hasCompetingSedFlags(args.slice(2))
         ) {
           return { warn: `This allows the sed script ${args[1]}, whatever it does.` };
         }

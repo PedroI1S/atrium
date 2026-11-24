@@ -1469,3 +1469,234 @@ fn round3_finding_2_git_short_option_values_and_subcommand_values() {
         "expected StoreHit when `--literal-pathspecs` is `-C`'s value, got {sel:?}"
     );
 }
+
+#[test]
+fn round3_option_value_scanning_class_rg_grep_cp_tar_awk_sed_find_interpreters() {
+    // 1. Search tools (`rg` / `grep`): attached/separate values containing
+    //    forbidden short flag letters (`-f`, `-z`) must NOT strip Home eligibility.
+    for home_ok in [
+        vec![w("rg"), w("-efoo"), w("src")],
+        vec![w("rg"), w("-ezip"), w("src")],
+        vec![w("rg"), wq("-g*.pdf"), w("needle"), w("src")],
+        vec![w("rg"), w("-rfoo"), w("needle"), w("src")],
+        vec![w("rg"), w("-Eutf-8"), w("needle"), w("src")],
+        vec![w("rg"), w("-e"), w("-f"), w("src")],
+        vec![w("grep"), w("-efoo"), w("README.md")],
+        vec![w("grep"), w("-e"), w("-f"), w("README.md")],
+    ] {
+        let e = classify_words(home_ok.clone());
+        assert!(
+            e.unread.is_empty(),
+            "unexpected unread on {home_ok:?}: {:?}",
+            e.unread
+        );
+        assert!(
+            e.home_readonly_eligible,
+            "attached/separate option value falsely stripped Home eligibility on {home_ok:?}"
+        );
+    }
+    // Actual forbidden `-f` / `-if` / `-z` still removes Home eligibility.
+    for home_no in [
+        &["rg", "-f", "pats.txt", "src"][..],
+        &["rg", "-if", "pats.txt", "src"][..],
+        &["rg", "-z", "needle", "src"][..],
+        &["grep", "-f", "pats.txt", "README.md"][..],
+        &["grep", "-if", "pats.txt", "README.md"][..],
+    ] {
+        let e = classify(home_no);
+        assert!(
+            !e.home_readonly_eligible,
+            "expected !home_readonly_eligible on {home_no:?}"
+        );
+    }
+
+    // 2. DerivedDestinationWriter `cp`: attached/separate values of `-t` and `-S`
+    //    must NOT falsely trigger `-a`/`-r`/`-R`.
+    for cp_no_trig in [
+        &["cp", "-tarchive", "a.txt"][..],
+        &["cp", "-t", "archive", "a.txt"][..],
+        &["cp", "-t", "-r", "a.txt"][..],
+        &["cp", "-vtdir", "a.txt"][..],
+        &["cp", "-S.bak", "a.txt", "b.txt"][..],
+        &["cp", "-S.orig", "a.txt", "b.txt"][..],
+        &["cp", "-S", "-a", "a.txt", "b.txt"][..],
+        &["cp", "--target-directory", "-R", "a.txt"][..],
+    ] {
+        let e = classify(cp_no_trig);
+        assert_eq!(
+            e.derived_destinations,
+            DerivedDestinations::None,
+            "{cp_no_trig:?}"
+        );
+        assert!(e.unread.is_empty(), "{cp_no_trig:?}");
+    }
+    for cp_trig in [
+        &["cp", "-Rtdir", "src"][..],
+        &["cp", "-rtdir", "src"][..],
+        &["cp", "-atdir", "src"][..],
+        &["cp", "-tdir", "-R", "src"][..],
+    ] {
+        let e = classify(cp_trig);
+        assert_eq!(
+            e.derived_destinations,
+            DerivedDestinations::Always,
+            "{cp_trig:?}"
+        );
+        assert_eq!(
+            e.unread,
+            vec![UnreadReason::DerivedDestinations { tool: "cp".into() }],
+            "{cp_trig:?}"
+        );
+    }
+
+    // 3. DerivedDestinationWriter `tar`: attached/separate values of `-f`, `-C`,
+    //    `-T`, `-X`, `--file`, and old-style `tar cf -x` must NOT falsely trigger `-x`.
+    for tar_no_trig in [
+        &["tar", "-cfextra.tar", "src"][..],
+        &["tar", "-cf", "extra.tar", "src"][..],
+        &["tar", "-cf", "-x", "src"][..],
+        &["tar", "-Cextra", "-cf", "out.tar", "src"][..],
+        &["tar", "-C", "-x", "-cf", "out.tar", "src"][..],
+        &["tar", "-cf", "out.tar", "-Textra.list"][..],
+        &["tar", "-cf", "out.tar", "-Xexclude.txt"][..],
+        &["tar", "cf", "-x", "src"][..],
+        &["tar", "--file", "--extract", "-c", "src"][..],
+    ] {
+        let e = classify(tar_no_trig);
+        assert_eq!(
+            e.derived_destinations,
+            DerivedDestinations::None,
+            "{tar_no_trig:?}"
+        );
+        assert!(e.unread.is_empty(), "{tar_no_trig:?}");
+    }
+    for tar_trig in [
+        &["tar", "-zxf", "a.tar.gz"][..],
+        &["tar", "-zxfa.tar.gz"][..],
+        &["tar", "-fa.tar", "-x"][..],
+        &["tar", "-f", "a.tar", "-x"][..],
+        &["tar", "--file=a.tar", "-x"][..],
+        &["tar", "--file", "a.tar", "-x"][..],
+        &["tar", "zxf", "a.tar.gz"][..],
+    ] {
+        let e = classify(tar_trig);
+        assert_eq!(
+            e.derived_destinations,
+            DerivedDestinations::Always,
+            "{tar_trig:?}"
+        );
+        assert_eq!(
+            e.unread,
+            vec![UnreadReason::DerivedDestinations { tool: "tar".into() }],
+            "{tar_trig:?}"
+        );
+    }
+
+    // 4. `awk -f`: attached/separate values of `-F` and `-v` must NOT be mistaken
+    //    for competing `-f` / `-e` flags.
+    for awk_pinned in [
+        &["awk", "-f", "prog.awk", "-Fsep", "data.txt"][..],
+        &["awk", "-f", "prog.awk", "-F", "-e", "data.txt"][..],
+        &["awk", "-f", "prog.awk", "-vfoo=1", "data.txt"][..],
+        &["awk", "-f", "prog.awk", "-v", "foo=1", "data.txt"][..],
+        &["awk", "-f", "prog.awk", "-vkey=val", "data.txt"][..],
+        &[
+            "awk",
+            "-f",
+            "prog.awk",
+            "--field-separator",
+            "-e",
+            "data.txt",
+        ][..],
+    ] {
+        let e = classify(awk_pinned);
+        assert_eq!(
+            e.unread,
+            vec![UnreadReason::Program {
+                program_words: vec!["awk".into(), "-f".into(), "prog.awk".into()]
+            }],
+            "expected pinned program on {awk_pinned:?}"
+        );
+    }
+    for awk_unpinned in [
+        &["awk", "-f", "prog.awk", "-nf", "other.awk", "data.txt"][..],
+        &["awk", "-f", "prog.awk", "-ne", "{print}", "data.txt"][..],
+        &["awk", "-f", "prog.awk", "-e{print}", "data.txt"][..],
+    ] {
+        let e = classify(awk_unpinned);
+        assert_eq!(
+            e.unread,
+            vec![UnreadReason::CodeRunnerInlineCode { tool: "awk".into() }],
+            "expected inline code on {awk_unpinned:?}"
+        );
+    }
+
+    // 5. `sed`: attached `-i.ef` and `-i.ref` do not read suffix as `-e`/`-f`,
+    //    and bare `-l` fails closed (macOS/BSD `-l` takes no arg).
+    let sed_i_ef = classify_words(vec![w("sed"), w("-i.ef"), wq("s/a/b/"), w("a.txt")]);
+    assert!(sed_i_ef.unread.is_empty());
+
+    let sed_f_iref = classify(&["sed", "-f", "edit.sed", "-i.ref", "a.txt"]);
+    assert_eq!(
+        sed_f_iref.unread,
+        vec![UnreadReason::Program {
+            program_words: vec!["sed".into(), "-f".into(), "edit.sed".into()]
+        }]
+    );
+
+    let sed_bare_l = classify_words(vec![w("sed"), w("-l"), wq("w out"), w("p"), w("a.txt")]);
+    assert_eq!(
+        sed_bare_l.unread,
+        vec![UnreadReason::CodeRunnerInlineCode { tool: "sed".into() }]
+    );
+
+    let sed_attached_l = classify_words(vec![w("sed"), w("-l80"), wq("s/a/b/"), w("a.txt")]);
+    assert!(sed_attached_l.unread.is_empty());
+
+    // 6. `find`: values of unambiguous 1-arg primaries (`-name -exec`) do not fire,
+    //    while real `-exec` after `-name foo` still fires.
+    let find_val = classify(&["find", ".", "-name", "-exec"]);
+    assert!(find_val.unread.is_empty());
+    let find_real = classify(&["find", ".", "-name", "foo", "-exec", "id", ";"]);
+    assert_eq!(
+        find_real.unread,
+        vec![UnreadReason::CodeRunnerInlineCode {
+            tool: "find".into()
+        }]
+    );
+
+    // 7. Interpreters (`python`, `node`, `perl`, `ruby`): attached values of
+    //    non-code flags must NOT populate `code_operands`, and separate values
+    //    before `-c`/`-e` still locate the real code operand.
+    for no_inline_op in [
+        &["python", "-Xtracemalloc", "script.py"][..],
+        &["python3", "-Wonce", "script.py"][..],
+        &["node", "-rexpress", "app.js"][..],
+        &["perl", "-Isrc/core", "script.pl"][..],
+        &["ruby", "-Ilib/ext", "app.rb"][..],
+    ] {
+        let e = classify(no_inline_op);
+        assert_eq!(
+            e.code,
+            CodeExecution::Inline {
+                code_operands: Vec::new()
+            },
+            "attached value misread as inline code flag on {no_inline_op:?}"
+        );
+    }
+
+    let py_sep = classify(&["python", "-W", "once", "-c", "print(1)"]);
+    assert_eq!(
+        py_sep.code,
+        CodeExecution::Inline {
+            code_operands: vec![4]
+        }
+    );
+    let py_cluster = classify(&["python", "-ucprint(1)"]);
+    assert_eq!(
+        py_cluster.code,
+        CodeExecution::Inline {
+            code_operands: vec![1]
+        }
+    );
+}
