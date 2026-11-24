@@ -996,3 +996,13 @@ P0 is merged (D-152), and no running task owns those files. So P3's round 2 may 
 - the `Rule` listing in `atrium-protocol`, its TypeScript mirror, and the Settings rules list that renders invalid rules.
 
 Each change is additive and keeps every existing field. P2 doesn't use `RuleEvalContext`. CR-P3-4 is not a defect. P4's first review has one low finding (jargon in the Settings text), which goes back to P4.
+
+## D-154 — 2026-11-24 — rodrigo: P2's alias rules are a literal port of `dev`'s
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** P2's (M1-38) review 7 (`reviews/M1-38-rev4-p2-paths-round7.md`) closed round 6's findings and found four more, all in the protected-root alias code that round 7 rebuilt from `dev`'s idea. The review counts went 7, 6, 5, 4. The two high findings are differences from `dev`:
+- `dev`'s `alias_fix` compares ancestor **identities**, so it catches a protected root reached under another name, such as a bind mount. P2 compares canonical spellings.
+- Filter probes ignore alias spellings.
+
+**Exception to PLAN §8.4:** Opus 5.5 writes one more P2 round. It **ports `dev`'s `alias_fix` and `links_below` (`deny.rs`/`engine.rs`) as literally as P2's types allow**, by ancestor identity, with budgets charged. It doesn't reinvent them.
+- Probes run on every applicable spelling: canonical, written and alias.
+- It also fixes review 7's other two findings.
+- If the next review still has findings, they come back to the driver.
