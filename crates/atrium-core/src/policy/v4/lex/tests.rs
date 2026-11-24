@@ -2519,3 +2519,116 @@ fn r7_bracket_class_is_d146_closed_form() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 8 (D-148; review round 6): `TooLarge` wins over `Exhausted`
+// ---------------------------------------------------------------------------
+
+/// Sweeps the compute budgets just below the cost of a run that ends in
+/// `TooLarge(Units)`: every run is either that, or an `Exhausted` that kept
+/// at most `MAX_UNITS` units (the 513th not yet holding a finished word).
+/// Once a budget gives `TooLarge`, every larger one does too, and the last
+/// failing charge (one unit short) gives it.
+fn assert_cap_beats_exhaustion(
+    ctx: &str,
+    full_cost: u64,
+    mut run: impl FnMut(&mut ComputeBudget) -> Result<usize, PartOutcome>,
+) {
+    let mut too_large_from: Option<u64> = None;
+    for units in full_cost.saturating_sub(400)..full_cost {
+        match run(&mut ComputeBudget::new(units, BIG_ALLOC)) {
+            Err(PartOutcome::TooLarge(Cap::Units)) => {
+                too_large_from.get_or_insert(units);
+            }
+            Ok(kept) => {
+                assert!(
+                    too_large_from.is_none(),
+                    "{ctx}: Exhausted at {units} after TooLarge at {too_large_from:?}"
+                );
+                assert!(kept <= limits::MAX_UNITS, "{ctx}: {kept} units kept");
+            }
+            Err(other) => panic!("{ctx}: units={units}: {other:?}"),
+        }
+    }
+    assert!(
+        too_large_from.is_some_and(|b| b < full_cost),
+        "{ctx}: one unit short of the capped run must still be TooLarge"
+    );
+}
+
+#[test]
+fn r8_exact_too_large_beats_exhaustion() {
+    // Review round 6's failing case: 512 stored units, `sudo` read whole,
+    // then the reserved-word check runs out. That is `TooLarge(Units)`.
+    let line = format!("{}sudo", "x;".repeat(512));
+    assert_eq!(
+        lex_exact(
+            &line,
+            0,
+            None,
+            &mut ComputeBudget::new(31_347, 128 * 1024 * 1024)
+        ),
+        Err(PartOutcome::TooLarge(Cap::Units))
+    );
+
+    // Cap reached plus a failing charge at every point after it: a finished
+    // command word, a second word, a redirect target.
+    for tail in ["sudo", "sudo id", "cat > out"] {
+        let line = format!("{}{tail}", "x;".repeat(512));
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        assert_eq!(
+            lex_exact(&line, 0, None, &mut b),
+            Err(PartOutcome::TooLarge(Cap::Units))
+        );
+        let full_cost = BIG_UNITS - b.remaining_units();
+        assert_cap_beats_exhaustion(&format!("exact `…{tail}`"), full_cost, |b| {
+            lex_exact(&line, 0, None, b).map(|out| {
+                assert!(has_exhausted(&out));
+                out.units.len()
+            })
+        });
+    }
+}
+
+#[test]
+fn r8_best_effort_too_large_beats_exhaustion() {
+    for tail in ["sudo id", "cat > out x", "FOO=1 sudo id"] {
+        let line = format!("{}{tail}", "x;".repeat(512));
+        let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+        assert_eq!(
+            lex_best_effort(&[&line], &mut b),
+            Err(PartOutcome::TooLarge(Cap::Units))
+        );
+        let full_cost = BIG_UNITS - b.remaining_units();
+        assert_cap_beats_exhaustion(&format!("best-effort `…{tail}`"), full_cost, |b| {
+            let mut rec = BestEffortRecord::default();
+            match lex_best_effort_into(&[&line], &mut rec, b) {
+                Err(PartOutcome::Exhausted(_)) => Ok(rec.units.len()),
+                Err(other) => Err(other),
+                Ok(()) => panic!("must not finish"),
+            }
+        });
+    }
+
+    // Derived units past the cap on a recovery path: `find -exec` commands
+    // recorded after exhaustion still count against `MAX_UNITS`.
+    let line = format!(r"{}find . -exec a \; -exec b \;", "x;".repeat(511));
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    assert_eq!(
+        lex_best_effort(&[&line], &mut b),
+        Err(PartOutcome::TooLarge(Cap::Units))
+    );
+    let full_cost = BIG_UNITS - b.remaining_units();
+    for units in full_cost.saturating_sub(2_000)..full_cost {
+        let mut rec = BestEffortRecord::default();
+        match lex_best_effort_into(
+            &[&line],
+            &mut rec,
+            &mut ComputeBudget::new(units, BIG_ALLOC),
+        ) {
+            Err(PartOutcome::TooLarge(Cap::Units)) => {}
+            Err(PartOutcome::Exhausted(_)) => assert!(rec.units.len() <= limits::MAX_UNITS),
+            other => panic!("units={units}: {other:?}"),
+        }
+    }
+}

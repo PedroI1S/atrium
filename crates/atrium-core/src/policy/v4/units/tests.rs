@@ -1137,3 +1137,42 @@ fn r6_exact_unwrap_keeps_recognised_wrappers_on_exhaustion() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 8 (D-148; review round 6): `TooLarge` wins over `Exhausted`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r8_build_units_too_large_beats_exhaustion_in_nested_scripts() {
+    // The 513th unit comes from a modeled `-c` script: running out after its
+    // first word is read is still `TooLarge(Units)`, not `Exhausted`.
+    let line = format!("sh -c '{}sudo id'", "x;".repeat(511));
+    let mut b = ComputeBudget::new(BIG_UNITS, BIG_ALLOC);
+    assert_eq!(
+        build_units(&line, &FoldRules::REV4, &mut b),
+        Err(PartOutcome::TooLarge(Cap::Units))
+    );
+    let full_cost = charged(&b);
+    let mut too_large_from: Option<u64> = None;
+    for units in full_cost.saturating_sub(400)..full_cost {
+        match build_units(
+            &line,
+            &FoldRules::REV4,
+            &mut ComputeBudget::new(units, BIG_ALLOC),
+        ) {
+            Err(PartOutcome::TooLarge(Cap::Units)) => {
+                too_large_from.get_or_insert(units);
+            }
+            Ok(p) => {
+                assert!(has_exhausted(&p), "units={units}");
+                assert!(p.units.len() <= limits::MAX_UNITS);
+                assert!(too_large_from.is_none(), "units={units}");
+            }
+            Err(other) => panic!("units={units}: {other:?}"),
+        }
+    }
+    assert!(
+        too_large_from.is_some(),
+        "one unit short must still be TooLarge"
+    );
+}
