@@ -157,7 +157,14 @@ pub(crate) fn check_recursive_root(
     budget: &mut ComputeBudget,
 ) -> Result<RecursiveRootResult, Exhausted> {
     recursive::check_recursive_root_impl(
-        root, links, filters, None, protected, resolver, caps, budget,
+        root,
+        links,
+        filters,
+        protected,
+        resolver,
+        caps,
+        budget,
+        &mut sensitive::RootAliases::default(),
     )
 }
 

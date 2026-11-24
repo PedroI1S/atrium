@@ -15,11 +15,11 @@ use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::glob::expand_shell_glob_written;
 use crate::policy::v4::paths::recursive::{check_filter_on_root, check_recursive_root_impl};
 use crate::policy::v4::paths::resolve::{
-    join_bytes, resolve_literal_impl, resolve_word_literal, word_spelling,
+    join_bytes, resolve_literal_impl, resolve_word_literal, word_entry_path, word_spelling,
 };
 use crate::policy::v4::paths::sensitive::{
-    SharedSensitive, check_target_parts, extend_charged, fold_path_listed, lexical_spelling,
-    origin_to_part, push_charged, under_bytes, written_name_hit,
+    RootAliases, SharedSensitive, extend_charged, fold_path_listed, lexical_spelling,
+    origin_to_part, push_charged, push_target_records, under_bytes,
 };
 
 #[derive(Debug, Clone)]
@@ -30,59 +30,26 @@ enum CwdState {
     Unknown,
 }
 
-/// Checks `target` against `protected` and records the outcome. Write-only
-/// identities come from `protected.write_only_hard_deny_identities`, which
-/// `build_protected_set` fills: there is one identity collection, so the
-/// resolver-backed flows and a standalone `check_target` always agree (§5,
-/// D-142).
+/// Checks `target` against `protected` and records every record: its written
+/// spelling's protected names, the canonical check, unlisted equivalences,
+/// identity gaps (all through `check_target`'s `Target::written`, D-147,
+/// D-149) and `dev`'s alias rule for protected roots that are links.
+#[allow(clippy::too_many_arguments)]
 fn push_checked(
     target: &Target,
     protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
     budget: &mut ComputeBudget,
+    aliases: &mut RootAliases,
     outcomes: &mut Vec<PartResult>,
 ) -> Result<(), Exhausted> {
-    let (exact, gap) = check_target_parts(target, protected, budget)?;
-    push_charged(outcomes, exact, budget)?;
-    if let Some(gap) = gap {
-        push_charged(outcomes, gap, budget)?;
-    }
-    Ok(())
+    push_target_records(
+        target, protected, resolver, caps, budget, aliases, outcomes, false,
+    )
 }
 
-/// [`push_checked`], then the written spelling's own protected name (D-147):
-/// a hit `dev` finds on the written spelling (`Sensitive::hit` over
-/// `all_paths`) stays a hit when resolution leads elsewhere, through a link
-/// or to a name that does not exist yet below an aliased root.
-fn push_checked_written(
-    target: &Target,
-    written: Option<&[u8]>,
-    protected: &ProtectedSet,
-    budget: &mut ComputeBudget,
-    outcomes: &mut Vec<PartResult>,
-) -> Result<(), Exhausted> {
-    push_checked(target, protected, budget, outcomes)?;
-    if let Some(w) = written
-        && !matches!(
-            target.origin,
-            TargetOrigin::ExpandedFrom {
-                variant_only: true,
-                ..
-            }
-        )
-        && let Some(hit) = written_name_hit(
-            w,
-            target.access,
-            &origin_to_part(&target.origin),
-            protected,
-            budget,
-        )?
-    {
-        push_charged(outcomes, hit, budget)?;
-    }
-    Ok(())
-}
-
-/// Charges a clone of `target` (its path and identities) before it is made (§8).
+/// Charges a clone of `target` (its paths and identities) before it is made (§8).
 fn charge_target_clone(target: &Target, budget: &mut ComputeBudget) -> Result<(), Exhausted> {
     let bytes = match &target.resolution {
         TargetResolution::Resolved {
@@ -95,7 +62,7 @@ fn charge_target_clone(target: &Target, budget: &mut ComputeBudget) -> Result<()
         }
         TargetResolution::Unread(_) => 64,
     };
-    budget.charge_alloc(bytes)
+    budget.charge_alloc(bytes + target.written.as_ref().map_or(0, Vec::len))
 }
 
 fn finish_call_exhausted(
@@ -235,6 +202,7 @@ struct ExecCtx<'a> {
     resolver: &'a dyn PathResolver,
     caps: &'a mut FsCaps,
     budget: &'a mut ComputeBudget,
+    aliases: &'a mut RootAliases,
     children_by_parent: &'a HashMap<Option<UnitIndex>, Vec<usize>>,
     pipeline_writers: &'a HashMap<PipelineId, UnitIndex>,
     subtree_writers: &'a [Option<UnitIndex>],
@@ -384,6 +352,7 @@ fn exec_unit_sequence(
                             origin,
                             access,
                             resolution: TargetResolution::Unread(UnreadReason::UnknownCwd),
+                            written: None,
                         };
                         if let Err(err) = push_charged(
                             &mut ctx.out.outcomes,
@@ -413,7 +382,7 @@ fn exec_unit_sequence(
             }
 
             if word.has_unquoted_glob() {
-                let (exp, exact_written) = match expand_shell_glob_written(
+                let (exp, exact_entries) = match expand_shell_glob_written(
                     word,
                     cur_cwd,
                     cur_written,
@@ -443,7 +412,7 @@ fn exec_unit_sequence(
                         return;
                     }
                 }
-                for (target, written_spelling) in exp.exact_matches.into_iter().zip(exact_written) {
+                for (target, entry_path) in exp.exact_matches.into_iter().zip(exact_entries) {
                     if ctx.out.targets.len() >= limits::MAX_PATHS {
                         if let Err(err) = push_charged(
                             &mut ctx.out.outcomes,
@@ -465,11 +434,11 @@ fn exec_unit_sequence(
                             &target,
                             e.links,
                             &e.filters,
-                            written_spelling.as_deref(),
                             ctx.protected,
                             ctx.resolver,
                             ctx.caps,
                             ctx.budget,
+                            ctx.aliases,
                         ) {
                             Ok(rec) => {
                                 ctx.out.multiply_linked_file |= rec.multiply_linked_file;
@@ -492,11 +461,13 @@ fn exec_unit_sequence(
                                 return;
                             }
                         }
-                    } else if let Err(err) = push_checked_written(
+                    } else if let Err(err) = push_checked(
                         &target,
-                        written_spelling.as_deref(),
                         ctx.protected,
+                        ctx.resolver,
+                        ctx.caps,
                         ctx.budget,
+                        ctx.aliases,
                         &mut ctx.out.outcomes,
                     ) {
                         ctx.exhausted_err = Some((part, err));
@@ -509,7 +480,7 @@ fn exec_unit_sequence(
                     {
                         match source_is_dir_or_unknown(
                             &target,
-                            written_spelling.as_deref(),
+                            entry_path.as_deref(),
                             ctx.resolver,
                             ctx.caps,
                             ctx.budget,
@@ -582,7 +553,7 @@ fn exec_unit_sequence(
                         }
                     };
                 let entry_path =
-                    match final_entry_path(word, cur_cwd, &ctx.protected.home, ctx.budget) {
+                    match word_entry_path(word, cur_cwd, &ctx.protected.home, ctx.budget) {
                         Ok(p) => p,
                         Err(e) => {
                             ctx.exhausted_err = Some((part, e));
@@ -605,17 +576,19 @@ fn exec_unit_sequence(
                         return;
                     }
                 };
+                let mut target = target;
+                target.written = written_spelling;
                 record_multiply_linked(&target, &mut ctx.out.multiply_linked_file);
                 if is_rec_root && let Some(e) = eff {
                     match check_recursive_root_impl(
                         &target,
                         e.links,
                         &e.filters,
-                        written_spelling.as_deref(),
                         ctx.protected,
                         ctx.resolver,
                         ctx.caps,
                         ctx.budget,
+                        ctx.aliases,
                     ) {
                         Ok(rec) => {
                             ctx.out.multiply_linked_file |= rec.multiply_linked_file;
@@ -637,11 +610,13 @@ fn exec_unit_sequence(
                             return;
                         }
                     }
-                } else if let Err(err) = push_checked_written(
+                } else if let Err(err) = push_checked(
                     &target,
-                    written_spelling.as_deref(),
                     ctx.protected,
+                    ctx.resolver,
+                    ctx.caps,
                     ctx.budget,
+                    ctx.aliases,
                     &mut ctx.out.outcomes,
                 ) {
                     ctx.exhausted_err = Some((part, err));
@@ -715,16 +690,18 @@ fn exec_unit_sequence(
                             return;
                         }
                     };
+                    let mut target = target;
+                    target.written = written_spelling;
                     record_multiply_linked(&target, &mut ctx.out.multiply_linked_file);
                     match check_recursive_root_impl(
                         &target,
                         e.links,
                         &e.filters,
-                        written_spelling.as_deref(),
                         ctx.protected,
                         ctx.resolver,
                         ctx.caps,
                         ctx.budget,
+                        ctx.aliases,
                     ) {
                         Ok(rec) => {
                             ctx.out.multiply_linked_file |= rec.multiply_linked_file;
@@ -755,6 +732,7 @@ fn exec_unit_sequence(
                             },
                             access: AccessMode::Read,
                             resolution: TargetResolution::Unread(UnreadReason::UnknownCwd),
+                            written: None,
                         },
                         ctx.budget,
                     ) {
@@ -827,6 +805,7 @@ fn exec_unit_sequence(
                                 origin,
                                 access,
                                 resolution: TargetResolution::Unread(UnreadReason::UnknownCwd),
+                                written: None,
                             },
                             ctx.budget,
                         ) {
@@ -866,12 +845,18 @@ fn exec_unit_sequence(
                     return;
                 }
             };
+
+            let mut target = target;
+
+            target.written = written_spelling;
             record_multiply_linked(&target, &mut ctx.out.multiply_linked_file);
-            if let Err(err) = push_checked_written(
+            if let Err(err) = push_checked(
                 &target,
-                written_spelling.as_deref(),
                 ctx.protected,
+                ctx.resolver,
+                ctx.caps,
                 ctx.budget,
+                ctx.aliases,
                 &mut ctx.out.outcomes,
             ) {
                 ctx.exhausted_err = Some((part, err));
@@ -1107,6 +1092,7 @@ pub(crate) fn resolve_command_targets_impl(
     budget.charge_alloc(
         start_cwd
             .len()
+            .saturating_mul(2)
             .saturating_add(units.len().saturating_mul(160)),
     )?;
 
@@ -1172,6 +1158,7 @@ pub(crate) fn resolve_command_targets_impl(
 
     let top_level: Vec<usize> = children_by_parent.get(&None).cloned().unwrap_or_default();
 
+    let mut aliases = RootAliases::default();
     let mut ctx = ExecCtx {
         units,
         effects,
@@ -1180,6 +1167,7 @@ pub(crate) fn resolve_command_targets_impl(
         resolver,
         caps,
         budget,
+        aliases: &mut aliases,
         children_by_parent: &children_by_parent,
         pipeline_writers: &pipeline_writers,
         subtree_writers: &subtree_writers,
@@ -1246,37 +1234,6 @@ fn mv_destination_operand(unit: &CommandUnit, eff: Option<&ToolEffects>) -> Opti
     (1..unit.argv.len())
         .rev()
         .find(|&i| is_path_role(e.roles.get(i).copied().unwrap_or(OperandRole::Path)))
-}
-
-/// The path of `word`'s final entry as the shell passes it (`~` expanded,
-/// joined onto the real working directory, not normalised and not followed),
-/// so `lstat` sees the entry itself, a link included (review 4, finding 6).
-fn final_entry_path(
-    word: &Word,
-    cwd: &[u8],
-    home: &[u8],
-    budget: &mut ComputeBudget,
-) -> Result<Option<Vec<u8>>, Exhausted> {
-    let raw = word.literal_bytes();
-    if raw.is_empty() || raw.contains(&0) {
-        return Ok(None);
-    }
-    budget.charge(raw.len() as u64 + 1)?;
-    budget.charge_alloc(raw.len() + cwd.len().max(home.len()) + 2)?;
-    let path = if word.starts_with_unquoted_tilde() {
-        if raw == b"~" {
-            home.to_vec()
-        } else if let Some(rest) = raw.strip_prefix(b"~/") {
-            join_bytes(home, rest)
-        } else {
-            return Ok(None);
-        }
-    } else if raw.starts_with(b"/") {
-        raw.to_vec()
-    } else {
-        join_bytes(cwd, raw)
-    };
-    Ok(Some(path))
 }
 
 /// Whether an `mv` source is a directory (or can't be established as not
@@ -1521,6 +1478,7 @@ pub(crate) fn resolve_subject_paths_impl(
     budget: &mut ComputeBudget,
 ) -> Result<ResolvedCallPaths, Exhausted> {
     let mut out = ResolvedCallPaths::default();
+    let mut aliases = RootAliases::default();
 
     // A structural limit decides before any budget is spent (§1: TooLarge is
     // above Exhausted), and its record survives an exhausted budget.
@@ -1597,11 +1555,13 @@ pub(crate) fn resolve_subject_paths_impl(
         record_multiply_linked(&target, &mut out.multiply_linked_file);
 
         if selector_glob.is_some() {
-            if let Err(e) = push_checked_written(
+            if let Err(e) = push_checked(
                 &target,
-                written.as_deref(),
                 protected,
+                resolver,
+                caps,
                 budget,
+                &mut aliases,
                 &mut out.outcomes,
             ) {
                 return finish_call_exhausted(out, part, e);
@@ -1621,11 +1581,11 @@ pub(crate) fn resolve_subject_paths_impl(
                 &target,
                 Default::default(),
                 filters_slice,
-                written.as_deref(),
                 protected,
                 resolver,
                 caps,
                 budget,
+                &mut aliases,
             ) {
                 Ok(rec) => {
                     out.multiply_linked_file |= rec.multiply_linked_file;
@@ -1643,11 +1603,13 @@ pub(crate) fn resolve_subject_paths_impl(
                 Err(e) => return finish_call_exhausted(out, part, e),
             }
         } else {
-            if let Err(e) = push_checked_written(
+            if let Err(e) = push_checked(
                 &target,
-                written.as_deref(),
                 protected,
+                resolver,
+                caps,
                 budget,
+                &mut aliases,
                 &mut out.outcomes,
             ) {
                 return finish_call_exhausted(out, part, e);
@@ -1669,7 +1631,7 @@ pub(crate) fn resolve_subject_paths_impl(
                     Ok(f) => f,
                     Err(e) => return finish_call_exhausted(out, filter_part, e),
                 };
-                let written_root = match written.as_deref() {
+                let written_root = match target.written.as_deref() {
                     Some(w) => match fold_path_listed(w, protected.folds, budget) {
                         Ok(fw) if fw != folded_root => Some((w, fw)),
                         Ok(_) => None,
@@ -1691,6 +1653,7 @@ pub(crate) fn resolve_subject_paths_impl(
                     budget,
                     &mut out.outcomes,
                     &mut out.multiply_linked_file,
+                    &mut aliases,
                 ) {
                     return finish_call_exhausted(out, filter_part, e);
                 }
@@ -1724,11 +1687,13 @@ pub(crate) fn resolve_subject_paths_impl(
         record_multiply_linked(&implicit, &mut out.multiply_linked_file);
 
         if selector_glob.is_some() {
-            if let Err(e) = push_checked_written(
+            if let Err(e) = push_checked(
                 &implicit,
-                written.as_deref(),
                 protected,
+                resolver,
+                caps,
                 budget,
+                &mut aliases,
                 &mut out.outcomes,
             ) {
                 return finish_call_exhausted(out, part, e);
@@ -1748,11 +1713,11 @@ pub(crate) fn resolve_subject_paths_impl(
                 &implicit,
                 Default::default(),
                 filters_slice,
-                written.as_deref(),
                 protected,
                 resolver,
                 caps,
                 budget,
+                &mut aliases,
             ) {
                 Ok(rec) => {
                     out.multiply_linked_file |= rec.multiply_linked_file;
@@ -1769,11 +1734,13 @@ pub(crate) fn resolve_subject_paths_impl(
                 Err(e) => return finish_call_exhausted(out, part, e),
             }
         } else {
-            if let Err(e) = push_checked_written(
+            if let Err(e) = push_checked(
                 &implicit,
-                written.as_deref(),
                 protected,
+                resolver,
+                caps,
                 budget,
+                &mut aliases,
                 &mut out.outcomes,
             ) {
                 return finish_call_exhausted(out, part, e);
@@ -1795,7 +1762,7 @@ pub(crate) fn resolve_subject_paths_impl(
                     Ok(f) => f,
                     Err(e) => return finish_call_exhausted(out, filter_part, e),
                 };
-                let written_root = match written.as_deref() {
+                let written_root = match implicit.written.as_deref() {
                     Some(w) => match fold_path_listed(w, protected.folds, budget) {
                         Ok(fw) if fw != folded_root => Some((w, fw)),
                         Ok(_) => None,
@@ -1817,6 +1784,7 @@ pub(crate) fn resolve_subject_paths_impl(
                     budget,
                     &mut out.outcomes,
                     &mut out.multiply_linked_file,
+                    &mut aliases,
                 ) {
                     return finish_call_exhausted(out, filter_part, e);
                 }
@@ -1886,7 +1854,7 @@ pub(crate) fn resolve_subject_paths_impl(
 
         let mut escaped = root_bases.is_empty() && !anchored;
         for (base, base_written) in &root_bases {
-            let (exp, exact_written) = match expand_shell_glob_written(
+            let (exp, _entries) = match expand_shell_glob_written(
                 &word,
                 base,
                 base_written,
@@ -1912,7 +1880,7 @@ pub(crate) fn resolve_subject_paths_impl(
                     return finish_call_exhausted(out, PartId::WholeCall, e);
                 }
             }
-            for (target, written_spelling) in exp.exact_matches.into_iter().zip(exact_written) {
+            for target in exp.exact_matches {
                 if out.targets.len() >= limits::MAX_PATHS {
                     if let Err(e) = push_charged(
                         &mut out.outcomes,
@@ -1936,11 +1904,13 @@ pub(crate) fn resolve_subject_paths_impl(
                     }
                 }
                 record_multiply_linked(&target, &mut out.multiply_linked_file);
-                if let Err(e) = push_checked_written(
+                if let Err(e) = push_checked(
                     &target,
-                    written_spelling.as_deref(),
                     protected,
+                    resolver,
+                    caps,
                     budget,
+                    &mut aliases,
                     &mut out.outcomes,
                 ) {
                     return finish_call_exhausted(out, filter_part, e);
@@ -2009,16 +1979,16 @@ pub(crate) fn resolve_subject_paths_impl(
         }
         // If recursive is also set on the subject, run S8 / hard-link checks on roots.
         if recursive {
-            for (root, root_written) in roots.iter().zip(&roots_written) {
+            for root in &roots {
                 match check_recursive_root_impl(
                     root,
                     Default::default(),
                     &[],
-                    root_written.as_deref(),
                     protected,
                     resolver,
                     caps,
                     budget,
+                    &mut aliases,
                 ) {
                     Ok(rec) => {
                         out.multiply_linked_file |= rec.multiply_linked_file;

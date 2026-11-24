@@ -143,6 +143,7 @@ fn unread_target(origin: TargetOrigin, access: AccessMode, reason: UnreadReason)
         origin,
         access,
         resolution: TargetResolution::Unread(reason),
+        written: None,
     }
 }
 
@@ -191,9 +192,60 @@ pub(crate) fn word_spelling(
     lexical_spelling(raw, written_cwd, home, budget)
 }
 
-/// Implementation of `v4::paths::resolve_literal` (contract §3, §5, §8).
+/// The path of `word`'s final entry as the shell passes it (`~` expanded,
+/// joined onto the real working directory, not normalised and not followed),
+/// so `lstat` sees the entry itself, a link included (review 4, finding 6).
+pub(crate) fn word_entry_path(
+    word: &Word,
+    cwd: &[u8],
+    home: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<Option<Vec<u8>>, Exhausted> {
+    let raw = word.literal_bytes();
+    if raw.is_empty() || raw.contains(&0) {
+        return Ok(None);
+    }
+    budget.charge(raw.len() as u64 + 1)?;
+    budget.charge_alloc(raw.len() + cwd.len().max(home.len()) + 2)?;
+    let path = if word.starts_with_unquoted_tilde() {
+        if raw == b"~" {
+            home.to_vec()
+        } else if let Some(rest) = raw.strip_prefix(b"~/") {
+            join_bytes(home, rest)
+        } else {
+            return Ok(None);
+        }
+    } else if raw.starts_with(b"/") {
+        raw.to_vec()
+    } else {
+        join_bytes(cwd, raw)
+    };
+    Ok(Some(path))
+}
+
+/// Implementation of `v4::paths::resolve_literal` (contract §3, §5, §8): the
+/// resolution, with the target's written spelling (`Target::written`, D-149)
+/// on `cwd`. A flow whose written working directory differs from its real one
+/// replaces it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_literal_impl(
+    raw: &[u8],
+    cwd: &[u8],
+    home: &[u8],
+    origin: TargetOrigin,
+    access: AccessMode,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+) -> Result<Target, Exhausted> {
+    let written = lexical_spelling(raw, cwd, home, budget)?;
+    let mut target = resolve_literal_inner(raw, cwd, home, origin, access, resolver, caps, budget)?;
+    target.written = written;
+    Ok(target)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_literal_inner(
     raw: &[u8],
     cwd: &[u8],
     home: &[u8],
@@ -542,6 +594,7 @@ pub(crate) fn resolve_literal_impl(
             dangling_symlink,
             multiply_linked,
         },
+        written: None,
     })
 }
 

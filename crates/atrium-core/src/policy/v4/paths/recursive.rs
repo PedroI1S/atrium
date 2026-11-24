@@ -17,8 +17,9 @@ use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl};
 use crate::policy::v4::paths::sensitive::{
     ASK_FILES, ASK_NAME_PREFIXES, ASK_TREES, BROWSER_FILES, BROWSER_ROOTS, CRED_FILES, CRED_TREES,
-    SharedSensitive, check_target_impl, fold_listed_component, fold_path_listed, join_folded,
-    origin_to_part, push_charged, under_bytes, under_str, written_name_hit,
+    RootAliases, SharedSensitive, alias_name_hit, check_target_all, fold_listed_component,
+    fold_path_listed, join_folded, origin_to_part, push_charged, push_target_records, under_bytes,
+    under_str,
 };
 
 fn finish_recursive_exhausted(
@@ -47,11 +48,11 @@ pub(crate) fn check_recursive_root_impl(
     root: &Target,
     links: LinkPolicy,
     filters: &[SearchFilter],
-    written_root: Option<&[u8]>,
     protected: &ProtectedSet,
     resolver: &dyn PathResolver,
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
+    aliases: &mut RootAliases,
 ) -> Result<RecursiveRootResult, Exhausted> {
     let root_part = origin_to_part(&root.origin);
     let mut result = RecursiveRootResult::default();
@@ -61,15 +62,24 @@ pub(crate) fn check_recursive_root_impl(
     budget.charge_alloc(4 * std::mem::size_of::<PartResult>())?;
     result.outcomes.reserve_exact(4);
 
+    // 1. The root's own records, first: its written spelling's protected
+    //    names (D-147, D-149), the canonical check, unlisted equivalences,
+    //    the gap, and `dev`'s alias rule. An Unread root keeps its name hit
+    //    beside its reason (§1; review 5, finding 1).
+    if let Err(e) = push_target_records(
+        root,
+        protected,
+        resolver,
+        caps,
+        budget,
+        aliases,
+        &mut result.outcomes,
+        true,
+    ) {
+        return finish_recursive_exhausted(result, root_part, e);
+    }
     let (root_canon, root_multiply_linked) = match &root.resolution {
-        TargetResolution::Unread(reason) => {
-            budget.charge(1)?;
-            result.outcomes.push(PartResult {
-                part: root_part,
-                outcome: PartOutcome::Unread(reason.clone()),
-            });
-            return Ok(result);
-        }
+        TargetResolution::Unread(_) => return Ok(result),
         TargetResolution::Resolved {
             canonical,
             multiply_linked,
@@ -79,15 +89,6 @@ pub(crate) fn check_recursive_root_impl(
 
     if root_multiply_linked {
         result.multiply_linked_file = true;
-    }
-
-    // 1. Check the root target itself (identities, listed folds, unlisted equivalences).
-    let root_check = match check_target_impl(root, protected, budget) {
-        Ok(r) => r,
-        Err(e) => return finish_recursive_exhausted(result, root_part, e),
-    };
-    if !matches!(root_check.outcome, PartOutcome::Clear) {
-        result.outcomes.push(root_check);
     }
 
     let shared = match SharedSensitive::for_protected_budgeted(protected, budget) {
@@ -106,67 +107,63 @@ pub(crate) fn check_recursive_root_impl(
     };
     let mut exempt_root = is_s8_exempt(&folded_root, shared.home_folded());
 
-    // D-147: the written spelling of the root (when the flow knows it) is
-    // checked like the canonical one, as on `dev`: its own protected name,
-    // S8, the store and exempt-root rule, and the filter's selected entries
-    // and probes.
-    let written = match written_root {
-        Some(w) => match fold_path_listed(w, protected.folds, budget) {
-            Ok(f) if f != folded_root => Some((w, f)),
-            Ok(_) => None,
+    // D-147, D-149: the root's other spellings are named like the canonical
+    // one, as on `dev`: its written spelling, and `dev`'s alias spelling when
+    // it lies below a protected root that is a link (`alias_fix`). They give
+    // names only; every filesystem check below uses the real root
+    // (`root_canon`), never a spelling (review 5's class rule).
+    let alias = match aliases.roots(protected, resolver, caps, budget) {
+        Ok(roots) => match RootAliases::rewrite(roots, root_canon, budget) {
+            Ok(a) => a,
             Err(e) => return finish_recursive_exhausted(result, root_part, e),
         },
-        None => None,
+        Err(e) => return finish_recursive_exhausted(result, root_part, e),
     };
-    if let Some((w, folded_w)) = &written {
-        match written_name_hit(w, root.access, &root_part, protected, budget) {
-            Ok(Some(hit)) => {
-                if let Err(e) = push_charged(&mut result.outcomes, hit, budget) {
-                    return finish_recursive_exhausted(result, root_part, e);
-                }
-            }
-            Ok(None) => {}
+    let mut spellings: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for s in root.written.iter().chain(alias.iter()) {
+        let folded = match fold_path_listed(s, protected.folds, budget) {
+            Ok(f) => f,
             Err(e) => return finish_recursive_exhausted(result, root_part, e),
+        };
+        if folded != folded_root && !spellings.iter().any(|(_, f)| *f == folded) {
+            if let Err(e) = budget.charge_alloc(s.len()) {
+                return finish_recursive_exhausted(result, root_part, e);
+            }
+            if let Err(e) = push_charged(&mut spellings, (s.clone(), folded), budget) {
+                return finish_recursive_exhausted(result, root_part, e);
+            }
         }
-        exempt_root |= is_s8_exempt(folded_w, shared.home_folded());
     }
+    for (_, folded_s) in &spellings {
+        exempt_root |= is_s8_exempt(folded_s, shared.home_folded());
+    }
+    let written = spellings.first().map(|(s, f)| (s.as_slice(), f.as_slice()));
 
     // 2. S8 protected-root policy (§5, §11 item 12): a recursive root that
     //    contains an existing hard-deny path is HardDeny whatever its filters.
     //    Exemptions: home itself, ancestors of home, and `~/.config` (D-133).
-    //    Extends to ancestors of Atrium data paths outside home.
-    let s8_hit = match check_s8_protected_root(
-        root_canon,
-        &folded_root,
-        &root_part,
-        protected,
-        &shared,
-        resolver,
-        caps,
-        budget,
-        &mut result.outcomes,
-    ) {
-        Ok(hit) => hit,
-        Err(e) => return finish_recursive_exhausted(result, root_part, e),
-    };
-    let s8_hit = s8_hit
-        || match &written {
-            Some((w, folded_w)) => match check_s8_protected_root(
-                w,
-                folded_w,
-                &root_part,
-                protected,
-                &shared,
-                resolver,
-                caps,
-                budget,
-                &mut result.outcomes,
-            ) {
-                Ok(hit) => hit,
-                Err(e) => return finish_recursive_exhausted(result, root_part, e),
-            },
-            None => false,
-        };
+    //    Extends to ancestors of Atrium data paths outside home. Checked under
+    //    the canonical name and every other spelling, on the real root.
+    let mut s8_hit = false;
+    for folded_s in std::iter::once(&folded_root).chain(spellings.iter().map(|(_, f)| f)) {
+        match check_s8_protected_root(
+            root_canon,
+            folded_s,
+            &root_part,
+            protected,
+            &shared,
+            resolver,
+            caps,
+            budget,
+            &mut result.outcomes,
+        ) {
+            Ok(hit) => s8_hit |= hit,
+            Err(e) => return finish_recursive_exhausted(result, root_part, e),
+        }
+        if s8_hit {
+            break;
+        }
+    }
 
     // 2b. S8-exempted roots (home, ancestors of home, `~/.config`) and roots
     //     containing credential stores (CR-12 + CR-17) keep `dev`'s
@@ -175,9 +172,9 @@ pub(crate) fn check_recursive_root_impl(
     if !s8_hit
         && let Some(family) = root_contains_store_or_exempt_sensitive(&folded_root, &shared)
             .or_else(|| {
-                written
-                    .as_ref()
-                    .and_then(|(_, f)| root_contains_store_or_exempt_sensitive(f, &shared))
+                spellings
+                    .iter()
+                    .find_map(|(_, f)| root_contains_store_or_exempt_sensitive(f, &shared))
             })
     {
         let store_hit = PartResult {
@@ -209,7 +206,7 @@ pub(crate) fn check_recursive_root_impl(
         && let Err(e) = check_filter_on_root(
             root_canon,
             &folded_root,
-            written.as_ref().map(|(w, f)| (*w, f.as_slice())),
+            written,
             filter,
             true,
             &filter_part,
@@ -220,6 +217,7 @@ pub(crate) fn check_recursive_root_impl(
             budget,
             &mut result.outcomes,
             &mut result.multiply_linked_file,
+            aliases,
         )
     {
         return finish_recursive_exhausted(result, filter_part, e);
@@ -238,6 +236,7 @@ pub(crate) fn check_recursive_root_impl(
             budget,
             &mut result.outcomes,
             &mut result.multiply_linked_file,
+            aliases,
         )
     {
         return finish_recursive_exhausted(result, root_part, e);
@@ -1290,6 +1289,7 @@ pub(crate) fn check_filter_on_root(
     budget: &mut ComputeBudget,
     outcomes: &mut Vec<PartResult>,
     multiply_linked_file: &mut bool,
+    aliases: &mut RootAliases,
 ) -> Result<(), Exhausted> {
     let compiled = match compile_filter(filter, budget)? {
         Ok(c) => c,
@@ -1427,23 +1427,17 @@ pub(crate) fn check_filter_on_root(
                     {
                         *multiply_linked_file = true;
                     }
-                    let res = check_target_impl(&resolved, protected, budget)?;
-                    if !matches!(res.outcome, PartOutcome::Clear) {
-                        push_charged(outcomes, res, budget)?;
-                    }
+                    // Named on the written root when it differs (D-147); every
+                    // record kept, a Store hit beside a gap's Unread (review 5,
+                    // finding 6).
+                    let mut resolved = resolved;
                     if let Some((w, _)) = written_root {
                         budget.charge_alloc(w.len() + 1 + entry_rel.len())?;
-                        let written_entry = join_bytes(w, &entry_rel);
-                        if let Some(hit) = written_name_hit(
-                            &written_entry,
-                            AccessMode::Read,
-                            filter_part,
-                            protected,
-                            budget,
-                        )? {
-                            push_charged(outcomes, hit, budget)?;
-                        }
+                        resolved.written = Some(join_bytes(w, &entry_rel));
                     }
+                    push_target_records(
+                        &resolved, protected, resolver, caps, budget, aliases, outcomes, true,
+                    )?;
                 }
                 Ok(false) => {}
                 Err(unread) => {
@@ -1779,6 +1773,7 @@ fn walk_followed_links(
     budget: &mut ComputeBudget,
     outcomes: &mut Vec<PartResult>,
     multiply_linked_file: &mut bool,
+    aliases: &mut RootAliases,
 ) -> Result<(), Exhausted> {
     budget.charge_alloc(root_canon.len().saturating_mul(2))?;
     let mut visited_paths: HashSet<Vec<u8>> = HashSet::new();
@@ -1895,67 +1890,69 @@ fn walk_followed_links(
                         *multiply_linked_file = true;
                     }
 
-                    let checked = check_target_impl(&target, protected, budget)?;
-                    match checked.outcome {
-                        PartOutcome::HardDenyHit(hit) => {
-                            if has_filter {
+                    // The link's records: its target's check (written and canonical
+                    // names, identities, gaps), `dev`'s alias rule, and `dev`'s
+                    // `links_below` rule: a link whose real path is in, is, or holds
+                    // a canonical protected root reaches it (review 5, finding 2).
+                    // Under a filter a hit is an over-approximation: Unread.
+                    let mut records = check_target_all(&target, protected, budget)?;
+                    if let Some(hit) =
+                        alias_name_hit(&target, protected, resolver, caps, budget, aliases)?
+                    {
+                        push_charged(&mut records, hit, budget)?;
+                    }
+                    if let TargetResolution::Resolved { canonical, .. } = &target.resolution {
+                        let is_dir = match resolver.stat(canonical, caps, budget) {
+                            Ok(md) => md.file_type == FileType::Dir,
+                            Err(ResolveError::Exhausted(e)) => return Err(e),
+                            Err(_) => false,
+                        };
+                        let roots = aliases.roots(protected, resolver, caps, budget)?;
+                        if let Some(root) = RootAliases::reached(roots, canonical, is_dir, budget)?
+                        {
+                            let hit = root.hit(part, budget)?;
+                            push_charged(&mut records, hit, budget)?;
+                        }
+                    }
+                    let mut under_filter_recorded = false;
+                    for r in records {
+                        match r.outcome {
+                            PartOutcome::HardDenyHit(_) | PartOutcome::StoreHit(_)
+                                if has_filter =>
+                            {
+                                if !under_filter_recorded {
+                                    under_filter_recorded = true;
+                                    budget.charge_alloc(child.len())?;
+                                    push_charged(
+                                        outcomes,
+                                        PartResult {
+                                            part: part.clone(),
+                                            outcome: PartOutcome::Unread(
+                                                UnreadReason::FollowedLinkUnderFilter {
+                                                    path: child.clone(),
+                                                },
+                                            ),
+                                        },
+                                        budget,
+                                    )?;
+                                }
+                            }
+                            PartOutcome::HardDenyHit(_)
+                            | PartOutcome::StoreHit(_)
+                            | PartOutcome::Unread(_) => {
                                 push_charged(
                                     outcomes,
                                     PartResult {
                                         part: part.clone(),
-                                        outcome: PartOutcome::Unread(
-                                            UnreadReason::FollowedLinkUnderFilter { path: child },
-                                        ),
-                                    },
-                                    budget,
-                                )?;
-                            } else {
-                                push_charged(
-                                    outcomes,
-                                    PartResult {
-                                        part: part.clone(),
-                                        outcome: PartOutcome::HardDenyHit(hit),
+                                        outcome: r.outcome,
                                     },
                                     budget,
                                 )?;
                             }
+                            PartOutcome::Clear
+                            | PartOutcome::Exhausted(_)
+                            | PartOutcome::TooLarge(_) => {}
                         }
-                        PartOutcome::StoreHit(hit) => {
-                            if has_filter {
-                                push_charged(
-                                    outcomes,
-                                    PartResult {
-                                        part: part.clone(),
-                                        outcome: PartOutcome::Unread(
-                                            UnreadReason::FollowedLinkUnderFilter { path: child },
-                                        ),
-                                    },
-                                    budget,
-                                )?;
-                            } else {
-                                push_charged(
-                                    outcomes,
-                                    PartResult {
-                                        part: part.clone(),
-                                        outcome: PartOutcome::StoreHit(hit),
-                                    },
-                                    budget,
-                                )?;
-                            }
-                        }
-                        PartOutcome::Unread(reason) => {
-                            push_charged(
-                                outcomes,
-                                PartResult {
-                                    part: part.clone(),
-                                    outcome: PartOutcome::Unread(reason),
-                                },
-                                budget,
-                            )?;
-                        }
-                        PartOutcome::Clear
-                        | PartOutcome::Exhausted(_)
-                        | PartOutcome::TooLarge(_) => {}
                     }
 
                     if let TargetResolution::Resolved {

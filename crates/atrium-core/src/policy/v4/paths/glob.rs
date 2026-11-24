@@ -18,7 +18,7 @@ use crate::policy::model::{
 };
 use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::resolve::{
-    join_bytes, resolve_literal_impl, resolve_word_literal, word_spelling,
+    join_bytes, resolve_literal_impl, resolve_word_literal, word_entry_path, word_spelling,
 };
 use crate::policy::v4::paths::sensitive::{ChargedRecord, lexical_spelling, push_charged};
 
@@ -439,14 +439,16 @@ pub(crate) fn expand_shell_glob_impl(
     .map(|(expansion, _)| expansion)
 }
 
-/// A glob expansion with the written spelling of each exact match.
+/// A glob expansion with the entry path of each exact match.
 pub(crate) type WrittenExpansion = (GlobExpansion, Vec<Option<Vec<u8>>>);
 
-/// [`expand_shell_glob_impl`], also returning the written spelling of each
-/// exact match (aligned with `exact_matches`): the matched path as spelled
-/// from the pattern, on the written working directory `written_cwd` for a
-/// relative pattern, so its protected names are checked as on `dev` (D-147).
-/// Variant-only matches get none: they are never hits.
+/// [`expand_shell_glob_impl`] on a written working directory `written_cwd`:
+/// each exact match's `Target::written` is the matched path as spelled from
+/// the pattern (on `written_cwd` for a relative pattern), so its protected
+/// names are checked as on `dev` (D-147, D-149); variant-only matches get no
+/// written spelling, since they are never hits. Also returns, aligned with
+/// `exact_matches`, each match's actual entry path (the expanded entry, not
+/// followed), for checks of the entry's own type (review 5, finding 4).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expand_shell_glob_written(
     pattern: &Word,
@@ -464,7 +466,7 @@ pub(crate) fn expand_shell_glob_written(
     budget.charge((raw.len() + cwd.len() + home.len() + 1) as u64)?;
 
     let mut expansion = GlobExpansion::default();
-    let mut written: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut entries: Vec<Option<Vec<u8>>> = Vec::new();
     let relative = !raw.starts_with(b"/") && !pattern.starts_with_unquoted_tilde();
     let cwd_comps = cwd.split(|&b| b == b'/').filter(|c| !c.is_empty()).count();
 
@@ -473,7 +475,7 @@ pub(crate) fn expand_shell_glob_written(
         expansion
             .unread
             .push(UnreadReason::UnresolvablePath { path: raw.to_vec() });
-        return Ok((expansion, written));
+        return Ok((expansion, entries));
     }
 
     // No unquoted glob characters at all: resolve as a literal path (§3, §10 row 9).
@@ -491,10 +493,12 @@ pub(crate) fn expand_shell_glob_written(
             caps,
             budget,
         )?;
+        let mut t = t;
+        t.written = word_spelling(pattern, written_cwd, home, budget)?;
         expansion.exact_matches.push(t);
-        let w = word_spelling(pattern, written_cwd, home, budget)?;
-        push_charged(&mut written, w, budget)?;
-        return Ok((expansion, written));
+        let e = word_entry_path(pattern, cwd, home, budget)?;
+        push_charged(&mut entries, e, budget)?;
+        return Ok((expansion, entries));
     }
 
     // Build an absolute `(bytes, provenance)` stream where expanded `home` and
@@ -524,7 +528,7 @@ pub(crate) fn expand_shell_glob_written(
                 UnreadReason::UnsupportedTildeForm,
                 budget,
             )?;
-            return Ok((expansion, written));
+            return Ok((expansion, entries));
         }
     } else if raw.starts_with(b"/") {
         abs_bytes.extend_from_slice(raw);
@@ -555,7 +559,7 @@ pub(crate) fn expand_shell_glob_written(
                 Ok(comp) => push_charged(&mut comps, comp, budget)?,
                 Err(unread) => {
                     push_charged(&mut expansion.unread, unread, budget)?;
-                    return Ok((expansion, written));
+                    return Ok((expansion, entries));
                 }
             }
         }
@@ -874,9 +878,11 @@ pub(crate) fn expand_shell_glob_written(
             caps,
             budget,
         )?;
+        let mut fallback = fallback;
+        fallback.written = word_spelling(pattern, written_cwd, home, budget)?;
         expansion.exact_matches.push(fallback);
-        let w = word_spelling(pattern, written_cwd, home, budget)?;
-        push_charged(&mut written, w, budget)?;
+        let e = word_entry_path(pattern, cwd, home, budget)?;
+        push_charged(&mut entries, e, budget)?;
     }
 
     for matched in exact_paths {
@@ -893,8 +899,8 @@ pub(crate) fn expand_shell_glob_written(
             caps,
             budget,
         )?;
-        expansion.exact_matches.push(target);
-        let w = if relative {
+        let mut target = target;
+        target.written = if relative {
             let rest: Vec<&[u8]> = matched
                 .split(|&b| b == b'/')
                 .filter(|c| !c.is_empty())
@@ -906,7 +912,9 @@ pub(crate) fn expand_shell_glob_written(
         } else {
             lexical_spelling(&matched, b"/", home, budget)?
         };
-        push_charged(&mut written, w, budget)?;
+        expansion.exact_matches.push(target);
+        budget.charge_alloc(matched.len())?;
+        push_charged(&mut entries, Some(matched), budget)?;
     }
 
     for matched in variant_paths {
@@ -923,10 +931,12 @@ pub(crate) fn expand_shell_glob_written(
             caps,
             budget,
         )?;
+        let mut target = target;
+        target.written = None;
         expansion.variant_only_matches.push(target);
     }
 
-    Ok((expansion, written))
+    Ok((expansion, entries))
 }
 
 fn push_unique_unread(
