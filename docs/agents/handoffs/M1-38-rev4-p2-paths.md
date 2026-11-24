@@ -636,3 +636,51 @@ Review 6 (Codex) had 5 findings. It accepted the pure `check_target` alias limit
 Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
 
 The budget-sweep tests run `check_recursive_root` many times, densely for 4,096 budgets after the first hit and then every 61. They may take a few seconds.
+
+## 13. Round 9 (D-154)
+
+Review 7 (Codex) had 4 findings, all in the alias code. D-154 asks for `dev`'s `alias_fix` and `links_below` (`gate.rs`) to be ported as literally as P2's types allow. Commits: `d731e0a` (port and fixes) and `328b86a` (regression tests). No change requests.
+
+### 13.1 The port (`sensitive.rs`, `RootAliases`)
+
+| `dev` (`gate.rs`) | P2 |
+|---|---|
+| `roots`: `sensitive_roots` + `ask_roots`, each with `identity(&r)` (`fs::metadata`, through links); unidentifiable roots skipped | `RootAliases::roots`: the same lists. Each root is read with `resolver.stat` (charged). It is skipped only when absent (`NotFound`, `ENOTDIR`); a cap or I/O failure marks the table incomplete (§8). |
+| `ask_roots`: `ASK_FILES`, `ASK_TREES`, and up to 256 entries of `~/.azure` whose lowercased name starts with `msal_token_cache.` | The same, through `resolver.read_dir`, with every name and copy charged. |
+| `alias_fix`: strip the firmlink; for each ancestor, shortest first, compare `identity(prefix)` with the roots; the first match gives root spelling + rest | `RootAliases::scan(canonical)`: the same order and rule, by `FileIdentity`, with every stat and copy charged. An absent ancestor ends the scan, since nothing below it exists. A cap or I/O failure ends it and is returned as the scan's Unread reason. |
+| `trees_of` (`fs::canonicalize`) and `in_trees` for `links_below` | `ProtectedRoot::canonical` and `RootAliases::reached`, unchanged in logic. The store roots that ask get `held` as `dev`'s `trees_of` gives them. |
+
+Differences from `dev`, each a P2 type constraint or the stricter side:
+- **The `~/.azure` folder:** it is kept in the alias table to spell the paths below it (review 7, finding 2's first case), but with `reach: false`, so `links_below` never reaches it wholesale (review 6, finding 4). Only the names below it decide.
+- **`~/.ssh` members:** `dev` adds the members of `~/.ssh` to the alias roots. P2 already covers them by identity in `ProtectedSet` (hard links, and the link targets recorded for `~/.ssh` under D-145), so they are not repeated here.
+
+### 13.2 Findings, fixes, tests
+
+| Finding | Fix | Regression test (`p2_tests.rs`) |
+|---|---|---|
+| 1 Aliases compared canonical spellings, not identities | 13.1. `FakeFs::bind_dir` models a bind mount: a second directory name with the same inode. | `round9_f1_protected_root_under_another_name_is_found_by_identity` (browser root and `~/.ssh`) |
+| 2 Filter probes ignored alias spellings | `other_spellings` gives the written and alias spellings of a root. Probes run on the canonical spelling and on every other one in `check_filter_on_root`, which takes the whole list, not `spellings.first()`. This covers the subject flow (explicit and implicit roots) and recursive roots. | `round9_f2_filter_probes_see_the_protected_root_alias` (the `~/.azure` store probe; `~/other` + browser alias) |
+| 3 A found alias dropped the incomplete-table Unread | `push_alias_records` keeps the scan's reason (incomplete table or unreadable ancestor) as Unread unless the alias gave a hard-deny hit. The reason sits beside a Store hit. | `round9_f3_alias_found_with_an_incomplete_table_keeps_its_reason` (`~/.ssh/config` alone; `~/.cargo/credentials` with its Store hit) |
+| 4 Glob spelling allocated before charging | The relative written spelling is built straight into a charged buffer, with no intermediate list. Growth of `exact_matches` and `variant_only_matches` goes through `push_charged`. | `round9_f4_glob_spelling_and_matches_are_charged` (every allocation budget completes or reports the allocation budget, monotonically). An allocation-counting allocator is not possible in a library test, so the ordering holds by construction. |
+| Correction to round 6, finding 3 | The dotless-i test now says that Unicode default case folding keeps `ı` distinct from `i`, and that Unread is the conservative answer. | `round8_f3_…` (comment); new independent case `round9_alias_spelling_gets_an_independent_unlisted_equivalence` (a zero-width space, a documented default-ignorable code point, below an aliased browser root) |
+
+### 13.3 Class sweeps
+
+- **Every comparison with a protected root uses identity as `dev` does.**
+  - Alias spellings (single targets, recursive roots, filter and selector bases, followed links) all come from `RootAliases::scan`.
+  - `links_below` stays canonical, as in `dev`.
+  - Hard links and members are compared by identity in `ProtectedSet`, unchanged.
+- **Every probe sees every spelling:**
+  - filter probes (13.2, row 2);
+  - selector-glob probes (base, written base, and now the base's alias);
+  - S8 and the store rule of a followed link (canonical and alias spellings, on the real folder);
+  - S8 and the store rule of a recursive root (canonical, written and alias).
+- **Charges:** the S8 candidate list (`next`) now grows through `push_charged`.
+
+### 13.4 Verification
+
+Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
+
+Expectations that rest on the review's text rather than code tracing:
+- `~/.ssh/config` is not a hard-deny name (13.2, row 3).
+- The filter `msal*` on a non-recursive root uses the probe path.
