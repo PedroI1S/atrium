@@ -23,6 +23,7 @@ use crate::policy::model::{
 use crate::policy::v4::paths::resolver::fake::FakeFs;
 use crate::policy::v4::paths::sensitive::{
     RootAliases, SharedSensitive, build_protected_set, fold_listed_component, fold_path_listed,
+    lossy_lowercase_starts_with,
 };
 use crate::policy::v4::paths::{
     FsResolver, PathResolver, check_recursive_root, check_target, expand_shell_glob,
@@ -6139,4 +6140,141 @@ fn round9_f4_glob_spelling_and_matches_are_charged() {
         }
     }
     assert!(completed_at.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// 12. Rework Round 10 regressions (review round 8, D-155)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round10_f1_ssh_member_folder_under_another_name_is_an_alias() {
+    // Review 8, finding 1: `dev`'s `ssh_members` makes the ordinary folder
+    // `~/.ssh/keys` an alias root. With the empty folder also named
+    // `/mnt/keys` (a bind mount), `/mnt/keys/future` is
+    // `~/.ssh/keys/future`: a hard deny.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/h/u/.ssh/keys");
+    fs.bind_dir(b"/h/u/.ssh/keys", b"/mnt/keys");
+    let prot = default_build(&fs);
+    let r = subject("/mnt/keys/future", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_hard_deny(&r.outcomes, "credential-read"),
+        "{:?}",
+        r.outcomes
+    );
+}
+
+#[test]
+fn round10_sweep_store_root_is_read_on_devs_spelling() {
+    // Sweep against `dev`'s root list: `dev`'s `ask_roots` reads
+    // `~/.azure/accessTokens.json` (mixed case). On a case-sensitive volume
+    // a link there to `/tmp/tok.json` makes `/tmp/tok.json` that store's
+    // alias: a Store hit, not Clear.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/tok.json");
+    fs.add_symlink(b"/h/u/.azure/accessTokens.json", b"/tmp/tok.json");
+    let prot = default_build(&fs);
+    let r = subject("/tmp/tok.json", AccessMode::Read, &prot, &fs);
+    assert!(has_store_hit(&r.outcomes), "{:?}", r.outcomes);
+}
+
+#[test]
+fn round10_f2_incomplete_reason_is_charged_before_it_is_copied() {
+    // Review 8, finding 2: an untraversable `~/.azure` leaves the table
+    // incomplete with an `UnresolvablePath` below it (at least 11 bytes). A scan
+    // under an allocation budget smaller than that reason reports the
+    // allocation budget (the copy is charged first); with room it returns
+    // the reason. The order (charge, then clone) holds by construction.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/h/u/.azure");
+    fs.set_dir_unreadable(b"/h/u/.azure", FsIoError::PermissionDenied);
+    let prot = default_build(&fs);
+    let mut aliases = RootAliases::default();
+    let mut caps = FsCaps::with_default_limits();
+    aliases
+        .roots(
+            &prot,
+            &fs,
+            &mut caps,
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    assert!(matches!(
+        aliases.incomplete(),
+        Some(UnreadReason::UnresolvablePath { .. })
+    ));
+    let mut tight = ComputeBudget::new(u64::MAX, 10);
+    let err = match aliases.scan(b"/tmp/x", &prot, &fs, &mut caps, &mut tight) {
+        Err(e) => e,
+        Ok(_) => panic!("the reason's copy must be charged"),
+    };
+    assert_eq!(err.reason, ExhaustReason::AllocationBudget);
+    let scan = aliases
+        .scan(
+            b"/tmp/x",
+            &prot,
+            &fs,
+            &mut caps,
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    assert!(matches!(
+        scan.unread,
+        Some(UnreadReason::UnresolvablePath { .. })
+    ));
+}
+
+#[test]
+fn round10_f3_msal_prefix_test_matches_devs_lossy_lowercase() {
+    // Review 8, finding 3: the MSAL prefix test is `dev`'s
+    // `to_string_lossy().to_lowercase().starts_with(pre)`, now decided
+    // without allocating. It agrees with `dev`'s expression on valid,
+    // mixed-case and invalid UTF-8 names (64 `0xFF` bytes, which `dev`
+    // expands to 192 bytes of U+FFFD).
+    let prefix = "msal_token_cache.";
+    let mut ff = b"msal_token_cache.".to_vec();
+    ff.extend(std::iter::repeat_n(0xFF_u8, 64));
+    let names: Vec<Vec<u8>> = vec![
+        b"msal_token_cache.json".to_vec(),
+        b"MSAL_TOKEN_CACHE.bin".to_vec(),
+        b"msal_token_cache".to_vec(),
+        b"msal_token_cachex".to_vec(),
+        b"".to_vec(),
+        ff.clone(),
+        std::iter::repeat_n(0xFF_u8, 64).collect(),
+        b"msal\xFF_token_cache.json".to_vec(),
+        "MSAL_TO\u{212A}EN_CACHE.json".as_bytes().to_vec(),
+        "\u{0130}msal_token_cache.json".as_bytes().to_vec(),
+    ];
+    for n in &names {
+        let dev = String::from_utf8_lossy(n)
+            .to_lowercase()
+            .starts_with(prefix);
+        assert_eq!(lossy_lowercase_starts_with(n, prefix), dev, "{n:?}");
+    }
+    assert!(lossy_lowercase_starts_with(&ff, prefix));
+
+    // And the discovery itself: an MSAL entry with an invalid name is found
+    // (a Store hit through a link to it), under a default budget.
+    let mut fs = FakeFs::new();
+    let mut entry = b"/h/u/.azure/".to_vec();
+    entry.extend_from_slice(&ff);
+    fs.add_file(&entry);
+    fs.add_symlink(b"/h/u/proj/c", &entry);
+    let prot = default_build(&fs);
+    let root = literal(b"proj", AccessMode::Read, &fs);
+    let res = check_recursive_root(
+        &root,
+        LinkPolicy {
+            at_root: true,
+            below_root: true,
+        },
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_store_hit(&res.outcomes), "{:?}", res.outcomes);
 }

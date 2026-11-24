@@ -3136,7 +3136,7 @@ pub(crate) fn build_protected_set(
 /// `from_utf8_lossy` gives) and each scalar is lowercased in turn. Per-scalar
 /// lowercasing differs from the string-level one only for a final capital
 /// sigma, which is not ASCII either way, so the answer is the same.
-fn lossy_lowercase_starts_with(name: &[u8], prefix: &str) -> bool {
+pub(crate) fn lossy_lowercase_starts_with(name: &[u8], prefix: &str) -> bool {
     let mut want = prefix.chars();
     for chunk in name.utf8_chunks() {
         let lowered = chunk
