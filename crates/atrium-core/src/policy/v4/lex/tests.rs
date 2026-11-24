@@ -2632,3 +2632,74 @@ fn r8_best_effort_too_large_beats_exhaustion() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 9 (D-150; review round 7): structural caps before any charge
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r9_max_bytes_beats_exhaustion_at_every_entry_point() {
+    let budgets = || {
+        [
+            ComputeBudget::new(0, usize::MAX),
+            ComputeBudget::new(0, 0),
+            ComputeBudget::new(1, 1),
+            ComputeBudget::new(3, 0),
+        ]
+    };
+    let over = "a".repeat(limits::MAX_BYTES + 1);
+    let half = "b".repeat(limits::MAX_BYTES / 2 + 1);
+    let third = "c".repeat(limits::MAX_BYTES / 3 + 1);
+    let inputs: [Vec<&str>; 4] = [
+        // Review round 7's failing case: one oversized text.
+        vec![&over],
+        // Several texts whose sum exceeds the cap.
+        vec![&half, &half],
+        vec![&third, &third, &third],
+        vec!["", &half, "x", &half],
+    ];
+    for texts in &inputs {
+        for mut b in budgets() {
+            assert_eq!(
+                lex_best_effort(texts, &mut b),
+                Err(PartOutcome::TooLarge(Cap::Bytes)),
+                "{} texts",
+                texts.len()
+            );
+        }
+        for mut b in budgets() {
+            let mut rec = BestEffortRecord::default();
+            assert_eq!(
+                lex_best_effort_into(texts, &mut rec, &mut b),
+                Err(PartOutcome::TooLarge(Cap::Bytes))
+            );
+            assert!(rec.raw_texts.is_empty() && rec.units.is_empty());
+        }
+    }
+
+    // The exact entry points already check the cap first; pinned here.
+    for mut b in budgets() {
+        assert_eq!(
+            lex_exact(&over, 0, None, &mut b),
+            Err(PartOutcome::TooLarge(Cap::Bytes))
+        );
+    }
+    for mut b in budgets() {
+        assert_eq!(
+            crate::policy::v4::units::build_units(&over, &FoldRules::REV4, &mut b),
+            Err(PartOutcome::TooLarge(Cap::Bytes))
+        );
+    }
+
+    // At exactly `MAX_BYTES` the cap does not apply, so a zero budget is
+    // `Exhausted`.
+    let exact = "a".repeat(limits::MAX_BYTES);
+    assert!(matches!(
+        lex_best_effort(&[&exact], &mut ComputeBudget::new(0, 0)),
+        Err(PartOutcome::Exhausted(_))
+    ));
+    assert!(matches!(
+        lex_exact(&exact, 0, None, &mut ComputeBudget::new(0, 0)),
+        Err(PartOutcome::Exhausted(_))
+    ));
+}
