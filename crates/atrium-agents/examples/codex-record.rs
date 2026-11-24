@@ -258,10 +258,7 @@ impl ToolGate for ScriptGate {
             | Mode::DenyApproval
             | Mode::AskThenApprove
             | Mode::InterruptAfterApproval => GateDecision::Ask {
-                ticket: ApprovalTicket {
-                    request_id: self.next_id("req"),
-                    rememberable: check.kind == ToolKind::Execute,
-                },
+                ticket: ApprovalTicket::new(self.next_id("req"), check.kind == ToolKind::Execute),
             },
             Mode::QuestionAnswer | Mode::QuestionDecline => GateDecision::Allow,
         };
@@ -284,12 +281,7 @@ impl ToolGate for ScriptGate {
 
     fn question_ticket(&self, _turn: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
         let id = self.next_id("question");
-        Box::pin(async move {
-            Some(ApprovalTicket {
-                request_id: id,
-                rememberable: false,
-            })
-        })
+        Box::pin(async move { Some(ApprovalTicket::new(id, false)) })
     }
 }
 

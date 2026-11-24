@@ -3,14 +3,27 @@
 use std::sync::Arc;
 
 use atrium_agents::BoxFuture;
-use atrium_protocol::policy::Rule;
+use atrium_protocol::agent::UnreadNotice;
+use atrium_protocol::policy::{PolicyContext, Rule};
 use atrium_protocol::thread::ThreadId;
 use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use super::codec::{enum_str, from_json, str_enum, to_json};
 use super::writer::Writer;
 use super::{Shared, now_ms, sql_err};
 use crate::{Binding, RequestKey, RequestStore, StoreError, StoreResult};
+
+/// Wire shape stored in `requests.context`: preserves the exact `PolicyContext`
+/// JSON for rows without an `unread` notice, while carrying `unread` across
+/// restarts without requiring a schema migration.
+#[derive(Serialize, Deserialize)]
+struct StoredContext {
+    #[serde(flatten)]
+    context: PolicyContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unread: Option<UnreadNotice>,
+}
 
 pub(crate) struct Requests {
     pub(super) shared: Arc<Shared>,
@@ -43,7 +56,10 @@ impl Writer {
                 Some(b.tool_name.clone()),
                 Some(enum_str(&b.tool_kind)),
                 Some(b.input_sha256.clone()),
-                Some(to_json(&b.context)?),
+                Some(to_json(&StoredContext {
+                    context: b.context,
+                    unread: b.unread,
+                })?),
                 b.title.clone(),
                 b.remember_matcher.as_ref().map(to_json).transpose()?,
             ),
@@ -258,6 +274,7 @@ impl RequestStore for Requests {
                 return Ok(None);
             };
             let missing = || StoreError::Sqlite("approval row is missing its binding".into());
+            let stored_context: StoredContext = from_json(&context.ok_or_else(missing)?)?;
             Ok(Some((
                 status,
                 Binding {
@@ -265,9 +282,10 @@ impl RequestStore for Requests {
                     tool_name: name.ok_or_else(missing)?,
                     tool_kind: str_enum(&kind.ok_or_else(missing)?)?,
                     input_sha256: sha.ok_or_else(missing)?,
-                    context: from_json(&context.ok_or_else(missing)?)?,
+                    context: stored_context.context,
                     title,
                     remember_matcher: matcher.map(|m| from_json(&m)).transpose()?,
+                    unread: stored_context.unread,
                 },
             )))
         })

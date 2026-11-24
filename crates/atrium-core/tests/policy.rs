@@ -1825,10 +1825,7 @@ fn gate_failure_denies() {
     ));
     assert!(block_on(g.gate.question_ticket(Some(1))).is_some());
     // an unknown ticket can't redeem
-    let bogus = ApprovalTicket {
-        request_id: "nope".into(),
-        rememberable: false,
-    };
+    let bogus = ApprovalTicket::new("nope".into(), false);
     assert!(matches!(
         block_on(g.gate.redeem(&bogus, &cmd_check("touch x"))),
         GateDecision::Deny { .. }

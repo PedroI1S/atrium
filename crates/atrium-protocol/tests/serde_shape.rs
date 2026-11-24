@@ -266,6 +266,7 @@ fn agent_all_event_variants() {
             input: json!({"command": "rm -rf target"}),
             reason: Some("delete files".into()),
             rememberable: true,
+            unread: None,
         },
         json!({
             "type": "approval_requested",
@@ -277,6 +278,58 @@ fn agent_all_event_variants() {
             "input": {"command": "rm -rf target"},
             "reason": "delete files",
             "rememberable": true
+        }),
+    );
+
+    round_trip(
+        &AgentEvent::ApprovalRequested {
+            request_id: "req_unread".into(),
+            call_id: Some("c2".into()),
+            name: "Bash".into(),
+            kind: ToolKind::Execute,
+            title: Some("for f in *.rs; do wc -l \"$f\"; done".into()),
+            input: json!({"command": "for f in *.rs; do wc -l \"$f\"; done"}),
+            reason: None,
+            rememberable: false,
+            unread: Some(UnreadNotice::Unread),
+        },
+        json!({
+            "type": "approval_requested",
+            "request_id": "req_unread",
+            "call_id": "c2",
+            "name": "Bash",
+            "kind": "execute",
+            "title": "for f in *.rs; do wc -l \"$f\"; done",
+            "input": {"command": "for f in *.rs; do wc -l \"$f\"; done"},
+            "reason": null,
+            "rememberable": false,
+            "unread": "unread"
+        }),
+    );
+
+    round_trip(
+        &AgentEvent::ApprovalRequested {
+            request_id: "req_exhausted".into(),
+            call_id: None,
+            name: "Bash".into(),
+            kind: ToolKind::Execute,
+            title: Some("long command".into()),
+            input: json!({"command": "long command"}),
+            reason: None,
+            rememberable: false,
+            unread: Some(UnreadNotice::Exhausted),
+        },
+        json!({
+            "type": "approval_requested",
+            "request_id": "req_exhausted",
+            "call_id": null,
+            "name": "Bash",
+            "kind": "execute",
+            "title": "long command",
+            "input": {"command": "long command"},
+            "reason": null,
+            "rememberable": false,
+            "unread": "exhausted"
         }),
     );
 
@@ -1455,7 +1508,7 @@ fn serde_default_fields_omitted() {
         }
     );
 
-    // 3. AgentEvent::ApprovalRequested with `rememberable` omitted
+    // 3. AgentEvent::ApprovalRequested with `rememberable` and `unread` omitted
     let json_approval = json!({
         "type": "approval_requested",
         "request_id": "r1",
@@ -1478,7 +1531,43 @@ fn serde_default_fields_omitted() {
             input: json!({}),
             reason: None,
             rememberable: false,
+            unread: None,
         }
+    );
+
+    // 3b. AgentEvent::ApprovalRequested with explicit `"unread": null` parses as `None`
+    // and omits `"unread"` when re-serialized.
+    let json_approval_null_unread = json!({
+        "type": "approval_requested",
+        "request_id": "r2",
+        "call_id": null,
+        "name": "Bash",
+        "kind": "execute",
+        "title": null,
+        "input": {},
+        "reason": null,
+        "rememberable": true,
+        "unread": null
+    });
+    let event: AgentEvent = serde_json::from_value(json_approval_null_unread).unwrap();
+    assert_eq!(
+        event,
+        AgentEvent::ApprovalRequested {
+            request_id: "r2".into(),
+            call_id: None,
+            name: "Bash".into(),
+            kind: ToolKind::Execute,
+            title: None,
+            input: json!({}),
+            reason: None,
+            rememberable: true,
+            unread: None,
+        }
+    );
+    let reencoded = serde_json::to_value(&event).unwrap();
+    assert!(
+        reencoded.get("unread").is_none(),
+        "unread: None should be omitted on serialization"
     );
 
     // 4. AgentEvent::Error with `details` omitted
@@ -1549,4 +1638,58 @@ fn serde_default_fields_omitted() {
             question_at_ms: None,
         }
     );
+}
+
+#[test]
+fn approvals_fixture_and_ts_mirror_match_protocol() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("repo root");
+    let fixture_path = repo_root.join("app/src/chat/fixtures/approvals.json");
+    let raw = std::fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", fixture_path.display()));
+    let messages: Vec<ServerMessage> =
+        serde_json::from_str(&raw).expect("approvals.json must deserialize as Vec<ServerMessage>");
+
+    let reencoded = serde_json::to_value(&messages).expect("serialize ServerMessage list");
+    let roundtripped: Vec<ServerMessage> =
+        serde_json::from_value(reencoded).expect("round-trip ServerMessage list");
+    assert_eq!(roundtripped, messages);
+
+    let mut saw_none = false;
+    let mut saw_unread = false;
+    let mut saw_exhausted = false;
+    for msg in &messages {
+        if let ServerMessage::Event { event } = msg
+            && let AgentEvent::ApprovalRequested { unread, .. } = &event.envelope.event
+        {
+            match unread {
+                None => saw_none = true,
+                Some(UnreadNotice::Unread) => saw_unread = true,
+                Some(UnreadNotice::Exhausted) => saw_exhausted = true,
+            }
+        }
+    }
+    assert!(
+        saw_none,
+        "approvals.json should cover ordinary approvals (unread: None)"
+    );
+    assert!(
+        saw_unread,
+        "approvals.json should cover UnreadNotice::Unread"
+    );
+    assert!(
+        saw_exhausted,
+        "approvals.json should cover UnreadNotice::Exhausted"
+    );
+
+    let ts_path = manifest_dir.join("bindings/protocol.ts");
+    let ts = std::fs::read_to_string(&ts_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ts_path.display()));
+    assert!(ts.contains("export type UnreadNotice ="));
+    assert!(ts.contains("\"unread\""));
+    assert!(ts.contains("\"exhausted\""));
+    assert!(ts.contains("unread?: UnreadNotice"));
 }

@@ -38,19 +38,139 @@ function AlwaysBlocked() {
           </div>
         )}
       </For>
-      <p class="note">Atrium checks these on every call it sees, before it runs, whatever the agent's enforcement level. A call Atrium doesn't see (see an agent's details in Agents) isn't checked, and a program that was allowed to run isn't checked again.</p>
+      <p class="note" data-atrium-part="hard-deny-scope">
+        Always blocked for commands Atrium can read in full. Commands built at run time (variables, loops, $(…), inline scripts) are checked on a best-effort basis under FullAccess and Any rules. Atrium checks these on every call it sees, before it runs, whatever the agent's enforcement level. A call Atrium doesn't see (see an agent's details in Agents) isn't checked, and a program that was allowed to run isn't checked again.
+      </p>
     </div>
   );
 }
 
-/*
- * CR-12 (rev 3.1, D-082), lands after M1-18 merges: the credential stores that always ask
- * (never auto-allowed in Home, but not blocked: an approval or a rule may allow them). The
- * Settings page "that lists what is protected names them" (contract §9). Its list mounts here,
- * between Always blocked and Known limits, read from the app like `hardDeny`.
+export interface UncheckedAssumption {
+  id: string;
+  title: string;
+  text: string;
+}
+
+/**
+ * Assumptions Atrium's policy checks don't cover (contract rev 4 §2, §9, §11 item 3).
+ * Stated in plain words, one short line each.
  */
+export const UNCHECKED_ASSUMPTIONS: readonly UncheckedAssumption[] = [
+  {
+    id: "command-names",
+    title: "Command names",
+    text: "A command called cat or git is assumed to be the usual system tool, even if another program with that name comes first on the system.",
+  },
+  {
+    id: "user-config",
+    title: "Your own configuration",
+    text: "Your own shell configuration (aliases, functions, options) and repository configuration (git config, build scripts).",
+  },
+  {
+    id: "repo-contents",
+    title: "Commit and diff contents",
+    text: "What commits and diffs contain beyond the file paths a git command names.",
+  },
+  {
+    id: "other-processes",
+    title: "Other processes and timing",
+    text: "Files or links changed by another process after Atrium checks them.",
+  },
+  {
+    id: "hard-links",
+    title: "Hard links in large folders",
+    text: "In large folders, Atrium checks only a limited number of files and folder levels for hard links to protected files.",
+  },
+  {
+    id: "inherited-fds",
+    title: "Inherited file descriptors",
+    text: "Open files passed down from a parent program beyond standard input, output, and error.",
+  },
+];
+
+function WhatAtriumCantCheck(): JSX.Element {
+  return (
+    <div class="s-sec" data-atrium-part="cant-check-section">
+      <div class="row">
+        <div class="rl">
+          <b>What Atrium can't check</b>
+          <span>Things Atrium's checks assume and don't verify.</span>
+        </div>
+      </div>
+      <div class="s-list" data-atrium-part="cant-check">
+        <For each={UNCHECKED_ASSUMPTIONS}>
+          {(a) => (
+            <div class="s-item" data-id={a.id}>
+              <Dot tone="idle" />
+              <div class="s-main">
+                <b>{a.title}</b>
+                <span>{a.text}</span>
+              </div>
+            </div>
+          )}
+        </For>
+      </div>
+    </div>
+  );
+}
+
+export interface AskStore {
+  id: string;
+  title: string;
+  paths: string;
+}
+
+/**
+ * Credential stores that always ask in Home (contract rev 4 §5–§6, §9; CR-12, CR-17, D-082):
+ * never auto-allowed in Home, but not blocked — an approval or a rule may allow them.
+ */
+export const ASK_STORES: readonly AskStore[] = [
+  {
+    id: "packages",
+    title: "Package and registry credentials",
+    paths: "~/.cargo/credentials.toml, ~/.cargo/credentials, ~/.pypirc, ~/.gem/credentials, ~/.yarnrc.yml",
+  },
+  {
+    id: "cloud-infra",
+    title: "Cloud, database and secret-manager configs",
+    paths: "~/.aws/sso/cache/, ~/.azure/accessTokens.json, ~/.azure/msal_token_cache.*, ~/.terraform.d/credentials.tfrc.json, ~/.config/op/config, ~/.vault-token, ~/.pgpass",
+  },
+  {
+    id: "git-env",
+    title: "Git credentials and environment files",
+    paths: "~/.config/git/credentials, ~/.env, and git reads (git show, git cat-file, git log -p, git diff) on credential files",
+  },
+  {
+    id: "shell-history",
+    title: "Shell history files",
+    paths: "~/.bash_history, ~/.zsh_history, ~/.zhistory, ~/.sh_history, ~/.ksh_history, ~/.history, ~/.local/share/fish/fish_history, ~/.config/fish/fish_history, ~/.zsh_sessions/, ~/.bash_sessions/",
+  },
+];
+
 function CredentialStoresThatAsk(): JSX.Element {
-  return null;
+  return (
+    <div class="s-sec" data-atrium-part="ask-stores-section">
+      <div class="row">
+        <div class="rl">
+          <b>Credential stores that ask</b>
+          <span>Home never reads or searches these without asking. Unlike Always blocked, you can approve once or add a rule.</span>
+        </div>
+      </div>
+      <div class="s-list" data-atrium-part="ask-stores">
+        <For each={ASK_STORES}>
+          {(s) => (
+            <div class="s-item" data-id={s.id}>
+              <Dot tone="needs-you" />
+              <div class="s-main">
+                <b>{s.title}</b>
+                <span>{s.paths}</span>
+              </div>
+            </div>
+          )}
+        </For>
+      </div>
+    </div>
+  );
 }
 
 const LIMITS: { id: string; title: string; text: string }[] = [
@@ -87,7 +207,7 @@ function KnownLimits() {
 }
 
 const BLOCKS: Record<string, () => JSX.Element> = {
-  "always-blocked": () => <><AlwaysBlocked /><CredentialStoresThatAsk /></>,
+  "always-blocked": () => <><AlwaysBlocked /><WhatAtriumCantCheck /><CredentialStoresThatAsk /></>,
   "known-limits": KnownLimits,
 };
 

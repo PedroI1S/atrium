@@ -291,7 +291,7 @@ The columns are **Home / prefix or exact rule / Any rule / FullAccess**, with `h
 
 **Approved earlier** (listed for completeness): CR-17's four stores (D-111); CR-19's name folds (D-118); D-133's `~/.config` exception.
 
-**For Pedro [D-013]:**
+**For Pedro [D-013]:** confirmed, all 15 items (D-157, 2026-11-24).
 1. **Unread allows under Any rules and FullAccess,** after the best-effort pass. This generalizes D-133's second point: the hard deny is promised only within the model, and reviews no longer count misses on Unread parts.
 2. **Unread always asks in Home and under prefix and exact rules,** including lines `dev` allows by resolving them, such as K7's exact positional cases (D-130), long readable `env` lines (K9) and ANSI-C words.
 3. **The Settings text** and the stated assumptions (§2, §9).

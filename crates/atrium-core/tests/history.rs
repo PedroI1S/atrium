@@ -918,6 +918,7 @@ fn markdown_is_a_readable_transcript() {
             input: json!({ "command": "ls" }),
             reason: Some("Not in the read-only list".into()),
             rememberable: true,
+            unread: None,
         })
         .push(AgentEvent::RequestResolved {
             request_id: "r1".into(),

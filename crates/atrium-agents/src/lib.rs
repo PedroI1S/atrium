@@ -70,7 +70,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atrium_host::supervise::ProcessIdentity;
-use atrium_protocol::agent::{AgentEvent, AgentEventEnvelope, Provider, SessionCommand, ToolKind};
+use atrium_protocol::agent::{
+    AgentEvent, AgentEventEnvelope, Provider, SessionCommand, ToolKind, UnreadNotice,
+};
 use atrium_protocol::policy::{EnforcementDescriptor, ToolSubject};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -253,9 +255,49 @@ pub trait ToolGate: Send + Sync {
 pub struct ApprovalTicket {
     pub request_id: String,
     /// Copied into `ApprovalRequested.rememberable`. Always `false` for
-    /// question tickets.
+    /// question tickets and for approvals with an `unread` notice.
     #[serde(default)]
     pub rememberable: bool,
+    /// Copied into `ApprovalRequested.unread` when Atrium couldn't read the
+    /// call in full (contract rev 4 §9). Always `None` for question tickets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread: Option<UnreadNotice>,
+}
+
+impl ApprovalTicket {
+    /// Builds an approval ticket without an unread notice.
+    pub fn new(request_id: String, rememberable: bool) -> Self {
+        Self {
+            request_id,
+            rememberable,
+            unread: None,
+        }
+    }
+
+    /// Builds an approval ticket carrying an [`UnreadNotice`] (contract rev 4
+    /// §9). Always sets `rememberable` to `false`.
+    pub fn with_unread(request_id: String, unread: UnreadNotice) -> Self {
+        Self {
+            request_id,
+            rememberable: false,
+            unread: Some(unread),
+        }
+    }
+
+    /// Builds an approval ticket with an optional [`UnreadNotice`]. Whenever
+    /// `unread` is `Some`, `rememberable` is forced to `false` (contract rev 4
+    /// §7, §9).
+    pub fn with_notice(
+        request_id: String,
+        rememberable: bool,
+        unread: Option<UnreadNotice>,
+    ) -> Self {
+        Self {
+            request_id,
+            rememberable: rememberable && unread.is_none(),
+            unread,
+        }
+    }
 }
 
 /// A tool call the provider is about to run.

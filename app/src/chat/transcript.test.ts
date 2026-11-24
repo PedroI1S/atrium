@@ -353,4 +353,16 @@ describe("recorded approvals and questions (the fake agent can't raise them)", (
     expect(cardState(r1, { status: "refused", action: "allow", code: "internal", message: "the store is unavailable", unknownOutcome: false })).toEqual({ kind: "failed", text: "the store is unavailable" });
     expect(cardState(r1, { status: "refused", action: "allow", code: null, message: "the connection dropped", unknownOutcome: true }).kind).toBe("failed");
   });
+
+  it("carries the unread notice from recorded approvals and defaults omitted unread to null", () => {
+    const t = upTo(22);
+    const plain = req(t, "r1", 2) as ApprovalItem;
+    const unread = req(t, "r3", 2) as ApprovalItem;
+    const exhausted = req(t, "r4", 2) as ApprovalItem;
+    expect(plain.unread).toBeNull();
+    expect(unread.unread).toBe("unread");
+    expect(unread.rememberable).toBe(false);
+    expect(exhausted.unread).toBe("exhausted");
+    expect(exhausted.rememberable).toBe(false);
+  });
 });

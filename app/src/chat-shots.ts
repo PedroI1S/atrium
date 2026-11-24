@@ -129,6 +129,12 @@ export function seeds(now: number) {
     .tool("c1", "Bash", "execute", "rm -rf build", null);
   approval.add({ type: "approval_requested", request_id: "q1", call_id: "c1", name: "Bash", kind: "execute", title: "rm -rf build", input: { command: "rm -rf build" }, reason: "Home asks before anything is deleted or changed.", rememberable: true });
 
+  const approvalUnread = new Seed("seed-approval-unread", "Count lines in every Rust file", now - 3 * MINUTE_MS).start()
+    .user(1, "Count lines in every Rust file")
+    .says("a1", "I'll loop over the Rust files and count their lines.")
+    .tool("c1", "Bash", "execute", 'for f in *.rs; do wc -l "$f"; done', null);
+  approvalUnread.add({ type: "approval_requested", request_id: "u1", call_id: "c1", name: "Bash", kind: "execute", title: 'for f in *.rs; do wc -l "$f"; done', input: { command: 'for f in *.rs; do wc -l "$f"; done' }, reason: null, rememberable: false, unread: "unread" });
+
   const question = new Seed("seed-question", "Add a refresh-rate setting", now - 9 * MINUTE_MS).start()
     .user(1, "Add a refresh-rate setting to the display preferences")
     .says("a1", "Before I write it, one thing decides the shape of the setting.");
@@ -158,7 +164,7 @@ export function seeds(now: number) {
     { thread_id: failed.id, reason: "failed", since_ms: now - 25 * MINUTE_MS, title: failed.title, detail: FAILURE },
     { thread_id: reply.id, reason: "reply", since_ms: now - 47 * MINUTE_MS, title: reply.title, detail: null },
   ];
-  return { all: [stream, approval, question, failed, reply], stream, approval, question, summaries, inbox };
+  return { all: [stream, approval, question, failed, reply], stream, approval, approvalUnread, question, summaries, inbox };
 }
 
 export const click = (selector: string): boolean => {
@@ -184,11 +190,13 @@ export async function runChatShots(): Promise<void> {
   await command({ type: "create_rule", rule: { scope: { type: "global" }, tool_kind: "execute", tool_name: null, matcher: { type: "command_exact", argv: ["git", "push", "--force"] }, path_scope: null, decision: "deny" } });
 
   const seeded = seeds(Date.now());
+  const chatSeeds = [...seeded.all, seeded.approvalUnread];
   for (const summary of seeded.summaries) apply({ type: "thread_updated", summary });
+  apply({ type: "thread_updated", summary: seeded.approvalUnread.summary({ type: "needs_approval" }, { pending_approvals: 1, attention_since_ms: Date.now() - 3 * MINUTE_MS, attention_detail: 'for f in *.rs; do wc -l "$f"; done' }) });
   // This window holds every seeded thread for the whole run, so each keeps its model.
-  for (const seed of seeded.all) holdThread(seed.id);
+  for (const seed of chatSeeds) holdThread(seed.id);
   await sleep(UNKNOWN_THREAD_WAIT_MS);
-  for (const seed of seeded.all) apply({ type: "snapshot", thread_id: seed.id, events: seed.events, has_older: false, truncated: false, last: seed.events[seed.events.length - 1]!.id });
+  for (const seed of chatSeeds) apply({ type: "snapshot", thread_id: seed.id, events: seed.events, has_older: false, truncated: false, last: seed.events[seed.events.length - 1]!.id });
   apply({ type: "inbox_updated", items: seeded.inbox });
 
   // 1. A streaming chat with markdown and tool calls: the last message grows while it is pictured.
@@ -214,6 +222,13 @@ export async function runChatShots(): Promise<void> {
   await patchSettings({ theme: "light" });
   await shot("chat-approval-always-light");
   click('[data-atrium-part="approval"] button[aria-haspopup="menu"]');
+
+  // 2b. An approval card Atrium can't read in full (contract rev 4 §9): notice shown, no "Always…".
+  openThread(seeded.approvalUnread.id);
+  await patchView(seeded.approvalUnread.id, { draft: "" });
+  await both("chat-approval-unread");
+  notes.unreadNotice = document.querySelector('[data-atrium-part="approval-unread"]')?.textContent ?? null;
+  notes.unreadAlwaysOffered = document.querySelector('[data-atrium-part="approval"] button[aria-haspopup="menu"]') !== null;
 
   // 3. A question form, with one option chosen.
   openThread(seeded.question.id);

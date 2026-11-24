@@ -45,7 +45,9 @@ call_id: string | null; name: string; kind: ToolKind; title: string | null; inpu
  *  The gate can turn this into a rule ("always…"); when `false` the UI
  *  offers only allow/deny once.
  */
-rememberable?: boolean } | 
+rememberable?: boolean; 
+/**  Present when Atrium couldn't read the call in full (contract rev 4 §9). */
+unread?: UnreadNotice | null } | 
 /**
  *  The agent asked the user something. Answer with
  *  [`SessionCommand::AnswerQuestion`] or dismiss with
@@ -671,6 +673,13 @@ glob: string | null; recursive: boolean } | { type: "fetch"; url: string } | { t
 export type TurnOutcome = "completed" | "interrupted" | "failed" | 
 /**  The provider stopped on a turn or token limit. */
 "limit_reached";
+
+/**  Why Atrium couldn't check a tool call in full (contract rev 4 §9). */
+export type UnreadNotice = 
+/**  Part of the call is outside the command or path model. */
+"unread" | 
+/**  The check ran out of its budget, or the tool subject is unknown. */
+"exhausted";
 
 /**  Token counts. Fields a provider doesn't report stay `None`. */
 export type Usage = {

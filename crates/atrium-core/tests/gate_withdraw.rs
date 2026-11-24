@@ -293,11 +293,8 @@ async fn withdraw_is_idempotent_across_resolved_redeemed_and_unknown_tickets() {
     gate.withdraw(&q_answered).await;
 
     // Unknown ticket -> withdraw is a no-op.
-    gate.withdraw(&ApprovalTicket {
-        request_id: "unknown-ticket".into(),
-        rememberable: false,
-    })
-    .await;
+    gate.withdraw(&ApprovalTicket::new("unknown-ticket".into(), false))
+        .await;
 
     // None of the withdrawn/final tickets count as open.
     assert_eq!(

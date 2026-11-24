@@ -296,6 +296,10 @@ pub struct Binding {
     /// opens the approval (it has the check and the resolved paths). `None`:
     /// not rememberable (`ApprovalRequested.rememberable = false`).
     pub remember_matcher: Option<atrium_protocol::policy::RuleMatcher>,
+    /// Present when Atrium couldn't read the call in full (contract rev 4 §9).
+    /// When set, the approval is never rememberable and the notice travels
+    /// through the ticket into `ApprovalRequested.unread`.
+    pub unread: Option<atrium_protocol::agent::UnreadNotice>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

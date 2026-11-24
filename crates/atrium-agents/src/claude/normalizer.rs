@@ -1010,6 +1010,7 @@ impl ClaudeNormalizer {
             input: c.input.clone(),
             reason: c.reason.clone(),
             rememberable: ticket.rememberable,
+            unread: ticket.unread,
         });
         let call_id = c.tool_use_id.clone();
         self.pending.push((
