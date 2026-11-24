@@ -954,3 +954,10 @@ P2's next round, round 5 (Opus 5.5, D-142), applies this ruling, keeps the rest 
 2. **D-146 is amended with two rules.** Both only add Unread.
    - Unquoted `/` is not an accepted member of `[…]`. A slash never matches inside a class in pathname matching, and the shells treat it differently.
    - A quoted or escaped `!` or `^` inside a class is also outside the model, following D-146's unqualified "no `!` or `^`".
+
+## D-149 — 2026-11-24 — rodrigo: CR-P2-3 amends P0 (the written spelling on `Target`)
+**Decided by rodrigo (driver), on the orchestrator's recommendation.** D-147 makes P2 check protected names on the written spelling as well as the canonical path, as `dev` does. The frozen `check_target(target, …)` and `check_recursive_root(root, …)` receive only a `Target`, and its resolution carries the canonical path, so these standalone entry points can't see the written spelling. Two cases fail. One is `~/.config/google-chrome/Cookies` when the folder is a link.
+- **P0 (M1-36) round 8** adds `written: Option<Vec<u8>>` to `Target` in `policy/model.rs`: the lexically normalised written spelling, which `resolve_literal` and glob expansion fill.
+- A Codex review and the verification follow. P1 and P2 are rebased onto the new tip.
+- P2 then replaces its side channel (`push_checked_written`, `written_root`) with the field.
+- P0 has not merged yet, so `dev` is untouched. Its merge still needs rodrigo's go (D-138).
