@@ -544,24 +544,49 @@ impl ExactSink for OutputSink {
 
 /// Unread reasons of the pending unit, plus the sink they are flushed into.
 ///
-/// Invariant: the sink always has `pending.len() + 1` free outcome slots, so
-/// moving the pending reasons and recording the final `Exhausted` never
+/// Invariant: the sink always has `pending.len() + held + 1` free outcome slots,
+/// so moving the pending reasons and recording the final `Exhausted` never
 /// allocate.
 pub(super) struct ReasonSink<'s> {
     pending: Vec<UnreadReason>,
+    /// Slots held for reasons the word or redirect being read may carry.
+    held: usize,
     out: &'s mut dyn ExactSink,
 }
 
 impl ReasonSink<'_> {
-    /// Reserves room for `n` more pending reasons (and their outcome slots).
+    /// Reserves room for `n` more pending reasons (and their outcome slots),
+    /// on top of the slots currently held.
     fn reserve(&mut self, n: usize, budget: &mut ComputeBudget) -> Result<(), Exhausted> {
-        charge_vec_growth(&mut self.pending, n, budget)?;
-        let free = self.pending.len().saturating_add(n).saturating_add(1);
+        let extra = self.held.saturating_add(n);
+        charge_vec_growth(&mut self.pending, extra, budget)?;
+        let free = self.pending.len().saturating_add(extra).saturating_add(1);
         self.out.reserve_outcomes(free, budget)
     }
 
-    /// Stores a reason into room reserved with [`Self::reserve`].
+    /// Stores a reason into room reserved with [`Self::reserve`] just before.
     fn push_reserved(&mut self, reason: UnreadReason) {
+        push_reserved(&mut self.pending, reason);
+    }
+
+    /// Holds `n` slots for reasons a word or redirect may carry once it is
+    /// read. Reasons recorded while it is being read reserve beyond the
+    /// held slots, so they never use them up. A new hold replaces the
+    /// previous one, whose word or redirect is finished by then.
+    fn hold(&mut self, n: usize, budget: &mut ComputeBudget) -> Result<(), Exhausted> {
+        self.held = 0;
+        self.reserve(n, budget)?;
+        self.held = n;
+        Ok(())
+    }
+
+    /// Stores a reason into a slot held with [`Self::hold`].
+    fn push_held(&mut self, reason: UnreadReason) {
+        debug_assert!(
+            self.held > 0,
+            "reason slot must be held before the read (§8)"
+        );
+        self.held = self.held.saturating_sub(1);
         push_reserved(&mut self.pending, reason);
     }
 }
@@ -1501,7 +1526,7 @@ fn lex_exact_redirect(
     sink.out.reserve_unit(scanner.budget)?;
     charge_vec_growth(&mut cur.redirects, 1, scanner.budget)?;
     scanner.budget.charge(REDIRECT_RECORD_UNITS)?;
-    sink.reserve(2, scanner.budget)?;
+    sink.hold(2, scanner.budget)?;
     scanner.budget.charge_alloc(REDIRECT_REASON_ALLOC_MAX)?;
 
     let target_opt = if scanner.peek().is_some_and(|b| !is_word_boundary(b)) {
@@ -1516,12 +1541,12 @@ fn lex_exact_redirect(
     if let Some((fd, _)) = explicit_fd
         && fd > 2
     {
-        sink.push_reserved(UnreadReason::DescriptorOutsideStd { fd });
+        sink.push_held(UnreadReason::DescriptorOutsideStd { fd });
         // Also check if DupOut/DupIn has a target descriptor > 2.
         if matches!(op, Op::DupOut | Op::DupIn)
             && let Some(m) = target_opt.as_ref().and_then(target_fd_over_std)
         {
-            sink.push_reserved(UnreadReason::DescriptorOutsideStd { fd: m });
+            sink.push_held(UnreadReason::DescriptorOutsideStd { fd: m });
         }
         return Ok(());
     }
@@ -1529,33 +1554,33 @@ fn lex_exact_redirect(
     let op_reason = |op: &str| UnreadReason::UnsupportedRedirect { op: op.to_string() };
     match op {
         Op::DupIn => {
-            sink.push_reserved(op_reason("<&"));
+            sink.push_held(op_reason("<&"));
             if let Some(m) = target_opt.as_ref().and_then(target_fd_over_std) {
-                sink.push_reserved(UnreadReason::DescriptorOutsideStd { fd: m });
+                sink.push_held(UnreadReason::DescriptorOutsideStd { fd: m });
             }
         }
         Op::ReadWrite | Op::Clobber => {
-            sink.push_reserved(op_reason(op_str));
+            sink.push_held(op_reason(op_str));
         }
         Op::DupOut => {
             let Some(target) = target_opt else {
-                sink.push_reserved(op_reason(">&"));
+                sink.push_held(op_reason(">&"));
                 return Ok(());
             };
             let Some((fd, digit_len)) = explicit_fd else {
                 // `>&2` / `>&-` / `>&file`: explicit `n` in 0..=2 required by §3's closed list.
-                sink.push_reserved(op_reason(">&"));
+                sink.push_held(op_reason(">&"));
                 if let Some(m) = target_fd_over_std(&target) {
-                    sink.push_reserved(UnreadReason::DescriptorOutsideStd { fd: m });
+                    sink.push_held(UnreadReason::DescriptorOutsideStd { fd: m });
                 }
                 return Ok(());
             };
             if digit_len != 1 {
-                sink.push_reserved(op_reason(">&"));
+                sink.push_held(op_reason(">&"));
                 return Ok(());
             }
             let Some(from) = u8::try_from(fd).ok().and_then(StdFd::from_u8) else {
-                sink.push_reserved(UnreadReason::DescriptorOutsideStd { fd });
+                sink.push_held(UnreadReason::DescriptorOutsideStd { fd });
                 return Ok(());
             };
             let tb = target.word.literal_bytes();
@@ -1565,14 +1590,14 @@ fn lex_exact_redirect(
                 let to = StdFd::from_u8(tb[0] - b'0').expect("0..=2");
                 push_reserved(&mut cur.redirects, ModelRedirect::Dup { from, to });
             } else if let Some(m) = target_fd_over_std(&target) {
-                sink.push_reserved(UnreadReason::DescriptorOutsideStd { fd: m });
+                sink.push_held(UnreadReason::DescriptorOutsideStd { fd: m });
             } else {
-                sink.push_reserved(op_reason(">&"));
+                sink.push_held(op_reason(">&"));
             }
         }
         Op::Read | Op::Write | Op::Append => {
             let Some(target) = target_opt else {
-                sink.push_reserved(op_reason(op_str));
+                sink.push_held(op_reason(op_str));
                 return Ok(());
             };
             let glob_target = target.has_unquoted_glob;
@@ -1598,17 +1623,17 @@ fn lex_exact_redirect(
                 Some(r) => {
                     if glob_target {
                         // zsh expands globs in redirect targets (MULTIOS); not a literal target.
-                        sink.push_reserved(UnreadReason::UnsupportedRedirect {
+                        sink.push_held(UnreadReason::UnsupportedRedirect {
                             op: format!("{op_str} (glob target)"),
                         });
                     }
                     push_reserved(&mut cur.redirects, r);
                 }
                 None => match explicit_fd {
-                    Some((fd, _)) => sink.push_reserved(UnreadReason::UnsupportedRedirect {
+                    Some((fd, _)) => sink.push_held(UnreadReason::UnsupportedRedirect {
                         op: format!("{fd}{op_str}"),
                     }),
-                    None => sink.push_reserved(op_reason(op_str)),
+                    None => sink.push_held(op_reason(op_str)),
                 },
             }
         }
@@ -1697,7 +1722,7 @@ fn reserve_word_storage(
     charge_vec_growth(&mut cur.argv, 1, scanner.budget)?;
     if in_command_position {
         scanner.budget.charge(1)?;
-        sink.reserve(1, scanner.budget)?;
+        sink.hold(1, scanner.budget)?;
     }
     Ok(())
 }
@@ -1791,6 +1816,7 @@ pub(super) fn lex_exact_core(
     let mut scanner = ExactScanner::new(line, budget);
     let mut sink = ReasonSink {
         pending: Vec::new(),
+        held: 0,
         out,
     };
     let mut cur = PendingUnit::new(Separator::Start, None);
@@ -2014,7 +2040,7 @@ pub(super) fn lex_exact_core(
                     if let Some(kw) = rw.standalone_reserved {
                         cur.seen_command_word = true;
                         push_reserved(&mut cur.argv, rw.word);
-                        sink.push_reserved(UnreadReason::ReservedWordOrConstruct {
+                        sink.push_held(UnreadReason::ReservedWordOrConstruct {
                             construct: kw.to_string(),
                         });
                         continue;
@@ -2027,7 +2053,7 @@ pub(super) fn lex_exact_core(
                                 cur.leading_sets_home = true;
                             }
                             push_reserved(&mut cur.argv, rw.word);
-                            sink.push_reserved(UnreadReason::Assignment);
+                            sink.push_held(UnreadReason::Assignment);
                             continue;
                         }
                         cur.seen_command_word = true;
@@ -2043,7 +2069,7 @@ pub(super) fn lex_exact_core(
                             if let Some(s) = word_as_str(w, scanner.budget).map_err(Err)?
                                 && is_reserved_word(s, scanner.budget).map_err(Err)?
                             {
-                                sink.push_reserved(UnreadReason::ReservedWordOrConstruct {
+                                sink.push_held(UnreadReason::ReservedWordOrConstruct {
                                     construct: s.to_string(),
                                 });
                             }
