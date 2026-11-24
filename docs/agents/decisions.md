@@ -961,3 +961,8 @@ P2's next round, round 5 (Opus 5.5, D-142), applies this ruling, keeps the rest 
 - A Codex review and the verification follow. P1 and P2 are rebased onto the new tip.
 - P2 then replaces its side channel (`push_checked_written`, `written_root`) with the field.
 - P0 has not merged yet, so `dev` is untouched. Its merge still needs rodrigo's go (D-138).
+
+## D-150 — 2026-11-24 — rodrigo: one more short Opus round for P1 (structural caps before charges)
+**Decided by rodrigo (driver).** P1's review 7 (`reviews/M1-37-rev4-p1-command-model-round7.md`) closed round 6's finding and found one more in the same family. In the best-effort pass, a line over `MAX_BYTES` with a zero budget is Exhausted (Ask) instead of TooLarge (Deny), because the entry charge comes before the size check.
+
+**Exception to PLAN §8.4:** Opus 5.5 reorders both best-effort entry points. It also audits the whole "TooLarge beats Exhausted" rule: every structural cap is checked before any fallible charge, in every P1 entry point. If the next review still has findings, they come back to the driver.
