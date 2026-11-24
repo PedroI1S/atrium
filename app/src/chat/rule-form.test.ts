@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Rule } from "../daemon/types";
+import type { ListedRule } from "../daemon/types";
 import {
   PATH_KINDS,
   broadGlob,
@@ -21,7 +21,7 @@ const HOME = "/Users/me";
 const ctx = { home: HOME, threadExists: (id: string) => id === "t1" };
 const form = (over: Partial<RuleForm>): RuleForm => ({ ...emptyRuleForm(), ...over });
 
-const storedRule = (over: Partial<Rule>): Rule => ({
+const storedRule = (over: Partial<ListedRule>): ListedRule => ({
   id: "r1",
   scope: { type: "global" },
   tool_kind: "execute",
@@ -31,6 +31,7 @@ const storedRule = (over: Partial<Rule>): Rule => ({
   decision: "allow",
   origin: { type: "settings" },
   created_at_ms: 1,
+  invalid_reason: null,
   ...over,
 });
 
@@ -102,7 +103,7 @@ describe("rules editor: the draft", () => {
   });
   it("warns when an allow rule is broader than it may look", () => {
     const runner = validateRule(form({ command: "python3 scripts/build.py" }), ctx);
-    expect(runner.ok && runner.warnings[0]).toMatch(/python3 script it names, with whatever arguments follow/);
+    expect(runner.ok && runner.warnings[0]).toMatch(/python3 script or package scripts\/build\.py/);
     const every = validateRule(form({ matcher: "any", toolKind: "execute" }), ctx);
     expect(every.ok && every.warnings).toEqual(["This allows every command without asking."]);
     const root = validateRule(form({ matcher: "path_glob", glob: "/**" }), ctx);
@@ -129,98 +130,111 @@ describe("rules editor: the draft", () => {
   });
 });
 
-describe("rules editor: rev 4 §7 allow rules on shells, wrappers, and code runners", () => {
+describe("rules editor: rev 4 §7 & D-141 parity with core", () => {
   const refused = (command: string, matcher: "command_prefix" | "command_exact" = "command_prefix") => {
     const v = validateRule(form({ matcher, command }), ctx);
     return !v.ok && v.errors.command !== undefined;
   };
-  it("refuses unpinned shells, eval, bare source/., and every wrapper", () => {
-    for (const c of ["bash", "sh -c", "bash -c 'ls'", "/bin/zsh", "dash -ec", "fish", "eval", "source", ".", "env", "env -i", "/usr/bin/env FOO=1 make", "exec ls", "command ls", "nohup make", "time cargo test", "nice -n 10 make", "xargs rm", "sudo ls", "doas ls", "timeout 60 cargo test", "stdbuf -oL make", "flock /tmp/l make", "script -q log", "chroot /x ls", "builtin cd", "busybox ls", "su -", "setsid ls", "caffeinate make", "arch -arm64 make"]) {
-      expect(refused(c), c).toBe(true);
-      expect(refused(c, "command_exact"), c).toBe(true);
-    }
-  });
-  it("accepts rev 4 §7 pinned script files on sh/bash/dash and source/. with a warning", () => {
-    for (const c of ["sh x.sh", "bash scripts/build.sh", "dash run.sh", "source env.sh", ". ./env.sh"]) {
-      const v = validateRule(form({ command: c }), ctx);
-      expect(v.ok && v.warnings.length, c).toBe(1);
-    }
-  });
-  it("refuses rev 4 §7 unpinned code-runner prefixes (awk, sed, git, cargo, pipx, ssh, docker)", () => {
+
+  it("refuses unpinned Allow prefixes for OUTSIDE_MODEL shells/wrappers, NestedShell, CodeRunner, and ConditionalRunner", () => {
     for (const c of [
-      "awk",
-      "gawk",
-      "mawk",
-      "awk -f",
-      "awk -f -",
-      "awk -f a.awk -e '{print}'",
-      "sed",
-      "sed -f",
-      "sed -f -",
-      "sed '1e id'",
-      "sed 's/a/b/w out'",
-      "git",
-      "git -c x=y status",
-      "git merge-index",
-      "git filter-branch",
-      "git bisect",
-      "git bisect run",
-      "git submodule",
-      "git submodule foreach",
-      "git rebase -x id",
-      "git diff --ext-diff",
-      "git push --exec=x",
-      "git push --receive-pack=x",
-      "cargo",
-      "pipx",
-      "pipx run",
-      "pipx install ruff",
-      "ssh host",
-      "docker",
-      "docker run img",
-      "kubectl exec pod",
-      "parallel echo",
+      // NestedShell without script pin
+      "sh", "bash", "dash", "sh -c", "bash -c 'ls'", "dash -ec",
+      // OUTSIDE_MODEL shells & wrappers
+      "/bin/zsh", "fish", "ksh", "nohup make", "builtin cd", "busybox ls", "setsid ls",
+      "caffeinate make", "chroot /x ls", "stdbuf -oL make", "flock /tmp/l make", "script -q log", "arch -arm64 make",
+      // FirstOperand CodeRunners without pin
+      "python", "python3", "python3 -c", "python3 -u build.py", "python3 -",
+      "node", "node -e '1'", "node --eval=1", "perl", "perl -e '1'", "ruby", "ruby -e '1'",
+      "source", ".", "npx", "npx -y prettier",
+      // FlagValue CodeRunners (`awk` family)
+      "awk", "gawk", "mawk", "awk -f", "awk -f -", "awk -f a.awk -e '{print}'",
+      // Multi-subcommand CodeRunners
+      "cargo", "cargo --version", "pipx", "pipx run", "pipx install ruff",
+      // No-pin CodeRunners (`eval`, `xargs`, `COMMAND_RUNNERS`)
+      "eval", "xargs rm", "ssh host", "docker", "docker run img", "kubectl exec pod", "parallel echo", "su -",
+      // ConditionalRunner `find`
+      "find", "find .", "find . -name x", "find . -exec rm {} +",
+      // ConditionalRunner `git`
+      "git", "git -c x=y status", "git merge-index", "git filter-branch",
+      "git bisect", "git bisect run", "git submodule", "git submodule foreach",
+      "git rebase -x id", "git diff --ext-diff", "git push --exec=x", "git push --receive-pack=x",
+      // ConditionalRunner `sed`
+      "sed", "sed -f", "sed -f -", "sed '1e id'", "sed 's/a/b/w out'", "sed -i p",
     ]) {
       expect(refused(c), c).toBe(true);
     }
-    // Valid pinned Allow prefixes under rev 4 §7:
-    for (const ok of ["awk -f prog.awk", "sed -f edit.sed", "pipx run ruff"]) {
+    // `m1-demo.ts` expects the bash error text to contain "can't allow bash".
+    const bashErr = validateRule(form({ command: "bash -c 'cargo test'" }), ctx);
+    expect(!bashErr.ok && bashErr.errors.command).toMatch(/can't allow bash/);
+  });
+
+  it("accepts pinned Allow prefixes and safe sed/git/cargo forms matching core (including `sed z`)", () => {
+    for (const ok of [
+      "sh x.sh", "bash scripts/build.sh", "dash run.sh",
+      "source env.sh", ". ./env.sh",
+      "python3 scripts/build.py", "python build.py", "node build.js", "perl run.pl", "ruby app.rb", "npx prettier",
+      "awk -f prog.awk", "sed -f edit.sed", "pipx run ruff",
+    ]) {
       const v = validateRule(form({ command: ok }), ctx);
       expect(v.ok && v.warnings.length, ok).toBe(1);
     }
-    for (const clean of ["cargo test", "git status", "git diff", "git bisect start", "git submodule status", "sed 's/error/warn/g'"]) {
-      expect(commandRisk(splitCommand(clean).ok ? (splitCommand(clean) as { ok: true; argv: string[] }).argv : []), clean).toBeNull();
-    }
-    // Exact command rules on remote runners remain allowed with a warning.
-    expect(commandRisk(["ssh", "host", "ls"], "command_exact")).toMatchObject({ warn: expect.any(String) });
-    expect(commandRisk(["docker", "run", "img"], "command_exact")).toMatchObject({ warn: expect.any(String) });
-  });
-  it("refuses interpreters given code inline, also in an option cluster", () => {
-    for (const c of ["python3 -c", "python -c 'print(1)'", "python3.12 -Ic x", "node -e", "node --eval", "node --eval=1", "node -p", "ruby -e", "ruby -ne x", "perl -e", "perl -lne", "perl -E", "osascript -e", "deno eval", "bun -e", "php -r", "lua -e", "find . -exec rm {} +", "find . -execdir x", "find . -ok rm"]) {
-      expect(refused(c), c).toBe(true);
+    for (const clean of [
+      "cargo test", "git status", "git diff", "git bisect start", "git submodule status",
+      "sed 's/error/warn/g'", "sed z", "sed F", "sed '1q 0'", "sed 'l 80'",
+    ]) {
+      const split = splitCommand(clean);
+      expect(split.ok, clean).toBe(true);
+      expect(commandRisk(split.ok ? split.argv : []), clean).toBeNull();
     }
   });
-  it("warns on interpreters and runners that name their script or package", () => {
-    for (const c of ["python3 scripts/build.py", "node build.js", "npx prettier", "deno run x.ts", "bun x.ts"]) {
-      const v = validateRule(form({ command: c }), ctx);
-      expect(v.ok && v.warnings.length, c).toBe(1);
+
+  it("accepts tools outside the frozen D-141 table (Finding 8: deno, bun, php, lua, pwsh, etc.) in both validateRule and checkStoredRule", () => {
+    for (const unknown of ["deno", "deno eval 1", "bun", "bun exec sh", "php -r 'x;'", "lua -e 'x'", "osascript -e x", "pwsh -c x", "powershell -Command x", "uvx", "pnpx", "bunx", "cat", "rm -rf build"]) {
+      const v = validateRule(form({ command: unknown }), ctx);
+      expect(v.ok, unknown).toBe(true);
+      if (v.ok && v.draft.matcher.type === "command_prefix") {
+        expect(checkStoredRule(storedRule({ matcher: v.draft.matcher })), unknown).toEqual({ valid: true, reason: null });
+      }
     }
-    expect(commandRisk(["cargo", "test"])).toBeNull();
-    expect(commandRisk(["python3", "-m", "pytest"], "command_exact")).toMatchObject({ warn: expect.any(String) });
-    expect(commandRisk(["find", ".", "-name", "x"], "command_exact")).toBeNull();
+  });
+
+  it("accepts CommandExact rules and Deny rules matching core `validate_rule_matcher`", () => {
+    for (const c of ["python3 -m pytest", "python3 -u build.py", "find . -name x", "ssh host ls", "docker run img", "bash -c 'ls'"]) {
+      expect(refused(c, "command_exact"), c).toBe(false);
+    }
     expect(commandRisk(["find", ".", "-delete"], "command_exact")).toMatchObject({ warn: expect.any(String) });
-  });
-  it("allows deny rules on all of them", () => {
-    for (const c of ["bash", "sh -c", "sudo", "env", "python3 -c", "find . -exec", "awk", "git", "pipx run", "sed", "docker"]) {
+    for (const c of ["bash", "sh -c", "python3 -c", "find . -exec", "awk", "git", "pipx run", "sed", "docker"]) {
       const v = validateRule(form({ decision: "deny", command: c }), ctx);
       expect(v.ok && v.warnings, c).toEqual([]);
     }
+  });
+
+  it("folds names via CR-19 (basename, case, ſ and K) and never trips on Object.prototype", () => {
+    for (const c of ["/bin/BASH -c 'ls'", "Bash -c x", "Python3 -c 'x'", "/bin/baſh", "/bin/\u212Ash", "FIND . -exec rm {} +", "EVAL x", "NoHup make", "AWK", "/usr/bin/GAWK", "GIT", "CARGO", "PIPX run", "SOURCE"]) {
+      expect(refused(c), c).toBe(true);
+    }
+    for (const c of ["constructor x", "toString", "__proto__ x", "hasOwnProperty", "valueOf -c"]) {
+      expect(() => validateRule(form({ command: c }), ctx), c).not.toThrow();
+      expect(validateRule(form({ command: c }), ctx).ok, c).toBe(true);
+    }
+    expect(foldName("/usr/bin/Baſh")).toBe("bash");
+    expect(foldName("\u212Ash")).toBe("ksh");
+  });
+
+  it("explains the pinning rule in the error text", () => {
+    const v = validateRule(form({ command: "python3 -u" }), ctx);
+    expect(!v.ok && v.errors.command).toMatch(/right after it \(e\.g\. python3 scripts\/build\.py\)/);
+    const f = validateRule(form({ command: "find ." }), ctx);
+    expect(!f.ok && f.errors.command).toMatch(/This exact command/);
   });
 });
 
 describe("rules editor: stored invalid rules (§11 item 5)", () => {
   it("marks stored rules rejected by rev 4 §7 invalid with a reason, while keeping valid rules valid", () => {
     const valid = storedRule({ id: "r_ok", matcher: { type: "command_prefix", argv: ["cargo", "test"] } });
+    const validSedZ = storedRule({ id: "r_sed_z", matcher: { type: "command_prefix", argv: ["sed", "z"] } });
+    const validDeno = storedRule({ id: "r_deno", matcher: { type: "command_prefix", argv: ["deno"] } });
     const invAwk = storedRule({ id: "r_awk", matcher: { type: "command_prefix", argv: ["awk"] } });
     const invGit = storedRule({ id: "r_git", matcher: { type: "command_prefix", argv: ["git"] } });
     const invPipx = storedRule({ id: "r_pipx", matcher: { type: "command_prefix", argv: ["pipx", "run"] } });
@@ -228,8 +242,9 @@ describe("rules editor: stored invalid rules (§11 item 5)", () => {
     const invGlob = storedRule({ id: "r_glob", tool_kind: "edit", matcher: { type: "path_glob", glob: "/a/[" } });
     const denyAwk = storedRule({ id: "r_deny", decision: "deny", matcher: { type: "command_prefix", argv: ["awk"] } });
 
-    expect(checkStoredRule(valid)).toEqual({ valid: true, reason: null });
-    expect(checkStoredRule(denyAwk)).toEqual({ valid: true, reason: null });
+    for (const ok of [valid, validSedZ, validDeno, denyAwk]) {
+      expect(checkStoredRule(ok), ok.id).toEqual({ valid: true, reason: null });
+    }
     for (const r of [invAwk, invGit, invPipx, invDaemon, invGlob]) {
       const res = checkStoredRule(r);
       expect(res.valid, r.id).toBe(false);
@@ -296,72 +311,6 @@ describe("rules editor: where a path limit is offered", () => {
   });
 });
 
-describe("rules editor: the allow check fails closed", () => {
-  const refused = (command: string, matcher: "command_prefix" | "command_exact" = "command_prefix") => {
-    const v = validateRule(form({ matcher, command }), ctx);
-    return !v.ok && v.errors.command !== undefined;
-  };
-  it("folds names as the disk does: case, ſ and K (U+212A), any folder", () => {
-    for (const c of ["/bin/BASH -c 'ls'", "Bash -c x", "/usr/bin/ENV ls", "SUDO ls", "Python3 -c 'x'", "/bin/baſh", "/bin/\u212Ash", "FIND . -exec rm {} +", "Find . -EXEC rm {} +", "EVAL x", "NoHup make", "RUN0 ls", "/usr/bin/SUDOEDIT f", "PERL -E x"]) {
-      expect(refused(c), c).toBe(true);
-      expect(refused(c, "command_exact"), c).toBe(true);
-    }
-    for (const c of ["AWK", "/usr/bin/GAWK", "GIT", "CARGO", "PIPX run", "SOURCE"]) {
-      expect(refused(c), c).toBe(true);
-    }
-  });
-  it("never trips on Object.prototype names", () => {
-    for (const c of ["constructor x", "toString", "__proto__ x", "hasOwnProperty", "valueOf -c"]) {
-      expect(() => validateRule(form({ command: c }), ctx), c).not.toThrow();
-      expect(validateRule(form({ command: c }), ctx).ok, c).toBe(true);
-    }
-  });
-  it("finds a code flag anywhere in an option word: attached code, digit clusters, any case", () => {
-    for (const c of [`python3 -c'import os; os.system("sh")'`, `python3 -c"print(1)"`, "python3 -Ic x", "python3 -IC x", `node -e"1"`, "node -pe 1", "node --EVAL=1", "node --print", `perl -e'system("sh")'`, `perl -0e 'x'`, `perl -0777ne 'x'`, `ruby -0e 'x'`, `ruby -e'x'`, `php -r'x;'`, `lua -e'x'`, "osascript -e x", "bun -e 1", "bun --eval=1", "python3.12 -c x", "python3-dbg -c x"]) {
-      expect(refused(c), c).toBe(true);
-      expect(refused(c, "command_exact"), c).toBe(true);
-    }
-  });
-  it("checks the subcommand on the first word that isn't an option", () => {
-    for (const c of ["deno eval 1", "deno -q eval 1", "deno --quiet eval 1", "bun eval 1", "bun --silent eval 1", "deno repl --eval 1", "Deno EVAL 1"]) {
-      expect(refused(c), c).toBe(true);
-      expect(refused(c, "command_exact"), c).toBe(true);
-    }
-  });
-  it("refuses PowerShell given code, by any prefix PowerShell accepts", () => {
-    for (const c of ["pwsh -c x", "pwsh -Command x", "pwsh -com x", "pwsh --command x", "pwsh /c x", "pwsh -EncodedCommand AA", "pwsh -ec AA", "pwsh -e AA", "pwsh -en AA", "pwsh -cwa x", "pwsh -CommandWithArgs x", "powershell -NoProfile -Command x", "pwsh.exe -c x", "pwsh -command:x"]) {
-      expect(refused(c), c).toBe(true);
-      expect(refused(c, "command_exact"), c).toBe(true);
-    }
-    expect(refused("pwsh")).toBe(true);
-    expect(refused("powershell build")).toBe(true);
-    expect(refused("pwsh -File build.ps1")).toBe(false);
-    expect(refused("pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1")).toBe(false);
-  });
-  it("refuses privilege wrappers", () => {
-    for (const c of ["run0 ls", "sudoedit /etc/hosts", "pkexec ls", "doas ls", "su -c x"]) expect(refused(c), c).toBe(true);
-  });
-  it("refuses a prefix rule on an interpreter, runner or find unless the script, package or file comes right after it", () => {
-    for (const c of ["python3", "python3 -u", "python3 -m pytest", "python3 -W ignore", "python3 -- x.py", "node", "node --inspect", "perl", "deno", "deno run", "deno run --allow-all x.ts", "bun", "bun run", "bun test", "npx", "npx -y prettier", "npx -p pkg cmd", "uvx", "find", "find .", "find . -name x", "python3 -", "python3 x.py -"]) {
-      expect(refused(c), c).toBe(true);
-    }
-    for (const c of ["python3 scripts/build.py", "python3 x.py --flag", "node build.js", "deno run x.ts", "bun run build", "npx prettier --write", "uvx ruff"]) {
-      expect(refused(c), c).toBe(false);
-    }
-    expect(refused("perl tool.pl -e", "command_exact")).toBe(true);
-    for (const c of ["python3 -m pytest", "python3 -u build.py", "npx -y prettier", "find . -name x"]) expect(refused(c, "command_exact"), c).toBe(false);
-    for (const c of ["npx -c 'sh'", "npx --call=x", "pnpx -c x"]) expect(refused(c, "command_exact"), c).toBe(true);
-  });
-  it("explains the rule in the error text", () => {
-    const v = validateRule(form({ command: "python3 -u" }), ctx);
-    expect(!v.ok && v.errors.command).toMatch(/right after it, like python3 scripts\/build.py/);
-    const f = validateRule(form({ command: "find ." }), ctx);
-    expect(!f.ok && f.errors.command).toMatch(/This exact command/);
-    expect(foldName("/usr/bin/Baſh")).toBe("bash");
-    expect(foldName("\u212Ash")).toBe("ksh");
-  });
-});
-
 describe("rules editor: line breaks, braces, and globset classes", () => {
   it("refuses a line break anywhere, quoted too", () => {
     for (const c of ["echo 'a\nb'", 'echo "a\rb"', "a\nb"]) expect(splitCommand(c), JSON.stringify(c)).toEqual({ ok: false, error: "A rule matches one line: remove the line break" });
@@ -375,38 +324,5 @@ describe("rules editor: line breaks, braces, and globset classes", () => {
   it("matches globset 0.4.21 on classes", () => {
     for (const bad of ["/a/[a-z-_]", "/a/[a-z-0]", "/a/[\\"]) expect(globSyntaxError(bad), bad).not.toBeNull();
     for (const good of ["/a/[\\]", "/a/[\\]]", "/a/[a-c-e]", "/a/[a-c-b]", "/a/[a\\-z]"]) expect(globSyntaxError(good), good).toBeNull();
-  });
-});
-
-describe("rules editor: bun exec, package runner -c, stdin scripts, and bare exact rules", () => {
-  const refused = (command: string, matcher: "command_prefix" | "command_exact" = "command_prefix") => {
-    const v = validateRule(form({ matcher, command }), ctx);
-    return !v.ok && v.errors.command !== undefined;
-  };
-  it("refuses bun exec, which runs a shell string", () => {
-    for (const c of ["bun exec 'rm -rf build'", "bun exec echo", "bun --silent exec sh", "BUN EXEC x"]) {
-      expect(refused(c), c).toBe(true);
-      expect(refused(c, "command_exact"), c).toBe(true);
-    }
-  });
-  it("refuses -c in a package runner's option cluster or with its value attached", () => {
-    for (const c of ["npx -yc sh", "npx -c'sh'", "npx prettier -yc sh", "npx prettier -c'sh'", "pnpx -Yc x", "bunx -c x", "uvx --CALL=x pkg"]) {
-      expect(refused(c, "command_exact"), c).toBe(true);
-      expect(refused(c), c).toBe(true);
-    }
-  });
-  it("refuses a script read from standard input, by any name", () => {
-    for (const c of ["python3 /dev/stdin", "node /dev/fd/0", "perl /DEV/STDIN", "ruby -", "python3 -u /proc/self/fd/0"]) {
-      expect(refused(c), c).toBe(true);
-      expect(refused(c, "command_exact"), c).toBe(true);
-    }
-  });
-  it("refuses exact rules with no script or package: the interpreter would read code from its input", () => {
-    for (const c of ["python3", "python3 -u", "node", "perl", "ruby", "php", "lua", "osascript", "deno", "deno run", "bun", "bun run", "npx", "npx -y", "uvx"]) {
-      expect(refused(c, "command_exact"), c).toBe(true);
-    }
-    for (const c of ["python3 -m pytest", "python3 -u build.py", "npx -y prettier", "node build.js", "deno run x.ts", "bun run build"]) {
-      expect(refused(c, "command_exact"), c).toBe(false);
-    }
   });
 });

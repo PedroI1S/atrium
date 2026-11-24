@@ -1,9 +1,11 @@
-// The rules editor in Settings → Approvals (PLAN §3.12, policy rev 4 §7, §11 items 4–5):
+// The rules editor in Settings → Approvals (PLAN §3.12, policy rev 4 §7, §11 items 4–5, D-141):
 // what the user types, checked before it becomes a `RuleDraft` for `CreateRule`. The daemon
-// checks again; this catches what would make a rule invalid at creation, or a rule that never
-// matches, or matches more than it reads. Pure; tested in rule-form.test.ts.
+// checks again via `atrium_core::policy::validate_rule_matcher`; this stays in 1-to-1 parity
+// with core's frozen D-141 tool table and §7 pinning rules. Pure; tested in rule-form.test.ts.
 
-import type { Rule, RuleDraft, RuleMatcher, RuleScope, ToolKind } from "../daemon/types";
+import type { ListedRule, RuleDraft, RuleMatcher, RuleScope, ToolKind } from "../daemon/types";
+
+export type { ListedRule };
 
 export type MatcherKind = RuleMatcher["type"];
 
@@ -46,12 +48,6 @@ export type Validation =
   | { ok: true; draft: RuleDraft; warnings: string[] }
   | { ok: false; errors: Partial<Record<Field, string>> };
 
-/**
- * A rule returned by `ListRules`: rev 4 keeps stored invalid rules visible and marks them
- * with `invalid_reason` so the user can review or delete them (§11 item 5).
- */
-export type ListedRule = Rule & { invalid_reason?: string | null };
-
 export interface StoredRuleValidity {
   valid: boolean;
   reason: string | null;
@@ -70,64 +66,34 @@ const MAX_TOOL_NAME_CHARS = 100;
 const MAX_GLOB_CHARS = 1000;
 const MAX_COMMAND_CHARS = 4000;
 
-// Policy rev 4 §7 & §11 item 4: Allow prefix rules that end at a code runner without pinning a
-// program are invalid at creation, and stored rules that fail validation stop covering anything
-// (§11 item 5). Names are CR-19 folded (basename, Unicode lowercase, ſ -> s; U+212A folds to k).
+// Policy rev 4 §7 & §11 item 4 (D-141 six row kinds): Allow prefix rules that end at a code
+// runner in `crates/atrium-core/src/policy/tools.rs` without its required program pin are invalid
+// at creation, and stored rules that fail validation stop covering anything (§11 item 5).
+// Every tool absent from the frozen table (e.g. `deno`, `bun`, `php`, `lua`, `pwsh`) is an
+// unknown tool and is accepted by core, daemon, and app alike.
+// Names are CR-19 folded (basename, Unicode lowercase, ſ -> s; U+212A folds to k).
 
 /** Modeled §4 nested shells (`tools.rs` `NestedShell`): pinnable as `[shell, <script>]`. */
 const MODELED_SHELLS = new Set(["sh", "bash", "dash"]);
-/** Outside-model shells (`tools.rs` `OUTSIDE_MODEL`): never pinnable by Allow prefix. */
+/** Outside-model shells (`tools.rs` `OUTSIDE_MODEL`, `code_runner_no_pin`): unpinnable by prefix. */
 const OUTSIDE_SHELLS = new Set(["zsh", "ksh", "fish", "ash", "csh", "tcsh", "mksh", "yash", "rbash", "posh", "elvish", "xonsh"]);
-/** Run a named script in the current shell (`tools.rs` `CodeRunner`, `FirstOperand`). */
-const SOURCE_RUNNERS = new Set(["source", "."]);
-/** Always unpinnable wrappers & `eval`/`xargs` (`tools.rs` `Wrapper`, `OUTSIDE_MODEL`, `CodeRunner`). */
-const UNPINNABLE_WRAPPERS = new Set([
-  "eval", "xargs",
-  "time", "nohup", "builtin", "command", "setsid", "unbuffer", "caffeinate", "sandbox-exec", "exec", "nice", "ionice", "stdbuf", "busybox", "toybox",
-  "timeout", "chrt", "taskset", "arch", "chroot", "flock", "script", "env",
-  "sudo", "sudoedit", "doas", "su", "runuser", "setpriv", "pkexec", "run0",
+/** Outside-model wrappers (`tools.rs` `OUTSIDE_MODEL`, `code_runner_no_pin`): unpinnable by prefix. */
+const OUTSIDE_WRAPPERS = new Set([
+  "nohup", "builtin", "busybox", "toybox", "setsid", "unbuffer", "caffeinate", "sandbox-exec",
+  "chroot", "ionice", "stdbuf", "chrt", "taskset", "flock", "script", "arch",
 ]);
-/** `tools.rs` `COMMAND_RUNNERS`: run arbitrary commands elsewhere; unpinnable by Allow prefix. */
-const COMMAND_RUNNERS = new Set([
-  "ssh", "mosh", "autossh", "nsenter", "unshare", "docker", "podman", "nerdctl", "kubectl", "oc", "lxc", "incus", "machinectl", "systemd-run", "systemd-nspawn",
-  "firejail", "bwrap", "flatpak-spawn", "toolbox", "distrobox", "distrobox-enter", "multipass", "vagrant", "limactl", "colima", "parallel",
-]);
-/** `awk` family (`tools.rs` `CodeRunner`, `FlagValue` `-f`/`--file`). */
+/** `tools.rs` `CodeRunner` with `ProgramPin::FirstOperand` (`code_runner_no_pin`). */
+const FIRST_OP_RUNNERS = new Set(["perl", "python", "python3", "node", "ruby", "source", ".", "npx"]);
+/** `tools.rs` `CodeRunner` with `ProgramPin::FlagValue` `-f`/`--file` (`code_runner_no_pin`). */
 const AWK_TOOLS = new Set(["awk", "gawk", "mawk"]);
-
-interface Interpreter {
-  /** Short flags that take code (compared case-insensitively, anywhere in a `-…` word). */
-  short: string;
-  /** Long flags that take code, with or without `=…`. */
-  long: readonly string[];
-  /** Subcommands that take code (`deno eval`). */
-  sub: readonly string[];
-  /** Subcommands that come before the script, so they don't name it (`deno run`). */
-  verbs: readonly string[];
-}
-/** Interpreters and how each is given code inline. Keys are folded names. */
-const INTERPRETERS = new Map<string, Interpreter>([
-  ["python", { short: "c", long: [], sub: [], verbs: [] }],
-  ["node", { short: "ep", long: ["--eval", "--print"], sub: [], verbs: [] }],
-  ["deno", { short: "", long: ["--eval", "--eval-file"], sub: ["eval", "repl"], verbs: ["run", "test", "task", "bench", "serve", "x", "install", "compile", "jupyter"] }],
-  ["bun", { short: "ep", long: ["--eval", "--print"], sub: ["eval", "repl", "exec"], verbs: ["run", "test", "x", "create", "build"] }],
-  ["ruby", { short: "e", long: [], sub: [], verbs: [] }],
-  ["perl", { short: "e", long: [], sub: [], verbs: [] }],
-  ["php", { short: "rbef", long: ["--run", "--process-code", "--process-begin", "--process-end", "--process-file"], sub: [], verbs: [] }],
-  ["lua", { short: "e", long: [], sub: [], verbs: [] }],
-  ["osascript", { short: "e", long: [], sub: [], verbs: [] }],
+/** `tools.rs` `CodeRunner` with `program_pin: None` (`eval`, `xargs`, and `COMMAND_RUNNERS`). */
+const NO_PIN_RUNNERS = new Set([
+  "eval", "xargs",
+  "ssh", "mosh", "autossh", "nsenter", "unshare", "docker", "podman", "nerdctl", "kubectl", "oc",
+  "lxc", "incus", "machinectl", "systemd-run", "systemd-nspawn", "firejail", "bwrap",
+  "flatpak-spawn", "toolbox", "distrobox", "distrobox-enter", "multipass", "vagrant", "limactl",
+  "colima", "su", "runuser", "setpriv", "parallel",
 ]);
-/** PowerShell's options that take code; it accepts any unambiguous prefix, with `-`, `--` or `/`. */
-const PWSH_CODE = ["command", "encodedcommand", "commandwithargs"];
-const PWSH_SHORT = new Set(["c", "e", "ec", "cwa"]);
-/** Package runners that pin `[runner, <package>]` (`pipx` is handled separately for `pipx run <pkg>`). */
-const PACKAGE_RUNNERS = new Set(["npx", "pnpx", "bunx", "uvx"]);
-/** `npx -c` / `--call` runs a shell command. */
-const RUNNER_CODE = new Set(["-c", "--call"]);
-/** Script names that mean standard input. Lower-cased. */
-const STDIN = new Set(["-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"]);
-/** `find` options that run a command for each file. */
-const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 
 /**
  * A command name as the disk resolves it (CR-19): the basename, Unicode lower-cased
@@ -136,14 +102,6 @@ const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 export function foldName(word: string): string {
   const b = word.split("/").pop() ?? word;
   return b.toLowerCase().replaceAll("ſ", "s");
-}
-const isOption = (w: string): boolean => w.length > 1 && w.startsWith("-");
-
-function interpreterOf(name: string): { key: string; spec: Interpreter } | "pwsh" | null {
-  if (name === "pwsh" || name === "powershell" || name.startsWith("pwsh") || name.startsWith("powershell")) return "pwsh";
-  const key = name.startsWith("python") ? "python" : name;
-  const spec = INTERPRETERS.get(key);
-  return spec ? { key, spec } : null;
 }
 
 function matchesGitFlag(tok: string, trigger: string): boolean {
@@ -160,10 +118,11 @@ function matchesGitFlag(tok: string, trigger: string): boolean {
 }
 
 function hasCompetingProgramFlags(rest: readonly string[], pinFlags: readonly string[]): boolean {
+  const all = [...pinFlags, "-e", "--source", "--eval", "--expression"];
   for (const tok of rest) {
     if (tok === "--") break;
     if (!tok.startsWith("-") || tok === "-") continue;
-    for (const f of [...pinFlags, "-e", "--source", "--eval", "--expression"]) {
+    for (const f of all) {
       if (f.startsWith("--")) {
         const name = tok.split("=")[0]!;
         if (name.startsWith("--") && name.length >= 3 && f.startsWith(name)) return true;
@@ -175,15 +134,71 @@ function hasCompetingProgramFlags(rest: readonly string[], pinFlags: readonly st
   return false;
 }
 
-/** Linear `sed` script inspector mirroring `v4/tools/sed.rs` (`e`, `w`, `r`, `W`, `R`). */
+/**
+ * Linear `sed` script inspector mirroring `crates/atrium-core/src/policy/v4/tools/sed.rs`
+ * 1-to-1 (`e`, `w`, `r`, `W`, `R`, `s///e|w|W`, safe commands including `z`, `F`, `l`, `q`, `Q`).
+ */
 function isSedScriptSafe(script: string): boolean {
   const n = script.length;
   let i = 0;
-  const skipWs = () => {
-    while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === ";" || script[i] === "\n" || script[i] === "\r")) i++;
-  };
-  const skipRegex = (delim: string): boolean => {
+
+  const scanRegexToDelim = (delim: string): boolean => {
     let inClass = false;
+    let classFirst = false;
+    while (i < n) {
+      const ch = script[i]!;
+      if (inClass) {
+        if (ch === "[" && i + 1 < n && (script[i + 1] === ":" || script[i + 1] === "." || script[i + 1] === "=")) {
+          const marker = script[i + 1]!;
+          i += 2;
+          let closed = false;
+          while (i + 1 < n) {
+            if (script[i] === marker && script[i + 1] === "]") {
+              i += 2;
+              closed = true;
+              break;
+            }
+            i++;
+          }
+          if (!closed) return false;
+          classFirst = false;
+          continue;
+        }
+        if (ch === "]" && !classFirst) {
+          inClass = false;
+          i++;
+          continue;
+        }
+        if (ch === "^" && classFirst) {
+          i++;
+          continue;
+        }
+        classFirst = false;
+        i++;
+        continue;
+      }
+      if (ch === "\\") {
+        if (i + 1 >= n) return false;
+        i += 2;
+        continue;
+      }
+      if (ch === delim) {
+        i++;
+        return true;
+      }
+      if (ch === "\n") return false;
+      if (ch === "[") {
+        inClass = true;
+        classFirst = true;
+        i++;
+        continue;
+      }
+      i++;
+    }
+    return false;
+  };
+
+  const scanReplacementToDelim = (delim: string): boolean => {
     while (i < n) {
       const ch = script[i]!;
       if (ch === "\\") {
@@ -191,49 +206,48 @@ function isSedScriptSafe(script: string): boolean {
         i += 2;
         continue;
       }
-      if (inClass) {
-        if (ch === "]") inClass = false;
-        i++;
-        continue;
-      }
-      if (ch === "[") {
-        inClass = true;
-        i++;
-        continue;
-      }
       if (ch === delim) {
         i++;
         return true;
       }
+      if (ch === "\n") return false;
       i++;
     }
     return false;
   };
+
   const skipAddr = (): "yes" | "no" | "bad" => {
     if (i >= n) return "no";
     const ch = script[i]!;
+    if (ch === "$") { i++; return "yes"; }
     if (ch >= "0" && ch <= "9") {
       while (i < n && script[i]! >= "0" && script[i]! <= "9") i++;
-      if (i < n && script[i] === "~") {
+      if (i < n && (script[i] === "~" || script[i] === "+")) {
         i++;
-        if (i >= n || script[i]! < "0" || script[i]! > "9") return "bad";
+        const start = i;
         while (i < n && script[i]! >= "0" && script[i]! <= "9") i++;
+        if (i === start) return "bad";
       }
       return "yes";
     }
-    if (ch === "$") { i++; return "yes"; }
+    if (ch === "+" || ch === "~") {
+      i++;
+      const start = i;
+      while (i < n && script[i]! >= "0" && script[i]! <= "9") i++;
+      return i === start ? "bad" : "yes";
+    }
     if (ch === "/") {
       i++;
-      if (!skipRegex("/")) return "bad";
+      if (!scanRegexToDelim("/")) return "bad";
       while (i < n && (script[i] === "I" || script[i] === "M")) i++;
       return "yes";
     }
     if (ch === "\\") {
       if (i + 1 >= n) return "bad";
       const d = script[i + 1]!;
-      if (d === "\n") return "bad";
+      if (d === "\n" || d === "\\") return "bad";
       i += 2;
-      if (!skipRegex(d)) return "bad";
+      if (!scanRegexToDelim(d)) return "bad";
       while (i < n && (script[i] === "I" || script[i] === "M")) i++;
       return "yes";
     }
@@ -242,7 +256,7 @@ function isSedScriptSafe(script: string): boolean {
 
   let blockDepth = 0;
   while (i < n) {
-    skipWs();
+    while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === "\r" || script[i] === "\n" || script[i] === ";")) i++;
     if (i >= n) break;
     if (script[i] === "#") {
       while (i < n && script[i] !== "\n") i++;
@@ -261,13 +275,7 @@ function isSedScriptSafe(script: string): boolean {
       if (i < n && script[i] === ",") {
         i++;
         while (i < n && (script[i] === " " || script[i] === "\t")) i++;
-        if (i < n && (script[i] === "+" || script[i] === "~")) {
-          i++;
-          if (i >= n || script[i]! < "0" || script[i]! > "9") return false;
-          while (i < n && script[i]! >= "0" && script[i]! <= "9") i++;
-        } else {
-          if (skipAddr() !== "yes") return false;
-        }
+        if (skipAddr() !== "yes") return false;
       }
     }
     while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === "!")) i++;
@@ -281,25 +289,12 @@ function isSedScriptSafe(script: string): boolean {
       const delim = script[i]!;
       if (delim === "\n" || delim === "\\") return false;
       i++;
-      if (!skipRegex(delim)) return false;
-      // Replacement
-      let closed = false;
-      while (i < n) {
-        const ch = script[i]!;
-        if (ch === "\\") {
-          if (i + 1 >= n) return false;
-          i += 2;
-          continue;
-        }
-        if (ch === delim) { i++; closed = true; break; }
-        i++;
-      }
-      if (!closed) return false;
-      // Flags
+      if (!scanRegexToDelim(delim)) return false;
+      if (!scanReplacementToDelim(delim)) return false;
       while (i < n) {
         const f = script[i]!;
-        if (f === ";" || f === "\n" || f === "\r" || f === "}") break;
-        if (f === " " || f === "\t") { i++; continue; }
+        if (f === ";" || f === "\n" || f === "}" || f === "#") break;
+        if (f === " " || f === "\t" || f === "\r") { i++; continue; }
         if (f === "e" || f === "w" || f === "W") return false;
         if ("gpIiMm0123456789".includes(f)) { i++; continue; }
         return false;
@@ -311,30 +306,34 @@ function isSedScriptSafe(script: string): boolean {
       const delim = script[i]!;
       if (delim === "\n" || delim === "\\") return false;
       i++;
-      for (let part = 0; part < 2; part++) {
-        let closed = false;
-        while (i < n) {
-          if (script[i] === "\\") { if (i + 1 >= n) return false; i += 2; continue; }
-          if (script[i] === delim) { i++; closed = true; break; }
-          i++;
-        }
-        if (!closed) return false;
-      }
+      if (!scanReplacementToDelim(delim)) return false;
+      if (!scanReplacementToDelim(delim)) return false;
       continue;
     }
-    if ("dDgGhHlnNpPx=".includes(cmd)) continue;
-    if (cmd === "q" || cmd === "Q") {
-      while (i < n && (script[i] === " " || script[i] === "\t")) i++;
+    if ("dDgGhHnNpPx=zF".includes(cmd)) {
+      while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === "\r")) i++;
+      if (i < n && script[i] !== ";" && script[i] !== "\n" && script[i] !== "}" && script[i] !== "#") return false;
+      continue;
+    }
+    if (cmd === "q" || cmd === "Q" || cmd === "l") {
+      while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === "\r")) i++;
       while (i < n && script[i]! >= "0" && script[i]! <= "9") i++;
+      while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === "\r")) i++;
+      if (i < n && script[i] !== ";" && script[i] !== "\n" && script[i] !== "}" && script[i] !== "#") return false;
       continue;
     }
     if (cmd === ":" || cmd === "b" || cmd === "t" || cmd === "T") {
-      while (i < n && script[i] !== ";" && script[i] !== "\n" && script[i] !== "\r" && script[i] !== "}") i++;
+      while (i < n && script[i] !== ";" && script[i] !== "\n" && script[i] !== "}" && script[i] !== "#") i++;
       continue;
     }
     if (cmd === "a" || cmd === "i" || cmd === "c") {
+      while (i < n && (script[i] === " " || script[i] === "\t")) i++;
+      if (i < n && script[i] === "\\") {
+        i++;
+        if (i < n && script[i] === "\n") i++;
+      }
       while (i < n) {
-        if (script[i] === "\\") { if (i + 1 >= n) return false; i += 2; continue; }
+        if (script[i] === "\\" && i + 1 < n) { i += 2; continue; }
         if (script[i] === "\n") { i++; break; }
         i++;
       }
@@ -396,11 +395,12 @@ function isSedPrefixSafe(args: readonly string[]): boolean {
 
 export type CommandRisk = { refuse: string } | { warn: string } | null;
 
-const NAME_A_SCRIPT = "Name the script right after it, like python3 scripts/build.py, with no options before it: otherwise the rule would also allow code written on the command line.";
-
 /**
- * Whether an allow rule on this argv would violate rev 4 §7's code-runner pinning rules or allow
- * more than the command it names. Fails closed. Deny rules on any of them are fine.
+ * Checks an allow rule's argv against rev 4 §7's code-runner pinning rules and the frozen D-141
+ * tool table (1-to-1 with `atrium_core::policy::validate_rule_matcher`).
+ *
+ * Refuses ONLY Allow `command_prefix` rules that core rejects; `command_exact` and Deny rules
+ * are never refused here (pinned programs and exact code runners carry a warning when allowed).
  */
 export function commandRisk(argv: readonly string[], matcher: "command_prefix" | "command_exact" = "command_prefix"): CommandRisk {
   const first = argv[0];
@@ -409,41 +409,50 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
   const args = argv.slice(1);
   const prefix = matcher === "command_prefix";
 
-  // 1. Outside-model shells (`zsh`..`xonsh`) are always refused.
+  // 1. Outside-model shells (`zsh`..`xonsh`) and outside-model wrappers (`nohup`..`arch`).
   if (OUTSIDE_SHELLS.has(name)) {
-    return { refuse: `A rule can't allow ${name}: it would allow every command run through it. Write the command itself.` };
+    if (prefix) {
+      return { refuse: `An Allow prefix rule can't allow ${name}: shells outside the model cannot be allowed by prefix.` };
+    }
+    return { warn: `This allows ${name}, which runs outside Atrium's command model.` };
+  }
+  if (OUTSIDE_WRAPPERS.has(name)) {
+    if (prefix) {
+      return { refuse: `An Allow prefix rule can't allow ${name}: wrappers outside the model cannot be allowed by prefix.` };
+    }
+    return { warn: `This allows ${name}, which runs outside Atrium's command model.` };
   }
 
-  // 2. Modeled nested shells (`sh`, `bash`, `dash`): rev 4 §7 allows pinning a named script right
-  //    after the shell (`sh x.sh`), while refusing bare shells or `-c` / flags.
+  // 2. Modeled nested shells (`sh`, `bash`, `dash`): Allow prefix pins `[shell, <script>]`.
   if (MODELED_SHELLS.has(name)) {
-    if (args.length >= 1 && args[0] !== "" && !args[0]!.startsWith("-") && !STDIN.has(args[0]!.toLowerCase())) {
-      return { warn: `This allows the ${name} script ${args[0]} it names${prefix ? ", with whatever arguments follow," : ""} whatever the script does.` };
+    if (prefix) {
+      if (args.length >= 1 && args[0] !== "" && !args[0]!.startsWith("-")) {
+        return { warn: `This allows the ${name} script ${args[0]}, with whatever arguments follow, whatever the script does.` };
+      }
+      return { refuse: `An Allow prefix rule can't allow ${name}${args.length ? ` ${args[0]}` : ""}: pin a script file right after it (e.g. ${name} script.sh).` };
     }
-    return { refuse: `A rule can't allow ${name}${args.length ? ` ${args[0]}` : ""}: pin a script file right after it (e.g. ${name} script.sh), or write the command itself.` };
+    return { warn: `This allows the ${name} command it names, whatever it runs.` };
   }
 
-  // 3. `source` and `.`: rev 4 §7 allows pinning a script file right after them (`source env.sh`).
-  if (SOURCE_RUNNERS.has(name)) {
-    if (args.length >= 1 && args[0] !== "" && !args[0]!.startsWith("-") && !STDIN.has(args[0]!.toLowerCase())) {
-      return { warn: `This allows sourcing ${args[0]}, whatever the script does.` };
+  // 3. First-operand code runners (`python`, `python3`, `perl`, `node`, `ruby`, `source`, `.`, `npx`).
+  if (FIRST_OP_RUNNERS.has(name)) {
+    if (prefix) {
+      if (args.length >= 1 && args[0] !== "" && !args[0]!.startsWith("-")) {
+        return { warn: `This allows the ${name} script or package ${args[0]} it names, with whatever arguments follow, whatever it does.` };
+      }
+      return { refuse: `An Allow prefix rule can't end at ${name}${args.length ? ` ${args[0]}` : ""}: name the script or package right after it (e.g. python3 scripts/build.py), with no options before it.` };
     }
-    return { refuse: `A rule can't allow ${name} without pinning a script file right after it (e.g. ${name} env.sh).` };
+    return { warn: `This allows the ${name} program it names, whatever it does.` };
   }
 
-  // 4. Unpinnable wrappers, `eval`, `xargs`, privilege tools.
-  if (UNPINNABLE_WRAPPERS.has(name)) {
-    return { refuse: `A rule can't allow ${name}: it runs the command that follows it, and Atrium wouldn't check that one. Write the command without ${name}.` };
-  }
-
-  // 5. `awk` / `gawk` / `mawk` (§7, §10 row 13, §11 item 4): Allow prefix requires `-f <file>` / `--file <file>`.
+  // 4. `awk` / `gawk` / `mawk` (§7, §10 row 13, §11 item 4): Allow prefix pins `-f <file>` / `--file <file>`.
   if (AWK_TOOLS.has(name)) {
     if (prefix) {
       if (
         args.length >= 2 &&
         (args[0] === "-f" || args[0] === "--file") &&
         args[1] !== "" &&
-        !STDIN.has(args[1]!.toLowerCase()) &&
+        args[1] !== "-" &&
         !hasCompetingProgramFlags(args.slice(2), ["-f", "--file"])
       ) {
         return { warn: `This allows the ${name} program ${args[1]}, whatever it does.` };
@@ -453,32 +462,45 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
     return { warn: `This allows the ${name} program it names, whatever it does.` };
   }
 
-  // 6. `sed` (§7): Allow prefix requires `-f <file>` / `--file <file>` or a safe inline script (no e/w/r/W/R).
-  if (name === "sed") {
-    if (prefix) {
-      if (args.length === 0) {
-        return { refuse: "An Allow prefix rule can't end at sed without pinning a program file (sed -f script.sed) or a safe inline script." };
-      }
-      if (args[0] === "-f" || args[0] === "--file") {
-        if (
-          args.length >= 2 &&
-          args[1] !== "" &&
-          !STDIN.has(args[1]!.toLowerCase()) &&
-          !hasCompetingProgramFlags(args.slice(2), ["-f", "--file"])
-        ) {
-          return { warn: `This allows the sed script ${args[1]}, whatever it does.` };
-        }
-        return { refuse: "An Allow prefix rule on sed -f must pin a program file (e.g. sed -f edit.sed)." };
-      }
-      if (!isSedPrefixSafe(args)) {
-        return { refuse: "An Allow prefix rule on sed can't use e, w, r, W, or R commands or unmodeled flags: pin a safe inline script or use sed -f <file>." };
-      }
-      return null;
+  // 5. `cargo` (§7): Allow prefix pins a subcommand (e.g. `cargo test`).
+  if (name === "cargo") {
+    if (prefix && (args.length === 0 || args[0] === "" || args[0]!.startsWith("-"))) {
+      return { refuse: "An Allow prefix rule can't end at cargo without pinning a subcommand (e.g. cargo test)." };
     }
     return null;
   }
 
-  // 7. `git` (§7, §11 item 4): Allow prefix requires a non-code-running subcommand and no code-running triggers.
+  // 6. `pipx` (§7, §11 item 4): Allow prefix pins `pipx run <package>`.
+  if (name === "pipx") {
+    if (prefix) {
+      if (args.length >= 2 && args[0] === "run" && args[1] !== "" && !args[1]!.startsWith("-")) {
+        return { warn: `This allows the package pipx run ${args[1]} runs, whatever it does.` };
+      }
+      return { refuse: "An Allow prefix rule on pipx must pin a package after pipx run (e.g. pipx run ruff)." };
+    }
+    return { warn: "This allows pipx to run the command it names." };
+  }
+
+  // 7. No-pin code runners (`eval`, `xargs`, `COMMAND_RUNNERS`: `ssh`, `docker`, `kubectl`, `parallel`, ...).
+  if (NO_PIN_RUNNERS.has(name)) {
+    if (prefix) {
+      return { refuse: `An Allow prefix rule can't end at ${name}: it has no pinnable prefix form. Use “This exact command” instead.` };
+    }
+    return { warn: `This allows whatever ${name} runs.` };
+  }
+
+  // 8. Conditional runner `find` (§7): Allow prefix is always refused (could append `-exec`).
+  if (name === "find") {
+    if (prefix) {
+      return { refuse: "An Allow prefix rule can't end at find (it would allow appending -exec): use “This exact command” instead." };
+    }
+    if (args.some((w) => w.toLowerCase() === "-delete")) {
+      return { warn: "This allows find to delete what it matches." };
+    }
+    return null;
+  }
+
+  // 9. Conditional runner `git` (§7, §11 item 4): Allow prefix pins a non-code-running subcommand.
   if (name === "git") {
     if (prefix) {
       if (args.length === 0 || args[0] === "" || args[0]!.startsWith("-")) {
@@ -518,98 +540,34 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
     return null;
   }
 
-  // 8. `cargo` (§7): Allow prefix requires pinning a subcommand (e.g. `cargo test`).
-  if (name === "cargo") {
-    if (prefix && (args.length === 0 || args[0] === "" || args[0]!.startsWith("-"))) {
-      return { refuse: "An Allow prefix rule can't end at cargo without pinning a subcommand (e.g. cargo test)." };
+  // 10. Conditional runner `sed` (§7): Allow prefix pins `-f <file>` / `--file <file>` or a safe inline script.
+  if (name === "sed") {
+    if (prefix) {
+      if (args.length === 0) {
+        return { refuse: "An Allow prefix rule can't end at sed without pinning a program file (sed -f script.sed) or a safe inline script." };
+      }
+      if (args[0] === "-f" || args[0] === "--file") {
+        if (
+          args.length >= 2 &&
+          args[1] !== "" &&
+          args[1] !== "-" &&
+          !hasCompetingProgramFlags(args.slice(2), ["-f", "--file"])
+        ) {
+          return { warn: `This allows the sed script ${args[1]}, whatever it does.` };
+        }
+        return { refuse: "An Allow prefix rule on sed -f must pin a program file (e.g. sed -f edit.sed)." };
+      }
+      if (!isSedPrefixSafe(args)) {
+        return { refuse: "An Allow prefix rule on sed can't use e, w, r, W, or R commands or unmodeled flags: pin a safe inline script or use sed -f <file>." };
+      }
+      return null;
     }
     return null;
   }
 
-  // 9. `pipx` (§7, §11 item 4): Allow prefix requires `pipx run <package>`.
-  if (name === "pipx") {
-    if (prefix) {
-      if (args.length >= 2 && args[0] === "run" && args[1] !== "" && !args[1]!.startsWith("-")) {
-        return { warn: `This allows the package pipx run ${args[1]} runs, whatever it does.` };
-      }
-      return { refuse: "An Allow prefix rule on pipx must pin a package after pipx run (e.g. pipx run ruff)." };
-    }
-    if (args.length >= 2 && args[0] === "run" && !args[1]!.startsWith("-")) {
-      return { warn: `This allows the package pipx run ${args[1]} runs, whatever it does.` };
-    }
-    return { warn: "This allows pipx to run the command it names." };
-  }
-
-  // 10. Interpreters (`python*`, `node`, `deno`, `bun`, `ruby`, `perl`, `php`, `lua`, `osascript`, `pwsh`).
-  const interp = interpreterOf(name);
-  if (interp === "pwsh") {
-    for (const w of args) {
-      const opt = w.toLowerCase().replace(/^(--?|\/)/, "");
-      if (w === opt) continue;
-      const bare = opt.split(/[:=]/)[0]!;
-      if (PWSH_SHORT.has(bare) || (bare !== "" && PWSH_CODE.some((c) => c.startsWith(bare)))) {
-        return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line, and Atrium wouldn't check it.` };
-      }
-    }
-    if (!args.some((w) => !w.startsWith("-") && /\.ps1$/i.test(w))) return { refuse: `A rule can allow ${name} only with the script it runs, like ${name} -File build.ps1.` };
-    return { warn: `This allows the script ${name} runs, whatever the script does.` };
-  }
-  if (interp !== null) {
-    const { short, long, sub, verbs } = interp.spec;
-    const operands: string[] = [];
-    for (const w of args) {
-      const lw = w.toLowerCase();
-      if (lw.startsWith("--")) {
-        if (long.some((l) => lw === l || lw.startsWith(`${l}=`))) return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line, and Atrium wouldn't check it.` };
-      } else if (isOption(w)) {
-        if (short !== "" && [...lw.slice(1)].some((c) => short.includes(c))) return { refuse: `A rule can't allow ${name} ${w}: it runs code written on the command line (${w} holds a code flag), and Atrium wouldn't check it.` };
-      } else operands.push(lw);
-    }
-    const stdin = operands.find((o) => STDIN.has(o));
-    if (stdin !== undefined) return { refuse: `A rule can't allow ${name} ${stdin}: it runs code read from its input, and Atrium wouldn't check it.` };
-    const subcommand = operands[0];
-    if (subcommand !== undefined && sub.includes(subcommand)) return { refuse: `A rule can't allow ${name} ${subcommand}: it runs code written on the command line, and Atrium wouldn't check it.` };
-    const verb = subcommand !== undefined && verbs.includes(subcommand) ? 1 : 0;
-    if (operands.length <= verb) return { refuse: `A rule can't allow ${argv.slice(0, 1).join(" ")} without the script it runs: without one, ${name} reads code from its input. ${NAME_A_SCRIPT}` };
-    if (prefix) {
-      const at = verbs.length && args[0] !== undefined && verbs.includes(args[0].toLowerCase()) ? 1 : 0;
-      const named = args[at];
-      if (named === undefined || named.startsWith("-")) return { refuse: `A prefix rule can't allow ${argv.slice(0, at + 1).join(" ")}${named === undefined ? " alone" : ` ${named}`}. ${NAME_A_SCRIPT}` };
-    }
-    return { warn: `This allows the ${name} script it names${prefix ? ", with whatever arguments follow," : ""} whatever the script does.` };
-  }
-
-  // 11. Package runners (`npx`, `pnpx`, `bunx`, `uvx`).
-  if (PACKAGE_RUNNERS.has(name)) {
-    const code = args.find((w) => {
-      const lw = w.toLowerCase();
-      return RUNNER_CODE.has(lw) || lw.startsWith("--call=") || (isOption(w) && !lw.startsWith("--") && lw.slice(1).includes("c"));
-    });
-    if (code) return { refuse: `A rule can't allow ${name} ${code}: it runs a shell command, and Atrium wouldn't check it.` };
-    if (prefix && (args[0] === undefined || args[0].startsWith("-"))) return { refuse: `A prefix rule on ${name} must name the package right after it, like ${name} prettier, with no options before it.` };
-    if (!args.some((w) => !w.startsWith("-"))) return { refuse: `A rule on ${name} must name the package it runs, like ${name} prettier.` };
-    return { warn: `This allows the package ${name} runs, whatever it does.` };
-  }
-
-  // 12. `find` (§7): Allow prefix is always refused (could append `-exec`).
-  if (name === "find") {
-    const exec = args.find((w) => FIND_EXEC.has(w.toLowerCase()));
-    if (exec) return { refuse: `A rule can't allow find ${exec}: it runs another command for each file, and Atrium wouldn't check that one.` };
-    if (prefix) return { refuse: "A prefix rule on find would also allow find … -exec or -delete added after it: use “This exact command” instead." };
-    if (args.some((w) => w.toLowerCase() === "-delete")) return { warn: "This allows find to delete what it matches." };
-    return null;
-  }
-
-  // 13. Remote/container command runners (`ssh`, `docker`, `kubectl`, `parallel`, ...):
-  //     Under rev 4 §7 (`code_runner_no_pin`, no program pin), Allow prefix is invalid;
-  //     exact command rules remain allowed with a warning.
-  if (COMMAND_RUNNERS.has(name)) {
-    if (prefix) {
-      return { refuse: `An Allow prefix rule can't end at ${name}: it runs arbitrary commands elsewhere. Use “This exact command” instead.` };
-    }
-    return { warn: `This allows whatever ${name} runs (on a host, in a container).` };
-  }
-
+  // Every other tool (HomeReadOnly, Search, §4 Wrapper, DerivedDestinationWriter,
+  // UNKNOWN_BY_DESIGN, and unknown tools such as `deno`, `bun`, `php`, `lua`, `pwsh`)
+  // is accepted by `atrium_core::policy::validate_rule_matcher`.
   return null;
 }
 

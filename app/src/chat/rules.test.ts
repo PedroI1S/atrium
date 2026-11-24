@@ -60,5 +60,26 @@ describe("how a remembered rule reads (D-054, D-062)", () => {
     expect(any.decision).toBe("Deny");
     expect(any.what).toBe("every web request");
     expect(any.code).toBeNull();
+    expect(any.invalidReason).toBeNull();
+  });
+
+  it("surfaces invalidReason for stored invalid rules (§11 item 5)", () => {
+    const inv = ruleText(
+      { ...rule({ matcher: { type: "command_prefix", argv: ["awk"] } }), invalid_reason: "unpinned awk" },
+      noTitle,
+    );
+    expect(inv.invalidReason).toBe("unpinned awk");
+
+    const invLocal = ruleText(
+      rule({ matcher: { type: "command_prefix", argv: ["awk"] } }),
+      noTitle,
+    );
+    expect(invLocal.invalidReason).toMatch(/awk/);
+
+    const okDeno = ruleText(
+      rule({ matcher: { type: "command_prefix", argv: ["deno"] } }),
+      noTitle,
+    );
+    expect(okDeno.invalidReason).toBeNull();
   });
 });
