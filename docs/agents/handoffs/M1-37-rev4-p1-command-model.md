@@ -498,3 +498,50 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core policy::v4:: -- --nocapture
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 8 (D-148)
+
+Short round under D-148 for review round 6's one major (`.orchestration/review-input/review-round6.md`).
+
+### Finding: exhaustion dropped a finished unit past `MAX_UNITS` instead of returning `TooLarge`
+- **Cause:** with 512 units stored, a pending 513th unit that already held a finished word was dropped by exhaustion recovery, and the result was `Exhausted` (Ask) instead of `TooLarge(Units)` (Deny), against §1's precedence and §8's structural cap. Both lexers had it.
+- **Fix:**
+  - **Exact lexer (`lex_exact_core` recovery):** a non-empty pending unit at the cap returns `CoreStop::TooLarge(Cap::Units)`. `lex_exact` maps it to `Err(TooLarge(Units))`. `build_units` gets the same through `UnitsSink`, whose cap counts the units of every nested `-c` level, and propagates it.
+  - **Best-effort (`lex_one_text` scan recovery):** a non-empty pending builder at the cap returns `TooLarge(Units)`. `push_converted`, `flush_builders_raw` and `flush_find_execs_raw` now return `Result`, and give `TooLarge(Units)` when a finished builder or `find -exec` command would go past the cap. Every recovery path (conversion, derived-work failure, pipeline bookkeeping, `find -exec` derivation and nesting) propagates it with `?`.
+  - **Other caps checked:**
+    - `MAX_BYTES` is tested on entry before any work in all three entry points;
+    - the best-effort memo hit checks the unit cap before charging;
+    - `flush_builder`, the conversion loop and `process_find_exec_cmds` already returned `TooLarge` before any charge;
+    - nesting depth (`MAX_DEPTH`) is an Unread reason, not a cap.
+- **Tests:**
+  - `r8_exact_too_large_beats_exhaustion`: the review's case (`"x;"×512 + "sudo"`, `ComputeBudget::new(31_347, 128 MiB)` → `TooLarge(Units)`), then the 400 budgets below the capped run's cost for `…sudo`, `…sudo id` and `…cat > out`. Every result is `TooLarge` or an `Exhausted` keeping at most 512 units; once `TooLarge`, always `TooLarge`; and one unit short is `TooLarge`.
+  - `r8_best_effort_too_large_beats_exhaustion`: the same for `…sudo id`, `…cat > out x` and `…FOO=1 sudo id`, plus derived `find -exec` units past the cap on recovery paths.
+  - `r8_build_units_too_large_beats_exhaustion_in_nested_scripts`: the 513th unit inside a `-c` script.
+
+### D-146 bracket rules confirmed (D-148)
+D-148 confirms the two stricter rules from round 7 as amendments to D-146; both only add Unread:
+- unquoted `/` is not a member of `[…]` (`[a/b]` is Unread);
+- a quoted or escaped `!` or `^` inside a class is outside the model (Unread, reported as `NegatedGlobClass`).
+
+They are no longer open items.
+
+### Change requests
+None.
+
+### Round 8 verification
+Run by the worker (D-123):
+- `cargo fmt --all`: clean
+- `cargo check -p atrium-core --tests`: clean
+- `cargo clippy -p atrium-core --tests -- -D warnings`: clean
+
+Not run (D-123): any test. Run in debug (reservation `debug_assert`s).
+
+Commands for the orchestrator's verification task (fish-compatible):
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4:: -- --nocapture
+cargo test --workspace --no-fail-fast
+```
