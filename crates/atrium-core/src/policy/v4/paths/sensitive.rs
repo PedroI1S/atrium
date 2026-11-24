@@ -776,6 +776,7 @@ impl ChargedRecord for (Vec<u8>, u8) {}
 impl ChargedRecord for (Vec<u8>, u8, bool) {}
 impl ChargedRecord for (Vec<u8>, Option<FileIdentity>) {}
 impl ChargedRecord for (Vec<u8>, Vec<u8>, usize) {}
+impl ChargedRecord for (Vec<u8>, Vec<u8>, u8) {}
 impl ChargedRecord for Option<Vec<u8>> {}
 impl ChargedRecord for Target {}
 impl ChargedRecord for PartId {}
@@ -1477,7 +1478,10 @@ pub(crate) fn check_target_into(
         let hard = matches!(hit.outcome, PartOutcome::HardDenyHit(_));
         written_store = !hard;
         push_charged(out, hit, budget)?;
-        if hard {
+        // A hard-deny hit ends the list, except that an Unread
+        // resolution still records its reason beside the hit (§1; review 5,
+        // finding 1).
+        if hard && !matches!(target.resolution, TargetResolution::Unread(_)) {
             return Ok(());
         }
     }

@@ -662,7 +662,15 @@ fn check_s8_protected_root(
     // (including listed-fold spellings like `.SSH` / `.ſsh`).
     if under_str(root_rel, ".ssh").is_some() {
         if let Some(found) = dir_has_existing_hard_deny_ssh_entry(
-            root_canon, protected, shared, resolver, caps, budget, part, outcomes,
+            root_canon,
+            folded_root,
+            protected,
+            shared,
+            resolver,
+            caps,
+            budget,
+            part,
+            outcomes,
         )? {
             push_hit(outcomes, "credential-read", found, budget)?;
             return Ok(true);
@@ -679,9 +687,13 @@ fn check_s8_protected_root(
             outcomes,
             &mut dir_cache,
         )?;
+        // Each `.ssh` found below the root is named on the spelling.
+        budget.charge(folded_root.len() as u64 + suffix.len() as u64 + 1)?;
+        budget.charge_alloc(folded_root.len() + 1 + suffix.len())?;
+        let ssh_name = join_bytes(folded_root, suffix.as_bytes());
         for ssh_root in ssh_roots {
             if let Some(found) = dir_has_existing_hard_deny_ssh_entry(
-                &ssh_root, protected, shared, resolver, caps, budget, part, outcomes,
+                &ssh_root, &ssh_name, protected, shared, resolver, caps, budget, part, outcomes,
             )? {
                 push_hit(outcomes, "credential-read", found, budget)?;
                 return Ok(true);
@@ -758,8 +770,15 @@ fn check_s8_protected_root(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Walks the real folder `ssh_root` and names each entry on `name_root` (the
+/// folded spelling the folder is checked under: canonical, written or alias,
+/// D-147, D-154) plus its path below the folder, so a hard-deny entry counts
+/// under the spelling being checked (review 5's class rule: names from the
+/// spelling, the filesystem from the real folder).
+#[allow(clippy::too_many_arguments)]
 fn dir_has_existing_hard_deny_ssh_entry(
     ssh_root: &[u8],
+    name_root: &[u8],
     protected: &ProtectedSet,
     shared: &SharedSensitive,
     resolver: &dyn PathResolver,
@@ -768,11 +787,12 @@ fn dir_has_existing_hard_deny_ssh_entry(
     part: &PartId,
     outcomes: &mut Vec<PartResult>,
 ) -> Result<Option<Vec<u8>>, Exhausted> {
-    budget.charge_alloc(ssh_root.len())?;
-    let mut stack = vec![(ssh_root.to_vec(), 0u8)];
+    budget.charge(ssh_root.len() as u64 + name_root.len() as u64 + 1)?;
+    budget.charge_alloc(ssh_root.len() + name_root.len())?;
+    let mut stack = vec![(ssh_root.to_vec(), name_root.to_vec(), 0u8)];
     let mut seen = 0usize;
     let mut emitted_depth_cap = false;
-    while let Some((dir, depth)) = stack.pop() {
+    while let Some((dir, name_dir, depth)) = stack.pop() {
         let entries = match resolver.read_dir(&dir, caps, budget) {
             Ok(e) => e,
             Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => continue,
@@ -820,9 +840,13 @@ fn dir_has_existing_hard_deny_ssh_entry(
             }
             let child_len = dir.len() + 1 + entry.name.len();
             budget.charge(child_len as u64)?;
-            budget.charge_alloc(child_len.saturating_mul(2))?;
+            budget.charge_alloc(child_len)?;
             let child = join_bytes(&dir, &entry.name);
-            let folded = fold_path_listed(&child, protected.folds, budget)?;
+            let folded_name = fold_listed_component(&entry.name, protected.folds, budget)?;
+            let name_len = name_dir.len() + 1 + folded_name.len();
+            budget.charge(name_len as u64)?;
+            budget.charge_alloc(name_len)?;
+            let folded = join_bytes(&name_dir, &folded_name);
             if entry.file_type != FileType::Dir
                 && shared
                     .hard_deny_hit_folded(&folded, AccessMode::Read)
@@ -832,7 +856,7 @@ fn dir_has_existing_hard_deny_ssh_entry(
             }
             if entry.file_type == FileType::Dir {
                 if depth + 1 < limits::WALK_MAX_DEPTH {
-                    push_charged(&mut stack, (child, depth + 1), budget)?;
+                    push_charged(&mut stack, (child, folded, depth + 1), budget)?;
                 } else if !emitted_depth_cap {
                     emitted_depth_cap = true;
                     push_charged(
