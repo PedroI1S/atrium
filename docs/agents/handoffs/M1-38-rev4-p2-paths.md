@@ -747,3 +747,66 @@ The other lossy conversions are covered by `fold_alloc_bound`, or are in the tes
 Run by the worker (D-123): `cargo fmt --all` (clean), `cargo check -p atrium-core --tests` (clean), `cargo clippy -p atrium-core --tests -- -D warnings` (clean). No tests were run.
 
 An allocation-counting allocator is not possible in a library test, so charge-before-clone ordering holds by construction. The tests check that each charge exists and that results are correct.
+
+## 15. Round 11 (D-161)
+
+Input: review 9 (Sonnet 5.5, `.orchestration/review-input/M1-38-rev4-p2-paths-round9.md`, on round 10 `cae98db` plus the merge of `dev` at `635fe23b`), with two items (V1 and Finding 1) and five test-gap groups.
+
+Commits on `agent/neon/M1-38-rev4-p2-paths`:
+- `0721aa8`: V1 (`read_dir` on non-Linux Unix) and Finding 1 (unified `FsResolver::canonicalize` charges and bounded proper-ancestor stat cache in `RootAliases::scan`);
+- `bf62832`: updated `round3_r2f4` and round 11 regression/cross-platform tests;
+- handoff commit: this section (`docs/agents/handoffs/M1-38-rev4-p2-paths.md`).
+
+No change requests: neither the frozen P0 interface (`model.rs`, `limits.rs`, `paths.rs` signatures) nor the contract (`docs/contracts/m1-policy-rev4.md`) required changes. All edits stay strictly inside P2's owned paths (`resolver.rs`, `sensitive.rs`, `p2_tests.rs`, and this handoff).
+
+### 15.1 V1: macOS `read_dir` build failure and `#[cfg(...)]` cross-platform audit
+
+- **Cause:** `FsResolver::read_dir` in `crates/atrium-core/src/policy/v4/paths/resolver.rs` imported `rustix::fs::RawDir` inside `#[cfg(unix)]`, but `rustix` only defines `RawDir` on Linux (`#[cfg(linux_kernel)]`), so `atrium-core` failed to compile on macOS.
+- **Fix:** Split Unix directory iteration inside `FsResolver::read_dir` into:
+  - `#[cfg(target_os = "linux")]`: existing `rustix::fs::RawDir` over a 4 KiB stack buffer;
+  - `#[cfg(all(unix, not(target_os = "linux")))]`: `rustix::fs::Dir::read_from(&dir_fd)`, which borrows `&dir_fd` (keeping the directory descriptor open for `DT_UNKNOWN` `statat` fallbacks without `unsafe`).
+  - Extracted `#[cfg(unix)] fn push_unix_dir_entry` so Linux and non-Linux Unix execute the exact same per-entry charges in the exact same order, always before allocating or stat'ing (§8): `caps.charge_entries_read(1)?` + `budget.charge(1)?` before `next()`, skip `.`/`..`, `budget.charge(name.len() - 1)?`, `charge_aux_stat` before `statat` on `DT_UNKNOWN`, `budget.charge_alloc(name.len())?` before allocating the name `Vec`, and `push_entry_charged`.
+- **Cross-platform `#[cfg(...)]` audit across all P2 files:** Checked every `#[cfg(...)]` in `paths.rs`, `resolver.rs`, `recursive.rs`, `sensitive.rs`, and `p2_tests.rs`:
+  - `resolver.rs`: `bytes_to_path`, `path_to_bytes`, `map_metadata`, `map_io_error`, `map_errno`, `map_rustix_file_type`, `PATH_MAX` (`1024` on Apple / `4096` elsewhere), `canonicalize_via_proc` (`linux` only), `push_unix_dir_entry` (`unix`), `read_link` (`unix` / `not(unix)`), `canonicalize` (`linux` fast path + `unix`/`not(unix)` fallback), `read_dir` (`linux` `RawDir` / `all(unix, not(linux))` `Dir` / `not(unix)`). No Linux-only APIs remain in `#[cfg(unix)]` blocks, and `#[cfg(target_os = "linux")]` blocks were checked for matching signatures and zero unused imports/vars.
+  - `recursive.rs`: `unix` (`OsStrExt::as_bytes`) vs `not(unix)` (`as_encoded_bytes`) for glob entry conversion — compiles on both macOS and Linux.
+  - `p2_tests.rs`: `round3_r2f4` widened from `#[cfg(target_os = "linux")]` to `#[cfg(unix)]`; `round3_r2f5` stays `#[cfg(target_os = "linux")]` (tests exact `/proc/self/fd` output-only allocation charge) with a non-Linux Unix companion (`round11_f1_fallback_canonicalize_checks_peak_before_allocating_and_charges_real_len`); `round11_v1_f1_real_fs_1100_plain_operands_and_large_read_dir` is `#[cfg(unix)]` (runs on both Linux and macOS); `round11_macos_real_fs_firmlink_strip_and_mixed_case_ssh` is `#[cfg(target_os = "macos")]`.
+
+### 15.2 Finding 1: `FsResolver::canonicalize` platform divergence and premature caps
+
+- **Cause:**
+  - On Linux, `canonicalize_via_proc` charged `caps.charge_link_read()?` for the fixed `/proc/self/fd/N` read, tripping `FS_MAX_READLINKS` (1,024) well before `FS_MAX_CANONICALIZATIONS` (4,096).
+  - On macOS (and any fallback path), `FsResolver::canonicalize` charged `charge_aux_stat` once per path component against `FS_MAX_STATS` (16,384) and permanently charged `2 * PATH_MAX` (2,048 bytes on macOS) of allocation per call, tripping `Stats` around ~1,300 operands and `AllocationBudget` around ~3,000 operands.
+  - In addition, `RootAliases::scan` in `sensitive.rs` re-stat'ed every ancestor of every operand on every call; on macOS, `tempfile::tempdir()` canonicalizes to 6–7 components (`/private/var/folders/xx/.../T/.tmp...`), so 1,100 files at depth 8–9 would consume ~19,800 stats (`resolve_literal` + `RootAliases::scan`) and trip `FS_MAX_STATS` (16,384) even after removing the double-counted stats from `canonicalize`.
+- **Fix:**
+  - **Unified caps & compute on `FsResolver::canonicalize` (`resolver.rs`):** Both Linux and macOS charge `caps.charge_canonicalize()?`, `budget.charge(path.len() + components.max(1))?`, and `charge_path_conversion(path, budget)?`. Neither platform consumes `FsCap::Stats` or `FsCap::LinkReads` during `canonicalize`. Removed `caps` and `caps.charge_link_read()?` from `canonicalize_via_proc`, and removed the per-component `charge_aux_stat` loop from the fallback.
+  - **Fallback allocation accounting keeping §8 "charge before allocate" (`resolver.rs`):** Added `FALLBACK_CANON_OVERHEAD = 64` and `FALLBACK_CANON_PEAK = PATH_MAX * 2 + FALLBACK_CANON_OVERHEAD`. Before calling `std::fs::canonicalize(p)`, the fallback verifies `budget.remaining_alloc_bytes() >= FALLBACK_CANON_PEAK` (failing via `budget.charge_alloc(FALLBACK_CANON_PEAK)?` before invoking `std::fs::canonicalize` when insufficient, so the OS call can never allocate past the remaining budget). Once `std::fs::canonicalize` returns `bytes` (and `realpath`'s transient buffer has been freed), it charges `budget.charge(bytes.len() as u64)?` and `budget.charge_alloc(bytes.len() + FALLBACK_CANON_OVERHEAD)?`. This preserves §8 strictly while allowing all 4,096 single-component operands to clear inside the 8 MiB `COMPUTE_BUDGET_ALLOC_BYTES` on both Linux and macOS.
+  - **Bounded proper-ancestor stat cache in `RootAliases::scan` (`sensitive.rs`):** Added `ancestor_stats: HashMap<Vec<u8>, Option<FileIdentity>>` (scoped to one `RootAliases` instance per call, capped at 1,024 entries, caching only proper ancestors `i + 1 < comps.len()` and never leaves, with compute and allocation charged before every insertion and compute charged on cache hits). Under a 7-component macOS tempdir, 1,100 files now use ~11,060 stats total (well under `FS_MAX_STATS = 16,384`).
+
+### 15.3 Items, fixes, and regression tests (`p2_tests.rs`)
+
+All test expectations were derived from the rev 4 contract (§1, §2, §3, §5, §8, §10) and decisions (D-145, D-147, D-149, D-154, D-161).
+
+| Item / Test gap | Fix | Regression test (`p2_tests.rs`) |
+|---|---|---|
+| V1 & F1: real-fs 1,100 operands + >1,000-entry `read_dir` + 4,096 canonicalizations (both Linux & macOS) | `Dir::read_from` on non-Linux Unix (`push_unix_dir_entry`), unified `canonicalize` caps/charges, `RootAliases::scan` proper-ancestor cache | `round11_v1_f1_real_fs_1100_plain_operands_and_large_read_dir` (`#[cfg(unix)]`); `round3_r2f4_fs_resolver_makes_no_uncharged_metadata_call` (widened to `#[cfg(unix)]`, asserts 0 `Stats` / 0 `LinkReads` / 1 `Canonicalizations`) |
+| F1: 4,096 single-component operands clear under default limits; 4,097 trips `Canonicalizations` | Unified `canonicalize` charges | `round11_f1_4096_single_component_operands_clear_under_default_limits` |
+| F1 & §8: non-Linux fallback peak guard before `std::fs::canonicalize` + real-length-plus-overhead deduction | `FALLBACK_CANON_PEAK` pre-check + `bytes.len() + FALLBACK_CANON_OVERHEAD` charge | `round11_f1_fallback_canonicalize_checks_peak_before_allocating_and_charges_real_len` (`#[cfg(all(unix, not(target_os = "linux")))]`) |
+| Test gap: charge ordering proxy (rounds 8 & 10) | Verified exact minimum alloc budgets (`min - 1` fails with `AllocationBudget`, `min` succeeds with 0 remaining, `min >= copy_size` and delta matches copy) | `round11_charge_ordering_exact_minimum_alloc_budgets` (incomplete-table reason in `RootAliases::scan`, MSAL entry copy in `spelled_roots`, `~/.ssh` member spelling in both `push_ssh_members` and S8 `dir_has_existing_hard_deny_ssh_entry`) |
+| Test gap: round 10 finding 1 (`~/.ssh` members) | Covered member file via hard link & bound member folder, subfolder under linked tree into `~/.ssh` (not alias root, files are members, `links_below` reaches tree), linked `~/.ssh` itself, and >1,024 entries silent cutoff -> Clear | `round11_r10f1_ssh_member_file_linked_tree_and_cutoff_cases` |
+| Test gap: round 10 fix 2 (`.ssh` below root & alias spelling) | Covered S8-exempt `~`, `~/proj` reaching `~/.ssh` via followed link (unfiltered HardDeny / filtered Unread), alias `/mnt/keys` with private key vs only `.pub`+`config`, `~/proj` reaching `/mnt/keys`, and written subfolder `lnk/../.ssh/sub` | `round11_r10fix2_ssh_below_root_and_alias_spelling` |
+| Test gap: macOS real-fs firmlink strip & mixed-case `~/.SSH` | Real tempdir (never real `~`) exercising `/System/Volumes/Data/<tmp>` canonicalization + firmlink strip (existing credential, absent `~/.aws/credentials`, ordinary file) and mixed-case `~/.SSH` (`ID_RSA`, absent key, `ID_RSA.PUB`, `CONFIG` read vs write) | `round11_macos_real_fs_firmlink_strip_and_mixed_case_ssh` (`#[cfg(target_os = "macos")]`) |
+
+### 15.4 Verification
+
+Run by the worker (D-123):
+- `cargo fmt --all` (clean)
+- `cargo check -p atrium-core --tests` (clean on macOS, 0 errors, 0 warnings)
+- No tests or `clippy` were run (D-123). No real provider was invoked.
+
+Exact commands for the orchestrator's verification (fish-compatible; run on both macOS and Linux):
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core --lib policy::v4::paths
+cargo test --workspace --no-fail-fast
+```
