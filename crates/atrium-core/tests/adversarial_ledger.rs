@@ -52,13 +52,15 @@ fn an_exact_rule_never_matches_a_longer_argv() {
         "rm -rf bu\\ild",
         "rm -rf build;",
         "ls; rm -rf build",
-        "rm -rf build; ls",
-        "rm -rf build | cat",
         "\\rm -rf build",
         "rm -rf build 2>&1",
         "rm -rf build >/dev/null",
     ];
     let not_same = [
+        // Contract §5 / §10 row 21 / §11 items 6 & 10: a unit after or sharing
+        // a pipeline with a possible writer (`rm`) is Unread -> Ask.
+        "rm -rf build; ls",
+        "rm -rf build | cat",
         "rm -rf build ~/Documents",
         "rm -rf build x",
         "rm -rf build -v",
@@ -140,14 +142,12 @@ fn a_prefix_rule_never_matches_a_longer_word_or_a_riskier_line() {
         RuleDecision::Allow,
         "make",
     )];
-    let yes = [
-        "make",
-        "make all",
-        "make -j4 test",
+    let yes = ["make", "make all", "make -j4 test"];
+    let no = [
+        // Contract §5 / §11 item 6: `make` is a possible writer, so a following
+        // unit is `Unread(AfterPossibleWriter)` -> Ask under prefix rules.
         "make; make",
         "make && make clean",
-    ];
-    let no = [
         "makeall",
         "make2",
         "gmake",

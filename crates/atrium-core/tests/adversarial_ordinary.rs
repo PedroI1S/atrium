@@ -89,47 +89,25 @@ fn check_table(table: &[Row]) {
 /// and `..` paths that no cwd could give.
 #[test]
 fn ordinary_lines_after_a_working_cd() {
+    // Contract §5: `cd` verifies its target directory via `resolver.stat`.
+    // Under `Env::home()`'s virtual resolver no directories exist, so `cd`
+    // fails closed to `Unread(UnknownCwd)` -> Ask under prefix rules while
+    // `Any` and `FullAccess` allow and nothing is falsely hard-denied.
+    let ask = ["Ask", "Ask", "Allow", "Allow"];
     check_table(&[
-        (
-            "cd proj && cat README.md",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        ("cd proj && rm -rf build", ["Ask", "Ask", "Allow", "Allow"]),
-        ("cd proj && cat .npmrc", ["Ask", "Allow", "Allow", "Allow"]),
-        (
-            "cd ~/proj && cat .npmrc",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        ("cd /tmp && cat .npmrc", ["Ask", "Allow", "Allow", "Allow"]),
-        ("cd proj && cat .netrc", ["Ask", "Allow", "Allow", "Allow"]),
-        (
-            "cd infra && cat .kube/config",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd app && cat .docker/config.json",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd proj && cat .claude.json",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd proj && grep registry .npmrc",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd proj && ls -la .gnupg",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd packages/app && cat ../.npmrc",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd a/b/c && cat ../../.npmrc",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
+        ("cd proj && cat README.md", ask),
+        ("cd proj && rm -rf build", ask),
+        ("cd proj && cat .npmrc", ask),
+        ("cd ~/proj && cat .npmrc", ask),
+        ("cd /tmp && cat .npmrc", ask),
+        ("cd proj && cat .netrc", ask),
+        ("cd infra && cat .kube/config", ask),
+        ("cd app && cat .docker/config.json", ask),
+        ("cd proj && cat .claude.json", ask),
+        ("cd proj && grep registry .npmrc", ask),
+        ("cd proj && ls -la .gnupg", ask),
+        ("cd packages/app && cat ../.npmrc", ask),
+        ("cd a/b/c && cat ../../.npmrc", ask),
         ("cd build && rm -rf *", ["Ask", "Ask", "Allow", "Allow"]),
         ("cd dist && rm -rf ./*", ["Ask", "Ask", "Allow", "Allow"]),
         (
@@ -149,42 +127,60 @@ fn ordinary_lines_after_a_working_cd() {
             "cd proj && rm -rf node_modules",
             ["Ask", "Ask", "Allow", "Allow"],
         ),
-        (
-            "cd proj && cat .gitignore",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        ("cd src && ls", ["Ask", "Allow", "Allow", "Allow"]),
-        ("cd .. && ls", ["Ask", "Allow", "Allow", "Allow"]),
-        ("cd ~ && ls", ["Ask", "Allow", "Allow", "Allow"]),
-        ("cd /tmp && ls", ["Ask", "Allow", "Allow", "Allow"]),
-        ("cd proj && git status", ["Ask", "Allow", "Allow", "Allow"]),
-        ("cd proj && cargo build", ["Ask", "Ask", "Allow", "Allow"]),
-        ("cd proj && npm install", ["Ask", "Ask", "Allow", "Allow"]),
-        (
-            "cd proj && rm -rf target dist",
-            ["Ask", "Ask", "Allow", "Allow"],
-        ),
-        (
-            "cd proj && find . -name '*.tmp' -delete",
-            ["Ask", "Ask", "Allow", "Allow"],
-        ),
-        (
-            "cd proj && cat .env.example",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd proj && cat .eslintrc.json",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd proj && cat .gitconfig",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd docs && cat ../README.md",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
+        ("cd proj && cat .gitignore", ask),
+        ("cd src && ls", ask),
+        ("cd .. && ls", ask),
+        ("cd ~ && ls", ask),
+        ("cd /tmp && ls", ask),
+        ("cd proj && git status", ask),
+        ("cd proj && cargo build", ask),
+        ("cd proj && npm install", ask),
+        ("cd proj && rm -rf target dist", ask),
+        ("cd proj && find . -name '*.tmp' -delete", ask),
+        ("cd proj && cat .env.example", ask),
+        ("cd proj && cat .eslintrc.json", ask),
+        ("cd proj && cat .gitconfig", ask),
+        ("cd docs && cat ../README.md", ask),
     ]);
+
+    // Real directories on disk (`SessionGate`): §5 `cd` tracks cwd cleanly and
+    // prefix rules allow the ordinary read/list lines.
+    let t = Tmp::new();
+    for dir in [
+        "proj",
+        "infra",
+        "app",
+        "packages/app",
+        "a/b/c",
+        "src",
+        "docs",
+    ] {
+        std::fs::create_dir_all(t.home.join(dir)).unwrap();
+    }
+    let g = t.gate(Preset::Home, prefix_rules());
+    for line in [
+        "cd proj && cat README.md",
+        "cd proj && cat .npmrc",
+        "cd ~/proj && cat .npmrc",
+        "cd /tmp && cat .npmrc",
+        "cd proj && cat .netrc",
+        "cd infra && cat .kube/config",
+        "cd app && cat .docker/config.json",
+        "cd proj && cat .claude.json",
+        "cd proj && grep registry .npmrc",
+        "cd proj && ls -la .gnupg",
+        "cd proj && cat .gitignore",
+        "cd src && ls",
+        "cd ~ && ls",
+        "cd /tmp && ls",
+        "cd proj && git status",
+        "cd proj && cat .env.example",
+        "cd proj && cat .eslintrc.json",
+        "cd proj && cat .gitconfig",
+    ] {
+        let d = block_on(g.gate.check(&cmd_check(line)));
+        assert_eq!(d, GateDecision::Allow, "{line:?} [real-disk prefix]");
+    }
 }
 
 /// Third-part corrections (the fixer's, see the handoff): after `;` or a
@@ -244,33 +240,43 @@ fn after_a_cd_that_may_fail_the_old_directory_counts() {
 /// by `&&` they keep dev's verdicts.
 #[test]
 fn ordinary_nested_cds() {
+    let ask = ["Ask", "Ask", "Allow", "Allow"];
+    // Virtual resolver (`Env::home()`): directories do not exist so §5 `cd`
+    // fails closed to `UnknownCwd` -> Ask under prefix rules, never TooLarge.
     check_table(&[
         (
             "cd a && cd b && cd c && cd d && cd e && cd f && cd g && ls",
-            ["Ask", "Allow", "Allow", "Allow"],
+            ask,
         ),
-        (
-            "cd a && cd b && cd c && cd d && cd e && cd f && ls",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd a && cd b && cd c && ls",
-            ["Ask", "Allow", "Allow", "Allow"],
-        ),
-        (
-            "cd a; cd b; cd c; cd d; cd e; cd f; cd g; ls",
-            ["Ask", "Ask", "Allow", "Allow"],
-        ),
-        ("cd a/b/c/d/e/f/g && ls", ["Ask", "Allow", "Allow", "Allow"]),
+        ("cd a && cd b && cd c && cd d && cd e && cd f && ls", ask),
+        ("cd a && cd b && cd c && ls", ask),
+        ("cd a; cd b; cd c; cd d; cd e; cd f; cd g; ls", ask),
+        ("cd a/b/c/d/e/f/g && ls", ask),
         (
             "cd a && cd b && cd c && cd d && cd e && cd f && cd g && cat README.md",
-            ["Ask", "Allow", "Allow", "Allow"],
+            ask,
         ),
         (
             "cd a && cd b && cd c && cd d && cd e && cd f && cd g && rm -rf build",
-            ["Ask", "Ask", "Allow", "Allow"],
+            ask,
         ),
     ]);
+
+    // Real directories on disk (`SessionGate`): `&&`-chained `cd`s track cwd
+    // and prefix rules allow them.
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.home.join("a/b/c/d/e/f/g")).unwrap();
+    let g = t.gate(Preset::Home, prefix_rules());
+    for line in [
+        "cd a && cd b && cd c && cd d && cd e && cd f && cd g && ls",
+        "cd a && cd b && cd c && cd d && cd e && cd f && ls",
+        "cd a && cd b && cd c && ls",
+        "cd a/b/c/d/e/f/g && ls",
+        "cd a && cd b && cd c && cd d && cd e && cd f && cd g && cat README.md",
+    ] {
+        let d = block_on(g.gate.check(&cmd_check(line)));
+        assert_eq!(d, GateDecision::Allow, "{line:?} [real-disk prefix]");
+    }
 }
 
 /// Review finding 10 and "tried and held": pipes and `$VAR` command words,
@@ -887,7 +893,11 @@ fn round_8_major_6_searches_given_a_folder_beside_a_linked_one() {
         for (name, rules, preset) in &settings {
             let g = t.gate_with("t1", 1, &dir, *preset, rules.clone(), None);
             let d = block_on(g.gate.check(&cmd_check(line)));
+            // Contract §10 row 15 / §11 item 15 / D-139: `rg -L` / `rg --follow`
+            // on a clean directory with no protected links is Allow in Home.
+            let is_rg_follow = matches!(line, "rg -L pat safe_sub" | "rg --follow pat safe_sub");
             let ok = match *name {
+                "home" if is_rg_follow => matches!(d, GateDecision::Allow),
                 "home" => matches!(d, GateDecision::Ask { .. }),
                 _ => matches!(d, GateDecision::Allow),
             };
@@ -991,9 +1001,11 @@ fn round_8_fix_rg_follow_given_as_a_value_keeps_devs_verdict() {
 /// today's verdict (and dev's).
 #[test]
 fn round_8_fix_rg_real_follow_flag_keeps_its_verdict() {
+    // Contract §10 row 15 / §11 item 15 / D-139: `rg -L` / `--follow` / `-iL`
+    // on a clean folder with no protected links is Allow in Home.
     vault_gate_table(&[
-        ("rg -L pat safe_sub", ["Ask", "Allow", "Allow"]),
-        ("rg --follow pat safe_sub", ["Ask", "Allow", "Allow"]),
-        ("rg -iL pat safe_sub", ["Ask", "Allow", "Allow"]),
+        ("rg -L pat safe_sub", ["Allow", "Allow", "Allow"]),
+        ("rg --follow pat safe_sub", ["Allow", "Allow", "Allow"]),
+        ("rg -iL pat safe_sub", ["Allow", "Allow", "Allow"]),
     ]);
 }

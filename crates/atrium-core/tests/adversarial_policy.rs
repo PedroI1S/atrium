@@ -277,15 +277,12 @@ fn leftover_hard_linked_files_ask() {
     let verdict = |line: &str| block_on(g.gate.check(&cmd_check(line)));
     assert_eq!(verdict("cat proj/plain.txt"), GateDecision::Allow);
     assert_eq!(verdict("wc -l proj/plain.txt"), GateDecision::Allow);
+    // Ordinary multiply-linked files ask (§1 step 4, §11 unchanged).
     for line in [
         "cat proj/linked.txt",
         "cat proj/second-name",
-        "head -n1 proj/innocent.txt",
-        "tail proj/data.db",
-        "wc proj/innocent.txt",
         "stat proj/linked.txt",
         "cat proj/plain.txt proj/linked.txt",
-        "ls proj && cat proj/innocent.txt",
     ] {
         assert!(
             matches!(verdict(line), GateDecision::Ask { .. }),
@@ -293,14 +290,38 @@ fn leftover_hard_linked_files_ask() {
             verdict(line)
         );
     }
-    for p in ["proj/linked.txt", "proj/innocent.txt", "proj/data.db"] {
+    // Under rev 4 (D-145 item 2, §5), `build_protected_set` walks `.gnupg` and
+    // `.config/gcloud` for identities too, so hard links to credentials there
+    // are HardDeny rather than Ask.
+    for line in [
+        "head -n1 proj/innocent.txt",
+        "tail proj/data.db",
+        "wc proj/innocent.txt",
+        "ls proj && cat proj/innocent.txt",
+    ] {
+        assert!(
+            matches!(verdict(line), GateDecision::Deny { .. }),
+            "{line}: {:?}",
+            verdict(line)
+        );
+    }
+    let linked_read = paths_check(ToolKind::Read, "Read", &["proj/linked.txt"], false, None);
+    assert!(
+        matches!(
+            block_on(g.gate.check(&linked_read)),
+            GateDecision::Ask { .. }
+        ),
+        "proj/linked.txt"
+    );
+    for p in ["proj/innocent.txt", "proj/data.db"] {
         let c = paths_check(ToolKind::Read, "Read", &[p], false, None);
         assert!(
-            matches!(block_on(g.gate.check(&c)), GateDecision::Ask { .. }),
+            matches!(block_on(g.gate.check(&c)), GateDecision::Deny { .. }),
             "{p}"
         );
     }
-    // an allow rule for the command can't take it past the asking either
+    // An allow rule for the command still asks for an ordinary multiply-linked
+    // file (§1 step 4) and still hard-denies a hard link into `.gnupg`.
     let g2 = t.gate(
         Preset::Home,
         vec![rule(
@@ -311,10 +332,10 @@ fn leftover_hard_linked_files_ask() {
             "r1",
         )],
     );
-    // (rules are applied before the downgrade: a rule Allow is also asked for
-    // a hard-linked file, the conservative reading of "never auto-allow")
-    let d = block_on(g2.gate.check(&cmd_check("cat proj/innocent.txt")));
-    assert!(matches!(d, GateDecision::Ask { .. }), "{d:?}");
+    let d_linked = block_on(g2.gate.check(&cmd_check("cat proj/linked.txt")));
+    assert!(matches!(d_linked, GateDecision::Ask { .. }), "{d_linked:?}");
+    let d_cred = block_on(g2.gate.check(&cmd_check("cat proj/innocent.txt")));
+    assert!(matches!(d_cred, GateDecision::Deny { .. }), "{d_cred:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -973,10 +994,51 @@ fn finding_3_popd_pushd_and_cdpath_leave_the_directory_unknown() {
     ]);
 }
 
+// Contract §3, §10 row 6, §11 items 1–2, §12 (M1-28 dropped the `$'…'` reader):
+// ANSI-C `$'…'` words are `Unread`, so Home and prefix rules ask while unscoped
+// `Any` and `FullAccess` allow (after the best-effort pass).
 #[test]
-#[ignore = "M1-13 finding 4"]
 fn finding_4_ansi_c_quoted_words_are_decoded() {
-    hard_everywhere(&["cat $'.ssh/\\x69d_rsa'", "cat $'\\056ssh/id_rsa'"]);
+    let env = Env::home();
+    let cat_rule = vec![rule(
+        RuleScope::Global,
+        ToolKind::Execute,
+        prefix(&["cat"]),
+        RuleDecision::Allow,
+        "cat-prefix",
+    )];
+    let any = allow_everything();
+    for line in ["cat $'.ssh/\\x69d_rsa'", "cat $'\\056ssh/id_rsa'"] {
+        let c = cmd_check(line);
+        assert!(
+            matches!(
+                env.eval_check(&c, &[], Preset::Home),
+                atrium_core::PolicyVerdict::Ask
+            ),
+            "{line} [home]"
+        );
+        assert!(
+            matches!(
+                env.eval_check(&c, &cat_rule, Preset::Home),
+                atrium_core::PolicyVerdict::Ask
+            ),
+            "{line} [prefix]"
+        );
+        assert!(
+            matches!(
+                env.eval_check(&c, &any, Preset::Home),
+                atrium_core::PolicyVerdict::Allow { .. }
+            ),
+            "{line} [any]"
+        );
+        assert!(
+            matches!(
+                env.eval_check(&c, &[], Preset::FullAccess),
+                atrium_core::PolicyVerdict::Allow { .. }
+            ),
+            "{line} [full]"
+        );
+    }
 }
 
 #[test]
@@ -1061,10 +1123,21 @@ fn finding_9_a_process_substitution_that_feeds_a_shell_is_read() {
     ]);
 }
 
+// Contract §5 (S8), §10 row 16, §11 item 12: a recursive search of a folder
+// containing an existing hard-deny credential file is HardDeny in every setting
+// (Home, Any, FullAccess). Without a credential file on disk (`Env::home()`),
+// Home still asks (`StoreHit`).
 #[test]
-#[ignore = "M1-13 finding 5"]
 fn finding_5_a_recursive_search_of_a_folder_with_a_credential_file_is_blocked() {
-    hard_everywhere(&[
+    let t = Tmp::new();
+    t.write(".aws/credentials", "aws_secret=1");
+    t.write(".docker/config.json", "{}");
+    t.write(".kube/config", "apiVersion: v1");
+    t.write(".config/gh/hosts.yml", "github.com:");
+    t.write(".claude/.credentials.json", "{}");
+    t.write(".codex/auth.json", "{}");
+
+    let cases = [
         "rg pat .aws",
         "rg pat .docker",
         "rg pat .kube",
@@ -1072,7 +1145,23 @@ fn finding_5_a_recursive_search_of_a_folder_with_a_credential_file_is_blocked() 
         "rg pat .claude",
         "rg pat .codex",
         "grep -r pat ~/.aws",
-    ]);
+    ];
+    let any = allow_everything();
+    for (label, preset, rules) in [
+        ("home", Preset::Home, vec![]),
+        ("home+any-rule", Preset::Home, any),
+        ("full-access", Preset::FullAccess, vec![]),
+    ] {
+        let g = t.gate(preset, rules);
+        for line in cases {
+            let d = block_on(g.gate.check(&cmd_check(line)));
+            assert!(
+                matches!(d, GateDecision::Deny { .. }),
+                "{line:?} [{label}]: expected HardDeny (S8), got {d:?}"
+            );
+        }
+    }
+    asks_in_home_only(&cases);
 }
 
 /// Credential-bearing files that the contract's hard-deny list does not name.
@@ -1135,8 +1224,8 @@ fn finding_6_other_credential_stores_ask_in_home() {
     asks_in_home_only(OUTSIDE_THE_LIST);
 }
 
+// Contract §11 / D-111 (CR-17's four stores ask in Home).
 #[test]
-#[ignore = "M1-13 finding 6: not in the CR-12 list (contract §9 rev 3.1)"]
 fn finding_6_stores_outside_the_cr_12_list_ask_in_home() {
     asks_in_home_only(NOT_IN_THE_CR_12_LIST);
 }
@@ -1169,7 +1258,8 @@ fn ordinary_commands_are_not_hard_denied() {
         ("cat proj/.env", Want::Allow),
         ("cat proj/.ssh/id_rsa", Want::Allow),
         ("rg pat proj/.ssh", Want::Allow),
-        ("cat ~/.ѕsh/id_rsa", Want::Allow),
+        // Contract §3 / §10 row 10: unquoted non-ASCII (`ѕ` U+0455) is Unread -> Ask, not HardDeny.
+        ("cat ~/.ѕsh/id_rsa", Want::Ask),
         ("cat /etc/hosts", Want::Allow),
         ("head -n 5 proj/file", Want::Allow),
         ("git status", Want::Allow),
