@@ -977,10 +977,10 @@ impl SharedSensitive {
                 }
             }
         }
+        // A folder linked from `~/.ssh` is itself protected (§11 item 17,
+        // D-145 item 3), for reads as well as writes.
         for d in &self.raw_ssh_linked {
-            if let Some(n) = comps_match_prefix_unlisted(&cand_comps, path_components(d), budget)?
-                && (cand_comps.len() > n || writes)
-            {
+            if comps_match_prefix_unlisted(&cand_comps, path_components(d), budget)?.is_some() {
                 return Ok(true);
             }
         }
@@ -1187,10 +1187,10 @@ fn hard_deny_match_parts(
             }
         }
     }
+    // A folder linked from `~/.ssh` is itself protected, for reads too
+    // (§11 item 17, D-145 item 3): `ls vault/work` is HardDeny.
     for d in ssh_linked {
-        if let Some(rest) = under_bytes(pl, d)
-            && (!rest.is_empty() || writes)
-        {
+        if under_bytes(pl, d).is_some() {
             return Some("credential-read");
         }
     }

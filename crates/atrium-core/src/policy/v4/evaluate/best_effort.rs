@@ -4084,9 +4084,8 @@ fn glob_hit_budgeted(
     }
     for d in shared.ssh_linked_folded() {
         if let Ok(ds) = std::str::from_utf8(d) {
-            if matcher.matches_strict_descendant(ds, budget)?
-                || (access != AccessMode::Read && matcher.matches_dir_prefix(ds, budget)?)
-            {
+            // the linked folder itself is protected too (§11 item 17)
+            if matcher.matches_dir_prefix(ds, budget)? {
                 return Ok(Some("credential-read"));
             }
             if is_recursive_search {
@@ -4560,7 +4559,8 @@ fn dir_selector_hit_be(
                 if !n.starts_with('/') || n.contains(['*', '?', '[']) {
                     continue;
                 }
-                let folded = fold_path_listed(n.as_bytes(), protected.folds, budget)?;
+                let lexical = lexical_normalize_bytes(n.as_bytes(), budget)?;
+                let folded = fold_path_listed(&lexical, protected.folds, budget)?;
                 if let Some(id) = shared.hard_deny_hit_folded(&folded, AccessMode::Read) {
                     return Ok(Some((id, n)));
                 }

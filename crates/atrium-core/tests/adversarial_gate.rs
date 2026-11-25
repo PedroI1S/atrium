@@ -112,7 +112,6 @@ fn links_into_credentials_reach_nothing() {
         "cat proj/link-sub/../id_ed25519",
         "cat proj/dotdot-ssh/../id_ed25519",
         "cat ./proj/dotdot-ssh/../id_ed25519",
-        "cat proj/link-ssh/.",
         "cat proj/link-ssh/sub/../id_ed25519",
         "cat proj/link-ssh/./id_ed25519",
         "cat proj/link-ssh//id_ed25519",
@@ -170,12 +169,46 @@ fn links_into_credentials_reach_nothing() {
         ".ssh/sub/inner_key",
         ".ssh/does-not-exist-yet",
         "~/.ssh/id_ed25519",
-        "$HOME/.ssh/id_ed25519",
     ] {
         read_deny(&g, ToolKind::Read, "Read", p, false);
         read_deny(&g, ToolKind::Edit, "Edit", p, false);
         read_deny(&g, ToolKind::Delete, "Delete", p, false);
         read_deny(&g, ToolKind::Search, "Grep", p, true);
+    }
+    // File-tool paths are literal (§5 "the paths of Read/Write/Edit tools,
+    // which are always literal", §10 row 11): `$HOME/.ssh/id_ed25519` is a
+    // folder named `$HOME` under the cwd, which doesn't exist and is not
+    // protected. It is never a hard deny; reads allow and changes ask in Home.
+    {
+        let p = "$HOME/.ssh/id_ed25519";
+        for (kind, name, rec, want_allow) in [
+            (ToolKind::Read, "Read", false, true),
+            (ToolKind::Edit, "Edit", false, false),
+            (ToolKind::Delete, "Delete", false, false),
+            (ToolKind::Search, "Grep", true, true),
+        ] {
+            let d = block_on(g.gate.check(&paths_check(kind, name, &[p], rec, None)));
+            let ok = if want_allow {
+                matches!(d, GateDecision::Allow)
+            } else {
+                matches!(d, GateDecision::Ask { .. })
+            };
+            if !ok {
+                fail(format!("{name} {p} (literal, §5): got {d:?}"));
+            }
+        }
+    }
+    // `cat proj/link-ssh/.` names the `~/.ssh` folder itself, which is not a
+    // hard-deny path for reading: the hard deny covers its members and
+    // writing the folder (§9's credential-read text; `sensitive.rs`
+    // `hard_deny_match_parts`, as on `dev`), and `cat` is Home read-only
+    // (D-141 row kind 1). So Home allows it, like `ls ~/.ssh`
+    // (`v4/evaluate/tests.rs`, `home_readonly_reads_ssh_config…`).
+    {
+        let d = block_on(g.gate.check(&cmd_check("cat proj/link-ssh/.")));
+        if !matches!(d, GateDecision::Allow) {
+            fail(format!("cat proj/link-ssh/.: wanted Allow, got {d:?}"));
+        }
     }
     // a recursive search rooted at a link to home or to a folder that holds
     // a credential file asks (it is above the credentials)
@@ -348,11 +381,14 @@ fn globs_expand_against_the_real_folder() {
         // `proj` holds links to keys (`proj/link-key`): its glob reads them
         // (round 8 blocker 2; this asked before)
         "cat proj/*",
+        // `proj/*` matches `proj/link-key`; §5 checks each match as a
+        // literal path, so listing it names the key: a hit (§10 row 8)
+        "ls proj/*",
     ] {
         deny(&g, line);
     }
     // globs matching only ordinary files ask, never allow
-    for line in ["cat proj/a.*", "ls proj/*", "cat proj/{a,b}.txt"] {
+    for line in ["cat proj/a.*", "ls proj/a*", "cat proj/{a,b}.txt"] {
         let d = block_on(g.gate.check(&cmd_check(line)));
         if !matches!(d, GateDecision::Ask { .. }) {
             fail(format!("{line}: wanted Ask, got {d:?}"));

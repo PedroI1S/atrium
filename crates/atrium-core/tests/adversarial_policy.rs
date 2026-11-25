@@ -206,8 +206,9 @@ fn clone_want(w: &Want) -> Want {
 }
 
 /// Round 3 / M1-03 finding 5, as decided in the third part (review M1-13
-/// finding 1): a symlink inside `~/.ssh` that points at a folder doesn't make
-/// the folder itself sensitive (listing it stays allowed), but every file
+/// finding 1), changed by rev 4's §11 item 17: a symlink inside `~/.ssh` that
+/// points at a folder makes the folder itself protected (listing it is a hard
+/// deny), and every file
 /// reachable through `~/.ssh` is that file: a file linked into `~/.ssh`, or a
 /// file inside a folder linked into it, is read as a key (hard deny). A hard
 /// link to a key is caught by identity.
@@ -228,8 +229,14 @@ fn leftover_symlink_in_ssh_to_an_ordinary_folder() {
         let d = block_on(g.gate.check(&cmd_check(line)));
         assert!(matches!(d, GateDecision::Deny { .. }), "{line}: {d:?}");
     };
-    allowed("ls proj");
-    allowed("ls proj/sub");
+    // Rev 4 changes M1-03 finding 5: a folder linked from inside `~/.ssh`
+    // (`~/.ssh/proj-link -> proj`) is itself protected, and so is everything
+    // below it (§11 item 17, D-145 item 3). Listing it is HardDeny.
+    denied("ls proj");
+    denied("ls proj/sub");
+    // an ordinary folder elsewhere still lists
+    t.write("other/c.txt", "z");
+    allowed("ls other");
     // M1-13 review finding 1: another name for a file in `~/.ssh` is that file
     denied("cat proj/a.txt");
     denied("cat proj/sub/b.txt");

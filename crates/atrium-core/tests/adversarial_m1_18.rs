@@ -2254,13 +2254,17 @@ fn fix4_finding1_reentering_globs_and_search_overflow() {
             false,
             cr,
         ),
+        // §8: the brace list is within the expansion budget, so its bounded
+        // literal alternative `.ssh/id_rsa` (under the root `~`) is read, and
+        // it is a hard-deny probe hit (§5 "Hard-deny probe matches for globs
+        // and search filters: HardDeny", §11 "Unchanged on purpose").
         subject(
             "F1b",
             Search,
             &["~"],
             Some(concat!("{{1..64}{a,b,c}/x*/", "..", "/foo,.ssh/id_rsa}")),
             false,
-            ask_all,
+            cr,
         ),
         subject(
             "F1b-asym",

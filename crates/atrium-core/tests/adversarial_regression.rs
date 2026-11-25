@@ -675,7 +675,8 @@ fn finding_11_a_hard_link_to_a_credential_kept_outside_home() {
 /// Re-review blocker 1: a folder linked into `~/.ssh` (and a deeper key below
 /// a linked folder). A recursive search of the folder, or of a folder that
 /// holds it, reads the keys; a file deep inside is a key at any depth. The
-/// folder itself stays ordinary for `ls` (M1-03 finding 5).
+/// folder itself is protected too, so `ls` of it is a hard deny (rev 4's
+/// §11 item 17 changes M1-03 finding 5).
 #[test]
 fn round_4_blocker_1_recursive_search_of_a_folder_linked_into_ssh() {
     let t = Tmp::new();
@@ -719,12 +720,18 @@ fn round_4_blocker_1_recursive_search_of_a_folder_linked_into_ssh() {
             }
         }
     }
-    // M1-03 finding 5: listing the linked folder stays ordinary
-    let g = t.gate(Preset::Home, vec![]);
-    for line in ["ls vault/work", "ls vault"] {
-        let d = block_on(g.gate.check(&cmd_check(line)));
-        if d != GateDecision::Allow {
-            failures.push(format!("[home] {line:?}: got {d:?}, wanted Allow"));
+    // Rev 4 changes M1-03 finding 5: a folder linked from inside `~/.ssh` is
+    // itself protected (§11 item 17, D-145 item 3), so listing `vault/work`
+    // (`~/.ssh/work`) or `vault` (`~/.ssh/deep`) is HardDeny everywhere.
+    for (setting, rules, preset) in gate_settings() {
+        let g = t.gate(preset, rules);
+        for line in ["ls vault/work", "ls vault"] {
+            let d = block_on(g.gate.check(&cmd_check(line)));
+            if !matches!(d, GateDecision::Deny { .. }) {
+                failures.push(format!(
+                    "[{setting}] {line:?}: got {d:?}, wanted Deny (§11 item 17)"
+                ));
+            }
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
@@ -1009,21 +1016,32 @@ fn round_5_blocker_1_searches_and_walkers_reaching_a_folder_linked_into_ssh() {
     let find_empty_outside = format!("find {quoted} -name x");
     let g = t.gate(Preset::Home, vec![]);
     for line in [
-        "ls vault/work",
         "ls vault",
-        "ls -la vault/work",
-        "ls vault/*",
         "cat vault/notes.txt",
         "cat vault/*.txt",
         "cp vault/notes.txt /tmp/n",
         "rg x vault/notes.txt",
         cd_empty_outside.as_str(),
         find_empty_outside.as_str(),
-        "ls vault/w*",
     ] {
         let d = block_on(g.gate.check(&cmd_check(line)));
         if matches!(d, GateDecision::Deny { .. }) {
             failures.push(format!("[home] {line:?}: got {d:?}, wanted not Deny"));
+        }
+    }
+    // Rev 4 changes M1-03 finding 5: the linked folder itself is protected
+    // (§11 item 17, D-145 item 3), and a glob that matches it names it (§5).
+    for line in [
+        "ls vault/work",
+        "ls -la vault/work",
+        "ls vault/*",
+        "ls vault/w*",
+    ] {
+        let d = block_on(g.gate.check(&cmd_check(line)));
+        if !matches!(d, GateDecision::Deny { .. }) {
+            failures.push(format!(
+                "[home] {line:?}: got {d:?}, wanted Deny (§11 item 17)"
+            ));
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
@@ -1754,9 +1772,25 @@ fn round_6_items_1_and_2_generated_globs_and_readers_reaching_a_linked_folder() 
     symlink(t.home.join("vault/work"), t.home.join(".ssh/work")).unwrap();
     let mut failures = vec![];
     // item 1: globs
+    // `~/**/id_work`, `~/**/id_*` and `./**/id_work` reach
+    // `vault/work/id_work` only under the recursive-`**` variant (the three
+    // dialects read `**` as `*`, and `vault/id_work` doesn't exist), so they
+    // are Unread, never hits: Ask / Allow / Allow (§5 "Matches found only
+    // under a variant … are Unread", §11 item 10, §1).
+    let variant_only = ["~/**/id_work", "~/**/id_*", "./**/id_work"];
+    let mut unread3: Vec<String> = vec![];
+    for g in variant_only {
+        for r in [
+            "cat",
+            "head -n 1",
+            "cp -t /tmp",
+            "grep x",
+            "tar czf /tmp/x.tgz",
+        ] {
+            unread3.push(format!("{r} {g}"));
+        }
+    }
     let globs = [
-        "~/**/id_work",
-        "~/**/id_*",
         "~/**/*",
         "~/*/**/id_work",
         "~/**/work/*",
@@ -1768,7 +1802,6 @@ fn round_6_items_1_and_2_generated_globs_and_readers_reaching_a_linked_folder() 
         "~/vault/{work,x}/*",
         "~/vault/*/*",
         "vault/**/id_work",
-        "./**/id_work",
         "~/**/../vault/work/*",
     ];
     let mut deny: Vec<String> = vec![];
@@ -1862,11 +1895,22 @@ fn round_6_items_1_and_2_generated_globs_and_readers_reaching_a_linked_folder() 
     for r in non_search_readers {
         home_ask.push(format!("cd vault && {r}"));
         home_ask.push(format!("cwd=vault|{r}"));
-        home_ask.push(format!("cwd=vault/work|{r}"));
+        // From inside `vault/work`, every word of these unknown tools
+        // (D-141; options too: P3's unknown-tool defaults) is a candidate
+        // path naming a member of the folder linked from `~/.ssh`, which is
+        // protected (§11 item 17, D-145 item 3): HardDeny. A bare `find`
+        // names nothing and asks.
+        if r == "find" {
+            home_ask.push(format!("cwd=vault/work|{r}"));
+        } else {
+            deny.push(format!("cwd=vault/work|{r}"));
+        }
     }
+    // `vault/*` matches the linked folder `vault/work`, which is itself
+    // protected (§11 item 17, D-145 item 3; §5 checks each match)
+    deny.push("ls ~/vault/*".into());
+    deny.push("ls vault/*".into());
     let not_deny = [
-        "ls ~/vault/*",
-        "ls vault/*",
         "ls ~/**/notes.txt",
         "cat ~/**/notes.txt",
         "cat ~/proj/**/*.rs",
@@ -1916,6 +1960,20 @@ fn round_6_items_1_and_2_generated_globs_and_readers_reaching_a_linked_folder() 
         for (name, d) in run(line) {
             if matches!(d, GateDecision::Deny { .. }) {
                 failures.push(format!("[{name}] {line:?}: got {d:?}, wanted not Deny"));
+            }
+        }
+    }
+    for line in &unread3 {
+        for (name, d) in run(line) {
+            let ok = if name == "home" {
+                matches!(d, GateDecision::Ask { .. })
+            } else {
+                d == GateDecision::Allow
+            };
+            if !ok {
+                failures.push(format!(
+                    "[{name}] {line:?}: got {d:?}, wanted Unread (Ask/Allow/Allow, §5)"
+                ));
             }
         }
     }
