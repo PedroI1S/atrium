@@ -708,6 +708,15 @@ fn unwrap_simple_be(
     folds: FoldRules,
     budget: &mut ComputeBudget,
 ) -> Result<Vec<String>, Exhausted> {
+    unwrap_simple_be_mode(words, folds, false, budget)
+}
+
+fn unwrap_simple_be_mode(
+    words: &[String],
+    folds: FoldRules,
+    opt_takes_val: bool,
+    budget: &mut ComputeBudget,
+) -> Result<Vec<String>, Exhausted> {
     let mut cur: Vec<String> = {
         let bytes: usize = words
             .iter()
@@ -730,8 +739,27 @@ fn unwrap_simple_be(
         let Some(first) = cur.get(idx) else { break };
         let f = fold_cmd_cr19(first, folds, budget)?;
         match f.as_str() {
-            "nohup" | "builtin" | "busybox" | "toybox" => {
+            "builtin" | "busybox" | "toybox" => {
                 idx += 1;
+            }
+            "nohup" => {
+                idx += 1;
+                while let Some(w) = cur.get(idx) {
+                    budget.charge(1)?;
+                    if w == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if w.starts_with('-') && w.len() > 1 {
+                        if opt_takes_val && !w.contains('=') {
+                            idx += 2;
+                        } else {
+                            idx += 1;
+                        }
+                    } else {
+                        break;
+                    }
+                }
             }
             "command" => {
                 idx += 1;
@@ -742,7 +770,13 @@ fn unwrap_simple_be(
                         break;
                     }
                     if w.starts_with('-') && w.len() > 1 {
-                        idx += 1;
+                        let known_bool = !w.starts_with("--")
+                            && w[1..].bytes().all(|b| matches!(b, b'p' | b'v' | b'V'));
+                        if opt_takes_val && !known_bool && !w.contains('=') {
+                            idx += 2;
+                        } else {
+                            idx += 1;
+                        }
                     } else {
                         break;
                     }
@@ -776,8 +810,18 @@ fn unwrap_simple_be(
                         break;
                     }
                     if w.starts_with('-') && w.len() > 1 {
-                        if matches!(w.as_str(), "--format" | "--output")
+                        let long_takes = match_gnu_long_opt(w, "--format", 5) == Some(None)
+                            || match_gnu_long_opt(w, "--output", 5) == Some(None);
+                        let known_bool = matches!(
+                            w.as_str(),
+                            "--portability" | "--verbose" | "--quiet" | "--append"
+                        ) || (!w.starts_with("--")
+                            && w[1..]
+                                .bytes()
+                                .all(|b| matches!(b, b'a' | b'p' | b'q' | b'v')));
+                        if long_takes
                             || short_cluster_takes_next(w, "fo")
+                            || (opt_takes_val && !known_bool && !w.contains('='))
                         {
                             idx += 2;
                         } else {
@@ -796,7 +840,19 @@ fn unwrap_simple_be(
                         idx += 1;
                         break;
                     }
-                    if w == "--adjustment" || short_cluster_takes_next(w, "n") {
+                    let long_takes = match_gnu_long_opt(w, "--adjustment", 5) == Some(None);
+                    let is_num = w.starts_with('-')
+                        && w.len() > 1
+                        && w[1..].bytes().all(|b| b.is_ascii_digit());
+                    if long_takes
+                        || short_cluster_takes_next(w, "n")
+                        || (opt_takes_val
+                            && w.starts_with('-')
+                            && w.len() > 1
+                            && !is_num
+                            && !w.contains('=')
+                            && !w.starts_with("-n"))
+                    {
                         idx += 2;
                     } else if w.starts_with('-') && w.len() > 1 {
                         idx += 1;
@@ -813,8 +869,20 @@ fn unwrap_simple_be(
                         idx += 1;
                         break;
                     }
-                    if matches!(w.as_str(), "--signal" | "--kill-after")
+                    let long_takes = match_gnu_long_opt(w, "--signal", 4) == Some(None)
+                        || match_gnu_long_opt(w, "--kill-after", 6) == Some(None);
+                    let known_bool = matches!(
+                        w.as_str(),
+                        "--foreground" | "--preserve-status" | "--verbose"
+                    ) || (!w.starts_with("--")
+                        && w[1..].bytes().all(|b| matches!(b, b'f' | b'v')));
+                    if long_takes
                         || short_cluster_takes_next(w, "sk")
+                        || (opt_takes_val
+                            && w.starts_with('-')
+                            && w.len() > 1
+                            && !known_bool
+                            && !w.contains('='))
                     {
                         idx += 2;
                     } else if w.starts_with('-') && w.len() > 1 {
@@ -844,16 +912,18 @@ fn unwrap_simple_be(
                         ) || match_gnu_long_opt(w, "--chdir", 4) == Some(None)
                             || match_gnu_long_opt(w, "--split-string", 5) == Some(None)
                             || match_gnu_long_opt(w, "--unset", 4) == Some(None)
+                            || match_gnu_long_opt(w, "--argv0", 5) == Some(None)
+                            || w == "--arg0"
                             || short_cluster_takes_next(w, "uCPaS")
                         {
                             idx += 2;
                         } else if !w.contains('=')
                             && !is_known_env_noarg_opt(w)
-                            && cur.get(idx + 2).is_some_and(|n2| {
-                                (n2.starts_with('-') && n2.len() > 1) || n2.contains('=')
-                            })
+                            && (opt_takes_val
+                                || cur.get(idx + 2).is_some_and(|n2| {
+                                    (n2.starts_with('-') && n2.len() > 1) || n2.contains('=')
+                                }))
                         {
-                            // Unknown option possibly taking an argument before another env flag.
                             idx += 2;
                         } else {
                             idx += 1;
@@ -874,9 +944,25 @@ fn unwrap_simple_be(
                     "xargs" => "nPILsdEJRSa",
                     "sandbox-exec" => "fnpD",
                     "chrt" => "TPD",
+                    "taskset" => "c",
                     "arch" => "ed",
                     _ => "",
                 };
+                let opt_short_vals = match f.as_str() {
+                    "xargs" => "iel",
+                    _ => "",
+                };
+                let known_short_bools = match f.as_str() {
+                    "caffeinate" => "dimsu",
+                    "ionice" => "t",
+                    "xargs" => "0oprtx",
+                    "setsid" => "cfw",
+                    "chrt" => "bfiorpm",
+                    "taskset" => "ap",
+                    "unbuffer" => "p",
+                    _ => "",
+                };
+                let mut taskset_has_cpu_list = false;
                 idx += 1;
                 while let Some(w) = cur.get(idx) {
                     budget.charge(1)?;
@@ -885,28 +971,72 @@ fn unwrap_simple_be(
                         break;
                     }
                     if w.starts_with('-') && w.len() > 1 {
+                        if f == "taskset"
+                            && (match_gnu_long_opt(w, "--cpu-list", 5).is_some()
+                                || (!w.starts_with("--") && w[1..].contains('c')))
+                        {
+                            taskset_has_cpu_list = true;
+                        }
                         let long_takes = match f.as_str() {
-                            "ionice" => matches!(
-                                w.as_str(),
-                                "--class" | "--classdata" | "--pid" | "--pgid" | "--uid"
-                            ),
-                            "stdbuf" => matches!(w.as_str(), "--input" | "--output" | "--error"),
-                            "xargs" => matches!(
-                                w.as_str(),
-                                "--max-args"
-                                    | "--max-procs"
-                                    | "--max-chars"
-                                    | "--delimiter"
-                                    | "--arg-file"
-                            ),
-                            "chrt" => matches!(
-                                w.as_str(),
-                                "--sched-runtime" | "--sched-period" | "--sched-deadline"
-                            ),
+                            "ionice" => {
+                                match_gnu_long_opt(w, "--class", 5) == Some(None)
+                                    || match_gnu_long_opt(w, "--classdata", 8) == Some(None)
+                                    || matches!(w.as_str(), "--pid" | "--pgid" | "--uid")
+                            }
+                            "stdbuf" => {
+                                match_gnu_long_opt(w, "--input", 4) == Some(None)
+                                    || match_gnu_long_opt(w, "--output", 5) == Some(None)
+                                    || match_gnu_long_opt(w, "--error", 4) == Some(None)
+                            }
+                            "xargs" => {
+                                match_gnu_long_opt(w, "--max-args", 6) == Some(None)
+                                    || match_gnu_long_opt(w, "--max-procs", 6) == Some(None)
+                                    || match_gnu_long_opt(w, "--max-chars", 6) == Some(None)
+                                    || match_gnu_long_opt(w, "--delimiter", 5) == Some(None)
+                                    || match_gnu_long_opt(w, "--arg-file", 5) == Some(None)
+                                    || (opt_takes_val
+                                        && (match_gnu_long_opt(w, "--replace", 5) == Some(None)
+                                            || match_gnu_long_opt(w, "--eof", 4) == Some(None)
+                                            || match_gnu_long_opt(w, "--max-lines", 6)
+                                                == Some(None)))
+                            }
+                            "chrt" => {
+                                match_gnu_long_opt(w, "--sched-runtime", 9) == Some(None)
+                                    || match_gnu_long_opt(w, "--sched-period", 9) == Some(None)
+                                    || match_gnu_long_opt(w, "--sched-deadline", 9) == Some(None)
+                            }
+                            "taskset" => match_gnu_long_opt(w, "--cpu-list", 5) == Some(None),
                             "arch" => w == "-arch",
                             _ => false,
                         };
-                        if long_takes || short_cluster_takes_next(w, short_vals) {
+                        let is_known_bool = (!w.starts_with("--")
+                            && w[1..].chars().all(|c| known_short_bools.contains(c)))
+                            || matches!(
+                                w.as_str(),
+                                "--all-tasks"
+                                    | "--pid"
+                                    | "--null"
+                                    | "--fork"
+                                    | "--wait"
+                                    | "--ctty"
+                                    | "--ignore"
+                                    | "--rr"
+                                    | "--fifo"
+                                    | "--batch"
+                                    | "--idle"
+                                    | "--other"
+                            );
+                        let is_short_attached_val = !w.starts_with("--")
+                            && w[1..].chars().any(|c| short_vals.contains(c))
+                            && !short_cluster_takes_next(w, short_vals);
+                        if long_takes
+                            || short_cluster_takes_next(w, short_vals)
+                            || (opt_takes_val && short_cluster_takes_next(w, opt_short_vals))
+                            || (opt_takes_val
+                                && !is_known_bool
+                                && !is_short_attached_val
+                                && !w.contains('='))
+                        {
                             idx += 2;
                         } else {
                             idx += 1;
@@ -915,7 +1045,7 @@ fn unwrap_simple_be(
                         break;
                     }
                 }
-                if matches!(f.as_str(), "chrt" | "taskset") {
+                if f == "chrt" || (f == "taskset" && !taskset_has_cpu_list) {
                     idx = (idx + 1).min(cur.len());
                 }
             }
@@ -928,8 +1058,15 @@ fn unwrap_simple_be(
                         idx += 1;
                         break;
                     }
-                    if matches!(w.as_str(), "--userspec" | "--groups")
+                    let long_takes = match_gnu_long_opt(w, "--userspec", 6) == Some(None)
+                        || match_gnu_long_opt(w, "--groups", 5) == Some(None);
+                    if long_takes
                         || short_cluster_takes_next(w, "Ggu")
+                        || (opt_takes_val
+                            && w.starts_with('-')
+                            && w.len() > 1
+                            && !w.contains('=')
+                            && w != "--skip-chdir")
                     {
                         idx += 2;
                     } else if w.starts_with('-') && w.len() > 1 {
@@ -948,7 +1085,8 @@ fn unwrap_simple_be(
             }
             "flock" | "script" => {
                 let saved = idx;
-                let short_vals = if f == "flock" { "wE" } else { "tTIOBmo" };
+                let short_vals = if f == "flock" { "wE" } else { "TIOBmo" };
+                let known_bools = if f == "flock" { "sexnuoF" } else { "aefkqr" };
                 let mut j = idx + 1;
                 let mut file_seen = false;
                 let mut has_c = false;
@@ -962,25 +1100,54 @@ fn unwrap_simple_be(
                         break;
                     }
                     if w.starts_with('-') && w.len() > 1 {
-                        if match_gnu_long_opt(w, "--command", 3).is_some()
+                        if match_gnu_long_opt(w, "--command", 5).is_some()
                             || (!w.starts_with("--") && w[1..].contains('c'))
                         {
                             has_c = true;
                             break;
                         }
                         let long_takes = if f == "flock" {
-                            matches!(w.as_str(), "--timeout" | "--wait" | "--conflict-exit-code")
+                            match_gnu_long_opt(w, "--timeout", 6) == Some(None)
+                                || match_gnu_long_opt(w, "--wait", 5) == Some(None)
+                                || match_gnu_long_opt(w, "--conflict-exit-code", 6) == Some(None)
                         } else {
-                            matches!(
-                                w.as_str(),
-                                "--log-io"
-                                    | "--log-in"
-                                    | "--log-out"
-                                    | "--output-limit"
-                                    | "--timing"
-                            )
+                            match_gnu_long_opt(w, "--log-io", 6) == Some(None)
+                                || match_gnu_long_opt(w, "--log-in", 6) == Some(None)
+                                || match_gnu_long_opt(w, "--log-out", 7) == Some(None)
+                                || match_gnu_long_opt(w, "--output-limit", 5) == Some(None)
+                                || (opt_takes_val
+                                    && match_gnu_long_opt(w, "--timing", 5) == Some(None))
                         };
-                        if long_takes || short_cluster_takes_next(w, short_vals) {
+                        let script_opt_t = f == "script" && short_cluster_takes_next(w, "t");
+                        let is_known_bool = (!w.starts_with("--")
+                            && w[1..].chars().all(|c| known_bools.contains(c)))
+                            || matches!(
+                                w.as_str(),
+                                "--quiet"
+                                    | "--append"
+                                    | "--flush"
+                                    | "--return"
+                                    | "--shared"
+                                    | "--exclusive"
+                                    | "--nonblock"
+                                    | "--unlock"
+                                    | "--no-fork"
+                                    | "--verbose"
+                            );
+                        let is_attached_val = !w.starts_with("--")
+                            && w[1..]
+                                .chars()
+                                .any(|c| short_vals.contains(c) || (f == "script" && c == 't'))
+                            && !short_cluster_takes_next(w, short_vals)
+                            && !script_opt_t;
+                        if long_takes
+                            || short_cluster_takes_next(w, short_vals)
+                            || (opt_takes_val && script_opt_t)
+                            || (opt_takes_val
+                                && !is_known_bool
+                                && !is_attached_val
+                                && !w.contains('='))
+                        {
                             j += 2;
                         } else {
                             j += 1;
@@ -2662,27 +2829,39 @@ fn extra_readings_from_raw(
     if raw_argv.is_empty() {
         return Ok((readings, payloads));
     }
-    let unwrapped = unwrap_simple_be(raw_argv, folds, budget)?;
-    let is_new_unwrapped =
-        !unwrapped.is_empty() && unwrapped != raw_argv && unwrapped != effective_argv;
-    if is_new_unwrapped {
-        readings.push(unwrapped.clone());
-        // If our cluster-aware unwrapper exposed a nested shell (`sh -c ...`)
-        // that P1's lexer couldn't unwrap (e.g. `exec -ca foo sh -c 'rm -rf ~'`,
-        // `flock /tmp/l -s sh -c 'rm -rf ~'`), extract its `-c` payload too.
-        if let Some(first) = unwrapped.first() {
-            let f = fold_cmd_cr19(first, folds, budget)?;
-            if is_shell_folded(&f, budget)?
-                && let Some(code) = extract_shell_c_code(&unwrapped[1..], budget)?
-            {
-                budget.charge_alloc(std::mem::size_of::<String>())?;
-                payloads.push(clone_str_budgeted(code, budget)?);
+    let unwrapped0 = unwrap_simple_be_mode(raw_argv, folds, false, budget)?;
+    let unwrapped1 = unwrap_simple_be_mode(raw_argv, folds, true, budget)?;
+    for unwrapped in [&unwrapped0, &unwrapped1] {
+        let is_new = !unwrapped.is_empty()
+            && unwrapped.as_slice() != raw_argv
+            && unwrapped.as_slice() != effective_argv
+            && !readings.iter().any(|r: &Vec<String>| r == unwrapped);
+        if is_new {
+            readings.push(unwrapped.clone());
+            // If our cluster-aware unwrapper exposed a nested shell (`sh -c ...`)
+            // that P1's lexer couldn't unwrap (e.g. `exec -ca foo sh -c 'rm -rf ~'`,
+            // `flock /tmp/l -s sh -c 'rm -rf ~'`), extract its `-c` payload too.
+            if let Some(first) = unwrapped.first() {
+                let f = fold_cmd_cr19(first, folds, budget)?;
+                if is_shell_folded(&f, budget)?
+                    && let Some(code) = extract_shell_c_code(&unwrapped[1..], budget)?
+                    && !payloads.iter().any(|p| p == code)
+                {
+                    budget.charge_alloc(std::mem::size_of::<String>())?;
+                    payloads.push(clone_str_budgeted(code, budget)?);
+                }
             }
         }
     }
-    // Check both raw and unwrapped head for `script`/`flock` `-c`/`-qc`/`--comm`.
-    for cand in [raw_argv, unwrapped.as_slice()] {
+    // Check raw and unwrapped heads for `script`/`flock` `-c`/`--comm` and `env` `-S`/`--spl*`.
+    for cand in [raw_argv, unwrapped0.as_slice(), unwrapped1.as_slice()] {
         if let Some(code) = extract_script_flock_c_code(cand, folds, budget)?
+            && !payloads.iter().any(|p| p == &code)
+        {
+            budget.charge_alloc(std::mem::size_of::<String>())?;
+            payloads.push(code);
+        }
+        if let Some(code) = extract_env_split_string_be(cand, folds, budget)?
             && !payloads.iter().any(|p| p == &code)
         {
             budget.charge_alloc(std::mem::size_of::<String>())?;
@@ -2690,6 +2869,76 @@ fn extra_readings_from_raw(
         }
     }
     Ok((readings, payloads))
+}
+
+fn extract_env_split_string_be(
+    argv: &[String],
+    folds: FoldRules,
+    budget: &mut ComputeBudget,
+) -> Result<Option<String>, Exhausted> {
+    let Some(first) = argv.first() else {
+        return Ok(None);
+    };
+    let mut f = fold_cmd_cr19(first, folds, budget)?;
+    if f != "env" {
+        let base_raw = first.rsplit('/').next().unwrap_or(first.as_str());
+        if (base_raw.contains("$(") || base_raw.contains('`'))
+            && let Some(sub) = substituted_program_simple(base_raw, folds, budget)?
+        {
+            f = fold_cmd_cr19(&sub, folds, budget)?;
+        }
+    }
+    if f != "env" {
+        return Ok(None);
+    }
+    let mut j = 1usize;
+    while let Some(w) = argv.get(j) {
+        budget.charge(w.len().max(1) as u64)?;
+        if w == "--" {
+            break;
+        }
+        if let Some(attached) = match_gnu_long_opt(w, "--split-string", 5) {
+            let val = match attached {
+                Some(v) => Some(v),
+                None => argv.get(j + 1).map(String::as_str),
+            };
+            if let Some(s) = val {
+                return Ok(Some(clone_str_budgeted(s, budget)?));
+            }
+            return Ok(None);
+        }
+        if w.starts_with('-') && !w.starts_with("--") && w.len() > 1 {
+            if let Some(pos) = w[1..].find('S') {
+                let after = &w[1 + pos + 1..];
+                if !after.is_empty() {
+                    return Ok(Some(clone_str_budgeted(after, budget)?));
+                }
+                if let Some(next) = argv.get(j + 1) {
+                    return Ok(Some(clone_str_budgeted(next, budget)?));
+                }
+                return Ok(None);
+            }
+            if short_cluster_takes_next(w, "uCPa") {
+                j += 2;
+            } else {
+                j += 1;
+            }
+        } else if w.starts_with("--") {
+            if match_gnu_long_opt(w, "--chdir", 4) == Some(None)
+                || match_gnu_long_opt(w, "--unset", 4) == Some(None)
+                || match_gnu_long_opt(w, "--argv0", 5) == Some(None)
+            {
+                j += 2;
+            } else {
+                j += 1;
+            }
+        } else if w.contains('=') {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(None)
 }
 
 /// Checks an inline payload extracted from `script -qc` / `flock --comm` on a
@@ -3143,6 +3392,15 @@ fn check_reading_operands(
         folded,
         "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep" | "rg" | "rgrep" | "ag" | "ack"
     );
+    let is_recursive_search = matches!(folded, "rg" | "rgrep")
+        || (matches!(folded, "grep" | "egrep" | "fgrep" | "zgrep" | "ggrep")
+            && eff[1..].iter().any(|a| {
+                a == "--recursive"
+                    || a == "--dereference-recursive"
+                    || (a.starts_with('-')
+                        && !a.starts_with("--")
+                        && a[1..].bytes().any(|b| matches!(b, b'r' | b'R')))
+            }));
     let is_git = folded == "git";
     let is_script_cmd = matches!(folded, "sed" | "awk" | "gawk" | "mawk");
 
@@ -3335,10 +3593,11 @@ fn check_reading_operands(
                 }
             }
         } else {
-            check_candidate_word(
+            check_candidate_word_ex(
                 w,
                 access,
                 Some(folded),
+                is_recursive_search,
                 part,
                 protected,
                 shared,
@@ -3426,6 +3685,25 @@ fn check_candidate_word(
     budget: &mut ComputeBudget,
     out: &mut Vec<PartResult>,
 ) -> Result<(), Exhausted> {
+    check_candidate_word_ex(
+        word, access, folded_cmd, false, part, protected, shared, unit_cands, opts, budget, out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_candidate_word_ex(
+    word: &str,
+    access: AccessMode,
+    folded_cmd: Option<&str>,
+    is_recursive_search: bool,
+    part: &PartId,
+    protected: &ProtectedSet,
+    shared: &SharedSensitive,
+    unit_cands: &[Vec<u8>],
+    opts: &BestEffortOptions<'_>,
+    budget: &mut ComputeBudget,
+    out: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
     budget.charge(word.len().max(1) as u64)?;
     let expanded_words: Vec<String> = if word.contains('{') {
         match brace_expand_budgeted(word, budget)? {
@@ -3475,9 +3753,30 @@ fn check_candidate_word(
                 )?;
                 return Ok(());
             }
+            if is_recursive_search && !is_s8_exempt_be(&folded, shared.home_folded()) {
+                for d in shared.ssh_linked_folded() {
+                    if under_bytes(d, &folded).is_some() {
+                        push_be_hit(
+                            out,
+                            part.clone(),
+                            "credential-read",
+                            HitMatch::ProtectedPath { path: abs },
+                            budget,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
             if globby
-                && let Some(id) =
-                    glob_hit_budgeted(&folded, access, protected, shared, protected.folds, budget)?
+                && let Some(id) = glob_hit_budgeted(
+                    &folded,
+                    access,
+                    is_recursive_search,
+                    protected,
+                    shared,
+                    protected.folds,
+                    budget,
+                )?
             {
                 push_be_hit(
                     out,
@@ -3495,6 +3794,14 @@ fn check_candidate_word(
     Ok(())
 }
 
+fn is_s8_exempt_be(folded_root: &[u8], home_folded: &[u8]) -> bool {
+    if under_bytes(home_folded, folded_root).is_some() {
+        return true;
+    }
+    let dot_config = join_folded(home_folded, b".config");
+    folded_root == dot_config.as_slice()
+}
+
 fn is_ssh_dir_folded(folded: &[u8], home_folded: &[u8]) -> bool {
     under_bytes(folded, home_folded) == Some(b".ssh")
 }
@@ -3505,6 +3812,7 @@ fn is_ssh_dir_folded(folded: &[u8], home_folded: &[u8]) -> bool {
 fn glob_hit_budgeted(
     folded_pattern: &[u8],
     access: AccessMode,
+    is_recursive_search: bool,
     protected: &ProtectedSet,
     shared: &SharedSensitive,
     folds: FoldRules,
@@ -3574,11 +3882,26 @@ fn glob_hit_budgeted(
         }
     }
     for d in shared.ssh_linked_folded() {
-        if let Ok(ds) = std::str::from_utf8(d)
-            && (matcher.matches_strict_descendant(ds, budget)?
-                || (access != AccessMode::Read && matcher.matches_dir_prefix(ds, budget)?))
-        {
-            return Ok(Some("credential-read"));
+        if let Ok(ds) = std::str::from_utf8(d) {
+            if matcher.matches_strict_descendant(ds, budget)?
+                || (access != AccessMode::Read && matcher.matches_dir_prefix(ds, budget)?)
+            {
+                return Ok(Some("credential-read"));
+            }
+            if is_recursive_search {
+                // Recursive search (`rg`, `grep -r`) matching an ancestor of an
+                // ssh-linked directory (outside S8-exempt roots like home itself).
+                let mut cur = ds;
+                while !cur.is_empty() && !is_s8_exempt_be(cur.as_bytes(), shared.home_folded()) {
+                    if matcher.is_match(cur, budget)? {
+                        return Ok(Some("credential-read"));
+                    }
+                    match cur.rsplit_once('/') {
+                        Some((parent, _)) if !parent.is_empty() => cur = parent,
+                        _ => break,
+                    }
+                }
+            }
         }
     }
     Ok(None)
