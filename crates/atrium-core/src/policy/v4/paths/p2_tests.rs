@@ -7567,3 +7567,836 @@ fn round12_hard_deny_target_suppresses_incomplete_alias_table_unread() {
         cap_res.outcomes
     );
 }
+
+// ---------------------------------------------------------------------------
+// 15. Rework Round 13 regressions (review round 10)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
+    use std::os::unix::ffi::OsStrExt;
+
+    use crate::policy::model::{DirEntry, FileType};
+    use crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC;
+
+    // Review 10, finding 1 (§8): `FsResolver::read_dir` charges
+    // `DIR_STREAM_ALLOC` before constructing the directory stream on both
+    // macOS (`fcntl_dupfd_cloexec` + `Dir::new`, with no second open) and
+    // Linux (`RawDir`), so both platforms consume the exact same allocation
+    // budget and a single `DirOpens` cap unit per listing.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let tiny = root.join("tiny");
+    let empty = root.join("empty");
+    std::fs::create_dir(&tiny).unwrap();
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::write(tiny.join("a"), b"1").unwrap();
+    std::fs::write(tiny.join("bb"), b"22").unwrap();
+
+    let tiny_bytes = tiny.as_os_str().as_bytes();
+    let empty_bytes = empty.as_os_str().as_bytes();
+    let resolver = FsResolver::new();
+
+    // `push_entry_charged` allocates the initial 8-slot `Vec<DirEntry>` buffer
+    // once for 1..=8 entries plus each entry's name bytes; `charge_path_conversion`
+    // adds `path.len() + 1` only when `path.len() >= 256`.
+    let path_conv_tiny = if tiny_bytes.len() >= 256 {
+        tiny_bytes.len() + 1
+    } else {
+        0
+    };
+    let entries_bytes = path_conv_tiny + 8 * std::mem::size_of::<DirEntry>() + 1 + 2;
+
+    // 1. Allocation budgets of `entries_bytes` and
+    //    `entries_bytes + DIR_STREAM_ALLOC - 1` must both exhaust before
+    //    completing; `entries_bytes + DIR_STREAM_ALLOC` succeeds with 0 left.
+    for tight in [entries_bytes, entries_bytes + DIR_STREAM_ALLOC - 1] {
+        let mut budget = ComputeBudget::new(1_000_000, tight);
+        assert_eq!(
+            resolver.read_dir(tiny_bytes, &mut FsCaps::with_default_limits(), &mut budget),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            })),
+            "budget {tight} must exhaust AllocationBudget"
+        );
+    }
+
+    let mut exact = ComputeBudget::new(1_000_000, entries_bytes + DIR_STREAM_ALLOC);
+    let mut entries = resolver
+        .read_dir(tiny_bytes, &mut FsCaps::with_default_limits(), &mut exact)
+        .expect("exact entries_bytes + DIR_STREAM_ALLOC budget must succeed");
+    assert_eq!(exact.remaining_alloc_bytes(), 0);
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        entries,
+        vec![
+            DirEntry {
+                name: b"a".to_vec(),
+                file_type: FileType::File,
+            },
+            DirEntry {
+                name: b"bb".to_vec(),
+                file_type: FileType::File,
+            },
+        ]
+    );
+
+    // 2. Cross-platform total-charge parity check: total deducted bytes match
+    //    the platform-independent formula `entries_bytes + DIR_STREAM_ALLOC`
+    //    on both Linux and macOS, and an empty directory costs exactly
+    //    `path_conv_empty + DIR_STREAM_ALLOC`.
+    let start_alloc = 1_000_000usize;
+    let mut parity_budget = ComputeBudget::new(1_000_000, start_alloc);
+    let parity_entries = resolver
+        .read_dir(
+            tiny_bytes,
+            &mut FsCaps::with_default_limits(),
+            &mut parity_budget,
+        )
+        .unwrap();
+    assert_eq!(parity_entries.len(), 2);
+    assert_eq!(
+        start_alloc - parity_budget.remaining_alloc_bytes(),
+        entries_bytes + DIR_STREAM_ALLOC
+    );
+
+    let path_conv_empty = if empty_bytes.len() >= 256 {
+        empty_bytes.len() + 1
+    } else {
+        0
+    };
+    let mut empty_below = ComputeBudget::new(1_000_000, path_conv_empty + DIR_STREAM_ALLOC - 1);
+    assert_eq!(
+        resolver.read_dir(
+            empty_bytes,
+            &mut FsCaps::with_default_limits(),
+            &mut empty_below,
+        ),
+        Err(ResolveError::Exhausted(Exhausted {
+            reason: ExhaustReason::AllocationBudget
+        }))
+    );
+    let mut empty_exact = ComputeBudget::new(1_000_000, path_conv_empty + DIR_STREAM_ALLOC);
+    assert_eq!(
+        resolver.read_dir(
+            empty_bytes,
+            &mut FsCaps::with_default_limits(),
+            &mut empty_exact,
+        ),
+        Ok(Vec::new())
+    );
+    assert_eq!(empty_exact.remaining_alloc_bytes(), 0);
+
+    // 3. `DirOpens` cap at 1: one listing succeeds (no second open from
+    //    `Dir::read_from`, zero `LinkReads` or `Canonicalizations` consumed),
+    //    and a second listing fails with `CapReached(DirOpens)`.
+    let mut one_open = FsCaps::new(100, 1, 100, 0, 0);
+    let first = resolver
+        .read_dir(
+            tiny_bytes,
+            &mut one_open,
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .expect("single DirOpens cap must allow one read_dir");
+    assert_eq!(first.len(), 2);
+    assert_eq!(
+        resolver.read_dir(
+            tiny_bytes,
+            &mut one_open,
+            &mut ComputeBudget::with_default_limits(),
+        ),
+        Err(ResolveError::CapReached(CapReached {
+            cap: FsCap::DirOpens
+        }))
+    );
+
+    // Precharging `DirOpens` precedes `DIR_STREAM_ALLOC`: zero `DirOpens`
+    // returns `CapReached(DirOpens)` without exhausting a 0-alloc budget.
+    let mut zero_alloc = ComputeBudget::new(1_000_000, 0);
+    assert_eq!(
+        resolver.read_dir(
+            tiny_bytes,
+            &mut FsCaps::new(100, 0, 100, 0, 0),
+            &mut zero_alloc,
+        ),
+        Err(ResolveError::CapReached(CapReached {
+            cap: FsCap::DirOpens
+        }))
+    );
+    assert!(!zero_alloc.is_exhausted());
+}
+
+#[test]
+fn round13_alias_only_hard_deny_suppresses_incomplete_table_unread() {
+    // Review 10, test gap for round 12 fix 1 (contract §1 step 2, §5; D-144,
+    // D-145, D-154): when a HardDenyHit comes ONLY from the alias spelling of
+    // a bind-mounted home `.ssh` written outside home and the alias table is
+    // incomplete, no spurious Unread from the incomplete table is emitted,
+    // both directly and through `check_recursive_root`'s followed-link walk.
+    let join_home = |parts: &[&[u8]]| -> Vec<u8> {
+        let mut out = HOME.to_vec();
+        for p in parts {
+            out.push(b'/');
+            out.extend_from_slice(p);
+        }
+        out
+    };
+    let ssh_dir = join_home(&[b".ssh"]);
+    let ssh_sub = join_home(&[b".ssh", b"sub"]);
+    let ssh_pub = join_home(&[b".ssh", b"id_rsa.pub"]);
+    let ssh_cfg = join_home(&[b".ssh", b"config"]);
+    let ssh_absent_expected = join_home(&[b".ssh", b"absent_key"]);
+    let azure_dir = join_home(&[b".azure"]);
+    let aws_cred = join_home(&[b".aws", b"credentials"]);
+    let gnupg_dir = join_home(&[b".gnupg"]);
+
+    let has_hard_deny_path = |outcomes: &[PartResult], expected: &[u8]| -> bool {
+        outcomes.iter().any(|r| {
+            matches!(
+                &r.outcome,
+                PartOutcome::HardDenyHit(h)
+                    if h.hard_deny_id == Some("credential-read")
+                        && matches!(
+                            &h.matched,
+                            HitMatch::ProtectedPath { path } if path.as_slice() == expected
+                        )
+            )
+        })
+    };
+    let unread_count = |outcomes: &[PartResult]| -> usize {
+        outcomes
+            .iter()
+            .filter(|r| matches!(r.outcome, PartOutcome::Unread(_)))
+            .count()
+    };
+
+    // 1. Direct checks with an incomplete alias table (unlistable `.azure`
+    //    folder; `ProtectedSet` gap is `Through(azure)` only, so `check_target`
+    //    alone is Clear on `/mnt/keys/absent_key` and `/mnt/keys/sub`).
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(&ssh_sub);
+    fs.add_file(&ssh_pub);
+    fs.add_file(&ssh_cfg);
+    fs.bind_dir(&ssh_dir, b"/mnt/keys");
+    fs.mkdir_all(&azure_dir);
+    fs.set_dir_read_error(&azure_dir, FsIoError::PermissionDenied);
+    fs.add_symlink(b"/h/u/proj_alias/to_key", b"/mnt/keys/absent_key");
+    fs.add_symlink(b"/h/u/proj_sub/to_sub", b"/mnt/keys/sub");
+    fs.add_symlink(b"/h/u/proj_pub/to_pub", b"/mnt/keys/id_rsa.pub");
+    fs.mkdir_all(b"/tmp/pub/inner");
+    fs.add_symlink(b"/h/u/lnk_root", b"/tmp/pub/inner");
+    fs.add_symlink(b"/tmp/pub/.ssh/sub/to_key", b"/mnt/keys/absent_key");
+    fs.mkdir_all(b"/tmp/pub2/inner");
+    fs.add_symlink(b"/h/u/lnk_root2", b"/tmp/pub2/inner");
+    fs.add_symlink(b"/tmp/pub2/.ssh/sub/to_pub", b"/mnt/keys/id_rsa.pub");
+    let prot = default_build(&fs);
+
+    // Confirm pure `check_target` (without `RootAliases`) returns Clear for
+    // both targets, proving the HardDenyHit comes ONLY from the alias spelling.
+    for raw in [b"/mnt/keys/absent_key".as_slice(), b"/mnt/keys/sub"] {
+        let t = literal(raw, AccessMode::Read, &fs);
+        assert_eq!(
+            check_target(&t, &prot, &mut ComputeBudget::with_default_limits())
+                .unwrap()
+                .outcome,
+            PartOutcome::Clear,
+            "check_target alone must be Clear for {:?}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+
+    // Subject flow: absent key and existing subfolder under bind-mounted `.ssh`
+    // both HardDeny via alias spelling with zero Unreads.
+    let sub_absent = subject("/mnt/keys/absent_key", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_hard_deny_path(&sub_absent.outcomes, &ssh_absent_expected),
+        "{:?}",
+        sub_absent.outcomes
+    );
+    assert!(
+        !has_unread(&sub_absent.outcomes, |_| true),
+        "{:?}",
+        sub_absent.outcomes
+    );
+
+    let sub_dir = subject("/mnt/keys/sub", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_hard_deny_path(&sub_dir.outcomes, &ssh_sub),
+        "{:?}",
+        sub_dir.outcomes
+    );
+    assert!(
+        !has_unread(&sub_dir.outcomes, |_| true),
+        "{:?}",
+        sub_dir.outcomes
+    );
+
+    // Command flow (`cat /mnt/keys/absent_key`): HardDeny via alias, zero Unreads.
+    let cmd = resolve_command_targets(
+        &[unit(
+            0,
+            vec![unquoted(b"cat"), unquoted(b"/mnt/keys/absent_key")],
+            vec![],
+            Separator::Start,
+            None,
+        )],
+        &[reader_effects("cat", 2)],
+        HOME,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny_path(&cmd.outcomes, &ssh_absent_expected),
+        "{:?}",
+        cmd.outcomes
+    );
+    assert!(!has_unread(&cmd.outcomes, |_| true), "{:?}", cmd.outcomes);
+
+    // Negative controls in the same fixture: public `.pub` and read-only
+    // `config` through the bind mount are not HardDenyHits, so the incomplete
+    // alias table's Unread reason is preserved.
+    for ordinary in ["/mnt/keys/id_rsa.pub", "/mnt/keys/config"] {
+        let res = subject(ordinary, AccessMode::Read, &prot, &fs);
+        assert!(!has_any_hard_deny(&res.outcomes), "{:?}", res.outcomes);
+        assert!(
+            has_unread(&res.outcomes, |r| matches!(
+                r,
+                UnreadReason::UnresolvablePath { path } if path == &azure_dir
+            )),
+            "{ordinary}: {:?}",
+            res.outcomes
+        );
+    }
+
+    // 2. Direct check with incomplete alias table caused by `Canonicalizations`
+    //    cap = 1 (zero `ProtectedSet::identity_gaps`): alias HardDenyHit still
+    //    suppresses the incomplete-table Unread, while `/mnt/keys/config` keeps it.
+    let mut cap_fs = FakeFs::new();
+    cap_fs.add_file(&ssh_cfg);
+    cap_fs.bind_dir(&ssh_dir, b"/mnt/keys");
+    cap_fs.add_file(&aws_cred);
+    cap_fs.mkdir_all(&gnupg_dir);
+    let cap_prot = default_build(&cap_fs);
+    assert!(cap_prot.identity_gaps.is_empty());
+
+    let cap_hit = resolve_subject_paths(
+        &["/mnt/keys/absent_key".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &cap_prot,
+        &cap_fs,
+        &mut FsCaps::new(1000, 1000, 1000, 1000, 1),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny_path(&cap_hit.outcomes, &ssh_absent_expected),
+        "{:?}",
+        cap_hit.outcomes
+    );
+    assert!(
+        !has_unread(&cap_hit.outcomes, |_| true),
+        "{:?}",
+        cap_hit.outcomes
+    );
+
+    let cap_cfg = resolve_subject_paths(
+        &["/mnt/keys/config".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &cap_prot,
+        &cap_fs,
+        &mut FsCaps::new(1000, 1000, 1000, 1000, 1),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(!has_any_hard_deny(&cap_cfg.outcomes));
+    assert!(has_unread(&cap_cfg.outcomes, |r| matches!(
+        r,
+        UnreadReason::WalkCapReached(FsCap::Canonicalizations)
+    )));
+
+    // 3. Through `check_recursive_root`'s followed-link walk
+    //    (`LinkPolicy { at_root: true, below_root: true }`).
+    let follow = LinkPolicy {
+        at_root: true,
+        below_root: true,
+    };
+
+    // 3a. Ordinary roots: step 1 emits 1 Unread for the ordinary root itself;
+    //     followed links whose HardDenyHit comes only from the alias spelling
+    //     (`to_key` dangling, `to_sub` existing dir) emit HardDenyHit and NO
+    //     additional Unread (total Unread count == 1), whereas `to_pub` emits
+    //     a second Unread (total Unread count == 2).
+    for (link_abs, root_rel, expected_path) in [
+        (
+            b"/h/u/proj_alias/to_key".as_slice(),
+            b"proj_alias".as_slice(),
+            ssh_absent_expected.as_slice(),
+        ),
+        (
+            b"/h/u/proj_sub/to_sub".as_slice(),
+            b"proj_sub".as_slice(),
+            ssh_sub.as_slice(),
+        ),
+    ] {
+        let link_target = literal(link_abs, AccessMode::Read, &fs);
+        assert_eq!(
+            check_target(
+                &link_target,
+                &prot,
+                &mut ComputeBudget::with_default_limits()
+            )
+            .unwrap()
+            .outcome,
+            PartOutcome::Clear
+        );
+        let rec = check_recursive_root(
+            &literal(root_rel, AccessMode::Read, &fs),
+            follow,
+            &[],
+            &prot,
+            &fs,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+        assert!(
+            has_hard_deny_path(&rec.outcomes, expected_path),
+            "{:?}",
+            rec.outcomes
+        );
+        assert_eq!(
+            unread_count(&rec.outcomes),
+            1,
+            "followed alias HardDenyHit must not add an Unread beyond the ordinary root's own: {:?}",
+            rec.outcomes
+        );
+    }
+
+    let rec_pub = check_recursive_root(
+        &literal(b"proj_pub", AccessMode::Read, &fs),
+        follow,
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(!has_any_hard_deny(&rec_pub.outcomes));
+    assert_eq!(
+        unread_count(&rec_pub.outcomes),
+        2,
+        "non-hard-deny followed link must keep the incomplete-table Unread: {:?}",
+        rec_pub.outcomes
+    );
+
+    // 3b. Written hard-deny root resolving to an external folder holding the
+    //     followed link (`lnk_root/../.ssh/sub` -> `/tmp/pub/.ssh/sub`): the
+    //     root itself emits no Unread, the link target alone is Clear, and the
+    //     entire `check_recursive_root` call emits the alias HardDenyHit with
+    //     zero Unreads total (while the `.pub` link counterpart emits Unread).
+    let ext_link = literal(b"/tmp/pub/.ssh/sub/to_key", AccessMode::Read, &fs);
+    assert_eq!(
+        check_target(&ext_link, &prot, &mut ComputeBudget::with_default_limits())
+            .unwrap()
+            .outcome,
+        PartOutcome::Clear
+    );
+    let written_root_hit = [b"lnk_root".as_slice(), b"..", b".ssh", b"sub"].join(&b'/');
+    let rec_zero = check_recursive_root(
+        &literal(&written_root_hit, AccessMode::Read, &fs),
+        follow,
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny_path(&rec_zero.outcomes, &ssh_absent_expected),
+        "{:?}",
+        rec_zero.outcomes
+    );
+    assert!(
+        !has_unread(&rec_zero.outcomes, |_| true),
+        "{:?}",
+        rec_zero.outcomes
+    );
+
+    let written_root_pub = [b"lnk_root2".as_slice(), b"..", b".ssh", b"sub"].join(&b'/');
+    let rec_zero_pub = check_recursive_root(
+        &literal(&written_root_pub, AccessMode::Read, &fs),
+        follow,
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_unread(&rec_zero_pub.outcomes, |r| matches!(
+            r,
+            UnreadReason::UnresolvablePath { path } if path == &azure_dir
+        )),
+        "{:?}",
+        rec_zero_pub.outcomes
+    );
+}
+
+#[test]
+fn round13_ancestor_stats_cache_bound_and_hit_miss_parity() {
+    use crate::policy::model::Hit;
+
+    // Review 10, test gap for `RootAliases::ancestor_stats` (contract §5, §8;
+    // review 9, finding 1): verify the 1,024-entry bound and that cache hits
+    // and misses (both inside and past the 1,024-entry bound) produce the exact
+    // same alias scans and path verdicts as a fresh `RootAliases` per call.
+    let join_home = |parts: &[&[u8]]| -> Vec<u8> {
+        let mut out = HOME.to_vec();
+        for p in parts {
+            out.push(b'/');
+            out.extend_from_slice(p);
+        }
+        out
+    };
+    let ssh_dir = join_home(&[b".ssh"]);
+    let ssh_pub = join_home(&[b".ssh", b"id_rsa.pub"]);
+    let chrome_dir = join_home(&[b".config", b"google-chrome"]);
+
+    let mut fs = FakeFs::new();
+    fs.add_file(&ssh_pub);
+    fs.mkdir_all(&chrome_dir);
+
+    const TOTAL_DIRS: usize = 1_100;
+    for i in 0..TOTAL_DIRS {
+        let dir = format!("/d{i:04}");
+        match i {
+            500 | 1050 => {
+                fs.bind_dir(&ssh_dir, dir.as_bytes());
+            }
+            501 | 1051 => {
+                fs.bind_dir(&chrome_dir, dir.as_bytes());
+            }
+            _ => {
+                fs.add_file(format!("{dir}/f").as_bytes());
+                fs.add_file(format!("{dir}/g").as_bytes());
+            }
+        }
+    }
+    fs.mkdir_all(b"/err_dir");
+    fs.set_stat_error(b"/err_dir", FsIoError::PermissionDenied);
+
+    let prot = build_protected_set(
+        HOME,
+        CWD,
+        vec![],
+        vec![],
+        FoldRules::REV4,
+        &fs,
+        &mut FsCaps::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        &mut ComputeBudget::new(u64::MAX, usize::MAX),
+    )
+    .unwrap();
+    assert!(prot.identity_gaps.is_empty());
+
+    // 1. Direct `RootAliases::scan`: fill all 1,024 cache entries (`d0000`..`d1023`)
+    //    and continue past the bound (`d1024`..`d1099`), asserting every result
+    //    matches a fresh `RootAliases::default()` per call.
+    let mut cached = RootAliases::default();
+    let mut initial_paths = Vec::with_capacity(TOTAL_DIRS);
+    for i in 0..TOTAL_DIRS {
+        let path = match i {
+            500 | 1050 => format!("/d{i:04}/absent_key"),
+            501 | 1051 => format!("/d{i:04}/Cookies"),
+            _ => format!("/d{i:04}/f"),
+        };
+        let got = cached
+            .scan(
+                path.as_bytes(),
+                &prot,
+                &fs,
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::with_default_limits(),
+            )
+            .unwrap();
+        let fresh = RootAliases::default()
+            .scan(
+                path.as_bytes(),
+                &prot,
+                &fs,
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::with_default_limits(),
+            )
+            .unwrap();
+        assert_eq!(got.alias, fresh.alias, "initial alias mismatch for {path}");
+        assert_eq!(
+            got.unread, fresh.unread,
+            "initial unread mismatch for {path}"
+        );
+        initial_paths.push(path);
+    }
+
+    // 2. Verify the exact 1,024-entry bound observably via `FsCaps::Stats`:
+    //    - Cached plain dir (`d0000`, `d1023` = 1,024th entry) needs only 1
+    //      stat (leaf only; proper ancestor is a cache hit).
+    //    - Uncached plain dir (`d1024` = 1,025th entry) hits `Stats` cap at 1
+    //      stat and succeeds at 2 stats (proper ancestor + leaf).
+    //    - Cached alias dir (`d0500`) needs 0 stats (returns at proper ancestor).
+    //    - Uncached alias dir (`d1050`) hits `Stats` cap at 0 stats and
+    //      succeeds at 1 stat.
+    for cached_plain in [b"/d0000/g".as_slice(), b"/d1023/g"] {
+        let hit = cached
+            .scan(
+                cached_plain,
+                &prot,
+                &fs,
+                &mut FsCaps::new(100, 100, 1, 100, 100),
+                &mut ComputeBudget::with_default_limits(),
+            )
+            .unwrap();
+        assert_eq!(hit.alias, None);
+        assert_eq!(hit.unread, None);
+    }
+
+    let miss_1stat = cached
+        .scan(
+            b"/d1024/g",
+            &prot,
+            &fs,
+            &mut FsCaps::new(100, 100, 1, 100, 100),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        miss_1stat.unread,
+        Some(UnreadReason::WalkCapReached(FsCap::Stats))
+    );
+    let miss_2stats = cached
+        .scan(
+            b"/d1024/g",
+            &prot,
+            &fs,
+            &mut FsCaps::new(100, 100, 2, 100, 100),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    assert_eq!(miss_2stats.alias, None);
+    assert_eq!(miss_2stats.unread, None);
+
+    let expected_ssh_other = join_home(&[b".ssh", b"other_key"]);
+    let cached_alias_0stat = cached
+        .scan(
+            b"/d0500/other_key",
+            &prot,
+            &fs,
+            &mut FsCaps::new(100, 100, 0, 100, 100),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        cached_alias_0stat.alias.as_deref(),
+        Some(expected_ssh_other.as_slice())
+    );
+    assert_eq!(cached_alias_0stat.unread, None);
+
+    let uncached_alias_0stat = cached
+        .scan(
+            b"/d1050/other_key",
+            &prot,
+            &fs,
+            &mut FsCaps::new(100, 100, 0, 100, 100),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        uncached_alias_0stat.unread,
+        Some(UnreadReason::WalkCapReached(FsCap::Stats))
+    );
+    let uncached_alias_1stat = cached
+        .scan(
+            b"/d1050/other_key",
+            &prot,
+            &fs,
+            &mut FsCaps::new(100, 100, 1, 100, 100),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        uncached_alias_1stat.alias.as_deref(),
+        Some(expected_ssh_other.as_slice())
+    );
+    assert_eq!(uncached_alias_1stat.unread, None);
+
+    // Cache hits, cache misses, error ancestors, and absent ancestors all
+    // match a fresh `RootAliases` per call.
+    let probe_paths: &[&[u8]] = &[
+        b"/d0000/g",
+        b"/d0500/other_key",
+        b"/d0500/id_rsa.pub",
+        b"/d0501/Cookies",
+        b"/d0501/Preferences",
+        b"/d1023/g",
+        b"/d1024/g",
+        b"/d1050/other_key",
+        b"/d1050/id_rsa.pub",
+        b"/d1051/Cookies",
+        b"/d1051/Preferences",
+        b"/err_dir/f",
+        b"/missing_dir/f",
+    ];
+    for &p in probe_paths {
+        let got = cached
+            .scan(
+                p,
+                &prot,
+                &fs,
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::with_default_limits(),
+            )
+            .unwrap();
+        let fresh = RootAliases::default()
+            .scan(
+                p,
+                &prot,
+                &fs,
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::with_default_limits(),
+            )
+            .unwrap();
+        assert_eq!(
+            got.alias,
+            fresh.alias,
+            "probe alias mismatch for {:?}",
+            String::from_utf8_lossy(p)
+        );
+        assert_eq!(
+            got.unread,
+            fresh.unread,
+            "probe unread mismatch for {:?}",
+            String::from_utf8_lossy(p)
+        );
+    }
+
+    // 3. End-to-end 1,100+ operands across distinct directories (plus repeat
+    //    hits in cached dirs and repeat misses past 1,024) in a single
+    //    `resolve_subject_paths` call and a single `resolve_command_targets`
+    //    call: every operand gets the exact same verdict as a fresh
+    //    `RootAliases` per call.
+    let mut batch_paths = initial_paths;
+    for extra in [
+        "/d0000/g",
+        "/d0500/other_key",
+        "/d0500/id_rsa.pub",
+        "/d0501/Preferences",
+        "/d1023/g",
+        "/d1024/g",
+        "/d1050/other_key",
+        "/d1050/id_rsa.pub",
+        "/d1051/Preferences",
+    ] {
+        batch_paths.push(extra.to_string());
+    }
+
+    let mut subj_budget = ComputeBudget::with_default_limits();
+    let batch_subj = resolve_subject_paths(
+        &batch_paths,
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut subj_budget,
+    )
+    .expect("1,109 subject paths across distinct dirs fit default limits");
+    assert!(!subj_budget.is_exhausted());
+
+    let mut argv = Vec::with_capacity(batch_paths.len() + 1);
+    argv.push(unquoted(b"cat"));
+    for p in &batch_paths {
+        argv.push(unquoted(p.as_bytes()));
+    }
+    let mut cmd_budget = ComputeBudget::with_default_limits();
+    let batch_cmd = resolve_command_targets(
+        &[unit(0, argv, vec![], Separator::Start, None)],
+        &[reader_effects("cat", batch_paths.len() + 1)],
+        HOME,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut cmd_budget,
+    )
+    .expect("1,109 command operands across distinct dirs fit default limits");
+    assert!(!cmd_budget.is_exhausted());
+
+    let normalize = |outcomes: &[PartResult], part: &PartId| -> Vec<PartOutcome> {
+        outcomes
+            .iter()
+            .filter(|r| &r.part == part)
+            .map(|r| match &r.outcome {
+                PartOutcome::HardDenyHit(h) => PartOutcome::HardDenyHit(Hit {
+                    part: PartId::SubjectPath { path_index: 0 },
+                    ..h.clone()
+                }),
+                PartOutcome::StoreHit(h) => PartOutcome::StoreHit(Hit {
+                    part: PartId::SubjectPath { path_index: 0 },
+                    ..h.clone()
+                }),
+                other => other.clone(),
+            })
+            .collect()
+    };
+
+    for (idx, path) in batch_paths.iter().enumerate() {
+        let fresh = subject(path, AccessMode::Read, &prot, &fs);
+        let fresh_norm = normalize(&fresh.outcomes, &PartId::SubjectPath { path_index: 0 });
+        let subj_norm = normalize(
+            &batch_subj.outcomes,
+            &PartId::SubjectPath { path_index: idx },
+        );
+        let cmd_norm = normalize(
+            &batch_cmd.outcomes,
+            &PartId::Operand {
+                unit: UnitIndex(0),
+                argv_index: idx + 1,
+            },
+        );
+        assert_eq!(subj_norm, fresh_norm, "subject mismatch at {idx} ({path})");
+        assert_eq!(cmd_norm, fresh_norm, "command mismatch at {idx} ({path})");
+
+        let expect_hard_deny = matches!(
+            path.as_str(),
+            "/d0500/absent_key"
+                | "/d0500/other_key"
+                | "/d0501/Cookies"
+                | "/d1050/absent_key"
+                | "/d1050/other_key"
+                | "/d1051/Cookies"
+        );
+        if expect_hard_deny {
+            assert!(
+                subj_norm.iter().any(|o| matches!(
+                    o,
+                    PartOutcome::HardDenyHit(h) if h.hard_deny_id == Some("credential-read")
+                )),
+                "expected HardDenyHit for {path}, got {subj_norm:?}"
+            );
+        } else {
+            assert_eq!(
+                subj_norm,
+                vec![PartOutcome::Clear],
+                "expected Clear for {path}, got {subj_norm:?}"
+            );
+        }
+    }
+}

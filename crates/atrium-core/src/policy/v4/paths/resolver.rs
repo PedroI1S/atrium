@@ -172,6 +172,25 @@ pub(super) const FALLBACK_CANON_PEAK: usize = PATH_MAX
     .saturating_mul(2)
     .saturating_add(FALLBACK_CANON_OVERHEAD);
 
+/// Fixed upper bound (in bytes) charged before constructing a directory stream
+/// in [`FsResolver::read_dir`] (§8; review 10, finding 1).
+///
+/// Origin of the bound:
+/// - On macOS / BSD (`fdopendir` in Darwin `Libc` `gen/FreeBSD/opendir.c`),
+///   libc mallocs `sizeof(DIR)` (about 128 bytes on 64-bit Darwin, including
+///   `pthread_mutex_t`), `struct _telldir` (about 24 bytes), and `dd_buf` sized
+///   to the local filesystem `st_blksize` (4,096 bytes on APFS/HFS+, floor
+///   `DIRBLKSIZ` = 1,024): `4,096 + 256 = 4,352` bytes covers the directory
+///   read buffer plus control structs and allocator overhead.
+/// - Charged identically on Linux (where `RawDir` uses a 4,096-byte stack
+///   buffer) so a given directory costs the exact same allocation budget on
+///   both platforms.
+/// - Across the full `FS_MAX_DIR_OPENS` (1,024) cap, `1,024 * 4,352` (about
+///   4.25 MiB) stays comfortably inside `COMPUTE_BUDGET_ALLOC_BYTES` (8 MiB),
+///   so large walks reach `FsCap::DirOpens` (`Unread`, §2) before exhausting
+///   the allocation budget.
+pub(super) const DIR_STREAM_ALLOC: usize = 4_096 + 256;
+
 /// `rustix` and `std` copy a path into a heap `CString` when it does not fit
 /// their stack buffers (256 bytes in `rustix`, 384 in `std`). Charges that
 /// copy before the call that makes it (§8).
@@ -436,6 +455,12 @@ impl PathResolver for FsResolver {
                 Mode::empty(),
             )
             .map_err(|e| map_errno(e, false))?;
+            // Charge a fixed upper bound for the libc `DIR` stream buffer
+            // before constructing the stream (`fdopendir` on non-Linux Unix),
+            // and charge the same constant on Linux so both platforms spend
+            // the same allocation budget for a given directory (§8; review 10,
+            // finding 1).
+            budget.charge_alloc(DIR_STREAM_ALLOC)?;
             let mut out: Vec<DirEntry> = Vec::new();
 
             #[cfg(target_os = "linux")]
@@ -463,8 +488,14 @@ impl PathResolver for FsResolver {
 
             #[cfg(all(unix, not(target_os = "linux")))]
             {
-                let mut dir =
-                    rustix::fs::Dir::read_from(&dir_fd).map_err(|e| map_errno(e, false))?;
+                // Duplicate `dir_fd` with `F_DUPFD_CLOEXEC` and hand ownership
+                // to `Dir::new` (`fdopendir`) instead of `Dir::read_from`,
+                // avoiding a second `openat(fd, ".")` while keeping `dir_fd`
+                // open for `DT_UNKNOWN` `statat` fallbacks (review 10,
+                // finding 1).
+                let stream_fd =
+                    rustix::io::fcntl_dupfd_cloexec(&dir_fd, 0).map_err(|e| map_errno(e, false))?;
+                let mut dir = rustix::fs::Dir::new(stream_fd).map_err(|e| map_errno(e, false))?;
                 loop {
                     // Charge entry read and work BEFORE advancing the directory
                     // iterator, matching the Linux `RawDir` charges and order
@@ -490,6 +521,7 @@ impl PathResolver for FsResolver {
         }
         #[cfg(not(unix))]
         {
+            budget.charge_alloc(DIR_STREAM_ALLOC)?;
             let mut rd = std::fs::read_dir(p).map_err(|e| map_io_error(&e, false))?;
             let mut out: Vec<DirEntry> = Vec::new();
             loop {
