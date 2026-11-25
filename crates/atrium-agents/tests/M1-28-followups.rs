@@ -499,8 +499,12 @@ for line in sys.stdin:
     );
 
     let ledger = RealLedger::new(Provider::Claude, &dir, Preset::Careful, true).await;
-    let deadline = Duration::from_millis(150);
-    let mut session = ClaudeAdapter::new(claude_opts(deadline))
+    let deadline = Duration::from_secs(1);
+    // Keep `gate_deadline` at its default (20 s): it also bounds real SQLite
+    // checks and tickets, so shrinking it causes spurious timeouts under load;
+    // bound only `drain_withdrawals` via `with_withdraw_timeout`.
+    let mut session = ClaudeAdapter::new(claude_opts(ClaudeOptions::default().gate_deadline))
+        .with_withdraw_timeout(deadline)
         .start(
             claude_cfg(&dir, script, ledger.gate.clone()),
             Transport::Local,
@@ -523,8 +527,8 @@ for line in sys.stdin:
 
     assert_eq!(ledger.gate.withdrawn().len(), 5);
     assert!(
-        elapsed < Duration::from_millis(450),
-        "5 hung withdrawals took {elapsed:?}; expected <= ~1 deadline (150ms), not 5 * 150ms"
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(3),
+        "5 hung withdrawals took {elapsed:?}; expected ~1 deadline (1s), not 0s or 5 * 1s"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1696,7 +1700,11 @@ for line in sys.stdin:
     let (gate, controls) = DelayedWithdrawGate::new(session_gate, filler_count);
 
     let wait_deadline = Duration::from_millis(150);
-    let mut session = ClaudeAdapter::new(claude_opts(wait_deadline))
+    // Keep `gate_deadline` at its default (20 s): it also bounds real SQLite
+    // checks and tickets, so shrinking it causes spurious timeouts under load;
+    // bound only `drain_withdrawals` via `with_withdraw_timeout`.
+    let mut session = ClaudeAdapter::new(claude_opts(ClaudeOptions::default().gate_deadline))
+        .with_withdraw_timeout(wait_deadline)
         .start(claude_cfg(&dir, script, gate.clone()), Transport::Local)
         .await
         .unwrap();
@@ -2300,7 +2308,11 @@ for line in sys.stdin:
         make_session_gate_with_ledger(Provider::Claude, &dir, Preset::Careful).await;
     let (gate, release_withdraw) = BlockedDeliveredWithdrawGate::new(session_gate);
 
-    let mut session = ClaudeAdapter::new(claude_opts(Duration::from_millis(150)))
+    // Keep `gate_deadline` at its default (20 s): it also bounds real SQLite
+    // checks and tickets, so shrinking it causes spurious timeouts under load;
+    // bound only `drain_withdrawals` via `with_withdraw_timeout`.
+    let mut session = ClaudeAdapter::new(claude_opts(ClaudeOptions::default().gate_deadline))
+        .with_withdraw_timeout(Duration::from_millis(20))
         .start(claude_cfg(&dir, script, gate.clone()), Transport::Local)
         .await
         .unwrap();
@@ -2314,7 +2326,7 @@ for line in sys.stdin:
     // Deliver `MAX_PENDING_REQUESTS` questions normally, free each ledger slot
     // independently (modeling daemon `DeclineQuestion`), and decline each one
     // while adapter `gate.withdraw()` remains blocked.
-    for _ in 0..total {
+    for iter in 0..total {
         let request_id = wait_for_question(&mut session).await;
         ledger
             .withdraw(&RequestKey {
@@ -2324,7 +2336,12 @@ for line in sys.stdin:
             })
             .await
             .unwrap();
-        assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+        assert_eq!(
+            store.requests().open_count(&thread, inc).await.unwrap(),
+            0,
+            "unexpected open request after withdrawing {request_id} on iteration {iter}/{total} (question_calls={})",
+            gate.question_calls(),
+        );
         session
             .commands
             .send(SessionCommand::DeclineQuestion { request_id })
@@ -2503,7 +2520,7 @@ for line in sys.stdin:
         .await
         .unwrap();
 
-    for _ in 0..total {
+    for iter in 0..total {
         let request_id = wait_for_question(&mut session).await;
         ledger
             .withdraw(&RequestKey {
@@ -2513,7 +2530,12 @@ for line in sys.stdin:
             })
             .await
             .unwrap();
-        assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+        assert_eq!(
+            store.requests().open_count(&thread, inc).await.unwrap(),
+            0,
+            "unexpected open request after withdrawing {request_id} on iteration {iter}/{total} (question_calls={})",
+            gate.question_calls(),
+        );
         session
             .commands
             .send(SessionCommand::DeclineQuestion { request_id })
