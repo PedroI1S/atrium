@@ -7,7 +7,7 @@ use atrium_host::supervise::{
     ProcessIdentity, identify, kill_recorded, spawn_group, terminate, terminate_blocking,
 };
 use atrium_protocol::thread::Cleanup;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 fn pid_exists(pid: u32) -> bool {
@@ -271,38 +271,11 @@ async fn gone_leader_with_live_descendant_in_group_is_not_verified() {
     assert_eq!(kill_recorded(&recorded), Cleanup::Verified);
 }
 
-const GONE_LEADER_HELPER_ENV: &str = "ATRIUM_SUPERVISE_GONE_LEADER_HELPER";
-const GONE_LEADER_MEMBER_ENV: &str = "ATRIUM_SUPERVISE_GONE_LEADER_MEMBER";
-
-#[test]
-fn helper_gone_leader_spawns_member_holding_stdin() {
-    if std::env::var_os(GONE_LEADER_MEMBER_ENV).is_some() {
-        let mut buf = [0u8; 1];
-        let _ = std::io::Read::read(&mut std::io::stdin(), &mut buf);
-        return;
-    }
-    if std::env::var_os(GONE_LEADER_HELPER_ENV).is_none() {
-        return;
-    }
-    // Spawn a member in the same process group (no `process_group(0)`),
-    // inheriting stdin so the parent test controls when it exits. The helper
-    // exits without waiting so the member is reparented to init.
-    #[allow(clippy::zombie_processes)]
-    let child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        .arg("--exact")
-        .arg("helper_gone_leader_spawns_member_holding_stdin")
-        .arg("--nocapture")
-        .arg("--quiet")
-        .env(GONE_LEADER_MEMBER_ENV, "1")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn group member");
-    println!("MEMBER:{}", child.id());
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-}
-
+/// Spawns a short-lived `/bin/sh` group leader that starts a lightweight
+/// `cat -u` group member holding stdin, then exits and is reaped so only the
+/// reparented member remains in `recorded.pgid`. Performs a `"ready\n"`
+/// round-trip through `cat -u` before returning so the member is already
+/// initialized and blocked in `read(0)` before callers start timing drain.
 async fn spawn_gone_leader_with_holding_member() -> (
     ProcessIdentity,
     u32,
@@ -310,12 +283,12 @@ async fn spawn_gone_leader_with_holding_member() -> (
     KillGroupGuard,
     KillPidGuard,
 ) {
-    let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
-    cmd.arg("--exact")
-        .arg("helper_gone_leader_spawns_member_holding_stdin")
-        .arg("--nocapture")
-        .arg("--quiet")
-        .env(GONE_LEADER_HELPER_ENV, "1")
+    // Non-interactive POSIX `sh` redirects `&` children's stdin to `/dev/null`
+    // before explicit redirections, so duplicate fd 0 to fd 3 first and pass
+    // fd 3 into `cat -u` as its stdin.
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("exec 3<&0; cat -u <&3 3<&- & echo \"MEMBER:$!\"; exit 0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -323,7 +296,7 @@ async fn spawn_gone_leader_with_holding_member() -> (
     let mut sup = spawn_group(cmd).expect("spawn_group");
     let recorded = sup.identity.clone();
     let group_guard = KillGroupGuard(recorded.pgid);
-    let stdin = sup.child.stdin.take().expect("stdin");
+    let mut stdin = sup.child.stdin.take().expect("stdin");
     let stdout = sup.child.stdout.take().expect("stdout");
     let mut lines = BufReader::new(stdout).lines();
     let member_pid: u32 = loop {
@@ -344,6 +317,23 @@ async fn spawn_gone_leader_with_holding_member() -> (
     assert!(status.success());
 
     assert_eq!(identify(recorded.pid).unwrap(), None, "leader must be gone");
+
+    // Confirm `cat -u` has finished exec/startup and is actively reading stdin
+    // before returning; once echoed, it loops back into `read(0)` until `stdin`
+    // is dropped.
+    stdin
+        .write_all(b"ready\n")
+        .await
+        .expect("write ready probe to member stdin");
+    stdin.flush().await.expect("flush ready probe");
+    let ready = lines
+        .next_line()
+        .await
+        .unwrap()
+        .expect("member exited before echoing ready");
+    assert_eq!(ready, "ready");
+    drop(lines);
+
     let member_id = identify(member_pid)
         .unwrap()
         .expect("member must still be alive");
