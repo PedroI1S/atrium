@@ -207,24 +207,22 @@ pub(super) fn run_best_effort_into(
         let part = PartId::BestEffortUnit(u.index);
 
         // Determine join/compound metadata for this unit.
-        let unit_meta = if !u.derived && u.depth == 0 {
-            let m = top_meta
-                .get(top_unit_ordinal)
-                .copied()
-                .unwrap_or(BeUnitMeta::SEQ);
+        let default_seq = BeUnitMeta::seq();
+        let default_and = BeUnitMeta::and();
+        let unit_meta: &BeUnitMeta = if !u.derived && u.depth == 0 {
+            let m = top_meta.get(top_unit_ordinal).unwrap_or(&default_seq);
             top_unit_ordinal += 1;
             m
         } else {
             let m = pending_derived_meta
                 .get(derived_unit_ordinal)
-                .copied()
-                .unwrap_or(BeUnitMeta::AND);
+                .unwrap_or(&default_and);
             derived_unit_ordinal += 1;
             m
         };
 
-        // Update depth-scoped cwd tracker before inspecting this unit.
-        cwd_tracker.enter_unit(u, &mut env_child_cands, budget)?;
+        // Update depth-scoped & compound-scoped cwd tracker before inspecting this unit.
+        cwd_tracker.enter_unit(u, unit_meta, &mut env_child_cands, budget)?;
         let base_cands = cwd_tracker.current_cands(budget)?;
         let base_cwd_unknown = cwd_tracker.is_unknown();
 
@@ -266,6 +264,7 @@ pub(super) fn run_best_effort_into(
         budget.charge(readings_count as u64)?;
         let mut unit_is_same_shell_parent = false;
         let mut same_shell_eval_payload: Option<String> = None;
+        let mut new_derived_meta: Option<Vec<BeUnitMeta>> = None;
         for reading in std::iter::once(&u.effective_argv)
             .chain(u.alt_argv.iter())
             .chain(extra_readings.iter())
@@ -290,12 +289,11 @@ pub(super) fn run_best_effort_into(
                 }
             }
             if !u.derived
-                && pending_derived_meta.is_empty()
+                && new_derived_meta.is_none()
                 && is_shell_folded(&folded_cmd, budget)?
                 && let Some(code) = extract_shell_c_code(&reading[1..], budget)?
             {
-                pending_derived_meta = scan_top_level_meta(code, budget)?;
-                derived_unit_ordinal = 0;
+                new_derived_meta = Some(scan_top_level_meta(code, budget)?);
             }
             if folded_cmd == "find" && has_find_exec_flag(reading, budget)? {
                 let (roots, _) = find_roots_budgeted(reading, budget)?;
@@ -382,7 +380,7 @@ pub(super) fn run_best_effort_into(
         // Check whether the immediately following sibling is a plain `exit`
         // (not `! exit`, not `exit &`, not in a pipeline/group).
         let next_meta = if !u.derived && u.depth == 0 {
-            top_meta.get(top_unit_ordinal).copied()
+            top_meta.get(top_unit_ordinal)
         } else {
             None
         };
@@ -392,7 +390,8 @@ pub(super) fn run_best_effort_into(
                 && !n.piped
                 && n.raw_argv.first().is_some_and(|f| f == "exit")
                 && n.effective_argv.first().is_some_and(|f| f == "exit")
-                && next_meta.is_none_or(|m| m.join != BeJoin::Bg && !m.may_skip_or_subshell)
+                && next_meta
+                    .is_none_or(|m| m.join != BeJoin::Bg && m.compound == unit_meta.compound)
         });
         cwd_tracker.after_unit(
             u,
@@ -404,6 +403,10 @@ pub(super) fn run_best_effort_into(
             protected.folds,
             budget,
         )?;
+        if let Some(dm) = new_derived_meta {
+            pending_derived_meta = dm;
+            derived_unit_ordinal = 0;
+        }
     }
 
     Ok(())
@@ -844,6 +847,14 @@ fn unwrap_simple_be(
                             || short_cluster_takes_next(w, "uCPaS")
                         {
                             idx += 2;
+                        } else if !w.contains('=')
+                            && !is_known_env_noarg_opt(w)
+                            && cur.get(idx + 2).is_some_and(|n2| {
+                                (n2.starts_with('-') && n2.len() > 1) || n2.contains('=')
+                            })
+                        {
+                            // Unknown option possibly taking an argument before another env flag.
+                            idx += 2;
                         } else {
                             idx += 1;
                         }
@@ -1015,532 +1026,730 @@ enum BeJoin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeCompound {
+    Brace,
+    Paren,
+    Cond,
+    Loop,
+    Func,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BeUnitMeta {
     join: BeJoin,
-    /// Inside `(...)`, `if`, `case`, or `{ ... }` after `||`: a `cd` must not
-    /// drop the outer directory from `cands`.
-    may_skip_or_subshell: bool,
-    /// Inside a loop (`for`/`while`/`until`/`select`) or function definition
-    /// (`name() { ... }`): a `cd` marks cwd unknown (`lost`).
-    in_loop_or_func: bool,
+    /// Join written immediately after a `)` group (possibly after its redirects)
+    /// that closes this unit's subshell (`( … ) && x`, `( … ) | x`, `( … ) || x`).
+    close_join: Option<BeJoin>,
+    /// Open compound commands surrounding this unit, outermost first, each with
+    /// a scan-unique id (matching `dev` `shell.rs` + `words.rs`).
+    compound: Vec<(BeCompound, u32)>,
     /// Byte slice of a `<<<WORD` here-string attached to this unit (if any).
     herestring: Option<(usize, usize)>,
 }
 
 impl BeUnitMeta {
-    const SEQ: Self = Self {
-        join: BeJoin::Seq,
-        may_skip_or_subshell: false,
-        in_loop_or_func: false,
-        herestring: None,
-    };
-    const AND: Self = Self {
-        join: BeJoin::And,
-        may_skip_or_subshell: false,
-        in_loop_or_func: false,
-        herestring: None,
-    };
+    const fn seq() -> Self {
+        Self {
+            join: BeJoin::Seq,
+            close_join: None,
+            compound: Vec::new(),
+            herestring: None,
+        }
+    }
+
+    const fn and() -> Self {
+        Self {
+            join: BeJoin::And,
+            close_join: None,
+            compound: Vec::new(),
+            herestring: None,
+        }
+    }
 }
 
-/// Linear scan of a command line matching `lex_one_text`'s unit boundaries and
-/// recording each unit's trailing separator, compound/subshell/loop/function
-/// flags, and attached `<<<` here-string range.
+fn is_posix_name_be(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Whether the argv words read so far leave the next unquoted word in command
+/// position where a reserved word opens or closes a compound command
+/// (matching `dev` `shell.rs::opens_body`).
+fn opens_body_be(words: &[&str]) -> bool {
+    let mut k = 0;
+    while k < words.len() {
+        match words[k] {
+            "then" | "do" | "else" | "elif" | "!" | "{" | "if" | "while" | "until" => k += 1,
+            "time" => {
+                k += 1;
+                if words.get(k).is_some_and(|w| *w == "-p") {
+                    k += 1;
+                }
+            }
+            "function" => {
+                if k + 1 >= words.len() {
+                    return false;
+                }
+                k += 2;
+            }
+            "coproc" => {
+                k += 1;
+                if k < words.len()
+                    && is_posix_name_be(words[k])
+                    && words.get(k + 1).is_none_or(|w| *w == "{")
+                {
+                    k += 1;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn is_known_env_noarg_opt(w: &str) -> bool {
+    matches!(
+        w,
+        "--ignore-environment"
+            | "--null"
+            | "--debug"
+            | "--help"
+            | "--version"
+            | "--ign"
+            | "--ignore"
+    ) || (w.starts_with('-')
+        && !w.starts_with("--")
+        && w.len() > 1
+        && w[1..].bytes().all(|b| matches!(b, b'i' | b'0' | b'v')))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanPending {
+    Redirect,
+    Heredoc(bool),
+    HereString,
+}
+
+/// Linear scan of a command line matching P1 `lex_one_text`'s unit boundaries
+/// 1-to-1 and recording each unit's trailing separator, surrounding compound
+/// stack (`Brace`/`Paren`/`Cond`/`Loop`/`Func`), `close_join` after `)` +
+/// redirects, and attached `<<<` here-string range.
 fn scan_top_level_meta(
     text: &str,
     budget: &mut ComputeBudget,
 ) -> Result<Vec<BeUnitMeta>, Exhausted> {
     let bytes = text.as_bytes();
     budget.charge(bytes.len().max(1) as u64)?;
-    let mut out = Vec::new();
+    let mut out: Vec<BeUnitMeta> = Vec::new();
     let mut i = 0usize;
-    let mut has_token = false;
-    let mut in_sq = false;
-    let mut in_dq = false;
-    let mut paren_depth = 0usize;
-    let mut backtick = false;
-    let mut subshell_depth = 0usize;
-    let mut cond_depth = 0usize;
-    let mut loop_depth = 0usize;
-    let mut func_brace_depth = 0usize;
-    let mut pending_func = false;
-    let mut word_start: Option<usize> = None;
+    let mut has_content = false;
+    let mut has_assign = false;
+    let mut cur_words: Vec<&str> = Vec::new();
+    let mut groups: Vec<(BeCompound, u32)> = Vec::new();
+    let mut next_group_id: u32 = 1;
+    let mut fn_def = false;
+    let mut after_paren = false;
+    let mut pending: Option<ScanPending> = None;
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
     let mut cur_herestring: Option<(usize, usize)> = None;
 
     let flush_meta = |out: &mut Vec<BeUnitMeta>,
-                      has_token: &mut bool,
+                      has_content: &mut bool,
+                      has_assign: &mut bool,
+                      cur_words: &mut Vec<&str>,
                       cur_herestring: &mut Option<(usize, usize)>,
+                      groups: &[(BeCompound, u32)],
                       join: BeJoin,
-                      subshell_depth: usize,
-                      cond_depth: usize,
-                      loop_depth: usize,
-                      func_brace_depth: usize,
                       budget: &mut ComputeBudget|
      -> Result<(), Exhausted> {
-        if *has_token {
-            budget.charge_alloc(std::mem::size_of::<BeUnitMeta>())?;
+        if *has_content {
+            budget.charge_alloc(
+                std::mem::size_of::<BeUnitMeta>()
+                    + groups.len() * std::mem::size_of::<(BeCompound, u32)>(),
+            )?;
             out.push(BeUnitMeta {
                 join,
-                may_skip_or_subshell: subshell_depth > 0 || cond_depth > 0,
-                in_loop_or_func: loop_depth > 0 || func_brace_depth > 0,
+                close_join: None,
+                compound: groups.to_vec(),
                 herestring: cur_herestring.take(),
             });
-            *has_token = false;
+            *has_content = false;
+            *has_assign = false;
+            cur_words.clear();
         } else {
             *cur_herestring = None;
         }
         Ok(())
     };
 
-    let finish_word = |text: &str,
-                       word_start: &mut Option<usize>,
-                       end: usize,
-                       cond_depth: &mut usize,
-                       loop_depth: &mut usize,
-                       func_brace_depth: &mut usize,
-                       pending_func: &mut bool| {
-        let Some(ws) = word_start.take() else {
-            return;
+    let group_tail =
+        |has_content: bool, has_assign: bool, cur_words: &[&str], after_paren: bool| {
+            !has_content || (after_paren && !has_assign && cur_words.is_empty())
         };
-        let w = &text[ws..end];
-        match w {
-            "if" | "case" => *cond_depth += 1,
-            "fi" | "esac" => *cond_depth = cond_depth.saturating_sub(1),
-            "for" | "while" | "until" | "select" => *loop_depth += 1,
-            "done" => *loop_depth = loop_depth.saturating_sub(1),
-            "function" => *pending_func = true,
-            "{" => {
-                if *pending_func {
-                    *pending_func = false;
-                    *func_brace_depth += 1;
-                } else if *func_brace_depth > 0 {
-                    *func_brace_depth += 1;
-                }
+
+    let scan_redirect_op = |bytes: &[u8], i: usize, pending: &mut Option<ScanPending>| -> usize {
+        let b = bytes[i];
+        let b1 = bytes.get(i + 1).copied();
+        let b2 = bytes.get(i + 2).copied();
+        if b == b'<' && b1 == Some(b'<') && b2 == Some(b'<') {
+            *pending = Some(ScanPending::HereString);
+            i + 3
+        } else if b == b'<' && b1 == Some(b'<') {
+            if b2 == Some(b'-') {
+                *pending = Some(ScanPending::Heredoc(true));
+                i + 3
+            } else {
+                *pending = Some(ScanPending::Heredoc(false));
+                i + 2
             }
-            "}" => {
-                if *func_brace_depth > 0 {
-                    *func_brace_depth -= 1;
-                }
-            }
-            _ => {}
+        } else if matches!(
+            (b, b1),
+            (b'>', Some(b'>' | b'&' | b'|')) | (b'<', Some(b'&' | b'>'))
+        ) {
+            *pending = Some(ScanPending::Redirect);
+            i + 2
+        } else {
+            *pending = Some(ScanPending::Redirect);
+            i + 1
         }
     };
 
     while i < bytes.len() {
-        let b = bytes[i];
-        if in_sq {
-            if b == b'\'' {
-                in_sq = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_dq {
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == b'"' {
-                in_dq = false;
-            }
-            i += 1;
-            continue;
-        }
-        if backtick {
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == b'`' {
-                backtick = false;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\\' if i + 1 < bytes.len() => {
-                if bytes[i + 1] == b'\n' && word_start.is_none() {
-                    i += 2;
-                } else {
-                    if word_start.is_none() {
-                        word_start = Some(i);
-                    }
-                    has_token = true;
-                    i += 2;
-                }
-            }
-            b'\'' => {
-                if word_start.is_none() {
-                    word_start = Some(i);
-                }
-                in_sq = true;
-                has_token = true;
+        budget.charge(1)?;
+        match bytes[i] {
+            b' ' | b'\t' => {
                 i += 1;
             }
-            b'"' => {
-                if word_start.is_none() {
-                    word_start = Some(i);
-                }
-                in_dq = true;
-                has_token = true;
-                i += 1;
-            }
-            b'`' => {
-                if word_start.is_none() {
-                    word_start = Some(i);
-                }
-                backtick = true;
-                has_token = true;
-                i += 1;
-            }
-            b'$' if bytes.get(i + 1) == Some(&b'(') => {
-                if word_start.is_none() {
-                    word_start = Some(i);
-                }
-                paren_depth += 1;
-                has_token = true;
+            b'\\' if bytes.get(i + 1) == Some(&b'\n') => {
                 i += 2;
             }
-            b'<' | b'>' if bytes.get(i + 1) == Some(&b'(') => {
-                if word_start.is_none() {
-                    word_start = Some(i);
-                }
-                paren_depth += 1;
-                has_token = true;
-                i += 2;
-            }
-            b'<' if paren_depth == 0
-                && bytes.get(i + 1) == Some(&b'<')
-                && bytes.get(i + 2) == Some(&b'<') =>
-            {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
-                i += 3;
-                while matches!(bytes.get(i), Some(b' ' | b'\t')) {
-                    i += 1;
-                }
-                let hs_start = i;
-                let mut hq: Option<u8> = None;
-                while i < bytes.len() {
-                    let c = bytes[i];
-                    if let Some(q) = hq {
-                        if q == b'"' && c == b'\\' && i + 1 < bytes.len() {
-                            i += 2;
-                            continue;
-                        }
-                        if c == q {
-                            hq = None;
-                        }
-                        i += 1;
-                    } else if matches!(c, b'\'' | b'"') {
-                        hq = Some(c);
-                        i += 1;
-                    } else if c == b'\\' && i + 1 < bytes.len() {
-                        i += 2;
-                    } else if matches!(
-                        c,
-                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
-                    ) {
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
-                cur_herestring = Some((hs_start, i));
-            }
-            b'(' if paren_depth > 0 => {
-                paren_depth += 1;
-                i += 1;
-            }
-            b')' if paren_depth > 0 => {
-                paren_depth -= 1;
-                i += 1;
-            }
-            b'#' if paren_depth == 0 && word_start.is_none() => {
+            b'#' => {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
             }
-            b'&' if paren_depth == 0 && bytes.get(i + 1) == Some(&b'&') => {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
-                flush_meta(
-                    &mut out,
-                    &mut has_token,
-                    &mut cur_herestring,
-                    BeJoin::And,
-                    subshell_depth,
-                    cond_depth,
-                    loop_depth,
-                    func_brace_depth,
-                    budget,
-                )?;
-                i += 2;
-            }
-            b'&' if paren_depth == 0 && bytes.get(i + 1) == Some(&b'>') => {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
-                has_token = true;
-                i += if bytes.get(i + 2) == Some(&b'>') {
-                    3
-                } else {
-                    2
-                };
-            }
-            b'|' if paren_depth == 0 && bytes.get(i + 1) == Some(&b'|') => {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
-                flush_meta(
-                    &mut out,
-                    &mut has_token,
-                    &mut cur_herestring,
-                    BeJoin::Or,
-                    subshell_depth,
-                    cond_depth,
-                    loop_depth,
-                    func_brace_depth,
-                    budget,
-                )?;
-                i += 2;
-            }
-            b'|' if paren_depth == 0 => {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
-                flush_meta(
-                    &mut out,
-                    &mut has_token,
-                    &mut cur_herestring,
-                    BeJoin::Pipe,
-                    subshell_depth,
-                    cond_depth,
-                    loop_depth,
-                    func_brace_depth,
-                    budget,
-                )?;
-                i += if bytes.get(i + 1) == Some(&b'&') {
-                    2
-                } else {
-                    1
-                };
-            }
-            b'&' if paren_depth == 0 => {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
-                flush_meta(
-                    &mut out,
-                    &mut has_token,
-                    &mut cur_herestring,
-                    BeJoin::Bg,
-                    subshell_depth,
-                    cond_depth,
-                    loop_depth,
-                    func_brace_depth,
-                    budget,
-                )?;
+            b'\n' => {
                 i += 1;
-            }
-            b';' if paren_depth == 0 => {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
                 flush_meta(
                     &mut out,
-                    &mut has_token,
+                    &mut has_content,
+                    &mut has_assign,
+                    &mut cur_words,
                     &mut cur_herestring,
+                    &groups,
                     BeJoin::Seq,
-                    subshell_depth,
-                    cond_depth,
-                    loop_depth,
-                    func_brace_depth,
                     budget,
                 )?;
+                after_paren = false;
+                pending = None;
+                // Skip heredoc bodies matching P1 `lex_one_text`.
+                for (delim, strip_tabs) in std::mem::take(&mut heredocs) {
+                    while i < bytes.len() {
+                        let line_start = i;
+                        while i < bytes.len() && bytes[i] != b'\n' {
+                            i += 1;
+                        }
+                        let line = &text[line_start..i];
+                        if i < bytes.len() && bytes[i] == b'\n' {
+                            i += 1;
+                        }
+                        let trimmed = if strip_tabs {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line
+                        };
+                        if trimmed == delim {
+                            break;
+                        }
+                    }
+                }
+            }
+            b';' => {
                 i += if bytes.get(i + 1) == Some(&b';') {
                     2
                 } else {
                     1
                 };
-            }
-            b'\n' if paren_depth == 0 => {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
                 flush_meta(
                     &mut out,
-                    &mut has_token,
+                    &mut has_content,
+                    &mut has_assign,
+                    &mut cur_words,
                     &mut cur_herestring,
+                    &groups,
                     BeJoin::Seq,
-                    subshell_depth,
-                    cond_depth,
-                    loop_depth,
-                    func_brace_depth,
                     budget,
                 )?;
-                i += 1;
+                after_paren = false;
+                pending = None;
             }
-            b'(' if paren_depth == 0 => {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
+            b'&' if bytes.get(i + 1) == Some(&b'&') => {
+                i += 2;
+                if group_tail(has_content, has_assign, &cur_words, after_paren)
+                    && let Some(last) = out.last_mut()
+                {
+                    last.close_join = Some(BeJoin::And);
+                }
+                flush_meta(
+                    &mut out,
+                    &mut has_content,
+                    &mut has_assign,
+                    &mut cur_words,
+                    &mut cur_herestring,
+                    &groups,
+                    BeJoin::And,
+                    budget,
+                )?;
+                after_paren = false;
+                pending = None;
+            }
+            b'&' if bytes.get(i + 1) == Some(&b'>') => {
+                i += if bytes.get(i + 2) == Some(&b'>') {
+                    3
+                } else {
+                    2
+                };
+                pending = Some(ScanPending::Redirect);
+            }
+            b'&' => {
+                i += 1;
+                flush_meta(
+                    &mut out,
+                    &mut has_content,
+                    &mut has_assign,
+                    &mut cur_words,
+                    &mut cur_herestring,
+                    &groups,
+                    BeJoin::Bg,
+                    budget,
+                )?;
+                after_paren = false;
+                pending = None;
+            }
+            b'|' => {
+                let is_pipe = bytes.get(i + 1) != Some(&b'|');
+                i += if is_pipe && bytes.get(i + 1) == Some(&b'&') {
+                    2
+                } else if is_pipe {
+                    1
+                } else {
+                    2
+                };
+                if group_tail(has_content, has_assign, &cur_words, after_paren)
+                    && let Some(last) = out.last_mut()
+                {
+                    if is_pipe && after_paren {
+                        last.close_join = Some(BeJoin::And);
+                    } else if !is_pipe {
+                        last.close_join = Some(BeJoin::Or);
+                    }
+                }
+                flush_meta(
+                    &mut out,
+                    &mut has_content,
+                    &mut has_assign,
+                    &mut cur_words,
+                    &mut cur_herestring,
+                    &groups,
+                    if is_pipe { BeJoin::Pipe } else { BeJoin::Or },
+                    budget,
+                )?;
+                after_paren = false;
+                pending = None;
+            }
+            b'(' => {
                 let mut k = i + 1;
                 while matches!(bytes.get(k), Some(b' ' | b'\t')) {
                     k += 1;
                 }
-                if bytes.get(k) == Some(&b')') && has_token {
-                    // `f()` function definition matches `lex_one_text:807-818`.
-                    pending_func = true;
+                if bytes.get(k) == Some(&b')') && !cur_words.is_empty() {
+                    // `f()` function definition: matches P1 `lex_one_text` and
+                    // `dev` `shell.rs` (`join = And` so it keeps an outer `&&` chain).
                     flush_meta(
                         &mut out,
-                        &mut has_token,
+                        &mut has_content,
+                        &mut has_assign,
+                        &mut cur_words,
                         &mut cur_herestring,
-                        BeJoin::Seq,
-                        subshell_depth,
-                        cond_depth,
-                        loop_depth,
-                        func_brace_depth,
+                        &groups,
+                        BeJoin::And,
                         budget,
                     )?;
+                    fn_def = true;
+                    after_paren = false;
+                    pending = None;
                     i = k + 1;
                 } else {
                     flush_meta(
                         &mut out,
-                        &mut has_token,
+                        &mut has_content,
+                        &mut has_assign,
+                        &mut cur_words,
                         &mut cur_herestring,
+                        &groups,
                         BeJoin::Seq,
-                        subshell_depth,
-                        cond_depth,
-                        loop_depth,
-                        func_brace_depth,
                         budget,
                     )?;
-                    subshell_depth += 1;
+                    let kind = if std::mem::take(&mut fn_def) {
+                        BeCompound::Func
+                    } else {
+                        BeCompound::Paren
+                    };
+                    let id = next_group_id;
+                    next_group_id = next_group_id.wrapping_add(1).max(1);
+                    groups.push((kind, id));
+                    after_paren = false;
+                    pending = None;
                     i += 1;
                 }
             }
-            b')' if paren_depth == 0 => {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
+            b')' => {
                 flush_meta(
                     &mut out,
-                    &mut has_token,
+                    &mut has_content,
+                    &mut has_assign,
+                    &mut cur_words,
                     &mut cur_herestring,
+                    &groups,
                     BeJoin::Seq,
-                    subshell_depth,
-                    cond_depth,
-                    loop_depth,
-                    func_brace_depth,
                     budget,
                 )?;
-                subshell_depth = subshell_depth.saturating_sub(1);
+                if groups
+                    .last()
+                    .is_some_and(|g| matches!(g.0, BeCompound::Paren | BeCompound::Func))
+                {
+                    groups.pop();
+                    after_paren = true;
+                } else {
+                    // `case x in a)`: pattern terminator, not a subshell group.
+                    after_paren = false;
+                }
+                pending = None;
                 i += 1;
             }
-            b' ' | b'\t' => {
-                finish_word(
-                    text,
-                    &mut word_start,
-                    i,
-                    &mut cond_depth,
-                    &mut loop_depth,
-                    &mut func_brace_depth,
-                    &mut pending_func,
-                );
-                i += 1;
+            b'<' | b'>' if bytes.get(i + 1) != Some(&b'(') => {
+                i = scan_redirect_op(bytes, i, &mut pending);
             }
             _ => {
-                if word_start.is_none() {
-                    word_start = Some(i);
+                // Scan one shell word linearly (matching P1 `lex_one_text`).
+                let word_start = i;
+                let mut quoted_prefix_empty = true;
+                let mut all_unquoted_digits = true;
+                let mut seen_eq_pos: Option<usize> = None;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    match c {
+                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' => break,
+                        b'<' | b'>' if bytes.get(i + 1) != Some(&b'(') => break,
+                        b'\\' => {
+                            quoted_prefix_empty = false;
+                            all_unquoted_digits = false;
+                            i += if i + 1 < bytes.len() { 2 } else { 1 };
+                        }
+                        b'\'' => {
+                            quoted_prefix_empty = false;
+                            all_unquoted_digits = false;
+                            i += 1;
+                            while i < bytes.len() {
+                                if bytes[i] == b'\'' {
+                                    i += 1;
+                                    break;
+                                }
+                                i += 1;
+                            }
+                        }
+                        b'"' => {
+                            quoted_prefix_empty = false;
+                            all_unquoted_digits = false;
+                            i += 1;
+                            let mut sub_depth = 0usize;
+                            while i < bytes.len() {
+                                match bytes[i] {
+                                    b'\\' if i + 1 < bytes.len() => i += 2,
+                                    b'"' if sub_depth == 0 => {
+                                        i += 1;
+                                        break;
+                                    }
+                                    b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                                        sub_depth += 1;
+                                        i += 2;
+                                    }
+                                    b'(' if sub_depth > 0 => {
+                                        sub_depth += 1;
+                                        i += 1;
+                                    }
+                                    b')' if sub_depth > 0 => {
+                                        sub_depth -= 1;
+                                        i += 1;
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                        }
+                        b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                            quoted_prefix_empty = false;
+                            all_unquoted_digits = false;
+                            i += 2;
+                            while i < bytes.len() {
+                                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                                    i += 2;
+                                } else if bytes[i] == b'\'' {
+                                    i += 1;
+                                    break;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                        b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                            all_unquoted_digits = false;
+                            i += 2;
+                            i = skip_balanced_paren_be(bytes, i);
+                        }
+                        b'<' | b'>' if bytes.get(i + 1) == Some(&b'(') => {
+                            all_unquoted_digits = false;
+                            i += 2;
+                            i = skip_balanced_paren_be(bytes, i);
+                        }
+                        b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                            all_unquoted_digits = false;
+                            i += 2;
+                            i = skip_balanced_brace_be(bytes, i);
+                        }
+                        b'`' => {
+                            all_unquoted_digits = false;
+                            i += 1;
+                            while i < bytes.len() {
+                                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                                    i += 2;
+                                } else if bytes[i] == b'`' {
+                                    i += 1;
+                                    break;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                        b'=' => {
+                            if seen_eq_pos.is_none() && quoted_prefix_empty {
+                                seen_eq_pos = Some(i - word_start);
+                            }
+                            all_unquoted_digits = false;
+                            i += 1;
+                        }
+                        _ => {
+                            if !c.is_ascii_digit() {
+                                all_unquoted_digits = false;
+                            }
+                            i += 1;
+                        }
+                    }
                 }
-                has_token = true;
-                i += 1;
+                if i == word_start {
+                    i += 1;
+                    continue;
+                }
+                // Unquoted digits directly before `<` or `>` are the redirect fd.
+                if pending.is_none()
+                    && quoted_prefix_empty
+                    && all_unquoted_digits
+                    && matches!(bytes.get(i), Some(b'<' | b'>'))
+                    && bytes.get(i + 1) != Some(&b'(')
+                {
+                    i = scan_redirect_op(bytes, i, &mut pending);
+                    continue;
+                }
+                let raw_word = &text[word_start..i];
+                match pending.take() {
+                    Some(ScanPending::Redirect) => {
+                        has_content = true;
+                        // Keep `after_paren` intact so `( … ) > /dev/null && x`
+                        // still attributes `&&` to the group's `close_join`.
+                    }
+                    Some(ScanPending::HereString) => {
+                        cur_herestring = Some((word_start, i));
+                    }
+                    Some(ScanPending::Heredoc(strip_tabs)) => {
+                        let delim = unquote_heredoc_delim_be(raw_word, budget)?;
+                        budget.charge_alloc(std::mem::size_of::<(String, bool)>())?;
+                        heredocs.push((delim, strip_tabs));
+                    }
+                    None => {
+                        let is_assign = cur_words.is_empty()
+                            && seen_eq_pos.is_some_and(|eq| {
+                                let name = raw_word[..eq].trim_end_matches('+');
+                                is_posix_name_be(name)
+                            });
+                        if is_assign {
+                            has_assign = true;
+                            has_content = true;
+                            after_paren = false;
+                        } else {
+                            let command_position = !has_assign && opens_body_be(&cur_words);
+                            if command_position && quoted_prefix_empty {
+                                let open_kind = match raw_word {
+                                    "{" if std::mem::take(&mut fn_def)
+                                        || cur_words.contains(&"function") =>
+                                    {
+                                        Some(BeCompound::Func)
+                                    }
+                                    "{" if cur_words.contains(&"coproc") => Some(BeCompound::Cond),
+                                    "{" => Some(BeCompound::Brace),
+                                    "if" | "case" => Some(BeCompound::Cond),
+                                    "while" | "until" | "for" | "select" => Some(BeCompound::Loop),
+                                    _ => None,
+                                };
+                                if let Some(kind) = open_kind {
+                                    let kind = if std::mem::take(&mut fn_def) {
+                                        BeCompound::Func
+                                    } else {
+                                        kind
+                                    };
+                                    let id = next_group_id;
+                                    next_group_id = next_group_id.wrapping_add(1).max(1);
+                                    groups.push((kind, id));
+                                } else if matches!(raw_word, "}" | "fi" | "done" | "esac") {
+                                    if groups.last().is_some_and(|g| g.0 != BeCompound::Paren) {
+                                        groups.pop();
+                                    }
+                                } else {
+                                    fn_def = false;
+                                }
+                            }
+                            after_paren = false;
+                            has_content = true;
+                            cur_words.push(raw_word);
+                        }
+                    }
+                }
             }
         }
     }
-    finish_word(
-        text,
-        &mut word_start,
-        bytes.len(),
-        &mut cond_depth,
-        &mut loop_depth,
-        &mut func_brace_depth,
-        &mut pending_func,
-    );
     flush_meta(
         &mut out,
-        &mut has_token,
+        &mut has_content,
+        &mut has_assign,
+        &mut cur_words,
         &mut cur_herestring,
+        &groups,
         BeJoin::Seq,
-        subshell_depth,
-        cond_depth,
-        loop_depth,
-        func_brace_depth,
         budget,
     )?;
     Ok(out)
+}
+
+fn skip_balanced_paren_be(bytes: &[u8], mut i: usize) -> usize {
+    let mut depth = 1usize;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+fn skip_balanced_brace_be(bytes: &[u8], mut i: usize) -> usize {
+    let mut depth = 1usize;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+fn unquote_heredoc_delim_be(raw: &str, budget: &mut ComputeBudget) -> Result<String, Exhausted> {
+    budget.charge(raw.len().max(1) as u64)?;
+    budget.charge_alloc(raw.len())?;
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            '\'' | '"' => {}
+            _ => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// One open compound command inside a `CwdFrame` (matching `dev` `words.rs::Frame`).
+struct BeCompoundFrame {
+    id: u32,
+    kind: BeCompound,
+    entry: Vec<Vec<u8>>,
+    saved_pool: Vec<Vec<u8>>,
+    saved_last_join: BeJoin,
 }
 
 struct CwdFrame {
@@ -1549,9 +1758,11 @@ struct CwdFrame {
     pool: Vec<Vec<u8>>,
     pending: bool,
     last_join: BeJoin,
+    last_close: Option<BeJoin>,
     unknown: bool,
     same_shell: bool,
     union: bool,
+    frames: Vec<BeCompoundFrame>,
 }
 
 struct BeCwdTracker {
@@ -1577,13 +1788,33 @@ impl BeCwdTracker {
                 pool: Vec::new(),
                 pending: false,
                 last_join: BeJoin::Seq,
+                last_close: None,
                 unknown: false,
                 same_shell: false,
                 union: false,
+                frames: Vec::new(),
             }],
             next_child_same_shell: false,
             next_child_union: false,
         })
+    }
+
+    fn close_compound_frame(
+        lv: &mut CwdFrame,
+        budget: &mut ComputeBudget,
+    ) -> Result<(), Exhausted> {
+        let Some(f) = lv.frames.pop() else {
+            return Ok(());
+        };
+        let inner = std::mem::take(&mut lv.pool);
+        lv.pool = f.saved_pool;
+        merge_cands_into(&mut lv.pool, inner, budget)?;
+        if f.kind != BeCompound::Brace && !lv.unknown {
+            merge_cands_into(&mut lv.cands, f.entry, budget)?;
+        }
+        lv.last_join = f.saved_last_join;
+        lv.pending = false;
+        Ok(())
     }
 
     fn flush_top_pool(&mut self, budget: &mut ComputeBudget) -> Result<(), Exhausted> {
@@ -1629,11 +1860,17 @@ impl BeCwdTracker {
     fn enter_unit(
         &mut self,
         u: &BestEffortUnit,
+        meta: &BeUnitMeta,
         child_override: &mut Option<(Vec<Vec<u8>>, bool)>,
         budget: &mut ComputeBudget,
     ) -> Result<(), Exhausted> {
         while self.stack.len() > 1 && self.stack.last().is_some_and(|f| f.depth > u.depth) {
-            let Some(done) = self.stack.pop() else { break };
+            let Some(mut done) = self.stack.pop() else {
+                break;
+            };
+            while !done.frames.is_empty() {
+                Self::close_compound_frame(&mut done, budget)?;
+            }
             if done.same_shell && !self.stack.is_empty() {
                 if done.unknown {
                     let lost_list = self.lost_cands(budget)?;
@@ -1671,13 +1908,68 @@ impl BeCwdTracker {
                 pool: Vec::new(),
                 pending: false,
                 last_join: BeJoin::Seq,
+                last_close: None,
                 unknown,
                 same_shell: self.next_child_same_shell,
                 union: self.next_child_union,
+                frames: Vec::new(),
             });
             self.next_child_same_shell = false;
             self.next_child_union = false;
-        } else {
+        }
+
+        // Transition compound frames (matching `dev` `words.rs:884-929`).
+        let common = self.stack.last().map_or(0, |lv| {
+            lv.frames
+                .iter()
+                .zip(&meta.compound)
+                .take_while(|(f, c)| f.id == c.1)
+                .count()
+        });
+        let need_close = self.stack.last().is_some_and(|lv| lv.frames.len() > common);
+        if need_close && let Some(lv) = self.stack.last_mut() {
+            while lv.frames.len() > common {
+                Self::close_compound_frame(lv, budget)?;
+            }
+            let closer = u
+                .raw_argv
+                .first()
+                .is_some_and(|f| matches!(f.as_str(), "}" | "fi" | "done" | "esac"));
+            if !closer {
+                let j = lv.last_close.unwrap_or(BeJoin::Seq);
+                if j == BeJoin::And && !lv.unknown {
+                    let cur = clone_bytes_vec(&lv.cands, budget)?;
+                    merge_cands_into(&mut lv.pool, cur, budget)?;
+                }
+                lv.last_join = j;
+                lv.pending = j != BeJoin::And && !lv.pool.is_empty();
+            }
+        }
+        for &(raw_kind, id) in &meta.compound[common..] {
+            if self.stack.last().is_some_and(|lv| lv.pending) {
+                self.flush_top_pool(budget)?;
+            }
+            if let Some(lv) = self.stack.last_mut() {
+                let kind = if raw_kind == BeCompound::Brace && lv.last_join == BeJoin::Or {
+                    BeCompound::Cond
+                } else {
+                    raw_kind
+                };
+                let entry = clone_bytes_vec(&lv.cands, budget)?;
+                let saved_pool = std::mem::take(&mut lv.pool);
+                let saved_last_join = lv.last_join;
+                budget.charge_alloc(std::mem::size_of::<BeCompoundFrame>())?;
+                lv.frames.push(BeCompoundFrame {
+                    id,
+                    kind,
+                    entry,
+                    saved_pool,
+                    saved_last_join,
+                });
+                lv.last_join = BeJoin::Seq;
+            }
+        }
+        if self.stack.last().is_some_and(|lv| lv.pending) {
             self.flush_top_pool(budget)?;
         }
         Ok(())
@@ -1739,7 +2031,7 @@ impl BeCwdTracker {
         &mut self,
         u: &BestEffortUnit,
         primary_cmd: Option<&str>,
-        meta: BeUnitMeta,
+        meta: &BeUnitMeta,
         next_is_exit: bool,
         same_shell_parent: bool,
         same_shell_payload: Option<&str>,
@@ -1749,8 +2041,16 @@ impl BeCwdTracker {
         let in_pipe = u.pipeline_id.is_some() || u.piped;
         let last_join = self.stack.last().map_or(BeJoin::Seq, |f| f.last_join);
         let skipped_from = last_join == BeJoin::Or;
-        let same_shell_union =
-            in_pipe || skipped_from || meta.may_skip_or_subshell || meta.join == BeJoin::Bg;
+        let repeats = self.stack.last().is_some_and(|f| {
+            f.frames
+                .iter()
+                .any(|cf| matches!(cf.kind, BeCompound::Loop | BeCompound::Func))
+        });
+        let in_cond_or_sub = self
+            .stack
+            .last()
+            .is_some_and(|f| f.frames.iter().any(|cf| cf.kind != BeCompound::Brace));
+        let same_shell_union = in_pipe || skipped_from || in_cond_or_sub || meta.join == BeJoin::Bg;
         self.next_child_same_shell = same_shell_parent && same_shell_payload.is_none();
         self.next_child_union = same_shell_union;
 
@@ -1766,6 +2066,7 @@ impl BeCwdTracker {
             self.apply_same_shell_payload(payload, join_eff, same_shell_union, folds, budget)?;
             if let Some(frame) = self.stack.last_mut() {
                 frame.last_join = join_eff;
+                frame.last_close = meta.close_join;
                 if join_eff != BeJoin::And && !frame.pool.is_empty() {
                     frame.pending = true;
                 }
@@ -1781,6 +2082,7 @@ impl BeCwdTracker {
                     merge_cands_into(&mut frame.pool, cur, budget)?;
                 }
                 frame.last_join = join_eff;
+                frame.last_close = meta.close_join;
                 if join_eff != BeJoin::And && !frame.pool.is_empty() {
                     frame.pending = true;
                 }
@@ -1791,11 +2093,8 @@ impl BeCwdTracker {
         let cmd = primary_cmd.unwrap();
         let eff = &u.effective_argv;
         let mut args: Vec<&str> = Vec::new();
-        let mut readable = cmd != "pushd"
-            && cmd != "popd"
-            && !in_pipe
-            && !meta.in_loop_or_func
-            && meta.join != BeJoin::Bg;
+        let mut readable =
+            cmd != "pushd" && cmd != "popd" && !in_pipe && !repeats && meta.join != BeJoin::Bg;
         let mut j = 1usize;
         while j < eff.len() {
             let a = eff[j].as_str();
@@ -1869,6 +2168,7 @@ impl BeCwdTracker {
             let old_pool = std::mem::take(&mut frame.pool);
             frame.unknown = true;
             frame.last_join = join_eff;
+            frame.last_close = meta.close_join;
             frame.pending = false;
             let _ = frame;
             self.push_seen(&old, budget)?;
@@ -1882,6 +2182,7 @@ impl BeCwdTracker {
 
         if frame.unknown {
             frame.last_join = join_eff;
+            frame.last_close = meta.close_join;
             let lost_list = self.lost_cands(budget)?;
             if let Some(frame) = self.stack.last_mut() {
                 frame.cands = lost_list;
@@ -1889,23 +2190,24 @@ impl BeCwdTracker {
             return Ok(());
         }
 
-        if join_eff == BeJoin::And && !meta.may_skip_or_subshell {
+        if join_eff == BeJoin::And {
             let old = std::mem::replace(&mut frame.cands, targets);
             if skipped_from {
                 merge_cands_into(&mut frame.cands, clone_bytes_vec(&old, budget)?, budget)?;
             }
             merge_cands_into(&mut frame.pool, old, budget)?;
-        } else if join_eff == BeJoin::Or && next_is_exit && !meta.may_skip_or_subshell {
+        } else if join_eff == BeJoin::Or && next_is_exit {
             let old = std::mem::replace(&mut frame.cands, targets);
             if skipped_from {
                 merge_cands_into(&mut frame.cands, old, budget)?;
             }
         } else {
-            // `;`, `\n`, unguarded `||`, or inside subshell/conditional: keep both targets and old cwds.
+            // `;`, `\n`, or unguarded `||`: keep both targets and old cwds.
             let old = std::mem::replace(&mut frame.cands, targets);
             merge_cands_into(&mut frame.cands, old, budget)?;
         }
         frame.last_join = join_eff;
+        frame.last_close = meta.close_join;
         if join_eff != BeJoin::And && !frame.pool.is_empty() {
             frame.pending = true;
         }
@@ -1930,11 +2232,12 @@ impl BeCwdTracker {
             f.cands = clone_bytes_vec(&entry_cands, budget)?;
             f.unknown = entry_unknown;
         }
+        let default_seq = BeUnitMeta::seq();
+        let mut no_override = None;
         for (idx, seg) in segs.iter().enumerate() {
-            inner.flush_top_pool(budget)?;
             let words = raw_words_budgeted(seg, budget)?;
             let eff = unwrap_simple_be(&words, folds, budget)?;
-            let meta = metas.get(idx).copied().unwrap_or(BeUnitMeta::SEQ);
+            let meta = metas.get(idx).unwrap_or(&default_seq);
             let dummy = BestEffortUnit {
                 index: idx,
                 raw_argv: words,
@@ -1947,6 +2250,7 @@ impl BeCwdTracker {
                 depth: 0,
                 derived: true,
             };
+            inner.enter_unit(&dummy, meta, &mut no_override, budget)?;
             let primary = match dummy.effective_argv.first() {
                 Some(f) => Some(fold_cmd_cr19(f, folds, budget)?),
                 None => None,
@@ -1966,9 +2270,12 @@ impl BeCwdTracker {
             )?;
         }
         self.push_seen(&inner.seen, budget)?;
-        let Some(done) = inner.stack.pop() else {
+        let Some(mut done) = inner.stack.pop() else {
             return Ok(());
         };
+        while !done.frames.is_empty() {
+            Self::close_compound_frame(&mut done, budget)?;
+        }
         let Some(parent) = self.stack.last_mut() else {
             return Ok(());
         };
@@ -2289,6 +2596,12 @@ fn extract_env_chdir_cands(
             }
             if short_cluster_takes_next(w, "uPaS") {
                 j += 2;
+            } else if !is_known_env_noarg_opt(w)
+                && raw_argv
+                    .get(j + 2)
+                    .is_some_and(|n2| (n2.starts_with('-') && n2.len() > 1) || n2.contains('='))
+            {
+                j += 2;
             } else {
                 j += 1;
             }
@@ -2298,6 +2611,13 @@ fn extract_env_chdir_cands(
             if matches!(w, "--unset" | "--split-string" | "--argv0")
                 || match_gnu_long_opt(w, "--split-string", 5) == Some(None)
                 || match_gnu_long_opt(w, "--unset", 4) == Some(None)
+            {
+                j += 2;
+            } else if !w.contains('=')
+                && !is_known_env_noarg_opt(w)
+                && raw_argv
+                    .get(j + 2)
+                    .is_some_and(|n2| (n2.starts_with('-') && n2.len() > 1) || n2.contains('='))
             {
                 j += 2;
             } else {
@@ -2318,7 +2638,7 @@ fn extract_env_chdir_cands(
     let mut unk = base_unknown;
     for d in dirs {
         match tracker.resolve_cd_arg(d, &cur, folds, budget)? {
-            Some(next) => cur = next,
+            Some(next) => merge_cands_into(&mut cur, next, budget)?,
             None => {
                 unk = true;
                 cur = tracker.lost_cands(budget)?;
