@@ -61,6 +61,7 @@ Branch: `agent/neon/M1-44-n18-delivered-question-withdraw-flake`
 
 ## Files Changed
 
+- `crates/atrium-agents/Cargo.toml` (`[dev-dependencies]` only: `tokio` `test-util` feature for paused-clock unit tests)
 - `crates/atrium-agents/src/claude/adapter.rs`
 - `crates/atrium-agents/tests/M1-28-followups.rs`
 - `docs/agents/handoffs/M1-44-n18-delivered-question-withdraw-flake.md`
@@ -92,7 +93,7 @@ All commands below are fish-safe (loops and background load wrapped in `bash -c`
      cargo test -p atrium-agents --lib withdraw_timeout_bounds_drain_without_shrinking_gate_deadline -- --exact
      cargo test -p atrium-agents --lib with_withdraw_timeout_propagates_through_start -- --exact
      ```
-   - Expected: both fail after their timeout (waiting on the 60 s `gate_deadline` instead of the 20 ms `withdraw_timeout`). Restore the line afterwards.
+   - Expected: `withdraw_timeout_bounds_drain_without_shrinking_gate_deadline` fails immediately on the paused clock (`drain_withdrawals did not detach at withdraw_timeout` at 11 s mock time instead of 73 s), and `with_withdraw_timeout_propagates_through_start` fails after its 5 s shutdown failure bound (waiting on the 60 s `gate_deadline` instead of the 20 ms `withdraw_timeout`). Restore the line afterwards.
 
 ## Round 2
 
@@ -129,7 +130,7 @@ Addressed every finding and the open point from Sonnet's round 1 review (`.orche
      - `Requests::open_question` (`crates/atrium-core/src/store/requests.rs:207-211`) -> `Writer::open_row` (`store/requests.rs:42-89`) inserts a `requests` row with `status = 'pending'` and leaves `event_opened` at its schema default `0` (`crates/atrium-core/schema/0001_init.sql:113-114`).
      - `event_opened = 1` and `cx.row.pq += 1` are set only when `AgentEvent::QuestionAsked` is recorded (`crates/atrium-core/src/store/writer.rs:885-906`).
      - Every UI/attention/recovery query on `requests` filters on `event_opened = 1 AND event_closed = 0`: `refresh_attention` (`crates/atrium-core/src/store/writer.rs:157-159`) and `open_items` (`crates/atrium-core/src/store/writer.rs:651-652`).
-     - Only `Requests::open_count` (`crates/atrium-core/src/store/requests.rs:225-237`) counts `event_opened = 0` rows, solely for `MAX_PENDING_REQUESTS` capacity accounting in `Ledger::open`. Because a timed-out `question_ticket` never emits `AgentEvent::QuestionAsked`, it cannot surface in the UI or notifications before `OrphanGuard::drop` withdraws it.
+     - `Requests::open_count` (`crates/atrium-core/src/store/requests.rs:225-237`) counts by `status IN ('pending', 'approved')` without filtering on `event_opened`, so it includes `event_opened = 0` rows for `MAX_PENDING_REQUESTS` capacity accounting in `Ledger::open`. Because a timed-out `question_ticket` never emits `AgentEvent::QuestionAsked`, it cannot surface in the UI or notifications before `OrphanGuard::drop` withdraws it.
 
 7. **Checks run in Round 2 (D-123):**
    - `cargo fmt --all` and `cargo check -p atrium-agents --tests --examples` clean with 0 warnings. No test suites were run by the worker.
@@ -139,3 +140,22 @@ Addressed every finding and the open point from Sonnet's round 1 review (`.orche
      cargo test -p atrium-agents --lib withdraw_timeout_bounds_drain_without_shrinking_gate_deadline -- --exact
      cargo test -p atrium-agents --lib with_withdraw_timeout_propagates_through_start -- --exact
      ```
+
+## Round 3
+
+Addressed Sonnet's round-2 finding and handoff wording correction (`.orchestration/review-input/M1-44-n18-delivered-question-withdraw-flake-round2.md`):
+
+1. **Finding 1 (Low) — deterministic paused-clock proof in `withdraw_timeout_bounds_drain_without_shrinking_gate_deadline`:**
+   - Enabled `tokio = { workspace = true, features = ["test-util"] } # M1-44` under `[dev-dependencies]` in `crates/atrium-agents/Cargo.toml` (dev-only; production builds and `Cargo.lock` unchanged).
+   - Converted `withdraw_timeout_bounds_drain_without_shrinking_gate_deadline` to `#[tokio::test(start_paused = true)]`, removed every wall-clock upper bound (`elapsed < 1s` and outer `timeout(2s)`), and used distinctive values (`gate_deadline = 73 s`, `withdraw_timeout = 11 s`) with `tokio::time::advance`:
+     - Part 1 (with override): asserts `drain_withdrawals` is still pending after advancing `10 s` (with `started == 1`), detaches immediately after advancing `1 s`, and `start.elapsed() == 11 s`.
+     - Part 2 (no override / fallback): asserts `drain_withdrawals` is still pending after advancing `72 s` (past `11 s`, with `started_fb == 1`), detaches immediately after advancing `1 s`, and `start_fb.elapsed() == 73 s`.
+   - Checked the other two new unit tests for wall-clock bounds that could fail under a stall:
+     - `late_question_ticket_denies_without_event_and_withdraws_orphan`: uses only in-memory channels/watches with no child process, so converted it to `#[tokio::test(start_paused = true)]` as well — all of its `timeout(2 s)` failure bounds now run against the mock clock and cannot be tripped by a host CPU stall.
+     - `with_withdraw_timeout_propagates_through_start`: spawns a real Python subprocess through `AgentAdapter::start` (so cannot pause tokio's clock), has no `elapsed < ...` assertion, and uses only outer failure bounds (2–5 s) against a 60 s `gate_deadline`.
+
+2. **Handoff wording correction:**
+   - Updated Round 2 item 6 to state accurately that `Requests::open_count` (`crates/atrium-core/src/store/requests.rs:225-237`) counts by `status IN ('pending', 'approved')` without filtering on `event_opened`.
+
+3. **Checks run in Round 3 (D-123):**
+   - `cargo fmt --all` and `cargo check -p atrium-agents --tests --examples` clean with 0 warnings. No test suites were run by the worker.
