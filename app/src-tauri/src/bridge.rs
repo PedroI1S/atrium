@@ -349,13 +349,20 @@ mod tests {
 
     use super::*;
 
-    type PeerSenders = Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<Vec<ServerMessage>>>>>;
+    type PeerSenders =
+        Arc<Mutex<Vec<(u64, tokio::sync::mpsc::UnboundedSender<Vec<ServerMessage>>)>>>;
+
+    #[derive(Default, Clone, Copy)]
+    struct ScriptedOptions {
+        inbox_delay: Duration,
+    }
 
     /// A daemon that speaks just enough of the wire: `Hello`, `SubscribeInbox`
     /// and commands, answered by `answer` (or never, when it returns `None`).
     struct Scripted {
         folder: tempfile::TempDir,
         peers: PeerSenders,
+        subscribers: Arc<tokio::sync::watch::Sender<usize>>,
     }
 
     async fn read_message(stream: &mut OwnedReadHalf) -> Option<ClientMessage> {
@@ -378,23 +385,34 @@ mod tests {
 
     impl Scripted {
         fn start(answer: fn(&DaemonCommand) -> Option<CommandResult>) -> Self {
+            Self::start_with(answer, ScriptedOptions::default())
+        }
+
+        fn start_with(
+            answer: fn(&DaemonCommand) -> Option<CommandResult>,
+            options: ScriptedOptions,
+        ) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let folder = tempfile::tempdir().unwrap();
             std::fs::set_permissions(folder.path(), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
             let listener = UnixListener::bind(folder.path().join("atriumd.sock")).unwrap();
             let peers: PeerSenders = Arc::new(Mutex::new(Vec::new()));
+            let (subscribers, _) = tokio::sync::watch::channel(0usize);
+            let subscribers = Arc::new(subscribers);
             let peers_accept = peers.clone();
+            let subscribers_accept = subscribers.clone();
             tokio::spawn(async move {
+                let mut next_id = 0u64;
                 while let Ok((stream, _)) = listener.accept().await {
+                    next_id += 1;
+                    let conn_id = next_id;
                     let peers_conn = peers_accept.clone();
+                    let subscribers_conn = subscribers_accept.clone();
                     tokio::spawn(async move {
                         let (mut reader, mut writer) = stream.into_split();
                         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-                        peers_conn
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .push(tx.clone());
+                        let mut subscribed = false;
                         let writer_task = tokio::spawn(async move {
                             while let Some(batch) = rx.recv().await {
                                 for message in batch {
@@ -413,12 +431,29 @@ mod tests {
                                     role,
                                 }),
                                 ClientMessage::SubscribeInbox { request_id } => {
-                                    Some(ServerMessage::Response {
+                                    if !options.inbox_delay.is_zero() {
+                                        tokio::time::sleep(options.inbox_delay).await;
+                                    }
+                                    let reply = ServerMessage::Response {
                                         request_id,
                                         result: CommandResult::Ok {
                                             value: serde_json::json!({"threads": [], "inbox": []}),
                                         },
-                                    })
+                                    };
+                                    // Queue the SubscribeInbox answer and register this
+                                    // connection as a push target under one lock, matching
+                                    // `atrium-daemon`'s `Hub::subscribe_inbox`.
+                                    let mut peers =
+                                        peers_conn.lock().unwrap_or_else(PoisonError::into_inner);
+                                    if tx.send(vec![reply]).is_err() {
+                                        break;
+                                    }
+                                    if !subscribed {
+                                        peers.push((conn_id, tx.clone()));
+                                        subscribed = true;
+                                        let _ = subscribers_conn.send(peers.len());
+                                    }
+                                    continue;
                                 }
                                 ClientMessage::Command {
                                     request_id,
@@ -435,15 +470,45 @@ mod tests {
                         }
                         drop(tx);
                         writer_task.abort();
+                        if subscribed {
+                            let mut peers =
+                                peers_conn.lock().unwrap_or_else(PoisonError::into_inner);
+                            peers.retain(|(id, _)| *id != conn_id);
+                            let _ = subscribers_conn.send(peers.len());
+                        }
                     });
                 }
             });
-            Self { folder, peers }
+            Self {
+                folder,
+                peers,
+                subscribers,
+            }
+        }
+
+        async fn inbox_subscribers(&self, n: usize) {
+            let mut subscribers = self.subscribers.subscribe();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                subscribers
+                    .wait_for(|&count| count >= n)
+                    .await
+                    .expect("the fake daemon stays alive");
+            })
+            .await
+            .expect("connections subscribe to the inbox");
         }
 
         fn push(&self, messages: Vec<ServerMessage>) {
             let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
-            peers.retain(|tx| tx.send(messages.clone()).is_ok());
+            peers.retain(|(_, tx)| tx.send(messages.clone()).is_ok());
+            self.subscribers.send_if_modified(|count| {
+                if *count != peers.len() {
+                    *count = peers.len();
+                    true
+                } else {
+                    false
+                }
+            });
         }
 
         fn options(&self) -> ClientOptions {
@@ -788,6 +853,7 @@ mod tests {
         let daemon = Scripted::start(list_threads_ok);
         let client = Client::start(daemon.options());
         client_connected(&client).await;
+        daemon.inbox_subscribers(1).await;
 
         let window = client.open_window("main");
         let handle = window.handle();
@@ -837,6 +903,7 @@ mod tests {
         let daemon = Scripted::start(list_threads_ok);
         let bridge = Bridge::start(daemon.options());
         connected(&bridge).await;
+        daemon.inbox_subscribers(1).await;
 
         let (sink, receiver) = sink();
         bridge.attach("main", sink);
@@ -879,6 +946,7 @@ mod tests {
         let daemon = Scripted::start(list_threads_ok);
         let client = Client::start(daemon.options());
         client_connected(&client).await;
+        daemon.inbox_subscribers(1).await;
 
         // Part A: count bound (MAX_BATCH_DELIVERIES = 512).
         let window = client.open_window("count");
@@ -987,6 +1055,7 @@ mod tests {
         let daemon = Scripted::start(list_threads_ok);
         let client = Client::start(daemon.options());
         client_connected(&client).await;
+        daemon.inbox_subscribers(1).await;
 
         let window = client.open_window("main");
         let handle = window.handle();
@@ -1026,6 +1095,7 @@ mod tests {
         let daemon = Scripted::start(list_threads_ok);
         let client = Client::start(daemon.options());
         client_connected(&client).await;
+        daemon.inbox_subscribers(1).await;
 
         let window = client.open_window("bench");
         let handle = window.handle();
@@ -1072,6 +1142,56 @@ mod tests {
             frames < TOTAL / 100,
             "expected >=100x fewer frames, got {frames}"
         );
+
+        drop(handle);
+        client.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("forward ends");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delayed_subscribe_inbox_does_not_lose_pushed_updates() {
+        let daemon = Scripted::start_with(
+            list_threads_ok,
+            ScriptedOptions {
+                inbox_delay: Duration::from_millis(200),
+            },
+        );
+        let client = Client::start(daemon.options());
+        client_connected(&client).await;
+
+        let window = client.open_window("main");
+        let handle = window.handle();
+        handle.show_inbox(true);
+
+        daemon.inbox_subscribers(1).await;
+
+        let messages: Vec<ServerMessage> = (0..100)
+            .map(|i| thread_updated(i, format!("delayed-{i}")))
+            .collect();
+        daemon.push(messages);
+        flush_barrier(&client).await;
+
+        let (sink, receiver) = sink();
+        let task = tokio::spawn(forward(window, sink));
+
+        let mut last_seq = 0u64;
+        let mut titles = Vec::new();
+        while titles.len() < 100 {
+            let parsed = next(&receiver);
+            for (seq, delivery) in unpack(parsed) {
+                assert_eq!(seq, last_seq + 1, "sequence numbers must rise by 1");
+                last_seq = seq;
+                handle.ack(seq);
+                if delivery["type"] == "thread_updated" {
+                    titles.push(delivery["summary"]["title"].as_str().unwrap().to_string());
+                }
+            }
+        }
+
+        let expected: Vec<String> = (0..100).map(|i| format!("delayed-{i}")).collect();
+        assert_eq!(titles, expected);
 
         drop(handle);
         client.shutdown();
