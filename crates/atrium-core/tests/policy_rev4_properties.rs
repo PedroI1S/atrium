@@ -431,9 +431,20 @@ fn property_1_outside_model_never_allowed_in_home_or_prefix_rules() {
     ];
 
     for &(name, make) in GENERATORS {
+        // Each generator must really produce lines outside the model: at
+        // least one sample is an Unread Ask in Home (asserted below for every
+        // Ask), so the property can't pass on Deny lines alone (P5 review 1,
+        // test gaps).
+        let mut unread_asks_in_home = 0;
         for iter in 0..12 {
             let sample = make(&mut rng);
             let c = cmd_check(&sample.line);
+            if matches!(
+                check(&t, Preset::Home, vec![], &c),
+                GateDecision::Ask { ref ticket } if ticket.unread == Some(UnreadNotice::Unread)
+            ) {
+                unread_asks_in_home += 1;
+            }
             let exact_lead = rule(
                 RuleScope::Global,
                 ToolKind::Execute,
@@ -478,6 +489,10 @@ fn property_1_outside_model_never_allowed_in_home_or_prefix_rules() {
                 }
             }
         }
+        assert!(
+            unread_asks_in_home > 0,
+            "Property 1 ({name}): no sample was an outside-model (Unread) line in Home"
+        );
     }
 }
 

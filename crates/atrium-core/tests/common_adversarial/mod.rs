@@ -257,6 +257,40 @@ impl Tmp {
     pub fn gate(&self, preset: Preset, rules: Vec<Rule>) -> TestGate {
         self.gate_with("t1", 1, &self.home, preset, rules, None)
     }
+    /// A gate at home whose Atrium-protected paths also include `extra`
+    /// (the daemon protects its own executable, for example).
+    pub fn gate_protecting(&self, preset: Preset, extra: Vec<PathBuf>) -> TestGate {
+        let store: Arc<MemStore> = Arc::default();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .current
+            .insert(ThreadId("t1".into()), 1);
+        let ledger: Arc<dyn ApprovalLedger> = Arc::new(Ledger::new(store.clone()));
+        let mut protected = vec![self.home.join(".config/atrium")];
+        protected.extend(extra);
+        let gate = SessionGate::new(
+            SessionGateConfig {
+                thread: ThreadId("t1".into()),
+                incarnation: 1,
+                cwd: self.home.clone(),
+                home: self.home.clone(),
+                atrium_data_paths: vec![self.home.join(".local/share/atrium")],
+                atrium_protected_paths: protected,
+                preset,
+                provider: Provider::Claude,
+            },
+            Arc::new(DefaultPolicy::new()),
+            ledger.clone(),
+            Arc::new(MemRules(store.clone())),
+        );
+        TestGate {
+            gate,
+            ledger,
+            store,
+        }
+    }
 }
 
 impl Default for Tmp {

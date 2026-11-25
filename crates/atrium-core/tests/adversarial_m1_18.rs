@@ -2773,3 +2773,66 @@ fn fix5_ordinary_lines_keep_devs_verdict() {
         DEV_ASK,
     )]);
 }
+
+/// Round 2, finding 1: an Atrium-protected path (the daemon's executable)
+/// inside a folder larger than the listing cap leaves a gap scoped to the
+/// targets spelled through that folder, never an open-ended one (D-145 item
+/// 4): a plain write elsewhere is the ordinary rememberable Ask of Home
+/// (§9), with no unread notice.
+#[test]
+fn round2_finding1_huge_protected_ancestor_keeps_plain_writes_rememberable() {
+    let t = Tmp::new();
+    let big = t.home.join("build/deps");
+    std::fs::create_dir_all(&big).unwrap();
+    for i in 0..16_500 {
+        std::fs::write(big.join(format!("f{i}")), "").unwrap();
+    }
+    std::fs::write(big.join("atriumd"), "bin").unwrap();
+    t.write("notes.txt", "x");
+    let g = t.gate_protecting(Preset::Home, vec![big.join("atriumd")]);
+    for line in ["touch notes.txt", "echo synthetic > out.txt"] {
+        match block_on(g.gate.check(&cmd_check(line))) {
+            GateDecision::Ask { ticket } => {
+                assert!(ticket.rememberable, "{line}: not rememberable");
+                assert_eq!(ticket.unread, None, "{line}");
+            }
+            other => panic!("{line}: wanted a rememberable Ask, got {other:?}"),
+        }
+    }
+    // the protected executable itself is still Atrium's
+    let d = block_on(g.gate.check(&cmd_check("rm build/deps/atriumd")));
+    assert!(
+        matches!(&d, GateDecision::Deny { reason } if reason.contains("atrium-self")),
+        "{d:?}"
+    );
+}
+
+/// Round 2, finding 4: `eval`, `source` and `.` run code in this shell and
+/// may `cd`, so the exact model's cwd is unknown after them and a later
+/// relative path is Unread (§5, §1): Ask in Home, Allow under an Any rule
+/// and FullAccess (D-176). The best-effort pass follows the `cd` it can see,
+/// so the planted `~/.npmrc` is not reached.
+#[test]
+fn round2_finding4_cwd_unknown_after_eval_source_and_dot() {
+    let t = Tmp::new();
+    t.write(".npmrc", "//registry.npmjs.org/:_authToken=x\n");
+    t.write("proj/a.txt", "x");
+    let mut failures = vec![];
+    for line in [
+        "eval 'cd proj && echo hi' && cat .npmrc",
+        "eval cd proj; cat .npmrc",
+        "source /dev/stdin <<< 'cd proj'; cat .npmrc",
+        ". /dev/stdin <<< 'cd proj'; cat .npmrc",
+    ] {
+        let got = gate_run(&t, line);
+        if got != ["Ask", "Allow", "Allow"] {
+            failures.push(format!("{line:?}: wanted [Ask, Allow, Allow], got {got:?}"));
+        }
+    }
+    // without the same-shell runner the cwd is known and the hit stands
+    let got = gate_run(&t, "true && cat .npmrc");
+    if got.iter().any(|g| !g.starts_with("Deny")) {
+        failures.push(format!("\"true && cat .npmrc\": wanted Deny, got {got:?}"));
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}

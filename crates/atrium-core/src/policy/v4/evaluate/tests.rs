@@ -685,6 +685,83 @@ fn section13_properties_3_and_4_exhaustion_across_subjects_and_settings() {
     }
 }
 
+/// Round 2, finding 9: a winning Deny rule decides before exhaustion (§1
+/// step 3 comes before step 5). Over a sweep of budget cutoffs on a padded
+/// line the call is never Allow; at least one cutoff exhausts the budget and
+/// is still the rule's Deny; and the full budget gives that Deny.
+#[test]
+fn round2_finding9_deny_rule_decides_past_exhaustion() {
+    let deny_cat = [Rule {
+        id: RuleId("deny-cat".into()),
+        scope: RuleScope::Global,
+        tool_kind: ToolKind::Execute,
+        tool_name: None,
+        matcher: RuleMatcher::CommandPrefix {
+            argv: vec!["cat".into()],
+        },
+        path_scope: None,
+        decision: RuleDecision::Deny,
+        origin: RuleOrigin::Settings,
+        created_at_ms: 0,
+    }];
+    let line = format!("cat x;{}", " true;".repeat(200));
+    let check = cmd_check(&line);
+    let data = vec![Path::new("/h/u/.local/share/atrium").to_path_buf()];
+    let prot_paths = vec![Path::new("/h/u/.config/atrium").to_path_buf()];
+    let thread = ThreadId("t1".into());
+    let protected = default_protected();
+    let is_rule_deny = |v: &PolicyVerdict| matches!(v, PolicyVerdict::Deny { rule: Some(r), .. } if r.0 == "deny-cat");
+    let mut exhausted_and_denied = 0;
+    for preset in [Preset::Home, Preset::FullAccess] {
+        let input = PolicyInput {
+            check: &check,
+            thread: &thread,
+            provider: Provider::Claude,
+            preset,
+            cwd: Path::new("/h/u"),
+            home: Path::new("/h/u"),
+            atrium_data_paths: &data,
+            atrium_protected_paths: &prot_paths,
+            resolved_paths: &[],
+        };
+        let mut units = 0u64;
+        while units < 400_000 {
+            let mut b = ComputeBudget::new(units, limits::COMPUTE_BUDGET_ALLOC_BYTES);
+            let ev = evaluate_call_with_budget(
+                &input,
+                &deny_cat,
+                &protected,
+                &VirtualTestResolver,
+                &mut b,
+            );
+            assert!(
+                !matches!(ev.verdict, PolicyVerdict::Allow { .. }),
+                "{preset:?} at {units} units: {:?}",
+                ev.verdict
+            );
+            let exhausted = ev
+                .outcome
+                .parts
+                .iter()
+                .any(|p| matches!(p.outcome, PartOutcome::Exhausted(_)));
+            if exhausted && is_rule_deny(&ev.verdict) {
+                exhausted_and_denied += 1;
+            }
+            units = if units < 64 { units + 1 } else { units * 2 };
+        }
+        let full = evaluate_call(&input, &deny_cat, &protected, &VirtualTestResolver);
+        assert!(
+            is_rule_deny(&full.verdict),
+            "{preset:?}: {:?}",
+            full.verdict
+        );
+    }
+    assert!(
+        exhausted_and_denied > 0,
+        "no cutoff exhausted the budget after the Deny rule could match"
+    );
+}
+
 /// Round 2, finding 3: a search selector whose last step is `..` names
 /// directories. Reaching only home itself (or folders under the root) is no
 /// hit: S8 exempts home (§5, §10 row 16) and an over-approximation never hits
