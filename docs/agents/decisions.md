@@ -1082,3 +1082,14 @@ D-141 removed flag arities from these rows precisely to avoid this.
 - **Three writers at once:** it runs alongside P2's round 11 and P3's round 4, one more than D-123's guideline of two on a laptop.
   - It is a test-only change, and its worker runs only `cargo check -p atrium-app --tests`.
   - Its builds use the shared build folder (`CARGO_TARGET_DIR` set to the main checkout's `target/`), so it adds no second cold build on disk.
+
+## D-164 — 2026-11-24 — Pedro: delete the old worker branches; superseded ones kept as tags
+**Decided by Pedro (driver).** The orchestrator did the deletion.
+- **Merged into `dev`, deleted on `origin` and locally:**
+  - `agent/sonnet/M1-13-adversarial`;
+  - `agent/hydrogen/M1-16-requests-and-notifications`;
+  - `agent/hydrogen/M1-20-gate-audit`, which was local only. Its handoff was first copied to `docs/agents/handoffs/M1-20-gate-audit.md`, because it existed only on that branch.
+- **Superseded by rev 4 (D-135), and never merged:** `agent/hydrogen/M1-27-engine-name-fold`, `M1-28-ansi-c-words`, `M1-29-cr17-stores`, `M1-30-tree-wildcards`, `M1-31-credential-folder-search` and `M1-32-link-globs`.
+  - Before deleting, each `origin` tip was tagged `archive/<task>` and the tags were pushed. The rev 4 briefs' disposition lists, and P5, still read hunks and tests from them.
+  - The branches were deleted on `origin` and locally.
+- **Kept:** `agent/orchestrator/M1-33…`, `M1-34…` and `agent/neon/M1-35…` to `M1-37…`, `M1-40…` (merged, rodrigo's choice to keep), plus every branch still in flight.
