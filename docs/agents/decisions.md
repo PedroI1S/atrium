@@ -1105,3 +1105,8 @@ D-141 removed flag arities from these rows precisely to avoid this.
 **Decided by Pedro (driver).** N17, the `atrium-host` `supervise.rs` `kill_recorded_returns_verified_when_gone_leader_group_drains_within_timeout` flake under load, gets its own task: M1-43-n17-supervise-drain-flake (`briefs/M1-43-n17-supervise-drain-flake.md`). Neon `medium` writes it, and Sonnet 5.5 reviews it (D-158, D-162).
 - **What M1-43 must do:** find the cause first, then make the test deterministic. It must not raise `GROUP_DRAIN_TIMEOUT`, loosen the assertion or add retries. Product code changes only if the code itself is wrong.
 
+## D-167 — 2026-11-24 — Pedro: brief M1-44 (N18), start later
+**Decided by Pedro (driver).** N18, the `atrium-agents` `M1-28-followups.rs` `claude_delivered_question_blocked_withdrawals_stay_bounded_and_complete` flake under load, gets its own task: M1-44-n18-delivered-question-withdraw-flake (`briefs/M1-44-n18-delivered-question-withdraw-flake.md`). Neon `medium` writes it, and Sonnet 5.5 reviews it.
+- **The brief is approved, but the task isn't started.** It starts with a separate go from the driver once the agy quota is back. (On 2026-11-24 the quota ran out during P2 round 13, with a reset in about 3 h.)
+- **Possible product bug:** if `QuestionAsked` reaches the session before its ledger record is written, that is a product ordering bug, and M1-44 fixes it in the product.
+

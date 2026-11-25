@@ -21,7 +21,7 @@ Each row below starts with its state: ✅ done (with evidence), 🟡 in progress
   - P5 (M1-41) and the integrated rev 4 review are still to come.
 - **N16:** the bridge test flake (major). The cause is found (the test's fake daemon), and the fix is M1-42.
 - **N17:** `atrium-host` `tests/supervise.rs` `kill_recorded_returns_verified_when_gone_leader_group_drains_within_timeout` flakes under load (minor). It returned `Unverified` instead of `Verified` once (2026-11-24, M1-42 round 4's verification, load average ~6.6 while a worker built), and passed 30 of 30 reruns on `dev` at load ~3. The test releases the group member after 150 ms and expects the drain to finish within `GROUP_DRAIN_TIMEOUT`, so a stalled scheduler can miss it. Routed to M1-43 (D-166).
-- **N18:** `atrium-agents` `tests/M1-28-followups.rs` `claude_delivered_question_blocked_withdrawals_stay_bounded_and_complete` flakes under load (minor). Once (2026-11-24, M1-42 round 5's verification, load ~5), `open_count` was 1 instead of 0 right after `ledger.withdraw` (line 2327). It passed 30 of 30 reruns on `dev` at load ~3. Not routed yet; the driver decides.
+- **N18:** `atrium-agents` `tests/M1-28-followups.rs` `claude_delivered_question_blocked_withdrawals_stay_bounded_and_complete` flakes under load (minor). Once (2026-11-24, M1-42 round 5's verification, load ~5), `open_count` was 1 instead of 0 right after `ledger.withdraw` (line 2327). It passed 30 of 30 reruns on `dev` at load ~3. Routed to M1-44 (D-167), which isn't started yet.
 - **Live and manual checks:**
   - M1-08L: the live Codex checks X1–X3;
   - Pedro's macOS benches;
