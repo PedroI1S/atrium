@@ -306,3 +306,51 @@ cargo test --workspace --no-fail-fast
 pnpm --dir app run typecheck
 pnpm --dir app test -- src/chat/rule-form.test.ts src/chat/rules.test.ts src/ui/rules-list.test.ts
 ```
+
+---
+
+## Round 5
+
+Rework closing the single remaining finding from `docs/agents/reviews/M1-39-rev4-p3-tools-rules-round4.md` (D-120). Core's `inspect_sed_script` (`crates/atrium-core/src/policy/v4/tools/sed.rs`) was left untouched as the reference implementation.
+
+### 1. Finding fixed
+
+- **Round 4 Finding 1 (`app/src/chat/rule-form.ts` `isSedScriptSafe` vs `v4/tools/sed.rs` on non-ASCII delimiters):**
+  - Core's `inspect_sed_script` scans `script.as_bytes()` (UTF-8 bytes), so a non-ASCII delimiter on `s`, `y`, or a `\`-regex address (`s€a€b€`, `s€a€b€p`, `y€ab€cd€`, `\€re€p`) takes the leading byte (`0xE2`) as the delimiter, stops at the leading byte of the closing `€`, and then encounters the stray UTF-8 continuation byte (`0x82`), returning `SedParseOutcome::Uncertain` (rejected).
+  - By contrast, an ASCII delimiter with non-ASCII text inside regex, replacement, or `y` bodies (`s/é/x/`, `s/x/é/`, `s/é/ü/gp`, `y/é/ü/`, `/é/p`, `\+é+p`, `s|é|€|p`) returns `SedParseOutcome::Safe`, because UTF-8 continuation/leading bytes (`>= 0x80`) never collide with ASCII delimiters or control bytes.
+  - Rewrote `isSedScriptSafe` in `app/src/chat/rule-form.ts` to encode the script with `new TextEncoder().encode(script)` and run the exact same UTF-8 byte state machine as `v4/tools/sed.rs::inspect_sed_script`, keeping core and app in 1-to-1 parity across BMP and astral characters alike.
+
+### 2. Tests and shared parity fixture
+
+- **Shared fixture table (`crates/atrium-core/src/policy/v4/rules/rule_validation_fixtures.json`, within owned `v4/` path):**
+  - 152 `(argv, valid)` Allow `command_prefix` parity cases covering every D-141 row kind, D-156 non-arity checks, CR-19 folds, non-ASCII `sed` delimiters (`€`, `£`, `😀` across `s`, `y`, `\`-address, `-e`, `--expression=`), and ASCII-delimiter `sed` scripts with non-ASCII regex/replacement text (`s/é/x/`, `s/x/é/`, `s/é/ü/gp`, `y/é/ü/`, `/é/p`, `\+é+p`, `s|é|€|p`).
+  - Read by both Rust (`crates/atrium-core/src/policy/v4/rules/tests.rs::shared_rule_validation_fixtures_match_core_and_public_validator` via `include_str!`) and Vitest (`app/src/chat/rule-form.test.ts`).
+- **`app/src/chat/rule-form.test.ts`:**
+  - Explicitly asserts `commandRisk` refuses and `checkStoredRule` marks invalid `["sed","s€a€b€"]`, `["sed","-n","s€a€b€p"]`, `["sed","-n","y€ab€cd€"]`, and `["sed","-n","\\€re€p"]`.
+  - Explicitly asserts both accept ASCII delimiters with non-ASCII text (`["sed","s/é/x/"]`, `["sed","s/x/é/"]`, `["sed","-n","s/é/ü/gp"]`, `["sed","-n","y/é/ü/"]`, `["sed","-n","/é/p"]`, `["sed","-n","\\+é+p"]`, `["sed","-n","s|é|€|p"]`).
+  - Runs the full shared `rule_validation_fixtures.json` table against `commandRisk` and `checkStoredRule`.
+- **`crates/atrium-core/src/policy/v4/rules/tests.rs` & `v4/tools/tests.rs`:**
+  - Added the four non-ASCII delimiter cases to `validate_rule_matcher_rejects_unpinned_allow_code_runner_prefixes` and the ASCII-delimiter non-ASCII text cases to `validate_rule_matcher_accepts_pinned_allow_prefixes_and_exact_rules`, plus the shared fixture parity test.
+  - Pinned the same scripts directly in `v4/tools/tests.rs::conditional_runner_sed_script_parser_and_program_pin`.
+- **`crates/atrium-daemon/tests/create_rule.rs`:**
+  - Added `["sed","s€a€b€"]`, `["sed","-n","s€a€b€p"]`, `["sed","-n","y€ab€cd€"]`, and `["sed","-n","\\€re€p"]` to `invalid_prefixes` and `["sed","s/é/x/"]`, `["sed","s/x/é/"]` to `valid_allow_prefixes`.
+
+### 3. Verification
+
+#### Run by worker (allowed under D-123)
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core -p atrium-daemon --tests` — clean (0 errors, 0 warnings)
+- No `cargo clippy`, `cargo test`, `pnpm`, or real providers run by worker (D-123).
+
+#### Exact commands for the orchestrator's verification task (fish-compatible)
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4::tools:: -- --nocapture
+cargo test -p atrium-core policy::v4::rules:: -- --nocapture
+cargo test -p atrium-daemon --test create_rule -- --nocapture
+cargo test --workspace --no-fail-fast
+./scripts/check-protocol-ts
+pnpm --dir app run typecheck
+pnpm --dir app test -- src/chat/rule-form.test.ts src/chat/rules.test.ts src/ui/rules-list.test.ts
+```
