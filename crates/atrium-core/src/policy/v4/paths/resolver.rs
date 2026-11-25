@@ -157,6 +157,21 @@ const PATH_MAX: usize = 1024;
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 const PATH_MAX: usize = 4096;
 
+/// Fixed per-call overhead charged alongside the returned path length in the
+/// `std::fs::canonicalize` fallback (`libc::realpath`'s transient buffer is
+/// freed before return, so charging `2 * PATH_MAX` permanently would exhaust
+/// the 8 MiB allocation budget before 4,096 operands; review 9, finding 1).
+pub(super) const FALLBACK_CANON_OVERHEAD: usize = 64;
+
+/// Worst-case transient + retained heap allocation of
+/// `std::fs::canonicalize(p)` (`libc::realpath`'s `PATH_MAX` buffer plus
+/// `std`'s `Vec<u8>` up to `PATH_MAX`), plus [`FALLBACK_CANON_OVERHEAD`].
+/// Required to be available in `budget` BEFORE invoking `std::fs::canonicalize`
+/// so the OS call can never allocate beyond the remaining budget (§8).
+pub(super) const FALLBACK_CANON_PEAK: usize = PATH_MAX
+    .saturating_mul(2)
+    .saturating_add(FALLBACK_CANON_OVERHEAD);
+
 /// `rustix` and `std` copy a path into a heap `CString` when it does not fit
 /// their stack buffers (256 bytes in `rustix`, 384 in `std`). Charges that
 /// copy before the call that makes it (§8).
@@ -205,7 +220,6 @@ fn push_entry_charged(
 #[cfg(target_os = "linux")]
 fn canonicalize_via_proc(
     p: &Path,
-    caps: &mut FsCaps,
     budget: &mut ComputeBudget,
 ) -> Result<Option<Vec<u8>>, ResolveError> {
     use rustix::fs::{CWD, Mode, OFlags, open, readlinkat_raw};
@@ -238,8 +252,10 @@ fn canonicalize_via_proc(
     let Ok(link_cstr) = std::ffi::CStr::from_bytes_with_nul(&link[..=end]) else {
         return Ok(None);
     };
-    // Reading the `/proc` link is a link read: charged first (round-3 finding 5).
-    caps.charge_link_read()?;
+    // The fixed `/proc/self/fd/N` read is bounded by `Canonicalizations` and
+    // this compute charge, not by `LinkReads` (`FS_MAX_READLINKS` = 1,024
+    // would otherwise trip before `FS_MAX_CANONICALIZATIONS` = 4,096;
+    // review 9, finding 1).
     budget.charge(end as u64)?;
     let mut buf = [0u8; PATH_MAX];
     let Ok(len) = readlinkat_raw(CWD, link_cstr, &mut buf) else {
@@ -251,6 +267,41 @@ fn canonicalize_via_proc(
     budget.charge(len as u64)?;
     budget.charge_alloc(len)?;
     Ok(Some(buf[..len].to_vec()))
+}
+
+/// Shared per-entry accounting and push for Unix `read_dir` implementations
+/// (Linux `RawDir` and non-Linux Unix `Dir`) so both platforms apply the exact
+/// same charges in the exact same order, always before allocating or stat'ing
+/// (§8; review 9, V1).
+#[cfg(unix)]
+fn push_unix_dir_entry(
+    dir_fd: &std::os::fd::OwnedFd,
+    name_cstr: &std::ffi::CStr,
+    raw_file_type: rustix::fs::FileType,
+    out: &mut Vec<DirEntry>,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+) -> Result<(), ResolveError> {
+    let name_bytes = name_cstr.to_bytes();
+    if name_bytes == b"." || name_bytes == b".." {
+        return Ok(());
+    }
+    budget.charge(name_bytes.len().saturating_sub(1) as u64)?;
+    let file_type = match map_rustix_file_type(raw_file_type) {
+        Some(ft) => ft,
+        None => {
+            // `DT_UNKNOWN`: one `fstatat`, charged first (round-2 finding 4).
+            charge_aux_stat(name_bytes.len(), caps, budget)?;
+            let st = rustix::fs::statat(dir_fd, name_cstr, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|e| map_errno(e, false))?;
+            map_rustix_file_type(rustix::fs::FileType::from_raw_mode(st.st_mode))
+                .unwrap_or(FileType::Other)
+        }
+    };
+    budget.charge_alloc(name_bytes.len())?;
+    let mut name = Vec::with_capacity(name_bytes.len());
+    name.extend_from_slice(name_bytes);
+    push_entry_charged(out, DirEntry { name, file_type }, budget)
 }
 
 impl PathResolver for FsResolver {
@@ -326,23 +377,32 @@ impl PathResolver for FsResolver {
         budget: &mut ComputeBudget,
     ) -> Result<Vec<u8>, ResolveError> {
         caps.charge_canonicalize()?;
-        budget.charge(path.len().max(1) as u64)?;
+        let components = path
+            .split(|&b| b == b'/')
+            .filter(|c| !c.is_empty())
+            .count()
+            .max(1);
+        budget.charge((path.len() as u64).saturating_add(components as u64))?;
         charge_path_conversion(path, budget)?;
         let p = bytes_to_path(path)?;
         #[cfg(target_os = "linux")]
-        if let Some(real) = canonicalize_via_proc(p, caps, budget)? {
+        if let Some(real) = canonicalize_via_proc(p, budget)? {
             return Ok(real);
         }
-        // Fallback (no `/proc`, or another platform): `realpath` allocates a
-        // buffer of at most `PATH_MAX` bytes and `std` copies the result into
-        // a `Vec` of the same bound, so both are charged before the call; its
-        // internal metadata calls are not visible here, so one `stat` per
-        // component of `path` is charged first (round-2 finding 4).
-        let components = path.split(|&b| b == b'/').filter(|c| !c.is_empty()).count();
-        for _ in 0..components.max(1) {
-            charge_aux_stat(path.len(), caps, budget)?;
+        // Fallback (macOS, non-Linux Unix, non-Unix, or Linux without `/proc`):
+        // `std::fs::canonicalize` allocates a transient `PATH_MAX` buffer in
+        // `realpath` (freed before return) and copies the result (`<= PATH_MAX`)
+        // into a `Vec<u8>`. Verify the remaining allocation budget covers that
+        // worst-case peak BEFORE calling `std::fs::canonicalize` (§8: charge
+        // before allocate), then charge the returned path length plus
+        // `FALLBACK_CANON_OVERHEAD` so large operand lists (up to
+        // `FS_MAX_CANONICALIZATIONS` = 4,096) do not exhaust the 8 MiB budget
+        // on freed temporary buffers. Per-component traversal is bounded by
+        // `Canonicalizations` and the component compute charge above, not
+        // double-charged against `Stats` (review 9, finding 1).
+        if budget.remaining_alloc_bytes() < FALLBACK_CANON_PEAK {
+            budget.charge_alloc(FALLBACK_CANON_PEAK)?;
         }
-        budget.charge_alloc(PATH_MAX.saturating_mul(2))?;
         let canon = std::fs::canonicalize(p).map_err(|e| map_io_error(&e, false))?;
         #[cfg(unix)]
         let bytes = {
@@ -351,6 +411,8 @@ impl PathResolver for FsResolver {
         };
         #[cfg(not(unix))]
         let bytes = path_to_bytes(&canon).to_vec();
+        budget.charge(bytes.len() as u64)?;
+        budget.charge_alloc(bytes.len().saturating_add(FALLBACK_CANON_OVERHEAD))?;
         Ok(bytes)
     }
 
@@ -366,7 +428,7 @@ impl PathResolver for FsResolver {
         let p = bytes_to_path(path)?;
         #[cfg(unix)]
         {
-            use rustix::fs::{AtFlags, Mode, OFlags, RawDir, open, statat};
+            use rustix::fs::{Mode, OFlags, open};
 
             let dir_fd = open(
                 p,
@@ -374,39 +436,56 @@ impl PathResolver for FsResolver {
                 Mode::empty(),
             )
             .map_err(|e| map_errno(e, false))?;
-            let mut stack_buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
-            let mut raw_dir = RawDir::new(&dir_fd, &mut stack_buf);
             let mut out: Vec<DirEntry> = Vec::new();
-            loop {
-                // Charge entry read and work BEFORE advancing the directory iterator.
-                caps.charge_entries_read(1)?;
-                budget.charge(1)?;
-                let Some(entry_res) = raw_dir.next() else {
-                    break;
-                };
-                let entry = entry_res.map_err(|e| map_errno(e, false))?;
-                let name_cstr = entry.file_name();
-                let name_bytes = name_cstr.to_bytes();
-                if name_bytes == b"." || name_bytes == b".." {
-                    continue;
+
+            #[cfg(target_os = "linux")]
+            {
+                let mut stack_buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+                let mut raw_dir = rustix::fs::RawDir::new(&dir_fd, &mut stack_buf);
+                loop {
+                    // Charge entry read and work BEFORE advancing the directory iterator.
+                    caps.charge_entries_read(1)?;
+                    budget.charge(1)?;
+                    let Some(entry_res) = raw_dir.next() else {
+                        break;
+                    };
+                    let entry = entry_res.map_err(|e| map_errno(e, false))?;
+                    push_unix_dir_entry(
+                        &dir_fd,
+                        entry.file_name(),
+                        entry.file_type(),
+                        &mut out,
+                        caps,
+                        budget,
+                    )?;
                 }
-                budget.charge(name_bytes.len().saturating_sub(1) as u64)?;
-                let file_type = match map_rustix_file_type(entry.file_type()) {
-                    Some(ft) => ft,
-                    None => {
-                        // `DT_UNKNOWN`: one `fstatat`, charged first (round-2 finding 4).
-                        charge_aux_stat(name_bytes.len(), caps, budget)?;
-                        let st = statat(&dir_fd, name_cstr, AtFlags::SYMLINK_NOFOLLOW)
-                            .map_err(|e| map_errno(e, false))?;
-                        map_rustix_file_type(rustix::fs::FileType::from_raw_mode(st.st_mode))
-                            .unwrap_or(FileType::Other)
-                    }
-                };
-                budget.charge_alloc(name_bytes.len())?;
-                let mut name = Vec::with_capacity(name_bytes.len());
-                name.extend_from_slice(name_bytes);
-                push_entry_charged(&mut out, DirEntry { name, file_type }, budget)?;
             }
+
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                let mut dir =
+                    rustix::fs::Dir::read_from(&dir_fd).map_err(|e| map_errno(e, false))?;
+                loop {
+                    // Charge entry read and work BEFORE advancing the directory
+                    // iterator, matching the Linux `RawDir` charges and order
+                    // exactly (review 9, V1).
+                    caps.charge_entries_read(1)?;
+                    budget.charge(1)?;
+                    let Some(entry_res) = dir.next() else {
+                        break;
+                    };
+                    let entry = entry_res.map_err(|e| map_errno(e, false))?;
+                    push_unix_dir_entry(
+                        &dir_fd,
+                        entry.file_name(),
+                        entry.file_type(),
+                        &mut out,
+                        caps,
+                        budget,
+                    )?;
+                }
+            }
+
             Ok(out)
         }
         #[cfg(not(unix))]

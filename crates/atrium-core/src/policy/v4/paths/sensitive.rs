@@ -1634,6 +1634,12 @@ pub(crate) struct AliasScan {
 pub(crate) struct RootAliases {
     roots: Option<Vec<ProtectedRoot>>,
     incomplete: Option<UnreadReason>,
+    /// Bounded per-call cache of proper-ancestor `stat` identities so a large
+    /// operand list under a deep working directory (such as macOS's 7-component
+    /// tempdirs) does not re-stat every ancestor on every operand (§8; review 9,
+    /// finding 1). Only proper ancestors (`i + 1 < comps.len()`, never leaves)
+    /// are cached, and every insertion is charged before it allocates.
+    ancestor_stats: HashMap<Vec<u8>, Option<FileIdentity>>,
 }
 
 /// Records the first reason a filesystem step could not be established.
@@ -1956,12 +1962,28 @@ impl RootAliases {
         for (i, comp) in comps.iter().enumerate() {
             prefix.push(b'/');
             prefix.extend_from_slice(comp);
-            let id = match resolver.stat(&prefix, caps, budget) {
-                Ok(md) => md.identity,
-                Err(e) if is_absent(&e) => break,
-                Err(e) => {
-                    note_unread(&mut unread, e, &prefix, budget)?;
-                    break;
+            let is_proper_ancestor = i + 1 < comps.len();
+            let id = if is_proper_ancestor && let Some(&cached) = self.ancestor_stats.get(&prefix) {
+                budget.charge(prefix.len().max(1) as u64)?;
+                cached
+            } else {
+                match resolver.stat(&prefix, caps, budget) {
+                    Ok(md) => {
+                        if is_proper_ancestor && self.ancestor_stats.len() < 1024 {
+                            budget.charge(prefix.len() as u64 + 1)?;
+                            budget.charge_alloc(
+                                prefix.len()
+                                    + 4 * std::mem::size_of::<(Vec<u8>, Option<FileIdentity>)>(),
+                            )?;
+                            self.ancestor_stats.insert(prefix.clone(), md.identity);
+                        }
+                        md.identity
+                    }
+                    Err(e) if is_absent(&e) => break,
+                    Err(e) => {
+                        note_unread(&mut unread, e, &prefix, budget)?;
+                        break;
+                    }
                 }
             };
             let Some(id) = id else { continue };
