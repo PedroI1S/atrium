@@ -431,3 +431,255 @@ fn best_effort_direct_catches_folded_sudo_and_globs() {
         PartOutcome::HardDenyHit(h) if h.hard_deny_id == Some("privilege-escalation")
     )));
 }
+
+/// Contract §13 Properties 3 & 4:
+/// - Compute or allocation exhaustion with no earlier decision is `Ask` in
+///   every setting (Home, Careful, prefix rule, unscoped Any rule, FullAccess),
+///   with `UnreadNotice::Exhausted` and `remember_matcher == None`.
+/// - Exhaustion NEVER creates a `HardDenyHit` or `StoreHit` on clean inputs.
+/// - When a hard-deny hit is discovered BEFORE exhaustion, that hit stands
+///   (`HardDeny`); when exhaustion happens before discovery, the verdict is
+///   `Ask` (never `Allow`).
+#[test]
+fn section13_properties_3_and_4_exhaustion_across_subjects_and_settings() {
+    let protected = default_protected();
+    let data = vec![Path::new("/h/u/.local/share/atrium").to_path_buf()];
+    let prot_paths = vec![Path::new("/h/u/.config/atrium").to_path_buf()];
+    let thread = ThreadId("t1".into());
+
+    let clean_checks: Vec<(&str, ToolCheck)> = vec![
+        ("cmd_simple", cmd_check("cat README.md")),
+        (
+            "cmd_multi",
+            cmd_check("cat README.md >/dev/null; head -n 5 proj/a.txt; ls proj"),
+        ),
+        (
+            "cmd_unread",
+            cmd_check("for f in *.rs; do wc -l \"$f\"; done"),
+        ),
+        (
+            "paths_read",
+            ToolCheck {
+                call_id: None,
+                kind: ToolKind::Read,
+                name: "Read".into(),
+                title: None,
+                input: json!({ "paths": ["proj/a.txt"] }),
+                subject: ToolSubject::Paths {
+                    paths: vec!["proj/a.txt".into()],
+                    glob: None,
+                    recursive: false,
+                },
+                turn: 1,
+            },
+        ),
+        (
+            "paths_search_glob",
+            ToolCheck {
+                call_id: None,
+                kind: ToolKind::Search,
+                name: "Grep".into(),
+                title: None,
+                input: json!({ "paths": ["proj"], "glob": "*.rs" }),
+                subject: ToolSubject::Paths {
+                    paths: vec!["proj".into()],
+                    glob: Some("*.rs".into()),
+                    recursive: true,
+                },
+                turn: 1,
+            },
+        ),
+        (
+            "fetch_https",
+            ToolCheck {
+                call_id: None,
+                kind: ToolKind::Fetch,
+                name: "WebFetch".into(),
+                title: None,
+                input: json!({ "url": "https://example.com/docs" }),
+                subject: ToolSubject::Fetch {
+                    url: "https://example.com/docs".into(),
+                },
+                turn: 1,
+            },
+        ),
+        (
+            "mcp_clean",
+            ToolCheck {
+                call_id: None,
+                kind: ToolKind::Other,
+                name: "mcp__demo__echo".into(),
+                title: None,
+                input: json!({ "text": "hello world", "path": "proj/a.txt" }),
+                subject: ToolSubject::Mcp {
+                    server: "demo".into(),
+                    tool: "echo".into(),
+                },
+                turn: 1,
+            },
+        ),
+        (
+            "none_subject",
+            ToolCheck {
+                call_id: None,
+                kind: ToolKind::Other,
+                name: "TodoWrite".into(),
+                title: None,
+                input: json!({}),
+                subject: ToolSubject::None,
+                turn: 1,
+            },
+        ),
+    ];
+
+    let unit_cutoffs = [0u64, 1, 2, 5, 10, 25, 60, 150, 400, 1_000, 3_000];
+    let alloc_cutoffs = [0usize, 16, 64, 256, 1_024];
+
+    for (label, check) in &clean_checks {
+        let any_rule = Rule {
+            id: RuleId("any".into()),
+            scope: RuleScope::Global,
+            tool_kind: check.kind,
+            tool_name: None,
+            matcher: RuleMatcher::Any,
+            path_scope: None,
+            decision: RuleDecision::Allow,
+            origin: RuleOrigin::Settings,
+            created_at_ms: 0,
+        };
+        let prefix_rule = Rule {
+            id: RuleId("pfx".into()),
+            scope: RuleScope::Global,
+            tool_kind: ToolKind::Execute,
+            tool_name: None,
+            matcher: RuleMatcher::CommandPrefix {
+                argv: vec!["cat".into()],
+            },
+            path_scope: None,
+            decision: RuleDecision::Allow,
+            origin: RuleOrigin::Settings,
+            created_at_ms: 0,
+        };
+
+        let settings: [(&str, Preset, &[Rule]); 5] = [
+            ("Home", Preset::Home, &[]),
+            ("Careful", Preset::Careful, &[]),
+            ("Prefix", Preset::Home, std::slice::from_ref(&prefix_rule)),
+            ("Any", Preset::Home, std::slice::from_ref(&any_rule)),
+            ("FullAccess", Preset::FullAccess, &[]),
+        ];
+
+        for (slabel, preset, rules) in settings {
+            let input = PolicyInput {
+                check,
+                thread: &thread,
+                provider: Provider::Claude,
+                preset,
+                cwd: Path::new("/h/u"),
+                home: Path::new("/h/u"),
+                atrium_data_paths: &data,
+                atrium_protected_paths: &prot_paths,
+                resolved_paths: &[],
+            };
+
+            let mut budgets = Vec::new();
+            for &u in &unit_cutoffs {
+                budgets.push((u, 64 * 1024usize));
+            }
+            for &a in &alloc_cutoffs {
+                budgets.push((100_000u64, a));
+            }
+
+            for (u, a) in budgets {
+                let mut b = ComputeBudget::new(u, a);
+                let ev = evaluate_call_with_budget(
+                    &input,
+                    rules,
+                    &protected,
+                    &VirtualTestResolver,
+                    &mut b,
+                );
+
+                // Property 4: exhaustion NEVER creates a HardDenyHit or StoreHit.
+                assert!(
+                    !ev.outcome.parts.iter().any(|p| matches!(
+                        p.outcome,
+                        PartOutcome::HardDenyHit(_) | PartOutcome::StoreHit(_)
+                    )),
+                    "Property 4 violated ({label}, {slabel}, u={u}, a={a}): {:?}",
+                    ev.outcome.parts
+                );
+
+                // Property 3: Exhausted with no earlier decision is Ask everywhere.
+                let has_exhausted = ev
+                    .outcome
+                    .parts
+                    .iter()
+                    .any(|p| matches!(p.outcome, PartOutcome::Exhausted(_)));
+                if has_exhausted {
+                    assert_eq!(
+                        ev.verdict,
+                        PolicyVerdict::Ask,
+                        "Property 3 violated ({label}, {slabel}, u={u}, a={a})"
+                    );
+                    assert_eq!(
+                        unread_notice_for_outcome(&ev.outcome),
+                        Some(UnreadNotice::Exhausted),
+                        "({label}, {slabel}, u={u}, a={a})"
+                    );
+                    assert!(
+                        ev.remember_matcher.is_none(),
+                        "({label}, {slabel}, u={u}, a={a})"
+                    );
+                }
+            }
+        }
+    }
+
+    // Hit-bearing input across exhaustion cutoffs: NEVER Allow (either HardDeny
+    // when hit was found before budget ran out, or Ask when exhausted earlier).
+    let hit_check = cmd_check("cat ~/.ssh/id_rsa");
+    let any_exec = [Rule {
+        id: RuleId("any".into()),
+        scope: RuleScope::Global,
+        tool_kind: ToolKind::Execute,
+        tool_name: None,
+        matcher: RuleMatcher::Any,
+        path_scope: None,
+        decision: RuleDecision::Allow,
+        origin: RuleOrigin::Settings,
+        created_at_ms: 0,
+    }];
+    for (preset, rules) in [
+        (Preset::Home, &[][..]),
+        (Preset::Home, &any_exec[..]),
+        (Preset::FullAccess, &[][..]),
+    ] {
+        let input = PolicyInput {
+            check: &hit_check,
+            thread: &thread,
+            provider: Provider::Claude,
+            preset,
+            cwd: Path::new("/h/u"),
+            home: Path::new("/h/u"),
+            atrium_data_paths: &data,
+            atrium_protected_paths: &prot_paths,
+            resolved_paths: &[],
+        };
+        for &u in &unit_cutoffs {
+            let mut b = ComputeBudget::new(u, 64 * 1024);
+            let ev =
+                evaluate_call_with_budget(&input, rules, &protected, &VirtualTestResolver, &mut b);
+            assert!(
+                matches!(
+                    ev.verdict,
+                    PolicyVerdict::HardDeny {
+                        id: "credential-read"
+                    } | PolicyVerdict::Ask
+                ),
+                "hit input under exhaustion (preset={preset:?}, u={u}): got {:?}",
+                ev.verdict
+            );
+        }
+    }
+}
