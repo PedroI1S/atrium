@@ -4223,7 +4223,7 @@ fn round5_d145_gaps_only_where_a_root_cannot_be_established() {
     assert!(!has_unread(&key.outcomes, |_| true));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn round3_r2f4_fs_resolver_makes_no_uncharged_metadata_call() {
     use std::os::unix::ffi::OsStrExt;
@@ -4235,9 +4235,9 @@ fn round3_r2f4_fs_resolver_makes_no_uncharged_metadata_call() {
     symlink(root.join("file"), root.join("link")).unwrap();
     let resolver = FsResolver::new();
 
-    // Review round 2, finding 4: with no stat left but a link read (or a
-    // canonicalization) available, the call may only succeed if it makes no
-    // metadata call. It succeeds, and only its own cap moves.
+    // Review round 2, finding 4 & review round 9, finding 1: with no stat left
+    // (and no link read left for canonicalize), each operation charges ONLY its
+    // own cap on both Linux and macOS.
     let mut caps = FsCaps::new(10, 10, 0, 10, 10);
     let target = resolver
         .read_link(
@@ -4249,27 +4249,27 @@ fn round3_r2f4_fs_resolver_makes_no_uncharged_metadata_call() {
     assert_eq!(target, root.join("file").as_os_str().as_bytes());
     assert_eq!(caps, FsCaps::new(10, 10, 0, 9, 10));
 
-    let mut caps = FsCaps::new(10, 10, 0, 10, 10);
+    let mut caps = FsCaps::new(10, 10, 0, 0, 10);
     let canon = resolver
         .canonicalize(
             root.join("link").as_os_str().as_bytes(),
             &mut caps,
             &mut ComputeBudget::with_default_limits(),
         )
-        .expect("canonicalize needs no stat on Linux");
+        .expect("canonicalize consumes only Canonicalizations on Unix");
     assert_eq!(canon, root.join("file").as_os_str().as_bytes());
-    // Round 3 review, finding 5: reading `/proc/self/fd/N` is a link read,
-    // charged before it runs; a canonicalization with no link read left
-    // stops before it.
-    assert_eq!(caps, FsCaps::new(10, 10, 0, 9, 9));
+    // Review round 9, finding 1: neither Linux `/proc/self/fd/N` nor the
+    // macOS fallback consumes `LinkReads` or `Stats`; `Canonicalizations`
+    // bounds the call uniformly on both platforms.
+    assert_eq!(caps, FsCaps::new(10, 10, 0, 0, 9));
     assert_eq!(
         resolver.canonicalize(
             root.join("file").as_os_str().as_bytes(),
-            &mut FsCaps::new(10, 10, 10, 0, 10),
+            &mut FsCaps::new(10, 10, 10, 10, 0),
             &mut ComputeBudget::with_default_limits(),
         ),
         Err(ResolveError::CapReached(CapReached {
-            cap: FsCap::LinkReads
+            cap: FsCap::Canonicalizations
         }))
     );
 
@@ -6277,4 +6277,1033 @@ fn round10_f3_msal_prefix_test_matches_devs_lossy_lowercase() {
     )
     .unwrap();
     assert!(has_store_hit(&res.outcomes), "{:?}", res.outcomes);
+}
+
+// ---------------------------------------------------------------------------
+// 13. Rework Round 11 regressions (review round 9, D-161)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn round11_v1_f1_real_fs_1100_plain_operands_and_large_read_dir() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Review 9, V1 & finding 1: real-filesystem test on both Linux and macOS.
+    // Resolves 1,100 plain existing files through both `resolve_subject_paths`
+    // and `resolve_command_targets` with default caps and budget (no target
+    // Unread or Exhausted), exercises `read_dir` on a 1,100-entry folder, and
+    // confirms `canonicalize` runs all 4,096 default canonicalizations without
+    // consuming `Stats` or `LinkReads`.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fake_home = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let home_bytes = fake_home.as_os_str().as_bytes().to_vec();
+    let dir = fake_home.join("d");
+    std::fs::create_dir_all(fake_home.join(".ssh")).unwrap();
+    std::fs::write(fake_home.join(".ssh/id_rsa"), b"fake-key").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_bytes = dir.as_os_str().as_bytes().to_vec();
+
+    const COUNT: usize = 1_100;
+    let mut names = Vec::with_capacity(COUNT);
+    for i in 0..COUNT {
+        let name = format!("f{i:04}");
+        std::fs::write(dir.join(&name), b"x").unwrap();
+        names.push(name);
+    }
+
+    let resolver = FsResolver::new();
+    // Separate builder caps/budget per round 4 finding 7 (tempdir parent size
+    // is host-dependent).
+    let prot = build_protected_set(
+        &home_bytes,
+        &dir_bytes,
+        vec![],
+        vec![],
+        FoldRules::REV4,
+        &resolver,
+        &mut FsCaps::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        &mut ComputeBudget::new(u64::MAX, usize::MAX),
+    )
+    .unwrap();
+
+    // 1. `resolve_subject_paths` on 1,100 plain existing files with default caps.
+    let mut subj_caps = FsCaps::with_default_limits();
+    let mut subj_budget = ComputeBudget::with_default_limits();
+    let subj = resolve_subject_paths(
+        &names,
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &resolver,
+        &mut subj_caps,
+        &mut subj_budget,
+    )
+    .expect("1,100 plain subject paths must fit default budget");
+    assert_eq!(subj.targets.len(), COUNT);
+    assert!(
+        subj.targets
+            .iter()
+            .all(|t| matches!(t.resolution, TargetResolution::Resolved { .. })),
+        "no target should be Unread"
+    );
+    assert_eq!(subj.outcomes.len(), COUNT);
+    assert!(all_clear(&subj.outcomes), "{:?}", &subj.outcomes[..5]);
+    assert!(!subj_budget.is_exhausted());
+
+    // 2. `resolve_command_targets` (`cat f0000 ... f1099`) with default caps.
+    let mut argv = Vec::with_capacity(COUNT + 1);
+    argv.push(unquoted(b"cat"));
+    for name in &names {
+        argv.push(unquoted(name.as_bytes()));
+    }
+    let cmd_unit = unit(0, argv, vec![], Separator::Start, None);
+    let cmd_eff = reader_effects("cat", COUNT + 1);
+    let mut cmd_caps = FsCaps::with_default_limits();
+    let mut cmd_budget = ComputeBudget::with_default_limits();
+    let cmd = resolve_command_targets(
+        &[cmd_unit],
+        &[cmd_eff],
+        &dir_bytes,
+        &prot,
+        &resolver,
+        &mut cmd_caps,
+        &mut cmd_budget,
+    )
+    .expect("1,100 plain command operands must fit default budget");
+    assert_eq!(cmd.targets.len(), COUNT);
+    assert!(
+        cmd.targets
+            .iter()
+            .all(|t| matches!(t.resolution, TargetResolution::Resolved { .. })),
+        "no command operand should be Unread"
+    );
+    assert_eq!(cmd.outcomes.len(), COUNT);
+    assert!(all_clear(&cmd.outcomes), "{:?}", &cmd.outcomes[..5]);
+    assert!(!cmd_budget.is_exhausted());
+
+    // 3. `FsResolver::read_dir` on the 1,100-entry directory (V1: Linux RawDir
+    //    and non-Linux Unix Dir charge identically and read every entry).
+    let mut rd_caps = FsCaps::with_default_limits();
+    let mut rd_budget = ComputeBudget::with_default_limits();
+    let entries = resolver
+        .read_dir(&dir_bytes, &mut rd_caps, &mut rd_budget)
+        .expect("read_dir on 1,100 entries fits default limits");
+    assert_eq!(entries.len(), COUNT);
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.file_type == crate::policy::model::FileType::File)
+    );
+    assert_eq!(
+        resolver.read_dir(
+            &dir_bytes,
+            &mut FsCaps::new(500, 10, 10, 10, 10),
+            &mut ComputeBudget::with_default_limits(),
+        ),
+        Err(ResolveError::CapReached(CapReached {
+            cap: FsCap::EntriesRead
+        }))
+    );
+    assert_eq!(
+        resolver.read_dir(
+            &dir_bytes,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::new(1_000_000, 100),
+        ),
+        Err(ResolveError::Exhausted(Exhausted {
+            reason: ExhaustReason::AllocationBudget
+        }))
+    );
+
+    // 4. `FsResolver::canonicalize` reaches all 4,096 default canonicalizations
+    //    on both Linux and macOS without touching `Stats` or `LinkReads` and
+    //    without exhausting the 8 MiB allocation budget.
+    let one_file = dir.join(&names[0]);
+    let one_file_bytes = one_file.as_os_str().as_bytes();
+    let mut canon_caps = FsCaps::with_default_limits();
+    let mut canon_budget = ComputeBudget::with_default_limits();
+    for i in 0..limits::FS_MAX_CANONICALIZATIONS {
+        let got = resolver
+            .canonicalize(one_file_bytes, &mut canon_caps, &mut canon_budget)
+            .unwrap_or_else(|e| panic!("canonicalize #{i} failed: {e:?}"));
+        assert_eq!(got, one_file_bytes);
+    }
+    assert_eq!(
+        canon_caps,
+        FsCaps::new(
+            limits::FS_MAX_ENTRIES_READ,
+            limits::FS_MAX_DIR_OPENS,
+            limits::FS_MAX_STATS,
+            limits::FS_MAX_READLINKS,
+            0,
+        )
+    );
+    assert!(!canon_budget.is_exhausted());
+    assert_eq!(
+        resolver.canonicalize(one_file_bytes, &mut canon_caps, &mut canon_budget),
+        Err(ResolveError::CapReached(CapReached {
+            cap: FsCap::Canonicalizations
+        }))
+    );
+}
+
+#[test]
+fn round11_f1_4096_single_component_operands_clear_under_default_limits() {
+    // Review 9, finding 1: 4,096 single-component-deep existing plain operands
+    // under default caps and budget are Clear (matching `MAX_USES` = 4,096 and
+    // `FS_MAX_CANONICALIZATIONS` = 4,096); operand 4,097 trips the cap.
+    let mut fs = FakeFs::new();
+    let mut names = Vec::with_capacity(limits::FS_MAX_CANONICALIZATIONS + 1);
+    for i in 0..=limits::FS_MAX_CANONICALIZATIONS {
+        let name = format!("f{i:04}");
+        fs.add_file(format!("/{name}").as_bytes());
+        names.push(name);
+    }
+    let prot = build_protected_set(
+        HOME,
+        b"/",
+        vec![],
+        vec![],
+        FoldRules::REV4,
+        &fs,
+        &mut FsCaps::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        &mut ComputeBudget::new(u64::MAX, usize::MAX),
+    )
+    .unwrap();
+
+    let n = limits::FS_MAX_CANONICALIZATIONS;
+    let subj = resolve_subject_paths(
+        &names[..n],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .expect("4,096 single-component subject paths fit default budget");
+    assert_eq!(subj.targets.len(), n);
+    assert_eq!(subj.outcomes.len(), n);
+    assert!(all_clear(&subj.outcomes));
+
+    let mut argv = Vec::with_capacity(n + 1);
+    argv.push(unquoted(b"cat"));
+    for name in &names[..n] {
+        argv.push(unquoted(name.as_bytes()));
+    }
+    let cmd = resolve_command_targets(
+        &[unit(0, argv, vec![], Separator::Start, None)],
+        &[reader_effects("cat", n + 1)],
+        b"/",
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .expect("4,096 single-component command operands fit default budget");
+    assert_eq!(cmd.targets.len(), n);
+    assert_eq!(cmd.outcomes.len(), n);
+    assert!(all_clear(&cmd.outcomes));
+
+    // Operand 4,097 trips `Canonicalizations` (Unread, never Exhausted).
+    let mut argv_over = Vec::with_capacity(n + 2);
+    argv_over.push(unquoted(b"cat"));
+    for name in &names {
+        argv_over.push(unquoted(name.as_bytes()));
+    }
+    let over = resolve_command_targets(
+        &[unit(0, argv_over, vec![], Separator::Start, None)],
+        &[reader_effects("cat", n + 2)],
+        b"/",
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_unread(&over.outcomes, |r| matches!(
+        r,
+        UnreadReason::WalkCapReached(FsCap::Canonicalizations)
+    )));
+    assert!(
+        !over
+            .outcomes
+            .iter()
+            .any(|r| matches!(r.outcome, PartOutcome::Exhausted(_)))
+    );
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[test]
+fn round11_f1_fallback_canonicalize_checks_peak_before_allocating_and_charges_real_len() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    use crate::policy::v4::paths::resolver::{FALLBACK_CANON_OVERHEAD, FALLBACK_CANON_PEAK};
+
+    // Non-Linux Unix companion to `round3_r2f5` (review 9, finding 1 & §8):
+    // a short directory link expands to a 200+ byte canonical path. Any budget
+    // below `FALLBACK_CANON_PEAK` fails with `AllocationBudget` BEFORE
+    // `std::fs::canonicalize` runs; once `FALLBACK_CANON_PEAK` is available,
+    // the call succeeds and deducts `output.len() + FALLBACK_CANON_OVERHEAD`
+    // (not `2 * PATH_MAX`).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let long_dir = root.join("l".repeat(200));
+    std::fs::create_dir(&long_dir).unwrap();
+    std::fs::write(long_dir.join("file"), b"x").unwrap();
+    symlink(&long_dir, root.join("short")).unwrap();
+    let input = root.join("short/file");
+    let input = input.as_os_str().as_bytes();
+    let output = long_dir.join("file");
+    let output = output.as_os_str().as_bytes();
+    assert!(input.len() < 256);
+    assert!(output.len() > input.len() + 150);
+    let resolver = FsResolver::new();
+
+    for tight_alloc in [input.len() + 8, output.len(), FALLBACK_CANON_PEAK - 1] {
+        let mut small = ComputeBudget::new(1_000_000, tight_alloc);
+        assert_eq!(
+            resolver.canonicalize(input, &mut FsCaps::with_default_limits(), &mut small),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            })),
+            "budget {tight_alloc} must fail before std::fs::canonicalize runs"
+        );
+    }
+
+    let mut exact_peak = ComputeBudget::new(1_000_000, FALLBACK_CANON_PEAK);
+    assert_eq!(
+        resolver.canonicalize(input, &mut FsCaps::with_default_limits(), &mut exact_peak),
+        Ok(output.to_vec())
+    );
+    let charged = FALLBACK_CANON_PEAK - exact_peak.remaining_alloc_bytes();
+    assert_eq!(charged, output.len() + FALLBACK_CANON_OVERHEAD);
+}
+
+#[test]
+fn round11_charge_ordering_exact_minimum_alloc_budgets() {
+    // Review 9, Test gaps ("Charge ordering"): as a proxy for allocation
+    // counting in a library test, find the exact minimum allocation budget at
+    // which each round 8 / round 10 charge site first succeeds (with 0 alloc
+    // bytes left, failing at `min - 1` with `AllocationBudget`), and assert it
+    // covers at least the full size of the copied data.
+    fn find_min_alloc(mut attempt: impl FnMut(&mut ComputeBudget) -> bool) -> usize {
+        let mut hi = 16usize;
+        loop {
+            let mut b = ComputeBudget::new(u64::MAX, hi);
+            if attempt(&mut b) {
+                break;
+            }
+            hi = hi.checked_mul(2).expect("must converge");
+        }
+        let mut lo = 0usize;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let mut b = ComputeBudget::new(u64::MAX, mid);
+            if attempt(&mut b) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        assert!(lo > 0);
+        let mut below = ComputeBudget::new(u64::MAX, lo - 1);
+        assert!(!attempt(&mut below), "must fail at min - 1 ({})", lo - 1);
+        assert_eq!(
+            below.exhausted_reason(),
+            Some(ExhaustReason::AllocationBudget)
+        );
+        let mut at = ComputeBudget::new(u64::MAX, lo);
+        assert!(attempt(&mut at), "must succeed at min ({lo})");
+        assert_eq!(at.remaining_alloc_bytes(), 0);
+        lo
+    }
+
+    // 1. Incomplete-table reason copy (`RootAliases::scan`, review 8 finding 2).
+    let mut long_data = b"/h/u/".to_vec();
+    long_data.extend(std::iter::repeat_n(b'd', 180));
+    let mut fs_inc = FakeFs::new();
+    fs_inc.mkdir_all(&long_data);
+    fs_inc.set_stat_error(&long_data, FsIoError::PermissionDenied);
+    let prot_inc = build_with(&fs_inc, &[&long_data], &[]);
+    let mut aliases_inc = RootAliases::default();
+    aliases_inc
+        .roots(
+            &prot_inc,
+            &fs_inc,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    let reason_len = match aliases_inc.incomplete() {
+        Some(UnreadReason::UnresolvablePath { path }) => path.len(),
+        other => panic!("expected UnresolvablePath, got {other:?}"),
+    };
+    assert_eq!(reason_len, long_data.len());
+
+    let fs_clean = FakeFs::new();
+    let prot_clean = build_with(&fs_clean, &[], &[]);
+    let mut aliases_clean = RootAliases::default();
+    aliases_clean
+        .roots(
+            &prot_clean,
+            &fs_clean,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    assert!(aliases_clean.incomplete().is_none());
+
+    // Single-component `/x` does not mutate `ancestor_stats`, so every probe
+    // sees identical state.
+    let min_inc = find_min_alloc(|b| {
+        matches!(
+            aliases_inc.scan(b"/x", &prot_inc, &fs_inc, &mut FsCaps::with_default_limits(), b),
+            Ok(ref s) if s.unread.is_some()
+        )
+    });
+    let min_clean = find_min_alloc(|b| {
+        aliases_clean
+            .scan(
+                b"/x",
+                &prot_clean,
+                &fs_clean,
+                &mut FsCaps::with_default_limits(),
+                b,
+            )
+            .is_ok()
+    });
+    assert!(min_inc >= reason_len);
+    assert_eq!(min_inc - min_clean, reason_len);
+
+    // 2. MSAL entry copy (`RootAliases::spelled_roots`, review 8 finding 3).
+    let mut msal_name = b"msal_token_cache.".to_vec();
+    msal_name.extend(std::iter::repeat_n(0xFF_u8, 128));
+    let mut other_name = b"other_entry_name_".to_vec();
+    other_name.extend(std::iter::repeat_n(0xFF_u8, 128));
+    assert_eq!(msal_name.len(), other_name.len());
+    let msal_copy_len = b"/h/u/.azure".len() + 1 + msal_name.len();
+
+    let mut fs_msal = FakeFs::new();
+    let mut msal_path = b"/h/u/.azure/".to_vec();
+    msal_path.extend_from_slice(&msal_name);
+    fs_msal.add_symlink(&msal_path, b"/nowhere");
+    let prot_msal = build_with(&fs_msal, &[], &[]);
+
+    let mut fs_other = FakeFs::new();
+    let mut other_path = b"/h/u/.azure/".to_vec();
+    other_path.extend_from_slice(&other_name);
+    fs_other.add_symlink(&other_path, b"/nowhere");
+    let prot_other = build_with(&fs_other, &[], &[]);
+
+    let min_msal = find_min_alloc(|b| {
+        RootAliases::default()
+            .roots(&prot_msal, &fs_msal, &mut FsCaps::with_default_limits(), b)
+            .is_ok()
+    });
+    let min_other = find_min_alloc(|b| {
+        RootAliases::default()
+            .roots(
+                &prot_other,
+                &fs_other,
+                &mut FsCaps::with_default_limits(),
+                b,
+            )
+            .is_ok()
+    });
+    assert!(min_msal >= msal_copy_len);
+    assert_eq!(min_msal - min_other, msal_copy_len);
+
+    // 3a. `~/.ssh` member spelling in `RootAliases::push_ssh_members` (review 8 finding 1).
+    let long_key = "k".repeat(121);
+    let ssh_copy_len = b"/h/u/.ssh".len() + 1 + long_key.len();
+    let mut fs_ssh_short = FakeFs::new();
+    fs_ssh_short.add_symlink(b"/h/u/.ssh/k", b"/nowhere");
+    let prot_ssh_short = build_with(&fs_ssh_short, &[], &[]);
+
+    let mut fs_ssh_long = FakeFs::new();
+    fs_ssh_long.add_symlink(format!("/h/u/.ssh/{long_key}").as_bytes(), b"/nowhere");
+    let prot_ssh_long = build_with(&fs_ssh_long, &[], &[]);
+
+    let min_ssh_short = find_min_alloc(|b| {
+        RootAliases::default()
+            .roots(
+                &prot_ssh_short,
+                &fs_ssh_short,
+                &mut FsCaps::with_default_limits(),
+                b,
+            )
+            .is_ok()
+    });
+    let min_ssh_long = find_min_alloc(|b| {
+        RootAliases::default()
+            .roots(
+                &prot_ssh_long,
+                &fs_ssh_long,
+                &mut FsCaps::with_default_limits(),
+                b,
+            )
+            .is_ok()
+    });
+    assert!(min_ssh_long >= ssh_copy_len);
+    assert!(min_ssh_long - min_ssh_short >= 120);
+
+    // 3b. `~/.ssh` member spelling in S8 `dir_has_existing_hard_deny_ssh_entry`
+    //     (round 10 fix 2).
+    let mut fs_s8_short = FakeFs::new();
+    fs_s8_short.mkdir_all(b"/tmp/pub/sub");
+    fs_s8_short.add_file(b"/tmp/pub/.ssh/k");
+    fs_s8_short.add_symlink(b"/h/u/lnk", b"/tmp/pub/sub");
+    let prot_s8_short = build_with(&fs_s8_short, &[], &[]);
+    let root_s8_short = literal(b"lnk/../.ssh", AccessMode::Read, &fs_s8_short);
+
+    let mut fs_s8_long = FakeFs::new();
+    fs_s8_long.mkdir_all(b"/tmp/pub/sub");
+    fs_s8_long.add_file(format!("/tmp/pub/.ssh/{long_key}").as_bytes());
+    fs_s8_long.add_symlink(b"/h/u/lnk", b"/tmp/pub/sub");
+    let prot_s8_long = build_with(&fs_s8_long, &[], &[]);
+    let root_s8_long = literal(b"lnk/../.ssh", AccessMode::Read, &fs_s8_long);
+
+    // Warm SharedSensitive so both runs measure the walk cleanly.
+    let _ = SharedSensitive::for_protected(&prot_s8_long);
+    let min_s8_long = find_min_alloc(|b| {
+        matches!(
+            check_recursive_root(
+                &root_s8_long,
+                LinkPolicy::default(),
+                &[],
+                &prot_s8_long,
+                &fs_s8_long,
+                &mut FsCaps::with_default_limits(),
+                b,
+            ),
+            Ok(ref r) if !b.is_exhausted() && has_hard_deny(&r.outcomes, "credential-read")
+        )
+    });
+    let _ = SharedSensitive::for_protected(&prot_s8_short);
+    let min_s8_short = find_min_alloc(|b| {
+        matches!(
+            check_recursive_root(
+                &root_s8_short,
+                LinkPolicy::default(),
+                &[],
+                &prot_s8_short,
+                &fs_s8_short,
+                &mut FsCaps::with_default_limits(),
+                b,
+            ),
+            Ok(ref r) if !b.is_exhausted() && has_hard_deny(&r.outcomes, "credential-read")
+        )
+    });
+    assert!(min_s8_long >= ssh_copy_len);
+    assert!(min_s8_long - min_s8_short >= 120);
+}
+
+#[test]
+fn round11_r10f1_ssh_member_file_linked_tree_and_cutoff_cases() {
+    // Review 9, Test gaps for round 10 finding 1:
+    // 1. A member file reached through a hard link or bound member folder.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_work");
+    fs.add_hard_link(b"/h/u/.ssh/id_work", b"/tmp/hl_key");
+    fs.add_file(b"/h/u/.ssh/id_work.pub");
+    fs.add_hard_link(b"/h/u/.ssh/id_work.pub", b"/tmp/hl_pub");
+    fs.add_file(b"/h/u/.ssh/keys/id_team");
+    fs.add_file(b"/h/u/.ssh/keys/id_team.pub");
+    fs.bind_dir(b"/h/u/.ssh/keys", b"/mnt/keys");
+    let prot = default_build(&fs);
+
+    let hl_priv = subject("/tmp/hl_key", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_hard_deny(&hl_priv.outcomes, "credential-read"),
+        "{:?}",
+        hl_priv.outcomes
+    );
+    assert!(hl_priv.multiply_linked_file);
+
+    let hl_pub = subject("/tmp/hl_pub", AccessMode::Read, &prot, &fs);
+    assert!(all_clear(&hl_pub.outcomes), "{:?}", hl_pub.outcomes);
+    assert!(hl_pub.multiply_linked_file);
+
+    let bound_priv = subject("/mnt/keys/id_team", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_hard_deny(&bound_priv.outcomes, "credential-read"),
+        "{:?}",
+        bound_priv.outcomes
+    );
+    let bound_pub = subject("/mnt/keys/id_team.pub", AccessMode::Read, &prot, &fs);
+    assert!(all_clear(&bound_pub.outcomes), "{:?}", bound_pub.outcomes);
+
+    // 2a. A subfolder reached through a folder linked into `~/.ssh`: linked
+    //     trees are NOT alias roots (matching `dev`'s `ssh_members`), though
+    //     files inside them are members and `links_below` reaches the linked tree.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/tmp/ext/sub/secret");
+    fs.mkdir_all(b"/h/u/.ssh");
+    fs.add_symlink(b"/h/u/.ssh/ext", b"/tmp/ext");
+    fs.bind_dir(b"/tmp/ext/sub", b"/mnt/sub");
+    fs.add_symlink(b"/h/u/proj/link_ext", b"/tmp/ext");
+    let prot = default_build(&fs);
+
+    let absent_under_linked = subject("/mnt/sub/future", AccessMode::Read, &prot, &fs);
+    assert!(
+        all_clear(&absent_under_linked.outcomes),
+        "linked tree subfolder must not become an alias root: {:?}",
+        absent_under_linked.outcomes
+    );
+    let existing_member = subject("/mnt/sub/secret", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_hard_deny(&existing_member.outcomes, "credential-read"),
+        "{:?}",
+        existing_member.outcomes
+    );
+    let list_linked = subject("/tmp/ext", AccessMode::Read, &prot, &fs);
+    assert!(
+        all_clear(&list_linked.outcomes),
+        "{:?}",
+        list_linked.outcomes
+    );
+    let below_linked = subject("/tmp/ext/future", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_hard_deny(&below_linked.outcomes, "credential-read"),
+        "{:?}",
+        below_linked.outcomes
+    );
+    let proj_root = literal(b"proj", AccessMode::Read, &fs);
+    let followed = check_recursive_root(
+        &proj_root,
+        LinkPolicy {
+            at_root: true,
+            below_root: true,
+        },
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&followed.outcomes, "credential-read"),
+        "{:?}",
+        followed.outcomes
+    );
+
+    // 2b. When `~/.ssh` itself is a symlink, its direct subfolders are still
+    //     member folders (alias roots), matching `dev`'s `ssh_members`.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/tmp/real_ssh/keys");
+    fs.add_symlink(b"/h/u/.ssh", b"/tmp/real_ssh");
+    fs.bind_dir(b"/tmp/real_ssh/keys", b"/mnt/keys");
+    let prot = default_build(&fs);
+    let via_linked_ssh = subject("/mnt/keys/future", AccessMode::Read, &prot, &fs);
+    assert!(
+        has_hard_deny(&via_linked_ssh.outcomes, "credential-read"),
+        "{:?}",
+        via_linked_ssh.outcomes
+    );
+
+    // 3. `/mnt/keys` when `~/.ssh` has more than 1,024 entries: `dev`'s
+    //    `ssh_members` stops silently at 1,024 entries (D-145), so an empty
+    //    member folder past the cutoff is Clear (no HardDeny and no Unread).
+    let mut fs = FakeFs::new();
+    for i in 0..1_024 {
+        fs.add_file(format!("/h/u/.ssh/a{i:04}").as_bytes());
+    }
+    fs.mkdir_all(b"/h/u/.ssh/zz_keys");
+    fs.bind_dir(b"/h/u/.ssh/zz_keys", b"/mnt/keys");
+    let prot = default_build(&fs);
+    assert!(prot.identity_gaps.is_empty(), "{:?}", prot.identity_gaps);
+    let past_cutoff = subject("/mnt/keys/future", AccessMode::Read, &prot, &fs);
+    assert!(
+        all_clear(&past_cutoff.outcomes),
+        "silent 1,024-entry cutoff must stay Clear as on dev: {:?}",
+        past_cutoff.outcomes
+    );
+}
+
+#[test]
+fn round11_r10fix2_ssh_below_root_and_alias_spelling() {
+    // Review 9, Test gaps for round 10 fix 2:
+    // 1. Home root `~` with `~/.ssh/id_rsa` is S8-exempt (§5, §10 row 16):
+    //    StoreHit, never HardDenyHit.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    let prot = default_build(&fs);
+    let home_root = literal(b"~", AccessMode::Read, &fs);
+    let home_res = check_recursive_root(
+        &home_root,
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        !has_any_hard_deny(&home_res.outcomes),
+        "{:?}",
+        home_res.outcomes
+    );
+    assert!(has_store_hit(&home_res.outcomes), "{:?}", home_res.outcomes);
+
+    // 2. Root `~/proj` reaching `~/.ssh` below it through a followed link
+    //    (`rg -L x ~/proj`): HardDenyHit without filter, Unread under filter.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    fs.add_symlink(b"/h/u/proj/sub/to_ssh", b"/h/u/.ssh");
+    let prot = default_build(&fs);
+    let proj_root = literal(b"~/proj", AccessMode::Read, &fs);
+    let follow = LinkPolicy {
+        at_root: true,
+        below_root: true,
+    };
+    let unfiltered = check_recursive_root(
+        &proj_root,
+        follow,
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&unfiltered.outcomes, "credential-read"),
+        "{:?}",
+        unfiltered.outcomes
+    );
+    let filter_rs = SearchFilter {
+        dialect: FilterDialect::RgGlob,
+        pattern: unquoted(b"*.rs"),
+        case_insensitive: false,
+        argv_index: Some(1),
+    };
+    let filtered = check_recursive_root(
+        &proj_root,
+        follow,
+        std::slice::from_ref(&filter_rs),
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        !has_any_hard_deny(&filtered.outcomes),
+        "{:?}",
+        filtered.outcomes
+    );
+    assert!(has_unread(&filtered.outcomes, |r| matches!(
+        r,
+        UnreadReason::FollowedLinkUnderFilter { .. }
+    )));
+
+    // 3. Alias spelling of the same cases: `~/.ssh` bound at `/mnt/keys`
+    //    (real path `/mnt/keys`, alias spelling `~/.ssh`).
+    //    (a) Recursive root `/mnt/keys` with filter `*.rs` and `id_rsa` present:
+    //        S8 names entries on the alias spelling `~/.ssh` -> HardDenyHit.
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_rsa");
+    fs.bind_dir(b"/h/u/.ssh", b"/mnt/keys");
+    fs.add_symlink(b"/h/u/proj/sub/to_alias", b"/mnt/keys");
+    let prot = default_build(&fs);
+    let alias_root = literal(b"/mnt/keys", AccessMode::Read, &fs);
+    let alias_s8 = check_recursive_root(
+        &alias_root,
+        LinkPolicy::default(),
+        std::slice::from_ref(&filter_rs),
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&alias_s8.outcomes, "credential-read"),
+        "{:?}",
+        alias_s8.outcomes
+    );
+    //    (b) `rg -L x ~/proj` reaching the alias `/mnt/keys`: HardDenyHit.
+    let proj_alias = check_recursive_root(
+        &literal(b"~/proj", AccessMode::Read, &fs),
+        follow,
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&proj_alias.outcomes, "credential-read"),
+        "{:?}",
+        proj_alias.outcomes
+    );
+    //    (c) Negative check on the alias spelling: `/mnt/keys` holding only
+    //        `id_rsa.pub` and `config` stays StoreHit (never HardDenyHit).
+    let mut fs = FakeFs::new();
+    fs.add_file(b"/h/u/.ssh/id_rsa.pub");
+    fs.add_file(b"/h/u/.ssh/config");
+    fs.bind_dir(b"/h/u/.ssh", b"/mnt/keys");
+    let prot = default_build(&fs);
+    let alias_pub = check_recursive_root(
+        &literal(b"/mnt/keys", AccessMode::Read, &fs),
+        LinkPolicy::default(),
+        std::slice::from_ref(&filter_rs),
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        !has_any_hard_deny(&alias_pub.outcomes),
+        "{:?}",
+        alias_pub.outcomes
+    );
+    assert!(
+        has_store_hit(&alias_pub.outcomes),
+        "{:?}",
+        alias_pub.outcomes
+    );
+
+    //    (d) Written subfolder spelling `lnk/../.ssh/sub` (real `/tmp/pub/.ssh/sub`):
+    //        HardDenyHit when a private key exists, Clear when only `.pub` exists.
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(b"/tmp/pub/sub");
+    fs.add_file(b"/tmp/pub/.ssh/sub/id_key.pub");
+    fs.add_symlink(b"/h/u/lnk", b"/tmp/pub/sub");
+    let prot = default_build(&fs);
+    let sub_pub = check_recursive_root(
+        &literal(b"lnk/../.ssh/sub", AccessMode::Read, &fs),
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(all_clear(&sub_pub.outcomes), "{:?}", sub_pub.outcomes);
+
+    fs.add_file(b"/tmp/pub/.ssh/sub/id_key");
+    let prot = default_build(&fs);
+    let sub_priv = check_recursive_root(
+        &literal(b"lnk/../.ssh/sub", AccessMode::Read, &fs),
+        LinkPolicy::default(),
+        std::slice::from_ref(&filter_rs),
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&sub_priv.outcomes, "credential-read"),
+        "{:?}",
+        sub_priv.outcomes
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn round11_macos_real_fs_firmlink_strip_and_mixed_case_ssh() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Review 9, Test gaps (macOS): exercise `/System/Volumes/Data/<tmp>`
+    // firmlink stripping and mixed-case `~/.SSH` canonicalization against a
+    // real macOS volume (always in a tempdir with a fake HOME, never real ~).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fake_home = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let home_bytes = fake_home.as_os_str().as_bytes().to_vec();
+
+    std::fs::create_dir_all(fake_home.join(".ssh")).unwrap();
+    std::fs::create_dir_all(fake_home.join("proj")).unwrap();
+    std::fs::write(fake_home.join(".ssh/id_rsa"), b"fake-key").unwrap();
+    std::fs::write(fake_home.join(".ssh/id_rsa.pub"), b"fake-pub").unwrap();
+    std::fs::write(fake_home.join(".ssh/config"), b"Host example\n").unwrap();
+    std::fs::write(fake_home.join("proj/ordinary.txt"), b"hello").unwrap();
+
+    let resolver = FsResolver::new();
+    let prot = build_protected_set(
+        &home_bytes,
+        &home_bytes,
+        vec![],
+        vec![],
+        FoldRules::REV4,
+        &resolver,
+        &mut FsCaps::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        &mut ComputeBudget::new(u64::MAX, usize::MAX),
+    )
+    .unwrap();
+
+    // 1. `/System/Volumes/Data/<fake_home>`: real canonicalization + firmlink strip.
+    let stripped_home = std::str::from_utf8(crate::policy::v4::paths::sensitive::strip_firmlink(
+        &home_bytes,
+    ))
+    .expect("tempdir path is UTF-8");
+    let data_home = format!("/System/Volumes/Data{stripped_home}");
+    let data_key = format!("{data_home}/.ssh/id_rsa");
+    let data_absent_aws = format!("{data_home}/.aws/credentials");
+    let data_ordinary = format!("{data_home}/proj/ordinary.txt");
+
+    let canon_data_key = resolver
+        .canonicalize(
+            data_key.as_bytes(),
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .expect("canonicalizing /System/Volumes/Data/<tmp> succeeds on macOS");
+    assert_eq!(
+        crate::policy::v4::paths::sensitive::strip_firmlink(&canon_data_key),
+        crate::policy::v4::paths::sensitive::strip_firmlink(
+            fake_home.join(".ssh/id_rsa").as_os_str().as_bytes()
+        )
+    );
+
+    let hit_existing = resolve_subject_paths(
+        &[data_key],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &resolver,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&hit_existing.outcomes, "credential-read"),
+        "{:?}",
+        hit_existing.outcomes
+    );
+
+    // Absent `~/.aws/credentials` spelled via `/System/Volumes/Data`: `.aws`
+    // does not exist, so ONLY firmlink stripping + listed fold catches it.
+    let mut absent_target = resolve_literal(
+        data_absent_aws.as_bytes(),
+        &home_bytes,
+        &home_bytes,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &resolver,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(matches!(
+        absent_target.resolution,
+        TargetResolution::Resolved { .. }
+    ));
+    // Verify canonical path alone (without written spelling) also strips the firmlink.
+    absent_target.written = None;
+    assert!(matches!(
+        check_target(&absent_target, &prot, &mut ComputeBudget::with_default_limits())
+            .unwrap()
+            .outcome,
+        PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("credential-read")
+    ));
+
+    let clear_ordinary = resolve_subject_paths(
+        &[data_ordinary],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &resolver,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        all_clear(&clear_ordinary.outcomes),
+        "{:?}",
+        clear_ordinary.outcomes
+    );
+
+    // 2. Mixed-case `~/.SSH` on the real volume.
+    let expected_canon_key = fake_home.join(".ssh/id_rsa");
+    if fake_home.join(".SSH/ID_RSA").exists() {
+        // Case-insensitive APFS volume: canonicalize restores on-disk casing.
+        let mixed_path = fake_home.join(".SSH/ID_RSA");
+        let canon = resolver
+            .canonicalize(
+                mixed_path.as_os_str().as_bytes(),
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::with_default_limits(),
+            )
+            .expect("mixed-case canonicalize succeeds on case-insensitive APFS");
+        assert_eq!(canon, expected_canon_key.as_os_str().as_bytes());
+
+        let lit = resolve_literal(
+            b"~/.SSH/ID_RSA",
+            &home_bytes,
+            &home_bytes,
+            TargetOrigin::SubjectPath { path_index: 0 },
+            AccessMode::Read,
+            &resolver,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+        assert!(matches!(
+            lit.resolution,
+            TargetResolution::Resolved { ref canonical, .. }
+                if canonical.as_slice() == expected_canon_key.as_os_str().as_bytes()
+        ));
+    }
+
+    for p in ["~/.SSH/ID_RSA", "~/.SSH/absent_key"] {
+        let res = resolve_subject_paths(
+            &[p.to_string()],
+            None,
+            false,
+            AccessMode::Read,
+            &prot,
+            &resolver,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+        assert!(
+            has_hard_deny(&res.outcomes, "credential-read"),
+            "{p}: {:?}",
+            res.outcomes
+        );
+    }
+    for p in ["~/.SSH/ID_RSA.PUB", "~/.SSH/CONFIG"] {
+        let res = resolve_subject_paths(
+            &[p.to_string()],
+            None,
+            false,
+            AccessMode::Read,
+            &prot,
+            &resolver,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+        assert!(all_clear(&res.outcomes), "{p}: {:?}", res.outcomes);
+    }
+    let write_cfg = resolve_subject_paths(
+        &["~/.SSH/CONFIG".to_string()],
+        None,
+        false,
+        AccessMode::Write,
+        &prot,
+        &resolver,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&write_cfg.outcomes, "credential-read"),
+        "{:?}",
+        write_cfg.outcomes
+    );
 }
