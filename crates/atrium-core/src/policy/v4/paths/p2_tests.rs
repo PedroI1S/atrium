@@ -7603,13 +7603,15 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     use crate::policy::model::{DirEntry, FileType};
     use crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC;
 
-    // Review 10, finding 1; review 11, finding 1; review 12, finding 1 (§8):
-    // `FsResolver::read_dir` always deducts `DIR_STREAM_ALLOC` (4,352 bytes)
-    // permanently per listing on both Linux and non-Linux Unix (regardless of
-    // `st_blksize`), while on non-Linux Unix it checks transient peak headroom
-    // (`stream_peak - DIR_STREAM_ALLOC + NAME_ALLOC_PEAK`) without permanently
-    // deducting it. A single `DirOpens` cap unit is charged per listing.
-    assert_eq!(DIR_STREAM_ALLOC, 4_352);
+    // Review 10, finding 1; review 11, finding 1; review 12, finding 1 (§2, §8):
+    // `FsResolver::read_dir` always deducts `DIR_STREAM_ALLOC` (256 bytes,
+    // equal to `DIR_STREAM_OVERHEAD`) permanently per listing on both Linux and
+    // non-Linux Unix (regardless of `st_blksize`), while on non-Linux Unix it
+    // checks the full transient peak headroom (`stream_peak - DIR_STREAM_ALLOC
+    // + NAME_ALLOC_PEAK`, covering the freed `dd_buf` and per-entry `CString`)
+    // without permanently deducting it. A single `DirOpens` cap unit is charged
+    // per listing.
+    assert_eq!(DIR_STREAM_ALLOC, 256);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
@@ -7635,12 +7637,12 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
         0
     };
     let entries_bytes = path_conv_tiny + 8 * std::mem::size_of::<DirEntry>() + 1 + 2;
-    let tiny_deducted = entries_bytes + 4_352;
+    let tiny_deducted = entries_bytes + 256;
     let tiny_exact_need = tiny_deducted + peak_tiny;
 
     // 1. Allocation budgets below `tiny_deducted + peak_tiny` must exhaust
     //    `AllocationBudget`; `tiny_exact_need` succeeds with `peak_tiny` bytes
-    //    remaining (total deducted == `entries_bytes + 4_352`).
+    //    remaining (total deducted == `entries_bytes + 256`).
     for tight in [entries_bytes, tiny_deducted - 1, tiny_exact_need - 1] {
         let mut budget = ComputeBudget::new(1_000_000, tight);
         assert_eq!(
@@ -7677,8 +7679,8 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     );
 
     // 2. Cross-platform total-charge parity check: total deducted bytes match
-    //    `entries_bytes + 4_352` identically on Linux and non-Linux Unix, and
-    //    an empty directory deducts `path_conv_empty + 4_352`.
+    //    `entries_bytes + 256` identically on Linux and non-Linux Unix, and an
+    //    empty directory deducts `path_conv_empty + 256`.
     let start_alloc = 1_000_000usize;
     let mut parity_budget = ComputeBudget::new(1_000_000, start_alloc);
     let parity_entries = resolver
@@ -7699,7 +7701,7 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     } else {
         0
     };
-    let empty_deducted = path_conv_empty + 4_352;
+    let empty_deducted = path_conv_empty + 256;
     let empty_exact_need = empty_deducted + peak_empty;
     let mut empty_below = ComputeBudget::new(1_000_000, empty_exact_need - 1);
     assert_eq!(
@@ -8595,9 +8597,9 @@ fn round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity() {
     // single 255-byte name must exhaust `AllocationBudget` BEFORE `Dir::new`
     // or `dir.next()` can allocate transient buffers on non-Linux Unix,
     // succeed at the exact need, and permanently deduct the exact same total
-    // allocation bytes (`path_conv + 4_352 + entries_bytes`) as Linux on every
+    // allocation bytes (`path_conv + 256 + entries_bytes`) as Linux on every
     // volume.
-    assert_eq!(DIR_STREAM_ALLOC, 4_352);
+    assert_eq!(DIR_STREAM_ALLOC, 256);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
@@ -8615,7 +8617,7 @@ fn round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity() {
         0
     };
     let entries_bytes = 8 * std::mem::size_of::<DirEntry>() + long_name.len();
-    let total_deducted = path_conv + 4_352 + entries_bytes;
+    let total_deducted = path_conv + 256 + entries_bytes;
     let peak = expected_dir_peak_headroom(&dir);
     let exact_need = total_deducted + peak;
 
@@ -8630,7 +8632,7 @@ fn round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity() {
         let stream_peak = dir_stream_peak_for_blksize(blk);
 
         // Non-Linux Unix tight budgets:
-        // - `path_conv + 4_352` and `path_conv + stream_peak - 1`: Exhausted
+        // - `path_conv + 256` and `path_conv + stream_peak - 1`: Exhausted
         //   before `Dir::new`;
         // - `path_conv + stream_peak` and
         //   `path_conv + stream_peak + NAME_ALLOC_PEAK - 1`: `Dir::new` runs,
@@ -8638,7 +8640,7 @@ fn round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity() {
         // - `total_deducted`: Exhausted;
         // - `exact_need - 1`: Exhausted 1 byte short of exact need.
         for tight in [
-            path_conv + 4_352,
+            path_conv + 256,
             path_conv + stream_peak - 1,
             path_conv + stream_peak,
             path_conv + stream_peak + NAME_ALLOC_PEAK - 1,
@@ -8661,7 +8663,7 @@ fn round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity() {
         // Linux `RawDir` uses a stack buffer with no per-entry `CString`, so
         // `peak == 0` and exact need is `total_deducted`.
         assert_eq!(peak, 0);
-        for tight in [path_conv + 4_352, exact_need - 1] {
+        for tight in [path_conv + 256, exact_need - 1] {
             let mut b = ComputeBudget::new(1_000_000, tight);
             assert_eq!(
                 resolver.read_dir(dir_bytes, &mut FsCaps::with_default_limits(), &mut b),
@@ -9354,9 +9356,13 @@ fn round15_read_dir_literal_constants_and_stream_charge_bounds() {
     use crate::policy::v4::paths::resolver::{DIR_STREAM_ALLOC, DIR_STREAM_OVERHEAD};
 
     // Review 12: assert literal constants (not tautologically against
-    // themselves) so any accidental reduction fails a test.
+    // themselves) so any accidental reduction fails a test. `DIR_STREAM_ALLOC`
+    // deducts only `DIR_STREAM_OVERHEAD` (256 bytes); the entire transient
+    // `dd_buf` is enforced via peak headroom so 1,024 `DirOpens` + 4,096
+    // operands never exhaust the 8 MiB budget before `DirOpens`.
     assert_eq!(DIR_STREAM_OVERHEAD, 256);
-    assert_eq!(DIR_STREAM_ALLOC, 4_352);
+    assert_eq!(DIR_STREAM_ALLOC, 256);
+    assert_eq!(DIR_STREAM_ALLOC, DIR_STREAM_OVERHEAD);
 
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -9397,12 +9403,12 @@ fn round15_read_dir_literal_constants_and_stream_charge_bounds() {
         assert_eq!(dir_stream_peak_for_blksize(131_072), 131_328);
         assert_eq!(dir_stream_peak_for_blksize(1_048_576), 1_048_832);
 
-        // 128 KiB blksize: deducts ONLY `DIR_STREAM_ALLOC` (4,352 bytes), not
+        // 128 KiB blksize: deducts ONLY `DIR_STREAM_ALLOC` (256 bytes), not
         // 131,328; budget below peak (131,327) exhausts `AllocationBudget`.
         let mut generous = ComputeBudget::new(1_000_000, 1_000_000);
         let extra_128k = charge_dir_stream(131_072i64, &mut generous).unwrap();
-        assert_eq!(extra_128k, 131_328 - 4_352);
-        assert_eq!(1_000_000 - generous.remaining_alloc_bytes(), 4_352);
+        assert_eq!(extra_128k, 131_072);
+        assert_eq!(1_000_000 - generous.remaining_alloc_bytes(), 256);
 
         let mut below_128k = ComputeBudget::new(1_000_000, 131_327);
         assert_eq!(
@@ -9413,14 +9419,11 @@ fn round15_read_dir_literal_constants_and_stream_charge_bounds() {
         );
 
         let mut exact_128k = ComputeBudget::new(1_000_000, 131_328);
-        assert_eq!(
-            charge_dir_stream(131_072i64, &mut exact_128k),
-            Ok(131_328 - 4_352)
-        );
-        assert_eq!(exact_128k.remaining_alloc_bytes(), 131_328 - 4_352);
+        assert_eq!(charge_dir_stream(131_072i64, &mut exact_128k), Ok(131_072));
+        assert_eq!(exact_128k.remaining_alloc_bytes(), 131_072);
 
         // 4 KiB volume: floored peak (65,792) is enforced before `Dir::new`,
-        // while deduction stays 4,352.
+        // while deduction stays 256.
         let mut below_4k = ComputeBudget::new(1_000_000, 65_791);
         assert_eq!(
             charge_dir_stream(4_096i64, &mut below_4k),
@@ -9429,13 +9432,10 @@ fn round15_read_dir_literal_constants_and_stream_charge_bounds() {
             }))
         );
         let mut exact_4k = ComputeBudget::new(1_000_000, 65_792);
-        assert_eq!(
-            charge_dir_stream(4_096i64, &mut exact_4k),
-            Ok(65_792 - 4_352)
-        );
-        assert_eq!(exact_4k.remaining_alloc_bytes(), 65_792 - 4_352);
+        assert_eq!(charge_dir_stream(4_096i64, &mut exact_4k), Ok(65_536));
+        assert_eq!(exact_4k.remaining_alloc_bytes(), 65_536);
 
-        // 1 MiB (max valid blksize): peak 1,048,832 enforced, deducts 4,352.
+        // 1 MiB (max valid blksize): peak 1,048,832 enforced, deducts 256.
         let mut below_1m = ComputeBudget::new(1_000_000, 1_048_831);
         assert_eq!(
             charge_dir_stream(1_048_576i64, &mut below_1m),
@@ -9446,9 +9446,9 @@ fn round15_read_dir_literal_constants_and_stream_charge_bounds() {
         let mut exact_1m = ComputeBudget::new(1_000_000, 1_048_832);
         assert_eq!(
             charge_dir_stream(1_048_576i64, &mut exact_1m),
-            Ok(1_048_832 - 4_352)
+            Ok(1_048_576)
         );
-        assert_eq!(exact_1m.remaining_alloc_bytes(), 1_048_832 - 4_352);
+        assert_eq!(exact_1m.remaining_alloc_bytes(), 1_048_576);
 
         // Negative and absurd (> 1 MiB) block sizes stay `Io(Other)` (Unread),
         // never allocating and never exhausting `budget`.
@@ -9488,8 +9488,10 @@ fn round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case() {
     //    `Unread(DirOpens)` when capped), NEVER `Exhausted`.
     // 2. Call-level worst case: 4,096 operands plus 1,024 `DirOpens` under
     //    default limits (`FsCaps::with_default_limits` and
-    //    `ComputeBudget::with_default_limits`) with a 128 KiB volume ends at
-    //    `Unread(DirOpens)`, NEVER `Exhausted`.
+    //    `ComputeBudget::with_default_limits`) across 4 KiB, 128 KiB, and
+    //    1 MiB volumes (both subject + recursive root and a single compound
+    //    `cat ...; rg pat /walk` call) ends at `Unread(DirOpens)`, NEVER
+    //    `Exhausted`, with identical permanent allocation totals.
     let tmp = tempfile::tempdir().expect("tempdir");
     let fake_home = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
     let home_bytes = fake_home.as_os_str().as_bytes().to_vec();
@@ -9657,8 +9659,8 @@ fn round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case() {
     assert!(!capped_budget.is_exhausted());
 
     // 1c. Verify non-Linux Unix `read_dir_unix_with_blksize_override` actually
-    //     obeys the injected `st_blksize` (128 KiB peak enforced, yet only
-    //     4,352 bytes deducted).
+    //     obeys the injected `st_blksize` (128 KiB and 1 MiB peaks enforced
+    //     before `Dir::new`, yet only 256 bytes permanently deducted).
     #[cfg(all(unix, not(target_os = "linux")))]
     {
         use crate::policy::v4::paths::resolver::read_dir_unix_with_blksize_override;
@@ -9672,46 +9674,51 @@ fn round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case() {
         };
         let entries_bytes = 8 * std::mem::size_of::<DirEntry>() + b"f.txt".len();
 
-        let mut iter_calls = 0usize;
-        let mut below_128k = ComputeBudget::new(1_000_000, path_conv + 131_328 - 1);
-        assert_eq!(
-            read_dir_unix_with_blksize_override(
+        for (blk, peak) in [(131_072i64, 131_328usize), (1_048_576i64, 1_048_832usize)] {
+            let mut iter_calls = 0usize;
+            let mut below = ComputeBudget::new(1_000_000, path_conv + peak - 1);
+            assert_eq!(
+                read_dir_unix_with_blksize_override(
+                    one_sub_bytes,
+                    &mut FsCaps::with_default_limits(),
+                    &mut below,
+                    blk,
+                    || {},
+                    || iter_calls += 1,
+                ),
+                Err(ResolveError::Exhausted(Exhausted {
+                    reason: ExhaustReason::AllocationBudget
+                })),
+                "blksize {blk}: budget below peak {peak} must exhaust before Dir::new"
+            );
+            assert_eq!(iter_calls, 0);
+
+            let start_alloc = 2_000_000usize;
+            let mut generous = ComputeBudget::new(1_000_000, start_alloc);
+            let got = read_dir_unix_with_blksize_override(
                 one_sub_bytes,
                 &mut FsCaps::with_default_limits(),
-                &mut below_128k,
-                131_072,
+                &mut generous,
+                blk,
                 || {},
-                || iter_calls += 1,
-            ),
-            Err(ResolveError::Exhausted(Exhausted {
-                reason: ExhaustReason::AllocationBudget
-            }))
-        );
-        assert_eq!(iter_calls, 0);
-
-        let start_alloc = 1_000_000usize;
-        let mut gen_128k = ComputeBudget::new(1_000_000, start_alloc);
-        let got = read_dir_unix_with_blksize_override(
-            one_sub_bytes,
-            &mut FsCaps::with_default_limits(),
-            &mut gen_128k,
-            131_072,
-            || {},
-            || {},
-        )
-        .unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(
-            start_alloc - gen_128k.remaining_alloc_bytes(),
-            path_conv + 4_352 + entries_bytes
-        );
+                || {},
+            )
+            .unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                start_alloc - generous.remaining_alloc_bytes(),
+                path_conv + 256 + entries_bytes,
+                "blksize {blk}: permanent deduction must equal Linux's (256 + entries)"
+            );
+        }
     }
 
     // 2. Call-level worst case: 4,096 single-component operands + 1,024
-    //    `DirOpens` (each opening a real directory with 128 KiB blksize on
-    //    non-Linux Unix / `RawDir` on Linux) sharing ONE default `FsCaps` and
-    //    ONE default `ComputeBudget` must end at `Unread(DirOpens)`, never
-    //    `Exhausted`.
+    //    `DirOpens` (each opening a real directory across 4 KiB, 128 KiB, and
+    //    1 MiB `st_blksize` on non-Linux Unix / `RawDir` on Linux) sharing ONE
+    //    default `FsCaps` and ONE default `ComputeBudget` must end at
+    //    `Unread(DirOpens)`, never `Exhausted`, with identical permanent
+    //    allocation totals at every `st_blksize`.
     let real_empty = fake_home.join("real_empty_leaf");
     std::fs::create_dir(&real_empty).unwrap();
     let real_empty_bytes = real_empty.as_os_str().as_bytes().to_vec();
@@ -9728,11 +9735,12 @@ fn round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case() {
         fake.mkdir_all(format!("/walk/d{i:04}").as_bytes());
     }
 
-    struct WorstCaseResolver {
-        fake: FakeFs,
-        real_empty: Vec<u8>,
+    struct WorstCaseResolver<'a> {
+        fake: &'a FakeFs,
+        real_empty: &'a [u8],
+        blksize: i64,
     }
-    impl PathResolver for WorstCaseResolver {
+    impl PathResolver for WorstCaseResolver<'_> {
         fn stat(
             &self,
             path: &[u8],
@@ -9785,15 +9793,16 @@ fn round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case() {
             if path.starts_with(b"/walk/d") {
                 #[cfg(target_os = "linux")]
                 {
-                    return FsResolver::new().read_dir(&self.real_empty, caps, budget);
+                    let _ = self.blksize;
+                    return FsResolver::new().read_dir(self.real_empty, caps, budget);
                 }
                 #[cfg(all(unix, not(target_os = "linux")))]
                 {
                     return crate::policy::v4::paths::resolver::read_dir_unix_with_blksize_override(
-                        &self.real_empty,
+                        self.real_empty,
                         caps,
                         budget,
-                        131_072,
+                        self.blksize,
                         || {},
                         || {},
                     );
@@ -9801,85 +9810,188 @@ fn round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case() {
             }
             let entries = self.fake.read_dir(path, caps, budget)?;
             #[cfg(target_os = "linux")]
-            budget.charge_alloc(crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC)?;
+            {
+                let _ = self.blksize;
+                budget.charge_alloc(crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC)?;
+            }
             #[cfg(all(unix, not(target_os = "linux")))]
             {
-                let _ = crate::policy::v4::paths::resolver::charge_dir_stream(131_072i64, budget)?;
+                let _ =
+                    crate::policy::v4::paths::resolver::charge_dir_stream(self.blksize, budget)?;
             }
             Ok(entries)
         }
     }
 
-    let worst = WorstCaseResolver {
-        fake,
-        real_empty: real_empty_bytes,
-    };
     let worst_prot = build_protected_set(
         HOME,
         b"/",
         vec![],
         vec![],
         FoldRules::REV4,
-        &worst.fake,
+        &fake,
         &mut FsCaps::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
         &mut ComputeBudget::new(u64::MAX, usize::MAX),
     )
     .unwrap();
+    // Warm thread-local `SharedSensitive` cache before comparing totals across
+    // `st_blksize` values so every iteration charges identically.
+    let _ = SharedSensitive::for_protected(&worst_prot);
     let walk_target = resolve_literal(
         b"/walk",
         b"/",
         HOME,
         TargetOrigin::SubjectPath { path_index: 0 },
         AccessMode::Read,
-        &worst.fake,
+        &fake,
         &mut FsCaps::with_default_limits(),
         &mut ComputeBudget::with_default_limits(),
     )
     .unwrap();
 
-    let mut shared_caps = FsCaps::with_default_limits();
-    let mut shared_budget = ComputeBudget::with_default_limits();
-    let subj = resolve_subject_paths(
-        &op_names,
-        None,
-        false,
-        AccessMode::Read,
-        &worst_prot,
-        &worst,
-        &mut shared_caps,
-        &mut shared_budget,
-    )
-    .expect("4,096 operands must fit default limits");
-    assert_eq!(subj.targets.len(), n_ops);
-    assert!(all_clear(&subj.outcomes));
-    assert!(!shared_budget.is_exhausted());
+    #[cfg(target_os = "linux")]
+    let worst_blksizes: &[i64] = &[4_096];
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let worst_blksizes: &[i64] = &[4_096, 131_072, 1_048_576];
 
-    let rec = check_recursive_root(
-        &walk_target,
-        LinkPolicy::default(),
-        &[],
+    let mut baseline_spent: Option<usize> = None;
+    for &blksize in worst_blksizes {
+        let worst = WorstCaseResolver {
+            fake: &fake,
+            real_empty: &real_empty_bytes,
+            blksize,
+        };
+        let mut shared_caps = FsCaps::with_default_limits();
+        let mut shared_budget = ComputeBudget::with_default_limits();
+        let subj = resolve_subject_paths(
+            &op_names,
+            None,
+            false,
+            AccessMode::Read,
+            &worst_prot,
+            &worst,
+            &mut shared_caps,
+            &mut shared_budget,
+        )
+        .expect("4,096 operands must fit default limits");
+        assert_eq!(subj.targets.len(), n_ops);
+        assert!(all_clear(&subj.outcomes));
+        assert!(!shared_budget.is_exhausted());
+
+        let rec = check_recursive_root(
+            &walk_target,
+            LinkPolicy::default(),
+            &[],
+            &worst_prot,
+            &worst,
+            &mut shared_caps,
+            &mut shared_budget,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "blksize {blksize}: 1,024 DirOpens after 4,096 operands must hit DirOpens cap, not Exhausted: {e:?}"
+            )
+        });
+        assert!(
+            has_unread(&rec.outcomes, |r| matches!(
+                r,
+                UnreadReason::WalkCapReached(FsCap::DirOpens)
+            )),
+            "blksize {blksize}: expected Unread(DirOpens), got {:?}",
+            rec.outcomes
+        );
+        assert!(
+            !rec.outcomes
+                .iter()
+                .any(|r| matches!(r.outcome, PartOutcome::Exhausted(_))),
+            "blksize {blksize}: must never turn into Exhausted: {:?}",
+            rec.outcomes
+        );
+        assert!(!shared_budget.is_exhausted());
+
+        let spent = limits::COMPUTE_BUDGET_ALLOC_BYTES - shared_budget.remaining_alloc_bytes();
+        match baseline_spent {
+            None => baseline_spent = Some(spent),
+            Some(first) => assert_eq!(
+                spent, first,
+                "blksize {blksize}: permanent allocation total must not grow with st_blksize"
+            ),
+        }
+    }
+
+    // 2b. Single compound command (`cat f0000..f4094; rg pat /walk`): 4,095
+    //     plain operands + 1 recursive root (= 4,096 Canonicalizations + 1,024
+    //     DirOpens) at max valid `st_blksize` (1 MiB) inside one
+    //     `resolve_command_targets` call ends at `Unread(DirOpens)`, never
+    //     `Exhausted`.
+    let mut cat_argv = Vec::with_capacity(n_ops);
+    cat_argv.push(unquoted(b"cat"));
+    for name in &op_names[..n_ops - 1] {
+        cat_argv.push(unquoted(name.as_bytes()));
+    }
+    let u_cat = unit(0, cat_argv, vec![], Separator::Start, None);
+    let eff_cat = reader_effects("cat", n_ops);
+    let u_rg = unit(
+        1,
+        vec![unquoted(b"rg"), unquoted(b"pat"), unquoted(b"/walk")],
+        vec![],
+        Separator::Semi,
+        None,
+    );
+    let eff_rg = ToolEffects {
+        tool_name: Some("rg"),
+        subcommand: None,
+        roles: vec![
+            OperandRole::Command,
+            OperandRole::Pattern,
+            OperandRole::Path,
+        ],
+        operand_access: vec![AccessMode::Read; 3],
+        writes: false,
+        derived_destinations: DerivedDestinations::None,
+        reads_recursively: true,
+        links: LinkPolicy::default(),
+        code: CodeExecution::None,
+        filter_dialect: None,
+        filters: vec![],
+        home_readonly_eligible: true,
+        cd_target_operand: None,
+        git_selects_by_name: false,
+        unread: vec![],
+    };
+    let worst_1m = WorstCaseResolver {
+        fake: &fake,
+        real_empty: &real_empty_bytes,
+        blksize: 1_048_576,
+    };
+    let mut cmd_caps = FsCaps::with_default_limits();
+    let mut cmd_budget = ComputeBudget::with_default_limits();
+    let cmd_res = resolve_command_targets(
+        &[u_cat, u_rg],
+        &[eff_cat, eff_rg],
+        b"/",
         &worst_prot,
-        &worst,
-        &mut shared_caps,
-        &mut shared_budget,
+        &worst_1m,
+        &mut cmd_caps,
+        &mut cmd_budget,
     )
-    .expect("1,024 DirOpens after 4,096 operands must hit DirOpens cap, not Exhausted");
+    .expect("compound 4,095 operands + recursive walk at 1 MiB blksize must not exhaust");
     assert!(
-        has_unread(&rec.outcomes, |r| matches!(
+        has_unread(&cmd_res.outcomes, |r| matches!(
             r,
             UnreadReason::WalkCapReached(FsCap::DirOpens)
         )),
-        "expected Unread(DirOpens), got {:?}",
-        rec.outcomes
+        "expected Unread(DirOpens), got tail {:?}",
+        &cmd_res.outcomes[cmd_res.outcomes.len().saturating_sub(5)..]
     );
     assert!(
-        !rec.outcomes
+        !cmd_res
+            .outcomes
             .iter()
             .any(|r| matches!(r.outcome, PartOutcome::Exhausted(_))),
-        "must never turn into Exhausted: {:?}",
-        rec.outcomes
+        "compound worst case must never turn into Exhausted"
     );
-    assert!(!shared_budget.is_exhausted());
+    assert!(!cmd_budget.is_exhausted());
 }
 
 #[cfg(unix)]
