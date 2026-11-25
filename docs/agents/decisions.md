@@ -1130,3 +1130,20 @@ D-141 removed flag arities from these rows precisely to avoid this.
 **Decided by Pedro (driver).**
 - **M1-44 (N18) has its go.** It starts together with P2 round 13 and M1-43 round 2, when the agy Gemini quota resets (about 02:03). That replaces D-167's "start later".
 - **Review fallback.** If agy's Claude (Sonnet) usage runs out, the Sonnet reviews (D-162, D-169) run on Pedro's Claude plan as read-only Claude Code subagents (`model: sonnet`), as they did before D-169.
+
+## D-171 — 2026-11-25 — Pedro: merge M1-43 (N17) into `dev`
+**Decided by Pedro (driver).** M1-43-n17-supervise-drain-flake is merged into `dev` as `6834b3c7`, after Sonnet's review 3 approved with no findings (`reviews/M1-43-n17-supervise-drain-flake-round3.md`). N17 is closed.
+- **The fix is test-only.** The gone-leader drain test's member joins the leader's group as the test's own child, is reaped by the test, and is released by an explicit message. That removes the PID 1 reap, the macOS CLOEXEC EOF window and the heavyweight test-binary member. `GROUP_DRAIN_TIMEOUT` and `src/supervise.rs` are unchanged.
+- **Verification (macOS):** workspace 932/0/7; `supervise` ×200 quiet and ×100 under load (up to 72) with 0 failures. Round 2's 2 uncaptured failures under load drove round 3.
+- **Known, out of scope:** five other `supervise` tests still depend on init reaping within 2 s (listed in the M1-43 handoff §3). A failure there is not an N17 regression.
+
+## D-172 — 2026-11-25 — Pedro: merge M1-44 (N18) into `dev`; sign off its `Cargo.toml` deviation
+**Decided by Pedro (driver).** M1-44-n18-delivered-question-withdraw-flake is merged into `dev` as `482da38b`, after Sonnet's review 4 approved with no findings (`reviews/M1-44-n18-delivered-question-withdraw-flake-round4.md`). N18 is closed.
+- **Cause:** not a product ordering bug. The test's 150 ms `gate_deadline` also bounded real SQLite question tickets, so under load a late ticket was denied without `QuestionAsked` and its row stayed pending behind the test's blocked withdraw. In production the late row is always withdrawn (`OrphanGuard`) and never reaches the UI (`event_opened = 0`).
+- **Fix:** a `#[doc(hidden)]` `ClaudeAdapter::with_withdraw_timeout` seam (production default unchanged), deterministic paused-clock tests, and three Claude tests keeping the default `gate_deadline`.
+- **Deviation signed off:** `crates/atrium-agents/Cargo.toml` gains `tokio` with `test-util` under `[dev-dependencies]` only, for the paused-clock tests. It is outside the brief's owned paths; `Cargo.lock` is unchanged.
+- **Change request logged** (`m1-must-fix.md`, CR-M1-44): move the override into `ClaudeOptions::withdraw_timeout`, matching `CodexOptions`, the next time `ClaudeOptions` may change, and drop the hidden method.
+
+## D-173 — 2026-11-25 — Pedro: P2 round 15 on Neon xhigh after the D-155 rise
+**Decided by Pedro (driver).** P2's review counts went 1 (review 10), 1 (review 11, a stall the orchestrator should have brought to the driver then), 2 (review 12, a rise). Under D-155 that comes to the driver. Pedro keeps Neon `xhigh` writing P2: round 15 fixes review 12's two Lows (the macOS `st_blksize` stream charge, and the name copy before its compute charge) and its test gaps. Reviews run on Pedro's Claude plan (D-170), since agy's Claude models hit their weekly limit on 2026-11-25 (reset in about 6.7 days). D-155's conditions still apply to later rounds.
+
