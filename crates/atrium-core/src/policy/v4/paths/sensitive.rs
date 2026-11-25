@@ -1,0 +1,3237 @@
+//! Shared sensitive-path rules, name folding, unlisted equivalence detection,
+//! and CR-12 / CR-17 credential store matching (contract §5, §11 item 13, §12).
+//!
+//! Incorporates:
+//! - `dev` `deny.rs` credential/browser/Atrium hard-deny lists and probes;
+//! - M1-29 CR-17's four additional credential stores that ask;
+//! - M1-31's thread-local shared `Sensitive` cache keyed strictly by value on
+//!   the folded strings it consumes;
+//! - §5 / §11 item 13 unlisted-equivalence detection (NFC/NFD canonical
+//!   decomposition, unlisted Unicode case folds, and APFS ignorable code
+//!   points) that turns matches under unlisted equivalences into `Unread`
+//!   without ever downgrading a listed-fold or identity hit.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+use crate::policy::limits;
+use crate::policy::model::{
+    AccessMode, ComputeBudget, Exhausted, FileIdentity, FileType, FoldRules, FsCap, FsCaps,
+    FsIoError, GapScope, Hit, HitMatch, HitSource, IdentityGap, PartId, PartOutcome, PartResult,
+    PathMetadata, ProtectedSet, ResolveError, Target, TargetOrigin, TargetResolution, UnreadReason,
+};
+use crate::policy::v4::paths::PathResolver;
+
+/// Hard-deny credential files relative to home (folded lowercase; `deny.rs`).
+pub(crate) const CRED_FILES: &[&str] = &[
+    ".aws/credentials",
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".docker/config.json",
+    ".kube/config",
+    ".config/gh/hosts.yml",
+    ".claude/.credentials.json",
+    ".claude.json",
+    ".codex/auth.json",
+];
+
+/// Hard-deny credential trees relative to home (folded lowercase; `deny.rs`).
+pub(crate) const CRED_TREES: &[&str] =
+    &[".gnupg", ".config/gcloud", ".gemini", "library/keychains"];
+
+/// Browser profile roots relative to home (folded lowercase; `deny.rs`).
+pub(crate) const BROWSER_ROOTS: &[&str] = &[
+    "library/application support/google/chrome",
+    "library/application support/chromium",
+    "library/application support/microsoft edge",
+    "library/application support/bravesoftware",
+    "library/application support/firefox",
+    "library/application support/arc",
+    "library/application support/vivaldi",
+    "library/cookies",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/bravesoftware",
+    ".config/microsoft-edge",
+    ".config/vivaldi",
+    ".mozilla",
+];
+
+/// Hard-deny credential filenames inside browser roots (folded lowercase; `deny.rs`).
+pub(crate) const BROWSER_FILES: &[&str] = &[
+    "login data",
+    "login data for account",
+    "cookies",
+    "cookies.binarycookies",
+    "cookies.sqlite",
+    "logins.json",
+    "key4.db",
+    "key3.db",
+    "web data",
+    "local state",
+];
+
+/// Representative `~/.ssh` private-key probe names (`deny.rs`).
+pub(crate) const SSH_PROBES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "x"];
+
+/// Representative browser file probe names (`deny.rs`).
+pub(crate) const BROWSER_FILE_PROBES: &[&str] =
+    &["cookies", "login data", "cookies.sqlite", "logins.json"];
+
+/// Credential store files that ask (CR-12 + CR-17 from M1-29; folded lowercase)
+/// paired with their store family label.
+pub(crate) const ASK_FILES: &[(&str, &str)] = &[
+    (".cargo/credentials.toml", "cargo-credentials"),
+    (".cargo/credentials", "cargo-credentials"),
+    (".pypirc", "pypirc"),
+    (".pgpass", "pgpass"),
+    (".vault-token", "vault-token"),
+    (".azure/accesstokens.json", "azure-tokens"),
+    (".config/git/credentials", "git-credentials"),
+    (".env", "dotenv"),
+    // CR-17 (M1-29, D-111)
+    (".gem/credentials", "gem-credentials"),
+    (
+        ".terraform.d/credentials.tfrc.json",
+        "terraform-credentials",
+    ),
+    (".config/op/config", "1password-config"),
+    (".yarnrc.yml", "yarnrc"),
+    // Shell history files
+    (".bash_history", "shell-history"),
+    (".zsh_history", "shell-history"),
+    (".zhistory", "shell-history"),
+    (".sh_history", "shell-history"),
+    (".ksh_history", "shell-history"),
+    (".history", "shell-history"),
+    (".local/share/fish/fish_history", "shell-history"),
+    (".config/fish/fish_history", "shell-history"),
+];
+
+/// Credential store directories that ask (CR-12; folded lowercase) paired with
+/// their store family label.
+pub(crate) const ASK_TREES: &[(&str, &str)] = &[
+    (".aws/sso/cache", "aws-sso-cache"),
+    (".zsh_sessions", "shell-history"),
+    (".bash_sessions", "shell-history"),
+];
+
+/// Prefix-matched credential stores that ask (`(dir, filename_prefix, family)`).
+pub(crate) const ASK_NAME_PREFIXES: &[(&str, &str, &str)] =
+    &[(".azure", "msal_token_cache.", "azure-msal-cache")];
+
+/// macOS Data volume firmlink prefix stripped before path comparison (`gate.rs`).
+const FIRMLINK_LOWER: &str = "/system/volumes/data";
+
+// ---------------------------------------------------------------------------
+// Listed folding & unlisted equivalence folding (§5, §11 item 13)
+// ---------------------------------------------------------------------------
+
+/// Strips macOS `/System/Volumes/Data` firmlink prefix (case-insensitively on
+/// ASCII) when followed by `/` or end of string.
+pub(crate) fn strip_firmlink(bytes: &[u8]) -> &[u8] {
+    let n = FIRMLINK_LOWER.len();
+    if bytes.len() >= n && bytes[..n].eq_ignore_ascii_case(FIRMLINK_LOWER.as_bytes()) {
+        if bytes.len() == n {
+            return b"/";
+        }
+        if bytes[n] == b'/' {
+            return &bytes[n..];
+        }
+    }
+    bytes
+}
+
+/// Upper bound on the heap bytes one listed fold of `len` input bytes
+/// allocates: the output buffer (reserved at 3/2 of the input, which bounds
+/// `to_lowercase`'s growth per scalar) plus `str::to_lowercase`'s temporary
+/// `String` for each valid UTF-8 segment (at most three times the input after
+/// its amortized growth). Charged before the fold runs (§8).
+pub(crate) const fn fold_alloc_bound(len: usize) -> usize {
+    len.saturating_mul(5).saturating_add(8)
+}
+
+/// Applies the listed rev 4 folds (`FoldRules`, CR-19 and `dev`'s
+/// `deny.rs`/`engine.rs` path fold `to_lowercase().replace('ſ', "s")`) to
+/// `bytes`, after charging the work and every allocation it makes (§8):
+/// - string-level `str::to_lowercase()` on each valid UTF-8 segment, so its
+///   contextual rules apply (final sigma: `ΟΣ` folds to `ος`, as on `dev`);
+/// - then U+017F (long s) to `s` when `fold_long_s`, and U+212A (Kelvin) to
+///   `k` when `fold_kelvin` (already implied by `to_lowercase`);
+/// - no Unicode normalization;
+/// - invalid UTF-8 bytes are kept verbatim; they end a segment, as `dev`'s
+///   lossy U+FFFD (neither cased nor case-ignorable) does.
+pub(crate) fn fold_listed_component(
+    bytes: &[u8],
+    folds: FoldRules,
+    budget: &mut ComputeBudget,
+) -> Result<Vec<u8>, Exhausted> {
+    budget.charge((bytes.len() as u64).saturating_mul(2).max(1))?;
+    budget.charge_alloc(fold_alloc_bound(bytes.len()))?;
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 2 + 4);
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                push_listed_str(&mut out, valid, folds);
+                break;
+            }
+            Err(e) => {
+                let valid_len = e.valid_up_to();
+                if valid_len > 0
+                    && let Ok(s) = std::str::from_utf8(&rest[..valid_len])
+                {
+                    push_listed_str(&mut out, s, folds);
+                }
+                let err_len = e.error_len().unwrap_or(rest.len() - valid_len);
+                out.extend_from_slice(&rest[valid_len..valid_len + err_len]);
+                rest = &rest[valid_len + err_len..];
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn push_listed_str(out: &mut Vec<u8>, s: &str, folds: FoldRules) {
+    if s.is_ascii() {
+        out.extend(s.bytes().map(|b| b.to_ascii_lowercase()));
+        return;
+    }
+    let lower = s.to_lowercase();
+    let mut buf = [0u8; 4];
+    for ch in lower.chars() {
+        match ch {
+            '\u{017F}' if folds.fold_long_s => out.push(b's'),
+            '\u{212A}' if folds.fold_kelvin => out.push(b'k'),
+            other => out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes()),
+        }
+    }
+}
+
+/// Folds a full path using [`FoldRules`] (see [`fold_listed_component`]),
+/// stripping `/System/Volumes/Data` and trailing slashes (preserving `"/"`),
+/// after charging the work and allocations (§8).
+pub(crate) fn fold_path_listed(
+    path: &[u8],
+    folds: FoldRules,
+    budget: &mut ComputeBudget,
+) -> Result<Vec<u8>, Exhausted> {
+    let p = strip_firmlink(path);
+    let mut folded = fold_listed_component(p, folds, budget)?;
+    while folded.len() > 1 && folded.last() == Some(&b'/') {
+        folded.pop();
+    }
+    if folded.is_empty() {
+        folded.push(b'/');
+    }
+    Ok(folded)
+}
+
+/// Upper bound on the heap bytes one extended fold of `len` input bytes
+/// allocates: the scalar buffer (reserved for two scalars per input byte, more
+/// than the 3/2 that canonical decomposition and the unlisted case folds can
+/// produce) and the output buffer (reserved at three times the input, the
+/// largest UTF-8 growth of a decomposition: a 3-byte Hangul syllable becomes
+/// three 3-byte jamo). Both are reserved up front, so neither grows (§8).
+pub(crate) const fn fold_extended_alloc_bound(len: usize) -> usize {
+    let chars = len.saturating_mul(2).saturating_add(4);
+    let out = len.saturating_mul(3).saturating_add(4);
+    chars
+        .saturating_mul(std::mem::size_of::<char>())
+        .saturating_add(out)
+}
+
+/// Extended equivalence fold for §5 / §11 item 13, after charging its work and
+/// its allocations (§8):
+/// - canonical decomposition (NFD) from an exact table: complete Latin-1,
+///   Latin Extended-A and Combining Diacritical Marks (including the four
+///   marks with decompositions, U+0340, U+0341, U+0343 and U+0344), the listed
+///   Latin Extended-B / Additional / Cyrillic letters, the singletons that
+///   decompose into ASCII or Latin-1 (U+037E, U+0387, U+1FEF, U+1FFD), and
+///   algorithmic Hangul, with canonical ordering of U+0300..=U+036F marks;
+/// - unlisted Unicode case folds beyond `to_lowercase` (`ß`/`ẞ` to `ss`,
+///   `İ`/`ı` to `i`, ligatures U+FB00..=U+FB06, final sigma to sigma, micro
+///   sign to mu), plus the listed ones;
+/// - removal of every default-ignorable code point.
+///
+/// Returns `(folded_bytes, uncovered)`. `uncovered` is `true` when any scalar
+/// is not fully decomposed by the table, so the conservative §11 item 13
+/// fallback applies to it. Invalid UTF-8 bytes are kept verbatim.
+pub(crate) fn fold_extended_component_tracked(
+    bytes: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<(Vec<u8>, bool), Exhausted> {
+    budget.charge((bytes.len() as u64).saturating_mul(4).max(1))?;
+    budget.charge_alloc(fold_extended_alloc_bound(bytes.len()))?;
+    let mut chars: Vec<char> = Vec::with_capacity(bytes.len().saturating_mul(2) + 4);
+    let mut out = Vec::with_capacity(bytes.len().saturating_mul(3) + 4);
+    let mut uncovered = false;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                uncovered |= push_extended_str(&mut out, &mut chars, valid);
+                break;
+            }
+            Err(e) => {
+                let valid_len = e.valid_up_to();
+                if valid_len > 0
+                    && let Ok(s) = std::str::from_utf8(&rest[..valid_len])
+                {
+                    uncovered |= push_extended_str(&mut out, &mut chars, s);
+                }
+                let err_len = e.error_len().unwrap_or(rest.len() - valid_len);
+                out.extend_from_slice(&rest[valid_len..valid_len + err_len]);
+                rest = &rest[valid_len + err_len..];
+            }
+        }
+    }
+    Ok((out, uncovered))
+}
+
+/// Folds `s` into `out` (reusing `chars` as scratch, which the caller reserved).
+/// Returns `true` iff some scalar of `s` is not fully decomposed by the exact
+/// table (§11 item 13).
+fn push_extended_str(out: &mut Vec<u8>, chars: &mut Vec<char>, s: &str) -> bool {
+    chars.clear();
+    let mut uncovered = false;
+    for ch in s.chars() {
+        if is_default_ignorable(ch) {
+            continue;
+        }
+        // Unlisted full Unicode case folds (before NFD so `İ` → `i`, not `i` + U+0307).
+        match ch {
+            '\u{00DF}' | '\u{1E9E}' => {
+                chars.push('s');
+                chars.push('s');
+            }
+            '\u{0130}' | '\u{0131}' => chars.push('i'),
+            '\u{017F}' => chars.push('s'),
+            '\u{212A}' => chars.push('k'),
+            '\u{212B}' => {
+                chars.push('a');
+                chars.push('\u{030A}');
+            }
+            '\u{03C2}' => chars.push('\u{03C3}'),
+            '\u{00B5}' => chars.push('\u{03BC}'),
+            '\u{FB00}' => chars.extend(['f', 'f']),
+            '\u{FB01}' => chars.extend(['f', 'i']),
+            '\u{FB02}' => chars.extend(['f', 'l']),
+            '\u{FB03}' => chars.extend(['f', 'f', 'i']),
+            '\u{FB04}' => chars.extend(['f', 'f', 'l']),
+            '\u{FB05}' | '\u{FB06}' => chars.extend(['s', 't']),
+            other => {
+                for lc in other.to_lowercase() {
+                    if !decompose_nfd(lc, chars) {
+                        uncovered = true;
+                    }
+                }
+            }
+        }
+    }
+    // Canonical ordering of combining mark runs (CCC > 0).
+    let mut i = 0;
+    while i < chars.len() {
+        if combining_class(chars[i]) == 0 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && combining_class(chars[i]) != 0 {
+            i += 1;
+        }
+        chars[start..i].sort_by_key(|&c| combining_class(c));
+    }
+    let mut buf = [0u8; 4];
+    for &ch in chars.iter() {
+        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    }
+    uncovered
+}
+
+/// Unicode `Default_Ignorable_Code_Point` (DerivedCoreProperties), the code
+/// points a volume may ignore when comparing names.
+fn is_default_ignorable(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Complete Unicode Canonical_Combining_Class (CCC) values for Combining
+/// Diacritical Marks (`U+0300..=U+036F`).
+fn combining_class(ch: char) -> u8 {
+    match ch {
+        '\u{0300}'..='\u{0314}'
+        | '\u{033D}'..='\u{0344}'
+        | '\u{0346}'
+        | '\u{034A}'..='\u{034C}'
+        | '\u{0350}'..='\u{0352}'
+        | '\u{0357}'
+        | '\u{035B}'
+        | '\u{0363}'..='\u{036F}' => 230, // Above
+        '\u{0315}' | '\u{031A}' | '\u{0358}' => 232, // Above Right
+        '\u{0316}'..='\u{0319}'
+        | '\u{031C}'..='\u{0320}'
+        | '\u{0323}'..='\u{0326}'
+        | '\u{0329}'..='\u{0333}'
+        | '\u{0339}'..='\u{033C}'
+        | '\u{0347}'..='\u{0349}'
+        | '\u{034D}'..='\u{034E}'
+        | '\u{0353}'..='\u{0356}'
+        | '\u{0359}'..='\u{035A}' => 220, // Below
+        '\u{0321}'..='\u{0322}' | '\u{0327}' | '\u{0328}' => 202, // Attached below
+        '\u{031B}' => 216,                           // Attached above right (horn)
+        '\u{0334}'..='\u{0338}' => 1,                // Overlay
+        '\u{0345}' => 240,                           // Iota subscript
+        '\u{035C}' | '\u{035F}' | '\u{0362}' => 233, // Double below
+        '\u{035D}'..='\u{035E}' | '\u{0360}'..='\u{0361}' => 234, // Double above
+        _ => 0,
+    }
+}
+
+/// Canonical NFD decomposition for precomposed lowercase Latin, common Greek/
+/// Cyrillic accented letters, and algorithmic Hangul syllables.
+///
+/// Returns `true` iff `ch` lies in a range whose canonical decomposition and
+/// combining class are completely covered by this table; returns `false` when
+/// `ch` is outside the exact table (so callers can apply §11 item 13's
+/// conservative `Unread` rule without false negatives).
+fn decompose_nfd(ch: char, out: &mut Vec<char>) -> bool {
+    let cp = ch as u32;
+    if cp <= 0x7F {
+        out.push(ch);
+        return true;
+    }
+    // Hangul algorithmic decomposition (Unicode Standard §3.12).
+    if (0xAC00..=0xD7A3).contains(&cp) {
+        let s_index = cp - 0xAC00;
+        let l = 0x1100 + s_index / 588;
+        let v = 0x1161 + (s_index % 588) / 28;
+        let t = 0x11A7 + (s_index % 28);
+        if let Some(lc) = char::from_u32(l) {
+            out.push(lc);
+        }
+        if let Some(vc) = char::from_u32(v) {
+            out.push(vc);
+        }
+        if t != 0x11A7
+            && let Some(tc) = char::from_u32(t)
+        {
+            out.push(tc);
+        }
+        return true;
+    }
+
+    // Complete lowercase Latin-1 Supplement, Latin Extended-A, plus key Latin
+    // Extended-B (including U+01FB `ǻ`), Latin Extended Additional, and Cyrillic.
+    let decomp: Option<&[char]> = match ch {
+        '\u{00E0}' => Some(&['a', '\u{0300}']), // à
+        '\u{00E1}' => Some(&['a', '\u{0301}']), // á
+        '\u{00E2}' => Some(&['a', '\u{0302}']), // â
+        '\u{00E3}' => Some(&['a', '\u{0303}']), // ã
+        '\u{00E4}' => Some(&['a', '\u{0308}']), // ä
+        '\u{00E5}' => Some(&['a', '\u{030A}']), // å
+        '\u{00E7}' => Some(&['c', '\u{0327}']), // ç
+        '\u{00E8}' => Some(&['e', '\u{0300}']), // è
+        '\u{00E9}' => Some(&['e', '\u{0301}']), // é
+        '\u{00EA}' => Some(&['e', '\u{0302}']), // ê
+        '\u{00EB}' => Some(&['e', '\u{0308}']), // ë
+        '\u{00EC}' => Some(&['i', '\u{0300}']), // ì
+        '\u{00ED}' => Some(&['i', '\u{0301}']), // í
+        '\u{00EE}' => Some(&['i', '\u{0302}']), // î
+        '\u{00EF}' => Some(&['i', '\u{0308}']), // ï
+        '\u{00F1}' => Some(&['n', '\u{0303}']), // ñ
+        '\u{00F2}' => Some(&['o', '\u{0300}']), // ò
+        '\u{00F3}' => Some(&['o', '\u{0301}']), // ó
+        '\u{00F4}' => Some(&['o', '\u{0302}']), // ô
+        '\u{00F5}' => Some(&['o', '\u{0303}']), // õ
+        '\u{00F6}' => Some(&['o', '\u{0308}']), // ö
+        '\u{00F9}' => Some(&['u', '\u{0300}']), // ù
+        '\u{00FA}' => Some(&['u', '\u{0301}']), // ú
+        '\u{00FB}' => Some(&['u', '\u{0302}']), // û
+        '\u{00FC}' => Some(&['u', '\u{0308}']), // ü
+        '\u{00FD}' => Some(&['y', '\u{0301}']), // ý
+        '\u{00FF}' => Some(&['y', '\u{0308}']), // ÿ
+        // Latin Extended-A (complete)
+        '\u{0101}' => Some(&['a', '\u{0304}']), // ā
+        '\u{0103}' => Some(&['a', '\u{0306}']), // ă
+        '\u{0105}' => Some(&['a', '\u{0328}']), // ą
+        '\u{0107}' => Some(&['c', '\u{0301}']), // ć
+        '\u{0109}' => Some(&['c', '\u{0302}']), // ĉ
+        '\u{010B}' => Some(&['c', '\u{0307}']), // ċ
+        '\u{010D}' => Some(&['c', '\u{030C}']), // č
+        '\u{010F}' => Some(&['d', '\u{030C}']), // ď
+        '\u{0113}' => Some(&['e', '\u{0304}']), // ē
+        '\u{0115}' => Some(&['e', '\u{0306}']), // ĕ
+        '\u{0117}' => Some(&['e', '\u{0307}']), // ė
+        '\u{0119}' => Some(&['e', '\u{0328}']), // ę
+        '\u{011B}' => Some(&['e', '\u{030C}']), // ě
+        '\u{011D}' => Some(&['g', '\u{0302}']), // ĝ
+        '\u{011F}' => Some(&['g', '\u{0306}']), // ğ
+        '\u{0121}' => Some(&['g', '\u{0307}']), // ġ
+        '\u{0123}' => Some(&['g', '\u{0327}']), // ģ
+        '\u{0125}' => Some(&['h', '\u{0302}']), // ĥ
+        '\u{0129}' => Some(&['i', '\u{0303}']), // ĩ
+        '\u{012B}' => Some(&['i', '\u{0304}']), // ī
+        '\u{012D}' => Some(&['i', '\u{0306}']), // ĭ
+        '\u{012F}' => Some(&['i', '\u{0328}']), // į
+        '\u{0135}' => Some(&['j', '\u{0302}']), // ĵ
+        '\u{0137}' => Some(&['k', '\u{0327}']), // ķ
+        '\u{013A}' => Some(&['l', '\u{0301}']), // ĺ
+        '\u{013C}' => Some(&['l', '\u{0327}']), // ļ
+        '\u{013E}' => Some(&['l', '\u{030C}']), // ľ
+        '\u{0144}' => Some(&['n', '\u{0301}']), // ń
+        '\u{0146}' => Some(&['n', '\u{0327}']), // ņ
+        '\u{0148}' => Some(&['n', '\u{030C}']), // ň
+        '\u{014D}' => Some(&['o', '\u{0304}']), // ō
+        '\u{014F}' => Some(&['o', '\u{0306}']), // ŏ
+        '\u{0151}' => Some(&['o', '\u{030B}']), // ő
+        '\u{0155}' => Some(&['r', '\u{0301}']), // ŕ
+        '\u{0157}' => Some(&['r', '\u{0327}']), // ŗ
+        '\u{0159}' => Some(&['r', '\u{030C}']), // ř
+        '\u{015B}' => Some(&['s', '\u{0301}']), // ś
+        '\u{015D}' => Some(&['s', '\u{0302}']), // ŝ
+        '\u{015F}' => Some(&['s', '\u{0327}']), // ş
+        '\u{0161}' => Some(&['s', '\u{030C}']), // š
+        '\u{0163}' => Some(&['t', '\u{0327}']), // ţ
+        '\u{0165}' => Some(&['t', '\u{030C}']), // ť
+        '\u{0169}' => Some(&['u', '\u{0303}']), // ũ
+        '\u{016B}' => Some(&['u', '\u{0304}']), // ū
+        '\u{016D}' => Some(&['u', '\u{0306}']), // ŭ
+        '\u{016F}' => Some(&['u', '\u{030A}']), // ů
+        '\u{0171}' => Some(&['u', '\u{030B}']), // ű
+        '\u{0173}' => Some(&['u', '\u{0328}']), // ų
+        '\u{0175}' => Some(&['w', '\u{0302}']), // ŵ
+        '\u{0177}' => Some(&['y', '\u{0302}']), // ŷ
+        '\u{017A}' => Some(&['z', '\u{0301}']), // ź
+        '\u{017C}' => Some(&['z', '\u{0307}']), // ż
+        '\u{017E}' => Some(&['z', '\u{030C}']), // ž
+        // Latin Extended-B canonical decompositions (including U+01FB `ǻ`)
+        '\u{01CE}' => Some(&['a', '\u{030C}']), // ǎ
+        '\u{01D0}' => Some(&['i', '\u{030C}']), // ǐ
+        '\u{01D2}' => Some(&['o', '\u{030C}']), // ǒ
+        '\u{01D4}' => Some(&['u', '\u{030C}']), // ǔ
+        '\u{01D6}' => Some(&['u', '\u{0308}', '\u{0304}']), // ǖ
+        '\u{01D8}' => Some(&['u', '\u{0308}', '\u{0301}']), // ǘ
+        '\u{01DA}' => Some(&['u', '\u{0308}', '\u{030C}']), // ǚ
+        '\u{01DC}' => Some(&['u', '\u{0308}', '\u{0300}']), // ǜ
+        '\u{01DF}' => Some(&['a', '\u{0308}', '\u{0304}']), // ǟ
+        '\u{01E1}' => Some(&['a', '\u{0307}', '\u{0304}']), // ǡ
+        '\u{01E3}' => Some(&['\u{00E6}', '\u{0304}']), // ǣ
+        '\u{01E7}' => Some(&['g', '\u{030C}']), // ǧ
+        '\u{01E9}' => Some(&['k', '\u{030C}']), // ǩ
+        '\u{01EB}' => Some(&['o', '\u{0328}']), // ǫ
+        '\u{01ED}' => Some(&['o', '\u{0328}', '\u{0304}']), // ǭ
+        '\u{01EF}' => Some(&['\u{0292}', '\u{030C}']), // ǯ
+        '\u{01F0}' => Some(&['j', '\u{030C}']), // ǰ
+        '\u{01F5}' => Some(&['g', '\u{0301}']), // ǵ
+        '\u{01F9}' => Some(&['n', '\u{0300}']), // ǹ
+        '\u{01FB}' => Some(&['a', '\u{030A}', '\u{0301}']), // ǻ
+        '\u{01FD}' => Some(&['\u{00E6}', '\u{0301}']), // ǽ
+        '\u{01FF}' => Some(&['\u{00F8}', '\u{0301}']), // ǿ
+        // Common Latin Extended Additional (Vietnamese / European)
+        '\u{1E09}' => Some(&['c', '\u{0327}', '\u{0301}']), // ḉ
+        '\u{1EBF}' => Some(&['e', '\u{0302}', '\u{0301}']), // ế
+        '\u{1EC1}' => Some(&['e', '\u{0302}', '\u{0300}']), // ề
+        '\u{1EDB}' => Some(&['o', '\u{031B}', '\u{0301}']), // ớ
+        '\u{1EEB}' => Some(&['u', '\u{031B}', '\u{0300}']), // ừ
+        // Cyrillic й / ё
+        '\u{0439}' => Some(&['\u{0438}', '\u{0306}']),
+        '\u{0451}' => Some(&['\u{0435}', '\u{0308}']),
+        // The only Combining Diacritical Marks with canonical decompositions.
+        '\u{0340}' => Some(&['\u{0300}']),
+        '\u{0341}' => Some(&['\u{0301}']),
+        '\u{0343}' => Some(&['\u{0313}']),
+        '\u{0344}' => Some(&['\u{0308}', '\u{0301}']),
+        // Singletons that decompose into ASCII or Latin-1.
+        '\u{037E}' => Some(&[';']),
+        '\u{0387}' => Some(&['\u{00B7}']),
+        '\u{1FEF}' => Some(&['`']),
+        '\u{1FFD}' => Some(&['\u{00B4}']),
+        _ => None,
+    };
+    if let Some(seq) = decomp {
+        out.extend_from_slice(seq);
+        return true;
+    }
+    out.push(ch);
+    // Blocks in which every scalar without a table entry has no canonical
+    // decomposition, and whose combining classes `combining_class` knows:
+    // Latin-1 Supplement and Latin Extended-A (`to_lowercase` runs first, and
+    // the table lists every lowercase letter of both blocks that decomposes),
+    // Combining Diacritical Marks (U+0340, U+0341, U+0343 and U+0344 are in
+    // the table), and Hangul Jamo. Every other scalar is uncovered, so the
+    // conservative §11 item 13 fallback applies to it.
+    (0x0080..=0x017F).contains(&cp)
+        || (0x0300..=0x036F).contains(&cp)
+        || (0x1100..=0x11FF).contains(&cp)
+}
+
+/// Returns `true` iff path component `cand` could match `prot` under an
+/// unlisted equivalence (NFD/NFC normalization, an unlisted Unicode case fold,
+/// default-ignorable code points), or conservatively whenever either side has
+/// a scalar the exact table does not fully decompose (§11 item 13).
+///
+/// The conservative rule is skipped only when the other side folds to pure
+/// ASCII: every canonical decomposition and case fold that reaches pure ASCII
+/// (Kelvin sign, long s, `ß`/`ẞ`, `İ`/`ı`, the `ﬀ`..`ﬆ` ligatures, U+037E,
+/// U+1FEF) is in the exact table, so an uncovered scalar can never become
+/// ASCII under any of those equivalences.
+fn component_may_match_unlisted(
+    cand: &[u8],
+    prot: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<bool, Exhausted> {
+    budget.charge((cand.len() + prot.len() + 1) as u64)?;
+    if cand.is_ascii() && prot.is_ascii() {
+        return Ok(cand.eq_ignore_ascii_case(prot));
+    }
+    let (cand_ext, cand_uncovered) = fold_extended_component_tracked(cand, budget)?;
+    let (prot_ext, prot_uncovered) = fold_extended_component_tracked(prot, budget)?;
+    budget.charge((cand_ext.len() + prot_ext.len() + 1) as u64)?;
+    if cand_ext == prot_ext {
+        return Ok(true);
+    }
+    Ok((cand_uncovered || prot_uncovered) && !cand_ext.is_ascii() && !prot_ext.is_ascii())
+}
+
+/// Non-empty `/`-separated components of `path` after stripping the
+/// `/System/Volumes/Data` firmlink (no allocation).
+fn path_components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    strip_firmlink(path)
+        .split(|&b| b == b'/')
+        .filter(|s| !s.is_empty())
+}
+
+/// Collects `path`'s components after charging the vector's exact size bound
+/// (a path of `n` bytes has at most `n / 2 + 1` non-empty components).
+fn collect_components<'a>(
+    path: &'a [u8],
+    budget: &mut ComputeBudget,
+) -> Result<Vec<&'a [u8]>, Exhausted> {
+    let bound = path.len() / 2 + 1;
+    budget.charge(path.len().max(1) as u64)?;
+    budget.charge_alloc(bound.saturating_mul(std::mem::size_of::<&[u8]>()))?;
+    let mut out = Vec::with_capacity(bound);
+    out.extend(path_components(path));
+    Ok(out)
+}
+
+/// Returns the number of leading `cand` components matched when every
+/// component of `prot` may match the corresponding `cand` component under an
+/// unlisted equivalence (`prot` is a prefix of `cand`), or `None`.
+fn comps_match_prefix_unlisted<'p>(
+    cand: &[&[u8]],
+    prot: impl Iterator<Item = &'p [u8]>,
+    budget: &mut ComputeBudget,
+) -> Result<Option<usize>, Exhausted> {
+    let mut n = 0usize;
+    for p in prot {
+        let Some(c) = cand.get(n) else {
+            return Ok(None);
+        };
+        if !component_may_match_unlisted(c, p, budget)? {
+            return Ok(None);
+        }
+        n += 1;
+    }
+    Ok(Some(n))
+}
+
+fn comps_match_exact_unlisted<'p>(
+    cand: &[&[u8]],
+    prot: impl Iterator<Item = &'p [u8]>,
+    budget: &mut ComputeBudget,
+) -> Result<bool, Exhausted> {
+    Ok(comps_match_prefix_unlisted(cand, prot, budget)? == Some(cand.len()))
+}
+
+fn str_components(rel: &str) -> impl Iterator<Item = &[u8]> {
+    rel.split('/').filter(|s| !s.is_empty()).map(str::as_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Byte-slice path prefix matching
+// ---------------------------------------------------------------------------
+
+/// Returns `Some(rest)` when `path` is equal to `base` (`rest = b""`) or
+/// strictly below `base` (`base + "/" + rest`).
+pub(crate) fn under_bytes<'a>(path: &'a [u8], base: &[u8]) -> Option<&'a [u8]> {
+    if path == base {
+        return Some(b"");
+    }
+    if base == b"/" {
+        return path.strip_prefix(b"/");
+    }
+    let rest = path.strip_prefix(base)?;
+    rest.strip_prefix(b"/")
+}
+
+/// Returns `Some(rest)` when `path` is equal to `base` (`rest = ""`) or
+/// strictly below `base`.
+pub(crate) fn under_str<'a>(path: &'a str, base: &str) -> Option<&'a str> {
+    if path == base {
+        return Some("");
+    }
+    let b = if base == "/" { "" } else { base };
+    path.strip_prefix(b).and_then(|r| r.strip_prefix('/'))
+}
+
+// ---------------------------------------------------------------------------
+// Shared Sensitive (ported from M1-31 N11, keyed strictly by value)
+// ---------------------------------------------------------------------------
+
+/// Pushes `item` onto `v` after charging the vector's growth (§8): when `v`
+/// is full, the buffer it is about to allocate (double its capacity, at least
+/// four slots) is charged first, so outcome and reason lists never grow
+/// uncharged.
+///
+/// A hit (or an Exhausted record) found before the budget ran out still
+/// stands (§8): when charging its slot is what exhausts the budget, it is
+/// recorded anyway, like the final Exhausted record, and the error returned.
+pub(crate) fn push_charged<T: ChargedRecord>(
+    v: &mut Vec<T>,
+    item: T,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    if v.len() == v.capacity() {
+        let new_cap = v.capacity().saturating_mul(2).max(4);
+        if let Err(e) = budget.charge_alloc(new_cap.saturating_mul(std::mem::size_of::<T>())) {
+            if item.keep_on_exhaustion() {
+                v.push(item);
+            }
+            return Err(e);
+        }
+        v.reserve_exact(new_cap - v.len());
+    }
+    v.push(item);
+    Ok(())
+}
+
+/// Appends `items` to `v` after charging the growth (§8). When the charge
+/// exhausts the budget, the records [`ChargedRecord::keep_on_exhaustion`]
+/// keeps (hits, Exhausted, TooLarge) are still appended, so a hit found
+/// before the budget ran out stands, and the error is returned.
+pub(crate) fn extend_charged<T: ChargedRecord>(
+    v: &mut Vec<T>,
+    items: Vec<T>,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    if v.capacity() - v.len() < items.len() {
+        let new_cap = (v.len() + items.len()).max(v.capacity().saturating_mul(2));
+        if let Err(e) = budget.charge_alloc(new_cap.saturating_mul(std::mem::size_of::<T>())) {
+            v.extend(items.into_iter().filter(ChargedRecord::keep_on_exhaustion));
+            return Err(e);
+        }
+        v.reserve_exact(new_cap - v.len());
+    }
+    v.extend(items);
+    Ok(())
+}
+
+/// A record kept by [`push_charged`] even when its slot exhausts the budget.
+pub(crate) trait ChargedRecord {
+    fn keep_on_exhaustion(&self) -> bool {
+        false
+    }
+}
+
+impl ChargedRecord for PartResult {
+    fn keep_on_exhaustion(&self) -> bool {
+        matches!(
+            self.outcome,
+            PartOutcome::HardDenyHit(_)
+                | PartOutcome::StoreHit(_)
+                | PartOutcome::Unread(_)
+                | PartOutcome::Exhausted(_)
+                | PartOutcome::TooLarge(_)
+        )
+    }
+}
+
+impl ChargedRecord for UnreadReason {}
+impl ChargedRecord for IdentityGap {}
+impl ChargedRecord for Vec<u8> {}
+impl ChargedRecord for (FileIdentity, &'static str) {}
+impl ChargedRecord for (Vec<u8>, u8) {}
+impl ChargedRecord for (Vec<u8>, u8, bool) {}
+impl ChargedRecord for (Vec<u8>, Option<FileIdentity>) {}
+impl ChargedRecord for (Vec<u8>, Vec<u8>, usize) {}
+impl ChargedRecord for (Vec<u8>, Vec<u8>, u8) {}
+impl ChargedRecord for Option<Vec<u8>> {}
+impl ChargedRecord for Target {}
+impl ChargedRecord for PartId {}
+impl ChargedRecord for ProtectedRoot {}
+impl ChargedRecord for SpelledRoot {}
+impl ChargedRecord for (Vec<u8>, Vec<u8>) {}
+
+/// Folds every path of `paths`, charging the list's allocation before building
+/// it (each fold charges its own work and allocation).
+fn fold_path_list(
+    paths: &[Vec<u8>],
+    folds: FoldRules,
+    budget: &mut ComputeBudget,
+) -> Result<Vec<Vec<u8>>, Exhausted> {
+    budget.charge_alloc(paths.len().saturating_mul(std::mem::size_of::<Vec<u8>>()))?;
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        out.push(fold_path_listed(p, folds, budget)?);
+    }
+    Ok(out)
+}
+
+/// Cached folded representation of [`ProtectedSet`]'s path lists, shared across
+/// checks on the same thread while the folded key stays equal (M1-31 N11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SharedSensitive {
+    raw_home: Vec<u8>,
+    raw_data: Vec<Vec<u8>>,
+    raw_protected: Vec<Vec<u8>>,
+    raw_ssh_linked: Vec<Vec<u8>>,
+    key_home: Vec<u8>,
+    key_data: Vec<Vec<u8>>,
+    key_protected: Vec<Vec<u8>>,
+    key_ssh_linked: Vec<Vec<u8>>,
+    key_folds: FoldRules,
+}
+
+impl SharedSensitive {
+    /// Returns an `Rc<SharedSensitive>` for `protected`, reusing the
+    /// thread-local cache when the folded home, data, protected, ssh-linked
+    /// lists and `FoldRules` match by value (M1-31 review 1, finding 1).
+    ///
+    /// Precharges compute and heap allocations against `budget` before folding
+    /// or building a cache entry (§8).
+    pub(crate) fn for_protected_budgeted(
+        protected: &ProtectedSet,
+        budget: &mut ComputeBudget,
+    ) -> Result<Rc<Self>, Exhausted> {
+        thread_local! {
+            static LAST: RefCell<Option<Rc<SharedSensitive>>> = const { RefCell::new(None) };
+        }
+        let folds = protected.folds;
+        let input_bytes = protected.home.len()
+            + protected
+                .atrium_data_paths
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+            + protected
+                .atrium_protected_paths
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+            + protected
+                .ssh_linked_dirs
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
+        budget.charge(input_bytes.max(1) as u64)?;
+
+        // Zero-allocation fast path when raw inputs are identical to the cached entry.
+        if let Some(hit) = LAST.with(|slot| {
+            let slot = slot.borrow();
+            if let Some(cached) = slot.as_ref()
+                && cached.key_folds == folds
+                && cached.raw_home == protected.home
+                && cached.raw_data == protected.atrium_data_paths
+                && cached.raw_protected == protected.atrium_protected_paths
+                && cached.raw_ssh_linked == protected.ssh_linked_dirs
+            {
+                return Some(Rc::clone(cached));
+            }
+            None
+        }) {
+            return Ok(hit);
+        }
+
+        // Each fold charges its own work and allocations before running; the
+        // second cache comparison below is charged here (§8).
+        budget.charge(input_bytes.max(1) as u64)?;
+        let key_home = fold_path_listed(&protected.home, folds, budget)?;
+        let key_data = fold_path_list(&protected.atrium_data_paths, folds, budget)?;
+        let key_protected = fold_path_list(&protected.atrium_protected_paths, folds, budget)?;
+        let key_ssh_linked = fold_path_list(&protected.ssh_linked_dirs, folds, budget)?;
+
+        if let Some(hit) = LAST.with(|slot| {
+            let slot = slot.borrow();
+            if let Some(cached) = slot.as_ref()
+                && cached.key_folds == folds
+                && cached.key_home == key_home
+                && cached.key_data == key_data
+                && cached.key_protected == key_protected
+                && cached.key_ssh_linked == key_ssh_linked
+            {
+                return Some(Rc::clone(cached));
+            }
+            None
+        }) {
+            return Ok(hit);
+        }
+
+        // Cache miss: precharge allocation for storing raw copies + `SharedSensitive`.
+        budget.charge_alloc(std::mem::size_of::<Self>() + input_bytes)?;
+        let built = Rc::new(Self {
+            raw_home: protected.home.clone(),
+            raw_data: protected.atrium_data_paths.clone(),
+            raw_protected: protected.atrium_protected_paths.clone(),
+            raw_ssh_linked: protected.ssh_linked_dirs.clone(),
+            key_home,
+            key_data,
+            key_protected,
+            key_ssh_linked,
+            key_folds: folds,
+        });
+        LAST.with(|slot| {
+            *slot.borrow_mut() = Some(Rc::clone(&built));
+        });
+        Ok(built)
+    }
+
+    /// Convenience wrapper for tests that inspects the thread-local cache
+    /// using default limits.
+    #[cfg(test)]
+    pub(crate) fn for_protected(protected: &ProtectedSet) -> Rc<Self> {
+        let mut budget = ComputeBudget::with_default_limits();
+        Self::for_protected_budgeted(protected, &mut budget)
+            .expect("SharedSensitive fits default budget")
+    }
+
+    pub(crate) fn home_folded(&self) -> &[u8] {
+        &self.key_home
+    }
+
+    pub(crate) fn data_folded(&self) -> &[Vec<u8>] {
+        &self.key_data
+    }
+
+    pub(crate) fn ssh_linked_folded(&self) -> &[Vec<u8>] {
+        &self.key_ssh_linked
+    }
+
+    /// Checks a folded path against hard-deny rules for `access`.
+    pub(crate) fn hard_deny_hit_folded(
+        &self,
+        pl: &[u8],
+        access: AccessMode,
+    ) -> Option<&'static str> {
+        hard_deny_match_parts(
+            pl,
+            &self.key_home,
+            &self.key_data,
+            &self.key_protected,
+            &self.key_ssh_linked,
+            access,
+        )
+    }
+
+    /// Checks a folded path against CR-12 + CR-17 credential store rules.
+    pub(crate) fn store_hit_folded(&self, pl: &[u8]) -> Option<&'static str> {
+        store_match_parts(pl, &self.key_home)
+    }
+
+    /// Checks whether `canonical` matches a protected path (hard-deny or store)
+    /// under extended equivalences (NFC/NFD, unlisted case folds,
+    /// default-ignorable code points, or conservatively any scalar the exact
+    /// table does not fully decompose) when it did NOT match under the listed
+    /// folds (§11 item 13). Every protected name is compared component by
+    /// component without allocating; the candidate's component list is charged
+    /// before it is built (§8).
+    pub(crate) fn matches_unlisted_equivalence(
+        &self,
+        canonical: &[u8],
+        access: AccessMode,
+        budget: &mut ComputeBudget,
+    ) -> Result<bool, Exhausted> {
+        let writes = access != AccessMode::Read;
+        let cand_comps = collect_components(canonical, budget)?;
+
+        for d in &self.raw_data {
+            if comps_match_prefix_unlisted(&cand_comps, path_components(d), budget)?.is_some() {
+                return Ok(true);
+            }
+        }
+        if writes {
+            for d in &self.raw_protected {
+                if comps_match_prefix_unlisted(&cand_comps, path_components(d), budget)?.is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+        for d in &self.raw_ssh_linked {
+            if let Some(n) = comps_match_prefix_unlisted(&cand_comps, path_components(d), budget)?
+                && (cand_comps.len() > n || writes)
+            {
+                return Ok(true);
+            }
+        }
+
+        let Some(home_n) =
+            comps_match_prefix_unlisted(&cand_comps, path_components(&self.raw_home), budget)?
+        else {
+            return Ok(false);
+        };
+        let rest = &cand_comps[home_n..];
+        if rest.is_empty() {
+            return Ok(false);
+        }
+
+        for f in CRED_FILES {
+            if comps_match_exact_unlisted(rest, str_components(f), budget)? {
+                return Ok(true);
+            }
+        }
+        for t in CRED_TREES {
+            if comps_match_prefix_unlisted(rest, str_components(t), budget)?.is_some() {
+                return Ok(true);
+            }
+        }
+        if component_may_match_unlisted(rest[0], b".ssh", budget)? {
+            if rest.len() == 1 {
+                if writes {
+                    return Ok(true);
+                }
+            } else {
+                let last = rest[rest.len() - 1];
+                let (last_ext, _) = fold_extended_component_tracked(last, budget)?;
+                let is_public = last_ext.ends_with(b".pub") || last_ext.starts_with(b"known_hosts");
+                let is_readable_cfg = rest.len() == 2
+                    && (component_may_match_unlisted(rest[1], b"config", budget)?
+                        || component_may_match_unlisted(rest[1], b"authorized_keys", budget)?);
+                if !(is_public || (is_readable_cfg && !writes)) {
+                    return Ok(true);
+                }
+            }
+        }
+        for b in BROWSER_ROOTS {
+            if let Some(n) = comps_match_prefix_unlisted(rest, str_components(b), budget)?
+                && rest.len() > n
+            {
+                let last = rest[rest.len() - 1];
+                for bf in BROWSER_FILES {
+                    if component_may_match_unlisted(last, bf.as_bytes(), budget)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        for &(f, _) in ASK_FILES {
+            if comps_match_exact_unlisted(rest, str_components(f), budget)? {
+                return Ok(true);
+            }
+        }
+        for &(t, _) in ASK_TREES {
+            if comps_match_prefix_unlisted(rest, str_components(t), budget)?.is_some() {
+                return Ok(true);
+            }
+        }
+        for &(dir, pre, _) in ASK_NAME_PREFIXES {
+            if let Some(n) = comps_match_prefix_unlisted(rest, str_components(dir), budget)?
+                && rest.len() == n + 1
+            {
+                let (last_ext, _) = fold_extended_component_tracked(rest[n], budget)?;
+                if last_ext.starts_with(pre.as_bytes()) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Charges the work and an upper bound of the allocations of a probe list
+    /// of `count` entries before it is built (§8): each probe is a folded base
+    /// (home or an Atrium data path) joined with a relative name of at most 80
+    /// bytes, and building it makes at most one temporary of the same size.
+    fn charge_probe_list(&self, count: usize, budget: &mut ComputeBudget) -> Result<(), Exhausted> {
+        let base = self
+            .key_data
+            .iter()
+            .map(Vec::len)
+            .chain(std::iter::once(self.key_home.len()))
+            .max()
+            .unwrap_or(0);
+        let per_probe = base
+            .saturating_add(80)
+            .saturating_mul(2)
+            .saturating_add(std::mem::size_of::<(Vec<u8>, &str)>());
+        budget.charge((count as u64).saturating_mul(base as u64 + 80))?;
+        budget.charge_alloc(count.saturating_mul(per_probe))
+    }
+
+    /// Representative hard-deny probe paths (folded lowercase, absolute) for
+    /// §2/§5 filter probe matching (same set as `dev`'s `Sensitive::probes`).
+    pub(crate) fn hard_deny_probes(
+        &self,
+        budget: &mut ComputeBudget,
+    ) -> Result<Vec<(Vec<u8>, &'static str)>, Exhausted> {
+        let count = CRED_FILES.len()
+            + 2 * CRED_TREES.len()
+            + SSH_PROBES.len()
+            + 2 * BROWSER_ROOTS.len() * BROWSER_FILE_PROBES.len()
+            + 2 * self.key_data.len();
+        self.charge_probe_list(count, budget)?;
+        let join = |base: &[u8], rel: &str| join_folded(base, rel.as_bytes());
+        let mut out = Vec::with_capacity(count);
+        for f in CRED_FILES {
+            out.push((join(&self.key_home, f), "credential-read"));
+        }
+        for t in CRED_TREES {
+            let tree = join(&self.key_home, t);
+            out.push((join(&tree, "x"), "credential-read"));
+            out.push((tree, "credential-read"));
+        }
+        let ssh = join(&self.key_home, ".ssh");
+        for n in SSH_PROBES {
+            out.push((join(&ssh, n), "credential-read"));
+        }
+        for b in BROWSER_ROOTS {
+            let root = join(&self.key_home, b);
+            for f in BROWSER_FILE_PROBES {
+                out.push((join(&root, f), "credential-read"));
+                out.push((join(&join(&root, "default"), f), "credential-read"));
+            }
+        }
+        for d in &self.key_data {
+            out.push((d.clone(), "atrium-self"));
+            out.push((join(d, "x"), "atrium-self"));
+        }
+        Ok(out)
+    }
+
+    /// Representative credential-store probe paths (folded lowercase, absolute)
+    /// for §5 filter probe matching (CR-12 + CR-17).
+    pub(crate) fn store_probes(
+        &self,
+        budget: &mut ComputeBudget,
+    ) -> Result<Vec<(Vec<u8>, &'static str)>, Exhausted> {
+        let count = ASK_FILES.len() + 5 * ASK_TREES.len() + 2 * ASK_NAME_PREFIXES.len();
+        self.charge_probe_list(count, budget)?;
+        let join = |base: &[u8], rel: &str| join_folded(base, rel.as_bytes());
+        let mut out = Vec::with_capacity(count);
+        for &(f, family) in ASK_FILES {
+            out.push((join(&self.key_home, f), family));
+        }
+        for &(t, family) in ASK_TREES {
+            let tree = join(&self.key_home, t);
+            out.push((tree.clone(), family));
+            out.push((join(&tree, "x.json"), family));
+            if t == ".zsh_sessions" {
+                out.push((join(&tree, "x.session"), family));
+                out.push((join(&tree, "x.history"), family));
+                out.push((join(&tree, "x.historynew"), family));
+            } else if t == ".bash_sessions" {
+                out.push((join(&tree, "x.session"), family));
+                out.push((join(&tree, "x.history"), family));
+            }
+        }
+        for &(dir, pre, family) in ASK_NAME_PREFIXES {
+            let base = join(&self.key_home, dir);
+            out.push((join(&base, &format!("{pre}json")), family));
+            out.push((join(&base, &format!("{pre}bin")), family));
+        }
+        Ok(out)
+    }
+}
+
+pub(crate) fn join_folded(base: &[u8], rel: &[u8]) -> Vec<u8> {
+    if rel.is_empty() {
+        return base.to_vec();
+    }
+    let mut v = Vec::with_capacity(base.len() + 1 + rel.len());
+    if base != b"/" {
+        v.extend_from_slice(base);
+    }
+    v.push(b'/');
+    v.extend_from_slice(rel);
+    v
+}
+
+fn hard_deny_match_parts(
+    pl: &[u8],
+    home: &[u8],
+    data: &[Vec<u8>],
+    protected: &[Vec<u8>],
+    ssh_linked: &[Vec<u8>],
+    access: AccessMode,
+) -> Option<&'static str> {
+    let writes = access != AccessMode::Read;
+    for d in data {
+        if under_bytes(pl, d).is_some() {
+            return Some("atrium-self");
+        }
+    }
+    if writes {
+        for d in protected {
+            if under_bytes(pl, d).is_some() {
+                return Some("atrium-self");
+            }
+        }
+    }
+    for d in ssh_linked {
+        if let Some(rest) = under_bytes(pl, d)
+            && (!rest.is_empty() || writes)
+        {
+            return Some("credential-read");
+        }
+    }
+    let rest_bytes = under_bytes(pl, home)?;
+    let rest = std::str::from_utf8(rest_bytes).ok()?;
+    if CRED_FILES.contains(&rest) || CRED_TREES.iter().any(|t| under_str(rest, t).is_some()) {
+        return Some("credential-read");
+    }
+    if let Some(r) = under_str(rest, ".ssh") {
+        if r.is_empty() {
+            if writes {
+                return Some("credential-read");
+            }
+        } else {
+            let name = r.rsplit('/').next().unwrap_or(r);
+            let public = name.ends_with(".pub") || name.starts_with("known_hosts");
+            let readable_config = r == "config" || r == "authorized_keys";
+            if !(public || (readable_config && !writes)) {
+                return Some("credential-read");
+            }
+        }
+    }
+    for b in BROWSER_ROOTS {
+        if let Some(r) = under_str(rest, b) {
+            let name = r.rsplit('/').next().unwrap_or(r);
+            if BROWSER_FILES.contains(&name) {
+                return Some("credential-read");
+            }
+        }
+    }
+    None
+}
+
+fn store_match_parts(pl: &[u8], home: &[u8]) -> Option<&'static str> {
+    let rest_bytes = under_bytes(pl, home)?;
+    let rest = std::str::from_utf8(rest_bytes).ok()?;
+    for &(f, family) in ASK_FILES {
+        if rest == f {
+            return Some(family);
+        }
+    }
+    for &(t, family) in ASK_TREES {
+        if under_str(rest, t).is_some() {
+            return Some(family);
+        }
+    }
+    for &(dir, pre, family) in ASK_NAME_PREFIXES {
+        if let Some(r) = under_str(rest, dir)
+            && !r.contains('/')
+            && r.starts_with(pre)
+        {
+            return Some(family);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Written spellings (D-147: protected names on the written spelling too)
+// ---------------------------------------------------------------------------
+
+/// The written spelling of a path operand, as `dev`'s `words::lexical_resolve`
+/// gives it: `~` and `~/…` expanded to `home`, a relative path joined onto
+/// `cwd` (the written working directory), `.` removed, `..` popping a
+/// component (never above `/`). `None` for spellings literal resolution does
+/// not model (empty, NUL, `~user`). Work and allocation are charged first
+/// (§8).
+pub(crate) fn lexical_spelling(
+    raw: &[u8],
+    cwd: &[u8],
+    home: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<Option<Vec<u8>>, Exhausted> {
+    if raw.is_empty() || raw.contains(&0) {
+        return Ok(None);
+    }
+    let (base, rest): (&[u8], &[u8]) = if raw == b"~" {
+        (home, b"")
+    } else if let Some(r) = raw.strip_prefix(b"~/") {
+        (home, r)
+    } else if raw.starts_with(b"~") {
+        return Ok(None);
+    } else if raw.starts_with(b"/") {
+        (b"/", raw)
+    } else {
+        (cwd, raw)
+    };
+    let len = base.len() + 1 + rest.len();
+    budget.charge(len as u64 * 2 + 1)?;
+    budget.charge_alloc(len + 1)?;
+    let mut out: Vec<u8> = Vec::with_capacity(len + 1);
+    for comp in base
+        .split(|&b| b == b'/')
+        .chain(rest.split(|&b| b == b'/'))
+        .filter(|c| !c.is_empty())
+    {
+        match comp {
+            b"." => {}
+            b".." => {
+                let cut = out.iter().rposition(|&b| b == b'/').unwrap_or(0);
+                out.truncate(cut);
+            }
+            _ => {
+                out.push(b'/');
+                out.extend_from_slice(comp);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(b'/');
+    }
+    Ok(Some(out))
+}
+
+/// The hit (hard-deny, else store) that a written spelling names under the
+/// listed folds, with `dev`'s exceptions (public `.ssh` names, readable
+/// `config` / `authorized_keys`), for `part` (D-147). `dev` compares
+/// protected names on the written spelling as well as on the resolved path
+/// (`Sensitive::hit` over `Analysis::all_paths`), so a protected spelling
+/// stays a hit when a root or the entry itself is a link, or does not exist
+/// yet below an aliased root.
+pub(crate) fn written_name_hit(
+    written: &[u8],
+    access: AccessMode,
+    part: &PartId,
+    protected: &ProtectedSet,
+    budget: &mut ComputeBudget,
+) -> Result<Option<PartResult>, Exhausted> {
+    let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
+    let folded = fold_path_listed(written, protected.folds, budget)?;
+    budget.charge(folded.len() as u64 + 1)?;
+    let outcome = if let Some(id) = shared.hard_deny_hit_folded(&folded, access) {
+        budget.charge_alloc(written.len())?;
+        PartOutcome::HardDenyHit(Hit {
+            hard_deny_id: Some(id),
+            source: HitSource::Model,
+            matched: HitMatch::ProtectedPath {
+                path: written.to_vec(),
+            },
+            part: part.clone(),
+        })
+    } else if let Some(family) = shared.store_hit_folded(&folded) {
+        PartOutcome::StoreHit(Hit {
+            hard_deny_id: None,
+            source: HitSource::Model,
+            matched: HitMatch::StoreFamily { family },
+            part: part.clone(),
+        })
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(PartResult {
+        part: part.clone(),
+        outcome,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Target checking (§5)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn origin_to_part(origin: &TargetOrigin) -> PartId {
+    match origin {
+        TargetOrigin::Operand { unit, argv_index } => PartId::Operand {
+            unit: *unit,
+            argv_index: *argv_index,
+        },
+        TargetOrigin::Redirect {
+            unit,
+            redirect_index,
+        } => PartId::Redirect {
+            unit: *unit,
+            redirect_index: *redirect_index,
+        },
+        TargetOrigin::SubjectPath { path_index } => PartId::SubjectPath {
+            path_index: *path_index,
+        },
+        TargetOrigin::ImplicitCwd { unit } => unit.map_or(PartId::WholeCall, PartId::Unit),
+        TargetOrigin::ExpandedFrom { source, .. } => source.clone(),
+    }
+}
+
+/// Checks one resolved (or unread) [`Target`] against `protected`: identities,
+/// listed name folds, and unlisted volume equivalences (§5, §11 item 13).
+fn unread_reason_alloc_bytes(reason: &UnreadReason) -> usize {
+    match reason {
+        UnreadReason::ProcessDependentPath { path }
+        | UnreadReason::UnresolvablePath { path }
+        | UnreadReason::UnlistedNameEquivalence { path }
+        | UnreadReason::FollowedLinkUnderFilter { path } => path.len(),
+        UnreadReason::VariantOnlyGlobMatch { pattern } => pattern.len(),
+        UnreadReason::ReservedWordOrConstruct { construct } => construct.len(),
+        UnreadReason::UnsupportedWrapperForm { wrapper } => wrapper.len(),
+        UnreadReason::UnsupportedNestedShellForm { shell } => shell.len(),
+        UnreadReason::CodeRunnerInlineCode { tool }
+        | UnreadReason::OutsideToolModel { tool }
+        | UnreadReason::DerivedDestinations { tool } => tool.len(),
+        UnreadReason::Program { program_words } => {
+            program_words.iter().map(String::len).sum::<usize>()
+        }
+        UnreadReason::UnknownFlag { tool, flag }
+        | UnreadReason::UnsupportedBaseDirChange { tool, flag }
+        | UnreadReason::UnsupportedFlagEffect { tool, flag } => tool.len() + flag.len(),
+        UnreadReason::GitWildcardPathspec { pathspec } => pathspec.len(),
+        UnreadReason::UnsupportedRedirect { op } => op.len(),
+        _ => 0,
+    }
+}
+
+/// `check_target` (§5, D-144, D-147, D-149): every record of the target (see
+/// [`check_target_into`]) reduced to one, the strictest: a hard-deny hit, else
+/// a reason for doubt (Unread), else the Store hit or Clear. A hard-deny hit
+/// established before the budget ran out stands (§1, §8).
+pub(crate) fn check_target_impl(
+    target: &Target,
+    protected: &ProtectedSet,
+    budget: &mut ComputeBudget,
+) -> Result<PartResult, Exhausted> {
+    let mut records: Vec<PartResult> = Vec::new();
+    if let Err(e) = check_target_into(target, protected, budget, &mut records, true, true) {
+        return match records
+            .into_iter()
+            .find(|r| matches!(r.outcome, PartOutcome::HardDenyHit(_)))
+        {
+            Some(hit) => Ok(hit),
+            None => Err(e),
+        };
+    }
+    let pick = records
+        .iter()
+        .position(|r| matches!(r.outcome, PartOutcome::HardDenyHit(_)))
+        .or_else(|| {
+            records
+                .iter()
+                .position(|r| matches!(r.outcome, PartOutcome::Unread(_)))
+        })
+        .unwrap_or(0);
+    Ok(records
+        .into_iter()
+        .nth(pick)
+        .expect("check_target_into records at least one outcome"))
+}
+
+/// Attaches the first applicable [`ProtectedSet::identity_gaps`] entry to `out`
+/// whenever `out[start..]` does not already hold a `HardDenyHit` (and `target`
+/// is not a variant-only glob match), deduplicating against an identical
+/// `Unread` reason already recorded for this target (for example when
+/// `RootAliases::incomplete` observed the exact same failure). Distinct
+/// reasons for doubt are both preserved (contract §1, §5; `model.rs`
+/// `ProtectedSet::identity_gaps`; D-144, D-145).
+fn attach_applicable_gap(
+    target: &Target,
+    protected: &ProtectedSet,
+    budget: &mut ComputeBudget,
+    out: &mut Vec<PartResult>,
+    start: usize,
+) -> Result<(), Exhausted> {
+    if !matches!(target.resolution, TargetResolution::Resolved { .. })
+        || out[start..]
+            .iter()
+            .any(|r| matches!(r.outcome, PartOutcome::HardDenyHit(_)))
+        || matches!(
+            target.origin,
+            TargetOrigin::ExpandedFrom {
+                variant_only: true,
+                ..
+            }
+        )
+    {
+        return Ok(());
+    }
+    if let Some(gap) = applicable_gap(target, protected, budget)? {
+        budget.charge((out.len() - start) as u64 + 1)?;
+        if out[start..]
+            .iter()
+            .any(|r| matches!(&r.outcome, PartOutcome::Unread(u) if u == &gap.reason))
+        {
+            return Ok(());
+        }
+        let part = origin_to_part(&target.origin);
+        let bytes = unread_reason_alloc_bytes(&gap.reason);
+        budget.charge(bytes as u64 + 1)?;
+        budget.charge_alloc(bytes)?;
+        push_charged(
+            out,
+            PartResult {
+                part,
+                outcome: PartOutcome::Unread(gap.reason.clone()),
+            },
+            budget,
+        )?;
+    }
+    Ok(())
+}
+
+/// Appends every record of `target` to `out` (§1 keeps every hit and every
+/// reason for doubt), each as soon as it is established, so a later
+/// exhaustion never loses it (§8; review 6, finding 1):
+/// - the protected names on its written spelling (`Target::written`, D-147,
+///   D-149), checked first, so an Unread resolution keeps the hit beside its
+///   reason;
+/// - the exact check of the canonical path (identities, listed folds,
+///   unlisted equivalences);
+/// - the unlisted equivalences (NFC/NFD, unlisted case folds) of the written
+///   spelling, when nothing else matched (§11 item 13);
+/// - when `attach_gap` is `true`, the identity gap that applies unless a
+///   `HardDenyHit` or identical `Unread` reason was already recorded
+///   (resolver-backed callers pass `false` and attach the gap after
+///   [`push_alias_records`] so an alias-only `HardDenyHit` never carries a
+///   spurious gap `Unread`, while distinct gap and alias-table reasons are
+///   both kept per §1 and D-144).
+///
+/// A hard-deny hit ends the list. A Clear outcome is recorded only when
+/// `keep_clear`. Variant-only matches are never hits, so their written
+/// spelling is not checked.
+pub(crate) fn check_target_into(
+    target: &Target,
+    protected: &ProtectedSet,
+    budget: &mut ComputeBudget,
+    out: &mut Vec<PartResult>,
+    keep_clear: bool,
+    attach_gap: bool,
+) -> Result<(), Exhausted> {
+    let part = origin_to_part(&target.origin);
+    let variant_only = matches!(
+        target.origin,
+        TargetOrigin::ExpandedFrom {
+            variant_only: true,
+            ..
+        }
+    );
+    let written = if variant_only {
+        None
+    } else {
+        target.written.as_deref()
+    };
+    let start = out.len();
+
+    let mut written_store = false;
+    if let Some(w) = written
+        && let Some(hit) = written_name_hit(w, target.access, &part, protected, budget)?
+    {
+        let hard = matches!(hit.outcome, PartOutcome::HardDenyHit(_));
+        written_store = !hard;
+        push_charged(out, hit, budget)?;
+        // A hard-deny hit ends the list, except that an Unread
+        // resolution still records its reason beside the hit (§1; review 5,
+        // finding 1).
+        if hard && !matches!(target.resolution, TargetResolution::Unread(_)) {
+            return Ok(());
+        }
+    }
+    let canonical = match &target.resolution {
+        TargetResolution::Unread(_) => {
+            let exact = check_target_exact(target, protected, budget)?;
+            return push_charged(out, exact, budget);
+        }
+        TargetResolution::Resolved { canonical, .. } => canonical,
+    };
+
+    let exact = check_target_exact(target, protected, budget)?;
+    match exact.outcome {
+        PartOutcome::HardDenyHit(_) | PartOutcome::Unread(_) => {
+            let hard = matches!(exact.outcome, PartOutcome::HardDenyHit(_));
+            push_charged(out, exact, budget)?;
+            if hard {
+                return Ok(());
+            }
+        }
+        PartOutcome::StoreHit(_) if !written_store => push_charged(out, exact, budget)?,
+        PartOutcome::Clear if !written_store => {
+            // The written spelling's unlisted equivalences, when nothing
+            // matched (§11 item 13).
+            let mut record = exact;
+            if let Some(w) = written
+                && w != canonical.as_slice()
+            {
+                let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
+                if shared.matches_unlisted_equivalence(w, target.access, budget)? {
+                    budget.charge_alloc(w.len())?;
+                    record = PartResult {
+                        part,
+                        outcome: PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence {
+                            path: w.to_vec(),
+                        }),
+                    };
+                }
+            }
+            if keep_clear || !matches!(record.outcome, PartOutcome::Clear) {
+                push_charged(out, record, budget)?;
+            }
+        }
+        _ => {}
+    }
+
+    if attach_gap {
+        attach_applicable_gap(target, protected, budget, out, start)?;
+    }
+    Ok(())
+}
+
+/// A protected root before its identity is read: spelling, hard-deny id,
+/// store family, (read, held, reach, alias) (see [`ProtectedRoot`]).
+type SpelledRoot = (
+    Vec<u8>,
+    Option<&'static str>,
+    &'static str,
+    (bool, bool, bool, bool),
+);
+
+/// `dev`'s spelling of a store root whose entry in [`ASK_FILES`] is folded
+/// (`deny.rs`: `.azure/accessTokens.json`). The alias table reads the root
+/// on this spelling (review 8 sweep).
+const DEV_ROOT_SPELLINGS: &[(&str, &str)] =
+    &[(".azure/accesstokens.json", ".azure/accessTokens.json")];
+
+/// `dev`'s `ask_roots` reads at most this many entries of each folder that
+/// holds name-prefixed store entries (`take(256)`).
+const ASK_PREFIX_ENTRIES: usize = 256;
+
+/// macOS Data volume firmlink, stripped before the alias scan as `dev`'s
+/// `alias_fix` does (case-sensitive `strip_prefix`).
+const FIRMLINK: &[u8] = b"/System/Volumes/Data";
+
+/// A protected root as `dev`'s `evaluate_sync` lists it for `alias_fix`
+/// (`sensitive_roots` and `ask_roots`, each with its `(dev, ino)` identity
+/// read through links) and for `links_below` (`trees_of`: the canonical
+/// path).
+pub(crate) struct ProtectedRoot {
+    /// `dev`'s `identity(&r)`: `stat`, following links.
+    identity: FileIdentity,
+    /// `dev`'s `trees_of`: the canonical path, when it could be read.
+    canonical: Option<Vec<u8>>,
+    spelled: Vec<u8>,
+    /// The hard-deny id, or `None` for a store root that asks.
+    id: Option<&'static str>,
+    /// The store family of a store root.
+    family: &'static str,
+    /// Reading counts, not only writing (`Tree::read`).
+    read: bool,
+    /// A recursive reader given a folder that holds the root reaches it
+    /// (`Tree::held`: `trees_of` sets it for every tree built with the
+    /// `credential-read` id, which includes the store roots that ask).
+    held: bool,
+    /// The root is one of `dev`'s trees (`links_below`). False only for a
+    /// folder that holds name-prefixed store entries (`~/.azure` for MSAL):
+    /// `dev`'s `ask_roots` lists the entries, not the folder, so the folder
+    /// only spells the paths below it (`alias_fix`; the names below it then
+    /// decide) and is never reached wholesale (review 6, finding 4; review
+    /// 7, finding 2).
+    reach: bool,
+    /// The root is one of `dev`'s `alias_fix` roots. False only for a folder
+    /// linked into `~/.ssh`: `dev`'s `ssh_members` returns it among
+    /// `linked_dirs` (a tree for `links_below`), while only the files in it
+    /// are members.
+    alias: bool,
+}
+
+/// The result of `dev`'s `alias_fix` scan of one path.
+#[derive(Default)]
+pub(crate) struct AliasScan {
+    /// The root's own spelling plus the rest of the path, when an ancestor
+    /// of the path (or the path) has the identity of a protected root.
+    pub(crate) alias: Option<Vec<u8>>,
+    /// Why the scan could not be completed: the table is incomplete, or an
+    /// ancestor's identity could not be read (a cap or an I/O failure, §8).
+    pub(crate) unread: Option<UnreadReason>,
+}
+
+/// The protected roots with their identities and canonical paths, built once
+/// per call through the resolver (charged), for `dev`'s two alias rules (a
+/// literal port of `gate.rs`, D-154):
+/// - `alias_fix`: a path with an ancestor (or itself) that is the same file
+///   or folder as a protected root, by `(dev, ino)`, is named as the root's
+///   spelling plus the rest. This covers links, bind mounts and any other
+///   second name of a root, even when the root's spelling is canonical;
+/// - `links_below` / `in_trees`: a followed link whose real path is in, is,
+///   or holds a protected root's canonical path reaches it.
+///
+/// Where `dev` skips a root whose identity it cannot read, P2 skips only an
+/// absent one: a cap or an I/O failure makes the table incomplete, its first
+/// reason is kept, and every scan reports it (§8; review 6, finding 2).
+#[derive(Default)]
+pub(crate) struct RootAliases {
+    roots: Option<Vec<ProtectedRoot>>,
+    incomplete: Option<UnreadReason>,
+    /// Bounded per-call cache of proper-ancestor `stat` identities so a large
+    /// operand list under a deep working directory (such as macOS's 7-component
+    /// tempdirs) does not re-stat every ancestor on every operand (§8; review 9,
+    /// finding 1). Only proper ancestors (`i + 1 < comps.len()`, never leaves)
+    /// are cached, and every insertion is charged before it allocates.
+    ancestor_stats: HashMap<Vec<u8>, Option<FileIdentity>>,
+}
+
+/// Records the first reason a filesystem step could not be established.
+fn note_unread(
+    slot: &mut Option<UnreadReason>,
+    err: ResolveError,
+    path: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    let reason = match err {
+        ResolveError::Exhausted(e) => return Err(e),
+        ResolveError::CapReached(c) => UnreadReason::from(c),
+        ResolveError::NotFound | ResolveError::Io(_) => {
+            if slot.is_some() {
+                return Ok(());
+            }
+            budget.charge_alloc(path.len())?;
+            UnreadReason::UnresolvablePath {
+                path: path.to_vec(),
+            }
+        }
+    };
+    slot.get_or_insert(reason);
+    Ok(())
+}
+
+/// Absence, as `dev` treats a root or ancestor it cannot find.
+fn is_absent(err: &ResolveError) -> bool {
+    matches!(
+        err,
+        ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)
+    )
+}
+
+impl RootAliases {
+    pub(crate) fn roots(
+        &mut self,
+        protected: &ProtectedSet,
+        resolver: &dyn PathResolver,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<&[ProtectedRoot], Exhausted> {
+        if self.roots.is_none() {
+            let spelled = self.spelled_roots(protected, resolver, caps, budget)?;
+            let mut roots = Vec::new();
+            for (p, id, family, (read, held, reach, alias)) in spelled {
+                // `dev`'s `identity(&r)` (`fs::metadata`, following links).
+                let identity = match resolver.stat(&p, caps, budget) {
+                    Ok(PathMetadata {
+                        identity: Some(i), ..
+                    }) => i,
+                    Ok(_) => {
+                        note_unread(
+                            &mut self.incomplete,
+                            ResolveError::Io(FsIoError::Other),
+                            &p,
+                            budget,
+                        )?;
+                        continue;
+                    }
+                    Err(e) if is_absent(&e) => continue,
+                    Err(e) => {
+                        note_unread(&mut self.incomplete, e, &p, budget)?;
+                        continue;
+                    }
+                };
+                // `dev`'s `trees_of` (`fs::canonicalize`), for the trees only.
+                let canonical = match reach.then(|| resolver.canonicalize(&p, caps, budget)) {
+                    None => None,
+                    Some(Ok(c)) => Some(c),
+                    Some(Err(e)) if is_absent(&e) => None,
+                    Some(Err(e)) => {
+                        note_unread(&mut self.incomplete, e, &p, budget)?;
+                        None
+                    }
+                };
+                push_charged(
+                    &mut roots,
+                    ProtectedRoot {
+                        identity,
+                        canonical,
+                        spelled: p,
+                        id,
+                        family,
+                        read,
+                        held,
+                        reach,
+                        alias,
+                    },
+                    budget,
+                )?;
+            }
+            self.roots = Some(roots);
+        }
+        Ok(self.roots.as_deref().unwrap_or(&[]))
+    }
+
+    /// `dev`'s `sensitive_roots` then `ask_roots` (ASK_FILES, ASK_TREES and
+    /// the name-prefixed entries of each prefix folder, at most
+    /// [`ASK_PREFIX_ENTRIES`] read), every spelling charged before it is
+    /// built (§8).
+    fn spelled_roots(
+        &mut self,
+        protected: &ProtectedSet,
+        resolver: &dyn PathResolver,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<Vec<SpelledRoot>, Exhausted> {
+        let home = protected.home.as_slice();
+        let total: usize = [".ssh"]
+            .iter()
+            .chain(CRED_FILES)
+            .chain(CRED_TREES)
+            .chain(BROWSER_ROOTS)
+            .copied()
+            .chain(ASK_FILES.iter().map(|(f, _)| *f))
+            .chain(ASK_TREES.iter().map(|(t, _)| *t))
+            .chain(ASK_NAME_PREFIXES.iter().map(|(d, _, _)| *d))
+            .map(|rel| home.len() + 1 + rel.len())
+            .chain(protected.atrium_data_paths.iter().map(Vec::len))
+            .chain(protected.atrium_protected_paths.iter().map(Vec::len))
+            .sum();
+        budget.charge(total as u64 + 1)?;
+        budget.charge_alloc(total)?;
+        let mut spelled: Vec<SpelledRoot> = Vec::new();
+        let cred = Some("credential-read");
+        for rel in std::iter::once(".ssh")
+            .chain(CRED_FILES.iter().copied())
+            .chain(CRED_TREES.iter().copied())
+            .chain(BROWSER_ROOTS.iter().copied())
+        {
+            let p = join_folded(home, rel.as_bytes());
+            push_charged(
+                &mut spelled,
+                (p, cred, "", (true, true, true, true)),
+                budget,
+            )?;
+        }
+        for d in &protected.atrium_data_paths {
+            let r = (
+                d.clone(),
+                Some("atrium-self"),
+                "",
+                (true, false, true, true),
+            );
+            push_charged(&mut spelled, r, budget)?;
+        }
+        for d in &protected.atrium_protected_paths {
+            let r = (
+                d.clone(),
+                Some("atrium-self"),
+                "",
+                (false, false, true, true),
+            );
+            push_charged(&mut spelled, r, budget)?;
+        }
+        // `dev`'s `ssh_members`, between `sensitive_roots` and `ask_roots`.
+        self.push_ssh_members(home, resolver, caps, budget, &mut spelled)?;
+        for (rel, family) in ASK_FILES.iter().copied().chain(ASK_TREES.iter().copied()) {
+            // The root is read on `dev`'s spelling (a case-sensitive volume
+            // only has that name), not on the folded one the names use.
+            let rel = DEV_ROOT_SPELLINGS
+                .iter()
+                .find(|(folded, _)| *folded == rel)
+                .map_or(rel, |(_, spelled)| *spelled);
+            let p = join_folded(home, rel.as_bytes());
+            push_charged(
+                &mut spelled,
+                (p, None, family, (true, true, true, true)),
+                budget,
+            )?;
+        }
+        for (dir, prefix, family) in ASK_NAME_PREFIXES.iter().copied() {
+            let folder = join_folded(home, dir.as_bytes());
+            budget.charge(folder.len() as u64 + 1)?;
+            budget.charge_alloc(folder.len())?;
+            let spelling = (folder.clone(), None, family, (true, false, false, true));
+            push_charged(&mut spelled, spelling, budget)?;
+            let entries = match resolver.read_dir(&folder, caps, budget) {
+                Ok(e) => e,
+                Err(e) if is_absent(&e) => continue,
+                Err(e) => {
+                    note_unread(&mut self.incomplete, e, &folder, budget)?;
+                    continue;
+                }
+            };
+            for e in entries.iter().take(ASK_PREFIX_ENTRIES) {
+                // `dev`: `to_string_lossy().to_lowercase().starts_with(pre)`,
+                // decided without allocating (review 8, finding 3).
+                budget.charge(e.name.len() as u64 * 2 + 1)?;
+                if lossy_lowercase_starts_with(&e.name, prefix) {
+                    budget.charge(folder.len() as u64 + e.name.len() as u64 + 1)?;
+                    budget.charge_alloc(folder.len() + 1 + e.name.len())?;
+                    let p = join_folded(&folder, &e.name);
+                    push_charged(
+                        &mut spelled,
+                        (p, None, family, (true, true, true, true)),
+                        budget,
+                    )?;
+                }
+            }
+        }
+        Ok(spelled)
+    }
+
+    /// `dev`'s `ssh_members` (`gate.rs`), as alias roots: every entry of
+    /// `~/.ssh` down to depth 8 and 1,024 entries is a member (a folder too,
+    /// unless it was reached through a link), spelled through `~/.ssh`. A
+    /// link to a folder is walked and is returned as a linked folder: a tree
+    /// for `links_below` (held), but not an alias root; the files in it are
+    /// members. A link to anything else is a member. Members keep `dev`'s
+    /// names: their alias spelling is checked by name, so the public names
+    /// of `~/.ssh` stay ordinary (review 8, finding 1). The walk's bounds are
+    /// `dev`'s, a cutoff is silent as there (D-145); a cap or I/O failure
+    /// makes the table incomplete (§8).
+    fn push_ssh_members(
+        &mut self,
+        home: &[u8],
+        resolver: &dyn PathResolver,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+        spelled: &mut Vec<SpelledRoot>,
+    ) -> Result<(), Exhausted> {
+        const MAX_ENTRIES: usize = 1024;
+        const MAX_DEPTH: u8 = 8;
+        let cred = Some("credential-read");
+        let mut found = 0usize;
+        budget.charge(home.len() as u64 + 6)?;
+        budget.charge_alloc(home.len() + 5)?;
+        let mut stack: Vec<(Vec<u8>, u8, bool)> = Vec::new();
+        push_charged(&mut stack, (join_folded(home, b".ssh"), 0, false), budget)?;
+        while let Some((dir, depth, linked)) = stack.pop() {
+            if depth >= MAX_DEPTH || found >= MAX_ENTRIES {
+                continue;
+            }
+            let entries = match resolver.read_dir(&dir, caps, budget) {
+                Ok(e) => e,
+                Err(e) if is_absent(&e) => continue,
+                Err(e) => {
+                    note_unread(&mut self.incomplete, e, &dir, budget)?;
+                    continue;
+                }
+            };
+            for e in entries.iter().take(MAX_ENTRIES) {
+                found += 1;
+                let len = dir.len() + 1 + e.name.len();
+                budget.charge(len as u64 + 1)?;
+                budget.charge_alloc(len)?;
+                let p = join_folded(&dir, &e.name);
+                match e.file_type {
+                    FileType::Symlink => match resolver.stat(&p, caps, budget) {
+                        Ok(md) if md.file_type == FileType::Dir => {
+                            budget.charge(len as u64 + 1)?;
+                            budget.charge_alloc(len)?;
+                            let tree = (p.clone(), cred, "", (true, true, true, false));
+                            push_charged(spelled, tree, budget)?;
+                            push_charged(&mut stack, (p, depth + 1, true), budget)?;
+                        }
+                        Ok(_) => {
+                            let member = (p, cred, "", (true, false, false, true));
+                            push_charged(spelled, member, budget)?;
+                        }
+                        Err(e) if is_absent(&e) => {}
+                        Err(e) => note_unread(&mut self.incomplete, e, &p, budget)?,
+                    },
+                    FileType::Dir => {
+                        if linked {
+                            push_charged(&mut stack, (p, depth + 1, linked), budget)?;
+                        } else {
+                            budget.charge(len as u64 + 1)?;
+                            budget.charge_alloc(len)?;
+                            push_charged(&mut stack, (p.clone(), depth + 1, linked), budget)?;
+                            let member = (p, cred, "", (true, false, false, true));
+                            push_charged(spelled, member, budget)?;
+                        }
+                    }
+                    _ => {
+                        let member = (p, cred, "", (true, false, false, true));
+                        push_charged(spelled, member, budget)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `dev`'s `alias_fix` on a path `canonical`: each ancestor of the path
+    /// (after the firmlink is stripped), shortest first, and the path itself,
+    /// is read through links (charged, as `dev`'s `identity`); the first one
+    /// with the identity of a protected root names the path as that root's
+    /// spelling plus the rest. An absent ancestor ends the scan, as nothing
+    /// below it exists. A cap or an I/O failure ends it too and is reported,
+    /// as is an incomplete table. Every copy is charged before it is built.
+    pub(crate) fn scan(
+        &mut self,
+        canonical: &[u8],
+        protected: &ProtectedSet,
+        resolver: &dyn PathResolver,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<AliasScan, Exhausted> {
+        self.roots(protected, resolver, caps, budget)?;
+        // The table's reason is charged (copy and storage) before it is
+        // cloned (§8; review 8, finding 2).
+        if let Some(r) = &self.incomplete {
+            let bytes = unread_reason_alloc_bytes(r);
+            budget.charge(bytes as u64 + 1)?;
+            budget.charge_alloc(bytes)?;
+        }
+        let mut unread = self.incomplete.clone();
+        let roots = self.roots.as_deref().unwrap_or(&[]);
+        let path = match canonical.strip_prefix(FIRMLINK) {
+            Some(rest) if rest.is_empty() || rest.starts_with(b"/") => rest,
+            _ => canonical,
+        };
+        let comps = collect_components(path, budget)?;
+        budget.charge(path.len() as u64 + 1)?;
+        budget.charge_alloc(path.len() + 1)?;
+        let mut prefix: Vec<u8> = Vec::with_capacity(path.len() + 1);
+        for (i, comp) in comps.iter().enumerate() {
+            prefix.push(b'/');
+            prefix.extend_from_slice(comp);
+            let is_proper_ancestor = i + 1 < comps.len();
+            let id = if is_proper_ancestor && let Some(&cached) = self.ancestor_stats.get(&prefix) {
+                budget.charge(prefix.len().max(1) as u64)?;
+                cached
+            } else {
+                match resolver.stat(&prefix, caps, budget) {
+                    Ok(md) => {
+                        if is_proper_ancestor && self.ancestor_stats.len() < 1024 {
+                            budget.charge(prefix.len() as u64 + 1)?;
+                            budget.charge_alloc(
+                                prefix.len()
+                                    + 4 * std::mem::size_of::<(Vec<u8>, Option<FileIdentity>)>(),
+                            )?;
+                            self.ancestor_stats.insert(prefix.clone(), md.identity);
+                        }
+                        md.identity
+                    }
+                    Err(e) if is_absent(&e) => break,
+                    Err(e) => {
+                        note_unread(&mut unread, e, &prefix, budget)?;
+                        break;
+                    }
+                }
+            };
+            let Some(id) = id else { continue };
+            budget.charge(roots.len() as u64 + 1)?;
+            if let Some(r) = roots.iter().find(|r| r.alias && r.identity == id) {
+                let rest = &comps[i + 1..];
+                let len = r.spelled.len() + rest.iter().map(|c| c.len() + 1).sum::<usize>();
+                budget.charge(len as u64 + 1)?;
+                budget.charge_alloc(len + 1)?;
+                let mut out = Vec::with_capacity(len + 1);
+                out.extend_from_slice(&r.spelled);
+                for c in rest {
+                    if out.last() != Some(&b'/') {
+                        out.push(b'/');
+                    }
+                    out.extend_from_slice(c);
+                }
+                return Ok(AliasScan {
+                    alias: Some(out),
+                    unread,
+                });
+            }
+        }
+        Ok(AliasScan {
+            alias: None,
+            unread,
+        })
+    }
+
+    /// `dev`'s `in_trees` for a walker that follows links (`names_dir`): the
+    /// root a followed link's real path `real` is in (a root's own folder
+    /// only when the walker reads into it), is, or holds, by canonical path
+    /// (`trees_of`).
+    pub(crate) fn reached<'r>(
+        roots: &'r [ProtectedRoot],
+        real: &[u8],
+        real_is_dir: bool,
+        budget: &mut ComputeBudget,
+    ) -> Result<Option<&'r ProtectedRoot>, Exhausted> {
+        budget.charge((roots.len() as u64).saturating_mul(real.len() as u64 + 1))?;
+        Ok(roots.iter().find(|t| {
+            let Some(path) = t.canonical.as_deref() else {
+                return false;
+            };
+            t.read
+                && t.reach
+                && ((under_bytes(real, path).is_some() && (real != path || !real_is_dir))
+                    || path == real
+                    || (t.held && under_bytes(path, real).is_some()))
+        }))
+    }
+
+    /// The reason the table is incomplete, if any.
+    pub(crate) fn incomplete(&self) -> Option<&UnreadReason> {
+        self.incomplete.as_ref()
+    }
+}
+
+/// `dev`'s `alias_fix` for a resolved target ([`RootAliases::scan`] of its
+/// canonical path), appended to `out` as each record is established: when
+/// the alias differs from the canonical path, its protected names (listed
+/// folds), else its unlisted equivalences as Unread (§11 item 13); and,
+/// unless a hard-deny hit was found, the scan's reason for doubt (an
+/// incomplete table, an unreadable ancestor) as Unread beside any Store hit
+/// (§1, §8; review 7, finding 3). Variant-only matches are never hits.
+fn push_alias_records(
+    target: &Target,
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    aliases: &mut RootAliases,
+    out: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
+    let TargetResolution::Resolved { canonical, .. } = &target.resolution else {
+        return Ok(());
+    };
+    if matches!(
+        target.origin,
+        TargetOrigin::ExpandedFrom {
+            variant_only: true,
+            ..
+        }
+    ) {
+        return Ok(());
+    }
+    let part = origin_to_part(&target.origin);
+    let scan = aliases.scan(canonical, protected, resolver, caps, budget)?;
+    let mut hard = false;
+    if let Some(alias) = scan.alias
+        && alias != *canonical
+    {
+        if let Some(hit) = written_name_hit(&alias, target.access, &part, protected, budget)? {
+            hard = matches!(hit.outcome, PartOutcome::HardDenyHit(_));
+            push_charged(out, hit, budget)?;
+        } else {
+            let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
+            if shared.matches_unlisted_equivalence(&alias, target.access, budget)? {
+                let record = PartResult {
+                    part: part.clone(),
+                    outcome: PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence {
+                        path: alias,
+                    }),
+                };
+                push_charged(out, record, budget)?;
+            }
+        }
+    }
+    if !hard && let Some(reason) = scan.unread {
+        let record = PartResult {
+            part,
+            outcome: PartOutcome::Unread(reason),
+        };
+        push_charged(out, record, budget)?;
+    }
+    Ok(())
+}
+
+/// Spellings of a root, each with its listed fold.
+pub(crate) type Spellings = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// The other spellings of a root whose canonical path folds to
+/// `folded_root`, each with its listed fold, deduplicated by fold: its
+/// written spelling (D-147, D-149) and its alias (`dev`'s `alias_fix`,
+/// [`RootAliases::scan`]). They give names only (probes, S8, the store
+/// rule); every filesystem step uses the real root. The scan's reason for
+/// doubt is recorded by [`push_alias_records`] on the root itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn other_spellings(
+    written: Option<&[u8]>,
+    canonical: &[u8],
+    folded_root: &[u8],
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    aliases: &mut RootAliases,
+) -> Result<Spellings, Exhausted> {
+    let alias = aliases
+        .scan(canonical, protected, resolver, caps, budget)?
+        .alias;
+    let mut spellings: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for s in written.into_iter().chain(alias.as_deref()) {
+        let folded = fold_path_listed(s, protected.folds, budget)?;
+        if folded != folded_root && !spellings.iter().any(|(_, f)| *f == folded) {
+            budget.charge(s.len() as u64 + 1)?;
+            budget.charge_alloc(s.len())?;
+            push_charged(&mut spellings, (s.to_vec(), folded), budget)?;
+        }
+    }
+    Ok(spellings)
+}
+
+/// Every record of `target` ([`check_target_into`]) plus its alias records
+/// ([`push_alias_records`]), appended to `outcomes` as each is established,
+/// so a later exhaustion never loses one (§1, §8). Clear is recorded only
+/// when `keep_clear`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_target_records(
+    target: &Target,
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    aliases: &mut RootAliases,
+    outcomes: &mut Vec<PartResult>,
+    keep_clear: bool,
+) -> Result<(), Exhausted> {
+    let start = outcomes.len();
+    check_target_into(target, protected, budget, outcomes, keep_clear, false)?;
+    // Once this target has a HardDenyHit, skip alias scanning and identity-gap
+    // attachment so an incomplete table or gap never attaches a spurious Unread
+    // alongside a definitive hit (contract §1, §5; ProtectedSet::identity_gaps;
+    // D-144, D-145; review 7 finding 3).
+    if outcomes[start..]
+        .iter()
+        .any(|r| matches!(r.outcome, PartOutcome::HardDenyHit(_)))
+    {
+        return Ok(());
+    }
+    push_alias_records(target, protected, resolver, caps, budget, aliases, outcomes)?;
+    // Attach an applicable identity gap whenever neither the direct check nor
+    // the alias check produced a HardDenyHit (preserving distinct Unread
+    // reasons from both the alias table and `ProtectedSet::identity_gaps` per
+    // contract §1 and D-144, while deduplicating identical reasons).
+    attach_applicable_gap(target, protected, budget, outcomes, start)
+}
+
+impl ProtectedRoot {
+    /// The record a reached root gives `part`: its hard-deny hit, or a Store
+    /// hit for a store root.
+    pub(crate) fn hit(
+        &self,
+        part: &PartId,
+        budget: &mut ComputeBudget,
+    ) -> Result<PartResult, Exhausted> {
+        budget.charge_alloc(self.spelled.len())?;
+        let outcome = match self.id {
+            Some(id) => PartOutcome::HardDenyHit(Hit {
+                hard_deny_id: Some(id),
+                source: HitSource::Model,
+                matched: HitMatch::ProtectedPath {
+                    path: self.spelled.clone(),
+                },
+                part: part.clone(),
+            }),
+            None => PartOutcome::StoreHit(Hit {
+                hard_deny_id: None,
+                source: HitSource::Model,
+                matched: HitMatch::StoreFamily {
+                    family: self.family,
+                },
+                part: part.clone(),
+            }),
+        };
+        Ok(PartResult {
+            part: part.clone(),
+            outcome,
+        })
+    }
+}
+
+fn check_target_exact(
+    target: &Target,
+    protected: &ProtectedSet,
+    budget: &mut ComputeBudget,
+) -> Result<PartResult, Exhausted> {
+    let part = origin_to_part(&target.origin);
+
+    let (canonical, identities) = match &target.resolution {
+        TargetResolution::Unread(reason) => {
+            budget.charge(1)?;
+            let alloc = unread_reason_alloc_bytes(reason);
+            if alloc > 0 {
+                budget.charge_alloc(alloc)?;
+            }
+            return Ok(PartResult {
+                part,
+                outcome: PartOutcome::Unread(reason.clone()),
+            });
+        }
+        TargetResolution::Resolved {
+            canonical,
+            identities,
+            ..
+        } => (canonical, identities),
+    };
+
+    // Over-approximation never produces a hit (§1, §5): variant-only glob
+    // matches always stay Unread.
+    if matches!(
+        target.origin,
+        TargetOrigin::ExpandedFrom {
+            variant_only: true,
+            ..
+        }
+    ) {
+        budget.charge(canonical.len().max(1) as u64)?;
+        budget.charge_alloc(canonical.len())?;
+        return Ok(PartResult {
+            part,
+            outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
+                pattern: canonical.clone(),
+            }),
+        });
+    }
+
+    // Precharge the identity scans (every identity against every protected
+    // list it is compared with) and the output path copy BEFORE any work or
+    // heap allocation (§8); the fold below charges its own work.
+    let writes = target.access != AccessMode::Read;
+    let id_lists = protected.hard_deny_identities.len()
+        + protected.store_identities.len()
+        + if writes {
+            protected.write_only_hard_deny_identities.len()
+        } else {
+            0
+        };
+    budget.charge(
+        (canonical.len() as u64 + 1)
+            .saturating_add((identities.len() as u64).saturating_mul(id_lists as u64 + 1)),
+    )?;
+    budget.charge_alloc(canonical.len().max(1))?;
+
+    // 1. Hard-deny identity check (path and every existing ancestor), plus
+    //    the write-only identities (`~/.ssh/config`, `~/.ssh/authorized_keys`,
+    //    Atrium's protected paths and their members) for any access other
+    //    than Read (§5, D-142).
+    for id in identities {
+        let found = protected
+            .hard_deny_identities
+            .iter()
+            .chain(
+                protected
+                    .write_only_hard_deny_identities
+                    .iter()
+                    .filter(|_| writes),
+            )
+            .find(|(pid, _)| pid == id);
+        if let Some((_, hard_id)) = found {
+            return Ok(PartResult {
+                part: part.clone(),
+                outcome: PartOutcome::HardDenyHit(Hit {
+                    hard_deny_id: Some(hard_id),
+                    source: HitSource::Model,
+                    matched: HitMatch::ProtectedPath {
+                        path: canonical.clone(),
+                    },
+                    part,
+                }),
+            });
+        }
+    }
+
+    // 2. Listed-fold hard-deny check (in addition to identity).
+    let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
+    let folded = fold_path_listed(canonical, protected.folds, budget)?;
+    if let Some(hard_id) = shared.hard_deny_hit_folded(&folded, target.access) {
+        return Ok(PartResult {
+            part: part.clone(),
+            outcome: PartOutcome::HardDenyHit(Hit {
+                hard_deny_id: Some(hard_id),
+                source: HitSource::Model,
+                matched: HitMatch::ProtectedPath {
+                    path: canonical.clone(),
+                },
+                part,
+            }),
+        });
+    }
+
+    // 3. Store identity check (CR-12 + CR-17).
+    for id in identities {
+        if let Some((_, family)) = protected.store_identities.iter().find(|(pid, _)| pid == id) {
+            return Ok(PartResult {
+                part: part.clone(),
+                outcome: PartOutcome::StoreHit(Hit {
+                    hard_deny_id: None,
+                    source: HitSource::Model,
+                    matched: HitMatch::StoreFamily { family },
+                    part,
+                }),
+            });
+        }
+    }
+
+    // 4. Listed-fold store check (CR-12 + CR-17).
+    if let Some(family) = shared.store_hit_folded(&folded) {
+        return Ok(PartResult {
+            part: part.clone(),
+            outcome: PartOutcome::StoreHit(Hit {
+                hard_deny_id: None,
+                source: HitSource::Model,
+                matched: HitMatch::StoreFamily { family },
+                part,
+            }),
+        });
+    }
+
+    // 5. Unlisted equivalence check (§5, §11 item 13): never downgrades a hit.
+    if shared.matches_unlisted_equivalence(canonical, target.access, budget)? {
+        return Ok(PartResult {
+            part,
+            outcome: PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence {
+                path: canonical.clone(),
+            }),
+        });
+    }
+
+    Ok(PartResult {
+        part,
+        outcome: PartOutcome::Clear,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ProtectedSet builder: the only collector of protected identities (D-145)
+// ---------------------------------------------------------------------------
+//
+// What the builder promises (D-145, contract §5 read with §1 step 4), which
+// is what `dev` promises:
+// 1. Protected trees and files are protected by name (every listed-fold
+//    spelling) and by the identities of their roots: each root's own
+//    identity (`lstat`, so a dangling link counts) and what it names after
+//    following links (as `dev`'s `metadata`). A target's path and existing
+//    ancestors are compared with them.
+// 2. Members' identities are collected for hard links only: regular files
+//    with more than one link, within the walk caps. A cutoff there is Clear,
+//    as in §5's bounded hard-link walk; an uncollected multiply-linked target
+//    is already Ask in every setting (§1 step 4). Browser roots are not
+//    protected wholesale, so their credential files (and the folders they sit
+//    in, through linked profile folders too) are their roots.
+// 3. Link targets are recorded only for `~/.ssh` members.
+// 4. A gap is Unread only where a root or its name cannot be established: a
+//    root or `~/.ssh` that cannot be stat'ed or listed within the caps, or an
+//    unreadable folder on the path to a root. Its scope is `Through(root)`,
+//    or `AnyTarget` for `~/.ssh` and for a root whose identity is unknown.
+// Linked directories are walked like directories.
+
+/// The identities a target can be compared with: a gap applies to it when its
+/// scope covers the target and the access matches (contract §2, §5, D-144).
+pub(crate) fn gap_applies(gap: &IdentityGap, target: &Target) -> bool {
+    if gap.write_only && target.access == AccessMode::Read {
+        return false;
+    }
+    let TargetResolution::Resolved {
+        identities,
+        multiply_linked,
+        ..
+    } = &target.resolution
+    else {
+        return false;
+    };
+    match &gap.scope {
+        GapScope::AnyTarget => true,
+        GapScope::HardLinks => *multiply_linked,
+        GapScope::Through(id) => *multiply_linked || identities.contains(id),
+    }
+}
+
+/// The first identity gap of `protected` that applies to `target`, after
+/// charging the scan (§8).
+pub(crate) fn applicable_gap<'p>(
+    target: &Target,
+    protected: &'p ProtectedSet,
+    budget: &mut ComputeBudget,
+) -> Result<Option<&'p IdentityGap>, Exhausted> {
+    let ids = match &target.resolution {
+        TargetResolution::Resolved { identities, .. } => identities.len(),
+        TargetResolution::Unread(_) => 0,
+    };
+    budget.charge(
+        (protected.identity_gaps.len() as u64)
+            .saturating_mul(ids as u64 + 1)
+            .saturating_add(1),
+    )?;
+    Ok(protected
+        .identity_gaps
+        .iter()
+        .find(|g| gap_applies(g, target)))
+}
+
+/// One cached directory entry with its listed-fold name, folded once per
+/// build (round-4 verification: re-folding every entry of `/` and `/tmp` for
+/// every protected name exhausted the allocation budget).
+struct Listed {
+    name: Vec<u8>,
+    folded: Vec<u8>,
+}
+
+/// A cached directory listing: its entries, absence, or the reason it could
+/// not be listed (kept so every consumer records its own gap).
+#[derive(Clone)]
+enum Listing {
+    Entries(Rc<[Listed]>),
+    Absent,
+    Failed(UnreadReason),
+}
+
+type DirCache = HashMap<Vec<u8>, Listing>;
+
+/// Identity lists being filled, with the sets that deduplicate them.
+#[derive(Default)]
+struct IdentityLists {
+    hard_deny: Vec<(FileIdentity, &'static str)>,
+    write_only: Vec<(FileIdentity, &'static str)>,
+    store: Vec<(FileIdentity, &'static str)>,
+    seen_hard_deny: HashSet<FileIdentity>,
+    seen_write_only: HashSet<FileIdentity>,
+    seen_store: HashSet<FileIdentity>,
+}
+
+/// Which identity list an entry goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListKind {
+    HardDeny,
+    WriteOnly,
+    Store,
+}
+
+impl ListKind {
+    /// A gap in a write-only collection affects only non-Read targets.
+    fn write_only(self) -> bool {
+        self == Self::WriteOnly
+    }
+}
+
+impl IdentityLists {
+    fn push(
+        &mut self,
+        kind: ListKind,
+        id: FileIdentity,
+        tag: &'static str,
+        budget: &mut ComputeBudget,
+    ) -> Result<(), Exhausted> {
+        let (list, seen) = match kind {
+            ListKind::HardDeny => (&mut self.hard_deny, &mut self.seen_hard_deny),
+            ListKind::WriteOnly => (&mut self.write_only, &mut self.seen_write_only),
+            ListKind::Store => (&mut self.store, &mut self.seen_store),
+        };
+        budget.charge(1)?;
+        if seen.contains(&id) {
+            return Ok(());
+        }
+        // The deduplicating set's slot (with its growth), then the list entry.
+        budget.charge_alloc(4 * std::mem::size_of::<FileIdentity>())?;
+        seen.insert(id);
+        push_charged(list, (id, tag), budget)
+    }
+}
+
+/// Which members of a protected tree are recorded (D-145 rule 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Members {
+    /// Regular files with more than one link (hard links).
+    HardLinks,
+    /// Entries named in `BROWSER_FILES` (a browser root's protected names).
+    BrowserFiles,
+}
+
+/// The builder's working state.
+struct Collector<'r> {
+    resolver: &'r dyn PathResolver,
+    folds: FoldRules,
+    lists: IdentityLists,
+    gaps: Vec<IdentityGap>,
+    dir_cache: DirCache,
+}
+
+/// Maps a resolver failure that is not absence to the Unread reason it
+/// stands for (`None` for absence; `Exhausted` is returned).
+fn failure_reason(
+    err: &ResolveError,
+    path: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<Option<UnreadReason>, Exhausted> {
+    match err {
+        ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory) => Ok(None),
+        ResolveError::CapReached(c) => Ok(Some(UnreadReason::from(*c))),
+        ResolveError::Io(_) => {
+            budget.charge_alloc(path.len())?;
+            Ok(Some(UnreadReason::UnresolvablePath {
+                path: path.to_vec(),
+            }))
+        }
+        ResolveError::Exhausted(e) => Err(*e),
+    }
+}
+
+/// The gap scope for a root: through its identity when known, else any target.
+fn root_scope(id: Option<FileIdentity>) -> GapScope {
+    id.map_or(GapScope::AnyTarget, GapScope::Through)
+}
+
+impl Collector<'_> {
+    fn gap(
+        &mut self,
+        reason: UnreadReason,
+        scope: GapScope,
+        write_only: bool,
+        budget: &mut ComputeBudget,
+    ) -> Result<(), Exhausted> {
+        let gap = IdentityGap {
+            reason,
+            scope,
+            write_only,
+        };
+        budget.charge((self.gaps.len() as u64).saturating_add(1))?;
+        if self.gaps.contains(&gap) {
+            return Ok(());
+        }
+        // A read-applicable gap subsumes the same write-only one.
+        if gap.write_only
+            && self
+                .gaps
+                .iter()
+                .any(|g| !g.write_only && g.reason == gap.reason && g.scope == gap.scope)
+        {
+            return Ok(());
+        }
+        budget.charge_alloc(unread_reason_alloc_bytes(&gap.reason))?;
+        push_charged(&mut self.gaps, gap, budget)
+    }
+
+    /// Records a resolver failure on `path` as a gap of `scope` (absence is
+    /// not one).
+    fn failure(
+        &mut self,
+        err: ResolveError,
+        path: &[u8],
+        scope: GapScope,
+        write_only: bool,
+        budget: &mut ComputeBudget,
+    ) -> Result<(), Exhausted> {
+        if let Some(reason) = failure_reason(&err, path, budget)? {
+            self.gap(reason, scope, write_only, budget)?;
+        }
+        Ok(())
+    }
+
+    /// Lists `dir` once per build, folding each name once. A failure is
+    /// cached with its reason and returned to every consumer, which records
+    /// the gap in its own scope (round-3 finding 3).
+    fn list_dir(
+        &mut self,
+        dir: &[u8],
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<Listing, Exhausted> {
+        budget.charge(dir.len().max(1) as u64)?;
+        if let Some(cached) = self.dir_cache.get(dir) {
+            return Ok(cached.clone());
+        }
+        let listing = match self.resolver.read_dir(dir, caps, budget) {
+            Ok(entries) => {
+                // The `Vec` of entries and the `Rc` buffer it is moved into.
+                budget.charge_alloc(
+                    entries
+                        .len()
+                        .saturating_mul(2 * std::mem::size_of::<Listed>())
+                        .saturating_add(32),
+                )?;
+                let mut listed = Vec::with_capacity(entries.len());
+                for e in entries {
+                    let folded = fold_listed_component(&e.name, self.folds, budget)?;
+                    listed.push(Listed {
+                        name: e.name,
+                        folded,
+                    });
+                }
+                Listing::Entries(Rc::from(listed))
+            }
+            Err(err) => match failure_reason(&err, dir, budget)? {
+                Some(reason) => Listing::Failed(reason),
+                None => Listing::Absent,
+            },
+        };
+        budget.charge_alloc(
+            dir.len()
+                + std::mem::size_of::<Listing>()
+                + 4 * std::mem::size_of::<Vec<u8>>()
+                + match &listing {
+                    Listing::Failed(r) => unread_reason_alloc_bytes(r),
+                    _ => 0,
+                },
+        )?;
+        self.dir_cache.insert(dir.to_vec(), listing.clone());
+        Ok(listing)
+    }
+
+    /// Every existing listed-fold spelling of the absolute configured path
+    /// `abs`, discovered component by component from `/`, so fold variants of
+    /// home's own components count too (round-3 finding 4); then the
+    /// configured spelling itself, for equivalences the listings don't show.
+    /// A folder on the way that cannot be listed may hide spellings whose
+    /// identity is unknown: an `AnyTarget` gap (D-145 rule 4), and the
+    /// configured spelling is still tried there.
+    fn folded_spellings(
+        &mut self,
+        abs: &[u8],
+        write_only: bool,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<Vec<Vec<u8>>, Exhausted> {
+        budget.charge_alloc(1 + std::mem::size_of::<Vec<u8>>())?;
+        let mut frontier: Vec<Vec<u8>> = vec![b"/".to_vec()];
+        for comp in abs.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+            let comp_folded = fold_listed_component(comp, self.folds, budget)?;
+            let mut next: Vec<Vec<u8>> = Vec::new();
+            for dir in &frontier {
+                let listing = self.list_dir(dir, caps, budget)?;
+                let names: Vec<&[u8]> = match &listing {
+                    Listing::Entries(entries) => {
+                        budget.charge(2 * entries.len() as u64 + 1)?;
+                        let matches = entries.iter().filter(|l| l.folded == comp_folded).count();
+                        budget
+                            .charge_alloc(matches.saturating_mul(std::mem::size_of::<&[u8]>()))?;
+                        entries
+                            .iter()
+                            .filter(|l| l.folded == comp_folded)
+                            .map(|l| l.name.as_slice())
+                            .collect()
+                    }
+                    Listing::Absent => continue,
+                    Listing::Failed(reason) => {
+                        self.gap(reason.clone(), GapScope::AnyTarget, write_only, budget)?;
+                        vec![comp]
+                    }
+                };
+                for name in names {
+                    budget.charge_alloc(dir.len() + 1 + name.len())?;
+                    let cand = join_folded(dir, name);
+                    budget.charge(next.len() as u64 + 1)?;
+                    if !next.contains(&cand) {
+                        push_charged(&mut next, cand, budget)?;
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        budget.charge(frontier.len() as u64 + 1)?;
+        if !frontier.iter().any(|p| p.as_slice() == abs) {
+            match self.resolver.lstat(abs, caps, budget) {
+                Ok(_) => {
+                    budget.charge_alloc(abs.len())?;
+                    push_charged(&mut frontier, abs.to_vec(), budget)?;
+                }
+                Err(err) => self.failure(err, abs, GapScope::AnyTarget, write_only, budget)?,
+            }
+        }
+        Ok(frontier)
+    }
+
+    /// `home` joined with the relative protected name `rel`.
+    fn under_home(
+        home: &[u8],
+        rel: &str,
+        budget: &mut ComputeBudget,
+    ) -> Result<Vec<u8>, Exhausted> {
+        budget.charge_alloc(home.len() + 1 + rel.len())?;
+        Ok(join_folded(home, rel.as_bytes()))
+    }
+
+    /// Records a root (D-145 rule 1): its own identity (`lstat`) and, when it
+    /// is a link to an existing entry, what it names (as `dev`'s `metadata`).
+    /// A root that cannot be stat'ed is an `AnyTarget` gap (its identity is
+    /// unknown). Returns what the root names after following links.
+    fn record_root(
+        &mut self,
+        path: &[u8],
+        kind: ListKind,
+        tag: &'static str,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<Option<PathMetadata>, Exhausted> {
+        let meta = match self.resolver.lstat(path, caps, budget) {
+            Ok(m) => m,
+            Err(err) => {
+                self.failure(err, path, GapScope::AnyTarget, kind.write_only(), budget)?;
+                return Ok(None);
+            }
+        };
+        if let Some(id) = meta.identity {
+            self.lists.push(kind, id, tag, budget)?;
+        }
+        if meta.file_type != FileType::Symlink {
+            return Ok(Some(meta));
+        }
+        match self.resolver.stat(path, caps, budget) {
+            Ok(target) => {
+                if let Some(id) = target.identity {
+                    self.lists.push(kind, id, tag, budget)?;
+                }
+                Ok(Some(target))
+            }
+            Err(ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory)) => {
+                Ok(Some(meta))
+            }
+            Err(err) => {
+                // The link's own identity does not establish its referent's: the
+                // root's identity is unknown, so the gap is AnyTarget (D-145 rule 4;
+                // review 4, finding 3).
+                self.failure(err, path, GapScope::AnyTarget, kind.write_only(), budget)?;
+                Ok(Some(meta))
+            }
+        }
+    }
+
+    /// Records a root and, when it names a folder (directly or through a
+    /// link), its members for hard links (D-145 rules 1-2).
+    fn record_tree(
+        &mut self,
+        path: &[u8],
+        kind: ListKind,
+        tag: &'static str,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<(), Exhausted> {
+        if let Some(m) = self.record_root(path, kind, tag, caps, budget)?
+            && m.file_type == FileType::Dir
+        {
+            self.walk_members(path, m, kind, tag, Members::HardLinks, caps, budget)?;
+        }
+        Ok(())
+    }
+
+    /// Walks the folder `root` (whose followed metadata is `root_meta`)
+    /// within `WALK_MAX_ENTRIES` entries and `WALK_MAX_DEPTH` levels,
+    /// recording `members` (D-145 rule 2). A folder reached through a link is
+    /// walked like the folder; folders are visited once by identity.
+    ///
+    /// Only the root's own listing failing is a gap (`Through(root)`, D-145
+    /// rule 4). A cutoff, an unreadable subfolder or a member that cannot be
+    /// stat'ed is Clear, as in §5's bounded hard-link walk.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_members(
+        &mut self,
+        root: &[u8],
+        root_meta: PathMetadata,
+        kind: ListKind,
+        tag: &'static str,
+        members: Members,
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<(), Exhausted> {
+        budget.charge_alloc(root.len() + 2 * std::mem::size_of::<(Vec<u8>, u8)>())?;
+        let mut stack: Vec<(Vec<u8>, u8)> = vec![(root.to_vec(), 0)];
+        let mut visited: HashSet<FileIdentity> = HashSet::new();
+        if let Some(id) = root_meta.identity {
+            budget.charge_alloc(4 * std::mem::size_of::<FileIdentity>())?;
+            visited.insert(id);
+        }
+        let mut entries_seen = 0usize;
+        while let Some((dir, depth)) = stack.pop() {
+            let entries = match self.resolver.read_dir(&dir, caps, budget) {
+                Ok(e) => e,
+                Err(ResolveError::Exhausted(e)) => return Err(e),
+                Err(err) => {
+                    if depth == 0 {
+                        let scope = root_scope(root_meta.identity);
+                        self.failure(err, &dir, scope, kind.write_only(), budget)?;
+                    }
+                    continue;
+                }
+            };
+            for entry in &entries {
+                if entry.name == b"." || entry.name == b".." {
+                    continue;
+                }
+                entries_seen += 1;
+                if entries_seen > limits::WALK_MAX_ENTRIES {
+                    return Ok(());
+                }
+                budget.charge(entry.name.len().max(1) as u64)?;
+                let named =
+                    members == Members::BrowserFiles && entry.file_type != FileType::Dir && {
+                        let folded = fold_listed_component(&entry.name, self.folds, budget)?;
+                        std::str::from_utf8(&folded).is_ok_and(|n| BROWSER_FILES.contains(&n))
+                    };
+                // In a browser root only the browser files are protected.
+                if members == Members::BrowserFiles
+                    && !named
+                    && !matches!(entry.file_type, FileType::Dir | FileType::Symlink)
+                {
+                    continue;
+                }
+                budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
+                let child = join_folded(&dir, &entry.name);
+                let meta = match self.resolver.lstat(&child, caps, budget) {
+                    Ok(m) => m,
+                    Err(ResolveError::Exhausted(e)) => return Err(e),
+                    Err(_) => continue,
+                };
+                if named {
+                    // A browser credential file is a root of its own name.
+                    if let Some(id) = meta.identity {
+                        self.lists.push(kind, id, tag, budget)?;
+                    }
+                } else if members == Members::HardLinks
+                    && meta.file_type == FileType::File
+                    && meta.nlink > 1
+                    && let Some(id) = meta.identity
+                {
+                    self.lists.push(kind, id, tag, budget)?;
+                }
+                // Folders, and links to folders, are walked.
+                let folder = match meta.file_type {
+                    FileType::Dir => Some(meta),
+                    FileType::Symlink => match self.resolver.stat(&child, caps, budget) {
+                        Ok(m) if m.file_type == FileType::Dir => Some(m),
+                        Ok(_) => None,
+                        Err(ResolveError::Exhausted(e)) => return Err(e),
+                        Err(_) => None,
+                    },
+                    _ => None,
+                };
+                let Some(m) = folder else { continue };
+                if depth + 1 >= limits::WALK_MAX_DEPTH {
+                    continue;
+                }
+                if m.identity.is_none_or(|id| !visited.contains(&id)) {
+                    if let Some(id) = m.identity {
+                        budget.charge_alloc(4 * std::mem::size_of::<FileIdentity>())?;
+                        visited.insert(id);
+                    }
+                    push_charged(&mut stack, (child, depth + 1), budget)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Walks every listed-fold spelling of `~/.ssh` (dev's `ssh_members`,
+    /// within the walk caps): private members, with their link targets, go to
+    /// the hard-deny list (D-145 rule 3); the top-level `config` and
+    /// `authorized_keys` to the write-only list; public names (`*.pub`,
+    /// `known_hosts*`) to neither; folders linked into `~/.ssh` are walked and
+    /// their real paths returned. Any incompleteness is an `AnyTarget` gap,
+    /// since a missed linked folder protects files anywhere by name.
+    fn walk_ssh(
+        &mut self,
+        home: &[u8],
+        caps: &mut FsCaps,
+        budget: &mut ComputeBudget,
+    ) -> Result<Vec<Vec<u8>>, Exhausted> {
+        let any = GapScope::AnyTarget;
+        let mut linked_dirs: Vec<Vec<u8>> = Vec::new();
+        let ssh = Self::under_home(home, ".ssh", budget)?;
+        let roots = self.folded_spellings(&ssh, false, caps, budget)?;
+        let mut stack: Vec<(Vec<u8>, u8, bool)> = Vec::new();
+        for r in roots {
+            push_charged(&mut stack, (r, 0, false), budget)?;
+        }
+        let mut visited: HashSet<FileIdentity> = HashSet::new();
+        let mut entries_seen = 0usize;
+        while let Some((dir, depth, linked)) = stack.pop() {
+            let entries = match self.resolver.read_dir(&dir, caps, budget) {
+                Ok(e) => e,
+                Err(err) => {
+                    self.failure(err, &dir, any.clone(), false, budget)?;
+                    continue;
+                }
+            };
+            for entry in &entries {
+                if entry.name == b"." || entry.name == b".." {
+                    continue;
+                }
+                entries_seen += 1;
+                if entries_seen > limits::WALK_MAX_ENTRIES {
+                    self.gap(
+                        UnreadReason::WalkCapReached(FsCap::EntriesRead),
+                        any,
+                        false,
+                        budget,
+                    )?;
+                    return Ok(linked_dirs);
+                }
+                let name = fold_listed_component(&entry.name, self.folds, budget)?;
+                let name = std::str::from_utf8(&name).ok();
+                let public = !linked
+                    && name.is_some_and(|n| n.ends_with(".pub") || n.starts_with("known_hosts"));
+                let write_only = !linked
+                    && depth == 0
+                    && name.is_some_and(|n| n == "config" || n == "authorized_keys");
+                let kind = if write_only {
+                    ListKind::WriteOnly
+                } else {
+                    ListKind::HardDeny
+                };
+                budget.charge_alloc(dir.len() + 1 + entry.name.len())?;
+                let child = join_folded(&dir, &entry.name);
+                let lmeta = match self.resolver.lstat(&child, caps, budget) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        self.failure(err, &child, any.clone(), false, budget)?;
+                        continue;
+                    }
+                };
+                let followed = if lmeta.file_type == FileType::Symlink {
+                    match self.resolver.stat(&child, caps, budget) {
+                        Ok(m) => Some(m),
+                        Err(
+                            ResolveError::NotFound | ResolveError::Io(FsIoError::NotADirectory),
+                        ) => None,
+                        Err(err) => {
+                            self.failure(err, &child, any.clone(), false, budget)?;
+                            None
+                        }
+                    }
+                } else {
+                    Some(lmeta)
+                };
+                let is_dir = followed.is_some_and(|m| m.file_type == FileType::Dir);
+                if !public && lmeta.file_type != FileType::Dir {
+                    // The member itself, and a link's target unless it is a
+                    // folder (a linked folder is walked, not protected whole).
+                    if let Some(id) = lmeta.identity {
+                        self.lists.push(kind, id, "credential-read", budget)?;
+                    }
+                    if !is_dir
+                        && lmeta.file_type == FileType::Symlink
+                        && let Some(id) = followed.and_then(|m| m.identity)
+                    {
+                        self.lists.push(kind, id, "credential-read", budget)?;
+                    }
+                }
+                if !is_dir {
+                    continue;
+                }
+                let via_link = lmeta.file_type == FileType::Symlink;
+                if via_link {
+                    match self.resolver.canonicalize(&child, caps, budget) {
+                        Ok(real) => {
+                            budget.charge(linked_dirs.len() as u64 + 1)?;
+                            if !linked_dirs.contains(&real) {
+                                push_charged(&mut linked_dirs, real, budget)?;
+                            }
+                        }
+                        Err(err) => self.failure(err, &child, any.clone(), false, budget)?,
+                    }
+                }
+                if depth + 1 >= limits::WALK_MAX_DEPTH {
+                    self.gap(
+                        UnreadReason::WalkCapReached(FsCap::WalkDepth),
+                        any.clone(),
+                        false,
+                        budget,
+                    )?;
+                    continue;
+                }
+                let m = followed.unwrap_or(lmeta);
+                if m.identity.is_none_or(|id| !visited.contains(&id)) {
+                    if let Some(id) = m.identity {
+                        budget.charge_alloc(4 * std::mem::size_of::<FileIdentity>())?;
+                        visited.insert(id);
+                    }
+                    push_charged(&mut stack, (child, depth + 1, linked || via_link), budget)?;
+                }
+            }
+        }
+        Ok(linked_dirs)
+    }
+}
+
+/// Builds a [`ProtectedSet`] using `resolver` (charging `caps` and `budget`
+/// before every operation), applying D-145 (see the rules above):
+/// - `hard_deny_identities`: credential files and trees, Atrium's data paths
+///   and browser credential files (their roots), the multiply-linked members
+///   of those trees, and `~/.ssh`'s private members with their link targets;
+/// - `write_only_hard_deny_identities`: `~/.ssh/config`,
+///   `~/.ssh/authorized_keys`, and Atrium's protected paths (roots and
+///   multiply-linked members), checked only when access is not Read;
+/// - `store_identities`: the CR-12 / CR-17 stores (roots and multiply-linked
+///   tree members);
+/// - `identity_gaps`: only where a root or its name could not be established;
+/// - `ssh_linked_dirs`: the real paths of folders linked into `~/.ssh`.
+///
+/// Every protected name is found under every listed-fold spelling of every
+/// component, from `/`. The caller should give the builder its own
+/// [`FsCaps`], so its listings don't use up the check's caps.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_protected_set(
+    home: &[u8],
+    cwd: &[u8],
+    atrium_data_paths: Vec<Vec<u8>>,
+    atrium_protected_paths: Vec<Vec<u8>>,
+    folds: FoldRules,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+) -> Result<ProtectedSet, Exhausted> {
+    budget.charge((home.len() + cwd.len() + 1) as u64)?;
+    budget.charge_alloc(home.len() + cwd.len())?;
+    let mut c = Collector {
+        resolver,
+        folds,
+        lists: IdentityLists::default(),
+        gaps: Vec::new(),
+        dir_cache: HashMap::new(),
+    };
+    let hd = ListKind::HardDeny;
+
+    // 1. Credential files and trees.
+    for f in CRED_FILES {
+        let abs = Collector::under_home(home, f, budget)?;
+        for p in c.folded_spellings(&abs, false, caps, budget)? {
+            c.record_root(&p, hd, "credential-read", caps, budget)?;
+        }
+    }
+    for t in CRED_TREES {
+        let abs = Collector::under_home(home, t, budget)?;
+        for p in c.folded_spellings(&abs, false, caps, budget)? {
+            c.record_tree(&p, hd, "credential-read", caps, budget)?;
+        }
+    }
+
+    // 2. Atrium data paths.
+    for d in &atrium_data_paths {
+        for p in c.folded_spellings(d, false, caps, budget)? {
+            c.record_tree(&p, hd, "atrium-self", caps, budget)?;
+        }
+    }
+
+    // 3. `~/.ssh` members, write-only `config` / `authorized_keys`, linked folders.
+    let ssh_linked_dirs = c.walk_ssh(home, caps, budget)?;
+
+    // 4. Browser credential files below every spelling of every browser root
+    //    (through linked profile folders too). A root that cannot be stat'ed
+    //    or listed is a gap through it.
+    for b in BROWSER_ROOTS {
+        let abs = Collector::under_home(home, b, budget)?;
+        for root in c.folded_spellings(&abs, false, caps, budget)? {
+            let meta = match resolver.stat(&root, caps, budget) {
+                Ok(m) => m,
+                Err(err) => {
+                    c.failure(err, &root, GapScope::AnyTarget, false, budget)?;
+                    continue;
+                }
+            };
+            if meta.file_type == FileType::Dir {
+                c.walk_members(
+                    &root,
+                    meta,
+                    hd,
+                    "credential-read",
+                    Members::BrowserFiles,
+                    caps,
+                    budget,
+                )?;
+            }
+        }
+    }
+
+    // 5. Atrium protected paths: write-only.
+    for d in &atrium_protected_paths {
+        for p in c.folded_spellings(d, true, caps, budget)? {
+            c.record_tree(&p, ListKind::WriteOnly, "atrium-self", caps, budget)?;
+        }
+    }
+
+    // 6. Credential stores that ask (CR-12 + CR-17).
+    let st = ListKind::Store;
+    for &(f, family) in ASK_FILES {
+        let abs = Collector::under_home(home, f, budget)?;
+        for p in c.folded_spellings(&abs, false, caps, budget)? {
+            c.record_root(&p, st, family, caps, budget)?;
+        }
+    }
+    for &(t, family) in ASK_TREES {
+        let abs = Collector::under_home(home, t, budget)?;
+        for p in c.folded_spellings(&abs, false, caps, budget)? {
+            c.record_tree(&p, st, family, caps, budget)?;
+        }
+    }
+    // The name-prefixed families: the folder is their root; each entry with
+    // the prefix is a root of its own name.
+    for &(dir, pre, family) in ASK_NAME_PREFIXES {
+        let abs = Collector::under_home(home, dir, budget)?;
+        for dir_path in c.folded_spellings(&abs, false, caps, budget)? {
+            let entries = match c.list_dir(&dir_path, caps, budget)? {
+                Listing::Entries(entries) => entries,
+                Listing::Absent => continue,
+                Listing::Failed(reason) => {
+                    let scope = match resolver.stat(&dir_path, caps, budget) {
+                        Ok(m) => root_scope(m.identity),
+                        Err(ResolveError::Exhausted(e)) => return Err(e),
+                        Err(_) => GapScope::AnyTarget,
+                    };
+                    c.gap(reason, scope, false, budget)?;
+                    continue;
+                }
+            };
+            // Named roots: the whole listing (already within the filesystem
+            // caps) is searched, not cut at the member walk's cap (review 4,
+            // finding 4).
+            for entry in entries.iter() {
+                budget.charge(entry.folded.len().max(1) as u64)?;
+                if entry.folded.starts_with(pre.as_bytes()) {
+                    budget.charge_alloc(dir_path.len() + 1 + entry.name.len())?;
+                    let p = join_folded(&dir_path, &entry.name);
+                    c.record_root(&p, st, family, caps, budget)?;
+                }
+            }
+        }
+    }
+
+    let Collector { lists, gaps, .. } = c;
+    Ok(ProtectedSet {
+        home: home.to_vec(),
+        cwd: cwd.to_vec(),
+        atrium_data_paths,
+        atrium_protected_paths,
+        hard_deny_identities: lists.hard_deny,
+        write_only_hard_deny_identities: lists.write_only,
+        identity_gaps: gaps,
+        store_identities: lists.store,
+        ssh_linked_dirs,
+        folds,
+    })
+}
+
+/// `String::from_utf8_lossy(name).to_lowercase().starts_with(prefix)` for an
+/// ASCII `prefix`, decided without allocating (review 8, finding 3): the
+/// name is decoded chunk by chunk (each invalid sequence is one U+FFFD, as
+/// `from_utf8_lossy` gives) and each scalar is lowercased in turn. Per-scalar
+/// lowercasing differs from the string-level one only for a final capital
+/// sigma, which is not ASCII either way, so the answer is the same.
+pub(crate) fn lossy_lowercase_starts_with(name: &[u8], prefix: &str) -> bool {
+    let mut want = prefix.chars();
+    for chunk in name.utf8_chunks() {
+        let lowered = chunk
+            .valid()
+            .chars()
+            .flat_map(char::to_lowercase)
+            .chain((!chunk.invalid().is_empty()).then_some('\u{FFFD}'));
+        for ch in lowered {
+            match want.next() {
+                None => return true,
+                Some(w) if w == ch => {}
+                Some(_) => return false,
+            }
+        }
+    }
+    want.next().is_none()
+}

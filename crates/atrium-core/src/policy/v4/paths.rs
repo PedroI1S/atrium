@@ -1,6 +1,19 @@
 //! Path resolution, glob expansion, recursive reads, and sensitive-path
 //! matching (owned by P2; contract §5).
 
+mod command;
+mod glob;
+mod recursive;
+mod resolve;
+pub(crate) mod resolver;
+pub(crate) mod sensitive;
+
+#[cfg(test)]
+mod p2_tests;
+
+#[allow(unused_imports)]
+pub(crate) use resolver::FsResolver;
+
 use crate::policy::model::{
     AccessMode, CommandUnit, ComputeBudget, DirEntry, Exhausted, FsCaps, GlobExpansion, LinkPolicy,
     PartId, PartResult, PathMetadata, ProtectedSet, RecursiveRootResult, ResolveError,
@@ -84,16 +97,16 @@ pub(crate) trait PathResolver {
 /// **Owned by:** P2 · **Contract:** §3, §5, §8.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_literal(
-    _raw: &[u8],
-    _cwd: &[u8],
-    _home: &[u8],
-    _origin: TargetOrigin,
-    _access: AccessMode,
-    _resolver: &dyn PathResolver,
-    _caps: &mut FsCaps,
-    _budget: &mut ComputeBudget,
+    raw: &[u8],
+    cwd: &[u8],
+    home: &[u8],
+    origin: TargetOrigin,
+    access: AccessMode,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
 ) -> Result<Target, Exhausted> {
-    todo!("P2: implement §5 literal path resolution")
+    resolve::resolve_literal_impl(raw, cwd, home, origin, access, resolver, caps, budget)
 }
 
 /// Expands an unquoted shell glob against `cwd` via `resolver`, separating
@@ -103,16 +116,16 @@ pub(crate) fn resolve_literal(
 /// **Owned by:** P2 · **Contract:** §5, §8.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expand_shell_glob(
-    _pattern: &Word,
-    _cwd: &[u8],
-    _home: &[u8],
-    _source: PartId,
-    _access: AccessMode,
-    _resolver: &dyn PathResolver,
-    _caps: &mut FsCaps,
-    _budget: &mut ComputeBudget,
+    pattern: &Word,
+    cwd: &[u8],
+    home: &[u8],
+    source: PartId,
+    access: AccessMode,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
 ) -> Result<GlobExpansion, Exhausted> {
-    todo!("P2: implement §5 shell glob expansion")
+    glob::expand_shell_glob_impl(pattern, cwd, home, source, access, resolver, caps, budget)
 }
 
 /// Checks one resolved (or unread) [`Target`] against `protected`: identities,
@@ -120,11 +133,11 @@ pub(crate) fn expand_shell_glob(
 ///
 /// **Owned by:** P2 · **Contract:** §5, §8.
 pub(crate) fn check_target(
-    _target: &Target,
-    _protected: &ProtectedSet,
-    _budget: &mut ComputeBudget,
+    target: &Target,
+    protected: &ProtectedSet,
+    budget: &mut ComputeBudget,
 ) -> Result<PartResult, Exhausted> {
-    todo!("P2: implement §5 target matching against protected set")
+    sensitive::check_target_impl(target, protected, budget)
 }
 
 /// Evaluates a recursive read root: S8 protected-root policy (with home,
@@ -135,15 +148,24 @@ pub(crate) fn check_target(
 ///
 /// **Owned by:** P2 · **Contract:** §1 step 4, §2, §5, §8.
 pub(crate) fn check_recursive_root(
-    _root: &Target,
-    _links: LinkPolicy,
-    _filters: &[SearchFilter],
-    _protected: &ProtectedSet,
-    _resolver: &dyn PathResolver,
-    _caps: &mut FsCaps,
-    _budget: &mut ComputeBudget,
+    root: &Target,
+    links: LinkPolicy,
+    filters: &[SearchFilter],
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
 ) -> Result<RecursiveRootResult, Exhausted> {
-    todo!("P2: implement §5 recursive root, filter, link, and hard-link checks")
+    recursive::check_recursive_root_impl(
+        root,
+        links,
+        filters,
+        protected,
+        resolver,
+        caps,
+        budget,
+        &mut sensitive::RootAliases::default(),
+    )
 }
 
 /// Resolves and checks all targets of a sequence of modeled command units,
@@ -154,15 +176,17 @@ pub(crate) fn check_recursive_root(
 ///
 /// **Owned by:** P2 · **Contract:** §5, §8.
 pub(crate) fn resolve_command_targets(
-    _units: &[CommandUnit],
-    _effects: &[ToolEffects],
-    _start_cwd: &[u8],
-    _protected: &ProtectedSet,
-    _resolver: &dyn PathResolver,
-    _caps: &mut FsCaps,
-    _budget: &mut ComputeBudget,
+    units: &[CommandUnit],
+    effects: &[ToolEffects],
+    start_cwd: &[u8],
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
 ) -> Result<ResolvedCallPaths, Exhausted> {
-    todo!("P2: implement §5 command-line path resolution and intra-call writer tracking")
+    command::resolve_command_targets_impl(
+        units, effects, start_cwd, protected, resolver, caps, budget,
+    )
 }
 
 /// Resolves and checks paths and search selectors/filters for a file-tool
@@ -171,16 +195,18 @@ pub(crate) fn resolve_command_targets(
 /// **Owned by:** P2 · **Contract:** §5, §8.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_subject_paths(
-    _paths: &[String],
-    _glob: Option<&str>,
-    _recursive: bool,
-    _access: AccessMode,
-    _protected: &ProtectedSet,
-    _resolver: &dyn PathResolver,
-    _caps: &mut FsCaps,
-    _budget: &mut ComputeBudget,
+    paths: &[String],
+    glob: Option<&str>,
+    recursive: bool,
+    access: AccessMode,
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
 ) -> Result<ResolvedCallPaths, Exhausted> {
-    todo!("P2: implement §5 file-tool and search-tool path resolution")
+    command::resolve_subject_paths_impl(
+        paths, glob, recursive, access, protected, resolver, caps, budget,
+    )
 }
 
 #[cfg(test)]
