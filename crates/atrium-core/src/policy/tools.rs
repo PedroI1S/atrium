@@ -3205,7 +3205,7 @@ mod tests {
     use atrium_protocol::policy::HOME_READONLY_COMMANDS;
 
     use super::*;
-    use crate::policy::{deny, engine, shell, words};
+    use crate::policy::dev_parity::{deny, engine, shell, words};
 
     fn check_flag_slice_unique(context: &str, flags: &[FlagSpec]) {
         let mut shorts = HashSet::new();

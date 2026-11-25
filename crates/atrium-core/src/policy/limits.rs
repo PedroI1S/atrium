@@ -141,11 +141,12 @@ mod tests {
 
     #[test]
     fn shared_limits_match_dev() {
-        assert_eq!(MAX_BYTES, super::super::deny::MAX_BYTES);
-        assert_eq!(MAX_UNITS, super::super::shell::MAX_UNITS);
-        assert_eq!(MAX_USES, super::super::words::MAX_USES);
-        assert_eq!(MAX_PATHS, super::super::words::MAX_PATHS);
-        assert_eq!(MAX_DEPTH, super::super::shell::MAX_DEPTH);
+        use super::super::dev_parity::{deny, shell, words};
+        assert_eq!(MAX_BYTES, deny::MAX_BYTES);
+        assert_eq!(MAX_UNITS, shell::MAX_UNITS);
+        assert_eq!(MAX_USES, words::MAX_USES);
+        assert_eq!(MAX_PATHS, words::MAX_PATHS);
+        assert_eq!(MAX_DEPTH, shell::MAX_DEPTH);
         assert_eq!(MAX_HOPS, super::super::gate::MAX_HOPS);
     }
 
