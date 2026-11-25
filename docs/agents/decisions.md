@@ -1118,3 +1118,10 @@ D-141 removed flag arities from these rows precisely to avoid this.
 - **No rebase was needed.** The orchestrator's round 5 verification ran on the branch merged into `dev` with P3 (`82f8d115`), and `dev` has changed only in `docs/` since. It was clean on macOS: fmt and workspace clippy clean; `bridge::` ×300 with 0 failures. The workspace had one failure, N18, unrelated and routed to M1-44.
 - **N16 is closed.**
 
+
+## D-169 — 2026-11-24 — Pedro: Claude reviews run inside agy
+**Decided by Pedro (driver).** The orchestrator's own Claude usage is nearly spent. agy's Claude models (`claude-sonnet-5-5-{low,medium,high}`, `claude-opus-5-5-{low,medium,high}`) draw on a separate limit from agy's Gemini models.
+- **What changes:** from now on, the Sonnet 5.5 reviews (D-162) run as agy workers (`scripts/agent-run agy claude-sonnet-5-5-high <task> <prompt>`), not as Claude Code subagents.
+  - Each review runs in the task's worktree, with `AGENT_RUN_LOG=<task>-review<N>` so the worker's logs aren't overwritten.
+  - The prompt makes the reviewer read-only, and its final message is the review. The agy policy hook still applies.
+- **Tooling:** `scripts/agent-run` gains the optional `AGENT_RUN_LOG`.

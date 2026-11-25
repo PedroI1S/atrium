@@ -4,7 +4,9 @@
 #   scripts/agent-run <codex|agy> <model> <task-id> <prompt-file>
 #
 # Claude workers (Sonnet/Opus) are launched as Claude Code subagents by the
-# orchestrator instead. Logs go to .orchestration/logs/<task-id>.* (git-ignored).
+# orchestrator instead. Logs go to .orchestration/logs/<task-id>.* (git-ignored),
+# or to .orchestration/logs/$AGENT_RUN_LOG.* when set (e.g. a review run in the
+# same worktree: AGENT_RUN_LOG=<task>-review3).
 # Verified launch flags: see PLAN.md §8.7.
 set -euo pipefail
 
@@ -12,6 +14,7 @@ provider="$1" model="$2" task="$3" prompt_file="$4"
 root="$(git rev-parse --show-toplevel)"
 worktree="$(cd "$root/.." && pwd)/atrium-wt/$task"
 logs="$root/.orchestration/logs"
+log="${AGENT_RUN_LOG:-$task}"
 mkdir -p "$logs"
 
 [[ -d "$worktree" ]] || { echo "worktree not found: $worktree" >&2; exit 1; }
@@ -23,8 +26,8 @@ case "$provider" in
     # for crate/npm downloads.
     exec codex exec -m "$model" -C "$worktree" \
       -s workspace-write -c sandbox_workspace_write.network_access=true \
-      --json -o "$logs/$task.last.md" "$prompt" \
-      > "$logs/$task.jsonl" 2> "$logs/$task.err" < /dev/null
+      --json -o "$logs/$log.last.md" "$prompt" \
+      > "$logs/$log.jsonl" 2> "$logs/$log.err" < /dev/null
     ;;
   agy)
     # Headless agy can't prompt, and hook "allow" can't grant permissions, so
@@ -62,7 +65,7 @@ PY
     cd "$worktree"
     exec agy -p "$prompt" --model "$model" --mode accept-edits \
       --dangerously-skip-permissions --output-format stream-json --print-timeout 0s \
-      > "$logs/$task.jsonl" 2> "$logs/$task.err" < /dev/null
+      > "$logs/$log.jsonl" 2> "$logs/$log.err" < /dev/null
     ;;
   *)
     echo "unknown provider: $provider (claude workers run as subagents)" >&2
