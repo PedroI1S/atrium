@@ -782,8 +782,11 @@ pub fn subject_rows() -> Vec<SubjectRow> {
         "*.{ts,tsx}",
         "src/{a,b}/mod.rs",
         "x/../src/*.rs",
-        "/h/u/proj/src/*.rs",
-        "~/proj/**/*.md",
+        // `/h/u/proj/src/*.rs` and `~/proj/**/*.md` are selectors (absolute
+        // or anchored): §5 expands them against the disk, so their Home
+        // verdict needs real files. They moved to
+        // `p1_anchored_selectors_inside_their_roots_on_a_real_disk` (P5 review
+        // 1, finding 7), with `~/notes/*.md` below.
         "[a-z]*.rs",
         "?.rs",
         ".github/*.yml",
@@ -797,17 +800,43 @@ pub fn subject_rows() -> Vec<SubjectRow> {
             allow,
         ));
     }
-    // a pattern that leaves one root but is under another the subject gives
-    // (the Claude adapter adds the place a pattern points at)
-    v.push(subject(
-        "P1 ordinary",
-        Search,
-        &["~/proj", "~/notes/"],
-        Some("~/notes/*.md"),
-        true,
-        allow,
-    ));
     v
+}
+
+/// P1's anchored selectors inside their roots, on a real disk (moved from
+/// the virtual `p1_search_globs_that_leave_their_roots`, P5 review 1,
+/// finding 7). §5 expands a selector like a shell glob; every match lies
+/// inside a root and is ordinary, so the search is Clear: Allow in Home,
+/// under an Any rule and in FullAccess (`dev`'s verdict). The last row is a
+/// pattern that leaves one root but is under another the subject gives (the
+/// Claude adapter adds the place a pattern points at).
+#[test]
+fn p1_anchored_selectors_inside_their_roots_on_a_real_disk() {
+    let t = Tmp::new();
+    t.write("proj/src/a.rs", "x");
+    t.write("proj/doc/x.md", "x");
+    t.write("notes/n.md", "x");
+    let h = t.home.display().to_string();
+    let abs = format!("{h}/proj/src/*.rs");
+    let rows: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["~/proj"], abs.as_str()),
+        (vec!["~/proj"], "~/proj/**/*.md"),
+        (vec!["~/proj", "~/notes/"], "~/notes/*.md"),
+    ];
+    let mut failures = vec![];
+    for (roots, g) in &rows {
+        for (name, rules, preset) in subject_settings(ToolKind::Search) {
+            let gate = t.gate_with("t1", 1, &t.home.join("proj"), preset, rules, None);
+            let c = paths_check(ToolKind::Search, "Glob", roots, true, Some(g));
+            let got = gate_short(&block_on(gate.gate.check(&c)));
+            if got != "Allow" {
+                failures.push(format!(
+                    "[{name}] Glob {roots:?} {g}: wanted Allow, got {got}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
 fn eval_subject(r: &SubjectRow, rules: &[Rule], preset: Preset) -> PolicyVerdict {

@@ -911,6 +911,36 @@ fn path_rules_resolve_symlinks_and_relative_paths() {
     ));
 }
 
+/// §3 as amended by §11 item 16 (D-176): a `~` inside a word is literal
+/// except right after `=` or `:`, and `>&m`/`>&-` (m in 0–2) are `1>&m`/
+/// `1>&-`. The exceptions stay outside the model (Unread: Ask in Home, §11
+/// item 2), and so does `>&file` and `>&3` (§11 item 10).
+#[test]
+fn section3_amendment_tilde_inside_words_and_bare_dup_redirects() {
+    let env = Env::home();
+    for line in [
+        "git diff HEAD~1",
+        "git show --stat HEAD~1",
+        "cat a~b",
+        "ls >&2",
+        "ls >&1",
+        "ls >&-",
+        "git diff HEAD~1 >&2",
+    ] {
+        assert_eq!(classify(&env.cmd(line)), Allow, "{line}");
+    }
+    for line in [
+        "cat a=~/x",
+        "ls --opt=~/x",
+        "cat x:~/y",
+        "ls >&out.txt",
+        "ls >&3",
+        "ls >& f",
+    ] {
+        assert_eq!(classify(&env.cmd(line)), Ask, "{line}");
+    }
+}
+
 #[test]
 fn home_preset_allows_reads_and_asks_for_changes() {
     let env = Env::home();
@@ -949,9 +979,9 @@ fn home_preset_allows_reads_and_asks_for_changes() {
     think.kind = ToolKind::Think;
     think.subject = ToolSubject::None;
     assert_eq!(classify(&env.eval_check(&think, &[], Preset::Home)), Allow);
-    // a search can't reach credentials either
-    let c = paths_check(ToolKind::Search, "Grep", &["~/.ssh"], true, None);
-    assert_eq!(classify(&env.eval_check(&c, &[], Preset::Home)), Hard(CR));
+    // a search can't reach credentials either: S8 needs an existing
+    // hard-deny path below the root (§5), so this one runs on a real disk
+    // with a key in `~/.ssh` (`real_disk_recursive_search_of_ssh_is_a_hard_deny`)
     let c = paths_check(ToolKind::Read, "Read", &["~/.npmrc"], false, None);
     assert_eq!(classify(&env.eval_check(&c, &[], Preset::Home)), Hard(CR));
 }
@@ -1177,7 +1207,6 @@ fn hard_deny_applies_to_searches_and_inside_substitutions() {
     ] {
         for p in [
             "~/.ssh/id_rsa",
-            "$HOME/.aws/credentials",
             "/h/u/.local/share/atrium/x.db",
             "~/../u/.npmrc",
         ] {
@@ -1190,6 +1219,16 @@ fn hard_deny_applies_to_searches_and_inside_substitutions() {
                 "{kind:?} {p}"
             );
         }
+        // File-tool paths are literal (§5, §10 row 11): `$HOME/.aws/credentials`
+        // is a folder named `$HOME` under the cwd, not the credential.
+        let c = paths_check(kind, "T", &["$HOME/.aws/credentials"], true, None);
+        assert!(
+            !matches!(
+                env.eval_check(&c, &[], Preset::Home),
+                PolicyVerdict::HardDeny { .. }
+            ),
+            "{kind:?} $HOME/.aws/credentials is literal"
+        );
     }
     // writes to Atrium's protected paths via file tools
     for kind in [ToolKind::Edit, ToolKind::Delete, ToolKind::Move] {
@@ -2811,4 +2850,35 @@ fn review_round5_table() {
         ),
     ];
     run_table(&env, &table);
+}
+
+/// Moved from the virtual `home_preset_allows_reads_and_asks_for_changes`
+/// (P5 review 1, finding 7): a recursive `Grep ~/.ssh` with a key present is
+/// S8 (§5: a recursive read whose root contains an existing hard-deny path),
+/// a hard deny in Home, under an Any rule and in FullAccess.
+#[test]
+fn real_disk_recursive_search_of_ssh_is_a_hard_deny() {
+    let t = Tmp::new();
+    t.write(".ssh/id_rsa", "secret");
+    t.write(".ssh/known_hosts", "x");
+    let any = rule(
+        RuleScope::Global,
+        ToolKind::Search,
+        RuleMatcher::Any,
+        RuleDecision::Allow,
+        "any",
+    );
+    for (preset, rules) in [
+        (Preset::Home, vec![]),
+        (Preset::Home, vec![any]),
+        (Preset::FullAccess, vec![]),
+    ] {
+        let g = t.gate(preset, rules.clone());
+        let c = paths_check(ToolKind::Search, "Grep", &["~/.ssh"], true, None);
+        let d = block_on(g.gate.check(&c));
+        assert!(
+            matches!(d, GateDecision::Deny { .. }),
+            "{preset:?} {rules:?}: {d:?}"
+        );
+    }
 }

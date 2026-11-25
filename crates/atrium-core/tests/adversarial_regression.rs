@@ -756,8 +756,6 @@ fn round_4_blocker_2_every_grep_recursion_spelling_reaches_the_hard_link_check()
             "grep -d recurse x proj",
             "grep --directories recurse x proj",
             "grep --directories=recurse x proj",
-            "grep --dir=recurse x proj",
-            "grep --rec x proj",
             "grep -id recurse x proj",
             "grep -drecurse x proj",
             "egrep -r x proj",
@@ -766,6 +764,22 @@ fn round_4_blocker_2_every_grep_recursion_spelling_reaches_the_hard_link_check()
             let d = block_on(g.gate.check(&cmd_check(line)));
             if matches!(d, GateDecision::Allow) {
                 failures.push(format!("[{setting}] {line:?}: got {d:?}"));
+            }
+        }
+        // Abbreviated long options aren't in P3's table: §6 makes an unknown
+        // flag Unread, so Ask in Home and Allow under Any and FullAccess
+        // (D-176's last paragraph; §11 items 1 and 2).
+        for line in ["grep --dir=recurse x proj", "grep --rec x proj"] {
+            let d = block_on(g.gate.check(&cmd_check(line)));
+            let ok = if setting == "home" {
+                matches!(d, GateDecision::Ask { .. })
+            } else {
+                d == GateDecision::Allow
+            };
+            if !ok {
+                failures.push(format!(
+                    "[{setting}] {line:?}: got {d:?}, wanted Unread (D-176)"
+                ));
             }
         }
     }
