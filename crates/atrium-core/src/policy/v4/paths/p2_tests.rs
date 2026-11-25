@@ -7573,30 +7573,25 @@ fn round12_hard_deny_target_suppresses_incomplete_alias_table_unread() {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn expected_dir_stream_alloc(dir: &std::path::Path) -> usize {
+fn expected_dir_peak_headroom(dir: &std::path::Path) -> usize {
     #[cfg(target_os = "linux")]
     {
         let _ = dir;
-        crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let blk = usize::try_from(std::fs::metadata(dir).expect("stat dir").blksize())
-            .expect("non-negative blksize");
-        crate::policy::v4::paths::resolver::dir_stream_alloc_for_blksize(blk)
-    }
-}
-
-#[cfg(unix)]
-const fn expected_dir_entry_peak_headroom() -> usize {
-    #[cfg(target_os = "linux")]
-    {
         0
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        crate::policy::v4::paths::resolver::NAME_ALLOC_PEAK
+        use std::os::unix::fs::MetadataExt;
+
+        use crate::policy::v4::paths::resolver::{
+            DIR_STREAM_ALLOC, NAME_ALLOC_PEAK, dir_stream_peak_for_blksize,
+        };
+
+        let blk = usize::try_from(std::fs::metadata(dir).expect("stat dir").blksize())
+            .expect("non-negative blksize");
+        dir_stream_peak_for_blksize(blk)
+            .saturating_sub(DIR_STREAM_ALLOC)
+            .saturating_add(NAME_ALLOC_PEAK)
     }
 }
 
@@ -7606,15 +7601,16 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     use std::os::unix::ffi::OsStrExt;
 
     use crate::policy::model::{DirEntry, FileType};
+    use crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC;
 
-    // Review 10, finding 1 & review 11, finding 1 (§8): `FsResolver::read_dir`
-    // charges `DIR_STREAM_ALLOC` (or `st_blksize + DIR_STREAM_OVERHEAD` when
-    // larger on non-Linux Unix) before constructing the directory stream on
-    // both macOS (`Dir::new(dir_fd)`, single open, no dup) and Linux (`RawDir`),
-    // and checks `NAME_ALLOC_PEAK` headroom before each `dir.next()` on
-    // non-Linux Unix. Total deducted bytes for ordinary directories
-    // (`st_blksize <= 4,096`) match identically across Linux and non-Linux Unix,
-    // with a single `DirOpens` cap unit per listing.
+    // Review 10, finding 1; review 11, finding 1; review 12, finding 1 (§8):
+    // `FsResolver::read_dir` always deducts `DIR_STREAM_ALLOC` (4,352 bytes)
+    // permanently per listing on both Linux and non-Linux Unix (regardless of
+    // `st_blksize`), while on non-Linux Unix it checks transient peak headroom
+    // (`stream_peak - DIR_STREAM_ALLOC + NAME_ALLOC_PEAK`) without permanently
+    // deducting it. A single `DirOpens` cap unit is charged per listing.
+    assert_eq!(DIR_STREAM_ALLOC, 4_352);
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
     let tiny = root.join("tiny");
@@ -7627,9 +7623,8 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     let tiny_bytes = tiny.as_os_str().as_bytes();
     let empty_bytes = empty.as_os_str().as_bytes();
     let resolver = FsResolver::new();
-    let stream_tiny = expected_dir_stream_alloc(&tiny);
-    let stream_empty = expected_dir_stream_alloc(&empty);
-    let peak = expected_dir_entry_peak_headroom();
+    let peak_tiny = expected_dir_peak_headroom(&tiny);
+    let peak_empty = expected_dir_peak_headroom(&empty);
 
     // `push_entry_charged` allocates the initial 8-slot `Vec<DirEntry>` buffer
     // once for 1..=8 entries plus each entry's name bytes; `charge_path_conversion`
@@ -7640,16 +7635,13 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
         0
     };
     let entries_bytes = path_conv_tiny + 8 * std::mem::size_of::<DirEntry>() + 1 + 2;
-    let tiny_exact_need = entries_bytes + stream_tiny + peak;
+    let tiny_deducted = entries_bytes + 4_352;
+    let tiny_exact_need = tiny_deducted + peak_tiny;
 
-    // 1. Allocation budgets below `entries_bytes + stream_tiny + peak` must
-    //    exhaust `AllocationBudget`; `tiny_exact_need` succeeds with `peak`
-    //    bytes remaining (total deducted == `entries_bytes + stream_tiny`).
-    for tight in [
-        entries_bytes,
-        entries_bytes + stream_tiny - 1,
-        tiny_exact_need - 1,
-    ] {
+    // 1. Allocation budgets below `tiny_deducted + peak_tiny` must exhaust
+    //    `AllocationBudget`; `tiny_exact_need` succeeds with `peak_tiny` bytes
+    //    remaining (total deducted == `entries_bytes + 4_352`).
+    for tight in [entries_bytes, tiny_deducted - 1, tiny_exact_need - 1] {
         let mut budget = ComputeBudget::new(1_000_000, tight);
         assert_eq!(
             resolver.read_dir(tiny_bytes, &mut FsCaps::with_default_limits(), &mut budget),
@@ -7664,10 +7656,10 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     let mut entries = resolver
         .read_dir(tiny_bytes, &mut FsCaps::with_default_limits(), &mut exact)
         .expect("exact tiny_exact_need budget must succeed");
-    assert_eq!(exact.remaining_alloc_bytes(), peak);
+    assert_eq!(exact.remaining_alloc_bytes(), peak_tiny);
     assert_eq!(
         tiny_exact_need - exact.remaining_alloc_bytes(),
-        entries_bytes + stream_tiny
+        tiny_deducted
     );
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     assert_eq!(
@@ -7685,9 +7677,8 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     );
 
     // 2. Cross-platform total-charge parity check: total deducted bytes match
-    //    `entries_bytes + stream_tiny` (which equals `entries_bytes +
-    //    DIR_STREAM_ALLOC` on local `st_blksize <= 4,096` volumes), and an
-    //    empty directory deducts `path_conv_empty + stream_empty`.
+    //    `entries_bytes + 4_352` identically on Linux and non-Linux Unix, and
+    //    an empty directory deducts `path_conv_empty + 4_352`.
     let start_alloc = 1_000_000usize;
     let mut parity_budget = ComputeBudget::new(1_000_000, start_alloc);
     let parity_entries = resolver
@@ -7700,7 +7691,7 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     assert_eq!(parity_entries.len(), 2);
     assert_eq!(
         start_alloc - parity_budget.remaining_alloc_bytes(),
-        entries_bytes + stream_tiny
+        tiny_deducted
     );
 
     let path_conv_empty = if empty_bytes.len() >= 256 {
@@ -7708,7 +7699,8 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     } else {
         0
     };
-    let empty_exact_need = path_conv_empty + stream_empty + peak;
+    let empty_deducted = path_conv_empty + 4_352;
+    let empty_exact_need = empty_deducted + peak_empty;
     let mut empty_below = ComputeBudget::new(1_000_000, empty_exact_need - 1);
     assert_eq!(
         resolver.read_dir(
@@ -7729,10 +7721,10 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
         ),
         Ok(Vec::new())
     );
-    assert_eq!(empty_exact.remaining_alloc_bytes(), peak);
+    assert_eq!(empty_exact.remaining_alloc_bytes(), peak_empty);
     assert_eq!(
         empty_exact_need - empty_exact.remaining_alloc_bytes(),
-        path_conv_empty + stream_empty
+        empty_deducted
     );
 
     // 3. `DirOpens` cap at 1: one listing succeeds (no second open from
@@ -8599,11 +8591,14 @@ fn round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity() {
     use crate::policy::model::{DirEntry, FileType};
     use crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC;
 
-    // Review 11, finding 1 (§8): a directory with a single 255-byte name must
-    // exhaust `AllocationBudget` BEFORE `dir.next()` can allocate a transient
-    // `CString` on non-Linux Unix (`NAME_ALLOC_PEAK` peak check), succeed at
-    // the exact need, and deduct the exact same total allocation bytes as
-    // Linux on ordinary local volumes (`st_blksize <= 4,096`).
+    // Review 11, finding 1 & review 12, finding 1 (§8): a directory with a
+    // single 255-byte name must exhaust `AllocationBudget` BEFORE `Dir::new`
+    // or `dir.next()` can allocate transient buffers on non-Linux Unix,
+    // succeed at the exact need, and permanently deduct the exact same total
+    // allocation bytes (`path_conv + 4_352 + entries_bytes`) as Linux on every
+    // volume.
+    assert_eq!(DIR_STREAM_ALLOC, 4_352);
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
     let dir = root.join("long_name_dir");
@@ -8619,43 +8614,34 @@ fn round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity() {
     } else {
         0
     };
-    let stream_alloc = expected_dir_stream_alloc(&dir);
     let entries_bytes = 8 * std::mem::size_of::<DirEntry>() + long_name.len();
-    let total_deducted = path_conv + stream_alloc + entries_bytes;
-    let peak = expected_dir_entry_peak_headroom();
+    let total_deducted = path_conv + 4_352 + entries_bytes;
+    let peak = expected_dir_peak_headroom(&dir);
     let exact_need = total_deducted + peak;
 
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        use crate::policy::v4::paths::resolver::{
-            DIR_STREAM_OVERHEAD, NAME_ALLOC_PEAK, dir_stream_alloc_for_blksize,
-        };
+        use std::os::unix::fs::MetadataExt;
 
-        // Pin `st_blksize` stream sizing formula (including large network /
-        // FUSE block sizes and overflow saturation).
-        assert_eq!(dir_stream_alloc_for_blksize(0), DIR_STREAM_ALLOC);
-        assert_eq!(dir_stream_alloc_for_blksize(1_024), DIR_STREAM_ALLOC);
-        assert_eq!(dir_stream_alloc_for_blksize(4_096), DIR_STREAM_ALLOC);
-        assert_eq!(
-            dir_stream_alloc_for_blksize(65_536),
-            65_536 + DIR_STREAM_OVERHEAD
-        );
-        assert_eq!(
-            dir_stream_alloc_for_blksize(1_048_576),
-            1_048_576 + DIR_STREAM_OVERHEAD
-        );
-        assert_eq!(dir_stream_alloc_for_blksize(usize::MAX), usize::MAX);
+        use crate::policy::v4::paths::resolver::{NAME_ALLOC_PEAK, dir_stream_peak_for_blksize};
+
+        let blk = usize::try_from(std::fs::metadata(&dir).expect("stat dir").blksize())
+            .expect("non-negative blksize");
+        let stream_peak = dir_stream_peak_for_blksize(blk);
 
         // Non-Linux Unix tight budgets:
-        // - `path_conv + stream_alloc` (equals `DIR_STREAM_ALLOC` on local 4K
-        //   volumes with short paths): Exhausted before 1st `dir.next()`;
-        // - `path_conv + stream_alloc + NAME_ALLOC_PEAK - 1`: Exhausted before
-        //   1st `dir.next()`;
-        // - `total_deducted`: Exhausted (no headroom for trailing `dir.next()`);
+        // - `path_conv + 4_352` and `path_conv + stream_peak - 1`: Exhausted
+        //   before `Dir::new`;
+        // - `path_conv + stream_peak` and
+        //   `path_conv + stream_peak + NAME_ALLOC_PEAK - 1`: `Dir::new` runs,
+        //   Exhausted before 1st `dir.next()`;
+        // - `total_deducted`: Exhausted;
         // - `exact_need - 1`: Exhausted 1 byte short of exact need.
         for tight in [
-            path_conv + stream_alloc,
-            path_conv + stream_alloc + NAME_ALLOC_PEAK - 1,
+            path_conv + 4_352,
+            path_conv + stream_peak - 1,
+            path_conv + stream_peak,
+            path_conv + stream_peak + NAME_ALLOC_PEAK - 1,
             total_deducted,
             exact_need - 1,
         ] {
@@ -8674,8 +8660,8 @@ fn round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity() {
     {
         // Linux `RawDir` uses a stack buffer with no per-entry `CString`, so
         // `peak == 0` and exact need is `total_deducted`.
-        assert_eq!(stream_alloc, DIR_STREAM_ALLOC);
-        for tight in [path_conv + DIR_STREAM_ALLOC, exact_need - 1] {
+        assert_eq!(peak, 0);
+        for tight in [path_conv + 4_352, exact_need - 1] {
             let mut b = ComputeBudget::new(1_000_000, tight);
             assert_eq!(
                 resolver.read_dir(dir_bytes, &mut FsCaps::with_default_limits(), &mut b),
@@ -8688,8 +8674,7 @@ fn round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity() {
     }
 
     // Exact need succeeds on both Linux and non-Linux Unix and leaves `peak`
-    // bytes unspent, so total deducted bytes match identically on ordinary
-    // volumes (`st_blksize <= 4,096`).
+    // bytes unspent, so total deducted bytes match identically on every volume.
     let mut exact = ComputeBudget::new(1_000_000, exact_need);
     let entries = resolver
         .read_dir(dir_bytes, &mut FsCaps::with_default_limits(), &mut exact)
@@ -9358,4 +9343,1631 @@ fn round14_target_with_any_target_gap_and_incomplete_alias_table_keeps_both_reas
             outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: ssh_dir }),
         }]
     );
+}
+
+// ---------------------------------------------------------------------------
+// 17. Rework Round 15 regressions (review round 12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round15_read_dir_literal_constants_and_stream_charge_bounds() {
+    use crate::policy::v4::paths::resolver::{DIR_STREAM_ALLOC, DIR_STREAM_OVERHEAD};
+
+    // Review 12: assert literal constants (not tautologically against
+    // themselves) so any accidental reduction fails a test.
+    assert_eq!(DIR_STREAM_OVERHEAD, 256);
+    assert_eq!(DIR_STREAM_ALLOC, 4_352);
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use crate::policy::v4::paths::resolver::{
+            DIR_STREAM_MAX_BLKSIZE, DIR_STREAM_PEAK_FLOOR, MAX_D_NAME_BUF, NAME_ALLOC_PEAK,
+            NAME_COMPUTE_PEAK, charge_dir_stream, dir_stream_peak_for_blksize,
+        };
+
+        assert_eq!(DIR_STREAM_PEAK_FLOOR, 65_536);
+        assert_eq!(DIR_STREAM_MAX_BLKSIZE, 1_048_576);
+        const {
+            assert!(DIR_STREAM_PEAK_FLOOR >= 16_384);
+            assert!(DIR_STREAM_PEAK_FLOOR > MAX_D_NAME_BUF);
+            assert!(DIR_STREAM_PEAK_FLOOR > DIR_STREAM_ALLOC);
+            assert!(NAME_ALLOC_PEAK > MAX_D_NAME_BUF);
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            assert_eq!(MAX_D_NAME_BUF, 1_024);
+            assert_eq!(NAME_ALLOC_PEAK, 1_088);
+            assert_eq!(NAME_COMPUTE_PEAK, 1_024);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            assert_eq!(MAX_D_NAME_BUF, 256);
+            assert_eq!(NAME_ALLOC_PEAK, 320);
+            assert_eq!(NAME_COMPUTE_PEAK, 256);
+        }
+
+        // Peak sizing: small volumes (0..=64 KiB) floor at 64 KiB + 256;
+        // larger volumes scale up to 1 MiB + 256.
+        assert_eq!(dir_stream_peak_for_blksize(0), 65_792);
+        assert_eq!(dir_stream_peak_for_blksize(1_024), 65_792);
+        assert_eq!(dir_stream_peak_for_blksize(4_096), 65_792);
+        assert_eq!(dir_stream_peak_for_blksize(16_384), 65_792);
+        assert_eq!(dir_stream_peak_for_blksize(65_536), 65_792);
+        assert_eq!(dir_stream_peak_for_blksize(131_072), 131_328);
+        assert_eq!(dir_stream_peak_for_blksize(1_048_576), 1_048_832);
+
+        // 128 KiB blksize: deducts ONLY `DIR_STREAM_ALLOC` (4,352 bytes), not
+        // 131,328; budget below peak (131,327) exhausts `AllocationBudget`.
+        let mut generous = ComputeBudget::new(1_000_000, 1_000_000);
+        let extra_128k = charge_dir_stream(131_072i64, &mut generous).unwrap();
+        assert_eq!(extra_128k, 131_328 - 4_352);
+        assert_eq!(1_000_000 - generous.remaining_alloc_bytes(), 4_352);
+
+        let mut below_128k = ComputeBudget::new(1_000_000, 131_327);
+        assert_eq!(
+            charge_dir_stream(131_072i64, &mut below_128k),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            }))
+        );
+
+        let mut exact_128k = ComputeBudget::new(1_000_000, 131_328);
+        assert_eq!(
+            charge_dir_stream(131_072i64, &mut exact_128k),
+            Ok(131_328 - 4_352)
+        );
+        assert_eq!(exact_128k.remaining_alloc_bytes(), 131_328 - 4_352);
+
+        // 4 KiB volume: floored peak (65,792) is enforced before `Dir::new`,
+        // while deduction stays 4,352.
+        let mut below_4k = ComputeBudget::new(1_000_000, 65_791);
+        assert_eq!(
+            charge_dir_stream(4_096i64, &mut below_4k),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            }))
+        );
+        let mut exact_4k = ComputeBudget::new(1_000_000, 65_792);
+        assert_eq!(
+            charge_dir_stream(4_096i64, &mut exact_4k),
+            Ok(65_792 - 4_352)
+        );
+        assert_eq!(exact_4k.remaining_alloc_bytes(), 65_792 - 4_352);
+
+        // 1 MiB (max valid blksize): peak 1,048,832 enforced, deducts 4,352.
+        let mut below_1m = ComputeBudget::new(1_000_000, 1_048_831);
+        assert_eq!(
+            charge_dir_stream(1_048_576i64, &mut below_1m),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            }))
+        );
+        let mut exact_1m = ComputeBudget::new(1_000_000, 1_048_832);
+        assert_eq!(
+            charge_dir_stream(1_048_576i64, &mut exact_1m),
+            Ok(1_048_832 - 4_352)
+        );
+        assert_eq!(exact_1m.remaining_alloc_bytes(), 1_048_832 - 4_352);
+
+        // Negative and absurd (> 1 MiB) block sizes stay `Io(Other)` (Unread),
+        // never allocating and never exhausting `budget`.
+        for bad in [-1i64, -4_096, i64::MIN, 1_048_577, 16 * 1_048_576, i64::MAX] {
+            let mut b = ComputeBudget::new(1_000_000, 1_000_000);
+            assert_eq!(
+                charge_dir_stream(bad, &mut b),
+                Err(ResolveError::Io(FsIoError::Other)),
+                "blksize {bad} must map to Io(Other)"
+            );
+            assert!(!b.is_exhausted());
+            assert_eq!(b.remaining_alloc_bytes(), 1_000_000);
+        }
+        let mut b_i32 = ComputeBudget::new(1_000_000, 1_000_000);
+        assert_eq!(
+            charge_dir_stream(-1i32, &mut b_i32),
+            Err(ResolveError::Io(FsIoError::Other))
+        );
+        let mut b_usize = ComputeBudget::new(1_000_000, 1_000_000);
+        assert_eq!(
+            charge_dir_stream(usize::MAX, &mut b_usize),
+            Err(ResolveError::Io(FsIoError::Other))
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case() {
+    use std::os::unix::ffi::OsStrExt;
+
+    use crate::policy::model::{DirEntry, PathMetadata};
+
+    // Review 12, finding 1 (§2, §8):
+    // 1. A real-FS recursive walk (`rg -L` link policy) over 100 directories
+    //    at a large `st_blksize` (128 KiB and 1 MiB) must end `Clear` (or
+    //    `Unread(DirOpens)` when capped), NEVER `Exhausted`.
+    // 2. Call-level worst case: 4,096 operands plus 1,024 `DirOpens` under
+    //    default limits (`FsCaps::with_default_limits` and
+    //    `ComputeBudget::with_default_limits`) with a 128 KiB volume ends at
+    //    `Unread(DirOpens)`, NEVER `Exhausted`.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fake_home = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let home_bytes = fake_home.as_os_str().as_bytes().to_vec();
+    let proj = fake_home.join("proj");
+    std::fs::create_dir(&proj).unwrap();
+    for i in 0..100usize {
+        let sub = proj.join(format!("d{i:02}"));
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("f.txt"), b"x").unwrap();
+    }
+    let proj_bytes = proj.as_os_str().as_bytes().to_vec();
+
+    struct LargeBlksizeFsResolver {
+        inner: FsResolver,
+        blksize: i64,
+    }
+    impl PathResolver for LargeBlksizeFsResolver {
+        fn stat(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<PathMetadata, ResolveError> {
+            self.inner.stat(path, caps, budget)
+        }
+        fn lstat(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<PathMetadata, ResolveError> {
+            self.inner.lstat(path, caps, budget)
+        }
+        fn read_link(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<Vec<u8>, ResolveError> {
+            self.inner.read_link(path, caps, budget)
+        }
+        fn canonicalize(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<Vec<u8>, ResolveError> {
+            self.inner.canonicalize(path, caps, budget)
+        }
+        fn read_dir(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<Vec<DirEntry>, ResolveError> {
+            #[cfg(target_os = "linux")]
+            {
+                let _ = self.blksize;
+                self.inner.read_dir(path, caps, budget)
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                crate::policy::v4::paths::resolver::read_dir_unix_with_blksize_override(
+                    path,
+                    caps,
+                    budget,
+                    self.blksize,
+                    || {},
+                    || {},
+                )
+            }
+        }
+    }
+
+    let real = FsResolver::new();
+    let prot = build_protected_set(
+        &home_bytes,
+        &home_bytes,
+        vec![],
+        vec![],
+        FoldRules::REV4,
+        &real,
+        &mut FsCaps::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        &mut ComputeBudget::new(u64::MAX, usize::MAX),
+    )
+    .unwrap();
+    let target = resolve_literal(
+        &proj_bytes,
+        &home_bytes,
+        &home_bytes,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &real,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+
+    let follow = LinkPolicy {
+        at_root: true,
+        below_root: true,
+    };
+
+    // 1a. Both 128 KiB (would have exhausted on dir #64 before round 15) and
+    //     1 MiB (would have exhausted on dir #8 before round 15) complete all
+    //     100 subdirectories cleanly as `Clear`.
+    for blksize in [131_072i64, 1_048_576i64] {
+        let wrapped = LargeBlksizeFsResolver {
+            inner: real,
+            blksize,
+        };
+        let mut caps = FsCaps::with_default_limits();
+        let mut budget = ComputeBudget::with_default_limits();
+        let res = check_recursive_root(
+            &target,
+            follow,
+            &[],
+            &prot,
+            &wrapped,
+            &mut caps,
+            &mut budget,
+        )
+        .expect("100-dir walk at large blksize must not exhaust");
+        assert!(
+            all_clear(&res.outcomes),
+            "blksize {blksize}: expected Clear, got {:?}",
+            res.outcomes
+        );
+        assert!(!budget.is_exhausted());
+    }
+
+    // 1b. With `DirOpens` capped at 50 on the 100-dir tree at 128 KiB, ends
+    //     `Unread(WalkCapReached(DirOpens))`, never `Exhausted`.
+    let wrapped_128k = LargeBlksizeFsResolver {
+        inner: real,
+        blksize: 131_072,
+    };
+    let mut capped_budget = ComputeBudget::with_default_limits();
+    let capped = check_recursive_root(
+        &target,
+        follow,
+        &[],
+        &prot,
+        &wrapped_128k,
+        &mut FsCaps::new(16_384, 50, 16_384, 1_024, 4_096),
+        &mut capped_budget,
+    )
+    .expect("capped 100-dir walk must return Unread(DirOpens), not Exhausted");
+    assert!(
+        has_unread(&capped.outcomes, |r| matches!(
+            r,
+            UnreadReason::WalkCapReached(FsCap::DirOpens)
+        )),
+        "{:?}",
+        capped.outcomes
+    );
+    assert!(
+        !capped
+            .outcomes
+            .iter()
+            .any(|r| matches!(r.outcome, PartOutcome::Exhausted(_))),
+        "{:?}",
+        capped.outcomes
+    );
+    assert!(!capped_budget.is_exhausted());
+
+    // 1c. Verify non-Linux Unix `read_dir_unix_with_blksize_override` actually
+    //     obeys the injected `st_blksize` (128 KiB peak enforced, yet only
+    //     4,352 bytes deducted).
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use crate::policy::v4::paths::resolver::read_dir_unix_with_blksize_override;
+
+        let one_sub = proj.join("d00");
+        let one_sub_bytes = one_sub.as_os_str().as_bytes();
+        let path_conv = if one_sub_bytes.len() >= 256 {
+            one_sub_bytes.len() + 1
+        } else {
+            0
+        };
+        let entries_bytes = 8 * std::mem::size_of::<DirEntry>() + b"f.txt".len();
+
+        let mut iter_calls = 0usize;
+        let mut below_128k = ComputeBudget::new(1_000_000, path_conv + 131_328 - 1);
+        assert_eq!(
+            read_dir_unix_with_blksize_override(
+                one_sub_bytes,
+                &mut FsCaps::with_default_limits(),
+                &mut below_128k,
+                131_072,
+                || {},
+                || iter_calls += 1,
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            }))
+        );
+        assert_eq!(iter_calls, 0);
+
+        let start_alloc = 1_000_000usize;
+        let mut gen_128k = ComputeBudget::new(1_000_000, start_alloc);
+        let got = read_dir_unix_with_blksize_override(
+            one_sub_bytes,
+            &mut FsCaps::with_default_limits(),
+            &mut gen_128k,
+            131_072,
+            || {},
+            || {},
+        )
+        .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            start_alloc - gen_128k.remaining_alloc_bytes(),
+            path_conv + 4_352 + entries_bytes
+        );
+    }
+
+    // 2. Call-level worst case: 4,096 single-component operands + 1,024
+    //    `DirOpens` (each opening a real directory with 128 KiB blksize on
+    //    non-Linux Unix / `RawDir` on Linux) sharing ONE default `FsCaps` and
+    //    ONE default `ComputeBudget` must end at `Unread(DirOpens)`, never
+    //    `Exhausted`.
+    let real_empty = fake_home.join("real_empty_leaf");
+    std::fs::create_dir(&real_empty).unwrap();
+    let real_empty_bytes = real_empty.as_os_str().as_bytes().to_vec();
+
+    let mut fake = FakeFs::new();
+    let n_ops = limits::FS_MAX_CANONICALIZATIONS;
+    let mut op_names = Vec::with_capacity(n_ops);
+    for i in 0..n_ops {
+        let name = format!("f{i:04}");
+        fake.add_file(format!("/{name}").as_bytes());
+        op_names.push(name);
+    }
+    for i in 0..=limits::FS_MAX_DIR_OPENS {
+        fake.mkdir_all(format!("/walk/d{i:04}").as_bytes());
+    }
+
+    struct WorstCaseResolver {
+        fake: FakeFs,
+        real_empty: Vec<u8>,
+    }
+    impl PathResolver for WorstCaseResolver {
+        fn stat(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<PathMetadata, ResolveError> {
+            self.fake.stat(path, caps, budget)
+        }
+        fn lstat(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<PathMetadata, ResolveError> {
+            self.fake.lstat(path, caps, budget)
+        }
+        fn read_link(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<Vec<u8>, ResolveError> {
+            self.fake.read_link(path, caps, budget)
+        }
+        fn canonicalize(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<Vec<u8>, ResolveError> {
+            let out = self.fake.canonicalize(path, caps, budget)?;
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                use crate::policy::v4::paths::resolver::{
+                    FALLBACK_CANON_OVERHEAD, FALLBACK_CANON_PEAK,
+                };
+                if budget.remaining_alloc_bytes() < FALLBACK_CANON_PEAK {
+                    budget.charge_alloc(FALLBACK_CANON_PEAK)?;
+                }
+                budget.charge_alloc(FALLBACK_CANON_OVERHEAD)?;
+            }
+            Ok(out)
+        }
+        fn read_dir(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<Vec<DirEntry>, ResolveError> {
+            if path.starts_with(b"/walk/d") {
+                #[cfg(target_os = "linux")]
+                {
+                    return FsResolver::new().read_dir(&self.real_empty, caps, budget);
+                }
+                #[cfg(all(unix, not(target_os = "linux")))]
+                {
+                    return crate::policy::v4::paths::resolver::read_dir_unix_with_blksize_override(
+                        &self.real_empty,
+                        caps,
+                        budget,
+                        131_072,
+                        || {},
+                        || {},
+                    );
+                }
+            }
+            let entries = self.fake.read_dir(path, caps, budget)?;
+            #[cfg(target_os = "linux")]
+            budget.charge_alloc(crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC)?;
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                let _ = crate::policy::v4::paths::resolver::charge_dir_stream(131_072i64, budget)?;
+            }
+            Ok(entries)
+        }
+    }
+
+    let worst = WorstCaseResolver {
+        fake,
+        real_empty: real_empty_bytes,
+    };
+    let worst_prot = build_protected_set(
+        HOME,
+        b"/",
+        vec![],
+        vec![],
+        FoldRules::REV4,
+        &worst.fake,
+        &mut FsCaps::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        &mut ComputeBudget::new(u64::MAX, usize::MAX),
+    )
+    .unwrap();
+    let walk_target = resolve_literal(
+        b"/walk",
+        b"/",
+        HOME,
+        TargetOrigin::SubjectPath { path_index: 0 },
+        AccessMode::Read,
+        &worst.fake,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+
+    let mut shared_caps = FsCaps::with_default_limits();
+    let mut shared_budget = ComputeBudget::with_default_limits();
+    let subj = resolve_subject_paths(
+        &op_names,
+        None,
+        false,
+        AccessMode::Read,
+        &worst_prot,
+        &worst,
+        &mut shared_caps,
+        &mut shared_budget,
+    )
+    .expect("4,096 operands must fit default limits");
+    assert_eq!(subj.targets.len(), n_ops);
+    assert!(all_clear(&subj.outcomes));
+    assert!(!shared_budget.is_exhausted());
+
+    let rec = check_recursive_root(
+        &walk_target,
+        LinkPolicy::default(),
+        &[],
+        &worst_prot,
+        &worst,
+        &mut shared_caps,
+        &mut shared_budget,
+    )
+    .expect("1,024 DirOpens after 4,096 operands must hit DirOpens cap, not Exhausted");
+    assert!(
+        has_unread(&rec.outcomes, |r| matches!(
+            r,
+            UnreadReason::WalkCapReached(FsCap::DirOpens)
+        )),
+        "expected Unread(DirOpens), got {:?}",
+        rec.outcomes
+    );
+    assert!(
+        !rec.outcomes
+            .iter()
+            .any(|r| matches!(r.outcome, PartOutcome::Exhausted(_))),
+        "must never turn into Exhausted: {:?}",
+        rec.outcomes
+    );
+    assert!(!shared_budget.is_exhausted());
+}
+
+#[cfg(unix)]
+#[test]
+fn round15_read_dir_peak_checks_precede_next_and_prevent_fd_leaks() {
+    use std::os::unix::ffi::OsStrExt;
+
+    use crate::policy::v4::paths::resolver::read_dir_unix_with_hooks;
+
+    // Review 12, finding 2 & test gaps:
+    // - both the allocation peak check and the compute peak check run BEFORE
+    //   `dir.next()` (`on_iter` runs 0 times);
+    // - the open fd count for `dir` returns to 0 after stream-charge
+    //   Exhausted, after peak-check Exhausted, and after negative / absurd
+    //   `st_blksize`;
+    // - total compute deducted for a 255-byte name is not double-charged.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let dir = root.join("peak_and_fd_dir");
+    std::fs::create_dir(&dir).unwrap();
+    let long_name = "a".repeat(255);
+    std::fs::write(dir.join(&long_name), b"x").unwrap();
+
+    let dir_bytes = dir.as_os_str().as_bytes();
+    let path_conv = if dir_bytes.len() >= 256 {
+        dir_bytes.len() + 1
+    } else {
+        0
+    };
+    let path_units = dir_bytes.len().max(1) as u64;
+    assert_eq!(count_open_fds_for_dir(&dir), 0);
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        use crate::policy::v4::paths::resolver::{
+            NAME_ALLOC_PEAK, NAME_COMPUTE_PEAK, dir_stream_peak_for_blksize,
+            read_dir_unix_with_blksize_override,
+        };
+
+        let blk = usize::try_from(std::fs::metadata(&dir).expect("stat dir").blksize())
+            .expect("non-negative blksize");
+        let stream_peak = dir_stream_peak_for_blksize(blk);
+
+        // 1. Stream-charge Exhausted BEFORE `Dir::new` (both local blksize and
+        //    injected 128 KiB): `after_open` observes 1 open fd, `on_iter` runs
+        //    0 times, and fd count returns to 0 immediately.
+        let mut opened = 0usize;
+        let mut iters = 0usize;
+        let mut b_stream = ComputeBudget::new(1_000_000, path_conv + stream_peak - 1);
+        assert_eq!(
+            read_dir_unix_with_hooks(
+                dir_bytes,
+                &mut FsCaps::with_default_limits(),
+                &mut b_stream,
+                || {
+                    opened += 1;
+                    assert_eq!(count_open_fds_for_dir(&dir), 1);
+                },
+                || iters += 1,
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            }))
+        );
+        assert_eq!(opened, 1);
+        assert_eq!(iters, 0);
+        assert_eq!(count_open_fds_for_dir(&dir), 0);
+
+        let mut opened_128k = 0usize;
+        let mut iters_128k = 0usize;
+        let mut b_128k = ComputeBudget::new(1_000_000, path_conv + 131_328 - 1);
+        assert_eq!(
+            read_dir_unix_with_blksize_override(
+                dir_bytes,
+                &mut FsCaps::with_default_limits(),
+                &mut b_128k,
+                131_072,
+                || {
+                    opened_128k += 1;
+                    assert_eq!(count_open_fds_for_dir(&dir), 1);
+                },
+                || iters_128k += 1,
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            }))
+        );
+        assert_eq!(opened_128k, 1);
+        assert_eq!(iters_128k, 0);
+        assert_eq!(count_open_fds_for_dir(&dir), 0);
+
+        // 2. Per-entry allocation peak (`stream_extra + NAME_ALLOC_PEAK`)
+        //    Exhausted BEFORE the first `dir.next()`: `Dir::new` succeeds,
+        //    `on_iter` runs 0 times, and fd count returns to 0.
+        for alloc_below_iter_peak in [
+            path_conv + stream_peak,
+            path_conv + stream_peak + NAME_ALLOC_PEAK - 1,
+        ] {
+            let mut opened = 0usize;
+            let mut iters = 0usize;
+            let mut b = ComputeBudget::new(1_000_000, alloc_below_iter_peak);
+            assert_eq!(
+                read_dir_unix_with_hooks(
+                    dir_bytes,
+                    &mut FsCaps::with_default_limits(),
+                    &mut b,
+                    || opened += 1,
+                    || iters += 1,
+                ),
+                Err(ResolveError::Exhausted(Exhausted {
+                    reason: ExhaustReason::AllocationBudget
+                }))
+            );
+            assert_eq!(opened, 1);
+            assert_eq!(
+                iters, 0,
+                "alloc budget {alloc_below_iter_peak} must fail before first dir.next()"
+            );
+            assert_eq!(count_open_fds_for_dir(&dir), 0);
+        }
+
+        // 3. Per-entry compute peak (`NAME_COMPUTE_PEAK`) Exhausted BEFORE the
+        //    first `dir.next()` (review 12 finding 2: 1 unit left before
+        //    `dir.next()`, plus exact boundary `NAME_COMPUTE_PEAK - 1`):
+        //    `on_iter` runs 0 times and fd count returns to 0.
+        for units_below_peak in [path_units + 2, path_units + 2 + NAME_COMPUTE_PEAK - 1] {
+            let mut opened = 0usize;
+            let mut iters = 0usize;
+            let mut b = ComputeBudget::new(units_below_peak, 1_000_000);
+            assert_eq!(
+                read_dir_unix_with_hooks(
+                    dir_bytes,
+                    &mut FsCaps::with_default_limits(),
+                    &mut b,
+                    || opened += 1,
+                    || iters += 1,
+                ),
+                Err(ResolveError::Exhausted(Exhausted {
+                    reason: ExhaustReason::ComputeBudget
+                }))
+            );
+            assert_eq!(opened, 1);
+            assert_eq!(
+                iters, 0,
+                "compute budget {units_below_peak} must fail before first dir.next()"
+            );
+            assert_eq!(count_open_fds_for_dir(&dir), 0);
+        }
+
+        // 4. Negative and absurd `st_blksize`: `after_open` observes 1 open
+        //    fd, `charge_dir_stream` returns `Io(Other)` before `Dir::new`,
+        //    `on_iter` runs 0 times, budget stays unexhausted, and fd count
+        //    returns to 0.
+        for bad_blk in [-1i64, -4_096, 1_048_577, i64::MAX] {
+            let mut opened = 0usize;
+            let mut iters = 0usize;
+            let mut b = ComputeBudget::with_default_limits();
+            assert_eq!(
+                read_dir_unix_with_blksize_override(
+                    dir_bytes,
+                    &mut FsCaps::with_default_limits(),
+                    &mut b,
+                    bad_blk,
+                    || {
+                        opened += 1;
+                        assert_eq!(count_open_fds_for_dir(&dir), 1);
+                    },
+                    || iters += 1,
+                ),
+                Err(ResolveError::Io(FsIoError::Other)),
+                "blksize {bad_blk} must fail with Io(Other)"
+            );
+            assert_eq!(opened, 1);
+            assert_eq!(iters, 0);
+            assert!(!b.is_exhausted());
+            assert_eq!(count_open_fds_for_dir(&dir), 0);
+        }
+
+        // 5. Compute deduction parity: the 255-byte name charges `254` units
+        //    once (never double-charged in `push_unix_dir_entry`), and the
+        //    exact minimum compute budget is `deducted + NAME_COMPUTE_PEAK`.
+        let start_units = 1_000_000u64;
+        let mut gen_units = ComputeBudget::new(start_units, 1_000_000);
+        let mut iter_count = 0usize;
+        let entries = read_dir_unix_with_hooks(
+            dir_bytes,
+            &mut FsCaps::with_default_limits(),
+            &mut gen_units,
+            || {},
+            || iter_count += 1,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, long_name.as_bytes());
+        let deducted = start_units - gen_units.remaining_units();
+        assert_eq!(
+            deducted,
+            path_units + 1 + (iter_count as u64) + 254,
+            "name compute must be charged once (not double-charged)"
+        );
+
+        let mut compute_short = ComputeBudget::new(deducted + NAME_COMPUTE_PEAK - 1, 1_000_000);
+        assert_eq!(
+            read_dir_unix_with_hooks(
+                dir_bytes,
+                &mut FsCaps::with_default_limits(),
+                &mut compute_short,
+                || {},
+                || {},
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::ComputeBudget
+            }))
+        );
+        let mut compute_exact = ComputeBudget::new(deducted + NAME_COMPUTE_PEAK, 1_000_000);
+        assert_eq!(
+            read_dir_unix_with_hooks(
+                dir_bytes,
+                &mut FsCaps::with_default_limits(),
+                &mut compute_exact,
+                || {},
+                || {},
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(compute_exact.remaining_units(), NAME_COMPUTE_PEAK);
+        assert_eq!(count_open_fds_for_dir(&dir), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC;
+
+        // 1. Stream-charge Exhausted BEFORE `RawDir::new`: `after_open` sees 1
+        //    open fd, `on_iter` runs 0 times, fd count returns to 0.
+        let mut opened = 0usize;
+        let mut iters = 0usize;
+        let mut b_stream = ComputeBudget::new(1_000_000, path_conv + DIR_STREAM_ALLOC - 1);
+        assert_eq!(
+            read_dir_unix_with_hooks(
+                dir_bytes,
+                &mut FsCaps::with_default_limits(),
+                &mut b_stream,
+                || {
+                    opened += 1;
+                    assert_eq!(count_open_fds_for_dir(&dir), 1);
+                },
+                || iters += 1,
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            }))
+        );
+        assert_eq!(opened, 1);
+        assert_eq!(iters, 0);
+        assert_eq!(count_open_fds_for_dir(&dir), 0);
+
+        // 2. Compute Exhausted before first `raw_dir.next()`: `on_iter` runs 0
+        //    times, fd count returns to 0.
+        let mut opened_c = 0usize;
+        let mut iters_c = 0usize;
+        let mut b_comp = ComputeBudget::new(path_units, 1_000_000);
+        assert_eq!(
+            read_dir_unix_with_hooks(
+                dir_bytes,
+                &mut FsCaps::with_default_limits(),
+                &mut b_comp,
+                || opened_c += 1,
+                || iters_c += 1,
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::ComputeBudget
+            }))
+        );
+        assert_eq!(opened_c, 1);
+        assert_eq!(iters_c, 0);
+        assert_eq!(count_open_fds_for_dir(&dir), 0);
+
+        // 3. Compute deduction matches formula on Linux (no fstat +1).
+        let start_units = 1_000_000u64;
+        let mut gen_units = ComputeBudget::new(start_units, 1_000_000);
+        let mut iter_count = 0usize;
+        let entries = read_dir_unix_with_hooks(
+            dir_bytes,
+            &mut FsCaps::with_default_limits(),
+            &mut gen_units,
+            || {},
+            || iter_count += 1,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, long_name.as_bytes());
+        assert_eq!(
+            start_units - gen_units.remaining_units(),
+            path_units + (iter_count as u64) + 254
+        );
+        assert_eq!(count_open_fds_for_dir(&dir), 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn round15_dt_unknown_push_unix_dir_entry_types_enoent_heap_and_charge_order() {
+    use std::os::unix::fs::{FileTypeExt, symlink};
+    use std::process::Command;
+
+    use crate::policy::model::{DirEntry, FileType};
+    use crate::policy::v4::paths::resolver::{DirStatBase, push_unix_dir_entry};
+
+    // Review 12 (`DT_UNKNOWN` test gap): exercise `push_unix_dir_entry` with
+    // `rustix::fs::FileType::Unknown` over a real tempdir covering:
+    // - regular file, directory, symlink (valid and dangling -> SYMLINK_NOFOLLOW),
+    //   and FIFO (`FileType::Other`);
+    // - `ENOENT` (vanished entry) maps to `Io(Other)` (Unread), never
+    //   `ResolveError::NotFound` (which would discard the whole listing);
+    // - stat cap and compute are charged BEFORE `fstatat`;
+    // - on non-Linux Unix: trailing-slash `dir_path` (`sep == 0`) and the
+    //   `dir + name >= PATH_MAX` heap branch (charging `alloc_len` before
+    //   allocating and before `statat`).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let dir = root.join("dt_unknown_dir");
+    std::fs::create_dir(&dir).unwrap();
+
+    let reg_path = dir.join("reg_file");
+    let sub_path = dir.join("sub_dir");
+    let link_path = dir.join("link_to_file");
+    let dangling_path = dir.join("dangling_link");
+    let fifo_path = dir.join("named_pipe");
+
+    std::fs::write(&reg_path, b"hello").unwrap();
+    std::fs::create_dir(&sub_path).unwrap();
+    symlink(&reg_path, &link_path).unwrap();
+    symlink(dir.join("nonexistent_target"), &dangling_path).unwrap();
+    let mkfifo_status = Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("invoke mkfifo");
+    assert!(mkfifo_status.success(), "mkfifo failed: {mkfifo_status:?}");
+    assert!(
+        std::fs::symlink_metadata(&fifo_path)
+            .expect("stat fifo")
+            .file_type()
+            .is_fifo()
+    );
+
+    #[cfg(target_os = "linux")]
+    let dir_fd = {
+        use rustix::fs::{Mode, OFlags, open};
+        open(
+            &dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open tempdir")
+    };
+    #[cfg(not(target_os = "linux"))]
+    let dir_bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        dir.as_os_str().as_bytes()
+    };
+
+    let make_base = || -> DirStatBase<'_> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd;
+            DirStatBase::Fd(dir_fd.as_fd())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            DirStatBase::Path(dir_bytes)
+        }
+    };
+
+    // 1. `.` and `..` are skipped even under `DT_UNKNOWN` with zero stats left.
+    let mut out = Vec::new();
+    for dot in [c".", c".."] {
+        push_unix_dir_entry(
+            make_base(),
+            dot,
+            rustix::fs::FileType::Unknown,
+            &mut out,
+            &mut FsCaps::new(100, 100, 0, 100, 100),
+            &mut ComputeBudget::with_default_limits(),
+            false,
+            0,
+        )
+        .unwrap();
+    }
+    assert!(out.is_empty());
+
+    // 2. Real file, dir, symlink, dangling symlink, and FIFO classified via
+    //    `DT_UNKNOWN`, charging exactly 1 stat per entry.
+    let mut type_caps = FsCaps::new(100, 100, 5, 100, 100);
+    let mut type_budget = ComputeBudget::with_default_limits();
+    let cases: [(&std::ffi::CStr, FileType); 5] = [
+        (c"reg_file", FileType::File),
+        (c"sub_dir", FileType::Dir),
+        (c"link_to_file", FileType::Symlink),
+        (c"dangling_link", FileType::Symlink),
+        (c"named_pipe", FileType::Other),
+    ];
+    for (name, _) in cases {
+        push_unix_dir_entry(
+            make_base(),
+            name,
+            rustix::fs::FileType::Unknown,
+            &mut out,
+            &mut type_caps,
+            &mut type_budget,
+            false,
+            0,
+        )
+        .unwrap_or_else(|e| panic!("DT_UNKNOWN failed for {name:?}: {e:?}"));
+    }
+    assert_eq!(
+        out,
+        cases
+            .iter()
+            .map(|(n, ft)| DirEntry {
+                name: n.to_bytes().to_vec(),
+                file_type: *ft,
+            })
+            .collect::<Vec<_>>()
+    );
+    // All 5 stats were consumed; a 6th `DT_UNKNOWN` entry now trips `Stats`.
+    assert_eq!(
+        push_unix_dir_entry(
+            make_base(),
+            c"reg_file",
+            rustix::fs::FileType::Unknown,
+            &mut out,
+            &mut type_caps,
+            &mut type_budget,
+            false,
+            0,
+        ),
+        Err(ResolveError::CapReached(CapReached { cap: FsCap::Stats }))
+    );
+
+    // 3. `ENOENT` (entry removed between listing and stat) maps to `Io(Other)`
+    //    (Unread), NEVER `ResolveError::NotFound` (so callers do not discard
+    //    the whole listing as absent), and leaves `out` intact.
+    let before_len = out.len();
+    assert_eq!(
+        push_unix_dir_entry(
+            make_base(),
+            c"vanished_entry",
+            rustix::fs::FileType::Unknown,
+            &mut out,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+            false,
+            0,
+        ),
+        Err(ResolveError::Io(FsIoError::Other))
+    );
+    assert_eq!(out.len(), before_len);
+
+    // 4. Stat cap and compute are charged BEFORE the syscall (checked on BOTH
+    //    existing `reg_file` and missing `vanished_entry`: if `statat` ran
+    //    first, `vanished_entry` would return `Io(Other)` instead of
+    //    `CapReached(Stats)` or `Exhausted(ComputeBudget)`).
+    for probe in [c"reg_file", c"vanished_entry"] {
+        let name_len = probe.to_bytes().len();
+        let name_charge = name_len.saturating_sub(1) as u64;
+        #[cfg(target_os = "linux")]
+        let aux_charge = name_len.max(1) as u64;
+        #[cfg(not(target_os = "linux"))]
+        let aux_charge = (dir_bytes.len() + 1 + name_len).max(1) as u64;
+
+        let mut scratch = Vec::new();
+        assert_eq!(
+            push_unix_dir_entry(
+                make_base(),
+                probe,
+                rustix::fs::FileType::Unknown,
+                &mut scratch,
+                &mut FsCaps::new(100, 100, 0, 100, 100),
+                &mut ComputeBudget::with_default_limits(),
+                false,
+                0,
+            ),
+            Err(ResolveError::CapReached(CapReached { cap: FsCap::Stats })),
+            "stat cap must precede fstatat for {probe:?}"
+        );
+        assert_eq!(
+            push_unix_dir_entry(
+                make_base(),
+                probe,
+                rustix::fs::FileType::Unknown,
+                &mut scratch,
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::new(name_charge + aux_charge - 1, 1_000_000),
+                false,
+                0,
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::ComputeBudget
+            })),
+            "aux stat compute must precede fstatat for {probe:?}"
+        );
+        // With `name_compute_precharged = true`, only `aux_charge` is needed
+        // before the syscall.
+        assert_eq!(
+            push_unix_dir_entry(
+                make_base(),
+                probe,
+                rustix::fs::FileType::Unknown,
+                &mut scratch,
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::new(aux_charge - 1, 1_000_000),
+                true,
+                0,
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::ComputeBudget
+            }))
+        );
+    }
+    // Exactly `aux_charge` units on `vanished_entry` (with precharged name)
+    // reaches `statat` and returns `Io(Other)`.
+    #[cfg(target_os = "linux")]
+    let vanished_aux = c"vanished_entry".to_bytes().len() as u64;
+    #[cfg(not(target_os = "linux"))]
+    let vanished_aux = (dir_bytes.len() + 1 + c"vanished_entry".to_bytes().len()) as u64;
+    assert_eq!(
+        push_unix_dir_entry(
+            make_base(),
+            c"vanished_entry",
+            rustix::fs::FileType::Unknown,
+            &mut Vec::new(),
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::new(vanished_aux, 1_000_000),
+            true,
+            0,
+        ),
+        Err(ResolveError::Io(FsIoError::Other))
+    );
+
+    // 5. Non-Linux Unix `stat_dir_child_by_path`: trailing slash (`sep == 0`)
+    //    and the `dir + name >= PATH_MAX` heap branch (charging `stats`,
+    //    compute, and `alloc_len` + headroom before `statat`).
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use crate::policy::v4::paths::resolver::PATH_MAX;
+
+        let mut slash_dir = dir_bytes.to_vec();
+        slash_dir.push(b'/');
+        let mut slash_out = Vec::new();
+        push_unix_dir_entry(
+            DirStatBase::Path(&slash_dir),
+            c"reg_file",
+            rustix::fs::FileType::Unknown,
+            &mut slash_out,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(slash_out.len(), 1);
+        assert_eq!(slash_out[0].file_type, FileType::File);
+
+        let mut long_dir = dir_bytes.to_vec();
+        while long_dir.len() + 1 + b"reg_file".len() < PATH_MAX {
+            long_dir.extend_from_slice(b"/.");
+        }
+        let full_len = long_dir.len() + 1 + b"reg_file".len();
+        assert!(full_len >= PATH_MAX);
+        let alloc_len = full_len + 1;
+
+        // Stat cap = 0 precedes compute, heap alloc, and syscall.
+        assert_eq!(
+            push_unix_dir_entry(
+                DirStatBase::Path(&long_dir),
+                c"reg_file",
+                rustix::fs::FileType::Unknown,
+                &mut Vec::new(),
+                &mut FsCaps::new(100, 100, 0, 100, 100),
+                &mut ComputeBudget::with_default_limits(),
+                true,
+                0,
+            ),
+            Err(ResolveError::CapReached(CapReached { cap: FsCap::Stats }))
+        );
+        // Compute (`full_len`) precedes heap alloc and syscall.
+        assert_eq!(
+            push_unix_dir_entry(
+                DirStatBase::Path(&long_dir),
+                c"reg_file",
+                rustix::fs::FileType::Unknown,
+                &mut Vec::new(),
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::new((full_len - 1) as u64, 1_000_000),
+                true,
+                0,
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::ComputeBudget
+            }))
+        );
+        // Heap allocation (`alloc_len`) precedes `Vec::with_capacity` and `statat`.
+        assert_eq!(
+            push_unix_dir_entry(
+                DirStatBase::Path(&long_dir),
+                c"reg_file",
+                rustix::fs::FileType::Unknown,
+                &mut Vec::new(),
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::new(1_000_000, alloc_len - 1),
+                true,
+                0,
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            }))
+        );
+        // At exact `alloc_len`, enters the heap branch, deducts `alloc_len`
+        // (leaving 0), and reaches `statat` (`ENAMETOOLONG` -> `Io(Other)`).
+        let mut exact_heap = ComputeBudget::new(1_000_000, alloc_len);
+        assert_eq!(
+            push_unix_dir_entry(
+                DirStatBase::Path(&long_dir),
+                c"reg_file",
+                rustix::fs::FileType::Unknown,
+                &mut Vec::new(),
+                &mut FsCaps::with_default_limits(),
+                &mut exact_heap,
+                true,
+                0,
+            ),
+            Err(ResolveError::Io(FsIoError::Other))
+        );
+        assert_eq!(exact_heap.remaining_alloc_bytes(), 0);
+
+        // Live-stream headroom is also enforced on the heap branch.
+        let headroom = 500usize;
+        assert_eq!(
+            push_unix_dir_entry(
+                DirStatBase::Path(&long_dir),
+                c"reg_file",
+                rustix::fs::FileType::Unknown,
+                &mut Vec::new(),
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::new(1_000_000, alloc_len + headroom - 1),
+                true,
+                headroom,
+            ),
+            Err(ResolveError::Exhausted(Exhausted {
+                reason: ExhaustReason::AllocationBudget
+            }))
+        );
+        let mut with_headroom = ComputeBudget::new(1_000_000, alloc_len + headroom);
+        assert_eq!(
+            push_unix_dir_entry(
+                DirStatBase::Path(&long_dir),
+                c"reg_file",
+                rustix::fs::FileType::Unknown,
+                &mut Vec::new(),
+                &mut FsCaps::with_default_limits(),
+                &mut with_headroom,
+                true,
+                headroom,
+            ),
+            Err(ResolveError::Io(FsIoError::Other))
+        );
+        assert_eq!(with_headroom.remaining_alloc_bytes(), headroom);
+    }
+}
+
+#[test]
+fn round15_attach_applicable_gap_edge_cases() {
+    use crate::policy::v4::paths::sensitive::{check_target_into, push_target_records};
+
+    // Review 12 (`attach_applicable_gap` test gaps):
+    // 1. A variant-only glob match with BOTH an `AnyTarget` gap and an
+    //    incomplete alias table gets NEITHER reason.
+    // 2. A target with an `UnlistedNameEquivalence` Unread plus a gap keeps
+    //    BOTH reasons.
+    // 3. A write-only gap on a `Read` target is not attached (and IS attached
+    //    on `Write` / `ReadWrite`).
+    // 4. Exhaustion inside `push_alias_records` loses only the gap Unread and
+    //    keeps the call `Exhausted`.
+    let join_home = |parts: &[&[u8]]| -> Vec<u8> {
+        let mut out = HOME.to_vec();
+        for p in parts {
+            out.push(b'/');
+            out.extend_from_slice(p);
+        }
+        out
+    };
+    let ssh_key = join_home(&[b".ssh", b"id_rsa"]);
+    // Use folded spelling `.AWS/credentials` so the `AnyTarget` gap `R1` comes
+    // exclusively from `ProtectedSet::identity_gaps` (`attach_applicable_gap`)
+    // while `RootAliases` (which probes lowercase `.aws/credentials`) stays
+    // completely independent.
+    let aws_cred_upper = join_home(&[b".AWS", b"credentials"]);
+    let azure_dir = join_home(&[b".azure"]);
+    let pypirc = join_home(&[b".pypirc"]);
+    let proj_readme = join_home(&[b"proj", b"readme"]);
+    let r1 = UnreadReason::UnresolvablePath {
+        path: aws_cred_upper.clone(),
+    };
+    let r2 = UnreadReason::UnresolvablePath {
+        path: azure_dir.clone(),
+    };
+
+    // 1. Variant-only glob match with both an `AnyTarget` gap (`R1`) and an
+    //    incomplete alias table (`R2`): gets neither `R1` nor `R2`.
+    let mut fs1 = FakeFs::new();
+    fs1.add_file(&ssh_key);
+    fs1.add_file(&aws_cred_upper);
+    fs1.set_stat_error(&aws_cred_upper, FsIoError::PermissionDenied);
+    fs1.mkdir_all(&azure_dir);
+    fs1.add_symlink(b"/h/u/proj/key", &ssh_key);
+    fs1.add_file(b"/h/u/proj/.hidden");
+    let prot1 = default_build(&fs1);
+    assert_eq!(
+        prot1.identity_gaps,
+        vec![IdentityGap {
+            reason: r1.clone(),
+            scope: GapScope::AnyTarget,
+            write_only: false,
+        }]
+    );
+    fs1.set_dir_read_error(&azure_dir, FsIoError::PermissionDenied);
+
+    let part_op = PartId::Operand {
+        unit: UnitIndex(0),
+        argv_index: 1,
+    };
+    let exp = expand_shell_glob(
+        &unquoted(b"proj/*"),
+        HOME,
+        HOME,
+        part_op.clone(),
+        AccessMode::Read,
+        &fs1,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert_eq!(exp.variant_only_matches.len(), 1);
+    let mut direct_vo_out = Vec::new();
+    push_target_records(
+        &exp.variant_only_matches[0],
+        &prot1,
+        &fs1,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+        &mut RootAliases::default(),
+        &mut direct_vo_out,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        direct_vo_out,
+        vec![PartResult {
+            part: part_op,
+            outcome: PartOutcome::Unread(UnreadReason::VariantOnlyGlobMatch {
+                pattern: b"/h/u/proj/.hidden".to_vec(),
+            }),
+        }],
+        "variant-only target must get neither AnyTarget gap nor incomplete alias reason"
+    );
+
+    // End-to-end command `cat proj/*`: `proj/key` hits HardDeny (suppressing
+    // `R1` & `R2`) and `proj/.hidden` is variant-only (suppressing `R1` & `R2`),
+    // so neither `R1` nor `R2` appears anywhere in the call's outcomes.
+    let cmd_vo = resolve_command_targets(
+        &[unit(
+            0,
+            vec![unquoted(b"cat"), unquoted(b"proj/*")],
+            vec![],
+            Separator::Start,
+            None,
+        )],
+        &[reader_effects("cat", 2)],
+        HOME,
+        &prot1,
+        &fs1,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_hard_deny(&cmd_vo.outcomes, "credential-read"));
+    assert!(has_unread(&cmd_vo.outcomes, |r| matches!(
+        r,
+        UnreadReason::VariantOnlyGlobMatch { .. }
+    )));
+    assert!(
+        !has_unread(&cmd_vo.outcomes, |r| r == &r1),
+        "must not attach AnyTarget gap R1: {:?}",
+        cmd_vo.outcomes
+    );
+    assert!(
+        !has_unread(&cmd_vo.outcomes, |r| r == &r2),
+        "must not attach incomplete alias R2: {:?}",
+        cmd_vo.outcomes
+    );
+
+    // 2. Target with `UnlistedNameEquivalence` Unread PLUS an `AnyTarget` gap
+    //    (`R1`) keeps BOTH reasons (with `RootAliases::incomplete == None`,
+    //    proving `R1` comes strictly from `attach_applicable_gap`; and when
+    //    the alias table is also incomplete with `R2`, keeps all three).
+    let nfc_cafe = b"/h/u/caf\xc3\xa9".to_vec();
+    let nfd_cafe = b"/h/u/cafe\xcc\x81".to_vec();
+    let mut fs2 = FakeFs::new();
+    fs2.add_file(&nfc_cafe);
+    fs2.add_file(&nfd_cafe);
+    fs2.add_file(&aws_cred_upper);
+    fs2.set_stat_error(&aws_cred_upper, FsIoError::PermissionDenied);
+    fs2.mkdir_all(&azure_dir);
+    let prot2 = build_with(&fs2, &[&nfc_cafe], &[]);
+    assert_eq!(
+        prot2.identity_gaps,
+        vec![IdentityGap {
+            reason: r1.clone(),
+            scope: GapScope::AnyTarget,
+            write_only: false,
+        }]
+    );
+    let mut check_aliases = RootAliases::default();
+    let pre_scan = check_aliases
+        .scan(
+            &nfd_cafe,
+            &prot2,
+            &fs2,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        pre_scan.unread, None,
+        "RootAliases must be complete so R1 comes strictly from attach_applicable_gap"
+    );
+
+    let eq_subj = subject("cafe\u{0301}", AccessMode::Read, &prot2, &fs2);
+    assert!(!has_any_hard_deny(&eq_subj.outcomes));
+    assert!(
+        has_unread(&eq_subj.outcomes, |r| matches!(
+            r,
+            UnreadReason::UnlistedNameEquivalence { path } if path == &nfd_cafe
+        )),
+        "must retain UnlistedNameEquivalence: {:?}",
+        eq_subj.outcomes
+    );
+    assert!(
+        has_unread(&eq_subj.outcomes, |r| r == &r1),
+        "must ALSO retain AnyTarget gap R1 alongside UnlistedNameEquivalence: {:?}",
+        eq_subj.outcomes
+    );
+
+    // With an incomplete alias table (`R2`) as well, all three distinct Unread
+    // reasons are retained.
+    fs2.set_dir_read_error(&azure_dir, FsIoError::PermissionDenied);
+    let eq_all3 = subject("cafe\u{0301}", AccessMode::Read, &prot2, &fs2);
+    assert!(has_unread(&eq_all3.outcomes, |r| matches!(
+        r,
+        UnreadReason::UnlistedNameEquivalence { path } if path == &nfd_cafe
+    )));
+    assert!(has_unread(&eq_all3.outcomes, |r| r == &r1));
+    assert!(has_unread(&eq_all3.outcomes, |r| r == &r2));
+
+    // 3. Write-only gap on a `Read` target is NOT attached (and IS attached on
+    //    `Write` and `ReadWrite`). Using a folded spelling `/h/u/ATRIUM_CFG`
+    //    with `stat_error` produces a `write_only: true` `AnyTarget` gap in
+    //    `ProtectedSet` while leaving `RootAliases` complete.
+    let wo_cfg = join_home(&[b"atrium_cfg"]);
+    let wo_cfg_upper = join_home(&[b"ATRIUM_CFG"]);
+    let wo_reason = UnreadReason::UnresolvablePath {
+        path: wo_cfg_upper.clone(),
+    };
+    let mut fs3 = FakeFs::new();
+    fs3.add_file(&wo_cfg_upper);
+    fs3.set_stat_error(&wo_cfg_upper, FsIoError::PermissionDenied);
+    fs3.add_file(&proj_readme);
+    let prot3 = build_with(&fs3, &[], &[&wo_cfg]);
+    assert_eq!(
+        prot3.identity_gaps,
+        vec![IdentityGap {
+            reason: wo_reason.clone(),
+            scope: GapScope::AnyTarget,
+            write_only: true,
+        }]
+    );
+
+    let wo_read = subject("proj/readme", AccessMode::Read, &prot3, &fs3);
+    assert!(
+        all_clear(&wo_read.outcomes),
+        "write-only gap must not attach to Read target: {:?}",
+        wo_read.outcomes
+    );
+    for write_access in [AccessMode::Write, AccessMode::ReadWrite] {
+        let wo_write = subject("proj/readme", write_access, &prot3, &fs3);
+        assert!(
+            has_unread(&wo_write.outcomes, |r| r == &wo_reason),
+            "write-only gap must attach to {write_access:?} target: {:?}",
+            wo_write.outcomes
+        );
+    }
+
+    // 4. Exhaustion inside `push_alias_records` loses only the gap Unread and
+    //    keeps the call `Exhausted` (preserving any earlier StoreHit).
+    let mut fs4 = FakeFs::new();
+    fs4.add_file(&aws_cred_upper);
+    fs4.set_stat_error(&aws_cred_upper, FsIoError::PermissionDenied);
+    fs4.add_file(&pypirc);
+    fs4.add_file(&proj_readme);
+    let prot4 = default_build(&fs4);
+    assert_eq!(
+        prot4.identity_gaps,
+        vec![IdentityGap {
+            reason: r1.clone(),
+            scope: GapScope::AnyTarget,
+            write_only: false,
+        }]
+    );
+
+    // Warm `SharedSensitive` cache before measuring compute costs.
+    let _ = subject(".pypirc", AccessMode::Read, &prot4, &fs4);
+
+    // 4a. Direct `push_target_records` on `.pypirc`: exhausts 1 unit into
+    //     `push_alias_records`, keeps StoreHit, drops only the gap Unread.
+    let pypirc_target = literal(&pypirc, AccessMode::Read, &fs4);
+    let mut b_check = ComputeBudget::with_default_limits();
+    check_target_into(
+        &pypirc_target,
+        &prot4,
+        &mut b_check,
+        &mut Vec::new(),
+        true,
+        false,
+    )
+    .unwrap();
+    let check_cost = limits::COMPUTE_BUDGET_UNITS - b_check.remaining_units();
+    let mut direct_out = Vec::new();
+    let mut direct_budget = ComputeBudget::new(check_cost + 1, limits::COMPUTE_BUDGET_ALLOC_BYTES);
+    assert_eq!(
+        push_target_records(
+            &pypirc_target,
+            &prot4,
+            &fs4,
+            &mut FsCaps::with_default_limits(),
+            &mut direct_budget,
+            &mut RootAliases::default(),
+            &mut direct_out,
+            true,
+        ),
+        Err(Exhausted {
+            reason: ExhaustReason::ComputeBudget
+        })
+    );
+    assert!(has_store_hit(&direct_out), "{direct_out:?}");
+    assert!(!has_unread(&direct_out, |r| r == &r1), "{direct_out:?}");
+    assert!(direct_budget.is_exhausted());
+
+    // 4b. End-to-end `resolve_subject_paths` (on `.pypirc` and `proj/readme`)
+    //     and `resolve_command_targets` (`cat .pypirc`): exhausting halfway
+    //     through `push_alias_records` skips only `attach_applicable_gap` and
+    //     keeps the call `Exhausted`.
+    let mut b_alias = ComputeBudget::with_default_limits();
+    RootAliases::default()
+        .scan(
+            &pypirc,
+            &prot4,
+            &fs4,
+            &mut FsCaps::with_default_limits(),
+            &mut b_alias,
+        )
+        .unwrap();
+    let alias_cost = limits::COMPUTE_BUDGET_UNITS - b_alias.remaining_units();
+    assert!(alias_cost > 500, "expected substantial alias scan cost");
+
+    for raw in [".pypirc", "proj/readme"] {
+        let mut b_full1 = ComputeBudget::with_default_limits();
+        let _ = resolve_subject_paths(
+            &[raw.to_string()],
+            None,
+            false,
+            AccessMode::Read,
+            &prot4,
+            &fs4,
+            &mut FsCaps::with_default_limits(),
+            &mut b_full1,
+        )
+        .unwrap();
+        let full_cost = limits::COMPUTE_BUDGET_UNITS - b_full1.remaining_units();
+        assert!(full_cost > alias_cost);
+
+        let mut mid_budget = ComputeBudget::new(
+            full_cost - alias_cost / 2,
+            limits::COMPUTE_BUDGET_ALLOC_BYTES,
+        );
+        let res = resolve_subject_paths(
+            &[raw.to_string()],
+            None,
+            false,
+            AccessMode::Read,
+            &prot4,
+            &fs4,
+            &mut FsCaps::with_default_limits(),
+            &mut mid_budget,
+        )
+        .expect("partial outcome + Exhausted must be returned");
+        assert!(
+            res.outcomes.iter().any(|r| matches!(
+                r.outcome,
+                PartOutcome::Exhausted(ExhaustReason::ComputeBudget)
+            )),
+            "{raw}: call must stay Exhausted: {:?}",
+            res.outcomes
+        );
+        assert!(
+            !has_unread(&res.outcomes, |r| r == &r1),
+            "{raw}: exhaustion inside push_alias_records loses only the gap Unread: {:?}",
+            res.outcomes
+        );
+        if raw == ".pypirc" {
+            assert!(has_store_hit(&res.outcomes), "{:?}", res.outcomes);
+        } else {
+            assert!(
+                res.outcomes
+                    .iter()
+                    .any(|r| matches!(r.outcome, PartOutcome::Clear)),
+                "{:?}",
+                res.outcomes
+            );
+        }
+        assert!(mid_budget.is_exhausted());
+    }
+
+    let mut b_cmd_full = ComputeBudget::with_default_limits();
+    let _ = resolve_command_targets(
+        &[unit(
+            0,
+            vec![unquoted(b"cat"), unquoted(b".pypirc")],
+            vec![],
+            Separator::Start,
+            None,
+        )],
+        &[reader_effects("cat", 2)],
+        HOME,
+        &prot4,
+        &fs4,
+        &mut FsCaps::with_default_limits(),
+        &mut b_cmd_full,
+    )
+    .unwrap();
+    let cmd_full_cost = limits::COMPUTE_BUDGET_UNITS - b_cmd_full.remaining_units();
+    let mut cmd_mid_budget = ComputeBudget::new(
+        cmd_full_cost - alias_cost / 2,
+        limits::COMPUTE_BUDGET_ALLOC_BYTES,
+    );
+    let cmd_res = resolve_command_targets(
+        &[unit(
+            0,
+            vec![unquoted(b"cat"), unquoted(b".pypirc")],
+            vec![],
+            Separator::Start,
+            None,
+        )],
+        &[reader_effects("cat", 2)],
+        HOME,
+        &prot4,
+        &fs4,
+        &mut FsCaps::with_default_limits(),
+        &mut cmd_mid_budget,
+    )
+    .expect("command call with partial StoreHit must return Exhausted");
+    assert!(has_store_hit(&cmd_res.outcomes), "{:?}", cmd_res.outcomes);
+    assert!(
+        cmd_res.outcomes.iter().any(|r| matches!(
+            r.outcome,
+            PartOutcome::Exhausted(ExhaustReason::ComputeBudget)
+        )),
+        "{:?}",
+        cmd_res.outcomes
+    );
+    assert!(
+        !has_unread(&cmd_res.outcomes, |r| r == &r1),
+        "{:?}",
+        cmd_res.outcomes
+    );
+    assert!(cmd_mid_budget.is_exhausted());
 }
