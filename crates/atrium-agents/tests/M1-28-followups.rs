@@ -499,7 +499,7 @@ for line in sys.stdin:
     );
 
     let ledger = RealLedger::new(Provider::Claude, &dir, Preset::Careful, true).await;
-    let deadline = Duration::from_millis(150);
+    let deadline = Duration::from_secs(1);
     // Keep `gate_deadline` at its default (20 s): it also bounds real SQLite
     // checks and tickets, so shrinking it causes spurious timeouts under load;
     // bound only `drain_withdrawals` via `with_withdraw_timeout`.
@@ -527,8 +527,8 @@ for line in sys.stdin:
 
     assert_eq!(ledger.gate.withdrawn().len(), 5);
     assert!(
-        elapsed < Duration::from_millis(450),
-        "5 hung withdrawals took {elapsed:?}; expected <= ~1 deadline (150ms), not 5 * 150ms"
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(3),
+        "5 hung withdrawals took {elapsed:?}; expected ~1 deadline (1s), not 0s or 5 * 1s"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -2326,7 +2326,7 @@ for line in sys.stdin:
     // Deliver `MAX_PENDING_REQUESTS` questions normally, free each ledger slot
     // independently (modeling daemon `DeclineQuestion`), and decline each one
     // while adapter `gate.withdraw()` remains blocked.
-    for _ in 0..total {
+    for iter in 0..total {
         let request_id = wait_for_question(&mut session).await;
         ledger
             .withdraw(&RequestKey {
@@ -2336,7 +2336,12 @@ for line in sys.stdin:
             })
             .await
             .unwrap();
-        assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+        assert_eq!(
+            store.requests().open_count(&thread, inc).await.unwrap(),
+            0,
+            "unexpected open request after withdrawing {request_id} on iteration {iter}/{total} (question_calls={})",
+            gate.question_calls(),
+        );
         session
             .commands
             .send(SessionCommand::DeclineQuestion { request_id })
@@ -2515,7 +2520,7 @@ for line in sys.stdin:
         .await
         .unwrap();
 
-    for _ in 0..total {
+    for iter in 0..total {
         let request_id = wait_for_question(&mut session).await;
         ledger
             .withdraw(&RequestKey {
@@ -2525,7 +2530,12 @@ for line in sys.stdin:
             })
             .await
             .unwrap();
-        assert_eq!(store.requests().open_count(&thread, inc).await.unwrap(), 0);
+        assert_eq!(
+            store.requests().open_count(&thread, inc).await.unwrap(),
+            0,
+            "unexpected open request after withdrawing {request_id} on iteration {iter}/{total} (question_calls={})",
+            gate.question_calls(),
+        );
         session
             .commands
             .send(SessionCommand::DeclineQuestion { request_id })
