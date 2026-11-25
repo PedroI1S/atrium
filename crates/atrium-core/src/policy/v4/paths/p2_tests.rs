@@ -7073,7 +7073,7 @@ fn round11_r10fix2_ssh_below_root_and_alias_spelling() {
     );
 
     //    (d) Written subfolder spelling `lnk/../.ssh/sub` (real `/tmp/pub/.ssh/sub`):
-    //        HardDenyHit when a private key exists, Clear when only `.pub` exists.
+    //        HardDenyHit by written spelling even when only `.pub` exists.
     let mut fs = FakeFs::new();
     fs.mkdir_all(b"/tmp/pub/sub");
     fs.add_file(b"/tmp/pub/.ssh/sub/id_key.pub");
@@ -7089,10 +7089,72 @@ fn round11_r10fix2_ssh_below_root_and_alias_spelling() {
         &mut ComputeBudget::with_default_limits(),
     )
     .unwrap();
-    assert!(all_clear(&sub_pub.outcomes), "{:?}", sub_pub.outcomes);
+    // Under dev's Sensitive::hit (deny.rs:523-532) over Analysis::all_paths
+    // (contract §5, D-147, D-149, D-154), the lexically normalised written
+    // spelling under the ssh folder is a HardDenyHit("credential-read") for
+    // any non-empty non-public entry, even when nothing exists there.
+    let expected_written = [HOME, b".ssh".as_slice(), b"sub".as_slice()].join(&b'/');
+    assert!(
+        has_hard_deny(&sub_pub.outcomes, "credential-read"),
+        "{:?}",
+        sub_pub.outcomes
+    );
+    assert!(
+        sub_pub.outcomes.iter().any(|r| matches!(
+            &r.outcome,
+            PartOutcome::HardDenyHit(h)
+                if h.hard_deny_id == Some("credential-read")
+                    && matches!(
+                        &h.matched,
+                        crate::policy::model::HitMatch::ProtectedPath { path }
+                            if path.as_slice() == expected_written.as_slice()
+                    )
+        )),
+        "{:?}",
+        sub_pub.outcomes
+    );
+
+    // Round 10 fix 2 S8 subfolder walk under a written ssh root spelling:
+    // unlike its subfolder, the ssh dir itself is not a Sensitive::hit on
+    // Read (deny.rs:523-524), so S8 walks the real folder naming entries on
+    // the written spelling: only a public key in the subfolder keeps StoreHit
+    // (no HardDenyHit), while adding a private key triggers S8 HardDenyHit
+    // even under a *.rs filter.
+    let written_ssh_root = [b"lnk".as_slice(), b"..", b".ssh"].join(&b'/');
+    let ssh_pub = check_recursive_root(
+        &literal(&written_ssh_root, AccessMode::Read, &fs),
+        LinkPolicy::default(),
+        std::slice::from_ref(&filter_rs),
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        !has_any_hard_deny(&ssh_pub.outcomes),
+        "{:?}",
+        ssh_pub.outcomes
+    );
+    assert!(has_store_hit(&ssh_pub.outcomes), "{:?}", ssh_pub.outcomes);
 
     fs.add_file(b"/tmp/pub/.ssh/sub/id_key");
     let prot = default_build(&fs);
+    let ssh_priv = check_recursive_root(
+        &literal(&written_ssh_root, AccessMode::Read, &fs),
+        LinkPolicy::default(),
+        std::slice::from_ref(&filter_rs),
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny(&ssh_priv.outcomes, "credential-read"),
+        "{:?}",
+        ssh_priv.outcomes
+    );
     let sub_priv = check_recursive_root(
         &literal(b"lnk/../.ssh/sub", AccessMode::Read, &fs),
         LinkPolicy::default(),
@@ -7305,5 +7367,203 @@ fn round11_macos_real_fs_firmlink_strip_and_mixed_case_ssh() {
         has_hard_deny(&write_cfg.outcomes, "credential-read"),
         "{:?}",
         write_cfg.outcomes
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 14. Rework Round 12 regressions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round12_hard_deny_target_suppresses_incomplete_alias_table_unread() {
+    // Round 12 (failure 1): when `check_target_into` already established a
+    // definitive HardDenyHit on a resolved target, `push_target_records` must
+    // not attach a spurious Unread from an incomplete `RootAliases` table
+    // (contract §1, §5; ProtectedSet::identity_gaps; D-144, D-145; review 7
+    // finding 3). Other targets in the same call and Store hits still keep
+    // their Unread reasons.
+    let join_home = |parts: &[&[u8]]| -> Vec<u8> {
+        let mut out = HOME.to_vec();
+        for p in parts {
+            out.push(b'/');
+            out.extend_from_slice(p);
+        }
+        out
+    };
+    let ssh_dir = join_home(&[b".ssh"]);
+    let aws_cred = join_home(&[b".aws", b"credentials"]);
+    let gnupg_dir = join_home(&[b".gnupg"]);
+    let gnupg_key = join_home(&[b".gnupg", b"k"]);
+    let pypirc = join_home(&[b".pypirc"]);
+    let proj_readme = join_home(&[b"proj", b"readme"]);
+    let proj_link = join_home(&[b"proj", b"link_aws"]);
+    let azure_dir = join_home(&[b".azure"]);
+
+    // 1. Unlistable ssh folder (marks `RootAliases::incomplete` via
+    //    `push_ssh_members`, commit 8471af06).
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(&ssh_dir);
+    fs.set_dir_read_error(&ssh_dir, FsIoError::PermissionDenied);
+    fs.add_file(&aws_cred);
+    fs.add_file(&gnupg_key);
+    fs.add_file(&pypirc);
+    fs.add_file(&proj_readme);
+    fs.add_symlink(&proj_link, &aws_cred);
+    let prot = default_build(&fs);
+
+    let aws_arg = String::from_utf8(aws_cred.clone()).unwrap();
+    let single = subject(&aws_arg, AccessMode::Read, &prot, &fs);
+    assert!(has_hard_deny(&single.outcomes, "credential-read"));
+    assert!(
+        !has_unread(&single.outcomes, |_| true),
+        "{:?}",
+        single.outcomes
+    );
+
+    // Multi-target call: target 0 (HardDenyHit) gets no Unread, while target 1
+    // (ordinary file) still gets its AnyTarget Unread.
+    let multi = resolve_subject_paths(
+        &[aws_arg.clone(), "proj/readme".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(multi.outcomes.iter().any(|r| {
+        r.part == PartId::SubjectPath { path_index: 0 }
+            && matches!(
+                r.outcome,
+                PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("credential-read")
+            )
+    }));
+    assert!(
+        !multi.outcomes.iter().any(|r| {
+            r.part == PartId::SubjectPath { path_index: 0 }
+                && matches!(r.outcome, PartOutcome::Unread(_))
+        }),
+        "{:?}",
+        multi.outcomes
+    );
+    assert!(
+        multi.outcomes.iter().any(|r| {
+            r.part == PartId::SubjectPath { path_index: 1 }
+                && matches!(
+                    r.outcome,
+                    PartOutcome::Unread(UnreadReason::UnresolvablePath { .. })
+                )
+        }),
+        "{:?}",
+        multi.outcomes
+    );
+
+    // Command flow (`cat <aws_cred>`): HardDenyHit and no Unread.
+    let cmd = resolve_command_targets(
+        &[unit(
+            0,
+            vec![unquoted(b"cat"), unquoted(&aws_cred)],
+            vec![],
+            Separator::Start,
+            None,
+        )],
+        &[reader_effects("cat", 2)],
+        HOME,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_hard_deny(&cmd.outcomes, "credential-read"));
+    assert!(!has_unread(&cmd.outcomes, |_| true), "{:?}", cmd.outcomes);
+
+    // Recursive root that is itself a HardDenyHit: no spurious Unread.
+    let rec = check_recursive_root(
+        &literal(&gnupg_dir, AccessMode::Read, &fs),
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_hard_deny(&rec.outcomes, "credential-read"));
+    assert!(!has_unread(&rec.outcomes, |_| true), "{:?}", rec.outcomes);
+
+    // Filter-selected symlink to a HardDenyHit: Filter part gets HardDenyHit
+    // and no spurious Unread.
+    let filt = resolve_subject_paths(
+        &["proj".to_string()],
+        Some("link_aws"),
+        true,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(filt.outcomes.iter().any(|r| {
+        r.part == PartId::Filter { unit: None }
+            && matches!(
+                r.outcome,
+                PartOutcome::HardDenyHit(ref h) if h.hard_deny_id == Some("credential-read")
+            )
+    }));
+    assert!(
+        !filt.outcomes.iter().any(|r| {
+            r.part == PartId::Filter { unit: None } && matches!(r.outcome, PartOutcome::Unread(_))
+        }),
+        "{:?}",
+        filt.outcomes
+    );
+
+    // Store hit still keeps both its StoreHit and its Unread.
+    let store_arg = String::from_utf8(pypirc).unwrap();
+    let store = subject(&store_arg, AccessMode::Read, &prot, &fs);
+    assert!(has_store_hit(&store.outcomes) && has_unread(&store.outcomes, |_| true));
+
+    // 2. Unlistable azure folder (marks `RootAliases::incomplete` in
+    //    `spelled_roots`): HardDenyHit target gets no spurious Unread.
+    let mut azure_fs = FakeFs::new();
+    azure_fs.mkdir_all(&azure_dir);
+    azure_fs.set_dir_read_error(&azure_dir, FsIoError::PermissionDenied);
+    azure_fs.add_file(&aws_cred);
+    let azure_prot = default_build(&azure_fs);
+    let azure_key = subject(&aws_arg, AccessMode::Read, &azure_prot, &azure_fs);
+    assert!(has_hard_deny(&azure_key.outcomes, "credential-read"));
+    assert!(
+        !has_unread(&azure_key.outcomes, |_| true),
+        "{:?}",
+        azure_key.outcomes
+    );
+
+    // 3. Canonicalizations cap = 1 (enough to resolve target, cuts off
+    //    `RootAliases::roots`): HardDenyHit target gets no spurious Unread.
+    let mut cap_fs = FakeFs::new();
+    cap_fs.mkdir_all(&ssh_dir);
+    cap_fs.mkdir_all(&gnupg_dir);
+    cap_fs.add_file(&aws_cred);
+    let cap_prot = default_build(&cap_fs);
+    let cap_res = resolve_subject_paths(
+        &[aws_arg],
+        None,
+        false,
+        AccessMode::Read,
+        &cap_prot,
+        &cap_fs,
+        &mut FsCaps::new(1000, 1000, 1000, 1000, 1),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_hard_deny(&cap_res.outcomes, "credential-read"));
+    assert!(
+        !has_unread(&cap_res.outcomes, |_| true),
+        "{:?}",
+        cap_res.outcomes
     );
 }
