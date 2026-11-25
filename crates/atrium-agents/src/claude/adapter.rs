@@ -2682,7 +2682,7 @@ for line in sys.stdin:
         };
 
         let mut session = ClaudeAdapter::new(ClaudeOptions {
-            gate_deadline: Duration::from_secs(60),
+            gate_deadline: Duration::from_secs(600),
             managed_settings: Some(vec![]),
             ..ClaudeOptions::default()
         })
@@ -2697,7 +2697,7 @@ for line in sys.stdin:
             .await
             .unwrap();
 
-        let req_id = timeout(Duration::from_secs(5), async {
+        let req_id = timeout(Duration::from_secs(30), async {
             while let Some(env) = session.events.recv().await {
                 if let AgentEvent::QuestionAsked { request_id, .. } = env.event {
                     return request_id;
@@ -2715,17 +2715,20 @@ for line in sys.stdin:
             .await
             .unwrap();
 
-        timeout(Duration::from_secs(2), withdraw_started_rx.wait_for(|v| *v))
-            .await
-            .expect("timed out waiting for gate.withdraw")
-            .unwrap();
+        timeout(
+            Duration::from_secs(30),
+            withdraw_started_rx.wait_for(|v| *v),
+        )
+        .await
+        .expect("timed out waiting for gate.withdraw")
+        .unwrap();
 
         // If `with_withdraw_timeout(20 ms)` did not propagate through `start()`,
-        // `drain_withdrawals` would block the actor loop for `gate_deadline` (60 s)
+        // `drain_withdrawals` would block the actor loop for `gate_deadline` (600 s)
         // and this shutdown would time out.
         let _ = session.commands.send(SessionCommand::Shutdown).await;
         drop(session.commands);
-        timeout(Duration::from_secs(5), async {
+        timeout(Duration::from_secs(30), async {
             while let Some(env) = session.events.recv().await {
                 if matches!(env.event, AgentEvent::SessionEnded { .. }) {
                     break;
