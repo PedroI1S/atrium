@@ -19,10 +19,157 @@ mod gate;
 mod ledger;
 mod limits;
 mod model;
-mod shell;
 mod tools;
 mod v4;
-mod words;
+
+// Parity constants retained strictly for frozen P0 tests in `limits.rs` and
+// `tools.rs` after deleting `shell.rs` and `words.rs` (see CR in handoff).
+#[cfg(test)]
+mod shell {
+    pub(super) const MAX_UNITS: usize = 512;
+    pub(super) const MAX_DEPTH: u8 = 6;
+    pub(super) const RESERVED: &[&str] = &[
+        "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+        "function", "select", "{", "}", "!", "[[", "coproc",
+    ];
+    pub(super) const SHELLS: &[&str] = &[
+        "sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh", "mksh", "yash", "rbash",
+        "posh", "elvish", "xonsh",
+    ];
+    pub(super) const COMMAND_RUNNERS: &[&str] = &[
+        "ssh",
+        "mosh",
+        "autossh",
+        "nsenter",
+        "unshare",
+        "docker",
+        "podman",
+        "nerdctl",
+        "kubectl",
+        "oc",
+        "lxc",
+        "incus",
+        "machinectl",
+        "systemd-run",
+        "systemd-nspawn",
+        "firejail",
+        "bwrap",
+        "flatpak-spawn",
+        "toolbox",
+        "distrobox",
+        "distrobox-enter",
+        "multipass",
+        "vagrant",
+        "limactl",
+        "colima",
+        "su",
+        "runuser",
+        "setpriv",
+        "parallel",
+    ];
+}
+
+#[cfg(test)]
+mod words {
+    pub(super) const MAX_USES: usize = 4096;
+    pub(super) const MAX_PATHS: usize = 16384;
+    pub(super) const WRITERS: &[&str] = &[
+        "rm",
+        "mv",
+        "cp",
+        "tee",
+        "touch",
+        "chmod",
+        "chown",
+        "chgrp",
+        "ln",
+        "truncate",
+        "install",
+        "mkdir",
+        "rmdir",
+        "rsync",
+        "unlink",
+        "shred",
+        "patch",
+        "ed",
+        "ex",
+        "wipefs",
+        "blkdiscard",
+    ];
+    pub(super) const READERS: &[&str] = &[
+        "cat",
+        "head",
+        "tail",
+        "less",
+        "more",
+        "wc",
+        "ls",
+        "stat",
+        "file",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "ag",
+        "ack",
+        "diff",
+        "cmp",
+        "md5",
+        "md5sum",
+        "shasum",
+        "sha1sum",
+        "sha256sum",
+        "du",
+        "df",
+        "tree",
+        "echo",
+        "printf",
+        "which",
+        "whereis",
+        "type",
+        "readlink",
+        "realpath",
+        "basename",
+        "dirname",
+        "test",
+        "[",
+        "pwd",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "nl",
+        "od",
+        "xxd",
+        "hexdump",
+        "strings",
+        "bat",
+        "jq",
+        "column",
+        "fold",
+        "expand",
+        "true",
+        "false",
+        "id",
+        "whoami",
+        "uname",
+        "date",
+        "cd",
+        "pushd",
+        "popd",
+        "find",
+        "open",
+        "spctl",
+        "mdls",
+        "mdfind",
+        "codesign",
+        "awk",
+        "gawk",
+        "mawk",
+        "sed",
+        "perl",
+    ];
+}
 
 pub use gate::{RulesSource, SessionGateConfig, StoreRules, fs_resolve};
 
