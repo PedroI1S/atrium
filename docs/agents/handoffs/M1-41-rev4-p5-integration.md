@@ -151,7 +151,7 @@ Implemented all three P0 stubs matching their frozen signatures in `policy/model
 | `adversarial_regression.rs::round_5_blocker_1`, `round_6_items_1_and_2`, `round_7_item_3`, `round_8_blocker_2` | Split modeled `Search` tools (`rg`/`grep`) + direct `vault/work` operands (stay `Deny`) from D-141 non-`Search` tools (`ag`, `ack`, `find`, `tar`, `zip`, `cp -r`, `rsync`) on ancestor dirs (`Ask` in Home); `ls proj/*` moved to `Deny` in `round_8_blocker_2` because §5 glob expansion resolves `proj/deploy_key -> ~/.ssh/id_rsa` (while `ls proj/vault_link` stays non-`Deny`) | D-141, §5, §6, §11 items 1 & 10 |
 | `adversarial_regression.rs::round_7_item_1` | `${DIR}`/`$DIR`/`$(...)` ask in Home and allow under `Any`/`FullAccess`; all 26 brace-range cases stay `Deny` | §3, §11 item 1 |
 | `adversarial_m1_18.rs` | `cat ~/.zſh_history` → `DEV_ASK` (§3, §10 row 10); `git` pathspec magic `:(top)`/`:/`/`:!` → `ASKS_HOME_NO_PREFIX` (§6); `gate_rows()` updated for D-141 non-`Search` tools (`find`/`ag`/`ack`/`cp`/`tar`/`rsync`/`zip`/`scp`/`7z`) & unmodeled `--deref`, `big_dir/*/*`, `{1..65}/*`, `${DIR}/*` → `dev_glob`, `rg -L`/`--follow x clean` → `Allow` in all settings (§10 row 15, D-139), `find -L clean -name '*.rs'` → `["Ask", "Allow", "Allow"]` (§10 row 9, D-141); `fix2_k1` unbounded `env`, `fix3_finding2` (keeping `-S` cred/sudo & `-C '../.ssh'` hits as `H_CR`/`H_PE`), `fix4_finding2`, `fix5_finding2` → `DEV_ASK` (§4, §11 items 1–2, §12 K9 dropped) | §2, §3, §4, §6, §10 rows 9, 10, 15, §11 items 1, 2, 10, 11, 15, §12 (K9), D-139, D-141 |
-| `adversarial_gate.rs` | Un-ignored findings 10 & 11; **zero** other verdict changes | §5, §10 row 8 |
+| `adversarial_gate.rs` | Un-ignored findings 10 & 11, plus other verdict changes (corrected in round 2, finding 12: the earlier "zero other verdict changes" was false; see `## Round 2`) | §5, §10 row 8 |
 | `adversarial_fuzz.rs` | Un-ignored finding 11 with non-glob `cd` spelling; **zero** other changes | §12 (M1-28) |
 | `crates/atrium-agents/tests/{claude_policy_e2e,codex_policy_e2e,consistency,gate_withdraw,M1-28-followups}.rs` and `crates/atrium-core/tests/ledger.rs` | Audited line-by-line; **zero** verdict changes required | — |
 
@@ -185,3 +185,152 @@ python3 app/scripts/m1_demo.py
 ```
 
 - **Linux verification:** owed for the gate on rodrigo's machine (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`).
+
+---
+
+## Round 2 (partial)
+
+Rework for review 1 (`.orchestration/review-input/M1-41-rev4-p5-integration-round1.md`) under D-176. Verdicts come from the d176 contract and decisions copies (`.orchestration/review-input/m1-policy-rev4.d176.md`, `decisions.d176.md`). The worker ran only `cargo check --workspace --tests` (clean, no warnings) and `cargo fmt --all`. **No test was run**, so every expectation below is derived and still needs verification. The section is **partial**: see "Not done" at the end.
+
+### Commits
+
+| Commit | Findings |
+| --- | --- |
+| `5b5771c0` | 1 |
+| `86d0aed2` | 9, 10 |
+| `d635a723` | 6 (§3 amendment, §11 item 16) |
+| `e018b8d3` | 8 (CR-P5-1) |
+| `e48dba3d` | 4 |
+| `d4c03b0c` | 3 |
+| `2ba8d67f` | §11 item 17 protection; 5, 7 expectations |
+| `2b5b5466` | 5, 6, 7 (real-disk fixtures, `grep --rec`, §3 amendment tests) |
+| `a3d9e047` | 2 |
+| `0fab9479` | tests for 1, 4, 9; property 1's generator check |
+| `47e33531` | 11 (CR-P5-2) |
+| `612d0656` | O1 |
+
+### Each finding
+
+1. **Plain writes Unread in the daemon.**
+   - *Cause:* `build_protected_set` folds every ancestor of a protected path. A huge ancestor, such as the test binary's `target/debug/deps`, hit the shared listing cap and gave an open-ended `AnyTarget` write gap, which D-145 item 4 forbids.
+   - *Fix (`sensitive.rs`, P2):*
+     - each discovery listing gets its own `FsCaps`;
+     - a `WalkCapReached` listing gap is scoped to `Through(folder)` by the folder's identity.
+   - *Test:* `adversarial_m1_18.rs::round2_finding1_huge_protected_ancestor_keeps_plain_writes_rememberable`. It uses SessionGate on a real temp home with 16,500 entries and the new `Tmp::gate_protecting` helper:
+     - `touch` and `echo > file` are a rememberable Ask with `unread = None`;
+     - `rm` of the protected file is still `atrium-self`.
+2. **Lost `dev` payload decoding.**
+   - *Cause:* round 1's best-effort pass kept no port of `dev`'s `echo`/`printf`/`yes` decoder or its sink readings.
+   - *Fix:* the new P5 module `v4/evaluate/best_effort/dev_readings.rs`.
+     - Budgeted ports of `unescape_one`, `unescape_to`, `format_printf` (`MAX_PAD` 256) and `echo_printf_texts`.
+     - A quote-aware scanner. It is compound-aware (`{}`, `()`, `if`, loops, `case`, `function`), counts keywords only where a command starts, and collects here-document bodies.
+     - Generators:
+       - stdin-reader sinks (`at`, `batch`, `make -f -`, `chroot`, `crontab`, `script`, `eval`/`source`/`.`, maybe-shell words, `env -S` shells);
+       - compound sinks in a pipe;
+       - here-document, here-string and process-substitution sinks (`<(…)` read by a shell word anywhere, `> >(bash)`);
+       - substituted command words and `-c` code (`$(…)`, backticks, `$(which X)` behind wrappers, `find -exec sh -c "$(…)"`);
+       - `script` option forms;
+       - `env -S` at any position;
+       - `ls|find … | xargs CMD`, which gives `CMD DIR/*`;
+       - a downloader before a sink, which gives `pipe-to-shell`.
+     - Each payload carries the `cd` context that comes before it; same-shell payloads also carry the rest of the line. Payloads are lexed with `lex_best_effort` and checked by a nested `run_best_effort_into`, to depth 2. There are at most 64 payloads of 64 KiB each, and every step is charged (§8).
+     - A payload the best-effort lexer can't read adds nothing, because §2 only adds hits. A nested hit carries the nested record's unit index.
+   - *Tests:*
+     - decode-level unit tests per generator in `dev_readings.rs` (`unescape_decodes_like_echo_and_printf`, `printf_formats_like_dev`, `echo_printf_and_yes_texts`, `stdin_reader_and_compound_sinks`, `heredoc_and_process_substitution_sinks`, `substituted_words_script_forms_and_xargs`, `payloads_are_charged`);
+     - end to end: `policy.rs::round2_finding2_dev_decoded_payloads_hard_deny_under_full_access`, HardDeny under Home and FullAccess (§2), with non-sink controls.
+3. **False hard denies.**
+   - *Cause:* unjoined relative selector variants (`**` from `**/..`) matched every probe.
+   - *Fix (`best_effort.rs`):* selectors ending in `..` are checked as directories, joined to their roots. Home and its ancestors are exempt (S8, §10 row 16).
+   - *Test:* `evaluate/tests.rs::round2_finding3_parent_selectors_reaching_home_are_not_hits`.
+   - *Disputed with derivations (driver to confirm):*
+     - `cat proj_atrium/*` stays `atrium-self`: `proj_atrium/data_link` resolves to the Atrium data dir (§5, identity of each match).
+     - `ag x`, `ack x` and `find -type f` at `cwd=vault/work` stay Deny: D-141 makes every word of an unknown tool a candidate path, and §11 item 17 (D-176) protects a folder linked from `~/.ssh` itself.
+4. **Cwd survives `eval`, `source` and `.`.**
+   - *Fix (`paths/command.rs`, P2, D-176 item 4):* the exact model's cwd is unknown after these units.
+   - *Deviation:* other code runners (`python`, `bash -c`, …) run in a child process and can't move this shell's cwd. Marking the cwd unknown after them would turn real hits into Unread, for example `python x && cat .ssh/id_rsa`, which would then be Allowed under FullAccess. So they are not included. **Driver to confirm.**
+   - *Test:* `adversarial_m1_18.rs::round2_finding4_cwd_unknown_after_eval_source_and_dot`, through SessionGate. Four eval/source/`.` forms give `[Ask, Allow, Allow]` (home, any, full). The control `true && cat .npmrc` is Deny.
+5. **and 7. Stale expectations.** See "Changed expectations" below.
+6. **§3 amendment (§11 item 16).**
+   - *Fix (`lex.rs`, P1):*
+     - a mid-word `~` is literal, except right after `=` or `:`;
+     - `>&m` and `>&-` read as `1>&m` and `1>&-`.
+   - *Tests:*
+     - `policy.rs::section3_amendment_tilde_inside_words_and_bare_dup_redirects`: `git diff HEAD~1` and `ls >&2` are Allow; `a=~/x`, `--opt=~/x`, `x:~/y` and `>&file` are Ask;
+     - `lex/tests.rs` additions.
+7. See 5.
+8. **CR-P5-1.**
+   - *Fix (`v4/tools.rs`, P3):* in `classify_home_readonly`, `operand_access = Read` when no forbidden flag is present.
+   - *Consequence:* §11 item 17 needed the `ssh_linked` check for every access in `sensitive.rs` (`hard_deny_match_parts`, `matches_unlisted_equivalence`) and `best_effort.rs` (`glob_hit_budgeted`).
+   - `evaluate/tests.rs:390` (`ls ~/.ssh` in Home) is traced in `e018b8d3`.
+9. **Deny past exhaustion.**
+   - *Fix:* `evaluate_rules_reserving_deny` in `evaluate.rs`. Once the call's budget is exhausted, rules are evaluated again on a reserved budget and only the winning Deny is kept. `gate.rs`'s protected-set failure path evaluates by names and keeps a winning Deny.
+   - *Test:* `evaluate/tests.rs::round2_finding9_deny_rule_decides_past_exhaustion`. Over a sweep of cutoffs it is never Allow, at least one cutoff is exhausted and Deny, and the full budget gives Deny.
+10. **Clippy.** All 11 are fixed in `86d0aed2`, as the review lists. Clippy was not run.
+11. **CR-P5-2.**
+    - `dev`'s frozen tables move into one `#[cfg(test)]` fixture module, `policy/dev_parity.rs`. `deny.rs` is deleted (with `git rm`). The `mod.rs` `shell`/`words` shims and `engine.rs`'s `#[cfg(test)]` RG_/GREP_/GIT_CRED_ lists are removed. The parity tests in `limits.rs` and `tools.rs` read the fixtures.
+    - `atrium_protocol::policy::HOME_READONLY_COMMANDS` is **kept**. It is a public constant of `atrium-protocol`, and the brief says to keep public signatures. Nothing live in `atrium-core` reads it; the protocol's own tests and the `v4/tools/tests.rs` parity tests do.
+    - The `v4/tools.rs` `classify_cd` wiring fix (round 1) still needs the driver's approval.
+12. **Handoff corrections.**
+    - The `adversarial_gate` row above is corrected: there were other verdict changes, listed below.
+    - `#[ignore]`: the base `5c4d154f` had **6** (M1-13 numbers 4, 5, 6, 10, 11, 11), and the branch has 0. So verification's "1 ignored" comes from `dev`-side tests or a doctest, not from this branch's `#[ignore]`s.
+    - The round 1 citations for `ls vault/work` Deny, the `cd` tables as Ask, and `HEAD~1` were wrong. They are replaced by the citations below: §11 item 17 / D-145 item 3, §5, and §11 item 16 respectively.
+
+**O1 (perf).** The decoded-payload scanner is skipped on lines without `|`, `<`, `>`, `$`, a backtick or `script`. This changes no verdict. Caching the protected set across calls was **not** done: `gate.rs` rebuilds it per call so a symlink swap between check and redeem is seen (`redeem_rechecks_hard_deny_after_symlink_swap`), and a cache would change that verdict. Finding 2's payload pass adds work on lines that match. The orchestrator re-times.
+
+### Changed expectations (with citations)
+
+- **`adversarial_regression.rs`**
+  - `round_5_blocker_1` / `round_7_item_3`:
+    - `ag x`, `ack x` and `find -type f` at `cwd=vault/work` are Deny (D-141, §11 item 17);
+    - `ls vault/work`, `ls -la vault/work`, `ls vault/*` and `ls vault/w*` are Deny (§11 item 17, D-145 item 3);
+    - `ls vault` is not Deny.
+  - `round_4_blocker_1`: `ls vault/work` and `ls vault` are Deny in all settings, because `vault` is linked from `.ssh/deep` (§11 item 17).
+  - `round_4_blocker_2`: `grep --dir=recurse` and `--rec` are Ask in Home and Allow under Any and Full (§6, D-176's last paragraph).
+  - `round_6_items_1_and_2`:
+    - the variant-only `~/**/id_work`, `~/**/id_*` and `./**/id_work` are Ask/Allow/Allow (§5, Unread);
+    - non-search readers at `cwd=vault/work` are Deny, except bare `find`, which asks (§11 item 17, D-141);
+    - `ls ~/vault/*` and `ls vault/*` are Deny (§5, §11 item 17).
+- **`adversarial_m1_18.rs`**
+  - `cat proj_atrium/*` is `AS` in every setting (§5; policy.rs `ls ~/.local/share/atrium`).
+  - `cat proj_atrium/p*`, `cat my_atrium_notes/*`, `cat atrium/*` and `head -n 1 my_atrium_notes/*.txt` are `dev_glob`. They have new fixtures (§5).
+  - The fix1 d100 list adds `**/a/b/../../..`, `**/../.` and `src/../..` (D-100).
+  - F1b is CR (§8).
+  - The virtual anchored-selector rows move to `p1_anchored_selectors_inside_their_roots_on_a_real_disk`, which expects Allow.
+- **`adversarial_gate.rs`**
+  - `cat proj/link-ssh/.` is Allow: the `~/.ssh` folder itself is readable (§5, `ls ~/.ssh` Allow in Home).
+  - `$HOME/.ssh/id_ed25519` in file tools is literal: Read and Grep are Allow, Edit and Delete are Ask (§5, §10 row 11).
+  - `ls proj/*` is Deny (§10 row 8).
+  - `ls proj/a*` is Ask.
+- **`adversarial_policy.rs`**: `leftover_symlink_in_ssh_to_an_ordinary_folder`:
+  - `ls proj` and `ls proj/sub` are Deny (§11 item 17);
+  - `ls other` is Allow (new fixture).
+- **`policy.rs`**
+  - `$HOME/.aws/credentials` in file tools is literal, so not a HardDeny (§5, §10 row 11).
+  - The virtual `Grep ~/.ssh` assertion moves to the real-disk `real_disk_recursive_search_of_ssh_is_a_hard_deny` (S8, §10 row 16).
+
+### Changes to P1, P2 and P3 files (D-176 item 4)
+
+- **P1** `v4/lex.rs`: the §3 amendment (finding 6). Tests are in `v4/lex/tests.rs`.
+- **P2** `v4/paths/sensitive.rs`:
+  - per-listing caps and the `Through(folder)` gap (finding 1);
+  - `ssh_linked` for every access (§11 item 17, following CR-P5-1).
+- **P2** `v4/paths/command.rs`: the cwd is unknown after `eval`/`source`/`.` (finding 4).
+- **P3** `v4/tools.rs`: Read operands in `classify_home_readonly` (finding 8, CR-P5-1). Tests are in `v4/tools/tests.rs`.
+- **P0** `policy/tools.rs` and `limits.rs`: the parity tests only import `dev_parity` (finding 11).
+
+### Cfg audit
+
+Round 2 adds no platform `cfg`. The new code uses only std string, byte and `fs` calls. The finding 1 test uses `std::fs` only. The existing `#[cfg(unix)]`/`#[cfg(not(unix))]` pairs (for example `engine_path_bytes`) and the macOS-only fixture paths (`/System/Volumes/Data`, `/.vol`) are unchanged and gated. Linux is still unverified.
+
+### Process notes
+
+- A test in `evaluate/tests.rs` (`round2_finding3_…`) was first appended with a shell heredoc, which the rules forbid. Later edits used Edit/Write.
+- `deny.rs` was removed with `git rm`.
+
+### Not done
+
+- **§13 properties 3 and 4 through `SessionGate` with real fixtures.** SessionGate has no budget hook, and no line inside the input caps was found that is known to exhaust the default budget through the gate. Brace expansion is capped, and filesystem caps give Unread, not Exhausted. The properties stay covered by the `evaluate_call_with_budget` sweeps (`evaluate/tests.rs::section13_properties_3_and_4_…`, `exhaustion_asks_everywhere_and_never_creates_a_hit`). The driver's options:
+  - approve a `#[doc(hidden)]` budget override on `DefaultPolicy`/`SessionGate` for tests;
+  - accept the unit sweeps.
+- **Property 1:** done. Each generator must now give at least one Unread Ask in Home.
+- **The review's other test gaps:** there is no §10 row for variant-only `**`, `HEAD~1` or `>&2`. They are covered by the tests above, but not added to `policy_rev4_section10.rs`.
