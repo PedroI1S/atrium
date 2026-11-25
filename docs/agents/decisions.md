@@ -1076,3 +1076,9 @@ D-141 removed flag arities from these rows precisely to avoid this.
 **Decided by Pedro (driver).** Codex has no usage left on Pedro's account; on its ChatGPT login it refuses `gpt-6.1-sol`, `gpt-6.1`, `gpt-6-astra` and `gpt-6`. So **Claude Sonnet 5.5** replaces Codex (D-124) as the reviewer for P2 (M1-38) and P3 (M1-39) on Pedro's shifts. It runs as a read-only Claude subagent in the task's worktree, with the same review prompt and the same D-120 rules.
 - **Cross-provider:** Sonnet (Anthropic) reviewing Neon (Google). P2's round 10 was written by Opus, but review 9 is followed by Neon's round 11, and every later round is reviewed again.
 - **Codex goes back to reviewing** when the usage returns, or on rodrigo's shifts.
+
+## D-163 — 2026-11-24 — Pedro: go for M1-42-n16-bridge-test-race
+**Decided by Pedro (driver).** M1-42 starts now, following its brief: a Neon `medium` writer (D-158), the orchestrator's verification (D-123), a Sonnet 5.5 review (D-162) and the 100% gate (D-120).
+- **Three writers at once:** it runs alongside P2's round 11 and P3's round 4, one more than D-123's guideline of two on a laptop.
+  - It is a test-only change, and its worker runs only `cargo check -p atrium-app --tests`.
+  - Its builds use the shared build folder (`CARGO_TARGET_DIR` set to the main checkout's `target/`), so it adds no second cold build on disk.
