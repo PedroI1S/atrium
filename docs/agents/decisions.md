@@ -1147,3 +1147,6 @@ D-141 removed flag arities from these rows precisely to avoid this.
 ## D-173 — 2026-11-25 — Pedro: P2 round 15 on Neon xhigh after the D-155 rise
 **Decided by Pedro (driver).** P2's review counts went 1 (review 10), 1 (review 11, a stall the orchestrator should have brought to the driver then), 2 (review 12, a rise). Under D-155 that comes to the driver. Pedro keeps Neon `xhigh` writing P2: round 15 fixes review 12's two Lows (the macOS `st_blksize` stream charge, and the name copy before its compute charge) and its test gaps. Reviews run on Pedro's Claude plan (D-170), since agy's Claude models hit their weekly limit on 2026-11-25 (reset in about 6.7 days). D-155's conditions still apply to later rounds.
 
+
+## D-174 — 2026-11-25 — Pedro: merge P2 (M1-38) into dev
+**Decided by Pedro (driver).** P2 (`agent/neon/M1-38-rev4-p2-paths` at `2c304075`) passed Sonnet review 13 with no findings (D-120 gate met). Merged into `dev` as `5e13aa19`. The merged tree passes the full DoD on macOS: workspace 1049/0/7, fmt, clippy, protocol, typecheck and 373 vitest. The first run failed one `atrium-host` `supervise` test that P2 doesn't touch. That test then passed 300 of 300 runs and the workspace rerun was clean. It is logged as N19. A Linux run of P2 is still owed (rodrigo). P5 (M1-41) is next and needs the driver's go.

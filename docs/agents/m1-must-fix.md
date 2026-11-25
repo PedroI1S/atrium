@@ -16,13 +16,14 @@ Each row below starts with its state: ✅ done (with evidence), 🟡 in progress
 
 **Open before the M1 gate:**
 - **Rev 4:**
-  - P0 (M1-36), P1 (M1-37) and P4 (M1-40) are merged.
-  - P2 (M1-38) and P3 (M1-39) are in rework.
+  - P0 (M1-36), P1 (M1-37), P2 (M1-38, D-174) and P4 (M1-40) are merged.
+  - P3 (M1-39) is in rework.
   - P5 (M1-41) and the integrated rev 4 review are still to come.
 - **N16:** ✅ the bridge test flake. The cause was the test's fake daemon, and the fix is M1-42, merged as `6281107a` (D-168).
 - **N17:** `atrium-host` `tests/supervise.rs` `kill_recorded_returns_verified_when_gone_leader_group_drains_within_timeout` flakes under load (minor). It returned `Unverified` instead of `Verified` once (2026-11-24, M1-42 round 4's verification, load average ~6.6 while a worker built), and passed 30 of 30 reruns on `dev` at load ~3. The test releases the group member after 150 ms and expects the drain to finish within `GROUP_DRAIN_TIMEOUT`, so a stalled scheduler can miss it. ✅ Fixed by M1-43, merged as `6834b3c7` (D-171).
 - **N18:** `atrium-agents` `tests/M1-28-followups.rs` `claude_delivered_question_blocked_withdrawals_stay_bounded_and_complete` flakes under load (minor). Once (2026-11-24, M1-42 round 5's verification, load ~5), `open_count` was 1 instead of 0 right after `ledger.withdraw`. It passed 30 of 30 reruns on `dev` at load ~3. ✅ Fixed by M1-44, merged as `482da38b` (D-172). Not a product bug: the test's short `gate_deadline` also bounded real tickets.
 - **CR-M1-44 (change request, not a defect):** move Claude's withdraw-drain override from the `#[doc(hidden)]` `ClaudeAdapter::with_withdraw_timeout` into `ClaudeOptions::withdraw_timeout: Option<Duration>`, matching `CodexOptions::withdraw_timeout`, the next time `ClaudeOptions` may change (it is a public struct without `#[non_exhaustive]`). Then drop the hidden method. From M1-44's handoff, Round 2 (D-172).
+- **N19:** `atrium-host` `tests/supervise.rs` `terminate_blocking_kills_a_leader_that_left_its_group` flaked once (minor). It failed on 2026-11-25 in the full workspace run on `dev` right after the P2 merge (`5e13aa19`). The panic was at `supervise.rs:964`, `wait_until_left`'s `!group_exists(old_pgid)`: right after the helper leader moved to its new group, `kill(-old_pgid, 0)` still found the old group. P2 doesn't touch `atrium-host`. It passed the `supervise` binary 200 of 200 quiet and 100 of 100 at load ~35. Suspected cause: XNU frees the old pgrp after the leader's `setpgid` returns, so the check races it. A fix would poll `group_exists` briefly with a bound instead of asserting once. The test dates from M1-07c (N8). The log is kept in the orchestrator's scratchpad as `devp2.fail1.tests`. Owner: to be decided by the driver.
 - **Live and manual checks:**
   - M1-08L: the live Codex checks X1–X3;
   - Pedro's macOS benches;
