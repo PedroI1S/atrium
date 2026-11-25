@@ -10,10 +10,11 @@
 
 1. **Step 1 — Keep daemon `SubscribeInbox` ordering in `Scripted`** (`app/src-tauri/src/bridge.rs`, `mod tests`):
    - Removed eager registration of connections into `peers` on `listener.accept()`.
-   - In the `ClientMessage::SubscribeInbox` arm, `Scripted` now acquires `peers_conn.lock()`, queues `ServerMessage::Response` onto `tx`, and only then appends `(conn_id, tx.clone())` to `peers` and updates the `watch::Sender<usize>` subscriber count — all under the same lock, matching `Hub::subscribe_inbox`.
-   - On connection close, subscribed connections are removed from `peers` by `conn_id` and the subscriber count is updated. `Scripted::push` also updates the subscriber count via `send_if_modified` if `retain` drops a closed sender.
+   - Tracked subscriber state in `watch::Sender<InboxSubscribers>` where `InboxSubscribers { live: usize, answered: u64 }` records both live push targets (`peers.len()`) and the monotonic count of `SubscribeInbox` requests answered.
+   - In the `ClientMessage::SubscribeInbox` arm, `Scripted` acquires `peers_conn.lock()`, queues `ServerMessage::Response` onto `tx`, registers `(conn_id, tx.clone())` in `peers` once (`if !subscribed`), and updates `InboxSubscribers { live, answered }` via `send_modify` (which updates stored state even with 0 receivers) — all under the same lock, matching `Hub::subscribe_inbox`.
+   - On connection close, subscribed connections are removed from `peers` by `conn_id` and `counts.live` is updated via `send_modify`. `Scripted::push` also updates `counts.live` via `send_if_modified` if `retain` drops a closed sender.
 2. **Step 2 — Wait for inbox subscribers before pushing**:
-   - Added `Scripted::inbox_subscribers(&self, n: usize)` which waits (with a 5 s timeout) on `self.subscribers.subscribe().wait_for(|&count| count >= n)` until `n` connections have had their `SubscribeInbox` answered and been registered as push targets.
+   - Added `Scripted::inbox_subscribers(&self, n: usize)` (`counts.live >= n`, 5 s timeout) for single-connection tests starting from 0 peers, plus `live_inbox_subscribers()`, `inbox_answered_mark()`, and `wait_inbox_answered(target)` (`counts.answered >= target`, 5 s timeout) for multi-connection / reconnect scenarios where a stale peer may already satisfy `live >= n`.
    - Called `daemon.inbox_subscribers(1).await` between connecting and the first `daemon.push` in every test that calls `daemon.push`:
      - `batching_keeps_order_and_sequence_numbers`
      - `a_lone_delivery_is_not_delayed`
@@ -21,9 +22,10 @@
      - `a_gone_sink_ends_forwarding_mid_stream`
      - `micro_measurement_frames_per_10000_deliveries`
    - Verified no other tests in `bridge.rs` call `daemon.push`.
-3. **Step 3 — Permanent regression test**:
-   - Added `ScriptedOptions { inbox_delay: Duration }` and `Scripted::start_with(answer, options)` (with `Scripted::start` delegating to `ScriptedOptions::default()`). When `!options.inbox_delay.is_zero()`, the `SubscribeInbox` handler sleeps `options.inbox_delay` before answering and registering the peer.
-   - Added `delayed_subscribe_inbox_does_not_lose_pushed_updates`, which starts `Scripted::start_with(list_threads_ok, ScriptedOptions { inbox_delay: Duration::from_millis(200) })`, waits for `client_connected` and `daemon.inbox_subscribers(1).await`, pushes 100 `ThreadUpdated` messages, flushes with `flush_barrier`, and asserts all 100 updates arrive in order with rising sequence numbers.
+3. **Step 3 — Permanent regression test and unit coverage**:
+   - Added `ScriptedOptions { inbox_delay: Duration, inbox_gate: Option<Arc<tokio::sync::Notify>> }` and `Scripted::start_with(answer, options)` (with `Scripted::start` delegating to `ScriptedOptions::default()`).
+   - Added `delayed_subscribe_inbox_does_not_lose_pushed_updates` (200 ms `inbox_delay`, 100 pushed updates, all arrive in order with rising sequence numbers).
+   - Added unit tests covering 0-receiver updates (`subscriber_count_is_stored_without_a_watcher`), disconnect cleanup (`disconnect_updates_live_subscriber_count_without_watcher`), dead-peer pruning in `push` (`push_prunes_dead_peer_and_drops_live_count`), two-connection gating (`second_connection_with_delayed_subscribe_inbox_receives_only_post_answer_pushes`), stale-peer disconnect + gated reconnect (`stale_peer_disconnect_requires_wait_inbox_answered_for_new_connection`), and repeated `SubscribeInbox` on one connection (`repeated_subscribe_inbox_on_same_connection_raises_answered_without_duplicating_peer`).
 
 ## Checks run by worker (D-123)
 
@@ -85,7 +87,9 @@ git checkout -- app/src-tauri/src/bridge.rs
 
 None.
 
-## Round 2
+## Round 2 (superseded by Round 3)
+
+> **Superseded by Round 3**: `watch::Sender<usize>` and `send_replace` were replaced by `watch::Sender<InboxSubscribers>` with `send_modify`; the `< 500 ms` wall-clock assertion was removed; the test was renamed in Round 4; and the revert snippet below no longer type-checks against current code — use the revert instructions in Round 3 / Round 4 below.
 
 ### Fix
 
@@ -126,7 +130,9 @@ for i in (seq 1 300)
 end
 ```
 
-#### 3. Verify the regression test fails with Step 1 reverted (race itself, not `inbox_subscribers` hang)
+#### 3. Verify the regression test fails with Step 1 reverted (superseded by Round 3)
+
+> **Superseded by Round 3** (`send_replace` no longer type-checks against `watch::Sender<InboxSubscribers>`; use the revert instructions in Round 3 / Round 4 below).
 
 Temporarily revert Step 1 in `app/src-tauri/src/bridge.rs` inside `Scripted::start_with`:
 
@@ -256,6 +262,95 @@ cargo test -p atrium-app bridge::tests::delayed_subscribe_inbox_does_not_lose_pu
 ```
 
 Expected failure: `inbox_subscribers(1)` returns immediately on accept (does **not** hang), `daemon.push` sends the 100 `ThreadUpdated` messages before the 200 ms `SubscribeInbox` answer arrives, the delayed answer clears `known.threads`, and the test panics in `next_raw` with `"a delivery arrives"` (not `"connections subscribe to the inbox"`).
+
+Restore the working tree afterwards:
+
+```fish
+git checkout -- app/src-tauri/src/bridge.rs
+```
+
+## Round 4
+
+### Changes
+
+1. **Handoff updated** (`docs/agents/handoffs/M1-42-n16-bridge-test-race.md`):
+   - Updated "Done" to describe the `InboxSubscribers { live, answered }` design and current test suite.
+   - Marked the entire "Round 2" section (including its `send_replace` revert step 3 and removed `< 500 ms` assertion) as superseded by Round 3.
+   - Verified the current revert snippet (below and in Round 3) type-checks against today's `Scripted::start_with` (`InboxSubscribers`, `send_modify`, `options_conn`).
+2. **Renamed and cleaned up 0-receiver test** (`app/src-tauri/src/bridge.rs`, `mod tests`):
+   - Renamed `inbox_subscribers_returns_immediately_if_already_subscribed` to `subscriber_count_is_stored_without_a_watcher`.
+   - Added `drop(handle); bridge.detach("main"); bridge.client().shutdown();` at the end, matching sibling tests.
+3. **Stale-peer test + removed redundant delay** (`app/src-tauri/src/bridge.rs`, `mod tests`):
+   - Dropped the redundant `inbox_delay: Duration::from_millis(200)` from `second_connection_with_delayed_subscribe_inbox_receives_only_post_answer_pushes` (the gate alone holds B deterministically).
+   - Added `stale_peer_disconnect_requires_wait_inbox_answered_for_new_connection`: connects A, waits for its answer, records `mark = inbox_answered_mark()`, disconnects A, connects B with its `SubscribeInbox` answer gated, asserts `answered == mark` and that `wait_inbox_answered(mark + 1)` stays `Poll::Pending` while B is gated (without sleeps or timing assertions), pushes `"before-b"`, releases B, waits via `wait_inbox_answered(mark + 1)`, pushes `"after-b"`, and verifies B receives its empty `inbox` snapshot followed only by `"after-b"`.
+4. **Repeated-`SubscribeInbox` test** (`app/src-tauri/src/bridge.rs`, `mod tests`):
+   - Added `repeated_subscribe_inbox_on_same_connection_raises_answered_without_duplicating_peer`: sends two `SubscribeInbox` requests over a single connection, verifying both are answered, `answered` rises from `1` to `2`, `live` and `peers.len()` stay `1` (matching `Hub::subscribe_inbox`'s `HashMap::insert`), and a subsequent push is delivered once before a barrier response.
+
+### Checks run by worker (D-123)
+
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-app --tests` — clean, 0 warnings
+
+No `cargo test`, `cargo clippy`, or `pnpm` was run by the worker under D-123.
+
+### Verification commands (fish-compatible)
+
+#### 1. Format, clippy, and full workspace test suite
+
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+```
+
+#### 2. Run `bridge::` tests 300 times in a row
+
+```fish
+for i in (seq 1 300)
+    cargo test -p atrium-app bridge:: --quiet; or begin; echo "FAILED on run $i"; break; end
+end
+```
+
+#### 3. Verify the regression test fails with Step 1 reverted
+
+Temporarily revert Step 1 in `app/src-tauri/src/bridge.rs` inside `Scripted::start_with`:
+
+1. Right after `let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();` and `let mut subscribed = false;`, restore eager peer registration on accept:
+   ```rust
+   {
+       let mut peers = peers_conn.lock().unwrap_or_else(PoisonError::into_inner);
+       peers.push((conn_id, tx.clone()));
+       subscribed = true;
+       subscribers_conn.send_modify(|counts| {
+           counts.live = peers.len();
+       });
+   }
+   ```
+2. In the `ClientMessage::SubscribeInbox { request_id }` arm, keep the gate/delay and return `Some(ServerMessage::Response { ... })` directly (without locking `peers_conn` or registering there):
+   ```rust
+   ClientMessage::SubscribeInbox { request_id } => {
+       if let Some(gate) = &options_conn.inbox_gate {
+           gate.notified().await;
+       }
+       if !options_conn.inbox_delay.is_zero() {
+           tokio::time::sleep(options_conn.inbox_delay).await;
+       }
+       Some(ServerMessage::Response {
+           request_id,
+           result: CommandResult::Ok {
+               value: serde_json::json!({"threads": [], "inbox": []}),
+           },
+       })
+   }
+   ```
+
+Then run the regression test:
+
+```fish
+cargo test -p atrium-app bridge::tests::delayed_subscribe_inbox_does_not_lose_pushed_updates -- --exact
+```
+
+Expected failure: `inbox_subscribers(1)` returns immediately on accept, `daemon.push` sends the 100 `ThreadUpdated` messages before the 200 ms `SubscribeInbox` answer arrives, the delayed answer clears `known.threads`, and the test panics in `next_raw` with `"a delivery arrives"`.
 
 Restore the working tree afterwards:
 

@@ -344,8 +344,8 @@ mod tests {
     use atrium_protocol::thread::{Location, ThreadId, ThreadState, ThreadSummary};
     use atrium_protocol::wire::{ClientMessage, CommandResult, ServerMessage};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixListener;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio::net::{UnixListener, UnixStream};
 
     use super::*;
 
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn inbox_subscribers_returns_immediately_if_already_subscribed() {
+    async fn subscriber_count_is_stored_without_a_watcher() {
         let daemon = Scripted::start(list_threads_ok);
         let bridge = Bridge::start(daemon.options());
         let (sink, receiver) = sink();
@@ -1291,6 +1291,10 @@ mod tests {
         assert_eq!(daemon.subscribers.receiver_count(), 0);
 
         daemon.inbox_subscribers(1).await;
+
+        drop(handle);
+        bridge.detach("main");
+        bridge.client().shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1385,8 +1389,8 @@ mod tests {
         let daemon = Scripted::start_with(
             list_threads_ok,
             ScriptedOptions {
-                inbox_delay: Duration::from_millis(200),
                 inbox_gate: Some(gate.clone()),
+                ..ScriptedOptions::default()
             },
         );
 
@@ -1479,5 +1483,180 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task_b)
             .await
             .expect("forward B ends");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_peer_disconnect_requires_wait_inbox_answered_for_new_connection() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let daemon = Scripted::start_with(
+            list_threads_ok,
+            ScriptedOptions {
+                inbox_gate: Some(gate.clone()),
+                ..ScriptedOptions::default()
+            },
+        );
+
+        // Connect A and wait for its `SubscribeInbox` answer.
+        let client_a = Client::start(daemon.options());
+        client_connected(&client_a).await;
+        gate.notify_one();
+        daemon.inbox_subscribers(1).await;
+
+        let mark = daemon.inbox_answered_mark();
+        assert_eq!(mark, 1);
+
+        // Disconnect A, then connect B with its `SubscribeInbox` answer gated.
+        // Even if A is still counted in `live` while its disconnect is in
+        // flight, `answered` remains `mark` until B's own `SubscribeInbox` is
+        // answered.
+        client_a.shutdown();
+        drop(client_a);
+
+        let client_b = Client::start(daemon.options());
+        client_connected(&client_b).await;
+        let window_b = client_b.open_window("main");
+        let handle_b = window_b.handle();
+        handle_b.show_inbox(true);
+
+        // While B is gated, `answered` is still `mark` and
+        // `wait_inbox_answered(mark + 1)` does not return yet.
+        assert_eq!(daemon.inbox_answered_mark(), mark);
+        {
+            let mut cx = Context::from_waker(Waker::noop());
+            let wait = pin!(daemon.wait_inbox_answered(mark + 1));
+            assert!(
+                wait.poll(&mut cx).is_pending(),
+                "wait_inbox_answered(mark + 1) must stay pending while B is gated"
+            );
+        }
+        // Any push while B is gated must not reach B.
+        daemon.push(vec![thread_updated(0, "before-b".into())]);
+
+        // Release B, wait via `wait_inbox_answered(mark + 1)`, push, and check
+        // that B receives the post-answer update.
+        gate.notify_one();
+        daemon.wait_inbox_answered(mark + 1).await;
+        assert_eq!(daemon.inbox_answered_mark(), mark + 1);
+
+        daemon.push(vec![thread_updated(1, "after-b".into())]);
+        flush_barrier(&client_b).await;
+
+        let (sink_b, receiver_b) = sink();
+        let task_b = tokio::spawn(forward(window_b, sink_b));
+        let mut last_seq_b = 0u64;
+        let mut saw_inbox_b = false;
+        let mut titles_b = Vec::new();
+        while titles_b.is_empty() {
+            for (seq, delivery) in unpack(next(&receiver_b)) {
+                assert_eq!(seq, last_seq_b + 1, "B sequence numbers must rise by 1");
+                last_seq_b = seq;
+                handle_b.ack(seq);
+                if delivery["type"] == "inbox" {
+                    assert_eq!(delivery["threads"], serde_json::json!([]));
+                    saw_inbox_b = true;
+                } else if delivery["type"] == "thread_updated" {
+                    titles_b.push(delivery["summary"]["title"].as_str().unwrap().to_string());
+                }
+            }
+        }
+        assert!(saw_inbox_b, "B received its initial inbox snapshot");
+        assert_eq!(titles_b, vec!["after-b"]);
+
+        drop(handle_b);
+        client_b.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task_b)
+            .await
+            .expect("forward B ends");
+    }
+
+    async fn write_client_message(stream: &mut OwnedWriteHalf, message: &ClientMessage) {
+        let payload = serde_json::to_vec(message).unwrap();
+        let mut frame = Vec::with_capacity(payload.len() + 5);
+        frame.extend_from_slice(&(payload.len() as u32 + 1).to_be_bytes());
+        frame.push(0);
+        frame.extend_from_slice(&payload);
+        stream.write_all(&frame).await.unwrap();
+    }
+
+    async fn read_server_message(stream: &mut OwnedReadHalf) -> ServerMessage {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).await.unwrap();
+            let length = u32::from_be_bytes(header) as usize;
+            let mut body = vec![0u8; length];
+            stream.read_exact(&mut body).await.unwrap();
+            serde_json::from_slice(&body[1..]).unwrap()
+        })
+        .await
+        .expect("a server message arrives")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_subscribe_inbox_on_same_connection_raises_answered_without_duplicating_peer()
+    {
+        let daemon = Scripted::start(list_threads_ok);
+        let stream = UnixStream::connect(daemon.options().socket).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_client_message(
+            &mut writer,
+            &ClientMessage::SubscribeInbox { request_id: 1 },
+        )
+        .await;
+        match read_server_message(&mut reader).await {
+            ServerMessage::Response {
+                request_id: 1,
+                result: CommandResult::Ok { .. },
+            } => {}
+            other => panic!("expected SubscribeInbox #1 Ok response, got {other:?}"),
+        }
+        daemon.wait_inbox_answered(1).await;
+        assert_eq!(daemon.live_inbox_subscribers(), 1);
+        assert_eq!(daemon.inbox_answered_mark(), 1);
+
+        // Sending `SubscribeInbox` again on the same connection must answer it
+        // (`answered` rises) without adding a duplicate push target (`live`
+        // stays 1, matching `Hub::subscribe_inbox`'s `HashMap::insert`).
+        write_client_message(
+            &mut writer,
+            &ClientMessage::SubscribeInbox { request_id: 2 },
+        )
+        .await;
+        match read_server_message(&mut reader).await {
+            ServerMessage::Response {
+                request_id: 2,
+                result: CommandResult::Ok { .. },
+            } => {}
+            other => panic!("expected SubscribeInbox #2 Ok response, got {other:?}"),
+        }
+        daemon.wait_inbox_answered(2).await;
+        assert_eq!(daemon.live_inbox_subscribers(), 1);
+        assert_eq!(daemon.inbox_answered_mark(), 2);
+        {
+            let peers = daemon.peers.lock().unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(peers.len(), 1);
+        }
+
+        // A push must arrive once, followed by the barrier response.
+        daemon.push(vec![thread_updated(1, "once".into())]);
+        write_client_message(
+            &mut writer,
+            &ClientMessage::Command {
+                request_id: 3,
+                command: DaemonCommand::ListThreads,
+            },
+        )
+        .await;
+        match read_server_message(&mut reader).await {
+            ServerMessage::ThreadUpdated { summary } => assert_eq!(summary.title, "once"),
+            other => panic!("expected pushed ThreadUpdated, got {other:?}"),
+        }
+        match read_server_message(&mut reader).await {
+            ServerMessage::Response {
+                request_id: 3,
+                result: CommandResult::Ok { .. },
+            } => {}
+            other => panic!("expected barrier Response after single push, got {other:?}"),
+        }
     }
 }
