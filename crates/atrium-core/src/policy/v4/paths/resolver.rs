@@ -153,9 +153,9 @@ fn map_rustix_file_type(ft: rustix::fs::FileType) -> Option<FileType> {
 /// Longest path the kernel returns from `readlink` or `realpath`
 /// (`PATH_MAX`): 1,024 bytes on Apple platforms, 4,096 elsewhere.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-const PATH_MAX: usize = 1024;
+pub(super) const PATH_MAX: usize = 1024;
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-const PATH_MAX: usize = 4096;
+pub(super) const PATH_MAX: usize = 4096;
 
 /// Fixed per-call overhead charged alongside the returned path length in the
 /// `std::fs::canonicalize` fallback (`libc::realpath`'s transient buffer is
@@ -174,78 +174,149 @@ pub(super) const FALLBACK_CANON_PEAK: usize = PATH_MAX
 
 /// Fixed per-stream control-struct and allocator overhead (in bytes) added to
 /// the directory read buffer size in [`FsResolver::read_dir`] (§8; review 10,
-/// finding 1; review 11, finding 1). Covers libc `DIR` (including its mutex),
-/// `_telldir`, and allocator metadata on non-Linux Unix.
+/// finding 1; review 11, finding 1; review 12, finding 1). Covers libc `DIR`
+/// (including its mutex), `_telldir`, and allocator metadata on non-Linux Unix.
 pub(super) const DIR_STREAM_OVERHEAD: usize = 256;
 
-/// Minimum per-listing allocation charge (in bytes) charged before building a
-/// directory stream in [`FsResolver::read_dir`] (§8; review 10, finding 1;
-/// review 11, finding 1).
+/// Uniform per-listing permanent allocation deduction (in bytes) charged
+/// before building a directory stream in [`FsResolver::read_dir`] (§2, §8;
+/// review 10, finding 1; review 11, finding 1; review 12, finding 1).
 ///
 /// Per-platform behaviour:
 /// - **Linux:** `rustix::fs::RawDir` reads into a fixed 4,096-byte stack buffer
 ///   and makes no heap allocation for the stream or for individual entries
-///   before [`push_unix_dir_entry`]. Charging `DIR_STREAM_ALLOC` (4,352 bytes)
-///   gives ordinary directories (`st_blksize <= 4,096`) the same total
-///   allocation deduction as non-Linux Unix.
+///   before [`push_unix_dir_entry`] (it borrows `&CStr` directly from the stack
+///   buffer and charges name compute before copying into `Vec<u8>`). Deducting
+///   `DIR_STREAM_ALLOC` (4,352 bytes) keeps every listing's permanent
+///   allocation total identical to non-Linux Unix.
 /// - **Non-Linux Unix (macOS / BSD):** `rustix::fs::Dir::new` calls `fdopendir`,
-///   whose libc `dd_buf` allocation can follow the directory's `st_blksize`
-///   (4,096 bytes on local APFS/HFS+, potentially larger on NFS, SMB, or FUSE,
-///   so it is not bounded by a fixed 4,096-byte constant). `FsResolver::read_dir`
-///   therefore calls `fstat` on the open directory fd before constructing `Dir`
-///   and charges `DIR_STREAM_ALLOC.max(st_blksize + DIR_STREAM_OVERHEAD)` up
-///   front. Because `rustix`'s libc-backend `Dir::next` also allocates a
-///   transient `CString` per entry, each iteration verifies [`NAME_ALLOC_PEAK`]
-///   bytes remain in `budget` before advancing `dir.next()`.
+///   whose libc `dd_buf` is freed when the listing ends and can follow the
+///   directory's `st_blksize` (4,096 bytes on local APFS/HFS+, potentially
+///   larger on exFAT, NFS, SMB, or FUSE) or a platform page-size / buffer
+///   minimum. Before constructing `Dir`, `FsResolver::read_dir` calls `fstat`
+///   on the open directory fd, rejects negative or absurd
+///   (`> DIR_STREAM_MAX_BLKSIZE`) block sizes as
+///   `ResolveError::Io(FsIoError::Other)` (`Unread`), verifies without
+///   permanently deducting that `budget.remaining_alloc_bytes()` covers the
+///   real transient peak (`max(st_blksize, DIR_STREAM_PEAK_FLOOR) +
+///   DIR_STREAM_OVERHEAD`), and permanently deducts only `DIR_STREAM_ALLOC`
+///   (4,352 bytes), so totals match Linux on every volume. While the `Dir`
+///   stream remains open, the un-deducted transient headroom
+///   (`peak - DIR_STREAM_ALLOC`) is preserved across both retained pushes and
+///   each `dir.next()` call. Because `rustix`'s libc-backend `Dir::next` also
+///   allocates and copies a transient `CString` per entry, each iteration
+///   verifies both allocation headroom (`stream_extra + NAME_ALLOC_PEAK`) and
+///   compute headroom (`NAME_COMPUTE_PEAK`) before advancing `dir.next()`, and
+///   charges `name.len() - 1` compute before copying the name into the stack
+///   `name_buf`.
 /// - **Non-Unix:** charged before `std::fs::read_dir`, alongside the per-entry
 ///   `PATH_MAX` charge before each `next()`.
 ///
-/// Across the full `FS_MAX_DIR_OPENS` (1,024) cap on local volumes
-/// (`st_blksize <= 4,096`), `1,024 * 4,352` (~4.25 MiB) stays well inside
-/// `COMPUTE_BUDGET_ALLOC_BYTES` (8 MiB), so large walks reach
+/// Across the full `FS_MAX_DIR_OPENS` (1,024) cap on any valid volume
+/// (`st_blksize <= DIR_STREAM_MAX_BLKSIZE`), `1,024 * 4,352` (~4.25 MiB) stays
+/// well inside `COMPUTE_BUDGET_ALLOC_BYTES` (8 MiB), so large walks reach
 /// `FsCap::DirOpens` (`Unread`, §2) before exhausting `AllocationBudget`.
 pub(super) const DIR_STREAM_ALLOC: usize = 4_096 + DIR_STREAM_OVERHEAD;
 
-/// Worst-case transient heap allocation (in bytes) of one
-/// `rustix::fs::Dir::next` call on non-Linux Unix (`libc` backend), where
-/// `Dir::read` copies `dirent.d_name` into an owned `CString`.
+/// Minimum assumed transient `dd_buf` size (64 KiB) for the non-Linux Unix
+/// stream peak check before `rustix::fs::Dir::new` (`fdopendir`) (§8;
+/// review 12, finding 1).
 ///
-/// On Apple targets 64-bit `struct dirent` sizes `d_name` to
-/// `__DARWIN_MAXPATHLEN` (1,024 bytes, covering both 255-byte `NAME_MAX` names
-/// and UTF-8 NFD expansions of 255 UTF-16 code units); on other non-Linux Unix
-/// targets `MAXNAMLEN` is 255 (+ NUL = 256 bytes). Adding 64 bytes covers
-/// `CString` / allocator metadata. Checked (without permanent deduction,
-/// matching [`FALLBACK_CANON_PEAK`]) before every `dir.next()` so `Dir::read`
-/// can never allocate past the remaining allocation budget (§8; review 11,
-/// finding 1).
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub(super) const NAME_ALLOC_PEAK: usize = 1_024 + 64;
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
-))]
-pub(super) const NAME_ALLOC_PEAK: usize = 256 + 64;
+/// Set to 64 KiB (not 4 KiB) so a 4 KiB APFS/HFS+ volume cannot be
+/// under-charged even if Darwin uses its 16 KiB Apple Silicon `PAGE_SIZE` or a
+/// larger (32–64 KiB) minimum buffer size, while also covering 64 KiB page
+/// systems and far exceeding `sizeof(struct dirent)` (~1,048 bytes on 64-bit
+/// Darwin). Checked as transient peak headroom without permanent deduction, so
+/// it never inflates call totals.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(super) const DIR_STREAM_PEAK_FLOOR: usize = 65_536;
+
+/// Upper bound (1 MiB, matching Darwin `MAXBSIZE` and realistic large
+/// exFAT/SMB/NFS/ZFS block sizes) on `st_blksize` accepted by non-Linux Unix
+/// [`FsResolver::read_dir`] (§2, §8; review 12, finding 1). A negative or
+/// larger `st_blksize` is rejected before `Dir::new` as
+/// `ResolveError::Io(FsIoError::Other)` (`Unread`), never triggering a huge
+/// libc buffer allocation.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(super) const DIR_STREAM_MAX_BLKSIZE: usize = 1_048_576;
 
 /// Stack-buffer size (bytes, including trailing NUL) used on non-Linux Unix to
 /// copy `entry.file_name()` out of `rustix::fs::DirEntry` and drop its
 /// transient `CString` before [`push_unix_dir_entry`] allocates retained
 /// `Vec<u8>` / `Vec<DirEntry>` storage.
+///
+/// On Apple targets 64-bit `struct dirent` sizes `d_name` to
+/// `__DARWIN_MAXPATHLEN` (1,024 bytes, covering both 255-byte `NAME_MAX` names
+/// and UTF-8 NFD expansions of 255 UTF-16 code units); on other non-Linux Unix
+/// targets `MAXNAMLEN` is 255 (+ NUL = 256 bytes).
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-const MAX_D_NAME_BUF: usize = 1_024;
+pub(super) const MAX_D_NAME_BUF: usize = 1_024;
 #[cfg(all(
     unix,
     not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
 ))]
-const MAX_D_NAME_BUF: usize = 256;
+pub(super) const MAX_D_NAME_BUF: usize = 256;
 
-/// Computes the non-Linux Unix stream allocation charge for a directory whose
-/// `fstat` reports `blksize` bytes, flooring at [`DIR_STREAM_ALLOC`] and
-/// saturating on overflow (§8; review 11, finding 1).
+/// Worst-case transient heap allocation (in bytes) of one
+/// `rustix::fs::Dir::next` call on non-Linux Unix (`libc` backend), where
+/// `Dir::read` copies `dirent.d_name` (up to [`MAX_D_NAME_BUF`] bytes) into an
+/// owned `CString`. Adding 64 bytes covers `CString` / allocator metadata.
+/// Checked (without permanent deduction, alongside the open stream's transient
+/// headroom) before every `dir.next()` so `Dir::read` can never allocate past
+/// the remaining allocation budget (§8; review 11, finding 1; review 12,
+/// finding 1).
 #[cfg(all(unix, not(target_os = "linux")))]
-pub(super) fn dir_stream_alloc_for_blksize(blksize: usize) -> usize {
+pub(super) const NAME_ALLOC_PEAK: usize = MAX_D_NAME_BUF + 64;
+
+/// Worst-case transient compute units of one `rustix::fs::Dir::next` call on
+/// non-Linux Unix (`libc` backend), where `Dir::read` copies up to
+/// [`MAX_D_NAME_BUF`] bytes of `dirent.d_name` into its `CString`. Checked
+/// (without permanent deduction) before every `dir.next()` so no name byte is
+/// copied past the remaining compute budget (§8; review 12, finding 2).
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(super) const NAME_COMPUTE_PEAK: u64 = MAX_D_NAME_BUF as u64;
+
+/// Computes the non-Linux Unix transient peak allocation (in bytes) of
+/// `rustix::fs::Dir::new` (`fdopendir`) for a validated `blksize`, flooring at
+/// [`DIR_STREAM_PEAK_FLOOR`] and adding [`DIR_STREAM_OVERHEAD`] (§8; review 12,
+/// finding 1).
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(super) fn dir_stream_peak_for_blksize(blksize: usize) -> usize {
     blksize
+        .max(DIR_STREAM_PEAK_FLOOR)
         .saturating_add(DIR_STREAM_OVERHEAD)
-        .max(DIR_STREAM_ALLOC)
+}
+
+/// Validates a directory's `st_blksize` and charges the non-Linux Unix stream
+/// allocation against `budget` BEFORE `rustix::fs::Dir::new` (`fdopendir`)
+/// runs (§2, §8; review 12, finding 1).
+///
+/// - Negative or absurd (`> DIR_STREAM_MAX_BLKSIZE`) block sizes return
+///   `ResolveError::Io(FsIoError::Other)` (`Unread`) without touching `budget`.
+/// - Checks without permanently deducting that `budget.remaining_alloc_bytes()`
+///   covers [`dir_stream_peak_for_blksize`], exhausting `AllocationBudget`
+///   before `Dir::new` if not.
+/// - Permanently deducts only [`DIR_STREAM_ALLOC`] (4,352 bytes), keeping
+///   totals equal to Linux on every volume.
+/// - Returns the live transient headroom (`peak - DIR_STREAM_ALLOC`) held in
+///   libc's `dd_buf` until the `Dir` stream is dropped.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(super) fn charge_dir_stream(
+    raw_blksize: impl TryInto<usize>,
+    budget: &mut ComputeBudget,
+) -> Result<usize, ResolveError> {
+    let Ok(blksize) = raw_blksize.try_into() else {
+        return Err(ResolveError::Io(FsIoError::Other));
+    };
+    if blksize > DIR_STREAM_MAX_BLKSIZE {
+        return Err(ResolveError::Io(FsIoError::Other));
+    }
+    let peak = dir_stream_peak_for_blksize(blksize);
+    if budget.remaining_alloc_bytes() < peak {
+        budget.charge_alloc(peak)?;
+    }
+    budget.charge_alloc(DIR_STREAM_ALLOC)?;
+    Ok(peak.saturating_sub(DIR_STREAM_ALLOC))
 }
 
 /// `rustix` and `std` copy a path into a heap `CString` when it does not fit
@@ -270,17 +341,39 @@ fn charge_aux_stat(
     Ok(())
 }
 
+/// Charges `bytes` of retained allocation while guaranteeing at least
+/// `headroom` un-deducted bytes remain available for live transient buffers
+/// (such as non-Linux Unix's open `DIR` stream buffer; `0` when none is live)
+/// (§8; review 12, finding 1).
+fn charge_alloc_with_headroom(
+    budget: &mut ComputeBudget,
+    bytes: usize,
+    headroom: usize,
+) -> Result<(), ResolveError> {
+    let need = bytes.saturating_add(headroom);
+    if budget.remaining_alloc_bytes() < need {
+        budget.charge_alloc(need)?;
+    }
+    budget.charge_alloc(bytes)?;
+    Ok(())
+}
+
 /// Pushes `entry` onto `out`, charging the vector's growth before it
 /// reallocates (the name's own bytes are charged by the caller, before the
 /// name is copied).
 fn push_entry_charged(
     out: &mut Vec<DirEntry>,
     entry: DirEntry,
+    alloc_headroom: usize,
     budget: &mut ComputeBudget,
 ) -> Result<(), ResolveError> {
     if out.len() == out.capacity() {
         let new_cap = out.capacity().saturating_mul(2).max(8);
-        budget.charge_alloc(new_cap.saturating_mul(std::mem::size_of::<DirEntry>()))?;
+        charge_alloc_with_headroom(
+            budget,
+            new_cap.saturating_mul(std::mem::size_of::<DirEntry>()),
+            alloc_headroom,
+        )?;
         out.reserve_exact(new_cap - out.len());
     }
     out.push(entry);
@@ -350,11 +443,23 @@ fn canonicalize_via_proc(
 /// (`rustix::fs::Dir` takes ownership of the single `dir_fd` and does not
 /// implement `AsFd` on the libc backend).
 #[cfg(unix)]
-enum DirStatBase<'a> {
+pub(super) enum DirStatBase<'a> {
     #[cfg(target_os = "linux")]
     Fd(std::os::fd::BorrowedFd<'a>),
     #[cfg(not(target_os = "linux"))]
     Path(&'a [u8]),
+}
+
+/// Maps `fstatat` errors on a `DT_UNKNOWN` entry returned by `readdir` on an
+/// already-open directory. `ENOENT` means the child vanished (or its parent
+/// was renamed) concurrently; never surface `ResolveError::NotFound`, which
+/// callers interpret as the whole directory being absent (review 12).
+#[cfg(unix)]
+fn map_dt_unknown_stat_errno(errno: rustix::io::Errno) -> ResolveError {
+    if errno == rustix::io::Errno::NOENT {
+        return ResolveError::Io(FsIoError::Other);
+    }
+    map_errno(errno, false)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -363,6 +468,7 @@ fn stat_dir_child_by_path(
     name_bytes: &[u8],
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
+    alloc_headroom: usize,
 ) -> Result<FileType, ResolveError> {
     let sep = usize::from(dir_path.last() != Some(&b'/'));
     let full_len = dir_path
@@ -385,7 +491,7 @@ fn stat_dir_child_by_path(
         let cstr = std::ffi::CStr::from_bytes_with_nul(&stack[..=pos])
             .map_err(|_| ResolveError::Io(FsIoError::Other))?;
         let st = rustix::fs::statat(rustix::fs::CWD, cstr, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|e| map_errno(e, false))?;
+            .map_err(map_dt_unknown_stat_errno)?;
         Ok(
             map_rustix_file_type(rustix::fs::FileType::from_raw_mode(st.st_mode))
                 .unwrap_or(FileType::Other),
@@ -394,7 +500,7 @@ fn stat_dir_child_by_path(
         let alloc_len = full_len
             .checked_add(1)
             .ok_or(ResolveError::Io(FsIoError::Other))?;
-        budget.charge_alloc(alloc_len)?;
+        charge_alloc_with_headroom(budget, alloc_len, alloc_headroom)?;
         let mut heap = Vec::with_capacity(alloc_len);
         heap.extend_from_slice(dir_path);
         if sep == 1 {
@@ -405,7 +511,7 @@ fn stat_dir_child_by_path(
         let cstr = std::ffi::CStr::from_bytes_with_nul(&heap)
             .map_err(|_| ResolveError::Io(FsIoError::Other))?;
         let st = rustix::fs::statat(rustix::fs::CWD, cstr, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|e| map_errno(e, false))?;
+            .map_err(map_dt_unknown_stat_errno)?;
         Ok(
             map_rustix_file_type(rustix::fs::FileType::from_raw_mode(st.st_mode))
                 .unwrap_or(FileType::Other),
@@ -416,21 +522,26 @@ fn stat_dir_child_by_path(
 /// Shared per-entry accounting and push for Unix `read_dir` implementations
 /// (Linux `RawDir` and non-Linux Unix `Dir`) so both platforms apply the exact
 /// same charges in the exact same order, always before allocating or stat'ing
-/// (§8; review 9, V1).
+/// (§8; review 9, V1; review 12, findings 1–2).
 #[cfg(unix)]
-fn push_unix_dir_entry(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_unix_dir_entry(
     stat_base: DirStatBase<'_>,
     name_cstr: &std::ffi::CStr,
     raw_file_type: rustix::fs::FileType,
     out: &mut Vec<DirEntry>,
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
+    name_compute_precharged: bool,
+    alloc_headroom: usize,
 ) -> Result<(), ResolveError> {
     let name_bytes = name_cstr.to_bytes();
     if name_bytes == b"." || name_bytes == b".." {
         return Ok(());
     }
-    budget.charge(name_bytes.len().saturating_sub(1) as u64)?;
+    if !name_compute_precharged {
+        budget.charge(name_bytes.len().saturating_sub(1) as u64)?;
+    }
     let file_type = match map_rustix_file_type(raw_file_type) {
         Some(ft) => ft,
         None => {
@@ -444,31 +555,66 @@ fn push_unix_dir_entry(
                         name_cstr,
                         rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
                     )
-                    .map_err(|e| map_errno(e, false))?;
+                    .map_err(map_dt_unknown_stat_errno)?;
                     map_rustix_file_type(rustix::fs::FileType::from_raw_mode(st.st_mode))
                         .unwrap_or(FileType::Other)
                 }
                 #[cfg(not(target_os = "linux"))]
                 DirStatBase::Path(dir_path) => {
-                    stat_dir_child_by_path(dir_path, name_bytes, caps, budget)?
+                    stat_dir_child_by_path(dir_path, name_bytes, caps, budget, alloc_headroom)?
                 }
             }
         }
     };
-    budget.charge_alloc(name_bytes.len())?;
+    charge_alloc_with_headroom(budget, name_bytes.len(), alloc_headroom)?;
     let mut name = Vec::with_capacity(name_bytes.len());
     name.extend_from_slice(name_bytes);
-    push_entry_charged(out, DirEntry { name, file_type }, budget)
+    push_entry_charged(out, DirEntry { name, file_type }, alloc_headroom, budget)
 }
 
 /// Shared Unix `read_dir` implementation with zero-cost hooks so tests can
-/// deterministically observe open fds during iteration and exercise a directory
-/// removed between `open` and reading (§8; review 11).
+/// deterministically observe open fds during iteration, verify pre-`next()`
+/// peak checks, and exercise a directory removed between `open` and reading
+/// (§8; review 11; review 12).
 #[cfg(unix)]
 pub(super) fn read_dir_unix_with_hooks(
     path: &[u8],
     caps: &mut FsCaps,
     budget: &mut ComputeBudget,
+    after_open: impl FnMut(),
+    on_iter: impl FnMut(),
+) -> Result<Vec<DirEntry>, ResolveError> {
+    read_dir_unix_impl(path, caps, budget, None, after_open, on_iter)
+}
+
+/// Non-Linux Unix `read_dir` hook entry point allowing tests to inject a
+/// synthetic `st_blksize` (large volumes, negative or absurd values) through
+/// the real `open` + `charge_dir_stream` + `Dir::new` path (review 12).
+#[cfg(all(test, unix, not(target_os = "linux")))]
+pub(super) fn read_dir_unix_with_blksize_override(
+    path: &[u8],
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    blksize_override: i64,
+    after_open: impl FnMut(),
+    on_iter: impl FnMut(),
+) -> Result<Vec<DirEntry>, ResolveError> {
+    read_dir_unix_impl(
+        path,
+        caps,
+        budget,
+        Some(blksize_override),
+        after_open,
+        on_iter,
+    )
+}
+
+#[cfg(unix)]
+fn read_dir_unix_impl(
+    path: &[u8],
+    caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    blksize_override: Option<i64>,
     mut after_open: impl FnMut(),
     mut on_iter: impl FnMut(),
 ) -> Result<Vec<DirEntry>, ResolveError> {
@@ -491,9 +637,10 @@ pub(super) fn read_dir_unix_with_hooks(
     {
         use std::os::fd::AsFd;
 
-        // Charge `DIR_STREAM_ALLOC` as a uniform per-listing floor so ordinary
-        // directories (`st_blksize <= 4,096`) deduct the exact same allocation
-        // total on Linux and non-Linux Unix (§8; review 10, finding 1).
+        let _ = blksize_override;
+        // Charge `DIR_STREAM_ALLOC` as a uniform per-listing deduction so
+        // every directory deducts the exact same allocation total on Linux and
+        // non-Linux Unix (§8; review 10, finding 1; review 12, finding 1).
         budget.charge_alloc(DIR_STREAM_ALLOC)?;
         let mut stack_buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
         let mut raw_dir = rustix::fs::RawDir::new(&dir_fd, &mut stack_buf);
@@ -513,6 +660,8 @@ pub(super) fn read_dir_unix_with_hooks(
                 &mut out,
                 caps,
                 budget,
+                false,
+                0,
             )?;
         }
     }
@@ -521,17 +670,22 @@ pub(super) fn read_dir_unix_with_hooks(
     {
         // Query `st_blksize` on the open directory fd BEFORE constructing the
         // libc `DIR` stream: Darwin / BSD `fdopendir` can size `dd_buf` from
-        // `st_blksize` (unbounded by 4,096 on NFS, SMB, or FUSE). This single
-        // `fstat` on the already-open fd mirrors `fdopendir`'s own internal
-        // `fstat` and is bounded 1:1 by `DirOpens` (matching
-        // `canonicalize_via_proc`, review 9 finding 1).
+        // `st_blksize` or a page-size/buffer floor. This single `fstat` on the
+        // already-open fd mirrors `fdopendir`'s own internal `fstat` and is
+        // bounded 1:1 by `DirOpens` (matching `canonicalize_via_proc`,
+        // review 9 finding 1). `charge_dir_stream` checks the real transient
+        // peak without permanently deducting it and deducts only
+        // `DIR_STREAM_ALLOC` (matching Linux on every volume; review 12
+        // finding 1).
         budget.charge(1)?;
-        let st = rustix::fs::fstat(&dir_fd).map_err(|e| map_errno(e, false))?;
-        let Ok(blksize) = usize::try_from(st.st_blksize) else {
-            return Err(ResolveError::Io(FsIoError::Other));
+        let stream_extra = match blksize_override {
+            Some(raw) => charge_dir_stream(raw, budget)?,
+            None => {
+                let st = rustix::fs::fstat(&dir_fd).map_err(|e| map_errno(e, false))?;
+                charge_dir_stream(st.st_blksize, budget)?
+            }
         };
-        let stream_alloc = dir_stream_alloc_for_blksize(blksize);
-        budget.charge_alloc(stream_alloc)?;
+        let iter_alloc_peak = stream_extra.saturating_add(NAME_ALLOC_PEAK);
 
         // Hand ownership of the single `dir_fd` directly to `Dir::new`
         // (`fdopendir`): no second `openat(fd, ".")` and no extra duplicated
@@ -540,13 +694,19 @@ pub(super) fn read_dir_unix_with_hooks(
         let mut dir = rustix::fs::Dir::new(dir_fd).map_err(|e| map_errno(e, false))?;
         let mut name_buf = [0u8; MAX_D_NAME_BUF];
         loop {
-            // Charge entry read and work, and verify `NAME_ALLOC_PEAK` headroom
-            // for `rustix::fs::Dir::read`'s transient `CString`, BEFORE
-            // advancing `dir.next()` (§8; review 11, finding 1).
+            // Charge entry read and work, and verify both allocation headroom
+            // (`stream_extra + NAME_ALLOC_PEAK`) and compute headroom
+            // (`NAME_COMPUTE_PEAK`) BEFORE advancing `dir.next()`, so
+            // `rustix::fs::Dir::read` can neither allocate its transient
+            // `CString` nor copy a `d_name` past the remaining budget (§8;
+            // review 11, finding 1; review 12, finding 2).
             caps.charge_entries_read(1)?;
             budget.charge(1)?;
-            if budget.remaining_alloc_bytes() < NAME_ALLOC_PEAK {
-                budget.charge_alloc(NAME_ALLOC_PEAK)?;
+            if budget.remaining_alloc_bytes() < iter_alloc_peak {
+                budget.charge_alloc(iter_alloc_peak)?;
+            }
+            if budget.remaining_units() < NAME_COMPUTE_PEAK {
+                budget.charge(NAME_COMPUTE_PEAK)?;
             }
             on_iter();
             let Some(entry_res) = dir.next() else {
@@ -554,14 +714,23 @@ pub(super) fn read_dir_unix_with_hooks(
             };
             let entry = entry_res.map_err(|e| map_errno(e, false))?;
             let ft = entry.file_type();
+            let name_bytes = entry.file_name().to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            // Charge the entry name's compute BEFORE copying into `name_buf`
+            // (and pass `name_compute_precharged = true` so
+            // `push_unix_dir_entry` does not double-charge it; §8; review 12,
+            // finding 2).
+            budget.charge(name_bytes.len().saturating_sub(1) as u64)?;
             let raw_with_nul = entry.file_name().to_bytes_with_nul();
             if raw_with_nul.len() <= name_buf.len() {
                 let len = raw_with_nul.len();
                 name_buf[..len].copy_from_slice(raw_with_nul);
                 // Drop `entry` (freeing its transient `CString`) before
                 // `push_unix_dir_entry` allocates retained `Vec<u8>` and
-                // `Vec<DirEntry>` storage, so transient and retained buffers
-                // are never live simultaneously.
+                // `Vec<DirEntry>` storage, so transient and retained name
+                // buffers are never live simultaneously.
                 drop(entry);
                 let name_cstr = std::ffi::CStr::from_bytes_with_nul(&name_buf[..len])
                     .map_err(|_| ResolveError::Io(FsIoError::Other))?;
@@ -572,6 +741,8 @@ pub(super) fn read_dir_unix_with_hooks(
                     &mut out,
                     caps,
                     budget,
+                    true,
+                    stream_extra,
                 )?;
             } else {
                 push_unix_dir_entry(
@@ -581,6 +752,8 @@ pub(super) fn read_dir_unix_with_hooks(
                     &mut out,
                     caps,
                     budget,
+                    true,
+                    stream_extra.saturating_add(raw_with_nul.len()),
                 )?;
             }
         }
@@ -742,6 +915,7 @@ impl PathResolver for FsResolver {
                         name: name_bytes.to_vec(),
                         file_type: map_file_type(ft),
                     },
+                    0,
                     budget,
                 )?;
             }
