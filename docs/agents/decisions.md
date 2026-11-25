@@ -1101,3 +1101,7 @@ D-141 removed flag arities from these rows precisely to avoid this.
 - **The orchestrator's single verification of round 5, on macOS, in the worktree's own `target/` (D-123):** fmt and workspace clippy clean; `check-protocol-ts` up to date; **925 passed, 0 failed, 7 ignored**; app typecheck clean; **373 vitest** passed.
 - **Linux is owed for the M1 gate.** P3 is not wired into `SessionGate`; P5 (M1-41) does that.
 
+## D-166 — 2026-11-24 — Pedro: open and start M1-43 (N17)
+**Decided by Pedro (driver).** N17, the `atrium-host` `supervise.rs` `kill_recorded_returns_verified_when_gone_leader_group_drains_within_timeout` flake under load, gets its own task: M1-43-n17-supervise-drain-flake (`briefs/M1-43-n17-supervise-drain-flake.md`). Neon `medium` writes it, and Sonnet 5.5 reviews it (D-158, D-162).
+- **What M1-43 must do:** find the cause first, then make the test deterministic. It must not raise `GROUP_DRAIN_TIMEOUT`, loosen the assertion or add retries. Product code changes only if the code itself is wrong.
+
