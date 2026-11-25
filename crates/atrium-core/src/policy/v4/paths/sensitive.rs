@@ -2682,8 +2682,17 @@ impl Collector<'_> {
     /// home's own components count too (round-3 finding 4); then the
     /// configured spelling itself, for equivalences the listings don't show.
     /// A folder on the way that cannot be listed may hide spellings whose
-    /// identity is unknown: an `AnyTarget` gap (D-145 rule 4), and the
-    /// configured spelling is still tried there.
+    /// identity is unknown, and the configured spelling is still tried there.
+    /// An unreadable folder is an `AnyTarget` gap (D-145 rule 4). A folder
+    /// that is readable but larger than the listing cap is a gap scoped to
+    /// the targets spelled through it (`Through(folder)`): the size of a
+    /// folder is not something a line controls (§2), and an open-ended gap
+    /// there would make every write Unread (P5 review 1, finding 1).
+    ///
+    /// Each discovery listing has its own filesystem caps (P5 review 1,
+    /// finding 1): a huge ancestor (a build folder holding the executable,
+    /// say) fails only its own listing, and never uses up the builder's caps
+    /// for every root after it.
     fn folded_spellings(
         &mut self,
         abs: &[u8],
@@ -2697,7 +2706,8 @@ impl Collector<'_> {
             let comp_folded = fold_listed_component(comp, self.folds, budget)?;
             let mut next: Vec<Vec<u8>> = Vec::new();
             for dir in &frontier {
-                let listing = self.list_dir(dir, caps, budget)?;
+                let mut listing_caps = FsCaps::with_default_limits();
+                let listing = self.list_dir(dir, &mut listing_caps, budget)?;
                 let names: Vec<&[u8]> = match &listing {
                     Listing::Entries(entries) => {
                         budget.charge(2 * entries.len() as u64 + 1)?;
@@ -2712,7 +2722,16 @@ impl Collector<'_> {
                     }
                     Listing::Absent => continue,
                     Listing::Failed(reason) => {
-                        self.gap(reason.clone(), GapScope::AnyTarget, write_only, budget)?;
+                        let scope = if matches!(reason, UnreadReason::WalkCapReached(_)) {
+                            match self.resolver.stat(dir, caps, budget) {
+                                Ok(m) => root_scope(m.identity),
+                                Err(ResolveError::Exhausted(e)) => return Err(e),
+                                Err(_) => GapScope::AnyTarget,
+                            }
+                        } else {
+                            GapScope::AnyTarget
+                        };
+                        self.gap(reason.clone(), scope, write_only, budget)?;
                         vec![comp]
                     }
                 };
