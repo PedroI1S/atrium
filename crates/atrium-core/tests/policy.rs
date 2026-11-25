@@ -358,7 +358,8 @@ fn hard_deny_table() {
         ("rg --hostname-bin x y sub", Ask),
         ("rg -f p sub", Ask),
         ("rg --file p sub", Ask),
-        ("rg -L token sub", Ask),
+        // rev 4 §10 row 15, §11 item 15, D-139: `rg -L` with no protected link is Allow in Home.
+        ("rg -L token sub", Allow),
         ("git branch -D x", Ask),
         ("git branch newbranch", Ask),
         ("git diff --output=f", Ask),
@@ -551,22 +552,34 @@ fn compound_command_allowed_only_if_every_segment_is() {
             "b",
         ),
     ];
+    // rev 4 §5, §11 item 6, §11 item 10: `cargo fmt` and `cargo test` are
+    // possible writers, so units after a possible writer or sharing a pipeline
+    // with one become Unread -> Ask under prefix rules.
     assert_eq!(
         classify(&env.cmd_rules("cargo fmt && cargo test", &rules)),
-        Allow
+        Ask
     );
     assert_eq!(
         classify(&env.cmd_rules("cargo fmt; cargo test | cat", &rules)),
-        Allow
+        Ask
     );
     assert_eq!(classify(&env.cmd_rules("cargo fmt && rm x", &rules)), Ask);
     assert_eq!(
         classify(&env.cmd_rules("cargo fmt || cargo build", &rules)),
         Ask
     );
-    // Home's own read-only list covers the segments the rules don't
+    // `cargo fmt` is a possible writer, so `git status` after it is Unread (§5, §11 item 6).
     assert_eq!(
         classify(&env.cmd_rules("cargo fmt && git status", &rules)),
+        Ask
+    );
+    // Non-writing compound lines stay Allow when every segment is covered or Home read-only.
+    assert_eq!(
+        classify(&env.cmd_rules("cat a && git status", &rules)),
+        Allow
+    );
+    assert_eq!(
+        classify(&env.cmd_rules("ls; cat a | head -5", &rules)),
         Allow
     );
     // a deny rule on any segment denies the whole line
@@ -771,17 +784,22 @@ fn newline_separates_commands() {
 
 #[test]
 fn parse_fills_assignments_and_redirects() {
+    // rev 4 §3: leading `NAME=value` assignments are outside the closed command model.
+    assert!(matches!(
+        parse_command(
+            "A=1 B='x y' cmd arg 2>&1 >out.txt <in >>log 2>/dev/null",
+            Path::new(HOME),
+        ),
+        ParsedCommand::Unparseable { .. }
+    ));
     let ParsedCommand::Segments(s) = parse_command(
-        "A=1 B='x y' cmd arg 2>&1 >out.txt <in >>log 2>/dev/null",
+        "cmd arg 2>&1 >out.txt <in >>log 2>/dev/null",
         Path::new(HOME),
     ) else {
         panic!()
     };
     let seg = &s[0];
-    assert_eq!(
-        seg.assignments,
-        [("A".into(), "1".into()), ("B".into(), "x y".into())]
-    );
+    assert!(seg.assignments.is_empty());
     assert_eq!(seg.argv, ["cmd", "arg"]);
     let ops: Vec<(u32, RedirectOp, &str)> = seg
         .redirects
@@ -804,22 +822,23 @@ fn parse_fills_assignments_and_redirects() {
             && !seg.redirects[2].harmless()
             && !seg.redirects[3].harmless()
     );
-    // quoting
+    // quoting within §3's closed model (`\*` outside quotes is modeled; `\ ` is outside §3)
     let ParsedCommand::Segments(s) =
-        parse_command(r#"echo "a  b" 'c d' e\ f "q\"r""#, Path::new(HOME))
+        parse_command(r#"echo "a  b" 'c d' e\*f "q\"r""#, Path::new(HOME))
     else {
         panic!()
     };
-    assert_eq!(s[0].argv, ["echo", "a  b", "c d", "e f", "q\"r"]);
-    // `&>` and `>&file` write
-    let ParsedCommand::Segments(s) = parse_command("ls &> a >& b", Path::new(HOME)) else {
-        panic!()
-    };
-    assert!(
-        s[0].redirects
-            .iter()
-            .all(|r| r.op == RedirectOp::Write && !r.harmless())
-    );
+    assert_eq!(s[0].argv, ["echo", "a  b", "c d", "e*f", "q\"r"]);
+    // rev 4 §3: unquoted backslash before space is outside the model.
+    assert!(matches!(
+        parse_command(r"echo e\ f", Path::new(HOME)),
+        ParsedCommand::Unparseable { .. }
+    ));
+    // rev 4 §3, §11 item 10: `&>` and `>&file` are outside the closed model.
+    assert!(matches!(
+        parse_command("ls &> a >& b", Path::new(HOME)),
+        ParsedCommand::Unparseable { .. }
+    ));
 }
 
 #[test]
@@ -836,12 +855,23 @@ fn path_rules_resolve_symlinks_and_relative_paths() {
         "cat sshdir/id_ed25519",
         "cat ./sshdir/../sshdir/id_ed25519",
         "dd if=link",
-        "VAR=link cat $VAR",
         "cat dangling",
         "cat -- link",
     ] {
         let d = block_on(gate.gate.check(&cmd_check(line)));
         assert!(matches!(d, GateDecision::Deny { .. }), "{line}: {d:?}");
+    }
+    // rev 4 §2, §3, §11 item 1–2: leading assignment + `$VAR` is Unread (not
+    // resolved on disk through best-effort), so Home asks with Unread notice.
+    match block_on(gate.gate.check(&cmd_check("VAR=link cat $VAR"))) {
+        GateDecision::Ask { ticket } => {
+            assert_eq!(
+                ticket.unread,
+                Some(atrium_protocol::agent::UnreadNotice::Unread)
+            );
+            assert!(!ticket.rememberable);
+        }
+        other => panic!("VAR=link cat $VAR: expected Ask(Unread), got {other:?}"),
     }
     // a Paths subject
     for p in ["link", "sshdir/id_ed25519", "./nope/../link"] {
@@ -2264,11 +2294,10 @@ fn engine_never_panics_on_garbage() {
         "too slow: {:?}",
         started.elapsed()
     );
-    // past the caps the answer is a Deny, not an Ask
-    assert!(matches!(
-        env.cmd_any(&hostile[2]),
-        PolicyVerdict::Deny { .. }
-    ));
+    // rev 4 §3, §8, §12 (N11): `{a,b}` x 2000 is under MAX_BYTES/MAX_UNITS
+    // and bounded brace expansion caps at 256 without setting TooLarge -> Ask.
+    assert_eq!(env.cmd_any(&hostile[2]), PolicyVerdict::Ask);
+    // past MAX_UNITS the answer is still TooLarge -> Deny (§1, §8, §10 row 20)
     assert!(matches!(
         env.cmd_any(&hostile[3]),
         PolicyVerdict::Deny { .. }
@@ -2291,15 +2320,17 @@ fn review_round1_table() {
         ("ls \u{85}", Ask),
         ("ls \u{2028}", Ask),
         ("ls \u{2029}", Ask),
-        ("ls \r", Allow),
+        // rev 4 §3, §11 item 2: unquoted `\r` is outside §3's closed byte set -> Unread (Ask).
+        ("ls \r", Ask),
         // 3, 4, 13
         ("date -uf.npmrc", Hard(CR)),
         ("date -uf.netrc", Hard(CR)),
         ("date -uf.kube/config", Hard(CR)),
         ("date -f x", Ask),
         ("date --file=x", Ask),
-        ("cat -\u{e9}", Allow),
-        ("ls -\u{e9}\u{65e5}\u{672c}", Allow),
+        // rev 4 §3, §10 row 10, §11 item 2: unquoted non-ASCII bytes are Unread -> Ask.
+        ("cat -\u{e9}", Ask),
+        ("ls -\u{e9}\u{65e5}\u{672c}", Ask),
         ("cat -\u{e9}f.npmrc", Hard(CR)),
         // 6
         ("git push --force-w origin main", Hard(FP)),
@@ -2338,10 +2369,12 @@ fn review_round1_table() {
         ("cp /dev/zero /dev/disk2", Hard(DW)),
         ("cat x | tee /dev/disk1", Hard(DW)),
         ("dd if=/dev/disk2 of=x", Ask),
-        // 8
-        ("grep -R BEGIN sub", Ask),
-        ("grep -rR BEGIN sub", Ask),
-        ("grep --dereference-recursive x sub", Ask),
+        // 8 — rev 4 §10 row 15, §11 item 15, D-139: followed-link searches with
+        // no link to a protected path are Allow in Home; `--deref` abbreviation is
+        // unlisted (`UnknownFlag` -> Ask).
+        ("grep -R BEGIN sub", Allow),
+        ("grep -rR BEGIN sub", Allow),
+        ("grep --dereference-recursive x sub", Allow),
         ("grep --deref x sub", Ask),
         ("grep -r BEGIN sub", Allow),
         // 10
@@ -2371,9 +2404,34 @@ fn macos_path_aliases_and_hard_links_reach_nothing() {
         let d = block_on(g.gate.check(&c));
         assert!(matches!(d, GateDecision::Deny { .. }), "{p}: {d:?}");
     };
-    denied("cat /.vol/16777229/30744292");
-    denied_read("/.vol/16777229/30744293");
-    denied_read("/.vol");
+    // rev 4 §3, §5, §11 item 14: `/.vol` paths are Unread(ProcessDependentPath)
+    // -> Ask with UnreadNotice::Unread and rememberable == false.
+    let ask_unread = |c: &ToolCheck, label: &str| match block_on(g.gate.check(c)) {
+        GateDecision::Ask { ticket } => {
+            assert_eq!(
+                ticket.unread,
+                Some(atrium_protocol::agent::UnreadNotice::Unread),
+                "{label}"
+            );
+            assert!(!ticket.rememberable, "{label}");
+        }
+        other => panic!("{label}: expected Ask(Unread), got {other:?}"),
+    };
+    ask_unread(&cmd_check("cat /.vol/16777229/30744292"), "cat /.vol/...");
+    ask_unread(
+        &paths_check(
+            ToolKind::Read,
+            "Read",
+            &["/.vol/16777229/30744293"],
+            false,
+            None,
+        ),
+        "Read /.vol/...",
+    );
+    ask_unread(
+        &paths_check(ToolKind::Read, "Read", &["/.vol"], false, None),
+        "Read /.vol",
+    );
     denied_read(&format!("/System/Volumes/Data{h}/.npmrc"));
     denied(&format!("cat /System/Volumes/Data{h}/Documents/../.npmrc"));
     denied(&format!("head /System/Volumes/Data{h}/.ssh/id_ed25519"));
@@ -2394,17 +2452,22 @@ fn macos_path_aliases_and_hard_links_reach_nothing() {
 fn multibyte_flags_and_oversized_calls_through_the_gate() {
     let t = Tmp::new();
     let g = t.gate(Preset::Home, vec![]);
+    // rev 4 §3, §10 row 10, §11 item 2: unquoted non-ASCII bytes are Unread -> Ask.
     for line in ["cat -\u{e9}", "ls -\u{e9}", "cat -\u{65e5}x"] {
-        assert_eq!(
-            block_on(g.gate.check(&cmd_check(line))),
-            GateDecision::Allow,
+        assert!(
+            matches!(
+                block_on(g.gate.check(&cmd_check(line))),
+                GateDecision::Ask { .. }
+            ),
             "{line}"
         );
     }
+    // rev 4 §3, §8, §12 (N11): `{a,b}` x 5000 is under MAX_BYTES/MAX_UNITS;
+    // bounded brace expansion stops at 256 without TooLarge -> Ask(Unread).
     let big = format!("ls {}", "{a,b}".repeat(5_000));
     assert!(matches!(
         block_on(g.gate.check(&cmd_check(&big))),
-        GateDecision::Deny { .. }
+        GateDecision::Ask { .. }
     ));
     let cds = format!("{}cd $X; cat f", "cd /tmp; ".repeat(2_000));
     assert!(matches!(
@@ -2459,12 +2522,16 @@ fn review_round2_table() {
     let env = Env::home();
     let long_cluster = format!("ssh -{}i.ssh/id_ed25519 host", "v".repeat(70));
     let table: Vec<(&str, Want)> = vec![
-        // c: reading what D-050 allows, and running/inspecting Atrium, isn't a write
-        ("ssh -F ~/.ssh/config host", Ask),
-        ("ssh-keygen -lf ~/.ssh/authorized_keys", Ask),
+        // c: rev 4 D-141, D-157: `ssh`, `ssh-keygen`, `open`, `codesign` are
+        // UNKNOWN_BY_DESIGN (`ReadWrite` operand access), so operands targeting
+        // write-only protected paths (`~/.ssh/config`, `~/.ssh/authorized_keys`,
+        // `/Applications/Atrium.app`) are HardDeny; `git diff` (HomeReadOnly)
+        // and executing `/Applications/Atrium.app/...` (Command word) keep their verdicts.
+        ("ssh -F ~/.ssh/config host", Hard(CR)),
+        ("ssh-keygen -lf ~/.ssh/authorized_keys", Hard(CR)),
         ("git diff --no-index ~/.ssh/config x", Allow),
-        ("open /Applications/Atrium.app", Ask),
-        ("codesign -dv /Applications/Atrium.app", Ask),
+        ("open /Applications/Atrium.app", Hard(AS)),
+        ("codesign -dv /Applications/Atrium.app", Hard(AS)),
         (
             "/Applications/Atrium.app/Contents/MacOS/atrium --version",
             Ask,
@@ -2475,7 +2542,7 @@ fn review_round2_table() {
             Hard(AS),
         ),
         ("ssh -vvvi.ssh/id_ed25519 host", Hard(CR)),
-        // d: write forms of the "readers"
+        // d: write forms of the "readers" (and D-141, D-157 unknown-tool ReadWrite for `sort`/`find`)
         ("sort -o ~/.config/atrium/config.toml x", Hard(AS)),
         ("sort --output=~/.config/atrium/config.toml x", Hard(AS)),
         ("uniq x ~/.config/atrium/config.toml", Hard(AS)),
@@ -2484,8 +2551,8 @@ fn review_round2_table() {
         ("sed -n 'w /h/u/.config/atrium/config.toml' x", Hard(AS)),
         ("xxd -r x ~/.config/atrium/config.toml", Hard(AS)),
         ("tree -o ~/.config/atrium/config.toml", Hard(AS)),
-        ("sort ~/.config/atrium/config.toml", Ask),
-        ("find ~/.config/atrium -name x", Ask),
+        ("sort ~/.config/atrium/config.toml", Hard(AS)),
+        ("find ~/.config/atrium -name x", Hard(AS)),
         // f: bodies fed to a shell with an argument or option value
         ("bash /dev/stdin <<EOF\nrm -rf ~\nEOF", Hard(RD)),
         ("bash /dev/stdin <<< 'rm -rf ~'", Hard(RD)),
@@ -2639,8 +2706,10 @@ fn review_round3_table() {
             Hard(AS),
         ),
         ("codesign -dvf -s - /Applications/Atrium.app", Hard(AS)),
-        ("codesign -dv /Applications/Atrium.app", Ask),
-        ("awk '{print}' ~/.config/atrium/config.toml", Ask),
+        // rev 4 D-141, D-156, D-157: `codesign` (UNKNOWN_BY_DESIGN) and `awk`
+        // (CodeRunner) keep conservative `ReadWrite` operand access.
+        ("codesign -dv /Applications/Atrium.app", Hard(AS)),
+        ("awk '{print}' ~/.config/atrium/config.toml", Hard(AS)),
     ];
     run_table(&env, &table);
 }
@@ -2708,7 +2777,8 @@ fn review_round4_table() {
             "gawk --include=inplace '{print}' ~/.config/atrium/config.toml",
             Hard(AS),
         ),
-        ("awk '{print}' ~/.config/atrium/config.toml", Ask),
+        // rev 4 D-141, D-156, D-157: `awk` keeps conservative `ReadWrite` operand access.
+        ("awk '{print}' ~/.config/atrium/config.toml", Hard(AS)),
     ];
     run_table(&env, &table);
 }

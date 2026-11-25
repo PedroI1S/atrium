@@ -33,8 +33,7 @@ use crate::policy::v4::units::build_units;
 use crate::{PolicyInput, PolicyVerdict};
 
 use best_effort::{
-    BestEffortOptions, check_search_glob_best_effort, is_home_readonly_tool, raw_text_checks,
-    run_best_effort_into,
+    BestEffortOptions, check_search_glob_best_effort, is_home_readonly_tool, run_best_effort_into,
 };
 
 /// Runs the §2 best-effort pass over raw text, tolerant-lexer units (including
@@ -615,6 +614,25 @@ fn evaluate_command(
         }
     }
 
+    // 3b. Resolve `key=value` / `--flag=value` RHS path operands on modeled
+    //     units (e.g. `dd if=link`, `cat --file=link`) so symlinks to hard-deny
+    //     targets behind `=` are caught on disk; only `HardDenyHit` is promoted
+    //     so ordinary non-path flag values (`--color=auto`) never emit Unread.
+    if !budget.is_exhausted() && !parsed.units.is_empty() {
+        if let Err(e) = resolve_kv_hard_deny_aliases(
+            &parsed.units,
+            &effects,
+            &effective_start_cwd,
+            protected,
+            resolver,
+            fs_caps,
+            budget,
+            &mut outcome.parts,
+        ) {
+            record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
+        }
+    }
+
     // 4. §2 best-effort pass over raw text and tolerant-lexer units.
     if !budget.is_exhausted() {
         let opts = BestEffortOptions {
@@ -692,6 +710,141 @@ fn evaluate_command(
         outcome: std::mem::take(outcome),
         remember_matcher: remember,
     }
+}
+
+fn resolve_kv_hard_deny_aliases(
+    units: &[CommandUnit],
+    effects: &[ToolEffects],
+    start_cwd: &[u8],
+    protected: &ProtectedSet,
+    resolver: &dyn PathResolver,
+    fs_caps: &mut FsCaps,
+    budget: &mut ComputeBudget,
+    outcomes: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
+    let mut cur_cwd = start_cwd.to_vec();
+    let mut cwd_known = true;
+    for (idx, u) in units.iter().enumerate() {
+        let eff = effects.get(idx);
+        if eff.and_then(|e| e.tool_name) == Some("cd") {
+            // Update tracked cwd for simple `cd DIR`; otherwise stop tracking.
+            if let Some(cd_idx) = eff.and_then(|e| e.cd_target_operand)
+                && let Some(w) = u.argv.get(cd_idx)
+                && cwd_known
+            {
+                let t = resolve_literal(
+                    w.literal_bytes(),
+                    &cur_cwd,
+                    &protected.home,
+                    TargetOrigin::Operand {
+                        unit: u.index,
+                        argv_index: cd_idx,
+                    },
+                    AccessMode::Read,
+                    resolver,
+                    fs_caps,
+                    budget,
+                )?;
+                if let TargetResolution::Resolved { canonical, .. } = t.resolution {
+                    cur_cwd = canonical;
+                } else {
+                    cwd_known = false;
+                }
+            } else {
+                cwd_known = false;
+            }
+            continue;
+        }
+        if !cwd_known {
+            continue;
+        }
+        for (argv_index, w) in u.argv.iter().enumerate().skip(1) {
+            let role = eff
+                .and_then(|e| e.roles.get(argv_index))
+                .copied()
+                .unwrap_or(OperandRole::Path);
+            if !matches!(
+                role,
+                OperandRole::Path
+                    | OperandRole::DestinationRoot
+                    | OperandRole::ProgramFile
+                    | OperandRole::FlagValue(
+                        crate::policy::model::ValueRole::Path
+                            | crate::policy::model::ValueRole::DestinationRoot
+                            | crate::policy::model::ValueRole::ProgramFile
+                    )
+            ) {
+                continue;
+            }
+            let bytes = w.literal_bytes();
+            let Some(eq) = bytes.iter().position(|&b| b == b'=') else {
+                continue;
+            };
+            let key = &bytes[..eq];
+            let val = &bytes[eq + 1..];
+            if key.is_empty() || val.is_empty() {
+                continue;
+            }
+            let Ok(val_str) = std::str::from_utf8(val) else {
+                continue;
+            };
+            let access = if key == b"of" {
+                AccessMode::Write
+            } else {
+                eff.and_then(|e| e.operand_access.get(argv_index))
+                    .copied()
+                    .unwrap_or(AccessMode::ReadWrite)
+            };
+            // Resolve RHS relative to `cur_cwd` by building a local view of `protected`
+            // with `cwd = cur_cwd` only when `cur_cwd != protected.cwd`.
+            let local_prot;
+            let prot_ref = if cur_cwd == protected.cwd {
+                protected
+            } else {
+                local_prot = ProtectedSet {
+                    home: protected.home.clone(),
+                    cwd: cur_cwd.clone(),
+                    atrium_data_paths: protected.atrium_data_paths.clone(),
+                    atrium_protected_paths: protected.atrium_protected_paths.clone(),
+                    hard_deny_identities: protected.hard_deny_identities.clone(),
+                    write_only_hard_deny_identities: protected
+                        .write_only_hard_deny_identities
+                        .clone(),
+                    identity_gaps: protected.identity_gaps.clone(),
+                    store_identities: protected.store_identities.clone(),
+                    ssh_linked_dirs: protected.ssh_linked_dirs.clone(),
+                    folds: protected.folds,
+                };
+                &local_prot
+            };
+            let res = resolve_subject_paths(
+                &[val_str.to_owned()],
+                None,
+                false,
+                access,
+                prot_ref,
+                resolver,
+                fs_caps,
+                budget,
+            )?;
+            for pr in res.outcomes {
+                if matches!(pr.outcome, PartOutcome::HardDenyHit(_)) {
+                    push_charged(
+                        outcomes,
+                        PartResult {
+                            part: PartId::Operand {
+                                unit: u.index,
+                                argv_index,
+                            },
+                            outcome: pr.outcome,
+                        },
+                        budget,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_command_cwd_override(
@@ -1182,20 +1335,6 @@ fn evaluate_mcp(
     };
 
     let mut targets: Vec<Target> = Vec::new();
-    if !budget.is_exhausted() {
-        match SharedSensitive::for_protected_budgeted(protected, budget) {
-            Ok(shared) => {
-                for &s in &strings {
-                    if let Err(e) = raw_text_checks(s, &shared, folds, budget, &mut outcome.parts) {
-                        record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
-                        break;
-                    }
-                }
-            }
-            Err(e) => record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason),
-        }
-    }
-
     if !budget.is_exhausted() {
         let path_candidates: Vec<String> = strings
             .iter()
