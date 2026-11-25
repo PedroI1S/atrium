@@ -1125,3 +1125,8 @@ D-141 removed flag arities from these rows precisely to avoid this.
   - Each review runs in the task's worktree, with `AGENT_RUN_LOG=<task>-review<N>` so the worker's logs aren't overwritten.
   - The prompt makes the reviewer read-only, and its final message is the review. The agy policy hook still applies.
 - **Tooling:** `scripts/agent-run` gains the optional `AGENT_RUN_LOG`.
+
+## D-170 — 2026-11-24 — Pedro: start M1-44 when Neon's quota is back; review fallback
+**Decided by Pedro (driver).**
+- **M1-44 (N18) has its go.** It starts together with P2 round 13 and M1-43 round 2, when the agy Gemini quota resets (about 02:03). That replaces D-167's "start later".
+- **Review fallback.** If agy's Claude (Sonnet) usage runs out, the Sonnet reviews (D-162, D-169) run on Pedro's Claude plan as read-only Claude Code subagents (`model: sonnet`), as they did before D-169.
