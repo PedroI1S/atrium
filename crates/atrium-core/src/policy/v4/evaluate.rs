@@ -33,8 +33,7 @@ use crate::policy::v4::units::{UnitReasonSink, build_units_with_hook};
 use crate::{PolicyInput, PolicyVerdict};
 
 use best_effort::{
-    BestEffortOptions, check_search_glob_best_effort, is_home_readonly_tool, raw_text_checks,
-    run_best_effort_into,
+    BestEffortOptions, check_search_glob_best_effort, raw_text_checks, run_best_effort_into,
 };
 
 /// Runs the §2 best-effort pass over raw text, tolerant-lexer units (including
@@ -599,39 +598,9 @@ fn evaluate_command(
                     eff = modeled_nested_shell_effects(u, eff.tool_name.unwrap_or("sh"));
                 }
 
-                // Wiring (CR logged in handoff): P0's `HomeReadOnly` leaves
-                // `operand_access = ReadWrite` while P2 treats `ReadWrite` as
-                // `writes = true`, which would falsely HardDeny `cat ~/.ssh/config`,
-                // `ls ~/.ssh`, and `cat ~/.config/atrium/config.toml`. When a
-                // `HomeReadOnly` tool has no write flags (i.e. writes is due at
-                // most to a redirect, which has its own `AccessMode::Write`),
-                // downgrade operand access to `Read`.
-                let redirect_writes = u
-                    .redirects
-                    .iter()
-                    .any(ModelRedirect::writes_outside_dev_null);
-                let tool_only_reads = if !eff.writes {
-                    true
-                } else if redirect_writes {
-                    match home_ro_tool_reads_only_without_redirects(u, &eff, budget) {
-                        Ok(ro) => ro,
-                        Err(e) => {
-                            record_exhausted(&mut outcome.parts, PartId::Unit(u.index), e.reason);
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                if tool_only_reads
-                    && eff
-                        .tool_name
-                        .is_some_and(|n| is_home_readonly_tool(n, eff.subcommand))
-                {
-                    for a in eff.operand_access.iter_mut().skip(1) {
-                        *a = AccessMode::Read;
-                    }
-                }
+                // CR-P5-1 is closed in P3's `classify_home_readonly` (D-176
+                // item 4): a read-only row with no forbidden flag already has
+                // `Read` operand access.
 
                 // Push unit-level Unread reasons from P3 (avoiding duplicate
                 // reasons already pushed by P1 or by the `CodeRunnerHook`).
@@ -1016,77 +985,6 @@ fn modeled_nested_shell_effects(unit: &CommandUnit, shell_name: &'static str) ->
         git_selects_by_name: false,
         unread: Vec::new(),
     }
-}
-
-/// Returns `true` when a `HomeReadOnly` tool has no write-enabling flags or
-/// operands of its own (so `eff.writes == true` came solely from an output
-/// redirect, whose target already has `AccessMode::Write`).
-fn home_ro_tool_reads_only_without_redirects(
-    unit: &CommandUnit,
-    eff: &ToolEffects,
-    budget: &mut ComputeBudget,
-) -> Result<bool, Exhausted> {
-    let Some(tool_name) = eff.tool_name else {
-        return Ok(false);
-    };
-    let Some(spec) = tools::lookup(tool_name) else {
-        return Ok(false);
-    };
-    let (ro, args_start) = match spec.kind {
-        ToolRowKind::HomeReadOnly(row) => (row.home_readonly, 1usize),
-        ToolRowKind::ConditionalRunner(row) => {
-            let Some(sub) = eff.subcommand else {
-                return Ok(false);
-            };
-            let Some(sub_spec) = row.subcommands.iter().find(|s| s.name == sub) else {
-                return Ok(false);
-            };
-            match sub_spec.kind {
-                tools::SubcommandKind::HomeReadOnly(r) => (r.home_readonly, 2usize),
-                _ => return Ok(false),
-            }
-        }
-        _ => return Ok(false),
-    };
-    if args_start > unit.argv.len() {
-        return Ok(false);
-    }
-    for arg in &unit.argv[args_start..] {
-        let bytes = arg.literal_bytes();
-        budget.charge(bytes.len().max(1) as u64)?;
-        if bytes == b"--" {
-            break;
-        }
-        match std::str::from_utf8(bytes) {
-            Ok(tok) => {
-                budget.charge(ro.forbidden.len().max(1) as u64)?;
-                if tools::is_forbidden_flag(ro.forbidden, tok) {
-                    return Ok(false);
-                }
-            }
-            Err(_) => {
-                if !ro.forbidden.is_empty() && bytes.starts_with(b"-") {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-    if let Some(only) = ro.only {
-        for arg in &unit.argv[args_start..] {
-            let bytes = arg.literal_bytes();
-            budget.charge(bytes.len().max(1) as u64)?;
-            match std::str::from_utf8(bytes) {
-                Ok(tok) => {
-                    budget.charge(only.len().max(1) as u64)?;
-                    if !only.contains(&tok) {
-                        return Ok(false);
-                    }
-                }
-                Err(_) => return Ok(false),
-            }
-        }
-    }
-    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]

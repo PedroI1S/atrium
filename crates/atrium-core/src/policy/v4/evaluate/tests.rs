@@ -10,9 +10,9 @@ use serde_json::json;
 
 use crate::policy::limits;
 use crate::policy::model::{
-    BestEffortRecord, CallOutcome, Cap, ComputeBudget, DirEntry, ExhaustReason, FileType,
-    FoldRules, FsCaps, Hit, HitMatch, HitSource, PartId, PartOutcome, PartResult, PathMetadata,
-    ProtectedSet, ResolveError, RuleCoverage, UnitIndex, UnitRuleCoverage, UnreadReason,
+    BestEffortRecord, CallOutcome, Cap, ComputeBudget, DirEntry, ExhaustReason, FoldRules, FsCaps,
+    Hit, HitMatch, HitSource, PartId, PartOutcome, PartResult, PathMetadata, ProtectedSet,
+    ResolveError, RuleCoverage, UnitIndex, UnitRuleCoverage, UnreadReason,
 };
 use crate::policy::v4::lex::lex_best_effort;
 use crate::policy::v4::paths::PathResolver;
@@ -22,6 +22,11 @@ use super::{
     decide, evaluate_call, evaluate_call_with_budget, run_best_effort, unread_notice_for_outcome,
 };
 
+/// An empty virtual filesystem, like `DefaultPolicy`'s resolver: nothing
+/// exists. (Round 1's resolver answered `stat` with "a directory" for every
+/// path while `lstat` said it was absent, so `~/.ssh` looked like an existing
+/// folder that could not be listed, and `cat ~/.ssh/config` asked: P5
+/// review 1, finding 8, the trace of `tests.rs:390`.)
 struct VirtualTestResolver;
 
 impl PathResolver for VirtualTestResolver {
@@ -33,11 +38,7 @@ impl PathResolver for VirtualTestResolver {
     ) -> Result<PathMetadata, ResolveError> {
         caps.charge_stat()?;
         budget.charge(path.len().max(1) as u64)?;
-        Ok(PathMetadata {
-            file_type: FileType::Dir,
-            nlink: 1,
-            identity: None,
-        })
+        Err(ResolveError::NotFound)
     }
 
     fn lstat(

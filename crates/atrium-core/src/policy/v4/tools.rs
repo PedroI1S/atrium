@@ -700,6 +700,18 @@ fn classify_home_readonly(
     // new-name` or `tree -o out`), mark as possible writer; otherwise only
     // output redirects outside `/dev/null` make it a writer.
     let _ = expected_name;
+    // CR-P5-1 (D-176 item 4): with no forbidden flag and `only` met, the
+    // tool only reads its operands, so they are `Read`. A write-only
+    // protected path (`~/.ssh/config`, Atrium's protected paths) is then not
+    // a hit for `cat ~/.ssh/config` or `git diff --no-index ~/.ssh/config x`.
+    // Output redirects keep their own `Write` access.
+    if !has_forbidden && only_ok {
+        let start = args_start.min(effects.operand_access.len());
+        budget.charge((effects.operand_access.len() - start) as u64 + 1)?;
+        for a in &mut effects.operand_access[start..] {
+            *a = AccessMode::Read;
+        }
+    }
     effects.writes = redirect_writes || has_forbidden || !only_ok;
     effects.home_readonly_eligible = home_guards_ok && as_written_ok && !has_forbidden && only_ok;
     effects.git_selects_by_name = row.git_selects_by_name;

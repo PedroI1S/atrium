@@ -80,9 +80,28 @@ fn home_readonly_accepted_as_written_and_case_folding() {
     assert!(!eff.writes);
     assert!(eff.unread.is_empty());
     assert_eq!(eff.roles, vec![OperandRole::Command, OperandRole::Path]);
-    assert_eq!(
-        eff.operand_access,
-        vec![AccessMode::Read, AccessMode::ReadWrite]
+    // CR-P5-1 (D-176 item 4): a read-only row with no forbidden flag only
+    // reads its operands.
+    assert_eq!(eff.operand_access, vec![AccessMode::Read, AccessMode::Read]);
+    // A forbidden flag keeps the conservative `ReadWrite` (a possible writer).
+    let forbidden = classify(&["tree", "-o", "out", "src"]);
+    assert!(forbidden.writes);
+    assert!(
+        forbidden.operand_access[1..]
+            .iter()
+            .all(|a| *a == AccessMode::ReadWrite),
+        "{:?}",
+        forbidden.operand_access
+    );
+    // `git diff --no-index` reads both of its operands.
+    let diff = classify(&["git", "diff", "--no-index", "a", "b"]);
+    assert_eq!(diff.subcommand, Some("diff"));
+    assert!(
+        diff.operand_access[2..]
+            .iter()
+            .all(|a| *a == AccessMode::Read),
+        "{:?}",
+        diff.operand_access
     );
 
     // §10 row 1 & §11 "Unchanged on purpose": Home eligibility matches command word as written.
