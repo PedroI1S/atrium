@@ -810,3 +810,60 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core --lib policy::v4::paths
 cargo test --workspace --no-fail-fast
 ```
+
+
+---
+
+## Round 12
+
+Input: the orchestrator's macOS verification of round 11 (`ee095d16`, merged into current `dev`), which was clean on `fmt`, `clippy`, protocol check, typecheck, and 377 vitest, with 985 passed, **2 failed**, 7 ignored (both in `policy::v4::paths::p2_tests` on `FakeFs`, i.e. platform-independent logic issues).
+
+Commits on `agent/neon/M1-38-rev4-p2-paths`:
+- `b550fdfe`: skip alias scanning after an established `HardDenyHit` in `push_target_records` (`sensitive.rs`, `recursive.rs`);
+- `1022a652`: fix round 11's `lnk/../.ssh/sub` test expectation with citations, exercise S8 subfolder walk on `lnk/../.ssh`, and add round 12 regression test (`p2_tests.rs`);
+- handoff commit: this section (`docs/agents/handoffs/M1-38-rev4-p2-paths.md`).
+
+No change requests; all edits remain strictly inside P2's owned paths (`sensitive.rs`, `recursive.rs`, `p2_tests.rs`, and this handoff).
+
+### Failure 1: `round5_d145_gaps_only_where_a_root_cannot_be_established` (`p2_tests.rs:4223`)
+
+- **Verdict:** **Code bug** (regression against D-145, D-144, `model.rs` `ProtectedSet::identity_gaps`, and review 7 finding 3). The round 5 test stands unchanged.
+- **Cause:** Reading the AWS credentials file when home's `.ssh` directory cannot be listed (`PermissionDenied`) produces an `AnyTarget` identity gap in `ProtectedSet`. Inside `check_target_into`, the target immediately hits `HardDenyHit("credential-read")` and returns without attaching `protected.identity_gaps`, matching `ProtectedSet::identity_gaps` ("a target a gap can affect that is not already a hit is Unread with the gap's reason", D-144, D-145). However, `push_target_records` then unconditionally called `push_alias_records`:
+  1. `RootAliases::spelled_roots` called `push_ssh_members`, which failed `read_dir` on `.ssh` and recorded `UnresolvablePath` in `RootAliases::incomplete`.
+  2. `aliases.scan` matched the AWS credentials root by identity with `alias == *canonical` and carried `self.incomplete` into `scan.unread`.
+  3. Because `alias == *canonical`, `push_alias_records` skipped its `alias != *canonical` branch, left its local `hard = false`, ignored the `HardDenyHit` already pushed by `check_target_into`, and appended `Unread(UnresolvablePath)` beside the hard-deny hit.
+- **Introducing commit:** **`8471af06`** (`8471af06ca302c8f64d23822cb52484078308741`, round 10: `"P2 round 10: dev's ssh_members as alias roots; charge-before-clone; no lossy allocation"`), which added `RootAliases::push_ssh_members` so an unlistable `.ssh` marks `RootAliases::incomplete`. That exposed the latent bug planted in **`d731e0a8`** (round 9: `"P2 round 9: port dev's alias_fix by ancestor identity; probes on every spelling"`), where `push_target_records` always called `push_alias_records` after `check_target_into` and `push_alias_records` only suppressed `scan.unread` when a *different* alias spelling (`alias != *canonical`) produced a hard-deny hit.
+- **Round 11 check:** Neither round 11's macOS `FsResolver::read_dir` (V1, unused by `FakeFs`) nor its unified `FsResolver::canonicalize` caps/charges and `RootAliases::ancestor_stats` cache (F1, which only caches successful proper-ancestor stats and has zero hits on a single-path scan) caused or touched this failure (`0721aa88`). Round 10 had not been run on macOS verification earlier because V1 blocked compilation until round 11 fixed it.
+- **Fix (`b550fdfe`, `1022a652`):**
+  - `sensitive.rs::push_target_records`: record `let start = outcomes.len();` before calling `check_target_into`, and return `Ok(())` without calling `push_alias_records` when `outcomes[start..]` already contains a `PartOutcome::HardDenyHit(_)`. (Other targets in the same call are unaffected because only `outcomes[start..]` is checked; an `Unread` resolution with a written hard-deny hit already records both records inside `check_target_into`, and `push_alias_records` is already a no-op on `TargetResolution::Unread`.)
+  - `recursive.rs::followed_link_records`: route through `push_target_records(..., false)` instead of calling `check_target_into` + `push_alias_records` separately (and made `push_alias_records` private in `sensitive.rs`).
+  - Added regression test `round12_hard_deny_target_suppresses_incomplete_alias_table_unread` covering unlistable `.ssh` (single subject, multi-target call scoping, command flow, recursive root, filter-selected symlink, and `StoreHit` + `Unread` preservation), unlistable `.azure`, and `Canonicalizations` cap = 1.
+- **Citations:** Contract §1, §5; `model.rs` `ProtectedSet::identity_gaps`; D-144; D-145 rule 4; review 7 finding 3 ("retain the incomplete-table reason when a rewrite yields no definitive hit; preserve it alongside Store hits where applicable").
+
+### Failure 2: `round11_r10fix2_ssh_below_root_and_alias_spelling` (`p2_tests.rs:7092`)
+
+- **Verdict:** **Test expectation bug**; the implementation is right.
+- **Cause:** Part 3(d) checked `lnk/../.ssh/sub` (where `lnk` points to an external `pub/sub` folder, so the canonical path is outside home and holds only `id_key.pub`, while home's `.ssh` does not exist) and asserted `all_clear`. Lexically normalising `lnk/../.ssh/sub` produces `<home>/.ssh/sub` (`words::lexical_resolve`, `sensitive::lexical_spelling`). On `dev`, `Analysis::all_paths` (`deny.rs:365`) includes the lexical resolution alongside the gate's resolved path, and `Sensitive::hit` (`deny.rs:523-532`) is a pure name check: every non-empty path strictly below `.ssh` whose basename is not `*.pub` or `known_hosts*` (and not top-level `config` or `authorized_keys` on `Read`) returns `Some("credential-read")` (HardDeny), regardless of whether `.ssh` exists on disk. Only `.ssh` itself (`r.is_empty()`) is not a `Sensitive::hit` on `Read`.
+- **Fix (`1022a652`):**
+  - Corrected part 3(d)'s expectation to assert `HardDenyHit("credential-read")` with `HitMatch::ProtectedPath` equal to the lexically normalised written path `<home>/.ssh/sub`, with inline citations.
+  - Added the genuine S8 nested-subfolder check for round 10 fix 2 using `lnk/../.ssh` (written `<home>/.ssh`, which is not a `Sensitive::hit` on `Read` per `deny.rs:523-524`): when nested `sub/` holds only `id_key.pub`, `check_recursive_root` returns `StoreHit("ssh-dir")` with no `HardDenyHit`; once a private `sub/id_key` is added, S8 returns `HardDenyHit("credential-read")` even under a `*.rs` filter.
+- **Citations:** `deny.rs:523-532`, `deny.rs:365` (`Analysis::all_paths`), `words.rs:316` (`lexical_resolve`), contract §5, D-147, D-149, D-154.
+
+### Audit of other round 10–11 tests
+
+Re-read every other round 10 and round 11 test (`round10_f1_ssh_member_folder_under_another_name_is_an_alias`, `round10_sweep_store_root_is_read_on_devs_spelling`, `round10_f2_incomplete_reason_is_charged_before_it_is_copied`, `round10_f3_msal_prefix_test_matches_devs_lossy_lowercase`, `round3_r2f4_fs_resolver_makes_no_uncharged_metadata_call`, `round11_v1_f1_real_fs_1100_plain_operands_and_large_read_dir`, `round11_f1_4096_single_component_operands_clear_under_default_limits`, `round11_f1_fallback_canonicalize_checks_peak_before_allocating_and_charges_real_len`, `round11_charge_ordering_exact_minimum_alloc_budgets`, `round11_r10f1_ssh_member_file_linked_tree_and_cutoff_cases`, `round11_r10fix2_ssh_below_root_and_alias_spelling` parts 1–3(c), and `round11_macos_real_fs_firmlink_strip_and_mixed_case_ssh`) against contract §1/§2/§5/§8, `dev` (`deny.rs`/`gate.rs`/`engine.rs`), and D-145/D-147/D-149/D-154/D-155. No other test had a mismatched written-spelling, alias, S8, or gap expectation.
+
+### Verification
+
+Run by the worker (D-123):
+- `cargo fmt --all` (clean)
+- `cargo check -p atrium-core --tests` (clean, 0 errors, 0 warnings)
+- No build/test suites were run (D-123).
+
+Commands for the orchestrator's verification (fish-compatible; run on both macOS and Linux):
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core --lib policy::v4::paths
+cargo test --workspace --no-fail-fast
+```
