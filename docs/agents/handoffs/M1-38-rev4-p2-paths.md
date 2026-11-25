@@ -1094,3 +1094,55 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core --lib policy::v4::paths
 cargo test --workspace --no-fail-fast
 ```
+
+### Round 15b
+
+Input: orchestrator's macOS verification of round 15 (`d16c369c`, merged into `dev`): fmt, clippy, protocol, typecheck, and vitest clean; workspace 1,048 passed, **1 failed**, 7 ignored (`round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case` at `p2_tests.rs:9866`: `Exhausted { reason: AllocationBudget }` instead of `Unread(WalkCapReached(FsCap::DirOpens))`).
+
+Commits on `agent/neon/M1-38-rev4-p2-paths`:
+- `57a40d75`: set `DIR_STREAM_ALLOC = DIR_STREAM_OVERHEAD` (`256` bytes) in `paths/resolver.rs` so the entire transient `dd_buf` is enforced by peak headroom rather than permanently deducted at 4 KiB per listing, and align `#[cfg(not(unix))]` `read_dir` with transient peak headroom;
+- `4abe0f50`: update `DIR_STREAM_ALLOC` (`256`) assertions in round 13–15 `read_dir` tests and expand the call-level worst-case test across 4 KiB / 128 KiB / 1 MiB `st_blksize` (with cross-`blksize` permanent-total parity and a single compound `resolve_command_targets` call) (`paths/p2_tests.rs`);
+- handoff commit: this subsection (`docs/agents/handoffs/M1-38-rev4-p2-paths.md`).
+
+#### Verdict & root cause: **Product bug** (`paths/resolver.rs`, `DIR_STREAM_ALLOC`)
+
+- **Allocation trace of the failing test** (`COMPUTE_BUDGET_ALLOC_BYTES` = 8,388,608 bytes = 8.00 MiB):
+  - **Phase A — 4,096 single-component operands (`f0000`..`f4095` in `/`, via `resolve_subject_paths`):**
+    - Per-operand charges (`632` B/operand on macOS, `568` B on Linux): `lexical_spelling` ×2 (`16` B), `resolve_literal_inner` (`expanded` `7` B, `queue` `102` B, `cand` `6` B, `existing_stack` cap 4 `192` B, `existing_path` `6` B, `canonicalize` `6` B + macOS `FALLBACK_CANON_OVERHEAD` `64` B, `identities` `16` B), `push_target_records` (`fold_path_listed` ×2 `76` B, `check_target_exact` `6` B, `collect_components` ×2 `128` B, `aliases.scan` `prefix` `7` B) -> **`2,588,672` B** on macOS (`2,326,528` B on Linux).
+    - Retained `Vec` doubling (`4 + 8 + ... + 4,096 = 8,188` slots): `out.targets` (`~120` B/slot ≈ `~982,560` B) + `out.outcomes` (`~104` B/slot ≈ `~851,552` B) -> **`~1.75–1.81` MiB**.
+    - `SharedSensitive` + initial `RootAliases::roots`: **`~9.7` KiB** (also consumes 2 `DirOpens` on absent `.ssh`/`.azure`).
+    - **Phase A total:** **`~4.23–4.29` MiB** on macOS (**`~3.98–4.04` MiB** on Linux), leaving **`~3.71–3.77` MiB** on macOS (**`~3.96–4.02` MiB** on Linux).
+  - **Phase B — 1,024 `DirOpens` (`check_recursive_root` on `/walk` with 1,025 empty subdirs `d0000`..`d1024`):**
+    - `check_recursive_root` setup + `RootAliases` rebuild: `~10.3` KiB (2 `DirOpens`, leaving `1,020` `DirOpens`).
+    - Open #1 (`/walk` via `FakeFs::read_dir` + `walk_hard_links` stack for 1,025 subdirs): `37,925` B (`entries`) + `11,275` B (`join_bytes`) + `130,944` B (`stack` cap growth) = **`~180` KiB** plus stream charge.
+    - Opens #1..#1,020 (`1,020` directory listings): round 15 kept `DIR_STREAM_ALLOC = 4_096 + DIR_STREAM_OVERHEAD` (`4,352` bytes) as a **permanent** per-listing deduction on both macOS and Linux, burning **`1,020 * 4,352 = 4,439,040` B (~4.23 MiB; `4.25` MiB across all 1,024 opens)** — plus `128,064` B of live `stream_extra + NAME_ALLOC_PEAK` headroom on macOS — which exhausted the remaining `~3.59` MiB around directory #835 on macOS (and would also exhaust around directory #925 on Linux, even at `st_blksize = 4,096`).
+- **Why this is a product bug (§2, §8):**
+  - On non-Linux Unix, libc's `dd_buf` is freed by `closedir` when `Dir` drops before `read_dir` returns; on Linux, `RawDir` reads into a stack array `[MaybeUninit<u8>; 4096]` and makes zero heap allocations for the stream.
+  - Round 15 made `peak - 4_352` transient, but left the base `4,096` bytes of the exact same freed `dd_buf` permanently deducted inside `DIR_STREAM_ALLOC = 4_352`, burning over half of the 8 MiB `COMPUTE_BUDGET_ALLOC_BYTES` across `FS_MAX_DIR_OPENS` (1,024). By contrast, `FALLBACK_CANON_PEAK` / `FALLBACK_CANON_OVERHEAD` (`64` B) and `NAME_ALLOC_PEAK` (`0` B) already treat their entire transient OS buffers as peak checks. Under §2, hitting `FsCap::DirOpens` must end `Unread(DirOpens)`, not `Exhausted`.
+
+#### Fix (`57a40d75`, `4abe0f50`)
+
+- **`paths/resolver.rs` (`57a40d75`):**
+  - Defined `DIR_STREAM_ALLOC = DIR_STREAM_OVERHEAD` (`256` bytes), keeping permanent per-listing deductions identical across Linux (`RawDir`), non-Linux Unix (`Dir`), and non-Unix (`std::fs::read_dir`) at `256` bytes/listing (`1,024 * 256 = 256` KiB, 3.1% of 8 MiB).
+  - Kept the full transient peak check unchanged: `charge_dir_stream` still enforces `budget.remaining_alloc_bytes() >= dir_stream_peak_for_blksize(blksize)` (`max(st_blksize, 65_536) + 256`: `65,792` B at 4 KiB, `131,328` B at 128 KiB, `1,048,832` B at 1 MiB) before `Dir::new`, rejects negative or `> 1 MiB` block sizes as `Io(Other)`, and returns the full transient buffer headroom `stream_extra = peak - 256 = max(st_blksize, 65_536)` preserved across every `dir.next()` and retained push while `Dir` is open. Peak pre-allocation protection is completely unchanged (`exact_need = path_conv + peak + entries_bytes + NAME_ALLOC_PEAK`).
+  - Updated `#[cfg(not(unix))]` `FsResolver::read_dir` to enforce `4_096 + DIR_STREAM_OVERHEAD` transient peak headroom before `std::fs::read_dir` and pass `stream_extra` (`4_096`) to `charge_alloc_with_headroom` / `push_entry_charged`, while deducting `DIR_STREAM_ALLOC` (`256` B).
+  - With `256` B/listing, the 4,096-operand + 1,024-`DirOpens` worst case deducts `~4.72` MiB on macOS (`~4.47` MiB on Linux), leaving **`~3.28` MiB** remaining at the 1,024th `DirOpen` — more than 3× the maximum valid `1 MiB` `st_blksize` peak (`1.00` MiB).
+- **`paths/p2_tests.rs` (`4abe0f50`) & audit of all round 15 tests:**
+  - Audited all five round 15 tests plus round 13/14 `read_dir` tests and earlier `FsResolver::read_dir` tests (`round2_finding11` uses 4-byte budget `< 256`; `round11_v1_f1` uses 100-byte budget `< 256`; `round15_read_dir_peak_checks_precede_next_and_prevent_fd_leaks`, `round15_dt_unknown_*`, and `round15_attach_applicable_gap_edge_cases` had no permanent-buffer mistake).
+  - Updated literal `DIR_STREAM_ALLOC` (`256`) and deduction-parity assertions in `round13_read_dir_charges_dir_stream_alloc_and_single_dir_open`, `round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity`, `round15_read_dir_literal_constants_and_stream_charge_bounds`, and `round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case` (Part 1c now verifies both 128 KiB and 1 MiB peaks with `256`-byte permanent deduction).
+  - Expanded Part 2 of `round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case` to run across `[4_096, 131_072, 1_048_576]` `st_blksize` (asserting `Unread(DirOpens)`, zero `Exhausted`, and identical permanent allocation totals across every `st_blksize` after warming `SharedSensitive`), and added Part 2b exercising a single compound `resolve_command_targets` call (`cat f0000..f4094; rg pat /walk`) at `1 MiB` `st_blksize`.
+
+#### Verification (Round 15b)
+
+Run by the worker (D-123):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean on macOS (0 errors, 0 warnings)
+- No tests or `clippy` were run (D-123).
+
+Commands for the orchestrator's verification (fish-compatible; run on both macOS and Linux):
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core --lib policy::v4::paths
+cargo test --workspace --no-fail-fast
+```
