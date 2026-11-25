@@ -567,8 +567,8 @@ fn glob_forms_the_gate_cannot_resolve_never_reach_allow_in_home() {
     finish();
 }
 
+// Contract §5 / §10 row 8: shell globs expand through symlinks on disk.
 #[test]
-#[ignore = "M1-13 finding 10"]
 fn finding_10_a_glob_that_reaches_a_credential_through_a_link_is_blocked() {
     let t = world();
     let g = t.gate(Preset::Home, vec![]);
@@ -578,8 +578,9 @@ fn finding_10_a_glob_that_reaches_a_credential_through_a_link_is_blocked() {
     finish();
 }
 
+// Contract §5 / best-effort protected-directory prefix matching: globs inside
+// credential trees (`.gnupg`) and Atrium's own folders (`atrium`) are blocked.
 #[test]
-#[ignore = "M1-13 finding 11"]
 fn finding_11_a_glob_inside_atriums_folder_names_is_blocked() {
     let t = world();
     let g = t.gate(Preset::Home, vec![]);

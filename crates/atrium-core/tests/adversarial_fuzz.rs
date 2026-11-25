@@ -304,6 +304,10 @@ const TARGETS: &[&[&str]] = &[
 ];
 
 fn spell(rng: &mut Rng, parts: &[&str]) -> String {
+    spell_with(rng, parts, true)
+}
+
+fn spell_with(rng: &mut Rng, parts: &[&str], allow_wildcards: bool) -> String {
     // the base: how the home is written
     let mut out = match rng.below(6) {
         0 => "~/".to_string(),
@@ -347,7 +351,7 @@ fn spell(rng: &mut Rng, parts: &[&str]) -> String {
             }
         }
         // a wildcard for one character (still matches only this name)
-        if seg.len() > 3 && rng.chance(15) && !seg.contains(['\\', '\'', '"']) {
+        if allow_wildcards && seg.len() > 3 && rng.chance(15) && !seg.contains(['\\', '\'', '"']) {
             let at = 1 + rng.below(seg.len() - 2);
             if seg.is_char_boundary(at) && seg.is_char_boundary(at + 1) {
                 let mut s = seg.clone();
@@ -404,9 +408,12 @@ fn shape(rng: &mut Rng, path: &str, parts: &[&str]) -> String {
         6 => format!("echo `{reader} {path}`"),
         7 => format!("cat <({reader} {path})"),
         8 => {
-            // `cd` to the folder, then name the file bare
+            // `cd` to the folder, then name the file bare.
+            // Contract §12 (M1-28 dropped globbed `cd` candidates): use a literal
+            // (non-glob) spelling for `cd`'s target while keeping wildcards in
+            // all direct path shapes above.
             let (dir, file) = parts.split_at(parts.len() - 1);
-            let d = spell(rng, dir);
+            let d = spell_with(rng, dir, false);
             let f = file[0];
             if dir.is_empty() {
                 format!("{reader} {path}")
@@ -418,8 +425,9 @@ fn shape(rng: &mut Rng, path: &str, parts: &[&str]) -> String {
     }
 }
 
+// Contract §5 / best-effort protected-directory prefix matching (un-ignored
+// from M1-13 finding 11; globbed `cd` candidates excluded per §12).
 #[test]
-#[ignore = "M1-13 finding 11"]
 fn random_spellings_of_sensitive_paths_are_always_hard_denied() {
     let env = Env::home();
     let any = allow_everything();

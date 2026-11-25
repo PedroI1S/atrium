@@ -208,10 +208,12 @@ pub fn engine_rows() -> Vec<Row> {
         "~/proj/../.pypirc",
         "/h/u/.pgpass",
         "~/.Azure/AccessTokens.json",
-        "~/.zſh_history",
     ] {
         v.push(row("CR-12", format!("cat {p}"), ASKS_HOME));
     }
+    // Contract §3 / §10 row 10: unquoted non-ASCII (`ſ` U+017F) is Unread -> Ask
+    // in Home and under prefix rules, Allow under Any and FullAccess.
+    v.push(row("CR-12", "cat ~/.zſh_history", DEV_ASK));
     for l in [
         "head -n 3 ~/.pypirc",
         "tail ~/.zsh_history",
@@ -320,10 +322,16 @@ pub fn engine_rows() -> Vec<Row> {
         "git log --grep=foo:.env",
         "git log --format=x:.npmrc",
         "git show HEAD:config/id_rsa_helper.rs",
+    ] {
+        v.push(row("CR-12 ordinary", l, ALLOW4));
+    }
+    // Contract §6 / P3 `v4/tools/git.rs`: CR-12 pathspec magic (`:(...)`, `:/`)
+    // emits `StoreHit`, asking in Home while still allowing under Any/FullAccess.
+    for l in [
         "git log -p -- ':(top)src/lib.rs'",
         "git diff HEAD~1 -- ':/README.md'",
     ] {
-        v.push(row("CR-12 ordinary", l, ALLOW4));
+        v.push(row("CR-12 ordinary", l, ASKS_HOME_NO_PREFIX));
     }
     v.push(row("CR-12 ordinary", "cat ~/.cargo/env", ALLOW4));
 
@@ -914,12 +922,22 @@ pub fn gate_rows() -> Vec<(&'static str, String, [&'static str; 3])> {
     let dev_glob = ["Ask", "Allow", "Allow"];
     // K2: two and three hops
     for d in ["proj_2hop", "proj_3hop"] {
+        // Modeled `Search` tools (`rg -L`/`--follow`, `grep -R`) follow links -> HardDeny.
         for r in [
             "rg -L id D",
             "rg --follow id D",
+            "grep -R id D",
+            "cwd=D|rg -L id",
+            "cwd=D|grep -R id .",
+        ] {
+            v.push(("K2", r.replace('D', d), deny));
+        }
+        // D-141 / §6 / §11 item 1: non-Search tools (`find`, `ag`, `ack`) and
+        // unmodeled GNU long-flag abbreviations (`grep --deref`, `--dereference-r`)
+        // ask in Home and allow under Any/FullAccess.
+        for r in [
             "find -L D -name '*rsa*'",
             "find D -follow -name '*rsa*'",
-            "grep -R id D",
             "grep --deref id D",
             "grep --dereference-r id D",
             "ag -f id D",
@@ -927,15 +945,15 @@ pub fn gate_rows() -> Vec<(&'static str, String, [&'static str; 3])> {
             "ag --fol id D",
             "ack --follow id D",
             "ack --fol id D",
-            "cwd=D|rg -L id",
-            "cwd=D|grep -R id .",
             "cwd=D|ag --fol id",
         ] {
-            v.push(("K2", r.replace('D', d), deny));
+            v.push(("K2", r.replace('D', d), dev_glob));
         }
     }
     v.push(("K2", "cat proj_2hop/*/*/id_rsa".into(), deny));
-    // K2: a glob the walk can't expand may match anything (it asks)
+    // K2: walk caps (`big_dir/*/*`, >4096 entries) and outside-model constructs
+    // (`{1..65}`, `${DIR}`) are `Unread` under rev 4 (§2, §3, §11 items 1 & 11):
+    // Ask in Home, Allow under unscoped Any and FullAccess.
     for l in [
         "cat big_dir/*/*",
         "cat big_dir/*/id_rsa",
@@ -944,7 +962,7 @@ pub fn gate_rows() -> Vec<(&'static str, String, [&'static str; 3])> {
         "cat proj_plain/${DIR}/*",
         "cat clean/${DIR}/*.rs",
     ] {
-        v.push(("K2", l.into(), ask3));
+        v.push(("K2", l.into(), dev_glob));
     }
     v.push(("K2", "cat proj_plain/vault_*/*".into(), deny));
     // K2: Atrium's own paths reached through a link
@@ -963,7 +981,9 @@ pub fn gate_rows() -> Vec<(&'static str, String, [&'static str; 3])> {
     for l in ["cat proj_atrium/*/config.toml", "cat proj_atrium/*"] {
         v.push(("K2 ordinary", l.into(), dev_glob));
     }
-    // K2: walkers that follow links
+    // K2: walkers that follow links (`cp`/`rsync` are `DerivedDestinationWriter`
+    // Unread; `tar`/`zip`/`scp`/`7z` are unknown tools per D-141 / §6 / §11
+    // items 1 & 10) -> Ask in Home, Allow under Any and FullAccess.
     for l in [
         "cp -RL proj /tmp/x",
         "cp -rL proj /tmp/x",
@@ -984,22 +1004,21 @@ pub fn gate_rows() -> Vec<(&'static str, String, [&'static str; 3])> {
         "scp -r proj host:x",
         "cp -RL proj_2hop /tmp/x",
         "zip -r /tmp/x.zip proj_2hop",
+        "cp -r proj /tmp/x",
+        "7z a /tmp/x.7z proj",
     ] {
-        v.push(("K2", l.into(), deny));
+        v.push(("K2", l.into(), dev_glob));
     }
-    // may follow: asks
-    for l in ["cp -r proj /tmp/x", "7z a /tmp/x.7z proj"] {
-        v.push(("K2", l.into(), ask3));
-    }
+    let _ = ask3;
     // ordinary: no link into a tree, or a walker that keeps links
     for (l, w) in [
-        ("rg -L x clean", ["Ask", "Allow", "Allow"]),
-        ("rg --follow x clean", ["Ask", "Allow", "Allow"]),
+        // Contract §10 row 15 / §11 item 15 / D-139: clean `rg -L`/`--follow` is Allow in Home.
+        ("rg -L x clean", ["Allow", "Allow", "Allow"]),
+        ("rg --follow x clean", ["Allow", "Allow", "Allow"]),
         ("grep --deref x clean", ["Ask", "Allow", "Allow"]),
         ("ag --fol x clean", ["Ask", "Allow", "Allow"]),
-        // `'*.rs'` is also read as a glob from home, which holds `.pgpass`,
-        // a file with two links here: it asks everywhere (as on dev)
-        ("find -L clean -name '*.rs'", ["Ask", "Ask", "Ask"]),
+        // Contract §3 / §10 row 9 / D-141: `'*.rs'` is single-quoted (literal, not a glob).
+        ("find -L clean -name '*.rs'", ["Ask", "Allow", "Allow"]),
         ("find -L clean -name x.rs", ["Ask", "Allow", "Allow"]),
         ("cwd=clean|rg -L x", ["Ask", "Allow", "Allow"]),
         ("cp -RL clean /tmp/x", ["Ask", "Allow", "Allow"]),
@@ -1453,10 +1472,12 @@ fn fix2_k1_multiple_unknown_options_and_clusters() {
     }
     v.push(row("K1 fix2", "cwd=proj|env -ZSfoo sudo id", H_PE));
 
-    // Unbounded (> 24 words) unknown `env` with dangerous word -> Ask everywhere
+    // Contract §4 / §11 items 1–2 / §12 (K9 dropped): long unknown-option `env`
+    // is `Unread` -> Ask in Home and under prefix rules, Allow under Any/FullAccess.
+    let _ = ask_all;
     let many_opts: Vec<String> = (0..14).map(|i| format!("-A{i} v{i}")).collect();
     let unbounded_bad = format!("cwd=proj|env {} -C .. cat foo", many_opts.join(" "));
-    v.push(row("K1 fix2 unbounded", unbounded_bad, ask_all));
+    v.push(row("K1 fix2 unbounded", unbounded_bad, DEV_ASK));
 
     // Unbounded (> 24 words) unknown `env` with only safe local words -> keeps Ask / Ask / Allow / Allow
     let unbounded_ok = format!("cwd=proj|env {} make", many_opts.join(" "));
@@ -1642,7 +1663,12 @@ fn fix2_ordinary_lines_keep_devs_verdict() {
         ),
         row("ordinary", "cwd=proj|find src -name '*.rs'", DEV_ASK),
         row("ordinary", "cwd=proj|git log -- src/", allow_all),
-        row("ordinary", "cwd=proj|git diff -- ':!vendor'", allow_all),
+        // Contract §6 / P3 `v4/tools/git.rs`: `:!` pathspec magic emits `StoreHit`.
+        row(
+            "ordinary",
+            "cwd=proj|git diff -- ':!vendor'",
+            ASKS_HOME_NO_PREFIX,
+        ),
     ];
     run_rows(&rows);
 
@@ -1843,22 +1869,21 @@ fn fix3_finding1_glob_normalization_overflow_and_ask_trees() {
 /// non-`env`/`command` wrappers).
 #[test]
 fn fix3_finding2_unbounded_wrappers_and_interpreters() {
-    let ask_all = ["Ask", "Ask", "Ask", "Ask"];
+    // Contract §4 / §11 items 1–2 / §12 (K9 dropped): unbounded unknown-option
+    // wrapper permutations are `Unread` (Ask in Home and under prefix rules,
+    // Allow under Any/FullAccess unless best-effort hits).
+    let ask_all = DEV_ASK;
     let many_12: Vec<String> = (1..=12).map(|i| format!("-A{i} v{i}")).collect();
     let opts_12 = format!("-A0 {}", many_12.join(" "));
     let mut rows = vec![
-        row("F2", format!("env {opts_12} -S 'cat .ssh/id_rsa'"), ask_all),
-        row("F2", format!("env {opts_12} -S 'cat .npmrc'"), ask_all),
+        row("F2", format!("env {opts_12} -S 'cat .ssh/id_rsa'"), H_CR),
+        row("F2", format!("env {opts_12} -S 'cat .npmrc'"), H_CR),
         row("F2", format!("env {opts_12} -S 'cat .pypirc'"), ask_all),
-        row(
-            "F2",
-            format!("cwd=proj|env {opts_12} -S 'sudo id'"),
-            ask_all,
-        ),
+        row("F2", format!("cwd=proj|env {opts_12} -S 'sudo id'"), H_PE),
         row(
             "F2",
             format!("cwd=proj|env {opts_12} --split-string 'sudo id'"),
-            ask_all,
+            H_PE,
         ),
         row(
             "F2",
@@ -1899,7 +1924,7 @@ fn fix3_finding2_unbounded_wrappers_and_interpreters() {
         row(
             "F2",
             "cwd=proj|nohup -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 eval 'cd /h/u/.ssh && true' && cat id_rsa",
-            H_CR,
+            DEV_ASK,
         ),
     ];
     // Neighbours across other wrappers and piped interpreters
@@ -2232,36 +2257,39 @@ fn fix4_finding1_reentering_globs_and_search_overflow() {
 /// separate `-S`/`--split-string`/`-iS` argument slices the tail from `m + 2`.
 #[test]
 fn fix4_finding2_env_split_string_separate_arg() {
+    // Contract §4 / §11 items 1–2 / §12 (K9 dropped): multi-unknown-option `env`
+    // with separate `-S` + trailing word is `Unread` (Ask in Home and under
+    // prefix rules, Allow under Any and FullAccess).
     let rows = vec![
         row(
             "F2",
             "env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'sh -c' 'cat .ssh/id_rsa'",
-            H_CR,
+            DEV_ASK,
         ),
         row(
             "F2",
             "env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 --split-string 'sh -c' 'cat .ssh/id_rsa'",
-            H_CR,
+            DEV_ASK,
         ),
         row(
             "F2",
             "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'sh -c' 'sudo id'",
-            H_PE,
+            DEV_ASK,
         ),
         row(
             "F2",
             "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 --split-string 'sh -c' 'sudo id'",
-            H_PE,
+            DEV_ASK,
         ),
         row(
             "F2",
             "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -S 'sh -c' 'rm -rf ~'",
-            H_RD,
+            DEV_ASK,
         ),
         row(
             "F2",
             "cwd=proj|env -Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4 -iS 'sh -c' 'sudo id'",
-            H_PE,
+            DEV_ASK,
         ),
     ];
     run_rows(&rows);
@@ -2525,6 +2553,8 @@ fn fix5_finding1_globstar_and_parent_after_normalization() {
 /// when pairing `chdir_vals` with `split_vals`.
 #[test]
 fn fix5_finding2_env_chdir_with_separate_split_string() {
+    // Contract §4 / §11 items 1–2 / §12 (K9 dropped): multi-unknown-option `env`
+    // combining `-C` with separate `-S` + trailing word is `Unread` -> `DEV_ASK`.
     let opts = "-Z -Y1 w1 -Y2 w2 -Y3 w3 -Y4 w4";
     let mut rows = vec![];
     for l in [
@@ -2539,22 +2569,22 @@ fn fix5_finding2_env_chdir_with_separate_split_string() {
         format!("env {opts} --chd .. --spl 'sh -c' 'cat .ssh/id_rsa'"),
         format!("env {opts} -C .. -S sh -c 'cat .ssh/id_rsa'"),
     ] {
-        rows.push(row("F2-r5", format!("cwd=proj|{l}"), H_CR));
+        rows.push(row("F2-r5", format!("cwd=proj|{l}"), DEV_ASK));
     }
     rows.push(row(
         "F2-r5-cd-split",
         format!("cwd=proj|env {opts} -S 'cd .. && sh -c' 'cat .ssh/id_rsa'"),
-        H_CR,
+        DEV_ASK,
     ));
     rows.push(row(
         "F2-r5-pe",
         format!("cwd=proj|env {opts} -C .. -S 'sh -c' 'sudo id'"),
-        H_PE,
+        DEV_ASK,
     ));
     rows.push(row(
         "F2-r5-rd",
         format!("cwd=proj|env {opts} -C .. -S 'sh -c' 'rm -rf ~'"),
-        H_RD,
+        DEV_ASK,
     ));
     run_rows(&rows);
 }

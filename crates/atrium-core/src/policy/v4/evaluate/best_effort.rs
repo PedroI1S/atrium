@@ -331,6 +331,75 @@ pub(super) fn run_best_effort_into(
                 out,
             )?;
         }
+        // If our alt-wrapper unwrapper exposed a shell / `source` / `.` reading
+        // stdin (piped `echo`, heredoc, or `<(echo ...)`), check its payload too.
+        if !extra_readings.is_empty() {
+            let mut exposes_stdin_shell = false;
+            for r in &extra_readings {
+                if let Some(first) = r.first() {
+                    let rf = fold_cmd_cr19(first, protected.folds, budget)?;
+                    if matches!(rf.as_str(), "source" | ".")
+                        || reads_stdin_as_script_budgeted(&rf, r, budget)?
+                        || is_shell_folded(&rf, budget)?
+                    {
+                        exposes_stdin_shell = true;
+                        break;
+                    }
+                }
+            }
+            if exposes_stdin_shell {
+                if u.piped
+                    && let Some(pid) = u.pipeline_id
+                    && let Some(piped_body) = extract_piped_echo_for_source(
+                        &record.units[..i],
+                        pid,
+                        protected.folds,
+                        budget,
+                    )?
+                {
+                    check_inline_payload_be(
+                        &piped_body,
+                        &part,
+                        protected,
+                        &shared,
+                        &unit_cands,
+                        unit_cwd_unknown,
+                        opts,
+                        budget,
+                        out,
+                    )?;
+                }
+                if let Some((hs, he)) = unit_meta.heredoc_body
+                    && let Some(raw_line) = record.raw_texts.first()
+                    && he <= raw_line.len()
+                {
+                    check_inline_payload_be(
+                        &raw_line[hs..he],
+                        &part,
+                        protected,
+                        &shared,
+                        &unit_cands,
+                        unit_cwd_unknown,
+                        opts,
+                        budget,
+                        out,
+                    )?;
+                }
+                for psub_payload in extract_proc_sub_echo_payloads(u, protected.folds, budget)? {
+                    check_inline_payload_be(
+                        &psub_payload,
+                        &part,
+                        protected,
+                        &shared,
+                        &unit_cands,
+                        unit_cwd_unknown,
+                        opts,
+                        budget,
+                        out,
+                    )?;
+                }
+            }
+        }
         if let Some(ctx) = next_find_exec_context {
             last_find_exec_context = Some(ctx);
         } else if !u.derived {
@@ -615,8 +684,15 @@ fn raw_pipe_to_shell_budgeted(
                 if reads_stdin_as_code_budgeted(&words, folds, 0, budget)? {
                     return Ok(true);
                 }
-                let eff = unwrap_simple_be(&words, folds, budget)?;
-                if eff != words && reads_stdin_as_code_budgeted(&eff, folds, 0, budget)? {
+                let eff0 = unwrap_simple_be(&words, folds, budget)?;
+                if eff0 != words && reads_stdin_as_code_budgeted(&eff0, folds, 0, budget)? {
+                    return Ok(true);
+                }
+                let eff1 = unwrap_simple_be_mode(&words, folds, true, budget)?;
+                if eff1 != words
+                    && eff1 != eff0
+                    && reads_stdin_as_code_budgeted(&eff1, folds, 0, budget)?
+                {
                     return Ok(true);
                 }
             }
@@ -1100,7 +1176,7 @@ fn unwrap_simple_be_mode(
                         break;
                     }
                     if w.starts_with('-') && w.len() > 1 {
-                        if match_gnu_long_opt(w, "--command", 5).is_some()
+                        if match_gnu_long_opt(w, "--command", 3).is_some()
                             || (!w.starts_with("--") && w[1..].contains('c'))
                         {
                             has_c = true;
@@ -1212,6 +1288,8 @@ struct BeUnitMeta {
     compound: Vec<(BeCompound, u32)>,
     /// Byte slice of a `<<<WORD` here-string attached to this unit (if any).
     herestring: Option<(usize, usize)>,
+    /// Byte slice of a `<<EOF` here-doc body attached to this unit (if any).
+    heredoc_body: Option<(usize, usize)>,
 }
 
 impl BeUnitMeta {
@@ -1221,6 +1299,7 @@ impl BeUnitMeta {
             close_join: None,
             compound: Vec::new(),
             herestring: None,
+            heredoc_body: None,
         }
     }
 
@@ -1230,6 +1309,7 @@ impl BeUnitMeta {
             close_join: None,
             compound: Vec::new(),
             herestring: None,
+            heredoc_body: None,
         }
     }
 }
@@ -1343,6 +1423,7 @@ fn scan_top_level_meta(
                 close_join: None,
                 compound: groups.to_vec(),
                 herestring: cur_herestring.take(),
+                heredoc_body: None,
             });
             *has_content = false;
             *has_assign = false;
@@ -1413,8 +1494,12 @@ fn scan_top_level_meta(
                 )?;
                 after_paren = false;
                 pending = None;
-                // Skip heredoc bodies matching P1 `lex_one_text`.
+                // Skip heredoc bodies matching P1 `lex_one_text`, recording the
+                // body byte range on the owning unit.
+                let owner_idx = out.len().checked_sub(1);
                 for (delim, strip_tabs) in std::mem::take(&mut heredocs) {
+                    let body_start = i;
+                    let mut body_end = i;
                     while i < bytes.len() {
                         let line_start = i;
                         while i < bytes.len() && bytes[i] != b'\n' {
@@ -1432,6 +1517,14 @@ fn scan_top_level_meta(
                         if trimmed == delim {
                             break;
                         }
+                        body_end = i;
+                    }
+                    if body_end > body_start
+                        && let Some(oi) = owner_idx
+                        && let Some(m) = out.get_mut(oi)
+                        && m.heredoc_body.is_none()
+                    {
+                        m.heredoc_body = Some((body_start, body_end));
                     }
                 }
             }
@@ -2708,50 +2801,55 @@ fn extract_env_chdir_cands(
     folds: FoldRules,
     budget: &mut ComputeBudget,
 ) -> Result<Option<(Vec<Vec<u8>>, bool)>, Exhausted> {
-    let Some(first) = raw_argv.first() else {
-        return Ok(None);
-    };
-    let mut first_folded = fold_cmd_cr19(first, folds, budget)?;
-    if first_folded != "env" {
-        let base_raw = first.rsplit('/').next().unwrap_or(first.as_str());
-        if (base_raw.contains("$(") || base_raw.contains('`'))
-            && let Some(sub) = substituted_program_simple(base_raw, folds, budget)?
-        {
-            first_folded = fold_cmd_cr19(&sub, folds, budget)?;
-        }
-    }
-    if first_folded != "env" {
+    if raw_argv.is_empty() {
         return Ok(None);
     }
+    // Scan `raw_argv` and any inner `env` reached past outer wrappers
+    // (e.g. `$(which timeout) 5 $(which env) -C ..`, `env -i $(which env) -C ..`,
+    // `command -Z X $(which env) -C ..`).
     let mut dirs: Vec<&str> = Vec::new();
-    let mut j = 1usize;
-    while j < raw_argv.len() {
-        let w = raw_argv[j].as_str();
-        budget.charge(w.len().max(1) as u64)?;
-        if w == "--" {
-            break;
-        }
-        if w == "-" {
-            j += 1;
-            continue;
-        }
-        if let Some(attached) = match_gnu_long_opt(w, "--chdir", 4) {
-            if let Some(val) = attached {
-                dirs.push(val);
-                j += 1;
-            } else if let Some(next) = raw_argv.get(j + 1) {
-                dirs.push(next.as_str());
-                j += 2;
-            } else {
-                j += 1;
+    for start in 0..raw_argv.len() {
+        let w = raw_argv[start].as_str();
+        let mut wf = fold_cmd_cr19(w, folds, budget)?;
+        if wf != "env" {
+            let base_raw = w.rsplit('/').next().unwrap_or(w);
+            if (base_raw.contains("$(") || base_raw.contains('`'))
+                && let Some(sub) = substituted_program_simple(base_raw, folds, budget)?
+            {
+                wf = fold_cmd_cr19(&sub, folds, budget)?;
             }
+        }
+        if wf != "env" {
             continue;
         }
-        if w.starts_with('-') && !w.starts_with("--") && w.len() > 1 {
-            if let Some(pos) = w[1..].find('C') {
-                let after = &w[1 + pos + 1..];
-                if !after.is_empty() {
-                    dirs.push(after);
+        // Only treat `raw_argv[start]` as an `env` wrapper when it is at index 0
+        // or preceded only by wrapper words/flags/duration/assignments (never
+        // after an inner command like `cat`).
+        if start > 0 {
+            let head_unwrapped0 = unwrap_simple_be_mode(&raw_argv[..=start], folds, false, budget)?;
+            let head_unwrapped1 = unwrap_simple_be_mode(&raw_argv[..=start], folds, true, budget)?;
+            let reaches_env = head_unwrapped0.is_empty()
+                || head_unwrapped1.is_empty()
+                || (head_unwrapped0.len() == 1 && head_unwrapped0[0] == raw_argv[start])
+                || (head_unwrapped1.len() == 1 && head_unwrapped1[0] == raw_argv[start]);
+            if !reaches_env {
+                break;
+            }
+        }
+        let mut j = start + 1;
+        while j < raw_argv.len() {
+            let w = raw_argv[j].as_str();
+            budget.charge(w.len().max(1) as u64)?;
+            if w == "--" {
+                break;
+            }
+            if w == "-" {
+                j += 1;
+                continue;
+            }
+            if let Some(attached) = match_gnu_long_opt(w, "--chdir", 4) {
+                if let Some(val) = attached {
+                    dirs.push(val);
                     j += 1;
                 } else if let Some(next) = raw_argv.get(j + 1) {
                     dirs.push(next.as_str());
@@ -2761,42 +2859,57 @@ fn extract_env_chdir_cands(
                 }
                 continue;
             }
-            if short_cluster_takes_next(w, "uPaS") {
-                j += 2;
-            } else if !is_known_env_noarg_opt(w)
-                && raw_argv
-                    .get(j + 2)
-                    .is_some_and(|n2| (n2.starts_with('-') && n2.len() > 1) || n2.contains('='))
-            {
-                j += 2;
-            } else {
-                j += 1;
+            if w.starts_with('-') && !w.starts_with("--") && w.len() > 1 {
+                if let Some(pos) = w[1..].find('C') {
+                    let after = &w[1 + pos + 1..];
+                    if !after.is_empty() {
+                        dirs.push(after);
+                        j += 1;
+                    } else if let Some(next) = raw_argv.get(j + 1) {
+                        dirs.push(next.as_str());
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                    continue;
+                }
+                if short_cluster_takes_next(w, "uPaS") {
+                    j += 2;
+                } else if !is_known_env_noarg_opt(w)
+                    && raw_argv
+                        .get(j + 2)
+                        .is_some_and(|n2| (n2.starts_with('-') && n2.len() > 1) || n2.contains('='))
+                {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+                continue;
             }
-            continue;
-        }
-        if w.starts_with("--") {
-            if matches!(w, "--unset" | "--split-string" | "--argv0")
-                || match_gnu_long_opt(w, "--split-string", 5) == Some(None)
-                || match_gnu_long_opt(w, "--unset", 4) == Some(None)
-            {
-                j += 2;
-            } else if !w.contains('=')
-                && !is_known_env_noarg_opt(w)
-                && raw_argv
-                    .get(j + 2)
-                    .is_some_and(|n2| (n2.starts_with('-') && n2.len() > 1) || n2.contains('='))
-            {
-                j += 2;
-            } else {
-                j += 1;
+            if w.starts_with("--") {
+                if matches!(w, "--unset" | "--split-string" | "--argv0")
+                    || match_gnu_long_opt(w, "--split-string", 5) == Some(None)
+                    || match_gnu_long_opt(w, "--unset", 4) == Some(None)
+                {
+                    j += 2;
+                } else if !w.contains('=')
+                    && !is_known_env_noarg_opt(w)
+                    && raw_argv
+                        .get(j + 2)
+                        .is_some_and(|n2| (n2.starts_with('-') && n2.len() > 1) || n2.contains('='))
+                {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+                continue;
             }
-            continue;
+            if w.contains('=') {
+                j += 1;
+                continue;
+            }
+            break;
         }
-        if w.contains('=') {
-            j += 1;
-            continue;
-        }
-        break;
     }
     if dirs.is_empty() {
         return Ok(None);
@@ -2814,6 +2927,51 @@ fn extract_env_chdir_cands(
         }
     }
     Ok(Some((cur, unk)))
+}
+
+fn extract_proc_sub_echo_payloads(
+    u: &BestEffortUnit,
+    folds: FoldRules,
+    budget: &mut ComputeBudget,
+) -> Result<Vec<String>, Exhausted> {
+    let mut out = Vec::new();
+    for w in u.raw_argv.iter().chain(u.redirects.iter().map(|(_, t)| t)) {
+        budget.charge(w.len().max(1) as u64)?;
+        if let Some(inner) = w.strip_prefix("<(").and_then(|s| s.strip_suffix(')')) {
+            let words = raw_words_budgeted(inner, budget)?;
+            if let Some(first) = words.first() {
+                let f = fold_cmd_cr19(first, folds, budget)?;
+                if f == "echo" && words.len() > 1 {
+                    let mut k = 1;
+                    while k < words.len()
+                        && words[k].starts_with('-')
+                        && words[k].len() > 1
+                        && words[k][1..]
+                            .bytes()
+                            .all(|b| matches!(b, b'n' | b'e' | b'E'))
+                    {
+                        k += 1;
+                    }
+                    if k < words.len() {
+                        let s = words[k..].join(" ");
+                        budget.charge_alloc(s.len() + std::mem::size_of::<String>())?;
+                        out.push(s);
+                    }
+                } else if f == "printf" && words.len() > 1 {
+                    let k = if words.get(1).map(String::as_str) == Some("--") {
+                        2
+                    } else {
+                        1
+                    };
+                    if let Some(s) = words.get(k) {
+                        budget.charge_alloc(std::mem::size_of::<String>())?;
+                        out.push(clone_str_budgeted(s, budget)?);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Derives cluster-aware wrapper readings and `script`/`flock -c` inline
@@ -2892,18 +3050,39 @@ fn extract_env_split_string_be(
         return Ok(None);
     }
     let mut j = 1usize;
+    let mut saw_unknown = false;
+    let join_with_tail = |val: &str,
+                          tail: &[String],
+                          saw_unknown: bool,
+                          budget: &mut ComputeBudget|
+     -> Result<String, Exhausted> {
+        if saw_unknown || tail.is_empty() {
+            return clone_str_budgeted(val, budget);
+        }
+        let len: usize = val.len() + tail.iter().map(|s| 1 + s.len()).sum::<usize>();
+        budget.charge(len.max(1) as u64)?;
+        budget.charge_alloc(len)?;
+        let mut s = String::with_capacity(len);
+        s.push_str(val);
+        for t in tail {
+            s.push(' ');
+            s.push_str(t);
+        }
+        Ok(s)
+    };
     while let Some(w) = argv.get(j) {
         budget.charge(w.len().max(1) as u64)?;
         if w == "--" {
             break;
         }
         if let Some(attached) = match_gnu_long_opt(w, "--split-string", 5) {
-            let val = match attached {
-                Some(v) => Some(v),
-                None => argv.get(j + 1).map(String::as_str),
+            let (val, tail_start) = match attached {
+                Some(v) => (Some(v), j + 1),
+                None => (argv.get(j + 1).map(String::as_str), j + 2),
             };
             if let Some(s) = val {
-                return Ok(Some(clone_str_budgeted(s, budget)?));
+                let tail = argv.get(tail_start..).unwrap_or(&[]);
+                return Ok(Some(join_with_tail(s, tail, saw_unknown, budget)?));
             }
             return Ok(None);
         }
@@ -2911,16 +3090,28 @@ fn extract_env_split_string_be(
             if let Some(pos) = w[1..].find('S') {
                 let after = &w[1 + pos + 1..];
                 if !after.is_empty() {
-                    return Ok(Some(clone_str_budgeted(after, budget)?));
+                    let tail = argv.get(j + 1..).unwrap_or(&[]);
+                    return Ok(Some(join_with_tail(after, tail, saw_unknown, budget)?));
                 }
                 if let Some(next) = argv.get(j + 1) {
-                    return Ok(Some(clone_str_budgeted(next, budget)?));
+                    let tail = argv.get(j + 2..).unwrap_or(&[]);
+                    return Ok(Some(join_with_tail(next, tail, saw_unknown, budget)?));
                 }
                 return Ok(None);
             }
             if short_cluster_takes_next(w, "uCPa") {
                 j += 2;
+            } else if !is_known_env_noarg_opt(w)
+                && argv
+                    .get(j + 2)
+                    .is_some_and(|n2| (n2.starts_with('-') && n2.len() > 1) || n2.contains('='))
+            {
+                saw_unknown = true;
+                j += 2;
             } else {
+                if !is_known_env_noarg_opt(w) {
+                    saw_unknown = true;
+                }
                 j += 1;
             }
         } else if w.starts_with("--") {
@@ -2929,7 +3120,22 @@ fn extract_env_split_string_be(
                 || match_gnu_long_opt(w, "--argv0", 5) == Some(None)
             {
                 j += 2;
+            } else if !w.contains('=')
+                && !is_known_env_noarg_opt(w)
+                && argv
+                    .get(j + 2)
+                    .is_some_and(|n2| (n2.starts_with('-') && n2.len() > 1) || n2.contains('='))
+            {
+                saw_unknown = true;
+                j += 2;
             } else {
+                if !is_known_env_noarg_opt(w)
+                    && match_gnu_long_opt(w, "--chdir", 4).is_none()
+                    && match_gnu_long_opt(w, "--unset", 4).is_none()
+                    && match_gnu_long_opt(w, "--argv0", 5).is_none()
+                {
+                    saw_unknown = true;
+                }
                 j += 1;
             }
         } else if w.contains('=') {
@@ -3267,9 +3473,15 @@ fn check_unit_reading(
                     }
                 }
                 if !hits_stdin && !downstream.raw_argv.is_empty() {
-                    let raw_unwrapped = unwrap_simple_be(&downstream.raw_argv, folds, budget)?;
-                    if reads_stdin_as_code_budgeted(&raw_unwrapped, folds, 0, budget)? {
+                    let raw0 = unwrap_simple_be(&downstream.raw_argv, folds, budget)?;
+                    if reads_stdin_as_code_budgeted(&raw0, folds, 0, budget)? {
                         hits_stdin = true;
+                    } else {
+                        let raw1 =
+                            unwrap_simple_be_mode(&downstream.raw_argv, folds, true, budget)?;
+                        if raw1 != raw0 && reads_stdin_as_code_budgeted(&raw1, folds, 0, budget)? {
+                            hits_stdin = true;
+                        }
                     }
                 }
                 if hits_stdin {
@@ -4042,11 +4254,13 @@ pub(super) fn check_search_glob_best_effort(
     }
 
     // Fast path: plain relative filter with no braces, backslashes, `$`, `[`,
-    // `..` segment, or `?` dot-component.
+    // `~`/`/` anchor, `//`, `.`/`..` segment, or `?` dot-component.
     let has_special = glob.contains(['{', '}', '\\', '$', '['])
+        || glob.contains("//")
+        || glob.starts_with(['~', '/'])
         || glob
             .split('/')
-            .any(|c| c == ".." || may_be_dot_component(c));
+            .any(|c| matches!(c, "." | "..") || may_be_dot_component(c));
     if !has_special {
         return Ok(());
     }
@@ -4113,6 +4327,7 @@ pub(super) fn check_search_glob_best_effort(
 
     let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
     let all_probes = shared.hard_deny_probes(budget)?;
+    let all_store_probes = shared.store_probes(budget)?;
 
     // Filter probes to only those reachable: when no variant escapes or is
     // anchored, only probes under `root_folded` can possibly match. This avoids
@@ -4129,8 +4344,16 @@ pub(super) fn check_search_glob_best_effort(
             .filter(|(p, _)| root_folded.iter().any(|rf| under_bytes(p, rf).is_some()))
             .collect()
     };
+    let active_store_probes: Vec<(Vec<u8>, &'static str)> = if escaped || any_anchored {
+        all_store_probes
+    } else {
+        all_store_probes
+            .into_iter()
+            .filter(|(p, _)| root_folded.iter().any(|rf| under_bytes(p, rf).is_some()))
+            .collect()
+    };
 
-    if !active_probes.is_empty() {
+    if !active_probes.is_empty() || !active_store_probes.is_empty() {
         let (variants, search_unbounded) = search_variants_from_cands_budgeted(
             &root_strs,
             &protected.cwd,
@@ -4161,44 +4384,42 @@ pub(super) fn check_search_glob_best_effort(
         }
 
         if !matchers.is_empty() {
+            let match_probe = |probe_bytes: &[u8],
+                               probe_s: &str,
+                               budget: &mut ComputeBudget|
+             -> Result<bool, Exhausted> {
+                let name = probe_s.rsplit('/').next().unwrap_or(probe_s);
+                for m in &matchers {
+                    budget.charge(probe_s.len().max(1) as u64)?;
+                    if m.is_match(probe_s) {
+                        return Ok(true);
+                    }
+                }
+                for rf in &root_folded {
+                    let Some(rel_b) = under_bytes(probe_bytes, rf) else {
+                        continue;
+                    };
+                    let Ok(rel) = std::str::from_utf8(rel_b) else {
+                        continue;
+                    };
+                    let name_allowed = recursive || !rel.contains('/');
+                    for m in &matchers {
+                        budget.charge(rel.len().max(1) as u64)?;
+                        if (name_allowed && m.is_match(name))
+                            || (!rel.is_empty() && m.is_match(rel))
+                        {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
+            };
+
             for (probe_bytes, hard_id) in &active_probes {
                 let Ok(probe_s) = std::str::from_utf8(probe_bytes) else {
                     continue;
                 };
-                let name = probe_s.rsplit('/').next().unwrap_or(probe_s);
-                let mut matched = false;
-                // Check absolute probe match first (covers escaping & anchored patterns).
-                for m in &matchers {
-                    budget.charge(probe_s.len().max(1) as u64)?;
-                    if m.is_match(probe_s) {
-                        matched = true;
-                        break;
-                    }
-                }
-                if !matched {
-                    for rf in &root_folded {
-                        let Some(rel_b) = under_bytes(probe_bytes, rf) else {
-                            continue;
-                        };
-                        let Ok(rel) = std::str::from_utf8(rel_b) else {
-                            continue;
-                        };
-                        let name_allowed = recursive || !rel.contains('/');
-                        for m in &matchers {
-                            budget.charge(rel.len().max(1) as u64)?;
-                            if (name_allowed && m.is_match(name))
-                                || (!rel.is_empty() && m.is_match(rel))
-                            {
-                                matched = true;
-                                break;
-                            }
-                        }
-                        if matched {
-                            break;
-                        }
-                    }
-                }
-                if matched {
+                if match_probe(probe_bytes, probe_s, budget)? {
                     push_be_hit(
                         out,
                         part.clone(),
@@ -4211,10 +4432,32 @@ pub(super) fn check_search_glob_best_effort(
                     return Ok(());
                 }
             }
+
+            for (probe_bytes, family) in &active_store_probes {
+                let Ok(probe_s) = std::str::from_utf8(probe_bytes) else {
+                    continue;
+                };
+                if match_probe(probe_bytes, probe_s, budget)? {
+                    push_charged(
+                        out,
+                        PartResult {
+                            part: part.clone(),
+                            outcome: PartOutcome::StoreHit(Hit {
+                                hard_deny_id: None,
+                                source: HitSource::BestEffort,
+                                matched: HitMatch::StoreFamily { family },
+                                part: part.clone(),
+                            }),
+                        },
+                        budget,
+                    )?;
+                    break;
+                }
+            }
         }
     }
 
-    if cands.unknown || escaped || any_anchored {
+    if cands.unknown || escaped {
         push_charged(
             out,
             PartResult {
@@ -5694,6 +5937,14 @@ fn extract_shell_c_code<'a>(
         }
         if w == "--command" {
             seen_c = true;
+            j += 1;
+            continue;
+        }
+        if matches!(w, "--rcfile" | "--init-file") {
+            j += 2;
+            continue;
+        }
+        if w.starts_with("--") {
             j += 1;
             continue;
         }
