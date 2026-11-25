@@ -375,6 +375,41 @@ pub struct Rule {
     pub created_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(specta::Type))]
+pub struct ListedRule {
+    pub id: RuleId,
+    pub scope: RuleScope,
+    pub tool_kind: ToolKind,
+    pub tool_name: Option<String>,
+    pub matcher: RuleMatcher,
+    pub path_scope: Option<String>,
+    pub decision: RuleDecision,
+    pub origin: RuleOrigin,
+    pub created_at_ms: u64,
+    #[serde(default)]
+    pub invalid_reason: Option<String>,
+}
+
+impl ListedRule {
+    /// Wraps a stored [`Rule`] with its rev 4 §7 validation result for
+    /// `DaemonCommand::ListRules` (contract §7, §11 item 5, D-153).
+    pub fn from_rule(rule: Rule, invalid_reason: Option<String>) -> Self {
+        Self {
+            id: rule.id,
+            scope: rule.scope,
+            tool_kind: rule.tool_kind,
+            tool_name: rule.tool_name,
+            matcher: rule.matcher,
+            path_scope: rule.path_scope,
+            decision: rule.decision,
+            origin: rule.origin,
+            created_at_ms: rule.created_at_ms,
+            invalid_reason,
+        }
+    }
+}
+
 /// What a policy decision was evaluated against. Bound into every approval
 /// ticket (D-046).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -596,3 +631,111 @@ pub const HOME_READONLY_COMMANDS: &[ReadOnlyCommand] = &[
     git(&["git", "rev-parse"]),
     git(&["git", "ls-files"]),
 ];
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{GIT_FORBIDDEN, HOME_READONLY_COMMANDS, Recursion};
+
+    #[test]
+    fn home_readonly_commands_invariants_and_rev4_parity() {
+        assert_eq!(
+            HOME_READONLY_COMMANDS.len(),
+            24,
+            "15 HomeReadOnly tools + 2 Search tools (rg, grep) + 7 git subcommands"
+        );
+
+        let mut seen: HashSet<&[&str]> = HashSet::new();
+        for entry in HOME_READONLY_COMMANDS {
+            assert!(!entry.prefix.is_empty(), "prefix must be non-empty");
+            assert!(
+                seen.insert(entry.prefix),
+                "duplicate HOME_READONLY_COMMANDS prefix: {:?}",
+                entry.prefix
+            );
+            for &word in entry.prefix {
+                assert!(!word.is_empty());
+                assert_eq!(word, word.to_ascii_lowercase());
+            }
+            for &flag in entry.forbidden {
+                assert!(
+                    flag.starts_with('-'),
+                    "forbidden flag {flag:?} on {:?} must start with '-'",
+                    entry.prefix
+                );
+            }
+            if entry.prefix.first() == Some(&"git") {
+                assert_eq!(entry.prefix.len(), 2);
+                assert_eq!(entry.forbidden, GIT_FORBIDDEN);
+                assert_eq!(entry.recursion, Recursion::Never);
+            }
+        }
+
+        // Verify the exact rev 4 §6 set of prefixes.
+        let expected: &[&[&str]] = &[
+            &["ls"],
+            &["pwd"],
+            &["cat"],
+            &["head"],
+            &["tail"],
+            &["wc"],
+            &["file"],
+            &["stat"],
+            &["du"],
+            &["df"],
+            &["which"],
+            &["uname"],
+            &["date"],
+            &["whoami"],
+            &["tree"],
+            &["rg"],
+            &["grep"],
+            &["git", "status"],
+            &["git", "log"],
+            &["git", "diff"],
+            &["git", "show"],
+            &["git", "branch"],
+            &["git", "rev-parse"],
+            &["git", "ls-files"],
+        ];
+        let actual: Vec<&[&str]> = HOME_READONLY_COMMANDS.iter().map(|e| e.prefix).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn listed_rule_wire_compatibility_and_invalid_reason_default() {
+        use super::{
+            ListedRule, Rule, RuleDecision, RuleId, RuleMatcher, RuleOrigin, RuleScope, ToolKind,
+        };
+        let rule = Rule {
+            id: RuleId("r1".into()),
+            scope: RuleScope::Global,
+            tool_kind: ToolKind::Execute,
+            tool_name: None,
+            matcher: RuleMatcher::CommandPrefix {
+                argv: vec!["awk".into()],
+            },
+            path_scope: None,
+            decision: RuleDecision::Allow,
+            origin: RuleOrigin::Settings,
+            created_at_ms: 42,
+        };
+        let listed = ListedRule::from_rule(rule.clone(), Some("unpinned awk".into()));
+        let json_val = serde_json::to_value(&listed).expect("serialize ListedRule");
+        assert_eq!(json_val["invalid_reason"], "unpinned awk");
+
+        // Deserializing back as `ListedRule` preserves `invalid_reason`.
+        let round: ListedRule = serde_json::from_value(json_val.clone()).expect("ListedRule");
+        assert_eq!(round, listed);
+
+        // Wire compatibility: callers expecting `Rule` still deserialize cleanly.
+        let as_rule: Rule = serde_json::from_value(json_val).expect("Rule");
+        assert_eq!(as_rule, rule);
+
+        // `#[serde(default)]`: legacy JSON without `invalid_reason` deserializes to `None`.
+        let legacy_json = serde_json::to_value(&rule).expect("serialize Rule");
+        let from_legacy: ListedRule = serde_json::from_value(legacy_json).expect("legacy");
+        assert_eq!(from_legacy.invalid_reason, None);
+    }
+}

@@ -321,6 +321,19 @@ export type InboxItem = {
 
 export type InboxReason = "storage_full" | "approval" | "question" | "failed" | "cleanup_unverified" | "reply";
 
+export type ListedRule = {
+	id: RuleId,
+	scope: RuleScope,
+	tool_kind: ToolKind,
+	tool_name: string | null,
+	matcher: RuleMatcher,
+	path_scope: string | null,
+	decision: RuleDecision,
+	origin: RuleOrigin,
+	created_at_ms: number,
+	invalid_reason?: string | null,
+};
+
 export type Location = 
 /**  Home: cwd `~`, policy "read freely, approve changes". */
 { type: "home" };

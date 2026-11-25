@@ -6,11 +6,11 @@
 import { ChevronLeft, ChevronRight, Search, X } from "lucide-solid";
 import { For, Match, Show, Switch, createResource, createSignal, lazy } from "solid-js";
 import { probes, providerName, refetchProbes } from "../chat/actions";
-import { ruleText } from "../chat/rules";
 import { command, daemon } from "../daemon/client";
-import { type Rule, isCommandFailure } from "../daemon/types";
+import { type ListedRule, isCommandFailure } from "../daemon/types";
 import { type SettingRow, type SettingsSectionSpec, registerSection, searchSettings } from "../settings-registry";
 import { DetailsLink } from "./Enforcement";
+import { RulesListView } from "./RulesList";
 import { advancedOpen, highlightRow, ruleFormOpen, setRuleFormOpen, setAdvancedOpen, setHighlightRow, setScreen, setSettingsQuery, setSettingsSection, settingsQuery, settingsSection, showToast, type SettingsSection } from "../state";
 import { MAX_BLUR_STRENGTH, MIN_ALPHA, type AppearanceSettings } from "../window-model";
 import { accessibilityOpaque, effectiveSettings, nativeError, nativeSupported, patchSettings, platform } from "../windows";
@@ -76,13 +76,13 @@ const NOTIFY: { id: string; key: string; label: string; hint: string }[] = [
 ];
 
 /** Remembered rules (contract §5 "Remember", §9), read when the Approvals section is shown. */
-const [rules, { refetch: refetchRules }] = createResource<Rule[], boolean>(
+const [rules, { refetch: refetchRules }] = createResource<ListedRule[], boolean>(
   () => connected() && settingsSection() === "approvals",
-  async (shown) => (shown ? command<Rule[]>({ type: "list_rules" }).catch(() => []) : []),
+  async (shown) => (shown ? command<ListedRule[]>({ type: "list_rules" }).catch(() => []) : []),
 );
 const [deletingRule, setDeletingRule] = createSignal<string | null>(null);
 
-async function deleteRule(rule: Rule): Promise<void> {
+async function deleteRule(rule: ListedRule): Promise<void> {
   setDeletingRule(rule.id);
   try {
     await command({ type: "delete_rule", rule_id: rule.id });
@@ -193,25 +193,13 @@ function AgentsList() {
 function RulesList() {
   const titleOf = (threadId: string) => daemon().threads[threadId]?.title;
   return (
-    <div class="s-list" data-atrium-part="rules">
-      <For each={rules() ?? []} fallback={<p class="s-empty">{rules.loading ? "" : "Nothing is remembered. Atrium asks each time, unless you choose “Always…” on an approval."}</p>}>
-        {(rule) => {
-          const text = ruleText(rule, titleOf);
-          return (
-            <div class="s-item">
-              <Dot tone={rule.decision === "allow" ? "ready" : "failed"} />
-              <div class="s-main">
-                <b>{text.decision} {text.what}</b>
-                <Show when={text.code}><span class="code">{text.code}</span></Show>
-                <span>{text.where}</span>
-                <span>{text.origin}</span>
-              </div>
-              <button type="button" class="btn sm" disabled={deletingRule() !== null} aria-label={`Delete the rule: ${text.decision} ${text.what} ${text.code ?? ""}`} onClick={() => void deleteRule(rule)}>Delete</button>
-            </div>
-          );
-        }}
-      </For>
-    </div>
+    <RulesListView
+      rules={rules() ?? []}
+      loading={rules.loading}
+      deleting={deletingRule() !== null}
+      titleOf={titleOf}
+      onDelete={(rule) => void deleteRule(rule)}
+    />
   );
 }
 

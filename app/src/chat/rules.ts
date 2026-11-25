@@ -1,7 +1,9 @@
-// How a remembered rule reads in Settings → Approvals (contract §5 and §9; D-054: the exact
-// command, never a summary; D-062: rules apply in any folder). Pure; tested in rules.test.ts.
+// How a remembered rule reads in Settings → Approvals (contract §5, §7, §9, §11 item 5;
+// D-054: the exact command, never a summary; D-062: rules apply in any folder; D-153).
+// Pure; tested in rules.test.ts.
 
-import type { Rule, ToolKind } from "../daemon/types";
+import type { ListedRule, ToolKind } from "../daemon/types";
+import { checkStoredRule } from "./rule-form";
 
 const KIND: Record<ToolKind, string> = {
   execute: "command",
@@ -39,9 +41,11 @@ export interface RuleText {
   where: string;
   /** How it came to be. */
   origin: string;
+  /** Non-null when this stored rule fails rev 4 §7 validation and covers nothing (§11 item 5). */
+  invalidReason: string | null;
 }
 
-export function ruleText(rule: Rule, titleOf: (threadId: string) => string | undefined): RuleText {
+export function ruleText(rule: ListedRule, titleOf: (threadId: string) => string | undefined): RuleText {
   // The tool in brackets: "by Edit of" read badly when the tool is named after its kind.
   const tool = rule.tool_name ? ` (${rule.tool_name})` : "";
   let what: string;
@@ -80,5 +84,13 @@ export function ruleText(rule: Rule, titleOf: (threadId: string) => string | und
   const where = rule.path_scope ? `${scope}, only for paths inside ${rule.path_scope}` : `${scope}, in any folder`;
   const when = new Date(rule.created_at_ms).toLocaleDateString();
   const origin = rule.origin.type === "approval" ? `Remembered from an approval on ${when}` : `Added in settings on ${when}`;
-  return { decision: rule.decision === "allow" ? "Allow" : "Deny", what, code, where, origin };
+  const validity = checkStoredRule(rule);
+  return {
+    decision: rule.decision === "allow" ? "Allow" : "Deny",
+    what,
+    code,
+    where,
+    origin,
+    invalidReason: validity.valid ? null : validity.reason,
+  };
 }

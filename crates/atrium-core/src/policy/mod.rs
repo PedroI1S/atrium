@@ -26,6 +26,21 @@ mod words;
 
 pub use gate::{RulesSource, SessionGateConfig, StoreRules, fs_resolve};
 
+/// Validates a rule matcher (and optional `path_scope`) against policy rev 4
+/// §7's code-runner pinning and glob syntax rules (contract §7, §11 items 4–5,
+/// D-153).
+///
+/// Calls `v4::rules::validate_rule_matcher` with [`model::FoldRules::REV4`]
+/// and returns a plain user-facing explanation on error, suitable for daemon
+/// `ErrorCode::Invalid` responses and `ListRules` invalid-rule annotations.
+pub fn validate_rule_matcher(
+    matcher: &atrium_protocol::policy::RuleMatcher,
+    decision: atrium_protocol::policy::RuleDecision,
+    path_scope: Option<&str>,
+) -> Result<(), String> {
+    v4::rules::validate_rule_draft_reason(matcher, decision, path_scope, &model::FoldRules::REV4)
+}
+
 /// Canonical bytes of a tool call's input for binding approvals: JSON with
 /// object keys sorted, no insignificant whitespace, numbers as serde_json
 /// prints them, prefixed by `kind` and `name`. Two calls hash equal iff an

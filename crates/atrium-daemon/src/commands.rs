@@ -18,7 +18,7 @@ use atrium_core::{
 use atrium_host::lifecycle;
 use atrium_protocol::agent::SessionCommand;
 use atrium_protocol::limits::REPLAY_PAGE_EVENTS;
-use atrium_protocol::policy::{Preset, Rule, RuleDraft, RuleId, RuleMatcher, RuleOrigin};
+use atrium_protocol::policy::{ListedRule, Preset, Rule, RuleDraft, RuleId, RuleOrigin, RuleScope};
 use atrium_protocol::thread::{Location, ThreadId, ThreadSummary};
 use atrium_protocol::wire::{
     AgentLaunch, DaemonCommand, ErrorCode, EventId, ExportFormat, ProviderProbe, StoredEvent,
@@ -333,7 +333,19 @@ pub(crate) async fn run(
         DaemonCommand::ListInbox => Ok(inbox_value(inner.hub().inbox())),
         DaemonCommand::ListRules => {
             let (_, rules) = inner.store.rules().await.map_err(store_failure)?;
-            value(&rules)
+            let listed: Vec<ListedRule> = rules
+                .into_iter()
+                .map(|rule| {
+                    let invalid_reason = atrium_core::policy::validate_rule_matcher(
+                        &rule.matcher,
+                        rule.decision,
+                        rule.path_scope.as_deref(),
+                    )
+                    .err();
+                    ListedRule::from_rule(rule, invalid_reason)
+                })
+                .collect();
+            value(&listed)
         }
         DaemonCommand::CreateRule { rule } => create_rule(inner, rule).await,
         DaemonCommand::DeleteRule { rule_id } => {
@@ -607,10 +619,20 @@ async fn probe(inner: &Arc<Inner>, preset: Preset) -> Result<Value, Failure> {
 }
 
 async fn create_rule(inner: &Arc<Inner>, draft: RuleDraft) -> Result<Value, Failure> {
-    if let RuleMatcher::CommandPrefix { argv } | RuleMatcher::CommandExact { argv } = &draft.matcher
-        && argv.is_empty()
+    if let RuleScope::Thread { thread_id } = &draft.scope
+        && thread_id.0.is_empty()
     {
-        return Err(failure(ErrorCode::Invalid, "the rule's command is empty"));
+        return Err(failure(
+            ErrorCode::Invalid,
+            "the rule's thread scope is empty",
+        ));
+    }
+    if let Err(reason) = atrium_core::policy::validate_rule_matcher(
+        &draft.matcher,
+        draft.decision,
+        draft.path_scope.as_deref(),
+    ) {
+        return Err(failure(ErrorCode::Invalid, reason));
     }
     let now = now_ms();
     let rule = Rule {
