@@ -18,7 +18,7 @@ use crate::policy::model::{
     ModelRedirect, OperandRole, PartId, PartOutcome, PartResult, ProtectedSet, RuleCoverage,
     RuleEvalContext, Target, TargetOrigin, TargetResolution, ToolEffects, UnitIndex, UnreadReason,
 };
-use crate::policy::tools;
+use crate::policy::tools::{self, ToolRowKind};
 use crate::policy::v4::lex::lex_best_effort;
 use crate::policy::v4::paths::sensitive::{
     ASK_FILES, ASK_NAME_PREFIXES, ASK_TREES, BROWSER_ROOTS, CRED_FILES, CRED_TREES,
@@ -29,11 +29,12 @@ use crate::policy::v4::paths::{
 };
 use crate::policy::v4::rules::{evaluate_rules, remember_matcher};
 use crate::policy::v4::tools::{check_git_selection_into, classify_unit};
-use crate::policy::v4::units::build_units;
+use crate::policy::v4::units::{UnitReasonSink, build_units_with_hook};
 use crate::{PolicyInput, PolicyVerdict};
 
 use best_effort::{
-    BestEffortOptions, check_search_glob_best_effort, is_home_readonly_tool, run_best_effort_into,
+    BestEffortOptions, check_search_glob_best_effort, is_home_readonly_tool, raw_text_checks,
+    run_best_effort_into,
 };
 
 /// Runs the §2 best-effort pass over raw text, tolerant-lexer units (including
@@ -408,33 +409,70 @@ fn evaluate_command(
         return finalize_too_large(std::mem::take(outcome));
     }
 
-    // 1. P1: exact lex + unwrap + nested shells + best-effort lex.
-    let parsed = match build_units(line, &folds, budget) {
-        Ok(p) => p,
-        Err(PartOutcome::TooLarge(cap)) => {
-            outcome.parts.push(PartResult {
-                part: PartId::WholeCall,
-                outcome: PartOutcome::TooLarge(cap),
-            });
-            return finalize_too_large(std::mem::take(outcome));
-        }
-        Err(other) => {
-            outcome.parts.push(PartResult {
-                part: PartId::WholeCall,
-                outcome: other,
-            });
-            return finalize_exhausted_or_ask(
-                input,
-                rules,
-                folds,
-                &[],
-                &[],
-                &[],
-                &BestEffortRecord::default(),
-                budget,
-                std::mem::take(outcome),
-                false,
-            );
+    // 1. P1: exact lex + unwrap + nested shells + best-effort lex, wired with
+    //    P3's `CodeRunnerHook` (`build_units_with_hook` / `UnitReasonSink`) so
+    //    code-runner reasons are attached while units are built and `classify_unit`
+    //    runs once per unit.
+    let mut hook_effects: Vec<(UnitIndex, ToolEffects, bool)> = Vec::new();
+    let parsed = {
+        let mut hook = |unit: &CommandUnit,
+                        _folded: &str,
+                        sink: &mut UnitReasonSink<'_>,
+                        budget: &mut ComputeBudget|
+         -> Result<(), Exhausted> {
+            let eff = classify_unit(unit, &folds, budget)?;
+            let is_nested_shell = eff
+                .tool_name
+                .and_then(tools::lookup)
+                .is_some_and(tools::ToolSpec::is_nested_shell);
+            let mut pushed_unread = false;
+            if !is_nested_shell && !eff.unread.is_empty() {
+                let is_code_runner = eff.code != CodeExecution::None
+                    || eff.tool_name.and_then(tools::lookup).is_some_and(|s| {
+                        matches!(
+                            s.kind,
+                            ToolRowKind::CodeRunner(_) | ToolRowKind::ConditionalRunner(_)
+                        )
+                    });
+                if is_code_runner {
+                    budget.charge(eff.unread.len() as u64)?;
+                    sink.reserve(eff.unread.len(), budget)?;
+                    for r in &eff.unread {
+                        sink.push(r.clone(), budget)?;
+                    }
+                    pushed_unread = true;
+                }
+            }
+            push_vec_charged(&mut hook_effects, (unit.index, eff, pushed_unread), budget)?;
+            Ok(())
+        };
+        match build_units_with_hook(line, &folds, Some(&mut hook), budget) {
+            Ok(p) => p,
+            Err(PartOutcome::TooLarge(cap)) => {
+                outcome.parts.push(PartResult {
+                    part: PartId::WholeCall,
+                    outcome: PartOutcome::TooLarge(cap),
+                });
+                return finalize_too_large(std::mem::take(outcome));
+            }
+            Err(other) => {
+                outcome.parts.push(PartResult {
+                    part: PartId::WholeCall,
+                    outcome: other,
+                });
+                return finalize_exhausted_or_ask(
+                    input,
+                    rules,
+                    folds,
+                    &[],
+                    &[],
+                    &[],
+                    &BestEffortRecord::default(),
+                    budget,
+                    std::mem::take(outcome),
+                    false,
+                );
+            }
         }
     };
 
@@ -484,9 +522,12 @@ fn evaluate_command(
         }
     }
 
-    // 2. P3: classify each modeled unit + Git name-selection / wildcard checks.
+    // 2. P3: reuse `ToolEffects` computed during the hook (or classify units
+    //    the hook did not visit) + Git name-selection / wildcard checks.
     let mut effects: Vec<ToolEffects> = Vec::with_capacity(parsed.units.len());
     let mut quoted_literal_words: HashSet<Vec<u8>> = HashSet::new();
+    let mut unquoted_glob_words: HashSet<Vec<u8>> = HashSet::new();
+    let mut hook_iter = hook_effects.into_iter().peekable();
     for u in &parsed.units {
         if budget.is_exhausted() {
             record_exhausted(
@@ -499,18 +540,46 @@ fn evaluate_command(
             break;
         }
         // Record exact quoted literal words that have NO unquoted glob chars (§3, §10 row 9).
+        // If the same byte spelling also appears unquoted with glob chars elsewhere in
+        // the call, do not suppress best-effort glob matching on it.
         for w in &u.argv {
-            if !w.has_unquoted_glob()
-                && w.literal_bytes()
-                    .iter()
-                    .any(|&b| matches!(b, b'*' | b'?' | b'['))
-            {
-                quoted_literal_words.insert(w.literal_bytes().to_vec());
+            let lb = w.literal_bytes();
+            if let Err(e) = budget.charge(lb.len().max(1) as u64) {
+                record_exhausted(&mut outcome.parts, PartId::Unit(u.index), e.reason);
+                break;
+            }
+            if lb.iter().any(|&b| matches!(b, b'*' | b'?' | b'[')) {
+                if w.has_unquoted_glob() {
+                    if !unquoted_glob_words.contains(lb) {
+                        if let Err(e) = budget.charge_alloc(lb.len() + 24) {
+                            record_exhausted(&mut outcome.parts, PartId::Unit(u.index), e.reason);
+                            break;
+                        }
+                        unquoted_glob_words.insert(lb.to_vec());
+                    }
+                } else if !quoted_literal_words.contains(lb) {
+                    if let Err(e) = budget.charge_alloc(lb.len() + 24) {
+                        record_exhausted(&mut outcome.parts, PartId::Unit(u.index), e.reason);
+                        break;
+                    }
+                    quoted_literal_words.insert(lb.to_vec());
+                }
             }
         }
+        if budget.is_exhausted() {
+            break;
+        }
 
-        match classify_unit(u, &folds, budget) {
-            Ok(mut eff) => {
+        let classified: Result<(ToolEffects, bool), Exhausted> =
+            if hook_iter.peek().is_some_and(|(idx, _, _)| *idx == u.index) {
+                let (_, eff, pushed_by_hook) = hook_iter.next().unwrap();
+                Ok((eff, pushed_by_hook))
+            } else {
+                classify_unit(u, &folds, budget).map(|eff| (eff, false))
+            };
+
+        match classified {
+            Ok((mut eff, pushed_by_hook)) => {
                 // Wiring: if P1 expanded this `sh`/`bash`/`dash -c SCRIPT` unit
                 // into child units (modeled §4 form), give the parent unit
                 // non-writing modeled nested-shell effects (matching P2's
@@ -541,11 +610,19 @@ fn evaluate_command(
                     .redirects
                     .iter()
                     .any(ModelRedirect::writes_outside_dev_null);
-                let tool_only_reads = !eff.writes
-                    || (redirect_writes
-                        && eff
-                            .tool_name
-                            .is_some_and(|n| is_never_writing_home_ro(n, eff.subcommand)));
+                let tool_only_reads = if !eff.writes {
+                    true
+                } else if redirect_writes {
+                    match home_ro_tool_reads_only_without_redirects(u, &eff, budget) {
+                        Ok(ro) => ro,
+                        Err(e) => {
+                            record_exhausted(&mut outcome.parts, PartId::Unit(u.index), e.reason);
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
                 if tool_only_reads
                     && eff
                         .tool_name
@@ -557,19 +634,21 @@ fn evaluate_command(
                 }
 
                 // Push unit-level Unread reasons from P3 (avoiding duplicate
-                // `UnreadReason::Program` already pushed by P1 for `sh x.sh`).
-                for reason in &eff.unread {
-                    let dup_p1_program = matches!(reason, UnreadReason::Program { .. })
-                        && p1_rejected_nested.contains(&u.index);
-                    if !dup_p1_program {
-                        record_part_preserving(
-                            &mut outcome.parts,
-                            PartResult {
-                                part: PartId::Unit(u.index),
-                                outcome: PartOutcome::Unread(reason.clone()),
-                            },
-                            budget,
-                        );
+                // reasons already pushed by P1 or by the `CodeRunnerHook`).
+                if !pushed_by_hook {
+                    for reason in &eff.unread {
+                        let dup_p1_program = matches!(reason, UnreadReason::Program { .. })
+                            && p1_rejected_nested.contains(&u.index);
+                        if !dup_p1_program {
+                            record_part_preserving(
+                                &mut outcome.parts,
+                                PartResult {
+                                    part: PartId::Unit(u.index),
+                                    outcome: PartOutcome::Unread(reason.clone()),
+                                },
+                                budget,
+                            );
+                        }
                     }
                 }
 
@@ -589,6 +668,9 @@ fn evaluate_command(
                 break;
             }
         }
+    }
+    for w in &unquoted_glob_words {
+        quoted_literal_words.remove(w);
     }
 
     // 3. P2: resolve command targets, globs, recursive roots, filters, writers, cd.
@@ -687,6 +769,7 @@ fn evaluate_command(
         &mut outcome.parts,
     );
 
+    ensure_exhausted_recorded(budget, &mut outcome.parts);
     let verdict = decide(outcome, &rule_coverage, input.preset, home_readonly_all);
     let remember = if verdict == PolicyVerdict::Ask {
         let rule_ctx = RuleEvalContext {
@@ -722,6 +805,8 @@ fn resolve_kv_hard_deny_aliases(
     budget: &mut ComputeBudget,
     outcomes: &mut Vec<PartResult>,
 ) -> Result<(), Exhausted> {
+    budget.charge(start_cwd.len().max(1) as u64)?;
+    budget.charge_alloc(start_cwd.len())?;
     let mut cur_cwd = start_cwd.to_vec();
     let mut cwd_known = true;
     for (idx, u) in units.iter().enumerate() {
@@ -777,6 +862,7 @@ fn resolve_kv_hard_deny_aliases(
                 continue;
             }
             let bytes = w.literal_bytes();
+            budget.charge(bytes.len().max(1) as u64)?;
             let Some(eq) = bytes.iter().position(|&b| b == b'=') else {
                 continue;
             };
@@ -795,34 +881,30 @@ fn resolve_kv_hard_deny_aliases(
                     .copied()
                     .unwrap_or(AccessMode::ReadWrite)
             };
-            // Resolve RHS relative to `cur_cwd` by building a local view of `protected`
-            // with `cwd = cur_cwd` only when `cur_cwd != protected.cwd`.
-            let local_prot;
-            let prot_ref = if cur_cwd == protected.cwd {
-                protected
-            } else {
-                local_prot = ProtectedSet {
-                    home: protected.home.clone(),
-                    cwd: cur_cwd.clone(),
-                    atrium_data_paths: protected.atrium_data_paths.clone(),
-                    atrium_protected_paths: protected.atrium_protected_paths.clone(),
-                    hard_deny_identities: protected.hard_deny_identities.clone(),
-                    write_only_hard_deny_identities: protected
-                        .write_only_hard_deny_identities
-                        .clone(),
-                    identity_gaps: protected.identity_gaps.clone(),
-                    store_identities: protected.store_identities.clone(),
-                    ssh_linked_dirs: protected.ssh_linked_dirs.clone(),
-                    folds: protected.folds,
+            // Resolve RHS relative to `cur_cwd` without cloning `ProtectedSet`:
+            // when `cur_cwd != protected.cwd` and `val` is relative, join onto
+            // `cur_cwd` first so `resolve_subject_paths` still applies full
+            // D-147/D-154 alias checks with zero `ProtectedSet` clone.
+            let joined_val: String =
+                if cur_cwd == protected.cwd || val.starts_with(b"/") || val.starts_with(b"~") {
+                    budget.charge_alloc(val_str.len())?;
+                    val_str.to_owned()
+                } else {
+                    let needed = cur_cwd.len() + 1 + val.len();
+                    budget.charge(needed as u64)?;
+                    budget.charge_alloc(needed)?;
+                    let joined = join_folded(&cur_cwd, val);
+                    match String::from_utf8(joined) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    }
                 };
-                &local_prot
-            };
             let res = resolve_subject_paths(
-                &[val_str.to_owned()],
+                &[joined_val],
                 None,
                 false,
                 access,
-                prot_ref,
+                protected,
                 resolver,
                 fs_caps,
                 budget,
@@ -857,15 +939,15 @@ fn resolve_command_cwd_override(
     budget.charge(sub_cwd.len().max(1) as u64)?;
     // Expand leading `$HOME` / `${HOME}` / `$PWD` / `${PWD}` on cwd override
     // (e.g. `cwd: Some("$HOME/.ssh")` in `adversarial_gate.rs`).
-    let home_s = String::from_utf8_lossy(&protected.home);
-    let cwd_s = String::from_utf8_lossy(&protected.cwd);
     let expanded: Vec<u8> = if let Some(rest) = sub_cwd
         .strip_prefix("$HOME")
         .or_else(|| sub_cwd.strip_prefix("${HOME}"))
         && (rest.is_empty() || rest.starts_with('/'))
     {
-        let mut v = Vec::with_capacity(home_s.len() + rest.len());
-        budget.charge_alloc(home_s.len() + rest.len())?;
+        let len = protected.home.len() + rest.len();
+        budget.charge(len.max(1) as u64)?;
+        budget.charge_alloc(len)?;
+        let mut v = Vec::with_capacity(len);
         v.extend_from_slice(&protected.home);
         v.extend_from_slice(rest.as_bytes());
         v
@@ -874,12 +956,15 @@ fn resolve_command_cwd_override(
         .or_else(|| sub_cwd.strip_prefix("${PWD}"))
         && (rest.is_empty() || rest.starts_with('/'))
     {
-        let mut v = Vec::with_capacity(cwd_s.len() + rest.len());
-        budget.charge_alloc(cwd_s.len() + rest.len())?;
+        let len = protected.cwd.len() + rest.len();
+        budget.charge(len.max(1) as u64)?;
+        budget.charge_alloc(len)?;
+        let mut v = Vec::with_capacity(len);
         v.extend_from_slice(&protected.cwd);
         v.extend_from_slice(rest.as_bytes());
         v
     } else {
+        budget.charge_alloc(sub_cwd.len())?;
         sub_cwd.as_bytes().to_vec()
     };
 
@@ -935,23 +1020,75 @@ fn modeled_nested_shell_effects(unit: &CommandUnit, shell_name: &'static str) ->
     }
 }
 
-/// `HomeReadOnly` tools whose normative row has empty `forbidden` and `only: None`
-/// (i.e. they can never write through flags, only via an output redirect).
-fn is_never_writing_home_ro(tool_name: &str, _subcommand: Option<&str>) -> bool {
-    matches!(
-        tool_name,
-        "ls" | "pwd"
-            | "cat"
-            | "head"
-            | "tail"
-            | "wc"
-            | "stat"
-            | "du"
-            | "df"
-            | "which"
-            | "uname"
-            | "whoami"
-    )
+/// Returns `true` when a `HomeReadOnly` tool has no write-enabling flags or
+/// operands of its own (so `eff.writes == true` came solely from an output
+/// redirect, whose target already has `AccessMode::Write`).
+fn home_ro_tool_reads_only_without_redirects(
+    unit: &CommandUnit,
+    eff: &ToolEffects,
+    budget: &mut ComputeBudget,
+) -> Result<bool, Exhausted> {
+    let Some(tool_name) = eff.tool_name else {
+        return Ok(false);
+    };
+    let Some(spec) = tools::lookup(tool_name) else {
+        return Ok(false);
+    };
+    let (ro, args_start) = match spec.kind {
+        ToolRowKind::HomeReadOnly(row) => (row.home_readonly, 1usize),
+        ToolRowKind::ConditionalRunner(row) => {
+            let Some(sub) = eff.subcommand else {
+                return Ok(false);
+            };
+            let Some(sub_spec) = row.subcommands.iter().find(|s| s.name == sub) else {
+                return Ok(false);
+            };
+            match sub_spec.kind {
+                tools::SubcommandKind::HomeReadOnly(r) => (r.home_readonly, 2usize),
+                _ => return Ok(false),
+            }
+        }
+        _ => return Ok(false),
+    };
+    if args_start > unit.argv.len() {
+        return Ok(false);
+    }
+    for arg in &unit.argv[args_start..] {
+        let bytes = arg.literal_bytes();
+        budget.charge(bytes.len().max(1) as u64)?;
+        if bytes == b"--" {
+            break;
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(tok) => {
+                budget.charge(ro.forbidden.len().max(1) as u64)?;
+                if tools::is_forbidden_flag(ro.forbidden, tok) {
+                    return Ok(false);
+                }
+            }
+            Err(_) => {
+                if !ro.forbidden.is_empty() && bytes.starts_with(b"-") {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    if let Some(only) = ro.only {
+        for arg in &unit.argv[args_start..] {
+            let bytes = arg.literal_bytes();
+            budget.charge(bytes.len().max(1) as u64)?;
+            match std::str::from_utf8(bytes) {
+                Ok(tok) => {
+                    budget.charge(only.len().max(1) as u64)?;
+                    if !only.contains(&tok) {
+                        return Ok(false);
+                    }
+                }
+                Err(_) => return Ok(false),
+            }
+        }
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1150,6 +1287,7 @@ fn evaluate_paths(
         _ => false,
     };
 
+    ensure_exhausted_recorded(budget, &mut outcome.parts);
     let verdict = decide(outcome, &rule_coverage, input.preset, home_readonly_all);
     let remember = if verdict == PolicyVerdict::Ask {
         let rule_ctx = RuleEvalContext {
@@ -1282,6 +1420,7 @@ fn evaluate_fetch(
         }
     };
 
+    ensure_exhausted_recorded(budget, &mut outcome.parts);
     let verdict = decide(outcome, &rule_coverage, input.preset, false);
     CallEvaluation {
         verdict,
@@ -1336,13 +1475,24 @@ fn evaluate_mcp(
 
     let mut targets: Vec<Target> = Vec::new();
     if !budget.is_exhausted() {
-        let path_candidates: Vec<String> = strings
-            .iter()
-            .copied()
-            .filter(|s| !s.is_empty() && !s.contains(char::is_whitespace))
-            .map(str::to_owned)
-            .collect();
-        if !path_candidates.is_empty() {
+        let mut path_candidates: Vec<String> = Vec::new();
+        let mut alloc_err = None;
+        for &s in &strings {
+            if !s.is_empty() && !s.contains('\0') {
+                if let Err(e) = budget
+                    .charge(s.len() as u64)
+                    .and_then(|()| budget.charge_alloc(s.len() + std::mem::size_of::<String>()))
+                {
+                    alloc_err = Some(e);
+                    break;
+                }
+                path_candidates.push(s.to_owned());
+            }
+        }
+        if let Some(e) = alloc_err {
+            record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
+        }
+        if !path_candidates.is_empty() && !budget.is_exhausted() {
             match resolve_subject_paths(
                 &path_candidates,
                 None,
@@ -1357,6 +1507,22 @@ fn evaluate_mcp(
                     outcome.multiply_linked_file |= resolved.multiply_linked_file;
                     outcome.parts.extend(resolved.outcomes);
                     targets = resolved.targets;
+                }
+                Err(e) => record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason),
+            }
+        }
+        // Best-effort raw-text checks on MCP string values (matches `dev`'s `raw` check).
+        if !budget.is_exhausted() && !strings.is_empty() {
+            match SharedSensitive::for_protected_budgeted(protected, budget) {
+                Ok(shared) => {
+                    for &s in &strings {
+                        if let Err(e) =
+                            raw_text_checks(s, &shared, folds, budget, &mut outcome.parts)
+                        {
+                            record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
+                            break;
+                        }
+                    }
                 }
                 Err(e) => record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason),
             }
@@ -1387,6 +1553,7 @@ fn evaluate_mcp(
         }
     };
 
+    ensure_exhausted_recorded(budget, &mut outcome.parts);
     let verdict = decide(outcome, &rule_coverage, input.preset, false);
     CallEvaluation {
         verdict,
@@ -1430,6 +1597,7 @@ fn evaluate_none(
         }
     };
 
+    ensure_exhausted_recorded(budget, &mut outcome.parts);
     // `ToolSubject::None` is allowed in every preset (including Careful),
     // unless a Deny rule or budget exhaustion applies (`dev` `engine.rs:840, 968`).
     let verdict = if let Some((reason, rule_id)) = &rule_coverage.deny {
@@ -1529,22 +1697,52 @@ fn evaluate_unknown(
     let mut targets: Vec<Target> = Vec::new();
     if !budget.is_exhausted() {
         let mut candidates: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut alloc_err = None;
         for &s in &strings {
             if !s.is_empty()
-                && !s.contains(char::is_whitespace)
+                && !s.contains('\0')
                 && candidates.len() < limits::MAX_USES
+                && seen.insert(s)
             {
+                if let Err(e) = budget.charge(s.len() as u64).and_then(|()| {
+                    budget.charge_alloc(
+                        s.len() + std::mem::size_of::<String>() + std::mem::size_of::<&str>(),
+                    )
+                }) {
+                    alloc_err = Some(e);
+                    break;
+                }
                 candidates.push(s.to_owned());
             }
         }
-        for u in &best_effort.units {
-            for w in u.effective_argv.iter().skip(1) {
-                if !w.is_empty() && !candidates.contains(w) && candidates.len() < limits::MAX_USES {
-                    candidates.push(w.clone());
+        if alloc_err.is_none() {
+            'outer: for u in &best_effort.units {
+                for w in u.effective_argv.iter().skip(1) {
+                    if !w.is_empty()
+                        && !w.contains('\0')
+                        && candidates.len() < limits::MAX_USES
+                        && seen.insert(w.as_str())
+                    {
+                        if let Err(e) = budget.charge(w.len() as u64).and_then(|()| {
+                            budget.charge_alloc(
+                                w.len()
+                                    + std::mem::size_of::<String>()
+                                    + std::mem::size_of::<&str>(),
+                            )
+                        }) {
+                            alloc_err = Some(e);
+                            break 'outer;
+                        }
+                        candidates.push(w.clone());
+                    }
                 }
             }
         }
-        if !candidates.is_empty() {
+        if let Some(e) = alloc_err {
+            record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
+        }
+        if !candidates.is_empty() && !budget.is_exhausted() {
             match resolve_subject_paths(
                 &candidates,
                 None,
@@ -1635,6 +1833,9 @@ fn home_recursive_root_ok(
     }
 
     // Must not equal or contain any credential file/tree, `.ssh`, browser root, or store.
+    // Since `folded = home + "/" + rest` with non-empty `rest`, checking whether
+    // `home + "/" + rel` lies at or below `folded` is identical to
+    // `under_bytes(rel, rest).is_some()` — zero heap allocation.
     budget.charge(
         (CRED_FILES.len()
             + CRED_TREES.len()
@@ -1644,8 +1845,7 @@ fn home_recursive_root_ok(
             + ASK_NAME_PREFIXES.len()
             + 2) as u64,
     )?;
-    let ssh = join_folded(home, b".ssh");
-    if under_bytes(&ssh, &folded).is_some() {
+    if under_bytes(b".ssh", rest).is_some() {
         return Ok(false);
     }
     for &rel in CRED_FILES
@@ -1653,36 +1853,38 @@ fn home_recursive_root_ok(
         .chain(CRED_TREES.iter())
         .chain(BROWSER_ROOTS.iter())
     {
-        let target = join_folded(home, rel.as_bytes());
-        if under_bytes(&target, &folded).is_some() {
+        if under_bytes(rel.as_bytes(), rest).is_some() {
             return Ok(false);
         }
     }
     for &(rel, _) in ASK_FILES.iter().chain(ASK_TREES.iter()) {
-        let target = join_folded(home, rel.as_bytes());
-        if under_bytes(&target, &folded).is_some() {
+        if under_bytes(rel.as_bytes(), rest).is_some() {
             return Ok(false);
         }
     }
-    for &(dir, pre, _) in ASK_NAME_PREFIXES {
-        let dir_path = join_folded(home, dir.as_bytes());
-        let prefix_path = join_folded(&dir_path, pre.as_bytes());
-        if under_bytes(&prefix_path, &folded).is_some() || under_bytes(&dir_path, &folded).is_some()
-        {
+    for &(dir, _, _) in ASK_NAME_PREFIXES {
+        if under_bytes(dir.as_bytes(), rest).is_some() {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// Extracts strings from a JSON payload (`Mcp`/`Unknown`) while enforcing
-/// structural caps (`MAX_USES` string count, `MAX_BYTES` total string bytes)
-/// BEFORE any compute charge (D-150).
+/// Extracts strings (including object keys, matching `dev` `strings_of`) from
+/// a JSON payload (`Mcp`/`Unknown`) while enforcing structural caps
+/// (`MAX_USES` string count, `MAX_BYTES` total string bytes) BEFORE any
+/// compute charge (D-150).
 fn collect_json_strings_capped(v: &Value) -> Result<Vec<&str>, Cap> {
     let mut out: Vec<&str> = Vec::new();
     let mut total_bytes: usize = 0;
+    let mut nodes: usize = 0;
+    let max_nodes = limits::MAX_USES.saturating_mul(4);
     let mut stack: Vec<&Value> = vec![v];
     while let Some(cur) = stack.pop() {
+        nodes += 1;
+        if nodes > max_nodes {
+            return Err(Cap::Uses);
+        }
         match cur {
             Value::String(s) => {
                 if out.len() >= limits::MAX_USES {
@@ -1706,7 +1908,15 @@ fn collect_json_strings_capped(v: &Value) -> Result<Vec<&str>, Cap> {
                 if map.len() > limits::MAX_USES.saturating_mul(2) {
                     return Err(Cap::Uses);
                 }
-                for val in map.values() {
+                for (k, val) in map {
+                    if out.len() >= limits::MAX_USES {
+                        return Err(Cap::Uses);
+                    }
+                    total_bytes = total_bytes.saturating_add(k.len());
+                    if total_bytes > limits::MAX_BYTES {
+                        return Err(Cap::Bytes);
+                    }
+                    out.push(k.as_str());
                     stack.push(val);
                 }
             }
@@ -1716,6 +1926,27 @@ fn collect_json_strings_capped(v: &Value) -> Result<Vec<&str>, Cap> {
     Ok(out)
 }
 
+fn push_vec_charged<T>(
+    vec: &mut Vec<T>,
+    item: T,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    if vec.len() == vec.capacity() {
+        let old_cap = vec.capacity();
+        let new_cap = if old_cap == 0 {
+            4
+        } else {
+            old_cap.saturating_mul(2)
+        };
+        let add_elems = new_cap - old_cap;
+        budget.charge(vec.len().max(1) as u64)?;
+        budget.charge_alloc(add_elems.saturating_mul(std::mem::size_of::<T>()))?;
+        vec.reserve_exact(new_cap - vec.len());
+    }
+    vec.push(item);
+    Ok(())
+}
+
 fn record_part_preserving(
     parts: &mut Vec<PartResult>,
     item: PartResult,
@@ -1723,6 +1954,18 @@ fn record_part_preserving(
 ) {
     if let Err(e) = push_charged(parts, item, budget) {
         record_exhausted(parts, PartId::WholeCall, e.reason);
+    }
+}
+
+fn ensure_exhausted_recorded(budget: &ComputeBudget, parts: &mut Vec<PartResult>) {
+    if budget.is_exhausted() {
+        record_exhausted(
+            parts,
+            PartId::WholeCall,
+            budget
+                .exhausted_reason()
+                .unwrap_or(ExhaustReason::ComputeBudget),
+        );
     }
 }
 
