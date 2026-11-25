@@ -104,206 +104,148 @@ export function foldName(word: string): string {
   return b.toLowerCase().replaceAll("ſ", "s");
 }
 
-type ShortOptArity = "bool" | "value" | "opt_attached" | "unknown";
-
-function gitSubcommandShortArity(subcommand: string, ch: string): ShortOptArity {
-  switch (subcommand) {
-    case "rebase":
-      if ("mfiqvnkph".includes(ch)) return "bool";
-      if ("sXxC".includes(ch)) return "value";
-      if ("Sr".includes(ch)) return "opt_attached";
-      return "unknown";
-    case "difftool":
-      if ("dyghpuswbRz".includes(ch)) return "bool";
-      if ("txSGOIl".includes(ch)) return "value";
-      if ("UCMBW".includes(ch)) return "opt_attached";
-      return "unknown";
-    case "mergetool":
-      if ("ygh".includes(ch)) return "bool";
-      if ("tx".includes(ch)) return "value";
-      return "unknown";
-    case "diff":
-      if ("puswbRzh".includes(ch)) return "bool";
-      if ("SGOIl".includes(ch)) return "value";
-      if ("UCMBW".includes(ch)) return "opt_attached";
-      return "unknown";
-    case "push":
-      if ("vqfudh".includes(ch) || ch === "n") return "bool";
-      if (ch === "o") return "value";
-      return "unknown";
-    default:
-      return "unknown";
+/**
+ * Matches a Git flag trigger (`-x`, `--exec`, `--tool-cmd`, `--ext-diff`,
+ * `--receive-pack`) against one token without modelling option arities (D-156).
+ * Mirrors `v4/tools.rs::matches_git_flag_pure` 1-to-1.
+ */
+function matchesGitFlag(tok: string, trigger: string): boolean {
+  if (trigger.startsWith("--")) {
+    if (!tok.startsWith("--")) return false;
+    const eq = tok.indexOf("=");
+    const name = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
+    const long = trigger.slice(2);
+    if (name === long) return true;
+    return name.length >= 2 && long.startsWith(name) && !(long === "tool-cmd" && name === "tool");
   }
-}
-
-function gitSubcommandLongTakesSeparateValue(subcommand: string, name: string): boolean {
-  switch (subcommand) {
-    case "rebase":
-      return ["onto", "strategy", "strategy-option", "exec", "empty", "whitespace"].includes(name);
-    case "difftool":
-      return ["tool", "extcmd", "tool-cmd", "output"].includes(name);
-    case "mergetool":
-      return ["tool", "tool-cmd"].includes(name);
-    case "diff":
-      return [
-        "output", "diff-filter", "src-prefix", "dst-prefix",
-        "line-prefix", "inter-hunk-context", "unified", "word-diff-regex",
-      ].includes(name);
-    case "push":
-      return ["repo", "push-option", "receive-pack", "exec"].includes(name);
-    default:
-      return false;
+  if (trigger.length === 2 && trigger.startsWith("-") && tok.startsWith("-") && !tok.startsWith("--") && tok.length > 1) {
+    return tok.slice(1).includes(trigger[1]!);
   }
+  return tok === trigger;
 }
 
 /**
  * Finds the first triggering flag on a Git subcommand (`rebase`, `difftool`,
- * `mergetool`, `diff`, `push`), respecting attached and separate short/long
- * option values so value bytes (e.g. `-Xcontext`, `-S0x1234`, `-txxdiff`) are
- * never read as option letters. Mirrors `v4/tools.rs::git_subcommand_has_flag_trigger_pure`.
+ * `mergetool`, `diff`, `push`) without consuming any word as an option's value
+ * (D-156). Honors `--` only when no preceding flag could have consumed `--`.
+ * Mirrors `v4/tools.rs::git_subcommand_has_flag_trigger_pure`.
  */
 function findGitSubcommandTriggerFlag(
-  subcommand: string,
   rest: readonly string[],
   triggers: readonly string[],
 ): string | null {
-  let i = 0;
-  while (i < rest.length) {
-    const tok = rest[i]!;
-    if (tok === "--") break;
+  let prevMayConsumeNext = false;
+  for (const tok of rest) {
+    if (tok === "--") {
+      if (!prevMayConsumeNext) break;
+      prevMayConsumeNext = false;
+      continue;
+    }
     if (!tok.startsWith("-") || tok === "-") {
-      i++;
+      prevMayConsumeNext = false;
       continue;
     }
-    if (tok.startsWith("--")) {
-      const eq = tok.indexOf("=");
-      const name = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
-      const hasEq = eq >= 0;
-      if (triggers.some((f) => f.startsWith("--") && f.slice(2) === name)) {
-        return tok;
-      }
-      i += !hasEq && gitSubcommandLongTakesSeparateValue(subcommand, name) ? 2 : 1;
-      continue;
+    if (triggers.some((trigger) => matchesGitFlag(tok, trigger))) {
+      return tok;
     }
-    const cluster = tok.slice(1);
-    let consumesNext = false;
-    for (let k = 0; k < cluster.length; k++) {
-      const ch = cluster[k]!;
-      const atEnd = k + 1 >= cluster.length;
-      if (triggers.some((f) => f.length === 2 && f.startsWith("-") && !f.startsWith("--") && f[1] === ch)) {
-        return tok;
-      }
-      const arity = gitSubcommandShortArity(subcommand, ch);
-      if (arity === "bool") continue;
-      if (arity === "value") consumesNext = atEnd;
-      break;
-    }
-    i += consumesNext ? 2 : 1;
+    prevMayConsumeNext = !(tok.startsWith("--") && tok.includes("="));
   }
   return null;
 }
 
 /**
- * Mirrors `v4/tools.rs::has_competing_awk_code_flags_pure`: checks for `-f`,
- * `-e`, `--file`, `--source`, `--eval` while respecting attached and separate
- * values of `-F`, `-v`, `-W`, `--field-separator`, and `--assign`.
+ * Checks whether `rest` contains `subarg` before an unconsumed `--` without
+ * consuming any word as an option's value (D-156). Mirrors
+ * `v4/tools.rs::git_subcommand_has_subarg_trigger_pure`.
  */
-function hasCompetingAwkFlags(rest: readonly string[], pinFlags: readonly string[]): boolean {
-  const longBad = [...pinFlags.filter((f) => f.startsWith("--")), "--source", "--eval"];
-  let i = 0;
-  while (i < rest.length) {
-    const tok = rest[i]!;
-    if (tok === "--") break;
-    if (!tok.startsWith("-") || tok === "-") {
-      i++;
+function hasGitSubcommandSubargTrigger(rest: readonly string[], subarg: string): boolean {
+  let prevMayConsumeNext = false;
+  for (const tok of rest) {
+    if (tok === "--") {
+      if (!prevMayConsumeNext) break;
+      prevMayConsumeNext = false;
       continue;
     }
-    if (tok.startsWith("--")) {
-      const eq = tok.indexOf("=");
-      const name = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
-      const hasEq = eq >= 0;
-      if (name.length > 0 && longBad.some((f) => f.slice(2).startsWith(name))) {
-        return true;
-      }
-      i += !hasEq && (name === "field-separator" || name === "assign") ? 2 : 1;
+    if (tok.startsWith("-") && tok !== "-") {
+      prevMayConsumeNext = !(tok.startsWith("--") && tok.includes("="));
       continue;
     }
-    const cluster = tok.slice(1);
-    let consumesNext = false;
-    for (let k = 0; k < cluster.length; k++) {
-      const ch = cluster[k]!;
-      const atEnd = k + 1 >= cluster.length;
-      const isCompeting =
-        ch === "e" ||
-        pinFlags.some((f) => f.length === 2 && !f.startsWith("--") && f[1] === ch);
-      if (isCompeting) return true;
-      if ("bcCgkMNnOPrSstV".includes(ch)) continue;
-      if (ch === "F" || ch === "v" || ch === "W") {
-        consumesNext = atEnd;
-      }
-      break;
-    }
-    i += consumesNext ? 2 : 1;
+    prevMayConsumeNext = false;
+    if (tok === subarg) return true;
   }
   return false;
 }
 
+const AWK_EXTRA_CODE_LONG_FLAGS = ["source", "eval", "exec", "include", "load"] as const;
+const AWK_EXTRA_CODE_SHORT_FLAGS = new Set(["e", "E", "i", "l", "W"]);
+
 /**
- * Mirrors `v4/tools.rs::has_competing_sed_flags_pure`: attached `-i.ref` and
- * `-l80` do not scan their suffix as option letters, while bare `-i`, bare `-l`,
- * `-f`, `-e`, `--file`, `--expression`, and unknown flags disable pinning.
+ * Mirrors `v4/tools.rs::has_competing_awk_code_flags_pure`: checks for any form
+ * that could supply code (`-f`, `-e`, `-E`, `-i`, `-l`, `-W…`, `--file`,
+ * `--source`, `--eval`, `--exec`, `--include`, `--load`) without consuming any
+ * word as an option's value (D-156).
  */
-function hasCompetingSedFlags(rest: readonly string[]): boolean {
-  let i = 0;
-  while (i < rest.length) {
-    const tok = rest[i]!;
-    if (tok === "--") break;
+function hasCompetingAwkFlags(rest: readonly string[], pinFlags: readonly string[]): boolean {
+  const longBad = [...pinFlags.filter((f) => f.startsWith("--")).map((f) => f.slice(2)), ...AWK_EXTRA_CODE_LONG_FLAGS];
+  const shortBad = new Set([
+    ...AWK_EXTRA_CODE_SHORT_FLAGS,
+    ...pinFlags.filter((f) => f.length === 2 && f.startsWith("-") && !f.startsWith("--")).map((f) => f[1]!),
+  ]);
+  let prevMayConsumeNext = false;
+  for (const tok of rest) {
+    if (tok === "--") {
+      if (!prevMayConsumeNext) break;
+      prevMayConsumeNext = false;
+      continue;
+    }
     if (!tok.startsWith("-") || tok === "-") {
-      i++;
+      prevMayConsumeNext = false;
       continue;
     }
     if (tok.startsWith("--")) {
       const eq = tok.indexOf("=");
       const name = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
-      const hasEq = eq >= 0;
-      if (name.length === 0) {
-        i++;
-        continue;
+      if (name.length > 0 && longBad.some((l) => l.startsWith(name))) {
+        return true;
       }
-      if ("file".startsWith(name) || "expression".startsWith(name)) return true;
-      if (name === "in-place") {
-        if (!hasEq) return true;
-        i++;
-        continue;
-      }
-      if (name === "line-length") {
-        if (!hasEq && i + 1 >= rest.length) return true;
-        i += hasEq ? 1 : 2;
-        continue;
-      }
-      if ([
-        "quiet", "silent", "regexp-extended", "separate", "unbuffered",
-        "null-data", "posix", "sandbox", "debug", "follow-symlinks",
-      ].includes(name)) {
-        if (hasEq) return true;
-        i++;
-        continue;
-      }
-      return true;
+      prevMayConsumeNext = eq < 0;
+      continue;
     }
-    const cluster = tok.slice(1);
-    for (let k = 0; k < cluster.length; k++) {
-      const ch = cluster[k]!;
-      const atEnd = k + 1 >= cluster.length;
-      if (ch === "f" || ch === "e") return true;
-      if (ch === "i" || ch === "l") {
-        if (atEnd) return true;
-        break;
-      }
-      if ("nErsuz".includes(ch)) continue;
-      return true;
+    for (const ch of tok.slice(1)) {
+      if (shortBad.has(ch)) return true;
     }
-    i++;
+    prevMayConsumeNext = true;
+  }
+  return false;
+}
+
+const SED_SAFE_BOOL_LONG = new Set([
+  "quiet", "silent", "regexp-extended", "separate", "unbuffered",
+  "null-data", "posix", "sandbox",
+]);
+const SED_SAFE_BOOL_SHORT = new Set(["n", "E", "r", "s", "u", "z"]);
+
+/**
+ * Mirrors `v4/tools.rs::has_competing_sed_flags_pure`: only pure zero-arg
+ * boolean flags are accepted after `sed -f PROG`; never consumes a word as an
+ * option's value and rejects `-f`, `-e`, `-i`, `-i.ref`, `-l`, `-l80`,
+ * `--in-place`, `--line-length`, and unknown flags (D-156).
+ */
+function hasCompetingSedFlags(rest: readonly string[]): boolean {
+  for (const tok of rest) {
+    if (tok === "--") break;
+    if (!tok.startsWith("-") || tok === "-") continue;
+    if (tok.startsWith("--")) {
+      const eq = tok.indexOf("=");
+      const name = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
+      if (eq >= 0 || name.length === 0 || !SED_SAFE_BOOL_LONG.has(name)) {
+        return true;
+      }
+      continue;
+    }
+    for (const ch of tok.slice(1)) {
+      if (!SED_SAFE_BOOL_SHORT.has(ch)) return true;
+    }
   }
   return false;
 }
@@ -536,29 +478,25 @@ function isSedPrefixSafe(args: readonly string[]): boolean {
       const name = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
       const val = eq >= 0 ? tok.slice(eq + 1) : null;
       if (name === "expression") {
-        if (val !== null) { scripts.push(val); i++; }
-        else if (i + 1 < args.length) { scripts.push(args[i + 1]!); i += 2; }
+        if (val !== null) scripts.push(val);
+        else if (i + 1 < args.length) scripts.push(args[i + 1]!);
         else return false;
-      } else if (["quiet", "silent", "regexp-extended", "separate", "unbuffered", "null-data", "posix", "sandbox"].includes(name)) {
-        if (val !== null) return false;
-        i++;
-      } else {
+      } else if (val !== null || !SED_SAFE_BOOL_LONG.has(name)) {
         return false;
       }
     } else {
-      let consumedNext = false;
       for (let k = 1; k < tok.length; k++) {
         const ch = tok[k]!;
+        const atEnd = k + 1 >= tok.length;
         if (ch === "e") {
-          if (k + 1 < tok.length) scripts.push(tok.slice(k + 1));
-          else if (i + 1 < args.length) { scripts.push(args[i + 1]!); consumedNext = true; }
+          if (atEnd && i + 1 < args.length) scripts.push(args[i + 1]!);
           else return false;
-          break;
+        } else if (!SED_SAFE_BOOL_SHORT.has(ch)) {
+          return false;
         }
-        if (!"nErsuz".includes(ch)) return false;
       }
-      i += consumedNext ? 2 : 1;
     }
+    i++;
   }
   if (scripts.length === 0) {
     if (firstPos === null) return false;
@@ -626,7 +564,7 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
         args.length >= 2 &&
         (args[0] === "-f" || args[0] === "--file") &&
         args[1] !== "" &&
-        args[1] !== "-" &&
+        !args[1]!.startsWith("-") &&
         !hasCompetingAwkFlags(args.slice(2), ["-f", "--file"])
       ) {
         return { warn: `This allows the ${name} program ${args[1]}, whatever it does.` };
@@ -687,10 +625,9 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
       }
       if (sub === "bisect" || sub === "submodule") {
         const triggerSub = sub === "bisect" ? "run" : "foreach";
-        const ddIdx = rest.indexOf("--");
-        const beforeDd = ddIdx >= 0 ? rest.slice(0, ddIdx) : rest;
-        const firstNonFlag = beforeDd.find((a) => !a.startsWith("-"));
-        if (firstNonFlag === undefined || firstNonFlag === triggerSub) {
+        const first = rest[0];
+        const pinnedFirst = first !== undefined && first !== "" && !first.startsWith("-") && first !== triggerSub;
+        if (!pinnedFirst || hasGitSubcommandSubargTrigger(rest, triggerSub)) {
           return { refuse: `An Allow prefix rule on git ${sub} must pin a non-code-running action (it would cover git ${sub} ${triggerSub}).` };
         }
       }
@@ -703,7 +640,7 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
       };
       const flags = subFlagTriggers[sub];
       if (flags) {
-        const hit = findGitSubcommandTriggerFlag(sub, rest, flags);
+        const hit = findGitSubcommandTriggerFlag(rest, flags);
         if (hit !== null) {
           return { refuse: `An Allow prefix rule can't allow git ${sub} with ${hit}: it runs an external command.` };
         }
@@ -722,7 +659,7 @@ export function commandRisk(argv: readonly string[], matcher: "command_prefix" |
         if (
           args.length >= 2 &&
           args[1] !== "" &&
-          args[1] !== "-" &&
+          !args[1]!.startsWith("-") &&
           !hasCompetingSedFlags(args.slice(2))
         ) {
           return { warn: `This allows the sed script ${args[1]}, whatever it does.` };

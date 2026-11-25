@@ -8,8 +8,8 @@ use crate::policy::model::{
 use crate::policy::tools::{self, GIT_CRED_DIRS, GIT_CRED_NAMES, GIT_CRED_SUFFIXES};
 
 use super::{
-    GitPathspecFlag, fold_command_bytes_budgeted, parse_git_global_opt, reserve_vec_slots_budgeted,
-    vec_push_budgeted, word_as_str_budgeted,
+    fold_command_bytes_budgeted, reserve_vec_slots_budgeted, vec_push_budgeted,
+    word_as_str_budgeted,
 };
 
 /// CR-17 credential store suffixes added beyond `dev`'s `GIT_CRED_SUFFIXES`
@@ -51,56 +51,68 @@ pub(super) fn check_git_selection_into_impl(
         return Ok(());
     }
 
-    // Find subcommand position (marked `OperandRole::Command` at index >= 1,
-    // or fallback to index 1). Charge before scanning `effects.roles`.
+    // Find subcommand position: prefer `OperandRole::Command` at index >= 1,
+    // else locate `effects.subcommand` in `unit.argv[1..]` (for Case 2 calls
+    // with leading global options where operand roles stay `Path`).
     budget.charge(effects.roles.len().max(1) as u64)?;
-    let subcmd_idx = effects
+    let mut subcmd_idx = effects
         .roles
         .iter()
         .enumerate()
         .skip(1)
-        .find_map(|(idx, role)| (*role == OperandRole::Command).then_some(idx))
-        .unwrap_or(1);
+        .find_map(|(idx, role)| (*role == OperandRole::Command).then_some(idx));
+    if subcmd_idx.is_none()
+        && let Some(sub_name) = sub
+    {
+        for (idx, word) in unit.argv.iter().enumerate().skip(1) {
+            if word_as_str_budgeted(word, budget)? == Some(sub_name) {
+                subcmd_idx = Some(idx);
+                break;
+            }
+        }
+    }
+    let subcmd_idx = subcmd_idx.unwrap_or(1);
     if subcmd_idx >= unit.argv.len() {
         return Ok(());
     }
 
     // Track pathspec magic (`:(...)`, `:!`, `:`) separately from default
-    // wildcard interpretation (`*`, `?`, `[`), skipping separate option values
-    // so e.g. `git -C --literal-pathspecs show ...` never mistakes a directory
-    // value for a global flag:
-    // - `--literal-pathspecs` disables both pathspec magic and wildcards;
-    // - `--noglob-pathspecs` makes wildcards literal by default while keeping
-    //   explicit pathspec magic (including `:(glob)`) active;
-    // - `--glob-pathspecs` leaves wildcards active (fail-closed if combined).
+    // wildcard interpretation (`*`, `?`, `[`) without modelling global option
+    // arities (D-156):
+    // - `--literal-pathspecs` disables both pathspec magic and wildcards, and
+    //   `--noglob-pathspecs` makes wildcards literal by default, ONLY while no
+    //   other unmodeled global option preceded them (so e.g.
+    //   `git -C --literal-pathspecs show ...` fails closed and keeps magic &
+    //   wildcards enabled);
+    // - `--glob-pathspecs` always re-enables both (fail-closed if combined).
     let mut pathspec_magic_enabled = true;
     let mut default_glob_wildcards = true;
-    let mut gidx = 1usize;
-    while gidx < subcmd_idx {
-        let Some(tok) = word_as_str_budgeted(&unit.argv[gidx], budget)? else {
-            gidx += 1;
+    let mut saw_other_global = false;
+    for w in &unit.argv[1..subcmd_idx] {
+        let Some(tok) = word_as_str_budgeted(w, budget)? else {
+            saw_other_global = true;
             continue;
         };
-        if !tok.starts_with('-') || tok == "-" {
-            gidx += 1;
-            continue;
-        }
-        let opt = parse_git_global_opt(tok, budget)?;
-        match opt.pathspec_flag {
-            Some(GitPathspecFlag::Literal) => {
-                pathspec_magic_enabled = false;
-                default_glob_wildcards = false;
+        match tok {
+            "--literal-pathspecs" => {
+                if !saw_other_global {
+                    pathspec_magic_enabled = false;
+                    default_glob_wildcards = false;
+                }
             }
-            Some(GitPathspecFlag::Noglob) => {
-                default_glob_wildcards = false;
+            "--noglob-pathspecs" => {
+                if !saw_other_global {
+                    default_glob_wildcards = false;
+                }
             }
-            Some(GitPathspecFlag::Glob) => {
+            "--glob-pathspecs" => {
                 pathspec_magic_enabled = true;
                 default_glob_wildcards = true;
             }
-            None => {}
+            _ => {
+                saw_other_global = true;
+            }
         }
-        gidx += if opt.consumes_next { 2 } else { 1 };
     }
 
     let mut after_dd = false;

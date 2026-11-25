@@ -42,6 +42,9 @@ async fn create_rule_rejects_unpinned_allow_code_runner_prefixes_and_invalid_glo
         &["awk", "-f"],
         &["awk", "-f", "-"],
         &["awk", "-f", "a.awk", "-e", "{print}"],
+        &["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"],
+        &["gawk", "-f", "prog.awk", "-W", "source=BEGIN{print 1}"],
+        &["gawk", "-f", "prog.awk", "-W"],
         &["python"],
         &["python3"],
         &["python3", "-c"],
@@ -62,6 +65,8 @@ async fn create_rule_rejects_unpinned_allow_code_runner_prefixes_and_invalid_glo
         &["git", "submodule", "foreach"],
         &["git", "rebase", "-x", "id"],
         &["git", "diff", "--ext-diff"],
+        &["git", "diff", "--unified", "--ext-diff"],
+        &["git", "diff", "-S", "--ext-diff"],
         &["git", "push", "--exec=x"],
         &["git", "push", "--receive-pack=x"],
         &["find"],
@@ -180,6 +185,7 @@ async fn create_rule_accepts_pinned_allow_prefixes_deny_rules_and_exact_commands
         &["python", "build.py"],
         &["pipx", "run", "ruff"],
         &["awk", "-f", "prog.awk"],
+        &["gawk", "-f", "prog.awk"],
         &["sed", "-f", "edit.sed"],
         &["sed", "s/error/warn/g"],
         &["sed", "z"],
@@ -306,6 +312,38 @@ async fn list_rules_keeps_stored_invalid_rules_visible_and_marked_invalid() {
             })
             .await
             .expect("seed valid rule");
+        store
+            .create_rule(Rule {
+                id: RuleId("rule_legacy_git_diff_unified_ext".into()),
+                scope: RuleScope::Global,
+                tool_kind: ToolKind::Execute,
+                tool_name: None,
+                matcher: RuleMatcher::CommandPrefix {
+                    argv: argv(&["git", "diff", "--unified", "--ext-diff"]),
+                },
+                path_scope: None,
+                decision: RuleDecision::Allow,
+                origin: RuleOrigin::Settings,
+                created_at_ms: 3,
+            })
+            .await
+            .expect("seed invalid git diff rule");
+        store
+            .create_rule(Rule {
+                id: RuleId("rule_legacy_gawk_wsource".into()),
+                scope: RuleScope::Global,
+                tool_kind: ToolKind::Execute,
+                tool_name: None,
+                matcher: RuleMatcher::CommandPrefix {
+                    argv: argv(&["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"]),
+                },
+                path_scope: None,
+                decision: RuleDecision::Allow,
+                origin: RuleOrigin::Settings,
+                created_at_ms: 4,
+            })
+            .await
+            .expect("seed invalid gawk -Wsource rule");
     }
 
     rig.boot(|_| {}).await;
@@ -314,17 +352,23 @@ async fn list_rules_keeps_stored_invalid_rules_visible_and_marked_invalid() {
     let listed = wire.ok(DaemonCommand::ListRules).await;
     let items: Vec<ListedRule> =
         serde_json::from_value(listed.clone()).expect("deserializes as Vec<ListedRule>");
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 4);
 
-    let legacy = items
-        .iter()
-        .find(|r| r.id == RuleId("rule_legacy_awk".into()))
-        .expect("stored invalid rule stays listed");
-    let reason = legacy
-        .invalid_reason
-        .as_deref()
-        .expect("stored invalid rule must be marked with invalid_reason");
-    assert!(!reason.is_empty());
+    for invalid_id in [
+        "rule_legacy_awk",
+        "rule_legacy_git_diff_unified_ext",
+        "rule_legacy_gawk_wsource",
+    ] {
+        let item = items
+            .iter()
+            .find(|r| r.id == RuleId(invalid_id.into()))
+            .unwrap_or_else(|| panic!("stored invalid rule {invalid_id} must stay listed"));
+        let reason = item
+            .invalid_reason
+            .as_deref()
+            .unwrap_or_else(|| panic!("stored invalid rule {invalid_id} must have invalid_reason"));
+        assert!(!reason.is_empty(), "{invalid_id}");
+    }
 
     // Finding 7 parity: `["sed", "z"]` is accepted by core, so daemon marks it valid.
     let valid = items
@@ -335,7 +379,7 @@ async fn list_rules_keeps_stored_invalid_rules_visible_and_marked_invalid() {
 
     // Wire-compatibility: callers deserializing `Vec<Rule>` still succeed.
     let as_rules: Vec<Rule> = serde_json::from_value(listed).expect("deserializes as Vec<Rule>");
-    assert_eq!(as_rules.len(), 2);
+    assert_eq!(as_rules.len(), 4);
 
     // Stored invalid rule can still be deleted via DeleteRule.
     wire.ok(DaemonCommand::DeleteRule {
@@ -344,8 +388,12 @@ async fn list_rules_keeps_stored_invalid_rules_visible_and_marked_invalid() {
     .await;
     let remaining: Vec<ListedRule> =
         serde_json::from_value(wire.ok(DaemonCommand::ListRules).await).expect("remaining rules");
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].id, RuleId("rule_valid_sed_z".into()));
+    assert_eq!(remaining.len(), 3);
+    assert!(
+        remaining
+            .iter()
+            .any(|r| r.id == RuleId("rule_valid_sed_z".into()))
+    );
 
     rig.stop(true).await;
 }

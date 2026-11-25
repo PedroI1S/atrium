@@ -811,6 +811,9 @@ fn conditional_runner_git_triggers_and_subcommands() {
 #[test]
 fn conditional_runner_sed_script_parser_and_program_pin() {
     // Safe scripts: `e`/`w`/`r` inside pattern/replacement or `y///` do NOT trigger.
+    // Under D-156, only pure zero-arg boolean flags and inspected `-e`/`--expression`
+    // forms are accepted; `-i` / `-i.bak` / `-l` / `--line-length` have unmodeled
+    // arities and fail closed to Unread.
     for safe in [
         vec![w("sed"), wq("s/foo/bar/g"), w("a.txt")],
         vec![w("sed"), wq("s/error/warn/g"), w("a.txt")],
@@ -818,8 +821,6 @@ fn conditional_runner_sed_script_parser_and_program_pin() {
         vec![w("sed"), wq("y/ewr/xyz/"), w("a.txt")],
         vec![w("sed"), w("-n"), wq("1,5p"), w("a.txt")],
         vec![w("sed"), w("-E"), w("-e"), wq("s|error|ok|g"), w("a.txt")],
-        vec![w("sed"), w("-i"), wq(""), wq("s/a/b/"), w("a.txt")],
-        vec![w("sed"), w("-i.bak"), wq("s/a/b/"), w("a.txt")],
         vec![w("sed"), wq("z"), w("a.txt")],
     ] {
         let e = classify_words(safe.clone());
@@ -828,22 +829,26 @@ fn conditional_runner_sed_script_parser_and_program_pin() {
         assert!(!e.home_readonly_eligible);
     }
 
-    // Finding 5: BSD/macOS bare `-i` can consume the next word (`p`) as the
-    // backup suffix and execute the following word (`w out`) as the script, so
-    // ambiguous bare `-i` forms (anything other than `sed -i '' ...`) are Unread.
-    for bsd_ambig in [
+    // Finding 5 & D-156: ALL `-i` / `--in-place` and `-l` / `--line-length` forms
+    // (including `sed -i ''` and `sed -i.bak`) are outside the frozen table and
+    // must NOT consume words as option values -> fail closed to Unread.
+    for unmodeled_sed in [
         vec![w("sed"), w("-i"), w("p"), wq("w out"), w("input")],
         vec![w("sed"), w("-ni"), w("p"), wq("w out"), w("input")],
         vec![w("sed"), w("-i"), wq("s/a/b/"), w("input")],
         vec![w("sed"), w("-i"), w("-e"), w("p"), wq("w out"), w("input")],
+        vec![w("sed"), w("-i"), wq(""), wq("s/a/b/"), w("a.txt")],
         vec![w("sed"), w("-i"), wq(""), wq("w out"), w("input")],
+        vec![w("sed"), w("-i.bak"), wq("s/a/b/"), w("a.txt")],
         vec![w("sed"), w("-i.bak"), wq("w out"), w("input")],
+        vec![w("sed"), w("--in-place=.bak"), wq("s/a/b/"), w("a.txt")],
+        vec![w("sed"), w("--line-length"), w("80"), w("p"), w("a.txt")],
     ] {
-        let e = classify_words(bsd_ambig.clone());
+        let e = classify_words(unmodeled_sed.clone());
         assert_eq!(
             e.unread,
             vec![UnreadReason::CodeRunnerInlineCode { tool: "sed".into() }],
-            "expected Unread on sed -i form {bsd_ambig:?}"
+            "expected Unread on sed form {unmodeled_sed:?}"
         );
     }
 
@@ -1351,20 +1356,16 @@ fn classify_unit_and_git_selection_respect_compute_and_alloc_budgets() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Round 3 regression tests (Finding 2: Git short-option values & class)
+// 10. Round 4 / D-156 regression tests (no option-value consumption & Review 3)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn round3_finding_2_git_short_option_values_and_subcommand_values() {
-    // Equivalent attached and separate global option values must NOT fire `-c`.
+fn d156_git_trigger_detection_never_consumes_option_values() {
+    // Non-triggering global forms: no word or short-option letter matches `-c`,
+    // `--config-env`, or `--exec-path`.
     for no_trig in [
-        &["git", "-Csrc", "status"][..],
         &["git", "-C", "src", "status"][..],
-        &["git", "-C", "-c", "status"][..],
-        &["git", "-pCsrc", "status"][..],
-        &["git", "-PCsrc", "status"][..],
-        &["git", "--git-dir=/tmp/c", "status"][..],
-        &["git", "--git-dir", "-c", "status"][..],
+        &["git", "--git-dir=repo-git", "status"][..],
         &["git", "--attr-source", "HEAD", "status"][..],
     ] {
         let e = classify(no_trig);
@@ -1375,17 +1376,25 @@ fn round3_finding_2_git_short_option_values_and_subcommand_values() {
             e.unread
         );
         assert!(!e.home_readonly_eligible, "{no_trig:?}");
+        assert!(e.writes, "{no_trig:?}");
     }
 
-    // Real global `-c` / `--config-env` / `--exec-path` triggers (attached and separate).
+    // D-156: Round 2's `git -Csrc` finding is closed by never consuming option
+    // values — any `c` inside a short-option cluster or any `-c` word fires.
     for trig in [
+        &["git", "-Csrc", "status"][..],
+        &["git", "-pCsrc", "status"][..],
+        &["git", "-PCsrc", "status"][..],
+        &["git", "-C", "-c", "status"][..],
+        &["git", "--git-dir", "-c", "status"][..],
+        &["git", "-C", "--", "-c", "x=y", "status"][..],
         &["git", "-c", "x=y", "status"][..],
         &["git", "-cx=y", "status"][..],
         &["git", "-pc", "x=y", "status"][..],
         &["git", "-pcx=y", "status"][..],
         &["git", "--config-env", "k=v", "status"][..],
         &["git", "--config-env=k=v", "status"][..],
-        &["git", "--exec-path=/tmp", "status"][..],
+        &["git", "--exec-path=alt-exec", "status"][..],
         &["git", "--exec-path", "status"][..],
     ] {
         let e = classify(trig);
@@ -1396,22 +1405,41 @@ fn round3_finding_2_git_short_option_values_and_subcommand_values() {
         );
     }
 
-    // Git subcommand option values (attached and separate) must NOT fire `-x` / `--ext-diff` / `--exec`.
+    // Leading global option before subcommand triggers & derived writers still fires.
+    let global_merge_index = classify(&["git", "-C", "repo", "merge-index", "prog", "file"]);
+    assert_eq!(
+        global_merge_index.unread,
+        vec![UnreadReason::CodeRunnerInlineCode {
+            tool: "git merge-index".into()
+        }]
+    );
+    let global_diff_ext = classify(&["git", "-C", "repo", "diff", "--unified", "--ext-diff"]);
+    assert_eq!(
+        global_diff_ext.unread,
+        vec![UnreadReason::CodeRunnerInlineCode {
+            tool: "git diff".into()
+        }]
+    );
+    let global_clone = classify(&["git", "-C", "repo", "clone", "url", "dir"]);
+    assert_eq!(
+        global_clone.unread,
+        vec![UnreadReason::DerivedDestinations {
+            tool: "git clone".into()
+        }]
+    );
+
+    // Non-triggering subcommand forms (no trigger word or letter before unconsumed `--`).
     for sub_safe in [
-        &["git", "rebase", "-Xcontext", "main"][..],
-        &["git", "rebase", "-X", "context", "main"][..],
-        &["git", "rebase", "-S0x1234", "main"][..],
-        &["git", "rebase", "-sxyz", "main"][..],
-        &["git", "rebase", "-s", "-x", "main"][..],
-        &["git", "rebase", "--onto", "-x", "main"][..],
-        &["git", "difftool", "-txxdiff"][..],
-        &["git", "difftool", "-t", "xxdiff"][..],
-        &["git", "difftool", "-t", "-x"][..],
-        &["git", "difftool", "-ytxxdiff"][..],
-        &["git", "mergetool", "-txxdiff"][..],
-        &["git", "mergetool", "-t", "xxdiff"][..],
-        &["git", "diff", "-S", "--ext-diff"][..],
-        &["git", "push", "-o", "--exec"][..],
+        &["git", "diff", "--unified"][..],
+        &["git", "diff", "--stat"][..],
+        &["git", "diff", "--", "--ext-diff"][..],
+        &["git", "diff", "--unified=3", "--", "--ext-diff"][..],
+        &["git", "rebase", "-X", "ours", "main"][..],
+        &["git", "rebase", "--onto", "main"][..],
+        &["git", "difftool", "-t", "vimdiff"][..],
+        &["git", "difftool", "--tool=vimdiff"][..],
+        &["git", "mergetool", "-t", "vimdiff"][..],
+        &["git", "push", "-u", "origin", "main"][..],
     ] {
         let e = classify(sub_safe);
         assert!(
@@ -1421,8 +1449,18 @@ fn round3_finding_2_git_short_option_values_and_subcommand_values() {
         );
     }
 
-    // Real subcommand triggers (separate, attached, and clustered after bools).
+    // Review 3 Finding 3 (`git diff --unified --ext-diff`) and all D-156
+    // subcommand triggers (no option value consumption; cluster letters fire).
     for (sub_trig, expected_tool) in [
+        (&["git", "diff", "--unified", "--ext-diff"][..], "git diff"),
+        (&["git", "diff", "-S", "--ext-diff"][..], "git diff"),
+        (&["git", "diff", "-S", "--", "--ext-diff"][..], "git diff"),
+        (&["git", "push", "-o", "--exec"][..], "git push"),
+        (&["git", "rebase", "-Xcontext", "main"][..], "git rebase"),
+        (&["git", "rebase", "-S0x1234", "main"][..], "git rebase"),
+        (&["git", "rebase", "-sxyz", "main"][..], "git rebase"),
+        (&["git", "rebase", "-s", "-x", "main"][..], "git rebase"),
+        (&["git", "rebase", "--onto", "-x", "main"][..], "git rebase"),
         (&["git", "rebase", "-x", "id", "main"][..], "git rebase"),
         (&["git", "rebase", "-xid", "main"][..], "git rebase"),
         (&["git", "rebase", "-ix", "id", "main"][..], "git rebase"),
@@ -1435,9 +1473,13 @@ fn round3_finding_2_git_short_option_values_and_subcommand_values() {
             &["git", "rebase", "-r", "-x", "id", "main"][..],
             "git rebase",
         ),
+        (&["git", "difftool", "-txxdiff"][..], "git difftool"),
+        (&["git", "difftool", "-t", "-x"][..], "git difftool"),
+        (&["git", "difftool", "-ytxxdiff"][..], "git difftool"),
         (&["git", "difftool", "-x", "id"][..], "git difftool"),
         (&["git", "difftool", "-xid"][..], "git difftool"),
         (&["git", "difftool", "-yx", "id"][..], "git difftool"),
+        (&["git", "mergetool", "-txxdiff"][..], "git mergetool"),
         (&["git", "mergetool", "-x", "id"][..], "git mergetool"),
         (&["git", "mergetool", "-xid"][..], "git mergetool"),
         (&["git", "mergetool", "-yx", "id"][..], "git mergetool"),
@@ -1452,8 +1494,8 @@ fn round3_finding_2_git_short_option_values_and_subcommand_values() {
         );
     }
 
-    // `git -C --literal-pathspecs show HEAD -- ':!.env'` must NOT mistake `-C`'s
-    // directory value for `--literal-pathspecs` in `check_git_selection`.
+    // `git -C --literal-pathspecs show HEAD -- ':!.env'` must NOT honor
+    // `--literal-pathspecs` after an unmodeled global option (`-C`).
     let (_, sel) = git_sel(vec![
         w("git"),
         w("-C"),
@@ -1466,14 +1508,45 @@ fn round3_finding_2_git_short_option_values_and_subcommand_values() {
     assert!(
         sel.iter()
             .any(|r| matches!(r.outcome, PartOutcome::StoreHit(_))),
-        "expected StoreHit when `--literal-pathspecs` is `-C`'s value, got {sel:?}"
+        "expected StoreHit when `--literal-pathspecs` follows `-C`, got {sel:?}"
+    );
+
+    // Leading `-C status show HEAD:.env` and `-C branch status -- '*.rs'` must
+    // still run CR-12 name selection and wildcard-pathspec checks.
+    let (_, sel_show) = git_sel(vec![
+        w("git"),
+        w("-C"),
+        w("status"),
+        w("show"),
+        w("HEAD:.env"),
+    ]);
+    assert!(
+        sel_show
+            .iter()
+            .any(|r| matches!(r.outcome, PartOutcome::StoreHit(_))),
+        "expected StoreHit on `git -C status show HEAD:.env`, got {sel_show:?}"
+    );
+    let (_, sel_wc) = git_sel(vec![
+        w("git"),
+        w("-C"),
+        w("branch"),
+        w("status"),
+        w("--"),
+        wq("*.rs"),
+    ]);
+    assert!(
+        sel_wc.iter().any(|r| matches!(
+            r.outcome,
+            PartOutcome::Unread(UnreadReason::GitWildcardPathspec { .. })
+        )),
+        "expected GitWildcardPathspec on `git -C branch status -- '*.rs'`, got {sel_wc:?}"
     );
 }
 
 #[test]
-fn round3_option_value_scanning_class_rg_grep_cp_tar_awk_sed_find_interpreters() {
-    // 1. Search tools (`rg` / `grep`): attached/separate values containing
-    //    forbidden short flag letters (`-f`, `-z`) must NOT strip Home eligibility.
+fn d156_arities_stay_only_in_frozen_table_and_review3_findings_1_and_2() {
+    // 1. Search tools (`rg` / `grep`): flag arities stay in the frozen table (D-156),
+    //    so attached/separate values of listed value-taking flags still keep Home eligibility.
     for home_ok in [
         vec![w("rg"), w("-efoo"), w("src")],
         vec![w("rg"), w("-ezip"), w("src")],
@@ -1492,10 +1565,9 @@ fn round3_option_value_scanning_class_rg_grep_cp_tar_awk_sed_find_interpreters()
         );
         assert!(
             e.home_readonly_eligible,
-            "attached/separate option value falsely stripped Home eligibility on {home_ok:?}"
+            "frozen Search flag table should keep Home eligibility on {home_ok:?}"
         );
     }
-    // Actual forbidden `-f` / `-if` / `-z` still removes Home eligibility.
     for home_no in [
         &["rg", "-f", "pats.txt", "src"][..],
         &["rg", "-if", "pats.txt", "src"][..],
@@ -1510,17 +1582,13 @@ fn round3_option_value_scanning_class_rg_grep_cp_tar_awk_sed_find_interpreters()
         );
     }
 
-    // 2. DerivedDestinationWriter `cp`: attached/separate values of `-t` and `-S`
-    //    must NOT falsely trigger `-a`/`-r`/`-R`.
+    // 2. DerivedDestinationWriter `cp` (D-156): no arity table; clean forms stay
+    //    clear, while any trigger word or short-option cluster containing `r`/`R`/`a` fires.
     for cp_no_trig in [
-        &["cp", "-tarchive", "a.txt"][..],
         &["cp", "-t", "archive", "a.txt"][..],
-        &["cp", "-t", "-r", "a.txt"][..],
-        &["cp", "-vtdir", "a.txt"][..],
-        &["cp", "-S.bak", "a.txt", "b.txt"][..],
-        &["cp", "-S.orig", "a.txt", "b.txt"][..],
-        &["cp", "-S", "-a", "a.txt", "b.txt"][..],
-        &["cp", "--target-directory", "-R", "a.txt"][..],
+        &["cp", "-S", ".old", "a.txt", "b.txt"][..],
+        &["cp", "--target-directory=dir", "a.txt"][..],
+        &["cp", "--", "-R", "a.txt", "b.txt"][..],
     ] {
         let e = classify(cp_no_trig);
         assert_eq!(
@@ -1531,6 +1599,14 @@ fn round3_option_value_scanning_class_rg_grep_cp_tar_awk_sed_find_interpreters()
         assert!(e.unread.is_empty(), "{cp_no_trig:?}");
     }
     for cp_trig in [
+        &["cp", "-tarchive", "a.txt"][..],
+        &["cp", "-t", "-r", "a.txt"][..],
+        &["cp", "-vtdir", "a.txt"][..],
+        &["cp", "-S.bak", "a.txt", "b.txt"][..],
+        &["cp", "-S.orig", "a.txt", "b.txt"][..],
+        &["cp", "-S", "-a", "a.txt", "b.txt"][..],
+        &["cp", "--target-directory", "-R", "a.txt"][..],
+        &["cp", "-t", "--", "-R", "a.txt"][..],
         &["cp", "-Rtdir", "src"][..],
         &["cp", "-rtdir", "src"][..],
         &["cp", "-atdir", "src"][..],
@@ -1549,18 +1625,15 @@ fn round3_option_value_scanning_class_rg_grep_cp_tar_awk_sed_find_interpreters()
         );
     }
 
-    // 3. DerivedDestinationWriter `tar`: attached/separate values of `-f`, `-C`,
-    //    `-T`, `-X`, `--file`, and old-style `tar cf -x` must NOT falsely trigger `-x`.
+    // 3. DerivedDestinationWriter `tar` (Review 3 Finding 1 & D-156):
+    //    `tar -s -x -f archive.tar` and every form with `-x`/`--extract`/`--get`
+    //    or an `x` letter in a cluster triggers DerivedDestinations.
     for tar_no_trig in [
-        &["tar", "-cfextra.tar", "src"][..],
-        &["tar", "-cf", "extra.tar", "src"][..],
-        &["tar", "-cf", "-x", "src"][..],
-        &["tar", "-Cextra", "-cf", "out.tar", "src"][..],
-        &["tar", "-C", "-x", "-cf", "out.tar", "src"][..],
-        &["tar", "-cf", "out.tar", "-Textra.list"][..],
-        &["tar", "-cf", "out.tar", "-Xexclude.txt"][..],
-        &["tar", "cf", "-x", "src"][..],
-        &["tar", "--file", "--extract", "-c", "src"][..],
+        &["tar", "-cf", "out.tar", "src"][..],
+        &["tar", "-C", "dir", "-cf", "out.tar", "src"][..],
+        &["tar", "cf", "out.tar", "src"][..],
+        &["tar", "--file=out.tar", "-c", "src"][..],
+        &["tar", "-cf", "out.tar", "--", "-x"][..],
     ] {
         let e = classify(tar_no_trig);
         assert_eq!(
@@ -1571,6 +1644,17 @@ fn round3_option_value_scanning_class_rg_grep_cp_tar_awk_sed_find_interpreters()
         assert!(e.unread.is_empty(), "{tar_no_trig:?}");
     }
     for tar_trig in [
+        &["tar", "-s", "-x", "-f", "archive.tar"][..],
+        &["tar", "-cfextra.tar", "src"][..],
+        &["tar", "-cf", "-x", "src"][..],
+        &["tar", "-Cextra", "-cf", "out.tar", "src"][..],
+        &["tar", "-C", "-x", "-cf", "out.tar", "src"][..],
+        &["tar", "-cf", "out.tar", "-Textra.list"][..],
+        &["tar", "-cf", "out.tar", "-Xexclude.txt"][..],
+        &["tar", "cf", "-x", "src"][..],
+        &["tar", "cf", "--", "-x", "src"][..],
+        &["tar", "-f", "--", "-x", "src"][..],
+        &["tar", "--file", "--extract", "-c", "src"][..],
         &["tar", "-zxf", "a.tar.gz"][..],
         &["tar", "-zxfa.tar.gz"][..],
         &["tar", "-fa.tar", "-x"][..],
@@ -1592,99 +1676,149 @@ fn round3_option_value_scanning_class_rg_grep_cp_tar_awk_sed_find_interpreters()
         );
     }
 
-    // 4. `awk -f`: attached/separate values of `-F` and `-v` must NOT be mistaken
-    //    for competing `-f` / `-e` flags.
-    for awk_pinned in [
-        &["awk", "-f", "prog.awk", "-Fsep", "data.txt"][..],
-        &["awk", "-f", "prog.awk", "-F", "-e", "data.txt"][..],
-        &["awk", "-f", "prog.awk", "-vfoo=1", "data.txt"][..],
-        &["awk", "-f", "prog.awk", "-v", "foo=1", "data.txt"][..],
-        &["awk", "-f", "prog.awk", "-vkey=val", "data.txt"][..],
-        &[
-            "awk",
-            "-f",
-            "prog.awk",
-            "--field-separator",
-            "-e",
-            "data.txt",
-        ][..],
+    // 4. `awk` / `gawk` / `mawk` (Review 3 Finding 2 & D-156):
+    //    Clean pinned forms retain `Unread(Program)`. Any competing code form
+    //    (`-W…` attached or separate, `--source`, `-e`, `-E`, `-f`, `-i`, `-l`,
+    //    or cluster containing any of those letters) yields plain `CodeRunnerInlineCode`.
+    for (awk_pinned, expected_prog) in [
+        (
+            &["gawk", "-f", "prog.awk", "data.txt"][..],
+            vec!["gawk", "-f", "prog.awk"],
+        ),
+        (
+            &["awk", "-f", "prog.awk", "-v", "k=1", "data.txt"][..],
+            vec!["awk", "-f", "prog.awk"],
+        ),
+        (
+            &["awk", "-f", "prog.awk", "-F", ",", "data.txt"][..],
+            vec!["awk", "-f", "prog.awk"],
+        ),
+        (
+            &["awk", "-f", "prog.awk", "-F:", "data.txt"][..],
+            vec!["awk", "-f", "prog.awk"],
+        ),
+        (
+            &["gawk", "-f", "prog.awk", "--", "-Wsource=BEGIN{print 1}"][..],
+            vec!["gawk", "-f", "prog.awk"],
+        ),
     ] {
         let e = classify(awk_pinned);
         assert_eq!(
             e.unread,
             vec![UnreadReason::Program {
-                program_words: vec!["awk".into(), "-f".into(), "prog.awk".into()]
+                program_words: expected_prog.into_iter().map(String::from).collect()
             }],
             "expected pinned program on {awk_pinned:?}"
         );
     }
-    for awk_unpinned in [
-        &["awk", "-f", "prog.awk", "-nf", "other.awk", "data.txt"][..],
-        &["awk", "-f", "prog.awk", "-ne", "{print}", "data.txt"][..],
-        &["awk", "-f", "prog.awk", "-e{print}", "data.txt"][..],
+    for (awk_unpinned, expected_tool) in [
+        (
+            &["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"][..],
+            "gawk",
+        ),
+        (
+            &["gawk", "-f", "prog.awk", "-W", "source=BEGIN{print 1}"][..],
+            "gawk",
+        ),
+        (
+            &["gawk", "-f", "prog.awk", "-Wcompat", "data.txt"][..],
+            "gawk",
+        ),
+        (
+            &["gawk", "-f", "prog.awk", "--source=BEGIN{print 1}"][..],
+            "gawk",
+        ),
+        (&["gawk", "-f", "prog.awk", "-i", "lib.awk"][..], "gawk"),
+        (&["gawk", "-f", "prog.awk", "-l", "ext"][..], "gawk"),
+        (&["gawk", "-f", "prog.awk", "-E", "other.awk"][..], "gawk"),
+        (&["gawk", "-f", "-Wsource=1"][..], "gawk"),
+        (&["awk", "-f", "prog.awk", "-Fsep", "data.txt"][..], "awk"),
+        (
+            &["awk", "-f", "prog.awk", "-F", "-e", "data.txt"][..],
+            "awk",
+        ),
+        (
+            &["awk", "-f", "prog.awk", "-F", "--", "-Wsource=1"][..],
+            "awk",
+        ),
+        (&["awk", "-f", "prog.awk", "-vfoo=1", "data.txt"][..], "awk"),
+        (
+            &[
+                "awk",
+                "-f",
+                "prog.awk",
+                "--field-separator",
+                "-e",
+                "data.txt",
+            ][..],
+            "awk",
+        ),
+        (
+            &["awk", "-f", "prog.awk", "-nf", "other.awk", "data.txt"][..],
+            "awk",
+        ),
+        (
+            &["awk", "-f", "prog.awk", "-ne", "{print}", "data.txt"][..],
+            "awk",
+        ),
+        (
+            &["awk", "-f", "prog.awk", "-e{print}", "data.txt"][..],
+            "awk",
+        ),
     ] {
         let e = classify(awk_unpinned);
         assert_eq!(
             e.unread,
-            vec![UnreadReason::CodeRunnerInlineCode { tool: "awk".into() }],
-            "expected inline code on {awk_unpinned:?}"
+            vec![UnreadReason::CodeRunnerInlineCode {
+                tool: expected_tool.into()
+            }],
+            "expected plain inline code on {awk_unpinned:?}"
         );
     }
 
-    // 5. `sed`: attached `-i.ef` and `-i.ref` do not read suffix as `-e`/`-f`,
-    //    and bare `-l` fails closed (macOS/BSD `-l` takes no arg).
-    let sed_i_ef = classify_words(vec![w("sed"), w("-i.ef"), wq("s/a/b/"), w("a.txt")]);
-    assert!(sed_i_ef.unread.is_empty());
-
-    let sed_f_iref = classify(&["sed", "-f", "edit.sed", "-i.ref", "a.txt"]);
+    // 5. `sed` (D-156): no `-i` / `-l` arity modelling; `-i.ef`, `-i.ref`, `-l`,
+    //    and `-l80` all fail closed to plain CodeRunnerInlineCode.
+    for sed_unread in [
+        vec![w("sed"), w("-i.ef"), wq("s/a/b/"), w("a.txt")],
+        vec![w("sed"), w("-f"), w("edit.sed"), w("-i.ref"), w("a.txt")],
+        vec![w("sed"), w("-l"), wq("w out"), w("p"), w("a.txt")],
+        vec![w("sed"), w("-l80"), wq("s/a/b/"), w("a.txt")],
+        vec![w("sed"), w("-f"), w("edit.sed"), w("-l80"), w("a.txt")],
+        vec![w("sed"), w("-f"), w("-e"), w("a.txt")],
+    ] {
+        let e = classify_words(sed_unread.clone());
+        assert_eq!(
+            e.unread,
+            vec![UnreadReason::CodeRunnerInlineCode { tool: "sed".into() }],
+            "expected Unread on {sed_unread:?}"
+        );
+    }
+    let sed_f_n = classify(&["sed", "-f", "edit.sed", "-n", "a.txt"]);
     assert_eq!(
-        sed_f_iref.unread,
+        sed_f_n.unread,
         vec![UnreadReason::Program {
             program_words: vec!["sed".into(), "-f".into(), "edit.sed".into()]
         }]
     );
 
-    let sed_bare_l = classify_words(vec![w("sed"), w("-l"), wq("w out"), w("p"), w("a.txt")]);
-    assert_eq!(
-        sed_bare_l.unread,
-        vec![UnreadReason::CodeRunnerInlineCode { tool: "sed".into() }]
-    );
-
-    let sed_attached_l = classify_words(vec![w("sed"), w("-l80"), wq("s/a/b/"), w("a.txt")]);
-    assert!(sed_attached_l.unread.is_empty());
-
-    // 6. `find`: values of unambiguous 1-arg primaries (`-name -exec`) do not fire,
-    //    while real `-exec` after `-name foo` still fires.
-    let find_val = classify(&["find", ".", "-name", "-exec"]);
-    assert!(find_val.unread.is_empty());
-    let find_real = classify(&["find", ".", "-name", "foo", "-exec", "id", ";"]);
-    assert_eq!(
-        find_real.unread,
-        vec![UnreadReason::CodeRunnerInlineCode {
-            tool: "find".into()
-        }]
-    );
-
-    // 7. Interpreters (`python`, `node`, `perl`, `ruby`): attached values of
-    //    non-code flags must NOT populate `code_operands`, and separate values
-    //    before `-c`/`-e` still locate the real code operand.
-    for no_inline_op in [
-        &["python", "-Xtracemalloc", "script.py"][..],
-        &["python3", "-Wonce", "script.py"][..],
-        &["node", "-rexpress", "app.js"][..],
-        &["perl", "-Isrc/core", "script.pl"][..],
-        &["ruby", "-Ilib/ext", "app.rb"][..],
+    // 6. `find` (D-156): never consumes option values, so `-exec` anywhere fires.
+    for find_trig in [
+        &["find", ".", "-name", "-exec"][..],
+        &["find", ".", "-name", "foo", "-exec", "id", ";"][..],
     ] {
-        let e = classify(no_inline_op);
+        let e = classify(find_trig);
         assert_eq!(
-            e.code,
-            CodeExecution::Inline {
-                code_operands: Vec::new()
-            },
-            "attached value misread as inline code flag on {no_inline_op:?}"
+            e.unread,
+            vec![UnreadReason::CodeRunnerInlineCode {
+                tool: "find".into()
+            }],
+            "{find_trig:?}"
         );
     }
 
+    // 7. Interpreters (`python`, `node`, `perl`, `ruby`; D-156): no short-option
+    //    arity modelling; separate `-c` still locates code_operands, and any
+    //    cluster containing an inline flag letter records that token as inline code.
     let py_sep = classify(&["python", "-W", "once", "-c", "print(1)"]);
     assert_eq!(
         py_sep.code,
@@ -1699,4 +1833,29 @@ fn round3_option_value_scanning_class_rg_grep_cp_tar_awk_sed_find_interpreters()
             code_operands: vec![1]
         }
     );
+    for (interp_cmd, expected_tool, expected_idx) in [
+        (&["python", "-Xtracemalloc", "script.py"][..], "python", 1),
+        (&["python3", "-Wonce", "script.py"][..], "python3", 1),
+        (&["node", "-rexpress", "app.js"][..], "node", 1),
+        // `-Isrc/core` ends with `e`, so without `-I` arity it reads the
+        // following word (`script.pl`, index 2) as `-e`'s operand.
+        (&["perl", "-Isrc/core", "script.pl"][..], "perl", 2),
+        (&["ruby", "-Ilib/ext", "app.rb"][..], "ruby", 1),
+    ] {
+        let e = classify(interp_cmd);
+        assert_eq!(
+            e.unread,
+            vec![UnreadReason::CodeRunnerInlineCode {
+                tool: expected_tool.into()
+            }],
+            "{interp_cmd:?}"
+        );
+        assert_eq!(
+            e.code,
+            CodeExecution::Inline {
+                code_operands: vec![expected_idx]
+            },
+            "D-156 cluster letter should record operand {expected_idx} on {interp_cmd:?}"
+        );
+    }
 }

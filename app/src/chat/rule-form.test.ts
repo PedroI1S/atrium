@@ -169,22 +169,25 @@ describe("rules editor: rev 4 §7 & D-141 parity with core", () => {
     expect(!bashErr.ok && bashErr.errors.command).toMatch(/can't allow bash/);
   });
 
-  it("accepts pinned Allow prefixes and safe sed/git/cargo forms matching core (including `sed z`)", () => {
+  it("accepts pinned Allow prefixes and safe sed/git/cargo forms matching core (including `sed z`) and rejects D-156 trigger/code forms", () => {
     for (const ok of [
       "sh x.sh", "bash scripts/build.sh", "dash run.sh",
       "source env.sh", ". ./env.sh",
       "python3 scripts/build.py", "python build.py", "node build.js", "perl run.pl", "ruby app.rb", "npx prettier",
-      "awk -f prog.awk", "awk -f prog.awk -vfoo=1", "awk -f prog.awk -Fsep", "awk -f prog.awk -F -e",
-      "sed -f edit.sed", "sed -f edit.sed -i.ref", "sed -f edit.sed -l80",
+      "awk -f prog.awk", "gawk -f prog.awk", "awk -f prog.awk -v k=1", "awk -f prog.awk -F ,", "awk -f prog.awk -F:",
+      "awk -f prog.awk -- -Wsource=1",
+      "sed -f edit.sed", "sed -f edit.sed -n",
       "pipx run ruff",
     ]) {
       const v = validateRule(form({ command: ok }), ctx);
       expect(v.ok && v.warnings.length, ok).toBe(1);
     }
     for (const clean of [
-      "cargo test", "git status", "git diff", "git bisect start", "git submodule status",
-      "git rebase -Xcontext", "git rebase -S0x1234", "git difftool -txxdiff", "git mergetool -txxdiff",
-      "git diff -S --ext-diff", "git push -o --exec",
+      "cargo test", "git status", "git diff", "git diff --unified", "git diff -- --ext-diff",
+      "git bisect start", "git submodule status",
+      "git rebase -X ours", "git rebase --onto main",
+      "git difftool -t vimdiff", "git difftool --tool=vimdiff", "git mergetool -t vimdiff",
+      "git push -u origin",
       "sed 's/error/warn/g'", "sed z", "sed F", "sed '1q 0'", "sed 'l 80'",
     ]) {
       const split = splitCommand(clean);
@@ -192,9 +195,25 @@ describe("rules editor: rev 4 §7 & D-141 parity with core", () => {
       expect(commandRisk(split.ok ? split.argv : []), clean).toBeNull();
     }
     for (const bad of [
-      "git rebase -xid", "git rebase -ix id", "git difftool -xid", "git difftool -yx id", "git mergetool -xid",
+      // Review 3 Finding 3 & D-156 Git triggers (never consume option values; cluster `x` fires)
+      "git diff --unified --ext-diff", "git diff -S --ext-diff", "git diff -S -- --ext-diff",
+      "git push -o --exec",
+      "git rebase -Xcontext", "git rebase -S0x1234", "git rebase -xid", "git rebase -ix id",
+      "git difftool -txxdiff", "git difftool -xid", "git difftool -yx id",
+      "git mergetool -txxdiff", "git mergetool -xid",
+      "git submodule --prefix status",
+      // Review 3 Finding 2 & D-156 awk/gawk competing code forms (`-W…`, `-e`, `-f`, `-i`, `-l`, `-E`, `--source`, cluster letters)
+      "gawk -f prog.awk '-Wsource=BEGIN{print 1}'", "gawk -f prog.awk -W 'source=BEGIN{print 1}'",
+      "gawk -f prog.awk -W", "gawk -f prog.awk --source=1",
+      "gawk -f prog.awk -i lib.awk", "gawk -f prog.awk -l ext", "gawk -f prog.awk -E other.awk",
+      "gawk -f -Wsource=1",
+      "awk -f prog.awk -vfoo=1", "awk -f prog.awk -Fsep", "awk -f prog.awk -F -e",
+      "awk -f prog.awk -F -- -Wsource=1",
       "awk -f prog.awk -nf other.awk", "awk -f prog.awk -ne '{print}'",
+      // D-156 sed competing/unmodeled flags (no `-i`/`-l` arity modelling)
+      "sed -f edit.sed -i.ref", "sed -f edit.sed -l80",
       "sed -f edit.sed -nf other.sed", "sed -f edit.sed -ne p", "sed -f edit.sed -i", "sed -f edit.sed -l",
+      "sed -f -e",
     ]) {
       expect(refused(bad), bad).toBe(true);
     }
@@ -247,7 +266,10 @@ describe("rules editor: stored invalid rules (§11 item 5)", () => {
     const validSedZ = storedRule({ id: "r_sed_z", matcher: { type: "command_prefix", argv: ["sed", "z"] } });
     const validDeno = storedRule({ id: "r_deno", matcher: { type: "command_prefix", argv: ["deno"] } });
     const invAwk = storedRule({ id: "r_awk", matcher: { type: "command_prefix", argv: ["awk"] } });
+    const invGawkWSource = storedRule({ id: "r_gawk_wsource", matcher: { type: "command_prefix", argv: ["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"] } });
+    const invGawkWSep = storedRule({ id: "r_gawk_wsep", matcher: { type: "command_prefix", argv: ["gawk", "-f", "prog.awk", "-W", "source=BEGIN{print 1}"] } });
     const invGit = storedRule({ id: "r_git", matcher: { type: "command_prefix", argv: ["git"] } });
+    const invGitDiffExt = storedRule({ id: "r_git_diff_unified_ext", matcher: { type: "command_prefix", argv: ["git", "diff", "--unified", "--ext-diff"] } });
     const invPipx = storedRule({ id: "r_pipx", matcher: { type: "command_prefix", argv: ["pipx", "run"] } });
     const invDaemon = { ...valid, id: "r_daemon", invalid_reason: "daemon marked invalid" };
     const invGlob = storedRule({ id: "r_glob", tool_kind: "edit", matcher: { type: "path_glob", glob: "/a/[" } });
@@ -256,7 +278,7 @@ describe("rules editor: stored invalid rules (§11 item 5)", () => {
     for (const ok of [valid, validSedZ, validDeno, denyAwk]) {
       expect(checkStoredRule(ok), ok.id).toEqual({ valid: true, reason: null });
     }
-    for (const r of [invAwk, invGit, invPipx, invDaemon, invGlob]) {
+    for (const r of [invAwk, invGawkWSource, invGawkWSep, invGit, invGitDiffExt, invPipx, invDaemon, invGlob]) {
       const res = checkStoredRule(r);
       expect(res.valid, r.id).toBe(false);
       expect(typeof res.reason === "string" && res.reason.length > 0, r.id).toBe(true);

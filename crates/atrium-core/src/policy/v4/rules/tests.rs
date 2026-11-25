@@ -1875,15 +1875,16 @@ fn round3_finding_1_wrapped_pinned_programs_receive_coverage_and_suppress_lower_
 }
 
 #[test]
-fn round3_finding_2_git_option_values_preserve_exact_rule_coverage_and_validation() {
+fn d156_no_option_value_consumption_in_validation_and_coverage() {
     let tid = ThreadId("t1".into());
     let mut budget = ComputeBudget::with_default_limits();
 
-    // `git -Csrc status` and `git -C src status` both receive exact Allow rule
-    // coverage (no false `-c` trigger), whereas `git -cx=y status` and
-    // `git -c x=y status` remain plain Unread and are NOT covered.
+    // D-156 closes Round 2's `git -Csrc` finding: a `c` in a short cluster
+    // fires `-c`, so `git -Csrc status` is plain Unread and NOT covered by an
+    // exact Allow, whereas `git -C src status` has no `c` in any cluster and
+    // keeps exact Allow coverage.
     for (cmd_line, words, expect_covered) in [
-        ("git -Csrc status", &["git", "-Csrc", "status"][..], true),
+        ("git -Csrc status", &["git", "-Csrc", "status"][..], false),
         (
             "git -C src status",
             &["git", "-C", "src", "status"][..],
@@ -1933,15 +1934,24 @@ fn round3_finding_2_git_option_values_preserve_exact_rule_coverage_and_validatio
         );
     }
 
-    // `validate_rule_matcher`: Git subcommand option values do not falsely fail
-    // validation, while real `-x` triggers (attached/clustered) still fail.
+    // `validate_rule_matcher` (D-156): clean non-triggering prefixes stay valid,
+    // while every prefix with a trigger word or a cluster containing a trigger
+    // letter or code-supplying flag is rejected (never consuming values).
     for valid in [
-        &["git", "rebase", "-Xcontext"][..],
-        &["git", "rebase", "-S0x1234"][..],
-        &["git", "difftool", "-txxdiff"][..],
-        &["git", "mergetool", "-txxdiff"][..],
-        &["git", "diff", "-S", "--ext-diff"][..],
-        &["git", "push", "-o", "--exec"][..],
+        &["git", "diff", "--unified"][..],
+        &["git", "diff", "--", "--ext-diff"][..],
+        &["git", "rebase", "-X", "ours"][..],
+        &["git", "rebase", "--onto", "main"][..],
+        &["git", "difftool", "-t", "vimdiff"][..],
+        &["git", "difftool", "--tool=vimdiff"][..],
+        &["git", "mergetool", "-t", "vimdiff"][..],
+        &["git", "push", "-u", "origin"][..],
+        &["gawk", "-f", "prog.awk"][..],
+        &["awk", "-f", "prog.awk", "-v", "k=1"][..],
+        &["awk", "-f", "prog.awk", "-F", ","][..],
+        &["awk", "-f", "prog.awk", "-F:"][..],
+        &["awk", "-f", "prog.awk", "--", "-Wsource=1"][..],
+        &["sed", "-f", "edit.sed", "-n"][..],
     ] {
         assert!(
             validate_rule_matcher(
@@ -1954,51 +1964,41 @@ fn round3_finding_2_git_option_values_preserve_exact_rule_coverage_and_validatio
         );
     }
     for invalid in [
+        &["git", "diff", "--unified", "--ext-diff"][..],
+        &["git", "diff", "-S", "--ext-diff"][..],
+        &["git", "diff", "-S", "--", "--ext-diff"][..],
+        &["git", "push", "-o", "--exec"][..],
+        &["git", "rebase", "-Xcontext"][..],
+        &["git", "rebase", "-S0x1234"][..],
         &["git", "rebase", "-xid"][..],
         &["git", "rebase", "-ix", "id"][..],
+        &["git", "difftool", "-txxdiff"][..],
         &["git", "difftool", "-xid"][..],
         &["git", "difftool", "-yx", "id"][..],
+        &["git", "mergetool", "-txxdiff"][..],
         &["git", "mergetool", "-xid"][..],
-    ] {
-        assert!(
-            validate_rule_matcher(
-                &RuleMatcher::CommandPrefix {
-                    argv: argv(invalid)
-                },
-                RuleDecision::Allow,
-                &FoldRules::REV4,
-            )
-            .is_err(),
-            "expected invalid prefix {invalid:?}"
-        );
-    }
-
-    // `awk -f` and `sed -f` trailing options with attached/separate values must
-    // not be misread as competing `-f`/`-e` flags, while real competing flags fail.
-    for valid in [
+        &["git", "submodule", "--prefix", "status"][..],
+        &["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"][..],
+        &["gawk", "-f", "prog.awk", "-W", "source=BEGIN{print 1}"][..],
+        &["gawk", "-f", "prog.awk", "-W"][..],
+        &["gawk", "-f", "prog.awk", "--source=BEGIN{print 1}"][..],
+        &["gawk", "-f", "prog.awk", "-i", "lib.awk"][..],
+        &["gawk", "-f", "prog.awk", "-l", "ext"][..],
+        &["gawk", "-f", "prog.awk", "-E", "other.awk"][..],
+        &["gawk", "-f", "-Wsource=1"][..],
         &["awk", "-f", "prog.awk", "-vfoo=1"][..],
         &["awk", "-f", "prog.awk", "-Fsep"][..],
         &["awk", "-f", "prog.awk", "-F", "-e"][..],
-        &["sed", "-f", "edit.sed", "-i.ref"][..],
-        &["sed", "-f", "edit.sed", "-l80"][..],
-    ] {
-        assert!(
-            validate_rule_matcher(
-                &RuleMatcher::CommandPrefix { argv: argv(valid) },
-                RuleDecision::Allow,
-                &FoldRules::REV4,
-            )
-            .is_ok(),
-            "expected valid prefix {valid:?}"
-        );
-    }
-    for invalid in [
+        &["awk", "-f", "prog.awk", "-F", "--", "-Wsource=1"][..],
         &["awk", "-f", "prog.awk", "-nf", "other.awk"][..],
         &["awk", "-f", "prog.awk", "-ne", "{print}"][..],
+        &["sed", "-f", "edit.sed", "-i.ref"][..],
+        &["sed", "-f", "edit.sed", "-l80"][..],
         &["sed", "-f", "edit.sed", "-nf", "other.sed"][..],
         &["sed", "-f", "edit.sed", "-ne", "p"][..],
         &["sed", "-f", "edit.sed", "-i"][..],
         &["sed", "-f", "edit.sed", "-l"][..],
+        &["sed", "-f", "-e"][..],
     ] {
         assert!(
             validate_rule_matcher(
@@ -2010,6 +2010,297 @@ fn round3_finding_2_git_option_values_preserve_exact_rule_coverage_and_validatio
             )
             .is_err(),
             "expected invalid prefix {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn round4_review3_findings_1_2_3_coverage_and_precedence() {
+    let tid = ThreadId("t1".into());
+    let mut budget = ComputeBudget::with_default_limits();
+
+    // Finding 1: `tar -s -x -f archive.tar` reports DerivedDestinations, so
+    // an exact Allow does NOT cover it and does NOT suppress a lower Global Deny.
+    {
+        let words = &["tar", "-s", "-x", "-f", "archive.tar"][..];
+        let check = cmd_check("tar -s -x -f archive.tar");
+        let units = vec![make_unit(0, words)];
+        let effects = classify_all(&units);
+        assert_eq!(
+            effects[0].unread,
+            vec![UnreadReason::DerivedDestinations { tool: "tar".into() }]
+        );
+        let be = BestEffortRecord {
+            raw_texts: vec!["tar -s -x -f archive.tar".into()],
+            units: vec![be_unit(0, words)],
+        };
+        let rules = vec![
+            make_rule(
+                "r_t_tar_exact",
+                RuleScope::Thread {
+                    thread_id: tid.clone(),
+                },
+                ToolKind::Execute,
+                RuleMatcher::CommandExact { argv: argv(words) },
+                RuleDecision::Allow,
+            ),
+            make_rule(
+                "r_g_deny_tar",
+                RuleScope::Global,
+                ToolKind::Execute,
+                RuleMatcher::CommandPrefix {
+                    argv: argv(&["tar"]),
+                },
+                RuleDecision::Deny,
+            ),
+        ];
+        let cov = evaluate_rules(
+            &RuleEvalContext {
+                check: &check,
+                thread_id: &tid,
+                preset: Preset::Home,
+                units: &units,
+                effects: &effects,
+                targets: &[],
+                outcomes: &[],
+                best_effort: &be,
+                folds: &FoldRules::REV4,
+            },
+            &rules,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(cov.per_unit[0].allow_rule.is_none());
+        assert_eq!(
+            cov.deny.as_ref().map(|(_, id)| id),
+            Some(&RuleId("r_g_deny_tar".into()))
+        );
+    }
+
+    // Finding 2: `gawk -f prog.awk '-Wsource=BEGIN{print 1}'` (attached and
+    // separate) gives plain Unread, so higher-ranked Thread Allow
+    // `["gawk", "-f", "prog.awk"]` does NOT cover it and lower-ranked Global
+    // Deny `["gawk"]` wins; meanwhile clean `gawk -f prog.awk data.txt` stays
+    // pinned and covered by that same Thread Allow (suppressing Global Deny).
+    {
+        let rules = vec![
+            make_rule(
+                "r_t_gawk_pin",
+                RuleScope::Thread {
+                    thread_id: tid.clone(),
+                },
+                ToolKind::Execute,
+                RuleMatcher::CommandPrefix {
+                    argv: argv(&["gawk", "-f", "prog.awk"]),
+                },
+                RuleDecision::Allow,
+            ),
+            make_rule(
+                "r_g_deny_gawk",
+                RuleScope::Global,
+                ToolKind::Execute,
+                RuleMatcher::CommandPrefix {
+                    argv: argv(&["gawk"]),
+                },
+                RuleDecision::Deny,
+            ),
+        ];
+
+        // Control: clean pinned `gawk -f prog.awk data.txt` IS covered and suppresses Global Deny.
+        let clean_words = &["gawk", "-f", "prog.awk", "data.txt"][..];
+        let clean_check = cmd_check("gawk -f prog.awk data.txt");
+        let clean_units = vec![make_unit(0, clean_words)];
+        let clean_effects = classify_all(&clean_units);
+        let clean_be = BestEffortRecord {
+            raw_texts: vec!["gawk -f prog.awk data.txt".into()],
+            units: vec![be_unit(0, clean_words)],
+        };
+        let cov_clean = evaluate_rules(
+            &RuleEvalContext {
+                check: &clean_check,
+                thread_id: &tid,
+                preset: Preset::Home,
+                units: &clean_units,
+                effects: &clean_effects,
+                targets: &[],
+                outcomes: &[],
+                best_effort: &clean_be,
+                folds: &FoldRules::REV4,
+            },
+            &rules,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(cov_clean.deny.is_none());
+        assert_eq!(
+            cov_clean.per_unit[0].allow_rule,
+            Some(RuleId("r_t_gawk_pin".into()))
+        );
+        assert!(cov_clean.per_unit[0].covers_pinned_program);
+
+        // Attached and separate `-Wsource` forms: plain Unread -> no Allow coverage, Global Deny wins.
+        for (line, words) in [
+            (
+                "gawk -f prog.awk '-Wsource=BEGIN{print 1}'",
+                &["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"][..],
+            ),
+            (
+                "gawk -f prog.awk -W 'source=BEGIN{print 1}'",
+                &["gawk", "-f", "prog.awk", "-W", "source=BEGIN{print 1}"][..],
+            ),
+        ] {
+            let check = cmd_check(line);
+            let units = vec![make_unit(0, words)];
+            let effects = classify_all(&units);
+            assert_eq!(
+                effects[0].unread,
+                vec![UnreadReason::CodeRunnerInlineCode {
+                    tool: "gawk".into()
+                }],
+                "{line}"
+            );
+            let be = BestEffortRecord {
+                raw_texts: vec![line.into()],
+                units: vec![be_unit(0, words)],
+            };
+            let cov = evaluate_rules(
+                &RuleEvalContext {
+                    check: &check,
+                    thread_id: &tid,
+                    preset: Preset::Home,
+                    units: &units,
+                    effects: &effects,
+                    targets: &[],
+                    outcomes: &[],
+                    best_effort: &be,
+                    folds: &FoldRules::REV4,
+                },
+                &rules,
+                &mut budget,
+            )
+            .unwrap();
+            assert!(cov.per_unit[0].allow_rule.is_none(), "{line}");
+            assert!(!cov.per_unit[0].covers_pinned_program, "{line}");
+            assert_eq!(
+                cov.deny.as_ref().map(|(_, id)| id),
+                Some(&RuleId("r_g_deny_gawk".into())),
+                "{line}"
+            );
+        }
+
+        // Stored invalid prefix `["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"]`
+        // covers nothing (§11 item 5).
+        let stored_bad_gawk = vec![make_rule(
+            "r_stored_bad_gawk",
+            RuleScope::Global,
+            ToolKind::Execute,
+            RuleMatcher::CommandPrefix {
+                argv: argv(&["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"]),
+            },
+            RuleDecision::Allow,
+        )];
+        let bad_words = &["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"][..];
+        let bad_units = vec![make_unit(0, bad_words)];
+        let bad_effects = classify_all(&bad_units);
+        let bad_check = cmd_check("gawk -f prog.awk '-Wsource=BEGIN{print 1}'");
+        let cov_stored = evaluate_rules(
+            &RuleEvalContext {
+                check: &bad_check,
+                thread_id: &tid,
+                preset: Preset::Home,
+                units: &bad_units,
+                effects: &bad_effects,
+                targets: &[],
+                outcomes: &[],
+                best_effort: &BestEffortRecord::default(),
+                folds: &FoldRules::REV4,
+            },
+            &stored_bad_gawk,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(cov_stored.per_unit[0].allow_rule.is_none());
+    }
+
+    // Finding 3: `git diff --unified --ext-diff` reports CodeRunnerInlineCode,
+    // so neither an exact Allow, a valid `["git", "diff"]` prefix, nor a stored
+    // invalid `["git", "diff", "--unified", "--ext-diff"]` prefix covers it,
+    // and lower-ranked Global Deny `["git"]` wins.
+    {
+        let words = &["git", "diff", "--unified", "--ext-diff"][..];
+        let check = cmd_check("git diff --unified --ext-diff");
+        let units = vec![make_unit(0, words)];
+        let effects = classify_all(&units);
+        assert_eq!(
+            effects[0].unread,
+            vec![UnreadReason::CodeRunnerInlineCode {
+                tool: "git diff".into()
+            }]
+        );
+        let be = BestEffortRecord {
+            raw_texts: vec!["git diff --unified --ext-diff".into()],
+            units: vec![be_unit(0, words)],
+        };
+        let rules = vec![
+            make_rule(
+                "r_t_git_exact",
+                RuleScope::Thread {
+                    thread_id: tid.clone(),
+                },
+                ToolKind::Execute,
+                RuleMatcher::CommandExact { argv: argv(words) },
+                RuleDecision::Allow,
+            ),
+            make_rule(
+                "r_t_git_diff_pfx",
+                RuleScope::Thread {
+                    thread_id: tid.clone(),
+                },
+                ToolKind::Execute,
+                RuleMatcher::CommandPrefix {
+                    argv: argv(&["git", "diff"]),
+                },
+                RuleDecision::Allow,
+            ),
+            make_rule(
+                "r_t_git_stored_invalid",
+                RuleScope::Thread {
+                    thread_id: tid.clone(),
+                },
+                ToolKind::Execute,
+                RuleMatcher::CommandPrefix { argv: argv(words) },
+                RuleDecision::Allow,
+            ),
+            make_rule(
+                "r_g_deny_git",
+                RuleScope::Global,
+                ToolKind::Execute,
+                RuleMatcher::CommandPrefix {
+                    argv: argv(&["git"]),
+                },
+                RuleDecision::Deny,
+            ),
+        ];
+        let cov = evaluate_rules(
+            &RuleEvalContext {
+                check: &check,
+                thread_id: &tid,
+                preset: Preset::Home,
+                units: &units,
+                effects: &effects,
+                targets: &[],
+                outcomes: &[],
+                best_effort: &be,
+                folds: &FoldRules::REV4,
+            },
+            &rules,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(cov.per_unit[0].allow_rule.is_none());
+        assert_eq!(
+            cov.deny.as_ref().map(|(_, id)| id),
+            Some(&RuleId("r_g_deny_git".into()))
         );
     }
 }

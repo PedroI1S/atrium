@@ -21,8 +21,10 @@ use crate::policy::tools::{
 
 use super::tools::{
     SedParseOutcome, charge_str_clone, fold_command_str_pure, git_subcommand_has_flag_trigger_pure,
-    has_competing_awk_code_flags_pure, has_competing_sed_flags_pure, inspect_sed_script,
-    vec_push_budgeted, vec_with_exact_budgeted, word_has_unquoted_glob_budgeted,
+    git_subcommand_has_subarg_trigger_pure, has_competing_awk_code_flags_pure,
+    has_competing_sed_flags_pure, inspect_sed_script, is_sed_safe_bool_long,
+    is_sed_safe_bool_short, vec_push_budgeted, vec_with_exact_budgeted,
+    word_has_unquoted_glob_budgeted,
 };
 
 #[cfg(test)]
@@ -231,7 +233,7 @@ fn validate_code_runner_prefix(
             if argv.len() >= 3
                 && pin.flags.contains(&argv[1].as_str())
                 && !argv[2].is_empty()
-                && argv[2] != "-"
+                && !argv[2].starts_with('-')
                 && !has_competing_awk_code_flags_pure(&argv[3..], pin.flags)
             {
                 Ok(())
@@ -283,12 +285,14 @@ fn validate_conditional_runner_prefix(
                     });
                 }
                 RunnerTrigger::SubcommandWithSubarg { subcommand, subarg } if sub == subcommand => {
-                    let first_non_flag = rest
-                        .iter()
-                        .take_while(|a| a.as_str() != "--")
-                        .find(|a| !a.starts_with('-'))
-                        .map(String::as_str);
-                    if first_non_flag.is_none() || first_non_flag == Some(subarg) {
+                    // Without option arities (D-156), require the non-code-running
+                    // action to be pinned right at `rest[0]` (no leading flag
+                    // that could consume it) and no trigger `subarg` before an
+                    // unconsumed `--`.
+                    let pinned_first = rest
+                        .first()
+                        .is_some_and(|a| !a.is_empty() && !a.starts_with('-') && a != subarg);
+                    if !pinned_first || git_subcommand_has_subarg_trigger_pure(rest, subarg) {
                         return Err(RuleValidationError::UnpinnedCodeRunner {
                             tool: format!("{} {subcommand}", spec.name),
                             required_pin: "pinning a non-code-running action (this prefix would cover code execution)",
@@ -296,8 +300,7 @@ fn validate_conditional_runner_prefix(
                     }
                 }
                 RunnerTrigger::SubcommandWithFlag { subcommand, flag }
-                    if sub == subcommand
-                        && git_subcommand_has_flag_trigger_pure(subcommand, rest, flag) =>
+                    if sub == subcommand && git_subcommand_has_flag_trigger_pure(rest, flag) =>
                 {
                     return Err(RuleValidationError::UnpinnedCodeRunner {
                         tool: format!("{} {subcommand}", spec.name),
@@ -326,7 +329,7 @@ fn validate_conditional_runner_prefix(
         if pin_flags.contains(&argv[1].as_str()) {
             if argv.len() >= 3
                 && !argv[2].is_empty()
-                && argv[2] != "-"
+                && !argv[2].starts_with('-')
                 && !has_competing_sed_flags_pure(&argv[3..])
             {
                 return Ok(());
@@ -386,49 +389,32 @@ fn validate_sed_inline_prefix_budgeted(
                 Some((n, v)) => (n, Some(v)),
                 None => (rest, None),
             };
-            match name {
-                "expression" => {
-                    if let Some(v) = val {
-                        vec_push_budgeted(&mut scripts, v, budget)?;
-                        i += 1;
-                    } else if i + 1 < argv.len() {
+            if name == "expression" {
+                if let Some(v) = val {
+                    vec_push_budgeted(&mut scripts, v, budget)?;
+                } else if i + 1 < argv.len() {
+                    vec_push_budgeted(&mut scripts, argv[i + 1].as_str(), budget)?;
+                } else {
+                    return Ok(false);
+                }
+            } else if val.is_some() || !is_sed_safe_bool_long(name) {
+                return Ok(false);
+            }
+        } else {
+            for (byte_off, ch) in tok[1..].char_indices() {
+                let at_end = 1 + byte_off + ch.len_utf8() >= tok.len();
+                if ch == 'e' {
+                    if at_end && i + 1 < argv.len() {
                         vec_push_budgeted(&mut scripts, argv[i + 1].as_str(), budget)?;
-                        i += 2;
                     } else {
                         return Ok(false);
                     }
-                }
-                "quiet" | "silent" | "regexp-extended" | "separate" | "unbuffered"
-                | "null-data" | "posix" | "sandbox" => {
-                    if val.is_some() {
-                        return Ok(false);
-                    }
-                    i += 1;
-                }
-                _ => return Ok(false),
-            }
-        } else {
-            let mut consumed_next = false;
-            for (byte_off, ch) in tok[1..].char_indices() {
-                let rest_start = 1 + byte_off + ch.len_utf8();
-                match ch {
-                    'e' => {
-                        if rest_start < tok.len() {
-                            vec_push_budgeted(&mut scripts, &tok[rest_start..], budget)?;
-                        } else if i + 1 < argv.len() {
-                            vec_push_budgeted(&mut scripts, argv[i + 1].as_str(), budget)?;
-                            consumed_next = true;
-                        } else {
-                            return Ok(false);
-                        }
-                        break;
-                    }
-                    'n' | 'E' | 'r' | 's' | 'u' | 'z' => {}
-                    _ => return Ok(false),
+                } else if !is_sed_safe_bool_short(ch) {
+                    return Ok(false);
                 }
             }
-            i += if consumed_next { 2 } else { 1 };
         }
+        i += 1;
     }
 
     if scripts.is_empty() {
