@@ -276,6 +276,12 @@ async fn gone_leader_with_live_descendant_in_group_is_not_verified() {
 /// reparented member remains in `recorded.pgid`. Performs a `"ready\n"`
 /// round-trip through `cat -u` before returning so the member is already
 /// initialized and blocked in `read(0)` before callers start timing drain.
+///
+/// Remaining environment dependence: once `stdin` is dropped and `cat -u`
+/// exits, callers still rely on PID 1 (`launchd` on macOS, or `init` / a
+/// subreaper on Linux) reaping the reparented zombie within
+/// `GROUP_DRAIN_TIMEOUT`. On Linux this fails where PID 1 does not reap
+/// orphans (for example, a container started without `--init`).
 async fn spawn_gone_leader_with_holding_member() -> (
     ProcessIdentity,
     u32,
@@ -286,6 +292,10 @@ async fn spawn_gone_leader_with_holding_member() -> (
     // Non-interactive POSIX `sh` redirects `&` children's stdin to `/dev/null`
     // before explicit redirections, so duplicate fd 0 to fd 3 first and pass
     // fd 3 into `cat -u` as its stdin.
+    //
+    // Note: on macOS, `Stdio::piped()` sets `FD_CLOEXEC` after `pipe()` rather
+    // than atomically, so in theory a parallel test's `fork` in that narrow
+    // window could inherit the `stdin` write end and delay `cat`'s EOF.
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg("exec 3<&0; cat -u <&3 3<&- & echo \"MEMBER:$!\"; exit 0")
@@ -338,6 +348,21 @@ async fn spawn_gone_leader_with_holding_member() -> (
         .unwrap()
         .expect("member must still be alive");
     assert_eq!(member_id.pgid, recorded.pgid);
+    // Prove `member_pid` is the `cat` process holding stdin (not an
+    // intermediate subshell). Comparing against the canonicalized `cat` on
+    // `PATH` also supports multicall binaries (e.g. BusyBox / uutils).
+    let expected_cat = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("cat"))
+            .find(|p| p.is_file())
+            .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+    });
+    assert!(
+        member_id.executable.file_name() == Some(std::ffi::OsStr::new("cat"))
+            || expected_cat.as_deref() == Some(member_id.executable.as_path()),
+        "expected member_pid {member_pid} to be cat (expected {expected_cat:?}), got {:?}",
+        member_id.executable
+    );
 
     (recorded, member_pid, stdin, group_guard, member_guard)
 }
