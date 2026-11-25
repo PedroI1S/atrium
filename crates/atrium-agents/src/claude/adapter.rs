@@ -132,11 +132,23 @@ impl Default for ClaudeOptions {
 #[derive(Default)]
 pub struct ClaudeAdapter {
     options: ClaudeOptions,
+    withdraw_timeout: Option<Duration>,
 }
 
 impl ClaudeAdapter {
     pub fn new(options: ClaudeOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            withdraw_timeout: None,
+        }
+    }
+
+    /// Override for how long `drain_withdrawals` waits before detaching slow
+    /// withdrawals in the background (defaults to `options.gate_deadline`).
+    #[doc(hidden)]
+    pub fn with_withdraw_timeout(mut self, timeout: Duration) -> Self {
+        self.withdraw_timeout = Some(timeout);
+        self
     }
 }
 
@@ -264,6 +276,7 @@ impl AgentAdapter for ClaudeAdapter {
         transport: Transport,
     ) -> BoxFuture<'_, Result<Session, AdapterError>> {
         let options = self.options.clone();
+        let withdraw_timeout = self.withdraw_timeout;
         Box::pin(async move {
             match transport {
                 Transport::Local => {}
@@ -283,6 +296,7 @@ impl AgentAdapter for ClaudeAdapter {
                 events_tx,
                 commands_rx,
             )?;
+            actor.withdraw_timeout = withdraw_timeout;
             let identity = actor.launch()?;
             // If this future is dropped during the handshake, `Proc`'s drop
             // kills the whole process group.
@@ -560,6 +574,7 @@ type HookAsked = (Option<String>, ApprovalTicket, Option<OwnedSemaphorePermit>);
 struct Actor {
     config: SessionConfig,
     options: ClaudeOptions,
+    withdraw_timeout: Option<Duration>,
     gate: Arc<dyn ToolGate>,
     norm: ClaudeNormalizer,
     started: Instant,
@@ -646,6 +661,7 @@ impl Actor {
             gate: config.gate.clone(),
             config,
             options,
+            withdraw_timeout: None,
             norm: ClaudeNormalizer::new(),
             started: Instant::now(),
             seq: 0,
@@ -1164,7 +1180,8 @@ impl Actor {
                 gate.withdraw(&ticket).await;
             }));
         }
-        let deadline = TokioInstant::now() + self.options.gate_deadline;
+        let deadline =
+            TokioInstant::now() + self.withdraw_timeout.unwrap_or(self.options.gate_deadline);
         for handle in handles {
             if timeout_at(deadline, handle).await.is_err() {
                 // Keep unfinished withdrawals running in the background with
@@ -2431,5 +2448,67 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["L1"]
         );
+    }
+
+    #[tokio::test]
+    async fn withdraw_timeout_bounds_drain_without_shrinking_gate_deadline() {
+        struct BlockingWithdrawGate {
+            started: Arc<AtomicUsize>,
+            release: tokio::sync::watch::Receiver<bool>,
+        }
+        impl ToolGate for BlockingWithdrawGate {
+            fn check<'a>(&'a self, _: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+                Box::pin(async { GateDecision::Allow })
+            }
+            fn redeem<'a>(
+                &'a self,
+                _: &'a ApprovalTicket,
+                _: &'a ToolCheck,
+            ) -> BoxFuture<'a, GateDecision> {
+                Box::pin(async { GateDecision::Allow })
+            }
+            fn question_ticket(&self, _: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
+                Box::pin(async { None })
+            }
+            fn withdraw<'a>(&'a self, _: &'a ApprovalTicket) -> BoxFuture<'a, ()> {
+                self.started.fetch_add(1, Ordering::AcqRel);
+                let mut rx = self.release.clone();
+                Box::pin(async move {
+                    while !*rx.borrow() {
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            }
+        }
+
+        let adapter = ClaudeAdapter::new(ClaudeOptions {
+            gate_deadline: Duration::from_secs(60),
+            ..ClaudeOptions::default()
+        })
+        .with_withdraw_timeout(Duration::from_millis(20));
+        assert_eq!(adapter.options.gate_deadline, Duration::from_secs(60));
+        assert_eq!(adapter.withdraw_timeout, Some(Duration::from_millis(20)));
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let mut a = actor("withdraw-timeout", &[init_line()]);
+        a.options.gate_deadline = Duration::from_secs(60);
+        a.withdraw_timeout = Some(Duration::from_millis(20));
+        a.gate = Arc::new(BlockingWithdrawGate {
+            started: started.clone(),
+            release: release_rx,
+        });
+        a.queue_withdraw(ApprovalTicket::new("W1".into(), false), None);
+
+        // `drain_withdrawals` must detach after `withdraw_timeout` (20 ms)
+        // rather than waiting for `gate_deadline` (60 s).
+        timeout(Duration::from_secs(2), a.drain_withdrawals())
+            .await
+            .expect("drain_withdrawals did not honor withdraw_timeout");
+        assert!(a.pending_withdrawals.is_empty());
+        assert_eq!(started.load(Ordering::Acquire), 1);
+        let _ = release_tx.send(true);
     }
 }
