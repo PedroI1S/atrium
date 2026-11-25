@@ -25,7 +25,7 @@
 3. **Step 3 — Permanent regression test and unit coverage**:
    - Added `ScriptedOptions { inbox_delay: Duration, inbox_gate: Option<Arc<tokio::sync::Notify>> }` and `Scripted::start_with(answer, options)` (with `Scripted::start` delegating to `ScriptedOptions::default()`).
    - Added `delayed_subscribe_inbox_does_not_lose_pushed_updates` (200 ms `inbox_delay`, 100 pushed updates, all arrive in order with rising sequence numbers).
-   - Added unit tests covering 0-receiver updates (`subscriber_count_is_stored_without_a_watcher`), disconnect cleanup (`disconnect_updates_live_subscriber_count_without_watcher`), dead-peer pruning in `push` (`push_prunes_dead_peer_and_drops_live_count`), two-connection gating (`second_connection_with_delayed_subscribe_inbox_receives_only_post_answer_pushes`), stale-peer disconnect + gated reconnect (`stale_peer_disconnect_requires_wait_inbox_answered_for_new_connection`), and repeated `SubscribeInbox` on one connection (`repeated_subscribe_inbox_on_same_connection_raises_answered_without_duplicating_peer`).
+   - Added unit tests covering 0-receiver updates (`subscriber_count_is_stored_without_a_watcher`), disconnect cleanup (`disconnect_updates_live_subscriber_count_without_watcher`), dead-peer pruning in `push` (`push_prunes_dead_peer_and_drops_live_count`), two-connection gating (`second_connection_with_delayed_subscribe_inbox_receives_only_post_answer_pushes`), deterministic stale-peer injection + gated reconnect (`stale_peer_requires_wait_inbox_answered_for_new_connection`, proving `inbox_subscribers(1)` is `Ready` while `wait_inbox_answered(mark + 1)` stays `Pending` and `peers.len()` excludes B until B's gate opens), and repeated `SubscribeInbox` on one connection (`repeated_subscribe_inbox_on_same_connection_raises_answered_without_duplicating_peer`).
 
 ## Checks run by worker (D-123)
 
@@ -282,7 +282,7 @@ git checkout -- app/src-tauri/src/bridge.rs
    - Added `drop(handle); bridge.detach("main"); bridge.client().shutdown();` at the end, matching sibling tests.
 3. **Stale-peer test + removed redundant delay** (`app/src-tauri/src/bridge.rs`, `mod tests`):
    - Dropped the redundant `inbox_delay: Duration::from_millis(200)` from `second_connection_with_delayed_subscribe_inbox_receives_only_post_answer_pushes` (the gate alone holds B deterministically).
-   - Added `stale_peer_disconnect_requires_wait_inbox_answered_for_new_connection`: connects A, waits for its answer, records `mark = inbox_answered_mark()`, disconnects A, connects B with its `SubscribeInbox` answer gated, asserts `answered == mark` and that `wait_inbox_answered(mark + 1)` stays `Poll::Pending` while B is gated (without sleeps or timing assertions), pushes `"before-b"`, releases B, waits via `wait_inbox_answered(mark + 1)`, pushes `"after-b"`, and verifies B receives its empty `inbox` snapshot followed only by `"after-b"`.
+   - Added `stale_peer_disconnect_requires_wait_inbox_answered_for_new_connection` (refined and renamed to `stale_peer_requires_wait_inbox_answered_for_new_connection` in Round 5 to inject a deterministic stale peer into `peers` and assert `inbox_subscribers(1)` is `Ready`, `wait_inbox_answered(mark + 1)` is `Pending`, and `peers.len()` rises from `1` to `2` across the gate).
 4. **Repeated-`SubscribeInbox` test** (`app/src-tauri/src/bridge.rs`, `mod tests`):
    - Added `repeated_subscribe_inbox_on_same_connection_raises_answered_without_duplicating_peer`: sends two `SubscribeInbox` requests over a single connection, verifying both are answered, `answered` rises from `1` to `2`, `live` and `peers.len()` stay `1` (matching `Hub::subscribe_inbox`'s `HashMap::insert`), and a subsequent push is delivered once before a barrier response.
 
@@ -356,4 +356,39 @@ Restore the working tree afterwards:
 
 ```fish
 git checkout -- app/src-tauri/src/bridge.rs
+```
+
+## Round 5
+
+### Changes
+
+1. **Deterministic stale-peer test** (`app/src-tauri/src/bridge.rs`, `mod tests`):
+   - Renamed `stale_peer_disconnect_requires_wait_inbox_answered_for_new_connection` to `stale_peer_requires_wait_inbox_answered_for_new_connection`.
+   - After A's `SubscribeInbox` is answered (`mark = inbox_answered_mark() == 1`), waits for A's disconnect to drain `live` to `0`, then deterministically injects a stale peer `(u64::MAX, stale_tx)` into `peers` (keeping `stale_rx` alive so `push` does not prune it) and sets `counts.live = peers.len()` under the same `peers` lock.
+   - Connects B with its `SubscribeInbox` answer gated. While B is gated, polls each future once with `Context::from_waker(Waker::noop())` (no sleeps or timing assertions) and pins:
+     - `inbox_subscribers(1)` is `Poll::Ready` (satisfied by the stale peer);
+     - `wait_inbox_answered(mark + 1)` is `Poll::Pending` (B is not answered yet);
+     - `peers.len() == 1` (and `live == 1`, `answered == mark`), so B is not registered yet.
+   - Pushes `"before-b"`, releases the gate, waits via `wait_inbox_answered(mark + 1)`, asserts `peers.len() == 2` (`live == 2`, `answered == mark + 1`), pushes `"after-b"`, and checks B receives its empty `inbox` snapshot followed only by `"after-b"`.
+2. **Handoff updated** (`docs/agents/handoffs/M1-42-n16-bridge-test-race.md`):
+   - Updated the Done and Round 4 entries to reflect the renamed test and what it now pins.
+
+### Checks run by worker (D-123)
+
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-app --tests` — clean, 0 warnings
+
+No `cargo test`, `cargo clippy`, or `pnpm` was run by the worker under D-123.
+
+### Verification commands (fish-compatible)
+
+Same as Round 4:
+
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+for i in (seq 1 300)
+    cargo test -p atrium-app bridge:: --quiet; or begin; echo "FAILED on run $i"; break; end
+end
 ```

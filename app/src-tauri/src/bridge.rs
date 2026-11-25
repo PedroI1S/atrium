@@ -1486,7 +1486,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn stale_peer_disconnect_requires_wait_inbox_answered_for_new_connection() {
+    async fn stale_peer_requires_wait_inbox_answered_for_new_connection() {
         let gate = Arc::new(tokio::sync::Notify::new());
         let daemon = Scripted::start_with(
             list_threads_ok,
@@ -1496,7 +1496,9 @@ mod tests {
             },
         );
 
-        // Connect A and wait for its `SubscribeInbox` answer.
+        // Connect A and wait for its `SubscribeInbox` answer, then record
+        // `mark = inbox_answered_mark()` and wait for A's disconnect to finish
+        // cleanly so the peer table starts from a deterministic state.
         let client_a = Client::start(daemon.options());
         client_connected(&client_a).await;
         gate.notify_one();
@@ -1505,39 +1507,85 @@ mod tests {
         let mark = daemon.inbox_answered_mark();
         assert_eq!(mark, 1);
 
-        // Disconnect A, then connect B with its `SubscribeInbox` answer gated.
-        // Even if A is still counted in `live` while its disconnect is in
-        // flight, `answered` remains `mark` until B's own `SubscribeInbox` is
-        // answered.
         client_a.shutdown();
         drop(client_a);
+        {
+            let mut sub = daemon.subscribers.subscribe();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                sub.wait_for(|counts| counts.live == 0)
+                    .await
+                    .expect("the fake daemon stays alive");
+            })
+            .await
+            .expect("A's disconnect removes A from live peers");
+        }
 
+        // Deterministically inject a stale peer whose receiver stays alive so
+        // `push` does not prune it, and bump `live` under the same lock.
+        let (stale_tx, stale_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut peers = daemon.peers.lock().unwrap_or_else(PoisonError::into_inner);
+            peers.push((u64::MAX, stale_tx));
+            daemon.subscribers.send_modify(|counts| {
+                counts.live = peers.len();
+            });
+        }
+
+        // Connect B with its `SubscribeInbox` answer gated.
         let client_b = Client::start(daemon.options());
         client_connected(&client_b).await;
         let window_b = client_b.open_window("main");
         let handle_b = window_b.handle();
         handle_b.show_inbox(true);
 
-        // While B is gated, `answered` is still `mark` and
-        // `wait_inbox_answered(mark + 1)` does not return yet.
+        // While B is gated:
+        // - `inbox_subscribers(1)` is already Ready (satisfied by the stale peer);
+        // - `wait_inbox_answered(mark + 1)` is Pending (B is not answered yet);
+        // - `peers.len()` is still 1 (only the stale peer; B is not registered).
+        assert_eq!(daemon.live_inbox_subscribers(), 1);
         assert_eq!(daemon.inbox_answered_mark(), mark);
         {
             let mut cx = Context::from_waker(Waker::noop());
-            let wait = pin!(daemon.wait_inbox_answered(mark + 1));
+            let live_wait = pin!(daemon.inbox_subscribers(1));
             assert!(
-                wait.poll(&mut cx).is_pending(),
+                live_wait.poll(&mut cx).is_ready(),
+                "inbox_subscribers(1) must be ready when a stale peer is present"
+            );
+            let answered_wait = pin!(daemon.wait_inbox_answered(mark + 1));
+            assert!(
+                answered_wait.poll(&mut cx).is_pending(),
                 "wait_inbox_answered(mark + 1) must stay pending while B is gated"
             );
         }
-        // Any push while B is gated must not reach B.
+        {
+            let peers = daemon.peers.lock().unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(
+                peers.len(),
+                1,
+                "B must not be registered in peers while its SubscribeInbox answer is gated"
+            );
+        }
+
+        // Push while B is gated; B must not receive this update.
         daemon.push(vec![thread_updated(0, "before-b".into())]);
 
-        // Release B, wait via `wait_inbox_answered(mark + 1)`, push, and check
-        // that B receives the post-answer update.
+        // Release B's gate, wait via `wait_inbox_answered(mark + 1)`, and
+        // verify B is now registered alongside the stale peer.
         gate.notify_one();
         daemon.wait_inbox_answered(mark + 1).await;
         assert_eq!(daemon.inbox_answered_mark(), mark + 1);
+        assert_eq!(daemon.live_inbox_subscribers(), 2);
+        {
+            let peers = daemon.peers.lock().unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(
+                peers.len(),
+                2,
+                "B must be registered in peers after its SubscribeInbox answer"
+            );
+        }
 
+        // Push after B's answer and check B receives its inbox snapshot and
+        // then only `"after-b"`.
         daemon.push(vec![thread_updated(1, "after-b".into())]);
         flush_barrier(&client_b).await;
 
@@ -1567,6 +1615,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task_b)
             .await
             .expect("forward B ends");
+        drop(stale_rx);
     }
 
     async fn write_client_message(stream: &mut OwnedWriteHalf, message: &ClientMessage) {
