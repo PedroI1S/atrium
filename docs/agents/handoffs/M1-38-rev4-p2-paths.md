@@ -923,3 +923,90 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core --lib policy::v4::paths
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 14
+
+Input: review 11 (Claude Sonnet 5.5, `.orchestration/review-input/M1-38-rev4-p2-paths-round11.md`) on round 13 (one Low finding and four test gaps). Under D-120, every finding and test gap is fixed in this round. Zero P3 files, zero `Cargo.toml` changes, and zero frozen P0 interface files (`model.rs`, `limits.rs`, `tools.rs`, `paths.rs` signatures) were touched.
+
+Commits on `agent/neon/M1-38-rev4-p2-paths`:
+- `9bb45944`: non-Linux Unix `FsResolver::read_dir` `fstat` `st_blksize` stream sizing, single-fd `Dir::new(dir_fd)`, `NAME_ALLOC_PEAK` peak check + stack copy & early `drop(entry)`, and accurate per-platform `DIR_STREAM_ALLOC` doc comment (`paths/resolver.rs`).
+- `34be0614`: retain distinct `Unread` reasons from both `ProtectedSet::identity_gaps` and `RootAliases::incomplete` in `attach_applicable_gap`, while deduplicating identical reasons and keeping `HardDenyHit` suppression (`paths/sensitive.rs`).
+- `361a43b8`: updated round 13 `read_dir` test + all four round 14 cross-platform tests (`paths/p2_tests.rs`).
+- handoff commit: this section (`docs/agents/handoffs/M1-38-rev4-p2-paths.md`).
+
+### Finding 1 (Low): Non-Linux Unix `read_dir` per-entry `CString` allocation, `st_blksize` stream buffer sizing, and `DIR_STREAM_ALLOC` doc accuracy (§8)
+
+- **Cause:**
+  1. In `crates/atrium-core/src/policy/v4/paths/resolver.rs`, the `#[cfg(all(unix, not(target_os = "linux")))]` branch iterated `rustix::fs::Dir::next()` without charging or peak-checking the transient `CString` allocated per entry by `rustix`'s libc backend. Because `entry` also stayed alive across `push_unix_dir_entry`, that transient `CString` overlapped with retained `Vec<u8>` / `Vec<DirEntry>` allocations.
+  2. Round 13 charged a fixed `DIR_STREAM_ALLOC` (4,352 bytes) assuming Darwin `fdopendir` always allocated a 4,096-byte `dd_buf`, without checking the open directory's `st_blksize` first (network/FUSE filesystems can report much larger `st_blksize` values).
+  3. Round 13 also duplicated `dir_fd` via `fcntl_dupfd_cloexec` solely to keep `dir_fd` around for `DT_UNKNOWN` `statat`, holding 2 fds to the directory during iteration rather than 1.
+  4. `DIR_STREAM_ALLOC`'s doc comment stated unverified fixed Darwin `dd_buf` bounds and omitted the per-entry `CString` allocation on non-Linux Unix.
+
+- **What was confirmed from source vs. sandbox boundaries:**
+  - **Vendored `rustix 1.1.5`:** `Cargo.lock` pins `rustix 1.1.5` and `crates/atrium-core/Cargo.toml` enables `rustix = { version = "1", features = ["fs"] }` with no direct `libc` dependency (and workspace `Cargo.toml` sets `unsafe_code = "deny"`), so direct `libc::readdir` cannot be used without violating workspace lints or P2 owned paths. The worker pre-tool sandbox blocks reading `~/.cargo/registry/src/...` outside the worktree (respected without bypass). From `docs.rs` (`rustix` 1.1.5 API docs), `Cargo.lock`, and review 11, we confirmed that on the `libc` backend `Dir::read`/`Dir::next` returns an owned `DirEntry` whose name is stored in a heap `CString`, while `RawDir` is Linux/Android-only. Via `cargo check` on macOS, we also confirmed that `rustix::fs::Dir` on the `libc` backend in 1.1.5 does not implement `AsFd` (`E0599: no method named as_fd`).
+  - **Darwin `fdopendir` `dd_buf` sizing:** Apple does not ship Darwin `Libc` `gen/FreeBSD/opendir.c` source locally on macOS, so the exact upper bound on `dd_buf` cannot be settled from files on this machine. Per BSD/Darwin `opendir.c` behaviour (`__opendir_common` inspects `fstat`'s `st_blksize`, which is 4,096 on APFS/HFS+ and can be arbitrarily larger on NFS, SMB, or FUSE), we treat `dd_buf` as **unbounded by the fixed 4,096-byte constant** and size the stream charge dynamically from `fstat(&dir_fd).st_blksize` before calling `Dir::new`.
+
+- **Fix (`9bb45944`, `paths/resolver.rs`):**
+  - Added `DIR_STREAM_OVERHEAD = 256`, kept `DIR_STREAM_ALLOC = 4_096 + DIR_STREAM_OVERHEAD` as the uniform floor, and added `dir_stream_alloc_for_blksize(blksize: usize) -> usize = blksize.saturating_add(DIR_STREAM_OVERHEAD).max(DIR_STREAM_ALLOC)`.
+  - On non-Linux Unix, before calling `Dir::new(dir_fd)`: charges `budget.charge(1)?`, calls `rustix::fs::fstat(&dir_fd)` (on the already-open fd, mirroring `fdopendir`'s internal `fstat`, bounded 1:1 by `DirOpens` without consuming `FsCaps::Stats` so `FsCaps` stays identical to Linux), rejects negative `st_blksize` with `ResolveError::Io(FsIoError::Other)` (-> `Unread`) without allocating, computes `stream_alloc = dir_stream_alloc_for_blksize(blksize)`, and calls `budget.charge_alloc(stream_alloc)?`. If `st_blksize` pushes `stream_alloc` past the remaining budget, `AllocationBudget` exhausts before `Dir::new` is ever called.
+  - Handed ownership of the single `dir_fd` directly to `rustix::fs::Dir::new(dir_fd)` (removing `fcntl_dupfd_cloexec`), so peak open fds to the directory during listing is **1** on both Linux and non-Linux Unix. For the rare `DT_UNKNOWN` fallback on non-Linux Unix (where `Dir` lacks `AsFd`), added `DirStatBase::{Fd, Path}` and `stat_dir_child_by_path` (stack `PATH_MAX` buffer or pre-charged heap buffer + `statat(CWD, cstr, SYMLINK_NOFOLLOW)`).
+  - Defined `NAME_ALLOC_PEAK` (`1_024 + 64` on macOS/iOS for 64-bit `struct dirent` `__DARWIN_MAXPATHLEN` `d_name[1024]`, covering 255-byte `NAME_MAX` names and UTF-8 NFD expansions; `256 + 64` on other non-Linux Unix for `MAXNAMLEN + 1`) and `MAX_D_NAME_BUF` (`1_024` / `256`). Before every `dir.next()`, checks `if budget.remaining_alloc_bytes() < NAME_ALLOC_PEAK { budget.charge_alloc(NAME_ALLOC_PEAK)?; }` (peak check without permanent deduction, matching `FALLBACK_CANON_PEAK`, so total deducted bytes for ordinary local volumes remain identical to Linux). Immediately after `dir.next()`, copies `entry.file_name().to_bytes_with_nul()` into the stack `name_buf` and drops `entry` before `push_unix_dir_entry` allocates retained `Vec<u8>` / `Vec<DirEntry>` storage, so transient and retained name buffers are never live simultaneously.
+  - Updated the `DIR_STREAM_ALLOC` doc comment so every per-platform statement (Linux, non-Linux Unix, non-Unix) states only what is true on that platform.
+  - Factored `read_dir_unix_with_hooks(path, caps, budget, after_open, on_iter)` (zero-cost generic callbacks; `FsResolver::read_dir` passes `|| {}, || {}`) so tests can deterministically observe open fds during iteration and trigger `rmdir` between `open` and read.
+
+### Additional fix: Distinct `AnyTarget` gap + incomplete alias table reasons (`34be0614`, `paths/sensitive.rs`)
+
+- **Cause:** Round 13 (`47aa36f0`) guarded `attach_applicable_gap` with `out[start..].iter().all(|r| matches!(r.outcome, PartOutcome::Clear | PartOutcome::StoreHit(_)))`. When a target had **both** an applicable `AnyTarget` gap `R1` in `ProtectedSet::identity_gaps` (e.g., `UnresolvablePath(".aws/credentials")`) and a *different* reason `R2` from `RootAliases::incomplete` (e.g., `WalkCapReached(FsCap::Canonicalizations)`), `push_alias_records` pushed `Unread(R2)` first and `attach_applicable_gap` then skipped `R1`, silently dropping D-144's gap reason.
+- **Contract / D-144 check:** Contract §1 ("Every hit and every reason for doubt found in any part is kept"), `model.rs` `CallOutcome` ("Never discards hits or reasons for doubt"), and D-144 (`ProtectedSet::identity_gaps`: "A target a gap can affect that is not already a hit is Unread with the gap's reason") require keeping **both** distinct reasons (`R1` and `R2`), while deduplicating identical reasons (`R1 == R2`, such as when both recorded the same unlistable `.ssh` or `.azure` failure) and still suppressing both once a `HardDenyHit` (direct or alias) is established.
+- **Fix (`34be0614`):** `attach_applicable_gap` now returns early only when `target.resolution` is not `Resolved`, `out[start..]` contains a `HardDenyHit`, or `target.origin` is `variant_only: true`. Otherwise it charges `(out.len() - start) as u64 + 1`, checks whether `out[start..]` already contains `PartOutcome::Unread(u)` with `u == &gap.reason` (deduplicating exact duplicates), and otherwise appends `PartOutcome::Unread(gap.reason.clone())`.
+
+### Removed directory between `open` and read on macOS (decision & rationale)
+
+- **Behaviour change in round 13:** Pre-round-13 `Dir::read_from(&dir_fd)` called `openat(dir_fd, ".", ...)`, which returns `ENOENT` (`ResolveError::NotFound`) if the empty directory was `rmdir`'d after `open`. Post-round-13 `Dir::new(dir_fd)` calls `fdopendir` + `readdir` on the already-open fd (matching Linux `RawDir` `getdents64`), which yields an empty listing `Ok(vec![])` on APFS/ext4/tmpfs (or `Err(NotFound)` on VFSes that fail `readdir` with `ENOENT`), never `ResolveError::Io(_)`.
+- **Contract decision:** The post-round-13 behaviour (`Ok(vec![])` matching Linux, or `Err(NotFound)`, never `Io`) is what the contract wants:
+  - Under contract §2 ("Time"), concurrent external mutations during evaluation are outside the promise; under POSIX, `rmdir` can only remove an already-empty directory, so an empty listing hides no entries and represents no I/O uncertainty (§5).
+  - Audited all `read_dir` callers in `recursive.rs` (lines 301, 799, 903, 1361, 1845, 2246), `glob.rs`, and `sensitive.rs`: every caller produces the **exact same policy verdict** for `Ok(vec![])` and `Err(ResolveError::NotFound)`, including `check_recursive_root` (ordinary roots, filtered roots, `.azure`, `.ssh`), `RootAliases`, and `expand_shell_glob`.
+
+### Tests added / updated (`361a43b8`, `paths/p2_tests.rs`)
+
+| Review 11 item | Test (`p2_tests.rs`) | Coverage |
+|---|---|---|
+| Round 13 baseline update | `round13_read_dir_charges_dir_stream_alloc_and_single_dir_open` (`#[cfg(unix)]`) | Uses `expected_dir_stream_alloc` and `expected_dir_entry_peak_headroom` (`0` on Linux, `NAME_ALLOC_PEAK` on non-Linux Unix); verifies total deducted bytes match identically on ordinary local volumes. |
+| Test gap 1 (255-byte name budgets + Linux parity) | `round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity` (`#[cfg(unix)]`) | 255-byte filename: pins `dir_stream_alloc_for_blksize` (0, 1 KiB, 4 KiB, 64 KiB, 1 MiB, `usize::MAX` saturation); verifies `Exhausted(AllocationBudget)` at `path_conv + stream_alloc`, `path_conv + stream_alloc + NAME_ALLOC_PEAK - 1`, `total_deducted`, and `exact_need - 1` on non-Linux Unix (`path_conv + DIR_STREAM_ALLOC` and `exact_need - 1` on Linux); verifies success at `exact_need` leaving `peak` bytes unspent and exact cross-platform total-deduction parity. |
+| Test gap 2 (open fd count before / during / after) | `round14_read_dir_open_fd_count_before_during_and_after` (`#[cfg(unix)]`) | Counts open fds matching the unique tempdir's `(dev, ino)` via `/proc/self/fd` on Linux and `/dev/fd` (`open(O_RDONLY \| O_NONBLOCK \| O_CLOEXEC)` + `fstat`, zero integer casts) on non-Linux Unix. Self-checks 0 -> 1 -> 2 -> 0 with manual probes so a second open or dup visibly reports 2; asserts 0 before, 1 on every `read_dir` iteration during, 0 after, and 0 after mid-listing `EntriesRead` failure. |
+| Test gap 3 (dir removed between open and read) | `round14_removed_dir_between_open_and_read_preserves_verdict` (`#[cfg(unix)]`) | Direct `read_dir_unix_with_hooks` with `rmdir` firing inside `after_open` asserts `Ok(vec![])` or `Err(NotFound)` (never `Io`); compares `check_recursive_root` across `EmptyListing`, `NotFound` (pre-round-13), and real `rmdir`-after-open on ordinary roots (plain & filtered), empty `.azure` with `msal*` filter (removed on call 0 in `RootAliases` and call 1 in filter walk), and empty `.ssh` (removed on call 0 in `RootAliases::push_ssh_members` and call 1 in S8 `scan_ssh_dir`), plus `expand_shell_glob` parity. |
+| Test gap 4 (`AnyTarget` gap + incomplete alias table) | `round14_target_with_any_target_gap_and_incomplete_alias_table_keeps_both_reasons` (all platforms) | Distinct reasons (`R1 = UnresolvablePath("~/.aws/credentials")` from `ProtectedSet::identity_gaps` `AnyTarget` gap + `R2 = WalkCapReached(Canonicalizations)` from `RootAliases::incomplete`): verifies both `R1` and `R2` are kept on ordinary subject (`proj/readme`), store target (`.pypirc` alongside `StoreHit`), command (`cat proj/readme`), and recursive root (`proj`), while hard-deny `.netrc` suppresses both; also verifies identical reasons (`R1 == R2` from unlistable `.ssh`) are deduplicated to one `Unread`. |
+
+### Cross-platform `#[cfg]` audit (macOS, other non-Linux Unix, Linux, non-Unix)
+
+- `paths/resolver.rs`:
+  - `DIR_STREAM_OVERHEAD` and `DIR_STREAM_ALLOC`: unconditional; used across all targets (`linux`, `all(unix, not(linux))`, `not(unix)`).
+  - `NAME_ALLOC_PEAK` and `MAX_D_NAME_BUF`: partitioned cleanly into `#[cfg(any(target_os = "macos", target_os = "ios"))]` (`1_024 + 64` / `1_024`) and `#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos", target_os = "ios"))))]` (`256 + 64` / `256`), matching the exact union `all(unix, not(target_os = "linux"))` with no overlap, gap, or dead code.
+  - `dir_stream_alloc_for_blksize`, `stat_dir_child_by_path`: `#[cfg(all(unix, not(target_os = "linux")))]`; called from `read_dir_unix_with_hooks` and `push_unix_dir_entry` under matching guards.
+  - `DirStatBase<'a>`: `#[cfg(unix)]` with `#[cfg(target_os = "linux")] Fd(BorrowedFd<'a>)` and `#[cfg(not(target_os = "linux"))] Path(&'a [u8])`; both arms used in `push_unix_dir_entry` and `read_dir_unix_with_hooks`.
+  - `read_dir_unix_with_hooks`: `#[cfg(unix)]`, called from `FsResolver::read_dir` (non-test) and `p2_tests.rs` (test). On Linux (`#[cfg(target_os = "linux")]`), `use std::os::fd::AsFd;`, `dir_fd.as_fd()`, `DIR_STREAM_ALLOC`, `RawDir::new`, `after_open`, `on_iter`, `path`, `caps`, `budget` are all used cleanly with zero unused imports or variables. On `#[cfg(not(unix))]`, `FsResolver::read_dir` retains its `std::fs::read_dir` path with `DIR_STREAM_ALLOC` and `PATH_MAX` pre-charges.
+- `paths/sensitive.rs`: zero platform `#[cfg]`s; unconditional across all targets.
+- `paths/p2_tests.rs`:
+  - `expected_dir_stream_alloc(dir)` (`#[cfg(unix)]`): binds `let _ = dir;` on Linux so no `unused_variables` warning fires under `-D warnings`.
+  - `expected_dir_entry_peak_headroom()` (`#[cfg(unix)]`): returns `0` on Linux, `NAME_ALLOC_PEAK` on `all(unix, not(target_os = "linux"))`.
+  - `round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity` (`#[cfg(unix)]`): uses `DIR_STREAM_ALLOC` in both the Linux and non-Linux Unix `#[cfg]` branches (zero unused imports on either OS).
+  - `count_open_fds_for_dir(target_dir)` (`#[cfg(unix)]`): compares native `(dev, ino)` types inside each `#[cfg]` block (`/proc/self/fd` + `std::fs::metadata` on Linux; `/dev/fd` + `rustix::fs::{stat, open, fstat}` on non-Linux Unix) with zero integer casts (no `clippy::unnecessary_cast` or `clippy::cast_sign_loss` risk on 32-bit/64-bit Linux or Darwin).
+  - `round14_removed_dir_between_open_and_read_preserves_verdict` (`#[cfg(unix)]`): uses only cross-Unix APIs (`OsStrExt`, `read_dir_unix_with_hooks`, `std::fs::remove_dir`).
+  - `round14_target_with_any_target_gap_and_incomplete_alias_table_keeps_both_reasons`: unconditional (`FakeFs`), compiles and runs on all platforms.
+
+### Verification
+
+Run by the worker (D-123):
+- `cargo fmt --all` (clean)
+- `cargo check -p atrium-core --tests` (clean on macOS, 0 errors, 0 warnings)
+- No test runs or `clippy` were executed (D-123).
+
+Commands for the orchestrator's verification (fish-compatible; run on both macOS and Linux):
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core --lib policy::v4::paths
+cargo test --workspace --no-fail-fast
+```
