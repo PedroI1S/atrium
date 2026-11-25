@@ -451,7 +451,8 @@ mod tests {
                                     if !subscribed {
                                         peers.push((conn_id, tx.clone()));
                                         subscribed = true;
-                                        let _ = subscribers_conn.send(peers.len());
+                                        // Update even when no receiver is subscribed yet.
+                                        let _ = subscribers_conn.send_replace(peers.len());
                                     }
                                     continue;
                                 }
@@ -474,7 +475,7 @@ mod tests {
                             let mut peers =
                                 peers_conn.lock().unwrap_or_else(PoisonError::into_inner);
                             peers.retain(|(id, _)| *id != conn_id);
-                            let _ = subscribers_conn.send(peers.len());
+                            let _ = subscribers_conn.send_replace(peers.len());
                         }
                     });
                 }
@@ -1198,5 +1199,38 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("forward ends");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbox_subscribers_returns_immediately_if_already_subscribed() {
+        let daemon = Scripted::start(list_threads_ok);
+        let bridge = Bridge::start(daemon.options());
+        let (sink, receiver) = sink();
+        bridge.attach("main", sink);
+        let handle = bridge.client().window("main").expect("window is open");
+        handle.show_inbox(true);
+
+        // Wait for the initial `inbox` snapshot so `SubscribeInbox` has been
+        // answered, then run a barrier on the same connection so the handler
+        // has finished updating `subscribers` while nobody is watching it.
+        let mut saw_inbox = false;
+        while !saw_inbox {
+            for (seq, delivery) in unpack(next(&receiver)) {
+                handle.ack(seq);
+                if delivery["type"] == "inbox" {
+                    saw_inbox = true;
+                }
+            }
+        }
+        flush_barrier(bridge.client()).await;
+        assert_eq!(daemon.subscribers.receiver_count(), 0);
+
+        let started = Instant::now();
+        daemon.inbox_subscribers(1).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "inbox_subscribers waited {:?} for an already-subscribed connection",
+            started.elapsed()
+        );
     }
 }

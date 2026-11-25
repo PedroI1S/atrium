@@ -82,3 +82,86 @@ git checkout -- app/src-tauri/src/bridge.rs
 ## Gotchas / follow-ups
 
 None.
+
+## Round 2
+
+### Fix
+
+`tokio::sync::watch::Sender::send` returns `Err(SendError)` **without updating the stored value** when there are no active receivers. Because `Scripted::start_with` drops the initial receiver (`let (subscribers, _) = tokio::sync::watch::channel(0usize);`), any `SubscribeInbox` or disconnect that completed before a test called `inbox_subscribers` left the stored count at `0`, causing `inbox_subscribers(1)` to time out after 5 s.
+
+Checked every place the subscriber count changes in `app/src-tauri/src/bridge.rs` (`mod tests`):
+- **Register (`SubscribeInbox` arm):** changed `subscribers_conn.send(peers.len())` to `subscribers_conn.send_replace(peers.len())`, which always updates the stored value even with 0 receivers.
+- **Disconnect:** changed `subscribers_conn.send(peers.len())` to `subscribers_conn.send_replace(peers.len())`.
+- **`Scripted::push`:** verified `self.subscribers.send_if_modified(...)` already updates the stored value unconditionally even with 0 receivers.
+
+### New test
+
+Added `inbox_subscribers_returns_immediately_if_already_subscribed` in `app/src-tauri/src/bridge.rs`:
+- Connects a `Bridge`, opens `"main"`, enables `show_inbox(true)`, waits for the initial `"inbox"` snapshot, and runs `flush_barrier` on the same connection so `SubscribeInbox` has completely finished updating `subscribers` before anyone watches it.
+- Asserts `daemon.subscribers.receiver_count() == 0`.
+- Calls `daemon.inbox_subscribers(1).await` and asserts it returns immediately (`< 500 ms`).
+
+### Checks run by worker (D-123)
+
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-app --tests` — clean, 0 warnings
+
+### Updated verification commands (fish-compatible)
+
+#### 1. Format, clippy, and full workspace test suite
+
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+```
+
+#### 2. Run `bridge::` tests 300 times in a row
+
+```fish
+for i in (seq 1 300)
+    cargo test -p atrium-app bridge:: --quiet; or begin; echo "FAILED on run $i"; break; end
+end
+```
+
+#### 3. Verify the regression test fails with Step 1 reverted (race itself, not `inbox_subscribers` hang)
+
+Temporarily revert Step 1 in `app/src-tauri/src/bridge.rs` inside `Scripted::start_with`:
+
+1. Right after `let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();` and `let mut subscribed = false;`, restore eager peer registration on accept **using `send_replace`**:
+   ```rust
+   {
+       let mut peers = peers_conn.lock().unwrap_or_else(PoisonError::into_inner);
+       peers.push((conn_id, tx.clone()));
+       subscribed = true;
+       let _ = subscribers_conn.send_replace(peers.len());
+   }
+   ```
+2. In the `ClientMessage::SubscribeInbox { request_id }` arm, keep the `inbox_delay` sleep and return `Some(ServerMessage::Response { ... })` directly (without locking `peers_conn` or registering there):
+   ```rust
+   ClientMessage::SubscribeInbox { request_id } => {
+       if !options.inbox_delay.is_zero() {
+           tokio::time::sleep(options.inbox_delay).await;
+       }
+       Some(ServerMessage::Response {
+           request_id,
+           result: CommandResult::Ok {
+               value: serde_json::json!({"threads": [], "inbox": []}),
+           },
+       })
+   }
+   ```
+
+Then run the regression test:
+
+```fish
+cargo test -p atrium-app bridge::tests::delayed_subscribe_inbox_does_not_lose_pushed_updates -- --exact
+```
+
+Expected failure: `inbox_subscribers(1)` returns immediately on accept (does **not** hang), `daemon.push` sends the 100 `ThreadUpdated` messages before the 200 ms `SubscribeInbox` answer arrives, the delayed answer clears `known.threads`, and the test panics in `next_raw` with `"a delivery arrives"` (not `"connections subscribe to the inbox"`).
+
+Restore the working tree afterwards:
+
+```fish
+git checkout -- app/src-tauri/src/bridge.rs
+```
