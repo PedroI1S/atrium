@@ -41,9 +41,15 @@ Also read these decisions in `docs/agents/decisions.md`. They narrow or clarify 
    - `evaluate_call`: P1, then P3's tool effects, then P2's paths, globs and filters, then the best-effort pass, then P3's rules, then `decide`. Budgets per §8, with the structural caps checked first (D-150).
 2. **Wire it into `SessionGate`** (`crates/atrium-core/src/policy/gate.rs`). The gate keeps its own jobs: the resolver, link walks, the multiply-linked-file check, `redeem`'s re-evaluation and the ledger. Only the evaluation underneath changes.
    - The adapters' and the daemon's use of `SessionGate` stays the same, and no protocol message changes, except setting P4's existing `unread` field.
-3. **Remove `dev`'s evaluator.** That's `policy/shell.rs`, `policy/words.rs`, the `deny.rs` and `engine.rs` code no longer used, and `HOME_READONLY_COMMANDS` if nothing uses it any more.
+3. **Remove `dev`'s evaluator** (its decision path in `engine.rs`, and the `deny.rs` code no longer used), and `HOME_READONLY_COMMANDS` if nothing uses it any more.
+   - **Corrected on 2026-11-25 (D-178):** the best-effort pass *is* `dev`'s hard-deny matching (§2). That matching lives in `deny.rs` (`analyze`/`hard_deny`), `shell.rs` and `words.rs`. **Restore and reuse that code; don't rewrite it.** Change only:
+     - the §8 charge points;
+     - the §11/§12 drops;
+     - non-ASCII safety.
+     
+     This version of the brief listed `shell.rs` and `words.rs` for deletion, and rounds 1 and 2 rewrote the matching instead. Most of reviews 1 and 2's findings came from that.
    - Keep what rev 4 reuses on purpose, and say in the handoff, item by item, what was deleted and what was kept and why:
-     - the best-effort pass's `dev` matching;
+     - the best-effort pass's `dev` matching (restored `dev` code, see above);
      - `apply_rules`' precedence;
      - `Sensitive`.
    - P4's Settings test parses `deny.rs`'s `ASK_FILES` / `ASK_TREES` / `ASK_NAME_PREFIXES`. If those move, update that test's source path in the same change, and say so.

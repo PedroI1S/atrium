@@ -1183,3 +1183,19 @@ The orchestrator reads `grep`'s abbreviated long options (`--rec`, `--dir=recurs
 Review 1's findings 1 and 8 are also still open. Pedro pauses P5 to rethink the plan; the branch stays as it is. The orchestrator recommended reusing `dev`'s `shell.rs`/`words.rs` as the best-effort module instead of a rewrite. Approved now, for when P5 resumes:
 1. a `#[doc(hidden)]` test-only `SessionGate` constructor that takes the budget limits, so §13's properties 3 and 4 run through the gate. Public behaviour is unchanged, like M1-44's `with_withdraw_timeout`;
 2. remove `HOME_READONLY_COMMANDS` from `atrium-protocol` and move the table into the test fixtures (`dev_parity` or P3's), closing review 2's finding 11.
+
+## D-178 — 2026-11-25 — Pedro: P5 round 3 restores `dev`'s matching instead of rewriting it
+**Decided by Pedro (driver).** After pausing P5 (D-177), Pedro accepts the orchestrator's plan, to launch on his go.
+- **The plan:** the best-effort pass becomes `dev`'s own hard-deny matching, restored from `5c4d154f`:
+  - `deny.rs`'s `analyze`/`hard_deny` path;
+  - `shell.rs`;
+  - `words.rs`.
+
+  It replaces the round 2 port (`dev_readings.rs`, 1,758 lines) and any part of round 1's `evaluate/best_effort.rs` that reimplements the same matching. The worker maps that file function by function (replaced or kept as rev 4–specific) before deleting anything.
+- **Allowed changes to the restored code:**
+  - §8 charge points, so every step is charged before it runs, and allocations by size, with `dev`'s logic unchanged;
+  - the §11/§12 drops (K7, K9, `$'…'`, globbed `cd`);
+  - non-ASCII safety.
+- **Everything else from rounds 1 and 2 stays.** The evaluator, the wiring, the migrated suites, and round 2's fixes for review 1's findings 3, 4, 5, 6, 9, 10 and 12. The other open findings from reviews 1 and 2 are fixed in the same round.
+- **Cause, and the orchestrator's error:** the brief's item 3 listed `shell.rs` and `words.rs` for deletion, while also saying to keep "the best-effort pass's `dev` matching", which lives in them. The orchestrator's round 2 prompt then asked for a *port* of `dev`'s readings rather than a restore. Pedro asked that this kind of error be avoided. The brief's item 3 is corrected, and `docs/agents/README.md` now has a convention: briefs that delete code name what is reused and say restore, don't rewrite.
+- **The writer** stays Opus 5.5 on Pedro's plan (D-176). The review stays Sonnet 5.5. D-177's two approvals (the test budget hook, removing `HOME_READONLY_COMMANDS`) apply.

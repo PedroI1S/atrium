@@ -45,6 +45,8 @@ A task merges only when its last cross-provider review is "approve" with **no op
   - Code never relies on the user's shell: scripts use `#!/usr/bin/env bash`.
   - Any command written into a report, handoff or doc for a human to run must work in fish: `env VAR=value cmd` (not `VAR=value cmd`), no `$(...)` or `export`, or wrap it in a bash script.
 
+- **Briefs that delete code must say which parts are reused** (D-178). When the contract keeps an existing behaviour (for example "`dev`'s matching"), the brief names the files and functions that implement it and says **restore and adapt, don't rewrite**. The same goes for rework prompts: never ask a worker to "port" working code from memory or from function names when the code itself can be brought back. A rewrite of proven code costs rounds: P5 lost two that way.
+
 - Task IDs: `M<milestone>-<nn>-<slug>`, e.g. `M0-01-codex-client`.
 - Branches: `agent/<model>/<task-id>`, e.g. `agent/sol/M0-01-codex-client`.
 - Worktrees: `../atrium-wt/<task-id>`.
