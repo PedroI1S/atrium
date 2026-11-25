@@ -1435,9 +1435,12 @@ pub(crate) fn check_target_impl(
 }
 
 /// Attaches the first applicable [`ProtectedSet::identity_gaps`] entry to `out`
-/// when `out[start..]` holds only `Clear` / `StoreHit` outcomes (i.e. neither
-/// a `HardDenyHit` nor an `Unread` was established for this target;
-/// `model.rs` `ProtectedSet::identity_gaps`, D-144, D-145).
+/// whenever `out[start..]` does not already hold a `HardDenyHit` (and `target`
+/// is not a variant-only glob match), deduplicating against an identical
+/// `Unread` reason already recorded for this target (for example when
+/// `RootAliases::incomplete` observed the exact same failure). Distinct
+/// reasons for doubt are both preserved (contract §1, §5; `model.rs`
+/// `ProtectedSet::identity_gaps`; D-144, D-145).
 fn attach_applicable_gap(
     target: &Target,
     protected: &ProtectedSet,
@@ -1445,11 +1448,28 @@ fn attach_applicable_gap(
     out: &mut Vec<PartResult>,
     start: usize,
 ) -> Result<(), Exhausted> {
-    if out[start..]
-        .iter()
-        .all(|r| matches!(r.outcome, PartOutcome::Clear | PartOutcome::StoreHit(_)))
-        && let Some(gap) = applicable_gap(target, protected, budget)?
+    if !matches!(target.resolution, TargetResolution::Resolved { .. })
+        || out[start..]
+            .iter()
+            .any(|r| matches!(r.outcome, PartOutcome::HardDenyHit(_)))
+        || matches!(
+            target.origin,
+            TargetOrigin::ExpandedFrom {
+                variant_only: true,
+                ..
+            }
+        )
     {
+        return Ok(());
+    }
+    if let Some(gap) = applicable_gap(target, protected, budget)? {
+        budget.charge((out.len() - start) as u64 + 1)?;
+        if out[start..]
+            .iter()
+            .any(|r| matches!(&r.outcome, PartOutcome::Unread(u) if u == &gap.reason))
+        {
+            return Ok(());
+        }
         let part = origin_to_part(&target.origin);
         let bytes = unread_reason_alloc_bytes(&gap.reason);
         budget.charge(bytes as u64 + 1)?;
@@ -1476,10 +1496,12 @@ fn attach_applicable_gap(
 ///   unlisted equivalences);
 /// - the unlisted equivalences (NFC/NFD, unlisted case folds) of the written
 ///   spelling, when nothing else matched (§11 item 13);
-/// - when `attach_gap` is `true`, the identity gap that applies beside a
-///   `Clear` or `StoreHit` outcome (resolver-backed callers pass `false` and
-///   attach the gap after [`push_alias_records`] so an alias-only
-///   `HardDenyHit` never carries a spurious gap `Unread`).
+/// - when `attach_gap` is `true`, the identity gap that applies unless a
+///   `HardDenyHit` or identical `Unread` reason was already recorded
+///   (resolver-backed callers pass `false` and attach the gap after
+///   [`push_alias_records`] so an alias-only `HardDenyHit` never carries a
+///   spurious gap `Unread`, while distinct gap and alias-table reasons are
+///   both kept per §1 and D-144).
 ///
 /// A hard-deny hit ends the list. A Clear outcome is recorded only when
 /// `keep_clear`. Variant-only matches are never hits, so their written
@@ -2186,8 +2208,10 @@ pub(crate) fn push_target_records(
         return Ok(());
     }
     push_alias_records(target, protected, resolver, caps, budget, aliases, outcomes)?;
-    // Attach an applicable identity gap only when neither the direct check nor
-    // the alias check produced a HardDenyHit or an Unread.
+    // Attach an applicable identity gap whenever neither the direct check nor
+    // the alias check produced a HardDenyHit (preserving distinct Unread
+    // reasons from both the alias table and `ProtectedSet::identity_gaps` per
+    // contract §1 and D-144, while deduplicating identical reasons).
     attach_applicable_gap(target, protected, budget, outcomes, start)
 }
 
