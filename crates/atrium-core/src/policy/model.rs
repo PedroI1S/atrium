@@ -1129,6 +1129,12 @@ pub(crate) struct RuleEvalContext<'a> {
     pub(crate) units: &'a [CommandUnit],
     pub(crate) effects: &'a [ToolEffects],
     pub(crate) targets: &'a [Target],
+    /// Outcomes established by earlier stages (P1 lexing/unwrapping, P2 path
+    /// resolution/checking, and P3 git selection) so `evaluate_rules` sees
+    /// unit-level, target-level, and call-level `Unread` and `Exhausted` parts
+    /// before granting Allow coverage or suppressing a lower-ranked Deny
+    /// (contract §7, D-153).
+    pub(crate) outcomes: &'a [PartResult],
     pub(crate) best_effort: &'a BestEffortRecord,
     pub(crate) folds: &'a FoldRules,
 }

@@ -1071,3 +1071,33 @@ D-141 removed flag arities from these rows precisely to avoid this.
 - **P3 (M1-39):** round 4 is written by Neon `xhigh` from `b021ad4`. It follows D-156's ruling (trigger and code detection never consumes option values), removes the arity modelling outside the frozen table in core and in `app/src/chat/rule-form.ts` together, and fixes review 3's three findings.
 - **Unchanged:** reviews by Codex (GPT-6.1 Sol, `high`, read-only); D-123's write-then-verify flow; D-120's 100% gate. Work that needs path-like literals the `agy` policy refuses (D-074) goes back to Claude.
 - **First:** the `agy` 1.5.15 hook check (D-158).
+
+## D-162 — 2026-11-24 — Pedro: Sonnet 5.5 reviews P2 and P3 while Codex is out
+**Decided by Pedro (driver).** Codex has no usage left on Pedro's account; on its ChatGPT login it refuses `gpt-6.1-sol`, `gpt-6.1`, `gpt-6-astra` and `gpt-6`. So **Claude Sonnet 5.5** replaces Codex (D-124) as the reviewer for P2 (M1-38) and P3 (M1-39) on Pedro's shifts. It runs as a read-only Claude subagent in the task's worktree, with the same review prompt and the same D-120 rules.
+- **Cross-provider:** Sonnet (Anthropic) reviewing Neon (Google). P2's round 10 was written by Opus, but review 9 is followed by Neon's round 11, and every later round is reviewed again.
+- **Codex goes back to reviewing** when the usage returns, or on rodrigo's shifts.
+
+## D-163 — 2026-11-24 — Pedro: go for M1-42-n16-bridge-test-race
+**Decided by Pedro (driver).** M1-42 starts now, following its brief: a Neon `medium` writer (D-158), the orchestrator's verification (D-123), a Sonnet 5.5 review (D-162) and the 100% gate (D-120).
+- **Three writers at once:** it runs alongside P2's round 11 and P3's round 4, one more than D-123's guideline of two on a laptop.
+  - It is a test-only change, and its worker runs only `cargo check -p atrium-app --tests`.
+  - Its builds use the shared build folder (`CARGO_TARGET_DIR` set to the main checkout's `target/`), so it adds no second cold build on disk.
+
+## D-164 — 2026-11-24 — Pedro: delete the old worker branches; superseded ones kept as tags
+**Decided by Pedro (driver).** The orchestrator did the deletion.
+- **Merged into `dev`, deleted on `origin` and locally:**
+  - `agent/sonnet/M1-13-adversarial`;
+  - `agent/hydrogen/M1-16-requests-and-notifications`;
+  - `agent/hydrogen/M1-20-gate-audit`, which was local only. Its handoff was first copied to `docs/agents/handoffs/M1-20-gate-audit.md`, because it existed only on that branch.
+- **Superseded by rev 4 (D-135), and never merged:** `agent/hydrogen/M1-27-engine-name-fold`, `M1-28-ansi-c-words`, `M1-29-cr17-stores`, `M1-30-tree-wildcards`, `M1-31-credential-folder-search` and `M1-32-link-globs`.
+  - Before deleting, each `origin` tip was tagged `archive/<task>` and the tags were pushed. The rev 4 briefs' disposition lists, and P5, still read hunks and tests from them.
+  - The branches were deleted on `origin` and locally.
+- **Kept:** `agent/orchestrator/M1-33…`, `M1-34…` and `agent/neon/M1-35…` to `M1-37…`, `M1-40…` (merged, rodrigo's choice to keep), plus every branch still in flight.
+
+## D-165 — 2026-11-24 — Pedro: merge P3 (M1-39) into `dev`
+**Decided by Pedro (driver).** P3 (`agent/neon/M1-39-rev4-p3-tools-rules` @ `bbe928de`) is merged into `dev` as `b48e9324`.
+- **Review:** approved in Sonnet review round 5 with no findings (D-120, D-162; `reviews/M1-39-rev4-p3-tools-rules-round5.md`). The optional fixture rows it mentions are not findings.
+- **No rebase was needed.** `dev` had moved only in `docs/` since the branch merged `dev` in (`27a11d1c`, after P4), and `git merge-tree` was clean.
+- **The orchestrator's single verification of round 5, on macOS, in the worktree's own `target/` (D-123):** fmt and workspace clippy clean; `check-protocol-ts` up to date; **925 passed, 0 failed, 7 ignored**; app typecheck clean; **373 vitest** passed.
+- **Linux is owed for the M1 gate.** P3 is not wired into `SessionGate`; P5 (M1-41) does that.
+
