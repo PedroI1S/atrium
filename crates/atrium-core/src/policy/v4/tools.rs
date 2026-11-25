@@ -564,6 +564,7 @@ fn classify_cd(
 ) -> Result<(), Exhausted> {
     // `cd` changes the shell's working directory; it does not write files
     // unless accompanied by a non-/dev/null output redirect.
+    effects.tool_name = Some("cd");
     effects.writes = redirect_writes;
     let mut idx = 1usize;
     let mut bad_flag = false;
