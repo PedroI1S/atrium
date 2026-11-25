@@ -21,7 +21,7 @@ use globset::{GlobBuilder, GlobMatcher};
 use crate::policy::model::{
     AccessMode, BestEffortRecord, BestEffortRedirectKind, BestEffortUnit, ComputeBudget,
     ExhaustReason, Exhausted, FoldRules, Hit, HitMatch, HitSource, PartId, PartOutcome, PartResult,
-    ProtectedSet, UnreadReason,
+    PipelineId, ProtectedSet, UnreadReason,
 };
 use crate::policy::tools::{self, ToolRowKind};
 use crate::policy::v4::lex::brace_expand_budgeted;
@@ -184,11 +184,11 @@ pub(super) fn run_best_effort_into(
         raw_text_checks(raw, &shared, protected.folds, budget, out)?;
     }
 
-    // 2. Top-level separator map (O(N) scan of raw_texts[0]) so `cd DIR && ...`
-    //    only keeps `DIR`, while `cd DIR; ...` / `cd DIR\n...` keeps both `DIR`
-    //    and the previous directory (matching `dev` and `adversarial_ordinary.rs`).
-    let top_joins = if record.raw_texts.len() == 1 {
-        scan_top_level_joins(&record.raw_texts[0], budget)?
+    // 2. Top-level unit metadata (O(N) scan of raw_texts[0]) so `cd DIR && ...`
+    //    tracks the `&&`-chain pool, subshells, compounds, loops, functions,
+    //    `&` backgrounding, and here-strings (matching `dev` `words.rs`).
+    let top_meta = if record.raw_texts.len() == 1 {
+        scan_top_level_meta(&record.raw_texts[0], budget)?
     } else {
         Vec::new()
     };
@@ -197,16 +197,56 @@ pub(super) fn run_best_effort_into(
     let mut cwd_tracker = BeCwdTracker::new(start_cwd, &protected.home, budget)?;
     let mut top_unit_ordinal = 0usize;
     let mut last_find_exec_context: Option<(u8, Vec<String>)> = None;
+    let mut env_child_cands: Option<(Vec<Vec<u8>>, bool)> = None;
+    let mut pending_derived_meta: Vec<BeUnitMeta> = Vec::new();
+    let mut derived_unit_ordinal = 0usize;
 
     budget.charge(record.units.len().max(1) as u64)?;
     for (i, u) in record.units.iter().enumerate() {
         budget.charge(1)?;
         let part = PartId::BestEffortUnit(u.index);
 
+        // Determine join/compound metadata for this unit.
+        let unit_meta = if !u.derived && u.depth == 0 {
+            let m = top_meta
+                .get(top_unit_ordinal)
+                .copied()
+                .unwrap_or(BeUnitMeta::SEQ);
+            top_unit_ordinal += 1;
+            m
+        } else {
+            let m = pending_derived_meta
+                .get(derived_unit_ordinal)
+                .copied()
+                .unwrap_or(BeUnitMeta::AND);
+            derived_unit_ordinal += 1;
+            m
+        };
+
         // Update depth-scoped cwd tracker before inspecting this unit.
-        cwd_tracker.enter_unit(u, budget)?;
-        let unit_cands = cwd_tracker.current_cands(budget)?;
-        let unit_cwd_unknown = cwd_tracker.is_unknown();
+        cwd_tracker.enter_unit(u, &mut env_child_cands, budget)?;
+        let base_cands = cwd_tracker.current_cands(budget)?;
+        let base_cwd_unknown = cwd_tracker.is_unknown();
+
+        // Check if `u.raw_argv` starts with `env` (or `$(which env)`) using
+        // `-C DIR` / `--chdir` / `--ch*` and compute shifted per-unit cwds.
+        let env_shift = extract_env_chdir_cands(
+            &u.raw_argv,
+            &base_cands,
+            base_cwd_unknown,
+            &cwd_tracker,
+            protected.folds,
+            budget,
+        )?;
+        let (unit_cands, unit_cwd_unknown) = match env_shift {
+            Some((shifted, shifted_unknown)) => {
+                // If this `env -C` wraps a nested shell (`sh -c ...`) or `-S`,
+                // propagate its shifted directory into the derived child frame.
+                env_child_cands = Some((clone_bytes_vec(&shifted, budget)?, shifted_unknown));
+                (shifted, shifted_unknown)
+            }
+            None => (base_cands, base_cwd_unknown),
+        };
 
         // Track `find` roots for immediately-following derived `-exec` units.
         let mut next_find_exec_context: Option<(u8, Vec<String>)> = None;
@@ -215,17 +255,47 @@ pub(super) fn run_best_effort_into(
             _ => None,
         };
 
-        // Check every reading (`effective_argv` + `alt_argv`) of this unit.
-        let readings_count = 1 + u.alt_argv.len();
+        // Build extra cluster-aware / nested-substitution readings from `raw_argv`
+        // (catches `exec -ca foo rm -rf ~`, `flock /tmp/l -s rm -rf ~`,
+        // `$(which env) $(which sudo) id`, `script -qc 'rm -rf ~' /dev/null`, etc.).
+        let (extra_readings, extra_payloads) =
+            extra_readings_from_raw(&u.raw_argv, &u.effective_argv, protected.folds, budget)?;
+
+        // Check every reading (`effective_argv` + `alt_argv` + cluster-unwrapped readings).
+        let readings_count = 1 + u.alt_argv.len() + extra_readings.len();
         budget.charge(readings_count as u64)?;
         let mut unit_is_same_shell_parent = false;
-        for reading in std::iter::once(&u.effective_argv).chain(u.alt_argv.iter()) {
+        let mut same_shell_eval_payload: Option<String> = None;
+        for reading in std::iter::once(&u.effective_argv)
+            .chain(u.alt_argv.iter())
+            .chain(extra_readings.iter())
+        {
             if reading.is_empty() {
                 continue;
             }
             let folded_cmd = fold_cmd_cr19(&reading[0], protected.folds, budget)?;
             if matches!(folded_cmd.as_str(), "eval" | "source" | ".") {
                 unit_is_same_shell_parent = true;
+                if same_shell_eval_payload.is_none() && folded_cmd == "eval" {
+                    let args = match reading.get(1).map(String::as_str) {
+                        Some("--") => &reading[2..],
+                        _ => &reading[1..],
+                    };
+                    if !args.is_empty() {
+                        let total: usize = args.iter().map(|s| s.len() + 1).sum();
+                        budget.charge(total as u64)?;
+                        budget.charge_alloc(total)?;
+                        same_shell_eval_payload = Some(args.join(" "));
+                    }
+                }
+            }
+            if !u.derived
+                && pending_derived_meta.is_empty()
+                && is_shell_folded(&folded_cmd, budget)?
+                && let Some(code) = extract_shell_c_code(&reading[1..], budget)?
+            {
+                pending_derived_meta = scan_top_level_meta(code, budget)?;
+                derived_unit_ordinal = 0;
             }
             if folded_cmd == "find" && has_find_exec_flag(reading, budget)? {
                 let (roots, _) = find_roots_budgeted(reading, budget)?;
@@ -243,6 +313,21 @@ pub(super) fn run_best_effort_into(
                 &unit_cands,
                 unit_cwd_unknown,
                 active_exec_roots,
+                opts,
+                budget,
+                out,
+            )?;
+        }
+        // Check any inline code payloads extracted by our cluster-aware unwrapper
+        // (e.g. `script -qc 'rm -rf ~' /dev/null`, `flock /tmp/l --comm 'rm -rf ~'`).
+        for payload in &extra_payloads {
+            check_inline_payload_be(
+                payload,
+                &part,
+                protected,
+                &shared,
+                &unit_cands,
+                unit_cwd_unknown,
                 opts,
                 budget,
                 out,
@@ -271,31 +356,51 @@ pub(super) fn run_best_effort_into(
             out,
         )?;
 
-        // Advance cwd tracker if this unit is `cd`/`pushd`/`popd`/`chdir`.
-        let join_after = if !u.derived && u.depth == 0 {
-            let j = top_joins
-                .get(top_unit_ordinal)
-                .copied()
-                .unwrap_or(BeJoin::Seq);
-            top_unit_ordinal += 1;
-            j
+        // If this unit is `eval`/`source`/`.` at depth 0, apply its same-shell
+        // `cd` effects immediately (before subsequent depth-0 siblings run,
+        // because P1's tolerant lexer emits deferred depth-1 units in BFS order).
+        let same_shell_payload = if unit_is_same_shell_parent && !u.derived && u.depth == 0 {
+            if let Some(p) = same_shell_eval_payload {
+                Some(p)
+            } else if let Some((hs_start, hs_end)) = unit_meta.herestring
+                && let Some(raw_line) = record.raw_texts.first()
+                && hs_end <= raw_line.len()
+            {
+                let unq = unquote_herestring_be(&raw_line[hs_start..hs_end], budget)?;
+                Some(unq)
+            } else if u.piped
+                && let Some(pid) = u.pipeline_id
+            {
+                extract_piped_echo_for_source(&record.units[..i], pid, protected.folds, budget)?
+            } else {
+                None
+            }
         } else {
-            // Inside derived units (`sh -c 'cd proj && cat .npmrc'`, `eval 'cd proj && ...'`),
-            // check if a subsequent sibling exists at the same depth with a `cd ... &&` hint.
-            BeJoin::And
+            None
+        };
+
+        // Check whether the immediately following sibling is a plain `exit`
+        // (not `! exit`, not `exit &`, not in a pipeline/group).
+        let next_meta = if !u.derived && u.depth == 0 {
+            top_meta.get(top_unit_ordinal).copied()
+        } else {
+            None
         };
         let next_is_exit = record.units.get(i + 1).is_some_and(|n| {
             n.depth == u.depth
                 && n.pipeline_id.is_none()
                 && !n.piped
+                && n.raw_argv.first().is_some_and(|f| f == "exit")
                 && n.effective_argv.first().is_some_and(|f| f == "exit")
+                && next_meta.is_none_or(|m| m.join != BeJoin::Bg && !m.may_skip_or_subshell)
         });
         cwd_tracker.after_unit(
             u,
             primary_cmd.as_deref(),
-            join_after,
+            unit_meta,
             next_is_exit,
             unit_is_same_shell_parent,
+            same_shell_payload.as_deref(),
             protected.folds,
             budget,
         )?;
@@ -494,16 +599,21 @@ fn raw_pipe_to_shell_budgeted(
     budget: &mut ComputeBudget,
 ) -> Result<bool, Exhausted> {
     let lower = fold_str_listed(text, folds, budget)?;
-    for dl in ["curl", "wget"] {
+    for dl in ["curl", "wget", "fetch"] {
         budget.charge(lower.len().max(1) as u64)?;
         let mut rest = lower.as_str();
         while let Some(i) = rest.find(dl) {
             rest = &rest[i + dl.len()..];
             let seg = rest.split([';', '\n', '&']).next().unwrap_or("");
-            if let Some((_, after)) = seg.split_once('|') {
+            let mut pipe_stages = seg.split('|');
+            let _ = pipe_stages.next();
+            for after in pipe_stages {
                 let words = raw_words_budgeted(after, budget)?;
+                if reads_stdin_as_code_budgeted(&words, folds, 0, budget)? {
+                    return Ok(true);
+                }
                 let eff = unwrap_simple_be(&words, folds, budget)?;
-                if reads_stdin_as_code_budgeted(&eff, folds, 0, budget)? {
+                if eff != words && reads_stdin_as_code_budgeted(&eff, folds, 0, budget)? {
                     return Ok(true);
                 }
             }
@@ -526,9 +636,15 @@ fn raw_words_budgeted(t: &str, budget: &mut ComputeBudget) -> Result<Vec<String>
             _ if quote.is_some() => {
                 if Some(c) == quote {
                     quote = None;
+                    prev = c;
+                    continue;
                 }
             }
-            '\'' | '"' => quote = Some(c),
+            '\'' | '"' if depth == 0 && !tick => {
+                quote = Some(c);
+                prev = c;
+                continue;
+            }
             '`' => tick = !tick,
             '(' if prev == '$' || depth > 0 => depth += 1,
             ')' if depth > 0 => depth -= 1,
@@ -552,26 +668,93 @@ fn raw_words_budgeted(t: &str, budget: &mut ComputeBudget) -> Result<Vec<String>
     Ok(out)
 }
 
+/// Checks if a short-option cluster (e.g. `-it`, `-fs`, `-sw`, `-iu`, `-ca`,
+/// `-tc`, `-tI`) consumes the next argv word as its value (i.e. contains a
+/// value-taking letter from `val_chars` at the end of the cluster; if chars
+/// follow that letter, the value is attached to the same token).
+fn short_cluster_takes_next(w: &str, val_chars: &str) -> bool {
+    if !w.starts_with('-') || w.starts_with("--") || w.len() < 2 {
+        return false;
+    }
+    let body = &w[1..];
+    for (off, ch) in body.char_indices() {
+        if val_chars.contains(ch) {
+            return off + ch.len_utf8() == body.len();
+        }
+    }
+    false
+}
+
+/// Checks whether `w` matches `--long` or an unambiguous GNU prefix of `--long`
+/// (with at least `min_len` chars including `--`, e.g. `--chd` for `--chdir` or
+/// `--comm` for `--command`), returning `Some(attached_value)` where `None`
+/// means the value is in the next argv word.
+fn match_gnu_long_opt<'a>(w: &'a str, full: &str, min_len: usize) -> Option<Option<&'a str>> {
+    if !w.starts_with("--") {
+        return None;
+    }
+    let (name, attached) = match w.split_once('=') {
+        Some((n, v)) => (n, Some(v)),
+        None => (w, None),
+    };
+    (name.len() >= min_len && full.starts_with(name)).then_some(attached)
+}
+
 fn unwrap_simple_be(
     words: &[String],
     folds: FoldRules,
     budget: &mut ComputeBudget,
 ) -> Result<Vec<String>, Exhausted> {
+    let mut cur: Vec<String> = {
+        let bytes: usize = words
+            .iter()
+            .map(|s| s.len() + std::mem::size_of::<String>())
+            .sum();
+        budget.charge(bytes.max(1) as u64)?;
+        budget.charge_alloc(bytes)?;
+        words.to_vec()
+    };
     let mut idx = 0usize;
     for _ in 0..16 {
-        let Some(first) = words.get(idx) else { break };
+        let Some(first) = cur.get(idx) else { break };
+        // Resolve nested command-word substitutions (`$(which env) $(which sudo) id`).
+        let base_raw = first.rsplit('/').next().unwrap_or(first.as_str());
+        if (base_raw.contains("$(") || base_raw.contains('`'))
+            && let Some(sub_name) = substituted_program_simple(base_raw, folds, budget)?
+        {
+            cur[idx] = sub_name;
+        }
+        let Some(first) = cur.get(idx) else { break };
         let f = fold_cmd_cr19(first, folds, budget)?;
         match f.as_str() {
-            "nohup" | "builtin" | "time" | "command" | "exec" | "busybox" | "toybox" => {
+            "nohup" | "builtin" | "busybox" | "toybox" => {
                 idx += 1;
-                while let Some(w) = words.get(idx) {
+            }
+            "command" => {
+                idx += 1;
+                while let Some(w) = cur.get(idx) {
                     budget.charge(1)?;
                     if w == "--" {
                         idx += 1;
                         break;
                     }
                     if w.starts_with('-') && w.len() > 1 {
-                        idx += if w == "-a" || w == "-f" || w == "-o" {
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "exec" => {
+                idx += 1;
+                while let Some(w) = cur.get(idx) {
+                    budget.charge(1)?;
+                    if w == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if w.starts_with('-') && w.len() > 1 {
+                        idx += if short_cluster_takes_next(w, "a") {
                             2
                         } else {
                             1
@@ -581,15 +764,36 @@ fn unwrap_simple_be(
                     }
                 }
             }
-            "nice" => {
+            "time" => {
                 idx += 1;
-                while let Some(w) = words.get(idx) {
+                while let Some(w) = cur.get(idx) {
                     budget.charge(1)?;
                     if w == "--" {
                         idx += 1;
                         break;
                     }
-                    if w == "-n" || w == "--adjustment" {
+                    if w.starts_with('-') && w.len() > 1 {
+                        if matches!(w.as_str(), "--format" | "--output")
+                            || short_cluster_takes_next(w, "fo")
+                        {
+                            idx += 2;
+                        } else {
+                            idx += 1;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "nice" => {
+                idx += 1;
+                while let Some(w) = cur.get(idx) {
+                    budget.charge(1)?;
+                    if w == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if w == "--adjustment" || short_cluster_takes_next(w, "n") {
                         idx += 2;
                     } else if w.starts_with('-') && w.len() > 1 {
                         idx += 1;
@@ -600,13 +804,15 @@ fn unwrap_simple_be(
             }
             "timeout" => {
                 idx += 1;
-                while let Some(w) = words.get(idx) {
+                while let Some(w) = cur.get(idx) {
                     budget.charge(1)?;
                     if w == "--" {
                         idx += 1;
                         break;
                     }
-                    if matches!(w.as_str(), "-s" | "-k" | "--signal" | "--kill-after") {
+                    if matches!(w.as_str(), "--signal" | "--kill-after")
+                        || short_cluster_takes_next(w, "sk")
+                    {
                         idx += 2;
                     } else if w.starts_with('-') && w.len() > 1 {
                         idx += 1;
@@ -614,11 +820,11 @@ fn unwrap_simple_be(
                         break;
                     }
                 }
-                idx = (idx + 1).min(words.len());
+                idx = (idx + 1).min(cur.len());
             }
             "env" => {
                 idx += 1;
-                while let Some(w) = words.get(idx) {
+                while let Some(w) = cur.get(idx) {
                     budget.charge(w.len().max(1) as u64)?;
                     if w == "--" {
                         idx += 1;
@@ -631,15 +837,12 @@ fn unwrap_simple_be(
                     if w.starts_with('-') && w.len() > 1 {
                         if matches!(
                             w.as_str(),
-                            "-u" | "-C"
-                                | "-P"
-                                | "-a"
-                                | "-S"
-                                | "--unset"
-                                | "--chdir"
-                                | "--split-string"
-                                | "--argv0"
-                        ) {
+                            "--unset" | "--chdir" | "--split-string" | "--argv0"
+                        ) || match_gnu_long_opt(w, "--chdir", 4) == Some(None)
+                            || match_gnu_long_opt(w, "--split-string", 5) == Some(None)
+                            || match_gnu_long_opt(w, "--unset", 4) == Some(None)
+                            || short_cluster_takes_next(w, "uCPaS")
+                        {
                             idx += 2;
                         } else {
                             idx += 1;
@@ -651,10 +854,144 @@ fn unwrap_simple_be(
                     }
                 }
             }
+            "caffeinate" | "ionice" | "stdbuf" | "xargs" | "setsid" | "unbuffer"
+            | "sandbox-exec" | "chrt" | "taskset" | "arch" => {
+                let short_vals = match f.as_str() {
+                    "caffeinate" => "tw",
+                    "ionice" => "cnpPu",
+                    "stdbuf" => "ioe",
+                    "xargs" => "nPILsdEJRSa",
+                    "sandbox-exec" => "fnpD",
+                    "chrt" => "TPD",
+                    "arch" => "ed",
+                    _ => "",
+                };
+                idx += 1;
+                while let Some(w) = cur.get(idx) {
+                    budget.charge(1)?;
+                    if w == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if w.starts_with('-') && w.len() > 1 {
+                        let long_takes = match f.as_str() {
+                            "ionice" => matches!(
+                                w.as_str(),
+                                "--class" | "--classdata" | "--pid" | "--pgid" | "--uid"
+                            ),
+                            "stdbuf" => matches!(w.as_str(), "--input" | "--output" | "--error"),
+                            "xargs" => matches!(
+                                w.as_str(),
+                                "--max-args"
+                                    | "--max-procs"
+                                    | "--max-chars"
+                                    | "--delimiter"
+                                    | "--arg-file"
+                            ),
+                            "chrt" => matches!(
+                                w.as_str(),
+                                "--sched-runtime" | "--sched-period" | "--sched-deadline"
+                            ),
+                            "arch" => w == "-arch",
+                            _ => false,
+                        };
+                        if long_takes || short_cluster_takes_next(w, short_vals) {
+                            idx += 2;
+                        } else {
+                            idx += 1;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if matches!(f.as_str(), "chrt" | "taskset") {
+                    idx = (idx + 1).min(cur.len());
+                }
+            }
+            "chroot" => {
+                let saved = idx;
+                idx += 1;
+                while let Some(w) = cur.get(idx) {
+                    budget.charge(1)?;
+                    if w == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if matches!(w.as_str(), "--userspec" | "--groups")
+                        || short_cluster_takes_next(w, "Ggu")
+                    {
+                        idx += 2;
+                    } else if w.starts_with('-') && w.len() > 1 {
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if idx + 1 < cur.len() {
+                    idx += 1;
+                } else {
+                    // `chroot NEWROOT` with no command starts a shell on stdin: keep it intact.
+                    idx = saved;
+                    break;
+                }
+            }
+            "flock" | "script" => {
+                let saved = idx;
+                let short_vals = if f == "flock" { "wE" } else { "tTIOBmo" };
+                let mut j = idx + 1;
+                let mut file_seen = false;
+                let mut has_c = false;
+                while let Some(w) = cur.get(j) {
+                    budget.charge(1)?;
+                    if w == "--" {
+                        j += 1;
+                        if !file_seen && j < cur.len() {
+                            j += 1;
+                        }
+                        break;
+                    }
+                    if w.starts_with('-') && w.len() > 1 {
+                        if match_gnu_long_opt(w, "--command", 3).is_some()
+                            || (!w.starts_with("--") && w[1..].contains('c'))
+                        {
+                            has_c = true;
+                            break;
+                        }
+                        let long_takes = if f == "flock" {
+                            matches!(w.as_str(), "--timeout" | "--wait" | "--conflict-exit-code")
+                        } else {
+                            matches!(
+                                w.as_str(),
+                                "--log-io"
+                                    | "--log-in"
+                                    | "--log-out"
+                                    | "--output-limit"
+                                    | "--timing"
+                            )
+                        };
+                        if long_takes || short_cluster_takes_next(w, short_vals) {
+                            j += 2;
+                        } else {
+                            j += 1;
+                        }
+                    } else if !file_seen {
+                        file_seen = true;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if has_c || j >= cur.len() {
+                    // Keep `script`/`flock -c ...` or bare `script FILE` intact for code/stdin checks.
+                    idx = saved;
+                    break;
+                }
+                idx = j;
+            }
             _ => break,
         }
     }
-    let slice = &words[idx.min(words.len())..];
+    let slice = &cur[idx.min(cur.len())..];
     let bytes: usize = slice
         .iter()
         .map(|s| s.len() + std::mem::size_of::<String>())
@@ -673,20 +1010,120 @@ enum BeJoin {
     Seq,
     And,
     Or,
+    Bg,
+    Pipe,
 }
 
-/// Linear scan of a command line recording the separator (`&&`, `||`, or
-/// `;`/`\n`/`|`/`&`) after each top-level command unit.
-fn scan_top_level_joins(text: &str, budget: &mut ComputeBudget) -> Result<Vec<BeJoin>, Exhausted> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BeUnitMeta {
+    join: BeJoin,
+    /// Inside `(...)`, `if`, `case`, or `{ ... }` after `||`: a `cd` must not
+    /// drop the outer directory from `cands`.
+    may_skip_or_subshell: bool,
+    /// Inside a loop (`for`/`while`/`until`/`select`) or function definition
+    /// (`name() { ... }`): a `cd` marks cwd unknown (`lost`).
+    in_loop_or_func: bool,
+    /// Byte slice of a `<<<WORD` here-string attached to this unit (if any).
+    herestring: Option<(usize, usize)>,
+}
+
+impl BeUnitMeta {
+    const SEQ: Self = Self {
+        join: BeJoin::Seq,
+        may_skip_or_subshell: false,
+        in_loop_or_func: false,
+        herestring: None,
+    };
+    const AND: Self = Self {
+        join: BeJoin::And,
+        may_skip_or_subshell: false,
+        in_loop_or_func: false,
+        herestring: None,
+    };
+}
+
+/// Linear scan of a command line matching `lex_one_text`'s unit boundaries and
+/// recording each unit's trailing separator, compound/subshell/loop/function
+/// flags, and attached `<<<` here-string range.
+fn scan_top_level_meta(
+    text: &str,
+    budget: &mut ComputeBudget,
+) -> Result<Vec<BeUnitMeta>, Exhausted> {
     let bytes = text.as_bytes();
     budget.charge(bytes.len().max(1) as u64)?;
-    let mut joins = Vec::new();
+    let mut out = Vec::new();
     let mut i = 0usize;
     let mut has_token = false;
     let mut in_sq = false;
     let mut in_dq = false;
     let mut paren_depth = 0usize;
     let mut backtick = false;
+    let mut subshell_depth = 0usize;
+    let mut cond_depth = 0usize;
+    let mut loop_depth = 0usize;
+    let mut func_brace_depth = 0usize;
+    let mut pending_func = false;
+    let mut word_start: Option<usize> = None;
+    let mut cur_herestring: Option<(usize, usize)> = None;
+
+    let flush_meta = |out: &mut Vec<BeUnitMeta>,
+                      has_token: &mut bool,
+                      cur_herestring: &mut Option<(usize, usize)>,
+                      join: BeJoin,
+                      subshell_depth: usize,
+                      cond_depth: usize,
+                      loop_depth: usize,
+                      func_brace_depth: usize,
+                      budget: &mut ComputeBudget|
+     -> Result<(), Exhausted> {
+        if *has_token {
+            budget.charge_alloc(std::mem::size_of::<BeUnitMeta>())?;
+            out.push(BeUnitMeta {
+                join,
+                may_skip_or_subshell: subshell_depth > 0 || cond_depth > 0,
+                in_loop_or_func: loop_depth > 0 || func_brace_depth > 0,
+                herestring: cur_herestring.take(),
+            });
+            *has_token = false;
+        } else {
+            *cur_herestring = None;
+        }
+        Ok(())
+    };
+
+    let finish_word = |text: &str,
+                       word_start: &mut Option<usize>,
+                       end: usize,
+                       cond_depth: &mut usize,
+                       loop_depth: &mut usize,
+                       func_brace_depth: &mut usize,
+                       pending_func: &mut bool| {
+        let Some(ws) = word_start.take() else {
+            return;
+        };
+        let w = &text[ws..end];
+        match w {
+            "if" | "case" => *cond_depth += 1,
+            "fi" | "esac" => *cond_depth = cond_depth.saturating_sub(1),
+            "for" | "while" | "until" | "select" => *loop_depth += 1,
+            "done" => *loop_depth = loop_depth.saturating_sub(1),
+            "function" => *pending_func = true,
+            "{" => {
+                if *pending_func {
+                    *pending_func = false;
+                    *func_brace_depth += 1;
+                } else if *func_brace_depth > 0 {
+                    *func_brace_depth += 1;
+                }
+            }
+            "}" => {
+                if *func_brace_depth > 0 {
+                    *func_brace_depth -= 1;
+                }
+            }
+            _ => {}
+        }
+    };
 
     while i < bytes.len() {
         let b = bytes[i];
@@ -721,33 +1158,101 @@ fn scan_top_level_joins(text: &str, budget: &mut ComputeBudget) -> Result<Vec<Be
         }
         match b {
             b'\\' if i + 1 < bytes.len() => {
-                has_token = true;
-                i += 2;
+                if bytes[i + 1] == b'\n' && word_start.is_none() {
+                    i += 2;
+                } else {
+                    if word_start.is_none() {
+                        word_start = Some(i);
+                    }
+                    has_token = true;
+                    i += 2;
+                }
             }
             b'\'' => {
+                if word_start.is_none() {
+                    word_start = Some(i);
+                }
                 in_sq = true;
                 has_token = true;
                 i += 1;
             }
             b'"' => {
+                if word_start.is_none() {
+                    word_start = Some(i);
+                }
                 in_dq = true;
                 has_token = true;
                 i += 1;
             }
             b'`' => {
+                if word_start.is_none() {
+                    word_start = Some(i);
+                }
                 backtick = true;
                 has_token = true;
                 i += 1;
             }
             b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                if word_start.is_none() {
+                    word_start = Some(i);
+                }
                 paren_depth += 1;
                 has_token = true;
                 i += 2;
             }
             b'<' | b'>' if bytes.get(i + 1) == Some(&b'(') => {
+                if word_start.is_none() {
+                    word_start = Some(i);
+                }
                 paren_depth += 1;
                 has_token = true;
                 i += 2;
+            }
+            b'<' if paren_depth == 0
+                && bytes.get(i + 1) == Some(&b'<')
+                && bytes.get(i + 2) == Some(&b'<') =>
+            {
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
+                i += 3;
+                while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+                    i += 1;
+                }
+                let hs_start = i;
+                let mut hq: Option<u8> = None;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    if let Some(q) = hq {
+                        if q == b'"' && c == b'\\' && i + 1 < bytes.len() {
+                            i += 2;
+                            continue;
+                        }
+                        if c == q {
+                            hq = None;
+                        }
+                        i += 1;
+                    } else if matches!(c, b'\'' | b'"') {
+                        hq = Some(c);
+                        i += 1;
+                    } else if c == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                    } else if matches!(
+                        c,
+                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+                    ) {
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+                cur_herestring = Some((hs_start, i));
             }
             b'(' if paren_depth > 0 => {
                 paren_depth += 1;
@@ -757,56 +1262,296 @@ fn scan_top_level_joins(text: &str, budget: &mut ComputeBudget) -> Result<Vec<Be
                 paren_depth -= 1;
                 i += 1;
             }
-            b'#' if paren_depth == 0 && !has_token => {
+            b'#' if paren_depth == 0 && word_start.is_none() => {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
             }
             b'&' if paren_depth == 0 && bytes.get(i + 1) == Some(&b'&') => {
-                if has_token {
-                    budget.charge_alloc(std::mem::size_of::<BeJoin>())?;
-                    joins.push(BeJoin::And);
-                    has_token = false;
-                }
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
+                flush_meta(
+                    &mut out,
+                    &mut has_token,
+                    &mut cur_herestring,
+                    BeJoin::And,
+                    subshell_depth,
+                    cond_depth,
+                    loop_depth,
+                    func_brace_depth,
+                    budget,
+                )?;
                 i += 2;
+            }
+            b'&' if paren_depth == 0 && bytes.get(i + 1) == Some(&b'>') => {
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
+                has_token = true;
+                i += if bytes.get(i + 2) == Some(&b'>') {
+                    3
+                } else {
+                    2
+                };
             }
             b'|' if paren_depth == 0 && bytes.get(i + 1) == Some(&b'|') => {
-                if has_token {
-                    budget.charge_alloc(std::mem::size_of::<BeJoin>())?;
-                    joins.push(BeJoin::Or);
-                    has_token = false;
-                }
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
+                flush_meta(
+                    &mut out,
+                    &mut has_token,
+                    &mut cur_herestring,
+                    BeJoin::Or,
+                    subshell_depth,
+                    cond_depth,
+                    loop_depth,
+                    func_brace_depth,
+                    budget,
+                )?;
                 i += 2;
             }
-            b';' | b'\n' | b'|' | b'&' | b'(' | b')' if paren_depth == 0 => {
-                if has_token {
-                    budget.charge_alloc(std::mem::size_of::<BeJoin>())?;
-                    joins.push(BeJoin::Seq);
-                    has_token = false;
+            b'|' if paren_depth == 0 => {
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
+                flush_meta(
+                    &mut out,
+                    &mut has_token,
+                    &mut cur_herestring,
+                    BeJoin::Pipe,
+                    subshell_depth,
+                    cond_depth,
+                    loop_depth,
+                    func_brace_depth,
+                    budget,
+                )?;
+                i += if bytes.get(i + 1) == Some(&b'&') {
+                    2
+                } else {
+                    1
+                };
+            }
+            b'&' if paren_depth == 0 => {
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
+                flush_meta(
+                    &mut out,
+                    &mut has_token,
+                    &mut cur_herestring,
+                    BeJoin::Bg,
+                    subshell_depth,
+                    cond_depth,
+                    loop_depth,
+                    func_brace_depth,
+                    budget,
+                )?;
+                i += 1;
+            }
+            b';' if paren_depth == 0 => {
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
+                flush_meta(
+                    &mut out,
+                    &mut has_token,
+                    &mut cur_herestring,
+                    BeJoin::Seq,
+                    subshell_depth,
+                    cond_depth,
+                    loop_depth,
+                    func_brace_depth,
+                    budget,
+                )?;
+                i += if bytes.get(i + 1) == Some(&b';') {
+                    2
+                } else {
+                    1
+                };
+            }
+            b'\n' if paren_depth == 0 => {
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
+                flush_meta(
+                    &mut out,
+                    &mut has_token,
+                    &mut cur_herestring,
+                    BeJoin::Seq,
+                    subshell_depth,
+                    cond_depth,
+                    loop_depth,
+                    func_brace_depth,
+                    budget,
+                )?;
+                i += 1;
+            }
+            b'(' if paren_depth == 0 => {
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
+                let mut k = i + 1;
+                while matches!(bytes.get(k), Some(b' ' | b'\t')) {
+                    k += 1;
                 }
+                if bytes.get(k) == Some(&b')') && has_token {
+                    // `f()` function definition matches `lex_one_text:807-818`.
+                    pending_func = true;
+                    flush_meta(
+                        &mut out,
+                        &mut has_token,
+                        &mut cur_herestring,
+                        BeJoin::Seq,
+                        subshell_depth,
+                        cond_depth,
+                        loop_depth,
+                        func_brace_depth,
+                        budget,
+                    )?;
+                    i = k + 1;
+                } else {
+                    flush_meta(
+                        &mut out,
+                        &mut has_token,
+                        &mut cur_herestring,
+                        BeJoin::Seq,
+                        subshell_depth,
+                        cond_depth,
+                        loop_depth,
+                        func_brace_depth,
+                        budget,
+                    )?;
+                    subshell_depth += 1;
+                    i += 1;
+                }
+            }
+            b')' if paren_depth == 0 => {
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
+                flush_meta(
+                    &mut out,
+                    &mut has_token,
+                    &mut cur_herestring,
+                    BeJoin::Seq,
+                    subshell_depth,
+                    cond_depth,
+                    loop_depth,
+                    func_brace_depth,
+                    budget,
+                )?;
+                subshell_depth = subshell_depth.saturating_sub(1);
                 i += 1;
             }
             b' ' | b'\t' => {
+                finish_word(
+                    text,
+                    &mut word_start,
+                    i,
+                    &mut cond_depth,
+                    &mut loop_depth,
+                    &mut func_brace_depth,
+                    &mut pending_func,
+                );
                 i += 1;
             }
             _ => {
+                if word_start.is_none() {
+                    word_start = Some(i);
+                }
                 has_token = true;
                 i += 1;
             }
         }
     }
-    if has_token {
-        budget.charge_alloc(std::mem::size_of::<BeJoin>())?;
-        joins.push(BeJoin::Seq);
-    }
-    Ok(joins)
+    finish_word(
+        text,
+        &mut word_start,
+        bytes.len(),
+        &mut cond_depth,
+        &mut loop_depth,
+        &mut func_brace_depth,
+        &mut pending_func,
+    );
+    flush_meta(
+        &mut out,
+        &mut has_token,
+        &mut cur_herestring,
+        BeJoin::Seq,
+        subshell_depth,
+        cond_depth,
+        loop_depth,
+        func_brace_depth,
+        budget,
+    )?;
+    Ok(out)
 }
 
 struct CwdFrame {
     depth: u8,
     cands: Vec<Vec<u8>>,
+    pool: Vec<Vec<u8>>,
+    pending: bool,
+    last_join: BeJoin,
     unknown: bool,
     same_shell: bool,
+    union: bool,
 }
 
 struct BeCwdTracker {
@@ -815,6 +1560,7 @@ struct BeCwdTracker {
     seen: Vec<Vec<u8>>,
     stack: Vec<CwdFrame>,
     next_child_same_shell: bool,
+    next_child_union: bool,
 }
 
 impl BeCwdTracker {
@@ -828,16 +1574,62 @@ impl BeCwdTracker {
             stack: vec![CwdFrame {
                 depth: 0,
                 cands: vec![start.to_vec()],
+                pool: Vec::new(),
+                pending: false,
+                last_join: BeJoin::Seq,
                 unknown: false,
                 same_shell: false,
+                union: false,
             }],
             next_child_same_shell: false,
+            next_child_union: false,
         })
+    }
+
+    fn flush_top_pool(&mut self, budget: &mut ComputeBudget) -> Result<(), Exhausted> {
+        let Some(frame) = self.stack.last_mut() else {
+            return Ok(());
+        };
+        if !frame.pending {
+            return Ok(());
+        }
+        frame.pending = false;
+        if frame.pool.is_empty() {
+            return Ok(());
+        }
+        let pooled = std::mem::take(&mut frame.pool);
+        if frame.unknown {
+            let _ = frame;
+            self.push_seen(&pooled, budget)?;
+            let lost_list = self.lost_cands(budget)?;
+            if let Some(frame) = self.stack.last_mut() {
+                frame.cands = lost_list;
+            }
+        } else {
+            for p in pooled {
+                if frame.cands.len() >= MAX_CWD_CANDS {
+                    let old = std::mem::take(&mut frame.cands);
+                    frame.unknown = true;
+                    let _ = frame;
+                    self.push_seen(&old, budget)?;
+                    let lost_list = self.lost_cands(budget)?;
+                    if let Some(frame) = self.stack.last_mut() {
+                        frame.cands = lost_list;
+                    }
+                    return Ok(());
+                }
+                if !frame.cands.iter().any(|c| c == &p) {
+                    frame.cands.push(p);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn enter_unit(
         &mut self,
         u: &BestEffortUnit,
+        child_override: &mut Option<(Vec<Vec<u8>>, bool)>,
         budget: &mut ComputeBudget,
     ) -> Result<(), Exhausted> {
         while self.stack.len() > 1 && self.stack.last().is_some_and(|f| f.depth > u.depth) {
@@ -847,27 +1639,46 @@ impl BeCwdTracker {
                     let lost_list = self.lost_cands(budget)?;
                     if let Some(parent) = self.stack.last_mut() {
                         parent.unknown = true;
+                        parent.pool.clear();
                         parent.cands = lost_list;
                     }
                 } else if let Some(parent) = self.stack.last_mut() {
-                    parent.cands = done.cands;
+                    if done.union {
+                        merge_cands_into(&mut parent.cands, done.cands, budget)?;
+                    } else {
+                        parent.cands = done.cands;
+                    }
+                    if !done.pool.is_empty() && !parent.unknown {
+                        merge_cands_into(&mut parent.pool, done.pool, budget)?;
+                        parent.pending |= !matches!(parent.last_join, BeJoin::And | BeJoin::Pipe);
+                    }
                 }
             }
         }
         let top_depth = self.stack.last().map_or(0, |f| f.depth);
         if u.depth > top_depth {
-            let (cands, unknown) = match self.stack.last() {
-                Some(top) => (clone_bytes_vec(&top.cands, budget)?, top.unknown),
-                None => (vec![clone_bytes(&self.start, budget)?], false),
+            let (cands, unknown) = match child_override.take() {
+                Some(ov) => ov,
+                None => match self.stack.last() {
+                    Some(top) => (clone_bytes_vec(&top.cands, budget)?, top.unknown),
+                    None => (vec![clone_bytes(&self.start, budget)?], false),
+                },
             };
             budget.charge_alloc(std::mem::size_of::<CwdFrame>())?;
             self.stack.push(CwdFrame {
                 depth: u.depth,
                 cands,
+                pool: Vec::new(),
+                pending: false,
+                last_join: BeJoin::Seq,
                 unknown,
                 same_shell: self.next_child_same_shell,
+                union: self.next_child_union,
             });
             self.next_child_same_shell = false;
+            self.next_child_union = false;
+        } else {
+            self.flush_top_pool(budget)?;
         }
         Ok(())
     }
@@ -928,23 +1739,63 @@ impl BeCwdTracker {
         &mut self,
         u: &BestEffortUnit,
         primary_cmd: Option<&str>,
-        join_after: BeJoin,
+        meta: BeUnitMeta,
         next_is_exit: bool,
         same_shell_parent: bool,
+        same_shell_payload: Option<&str>,
         folds: FoldRules,
         budget: &mut ComputeBudget,
     ) -> Result<(), Exhausted> {
-        self.next_child_same_shell = same_shell_parent;
-        let Some(cmd) = primary_cmd else {
-            return Ok(());
+        let in_pipe = u.pipeline_id.is_some() || u.piped;
+        let last_join = self.stack.last().map_or(BeJoin::Seq, |f| f.last_join);
+        let skipped_from = last_join == BeJoin::Or;
+        let same_shell_union =
+            in_pipe || skipped_from || meta.may_skip_or_subshell || meta.join == BeJoin::Bg;
+        self.next_child_same_shell = same_shell_parent && same_shell_payload.is_none();
+        self.next_child_union = same_shell_union;
+
+        let join_eff = if meta.join == BeJoin::Pipe {
+            BeJoin::And
+        } else {
+            meta.join
         };
-        if !matches!(cmd, "cd" | "pushd" | "popd" | "chdir") {
+
+        // Apply inline `eval` / `source <<<` / piped `source` same-shell `cd`
+        // effects right away so following depth-0 siblings see the updated cwd.
+        if let Some(payload) = same_shell_payload {
+            self.apply_same_shell_payload(payload, join_eff, same_shell_union, folds, budget)?;
+            if let Some(frame) = self.stack.last_mut() {
+                frame.last_join = join_eff;
+                if join_eff != BeJoin::And && !frame.pool.is_empty() {
+                    frame.pending = true;
+                }
+            }
             return Ok(());
         }
+
+        let is_cd = primary_cmd.is_some_and(|c| matches!(c, "cd" | "pushd" | "popd" | "chdir"));
+        if !is_cd {
+            if let Some(frame) = self.stack.last_mut() {
+                if join_eff == BeJoin::And && !frame.unknown {
+                    let cur = clone_bytes_vec(&frame.cands, budget)?;
+                    merge_cands_into(&mut frame.pool, cur, budget)?;
+                }
+                frame.last_join = join_eff;
+                if join_eff != BeJoin::And && !frame.pool.is_empty() {
+                    frame.pending = true;
+                }
+            }
+            return Ok(());
+        }
+
+        let cmd = primary_cmd.unwrap();
         let eff = &u.effective_argv;
-        let in_pipe = u.pipeline_id.is_some() || u.piped;
         let mut args: Vec<&str> = Vec::new();
-        let mut readable = cmd != "pushd" && cmd != "popd" && !in_pipe;
+        let mut readable = cmd != "pushd"
+            && cmd != "popd"
+            && !in_pipe
+            && !meta.in_loop_or_func
+            && meta.join != BeJoin::Bg;
         let mut j = 1usize;
         while j < eff.len() {
             let a = eff[j].as_str();
@@ -1015,9 +1866,13 @@ impl BeCwdTracker {
         };
         if lost {
             let old = std::mem::take(&mut frame.cands);
+            let old_pool = std::mem::take(&mut frame.pool);
             frame.unknown = true;
+            frame.last_join = join_eff;
+            frame.pending = false;
             let _ = frame;
             self.push_seen(&old, budget)?;
+            self.push_seen(&old_pool, budget)?;
             let lost_list = self.lost_cands(budget)?;
             if let Some(frame) = self.stack.last_mut() {
                 frame.cands = lost_list;
@@ -1026,24 +1881,115 @@ impl BeCwdTracker {
         }
 
         if frame.unknown {
+            frame.last_join = join_eff;
             let lost_list = self.lost_cands(budget)?;
             if let Some(frame) = self.stack.last_mut() {
                 frame.cands = lost_list;
             }
-        } else if join_after == BeJoin::And || (join_after == BeJoin::Or && next_is_exit) {
-            frame.cands = targets;
-        } else {
-            // `;`, `\n`, or unguarded `||`: `cd` may fail, so keep both targets and old cwds.
-            let mut merged = targets;
-            for old in &frame.cands {
-                if merged.len() >= MAX_CWD_CANDS {
-                    break;
-                }
-                if !merged.iter().any(|m| m == old) {
-                    merged.push(clone_bytes(old, budget)?);
-                }
+            return Ok(());
+        }
+
+        if join_eff == BeJoin::And && !meta.may_skip_or_subshell {
+            let old = std::mem::replace(&mut frame.cands, targets);
+            if skipped_from {
+                merge_cands_into(&mut frame.cands, clone_bytes_vec(&old, budget)?, budget)?;
             }
-            frame.cands = merged;
+            merge_cands_into(&mut frame.pool, old, budget)?;
+        } else if join_eff == BeJoin::Or && next_is_exit && !meta.may_skip_or_subshell {
+            let old = std::mem::replace(&mut frame.cands, targets);
+            if skipped_from {
+                merge_cands_into(&mut frame.cands, old, budget)?;
+            }
+        } else {
+            // `;`, `\n`, unguarded `||`, or inside subshell/conditional: keep both targets and old cwds.
+            let old = std::mem::replace(&mut frame.cands, targets);
+            merge_cands_into(&mut frame.cands, old, budget)?;
+        }
+        frame.last_join = join_eff;
+        if join_eff != BeJoin::And && !frame.pool.is_empty() {
+            frame.pending = true;
+        }
+        Ok(())
+    }
+
+    fn apply_same_shell_payload(
+        &mut self,
+        payload: &str,
+        outer_join: BeJoin,
+        union_with_parent: bool,
+        folds: FoldRules,
+        budget: &mut ComputeBudget,
+    ) -> Result<(), Exhausted> {
+        let metas = scan_top_level_meta(payload, budget)?;
+        let segs = split_payload_segments(payload, budget)?;
+        let entry_cands = self.current_cands(budget)?;
+        let entry_unknown = self.is_unknown();
+        let mut inner = BeCwdTracker::new(&self.start, &self.home, budget)?;
+        inner.seen = clone_bytes_vec(&self.seen, budget)?;
+        if let Some(f) = inner.stack.last_mut() {
+            f.cands = clone_bytes_vec(&entry_cands, budget)?;
+            f.unknown = entry_unknown;
+        }
+        for (idx, seg) in segs.iter().enumerate() {
+            inner.flush_top_pool(budget)?;
+            let words = raw_words_budgeted(seg, budget)?;
+            let eff = unwrap_simple_be(&words, folds, budget)?;
+            let meta = metas.get(idx).copied().unwrap_or(BeUnitMeta::SEQ);
+            let dummy = BestEffortUnit {
+                index: idx,
+                raw_argv: words,
+                effective_argv: eff,
+                alt_argv: Vec::new(),
+                assignments: Vec::new(),
+                redirects: Vec::new(),
+                pipeline_id: None,
+                piped: false,
+                depth: 0,
+                derived: true,
+            };
+            let primary = match dummy.effective_argv.first() {
+                Some(f) => Some(fold_cmd_cr19(f, folds, budget)?),
+                None => None,
+            };
+            let next_is_exit = segs
+                .get(idx + 1)
+                .is_some_and(|ns| ns.trim() == "exit" || ns.trim().starts_with("exit "));
+            inner.after_unit(
+                &dummy,
+                primary.as_deref(),
+                meta,
+                next_is_exit,
+                false,
+                None,
+                folds,
+                budget,
+            )?;
+        }
+        self.push_seen(&inner.seen, budget)?;
+        let Some(done) = inner.stack.pop() else {
+            return Ok(());
+        };
+        let Some(parent) = self.stack.last_mut() else {
+            return Ok(());
+        };
+        if done.unknown {
+            parent.unknown = true;
+            parent.pool.clear();
+            let _ = parent;
+            let lost_list = self.lost_cands(budget)?;
+            if let Some(parent) = self.stack.last_mut() {
+                parent.cands = lost_list;
+            }
+        } else {
+            if union_with_parent {
+                merge_cands_into(&mut parent.cands, done.cands, budget)?;
+            } else {
+                parent.cands = done.cands;
+            }
+            if !done.pool.is_empty() && !parent.unknown {
+                merge_cands_into(&mut parent.pool, done.pool, budget)?;
+                parent.pending |= outer_join != BeJoin::And;
+            }
         }
         Ok(())
     }
@@ -1086,6 +2032,397 @@ impl BeCwdTracker {
         }
         Ok(Some(out))
     }
+}
+
+fn merge_cands_into(
+    dst: &mut Vec<Vec<u8>>,
+    src: Vec<Vec<u8>>,
+    budget: &mut ComputeBudget,
+) -> Result<(), Exhausted> {
+    for p in src {
+        if dst.len() >= MAX_CWD_CANDS {
+            break;
+        }
+        budget.charge(p.len().max(1) as u64)?;
+        if !dst.iter().any(|e| e == &p) {
+            dst.push(p);
+        }
+    }
+    Ok(())
+}
+
+fn split_payload_segments(
+    text: &str,
+    budget: &mut ComputeBudget,
+) -> Result<Vec<String>, Exhausted> {
+    let bytes = text.as_bytes();
+    budget.charge(bytes.len().max(1) as u64)?;
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut paren = 0usize;
+    let mut tick = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_sq {
+            if b == b'\'' {
+                in_sq = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dq {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_dq = false;
+            }
+            i += 1;
+            continue;
+        }
+        if tick {
+            if b == b'`' {
+                tick = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'\'' => {
+                in_sq = true;
+                i += 1;
+            }
+            b'"' => {
+                in_dq = true;
+                i += 1;
+            }
+            b'`' => {
+                tick = true;
+                i += 1;
+            }
+            b'$' | b'<' | b'>' if bytes.get(i + 1) == Some(&b'(') => {
+                paren += 1;
+                i += 2;
+            }
+            b'(' if paren > 0 => {
+                paren += 1;
+                i += 1;
+            }
+            b')' if paren > 0 => {
+                paren -= 1;
+                i += 1;
+            }
+            b';' | b'\n' | b'|' | b'&' if paren == 0 => {
+                let seg = text[start..i].trim();
+                if !seg.is_empty() {
+                    budget.charge_alloc(std::mem::size_of::<String>())?;
+                    out.push(clone_str_budgeted(seg, budget)?);
+                }
+                i += if matches!(
+                    (b, bytes.get(i + 1)),
+                    (b'&', Some(b'&')) | (b'|', Some(b'|')) | (b';', Some(b';'))
+                ) {
+                    2
+                } else {
+                    1
+                };
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        budget.charge_alloc(std::mem::size_of::<String>())?;
+        out.push(clone_str_budgeted(tail, budget)?);
+    }
+    Ok(out)
+}
+
+fn unquote_herestring_be(raw: &str, budget: &mut ComputeBudget) -> Result<String, Exhausted> {
+    budget.charge(raw.len().max(1) as u64)?;
+    budget.charge_alloc(raw.len())?;
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    let mut q: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match q {
+            Some(qc) => {
+                if qc == '"' && c == '\\' {
+                    if let Some(n) = chars.next() {
+                        out.push(n);
+                    }
+                } else if c == qc {
+                    q = None;
+                } else {
+                    out.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => q = Some(c),
+                '\\' => {
+                    if let Some(n) = chars.next() {
+                        out.push(n);
+                    }
+                }
+                _ => out.push(c),
+            },
+        }
+    }
+    Ok(out)
+}
+
+fn extract_piped_echo_for_source(
+    earlier: &[BestEffortUnit],
+    pid: PipelineId,
+    folds: FoldRules,
+    budget: &mut ComputeBudget,
+) -> Result<Option<String>, Exhausted> {
+    for prev in earlier.iter().rev() {
+        if prev.pipeline_id != Some(pid) {
+            break;
+        }
+        let Some(first) = prev.effective_argv.first() else {
+            continue;
+        };
+        let f = fold_cmd_cr19(first, folds, budget)?;
+        if f == "echo" {
+            let mut j = 1usize;
+            while j < prev.effective_argv.len() {
+                let w = prev.effective_argv[j].as_str();
+                if w.starts_with('-')
+                    && w.len() > 1
+                    && w[1..].bytes().all(|b| matches!(b, b'n' | b'e' | b'E'))
+                {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j < prev.effective_argv.len() {
+                let len: usize = prev.effective_argv[j..].iter().map(|s| s.len() + 1).sum();
+                budget.charge(len as u64)?;
+                budget.charge_alloc(len)?;
+                return Ok(Some(prev.effective_argv[j..].join(" ")));
+            }
+        } else if f == "printf" {
+            let j = if prev.effective_argv.get(1).map(String::as_str) == Some("--") {
+                2
+            } else {
+                1
+            };
+            if let Some(fmt) = prev.effective_argv.get(j) {
+                return Ok(Some(clone_str_budgeted(fmt, budget)?));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Extracts shifted per-unit cwd candidates when `raw_argv` starts with `env`
+/// (or `$(which env)`) and carries `-C DIR` / `-CDIR` / `--chdir` / `--ch*`.
+fn extract_env_chdir_cands(
+    raw_argv: &[String],
+    base_cands: &[Vec<u8>],
+    base_unknown: bool,
+    tracker: &BeCwdTracker,
+    folds: FoldRules,
+    budget: &mut ComputeBudget,
+) -> Result<Option<(Vec<Vec<u8>>, bool)>, Exhausted> {
+    let Some(first) = raw_argv.first() else {
+        return Ok(None);
+    };
+    let mut first_folded = fold_cmd_cr19(first, folds, budget)?;
+    if first_folded != "env" {
+        let base_raw = first.rsplit('/').next().unwrap_or(first.as_str());
+        if (base_raw.contains("$(") || base_raw.contains('`'))
+            && let Some(sub) = substituted_program_simple(base_raw, folds, budget)?
+        {
+            first_folded = fold_cmd_cr19(&sub, folds, budget)?;
+        }
+    }
+    if first_folded != "env" {
+        return Ok(None);
+    }
+    let mut dirs: Vec<&str> = Vec::new();
+    let mut j = 1usize;
+    while j < raw_argv.len() {
+        let w = raw_argv[j].as_str();
+        budget.charge(w.len().max(1) as u64)?;
+        if w == "--" {
+            break;
+        }
+        if w == "-" {
+            j += 1;
+            continue;
+        }
+        if let Some(attached) = match_gnu_long_opt(w, "--chdir", 4) {
+            if let Some(val) = attached {
+                dirs.push(val);
+                j += 1;
+            } else if let Some(next) = raw_argv.get(j + 1) {
+                dirs.push(next.as_str());
+                j += 2;
+            } else {
+                j += 1;
+            }
+            continue;
+        }
+        if w.starts_with('-') && !w.starts_with("--") && w.len() > 1 {
+            if let Some(pos) = w[1..].find('C') {
+                let after = &w[1 + pos + 1..];
+                if !after.is_empty() {
+                    dirs.push(after);
+                    j += 1;
+                } else if let Some(next) = raw_argv.get(j + 1) {
+                    dirs.push(next.as_str());
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+                continue;
+            }
+            if short_cluster_takes_next(w, "uPaS") {
+                j += 2;
+            } else {
+                j += 1;
+            }
+            continue;
+        }
+        if w.starts_with("--") {
+            if matches!(w, "--unset" | "--split-string" | "--argv0")
+                || match_gnu_long_opt(w, "--split-string", 5) == Some(None)
+                || match_gnu_long_opt(w, "--unset", 4) == Some(None)
+            {
+                j += 2;
+            } else {
+                j += 1;
+            }
+            continue;
+        }
+        if w.contains('=') {
+            j += 1;
+            continue;
+        }
+        break;
+    }
+    if dirs.is_empty() {
+        return Ok(None);
+    }
+    let mut cur = clone_bytes_vec(base_cands, budget)?;
+    let mut unk = base_unknown;
+    for d in dirs {
+        match tracker.resolve_cd_arg(d, &cur, folds, budget)? {
+            Some(next) => cur = next,
+            None => {
+                unk = true;
+                cur = tracker.lost_cands(budget)?;
+                break;
+            }
+        }
+    }
+    Ok(Some((cur, unk)))
+}
+
+/// Derives cluster-aware wrapper readings and `script`/`flock -c` inline
+/// payloads directly from `raw_argv` (complementing P1's `effective_argv`).
+fn extra_readings_from_raw(
+    raw_argv: &[String],
+    effective_argv: &[String],
+    folds: FoldRules,
+    budget: &mut ComputeBudget,
+) -> Result<(Vec<Vec<String>>, Vec<String>), Exhausted> {
+    let mut readings = Vec::new();
+    let mut payloads = Vec::new();
+    if raw_argv.is_empty() {
+        return Ok((readings, payloads));
+    }
+    let unwrapped = unwrap_simple_be(raw_argv, folds, budget)?;
+    let is_new_unwrapped =
+        !unwrapped.is_empty() && unwrapped != raw_argv && unwrapped != effective_argv;
+    if is_new_unwrapped {
+        readings.push(unwrapped.clone());
+        // If our cluster-aware unwrapper exposed a nested shell (`sh -c ...`)
+        // that P1's lexer couldn't unwrap (e.g. `exec -ca foo sh -c 'rm -rf ~'`,
+        // `flock /tmp/l -s sh -c 'rm -rf ~'`), extract its `-c` payload too.
+        if let Some(first) = unwrapped.first() {
+            let f = fold_cmd_cr19(first, folds, budget)?;
+            if is_shell_folded(&f, budget)?
+                && let Some(code) = extract_shell_c_code(&unwrapped[1..], budget)?
+            {
+                budget.charge_alloc(std::mem::size_of::<String>())?;
+                payloads.push(clone_str_budgeted(code, budget)?);
+            }
+        }
+    }
+    // Check both raw and unwrapped head for `script`/`flock` `-c`/`-qc`/`--comm`.
+    for cand in [raw_argv, unwrapped.as_slice()] {
+        if let Some(code) = extract_script_flock_c_code(cand, folds, budget)?
+            && !payloads.iter().any(|p| p == &code)
+        {
+            budget.charge_alloc(std::mem::size_of::<String>())?;
+            payloads.push(code);
+        }
+    }
+    Ok((readings, payloads))
+}
+
+/// Checks an inline payload extracted from `script -qc` / `flock --comm` on a
+/// single unit (split into simple segments and run through `check_unit_reading`).
+#[allow(clippy::too_many_arguments)]
+fn check_inline_payload_be(
+    payload: &str,
+    part: &PartId,
+    protected: &ProtectedSet,
+    shared: &SharedSensitive,
+    unit_cands: &[Vec<u8>],
+    unit_cwd_unknown: bool,
+    opts: &BestEffortOptions<'_>,
+    budget: &mut ComputeBudget,
+    out: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
+    for seg in split_payload_segments(payload, budget)? {
+        let words = raw_words_budgeted(&seg, budget)?;
+        let eff = unwrap_simple_be(&words, protected.folds, budget)?;
+        let Some(first) = eff.first() else {
+            continue;
+        };
+        let folded = fold_cmd_cr19(first, protected.folds, budget)?;
+        let dummy = BestEffortUnit {
+            index: 0,
+            raw_argv: words,
+            effective_argv: eff.clone(),
+            alt_argv: Vec::new(),
+            assignments: Vec::new(),
+            redirects: Vec::new(),
+            pipeline_id: None,
+            piped: false,
+            depth: 1,
+            derived: true,
+        };
+        check_unit_reading(
+            0,
+            &dummy,
+            &eff,
+            &folded,
+            part,
+            &[],
+            protected,
+            shared,
+            unit_cands,
+            unit_cwd_unknown,
+            None,
+            opts,
+            budget,
+            out,
+        )?;
+    }
+    Ok(())
 }
 
 fn clone_bytes(b: &[u8], budget: &mut ComputeBudget) -> Result<Vec<u8>, Exhausted> {
@@ -1346,6 +2683,7 @@ fn check_unit_reading(
     // 6. Pipe-to-shell (`curl ... | sh`, `bash -c "$(curl ...)"`, `source <(curl ...)`).
     if DOWNLOADERS.contains(&folded)
         && let Some(pid) = u.pipeline_id
+        && unit_idx < all_units.len()
     {
         for downstream in &all_units[unit_idx + 1..] {
             budget.charge(1)?;
@@ -1357,6 +2695,12 @@ fn check_unit_reading(
                     if reads_stdin_as_code_budgeted(dr, folds, 0, budget)? {
                         hits_stdin = true;
                         break;
+                    }
+                }
+                if !hits_stdin && !downstream.raw_argv.is_empty() {
+                    let raw_unwrapped = unwrap_simple_be(&downstream.raw_argv, folds, budget)?;
+                    if reads_stdin_as_code_budgeted(&raw_unwrapped, folds, 0, budget)? {
+                        hits_stdin = true;
                     }
                 }
                 if hits_stdin {
@@ -1490,6 +2834,8 @@ fn check_reading_operands(
         let mut has_pat_flag = false;
         let mut dd = false;
         let mut j = 1usize;
+        let is_rg = folded == "rg";
+        let has_g_glob = matches!(folded, "rg" | "ag" | "ack");
         while j < eff.len() {
             let w = eff[j].as_str();
             budget.charge(w.len().max(1) as u64)?;
@@ -1499,7 +2845,9 @@ fn check_reading_operands(
                 continue;
             }
             if !dd && w.starts_with('-') && w != "-" {
-                if matches!(w, "-e" | "--regexp") {
+                if matches!(w, "-e" | "--regexp")
+                    || (!w.starts_with("--") && short_cluster_takes_next(w, "e"))
+                {
                     has_pat_flag = true;
                     if j + 1 < eff.len() {
                         skip_flag_val_indices.push(j + 1);
@@ -1507,29 +2855,31 @@ fn check_reading_operands(
                     j += 2;
                     continue;
                 }
-                if w.starts_with("--regexp=") || (w.starts_with("-e") && w.len() > 2) {
+                if w.starts_with("--regexp=") || (!w.starts_with("--") && w[1..].contains('e')) {
                     has_pat_flag = true;
                     j += 1;
                     continue;
                 }
-                if matches!(w, "-f" | "--file") {
+                if matches!(w, "-f" | "--file")
+                    || (!w.starts_with("--") && short_cluster_takes_next(w, "f"))
+                {
+                    // `-f FILE`: file operand IS a candidate path (never skip it).
                     has_pat_flag = true;
                     j += 2;
                     continue;
                 }
-                if w.starts_with("--file=") || (w.starts_with("-f") && w.len() > 2) {
+                if w.starts_with("--file=") || (!w.starts_with("--") && w[1..].contains('f')) {
                     has_pat_flag = true;
                     j += 1;
                     continue;
                 }
-                if matches!(
+                let skips_next = matches!(
                     w,
-                    "-g" | "--glob"
+                    "--glob"
                         | "--iglob"
                         | "--include"
                         | "--exclude"
                         | "--exclude-dir"
-                        | "-r"
                         | "--replace"
                         | "-t"
                         | "--type"
@@ -1541,7 +2891,9 @@ fn check_reading_operands(
                         | "-A"
                         | "-B"
                         | "-C"
-                ) {
+                ) || (has_g_glob && w == "-g")
+                    || (is_rg && w == "-r");
+                if skips_next {
                     if j + 1 < eff.len() {
                         skip_flag_val_indices.push(j + 1);
                     }
@@ -1624,9 +2976,14 @@ fn check_reading_operands(
                 }
             }
         } else if w.starts_with('-') && w.len() > 1 {
-            // Skip `-ePAT` / `-gGLOB` / `-rREPL` on search tools (§11 item 9).
-            if is_search_tool && (w.starts_with("-e") || w.starts_with("-g") || w.starts_with("-r"))
-            {
+            // Skip `-ePAT` (all search tools), `-gGLOB` (`rg`/`ag`/`ack`), and
+            // `-rREPL` (`rg` only; on `grep`, `-r` is boolean `--recursive` so
+            // `-rf.npmrc` is `-r -f .npmrc` and MUST still be checked!).
+            let skip_attached = is_search_tool
+                && (w.starts_with("-e")
+                    || (matches!(folded, "rg" | "ag" | "ack") && w.starts_with("-g"))
+                    || (folded == "rg" && w.starts_with("-r")));
+            if skip_attached {
                 continue;
             }
             // Attached short-flag values (`-f.npmrc`, `-uf.npmrc`, `-o.npmrc`, `-éf.npmrc`).
@@ -1800,7 +3157,7 @@ fn check_candidate_word(
             }
             if globby
                 && let Some(id) =
-                    glob_hit_budgeted(&folded, access, shared, protected.folds, budget)?
+                    glob_hit_budgeted(&folded, access, protected, shared, protected.folds, budget)?
             {
                 push_be_hit(
                     out,
@@ -1822,12 +3179,15 @@ fn is_ssh_dir_folded(folded: &[u8], home_folded: &[u8]) -> bool {
     under_bytes(folded, home_folded) == Some(b".ssh")
 }
 
-/// Budgeted port of `dev` `Sensitive::glob_hit` (`deny.rs:594-619`).
+/// Budgeted port of `dev` `Sensitive::glob_hit` (`deny.rs:594-619`), extended
+/// with protected-directory prefix matching for `CRED_TREES`, Atrium data paths,
+/// and write-protected Atrium config paths (M1-13 finding 11).
 fn glob_hit_budgeted(
     folded_pattern: &[u8],
     access: AccessMode,
+    protected: &ProtectedSet,
     shared: &SharedSensitive,
-    _folds: FoldRules,
+    folds: FoldRules,
     budget: &mut ComputeBudget,
 ) -> Result<Option<&'static str>, Exhausted> {
     let Ok(pat_str) = std::str::from_utf8(folded_pattern) else {
@@ -1861,6 +3221,44 @@ fn glob_hit_budgeted(
             && matcher.is_match(ps, budget)?
         {
             return Ok(Some(id));
+        }
+    }
+
+    // 3. Protected-directory prefix matching: any pattern whose leading
+    //    components match a protected tree (`CRED_TREES`, Atrium data dir,
+    //    or write-protected Atrium config dir when `access != Read`) targets
+    //    inside that tree even when the leaf filename isn't `"x"`.
+    for d in shared.data_folded() {
+        if let Ok(ds) = std::str::from_utf8(d)
+            && matcher.matches_dir_prefix(ds, budget)?
+        {
+            return Ok(Some("atrium-self"));
+        }
+    }
+    if access != AccessMode::Read {
+        for raw_p in &protected.atrium_protected_paths {
+            let pf = fold_path_listed(raw_p, folds, budget)?;
+            if let Ok(ps) = std::str::from_utf8(&pf)
+                && (matcher.is_match(ps, budget)? || matcher.matches_dir_prefix(ps, budget)?)
+            {
+                return Ok(Some("atrium-self"));
+            }
+        }
+    }
+    for &t in CRED_TREES {
+        let tree = join_folded(shared.home_folded(), t.as_bytes());
+        if let Ok(ts) = std::str::from_utf8(&tree)
+            && matcher.matches_dir_prefix(ts, budget)?
+        {
+            return Ok(Some("credential-read"));
+        }
+    }
+    for d in shared.ssh_linked_folded() {
+        if let Ok(ds) = std::str::from_utf8(d)
+            && (matcher.matches_strict_descendant(ds, budget)?
+                || (access != AccessMode::Read && matcher.matches_dir_prefix(ds, budget)?))
+        {
+            return Ok(Some("credential-read"));
         }
     }
     Ok(None)
@@ -1918,15 +3316,66 @@ impl ShellGlobBe {
         }
         Ok(idx == self.parts.len())
     }
+
+    /// Returns `true` when `self` matches `dir` itself or any path below `dir`
+    /// (its leading `k` components match `dir`'s `k` components, respecting
+    /// shell dot-matching rules).
+    fn matches_dir_prefix(&self, dir: &str, budget: &mut ComputeBudget) -> Result<bool, Exhausted> {
+        budget.charge(dir.len().max(1) as u64)?;
+        if let Some(w) = &self.whole {
+            if w.is_match(dir) {
+                return Ok(true);
+            }
+            let sample = join_folded(dir.as_bytes(), b"x");
+            return Ok(std::str::from_utf8(&sample).is_ok_and(|s| w.is_match(s)));
+        }
+        let mut idx = 0usize;
+        for seg in dir.split('/') {
+            let Some((dot, matcher)) = self.parts.get(idx) else {
+                return Ok(false);
+            };
+            if (!*dot && seg.starts_with('.')) || !matcher.as_ref().is_some_and(|m| m.is_match(seg))
+            {
+                return Ok(false);
+            }
+            idx += 1;
+        }
+        Ok(idx > 0 && idx <= self.parts.len())
+    }
+
+    fn matches_strict_descendant(
+        &self,
+        dir: &str,
+        budget: &mut ComputeBudget,
+    ) -> Result<bool, Exhausted> {
+        budget.charge(dir.len().max(1) as u64)?;
+        if let Some(w) = &self.whole {
+            let sample = join_folded(dir.as_bytes(), b"x");
+            return Ok(std::str::from_utf8(&sample).is_ok_and(|s| w.is_match(s)));
+        }
+        let mut idx = 0usize;
+        for seg in dir.split('/') {
+            let Some((dot, matcher)) = self.parts.get(idx) else {
+                return Ok(false);
+            };
+            if (!*dot && seg.starts_with('.')) || !matcher.as_ref().is_some_and(|m| m.is_match(seg))
+            {
+                return Ok(false);
+            }
+            idx += 1;
+        }
+        Ok(idx > 0 && idx < self.parts.len())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Best-effort search-glob check for `ToolSubject::Paths { glob: Some(g) }`
 // ---------------------------------------------------------------------------
 
-/// Handles brace-expanded, `$HOME`-containing, backslash-escaped, and
-/// dot-class (`[.][.]`) search globs on `ToolSubject::Paths` (complementing P2's
-/// `resolve_subject_paths`, §2, §5, D-100).
+/// Handles brace-expanded, `$HOME`/`$VAR`, backslash-escaped, wildcard-`..`,
+/// and dot/slash-class (`[.][.][/]`) search globs on `ToolSubject::Paths`
+/// (budgeted port of `dev` `deny.rs::search_glob_hit` + `escape_from_cands`,
+/// complementing P2's `resolve_subject_paths`, §2, §5, D-100).
 pub(super) fn check_search_glob_best_effort(
     roots: &[String],
     glob: &str,
@@ -1942,75 +3391,34 @@ pub(super) fn check_search_glob_best_effort(
             out,
             PartResult {
                 part,
-                outcome: PartOutcome::Unread(UnreadReason::UnsupportedFilterForm),
+                outcome: PartOutcome::Exhausted(ExhaustReason::ComputeBudget),
             },
             budget,
         )?;
         return Ok(());
     }
 
-    // Fast path: plain relative filter with no braces, backslashes, `$`, or dot-class.
-    let has_special =
-        glob.contains(['{', '}', '\\', '$']) || glob.split('/').any(may_be_dot_component);
+    // Fast path: plain relative filter with no braces, backslashes, `$`, `[`,
+    // `..` segment, or `?` dot-component.
+    let has_special = glob.contains(['{', '}', '\\', '$', '['])
+        || glob
+            .split('/')
+            .any(|c| c == ".." || may_be_dot_component(c));
     if !has_special {
         return Ok(());
     }
 
-    let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
-
-    // Unescape backslashes as an additional candidate, then brace-expand (N11).
-    let mut raw_variants: Vec<String> = vec![clone_str_budgeted(glob, budget)?];
-    let mut mark_unread = glob.contains(['\\', '$']);
-    if glob.contains('\\') {
-        budget.charge(glob.len() as u64)?;
-        budget.charge_alloc(glob.len())?;
-        let mut unesc = String::with_capacity(glob.len());
-        let mut chars = glob.chars();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                if let Some(next) = chars.next() {
-                    unesc.push(next);
-                } else {
-                    unesc.push('\\');
-                }
-            } else {
-                unesc.push(c);
-            }
-        }
-        raw_variants.push(unesc);
-    }
-
-    let mut expanded: Vec<String> = Vec::new();
-    for r in &raw_variants {
-        match brace_expand_budgeted(r, budget)? {
-            Some(vs) => {
-                if expanded.len() + vs.len() > MAX_SEARCH_GLOB_VARIANTS {
-                    // Unbounded glob expansion -> Exhausted (Ask everywhere, §2).
-                    push_charged(
-                        out,
-                        PartResult {
-                            part,
-                            outcome: PartOutcome::Exhausted(ExhaustReason::ComputeBudget),
-                        },
-                        budget,
-                    )?;
-                    return Ok(());
-                }
-                expanded.extend(vs);
-            }
-            None => {
-                // Exceeded MAX_BRACE_RESULTS / MAX_SEQUENCE / MAX_BRACE_WORK -> Exhausted (§2).
-                push_charged(
-                    out,
-                    PartResult {
-                        part,
-                        outcome: PartOutcome::Exhausted(ExhaustReason::ComputeBudget),
-                    },
-                    budget,
-                )?;
-                return Ok(());
-            }
-        }
+    let cands = expand_glob_candidates_budgeted(glob, &protected.cwd, &protected.home, budget)?;
+    if cands.unbounded {
+        push_charged(
+            out,
+            PartResult {
+                part,
+                outcome: PartOutcome::Exhausted(ExhaustReason::ComputeBudget),
+            },
+            budget,
+        )?;
+        return Ok(());
     }
 
     // Resolve lexical root paths.
@@ -2028,160 +3436,142 @@ pub(super) fn check_search_glob_best_effort(
             root_paths.push(abs);
         }
     }
+    let mut root_strs: Vec<String> = Vec::with_capacity(root_paths.len());
     let mut root_folded: Vec<Vec<u8>> = Vec::with_capacity(root_paths.len());
     for rp in &root_paths {
         root_folded.push(fold_path_listed(rp, protected.folds, budget)?);
+        let s = String::from_utf8_lossy(rp).into_owned();
+        budget.charge_alloc(s.len())?;
+        root_strs.push(s);
     }
 
-    let probes = shared.hard_deny_probes(budget)?;
+    // Escape check (D-100): determines whether any normalized variant leaves
+    // every search root or overflows `MAX_SEARCH_GLOB_VARIANTS`.
+    let (escaped, esc_unbounded) = escape_from_cands_budgeted(
+        &root_strs,
+        &root_folded,
+        &protected.cwd,
+        &protected.home,
+        protected.folds,
+        &cands,
+        budget,
+    )?;
+    if esc_unbounded {
+        push_charged(
+            out,
+            PartResult {
+                part,
+                outcome: PartOutcome::Exhausted(ExhaustReason::ComputeBudget),
+            },
+            budget,
+        )?;
+        return Ok(());
+    }
 
-    for variant in &expanded {
-        if variant.is_empty() {
-            continue;
+    let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
+    let all_probes = shared.hard_deny_probes(budget)?;
+
+    // Filter probes to only those reachable: when no variant escapes or is
+    // anchored, only probes under `root_folded` can possibly match. This avoids
+    // compiling 256 matchers for clean project searches like `{1..64}{a,b,c,d}/**/*.rs`.
+    let any_anchored = cands
+        .variants
+        .iter()
+        .any(|v| v.starts_with('/') || v.starts_with('~'));
+    let active_probes: Vec<(Vec<u8>, &'static str)> = if escaped || any_anchored {
+        all_probes
+    } else {
+        all_probes
+            .into_iter()
+            .filter(|(p, _)| root_folded.iter().any(|rf| under_bytes(p, rf).is_some()))
+            .collect()
+    };
+
+    if !active_probes.is_empty() {
+        let (variants, search_unbounded) = search_variants_from_cands_budgeted(
+            &root_strs,
+            &protected.cwd,
+            &protected.home,
+            protected.folds,
+            &cands,
+            budget,
+        )?;
+        if search_unbounded {
+            push_charged(
+                out,
+                PartResult {
+                    part,
+                    outcome: PartOutcome::Exhausted(ExhaustReason::ComputeBudget),
+                },
+                budget,
+            )?;
+            return Ok(());
         }
-        budget.charge(variant.len() as u64)?;
-        if variant.split('/').any(may_be_dot_component) {
-            mark_unread = true;
-        }
-        let h = expand_home_be(variant, &protected.home, &protected.cwd, budget)?;
-        if let Some(rest) = h.strip_prefix('~')
-            && !rest.is_empty()
-            && !rest.starts_with('/')
-        {
-            mark_unread = true;
-            continue;
-        }
-        let anchored = h.starts_with('/') || h.starts_with('~');
-        if anchored {
-            mark_unread = true;
-        }
-        let mut pat_abs_list: Vec<Vec<u8>> = Vec::new();
-        if anchored {
-            pat_abs_list.push(lexical_normalize_bytes(h.as_bytes(), budget)?);
-        } else {
-            for rp in &root_paths {
-                pat_abs_list.push(join_lexical_bytes(rp, h.as_bytes(), budget)?);
+
+        let mut matchers: Vec<GlobMatcher> = Vec::with_capacity(variants.len());
+        for norm in &variants {
+            budget.charge((norm.len() as u64).saturating_mul(4).max(4))?;
+            budget.charge_alloc(norm.len().saturating_mul(8).max(32))?;
+            if let Ok(g) = GlobBuilder::new(norm).literal_separator(false).build() {
+                matchers.push(g.compile_matcher());
             }
         }
 
-        for pat_abs in &pat_abs_list {
-            let pat_folded = fold_path_listed(pat_abs, protected.folds, budget)?;
-            // Check whether the literal prefix before the first wildcard escapes all roots.
-            if let Ok(ps) = std::str::from_utf8(&pat_folded) {
-                let mut lit_prefix = Vec::new();
-                for seg in ps.split('/').filter(|s| !s.is_empty()) {
-                    if seg.contains(['*', '?', '[']) {
+        if !matchers.is_empty() {
+            for (probe_bytes, hard_id) in &active_probes {
+                let Ok(probe_s) = std::str::from_utf8(probe_bytes) else {
+                    continue;
+                };
+                let name = probe_s.rsplit('/').next().unwrap_or(probe_s);
+                let mut matched = false;
+                // Check absolute probe match first (covers escaping & anchored patterns).
+                for m in &matchers {
+                    budget.charge(probe_s.len().max(1) as u64)?;
+                    if m.is_match(probe_s) {
+                        matched = true;
                         break;
                     }
-                    lit_prefix.push(b'/');
-                    lit_prefix.extend_from_slice(seg.as_bytes());
                 }
-                if lit_prefix.is_empty() {
-                    lit_prefix.push(b'/');
-                }
-                if !root_folded
-                    .iter()
-                    .any(|rf| under_bytes(&lit_prefix, rf).is_some())
-                {
-                    mark_unread = true;
-                }
-                if let Some(id) = shared.hard_deny_hit_folded(&pat_folded, AccessMode::Read) {
-                    push_be_hit(
-                        out,
-                        part.clone(),
-                        id,
-                        HitMatch::ProbeName {
-                            probe: ps.to_owned(),
-                        },
-                        budget,
-                    )?;
-                    return Ok(());
-                }
-                if let Some(id) = glob_hit_budgeted(
-                    &pat_folded,
-                    AccessMode::Read,
-                    &shared,
-                    protected.folds,
-                    budget,
-                )? {
-                    push_be_hit(
-                        out,
-                        part.clone(),
-                        id,
-                        HitMatch::ProbeName {
-                            probe: ps.to_owned(),
-                        },
-                        budget,
-                    )?;
-                    return Ok(());
-                }
-                // Also test globset match (literal_separator=false) against probes inside roots
-                // matching `dev` `search_glob_hit`.
-                budget.charge((ps.len() as u64).saturating_mul(8).max(8))?;
-                budget.charge_alloc(ps.len().saturating_mul(16).max(64))?;
-                if let Ok(g) = GlobBuilder::new(ps).literal_separator(false).build() {
-                    let m = g.compile_matcher();
-                    for (probe, id) in &probes {
-                        let Ok(probe_s) = std::str::from_utf8(probe) else {
-                            continue;
-                        };
-                        budget.charge(probe_s.len().max(1) as u64)?;
-                        if m.is_match(probe_s) {
-                            push_be_hit(
-                                out,
-                                part.clone(),
-                                id,
-                                HitMatch::ProbeName {
-                                    probe: probe_s.to_owned(),
-                                },
-                                budget,
-                            )?;
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Non-anchored basename/relative probe match for recursive searches.
-        if !anchored && let Ok(hf) = fold_str_listed(&h, protected.folds, budget) {
-            budget.charge((hf.len() as u64).saturating_mul(8).max(8))?;
-            budget.charge_alloc(hf.len().saturating_mul(16).max(64))?;
-            if let Ok(g) = GlobBuilder::new(&hf).literal_separator(false).build() {
-                let m = g.compile_matcher();
-                for (probe, id) in &probes {
-                    let Ok(probe_s) = std::str::from_utf8(probe) else {
-                        continue;
-                    };
-                    let name = probe_s.rsplit('/').next().unwrap_or(probe_s);
+                if !matched {
                     for rf in &root_folded {
-                        let Some(rel_b) = under_bytes(probe, rf) else {
+                        let Some(rel_b) = under_bytes(probe_bytes, rf) else {
                             continue;
                         };
                         let Ok(rel) = std::str::from_utf8(rel_b) else {
                             continue;
                         };
-                        budget.charge(rel.len().max(1) as u64)?;
-                        let name_ok = recursive || !rel.contains('/');
-                        if (name_ok && m.is_match(name)) || (!rel.is_empty() && m.is_match(rel)) {
-                            push_be_hit(
-                                out,
-                                part.clone(),
-                                id,
-                                HitMatch::ProbeName {
-                                    probe: probe_s.to_owned(),
-                                },
-                                budget,
-                            )?;
-                            return Ok(());
+                        let name_allowed = recursive || !rel.contains('/');
+                        for m in &matchers {
+                            budget.charge(rel.len().max(1) as u64)?;
+                            if (name_allowed && m.is_match(name))
+                                || (!rel.is_empty() && m.is_match(rel))
+                            {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if matched {
+                            break;
                         }
                     }
+                }
+                if matched {
+                    push_be_hit(
+                        out,
+                        part.clone(),
+                        hard_id,
+                        HitMatch::ProbeName {
+                            probe: clone_str_budgeted(probe_s, budget)?,
+                        },
+                        budget,
+                    )?;
+                    return Ok(());
                 }
             }
         }
     }
 
-    if mark_unread {
+    if cands.unknown || escaped || any_anchored {
         push_charged(
             out,
             PartResult {
@@ -2195,8 +3585,42 @@ pub(super) fn check_search_glob_best_effort(
     Ok(())
 }
 
+#[derive(Default)]
+struct GlobCandidatesBe {
+    variants: Vec<String>,
+    unknown: bool,
+    unbounded: bool,
+}
+
+fn class_may_match_dot(class: &str) -> bool {
+    if class.len() < 2 {
+        return false;
+    }
+    let inner = &class[1..class.len() - 1];
+    if !inner.contains(['!', '^', '.', '\\'])
+        && !inner
+            .as_bytes()
+            .windows(3)
+            .any(|w| w[1] == b'-' && w[0] <= b'.' && b'.' <= w[2])
+    {
+        return false;
+    }
+    GlobBuilder::new(class)
+        .literal_separator(true)
+        .build()
+        .map_or(true, |g| g.compile_matcher().is_match("."))
+}
+
 fn may_be_dot_component(c: &str) -> bool {
     if c == "*" || c == "**" || !c.contains(['[', '?']) {
+        return false;
+    }
+    if !c.contains('?')
+        && c.starts_with('[')
+        && c.ends_with(']')
+        && !c[1..c.len() - 1].contains(['[', ']'])
+        && !class_may_match_dot(c)
+    {
         return false;
     }
     let Ok(g) = GlobBuilder::new(c).literal_separator(true).build() else {
@@ -2204,6 +3628,529 @@ fn may_be_dot_component(c: &str) -> bool {
     };
     let m = g.compile_matcher();
     m.is_match(".") || m.is_match("..")
+}
+
+fn widen_pattern_dots_budgeted(s: &str, budget: &mut ComputeBudget) -> Result<String, Exhausted> {
+    let bytes = s.as_bytes();
+    budget.charge(bytes.len().max(1) as u64)?;
+    budget.charge_alloc(bytes.len())?;
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = s[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        if ch == '?' {
+            out.push('.');
+            i += len;
+        } else if ch == '[' {
+            let mut j = i + 1;
+            if j < bytes.len() && (bytes[j] == b'!' || bytes[j] == b'^') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                j += 1;
+            }
+            while j < bytes.len() && bytes[j] != b']' {
+                if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                let class = &s[i..=j];
+                if class_may_match_dot(class) {
+                    out.push('.');
+                } else {
+                    out.push_str(class);
+                }
+                i = j + 1;
+            } else {
+                out.push(ch);
+                i += len;
+            }
+        } else {
+            out.push(ch);
+            i += len;
+        }
+    }
+    Ok(out)
+}
+
+fn widen_pattern_slashes_budgeted(
+    s: &str,
+    budget: &mut ComputeBudget,
+) -> Result<Option<String>, Exhausted> {
+    let bytes = s.as_bytes();
+    budget.charge(bytes.len().max(1) as u64)?;
+    let mut out = String::new();
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = s[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        if ch == '[' {
+            let mut j = i + 1;
+            if j < bytes.len() && (bytes[j] == b'!' || bytes[j] == b'^') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                j += 1;
+            }
+            while j < bytes.len() && bytes[j] != b']' {
+                if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            if j < bytes.len() && bytes[j] == b']' {
+                let class = &s[i..=j];
+                let inner = &s[i + 1..j];
+                let has_slash = inner.contains('/')
+                    || inner
+                        .as_bytes()
+                        .windows(3)
+                        .any(|w| w[1] == b'-' && w[0] <= b'/' && b'/' <= w[2]);
+                if has_slash {
+                    if !changed {
+                        budget.charge_alloc(bytes.len())?;
+                        out.reserve(bytes.len());
+                        out.push_str(&s[..i]);
+                        changed = true;
+                    }
+                    out.push('/');
+                } else if changed {
+                    out.push_str(class);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        if changed {
+            out.push(ch);
+        }
+        i += len;
+    }
+    Ok(changed.then_some(out))
+}
+
+fn expand_glob_vars_budgeted(
+    s: &str,
+    budget: &mut ComputeBudget,
+) -> Result<Vec<String>, Exhausted> {
+    if !s.contains('$') {
+        return Ok(Vec::new());
+    }
+    let bytes = s.as_bytes();
+    budget.charge(bytes.len().max(1) as u64)?;
+    budget.charge_alloc(bytes.len().saturating_mul(3).saturating_add(32))?;
+    let mut as_globstar = String::with_capacity(bytes.len() + 8);
+    let mut as_empty = String::with_capacity(bytes.len());
+    let mut first_abs: Option<String> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let end = if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                s[i + 2..].find('}').map_or(bytes.len(), |k| i + 2 + k + 1)
+            } else {
+                let mut k = i + 1;
+                while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                    k += 1;
+                }
+                k
+            };
+            as_globstar.push_str("**");
+            if first_abs.is_none() {
+                let rest = &s[end..];
+                first_abs = Some(if rest.starts_with('/') || rest.is_empty() {
+                    format!("/**{rest}")
+                } else {
+                    format!("/**/{rest}")
+                });
+            }
+            i = end;
+        } else {
+            let ch = s[i..].chars().next().unwrap();
+            as_globstar.push(ch);
+            as_empty.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    let mut out = vec![as_globstar, as_empty];
+    if let Some(a) = first_abs {
+        out.push(a);
+    }
+    Ok(out)
+}
+
+fn expand_glob_candidates_budgeted(
+    glob: &str,
+    cwd: &[u8],
+    home: &[u8],
+    budget: &mut ComputeBudget,
+) -> Result<GlobCandidatesBe, Exhausted> {
+    let mut res = GlobCandidatesBe::default();
+    let mut raw = vec![clone_str_budgeted(glob, budget)?];
+    if glob.contains('\\') {
+        res.unknown = true;
+        budget.charge(glob.len() as u64)?;
+        budget.charge_alloc(glob.len())?;
+        let mut unesc = String::with_capacity(glob.len());
+        let mut chars = glob.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    unesc.push(next);
+                } else {
+                    unesc.push('\\');
+                }
+            } else {
+                unesc.push(c);
+            }
+        }
+        raw.push(unesc);
+    }
+    let mut expansions = Vec::new();
+    for r in &raw {
+        match brace_expand_budgeted(r, budget)? {
+            Some(exps) => {
+                if expansions.len() + exps.len() > MAX_SEARCH_GLOB_VARIANTS {
+                    res.unknown = true;
+                    res.unbounded = true;
+                    return Ok(res);
+                }
+                expansions.extend(exps);
+            }
+            None => {
+                res.unknown = true;
+                res.unbounded = true;
+                return Ok(res);
+            }
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    for e in expansions {
+        if e.is_empty() {
+            continue;
+        }
+        let h = expand_home_be(&e, home, cwd, budget)?;
+        if let Some(rest) = h.strip_prefix('~')
+            && !rest.is_empty()
+            && !rest.starts_with('/')
+        {
+            res.unknown = true;
+            continue;
+        }
+        if h.split('/').any(may_be_dot_component) {
+            res.unknown = true;
+        }
+        let mut bases = vec![h.clone()];
+        if h.contains('$') {
+            res.unknown = true;
+            bases.extend(expand_glob_vars_budgeted(&h, budget)?);
+        }
+        let mut cands: Vec<String> = Vec::new();
+        for b in bases {
+            if !cands.contains(&b) {
+                cands.push(b.clone());
+            }
+            if b.contains(['?', '[']) {
+                let dots = widen_pattern_dots_budgeted(&b, budget)?;
+                if dots != b && !cands.contains(&dots) {
+                    cands.push(dots.clone());
+                }
+                if let Some(sl) = widen_pattern_slashes_budgeted(&b, budget)? {
+                    res.unknown = true;
+                    if !cands.contains(&sl) {
+                        cands.push(sl.clone());
+                    }
+                    let sl_dots = widen_pattern_dots_budgeted(&sl, budget)?;
+                    if sl_dots != sl && !cands.contains(&sl_dots) {
+                        cands.push(sl_dots);
+                    }
+                }
+                if dots != b
+                    && let Some(dots_sl) = widen_pattern_slashes_budgeted(&dots, budget)?
+                {
+                    res.unknown = true;
+                    if !cands.contains(&dots_sl) {
+                        cands.push(dots_sl);
+                    }
+                }
+            }
+        }
+        for cand in cands {
+            if cand.is_empty() {
+                continue;
+            }
+            if !seen.contains(&cand) {
+                if res.variants.len() >= MAX_SEARCH_GLOB_VARIANTS {
+                    res.unknown = true;
+                    res.unbounded = true;
+                    res.variants.clear();
+                    return Ok(res);
+                }
+                budget.charge_alloc(cand.len() + 32)?;
+                seen.insert(cand.clone());
+                res.variants.push(cand);
+            }
+        }
+    }
+    Ok(res)
+}
+
+fn apply_dotdot_budgeted<'a>(
+    mut st: Vec<&'a str>,
+    abs: bool,
+    out: &mut Vec<Vec<&'a str>>,
+    cap: usize,
+    budget: &mut ComputeBudget,
+) -> Result<bool, Exhausted> {
+    budget.charge(st.len().max(1) as u64)?;
+    if out.len() > cap.saturating_mul(4).max(16) {
+        out.sort_unstable();
+        out.dedup();
+        if out.len() > cap {
+            return Ok(false);
+        }
+    }
+    match st.last().copied() {
+        None => {
+            if !abs {
+                st.push("..");
+            }
+            out.push(st);
+        }
+        Some("..") => {
+            st.push("..");
+            out.push(st);
+        }
+        Some("**") => {
+            budget.charge_alloc(st.len() * 2 * std::mem::size_of::<&str>())?;
+            out.push(st.clone());
+            st.pop();
+            out.push(st.clone());
+            if !apply_dotdot_budgeted(st, abs, out, cap, budget)? {
+                return Ok(false);
+            }
+        }
+        Some(last) if !last.contains(['*', '?', '[']) => {
+            st.pop();
+            out.push(st);
+        }
+        Some(_) => {
+            budget.charge_alloc(st.len() * std::mem::size_of::<&str>())?;
+            let mut popped = st.clone();
+            popped.pop();
+            out.push(popped);
+            st.push("..");
+            out.push(st);
+        }
+    }
+    Ok(true)
+}
+
+fn normalize_glob_variants_budgeted(
+    g: &str,
+    cap: usize,
+    budget: &mut ComputeBudget,
+) -> Result<Option<Vec<String>>, Exhausted> {
+    budget.charge(g.len().max(1) as u64)?;
+    let abs = g.starts_with('/');
+    let mut states: Vec<Vec<&str>> = vec![Vec::new()];
+    for c in g.split('/') {
+        match c {
+            "" | "." => {}
+            "**" => {
+                for st in &mut states {
+                    if st.last().copied() != Some("**") {
+                        st.push(c);
+                    }
+                }
+                states.sort_unstable();
+                states.dedup();
+            }
+            ".." => {
+                let mut next = Vec::with_capacity(states.len());
+                for st in states {
+                    if !apply_dotdot_budgeted(st, abs, &mut next, cap, budget)? {
+                        return Ok(None);
+                    }
+                }
+                next.sort_unstable();
+                next.dedup();
+                if next.len() > cap {
+                    return Ok(None);
+                }
+                states = next;
+            }
+            _ => {
+                for st in &mut states {
+                    st.push(c);
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(states.len());
+    for st in states {
+        let len: usize = st.iter().map(|s| s.len() + 1).sum::<usize>().max(1);
+        budget.charge(len as u64)?;
+        budget.charge_alloc(len)?;
+        let s = if abs {
+            format!("/{}", st.join("/"))
+        } else if st.is_empty() {
+            ".".to_owned()
+        } else {
+            st.join("/")
+        };
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    Ok(Some(out))
+}
+
+fn escape_from_cands_budgeted(
+    root_strs: &[String],
+    root_folded: &[Vec<u8>],
+    cwd: &[u8],
+    home: &[u8],
+    folds: FoldRules,
+    cands: &GlobCandidatesBe,
+    budget: &mut ComputeBudget,
+) -> Result<(bool, bool), Exhausted> {
+    let mut total_norm = 0usize;
+    let mut escaped = false;
+    for gv in &cands.variants {
+        if gv.is_empty() {
+            continue;
+        }
+        let anchored = gv.starts_with('/') || gv.starts_with('~');
+        let raw_joined: Vec<String> = if anchored {
+            vec![expand_home_be(gv, home, cwd, budget)?]
+        } else {
+            let mut v = Vec::with_capacity(root_strs.len());
+            for r in root_strs {
+                let base = r.trim_end_matches('/');
+                let len = base.len() + 1 + gv.len();
+                budget.charge(len as u64)?;
+                budget.charge_alloc(len)?;
+                v.push(format!("{base}/{gv}"));
+            }
+            v
+        };
+        for j in raw_joined {
+            let remaining = MAX_SEARCH_GLOB_VARIANTS.saturating_sub(total_norm);
+            if remaining == 0 {
+                return Ok((true, true));
+            }
+            let Some(norms) = normalize_glob_variants_budgeted(&j, remaining, budget)? else {
+                return Ok((true, true));
+            };
+            total_norm += norms.len();
+            if total_norm > MAX_SEARCH_GLOB_VARIANTS {
+                return Ok((true, true));
+            }
+            for n in norms {
+                let nf = fold_path_listed(n.as_bytes(), folds, budget)?;
+                let Ok(ns) = std::str::from_utf8(&nf) else {
+                    escaped = true;
+                    continue;
+                };
+                let mut lit_prefix = Vec::new();
+                for seg in ns.split('/').filter(|s| !s.is_empty()) {
+                    if seg.contains(['*', '?', '[']) {
+                        break;
+                    }
+                    lit_prefix.push(b'/');
+                    lit_prefix.extend_from_slice(seg.as_bytes());
+                }
+                if lit_prefix.is_empty() {
+                    lit_prefix.push(b'/');
+                }
+                if !root_folded
+                    .iter()
+                    .any(|rf| under_bytes(&lit_prefix, rf).is_some())
+                {
+                    escaped = true;
+                }
+            }
+        }
+    }
+    Ok((escaped, false))
+}
+
+fn search_variants_from_cands_budgeted(
+    root_strs: &[String],
+    cwd: &[u8],
+    home: &[u8],
+    folds: FoldRules,
+    cands: &GlobCandidatesBe,
+    budget: &mut ComputeBudget,
+) -> Result<(Vec<String>, bool), Exhausted> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut unjoined_norm = 0usize;
+    let mut joined_norm = 0usize;
+
+    let push_norms = |pat: &str,
+                      total: &mut usize,
+                      out: &mut Vec<String>,
+                      seen: &mut HashSet<String>,
+                      budget: &mut ComputeBudget|
+     -> Result<bool, Exhausted> {
+        let remaining = MAX_SEARCH_GLOB_VARIANTS.saturating_sub(*total);
+        if remaining == 0 {
+            return Ok(false);
+        }
+        let Some(norms) = normalize_glob_variants_budgeted(pat, remaining, budget)? else {
+            return Ok(false);
+        };
+        *total += norms.len();
+        if *total > MAX_SEARCH_GLOB_VARIANTS {
+            return Ok(false);
+        }
+        for n in norms {
+            let folded = fold_str_listed(&n, folds, budget)?;
+            if !folded.is_empty() && !seen.contains(&folded) {
+                budget.charge_alloc(folded.len() + 32)?;
+                seen.insert(folded.clone());
+                out.push(folded);
+            }
+        }
+        Ok(true)
+    };
+
+    for gv in &cands.variants {
+        if gv.is_empty() {
+            continue;
+        }
+        if !push_norms(gv, &mut unjoined_norm, &mut out, &mut seen, budget)? {
+            return Ok((Vec::new(), true));
+        }
+        let anchored = gv.starts_with('/') || gv.starts_with('~');
+        if !anchored {
+            for r in root_strs {
+                let base = r.trim_end_matches('/');
+                let len = base.len() + 1 + gv.len();
+                budget.charge(len as u64)?;
+                budget.charge_alloc(len)?;
+                let joined = format!("{base}/{gv}");
+                if !push_norms(&joined, &mut joined_norm, &mut out, &mut seen, budget)? {
+                    return Ok((Vec::new(), true));
+                }
+            }
+        } else {
+            let expanded = expand_home_be(gv, home, cwd, budget)?;
+            if expanded != *gv
+                && !push_norms(&expanded, &mut joined_norm, &mut out, &mut seen, budget)?
+            {
+                return Ok((Vec::new(), true));
+            }
+        }
+    }
+    Ok((out, false))
 }
 
 // ---------------------------------------------------------------------------
@@ -2799,6 +4746,167 @@ fn is_executor_be(folded: &str, budget: &mut ComputeBudget) -> Result<bool, Exha
     Ok(matches!(folded, "eval" | "source" | "."))
 }
 
+fn extract_script_flock_c_code(
+    argv: &[String],
+    folds: FoldRules,
+    budget: &mut ComputeBudget,
+) -> Result<Option<String>, Exhausted> {
+    let Some(first) = argv.first() else {
+        return Ok(None);
+    };
+    let folded = fold_cmd_cr19(first, folds, budget)?;
+    if !matches!(folded.as_str(), "script" | "flock") {
+        return Ok(None);
+    }
+    let short_vals = if folded == "flock" { "wE" } else { "tTIOBmo" };
+    let mut j = 1usize;
+    let mut file_seen = false;
+    while let Some(w) = argv.get(j) {
+        budget.charge(w.len().max(1) as u64)?;
+        if w == "--" {
+            break;
+        }
+        if let Some(attached) = match_gnu_long_opt(w, "--command", 3) {
+            if let Some(val) = attached {
+                return Ok(Some(clone_str_budgeted(val, budget)?));
+            }
+            if let Some(next) = argv.get(j + 1) {
+                return Ok(Some(clone_str_budgeted(next, budget)?));
+            }
+            return Ok(None);
+        }
+        if w.starts_with('-') && !w.starts_with("--") && w.len() > 1 {
+            if let Some(pos) = w[1..].find('c') {
+                let after = &w[1 + pos + 1..];
+                if !after.is_empty() {
+                    return Ok(Some(clone_str_budgeted(after, budget)?));
+                }
+                if let Some(next) = argv.get(j + 1) {
+                    return Ok(Some(clone_str_budgeted(next, budget)?));
+                }
+                return Ok(None);
+            }
+            if short_cluster_takes_next(w, short_vals) {
+                j += 2;
+            } else {
+                j += 1;
+            }
+            continue;
+        }
+        if w.starts_with("--") {
+            let long_takes = if folded == "flock" {
+                matches!(w.as_str(), "--timeout" | "--wait" | "--conflict-exit-code")
+            } else {
+                matches!(
+                    w.as_str(),
+                    "--log-io" | "--log-in" | "--log-out" | "--output-limit" | "--timing"
+                )
+            };
+            j += if long_takes { 2 } else { 1 };
+            continue;
+        }
+        if !file_seen {
+            file_seen = true;
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+/// Budgeted port of `dev` `shell::reads_stdin_as_script` (`at`, `batch`,
+/// `script` without command, `chroot` without command, `crontab`, `make -f -`).
+fn reads_stdin_as_script_budgeted(
+    folded: &str,
+    args: &[String],
+    budget: &mut ComputeBudget,
+) -> Result<bool, Exhausted> {
+    let stdin = |w: &str| matches!(w, "-" | "/dev/stdin" | "/dev/fd/0");
+    budget.charge(args.len().max(1) as u64)?;
+    match folded {
+        "at" | "batch" | "script" => Ok(true),
+        "chroot" => {
+            let mut operands = 0usize;
+            let mut k = 0usize;
+            while k < args.len() {
+                let a = args[k].as_str();
+                if matches!(a, "--userspec" | "--groups") || short_cluster_takes_next(a, "Ggu") {
+                    k += 2;
+                    continue;
+                }
+                if !a.starts_with('-') {
+                    operands += 1;
+                }
+                k += 1;
+            }
+            Ok(operands <= 1)
+        }
+        "crontab" => {
+            let mut k = 0usize;
+            let mut file = false;
+            while k < args.len() {
+                let a = args[k].as_str();
+                budget.charge(a.len().max(1) as u64)?;
+                if stdin(a) {
+                    return Ok(true);
+                }
+                if let Some(flags) = a.strip_prefix('-') {
+                    let (before, user_next) = match flags.find('u') {
+                        Some(p) => (&flags[..p], p + 1 == flags.len()),
+                        None => (flags, false),
+                    };
+                    if before.contains(['l', 'r', 'e']) {
+                        return Ok(false);
+                    }
+                    k += if user_next { 2 } else { 1 };
+                    continue;
+                }
+                file = true;
+                k += 1;
+            }
+            Ok(!file)
+        }
+        "make" | "gmake" => {
+            for (i, a) in args.iter().enumerate() {
+                budget.charge(a.len().max(1) as u64)?;
+                let next_is_stdin = args.get(i + 1).is_some_and(|n| stdin(n));
+                if let Some(v) = a
+                    .strip_prefix("--file=")
+                    .or_else(|| a.strip_prefix("--makefile="))
+                {
+                    if stdin(v) {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                if matches!(a.as_str(), "--file" | "--makefile") {
+                    if next_is_stdin {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                if a.starts_with('-')
+                    && !a.starts_with("--")
+                    && let Some(k) = a.find('f')
+                {
+                    let rest = &a[k + 1..];
+                    let hit = if rest.is_empty() {
+                        next_is_stdin
+                    } else {
+                        stdin(rest)
+                    };
+                    if hit {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn reads_stdin_as_code_budgeted(
     eff: &[String],
     folds: FoldRules,
@@ -2814,6 +4922,24 @@ fn reads_stdin_as_code_budgeted(
     budget.charge(first.len().max(1) as u64)?;
     let folded = fold_cmd_cr19(first, folds, budget)?;
     let args = &eff[1..];
+
+    // `script -c CODE` / `flock -c CODE` / `--comm CODE`: check if CODE reads stdin as code.
+    if matches!(folded.as_str(), "script" | "flock")
+        && let Some(code) = extract_script_flock_c_code(eff, folds, budget)?
+    {
+        for seg in split_payload_segments(&code, budget)? {
+            let words = raw_words_budgeted(&seg, budget)?;
+            let inner_eff = unwrap_simple_be(&words, folds, budget)?;
+            if reads_stdin_as_code_budgeted(&inner_eff, folds, depth + 1, budget)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+
+    if reads_stdin_as_script_budgeted(&folded, args, budget)? {
+        return Ok(true);
+    }
 
     if matches!(folded.as_str(), "source" | ".") {
         return Ok(args
@@ -2872,15 +4998,18 @@ fn reads_stdin_as_code_budgeted(
                 .chars()
                 .any(|c| c == 'c' || (!is_sh && matches!(c, 'e' | 'E' | 'm'))))
             || (!is_sh && matches!(a.as_str(), "--eval" | "--command" | "--print"))
+            || (is_sh && (a == "--command" || a.starts_with("--command=")))
     });
     if code_flag {
         if is_sh {
             // `sh -c bash`: check if the `-c` code itself reads stdin as code.
             if let Some(code) = extract_shell_c_code(args, budget)? {
-                let words = raw_words_budgeted(code, budget)?;
-                let inner_eff = unwrap_simple_be(&words, folds, budget)?;
-                if reads_stdin_as_code_budgeted(&inner_eff, folds, depth + 1, budget)? {
-                    return Ok(true);
+                for seg in split_payload_segments(code, budget)? {
+                    let words = raw_words_budgeted(&seg, budget)?;
+                    let inner_eff = unwrap_simple_be(&words, folds, budget)?;
+                    if reads_stdin_as_code_budgeted(&inner_eff, folds, depth + 1, budget)? {
+                        return Ok(true);
+                    }
                 }
             }
         }
