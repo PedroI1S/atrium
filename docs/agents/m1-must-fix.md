@@ -16,8 +16,8 @@ Each row below starts with its state: ✅ done (with evidence), 🟡 in progress
 
 **Open before the M1 gate:**
 - **Rev 4:**
-  - P0 (M1-36), P1 (M1-37), P2 (M1-38, D-174) and P4 (M1-40) are merged.
-  - P3 (M1-39) is in rework.
+  - P0 (M1-36), P1 (M1-37), P2 (M1-38, D-174), P3 (M1-39, D-165) and P4 (M1-40) are merged.
+  - P5 (M1-41) is in progress (D-175).
   - P5 (M1-41) and the integrated rev 4 review are still to come.
 - **N16:** ✅ the bridge test flake. The cause was the test's fake daemon, and the fix is M1-42, merged as `6281107a` (D-168).
 - **N17:** `atrium-host` `tests/supervise.rs` `kill_recorded_returns_verified_when_gone_leader_group_drains_within_timeout` flakes under load (minor). It returned `Unverified` instead of `Verified` once (2026-11-24, M1-42 round 4's verification, load average ~6.6 while a worker built), and passed 30 of 30 reruns on `dev` at load ~3. The test releases the group member after 150 ms and expects the drain to finish within `GROUP_DRAIN_TIMEOUT`, so a stalled scheduler can miss it. ✅ Fixed by M1-43, merged as `6834b3c7` (D-171).

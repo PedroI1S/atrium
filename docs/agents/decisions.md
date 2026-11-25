@@ -1150,3 +1150,6 @@ D-141 removed flag arities from these rows precisely to avoid this.
 
 ## D-174 — 2026-11-25 — Pedro: merge P2 (M1-38) into dev
 **Decided by Pedro (driver).** P2 (`agent/neon/M1-38-rev4-p2-paths` at `2c304075`) passed Sonnet review 13 with no findings (D-120 gate met). Merged into `dev` as `5e13aa19`. The merged tree passes the full DoD on macOS: workspace 1049/0/7, fmt, clippy, protocol, typecheck and 373 vitest. The first run failed one `atrium-host` `supervise` test that P2 doesn't touch. That test then passed 300 of 300 runs and the workspace rerun was clean. It is logged as N19. A Linux run of P2 is still owed (rodrigo). P5 (M1-41) is next and needs the driver's go.
+
+## D-175 — 2026-11-25 — Pedro: start P5 (M1-41)
+**Decided by Pedro (driver).** Both of P5's prerequisites are merged: P2 (D-174) and P3 (D-165). P5 starts on Neon `xhigh` (D-158, D-161), on `agent/neon/M1-41-rev4-p5-integration`, cut from `dev` at `5c4d154f`. Its review runs on Pedro's Claude plan with Sonnet 5.5 (D-162, D-170), while agy's Claude models are at their weekly limit. The integrated rev 4 review (§13 step 5) is still the driver's pick. D-155's conditions apply to P5's rework rounds.
