@@ -230,8 +230,15 @@ fn lex_exact_tilde_rules() {
         );
     }
 
-    // Disallowed non-leading unquoted `~`: `a~b`, `--dir=~/x`.
-    for line in ["echo a~b", "ls --dir=~/x"] {
+    // §3 as amended (§11 item 16, D-176): a `~` right after `=` or `:` may
+    // be tilde-expanded, so it stays outside the model.
+    for line in [
+        "ls --dir=~/x",
+        "echo a=~/x",
+        "echo x:~/y",
+        "echo PATH=x:~/bin",
+        "echo a=~",
+    ] {
         let mut budget = ComputeBudget::with_default_limits();
         let out = lex_exact(line, 0, None, &mut budget).unwrap();
         assert!(
@@ -241,6 +248,25 @@ fn lex_exact_tilde_rules() {
             "line `{line}`: {:?}",
             out.outcomes
         );
+    }
+
+    // Any other non-leading unquoted `~` is a literal byte (`HEAD~1`, `a~b`).
+    for (line, word) in [
+        ("echo a~b", &b"a~b"[..]),
+        ("git diff HEAD~1", &b"HEAD~1"[..]),
+        ("echo a~~b", &b"a~~b"[..]),
+        ("echo x/~y", &b"x/~y"[..]),
+    ] {
+        let mut budget = ComputeBudget::with_default_limits();
+        let out = lex_exact(line, 0, None, &mut budget).unwrap();
+        assert!(
+            unread_reasons(&out).is_empty(),
+            "{line}: {:?}",
+            out.outcomes
+        );
+        let last = out.units[0].argv.last().unwrap();
+        assert_eq!(last.literal_bytes(), word, "{line}");
+        assert!(!last.starts_with_unquoted_tilde(), "{line}");
     }
 
     // Quoted `~` is literal and NOT `starts_with_unquoted_tilde`.
@@ -578,14 +604,53 @@ fn lex_exact_closed_redirect_list_and_outside_redirects() {
         );
     }
 
-    // Other outside redirects: `<&0`, `<>`, `>|`, `>&2`, `>&foo`, `1>`, `0<`, glob target, missing target.
+    // §3 as amended (§11 item 16, D-176): `>&m` and `>&-` without `n` are
+    // `1>&m` and `1>&-`, with `m` in 0..=2.
+    for m in 0u8..=2 {
+        let line = format!("cat >&{m}");
+        let mut b = ComputeBudget::with_default_limits();
+        let out = lex_exact(&line, 0, None, &mut b).unwrap();
+        assert!(
+            unread_reasons(&out).is_empty(),
+            "{line}: {:?}",
+            out.outcomes
+        );
+        assert_eq!(
+            out.units[0].redirects,
+            vec![ModelRedirect::Dup {
+                from: StdFd::Stdout,
+                to: StdFd::from_u8(m).unwrap()
+            }],
+            "{line}"
+        );
+    }
+    let mut b = ComputeBudget::with_default_limits();
+    let out = lex_exact("cat >&-", 0, None, &mut b).unwrap();
+    assert!(unread_reasons(&out).is_empty(), "{:?}", out.outcomes);
+    assert_eq!(
+        out.units[0].redirects,
+        vec![ModelRedirect::Close { fd: StdFd::Stdout }]
+    );
+    // `>&3` names a descriptor outside 0..=2.
+    let mut b = ComputeBudget::with_default_limits();
+    let out = lex_exact("cat >&3", 0, None, &mut b).unwrap();
+    assert!(
+        unread_reasons(&out)
+            .iter()
+            .any(|r| matches!(r, UnreadReason::DescriptorOutsideStd { fd: 3 })),
+        "{:?}",
+        out.outcomes
+    );
+
+    // Other outside redirects: `<&0`, `<>`, `>|`, `>&foo` (a file redirect in
+    // bash), `1>`, `0<`, glob target, missing target.
     for line in [
         "cat <&0",
         "cat <> file",
         "cat >| file",
-        "cat >&2",
-        "cat >&-",
         "cat >&foo",
+        "cat >&out.txt",
+        "cat >&'2'",
         "cat 1> out",
         "cat 0< in",
         "cat 2< in",

@@ -1216,7 +1216,12 @@ fn read_word(
                             push_unread(scanner, sink, UnreadReason::UnsupportedTildeForm)?;
                         }
                     }
-                } else {
+                } else if matches!(word.bytes.last(), Some(b'=' | b':')) {
+                    // §3 as amended (§11 item 16, D-176): a `~` right after
+                    // `=` or `:` may be tilde-expanded (`a=~/x`,
+                    // `--opt=~/x`, `PATH=x:~/bin`), so the line is outside
+                    // the model. Elsewhere in a word `~` is a literal byte,
+                    // as bash and zsh read it (`HEAD~1`, `a~b`).
                     push_unread(
                         scanner,
                         sink,
@@ -1695,14 +1700,11 @@ fn lex_exact_redirect(
                 sink.push_held(op_reason(">&"));
                 return Ok(());
             };
-            let Some((fd, digit_len)) = explicit_fd else {
-                // `>&2` / `>&-` / `>&file`: explicit `n` in 0..=2 required by §3's closed list.
-                sink.push_held(op_reason(">&"));
-                if let Some(m) = target_fd_over_std(&target) {
-                    sink.push_held(UnreadReason::DescriptorOutsideStd { fd: m });
-                }
-                return Ok(());
-            };
+            // §3 as amended (§11 item 16, D-176): `>&m` and `>&-` without
+            // `n` are `1>&m` and `1>&-`. The target rules below are the
+            // same, so `>&file` (a file redirect in bash) stays outside the
+            // model.
+            let (fd, digit_len) = explicit_fd.unwrap_or((1, 1));
             if digit_len != 1 {
                 sink.push_held(op_reason(">&"));
                 return Ok(());
