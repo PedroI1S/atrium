@@ -867,3 +867,59 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core --lib policy::v4::paths
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 13
+
+Input: review 10 (Claude Sonnet 5.5, `.orchestration/review-input/M1-38-rev4-p2-paths-round10.md`) on rounds 11 and 12 (which closed review 9 and round 12 with **one Low finding** and three test-gap groups), on top of `dev` merged at `6f2d5c57` (which brought in P3, `M1-39`). Zero P3 files and zero frozen interface files (`model.rs`, `limits.rs`, `tools.rs`, `paths.rs` signatures) were touched.
+
+Commits on `agent/neon/M1-38-rev4-p2-paths`:
+- `1ca72db7` (WIP saved by orchestrator mid-round when quota ran out; kept in history): `DIR_STREAM_ALLOC` + `fcntl_dupfd_cloexec` + `Dir::new` in `paths/resolver.rs`, and initial round 13 tests in `paths/p2_tests.rs`.
+- `47aa36f0`: defer `ProtectedSet::identity_gaps` attachment until after `push_alias_records` in `paths/sensitive.rs`, and finalize/fix round 13's alias-only test coverage in `paths/p2_tests.rs`.
+- handoff commit: this section (`docs/agents/handoffs/M1-38-rev4-p2-paths.md`).
+
+No change requests; all edits remain strictly inside P2's owned paths (`paths/resolver.rs`, `paths/sensitive.rs`, `paths/p2_tests.rs`, and this handoff).
+
+### Finding 1 (Low): Uncharged `openat` and `fdopendir` stream allocation in non-Linux Unix `read_dir` (§8)
+
+- **Cause:** `FsResolver::read_dir` in `crates/atrium-core/src/policy/v4/paths/resolver.rs` called `rustix::fs::Dir::read_from(&dir_fd)` in the `#[cfg(all(unix, not(target_os = "linux")))]` branch. In `rustix 1.1.5`, `Dir::read_from` runs `fcntl_getfl`, a second `openat(fd, ".")`, and `fdopendir`, which mallocs `DIR` and its read buffer — neither the second open nor the stream buffer allocation was charged, and small allocation budgets differed between macOS and Linux.
+- **Fix (`1ca72db7`, `paths/resolver.rs`):**
+  - Replaced `Dir::read_from(&dir_fd)` on non-Linux Unix with `rustix::io::fcntl_dupfd_cloexec(&dir_fd, 0)` + `rustix::fs::Dir::new(stream_fd)`, duplicating the existing fd with `FD_CLOEXEC` (no second open) while keeping `dir_fd` open for `DT_UNKNOWN` `statat` fallbacks.
+  - Defined `pub(super) const DIR_STREAM_ALLOC: usize = 4_096 + 256;` (4,352 bytes) with a doc comment explaining the bound: on macOS / BSD (`fdopendir` in Darwin `Libc` `gen/FreeBSD/opendir.c`), libc mallocs `sizeof(DIR)` (~128 bytes on 64-bit Darwin, including `pthread_mutex_t`), `struct _telldir` (~24 bytes), and `dd_buf` sized to local filesystem `st_blksize` (4,096 bytes on APFS/HFS+, floor `DIRBLKSIZ` = 1,024). Across the full `FS_MAX_DIR_OPENS` (1,024) cap, `1,024 * 4,352` (~4.25 MiB) stays well inside `COMPUTE_BUDGET_ALLOC_BYTES` (8 MiB), so large walks reach `FsCap::DirOpens` (`Unread`, §2) before exhausting `AllocationBudget`.
+  - Charged `budget.charge_alloc(DIR_STREAM_ALLOC)?;` in the shared `#[cfg(unix)]` block right after opening `dir_fd` and before constructing either Linux `RawDir` or non-Linux Unix `Dir::new` (and before `std::fs::read_dir` under `#[cfg(not(unix))]`), so a given directory costs the exact same allocation budget on both macOS and Linux.
+
+### Additional fix caught while finishing Round 13 (`47aa36f0`, `paths/sensitive.rs`)
+
+- **Cause:** Auditing `1ca72db7`'s alias-only test by hand revealed that `push_target_records` called `check_target_into` (which attached `ProtectedSet::identity_gaps`) *before* `push_alias_records`. When a target's `HardDenyHit` came **only** from an alias spelling (a bind-mounted `~/.ssh` written outside home, `/mnt/keys/absent_key`) in a filesystem whose `.azure` directory was already unlistable before `build_protected_set` (`folded_spellings` for `.azure/accesstokens.json` records an `AnyTarget` gap in `ProtectedSet::identity_gaps` as well as marking `RootAliases::incomplete`), `check_target_into` pushed `Unread(UnresolvablePath(".azure"))` before `push_alias_records` discovered the alias `HardDenyHit`. That left a spurious `Unread` alongside the alias `HardDenyHit` (contrary to `model.rs` `ProtectedSet::identity_gaps`, D-144, D-145, and review 10's test gap) and also emitted duplicate `Unread` records on non-hits when both `ProtectedSet::identity_gaps` and `RootAliases::incomplete` recorded the same failure.
+- **Fix (`47aa36f0`, `paths/sensitive.rs`):** Extracted `attach_applicable_gap`, added `attach_gap: bool` to `check_target_into` (`true` for standalone `check_target_impl`, `false` for `push_target_records`), and called `attach_applicable_gap` in `push_target_records` after `push_alias_records`. Once either the direct check or the alias check establishes a `HardDenyHit` (or an `Unread`), no spurious gap `Unread` is attached; `StoreHit` and `Clear` targets without a `HardDenyHit` or alias `Unread` still attach their applicable gap.
+
+### Tests added (`paths/p2_tests.rs`)
+
+All expectations were derived from contract §1, §2, §5, §8, §10 and decisions D-144, D-145, D-154, D-161, and traced by hand against both macOS and Linux code paths:
+
+| Review 10 item | Test (`p2_tests.rs`) | Coverage |
+|---|---|---|
+| Finding 1 (`read_dir` stream alloc, `DirOpens` = 1, cross-platform parity) | `round13_read_dir_charges_dir_stream_alloc_and_single_dir_open` (`#[cfg(unix)]`, runs on macOS & Linux) | Tiny directory (`a`, `bb`) with allocation budgets of `entries_bytes`, `entries_bytes + DIR_STREAM_ALLOC - 1` (both `Exhausted(AllocationBudget)`), and `entries_bytes + DIR_STREAM_ALLOC` (succeeds with 0 alloc bytes left and exact entries); platform-independent total-charge parity assertion plus empty-dir exact boundary (`DIR_STREAM_ALLOC - 1` vs `DIR_STREAM_ALLOC`); `DirOpens` cap = 1 (1st listing succeeds with 0 `LinkReads`/`Canonicalizations`, 2nd returns `CapReached(DirOpens)`); zero `DirOpens` precedes `DIR_STREAM_ALLOC`. |
+| Round 12 fix 1 (alias-only `HardDenyHit` with incomplete table, direct + followed links) | `round13_alias_only_hard_deny_suppresses_incomplete_table_unread` | Bind-mounted `~/.ssh` at `/mnt/keys` with `FakeFs`, covering: (1) single-FS unlistable `.azure` before `build_protected_set` (`AnyTarget` gap + incomplete `RootAliases`), (2a) `Canonicalizations` cap = 1 with empty `identity_gaps`, and (2b) clean `ProtectedSet` (`identity_gaps.is_empty()`) where `.azure` becomes unlistable for `RootAliases`. Verifies standalone `check_target` does not hit (`Clear` when `identity_gaps` empty; only gap `Unread` when `AnyTarget` gap present), while direct subject/command flows and `check_recursive_root`'s followed-link walk (both ordinary roots and written hard-deny roots) produce the alias `HardDenyHit` with zero spurious `Unread`s, and public `.pub` / readable `config` negative controls preserve the incomplete-table `Unread`. |
+| `ancestor_stats` cache (1,024-entry bound and hit/miss parity) | `round13_ancestor_stats_cache_bound_and_hit_miss_parity` | 1,100 distinct directories (`/d0000`–`/d1099`), including bind-mounted `~/.ssh` (`/d0500`, `/d1050`) and browser root (`/d0501`, `/d1051`) both inside and past the 1,024-entry bound, plus error and absent ancestors. Verifies direct `RootAliases::scan` parity vs fresh `RootAliases` across all 1,100 dirs; observes the exact 1,024-entry bound via `FsCaps::Stats` (`d0000`/`d1023`/`d0500` cached vs `d1024`/`d1050` uncached); and verifies end-to-end 1,109-operand `resolve_subject_paths` and `resolve_command_targets` verdicts match a fresh `RootAliases` per call. |
+
+### Cross-platform `#[cfg]` audit (macOS & Linux)
+
+- `paths/resolver.rs`: `DIR_STREAM_ALLOC` is unconditional (used in `#[cfg(unix)]`, `#[cfg(not(unix))]`, and `p2_tests.rs`). In `FsResolver::read_dir`, `budget.charge_alloc(DIR_STREAM_ALLOC)?` runs in the shared `#[cfg(unix)]` block before both `#[cfg(target_os = "linux")]` (`RawDir` on a 4 KiB stack buffer, unchanged imports/vars) and `#[cfg(all(unix, not(target_os = "linux")))]` (`rustix::io::fcntl_dupfd_cloexec(&dir_fd, 0)` + `rustix::fs::Dir::new(stream_fd)`). `canonicalize_via_proc` (`#[cfg(target_os = "linux")]`) and `FALLBACK_CANON_*` are unchanged and warning-free on both platforms.
+- `paths/p2_tests.rs`: `round13_read_dir_charges_dir_stream_alloc_and_single_dir_open` is `#[cfg(unix)]` (identical assertions on Linux and macOS); `round3_r2f5` (`#[cfg(target_os = "linux")]`) and `round11_v1_f1_real_fs_1100_plain_operands_and_large_read_dir` (`#[cfg(unix)]`) were re-audited by reading for Linux compatibility under the new `DIR_STREAM_ALLOC` charge.
+
+### Verification
+
+Run by the worker (D-123):
+- `cargo fmt --all` (clean)
+- `cargo check -p atrium-core --tests` (clean on macOS, 0 errors, 0 warnings)
+- No build/test suites or `clippy` were run (D-123).
+
+Commands for the orchestrator's verification (fish-compatible; run on both macOS and Linux):
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core --lib policy::v4::paths
+cargo test --workspace --no-fail-fast
+```
